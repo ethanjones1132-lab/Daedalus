@@ -1,0 +1,27 @@
+// ═══════════════════════════════════════════════════════════════
+// ── Jarvis Bun Server ──
+// ═══════════════════════════════════════════════════════════════
+// WSL-side HTTP server on port 19877.
+// Uses OpenAI-compatible API for both OpenRouter and Ollama.
+
+import { serve } from "bun";
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, rmSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
+import { spawn } from "child_process";
+
+import type { JarvisConfig, JarvisSession, OpenClawRequest, OpenClawResponse } from "./types";
+
+// ═══════════════════════════════════════════════════════════════
+// ── Companion State interface ──
+// ═══════════════════════════════════════════════════════════════
+interface CompanionState {
+  enabled: boolean;
+  name: string;
+  species: string;
+  rarity: string;
+  mood: string;
+  happiness: number;
+  energy: number;
+  level: number;
+  xp: nu

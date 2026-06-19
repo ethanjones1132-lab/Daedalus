@@ -84,8 +84,8 @@ export default function ActionRegistryView() {
         invoke<ActionRegistryBucket>('get_action_registry_bucket', { bucket: 'blocked' }),
       ]);
       setSummary(summaryData);
-      setActive(activeData.actions);
-      setBlocked(blockedData.actions);
+      setActive(activeData?.actions ?? []);
+      setBlocked(blockedData?.actions ?? []);
       setError(null);
     } catch (e) {
       setError(String(e));

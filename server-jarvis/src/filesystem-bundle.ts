@@ -2,7 +2,8 @@
 // ── Filesystem Bundle ──
 // ═══════════════════════════════════════════════════════════════
 // Canonical filesystem + search tools registered into the ToolRuntime:
-// read_file, write_file, edit_file, multi_edit, glob, grep, list_directory.
+// read_file, write_file, edit_file, multi_edit, apply_patch, glob, grep,
+// list_directory.
 //
 // Handlers are ported verbatim from the legacy tools.ts so the chat model's
 // behaviour is preserved exactly. Path scoping (fs-scope) and the
@@ -14,16 +15,11 @@
 
 import { promises as fs } from "fs";
 import { join, resolve, relative, dirname } from "path";
-import { applyPatch } from "diff";
 import type { ToolRuntime, ExecutionContext } from "./tool-runtime";
 import type { ToolDefinition } from "./tool-types";
-import { safePath, fromWslPath } from "./fs-scope";
+import { safePath } from "./fs-scope";
 import { markFileRead, hasFileBeenRead } from "./fs-read-cache";
-
-/** Convert a scoped WSL path back to a native path for filesystem I/O. */
-function nativePath(scoped: string): string {
-  return fromWslPath(scoped);
-}
+import { applyUnifiedPatch, buildUnifiedDiff } from "./diff";
 
 // ── Tool Definitions (copied byte-for-byte from legacy getAllTools) ──────────────
 
@@ -112,12 +108,12 @@ const APPLY_PATCH_DEF: ToolDefinition = {
   type: "function",
   function: {
     name: "apply_patch",
-    description: "Apply a unified diff patch to a file. The patch must apply cleanly to the current file content.",
+    description: "Apply a unified diff (patch) to an existing file. Read the file first, then provide a standard unified-diff patch. Fails cleanly (without writing) if the patch context no longer matches the file.",
     parameters: {
       type: "object",
       properties: {
         path: { type: "string", description: "Path to the file to patch" },
-        patch: { type: "string", description: "Unified diff patch text" },
+        patch: { type: "string", description: "Unified diff text to apply to the file" },
       },
       required: ["path", "patch"],
     },
@@ -190,7 +186,7 @@ async function handleReadFile(args: Record<string, unknown>, ctx: ExecutionConte
   const limit = (args.limit as number) || 500;
 
   try {
-    const content = await fs.readFile(nativePath(path), "utf-8");
+    const content = await fs.readFile(path, "utf-8");
     markFileRead(path);
     const lines = content.split("\n");
     const start = Math.max(0, offset - 1);
@@ -199,7 +195,7 @@ async function handleReadFile(args: Record<string, unknown>, ctx: ExecutionConte
     const numbered = lines.slice(start, end).map((line, i) => `${(start + i + 1).toString().padStart(6)} | ${line}`);
     return numbered.join("\n");
   } catch (e: any) {
-    return `File not found or error reading file: ${path}`;
+    return `File not found: ${path}. Use glob with pattern to find the correct path before retrying.`;
   }
 }
 
@@ -208,10 +204,10 @@ async function handleWriteFile(args: Record<string, unknown>, ctx: ExecutionCont
   const path = safePath(args.path as string, cfg);
   const content = args.content as string;
 
-  const dir = dirname(nativePath(path));
+  const dir = dirname(path);
   await fs.mkdir(dir, { recursive: true });
 
-  await fs.writeFile(nativePath(path), content, "utf-8");
+  await fs.writeFile(path, content, "utf-8");
   const lines = content.split("\n").length;
   return `Wrote ${lines} lines to ${args.path}`;
 }
@@ -219,7 +215,6 @@ async function handleWriteFile(args: Record<string, unknown>, ctx: ExecutionCont
 async function handleEditFile(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
   const path = safePath(args.path as string, cfg);
-  const native = nativePath(path);
   const oldStr = args.old_string as string;
   const newStr = args.new_string as string;
 
@@ -229,7 +224,7 @@ async function handleEditFile(args: Record<string, unknown>, ctx: ExecutionConte
 
   let content: string;
   try {
-    content = await fs.readFile(native, "utf-8");
+    content = await fs.readFile(path, "utf-8");
   } catch (e: any) {
     return `File not found: ${path}`;
   }
@@ -244,14 +239,13 @@ async function handleEditFile(args: Record<string, unknown>, ctx: ExecutionConte
   }
 
   const updated = content.replace(oldStr, newStr);
-  await fs.writeFile(native, updated, "utf-8");
+  await fs.writeFile(path, updated, "utf-8");
   return `Edited ${args.path}: replaced ${oldStr.length} chars with ${newStr.length} chars`;
 }
 
 async function handleMultiEdit(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
   const path = safePath(args.path as string, cfg);
-  const native = nativePath(path);
   const edits = args.edits as Array<{ old_string: string; new_string: string }>;
 
   if (!hasFileBeenRead(path)) {
@@ -260,7 +254,7 @@ async function handleMultiEdit(args: Record<string, unknown>, ctx: ExecutionCont
 
   let content: string;
   try {
-    content = await fs.readFile(native, "utf-8");
+    content = await fs.readFile(path, "utf-8");
   } catch (e: any) {
     return `File not found: ${path}`;
   }
@@ -276,40 +270,40 @@ async function handleMultiEdit(args: Record<string, unknown>, ctx: ExecutionCont
     results.push(`OK: replaced "${edit.old_string.slice(0, 40)}..."`);
   }
 
-  await fs.writeFile(native, content, "utf-8");
+  await fs.writeFile(path, content, "utf-8");
   return `Multi-edit on ${args.path}:\n${results.join("\n")}`;
 }
 
 async function handleApplyPatch(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
   const path = safePath(args.path as string, cfg);
-  const native = nativePath(path);
   const patch = args.patch as string;
 
   if (!hasFileBeenRead(path)) {
-    return `Error: File "${args.path}" has not been read yet in this conversation. Call read_file on "${args.path}" first, then retry your patch with the exact current content.`;
+    return `Error: File "${args.path}" has not been read yet in this conversation. Call read_file on "${args.path}" first, then apply the patch.`;
   }
 
   let content: string;
   try {
-    content = await fs.readFile(native, "utf-8");
+    content = await fs.readFile(path, "utf-8");
   } catch (e: any) {
     return `File not found: ${path}`;
   }
 
-  const patched = applyPatch(content, patch);
-  if (patched === false) {
-    return `Error: patch does not apply cleanly to "${args.path}". The file content may have changed. Call read_file to see the current content and regenerate the patch.`;
+  const result = applyUnifiedPatch(content, patch);
+  if (!result.ok || result.content === undefined) {
+    return `Error: patch did not apply cleanly to "${args.path}". The file may have changed since it was read — call read_file again and regenerate the patch against the current content.`;
   }
 
-  await fs.writeFile(native, patched, "utf-8");
-  return `Patched ${args.path}`;
+  await fs.writeFile(path, result.content, "utf-8");
+  const diff = buildUnifiedDiff(content, result.content, args.path as string);
+  return `Patched ${args.path}: +${diff.additions}/-${diff.deletions}`;
 }
 
 async function handleGlob(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
   const pattern = args.pattern as string;
-  const searchPath = nativePath(safePath(args.path as string || cfg.jarvis_path || ".", cfg));
+  const searchPath = args.path as string || cfg.jarvis_path || cfg.jarvis_path;
 
   // Simple glob implementation
   const results: string[] = [];
@@ -358,7 +352,7 @@ function formatSize(bytes: number): string {
 async function handleGrep(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
   const pattern = args.pattern as string;
-  const searchPath = nativePath(safePath(args.path as string || cfg.jarvis_path || ".", cfg));
+  const searchPath = args.path as string || cfg.jarvis_path || cfg.jarvis_path;
   const outputMode = (args.output_mode as string) || "files_with_matches";
   const headLimit = (args.head_limit as number) || 50;
 
@@ -407,13 +401,12 @@ async function handleGrep(args: Record<string, unknown>, ctx: ExecutionContext):
 async function handleListDir(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
   const path = safePath(args.path as string, cfg);
-  const native = nativePath(path);
 
   try {
-    const entries = await fs.readdir(native);
+    const entries = await fs.readdir(path);
     const items = await Promise.all(
       entries.map(async (entry) => {
-        const full = nativePath(join(path, entry));
+        const full = join(path, entry);
         try {
           const stats = await fs.stat(full);
           const type = stats.isDirectory() ? "📁" : "📄";

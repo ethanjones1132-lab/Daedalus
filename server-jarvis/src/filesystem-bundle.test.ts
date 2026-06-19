@@ -2,9 +2,10 @@ import { describe, test, expect, afterEach } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
+import { createTwoFilesPatch } from "diff";
 import { createToolRuntime, makeExecutionContext } from "./tool-runtime";
 import type { ToolRuntime, ExecutionContext } from "./tool-runtime";
-import { registerFilesystemBundle } from "./filesystem-bundle";
+import { registerFilesystemBundle, registerSearchBundle } from "./filesystem-bundle";
 import { defaultConfig } from "./config";
 
 // These tests run against a real workspace and use WORKSPACE-RELATIVE paths so
@@ -45,9 +46,9 @@ function call(name: string, args: Record<string, unknown>) {
 }
 
 describe("FilesystemBundle registration", () => {
-  test("registers all 7 filesystem tools", () => {
+  test("registers all 8 filesystem tools", () => {
     const names = makeRuntime().listTools().map((t) => t.function.name);
-    for (const n of ["read_file", "write_file", "edit_file", "multi_edit", "glob", "grep", "list_directory"]) {
+    for (const n of ["read_file", "write_file", "edit_file", "multi_edit", "apply_patch", "glob", "grep", "list_directory"]) {
       expect(names).toContain(n);
     }
   });
@@ -88,7 +89,7 @@ describe("FilesystemBundle > read_file", () => {
     const ws = makeTempWorkspace();
     const result = await makeRuntime().execute(call("read_file", { path: "nope.txt" }), makeCtx(ws));
     expect(result.is_error).toBe(false);
-    expect(result.output).toContain("File not found or error reading file");
+    expect(result.output).toContain("File not found");
   });
 });
 
@@ -128,6 +129,60 @@ describe("FilesystemBundle > edit_file (read-before-edit guard)", () => {
     );
     expect(result.is_error).toBe(false);
     expect(readFileSync(join(ws, "f.txt"), "utf-8")).toBe("hi world");
+  });
+});
+
+describe("FilesystemBundle > apply_patch (Tier A)", () => {
+  test("apply_patch is registered in the full bundle but NOT the read-only search bundle", () => {
+    const full = makeRuntime().listTools().map((t) => t.function.name);
+    expect(full).toContain("apply_patch");
+
+    const search = createToolRuntime();
+    registerSearchBundle(search);
+    const searchNames = search.listTools().map((t) => t.function.name);
+    expect(searchNames).not.toContain("apply_patch");
+  });
+
+  test("apply_patch is dangerous + approval-required", () => {
+    const def = makeRuntime().listTools().find((d) => d.function.name === "apply_patch")!;
+    expect(def.dangerous).toBe(true);
+    expect(def.requires_approval).toBe(true);
+  });
+
+  test("refuses to patch a file that has not been read", async () => {
+    const ws = makeTempWorkspace();
+    writeFileSync(join(ws, "p.txt"), "alpha\nbeta\ngamma\n");
+    const patch = createTwoFilesPatch("p.txt", "p.txt", "alpha\nbeta\ngamma\n", "alpha\nBETA\ngamma\n");
+    const result = await makeRuntime().execute(call("apply_patch", { path: "p.txt", patch }), makeCtx(ws));
+    expect(result.output).toContain("has not been read yet");
+  });
+
+  test("applies a unified diff after the file has been read", async () => {
+    const ws = makeTempWorkspace();
+    const before = "alpha\nbeta\ngamma\n";
+    const after = "alpha\nBETA\ngamma\n";
+    writeFileSync(join(ws, "p.txt"), before);
+    const patch = createTwoFilesPatch("p.txt", "p.txt", before, after);
+    const rt = makeRuntime();
+    const ctx = makeCtx(ws);
+    await rt.execute(call("read_file", { path: "p.txt" }), ctx);
+    const result = await rt.execute(call("apply_patch", { path: "p.txt", patch }), ctx);
+    expect(result.is_error).toBe(false);
+    expect(readFileSync(join(ws, "p.txt"), "utf-8")).toBe(after);
+  });
+
+  test("returns an error (without writing) when the patch does not apply", async () => {
+    const ws = makeTempWorkspace();
+    const before = "alpha\nbeta\ngamma\n";
+    writeFileSync(join(ws, "p.txt"), before);
+    // Patch built against different content → context mismatch.
+    const patch = createTwoFilesPatch("p.txt", "p.txt", "x\ny\nz\n", "x\nY\nz\n");
+    const rt = makeRuntime();
+    const ctx = makeCtx(ws);
+    await rt.execute(call("read_file", { path: "p.txt" }), ctx);
+    const result = await rt.execute(call("apply_patch", { path: "p.txt", patch }), ctx);
+    expect(result.output.toLowerCase()).toMatch(/could not|did not|does not|failed|not apply/);
+    expect(readFileSync(join(ws, "p.txt"), "utf-8")).toBe(before);
   });
 });
 

@@ -1,3 +1,182 @@
+// ═══════════════════════════════════════════════════════════════
+// ── Claude Code CLI Integration ──
+}
+// Spawns the Claude Code CLI as a subprocess, captures streaming JSON output,
+// and bridges it into the Jarvis SSE event stream.
+
+import { spawn } from "child_process";
+import { existsSync, mkdirSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
+import type { JarvisConfig } from "./config";
+
+const LOCAL_PROXY_BASE_URL = "http://127.0.0.1:19878";
+const LOCAL_CLAUDE_CONFIG_DIR =
+  process.env.JARVIS_CLAUDE_CONFIG_DIR ||
+  join(homedir(), ".openclaw", "jarvis", "hermes", "claude-local-config");
+
+const CREDENTIAL_ENV_PREFIXES = ["ANTHROPIC_", "CLAUDE_CODE_"];
+const CREDENTIAL_ENV_KEYS = new Set([
+  "CLAUDE_CONFIG_DIR",
+  "ANTHROPIC_API_KEY_FILE_DESCRIPTOR",
+  "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+]);
+
+// ── Path Resolution ──
+
+export function resolveClaudePath(configPath: string): string {
+  if (configPath && configPath !== "claude" && existsSync(configPath)) {
+    return configPath;
+  }
+  const fallbacks = [
+    "/home/ethan/.nvm/versions/node/v2
+    "/usr/local/bin/claude",
+    "/usr/bin/claude",
+  ];
+  for (const p of fallbacks) {
+    if (existsSync(p)) {
+      return p;
+    }
+  }
+  return configPath || "claude";
+}
+
+export function buildLocalClaudeEnv(baseEnv: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(baseEnv)) {
+    if (value === undefined) continue;
+    if (CREDENTIAL_ENV_KEYS.has(key)) continue;
+    if (CREDENTIAL_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) continue;
+    env[key] = value;
+  }
+
+  mkdirSync(LOCAL_CLAUDE_CONFIG_DIR, { recursive: true });
+
+  return {
+    ...env,
+    OPENCLAW_JARVIS: "true",
+    ANTHROPIC_API_KEY: "ollama",
+    ANTHROPIC_AUTH_TOKEN: "ollama",
+    ANTHROPIC_BASE_URL: LOCAL_PROXY_BASE_URL,
+    CLAUDE_CONFIG_DIR: LOCAL_CLAUDE_CONFIG_DIR,
+    CLAUDE_CODE_SIMPLE: "1",
+    CLAUDE_CODE_USE_LOCAL_MODEL: "1",
+    CLAUDE_CODE_DISABLE_TELEMETRY: "1",
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+    CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1",
+    NO_PROXY: appendNoProxy(env.NO_PROXY),
+    no_proxy: appendNoProxy(env.no_proxy),
+  };
+}
+
+export function buildLocalClaudeArgs(args: string[]): string[] {
+  const next = [...args];
+  if (!next.includes("--bare")) {
+    next.unshift("--bare");
+  }
+  if (!next.includes("--no-telemetry")) {
+    next.push("--no-telemetry");
+  }
+  return next;
+}
+
+function appendNoProxy(existing: string | undefined): string {
+  const required = ["127.0.0.1", "localhost"];
+  const parts = new Set(
+    (existing || "")
+      .split(",")
+      .map((part) => part.trim())
+      .filter(Boolean),
+  );
+  for (const value of required) parts.add(value);
+  return Array.from(parts).join(",");
+}
+
+// ── Types ──
+
+export interface ClaudeCliRequest {
+  prompt: string;
+  session_id?: string;
+  cwd?: string;
+  max_turns?: number;
+  cliArgs?: string[];
+}
+
+export interface ClaudeCliMessage {
+  type: string;
+  content?: string;
+  delta?: { text: string };
+  session_id?: string;
+  usage?: { input_tokens: number; output_tokens: number };
+  tool_use?: { name: string; input: Record<string, unknown> };
+  tool_result?: { content: string; is_error?: boolean };
+  [key: string]: unknown;
+}
+
+// ── Check Availability ──
+
+export async function isClaudeCliAvailable(path: string): Promise<boolean> {
+  const resolved = resolveClaudePath(path);
+  return new Promise((resolve) => {
+    const proc = spawn(resolved, ["--version"], {
+      timeout: 5000,
+      env: buildLocalClaudeEnv(),
+    });
+    proc.on("close", (code) => resolve(code === 0));
+    proc.on("error", () => resolve(false));
+  });
+}
+
+// ── Invoke (one-shot, returns full response) ──
+
+export async function invokeClaudeCli(
+  cfg: JarvisConfig,
+  req: ClaudeCliRequest,
+): Promise<{ success: boolean; output: string; session_id?: string; error?: string; tokens_used?: number }> {
+  const cliCfg = cfg.claude_cli;
+
+  const args = buildLocalClaudeArgs([...(cliCfg.args || [])]);
+  // Prompt is passed as a positional argument (not --prompt flag)
+  args.push(req.prompt);
+
+  if (req.session_id) args.push("--resume", req.session_id);
+  // Note: --cwd is not a valid Claude CLI flag; cwd is set via spawn options
+  if (req.max_turns) args.push("--max-turns", String(req.max_turns));
+
+  return new Promise((resolve) => {
+    // Use localhost for Ollama — subprocess runs in WSL, same as Bun server
+    const localOnlyEnv = {
+      ...buildLocalClaudeEnv(),
+      CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: "1",
+    };
+
+    const resolvedPath = resolveClaudePath(cliCfg.path);
+    const proc = spawn(resolvedPath, args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: localOnlyEnv,
+      timeout: cliCfg.timeout_ms,
+      cwd: req.cwd || cliCfg.cwd,
+    });
+
+    // Close stdin immediately — CLI should use positional prompt arg, not stdin
+    proc.stdin?.end();
+
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      proc.kill("SIGTERM");
+    }, cliCfg.timeout_ms);
+
+    proc.stdout?.on("data", (d: Buffer) => { stdout += d.toString(); });
+    proc.stderr?.on("data", (d: Buffer) => { stderr += d.toString(); });
+
+    proc.on("close", (code) => {
+      clearTimeout(timeout);
+      if (timedOut) {
+        resolve({ success: false, output: "", error: `Claude CLI timed out after ${cliCfg.timeout_ms}ms` });
         return;
       }
       if (code === 0) {
@@ -163,3 +342,20 @@ export async function* streamClaudeCli(
 
     // Check stderr for errors
     let stderr = "";
+    for await (const chunk of proc.stderr!) {
+      stderr += decoder.decode(chunk, { stream: true });
+    }
+
+    const exitCode = await new Promise<number>((resolve) => {
+      proc.on("close", (code) => resolve(code || 0));
+    });
+
+    if (exitCode !== 0 && stderr) {
+      yield { type: "error", error: stderr.slice(0, 500) };
+    } else {
+      yield { type: "message_stop", session_id: req.session_id };
+    }
+  } finally {
+    proc.kill();
+  }
+}

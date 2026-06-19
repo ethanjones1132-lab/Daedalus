@@ -3,6 +3,8 @@ pub mod types;
 pub mod runner;
 pub mod queue;
 pub mod bridge;
+pub mod hermes;
+pub mod learning;
 
 pub use types::JarvisState;
 

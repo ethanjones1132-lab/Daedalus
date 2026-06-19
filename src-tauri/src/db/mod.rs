@@ -27,8 +27,15 @@ impl AppDb {
         let conn = rusqlite::Connection::open(&db_path)
             .map_err(|e| format!("Failed to open database at {:?}: {}", db_path, e))?;
 
-        // Enable WAL mode and set busy timeout for concurrency
-        let _ = conn.execute("PRAGMA journal_mode = WAL;", []);
+        // Enable WAL mode and set busy timeout and other pragmas for concurrency and speed
+        let _ = conn.execute_batch(
+            "PRAGMA journal_mode = WAL; \
+             PRAGMA foreign_keys = ON; \
+             PRAGMA synchronous = NORMAL; \
+             PRAGMA temp_store = MEMORY; \
+             PRAGMA mmap_size = 30000000000; \
+             PRAGMA cache_size = -20000;",
+        );
         let _ = conn.busy_timeout(std::time::Duration::from_millis(5000));
 
         migrations::run_migrations(&conn)

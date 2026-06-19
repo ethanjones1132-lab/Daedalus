@@ -39,7 +39,8 @@ function loadConfig(): { bridge_port: number } {
 
 const { bridge_port } = loadConfig();
 
-const server = Bun.listen({
+try {
+  Bun.listen({
   hostname: "127.0.0.1",
   port: bridge_port,
   socket: {
@@ -118,6 +119,13 @@ const server = Bun.listen({
       console.log("[Bridge] Agent disconnected");
     },
   },
-});
-
-console.log(`[Bridge] Listening on 127.0.0.1:${bridge_port}`);
+  });
+  console.log(`[Bridge] Listening on 127.0.0.1:${bridge_port}`);
+} catch (e: any) {
+  if (e && (e.code === "EADDRINUSE" || /EADDRINUSE|address already in use/i.test(String(e?.message)))) {
+    console.warn(`[Bridge] Port ${bridge_port} already in use — a bridge is already running; exiting cleanly.`);
+    process.exit(0);
+  }
+  console.error("[Bridge] Failed to start:", e);
+  process.exit(1);
+}

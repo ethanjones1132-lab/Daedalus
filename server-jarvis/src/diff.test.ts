@@ -1,5 +1,24 @@
 import { describe, expect, test } from "bun:test";
-import { buildUnifiedDiff } from "./diff";
+import { createTwoFilesPatch } from "diff";
+import { buildUnifiedDiff, applyUnifiedPatch } from "./diff";
+
+describe("applyUnifiedPatch", () => {
+  test("applies a clean unified diff and returns the new content", () => {
+    const original = "line1\nline2\nline3\n";
+    const modified = "line1\nLINE2\nline3\n";
+    const patch = createTwoFilesPatch("f.txt", "f.txt", original, modified);
+    const r = applyUnifiedPatch(original, patch);
+    expect(r.ok).toBe(true);
+    expect(r.content).toBe(modified);
+  });
+
+  test("returns ok:false when the patch context does not match", () => {
+    const patch = createTwoFilesPatch("f.txt", "f.txt", "line1\nline2\nline3\n", "line1\nLINE2\nline3\n");
+    const r = applyUnifiedPatch("completely different content\n", patch);
+    expect(r.ok).toBe(false);
+    expect(r.content).toBeUndefined();
+  });
+});
 
 describe("buildUnifiedDiff", () => {
   test("reports changed=false for identical content", () => {

@@ -28,3 +28,20 @@ describe("ReasoningParser", () => {
 
   test("handles Qwen style tags split across multiple chunks", () => {
     const parser = new ReasoningParser("session-2");
+    
+    const events1 = parser.processChunk("Hello! <think>Let me");
+    expect(events1).toEqual([
+      { type: "content", text: "Hello! " },
+      { type: "reasoning_chunk", text: "Let me" },
+    ]);
+    
+    const events2 = parser.processChunk(" think about this.</think>Done thinking.");
+    expect(events2).toEqual([
+      {
+        type: "reasoning_chunk",
+        text: " think about this.",
+      },
+      {
+        type: "reasoning_step",
+        step: {
+          type: "thought

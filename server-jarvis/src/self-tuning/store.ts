@@ -1,3 +1,170 @@
+import { Database } from "bun:sqlite";
+import { existsSync, mkdirSync } from "fs";
+import { dirname, join } from "path";
+import { homedir } from "os";
+import { execSync } from "child_process";
+
+export interface AgentRun {
+  id: string;
+  session_id: string;
+  user_request: string;
+  task_type: string;
+  pipeline: string; // JSON string array
+  completed: number;
+  final_output?: string;
+  user_rating?: number;
+  duration_ms?: number;
+  tool_calls_count?: number;
+  token_count?: number;
+  created_at?: string;
+}
+
+export interface StageRun {
+  id: string;
+  agent_run_id: string;
+  mode_id: string;
+  turn_number: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  tool_calls_json?: string;
+  duration_ms?: number;
+  was_successful: number;
+  had_error: number;
+  error_message?: string;
+  created_at?: string;
+}
+
+export interface TuningProposal {
+  id: string;
+  agent_run_id: string;
+  proposal_type: string;
+  task_type: string;
+  current_value?: string;
+  proposed_value?: string;
+  rationale?: string;
+  applied: number;
+  created_at?: string;
+}
+
+export interface TuningOutcome {
+  id: string;
+  proposal_id: string;
+  user_rating_delta?: number;
+  token_delta?: number;
+  success_rate_delta?: number;
+  measured_at?: string;
+}
+
+function getWindowsHome(): string | null {
+  try {
+    const raw = execSync('cmd.exe
+    const trimmed = raw.trim();
+    if (trimmed && trimmed.match(/^[a-zA-Z]:\\/)) {
+      const drive = trimmed[0].toLowerCase();
+      const path = trimmed.slice(2).replace(/\\/g, "/");
+      return `/mnt/${drive}${path}`;
+    }
+  } catch (e) {
+    // Fail silently
+  }
+  return null;
+}
+
+export function locateJarvisDb(): string | null {
+  const winHome = getWindowsHome();
+  const candidates: string[] = [];
+  const user = homedir().split("/").pop() || "ethan";
+
+  if (winHome) {
+    candidates.push(join(winHome, ".local", "share", "com.jarvis.desktop", "jarvis.db"));
+    candidates.push(join(winHome, "AppData", "Local", "com.jarvis.desktop", "jarvis.db"));
+    candidates.push(join(winHome, ".openclaw", "jarvis", "memory", "jarvis.db"));
+  }
+
+  candidates.push(`/mnt/c/Users/${user}/.local/share/com.jarvis.desktop/jarvis.db`);
+  candidates.push(`/mnt/c/Users/${user}/AppData/Local/com.jarvis.desktop/jarvis.db`);
+  candidates.push(`/mnt/c/Users/${user}/.openclaw/jarvis/memory/jarvis.db`);
+
+  candidates.push(join(homedir(), ".local", "share", "com.jarvis.desktop", "jarvis.db"));
+  candidates.push(join(homedir(), ".openclaw", "jarvis", "memory", "jarvis.db"));
+  candidates.push(join(homedir(), ".openclaw", "jarvis", "jarvis.db"));
+  candidates.push(join(homedir(), "jarvis.db"));
+
+  for (const c of candidates) {
+    if (existsSync(c)) {
+      return c;
+    }
+  }
+  return null;
+}
+
+// Self-tuning telemetry lives in its OWN Bun-native SQLite DB (WSL ext4), NOT the shared
+// Windows jarvis.db. That DB is held open by the native Rust process in WAL mode; a second
+// opener reaching it over the /mnt/c 9p mount cannot coordinate the -shm shared-memory file
+// across the Win/WSL boundary, which throws SQLITE_IOERR ("disk I/O error") on every write.
+// Rust only *creates* these tables (migrations) and never reads them, so keeping the data
+// server-side is safe. Schema mirrors src-tauri/src/db/migrations.rs::create_self_tuning_tables.
+const SELF_TUNING_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS agent_runs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    user_request TEXT NOT NULL,
+    task_type TEXT NOT NULL,
+    pipeline TEXT NOT NULL,
+    completed INTEGER NOT NULL DEFAULT 0,
+    final_output TEXT,
+    user_rating INTEGER,
+    duration_ms INTEGER,
+    tool_calls_count INTEGER,
+    token_count INTEGER,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  );
+  CREATE TABLE IF NOT EXISTS stage_runs (
+    id TEXT PRIMARY KEY,
+    agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+    mode_id TEXT NOT NULL,
+    turn_number INTEGER NOT NULL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    tool_calls_json TEXT DEFAULT '[]',
+    duration_ms INTEGER,
+    was_successful INTEGER NOT NULL DEFAULT 0,
+    had_error INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_stage_runs_agent_run_id ON stage_runs(agent_run_id);
+  CREATE TABLE IF NOT EXISTS tuning_proposals (
+    id TEXT PRIMARY KEY,
+    agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+    proposal_type TEXT NOT NULL,
+    task_type TEXT NOT NULL,
+    current_value TEXT,
+    proposed_value TEXT,
+    rationale TEXT,
+    applied INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_tuning_proposals_agent_run_id ON tuning_proposals(agent_run_id);
+  CREATE TABLE IF NOT EXISTS tuning_outcomes (
+    id TEXT PRIMARY KEY,
+    proposal_id TEXT NOT NULL REFERENCES tuning_proposals(id) ON DELETE CASCADE,
+    user_rating_delta REAL,
+    token_delta REAL,
+    success_rate_delta REAL,
+    measured_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_tuning_outcomes_proposal_id ON tuning_outcomes(proposal_id);
+`;
+
+const schemaEnsuredPaths = new Set<string>();
+
+/** Dedicated, WSL-native self-tuning DB path (parent dir created lazily). */
+export function selfTuningDbPath(): string {
+  const p = join(homedir(), ".openclaw", "jarvis", "self-tuning.db");
+  try { mkdirSync(dirname(p), { recursive: true }); } catch { /* best effort */ }
+  return p;
+}
 
 export class SelfTuningStore {
   private cachedDb: Database | null = null;
@@ -9,14 +176,20 @@ export class SelfTuningStore {
       if (this.dbPathOverride === ":memory:") {
         if (!this.cachedDb) {
           const db = new Database(":memory:");
+          db.exec(SELF_TUNING_SCHEMA);
           db.close = () => {}; // Make close a no-op so the in-memory DB stays alive
           this.cachedDb = db;
         }
         return this.cachedDb;
       }
-      const dbPath = this.dbPathOverride || locateJarvisDb();
-      if (!dbPath) return null;
-      return this.dbPathOverride ? new Database(dbPath, { create: true }) : new Database(dbPath);
+      // Default to the dedicated, WSL-native self-tuning DB (see SELF_TUNING_SCHEMA note).
+      const dbPath = this.dbPathOverride || selfTuningDbPath();
+      const db = new Database(dbPath, { create: true });
+      if (!schemaEnsuredPaths.has(dbPath)) {
+        db.exec(SELF_TUNING_SCHEMA);
+        schemaEnsuredPaths.add(dbPath);
+      }
+      return db;
     } catch (e) {
       console.error("[SelfTuningStore] open failed:", e);
       return null;
@@ -128,3 +301,90 @@ export class SelfTuningStore {
       ).run(
         outcome.id,
         outcome.proposal_id,
+        outcome.user_rating_delta ?? null,
+        outcome.token_delta ?? null,
+        outcome.success_rate_delta ?? null
+      );
+    } catch (e) {
+      console.error("[SelfTuningStore] insertTuningOutcome failed:", e);
+    } finally {
+      db.close();
+    }
+  }
+
+  getAgentRuns(): AgentRun[] {
+    const db = this.getDb();
+    if (!db) return [];
+    try {
+      return db.query("SELECT * FROM agent_runs ORDER BY created_at DESC").all() as AgentRun[];
+    } catch (e) {
+      console.error("[SelfTuningStore] getAgentRuns failed:", e);
+      return [];
+    } finally {
+      db.close();
+    }
+  }
+
+  getStageRuns(agentRunId: string): StageRun[] {
+    const db = this.getDb();
+    if (!db) return [];
+    try {
+      return db.query("SELECT * FROM stage_runs WHERE agent_run_id = ? ORDER BY turn_number ASC").all(agentRunId) as StageRun[];
+    } catch (e) {
+      console.error("[SelfTuningStore] getStageRuns failed:", e);
+      return [];
+    } finally {
+      db.close();
+    }
+  }
+
+  getPendingProposals(): TuningProposal[] {
+    const db = this.getDb();
+    if (!db) return [];
+    try {
+      return db.query("SELECT * FROM tuning_proposals WHERE applied = 0 ORDER BY created_at DESC").all() as TuningProposal[];
+    } catch (e) {
+      console.error("[SelfTuningStore] getPendingProposals failed:", e);
+      return [];
+    } finally {
+      db.close();
+    }
+  }
+
+  getAppliedProposals(): TuningProposal[] {
+    const db = this.getDb();
+    if (!db) return [];
+    try {
+      return db.query("SELECT * FROM tuning_proposals WHERE applied = 1 ORDER BY created_at DESC").all() as TuningProposal[];
+    } catch (e) {
+      console.error("[SelfTuningStore] getAppliedProposals failed:", e);
+      return [];
+    } finally {
+      db.close();
+    }
+  }
+
+  applyTuningProposal(id: string): void {
+    const db = this.getDb();
+    if (!db) return;
+    try {
+      db.prepare("UPDATE tuning_proposals SET applied = 1 WHERE id = ?").run(id);
+    } catch (e) {
+      console.error("[SelfTuningStore] applyTuningProposal failed:", e);
+    } finally {
+      db.close();
+    }
+  }
+
+  updateUserRating(runId: string, rating: number): void {
+    const db = this.getDb();
+    if (!db) return;
+    try {
+      db.prepare("UPDATE agent_runs SET user_rating = ? WHERE id = ?").run(rating, runId);
+    } catch (e) {
+      console.error("[SelfTuningStore] updateUserRating failed:", e);
+    } finally {
+      db.close();
+    }
+  }
+}

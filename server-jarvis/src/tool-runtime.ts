@@ -9,10 +9,23 @@
 // through separate tool implementations.
 
 import type { JarvisConfig } from "./config";
-import type { ToolDefinition, ToolCall, ToolResult } from "./tools";
+import type { ToolDefinition, ToolCall, ToolResult } from "./tool-types";
 
 // ── Re-export tool types so callers import from one place ─────────────────────
 export type { ToolDefinition, ToolCall, ToolResult };
+
+/**
+ * Map full tool definitions to the OpenAI API shape (drops runtime-only flags).
+ * Filters out tools marked `text_protocol_only` so they are never sent to
+ * native-function-calling models — they remain callable via the text protocol.
+ */
+export function toApiTools(
+  defs: ToolDefinition[],
+): Array<Pick<ToolDefinition, "type" | "function">> {
+  return defs
+    .filter((d) => !d.text_protocol_only)
+    .map(({ type, function: fn }) => ({ type, function: fn }));
+}
 
 // ── Execution Context ─────────────────────────────────────────────────────────
 
@@ -42,15 +55,16 @@ export interface ExecutionContext {
    */
   workspace_path?: string;
   /**
-   * Callback invoked when a tool requires interactive approval.
-   * Should return `true` to allow execution, `false` to deny.
-   * If absent, "ask" decisions are treated as denied.
+   * Optional approval prompt for tools whose policy resolves to "ask".
+   * When present, `execute()` awaits it on an "ask" decision and only runs the
+   * handler if it resolves `true`. Absent → "ask" falls through (legacy
+   * passthrough behavior, used by surfaces that cannot prompt).
    */
-  requestApproval?: (
-    def: ToolDefinition,
-    call: ToolCall,
-    reason: string,
-  ) => Promise<boolean>;
+  requestApproval?: (req: {
+    call_id: string;
+    name: string;
+    arguments: Record<string, unknown>;
+  }) => Promise<boolean>;
 }
 
 /**
@@ -248,37 +262,27 @@ export function createToolRuntime(): ToolRuntime {
         duration_ms: Date.now() - start,
       };
     }
-    // "ask" in interactive mode: caller must approve via requestApproval callback
-    if (policy.decision === "ask") {
-      if (!ctx.requestApproval) {
-        const reason = `Tool "${call.name}" requires approval but no approval handler is configured`;
-        return {
-          call_id: call.id,
-          name: call.name,
-          output: reason,
-          is_error: true,
-          error: reason,
-          duration_ms: Date.now() - start,
-        };
-      }
-      let approved = false;
-      try {
-        approved = await ctx.requestApproval(entry.def, call, policy.reason);
-      } catch (e) {
-        approved = false;
-      }
+    // "ask" in interactive mode: prompt the caller if it provided an approval
+    // hook, otherwise fall through (legacy behavior for surfaces that can't ask).
+    if (policy.decision === "ask" && ctx.requestApproval) {
+      const approved = await ctx.requestApproval({
+        call_id: call.id,
+        name: call.name,
+        arguments: call.arguments,
+      });
       if (!approved) {
-        const reason = `Tool "${call.name}" was not approved`;
+        const msg = `Tool "${call.name}" was rejected by the user.`;
         return {
           call_id: call.id,
           name: call.name,
-          output: reason,
+          output: msg,
           is_error: true,
-          error: reason,
+          error: msg,
           duration_ms: Date.now() - start,
         };
       }
     }
+    // "allow": proceed directly
 
     // Execute handler — catch all throws
     try {

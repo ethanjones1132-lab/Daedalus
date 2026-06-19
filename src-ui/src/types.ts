@@ -1,85 +1,38 @@
-// ═══════════════════════════════════════════════════════════════
-// ── Centralized TypeScript Interfaces ──
-// ═══════════════════════════════════════════════════════════════
-
 export type ViewId =
   | 'overview' | 'chat-feeds' | 'jarvis' | 'channels' | 'instances' | 'sessions'
-  | 'usage' | 'cron' | 'agents' | 'skills' | 'nodes' | 'dreaming'
-  | 'models' | 'config' | 'logs' | 'hooks' | 'commitments' | 'devices'
-  | 'approvals' | 'gateway' | 'doctor';
+  | 'usage' | 'cron' | 'agents' | 'skills' | 'nodes'
+  | 'models' | 'control' | 'config' | 'logs' | 'hooks' | 'commitments' | 'devices'
+  | 'approvals' | 'gateway' | 'doctor' | 'health' | 'plugins'
+  | 'memory'
+  | 'jarvis-hub' | 'jarvis-chat' | 'jarvis-sessions' | 'jarvis-skills'
+  | 'jarvis-tools' | 'jarvis-companion' | 'jarvis-config' | 'jarvis-status';
 
-export interface NavItem { id: ViewId; label: string; icon: string; }
-export interface NavSection { title: string; items: NavItem[]; }
+export interface NavItem { id: ViewId; label: string; icon: string }
+export interface NavSection { title: string; items: NavItem[] }
 
-// ── Chat ──
-
-export interface ChatMessage {
+export interface SessionMessage {
+  id: string;
+  session_id: string;
   role: string;
   content: string;
-  timestamp: string | null;
+  tokens: number;
+  tool_calls: string | null;
+  created_at: string;
 }
 
-export interface SessionHistory {
-  session_key: string;
-  agent_id: string;
-  session_id: string;
-  messages: ChatMessage[];
-}
-
-export interface ChatSession {
-  key: string;
-  agent_id: string;
-  session_id: string;
-  kind: string;
-  updated_at: number;
-  age_ms: number;
-  model: string;
-  last_message_preview: string;
-}
-
-// ── Sessions ──
-
-export interface SessionData {
-  key: string;
-  agent_id: string;
-  session_id: string;
-  kind: string;
-  updated_at: number;
-  age_ms: number;
-  model: string;
-  model_provider: string;
-  thinking_level: string;
-  input_tokens: number | null;
-  output_tokens: number | null;
-  total_tokens: number | null;
-  context_tokens: number | null;
-  percent_used: number | null;
-  remaining_tokens: number | null;
-  total_tokens_fresh: boolean;
-  system_sent: boolean;
-  aborted_last_run: boolean;
-  flags: string[];
-}
-
-// ── Agents ──
-
-export interface AgentData {
+export interface BackendSession {
   id: string;
-  name: string;
-  identity_name: string;
-  identity_emoji: string;
-  identity_source: string;
-  workspace: string;
-  agent_dir: string;
+  agent_id: string;
+  title: string;
+  backend: string;
   model: string;
-  bindings: number;
-  is_default: boolean;
-  sessions_count?: number;
-  last_active_age_ms?: number;
-  bootstrap_pending?: boolean;
+  context_tokens: number;
+  total_tokens: number;
+  created_at: string;
+  updated_at: string;
+  archived: boolean;
+  message_count: number;
 }
-
-// ── Skills ──
 
 export interface SkillInfo {
   name: string;
@@ -94,8 +47,6 @@ export interface SkillInfo {
   missing: { bins: string[]; env: string[]; config: string[]; os: string[] };
 }
 
-// ── Models ──
-
 export interface ModelInfo {
   key: string;
   name: string;
@@ -106,8 +57,6 @@ export interface ModelInfo {
   tags: string[];
   missing: boolean;
 }
-
-// ── Cron Jobs ──
 
 export interface CronJob {
   id: string;
@@ -138,8 +87,6 @@ export interface CronJob {
   };
 }
 
-// ── Hooks ──
-
 export interface HookInfo {
   name: string;
   description: string;
@@ -156,8 +103,6 @@ export interface HookInfo {
   managed_by_plugin: boolean;
 }
 
-// ── Commitments ──
-
 export interface CommitmentInfo {
   id: string;
   status: string;
@@ -166,22 +111,4 @@ export interface CommitmentInfo {
   created_at_ms: number | null;
   due_at_ms: number | null;
   extra: Record<string, unknown>;
-}
-
-// ── Dashboard ──
-
-export interface DashboardData {
-  status: {
-    runtime_version: string;
-    os: { label: string };
-    gateway: { mode: string; url: string; reachable: boolean; error?: string };
-    gateway_service: { status: string; runtime_short: string };
-    node_service: { installed: boolean; runtime_short: string };
-    update: { available: boolean; latest_version: string; channel: string; package_manager: string; install_kind: string };
-    memory: { enabled: boolean; slot: string };
-    agents_total: number;
-    sessions_total: number;
-  };
-  agents: AgentData[];
-  sessions: SessionData[];
 }

@@ -1,60 +1,55 @@
-export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
-  constructor(props: ErrorBoundaryProps) {
-    super(props);
-    this.state = { hasError: false, error: null };
-  }
+import { motion, Variants } from 'framer-motion';
+import { ReactNode } from 'react';
+import { clsx } from 'clsx';
+import { twMerge } from 'tailwind-merge';
 
-  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
-    return { hasError: true, error };
-  }
-
-  render() {
-    if (this.state.hasError) {
-      if (this.props.fallback) return this.props.fallback;
-      return (
-        <motion.div
-          initial={{ opacity: 0, scale: 0.95 }}
-          animate={{ opacity: 1, scale: 1 }}
-          className="p-6 bg-red-500/10 border border-red-500/30 rounded-xl text-center"
-        >
-          <p className="text-red-400 text-sm font-mono mb-2">Something went wrong</p>
-          <p className="text-red-400/60 text-xs font-mono">{this.state.error?.message}</p>
-          <button
-            onClick={() => this.setState({ hasError: false, error: null })}
-            className="mt-3 px-3 py-1 text-xs font-mono text-bone-dim border border-iron/30 rounded-lg hover:border-iron/50 transition-colors"
-          >
-            Try Again
-          </button>
-        </motion.div>
-      );
-    }
-    return this.props.children;
-  }
+// ── Utility ──
+export function cn(...inputs: (string | undefined | null | false)[]) {
+  return twMerge(clsx(inputs));
 }
 
-// ── Skeleton Components ──
-export { SkeletonCard, SkeletonText, SkeletonCircle } from './Skeleton';
+// ── PageTransition ──
+export function PageTransition({ children, className }: { children: ReactNode; className?: string }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 12 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -8 }}
+      transition={{ type: 'spring', stiffness: 300, damping: 30 }}
+      className={cn('h-full', className)}
+    >
+      {children}
+    </motion.div>
+  );
+}
 
-// ── Toast Notifications ──
-export { ToastProvider, useToast } from './Toast';
-export type { Toast, ToastType } from './Toast';
+// ── AnimatedGrid ──
+const gridContainerVariants: Variants = {
+  hidden: { opacity: 0 },
+  visible: {
+    opacity: 1,
+    transition: { staggerChildren: 0.04, delayChildren: 0.05 },
+  },
+};
 
-// ── Mythos Primitives ──
-export {
-  TiltCard,
-  MagneticButton,
-  AnimatedNumber,
-  Label,
-  MetricBlock,
-  ShimmerBar,
-  HaloGlow,
-  MythosDivider,
-  MythosTooltip,
-  useTiltMotion,
-  useMagneticMotion,
-  useEyeTrack,
-  MYTHOS_SPRING,
-  MYTHOS_SPRING_SOFT,
-  MYTHOS_SPRING_SNAP,
-} from './Mythos';
-export type { TiltCardProps, MagneticButtonProps, AnimatedNumberProps, LabelProps, MetricBlockProps, ShimmerBarProps } from './Mythos';
+const gridItemVariants: Variants = {
+  hidden: { opacity: 0, y: 12, scale: 0.97 },
+  visible: {
+    opacity: 1,
+    y: 0,
+    scale: 1,
+    transition: { duration: 0.3, ease: [0.25, 0.46, 0.45, 0.94] },
+  },
+};
+
+export function AnimatedGrid({
+  children,
+  className,
+}: {
+  children: ReactNode;
+  className?: string;
+}) {
+  return (
+    <motion.div
+      variants={gridContainerVariants}
+      initial="hidden"

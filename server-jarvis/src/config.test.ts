@@ -94,3 +94,19 @@ describe("top_k sampling", () => {
     expect(cfg.top_k).toBe(12);
   });
 });
+
+// ─── Interactive tool approval (Track B follow-up) ───────────────────────────
+describe("tools.interactive_approval", () => {
+  test("defaults to false (legacy passthrough preserved)", () => {
+    expect(defaultConfig().tools.interactive_approval).toBe(false);
+  });
+
+  test("normalizeConfig fills in a missing interactive_approval with false", () => {
+    expect(normalizeConfig({}).tools.interactive_approval).toBe(false);
+  });
+
+  test("an explicit interactive_approval:true survives normalization", () => {
+    const cfg = normalizeConfig({ tools: { interactive_approval: true } });
+    expect(cfg.tools.interactive_approval).toBe(true);
+  });
+});

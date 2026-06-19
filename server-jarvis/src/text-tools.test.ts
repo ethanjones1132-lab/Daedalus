@@ -1,13 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { defaultConfig } from "./config";
 import {
   extractTextToolCalls,
   hasExplicitWebSearchIntent,
   TextToolCallStreamSanitizer,
   webSearchQueryFromPrompt,
 } from "./text-tools";
-import { getApiTools } from "./tools";
-import type { ToolDefinition } from "./tools";
+import { toApiTools } from "./tool-runtime";
+import type { ToolDefinition } from "./tool-types";
 
 const tools: ToolDefinition[] = [
   {
@@ -157,7 +156,7 @@ describe("text tool extraction", () => {
   });
 
   test("api tool schemas exclude Jarvis-only metadata", () => {
-    const apiTools = getApiTools(defaultConfig());
+    const apiTools = toApiTools(tools);
 
     expect(apiTools.length).toBeGreaterThan(0);
     expect(apiTools.some(tool => "requires_approval" in tool)).toBe(false);

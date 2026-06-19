@@ -145,5 +145,4 @@ use tokio::sync::Mutex;
 pub struct JarvisState {
     pub config: Arc<Mutex<JarvisConfig>>,
     pub queue: Arc<crate::jarvis::queue::MessageQueue>,
-    pub http_client: reqwest::Client,
 }

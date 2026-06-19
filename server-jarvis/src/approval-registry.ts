@@ -7,7 +7,7 @@
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
 interface PendingApproval {
-      resolve: (approved: boolean) => void;
+  resolve: (approved: boolean) => void;
   timer: ReturnType<typeof setTimeout>;
 }
 
@@ -17,7 +17,7 @@ export interface ApprovalRegistry {
    * to the user's decision (true = approve, false = reject). Auto-resolves to
    * `false` if no decision arrives within `timeoutMs`.
    */
-      request(callId: string, timeoutMs?: number): Promise<boolean>;
+  request(callId: string, timeoutMs?: number): Promise<boolean>;
   /**
    * Resolve a pending approval. Returns `true` if a matching pending request
    * existed (and was resolved), `false` otherwise.
@@ -27,7 +27,7 @@ export interface ApprovalRegistry {
   pending(): number;
 }
 
-    export function createApprovalRegistry(): ApprovalRegistry {
+export function createApprovalRegistry(): ApprovalRegistry {
   const pending = new Map<string, PendingApproval>();
 
   function settle(callId: string, approved: boolean): boolean {
@@ -37,7 +37,7 @@ export interface ApprovalRegistry {
     pending.delete(callId);
     entry.resolve(approved);
     return true;
-      }
+  }
 
   return {
     request(callId: string, timeoutMs: number = DEFAULT_TIMEOUT_MS): Promise<boolean> {
@@ -47,7 +47,7 @@ export interface ApprovalRegistry {
       });
     },
     resolve(callId: string, approved: boolean): boolean {
-          return settle(callId, approved);
+      return settle(callId, approved);
     },
     pending(): number {
       return pending.size;

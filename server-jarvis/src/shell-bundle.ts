@@ -27,7 +27,7 @@ const BASH_DEF: ToolDefinition = {
   dangerous: true,
 };
 
-async function handleBash(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
+async function handleBash(args: Record<string
   const cfg = ctx.config;
   const command = args.command as string;
   const timeout = Math.min((args.timeout_ms as number) || 30000, 60000);
