@@ -1,0 +1,318 @@
+{
+
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+
+  "title": "Unified Action Registry Item",
+
+  "type": "object",
+
+  "required": [
+
+    "id",
+
+    "project",
+
+    "source_system",
+
+    "source_area",
+
+    10|    "priority",
+
+    "risk_level",
+
+    "category",
+
+    "action_type",
+
+    "title",
+
+    "description",
+
+    "acceptance_criteria",
+
+    "dependencies",
+
+    "status",
+
+    "owner",
+
+    20|    "approval_required",
+
+    "created_at",
+
+    "updated_at"
+
+  ],
+
+  "properties": {
+
+    "id": {
+
+      "type": "string",
+
+      "minLength": 1
+
+    },
+
+    "project": {
+
+    30|      "type": "string",
+
+      "minLength": 1
+
+    },
+
+    "source_system": {
+
+      "type": "string",
+
+      "minLength": 1
+
+    },
+
+    "source_area": {
+
+      "type": "string",
+
+      "minLength": 1
+
+    40|    },
+
+    "priority": {
+
+      "type": "string",
+
+      "enum": [
+
+        "P0",
+
+        "P1",
+
+        "P2",
+
+        "P3"
+
+      ]
+
+    },
+
+    50|    "risk_level": {
+
+      "type": "string",
+
+      "enum": [
+
+        "low",
+
+        "medium",
+
+        "high",
+
+        "critical"
+
+      ]
+
+    },
+
+    "category": {
+
+    60|      "type": "string",
+
+      "minLength": 1
+
+    },
+
+    "action_type": {
+
+      "type": "string",
+
+      "minLength": 1
+
+    },
+
+    "title": {
+
+      "type": "string",
+
+      "minLength": 1
+
+    70|    },
+
+    "description": {
+
+      "type": "string",
+
+      "minLength": 1
+
+    },
+
+    "acceptance_criteria": {
+
+      "type": "array",
+
+      "items": {
+
+        "type": "string",
+
+        "minLength": 1
+
+    80|      }
+
+    },
+
+    "dependencies": {
+
+      "type": "array",
+
+      "items": {
+
+        "type": "string",
+
+        "minLength": 1
+
+      }
+
+    },
+
+    "status": {
+
+    90|      "type": "string",
+
+      "enum": [
+
+        "open",
+
+        "in_progress",
+
+        "blocked",
+
+        "done",
+
+        "cancelled"
+
+      ]
+
+    },
+
+    "owner": {
+
+   100|      "type": "string",
+
+      "enum": [
+
+        "system",
+
+        "user",
+
+        "shared"
+
+      ]
+
+    },
+
+    "approval_required": {
+
+      "type": "boolean"
+
+    },
+
+   110|    "next_due": {
+
+      "type": [
+
+        "string",
+
+        "null"
+
+      ]
+
+    },
+
+    "created_at": {
+
+      "type": "string",
+
+      "minLength": 1
+
+    },
+
+   120|    "updated_at": {
+
+      "type": "string",
+
+      "minLength": 1
+
+    },
+
+    "completed_at": {
+
+      "type": [
+
+        "string",
+
+        "null"
+
+      ]
+
+    },
+
+   130|    "result_summary": {
+
+      "type": [
+
+        "string",
+
+        "null"
+
+      ]
+
+    },
+
+    "evidence": {
+
+      "type": "array",
+
+      "items": {
+
+        "type": "object",
+
+   140|        "required": [
+
+          "kind",
+
+          "value"
+
+        ],
+
+        "properties": {
+
+          "kind": {
+
+            "type": "string",
+
+            "minLength": 1
+
+          },
+
+          "value": {
+
+   150|            "type": "string",
+
+            "minLength": 1
+
+          }
+
+        },
+
+        "additionalProperties": true
+
+      }
+
+    }
+
+  },
+
+  "additionalProperties": true
+
+}
+

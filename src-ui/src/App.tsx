@@ -1,0 +1,1 @@
+EROFS: read-only file system, open '\\wsl.localhost\ubuntu\mnt\wslg\distro\home\ethan\.openclaw\agents\coderclaw\workspace\home-base\src-ui\src\App.tsx'

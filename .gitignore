@@ -1,0 +1,36 @@
+# --- Rust / Tauri ---
+src-tauri/target/
+**/*.rs.bk
+
+# --- Node / Bun / Vite ---
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+bun.lockb
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# --- Recovery debris quarantine (kept out of history) ---
+_quarantine/
+
+# --- OS / editor junk ---
+.DS_Store
+Thumbs.db
+*.swp
+
+# --- WSL/Windows blunder artifacts (never commit) ---
+nul
+DumpStack.log
+*.tmp
+
+# --- Local secrets / config ---
+.env
+.env.*
+!.env.example

@@ -1,0 +1,99 @@
+@import "tailwindcss";
+
+@theme {
+  /* ═══════════════════════════════════════════════════════════
+     Enterprise Gothic Maximalist Palette
+     ═══════════════════════════════════════════════════════════ */
+
+  /* Metallic Blacks */
+  --color-void: #0a0a0c;
+  --color-obsidian: #0e0e14;
+  --color-charcoal: #14141e;
+  --color-iron: #1e1e2e;
+  --color-slate-dark: #2a2a40;
+
+  /* Surface with glass effect */
+  --color-surface: rgba(14, 14, 20, 0.6);
+  --color-surface-solid: #12121a;
+  --color-surface-raised: #1a1a28;
+
+  /* Royal Purple accents */
+  --color-royal: #8b5cf6;
+  --color-royal-light: #a78bfa;
+  --color-royal-dark: #6d28d9;
+  --color-royal-muted: #7c3aed;
+
+  /* Cyan Neon accents */
+  --color-cyan-neon: #22d3ee;
+  --color-cyan-glow: #67e8f9;
+  --color-cyan-dim: #0e7490;
+
+  /* Semantic */
+  --color-success: #34d399;
+  --color-warning: #fbbf24;
+  --color-error: #f87171;
+
+  /* Text */
+  --color-bone: #e8e8f8;
+  --color-bone-muted: #9090b8;
+  --color-bone-dim: #5a5a7a;
+  --color-bone-faint: #3a3a58;
+
+  /* Typography */
+  --font-sans: 'Inter', 'SF Pro Display', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Base
+   ═══════════════════════════════════════════════════════════ */
+
+body {
+  background-color: var(--color-void);
+  color: var(--color-bone);
+  font-family: var(--font-sans);
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  width: 100vw;
+  height: 100vh;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Scrollbar
+   ═══════════════════════════════════════════════════════════ */
+
+::-webkit-scrollbar {
+  width: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-slate-dark);
+  border-radius: 10px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-royal);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Glass / Glow Utilities
+   ═══════════════════════════════════════════════════════════ */
+
+.glass {
+  background: rgba(14, 14, 20, 0.6);
+  backdrop-filter: blur(20px) saturate(1.4);
+  -webkit-backdrop-filter: blur(20px) saturate(1.4);
+}
+
+.glass-strong {
+  background: rgba(14, 14, 20, 0.8);
+  backdrop-filter: blur(30px) saturate(1.6);
+  -webkit-backdrop-filter: blur(30px) saturate(1.6);
+}

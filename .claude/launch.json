@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "jarvis-dist",
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": ["bash", "-lc", "cd /home/ethan/.openclaw/agents/coderclaw/workspace/home-base/src-ui/dist && exec python3 -m http.server 4399 --bind 127.0.0.1"],
+      "port": 4399
+    }
+  ]
+}

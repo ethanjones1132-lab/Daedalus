@@ -1,0 +1,254 @@
+// Action Registry — file-backed cross-project action summary for Jarvis UI
+
+use crate::commands::load_jarvis_config;
+use crate::db::AppDb;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
+use tauri::{AppHandle, Emitter, State};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionRegistrySummary {
+    pub active: usize,
+    pub blocked: usize,
+    pub done: usize,
+    pub pending_approvals: usize,
+    pub escalated: usize,
+    pub alerts: usize,
+}
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryAction {
+    pub id: String,
+    pub project: String,
+    pub source_system: String,
+    pub source_area: String,
+    pub priority: String,
+    pub risk_level: String,
+    pub category: String,
+    pub action_type: String,
+        pub title: String,
+    pub description: String,
+    pub status: String,
+    pub owner: String,
+    pub approval_required: bool,
+    #[serde(default)]
+    pub approval_status: Option<String>,
+    #[serde(default)]
+    pub next_due: Option<String>,
+    #[serde(default)]
+        pub escalated: Option<bool>,
+    #[serde(default)]
+    pub escalation_note: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionRegistryBucket {
+    pub bucket: String,
+    pub actions: Vec<RegistryAction>,
+    }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionRegistryAlert {
+    pub id: String,
+    pub kind: String,
+    pub severity: String,
+    pub title: String,
+    pub message: String,
+    #[serde(default)]
+        pub action_id: Option<String>,
+    #[serde(default)]
+    pub count: Option<usize>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BucketFile {
+    bucket: String,
+    actions: Vec<serde_json::Value>,
+    }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NotificationsFile {
+    alerts: Vec<ActionRegistryAlert>,
+}
+
+fn registry_root(db: &AppDb) -> Result<PathBuf, String> {
+    let config = load_jarvis_config(db)?;
+    let base = if config.jarvis_path.trim().is_empty() {
+            std::env::current_dir().map_err(|e| e.to_string())?
+    } else {
+        PathBuf::from(&config.jarvis_path)
+    };
+    Ok(base.join("workspace").join("action-registry"))
+}
+
+fn read_bucket(path: &Path) -> Result<Vec<RegistryAction>, String> {
+    if !path.exists() {
+        return Ok(vec![]);
+        }
+    let raw = fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let payload: BucketFile = serde_json::from_str(&raw)
+        .map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    Ok(payload
+        .actions
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<RegistryAction>(value).ok())
+        .collect())
+}
+   
+fn read_alerts(path: &Path) -> Vec<ActionRegistryAlert> {
+    if !path.exists() {
+        return vec![];
+    }
+    let raw = match fs::read_to_string(path) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    serde_json::from_str::<NotificationsFile>(&raw)
+           .map(|f| f.alerts)
+        .unwrap_or_default()
+}
+
+/// Return bucket counts and alert totals for the action registry dashboard.
+#[tauri::command]
+pub fn get_action_registry_summary(db: State<AppDb>) -> Result<ActionRegistrySummary, String> {
+    let root = registry_root(db.inner())?;
+    let data = root.join("data");
+    let active = read_bucket(&data.join("active.json"))?;
+       let blocked = read_bucket(&data.join("blocked.json"))?;
+    let done = read_bucket(&data.join("done.json"))?;
+    let alerts = read_alerts(&data.join("notifications.json"));
+
+    let pending_approvals = active
+        .iter()
+        .chain(blocked.iter())
+        .filter(|a| {
+            a.approval_required
+                && a.approval_status
+                       .as_deref()
+                    .map(|s| s != "approved" && s != "waived")
+                    .unwrap_or(true)
+        })
+        .count();
+    let escalated = active.iter().filter(|a| a.escalated.unwrap_or(false)).count();
+
+    Ok(ActionRegistrySummary {
+        active: active.len(),
+        blocked: blocked.len(),
+           done: done.len(),
+        pending_approvals,
+        escalated,
+        alerts: alerts.len(),
+    })
+}
+
+/// Return all actions for a bucket (`active`, `blocked`, or `done`).
+#[tauri::command]
+pub fn get_action_registry_bucket(
+       db: State<AppDb>,
+    bucket: String,
+) -> Result<ActionRegistryBucket, String> {
+    let allowed = ["active", "blocked", "done"];
+    if !allowed.contains(&bucket.as_str()) {
+        return Err(format!("unknown bucket: {bucket}"));
+    }
+    let root = registry_root(db.inner())?;
+    let actions = read_bucket(&root.join("data").join(format!("{bucket}.json")))?;
+    Ok(ActionRegistryBucket { bucket, actions })
+   }
+
+/// Return current notification alerts generated by the registry sync loop.
+#[tauri::command]
+pub fn get_action_registry_alerts(db: State<AppDb>) -> Result<Vec<ActionRegistryAlert>, String> {
+    let root = registry_root(db.inner())?;
+    Ok(read_alerts(&root.join("data").join("notifications.json")))
+}
+
+/// Run adapter sync via Python CLI and emit UI alerts when new notifications appear.
+   #[tauri::command]
+pub fn sync_action_registry(app: AppHandle, db: State<AppDb>) -> Result<serde_json::Value, String> {
+    let root = registry_root(db.inner())?;
+    let output = std::process::Command::new("python3")
+        .current_dir(&root)
+        .env("PYTHONPATH", "src")
+        .args(["-m", "action_registry", "sync", "--root"])
+        .arg(root.to_string_lossy().to_string())
+        .output()
+        .map_err(|e| format!("failed to spawn sync: {e}"))?;
+   
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!("sync failed: {stderr}{stdout}"));
+    }
+
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("invalid sync output: {e}"))?;
+
+       let alerts = read_alerts(&root.join("data").join("notifications.json"));
+    if !alerts.is_empty() {
+        let _ = app.emit("action-registry://alerts", &alerts);
+    }
+
+    Ok(payload)
+}
+
+/// Update the approval status of an action in the registry.
+#[tauri::command]
+   pub fn update_action_approval(
+    app: AppHandle,
+    db: State<AppDb>,
+    action_id: String,
+    status: String,
+) -> Result<bool, String> {
+    let root = registry_root(db.inner())?;
+    let data_dir = root.join("data");
+
+    let mut found = false;
+       let buckets = ["active", "blocked", "done"];
+
+    for bucket in &buckets {
+        let path = data_dir.join(format!("{bucket}.json"));
+        if !path.exists() {
+            continue;
+        }
+
+        let raw = fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read bucket {bucket}: {e}"))?;
+           
+        let mut payload: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("failed to parse bucket {bucket}: {e}"))?;
+
+        if let Some(actions) = payload.get_mut("actions").and_then(|a| a.as_array_mut()) {
+            for action in actions {
+                if action.get("id").and_then(|id| id.as_str()) == Some(&action_id) {
+                    action["approval_status"] = serde_json::Value::String(status.clone());
+                    action["updated_at"] = serde_json::Value::String(
+                        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+                       );
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        if found {
+            let updated_raw = serde_json::to_string_pretty(&payload)
+                .map_err(|e| format!("failed to serialize updated bucket {bucket}: {e}"))?;
+               fs::write(&path, updated_raw)
+                .map_err(|e| format!("failed to write updated bucket {bucket}: {e}"))?;
+            break;
+        }
+    }
+
+    if !found {
+        return Err(format!("Action with ID '{}' not found in any bucket.", action_id));
+    }
+
+       // Run a sync to regenerate notifications/alerts automatically and emit the new alerts
+    let _ = sync_action_registry(app, db);
+
+    Ok(true)
+}

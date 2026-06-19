@@ -1,0 +1,19 @@
+[build-system]
+
+requires = ["setuptools>=68"]
+
+build-backend = "setuptools.build_meta"
+
+
+
+[project]
+name = "action-registry-workspace"
+version = "0.2.0"
+description = "Bootstrap workspace for a unified cross-project action registry"
+requires-python = ">=3.11"
+    10|
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+action-registry = "action_registry.cli:main"

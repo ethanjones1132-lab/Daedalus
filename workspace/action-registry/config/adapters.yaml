@@ -1,0 +1,15 @@
+paths:
+  home_base_root: /home/ethan/.openclaw/agents/coderclaw/workspace/home-base
+  snitch_root: /home/ethan/.openclaw/workspace/snitch-llc
+  jonesinsrc_root: /mnt/c/Users/ethan/OneDrive/Documents/JonesinSRC
+  prizepicks_root: /home/ethan/.openclaw/agents/coderclaw/workspace/prizepicks-monster
+
+enabled_adapters:
+  - jarvis
+  - jonesinsrc-website
+  - snitch-llc
+  - jonesinsrc-products
+
+sync:
+  missing_runs_threshold: 2
+  escalation_run_limit: 2

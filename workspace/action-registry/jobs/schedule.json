@@ -1,0 +1,57 @@
+{
+  "window": {
+    "start": "2026-06-17T03:36:00-04:00",
+    "end": "2026-06-17T10:00:00-04:00",
+    "executor": "cursor-agent",
+    "policy": "if-stuck-skip-to-next"
+  },
+  "jobs": [
+    {
+    10|      "id": "ar-job-1",
+      "name": "Adapters foundation",
+      "scheduled_at": "2026-06-17T03:40:00-04:00",
+      "status": "completed",
+      "scope": [
+        "jarvis adapter",
+        "jonesinsrc website adapter",
+        "snitch llc adapter",
+        "sync CLI",
+        "adapter tests"
+    20|      ]
+    },
+    {
+      "id": "ar-job-2",
+      "name": "JonesinSRC product adapters",
+      "scheduled_at": "2026-06-17T05:30:00-04:00",
+      "status": "completed",
+      "scope": [
+        "wallslayer adapter",
+        "prizepicks monster adapter",
+    30|        "kalshi monster adapter",
+        "ingest pipeline"
+      ]
+    },
+    {
+      "id": "ar-job-3",
+      "name": "Jarvis summary view",
+      "scheduled_at": "2026-06-17T07:30:00-04:00",
+      "status": "completed",
+      "scope": [
+    40|        "tauri action registry commands",
+        "ActionRegistryView UI tab",
+        "navigation wiring"
+      ]
+    },
+    {
+      "id": "ar-job-4",
+      "name": "Notifications and approval gating",
+      "scheduled_at": "2026-06-17T09:00:00-04:00",
+      "status": "completed",
+    50|      "scope": [
+        "notification refresh",
+        "approval gate helpers",
+        "jarvis toast alerts"
+      ]
+    }
+  ]
+}

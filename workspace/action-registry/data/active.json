@@ -1,0 +1,61 @@
+{
+  "bucket": "active",
+  "version": 1,
+  "actions": [
+    {
+      "id": "jonesinsrc-website-20260616-001",
+      "project": "jonesinsrc",
+      "source_system": "website-registry",
+      "source_area": "website",
+    10|      "priority": "P0",
+      "risk_level": "high",
+      "category": "web_registry",
+      "action_type": "website_track",
+      "title": "JonesinSRC website track",
+      "description": "Canonical registry entry for the JonesinSRC website so storefront trust, lead capture, funnel truth, and conversion work attach to one stable surface instead of scattering across theme edits and chat notes.",
+      "acceptance_criteria": [
+        "Registry record preserves the website identity, directory, and temporary domain context",
+        "Future funnel, contact, and checkout actions can reference the website slug",
+        "Current trust-signal and lead-capture improvements are preserved in evidence"
+    20|      ],
+      "dependencies": [],
+      "status": "open",
+      "owner": "shared",
+      "approval_required": false,
+      "next_due": "2026-06-16T18:00:00",
+      "created_at": "2026-06-16T13:54:49",
+      "updated_at": "2026-06-16T13:54:49",
+      "surface_name": "JonesinSRC website",
+      "surface_slug": "jonesinsrc-website",
+    30|      "surface_type": "shopify_portfolio_store",
+      "temporary_domain": "coppercreekcoffee.myshopify.com",
+      "lifecycle_stage": "live",
+      "evidence": [
+        {
+          "kind": "repo",
+          "value": "C:/Users/ethan/OneDrive/Documents/JonesinSRC"
+        },
+        {
+          "kind": "context",
+    40|          "value": "Trust signals and a lead-capture form were added to the site, but WallSlayer is still live with zero sales so the website remains a primary conversion surface."
+        }
+      ]
+    },
+    {
+      "id": "jonesinsrc-wallslayer-20260616-001",
+      "project": "jonesinsrc",
+      "source_system": "product-registry",
+      "source_area": "wallslayer",
+      "priority": "P0",
+    50|      "risk_level": "high",
+      "category": "product_registry",
+      "action_type": "product_track",
+      "title": "WallSlayer product track",
+      "description": "Canonical registry entry for WallSlayer so storefront, pricing, support, and zero-sales diagnostics can attach to one stable product record.",
+      "acceptance_criteria": [
+        "Registry record preserves product identity, price path, and delivery model",
+        "Future storefront and funnel actions can reference the product slug",
+        "Current live-zero-sales context is preserved in evidence"
+      ],
+    60|      "dependencies": [],
+... 454 lines not shown ...

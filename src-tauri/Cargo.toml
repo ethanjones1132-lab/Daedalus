@@ -1,0 +1,42 @@
+[package]
+name = "home-base"
+version = "0.1.0"
+description = "Home Base — OpenClaw agent command center"
+authors = ["Ethan"]
+license = "MIT"
+edition = "2021"
+rust-version = "1.85.0"
+
+[lib]
+name = "home_base_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.1", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.11.1", features = [] }
+tauri-plugin-log = "2"
+tauri-plugin-shell = "2"
+
+# tokio for async task spawning (used for parallel WSL CLI calls)
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# --- Restored dependencies (derived from actual `use` sites in src-tauri/src; see RECOVERY_STATUS.md) ---
+# SQLite-backed native command surface (sessions, memory, cron, agents, ...)
+rusqlite = { version = "0.32", features = ["bundled"] }
+# HTTP to Ollama / OpenRouter / claude_cli_proxy — both async Client and blocking are used
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+# Timestamps on sessions/messages/memory/cron, serialized via serde
+chrono = { version = "0.4", features = ["serde"] }
+# IDs for sessions, messages, agents
+uuid = { version = "1", features = ["v4", "serde"] }
+# adapters.yaml / config parsing
+serde_yaml = "0.9"
+# typed error enums
+thiserror = "1"
+# cron expression parsing for the cron scheduler (src/cron_scheduler.rs: `use cron::Schedule;`)
+cron = "0.12"

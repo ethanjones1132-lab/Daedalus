@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "updated_at": "2026-06-17T07:14:02",
+  "alerts": [
+    {
+      "id": "approval-home-base-stale-binary-20260617",
+      "kind": "approval_required",
+      "severity": "medium",
+      "title": "Rebuild stale Jarvis binary before release",
+    10|      "message": "This action requires user approval before side effects can run.",
+      "action_id": "home-base-stale-binary-20260617",
+      "bucket": "active",
+      "created_at": "2026-06-17T07:14:02"
+    },
+    {
+      "id": "approval-jonesinsrc-wallslayer-20260617",
+      "kind": "approval_required",
+      "severity": "medium",
+      "title": "WallSlayer zero-sales funnel diagnostic",
+    20|      "message": "This action requires user approval before side effects can run.",
+      "action_id": "jonesinsrc-wallslayer-20260617",
+      "bucket": "active",
+      "created_at": "2026-06-17T07:14:02"
+    },
+    {
+      "id": "approval-summary-2026-06-17T07:14:02",
+      "kind": "approval_summary",
+      "severity": "medium",
+      "title": "Actions awaiting approval",
+    30|      "message": "2 action(s) require approval before execution.",
+      "count": 2,
+      "created_at": "2026-06-17T07:14:02"
+    }
+  ]
+}
