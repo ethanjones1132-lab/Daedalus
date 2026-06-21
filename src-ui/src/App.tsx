@@ -37,6 +37,13 @@ import ChannelsView from './components/jarvis/ChannelsView';
 import CronView from './components/jarvis/CronView';
 import AgentsView from './components/jarvis/AgentsView';
 import ActionRegistryView from './components/jarvis/ActionRegistryView';
+import DevicesView from './components/jarvis/DevicesView';
+import NodesView from './components/jarvis/NodesView';
+import HooksView from './components/jarvis/HooksView';
+import CommitmentsView from './components/jarvis/CommitmentsView';
+import ApprovalsView from './components/jarvis/ApprovalsView';
+import PluginsView from './components/jarvis/PluginsView';
+import GatewayView from './components/jarvis/GatewayView';
 
 const APP_VERSION = '3.0.0';
 
@@ -56,6 +63,18 @@ const NAV_SECTIONS: NavSection[] = [
       { id: 'control', label: 'Control', icon: 'G' },
       { id: 'models', label: 'Models', icon: 'M' },
       { id: 'memory', label: 'Memory', icon: 'R' },
+    ],
+  },
+  {
+    title: 'INFRASTRUCTURE',
+    items: [
+      { id: 'approvals', label: 'Approvals', icon: 'P' },
+      { id: 'commitments', label: 'Commitments', icon: 'C' },
+      { id: 'hooks', label: 'Hooks', icon: 'H' },
+      { id: 'devices', label: 'Devices', icon: 'D' },
+      { id: 'nodes', label: 'Nodes', icon: 'N' },
+      { id: 'plugins', label: 'Plugins', icon: 'X' },
+      { id: 'gateway', label: 'Gateway', icon: 'W' },
     ],
   },
   {
@@ -639,7 +658,6 @@ function AppInner() {
       case 'sessions': return <SessionsView />;
       case 'models':
       case 'config':
-      case 'gateway':
       case 'health':
       case 'jarvis-config':
       case 'jarvis-status':
@@ -650,6 +668,13 @@ function AppInner() {
       case 'skills': return <SkillsView />;
       case 'agents': return <AgentsView />;
       case 'channels': return <ChannelsView />;
+      case 'devices': return <ErrorBoundary><DevicesView /></ErrorBoundary>;
+      case 'nodes': return <ErrorBoundary><NodesView /></ErrorBoundary>;
+      case 'hooks': return <ErrorBoundary><HooksView /></ErrorBoundary>;
+      case 'commitments': return <ErrorBoundary><CommitmentsView /></ErrorBoundary>;
+      case 'approvals': return <ErrorBoundary><ApprovalsView /></ErrorBoundary>;
+      case 'plugins': return <ErrorBoundary><PluginsView /></ErrorBoundary>;
+      case 'gateway': return <ErrorBoundary><GatewayView /></ErrorBoundary>;
       default: return <OverviewView />;
     }
   };
