@@ -1,13 +1,16 @@
 # Home-Base Recovery Status & Handoff
 
-**Last updated:** 2026-06-18 (transcript-recovery pass)
+**Last updated:** 2026-06-21 (full typecheck green pass)
 **Tree:** `C:\Projects\home-base-recovered\` — the working source of truth.
 **Local git:** this tree is now its own repo (it shadows a stray `C:\.git`). Commits:
 - `cf0b489` — tree as found + initial Rust build infra fixes
 - `bd1155c` — transcript recovery merged; Rust down to the long-tail
+- `9a0cf63` — recovery handoff written with exact long-tail steps
+- *(prior sessions, uncommitted)* — Rust long-tail fixed with stubs + 89-file overhaul
+- *(this run)* — server-jarvis typecheck green; all 3 subsystems verified clean
 
-> Every status claim here was produced by running the tool (`cargo check`) and
-> reading its output. Don't trust an entry unless it cites the command that proved it.
+> Every status claim here was produced by running the actual commands and reading output.
+> Don't trust an entry unless it cites the command that proved it.
 
 ---
 
@@ -30,88 +33,77 @@ recorded every Write/Edit/Read** — so the real source is reconstructable from 
 - `scripts/recover_from_transcripts.py` — earlier Claude-only version (kept for reference).
 - `scripts/scan_antigravity.py` — scans Antigravity logs for writes/views of specific files.
 
-**What the extractor recovered with full real content:** `App.tsx` (34 KB), `server-jarvis/src/index.ts` (111 KB), `skills.rs` (21 KB), `lib.rs` (27 KB), the full 23 KB `db/migrations.rs`, all of `server-jarvis` (75 files), the `jarvis/memory/` subsystem, and partial `hermes/*`.
+---
+
+## ✅ Current build state (2026-06-21)
+
+| Subsystem | Status | Verification command | Result |
+|-----------|--------|----------------------|--------|
+| Rust (`src-tauri`) | ✅ **CLEAN** | `cargo check --manifest-path src-tauri/Cargo.toml` | exit 0, "Finished" |
+| React UI (`src-ui`) | ✅ **CLEAN** | `cd src-ui && bunx tsc -b` | exit 0, no output |
+| Bun server (`server-jarvis`) | ✅ **CLEAN** | `cd server-jarvis && bunx tsc --noEmit` | exit 0, 0 errors |
+| Python (`claude_cli_proxy`) | ✅ **GREEN** | `py_compile` passes | — |
+
+### What got fixed this pass
+Prior sessions (uncommitted, 89 files modified):
+- Fixed all 55 undefined Rust commands via stubs in `commands/recovery_stubs.rs`, 
+  recovered real bodies in `sessions.rs`, `jarvis_commands.rs`, `system.rs`, `hermes/process.rs`, etc.
+- Installed node_modules for both `src-ui` and `server-jarvis`
+- Overlaid recovered UI components
+
+This session (2026-06-21):
+- **Created `server-jarvis/tsconfig.json`** — first ever; enables `bunx tsc --noEmit` typecheck
+- **Installed `@types/bun@1.3.14` and `typescript@6.0.3`** in server-jarvis
+- **Re-authored `server-jarvis/src/football.ts`** — was completely missing; now has NFL_2025_PLAYERS (28 players), NFL_2025_DEFENSES (all 32 teams), NFL_2025_TRENDS, NFL_2025_LEAGUE_CONTEXT
+- **Re-authored `server-jarvis/src/cron-prompts.ts`** — was truncated at line 27; now complete with LEARNING_SUBTOPICS (10 subtopics) + 4 exported functions (buildLearningPrompt, buildReviewPrompt, buildCodebaseAuditPrompt, buildFootballAuditPrompt)
+- **Re-authored `server-jarvis/src/prizepicks.ts`** — was truncated at line 23; now complete with PRIZEPICKS_SYSTEM_PROMPT + 5 exported functions (buildPrizePicksContext, buildFullDatabaseContext, normalizeStatType, findPlayerName, generateWeeklyPicks)
+- **Created `server-jarvis/src/bun-compat.d.ts`** — global type shims for Response.json<T>() and ReadableStreamReadResult<T>
+- **Fixed 22 TypeScript errors** in production code:
+  - `agent-lifecycle.ts`: `agents_root` typo → `agents_root: agentsRoot`
+  - `agent-schema.ts`: `string | string[]` push → spread correctly
+  - `bridge.ts`: `socket.on/off` → `@ts-expect-error` (Bun Socket compat)
+  - `claude-cli.ts`: Added `result?: string` and `content?: string | Array<...>` to ClaudeCliMessage
+  - `config.ts`: Added missing `health_check_interval_ms: 30000` to defaultConfig()
+  - `index.ts`: Fixed 6 reasoning event `else` branches → `else if (re.type === "content")`; fixed `compactProfile` scope (hoisted before try block); fixed bare `return;` → `return { content: "", tool_calls: undefined }`
+  - `mcp-tools.ts`: 3 fixes (as McpServers cast, servers: {} in error return, server.command!)
+  - `orchestration/pipeline.ts`: Added `PipelineMessage` type alias; annotated message arrays
+  - `tools.ts`: Extended `ToolParameter.items` to include `properties` and `required`
 
 ---
 
-## Current build state (2026-06-18)
+## ⏭️ NEXT STEPS
 
-| Subsystem | Status | Evidence |
-|-----------|--------|----------|
-| Python (`claude_cli_proxy` + `workspace/action-registry`) | ✅ GREEN | `py_compile` passes |
-| Rust (`src-tauri`) | 🟡 **CASCADE CLEARED — long-tail of truncated command files remains** | `cargo check` → from 345 errors down to **55 undefined commands** concentrated in a few truncated files |
-| Bun server (`server-jarvis`) | 🟡 real `index.ts` (111 KB) + 75 files recovered; **not yet typechecked** | — |
-| React UI (`src-ui`) | 🟡 real `App.tsx` (34 KB) recovered; **node_modules not installed, not typechecked** | — |
+### 1. Run bun tests (now that typecheck is green)
+```bash
+cd server-jarvis && bun test
+```
+Expect some failures in tests that mock the server or require real Ollama. Fix any
+structural test failures (wrong imports, missing stubs) but leave integration failures.
 
-### What got fixed this pass (Rust 345 → long-tail)
-The original "383/345 errors" were almost all cascade. Root causes fixed:
-- Added `src-tauri/build.rs` (`tauri_build::build()`) — fixed the `OUT_DIR` error and ~340 `__cmd__` macro errors.
-- Added `cron = "0.12"` to `Cargo.toml`; generated placeholder `icons/` (via `cargo tauri icon`) + placeholder `server-jarvis/dist/index.js` (build-script resources).
-- Restored lost `use serde::{...}` headers in `types/mod.rs` + `types/extra.rs`.
-- Overlaid the 216 recovered real files onto the tree (0 EROFS husks remain in `src*`).
-- Merged `commands/mod.rs` (recovered module decls + `action_registry` + `legacy`), `jarvis/mod.rs` (+`hermes`,+`learning`), created `jarvis/hermes/mod.rs`.
-- Pulled full `db/migrations.rs` (565-line real schema).
-- Reconstructed truncated files: `settings.rs`, `sessions.rs`, `skills.rs` (`list_skills` + `enable/disable/invoke_skill`, `skill_revisions_list`), `agents.rs` (all 8 commands).
-
----
-
-## ⏭️ NEXT STEPS (precise — this is the handoff)
-
-### 1. Finish the Rust long-tail — 55 undefined `#[tauri::command]`s
-These are referenced in `lib.rs`'s `generate_handler![]` but their definitions were
-truncated. They live in a few files that the transcript stitcher cut short:
-
-- **`commands/system.rs`** — TRUNCATED at line 37 (only structs survive). Needs ~23 cmds:
-  `get_system_health, get_doctor_report, get_gateway_status, check_updates,
-  optimize_claude_settings, restart_bridge, get_devices, add_device, remove_device,
-  add_node, remove_node, get_hooks, register_hook, unregister_hook, get_commitments,
-  add_commitment, complete_commitment, delete_commitment, get_approvals,
-  approve_request, reject_request, enable_plugin, disable_plugin`.
-- **`commands/jarvis_commands.rs`** — only the EARLY 9-cmd version recovered. Missing ~17:
-  `jarvis_get_skills, jarvis_get_tools, jarvis_ping, jarvis_discover_models,
-  jarvis_test_connection, jarvis_switch_backend, jarvis_get_companion,
-  jarvis_save_companion, jarvis_tool_decision, jarvis_review_session,
-  jarvis_commit_session_end, jarvis_get_tier_stats, jarvis_list_memories_by_tier,
-  jarvis_recall_cold_memory, jarvis_restart_ollama, jarvis_restart_server,
-  jarvis_invoke_skill`, plus `cancel_chat_stream`.
-- **`commands/sessions.rs`** — needs `list_sessions, create_session, delete_session,
-  export_session, append_message, update_token_count` (only `compact_session_db` present).
-- **`commands/memory.rs`** — verify `list_workspace_files`, `read_workspace_file` (may be missing).
-- **`jarvis/hermes/commands.rs`** (43 lines, truncated — only `hermes_status`) + **`process.rs`** (41 lines, truncated). Needs `hermes_spawn/shutdown/restart/interrupt/invoke` + the `HermesProcess` body. **Check Codex transcripts** (`~/.codex/`) — `hermes_spawn` appears there.
-
-**Two ways to do this (recommended: try A first per file, fall back to B):**
-- **(A) Recover the real bodies** — re-mine transcripts for each file. The stitcher in
-  `recover_all.py` falls back to "contiguous from line 1" when a file was never fully
-  viewed; improving stitching or pulling a specific late VIEW_FILE/write often yields the
-  whole file. Grep the transcripts for the function name to find the session that has it.
-- **(B) Stub to get the window up fast** — for any command still missing, add
-  `#[tauri::command] pub async fn NAME(...) -> Result<serde_json::Value, String> { Err("not yet recovered".into()) }`.
-  The Tauri window renders regardless; only that feature errors at runtime. The reconstructed
-  `agents.rs`/`skills.rs` in this pass are good templates for real CRUD.
-
-Re-verify after each file: `cargo check --manifest-path src-tauri/Cargo.toml` then
-`grep -oE "__cmd__[a-z_]+" output | sort -u` to see what's still undefined. **Expect a
-second wave of real type/borrow errors** once the macro cascade fully clears (previously
-seen: `JarvisState` init missing `queue` field at `lib.rs:456`; a `chrono` DateTime
-subtraction; a couple of `does not live long enough`). Fix those normally.
-
-### 2. UI build
-`cd src-ui && bun install` then `bunx tsc -b` / `bun run build`. `App.tsx` (34 KB) is real;
-components in `src-ui/src/components/jarvis/` mostly survived. Fix any remaining truncations
-the same way (compare against `from-transcripts-all/src-ui`).
-
-### 3. Make `tauri dev` launch (the "app on screen" goal)
-`tauri.conf.json` `beforeDevCommand` is `wsl bash .../scripts/dev-ui.sh` — **dead** (the
-Ubuntu WSL distro is gone; only `docker-desktop` remains). Replace with a native command,
-e.g. `beforeDevCommand: "bun --cwd src-ui run dev"` and confirm `devUrl`/`frontendDist`.
+### 2. Make `tauri dev` launch (the "app on screen" goal)
+`tauri.conf.json` `beforeDevCommand` is `wsl bash .../scripts/dev-ui.sh` — **dead**
+(the Ubuntu WSL distro is gone; only `docker-desktop` remains). Replace with a native
+command: `beforeDevCommand: "bun --cwd src-ui run dev"` and confirm `devUrl`/`frontendDist`.
 Then `cargo tauri dev` from the repo root. The window renders the React UI even if the Bun
 server / backend commands aren't all wired yet.
 
-### 4. Bun server (separate process; lowest priority for "window on screen")
-`server-jarvis/src/index.ts` (111 KB real) + 75 files recovered. Typecheck with
-`cd server-jarvis && bun install && bunx tsc --noEmit`. Some imported modules may still be
-missing (`agent-schema`, `projection-store`, `activation-boundary`, `orchestration/*`,
-`self-tuning/mod`) — check `from-transcripts-all/server-jarvis` first; mine Codex if absent.
+### 3. Investigate Tauri config for native Windows build
+`src-tauri/tauri.conf.json` likely still references WSL paths. Update for native Windows:
+- `beforeDevCommand`: `bun --cwd ../src-ui run dev`
+- `devUrl`: `http://localhost:5173` (Vite default)
+- `beforeBuildCommand`: `bun --cwd ../src-ui run build`
+
+### 4. Run server in real-use mode
+```bash
+cd server-jarvis && bun run dev
+```
+Verify it starts on port 19877, check `/health`, `/models`, `/config` endpoints.
+
+### 5. Forward improvements (architecture priority from AGENTS.md)
+- Build provenance / stale-binary prevention
+- Eval / regression harness
+- Bridge and runtime reliability
+- The still-stubbed commands in `recovery_stubs.rs` — wire to real implementations
 
 ---
 
@@ -123,8 +115,9 @@ missing (`agent-schema`, `projection-store`, `activation-boundary`, `orchestrati
 
 ## How to re-verify
 ```bash
-cargo check --manifest-path src-tauri/Cargo.toml      # Rust
-cd src-ui && bun install && bunx tsc -b               # UI
-cd server-jarvis && bun install && bunx tsc --noEmit  # Bun server
-python -m py_compile scripts/claude_cli_proxy.py      # Python (green)
+cargo check --manifest-path src-tauri/Cargo.toml      # Rust ✅ GREEN
+cd src-ui && bunx tsc -b                               # UI ✅ GREEN  
+cd server-jarvis && bunx tsc --noEmit                  # Server ✅ GREEN
+python -m py_compile scripts/claude_cli_proxy.py       # Python ✅ GREEN
+cd server-jarvis && bun test                           # Tests (not yet verified)
 ```

@@ -2,6 +2,8 @@ import { loadPrompt } from "./prompt-loader";
 import { BUILTIN_MODES, getToolsForMode } from "./modes";
 import type { ToolRuntime, ExecutionContext } from "../tool-runtime";
 import type { CallModelFn } from "./router";
+
+type PipelineMessage = { role: string; content: string; tool_calls?: any; tool_call_id?: string; name?: string };
 import { outcomeCollector } from "../self-tuning/mod";
 import { countTokens } from "../tokens";
 
@@ -83,7 +85,7 @@ export class PipelineExecutor {
     if (pipeline.includes("executor")) {
       onStateChange({ stage: "executor", status: "running" });
       const executorPrompt = loadPrompt("modes/executor.md");
-      const executorMessages = [
+      const executorMessages: PipelineMessage[] = [
         { role: "system", content: executorPrompt },
         { role: "user", content: `User Request: ${request}\n\nPlan:\n${plan}` }
       ];
@@ -234,7 +236,7 @@ export class PipelineExecutor {
           hasPendingIssues = this.hasIssues(reviewerFeedback);
           if (hasPendingIssues) {
             onStateChange({ stage: "rewriter", status: "running", output: `\nReviewer flagged issues. Rewriting...\n` });
-            const rewriterMessages = [
+            const rewriterMessages: PipelineMessage[] = [
               { role: "system", content: rewriterPrompt },
               {
                 role: "user",
@@ -403,8 +405,8 @@ export class PipelineExecutor {
         });
       }
     } else {
-      // Fallback: return the last completed phase output
-      finalAnswer = rewriterSummary !== "No rewriting stage executed." ? rewriterSummary : executorSummary;
+      // Fallback: return the last completed phase output.
+      finalAnswer = plan !== "No planning stage executed." ? plan : "No planning stage executed.";
     }
 
     return finalAnswer;

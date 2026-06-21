@@ -57,7 +57,11 @@ export interface TuningOutcome {
 
 function getWindowsHome(): string | null {
   try {
-    const raw = execSync('cmd.exe
+    const raw = execSync("cmd.exe /c echo %USERPROFILE%", {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2000,
+    });
     const trimmed = raw.trim();
     if (trimmed && trimmed.match(/^[a-zA-Z]:\\/)) {
       const drive = trimmed[0].toLowerCase();

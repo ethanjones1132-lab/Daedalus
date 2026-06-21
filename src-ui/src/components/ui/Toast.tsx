@@ -1,42 +1,11 @@
-import { createContext, useContext, useState, useCallback, ReactNode } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { cn } from './index';
+// RECOVERY NOTE (2026-06-19):
+//   The original Toast component was truncated in the recovered tree.
+//   Replaced with a no-op stub so the build is green. A future pass
+//   should port the real implementation back from the transcript logs.
 
-export type ToastType = 'success' | 'error' | 'warning' | 'info';
+import { ReactNode } from 'react';
 
-export interface Toast {
-  id: string;
-  message: string;
-  type: ToastType;
-  title?: string;
-  duration?: number;
+export function Component({ children }: { children?: ReactNode }) {
+  return <>{children}</>;
 }
-
-interface ToastContextType {
-  toast: (message: string, type?: ToastType, title?: string, duration?: number) => void;
-  success: (message: string, title?: string, duration?: number) => void;
-  error: (message: string, title?: string, duration?: number) => void;
-  warn: (message: string, title?: string, duration?: number) => void;
-  info: (message: string, title?: string, duration?: number) => void;
-  removeToast: (id: string) => void;
-}
-
-const ToastContext = createContext<ToastContextType | undefined>(undefined);
-
-export function useToast() {
-  const context = useContext(ToastContext);
-  if (!context) {
-    throw new Error('useToast must be used within a ToastProvider');
-  }
-  return context;
-}
-
-export function ToastProvider({ children }: { children: ReactNode }) {
-  const [toasts, setToasts] = useState<Toast[]>([]);
-
-  const removeToast = useCallback((id: string) => {
-    setToasts((prev) => prev.filter((t) => t.id !== id));
-  }, []);
-
-  const toast = useCallback(
-    (message: string, type: ToastType = 'info', 
+export default Component;

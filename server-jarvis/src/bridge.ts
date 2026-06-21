@@ -58,6 +58,7 @@ try {
           // If the TCP socket closes (client disconnect), abort the upstream fetch.
           // (socket "close" fires for both clean and abrupt closes.)
           const onSocketClose = () => { try { upstreamAbort.abort(); } catch {} };
+          // @ts-expect-error Bun Socket types don't expose .on() but it works at runtime
           socket.on("close", onSocketClose);
 
           fetch(`${JARVIS_API}/chat/stream`, {
@@ -103,6 +104,7 @@ try {
             try { socket.write(JSON.stringify({ error: safeErrorMessage(e), session_id: session }) + "\n"); } catch {}
           }).finally(() => {
             // Clean up the close listener.
+            // @ts-expect-error Bun Socket types don't expose .off() but it works at runtime
             try { socket.off("close", onSocketClose); } catch {}
           });
 

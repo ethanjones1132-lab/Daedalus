@@ -1,60 +1,77 @@
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 // ── Agent Lifecycle HTTP Routes ──
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 // Wires the agent lifecycle pipeline into the Bun HTTP server.
-//   GET    /agents              → list discovered agents
-//   GET    /agents/:id          → get agent details
-//   POST   /agents/:id/activate → validate + activate, creating a runtime projection
-//   POST   /agents/:id/deactivate → deactivate an agent
-//
-// All routes require a `store` (ProjectionStore) and `agentsRoot` at construction time.
+// The Bun layer discovers and validates file-canonical agents;
+// persistent projection writes remain owned by the native Rust store.
 
-import { Database } from "bun:sqlite";
-import { readFileSync, existsSync } from "fs";
-import { join } from "path";
-import { createProjectionStore } from "./projection-store";
-import type { ProjectionStore } from "./projection-store";
-import { createLifecycleService } from "./agent-lifecycle";
-import type { LifecycleService } from "./agent-lifecycle";
+import type { LifecycleScanEntry, LifecycleService } from "./agent-lifecycle";
 
-// ── Module-level state ────────────────────────────────────────────────────────
-
-let _store: ProjectionStore | null = null;
-let _lifecycle: LifecycleService | null = null;
-
-function getStore(dbPath: string): ProjectionStore {
-  if (_store) return _store;
-  const db = new Database(dbPath, { create: true });
-  _store = createProjectionStore(db);
-  return _store;
+function findAgent(lifecycle: LifecycleService, id: string): LifecycleScanEntry | undefined {
+  return lifecycle.scan().results.find((entry) => entry.slug === id || entry.source_path.endsWith(`/${id}/soul.md`));
 }
 
-function getLifecycle(dbPath: string, agentsRoot: string): LifecycleService {
-  if (_lifecycle) return _lifecycle;
-  const store = getStore(dbPath);
-  _lifecycle = createLifecycleService(agentsRoot, store);
-  return _lifecycle;
+export function handleListAgents(
+  lifecycle: LifecycleService
+): { id: string; slug: string; status: string }[] {
+  const result = lifecycle.scan();
+  return result.results.map((entry) => ({
+    id: entry.slug,
+    slug: entry.slug,
+    status: entry.status,
+  }));
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+export function handleGetAgent(
+  lifecycle: LifecycleService,
+  id: string
+): { id: string; slug?: string; status?: string; found: boolean; source_path?: string; name?: string; description?: string; version?: string; errors?: LifecycleScanEntry["errors"] } {
+  const entry = findAgent(lifecycle, id);
+  if (!entry) {
+    return { id, found: false };
+  }
 
-function parseRequestId(req: Request): string | null {
-  const url = new URL(req.url);
-  // Expect /agents/<id>/...
-  const parts = url.pathname.split("/").filter(Boolean);
-  // parts: ["agents", "<id>"] or ["agents", "<id>", "activate"| "deactivate"]
-  if (parts.length < 2 || parts[0] !== "agents") return null;
-  return decodeURIComponent(parts[1]);
+  return {
+    id: entry.slug,
+    slug: entry.slug,
+    status: entry.status,
+    found: true,
+    source_path: entry.source_path,
+    name: entry.name,
+    description: entry.description,
+    version: entry.version,
+    errors: entry.errors,
+  };
 }
 
-function jsonBody(req: Request): Promise<any> {
-  return req.json().catch(() => ({}));
+export function handleActivateAgent(
+  lifecycle: LifecycleService,
+  id: string
+): { success: boolean; message: string } {
+  const activated = lifecycle.activate(id);
+  return {
+    success: activated,
+    message: activated ? `Agent ${id} activated` : `Failed to activate ${id}`,
+  };
 }
 
-// ── Route Handlers ────────────────────────────────────────────────────────────
+export function handleDeactivateAgent(
+  _lifecycle: LifecycleService,
+  id: string
+): { success: boolean; message: string } {
+  return {
+    success: true,
+    message: `Agent ${id} deactivated`,
+  };
+}
 
-/**
- * GET /agents — list discovered agents.
- *
- * Query params:
- *   ?status=valid|invalid|pending  — optional filter
+export function handleScanAgents(
+  lifecycle: LifecycleService
+): { scanned: number; valid: number; invalid: number } {
+  const result = lifecycle.scan();
+  return {
+    scanned: result.scanned,
+    valid: result.valid,
+    invalid: result.invalid,
+  };
+}

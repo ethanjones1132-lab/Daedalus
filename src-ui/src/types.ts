@@ -3,7 +3,7 @@ export type ViewId =
   | 'usage' | 'cron' | 'agents' | 'skills' | 'nodes'
   | 'models' | 'control' | 'config' | 'logs' | 'hooks' | 'commitments' | 'devices'
   | 'approvals' | 'gateway' | 'doctor' | 'health' | 'plugins'
-  | 'memory'
+  | 'memory' | 'action-registry'
   | 'jarvis-hub' | 'jarvis-chat' | 'jarvis-sessions' | 'jarvis-skills'
   | 'jarvis-tools' | 'jarvis-companion' | 'jarvis-config' | 'jarvis-status';
 

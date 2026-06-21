@@ -35,6 +35,7 @@ impl HermesAppState {
         // Subscribe before start so we don't miss early events.
         let mut sub = proc.subscribe_events();
         let app_clone = app.clone();
+        let proc = std::sync::Arc::new(proc);
         tokio::spawn(async move {
             while let Ok(ev) = sub.recv().await {
                 let payload = serde_json::json!({

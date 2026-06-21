@@ -160,3 +160,120 @@ pub fn jarvis_api_candidates() -> Vec<String> {
     candidates.dedup();
     candidates
 }
+
+// ── Helper functions added in recovery (2026-06-19) ──────────────
+//
+// These three helpers are referenced by jarvis/mod.rs, jarvis/runner.rs,
+// commands/system.rs, and commands/legacy.rs. The recovered tree
+// referenced them but their definitions were lost in the snapshot.
+// The bodies are deliberately conservative: they only call `wsl.exe` on
+// Windows and fall back to plain `Command` on Linux/macOS.
+
+/// Resolve the WSL home directory (`/home/<user>`). On non-Windows targets
+/// this returns the value of `$HOME` directly. Used everywhere the app
+/// needs to construct paths under JARVIS_HOME.
+pub fn wsl_home() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        // `wsl.exe -- bash -lc 'echo $HOME'` is the most reliable source
+        // because the user's actual Linux home may differ from the Windows
+        // `%USERPROFILE%`.
+        let mut cmd = Command::new("wsl.exe");
+        cmd.args(["--", "bash", "-lc", "echo -n $HOME"]);
+        hide_windows_console(&mut cmd);
+        if let Some(out) = command_output_timeout(cmd, Duration::from_secs(5)) {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !s.is_empty() {
+                    return s;
+                }
+            }
+        }
+        // Fallback to USERPROFILE/HOME
+        std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_else(|_| r"C:\Users\ethan".to_string())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var("HOME").unwrap_or_else(|_| "/home/ethan".to_string())
+    }
+}
+
+/// Run an openclaw CLI subcommand and return its stdout. On Windows, this
+/// shells out via `wsl.exe -- bash -lc '<args joined>'`. On non-Windows
+/// platforms it executes the binary directly. Returns Err if the process
+/// fails to start or exits non-zero.
+pub fn wsl_openclaw(args: &[&str]) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let joined = shlex_join(args);
+        let mut cmd = Command::new("wsl.exe");
+        cmd.args(["--", "bash", "-lc", &format!("openclaw {joined}")]);
+        hide_windows_console(&mut cmd);
+        let out = command_output_timeout(cmd, Duration::from_secs(30))
+            .ok_or_else(|| "openclaw invocation timed out or failed to spawn".to_string())?;
+        if !out.status.success() {
+            return Err(format!(
+                "openclaw failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut cmd = Command::new("openclaw");
+        cmd.args(args);
+        let out = cmd
+            .output()
+            .map_err(|e| format!("Failed to spawn openclaw: {}", e))?;
+        if !out.status.success() {
+            return Err(format!(
+                "openclaw failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+}
+
+/// Read a file under the WSL filesystem and return its contents. The path
+/// is interpreted as a WSL path on Windows; on non-Windows it is read
+/// directly via `std::fs`.
+pub fn wsl_read_file(path: &str) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = Command::new("wsl.exe");
+        cmd.args(["--", "cat", path]);
+        hide_windows_console(&mut cmd);
+        let out = command_output_timeout(cmd, Duration::from_secs(10))
+            .ok_or_else(|| "wsl cat timed out or failed to spawn".to_string())?;
+        if !out.status.success() {
+            return Err(format!(
+                "wsl cat failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {}", path, e))
+    }
+}
+
+/// Tiny shlex join for the WSL passthrough. Quoting is deliberately
+/// minimal — the WSL openclaw invocation only ever receives safe args.
+fn shlex_join(args: &[&str]) -> String {
+    args.iter()
+        .map(|a| {
+            if a.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:".contains(c)) {
+                a.to_string()
+            } else {
+                format!("'{}'", a.replace('\'', "'\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}

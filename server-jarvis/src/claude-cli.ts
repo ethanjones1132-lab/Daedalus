@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════
 // ── Claude Code CLI Integration ──
-}
+// ═══════════════════════════════════════════════════════════════
 // Spawns the Claude Code CLI as a subprocess, captures streaming JSON output,
 // and bridges it into the Jarvis SSE event stream.
 
@@ -29,7 +29,7 @@ export function resolveClaudePath(configPath: string): string {
     return configPath;
   }
   const fallbacks = [
-    "/home/ethan/.nvm/versions/node/v2
+    "/home/ethan/.nvm/versions/node/v20/bin/claude",
     "/usr/local/bin/claude",
     "/usr/bin/claude",
   ];
@@ -104,7 +104,8 @@ export interface ClaudeCliRequest {
 
 export interface ClaudeCliMessage {
   type: string;
-  content?: string;
+  content?: string | Array<Record<string, unknown>>;
+  result?: string;
   delta?: { text: string };
   session_id?: string;
   usage?: { input_tokens: number; output_tokens: number };

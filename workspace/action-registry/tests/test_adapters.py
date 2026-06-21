@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -22,6 +23,51 @@ class AdapterTests(unittest.TestCase):
             ctx.home_base_root = str(root)
             actions = JarvisAdapter().collect(ctx)
             self.assertTrue(any(action["project"] == "home-base" for action in actions))
+
+    def test_jarvis_stale_binary_uses_newest_packaged_artifact(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "target" / "x86_64-pc-windows-gnu" / "release" / "home-base.exe"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("binary\n", encoding="utf-8")
+            old_source = root / "src-tauri" / "src" / "lib.rs"
+            old_source.parent.mkdir(parents=True)
+            old_source.write_text("old\n", encoding="utf-8")
+            new_artifact = root / "server-jarvis" / "dist" / "index.js"
+            new_artifact.parent.mkdir(parents=True)
+            new_artifact.write_text("new\n", encoding="utf-8")
+
+            os.utime(binary, (100, 100))
+            os.utime(old_source, (101, 101))
+            os.utime(new_artifact, (200, 200))
+
+            ctx = default_context(root)
+            ctx.home_base_root = str(root)
+            actions = JarvisAdapter().collect(ctx)
+            stale = [action for action in actions if action["id"].startswith("home-base-stale-binary")]
+
+            self.assertEqual(len(stale), 1)
+            self.assertEqual(stale[0]["evidence"][1]["kind"], "newest_source")
+            self.assertEqual(stale[0]["evidence"][1]["value"], str(new_artifact))
+
+    def test_jarvis_stale_binary_not_emitted_when_binary_is_newer(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "target" / "x86_64-pc-windows-gnu" / "release" / "home-base.exe"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("binary\n", encoding="utf-8")
+            source = root / "src-ui" / "src" / "App.tsx"
+            source.parent.mkdir(parents=True)
+            source.write_text("old\n", encoding="utf-8")
+
+            os.utime(source, (100, 100))
+            os.utime(binary, (200, 200))
+
+            ctx = default_context(root)
+            ctx.home_base_root = str(root)
+            actions = JarvisAdapter().collect(ctx)
+
+            self.assertFalse(any(action["id"].startswith("home-base-stale-binary") for action in actions))
 
     def test_product_adapter_emits_three_products(self):
         actions = JonesinSrcProductsAdapter().collect(default_context())

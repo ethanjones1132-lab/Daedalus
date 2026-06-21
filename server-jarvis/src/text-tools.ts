@@ -134,6 +134,40 @@ export function hasExplicitWebSearchIntent(text: string): boolean {
   return /\b(?:web\s*search|search\s+(?:the\s+)?(?:web|internet)|browse\s+(?:the\s+)?(?:web|internet)|(?:internet|online)\s+search|look\s+(?:it|this|that|them)?\s*up\s+(?:online|on\s+the\s+web))\b/i.test(text);
 }
 
+export function hasLocalWorkspaceToolIntent(text: string): boolean {
+  const lower = text.toLowerCase();
+  if (/\b(?:web\s*search|search\s+(?:the\s+)?(?:web|internet)|browse|online|internet)\b/i.test(text)) {
+    return /\b(?:file|folder|directory|path|workspace|project|repo|codebase|src|package\.json|tsconfig\.json|README)\b/i.test(text);
+  }
+  if (/\b(?:read|write|edit|list|grep|find|search)\b/i.test(text)
+    && /\b(?:file|files|folder|directory|path|workspace|project|repo|codebase|src|package\.json|tsconfig\.json|README)\b/i.test(text)) {
+    return true;
+  }
+  if (/\b(?:run|execute|invoke|call)\s+(?:a\s+)?(?:command|shell|terminal|script|test|build)\b/i.test(text)) {
+    return true;
+  }
+  if (/(?:^|[\s(])(?:bash|shell|cmd|powershell|pwsh|node|npm|bun|cargo|pytest|git)\b/.test(lower)) {
+    return true;
+  }
+  return /(?:[\\/][\w.-]+|[A-Za-z]:[\\/])/.test(text);
+}
+
+export function isNativeToolProtocolUnsupportedError(status: number, body: string): boolean {
+  const text = `${status} ${body}`.toLowerCase();
+  return (status === 400 || status === 422)
+    && (
+      text.includes("tool")
+      && (
+        text.includes("does not support")
+        || text.includes("not support")
+        || text.includes("unsupported")
+        || text.includes("tool calls")
+        || text.includes("tool calls are")
+        || text.includes("tool_choice")
+      )
+    );
+}
+
 export function webSearchQueryFromPrompt(text: string): string {
   return text
     .replace(/^\s*please\b[:,]?\s*/i, "")

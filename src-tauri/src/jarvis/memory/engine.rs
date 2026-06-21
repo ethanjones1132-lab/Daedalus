@@ -122,10 +122,10 @@ pub fn list_memories(conn: &Connection) -> Result<Vec<MemoryEntry>, String> {
             memory_columns()
         ))
         .map_err(|e| e.to_string())?;
-    collect_memories(
-        stmt.query_map([], memory_from_row)
-            .map_err(|e| e.to_string())?,
-    )
+    let rows = stmt
+        .query_map([], memory_from_row)
+        .map_err(|e| e.to_string())?;
+    collect_memories(rows)
 }
 
 pub fn read_memory(conn: &Connection, id: &str) -> Result<MemoryEntry, String> {
@@ -278,13 +278,13 @@ pub fn search_memories(conn: &Connection, query: &str) -> Result<Vec<MemoryEntry
             memory_columns()
         ))
         .map_err(|e| e.to_string())?;
-    collect_memories(
-        stmt.query_map(
+    let rows = stmt
+        .query_map(
             params![&pattern, &pattern, &pattern, &pattern],
             memory_from_row,
         )
-        .map_err(|e| e.to_string())?,
-    )
+        .map_err(|e| e.to_string())?;
+    collect_memories(rows)
 }
 
 pub fn recall_memories(
@@ -1319,13 +1319,13 @@ fn fts_candidates(conn: &Connection, query: &str) -> Result<Vec<MemoryEntry>, St
             prefixed_memory_columns("m")
         ))
         .map_err(|e| e.to_string())?;
-    collect_memories(
-        stmt.query_map(
+    let rows = stmt
+        .query_map(
             params![expr, RECALL_CANDIDATE_LIMIT as i64],
             memory_from_row,
         )
-        .map_err(|e| e.to_string())?,
-    )
+        .map_err(|e| e.to_string())?;
+    collect_memories(rows)
 }
 
 fn like_candidates(conn: &Connection, query: &str) -> Result<Vec<MemoryEntry>, String> {
@@ -1343,8 +1343,8 @@ fn like_candidates(conn: &Connection, query: &str) -> Result<Vec<MemoryEntry>, S
             memory_columns()
         ))
         .map_err(|e| e.to_string())?;
-    collect_memories(
-        stmt.query_map(
+    let rows = stmt
+        .query_map(
             params![
                 &pattern,
                 &pattern,
@@ -1354,8 +1354,8 @@ fn like_candidates(conn: &Connection, query: &str) -> Result<Vec<MemoryEntry>, S
             ],
             memory_from_row,
         )
-        .map_err(|e| e.to_string())?,
-    )
+        .map_err(|e| e.to_string())?;
+    collect_memories(rows)
 }
 
 fn active_memories(conn: &Connection) -> Result<Vec<MemoryEntry>, String> {
@@ -1365,10 +1365,10 @@ fn active_memories(conn: &Connection) -> Result<Vec<MemoryEntry>, String> {
             memory_columns()
         ))
         .map_err(|e| e.to_string())?;
-    collect_memories(
-        stmt.query_map([RECALL_CANDIDATE_LIMIT as i64], memory_from_row)
-            .map_err(|e| e.to_string())?,
-    )
+    let rows = stmt
+        .query_map([RECALL_CANDIDATE_LIMIT as i64], memory_from_row)
+        .map_err(|e| e.to_string())?;
+    collect_memories(rows)
 }
 
 fn find_similar_memory(
@@ -1424,10 +1424,12 @@ fn active_prompt_deltas(conn: &Connection) -> Result<Vec<String>, String> {
              WHERE enabled = 1 ORDER BY updated_at DESC LIMIT 5",
         )
         .map_err(|e| e.to_string())?;
-    stmt.query_map([], |row| row.get::<_, String>(0))
+    let collected: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(collected)
 }
 
 fn validate_memory_payload(title: &str, content: &str, category: &str) -> Result<(), SafetyBlock> {
@@ -2081,13 +2083,17 @@ pub fn run_tier_management(conn: &Connection) -> Result<(i64, i64), String> {
     let result = (|| -> Result<(), String> {
         // HOT → WARM: memories older than 14 days, still hot
         let warm_candidates: Vec<(String, String)> = {
-            let mut stmt = conn.prepare(
-                &format!("SELECT id, content FROM memory WHERE tier = 'hot' AND status = 'active' AND updated_at < datetime('now', '-{} days') LIMIT 50", HOT_THRESHOLD_DAYS)
-            ).map_err(|e| e.to_string())?;
-            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            let mut stmt = conn
+                .prepare(
+                    &format!("SELECT id, content FROM memory WHERE tier = 'hot' AND status = 'active' AND updated_at < datetime('now', '-{} days') LIMIT 50", HOT_THRESHOLD_DAYS)
+                )
+                .map_err(|e| e.to_string())?;
+            let collected: Vec<(String, String)> = stmt
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
                 .map_err(|e| e.to_string())?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            collected
         };
         for (id, content) in &warm_candidates {
             let summary = truncate(content, 200);
@@ -2100,13 +2106,17 @@ pub fn run_tier_management(conn: &Connection) -> Result<(i64, i64), String> {
 
         // WARM → COLD: memories older than 56 days, still warm
         let cold_candidates: Vec<String> = {
-            let mut stmt = conn.prepare(
-                &format!("SELECT id FROM memory WHERE tier = 'warm' AND status = 'active' AND updated_at < datetime('now', '-{} days') LIMIT 50", WARM_THRESHOLD_DAYS)
-            ).map_err(|e| e.to_string())?;
-            stmt.query_map([], |row| row.get::<_, String>(0))
+            let mut stmt = conn
+                .prepare(
+                    &format!("SELECT id FROM memory WHERE tier = 'warm' AND status = 'active' AND updated_at < datetime('now', '-{} days') LIMIT 50", WARM_THRESHOLD_DAYS)
+                )
+                .map_err(|e| e.to_string())?;
+            let collected: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(0))
                 .map_err(|e| e.to_string())?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            collected
         };
         for id in &cold_candidates {
             conn.execute(

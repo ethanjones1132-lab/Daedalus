@@ -34,6 +34,10 @@ class BaseAdapter(ABC):
         """Return normalized action dicts ready for ingest."""
 
 
+def action_id(prefix: str, date_tag: str) -> str:
+    return f"{prefix}-{date_tag}"
+
+
 def build_action(
     *,
     item_id: str,

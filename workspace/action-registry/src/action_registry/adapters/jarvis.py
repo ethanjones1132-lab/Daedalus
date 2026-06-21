@@ -6,6 +6,55 @@ from typing import Any
 from .base import AdapterContext, BaseAdapter, action_id
 
 
+_SOURCE_DIRS: tuple[tuple[str, tuple[str, ...] | None], ...] = (
+    ("src-tauri/src", (".rs",)),
+    ("src-tauri/capabilities", (".json",)),
+    ("src-tauri/icons", None),
+    ("src-ui/src", (".ts", ".tsx", ".js", ".jsx", ".css", ".html")),
+    ("src-ui/dist", None),
+    ("server-jarvis/src", (".ts", ".js")),
+    ("server-jarvis/dist", None),
+)
+
+_SOURCE_FILES = (
+    "src-tauri/Cargo.toml",
+    "src-tauri/Cargo.lock",
+    "src-tauri/build.rs",
+    "src-tauri/tauri.conf.json",
+    "src-ui/index.html",
+    "src-ui/package.json",
+    "src-ui/tsconfig.json",
+    "src-ui/vite.config.ts",
+    "server-jarvis/package.json",
+)
+
+
+def _iter_source_files(root: Path) -> list[Path]:
+    files: list[Path] = []
+    for rel in _SOURCE_FILES:
+        path = root / rel
+        if path.is_file():
+            files.append(path)
+
+    for rel_dir, suffixes in _SOURCE_DIRS:
+        base = root / rel_dir
+        if not base.exists() or not base.is_dir():
+            continue
+        for path in base.rglob("*"):
+            if not path.is_file():
+                continue
+            if suffixes is None or path.suffix in suffixes:
+                files.append(path)
+    return files
+
+
+def _newest_source_file(root: Path) -> Path | None:
+    files = _iter_source_files(root)
+    if not files:
+        return None
+    return max(files, key=lambda path: path.stat().st_mtime)
+
+
 class JarvisAdapter(BaseAdapter):
     name = "jarvis"
 
@@ -16,28 +65,29 @@ class JarvisAdapter(BaseAdapter):
         date_tag = ctx.now.strftime("%Y%m%d")
 
         release_binary = root / "target" / "x86_64-pc-windows-gnu" / "release" / "home-base.exe"
-        src_tauri = root / "src-tauri" / "src" / "lib.rs"
-        if release_binary.exists() and src_tauri.exists():
-            if release_binary.stat().st_mtime < src_tauri.stat().st_mtime:
+        newest_source = _newest_source_file(root)
+        if release_binary.exists() and newest_source is not None:
+            if release_binary.stat().st_mtime < newest_source.stat().st_mtime:
                 actions.append(
                     self._build(
                         action_id("home-base-stale-binary", date_tag),
                         title="Rebuild stale Jarvis binary before release",
                         description=(
-                            "The Windows release binary is older than recent Rust source changes. "
-                            "Rebuild and redeploy to avoid shipping stale platform behavior."
+                            "The Windows release binary is older than the newest Jarvis source or packaged "
+                            "artifact. Rebuild and redeploy to avoid shipping stale platform behavior."
                         ),
                         priority="P0",
                         risk_level="high",
                         action_type="release_guard",
                         category="build_provenance",
                         acceptance_criteria=[
-                            "Release binary mtime is newer than src-tauri source changes",
+                            "Release binary mtime is newer than all Rust, UI, and bundled server artifacts",
                             "Doctor report shows expected binary freshness",
                         ],
                         evidence=[
                             {"kind": "binary", "value": str(release_binary)},
-                            {"kind": "source", "value": str(src_tauri)},
+                            {"kind": "newest_source", "value": str(newest_source)},
+                            {"kind": "repo", "value": str(root)},
                         ],
                         approval_required=True,
                         stamp=stamp,

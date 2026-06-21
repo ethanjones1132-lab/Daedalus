@@ -45,3 +45,6 @@ pub use action_registry::*;
 // Legacy dashboard/get_* command handlers (WSL-backed)
 pub mod legacy;
 pub use legacy::*;
+
+pub mod recovery_stubs;
+pub use recovery_stubs::*;

@@ -14,8 +14,21 @@ pub fn run_jarvis_message(
 ) -> Result<(), String> {
     let jarvis_path = config.jarvis_path.clone();
     let effective_url = config.effective_base_url();
-    let model = config.model.clone();
-    let api_key = config.api_key.clone();
+    // Map legacy flat fields onto the v3.1 sub-config shape.
+    let (model, api_key) = match config.active_backend {
+        crate::jarvis::types::JarvisBackend::Ollama => (
+            config.ollama.model.clone(),
+            "ollama".to_string(),
+        ),
+        crate::jarvis::types::JarvisBackend::OpenRouter => (
+            config.openrouter.model.clone(),
+            config.openrouter.api_key.clone(),
+        ),
+        crate::jarvis::types::JarvisBackend::ClaudeCli => (
+            config.claude_cli.model.clone().unwrap_or_default(),
+            String::new(),
+        ),
+    };
 
     // Build the Jarvis invocation
     let message_escaped = message.replace('\\', "\\\\").replace('"', "\\\"");
@@ -135,7 +148,7 @@ pub fn check_jarvis_status(config: &JarvisConfig) -> JarvisStatus {
     let effective_url = config.effective_base_url();
 
     // Check if Ollama is reachable (non-blocking TCP connect)
-    let ollama_running = if matches!(config.backend, JarvisBackend::Ollama) {
+    let ollama_running = if matches!(config.active_backend, JarvisBackend::Ollama) {
         let host = effective_url
             .trim_start_matches("http://")
             .trim_start_matches("https://")
@@ -155,9 +168,9 @@ pub fn check_jarvis_status(config: &JarvisConfig) -> JarvisStatus {
     };
 
     // For a proper Ollama check, we use a lightweight blocking call in a separate thread
-    let model_available = if matches!(config.backend, JarvisBackend::Ollama) {
+    let model_available = if matches!(config.active_backend, JarvisBackend::Ollama) {
         let url = effective_url.clone();
-        let model = config.model.clone();
+        let model = config.ollama.model.clone();
         // Use a scoped thread for the blocking HTTP call
         std::thread::spawn(move || {
             let client = reqwest::blocking::Client::builder()
@@ -181,7 +194,7 @@ pub fn check_jarvis_status(config: &JarvisConfig) -> JarvisStatus {
         .join()
         .unwrap_or(false)
     } else {
-        !config.api_key.is_empty()
+        !config.openrouter.api_key.is_empty()
     };
 
     // Check if bun is available in WSL
@@ -190,11 +203,16 @@ pub fn check_jarvis_status(config: &JarvisConfig) -> JarvisStatus {
         .unwrap_or(false);
 
     // Check if bridge TCP port is listening
-    let bridge_active = std::net::TcpStream::connect(format!("127.0.0.1:{}", config.bridge_port)).is_ok();
+    let bridge_active =
+        std::net::TcpStream::connect(format!("127.0.0.1:{}", config.bridge_port)).is_ok();
 
     JarvisStatus {
         ollama_running,
-        model_available: if matches!(config.backend, JarvisBackend::Ollama) { model_available } else { true },
+        model_available: if matches!(config.active_backend, JarvisBackend::Ollama) {
+            model_available
+        } else {
+            true
+        },
         bridge_active,
         bridge_port: config.bridge_port,
         bun_available,

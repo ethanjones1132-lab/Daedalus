@@ -429,13 +429,16 @@ pub async fn start_cron_scheduler(app: AppHandle) {
                     continue;
                 }
             };
-            match stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?))) {
+            let collected: Vec<(String, String)> = match stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            }) {
                 Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
                 Err(e) => {
                     eprintln!("[cron] row error: {}", e);
                     vec![]
                 }
-            }
+            };
+            collected
         };
 
         for (job_id, schedule_expr) in due_jobs {

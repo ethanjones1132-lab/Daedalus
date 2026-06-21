@@ -23,7 +23,7 @@ tauri-plugin-log = "2"
 tauri-plugin-shell = "2"
 
 # tokio for async task spawning (used for parallel WSL CLI calls)
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"] }
 
 # --- Restored dependencies (derived from actual `use` sites in src-tauri/src; see RECOVERY_STATUS.md) ---
 # SQLite-backed native command surface (sessions, memory, cron, agents, ...)

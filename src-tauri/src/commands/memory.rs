@@ -42,7 +42,7 @@ pub fn memory_update(
 #[tauri::command]
 pub fn memory_delete(db: State<AppDb>, id: String) -> Result<bool, String> {
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    engine::tombsto
+    engine::tombstone_memory(&conn, &id, "user", "User deleted via UI", None, None)
 }
 
 #[tauri::command]
@@ -204,4 +204,41 @@ pub fn list_recent_memories(
     }
 
     Ok(results)
+}
+
+// ── Workspace file commands ──────────────────────────────────────
+//
+// These are separate from the cold-tier Drive archive; they expose the
+// local JARVIS workspace directory (where the agent's persistent notes
+// and scratch files live) to the UI. Path validation is the same as
+// `expand_path_safe` above.
+
+#[tauri::command]
+pub fn list_workspace_files(path: String) -> Result<Vec<String>, String> {
+    let expanded = expand_path_safe(&path)?;
+    if !expanded.exists() {
+        return Ok(Vec::new());
+    }
+    let entries = std::fs::read_dir(&expanded)
+        .map_err(|e| format!("Failed to read directory: {}", e))?;
+    let mut files = Vec::new();
+    for entry in entries {
+        if let Ok(entry) = entry {
+            if let Ok(ft) = entry.file_type() {
+                if ft.is_file() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    files.push(name);
+                }
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+#[tauri::command]
+pub fn read_workspace_file(path: String) -> Result<String, String> {
+    let expanded = expand_path_safe(&path)?;
+    std::fs::read_to_string(&expanded)
+        .map_err(|e| format!("Failed to read workspace file: {}", e))
 }

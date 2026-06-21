@@ -1,21 +1,28 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { motion, AnimatePresence, useReducedMotion } from 'framer-motion';
+import { motion, AnimatePresence } from 'framer-motion';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { cn } from '../ui';
+import type { CompanionState } from './types';
 import {
   JarvisSession, JarvisMessage, JarvisConfig, JarvisStatus,
   OPENROUTER_MODELS,
 } from './types';
+import ControlCenterView from './ControlCenterView';
 
 // ═══════════════════════════════════════════════════════════════
 // ── Main Jarvis View ──
 // ═══════════════════════════════════════════════════════════════
 
-type JarvisSubView = 'chat' | 'sessions' | 'config' | 'status';
+type JarvisSubView = 'chat' | 'sessions' | 'config' | 'status' | 'control';
 
-export default function JarvisView() {
-  const [subView, setSubView] = useState<JarvisSubView>('chat');
+interface JarvisViewProps {
+  initialSubView?: JarvisSubView;
+  onCompanionChange?: (companion: CompanionState | null) => void;
+}
+
+export default function JarvisView({ initialSubView = 'chat', onCompanionChange }: JarvisViewProps) {
+  const [subView, setSubView] = useState<JarvisSubView>(initialSubView);
   const [sessions, setSessions] = useState<JarvisSession[]>([]);
   const [activeSession, setActiveSession] = useState<string | null>(null);
   const [config, setConfig] = useState<JarvisConfig | null>(null);
@@ -53,7 +60,22 @@ export default function JarvisView() {
     { id: 'sessions', label: 'Sessions', icon: '◉' },
     { id: 'config', label: 'Config', icon: '⚙' },
     { id: 'status', label: 'Status', icon: '♡' },
+    { id: 'control', label: 'Control', icon: '◆' },
   ];
+
+  // Load companion and notify parent
+  useEffect(() => {
+    const loadCompanion = async () => {
+      try {
+        const companion = await invoke<CompanionState | null>('jarvis_get_companion');
+        onCompanionChange?.(companion);
+      } catch (e) {
+        console.error('Failed to load companion:', e);
+        onCompanionChange?.(null);
+      }
+    };
+    loadCompanion();
+  }, [onCompanionChange]);
 
   return (
     <motion.div
@@ -115,6 +137,11 @@ export default function JarvisView() {
           {subView === 'status' && (
             <motion.div key="status" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="h-full">
               <StatusPanel status={status} onRefresh={loadStatus} />
+            </motion.div>
+          )}
+          {subView === 'control' && (
+            <motion.div key="control" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="h-full">
+              <ControlCenterView />
             </motion.div>
           )}
         </AnimatePresence>
@@ -214,8 +241,8 @@ function ChatPanel({
 
   useEffect(() => {
     if (config) {
-      setBackendLabel(config.backend === 'openrouter' ? 'OpenRouter' : 'Ollama');
-      setModelLabel(config.model);
+      setBackendLabel(config.active_backend === 'openrouter' ? 'OpenRouter' : 'Ollama');
+      setModelLabel((config.active_backend === 'ollama' ? config.ollama.model : config.openrouter.model));
     }
   }, [config]);
 
@@ -311,7 +338,7 @@ function ChatPanel({
           <h2 className="text-lg font-bold text-bone tracking-tight">Jarvis</h2>
           {config && (
             <>
-              <Pill variant={config.backend === 'openrouter' ? 'info' : 'success'}>{backendLabel}</Pill>
+              <Pill variant={config.active_backend === 'openrouter' ? 'info' : 'success'}>{backendLabel}</Pill>
               <Pill>{modelLabel}</Pill>
             </>
           )}
@@ -341,14 +368,14 @@ function ChatPanel({
               <p className="text-bone-dim text-sm font-mono">
                 Your local AI coding assistant. Ask me to build, debug, or explore code.
               </p>
-              {config?.backend === 'openrouter' && (
+              {config?.active_backend === 'openrouter' && (
                 <p className="text-bone-faint text-xs font-mono mt-2">
-                  Powered by OpenRouter · {config.model}
+                  Powered by OpenRouter · {config.openrouter.model}
                 </p>
               )}
-              {config?.backend === 'ollama' && (
+              {config?.active_backend === 'ollama' && (
                 <p className="text-bone-faint text-xs font-mono mt-2">
-                  Powered by Ollama · {config.model}
+                  Powered by Ollama · {config.ollama.model}
                 </p>
               )}
             </div>
@@ -415,7 +442,7 @@ function ChatPanel({
             {isStreaming ? '● Streaming...' : `${messages.filter(m => m.role === 'user').length} messages sent`}
           </span>
           <span className="text-[10px] font-mono text-bone-faint">
-            {config?.backend === 'openrouter' ? 'via OpenRouter' : 'via Ollama'}
+            {config?.active_backend === 'openrouter' ? 'via OpenRouter' : 'via Ollama'}
           </span>
         </div>
       </div>
@@ -620,10 +647,10 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
           <h3 className="text-sm font-semibold text-bone mb-3">Backend</h3>
           <div className="flex gap-2">
             <button
-              onClick={() => updateField('backend', 'ollama')}
+              onClick={() => updateField('active_backend', 'ollama')}
               className={cn(
                 'flex-1 px-4 py-3 rounded-xl border text-sm font-mono transition-all text-center',
-                localConfig.backend === 'ollama'
+                localConfig.active_backend === 'ollama'
                   ? 'bg-cyan-neon/15 border-cyan-neon/40 text-cyan-glow'
                   : 'bg-obsidian/40 border-iron/30 text-bone-dim hover:border-iron/50'
               )}
@@ -633,10 +660,10 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
               <div className="text-[10px] text-bone-faint mt-0.5">Local models</div>
             </button>
             <button
-              onClick={() => updateField('backend', 'openrouter')}
+              onClick={() => updateField('active_backend', 'openrouter')}
               className={cn(
                 'flex-1 px-4 py-3 rounded-xl border text-sm font-mono transition-all text-center',
-                localConfig.backend === 'openrouter'
+                localConfig.active_backend === 'openrouter'
                   ? 'bg-royal/15 border-royal/40 text-royal-light'
                   : 'bg-obsidian/40 border-iron/30 text-bone-dim hover:border-iron/50'
               )}
@@ -649,14 +676,17 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
         </GlassCard>
 
         {/* OpenRouter API Key */}
-        {localConfig.backend === 'openrouter' && (
+        {localConfig.active_backend === 'openrouter' && (
           <GlassCard hoverable={false}>
             <h3 className="text-sm font-semibold text-bone mb-3">OpenRouter API Key</h3>
             <div className="relative">
               <input
                 type={showApiKey ? 'text' : 'password'}
-                value={localConfig.api_key}
-                onChange={(e) => updateField('api_key', e.target.value)}
+                value={(localConfig.openrouter?.api_key ?? '')}
+                onChange={(e) => setLocalConfig(prev => prev ? {
+                  ...prev,
+                  openrouter: { ...prev.openrouter, api_key: e.target.value }
+                } : prev)}
                 placeholder="sk-or-v1-..."
                 className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors pr-16"
               />
@@ -676,11 +706,11 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
         {/* Model Selection */}
         <GlassCard hoverable={false}>
           <h3 className="text-sm font-semibold text-bone mb-3">Model</h3>
-          {localConfig.backend === 'openrouter' ? (
+          {localConfig.active_backend === 'openrouter' ? (
             <div className="space-y-2">
               <select
-                value={localConfig.model}
-                onChange={(e) => updateField('model', e.target.value)}
+                value={localConfig.openrouter.model}
+                onChange={(e) => updateField('openrouter', { ...localConfig.openrouter, model: e.target.value })}
                 className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone focus:outline-none focus:border-royal/50 transition-colors"
               >
                 <option value="">Custom model...</option>
@@ -692,8 +722,8 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
               </select>
               <input
                 type="text"
-                value={localConfig.model}
-                onChange={(e) => updateField('model', e.target.value)}
+                value={localConfig.openrouter.model}
+                onChange={(e) => updateField('openrouter', { ...localConfig.openrouter, model: e.target.value })}
                 placeholder="Enter custom model ID (e.g., anthropic/claude-sonnet-4)"
                 className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors"
               />
@@ -701,8 +731,8 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
           ) : (
             <input
               type="text"
-              value={localConfig.model}
-              onChange={(e) => updateField('model', e.target.value)}
+              value={localConfig.ollama.model}
+              onChange={(e) => updateField('ollama', { ...localConfig.ollama, model: e.target.value })}
               placeholder="e.g., qwen2.5-coder:7b"
               className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors"
             />
@@ -717,8 +747,8 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
               <label className="text-[10px] font-mono text-bone-dim block mb-1">Ollama URL</label>
               <input
                 type="text"
-                value={localConfig.ollama_base_url}
-                onChange={(e) => updateField('ollama_base_url', e.target.value)}
+                value={localConfig.ollama.base_url}
+                onChange={(e) => updateField('ollama', { ...localConfig.ollama, base_url: e.target.value })}
                 className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors"
               />
             </div>
@@ -726,8 +756,8 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
               <label className="text-[10px] font-mono text-bone-dim block mb-1">OpenRouter URL</label>
               <input
                 type="text"
-                value={localConfig.openrouter_base_url}
-                onChange={(e) => updateField('openrouter_base_url', e.target.value)}
+                value={localConfig.openrouter.base_url}
+                onChange={(e) => updateField('openrouter', { ...localConfig.openrouter, base_url: e.target.value })}
                 className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors"
               />
             </div>
@@ -808,7 +838,7 @@ function StatusPanel({ status, onRefresh }: { status: JarvisStatus | null; onRef
 
   const items = [
     { label: 'Ollama Running', ok: status.ollama_running, desc: 'Local Ollama service is reachable' },
-    { label: 'Model Available', ok: status.model_available, desc: 'Configured model is loaded in Ollama' },
+    { label: 'Model Available', ok: status.ollama_model_available, desc: 'Configured model is loaded in Ollama' },
     { label: 'Bridge Active', ok: status.bridge_active, desc: `Agent bridge on port ${status.bridge_port}` },
     { label: 'Bun Runtime', ok: status.bun_available, desc: 'Bun is installed in WSL' },
   ];

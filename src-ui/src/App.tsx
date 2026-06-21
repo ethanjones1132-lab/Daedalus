@@ -690,7 +690,7 @@ function AppInner() {
             species={(companion?.species as CompanionSpecies) || 'cat'}
             rarity={(companion?.rarity as CompanionRarity) || 'rare'}
             state={companion || undefined}
-            size="md"
+            size={64}
             cronAwareness={cronAwareness}
           />
         </motion.div>

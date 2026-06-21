@@ -1,62 +1,230 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // ═══════════════════════════════════════════════════════════════
 // ── Jarvis Config ──
 // ═══════════════════════════════════════════════════════════════
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum JarvisBackend {
     #[serde(rename = "ollama")]
     Ollama,
     #[serde(rename = "openrouter")]
     OpenRouter,
+    #[serde(rename = "claude_cli")]
+    ClaudeCli,
 }
 
 impl Default for JarvisBackend {
     fn default() -> Self { JarvisBackend::Ollama }
 }
 
+impl std::fmt::Display for JarvisBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JarvisBackend::Ollama => f.write_str("ollama"),
+            JarvisBackend::OpenRouter => f.write_str("openrouter"),
+            JarvisBackend::ClaudeCli => f.write_str("claude_cli"),
+        }
+    }
+}
+
+// The full v3.1 config schema that the Native settings UI persists into
+// SQLite. Each "compound" sub-config is serialized as its own JSON blob
+// in the settings table; see commands/settings.rs for the loader.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct JarvisConfig {
-    pub backend: JarvisBackend,
-    pub ollama_base_url: String,
-    pub openrouter_base_url: String,
-    pub model: String,
-    pub api_key: String,
+    pub version: String,
+    pub active_backend: JarvisBackend,
+    pub ollama: OllamaConfig,
+    pub openrouter: OpenRouterConfig,
+    pub claude_cli: ClaudeCliConfig,
+    pub tools: ToolConfig,
+    pub reasoning: ReasoningConfig,
+    pub companion: CompanionConfig,
     pub system_prompt: String,
+    pub mode: String,
+    pub prizepicks_prompt: String,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub top_p: f64,
     pub bridge_port: u16,
     pub bridge_enabled: bool,
     pub jarvis_path: String,
+    pub compaction: CompactionConfigV2,
+    pub profiles: HashMap<String, ModelProfile>,
+    pub active_profile: String,
+    pub api_sports_key: String,
+    pub agents_root: String,
 }
 
 impl Default for JarvisConfig {
     fn default() -> Self {
         JarvisConfig {
-            backend: JarvisBackend::Ollama,
-            ollama_base_url: "http://localhost:11434/v1".to_string(),
-            openrouter_base_url: "https://openrouter.ai/api/v1".to_string(),
-            model: "qwen2.5-coder:7b".to_string(),
-            api_key: "ollama".to_string(),
-            system_prompt: "You are Jarvis, a local AI assistant running via Ollama. Be concise and helpful.".to_string(),
+            version: "3.1.0".to_string(),
+            active_backend: JarvisBackend::Ollama,
+            ollama: OllamaConfig::default(),
+            openrouter: OpenRouterConfig::default(),
+            claude_cli: ClaudeCliConfig::default(),
+            tools: ToolConfig::default(),
+            reasoning: ReasoningConfig::default(),
+            companion: CompanionConfig::default(),
+            system_prompt: "You are Jarvis, a local AI assistant. Be concise and helpful.".to_string(),
+            mode: "general".to_string(),
+            prizepicks_prompt: String::new(),
+            temperature: 0.7,
+            max_tokens: 2048,
+            top_p: 0.95,
             bridge_port: 19876,
             bridge_enabled: true,
             jarvis_path: String::new(),
+            compaction: CompactionConfigV2::default(),
+            profiles: HashMap::new(),
+            active_profile: "default".to_string(),
+            api_sports_key: String::new(),
+            agents_root: String::new(),
         }
     }
 }
 
 impl JarvisConfig {
-    /// Get the effective base URL based on the selected backend
+    /// Get the effective base URL for the active backend.
     pub fn effective_base_url(&self) -> String {
-        match self.backend {
-            JarvisBackend::Ollama => {
-                // Resolve Windows host IP at runtime for WSL2
-                let host_ip = crate::wsl::wsl_windows_host_ip();
-                self.ollama_base_url.replace("localhost", &host_ip).replace("127.0.0.1", &host_ip)
-            }
-            JarvisBackend::OpenRouter => self.openrouter_base_url.clone(),
+        match self.active_backend {
+            JarvisBackend::Ollama => self.ollama.base_url.clone(),
+            JarvisBackend::OpenRouter => self.openrouter.base_url.clone(),
+            JarvisBackend::ClaudeCli => self.claude_cli.path.clone(),
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ── Sub-configs (recovered from callsite inspection) ──
+// ═══════════════════════════════════════════════════════════════
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct OllamaConfig {
+    pub base_url: String,
+    pub model: String,
+    #[serde(default)]
+    pub auto_pull: bool,
+    #[serde(default)]
+    pub num_ctx: u32,
+    #[serde(default)]
+    pub health_check_interval_ms: u64,
+    #[serde(default)]
+    pub options: OllamaOptions,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct OllamaOptions {
+    #[serde(default)]
+    pub num_gpu: u32,
+    #[serde(default)]
+    pub num_thread: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct OpenRouterConfig {
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    pub model: String,
+    #[serde(default)]
+    pub site_url: String,
+    #[serde(default)]
+    pub site_name: String,
+    #[serde(default)]
+    pub fallbacks: Vec<String>,
+    #[serde(default)]
+    pub enable_fallbacks: bool,
+    #[serde(default)]
+    pub enable_paid_fallbacks: bool,
+    #[serde(default)]
+    pub max_retries: u32,
+    #[serde(default)]
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ClaudeCliConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub path: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ToolConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub require_approval: Vec<String>,
+    #[serde(default = "default_sandbox")]
+    pub sandbox_mode: String,
+    #[serde(default)]
+    pub allowlist: Vec<String>,
+    #[serde(default)]
+    pub denylist: Vec<String>,
+}
+
+fn default_sandbox() -> String { "permissive".to_string() }
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ReasoningConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub show_trace_by_default: bool,
+    #[serde(default)]
+    pub max_tokens: u32,
+    #[serde(default)]
+    pub backend: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct CompanionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_companion_name")]
+    pub name: String,
+    #[serde(default = "default_companion_species")]
+    pub species: String,
+    #[serde(default = "default_companion_rarity")]
+    pub rarity: String,
+}
+
+fn default_companion_name() -> String { "Sprout".to_string() }
+fn default_companion_species() -> String { "spriggan".to_string() }
+fn default_companion_rarity() -> String { "common".to_string() }
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct CompactionConfigV2 {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub threshold_messages: u32,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub keep_system_prompt: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ModelProfile {
+    #[serde(default)]
+    pub backend: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub options: serde_json::Value,
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -145,4 +313,5 @@ use tokio::sync::Mutex;
 pub struct JarvisState {
     pub config: Arc<Mutex<JarvisConfig>>,
     pub queue: Arc<crate::jarvis::queue::MessageQueue>,
+    pub http_client: reqwest::Client,
 }

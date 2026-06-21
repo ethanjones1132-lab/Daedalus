@@ -7,6 +7,7 @@ from .base import AdapterContext, BaseAdapter
 from .jarvis import JarvisAdapter
 from .jonesinsrc_products import JonesinSrcProductsAdapter
 from .jonesinsrc_website import JonesinSrcWebsiteAdapter
+from .prizepicks import PrizePicksAdapter
 from .snitch_llc import SnitchLlcAdapter
 
 ADAPTERS: list[BaseAdapter] = [
@@ -14,13 +15,14 @@ ADAPTERS: list[BaseAdapter] = [
     JonesinSrcWebsiteAdapter(),
     SnitchLlcAdapter(),
     JonesinSrcProductsAdapter(),
+    PrizePicksAdapter(),
 ]
 
 DEFAULT_PATHS = {
-    "home_base_root": "/home/ethan/.openclaw/agents/coderclaw/workspace/home-base",
-    "snitch_root": "/home/ethan/.openclaw/workspace/snitch-llc",
-    "jonesinsrc_root": "/mnt/c/Users/ethan/OneDrive/Documents/JonesinSRC",
-    "prizepicks_root": "/home/ethan/.openclaw/agents/coderclaw/workspace/prizepicks-monster",
+    "home_base_root": "C:/Projects/home-base-recovered",
+    "snitch_root": "C:/Projects/snitch-llc",
+    "jonesinsrc_root": "C:/Users/ethan/OneDrive/Documents/JonesinSRC",
+    "prizepicks_root": "C:/Projects/prizepicks-monster",
 }
 
 

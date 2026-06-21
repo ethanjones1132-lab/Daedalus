@@ -64,6 +64,8 @@ pub struct DashboardStatus {
     pub sessions_total: u64,
     pub default_agent_id: String,
     pub bootstrap_pending_count: u64,
+    #[serde(default)]
+    pub model_defaults: serde_json::Value,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

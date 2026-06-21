@@ -1,8 +1,7 @@
 // ═══════════════════════════════════════════════════════════════
 // ── Shell Bundle ──
 // ═══════════════════════════════════════════════════════════════
-// The `bash` tool registered into the ToolRuntime. Ported verbatim from the
-// legacy tools.ts (toolBash). Dangerous + approval-required.
+// The `bash` tool registered into the ToolRuntime. Dangerous + approval-required.
 
 import { spawn } from "child_process";
 import type { ToolRuntime, ExecutionContext } from "./tool-runtime";
@@ -27,14 +26,14 @@ const BASH_DEF: ToolDefinition = {
   dangerous: true,
 };
 
-async function handleBash(args: Record<string
+async function handleBash(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
   const command = args.command as string;
   const timeout = Math.min((args.timeout_ms as number) || 30000, 60000);
 
   return new Promise((resolve) => {
     const proc = spawn("bash", ["-c", command], {
-      cwd: cfg.jarvis_path || cfg.jarvis_path,
+      cwd: cfg.jarvis_path || process.cwd(),
       timeout,
       env: { ...process.env, PATH: process.env.PATH },
     });
@@ -54,7 +53,6 @@ async function handleBash(args: Record<string
         let msg = `Command failed with exit code ${code}`;
         if (err) msg += `\nError: ${err}`;
         if (output) msg += `\nPartial output: ${output}`;
-        // Add actionable hints for common failures
         if (code === 127) msg += "\nHint: Command not found. Check if the tool is installed or use the full path.";
         else if (code === 1 && err.includes("Permission denied")) msg += "\nHint: Permission denied. Try checking file permissions with ls -la, or use a different approach.";
         else if (code === 1 && err.includes("No such file")) msg += "\nHint: File or directory not found. Use glob to find the correct path.";

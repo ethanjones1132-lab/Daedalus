@@ -625,8 +625,8 @@ export async function chatCompletionWithFallback(
           headers: {
             "Authorization": `Bearer ${cfg.openrouter.api_key}`,
             "Content-Type": "application/json",
-            "HTTP-Referer": cfg.o
-            "X-Title": cfg.openrouter.site_name,
+            "HTTP-Referer": cfg.openrouter.site_url || "http://localhost:19877",
+            "X-Title": cfg.openrouter.site_name || "Jarvis",
           },
           body: JSON.stringify(modelRequestBody),
         });
@@ -687,8 +687,8 @@ export async function checkOpenRouterHealth(cfg: JarvisConfig, forceRefresh = fa
       signal: ctrl.signal,
       headers: {
         "Authorization": `Bearer ${cfg.openrouter.api_key}`,
-        "HTTP-Referer": cfg.openrouter.site_url,
-        "X-Title": cfg.openrouter.site_name,
+        "HTTP-Referer": cfg.openrouter.site_url,
+        "X-Title": cfg.openrouter.site_name,
       },
     });
 
@@ -738,8 +738,8 @@ export async function listOpenRouterModels(cfg: JarvisConfig, forceRefresh = fal
       signal: ctrl.signal,
       headers: {
         "Authorization": `Bearer ${cfg.openrouter.api_key}`,
-        "HTTP-Referer": cfg.openrouter.site_url,
-        "X-Title": cfg.openrouter.site_name,
+        "HTTP-Referer": cfg.openrouter.site_url,
+        "X-Title": cfg.openrouter.site_name,
       },
     });
 
@@ -765,8 +765,8 @@ export function openRouterHeaders(cfg: JarvisConfig): Record<string, string> {
   return {
     "Authorization": `Bearer ${cfg.openrouter.api_key}`,
     "Content-Type": "application/json",
-    "HTTP-Referer": cfg.openrouter.site_url,
-    "X-Title": cfg.openrouter.site_name,
+    "HTTP-Referer": cfg.openrouter.site_url,
+    "X-Title": cfg.openrouter.site_name,
   };
 }
 

@@ -7,7 +7,7 @@
       "project": "jonesinsrc",
       "source_system": "website-registry",
       "source_area": "website",
-    10|      "priority": "P0",
+      "priority": "P0",
       "risk_level": "high",
       "category": "web_registry",
       "action_type": "website_track",
@@ -17,7 +17,7 @@
         "Registry record preserves the website identity, directory, and temporary domain context",
         "Future funnel, contact, and checkout actions can reference the website slug",
         "Current trust-signal and lead-capture improvements are preserved in evidence"
-    20|      ],
+      ],
       "dependencies": [],
       "status": "open",
       "owner": "shared",
@@ -27,7 +27,7 @@
       "updated_at": "2026-06-16T13:54:49",
       "surface_name": "JonesinSRC website",
       "surface_slug": "jonesinsrc-website",
-    30|      "surface_type": "shopify_portfolio_store",
+      "surface_type": "shopify_portfolio_store",
       "temporary_domain": "coppercreekcoffee.myshopify.com",
       "lifecycle_stage": "live",
       "evidence": [
@@ -37,7 +37,7 @@
         },
         {
           "kind": "context",
-    40|          "value": "Trust signals and a lead-capture form were added to the site, but WallSlayer is still live with zero sales so the website remains a primary conversion surface."
+          "value": "Trust signals and a lead-capture form were added to the site, but WallSlayer is still live with zero sales so the website remains a primary conversion surface."
         }
       ]
     },
@@ -47,7 +47,7 @@
       "source_system": "product-registry",
       "source_area": "wallslayer",
       "priority": "P0",
-    50|      "risk_level": "high",
+      "risk_level": "high",
       "category": "product_registry",
       "action_type": "product_track",
       "title": "WallSlayer product track",
@@ -57,5 +57,351 @@
         "Future storefront and funnel actions can reference the product slug",
         "Current live-zero-sales context is preserved in evidence"
       ],
-    60|      "dependencies": [],
-... 454 lines not shown ...
+      "dependencies": [],
+      "status": "open",
+      "owner": "shared",
+      "approval_required": false,
+      "next_due": "2026-06-17T18:00:00",
+      "created_at": "2026-06-16T13:54:49",
+      "updated_at": "2026-06-16T13:54:49",
+      "surface_name": "WallSlayer",
+      "surface_slug": "wallslayer",
+      "surface_type": "desktop_app",
+      "price": "$39",
+      "lifecycle_stage": "live_zero_sales",
+      "evidence": [
+        {
+          "kind": "repo",
+          "value": "C:/Users/ethan/OneDrive/Desktop/Claude Wall Slayer/wall-slayer"
+        }
+      ]
+    },
+    {
+      "id": "jonesinsrc-prizepicks-monster-20260616-001",
+      "project": "jonesinsrc",
+      "source_system": "product-registry",
+      "source_area": "prizepicks-monster",
+      "priority": "P0",
+      "risk_level": "high",
+      "category": "product_registry",
+      "action_type": "product_track",
+      "title": "PrizePicks Monster product track",
+      "description": "Canonical registry entry for PrizePicks Monster DFS player prop intelligence app. Rebuilt from Kalshi Monster base after WSL data loss.",
+      "acceptance_criteria": [
+        "Registry record preserves product identity, price, and delivery model",
+        "Future storefront and funnel actions can reference the product slug",
+        "Rebuild from Kalshi Monster codebase is tracked"
+      ],
+      "dependencies": [],
+      "status": "done",
+      "owner": "shared",
+      "approval_required": false,
+      "next_due": "2026-06-19T18:00:00",
+      "created_at": "2026-06-16T13:54:49",
+      "updated_at": "2026-06-19T19:14:29",
+      "surface_name": "PrizePicks Monster",
+      "surface_slug": "prizepicks-monster",
+      "surface_type": "desktop_app",
+      "price": "$25",
+      "lifecycle_stage": "rebuild",
+      "evidence": [
+        {
+          "kind": "repo",
+          "value": "C:/Projects/prizepicks-monster"
+        },
+        {
+          "kind": "context",
+          "value": "Rebuilt from Kalshi Monster base. Tauri 2 + Rust + React. Player prop fetcher, chat context, and UI rebranded. Cron workdir updated."
+        }
+      ],
+      "completed_at": "2026-06-19T19:14:29",
+      "result_summary": "Rebuilt from Kalshi Monster base. New repo at C:/Projects/prizepicks-monster. 107 Tauri commands, 4 new prop commands. Frontend rebranded. Cron workdir updated."
+    },
+    {
+      "id": "jonesinsrc-kalshi-monster-20260616-001",
+      "project": "jonesinsrc",
+      "source_system": "product-registry",
+      "source_area": "kalshi-monster",
+      "priority": "P0",
+      "risk_level": "medium",
+      "category": "product_registry",
+      "action_type": "product_track",
+      "title": "Kalshi Monster product track",
+      "description": "Canonical registry entry for Kalshi Monster prediction market intelligence app.",
+      "acceptance_criteria": [
+        "Registry record preserves product identity, price, and delivery model",
+        "Future storefront and funnel actions can reference the product slug"
+      ],
+      "dependencies": [],
+      "status": "open",
+      "owner": "shared",
+      "approval_required": false,
+      "next_due": "2026-06-17T18:00:00",
+      "created_at": "2026-06-16T13:54:49",
+      "updated_at": "2026-06-16T13:54:49",
+      "surface_name": "Kalshi Monster",
+      "surface_slug": "kalshi-monster",
+      "surface_type": "desktop_app",
+      "price": "$25",
+      "lifecycle_stage": "live",
+      "evidence": [
+        {
+          "kind": "repo",
+          "value": "C:/Users/ethan/kalshi-build/kalshi-monster"
+        }
+      ]
+    },
+    {
+      "id": "jonesinsrc-vst3-corvus-20260616-001",
+      "project": "jonesinsrc",
+      "source_system": "product-registry",
+      "source_area": "vst3-corvus",
+      "priority": "P1",
+      "risk_level": "low",
+      "category": "product_registry",
+      "action_type": "product_track",
+      "title": "VST3 Corvus product track",
+      "description": "Canonical registry entry for VST3 Corvus audio plugin.",
+      "acceptance_criteria": [
+        "Registry record preserves product identity, price, and delivery model"
+      ],
+      "dependencies": [],
+      "status": "open",
+      "owner": "shared",
+      "approval_required": false,
+      "created_at": "2026-06-16T13:54:49",
+      "updated_at": "2026-06-16T13:54:49",
+      "surface_name": "VST3 Corvus",
+      "surface_slug": "vst3-corvus",
+      "surface_type": "audio_plugin",
+      "price": "$10",
+      "lifecycle_stage": "live"
+    },
+    {
+      "id": "jonesinsrc-vst3-perihelion-20260616-001",
+      "project": "jonesinsrc",
+      "source_system": "product-registry",
+      "source_area": "vst3-perihelion",
+      "priority": "P1",
+      "risk_level": "low",
+      "category": "product_registry",
+      "action_type": "product_track",
+      "title": "VST3 Perihelion product track",
+      "description": "Canonical registry entry for VST3 Perihelion audio plugin.",
+      "acceptance_criteria": [
+        "Registry record preserves product identity, price, and delivery model"
+      ],
+      "dependencies": [],
+      "status": "open",
+      "owner": "shared",
+      "approval_required": false,
+      "created_at": "2026-06-16T13:54:49",
+      "updated_at": "2026-06-16T13:54:49",
+      "surface_name": "VST3 Perihelion",
+      "surface_slug": "vst3-perihelion",
+      "surface_type": "audio_plugin",
+      "price": "$10",
+      "lifecycle_stage": "live"
+    },
+    {
+      "id": "jonesinsrc-subscription-audit-20260616-001",
+      "project": "jonesinsrc",
+      "source_system": "product-registry",
+      "source_area": "subscription-audit",
+      "priority": "P2",
+      "risk_level": "low",
+      "category": "product_registry",
+      "action_type": "product_track",
+      "title": "Subscription Audit product track",
+      "description": "Canonical registry entry for Subscription Audit service.",
+      "acceptance_criteria": [
+        "Registry record preserves service identity and pricing model"
+      ],
+      "dependencies": [],
+      "status": "open",
+      "owner": "shared",
+      "approval_required": false,
+      "created_at": "2026-06-16T13:54:49",
+      "updated_at": "2026-06-16T13:54:49",
+      "surface_name": "Subscription Audit",
+      "surface_slug": "subscription-audit",
+      "surface_type": "service",
+      "price": "$5/run",
+      "lifecycle_stage": "live"
+    },
+    {
+      "id": "jonesinsrc-business-automation-20260616-001",
+      "project": "jonesinsrc",
+      "source_system": "product-registry",
+      "source_area": "business-automation",
+      "priority": "P2",
+      "risk_level": "low",
+      "category": "product_registry",
+      "action_type": "product_track",
+      "title": "Business Automation product track",
+      "description": "Canonical registry entry for Business Automation custom service.",
+      "acceptance_criteria": [
+        "Registry record preserves service identity and custom pricing model"
+      ],
+      "dependencies": [],
+      "status": "open",
+      "owner": "shared",
+      "approval_required": false,
+      "created_at": "2026-06-16T13:54:49",
+      "updated_at": "2026-06-16T13:54:49",
+      "surface_name": "Business Automation",
+      "surface_slug": "business-automation",
+      "surface_type": "service",
+      "price": "custom",
+      "lifecycle_stage": "live"
+    },
+    {
+      "id": "home-base-20260617-001",
+      "project": "home-base",
+      "source_system": "agent-registry",
+      "source_area": "core",
+      "priority": "P0",
+      "risk_level": "high",
+      "category": "agent_implementation",
+      "action_type": "project_track",
+      "title": "Home-base / Jarvis core track",
+      "description": "Canonical registry entry for the home-base project \u2014 the central AI infrastructure platform. Tracks agent implementations, action registry, and cross-project orchestration.",
+      "acceptance_criteria": [
+        "Registry record preserves project identity and architecture",
+        "Action registry tracks agent implementations across all projects",
+        "Cron jobs are registered and monitored"
+      ],
+      "dependencies": [],
+      "status": "open",
+      "owner": "shared",
+      "approval_required": false,
+      "next_due": "2026-06-20T06:05:00",
+      "created_at": "2026-06-17T03:36:00",
+      "updated_at": "2026-06-17T03:36:00",
+      "surface_name": "Home-base / Jarvis",
+      "surface_slug": "home-base",
+      "surface_type": "ai_platform",
+      "lifecycle_stage": "active_development",
+      "evidence": [
+        {
+          "kind": "repo",
+          "value": "C:/Projects/home-base-recovered"
+        }
+      ]
+    },
+    {
+      "id": "snitch-llc-20260617-001",
+      "project": "snitch-llc",
+      "source_system": "agent-registry",
+      "source_area": "core",
+      "priority": "P1",
+      "risk_level": "medium",
+      "category": "agent_implementation",
+      "action_type": "project_track",
+      "title": "Snitch LLC track",
+      "description": "Canonical registry entry for Snitch LLC data pipeline project.",
+      "acceptance_criteria": [
+        "Registry record preserves project identity and pipeline status",
+        "Daily cron integrity pass is registered"
+      ],
+      "dependencies": [],
+      "status": "open",
+      "owner": "shared",
+      "approval_required": false,
+      "next_due": "2026-06-19T12:05:00",
+      "created_at": "2026-06-17T03:36:00",
+      "updated_at": "2026-06-17T03:36:00",
+      "surface_name": "Snitch LLC",
+      "surface_slug": "snitch-llc",
+      "surface_type": "data_pipeline",
+      "lifecycle_stage": "active",
+      "evidence": [
+        {
+          "kind": "repo",
+          "value": "C:/Projects/snitch-llc"
+        }
+      ]
+    },
+    {
+      "id": "prizepicks-monster-rebuild-20260619-001",
+      "project": "prizepicks-monster",
+      "source_system": "agent-registry",
+      "source_area": "rebuild",
+      "priority": "P0",
+      "risk_level": "high",
+      "category": "agent_implementation",
+      "action_type": "rebuild",
+      "title": "PrizePicks Monster rebuild from Kalshi Monster base",
+      "description": "Rebuild PrizePicks Monster as a new project using Kalshi Monster codebase as the foundation. WSL data loss destroyed the original repo. New repo at C:/Projects/prizepicks-monster.",
+      "acceptance_criteria": [
+        "New repo created at C:/Projects/prizepicks-monster",
+        "All Kalshi-specific code removed or rebranded to PrizePicks",
+        "Player prop fetcher implemented (mock data acceptable for v1)",
+        "Chat context builder rewritten for DFS player props",
+        "Frontend UI rebranded (PrizePicks Monster, prop board, etc.)",
+        "Tauri commands registered for prop data (get_props, search_props, get_scored_props)",
+        "Cron job workdir updated to new repo path",
+        "System prompt rewritten for DFS player prop analysis"
+      ],
+      "dependencies": [
+        "jonesinsrc-prizepicks-monster-20260616-001"
+      ],
+      "status": "done",
+      "owner": "shared",
+      "approval_required": false,
+      "created_at": "2026-06-19T10:30:00",
+      "updated_at": "2026-06-19T19:14:29",
+      "completed_at": "2026-06-19T12:00:00",
+      "result_summary": "PrizePicks Monster rebuilt from Kalshi Monster base. 107 Tauri commands registered (4 new prop commands). Frontend rebranded. Cron workdir updated. Prop fetcher returns mock data \u2014 real OpticOdds/Apify integration pending.",
+      "evidence": [
+        {
+          "kind": "repo",
+          "value": "C:/Projects/prizepicks-monster"
+        },
+        {
+          "kind": "cron",
+          "value": "Cron 119560f88d7a workdir updated to C:/Projects/prizepicks-monster"
+        }
+      ]
+    },
+    {
+      "id": "cron-fix-wsl-paths-20260619-001",
+      "project": "home-base",
+      "source_system": "agent-registry",
+      "source_area": "cron",
+      "priority": "P0",
+      "risk_level": "high",
+      "category": "agent_implementation",
+      "action_type": "fix",
+      "title": "Fix cron job workdirs for WSL-migrated projects",
+      "description": "Jarvis, PrizePicks Monster, and Kalshi Monster cron jobs had stale WSL UNC workdirs. Projects were moved to native Windows paths. Updated all three cron workdirs.",
+      "acceptance_criteria": [
+        "Jarvis cron workdir points to C:/Projects/home-base-recovered",
+        "PrizePicks Monster cron workdir points to C:/Projects/prizepicks-monster",
+        "Kalshi Monster cron workdir points to C:/Users/ethan/kalshi-build/kalshi-monster"
+      ],
+      "dependencies": [],
+      "status": "done",
+      "owner": "shared",
+      "approval_required": false,
+      "created_at": "2026-06-19T10:30:00",
+      "updated_at": "2026-06-19T12:00:00",
+      "completed_at": "2026-06-19T12:00:00",
+      "result_summary": "All three cron workdirs updated from WSL UNC paths to native Windows paths. JonesinSRC, WallSlayer, and Snitch LLC crons were already on native paths.",
+      "evidence": [
+        {
+          "kind": "cron",
+          "value": "Jarvis: 144012158c66 -> C:/Projects/home-base-recovered"
+        },
+        {
+          "kind": "cron",
+          "value": "PrizePicks: 119560f88d7a -> C:/Projects/prizepicks-monster"
+        },
+        {
+          "kind": "cron",
+          "value": "Kalshi: 530395f0b729 -> C:/Users/ethan/kalshi-build/kalshi-monster"
+        }
+      ]
+    }
+  ]
+}

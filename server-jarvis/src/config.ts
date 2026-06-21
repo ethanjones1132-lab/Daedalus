@@ -201,6 +201,7 @@ export function defaultConfig(): JarvisConfig {
       base_url: "http://localhost:11434/v1",
       model: "qwen3.5-9b:latest",
       auto_pull: true,
+      health_check_interval_ms: 30000,
       options: {
         num_ctx: 8192,
         num_gpu: 31,

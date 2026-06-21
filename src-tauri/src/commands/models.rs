@@ -390,7 +390,7 @@ pub async fn discover_models_openrouter(api_key: String) -> Result<Vec<Discovere
                         || (parse_price(&pricing_prompt) == Some(0.0)
                             && parse_price(&pricing_completion) == Some(0.0));
                     let tokenizer_is_router = v
-                 
+                        .get("architecture")
                         .and_then(|a| a.get("tokenizer"))
                         .and_then(|t| t.as_str())
                         .map(|t| t == "Router")

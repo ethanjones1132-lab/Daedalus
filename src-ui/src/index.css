@@ -1,400 +1,45 @@
-@import "tailwindcss";
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
 
-@theme {
-  /* ═══════════════════════════════════════════════════════════
-     Mythos Design System
-     OLED-black canvas · monochromatic violet/charcoal base · single cyan signature accent
-     Inspired by Fable 5 / Mythos aesthetic standards: heavy mass, tactile depth,
-     1px light edge, ambient aurora, restraint over noise.
-     ═══════════════════════════════════════════════════════════ */
-
-  /* Metallic Blacks — deeper, slightly violet-tinted */
-  --color-void: #06060a;
-  --color-obsidian: #0a0a12;
-  --color-charcoal: #0f0f18;
-  --color-iron: #161624;
-  --color-slate-dark: #1f1f30;
-
-  /* Surface elevations (alpha for glass layering) */
-  --color-surface-1: rgba(15, 15, 24, 0.55);
-  --color-surface-2: rgba(20, 20, 32, 0.72);
-  --color-surface-3: rgba(26, 26, 42, 0.88);
-  --color-surface-raised: #1a1a28;
-
-  /* Royal Purple — accent family (the base of the brand) */
-  --color-royal: #8b5cf6;
-  --color-royal-light: #a78bfa;
-  --color-royal-dark: #6d28d9;
-  --color-royal-muted: #7c3aed;
-  --color-royal-glow: rgba(139, 92, 246, 0.45);
-
-  /* Cyan Neon — THE signature accent. Use sparingly. */
-  --color-cyan-neon: #22d3ee;
-  --color-cyan-glow: #67e8f
-  --color-cyan-dim: #0e7490;
-  --color-cyan-glow-a: rgba(34, 211, 238, 0.5);
-
-  /* Aurora — the only multi-hue effect we use. Sits behind everything. */
-  --color-aurora-1: #22d3ee;
-  --color-aurora-2: #8b5cf6;
-  --color-aurora-3: #ec4899;
-
-  /* Semantic */
-  --color-success: #34d399;
-  --color-warning: #fbbf24;
-  --color-error: #f87171;
-
-  /* Text — the bone palette. Use the right opacity for the right hierarchy. */
-  --color-bone: #f0f0fa;
-  --color-bone-muted: #a0a0c8;
-  --color-bone-dim: #6a6a90;
-  --color-bone-faint: #404060;
-
-  /* Typography */
-  --font-sans: 'Inter', 'SF Pro Display', system-ui, -apple-system, sans-serif;
-  --font-mono: 'JetBrains Mono', 'Fira Code', 'SF Mono', monospace;
-  --font-display: 'Inter', 'SF Pro Display', system-ui, sans-serif;
-
-  /* Mythos spring physics — heavy, weighty, not bouncy */
-  --ease-mythos-out: cubic-bezier(0.16, 1, 0.3, 1);
-  --ease-mythos-in-out: cubic-bezier(0.65, 0, 0.35, 1);
-  --ease-mythos-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
-  --ease-mythos-snap: cubic-bezier(0.4, 0, 0.2, 1);
+:root {
+  color-scheme: dark;
 }
 
-/* ═══════════════════════════════════════════════════════════
-   Base
-   ═══════════════════════════════════════════════════════════ */
-
-body {
-  background-color: var(--color-void);
-  color: var(--color-bone);
-  font-family: var(--font-sans);
-  margin: 0;
-  padding: 0;
-  overflow: hidden;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  font-feature-settings: 'cv11', 'ss01', 'ss03';
-  text-rendering: optimizeLegibility;
-}
-
+html,
+body,
 #root {
-  width: 100vw;
-  height: 100vh;
-  position: relative;
-  isolation: isolate;
+  height: 100%;
+  margin: 0;
+  background-color: #0a0a0b;
+  color: #f5f5f0;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    'Segoe UI', sans-serif;
 }
 
-/* ═══════════════════════════════════════════════════════════
-   Atmospheric Background (the Mythos canvas)
-   Three layers: aurora (slow drift) + grain (subtle film texture) + vignette
-   CSS-only, GPU-friendly, behind everything via stacking context.
-   ═══════════════════════════════════════════════════════════ */
-
-#root::before {
-  content: '';
-  position: fixed;
-  inset: -10vmax;
-  z-index: -2;
-  background:
-    radial-gradient(60vmax 50vmax at 15% 10%, rgba(139, 92, 246, 0.18), transparent 60%),
-    radial-gradient(55vmax 45vmax at 90% 25%, rgba(34, 211, 238, 0.10), transparent 65%),
-    radial-gradient(50vmax 60vmax at 75% 95%, rgba(236, 72, 153, 0.07), transparent 60%),
-    radial-gradient(45vmax 40vmax at 5% 85%, rgba(139, 92, 246, 0.10), transparent 60%);
-  filter: blur(40px) saturate(1.2);
-  animation: mythos-aurora 24s ease-in-out infinite alternate;
-  pointer-events: none;
-}
-
-#root::after {
-  content: '';
-  position: fixed;
-  inset: 0;
-  z-index: -1;
-  pointer-events: none;
-  background:
-    /* Vignette */
-    radial-gradient(ellipse at center, transparent 50%, rgba(0, 0, 0, 0.55) 100%),
-    /* Subtle scanline for premium OLED feel */
-    repeating-linear-gradient(0deg, transparent 0px, transparent 2px, rgba(255, 255, 255, 0.005) 3px);
-  mix-blend-mode: overlay;
-  opacity: 0.8;
-}
-
-@keyframes mythos-aurora {
-  0%   { transform: translate3d(0, 0, 0) scale(1); }
-  50%  { transform: translate3d(2vmax, -1vmax, 0) scale(1.05); }
-  100% { transform: translate3d(-1vmax, 1vmax, 0) scale(1.02); }
-}
-
-/* Film grain — separate from vignette so it can pulse independently */
+/* Subtle noise grain for the Mythos overlay. */
 .mythos-grain {
   position: fixed;
   inset: 0;
-  z-index: 100;
   pointer-events: none;
-  opacity: 0.035;
+  background-image: radial-gradient(rgba(255, 255, 255, 0.025) 1px, transparent 1px);
+  background-size: 3px 3px;
   mix-blend-mode: overlay;
-  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-  background-size: 200px 200px;
-  animation: mythos-grain-shift 1.6s steps(6) infinite;
+  z-index: 0;
 }
 
-@keyframes mythos-grain-shift {
-  0%   { transform: translate(0, 0); }
-  20%  { transform: translate(-2%, 1%); }
-  40%  { transform: translate(1%, -1%); }
-  60%  { transform: translate(-1%, 2%); }
-  80%  { transform: translate(2%, 1%); }
-  100% { transform: translate(0, 0); }
-}
-
-/* ═══════════════════════════════════════════════════════════
-   Companion sprite pixel rendering (preserved)
-   ═══════════════════════════════════════════════════════════ */
-
-.pixel-companion-sprite {
-  background-position: 0 0;
-  background-repeat: no-repeat;
-  image-rendering: pixelated;
-  image-rendering: crisp-edges;
-}
-
-@keyframes pixel-companion-play {
-  from { background-position: 0 0; }
-  to   { background-position: calc(-1 * var(--pixel-strip-width)) 0; }
-}
-
-/* ═══════════════════════════════════════════════════════════
-   Scrollbar — minimal, premium
-   ═══════════════════════════════════════════════════════════ */
-
+/* Custom scrollbar — keeps the chat transcript readable. */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 8px;
+  height: 8px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: linear-gradient(180deg, var(--color-iron), var(--color-slate-dark));
-  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--color-royal);
-}
-
-/* ═══════════════════════════════════════════════════════════
-   Glass utilities — the Mythos material layer
-   ═══════════════════════════════════════════════════════════ */
-
-.glass {
-  background: var(--color-surface-1);
-  backdrop-filter: blur(24px) saturate(1.5);
-  -webkit-backdrop-filter: blur(24px) saturate(1.5);
-}
-
-.glass-strong {
-  background: var(--color-surface-2);
-  backdrop-filter: blur(40px) saturate(1.7);
-  -webkit-backdrop-filter: blur(40px) saturate(1.7);
-}
-
-/* The Mythos glass — the canonical surface. Apply to elevated cards. */
-.glass-mythos {
-  background:
-    linear-gradient(135deg, rgba(255, 255, 255, 0.04) 0%, rgba(255, 255, 255, 0) 50%, rgba(139, 92, 246, 0.03) 100%),
-    var(--color-surface-2);
-  backdrop-filter: blur(28px) saturate(1.6);
-  -webkit-backdrop-filter: blur(28px) saturate(1.6);
-  position: relative;
-  isolation: isolate;
-}
-
-/* ═══════════════════════════════════════════════════════════
-   Neon glows — signature accent only
-   ═══════════════════════════════════════════════════════════ */
-
-.neon-glow-cyan {
-  box-shadow:
-    0 0 12px var(--color-cyan-glow-a),
-    0 0 32px rgba(34, 211, 238, 0.12),
-    inset 0 0 12px rgba(34, 211, 238, 0.04);
-}
-
-.neon-glow-royal {
-  box-shadow:
-    0 0 12px var(--color-royal-glow),
-    0 0 32px rgba(139, 92, 246, 0.12),
-    inset 0 0 12px rgba(139, 92, 246, 0.04);
-}
-
-.neon-glow-amber {
-  box-shadow:
-    0 0 12px rgba(251, 191, 36, 0.3),
-    0 0 32px rgba(251, 191, 36, 0.12);
-}
-
-.neon-glow-soft {
-  box-shadow:
-    0 0 24px rgba(139, 92, 246, 0.18),
-    0 0 60px rgba(34, 211, 238, 0.08);
-}
-
-/* ═══════════════════════════════════════════════════════════
-   Selection
-   ═══════════════════════════════════════════════════════════ */
-
-::selection {
-  background: rgba(34, 211, 238, 0.35);
-  color: var(--color-bone);
-  text-shadow: 0 0 12px var(--color-cyan-glow-a);
-}
-
-/* ═══════════════════════════════════════════════════════════
-   Light theme override
-   ═══════════════════════════════════════════════════════════ */
-
-[data-theme="light"] {
-  --color-void: #f6f6fa;
-  --color-obsidian: #ececf4;
-  --color-charcoal: #dcdce8;
-  --color-iron: #c8c8dc;
-  --color-slate-dark: #b0b0cc;
-  --color-surface-1: rgba(234, 234, 242, 0.75);
-  --color-surface-2: rgba(228, 228, 240, 0.88);
-  --color-surface-3: rgba(218, 218, 232, 0.95);
-  --color-bone: #1a1a2e;
-  --color-bone-muted: #4a4a6a;
-  --color-bone-dim: #7070a0;
-  --color-bone-faint: #9090b8;
-}
-
-[data-theme="light"] body {
-  background-color: var(--color-void);
-  color: var(--color-bone);
-}
-
-[data-theme="light"] .glass { background: var(--color-surface-1); }
-[data-theme="light"] .glass-strong { background: var(--color-surface-2); }
-
-/* ═══════════════════════════════════════════════════════════
-   highlight.js — Enterprise Gothic Theme (preserved)
-   ═══════════════════════════════════════════════════════════ */
-
-.hljs { color: #e8e8f8; background: transparent; }
-.hljs-keyword, .hljs-selector-tag, .hljs-deletion { color: #c084fc; }
-.hljs-string, .hljs-addition { color: #34d399; }
-.hljs-number, .hljs-literal { color: #fbbf24; }
-.hljs-comment, .hljs-quote { color: #5a5a7a; font-style: italic; }
-.hljs-title, .hljs-section { color: #67e8f9; }
-.hljs-type, .hljs-class .hljs-title { color: #a78bfa; }
-.hljs-variable, .hljs-template-variable { color: #f87171; }
-.hljs-attr, .hljs-attribute { color: #22d3ee; }
-.hljs-built_in, .hljs-builtin-name { color: #67e8f9; }
-.hljs-meta { color: #9090b8; }
-.hljs-symbol, .hljs-bullet { color: #fbbf24; }
-.hljs-link { color: #22d3ee; text-decoration: underline; }
-.hljs-params { color: #e8e8f8; }
-.hljs-regexp { color: #f87171; }
-
-/* ═══════════════════════════════════════════════════════════
-   Markdown Prose
-   ═══════════════════════════════════════════════════════════ */
-
-.jarvis-markdown { word-break: break-word; overflow-wrap: break-word; }
-.jarvis-markdown pre code { font-family: var(--font-mono); }
-.jarvis-markdown p code,
-.jarvis-markdown li code,
-.jarvis-markdown td code { font-family: var(--font-mono); }
-
-/* ═══════════════════════════════════════════════════════════
-   Utility primitives — Mythos motion language
-   ═══════════════════════════════════════════════════════════ */
-
-/* The Mythos perspective wrapper for 3D tilt effects. */
-.mythos-perspective {
-  perspective: 1200px;
-  perspective-origin: 50% 50%;
-  transform-style: preserve-3d;
-}
-
-/* Edge-lit frame: 1px gradient inner border. Use as a wrapper or via ::before. */
-.mythos-edge {
-  position: relative;
-  isolation: isolate;
-}
-.mythos-edge::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  padding: 1px;
-  border-radius: inherit;
-  background: linear-gradient(
-    135deg,
-    rgba(255, 255, 255, 0.18) 0%,
-    rgba(255, 255, 255, 0.04) 25%,
-    rgba(139, 92, 246, 0.08) 50%,
-    rgba(255, 255, 255, 0) 75%,
-    rgba(34, 211, 238, 0.12) 100%
-  );
-  -webkit-mask:
-    linear-gradient(#000 0 0) content-box,
-    linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-          mask-composite: exclude;
-  pointer-events: none;
-  z-index: 1;
-}
-
-/* Shimmer — used on progress bars and active elements. */
-.mythos-shimmer {
-  position: relative;
-  overflow: hidden;
-}
-.mythos-shimmer::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(
-    100deg,
-    transparent 30%,
-    rgba(255, 255, 255, 0.12) 50%,
-    transparent 70%
-  );
-  transform: translateX(-100%);
-  animation: mythos-shimmer-slide 2.4s var(--ease-mythos-in-out) infinite;
-}
-@keyframes mythos-shimmer-slide {
-  to { transform: translateX(100%); }
-}
-
-/* Pulse glow — the "I'm alive" indicator on status dots. */
-.mythos-pulse-glow {
-  position: relative;
-}
-.mythos-pulse-glow::before {
-  content: '';
-  position: absolute;
-  inset: -2px;
-  border-radius: inherit;
-  background: currentColor;
-  opacity: 0.4;
-  filter: blur(8px);
-  animation: mythos-pulse 2.4s var(--ease-mythos-in-out) infinite;
-  z-index: -1;
-}
-@keyframes mythos-pulse {
-  0%, 100% { opacity: 0.3; transform: scale(1); }
-  50%      { opacity: 0.6; transform: scale(1.08); }
-}
-
-/* Reduced motion — respect the user. */
-@media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
-  }
+  background: rgba(255, 255, 255, 0.15);
 }

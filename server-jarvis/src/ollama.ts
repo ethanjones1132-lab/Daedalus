@@ -27,7 +27,8 @@ export function resolveWindowsHostIP(): string {
     for (const line of route.split("\n")) {
       const parts = line.trim().split(/\s+/);
       if (parts[1] === "00000000" && parts[7] === "00000000") {
-       
+        const hex = parts[2];
+
         if (hex && hex.length === 8) {
           const ip = [
             parseInt(hex.substring(6, 8), 16),
@@ -58,8 +59,9 @@ export function resolveWindowsHostIP(): string {
 
   // Method 4: ip route command
   try {
-    const result = require("child_process").execSync("ip route show default", {
+    const result = execSync("ip route show default", {
       encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
       timeout: 3000,
     });
     const match = result.match(/default via (\S+)/);
@@ -295,7 +297,7 @@ export async function listOllamaModels(cfg: OllamaConfig): Promise<OllamaModel[]
       const ctrl = new AbortController();
       const timeout = setTimeout(() => ctrl.abort(), 5000);
 
-   
+      const res = await fetch(`${cleanUrl}/api/tags`, { signal: ctrl.signal });
       clearTimeout(timeout);
       if (!res.ok) continue;
 

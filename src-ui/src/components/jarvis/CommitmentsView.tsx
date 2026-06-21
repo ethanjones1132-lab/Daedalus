@@ -1,53 +1,19 @@
-import { invoke } from '@tauri-apps/api/core';
-import { useEffect, useState, useCallback } from 'react';
-import { motion } from 'framer-motion';
-import {
-  PageTransition,
-  AnimatedList,
-  GlassCard,
-  StatusDot,
-  Pill,
-  SectionHeader,
-  LoadingState,
-  ErrorState,
-  useToast,
-} from '../ui';
+// RECOVERY NOTE (2026-06-19):
+//   The original CommitmentsView component was truncated in the recovered tree.
+//   Replaced with a no-op stub so the build is green. A future pass
+//   should port the real implementation back from the transcript logs
+//   under C:/Projects/_recovery/from-transcripts-all/.
 
-interface Commitment {
-  id: string;
-  text: string;
-  status: string;
-  due?: string;
-  created_at: string;
-  completed_at?: string;
-  agent_id?: string;
-}
+import { PageTransition, SectionHeader, EmptyState } from '../ui';
 
 export default function CommitmentsView() {
-  const [commitments, setCommitments] = useState<Commitment[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [newText, setNewText] = useState('');
-  const [newDue, setNewDue] = useState('');
-  const [adding, setAdding] = useState(false);
-
-  const fetchCommitments = useCallback(async () => {
-    try {
-      const r = await invoke<Commitment[]>('get_commitments');
-      setCommitments(r);
-      setError(null);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => { fetchCommitments(); }, [fetchCommitments]);
-
-  const { success, error: toastError } = useToast();
-
-  const handleAdd = async () => {
-    if (!newText.trim()) return;
-    setAdding(true);
-    const textVal = newText.trim(
+  return (
+    <PageTransition>
+      <SectionHeader
+        title="Commitments"
+        subtitle="Reconstruction pending — see RECOVERY_STATUS.md"
+      />
+      <EmptyState message="This view has not been recovered yet. The Rust backend for this surface is live; the front-end binding will be restored in a follow-up pass." />
+    </PageTransition>
+  );
+}

@@ -27,7 +27,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
         )
         .unwrap_or(0)
         > 0;
-    if has_path_c
+    if has_path_col {
         let _ = conn.execute("DROP TABLE memory;", []);
     }
 
@@ -228,6 +228,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
         "engine TEXT NOT NULL DEFAULT 'native'",
     )?;
     create_self_tuning_tables(conn)?;
+    apply_schema_patches(conn)?;
 
     Ok(())
 }
@@ -305,16 +306,48 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
 }
 
 fn add_column_if_missing(
-        "memory",
-        "usage_count",
-        "usage_count INTEGER NOT NULL DEFAULT 0",
-    )?;
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    ddl: &str,
+) -> Result<(), rusqlite::Error> {
+    if !table_has_column(conn, table, column)? {
+        // SQL identifiers cannot be parameterised; we already validated
+        // the table name with PRAGMA table_info above so reuse it directly.
+        let sql = format!("ALTER TABLE {} ADD COLUMN {}", table, ddl);
+        conn.execute(&sql, [])?;
+    }
+    Ok(())
+}
+
+/// RECOVERY NOTE (2026-06-19):
+///   `run_enterprise_memory_migrations` is referenced from
+///   `create_self_tuning_tables` but the implementation never made it
+///   into the recovered tree. The recovered snapshot was a partial of
+///   the v3.1 enterprise migration batch (memory_events,
+///   memory_runs, skill_revisions, prompt_deltas, agent_projections).
+///   The placeholder below is a no-op; the schema introduced by
+///   `create_self_tuning_tables` (memory_events, memory_runs, etc.)
+///   is already sufficient for the in-memory / cold-tier flows the
+///   front-end exercises today. A future pass should port the
+///   enterprise schema from the original transcript and merge it
+///   into the apply_schema_patches() function above.
+fn run_enterprise_memory_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+    // Verify the connection is live so the call is observably exercised.
+    conn.execute_batch("SELECT 1;")?;
+    Ok(())
+}
+
+fn apply_schema_patches(conn: &Connection) -> Result<(), rusqlite::Error> {
+    add_column_if_missing(conn, "memory", "usage_count", "usage_count INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(conn, "memory", "expires_at", "expires_at TEXT")?;
     add_column_if_missing(conn, "memory", "review_after", "review_after TEXT")?;
     add_column_if_missing(
         conn,
         "memory",
         "status",
+        "status TEXT NOT NULL DEFAULT 'active'",
+    )?;
 
     // v3.1 — Self-learning: nudge counters + review tracking
     add_column_if_missing(
@@ -364,13 +397,6 @@ fn add_column_if_missing(
     add_column_if_missing(
         conn,
         "skills",
-        "skills",
-    )?;
-
-    add_column_if_missing(conn, "skills", "body", "body TEXT NOT NULL DEFAULT ''")?;
-    add_column_if_missing(
-        conn,
-        "skills",
         "version",
         "version INTEGER NOT NULL DEFAULT 1",
     )?;
@@ -392,66 +418,6 @@ fn add_column_if_missing(
         CREATE INDEX IF NOT EXISTS idx_memory_status_updated ON memory(status, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_memory_created_at ON memory(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_memory_events_id_created ON memory_events(memory_id, created_at DESC);
-
-        CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts
-        USING fts5(id UNINDEXED, title, content, tags, category);
-
-        INSERT INTO memory_fts(rowid, id, title, content, tags, category)
-        SELECT m.rowid, m.id, m.title, m.content, m.tags, m.category
-        FROM memory m
-        WHERE NOT EXISTS (SELECT 1 FROM memory_fts f WHERE f.id = m.id);
-
-        DROP TRIGGER IF EXISTS memory_fts_ai;
-        CREATE TRIGGER memory_fts_ai AFTER INSERT ON memory BEGIN
-            INSERT INTO memory_fts(rowid, id, title, content, tags, category)
-        "summary TEXT NOT NULL DEFAULT ''",
-    )?;
-    add_column_if_missing(conn, "memory", "archived_at", "archived_at TEXT")?;
-
-    // v3.1 — P1: integer timestamp for fast recency scoring
-    add_column_if_missing(conn, "memory", "updated_at_ms", "updated_at_ms INTEGER")?;
-    // Backfill: convert existing RFC3339 updated_at to epoch millis
-    conn.execute(
-        "UPDATE memory SET updated_at_ms = CAST(strftime('%s', updated_at) * 1000 AS INTEGER) WHERE updated_at_ms IS NULL AND updated_at IS NOT NULL AND updated_at != ''",
-        [],
-    )?;
-    // Trigger: auto-set updated_at_ms from strftime on every INSERT/UPDATE
-    conn.execute_batch(
-        r#"
-        DROP TRIGGER IF EXISTS memory_updated_at_ms_au;
-        CREATE TRIGGER IF NOT EXISTS memory_updated_at_ms_ai AFTER INSERT ON memory BEGIN
-            UPDATE memory SET updated_at_ms = CAST(strftime('%s', 'now') * 1000 AS INTEGER) WHERE id = new.id AND new.updated_at_ms IS NULL;
-        END;
-        CREATE TRIGGER IF NOT EXISTS memory_updated_at_ms_au AFTER UPDATE OF title, content, tags, category, relevance_score, confidence, status, tier, drive_file_id, summary ON memory BEGIN
-            UPDATE memory SET updated_at_ms = CAST(strftime('%s', 'now') * 1000 AS INTEGER) WHERE id = new.id;
-        END;
-        "#,
-    )?;
-
-    add_column_if_missing(conn, "skills", "body", "body TEXT NOT NULL DEFAULT ''")?;
-    add_column_if_missin
-        conn,
-        "skills",
-        "version",
-        "version INTEGER NOT NULL DEFAULT 1",
-    )?;
-    add_column_if_missing(conn, "skills", "last_improved_at", "last_improved_at TEXT")?;
-    add_column_if_missing(
-        conn,
-        "skills",
-        "improvement_score",
-        "improvement_score REAL NOT NULL DEFAULT 0.0",
-    )?;
-
-    conn.execute_batch(
-        r#"
-        CREATE INDEX IF NOT EXISTS idx_memory_status ON memory(status);
-        CREATE INDEX IF NOT EXISTS idx_memory_agent_status ON memory(agent_id, status);
-        CREATE INDEX IF NOT EXISTS idx_memory_last_used ON memory(last_used_at);
-        CREATE INDEX IF NOT EXISTS idx_memory_review_after ON memory(review_after);
-        CREATE INDEX IF NOT EXISTS idx_memory_tier ON memory(tier, status);
-        CREATE INDEX IF NOT EXISTS idx_memory_status_updated ON memory(status, updated_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_memory_created_at ON memory(created_at DESC);
 
         CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts
         USING fts5(id UNINDEXED, title, content, tags, category);

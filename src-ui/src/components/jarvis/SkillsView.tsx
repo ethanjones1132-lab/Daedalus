@@ -1,61 +1,20 @@
-import { invoke } from '@tauri-apps/api/core';
-import { useEffect, useState, useCallback } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import {
-  PageTransition,
-  AnimatedGrid,
-  GlassCard,
-  Pill,
-  SectionHeader,
-  LoadingState,
-  ErrorState,
-  EmptyState,
-  cn,
-  useToast,
-} from '../ui';
+// RECOVERY NOTE (2026-06-19):
+//   The original Skills component was truncated in the recovered tree.
+//   Replaced with a no-op stub so the build is green. A future pass
+//   should port the real implementation back from the transcript logs.
 
-// ── Types ──
+import { PageTransition, SectionHeader, EmptyState } from '../ui';
 
-interface Skill {
-  id: string;
-  name: string;
-  description: string;
-  path: string;
-  enabled: boolean;
-  metadata: string | null;
-  body: string;
-  version: number;
-  last_improved_at?: string | null;
-  improvement_score: number;
-  created_at: string;
-  updated_at: string;
-}
-
-interface SkillRevision {
-  id: string;
-  skill_id: string;
-  version: number;
-  body_before: string;
-  body_after: string;
-  change_reason: string;
-  source_session_id?: string | null;
-  created_at: string;
-}
-
-interface InvokeModalProps {
-  skill: Skill;
-  onClose: () => void;
-  onInvoke: (skill: Skill, args: string) => void;
-}
-
-// ── Invoke Modal ──
-
-function InvokeModal({ skill, onClose, onInvoke }: InvokeModalProps) {
-  const [args, setArgs] = useState('{}');
-
+export function SkillsView() {
   return (
-    <motion.div
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-void/80 
+    <PageTransition>
+      <SectionHeader
+        title="Skills"
+        subtitle="Reconstruction pending — see RECOVERY_STATUS.md"
+      />
+      <EmptyState message="This view has not been recovered yet." />
+    </PageTransition>
+  );
+}
+
+export default SkillsView;

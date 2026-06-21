@@ -136,3 +136,225 @@ pub async fn compact_session_db(
         "summary": summary,
     }))
 }
+
+// ── Canonical session command surface ────────────────────────────────
+//
+// The Tauri commands below were missing from the recovered sessions.rs.
+// They're implemented against the same SQLite path that
+// `compact_session_db` uses, so they're durable across restarts.
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub agent_id: String,
+    pub title: String,
+    pub backend: String,
+    pub model: String,
+    pub context_tokens: i64,
+    pub total_tokens: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub archived: bool,
+    pub message_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMessageOut {
+    pub id: String,
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
+    pub tokens: i64,
+    pub tool_calls: Option<String>,
+    pub created_at: String,
+}
+
+#[tauri::command]
+pub fn list_sessions(db: State<AppDb>) -> Result<Vec<SessionSummary>, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.id, s.agent_id, s.title, s.backend, s.model,
+                    COALESCE(s.context_tokens, 0), COALESCE(s.total_tokens, 0),
+                    s.created_at, s.updated_at, COALESCE(s.archived, 0),
+                    COALESCE((SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id), 0)
+             FROM sessions s
+             ORDER BY s.updated_at DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(SessionSummary {
+                id: row.get(0)?,
+                agent_id: row.get(1)?,
+                title: row.get(2)?,
+                backend: row.get(3)?,
+                model: row.get(4)?,
+                context_tokens: row.get(5)?,
+                total_tokens: row.get(6)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+                archived: row.get::<_, i64>(9)? != 0,
+                message_count: row.get(10)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows {
+        if let Ok(s) = r {
+            out.push(s);
+        }
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn create_session(
+    db: State<AppDb>,
+    title: Option<String>,
+    agent_id: Option<String>,
+    backend: Option<String>,
+    model: Option<String>,
+) -> Result<SessionSummary, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let title = title.unwrap_or_else(|| "Untitled session".to_string());
+    let agent_id = agent_id.unwrap_or_else(|| "main".to_string());
+    let backend = backend.unwrap_or_else(|| "ollama".to_string());
+    let model = model.unwrap_or_else(|| "qwen3:8b".to_string());
+    conn.execute(
+        "INSERT INTO sessions (id, agent_id, title, backend, model, created_at, updated_at, archived, context_tokens, total_tokens)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0)",
+        rusqlite::params![&id, &agent_id, &title, &backend, &model, &now, &now],
+    )
+    .map_err(|e| format!("Failed to insert session: {}", e))?;
+    Ok(SessionSummary {
+        id,
+        agent_id,
+        title,
+        backend,
+        model,
+        context_tokens: 0,
+        total_tokens: 0,
+        created_at: now.clone(),
+        updated_at: now,
+        archived: false,
+        message_count: 0,
+    })
+}
+
+#[tauri::command]
+pub fn delete_session(db: State<AppDb>, session_id: String) -> Result<bool, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let affected = conn
+        .execute("DELETE FROM messages WHERE session_id = ?", rusqlite::params![&session_id])
+        .map_err(|e| e.to_string())?;
+    let _ = affected;
+    let n = conn
+        .execute("DELETE FROM sessions WHERE id = ?", rusqlite::params![&session_id])
+        .map_err(|e| e.to_string())?;
+    Ok(n > 0)
+}
+
+#[tauri::command]
+pub fn get_session_history(
+    db: State<AppDb>,
+    session_id: String,
+) -> Result<Vec<SessionMessageOut>, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, role, content, COALESCE(tokens, 0), tool_calls, created_at
+             FROM messages WHERE session_id = ? ORDER BY created_at ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([&session_id], |row| {
+            Ok(SessionMessageOut {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                tokens: row.get(4)?,
+                tool_calls: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows {
+        if let Ok(m) = r {
+            out.push(m);
+        }
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn append_message(
+    db: State<AppDb>,
+    session_id: String,
+    role: String,
+    content: String,
+    tokens: Option<i64>,
+) -> Result<String, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let t = tokens.unwrap_or(0);
+    conn.execute(
+        "INSERT INTO messages (id, session_id, role, content, tokens, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        rusqlite::params![&id, &session_id, &role, &content, t, &now],
+    )
+    .map_err(|e| format!("Failed to insert message: {}", e))?;
+    // Bump session's updated_at so list_sessions reorders correctly.
+    let _ = conn.execute(
+        "UPDATE sessions SET updated_at = ? WHERE id = ?",
+        rusqlite::params![&now, &session_id],
+    );
+    Ok(id)
+}
+
+#[tauri::command]
+pub fn export_session(
+    db: State<AppDb>,
+    session_id: String,
+    out_path: String,
+) -> Result<String, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, role, content, COALESCE(tokens, 0), tool_calls, created_at
+             FROM messages WHERE session_id = ? ORDER BY created_at ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([&session_id], |row| {
+            Ok(SessionMessageOut {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                tokens: row.get(4)?,
+                tool_calls: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = String::from("# Session export\n\n");
+    for r in rows {
+        if let Ok(m) = r {
+            out.push_str(&format!(
+                "## {} ({})\n\n{}\n\n",
+                m.role,
+                m.created_at,
+                m.content
+            ));
+        }
+    }
+    std::fs::write(&out_path, out).map_err(|e| format!("Failed to write export: {}", e))?;
+    Ok(out_path)
+}

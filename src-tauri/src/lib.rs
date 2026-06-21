@@ -23,6 +23,7 @@ pub(crate) static SERVER_PROCESS: std::sync::OnceLock<
     std::sync::Mutex<Option<std::process::Child>>,
 > = std::sync::OnceLock::new();
 
+#[allow(dead_code)]
 pub(crate) static SERVER_SPAWNING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -452,9 +453,13 @@ pub fn get_home_dir() -> String {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let jarvis_config = Arc::new(Mutex::new(crate::jarvis::types::JarvisConfig::default()));
+    let jarvis_queue = Arc::new(crate::jarvis::queue::MessageQueue::new(
+        jarvis_config.clone(),
+    ));
 
     let jarvis_state = JarvisState {
         config: jarvis_config.clone(),
+        queue: jarvis_queue,
         http_client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .pool_max_idle_per_host(10)

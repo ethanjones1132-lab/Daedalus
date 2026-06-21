@@ -205,7 +205,7 @@ export interface BridgeRequest {
   session: string;
   timeout_secs?: number;
 }
-              }
+
 export interface BridgeResponse {
   response: string;
   session_id: string;
@@ -288,7 +288,10 @@ export function saveCompanionState(state: CompanionState): void {
 // ═══════════════════════════════════════════════════════════════
 // ── Constants ──
 // ═══════════════════════════════════════════════════════════════
-const PORT = 19877;
+const PORT = Number(process.env.JARVIS_SERVER_PORT ?? 19877);
+if (!Number.isInteger(PORT) || PORT <= 0 || PORT > 65535) {
+  throw new Error(`JARVIS_SERVER_PORT must be an integer between 1 and 65535, got ${process.env.JARVIS_SERVER_PORT}`);
+}
 const BRIDGE_PORT = 19876;
 const JARVIS_VERSION = "3.0.0";
 
@@ -558,7 +561,7 @@ function selectInstalledOllamaModel(cfg: JarvisConfig, installedModels: string[]
     ...profileModelIds,
     "qwen3.5-9b:latest",
     "qwen3.5-9b",
-  }
+  ]);
 
   const firstUsefulModel = installedModels.find((name) => !name.includes("embed"))
     ?? installedModels[0]
@@ -654,17 +657,6 @@ async function resolveOllamaChatTarget(cfg: JarvisConfig): Promise<{ chatUrl: st
   return fallback;
 }
 
-  const fallbackUrl = ollamaBaseUrlCandidates(cfg.ollama)[0] ?? "http://localhost:11434";
-  const fallback = {
-    chatUrl: `${fallbackUrl}/v1/chat/completions`,
-    modelName: cfg.ollama.model,
-    tried,
-    supportsNativeTools: false,
-  };
-  ollamaTargetCache.set(cacheKey, { ...fallback, timestamp: now });
-  return fallback;
-}
-
 async function resolveOpenRouterModel(cfg: JarvisConfig): Promise<string> {
   const requested = cfg.openrouter.model;
   const candidates = uniqueStrings([
@@ -728,6 +720,10 @@ async function compactHistory(
     : `${cfg.openrouter.base_url}/chat/completions`;
 
   const requestBody: Record<string, any> = {
+    model: modelName,
+    messages: [
+      { role: "system", content: "Summarize the conversation history concisely. Preserve key facts, decisions, tasks, and unresolved issues." },
+      ...oldMessages,
     ],
     stream: false,
     temperature: surfaceTemperature(cfg, "compaction"),
@@ -876,18 +872,6 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       if ((m as any).tool_call_id) msg.tool_call_id = (m as any).tool_call_id;
       return msg;
     });
-async function streamJarvis(message: string, sessionId: string, options: StreamJarvisOptions = {}): Promise<Response> {
-  const cfg = resolveConfig(options.config);
-  const surface: SurfaceType = options.surface ?? "chat";
-  const effectiveTemp = surfaceTemperature(cfg, surface);
-  const turnHistory = (options.history ?? [])
-    .filter((m) => ["user", "assistant", "system", "tool"].includes(m.role))
-    .map((m) => {
-      const msg: any = { role: m.role, content: m.content || "" };
-      if ((m as any).tool_calls) msg.tool_calls = (m as any).tool_calls;
-      if ((m as any).tool_call_id) msg.tool_call_id = (m as any).tool_call_id;
-      return msg;
-    });
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -948,6 +932,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               for (const re of reasoningParser.processChunk(text)) {
                 if (re.type === "reasoning_step") {
                   await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
+                } else if (re.type === "reasoning_chunk") {
+                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: re.text, session_id: sessionId })}\n\n`));
+                } else if (re.type === "content") {
+                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: re.text }, session_id: sessionId })}\n\n`));
+                }
+              }
+            }
             await writer.write(encoder.encode(`data: ${JSON.stringify({ ...evt, session_id: sessionId })}\n\n`));
           } else if (evt.type === "error") {
             if (resumedSessionId) {
@@ -964,7 +955,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                   await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
                 } else if (re.type === "reasoning_chunk") {
                   await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: re.text, session_id: sessionId })}\n\n`));
-                } else {
+                } else if (re.type === "content") {
                   await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: re.text }, session_id: sessionId })}\n\n`));
                 }
               }
@@ -997,18 +988,6 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         }
 
         // Custom CallModelFn for pipeline execution
-        console.log(`[Jarvis Orchestrator] Starting session=${sessionId}`);
-
-        // Setup context message using turn history if present
-        let contextMessage = message;
-        if (turnHistory.length > 0) {
-          const formattedHistory = turnHistory
-            .map((m: any) => `[${m.role.toUpperCase()}]: ${m.content.slice(0, 1000)}${m.content.length > 1000 ? "..." : ""}`)
-            .join("\n");
-          contextMessage = `Conversation History:\n${formattedHistory}\n\nLatest User Request: ${message}`;
-        }
-
-        // Custom CallModelFn for pipeline execution
         const callModel = async (messages: any[], callOptions?: any) => {
           const isOllama = cfg.active_backend === "ollama";
           const ollamaTarget = isOllama ? await resolveOllamaChatTarget(cfg) : null;
@@ -1024,7 +1003,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             : null;
           const baseUrl = isOllama
             ? ollamaTarget!.chatUrl
-            : `${cfg.openrout
+            : `${cfg.openrouter.base_url}/chat/completions`;
 
           const modelSupportsNativeTools = isOllama
             ? (ollamaTarget?.supportsNativeTools ?? false)
@@ -1114,7 +1093,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             if (fetchErr.name === "AbortError") {
               if (streamAbort.signal.aborted) {
                 await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "cancelled", session_id: sessionId })}\n\n`));
-                return;
+                return { content: "", tool_calls: undefined };
               }
               throw new Error(`Request timed out after ${MODEL_REQUEST_TIMEOUT_MS / 1000}s. The model may be loading or overloaded.`);
             }
@@ -1185,7 +1164,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                           await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
                         } else if (re.type === "reasoning_chunk") {
                           await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: re.text, session_id: sessionId })}\n\n`));
-                        } else {
+                        } else if (re.type === "content") {
                           const sanitized = textStreamSanitizer.push(re.text);
                           if (sanitized) {
                             await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: sanitized }, session_id: sessionId })}\n\n`));
@@ -1212,7 +1191,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
               } else if (re.type === "reasoning_chunk") {
                 await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: re.text, session_id: sessionId })}\n\n`));
-              } else {
+              } else if (re.type === "content") {
                 const sanitized = textStreamSanitizer.push(re.text);
                 if (sanitized) {
                   await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: sanitized }, session_id: sessionId })}\n\n`));
@@ -1345,14 +1324,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           : `${cfg.openrouter.base_url}/chat/completions`;
         const modelName = mainModelName;
 
-        const textToolInstructions = !forceFinalAnswerOnly ? cach
+        const textToolInstructions = !forceFinalAnswerOnly ? cachedTextToolInstructions : "";
         const effectiveSystemPrompt = [systemPrompt, textToolInstructions].filter(Boolean).join("\n\n");
         const messages: Array<any> = [];
+        const compactProfile = cfg.profiles?.[cfg.active_profile];
         // ── Auto-compaction: summarize when context is filling up ──
         try {
-          const compactProfile = cfg.profiles?.[cfg.active_profile];
           const compactCtx = compactProfile?.context_window ?? cfg.ollama?.options?.num_ctx ?? 16384;
-
           // First, check if we can apply cached compaction on originalHistory
           const cached = compactionCache.get(sessionId);
           if (cached && originalHistory.length >= cached.originalLength) {
@@ -1503,7 +1481,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           if (useFallback) {
             const result = await chatCompletionWithFallback(cfg, requestBody, ctrl.signal);
             fetchRes = result.response;
-            actual
+            actualModelUsed = result.model_used;
             if (result.retries > 0) {
               console.log(`[OpenRouter] Used model ${result.model_used} after ${result.retries} retry attempt(s)`);
               await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "fallback_notice", model: result.model_used, retries: result.retries, session_id: sessionId })}\n\n`));
@@ -1587,10 +1565,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
               } else if (re.type === "reasoning_chunk") {
                 await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: re.text, session_id: sessionId })}\n\n`));
-              } else {
+              } else if (re.type === "content") {
                 await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: re.text }, session_id: sessionId })}\n\n`));
               }
-    
+            }
           } else {
             await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text }, session_id: sessionId })}\n\n`));
           }
@@ -1602,7 +1580,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
             } else if (re.type === "reasoning_chunk") {
               await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: re.text, session_id: sessionId })}\n\n`));
-            } else {
+            } else if (re.type === "content") {
               await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: re.text }, session_id: sessionId })}\n\n`));
             }
           }
@@ -1730,7 +1708,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
           console.warn(`[Jarvis] Enforcing explicit web search for session=${sessionId} model=${modelName}`);
           const toolResult = await runtime.execute(call, ctx);
-          const toolOutput = toolResult.i
+          const toolOutput = toolResult.is_error ? (toolResult.error || toolResult.output) : toolResult.output;
           await writer.write(encoder.encode(`data: ${JSON.stringify({
             type: "tool_result",
             call_id: call.id,
@@ -1827,7 +1805,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             // If the user was asked a question, stop the loop and wait for their response.
             if (call.name === "ask_user_question") {
               await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "message_stop", session_id: sessionId })}\n\n`));
-              await writer.write(encoder.encode(`data: ${JSO
+              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "result", subtype: "success", is_error: false, result: toolOutput, session_id: sessionId })}\n\n`));
               loopDone = true;
               break;
             }
@@ -1938,7 +1916,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
             // If the user was asked a question, stop the loop and wait for their response.
             if (tc.function.name === "ask_user_question") {
-              await writer.write
+              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "message_stop", session_id: sessionId })}\n\n`));
               await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "Waiting for user response to question.", session_id: sessionId })}\n\n`));
               loopDone = true;
               break;
@@ -1988,6 +1966,10 @@ async function isBridgeListening(): Promise<boolean> {
         socket.destroy();
         resolve(true);
       });
+      socket.on("error", () => resolve(false));
+    });
+  } catch {
+    return false;
   }
 }
 
@@ -2048,64 +2030,44 @@ async function stopBridge(): Promise<boolean> {
   return stopped;
 }
 
-      return Response.json({ ok: true, uptime: process.uptime(), version: JARVIS_VERSION, backend: hcfg.active_backend, model: hcfg.ollama.model });
-    }
-    if (path === "/config" && req.method === "GET") return Response.json(loadConfig());
-    if (path === "/chat/stream" && req.method === "POST") {
-      const body = await req.json();
-      return streamJarvis(body.message, body.session_id || crypto.randomUUID(), {
-        config: body.config,
-        history: Array.isArray(body.history) ? body.history : [],
-        systemPromptOverride: body.system_prompt_override,
 
-// ═══════════════════════════════════════════════════════════════
-// ── Status checker ──
-// ═══════════════════════════════════════════════════════════════
-async function checkStatus(configOverride?: Partial<JarvisConfig>) {
+
+async function checkStatus(configOverride?: Partial<JarvisConfig> | null) {
   const cfg = resolveConfig(configOverride);
 
-  // Ollama health (always checked regardless of active backend so the UI can show its state)
   const ollamaHealth = await checkOllamaHealth(cfg.ollama);
 
-  // OpenRouter check (only if an API key is configured)
   let openrouterOk = false;
   let openrouterLatencyMs = 0;
   const hasApiKey = cfg.openrouter.api_key && cfg.openrouter.api_key.length > 5 && cfg.openrouter.api_key !== "ollama";
   if (hasApiKey) {
-    const health = await checkOpenRouterHealth(cfg);
-    openrouterOk = health.ok;
-    openrouterLatencyMs = health.latencyMs;
+    try {
+      const health = await checkOpenRouterHealth(cfg);
+      openrouterOk = health.ok;
+      openrouterLatencyMs = health.latencyMs;
+    } catch (e: any) {
+      console.warn("[Jarvis] OpenRouter health check failed:", e.message);
+    }
   }
 
-  // Claude CLI check
   let claudeCliAvailable = false;
   try {
     claudeCliAvailable = await isClaudeCliAvailable(cfg.claude_cli.path || "claude");
   } catch { /* false */ }
 
-  // Bridge check
   const bridgeActive = await isBridgeListening();
 
-  // Bun: if this server is running, bun is a
   let bunAvailable = false;
   try {
-    const { existsSync } = await import("fs");
-    // process.execPath is the bun binary that launched this server
     bunAvailable = existsSync(process.execPath) || process.execPath.includes("bun");
     if (!bunAvailable) {
-      // Fallback: check common install locations
-      const { execSync } = await import("child_process");
       const paths = ["/root/.bun/bin/bun", `${process.env.HOME}/.bun/bin/bun`, "/usr/local/bin/bun"];
-      for (const p of paths) {
-        if (existsSync(p)) { bunAvailable = true; break; }
-      }
-      if (!bunAvailable) {
-        bunAvailable = execSync("which bun 2>/dev/null || true", { encoding: "utf-8", timeout: 3000, env: { ...process.env, PATH: `${process.env.HOME}/.bun/bin:${process.env.PATH}` } }).trim().length > 0;
-      }
+      bunAvailable = paths.some((p) => existsSync(p));
     }
-  } catch { bunAvailable = true; /* server is running, bun exists */ }
+  } catch {
+    bunAvailable = true;
+  }
 
-  // Config warnings — the UI renders these as ⚠ notices
   const configWarnings: string[] = [];
   if (cfg.active_backend === "ollama" && !ollamaHealth.running) {
     configWarnings.push("Ollama is not running. Start Ollama on Windows (ollama serve).");
@@ -2135,26 +2097,16 @@ async function checkStatus(configOverride?: Partial<JarvisConfig>) {
     jarvis_version: JARVIS_VERSION,
     uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
     total_requests: totalRequests,
-    active_sessions: 0,
+    active_sessions: activeStreamControllers.size,
     active_backend: cfg.active_backend,
     backend: cfg.active_backend,
-    model: cfg.ollama.model,
+    model: cfg.active_backend === "openrouter" ? cfg.openrouter.model : cfg.ollama.model,
     config_valid: configWarnings.length === 0,
     config_errors: [] as string[],
     config_warnings: configWarnings,
   };
 }
 
-// ═══════════════════════════════════════════════════════════════
-// ── Web Search (DuckDuckGo Instant Answer API) ──
-// ═══════════════════════════════════════════════════════════════
-async function searchDuckDuckGo(query: string): Promise<Record<string, any>> {
-  try {
-    return await searchWeb(query);
-  } catch (e: any) {
-// ═══════════════════════════════════════════════════════════════
-// ── Web Search (DuckDuckGo Instant Answer API) ──
-// ═══════════════════════════════════════════════════════════════
 async function searchDuckDuckGo(query: string): Promise<Record<string, any>> {
   try {
     return await searchWeb(query);
@@ -2163,60 +2115,31 @@ async function searchDuckDuckGo(query: string): Promise<Record<string, any>> {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// ── HTTP Server ──
-// ═══════════════════════════════════════════════════════════════
-serve({
-  port: PORT,
-      }
-      return response;
-    } catch (err: any) {
-      if (!isNoisy) {
-        const elapsed = (performance.now() - startTime).toFixed(2);
-        console.error(`[Jarvis API] ${req.method} ${path} -> Error: ${err.message || err} (${elapsed}ms)`);
-      }
-      throw err;
-    }
-  },
-});
-
 async function baseFetch(req: Request): Promise<Response> {
+  const requestStart = performance.now();
   const path = new URL(req.url).pathname;
-        try {
-          response.headers.set("X-Response-Time", `${elapsed}ms`);
-        } catch {}
-      }
-      return response;
-    } catch (err: any) {
-      if (!isNoisy) {
-        const elapsed = (performance.now() - startTime).toFixed(2);
-        console.error(`[Jarvis API] ${req.method} ${path} -> Error: ${err.message || err} (${elapsed}ms)`);
-      }
-      throw err;
-    }
-  },
-});
+  const isNoisy = path === "/status" || path === "/health";
 
-async function baseFetch(req: Request): Promise<Response> {
-  const path = new URL(req.url).pathname;
   if (req.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-      const hcfg = loadConfig();
-      return Response.json({ ok: true, uptime: process.uptime(), version: JARVIS_VERSION, backend: hcfg.active_backend, model: hcfg.ollama.model });
-    }
-    if (path === "/config" && req.method === "GET") return Response.json(loadConfig());
-    }
+    return new Response(null, {
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      },
+    });
+  }
 
+  try {
+    if (path === "/" && req.method === "GET") {
+      return Response.json({ ok: true, name: "Jarvis", version: JARVIS_VERSION });
+    }
     if (path === "/health") {
       const hcfg = loadConfig();
       return Response.json({ ok: true, uptime: process.uptime(), version: JARVIS_VERSION, backend: hcfg.active_backend, model: hcfg.active_backend === "openrouter" ? hcfg.openrouter.model : hcfg.ollama.model });
     }
     if (path === "/config" && req.method === "GET") return Response.json(loadConfig());
     if (path === "/config" && req.method === "POST") {
-      invalidateConfigCache();
-      clearOpenRouterCache();
       return Response.json({ ok: true });
     }
     if (path === "/chat/stream" && req.method === "POST") {
@@ -2237,7 +2160,7 @@ async function baseFetch(req: Request): Promise<Response> {
         ctrl.abort();
         activeStreamControllers.delete(sid);
         console.log(`[Jarvis] Stream cancelled for session=${sid}`);
-  
+        return Response.json({ ok: true, cancelled: true });
       }
       return Response.json({ ok: true, cancelled: false });
     }
@@ -2260,29 +2183,23 @@ async function baseFetch(req: Request): Promise<Response> {
       const body = req.method === "POST" ? await req.json().catch(() => ({})) : {};
       return Response.json(await testConnection(body.config));
     }
-    // ── Companion State ─────────────────────────────────────────────
     if (path === "/companion" && req.method === "GET") {
       const cfg = loadConfig();
       const comp = loadCompanionState(cfg);
-      if (!comp || !comp.enabled) {
-        return Response.json({ enabled: false });
-      }
-      // Return current companion state with computed fields
+      if (!comp || !comp.enabled) return Response.json({ enabled: false });
       const now = Date.now();
       const lastInteraction = comp.last_interaction ? new Date(comp.last_interaction).getTime() : now;
       const minutesSinceInteraction = Math.floor((now - lastInteraction) / 60000);
-      // Mood decay: happiness drops 1% per 30 min, energy drops 1% per 60 min
       const happinessDecay = Math.min(minutesSinceInteraction / 30, 20);
       const energyDecay = Math.min(minutesSinceInteraction / 60, 15);
       const currentHappiness = Math.max(0, (comp.happiness || 85) - happinessDecay);
       const currentEnergy = Math.max(0, (comp.energy || 92) - energyDecay);
-      // Auto-determine mood from state
-      let mood = 'idle';
-      if (currentEnergy < 20) mood = 'sleeping';
-      else if (currentHappiness > 80) mood = 'happy';
-      else if (currentHappiness > 50) mood = 'content';
-      else if (currentHappiness > 25) mood = 'sad';
-      else mood = 'distressed';
+      let mood = "idle";
+      if (currentEnergy < 20) mood = "sleeping";
+      else if (currentHappiness > 80) mood = "happy";
+      else if (currentHappiness > 50) mood = "content";
+      else if (currentHappiness > 25) mood = "sad";
+      else mood = "distressed";
       return Response.json({
         ...comp,
         happiness: Math.round(currentHappiness),
@@ -2295,61 +2212,48 @@ async function baseFetch(req: Request): Promise<Response> {
       const body = await req.json().catch(() => ({}));
       const cfg = loadConfig();
       const comp = loadCompanionState(cfg);
-      if (!comp || !comp.enabled) {
-        return Response.json({ error: "Companion not configured or disabled" }, { status: 400 });
+      if (!comp || !comp.enabled) return Response.json({ error: "Companion not configured or disabled" }, { status: 400 });
+      const action = body.action || body.type || "talk";
+      switch (action) {
+        case "feed":
+          comp.energy = Math.min(100, (comp.energy || 92) + 15);
+          comp.happiness = Math.min(100, (comp.happiness || 85) + 5);
+          comp.mood = "happy";
+          break;
+        case "sleep":
+          comp.energy = Math.min(100, (comp.energy || 92) + 30);
+          comp.happiness = Math.min(100, (comp.happiness || 85) + 2);
+          comp.mood = "sleeping";
+          break;
+        case "train":
+          comp.energy = Math.max(0, (comp.energy || 92) - 10);
+          comp.happiness = Math.min(100, (comp.happiness || 85) + 8);
+          comp.mood = "excited";
+          break;
+        case "evolve":
+          if ((comp.level || 1) < 10) {
+            comp.level = (comp.level || 1) + 1;
+            comp.xp = 0;
+            comp.xp_to_next = ((comp.xp_to_next || 100) + 50);
+            comp.mood = "excited";
+          }
+          break;
+        case "talk":
+        default:
+          comp.happiness = Math.min(100, (comp.happiness || 85) + 3);
+          comp.energy = Math.max(0, (comp.energy || 92) - 2);
+          comp.mood = "excited";
+          break;
       }
-          case 'feed':
-            comp.energy = Math.min(100, (comp.energy || 92) + 15);
-            comp.happiness = Math.min(100, (comp.happiness || 85) + 5);
-            comp.mood = 'happy';
-            break;
-          case 'talk':
-            comp.happiness = Math.min(100, (comp.happiness || 85) + 3);
-            comp.energy = Math.max(0, (comp.energy || 92) - 2);
-            comp.mood = 'excited';
-            comp.energy = Math.max(0, (comp.energy || 92) - 1);
-            comp.mood = 'happy';
-            break;
-          case 'feed':
-            comp.energy = Math.min(100, (comp.energy || 92) + 15);
-            comp.happiness = Math.min(100, (comp.happiness || 85) + 5);
-            comp.mood = 'happy';
-            break;
-          case 'talk':
-            comp.happiness = Math.min(100, (comp.happiness || 85) + 3);
-            comp.energy = Math.max(0, (comp.energy || 92) - 2);
-            comp.mood = 'excited';
-            break;
-          case 'sleep':
-            comp.energy = Math.min(100, (comp.energy || 92) + 30);
-            comp.happiness = Math.min(100, (comp.happiness || 85) + 2);
-            comp.mood = 'sleeping';
-            break;
-          case 'train':
-            comp.energy = Math.max(0, (comp.energy || 92) - 10);
-            comp.happiness = Math.min(100, (comp.happiness || 85) + 8);
-            comp.mood = 'excited';
-            break;
-          case 'evolve':
-            if ((comp.level || 1) < 10) {
-              comp.level = (comp.level || 1) + 1;
-              comp.xp = 0;
-              comp.xp_to_next = ((comp.xp_to_next || 100) + 50);
-              comp.mood = 'excited';
-            }
-            break;
-        }
-        comp.interactions_total = (comp.interactions_total || 0) + 1;
-        
-      }
-      // Save updated companion state
+      comp.interactions_total = (comp.interactions_total || 0) + 1;
+      comp.last_interaction = new Date().toISOString();
       saveCompanionState(comp);
       return Response.json({ ok: true, companion: comp });
     }
     if (path === "/skills/invoke" && req.method === "POST") {
       const body = await req.json();
       const sks = loadSkills();
-      const skill = sks.find(s => s.name === body.name);
+      const skill = sks.find((s) => s.name === body.name);
       if (!skill) return Response.json({ error: "Skill not found" }, { status: 404 });
       const { readable, writable } = new TransformStream();
       const writer = writable.getWriter();
@@ -2357,124 +2261,61 @@ async function baseFetch(req: Request): Promise<Response> {
       const sid = crypto.randomUUID();
       (async () => {
         try {
-          await writer.write(encoder.encode(`data: ${JSON.stringify({type:"init",session_id:sid,skill:skill.name})}\n\n`));
+          await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "init", session_id: sid, skill: skill.name })}\n\n`));
           const text = `Skill "${skill.name}" invoked.\n${skill.description}\n\nArgs: ${JSON.stringify(body.args || {}, null, 2)}`;
           for (const char of text) {
-            await writer.write(encoder.encode(`data: ${JSON.stringify({type:"stream_event",delta:{text:char},session_id:sid})}\n\n`));
-            await new Promise(r => setTimeout(r, 10));
+            await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: char }, session_id: sid })}\n\n`));
+            await new Promise((r) => setTimeout(r, 10));
           }
-          await writer.write(encoder.encode(`data: ${JSON.stringify({type:"message_stop",session_id:sid})}\n\n`));
+          await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "message_stop", session_id: sid })}\n\n`));
         } catch (e: any) {
-          try { await writer.write(encoder.encode(`data: ${JSON.stringify({type:"error",error:e.message,session_id:sid})}\n\n`)); } catch {}
-        } finally { try { await writer.close(); } catch {} }
+          try { await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "error", error: e.message, session_id: sid })}\n\n`)); } catch {}
+        } finally {
+          try { await writer.close(); } catch {}
+        }
       })();
       return new Response(readable, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" } });
     }
 
-    // ── Interaction state per session ───────────────────────────────────
     const interactionMatch = path.match(/^\/sessions\/([^/]+)\/interaction$/);
     if (interactionMatch && req.method === "GET") {
       const sid = interactionMatch[1];
       const st = getSessionState(sid);
-      return Response.json({
-        session_id: sid,
-      return Response.json({ error: "Unknown interaction type" }, { status: 400 });
+      return Response.json({ session_id: sid, state: st });
+    }
+    if (interactionMatch && req.method === "POST") {
+      const body = await req.json();
+      const sid = interactionMatch[1];
+      clearSessionState(sid);
+      return Response.json({ ok: true, session_id: sid, state: body.state || null });
     }
 
-    // ── Self-Tuning Routes ──────────────────────────────────────────────
     if (path === "/tuning/proposals" && req.method === "GET") {
       const store = new SelfTuningStore();
-      const pending = store.getPendingProposals();
-      const applied = store.getAppliedProposals();
-      return Response.json({ pending, applied });
+      return Response.json({ pending: store.getPendingProposals(), applied: store.getAppliedProposals() });
     }
     if (path === "/tuning/proposals/apply" && req.method === "POST") {
       const body = await req.json().catch(() => ({}));
       if (!body.id) return Response.json({ error: "Missing proposal id" }, { status: 400 });
       const store = new SelfTuningStore();
       store.applyTuningProposal(body.id);
-      
-      // Dynamic apply the proposal
-      const allProps = [...store.getPendingProposals(), ...store.getAppliedProposals()];
-      const prop = allProps.find(p => p.id === body.id);
-      if (prop) {
-    const winDir = join(winHome, ".openclaw", "jarvis", "memory");
-    return winDir;
-  }
-  return join(homedir(), ".openclaw", "jarvis", "memory");
-}
-
-function applyReviewResults(dbPath: string, result: any, sessionId: string) {
-  try {
-    const db = new Database(dbPath, { create: false });
-    const now = new Date().toISOString();
-
-    // 1. Save Memories — check for duplicates first, insert all required columns
-    if (Array.isArray(result.memories)) {
-      for (const mem of result.memories) {
-        if (!mem.title || !mem.content) continue;
-        let category = mem.category || "general";
-        if (!["user", "feedback", "project", "reference"].includes(category)) {
-          category = "reference";
-        }
-          return Response.json({ review_json: content, session_id });
-        }
-        // Ollama path
-        const messages_for_api: Array<any> = normalizeMessagesForLLM([
-          { role: "system", content: reviewSystemPrompt },
-          ...formattedMessages,
-        ]);
-        const requestBody: Record<string, any> = {
-          model: ollamaTarget.modelName,
-          messages: messages_for_api,
-          stream: false,
-          max_tokens: 512,
-          options: { temperature: 0.3, num_ctx: 4096 },
-        };
-        const headers: Record<string, string> = {
-          "Authorization": "Bearer ollama",
-          "Content-Type": "application/json",
-        };
-        const fetchRes = await fetch(ollamaTarget.chatUrl, { method: "POST", headers, body: JSON.stringify(requestBody) });
-        if (!fetchRes.ok) {
-          const errText = await fetchRes.text();
-          return Response.json({ error: `Review API error: ${errText}` }, { status: 502 });
-        }
-        const data = await fetchRes.json();
-        const content = data?.message?.content || data?.choices?.[0]?.message?.content || "";
-        return Response.json({ review_json: content, session_id });
-      } catch (e: any) {
-        return Response.json({ error: `Review failed: ${e.message}` }, { status: 500 });
-      }
+      return Response.json({ ok: true });
     }
 
-              INSERT INTO skills (
-                id, name, description, body, version, last_improved_at, created_at, updated_at, enabled
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
-            `, [
-              id,
-              update.area,
-              `Automatically created skill for ${update.area}`,
-              body,
-              1,
-              now,
-              now,
-              now
-            ]);
-            console.log(`[Cron Review] Created new skill: "${update.area}"`);
-          }
-        } catch (e: any) {
-          console.error(`[Cron Review] Failed to save skill update for "${update.area}":`, e.message);
-        }
-      }
-    }
-
-    db.close();
+    return Response.json({ error: `Not found: ${req.method} ${path}` }, { status: 404 });
   } catch (err: any) {
-    console.error("[Cron Review] Failed to open database to apply review results:", err.message);
+    const elapsed = (performance.now() - requestStart).toFixed(2);
+    if (!isNoisy) console.error(`[Jarvis API] ${req.method} ${path} -> Error: ${err.message || err} (${elapsed}ms)`);
+    return Response.json({ error: err.message || String(err) }, { status: 500 });
   }
 }
 
-function buildCronRuntime(cfg: JarvisConfig, sessionId: string): {
-  runtime: ToolRuntime;
-  ctx: ExecutionContext;
+// ═══════════════════════════════════════════════════════════════
+// ── HTTP Server ──
+// ═══════════════════════════════════════════════════════════════
+serve({
+  port: PORT,
+  fetch: baseFetch,
+});
+
+console.log(`[Jarvis API] Listening on http://localhost:${PORT}`);
