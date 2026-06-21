@@ -1,77 +1,81 @@
-// Recovery command stubs.
+// Recovery command stubs — now partly wired to the live Bun server.
 //
 // RECOVERY NOTE (2026-06-19):
 //   A handful of jarvis_* Tauri commands referenced in lib.rs's
 //   `tauri::generate_handler!` were never recovered from any snapshot
-//   or transcript. The two Tauri commands the front-end hits on every
-//   page (jarvis_get_skills, jarvis_get_tools) and the seven that gate
-//   the companion / model / health UI are stubbed here with typed
-//   responses that match the TS interfaces in
+//   or transcript. They were originally stubbed here with typed
+//   responses matching the TS interfaces in
 //   src-ui/src/components/jarvis/types.ts.
 //
-//   Each stub is intentionally minimal: it returns a stable, schema-
-//   matching payload so the UI renders without throwing, and the
-//   caller's error path can be exercised. Real implementations belong
-//   in a follow-up pass once the Bun server is reachable again and the
-//   engine layer can talk to it.
+// WIRED (2026-06-21):
+//   The six read-path commands the UI hits on every page load now proxy
+//   to the live Bun server (http://localhost:19877):
+//     jarvis_get_skills      -> GET  /skills
+//     jarvis_get_tools       -> GET  /tools
+//     jarvis_discover_models -> GET  /models
+//     jarvis_test_connection -> POST /test   {config}
+//     jarvis_ping            -> GET  /health
+//     jarvis_get_companion   -> GET  /companion
+//   The Bun JSON is already snake_case and matches the UI interfaces, so
+//   we deserialize into serde_json::Value and proxy it through verbatim
+//   rather than re-deriving typed structs that could drift.
+//
+//   The remaining commands (invoke_skill, save_companion, memory tiers,
+//   etc.) are still stubs — they map to streaming/mutating Bun endpoints
+//   and belong in a follow-up pass.
 //
 //   The whole module is gated behind `#[allow(dead_code)]` so unused
 //   fields don't trip the linter.
 
 #![allow(dead_code)]
 
-use serde::Serialize;
 use serde_json::Value;
 
-#[derive(Serialize)]
-pub struct JarvisSkillStub {
-    pub name: String,
-    pub description: String,
-    pub category: String,
-    pub enabled: bool,
-    pub source: String,
-    pub usage_count: u64,
+/// Resolve the base URL of the live Bun server, starting it if needed.
+///
+/// Prefers the cached URL discovered by the health-probe in lib.rs; if it
+/// has not been resolved yet, triggers a probe/spawn and re-reads the cache.
+async fn bun_base() -> Result<String, String> {
+    if let Some(url) = crate::wsl::get_cached_bun_url() {
+        return Ok(url.trim_end_matches('/').to_string());
+    }
+    crate::ensure_jarvis_server_started().await?;
+    crate::wsl::get_cached_bun_url()
+        .map(|u| u.trim_end_matches('/').to_string())
+        .ok_or_else(|| "Jarvis Bun server is not reachable".to_string())
 }
 
-#[derive(Serialize)]
-pub struct JarvisToolParamStub {
-    pub name: String,
-    pub param_type: String,
-    pub description: String,
-    pub required: bool,
-    pub default_value: Option<String>,
+/// Shared reqwest client with a sane timeout, mirroring commands/models.rs.
+fn http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))
 }
 
-#[derive(Serialize)]
-pub struct JarvisToolStub {
-    pub name: String,
-    pub description: String,
-    pub parameters: Vec<JarvisToolParamStub>,
-}
-
-#[derive(Serialize)]
-pub struct JarvisCompanionStub {
-    pub enabled: bool,
-    pub name: String,
-    pub species: String,
-    pub rarity: String,
-    pub mood: String,
-    pub happiness: u32,
-    pub energy: u32,
-    pub level: u32,
-    pub xp: u32,
-    pub xp_to_next: u32,
-    pub interactions_total: u64,
+/// GET `{bun_base}{path}` and deserialize the JSON body into `T`.
+async fn bun_get_json<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, String> {
+    let base = bun_base().await?;
+    let url = format!("{}{}", base, path);
+    let client = http_client()?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Bun server request to {} failed: {}", path, e))?;
+    resp.json::<T>()
+        .await
+        .map_err(|e| format!("JSON parse error from {}: {}", path, e))
 }
 
 #[tauri::command]
-pub async fn jarvis_get_skills() -> Result<Vec<JarvisSkillStub>, String> {
-    Ok(vec![])
+pub async fn jarvis_get_skills() -> Result<Vec<Value>, String> {
+    bun_get_json("/skills").await
 }
 
 #[tauri::command]
-pub async fn jarvis_get_tools() -> Result<Vec<JarvisToolStub>, String> {
-    Ok(vec![])
+pub async fn jarvis_get_tools() -> Result<Vec<Value>, String> {
+    bun_get_json("/tools").await
 }
 
 #[tauri::command]
@@ -89,26 +93,52 @@ pub async fn jarvis_invoke_skill(
 
 #[tauri::command]
 pub async fn jarvis_ping() -> Result<String, String> {
-    Ok("pong".to_string())
+    // Liveness probe against the Bun server's /health endpoint. Returns the
+    // classic "pong" sentinel the HealthBanner expects on a 2xx response.
+    let base = bun_base().await?;
+    let client = http_client()?;
+    let resp = client
+        .get(format!("{}/health", base))
+        .send()
+        .await
+        .map_err(|e| format!("Bun server health check failed: {}", e))?;
+    if resp.status().is_success() {
+        Ok("pong".to_string())
+    } else {
+        Err(format!("Bun server unhealthy: HTTP {}", resp.status()))
+    }
 }
 
 #[tauri::command]
 pub async fn jarvis_discover_models(
     _backend: Option<String>,
 ) -> Result<Vec<Value>, String> {
-    Ok(vec![])
+    // The Bun server's /models endpoint discovers across all configured
+    // backends (Ollama + OpenRouter); the optional `_backend` hint is not
+    // needed for the GET form.
+    bun_get_json("/models").await
 }
 
 #[tauri::command]
 pub async fn jarvis_test_connection(
-    _backend: String,
-    _config: Option<Value>,
+    backend: String,
+    config: Option<Value>,
 ) -> Result<Value, String> {
-    Ok(serde_json::json!({
-        "ok": false,
-        "latency_ms": 0,
-        "error": "test_connection is not yet wired up in the recovered tree",
-    }))
+    // POST /test with the optional config override. The Bun server validates
+    // reachability for the active (or supplied) backend and returns
+    // { ok, latency_ms, error? }.
+    let base = bun_base().await?;
+    let client = http_client()?;
+    let body = serde_json::json!({ "backend": backend, "config": config });
+    let resp = client
+        .post(format!("{}/test", base))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Bun server connection test failed: {}", e))?;
+    resp.json::<Value>()
+        .await
+        .map_err(|e| format!("JSON parse error from /test: {}", e))
 }
 
 #[tauri::command]
@@ -118,20 +148,10 @@ pub async fn jarvis_switch_backend(backend: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn jarvis_get_companion() -> Result<JarvisCompanionStub, String> {
-    Ok(JarvisCompanionStub {
-        enabled: false,
-        name: "Sprout".into(),
-        species: "spriggan".into(),
-        rarity: "common".into(),
-        mood: "idle".into(),
-        happiness: 50,
-        energy: 50,
-        level: 1,
-        xp: 0,
-        xp_to_next: 100,
-        interactions_total: 0,
-    })
+pub async fn jarvis_get_companion() -> Result<Value, String> {
+    // GET /companion returns the live companion state, or { enabled: false }
+    // when no companion is configured — proxied through as-is.
+    bun_get_json("/companion").await
 }
 
 #[tauri::command]

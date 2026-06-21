@@ -98,11 +98,27 @@ cd server-jarvis && bun run dev
 ```
 Verify it starts on port 19877, check `/health`, `/models`, `/config` endpoints.
 
+### 4. ✅ Wire read-path stubs to live Bun server (2026-06-21)
+Six UI page-load commands in `commands/recovery_stubs.rs` now proxy to the
+Bun server instead of returning empty/stub payloads (`cargo check` green):
+- `jarvis_get_skills` → `GET /skills`
+- `jarvis_get_tools` → `GET /tools`
+- `jarvis_discover_models` → `GET /models`
+- `jarvis_test_connection` → `POST /test` (note: endpoint is `/test`, **not** `/config/test`)
+- `jarvis_ping` → `GET /health`
+- `jarvis_get_companion` → `GET /companion`
+
+Base URL resolved via `crate::wsl::get_cached_bun_url()` with an
+`ensure_jarvis_server_started()` fallback; Bun JSON (already snake_case,
+matching `src-ui/.../types.ts`) is proxied through as `serde_json::Value`.
+
 ### 5. Forward improvements (architecture priority from AGENTS.md)
 - Build provenance / stale-binary prevention
 - Eval / regression harness
 - Bridge and runtime reliability
-- The still-stubbed commands in `recovery_stubs.rs` — wire to real implementations
+- Remaining stubbed commands in `recovery_stubs.rs` (write/streaming path:
+  `jarvis_invoke_skill` → `POST /skills/invoke` SSE, `jarvis_save_companion`
+  → `POST /companion`, memory-tier commands) — wire to real implementations
 
 ---
 
