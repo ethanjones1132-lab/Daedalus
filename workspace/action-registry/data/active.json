@@ -789,12 +789,12 @@
         "Both palettes render correctly (verified in build)"
       ],
       "dependencies": [],
-      "status": "open",
+      "status": "done",
       "owner": "shared",
       "approval_required": false,
       "next_due": "2026-06-24T18:00:00",
       "created_at": "2026-06-21T16:45:00",
-      "updated_at": "2026-06-21T16:45:00",
+      "updated_at": "2026-06-21T17:05:00",
       "action_kind": "task",
       "confidence": 0.9,
       "confidence_reason": "Planned from verified codebase audit (2026-06-21)",
@@ -807,7 +807,8 @@
           "kind": "context",
           "value": "grep confirms zero code sets data-theme; light palette is dead until a toggle is wired."
         }
-      ]
+      ],
+      "completed_at": "2026-06-21T17:05:00"
     },
     {
       "id": "jarvis-eng-command-palette-20260621-001",
@@ -863,12 +864,12 @@
         "CI is green on the current branch"
       ],
       "dependencies": [],
-      "status": "open",
+      "status": "done",
       "owner": "shared",
       "approval_required": false,
       "next_due": "2026-06-25T18:00:00",
       "created_at": "2026-06-21T16:45:00",
-      "updated_at": "2026-06-21T16:45:00",
+      "updated_at": "2026-06-21T17:05:00",
       "action_kind": "task",
       "confidence": 0.9,
       "confidence_reason": "Planned from verified codebase audit (2026-06-21)",
@@ -877,7 +878,8 @@
           "kind": "context",
           "value": "ls .github/workflows -> none. Theme-husk bug (fix 58d9c19) would have been caught by a CSS-generation assertion."
         }
-      ]
+      ],
+      "completed_at": "2026-06-21T17:05:00"
     },
     {
       "id": "jarvis-eng-dry-resource-list-20260621-001",
