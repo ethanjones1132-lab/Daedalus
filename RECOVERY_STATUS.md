@@ -112,13 +112,22 @@ Base URL resolved via `crate::wsl::get_cached_bun_url()` with an
 `ensure_jarvis_server_started()` fallback; Bun JSON (already snake_case,
 matching `src-ui/.../types.ts`) is proxied through as `serde_json::Value`.
 
+Also wired the memory-tier read commands to the SQLite `memory` table
+(that subsystem is Rust-side, not Bun): `jarvis_get_tier_stats` now returns
+live `{hot, warm, cold}` counts (consumed by MemoryView) and
+`jarvis_list_memories_by_tier` filters active memories by tier.
+
 ### 5. Forward improvements (architecture priority from AGENTS.md)
 - Build provenance / stale-binary prevention
 - Eval / regression harness
 - Bridge and runtime reliability
-- Remaining stubbed commands in `recovery_stubs.rs` (write/streaming path:
-  `jarvis_invoke_skill` → `POST /skills/invoke` SSE, `jarvis_save_companion`
-  → `POST /companion`, memory-tier commands) — wire to real implementations
+- Remaining stubbed commands in `recovery_stubs.rs` — wire to real
+  implementations as UI consumers appear. None are currently called by the
+  UI: `jarvis_invoke_skill` (→ `POST /skills/invoke`, SSE),
+  `jarvis_save_companion` (→ `POST /companion`; note Bun's POST is an
+  *interaction action*, not a state save — contract needs reconciling),
+  `jarvis_switch_backend`, `jarvis_restart_ollama`, `jarvis_review_session`,
+  `jarvis_commit_session_end`, `jarvis_recall_cold_memory`
 
 ---
 

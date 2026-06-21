@@ -20,16 +20,23 @@
 //   we deserialize into serde_json::Value and proxy it through verbatim
 //   rather than re-deriving typed structs that could drift.
 //
-//   The remaining commands (invoke_skill, save_companion, memory tiers,
-//   etc.) are still stubs — they map to streaming/mutating Bun endpoints
-//   and belong in a follow-up pass.
+//   The memory-tier read commands (jarvis_get_tier_stats,
+//   jarvis_list_memories_by_tier) are wired directly to the SQLite
+//   `memory` table — that subsystem is Rust/SQLite-side, not Bun.
+//
+//   The remaining commands (invoke_skill, save_companion, switch_backend,
+//   restart_ollama, review_session, commit_session_end, recall_cold_memory)
+//   are still stubs: they have no current UI caller and map to
+//   streaming/mutating endpoints, so they belong in a follow-up pass.
 //
 //   The whole module is gated behind `#[allow(dead_code)]` so unused
 //   fields don't trip the linter.
 
 #![allow(dead_code)]
 
+use crate::db::AppDb;
 use serde_json::Value;
+use tauri::State;
 
 /// Resolve the base URL of the live Bun server, starting it if needed.
 ///
@@ -189,16 +196,40 @@ pub async fn jarvis_commit_session_end(
 }
 
 #[tauri::command]
-pub async fn jarvis_get_tier_stats() -> Result<Value, String> {
-    Ok(serde_json::json!({
-        "hot": 0, "warm": 0, "cold": 0,
-        "note": "stub",
-    }))
+pub fn jarvis_get_tier_stats(db: State<AppDb>) -> Result<Value, String> {
+    // Live counts of active memories per Drive-Brain tier (hot/warm/cold),
+    // backed by the SQLite `memory` table + idx_memory_tier index. Matches
+    // the `Record<Tier, number>` shape MemoryView expects.
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let mut counts = serde_json::Map::new();
+    for tier in ["hot", "warm", "cold"] {
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory WHERE tier = ?1 AND status = 'active'",
+                [tier],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("tier stats query failed: {}", e))?;
+        counts.insert(tier.to_string(), Value::from(n));
+    }
+    Ok(Value::Object(counts))
 }
 
 #[tauri::command]
-pub async fn jarvis_list_memories_by_tier(_tier: String) -> Result<Vec<Value>, String> {
-    Ok(vec![])
+pub fn jarvis_list_memories_by_tier(
+    db: State<AppDb>,
+    tier: String,
+) -> Result<Vec<Value>, String> {
+    // Active memories in a given tier, serialized as the same MemoryEntry
+    // shape the other memory_* commands return.
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let all = crate::jarvis::memory::engine::list_memories(&conn)?;
+    let filtered = all
+        .into_iter()
+        .filter(|m| m.tier == tier && m.status == "active")
+        .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
+        .collect();
+    Ok(filtered)
 }
 
 #[tauri::command]
