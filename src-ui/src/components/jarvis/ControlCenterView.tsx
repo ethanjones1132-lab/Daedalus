@@ -1,19 +1,373 @@
-// RECOVERY NOTE (2026-06-19):
-//   The original ControlCenterView component was truncated in the recovered tree.
-//   Replaced with a no-op stub so the build is green. A future pass
-//   should port the real implementation back from the transcript logs
-//   under C:/Projects/_recovery/from-transcripts-all/.
+// ═══════════════════════════════════════════════════════════════
+// ── ControlCenterView — operations dashboard (the "Control" subview)
+// ═══════════════════════════════════════════════════════════════
+//
+// Self-contained (no props) so it matches JarvisView's `<ControlCenterView />`
+// call site. Config editing and live status already live in JarvisView's own
+// ConfigPanel / StatusPanel, so this surface covers what those don't:
+//   • Profiles    — list_model_profiles / set_active_profile / delete_profile
+//   • Diagnostics — get_system_health (HealthData) + get_doctor_report
+//   • Overview    — active profile + a consolidated health glance
 
-import { PageTransition, SectionHeader, EmptyState } from '../ui';
+import { useCallback, useEffect, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import {
+  cn,
+  GlassCard,
+  Pill,
+  SectionHeader,
+  StatusDot,
+  LoadingState,
+  ErrorState,
+  EmptyState,
+  useToast,
+} from '../ui';
+
+// ── Types (mirror the Rust command return shapes) ──────────────
+
+interface ModelProfile {
+  id: string;
+  name: string;
+  provider: string;
+  model: string;
+  api_base: string;
+  max_tokens: number;
+  temperature: number;
+  top_p: number;
+  is_active: boolean;
+  engine: string;
+}
+
+interface HealthData {
+  ollama: { running: boolean; model: string | null; url: string };
+  bun_server: { running: boolean; url: string };
+  bridge: { running: boolean; port: number };
+  claude_proxy: { running: boolean; port: number };
+  disk: { total: string; used: string; available: string; use_percent: string };
+  memory: { total_mb: number; available_mb: number; used_mb: number; used_percent: number };
+  timestamp: string;
+}
+
+interface DoctorCheck {
+  name: string;
+  status: string;
+  detail: string;
+}
+
+interface DoctorReport {
+  checks: DoctorCheck[];
+  summary: { total: number; ok: number; warn: number; error: number; overall: string };
+  timestamp: string;
+}
+
+type Tab = 'overview' | 'profiles' | 'diagnostics';
+
+const TABS: Array<{ id: Tab; label: string }> = [
+  { id: 'overview', label: 'Overview' },
+  { id: 'profiles', label: 'Profiles' },
+  { id: 'diagnostics', label: 'Diagnostics' },
+];
+
+// ── Helpers ────────────────────────────────────────────────────
+
+function parsePercent(value: string): number {
+  const n = Number(String(value).replace('%', '').trim());
+  return Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : 0;
+}
+
+function checkVariant(status: string): 'success' | 'warn' | 'error' | 'default' {
+  const s = status.toLowerCase();
+  if (s === 'ok' || s === 'pass') return 'success';
+  if (s === 'warn' || s === 'warning') return 'warn';
+  if (s === 'error' || s === 'fail') return 'error';
+  return 'default';
+}
+
+function Bar({ percent, danger }: { percent: number; danger?: boolean }) {
+  return (
+    <div className="h-1.5 w-full rounded-full bg-white/10 overflow-hidden">
+      <div
+        className={cn(
+          'h-full rounded-full transition-[width] duration-500',
+          danger || percent >= 90 ? 'bg-red-400' : percent >= 75 ? 'bg-amber-400' : 'bg-emerald-400',
+        )}
+        style={{ width: `${percent}%` }}
+      />
+    </div>
+  );
+}
+
+// ── Main view ──────────────────────────────────────────────────
 
 export default function ControlCenterView() {
+  const [tab, setTab] = useState<Tab>('overview');
+  const [profiles, setProfiles] = useState<ModelProfile[]>([]);
+  const [health, setHealth] = useState<HealthData | null>(null);
+  const [doctor, setDoctor] = useState<DoctorReport | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const { success, error: toastError } = useToast();
+
+  const fetchAll = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const [profileList, healthData, doctorReport] = await Promise.all([
+        invoke<ModelProfile[]>('list_model_profiles'),
+        invoke<HealthData>('get_system_health').catch(() => null),
+        invoke<DoctorReport>('get_doctor_report').catch(() => null),
+      ]);
+      setProfiles(profileList);
+      setHealth(healthData);
+      setDoctor(doctorReport);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchAll();
+  }, [fetchAll]);
+
+  const activate = useCallback(
+    async (profile: ModelProfile) => {
+      setProfiles((prev) => prev.map((p) => ({ ...p, is_active: p.id === profile.id })));
+      try {
+        await invoke<boolean>('set_active_profile', { id: profile.id });
+        success(`Activated ${profile.name}`);
+        await fetchAll();
+      } catch (e) {
+        toastError(String(e), 'Activation failed');
+        await fetchAll();
+      }
+    },
+    [fetchAll, success, toastError],
+  );
+
+  const remove = useCallback(
+    async (profile: ModelProfile) => {
+      if (!window.confirm(`Delete profile "${profile.name}"?`)) return;
+      try {
+        await invoke<boolean>('delete_profile', { id: profile.id });
+        success(`Deleted ${profile.name}`);
+        await fetchAll();
+      } catch (e) {
+        toastError(String(e), 'Delete failed');
+      }
+    },
+    [fetchAll, success, toastError],
+  );
+
+  const activeProfile = profiles.find((p) => p.is_active) ?? null;
+
   return (
-    <PageTransition>
+    <div className="flex flex-col gap-4 h-full overflow-hidden">
       <SectionHeader
-        title="ControlCenter"
-        subtitle="Reconstruction pending — see RECOVERY_STATUS.md"
+        title="Control Center"
+        subtitle="Profiles, diagnostics, and system operations"
+        action={
+          <button
+            type="button"
+            onClick={fetchAll}
+            className="px-3 py-1.5 text-xs rounded-lg border border-white/10 text-bone/60 hover:text-bone transition-colors"
+          >
+            Refresh
+          </button>
+        }
       />
-      <EmptyState message="This view has not been recovered yet. The Rust backend for this surface is live; the front-end binding will be restored in a follow-up pass." />
-    </PageTransition>
+
+      <div className="flex gap-1 text-[11px]">
+        {TABS.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            onClick={() => setTab(t.id)}
+            className={cn(
+              'px-3 py-1.5 rounded-lg transition-colors',
+              tab === t.id ? 'bg-white/10 text-bone' : 'text-bone/40 hover:text-bone/70',
+            )}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="flex-1 overflow-y-auto min-h-0">
+        {loading ? (
+          <LoadingState message="Loading control center…" />
+        ) : error ? (
+          <ErrorState error={error} onRetry={fetchAll} />
+        ) : tab === 'overview' ? (
+          <div className="space-y-3">
+            <GlassCard className="p-4">
+              <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40 mb-2">
+                Active profile
+              </div>
+              {activeProfile ? (
+                <div className="flex items-center gap-2">
+                  <StatusDot ok />
+                  <span className="text-sm font-medium text-bone">{activeProfile.name}</span>
+                  <Pill variant="info">{activeProfile.provider}</Pill>
+                  <Pill variant="default">{activeProfile.model}</Pill>
+                  <span className="ml-auto text-[10px] font-mono text-bone/40">
+                    temp {activeProfile.temperature} · {activeProfile.max_tokens} tok
+                  </span>
+                </div>
+              ) : (
+                <span className="text-sm text-bone/50">No active profile.</span>
+              )}
+            </GlassCard>
+
+            <div className="grid grid-cols-3 gap-3">
+              <GlassCard className="p-3">
+                <div className="text-2xl font-semibold text-bone">{profiles.length}</div>
+                <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40">
+                  profiles
+                </div>
+              </GlassCard>
+              <GlassCard className="p-3">
+                <div
+                  className={cn(
+                    'text-2xl font-semibold',
+                    doctor?.summary.overall === 'ok' ? 'text-emerald-300' : 'text-amber-300',
+                  )}
+                >
+                  {doctor ? `${doctor.summary.ok}/${doctor.summary.total}` : '—'}
+                </div>
+                <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40">
+                  checks ok
+                </div>
+              </GlassCard>
+              <GlassCard className="p-3">
+                <div className="text-2xl font-semibold text-bone">
+                  {health ? `${health.memory.used_percent}%` : '—'}
+                </div>
+                <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40">
+                  memory used
+                </div>
+              </GlassCard>
+            </div>
+          </div>
+        ) : tab === 'profiles' ? (
+          profiles.length === 0 ? (
+            <EmptyState message="No model profiles configured." />
+          ) : (
+            <ul className="space-y-2">
+              {profiles.map((p) => (
+                <li key={p.id}>
+                  <GlassCard className={cn('p-3', p.is_active && 'border-accent/40 bg-white/[0.06]')}>
+                    <div className="flex items-center gap-2">
+                      <StatusDot ok={p.is_active} warn={!p.is_active} />
+                      <span className="text-sm font-medium text-bone truncate">{p.name}</span>
+                      <Pill variant="info">{p.provider}</Pill>
+                      <Pill variant="default">{p.model}</Pill>
+                      {p.is_active && <Pill variant="success">active</Pill>}
+                      <div className="ml-auto flex items-center gap-1 text-[11px]">
+                        {!p.is_active && (
+                          <button
+                            type="button"
+                            onClick={() => activate(p)}
+                            className="px-2 py-0.5 rounded-md border border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10 transition-colors"
+                          >
+                            Activate
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => remove(p)}
+                          className="px-2 py-0.5 rounded-md border border-red-500/30 text-red-200 hover:bg-red-500/10 transition-colors"
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </div>
+                    <div className="mt-1.5 text-[10px] font-mono text-bone/40">
+                      engine {p.engine} · temp {p.temperature} · top_p {p.top_p} · {p.max_tokens} tok
+                    </div>
+                  </GlassCard>
+                </li>
+              ))}
+            </ul>
+          )
+        ) : (
+          // ── Diagnostics ──
+          <div className="space-y-3">
+            {health ? (
+              <GlassCard className="p-4 space-y-3">
+                <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40">
+                  Subsystems
+                </div>
+                <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
+                  {[
+                    { name: 'Ollama', up: health.ollama.running, detail: health.ollama.url },
+                    { name: 'Bun server', up: health.bun_server.running, detail: health.bun_server.url },
+                    { name: 'Bridge', up: health.bridge.running, detail: `:${health.bridge.port}` },
+                    { name: 'Claude proxy', up: health.claude_proxy.running, detail: `:${health.claude_proxy.port}` },
+                  ].map((s) => (
+                    <div key={s.name} className="flex items-center gap-2">
+                      <StatusDot ok={s.up} warn={!s.up} />
+                      <span className="text-bone">{s.name}</span>
+                      <span className="ml-auto font-mono text-[10px] text-bone/40 truncate">
+                        {s.detail}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="space-y-2 pt-1">
+                  <div>
+                    <div className="flex justify-between text-[10px] font-mono text-bone/50 mb-1">
+                      <span>Disk ({health.disk.used} / {health.disk.total})</span>
+                      <span>{health.disk.use_percent}</span>
+                    </div>
+                    <Bar percent={parsePercent(health.disk.use_percent)} />
+                  </div>
+                  <div>
+                    <div className="flex justify-between text-[10px] font-mono text-bone/50 mb-1">
+                      <span>Memory ({health.memory.used_mb} / {health.memory.total_mb} MB)</span>
+                      <span>{health.memory.used_percent}%</span>
+                    </div>
+                    <Bar percent={health.memory.used_percent} />
+                  </div>
+                </div>
+              </GlassCard>
+            ) : (
+              <EmptyState message="System health unavailable." />
+            )}
+
+            {doctor && (
+              <GlassCard className="p-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="text-[10px] font-mono uppercase tracking-wider text-bone/40">
+                    Doctor
+                  </span>
+                  <Pill variant={doctor.summary.overall === 'ok' ? 'success' : 'warn'}>
+                    {doctor.summary.ok} ok · {doctor.summary.warn} warn · {doctor.summary.error} error
+                  </Pill>
+                </div>
+                <ul className="space-y-1.5">
+                  {doctor.checks.map((c, i) => (
+                    <li key={i} className="flex items-start gap-2 text-xs">
+                      <span className="mt-0.5">
+                        <StatusDot
+                          ok={checkVariant(c.status) === 'success'}
+                          warn={checkVariant(c.status) === 'warn'}
+                        />
+                      </span>
+                      <span className="text-bone">{c.name}</span>
+                      <span className="ml-auto text-right font-mono text-[10px] text-bone/40 max-w-[55%] truncate">
+                        {c.detail}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </GlassCard>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
