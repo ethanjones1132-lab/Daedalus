@@ -1,9 +1,7 @@
 import { loadPrompt } from "./prompt-loader";
 import { BUILTIN_MODES, getToolsForMode } from "./modes";
 import type { ToolRuntime, ExecutionContext } from "../tool-runtime";
-import type { CallModelFn } from "./router";
-
-type PipelineMessage = { role: string; content: string; tool_calls?: any; tool_call_id?: string; name?: string };
+import type { CallModelFn, ChatMessage } from "./router";
 import { outcomeCollector } from "../self-tuning/mod";
 import { countTokens } from "../tokens";
 
@@ -40,7 +38,7 @@ export class PipelineExecutor {
         const resp = await this.callModel([
           { role: "system", content: plannerPrompt },
           { role: "user", content: request }
-        ], {
+        ] as ChatMessage[], {
           temperature: BUILTIN_MODES.planner.temperature,
           max_tokens: BUILTIN_MODES.planner.max_tokens,
           stream: true,
@@ -85,7 +83,7 @@ export class PipelineExecutor {
     if (pipeline.includes("executor")) {
       onStateChange({ stage: "executor", status: "running" });
       const executorPrompt = loadPrompt("modes/executor.md");
-      const executorMessages: PipelineMessage[] = [
+      const executorMessages: ChatMessage[] = [
         { role: "system", content: executorPrompt },
         { role: "user", content: `User Request: ${request}\n\nPlan:\n${plan}` }
       ];
@@ -208,7 +206,7 @@ export class PipelineExecutor {
               role: "user",
               content: `User Request: ${request}\n\nOriginal Plan:\n${plan}\n\nExecutor Activity:\n${executorSummary}\n\nRewriter Activity:\n${rewriterSummary}`
             }
-          ], {
+          ] as ChatMessage[], {
             temperature: BUILTIN_MODES.reviewer.temperature,
             max_tokens: BUILTIN_MODES.reviewer.max_tokens,
             stream: true,
@@ -236,7 +234,7 @@ export class PipelineExecutor {
           hasPendingIssues = this.hasIssues(reviewerFeedback);
           if (hasPendingIssues) {
             onStateChange({ stage: "rewriter", status: "running", output: `\nReviewer flagged issues. Rewriting...\n` });
-            const rewriterMessages: PipelineMessage[] = [
+            const rewriterMessages: ChatMessage[] = [
               { role: "system", content: rewriterPrompt },
               {
                 role: "user",
@@ -365,7 +363,7 @@ export class PipelineExecutor {
             role: "user",
             content: `User Request: ${request}\n\nOriginal Plan:\n${plan}\n\nExecutor Activity:\n${executorSummary}\n\nReviewer Feedback:\n${reviewerFeedback}\n\nRewriter Activity:\n${rewriterSummary}`
           }
-        ], {
+        ] as ChatMessage[], {
           temperature: BUILTIN_MODES.synthesizer.temperature,
           max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
           stream: true,

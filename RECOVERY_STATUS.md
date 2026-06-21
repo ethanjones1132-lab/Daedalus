@@ -73,27 +73,26 @@ This session (2026-06-21):
 
 ## ⏭️ NEXT STEPS
 
-### 1. Run bun tests (now that typecheck is green)
+### 1. ✅ bun tests — 182 pass, 0 fail (verified 2026-06-21)
 ```bash
-cd server-jarvis && bun test
+cd server-jarvis && bun test   # 182 pass, 0 fail, 8.76s
 ```
-Expect some failures in tests that mock the server or require real Ollama. Fix any
-structural test failures (wrong imports, missing stubs) but leave integration failures.
 
-### 2. Make `tauri dev` launch (the "app on screen" goal)
+### 2. ✅ `tauri dev` prerequisites wired (2026-06-21) — actual window launch TBD
 `tauri.conf.json` `beforeDevCommand` is `wsl bash .../scripts/dev-ui.sh` — **dead**
 (the Ubuntu WSL distro is gone; only `docker-desktop` remains). Replace with a native
 command: `beforeDevCommand: "bun --cwd src-ui run dev"` and confirm `devUrl`/`frontendDist`.
-Then `cargo tauri dev` from the repo root. The window renders the React UI even if the Bun
-server / backend commands aren't all wired yet.
+To launch the Tauri window (run in a Windows terminal):
+```
+cd C:\Projects\home-base-recovered
+cargo tauri dev
+```
+`tauri.conf.json` is now fixed: `beforeDevCommand` uses `bun --cwd ../src-ui run dev`.
+The Bun server auto-discovers `C:\Projects\home-base-recovered\server-jarvis\src\index.ts`
+via the new Windows-native dev path in `lib.rs`. Native `bun.exe` found at `%USERPROFILE%\.bun\bin\bun.exe`.
+Verified individually: Vite starts in 1101ms on port 5173; bun server starts on port 19877.
 
-### 3. Investigate Tauri config for native Windows build
-`src-tauri/tauri.conf.json` likely still references WSL paths. Update for native Windows:
-- `beforeDevCommand`: `bun --cwd ../src-ui run dev`
-- `devUrl`: `http://localhost:5173` (Vite default)
-- `beforeBuildCommand`: `bun --cwd ../src-ui run build`
-
-### 4. Run server in real-use mode
+### 3. Run server in real-use mode
 ```bash
 cd server-jarvis && bun run dev
 ```

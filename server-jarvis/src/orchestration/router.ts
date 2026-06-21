@@ -11,8 +11,16 @@ export interface RoutingResult {
   routing_rationale: string;
 }
 
+export interface ChatMessage {
+  role: string;
+  content: string;
+  tool_calls?: any;
+  tool_call_id?: string;
+  name?: string;
+}
+
 export type CallModelFn = (
-  messages: Array<{ role: string; content: string; tool_calls?: any; tool_call_id?: string }>,
+  messages: Array<ChatMessage>,
   options?: {
     temperature?: number;
     max_tokens?: number;

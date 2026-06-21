@@ -5,8 +5,8 @@
   "identifier": "com.jarvis.desktop",
   "build": {
     "frontendDist": "../src-ui/dist",
-    "beforeDevCommand": "wsl bash /home/ethan/.openclaw/agents/coderclaw/workspace/home-base/scripts/dev-ui.sh",
-    "beforeBuildCommand": "wsl bash /home/ethan/.openclaw/agents/coderclaw/workspace/home-base/scripts/build-ui.sh",
+    "beforeDevCommand": "bun --cwd ../src-ui run dev",
+    "beforeBuildCommand": "bun --cwd ../src-ui run build",
     "devUrl": "http://localhost:5173"
   },
   "app": {

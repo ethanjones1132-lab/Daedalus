@@ -180,9 +180,15 @@ fn find_claude_cli_proxy() -> Option<String> {
 }
 
 fn find_jarvis_server() -> Option<String> {
-    // NEW: On Windows, if we have a local (bundled) bun.exe, prefer the bundled server .js
-    // (included via tauri "resources" in the installer / from build). This lets a fresh
-    // NSIS installer launch a full successful application on new hardware (no WSL dev tree required).
+    // Explicit override — useful for dev without WSL.
+    if let Ok(path) = std::env::var("JARVIS_SERVER_PATH") {
+        if std::path::Path::new(&path).exists() {
+            println!("[Jarvis] Using JARVIS_SERVER_PATH override: {}", path);
+            return Some(path);
+        }
+    }
+
+    // Bundled server next to the EXE (production installer / cargo tauri build).
     #[cfg(target_os = "windows")]
     {
         if let Ok(exe) = std::env::current_exe() {
@@ -197,6 +203,31 @@ fn find_jarvis_server() -> Option<String> {
                         return Some(cand.to_string_lossy().into_owned());
                     }
                 }
+            }
+        }
+
+        // Windows-native dev tree locations (no WSL required).
+        // Checked in order; first existing path wins.
+        let dev_candidates: &[&str] = &[
+            r"C:\Projects\home-base-recovered\server-jarvis\src\index.ts",
+        ];
+        for cand in dev_candidates {
+            if std::path::Path::new(cand).exists() {
+                println!("[Jarvis] Found server at native dev path: {}", cand);
+                return Some(cand.to_string());
+            }
+        }
+
+        // Standard user-level openclaw install (Windows without WSL).
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            let user_server = std::path::PathBuf::from(profile)
+                .join(".openclaw")
+                .join("jarvis")
+                .join("server-jarvis")
+                .join("src")
+                .join("index.ts");
+            if user_server.exists() {
+                return Some(user_server.to_string_lossy().into_owned());
             }
         }
     }
@@ -267,7 +298,14 @@ fn find_bun_executable() -> String {
     }
 
     if cfg!(target_os = "windows") {
-        // On Windows, bun lives inside WSL.  Return the WSL path; callers that
+        // Check the standard Windows-native bun installation (bun install on Windows).
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            let native_bun = std::path::PathBuf::from(profile).join(".bun").join("bin").join("bun.exe");
+            if native_bun.exists() {
+                return native_bun.to_string_lossy().into_owned();
+            }
+        }
+        // Fall back: bun lives inside WSL.  Return the WSL path; callers that
         // run it via `wsl.exe -- bash -lc` will resolve it through WSL PATH.
         return format!("{}/.bun/bin/bun", wsl_home());
     }

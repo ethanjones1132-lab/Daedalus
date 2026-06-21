@@ -104,9 +104,9 @@ export interface ClaudeCliRequest {
 
 export interface ClaudeCliMessage {
   type: string;
-  content?: string | Array<Record<string, unknown>>;
-  result?: string;
+  content?: string | Array<{ type?: string; text?: string }>;
   delta?: { text: string };
+  result?: string;
   session_id?: string;
   usage?: { input_tokens: number; output_tokens: number };
   tool_use?: { name: string; input: Record<string, unknown> };
@@ -319,9 +319,7 @@ export async function* streamClaudeCli(
               break;
             }
             case "result": {
-              // The CLI's result event contains the full text in msg.result
-              // (assistant events may have empty content strings in stream-json mode)
-              const resultText = msg.result || fullOutput || "";
+              const resultText = typeof msg.result === "string" ? msg.result : fullOutput || "";
               yield {
                 type: "result",
                 content: resultText,
