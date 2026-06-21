@@ -25,6 +25,7 @@ import {
   Label,
 } from './components/ui';
 import { usePolling } from './hooks/usePolling';
+import { useTheme } from './hooks/useTheme';
 import MarkdownRenderer from './components/jarvis/MarkdownRenderer';
 import type { BackendSession, NavSection, SessionMessage, ViewId } from './types';
 import type { CompanionRarity, CompanionSpecies, CompanionState } from './components/jarvis/types';
@@ -537,6 +538,7 @@ interface ActionRegistryAlert {
 
 function AppInner() {
   const { warn, error: toastError } = useToast();
+  const { theme, toggle: toggleTheme } = useTheme();
   const [currentView, setCurrentView] = useState<ViewId>(() => {
     try {
       const saved = localStorage.getItem('jarvis-current-view') as ViewId | null;
@@ -700,6 +702,15 @@ function AppInner() {
               <span className="w-1.5 h-1.5 rounded-full bg-cyan-neon animate-pulse" style={{ boxShadow: '0 0 8px rgba(34, 211, 238, 0.7)' }} />
               <span className="text-[10px] font-mono uppercase tracking-widest text-cyan-glow">synced {formatAge(Date.now() - lastRefresh.getTime())}</span>
             </div>
+            <button
+              type="button"
+              onClick={toggleTheme}
+              title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+              aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+              className="text-bone/40 hover:text-bone transition-colors text-sm leading-none w-5 h-5 flex items-center justify-center"
+            >
+              {theme === 'dark' ? '☾' : '☀'}
+            </button>
             <span className="text-bone-faint text-[10px] font-mono uppercase tracking-widest">v{APP_VERSION}</span>
           </div>
         </motion.header>
