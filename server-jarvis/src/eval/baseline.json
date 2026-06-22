@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "total": 14,
+  "passed": 14,
+  "outcomes": {
+    "routing/code-review-clean-json": "pass",
+    "routing/debug-clean-json": "pass",
+    "routing/refactor-clean-json": "pass",
+    "routing/docs-clean-json": "pass",
+    "routing/embedded-json-in-prose": "pass",
+    "routing/partial-json-normalizes-pipeline": "pass",
+    "routing/garbage-falls-back-to-general": "pass",
+    "routing/empty-output-falls-back": "pass",
+    "gating/reviewer-read-only": "pass",
+    "gating/rewriter-write-only": "pass",
+    "gating/executor-gets-all": "pass",
+    "gating/planner-gets-none": "pass",
+    "gating/synthesizer-gets-none": "pass",
+    "gating/unknown-mode-gets-none": "pass"
+  }
+}
