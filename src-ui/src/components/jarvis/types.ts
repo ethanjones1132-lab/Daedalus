@@ -4,6 +4,17 @@
 
 export type JarvisBackend = 'ollama' | 'openrouter' | 'claude_cli';
 
+/// Build provenance returned by the `get_build_info` Tauri command.
+export interface BuildInfo {
+  version: string;
+  git_sha: string;
+  git_short: string;
+  dirty: boolean;
+  build_time: string;
+  source_sha: string | null;
+  stale: boolean;
+}
+
 export interface JarvisConfig {
   version: string;
   active_backend: JarvisBackend;

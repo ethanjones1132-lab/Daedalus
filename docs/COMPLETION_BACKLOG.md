@@ -15,14 +15,19 @@ checking off.
 - [ ] **E — Recover remaining stub views** (SelfImprovementView, PrizePicksPanel remain):
   SelfImprovementView and PrizePicksPanel are still no-op "not recovered yet" placeholders.
   SystemHealthView, SettingsView, and ModelProfilesView were recovered this session.
-- [ ] **Unify the two config stores.** `jarvis_save_config` writes the file store
-  (`~/.openclaw/jarvis/config.json`) while `commands::load_jarvis_config` reads the
-  SQLite `settings` table; `jarvis_path` lives in SQLite, `active_backend` in the file.
-  Pick one source of truth and migrate the other to read through it.
+- [x] **Unify the two config stores.** (Phase 1.1, 2026-06-22) SQLite `settings` is now
+  the single source of truth; the file store (`~/.openclaw/jarvis/config.json`) is a
+  one-way, deep-merged projection the Bun server reads. One canonical write path
+  `commands::persist_jarvis_config`; `jarvis_save_config`/`jarvis_switch_backend` route
+  through it; boot hydrates from SQLite with a one-time file→SQLite import. *Verified:*
+  `cargo check` green; 3 round-trip/migration unit tests in `settings.rs` pass.
 - [ ] **Unify session stores.** Tauri `get_sessions_dir` (file) vs the Bun server's
   session history vs the SQLite `sessions` table — three stores; pick one.
-- [ ] **Extract + unit-test the SSE frame handler** in `runner.rs` (currently inline in a
-  thread closure) so token/result/error relay is covered by tests.
+- [x] **Extract + unit-test the SSE frame handler** (Phase 1.8, 2026-06-22). All SSE
+  parsing/decisioning moved out of the `runner.rs` thread closure into a pure, stateful
+  `SseRelay::handle_line` → `SseFrameOutcome`; the I/O loop only maps outcomes to
+  `app.emit`. *Verified:* 10 unit tests cover token/reasoning/stage/error/result-
+  suppression/`[DONE]`/malformed frames; `cargo test --lib` 31 pass.
 
 ## Needs user action (not a code bug)
 
@@ -33,6 +38,35 @@ checking off.
   real OpenRouter model (use e.g. `nvidia/llama-3.1-nemotron-ultra-253b-v1:free`).
 
 ## Done
+
+- [x] **Build provenance + stale-binary guard.** (Phase 1.4, 2026-06-22) `build.rs`
+  embeds git SHA / dirty flag / build time; the `get_build_info` command computes
+  staleness against the source tree; `BuildBadge.tsx` shows `v<x> · <sha>` everywhere
+  with a loud `⚠ stale` marker when the binary lags HEAD. Replaces the hardcoded
+  `APP_VERSION` string. *Verified:* `cargo check` + `bunx tsc -b` green.
+- [x] **Reconcile recovery contract mismatches.** (Phase 1.5, 2026-06-22)
+  `jarvis_save_companion` confirmed correct (writes `companion.json`). `jarvis_recall_cold_memory`
+  was a silent "not wired" stub — now wired to `engine::recall_cold_memory`; cold-memory
+  recall is honest (returns resident content; explicit deferred-to-Phase-2 error for
+  Drive-offloaded entries instead of silent empty). *Verified:* `cargo test --lib` 31 pass.
+- [x] **Audit fix — Create Profile was dead.** `create_profile` (models.rs) takes flat
+  args (`name, backend, model, temperature, max_tokens, top_p, engine`); ModelProfilesView
+  invoked it with a wrapped `{ profile }` (+ `provider` vs `backend`, no `top_p`), so it
+  always failed arg-deserialization. Fixed the invoke to send flat args.
+  (`src-ui/src/components/jarvis/ModelProfilesView.tsx`) *Verified:* `bunx tsc -b` green.
+- [x] **Wired `jarvis_invoke_skill`.** Proxies to the Bun server `POST /skills/invoke`,
+  collects the SSE stream, returns `{ session_id, skill, output }` (404 → "Skill not
+  found"). (`src-tauri/src/commands/recovery_stubs.rs`)
+- [x] **Wired `jarvis_save_companion`.** Persists full companion state to
+  `companion.json` (the file `GET /companion` reads); the Bun `POST /companion` is an
+  interaction, not a save. Added `save_companion_state`/`get_companion_path`.
+  (`src-tauri/src/jarvis/mod.rs`, `recovery_stubs.rs`)
+- [x] **Cleared all clippy lints.** `cargo clippy --all-targets` is warning-free (was 28):
+  real fixes (struct-update `..Default`, `clamp`, `checked_div`, `strip_prefix`,
+  `sort_by_key`, merged identical branches) + targeted `#[allow]` where a refactor wasn't
+  worth the risk (too-many-args, type-complexity, should-implement-trait, dead-code).
+  *Verified:* clippy exit 0, `cargo test` 18 pass.
+
 
 - [x] **Warm the *configured* model, not hardcoded `qwen3:8b`.** `warm_model(model)`
   now takes the configured `ollama.model` name; `start_ollama_and_warm(model)`,

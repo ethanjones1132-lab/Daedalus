@@ -65,114 +65,71 @@ pub fn run_jarvis_message(
         }
 
         // Parse the SSE stream: newline-delimited `data: {json}` frames, terminated by
-        // a `[DONE]` sentinel. Tokens arrive as `stream_event` frames with `delta.text`.
+        // a `[DONE]` sentinel. All frame parsing/decisioning lives in `SseRelay`
+        // (pure + unit-tested below); this loop only maps outcomes to `app.emit`.
         let reader = BufReader::new(resp);
+        let mut relay = SseRelay::new();
         let mut terminated = false;
-        // Track whether any incremental token was streamed. The server has two answer
-        // shapes: a token stream (`stream_event` deltas) and an orchestrator pipeline
-        // that returns the whole answer in the terminal `result` frame. If nothing was
-        // streamed, we surface the `result` text so the turn isn't silently blank.
-        let mut streamed_any = false;
         for line in reader.lines() {
             let line = match line {
                 Ok(l) => l,
                 Err(_) => break,
             };
-            let payload = match line.trim().strip_prefix("data:") {
-                Some(p) => p.trim(),
-                None => continue, // SSE comments / blank separators between frames
-            };
-            if payload.is_empty() {
-                continue;
-            }
-            if payload == "[DONE]" {
-                let _ = app.emit("jarvis://done", serde_json::json!({ "session_id": sid }));
-                terminated = true;
-                break;
-            }
-
-            let evt: serde_json::Value = match serde_json::from_str(payload) {
-                Ok(v) => v,
-                Err(_) => continue, // skip malformed frames rather than aborting the turn
-            };
-
-            match evt.get("type").and_then(|t| t.as_str()) {
-                Some("stream_event") => {
-                    if let Some(text) = evt
-                        .get("delta")
-                        .and_then(|d| d.get("text"))
-                        .and_then(|t| t.as_str())
-                    {
-                        streamed_any = true;
-                        let _ = app.emit(
-                            "jarvis://token",
-                            serde_json::json!({ "text": text, "session_id": sid }),
-                        );
-                    }
+            match relay.handle_line(&line) {
+                SseFrameOutcome::Continue => {}
+                SseFrameOutcome::Token(text) => {
+                    let _ = app.emit(
+                        "jarvis://token",
+                        serde_json::json!({ "text": text, "session_id": sid }),
+                    );
                 }
-                Some("error") => {
-                    let err = evt
-                        .get("error")
-                        .and_then(|e| e.as_str())
-                        .unwrap_or("Unknown error from Jarvis server");
-                    emit_error(&app, &sid, err.to_string());
+                SseFrameOutcome::Reasoning(text) => {
+                    let _ = app.emit(
+                        "jarvis://reasoning",
+                        serde_json::json!({ "text": text, "session_id": sid }),
+                    );
+                }
+                SseFrameOutcome::Stage {
+                    stage,
+                    status,
+                    agent,
+                } => {
+                    let _ = app.emit(
+                        "jarvis://stage",
+                        serde_json::json!({
+                            "stage": stage,
+                            "status": status,
+                            "agent": agent,
+                            "session_id": sid,
+                        }),
+                    );
+                }
+                SseFrameOutcome::Error(err) => {
+                    emit_error(&app, &sid, err);
                     terminated = true;
                     break;
                 }
-                Some("result") => {
-                    // Terminal frame. If the answer came back as one aggregate (orchestrator
-                    // mode) rather than streamed deltas, surface it now so the turn isn't
-                    // blank. `result` carries either the final answer or a failure message.
-                    if !streamed_any {
-                        if let Some(text) = evt.get("result").and_then(|r| r.as_str()) {
-                            if !text.is_empty() {
-                                let is_err =
-                                    evt.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false);
-                                if is_err {
-                                    emit_error(&app, &sid, text.to_string());
-                                } else {
-                                    let _ = app.emit(
-                                        "jarvis://token",
-                                        serde_json::json!({ "text": text, "session_id": sid }),
-                                    );
-                                }
-                            }
-                        }
+                SseFrameOutcome::ResultThenDone { token, error } => {
+                    // Orchestrator aggregate: surface the answer (or failure) that
+                    // never streamed as deltas, then close the turn.
+                    if let Some(t) = token {
+                        let _ = app.emit(
+                            "jarvis://token",
+                            serde_json::json!({ "text": t, "session_id": sid }),
+                        );
+                    }
+                    if let Some(e) = error {
+                        emit_error(&app, &sid, e);
                     }
                     let _ = app.emit("jarvis://done", serde_json::json!({ "session_id": sid }));
                     terminated = true;
                     break;
                 }
-                Some("orchestrator_stage") => {
-                    // Pipeline stage progress from the multi-agent orchestrator.
-                    // Shape: { type, stage, status, agent? }
-                    // Relay to the UI so it can show a "Planner → Executor → …" breadcrumb.
-                    let _ = app.emit(
-                        "jarvis://stage",
-                        serde_json::json!({
-                            "stage":  evt.get("stage").and_then(|s| s.as_str()).unwrap_or(""),
-                            "status": evt.get("status").and_then(|s| s.as_str()).unwrap_or(""),
-                            "agent":  evt.get("agent").and_then(|s| s.as_str()).unwrap_or(""),
-                            "session_id": sid,
-                        }),
-                    );
+                SseFrameOutcome::Done => {
+                    let _ = app.emit("jarvis://done", serde_json::json!({ "session_id": sid }));
+                    terminated = true;
+                    break;
                 }
-                Some("reasoning_step") | Some("reasoning_chunk") => {
-                    // Internal chain-of-thought text from the model. Relay as a separate
-                    // event so the UI can show it in a collapsible "Thinking…" section
-                    // without mixing it into the final answer tokens.
-                    if let Some(text) = evt
-                        .get("content")
-                        .or_else(|| evt.get("chunk"))
-                        .and_then(|c| c.as_str())
-                    {
-                        let _ = app.emit(
-                            "jarvis://reasoning",
-                            serde_json::json!({ "text": text, "session_id": sid }),
-                        );
-                    }
-                }
-                _ => {} // ignore init / heartbeat / other frame types
             }
         }
 
@@ -184,6 +141,241 @@ pub fn run_jarvis_message(
     });
 
     Ok(())
+}
+
+/// The decision for a single SSE line, decoupled from how it's delivered to the
+/// UI. The I/O loop maps each variant to a `jarvis://*` Tauri event.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SseFrameOutcome {
+    /// Nothing to emit (comment, blank, malformed, or an unhandled frame type).
+    Continue,
+    /// Incremental answer token (`stream_event` delta).
+    Token(String),
+    /// Chain-of-thought text (`reasoning_step` / `reasoning_chunk`).
+    Reasoning(String),
+    /// Orchestrator pipeline stage breadcrumb (`orchestrator_stage`).
+    Stage {
+        stage: String,
+        status: String,
+        agent: String,
+    },
+    /// Server-reported error — terminal.
+    Error(String),
+    /// Terminal `result` frame: surface the aggregate answer/failure that never
+    /// streamed as deltas, then finish.
+    ResultThenDone {
+        token: Option<String>,
+        error: Option<String>,
+    },
+    /// `[DONE]` sentinel — terminal.
+    Done,
+}
+
+/// Stateful SSE frame relay. Holds the one piece of cross-frame state the
+/// protocol needs — whether any token streamed — so the terminal `result`
+/// frame knows whether to surface its aggregate text.
+pub struct SseRelay {
+    streamed_any: bool,
+}
+
+impl SseRelay {
+    pub fn new() -> Self {
+        Self {
+            streamed_any: false,
+        }
+    }
+
+    /// Decide what a single raw SSE line means. Handles the `data:` prefix, the
+    /// `[DONE]` sentinel, malformed JSON (skipped), and every known frame type.
+    pub fn handle_line(&mut self, raw_line: &str) -> SseFrameOutcome {
+        let payload = match raw_line.trim().strip_prefix("data:") {
+            Some(p) => p.trim(),
+            None => return SseFrameOutcome::Continue, // comments / blank separators
+        };
+        if payload.is_empty() {
+            return SseFrameOutcome::Continue;
+        }
+        if payload == "[DONE]" {
+            return SseFrameOutcome::Done;
+        }
+
+        let evt: serde_json::Value = match serde_json::from_str(payload) {
+            Ok(v) => v,
+            Err(_) => return SseFrameOutcome::Continue, // skip, don't abort the turn
+        };
+
+        match evt.get("type").and_then(|t| t.as_str()) {
+            Some("stream_event") => {
+                if let Some(text) = evt
+                    .get("delta")
+                    .and_then(|d| d.get("text"))
+                    .and_then(|t| t.as_str())
+                {
+                    self.streamed_any = true;
+                    return SseFrameOutcome::Token(text.to_string());
+                }
+                SseFrameOutcome::Continue
+            }
+            Some("error") => {
+                let err = evt
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("Unknown error from Jarvis server");
+                SseFrameOutcome::Error(err.to_string())
+            }
+            Some("result") => {
+                let mut token = None;
+                let mut error = None;
+                if !self.streamed_any {
+                    if let Some(text) = evt.get("result").and_then(|r| r.as_str()) {
+                        if !text.is_empty() {
+                            let is_err =
+                                evt.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false);
+                            if is_err {
+                                error = Some(text.to_string());
+                            } else {
+                                token = Some(text.to_string());
+                            }
+                        }
+                    }
+                }
+                SseFrameOutcome::ResultThenDone { token, error }
+            }
+            Some("orchestrator_stage") => SseFrameOutcome::Stage {
+                stage: evt.get("stage").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                status: evt.get("status").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                agent: evt.get("agent").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+            },
+            Some("reasoning_step") | Some("reasoning_chunk") => {
+                if let Some(text) = evt
+                    .get("content")
+                    .or_else(|| evt.get("chunk"))
+                    .and_then(|c| c.as_str())
+                {
+                    return SseFrameOutcome::Reasoning(text.to_string());
+                }
+                SseFrameOutcome::Continue
+            }
+            _ => SseFrameOutcome::Continue, // init / heartbeat / unknown
+        }
+    }
+}
+
+impl Default for SseRelay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod sse_tests {
+    use super::*;
+
+    #[test]
+    fn non_data_lines_and_blanks_are_ignored() {
+        let mut r = SseRelay::new();
+        assert_eq!(r.handle_line(": comment"), SseFrameOutcome::Continue);
+        assert_eq!(r.handle_line(""), SseFrameOutcome::Continue);
+        assert_eq!(r.handle_line("data:"), SseFrameOutcome::Continue);
+        assert_eq!(r.handle_line("data:   "), SseFrameOutcome::Continue);
+    }
+
+    #[test]
+    fn malformed_json_is_skipped_not_fatal() {
+        let mut r = SseRelay::new();
+        assert_eq!(r.handle_line("data: {not json"), SseFrameOutcome::Continue);
+    }
+
+    #[test]
+    fn stream_event_delta_becomes_a_token() {
+        let mut r = SseRelay::new();
+        let out = r.handle_line(r#"data: {"type":"stream_event","delta":{"text":"hi"}}"#);
+        assert_eq!(out, SseFrameOutcome::Token("hi".to_string()));
+    }
+
+    #[test]
+    fn done_sentinel_is_terminal() {
+        let mut r = SseRelay::new();
+        assert_eq!(r.handle_line("data: [DONE]"), SseFrameOutcome::Done);
+    }
+
+    #[test]
+    fn error_frame_surfaces_message() {
+        let mut r = SseRelay::new();
+        let out = r.handle_line(r#"data: {"type":"error","error":"boom"}"#);
+        assert_eq!(out, SseFrameOutcome::Error("boom".to_string()));
+    }
+
+    #[test]
+    fn result_surfaces_aggregate_when_nothing_streamed() {
+        let mut r = SseRelay::new();
+        let out = r.handle_line(r#"data: {"type":"result","result":"final answer"}"#);
+        assert_eq!(
+            out,
+            SseFrameOutcome::ResultThenDone {
+                token: Some("final answer".to_string()),
+                error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn result_is_error_routes_to_error_slot() {
+        let mut r = SseRelay::new();
+        let out = r.handle_line(r#"data: {"type":"result","result":"it failed","is_error":true}"#);
+        assert_eq!(
+            out,
+            SseFrameOutcome::ResultThenDone {
+                token: None,
+                error: Some("it failed".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn result_is_suppressed_after_tokens_streamed() {
+        let mut r = SseRelay::new();
+        // A token streamed first…
+        let _ = r.handle_line(r#"data: {"type":"stream_event","delta":{"text":"partial"}}"#);
+        // …so the terminal result must NOT re-surface the aggregate (no double answer).
+        let out = r.handle_line(r#"data: {"type":"result","result":"partial"}"#);
+        assert_eq!(
+            out,
+            SseFrameOutcome::ResultThenDone {
+                token: None,
+                error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn orchestrator_stage_maps_fields() {
+        let mut r = SseRelay::new();
+        let out = r.handle_line(
+            r#"data: {"type":"orchestrator_stage","stage":"plan","status":"running","agent":"planner"}"#,
+        );
+        assert_eq!(
+            out,
+            SseFrameOutcome::Stage {
+                stage: "plan".to_string(),
+                status: "running".to_string(),
+                agent: "planner".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn reasoning_frames_relay_content_or_chunk() {
+        let mut r = SseRelay::new();
+        assert_eq!(
+            r.handle_line(r#"data: {"type":"reasoning_step","content":"thinking"}"#),
+            SseFrameOutcome::Reasoning("thinking".to_string())
+        );
+        assert_eq!(
+            r.handle_line(r#"data: {"type":"reasoning_chunk","chunk":"more"}"#),
+            SseFrameOutcome::Reasoning("more".to_string())
+        );
+    }
 }
 
 /// Check Jarvis status: Ollama, Bun server, proxy, bridge, model availability.
@@ -212,7 +404,7 @@ pub fn check_jarvis_status(config: &JarvisConfig) -> JarvisStatus {
                                     models.iter().any(|m| {
                                         m.get("name")
                                             .and_then(|n| n.as_str())
-                                            .map_or(false, |n| n.contains(&model))
+                                            .is_some_and(|n| n.contains(&model))
                                     })
                                 })
                                 .unwrap_or(false);

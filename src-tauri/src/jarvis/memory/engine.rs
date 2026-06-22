@@ -321,7 +321,7 @@ pub fn recall_memories(
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    recalls.truncate(limit.max(1).min(RECALL_LIMIT));
+    recalls.truncate(limit.clamp(1, RECALL_LIMIT));
 
     if mark_used {
         let ts = now();
@@ -1280,6 +1280,7 @@ fn finish_run(
     .map_err(|e| e.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_memory_event(
     conn: &Connection,
     memory_id: Option<&str>,
@@ -1507,11 +1508,10 @@ fn score_memory(memory: &MemoryEntry, terms: &[String]) -> (f64, Vec<String>) {
         if title_lower.contains(term) {
             title_hits += 1;
             matched.push(term.clone());
-        } else if tags_lower.contains(term) || category_lower.contains(term) {
-            body_hits += 1;
-            matched.push(term.clone());
-        } else if memory.content.len() < MAX_MEMORY_CONTENT_BYTES
-            && memory.content.to_lowercase().contains(term)
+        } else if tags_lower.contains(term)
+            || category_lower.contains(term)
+            || (memory.content.len() < MAX_MEMORY_CONTENT_BYTES
+                && memory.content.to_lowercase().contains(term))
         {
             body_hits += 1;
             matched.push(term.clone());
@@ -2265,11 +2265,21 @@ pub fn recall_cold_memory(conn: &Connection, id: &str) -> Result<Option<String>,
     match tier.as_str() {
         "hot" | "warm" => Ok(Some(content)),
         "cold" => {
-            if let Some(_fid) = drive_file_id {
-                // TODO Phase 2: fetch from Drive API
-                Ok(None) // Placeholder — will be implemented with Drive integration
+            if let Some(fid) = drive_file_id {
+                // Cold content is offloaded to Drive to keep the hot/warm DB lean.
+                // Drive *fetch* is deferred to Phase 2 (see docs/MASTER_PLAN.md). Be
+                // explicit instead of silently returning empty content for a memory
+                // that demonstrably exists — a silent None here looks like data loss.
+                Err(format!(
+                    "Cold memory '{id}' is archived to Drive (file {fid}); offline \
+                     retrieval is deferred to Phase 2. Its searchable summary remains \
+                     in the index."
+                ))
+            } else if !content.is_empty() {
+                // Cold but still resident in the DB (not yet offloaded to Drive).
+                Ok(Some(content))
             } else {
-                Ok(None) // No Drive file yet
+                Ok(None) // No Drive file and no resident content.
             }
         }
         _ => Ok(None),

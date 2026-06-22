@@ -621,16 +621,26 @@ pub fn run() {
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                // Hydrate the in-memory config from SQLite so boot reflects the user's
-                // chosen backend. JarvisState starts as the Ollama default until this
-                // runs; without this, OpenRouter users would still pay for an Ollama
-                // boot and the in-memory config would never match what was persisted.
-                // The file store (`~/.openclaw/jarvis/config.json`) is what the UI's
-                // Save writes via `jarvis_save_config`, so it is the source of truth for
-                // the active backend. Hydrating it here also fixes a latent bug: without
-                // this the in-memory config stayed at the Ollama default, so the Control
-                // view reverted to Ollama on every restart regardless of what was saved.
-                let cfg = crate::jarvis::load_jarvis_config();
+                // Hydrate the in-memory config from SQLite — the single source of
+                // truth for JarvisConfig. JarvisState starts at the Ollama default
+                // until this runs; without it, OpenRouter users would pay for an
+                // Ollama boot and the Control view would revert to Ollama on restart.
+                //
+                // On the first boot after the file→SQLite cutover, import any legacy
+                // file store (`~/.openclaw/jarvis/config.json`) so the user's saved
+                // backend/key survive; thereafter the file is a one-way projection
+                // that only the Bun server reads.
+                let db_state = handle.state::<crate::db::AppDb>();
+                match crate::commands::migrate_file_config_into_sqlite_if_needed(&db_state)
+                {
+                    Ok(true) => println!(
+                        "[Jarvis] Imported legacy file config into SQLite (one-time migration)."
+                    ),
+                    Ok(false) => {}
+                    Err(e) => eprintln!("[Jarvis] config migration check failed: {e}"),
+                }
+                let cfg = crate::commands::load_jarvis_config(&db_state)
+                    .unwrap_or_default();
                 {
                     let state = handle.state::<crate::jarvis::types::JarvisState>();
                     *state.config.lock().await = cfg.clone();
@@ -716,6 +726,7 @@ pub fn run() {
             jarvis_stop_bridge,
             jarvis_restart_server,
             jarvis_restart_ollama,
+            get_build_info,
             get_all_settings,
             get_setting,
             set_setting,

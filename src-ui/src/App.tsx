@@ -45,8 +45,7 @@ import CommitmentsView from './components/jarvis/CommitmentsView';
 import ApprovalsView from './components/jarvis/ApprovalsView';
 import PluginsView from './components/jarvis/PluginsView';
 import GatewayView from './components/jarvis/GatewayView';
-
-const APP_VERSION = '3.0.0';
+import BuildBadge from './components/jarvis/BuildBadge';
 
 const NAV_SECTIONS: NavSection[] = [
   { title: 'JARVIS', items: [{ id: 'jarvis', label: 'Jarvis', icon: 'J' }] },
@@ -263,7 +262,7 @@ function Sidebar({ currentView, onNavigate }: { currentView: ViewId; onNavigate:
         ))}
       </nav>
       <div className="px-4 py-3 border-t border-white/[0.04] flex items-center justify-between">
-        <span className="text-[10px] font-mono text-bone-faint">v{APP_VERSION}</span>
+        <BuildBadge />
         <div className="flex items-center gap-1.5">
           <span className="w-1.5 h-1.5 rounded-full bg-cyan-neon animate-pulse" style={{ boxShadow: '0 0 6px rgba(34, 211, 238, 0.7)' }} />
           <span className="text-[9px] font-mono uppercase tracking-widest text-cyan-glow">live</span>
@@ -711,7 +710,7 @@ function AppInner() {
             >
               {theme === 'dark' ? '☾' : '☀'}
             </button>
-            <span className="text-bone-faint text-[10px] font-mono uppercase tracking-widest">v{APP_VERSION}</span>
+            <BuildBadge />
           </div>
         </motion.header>
         <HealthBanner />

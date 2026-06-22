@@ -193,8 +193,10 @@ pub async fn jarvis_get_config(state: State<'_, JarvisState>) -> Result<JarvisCo
 pub async fn jarvis_save_config(
     config: JarvisConfig,
     state: State<'_, JarvisState>,
+    db: State<'_, crate::db::AppDb>,
 ) -> Result<(), String> {
-    jarvis::save_jarvis_config(&config)?;
+    // SQLite is canonical; this also projects to the Bun-readable file store.
+    crate::commands::persist_jarvis_config(&db, &config)?;
     let backend = config.active_backend.clone();
     let ollama_model = config.ollama.model.clone();
     {

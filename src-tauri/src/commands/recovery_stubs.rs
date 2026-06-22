@@ -86,13 +86,74 @@ pub async fn jarvis_get_tools() -> Result<Vec<Value>, String> {
 }
 
 #[tauri::command]
-pub async fn jarvis_invoke_skill(name: String, _args: Option<Value>) -> Result<Value, String> {
-    Err(format!(
-        "jarvis_invoke_skill({}) is not yet wired up in the recovered tree; \
-         restore the skill runner from transcripts or implement against the \
-         Bun-side registry",
-        name
-    ))
+pub async fn jarvis_invoke_skill(name: String, args: Option<Value>) -> Result<Value, String> {
+    // Invoke a skill via the Bun server's `POST /skills/invoke`, which streams the
+    // result as SSE (`init` → `stream_event` deltas → `message_stop`). The command
+    // contract is a single Value, so we collect the stream and return the aggregate
+    // text plus the server-assigned session id.
+    let base = bun_base().await?;
+    let client = http_client()?;
+    let body = serde_json::json!({ "name": name, "args": args.unwrap_or(Value::Null) });
+
+    let resp = client
+        .post(format!("{}/skills/invoke", base))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("skills/invoke request failed: {}", e))?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(format!("Skill not found: {}", name));
+    }
+    if !resp.status().is_success() {
+        return Err(format!("skills/invoke returned HTTP {}", resp.status()));
+    }
+
+    let raw = resp
+        .text()
+        .await
+        .map_err(|e| format!("reading skills/invoke stream: {}", e))?;
+
+    let mut output = String::new();
+    let mut session_id = String::new();
+    for line in raw.lines() {
+        let payload = match line.trim().strip_prefix("data:") {
+            Some(p) => p.trim(),
+            None => continue,
+        };
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let Ok(evt) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        match evt.get("type").and_then(|t| t.as_str()) {
+            Some("init") => {
+                if let Some(s) = evt.get("session_id").and_then(|s| s.as_str()) {
+                    session_id = s.to_string();
+                }
+            }
+            Some("stream_event") => {
+                if let Some(text) = evt
+                    .get("delta")
+                    .and_then(|d| d.get("text"))
+                    .and_then(|t| t.as_str())
+                {
+                    output.push_str(text);
+                }
+            }
+            Some("error") => {
+                return Err(evt
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("skill invocation error")
+                    .to_string());
+            }
+            _ => {}
+        }
+    }
+
+    Ok(serde_json::json!({ "session_id": session_id, "skill": name, "output": output }))
 }
 
 #[tauri::command]
@@ -147,6 +208,7 @@ pub async fn jarvis_test_connection(
 pub async fn jarvis_switch_backend(
     backend: String,
     state: State<'_, crate::jarvis::types::JarvisState>,
+    db: State<'_, crate::db::AppDb>,
 ) -> Result<(), String> {
     use crate::jarvis::types::JarvisBackend;
     let new_backend = match backend.as_str() {
@@ -156,11 +218,11 @@ pub async fn jarvis_switch_backend(
         other => return Err(format!("unknown backend: {other}")),
     };
 
-    // Persist to the file store (the UI's source of truth) and mirror into the
+    // Persist canonically (SQLite + file projection) and mirror into the
     // in-memory state so subsequent chats route to the new backend immediately.
     let mut cfg = { state.config.lock().await.clone() };
     cfg.active_backend = new_backend.clone();
-    crate::jarvis::save_jarvis_config(&cfg)?;
+    crate::commands::persist_jarvis_config(&db, &cfg)?;
     let ollama_model = cfg.ollama.model.clone();
     {
         let mut guard = state.config.lock().await;
@@ -180,8 +242,11 @@ pub async fn jarvis_get_companion() -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub async fn jarvis_save_companion(_companion: Value) -> Result<(), String> {
-    Err("jarvis_save_companion is not yet wired up in the recovered tree".to_string())
+pub async fn jarvis_save_companion(companion: Value) -> Result<(), String> {
+    // Persist the full companion state to companion.json (the file the Bun server's
+    // GET /companion reads). The Bun POST /companion route is an interaction, not a
+    // save, so we write the canonical state directly.
+    crate::jarvis::save_companion_state(&companion)
 }
 
 #[tauri::command]
@@ -266,8 +331,22 @@ pub fn jarvis_list_memories_by_tier(db: State<AppDb>, tier: String) -> Result<Ve
 }
 
 #[tauri::command]
-pub async fn jarvis_recall_cold_memory(_id: String) -> Result<Value, String> {
-    Err("jarvis_recall_cold_memory is not yet wired up in the recovered tree".to_string())
+pub async fn jarvis_recall_cold_memory(
+    db: tauri::State<'_, crate::db::AppDb>,
+    id: String,
+) -> Result<Value, String> {
+    // Wired to the real memory engine (was a silent "not wired" stub). Hot/warm
+    // and DB-resident cold memories return their content; Drive-offloaded cold
+    // memories return an explicit deferred error rather than empty content.
+    let content = {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        crate::jarvis::memory::engine::recall_cold_memory(&conn, &id)?
+    };
+    Ok(serde_json::json!({
+        "id": id,
+        "found": content.is_some(),
+        "content": content,
+    }))
 }
 
 // `update_token_count` is referenced by lib.rs but is also a member of the

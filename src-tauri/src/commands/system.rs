@@ -265,6 +265,68 @@ fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+// ── Build provenance ────────────────────────────────────────
+
+/// Build provenance, embedded at compile time by `build.rs`, plus a runtime
+/// staleness check against the source tree (when locatable on this machine).
+#[derive(Debug, Clone, Serialize)]
+pub struct BuildInfo {
+    pub version: String,
+    pub git_sha: String,
+    pub git_short: String,
+    pub dirty: bool,
+    pub build_time: String,
+    /// Current HEAD of the source tree this binary was built from, if that tree
+    /// still exists on this machine. `None` for an installed/relocated binary.
+    pub source_sha: Option<String>,
+    /// True when the source tree has advanced past the SHA this binary embeds —
+    /// i.e. the running binary is stale and should be rebuilt.
+    pub stale: bool,
+}
+
+/// Report what this binary was built from, and whether the source has moved on.
+#[tauri::command]
+pub fn get_build_info() -> BuildInfo {
+    let git_sha = env!("JARVIS_GIT_SHA").to_string();
+    let dirty = env!("JARVIS_GIT_DIRTY") == "1";
+    let build_unix: i64 = env!("JARVIS_BUILD_UNIX").parse().unwrap_or(0);
+    let build_time = chrono::DateTime::from_timestamp(build_unix, 0)
+        .map(|d| d.to_rfc3339())
+        .unwrap_or_default();
+    let git_short = git_sha.chars().take(9).collect::<String>();
+
+    // The source tree is the parent of the crate manifest dir captured at build
+    // time. On the dev machine this still exists; elsewhere it won't.
+    let source_sha = {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent();
+        repo_root.and_then(|root| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        })
+    };
+
+    let stale = match &source_sha {
+        Some(head) => head != &git_sha,
+        None => false,
+    };
+
+    BuildInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        git_sha,
+        git_short,
+        dirty,
+        build_time,
+        source_sha,
+        stale,
+    }
+}
+
 // ── Health & Doctor ─────────────────────────────────────────
 
 #[tauri::command]
@@ -369,7 +431,7 @@ fn memory_health() -> MemoryHealth {
         }
         if let (Some(t), Some(a)) = (total_kb, avail_kb) {
             let used = t.saturating_sub(a);
-            let pct = if t > 0 { (used * 100) / t } else { 0 };
+            let pct = (used * 100).checked_div(t).unwrap_or(0);
             return MemoryHealth {
                 total_mb: t / 1024,
                 available_mb: a / 1024,
