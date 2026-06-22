@@ -31,6 +31,9 @@ jobs:
       - name: Typecheck
         run: npx tsc -b
 
+      - name: Unit tests
+        run: npm run test
+
       - name: Build
         run: npx vite build
 
@@ -100,3 +103,6 @@ jobs:
 
       - name: Check
         run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Test
+        run: cargo test --manifest-path src-tauri/Cargo.toml
