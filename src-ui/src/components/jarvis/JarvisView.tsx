@@ -256,7 +256,17 @@ function ChatPanel({
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, []);
 
-  useEffect(() => { scrollToBottom(); }, [messages, scrollToBottom]);
+  // Throttle scroll during streaming: tokens arrive at 20-50 Hz, but smooth-scrolling
+  // on every character feels laggy and costs layout work. 100ms ≈ 10 fps — smooth
+  // enough to follow the cursor, cheap enough to not thrash the main thread.
+  useEffect(() => {
+    if (!isStreaming) {
+      scrollToBottom();
+      return;
+    }
+    const t = setTimeout(scrollToBottom, 100);
+    return () => clearTimeout(t);
+  }, [messages, isStreaming, scrollToBottom]);
 
   // Listen for streaming tokens
   useEffect(() => {
@@ -274,7 +284,9 @@ function ChatPanel({
     const unlistenDone = listen<{ session_id: string }>('jarvis://done', () => {
       setIsStreaming(false);
       setPipelineStage('');
-      setReasoningText('');
+      // Keep reasoningText visible after done so the user can review the
+      // chain-of-thought that produced the answer. They can collapse it
+      // manually; we'll clear it on the next user message.
       setMessages(prev => {
         const last = prev[prev.length - 1];
         if (last && last.isStreaming) {
@@ -328,15 +340,29 @@ function ChatPanel({
     setMessages(prev => [...prev, { role: 'user', content: userMsg }]);
 
     try {
+      // Auto-create a session on first message so the turn is durable in SQLite
+      // and the user can return to it from the Sessions panel. Without this, the
+      // first message gets a transient UUID and vanishes on refresh.
+      let effectiveSessionId = activeSession || sessionId;
+      if (!effectiveSessionId) {
+        const newSession = await invoke<JarvisSession>('jarvis_new_session', {
+          name: userMsg.slice(0, 60),
+        });
+        effectiveSessionId = newSession.id;
+        setSessionId(newSession.id);
+        setActiveSession(newSession.id);
+        onSessionCreated();
+      }
+
       await invoke('jarvis_send_message', {
         message: userMsg,
-        sessionId: activeSession || sessionId,
+        sessionId: effectiveSessionId,
       });
     } catch (e) {
       setIsStreaming(false);
       setError(String(e));
     }
-  }, [input, isStreaming, activeSession, sessionId]);
+  }, [input, isStreaming, activeSession, sessionId, onSessionCreated]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -350,6 +376,9 @@ function ChatPanel({
     setSessionId('');
     setActiveSession(null);
     setError(null);
+    setPipelineStage('');
+    setReasoningText('');
+    setShowReasoning(false);
     inputRef.current?.focus();
   };
 
@@ -518,6 +547,17 @@ function ChatPanel({
 function ChatMessage({ message }: { message: JarvisMessage }) {
   const isUser = message.role === 'user';
   const isTool = message.role === 'tool';
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(message.content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch (e) {
+      console.error('Failed to copy:', e);
+    }
+  }, [message.content]);
 
   return (
     <motion.div
@@ -553,6 +593,15 @@ function ChatMessage({ message }: { message: JarvisMessage }) {
           <span className="text-[10px] font-mono text-bone-faint">
             {new Date(message.timestamp).toLocaleTimeString()}
           </span>
+        )}
+        {!message.isStreaming && (
+          <button
+            onClick={handleCopy}
+            className="ml-auto text-[10px] font-mono text-bone-faint hover:text-bone-dim transition-colors px-1.5 py-0.5 rounded border border-iron/20 hover:border-iron/40"
+            title="Copy message"
+          >
+            {copied ? '✓ copied' : 'copy'}
+          </button>
         )}
       </div>
       <div className={cn(
