@@ -33,8 +33,13 @@ pub fn evaluate_source(url: &str) -> SourceEvaluation {
 
     // Reject obvious non-research surfaces first.
     let rejected_substrings = [
-        "facebook.com", "twitter.com", "x.com", "instagram.com",
-        "tiktok.com", "reddit.com", "pinterest.com",
+        "facebook.com",
+        "twitter.com",
+        "x.com",
+        "instagram.com",
+        "tiktok.com",
+        "reddit.com",
+        "pinterest.com",
         "w3schools.com",
     ];
     for bad in rejected_substrings {
@@ -49,9 +54,17 @@ pub fn evaluate_source(url: &str) -> SourceEvaluation {
 
     // Tier 1 surfaces — well-sourced, primary or peer-reviewed.
     let tier1_substrings = [
-        ".edu", ".gov", "arxiv.org", "github.com", "gitlab.com",
-        "doi.org", "pubmed.ncbi.nlm.nih.gov", "ncbi.nlm.nih.gov",
-        "ieee.org", "acm.org", "wikipedia.org",
+        ".edu",
+        ".gov",
+        "arxiv.org",
+        "github.com",
+        "gitlab.com",
+        "doi.org",
+        "pubmed.ncbi.nlm.nih.gov",
+        "ncbi.nlm.nih.gov",
+        "ieee.org",
+        "acm.org",
+        "wikipedia.org",
     ];
     for good in tier1_substrings {
         if lower.contains(good) {
@@ -106,7 +119,13 @@ pub fn output_path(out_dir: &std::path::Path, topic: &str) -> PathBuf {
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let safe: String = topic
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     out_dir.join(format!("learning-{safe}-{stamp}.md"))
 }

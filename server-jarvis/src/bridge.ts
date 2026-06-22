@@ -99,12 +99,13 @@ try {
                             writeSocket(socket, JSON.stringify(evt) + "\n");
                           }
                         } catch { /* skip malformed SSE frames */ }
+                      }
                     }
                   }
+                } catch (readErr) {
+                  writeSocket(socket, JSON.stringify({ error: safeErrorMessage(readErr), session_id: session }) + "\n");
+                  break;
                 }
-              } catch (readErr) {
-                writeSocket(socket, JSON.stringify({ error: safeErrorMessage(readErr), session_id: session }) + "\n");
-                break;
               }
             }).catch((e) => {
               writeSocket(socket, JSON.stringify({ error: safeErrorMessage(e), session_id: session }) + "\n");

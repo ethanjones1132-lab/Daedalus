@@ -562,8 +562,11 @@ pub fn get_skill(db: State<AppDb>, name: String) -> Result<Skill, String> {
 #[tauri::command]
 pub fn enable_skill(db: State<AppDb>, name: String) -> Result<(), String> {
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    conn.execute("UPDATE skills SET enabled = 1, updated_at = datetime('now') WHERE name = ?", [&name])
-        .map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE skills SET enabled = 1, updated_at = datetime('now') WHERE name = ?",
+        [&name],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -571,8 +574,11 @@ pub fn enable_skill(db: State<AppDb>, name: String) -> Result<(), String> {
 #[tauri::command]
 pub fn disable_skill(db: State<AppDb>, name: String) -> Result<(), String> {
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    conn.execute("UPDATE skills SET enabled = 0, updated_at = datetime('now') WHERE name = ?", [&name])
-        .map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE skills SET enabled = 0, updated_at = datetime('now') WHERE name = ?",
+        [&name],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

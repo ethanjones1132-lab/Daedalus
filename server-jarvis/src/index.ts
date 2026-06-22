@@ -25,7 +25,7 @@ import {
 } from "./agent-routes";
 import { effectiveOllamaUrl, checkOllamaHealth, checkOllamaModelSupportsTools, resolveWindowsHostIP } from "./ollama";
 import { streamClaudeCli, isClaudeCliAvailable } from "./claude-cli";
-import { ReasoningParser, stripReasoningFromText } from "./reasoning";
+import { ReasoningParser, stripReasoningFromText, type ReasoningEvent } from "./reasoning";
 import {
   listOpenRouterModels,
   checkOpenRouterHealth,
@@ -118,6 +118,24 @@ const MODEL_STREAM_STALL_CHECK_MS = 125_000;
 const MAX_TOOL_RESULT_CHARS = 2000;  // Truncate tool results going back to model context
 const MAX_TOOL_EXECUTION_TURNS = 10;
 const activeStreamControllers = new Map<string, AbortController>();
+
+function visibleTextFromReasoningEvent(event: ReasoningEvent): string {
+  switch (event.type) {
+    case "content":
+      return event.text;
+    case "reasoning_chunk":
+      return event.text;
+    default:
+      return "";
+  }
+}
+
+function ensureActiveToolCall(activeToolCalls: Array<{ id?: string; name?: string; arguments?: string }>, idx: number) {
+  if (!activeToolCalls[idx]) {
+    activeToolCalls[idx] = { id: "", name: "", arguments: "" };
+  }
+  return activeToolCalls[idx];
+}
 
 async function resolveOutputMaxTokens(
   cfg: JarvisConfig,
@@ -930,12 +948,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             const text: string = evt.delta.text;
             if (reasoningParser) {
               for (const re of reasoningParser.processChunk(text)) {
+                const visibleText = visibleTextFromReasoningEvent(re);
+                if (!visibleText) continue;
                 if (re.type === "reasoning_step") {
                   await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
                 } else if (re.type === "reasoning_chunk") {
-                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: re.text, session_id: sessionId })}\n\n`));
-                } else if (re.type === "content") {
-                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: re.text }, session_id: sessionId })}\n\n`));
+                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
+                } else {
+                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: visibleText }, session_id: sessionId })}\n\n`));
                 }
               }
             }
@@ -951,12 +971,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
             if (reasoningParser) {
               for (const re of reasoningParser.flush()) {
+                const visibleText = visibleTextFromReasoningEvent(re);
+                if (!visibleText) continue;
                 if (re.type === "reasoning_step") {
                   await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
                 } else if (re.type === "reasoning_chunk") {
-                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: re.text, session_id: sessionId })}\n\n`));
-                } else if (re.type === "content") {
-                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: re.text }, session_id: sessionId })}\n\n`));
+                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
+                } else {
+                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: visibleText }, session_id: sessionId })}\n\n`));
                 }
               }
               const trace = reasoningParser.finalize();
@@ -1140,12 +1162,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 if (choice.delta?.tool_calls) {
                   for (const tc of choice.delta.tool_calls) {
                     const idx = tc.index ?? 0;
-                    if (!activeToolCalls[idx]) {
-                      activeToolCalls[idx]
-                    }
-                    if (tc.id) activeToolCalls[idx].id = tc.id;
-                    if (tc.function?.name) activeToolCalls[idx].name = tc.function.name;
-                    if (tc.function?.arguments) activeToolCalls[idx].arguments += tc.function.arguments;
+                    const active = ensureActiveToolCall(activeToolCalls, idx);
+                    if (tc.id) active.id = tc.id;
+                    if (tc.function?.name) active.name += tc.function.name;
+                    if (tc.function?.arguments) active.arguments += tc.function.arguments;
                   }
                 }
 
@@ -1160,12 +1180,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
                     if (reasoningParser) {
                       for (const re of reasoningParser.processChunk(chunkText)) {
+                        const visibleText = visibleTextFromReasoningEvent(re);
+                        if (!visibleText) continue;
                         if (re.type === "reasoning_step") {
                           await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
                         } else if (re.type === "reasoning_chunk") {
-                          await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: re.text, session_id: sessionId })}\n\n`));
-                        } else if (re.type === "content") {
-                          const sanitized = textStreamSanitizer.push(re.text);
+                          await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
+                        } else {
+                          const sanitized = textStreamSanitizer.push(visibleText);
                           if (sanitized) {
                             await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: sanitized }, session_id: sessionId })}\n\n`));
                           }
@@ -1187,12 +1209,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
           if (reasoningParser) {
             for (const re of reasoningParser.flush()) {
+              const visibleText = visibleTextFromReasoningEvent(re);
+              if (!visibleText) continue;
               if (re.type === "reasoning_step") {
                 await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
               } else if (re.type === "reasoning_chunk") {
-                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: re.text, session_id: sessionId })}\n\n`));
-              } else if (re.type === "content") {
-                const sanitized = textStreamSanitizer.push(re.text);
+                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
+              } else {
+                const sanitized = textStreamSanitizer.push(visibleText);
                 if (sanitized) {
                   await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: sanitized }, session_id: sessionId })}\n\n`));
                 }
@@ -1561,12 +1585,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           if (!text) return;
           if (reasoningParser) {
             for (const re of reasoningParser.processChunk(text)) {
+              const visibleText = visibleTextFromReasoningEvent(re);
+              if (!visibleText) continue;
               if (re.type === "reasoning_step") {
                 await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
               } else if (re.type === "reasoning_chunk") {
-                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: re.text, session_id: sessionId })}\n\n`));
-              } else if (re.type === "content") {
-                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: re.text }, session_id: sessionId })}\n\n`));
+                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
+              } else {
+                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: visibleText }, session_id: sessionId })}\n\n`));
               }
             }
           } else {
@@ -1576,12 +1602,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const completeReasoning = async () => {
           if (!reasoningParser) return;
           for (const re of reasoningParser.flush()) {
+            const visibleText = visibleTextFromReasoningEvent(re);
+            if (!visibleText) continue;
             if (re.type === "reasoning_step") {
               await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
             } else if (re.type === "reasoning_chunk") {
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: re.text, session_id: sessionId })}\n\n`));
-            } else if (re.type === "content") {
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: re.text }, session_id: sessionId })}\n\n`));
+              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
+            } else {
+              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: visibleText }, session_id: sessionId })}\n\n`));
             }
           }
           const trace = reasoningParser.finalize();

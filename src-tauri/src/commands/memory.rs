@@ -219,8 +219,8 @@ pub fn list_workspace_files(path: String) -> Result<Vec<String>, String> {
     if !expanded.exists() {
         return Ok(Vec::new());
     }
-    let entries = std::fs::read_dir(&expanded)
-        .map_err(|e| format!("Failed to read directory: {}", e))?;
+    let entries =
+        std::fs::read_dir(&expanded).map_err(|e| format!("Failed to read directory: {}", e))?;
     let mut files = Vec::new();
     for entry in entries {
         if let Ok(entry) = entry {
@@ -239,6 +239,5 @@ pub fn list_workspace_files(path: String) -> Result<Vec<String>, String> {
 #[tauri::command]
 pub fn read_workspace_file(path: String) -> Result<String, String> {
     let expanded = expand_path_safe(&path)?;
-    std::fs::read_to_string(&expanded)
-        .map_err(|e| format!("Failed to read workspace file: {}", e))
+    std::fs::read_to_string(&expanded).map_err(|e| format!("Failed to read workspace file: {}", e))
 }

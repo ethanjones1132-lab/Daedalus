@@ -16,7 +16,9 @@ pub enum JarvisBackend {
 }
 
 impl Default for JarvisBackend {
-    fn default() -> Self { JarvisBackend::Ollama }
+    fn default() -> Self {
+        JarvisBackend::Ollama
+    }
 }
 
 impl std::fmt::Display for JarvisBackend {
@@ -69,7 +71,8 @@ impl Default for JarvisConfig {
             tools: ToolConfig::default(),
             reasoning: ReasoningConfig::default(),
             companion: CompanionConfig::default(),
-            system_prompt: "You are Jarvis, a local AI assistant. Be concise and helpful.".to_string(),
+            system_prompt: "You are Jarvis, a local AI assistant. Be concise and helpful."
+                .to_string(),
             mode: "general".to_string(),
             prizepicks_prompt: String::new(),
             temperature: 0.7,
@@ -175,7 +178,9 @@ pub struct ToolConfig {
     pub denylist: Vec<String>,
 }
 
-fn default_sandbox() -> String { "permissive".to_string() }
+fn default_sandbox() -> String {
+    "permissive".to_string()
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ReasoningConfig {
@@ -201,9 +206,15 @@ pub struct CompanionConfig {
     pub rarity: String,
 }
 
-fn default_companion_name() -> String { "Sprout".to_string() }
-fn default_companion_species() -> String { "spriggan".to_string() }
-fn default_companion_rarity() -> String { "common".to_string() }
+fn default_companion_name() -> String {
+    "Sprout".to_string()
+}
+fn default_companion_species() -> String {
+    "spriggan".to_string()
+}
+fn default_companion_rarity() -> String {
+    "common".to_string()
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct CompactionConfigV2 {
@@ -291,7 +302,9 @@ pub struct BridgeRequest {
     pub timeout_secs: u64,
 }
 
-fn default_timeout() -> u64 { 30 }
+fn default_timeout() -> u64 {
+    30
+}
 
 #[derive(Debug, Serialize)]
 pub struct BridgeResponse {

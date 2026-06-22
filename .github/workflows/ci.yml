@@ -95,6 +95,15 @@ jobs:
             librsvg2-dev \
             patchelf
 
+      # tauri.conf.json bundles ../server-jarvis/dist/index.js as a resource,
+      # and tauri-build validates resource paths at build time. dist/ is
+      # gitignored, so build it before cargo touches the crate.
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Build server bundle (tauri resource)
+        run: bun install --frozen-lockfile && bun build ./src/index.ts --outdir ./dist --target bun
+        working-directory: server-jarvis
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2

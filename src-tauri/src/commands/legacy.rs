@@ -43,11 +43,12 @@ pub async fn legacy_get_dashboard() -> Result<serde_json::Value, String> {
 }
 
 pub async fn legacy_get_cron_jobs() -> Result<Vec<CronJob>, String> {
-    let json_str = tokio::task::spawn_blocking(|| wsl_openclaw(&["cron", "list", "--json", "--all"]))
-        .await
-        .map_err(|e| format!("Task join error: {}", e))??;
-    let raw: serde_json::Value = serde_json::from_str(&json_str)
-        .map_err(|e| format!("Failed to parse cron JSON: {}", e))?;
+    let json_str =
+        tokio::task::spawn_blocking(|| wsl_openclaw(&["cron", "list", "--json", "--all"]))
+            .await
+            .map_err(|e| format!("Task join error: {}", e))??;
+    let raw: serde_json::Value =
+        serde_json::from_str(&json_str).map_err(|e| format!("Failed to parse cron JSON: {}", e))?;
     Ok(parse_cron_jobs(&raw))
 }
 
@@ -127,9 +128,11 @@ pub async fn legacy_get_health() -> Result<serde_json::Value, String> {
 
 pub async fn legacy_get_logs(limit: Option<u64>) -> Result<serde_json::Value, String> {
     let limit_val = limit.unwrap_or(50).to_string();
-    let json_str = tokio::task::spawn_blocking(move || wsl_openclaw(&["logs", "--json", "--limit", &limit_val]))
-        .await
-        .map_err(|e| format!("Task join error: {}", e))??;
+    let json_str = tokio::task::spawn_blocking(move || {
+        wsl_openclaw(&["logs", "--json", "--limit", &limit_val])
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))??;
     serde_json::from_str(&json_str).map_err(|e| format!("Failed to parse logs JSON: {}", e))
 }
 
@@ -146,9 +149,10 @@ pub async fn legacy_get_config() -> Result<ConfigData, String> {
 }
 
 pub async fn legacy_get_sessions() -> Result<Vec<SessionSummary>, String> {
-    let json_str = tokio::task::spawn_blocking(|| wsl_openclaw(&["sessions", "--json", "--all-agents"]))
-        .await
-        .map_err(|e| format!("Task join error: {}", e))??;
+    let json_str =
+        tokio::task::spawn_blocking(|| wsl_openclaw(&["sessions", "--json", "--all-agents"]))
+            .await
+            .map_err(|e| format!("Task join error: {}", e))??;
     let raw: serde_json::Value = serde_json::from_str(&json_str)
         .map_err(|e| format!("Failed to parse sessions JSON: {}", e))?;
     let mut sessions = parse_sessions_from_list(&raw);
@@ -227,7 +231,11 @@ pub async fn legacy_get_session_history(
                 .get("timestamp")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            messages.push(ChatMessage { role, content, timestamp });
+            messages.push(ChatMessage {
+                role,
+                content,
+                timestamp,
+            });
         }
     }
 

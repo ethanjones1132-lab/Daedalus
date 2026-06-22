@@ -71,9 +71,7 @@ pub async fn hermes_spawn(
 }
 
 #[tauri::command]
-pub async fn hermes_shutdown(
-    state: State<'_, HermesAppState>,
-) -> Result<HermesStatus, String> {
+pub async fn hermes_shutdown(state: State<'_, HermesAppState>) -> Result<HermesStatus, String> {
     state.detach_and_shutdown().await?;
     hermes_status(state).await
 }
@@ -89,9 +87,7 @@ pub async fn hermes_restart(
 }
 
 #[tauri::command]
-pub async fn hermes_interrupt(
-    state: State<'_, HermesAppState>,
-) -> Result<HermesStatus, String> {
+pub async fn hermes_interrupt(state: State<'_, HermesAppState>) -> Result<HermesStatus, String> {
     // There is no per-request cancel RPC in the bridge today; the closest
     // available action is to shut the child down, which drains any pending
     // oneshot senders with a NotRunning error. Re-spawning is the caller's
@@ -101,10 +97,7 @@ pub async fn hermes_interrupt(
 }
 
 #[tauri::command]
-pub async fn hermes_invoke(
-    args: HermesInvokeArgs,
-    _app: AppHandle,
-) -> Result<Value, String> {
+pub async fn hermes_invoke(args: HermesInvokeArgs, _app: AppHandle) -> Result<Value, String> {
     let proc = require_process(&_app).await?;
     proc.invoke(args.method, args.params)
         .await

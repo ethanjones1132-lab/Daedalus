@@ -134,13 +134,19 @@ pub fn get_cached_bun_url() -> Option<String> {
 
 /// Set the cached Bun URL.
 pub fn set_cached_bun_url(url: String) {
-    let mut guard = CACHED_BUN_URL.get_or_init(|| Mutex::new(None)).lock().unwrap_or_else(|p| p.into_inner());
+    let mut guard = CACHED_BUN_URL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     *guard = Some(url);
 }
 
 /// Clear the cached Bun URL.
 pub fn clear_cached_bun_url() {
-    let mut guard = CACHED_BUN_URL.get_or_init(|| Mutex::new(None)).lock().unwrap_or_else(|p| p.into_inner());
+    let mut guard = CACHED_BUN_URL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     *guard = None;
 }
 
@@ -268,7 +274,9 @@ pub fn wsl_read_file(path: &str) -> Result<String, String> {
 fn shlex_join(args: &[&str]) -> String {
     args.iter()
         .map(|a| {
-            if a.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:".contains(c)) {
+            if a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_./:".contains(c))
+            {
                 a.to_string()
             } else {
                 format!("'{}'", a.replace('\'', "'\''"))

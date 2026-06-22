@@ -13,7 +13,7 @@ use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{interval, MissedTickBehavior};
 
 const POLL_INTERVAL_SECS: u64 = 60;
 const INITIAL_DELAY_SECS: u64 = 20;
@@ -66,7 +66,10 @@ pub fn validate_cron_schedule(schedule_expr: &str) -> Result<(), String> {
     let seven = five_to_seven_field(schedule_expr);
     match Schedule::from_str(&seven) {
         Ok(_) => Ok(()),
-        Err(e) => Err(format!("Invalid cron expression '{}': {}", schedule_expr, e)),
+        Err(e) => Err(format!(
+            "Invalid cron expression '{}': {}",
+            schedule_expr, e
+        )),
     }
 }
 
@@ -429,15 +432,14 @@ pub async fn start_cron_scheduler(app: AppHandle) {
                     continue;
                 }
             };
-            let collected: Vec<(String, String)> = match stmt.query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            }) {
-                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-                Err(e) => {
-                    eprintln!("[cron] row error: {}", e);
-                    vec![]
-                }
-            };
+            let collected: Vec<(String, String)> =
+                match stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?))) {
+                    Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                    Err(e) => {
+                        eprintln!("[cron] row error: {}", e);
+                        vec![]
+                    }
+                };
             collected
         };
 
@@ -447,7 +449,10 @@ pub async fn start_cron_scheduler(app: AppHandle) {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
                 if pending_missed.contains(&job_id) {
-                    eprintln!("[cron] {} is pending missed action — skipping auto-trigger", job_id);
+                    eprintln!(
+                        "[cron] {} is pending missed action — skipping auto-trigger",
+                        job_id
+                    );
                     continue;
                 }
             }
@@ -487,11 +492,9 @@ pub fn dismiss_missed_job(app: &AppHandle, id: &str) -> Result<bool, String> {
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
 
     let schedule: String = conn
-        .query_row(
-            "SELECT schedule FROM cron_jobs WHERE id = ?",
-            [id],
-            |row| row.get(0),
-        )
+        .query_row("SELECT schedule FROM cron_jobs WHERE id = ?", [id], |row| {
+            row.get(0)
+        })
         .map_err(|e| format!("Cron job '{}' not found: {}", id, e))?;
 
     let next_run = compute_next_run(&schedule);
@@ -519,15 +522,11 @@ pub async fn trigger_missed_job(app: &AppHandle, id: &str) -> Result<bool, Strin
     let schedule_expr = {
         let db = app.state::<AppDb>();
         let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-        conn.query_row(
-            "SELECT schedule FROM cron_jobs WHERE id = ?",
-            [id],
-            |row| row.get::<_, String>(0),
-        )
+        conn.query_row("SELECT schedule FROM cron_jobs WHERE id = ?", [id], |row| {
+            row.get::<_, String>(0)
+        })
         .map_err(|e| format!("Cron job '{}' not found: {}", id, e))?
     };
 
-    execute_job(app, id, &schedule_expr)
-        .await
-        .map(|_| true)
+    execute_job(app, id, &schedule_expr).await.map(|_| true)
 }

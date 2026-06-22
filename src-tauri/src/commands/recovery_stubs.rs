@@ -86,10 +86,7 @@ pub async fn jarvis_get_tools() -> Result<Vec<Value>, String> {
 }
 
 #[tauri::command]
-pub async fn jarvis_invoke_skill(
-    name: String,
-    _args: Option<Value>,
-) -> Result<Value, String> {
+pub async fn jarvis_invoke_skill(name: String, _args: Option<Value>) -> Result<Value, String> {
     Err(format!(
         "jarvis_invoke_skill({}) is not yet wired up in the recovered tree; \
          restore the skill runner from transcripts or implement against the \
@@ -117,9 +114,7 @@ pub async fn jarvis_ping() -> Result<String, String> {
 }
 
 #[tauri::command]
-pub async fn jarvis_discover_models(
-    _backend: Option<String>,
-) -> Result<Vec<Value>, String> {
+pub async fn jarvis_discover_models(_backend: Option<String>) -> Result<Vec<Value>, String> {
     // The Bun server's /models endpoint discovers across all configured
     // backends (Ollama + OpenRouter); the optional `_backend` hint is not
     // needed for the GET form.
@@ -162,9 +157,7 @@ pub async fn jarvis_get_companion() -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub async fn jarvis_save_companion(
-    _companion: Value,
-) -> Result<(), String> {
+pub async fn jarvis_save_companion(_companion: Value) -> Result<(), String> {
     Err("jarvis_save_companion is not yet wired up in the recovered tree".to_string())
 }
 
@@ -216,10 +209,7 @@ pub fn jarvis_get_tier_stats(db: State<AppDb>) -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub fn jarvis_list_memories_by_tier(
-    db: State<AppDb>,
-    tier: String,
-) -> Result<Vec<Value>, String> {
+pub fn jarvis_list_memories_by_tier(db: State<AppDb>, tier: String) -> Result<Vec<Value>, String> {
     // Active memories in a given tier, serialized as the same MemoryEntry
     // shape the other memory_* commands return.
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());

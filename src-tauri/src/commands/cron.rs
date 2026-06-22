@@ -376,30 +376,29 @@ pub fn list_pending_missed_jobs(db: State<AppDb>) -> Result<Vec<CronJob>, String
 
     let mut jobs = Vec::new();
     for id in pending_ids {
-        let job = conn
-            .query_row(
-                "SELECT id, name, schedule, agent_id, session_id, prompt, enabled,
+        let job = conn.query_row(
+            "SELECT id, name, schedule, agent_id, session_id, prompt, enabled,
                         last_run, next_run, run_count, metadata, created_at, updated_at
                  FROM cron_jobs WHERE id = ?",
-                [&id],
-                |row| {
-                    Ok(CronJob {
-                        id: row.get(0)?,
-                        name: row.get(1)?,
-                        schedule: row.get(2)?,
-                        agent_id: row.get(3)?,
-                        session_id: row.get(4)?,
-                        prompt: row.get(5)?,
-                        enabled: row.get::<_, i64>(6)? != 0,
-                        last_run: row.get(7)?,
-                        next_run: row.get(8)?,
-                        run_count: row.get(9)?,
-                        metadata: row.get(10)?,
-                        created_at: row.get(11)?,
-                        updated_at: row.get(12)?,
-                    })
-                },
-            );
+            [&id],
+            |row| {
+                Ok(CronJob {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    schedule: row.get(2)?,
+                    agent_id: row.get(3)?,
+                    session_id: row.get(4)?,
+                    prompt: row.get(5)?,
+                    enabled: row.get::<_, i64>(6)? != 0,
+                    last_run: row.get(7)?,
+                    next_run: row.get(8)?,
+                    run_count: row.get(9)?,
+                    metadata: row.get(10)?,
+                    created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
+                })
+            },
+        );
         if let Ok(j) = job {
             jobs.push(j);
         }

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::HashSet;
 
 const RECALL_LIMIT: usize = 5;
@@ -262,7 +262,10 @@ pub fn search_memories(conn: &Connection, query: &str) -> Result<Vec<MemoryEntry
     // Try FTS5 first for better relevance, fall back to LIKE for substring matches
     let fts_results = fts_candidates(conn, query).unwrap_or_default();
     if !fts_results.is_empty() {
-        let mut results: Vec<_> = fts_results.into_iter().filter(|m| m.status == "active").collect();
+        let mut results: Vec<_> = fts_results
+            .into_iter()
+            .filter(|m| m.status == "active")
+            .collect();
         results.truncate(20);
         return Ok(results);
     }
@@ -424,7 +427,10 @@ pub fn build_turn_memory_context(
         if sm.next_steps != "[]" && session_chars < SESSION_MEMORY_BUDGET {
             let budget = SESSION_MEMORY_BUDGET.saturating_sub(session_chars);
             if budget > 50 {
-                lines.push(format!("- Next steps: {}", truncate(&sm.next_steps, budget)));
+                lines.push(format!(
+                    "- Next steps: {}",
+                    truncate(&sm.next_steps, budget)
+                ));
             }
         }
     }
@@ -1964,7 +1970,8 @@ pub fn mark_review_completed(conn: &Connection, session_id: &str) -> Result<(), 
     conn.execute(
         "UPDATE session_memory SET last_review_at = ?, updated_at = ? WHERE session_id = ?",
         params![&now_str, &now_str, session_id],
-    ).map_err(|e| format!("Failed to mark review completed: {}", e))?;
+    )
+    .map_err(|e| format!("Failed to mark review completed: {}", e))?;
     Ok(())
 }
 
@@ -1976,18 +1983,26 @@ pub fn apply_deferred_review(
     session_id: &str,
     review_json: &str,
 ) -> Result<(i64, i64), String> {
-    let parsed: serde_json::Value = serde_json::from_str(review_json)
-        .map_err(|e| format!("Invalid review JSON: {}", e))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(review_json).map_err(|e| format!("Invalid review JSON: {}", e))?;
 
     let mut mem_changed = 0;
     let mut skill_changed = 0;
 
     if let Some(memories) = parsed.get("memories").and_then(|v| v.as_array()) {
         for mem in memories {
-            let title = mem.get("title").and_then(|v| v.as_str()).unwrap_or("Auto-review memory");
+            let title = mem
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Auto-review memory");
             let content = mem.get("content").and_then(|v| v.as_str());
-            let category = mem.get("category").and_then(|v| v.as_str()).unwrap_or("general");
-            let Some(content) = content else { continue; };
+            let category = mem
+                .get("category")
+                .and_then(|v| v.as_str())
+                .unwrap_or("general");
+            let Some(content) = content else {
+                continue;
+            };
 
             let write = MemoryWrite {
                 title: title.to_string(),
@@ -2011,9 +2026,17 @@ pub fn apply_deferred_review(
         for update in updates {
             let skill_name = update.get("skill_name").and_then(|v| v.as_str());
             let change = update.get("change").and_then(|v| v.as_str());
-            let (Some(skill_name), Some(change)) = (skill_name, change) else { continue; };
+            let (Some(skill_name), Some(change)) = (skill_name, change) else {
+                continue;
+            };
 
-            match apply_skill_improvement(conn, skill_name, &format!("- {}", change), "Deferred LLM review", Some(session_id)) {
+            match apply_skill_improvement(
+                conn,
+                skill_name,
+                &format!("- {}", change),
+                "Deferred LLM review",
+                Some(session_id),
+            ) {
                 Ok(true) => skill_changed += 1,
                 Ok(false) => {} // duplicate, already present
                 Err(e) => eprintln!("[review] Skill improvement blocked: {}", e),
@@ -2034,7 +2057,8 @@ pub fn commit_session_end(conn: &Connection, session_id: &str) -> Result<(), Str
     conn.execute(
         "UPDATE session_memory SET turn_counter = 0, updated_at = ? WHERE session_id = ?",
         params![now(), session_id],
-    ).map_err(|e| format!("Failed to reset counter on session end: {}", e))?;
+    )
+    .map_err(|e| format!("Failed to reset counter on session end: {}", e))?;
     Ok(())
 }
 
@@ -2089,7 +2113,9 @@ pub fn run_tier_management(conn: &Connection) -> Result<(i64, i64), String> {
                 )
                 .map_err(|e| e.to_string())?;
             let collected: Vec<(String, String)> = stmt
-                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
                 .map_err(|e| e.to_string())?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?;
@@ -2100,7 +2126,8 @@ pub fn run_tier_management(conn: &Connection) -> Result<(i64, i64), String> {
             conn.execute(
                 "UPDATE memory SET tier = 'warm', summary = ?, updated_at = ? WHERE id = ?",
                 params![summary, now_str, id],
-            ).map_err(|e| format!("Failed to tier {}: {}", id, e))?;
+            )
+            .map_err(|e| format!("Failed to tier {}: {}", id, e))?;
             hot_to_warm += 1;
         }
 
@@ -2122,7 +2149,8 @@ pub fn run_tier_management(conn: &Connection) -> Result<(i64, i64), String> {
             conn.execute(
                 "UPDATE memory SET tier = 'cold', content = '', updated_at = ? WHERE id = ?",
                 params![now_str, id],
-            ).map_err(|e| format!("Failed to cold-tier {}: {}", id, e))?;
+            )
+            .map_err(|e| format!("Failed to cold-tier {}: {}", id, e))?;
             // Free up the content blob — it should already be on Drive
             warm_to_cold += 1;
         }
@@ -2132,18 +2160,39 @@ pub fn run_tier_management(conn: &Connection) -> Result<(i64, i64), String> {
 
     match result {
         Ok(()) => {
-            let _ = finish_run(conn, &run_id, "success", hot_to_warm + warm_to_cold, hot_to_warm, warm_to_cold, "");
+            let _ = finish_run(
+                conn,
+                &run_id,
+                "success",
+                hot_to_warm + warm_to_cold,
+                hot_to_warm,
+                warm_to_cold,
+                "",
+            );
             Ok((hot_to_warm, warm_to_cold))
         }
         Err(err) => {
-            let _ = finish_run(conn, &run_id, "failed", hot_to_warm + warm_to_cold, hot_to_warm, warm_to_cold, &err);
+            let _ = finish_run(
+                conn,
+                &run_id,
+                "failed",
+                hot_to_warm + warm_to_cold,
+                hot_to_warm,
+                warm_to_cold,
+                &err,
+            );
             Err(err)
         }
     }
 }
 
 /// List memories by tier, with optional category filter.
-pub fn list_memories_by_tier(conn: &Connection, tier: &str, category: Option<&str>, limit: i64) -> Result<Vec<MemoryEntry>, String> {
+pub fn list_memories_by_tier(
+    conn: &Connection,
+    tier: &str,
+    category: Option<&str>,
+    limit: i64,
+) -> Result<Vec<MemoryEntry>, String> {
     let sql = match category {
         Some(_cat) => format!(
             "SELECT {} FROM memory WHERE tier = ? AND category = ? AND status = 'active' ORDER BY updated_at DESC LIMIT ?",
@@ -2156,18 +2205,46 @@ pub fn list_memories_by_tier(conn: &Connection, tier: &str, category: Option<&st
     };
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = match category {
-        Some(_cat) => stmt.query_map(params![tier, _cat, limit], memory_from_row).map_err(|e| e.to_string())?,
-        None => stmt.query_map(params![tier, limit], memory_from_row).map_err(|e| e.to_string())?,
+        Some(_cat) => stmt
+            .query_map(params![tier, _cat, limit], memory_from_row)
+            .map_err(|e| e.to_string())?,
+        None => stmt
+            .query_map(params![tier, limit], memory_from_row)
+            .map_err(|e| e.to_string())?,
     };
     collect_memories(rows)
 }
 
 /// Get tier statistics: count per tier.
 pub fn get_tier_stats(conn: &Connection) -> Result<serde_json::Value, String> {
-    let hot: i64 = conn.query_row("SELECT COUNT(*) FROM memory WHERE tier = 'hot' AND status = 'active'", [], |r| r.get(0)).unwrap_or(0);
-    let warm: i64 = conn.query_row("SELECT COUNT(*) FROM memory WHERE tier = 'warm' AND status = 'active'", [], |r| r.get(0)).unwrap_or(0);
-    let cold: i64 = conn.query_row("SELECT COUNT(*) FROM memory WHERE tier = 'cold' AND status = 'active'", [], |r| r.get(0)).unwrap_or(0);
-    let tombstoned: i64 = conn.query_row("SELECT COUNT(*) FROM memory WHERE status = 'tombstoned'", [], |r| r.get(0)).unwrap_or(0);
+    let hot: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory WHERE tier = 'hot' AND status = 'active'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let warm: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory WHERE tier = 'warm' AND status = 'active'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let cold: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory WHERE tier = 'cold' AND status = 'active'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let tombstoned: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory WHERE status = 'tombstoned'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
     Ok(serde_json::json!({
         "hot": hot, "warm": warm, "cold": cold, "tombstoned": tombstoned,
         "total": hot + warm + cold + tombstoned
@@ -2177,11 +2254,13 @@ pub fn get_tier_stats(conn: &Connection) -> Result<serde_json::Value, String> {
 /// Recall a cold memory by fetching its full content from Drive.
 /// Returns the content if drive_file_id is set, or None if not yet archived.
 pub fn recall_cold_memory(conn: &Connection, id: &str) -> Result<Option<String>, String> {
-    let (tier, drive_file_id, content): (String, Option<String>, String) = conn.query_row(
-        "SELECT tier, drive_file_id, content FROM memory WHERE id = ?",
-        [id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    ).map_err(|e| format!("Memory not found: {}", e))?;
+    let (tier, drive_file_id, content): (String, Option<String>, String) = conn
+        .query_row(
+            "SELECT tier, drive_file_id, content FROM memory WHERE id = ?",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|e| format!("Memory not found: {}", e))?;
 
     match tier.as_str() {
         "hot" | "warm" => Ok(Some(content)),
@@ -2200,7 +2279,11 @@ pub fn recall_cold_memory(conn: &Connection, id: &str) -> Result<Option<String>,
 /// Serialize a memory entry to markdown for Drive archival.
 pub fn memory_to_markdown(entry: &MemoryEntry) -> String {
     let tags: Vec<String> = serde_json::from_str(&entry.tags).unwrap_or_default();
-    let tag_str = if tags.is_empty() { "[]".to_string() } else { tags.join(", ") };
+    let tag_str = if tags.is_empty() {
+        "[]".to_string()
+    } else {
+        tags.join(", ")
+    };
     format!(
         "---\nid: {}\ntitle: {}\ncategory: {}\ntags: [{}]\nsource: {}\nconfidence: {:.2}\ncreated_at: {}\nupdated_at: {}\ntier: {}\nstatus: {}\n---\n\n{}\n",
         entry.id, entry.title, entry.category, tag_str, entry.source,
