@@ -21,8 +21,13 @@ checking off.
   `commands::persist_jarvis_config`; `jarvis_save_config`/`jarvis_switch_backend` route
   through it; boot hydrates from SQLite with a one-time file→SQLite import. *Verified:*
   `cargo check` green; 3 round-trip/migration unit tests in `settings.rs` pass.
-- [ ] **Unify session stores.** Tauri `get_sessions_dir` (file) vs the Bun server's
-  session history vs the SQLite `sessions` table — three stores; pick one.
+- [x] **Unify session stores.** (Phase 1.2, 2026-06-22) SQLite `sessions`/`messages`
+  is the single canonical store. The file store (`~/.openclaw/jarvis/sessions/*.json`)
+  and its `create/list/delete_jarvis_session` helpers were removed; the `jarvis_*`
+  chat-session commands now route through shared `commands::sessions` `&AppDb` helpers
+  (`create_session_row`/`list_session_rows`/`delete_session_row`). The Bun server's
+  per-session history remains as a runtime message-context cache (a projection, not a
+  competing metadata store). *Verified:* `cargo test --lib` 32 pass; warning-free.
 - [x] **Extract + unit-test the SSE frame handler** (Phase 1.8, 2026-06-22). All SSE
   parsing/decisioning moved out of the `runner.rs` thread closure into a pure, stateful
   `SseRelay::handle_line` → `SseFrameOutcome`; the I/O loop only maps outcomes to

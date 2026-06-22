@@ -1,4 +1,3 @@
-use crate::jarvis;
 use crate::jarvis::bridge::{start_bridge, stop_bridge};
 use crate::jarvis::runner::{check_jarvis_status, run_jarvis_message};
 use crate::jarvis::types::*;
@@ -137,30 +136,62 @@ pub async fn cancel_chat_stream(session_id: String) -> Result<bool, String> {
     Ok(false)
 }
 
+// The chat-session commands map the canonical SQLite session (commands/sessions.rs)
+// onto the `JarvisSession` shape the chat UI expects. There is one session store
+// (SQLite); the legacy file store was retired in Phase 1.2.
+
+fn summary_to_jarvis_session(s: crate::commands::SessionSummary) -> JarvisSession {
+    JarvisSession {
+        id: s.id,
+        name: s.title,
+        created_at: s.created_at,
+        model: s.model,
+        message_count: s.message_count.max(0) as u32,
+    }
+}
+
 #[tauri::command]
 pub async fn jarvis_new_session(
     name: Option<String>,
     state: State<'_, JarvisState>,
+    db: State<'_, crate::db::AppDb>,
 ) -> Result<JarvisSession, String> {
-    let config = state.config.lock().await;
-    let model = match config.active_backend {
-        crate::jarvis::types::JarvisBackend::Ollama => config.ollama.model.clone(),
-        crate::jarvis::types::JarvisBackend::OpenRouter => config.openrouter.model.clone(),
-        crate::jarvis::types::JarvisBackend::ClaudeCli => {
-            config.claude_cli.model.clone().unwrap_or_default()
-        }
+    let (backend, model) = {
+        let config = state.config.lock().await;
+        let model = match config.active_backend {
+            crate::jarvis::types::JarvisBackend::Ollama => config.ollama.model.clone(),
+            crate::jarvis::types::JarvisBackend::OpenRouter => config.openrouter.model.clone(),
+            crate::jarvis::types::JarvisBackend::ClaudeCli => {
+                config.claude_cli.model.clone().unwrap_or_default()
+            }
+        };
+        (config.active_backend.to_string(), model)
     };
-    jarvis::create_jarvis_session(name, &model)
+    let s = crate::commands::create_session_row(
+        &db,
+        name,
+        Some("main".to_string()),
+        Some(backend),
+        Some(model),
+    )?;
+    Ok(summary_to_jarvis_session(s))
 }
 
 #[tauri::command]
-pub async fn jarvis_list_sessions() -> Result<Vec<JarvisSession>, String> {
-    jarvis::list_jarvis_sessions()
+pub async fn jarvis_list_sessions(
+    db: State<'_, crate::db::AppDb>,
+) -> Result<Vec<JarvisSession>, String> {
+    let rows = crate::commands::list_session_rows(&db)?;
+    Ok(rows.into_iter().map(summary_to_jarvis_session).collect())
 }
 
 #[tauri::command]
-pub async fn jarvis_delete_session(session_id: String) -> Result<(), String> {
-    jarvis::delete_jarvis_session(&session_id)
+pub async fn jarvis_delete_session(
+    session_id: String,
+    db: State<'_, crate::db::AppDb>,
+) -> Result<(), String> {
+    crate::commands::delete_session_row(&db, &session_id)?;
+    Ok(())
 }
 
 /// User decision on a pending tool call (approve / deny / modify).

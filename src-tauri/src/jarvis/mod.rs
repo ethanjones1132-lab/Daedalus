@@ -15,7 +15,6 @@ use std::path::PathBuf;
 
 const CONFIG_DIR: &str = ".openclaw/jarvis";
 const CONFIG_FILE: &str = "config.json";
-const SESSIONS_DIR: &str = "sessions";
 
 /// Load Jarvis config from disk, creating defaults only if the file is missing.
 pub fn load_jarvis_config() -> JarvisConfig {
@@ -38,23 +37,27 @@ pub fn load_jarvis_config() -> JarvisConfig {
                         "[Jarvis] config.json present but unparseable ({e}); using in-memory \
                          defaults and leaving the existing file untouched"
                     );
-                    let mut config = JarvisConfig::default();
-                    config.jarvis_path = jarvis_path;
-                    return config;
+                    return JarvisConfig {
+                        jarvis_path,
+                        ..Default::default()
+                    };
                 }
             },
             Err(e) => {
                 eprintln!("[Jarvis] could not read config.json ({e}); using in-memory defaults");
-                let mut config = JarvisConfig::default();
-                config.jarvis_path = jarvis_path;
-                return config;
+                return JarvisConfig {
+                    jarvis_path,
+                    ..Default::default()
+                };
             }
         }
     }
 
     // No config file yet — create one from defaults.
-    let mut config = JarvisConfig::default();
-    config.jarvis_path = jarvis_path;
+    let config = JarvisConfig {
+        jarvis_path,
+        ..Default::default()
+    };
     if let Some(parent) = config_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -137,68 +140,30 @@ pub fn get_config_path() -> PathBuf {
     config_base().join(CONFIG_FILE)
 }
 
-/// Get the sessions directory path
-pub fn get_sessions_dir() -> PathBuf {
-    config_base().join(SESSIONS_DIR)
+/// Path to the companion state file, shared with the Bun server's `COMPANION_FILE`
+/// (`<native-home>/.openclaw/jarvis/companion.json`).
+pub fn get_companion_path() -> PathBuf {
+    config_base().join("companion.json")
 }
 
-/// Ensure the sessions directory exists
-pub fn ensure_sessions_dir() -> Result<PathBuf, String> {
-    let dir = get_sessions_dir();
-    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create sessions dir: {}", e))?;
-    Ok(dir)
-}
-
-/// List all Jarvis sessions from disk
-pub fn list_jarvis_sessions() -> Result<Vec<crate::jarvis::types::JarvisSession>, String> {
-    let dir = get_sessions_dir();
-    if !dir.exists() {
-        return Ok(vec![]);
+/// Persist the full companion state to `companion.json` so the Bun server's
+/// `GET /companion` reflects it. The Bun `POST /companion` route is an *interaction*
+/// (feed/talk/…), not a state save, so a true save writes the file directly.
+pub fn save_companion_state(state: &serde_json::Value) -> Result<(), String> {
+    let path = get_companion_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create companion dir: {}", e))?;
     }
-    let mut sessions = Vec::new();
-    for entry in fs::read_dir(&dir).map_err(|e| format!("Failed to read sessions dir: {}", e))? {
-        let entry = entry.map_err(|e| format!("Failed to read session entry: {}", e))?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("json") {
-            if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(session) =
-                    serde_json::from_str::<crate::jarvis::types::JarvisSession>(&content)
-                {
-                    sessions.push(session);
-                }
-            }
-        }
-    }
-    sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    Ok(sessions)
-}
-
-/// Delete a Jarvis session
-pub fn delete_jarvis_session(session_id: &str) -> Result<(), String> {
-    let path = get_sessions_dir().join(format!("{}.json", session_id));
-    if path.exists() {
-        fs::remove_file(&path).map_err(|e| format!("Failed to delete session: {}", e))?;
-    }
+    let json = serde_json::to_string_pretty(state)
+        .map_err(|e| format!("serialize companion: {}", e))?;
+    fs::write(&path, json).map_err(|e| format!("write companion: {}", e))?;
     Ok(())
 }
 
-/// Create a new Jarvis session
-pub fn create_jarvis_session(
-    name: Option<String>,
-    model: &str,
-) -> Result<crate::jarvis::types::JarvisSession, String> {
-    let dir = ensure_sessions_dir()?;
-    let id = uuid::Uuid::new_v4().to_string();
-    let session = crate::jarvis::types::JarvisSession {
-        id: id.clone(),
-        name: name.unwrap_or_else(|| format!("Session {}", &id[..8])),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        model: model.to_string(),
-        message_count: 0,
-    };
-    let json = serde_json::to_string_pretty(&session)
-        .map_err(|e| format!("Failed to serialize session: {}", e))?;
-    fs::write(dir.join(format!("{}.json", id)), json)
-        .map_err(|e| format!("Failed to write session: {}", e))?;
-    Ok(session)
-}
+// Session persistence was unified onto SQLite in Phase 1.2. The former
+// file-based session store (`~/.openclaw/jarvis/sessions/*.json`) and its
+// `create/list/delete_jarvis_session` helpers were removed; the `jarvis_*`
+// chat-session commands now route through `commands::sessions` (the canonical
+// SQLite `sessions`/`messages` tables). The Bun server keeps its own per-session
+// message history as a runtime context cache — a projection, not a competing
+// metadata store.

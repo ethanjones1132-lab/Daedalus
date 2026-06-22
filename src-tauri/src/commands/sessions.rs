@@ -175,8 +175,14 @@ pub struct SessionMessageOut {
     pub created_at: String,
 }
 
-#[tauri::command]
-pub fn list_sessions(db: State<AppDb>) -> Result<Vec<SessionSummary>, String> {
+// ── &AppDb helpers ───────────────────────────────────────────────────
+//
+// These hold the canonical SQLite session logic. Both the native "Sessions"
+// command surface AND the `jarvis_*` chat-session commands call them, so there
+// is exactly ONE session store (SQLite). The legacy file store under
+// `~/.openclaw/jarvis/sessions/` was retired in Phase 1.2.
+
+pub fn list_session_rows(db: &AppDb) -> Result<Vec<SessionSummary>, String> {
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     let mut stmt = conn
         .prepare(
@@ -205,18 +211,11 @@ pub fn list_sessions(db: State<AppDb>) -> Result<Vec<SessionSummary>, String> {
             })
         })
         .map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    for r in rows {
-        if let Ok(s) = r {
-            out.push(s);
-        }
-    }
-    Ok(out)
+    Ok(rows.flatten().collect())
 }
 
-#[tauri::command]
-pub fn create_session(
-    db: State<AppDb>,
+pub fn create_session_row(
+    db: &AppDb,
     title: Option<String>,
     agent_id: Option<String>,
     backend: Option<String>,
@@ -250,23 +249,41 @@ pub fn create_session(
     })
 }
 
-#[tauri::command]
-pub fn delete_session(db: State<AppDb>, session_id: String) -> Result<bool, String> {
+pub fn delete_session_row(db: &AppDb, session_id: &str) -> Result<bool, String> {
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let affected = conn
-        .execute(
-            "DELETE FROM messages WHERE session_id = ?",
-            rusqlite::params![&session_id],
-        )
-        .map_err(|e| e.to_string())?;
-    let _ = affected;
+    conn.execute(
+        "DELETE FROM messages WHERE session_id = ?",
+        rusqlite::params![session_id],
+    )
+    .map_err(|e| e.to_string())?;
     let n = conn
         .execute(
             "DELETE FROM sessions WHERE id = ?",
-            rusqlite::params![&session_id],
+            rusqlite::params![session_id],
         )
         .map_err(|e| e.to_string())?;
     Ok(n > 0)
+}
+
+#[tauri::command]
+pub fn list_sessions(db: State<AppDb>) -> Result<Vec<SessionSummary>, String> {
+    list_session_rows(&db)
+}
+
+#[tauri::command]
+pub fn create_session(
+    db: State<AppDb>,
+    title: Option<String>,
+    agent_id: Option<String>,
+    backend: Option<String>,
+    model: Option<String>,
+) -> Result<SessionSummary, String> {
+    create_session_row(&db, title, agent_id, backend, model)
+}
+
+#[tauri::command]
+pub fn delete_session(db: State<AppDb>, session_id: String) -> Result<bool, String> {
+    delete_session_row(&db, &session_id)
 }
 
 #[tauri::command]
@@ -295,10 +312,8 @@ pub fn get_session_history(
         })
         .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    for r in rows {
-        if let Ok(m) = r {
-            out.push(m);
-        }
+    for m in rows.flatten() {
+        out.push(m);
     }
     Ok(out)
 }
@@ -355,14 +370,52 @@ pub fn export_session(
         })
         .map_err(|e| e.to_string())?;
     let mut out = String::from("# Session export\n\n");
-    for r in rows {
-        if let Ok(m) = r {
-            out.push_str(&format!(
-                "## {} ({})\n\n{}\n\n",
-                m.role, m.created_at, m.content
-            ));
-        }
+    for m in rows.flatten() {
+        out.push_str(&format!(
+            "## {} ({})\n\n{}\n\n",
+            m.role, m.created_at, m.content
+        ));
     }
     std::fs::write(&out_path, out).map_err(|e| format!("Failed to write export: {}", e))?;
     Ok(out_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::run_migrations;
+    use rusqlite::Connection;
+    use std::sync::Mutex;
+
+    fn mem_db() -> AppDb {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        run_migrations(&conn).expect("run migrations");
+        AppDb {
+            conn: Mutex::new(conn),
+            db_path: std::path::PathBuf::from(":memory:"),
+        }
+    }
+
+    #[test]
+    fn session_rows_round_trip_through_sqlite() {
+        let db = mem_db();
+        let a = create_session_row(
+            &db,
+            Some("first".into()),
+            Some("main".into()),
+            Some("ollama".into()),
+            Some("qwen3:8b".into()),
+        )
+        .expect("create a");
+        let _b = create_session_row(&db, Some("second".into()), None, None, None).expect("create b");
+
+        let listed = list_session_rows(&db).expect("list");
+        assert_eq!(listed.len(), 2, "both sessions should be listed");
+        assert!(listed.iter().any(|s| s.id == a.id && s.title == "first"));
+
+        assert!(delete_session_row(&db, &a.id).expect("delete"));
+        let after = list_session_rows(&db).expect("list after delete");
+        assert_eq!(after.len(), 1, "one session remains after delete");
+        assert!(!after.iter().any(|s| s.id == a.id));
+    }
 }
