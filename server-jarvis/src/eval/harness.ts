@@ -155,6 +155,23 @@ if (import.meta.main) {
       console.log(`${r.pass ? "PASS" : "FAIL"}  ${r.id}${r.pass ? "" : "  — " + r.detail}`);
     }
     console.log(`\n${report.passed}/${report.total} passed, ${report.failed} failed`);
-    if (report.failed > 0) process.exit(1);
+
+    // Gate on baseline DRIFT too (not just hard failures), so the CLI is a
+    // complete regression gate matching harness.test.ts.
+    const { readFileSync } = await import("fs");
+    let drift: string[] = [];
+    try {
+      const baseline = JSON.parse(readFileSync(baselinePath, "utf8")) as Baseline;
+      drift = diffBaseline(report, baseline);
+      if (drift.length) {
+        console.log("\nBaseline drift detected:");
+        for (const d of drift) console.log(`  - ${d}`);
+        console.log("If intended, re-run with --write-baseline to update the snapshot.");
+      }
+    } catch (e) {
+      console.log(`\n(could not read baseline: ${e})`);
+    }
+
+    if (report.failed > 0 || drift.length > 0) process.exit(1);
   }
 }
