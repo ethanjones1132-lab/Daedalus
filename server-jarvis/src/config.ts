@@ -218,7 +218,7 @@ export function defaultConfig(): JarvisConfig {
       fallbacks: [
         "openrouter/free",
         "openrouter/owl-alpha",
-        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "nvidia/llama-3.1-nemotron-ultra-253b-v1:free",
         "qwen/qwen3-coder:free",
       ],
       enable_fallbacks: true,

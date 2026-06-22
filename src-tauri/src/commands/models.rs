@@ -215,6 +215,7 @@ pub async fn set_active_profile(db: State<'_, AppDb>, id: String) -> Result<bool
 
 /// Create a new model profile
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn create_profile(
     db: State<'_, AppDb>,
     name: String,

@@ -1,5 +1,5 @@
 import { motion, AnimatePresence, type Variants } from 'framer-motion';
-import { Component as ReactComponent, ReactNode, useEffect, useState, useCallback, createContext, useContext } from 'react';
+import { Component as ReactComponent, ReactNode, useEffect, useState, useCallback, useMemo, createContext, useContext } from 'react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
@@ -459,7 +459,7 @@ interface Toast {
   action?: ToastAction;
 }
 
-interface ToastContextValue {
+export interface ToastContextValue {
   info: (message: string, title?: string, options?: unknown, action?: ToastAction) => void;
   success: (message: string, title?: string, options?: unknown, action?: ToastAction) => void;
   warn: (message: string, title?: string, options?: unknown, action?: ToastAction) => void;
@@ -485,8 +485,11 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
 
-  const push = useCallback(
-    (variant: ToastVariant) => (message: string, title?: string, _options?: unknown, action?: ToastAction) => {
+  // Single stable notifier. Its identity (and the memoized `value` below) must NOT
+  // change across renders: App.tsx lists `warn`/`error` in effect deps, so unstable
+  // identities re-run that effect every render and re-fire toasts in a feedback loop.
+  const notify = useCallback(
+    (variant: ToastVariant, message: string, title?: string, _options?: unknown, action?: ToastAction) => {
       const id = Date.now() + Math.random();
       setToasts((prev) => [...prev, { id, message, title, variant, action }]);
       // Auto-dismiss after 4s.
@@ -495,12 +498,15 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     [dismiss],
   );
 
-  const value: ToastContextValue = {
-    info: push('info'),
-    success: push('success'),
-    warn: push('warn'),
-    error: push('error'),
-  };
+  const value = useMemo<ToastContextValue>(
+    () => ({
+      info: (message, title, options, action) => notify('info', message, title, options, action),
+      success: (message, title, options, action) => notify('success', message, title, options, action),
+      warn: (message, title, options, action) => notify('warn', message, title, options, action),
+      error: (message, title, options, action) => notify('error', message, title, options, action),
+    }),
+    [notify],
+  );
 
   return (
     <ToastContext.Provider value={value}>

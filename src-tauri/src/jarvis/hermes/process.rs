@@ -78,6 +78,7 @@ pub struct HermesProcess {
     config: HermesConfig,
     state: Arc<Mutex<HermesState>>,
     /// Pending calls keyed by Rid. Each carries a oneshot for the response.
+    #[allow(clippy::type_complexity)]
     pending: Arc<Mutex<HashMap<Rid, oneshot::Sender<Result<serde_json::Value, BridgeError>>>>>,
     /// Monotonic request id counter, formatted as `j{n}`.
     next_rid: AtomicU64,
@@ -139,16 +140,14 @@ impl HermesProcess {
         for (k, v) in &self.config.extra_env {
             command.env(k, v);
         }
-        let mut child = command.spawn().map_err(|e| BridgeError::Io(e))?;
+        let mut child = command.spawn().map_err(BridgeError::Io)?;
         let stdin = child.stdin.take().ok_or_else(|| {
-            BridgeError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            BridgeError::Io(std::io::Error::other(
                 "child stdin not captured",
             ))
         })?;
         let stdout = child.stdout.take().ok_or_else(|| {
-            BridgeError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            BridgeError::Io(std::io::Error::other(
                 "child stdout not captured",
             ))
         })?;

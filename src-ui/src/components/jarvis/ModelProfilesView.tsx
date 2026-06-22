@@ -101,7 +101,18 @@ export function ModelProfilesView() {
     }
     setCreating(true);
     try {
-      await invoke('create_profile', { profile: form });
+      // The Rust `create_profile` command takes flat args (and names the provider
+      // `backend`), not a wrapped `profile` object — sending `{ profile }` failed
+      // arg-deserialization, so Create silently never worked.
+      await invoke('create_profile', {
+        name: form.name,
+        backend: form.provider,
+        model: form.model,
+        temperature: form.temperature,
+        max_tokens: form.max_tokens,
+        top_p: 1.0,
+        engine: form.engine,
+      });
       success(`Created "${form.name}"`);
       setForm(DEFAULT_FORM);
       setShowNew(false);

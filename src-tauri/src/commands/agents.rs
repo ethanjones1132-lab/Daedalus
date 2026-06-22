@@ -187,6 +187,7 @@ pub(crate) fn unbind_channel_row(
 }
 
 /// Channel ids bound to an agent (used by tests and future read paths).
+#[allow(dead_code)]
 pub(crate) fn channel_bindings(conn: &Connection, agent_id: &str) -> Result<Vec<String>, String> {
     ensure_binding_table(conn)?;
     let mut stmt = conn

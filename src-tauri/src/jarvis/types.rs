@@ -6,8 +6,10 @@ use std::collections::HashMap;
 // ═══════════════════════════════════════════════════════════════
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Default)]
 pub enum JarvisBackend {
     #[serde(rename = "ollama")]
+    #[default]
     Ollama,
     #[serde(rename = "openrouter")]
     OpenRouter,
@@ -15,11 +17,6 @@ pub enum JarvisBackend {
     ClaudeCli,
 }
 
-impl Default for JarvisBackend {
-    fn default() -> Self {
-        JarvisBackend::Ollama
-    }
-}
 
 impl std::fmt::Display for JarvisBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

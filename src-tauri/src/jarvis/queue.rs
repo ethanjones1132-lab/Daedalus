@@ -24,8 +24,11 @@ impl MessageQueue {
         let (tx, mut rx) = mpsc::channel::<JarvisRequest>(QUEUE_CAPACITY);
         let config_clone = config.clone();
 
-        // Single consumer task — processes one message at a time
-        tokio::spawn(async move {
+        // Single consumer task — processes one message at a time.
+        // Use Tauri's global async runtime (not bare `tokio::spawn`): new() is called
+        // from the synchronous run() entry point before any ambient Tokio runtime
+        // exists, so `tokio::spawn` would panic with "there is no reactor running".
+        tauri::async_runtime::spawn(async move {
             while let Some(req) = rx.recv().await {
                 let _config_guard = config_clone.lock().await;
                 drop(_config_guard);
@@ -85,5 +88,21 @@ impl MessageQueue {
             mpsc::error::TrySendError::Closed(_) => "Jarvis queue is closed".to_string(),
         })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: MessageQueue::new() spawns its consumer task from the synchronous
+    // run() entry point, BEFORE Tauri's async runtime is established. It must not rely
+    // on an ambient Tokio runtime — bare `tokio::spawn` panics there with "there is no
+    // reactor running". A plain `#[test]` (no `#[tokio::test]`) has no ambient runtime,
+    // exactly reproducing run()'s context, so this fails if the spawn regresses.
+    #[test]
+    fn new_does_not_require_ambient_tokio_runtime() {
+        let config = Arc::new(Mutex::new(JarvisConfig::default()));
+        let _queue = MessageQueue::new(config);
     }
 }

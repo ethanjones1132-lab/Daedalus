@@ -606,7 +606,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
 
-        let mut insert = |id: &str, tier: &str, status: &str| {
+        let insert = |id: &str, tier: &str, status: &str| {
             conn.execute(
                 "INSERT INTO memory (id, tier, status) VALUES (?1, ?2, ?3)",
                 rusqlite::params![id, tier, status],
