@@ -9,6 +9,7 @@ import {
   OPENROUTER_MODELS,
 } from './types';
 import ControlCenterView from './ControlCenterView';
+import MarkdownRenderer from './MarkdownRenderer';
 
 // ═══════════════════════════════════════════════════════════════
 // ── Main Jarvis View ──
@@ -236,6 +237,11 @@ function ChatPanel({
   const [error, setError] = useState<string | null>(null);
   const [backendLabel, setBackendLabel] = useState<string>('');
   const [modelLabel, setModelLabel] = useState<string>('');
+  // Orchestrator pipeline progress: e.g. "planner", "executor", "reviewer"
+  const [pipelineStage, setPipelineStage] = useState<string>('');
+  // Reasoning/CoT text accumulated while streaming (cleared on done)
+  const [reasoningText, setReasoningText] = useState<string>('');
+  const [showReasoning, setShowReasoning] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -267,6 +273,8 @@ function ChatPanel({
 
     const unlistenDone = listen<{ session_id: string }>('jarvis://done', () => {
       setIsStreaming(false);
+      setPipelineStage('');
+      setReasoningText('');
       setMessages(prev => {
         const last = prev[prev.length - 1];
         if (last && last.isStreaming) {
@@ -279,6 +287,7 @@ function ChatPanel({
 
     const unlistenError = listen<{ error: string; session_id: string }>('jarvis://error', (event) => {
       setIsStreaming(false);
+      setPipelineStage('');
       setError(event.payload.error);
       setMessages(prev => {
         const last = prev[prev.length - 1];
@@ -289,10 +298,21 @@ function ChatPanel({
       });
     });
 
+    const unlistenStage = listen<{ stage: string; status: string; agent: string }>('jarvis://stage', (event) => {
+      const { stage, status } = event.payload;
+      setPipelineStage(status === 'done' ? '' : stage);
+    });
+
+    const unlistenReasoning = listen<{ text: string }>('jarvis://reasoning', (event) => {
+      setReasoningText(prev => prev + event.payload.text);
+    });
+
     return () => {
       unlisten.then(f => f());
       unlistenDone.then(f => f());
       unlistenError.then(f => f());
+      unlistenStage.then(f => f());
+      unlistenReasoning.then(f => f());
     };
   }, [onSessionCreated]);
 
@@ -302,6 +322,9 @@ function ChatPanel({
     setInput('');
     setError(null);
     setIsStreaming(true);
+    setPipelineStage('');
+    setReasoningText('');
+    setShowReasoning(false);
     setMessages(prev => [...prev, { role: 'user', content: userMsg }]);
 
     try {
@@ -394,6 +417,44 @@ function ChatPanel({
           >
             <p className="text-error text-xs font-mono">{error}</p>
           </motion.div>
+        )}
+
+        {/* Pipeline stage breadcrumb (orchestrator mode) */}
+        {pipelineStage && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            className="flex items-center gap-2 px-3 py-2 bg-royal/5 border border-royal/15 rounded-lg text-[10px] font-mono text-royal-light"
+          >
+            <motion.span
+              animate={{ opacity: [0.4, 1, 0.4] }}
+              transition={{ duration: 1.2, repeat: Infinity }}
+            >
+              ◈
+            </motion.span>
+            <span className="uppercase tracking-wider">{pipelineStage}</span>
+            <span className="text-bone-faint">running…</span>
+          </motion.div>
+        )}
+
+        {/* Reasoning/CoT disclosure (only shown when there's content) */}
+        {reasoningText && (
+          <div className="border border-iron/20 rounded-lg overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setShowReasoning(r => !r)}
+              className="w-full flex items-center gap-2 px-3 py-1.5 text-[10px] font-mono text-bone-faint hover:text-bone-dim transition-colors bg-obsidian/30"
+            >
+              <span>{showReasoning ? '▾' : '▸'}</span>
+              <span>Thinking</span>
+              <span className="ml-auto opacity-50">{reasoningText.length} chars</span>
+            </button>
+            {showReasoning && (
+              <div className="px-3 py-2 text-[11px] font-mono text-bone-faint whitespace-pre-wrap max-h-40 overflow-y-auto bg-obsidian/20">
+                {reasoningText}
+              </div>
+            )}
+          </div>
         )}
 
         <div ref={messagesEndRef} />
@@ -495,10 +556,14 @@ function ChatMessage({ message }: { message: JarvisMessage }) {
         )}
       </div>
       <div className={cn(
-        'text-xs font-mono leading-relaxed whitespace-pre-wrap break-words',
+        'leading-relaxed break-words',
+        // User + tool output stay literal monospace; the assistant gets full markdown
+        // (code blocks, lists, bold, links) at a readable prose size — restoring the
+        // chat quality that regressed when this bubble rendered raw text.
+        isUser || isTool ? 'text-xs font-mono whitespace-pre-wrap' : 'text-sm',
         isUser ? 'text-bone' : isTool ? 'text-bone-dim' : 'text-bone-muted'
       )}>
-        {message.content}
+        {isUser || isTool ? message.content : <MarkdownRenderer content={message.content} />}
         {message.isStreaming && (
           <motion.span
             className="inline-block w-1.5 h-3.5 bg-cyan-neon/60 ml-0.5 align-middle"
@@ -836,31 +901,85 @@ function StatusPanel({ status, onRefresh }: { status: JarvisStatus | null; onRef
     );
   }
 
-  const items = [
-    { label: 'Ollama Running', ok: status.ollama_running, desc: 'Local Ollama service is reachable' },
-    { label: 'Model Available', ok: status.ollama_model_available, desc: 'Configured model is loaded in Ollama' },
-    { label: 'Bridge Active', ok: status.bridge_active, desc: `Agent bridge on port ${status.bridge_port}` },
-    { label: 'Bun Runtime', ok: status.bun_available, desc: 'Bun is installed in WSL' },
+  const isOllama = status.active_backend === 'ollama';
+  const isOpenRouter = status.active_backend === 'openrouter';
+  const isClaudeCli = status.active_backend === 'claude_cli';
+
+  // Build a per-backend service checklist so the user sees exactly what's
+  // needed for *their* active backend, not a generic list that's always red.
+  const serviceItems: { label: string; ok: boolean; desc: string; required: boolean }[] = [
+    {
+      label: 'Bun Server',
+      ok: status.bun_server_running,
+      desc: status.bun_server_url,
+      required: true,
+    },
+    {
+      label: 'Ollama',
+      ok: status.ollama_running,
+      desc: isOllama ? `model: ${status.model || '—'}` : 'not required for this backend',
+      required: isOllama,
+    },
+    {
+      label: 'Model loaded',
+      ok: status.model_available,
+      desc: status.model || '—',
+      required: isOllama,
+    },
+    {
+      label: 'OpenRouter key',
+      ok: status.openrouter_key_set,
+      desc: isOpenRouter ? 'API key is set' : 'not required for this backend',
+      required: isOpenRouter,
+    },
+    {
+      label: 'Claude proxy',
+      ok: status.claude_proxy_running,
+      desc: 'port 19878',
+      required: isClaudeCli,
+    },
+    {
+      label: 'Bridge',
+      ok: status.bridge_active,
+      desc: `port ${status.bridge_port}`,
+      required: false,
+    },
   ];
 
   return (
     <div className="h-full overflow-y-auto">
       <div className="flex items-center justify-between mb-4">
-        <h2 className="text-lg font-bold text-bone tracking-tight">Status</h2>
-        <button onClick={onRefresh} className="px-3 py-1 text-xs font-mono text-bone-dim border border-iron/30 rounded-lg hover:border-iron/50 hover:text-bone-muted transition-colors">↻ Refresh</button>
+        <div className="flex items-center gap-3">
+          <h2 className="text-lg font-bold text-bone tracking-tight">Status</h2>
+          <Pill variant={isOllama ? 'success' : 'info'}>
+            {status.active_backend}
+          </Pill>
+          {status.model && <Pill>{status.model}</Pill>}
+        </div>
+        <button
+          onClick={onRefresh}
+          className="px-3 py-1 text-xs font-mono text-bone-dim border border-iron/30 rounded-lg hover:border-iron/50 hover:text-bone-muted transition-colors"
+        >
+          ↻ Refresh
+        </button>
       </div>
 
-      <div className="space-y-3">
-        {items.map(item => (
-          <GlassCard key={item.label} hoverable={false}>
+      <div className="space-y-2">
+        {serviceItems.map(item => (
+          <GlassCard key={item.label} hoverable={false} className={cn('py-2.5', !item.required && 'opacity-60')}>
             <div className="flex items-center gap-3">
-              <StatusDot ok={item.ok} />
-              <div className="flex-1">
+              <StatusDot ok={item.ok} warn={!item.required && !item.ok} />
+              <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
                   <span className="text-sm font-semibold text-bone">{item.label}</span>
-                  <Pill variant={item.ok ? 'success' : 'error'}>{item.ok ? 'online' : 'offline'}</Pill>
+                  {item.required && (
+                    <Pill variant={item.ok ? 'success' : 'error'}>{item.ok ? 'ok' : 'down'}</Pill>
+                  )}
+                  {!item.required && (
+                    <Pill variant={item.ok ? 'default' : 'default'}>{item.ok ? 'ok' : 'off'}</Pill>
+                  )}
                 </div>
-                <p className="text-[11px] font-mono text-bone-faint mt-0.5">{item.desc}</p>
+                <p className="text-[11px] font-mono text-bone-faint mt-0.5 truncate">{item.desc}</p>
               </div>
             </div>
           </GlassCard>
@@ -868,32 +987,36 @@ function StatusPanel({ status, onRefresh }: { status: JarvisStatus | null; onRef
       </div>
 
       {/* Quick actions */}
-      <div className="mt-6">
-        <h3 className="text-sm font-semibold text-bone-muted mb-3">Quick Actions</h3>
-        <div className="flex gap-2">
+      <div className="mt-4 flex gap-2">
+        <button
+          onClick={async () => {
+            try { await invoke('jarvis_start_bridge'); onRefresh(); }
+            catch (e) { console.error('Failed to start bridge:', e); }
+          }}
+          className="px-3 py-1.5 text-xs font-mono text-cyan-glow border border-cyan-neon/30 rounded-lg hover:bg-cyan-neon/10 transition-colors"
+        >
+          Start Bridge
+        </button>
+        <button
+          onClick={async () => {
+            try { await invoke('jarvis_stop_bridge'); onRefresh(); }
+            catch (e) { console.error('Failed to stop bridge:', e); }
+          }}
+          className="px-3 py-1.5 text-xs font-mono text-error border border-error/30 rounded-lg hover:bg-error/10 transition-colors"
+        >
+          Stop Bridge
+        </button>
+        {isOllama && (
           <button
             onClick={async () => {
-              try {
-                await invoke('jarvis_start_bridge');
-                onRefresh();
-              } catch (e) { console.error('Failed to start bridge:', e); }
+              try { await invoke('jarvis_restart_ollama'); onRefresh(); }
+              catch (e) { console.error('Failed to restart Ollama:', e); }
             }}
-            className="px-3 py-1.5 text-xs font-mono text-cyan-glow border border-cyan-neon/30 rounded-lg hover:bg-cyan-neon/10 transition-colors"
+            className="px-3 py-1.5 text-xs font-mono text-amber-300 border border-amber-400/30 rounded-lg hover:bg-amber-400/10 transition-colors"
           >
-            Start Bridge
+            Restart Ollama
           </button>
-          <button
-            onClick={async () => {
-              try {
-                await invoke('jarvis_stop_bridge');
-                onRefresh();
-              } catch (e) { console.error('Failed to stop bridge:', e); }
-            }}
-            className="px-3 py-1.5 text-xs font-mono text-error border border-error/30 rounded-lg hover:bg-error/10 transition-colors"
-          >
-            Stop Bridge
-          </button>
-        </div>
+        )}
       </div>
     </div>
   );

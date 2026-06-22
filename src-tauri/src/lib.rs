@@ -15,6 +15,7 @@ use crate::jarvis::hermes::commands::{
 use crate::jarvis::hermes::state::HermesAppState;
 use jarvis::types::JarvisState;
 use std::sync::Arc;
+use tauri::Manager;
 use tokio::sync::Mutex;
 
 // ─── Jarvis Bun Server Auto-Start ────────────────────────────────────────────
@@ -60,7 +61,7 @@ pub(crate) fn wsl_home() -> String {
 //   • claude_cli_proxy.py (port 19878) — Anthropic /v1/messages -> claude CLI
 // Both are spawned lazily off the main thread so the window paints fast.
 
-static OLLAMA_PROCESS: std::sync::OnceLock<std::sync::Mutex<Option<std::process::Child>>> =
+pub(crate) static OLLAMA_PROCESS: std::sync::OnceLock<std::sync::Mutex<Option<std::process::Child>>> =
     std::sync::OnceLock::new();
 pub(crate) static PROXY_PROCESS: std::sync::OnceLock<
     std::sync::Mutex<Option<std::process::Child>>,
@@ -110,7 +111,7 @@ fn spawn_ollama() -> Option<std::process::Child> {
     Some(child)
 }
 
-fn warm_qwen_model() {
+fn warm_model(model: String) {
     // Best-effort: send a 1-token generate request so the model is hot when
     // the user fires their first chat. Failures are non-fatal.
     let _ = reqwest::blocking::Client::builder()
@@ -119,7 +120,7 @@ fn warm_qwen_model() {
         .and_then(|c| {
             c.post("http://127.0.0.1:11434/api/generate")
                 .json(&serde_json::json!({
-                    "model": "qwen3:8b",
+                    "model": model,
                     "prompt": "ok",
                     "stream": false,
                     "options": {"num_predict": 1}
@@ -128,25 +129,84 @@ fn warm_qwen_model() {
         });
 }
 
-pub(crate) fn spawn_claude_cli_proxy() -> Option<std::process::Child> {
+/// Ensure the local Ollama server is running and warm. Idempotent and best-effort:
+/// if Ollama is already listening it does nothing but warm the model; otherwise it
+/// spawns `ollama serve`, waits up to ~15s for the port, registers the child for
+/// shutdown, and warms the model off-thread. Only called when Ollama is the active
+/// backend, so OpenRouter/Claude-CLI sessions don't pay for a local model server.
+///
+/// `model` is the configured `ollama.model` from the active config. Defaults to
+/// `"qwen3:8b"` only when an empty string is passed (e.g. from the reconcile path
+/// before a config is fully loaded).
+pub(crate) async fn start_ollama_and_warm(model: String) {
+    let model = if model.is_empty() { "qwen3:8b".to_string() } else { model };
+    if is_port_listening(11434) {
+        println!("[Jarvis] Ollama already running on port 11434");
+    } else if let Some(child) = spawn_ollama() {
+        let mut ready = false;
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if is_port_listening(11434) {
+                ready = true;
+                break;
+            }
+        }
+        if !ready {
+            eprintln!("[Jarvis] Ollama did not become ready within 15s");
+        } else {
+            println!("[Jarvis] Ollama ready on 11434");
+        }
+        if let Some(m) = OLLAMA_PROCESS.get() {
+            if let Ok(mut g) = m.lock() {
+                *g = Some(child);
+            }
+        }
+    }
+    // Warm the model off the async runtime so we don't block the boot task.
+    std::thread::spawn(move || warm_model(model));
+}
+
+/// Bring up the servers the given backend needs, in the background. Idempotent —
+/// starting an already-running service is a no-op — so it is safe to call on every
+/// config save / backend switch. Ollama is started + warmed only for the Ollama
+/// backend; the Bun server (needed by every backend for tools/skills/models) is
+/// ensured for all. Fire-and-forget so the caller (e.g. the Save button) returns
+/// immediately rather than blocking on Ollama warm-up.
+///
+/// `ollama_model` is forwarded to `start_ollama_and_warm`; pass an empty string when
+/// the model is not yet known (falls back to the `qwen3:8b` default).
+pub fn reconcile_backend_services(backend: crate::jarvis::types::JarvisBackend, ollama_model: String) {
+    tauri::async_runtime::spawn(async move {
+        if matches!(backend, crate::jarvis::types::JarvisBackend::Ollama) {
+            start_ollama_and_warm(ollama_model).await;
+        }
+        if let Err(e) = ensure_jarvis_server_started().await {
+            eprintln!("[Jarvis] ensure server after backend reconcile failed: {}", e);
+        }
+    });
+}
+
+pub(crate) fn spawn_claude_cli_proxy(ollama_model: String) -> Option<std::process::Child> {
     use std::process::{Command, Stdio};
     let script = find_claude_cli_proxy()?;
     let py = find_jarvis_python()?;
+    let model = if ollama_model.is_empty() { "qwen3:8b".to_string() } else { ollama_model };
     let mut command = Command::new(&py);
     command
         .arg(&script)
         .env("JARVIS_CLAUDE_PROXY_PORT", "19878")
         .env("JARVIS_OLLAMA_URL", "http://127.0.0.1:11434")
-        .env("JARVIS_DEFAULT_MODEL", "qwen3:8b")
+        .env("JARVIS_DEFAULT_MODEL", &model)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     crate::wsl::hide_windows_console(&mut command);
     let child = command.spawn().ok()?;
     println!(
-        "[Jarvis] claude_cli_proxy started (PID {}, py {}, script {})",
+        "[Jarvis] claude_cli_proxy started (PID {}, py {}, script {}, model {})",
         child.id(),
         py,
-        script
+        script,
+        model,
     );
     Some(child)
 }
@@ -561,36 +621,51 @@ pub fn run() {
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                // Start Ollama
-                if crate::is_port_listening(11434) {
-                    println!("[Jarvis] Ollama already running on port 11434");
-                } else if let Some(child) = crate::spawn_ollama() {
-                    let mut ready = false;
-                    for _ in 0..30 {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        if crate::is_port_listening(11434) {
-                            ready = true;
-                            break;
-                        }
+                // Hydrate the in-memory config from SQLite so boot reflects the user's
+                // chosen backend. JarvisState starts as the Ollama default until this
+                // runs; without this, OpenRouter users would still pay for an Ollama
+                // boot and the in-memory config would never match what was persisted.
+                // The file store (`~/.openclaw/jarvis/config.json`) is what the UI's
+                // Save writes via `jarvis_save_config`, so it is the source of truth for
+                // the active backend. Hydrating it here also fixes a latent bug: without
+                // this the in-memory config stayed at the Ollama default, so the Control
+                // view reverted to Ollama on every restart regardless of what was saved.
+                let cfg = crate::jarvis::load_jarvis_config();
+                {
+                    let state = handle.state::<crate::jarvis::types::JarvisState>();
+                    *state.config.lock().await = cfg.clone();
+                }
+                let backend = cfg.active_backend.clone();
+                println!("[Jarvis] Boot backend = {}", backend);
+
+                // Backend-specific local dependency: only start Ollama when it's active.
+                match backend {
+                    crate::jarvis::types::JarvisBackend::Ollama => {
+                        crate::start_ollama_and_warm(cfg.ollama.model.clone()).await;
                     }
-                    if !ready {
-                        eprintln!("[Jarvis] Ollama did not become ready within 15s");
-                    } else {
-                        println!("[Jarvis] Ollama ready on 11434");
-                    }
-                    if let Some(m) = crate::OLLAMA_PROCESS.get() {
-                        if let Ok(mut g) = m.lock() {
-                            *g = Some(child);
+                    crate::jarvis::types::JarvisBackend::OpenRouter => {
+                        if cfg.openrouter.api_key.trim().is_empty() {
+                            eprintln!(
+                                "[Jarvis] OpenRouter is the active backend but no API key is set \
+                                 — chats will fail until a key is configured in Control."
+                            );
                         }
+                        println!("[Jarvis] OpenRouter backend — skipping local Ollama startup.");
+                    }
+                    crate::jarvis::types::JarvisBackend::ClaudeCli => {
+                        println!("[Jarvis] Claude CLI backend — skipping local Ollama startup.");
                     }
                 }
 
-                // Warm qwen model
-                std::thread::spawn(crate::warm_qwen_model);
+                // Backend-independent services below: the proxy routes to whichever
+                // backend is active, the Bun server powers tools/skills/models, and the
+                // cron scheduler drives routines — all needed regardless of backend.
 
-                // Start Claude CLI proxy
+                // Start Claude CLI proxy (pass the configured Ollama model so the proxy
+                // knows which model to default to when the active backend is local).
+                let proxy_model = cfg.ollama.model.clone();
                 let proxy_result =
-                    tauri::async_runtime::spawn_blocking(crate::spawn_claude_cli_proxy).await;
+                    tauri::async_runtime::spawn_blocking(move || crate::spawn_claude_cli_proxy(proxy_model)).await;
                 match proxy_result {
                     Ok(Some(child)) => {
                         if let Some(m) = crate::PROXY_PROCESS.get() {

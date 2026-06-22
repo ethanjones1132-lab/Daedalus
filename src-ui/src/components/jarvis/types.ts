@@ -132,29 +132,23 @@ export interface ToolResult {
 }
 
 export interface JarvisStatus {
+  // Ollama backend
   ollama_running: boolean;
-  ollama_model_available: boolean;
-  ollama_latency_ms: number;
-  ollama_models: string[];
-  openrouter_ok: boolean;
-  openrouter_latency_ms: number;
-  claude_cli_available: boolean;
-  claude_proxy_active: boolean;
+  model_available: boolean;
+  // Bun server (needed by all backends)
+  bun_server_running: boolean;
+  bun_server_url: string;
+  // Claude CLI proxy
+  claude_proxy_running: boolean;
+  // Bridge
   bridge_active: boolean;
   bridge_port: number;
+  // General availability
   bun_available: boolean;
-  jarvis_version: string;
-  uptime_seconds: number;
-  total_requests: number;
-  active_sessions: number;
+  // Active backend descriptor
   active_backend: string;
   model: string;
-  config_valid: boolean;
-  config_errors: string[];
-  config_warnings: string[];
-  backend: string;
-  resolved_openrouter_model?: string;
-  error?: string;
+  openrouter_key_set: boolean;
 }
 
 export interface DiscoveredModel {
@@ -246,7 +240,7 @@ export type JarvisSubView =
 export const OPENROUTER_MODELS: OpenRouterModel[] = [
   { id: 'openrouter/free', name: 'Free Models Router', context_length: 200000, pricing: 'free', description: 'Routes to available free OpenRouter models', is_free: true, is_router: true },
   { id: 'openrouter/owl-alpha', name: 'Owl Alpha', context_length: 1048756, pricing: 'free', description: 'OpenRouter free model', is_free: true },
-  { id: 'nvidia/nemotron-3-ultra-550b-a55b:free', name: 'Nemotron 3 Ultra', context_length: 1000000, pricing: 'free', description: 'Large free reasoning/orchestration model', is_free: true },
+  { id: 'nvidia/llama-3.1-nemotron-ultra-253b-v1:free', name: 'Nemotron Ultra 253B', context_length: 131072, pricing: 'free', description: 'NVIDIA Llama-3.1 Nemotron Ultra — free reasoning/orchestration model', is_free: true },
   { id: 'qwen/qwen3-coder:free', name: 'Qwen3 Coder 480B', context_length: 1048576, pricing: 'free', description: 'Free coder model', is_free: true },
   { id: 'openai/gpt-oss-120b:free', name: 'GPT OSS 120B', context_length: 131072, pricing: 'free', description: 'Free OpenAI OSS model', is_free: true },
   { id: 'meta-llama/llama-3.3-70b-instruct:free', name: 'Llama 3.3 70B', context_length: 131072, pricing: 'free', description: 'Free Llama instruct model', is_free: true },

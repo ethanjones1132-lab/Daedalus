@@ -111,10 +111,16 @@ pub async fn jarvis_send_message(
     app: AppHandle,
     message: String,
     session_id: String,
-    state: State<'_, JarvisState>,
 ) -> Result<(), String> {
-    let config = state.config.lock().await.clone();
-    run_jarvis_message(app, config, session_id, message)
+    // Chat is served by the native Bun server, which loads the active config
+    // (backend + model + OpenRouter key) itself. Make sure it is up, then hand the
+    // turn to the SSE relay. We no longer pass config through here — the server is
+    // the single source of truth, which is also why the key must be persisted to the
+    // config file it reads (see jarvis::get_config_path).
+    crate::ensure_jarvis_server_started().await?;
+    let base_url = crate::wsl::get_cached_bun_url()
+        .unwrap_or_else(|| "http://127.0.0.1:19877".to_string());
+    run_jarvis_message(app, base_url, session_id, message)
 }
 
 #[tauri::command]
@@ -189,8 +195,15 @@ pub async fn jarvis_save_config(
     state: State<'_, JarvisState>,
 ) -> Result<(), String> {
     jarvis::save_jarvis_config(&config)?;
-    let mut guard = state.config.lock().await;
-    *guard = config;
+    let backend = config.active_backend.clone();
+    let ollama_model = config.ollama.model.clone();
+    {
+        let mut guard = state.config.lock().await;
+        *guard = config;
+    }
+    // Bring up whatever the (possibly newly selected) backend needs — e.g. start
+    // Ollama when the user switches to it in Control. Idempotent + non-blocking.
+    crate::reconcile_backend_services(backend, ollama_model);
     Ok(())
 }
 

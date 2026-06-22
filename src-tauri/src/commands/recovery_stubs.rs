@@ -144,8 +144,31 @@ pub async fn jarvis_test_connection(
 }
 
 #[tauri::command]
-pub async fn jarvis_switch_backend(backend: String) -> Result<(), String> {
-    eprintln!("[jarvis] switch_backend requested: {backend} (no-op in recovered tree)");
+pub async fn jarvis_switch_backend(
+    backend: String,
+    state: State<'_, crate::jarvis::types::JarvisState>,
+) -> Result<(), String> {
+    use crate::jarvis::types::JarvisBackend;
+    let new_backend = match backend.as_str() {
+        "ollama" => JarvisBackend::Ollama,
+        "openrouter" => JarvisBackend::OpenRouter,
+        "claude_cli" => JarvisBackend::ClaudeCli,
+        other => return Err(format!("unknown backend: {other}")),
+    };
+
+    // Persist to the file store (the UI's source of truth) and mirror into the
+    // in-memory state so subsequent chats route to the new backend immediately.
+    let mut cfg = { state.config.lock().await.clone() };
+    cfg.active_backend = new_backend.clone();
+    crate::jarvis::save_jarvis_config(&cfg)?;
+    let ollama_model = cfg.ollama.model.clone();
+    {
+        let mut guard = state.config.lock().await;
+        *guard = cfg;
+    }
+
+    // Start whatever the new backend needs (Ollama for local; Bun for all).
+    crate::reconcile_backend_services(new_backend, ollama_model);
     Ok(())
 }
 
@@ -171,8 +194,28 @@ pub async fn jarvis_restart_server() -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub async fn jarvis_restart_ollama() -> Result<bool, String> {
-    Err("jarvis_restart_ollama is not yet wired up in the recovered tree".to_string())
+pub async fn jarvis_restart_ollama(
+    state: tauri::State<'_, crate::jarvis::types::JarvisState>,
+) -> Result<bool, String> {
+    // Kill the tracked Ollama child (if we spawned one), let the port free up, then
+    // respawn + warm. Returns true once Ollama is listening again. Best-effort: if
+    // Ollama was started outside the app there may be no child to kill, in which case
+    // we simply (re)ensure it is up.
+    let model = state.config.lock().await.ollama.model.clone();
+    if let Some(m) = crate::OLLAMA_PROCESS.get() {
+        if let Ok(mut g) = m.lock() {
+            if let Some(mut child) = g.take() {
+                let _ = child.kill();
+            }
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    crate::start_ollama_and_warm(model).await;
+    if crate::is_port_listening(11434) {
+        Ok(true)
+    } else {
+        Err("Ollama did not come back up within the startup window".to_string())
+    }
 }
 
 #[tauri::command]

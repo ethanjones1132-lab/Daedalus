@@ -282,11 +282,23 @@ pub struct StreamEvent {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct JarvisStatus {
+    // Ollama backend
     pub ollama_running: bool,
     pub model_available: bool,
+    // Bun server (needed by all backends)
+    pub bun_server_running: bool,
+    pub bun_server_url: String,
+    // Claude CLI proxy
+    pub claude_proxy_running: bool,
+    // Bridge
     pub bridge_active: bool,
     pub bridge_port: u16,
+    // General availability indicator
     pub bun_available: bool,
+    // Active backend + model (for the status chip row)
+    pub active_backend: String,
+    pub model: String,
+    pub openrouter_key_set: bool,
 }
 
 // ═══════════════════════════════════════════════════════════════
