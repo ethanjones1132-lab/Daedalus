@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ui:
+    name: UI (typecheck + build + theme guard)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src-ui
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # src-ui ships package-lock.json, so npm is its package manager.
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc -b
+
+      - name: Unit tests
+        run: npm run test
+
+      - name: Build
+        run: npx vite build
+
+      # ── Theme-husk guard ──────────────────────────────────────────
+      # Tailwind v4 silently emits no CSS for unknown named-color
+      # utilities, so a stripped index.css @theme block compiles green
+      # but renders the whole UI unstyled. Fail loudly if the brand
+      # tokens / utilities are absent from the generated stylesheet.
+      - name: Theme tokens present in built CSS
+        run: |
+          set -euo pipefail
+          css=$(ls dist/assets/index-*.css | head -1)
+          echo "Inspecting $css"
+          for tok in --color-bone --color-royal --color-accent; do
+            grep -q -- "$tok" "$css" \
+              || { echo "::error::theme token '$tok' missing from built CSS — index.css @theme block may be a husk"; exit 1; }
+          done
+          for util in '\.text-bone' '\.bg-accent' '\.border-iron'; do
+            grep -qE "$util" "$css" \
+              || { echo "::error::utility '$util' did not generate — theme is dead"; exit 1; }
+          done
+          echo "✓ Brand tokens and utilities present."
+
+  server:
+    name: Bun server (typecheck + tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server-jarvis
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      # server-jarvis ships bun.lock, so bun is its package manager.
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bunx tsc --noEmit
+
+      - name: Test
+        run: bun test
+
+  rust:
+    name: Rust (cargo check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tauri's Linux build needs the WebKitGTK + GTK system libraries.
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      # tauri.conf.json bundles ../server-jarvis/dist/index.js as a resource,
+      # and tauri-build validates resource paths at build time. dist/ is
+      # gitignored, so build it before cargo touches the crate.
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Build server bundle (tauri resource)
+        run: bun install --frozen-lockfile && bun build ./src/index.ts --outdir ./dist --target bun
+        working-directory: server-jarvis
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Check
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Test
+        run: cargo test --manifest-path src-tauri/Cargo.toml

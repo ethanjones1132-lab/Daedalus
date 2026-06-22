@@ -1,15 +1,12 @@
-use crate::jarvis::types::*;
 use crate::jarvis::queue::MessageQueue;
+use crate::jarvis::types::*;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
 
 /// Start the TCP socket listener for agent bridge connections.
 /// Uses a local TCP port since Unix sockets are not available on Windows.
-pub fn start_bridge(
-    port: u16,
-    queue: Arc<MessageQueue>,
-) -> Result<(), String> {
+pub fn start_bridge(port: u16, queue: Arc<MessageQueue>) -> Result<(), String> {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
         .map_err(|e| format!("Failed to bind bridge on port {}: {}", port, e))?;
 
@@ -62,7 +59,11 @@ fn handle_agent_connection(mut stream: std::net::TcpStream, queue: Arc<MessageQu
                     tokens_used: None,
                     error: Some(format!("Invalid request JSON: {}", e)),
                 };
-                let _ = writeln!(stream, "{}", serde_json::to_string(&response).unwrap_or_default());
+                let _ = writeln!(
+                    stream,
+                    "{}",
+                    serde_json::to_string(&response).unwrap_or_default()
+                );
                 continue;
             }
         };
@@ -73,7 +74,11 @@ fn handle_agent_connection(mut stream: std::net::TcpStream, queue: Arc<MessageQu
             request.session.clone()
         };
 
-        match queue.try_enqueue(request.from.clone(), request.message.clone(), session.clone()) {
+        match queue.try_enqueue(
+            request.from.clone(),
+            request.message.clone(),
+            session.clone(),
+        ) {
             Ok(()) => {
                 let response = BridgeResponse {
                     response: format!("Message queued for session {}", session),
@@ -81,7 +86,11 @@ fn handle_agent_connection(mut stream: std::net::TcpStream, queue: Arc<MessageQu
                     tokens_used: None,
                     error: None,
                 };
-                let _ = writeln!(stream, "{}", serde_json::to_string(&response).unwrap_or_default());
+                let _ = writeln!(
+                    stream,
+                    "{}",
+                    serde_json::to_string(&response).unwrap_or_default()
+                );
             }
             Err(e) => {
                 let response = BridgeResponse {
@@ -90,7 +99,11 @@ fn handle_agent_connection(mut stream: std::net::TcpStream, queue: Arc<MessageQu
                     tokens_used: None,
                     error: Some(e),
                 };
-                let _ = writeln!(stream, "{}", serde_json::to_string(&response).unwrap_or_default());
+                let _ = writeln!(
+                    stream,
+                    "{}",
+                    serde_json::to_string(&response).unwrap_or_default()
+                );
             }
         }
     }

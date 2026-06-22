@@ -228,6 +228,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
         "engine TEXT NOT NULL DEFAULT 'native'",
     )?;
     create_self_tuning_tables(conn)?;
+    create_session_memory_table(conn)?;
     apply_schema_patches(conn)?;
 
     Ok(())
@@ -293,6 +294,25 @@ fn create_self_tuning_tables(conn: &Connection) -> Result<(), rusqlite::Error> {
     )
 }
 
+fn create_session_memory_table(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS session_memory (
+            session_id      TEXT PRIMARY KEY,
+            summary         TEXT NOT NULL DEFAULT '',
+            current_goal    TEXT NOT NULL DEFAULT '',
+            decisions       TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(decisions)),
+            next_steps      TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(next_steps)),
+            last_message_at TEXT,
+            updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            turn_counter    INTEGER NOT NULL DEFAULT 0,
+            last_review_at  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_memory_updated_at ON session_memory(updated_at DESC);
+        "#,
+    )
+}
+
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, rusqlite::Error> {
     let escaped_table = table.replace('\'', "''");
     let mut stmt = conn.prepare(&format!("PRAGMA table_info('{}')", escaped_table))?;
@@ -339,7 +359,50 @@ fn run_enterprise_memory_migrations(conn: &Connection) -> Result<(), rusqlite::E
 }
 
 fn apply_schema_patches(conn: &Connection) -> Result<(), rusqlite::Error> {
-    add_column_if_missing(conn, "memory", "usage_count", "usage_count INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(
+        conn,
+        "memory",
+        "agent_id",
+        "agent_id TEXT NOT NULL DEFAULT 'jarvis'",
+    )?;
+    add_column_if_missing(
+        conn,
+        "memory",
+        "source",
+        "source TEXT NOT NULL DEFAULT 'manual'",
+    )?;
+    add_column_if_missing(
+        conn,
+        "memory",
+        "source_session_id",
+        "source_session_id TEXT",
+    )?;
+    add_column_if_missing(
+        conn,
+        "memory",
+        "source_message_ids",
+        "source_message_ids TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(source_message_ids))",
+    )?;
+    add_column_if_missing(
+        conn,
+        "memory",
+        "confidence",
+        "confidence REAL NOT NULL DEFAULT 0.6",
+    )?;
+    add_column_if_missing(conn, "memory", "last_used_at", "last_used_at TEXT")?;
+    add_column_if_missing(conn, "memory", "supersedes_id", "supersedes_id TEXT")?;
+    add_column_if_missing(
+        conn,
+        "memory",
+        "metadata",
+        "metadata TEXT CHECK(metadata IS NULL OR json_valid(metadata))",
+    )?;
+    add_column_if_missing(
+        conn,
+        "memory",
+        "usage_count",
+        "usage_count INTEGER NOT NULL DEFAULT 0",
+    )?;
     add_column_if_missing(conn, "memory", "expires_at", "expires_at TEXT")?;
     add_column_if_missing(conn, "memory", "review_after", "review_after TEXT")?;
     add_column_if_missing(
@@ -417,7 +480,6 @@ fn apply_schema_patches(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS idx_memory_tier ON memory(tier, status);
         CREATE INDEX IF NOT EXISTS idx_memory_status_updated ON memory(status, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_memory_created_at ON memory(created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_memory_events_id_created ON memory_events(memory_id, created_at DESC);
 
         CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts
         USING fts5(id UNINDEXED, title, content, tags, category);
@@ -527,5 +589,47 @@ mod tests {
         assert!(table_has_column(&conn, "stage_runs", "mode_id").unwrap());
         assert!(table_has_column(&conn, "tuning_proposals", "proposal_type").unwrap());
         assert!(table_has_column(&conn, "tuning_outcomes", "user_rating_delta").unwrap());
+    }
+
+    #[test]
+    fn fresh_migrations_add_memory_tier_and_status() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        assert!(table_has_column(&conn, "memory", "tier").unwrap());
+        assert!(table_has_column(&conn, "memory", "status").unwrap());
+    }
+
+    /// Guards the exact query backing `jarvis_get_tier_stats` (MemoryView's
+    /// hot/warm/cold counts): only active rows count, partitioned by tier.
+    #[test]
+    fn memory_tier_stats_count_only_active_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        let mut insert = |id: &str, tier: &str, status: &str| {
+            conn.execute(
+                "INSERT INTO memory (id, tier, status) VALUES (?1, ?2, ?3)",
+                rusqlite::params![id, tier, status],
+            )
+            .unwrap();
+        };
+        insert("m1", "hot", "active");
+        insert("m2", "hot", "active");
+        insert("m3", "warm", "active");
+        insert("m4", "cold", "active");
+        insert("m5", "hot", "tombstoned"); // must be excluded
+
+        let count = |tier: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM memory WHERE tier = ?1 AND status = 'active'",
+                [tier],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(count("hot"), 2, "tombstoned hot row must not count");
+        assert_eq!(count("warm"), 1);
+        assert_eq!(count("cold"), 1);
     }
 }

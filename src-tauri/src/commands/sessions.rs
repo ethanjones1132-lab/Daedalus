@@ -109,10 +109,14 @@ pub async fn compact_session_db(
         let conn = rusqlite::Connection::open(&db_path)
             .map_err(|e| format!("Failed to open DB at {:?}: {}", db_path, e))?;
         let mut stmt = conn
-            .prepare("SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at ASC")
+            .prepare(
+                "SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at ASC",
+            )
             .map_err(|e| e.to_string())?;
         let msgs: Vec<(String, String)> = stmt
-            .query_map([&sid], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .query_map([&sid], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
@@ -250,11 +254,17 @@ pub fn create_session(
 pub fn delete_session(db: State<AppDb>, session_id: String) -> Result<bool, String> {
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     let affected = conn
-        .execute("DELETE FROM messages WHERE session_id = ?", rusqlite::params![&session_id])
+        .execute(
+            "DELETE FROM messages WHERE session_id = ?",
+            rusqlite::params![&session_id],
+        )
         .map_err(|e| e.to_string())?;
     let _ = affected;
     let n = conn
-        .execute("DELETE FROM sessions WHERE id = ?", rusqlite::params![&session_id])
+        .execute(
+            "DELETE FROM sessions WHERE id = ?",
+            rusqlite::params![&session_id],
+        )
         .map_err(|e| e.to_string())?;
     Ok(n > 0)
 }
@@ -349,9 +359,7 @@ pub fn export_session(
         if let Ok(m) = r {
             out.push_str(&format!(
                 "## {} ({})\n\n{}\n\n",
-                m.role,
-                m.created_at,
-                m.content
+                m.role, m.created_at, m.content
             ));
         }
     }

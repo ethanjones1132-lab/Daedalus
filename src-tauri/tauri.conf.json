@@ -5,8 +5,8 @@
   "identifier": "com.jarvis.desktop",
   "build": {
     "frontendDist": "../src-ui/dist",
-    "beforeDevCommand": "bun --cwd ../src-ui run dev",
-    "beforeBuildCommand": "bun --cwd ../src-ui run build",
+    "beforeDevCommand": "cd src-ui && bun run dev",
+    "beforeBuildCommand": "cd server-jarvis && bun build ./src/index.ts --outdir ./dist --target bun && cd ../src-ui && bun run build",
     "devUrl": "http://localhost:5173"
   },
   "app": {

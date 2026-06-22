@@ -65,4 +65,3 @@ pub fn load_relevant_memories(
     }
     Ok(lines.join("\n"))
 }
-

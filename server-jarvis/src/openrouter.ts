@@ -771,7 +771,7 @@ export function openRouterHeaders(cfg: JarvisConfig): Record<string, string> {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Cost Tracking (stub — call after streaming finishes)
+// Cost Tracking
 // ═══════════════════════════════════════════════════════════════
 
 export function logOpenRouterCost(cost: OpenRouterCostInfo | null): void {

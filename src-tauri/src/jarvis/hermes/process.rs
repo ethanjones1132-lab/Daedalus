@@ -6,11 +6,11 @@
 use crate::jarvis::hermes::protocol::{BridgeError, IncomingMessage, OutgoingMessage, Rid};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::process::Command;
 use std::process::Stdio;
-use tokio::io::{AsyncWriteExt, BufReader, AsyncBufReadExt};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 use tokio::sync::{broadcast, oneshot, Mutex};
 
 #[derive(Debug, Clone)]
@@ -139,23 +139,19 @@ impl HermesProcess {
         for (k, v) in &self.config.extra_env {
             command.env(k, v);
         }
-        let mut child = command
-            .spawn()
-            .map_err(|e| BridgeError::Io(e))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| BridgeError::Io(std::io::Error::new(
+        let mut child = command.spawn().map_err(|e| BridgeError::Io(e))?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            BridgeError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "child stdin not captured",
-            )))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| BridgeError::Io(std::io::Error::new(
+            ))
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            BridgeError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "child stdout not captured",
-            )))?;
+            ))
+        })?;
 
         *self.writer.lock().await = Some(stdin);
         *self.child.lock().await = Some(child);
@@ -270,7 +266,9 @@ impl HermesProcess {
         {
             let mut w = self.writer.lock().await;
             let w = w.as_mut().ok_or(BridgeError::NotRunning)?;
-            w.write_all(line.as_bytes()).await.map_err(BridgeError::Io)?;
+            w.write_all(line.as_bytes())
+                .await
+                .map_err(BridgeError::Io)?;
             w.write_all(b"\n").await.map_err(BridgeError::Io)?;
         }
 

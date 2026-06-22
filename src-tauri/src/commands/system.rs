@@ -438,14 +438,14 @@ pub async fn get_doctor_report() -> Result<DoctorReport, String> {
 
     // System store
     let store_ok = system_store_path().exists()
-        || system_store_path().parent().map(|p| p.exists()).unwrap_or(false);
+        || system_store_path()
+            .parent()
+            .map(|p| p.exists())
+            .unwrap_or(false);
     checks.push(DoctorCheck {
         name: "system_store".into(),
         status: "ok".into(),
-        detail: format!(
-            "JSON system store at {}",
-            system_store_path().display()
-        ),
+        detail: format!("JSON system store at {}", system_store_path().display()),
     });
     let _ = store_ok;
 
@@ -620,11 +620,7 @@ pub fn get_hooks() -> Result<Vec<Hook>, String> {
 }
 
 #[tauri::command]
-pub fn register_hook(
-    name: String,
-    event: String,
-    script: Option<String>,
-) -> Result<Hook, String> {
+pub fn register_hook(name: String, event: String, script: Option<String>) -> Result<Hook, String> {
     let mut store = load_store()?;
     let hook = Hook {
         id: new_id(),

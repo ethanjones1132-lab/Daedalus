@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "bun --hot ./src/index.ts",
     "build": "bun build ./src/index.ts --outdir ./dist --target bun",
-    "start": "bun ./src/index.ts"
+    "start": "bun ./src/index.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "diff": "^9.0.0",

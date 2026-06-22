@@ -395,7 +395,8 @@ pub async fn discover_models_openrouter(api_key: String) -> Result<Vec<Discovere
                         .and_then(|t| t.as_str())
                         .map(|t| t == "Router")
                         .unwrap_or(false);
-                    let is_router = id == "openrouter/free" || id == "openrouter/fusion" || tokenizer_is_router;
+                    let is_router =
+                        id == "openrouter/free" || id == "openrouter/fusion" || tokenizer_is_router;
                     let modality = v
                         .get("architecture")
                         .and_then(|a| a.get("modality"))

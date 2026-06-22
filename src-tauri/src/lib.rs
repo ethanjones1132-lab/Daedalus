@@ -208,9 +208,8 @@ fn find_jarvis_server() -> Option<String> {
 
         // Windows-native dev tree locations (no WSL required).
         // Checked in order; first existing path wins.
-        let dev_candidates: &[&str] = &[
-            r"C:\Projects\home-base-recovered\server-jarvis\src\index.ts",
-        ];
+        let dev_candidates: &[&str] =
+            &[r"C:\Projects\home-base-recovered\server-jarvis\src\index.ts"];
         for cand in dev_candidates {
             if std::path::Path::new(cand).exists() {
                 println!("[Jarvis] Found server at native dev path: {}", cand);
@@ -246,7 +245,11 @@ fn find_jarvis_server() -> Option<String> {
     } else {
         std::path::Path::new(&base).exists()
     };
-    if exists { Some(base) } else { None }
+    if exists {
+        Some(base)
+    } else {
+        None
+    }
 }
 
 /// Async health probe across candidate URLs. Uses a 2s per-probe timeout because
@@ -300,7 +303,10 @@ fn find_bun_executable() -> String {
     if cfg!(target_os = "windows") {
         // Check the standard Windows-native bun installation (bun install on Windows).
         if let Some(profile) = std::env::var_os("USERPROFILE") {
-            let native_bun = std::path::PathBuf::from(profile).join(".bun").join("bin").join("bun.exe");
+            let native_bun = std::path::PathBuf::from(profile)
+                .join(".bun")
+                .join("bin")
+                .join("bun.exe");
             if native_bun.exists() {
                 return native_bun.to_string_lossy().into_owned();
             }
@@ -346,7 +352,8 @@ fn jarvis_server_log_stdio(file_name: &str) -> std::process::Stdio {
 fn spawn_jarvis_server(entry: &str) -> Option<std::process::Child> {
     let bun = find_bun_executable();
     let is_windows = cfg!(target_os = "windows");
-    let looks_like_local_bun = is_windows && bun.to_lowercase().ends_with(".exe") && !bun.contains("wsl");
+    let looks_like_local_bun =
+        is_windows && bun.to_lowercase().ends_with(".exe") && !bun.contains("wsl");
 
     let spawn_result = if is_windows && !looks_like_local_bun {
         // Original WSL path for dev / full WSL setups.

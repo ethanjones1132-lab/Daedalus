@@ -80,12 +80,10 @@ impl MessageQueue {
             reply_tx,
         };
 
-        self.sender
-            .try_send(request)
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => "Jarvis queue is full (10 pending)".to_string(),
-                mpsc::error::TrySendError::Closed(_) => "Jarvis queue is closed".to_string(),
-            })?;
+        self.sender.try_send(request).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => "Jarvis queue is full (10 pending)".to_string(),
+            mpsc::error::TrySendError::Closed(_) => "Jarvis queue is closed".to_string(),
+        })?;
         Ok(())
     }
 }

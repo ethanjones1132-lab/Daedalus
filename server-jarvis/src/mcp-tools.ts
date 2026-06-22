@@ -78,10 +78,11 @@ async function mcpRequest(
     return json.result ?? {};
   }
 
-  if (!server.command) throw new Error(`MCP server ${serverName} has no command or URL`);
+  const command = server.command;
+  if (!command) throw new Error(`MCP server ${serverName} has no command or URL`);
 
   return new Promise((resolveReq, rejectReq) => {
-    const child = spawn(server.command!, server.args || [], {
+    const child = spawn(command, server.args || [], {
       cwd: server.cwd ? resolve(server.cwd) : cfg.jarvis_path,
       env: { ...process.env, ...(server.env || {}) },
       stdio: ["pipe", "pipe", "pipe"],

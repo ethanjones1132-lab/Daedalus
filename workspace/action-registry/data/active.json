@@ -9,14 +9,13 @@
       "source_area": "website",
       "priority": "P0",
       "risk_level": "high",
-      "category": "web_registry",
+      "category": "funnel_triage",
       "action_type": "website_track",
       "title": "JonesinSRC website track",
-      "description": "Canonical registry entry for the JonesinSRC website so storefront trust, lead capture, funnel truth, and conversion work attach to one stable surface instead of scattering across theme edits and chat notes.",
+      "description": "Verify trust signals, lead capture, and checkout paths on the live Shopify portfolio store.",
       "acceptance_criteria": [
-        "Registry record preserves the website identity, directory, and temporary domain context",
-        "Future funnel, contact, and checkout actions can reference the website slug",
-        "Current trust-signal and lead-capture improvements are preserved in evidence"
+        "Lead capture form submission path is verified end-to-end",
+        "Trust signals are visible on the live storefront"
       ],
       "dependencies": [],
       "status": "open",
@@ -24,7 +23,7 @@
       "approval_required": false,
       "next_due": "2026-06-16T18:00:00",
       "created_at": "2026-06-16T13:54:49",
-      "updated_at": "2026-06-16T13:54:49",
+      "updated_at": "2026-06-21T14:39:45",
       "surface_name": "JonesinSRC website",
       "surface_slug": "jonesinsrc-website",
       "surface_type": "shopify_portfolio_store",
@@ -38,8 +37,66 @@
         {
           "kind": "context",
           "value": "Trust signals and a lead-capture form were added to the site, but WallSlayer is still live with zero sales so the website remains a primary conversion surface."
+        },
+        {
+          "kind": "context",
+          "value": "Trust signals and lead capture were added; zero-sales WallSlayer keeps website conversion urgent."
         }
-      ]
+      ],
+      "track_key": "jonesinsrc:website",
+      "action_kind": "track",
+      "created_run": 3,
+      "last_seen_run": 4,
+      "priority_promoted_run": 3,
+      "confidence": 0.7,
+      "confidence_reason": "Repo reachable"
+    },
+    {
+      "id": "jonesinsrc-kalshi-monster-20260616-001",
+      "project": "jonesinsrc",
+      "source_system": "product-registry",
+      "source_area": "kalshi-monster",
+      "priority": "P0",
+      "risk_level": "medium",
+      "category": "product_registry",
+      "action_type": "product_track",
+      "title": "Kalshi Monster launch and funnel track",
+      "description": "Product adapter emitted a live track for Kalshi Monster so storefront, support, and publishing work attach to one stable product record.",
+      "acceptance_criteria": [
+        "Registry record preserves product identity, price path, and delivery model",
+        "Future funnel and support actions can reference the product slug"
+      ],
+      "dependencies": [],
+      "status": "open",
+      "owner": "shared",
+      "approval_required": false,
+      "next_due": "2026-06-17T18:00:00",
+      "created_at": "2026-06-16T13:54:49",
+      "updated_at": "2026-06-21T14:39:45",
+      "surface_name": "Kalshi Monster",
+      "surface_slug": "kalshi-monster",
+      "surface_type": "desktop_app",
+      "price": "$25",
+      "lifecycle_stage": "live",
+      "evidence": [
+        {
+          "kind": "repo",
+          "value": "C:/Users/ethan/kalshi-build/kalshi-monster"
+        },
+        {
+          "kind": "product",
+          "value": "$25 web_app"
+        },
+        {
+          "kind": "context",
+          "value": "Kalshi Monster is a commercial JonesinSRC web app offering."
+        }
+      ],
+      "track_key": "jonesinsrc:kalshi-monster",
+      "action_kind": "task",
+      "created_run": 3,
+      "last_seen_run": 4,
+      "priority_promoted_run": 3
     },
     {
       "id": "jonesinsrc-wallslayer-20260616-001",
@@ -49,21 +106,22 @@
       "priority": "P0",
       "risk_level": "high",
       "category": "product_registry",
-      "action_type": "product_track",
-      "title": "WallSlayer product track",
-      "description": "Canonical registry entry for WallSlayer so storefront, pricing, support, and zero-sales diagnostics can attach to one stable product record.",
+      "action_type": "funnel_diagnostic",
+      "title": "WallSlayer zero-sales funnel diagnostic",
+      "description": "Product adapter emitted a live track for WallSlayer so storefront, support, and publishing work attach to one stable product record.",
       "acceptance_criteria": [
         "Registry record preserves product identity, price path, and delivery model",
-        "Future storefront and funnel actions can reference the product slug",
-        "Current live-zero-sales context is preserved in evidence"
+        "Future funnel and support actions can reference the product slug",
+        "Storefront visit-to-checkout path is traced with evidence",
+        "Zero-sales hypothesis is recorded with at least one diagnostic action"
       ],
       "dependencies": [],
       "status": "open",
       "owner": "shared",
-      "approval_required": false,
+      "approval_required": true,
       "next_due": "2026-06-17T18:00:00",
       "created_at": "2026-06-16T13:54:49",
-      "updated_at": "2026-06-16T13:54:49",
+      "updated_at": "2026-06-21T14:39:45",
       "surface_name": "WallSlayer",
       "surface_slug": "wallslayer",
       "surface_type": "desktop_app",
@@ -73,8 +131,21 @@
         {
           "kind": "repo",
           "value": "C:/Users/ethan/OneDrive/Desktop/Claude Wall Slayer/wall-slayer"
+        },
+        {
+          "kind": "product",
+          "value": "$19 limited → $39 download"
+        },
+        {
+          "kind": "context",
+          "value": "Wall Slayer Shopify is live and currently showing zero sales."
         }
-      ]
+      ],
+      "track_key": "jonesinsrc:wallslayer",
+      "action_kind": "task",
+      "created_run": 3,
+      "last_seen_run": 4,
+      "priority_promoted_run": 3
     },
     {
       "id": "jonesinsrc-prizepicks-monster-20260616-001",
@@ -85,20 +156,20 @@
       "risk_level": "high",
       "category": "product_registry",
       "action_type": "product_track",
-      "title": "PrizePicks Monster product track",
-      "description": "Canonical registry entry for PrizePicks Monster DFS player prop intelligence app. Rebuilt from Kalshi Monster base after WSL data loss.",
+      "title": "PrizePicks Monster commercialization track",
+      "description": "Product adapter emitted a live track for PrizePicks Monster so storefront, support, and publishing work attach to one stable product record.",
       "acceptance_criteria": [
-        "Registry record preserves product identity, price, and delivery model",
-        "Future storefront and funnel actions can reference the product slug",
-        "Rebuild from Kalshi Monster codebase is tracked"
+        "Registry record preserves product identity, price path, and delivery model",
+        "Future funnel and support actions can reference the product slug",
+        "Predictions database path is restored or documented"
       ],
       "dependencies": [],
-      "status": "done",
+      "status": "open",
       "owner": "shared",
       "approval_required": false,
       "next_due": "2026-06-19T18:00:00",
       "created_at": "2026-06-16T13:54:49",
-      "updated_at": "2026-06-19T19:14:29",
+      "updated_at": "2026-06-21T14:39:45",
       "surface_name": "PrizePicks Monster",
       "surface_slug": "prizepicks-monster",
       "surface_type": "desktop_app",
@@ -112,42 +183,402 @@
         {
           "kind": "context",
           "value": "Rebuilt from Kalshi Monster base. Tauri 2 + Rust + React. Player prop fetcher, chat context, and UI rebranded. Cron workdir updated."
+        },
+        {
+          "kind": "product",
+          "value": "$25 web_app"
+        },
+        {
+          "kind": "context",
+          "value": "PrizePicks Monster is a commercial JonesinSRC web app offering."
+        },
+        {
+          "kind": "missing",
+          "value": "C:\\Projects\\prizepicks-monster\\predictions.db"
         }
       ],
       "completed_at": "2026-06-19T19:14:29",
-      "result_summary": "Rebuilt from Kalshi Monster base. New repo at C:/Projects/prizepicks-monster. 107 Tauri commands, 4 new prop commands. Frontend rebranded. Cron workdir updated."
+      "result_summary": "Rebuilt from Kalshi Monster base. New repo at C:/Projects/prizepicks-monster. 107 Tauri commands, 4 new prop commands. Frontend rebranded. Cron workdir updated.",
+      "track_key": "jonesinsrc:prizepicks-monster",
+      "action_kind": "task",
+      "created_run": 3,
+      "last_seen_run": 4,
+      "priority_promoted_run": 3
     },
     {
-      "id": "jonesinsrc-kalshi-monster-20260616-001",
-      "project": "jonesinsrc",
-      "source_system": "product-registry",
-      "source_area": "kalshi-monster",
+      "id": "home-base-20260617-001",
+      "project": "home-base",
+      "source_system": "agent-registry",
+      "source_area": "core",
       "priority": "P0",
-      "risk_level": "medium",
-      "category": "product_registry",
-      "action_type": "product_track",
-      "title": "Kalshi Monster product track",
-      "description": "Canonical registry entry for Kalshi Monster prediction market intelligence app.",
+      "risk_level": "high",
+      "category": "agent_implementation",
+      "action_type": "project_track",
+      "title": "Home-base / Jarvis core track",
+      "description": "Canonical registry entry for the home-base project — the central AI infrastructure platform. Tracks agent implementations, action registry, and cross-project orchestration.",
       "acceptance_criteria": [
-        "Registry record preserves product identity, price, and delivery model",
-        "Future storefront and funnel actions can reference the product slug"
+        "Registry record preserves project identity and architecture",
+        "Action registry tracks agent implementations across all projects",
+        "Cron jobs are registered and monitored"
       ],
       "dependencies": [],
       "status": "open",
       "owner": "shared",
       "approval_required": false,
-      "next_due": "2026-06-17T18:00:00",
-      "created_at": "2026-06-16T13:54:49",
-      "updated_at": "2026-06-16T13:54:49",
-      "surface_name": "Kalshi Monster",
-      "surface_slug": "kalshi-monster",
-      "surface_type": "desktop_app",
-      "price": "$25",
-      "lifecycle_stage": "live",
+      "next_due": "2026-06-20T06:05:00",
+      "created_at": "2026-06-17T03:36:00",
+      "updated_at": "2026-06-17T03:36:00",
+      "surface_name": "Home-base / Jarvis",
+      "surface_slug": "home-base",
+      "surface_type": "ai_platform",
+      "lifecycle_stage": "active_development",
       "evidence": [
         {
           "kind": "repo",
-          "value": "C:/Users/ethan/kalshi-build/kalshi-monster"
+          "value": "C:/Projects/home-base-recovered"
+        }
+      ]
+    },
+    {
+      "id": "cron-failures-20260621-001",
+      "project": "hermes-crons",
+      "source_system": "cron-diagnostics",
+      "source_area": "cron-ops",
+      "priority": "P0",
+      "risk_level": "medium",
+      "category": "ops",
+      "action_type": "cron_fix",
+      "title": "Fix failing Hermes maintenance crons",
+      "description": "Investigate failing Hermes cron jobs for Jarvis, Kalshi Monster, and Snitch LLC; normalize schedules/delivery; harden prompts to avoid destructive or over-broad maintenance; verify affected repos with real build/test commands.",
+      "acceptance_criteria": [
+        "Jarvis cron no longer uses interval schedule that caused scheduler update/API mismatch",
+        "Jarvis cron delivery normalized to #jarvis instead of origin alias",
+        "Kalshi and Snitch prompts avoid dependency installs, audit fixes, desktop-only tools, and broad rewrites",
+        "Kalshi health checks pass: UI build, cargo check, kalshi Rust tests",
+        "Snitch health checks pass: Python compileall, backend self-test, frontend build, Tauri cargo check"
+      ],
+      "dependencies": [],
+      "status": "done",
+      "owner": "shared",
+      "approval_required": false,
+      "next_due": null,
+      "created_at": "2026-06-21T14:33:22",
+      "updated_at": "2026-06-21T14:33:22",
+      "completed_at": "2026-06-21T14:33:22",
+      "surface_name": "Hermes cron scheduler",
+      "surface_slug": "hermes-crons",
+      "surface_type": "automation",
+      "evidence": [
+        {
+          "kind": "file",
+          "value": "C:/Users/ethan/AppData/Local/hermes/cron/jobs.json"
+        },
+        {
+          "kind": "command",
+          "value": "Kalshi: npm run build --prefix src-ui; cargo check --manifest-path src-tauri/Cargo.toml; cargo test --manifest-path src-tauri/Cargo.toml kalshi::"
+        },
+        {
+          "kind": "command",
+          "value": "Snitch: python3 -m compileall -q audit_labels.py scripts; node --check backend/server.js; npm run test:backend; npm --prefix frontend run build; cargo check --manifest-path frontend/src-tauri/Cargo.toml"
+        }
+      ],
+      "result_summary": "Diagnosed failing Hermes crons, fixed Jarvis schedule/delivery, hardened Kalshi/Snitch prompts, and verified Kalshi/Snitch builds/tests are healthy."
+    },
+    {
+      "id": "cron-fix-wsl-paths-20260619-001",
+      "project": "home-base",
+      "source_system": "agent-registry",
+      "source_area": "cron",
+      "priority": "P0",
+      "risk_level": "high",
+      "category": "agent_implementation",
+      "action_type": "fix",
+      "title": "Fix cron job workdirs for WSL-migrated projects",
+      "description": "Jarvis, PrizePicks Monster, and Kalshi Monster cron jobs had stale WSL UNC workdirs. Projects were moved to native Windows paths. Updated all three cron workdirs.",
+      "acceptance_criteria": [
+        "Jarvis cron workdir points to C:/Projects/home-base-recovered",
+        "PrizePicks Monster cron workdir points to C:/Projects/prizepicks-monster",
+        "Kalshi Monster cron workdir points to C:/Users/ethan/kalshi-build/kalshi-monster"
+      ],
+      "dependencies": [],
+      "status": "done",
+      "owner": "shared",
+      "approval_required": false,
+      "created_at": "2026-06-19T10:30:00",
+      "updated_at": "2026-06-19T12:00:00",
+      "completed_at": "2026-06-19T12:00:00",
+      "result_summary": "All three cron workdirs updated from WSL UNC paths to native Windows paths. JonesinSRC, WallSlayer, and Snitch LLC crons were already on native paths.",
+      "evidence": [
+        {
+          "kind": "cron",
+          "value": "Jarvis: 144012158c66 -> C:/Projects/home-base-recovered"
+        },
+        {
+          "kind": "cron",
+          "value": "PrizePicks: 119560f88d7a -> C:/Projects/prizepicks-monster"
+        },
+        {
+          "kind": "cron",
+          "value": "Kalshi: 530395f0b729 -> C:/Users/ethan/kalshi-build/kalshi-monster"
+        }
+      ]
+    },
+    {
+      "id": "home-base-recovery-build-20260621-001",
+      "project": "home-base",
+      "source_system": "agent-registry",
+      "source_area": "recovery",
+      "priority": "P0",
+      "risk_level": "high",
+      "category": "agent_implementation",
+      "action_type": "fix",
+      "title": "Restore Home-base/Jarvis recovered build path",
+      "description": "Recovered Home-base/Jarvis had broken TypeScript bridge syntax, dead WSL-based Tauri UI commands, incomplete SQLite migrations, and lingering recovery stubs. Restored native Windows build commands, filled migration gaps, and confirmed remaining recovery stubs have no current UI callers so Rust, UI, Bun, and Tauri verification all pass.",
+      "acceptance_criteria": [
+        "server-jarvis/src/bridge.ts malformed try/catch structure is fixed",
+        "Bun server typecheck and bundle build pass from server-jarvis",
+        "Tauri beforeDevCommand and beforeBuildCommand use native Windows-compatible paths",
+        "SQLite migrations create session_memory and memory columns required by memory engine",
+        "Remaining recovery stubs are not wired into any current UI caller",
+        "Rust library tests, UI typecheck, Bun tests, cargo check, and cargo tauri build --debug all pass"
+      ],
+      "dependencies": [
+        "home-base-20260617-001"
+      ],
+      "status": "done",
+      "owner": "shared",
+      "approval_required": false,
+      "created_at": "2026-06-21T12:00:00",
+      "updated_at": "2026-06-21T12:00:00",
+      "completed_at": "2026-06-21T12:00:00",
+      "result_summary": "Fixed bridge.ts brace/try-catch structure; replaced dead WSL Tauri commands with native bun commands; fixed SQLite migration gaps; verified cargo test --lib, cargo check, bunx tsc, bun build, bun test, src-ui bunx tsc -b, py_compile, and cargo tauri build --debug.",
+      "evidence": [
+        {
+          "kind": "command",
+          "value": "cd server-jarvis && bunx tsc --noEmit --pretty false -> exit 0"
+        },
+        {
+          "kind": "command",
+          "value": "cd server-jarvis && bun build ./src/index.ts --outdir ./dist --target bun -> Bundled 61 modules"
+        },
+        {
+          "kind": "command",
+          "value": "cd src-ui && bunx tsc -b -> exit 0"
+        },
+        {
+          "kind": "command",
+          "value": "cd server-jarvis && bun test -> 185 pass, 0 fail"
+        },
+        {
+          "kind": "command",
+          "value": "cargo test --lib --manifest-path src-tauri/Cargo.toml -> 6 passed, 0 failed"
+        },
+        {
+          "kind": "command",
+          "value": "cargo tauri build --debug -> Jarvis_3.0.0_x64-setup.exe built"
+        }
+      ]
+    },
+    {
+      "id": "prizepicks-monster-rebuild-20260619-001",
+      "project": "prizepicks-monster",
+      "source_system": "agent-registry",
+      "source_area": "rebuild",
+      "priority": "P0",
+      "risk_level": "high",
+      "category": "agent_implementation",
+      "action_type": "rebuild",
+      "title": "PrizePicks Monster rebuild from Kalshi Monster base",
+      "description": "Rebuild PrizePicks Monster as a new project using Kalshi Monster codebase as the foundation. WSL data loss destroyed the original repo. New repo at C:/Projects/prizepicks-monster.",
+      "acceptance_criteria": [
+        "New repo created at C:/Projects/prizepicks-monster",
+        "All Kalshi-specific code removed or rebranded to PrizePicks",
+        "Player prop fetcher implemented (mock data acceptable for v1)",
+        "Chat context builder rewritten for DFS player props",
+        "Frontend UI rebranded (PrizePicks Monster, prop board, etc.)",
+        "Tauri commands registered for prop data (get_props, search_props, get_scored_props)",
+        "Cron job workdir updated to new repo path",
+        "System prompt rewritten for DFS player prop analysis"
+      ],
+      "dependencies": [
+        "jonesinsrc-prizepicks-monster-20260616-001"
+      ],
+      "status": "done",
+      "owner": "shared",
+      "approval_required": false,
+      "created_at": "2026-06-19T10:30:00",
+      "updated_at": "2026-06-19T19:14:29",
+      "completed_at": "2026-06-19T12:00:00",
+      "result_summary": "PrizePicks Monster rebuilt from Kalshi Monster base. 107 Tauri commands registered (4 new prop commands). Frontend rebranded. Cron workdir updated. Prop fetcher returns mock data — real OpticOdds/Apify integration pending.",
+      "evidence": [
+        {
+          "kind": "repo",
+          "value": "C:/Projects/prizepicks-monster"
+        },
+        {
+          "kind": "cron",
+          "value": "Cron 119560f88d7a workdir updated to C:/Projects/prizepicks-monster"
+        }
+      ]
+    },
+    {
+      "id": "prizepicks-props-real-data",
+      "project": "prizepicks-monster",
+      "track_key": "prizepicks-monster:prop-fetcher",
+      "source_system": "adapter",
+      "source_area": "prizepicks-monster",
+      "action_kind": "signal",
+      "priority": "P0",
+      "risk_level": "high",
+      "category": "data_integration",
+      "action_type": "integration_task",
+      "title": "Wire real prop data sources into PrizePicks fetcher",
+      "description": "The player prop fetcher still returns mock/empty data. Integrate OpticOdds, Apify, or Direct API sources for live prop lines.",
+      "acceptance_criteria": [
+        "Prop fetcher returns real player prop data from at least one source",
+        "Multi-source failover works (OpticOdds → Apify → Direct → Mock)"
+      ],
+      "dependencies": [],
+      "status": "open",
+      "owner": "shared",
+      "approval_required": false,
+      "created_at": "2026-06-21T14:38:34",
+      "updated_at": "2026-06-21T14:39:45",
+      "evidence": [
+        {
+          "kind": "source",
+          "value": "C:\\Projects\\prizepicks-monster\\src-tauri\\src\\prizepicks\\prop_fetcher.rs"
+        },
+        {
+          "kind": "context",
+          "value": "Fetcher returns mock data"
+        }
+      ],
+      "confidence": 0.95,
+      "confidence_reason": "Source file contains mock return paths",
+      "created_run": 3,
+      "last_seen_run": 4,
+      "priority_promoted_run": 3
+    },
+    {
+      "id": "snitch-llc-20260617-001",
+      "project": "snitch-llc",
+      "source_system": "agent-registry",
+      "source_area": "core",
+      "priority": "P1",
+      "risk_level": "medium",
+      "category": "agent_implementation",
+      "action_type": "project_track",
+      "title": "Snitch LLC track",
+      "description": "Canonical registry entry for Snitch LLC data pipeline project.",
+      "acceptance_criteria": [
+        "Registry record preserves project identity and pipeline status",
+        "Daily cron integrity pass is registered"
+      ],
+      "dependencies": [],
+      "status": "open",
+      "owner": "shared",
+      "approval_required": false,
+      "next_due": "2026-06-19T12:05:00",
+      "created_at": "2026-06-17T03:36:00",
+      "updated_at": "2026-06-17T03:36:00",
+      "surface_name": "Snitch LLC",
+      "surface_slug": "snitch-llc",
+      "surface_type": "data_pipeline",
+      "lifecycle_stage": "active",
+      "evidence": [
+        {
+          "kind": "repo",
+          "value": "C:/Projects/snitch-llc"
+        }
+      ]
+    },
+    {
+      "id": "home-base-eval-harness-20260621",
+      "project": "home-base",
+      "source_system": "jarvis-adapter",
+      "source_area": "jarvis",
+      "priority": "P1",
+      "risk_level": "high",
+      "category": "project_registry",
+      "action_type": "project_track",
+      "title": "Jarvis platform follow-through",
+      "description": "AGENTS.md lists active platform priorities: build provenance, eval harness, bridge reliability, profile provisioning UI, frontier scaffolding, and OpenClaw bridge.",
+      "acceptance_criteria": [
+        "At least one identified platform item has a tracked action with evidence",
+        "Bridge and runtime reliability checks are represented in the registry"
+      ],
+      "dependencies": [],
+      "status": "open",
+      "owner": "shared",
+      "approval_required": false,
+      "created_at": "2026-06-21T14:38:34",
+      "updated_at": "2026-06-21T14:39:45",
+      "evidence": [
+        {
+          "kind": "missing",
+          "value": "C:\\Projects\\home-base-recovered\\inference_metrics.csv"
+        },
+        {
+          "kind": "repo",
+          "value": "C:\\Projects\\home-base-recovered"
+        },
+        {
+          "kind": "doc",
+          "value": "C:\\Projects\\home-base-recovered\\AGENTS.md"
+        }
+      ],
+      "track_key": "home-base:jarvis",
+      "action_kind": "task",
+      "created_run": 3,
+      "last_seen_run": 4
+    },
+    {
+      "id": "home-base-mcp-adapter-notifications-20260621-001",
+      "project": "home-base",
+      "source_system": "agent-registry",
+      "source_area": "server-jarvis",
+      "priority": "P1",
+      "risk_level": "low",
+      "category": "agent_implementation",
+      "action_type": "fix",
+      "title": "Make Jarvis MCP adapter ignore JSON-RPC notifications",
+      "description": "Jarvis's MCP adapter accepted request objects with optional ids but still returned invalid error responses for JSON-RPC notifications that intentionally omit an id. Added notification detection so methods like notifications/initialized are ignored without a response, while requests still return valid JSON-RPC responses.",
+      "acceptance_criteria": [
+        "MCP adapter returns undefined for JSON-RPC notifications without an id",
+        "MCP request/error responses keep valid ids",
+        "server-jarvis typecheck, bundle build, and tests pass"
+      ],
+      "dependencies": [
+        "home-base-recovery-build-20260621-001"
+      ],
+      "status": "done",
+      "owner": "shared",
+      "approval_required": false,
+      "created_at": "2026-06-21T16:26:50",
+      "updated_at": "2026-06-21T16:26:50",
+      "completed_at": "2026-06-21T16:26:50",
+      "result_summary": "Added MCP adapter notification handling and regression coverage for notifications/initialized. Verified bun run typecheck, bun run build, bun test, and bun run start health checks.",
+      "evidence": [
+        {
+          "kind": "command",
+          "value": "cd server-jarvis && bun test src/mcp-adapter.test.ts -> 4 pass, 0 fail"
+        },
+        {
+          "kind": "command",
+          "value": "cd server-jarvis && bun run typecheck -> exit 0"
+        },
+        {
+          "kind": "command",
+          "value": "cd server-jarvis && bun run build -> Bundled 61 modules"
+        },
+        {
+          "kind": "command",
+          "value": "cd server-jarvis && bun test -> 186 pass, 0 fail"
+        },
+        {
+          "kind": "command",
+          "value": "curl http://localhost:19877/health -> ok:true"
         }
       ]
     },
@@ -204,30 +635,90 @@
       "lifecycle_stage": "live"
     },
     {
-      "id": "jonesinsrc-subscription-audit-20260616-001",
-      "project": "jonesinsrc",
-      "source_system": "product-registry",
-      "source_area": "subscription-audit",
-      "priority": "P2",
-      "risk_level": "low",
-      "category": "product_registry",
-      "action_type": "product_track",
-      "title": "Subscription Audit product track",
-      "description": "Canonical registry entry for Subscription Audit service.",
+      "id": "prizepicks-monster-track",
+      "project": "prizepicks-monster",
+      "track_key": "prizepicks-monster:core",
+      "source_system": "adapter",
+      "source_area": "prizepicks-monster",
+      "action_kind": "track",
+      "priority": "P1",
+      "risk_level": "medium",
+      "category": "project_registry",
+      "action_type": "project_track",
+      "title": "PrizePicks Monster DFS app track",
+      "description": "PrizePicks Monster is a Tauri 2 + Rust desktop app for AI-driven DFS player prop analysis. It provides prop board, edge analysis, AI chat, prediction tracking, and paper trading.",
       "acceptance_criteria": [
-        "Registry record preserves service identity and pricing model"
+        "Repo exists with valid Tauri project structure",
+        "Rust backend compiles (cargo check passes)",
+        "Frontend builds (npm run build succeeds)",
+        "Player prop fetcher returns real data (not mock)"
       ],
       "dependencies": [],
       "status": "open",
       "owner": "shared",
       "approval_required": false,
-      "created_at": "2026-06-16T13:54:49",
-      "updated_at": "2026-06-16T13:54:49",
-      "surface_name": "Subscription Audit",
-      "surface_slug": "subscription-audit",
-      "surface_type": "service",
-      "price": "$5/run",
-      "lifecycle_stage": "live"
+      "created_at": "2026-06-21T14:38:34",
+      "updated_at": "2026-06-21T14:39:45",
+      "evidence": [
+        {
+          "kind": "repo",
+          "value": "C:\\Projects\\prizepicks-monster"
+        },
+        {
+          "kind": "source",
+          "value": "C:\\Projects\\prizepicks-monster\\src-tauri\\src\\lib.rs"
+        },
+        {
+          "kind": "frontend",
+          "value": "C:\\Projects\\prizepicks-monster\\src-ui\\src\\App.tsx"
+        }
+      ],
+      "confidence": 0.9,
+      "confidence_reason": "Cargo.toml found",
+      "created_run": 3,
+      "last_seen_run": 4
+    },
+    {
+      "id": "snitch-llc-20260616-001",
+      "project": "snitch-llc",
+      "track_key": "snitch-llc:snitch-llc",
+      "source_system": "pipeline-adapter",
+      "source_area": "snitch-llc",
+      "action_kind": "track",
+      "priority": "P1",
+      "risk_level": "medium",
+      "category": "data_pipeline",
+      "action_type": "pipeline_review",
+      "title": "Snitch LLC application track",
+      "description": "Validate pool-detection outputs, address matching, and assessor-report generation.",
+      "acceptance_criteria": [
+        "Pipeline outputs are enumerated with counts and freshness",
+        "Address matching spot-check passes on a sample set"
+      ],
+      "dependencies": [],
+      "status": "open",
+      "owner": "shared",
+      "approval_required": false,
+      "created_at": "2026-06-21T14:38:34",
+      "updated_at": "2026-06-21T14:39:45",
+      "evidence": [
+        {
+          "kind": "repo",
+          "value": "C:/Projects/snitch-llc"
+        },
+        {
+          "kind": "parcels",
+          "value": "66"
+        },
+        {
+          "kind": "outputs",
+          "value": "6520"
+        }
+      ],
+      "confidence": 0.8,
+      "confidence_reason": "Pipeline directories enumerated",
+      "created_run": 3,
+      "last_seen_run": 4
     },
     {
       "id": "jonesinsrc-business-automation-20260616-001",
@@ -256,150 +747,398 @@
       "lifecycle_stage": "live"
     },
     {
-      "id": "home-base-20260617-001",
-      "project": "home-base",
-      "source_system": "agent-registry",
-      "source_area": "core",
-      "priority": "P0",
-      "risk_level": "high",
-      "category": "agent_implementation",
-      "action_type": "project_track",
-      "title": "Home-base / Jarvis core track",
-      "description": "Canonical registry entry for the home-base project \u2014 the central AI infrastructure platform. Tracks agent implementations, action registry, and cross-project orchestration.",
+      "id": "jonesinsrc-subscription-audit-20260616-001",
+      "project": "jonesinsrc",
+      "source_system": "product-registry",
+      "source_area": "subscription-audit",
+      "priority": "P2",
+      "risk_level": "low",
+      "category": "product_registry",
+      "action_type": "product_track",
+      "title": "Subscription Audit product track",
+      "description": "Canonical registry entry for Subscription Audit service.",
       "acceptance_criteria": [
-        "Registry record preserves project identity and architecture",
-        "Action registry tracks agent implementations across all projects",
-        "Cron jobs are registered and monitored"
+        "Registry record preserves service identity and pricing model"
       ],
       "dependencies": [],
       "status": "open",
       "owner": "shared",
       "approval_required": false,
-      "next_due": "2026-06-20T06:05:00",
-      "created_at": "2026-06-17T03:36:00",
-      "updated_at": "2026-06-17T03:36:00",
-      "surface_name": "Home-base / Jarvis",
-      "surface_slug": "home-base",
-      "surface_type": "ai_platform",
-      "lifecycle_stage": "active_development",
+      "created_at": "2026-06-16T13:54:49",
+      "updated_at": "2026-06-16T13:54:49",
+      "surface_name": "Subscription Audit",
+      "surface_slug": "subscription-audit",
+      "surface_type": "service",
+      "price": "$5/run",
+      "lifecycle_stage": "live"
+    },
+    {
+      "id": "jarvis-eng-theme-toggle-20260621-001",
+      "project": "jarvis",
+      "source_system": "engineering-roadmap",
+      "source_area": "src-ui/theme",
+      "priority": "P1",
+      "risk_level": "low",
+      "category": "frontend",
+      "action_type": "feature",
+      "title": "Wire a light/dark theme toggle",
+      "description": "index.css ships a complete [data-theme=light] palette but nothing sets data-theme, so the finished light mode is unreachable. Add a toggle that flips documentElement[data-theme] and persists via set_setting/get_setting.",
+      "acceptance_criteria": [
+        "Toggle control in the UI flips between dark and light",
+        "Choice persists across restarts via the settings commands",
+        "Both palettes render correctly (verified in build)"
+      ],
+      "dependencies": [],
+      "status": "done",
+      "owner": "shared",
+      "approval_required": false,
+      "next_due": "2026-06-24T18:00:00",
+      "created_at": "2026-06-21T16:45:00",
+      "updated_at": "2026-06-21T17:05:00",
+      "action_kind": "task",
+      "confidence": 0.9,
+      "confidence_reason": "Planned from verified codebase audit (2026-06-21)",
       "evidence": [
         {
-          "kind": "repo",
-          "value": "C:/Projects/home-base-recovered"
+          "kind": "file",
+          "value": "src-ui/src/index.css:259"
+        },
+        {
+          "kind": "context",
+          "value": "grep confirms zero code sets data-theme; light palette is dead until a toggle is wired."
+        }
+      ],
+      "completed_at": "2026-06-21T17:05:00"
+    },
+    {
+      "id": "jarvis-eng-command-palette-20260621-001",
+      "project": "jarvis",
+      "source_system": "engineering-roadmap",
+      "source_area": "src-ui/navigation",
+      "priority": "P2",
+      "risk_level": "low",
+      "category": "frontend",
+      "action_type": "feature",
+      "title": "Add a Cmd+K command palette",
+      "description": "The sidebar now has ~19 nav items across 4 sections with no keyboard navigation. Add a Cmd/Ctrl+K palette that fuzzy-searches views (and later actions) and navigates on select.",
+      "acceptance_criteria": [
+        "Cmd/Ctrl+K opens a searchable palette",
+        "Selecting a result navigates via the existing onNavigate(ViewId)",
+        "Esc closes; arrow keys move selection"
+      ],
+      "dependencies": [],
+      "status": "open",
+      "owner": "shared",
+      "approval_required": false,
+      "next_due": "2026-06-28T18:00:00",
+      "created_at": "2026-06-21T16:45:00",
+      "updated_at": "2026-06-21T16:45:00",
+      "action_kind": "task",
+      "confidence": 0.9,
+      "confidence_reason": "Planned from verified codebase audit (2026-06-21)",
+      "evidence": [
+        {
+          "kind": "file",
+          "value": "src-ui/src/App.tsx:43"
+        },
+        {
+          "kind": "context",
+          "value": "NAV_SECTIONS holds all ViewId targets; palette can map over them."
         }
       ]
     },
     {
-      "id": "snitch-llc-20260617-001",
-      "project": "snitch-llc",
-      "source_system": "agent-registry",
-      "source_area": "core",
+      "id": "jarvis-eng-ci-pipeline-20260621-001",
+      "project": "jarvis",
+      "source_system": "engineering-roadmap",
+      "source_area": "ci",
+      "priority": "P0",
+      "risk_level": "low",
+      "category": "infrastructure",
+      "action_type": "feature",
+      "title": "Add a CI pipeline with a theme-husk guard",
+      "description": "No .github/workflows exists. The session began with a green build hiding a dead theme and 14 dead views. Add CI running cargo check + tsc + vite build + bun test on push/PR, plus a guard asserting custom color tokens appear in the generated CSS.",
+      "acceptance_criteria": [
+        "Workflow runs cargo check, bunx tsc -b, vite build, and bun test",
+        "A step greps dist CSS for --color-bone/.text-bone and fails if absent",
+        "CI is green on the current branch"
+      ],
+      "dependencies": [],
+      "status": "done",
+      "owner": "shared",
+      "approval_required": false,
+      "next_due": "2026-06-25T18:00:00",
+      "created_at": "2026-06-21T16:45:00",
+      "updated_at": "2026-06-21T17:05:00",
+      "action_kind": "task",
+      "confidence": 0.9,
+      "confidence_reason": "Planned from verified codebase audit (2026-06-21)",
+      "evidence": [
+        {
+          "kind": "context",
+          "value": "ls .github/workflows -> none. Theme-husk bug (fix 58d9c19) would have been caught by a CSS-generation assertion."
+        }
+      ],
+      "completed_at": "2026-06-21T17:05:00"
+    },
+    {
+      "id": "jarvis-eng-dry-resource-list-20260621-001",
+      "project": "jarvis",
+      "source_system": "engineering-roadmap",
+      "source_area": "src-ui/hooks",
+      "priority": "P2",
+      "risk_level": "low",
+      "category": "frontend",
+      "action_type": "refactor",
+      "title": "Extract a useResourceList hook to DRY CRUD views",
+      "description": "The 9 list views added this session (Skills, Agents, Channels, Devices, Nodes, Hooks, Commitments, Approvals, Plugins) repeat the same fetch/loading/error/optimistic-toggle block. Extract a useResourceList<T> hook and refactor the views onto it.",
+      "acceptance_criteria": [
+        "useResourceList encapsulates fetch + loading + error + refetch",
+        "At least the 9 new views consume it with no behavior change",
+        "tsc + vite build stay green"
+      ],
+      "dependencies": [],
+      "status": "open",
+      "owner": "shared",
+      "approval_required": false,
+      "next_due": "2026-06-30T18:00:00",
+      "created_at": "2026-06-21T16:45:00",
+      "updated_at": "2026-06-21T16:45:00",
+      "action_kind": "task",
+      "confidence": 0.9,
+      "confidence_reason": "Planned from verified codebase audit (2026-06-21)",
+      "evidence": [
+        {
+          "kind": "file",
+          "value": "src-ui/src/components/jarvis/DevicesView.tsx"
+        },
+        {
+          "kind": "context",
+          "value": "Boilerplate duplicated across all list views authored this session."
+        }
+      ]
+    },
+    {
+      "id": "jarvis-eng-confirm-modal-20260621-001",
+      "project": "jarvis",
+      "source_system": "engineering-roadmap",
+      "source_area": "src-ui/ui",
+      "priority": "P2",
+      "risk_level": "low",
+      "category": "frontend",
+      "action_type": "feature",
+      "title": "Replace window.confirm with a styled confirm modal",
+      "description": "Delete/remove flows in the new views use native window.confirm (blocking, off-brand). Build a reusable ConfirmModal (reuse the ToolApprovalModal pattern) and route destructive actions through it.",
+      "acceptance_criteria": [
+        "A reusable confirm modal exists in components/ui",
+        "All window.confirm calls in jarvis views use it",
+        "Confirm/cancel paths verified"
+      ],
+      "dependencies": [],
+      "status": "open",
+      "owner": "shared",
+      "approval_required": false,
+      "next_due": "2026-06-30T18:00:00",
+      "created_at": "2026-06-21T16:45:00",
+      "updated_at": "2026-06-21T16:45:00",
+      "action_kind": "task",
+      "confidence": 0.9,
+      "confidence_reason": "Planned from verified codebase audit (2026-06-21)",
+      "evidence": [
+        {
+          "kind": "file",
+          "value": "src-ui/src/components/jarvis/ToolApprovalModal.tsx"
+        },
+        {
+          "kind": "context",
+          "value": "window.confirm used in Agents/Channels/Devices/Nodes/Hooks/ControlCenter views."
+        }
+      ]
+    },
+    {
+      "id": "jarvis-eng-a11y-pass-20260621-001",
+      "project": "jarvis",
+      "source_system": "engineering-roadmap",
+      "source_area": "src-ui/accessibility",
+      "priority": "P2",
+      "risk_level": "medium",
+      "category": "frontend",
+      "action_type": "quality",
+      "title": "Accessibility and keyboard pass on tabbed/modal views",
+      "description": "New tabbed (Skills, ControlCenter) and modal surfaces lack focus trapping, aria-selected on tabs, and Esc-to-close. Add roving focus, aria roles, and keyboard handling.",
+      "acceptance_criteria": [
+        "Tabs expose role=tab/aria-selected and are arrow-navigable",
+        "Modals trap focus and close on Esc",
+        "No keyboard traps; visible focus rings"
+      ],
+      "dependencies": [],
+      "status": "open",
+      "owner": "shared",
+      "approval_required": false,
+      "next_due": "2026-07-07T18:00:00",
+      "created_at": "2026-06-21T16:45:00",
+      "updated_at": "2026-06-21T16:45:00",
+      "action_kind": "task",
+      "confidence": 0.9,
+      "confidence_reason": "Planned from verified codebase audit (2026-06-21)",
+      "evidence": [
+        {
+          "kind": "file",
+          "value": "src-ui/src/components/jarvis/SkillsView.tsx"
+        },
+        {
+          "kind": "context",
+          "value": "Custom tab/modal markup added this session without aria or focus management."
+        }
+      ]
+    },
+    {
+      "id": "jarvis-eng-eval-harness-20260621-001",
+      "project": "jarvis",
+      "source_system": "engineering-roadmap",
+      "source_area": "eval",
       "priority": "P1",
       "risk_level": "medium",
-      "category": "agent_implementation",
-      "action_type": "project_track",
-      "title": "Snitch LLC track",
-      "description": "Canonical registry entry for Snitch LLC data pipeline project.",
+      "category": "platform",
+      "action_type": "feature",
+      "title": "Build an eval / regression harness",
+      "description": "AGENTS.md names an eval/regression harness as a current priority; none exists. Define a harness that exercises the inference path and tool runtime against fixed prompts and asserts on structured outputs, runnable in CI.",
       "acceptance_criteria": [
-        "Registry record preserves project identity and pipeline status",
-        "Daily cron integrity pass is registered"
+        "Harness runs a fixed suite against the tool runtime / inference path",
+        "Pass/fail is deterministic and CI-runnable",
+        "Baseline captured for regression comparison"
+      ],
+      "dependencies": [
+        "jarvis-eng-ci-pipeline-20260621-001"
+      ],
+      "status": "done",
+      "owner": "shared",
+      "approval_required": false,
+      "next_due": "2026-07-12T18:00:00",
+      "created_at": "2026-06-21T16:45:00",
+      "updated_at": "2026-06-21T20:10:00",
+      "action_kind": "task",
+      "confidence": 0.9,
+      "confidence_reason": "Planned from verified codebase audit (2026-06-21)",
+      "evidence": [
+        {
+          "kind": "file",
+          "value": "AGENTS.md:27"
+        },
+        {
+          "kind": "context",
+          "value": "server-jarvis has 191 unit tests but no end-to-end eval/regression harness."
+        }
+      ],
+      "completed_at": "2026-06-21T20:10:00"
+    },
+    {
+      "id": "jarvis-eng-build-provenance-20260621-001",
+      "project": "jarvis",
+      "source_system": "engineering-roadmap",
+      "source_area": "build",
+      "priority": "P1",
+      "risk_level": "medium",
+      "category": "infrastructure",
+      "action_type": "feature",
+      "title": "Add build provenance and stale-binary prevention",
+      "description": "AGENTS.md names build provenance / stale-binary prevention as a priority. Stamp builds with commit + timestamp, surface it in-app (e.g. HealthBanner/Gateway), and warn when the running binary lags the source tree.",
+      "acceptance_criteria": [
+        "Build embeds git SHA + build time",
+        "Version/provenance is visible in the UI",
+        "A check flags a stale binary vs current source"
       ],
       "dependencies": [],
       "status": "open",
       "owner": "shared",
       "approval_required": false,
-      "next_due": "2026-06-19T12:05:00",
-      "created_at": "2026-06-17T03:36:00",
-      "updated_at": "2026-06-17T03:36:00",
-      "surface_name": "Snitch LLC",
-      "surface_slug": "snitch-llc",
-      "surface_type": "data_pipeline",
-      "lifecycle_stage": "active",
+      "next_due": "2026-07-12T18:00:00",
+      "created_at": "2026-06-21T16:45:00",
+      "updated_at": "2026-06-21T16:45:00",
+      "action_kind": "task",
+      "confidence": 0.9,
+      "confidence_reason": "Planned from verified codebase audit (2026-06-21)",
       "evidence": [
         {
-          "kind": "repo",
-          "value": "C:/Projects/snitch-llc"
+          "kind": "file",
+          "value": "AGENTS.md:25"
+        },
+        {
+          "kind": "context",
+          "value": "APP_VERSION is a hardcoded '3.0.0' string in App.tsx with no git provenance."
         }
       ]
     },
     {
-      "id": "prizepicks-monster-rebuild-20260619-001",
-      "project": "prizepicks-monster",
-      "source_system": "agent-registry",
-      "source_area": "rebuild",
-      "priority": "P0",
-      "risk_level": "high",
-      "category": "agent_implementation",
-      "action_type": "rebuild",
-      "title": "PrizePicks Monster rebuild from Kalshi Monster base",
-      "description": "Rebuild PrizePicks Monster as a new project using Kalshi Monster codebase as the foundation. WSL data loss destroyed the original repo. New repo at C:/Projects/prizepicks-monster.",
+      "id": "jarvis-eng-test-coverage-20260621-001",
+      "project": "jarvis",
+      "source_system": "engineering-roadmap",
+      "source_area": "testing",
+      "priority": "P1",
+      "risk_level": "medium",
+      "category": "quality",
+      "action_type": "feature",
+      "title": "Close the Rust and UI test-coverage gap",
+      "description": "Only 3 Rust files have #[cfg(test)] and the UI has zero tests. Add Rust unit/integration tests for the native command surface (sessions, memory tiers, agents) and set up a UI test runner (vitest) with tests for the new views and useResourceList.",
       "acceptance_criteria": [
-        "New repo created at C:/Projects/prizepicks-monster",
-        "All Kalshi-specific code removed or rebranded to PrizePicks",
-        "Player prop fetcher implemented (mock data acceptable for v1)",
-        "Chat context builder rewritten for DFS player props",
-        "Frontend UI rebranded (PrizePicks Monster, prop board, etc.)",
-        "Tauri commands registered for prop data (get_props, search_props, get_scored_props)",
-        "Cron job workdir updated to new repo path",
-        "System prompt rewritten for DFS player prop analysis"
+        "Rust tests cover sessions, memory tier, and agent CRUD commands",
+        "A UI test runner is configured with passing component tests",
+        "Both suites run in CI"
       ],
       "dependencies": [
-        "jonesinsrc-prizepicks-monster-20260616-001"
+        "jarvis-eng-ci-pipeline-20260621-001"
       ],
       "status": "done",
       "owner": "shared",
       "approval_required": false,
-      "created_at": "2026-06-19T10:30:00",
-      "updated_at": "2026-06-19T19:14:29",
-      "completed_at": "2026-06-19T12:00:00",
-      "result_summary": "PrizePicks Monster rebuilt from Kalshi Monster base. 107 Tauri commands registered (4 new prop commands). Frontend rebranded. Cron workdir updated. Prop fetcher returns mock data \u2014 real OpticOdds/Apify integration pending.",
+      "next_due": "2026-07-12T18:00:00",
+      "created_at": "2026-06-21T16:45:00",
+      "updated_at": "2026-06-21T20:10:00",
+      "action_kind": "task",
+      "confidence": 0.9,
+      "confidence_reason": "Planned from verified codebase audit (2026-06-21)",
       "evidence": [
         {
-          "kind": "repo",
-          "value": "C:/Projects/prizepicks-monster"
-        },
-        {
-          "kind": "cron",
-          "value": "Cron 119560f88d7a workdir updated to C:/Projects/prizepicks-monster"
+          "kind": "context",
+          "value": "grep: 3 Rust test files, 0 UI test files, 30 server test files."
         }
-      ]
+      ],
+      "completed_at": "2026-06-21T20:10:00"
     },
     {
-      "id": "cron-fix-wsl-paths-20260619-001",
-      "project": "home-base",
-      "source_system": "agent-registry",
-      "source_area": "cron",
-      "priority": "P0",
-      "risk_level": "high",
-      "category": "agent_implementation",
+      "id": "jarvis-eng-contract-mismatches-20260621-001",
+      "project": "jarvis",
+      "source_system": "engineering-roadmap",
+      "source_area": "src-tauri/contracts",
+      "priority": "P1",
+      "risk_level": "medium",
+      "category": "platform",
       "action_type": "fix",
-      "title": "Fix cron job workdirs for WSL-migrated projects",
-      "description": "Jarvis, PrizePicks Monster, and Kalshi Monster cron jobs had stale WSL UNC workdirs. Projects were moved to native Windows paths. Updated all three cron workdirs.",
+      "title": "Reconcile the remaining recovery contract mismatches",
+      "description": "jarvis_save_companion still errors because the Bun POST /companion is an interaction action, not a state save; and cold-memory Google Drive archival in engine.rs is a placeholder. Reconcile the companion save contract and implement (or formally defer) Drive archival.",
       "acceptance_criteria": [
-        "Jarvis cron workdir points to C:/Projects/home-base-recovered",
-        "PrizePicks Monster cron workdir points to C:/Projects/prizepicks-monster",
-        "Kalshi Monster cron workdir points to C:/Users/ethan/kalshi-build/kalshi-monster"
+        "jarvis_save_companion persists companion state through a defined contract",
+        "Cold-memory archival path is implemented or explicitly stubbed with a tracked decision",
+        "No silent 'not wired' errors on user-reachable paths"
       ],
       "dependencies": [],
-      "status": "done",
+      "status": "open",
       "owner": "shared",
       "approval_required": false,
-      "created_at": "2026-06-19T10:30:00",
-      "updated_at": "2026-06-19T12:00:00",
-      "completed_at": "2026-06-19T12:00:00",
-      "result_summary": "All three cron workdirs updated from WSL UNC paths to native Windows paths. JonesinSRC, WallSlayer, and Snitch LLC crons were already on native paths.",
+      "next_due": "2026-07-07T18:00:00",
+      "created_at": "2026-06-21T16:45:00",
+      "updated_at": "2026-06-21T16:45:00",
+      "action_kind": "task",
+      "confidence": 0.9,
+      "confidence_reason": "Planned from verified codebase audit (2026-06-21)",
       "evidence": [
         {
-          "kind": "cron",
-          "value": "Jarvis: 144012158c66 -> C:/Projects/home-base-recovered"
+          "kind": "file",
+          "value": "src-tauri/src/commands/recovery_stubs.rs:161"
         },
         {
-          "kind": "cron",
-          "value": "PrizePicks: 119560f88d7a -> C:/Projects/prizepicks-monster"
-        },
-        {
-          "kind": "cron",
-          "value": "Kalshi: 530395f0b729 -> C:/Users/ethan/kalshi-build/kalshi-monster"
+          "kind": "file",
+          "value": "src-tauri/src/jarvis/memory/engine.rs:2270"
         }
       ]
     }
