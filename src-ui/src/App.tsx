@@ -45,6 +45,7 @@ import CommitmentsView from './components/jarvis/CommitmentsView';
 import ApprovalsView from './components/jarvis/ApprovalsView';
 import PluginsView from './components/jarvis/PluginsView';
 import GatewayView from './components/jarvis/GatewayView';
+import HermesChat from './components/jarvis/HermesChat';
 import BuildBadge from './components/jarvis/BuildBadge';
 
 const NAV_SECTIONS: NavSection[] = [
@@ -75,6 +76,7 @@ const NAV_SECTIONS: NavSection[] = [
       { id: 'nodes', label: 'Nodes', icon: 'N' },
       { id: 'plugins', label: 'Plugins', icon: 'X' },
       { id: 'gateway', label: 'Gateway', icon: 'W' },
+      { id: 'hermes', label: 'Hermes Bridge', icon: 'B' },
     ],
   },
   {
@@ -676,6 +678,7 @@ function AppInner() {
       case 'approvals': return <ErrorBoundary><ApprovalsView /></ErrorBoundary>;
       case 'plugins': return <ErrorBoundary><PluginsView /></ErrorBoundary>;
       case 'gateway': return <ErrorBoundary><GatewayView /></ErrorBoundary>;
+      case 'hermes': return <ErrorBoundary><HermesChat /></ErrorBoundary>;
       default: return <OverviewView />;
     }
   };

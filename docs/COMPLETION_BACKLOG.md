@@ -48,6 +48,15 @@ checking off.
 
 ## Done
 
+- [x] **Harden the external-agent (Hermes/OpenClaw) bridge.** (Phase 1.6, 2026-06-22)
+  External-agent bridging is a priority feature but **must not** be the primary chat
+  runtime — confirmed: native chat (`run_jarvis_message` → Bun) is the default; the
+  Hermes bridge is opt-in (spawned on demand via `hermes_spawn`, not at boot). Locked
+  the JSON-RPC wire contract with 6 protocol unit tests (request envelope, response
+  ok/error, event extraction, rejection of non-response/event). Made the feature
+  reachable: `HermesChat` was an orphaned component — wired it to a dedicated "Hermes
+  Bridge" nav entry (new `'hermes'` ViewId + renderView case). *Verified:*
+  `cargo test --lib` 39 pass; `bunx tsc -b` green.
 - [x] **Process supervisor for the 3 boot children.** (Phase 1.3, 2026-06-22)
   New `src-tauri/src/supervisor.rs` runs a 20s watchdog that relaunches Ollama
   (only when it's the active backend), the claude_cli_proxy (:19878), and the
