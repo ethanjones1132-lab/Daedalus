@@ -3,6 +3,7 @@ pub mod cron_scheduler;
 pub mod db;
 pub mod jarvis;
 pub mod parsers;
+pub mod supervisor;
 pub mod types;
 pub mod wsl;
 
@@ -697,6 +698,10 @@ pub fn run() {
                 if let Err(e) = crate::ensure_jarvis_server_started().await {
                     eprintln!("[Jarvis] Bun server startup failed at boot: {}", e);
                 }
+
+                // Keep the three boot children alive (Ollama/proxy/Bun): detect a
+                // dead required service and relaunch it, with bounded restarts.
+                crate::supervisor::spawn_supervisor(handle.clone());
 
                 // Start cron scheduler.
                 crate::cron_scheduler::start_cron_scheduler(handle).await;

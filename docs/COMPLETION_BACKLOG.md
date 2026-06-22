@@ -48,6 +48,14 @@ checking off.
 
 ## Done
 
+- [x] **Process supervisor for the 3 boot children.** (Phase 1.3, 2026-06-22)
+  New `src-tauri/src/supervisor.rs` runs a 20s watchdog that relaunches Ollama
+  (only when it's the active backend), the claude_cli_proxy (:19878), and the
+  Bun server (:19877) when a required service is down — reusing the existing
+  idempotent spawn helpers. Restarts are bounded (`MAX_CONSECUTIVE_RESTARTS=5`,
+  reset on recovery) so a broken dependency can't cause a respawn loop; emits a
+  `jarvis://supervisor` heartbeat. Applies the Hermes-gateway watchdog lesson.
+  *Verified:* `cargo test --lib` 33 pass (incl. backoff-bound test); warning-free.
 - [x] **Build provenance + stale-binary guard.** (Phase 1.4, 2026-06-22) `build.rs`
   embeds git SHA / dirty flag / build time; the `get_build_info` command computes
   staleness against the source tree; `BuildBadge.tsx` shows `v<x> · <sha>` everywhere
