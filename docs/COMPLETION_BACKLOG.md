@@ -12,9 +12,13 @@ checking off.
 
 ## Backlog
 
-- [ ] **E — Recover remaining stub views** (SelfImprovementView, PrizePicksPanel remain):
-  SelfImprovementView and PrizePicksPanel are still no-op "not recovered yet" placeholders.
-  SystemHealthView, SettingsView, and ModelProfilesView were recovered this session.
+- [x] **E — Retire remaining stub views** (Phase 1.7, 2026-06-22). SelfImprovementView and
+  PrizePicksPanel were no-op placeholders, **orphaned** (not imported/routed in App.tsx —
+  no UI-reachable dead path). Both deleted, and the dangling `'self-improvement'`/
+  `'prizepicks'` members trimmed from `JarvisSubView`. Decision: PrizePicks is owned by the
+  separate `prizepicks-monster` app (not home-base); **SelfImprovement is deferred to the
+  Phase-3 intelligence layer** (MASTER_PLAN §5.2) where it will be built for real rather than
+  stubbed. *Verified:* `bunx tsc -b` green; no remaining references.
 - [x] **Unify the two config stores.** (Phase 1.1, 2026-06-22) SQLite `settings` is now
   the single source of truth; the file store (`~/.openclaw/jarvis/config.json`) is a
   one-way, deep-merged projection the Bun server reads. One canonical write path

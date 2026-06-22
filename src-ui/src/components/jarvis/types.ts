@@ -242,9 +242,7 @@ export type JarvisSubView =
   | 'tools'
   | 'companion'
   | 'control'
-  | 'memory'
-  | 'self-improvement'
-  | 'prizepicks';
+  | 'memory';
 
 // Popular OpenRouter models for the dropdown
 // NOTE: No Anthropic cloud models — all inference must be local or non-Anthropic
