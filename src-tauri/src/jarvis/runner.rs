@@ -130,6 +130,20 @@ pub fn run_jarvis_message(
                     terminated = true;
                     break;
                 }
+                SseFrameOutcome::ApprovalRequest { call_id, name, arguments } => {
+                    // Relay to the UI so ToolApprovalModal can surface it. The UI
+                    // sends the decision back via `jarvis_tool_decision` (Tauri command)
+                    // which POSTs to /tool/decision on the Bun server.
+                    let _ = app.emit(
+                        "jarvis://approval_request",
+                        serde_json::json!({
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": arguments,
+                            "session_id": sid,
+                        }),
+                    );
+                }
             }
         }
 
@@ -169,6 +183,14 @@ pub enum SseFrameOutcome {
     },
     /// `[DONE]` sentinel — terminal.
     Done,
+    /// Policy "ask" — the server paused on a tool call and needs the user to
+    /// approve or deny before execution continues. The UI shows ToolApprovalModal
+    /// and POSTs the decision to `/tool/decision`.
+    ApprovalRequest {
+        call_id: String,
+        name: String,
+        arguments: serde_json::Value,
+    },
 }
 
 /// Stateful SSE frame relay. Holds the one piece of cross-frame state the
@@ -255,6 +277,12 @@ impl SseRelay {
                     return SseFrameOutcome::Reasoning(text.to_string());
                 }
                 SseFrameOutcome::Continue
+            }
+            Some("tool_approval_request") => {
+                let call_id = evt.get("call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let name = evt.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let arguments = evt.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
+                SseFrameOutcome::ApprovalRequest { call_id, name, arguments }
             }
             _ => SseFrameOutcome::Continue, // init / heartbeat / unknown
         }
@@ -361,6 +389,19 @@ mod sse_tests {
                 status: "running".to_string(),
                 agent: "planner".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn approval_request_frame_extracts_fields() {
+        let mut r = SseRelay::new();
+        let out = r.handle_line(
+            r#"data: {"type":"tool_approval_request","call_id":"c1","name":"shell_exec","arguments":{"cmd":"rm -rf /"}}"#,
+        );
+        assert!(
+            matches!(out, SseFrameOutcome::ApprovalRequest { ref call_id, ref name, .. }
+                if call_id == "c1" && name == "shell_exec"),
+            "expected ApprovalRequest, got {out:?}",
         );
     }
 

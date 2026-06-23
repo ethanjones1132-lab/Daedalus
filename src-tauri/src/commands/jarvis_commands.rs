@@ -205,13 +205,24 @@ pub async fn jarvis_tool_decision(
     tool_call_id: String,
     decision: String,
 ) -> Result<(), String> {
-    // Best-effort: log the decision. The runner reads from the queue on
-    // its next poll; if the user is operating through a non-queue path
-    // (e.g. a streamed turn), the Bun server's WebSocket layer handles it.
+    let approved = decision == "approve";
     eprintln!(
-        "[jarvis] tool decision: session={} call={} decision={}",
-        session_id, tool_call_id, decision
+        "[jarvis] tool decision: session={} call={} approved={}",
+        session_id, tool_call_id, approved
     );
+    // Forward to the Bun server's approval registry so the paused tool
+    // continuation can resume or be denied.
+    let base = crate::wsl::get_cached_bun_url()
+        .unwrap_or_else(|| "http://127.0.0.1:19877".to_string());
+    let url = format!("{}/tool/decision", base.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let _ = client
+        .post(&url)
+        .json(&serde_json::json!({ "call_id": tool_call_id, "approved": approved }))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| eprintln!("[jarvis] tool decision POST failed: {e}"));
     Ok(())
 }
 

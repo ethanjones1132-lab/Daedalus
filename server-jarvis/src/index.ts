@@ -38,6 +38,12 @@ import {
 } from "./openrouter";
 import type { OpenRouterCostInfo } from "./openrouter";
 import { recordInference, inferenceMetricsSnapshot, type Backend } from "./inference-metrics";
+import { createApprovalRegistry } from "./approval-registry";
+
+// One process-level approval registry: the chat surface emits
+// `tool_approval_request` SSE events and awaits decisions here.
+// The UI resolves them via POST /tool/decision.
+const approvalRegistry = createApprovalRegistry();
 import type { ToolCall } from "./tool-types";
 import {
   buildTextToolInstructions,
@@ -997,6 +1003,24 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       // Patch the execution context with the active session ID so
       // interactive tools (ask_user_question) can scope state per-session.
       ctx.session_id = sessionId;
+      // Wire the approval hook: emit a `tool_approval_request` SSE event so
+      // the Tauri runner relays it to the UI (ToolApprovalModal), then await
+      // the user's decision from the process-level registry. Auto-denies after
+      // 5 minutes so a disconnected client can never wedge the stream.
+      ctx.requestApproval = async (req) => {
+        await writer.write(
+          encoder.encode(
+            `data: ${JSON.stringify({
+              type: "tool_approval_request",
+              call_id: req.call_id,
+              name: req.name,
+              arguments: req.arguments,
+              session_id: sessionId,
+            })}\n\n`,
+          ),
+        );
+        return approvalRegistry.request(req.call_id);
+      };
 
       // ── Orchestrator path (PAMO-SET Phase 2) ─────────────────────
       if (cfg.orchestrator?.enabled) {
@@ -2199,6 +2223,11 @@ async function baseFetch(req: Request): Promise<Response> {
     }
     if (path === "/health/inference") {
       return Response.json(inferenceMetricsSnapshot());
+    }
+    if (path === "/tool/decision" && req.method === "POST") {
+      const { call_id, approved } = await req.json() as { call_id: string; approved: boolean };
+      const resolved = approvalRegistry.resolve(call_id, Boolean(approved));
+      return Response.json({ ok: resolved, call_id });
     }
     if (path === "/config" && req.method === "GET") return Response.json(loadConfig());
     if (path === "/config" && req.method === "POST") {
