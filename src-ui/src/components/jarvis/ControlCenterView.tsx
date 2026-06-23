@@ -49,6 +49,19 @@ interface HealthData {
   timestamp: string;
 }
 
+// Subsystem row in the Diagnostics grid; the restart command is invoked
+// verbatim, so the keys map directly to Tauri handlers (see
+// src-tauri/src/lib.rs invoke_handler! and recovery_stubs.rs).
+type SubsystemKey = 'ollama' | 'bun' | 'bridge' | 'proxy';
+
+interface SubsystemRow {
+  key: SubsystemKey;
+  name: string;
+  up: boolean;
+  detail: string;
+  command: string;
+}
+
 interface DoctorCheck {
   name: string;
   status: string;
@@ -108,6 +121,7 @@ export default function ControlCenterView() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<ModelProfile | null>(null);
+  const [restarting, setRestarting] = useState<SubsystemKey | null>(null);
   const { success, error: toastError } = useToast();
 
   const fetchAll = useCallback(async () => {
@@ -162,6 +176,28 @@ export default function ControlCenterView() {
       toastError(String(e), 'Delete failed');
     }
   }, [pendingDelete, fetchAll, success, toastError]);
+
+  // Per-row restart handler. The backend commands return a specific error
+  // string (see lib.rs force_restart_jarvis_server / recovery_stubs
+  // jarvis_restart_*) so the toast surfaces the real reason instead of
+  // silently doing nothing.
+  const restartSubsystem = useCallback(
+    async (row: SubsystemRow) => {
+      if (restarting) return;
+      setRestarting(row.key);
+      try {
+        await invoke<boolean>(row.command);
+        success(`${row.name} restarted`, 'Restart');
+        await fetchAll();
+      } catch (e) {
+        toastError(String(e), `Restart ${row.name} failed`);
+        await fetchAll();
+      } finally {
+        setRestarting(null);
+      }
+    },
+    [restarting, fetchAll, success, toastError],
+  );
 
   const activeProfile = profiles.find((p) => p.is_active) ?? null;
 
@@ -307,24 +343,45 @@ export default function ControlCenterView() {
           <div className="space-y-3">
             {health ? (
               <GlassCard className="p-4 space-y-3">
-                <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40">
-                  Subsystems
+                <div className="flex items-center gap-2">
+                  <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40">
+                    Subsystems
+                  </div>
+                  <span className="text-[10px] font-mono text-bone/30">
+                    click restart to re-spawn
+                  </span>
                 </div>
                 <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
-                  {[
-                    { name: 'Ollama', up: health.ollama.running, detail: health.ollama.url },
-                    { name: 'Bun server', up: health.bun_server.running, detail: health.bun_server.url },
-                    { name: 'Bridge', up: health.bridge.running, detail: `:${health.bridge.port}` },
-                    { name: 'Claude proxy', up: health.claude_proxy.running, detail: `:${health.claude_proxy.port}` },
-                  ].map((s) => (
-                    <div key={s.name} className="flex items-center gap-2">
-                      <StatusDot ok={s.up} warn={!s.up} />
-                      <span className="text-bone">{s.name}</span>
-                      <span className="ml-auto font-mono text-[10px] text-bone/40 truncate">
-                        {s.detail}
-                      </span>
-                    </div>
-                  ))}
+                  {([
+                    { key: 'ollama', name: 'Ollama', up: health.ollama.running, detail: health.ollama.url, command: 'jarvis_restart_ollama' },
+                    { key: 'bun', name: 'Bun server', up: health.bun_server.running, detail: health.bun_server.url, command: 'jarvis_restart_server' },
+                    { key: 'bridge', name: 'Bridge', up: health.bridge.running, detail: `:${health.bridge.port}`, command: 'restart_bridge' },
+                    { key: 'proxy', name: 'Claude proxy', up: health.claude_proxy.running, detail: `:${health.claude_proxy.port}`, command: 'jarvis_restart_proxy' },
+                  ] as SubsystemRow[]).map((s) => {
+                    const busy = restarting === s.key;
+                    return (
+                      <div key={s.key} className="flex items-center gap-2">
+                        <StatusDot ok={s.up} warn={!s.up} />
+                        <span className="text-bone">{s.name}</span>
+                        <span className="ml-auto font-mono text-[10px] text-bone/40 truncate max-w-[40%]">
+                          {s.detail}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => restartSubsystem(s)}
+                          disabled={busy || restarting !== null}
+                          className={cn(
+                            'px-2 py-0.5 rounded-md border text-[10px] font-mono transition-colors',
+                            'border-white/10 text-bone/60 hover:text-bone hover:border-white/20',
+                            'disabled:opacity-50 disabled:cursor-not-allowed',
+                          )}
+                          aria-label={`Restart ${s.name}`}
+                        >
+                          {busy ? '…' : 'Restart'}
+                        </button>
+                      </div>
+                    );
+                  })}
                 </div>
 
                 <div className="space-y-2 pt-1">

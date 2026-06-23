@@ -242,6 +242,9 @@ function ChatPanel({
   // Reasoning/CoT text accumulated while streaming (cleared on done)
   const [reasoningText, setReasoningText] = useState<string>('');
   const [showReasoning, setShowReasoning] = useState(false);
+  // Intermediate agent activity per stage (planner/executor/reviewer/rewriter)
+  const [agentSteps, setAgentSteps] = useState<{ stage: string; text: string }[]>([]);
+  const [showAgents, setShowAgents] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -319,12 +322,24 @@ function ChatPanel({
       setReasoningText(prev => prev + event.payload.text);
     });
 
+    const unlistenAgents = listen<{ stage: string; text: string }>('jarvis://agent_activity', (event) => {
+      const { stage, text } = event.payload;
+      setAgentSteps(prev => {
+        const last = prev[prev.length - 1];
+        if (last && last.stage === stage) {
+          return [...prev.slice(0, -1), { stage, text: last.text + text }];
+        }
+        return [...prev, { stage, text }];
+      });
+    });
+
     return () => {
       unlisten.then(f => f());
       unlistenDone.then(f => f());
       unlistenError.then(f => f());
       unlistenStage.then(f => f());
       unlistenReasoning.then(f => f());
+      unlistenAgents.then(f => f());
     };
   }, [onSessionCreated]);
 
@@ -337,6 +352,8 @@ function ChatPanel({
     setPipelineStage('');
     setReasoningText('');
     setShowReasoning(false);
+    setAgentSteps([]);
+    setShowAgents(false);
     setMessages(prev => [...prev, { role: 'user', content: userMsg }]);
 
     try {
@@ -379,6 +396,8 @@ function ChatPanel({
     setPipelineStage('');
     setReasoningText('');
     setShowReasoning(false);
+    setAgentSteps([]);
+    setShowAgents(false);
     inputRef.current?.focus();
   };
 
@@ -481,6 +500,31 @@ function ChatPanel({
             {showReasoning && (
               <div className="px-3 py-2 text-[11px] font-mono text-bone-faint whitespace-pre-wrap max-h-40 overflow-y-auto bg-obsidian/20">
                 {reasoningText}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Agent pipeline activity — collapsed by default, shows per-stage intermediate output */}
+        {agentSteps.length > 0 && (
+          <div className="border border-royal/15 rounded-lg overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setShowAgents(a => !a)}
+              className="w-full flex items-center gap-2 px-3 py-1.5 text-[10px] font-mono text-bone-faint hover:text-bone-dim transition-colors bg-obsidian/30"
+            >
+              <span>{showAgents ? '▾' : '▸'}</span>
+              <span className="text-royal-light">Agents</span>
+              <span className="ml-auto opacity-50">{agentSteps.length} stage{agentSteps.length !== 1 ? 's' : ''}</span>
+            </button>
+            {showAgents && (
+              <div className="px-3 py-2 space-y-3 max-h-64 overflow-y-auto bg-obsidian/20">
+                {agentSteps.map((step, i) => (
+                  <div key={i}>
+                    <div className="text-[9px] font-mono text-royal-light uppercase tracking-widest mb-0.5">{step.stage}</div>
+                    <div className="text-[11px] font-mono text-bone-faint whitespace-pre-wrap leading-relaxed">{step.text}</div>
+                  </div>
+                ))}
               </div>
             )}
           </div>

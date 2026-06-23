@@ -42,6 +42,7 @@ export class PipelineExecutor {
           temperature: BUILTIN_MODES.planner.temperature,
           max_tokens: BUILTIN_MODES.planner.max_tokens,
           stream: true,
+          stageLabel: "planner",
           onChunk: (chunk) => {
             onStateChange({ stage: "planner", status: "running", output: chunk });
           }
@@ -106,6 +107,7 @@ export class PipelineExecutor {
               max_tokens: BUILTIN_MODES.executor.max_tokens,
               tools: getToolsForMode("executor", this.runtime.listTools()),
               stream: true,
+              stageLabel: "executor",
               onChunk: (chunk) => {
                 onStateChange({ stage: "executor", status: "running", output: chunk });
               }
@@ -210,6 +212,7 @@ export class PipelineExecutor {
             temperature: BUILTIN_MODES.reviewer.temperature,
             max_tokens: BUILTIN_MODES.reviewer.max_tokens,
             stream: true,
+            stageLabel: "reviewer",
             onChunk: (chunk) => {
               onStateChange({ stage: "reviewer", status: "running", output: chunk });
             }
@@ -257,6 +260,7 @@ export class PipelineExecutor {
                   max_tokens: BUILTIN_MODES.rewriter.max_tokens,
                   tools: getToolsForMode("rewriter", this.runtime.listTools()),
                   stream: true,
+                  stageLabel: "rewriter",
                   onChunk: (chunk) => {
                     onStateChange({ stage: "rewriter", status: "running", output: chunk });
                   }
@@ -367,6 +371,8 @@ export class PipelineExecutor {
           temperature: BUILTIN_MODES.synthesizer.temperature,
           max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
           stream: true,
+          stageLabel: "synthesizer",
+          surfaceAsAnswer: true,
           onChunk: (chunk) => {
             onStateChange({ stage: "synthesizer", status: "running", output: chunk });
           }

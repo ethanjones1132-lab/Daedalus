@@ -201,7 +201,15 @@ pub(crate) fn spawn_claude_cli_proxy(ollama_model: String) -> Option<std::proces
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     crate::wsl::hide_windows_console(&mut command);
-    let child = command.spawn().ok()?;
+    let child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "[Jarvis] claude_cli_proxy spawn failed: {e} (py={py}, script={script}, model={model})"
+            );
+            return None;
+        }
+    };
     println!(
         "[Jarvis] claude_cli_proxy started (PID {}, py {}, script {}, model {})",
         child.id(),
@@ -263,6 +271,53 @@ fn find_jarvis_server() -> Option<String> {
                     if cand.exists() {
                         return Some(cand.to_string_lossy().into_owned());
                     }
+                }
+            }
+        }
+
+        // Walk up the current_exe ancestry looking for a repo-rooted
+        // server-jarvis. This catches `cargo tauri build` outputs that
+        // ended up under target/.../home-base.exe and dev runs that point
+        // at a sibling checkout, without hardcoding the home path.
+        if let Ok(exe) = std::env::current_exe() {
+            let mut cursor = exe.parent().map(|p| p.to_path_buf());
+            for _ in 0..8 {
+                let Some(dir) = cursor.as_ref() else { break };
+                for rel in [
+                    "server-jarvis/dist/index.js",
+                    "server-jarvis/src/index.ts",
+                ] {
+                    let cand = dir.join(rel);
+                    if cand.exists() {
+                        return Some(cand.to_string_lossy().into_owned());
+                    }
+                }
+                match dir.parent() {
+                    Some(p) => cursor = Some(p.to_path_buf()),
+                    None => break,
+                }
+            }
+        }
+
+        // Same check relative to CWD — useful when the binary is launched
+        // from a sibling of the repo (e.g. `target\release\home-base.exe`
+        // run from the repo root, or from a CI workspace).
+        if let Ok(cwd) = std::env::current_dir() {
+            let mut cursor = Some(cwd);
+            for _ in 0..8 {
+                let Some(dir) = cursor.as_ref() else { break };
+                for rel in [
+                    "server-jarvis/dist/index.js",
+                    "server-jarvis/src/index.ts",
+                ] {
+                    let cand = dir.join(rel);
+                    if cand.exists() {
+                        return Some(cand.to_string_lossy().into_owned());
+                    }
+                }
+                match dir.parent() {
+                    Some(p) => cursor = Some(p.to_path_buf()),
+                    None => break,
                 }
             }
         }
@@ -444,9 +499,64 @@ fn spawn_jarvis_server(entry: &str) -> Option<std::process::Child> {
             .stderr(jarvis_server_log_stdio("server-jarvis.err.log"))
             .spawn()
     };
-    let child = spawn_result.ok()?;
+    let child = match spawn_result {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[Jarvis] Bun spawn failed: {e} (bun={bun}, entry={entry})");
+            return None;
+        }
+    };
     println!("[Jarvis] Bun server spawned (PID {})", child.id());
     Some(child)
+}
+
+/// Force-restart the Bun server. Bypasses the HEALTHY_TTL fast-path in
+/// `ensure_jarvis_server_started` (the symptom of "clicked restart, nothing
+/// happened" when the server is actually down) and clears the supervisor's
+/// consecutive-failure counter so the auto-restart loop stays healthy after
+/// a user-driven restart. Returns a specific error string on failure so the
+/// UI can show why (missing server bundle, spawn error, health timeout).
+pub async fn force_restart_jarvis_server() -> Result<(), String> {
+    // 1. Re-arm the supervisor so a subsequent auto-restart is allowed even
+    //    if previous ticks drove the counter to the give-up cap.
+    crate::supervisor::reset_failures(crate::supervisor::SupervisedService::Bun);
+
+    // 2. Locate the server entry (the cheap part; surfaces a real error if
+    //    the bundle is genuinely missing on this machine).
+    let server_entry = find_jarvis_server()
+        .ok_or_else(|| "server bundle not found (no index.js / index.ts beside the app or in the repo)".to_string())?;
+
+    // 3. Kill the tracked child (if any) and re-spawn off the runtime.
+    let spawn_result: Result<(), String> = tauri::async_runtime::spawn_blocking(move || {
+        if SERVER_PROCESS.get().is_none() {
+            let _ = SERVER_PROCESS.set(std::sync::Mutex::new(None));
+        }
+        let m = SERVER_PROCESS
+            .get()
+            .ok_or("SERVER_PROCESS not initialized")?;
+        let mut guard = m.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+        }
+        let child = spawn_jarvis_server(&server_entry)
+            .ok_or_else(|| "Failed to spawn Bun server (see [Jarvis] logs above for the OS error)".to_string())?;
+        *guard = Some(child);
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
+
+    spawn_result?;
+
+    // 4. Probe the freshly spawned server (up to ~20s).
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(20) {
+        if probe_jarvis_healthy().await {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    Err("Bun server did not become healthy within 20s of restart".to_string())
 }
 
 pub async fn ensure_jarvis_server_started() -> Result<(), String> {
@@ -731,6 +841,7 @@ pub fn run() {
             jarvis_stop_bridge,
             jarvis_restart_server,
             jarvis_restart_ollama,
+            jarvis_restart_proxy,
             get_build_info,
             get_all_settings,
             get_setting,

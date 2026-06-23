@@ -398,17 +398,29 @@ export function invalidateConfigCache(): void {
 export function deepMerge(target: any, source: any): any {
   const result = { ...target };
   for (const key of Object.keys(source)) {
+    const sourceVal = source[key];
     if (
-      source[key] &&
-      typeof source[key] === "object" &&
-      !Array.isArray(source[key]) &&
+      sourceVal &&
+      typeof sourceVal === "object" &&
+      !Array.isArray(sourceVal) &&
       target[key] &&
       typeof target[key] === "object" &&
       !Array.isArray(target[key])
     ) {
-      result[key] = deepMerge(target[key], source[key]);
+      result[key] = deepMerge(target[key], sourceVal);
     } else {
-      result[key] = source[key];
+      // A blank value in the saved config must never wipe out a meaningful
+      // default. A persisted partial config such as
+      //   {"openrouter":{"base_url":"","model":""}}
+      // would otherwise leave the OpenRouter URL/model empty — streamJarvis
+      // then builds `fetch("/chat/completions")` ("URL is invalid") and every
+      // chat turn fails, which is exactly how chat looked "completely dead".
+      // null/undefined are always non-overriding; an empty string only yields
+      // to a *non-empty string* default (so clearing a field whose default is
+      // already "" — e.g. api_key — still works).
+      if (sourceVal === undefined || sourceVal === null) continue;
+      if (sourceVal === "" && typeof target[key] === "string" && target[key] !== "") continue;
+      result[key] = sourceVal;
     }
   }
   return result;

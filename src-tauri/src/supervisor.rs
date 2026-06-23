@@ -15,6 +15,7 @@
 // loop. The tick interval itself also bounds restart frequency.
 
 use crate::jarvis::types::{JarvisBackend, JarvisState};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -24,61 +25,80 @@ const PROXY_PORT: u16 = 19878;
 const OLLAMA_PORT: u16 = 11434;
 const MAX_CONSECUTIVE_RESTARTS: u32 = 5;
 
+/// Consecutive-failure counters live at module scope so manual restart
+/// commands (Bun / Ollama / proxy) can clear them. Per-instance fields would
+/// be unreachable from a Tauri command — the supervisor task is the only
+/// thing that owns the struct — so a forced restart would still appear
+/// permanently given-up to subsequent supervisor ticks.
+pub(crate) static BUN_FAILS: AtomicU32 = AtomicU32::new(0);
+pub(crate) static PROXY_FAILS: AtomicU32 = AtomicU32::new(0);
+pub(crate) static OLLAMA_FAILS: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SupervisedService {
+    Bun,
+    Proxy,
+    Ollama,
+}
+
 /// Whether another restart attempt is allowed given the consecutive-failure
 /// count. Pure so the backoff bound is unit-testable.
 fn may_restart(consecutive_failures: u32) -> bool {
     consecutive_failures < MAX_CONSECUTIVE_RESTARTS
 }
 
-#[derive(Default)]
-struct Supervisor {
-    bun_fails: u32,
-    proxy_fails: u32,
-    ollama_fails: u32,
+/// Reset a service's consecutive-failure counter so the supervisor resumes
+/// auto-restarting it. Called when the user forces a manual restart.
+pub(crate) fn reset_failures(service: SupervisedService) {
+    let counter = match service {
+        SupervisedService::Bun => &BUN_FAILS,
+        SupervisedService::Proxy => &PROXY_FAILS,
+        SupervisedService::Ollama => &OLLAMA_FAILS,
+    };
+    counter.store(0, Ordering::Relaxed);
 }
 
 /// Spawn the supervisor loop. Gives boot one tick of grace before the first
 /// check so the eager boot-time starts have a chance to come up first.
 pub fn spawn_supervisor(handle: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        let mut sup = Supervisor::default();
         tokio::time::sleep(TICK).await;
         loop {
-            sup.tick(&handle).await;
+            tick(&handle).await;
             tokio::time::sleep(TICK).await;
         }
     });
 }
 
-impl Supervisor {
-    async fn tick(&mut self, handle: &AppHandle) {
-        // Read the active backend + model once per tick.
-        let (is_ollama, ollama_model) = {
-            let state = handle.state::<JarvisState>();
-            let cfg = state.config.lock().await;
-            (
-                matches!(cfg.active_backend, JarvisBackend::Ollama),
-                cfg.ollama.model.clone(),
-            )
-        };
+async fn tick(handle: &AppHandle) {
+    // Read the active backend + model once per tick.
+    let (is_ollama, ollama_model) = {
+        let state = handle.state::<JarvisState>();
+        let cfg = state.config.lock().await;
+        (
+            matches!(cfg.active_backend, JarvisBackend::Ollama),
+            cfg.ollama.model.clone(),
+        )
+    };
 
-        // ── Bun server (required by every backend for tools/skills/models) ──
-        if crate::is_port_listening(BUN_PORT) {
-            self.bun_fails = 0;
-        } else if may_restart(self.bun_fails) {
+    // ── Bun server (required by every backend for tools/skills/models) ──
+    if crate::is_port_listening(BUN_PORT) {
+        BUN_FAILS.store(0, Ordering::Relaxed);
+    } else {
+        let fails = BUN_FAILS.load(Ordering::Relaxed);
+        if may_restart(fails) {
             // ensure_* is idempotent (it health-probes before spawning).
             match crate::ensure_jarvis_server_started().await {
                 Ok(_) => {
-                    self.bun_fails = 0;
+                    BUN_FAILS.store(0, Ordering::Relaxed);
                     println!("[supervisor] Bun server was down — relaunched.");
                 }
                 Err(e) => {
-                    self.bun_fails += 1;
+                    let next = BUN_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
                     eprintln!(
-                        "[supervisor] Bun server restart failed ({}/{}): {e}",
-                        self.bun_fails, MAX_CONSECUTIVE_RESTARTS
+                        "[supervisor] Bun server restart failed ({next}/{MAX_CONSECUTIVE_RESTARTS}): {e}"
                     );
-                    if self.bun_fails == MAX_CONSECUTIVE_RESTARTS {
+                    if next == MAX_CONSECUTIVE_RESTARTS {
                         eprintln!(
                             "[supervisor] Bun server: giving up auto-restart until it is healthy again."
                         );
@@ -86,11 +106,14 @@ impl Supervisor {
                 }
             }
         }
+    }
 
-        // ── claude_cli_proxy (routes to whichever backend is active) ──
-        if crate::is_port_listening(PROXY_PORT) {
-            self.proxy_fails = 0;
-        } else if may_restart(self.proxy_fails) {
+    // ── claude_cli_proxy (routes to whichever backend is active) ──
+    if crate::is_port_listening(PROXY_PORT) {
+        PROXY_FAILS.store(0, Ordering::Relaxed);
+    } else {
+        let fails = PROXY_FAILS.load(Ordering::Relaxed);
+        if may_restart(fails) {
             // Drop any stale tracked handle (the process is gone if the port is down).
             if let Some(m) = crate::PROXY_PROCESS.get() {
                 if let Ok(mut g) = m.lock() {
@@ -106,49 +129,50 @@ impl Supervisor {
                             *g = Some(child);
                         }
                     }
-                    self.proxy_fails = 0;
+                    PROXY_FAILS.store(0, Ordering::Relaxed);
                     println!("[supervisor] claude_cli_proxy was down — relaunched.");
                 }
                 None => {
-                    self.proxy_fails += 1;
+                    let next = PROXY_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
                     eprintln!(
-                        "[supervisor] claude_cli_proxy restart failed ({}/{}).",
-                        self.proxy_fails, MAX_CONSECUTIVE_RESTARTS
+                        "[supervisor] claude_cli_proxy restart failed ({next}/{MAX_CONSECUTIVE_RESTARTS})."
                     );
                 }
             }
         }
+    }
 
-        // ── Ollama (only required when it is the active backend) ──
-        if !is_ollama {
-            self.ollama_fails = 0;
-        } else if crate::is_port_listening(OLLAMA_PORT) {
-            self.ollama_fails = 0;
-        } else if may_restart(self.ollama_fails) {
+    // ── Ollama (only required when it is the active backend) ──
+    if !is_ollama {
+        OLLAMA_FAILS.store(0, Ordering::Relaxed);
+    } else if crate::is_port_listening(OLLAMA_PORT) {
+        OLLAMA_FAILS.store(0, Ordering::Relaxed);
+    } else {
+        let fails = OLLAMA_FAILS.load(Ordering::Relaxed);
+        if may_restart(fails) {
             crate::start_ollama_and_warm(ollama_model).await;
             if crate::is_port_listening(OLLAMA_PORT) {
-                self.ollama_fails = 0;
+                OLLAMA_FAILS.store(0, Ordering::Relaxed);
                 println!("[supervisor] Ollama was down — relaunched.");
             } else {
-                self.ollama_fails += 1;
+                let next = OLLAMA_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
                 eprintln!(
-                    "[supervisor] Ollama restart failed ({}/{}).",
-                    self.ollama_fails, MAX_CONSECUTIVE_RESTARTS
+                    "[supervisor] Ollama restart failed ({next}/{MAX_CONSECUTIVE_RESTARTS})."
                 );
             }
         }
-
-        // Heartbeat for any UI that wants to show supervisor activity.
-        let _ = handle.emit(
-            "jarvis://supervisor",
-            serde_json::json!({
-                "bun_up": crate::is_port_listening(BUN_PORT),
-                "proxy_up": crate::is_port_listening(PROXY_PORT),
-                "ollama_up": crate::is_port_listening(OLLAMA_PORT),
-                "ollama_required": is_ollama,
-            }),
-        );
     }
+
+    // Heartbeat for any UI that wants to show supervisor activity.
+    let _ = handle.emit(
+        "jarvis://supervisor",
+        serde_json::json!({
+            "bun_up": crate::is_port_listening(BUN_PORT),
+            "proxy_up": crate::is_port_listening(PROXY_PORT),
+            "ollama_up": crate::is_port_listening(OLLAMA_PORT),
+            "ollama_required": is_ollama,
+        }),
+    );
 }
 
 #[cfg(test)]
@@ -161,5 +185,26 @@ mod tests {
         assert!(may_restart(MAX_CONSECUTIVE_RESTARTS - 1));
         assert!(!may_restart(MAX_CONSECUTIVE_RESTARTS));
         assert!(!may_restart(MAX_CONSECUTIVE_RESTARTS + 1));
+    }
+
+    #[test]
+    fn reset_failures_clears_counter_so_supervisor_resumes() {
+        // Simulate a service that has hit the give-up threshold.
+        BUN_FAILS.store(MAX_CONSECUTIVE_RESTARTS, Ordering::Relaxed);
+        assert!(!may_restart(BUN_FAILS.load(Ordering::Relaxed)));
+
+        // After a forced restart the counter must be back at zero so the
+        // next supervisor tick can take another swing.
+        reset_failures(SupervisedService::Bun);
+        assert_eq!(BUN_FAILS.load(Ordering::Relaxed), 0);
+        assert!(may_restart(BUN_FAILS.load(Ordering::Relaxed)));
+
+        // Same contract for the other two services.
+        PROXY_FAILS.store(MAX_CONSECUTIVE_RESTARTS, Ordering::Relaxed);
+        OLLAMA_FAILS.store(MAX_CONSECUTIVE_RESTARTS, Ordering::Relaxed);
+        reset_failures(SupervisedService::Proxy);
+        reset_failures(SupervisedService::Ollama);
+        assert_eq!(PROXY_FAILS.load(Ordering::Relaxed), 0);
+        assert_eq!(OLLAMA_FAILS.load(Ordering::Relaxed), 0);
     }
 }

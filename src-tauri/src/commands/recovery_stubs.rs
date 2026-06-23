@@ -251,10 +251,12 @@ pub async fn jarvis_save_companion(companion: Value) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn jarvis_restart_server() -> Result<bool, String> {
-    // Trigger a re-probe + re-spawn. The real implementation lives in
-    // lib.rs's `ensure_jarvis_server_started`; this command is a marker
-    // that the caller (UI button) can fire.
-    crate::ensure_jarvis_server_started().await?;
+    // Bypass the TTL fast-path in `ensure_jarvis_server_started` — that path
+    // returns success without re-spawning when the server was last seen
+    // healthy within the 10s window, which silently no-ops a "Restart" click
+    // when the user is staring at a dead UI. `force_restart_jarvis_server`
+    // kills the tracked child, re-spawns, and probes fresh.
+    crate::force_restart_jarvis_server().await?;
     Ok(true)
 }
 
@@ -266,6 +268,7 @@ pub async fn jarvis_restart_ollama(
     // respawn + warm. Returns true once Ollama is listening again. Best-effort: if
     // Ollama was started outside the app there may be no child to kill, in which case
     // we simply (re)ensure it is up.
+    crate::supervisor::reset_failures(crate::supervisor::SupervisedService::Ollama);
     let model = state.config.lock().await.ollama.model.clone();
     if let Some(m) = crate::OLLAMA_PROCESS.get() {
         if let Ok(mut g) = m.lock() {
@@ -281,6 +284,59 @@ pub async fn jarvis_restart_ollama(
     } else {
         Err("Ollama did not come back up within the startup window".to_string())
     }
+}
+
+#[tauri::command]
+pub async fn jarvis_restart_proxy(
+    state: tauri::State<'_, crate::jarvis::types::JarvisState>,
+) -> Result<bool, String> {
+    // Re-arm the supervisor (a long silent outage may have driven the proxy
+    // counter to the give-up cap), kill the tracked child, sleep briefly so
+    // the port is released, then re-spawn and probe :19878.
+    crate::supervisor::reset_failures(crate::supervisor::SupervisedService::Proxy);
+    let model = state.config.lock().await.ollama.model.clone();
+
+    if let Some(m) = crate::PROXY_PROCESS.get() {
+        if let Ok(mut g) = m.lock() {
+            if let Some(mut child) = g.take() {
+                let _ = child.kill();
+            }
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // `spawn_claude_cli_proxy` returns `None` when either the script or the
+    // python interpreter can't be located; the underlying spawn error is
+    // already logged via eprintln in lib.rs. Wrap with a specific error
+    // string the UI can surface verbatim.
+    let child = match crate::spawn_claude_cli_proxy(model.clone()) {
+        Some(c) => c,
+        None => {
+            return Err(match (model.is_empty(), true) {
+                _ if !model.is_empty() => {
+                    "claude_cli_proxy: failed to start (check python interpreter and claude_cli_proxy.py path)"
+                        .to_string()
+                }
+                _ => "claude_cli_proxy: failed to start (no model configured)".to_string(),
+            });
+        }
+    };
+
+    if let Some(m) = crate::PROXY_PROCESS.get() {
+        if let Ok(mut g) = m.lock() {
+            *g = Some(child);
+        }
+    }
+
+    // Wait for the proxy to bind :19878.
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(8) {
+        if crate::is_port_listening(19878) {
+            return Ok(true);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    Err("claude_cli_proxy: spawned but not listening on :19878".to_string())
 }
 
 #[tauri::command]

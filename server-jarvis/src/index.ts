@@ -1168,6 +1168,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let fullTurnText = "";
           let activeToolCalls: any[] = [];
           const textStreamSanitizer = new TextToolCallStreamSanitizer();
+          const emitTextToken = async (text: string) => {
+            if (callOptions?.surfaceAsAnswer) {
+              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text }, session_id: sessionId })}\n\n`));
+            } else {
+              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "agent_activity", stage: callOptions?.stageLabel ?? "agent", text, session_id: sessionId })}\n\n`));
+            }
+          };
 
           while (true) {
             const { done, value } = await reader.read();
@@ -1215,14 +1222,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                         } else {
                           const sanitized = textStreamSanitizer.push(visibleText);
                           if (sanitized) {
-                            await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: sanitized }, session_id: sessionId })}\n\n`));
+                            await emitTextToken(sanitized);
                           }
                         }
                       }
                     } else {
                       const sanitized = textStreamSanitizer.push(chunkText);
                       if (sanitized) {
-                        await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: sanitized }, session_id: sessionId })}\n\n`));
+                        await emitTextToken(sanitized);
                       }
                     }
                   }
@@ -1244,7 +1251,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               } else {
                 const sanitized = textStreamSanitizer.push(visibleText);
                 if (sanitized) {
-                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: sanitized }, session_id: sessionId })}\n\n`));
+                  await emitTextToken(sanitized);
                 }
               }
             }
@@ -1254,7 +1261,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
           const remaining = textStreamSanitizer.flush();
           if (remaining) {
-            await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: remaining }, session_id: sessionId })}\n\n`));
+            await emitTextToken(remaining);
           }
 
           let parsedToolCalls = activeToolCalls.filter(Boolean).map((tc) => {

@@ -144,6 +144,16 @@ pub fn run_jarvis_message(
                         }),
                     );
                 }
+                SseFrameOutcome::AgentActivity { stage, text } => {
+                    let _ = app.emit(
+                        "jarvis://agent_activity",
+                        serde_json::json!({
+                            "stage": stage,
+                            "text": text,
+                            "session_id": sid,
+                        }),
+                    );
+                }
             }
         }
 
@@ -190,6 +200,13 @@ pub enum SseFrameOutcome {
         call_id: String,
         name: String,
         arguments: serde_json::Value,
+    },
+    /// Intermediate pipeline stage activity (planner/executor/reviewer/rewriter output).
+    /// Does NOT flip `streamed_any` so the terminal `result` frame still surfaces if
+    /// no synthesizer tokens hit the chat bubble.
+    AgentActivity {
+        stage: String,
+        text: String,
     },
 }
 
@@ -283,6 +300,17 @@ impl SseRelay {
                 let name = evt.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let arguments = evt.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
                 SseFrameOutcome::ApprovalRequest { call_id, name, arguments }
+            }
+            Some("agent_activity") => {
+                if let Some(text) = evt.get("text").and_then(|t| t.as_str()) {
+                    if !text.is_empty() {
+                        return SseFrameOutcome::AgentActivity {
+                            stage: evt.get("stage").and_then(|s| s.as_str()).unwrap_or("agent").to_string(),
+                            text: text.to_string(),
+                        };
+                    }
+                }
+                SseFrameOutcome::Continue
             }
             _ => SseFrameOutcome::Continue, // init / heartbeat / unknown
         }
@@ -415,6 +443,34 @@ mod sse_tests {
         assert_eq!(
             r.handle_line(r#"data: {"type":"reasoning_chunk","chunk":"more"}"#),
             SseFrameOutcome::Reasoning("more".to_string())
+        );
+    }
+
+    #[test]
+    fn agent_activity_frame_is_relayed() {
+        let mut r = SseRelay::new();
+        let out = r.handle_line(r#"data: {"type":"agent_activity","stage":"planner","text":"step 1"}"#);
+        assert_eq!(
+            out,
+            SseFrameOutcome::AgentActivity {
+                stage: "planner".to_string(),
+                text: "step 1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn agent_activity_does_not_suppress_result_frame() {
+        let mut r = SseRelay::new();
+        // AgentActivity must NOT flip streamed_any — the final result should still surface.
+        let _ = r.handle_line(r#"data: {"type":"agent_activity","stage":"planner","text":"planning..."}"#);
+        let out = r.handle_line(r#"data: {"type":"result","result":"final answer"}"#);
+        assert_eq!(
+            out,
+            SseFrameOutcome::ResultThenDone {
+                token: Some("final answer".to_string()),
+                error: None,
+            }
         );
     }
 }
