@@ -4,7 +4,7 @@
 // Spawns the Claude Code CLI as a subprocess, captures streaming JSON output,
 // and bridges it into the Jarvis SSE event stream.
 
-import { spawn } from "child_process";
+import { spawn, execSync } from "child_process";
 import { existsSync, mkdirSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
@@ -24,19 +24,28 @@ const CREDENTIAL_ENV_KEYS = new Set([
 
 // ── Path Resolution ──
 
+function discoverClaudeOnPath(): string | null {
+  try {
+    const cmd = process.platform === "win32" ? "where claude" : "which claude";
+    const out = execSync(cmd, { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] })
+      .trim()
+      .split(/\r?\n/)[0];
+    if (out && existsSync(out)) return out;
+  } catch {
+    // not on PATH
+  }
+  return null;
+}
+
 export function resolveClaudePath(configPath: string): string {
   if (configPath && configPath !== "claude" && existsSync(configPath)) {
     return configPath;
   }
-  const fallbacks = [
-    "/home/ethan/.nvm/versions/node/v20/bin/claude",
-    "/usr/local/bin/claude",
-    "/usr/bin/claude",
-  ];
+  const onPath = discoverClaudeOnPath();
+  if (onPath) return onPath;
+  const fallbacks = ["/usr/local/bin/claude", "/usr/bin/claude"];
   for (const p of fallbacks) {
-    if (existsSync(p)) {
-      return p;
-    }
+    if (existsSync(p)) return p;
   }
   return configPath || "claude";
 }
@@ -224,6 +233,7 @@ export interface ClaudeStreamEvent {
 export async function* streamClaudeCli(
   cfg: JarvisConfig,
   req: ClaudeCliRequest,
+  abortSignal?: AbortSignal,
 ): AsyncGenerator<ClaudeStreamEvent> {
   const cliCfg = cfg.claude_cli;
 
@@ -258,9 +268,22 @@ export async function* streamClaudeCli(
   let fullOutput = "";
 
   const stdoutIterator = proc.stdout![Symbol.asyncIterator]();
+  const onAbort = () => {
+    try { proc.kill(); } catch {}
+  };
+  if (abortSignal) {
+    if (abortSignal.aborted) {
+      proc.kill();
+      return;
+    }
+    abortSignal.addEventListener("abort", onAbort);
+  }
 
   try {
     while (true) {
+      if (abortSignal?.aborted) {
+        return;
+      }
       const { done, value } = await stdoutIterator.next();
       if (done) break;
 
@@ -355,6 +378,9 @@ export async function* streamClaudeCli(
       yield { type: "message_stop", session_id: req.session_id };
     }
   } finally {
+    if (abortSignal) {
+      abortSignal.removeEventListener("abort", onAbort);
+    }
     proc.kill();
   }
 }

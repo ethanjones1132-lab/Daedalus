@@ -22,6 +22,10 @@ export interface InferenceRecord {
   tokens_out: number;
   error?: string;   // set when ok=false
   fallback_used?: boolean;
+  /** OpenRouter fallback-chain retry count for this turn (0 = primary succeeded). */
+  retry_count?: number;
+  /** Model actually used when a fallback chain was engaged. */
+  fallback_model?: string;
 }
 
 const RING_SIZE = 200;

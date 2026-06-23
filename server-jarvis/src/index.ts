@@ -12,7 +12,7 @@ import { readdirSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 
 import { join } from "path";
 import { homedir } from "os";
 import { spawn, execSync } from "child_process";
-import { loadConfig, normalizeConfig, CONFIG_DIR, COMPANION_FILE, surfaceTemperature } from "./config";
+import { loadConfig, saveConfig, normalizeConfig, CONFIG_DIR, COMPANION_FILE, surfaceTemperature } from "./config";
 import type { JarvisConfig, OllamaConfig, SurfaceType } from "./config";
 import { Database } from "bun:sqlite";
 import { buildLearningPrompt, buildReviewPrompt, buildCodebaseAuditPrompt, buildFootballAuditPrompt } from "./cron-prompts";
@@ -61,13 +61,10 @@ import {
   toApiTools,
 } from "./tool-runtime";
 import type { ToolRuntime, ExecutionContext } from "./tool-runtime";
-import { registerFilesystemBundle } from "./filesystem-bundle";
-import { registerShellBundle } from "./shell-bundle";
-import { registerWebBundle, searchWeb } from "./web-bundle";
-import { registerMetaBundle } from "./meta-bundle";
-import { registerTaskBundle } from "./task-bundle";
-import { registerMcpClientBundle } from "./mcp-client-bundle";
-import { registerInteractiveBundle, getSessionState, clearSessionState } from "./interactive-bundle";
+import { registerStandardBundles } from "./bundles-registry";
+import { searchWeb } from "./web-bundle";
+import { getSessionState, clearSessionState } from "./interactive-bundle";
+import { StreamSession, VisibleTextPipe } from "./stream-emitter";
 import { PredictiveRouter } from "./orchestration/router";
 import { PipelineExecutor } from "./orchestration/pipeline";
 import { outcomeCollector, selfTuningProposer, SelfTuningStore } from "./self-tuning/mod";
@@ -191,13 +188,7 @@ function buildChatRuntime(cfg: JarvisConfig): {
   ctx: ExecutionContext;
 } {
   const runtime = createToolRuntime();
-  registerFilesystemBundle(runtime);
-  registerShellBundle(runtime);
-  registerWebBundle(runtime);
-  registerMetaBundle(runtime);
-  registerTaskBundle(runtime);
-  registerMcpClientBundle(runtime);
-  registerInteractiveBundle(runtime);
+  registerStandardBundles(runtime);
 
   const ctx = makeExecutionContext("chat", cfg, {
     workspace_path: cfg.jarvis_path,
@@ -885,6 +876,62 @@ function optimizeContextWindow(
   return [...pinnedSystemMessages, ...retained];
 }
 
+/** Thrown when the client aborts an in-flight stream — not a user-visible error. */
+class StreamCancelledError extends Error {
+  constructor() {
+    super("stream cancelled");
+    this.name = "StreamCancelledError";
+  }
+}
+
+/** Collect aggregate answer from a streamJarvis Response (cron scheduler contract). */
+async function drainStreamJarvisResponse(resp: Response): Promise<{ output: string; error?: string }> {
+  const reader = resp.body?.getReader();
+  if (!reader) return { output: "", error: "No response body" };
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let streamed = "";
+  let aggregate = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data: ")) continue;
+      const payload = trimmed.slice(6);
+      if (payload === "[DONE]") continue;
+      try {
+        const evt = JSON.parse(payload);
+        if (evt.type === "stream_event" && evt.delta?.text) streamed += evt.delta.text;
+        if (evt.type === "result" && typeof evt.result === "string") aggregate = evt.result;
+        if (evt.type === "error" && evt.error) return { output: streamed, error: String(evt.error) };
+        if (evt.type === "cancelled") return { output: streamed, error: "cancelled" };
+      } catch {
+        // skip malformed frames
+      }
+    }
+  }
+  return { output: aggregate || streamed };
+}
+
+/** Non-streaming cron dispatch — matches cron_scheduler.rs JSON contract. */
+async function runCronInference(body: Record<string, unknown>): Promise<{ success: boolean; output: string; error?: string }> {
+  const prompt = String(body.prompt ?? "");
+  if (!prompt.trim()) return { success: false, output: "", error: "prompt required" };
+  const sessionId = String(body.session_id ?? `cron_${crypto.randomUUID()}`);
+  try {
+    const resp = await streamJarvis(prompt, sessionId, { surface: "cron" });
+    const { output, error } = await drainStreamJarvisResponse(resp);
+    if (error) return { success: false, output, error };
+    return { success: true, output };
+  } catch (e: any) {
+    return { success: false, output: "", error: e?.message ?? String(e) };
+  }
+}
+
 async function streamJarvis(message: string, sessionId: string, options: StreamJarvisOptions = {}): Promise<Response> {
   const cfg = resolveConfig(options.config);
   const surface: SurfaceType = options.surface ?? "chat";
@@ -906,6 +953,26 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
   (async () => {
     const streamAbort = new AbortController();
     activeStreamControllers.set(sessionId, streamAbort);
+    const streamWrite = async (frame: string): Promise<boolean> => {
+      try {
+        await writer.write(encoder.encode(frame));
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const session = new StreamSession({
+      sessionId,
+      write: streamWrite,
+      isAborted: () => streamAbort.signal.aborted,
+    });
+    const emitCancelled = async (): Promise<never> => {
+      if (!session.hasTerminated()) {
+        session.noteTerminal();
+        await streamWrite(`data: ${JSON.stringify({ type: "cancelled", session_id: sessionId })}\n\n`);
+      }
+      throw new StreamCancelledError();
+    };
     try {
       const systemPrompt = options.systemPromptOverride ?? cfg.system_prompt;
       const isOllama = cfg.active_backend === "ollama";
@@ -920,11 +987,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           : ollamaTarget?.modelName ?? cfg.ollama.model;
 
       console.log(`[Jarvis] Stream start session=${sessionId} backend=${cfg.active_backend} model=${modelLabel}`);
-      await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "init", session_id: sessionId, model: modelLabel })}\n\n`));
+      await session.init(modelLabel);
 
       // ── Claude CLI path ──────────────────────────────────────────
       if (cfg.active_backend === "claude_cli") {
-        const reasoningParser = cfg.reasoning.enabled ? new ReasoningParser(sessionId) : null;
+        const reasoningParser = new ReasoningParser(sessionId);
         const resumedSessionId = cliSessionMap.get(sessionId);
         const historyPrompt = !resumedSessionId && turnHistory.length > 0
           ? `${turnHistory.map(m => {
@@ -951,23 +1018,45 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           cwd: cfg.claude_cli.cwd,
           max_turns: 1,
           cliArgs,
-        })) {
+        }, streamAbort.signal)) {
+          if (streamAbort.signal.aborted) {
+            await emitCancelled();
+          }
           if (evt.type === "stream_event" && evt.delta?.text) {
             const text: string = evt.delta.text;
-            if (reasoningParser) {
-              for (const re of reasoningParser.processChunk(text)) {
-                const visibleText = visibleTextFromReasoningEvent(re);
-                if (!visibleText) continue;
-                if (re.type === "reasoning_step") {
+            for (const re of reasoningParser.processChunk(text)) {
+              const visibleText = visibleTextFromReasoningEvent(re);
+              if (!visibleText) continue;
+              if (re.type === "reasoning_step") {
+                if (cfg.reasoning.enabled) {
                   await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
-                } else if (re.type === "reasoning_chunk") {
-                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
-                } else {
-                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: visibleText }, session_id: sessionId })}\n\n`));
                 }
+              } else if (re.type === "reasoning_chunk") {
+                if (cfg.reasoning.enabled) {
+                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
+                }
+              } else {
+                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: visibleText }, session_id: sessionId })}\n\n`));
               }
             }
-            await writer.write(encoder.encode(`data: ${JSON.stringify({ ...evt, session_id: sessionId })}\n\n`));
+          } else if (evt.type === "tool_use") {
+            await writer.write(encoder.encode(`data: ${JSON.stringify({
+              type: "tool_use",
+              id: (evt as any).id,
+              name: evt.tool_name,
+              input: evt.tool_input,
+              session_id: sessionId,
+            })}\n\n`));
+          } else if (evt.type === "tool_result") {
+            await writer.write(encoder.encode(`data: ${JSON.stringify({
+              type: "tool_result",
+              name: evt.tool_name,
+              output: evt.tool_output,
+              session_id: sessionId,
+            })}\n\n`));
+          } else if (evt.type === "message_stop") {
+            session.noteTerminal();
+            await streamWrite(`data: ${JSON.stringify({ type: "message_stop", session_id: sessionId })}\n\n`);
           } else if (evt.type === "error") {
             if (resumedSessionId) {
               cliSessionMap.delete(sessionId);
@@ -1140,8 +1229,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             streamAbort.signal.removeEventListener("abort", onStreamAbort);
             if (fetchErr.name === "AbortError") {
               if (streamAbort.signal.aborted) {
-                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "cancelled", session_id: sessionId })}\n\n`));
-                return { content: "", tool_calls: undefined };
+                await emitCancelled();
               }
               throw new Error(`Request timed out after ${MODEL_REQUEST_TIMEOUT_MS / 1000}s. The model may be loading or overloaded.`);
             }
@@ -1154,15 +1242,18 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           if (!fetchRes.ok) {
             const errText = await fetchRes.text();
             clearTimeout(timeout);
+            streamAbort.signal.removeEventListener("abort", onStreamAbort);
             throw new Error(`API ${fetchRes.status}: ${errText.slice(0, 300)}`);
           }
           clearTimeout(timeout);
-          streamAbort.signal.removeEventListener("abort", onStreamAbort);
 
           const reader = fetchRes.body?.getReader();
-          if (!reader) throw new Error("No response body from API");
+          if (!reader) {
+            streamAbort.signal.removeEventListener("abort", onStreamAbort);
+            throw new Error("No response body from API");
+          }
 
-          const reasoningParser = cfg.reasoning.enabled ? new ReasoningParser(sessionId) : null;
+          const reasoningParser = new ReasoningParser(sessionId);
           const decoder = new TextDecoder();
           let buffer = "";
           let fullTurnText = "";
@@ -1176,7 +1267,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
           };
 
+          try {
           while (true) {
+            if (streamAbort.signal.aborted) {
+              await emitCancelled();
+            }
             const { done, value } = await reader.read();
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
@@ -1216,9 +1311,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                         const visibleText = visibleTextFromReasoningEvent(re);
                         if (!visibleText) continue;
                         if (re.type === "reasoning_step") {
-                          await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
+                          if (cfg.reasoning.enabled) {
+                            await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
+                          }
                         } else if (re.type === "reasoning_chunk") {
-                          await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
+                          if (cfg.reasoning.enabled) {
+                            await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
+                          }
                         } else {
                           const sanitized = textStreamSanitizer.push(visibleText);
                           if (sanitized) {
@@ -1245,9 +1344,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               const visibleText = visibleTextFromReasoningEvent(re);
               if (!visibleText) continue;
               if (re.type === "reasoning_step") {
-                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
+                if (cfg.reasoning.enabled) {
+                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
+                }
               } else if (re.type === "reasoning_chunk") {
-                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
+                if (cfg.reasoning.enabled) {
+                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
+                }
               } else {
                 const sanitized = textStreamSanitizer.push(visibleText);
                 if (sanitized) {
@@ -1255,8 +1358,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 }
               }
             }
-            const trace = reasoningParser.finalize();
-            await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_complete", trace, session_id: sessionId })}\n\n`));
+            if (cfg.reasoning.enabled) {
+              const trace = reasoningParser.finalize();
+              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_complete", trace, session_id: sessionId })}\n\n`));
+            }
           }
 
           const remaining = textStreamSanitizer.flush();
@@ -1294,6 +1399,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             content: cleanContent,
             tool_calls: parsedToolCalls.length > 0 ? parsedToolCalls : undefined,
           };
+          } finally {
+            streamAbort.signal.removeEventListener("abort", onStreamAbort);
+          }
         };
 
         // Route the user request using the predictive router
@@ -1339,8 +1447,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
         // Write final done messages
         await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "agent_run_id", agent_run_id: agentRunId, session_id: sessionId })}\n\n`));
-        await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "message_stop", session_id: sessionId })}\n\n`));
-        await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "result", subtype: "success", is_error: false, result: result, session_id: sessionId })}\n\n`));
+        await session.finish(result);
         return;
       }
 
@@ -1367,6 +1474,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       let toolExecutionCount = 0;
       let sessionCostInfo: OpenRouterCostInfo | null = null;
       let prevToolCallCount = 0;  // Track tools called in previous turn for nudge logic
+      let lastFallbackRetries = 0;
+      let lastFallbackModel: string | undefined;
       const requiresVerifiedWebSearch = cfg.tools.enabled && hasExplicitWebSearchIntent(message);
       const requiresLocalToolUse = cfg.tools.enabled && hasLocalWorkspaceToolIntent(message);
 
@@ -1539,7 +1648,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             const result = await chatCompletionWithFallback(cfg, requestBody, ctrl.signal);
             fetchRes = result.response;
             actualModelUsed = result.model_used;
+            lastFallbackRetries = result.retries;
             if (result.retries > 0) {
+              lastFallbackModel = result.model_used;
               console.log(`[OpenRouter] Used model ${result.model_used} after ${result.retries} retry attempt(s)`);
               await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "fallback_notice", model: result.model_used, retries: result.retries, session_id: sessionId })}\n\n`));
             }
@@ -1551,8 +1662,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           streamAbort.signal.removeEventListener("abort", onStreamAbortMain);
           if (fetchErr.name === "AbortError") {
             if (streamAbort.signal.aborted) {
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "cancelled", session_id: sessionId })}\n\n`));
-              return;
+              await emitCancelled();
             }
             throw new Error(`Request timed out after ${requestTimeout / 1000}s. The model may be loading or overloaded.`);
           }
@@ -1579,16 +1689,24 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
             const retryCtrl = new AbortController();
             const retryTimeout = setTimeout(() => retryCtrl.abort(), requestTimeout);
+            const onRetryAbort = () => retryCtrl.abort();
+            streamAbort.signal.addEventListener("abort", onRetryAbort);
             try {
               fetchRes = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(requestBody), signal: retryCtrl.signal });
               if (!fetchRes.ok) {
                 const retryErrText = await fetchRes.text();
                 clearTimeout(retryTimeout);
+                streamAbort.signal.removeEventListener("abort", onRetryAbort);
                 throw new Error(`API ${fetchRes.status}: ${retryErrText.slice(0, 300)}`);
               }
               clearTimeout(retryTimeout);
+              streamAbort.signal.removeEventListener("abort", onRetryAbort);
             } catch (retryErr: any) {
               clearTimeout(retryTimeout);
+              streamAbort.signal.removeEventListener("abort", onRetryAbort);
+              if (retryErr.name === "AbortError" && streamAbort.signal.aborted) {
+                await emitCancelled();
+              }
               throw retryErr;
             }
           } else {
@@ -1604,53 +1722,28 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         if (!reader) throw new Error("No response body from API");
         streamAbort.signal.removeEventListener("abort", onStreamAbortMain);
 
-        const reasoningParser = cfg.reasoning.enabled ? new ReasoningParser(sessionId) : null;
+        const textPipe = session.newTextPipe(cfg.reasoning.enabled);
         const decoder = new TextDecoder();
         let buffer = "";
         let turnText = "";
         let lastActivity = Date.now();
         let activeToolCalls: any[] = [];
-        const textStreamSanitizer = new TextToolCallStreamSanitizer();
         const holdVisibleText = !forceFinalAnswerOnly
           && ((requiresVerifiedWebSearch && !verifiedWebSearchDone)
             || (requiresLocalToolUse && toolExecutionCount === 0));
         const emitVisibleText = async (text: string) => {
           if (!text) return;
-          if (reasoningParser) {
-            for (const re of reasoningParser.processChunk(text)) {
-              const visibleText = visibleTextFromReasoningEvent(re);
-              if (!visibleText) continue;
-              if (re.type === "reasoning_step") {
-                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
-              } else if (re.type === "reasoning_chunk") {
-                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
-              } else {
-                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: visibleText }, session_id: sessionId })}\n\n`));
-              }
-            }
-          } else {
-            await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text }, session_id: sessionId })}\n\n`));
-          }
+          await textPipe.push(text);
         };
         const completeReasoning = async () => {
-          if (!reasoningParser) return;
-          for (const re of reasoningParser.flush()) {
-            const visibleText = visibleTextFromReasoningEvent(re);
-            if (!visibleText) continue;
-            if (re.type === "reasoning_step") {
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
-            } else if (re.type === "reasoning_chunk") {
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
-            } else {
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: visibleText }, session_id: sessionId })}\n\n`));
-            }
-          }
-          const trace = reasoningParser.finalize();
-          await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_complete", trace, session_id: sessionId })}\n\n`));
+          await textPipe.finish();
         };
 
         try {
           while (true) {
+            if (streamAbort.signal.aborted) {
+              await emitCancelled();
+            }
             const chunkTimeout = setTimeout(() => {
               if (Date.now() - lastActivity > MODEL_STREAM_STALL_TIMEOUT_MS) reader.cancel("Stream stalled");
             }, MODEL_STREAM_STALL_CHECK_MS);
@@ -1696,8 +1789,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                   if (content) {
                     turnText += content;
                     fullText += content;
-                    const visibleText = textStreamSanitizer.push(content);
-                    if (!holdVisibleText) await emitVisibleText(visibleText);
+                    if (!holdVisibleText) await emitVisibleText(content);
                   }
                 }
 
@@ -1738,11 +1830,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           && requiresLocalToolUse
           && toolExecutionCount === 0
           && !forcedLocalInspectionDone;
-        const safeTail = textStreamSanitizer.flush();
-
-        if (!holdVisibleText) {
-          await emitVisibleText(safeTail);
-        } else if (validCalls.length === 0 && runnableTextCalls.length === 0 && !shouldForceWebSearch && !shouldForceLocalInspection) {
+        if (holdVisibleText && validCalls.length === 0 && runnableTextCalls.length === 0 && !shouldForceWebSearch && !shouldForceLocalInspection) {
           await emitVisibleText(textExtraction.cleanedText);
         }
         await completeReasoning();
@@ -1865,8 +1953,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
             // If the user was asked a question, stop the loop and wait for their response.
             if (call.name === "ask_user_question") {
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "message_stop", session_id: sessionId })}\n\n`));
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "result", subtype: "success", is_error: false, result: toolOutput, session_id: sessionId })}\n\n`));
+              await session.finish(toolOutput);
               loopDone = true;
               break;
             }
@@ -1906,8 +1993,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             logOpenRouterCost(sessionCostInfo);
             await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "cost_info", ...sessionCostInfo, session_id: sessionId })}\n\n`));
           }
-          await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "message_stop", session_id: sessionId })}\n\n`));
-          await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "result", subtype: "success", is_error: false, result: resultText, session_id: sessionId })}\n\n`));
+          await session.finish(resultText);
           loopDone = true;
         } else {
           // Model called tools!
@@ -1977,8 +2063,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
             // If the user was asked a question, stop the loop and wait for their response.
             if (tc.function.name === "ask_user_question") {
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "message_stop", session_id: sessionId })}\n\n`));
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "Waiting for user response to question.", session_id: sessionId })}\n\n`));
+              await session.finish("Waiting for user response to question.");
               loopDone = true;
               break;
             }
@@ -2000,18 +2085,24 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       recordInference({
         ts: Date.now(),
         backend: _cfg2.active_backend as Backend,
-        model: _cfg2.active_backend === "openrouter"
+        model: lastFallbackModel ?? (_cfg2.active_backend === "openrouter"
           ? (_cfg2.openrouter.model ?? "openrouter/free")
           : _cfg2.active_backend === "claude_cli"
           ? (_cfg2.claude_cli.model ?? "claude_cli")
-          : _cfg2.ollama.model,
+          : _cfg2.ollama.model),
         ok: true,
         latency_ms: Date.now() - _turnStart,
         tokens_in: 0,
         tokens_out: 0,
+        fallback_used: lastFallbackRetries > 0,
+        retry_count: lastFallbackRetries,
+        fallback_model: lastFallbackModel,
       });
 
     } catch (error: any) {
+      if (error?.name === "StreamCancelledError") {
+        return;
+      }
       const errMsg = error?.message || String(error);
       console.error(`[Jarvis] Stream error session=${sessionId}:`, errMsg);
       const _cfg3 = resolveConfig(options.config);
@@ -2034,6 +2125,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       } catch {}
     } finally {
       activeStreamControllers.delete(sessionId);
+      try {
+        await session.ensureTerminal();
+      } catch {}
       try { await writer.close(); } catch {}
     }
   })();
@@ -2238,7 +2332,14 @@ async function baseFetch(req: Request): Promise<Response> {
     }
     if (path === "/config" && req.method === "GET") return Response.json(loadConfig());
     if (path === "/config" && req.method === "POST") {
-      return Response.json({ ok: true });
+      const body = await req.json().catch(() => ({}));
+      const saved = saveConfig(body);
+      return Response.json({ ok: true, config: saved });
+    }
+    if (path === "/cron/run" && req.method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      const result = await runCronInference(body as Record<string, unknown>);
+      return Response.json(result);
     }
     if (path === "/chat/stream" && req.method === "POST") {
       const body = await req.json();

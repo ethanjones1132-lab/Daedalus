@@ -409,6 +409,7 @@ export function SkillsView() {
           <div className="w-1/2 min-h-0">
             <GlassCard className="p-4 h-full">
               <SkillDetail
+                key={selected.id}
                 skill={selected}
                 onClose={() => setSelectedId(null)}
                 onToggle={toggle}

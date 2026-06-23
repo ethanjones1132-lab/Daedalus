@@ -118,6 +118,15 @@ interface CompanionCronJob {
   enabled: boolean;
 }
 
+/** Phase 2.5 — explicit placeholder for ViewId members not yet in the nav. */
+function UnwiredView({ viewId }: { viewId: ViewId }) {
+  return (
+    <EmptyState
+      message={`${viewId} is not wired yet — use the sidebar for active surfaces, or see PRIORITIES.md for the rollout plan.`}
+    />
+  );
+}
+
 function isSelfImprovementCron(job: CompanionCronJob): boolean {
   const prompt = job.prompt.toLowerCase();
   return (
@@ -627,17 +636,25 @@ function AppInner() {
       })
       .catch(() => {});
 
-    const alertListen = listen<ActionRegistryAlert[]>('action-registry://alerts', (e) => {
+    const unsubs: Array<() => void> = [];
+    let disposed = false;
+    listen<ActionRegistryAlert[]>('action-registry://alerts', (e) => {
       showRegistryAlert(e.payload);
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else unsubs.push(unlisten);
     });
 
     return () => {
-      alertListen.then((unlisten) => unlisten());
+      disposed = true;
+      unsubs.forEach((f) => f());
     };
   }, [warn, toastError]);
 
   useEffect(() => {
-    const missedListen = listen<CompanionCronJob[]>('cron://missed-jobs', (e) => {
+    const unsubs: Array<() => void> = [];
+    let disposed = false;
+    listen<CompanionCronJob[]>('cron://missed-jobs', (e) => {
       const count = e.payload.length;
       if (count > 0) {
         warn(
@@ -657,10 +674,14 @@ function AppInner() {
       } else {
         void refreshCronAwareness();
       }
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else unsubs.push(unlisten);
     });
 
     return () => {
-      missedListen.then((unlisten) => unlisten());
+      disposed = true;
+      unsubs.forEach((f) => f());
     };
   }, [warn, refreshCronAwareness]);
 
@@ -672,7 +693,11 @@ function AppInner() {
 
   const renderView = () => {
     switch (currentView) {
-      case 'jarvis': return <ErrorBoundary><JarvisView onCompanionChange={setCompanion} /></ErrorBoundary>;
+      case 'jarvis':
+      case 'jarvis-hub':
+      case 'jarvis-chat':
+      case 'jarvis-companion':
+        return <ErrorBoundary><JarvisView onCompanionChange={setCompanion} /></ErrorBoundary>;
       case 'chat-feeds': return <ChatFeedsView />;
       case 'overview': return <OverviewView />;
       case 'sessions': return <SessionsView />;
@@ -696,6 +721,17 @@ function AppInner() {
       case 'plugins': return <ErrorBoundary><PluginsView /></ErrorBoundary>;
       case 'gateway': return <ErrorBoundary><GatewayView /></ErrorBoundary>;
       case 'hermes': return <ErrorBoundary><HermesChat /></ErrorBoundary>;
+      case 'jarvis-sessions':
+        return <ErrorBoundary><JarvisView initialSubView="sessions" onCompanionChange={setCompanion} /></ErrorBoundary>;
+      case 'jarvis-skills':
+        return <SkillsView />;
+      case 'jarvis-tools':
+        return <ErrorBoundary><JarvisView initialSubView="control" onCompanionChange={setCompanion} /></ErrorBoundary>;
+      case 'instances':
+      case 'usage':
+      case 'logs':
+      case 'doctor':
+        return <UnwiredView viewId={currentView} />;
       default: return <OverviewView />;
     }
   };

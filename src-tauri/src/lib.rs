@@ -84,9 +84,14 @@ fn find_ollama_binary() -> Option<String> {
 }
 
 fn find_jarvis_python() -> Option<String> {
-    if let Ok(home) = std::env::var("HOME") {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok();
+    if let Some(home) = home {
         for rel in [
+            ".openclaw/jarvis/hermes/.venv/Scripts/python.exe",
             ".openclaw/jarvis/hermes/.venv/bin/python",
+            ".openclaw/jarvis/hermes/venv/Scripts/python.exe",
             ".openclaw/jarvis/hermes/venv/bin/python",
         ] {
             let p = format!("{home}/{rel}");
@@ -96,6 +101,21 @@ fn find_jarvis_python() -> Option<String> {
         }
     }
     Some("python3".into())
+}
+
+fn build_hermes_config() -> crate::jarvis::hermes::process::HermesConfig {
+    use std::path::PathBuf;
+    let mut config = crate::jarvis::hermes::process::HermesConfig::default();
+    if let Some(py) = find_jarvis_python() {
+        config.python = PathBuf::from(py);
+    }
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        config.hermes_home = PathBuf::from(home)
+            .join(".openclaw")
+            .join("jarvis")
+            .join("hermes");
+    }
+    config
 }
 
 fn spawn_ollama() -> Option<std::process::Child> {
@@ -723,7 +743,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .manage(jarvis_state)
         .manage(db)
-        .manage(HermesAppState::new())
+        .manage(HermesAppState::with_config(build_hermes_config()))
         .setup(|app| {
             // Ensure the OnceLocks are initialized
             crate::PROXY_PROCESS.get_or_init(|| std::sync::Mutex::new(None));
@@ -918,6 +938,7 @@ pub fn run() {
             set_agent_enabled,
             bind_agent_channel,
             unbind_agent_channel,
+            list_agent_channel_bindings,
             get_gateway_status,
             optimize_claude_settings,
             check_updates,

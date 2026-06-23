@@ -405,14 +405,4 @@ pub async fn jarvis_recall_cold_memory(
     }))
 }
 
-// `update_token_count` is referenced by lib.rs but is also a member of the
-// sessions command set; the canonical impl lives in commands/sessions.rs.
-// Stub here as a no-op so the macro can resolve either way.
-#[tauri::command]
-pub async fn update_token_count(
-    _session_id: String,
-    _tokens_in: i64,
-    _tokens_out: i64,
-) -> Result<(), String> {
-    Ok(())
-}
+// `update_token_count` canonical impl: commands/sessions.rs

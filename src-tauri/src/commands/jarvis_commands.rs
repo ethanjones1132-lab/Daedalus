@@ -108,6 +108,7 @@ pub async fn run_learning_session(
 #[tauri::command]
 pub async fn jarvis_send_message(
     app: AppHandle,
+    db: tauri::State<'_, crate::db::AppDb>,
     message: String,
     session_id: String,
 ) -> Result<(), String> {
@@ -119,21 +120,50 @@ pub async fn jarvis_send_message(
     crate::ensure_jarvis_server_started().await?;
     let base_url = crate::wsl::get_cached_bun_url()
         .unwrap_or_else(|| "http://127.0.0.1:19877".to_string());
-    run_jarvis_message(app, base_url, session_id, message)
+
+    let history = if session_id.is_empty() {
+        Vec::new()
+    } else {
+        crate::commands::sessions::history_for_chat_stream(&db, &session_id)?
+    };
+
+    if !session_id.is_empty() {
+        crate::commands::sessions::insert_message_row(&db, &session_id, "user", &message, 0)?;
+    }
+
+    run_jarvis_message(app, base_url, session_id, message, history)
 }
 
 #[tauri::command]
 pub async fn cancel_chat_stream(session_id: String) -> Result<bool, String> {
-    // The recovered runner spawns the WSL child in a fire-and-forget task
-    // tracked only by a thread-local handle. A future hardening pass will
-    // plumb a CancellationToken through queue.rs; for now we return Ok(false)
-    // to signal "no stream found / not implemented" so the UI can fall back
-    // to displaying a stale stream as finished.
+    // POST to the Bun server's `/chat/cancel` route so the in-flight SSE
+    // controller on the Bun side aborts the OpenRouter/Ollama fetch and emits
+    // a `cancelled` frame (which the Rust `SseRelay` now treats as terminal —
+    // see runner.rs::SseFrameOutcome::Cancelled). Without this, the only way
+    // to escape a hung stream was to restart the app.
     //
-    // The session_id argument is preserved so the future implementation can
-    // match it against the per-session child process table.
-    let _ = session_id;
-    Ok(false)
+    // The Bun route reads `session_id` to match the active StreamSession
+    // (see server-jarvis/src/index.ts ::POST /chat/cancel). Returns Ok(true)
+    // when the cancel fires; the UI flips `isStreaming=false` on success and
+    // surfaces any returned error to the user as a toast.
+    let base = crate::wsl::get_cached_bun_url()
+        .unwrap_or_else(|| "http://127.0.0.1:19877".to_string());
+    let url = format!("{}/chat/cancel", base.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({ "session_id": session_id }))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to POST /chat/cancel: {e}"))?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("/chat/cancel returned {code}: {body}"));
+    }
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::json!({}));
+    Ok(body.get("cancelled").and_then(|v| v.as_bool()).unwrap_or(false))
 }
 
 // The chat-session commands map the canonical SQLite session (commands/sessions.rs)
@@ -211,18 +241,25 @@ pub async fn jarvis_tool_decision(
         session_id, tool_call_id, approved
     );
     // Forward to the Bun server's approval registry so the paused tool
-    // continuation can resume or be denied.
+    // continuation can resume or be denied. Surface the POST error to the UI
+    // (the previous implementation silently swallowed it via `let _ = ...`,
+    // leaving the orchestrator pinned waiting on a decision that never came).
     let base = crate::wsl::get_cached_bun_url()
         .unwrap_or_else(|| "http://127.0.0.1:19877".to_string());
     let url = format!("{}/tool/decision", base.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let _ = client
+    let resp = client
         .post(&url)
         .json(&serde_json::json!({ "call_id": tool_call_id, "approved": approved }))
         .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
-        .map_err(|e| eprintln!("[jarvis] tool decision POST failed: {e}"));
+        .map_err(|e| format!("Tool decision POST failed: {e}"))?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Tool decision returned {code}: {body}"));
+    }
     Ok(())
 }
 

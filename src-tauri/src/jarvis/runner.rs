@@ -17,6 +17,7 @@ pub fn run_jarvis_message(
     base_url: String,
     session_id: String,
     message: String,
+    history: Vec<serde_json::Value>,
 ) -> Result<(), String> {
     let effective_session_id = if session_id.is_empty() {
         uuid::Uuid::new_v4().to_string()
@@ -47,7 +48,11 @@ pub fn run_jarvis_message(
 
         let resp = match client
             .post(&url)
-            .json(&serde_json::json!({ "message": message, "session_id": sid }))
+            .json(&serde_json::json!({
+                "message": message,
+                "session_id": sid,
+                "history": history,
+            }))
             .send()
         {
             Ok(r) => r,
@@ -130,6 +135,62 @@ pub fn run_jarvis_message(
                     terminated = true;
                     break;
                 }
+                SseFrameOutcome::MessageStop => {
+                    // Bun always emits `message_stop` immediately before the trailing
+                    // `result` frame (orchestrator + non-orchestrator paths). Do NOT
+                    // terminate here — breaking the read loop drops the aggregate
+                    // answer when no `stream_event` deltas were sent (orchestrator
+                    // synthesizer, holdVisibleText tool turns, etc.). Terminal `done`
+                    // is emitted by ResultThenDone / Done / the EOF safety net.
+                }
+                SseFrameOutcome::Cancelled => {
+                    // User-initiated stop — clear the spinner without a scary error banner.
+                    let _ = app.emit("jarvis://done", serde_json::json!({ "session_id": sid }));
+                    terminated = true;
+                    break;
+                }
+                SseFrameOutcome::ToolCall { call_id, name, arguments } => {
+                    let _ = app.emit(
+                        "jarvis://tool_call",
+                        serde_json::json!({
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": arguments,
+                            "session_id": sid,
+                        }),
+                    );
+                }
+                SseFrameOutcome::ReasoningComplete { trace } => {
+                    let _ = app.emit(
+                        "jarvis://reasoning_complete",
+                        serde_json::json!({
+                            "trace": trace,
+                            "session_id": sid,
+                        }),
+                    );
+                }
+                SseFrameOutcome::ToolResult { name, output, is_error, call_id } => {
+                    let _ = app.emit(
+                        "jarvis://tool_result",
+                        serde_json::json!({
+                            "call_id": call_id,
+                            "name": name,
+                            "output": output,
+                            "is_error": is_error,
+                            "session_id": sid,
+                        }),
+                    );
+                }
+                SseFrameOutcome::Cost { tokens, cost_usd } => {
+                    let _ = app.emit(
+                        "jarvis://cost",
+                        serde_json::json!({
+                            "tokens": tokens,
+                            "cost_usd": cost_usd,
+                            "session_id": sid,
+                        }),
+                    );
+                }
                 SseFrameOutcome::ApprovalRequest { call_id, name, arguments } => {
                     // Relay to the UI so ToolApprovalModal can surface it. The UI
                     // sends the decision back via `jarvis_tool_decision` (Tauri command)
@@ -193,6 +254,40 @@ pub enum SseFrameOutcome {
     },
     /// `[DONE]` sentinel — terminal.
     Done,
+    /// `message_stop` frame — terminal. Bun emits this on every chat completion,
+    /// so we honor it directly instead of relying on a trailing `result`/EOF only.
+    MessageStop,
+    /// `cancelled` frame — terminal. Bun emits this on abort and exits without a
+    /// trailing `result` or `message_stop`; without honoring it the relay would
+    /// block until the 900s reqwest timeout (the EOF fallback eventually clears
+    /// the spinner, but the user perceives "no response").
+    Cancelled,
+    /// Tool call visibility frame — Bun emits `tool_use` (extracted below) when an
+    /// agent invokes a tool. We surface it so the UI can render an inline tool-call
+    /// card with name + arguments.
+    ToolCall {
+        call_id: String,
+        name: String,
+        arguments: serde_json::Value,
+    },
+    /// Chain-of-thought trace finalized for the turn (`reasoning_complete`).
+    ReasoningComplete {
+        trace: serde_json::Value,
+    },
+    /// Tool result visibility frame — Bun emits `tool_result` after a tool runs;
+    /// we surface output + error flag for the inline card.
+    ToolResult {
+        call_id: String,
+        name: String,
+        output: String,
+        is_error: bool,
+    },
+    /// Token usage / cost frame — Bun emits `cost_info`. We surface tokens and
+    /// dollar cost so the footer can show the running tally per turn.
+    Cost {
+        tokens: i64,
+        cost_usd: f64,
+    },
     /// Policy "ask" — the server paused on a tool call and needs the user to
     /// approve or deny before execution continues. The UI shows ToolApprovalModal
     /// and POSTs the decision to `/tool/decision`.
@@ -275,7 +370,44 @@ impl SseRelay {
                             } else {
                                 token = Some(text.to_string());
                             }
+                        } else if evt
+                            .get("is_error")
+                            .and_then(|b| b.as_bool())
+                            .unwrap_or(false)
+                        {
+                            // Explicit error result with empty text — surface the
+                            // subtype (or a generic message) as a readable error.
+                            error = Some(
+                                evt.get("subtype")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("Empty error result")
+                                    .to_string(),
+                            );
+                        } else {
+                            // Empty result with no tokens streamed and no error
+                            // flag — most likely the synthesizer threw before
+                            // emitting any chunk. Synthesize a fallback token so the
+                            // chat bubble isn't blank. Keeps the user informed instead
+                            // of staring at a streaming cursor that disappeared.
+                            token = Some("⚠ Synthesizer returned no output.".to_string());
                         }
+                    } else if evt
+                        .get("is_error")
+                        .and_then(|b| b.as_bool())
+                        .unwrap_or(false)
+                    {
+                        // No result field at all but is_error=true — surface the
+                        // subtype if present, otherwise a generic message.
+                        error = Some(
+                            evt.get("subtype")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("Synthesizer returned no output")
+                                .to_string(),
+                        );
+                    } else {
+                        // No result field and no error — same scenario: a fallback
+                        // so the chat bubble isn't blank.
+                        token = Some("⚠ Synthesizer returned no output.".to_string());
                     }
                 }
                 SseFrameOutcome::ResultThenDone { token, error }
@@ -289,9 +421,20 @@ impl SseRelay {
                 if let Some(text) = evt
                     .get("content")
                     .or_else(|| evt.get("chunk"))
+                    .or_else(|| evt.get("text"))
                     .and_then(|c| c.as_str())
                 {
                     return SseFrameOutcome::Reasoning(text.to_string());
+                }
+                // Bun emits reasoning_step as `{ step: { content: "..." } }`.
+                if evt.get("type").and_then(|t| t.as_str()) == Some("reasoning_step") {
+                    if let Some(text) = evt
+                        .get("step")
+                        .and_then(|s| s.get("content"))
+                        .and_then(|c| c.as_str())
+                    {
+                        return SseFrameOutcome::Reasoning(text.to_string());
+                    }
                 }
                 SseFrameOutcome::Continue
             }
@@ -311,6 +454,84 @@ impl SseRelay {
                     }
                 }
                 SseFrameOutcome::Continue
+            }
+            Some("message_stop") => SseFrameOutcome::MessageStop,
+            Some("cancelled") => SseFrameOutcome::Cancelled,
+            Some("reasoning_complete") => {
+                let trace = evt.get("trace").cloned().unwrap_or(serde_json::Value::Null);
+                SseFrameOutcome::ReasoningComplete { trace }
+            }
+            Some("tool_use") => {
+                let call_id = evt
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| evt.get("call_id").and_then(|v| v.as_str()))
+                    .unwrap_or("")
+                    .to_string();
+                let name = evt
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| {
+                        evt.get("tool_name").and_then(|v| v.as_str())
+                    })
+                    .unwrap_or("unknown")
+                    .to_string();
+                let arguments = evt
+                    .get("arguments")
+                    .cloned()
+                    .or_else(|| evt.get("input").cloned())
+                    .unwrap_or(serde_json::Value::Null);
+                SseFrameOutcome::ToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                }
+            }
+            Some("tool_result") => {
+                let call_id = evt
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| evt.get("tool_use_id").and_then(|v| v.as_str()))
+                    .unwrap_or("")
+                    .to_string();
+                let name = evt
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| evt.get("tool_name").and_then(|v| v.as_str()))
+                    .unwrap_or("unknown")
+                    .to_string();
+                let output = evt
+                    .get("output")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| evt.get("content").and_then(|c| c.as_str()))
+                    .unwrap_or("")
+                    .to_string();
+                let is_error = evt
+                    .get("is_error")
+                    .and_then(|v| v.as_bool())
+                    .or_else(|| {
+                        evt.get("status").and_then(|s| s.as_str()).map(|s| s == "error")
+                    })
+                    .unwrap_or(false);
+                SseFrameOutcome::ToolResult {
+                    call_id,
+                    name,
+                    output,
+                    is_error,
+                }
+            }
+            Some("cost_info") => {
+                let tokens = evt
+                    .get("total_tokens")
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| evt.get("tokens").and_then(|v| v.as_i64()))
+                    .unwrap_or(0);
+                let cost_usd = evt
+                    .get("cost_usd")
+                    .and_then(|v| v.as_f64())
+                    .or_else(|| evt.get("cost").and_then(|v| v.as_f64()))
+                    .unwrap_or(0.0);
+                SseFrameOutcome::Cost { tokens, cost_usd }
             }
             _ => SseFrameOutcome::Continue, // init / heartbeat / unknown
         }
@@ -353,6 +574,161 @@ mod sse_tests {
     fn done_sentinel_is_terminal() {
         let mut r = SseRelay::new();
         assert_eq!(r.handle_line("data: [DONE]"), SseFrameOutcome::Done);
+    }
+
+    #[test]
+    fn message_stop_is_non_terminal_marker() {
+        // `message_stop` is a progress marker, not a stream terminator. The Bun
+        // server always sends a trailing `result` frame after it.
+        let mut r = SseRelay::new();
+        assert_eq!(
+            r.handle_line(r#"data: {"type":"message_stop"}"#),
+            SseFrameOutcome::MessageStop,
+        );
+    }
+
+    #[test]
+    fn message_stop_before_result_surfaces_aggregate_answer() {
+        // Regression: breaking the SSE read loop on `message_stop` dropped the
+        // trailing `result` when no `stream_event` deltas were sent (orchestrator
+        // path). The relay must keep parsing through `message_stop`.
+        let mut r = SseRelay::new();
+        assert_eq!(
+            r.handle_line(r#"data: {"type":"message_stop","session_id":"abc"}"#),
+            SseFrameOutcome::MessageStop,
+        );
+        let out = r.handle_line(
+            r#"data: {"type":"result","subtype":"success","is_error":false,"result":"final answer"}"#,
+        );
+        assert_eq!(
+            out,
+            SseFrameOutcome::ResultThenDone {
+                token: Some("final answer".to_string()),
+                error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn reasoning_chunk_accepts_text_field_from_bun() {
+        let mut r = SseRelay::new();
+        assert_eq!(
+            r.handle_line(r#"data: {"type":"reasoning_chunk","text":"thinking"}"#),
+            SseFrameOutcome::Reasoning("thinking".to_string())
+        );
+    }
+
+    #[test]
+    fn reasoning_step_accepts_nested_step_content_from_bun() {
+        let mut r = SseRelay::new();
+        let out = r.handle_line(
+            r#"data: {"type":"reasoning_step","step":{"content":"planning step"}}"#,
+        );
+        assert_eq!(out, SseFrameOutcome::Reasoning("planning step".to_string()));
+    }
+
+    #[test]
+    fn cancelled_frame_is_terminal() {
+        // Bun's abort path emits `cancelled` and exits without a trailing
+        // `result`/`message_stop` — without honoring it the relay blocks until
+        // the reqwest 900s timeout.
+        let mut r = SseRelay::new();
+        assert_eq!(
+            r.handle_line(r#"data: {"type":"cancelled"}"#),
+            SseFrameOutcome::Cancelled,
+        );
+    }
+
+    #[test]
+    fn empty_result_after_no_tokens_surfaces_a_fallback_token() {
+        // Regression: previously a `{type:"result", result:"", is_error:false}`
+        // frame following zero tokens would short-circuit on `text.is_empty()`
+        // and never emit, leaving no chat bubble while still firing `done`. The
+        // user saw the spinner disappear with no message.
+        let mut r = SseRelay::new();
+        let out = r.handle_line(r#"data: {"type":"result","result":"","is_error":false}"#);
+        match out {
+            SseFrameOutcome::ResultThenDone { token: Some(t), error: None } => {
+                assert!(!t.is_empty(), "fallback token must be non-empty");
+            },
+            other => panic!("expected ResultThenDone with a fallback token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_result_with_explicit_is_error_surfaces_a_readable_error() {
+        let mut r = SseRelay::new();
+        let out = r.handle_line(
+            r#"data: {"type":"result","result":"","is_error":true,"subtype":"no_output"}"#,
+        );
+        match out {
+            SseFrameOutcome::ResultThenDone { token: None, error: Some(e) } => {
+                assert_eq!(e, "no_output");
+            },
+            other => panic!("expected ResultThenDone with an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_use_frame_maps_to_tool_call_outcome() {
+        let mut r = SseRelay::new();
+        let out = r.handle_line(
+            r#"data: {"type":"tool_use","id":"tc_1","name":"shell_exec","arguments":{"cmd":"ls"}}"#,
+        );
+        match out {
+            SseFrameOutcome::ToolCall { call_id, name, arguments } => {
+                assert_eq!(call_id, "tc_1");
+                assert_eq!(name, "shell_exec");
+                assert_eq!(arguments, serde_json::json!({"cmd": "ls"}));
+            },
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reasoning_complete_frame_maps_to_reasoning_complete_outcome() {
+        let mut r = SseRelay::new();
+        let out = r.handle_line(
+            r#"data: {"type":"reasoning_complete","trace":{"steps":[]},"session_id":"s1"}"#,
+        );
+        match out {
+            SseFrameOutcome::ReasoningComplete { trace } => {
+                assert_eq!(trace, serde_json::json!({"steps": []}));
+            },
+            other => panic!("expected ReasoningComplete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_frame_maps_to_tool_result_outcome() {
+        let mut r = SseRelay::new();
+        let out = r.handle_line(
+            r#"data: {"type":"tool_result","call_id":"c1","name":"shell_exec","output":"src\n","is_error":false}"#,
+        );
+        match out {
+            SseFrameOutcome::ToolResult { call_id, name, output, is_error } => {
+                assert_eq!(call_id, "c1");
+                assert_eq!(name, "shell_exec");
+                assert_eq!(output, "src\n");
+                assert!(!is_error);
+            },
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cost_info_frame_maps_to_cost_outcome() {
+        let mut r = SseRelay::new();
+        let out = r.handle_line(
+            r#"data: {"type":"cost_info","total_tokens":1234,"cost_usd":0.002}"#,
+        );
+        match out {
+            SseFrameOutcome::Cost { tokens, cost_usd } => {
+                assert_eq!(tokens, 1234);
+                assert!((cost_usd - 0.002).abs() < 1e-9);
+            },
+            other => panic!("expected Cost, got {other:?}"),
+        }
     }
 
     #[test]

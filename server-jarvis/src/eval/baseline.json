@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "total": 14,
-  "passed": 14,
+  "total": 16,
+  "passed": 16,
   "outcomes": {
     "routing/code-review-clean-json": "pass",
     "routing/debug-clean-json": "pass",
@@ -11,6 +11,8 @@
     "routing/partial-json-normalizes-pipeline": "pass",
     "routing/garbage-falls-back-to-general": "pass",
     "routing/empty-output-falls-back": "pass",
+    "routing/test-task": "pass",
+    "routing/plan-high-complexity": "pass",
     "gating/reviewer-read-only": "pass",
     "gating/rewriter-write-only": "pass",
     "gating/executor-gets-all": "pass",

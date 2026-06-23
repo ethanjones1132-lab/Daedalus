@@ -4,7 +4,7 @@
 // Single source of truth for all Jarvis settings.
 // Loaded by both the Bun HTTP server and the Rust backend.
 
-import { readFileSync, existsSync, statSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync } from "fs";
 import { join, resolve } from "path";
 import { homedir } from "os";
 import { execSync } from "child_process";
@@ -391,6 +391,17 @@ export function loadConfig(): JarvisConfig {
 export function invalidateConfigCache(): void {
   configCache = null;
   configCacheTime = 0;
+}
+
+/** Merge partial updates into the on-disk config (canonical Bun write path). */
+export function saveConfig(partial: Partial<JarvisConfig>): JarvisConfig {
+  const current = loadConfig();
+  const merged = normalizeConfig(deepMerge(current, partial));
+  mkdirSync(CONFIG_DIR, { recursive: true });
+  writeFileSync(CONFIG_FILE, JSON.stringify(merged, null, 2), "utf-8");
+  configCache = merged;
+  configCacheTime = Date.now();
+  return merged;
 }
 
 // ── Helpers ──

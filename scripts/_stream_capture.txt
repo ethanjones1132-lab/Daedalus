@@ -1,0 +1,24 @@
+data: {"type":"init","session_id":"test-stream-1","model":"openrouter/free"}
+
+data: {"type":"orchestrator_stage","stage":"planner","status":"running","session_id":"test-stream-1"}
+
+data: {"type":"orchestrator_stage","stage":"planner","status":"failed","session_id":"test-stream-1"}
+
+data: {"type":"orchestrator_stage","stage":"executor","status":"running","session_id":"test-stream-1"}
+
+data: {"type":"orchestrator_stage","stage":"executor","status":"failed","session_id":"test-stream-1"}
+
+data: {"type":"orchestrator_stage","stage":"reviewer","status":"running","session_id":"test-stream-1"}
+
+data: {"type":"orchestrator_stage","stage":"reviewer","status":"failed","session_id":"test-stream-1"}
+
+data: {"type":"orchestrator_stage","stage":"synthesizer","status":"running","session_id":"test-stream-1"}
+
+data: {"type":"orchestrator_stage","stage":"synthesizer","status":"failed","session_id":"test-stream-1"}
+
+data: {"type":"agent_run_id","agent_run_id":"run_aa2763f6-840b-4521-8d81-6a80fec9affa","session_id":"test-stream-1"}
+
+data: {"type":"message_stop","session_id":"test-stream-1"}
+
+data: {"type":"result","subtype":"success","is_error":false,"result":"Synthesis failed: API 401: {\"error\":{\"message\":\"User not found.\",\"code\":401}}","session_id":"test-stream-1"}
+

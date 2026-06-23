@@ -288,6 +288,16 @@ describe("ToolRuntime permission policy", () => {
     const result = await runtime.execute({ id: "c2", name: "any_tool", arguments: {} }, ctx);
     expect(result.is_error).toBe(true);
     expect(result.error).toMatch(/disabled/i);
+    expect(result.error_code).toBe("policy_denied");
+  });
+
+  test("unknown tool returns error_code unknown_tool", async () => {
+    const runtime = createToolRuntime();
+    const result = await runtime.execute(
+      { id: "c0", name: "missing_tool", arguments: {} },
+      makeExecutionContext("chat", defaultConfig()),
+    );
+    expect(result.error_code).toBe("unknown_tool");
   });
 
   // ── ask path: requires_approval → interactive allowed ─────────────────────

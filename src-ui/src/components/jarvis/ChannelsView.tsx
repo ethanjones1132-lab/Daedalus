@@ -159,8 +159,8 @@ export function ChannelsView() {
   const [pendingDelete, setPendingDelete] = useState<Channel | null>(null);
   const { success, error: toastError } = useToast();
 
-  const fetchChannels = useCallback(async () => {
-    setLoading(true);
+  const fetchChannels = useCallback(async (opts?: { silent?: boolean }) => {
+    if (!opts?.silent) setLoading(true);
     setError(null);
     try {
       const list = await invoke<Channel[]>('list_channels');
@@ -168,7 +168,7 @@ export function ChannelsView() {
     } catch (e) {
       setError(String(e));
     } finally {
-      setLoading(false);
+      if (!opts?.silent) setLoading(false);
     }
   }, []);
 
@@ -183,7 +183,7 @@ export function ChannelsView() {
         await invoke<Channel>('add_channel', { name, channelType: type, config });
         success(`Added channel ${name}`);
         setAdding(false);
-        await fetchChannels();
+        await fetchChannels({ silent: true });
       } catch (e) {
         toastError(String(e), 'Add failed');
       }
@@ -197,7 +197,7 @@ export function ChannelsView() {
       try {
         await invoke<boolean>(connected ? 'logout_channel' : 'login_channel', { id: channel.id });
         success(`${connected ? 'Disconnected' : 'Connected'} ${channel.name}`);
-        await fetchChannels();
+        await fetchChannels({ silent: true });
       } catch (e) {
         toastError(String(e), 'Connection toggle failed');
       }
@@ -214,7 +214,7 @@ export function ChannelsView() {
     try {
       await invoke<boolean>('remove_channel', { id: channel.id });
       success(`Removed ${channel.name}`);
-      await fetchChannels();
+      await fetchChannels({ silent: true });
     } catch (e) {
       toastError(String(e), 'Remove failed');
     }

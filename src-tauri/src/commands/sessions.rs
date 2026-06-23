@@ -266,6 +266,16 @@ pub fn delete_session_row(db: &AppDb, session_id: &str) -> Result<bool, String> 
 }
 
 #[tauri::command]
+pub fn update_token_count(
+    db: State<AppDb>,
+    session_id: String,
+    tokens_in: i64,
+    tokens_out: i64,
+) -> Result<(), String> {
+    update_db_token_count(db, &session_id, tokens_in, tokens_out)
+}
+
+#[tauri::command]
 pub fn list_sessions(db: State<AppDb>) -> Result<Vec<SessionSummary>, String> {
     list_session_rows(&db)
 }
@@ -318,6 +328,52 @@ pub fn get_session_history(
     Ok(out)
 }
 
+/// Prior messages for the Bun `/chat/stream` body (excludes the in-flight user turn).
+pub fn history_for_chat_stream(db: &AppDb, session_id: &str) -> Result<Vec<serde_json::Value>, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let mut stmt = conn
+        .prepare(
+            "SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows.flatten() {
+        let (role, content) = row;
+        if ["user", "assistant", "system", "tool"].contains(&role.as_str()) {
+            out.push(serde_json::json!({ "role": role, "content": content }));
+        }
+    }
+    Ok(out)
+}
+
+/// Insert a message row (shared by Tauri command + jarvis_send_message).
+pub fn insert_message_row(
+    db: &AppDb,
+    session_id: &str,
+    role: &str,
+    content: &str,
+    tokens: i64,
+) -> Result<String, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO messages (id, session_id, role, content, tokens, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        rusqlite::params![&id, session_id, role, content, tokens, &now],
+    )
+    .map_err(|e| format!("Failed to insert message: {}", e))?;
+    let _ = conn.execute(
+        "UPDATE sessions SET updated_at = ? WHERE id = ?",
+        rusqlite::params![&now, session_id],
+    );
+    Ok(id)
+}
+
 #[tauri::command]
 pub fn append_message(
     db: State<AppDb>,
@@ -326,21 +382,7 @@ pub fn append_message(
     content: String,
     tokens: Option<i64>,
 ) -> Result<String, String> {
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    let t = tokens.unwrap_or(0);
-    conn.execute(
-        "INSERT INTO messages (id, session_id, role, content, tokens, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        rusqlite::params![&id, &session_id, &role, &content, t, &now],
-    )
-    .map_err(|e| format!("Failed to insert message: {}", e))?;
-    // Bump session's updated_at so list_sessions reorders correctly.
-    let _ = conn.execute(
-        "UPDATE sessions SET updated_at = ? WHERE id = ?",
-        rusqlite::params![&now, &session_id],
-    );
-    Ok(id)
+    insert_message_row(&db, &session_id, &role, &content, tokens.unwrap_or(0))
 }
 
 #[tauri::command]
@@ -417,5 +459,18 @@ mod tests {
         let after = list_session_rows(&db).expect("list after delete");
         assert_eq!(after.len(), 1, "one session remains after delete");
         assert!(!after.iter().any(|s| s.id == a.id));
+    }
+
+    #[test]
+    fn history_for_chat_stream_returns_prior_messages_in_order() {
+        let db = mem_db();
+        let session = create_session_row(&db, Some("chat".into()), None, None, None).expect("create");
+        insert_message_row(&db, &session.id, "user", "hello", 0).expect("user");
+        insert_message_row(&db, &session.id, "assistant", "hi there", 0).expect("assistant");
+        let history = history_for_chat_stream(&db, &session.id).expect("history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["role"], "user");
+        assert_eq!(history[0]["content"], "hello");
+        assert_eq!(history[1]["role"], "assistant");
     }
 }

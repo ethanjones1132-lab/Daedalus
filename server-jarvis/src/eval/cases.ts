@@ -106,6 +106,20 @@ export const ROUTING_CASES: RoutingCase[] = [
     modelOutput: "",
     expect: { task_type: "general", pipeline: DEFAULT_PIPELINE },
   },
+  {
+    id: "routing/test-task",
+    kind: "routing",
+    request: "add unit tests for the router",
+    modelOutput: routingJson("test", ["executor", "reviewer", "synthesizer"], "medium"),
+    expect: { task_type: "test", pipeline: ["executor", "reviewer", "synthesizer"], estimated_complexity: "medium" },
+  },
+  {
+    id: "routing/plan-high-complexity",
+    kind: "routing",
+    request: "plan a large refactor of the entire system",
+    modelOutput: routingJson("plan", ["planner", "executor", "reviewer", "synthesizer"], "high"),
+    expect: { task_type: "plan", pipeline: ["planner", "executor", "reviewer", "synthesizer"], estimated_complexity: "high" },
+  },
 ];
 
 const TOOL_UNIVERSE = [

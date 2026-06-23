@@ -11,6 +11,7 @@
 import { describe, expect, it } from 'vitest';
 // Vite `?raw` import — App.tsx source as a string, robust to cwd/URL scheme.
 import src from './App.tsx?raw';
+import typesSrc from './types.ts?raw';
 
 describe('nav dead-path guard', () => {
   it('every nav view id has a renderView case (no silent fallthrough to default)', () => {
@@ -26,6 +27,20 @@ describe('nav dead-path guard', () => {
     expect(
       missing,
       `nav items with no renderView case (would silently render Overview): ${missing.join(', ')}`,
+    ).toEqual([]);
+  });
+
+  it('every ViewId union member has a renderView case', () => {
+    const viewIds = [...typesSrc.matchAll(/export type ViewId =\s*([\s\S]*?);/g)];
+    expect(viewIds.length).toBe(1);
+    const members = [...viewIds[0][1].matchAll(/'([^']+)'/g)].map((m) => m[1]);
+    const caseLabels = new Set(
+      [...src.matchAll(/case\s+'([^']+)'\s*:/g)].map((m) => m[1]),
+    );
+    const missing = members.filter((id) => !caseLabels.has(id));
+    expect(
+      missing,
+      `ViewId members with no renderView case: ${missing.join(', ')}`,
     ).toEqual([]);
   });
 });

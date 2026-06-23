@@ -27,6 +27,10 @@ export type CallModelFn = (
     stream?: boolean;
     onChunk?: (chunk: string) => void;
     tools?: any[];
+    /** Breadcrumb label for orchestrator agent_activity frames. */
+    stageLabel?: string;
+    /** When true, stream deltas as visible answer tokens instead of agent_activity. */
+    surfaceAsAnswer?: boolean;
   }
 ) => Promise<{ content: string; tool_calls?: any[] }>;
 

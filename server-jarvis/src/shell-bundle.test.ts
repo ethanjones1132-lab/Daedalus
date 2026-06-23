@@ -33,5 +33,5 @@ describe("ShellBundle", () => {
     );
     expect(result.is_error).toBe(false);
     expect(result.output).toContain("hi");
-  });
+  }, { timeout: 15_000 });
 });

@@ -99,7 +99,7 @@ pub async fn hermes_interrupt(state: State<'_, HermesAppState>) -> Result<Hermes
 #[tauri::command]
 pub async fn hermes_invoke(args: HermesInvokeArgs, _app: AppHandle) -> Result<Value, String> {
     let proc = require_process(&_app).await?;
-    proc.invoke(args.method, args.params)
+    proc.invoke(args.method, args.params, args.timeout_ms)
         .await
         .map_err(|e| e.to_string())
 }

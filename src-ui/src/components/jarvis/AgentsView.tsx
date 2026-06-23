@@ -12,7 +12,7 @@
 // plus list_channels() for the binding picker.
 
 import { invoke } from '@tauri-apps/api/core';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   cn,
   ConfirmModal,
@@ -58,19 +58,6 @@ interface AgentDraft {
 const EMPTY_DRAFT: AgentDraft = { name: '', model: '', description: '', system_prompt: '' };
 
 // ── Helpers ────────────────────────────────────────────────────
-
-function boundChannelIds(agent: Agent): string[] {
-  if (!agent.config) return [];
-  try {
-    const parsed = JSON.parse(agent.config);
-    if (Array.isArray(parsed.channels)) {
-      return parsed.channels.filter((c: unknown): c is string => typeof c === 'string');
-    }
-  } catch {
-    /* ignore malformed config */
-  }
-  return [];
-}
 
 // ── Editor (create + edit) ─────────────────────────────────────
 
@@ -163,7 +150,20 @@ function ChannelBindings({
   onChanged: () => void;
 }) {
   const { error: toastError } = useToast();
-  const bound = useMemo(() => new Set(boundChannelIds(agent)), [agent]);
+  const [bound, setBound] = useState<Set<string>>(new Set());
+
+  const refreshBindings = useCallback(async () => {
+    try {
+      const ids = await invoke<string[]>('list_agent_channel_bindings', { agentId: agent.id });
+      setBound(new Set(ids));
+    } catch {
+      setBound(new Set());
+    }
+  }, [agent.id]);
+
+  useEffect(() => {
+    void refreshBindings();
+  }, [refreshBindings]);
 
   const toggle = useCallback(
     async (channel: Channel) => {
@@ -173,12 +173,13 @@ function ChannelBindings({
           agentId: agent.id,
           channelId: channel.id,
         });
+        await refreshBindings();
         onChanged();
       } catch (e) {
         toastError(String(e), 'Channel binding failed');
       }
     },
-    [agent.id, bound, onChanged, toastError],
+    [agent.id, bound, onChanged, refreshBindings, toastError],
   );
 
   if (channels.length === 0) return null;

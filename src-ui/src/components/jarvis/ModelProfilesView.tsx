@@ -115,8 +115,8 @@ export function ModelProfilesView() {
         backend: form.provider,
         model: form.model,
         temperature: form.temperature,
-        max_tokens: form.max_tokens,
-        top_p: 1.0,
+        maxTokens: form.max_tokens,
+        topP: 1.0,
         engine: form.engine,
       });
       success(`Created "${form.name}"`);
