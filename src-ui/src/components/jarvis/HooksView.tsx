@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useState } from 'react';
 import {
   cn,
+  ConfirmModal,
   GlassCard,
   Pill,
   SectionHeader,
@@ -41,6 +42,7 @@ export default function HooksView() {
   const [name, setName] = useState('');
   const [event, setEvent] = useState(HOOK_EVENTS[0]);
   const [script, setScript] = useState('');
+  const [pendingDelete, setPendingDelete] = useState<Hook | null>(null);
   const { success, error: toastError } = useToast();
 
   const fetchHooks = useCallback(async () => {
@@ -76,25 +78,34 @@ export default function HooksView() {
     }
   }, [name, event, script, fetchHooks, success, toastError]);
 
-  const unregister = useCallback(
-    async (h: Hook) => {
-      if (!window.confirm(`Unregister hook "${h.name}"?`)) return;
-      try {
-        await invoke<boolean>('unregister_hook', { id: h.id });
-        success(`Unregistered ${h.name}`);
-        await fetchHooks();
-      } catch (e) {
-        toastError(String(e), 'Unregister failed');
-      }
-    },
-    [fetchHooks, success, toastError],
-  );
+  const unregister = useCallback((h: Hook) => { setPendingDelete(h); }, []);
+
+  const confirmDelete = useCallback(async () => {
+    if (!pendingDelete) return;
+    const h = pendingDelete;
+    setPendingDelete(null);
+    try {
+      await invoke<boolean>('unregister_hook', { id: h.id });
+      success(`Unregistered ${h.name}`);
+      await fetchHooks();
+    } catch (e) {
+      toastError(String(e), 'Unregister failed');
+    }
+  }, [pendingDelete, fetchHooks, success, toastError]);
 
   const inputCls =
     'px-3 py-2 text-sm rounded-lg bg-white/5 border border-white/10 text-bone placeholder:text-bone/30 focus:outline-none focus:border-accent/50';
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-hidden">
+      <ConfirmModal
+        open={pendingDelete !== null}
+        message={`Unregister hook "${pendingDelete?.name}"?`}
+        confirmLabel="Unregister"
+        danger
+        onConfirm={confirmDelete}
+        onCancel={() => setPendingDelete(null)}
+      />
       <SectionHeader title="Hooks" subtitle="Event-driven automation hooks" count={hooks.length} />
 
       <GlassCard className="p-3 space-y-2">

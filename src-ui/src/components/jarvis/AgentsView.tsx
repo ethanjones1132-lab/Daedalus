@@ -15,6 +15,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   cn,
+  ConfirmModal,
   GlassCard,
   Pill,
   SectionHeader,
@@ -216,6 +217,7 @@ export function AgentsView() {
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<Agent | null>(null);
   const { success, error: toastError } = useToast();
 
   const fetchAll = useCallback(async () => {
@@ -293,21 +295,34 @@ export function AgentsView() {
   );
 
   const remove = useCallback(
-    async (agent: Agent) => {
-      if (!window.confirm(`Delete agent "${agent.name}"? This cannot be undone.`)) return;
-      try {
-        await invoke('delete_agent', { id: agent.id });
-        success(`Deleted ${agent.name}`);
-        await fetchAll();
-      } catch (e) {
-        toastError(String(e), 'Delete failed');
-      }
-    },
-    [fetchAll, success, toastError],
+    async (agent: Agent) => { setPendingDelete(agent); },
+    [],
   );
+
+  const confirmDelete = useCallback(async () => {
+    if (!pendingDelete) return;
+    const agent = pendingDelete;
+    setPendingDelete(null);
+    try {
+      await invoke('delete_agent', { id: agent.id });
+      success(`Deleted ${agent.name}`);
+      await fetchAll();
+    } catch (e) {
+      toastError(String(e), 'Delete failed');
+    }
+  }, [pendingDelete, fetchAll, success, toastError]);
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-hidden">
+      <ConfirmModal
+        open={pendingDelete !== null}
+        message={`Delete agent "${pendingDelete?.name}"?`}
+        detail="This cannot be undone."
+        confirmLabel="Delete"
+        danger
+        onConfirm={confirmDelete}
+        onCancel={() => setPendingDelete(null)}
+      />
       <SectionHeader
         title="Agents"
         subtitle="Create, configure, and bind agents to channels"

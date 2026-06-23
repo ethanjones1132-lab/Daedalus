@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
   cn,
+  ConfirmModal,
   GlassCard,
   Pill,
   SectionHeader,
@@ -54,6 +55,7 @@ export function ModelProfilesView() {
   const [showNew, setShowNew] = useState(false);
   const [form, setForm] = useState<NewProfileForm>(DEFAULT_FORM);
   const [creating, setCreating] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState<ModelProfile | null>(null);
   const { success, error: toastError } = useToast();
 
   const load = useCallback(async () => {
@@ -83,8 +85,12 @@ export function ModelProfilesView() {
     }
   }, [load, success, toastError]);
 
-  const remove = useCallback(async (profile: ModelProfile) => {
-    if (!window.confirm(`Delete profile "${profile.name}"?`)) return;
+  const remove = useCallback((profile: ModelProfile) => { setPendingDelete(profile); }, []);
+
+  const confirmDelete = useCallback(async () => {
+    if (!pendingDelete) return;
+    const profile = pendingDelete;
+    setPendingDelete(null);
     try {
       await invoke('delete_profile', { id: profile.id });
       success(`Deleted "${profile.name}"`);
@@ -92,7 +98,7 @@ export function ModelProfilesView() {
     } catch (e) {
       toastError(String(e), 'Delete failed');
     }
-  }, [load, success, toastError]);
+  }, [pendingDelete, load, success, toastError]);
 
   const create = useCallback(async () => {
     if (!form.name.trim() || !form.model.trim()) {
@@ -128,6 +134,14 @@ export function ModelProfilesView() {
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-hidden">
+      <ConfirmModal
+        open={pendingDelete !== null}
+        message={`Delete profile "${pendingDelete?.name}"?`}
+        confirmLabel="Delete"
+        danger
+        onConfirm={confirmDelete}
+        onCancel={() => setPendingDelete(null)}
+      />
       <SectionHeader
         title="Model Profiles"
         subtitle="Saved inference configurations — activate one to make it the default"

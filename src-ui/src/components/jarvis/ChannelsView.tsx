@@ -16,6 +16,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   cn,
+  ConfirmModal,
   GlassCard,
   Pill,
   SectionHeader,
@@ -155,6 +156,7 @@ export function ChannelsView() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState<Channel | null>(null);
   const { success, error: toastError } = useToast();
 
   const fetchChannels = useCallback(async () => {
@@ -203,24 +205,33 @@ export function ChannelsView() {
     [fetchChannels, success, toastError],
   );
 
-  const remove = useCallback(
-    async (channel: Channel) => {
-      if (!window.confirm(`Remove channel "${channel.name}"?`)) return;
-      try {
-        await invoke<boolean>('remove_channel', { id: channel.id });
-        success(`Removed ${channel.name}`);
-        await fetchChannels();
-      } catch (e) {
-        toastError(String(e), 'Remove failed');
-      }
-    },
-    [fetchChannels, success, toastError],
-  );
+  const remove = useCallback((channel: Channel) => { setPendingDelete(channel); }, []);
+
+  const confirmDelete = useCallback(async () => {
+    if (!pendingDelete) return;
+    const channel = pendingDelete;
+    setPendingDelete(null);
+    try {
+      await invoke<boolean>('remove_channel', { id: channel.id });
+      success(`Removed ${channel.name}`);
+      await fetchChannels();
+    } catch (e) {
+      toastError(String(e), 'Remove failed');
+    }
+  }, [pendingDelete, fetchChannels, success, toastError]);
 
   const connectedCount = useMemo(() => channels.filter(isConnected).length, [channels]);
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-hidden">
+      <ConfirmModal
+        open={pendingDelete !== null}
+        message={`Remove channel "${pendingDelete?.name}"?`}
+        confirmLabel="Remove"
+        danger
+        onConfirm={confirmDelete}
+        onCancel={() => setPendingDelete(null)}
+      />
       <SectionHeader
         title="Channels"
         subtitle="Add, connect, and manage delivery channels"

@@ -697,3 +697,6 @@ export function SidebarNavItem({
     </motion.button>
   );
 }
+
+// Re-export ConfirmModal from its own file so consumers import from one place.
+export { ConfirmModal } from './ConfirmModal';

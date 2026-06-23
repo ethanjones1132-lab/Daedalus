@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   PageTransition,
@@ -47,6 +47,7 @@ import PluginsView from './components/jarvis/PluginsView';
 import GatewayView from './components/jarvis/GatewayView';
 import HermesChat from './components/jarvis/HermesChat';
 import BuildBadge from './components/jarvis/BuildBadge';
+import CommandPalette from './components/jarvis/CommandPalette';
 
 const NAV_SECTIONS: NavSection[] = [
   { title: 'JARVIS', items: [{ id: 'jarvis', label: 'Jarvis', icon: 'J' }] },
@@ -549,6 +550,11 @@ function AppInner() {
   });
   const [companion, setCompanion] = useState<CompanionState | null>(null);
   const [lastRefresh, setLastRefresh] = useState<Date>(new Date());
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const allNavItems = useMemo(
+    () => NAV_SECTIONS.flatMap((s) => s.items),
+    [],
+  );
   // Feature 2: Luxury companion awareness for self-improvement crons (premium "alive" feel)
   const [cronAwareness, setCronAwareness] = useState<string | null>('Syncing improvement routines…');
 
@@ -559,6 +565,17 @@ function AppInner() {
   useEffect(() => {
     const intervalId = setInterval(() => setLastRefresh(new Date()), 10000);
     return () => clearInterval(intervalId);
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault();
+        setPaletteOpen((o) => !o);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
   }, []);
 
   const refreshCronAwareness = useCallback(async () => {
@@ -733,6 +750,12 @@ function AppInner() {
           />
         </motion.div>
       </div>
+      <CommandPalette
+        open={paletteOpen}
+        items={allNavItems}
+        onClose={() => setPaletteOpen(false)}
+        onNavigate={(id) => { setCurrentView(id); }}
+      />
     </div>
   );
 }

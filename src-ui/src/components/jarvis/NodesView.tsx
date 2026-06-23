@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useState } from 'react';
 import {
   cn,
+  ConfirmModal,
   GlassCard,
   Pill,
   SectionHeader,
@@ -30,6 +31,7 @@ export default function NodesView() {
   const [error, setError] = useState<string | null>(null);
   const [name, setName] = useState('');
   const [address, setAddress] = useState('');
+  const [pendingDelete, setPendingDelete] = useState<Node | null>(null);
   const { success, error: toastError } = useToast();
 
   const fetchNodes = useCallback(async () => {
@@ -61,19 +63,20 @@ export default function NodesView() {
     }
   }, [name, address, fetchNodes, success, toastError]);
 
-  const remove = useCallback(
-    async (n: Node) => {
-      if (!window.confirm(`Remove node "${n.name}"?`)) return;
-      try {
-        await invoke<boolean>('remove_node', { id: n.id });
-        success(`Removed ${n.name}`);
-        await fetchNodes();
-      } catch (e) {
-        toastError(String(e), 'Remove failed');
-      }
-    },
-    [fetchNodes, success, toastError],
-  );
+  const remove = useCallback((n: Node) => { setPendingDelete(n); }, []);
+
+  const confirmDelete = useCallback(async () => {
+    if (!pendingDelete) return;
+    const n = pendingDelete;
+    setPendingDelete(null);
+    try {
+      await invoke<boolean>('remove_node', { id: n.id });
+      success(`Removed ${n.name}`);
+      await fetchNodes();
+    } catch (e) {
+      toastError(String(e), 'Remove failed');
+    }
+  }, [pendingDelete, fetchNodes, success, toastError]);
 
   const inputCls =
     'px-3 py-2 text-sm rounded-lg bg-white/5 border border-white/10 text-bone placeholder:text-bone/30 focus:outline-none focus:border-accent/50';
@@ -87,6 +90,14 @@ export default function NodesView() {
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-hidden">
+      <ConfirmModal
+        open={pendingDelete !== null}
+        message={`Remove node "${pendingDelete?.name}"?`}
+        confirmLabel="Remove"
+        danger
+        onConfirm={confirmDelete}
+        onCancel={() => setPendingDelete(null)}
+      />
       <SectionHeader title="Nodes" subtitle="Distributed compute nodes" count={nodes.length} />
 
       <div className="flex gap-2">

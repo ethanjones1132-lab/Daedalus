@@ -161,9 +161,20 @@ function SkillDetail({
         >
           {skill.enabled ? 'Disable' : 'Enable'}
         </button>
-        <div className="ml-auto flex gap-1 text-[11px]">
+        <div
+          className="ml-auto flex gap-1 text-[11px]"
+          role="tablist"
+          aria-label="Skill detail tabs"
+          onKeyDown={(e) => {
+            if (e.key === 'ArrowRight') setTab('revisions');
+            else if (e.key === 'ArrowLeft') setTab('body');
+          }}
+        >
           <button
             type="button"
+            role="tab"
+            aria-selected={tab === 'body'}
+            tabIndex={tab === 'body' ? 0 : -1}
             onClick={() => setTab('body')}
             className={cn(
               'px-2.5 py-1 rounded-md transition-colors',
@@ -174,6 +185,9 @@ function SkillDetail({
           </button>
           <button
             type="button"
+            role="tab"
+            aria-selected={tab === 'revisions'}
+            tabIndex={tab === 'revisions' ? 0 : -1}
             onClick={() => setTab('revisions')}
             className={cn(
               'px-2.5 py-1 rounded-md transition-colors',

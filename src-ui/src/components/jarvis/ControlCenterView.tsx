@@ -13,6 +13,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
   cn,
+  ConfirmModal,
   GlassCard,
   Pill,
   SectionHeader,
@@ -106,6 +107,7 @@ export default function ControlCenterView() {
   const [doctor, setDoctor] = useState<DoctorReport | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<ModelProfile | null>(null);
   const { success, error: toastError } = useToast();
 
   const fetchAll = useCallback(async () => {
@@ -146,24 +148,33 @@ export default function ControlCenterView() {
     [fetchAll, success, toastError],
   );
 
-  const remove = useCallback(
-    async (profile: ModelProfile) => {
-      if (!window.confirm(`Delete profile "${profile.name}"?`)) return;
-      try {
-        await invoke<boolean>('delete_profile', { id: profile.id });
-        success(`Deleted ${profile.name}`);
-        await fetchAll();
-      } catch (e) {
-        toastError(String(e), 'Delete failed');
-      }
-    },
-    [fetchAll, success, toastError],
-  );
+  const remove = useCallback((profile: ModelProfile) => { setPendingDelete(profile); }, []);
+
+  const confirmDelete = useCallback(async () => {
+    if (!pendingDelete) return;
+    const profile = pendingDelete;
+    setPendingDelete(null);
+    try {
+      await invoke<boolean>('delete_profile', { id: profile.id });
+      success(`Deleted ${profile.name}`);
+      await fetchAll();
+    } catch (e) {
+      toastError(String(e), 'Delete failed');
+    }
+  }, [pendingDelete, fetchAll, success, toastError]);
 
   const activeProfile = profiles.find((p) => p.is_active) ?? null;
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-hidden">
+      <ConfirmModal
+        open={pendingDelete !== null}
+        message={`Delete profile "${pendingDelete?.name}"?`}
+        confirmLabel="Delete"
+        danger
+        onConfirm={confirmDelete}
+        onCancel={() => setPendingDelete(null)}
+      />
       <SectionHeader
         title="Control Center"
         subtitle="Profiles, diagnostics, and system operations"
