@@ -37,6 +37,7 @@ import {
   applyOpenRouterRequestConfig,
 } from "./openrouter";
 import type { OpenRouterCostInfo } from "./openrouter";
+import { recordInference, inferenceMetricsSnapshot, type Backend } from "./inference-metrics";
 import type { ToolCall } from "./tool-types";
 import {
   buildTextToolInstructions,
@@ -894,6 +895,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
   totalRequests++;
+  const _turnStart = Date.now();
 
   (async () => {
     const streamAbort = new AbortController();
@@ -1963,10 +1965,39 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       }
 
       console.log(`[Jarvis] Stream complete session=${sessionId} turns=${turnCount} verified_web_search=${verifiedWebSearchDone}`);
+      const _cfg2 = resolveConfig(options.config);
+      recordInference({
+        ts: Date.now(),
+        backend: _cfg2.active_backend as Backend,
+        model: _cfg2.active_backend === "openrouter"
+          ? (_cfg2.openrouter.model ?? "openrouter/free")
+          : _cfg2.active_backend === "claude_cli"
+          ? (_cfg2.claude_cli.model ?? "claude_cli")
+          : _cfg2.ollama.model,
+        ok: true,
+        latency_ms: Date.now() - _turnStart,
+        tokens_in: 0,
+        tokens_out: 0,
+      });
 
     } catch (error: any) {
       const errMsg = error?.message || String(error);
       console.error(`[Jarvis] Stream error session=${sessionId}:`, errMsg);
+      const _cfg3 = resolveConfig(options.config);
+      recordInference({
+        ts: Date.now(),
+        backend: _cfg3.active_backend as Backend,
+        model: _cfg3.active_backend === "openrouter"
+          ? (_cfg3.openrouter.model ?? "openrouter/free")
+          : _cfg3.active_backend === "claude_cli"
+          ? (_cfg3.claude_cli.model ?? "claude_cli")
+          : _cfg3.ollama.model,
+        ok: false,
+        latency_ms: Date.now() - _turnStart,
+        tokens_in: 0,
+        tokens_out: 0,
+        error: errMsg.slice(0, 200),
+      });
       try {
         await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "error", error: errMsg, session_id: sessionId })}\n\n`));
       } catch {}
@@ -2165,6 +2196,9 @@ async function baseFetch(req: Request): Promise<Response> {
     if (path === "/health") {
       const hcfg = loadConfig();
       return Response.json({ ok: true, uptime: process.uptime(), version: JARVIS_VERSION, backend: hcfg.active_backend, model: hcfg.active_backend === "openrouter" ? hcfg.openrouter.model : hcfg.ollama.model });
+    }
+    if (path === "/health/inference") {
+      return Response.json(inferenceMetricsSnapshot());
     }
     if (path === "/config" && req.method === "GET") return Response.json(loadConfig());
     if (path === "/config" && req.method === "POST") {

@@ -2,6 +2,26 @@ import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { cn, GlassCard, Pill, SectionHeader, StatusDot, LoadingState, ErrorState } from '../ui';
 
+// Matches server-jarvis/src/inference-metrics.ts BackendStats shape.
+interface BackendStats {
+  backend: string;
+  requests: number;
+  errors: number;
+  error_rate: number;
+  p50_ms: number;
+  p95_ms: number;
+  total_tokens_in: number;
+  total_tokens_out: number;
+  last_error?: string;
+  last_model?: string;
+}
+
+interface InferenceMetrics {
+  window_size: number;
+  backends: BackendStats[];
+  generated_at: number;
+}
+
 interface OllamaHealth { running: boolean; model: string | null; url: string }
 interface BunHealth { running: boolean; url: string }
 interface BridgeHealth { running: boolean; port: number }
@@ -48,9 +68,12 @@ function statusVariant(status: string): 'success' | 'warn' | 'error' | 'default'
   return 'default';
 }
 
+const BUN_URL = 'http://127.0.0.1:19877';
+
 export default function SystemHealthView() {
   const [health, setHealth] = useState<HealthData | null>(null);
   const [doctor, setDoctor] = useState<DoctorReport | null>(null);
+  const [inferenceMetrics, setInferenceMetrics] = useState<InferenceMetrics | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lastRefresh, setLastRefresh] = useState<Date>(new Date());
@@ -59,12 +82,14 @@ export default function SystemHealthView() {
     setLoading(true);
     setError(null);
     try {
-      const [h, d] = await Promise.all([
+      const [h, d, im] = await Promise.all([
         invoke<HealthData>('get_system_health').catch(() => null),
         invoke<DoctorReport>('get_doctor_report').catch(() => null),
+        globalThis.fetch?.(`${BUN_URL}/health/inference`).then(r => r.ok ? r.json() as Promise<InferenceMetrics> : null).catch(() => null) ?? Promise.resolve(null),
       ]);
       setHealth(h);
       setDoctor(d);
+      setInferenceMetrics(im);
       setLastRefresh(new Date());
     } catch (e) {
       setError(String(e));
@@ -191,6 +216,33 @@ export default function SystemHealthView() {
                 </ul>
                 <div className="mt-3 text-[10px] font-mono text-bone/25">
                   {doctor.timestamp}
+                </div>
+              </GlassCard>
+            )}
+
+            {/* Inference metrics — per-backend latency/error stats from the Bun ring buffer */}
+            {inferenceMetrics && inferenceMetrics.window_size > 0 && (
+              <GlassCard className="p-4">
+                <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40 mb-3">
+                  Inference (last {inferenceMetrics.window_size} turns)
+                </div>
+                <div className="space-y-2">
+                  {inferenceMetrics.backends.map((b) => (
+                    <div key={b.backend} className="text-xs flex items-center gap-3 flex-wrap">
+                      <span className="font-mono text-bone font-medium w-28 shrink-0">{b.backend}</span>
+                      <Pill variant={b.error_rate > 0.1 ? 'error' : b.error_rate > 0 ? 'warn' : 'success'}>
+                        {b.errors}/{b.requests} err
+                      </Pill>
+                      <span className="font-mono text-bone/50 text-[10px]">p50 {b.p50_ms}ms</span>
+                      <span className="font-mono text-bone/50 text-[10px]">p95 {b.p95_ms}ms</span>
+                      {b.last_model && (
+                        <span className="font-mono text-bone/30 text-[10px] truncate">{b.last_model}</span>
+                      )}
+                      {b.last_error && (
+                        <span className="text-red-400 text-[10px] truncate">{b.last_error}</span>
+                      )}
+                    </div>
+                  ))}
                 </div>
               </GlassCard>
             )}
