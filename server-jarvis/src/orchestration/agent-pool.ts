@@ -10,7 +10,7 @@ export interface AgentCapabilities {
 
 export interface OrchestratorAgent {
   id: string;
-  provider: "openrouter" | "ollama" | "claude_cli" | "opencode_zen";
+  provider: "openrouter" | "ollama" | "claude_cli" | "opencode_zen" | "opencode_go";
   model_id: string;
   capabilities: AgentCapabilities;
   default_for: string[];
@@ -40,11 +40,47 @@ export const ORCHESTRATOR_STAGES = [
 
 export const DEFAULT_ORCHESTRATOR_AGENTS: OrchestratorAgent[] = [
   {
+    // Coordinator → OpenCode Go / Mimo 2.5. The coordinator only emits
+    // short JSON routing decisions, so we want a fast, json-reliable,
+    // reasoning-light model here. Mimo 2.5 fits that profile and the
+    // OpenCode Go namespace has been our most reliable for cron work
+    // (jarvis cron model = opencode-go/minimax-m3, with mimo-v2.5-pro
+    // also used by other cron jobs). We deliberately avoid openrouter/free
+    // here because the free router hangs on long-context coordinator
+    // calls and surfaces no error to the caller (see the post-hang
+    // diagnosis: 12-minute stalls on the planner call to openrouter/free).
+    id: "go-mimo-v2-5-coordinator",
+    provider: "opencode_go",
+    model_id: "opencode-go/mimo-v2-5",
+    capabilities: { code: 0.72, reasoning: 0.78, speed: 0.7, cost: 1, json_reliability: 0.88 },
+    default_for: ["coordinator"],
+    enabled: true,
+  },
+  {
+    // Planner → OpenCode Zen / Nemotron Ultra Free. The planner needs
+    // strong reasoning (chain-of-thought over the user's request) and
+    // produces a structured markdown plan. Nemotron Ultra Free is the
+    // highest-reasoning free model in the OpenCode Zen catalog and is
+    // substantially more reliable than openrouter/free for streaming a
+    // long plan to completion without dropping bytes mid-stream.
+    id: "zen-nemotron-3-ultra-free-planner",
+    provider: "opencode_zen",
+    model_id: "opencode/nemotron-3-ultra-free",
+    capabilities: { code: 0.78, reasoning: 0.94, speed: 0.5, cost: 1, json_reliability: 0.86 },
+    default_for: ["planner"],
+    enabled: true,
+  },
+  {
+    // router-free is kept as a generic executor/reviewer/synthesizer
+    // candidate only. It is no longer default_for any stage — the
+    // coordinator and planner are pinned to the dedicated Go/Zen
+    // models above. The free router is still useful for tool execution
+    // (cheap, fast) and as a tail of the fallback cascade.
     id: "router-free",
     provider: "openrouter",
     model_id: "openrouter/free",
     capabilities: { code: 0.35, reasoning: 0.55, speed: 0.9, cost: 1, json_reliability: 0.75 },
-    default_for: ["coordinator", "planner"],
+    default_for: [],
     enabled: true,
   },
   {

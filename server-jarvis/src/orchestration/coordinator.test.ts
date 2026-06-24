@@ -42,4 +42,32 @@ describe("Coordinator", () => {
 
     await expect(coordinator.route("hello", { sessionId: "session-2" })).rejects.toBeInstanceOf(CoordinatorError);
   });
+
+  test("suppresses coordinator activity from the user-visible stream", async () => {
+    const optionsSeen: unknown[] = [];
+    const coordinator = new Coordinator(async (_messages, options) => {
+      optionsSeen.push(options);
+      return {
+        content: JSON.stringify({
+          task_type: "general",
+          pipeline: ["synthesizer"],
+          topology: "linear",
+          context: {
+            needs_workspace_inspection: false,
+            needs_memory: true,
+            estimated_complexity: "low",
+          },
+          coordinator_rationale: "Simple request.",
+        }),
+      };
+    });
+
+    await coordinator.route("say hi", { sessionId: "session-3" });
+
+    expect(optionsSeen).toHaveLength(1);
+    expect(optionsSeen[0]).toMatchObject({
+      stageLabel: "coordinator",
+      suppressActivity: true,
+    });
+  });
 });

@@ -573,14 +573,14 @@ function resolvePoolModels(cfg: JarvisConfig, options: FallbackResolveOptions = 
     const cascade = pool.cascadeChain(options.stage, options.taskType ?? "general");
     const ordered = options.cascadeTier === "strong" ? [...cascade].reverse() : cascade;
     return ordered
-      .filter((agent) => agent.provider === "openrouter" || agent.provider === "opencode_zen")
+      .filter((agent) => agent.provider === "openrouter" || agent.provider === "opencode_zen" || agent.provider === "opencode_go")
       .map((agent) => agent.model_id);
   }
   const selected = pool.pickFor(options.stage, options.taskType ?? "general");
   if (!selected) return [];
   return pool
     .fallbackChain(selected)
-    .filter((agent) => agent.provider === "openrouter" || agent.provider === "opencode_zen")
+    .filter((agent) => agent.provider === "openrouter" || agent.provider === "opencode_zen" || agent.provider === "opencode_go")
     .map((agent) => agent.model_id);
 }
 
@@ -628,6 +628,15 @@ export async function chatCompletionWithFallback(
   const allModels = await resolveFallbackModels(cfg, options);
   let lastError = "";
   const primaryRetryCount = Math.max(0, Number(cfg.openrouter.max_retries ?? RETRY_DELAYS.length));
+  // First-token watchdog: how long to wait for the response body's first
+  // content byte before declaring the model hung and advancing to the
+  // fallback cascade. Without this, an openrouter/free or similar
+  // response that opens the HTTP connection but never sends a token
+  // (the post-hang diagnosis: 12-minute stalls on the planner call)
+  // blocks the whole stage. 30s is long enough to ride out cold
+  // model load on the free router, short enough that a single
+  // hung model never blocks a turn for more than 30s + retry delay.
+  const firstTokenTimeoutMs = Math.max(1_000, Number((cfg.openrouter as any).first_token_timeout_ms ?? 30_000));
 
   for (let attempt = 0; attempt < allModels.length; attempt++) {
     const model = allModels[attempt];
@@ -636,6 +645,20 @@ export async function chatCompletionWithFallback(
       : RETRY_DELAYS.slice(0, Math.min(primaryRetryCount, 1)); // Less retries for fallbacks
 
     for (let retry = 0; retry <= retryDelays.length; retry++) {
+      // Per-attempt AbortController: a child of the user-provided
+      // signal so user-cancel still propagates, but the watchdog can
+      // abort *this attempt only* without aborting the whole cascade.
+      // reason is the discriminator in the catch path below: a
+      // user-cancel abort has no reason (or reason === signal.reason),
+      // a watchdog abort carries our STALL_REASON marker.
+      const STALL_REASON = `first-token-timeout:${model}`;
+      const attemptCtrl = new AbortController();
+      const onUserAbort = () => attemptCtrl.abort(signal?.reason);
+      if (signal) {
+        if (signal.aborted) attemptCtrl.abort(signal.reason);
+        else signal.addEventListener("abort", onUserAbort, { once: true });
+      }
+      let watchdogTimer: ReturnType<typeof setTimeout> | undefined;
       try {
         const modelRequestBody = { ...requestBody, model };
         await applyOpenRouterRequestConfig(
@@ -650,7 +673,7 @@ export async function chatCompletionWithFallback(
         );
         const res = await fetch(`${cfg.openrouter.base_url}/chat/completions`, {
           method: "POST",
-          signal,
+          signal: attemptCtrl.signal,
           headers: {
             "Authorization": `Bearer ${cfg.openrouter.api_key}`,
             "Content-Type": "application/json",
@@ -661,7 +684,51 @@ export async function chatCompletionWithFallback(
         });
 
         if (res.ok) {
-          return { response: res, model_used: model, retries: retry + attempt };
+          // First-token watchdog on the response body. We can't peek
+          // at the body without consuming it, so we race a Promise
+          // that resolves on the first body chunk against the timer.
+          // If the timer wins, abort the attempt — the catch path
+          // detects the STALL_REASON and treats it as a failed model
+          // (advances cascade). If the chunk wins, clear the timer
+          // and return the response normally.
+          const bodyReader = res.body?.getReader();
+          if (!bodyReader) {
+            return { response: res, model_used: model, retries: retry + attempt };
+          }
+          let firstByteResolver: (() => void) | undefined;
+          const firstBytePromise = new Promise<void>((resolve) => {
+            firstByteResolver = resolve;
+          });
+          const firstByteTimeout = new Promise<"timeout">((resolve) => {
+            watchdogTimer = setTimeout(() => resolve("timeout"), firstTokenTimeoutMs);
+          });
+          const raceResult = await Promise.race([
+            bodyReader.read().then((chunk) => ({ kind: "chunk" as const, chunk })),
+            firstByteTimeout.then(() => ({ kind: "timeout" as const })),
+          ]);
+          if (raceResult.kind === "timeout") {
+            attemptCtrl.abort(STALL_REASON);
+            // Drain the reader so the underlying socket can close cleanly.
+            try { await bodyReader.cancel().catch(() => {}); } catch {}
+            lastError = `Model ${model} did not send any body bytes within ${firstTokenTimeoutMs}ms (first-token timeout)`;
+            console.warn(`[OpenRouter] ${lastError} — advancing to next cascade model`);
+            break;
+          }
+          // Got first byte. Reassemble the body: yield the read chunk,
+          // then tee the rest of the original stream into the new one
+          // so the caller can read it normally.
+          clearTimeout(watchdogTimer);
+          firstByteResolver!();
+          const rewrapped = rewrapReadableStreamWithFirstChunk(
+            bodyReader as unknown as ReadableStreamDefaultReader<any>,
+            raceResult.chunk as ReadableStreamReadResult<any>,
+          );
+          const newResponse = new Response(rewrapped, {
+            status: res.status,
+            statusText: res.statusText,
+            headers: res.headers,
+          });
+          return { response: newResponse, model_used: model, retries: retry + attempt };
         }
 
         // Non-retryable error
@@ -682,18 +749,72 @@ export async function chatCompletionWithFallback(
         lastError = `Model ${model} failed after ${retryDelays.length + 1} attempts`;
         break;
       } catch (e: any) {
-        if (e.name === "AbortError" || e.message?.includes("abort")) {
+        if (watchdogTimer) clearTimeout(watchdogTimer);
+        if (signal) signal.removeEventListener("abort", onUserAbort);
+        // Distinguish user-cancel (fatal) from watchdog-abort (advance cascade).
+        // Watchdog aborts carry the STALL_REASON string in either the
+        // signal reason (Browser fetch) or in the thrown error message
+        // (Bun fetch surfaces the reason in the AbortError message).
+        const isStall = (e?.message ?? "").includes(STALL_REASON)
+          || (attemptCtrl.signal.reason === STALL_REASON);
+        const isUserCancel = signal?.aborted && !isStall;
+        if (isUserCancel || (e.name === "AbortError" && !isStall)) {
           throw e; // Don't retry user-aborted requests
+        }
+        if (isStall) {
+          // Already logged in the timeout branch; just move to next model.
+          lastError = e.message || lastError;
+          break;
         }
         lastError = e.message || String(e);
         if (retry < retryDelays.length) {
           await sleep(retryDelays[retry]);
         }
+      } finally {
+        if (watchdogTimer) clearTimeout(watchdogTimer);
+        if (signal) signal.removeEventListener("abort", onUserAbort);
       }
     }
   }
 
   throw new Error(`All OpenRouter models exhausted. Last error: ${lastError}`);
+}
+
+/**
+ * Reassemble a ReadableStream from an already-read first chunk plus
+ * the remaining body of the original stream. Used by
+ * `chatCompletionWithFallback` after the first-token watchdog fires
+ * the first body byte: we already consumed the first chunk (to test
+ * whether bytes were arriving), so we re-prepend it to a tee of the
+ * rest of the original stream and return a Response the caller can
+ * read normally.
+ */
+function rewrapReadableStreamWithFirstChunk(
+  original: ReadableStreamDefaultReader<any>,
+  firstChunk: ReadableStreamReadResult<any>,
+): ReadableStream<any> {
+  let firstEnqueued = false;
+  return new ReadableStream<any>({
+    async pull(controller) {
+      if (!firstEnqueued && !firstChunk.done && firstChunk.value !== undefined) {
+        controller.enqueue(firstChunk.value);
+        firstEnqueued = true;
+      }
+      try {
+        const next = await original.read();
+        if (next.done) {
+          controller.close();
+        } else {
+          controller.enqueue(next.value);
+        }
+      } catch (e) {
+        controller.error(e);
+      }
+    },
+    cancel(reason) {
+      return original.cancel(reason).catch(() => {});
+    },
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════

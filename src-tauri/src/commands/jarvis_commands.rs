@@ -118,8 +118,16 @@ pub async fn jarvis_send_message(
     // the single source of truth, which is also why the key must be persisted to the
     // config file it reads (see jarvis::get_config_path).
     crate::ensure_jarvis_server_started().await?;
-    let base_url = crate::wsl::get_cached_bun_url()
-        .unwrap_or_else(|| "http://127.0.0.1:19877".to_string());
+    // Re-probe the Bun URL on every turn. `get_cached_bun_url()` returns
+    // whatever was last validated, which can go stale when the server is
+    // restarted in a different mode (WSL → native, or vice versa) — a stale
+    // WSL IP cached against a now-native server (or vice versa) makes the
+    // chat POST hang on a dead SYN. `resolve_jarvis_url` re-checks the
+    // cached URL against /health, falls through to all candidates on
+    // failure, and re-caches the first live one. Cost: 1 GET /health per
+    // chat turn (sub-millisecond when the server is up).
+    let probe_client = reqwest::Client::new();
+    let base_url = crate::cron_scheduler::resolve_jarvis_url(&probe_client).await;
 
     let history = if session_id.is_empty() {
         Vec::new()
@@ -146,14 +154,21 @@ pub async fn cancel_chat_stream(session_id: String) -> Result<bool, String> {
     // (see server-jarvis/src/index.ts ::POST /chat/cancel). Returns Ok(true)
     // when the cancel fires; the UI flips `isStreaming=false` on success and
     // surfaces any returned error to the user as a toast.
-    let base = crate::wsl::get_cached_bun_url()
-        .unwrap_or_else(|| "http://127.0.0.1:19877".to_string());
+    //
+    // Re-probe the Bun URL on every call (see `jarvis_send_message` for the
+    // stale-cache rationale — a cancelled stream against a dead URL leaves
+    // the UI pinned with no way out short of an app restart).
+    let probe_client = reqwest::Client::new();
+    let base = crate::cron_scheduler::resolve_jarvis_url(&probe_client).await;
     let url = format!("{}/chat/cancel", base.trim_end_matches('/'));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("Failed to build /chat/cancel client: {e}"))?;
     let resp = client
         .post(&url)
         .json(&serde_json::json!({ "session_id": session_id }))
-        .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
         .map_err(|e| format!("Failed to POST /chat/cancel: {e}"))?;
@@ -244,14 +259,21 @@ pub async fn jarvis_tool_decision(
     // continuation can resume or be denied. Surface the POST error to the UI
     // (the previous implementation silently swallowed it via `let _ = ...`,
     // leaving the orchestrator pinned waiting on a decision that never came).
-    let base = crate::wsl::get_cached_bun_url()
-        .unwrap_or_else(|| "http://127.0.0.1:19877".to_string());
+    //
+    // Re-probe the Bun URL on every call (see `jarvis_send_message` for the
+    // stale-cache rationale — a denied tool against a dead URL leaves the
+    // orchestrator pinned mid-turn).
+    let probe_client = reqwest::Client::new();
+    let base = crate::cron_scheduler::resolve_jarvis_url(&probe_client).await;
     let url = format!("{}/tool/decision", base.trim_end_matches('/'));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("Failed to build /tool/decision client: {e}"))?;
     let resp = client
         .post(&url)
         .json(&serde_json::json!({ "call_id": tool_call_id, "approved": approved }))
-        .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
         .map_err(|e| format!("Tool decision POST failed: {e}"))?;

@@ -118,8 +118,16 @@ console.warn = (...args: any[]) => {
 };
 
 const MODEL_REQUEST_TIMEOUT_MS = 300_000;
-const MODEL_STREAM_STALL_TIMEOUT_MS = 120_000;
-const MODEL_STREAM_STALL_CHECK_MS = 125_000;
+const MODEL_STREAM_STALL_TIMEOUT_MS = 60_000;
+const MODEL_STREAM_STALL_CHECK_MS = 5_000;
+// First-token watchdog. See chatCompletionWithFallback for the upstream
+// implementation. This constant governs the orchestrator-level defense
+// in depth that aborts the read loop if the response body is open but
+// no content token has arrived in MODEL_FIRST_TOKEN_TIMEOUT_MS. Capped
+// to 60s so it never exceeds the outer MODEL_STREAM_STALL_TIMEOUT_MS
+// (60s) — otherwise the stall watchdog would always fire first and the
+// first-token watchdog would be dead code.
+const MODEL_FIRST_TOKEN_TIMEOUT_MS = 30_000;
 const MAX_TOOL_RESULT_CHARS = 2000;  // Truncate tool results going back to model context
 const MAX_TOOL_EXECUTION_TURNS = 10;
 const activeStreamControllers = new Map<string, AbortController>();
@@ -1186,7 +1194,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               } else {
                 agent = pool.pickFor(stageLabel, orchestratorTaskType);
               }
-              if (agent && (agent.provider === "openrouter" || agent.provider === "opencode_zen")) {
+              if (agent && (agent.provider === "openrouter" || agent.provider === "opencode_zen" || agent.provider === "opencode_go")) {
                 poolModel = agent.model_id;
                 console.log(`[Jarvis Orchestrator] Pool resolved model ${agent.model_id} for stage=${stageLabel} cascadeTier=${cascadeTier ?? "none"} task=${orchestratorTaskType} agent=${agent.id} (provider=${agent.provider})`);
               }
@@ -1348,11 +1356,29 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let fullTurnText = "";
           let activeToolCalls: any[] = [];
           let lastActivity = Date.now();
+          let firstTokenReceived = false;
+          // Defense-in-depth: in case the request bypassed the
+          // chatCompletionWithFallback path (useFallback=false) OR the
+          // upstream race-based watchdog in chatCompletionWithFallback
+          // missed an edge case, the orchestrator's read loop also
+          // enforces a 30s first-token window. If 30s pass after the
+          // response is opened without any choice.delta.content
+          // chunk, abort the stream. This guarantees the user's
+          // perceived latency never exceeds 30s on a hung model —
+          // before this, the read loop silently waited for the 5-min
+          // outer AbortController.
+          const firstTokenTimer = setTimeout(() => {
+            if (!firstTokenReceived && !streamAbort.signal.aborted) {
+              console.warn(`[Jarvis Orchestrator] First-token timeout (${MODEL_FIRST_TOKEN_TIMEOUT_MS / 1000}s) on stage=${callOptions?.stageLabel ?? "agent"} model=${actualModelUsed} — aborting stream`);
+              streamAbort.abort("First-token timeout");
+              reader.cancel("First-token timeout").catch(() => {});
+            }
+          }, MODEL_FIRST_TOKEN_TIMEOUT_MS);
           const textStreamSanitizer = new TextToolCallStreamSanitizer();
           const emitTextToken = async (text: string) => {
             if (callOptions?.surfaceAsAnswer) {
               await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text }, session_id: sessionId })}\n\n`));
-            } else {
+            } else if (!callOptions?.suppressActivity) {
               await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "agent_activity", stage: callOptions?.stageLabel ?? "agent", text, session_id: sessionId })}\n\n`));
             }
           };
@@ -1407,6 +1433,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 if (chunkText) {
                   chunkText = chunkText.replace(/<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>|<\|im_sep\|>/g, "");
                   if (chunkText) {
+                    if (!firstTokenReceived) {
+                      firstTokenReceived = true;
+                      clearTimeout(firstTokenTimer);
+                    }
                     fullTurnText += chunkText;
                     if (callOptions?.onChunk) {
                       callOptions.onChunk(chunkText);
@@ -1444,6 +1474,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               }
             }
           }
+
+          // Always clear the first-token timer when the read loop exits,
+          // whether normally (done), via abort, or via the watchdog.
+          clearTimeout(firstTokenTimer);
 
           if (reasoningParser) {
             for (const re of reasoningParser.flush()) {
@@ -1877,6 +1911,20 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         let buffer = "";
         let turnText = "";
         let lastActivity = Date.now();
+        let firstTokenReceived = false;
+        // Agent Loop first-token watchdog. The Agent Loop fetches
+        // directly (bypassing chatCompletionWithFallback), so the
+        // cascade-advance logic in openrouter.ts does not cover this
+        // path. Aborting on 30s of silence from the response body
+        // surfaces a clear error to the caller instead of the
+        // pre-fix silent 5-min stall.
+        const firstTokenTimer = setTimeout(() => {
+          if (!firstTokenReceived && !streamAbort.signal.aborted) {
+            console.warn(`[Jarvis Agent Loop] First-token timeout (${MODEL_FIRST_TOKEN_TIMEOUT_MS / 1000}s) on model=${modelName} — aborting stream`);
+            streamAbort.abort("First-token timeout");
+            reader.cancel("First-token timeout").catch(() => {});
+          }
+        }, MODEL_FIRST_TOKEN_TIMEOUT_MS);
         let activeToolCalls: any[] = [];
         const holdVisibleText = !forceFinalAnswerOnly
           && ((requiresVerifiedWebSearch && !verifiedWebSearchDone)
@@ -1937,6 +1985,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                   // Strip ChatML leakage tokens
                   content = content.replace(/<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>|<\|im_sep\|>/g, "");
                   if (content) {
+                    if (!firstTokenReceived) {
+                      firstTokenReceived = true;
+                      clearTimeout(firstTokenTimer);
+                    }
                     turnText += content;
                     fullText += content;
                     if (!holdVisibleText) await emitVisibleText(content);
@@ -1958,6 +2010,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }
         } finally {
           clearTimeout(timeout);
+          clearTimeout(firstTokenTimer);
         }
 
         // Filter activeToolCalls to only contain valid tool calls

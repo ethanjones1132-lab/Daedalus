@@ -510,6 +510,7 @@ function ChatPanel({
       const { text, session_id } = event.payload;
       if (!text || !matchesStreamSession(session_id)) return;
       setError(null);
+      setPipelineStage('');
       setMessages(prev => {
         const last = prev[prev.length - 1];
         if (last && last.role === 'assistant' && last.isStreaming) {
@@ -600,6 +601,10 @@ function ChatPanel({
     track(listen<{ stage: string; text: string; session_id?: string }>('jarvis://agent_activity', (event) => {
       if (!matchesStreamSession(event.payload.session_id)) return;
       const { stage, text } = event.payload;
+      if (stage === 'coordinator') {
+        setPipelineStage('coordinator');
+        return;
+      }
       setAgentSteps(prev => {
         const last = prev[prev.length - 1];
         if (last && last.stage === stage) {
@@ -822,6 +827,14 @@ function ChatPanel({
   };
 
   const lastAssistant = messages[messages.length - 1];
+  const streamStatusText = (() => {
+    if (!isStreaming) return undefined;
+    if (pendingApproval) return `Jarvis is waiting for approval to run ${pendingApproval.name}.`;
+    if (pipelineStage) return `Jarvis is running ${pipelineStage}...`;
+    const latestAgentStep = agentSteps[agentSteps.length - 1];
+    if (latestAgentStep?.stage) return `Jarvis is working in ${latestAgentStep.stage}...`;
+    return 'Jarvis is preparing the response...';
+  })();
   const showSkeleton =
     isStreaming &&
     !loadingHistory &&
@@ -937,7 +950,13 @@ function ChatPanel({
         )}
 
         {messages.map((msg, i) => (
-          <ChatMessage key={i} message={msg} index={i} prefersReducedMotion={prefersReducedMotion.current} />
+          <ChatMessage
+            key={i}
+            message={msg}
+            index={i}
+            prefersReducedMotion={prefersReducedMotion.current}
+            streamStatus={msg.isStreaming && !msg.content.trim() ? streamStatusText : undefined}
+          />
         ))}
 
         {/* First-token skeleton (Phase 2.5) — shimmer placeholder for the
@@ -1161,11 +1180,12 @@ function ChatPanel({
 // ═══════════════════════════════════════════════════════════════
 
 function ChatMessage({
-  message, index, prefersReducedMotion,
+  message, index, prefersReducedMotion, streamStatus,
 }: {
   message: JarvisMessage;
   index: number;
   prefersReducedMotion: boolean;
+  streamStatus?: string;
 }) {
   const isUser = message.role === 'user';
   const isTool = message.role === 'tool';
@@ -1233,7 +1253,11 @@ function ChatMessage({
         isUser || isTool ? 'text-xs font-mono whitespace-pre-wrap' : 'text-sm',
         isUser ? 'text-bone' : isTool ? 'text-bone-dim' : 'text-bone-muted'
       )}>
-        {isUser || isTool ? message.content : <MarkdownView content={message.content} />}
+        {isUser || isTool
+          ? message.content
+          : streamStatus
+            ? <span className="text-bone-faint font-mono text-xs">{streamStatus}</span>
+            : <MarkdownView content={message.content} />}
         {message.isStreaming && (
           <motion.span
             className="inline-block w-1.5 h-3.5 bg-cyan-neon/70 ml-0.5 align-middle rounded-sm"

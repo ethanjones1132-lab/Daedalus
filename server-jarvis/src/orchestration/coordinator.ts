@@ -25,6 +25,7 @@ export type CallModelFn = (
     stageLabel?: string;
     cascadeTier?: "cheap" | "strong";
     surfaceAsAnswer?: boolean;
+    suppressActivity?: boolean;
   }
 ) => Promise<{ content: string; tool_calls?: any[] }>;
 
@@ -97,6 +98,7 @@ export class Coordinator {
       temperature: 0.1,
       max_tokens: 700,
       stageLabel: "coordinator",
+      suppressActivity: true,
     });
 
     const parsed = this.extractJson<unknown>(response.content);

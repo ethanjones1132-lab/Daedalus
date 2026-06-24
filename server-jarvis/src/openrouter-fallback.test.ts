@@ -141,4 +141,78 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
       "deepseek/deepseek-v4-flash",
     ]);
   });
+
+  test("first-token watchdog advances to the next cascade model on a hung response body", async () => {
+    // Regression: openrouter/free opened the response stream then never
+    // sent any body bytes (12+ minute stalls, post-hang diagnosis
+    // 2026-06-24). The first-token watchdog in chatCompletionWithFallback
+    // must abort the hung attempt and advance to the next model rather
+    // than returning the hung stream to the caller.
+    const cfg = cfgWithPool();
+    cfg.openrouter.model = "openrouter/free";
+    // Tight timeout so the test runs in <2s.
+    (cfg.openrouter as any).first_token_timeout_ms = 200;
+    // Force the pool so openrouter/free IS the primary for the executor
+    // stage and there's a deterministic secondary to fall back to.
+    cfg.orchestrator.agents = [
+      {
+        id: "hung-primary",
+        provider: "openrouter",
+        model_id: "openrouter/free",
+        capabilities: { code: 0.5, reasoning: 0.5, speed: 0.9, cost: 1, json_reliability: 0.6 },
+        default_for: ["executor"],
+        enabled: true,
+      },
+      {
+        id: "healthy-secondary",
+        provider: "openrouter",
+        model_id: "cohere/north-mini-code:free",
+        capabilities: { code: 0.95, reasoning: 0.7, speed: 0.8, cost: 1, json_reliability: 0.8 },
+        default_for: ["executor"],
+        enabled: true,
+      },
+    ];
+
+    const seenChatModels: string[] = [];
+    let hungFetchReturned = false;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) {
+        return new Response(JSON.stringify({
+          data: [
+            { id: "openrouter/free", name: "Free", context_length: 200000, pricing: { prompt: "0", completion: "0" }, architecture: {}, supported_parameters: [], description: "" },
+            { id: "cohere/north-mini-code:free", name: "North", context_length: 256000, pricing: { prompt: "0", completion: "0" }, architecture: {}, supported_parameters: [], description: "" },
+            { id: "nvidia/nemotron-3-ultra-550b-a55b:free", name: "Nemotron", context_length: 1000000, pricing: { prompt: "0", completion: "0" }, architecture: {}, supported_parameters: [], description: "" },
+          ],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      seenChatModels.push(body.model);
+      if (body.model === "openrouter/free") {
+        // Simulate a hung openrouter/free: HTTP 200 with a body that
+        // never produces any bytes. The Response body is a stream
+        // that never yields.
+        hungFetchReturned = true;
+        const { readable, writable } = new TransformStream();
+        // Intentionally do not close the writable side — body hangs.
+        return new Response(readable, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+      }
+      return new Response("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n", { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    }) as typeof fetch;
+
+    const result = await chatCompletionWithFallback(
+      cfg,
+      { model: "openrouter/free", messages: [{ role: "user", content: "do the thing" }], stream: true },
+      undefined,
+      { stage: "executor", taskType: "general" },
+    );
+
+    expect(hungFetchReturned).toBe(true);
+    expect(seenChatModels[0]).toBe("openrouter/free");
+    // The first-token watchdog should have aborted openrouter/free and
+    // advanced to the next cascade model.
+    expect(seenChatModels.length).toBeGreaterThanOrEqual(2);
+    expect(result.model_used).toBe("cohere/north-mini-code:free");
+  });
 });

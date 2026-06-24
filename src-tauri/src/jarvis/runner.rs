@@ -37,6 +37,13 @@ pub fn run_jarvis_message(
 
         let client = match reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(900))
+            // Bound the connect phase: a stale or wrong-interface cached URL
+            // (e.g. WSL IP after a native restart) would otherwise hang the SYN
+            // forever — the 900s overall timeout covers the full request, not
+            // the individual connect. 5s is long enough to ride out WSL2
+            // localhost-forward latency, short enough that a dead URL surfaces
+            // an error banner instead of a forever-spinning spinner.
+            .connect_timeout(std::time::Duration::from_secs(5))
             .build()
         {
             Ok(c) => c,

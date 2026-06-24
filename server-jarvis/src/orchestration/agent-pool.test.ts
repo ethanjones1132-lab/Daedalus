@@ -130,4 +130,31 @@ describe("AgentPool", () => {
     expect(defaultIds).toContain("cohere/north-mini-code:free");
     expect(defaultIds).toContain("xiaomi/mimo-v2.5");
   });
+
+  test("coordinator defaults to opencode-go Mimo 2.5 and planner defaults to opencode Zen Nemotron Ultra Free", () => {
+    // The free router caused 12+ minute stalls on the coordinator/planner
+    // stages (post-hang diagnosis 2026-06-24). Pin the coordinator to the
+    // OpenCode Go Mimo 2.5 model and the planner to the OpenCode Zen
+    // Nemotron Ultra Free model so neither stage can pick the unreliable
+    // openrouter/free as its default.
+    const coordinator = DEFAULT_ORCHESTRATOR_AGENTS.find((agent) => agent.default_for.includes("coordinator"));
+    const planner = DEFAULT_ORCHESTRATOR_AGENTS.find((agent) => agent.default_for.includes("planner"));
+
+    expect(coordinator).toBeDefined();
+    expect(coordinator?.provider).toBe("opencode_go");
+    expect(coordinator?.model_id).toBe("opencode-go/mimo-v2-5");
+
+    expect(planner).toBeDefined();
+    expect(planner?.provider).toBe("opencode_zen");
+    expect(planner?.model_id).toBe("opencode/nemotron-3-ultra-free");
+  });
+
+  test("openrouter/free is no longer the default for any stage", () => {
+    const routerFree = DEFAULT_ORCHESTRATOR_AGENTS.find((agent) => agent.id === "router-free");
+    expect(routerFree).toBeDefined();
+    // It still exists in the pool as a generic executor/reviewer/
+    // synthesizer candidate and as a tail of the fallback cascade,
+    // but it must not be the default_for any stage.
+    expect(routerFree?.default_for ?? []).toEqual([]);
+  });
 });
