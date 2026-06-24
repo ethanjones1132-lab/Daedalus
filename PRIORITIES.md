@@ -86,7 +86,6 @@ Quick status: **Phase 1 done · Phase 2 done · Phase 3 done · Orchestrator v2 
 ---
 
 ## Suggested next target
-## Suggested next target
 
 All tracked items are **done**. The platform is in a solid maintenance + hardening posture.
 
