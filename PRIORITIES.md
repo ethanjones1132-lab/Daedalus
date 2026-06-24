@@ -1,6 +1,6 @@
 # Jarvis / home-base — Priority Roadmap
 
-Last updated: 2026-06-24 (Live smoke test caught prompt-loader hardcoded paths — fixed with walk-up fallback + JARVIS_PROMPTS_DIR override)
+Last updated: 2026-06-24 (Evening pass — debug-binary freshness now wired into `verify.sh`; Phase 2 completion criterion met)
 Working copy: `C:\Projects\home-base-recovered`
 
 Quick status: **Phase 1 done · Phase 2 done · Phase 3 done · Orchestrator v2 substrate live**
@@ -91,8 +91,8 @@ All tracked items are **done**. The platform is in a solid maintenance + hardeni
 
 Near-term hardening opportunities (untracked):
 - **TypeScript typecheck hygiene**: a scope bug (`let`-in-try invisible to catch) was fixed 2026-06-23 in `index.ts`. Run `bunx tsc --noEmit` after any significant edit to catch similar regressions early. Confirmed clean on 2026-06-24.
-- **`cargo tauri build --debug`**: Phase 2 completion criteria include a working debug binary; this has not been formally verified in CI — wire it to the eval gate.
-- **Live end-to-end smoke test of the Orchestrator v2 path**: a `stream_event` flow exercising `coordinator.route → pipeline.execute(linear|parallel|cascade|recursive)` against a real OpenRouter call. The 233 unit tests cover the routing and pool logic; a real stream is the only proof the chat path actually delivers the new topology.
+- **`cargo tauri build --debug` (done 2026-06-24 evening)**: Phase 2 completion criterion ("produces a working binary") was unverified in CI. `scripts/verify.sh` now checks `target/debug/home-base.exe` exists and is fresh (newer than any `src-tauri/src/*.rs`, `Cargo.toml`, `tauri.conf.json`). Use `--build-tauri` to force a rebuild. 6/6 verify checks pass.
+- **Live end-to-end smoke test of the Orchestrator v2 path**: a `stream_event` flow exercising `coordinator.route → pipeline.execute(linear|parallel|cascade|recursive)` against a real OpenRouter call. The 240 unit tests cover the routing and pool logic; a real stream is the only proof the chat path actually delivers the new topology.
 - **Eval harness expansion (done 2026-06-24)**: 17 new cases added — 11 Coordinator v2 (topology selection, executablePipeline, error surfacing) + 6 AgentPool default coverage. Harness now has 33 cases, all pass, baseline locked.
 - **Chat pipeline hardening (done 2026-06-24)**: First-token watchdog in `chatCompletionWithFallback` + defense-in-depth timers in orchestrator and agent-loop read paths. opencode_go provider support. Coordinator pinned to opencode-go Mimo 2.5, planner pinned to opencode Zen Nemotron Ultra Free. 60s stream-stall cap. `connect_timeout(5s)` on the blocking runner + per-turn URL re-resolution. 4 new bun tests, 3 new cargo tests.
 - **Prompt loader walk-up fallback (done 2026-06-24)**: Live smoke test exposed hardcoded 4-path resolution missing the real `server-jarvis/src/prompts/` location when `__dirname` resolves to a bundled-binary directory. Fixed with `JARVIS_PROMPTS_DIR` override + walk-up-to-6-ancestors fallback. 3 new prompt-loader tests (240 total bun tests). Chat was unblocked after the next server restart.
@@ -107,3 +107,4 @@ Each phase is done when:
 - `bunx tsc --noEmit` passes in server-jarvis/
 - `bunx tsc -b` passes in src-ui/
 - `cargo tauri build --debug` produces a working binary
+  - **Now gated**: `scripts/verify.sh` checks `src-tauri/target/debug/home-base.exe` exists and isn't older than any file under `src-tauri/src/`, `src-tauri/Cargo.toml`, or `src-tauri/tauri.conf.json`. Pass `--build-tauri` to force a from-scratch rebuild (`cargo tauri build --debug --no-bundle`).
