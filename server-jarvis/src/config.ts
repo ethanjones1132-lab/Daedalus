@@ -215,14 +215,15 @@ export function defaultConfig(): JarvisConfig {
     openrouter: {
       base_url: "https://openrouter.ai/api/v1",
       api_key: "",
-      model: "openrouter/free",
+      model: "qwen/qwen3-coder:free",
       site_url: "http://localhost:19877",
       site_name: "Jarvis Home-Base",
       fallbacks: [
         "openrouter/free",
         "openrouter/owl-alpha",
-        "nvidia/llama-3.1-nemotron-ultra-253b-v1:free",
         "qwen/qwen3-coder:free",
+        "cohere/north-mini-code:free",
+        "nvidia/llama-3.1-nemotron-ultra-253b-v1:free",
       ],
       enable_fallbacks: true,
       enable_paid_fallbacks: false,

@@ -198,6 +198,31 @@ function buildChatRuntime(cfg: JarvisConfig): {
   return { runtime, ctx };
 }
 
+/**
+ * Build a sandbox permissions block describing tool constraints to the model.
+ * Rendered as a stable system-prompt prefix that never changes between turns,
+ * enabling prompt caching for the static portion of the context.
+ */
+function buildSandboxPermissions(cfg: JarvisConfig): string {
+  const mode = cfg.tools?.sandbox_mode ?? "strict";
+  const workspacePath = cfg.jarvis_path || "configured workspace";
+  const lines: string[] = [
+    "## Sandbox & Permissions",
+    "",
+    "You are running within Jarvis's tool runtime. The following constraints apply to every tool call:",
+    "",
+    `- **Workspace scope**: File access is bounded to \`${workspacePath}\`. Paths outside this scope are rejected.`,
+    `- **Shell sandbox**: Shell commands execute under sandbox mode \`${mode}\`.`,
+    "  - `strict`: Dangerous tools (write, edit, bash) are blocked on non-interactive surfaces and require approval on interactive surfaces.",
+    "  - `permissive`: Warnings are shown but tools are allowed.",
+    "  - `off`: No sandbox enforcement (full access).",
+    "- **Network access**: Web searches and HTTP requests may be restricted to approved domains.",
+    "- **Non-interactive surfaces**: Cron and agent runs default to read-only. Write operations are blocked unless explicitly configured.",
+    "- **Prohibited**: Do not attempt to bypass sandbox restrictions, escape the workspace, or execute shell commands that modify system state outside the workspace.",
+  ];
+  return lines.join("\n");
+}
+
 export interface JarvisSession {
   id: string;
   name: string;
@@ -1139,13 +1164,32 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const callModel = async (messages: any[], callOptions?: any) => {
           const isOllama = cfg.active_backend === "ollama";
           const ollamaTarget = isOllama ? await resolveOllamaChatTarget(cfg) : null;
+
+          // Resolve model from agent pool when a stage label is provided.
+          // Each orchestrator stage gets its designated model directly,
+          // bypassing the generic cfg.openrouter.model default.
+          let poolModel: string | null = null;
+          const stageLabel = callOptions?.stageLabel as string | undefined;
+          if (!isOllama && stageLabel && cfg.orchestrator?.enabled) {
+            try {
+              const pool = new AgentPool(cfg.orchestrator?.agents ?? []);
+              const agent = pool.pickFor(stageLabel, orchestratorTaskType);
+              if (agent && agent.provider === "openrouter") {
+                poolModel = agent.model_id;
+                console.log(`[Jarvis Orchestrator] Pool resolved model ${agent.model_id} for stage=${stageLabel} task=${orchestratorTaskType} agent=${agent.id}`);
+              }
+            } catch (e: any) {
+              console.warn(`[Jarvis Orchestrator] Pool resolution failed for stage=${stageLabel}: ${e.message}`);
+            }
+          }
+
           const resolvedOpenRouterModel = cfg.active_backend === "openrouter"
             ? await resolveOpenRouterModel(cfg)
             : null;
 
           const modelName = isOllama
             ? (ollamaTarget?.modelName ?? cfg.ollama.model)
-            : resolvedOpenRouterModel ?? cfg.openrouter.model;
+            : poolModel ?? resolvedOpenRouterModel ?? cfg.openrouter.model;
           const openRouterEffective = !isOllama
             ? await resolveEffectiveOpenRouterRequestConfig(cfg, modelName, messages, { surface })
             : null;
@@ -1645,24 +1689,25 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         if (activeHistory.length < previousLength) {
           console.warn(`[Jarvis] Optimizing context: truncated history from ${previousLength} to ${activeHistory.length} messages (context window: ${num_ctx})`);
         }
-        // ~250 tokens per message, capped at 100
-        // Merge system prompt + memory context into a single system message
-        const firstSystemIdx = activeHistory.findIndex((m: any) => m.role === "system");
-        if (firstSystemIdx >= 0 && effectiveSystemPrompt) {
-          const existing = activeHistory[firstSystemIdx];
-          const merged = {
-            role: "system" as const,
-            content: `${effectiveSystemPrompt}\n\n---\n\n${existing.content}`,
-          };
-          const historyWithoutSystem = [...activeHistory];
-          historyWithoutSystem.splice(firstSystemIdx, 1);
-          messages.push(merged);
-          messages.push(...historyWithoutSystem);
-        } else if (effectiveSystemPrompt) {
-          messages.push({ role: "system", content: effectiveSystemPrompt });
-          messages.push(...activeHistory);
-        } else {
-          messages.push(...activeHistory);
+        // Cache-friendly prompt assembly:
+        //   [0] static prefix (identity + sandbox + tools) — NEVER changes between turns
+        //   [1..N] compaction summaries / memory context from history (infrequent changes)
+        //   [N+1..] conversation history (changes every turn)
+        //   [last] current user prompt (changes every turn)
+        // Only the tail changes between turns → prompt cache stays warm for the prefix.
+        {
+          const effectiveTextTools = !forceFinalAnswerOnly ? cachedTextToolInstructions : "";
+          const sandboxBlock = buildSandboxPermissions(cfg);
+          const staticPrefix = [cfg.system_prompt, sandboxBlock, effectiveTextTools].filter(Boolean).join("\n\n");
+          messages.push({ role: "system", content: staticPrefix });
+          // Preserve compaction summaries and memory system messages from history unchanged
+          for (const msg of activeHistory) {
+            if (msg.role === "system") {
+              messages.push(msg);
+            }
+          }
+          // Non-system history
+          messages.push(...activeHistory.filter(m => m.role !== "system"));
         }
         if (currentPrompt) {
           messages.push({ role: "user", content: currentPrompt });

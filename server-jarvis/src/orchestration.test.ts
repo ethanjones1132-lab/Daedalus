@@ -261,6 +261,12 @@ describe("Orchestration & Routing Tests", () => {
   test("builtin modes expose expected finality and filters", () => {
     expect(BUILTIN_MODES.synthesizer.is_final).toBe(true);
     expect(BUILTIN_MODES.planner.tools_filter).toEqual([]);
-    expect(BUILTIN_MODES.executor.tools_filter).toContain("*");
+    expect(BUILTIN_MODES.executor.tools_filter).toEqual([
+      "read_file", "write_file", "edit_file", "multi_edit", "apply_patch",
+      "glob", "grep", "list_directory",
+      "bash",
+      "web_search", "web_fetch",
+      "agent", "run_background_command",
+    ]);
   });
 });
