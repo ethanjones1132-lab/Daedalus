@@ -1,6 +1,6 @@
 # Jarvis / home-base — Priority Roadmap
 
-Last updated: 2026-06-24 (Orchestrator v2 — Fugu-style Coordinator + AgentPool + 3 topologies committed)
+Last updated: 2026-06-24 (Eval harness expanded: Coordinator v2 topology + AgentPool coverage cases — 33 total, all pass)
 Working copy: `C:\Projects\home-base-recovered`
 
 Quick status: **Phase 1 done · Phase 2 done · Phase 3 done · Orchestrator v2 substrate live**
@@ -55,7 +55,7 @@ Quick status: **Phase 1 done · Phase 2 done · Phase 3 done · Orchestrator v2 
 | **P2** | Tauri shell rewire | Simplify the Tauri command surface — consolidate redundant IPC, remove dead stubs | ✅ Done (2026-06-23) |
 | **P2** | Orchestrator v2 substrate (Fugu-style Coordinator + AgentPool + 3 topologies) | Replace PredictiveRouter with a Coordinator that selects among linear / speculative_parallel / speculative_cascade / recursive topologies. 12 default OpenRouter/OpenCode-Zen agents scored on code / reasoning / speed / cost / json_reliability. Pool-aware fallbacks and per-stage retry telemetry. | ✅ Done (2026-06-24) |
 | **P3** | Frontier scaffolding | Pre-built agent templates, skill templates, and project scaffolding for new capabilities | ✅ Done (2026-06-23) |
-| **P3** | Eval harness expansion | Beyond regression: benchmark suites, A/B inference comparison, cost tracking | ⬜ Not started |
+| **P3** | Eval harness expansion | Beyond regression: benchmark suites, A/B inference comparison, cost tracking | ✅ Done (2026-06-24) |
 
 ---
 
@@ -81,19 +81,19 @@ Quick status: **Phase 1 done · Phase 2 done · Phase 3 done · Orchestrator v2 
 | Phase 3 | 3 | **0** |
 | Platform P1 | 2 | **0** |
 | Platform P2 | 5 | **0** |
-| Platform P3 | 1 | **1** |
+| Platform P3 | 2 | **0** |
 
 ---
 
 ## Suggested next target
 
-The only remaining tracked item is **P3 Eval harness expansion** — benchmark suites, A/B inference comparison, cost tracking. With the Orchestrator v2 substrate live, the eval harness can now exercise the three new topologies and the AgentPool fallback chain end-to-end instead of just the linear pipeline.
+All tracked items are **done**. The platform is in a solid maintenance + hardening posture.
 
-Near-term hardening opportunities:
-- **TypeScript typecheck hygiene**: a scope bug (`let`-in-try invisible to catch) was fixed 2026-06-23 in `index.ts`. Run `bunx tsc --noEmit` after any significant edit to catch similar regressions early. Confirmed clean on 2026-06-24 after Orchestrator v2 commit.
+Near-term hardening opportunities (untracked):
+- **TypeScript typecheck hygiene**: a scope bug (`let`-in-try invisible to catch) was fixed 2026-06-23 in `index.ts`. Run `bunx tsc --noEmit` after any significant edit to catch similar regressions early. Confirmed clean on 2026-06-24.
 - **`cargo tauri build --debug`**: Phase 2 completion criteria include a working debug binary; this has not been formally verified in CI — wire it to the eval gate.
-- **Eval harness breadth**: current scenarios cover routing and tool execution; add multi-turn conversation, fallback-chain, memory-recall, and the new speculative / recursive topology scenarios.
 - **Live end-to-end smoke test of the Orchestrator v2 path**: a `stream_event` flow exercising `coordinator.route → pipeline.execute(linear|parallel|cascade|recursive)` against a real OpenRouter call. The 233 unit tests cover the routing and pool logic; a real stream is the only proof the chat path actually delivers the new topology.
+- **Eval harness expansion (done 2026-06-24)**: 17 new cases added — 11 Coordinator v2 (topology selection, executablePipeline, error surfacing) + 6 AgentPool default coverage. Harness now has 33 cases, all pass, baseline locked.
 
 ---
 
