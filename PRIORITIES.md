@@ -1,6 +1,6 @@
 # Jarvis / home-base — Priority Roadmap
 
-Last updated: 2026-06-24 (Eval harness expanded: Coordinator v2 topology + AgentPool coverage cases — 33 total, all pass)
+Last updated: 2026-06-24 (Live smoke test caught prompt-loader hardcoded paths — fixed with walk-up fallback + JARVIS_PROMPTS_DIR override)
 Working copy: `C:\Projects\home-base-recovered`
 
 Quick status: **Phase 1 done · Phase 2 done · Phase 3 done · Orchestrator v2 substrate live**
@@ -66,7 +66,7 @@ Quick status: **Phase 1 done · Phase 2 done · Phase 3 done · Orchestrator v2 
 - **`PipelineExecutor` topologies** — `speculative_parallel` (planner + reviewer concurrent, then synthesizer, gated to model-only stages), `speculative_cascade` (executor cheap → strong on low confidence, gated to `[executor, synthesizer]`), `recursive` (critique-then-reenter via `prompts/modes/recursion-critique.md`, bounded by `orchestrator.max_recursion_depth` default 2). `linear` is the only topology permitted for file edits and destructive actions.
 - **Inference resilience plumbing** — `chatCompletionWithFallback` now accepts `FallbackResolveOptions` (`stage`, `taskType`, `cascadeTier`) so stage-specific OpenRouter agents are tried before generic fallbacks. `BackendStats` gains `total_retries`, `fallbacks_used`, `last_fallback_model` for `/health/inference`. Stream stall watchdog mirrors the Agent Loop's `MODEL_STREAM_STALL_*` constants.
 - **Config** — `orchestrator.agents` and `orchestrator.max_recursion_depth` are now config fields with safe defaults.
-- **Tests** — 233 bun tests pass, 55 cargo tests pass, both `tsc` jobs clean. 4 new test files (`agent-pool.test.ts`, `coordinator.test.ts`, `openrouter-fallback.test.ts`, expanded `inference-metrics.test.ts`, `orchestration.test.ts`).
+- **Tests** — 240 bun tests pass (was 233; +3 prompt-loader, +4 first-token-watchdog/coordinator-pool), 58 cargo tests pass (was 55; +3 connect-timeout/regression), both `tsc` jobs clean.
 - **Hygiene** — `.hermes/` added to `.gitignore` (local session notes, never commit).
 
 ---
@@ -86,6 +86,7 @@ Quick status: **Phase 1 done · Phase 2 done · Phase 3 done · Orchestrator v2 
 ---
 
 ## Suggested next target
+## Suggested next target
 
 All tracked items are **done**. The platform is in a solid maintenance + hardening posture.
 
@@ -94,6 +95,8 @@ Near-term hardening opportunities (untracked):
 - **`cargo tauri build --debug`**: Phase 2 completion criteria include a working debug binary; this has not been formally verified in CI — wire it to the eval gate.
 - **Live end-to-end smoke test of the Orchestrator v2 path**: a `stream_event` flow exercising `coordinator.route → pipeline.execute(linear|parallel|cascade|recursive)` against a real OpenRouter call. The 233 unit tests cover the routing and pool logic; a real stream is the only proof the chat path actually delivers the new topology.
 - **Eval harness expansion (done 2026-06-24)**: 17 new cases added — 11 Coordinator v2 (topology selection, executablePipeline, error surfacing) + 6 AgentPool default coverage. Harness now has 33 cases, all pass, baseline locked.
+- **Chat pipeline hardening (done 2026-06-24)**: First-token watchdog in `chatCompletionWithFallback` + defense-in-depth timers in orchestrator and agent-loop read paths. opencode_go provider support. Coordinator pinned to opencode-go Mimo 2.5, planner pinned to opencode Zen Nemotron Ultra Free. 60s stream-stall cap. `connect_timeout(5s)` on the blocking runner + per-turn URL re-resolution. 4 new bun tests, 3 new cargo tests.
+- **Prompt loader walk-up fallback (done 2026-06-24)**: Live smoke test exposed hardcoded 4-path resolution missing the real `server-jarvis/src/prompts/` location when `__dirname` resolves to a bundled-binary directory. Fixed with `JARVIS_PROMPTS_DIR` override + walk-up-to-6-ancestors fallback. 3 new prompt-loader tests (240 total bun tests). Chat was unblocked after the next server restart.
 
 ---
 
