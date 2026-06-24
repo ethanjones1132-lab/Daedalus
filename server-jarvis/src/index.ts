@@ -1168,15 +1168,27 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // Resolve model from agent pool when a stage label is provided.
           // Each orchestrator stage gets its designated model directly,
           // bypassing the generic cfg.openrouter.model default.
+          // When cascadeTier is "cheap" the cascade's first (fastest/cheapest) agent
+          // is used; when "strong" the last (highest-capability) is used. Without a
+          // tier the pool's default_for agent for the stage is used (pickFor).
+          // opencode_zen agents are routed through the same OpenRouter API endpoint
+          // as native openrouter agents — same base_url and api_key apply.
           let poolModel: string | null = null;
           const stageLabel = callOptions?.stageLabel as string | undefined;
+          const cascadeTier = callOptions?.cascadeTier as "cheap" | "strong" | undefined;
           if (!isOllama && stageLabel && cfg.orchestrator?.enabled) {
             try {
               const pool = new AgentPool(cfg.orchestrator?.agents ?? []);
-              const agent = pool.pickFor(stageLabel, orchestratorTaskType);
-              if (agent && agent.provider === "openrouter") {
+              let agent: import("./orchestration/agent-pool").OrchestratorAgent | undefined;
+              if (cascadeTier) {
+                const chain = pool.cascadeChain(stageLabel, orchestratorTaskType);
+                agent = cascadeTier === "cheap" ? chain[0] : chain[chain.length - 1];
+              } else {
+                agent = pool.pickFor(stageLabel, orchestratorTaskType);
+              }
+              if (agent && (agent.provider === "openrouter" || agent.provider === "opencode_zen")) {
                 poolModel = agent.model_id;
-                console.log(`[Jarvis Orchestrator] Pool resolved model ${agent.model_id} for stage=${stageLabel} task=${orchestratorTaskType} agent=${agent.id}`);
+                console.log(`[Jarvis Orchestrator] Pool resolved model ${agent.model_id} for stage=${stageLabel} cascadeTier=${cascadeTier ?? "none"} task=${orchestratorTaskType} agent=${agent.id} (provider=${agent.provider})`);
               }
             } catch (e: any) {
               console.warn(`[Jarvis Orchestrator] Pool resolution failed for stage=${stageLabel}: ${e.message}`);
@@ -2467,6 +2479,11 @@ async function baseFetch(req: Request): Promise<Response> {
     }
     if (path === "/health/inference") {
       return Response.json(inferenceMetricsSnapshot());
+    }
+    if (path === "/agents/pool" && req.method === "GET") {
+      const poolCfg = loadConfig();
+      const pool = new AgentPool(poolCfg.orchestrator?.agents ?? []);
+      return Response.json({ pool: pool.list(), coverage: pool.coverage(), max_recursion_depth: poolCfg.orchestrator?.max_recursion_depth ?? 2 });
     }
     if (path === "/tool/decision" && req.method === "POST") {
       const { call_id, approved } = await req.json() as { call_id: string; approved: boolean };

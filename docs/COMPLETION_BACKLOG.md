@@ -12,6 +12,53 @@ checking off.
 
 ## Backlog
 
+- [x] **F1 — cascadeTier not honored in primary pool model selection.** (2026-06-24)
+  `callModel` in `server-jarvis/src/index.ts` always called `pool.pickFor(stage, task)` even
+  when `callOptions.cascadeTier` was "cheap" or "strong", so both cheap and strong executor
+  calls in `speculative_cascade` used the same primary model. Root cause: the tier signal
+  was only forwarded to `chatCompletionWithFallback` (for fallback chain ordering) but never
+  consulted at the primary selection level. Fix: when `cascadeTier` is set, use
+  `pool.cascadeChain(stage, task)[0]` for "cheap" and `chain[chain.length-1]` for "strong".
+  (`server-jarvis/src/index.ts` ~line 1168)
+  *Verified:* `bunx tsc --noEmit` green; 233 bun tests pass.
+
+- [x] **F2 — opencode_zen pool agents silently excluded from model routing.** (2026-06-24)
+  5 of 12 default pool agents carry `provider: "opencode_zen"`. The `callModel` provider
+  check (`agent.provider === "openrouter"`) excluded them so they were never used as
+  primary models. `resolvePoolModels` in openrouter.ts had the same filter, so they were
+  also missing from fallback chains. Root cause: provider type guard too narrow. Fix:
+  treat `opencode_zen` identically to `openrouter` (same API base_url/key apply); added
+  `|| agent.provider === "opencode_zen"` in both callModel and resolvePoolModels.
+  (`server-jarvis/src/index.ts` ~line 1177; `server-jarvis/src/openrouter.ts` lines 576, 583)
+  *Verified:* `bunx tsc --noEmit` green; 233 bun tests pass.
+
+- [x] **F3 — orchestrator_recursion SSE frame silently dropped.** (2026-06-24)
+  `SseRelay.handle_line` in `src-tauri/src/jarvis/runner.rs` had no case for the
+  `"orchestrator_recursion"` event type emitted by the recursive-topology pipeline — it fell
+  through to `SseFrameOutcome::Continue`. Users got no feedback that recursive critique was
+  running. Root cause: new SSE frame type not added to the relay enum/match. Fix: added
+  `Recursion { depth, status, reenter_stage, critique }` variant to `SseFrameOutcome`,
+  parse in `handle_line`, emit `jarvis://recursion` from the I/O loop, and added a
+  `listen("jarvis://recursion", ...)` handler in `JarvisView.tsx` that shows
+  "↩ depth N" inside the existing pipeline breadcrumb.
+  (`src-tauri/src/jarvis/runner.rs`; `src-ui/src/components/jarvis/JarvisView.tsx`)
+  *Verified:* 2 new SSE unit tests pass; `cargo test --lib` 58 pass; `bunx tsc -b` green.
+
+- [x] **F4 — agent_run_id SSE frame silently dropped.** (2026-06-24)
+  The `"agent_run_id"` frame emitted after pipeline completion fell through to `Continue`.
+  Fix: added `AgentRunId { run_id }` variant, parse in `handle_line`, emit
+  `jarvis://agent_run` — the UI can correlate turns to self-tuning run IDs.
+  (`src-tauri/src/jarvis/runner.rs`)
+  *Verified:* new SSE unit test passes; `cargo test --lib` 58 pass.
+
+- [x] **F5 — No HTTP endpoint to inspect the orchestrator agent pool.** (2026-06-24)
+  The `AgentPool` state (agent list, coverage, diversity gaps) was only available
+  inside the orchestrator path; no HTTP route exposed it for tooling or UI dashboards.
+  Fix: added `GET /agents/pool` → `{ pool: OrchestratorAgent[], coverage: AgentPoolCoverage,
+  max_recursion_depth: number }`.
+  (`server-jarvis/src/index.ts` ~line 2482)
+  *Verified:* `bunx tsc --noEmit` green; 233 bun tests pass.
+
 - [x] **E — Retire remaining stub views** (Phase 1.7, 2026-06-22). SelfImprovementView and
   PrizePicksPanel were no-op placeholders, **orphaned** (not imported/routed in App.tsx —
   no UI-reachable dead path). Both deleted, and the dangling `'self-improvement'`/

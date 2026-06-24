@@ -322,6 +322,8 @@ function ChatPanel({
   const [error, setError] = useState<string | null>(null);
   // Orchestrator pipeline progress: e.g. "planner", "executor", "reviewer"
   const [pipelineStage, setPipelineStage] = useState<string>('');
+  // Recursive-critique info: set when recursive topology is in a critique/re-enter cycle
+  const [recursionDepth, setRecursionDepth] = useState<number | null>(null);
   // Reasoning/CoT text accumulated while streaming (cleared on done)
   const [reasoningText, setReasoningText] = useState<string>('');
   const [showReasoning, setShowReasoning] = useState(false);
@@ -434,6 +436,7 @@ function ChatPanel({
       invoke('cancel_chat_stream', { sessionId: prev }).catch(() => {});
       setIsStreaming(false);
       setPipelineStage('');
+      setRecursionDepth(null);
       setReasoningText('');
       setShowReasoning(false);
       setAgentSteps([]);
@@ -520,6 +523,7 @@ function ChatPanel({
       if (!matchesStreamSession(event.payload.session_id)) return;
       setIsStreaming(false);
       setPipelineStage('');
+      setRecursionDepth(null);
       setPendingApproval(null);
       setUserPinnedToBottom(true);
       const sid = event.payload.session_id || activeSessionRef.current || sessionIdRef.current;
@@ -545,6 +549,7 @@ function ChatPanel({
       if (!matchesStreamSession(event.payload.session_id)) return;
       setIsStreaming(false);
       setPipelineStage('');
+      setRecursionDepth(null);
       setPendingApproval(null);
       setError(event.payload.error);
       setUserPinnedToBottom(true);
@@ -568,6 +573,13 @@ function ChatPanel({
       if (!matchesStreamSession(event.payload.session_id)) return;
       const { stage, status } = event.payload;
       setPipelineStage(status === 'done' ? '' : stage);
+    }));
+
+    track(listen<{ depth: number; status: string; reenter_stage?: string; critique?: string; session_id?: string }>('jarvis://recursion', (event) => {
+      if (!matchesStreamSession(event.payload.session_id)) return;
+      const { depth, status } = event.payload;
+      // Show depth only while an active recursive critique cycle is running
+      setRecursionDepth(status === 'done' || status === 'max_depth' ? null : depth);
     }));
 
     track(listen<{ text: string; session_id?: string }>('jarvis://reasoning', (event) => {
@@ -681,6 +693,7 @@ function ChatPanel({
     setError(null);
     setIsStreaming(true);
     setPipelineStage('');
+    setRecursionDepth(null);
     setReasoningText('');
     setShowReasoning(false);
     setAgentSteps([]);
@@ -792,6 +805,7 @@ function ChatPanel({
     setActiveSession(null);
     setError(null);
     setPipelineStage('');
+    setRecursionDepth(null);
     setReasoningText('');
     setShowReasoning(false);
     setAgentSteps([]);
@@ -992,7 +1006,10 @@ function ChatPanel({
               <Sparkles size={11} />
             </motion.span>
             <span className="uppercase tracking-wider">{pipelineStage}</span>
-            <span className="text-bone-faint">running…</span>
+            {recursionDepth !== null && (
+              <span className="text-bone-faint">↩ depth {recursionDepth}</span>
+            )}
+            {recursionDepth === null && <span className="text-bone-faint">running…</span>}
           </motion.div>
         )}
 

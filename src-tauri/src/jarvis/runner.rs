@@ -109,6 +109,29 @@ pub fn run_jarvis_message(
                         }),
                     );
                 }
+                SseFrameOutcome::Recursion {
+                    depth,
+                    status,
+                    reenter_stage,
+                    critique,
+                } => {
+                    let _ = app.emit(
+                        "jarvis://recursion",
+                        serde_json::json!({
+                            "depth": depth,
+                            "status": status,
+                            "reenter_stage": reenter_stage,
+                            "critique": critique,
+                            "session_id": sid,
+                        }),
+                    );
+                }
+                SseFrameOutcome::AgentRunId { run_id } => {
+                    let _ = app.emit(
+                        "jarvis://agent_run",
+                        serde_json::json!({ "run_id": run_id, "session_id": sid }),
+                    );
+                }
                 SseFrameOutcome::Error(err) => {
                     emit_error(&app, &sid, err);
                     terminated = true;
@@ -303,6 +326,20 @@ pub enum SseFrameOutcome {
         stage: String,
         text: String,
     },
+    /// Recursive-critique loop progress (`orchestrator_recursion`). Emitted when the
+    /// `recursive` topology enters a critique or re-enter cycle.
+    Recursion {
+        depth: u64,
+        status: String,
+        reenter_stage: Option<String>,
+        critique: Option<String>,
+    },
+    /// Stable identifier for the orchestrator run that produced this turn's answer.
+    /// Emitted as `agent_run_id` after the pipeline completes; used by self-tuning
+    /// to correlate a user rating with the run record in SQLite.
+    AgentRunId {
+        run_id: String,
+    },
 }
 
 /// Stateful SSE frame relay. Holds the one piece of cross-frame state the
@@ -455,6 +492,15 @@ impl SseRelay {
                 }
                 SseFrameOutcome::Continue
             }
+            Some("orchestrator_recursion") => SseFrameOutcome::Recursion {
+                depth: evt.get("depth").and_then(|v| v.as_u64()).unwrap_or(0),
+                status: evt.get("status").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                reenter_stage: evt.get("reenter_stage").and_then(|s| s.as_str()).map(str::to_string),
+                critique: evt.get("critique").and_then(|s| s.as_str()).map(str::to_string),
+            },
+            Some("agent_run_id") => SseFrameOutcome::AgentRunId {
+                run_id: evt.get("agent_run_id").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+            },
             Some("message_stop") => SseFrameOutcome::MessageStop,
             Some("cancelled") => SseFrameOutcome::Cancelled,
             Some("reasoning_complete") => {
@@ -846,6 +892,54 @@ mod sse_tests {
             SseFrameOutcome::ResultThenDone {
                 token: Some("final answer".to_string()),
                 error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn orchestrator_recursion_maps_fields() {
+        let mut r = SseRelay::new();
+        let out = r.handle_line(
+            r#"data: {"type":"orchestrator_recursion","depth":1,"status":"reenter","reenter_stage":"executor","critique":"answer was incomplete"}"#,
+        );
+        assert!(
+            matches!(
+                out,
+                SseFrameOutcome::Recursion { depth: 1, ref status, ref reenter_stage, ref critique }
+                if status == "reenter"
+                    && reenter_stage.as_deref() == Some("executor")
+                    && critique.as_deref() == Some("answer was incomplete")
+            ),
+            "expected Recursion, got {out:?}",
+        );
+    }
+
+    #[test]
+    fn orchestrator_recursion_handles_missing_optional_fields() {
+        let mut r = SseRelay::new();
+        let out = r.handle_line(
+            r#"data: {"type":"orchestrator_recursion","depth":0,"status":"critique"}"#,
+        );
+        assert!(
+            matches!(
+                out,
+                SseFrameOutcome::Recursion { depth: 0, ref status, reenter_stage: None, critique: None }
+                if status == "critique"
+            ),
+            "expected Recursion with optional fields absent, got {out:?}",
+        );
+    }
+
+    #[test]
+    fn agent_run_id_frame_extracts_run_id() {
+        let mut r = SseRelay::new();
+        let out = r.handle_line(
+            r#"data: {"type":"agent_run_id","agent_run_id":"run_abc123","session_id":"sess1"}"#,
+        );
+        assert_eq!(
+            out,
+            SseFrameOutcome::AgentRunId {
+                run_id: "run_abc123".to_string(),
             }
         );
     }

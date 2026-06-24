@@ -573,14 +573,14 @@ function resolvePoolModels(cfg: JarvisConfig, options: FallbackResolveOptions = 
     const cascade = pool.cascadeChain(options.stage, options.taskType ?? "general");
     const ordered = options.cascadeTier === "strong" ? [...cascade].reverse() : cascade;
     return ordered
-      .filter((agent) => agent.provider === "openrouter")
+      .filter((agent) => agent.provider === "openrouter" || agent.provider === "opencode_zen")
       .map((agent) => agent.model_id);
   }
   const selected = pool.pickFor(options.stage, options.taskType ?? "general");
   if (!selected) return [];
   return pool
     .fallbackChain(selected)
-    .filter((agent) => agent.provider === "openrouter")
+    .filter((agent) => agent.provider === "openrouter" || agent.provider === "opencode_zen")
     .map((agent) => agent.model_id);
 }
 
