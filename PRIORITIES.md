@@ -1,9 +1,9 @@
 # Jarvis / home-base — Priority Roadmap
 
-Last updated: 2026-06-23 (Phase 2 complete — all items done, TypeScript typecheck regression fixed)
+Last updated: 2026-06-24 (Orchestrator v2 — Fugu-style Coordinator + AgentPool + 3 topologies committed)
 Working copy: `C:\Projects\home-base-recovered`
 
-Quick status: **Phase 1 done · Phase 2 done · Phase 3 done (items already implemented)**
+Quick status: **Phase 1 done · Phase 2 done · Phase 3 done · Orchestrator v2 substrate live**
 
 ---
 
@@ -53,8 +53,21 @@ Quick status: **Phase 1 done · Phase 2 done · Phase 3 done (items already impl
 | **P2** | Profile provisioning UI | End-to-end profile creation/selection from the UI (currently SQLite-native only) | ✅ Done (2026-06-23) |
 | **P2** | OpenClaw bridge | Formal bridge between Jarvis and the OpenClaw agent runtime | ✅ Done (2026-06-23) |
 | **P2** | Tauri shell rewire | Simplify the Tauri command surface — consolidate redundant IPC, remove dead stubs | ✅ Done (2026-06-23) |
+| **P2** | Orchestrator v2 substrate (Fugu-style Coordinator + AgentPool + 3 topologies) | Replace PredictiveRouter with a Coordinator that selects among linear / speculative_parallel / speculative_cascade / recursive topologies. 12 default OpenRouter/OpenCode-Zen agents scored on code / reasoning / speed / cost / json_reliability. Pool-aware fallbacks and per-stage retry telemetry. | ✅ Done (2026-06-24) |
 | **P3** | Frontier scaffolding | Pre-built agent templates, skill templates, and project scaffolding for new capabilities | ✅ Done (2026-06-23) |
 | **P3** | Eval harness expansion | Beyond regression: benchmark suites, A/B inference comparison, cost tracking | ⬜ Not started |
+
+---
+
+## Orchestrator v2 — what changed (2026-06-24)
+
+- **`Coordinator`** (`server-jarvis/src/orchestration/coordinator.ts`) — explicit topology selection, skip / re-enter directives, validated JSON output, surfaces failures as `CoordinatorError` instead of silently defaulting. `router.ts` is now a compatibility shim.
+- **`AgentPool`** (`server-jarvis/src/orchestration/agent-pool.ts`) — 12 default agents across OpenRouter and OpenCode-Zen. `pickFor`, `fallbackChain`, `cascadeChain`, `coverage()` (diversity + stage_gaps). Stage weights vary by stage and task type; cascade tier (cheap → strong) uses a confidence threshold of 0.65 from the cheap executor output.
+- **`PipelineExecutor` topologies** — `speculative_parallel` (planner + reviewer concurrent, then synthesizer, gated to model-only stages), `speculative_cascade` (executor cheap → strong on low confidence, gated to `[executor, synthesizer]`), `recursive` (critique-then-reenter via `prompts/modes/recursion-critique.md`, bounded by `orchestrator.max_recursion_depth` default 2). `linear` is the only topology permitted for file edits and destructive actions.
+- **Inference resilience plumbing** — `chatCompletionWithFallback` now accepts `FallbackResolveOptions` (`stage`, `taskType`, `cascadeTier`) so stage-specific OpenRouter agents are tried before generic fallbacks. `BackendStats` gains `total_retries`, `fallbacks_used`, `last_fallback_model` for `/health/inference`. Stream stall watchdog mirrors the Agent Loop's `MODEL_STREAM_STALL_*` constants.
+- **Config** — `orchestrator.agents` and `orchestrator.max_recursion_depth` are now config fields with safe defaults.
+- **Tests** — 233 bun tests pass, 55 cargo tests pass, both `tsc` jobs clean. 4 new test files (`agent-pool.test.ts`, `coordinator.test.ts`, `openrouter-fallback.test.ts`, expanded `inference-metrics.test.ts`, `orchestration.test.ts`).
+- **Hygiene** — `.hermes/` added to `.gitignore` (local session notes, never commit).
 
 ---
 
@@ -67,19 +80,20 @@ Quick status: **Phase 1 done · Phase 2 done · Phase 3 done (items already impl
 | Phase 2 P2 | 2 | **0** |
 | Phase 3 | 3 | **0** |
 | Platform P1 | 2 | **0** |
-| Platform P2 | 4 | **0** |
+| Platform P2 | 5 | **0** |
 | Platform P3 | 1 | **1** |
 
 ---
 
 ## Suggested next target
 
-All tracked phases are complete. The remaining P3 item is **Eval harness expansion** — benchmark suites, A/B inference comparison, cost tracking.
+The only remaining tracked item is **P3 Eval harness expansion** — benchmark suites, A/B inference comparison, cost tracking. With the Orchestrator v2 substrate live, the eval harness can now exercise the three new topologies and the AgentPool fallback chain end-to-end instead of just the linear pipeline.
 
 Near-term hardening opportunities:
-- **TypeScript typecheck hygiene**: a scope bug (`let`-in-try invisible to catch) was fixed 2026-06-23 in `index.ts`. Run `bunx tsc --noEmit` after any significant edit to catch similar regressions early.
+- **TypeScript typecheck hygiene**: a scope bug (`let`-in-try invisible to catch) was fixed 2026-06-23 in `index.ts`. Run `bunx tsc --noEmit` after any significant edit to catch similar regressions early. Confirmed clean on 2026-06-24 after Orchestrator v2 commit.
 - **`cargo tauri build --debug`**: Phase 2 completion criteria include a working debug binary; this has not been formally verified in CI — wire it to the eval gate.
-- **Eval harness breadth**: current scenarios cover routing and tool execution; add multi-turn conversation, fallback-chain, and memory-recall scenarios.
+- **Eval harness breadth**: current scenarios cover routing and tool execution; add multi-turn conversation, fallback-chain, memory-recall, and the new speculative / recursive topology scenarios.
+- **Live end-to-end smoke test of the Orchestrator v2 path**: a `stream_event` flow exercising `coordinator.route → pipeline.execute(linear|parallel|cascade|recursive)` against a real OpenRouter call. The 233 unit tests cover the routing and pool logic; a real stream is the only proof the chat path actually delivers the new topology.
 
 ---
 
