@@ -163,16 +163,24 @@ export class StreamSession {
   /**
    * Emit the single terminal `message_stop` (plus an optional `result`).
    * Idempotent — subsequent calls are no-ops.
+   *
+   * Pass `{ isError: true }` when `result` carries a failure (e.g. the
+   * orchestrator's synthesizer threw on a hard auth/network error). The
+   * Rust relay surfaces an error-flagged `result` as `jarvis://error`
+   * (a visible banner) instead of injecting the text into the chat bubble
+   * as if it were a real answer — which previously made auth failures look
+   * like a silent stall.
    */
-  async finish(result?: string): Promise<void> {
+  async finish(result?: string, opts?: { isError?: boolean }): Promise<void> {
     if (this.terminalSent) return;
     this.terminalSent = true;
     await this.write(sseFrame({ type: "message_stop", session_id: this.sessionId }));
     if (result !== undefined) {
+      const isError = opts?.isError ?? false;
       await this.write(sseFrame({
         type: "result",
-        subtype: "success",
-        is_error: false,
+        subtype: isError ? "error" : "success",
+        is_error: isError,
         result,
         session_id: this.sessionId,
       }));

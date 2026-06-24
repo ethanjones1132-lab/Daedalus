@@ -421,6 +421,12 @@ function ChatPanel({
   // different session. Without this the user sees an empty chat for a session
   // that has prior messages. Was the #1 audit bug.
   const prevActiveSessionRef = useRef<string | null>(activeSession);
+  // When handleSend creates a session for the very first message, it sets this
+  // to the new id and optimistically renders the user + streaming-assistant
+  // messages. The history-load effect below would otherwise immediately fetch
+  // the (still-empty) history and overwrite them — the "my message vanished"
+  // bug. We skip the load exactly once for that freshly-created session.
+  const suppressHistoryLoadRef = useRef<string | null>(null);
   useEffect(() => {
     const prev = prevActiveSessionRef.current;
     prevActiveSessionRef.current = activeSession;
@@ -448,6 +454,14 @@ function ChatPanel({
       setReasoningText('');
       setAgentSteps([]);
       setIsStreaming(false);
+      return;
+    }
+    if (suppressHistoryLoadRef.current && suppressHistoryLoadRef.current === activeSession) {
+      // Freshly created by handleSend — the optimistic messages are already on
+      // screen and the stream is in flight. Loading empty history would wipe
+      // them. Consume the suppression once and leave the messages intact.
+      suppressHistoryLoadRef.current = null;
+      setLoadingHistory(false);
       return;
     }
     let cancelled = false;
@@ -537,6 +551,13 @@ function ChatPanel({
       setMessages(prev => {
         const last = prev[prev.length - 1];
         if (last && last.isStreaming) {
+          // If nothing streamed before the error (e.g. a turn-fatal auth
+          // failure), drop the empty assistant bubble so the user sees just
+          // their message + the error banner — not a blank reply. Otherwise
+          // finalize whatever partial text did arrive.
+          if (!last.content.trim()) {
+            return prev.slice(0, -1);
+          }
           return [...prev.slice(0, -1), { ...last, isStreaming: false }];
         }
         return prev;
@@ -680,6 +701,10 @@ function ChatPanel({
           name: userMsg.slice(0, 60),
         });
         effectiveSessionId = newSession.id;
+        // Suppress the history-load effect that setActiveSession is about to
+        // trigger — otherwise it overwrites the optimistic messages above with
+        // the empty history of this brand-new session.
+        suppressHistoryLoadRef.current = newSession.id;
         setSessionId(newSession.id);
         setActiveSession(newSession.id);
         onSessionCreated();

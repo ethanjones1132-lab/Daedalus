@@ -1447,12 +1447,34 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }
         } catch {}
 
-        outcomeCollector.completeAgentRun(agentRunId, result, duration, totalToolCalls, totalTokens);
+        outcomeCollector.completeAgentRun(agentRunId, result.answer, duration, totalToolCalls, totalTokens);
         await selfTuningProposer.proposeAndApply(agentRunId, route.task_type);
 
         // Write final done messages
         await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "agent_run_id", agent_run_id: agentRunId, session_id: sessionId })}\n\n`));
-        await session.finish(result);
+        if (result.error) {
+          // Turn-fatal failure (e.g. auth rejected on every stage): surface a
+          // real error frame so the UI shows a banner instead of dropping the
+          // failure text into the chat bubble as if it were an answer.
+          console.error(`[Jarvis Orchestrator] session=${sessionId} failed: ${result.error}`);
+          recordInference({
+            ts: Date.now(),
+            backend: cfg.active_backend as Backend,
+            // claude_cli is handled by an earlier early-return, so here the
+            // backend is ollama | openrouter.
+            model: cfg.active_backend === "openrouter"
+              ? (cfg.openrouter.model ?? "openrouter/free")
+              : cfg.ollama.model,
+            ok: false,
+            latency_ms: duration,
+            tokens_in: 0,
+            tokens_out: 0,
+            error: result.error.slice(0, 200),
+          });
+          await session.finish(result.error, { isError: true });
+        } else {
+          await session.finish(result.answer);
+        }
         return;
       }
 
@@ -2525,6 +2547,14 @@ async function baseFetch(req: Request): Promise<Response> {
 // ═══════════════════════════════════════════════════════════════
 serve({
   port: PORT,
+  // Disable Bun's idle-connection timeout (default 10s). Chat is a long-lived
+  // SSE stream: during a single model call the server sends no frames, and a
+  // slow local/free model can idle well past 10s — Bun would close the socket
+  // mid-turn and the user would see a silent stall. Bun's max finite idleTimeout
+  // is 255s, which is still under MODEL_REQUEST_TIMEOUT_MS (300s), so the only
+  // safe choice is to disable it here and rely on the per-request abort timeout
+  // (300s) and the Rust relay's own 900s ceiling to bound a genuinely hung turn.
+  idleTimeout: 0,
   fetch: baseFetch,
 });
 

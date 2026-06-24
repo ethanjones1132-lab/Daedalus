@@ -11,6 +11,58 @@ export interface PipelineProgressState {
   output?: string;
 }
 
+/**
+ * Result of a pipeline run. `answer` is the text to surface; `error` is set
+ * only when that text is a failure notice rather than a real answer (e.g. the
+ * synthesizer threw on a hard auth/network error). Callers MUST check `error`
+ * and surface it as an error frame — otherwise a turn-fatal failure looks like
+ * a successful (but nonsensical) response, which is exactly how an invalid
+ * OpenRouter key used to present as a silent stall.
+ */
+export interface PipelineResult {
+  answer: string;
+  error?: string;
+}
+
+/**
+ * Safe error-to-string. Thrown values are not always `Error` instances — a
+ * streaming/parse path can `throw` a non-Error (or even `undefined`), and a
+ * bare `e.message` then crashes the catch block itself with a confusing
+ * "undefined is not an object (evaluating 'e.message')" that masks the real
+ * failure. Always funnel caught values through this.
+ */
+export function errText(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === "string") return e;
+  if (e && typeof e === "object" && "message" in e) {
+    const m = (e as { message?: unknown }).message;
+    if (typeof m === "string") return m;
+  }
+  return String(e);
+}
+
+/**
+ * Turn a raw model/transport error into a user-readable one-liner. Hard auth
+ * and quota failures are the common turn-killers and deserve an actionable hint
+ * instead of a bare `API 401: {...}` dump.
+ */
+export function describePipelineError(raw: string): string {
+  const msg = raw || "Unknown error";
+  if (/\b401\b/.test(msg) || /unauthor/i.test(msg) || /user not found/i.test(msg) || /invalid api key/i.test(msg)) {
+    return "Authentication failed (401): the inference provider rejected the API key. Check your OpenRouter API key in Settings.";
+  }
+  if (/\b403\b/.test(msg) || /forbidden/i.test(msg)) {
+    return "Access denied (403): the API key lacks permission for this model. Check your provider plan or model access.";
+  }
+  if (/\b429\b/.test(msg) || /rate limit/i.test(msg) || /quota/i.test(msg)) {
+    return "Rate limited or out of quota (429): the provider is throttling requests or your credit is exhausted. Try again shortly.";
+  }
+  if (/\b5\d\d\b/.test(msg) || /bad gateway/i.test(msg) || /unavailable/i.test(msg)) {
+    return `The inference provider returned a server error. ${msg}`;
+  }
+  return msg;
+}
+
 export class PipelineExecutor {
   constructor(
     private callModel: CallModelFn,
@@ -23,7 +75,7 @@ export class PipelineExecutor {
     pipeline: string[],
     agentRunId: string,
     onStateChange: (state: PipelineProgressState) => void
-  ): Promise<string> {
+  ): Promise<PipelineResult> {
     let plan = "No planning stage executed.";
     let executorSummary = "No execution stage executed.";
     let reviewerFeedback = "No review stage executed.";
@@ -63,8 +115,8 @@ export class PipelineExecutor {
           had_error: 0,
         });
       } catch (e: any) {
-        onStateChange({ stage: "planner", status: "failed", output: e.message });
-        plan = `Failed to generate plan: ${e.message}`;
+        onStateChange({ stage: "planner", status: "failed", output: errText(e) });
+        plan = `Failed to generate plan: ${errText(e)}`;
 
         outcomeCollector.recordStageRun({
           id: `stage_${crypto.randomUUID()}`,
@@ -75,7 +127,7 @@ export class PipelineExecutor {
           duration_ms: Date.now() - startTime,
           was_successful: 0,
           had_error: 1,
-          error_message: e.message,
+          error_message: errText(e),
         });
       }
     }
@@ -160,7 +212,7 @@ export class PipelineExecutor {
               duration_ms: Date.now() - turnStartTime,
               was_successful: 0,
               had_error: 1,
-              error_message: err.message,
+              error_message: errText(err),
             });
             throw err;
           }
@@ -183,8 +235,8 @@ export class PipelineExecutor {
 
         onStateChange({ stage: "executor", status: "done", output: executorSummary });
       } catch (e: any) {
-        onStateChange({ stage: "executor", status: "failed", output: e.message });
-        executorSummary = `Executor failed: ${e.message}`;
+        onStateChange({ stage: "executor", status: "failed", output: errText(e) });
+        executorSummary = `Executor failed: ${errText(e)}`;
       }
     }
 
@@ -313,7 +365,7 @@ export class PipelineExecutor {
                   duration_ms: Date.now() - rewStartTime,
                   was_successful: 0,
                   had_error: 1,
-                  error_message: err.message,
+                  error_message: errText(err),
                 });
                 throw err;
               }
@@ -336,7 +388,7 @@ export class PipelineExecutor {
             onStateChange({ stage: "rewriter", status: "done", output: rewriterSummary });
           }
         } catch (e: any) {
-          onStateChange({ stage: "reviewer", status: "failed", output: e.message });
+          onStateChange({ stage: "reviewer", status: "failed", output: errText(e) });
           hasPendingIssues = false; // abort review loop on error
 
           outcomeCollector.recordStageRun({
@@ -348,7 +400,7 @@ export class PipelineExecutor {
             duration_ms: Date.now() - revStartTime,
             was_successful: 0,
             had_error: 1,
-            error_message: e.message,
+            error_message: errText(e),
           });
         }
       }
@@ -356,6 +408,7 @@ export class PipelineExecutor {
 
     // 4. Synthesizer Stage
     let finalAnswer = "";
+    let fatalError: string | undefined;
     if (pipeline.includes("synthesizer")) {
       onStateChange({ stage: "synthesizer", status: "running" });
       const synthesizerPrompt = loadPrompt("modes/synthesizer.md");
@@ -393,8 +446,12 @@ export class PipelineExecutor {
           had_error: 0,
         });
       } catch (e: any) {
-        onStateChange({ stage: "synthesizer", status: "failed", output: e.message });
-        finalAnswer = `Synthesis failed: ${e.message}`;
+        onStateChange({ stage: "synthesizer", status: "failed", output: errText(e) });
+        // The synthesizer produces the turn's actual answer. If it threw, there
+        // is no answer — record the failure so the caller emits an error frame
+        // instead of passing "Synthesis failed: …" off as a successful result.
+        fatalError = describePipelineError(errText(e));
+        finalAnswer = `Synthesis failed: ${errText(e)}`;
 
         outcomeCollector.recordStageRun({
           id: `stage_${crypto.randomUUID()}`,
@@ -405,7 +462,7 @@ export class PipelineExecutor {
           duration_ms: Date.now() - synthStartTime,
           was_successful: 0,
           had_error: 1,
-          error_message: e.message,
+          error_message: errText(e),
         });
       }
     } else {
@@ -413,7 +470,7 @@ export class PipelineExecutor {
       finalAnswer = plan !== "No planning stage executed." ? plan : "No planning stage executed.";
     }
 
-    return finalAnswer;
+    return { answer: finalAnswer, error: fatalError };
   }
 
   private hasIssues(reviewText: string): boolean {

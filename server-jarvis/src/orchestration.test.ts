@@ -1,7 +1,7 @@
 import { describe, test, expect } from "bun:test";
 import { BUILTIN_MODES, getToolsForMode } from "./orchestration/modes";
 import { PredictiveRouter } from "./orchestration/router";
-import { PipelineExecutor } from "./orchestration/pipeline";
+import { PipelineExecutor, describePipelineError, errText } from "./orchestration/pipeline";
 import { createToolRuntime, makeExecutionContext } from "./tool-runtime";
 import type { ToolDefinition } from "./tool-types";
 import { defaultConfig } from "./config";
@@ -52,8 +52,49 @@ describe("Orchestration & Routing Tests", () => {
 
     const result = await executor.execute("do nothing", [], "run-empty", (state) => states.push(state as any));
 
-    expect(result).toBe("No planning stage executed.");
+    expect(result.answer).toBe("No planning stage executed.");
+    expect(result.error).toBeUndefined();
     expect(states).toEqual([]);
+  });
+
+  test("PipelineExecutor surfaces a synthesizer failure as a turn-fatal error", async () => {
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig);
+    // Every model call rejects like an invalid OpenRouter key would.
+    const executor = new PipelineExecutor(
+      async () => { throw new Error("API 401: {\"error\":{\"message\":\"User not found.\",\"code\":401}}"); },
+      runtime,
+      ctx,
+    );
+    const states: Array<{ stage: string; status: string }> = [];
+
+    const result = await executor.execute("hi", ["synthesizer"], "run-auth-fail", (state) => states.push(state as any));
+
+    // The answer still carries the raw notice for logging, but `error` is set so
+    // the caller emits an error frame instead of a fake "success".
+    expect(result.answer).toContain("Synthesis failed");
+    expect(result.error).toBeDefined();
+    expect(result.error).toMatch(/Authentication failed \(401\)/);
+    expect(states.some((s) => s.stage === "synthesizer" && s.status === "failed")).toBe(true);
+  });
+
+  test("errText safely stringifies non-Error throws without crashing", () => {
+    expect(errText(new Error("boom"))).toBe("boom");
+    expect(errText("plain string")).toBe("plain string");
+    expect(errText({ message: "objlike" })).toBe("objlike");
+    // The case that produced "undefined is not an object (evaluating 'e.message')":
+    expect(errText(undefined)).toBe("undefined");
+    expect(errText(null)).toBe("null");
+    expect(errText({ code: 500 })).toBe("[object Object]");
+  });
+
+  test("describePipelineError maps hard transport errors to actionable hints", () => {
+    expect(describePipelineError("API 401: User not found")).toMatch(/Authentication failed \(401\)/);
+    expect(describePipelineError("API 403: forbidden")).toMatch(/Access denied \(403\)/);
+    expect(describePipelineError("API 429: rate limit exceeded")).toMatch(/Rate limited/);
+    expect(describePipelineError("API 502: bad gateway")).toMatch(/server error/);
+    // Non-transport errors pass through unchanged.
+    expect(describePipelineError("boom")).toBe("boom");
   });
 
   test("builtin modes expose expected finality and filters", () => {
