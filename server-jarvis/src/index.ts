@@ -948,7 +948,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
   totalRequests++;
-  const _turnStart = Date.now();
+  let _turnStart = Date.now();
 
   (async () => {
     const streamAbort = new AbortController();
@@ -973,6 +973,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       }
       throw new StreamCancelledError();
     };
+    // Hoisted so the catch block can include them in error-path recordInference calls.
+    // let-in-try is block-scoped and invisible to catch; declare here then reinitialize in the Ollama/OpenRouter path.
+    let sessionCostInfo: OpenRouterCostInfo | null = null;
+    let lastFallbackRetries = 0;
+    let lastFallbackModel: string | undefined;
     try {
       const systemPrompt = options.systemPromptOverride ?? cfg.system_prompt;
       const isOllama = cfg.active_backend === "ollama";
@@ -1472,10 +1477,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       let forceFinalAnswerOnly = false;
       let verifiedWebSearchDone = false;
       let toolExecutionCount = 0;
-      let sessionCostInfo: OpenRouterCostInfo | null = null;
+      sessionCostInfo = null;
       let prevToolCallCount = 0;  // Track tools called in previous turn for nudge logic
-      let lastFallbackRetries = 0;
-      let lastFallbackModel: string | undefined;
+      lastFallbackRetries = 0;
+      lastFallbackModel = undefined;
       const requiresVerifiedWebSearch = cfg.tools.enabled && hasExplicitWebSearchIntent(message);
       const requiresLocalToolUse = cfg.tools.enabled && hasLocalWorkspaceToolIntent(message);
 
@@ -1485,6 +1490,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
       while (!loopDone && turnCount < MAX_TOOL_EXECUTION_TURNS) {
         turnCount++;
+        _turnStart = Date.now();
         const baseUrl = isOllama
           ? ollamaTarget!.chatUrl
           : `${cfg.openrouter.base_url}/chat/completions`;
@@ -1835,6 +1841,25 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         }
         await completeReasoning();
 
+        // Record per-turn inference for resilience observability (per-backend retry/fallback telemetry)
+        const _cfgTurn = resolveConfig(options.config);
+        recordInference({
+          ts: Date.now(),
+          backend: _cfgTurn.active_backend as Backend,
+          model: lastFallbackModel ?? (_cfgTurn.active_backend === "openrouter"
+            ? (_cfgTurn.openrouter.model ?? "openrouter/free")
+            : _cfgTurn.active_backend === "claude_cli"
+            ? (_cfgTurn.claude_cli.model ?? "claude_cli")
+            : _cfgTurn.ollama.model),
+          ok: true,
+          latency_ms: Date.now() - _turnStart,
+          tokens_in: sessionCostInfo?.prompt_tokens ?? 0,
+          tokens_out: sessionCostInfo?.completion_tokens ?? 0,
+          fallback_used: lastFallbackRetries > 0,
+          retry_count: lastFallbackRetries,
+          fallback_model: lastFallbackModel,
+        });
+
         if (shouldForceWebSearch) {
           fullText = fullTextBeforeTurn;
           if (currentPrompt) {
@@ -2081,23 +2106,6 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       }
 
       console.log(`[Jarvis] Stream complete session=${sessionId} turns=${turnCount} verified_web_search=${verifiedWebSearchDone}`);
-      const _cfg2 = resolveConfig(options.config);
-      recordInference({
-        ts: Date.now(),
-        backend: _cfg2.active_backend as Backend,
-        model: lastFallbackModel ?? (_cfg2.active_backend === "openrouter"
-          ? (_cfg2.openrouter.model ?? "openrouter/free")
-          : _cfg2.active_backend === "claude_cli"
-          ? (_cfg2.claude_cli.model ?? "claude_cli")
-          : _cfg2.ollama.model),
-        ok: true,
-        latency_ms: Date.now() - _turnStart,
-        tokens_in: 0,
-        tokens_out: 0,
-        fallback_used: lastFallbackRetries > 0,
-        retry_count: lastFallbackRetries,
-        fallback_model: lastFallbackModel,
-      });
 
     } catch (error: any) {
       if (error?.name === "StreamCancelledError") {
@@ -2116,9 +2124,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           : _cfg3.ollama.model,
         ok: false,
         latency_ms: Date.now() - _turnStart,
-        tokens_in: 0,
-        tokens_out: 0,
+        tokens_in: sessionCostInfo?.prompt_tokens ?? 0,
+        tokens_out: sessionCostInfo?.completion_tokens ?? 0,
         error: errMsg.slice(0, 200),
+        fallback_used: lastFallbackRetries > 0,
+        retry_count: lastFallbackRetries,
+        fallback_model: lastFallbackModel,
       });
       try {
         await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "error", error: errMsg, session_id: sessionId })}\n\n`));

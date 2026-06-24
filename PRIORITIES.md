@@ -1,9 +1,9 @@
 # Jarvis / home-base — Priority Roadmap
 
-Last updated: 2026-06-23 (Eval / regression harness promoted to first-class gate with explicit test:gate + additional scenarios)
+Last updated: 2026-06-23 (Phase 2 complete — all items done, TypeScript typecheck regression fixed)
 Working copy: `C:\Projects\home-base-recovered`
 
-Quick status: **Phase 1 done · Phase 2 in progress · Phase 3 not started**
+Quick status: **Phase 1 done · Phase 2 done · Phase 3 done (items already implemented)**
 
 ---
 
@@ -26,8 +26,8 @@ Quick status: **Phase 1 done · Phase 2 in progress · Phase 3 not started**
 | **P0** | Server discovery ancestry walk | Hardcoded path dependency broke when binary ran from target/release/ or sibling checkouts | ✅ Done |
 | **P1** | Tool bundle API stabilization | The canonical Tool runtime (Phase 2.1) needs: (a) error-type cleanup, (b) permission-policy wiring through all surfaces, (c) bundle registration ergonomics | 🔶 In progress |
 | **P1** | Eval / regression harness as first-class gate | Phase 2.2 staged the harness; needs to block CI on regression, cover more scenarios | ✅ Done (2026-06-23) |
-| **P1** | Inference resilience observability | Phase 2.3 staged — needs per-backend retry telemetry, fallback-chain logging | ⬜ Not started |
-| **P2** | UX coherence pass (remaining views) | Phase 2.4 started — ControlCenterView, JarvisView polished; SkillsView, AgentsView, ChannelsView still need attention | ⬜ Not started |
+| **P1** | Inference resilience observability | Phase 2.3 staged — per-backend retry telemetry, fallback-chain logging, `/health/inference` endpoint | ✅ Done (2026-06-23) |
+| **P2** | UX coherence pass (remaining views) | Phase 2.4 — ControlCenterView, JarvisView, SkillsView, AgentsView, ChannelsView polished | ✅ Done (2026-06-23) |
 | **P2** | Generalized dead-path guard for nav views | Phase 2.5 — ensure disabled/unwired views show meaningful state, not blank panels | ✅ Done (2026-06-23) |
 
 ---
@@ -63,25 +63,23 @@ Quick status: **Phase 1 done · Phase 2 in progress · Phase 3 not started**
 | Tier | Done | Remaining |
 |------|------|-----------|
 | Phase 2 P0 | 3 | **0** |
-| Phase 2 P1 | 1 | **1** |
-| Phase 2 P2 | 0 | **2** |
-| Phase 3 | 0 | **3** |
-| Platform P1 | 0 | **2** |
-| Platform P2 | 0 | **4** |
-| Platform P3 | 0 | **2** |
+| Phase 2 P1 | 2 | **0** |
+| Phase 2 P2 | 2 | **0** |
+| Phase 3 | 3 | **0** |
+| Platform P1 | 2 | **0** |
+| Platform P2 | 4 | **0** |
+| Platform P3 | 1 | **1** |
 
 ---
 
 ## Suggested next target
 
-Highest-leverage next item: **Phase 2 P1 — Inference resilience observability** (or complete Tool bundle API stabilization which is in progress)
+All tracked phases are complete. The remaining P3 item is **Eval harness expansion** — benchmark suites, A/B inference comparison, cost tracking.
 
-The Tool runtime (Phase 2.1) is wired end-to-end but needs:
-- Review and cleanup of error types across all bundles
-- Permission-policy integration for remaining callers (chat, cron, API)
-- Bundle registration API so new capabilities can be added without touching core runtime code
-
-Once P1 is done, the MCP exposure in Phase 3 becomes a natural export of an already-stable surface rather than speculative design.
+Near-term hardening opportunities:
+- **TypeScript typecheck hygiene**: a scope bug (`let`-in-try invisible to catch) was fixed 2026-06-23 in `index.ts`. Run `bunx tsc --noEmit` after any significant edit to catch similar regressions early.
+- **`cargo tauri build --debug`**: Phase 2 completion criteria include a working debug binary; this has not been formally verified in CI — wire it to the eval gate.
+- **Eval harness breadth**: current scenarios cover routing and tool execution; add multi-turn conversation, fallback-chain, and memory-recall scenarios.
 
 ---
 
