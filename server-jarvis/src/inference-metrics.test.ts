@@ -69,4 +69,36 @@ describe("inferenceMetricsSnapshot", () => {
     expect(stat).toBeDefined();
     expect(stat!.p95_ms).toBeGreaterThanOrEqual(stat!.p50_ms);
   });
+
+  it("aggregates retry telemetry and fallbacks", () => {
+    recordInference({
+      ts: Date.now(),
+      backend: "openrouter",
+      model: "primary",
+      ok: true,
+      latency_ms: 100,
+      tokens_in: 10,
+      tokens_out: 20,
+      fallback_used: true,
+      retry_count: 2,
+      fallback_model: "fallback-model",
+    });
+    recordInference({
+      ts: Date.now(),
+      backend: "openrouter",
+      model: "fallback-model",
+      ok: true,
+      latency_ms: 150,
+      tokens_in: 5,
+      tokens_out: 15,
+      fallback_used: false,
+      retry_count: 0,
+    });
+    const snap = inferenceMetricsSnapshot();
+    const stat = snap.backends.find((b) => b.backend === "openrouter");
+    expect(stat).toBeDefined();
+    expect(stat!.total_retries).toBeGreaterThanOrEqual(2);
+    expect(stat!.fallbacks_used).toBeGreaterThanOrEqual(1);
+    expect(stat!.last_fallback_model).toBe("fallback-model");
+  });
 });

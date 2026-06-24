@@ -8,6 +8,7 @@ import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync } from "fs
 import { join, resolve } from "path";
 import { homedir } from "os";
 import { execSync } from "child_process";
+import { DEFAULT_ORCHESTRATOR_AGENTS, type OrchestratorAgent } from "./orchestration/agent-pool";
 
 // ── Types ──
 
@@ -122,6 +123,8 @@ export interface CompanionConfig {
 
 export interface OrchestratorConfig {
   enabled: boolean;
+  agents: OrchestratorAgent[];
+  max_recursion_depth: number;
 }
 
 export interface JarvisConfig {
@@ -267,6 +270,8 @@ export function defaultConfig(): JarvisConfig {
     },
     orchestrator: {
       enabled: true,
+      agents: DEFAULT_ORCHESTRATOR_AGENTS,
+      max_recursion_depth: 2,
     },
     system_prompt: `You are Jarvis, a local AI coding assistant running on Qwen 3.5 9B in WSL2.
 Workspace: \`/home/ethan/.openclaw/agents/coderclaw/workspace/home-base\`.

@@ -34,3 +34,6 @@ DumpStack.log
 .env
 .env.*
 !.env.example
+
+# --- Local agent session notes (never commit) ---
+.hermes/

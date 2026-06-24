@@ -5,6 +5,7 @@
 // retry/fallback, and per-model capability gates.
 
 import type { JarvisConfig, SurfaceType } from "./config";
+import { AgentPool } from "./orchestration/agent-pool";
 
 // ═══════════════════════════════════════════════════════════════
 // Types
@@ -558,8 +559,33 @@ function isRetryableStatus(status: number): boolean {
   return status === 429 || status === 503 || status === 502 || status === 504;
 }
 
-async function resolveFallbackModels(cfg: JarvisConfig): Promise<string[]> {
+interface FallbackResolveOptions {
+  stage?: string;
+  taskType?: string;
+  cascadeTier?: "cheap" | "strong";
+}
+
+function resolvePoolModels(cfg: JarvisConfig, options: FallbackResolveOptions = {}): string[] {
+  if (!options.stage) return [];
+  const pool = new AgentPool(cfg.orchestrator?.agents ?? []);
+  if (options.cascadeTier) {
+    const cascade = pool.cascadeChain(options.stage, options.taskType ?? "general");
+    const ordered = options.cascadeTier === "strong" ? [...cascade].reverse() : cascade;
+    return ordered
+      .filter((agent) => agent.provider === "openrouter")
+      .map((agent) => agent.model_id);
+  }
+  const selected = pool.pickFor(options.stage, options.taskType ?? "general");
+  if (!selected) return [];
+  return pool
+    .fallbackChain(selected)
+    .filter((agent) => agent.provider === "openrouter")
+    .map((agent) => agent.model_id);
+}
+
+async function resolveFallbackModels(cfg: JarvisConfig, options: FallbackResolveOptions = {}): Promise<string[]> {
   const requested = cfg.openrouter.model || "openrouter/free";
+  const poolModels = resolvePoolModels(cfg, options);
   try {
     const catalog = await listOpenRouterModels(cfg);
     const byId = new Map(catalog.map((model) => [model.id, model]));
@@ -575,6 +601,7 @@ async function resolveFallbackModels(cfg: JarvisConfig): Promise<string[]> {
       });
 
     return Array.from(new Set([
+      ...poolModels.filter((id) => byId.has(id)),
       requested,
       ...PREFERRED_FREE_FALLBACKS.filter((id) => id !== requested && byId.has(id)),
       ...freeCatalogIds,
@@ -583,7 +610,7 @@ async function resolveFallbackModels(cfg: JarvisConfig): Promise<string[]> {
   } catch (error) {
     console.warn("[OpenRouter] Failed to build catalog-aware fallback list:", error);
     const configuredFreeOnly = (cfg.openrouter.fallbacks || []).filter((id) => id.endsWith(":free") || id === "openrouter/free");
-    return Array.from(new Set([requested, "openrouter/free", ...configuredFreeOnly]));
+    return Array.from(new Set([...poolModels.filter((id) => id.endsWith(":free") || id === "openrouter/free"), requested, "openrouter/free", ...configuredFreeOnly]));
   }
 }
 
@@ -595,8 +622,9 @@ export async function chatCompletionWithFallback(
   cfg: JarvisConfig,
   requestBody: any,
   signal?: AbortSignal,
+  options: FallbackResolveOptions = {},
 ): Promise<{ response: Response; model_used: string; retries: number }> {
-  const allModels = await resolveFallbackModels(cfg);
+  const allModels = await resolveFallbackModels(cfg, options);
   let lastError = "";
   const primaryRetryCount = Math.max(0, Number(cfg.openrouter.max_retries ?? RETRY_DELAYS.length));
 

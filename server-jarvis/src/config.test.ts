@@ -152,3 +152,45 @@ describe("tools.interactive_approval", () => {
     expect(cfg.tools.interactive_approval).toBe(true);
   });
 });
+
+describe("orchestrator agent pool config", () => {
+  test("defaultConfig provides a sane enabled agent pool", () => {
+    const agents = defaultConfig().orchestrator.agents;
+    expect(agents.length).toBeGreaterThanOrEqual(3);
+    expect(agents.every((agent) => agent.enabled)).toBe(true);
+    expect(agents.some((agent) => agent.default_for.includes("executor"))).toBe(true);
+    expect(agents.some((agent) => agent.default_for.includes("reviewer"))).toBe(true);
+  });
+
+  test("normalizeConfig fills in missing orchestrator agents", () => {
+    const cfg = normalizeConfig({ orchestrator: { enabled: true } });
+    expect(cfg.orchestrator.agents.length).toBe(defaultConfig().orchestrator.agents.length);
+  });
+
+  test("defaultConfig enables a bounded recursive orchestrator depth", () => {
+    expect(defaultConfig().orchestrator.max_recursion_depth).toBe(2);
+  });
+
+  test("normalizeConfig fills in missing orchestrator recursion depth", () => {
+    const cfg = normalizeConfig({ orchestrator: { enabled: true } });
+    expect(cfg.orchestrator.max_recursion_depth).toBe(2);
+  });
+
+  test("explicit orchestrator agents survive normalization", () => {
+    const cfg = normalizeConfig({
+      orchestrator: {
+        agents: [
+          {
+            id: "custom-agent",
+            provider: "openrouter",
+            model_id: "openrouter/free",
+            capabilities: { code: 0.1, reasoning: 0.9, speed: 0.8, cost: 1, json_reliability: 0.7 },
+            default_for: ["coordinator"],
+            enabled: true,
+          },
+        ],
+      },
+    });
+    expect(cfg.orchestrator.agents.map((agent) => agent.id)).toEqual(["custom-agent"]);
+  });
+});

@@ -11,6 +11,21 @@ export interface PipelineProgressState {
   output?: string;
 }
 
+export type PipelineTopology = "linear" | "speculative_parallel" | "speculative_cascade" | "recursive";
+
+export interface PipelineExecuteOptions {
+  topology?: PipelineTopology;
+  maxRecursionDepth?: number;
+  onRecursion?: (event: PipelineRecursionEvent) => void | Promise<void>;
+}
+
+export interface PipelineRecursionEvent {
+  depth: number;
+  status: "critique" | "reenter" | "max_depth" | "done" | "failed";
+  reenter_stage?: "executor";
+  critique?: string;
+}
+
 /**
  * Result of a pipeline run. `answer` is the text to surface; `error` is set
  * only when that text is a failure notice rather than a real answer (e.g. the
@@ -22,6 +37,7 @@ export interface PipelineProgressState {
 export interface PipelineResult {
   answer: string;
   error?: string;
+  recursion_depth?: number;
 }
 
 /**
@@ -74,8 +90,16 @@ export class PipelineExecutor {
     request: string,
     pipeline: string[],
     agentRunId: string,
-    onStateChange: (state: PipelineProgressState) => void
+    onStateChange: (state: PipelineProgressState) => void,
+    options: PipelineExecuteOptions = {}
   ): Promise<PipelineResult> {
+    if (this.canRunSpeculativeParallel(pipeline, options.topology)) {
+      return this.executeSpeculativeParallel(request, pipeline, agentRunId, onStateChange);
+    }
+    if (this.canRunSpeculativeCascade(pipeline, options.topology)) {
+      return this.executeSpeculativeCascade(request, agentRunId, onStateChange);
+    }
+
     let plan = "No planning stage executed.";
     let executorSummary = "No execution stage executed.";
     let reviewerFeedback = "No review stage executed.";
@@ -470,12 +494,412 @@ export class PipelineExecutor {
       finalAnswer = plan !== "No planning stage executed." ? plan : "No planning stage executed.";
     }
 
-    return { answer: finalAnswer, error: fatalError };
+    const result = { answer: finalAnswer, error: fatalError, recursion_depth: 0 };
+    if (!fatalError && pipeline.includes("synthesizer")) {
+      return this.applyRecursiveCritique(request, result, agentRunId, onStateChange, options);
+    }
+    return result;
   }
 
   private hasIssues(reviewText: string): boolean {
     const normalized = reviewText.toUpperCase();
     return normalized.includes("PARTIAL") || normalized.includes("MISSING");
   }
-}
 
+  private canRunSpeculativeParallel(pipeline: string[], topology: PipelineTopology | undefined): boolean {
+    if (topology !== "speculative_parallel") return false;
+    if (!pipeline.includes("planner") || !pipeline.includes("reviewer") || !pipeline.includes("synthesizer")) return false;
+    // Executor and rewriter stages depend on prior outputs and tool feedback, so
+    // the first speculative slice only parallelizes model-only planning/review.
+    return !pipeline.includes("executor") && !pipeline.includes("rewriter");
+  }
+
+  private canRunSpeculativeCascade(pipeline: string[], topology: PipelineTopology | undefined): boolean {
+    if (topology !== "speculative_cascade") return false;
+    if (!pipeline.includes("executor") || !pipeline.includes("synthesizer")) return false;
+    return !pipeline.includes("planner") && !pipeline.includes("reviewer") && !pipeline.includes("rewriter");
+  }
+
+  private async executeSpeculativeParallel(
+    request: string,
+    pipeline: string[],
+    agentRunId: string,
+    onStateChange: (state: PipelineProgressState) => void
+  ): Promise<PipelineResult> {
+    const plannerPrompt = loadPrompt("modes/planner.md");
+    const reviewerPrompt = loadPrompt("modes/reviewer.md");
+
+    const plannerPromise = this.runModelOnlyStage({
+      stage: "planner",
+      prompt: plannerPrompt,
+      userContent: request,
+      agentRunId,
+      turnNumber: 1,
+      fallback: "Failed to generate plan",
+      onStateChange,
+    });
+
+    const reviewerPromise = this.runModelOnlyStage({
+      stage: "reviewer",
+      prompt: reviewerPrompt,
+      userContent: `User Request: ${request}\n\nReview the request, likely execution risks, missing context, and quality checks before synthesis.`,
+      agentRunId,
+      turnNumber: 1,
+      fallback: "Review failed",
+      onStateChange,
+    });
+
+    const [plan, reviewerFeedback] = await Promise.all([plannerPromise, reviewerPromise]);
+    const executorSummary = "No execution stage executed. Planner and reviewer ran speculatively without tool execution.";
+    const rewriterSummary = "No rewriting stage executed.";
+
+    if (!pipeline.includes("synthesizer")) {
+      return { answer: plan };
+    }
+
+    onStateChange({ stage: "synthesizer", status: "running" });
+    const synthesizerPrompt = loadPrompt("modes/synthesizer.md");
+    const synthStartTime = Date.now();
+    try {
+      const resp = await this.callModel([
+        { role: "system", content: synthesizerPrompt },
+        {
+          role: "user",
+          content: `User Request: ${request}\n\nOriginal Plan:\n${plan}\n\nExecutor Activity:\n${executorSummary}\n\nReviewer Feedback:\n${reviewerFeedback}\n\nRewriter Activity:\n${rewriterSummary}`
+        }
+      ] as ChatMessage[], {
+        temperature: BUILTIN_MODES.synthesizer.temperature,
+        max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
+        stream: true,
+        stageLabel: "synthesizer",
+        surfaceAsAnswer: true,
+        onChunk: (chunk) => {
+          onStateChange({ stage: "synthesizer", status: "running", output: chunk });
+        }
+      });
+      const finalAnswer = resp.content;
+      onStateChange({ stage: "synthesizer", status: "done", output: finalAnswer });
+
+      outcomeCollector.recordStageRun({
+        id: `stage_${crypto.randomUUID()}`,
+        agent_run_id: agentRunId,
+        mode_id: "synthesizer",
+        turn_number: 1,
+        input_tokens: Math.round((synthesizerPrompt.length + request.length + plan.length + executorSummary.length + reviewerFeedback.length + rewriterSummary.length) / 4),
+        output_tokens: countTokens(finalAnswer),
+        tool_calls_json: "[]",
+        duration_ms: Date.now() - synthStartTime,
+        was_successful: 1,
+        had_error: 0,
+      });
+
+      return { answer: finalAnswer, recursion_depth: 0 };
+    } catch (e: any) {
+      onStateChange({ stage: "synthesizer", status: "failed", output: errText(e) });
+      const fatalError = describePipelineError(errText(e));
+
+      outcomeCollector.recordStageRun({
+        id: `stage_${crypto.randomUUID()}`,
+        agent_run_id: agentRunId,
+        mode_id: "synthesizer",
+        turn_number: 1,
+        tool_calls_json: "[]",
+        duration_ms: Date.now() - synthStartTime,
+        was_successful: 0,
+        had_error: 1,
+        error_message: errText(e),
+      });
+
+      return { answer: `Synthesis failed: ${errText(e)}`, error: fatalError, recursion_depth: 0 };
+    }
+  }
+
+  private async runModelOnlyStage(args: {
+    stage: "planner" | "executor" | "reviewer";
+    prompt: string;
+    userContent: string;
+    agentRunId: string;
+    turnNumber: number;
+    fallback: string;
+    cascadeTier?: "cheap" | "strong";
+    onStateChange: (state: PipelineProgressState) => void;
+  }): Promise<string> {
+    args.onStateChange({ stage: args.stage, status: "running" });
+    const startTime = Date.now();
+    try {
+      const resp = await this.callModel([
+        { role: "system", content: args.prompt },
+        { role: "user", content: args.userContent }
+      ] as ChatMessage[], {
+        temperature: BUILTIN_MODES[args.stage].temperature,
+        max_tokens: BUILTIN_MODES[args.stage].max_tokens,
+        stream: true,
+        stageLabel: args.stage,
+        cascadeTier: args.cascadeTier,
+        onChunk: (chunk) => {
+          args.onStateChange({ stage: args.stage, status: "running", output: chunk });
+        }
+      });
+      const output = resp.content;
+      args.onStateChange({ stage: args.stage, status: "done", output });
+
+      outcomeCollector.recordStageRun({
+        id: `stage_${crypto.randomUUID()}`,
+        agent_run_id: args.agentRunId,
+        mode_id: args.stage,
+        turn_number: args.turnNumber,
+        input_tokens: Math.round((args.prompt.length + args.userContent.length) / 4),
+        output_tokens: countTokens(output),
+        tool_calls_json: "[]",
+        duration_ms: Date.now() - startTime,
+        was_successful: 1,
+        had_error: 0,
+      });
+
+      return output;
+    } catch (e: any) {
+      const message = errText(e);
+      args.onStateChange({ stage: args.stage, status: "failed", output: message });
+
+      outcomeCollector.recordStageRun({
+        id: `stage_${crypto.randomUUID()}`,
+        agent_run_id: args.agentRunId,
+        mode_id: args.stage,
+        turn_number: args.turnNumber,
+        tool_calls_json: "[]",
+        duration_ms: Date.now() - startTime,
+        was_successful: 0,
+        had_error: 1,
+        error_message: message,
+      });
+
+      return `${args.fallback}: ${message}`;
+    }
+  }
+
+  private async executeSpeculativeCascade(
+    request: string,
+    agentRunId: string,
+    onStateChange: (state: PipelineProgressState) => void
+  ): Promise<PipelineResult> {
+    const executorPrompt = loadPrompt("modes/executor.md");
+    const cheapOutput = await this.runModelOnlyStage({
+      stage: "executor",
+      prompt: executorPrompt,
+      userContent: `User Request: ${request}\n\nAnswer with the cheapest adequate execution path. End with a line exactly like CONFIDENCE: 0.0 to 1.0.`,
+      agentRunId,
+      turnNumber: 1,
+      fallback: "Cheap executor failed",
+      cascadeTier: "cheap",
+      onStateChange,
+    });
+
+    const cheapConfidence = this.extractConfidence(cheapOutput);
+    let strongOutput = "Strong executor not used; cheap executor confidence met the cascade threshold.";
+    if (cheapConfidence === undefined || cheapConfidence < 0.65) {
+      strongOutput = await this.runModelOnlyStage({
+        stage: "executor",
+        prompt: executorPrompt,
+        userContent: `User Request: ${request}\n\nCheap executor output:\n${cheapOutput}\n\nThe cheap executor was uncertain. Re-execute with stronger reasoning, correct any gaps, and end with CONFIDENCE: 0.0 to 1.0.`,
+        agentRunId,
+        turnNumber: 2,
+        fallback: "Strong executor failed",
+        cascadeTier: "strong",
+        onStateChange,
+      });
+    }
+
+    const executorSummary = [
+      `Cheap executor confidence: ${cheapConfidence === undefined ? "unknown" : cheapConfidence.toFixed(2)}`,
+      `Cheap executor output:\n${cheapOutput}`,
+      `Strong executor output:\n${strongOutput}`,
+    ].join("\n\n");
+
+    onStateChange({ stage: "synthesizer", status: "running" });
+    const synthesizerPrompt = loadPrompt("modes/synthesizer.md");
+    const synthStartTime = Date.now();
+    try {
+      const resp = await this.callModel([
+        { role: "system", content: synthesizerPrompt },
+        {
+          role: "user",
+          content: `User Request: ${request}\n\nOriginal Plan:\nSpeculative cascade: cheap executor first, strong executor only on uncertainty.\n\nExecutor Activity:\n${executorSummary}\n\nReviewer Feedback:\nNo review stage executed.\n\nRewriter Activity:\nNo rewriting stage executed.`
+        }
+      ] as ChatMessage[], {
+        temperature: BUILTIN_MODES.synthesizer.temperature,
+        max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
+        stream: true,
+        stageLabel: "synthesizer",
+        surfaceAsAnswer: true,
+        onChunk: (chunk) => {
+          onStateChange({ stage: "synthesizer", status: "running", output: chunk });
+        }
+      });
+      const finalAnswer = resp.content;
+      onStateChange({ stage: "synthesizer", status: "done", output: finalAnswer });
+
+      outcomeCollector.recordStageRun({
+        id: `stage_${crypto.randomUUID()}`,
+        agent_run_id: agentRunId,
+        mode_id: "synthesizer",
+        turn_number: 1,
+        input_tokens: Math.round((synthesizerPrompt.length + request.length + executorSummary.length) / 4),
+        output_tokens: countTokens(finalAnswer),
+        tool_calls_json: "[]",
+        duration_ms: Date.now() - synthStartTime,
+        was_successful: 1,
+        had_error: 0,
+      });
+
+      return { answer: finalAnswer, recursion_depth: 0 };
+    } catch (e: any) {
+      onStateChange({ stage: "synthesizer", status: "failed", output: errText(e) });
+      const fatalError = describePipelineError(errText(e));
+
+      outcomeCollector.recordStageRun({
+        id: `stage_${crypto.randomUUID()}`,
+        agent_run_id: agentRunId,
+        mode_id: "synthesizer",
+        turn_number: 1,
+        tool_calls_json: "[]",
+        duration_ms: Date.now() - synthStartTime,
+        was_successful: 0,
+        had_error: 1,
+        error_message: errText(e),
+      });
+
+      return { answer: `Synthesis failed: ${errText(e)}`, error: fatalError, recursion_depth: 0 };
+    }
+  }
+
+  private extractConfidence(text: string): number | undefined {
+    const match = text.match(/CONFIDENCE\s*[:=]\s*(\d+(?:\.\d+)?)/i);
+    if (!match) return undefined;
+    const parsed = Number(match[1]);
+    if (!Number.isFinite(parsed)) return undefined;
+    const normalized = parsed > 1 ? parsed / 100 : parsed;
+    if (normalized < 0 || normalized > 1) return undefined;
+    return normalized;
+  }
+
+  private async applyRecursiveCritique(
+    request: string,
+    result: PipelineResult,
+    agentRunId: string,
+    onStateChange: (state: PipelineProgressState) => void,
+    options: PipelineExecuteOptions,
+  ): Promise<PipelineResult> {
+    if (options.topology !== "recursive") return result;
+
+    const depth = result.recursion_depth ?? 0;
+    await options.onRecursion?.({ depth, status: "critique" });
+    const critiquePrompt = loadPrompt("modes/recursion-critique.md");
+    const startTime = Date.now();
+
+    try {
+      const resp = await this.callModel([
+        { role: "system", content: critiquePrompt },
+        {
+          role: "user",
+          content: `User Request:\n${request}\n\nCandidate Answer:\n${result.answer}`
+        }
+      ] as ChatMessage[], {
+        temperature: 0.1,
+        max_tokens: 768,
+        stream: true,
+        stageLabel: "recursion_critique" as any,
+      });
+
+      outcomeCollector.recordStageRun({
+        id: `stage_${crypto.randomUUID()}`,
+        agent_run_id: agentRunId,
+        mode_id: "recursion_critique",
+        turn_number: depth + 1,
+        input_tokens: Math.round((critiquePrompt.length + request.length + result.answer.length) / 4),
+        output_tokens: countTokens(resp.content),
+        tool_calls_json: "[]",
+        duration_ms: Date.now() - startTime,
+        was_successful: 1,
+        had_error: 0,
+      });
+
+      const decision = this.parseRecursionDecision(resp.content);
+      if (!decision.needs_more_work) {
+        await options.onRecursion?.({ depth, status: "done", critique: decision.critique });
+        return result;
+      }
+
+      if (decision.reenter_stage !== "executor") {
+        await options.onRecursion?.({ depth, status: "done", critique: decision.critique });
+        return result;
+      }
+
+      const maxDepth = Math.max(0, options.maxRecursionDepth ?? 2);
+      if (depth >= maxDepth) {
+        await options.onRecursion?.({ depth, status: "max_depth", reenter_stage: "executor", critique: decision.critique });
+        return result;
+      }
+
+      const nextDepth = depth + 1;
+      await options.onRecursion?.({ depth: nextDepth, status: "reenter", reenter_stage: "executor", critique: decision.critique });
+      const recursiveRequest = [
+        `Original User Request:\n${request}`,
+        `Candidate Answer:\n${result.answer}`,
+        `Recursive Critique:\n${decision.critique}`,
+        "Re-enter executor to verify or repair the answer, then synthesize the final response.",
+      ].join("\n\n");
+
+      const rerun = await this.execute(
+        recursiveRequest,
+        ["executor", "synthesizer"],
+        agentRunId,
+        onStateChange,
+        { topology: "linear" },
+      );
+
+      return {
+        ...rerun,
+        recursion_depth: nextDepth,
+      };
+    } catch (e: any) {
+      const message = errText(e);
+      await options.onRecursion?.({ depth, status: "failed", critique: message });
+      outcomeCollector.recordStageRun({
+        id: `stage_${crypto.randomUUID()}`,
+        agent_run_id: agentRunId,
+        mode_id: "recursion_critique",
+        turn_number: depth + 1,
+        tool_calls_json: "[]",
+        duration_ms: Date.now() - startTime,
+        was_successful: 0,
+        had_error: 1,
+        error_message: message,
+      });
+      return result;
+    }
+  }
+
+  private parseRecursionDecision(raw: string): {
+    needs_more_work: boolean;
+    reenter_stage?: "executor";
+    critique: string;
+  } {
+    try {
+      const jsonStart = raw.indexOf("{");
+      const jsonEnd = raw.lastIndexOf("}");
+      const parsed = JSON.parse(jsonStart >= 0 && jsonEnd >= jsonStart ? raw.slice(jsonStart, jsonEnd + 1) : raw);
+      const reenterStage = parsed?.reenter_stage === "executor" ? "executor" : undefined;
+      return {
+        needs_more_work: Boolean(parsed?.needs_more_work),
+        reenter_stage: reenterStage,
+        critique: typeof parsed?.critique === "string" ? parsed.critique : raw,
+      };
+    } catch {
+      return {
+        needs_more_work: /\bneeds?_more_work\b|\bre-?enter\b|\bmissing\b|\bincomplete\b/i.test(raw),
+        reenter_stage: /\bexecutor\b/i.test(raw) ? "executor" : undefined,
+        critique: raw,
+      };
+    }
+  }
+}

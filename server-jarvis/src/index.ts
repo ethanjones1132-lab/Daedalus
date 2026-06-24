@@ -65,7 +65,8 @@ import { registerStandardBundles } from "./bundles-registry";
 import { searchWeb } from "./web-bundle";
 import { getSessionState, clearSessionState } from "./interactive-bundle";
 import { StreamSession, VisibleTextPipe } from "./stream-emitter";
-import { PredictiveRouter } from "./orchestration/router";
+import { Coordinator } from "./orchestration/coordinator";
+import { AgentPool, formatPoolDiversity } from "./orchestration/agent-pool";
 import { PipelineExecutor } from "./orchestration/pipeline";
 import { outcomeCollector, selfTuningProposer, SelfTuningStore } from "./self-tuning/mod";
 
@@ -1119,6 +1120,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       // ── Orchestrator path (PAMO-SET Phase 2) ─────────────────────
       if (cfg.orchestrator?.enabled) {
         console.log(`[Jarvis Orchestrator] Starting session=${sessionId}`);
+        const agentPool = new AgentPool(cfg.orchestrator.agents ?? []);
+        const poolCoverage = agentPool.coverage();
+        console.log(`[Jarvis Orchestrator] Agent pool coverage: ${formatPoolDiversity(poolCoverage)}${poolCoverage.stage_gaps.length > 0 ? `; gaps=${poolCoverage.stage_gaps.join(",")}` : ""}`);
 
         // Setup context message using turn history if present
         let contextMessage = message;
@@ -1128,6 +1132,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             .join("\n");
           contextMessage = `Conversation History:\n${formattedHistory}\n\nLatest User Request: ${message}`;
         }
+
+        let orchestratorTaskType = "general";
 
         // Custom CallModelFn for pipeline execution
         const callModel = async (messages: any[], callOptions?: any) => {
@@ -1221,14 +1227,36 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             headers["X-Title"] = cfg.openrouter.site_name || "Jarvis";
           }
 
+          // Use the same fallback/retry pipeline as the main Agent Loop so the
+          // orchestrator is not single-shot on the OpenRouter free tier (which
+          // 429s frequently and 503s during provider outages). Without this
+          // every orchestrator stage dies on the first transient error and the
+          // user sees a silent stall.
+          const useFallback = !isOllama && cfg.openrouter.enable_fallbacks;
+          const requestTimeout = isOllama ? MODEL_REQUEST_TIMEOUT_MS : (cfg.openrouter.timeout_ms || MODEL_REQUEST_TIMEOUT_MS);
           const ctrl = new AbortController();
-          const timeout = setTimeout(() => ctrl.abort(), MODEL_REQUEST_TIMEOUT_MS);
+          const timeout = setTimeout(() => ctrl.abort(), requestTimeout);
           const onStreamAbort = () => ctrl.abort();
           streamAbort.signal.addEventListener("abort", onStreamAbort);
 
           let fetchRes: Response;
+          let actualModelUsed = modelName;
           try {
-            fetchRes = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(requestBody), signal: ctrl.signal });
+            if (useFallback) {
+              const result = await chatCompletionWithFallback(cfg, requestBody, ctrl.signal, {
+                stage: callOptions?.stageLabel,
+                taskType: orchestratorTaskType,
+                cascadeTier: callOptions?.cascadeTier,
+              });
+              fetchRes = result.response;
+              actualModelUsed = result.model_used;
+              if (result.retries > 0) {
+                console.log(`[Jarvis Orchestrator] callModel used model ${result.model_used} after ${result.retries} retry attempt(s)`);
+                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "fallback_notice", model: result.model_used, retries: result.retries, session_id: sessionId })}\n\n`));
+              }
+            } else {
+              fetchRes = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(requestBody), signal: ctrl.signal });
+            }
           } catch (fetchErr: any) {
             clearTimeout(timeout);
             streamAbort.signal.removeEventListener("abort", onStreamAbort);
@@ -1236,7 +1264,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               if (streamAbort.signal.aborted) {
                 await emitCancelled();
               }
-              throw new Error(`Request timed out after ${MODEL_REQUEST_TIMEOUT_MS / 1000}s. The model may be loading or overloaded.`);
+              throw new Error(`Request timed out after ${requestTimeout / 1000}s. The model may be loading or overloaded.`);
             }
             if (isOllama && (fetchErr.message?.includes("ECONNREFUSED") || fetchErr.message?.includes("fetch failed"))) {
               throw new Error(`Cannot connect to Ollama. Tried: ${ollamaTarget?.tried.join("; ") || baseUrl}. Make sure Ollama is running and the model is pulled (ollama pull ${modelName}).`);
@@ -1263,6 +1291,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let buffer = "";
           let fullTurnText = "";
           let activeToolCalls: any[] = [];
+          let lastActivity = Date.now();
           const textStreamSanitizer = new TextToolCallStreamSanitizer();
           const emitTextToken = async (text: string) => {
             if (callOptions?.surfaceAsAnswer) {
@@ -1277,8 +1306,24 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             if (streamAbort.signal.aborted) {
               await emitCancelled();
             }
-            const { done, value } = await reader.read();
+            // Stream stall watchdog: cancel the reader if the model stops
+            // sending bytes. Mirrors the Agent Loop's `MODEL_STREAM_STALL_*`
+            // constants — without it, a hung OpenRouter SSE stream blocks the
+            // whole stage until the outer 5-minute AbortController trips.
+            const chunkTimeout = setTimeout(() => {
+              if (Date.now() - lastActivity > MODEL_STREAM_STALL_TIMEOUT_MS) {
+                reader.cancel("Stream stalled").catch(() => {});
+              }
+            }, MODEL_STREAM_STALL_CHECK_MS);
+            let readResult: ReadableStreamReadResult<Uint8Array>;
+            try {
+              readResult = await reader.read();
+            } finally {
+              clearTimeout(chunkTimeout);
+            }
+            const { done, value } = readResult;
             if (done) break;
+            lastActivity = Date.now();
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split("\n");
             buffer = lines.pop() || "";
@@ -1409,20 +1454,27 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }
         };
 
-        // Route the user request using the predictive router
-        const router = new PredictiveRouter(callModel);
-        const route = await router.route(contextMessage);
-        console.log(`[Jarvis Orchestrator] Router decided task_type=${route.task_type}, pipeline=${route.pipeline.join(" -> ")}`);
+        // Route the user request through the Fugu-style coordinator. The
+        // current executor still consumes a concrete stage list, so null skips
+        // and re-entry directives are materialized at the activation boundary.
+        const coordinator = new Coordinator(callModel);
+        const route = await coordinator.route(contextMessage, {
+          sessionId,
+          history: turnHistory,
+        });
+        orchestratorTaskType = route.task_type;
+        const executablePipeline = coordinator.executablePipeline(route);
+        console.log(`[Jarvis Orchestrator] Coordinator decided task_type=${route.task_type}, topology=${route.topology}, pipeline=${route.pipeline.map((step) => step ?? "skip").join(" -> ")}`);
 
         // Initialize tuned configurations and start run in collector
         const agentRunId = `run_${crypto.randomUUID()}`;
         selfTuningProposer.initializeTunedConfigs();
-        outcomeCollector.startAgentRun(agentRunId, sessionId, contextMessage, route.task_type, route.pipeline);
+        outcomeCollector.startAgentRun(agentRunId, sessionId, contextMessage, route.task_type, executablePipeline);
         const runStartTime = Date.now();
 
         // Execute the pipeline
         const executor = new PipelineExecutor(callModel, runtime, ctx);
-        const result = await executor.execute(contextMessage, route.pipeline, agentRunId, async (state) => {
+        const result = await executor.execute(contextMessage, executablePipeline, agentRunId, async (state) => {
           // Stream stage progress back to client
           await writer.write(encoder.encode(`data: ${JSON.stringify({
             type: "orchestrator_stage",
@@ -1430,6 +1482,19 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             status: state.status,
             session_id: sessionId
           })}\n\n`));
+        }, {
+          topology: route.topology,
+          maxRecursionDepth: cfg.orchestrator.max_recursion_depth,
+          onRecursion: async (event) => {
+            await writer.write(encoder.encode(`data: ${JSON.stringify({
+              type: "orchestrator_recursion",
+              depth: event.depth,
+              status: event.status,
+              reenter_stage: event.reenter_stage,
+              critique: event.critique,
+              session_id: sessionId
+            })}\n\n`));
+          },
         });
 
         // Record metrics and propose tuning options

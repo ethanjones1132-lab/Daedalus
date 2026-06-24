@@ -56,6 +56,11 @@ export interface BackendStats {
   last_error?: string;
   last_model?: string;
   last_ts?: number;
+  /** Total retry attempts across all records for this backend (0 = no retries). */
+  total_retries: number;
+  /** Number of turns that engaged a fallback model. */
+  fallbacks_used: number;
+  last_fallback_model?: string;
 }
 
 function percentile(sorted: number[], p: number): number {
@@ -84,6 +89,10 @@ export function inferenceMetricsSnapshot(): InferenceMetricsSnapshot {
     const errors = recs.filter((r) => !r.ok);
     const latencies = recs.map((r) => r.latency_ms).sort((a, b) => a - b);
     const last = recs[recs.length - 1];
+    const retriesList = recs.map((r) => r.retry_count ?? 0);
+    const totalRetries = retriesList.reduce((s, r) => s + r, 0);
+    const fallbacksUsed = recs.filter((r) => !!r.fallback_used).length;
+    const lastFallbackM = recs.filter((r) => r.fallback_model).map((r) => r.fallback_model).pop();
     stats.push({
       backend,
       requests: recs.length,
@@ -96,6 +105,9 @@ export function inferenceMetricsSnapshot(): InferenceMetricsSnapshot {
       last_error: errors.at(-1)?.error,
       last_model: last?.model,
       last_ts: last?.ts,
+      total_retries: totalRetries,
+      fallbacks_used: fallbacksUsed,
+      last_fallback_model: lastFallbackM,
     });
   }
 

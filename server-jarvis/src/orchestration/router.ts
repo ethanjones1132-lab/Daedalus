@@ -1,39 +1,30 @@
 import { loadPrompt } from "./prompt-loader";
+import {
+  Coordinator,
+  CoordinatorError,
+  type CallModelFn,
+  type ChatMessage,
+  type CoordinatorContext,
+  type CoordinatorResult,
+  type CoordinatorRouteOptions,
+  type CoordinatorStageDecision,
+  type StageName,
+  type TaskType,
+  type Topology,
+} from "./coordinator";
 
 export interface RoutingResult {
-  task_type: "code_review" | "debug" | "refactor" | "general" | "plan" | "research" | "test" | "docs";
+  task_type: TaskType;
   pipeline: string[];
-  context: {
-    needs_workspace_inspection: boolean;
-    needs_memory: boolean;
-    estimated_complexity: "low" | "medium" | "high";
-  };
+  context: CoordinatorContext;
   routing_rationale: string;
 }
 
-export interface ChatMessage {
-  role: string;
-  content: string;
-  tool_calls?: any;
-  tool_call_id?: string;
-  name?: string;
-}
-
-export type CallModelFn = (
-  messages: Array<ChatMessage>,
-  options?: {
-    temperature?: number;
-    max_tokens?: number;
-    stream?: boolean;
-    onChunk?: (chunk: string) => void;
-    tools?: any[];
-    /** Breadcrumb label for orchestrator agent_activity frames. */
-    stageLabel?: string;
-    /** When true, stream deltas as visible answer tokens instead of agent_activity. */
-    surfaceAsAnswer?: boolean;
-  }
-) => Promise<{ content: string; tool_calls?: any[] }>;
-
+/**
+ * Compatibility shim for the old eval harness and any stale imports. The live
+ * orchestrator path uses Coordinator directly so coordinator failures surface
+ * instead of silently selecting a default pipeline.
+ */
 export class PredictiveRouter {
   constructor(private callModel: CallModelFn) {}
 
@@ -48,18 +39,8 @@ export class PredictiveRouter {
         max_tokens: 512,
       });
 
-      const parsed = this.extractJson<RoutingResult>(resp.content);
-      // Validate the returned object structure and provide safe fallbacks
-      return {
-        task_type: parsed.task_type || "general",
-        pipeline: parsed.pipeline || ["planner", "executor", "reviewer", "synthesizer"],
-        context: {
-          needs_workspace_inspection: parsed.context?.needs_workspace_inspection ?? false,
-          needs_memory: parsed.context?.needs_memory ?? true,
-          estimated_complexity: parsed.context?.estimated_complexity || "medium",
-        },
-        routing_rationale: parsed.routing_rationale || "Auto-routed.",
-      };
+      const parsed = this.extractJson<Partial<RoutingResult>>(resp.content);
+      return this.normalize(parsed);
     } catch (e: any) {
       console.warn(`[PredictiveRouter] Routing failed, using default pipeline: ${e.message}`);
       return {
@@ -73,6 +54,20 @@ export class PredictiveRouter {
         routing_rationale: `Fallback routing due to error: ${e.message}`,
       };
     }
+  }
+
+  private normalize(parsed: Partial<RoutingResult>): RoutingResult {
+    const taskType = parsed.task_type ?? "general";
+    return {
+      task_type: taskType,
+      pipeline: parsed.pipeline ?? ["planner", "executor", "reviewer", "synthesizer"],
+      context: {
+        needs_workspace_inspection: parsed.context?.needs_workspace_inspection ?? false,
+        needs_memory: parsed.context?.needs_memory ?? true,
+        estimated_complexity: parsed.context?.estimated_complexity ?? "medium",
+      },
+      routing_rationale: parsed.routing_rationale ?? "Auto-routed.",
+    };
   }
 
   private extractJson<T>(text: string): T {
@@ -91,3 +86,17 @@ export class PredictiveRouter {
     throw new Error(`Failed to parse JSON from model output: ${text}`);
   }
 }
+
+export {
+  Coordinator,
+  CoordinatorError,
+  type CallModelFn,
+  type ChatMessage,
+  type CoordinatorContext,
+  type CoordinatorResult,
+  type CoordinatorRouteOptions,
+  type CoordinatorStageDecision,
+  type StageName,
+  type TaskType,
+  type Topology,
+};
