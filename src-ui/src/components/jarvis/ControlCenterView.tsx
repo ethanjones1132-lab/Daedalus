@@ -46,6 +46,19 @@ interface HealthData {
   claude_proxy: { running: boolean; port: number };
   disk: { total: string; used: string; available: string; use_percent: string };
   memory: { total_mb: number; available_mb: number; used_mb: number; used_percent: number };
+  /**
+   * Supervisor backoff snapshot. Present on builds that include the
+   * supervisor-give-up reporting; legacy servers simply omit the field.
+   * When `*_give_up` is true the watchdog has hit `MAX_CONSECUTIVE_RESTARTS`
+   * and is no longer auto-restarting that service. Surfacing this prevents
+   * the silent-give-up failure mode where a down service just sits there
+   * with the supervisor quietly doing nothing.
+   */
+  supervisor?: {
+    bun_give_up: boolean;
+    proxy_give_up: boolean;
+    ollama_give_up: boolean;
+  };
   timestamp: string;
 }
 
@@ -60,6 +73,14 @@ interface SubsystemRow {
   up: boolean;
   detail: string;
   command: string;
+  /**
+   * True if the supervisor has hit `MAX_CONSECUTIVE_RESTARTS` consecutive
+   * spawn failures for this service and has stopped auto-restarting. When
+   * `up` is false AND `giveUp` is true, the UI shows an "auto-restart paused"
+   * pill so the user knows the watchdog is no longer poking the port and
+   * should press Restart to clear the backoff.
+   */
+  giveUp: boolean;
 }
 
 interface DoctorCheck {
@@ -353,16 +374,30 @@ export default function ControlCenterView() {
                 </div>
                 <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
                   {([
-                    { key: 'ollama', name: 'Ollama', up: health.ollama.running, detail: health.ollama.url, command: 'jarvis_restart_ollama' },
-                    { key: 'bun', name: 'Bun server', up: health.bun_server.running, detail: health.bun_server.url, command: 'jarvis_restart_server' },
-                    { key: 'bridge', name: 'Bridge', up: health.bridge.running, detail: `:${health.bridge.port}`, command: 'restart_bridge' },
-                    { key: 'proxy', name: 'Claude proxy', up: health.claude_proxy.running, detail: `:${health.claude_proxy.port}`, command: 'jarvis_restart_proxy' },
+                    { key: 'ollama', name: 'Ollama', up: health.ollama.running, detail: health.ollama.url, command: 'jarvis_restart_ollama', giveUp: health.supervisor?.ollama_give_up === true },
+                    { key: 'bun', name: 'Bun server', up: health.bun_server.running, detail: health.bun_server.url, command: 'jarvis_restart_server', giveUp: health.supervisor?.bun_give_up === true },
+                    { key: 'bridge', name: 'Bridge', up: health.bridge.running, detail: `:${health.bridge.port}`, command: 'restart_bridge', giveUp: false },
+                    { key: 'proxy', name: 'Claude proxy', up: health.claude_proxy.running, detail: `:${health.claude_proxy.port}`, command: 'jarvis_restart_proxy', giveUp: health.supervisor?.proxy_give_up === true },
                   ] as SubsystemRow[]).map((s) => {
                     const busy = restarting === s.key;
+                    // Surface the silent-give-up state: the supervisor has hit
+                    // `MAX_CONSECUTIVE_RESTARTS` and is no longer auto-restarting
+                    // this service. The pill + the inline hint steer the user
+                    // toward the Restart button rather than waiting on a watchdog
+                    // that isn't running.
+                    const showGiveUpHint = !s.up && s.giveUp;
                     return (
                       <div key={s.key} className="flex items-center gap-2">
                         <StatusDot ok={s.up} warn={!s.up} />
                         <span className="text-bone">{s.name}</span>
+                        {showGiveUpHint && (
+                          <span
+                            className="px-1.5 py-0.5 rounded-md border border-amber-500/30 bg-amber-500/10 text-amber-200 text-[9px] font-mono uppercase tracking-wider"
+                            title="Supervisor hit the consecutive-restart limit and stopped trying. Use Restart to clear the backoff and resume auto-restart."
+                          >
+                            auto-restart paused
+                          </span>
+                        )}
                         <span className="ml-auto font-mono text-[10px] text-bone/40 truncate max-w-[40%]">
                           {s.detail}
                         </span>

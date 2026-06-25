@@ -15,6 +15,7 @@
 // loop. The tick interval itself also bounds restart frequency.
 
 use crate::jarvis::types::{JarvisBackend, JarvisState};
+use crate::commands::system::SupervisorStatus;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
@@ -56,6 +57,19 @@ pub(crate) fn reset_failures(service: SupervisedService) {
         SupervisedService::Ollama => &OLLAMA_FAILS,
     };
     counter.store(0, Ordering::Relaxed);
+}
+
+/// Snapshot of which services the supervisor has given up auto-restarting.
+/// Exposed to the UI via `get_system_health` so a down service can show
+/// "auto-restart paused — use Restart" instead of leaving the user guessing
+/// why the watchdog is no longer poking the port. Pure read of the existing
+/// atomic counters, safe to call from any task.
+pub fn give_up_status() -> SupervisorStatus {
+    SupervisorStatus {
+        bun_give_up: BUN_FAILS.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_RESTARTS,
+        proxy_give_up: PROXY_FAILS.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_RESTARTS,
+        ollama_give_up: OLLAMA_FAILS.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_RESTARTS,
+    }
 }
 
 /// Spawn the supervisor loop. Gives boot one tick of grace before the first
@@ -171,6 +185,9 @@ async fn tick(handle: &AppHandle) {
             "proxy_up": crate::is_port_listening(PROXY_PORT),
             "ollama_up": crate::is_port_listening(OLLAMA_PORT),
             "ollama_required": is_ollama,
+            "bun_give_up": BUN_FAILS.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_RESTARTS,
+            "proxy_give_up": PROXY_FAILS.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_RESTARTS,
+            "ollama_give_up": OLLAMA_FAILS.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_RESTARTS,
         }),
     );
 }
@@ -206,5 +223,48 @@ mod tests {
         reset_failures(SupervisedService::Ollama);
         assert_eq!(PROXY_FAILS.load(Ordering::Relaxed), 0);
         assert_eq!(OLLAMA_FAILS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn give_up_status_reflects_atomic_counters_for_each_service() {
+        // Default: fresh boot, nothing has failed — every field is false.
+        BUN_FAILS.store(0, Ordering::Relaxed);
+        PROXY_FAILS.store(0, Ordering::Relaxed);
+        OLLAMA_FAILS.store(0, Ordering::Relaxed);
+        let status = give_up_status();
+        assert!(!status.bun_give_up);
+        assert!(!status.proxy_give_up);
+        assert!(!status.ollama_give_up);
+
+        // Below the threshold is still "trying".
+        BUN_FAILS.store(MAX_CONSECUTIVE_RESTARTS - 1, Ordering::Relaxed);
+        assert!(!give_up_status().bun_give_up);
+
+        // Hitting the threshold flips the bit for that service only.
+        BUN_FAILS.store(MAX_CONSECUTIVE_RESTARTS, Ordering::Relaxed);
+        let status = give_up_status();
+        assert!(status.bun_give_up);
+        assert!(!status.proxy_give_up);
+        assert!(!status.ollama_give_up);
+
+        // Recovery: reset clears the bit again.
+        reset_failures(SupervisedService::Bun);
+        assert!(!give_up_status().bun_give_up);
+
+        // All three can be in give-up simultaneously (e.g. a single bad
+        // config that breaks every spawn). The snapshot must report each
+        // independently — no all-or-nothing leakage.
+        BUN_FAILS.store(MAX_CONSECUTIVE_RESTARTS, Ordering::Relaxed);
+        PROXY_FAILS.store(MAX_CONSECUTIVE_RESTARTS, Ordering::Relaxed);
+        OLLAMA_FAILS.store(MAX_CONSECUTIVE_RESTARTS, Ordering::Relaxed);
+        let status = give_up_status();
+        assert!(status.bun_give_up);
+        assert!(status.proxy_give_up);
+        assert!(status.ollama_give_up);
+
+        // Tidy up so we don't leak state to the next test.
+        BUN_FAILS.store(0, Ordering::Relaxed);
+        PROXY_FAILS.store(0, Ordering::Relaxed);
+        OLLAMA_FAILS.store(0, Ordering::Relaxed);
     }
 }
