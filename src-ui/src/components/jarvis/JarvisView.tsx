@@ -26,6 +26,13 @@ interface JarvisViewProps {
   onCompanionChange?: (companion: CompanionState | null) => void;
 }
 
+const sessionInvokeArgs = (sessionId: string) => ({
+  sessionId,
+  session_id: sessionId,
+});
+
+const JARVIS_API_URL = 'http://127.0.0.1:19877';
+
 export default function JarvisView({ initialSubView = 'chat', onCompanionChange }: JarvisViewProps) {
   const [subView, setSubView] = useState<JarvisSubView>(initialSubView);
   const [sessions, setSessions] = useState<JarvisSession[]>([]);
@@ -369,6 +376,7 @@ function ChatPanel({
   const activeSessionRef = useRef(activeSession);
   const sessionIdRef = useRef(sessionId);
   const onSessionCreatedRef = useRef(onSessionCreated);
+  const streamAbortRef = useRef<AbortController | null>(null);
   useEffect(() => { activeSessionRef.current = activeSession; }, [activeSession]);
   useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
   useEffect(() => { onSessionCreatedRef.current = onSessionCreated; }, [onSessionCreated]);
@@ -378,6 +386,44 @@ function ChatPanel({
     if (!current) return true;
     if (!sid) return false;
     return sid === current;
+  }, []);
+
+  const appendAssistantText = useCallback((text: string) => {
+    if (!text) return;
+    setError(null);
+    setPipelineStage('');
+    setMessages(prev => {
+      const last = prev[prev.length - 1];
+      if (last && last.role === 'assistant' && last.isStreaming) {
+        return [...prev.slice(0, -1), { ...last, content: last.content + text }];
+      }
+      return [...prev, { role: 'assistant', content: text, isStreaming: true }];
+    });
+  }, []);
+
+  const finalizeAssistantMessage = useCallback((sid?: string) => {
+    setIsStreaming(false);
+    setPipelineStage('');
+    setRecursionDepth(null);
+    setPendingApproval(null);
+    setUserPinnedToBottom(true);
+    const effectiveSid = sid || activeSessionRef.current || sessionIdRef.current;
+    setMessages(prev => {
+      const last = prev[prev.length - 1];
+      if (last && last.isStreaming) {
+        const finalized = { ...last, isStreaming: false };
+        if (effectiveSid && finalized.content.trim()) {
+          invoke('append_message', {
+            ...sessionInvokeArgs(effectiveSid),
+            role: 'assistant',
+            content: finalized.content,
+          }).catch((e) => console.error('Failed to persist assistant message:', e));
+        }
+        return [...prev.slice(0, -1), finalized];
+      }
+      return prev;
+    });
+    onSessionCreatedRef.current();
   }, []);
 
   // Reduced-motion respect — we use it to disable token fade-in / shimmer.
@@ -433,7 +479,7 @@ function ChatPanel({
     const prev = prevActiveSessionRef.current;
     prevActiveSessionRef.current = activeSession;
     if (prev && prev !== activeSession) {
-      invoke('cancel_chat_stream', { sessionId: prev }).catch(() => {});
+      invoke('cancel_chat_stream', sessionInvokeArgs(prev)).catch(() => {});
       setIsStreaming(false);
       setPipelineStage('');
       setRecursionDepth(null);
@@ -469,7 +515,7 @@ function ChatPanel({
     }
     let cancelled = false;
     setLoadingHistory(true);
-    invoke<SessionHistoryMessage[]>('get_session_history', { sessionId: activeSession })
+    invoke<SessionHistoryMessage[]>('get_session_history', sessionInvokeArgs(activeSession))
       .then((rows) => {
         if (cancelled) return;
         setMessages(rows.map(r => ({
@@ -509,41 +555,12 @@ function ChatPanel({
     track(listen<{ text: string; session_id: string }>('jarvis://token', (event) => {
       const { text, session_id } = event.payload;
       if (!text || !matchesStreamSession(session_id)) return;
-      setError(null);
-      setPipelineStage('');
-      setMessages(prev => {
-        const last = prev[prev.length - 1];
-        if (last && last.role === 'assistant' && last.isStreaming) {
-          return [...prev.slice(0, -1), { ...last, content: last.content + text }];
-        }
-        return [...prev, { role: 'assistant', content: text, isStreaming: true }];
-      });
+      appendAssistantText(text);
     }));
 
     track(listen<{ session_id: string }>('jarvis://done', (event) => {
       if (!matchesStreamSession(event.payload.session_id)) return;
-      setIsStreaming(false);
-      setPipelineStage('');
-      setRecursionDepth(null);
-      setPendingApproval(null);
-      setUserPinnedToBottom(true);
-      const sid = event.payload.session_id || activeSessionRef.current || sessionIdRef.current;
-      setMessages(prev => {
-        const last = prev[prev.length - 1];
-        if (last && last.isStreaming) {
-          const finalized = { ...last, isStreaming: false };
-          if (sid && finalized.content.trim()) {
-            invoke('append_message', {
-              sessionId: sid,
-              role: 'assistant',
-              content: finalized.content,
-            }).catch((e) => console.error('Failed to persist assistant message:', e));
-          }
-          return [...prev.slice(0, -1), finalized];
-        }
-        return prev;
-      });
-      onSessionCreatedRef.current();
+      finalizeAssistantMessage(event.payload.session_id);
     }));
 
     track(listen<{ error: string; session_id: string }>('jarvis://error', (event) => {
@@ -674,7 +691,7 @@ function ChatPanel({
       disposed = true;
       unsubs.forEach((f) => f());
     };
-  }, [matchesStreamSession]);
+  }, [appendAssistantText, finalizeAssistantMessage, matchesStreamSession]);
 
   // True autosize composer (Phase 2.4). The previous rows=⟨line-count⟩ approach
   // overflowed for single-line wrapped text.
@@ -691,9 +708,161 @@ function ChatPanel({
     return () => clearTimeout(t);
   }, [activeSession, isStreaming]);
 
+  const streamFromJarvisApi = useCallback(async (
+    sid: string,
+    userMsg: string,
+    history: Array<{ role: string; content: string }>,
+  ) => {
+    streamAbortRef.current?.abort();
+    const controller = new AbortController();
+    streamAbortRef.current = controller;
+    setPipelineStage('stream relay');
+
+    invoke('append_message', {
+      ...sessionInvokeArgs(sid),
+      role: 'user',
+      content: userMsg,
+    }).catch((e) => console.error('Failed to persist user message:', e));
+
+    const response = await fetch(`${JARVIS_API_URL}/chat/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: userMsg,
+        session_id: sid,
+        history,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new Error(`Jarvis server returned ${response.status}: ${body}`);
+    }
+    if (!response.body) {
+      throw new Error('Jarvis server returned no response stream.');
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let streamedVisibleText = false;
+
+    const handleFrame = (frame: any) => {
+      if (!frame || typeof frame !== 'object') return;
+      if (frame.type === 'stream_event' && frame.delta?.text) {
+        streamedVisibleText = true;
+        appendAssistantText(String(frame.delta.text));
+        return;
+      }
+      if (frame.type === 'agent_activity' && frame.text) {
+        const stage = String(frame.stage || 'agent');
+        if (stage === 'coordinator') {
+          setPipelineStage('coordinator');
+          return;
+        }
+        setAgentSteps(prev => {
+          const last = prev[prev.length - 1];
+          const text = String(frame.text);
+          if (last && last.stage === stage) {
+            return [...prev.slice(0, -1), { stage, text: last.text + text }];
+          }
+          return [...prev, { stage, text }];
+        });
+        return;
+      }
+      if (frame.type === 'orchestrator_stage') {
+        setPipelineStage(frame.status === 'done' ? '' : String(frame.stage || ''));
+        return;
+      }
+      if (frame.type === 'orchestrator_recursion') {
+        const status = String(frame.status || '');
+        setRecursionDepth(status === 'done' || status === 'max_depth' ? null : Number(frame.depth || 0));
+        return;
+      }
+      if (frame.type === 'reasoning_step' || frame.type === 'reasoning_chunk') {
+        const text = frame.content ?? frame.text ?? frame.delta?.text ?? frame.step?.content;
+        if (text) setReasoningText(prev => prev + String(text));
+        return;
+      }
+      if (frame.type === 'reasoning_complete') {
+        setShowReasoning(true);
+        return;
+      }
+      if (frame.type === 'tool_use') {
+        setToolCalls(prev => [...prev, {
+          call_id: frame.id || frame.call_id,
+          name: frame.name || frame.tool_name || 'unknown',
+          arguments: frame.arguments ?? null,
+        }]);
+        return;
+      }
+      if (frame.type === 'tool_result') {
+        const callId = frame.call_id;
+        const name = frame.name || 'tool';
+        const output = String(frame.output ?? frame.result ?? '');
+        const isError = Boolean(frame.is_error || frame.status === 'error');
+        setToolCalls(prev => {
+          const idx = [...prev].reverse().findIndex((c) => {
+            if (c.result !== undefined) return false;
+            if (callId && c.call_id) return c.call_id === callId;
+            return c.name === name;
+          });
+          if (idx >= 0) {
+            const real = prev.length - 1 - idx;
+            const next = [...prev];
+            next[real] = { ...next[real], result: output, is_error: isError, matched: true };
+            return next;
+          }
+          return [...prev, { name, arguments: null, result: output, is_error: isError }];
+        });
+        return;
+      }
+      if (frame.type === 'cost_info') {
+        setTurnCost({
+          tokens: Number(frame.total_tokens ?? frame.tokens ?? 0),
+          costUsd: Number(frame.cost_usd ?? 0),
+        });
+        return;
+      }
+      if (frame.type === 'result' && !streamedVisibleText) {
+        if (frame.is_error) throw new Error(String(frame.result || frame.error || 'Jarvis stream failed.'));
+        const text = String(frame.result || '');
+        if (text) appendAssistantText(text);
+        return;
+      }
+      if (frame.type === 'error') {
+        throw new Error(String(frame.error || 'Jarvis stream failed.'));
+      }
+    };
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split('\n\n');
+      buffer = events.pop() ?? '';
+      for (const eventText of events) {
+        for (const line of eventText.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const data = trimmed.slice(5).trim();
+          if (!data || data === '[DONE]') continue;
+          handleFrame(JSON.parse(data));
+        }
+      }
+    }
+
+    finalizeAssistantMessage(sid);
+    streamAbortRef.current = null;
+  }, [appendAssistantText, finalizeAssistantMessage]);
+
   const handleSend = useCallback(async () => {
     if (!input.trim() || isStreaming) return;
     const userMsg = input.trim();
+    const history = messages
+      .filter((msg) => !msg.isStreaming && msg.content.trim())
+      .map((msg) => ({ role: msg.role, content: msg.content }));
     setInput('');
     setError(null);
     setIsStreaming(true);
@@ -728,22 +897,23 @@ function ChatPanel({
         onSessionCreated();
       }
 
-      await invoke('jarvis_send_message', {
-        message: userMsg,
-        sessionId: effectiveSessionId,
-      });
+      await streamFromJarvisApi(effectiveSessionId, userMsg, history);
     } catch (e) {
+      streamAbortRef.current = null;
       setIsStreaming(false);
       setError(String(e));
       setMessages(prev => {
         const last = prev[prev.length - 1];
         if (last?.role === 'assistant' && last.isStreaming) {
+          if (!last.content.trim()) {
+            return prev.slice(0, -1);
+          }
           return [...prev.slice(0, -1), { ...last, isStreaming: false }];
         }
         return prev;
       });
     }
-  }, [input, isStreaming, activeSession, sessionId, onSessionCreated, setActiveSession]);
+  }, [input, isStreaming, messages, activeSession, sessionId, onSessionCreated, setActiveSession, streamFromJarvisApi]);
 
   // Phase 1.3 — real Stop. POST /chat/cancel on the Bun server; SseRelay now
   // treats the resulting `cancelled` frame as terminal, so isStreaming flips.
@@ -753,8 +923,15 @@ function ChatPanel({
       setIsStreaming(false);
       return;
     }
+    streamAbortRef.current?.abort();
+    streamAbortRef.current = null;
+    fetch(`${JARVIS_API_URL}/chat/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sid }),
+    }).catch(() => {});
     try {
-      const cancelled = await invoke<boolean>('cancel_chat_stream', { sessionId: sid });
+      const cancelled = await invoke<boolean>('cancel_chat_stream', sessionInvokeArgs(sid));
       if (!cancelled) setIsStreaming(false);
     } catch (e) {
       console.error('Failed to cancel stream:', e);
@@ -768,8 +945,9 @@ function ChatPanel({
     if (!pendingApproval) return;
     try {
       await invoke('jarvis_tool_decision', {
-        sessionId: pendingApproval.session_id,
+        ...sessionInvokeArgs(pendingApproval.session_id),
         toolCallId: pendingApproval.call_id,
+        tool_call_id: pendingApproval.call_id,
         decision: approved ? 'approve' : 'deny',
       });
       setPendingApproval(null);
@@ -802,7 +980,7 @@ function ChatPanel({
   const handleNewChat = () => {
     const sid = activeSession || sessionId;
     if (isStreaming && sid) {
-      invoke('cancel_chat_stream', { sessionId: sid }).catch(() => {});
+      invoke('cancel_chat_stream', sessionInvokeArgs(sid)).catch(() => {});
     }
     setIsStreaming(false);
     setMessages([]);

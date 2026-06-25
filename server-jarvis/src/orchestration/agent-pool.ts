@@ -38,69 +38,105 @@ export const ORCHESTRATOR_STAGES = [
   "synthesizer",
 ] as const;
 
+// Provider routing note: `model_id` is the EXACT id each provider's
+// /chat/completions endpoint expects. OpenCode Zen/Go use bare ids
+// (e.g. "mimo-v2.5-free"); OpenRouter uses namespaced ids
+// (e.g. "nvidia/nemotron-3-ultra-550b-a55b:free"). The endpoint + key for
+// each provider are resolved at request time via `resolveProviderTarget`
+// (see providers.ts), so the same fallback cascade can hop across providers.
+//
+// Stage pinning: the OpenCode Zen models lead each stage (most reliable,
+// dedicated keys, no free-router hangs). OpenCode Go and OpenRouter free
+// models form the cross-provider fallback tail so a single provider's rate
+// limit or outage never kills a turn. OpenCode Go `minimax-m3` is omitted on
+// purpose — it speaks the Anthropic `/messages` format, not the OpenAI SSE
+// `/chat/completions` protocol the stream parser expects.
 export const DEFAULT_ORCHESTRATOR_AGENTS: OrchestratorAgent[] = [
+  // ── OpenCode Zen (primary, OpenAI-compatible) ───────────────────
   {
-    // Coordinator → OpenCode Go / Mimo 2.5. The coordinator only emits
-    // short JSON routing decisions, so we want a fast, json-reliable,
-    // reasoning-light model here. Mimo 2.5 fits that profile and the
-    // OpenCode Go namespace has been our most reliable for cron work
-    // (jarvis cron model = opencode-go/minimax-m3, with mimo-v2.5-pro
-    // also used by other cron jobs). We deliberately avoid openrouter/free
-    // here because the free router hangs on long-context coordinator
-    // calls and surfaces no error to the caller (see the post-hang
-    // diagnosis: 12-minute stalls on the planner call to openrouter/free).
-    id: "go-mimo-v2-5-coordinator",
-    provider: "opencode_go",
-    model_id: "opencode-go/mimo-v2-5",
-    capabilities: { code: 0.72, reasoning: 0.78, speed: 0.7, cost: 1, json_reliability: 0.88 },
-    default_for: ["coordinator"],
-    enabled: true,
-  },
-  {
-    // Planner → OpenCode Zen / Nemotron Ultra Free. The planner needs
-    // strong reasoning (chain-of-thought over the user's request) and
-    // produces a structured markdown plan. Nemotron Ultra Free is the
-    // highest-reasoning free model in the OpenCode Zen catalog and is
-    // substantially more reliable than openrouter/free for streaming a
-    // long plan to completion without dropping bytes mid-stream.
-    id: "zen-nemotron-3-ultra-free-planner",
+    // Coordinator → short JSON routing decisions: fast, terminal, NO reasoning
+    // overhead. deepseek-v4-flash-free emits clean JSON content directly
+    // (verified) — unlike the reasoning-heavy mimo models, which burn their
+    // token budget on <think> and leave `content` empty, breaking routing.
+    id: "zen-deepseek-v4-flash-free",
     provider: "opencode_zen",
-    model_id: "opencode/nemotron-3-ultra-free",
-    capabilities: { code: 0.78, reasoning: 0.94, speed: 0.5, cost: 1, json_reliability: 0.86 },
-    default_for: ["planner"],
+    model_id: "deepseek-v4-flash-free",
+    capabilities: { code: 0.9, reasoning: 0.86, speed: 0.82, cost: 1, json_reliability: 0.9 },
+    default_for: ["coordinator", "reviewer"],
     enabled: true,
   },
   {
-    // router-free is kept as a generic executor/reviewer/synthesizer
-    // candidate only. It is no longer default_for any stage — the
-    // coordinator and planner are pinned to the dedicated Go/Zen
-    // models above. The free router is still useful for tool execution
-    // (cheap, fast) and as a tail of the fallback cascade.
-    id: "router-free",
-    provider: "openrouter",
-    model_id: "openrouter/free",
-    capabilities: { code: 0.35, reasoning: 0.55, speed: 0.9, cost: 1, json_reliability: 0.75 },
+    // mimo-v2.5-free stays in the pool as a general fallback member, but NOT as
+    // a stage default — it's reasoning-only for short prompts (emits no content).
+    id: "zen-mimo-v25-free",
+    provider: "opencode_zen",
+    model_id: "mimo-v2.5-free",
+    capabilities: { code: 0.72, reasoning: 0.8, speed: 0.7, cost: 1, json_reliability: 0.7 },
     default_for: [],
     enabled: true,
   },
   {
-    id: "code-free",
-    provider: "openrouter",
-    model_id: "qwen/qwen3-coder:free",
-    capabilities: { code: 0.9, reasoning: 0.7, speed: 0.55, cost: 0.95, json_reliability: 0.75 },
-    default_for: ["executor", "rewriter"],
+    // Planner + synthesizer → strongest reasoning in the Zen catalog.
+    id: "zen-nemotron-ultra-free",
+    provider: "opencode_zen",
+    model_id: "nemotron-3-ultra-free",
+    capabilities: { code: 0.8, reasoning: 0.95, speed: 0.55, cost: 1, json_reliability: 0.88 },
+    default_for: ["planner", "synthesizer"],
     enabled: true,
   },
   {
-    id: "north-code-mini-free",
+    // Executor + rewriter → code-specialized.
+    id: "zen-north-code-free",
+    provider: "opencode_zen",
+    model_id: "north-mini-code-free",
+    capabilities: { code: 0.92, reasoning: 0.72, speed: 0.72, cost: 1, json_reliability: 0.8 },
+    default_for: ["executor", "rewriter"],
+    enabled: true,
+  },
+  // ── OpenCode Go (OpenAI-compatible tail) ────────────────────────
+  {
+    id: "go-mimo-v25",
+    provider: "opencode_go",
+    model_id: "mimo-v2.5",
+    capabilities: { code: 0.8, reasoning: 0.85, speed: 0.72, cost: 0.9, json_reliability: 0.86 },
+    default_for: [],
+    enabled: true,
+  },
+  {
+    id: "go-deepseek-v4-pro",
+    provider: "opencode_go",
+    model_id: "deepseek-v4-pro",
+    capabilities: { code: 0.93, reasoning: 0.9, speed: 0.6, cost: 0.7, json_reliability: 0.85 },
+    default_for: ["executor"],
+    enabled: true,
+  },
+  // ── OpenRouter (cross-provider fallback tail) ───────────────────
+  {
+    id: "or-owl-alpha",
+    provider: "openrouter",
+    model_id: "openrouter/owl-alpha",
+    capabilities: { code: 0.6, reasoning: 0.72, speed: 0.8, cost: 1, json_reliability: 0.78 },
+    default_for: [],
+    enabled: true,
+  },
+  {
+    id: "or-nemotron-ultra-free",
+    provider: "openrouter",
+    model_id: "nvidia/nemotron-3-ultra-550b-a55b:free",
+    capabilities: { code: 0.78, reasoning: 0.96, speed: 0.42, cost: 1, json_reliability: 0.88 },
+    default_for: ["reviewer"],
+    enabled: true,
+  },
+  {
+    id: "or-north-code-free",
     provider: "openrouter",
     model_id: "cohere/north-mini-code:free",
     capabilities: { code: 0.92, reasoning: 0.72, speed: 0.7, cost: 1, json_reliability: 0.78 },
-    default_for: ["executor", "rewriter"],
+    default_for: ["rewriter"],
     enabled: true,
   },
   {
-    id: "deepseek-v4-flash",
+    id: "or-deepseek-v4-flash",
     provider: "openrouter",
     model_id: "deepseek/deepseek-v4-flash",
     capabilities: { code: 0.9, reasoning: 0.86, speed: 0.78, cost: 0.55, json_reliability: 0.82 },
@@ -108,67 +144,43 @@ export const DEFAULT_ORCHESTRATOR_AGENTS: OrchestratorAgent[] = [
     enabled: true,
   },
   {
-    id: "verifier-free",
+    id: "or-nemotron-nano-reasoning-free",
     provider: "openrouter",
-    model_id: "nvidia/llama-3.1-nemotron-ultra-253b-v1:free",
-    capabilities: { code: 0.6, reasoning: 0.9, speed: 0.45, cost: 0.9, json_reliability: 0.85 },
-    default_for: ["reviewer", "synthesizer"],
+    model_id: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+    capabilities: { code: 0.6, reasoning: 0.82, speed: 0.85, cost: 1, json_reliability: 0.8 },
+    default_for: [],
     enabled: true,
   },
   {
-    id: "nemotron-ultra-free",
+    id: "or-ling-flash",
     provider: "openrouter",
-    model_id: "nvidia/nemotron-3-ultra-550b-a55b:free",
-    capabilities: { code: 0.78, reasoning: 0.96, speed: 0.42, cost: 1, json_reliability: 0.88 },
-    default_for: ["reviewer", "synthesizer"],
+    model_id: "inclusionai/ling-2.6-flash",
+    capabilities: { code: 0.7, reasoning: 0.78, speed: 0.88, cost: 0.8, json_reliability: 0.8 },
+    default_for: [],
     enabled: true,
   },
   {
-    id: "mimo-v25",
+    id: "or-gemma4-free",
     provider: "openrouter",
-    model_id: "xiaomi/mimo-v2.5",
-    capabilities: { code: 0.84, reasoning: 0.88, speed: 0.62, cost: 0.62, json_reliability: 0.82 },
-    default_for: ["planner", "synthesizer"],
+    model_id: "google/gemma-4-31b-it:free",
+    capabilities: { code: 0.62, reasoning: 0.7, speed: 0.8, cost: 1, json_reliability: 0.76 },
+    default_for: [],
     enabled: true,
   },
   {
-    id: "zen-big-pickle-free",
-    provider: "opencode_zen",
-    model_id: "opencode/big-pickle",
-    capabilities: { code: 0.82, reasoning: 0.72, speed: 0.75, cost: 1, json_reliability: 0.72 },
-    default_for: ["executor"],
+    id: "or-laguna-m1-free",
+    provider: "openrouter",
+    model_id: "poolside/laguna-m.1:free",
+    capabilities: { code: 0.85, reasoning: 0.74, speed: 0.7, cost: 1, json_reliability: 0.76 },
+    default_for: [],
     enabled: true,
   },
   {
-    id: "zen-mimo-v2-pro-free",
-    provider: "opencode_zen",
-    model_id: "opencode/mimo-v2-pro-free",
-    capabilities: { code: 0.86, reasoning: 0.84, speed: 0.62, cost: 1, json_reliability: 0.78 },
-    default_for: ["planner", "synthesizer"],
-    enabled: true,
-  },
-  {
-    id: "zen-mimo-v2-omni-free",
-    provider: "opencode_zen",
-    model_id: "opencode/mimo-v2-omni-free",
-    capabilities: { code: 0.76, reasoning: 0.82, speed: 0.58, cost: 1, json_reliability: 0.74 },
-    default_for: ["research"],
-    enabled: true,
-  },
-  {
-    id: "zen-minimax-m25-free",
-    provider: "opencode_zen",
-    model_id: "opencode/minimax-m2.5-free",
-    capabilities: { code: 0.84, reasoning: 0.82, speed: 0.66, cost: 1, json_reliability: 0.8 },
-    default_for: ["executor", "reviewer"],
-    enabled: true,
-  },
-  {
-    id: "zen-nemotron-super-free",
-    provider: "opencode_zen",
-    model_id: "opencode/nemotron-3-super-free",
-    capabilities: { code: 0.78, reasoning: 0.9, speed: 0.56, cost: 1, json_reliability: 0.84 },
-    default_for: ["reviewer"],
+    id: "or-laguna-xs2-free",
+    provider: "openrouter",
+    model_id: "poolside/laguna-xs.2:free",
+    capabilities: { code: 0.8, reasoning: 0.68, speed: 0.85, cost: 1, json_reliability: 0.74 },
+    default_for: [],
     enabled: true,
   },
 ];

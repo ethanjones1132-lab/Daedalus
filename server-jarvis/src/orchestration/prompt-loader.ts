@@ -6,19 +6,26 @@ import { dirname, join, resolve } from "path";
  *
  * Resolution order (first hit wins):
  *   1. $JARVIS_PROMPTS_DIR / <fileName>      — explicit override
- *   2. <__dirname>/../prompts/<fileName>     — sibling of orchestration/
- *   3. <__dirname>/../../src/prompts/<...>  — bundled source layout
- *   4. <cwd>/server-jarvis/src/prompts/<…>   — dev run from repo root
- *   5. <cwd>/src/prompts/<…>                 — dev run from server-jarvis/
- *   6. Walk up from __dirname to 6 levels, look for server-jarvis/src/prompts/<…>
+ *   2. <__dirname>/prompts/<fileName>        — prompts shipped beside the bundle
+ *   3. <__dirname>/../prompts/<fileName>     — sibling of orchestration/
+ *   4. <__dirname>/../../src/prompts/<...>  — bundled source layout
+ *   5. <cwd>/server-jarvis/src/prompts/<…>   — dev run from repo root
+ *   6. <cwd>/src/prompts/<…>                 — dev run from server-jarvis/
+ *   7. Walk up from __dirname to 6 levels, look for server-jarvis/src/prompts/<…>
  *
- * The walk-up (6) is the key robustness fix: when Bun bundles the server
- * (e.g. into a Tauri resource or a release binary), `__dirname` resolves to
- * the bundle's resource directory, not the source layout. The fixed
- * candidate list misses in that case, surfacing a `Prompt file not found`
- * error frame to the user. Walking up the tree until we find a
- * `server-jarvis/src/prompts/` directory means the loader works under
- * bundling, source-mapped dev runs, and direct `bun run` invocations.
+ * Candidate (2) is the deployed-bundle case: `bun build` compiles the server to
+ * a single `index.js` but does NOT inline the prompt `.md` files (they are read
+ * at runtime via readFileSync). When that bundle runs natively next to the app
+ * (e.g. `bun.exe <Desktop>/index.js`), `__dirname` is the bundle's directory and
+ * there is no `server-jarvis/` source tree anywhere up the ancestry — so the
+ * walk-up (7) misses and every orchestrator turn dies with `Prompt file not
+ * found: coordinator.md`. Shipping a `prompts/` folder beside `index.js` and
+ * checking it first makes the deployed app self-contained.
+ *
+ * The walk-up (7) is the secondary robustness net: when Bun bundles the server
+ * into a Tauri resource directory but the source tree is reachable several levels
+ * up, walking until we find a `server-jarvis/src/prompts/` directory means the
+ * loader still works under source-mapped dev runs and direct `bun run`.
  */
 export function loadPrompt(fileName: string): string {
   const tried: string[] = [];
@@ -30,7 +37,15 @@ export function loadPrompt(fileName: string): string {
     if (existsSync(p)) return readFileSync(p, "utf-8");
   }
 
-  // 2-3. Relative to the source file's directory (works in dev with `bun run src/index.ts`)
+  // 2. Prompts shipped beside the bundled entry (deployed native install).
+  //    `fileName` may be "modes/foo.md", so join() handles the subdir too.
+  {
+    const p = join(__dirname, "prompts", fileName);
+    tried.push(p);
+    if (existsSync(p)) return readFileSync(p, "utf-8");
+  }
+
+  // 3-4. Relative to the source file's directory (works in dev with `bun run src/index.ts`)
   const relativeCandidates = [
     join(__dirname, "..", "prompts", fileName),
     join(__dirname, "..", "..", "src", "prompts", fileName),

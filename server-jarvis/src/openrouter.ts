@@ -6,6 +6,12 @@
 
 import type { JarvisConfig, SurfaceType } from "./config";
 import { AgentPool } from "./orchestration/agent-pool";
+import {
+  resolveProviderTarget,
+  providerChatUrl,
+  providerHeaders,
+  type HttpProviderId,
+} from "./providers";
 
 // ═══════════════════════════════════════════════════════════════
 // Types
@@ -566,58 +572,133 @@ interface FallbackResolveOptions {
   cascadeTier?: "cheap" | "strong";
 }
 
-function resolvePoolModels(cfg: JarvisConfig, options: FallbackResolveOptions = {}): string[] {
-  if (!options.stage) return [];
-  const pool = new AgentPool(cfg.orchestrator?.agents ?? []);
-  if (options.cascadeTier) {
-    const cascade = pool.cascadeChain(options.stage, options.taskType ?? "general");
-    const ordered = options.cascadeTier === "strong" ? [...cascade].reverse() : cascade;
-    return ordered
-      .filter((agent) => agent.provider === "openrouter" || agent.provider === "opencode_zen" || agent.provider === "opencode_go")
-      .map((agent) => agent.model_id);
-  }
-  const selected = pool.pickFor(options.stage, options.taskType ?? "general");
-  if (!selected) return [];
-  return pool
-    .fallbackChain(selected)
-    .filter((agent) => agent.provider === "openrouter" || agent.provider === "opencode_zen" || agent.provider === "opencode_go")
-    .map((agent) => agent.model_id);
+/** One step in the cross-provider fallback cascade. */
+interface CascadeEntry {
+  provider: HttpProviderId;
+  model_id: string;
 }
 
-async function resolveFallbackModels(cfg: JarvisConfig, options: FallbackResolveOptions = {}): Promise<string[]> {
-  const requested = cfg.openrouter.model || "openrouter/free";
-  const poolModels = resolvePoolModels(cfg, options);
-  try {
-    const catalog = await listOpenRouterModels(cfg);
-    const byId = new Map(catalog.map((model) => [model.id, model]));
-    const freeCatalogIds = catalog
-      .filter((model) => model.is_free && model.id !== requested)
-      .map((model) => model.id);
-    const paidFallbacksAllowed = Boolean((cfg.openrouter as any).enable_paid_fallbacks);
-    const configuredFallbacks = (cfg.openrouter.fallbacks || [])
-      .filter((modelId) => {
-        const model = byId.get(modelId);
-        if (!model) return paidFallbacksAllowed;
-        return model.is_free || paidFallbacksAllowed;
-      });
+const SUPPORTED_HTTP_PROVIDERS: ReadonlySet<string> = new Set([
+  "openrouter",
+  "opencode_zen",
+  "opencode_go",
+]);
 
-    return Array.from(new Set([
-      ...poolModels.filter((id) => byId.has(id)),
-      requested,
-      ...PREFERRED_FREE_FALLBACKS.filter((id) => id !== requested && byId.has(id)),
-      ...freeCatalogIds,
-      ...configuredFallbacks,
-    ]));
-  } catch (error) {
-    console.warn("[OpenRouter] Failed to build catalog-aware fallback list:", error);
-    const configuredFreeOnly = (cfg.openrouter.fallbacks || []).filter((id) => id.endsWith(":free") || id === "openrouter/free");
-    return Array.from(new Set([...poolModels.filter((id) => id.endsWith(":free") || id === "openrouter/free"), requested, "openrouter/free", ...configuredFreeOnly]));
+/**
+ * Resolve the stage's pool agents as an ordered cross-provider cascade. The
+ * AgentPool already orders these optimally (stage default first, then by
+ * overall score), so the cascade walks from the best model to progressively
+ * cheaper/more-available ones — across OpenRouter and the OpenCode providers.
+ */
+function resolvePoolAgents(cfg: JarvisConfig, options: FallbackResolveOptions = {}): CascadeEntry[] {
+  if (!options.stage) return [];
+  const pool = new AgentPool(cfg.orchestrator?.agents ?? []);
+  let agents;
+  if (options.cascadeTier) {
+    const cascade = pool.cascadeChain(options.stage, options.taskType ?? "general");
+    agents = options.cascadeTier === "strong" ? [...cascade].reverse() : cascade;
+  } else {
+    const selected = pool.pickFor(options.stage, options.taskType ?? "general");
+    agents = selected ? pool.fallbackChain(selected) : [];
   }
+  return agents
+    .filter((agent) => SUPPORTED_HTTP_PROVIDERS.has(agent.provider))
+    .map((agent) => ({ provider: agent.provider as HttpProviderId, model_id: agent.model_id }));
 }
 
 /**
- * Attempt a chat completion with the given model, retrying on transient errors.
- * Falls back to the provided fallback models if the primary model fails.
+ * Build the full fallback cascade: the stage's pool agents (cross-provider,
+ * optimally ordered) followed by an OpenRouter-only tail of free/configured
+ * models. Pool agents are trusted as-is (NOT filtered against the OpenRouter
+ * catalog — that catalog only knows OpenRouter ids, and would wrongly drop
+ * valid OpenCode models). The catalog is only consulted to enumerate the free
+ * OpenRouter tail.
+ */
+async function resolveFallbackCascade(cfg: JarvisConfig, options: FallbackResolveOptions = {}): Promise<CascadeEntry[]> {
+  const requested = cfg.openrouter.model || "openrouter/free";
+  const seen = new Set<string>();
+  const cascade: CascadeEntry[] = [];
+  const push = (entry: CascadeEntry) => {
+    const key = `${entry.provider}:${entry.model_id}`;
+    if (!entry.model_id || seen.has(key)) return;
+    seen.add(key);
+    cascade.push(entry);
+  };
+
+  // 1. Pool agents first — cross-provider, optimal order.
+  for (const entry of resolvePoolAgents(cfg, options)) push(entry);
+
+  // 2. OpenRouter free/configured tail (catalog-aware).
+  try {
+    const catalog = await listOpenRouterModels(cfg);
+    const byId = new Map(catalog.map((model) => [model.id, model]));
+    const paidFallbacksAllowed = Boolean((cfg.openrouter as any).enable_paid_fallbacks);
+    if (byId.has(requested) || requested === "openrouter/free") {
+      push({ provider: "openrouter", model_id: requested });
+    }
+    for (const id of PREFERRED_FREE_FALLBACKS) {
+      if (id !== requested && byId.has(id)) push({ provider: "openrouter", model_id: id });
+    }
+    for (const model of catalog) {
+      if (model.is_free && model.id !== requested) push({ provider: "openrouter", model_id: model.id });
+    }
+    for (const id of cfg.openrouter.fallbacks || []) {
+      const model = byId.get(id);
+      if (!model && !paidFallbacksAllowed) continue;
+      if (model && !model.is_free && !paidFallbacksAllowed) continue;
+      push({ provider: "openrouter", model_id: id });
+    }
+  } catch (error) {
+    console.warn("[OpenRouter] Failed to build catalog-aware fallback tail:", error);
+    push({ provider: "openrouter", model_id: requested });
+    push({ provider: "openrouter", model_id: "openrouter/free" });
+    for (const id of (cfg.openrouter.fallbacks || []).filter((m) => m.endsWith(":free") || m === "openrouter/free")) {
+      push({ provider: "openrouter", model_id: id });
+    }
+  }
+
+  return cascade;
+}
+
+/**
+ * Build the per-attempt request body for a provider. OpenRouter bodies get the
+ * full catalog-aware massaging (max_tokens, temperature/top_p gating, native
+ * tool support). OpenCode (Zen/Go) are OpenAI-compatible but have no catalog
+ * here, so we send a lean body and drop `tools` (those stages use the text
+ * tool protocol — see callModel's `useTextTools`).
+ */
+async function buildAttemptBody(
+  cfg: JarvisConfig,
+  provider: HttpProviderId,
+  requestBody: any,
+  model: string,
+): Promise<Record<string, any>> {
+  const body: Record<string, any> = { ...requestBody, model };
+  if (provider === "openrouter") {
+    await applyOpenRouterRequestConfig(body, cfg, model, body.messages ?? [], {
+      requestedTemperature: requestBody.temperature,
+      requestedTopP: requestBody.top_p,
+    });
+  } else {
+    delete body.tools;
+    delete body.tool_choice;
+  }
+  return body;
+}
+
+/**
+ * Attempt a chat completion, cascading across the stage's agent pool and an
+ * OpenRouter fallback tail. Fallback policy:
+ *   • Rate-limit (429): retry the SAME model at most twice — after 2 consecutive
+ *     429s, advance to the next optimal pool model (per the orchestrator spec).
+ *   • Other transient (502/503/504) or network errors: one short retry, then
+ *     advance.
+ *   • Non-retryable HTTP (4xx other than 429): advance to the next model rather
+ *     than aborting the whole turn — a single bad model/provider never kills a
+ *     turn that another pool model could answer.
+ *   • First-token watchdog: a model that opens the connection but never sends a
+ *     body byte within the timeout is abandoned and the cascade advances.
+ * Only when EVERY model is exhausted do we throw.
  */
 export async function chatCompletionWithFallback(
   cfg: JarvisConfig,
@@ -625,33 +706,41 @@ export async function chatCompletionWithFallback(
   signal?: AbortSignal,
   options: FallbackResolveOptions = {},
 ): Promise<{ response: Response; model_used: string; retries: number }> {
-  const allModels = await resolveFallbackModels(cfg, options);
+  const cascade = await resolveFallbackCascade(cfg, options);
+  if (cascade.length === 0) {
+    cascade.push({ provider: "openrouter", model_id: cfg.openrouter.model || "openrouter/free" });
+  }
   let lastError = "";
-  const primaryRetryCount = Math.max(0, Number(cfg.openrouter.max_retries ?? RETRY_DELAYS.length));
-  // First-token watchdog: how long to wait for the response body's first
-  // content byte before declaring the model hung and advancing to the
-  // fallback cascade. Without this, an openrouter/free or similar
-  // response that opens the HTTP connection but never sends a token
-  // (the post-hang diagnosis: 12-minute stalls on the planner call)
-  // blocks the whole stage. 30s is long enough to ride out cold
-  // model load on the free router, short enough that a single
-  // hung model never blocks a turn for more than 30s + retry delay.
+  // `max_retries` is the configured ceiling on per-model attempts. The 2-strike
+  // rate-limit rule and the single-retry transient policy are clamped to it, so
+  // setting max_retries=0 disables all same-model retries (immediate advance).
+  const maxRetries = Math.max(0, Number(cfg.openrouter.max_retries ?? RETRY_DELAYS.length));
+  // User rule: 2 consecutive rate-limit (429) errors on a model → next pool model.
+  const RATE_LIMIT_MAX_ATTEMPTS = Math.max(1, Math.min(2, maxRetries + 1));
+  // Non-429 transient errors (502/503/504, network): at most one short retry.
+  const OTHER_TRANSIENT_MAX_ATTEMPTS = Math.max(1, Math.min(2, maxRetries + 1));
+  // First-token watchdog: how long to wait for the response body's first byte
+  // before declaring the model hung and advancing the cascade. Guards against
+  // a model that opens the HTTP connection but never streams (the post-hang
+  // diagnosis: multi-minute stalls on a free-router call).
   const firstTokenTimeoutMs = Math.max(1_000, Number((cfg.openrouter as any).first_token_timeout_ms ?? 30_000));
 
-  for (let attempt = 0; attempt < allModels.length; attempt++) {
-    const model = allModels[attempt];
-    const retryDelays = attempt === 0
-      ? RETRY_DELAYS.slice(0, primaryRetryCount)
-      : RETRY_DELAYS.slice(0, Math.min(primaryRetryCount, 1)); // Less retries for fallbacks
+  for (let modelIdx = 0; modelIdx < cascade.length; modelIdx++) {
+    const { provider, model_id: model } = cascade[modelIdx];
+    const target = resolveProviderTarget(cfg, provider);
+    if (!target.api_key) {
+      lastError = `No API key configured for provider "${provider}" (model ${model}) — skipping`;
+      console.warn(`[Fallback] ${lastError}`);
+      continue;
+    }
 
-    for (let retry = 0; retry <= retryDelays.length; retry++) {
-      // Per-attempt AbortController: a child of the user-provided
-      // signal so user-cancel still propagates, but the watchdog can
-      // abort *this attempt only* without aborting the whole cascade.
-      // reason is the discriminator in the catch path below: a
-      // user-cancel abort has no reason (or reason === signal.reason),
-      // a watchdog abort carries our STALL_REASON marker.
-      const STALL_REASON = `first-token-timeout:${model}`;
+    let rateLimitStrikes = 0;
+    let transientRetries = 0;
+
+    // Per-model attempt loop. Each `continue` retries the same model; each
+    // `break` advances to the next model in the cascade.
+    attemptLoop: while (true) {
+      const STALL_REASON = `first-token-timeout:${provider}:${model}`;
       const attemptCtrl = new AbortController();
       const onUserAbort = () => attemptCtrl.abort(signal?.reason);
       if (signal) {
@@ -660,45 +749,20 @@ export async function chatCompletionWithFallback(
       }
       let watchdogTimer: ReturnType<typeof setTimeout> | undefined;
       try {
-        const modelRequestBody = { ...requestBody, model };
-        await applyOpenRouterRequestConfig(
-          modelRequestBody,
-          cfg,
-          model,
-          modelRequestBody.messages ?? [],
-          {
-            requestedTemperature: requestBody.temperature,
-            requestedTopP: requestBody.top_p,
-          },
-        );
-        const res = await fetch(`${cfg.openrouter.base_url}/chat/completions`, {
+        const attemptBody = await buildAttemptBody(cfg, provider, requestBody, model);
+        const res = await fetch(providerChatUrl(target), {
           method: "POST",
           signal: attemptCtrl.signal,
-          headers: {
-            "Authorization": `Bearer ${cfg.openrouter.api_key}`,
-            "Content-Type": "application/json",
-            "HTTP-Referer": cfg.openrouter.site_url || "http://localhost:19877",
-            "X-Title": cfg.openrouter.site_name || "Jarvis",
-          },
-          body: JSON.stringify(modelRequestBody),
+          headers: providerHeaders(cfg, target),
+          body: JSON.stringify(attemptBody),
         });
 
         if (res.ok) {
-          // First-token watchdog on the response body. We can't peek
-          // at the body without consuming it, so we race a Promise
-          // that resolves on the first body chunk against the timer.
-          // If the timer wins, abort the attempt — the catch path
-          // detects the STALL_REASON and treats it as a failed model
-          // (advances cascade). If the chunk wins, clear the timer
-          // and return the response normally.
+          // First-token watchdog: race the first body chunk against the timer.
           const bodyReader = res.body?.getReader();
           if (!bodyReader) {
-            return { response: res, model_used: model, retries: retry + attempt };
+            return { response: res, model_used: model, retries: modelIdx };
           }
-          let firstByteResolver: (() => void) | undefined;
-          const firstBytePromise = new Promise<void>((resolve) => {
-            firstByteResolver = resolve;
-          });
           const firstByteTimeout = new Promise<"timeout">((resolve) => {
             watchdogTimer = setTimeout(() => resolve("timeout"), firstTokenTimeoutMs);
           });
@@ -708,17 +772,12 @@ export async function chatCompletionWithFallback(
           ]);
           if (raceResult.kind === "timeout") {
             attemptCtrl.abort(STALL_REASON);
-            // Drain the reader so the underlying socket can close cleanly.
             try { await bodyReader.cancel().catch(() => {}); } catch {}
-            lastError = `Model ${model} did not send any body bytes within ${firstTokenTimeoutMs}ms (first-token timeout)`;
-            console.warn(`[OpenRouter] ${lastError} — advancing to next cascade model`);
-            break;
+            lastError = `Model ${model} (${provider}) sent no body bytes within ${firstTokenTimeoutMs}ms (first-token timeout)`;
+            console.warn(`[Fallback] ${lastError} — advancing to next model`);
+            break attemptLoop;
           }
-          // Got first byte. Reassemble the body: yield the read chunk,
-          // then tee the rest of the original stream into the new one
-          // so the caller can read it normally.
           clearTimeout(watchdogTimer);
-          firstByteResolver!();
           const rewrapped = rewrapReadableStreamWithFirstChunk(
             bodyReader as unknown as ReadableStreamDefaultReader<any>,
             raceResult.chunk as ReadableStreamReadResult<any>,
@@ -728,33 +787,44 @@ export async function chatCompletionWithFallback(
             statusText: res.statusText,
             headers: res.headers,
           });
-          return { response: newResponse, model_used: model, retries: retry + attempt };
+          return { response: newResponse, model_used: model, retries: modelIdx };
         }
 
-        // Non-retryable error
-        if (!isRetryableStatus(res.status)) {
-          const body = await res.text().catch(() => "");
-          throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
+        // ── Rate limit: 2-strike rule ──
+        if (res.status === 429) {
+          await res.text().catch(() => "");
+          rateLimitStrikes++;
+          lastError = `Model ${model} (${provider}) rate limited (429) [strike ${rateLimitStrikes}/${RATE_LIMIT_MAX_ATTEMPTS}]`;
+          if (rateLimitStrikes >= RATE_LIMIT_MAX_ATTEMPTS) {
+            console.warn(`[Fallback] ${lastError} — advancing to next optimal pool model`);
+            break attemptLoop;
+          }
+          const delayMs = RETRY_DELAYS[rateLimitStrikes - 1] ?? 1000;
+          console.warn(`[Fallback] ${lastError} — retrying same model in ${Math.round(delayMs)}ms`);
+          await sleep(delayMs + Math.random() * 300);
+          continue attemptLoop;
         }
 
-        // Retryable error — wait and retry with same model
-        if (retry < retryDelays.length) {
-          const delayMs = retryDelays[retry] + Math.random() * 500;
-          console.warn(`[OpenRouter] ${model} returned ${res.status}, retrying in ${Math.round(delayMs)}ms (attempt ${retry + 1}/${retryDelays.length})`);
-          await sleep(delayMs);
-          continue;
+        // ── Other transient errors (502/503/504): one short retry ──
+        if (isRetryableStatus(res.status)) {
+          await res.text().catch(() => "");
+          transientRetries++;
+          lastError = `Model ${model} (${provider}) returned ${res.status} [retry ${transientRetries}/${OTHER_TRANSIENT_MAX_ATTEMPTS}]`;
+          if (transientRetries >= OTHER_TRANSIENT_MAX_ATTEMPTS) {
+            console.warn(`[Fallback] ${lastError} — advancing to next model`);
+            break attemptLoop;
+          }
+          await sleep((RETRY_DELAYS[transientRetries - 1] ?? 1000) + Math.random() * 300);
+          continue attemptLoop;
         }
 
-        // Exhausted retries for this model, move to next fallback
-        lastError = `Model ${model} failed after ${retryDelays.length + 1} attempts`;
-        break;
+        // ── Non-retryable HTTP error: advance, don't kill the turn ──
+        const body = await res.text().catch(() => "");
+        lastError = `Model ${model} (${provider}) HTTP ${res.status}: ${body.slice(0, 160)}`;
+        console.warn(`[Fallback] ${lastError} — advancing to next model`);
+        break attemptLoop;
       } catch (e: any) {
-        if (watchdogTimer) clearTimeout(watchdogTimer);
-        if (signal) signal.removeEventListener("abort", onUserAbort);
-        // Distinguish user-cancel (fatal) from watchdog-abort (advance cascade).
-        // Watchdog aborts carry the STALL_REASON string in either the
-        // signal reason (Browser fetch) or in the thrown error message
-        // (Bun fetch surfaces the reason in the AbortError message).
+        // Distinguish user-cancel (fatal) from watchdog-abort / network error.
         const isStall = (e?.message ?? "").includes(STALL_REASON)
           || (attemptCtrl.signal.reason === STALL_REASON);
         const isUserCancel = signal?.aborted && !isStall;
@@ -762,14 +832,18 @@ export async function chatCompletionWithFallback(
           throw e; // Don't retry user-aborted requests
         }
         if (isStall) {
-          // Already logged in the timeout branch; just move to next model.
           lastError = e.message || lastError;
-          break;
+          break attemptLoop;
         }
+        // Network/transport error — one short retry, then advance.
+        transientRetries++;
         lastError = e.message || String(e);
-        if (retry < retryDelays.length) {
-          await sleep(retryDelays[retry]);
+        if (transientRetries >= OTHER_TRANSIENT_MAX_ATTEMPTS) {
+          console.warn(`[Fallback] Model ${model} (${provider}) network error: ${lastError} — advancing to next model`);
+          break attemptLoop;
         }
+        await sleep(RETRY_DELAYS[transientRetries - 1] ?? 1000);
+        continue attemptLoop;
       } finally {
         if (watchdogTimer) clearTimeout(watchdogTimer);
         if (signal) signal.removeEventListener("abort", onUserAbort);
@@ -777,7 +851,7 @@ export async function chatCompletionWithFallback(
     }
   }
 
-  throw new Error(`All OpenRouter models exhausted. Last error: ${lastError}`);
+  throw new Error(`All provider models exhausted. Last error: ${lastError}`);
 }
 
 /**

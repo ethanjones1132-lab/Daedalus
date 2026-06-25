@@ -118,43 +118,58 @@ describe("AgentPool", () => {
     expect(formatPoolDiversity(pool.coverage())).toBe("1 code-strong, 1 reasoning-strong, 1 fast, 3 cheap");
   });
 
-  test("default pool includes requested OpenCode Zen and frontier OpenRouter models", () => {
-    const defaultIds = new Set(DEFAULT_ORCHESTRATOR_AGENTS.map((agent) => agent.model_id));
+  test("default pool wires the provider/model set from the attached agent pool", () => {
+    const byModel = new Set(DEFAULT_ORCHESTRATOR_AGENTS.map((agent) => agent.model_id));
 
-    expect(defaultIds).toContain("opencode/big-pickle");
-    expect(defaultIds).toContain("opencode/mimo-v2-pro-free");
-    expect(defaultIds).toContain("opencode/minimax-m2.5-free");
-    expect(defaultIds).toContain("opencode/nemotron-3-super-free");
-    expect(defaultIds).toContain("deepseek/deepseek-v4-flash");
-    expect(defaultIds).toContain("nvidia/nemotron-3-ultra-550b-a55b:free");
-    expect(defaultIds).toContain("cohere/north-mini-code:free");
-    expect(defaultIds).toContain("xiaomi/mimo-v2.5");
+    // OpenCode Zen (bare ids, OpenAI-compatible)
+    expect(byModel).toContain("mimo-v2.5-free");
+    expect(byModel).toContain("nemotron-3-ultra-free");
+    expect(byModel).toContain("north-mini-code-free");
+    expect(byModel).toContain("deepseek-v4-flash-free");
+    // OpenCode Go (bare ids, OpenAI-compatible; minimax-m3 omitted — Anthropic format)
+    expect(byModel).toContain("mimo-v2.5");
+    expect(byModel).toContain("deepseek-v4-pro");
+    expect(byModel).not.toContain("minimax-m3");
+    // OpenRouter (namespaced ids)
+    expect(byModel).toContain("openrouter/owl-alpha");
+    expect(byModel).toContain("nvidia/nemotron-3-ultra-550b-a55b:free");
+    expect(byModel).toContain("cohere/north-mini-code:free");
+    expect(byModel).toContain("deepseek/deepseek-v4-flash");
+    expect(byModel).toContain("inclusionai/ling-2.6-flash");
+    expect(byModel).toContain("google/gemma-4-31b-it:free");
+
+    // All three HTTP providers are represented so the fallback cascade can
+    // hop across providers when one is rate-limited.
+    const providers = new Set(DEFAULT_ORCHESTRATOR_AGENTS.map((a) => a.provider));
+    expect(providers).toContain("opencode_zen");
+    expect(providers).toContain("opencode_go");
+    expect(providers).toContain("openrouter");
   });
 
-  test("coordinator defaults to opencode-go Mimo 2.5 and planner defaults to opencode Zen Nemotron Ultra Free", () => {
-    // The free router caused 12+ minute stalls on the coordinator/planner
-    // stages (post-hang diagnosis 2026-06-24). Pin the coordinator to the
-    // OpenCode Go Mimo 2.5 model and the planner to the OpenCode Zen
-    // Nemotron Ultra Free model so neither stage can pick the unreliable
-    // openrouter/free as its default.
+  test("coordinator and planner default to reliable OpenCode Zen models, not the free router", () => {
+    // The free router caused multi-minute stalls on the coordinator/planner
+    // stages (post-hang diagnosis 2026-06-24). Both stages now default to
+    // OpenCode Zen models with dedicated keys.
     const coordinator = DEFAULT_ORCHESTRATOR_AGENTS.find((agent) => agent.default_for.includes("coordinator"));
     const planner = DEFAULT_ORCHESTRATOR_AGENTS.find((agent) => agent.default_for.includes("planner"));
 
     expect(coordinator).toBeDefined();
-    expect(coordinator?.provider).toBe("opencode_go");
-    expect(coordinator?.model_id).toBe("opencode-go/mimo-v2-5");
+    expect(coordinator?.provider).toBe("opencode_zen");
+    // Non-reasoning, terminal-JSON model — reasoning-heavy models emit no
+    // `content` for short coordinator prompts and break routing.
+    expect(coordinator?.model_id).toBe("deepseek-v4-flash-free");
 
     expect(planner).toBeDefined();
     expect(planner?.provider).toBe("opencode_zen");
-    expect(planner?.model_id).toBe("opencode/nemotron-3-ultra-free");
+    expect(planner?.model_id).toBe("nemotron-3-ultra-free");
   });
 
-  test("openrouter/free is no longer the default for any stage", () => {
-    const routerFree = DEFAULT_ORCHESTRATOR_AGENTS.find((agent) => agent.id === "router-free");
-    expect(routerFree).toBeDefined();
-    // It still exists in the pool as a generic executor/reviewer/
-    // synthesizer candidate and as a tail of the fallback cascade,
-    // but it must not be the default_for any stage.
-    expect(routerFree?.default_for ?? []).toEqual([]);
+  test("no stage defaults to the unreliable openrouter/free router model", () => {
+    const stages = ["coordinator", "planner", "executor", "reviewer", "rewriter", "synthesizer"];
+    for (const stage of stages) {
+      const def = DEFAULT_ORCHESTRATOR_AGENTS.find((agent) => agent.default_for.includes(stage));
+      expect(def, `stage ${stage} has a default agent`).toBeDefined();
+      expect(def?.model_id, `stage ${stage} must not default to openrouter/free`).not.toBe("openrouter/free");
+    }
   });
 });

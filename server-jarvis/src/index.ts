@@ -37,6 +37,7 @@ import {
   applyOpenRouterRequestConfig,
 } from "./openrouter";
 import type { OpenRouterCostInfo } from "./openrouter";
+import { resolveProviderTarget, providerChatUrl, providerHeaders } from "./providers";
 import { recordInference, inferenceMetricsSnapshot, type Backend } from "./inference-metrics";
 import { createApprovalRegistry } from "./approval-registry";
 
@@ -1182,6 +1183,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // opencode_zen agents are routed through the same OpenRouter API endpoint
           // as native openrouter agents — same base_url and api_key apply.
           let poolModel: string | null = null;
+          // Provider of the pool-selected agent. Drives endpoint + key routing
+          // for the primary request (the fallback cascade routes per-attempt).
+          let poolProvider: "openrouter" | "opencode_zen" | "opencode_go" | null = null;
           const stageLabel = callOptions?.stageLabel as string | undefined;
           const cascadeTier = callOptions?.cascadeTier as "cheap" | "strong" | undefined;
           if (!isOllama && stageLabel && cfg.orchestrator?.enabled) {
@@ -1196,6 +1200,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               }
               if (agent && (agent.provider === "openrouter" || agent.provider === "opencode_zen" || agent.provider === "opencode_go")) {
                 poolModel = agent.model_id;
+                poolProvider = agent.provider;
                 console.log(`[Jarvis Orchestrator] Pool resolved model ${agent.model_id} for stage=${stageLabel} cascadeTier=${cascadeTier ?? "none"} task=${orchestratorTaskType} agent=${agent.id} (provider=${agent.provider})`);
               }
             } catch (e: any) {
@@ -1210,16 +1215,26 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const modelName = isOllama
             ? (ollamaTarget?.modelName ?? cfg.ollama.model)
             : poolModel ?? resolvedOpenRouterModel ?? cfg.openrouter.model;
-          const openRouterEffective = !isOllama
+          // The effective provider for the PRIMARY request. OpenCode providers
+          // speak OpenAI-compatible /chat/completions but live on their own
+          // base_url + key (resolveProviderTarget). OpenRouter is the default.
+          const effectiveProvider = poolProvider ?? "openrouter";
+          const isOpenCodeProvider = effectiveProvider === "opencode_zen" || effectiveProvider === "opencode_go";
+          const providerTarget = !isOllama ? resolveProviderTarget(cfg, effectiveProvider) : null;
+          // Only the OpenRouter catalog can describe OpenRouter models; skip it
+          // for OpenCode (its models aren't in that catalog).
+          const openRouterEffective = (!isOllama && !isOpenCodeProvider)
             ? await resolveEffectiveOpenRouterRequestConfig(cfg, modelName, messages, { surface })
             : null;
           const baseUrl = isOllama
             ? ollamaTarget!.chatUrl
-            : `${cfg.openrouter.base_url}/chat/completions`;
+            : providerChatUrl(providerTarget!);
 
           const modelSupportsNativeTools = isOllama
             ? (ollamaTarget?.supportsNativeTools ?? false)
-            : (openRouterEffective?.supports_tools ?? isOpenRouterModelSupportsTools(modelName));
+            : isOpenCodeProvider
+              ? false // OpenCode agents use the text tool protocol
+              : (openRouterEffective?.supports_tools ?? isOpenRouterModelSupportsTools(modelName));
           // Use text tool protocol if native tools are disabled/unsupported and tools are requested
           const useTextTools = !modelSupportsNativeTools && callOptions?.tools && callOptions.tools.length > 0;
 
@@ -1261,6 +1276,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               num_thread: activeProfile?.num_threads ?? cfg.ollama.options?.num_thread ?? 8,
               num_batch: activeProfile?.batch_size ?? cfg.ollama.options?.num_batch ?? 256,
             };
+          } else if (isOpenCodeProvider) {
+            // OpenCode (Zen/Go): OpenAI-compatible but not in the OpenRouter
+            // catalog. Apply a lean config from callOptions/cfg directly.
+            if (callOptions?.max_tokens !== undefined) requestBody.max_tokens = callOptions.max_tokens;
+            else if (typeof cfg.max_tokens === "number" && cfg.max_tokens > 0) requestBody.max_tokens = cfg.max_tokens;
+            if (callOptions?.temperature !== undefined) requestBody.temperature = callOptions.temperature;
+            else if (cfg.temperature !== undefined) requestBody.temperature = cfg.temperature;
+            if (cfg.top_p !== undefined) requestBody.top_p = cfg.top_p;
           } else {
             await applyOpenRouterRequestConfig(requestBody, cfg, modelName, normalizedMessages, {
               requestedMaxTokens: callOptions?.max_tokens,
@@ -1272,7 +1295,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
           if (cfg.tools.enabled && !useTextTools && callOptions?.tools && callOptions.tools.length > 0) {
             requestBody.tools = toApiTools(callOptions.tools);
-            if (!isOllama) {
+            if (!isOllama && !isOpenCodeProvider) {
               await applyOpenRouterRequestConfig(requestBody, cfg, modelName, normalizedMessages, {
                 requestedMaxTokens: callOptions?.max_tokens,
                 requestedTemperature: callOptions?.temperature,
@@ -1282,14 +1305,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
           }
 
-          const headers: Record<string, string> = {
-            "Authorization": isOllama ? "Bearer ollama" : `Bearer ${cfg.openrouter.api_key}`,
-            "Content-Type": "application/json",
-          };
-          if (!isOllama) {
-            headers["HTTP-Referer"] = cfg.openrouter.site_url || "http://localhost:19877";
-            headers["X-Title"] = cfg.openrouter.site_name || "Jarvis";
-          }
+          const headers: Record<string, string> = isOllama
+            ? { "Authorization": "Bearer ollama", "Content-Type": "application/json" }
+            : providerHeaders(cfg, providerTarget!);
 
           // Use the same fallback/retry pipeline as the main Agent Loop so the
           // orchestrator is not single-shot on the OpenRouter free tier (which
@@ -2341,7 +2359,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
   })();
 
   return new Response(readable, {
-    headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" },
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    },
   });
 }
 

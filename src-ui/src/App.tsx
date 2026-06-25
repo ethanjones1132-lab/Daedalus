@@ -51,7 +51,7 @@ import CommandPalette from './components/jarvis/CommandPalette';
 
 const NAV_SECTIONS: NavSection[] = [
   { title: 'JARVIS', items: [{ id: 'jarvis', label: 'Jarvis', icon: 'J' }] },
-  { title: 'CHAT', items: [{ id: 'chat-feeds', label: 'Chats', icon: 'C' }] },
+  { title: 'CHAT', items: [{ id: 'jarvis-chat', label: 'Chat', icon: 'C' }] },
   {
     title: 'CONTROL',
     items: [

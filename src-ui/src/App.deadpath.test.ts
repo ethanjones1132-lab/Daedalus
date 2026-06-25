@@ -43,4 +43,11 @@ describe('nav dead-path guard', () => {
       `ViewId members with no renderView case: ${missing.join(', ')}`,
     ).toEqual([]);
   });
+
+  it('the sidebar Chat entry opens the live Jarvis chat surface', () => {
+    const chatSection = src.match(/\{\s*title:\s*'CHAT'[\s\S]*?items:\s*\[\{\s*id:\s*'([^']+)',\s*label:\s*'([^']+)'/);
+    expect(chatSection, 'CHAT nav section should exist').not.toBeNull();
+    expect(chatSection?.[1]).toBe('jarvis-chat');
+    expect(chatSection?.[2]).toBe('Chat');
+  });
 });

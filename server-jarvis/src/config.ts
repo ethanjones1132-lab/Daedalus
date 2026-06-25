@@ -79,6 +79,19 @@ export interface OpenRouterConfig {
   timeout_ms: number;
 }
 
+/**
+ * OpenAI-compatible secondary provider (OpenCode Zen / OpenCode Go).
+ * These route through their own base_url + api_key — NOT OpenRouter's — but
+ * speak the same `/chat/completions` SSE protocol, so the existing stream
+ * parser and request builder work unchanged. The orchestrator agent pool
+ * references them by `provider: "opencode_zen" | "opencode_go"`; the fallback
+ * cascade resolves the right endpoint per attempt via `resolveProviderTarget`.
+ */
+export interface OpenCodeProviderConfig {
+  base_url: string;
+  api_key: string;
+}
+
 export interface ClaudeCliConfig {
   enabled: boolean;
   /** Path to the `claude` binary */
@@ -132,6 +145,10 @@ export interface JarvisConfig {
   active_backend: BackendType;
   ollama: OllamaConfig;
   openrouter: OpenRouterConfig;
+  /** OpenCode Zen — OpenAI-compatible secondary provider for pool agents. */
+  opencode_zen: OpenCodeProviderConfig;
+  /** OpenCode Go — OpenAI-compatible secondary provider for pool agents. */
+  opencode_go: OpenCodeProviderConfig;
   claude_cli: ClaudeCliConfig;
   tools: ToolConfig;
   reasoning: ReasoningConfig;
@@ -229,6 +246,17 @@ export function defaultConfig(): JarvisConfig {
       enable_paid_fallbacks: false,
       max_retries: 3,
       timeout_ms: 60000,
+    },
+    // Secondary OpenAI-compatible providers. Keys are intentionally blank in
+    // source (no secrets committed) — they are written to the live config.json
+    // store. base_url defaults match the OpenCode Zen/Go endpoints.
+    opencode_zen: {
+      base_url: "https://opencode.ai/zen/v1",
+      api_key: "",
+    },
+    opencode_go: {
+      base_url: "https://opencode.ai/zen/go/v1",
+      api_key: "",
     },
     claude_cli: {
       enabled: true,

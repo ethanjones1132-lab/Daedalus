@@ -101,8 +101,19 @@ export class Coordinator {
       suppressActivity: true,
     });
 
-    const parsed = this.extractJson<unknown>(response.content);
-    const decision = this.validate(parsed);
+    // Resilient routing: a coordinator model that returns empty/garbled output
+    // (e.g. a reasoning model that spends its budget on <think> and emits no
+    // JSON content) must NOT kill the turn. Fall back to a safe default route
+    // so the pipeline always proceeds to a streamed answer. This is the
+    // coordinator-level complement to the cross-provider model fallback.
+    let decision: CoordinatorResult;
+    try {
+      const parsed = this.extractJson<unknown>(response.content);
+      decision = this.validate(parsed);
+    } catch (e) {
+      console.warn(`[Coordinator] Routing parse failed, using default route: ${e instanceof Error ? e.message : String(e)}`);
+      decision = this.defaultRoute();
+    }
     state.turns += 1;
     state.lastOutcome = options.lastOutcome ?? state.lastOutcome;
     state.lastDecision = decision;
@@ -110,6 +121,25 @@ export class Coordinator {
     Coordinator.states.set(options.sessionId, state);
     this.pruneStates();
     return decision;
+  }
+
+  /**
+   * Safe default route when the coordinator model output can't be parsed into a
+   * valid decision. A linear planner→executor→synthesizer pipeline handles the
+   * broadest range of requests and always ends in a streamed synthesizer answer.
+   */
+  private defaultRoute(): CoordinatorResult {
+    return {
+      task_type: "general",
+      pipeline: ["planner", "executor", "synthesizer"],
+      topology: "linear",
+      context: {
+        needs_workspace_inspection: false,
+        needs_memory: true,
+        estimated_complexity: "medium",
+      },
+      coordinator_rationale: "Default route (coordinator output was unparseable).",
+    };
   }
 
   executablePipeline(decision: CoordinatorResult): StageName[] {

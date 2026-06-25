@@ -28,6 +28,20 @@ pub fn run_jarvis_message(
     let sid = effective_session_id;
 
     std::thread::spawn(move || {
+        eprintln!(
+            "[jarvis-chat] relay thread started session={} url={}",
+            sid, url
+        );
+        let _ = app.emit(
+            "jarvis://stage",
+            serde_json::json!({
+                "stage": "stream relay",
+                "status": "running",
+                "agent": "native",
+                "session_id": sid,
+            }),
+        );
+
         let emit_error = |app: &AppHandle, sid: &str, msg: String| {
             let _ = app.emit(
                 "jarvis://error",
@@ -64,10 +78,24 @@ pub fn run_jarvis_message(
         {
             Ok(r) => r,
             Err(e) => {
-                emit_error(&app, &sid, format!("Could not reach the Jarvis server: {e}"));
+                eprintln!(
+                    "[jarvis-chat] stream POST failed session={} error={}",
+                    sid, e
+                );
+                emit_error(
+                    &app,
+                    &sid,
+                    format!("Could not reach the Jarvis server: {e}"),
+                );
                 return;
             }
         };
+
+        eprintln!(
+            "[jarvis-chat] stream response session={} status={}",
+            sid,
+            resp.status()
+        );
 
         if !resp.status().is_success() {
             let code = resp.status();
@@ -179,7 +207,11 @@ pub fn run_jarvis_message(
                     terminated = true;
                     break;
                 }
-                SseFrameOutcome::ToolCall { call_id, name, arguments } => {
+                SseFrameOutcome::ToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                } => {
                     let _ = app.emit(
                         "jarvis://tool_call",
                         serde_json::json!({
@@ -199,7 +231,12 @@ pub fn run_jarvis_message(
                         }),
                     );
                 }
-                SseFrameOutcome::ToolResult { name, output, is_error, call_id } => {
+                SseFrameOutcome::ToolResult {
+                    name,
+                    output,
+                    is_error,
+                    call_id,
+                } => {
                     let _ = app.emit(
                         "jarvis://tool_result",
                         serde_json::json!({
@@ -221,7 +258,11 @@ pub fn run_jarvis_message(
                         }),
                     );
                 }
-                SseFrameOutcome::ApprovalRequest { call_id, name, arguments } => {
+                SseFrameOutcome::ApprovalRequest {
+                    call_id,
+                    name,
+                    arguments,
+                } => {
                     // Relay to the UI so ToolApprovalModal can surface it. The UI
                     // sends the decision back via `jarvis_tool_decision` (Tauri command)
                     // which POSTs to /tool/decision on the Bun server.
@@ -301,9 +342,7 @@ pub enum SseFrameOutcome {
         arguments: serde_json::Value,
     },
     /// Chain-of-thought trace finalized for the turn (`reasoning_complete`).
-    ReasoningComplete {
-        trace: serde_json::Value,
-    },
+    ReasoningComplete { trace: serde_json::Value },
     /// Tool result visibility frame — Bun emits `tool_result` after a tool runs;
     /// we surface output + error flag for the inline card.
     ToolResult {
@@ -314,10 +353,7 @@ pub enum SseFrameOutcome {
     },
     /// Token usage / cost frame — Bun emits `cost_info`. We surface tokens and
     /// dollar cost so the footer can show the running tally per turn.
-    Cost {
-        tokens: i64,
-        cost_usd: f64,
-    },
+    Cost { tokens: i64, cost_usd: f64 },
     /// Policy "ask" — the server paused on a tool call and needs the user to
     /// approve or deny before execution continues. The UI shows ToolApprovalModal
     /// and POSTs the decision to `/tool/decision`.
@@ -329,10 +365,7 @@ pub enum SseFrameOutcome {
     /// Intermediate pipeline stage activity (planner/executor/reviewer/rewriter output).
     /// Does NOT flip `streamed_any` so the terminal `result` frame still surfaces if
     /// no synthesizer tokens hit the chat bubble.
-    AgentActivity {
-        stage: String,
-        text: String,
-    },
+    AgentActivity { stage: String, text: String },
     /// Recursive-critique loop progress (`orchestrator_recursion`). Emitted when the
     /// `recursive` topology enters a critique or re-enter cycle.
     Recursion {
@@ -344,9 +377,7 @@ pub enum SseFrameOutcome {
     /// Stable identifier for the orchestrator run that produced this turn's answer.
     /// Emitted as `agent_run_id` after the pipeline completes; used by self-tuning
     /// to correlate a user rating with the run record in SQLite.
-    AgentRunId {
-        run_id: String,
-    },
+    AgentRunId { run_id: String },
 }
 
 /// Stateful SSE frame relay. Holds the one piece of cross-frame state the
@@ -407,8 +438,10 @@ impl SseRelay {
                 if !self.streamed_any {
                     if let Some(text) = evt.get("result").and_then(|r| r.as_str()) {
                         if !text.is_empty() {
-                            let is_err =
-                                evt.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false);
+                            let is_err = evt
+                                .get("is_error")
+                                .and_then(|b| b.as_bool())
+                                .unwrap_or(false);
                             if is_err {
                                 error = Some(text.to_string());
                             } else {
@@ -457,9 +490,21 @@ impl SseRelay {
                 SseFrameOutcome::ResultThenDone { token, error }
             }
             Some("orchestrator_stage") => SseFrameOutcome::Stage {
-                stage: evt.get("stage").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-                status: evt.get("status").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-                agent: evt.get("agent").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                stage: evt
+                    .get("stage")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                status: evt
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                agent: evt
+                    .get("agent")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string(),
             },
             Some("reasoning_step") | Some("reasoning_chunk") => {
                 if let Some(text) = evt
@@ -483,16 +528,35 @@ impl SseRelay {
                 SseFrameOutcome::Continue
             }
             Some("tool_approval_request") => {
-                let call_id = evt.get("call_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let name = evt.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let arguments = evt.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
-                SseFrameOutcome::ApprovalRequest { call_id, name, arguments }
+                let call_id = evt
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = evt
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let arguments = evt
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                SseFrameOutcome::ApprovalRequest {
+                    call_id,
+                    name,
+                    arguments,
+                }
             }
             Some("agent_activity") => {
                 if let Some(text) = evt.get("text").and_then(|t| t.as_str()) {
                     if !text.is_empty() {
                         return SseFrameOutcome::AgentActivity {
-                            stage: evt.get("stage").and_then(|s| s.as_str()).unwrap_or("agent").to_string(),
+                            stage: evt
+                                .get("stage")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("agent")
+                                .to_string(),
                             text: text.to_string(),
                         };
                     }
@@ -501,12 +565,26 @@ impl SseRelay {
             }
             Some("orchestrator_recursion") => SseFrameOutcome::Recursion {
                 depth: evt.get("depth").and_then(|v| v.as_u64()).unwrap_or(0),
-                status: evt.get("status").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-                reenter_stage: evt.get("reenter_stage").and_then(|s| s.as_str()).map(str::to_string),
-                critique: evt.get("critique").and_then(|s| s.as_str()).map(str::to_string),
+                status: evt
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                reenter_stage: evt
+                    .get("reenter_stage")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_string),
+                critique: evt
+                    .get("critique")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_string),
             },
             Some("agent_run_id") => SseFrameOutcome::AgentRunId {
-                run_id: evt.get("agent_run_id").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                run_id: evt
+                    .get("agent_run_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string(),
             },
             Some("message_stop") => SseFrameOutcome::MessageStop,
             Some("cancelled") => SseFrameOutcome::Cancelled,
@@ -524,9 +602,7 @@ impl SseRelay {
                 let name = evt
                     .get("name")
                     .and_then(|v| v.as_str())
-                    .or_else(|| {
-                        evt.get("tool_name").and_then(|v| v.as_str())
-                    })
+                    .or_else(|| evt.get("tool_name").and_then(|v| v.as_str()))
                     .unwrap_or("unknown")
                     .to_string();
                 let arguments = evt
@@ -563,7 +639,9 @@ impl SseRelay {
                     .get("is_error")
                     .and_then(|v| v.as_bool())
                     .or_else(|| {
-                        evt.get("status").and_then(|s| s.as_str()).map(|s| s == "error")
+                        evt.get("status")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s == "error")
                     })
                     .unwrap_or(false);
                 SseFrameOutcome::ToolResult {
@@ -674,9 +752,8 @@ mod sse_tests {
     #[test]
     fn reasoning_step_accepts_nested_step_content_from_bun() {
         let mut r = SseRelay::new();
-        let out = r.handle_line(
-            r#"data: {"type":"reasoning_step","step":{"content":"planning step"}}"#,
-        );
+        let out =
+            r.handle_line(r#"data: {"type":"reasoning_step","step":{"content":"planning step"}}"#);
         assert_eq!(out, SseFrameOutcome::Reasoning("planning step".to_string()));
     }
 
@@ -701,9 +778,12 @@ mod sse_tests {
         let mut r = SseRelay::new();
         let out = r.handle_line(r#"data: {"type":"result","result":"","is_error":false}"#);
         match out {
-            SseFrameOutcome::ResultThenDone { token: Some(t), error: None } => {
+            SseFrameOutcome::ResultThenDone {
+                token: Some(t),
+                error: None,
+            } => {
                 assert!(!t.is_empty(), "fallback token must be non-empty");
-            },
+            }
             other => panic!("expected ResultThenDone with a fallback token, got {other:?}"),
         }
     }
@@ -715,9 +795,12 @@ mod sse_tests {
             r#"data: {"type":"result","result":"","is_error":true,"subtype":"no_output"}"#,
         );
         match out {
-            SseFrameOutcome::ResultThenDone { token: None, error: Some(e) } => {
+            SseFrameOutcome::ResultThenDone {
+                token: None,
+                error: Some(e),
+            } => {
                 assert_eq!(e, "no_output");
-            },
+            }
             other => panic!("expected ResultThenDone with an error, got {other:?}"),
         }
     }
@@ -729,11 +812,15 @@ mod sse_tests {
             r#"data: {"type":"tool_use","id":"tc_1","name":"shell_exec","arguments":{"cmd":"ls"}}"#,
         );
         match out {
-            SseFrameOutcome::ToolCall { call_id, name, arguments } => {
+            SseFrameOutcome::ToolCall {
+                call_id,
+                name,
+                arguments,
+            } => {
                 assert_eq!(call_id, "tc_1");
                 assert_eq!(name, "shell_exec");
                 assert_eq!(arguments, serde_json::json!({"cmd": "ls"}));
-            },
+            }
             other => panic!("expected ToolCall, got {other:?}"),
         }
     }
@@ -747,7 +834,7 @@ mod sse_tests {
         match out {
             SseFrameOutcome::ReasoningComplete { trace } => {
                 assert_eq!(trace, serde_json::json!({"steps": []}));
-            },
+            }
             other => panic!("expected ReasoningComplete, got {other:?}"),
         }
     }
@@ -759,12 +846,17 @@ mod sse_tests {
             r#"data: {"type":"tool_result","call_id":"c1","name":"shell_exec","output":"src\n","is_error":false}"#,
         );
         match out {
-            SseFrameOutcome::ToolResult { call_id, name, output, is_error } => {
+            SseFrameOutcome::ToolResult {
+                call_id,
+                name,
+                output,
+                is_error,
+            } => {
                 assert_eq!(call_id, "c1");
                 assert_eq!(name, "shell_exec");
                 assert_eq!(output, "src\n");
                 assert!(!is_error);
-            },
+            }
             other => panic!("expected ToolResult, got {other:?}"),
         }
     }
@@ -772,14 +864,13 @@ mod sse_tests {
     #[test]
     fn cost_info_frame_maps_to_cost_outcome() {
         let mut r = SseRelay::new();
-        let out = r.handle_line(
-            r#"data: {"type":"cost_info","total_tokens":1234,"cost_usd":0.002}"#,
-        );
+        let out =
+            r.handle_line(r#"data: {"type":"cost_info","total_tokens":1234,"cost_usd":0.002}"#);
         match out {
             SseFrameOutcome::Cost { tokens, cost_usd } => {
                 assert_eq!(tokens, 1234);
                 assert!((cost_usd - 0.002).abs() < 1e-9);
-            },
+            }
             other => panic!("expected Cost, got {other:?}"),
         }
     }
@@ -878,7 +969,8 @@ mod sse_tests {
     #[test]
     fn agent_activity_frame_is_relayed() {
         let mut r = SseRelay::new();
-        let out = r.handle_line(r#"data: {"type":"agent_activity","stage":"planner","text":"step 1"}"#);
+        let out =
+            r.handle_line(r#"data: {"type":"agent_activity","stage":"planner","text":"step 1"}"#);
         assert_eq!(
             out,
             SseFrameOutcome::AgentActivity {
@@ -892,7 +984,9 @@ mod sse_tests {
     fn agent_activity_does_not_suppress_result_frame() {
         let mut r = SseRelay::new();
         // AgentActivity must NOT flip streamed_any — the final result should still surface.
-        let _ = r.handle_line(r#"data: {"type":"agent_activity","stage":"planner","text":"planning..."}"#);
+        let _ = r.handle_line(
+            r#"data: {"type":"agent_activity","stage":"planner","text":"planning..."}"#,
+        );
         let out = r.handle_line(r#"data: {"type":"result","result":"final answer"}"#);
         assert_eq!(
             out,
@@ -996,8 +1090,8 @@ pub fn check_jarvis_status(config: &JarvisConfig) -> JarvisStatus {
     };
 
     // ── Bun server ──────────────────────────────────────────────
-    let bun_server_url = crate::wsl::get_cached_bun_url()
-        .unwrap_or_else(|| "http://127.0.0.1:19877".to_string());
+    let bun_server_url =
+        crate::wsl::get_cached_bun_url().unwrap_or_else(|| "http://127.0.0.1:19877".to_string());
     let bun_server_running = {
         let url = format!("{}/health", bun_server_url.trim_end_matches('/'));
         reqwest::blocking::Client::builder()

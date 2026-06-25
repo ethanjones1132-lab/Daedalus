@@ -26,6 +26,54 @@ describe("loadPrompt resolution", () => {
     }
   });
 
+  test("finds prompts shipped beside the bundled entry (__dirname/prompts)", () => {
+    // The deployed-native case: `bun build` emits a single index.js and the
+    // app runs `bun.exe <Desktop>/index.js`, so __dirname is the bundle dir
+    // with no server-jarvis source tree up the ancestry. A `prompts/` folder
+    // beside index.js (with a `modes/` subdir) must resolve. We exercise the
+    // real loader in a sub-process whose __dirname is the synthetic bundle dir.
+    const root = mkdtempSync(join(tmpdir(), "jarvis-beside-"));
+    const bundleDir = join(root, "Desktop");
+    const promptsDir = join(bundleDir, "prompts");
+    mkdirSync(join(promptsDir, "modes"), { recursive: true });
+    writeFileSync(join(promptsDir, "coordinator.md"), "COORDINATOR_BESIDE");
+    writeFileSync(join(promptsDir, "modes", "planner.md"), "PLANNER_BESIDE");
+
+    const loaderPath = join(import.meta.dir, "prompt-loader.ts");
+    const stagedLoader = join(bundleDir, "prompt-loader.ts");
+
+    const sub = Bun.spawnSync({
+      cmd: [
+        "bun",
+        "-e",
+        `
+          const src = await Bun.file(${JSON.stringify(loaderPath)}).text();
+          const modPath = ${JSON.stringify(stagedLoader)};
+          await Bun.write(modPath, src);
+          // Run from a cwd where the cwd-based candidates cannot match, so only
+          // the __dirname/prompts candidate can succeed.
+          process.chdir(${JSON.stringify(root)});
+          const m = await import(modPath);
+          const top = m.loadPrompt("coordinator.md");
+          const nested = m.loadPrompt("modes/planner.md");
+          process.stdout.write("RESULT::" + top + "::" + nested + "::END");
+        `,
+      ],
+      env: { ...process.env, JARVIS_PROMPTS_DIR: "" },
+      cwd: root,
+    });
+
+    rmSync(root, { recursive: true, force: true });
+
+    if (sub.exitCode !== 0) {
+      throw new Error(
+        `Subprocess failed (exit=${sub.exitCode}):\nstdout=${sub.stdout?.toString()}\nstderr=${sub.stderr?.toString()}`,
+      );
+    }
+    const stdout = sub.stdout.toString();
+    expect(stdout).toContain("RESULT::COORDINATOR_BESIDE::PLANNER_BESIDE::END");
+  });
+
   test("walk-up fallback finds prompts dir when __dirname lands in a non-source location", () => {
     // Simulate the bundled-binary layout: a synthetic tree where the
     // orchestration dir contains nothing useful, and the prompts dir
@@ -83,6 +131,44 @@ describe("loadPrompt resolution", () => {
     }
     const stdout = sub.stdout.toString();
     expect(stdout).toContain("RESULT::WALKED_UP_BODY::END");
+  });
+
+  // Regression for the live-chat outage where `loadPrompt("coordinator.md")`
+  // threw `Prompt file not found` on the deployed build: every orchestrator
+  // turn died with an immediate error frame and zero streaming. The mechanism
+  // tests above use synthetic temp files, so they pass even if a real prompt
+  // is renamed, moved, or missing from the shipped tree. This test exercises
+  // the exact call sites (Coordinator + PipelineExecutor + router shim) against
+  // the real source layout with no overrides — the seam that actually reproduces
+  // the bug. If any orchestrator prompt stops resolving, the live chat path is
+  // broken, and this test fails first.
+  test("every orchestrator prompt resolves from the real source tree (no overrides)", async () => {
+    const originalCwd = process.cwd();
+    const previousOverride = process.env.JARVIS_PROMPTS_DIR;
+    delete process.env.JARVIS_PROMPTS_DIR;
+    try {
+      const { loadPrompt } = await import("./prompt-loader");
+      // Keep this list in lockstep with the loadPrompt() call sites in
+      // coordinator.ts, pipeline.ts, and router.ts.
+      const runtimePrompts = [
+        "coordinator.md",
+        "router.md",
+        "modes/planner.md",
+        "modes/executor.md",
+        "modes/reviewer.md",
+        "modes/rewriter.md",
+        "modes/synthesizer.md",
+        "modes/recursion-critique.md",
+      ];
+      for (const name of runtimePrompts) {
+        const body = loadPrompt(name);
+        expect(body.trim().length, `prompt ${name} resolved but is empty`).toBeGreaterThan(0);
+      }
+    } finally {
+      if (previousOverride === undefined) delete process.env.JARVIS_PROMPTS_DIR;
+      else process.env.JARVIS_PROMPTS_DIR = previousOverride;
+      process.chdir(originalCwd);
+    }
   });
 
   test("throws a descriptive error with all tried paths when no candidate matches", async () => {

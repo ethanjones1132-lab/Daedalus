@@ -303,15 +303,18 @@ export const COORDINATOR_CASES: CoordinatorCase[] = [
     expect: { executablePipeline: ["synthesizer"] },
   },
   {
-    id: "coordinator/invalid-json-throws",
+    // Unparseable output → resilient default route (NOT a thrown error), so a
+    // misbehaving coordinator model can never kill the turn.
+    id: "coordinator/invalid-json-defaults",
     kind: "coordinator",
     request: "add unit tests",
     sessionId: "eval-coord-bad-json",
     modelOutput: "I cannot produce JSON for this request.",
-    expect: { throws: true },
+    expect: { task_type: "general", topology: "linear", executablePipeline: ["planner", "executor", "synthesizer"] },
   },
   {
-    id: "coordinator/invalid-task-type-throws",
+    // Invalid task_type → same default-route recovery.
+    id: "coordinator/invalid-task-type-defaults",
     kind: "coordinator",
     request: "summarize the codebase",
     sessionId: "eval-coord-bad-task-type",
@@ -322,7 +325,7 @@ export const COORDINATOR_CASES: CoordinatorCase[] = [
       context: { needs_workspace_inspection: false, needs_memory: false, estimated_complexity: "low" },
       coordinator_rationale: "eval fixture",
     }),
-    expect: { throws: true },
+    expect: { task_type: "general", topology: "linear", executablePipeline: ["planner", "executor", "synthesizer"] },
   },
   {
     id: "coordinator/complexity-low-parsed",

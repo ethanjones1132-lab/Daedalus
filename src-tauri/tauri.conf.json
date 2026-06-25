@@ -36,8 +36,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": [
-      "../server-jarvis/dist/index.js"
-    ]
+    "resources": {
+      "../server-jarvis/dist/index.js": "index.js",
+      "../server-jarvis/src/prompts/**/*": "prompts/"
+    }
   }
 }

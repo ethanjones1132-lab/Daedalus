@@ -37,10 +37,28 @@ describe("Coordinator", () => {
     expect(calls[0][1].content).toContain("executor failed: API 503");
   });
 
-  test("surfaces coordinator failure instead of silently defaulting", async () => {
+  test("falls back to a safe default route when coordinator output is unparseable", async () => {
+    // A coordinator model that returns no JSON (e.g. a reasoning model that
+    // emits only <think> and leaves content empty) must NOT kill the turn.
+    // The route falls back to a default linear pipeline so the turn still
+    // produces a streamed answer.
     const coordinator = new Coordinator(async () => ({ content: "not json" }));
 
-    await expect(coordinator.route("hello", { sessionId: "session-2" })).rejects.toBeInstanceOf(CoordinatorError);
+    const decision = await coordinator.route("hello", { sessionId: "session-2" });
+    expect(decision.task_type).toBe("general");
+    expect(decision.topology).toBe("linear");
+    expect(decision.pipeline).toContain("synthesizer");
+  });
+
+  test("propagates a genuine transport failure (callModel throws → caller surfaces an error)", async () => {
+    // When the model call itself fails (all providers exhausted, auth, etc.)
+    // the error must propagate so the turn surfaces an error banner — only
+    // unparseable OUTPUT is recovered via the default route.
+    const coordinator = new Coordinator(async () => {
+      throw new Error("All provider models exhausted. Last error: HTTP 401");
+    });
+
+    await expect(coordinator.route("hello", { sessionId: "session-3" })).rejects.toThrow(/exhausted/);
   });
 
   test("suppresses coordinator activity from the user-visible stream", async () => {

@@ -3,7 +3,46 @@ use crate::jarvis::runner::{check_jarvis_status, run_jarvis_message};
 use crate::jarvis::types::*;
 use crate::jarvis_types::JarvisState;
 use serde::Serialize;
+use std::time::Duration;
 use tauri::{AppHandle, State};
+
+async fn chat_base_url() -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .connect_timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|e| format!("Failed to build Jarvis health client: {e}"))?;
+
+    let base_url = crate::cron_scheduler::resolve_jarvis_url(&client).await;
+    if probe_chat_health(&client, &base_url).await {
+        return Ok(base_url);
+    }
+
+    tokio::time::timeout(
+        Duration::from_secs(25),
+        crate::ensure_jarvis_server_started(),
+    )
+    .await
+    .map_err(|_| "Timed out while starting the Bun server for chat".to_string())??;
+
+    let base_url = crate::cron_scheduler::resolve_jarvis_url(&client).await;
+    if probe_chat_health(&client, &base_url).await {
+        return Ok(base_url);
+    }
+
+    Err(format!(
+        "Bun server is not reachable at {} after startup",
+        base_url.trim_end_matches('/')
+    ))
+}
+
+async fn probe_chat_health(client: &reqwest::Client, base_url: &str) -> bool {
+    let url = format!("{}/health", base_url.trim_end_matches('/'));
+    matches!(
+        client.get(url).timeout(Duration::from_secs(2)).send().await,
+        Ok(resp) if resp.status().is_success()
+    )
+}
 
 #[derive(Serialize)]
 pub struct LearningRunResult {
@@ -117,7 +156,11 @@ pub async fn jarvis_send_message(
     // turn to the SSE relay. We no longer pass config through here — the server is
     // the single source of truth, which is also why the key must be persisted to the
     // config file it reads (see jarvis::get_config_path).
-    crate::ensure_jarvis_server_started().await?;
+    eprintln!(
+        "[jarvis-chat] send requested session={} chars={}",
+        session_id,
+        message.chars().count()
+    );
     // Re-probe the Bun URL on every turn. `get_cached_bun_url()` returns
     // whatever was last validated, which can go stale when the server is
     // restarted in a different mode (WSL → native, or vice versa) — a stale
@@ -126,8 +169,11 @@ pub async fn jarvis_send_message(
     // cached URL against /health, falls through to all candidates on
     // failure, and re-caches the first live one. Cost: 1 GET /health per
     // chat turn (sub-millisecond when the server is up).
-    let probe_client = reqwest::Client::new();
-    let base_url = crate::cron_scheduler::resolve_jarvis_url(&probe_client).await;
+    let base_url = chat_base_url().await?;
+    eprintln!(
+        "[jarvis-chat] stream target session={} base={}",
+        session_id, base_url
+    );
 
     let history = if session_id.is_empty() {
         Vec::new()
@@ -139,6 +185,7 @@ pub async fn jarvis_send_message(
         crate::commands::sessions::insert_message_row(&db, &session_id, "user", &message, 0)?;
     }
 
+    eprintln!("[jarvis-chat] spawning stream relay session={}", session_id);
     run_jarvis_message(app, base_url, session_id, message, history)
 }
 
@@ -178,7 +225,10 @@ pub async fn cancel_chat_stream(session_id: String) -> Result<bool, String> {
         return Err(format!("/chat/cancel returned {code}: {body}"));
     }
     let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::json!({}));
-    Ok(body.get("cancelled").and_then(|v| v.as_bool()).unwrap_or(false))
+    Ok(body
+        .get("cancelled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false))
 }
 
 // The chat-session commands map the canonical SQLite session (commands/sessions.rs)

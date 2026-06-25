@@ -142,6 +142,79 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
     ]);
   });
 
+  test("advances to the next pool model after 2 consecutive rate-limit (429) errors, routing OpenCode to its own endpoint+key", async () => {
+    // Core orchestrator fallback rule: two consecutive 429s on a model → next
+    // optimal pool model. The secondary here is an OpenCode Zen agent, which
+    // must be called at its own base_url with its own key (NOT OpenRouter's).
+    const cfg = cfgWithPool();
+    cfg.openrouter.api_key = "sk-or-key";
+    cfg.openrouter.max_retries = 3; // allow the 2-strike rate-limit rule to apply
+    cfg.opencode_zen.base_url = "https://opencode.ai/zen/v1";
+    cfg.opencode_zen.api_key = "sk-zen-key";
+    cfg.orchestrator.agents = [
+      {
+        id: "or-primary",
+        provider: "openrouter",
+        model_id: "cohere/north-mini-code:free",
+        capabilities: { code: 0.95, reasoning: 0.7, speed: 0.8, cost: 1, json_reliability: 0.8 },
+        default_for: ["executor"],
+        enabled: true,
+      },
+      {
+        id: "zen-secondary",
+        provider: "opencode_zen",
+        model_id: "nemotron-3-ultra-free",
+        capabilities: { code: 0.8, reasoning: 0.95, speed: 0.6, cost: 1, json_reliability: 0.88 },
+        default_for: ["executor"],
+        enabled: true,
+      },
+    ];
+
+    const calls: Array<{ url: string; model: string; auth: string }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) {
+        return new Response(JSON.stringify({
+          data: [
+            { id: "cohere/north-mini-code:free", name: "North", context_length: 256000, pricing: { prompt: "0", completion: "0" }, architecture: {}, supported_parameters: [], description: "" },
+          ],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      const auth = String((init?.headers as Record<string, string>)?.["Authorization"] ?? "");
+      calls.push({ url, model: body.model, auth });
+      if (body.model === "cohere/north-mini-code:free") {
+        return new Response("rate limited", { status: 429 });
+      }
+      return new Response("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n", {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }) as typeof fetch;
+
+    const result = await chatCompletionWithFallback(
+      cfg,
+      { model: "cohere/north-mini-code:free", messages: [{ role: "user", content: "go" }], stream: true },
+      undefined,
+      { stage: "executor", taskType: "debug" },
+    );
+
+    const chatCalls = calls.filter((c) => c.url.includes("/chat/completions"));
+    const primaryCalls = chatCalls.filter((c) => c.model === "cohere/north-mini-code:free");
+    const zenCalls = chatCalls.filter((c) => c.model === "nemotron-3-ultra-free");
+
+    // 2 consecutive 429s on the primary, then advance.
+    expect(primaryCalls.length).toBe(2);
+    expect(primaryCalls.every((c) => c.url.startsWith("https://openrouter.ai/api/v1"))).toBe(true);
+    expect(primaryCalls.every((c) => c.auth === "Bearer sk-or-key")).toBe(true);
+
+    // The OpenCode Zen secondary is hit at its own endpoint with its own key.
+    expect(zenCalls.length).toBe(1);
+    expect(zenCalls[0].url).toBe("https://opencode.ai/zen/v1/chat/completions");
+    expect(zenCalls[0].auth).toBe("Bearer sk-zen-key");
+    expect(result.model_used).toBe("nemotron-3-ultra-free");
+  });
+
   test("first-token watchdog advances to the next cascade model on a hung response body", async () => {
     // Regression: openrouter/free opened the response stream then never
     // sent any body bytes (12+ minute stalls, post-hang diagnosis
