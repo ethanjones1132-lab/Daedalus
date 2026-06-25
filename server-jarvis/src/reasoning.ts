@@ -356,10 +356,19 @@ export function stripReasoningFromText(text: string): string {
 
   const result = visibleChunks.join("").trim();
   // Fallback: If stripping left us with nothing, but the original text had content,
-  // and we were in a "Thinking:" block that never closed, restore the thought content as visible text.
+  // and all the content was classified as reasoning, surface the reasoning as
+  // visible text so the user sees something instead of a blank response.
   if (!result && text.trim()) {
-    const lastStep = trace.steps[trace.steps.length - 1];
-    if (lastStep && lastStep.type === "thought" && text.includes("Thinking:")) {
+    // Check if any trace step captured thought content we can surface
+    const thoughtContent = trace.steps
+      .filter(s => s.type === "thought" && s.content.trim())
+      .map(s => s.content.trim())
+      .join("\n\n");
+    if (thoughtContent) {
+      return thoughtContent;
+    }
+    // Legacy fallback for unclosed "Thinking:" block (pre-tag reasoning pattern)
+    if (text.includes("Thinking:")) {
       const idx = text.indexOf("Thinking:");
       const before = text.slice(0, idx);
       const after = text.slice(idx + "Thinking:".length);

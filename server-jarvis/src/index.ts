@@ -1646,7 +1646,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           });
           await session.finish(result.error, { isError: true });
         } else {
-          await session.finish(result.answer);
+          const answer = result.answer?.trim() || "";
+          if (!answer && !result.error) {
+            console.warn(`[Jarvis Orchestrator] Pipeline returned empty answer session=${sessionId} — surfacing fallback`);
+            await session.finish("The orchestrator completed but produced no output. This may be a transient model issue. Try your request again.");
+          } else {
+            await session.finish(answer || result.answer);
+          }
         }
         return;
       }
@@ -2213,22 +2219,34 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let resultText = toolExecutionCount > 0
             ? finalTurnResultText
             : (cfg.reasoning.enabled ? stripReasoningFromText(fullText) : fullText);
-          if (toolExecutionCount > 0 && finalTurnResultText.trim().length === 0) {
-            if (!emptyFinalAnswerRetryDone) {
-              fullText = fullTextBeforeTurn;
-              currentPrompt = [
-                currentPrompt,
-                "Tool use is complete. Do not call tools or emit <tool_call> blocks. Write the final visible answer now using the tool results already provided. If the requested app or file is not present, say that plainly. Do not emit hidden reasoning tags.",
-              ].filter(Boolean).join("\n\n");
-              emptyFinalAnswerRetryDone = true;
-              forceFinalAnswerOnly = true;
-              useTextToolProtocol = false;
-              prevToolCallCount = 0;
-              console.warn(`[Jarvis] Forcing final-answer-only retry session=${sessionId} after ${toolExecutionCount} tool result(s)`);
-              continue;
-            }
-            resultText = "I completed tool inspection, but the model returned no visible final answer after a final-answer-only retry. The streamed tool results above are preserved for review.";
+
+          // Retry once if the model returned empty content — covers both
+          // the tool-execution case (tools ran but no final answer) and
+          // the no-tool case (model returned nothing at all). Some
+          // providers/models transiently return empty on the first attempt
+          // due to rate-limiting, timing, or model-specific edge cases.
+          if (resultText.trim().length === 0 && !emptyFinalAnswerRetryDone) {
+            fullText = fullTextBeforeTurn;
+            const retryPrompt = toolExecutionCount > 0
+              ? "Tool use is complete. Do not call tools or emit <tool_call> blocks. Write the final visible answer now using the tool results already provided. If the requested app or file is not present, say that plainly. Do not emit hidden reasoning tags."
+              : "Your previous response was empty. Write a final answer now. Do not call tools or emit <tool_call> blocks. If you have no specific result to report, tell the user what you found or why you couldn't complete the request.";
+            currentPrompt = [currentPrompt, retryPrompt].filter(Boolean).join("\n\n");
+            emptyFinalAnswerRetryDone = true;
+            forceFinalAnswerOnly = true;
+            useTextToolProtocol = false;
+            prevToolCallCount = 0;
+            console.warn(`[Jarvis] Empty response retry session=${sessionId} after ${toolExecutionCount} tool execution(s)`);
+            continue;
           }
+
+          if (resultText.trim().length === 0) {
+            // Both the initial attempt and the retry returned empty — surface
+            // a fallback so the user sees something instead of a blank bubble.
+            resultText = toolExecutionCount > 0
+              ? "I completed tool inspection, but the model returned no visible final answer after a final-answer-only retry. The streamed tool results above are preserved for review."
+              : "The model returned no content. This can happen due to transient model issues, provider timeouts, or empty completions on the free tier. Please try sending your message again.";
+          }
+
           if (sessionCostInfo) {
             logOpenRouterCost(sessionCostInfo);
             await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "cost_info", ...sessionCostInfo, session_id: sessionId })}\n\n`));

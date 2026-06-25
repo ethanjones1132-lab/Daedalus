@@ -466,7 +466,7 @@ impl SseRelay {
                             // emitting any chunk. Synthesize a fallback token so the
                             // chat bubble isn't blank. Keeps the user informed instead
                             // of staring at a streaming cursor that disappeared.
-                            token = Some("⚠ Synthesizer returned no output.".to_string());
+                            token = Some("⚠ The model returned no content. This can happen due to transient model issues. Try your request again.".to_string());
                         }
                     } else if evt
                         .get("is_error")
@@ -478,13 +478,13 @@ impl SseRelay {
                         error = Some(
                             evt.get("subtype")
                                 .and_then(|s| s.as_str())
-                                .unwrap_or("Synthesizer returned no output")
+                                .unwrap_or("Empty model response")
                                 .to_string(),
                         );
                     } else {
                         // No result field and no error — same scenario: a fallback
                         // so the chat bubble isn't blank.
-                        token = Some("⚠ Synthesizer returned no output.".to_string());
+                        token = Some("⚠ The model returned no content. This can happen due to transient model issues. Try your request again.".to_string());
                     }
                 }
                 SseFrameOutcome::ResultThenDone { token, error }
