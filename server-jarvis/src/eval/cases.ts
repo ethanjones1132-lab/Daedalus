@@ -304,16 +304,20 @@ export const COORDINATOR_CASES: CoordinatorCase[] = [
   },
   {
     // Unparseable output → resilient default route (NOT a thrown error), so a
-    // misbehaving coordinator model can never kill the turn.
+    // misbehaving coordinator model can never kill the turn. The default
+    // route goes straight to the synthesizer (no planner/executor) per the
+    // 2026-06-26 live diagnosis: the planner/executor stages were the ones
+    // also failing on the fallback path, and routing through them leaked
+    // internal planner task text into the user-visible stream.
     id: "coordinator/invalid-json-defaults",
     kind: "coordinator",
     request: "add unit tests",
     sessionId: "eval-coord-bad-json",
     modelOutput: "I cannot produce JSON for this request.",
-    expect: { task_type: "general", topology: "linear", executablePipeline: ["planner", "executor", "synthesizer"] },
+    expect: { task_type: "general", topology: "linear", executablePipeline: ["synthesizer"] },
   },
   {
-    // Invalid task_type → same default-route recovery.
+    // Invalid task_type → same default-route recovery (synthesizer-only).
     id: "coordinator/invalid-task-type-defaults",
     kind: "coordinator",
     request: "summarize the codebase",
@@ -325,7 +329,7 @@ export const COORDINATOR_CASES: CoordinatorCase[] = [
       context: { needs_workspace_inspection: false, needs_memory: false, estimated_complexity: "low" },
       coordinator_rationale: "eval fixture",
     }),
-    expect: { task_type: "general", topology: "linear", executablePipeline: ["planner", "executor", "synthesizer"] },
+    expect: { task_type: "general", topology: "linear", executablePipeline: ["synthesizer"] },
   },
   {
     id: "coordinator/complexity-low-parsed",

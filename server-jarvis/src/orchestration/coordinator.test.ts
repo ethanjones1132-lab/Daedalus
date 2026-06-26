@@ -40,14 +40,18 @@ describe("Coordinator", () => {
   test("falls back to a safe default route when coordinator output is unparseable", async () => {
     // A coordinator model that returns no JSON (e.g. a reasoning model that
     // emits only <think> and leaves content empty) must NOT kill the turn.
-    // The route falls back to a default linear pipeline so the turn still
-    // produces a streamed answer.
+    // The route falls back to a *synthesizer-only* pipeline so the turn still
+    // produces a streamed answer without dragging the user through the noisy
+    // planner/executor stages that the live 2026-06-26 diagnosis showed were
+    // also misbehaving on the fallback path.
     const coordinator = new Coordinator(async () => ({ content: "not json" }));
 
     const decision = await coordinator.route("hello", { sessionId: "session-2" });
     expect(decision.task_type).toBe("general");
     expect(decision.topology).toBe("linear");
-    expect(decision.pipeline).toContain("synthesizer");
+    // Synthesizer-only fallback — no planner, no executor.
+    expect(decision.pipeline).toEqual(["synthesizer"]);
+    expect(decision.coordinator_rationale).toContain("unparseable");
   });
 
   test("propagates a genuine transport failure (callModel throws → caller surfaces an error)", async () => {

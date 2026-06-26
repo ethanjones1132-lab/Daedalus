@@ -125,20 +125,39 @@ export class Coordinator {
 
   /**
    * Safe default route when the coordinator model output can't be parsed into a
-   * valid decision. A linear planner→executor→synthesizer pipeline handles the
-   * broadest range of requests and always ends in a streamed synthesizer answer.
+   * valid decision.
+   *
+   * The fallback goes straight to a single `synthesizer` stage. Rationale (from
+   * the 2026-06-26 live diagnosis in `docs/NEXT_AGENT_JARVIS_LIVE_MODEL_DIAGNOSIS_2026-06-26.md`):
+   *   - The coordinator's "I'm broken" signal almost always means the
+   *     planner/executor models are also degrading (the same provider/model
+   *     pool fails to emit usable JSON in 6+ seconds).
+   *   - Routing through `planner → executor → synthesizer` on the fallback path
+   *     would (a) leak internal planner task text into the user-visible
+   *     stream, (b) compound the first-token timeouts we already see in those
+   *     stages, and (c) produce noisier / less reliable answers than a direct
+   *     synthesizer pass.
+   *   - The synthesizer stage is the one guaranteed to emit a streamed answer
+   *     (the user always sees a final bubble), and the routing for that stage
+   *     is already model-pool aware.
+   *
+   * So the safe default is: skip the planning stages we know are misbehaving,
+   * and let the synthesizer produce a best-effort direct answer. The session
+   * history + memory context are still passed through, so a follow-up turn can
+   * re-engage the planner if the user wants something more structured.
    */
   private defaultRoute(): CoordinatorResult {
     return {
       task_type: "general",
-      pipeline: ["planner", "executor", "synthesizer"],
+      pipeline: ["synthesizer"],
       topology: "linear",
       context: {
         needs_workspace_inspection: false,
         needs_memory: true,
         estimated_complexity: "medium",
       },
-      coordinator_rationale: "Default route (coordinator output was unparseable).",
+      coordinator_rationale:
+        "Default route (coordinator output was unparseable): skipping planner/executor and going straight to a streamed synthesizer answer.",
     };
   }
 
