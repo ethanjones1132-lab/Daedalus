@@ -70,6 +70,7 @@ import { Coordinator } from "./orchestration/coordinator";
 import { AgentPool, formatPoolDiversity } from "./orchestration/agent-pool";
 import { PipelineExecutor } from "./orchestration/pipeline";
 import { outcomeCollector, selfTuningProposer, SelfTuningStore } from "./self-tuning/mod";
+import { normalizeStreamedToolCalls } from "./streaming-tool-calls";
 
 // ── Structured Logging Override ──────────────────────────────────────────────
 const originalLog = console.log;
@@ -1527,19 +1528,23 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             await emitTextToken(remaining);
           }
 
-          let parsedToolCalls = activeToolCalls.filter(Boolean).map((tc) => {
-            let parsedArgs = {};
-            try {
-              parsedArgs = JSON.parse(tc.arguments);
-            } catch {
-              parsedArgs = {};
-            }
-            return {
-              id: tc.id || `call_${crypto.randomUUID().slice(0, 8)}`,
-              name: tc.name,
-              arguments: parsedArgs
-            };
-          });
+          // Normalize the stream-assembled tool-call slots into a dispatchable
+          // list. The old code here silently coerced non-JSON `arguments` to
+          // `{}` and emitted a tool call with an undefined `name` whenever the
+          // model streamed arguments chunks but no function.name delta — both
+          // failure modes are real per the 2026-06-26 live diagnosis (Priority
+          // 3: "executor/provider compatibility is unstable and produces
+          // malformed-tool-message failures during fallback"). The
+          // agent-loop path at line 2041 already filters name-less slots; the
+          // orchestrator path now does the same and additionally surfaces a
+          // one-line `[Jarvis]` warning per malformed entry so the operator
+          // can attribute the failure to a specific model output.
+          const normalizeCtx = `model=${poolModel ?? "<unknown>"} provider=${poolProvider ?? "<unknown>"} stage=${stageLabel ?? "<none>"}`;
+          const normalized = normalizeStreamedToolCalls(activeToolCalls);
+          for (const w of normalized.warnings) {
+            console.warn(`[Jarvis] malformed streamed tool_call (${w.kind}) ${normalizeCtx}: ${w.message}`);
+          }
+          let parsedToolCalls = normalized.calls;
 
           if (useTextTools) {
             const extracted = extractTextToolCalls(fullTurnText, callOptions.tools);
