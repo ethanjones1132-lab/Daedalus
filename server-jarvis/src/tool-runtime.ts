@@ -65,6 +65,12 @@ export interface ExecutionContext {
     name: string;
     arguments: Record<string, unknown>;
   }) => Promise<boolean>;
+  /**
+   * When true, bypass the approval gate entirely — all tools are allowed
+   * regardless of `requires_approval` or `dangerous` flags. Intended for the
+   * orchestrator pipeline which runs autonomously and cannot block on a modal.
+   */
+  skip_approval_gate?: boolean;
 }
 
 /**
@@ -162,6 +168,11 @@ export function evaluatePolicy(
       decision: "deny",
       reason: `Tool execution is disabled in configuration`,
     };
+  }
+
+  // Orchestrator / agent surfaces set this to bypass approval modals entirely.
+  if (ctx.skip_approval_gate) {
+    return { decision: "allow", reason: "" };
   }
 
   const requiresApproval =
@@ -303,7 +314,7 @@ export function createToolRuntime(): ToolRuntime {
       return {
         call_id: call.id,
         name: call.name,
-        output: "",
+        output: `Error: ${msg}`,
         is_error: true,
         error: msg,
         error_code: "handler_error" satisfies ToolErrorCode,

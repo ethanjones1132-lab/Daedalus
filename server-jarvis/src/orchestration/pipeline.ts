@@ -4,11 +4,19 @@ import type { ToolRuntime, ExecutionContext } from "../tool-runtime";
 import type { CallModelFn, ChatMessage } from "./router";
 import { outcomeCollector } from "../self-tuning/mod";
 import { countTokens } from "../tokens";
+import type { ConductorBus, ConductorDirective } from "./conductor-bus";
+import type { LiveConductor } from "./conductor";
+import type { StageName } from "./coordinator";
 
 export interface PipelineProgressState {
   stage: "planner" | "executor" | "reviewer" | "rewriter" | "synthesizer";
   status: "running" | "done" | "failed";
   output?: string;
+}
+
+export interface ConductorWiring {
+  bus: ConductorBus;
+  live: LiveConductor;
 }
 
 export type PipelineTopology = "linear" | "speculative_parallel" | "speculative_cascade" | "recursive";
@@ -17,6 +25,7 @@ export interface PipelineExecuteOptions {
   topology?: PipelineTopology;
   maxRecursionDepth?: number;
   onRecursion?: (event: PipelineRecursionEvent) => void | Promise<void>;
+  onDirective?: (directive: ConductorDirective, stage: StageName) => Promise<void> | void;
 }
 
 export interface PipelineRecursionEvent {
@@ -83,7 +92,8 @@ export class PipelineExecutor {
   constructor(
     private callModel: CallModelFn,
     private runtime: ToolRuntime,
-    private ctx: ExecutionContext
+    private ctx: ExecutionContext,
+    private conductor?: ConductorWiring
   ) {}
 
   async execute(
@@ -105,11 +115,110 @@ export class PipelineExecutor {
     let reviewerFeedback = "No review stage executed.";
     let rewriterSummary = "No rewriting stage executed.";
 
+    // Conductor wiring: mutable queue and helpers (no-ops when conductor is absent)
+    const remaining: StageName[] = [...pipeline].filter((s): s is StageName => s !== null && s !== undefined) as StageName[];
+    const pendingInjections = new Map<StageName, string>();
+    let conductorRerouted = false;
+
+    const applyDirective = async (directive: ConductorDirective, completedStage: StageName): Promise<void> => {
+      if (directive.type === "reroute") {
+        remaining.length = 0;
+        remaining.push(...directive.newRemaining);
+        conductorRerouted = true;
+      } else if (directive.type === "inject_context") {
+        pendingInjections.set(directive.forStage, directive.note);
+      } else if (directive.type === "abort_stage") {
+        // Fire the bus-registered AbortController for the named stage.  The
+        // stage must be currently registered (it always is when the conductor
+        // observes an in-flight stage), but resolveAbort no-ops on unknown
+        // stages so a misnamed directive degrades safely.
+        this.conductor?.bus.resolveAbort(directive.stage);
+      }
+      // continue is a no-op (still recorded below for audit completeness —
+      // skipping continue would leave a hole in the audit trail).
+      if (options.onDirective && directive.type !== "continue") {
+        await options.onDirective(directive, completedStage);
+      }
+      // Record to outcomeCollector so the run is replayable. Errors here must
+      // not break the pipeline.
+      try {
+        const baseFields = {
+          id: `dir_${crypto.randomUUID()}`,
+          agent_run_id: agentRunId,
+          stage: completedStage,
+          directive_type: directive.type,
+          reason: undefined as string | undefined,
+          new_remaining_json: undefined as string | undefined,
+          inject_note: undefined as string | undefined,
+          inject_for_stage: undefined as string | undefined,
+        };
+        if (directive.type === "reroute") {
+          baseFields.reason = directive.reason;
+          baseFields.new_remaining_json = JSON.stringify(directive.newRemaining);
+        } else if (directive.type === "abort_stage") {
+          baseFields.reason = directive.reason;
+        } else if (directive.type === "inject_context") {
+          baseFields.reason = directive.reason;
+          baseFields.inject_note = directive.note;
+          baseFields.inject_for_stage = directive.forStage;
+        }
+        outcomeCollector.recordDirective(baseFields);
+      } catch (e) {
+        console.warn(`[PipelineExecutor] recordDirective failed: ${errText(e)}`);
+      }
+    };
+
+    /**
+     * Register a stage-scoped AbortController on the bus so the conductor can
+     * cancel this stage mid-stream (resolves to `bus.resolveAbort(stage)`).
+     * Returns the signal for the caller to thread into `callOptions.stageAbort`.
+     */
+    const registerStageAbort = (stage: StageName): AbortSignal | undefined => {
+      if (!this.conductor) return undefined;
+      const ctrl = new AbortController();
+      this.conductor.bus.registerAbortHandle(stage, ctrl);
+      return ctrl.signal;
+    };
+
+    /**
+     * Per-stage cumulative text length, used to populate
+     * `stage_token.cumulativeLen` for the throttled bus publish. Reset per turn
+     * (this map is created fresh on every execute() call).
+     */
+    const stageCumulativeLen = new Map<StageName, number>();
+
+    /**
+     * Helper invoked from a stage's onChunk callback. Increments the per-stage
+     * cumulative length and publishes a throttled `stage_token` event to the
+     * bus. Safe to call when no conductor is attached (no-op).
+     */
+    const publishToken = (stage: StageName, chunk: string): void => {
+      if (!this.conductor) return;
+      const next = (stageCumulativeLen.get(stage) ?? 0) + chunk.length;
+      stageCumulativeLen.set(stage, next);
+      this.conductor.bus.publishThrottled({
+        type: "stage_token",
+        stage,
+        textDelta: chunk,
+        cumulativeLen: next,
+      });
+    };
+
+    const safeAfterStage = async (stage: StageName, outcome: "completed" | "failed", output: string): Promise<ConductorDirective> => {
+      if (!this.conductor) return { type: "continue" };
+      try {
+        return await this.conductor.live.afterStage(stage, outcome, output, [...remaining]);
+      } catch {
+        return { type: "continue" };
+      }
+    };
+
     // 1. Planner Stage
     if (pipeline.includes("planner")) {
       onStateChange({ stage: "planner", status: "running" });
       const plannerPrompt = loadPrompt("modes/planner.md");
       const startTime = Date.now();
+      this.conductor?.bus.publish({ type: "stage_started", stage: "planner", model: "", runId: agentRunId });
       try {
         const resp = await this.callModel([
           { role: "system", content: plannerPrompt },
@@ -119,12 +228,16 @@ export class PipelineExecutor {
           max_tokens: BUILTIN_MODES.planner.max_tokens,
           stream: true,
           stageLabel: "planner",
+          stageAbort: registerStageAbort("planner"),
           onChunk: (chunk) => {
             onStateChange({ stage: "planner", status: "running", output: chunk });
+            publishToken("planner", chunk);
           }
         });
         plan = resp.content;
+        const plannerDurationMs = Date.now() - startTime;
         onStateChange({ stage: "planner", status: "done", output: plan });
+        this.conductor?.bus.publish({ type: "stage_completed", stage: "planner", output: plan, tokens: countTokens(plan), durationMs: plannerDurationMs });
 
         outcomeCollector.recordStageRun({
           id: `stage_${crypto.randomUUID()}`,
@@ -134,13 +247,18 @@ export class PipelineExecutor {
           input_tokens: Math.round((plannerPrompt.length + request.length) / 4),
           output_tokens: countTokens(plan),
           tool_calls_json: "[]",
-          duration_ms: Date.now() - startTime,
+          duration_ms: plannerDurationMs,
           was_successful: 1,
           had_error: 0,
         });
+
+        const plannerDirective = await safeAfterStage("planner", "completed", plan);
+        await applyDirective(plannerDirective, "planner");
       } catch (e: any) {
+        const plannerDurationMs = Date.now() - startTime;
         onStateChange({ stage: "planner", status: "failed", output: errText(e) });
         plan = `Failed to generate plan: ${errText(e)}`;
+        this.conductor?.bus.publish({ type: "stage_failed", stage: "planner", error: errText(e) });
 
         outcomeCollector.recordStageRun({
           id: `stage_${crypto.randomUUID()}`,
@@ -148,16 +266,19 @@ export class PipelineExecutor {
           mode_id: "planner",
           turn_number: 1,
           tool_calls_json: "[]",
-          duration_ms: Date.now() - startTime,
+          duration_ms: plannerDurationMs,
           was_successful: 0,
           had_error: 1,
           error_message: errText(e),
         });
+
+        const plannerFailDirective = await safeAfterStage("planner", "failed", errText(e));
+        await applyDirective(plannerFailDirective, "planner");
       }
     }
 
     // 2. Executor Stage
-    if (pipeline.includes("executor")) {
+    if (pipeline.includes("executor") && (!conductorRerouted || remaining.includes("executor"))) {
       onStateChange({ stage: "executor", status: "running" });
       const executorPrompt = loadPrompt("modes/executor.md");
       const executorMessages: ChatMessage[] = [
@@ -165,10 +286,20 @@ export class PipelineExecutor {
         { role: "user", content: `User Request: ${request}\n\nPlan:\n${plan}` }
       ];
 
+      // Apply any injected context from conductor
+      const executorInjection = pendingInjections.get("executor");
+      if (executorInjection) {
+        executorMessages[1] = { ...executorMessages[1], content: executorMessages[1].content + "\n\nAdditional context:\n" + executorInjection };
+        pendingInjections.delete("executor");
+      }
+
       let turnCount = 0;
       let executorDone = false;
       const maxTurns = BUILTIN_MODES.executor.max_turns;
       let executorTurn = 0;
+      const executorStartTime = Date.now();
+
+      this.conductor?.bus.publish({ type: "stage_started", stage: "executor", model: "", runId: agentRunId });
 
       try {
         while (!executorDone && turnCount < maxTurns) {
@@ -184,8 +315,10 @@ export class PipelineExecutor {
               tools: getToolsForMode("executor", this.runtime.listTools()),
               stream: true,
               stageLabel: "executor",
+              stageAbort: registerStageAbort("executor"),
               onChunk: (chunk) => {
                 onStateChange({ stage: "executor", status: "running", output: chunk });
+                publishToken("executor", chunk);
               }
             });
 
@@ -197,7 +330,10 @@ export class PipelineExecutor {
 
             if (response.tool_calls && response.tool_calls.length > 0) {
               for (const tc of response.tool_calls) {
+                this.conductor?.bus.publish({ type: "tool_call_started", stage: "executor", name: tc.name, args: tc.arguments ?? {} });
                 const toolResult = await this.runtime.execute(tc, this.ctx);
+                this.conductor?.bus.publish({ type: "tool_result", stage: "executor", name: tc.name, isError: toolResult.is_error, summary: toolResult.output.slice(0, 200) });
+                this.conductor?.live.onToolResult("executor", tc.name, toolResult.is_error, toolResult.output.slice(0, 200));
                 executorMessages.push({
                   role: "tool",
                   tool_call_id: tc.id,
@@ -257,15 +393,25 @@ export class PipelineExecutor {
           .filter(Boolean)
           .join("\n\n");
 
+        const executorDurationMs = Date.now() - executorStartTime;
         onStateChange({ stage: "executor", status: "done", output: executorSummary });
+        this.conductor?.bus.publish({ type: "stage_completed", stage: "executor", output: executorSummary.slice(0, 500), tokens: countTokens(executorSummary), durationMs: executorDurationMs });
+
+        const executorDirective = await safeAfterStage("executor", "completed", executorSummary);
+        await applyDirective(executorDirective, "executor");
       } catch (e: any) {
+        const executorDurationMs = Date.now() - executorStartTime;
         onStateChange({ stage: "executor", status: "failed", output: errText(e) });
         executorSummary = `Executor failed: ${errText(e)}`;
+        this.conductor?.bus.publish({ type: "stage_failed", stage: "executor", error: errText(e) });
+
+        const executorFailDirective = await safeAfterStage("executor", "failed", errText(e));
+        await applyDirective(executorFailDirective, "executor");
       }
     }
 
     // 3. Reviewer & Rewriter Correction Loop
-    if (pipeline.includes("reviewer")) {
+    if (pipeline.includes("reviewer") && (!conductorRerouted || remaining.includes("reviewer"))) {
       const reviewerPrompt = loadPrompt("modes/reviewer.md");
       const rewriterPrompt = loadPrompt("modes/rewriter.md");
       let loopCount = 0;
@@ -276,6 +422,7 @@ export class PipelineExecutor {
         loopCount++;
         onStateChange({ stage: "reviewer", status: "running", output: `\nReview Turn ${loopCount}...\n` });
         const revStartTime = Date.now();
+        this.conductor?.bus.publish({ type: "stage_started", stage: "reviewer", model: "", runId: agentRunId });
 
         try {
           const reviewerResp = await this.callModel([
@@ -289,13 +436,17 @@ export class PipelineExecutor {
             max_tokens: BUILTIN_MODES.reviewer.max_tokens,
             stream: true,
             stageLabel: "reviewer",
+            stageAbort: registerStageAbort("reviewer"),
             onChunk: (chunk) => {
               onStateChange({ stage: "reviewer", status: "running", output: chunk });
+              publishToken("reviewer", chunk);
             }
           });
 
           reviewerFeedback = reviewerResp.content;
+          const revDurationMs = Date.now() - revStartTime;
           onStateChange({ stage: "reviewer", status: "done", output: reviewerFeedback });
+          this.conductor?.bus.publish({ type: "stage_completed", stage: "reviewer", output: reviewerFeedback, tokens: countTokens(reviewerFeedback), durationMs: revDurationMs });
 
           outcomeCollector.recordStageRun({
             id: `stage_${crypto.randomUUID()}`,
@@ -305,10 +456,14 @@ export class PipelineExecutor {
             input_tokens: Math.round((reviewerPrompt.length + request.length + plan.length + executorSummary.length + rewriterSummary.length) / 4),
             output_tokens: countTokens(reviewerFeedback),
             tool_calls_json: "[]",
-            duration_ms: Date.now() - revStartTime,
+            duration_ms: revDurationMs,
             was_successful: 1,
             had_error: 0,
           });
+
+          const reviewerDirective = await safeAfterStage("reviewer", "completed", reviewerFeedback);
+          await applyDirective(reviewerDirective, "reviewer");
+          if (conductorRerouted) break; // conductor issued a reroute — exit reviewer loop early
 
           hasPendingIssues = this.hasIssues(reviewerFeedback);
           if (hasPendingIssues) {
@@ -324,6 +479,8 @@ export class PipelineExecutor {
             let rewriterDone = false;
             let rewriterTurn = 0;
             const maxRewriterTurns = BUILTIN_MODES.rewriter.max_turns;
+            const rewriterStartTime = Date.now();
+            this.conductor?.bus.publish({ type: "stage_started", stage: "rewriter", model: "", runId: agentRunId });
 
             while (!rewriterDone && rewriterTurn < maxRewriterTurns) {
               rewriterTurn++;
@@ -337,8 +494,10 @@ export class PipelineExecutor {
                   tools: getToolsForMode("rewriter", this.runtime.listTools()),
                   stream: true,
                   stageLabel: "rewriter",
+                  stageAbort: registerStageAbort("rewriter"),
                   onChunk: (chunk) => {
                     onStateChange({ stage: "rewriter", status: "running", output: chunk });
+                    publishToken("rewriter", chunk);
                   }
                 });
 
@@ -350,7 +509,10 @@ export class PipelineExecutor {
 
                 if (rewriteResp.tool_calls && rewriteResp.tool_calls.length > 0) {
                   for (const tc of rewriteResp.tool_calls) {
+                    this.conductor?.bus.publish({ type: "tool_call_started", stage: "rewriter", name: tc.name, args: tc.arguments ?? {} });
                     const toolResult = await this.runtime.execute(tc, this.ctx);
+                    this.conductor?.bus.publish({ type: "tool_result", stage: "rewriter", name: tc.name, isError: toolResult.is_error, summary: toolResult.output.slice(0, 200) });
+                    this.conductor?.live.onToolResult("rewriter", tc.name, toolResult.is_error, toolResult.output.slice(0, 200));
                     rewriterMessages.push({
                       role: "tool",
                       tool_call_id: tc.id,
@@ -409,11 +571,19 @@ export class PipelineExecutor {
               .filter(Boolean)
               .join("\n\n");
 
+            const rewriterDurationMs = Date.now() - rewriterStartTime;
             onStateChange({ stage: "rewriter", status: "done", output: rewriterSummary });
+            this.conductor?.bus.publish({ type: "stage_completed", stage: "rewriter", output: rewriterSummary.slice(0, 500), tokens: countTokens(rewriterSummary), durationMs: rewriterDurationMs });
+
+            const rewriterDirective = await safeAfterStage("rewriter", "completed", rewriterSummary);
+            await applyDirective(rewriterDirective, "rewriter");
+            if (conductorRerouted) break; // conductor issued a reroute — exit reviewer loop early
           }
         } catch (e: any) {
+          const revDurationMs = Date.now() - revStartTime;
           onStateChange({ stage: "reviewer", status: "failed", output: errText(e) });
           hasPendingIssues = false; // abort review loop on error
+          this.conductor?.bus.publish({ type: "stage_failed", stage: "reviewer", error: errText(e) });
 
           outcomeCollector.recordStageRun({
             id: `stage_${crypto.randomUUID()}`,
@@ -421,11 +591,14 @@ export class PipelineExecutor {
             mode_id: "reviewer",
             turn_number: loopCount,
             tool_calls_json: "[]",
-            duration_ms: Date.now() - revStartTime,
+            duration_ms: revDurationMs,
             was_successful: 0,
             had_error: 1,
             error_message: errText(e),
           });
+
+          const reviewerFailDirective = await safeAfterStage("reviewer", "failed", errText(e));
+          await applyDirective(reviewerFailDirective, "reviewer");
         }
       }
     }
@@ -433,10 +606,11 @@ export class PipelineExecutor {
     // 4. Synthesizer Stage
     let finalAnswer = "";
     let fatalError: string | undefined;
-    if (pipeline.includes("synthesizer")) {
+    if (pipeline.includes("synthesizer") && (!conductorRerouted || remaining.includes("synthesizer"))) {
       onStateChange({ stage: "synthesizer", status: "running" });
       const synthesizerPrompt = loadPrompt("modes/synthesizer.md");
       const synthStartTime = Date.now();
+      this.conductor?.bus.publish({ type: "stage_started", stage: "synthesizer", model: "", runId: agentRunId });
       try {
         const resp = await this.callModel([
           { role: "system", content: synthesizerPrompt },
@@ -450,12 +624,16 @@ export class PipelineExecutor {
           stream: true,
           stageLabel: "synthesizer",
           surfaceAsAnswer: true,
+          stageAbort: registerStageAbort("synthesizer"),
           onChunk: (chunk) => {
             onStateChange({ stage: "synthesizer", status: "running", output: chunk });
+            publishToken("synthesizer", chunk);
           }
         });
         finalAnswer = resp.content;
+        const synthDurationMs = Date.now() - synthStartTime;
         onStateChange({ stage: "synthesizer", status: "done", output: finalAnswer });
+        this.conductor?.bus.publish({ type: "stage_completed", stage: "synthesizer", output: finalAnswer.slice(0, 500), tokens: countTokens(finalAnswer), durationMs: synthDurationMs });
 
         outcomeCollector.recordStageRun({
           id: `stage_${crypto.randomUUID()}`,
@@ -465,17 +643,22 @@ export class PipelineExecutor {
           input_tokens: Math.round((synthesizerPrompt.length + request.length + plan.length + executorSummary.length + reviewerFeedback.length + rewriterSummary.length) / 4),
           output_tokens: countTokens(finalAnswer),
           tool_calls_json: "[]",
-          duration_ms: Date.now() - synthStartTime,
+          duration_ms: synthDurationMs,
           was_successful: 1,
           had_error: 0,
         });
+
+        const synthDirective = await safeAfterStage("synthesizer", "completed", finalAnswer);
+        await applyDirective(synthDirective, "synthesizer");
       } catch (e: any) {
+        const synthDurationMs = Date.now() - synthStartTime;
         onStateChange({ stage: "synthesizer", status: "failed", output: errText(e) });
         // The synthesizer produces the turn's actual answer. If it threw, there
         // is no answer — record the failure so the caller emits an error frame
         // instead of passing "Synthesis failed: …" off as a successful result.
         fatalError = describePipelineError(errText(e));
         finalAnswer = `Synthesis failed: ${errText(e)}`;
+        this.conductor?.bus.publish({ type: "stage_failed", stage: "synthesizer", error: errText(e) });
 
         outcomeCollector.recordStageRun({
           id: `stage_${crypto.randomUUID()}`,
@@ -483,14 +666,18 @@ export class PipelineExecutor {
           mode_id: "synthesizer",
           turn_number: 1,
           tool_calls_json: "[]",
-          duration_ms: Date.now() - synthStartTime,
+          duration_ms: synthDurationMs,
           was_successful: 0,
           had_error: 1,
           error_message: errText(e),
         });
+
+        const synthFailDirective = await safeAfterStage("synthesizer", "failed", errText(e));
+        await applyDirective(synthFailDirective, "synthesizer");
       }
     } else {
       // Fallback: return the last completed phase output.
+      // This covers both: synthesizer not in pipeline, and conductor rerouted past it.
       finalAnswer = plan !== "No planning stage executed." ? plan : "No planning stage executed.";
     }
 
@@ -575,6 +762,7 @@ export class PipelineExecutor {
         surfaceAsAnswer: true,
         onChunk: (chunk) => {
           onStateChange({ stage: "synthesizer", status: "running", output: chunk });
+          publishToken("synthesizer", chunk);
         }
       });
       const finalAnswer = resp.content;
@@ -733,6 +921,7 @@ export class PipelineExecutor {
         surfaceAsAnswer: true,
         onChunk: (chunk) => {
           onStateChange({ stage: "synthesizer", status: "running", output: chunk });
+          publishToken("synthesizer", chunk);
         }
       });
       const finalAnswer = resp.content;

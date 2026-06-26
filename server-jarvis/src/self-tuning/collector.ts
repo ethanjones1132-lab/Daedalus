@@ -1,4 +1,4 @@
-import { SelfTuningStore, type AgentRun, type StageRun } from "./store";
+import { SelfTuningStore, type AgentRun, type StageRun, type ConductorDirectiveRow } from "./store";
 
 export class SessionOutcomeCollector {
   private store: SelfTuningStore;
@@ -21,6 +21,20 @@ export class SessionOutcomeCollector {
 
   recordStageRun(stage: StageRun): void {
     this.store.insertStageRun(stage);
+  }
+
+  /**
+   * Record a conductor directive (reroute / abort / inject / continue) so the
+   * run stays auditable and replayable despite the live conductor's
+   * non-determinism. Safe to call with no agent_run_id (a best-effort empty
+   * id is used); will swallow DB errors and log.
+   */
+  recordDirective(directive: Omit<ConductorDirectiveRow, "created_at">): void {
+    try {
+      this.store.insertConductorDirective(directive as ConductorDirectiveRow);
+    } catch (e) {
+      console.error("[SessionOutcomeCollector] recordDirective failed:", e);
+    }
   }
 
   completeAgentRun(runId: string, finalOutput: string, durationMs: number, toolCallsCount: number, tokenCount: number): void {

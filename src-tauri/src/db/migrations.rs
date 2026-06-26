@@ -471,6 +471,28 @@ fn apply_schema_patches(conn: &Connection) -> Result<(), rusqlite::Error> {
         "improvement_score REAL NOT NULL DEFAULT 0.0",
     )?;
 
+    // v3.2 — Live Conductor: directive audit trail (mirrors the server-jarvis
+    // SelfTuningStore schema in server-jarvis/src/self-tuning/store.ts; the
+    // native process owns the migration so the table is present whether the
+    // Bun server creates its own self-tuning DB or shares this one).
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS conductor_directives (
+            id TEXT PRIMARY KEY,
+            agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+            stage TEXT NOT NULL,
+            directive_type TEXT NOT NULL,
+            reason TEXT,
+            new_remaining_json TEXT,
+            inject_note TEXT,
+            inject_for_stage TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_conductor_directives_agent_run_id
+            ON conductor_directives(agent_run_id);
+        "#,
+    )?;
+
     conn.execute_batch(
         r#"
         CREATE INDEX IF NOT EXISTS idx_memory_status ON memory(status);

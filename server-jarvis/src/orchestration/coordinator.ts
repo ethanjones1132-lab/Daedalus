@@ -1,4 +1,5 @@
 import { loadPrompt } from "./prompt-loader";
+import { extractJson } from "./json";
 
 export type TaskType = "code_review" | "debug" | "refactor" | "general" | "plan" | "research" | "test" | "docs";
 export type Complexity = "low" | "medium" | "high";
@@ -26,6 +27,13 @@ export type CallModelFn = (
     cascadeTier?: "cheap" | "strong";
     surfaceAsAnswer?: boolean;
     suppressActivity?: boolean;
+    /**
+     * Optional stage-scoped AbortSignal from the live conductor. When provided,
+     * the callModel implementation MUST wire it into the underlying stream
+     * reader (in addition to any request-level `streamAbort`), so the conductor
+     * can cancel a single stage's stream without killing the whole request.
+     */
+    stageAbort?: AbortSignal;
   }
 ) => Promise<{ content: string; tool_calls?: any[] }>;
 
@@ -108,7 +116,7 @@ export class Coordinator {
     // coordinator-level complement to the cross-provider model fallback.
     let decision: CoordinatorResult;
     try {
-      const parsed = this.extractJson<unknown>(response.content);
+      const parsed = extractJson<unknown>(response.content);
       decision = this.validate(parsed);
     } catch (e) {
       console.warn(`[Coordinator] Routing parse failed, using default route: ${e instanceof Error ? e.message : String(e)}`);
@@ -125,20 +133,21 @@ export class Coordinator {
 
   /**
    * Safe default route when the coordinator model output can't be parsed into a
-   * valid decision. A linear planner→executor→synthesizer pipeline handles the
-   * broadest range of requests and always ends in a streamed synthesizer answer.
+   * valid decision. A direct synthesizer route avoids sending the user through
+   * the slower planner/executor stages when the coordinator itself is already
+   * degraded, while still guaranteeing a streamed answer.
    */
   private defaultRoute(): CoordinatorResult {
     return {
       task_type: "general",
-      pipeline: ["planner", "executor", "synthesizer"],
+      pipeline: ["synthesizer"],
       topology: "linear",
       context: {
         needs_workspace_inspection: false,
         needs_memory: true,
-        estimated_complexity: "medium",
+        estimated_complexity: "low",
       },
-      coordinator_rationale: "Default route (coordinator output was unparseable).",
+      coordinator_rationale: "Default direct-answer route (coordinator output was unparseable).",
     };
   }
 
@@ -222,19 +231,4 @@ export class Coordinator {
     throw new CoordinatorError(`Coordinator returned invalid stage decision: ${step}`);
   }
 
-  private extractJson<T>(text: string): T {
-    try {
-      return JSON.parse(text.trim()) as T;
-    } catch {}
-
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
-    if (start !== -1 && end !== -1 && end > start) {
-      const jsonStr = text.substring(start, end + 1);
-      try {
-        return JSON.parse(jsonStr) as T;
-      } catch {}
-    }
-    throw new CoordinatorError(`Failed to parse JSON from coordinator output: ${text}`);
-  }
 }

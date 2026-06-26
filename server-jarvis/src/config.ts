@@ -138,6 +138,14 @@ export interface OrchestratorConfig {
   enabled: boolean;
   agents: OrchestratorAgent[];
   max_recursion_depth: number;
+  conductor: ConductorConfig;
+}
+
+export interface ConductorConfig {
+  enabled: boolean;
+  supervision_timeout_ms: number;
+  max_tool_errors_before_reroute: number;
+  supervise_low_complexity: boolean;
 }
 
 export interface JarvisConfig {
@@ -301,6 +309,12 @@ export function defaultConfig(): JarvisConfig {
       enabled: true,
       agents: DEFAULT_ORCHESTRATOR_AGENTS,
       max_recursion_depth: 2,
+      conductor: {
+        enabled: true,
+        supervision_timeout_ms: 8000,
+        max_tool_errors_before_reroute: 2,
+        supervise_low_complexity: false,
+      },
     },
     system_prompt: `You are Jarvis, a local AI coding assistant running on Qwen 3.5 9B in WSL2.
 Workspace: \`/home/ethan/.openclaw/agents/coderclaw/workspace/home-base\`.
