@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { AgentPool, DEFAULT_ORCHESTRATOR_AGENTS, formatPoolDiversity, type OrchestratorAgent } from "./agent-pool";
+import {
+  AgentPool,
+  DEFAULT_ORCHESTRATOR_AGENTS,
+  firstTokenTimeoutFor,
+  formatPoolDiversity,
+  type OrchestratorAgent,
+} from "./agent-pool";
 
 const agents: OrchestratorAgent[] = [
   {
@@ -171,5 +177,101 @@ describe("AgentPool", () => {
       expect(def, `stage ${stage} has a default agent`).toBeDefined();
       expect(def?.model_id, `stage ${stage} must not default to openrouter/free`).not.toBe("openrouter/free");
     }
+  });
+
+  test("planner + synthesizer defaults carry the 2026-06-26 first-token override", () => {
+    // The live diagnosis named `nemotron-3-ultra-free` as a model that
+    // hits the 30s first-token watchdog right as valid content begins
+    // streaming. The override is the seam that prevents the chain from
+    // aborting that turn.
+    const planner = DEFAULT_ORCHESTRATOR_AGENTS.find((a) => a.default_for.includes("planner"));
+    const synth = DEFAULT_ORCHESTRATOR_AGENTS.find((a) => a.default_for.includes("synthesizer"));
+    expect(planner?.first_token_timeout_ms).toBe(55_000);
+    expect(synth?.first_token_timeout_ms).toBe(55_000);
+  });
+});
+
+describe("firstTokenTimeoutFor", () => {
+  const poolAgents: OrchestratorAgent[] = [
+    {
+      id: "swift",
+      provider: "openrouter",
+      model_id: "openrouter/free",
+      capabilities: { code: 0.5, reasoning: 0.5, speed: 0.95, cost: 1, json_reliability: 0.7 },
+      default_for: [],
+      enabled: true,
+    },
+    {
+      id: "nemotron",
+      provider: "opencode_zen",
+      model_id: "nemotron-3-ultra-free",
+      capabilities: { code: 0.8, reasoning: 0.95, speed: 0.55, cost: 1, json_reliability: 0.88 },
+      default_for: ["planner", "synthesizer"],
+      first_token_timeout_ms: 55_000,
+      enabled: true,
+    },
+    {
+      id: "nemotron-disabled",
+      provider: "openrouter",
+      model_id: "nvidia/nemotron-3-ultra-550b-a55b:free",
+      capabilities: { code: 0.78, reasoning: 0.96, speed: 0.42, cost: 1, json_reliability: 0.88 },
+      default_for: [],
+      first_token_timeout_ms: 55_000,
+      enabled: false,
+    },
+  ];
+  const pool = new AgentPool(poolAgents);
+
+  test("returns the per-model override when the model is in the pool and enabled", () => {
+    expect(firstTokenTimeoutFor(pool, "nemotron-3-ultra-free", 30_000)).toBe(55_000);
+  });
+
+  test("returns baseMs when the model is in the pool but has no override", () => {
+    expect(firstTokenTimeoutFor(pool, "openrouter/free", 30_000)).toBe(30_000);
+  });
+
+  test("returns baseMs when the model is not in the pool at all", () => {
+    expect(firstTokenTimeoutFor(pool, "some/unknown-model:free", 30_000)).toBe(30_000);
+  });
+
+  test("returns baseMs when the pool reference is missing", () => {
+    expect(firstTokenTimeoutFor(undefined, "nemotron-3-ultra-free", 30_000)).toBe(30_000);
+  });
+
+  test("returns baseMs when the modelId is missing", () => {
+    expect(firstTokenTimeoutFor(pool, undefined, 30_000)).toBe(30_000);
+  });
+
+  test("ignores overrides on disabled agents — fall back to the global default", () => {
+    // The override is on the agent record, but the agent is `enabled: false`.
+    // The watchdog should not silently trust an override for a model the pool
+    // considers off; fall back to the global base.
+    expect(firstTokenTimeoutFor(pool, "nvidia/nemotron-3-ultra-550b-a55b:free", 30_000)).toBe(30_000);
+  });
+
+  test("clamps the override to the supplied cap", () => {
+    const cap = 40_000;
+    expect(firstTokenTimeoutFor(pool, "nemotron-3-ultra-free", 30_000, cap)).toBe(40_000);
+  });
+
+  test("clamps the override to the 1s floor (no zero/negative values)", () => {
+    const agentsZero: OrchestratorAgent[] = [{
+      id: "evil",
+      provider: "openrouter",
+      model_id: "evil/model",
+      capabilities: { code: 0.5, reasoning: 0.5, speed: 0.5, cost: 0.5, json_reliability: 0.5 },
+      default_for: [],
+      first_token_timeout_ms: 0,
+      enabled: true,
+    }];
+    const p = new AgentPool(agentsZero);
+    expect(firstTokenTimeoutFor(p, "evil/model", 30_000)).toBe(1_000);
+  });
+
+  test("returns baseMs clamped to 1s floor when baseMs itself is bogus", () => {
+    // Defensive: a misconfigured `baseMs` (NaN, negative) must not produce
+    // a zero/negative timeout, which would mean "abort immediately."
+    expect(firstTokenTimeoutFor(pool, "openrouter/free", Number.NaN)).toBe(30_000);
+    expect(firstTokenTimeoutFor(pool, "openrouter/free", -5)).toBe(1_000);
   });
 });

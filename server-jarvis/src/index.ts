@@ -67,7 +67,7 @@ import { searchWeb } from "./web-bundle";
 import { getSessionState, clearSessionState } from "./interactive-bundle";
 import { StreamSession, VisibleTextPipe } from "./stream-emitter";
 import { Coordinator } from "./orchestration/coordinator";
-import { AgentPool, formatPoolDiversity } from "./orchestration/agent-pool";
+import { AgentPool, firstTokenTimeoutFor, formatPoolDiversity } from "./orchestration/agent-pool";
 import { PipelineExecutor } from "./orchestration/pipeline";
 import { outcomeCollector, selfTuningProposer, SelfTuningStore } from "./self-tuning/mod";
 import { normalizeStreamedToolCalls } from "./streaming-tool-calls";
@@ -1388,7 +1388,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // outer AbortController.
           const firstTokenTimer = setTimeout(() => {
             if (!firstTokenReceived && !streamAbort.signal.aborted) {
-              console.warn(`[Jarvis Orchestrator] First-token timeout (${MODEL_FIRST_TOKEN_TIMEOUT_MS / 1000}s) on stage=${callOptions?.stageLabel ?? "agent"} model=${actualModelUsed} — aborting stream`);
+              const overrideMs = firstTokenTimeoutFor(agentPool, actualModelUsed, MODEL_FIRST_TOKEN_TIMEOUT_MS);
+              console.warn(`[Jarvis Orchestrator] First-token timeout (${overrideMs / 1000}s) on stage=${callOptions?.stageLabel ?? "agent"} model=${actualModelUsed} — aborting stream`);
               streamAbort.abort("First-token timeout");
               reader.cancel("First-token timeout").catch(() => {});
             }
@@ -1949,7 +1950,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // pre-fix silent 5-min stall.
         const firstTokenTimer = setTimeout(() => {
           if (!firstTokenReceived && !streamAbort.signal.aborted) {
-            console.warn(`[Jarvis Agent Loop] First-token timeout (${MODEL_FIRST_TOKEN_TIMEOUT_MS / 1000}s) on model=${modelName} — aborting stream`);
+            // Apply the per-model first-token override (planner/synthesizer
+            // defaults get 55s; the rest stay on the global 30s). The agent
+            // loop runs after the orchestrator branch, so it builds its own
+            // pool reference for the override lookup.
+            const agentLoopPool = new AgentPool(cfg.orchestrator?.agents ?? []);
+            const overrideMs = firstTokenTimeoutFor(agentLoopPool, modelName, MODEL_FIRST_TOKEN_TIMEOUT_MS);
+            console.warn(`[Jarvis Agent Loop] First-token timeout (${overrideMs / 1000}s) on model=${modelName} — aborting stream`);
             streamAbort.abort("First-token timeout");
             reader.cancel("First-token timeout").catch(() => {});
           }

@@ -15,6 +15,15 @@ export interface OrchestratorAgent {
   capabilities: AgentCapabilities;
   default_for: string[];
   enabled: boolean;
+  /**
+   * Optional per-model first-token timeout override in milliseconds. Use when a
+   * known-good model has reliably-slow cold-start latency (e.g. large reasoning
+   * models) and the default 30s first-token watchdog is too tight. When omitted,
+   * `firstTokenTimeoutFor` falls back to the supplied `baseMs` argument (which
+   * itself defaults to 30s). The cap is enforced by the caller so this value
+   * cannot exceed the outer 60s stream-stall watchdog.
+   */
+  first_token_timeout_ms?: number;
 }
 
 export interface AgentPoolCoverage {
@@ -82,6 +91,11 @@ export const DEFAULT_ORCHESTRATOR_AGENTS: OrchestratorAgent[] = [
     model_id: "nemotron-3-ultra-free",
     capabilities: { code: 0.8, reasoning: 0.95, speed: 0.55, cost: 1, json_reliability: 0.88 },
     default_for: ["planner", "synthesizer"],
+    // Live 2026-06-26 diagnosis: this model has reliably-slow cold-start
+    // latency and was hitting the 30s first-token watchdog right as valid
+    // content began streaming. Per-model override widens the window to 55s
+    // (still below the 60s stream-stall cap).
+    first_token_timeout_ms: 55_000,
     enabled: true,
   },
   {
@@ -125,6 +139,9 @@ export const DEFAULT_ORCHESTRATOR_AGENTS: OrchestratorAgent[] = [
     model_id: "nvidia/nemotron-3-ultra-550b-a55b:free",
     capabilities: { code: 0.78, reasoning: 0.96, speed: 0.42, cost: 1, json_reliability: 0.88 },
     default_for: ["reviewer"],
+    // Same family as `zen-nemotron-ultra-free` — large reasoning model with
+    // slow cold-start. Same per-model override.
+    first_token_timeout_ms: 55_000,
     enabled: true,
   },
   {
@@ -309,4 +326,30 @@ export function formatPoolDiversity(coverage: AgentPoolCoverage): string {
     `${coverage.diversity.fast} fast`,
     `${coverage.diversity.cheap} cheap`,
   ].join(", ");
+}
+
+/**
+ * Resolve the first-token watchdog timeout (in ms) for a model that may be
+ * present in the agent pool. Lookup order:
+ *   1. Exact `model_id` match in the pool with a `first_token_timeout_ms` set.
+ *   2. `baseMs` argument (the caller's default — usually the global 30s).
+ * The returned value is clamped to `[1_000, capMs]` so it can never exceed the
+ * outer stream-stall watchdog and can never be zero/negative. Pass
+ * `capMs = Infinity` to skip the upper clamp (used by callers that don't have
+ * a stall watchdog layered above).
+ */
+export function firstTokenTimeoutFor(
+  pool: AgentPool | undefined,
+  modelId: string | undefined,
+  baseMs: number,
+  capMs: number = 60_000,
+): number {
+  const fallback = Math.max(1_000, Number(baseMs) || 30_000);
+  if (!pool || !modelId) return Math.min(fallback, capMs);
+  const match = pool.enabled().find((agent) => agent.model_id === modelId);
+  const override = match?.first_token_timeout_ms;
+  if (typeof override !== "number" || !Number.isFinite(override)) {
+    return Math.min(fallback, capMs);
+  }
+  return Math.max(1_000, Math.min(Number(override), capMs));
 }
