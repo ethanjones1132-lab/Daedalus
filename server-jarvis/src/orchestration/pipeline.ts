@@ -4,6 +4,7 @@ import type { ToolRuntime, ExecutionContext } from "../tool-runtime";
 import type { CallModelFn, ChatMessage } from "./router";
 import { outcomeCollector } from "../self-tuning/mod";
 import { countTokens } from "../tokens";
+import { buildSynthesizerContext } from "./synth-context";
 
 export interface PipelineProgressState {
   stage: "planner" | "executor" | "reviewer" | "rewriter" | "synthesizer";
@@ -442,7 +443,7 @@ export class PipelineExecutor {
           { role: "system", content: synthesizerPrompt },
           {
             role: "user",
-            content: `User Request: ${request}\n\nOriginal Plan:\n${plan}\n\nExecutor Activity:\n${executorSummary}\n\nReviewer Feedback:\n${reviewerFeedback}\n\nRewriter Activity:\n${rewriterSummary}`
+            content: buildSynthesizerContext(request, { plan, executorSummary, reviewerFeedback, rewriterSummary })
           }
         ] as ChatMessage[], {
           temperature: BUILTIN_MODES.synthesizer.temperature,
@@ -565,7 +566,7 @@ export class PipelineExecutor {
         { role: "system", content: synthesizerPrompt },
         {
           role: "user",
-          content: `User Request: ${request}\n\nOriginal Plan:\n${plan}\n\nExecutor Activity:\n${executorSummary}\n\nReviewer Feedback:\n${reviewerFeedback}\n\nRewriter Activity:\n${rewriterSummary}`
+          content: buildSynthesizerContext(request, { plan, executorSummary, reviewerFeedback, rewriterSummary })
         }
       ] as ChatMessage[], {
         temperature: BUILTIN_MODES.synthesizer.temperature,
@@ -723,7 +724,10 @@ export class PipelineExecutor {
         { role: "system", content: synthesizerPrompt },
         {
           role: "user",
-          content: `User Request: ${request}\n\nOriginal Plan:\nSpeculative cascade: cheap executor first, strong executor only on uncertainty.\n\nExecutor Activity:\n${executorSummary}\n\nReviewer Feedback:\nNo review stage executed.\n\nRewriter Activity:\nNo rewriting stage executed.`
+          content: buildSynthesizerContext(request, {
+            plan: "Speculative cascade: cheap executor first, strong executor only on uncertainty.",
+            executorSummary,
+          })
         }
       ] as ChatMessage[], {
         temperature: BUILTIN_MODES.synthesizer.temperature,
