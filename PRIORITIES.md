@@ -1,6 +1,6 @@
 # Jarvis / home-base — Priority Roadmap
 
-Last updated: 2026-06-27 (Overnight pass — committed uncommitted orchestrator hardening: `sanitizeToolMessages` to fix 400 cascade on multi-turn executor conversations; `suppressActivity:false` on all pipeline stages; coordinator prompt restructured for strict JSON-only output; committed orchestrator quality refinement plan doc; pushed to master. 279 bun tests, 59 cargo tests, 33/33 eval cases — all pass.)
+Last updated: 2026-06-27 (Maintenance pass — verified 6/6 verify gate. Recent orchestrator hardening commits (ec3ba5c sanitize tool messages, 2dc1ec0 PRIORITIES doc) had left `src-tauri/target/debug/home-base.exe` older than a Rust source file, so the verify.sh staleness check flagged it. Rebuilt with `cargo tauri build --debug --no-bundle` (46s) — binary now fresh, full 6/6 verify gate green. 279 bun tests, 59 cargo tests, 33/33 eval cases — all pass. Working tree clean on `master`.)
 Working copy: `C:\Projects\home-base-recovered`
 
 Quick status: **Phase 1 done · Phase 2 done · Phase 3 done · Orchestrator v2 substrate live**
