@@ -120,6 +120,7 @@ export class PipelineExecutor {
           max_tokens: BUILTIN_MODES.planner.max_tokens,
           stream: true,
           stageLabel: "planner",
+          suppressActivity: false,
           onChunk: (chunk) => {
             onStateChange({ stage: "planner", status: "running", output: chunk });
           }
@@ -185,6 +186,7 @@ export class PipelineExecutor {
               tools: getToolsForMode("executor", this.runtime.listTools()),
               stream: true,
               stageLabel: "executor",
+              suppressActivity: false,
               onChunk: (chunk) => {
                 onStateChange({ stage: "executor", status: "running", output: chunk });
               }
@@ -290,6 +292,7 @@ export class PipelineExecutor {
             max_tokens: BUILTIN_MODES.reviewer.max_tokens,
             stream: true,
             stageLabel: "reviewer",
+            suppressActivity: false,
             onChunk: (chunk) => {
               onStateChange({ stage: "reviewer", status: "running", output: chunk });
             }
@@ -338,6 +341,7 @@ export class PipelineExecutor {
                   tools: getToolsForMode("rewriter", this.runtime.listTools()),
                   stream: true,
                   stageLabel: "rewriter",
+                  suppressActivity: false,
                   onChunk: (chunk) => {
                     onStateChange({ stage: "rewriter", status: "running", output: chunk });
                   }

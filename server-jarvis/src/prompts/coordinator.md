@@ -29,20 +29,6 @@ Future topologies may be selected only when they are explicitly supported by the
 runtime. Return "linear" for file edits, destructive actions, or any turn where
 recursion could repeat side effects.
 
-Return ONLY valid JSON. No markdown, no comments, no explanation outside JSON.
-Use this exact shape:
-{
-  "task_type": "code_review|debug|refactor|general|plan|research|test|docs",
-  "pipeline": ["planner", "executor", "reviewer", "synthesizer"],
-  "topology": "linear",
-  "context": {
-    "needs_workspace_inspection": false,
-    "needs_memory": true,
-    "estimated_complexity": "low|medium|high"
-  },
-  "coordinator_rationale": "brief reason for the route"
-}
-
 Rules:
 - Simple questions can skip planner, executor, and reviewer: [null, null, null, "synthesizer"].
 - Plan-only requests should use ["planner", null, null, "synthesizer"].
@@ -57,3 +43,22 @@ Rules:
 - If the last outcome reports executor failure, prefer ["re-enter:planner", "executor", "reviewer", "synthesizer"].
 - Never invent tool results. If workspace inspection is needed, set needs_workspace_inspection to true.
 - Do not silently fall back. If you cannot decide, still return valid JSON with a clear coordinator_rationale.
+
+IMPORTANT — OUTPUT FORMAT:
+You MUST respond with a single valid JSON object. No text before it. No text after it. No markdown code blocks. No backticks. No explanation. No "Here is the JSON:" preamble. No conversational filler. ONLY the raw JSON object.
+
+Use this exact shape:
+
+{"task_type": "general", "pipeline": ["planner", "executor", "reviewer", "synthesizer"], "topology": "linear", "context": {"needs_workspace_inspection": false, "needs_memory": true, "estimated_complexity": "low"}, "coordinator_rationale": "brief reason for the route"}
+
+Note: no whitespace padding around values, no trailing commas, no comments. Just a single line of valid JSON.
+
+task_type options: "code_review", "debug", "refactor", "general", "plan", "research", "test", "docs"
+topology options: "linear", "speculative_parallel", "speculative_cascade", "recursive"
+estimated_complexity options: "low", "medium", "high"
+needs_workspace_inspection: true/false
+needs_memory: true/false
+
+Do NOT output any markdown code fences, slashes, or line breaks.
+Do NOT output any text besides the JSON object itself.
+Your entire response will be parsed as JSON. If it is not valid JSON, the pipeline defaults to a synthesizer-only route with no tool access.

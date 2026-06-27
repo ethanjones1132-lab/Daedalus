@@ -661,11 +661,54 @@ async function resolveFallbackCascade(cfg: JarvisConfig, options: FallbackResolv
 }
 
 /**
+ * Strip or convert tool-related fields from messages for providers that do NOT
+ * support native tool calling (OpenCode Zen/Go, or an OpenRouter free model
+ * that uses the text tool protocol).
+ *
+ * When the orchestrator's executor stage runs multiple turns, the conversation
+ * accumulates `role: "tool"` messages and assistant messages with `tool_calls`
+ * fields. Non-tool-capable providers reject these with 400 errors like "missing
+ * field `function`" or "missing field `type`", which tank the entire fallback
+ * cascade (observed 2026-06-27: 15 consecutive 400s before landing on
+ * openrouter/free).
+ *
+ * Transformation:
+ *   1. `role: "tool"` → `role: "user"` with a descriptive prefix so the model
+ *      still sees the tool's output in the conversation history.
+ *   2. Strip `tool_calls` from assistant messages — the text protocol embeds
+ *      calls in the text content, so the native field is redundant and harmful
+ *      for text-protocol providers.
+ */
+function sanitizeToolMessages(msgs: Array<any>): Array<any> {
+  if (!Array.isArray(msgs)) return msgs;
+  return msgs.map((msg) => {
+    if (!msg || typeof msg !== "object") return msg;
+    // Convert tool result messages to user role with a context prefix
+    if (msg.role === "tool") {
+      const name = typeof msg.name === "string" ? msg.name : "unknown_tool";
+      const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content ?? "");
+      return { role: "user", content: `[Tool result from ${name}]: ${content}` };
+    }
+    // Strip tool_calls from assistant messages (text protocol was used)
+    if (msg.role === "assistant" && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+      const { tool_calls, ...clean } = msg;
+      return clean;
+    }
+    return msg;
+  });
+}
+
+/**
  * Build the per-attempt request body for a provider. OpenRouter bodies get the
  * full catalog-aware massaging (max_tokens, temperature/top_p gating, native
  * tool support). OpenCode (Zen/Go) are OpenAI-compatible but have no catalog
  * here, so we send a lean body and drop `tools` (those stages use the text
  * tool protocol — see callModel's `useTextTools`).
+ *
+ * CRITICAL: Tool-related message fields are sanitised for providers that do
+ * NOT support native tools. Without this, a multi-turn executor conversation
+ * that accumulated `role: "tool"` and `tool_calls` fields would cause a 400
+ * error on every non-tool-capable model in the fallback cascade.
  */
 async function buildAttemptBody(
   cfg: JarvisConfig,
@@ -679,9 +722,19 @@ async function buildAttemptBody(
       requestedTemperature: requestBody.temperature,
       requestedTopP: requestBody.top_p,
     });
+    // Sanitize tool message fields for OpenRouter models that resolved to
+    // text-tool-protocol (body.tools was already deleted by the config step).
+    if (!body.tools && Array.isArray(body.messages)) {
+      body.messages = sanitizeToolMessages(body.messages);
+    }
   } else {
     delete body.tools;
     delete body.tool_choice;
+    // Always sanitize for non-OpenRouter providers (OpenCode Zen/Go) — they
+    // use the text tool protocol and cannot process native tool message fields.
+    if (Array.isArray(body.messages)) {
+      body.messages = sanitizeToolMessages(body.messages);
+    }
   }
   return body;
 }
