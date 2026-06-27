@@ -57,9 +57,11 @@ export const ORCHESTRATOR_STAGES = [
 // Stage pinning: the OpenCode Zen models lead each stage (most reliable,
 // dedicated keys, no free-router hangs). OpenCode Go and OpenRouter free
 // models form the cross-provider fallback tail so a single provider's rate
-// limit or outage never kills a turn. OpenCode Go `minimax-m3` is omitted on
-// purpose — it speaks the Anthropic `/messages` format, not the OpenAI SSE
-// `/chat/completions` protocol the stream parser expects.
+// limit or outage never kills a turn. OpenCode Go `minimax-m3` IS included (it
+// serves OpenAI-compatible /chat/completions) as a non-default reasoning
+// fallback member; its `<think>` blocks are stripped by buildSynthesizerContext
+// and the chat ReasoningParser. It is never a stage default (would burn budget
+// on reasoning for short JSON like the coordinator needs).
 export const DEFAULT_ORCHESTRATOR_AGENTS: OrchestratorAgent[] = [
   // ── OpenCode Zen (primary, OpenAI-compatible) ───────────────────
   {
@@ -122,6 +124,16 @@ export const DEFAULT_ORCHESTRATOR_AGENTS: OrchestratorAgent[] = [
     model_id: "deepseek-v4-pro",
     capabilities: { code: 0.93, reasoning: 0.9, speed: 0.6, cost: 0.7, json_reliability: 0.85 },
     default_for: ["executor"],
+    enabled: true,
+  },
+  {
+    // MiniMax M3 — strong reasoning, OpenCode Go via /chat/completions. Pure
+    // fallback tail member (default_for: []) — never coordinator (emits <think>).
+    id: "go-minimax-m3",
+    provider: "opencode_go",
+    model_id: "minimax-m3",
+    capabilities: { code: 0.85, reasoning: 0.9, speed: 0.6, cost: 0.7, json_reliability: 0.78 },
+    default_for: [],
     enabled: true,
   },
   // ── OpenRouter (cross-provider fallback tail) ───────────────────

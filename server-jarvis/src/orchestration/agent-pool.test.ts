@@ -132,10 +132,10 @@ describe("AgentPool", () => {
     expect(byModel).toContain("nemotron-3-ultra-free");
     expect(byModel).toContain("north-mini-code-free");
     expect(byModel).toContain("deepseek-v4-flash-free");
-    // OpenCode Go (bare ids, OpenAI-compatible; minimax-m3 omitted — Anthropic format)
+    // OpenCode Go (bare ids, OpenAI-compatible; minimax-m3 included via /chat/completions)
     expect(byModel).toContain("mimo-v2.5");
     expect(byModel).toContain("deepseek-v4-pro");
-    expect(byModel).not.toContain("minimax-m3");
+    expect(byModel).toContain("minimax-m3");
     // OpenRouter (namespaced ids)
     expect(byModel).toContain("openrouter/owl-alpha");
     expect(byModel).toContain("nvidia/nemotron-3-ultra-550b-a55b:free");
