@@ -189,6 +189,28 @@ describe("AgentPool", () => {
     expect(planner?.first_token_timeout_ms).toBe(55_000);
     expect(synth?.first_token_timeout_ms).toBe(55_000);
   });
+
+  test("firstTokenTimeoutFor resolves Nemotron planner + synthesizer to 55_000 via the DEFAULT pool", () => {
+    // Regression guard for the 2026-06-27 first-token watchdog bug. The
+    // orchestrator and agent-loop call sites in `index.ts` used to compute
+    // the per-model override value but pass the global 30_000 constant to
+    // `setTimeout(...)` — so slow cold-starts were still aborted at 30s
+    // despite the override being "in effect". The fix is for each call
+    // site to use `firstTokenTimeoutFor(pool, model, MODEL_FIRST_TOKEN_TIMEOUT_MS)`
+    // as the *delay* itself, not just the log message. This test pins the
+    // resolution so any future regression in the call site (e.g. someone
+    // re-uses the global constant instead of the resolved value) is caught
+    // by the helper's contract.
+    const defaultPool = new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS);
+    const planner = DEFAULT_ORCHESTRATOR_AGENTS.find((a) => a.default_for.includes("planner"));
+    const synth = DEFAULT_ORCHESTRATOR_AGENTS.find((a) => a.default_for.includes("synthesizer"));
+    expect(planner?.model_id).toBe("nemotron-3-ultra-free");
+    expect(synth?.model_id).toBe("nemotron-3-ultra-free");
+    // 55_000 must be the resolved value — not 30_000 — so the call site
+    // genuinely grants the wider window.
+    expect(firstTokenTimeoutFor(defaultPool, planner!.model_id, 30_000)).toBe(55_000);
+    expect(firstTokenTimeoutFor(defaultPool, synth!.model_id, 30_000)).toBe(55_000);
+  });
 });
 
 describe("firstTokenTimeoutFor", () => {

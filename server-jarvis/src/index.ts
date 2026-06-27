@@ -1377,23 +1377,28 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let lastActivity = Date.now();
           let firstTokenReceived = false;
           // Defense-in-depth: in case the request bypassed the
-          // chatCompletionWithFallback path (useFallback=false) OR the
-          // upstream race-based watchdog in chatCompletionWithFallback
-          // missed an edge case, the orchestrator's read loop also
-          // enforces a 30s first-token window. If 30s pass after the
-          // response is opened without any choice.delta.content
-          // chunk, abort the stream. This guarantees the user's
-          // perceived latency never exceeds 30s on a hung model —
-          // before this, the read loop silently waited for the 5-min
-          // outer AbortController.
+          // First-token watchdog (orchestrator). If the response body is open
+          // but no `choice.delta.content` chunk has arrived before the per-model
+          // window expires, abort the stream. Default is 30s; agents with a
+          // `first_token_timeout_ms` override (e.g. Nemotron planner/synthesizer
+          // at 55s) widen the window accordingly. CRITICAL: the override MUST
+          // be applied to the `setTimeout` delay itself — a previous revision
+          // only used the resolved value in the log message, so slow cold-starts
+          // were still aborted at 30s despite the override being "in effect".
+          // `firstTokenTimeoutFor` clamps to [1_000, 60_000] so this watchdog
+          // can never fire after the outer 60s stream-stall watchdog would have.
+          const firstTokenMs = firstTokenTimeoutFor(
+            agentPool,
+            actualModelUsed,
+            MODEL_FIRST_TOKEN_TIMEOUT_MS,
+          );
           const firstTokenTimer = setTimeout(() => {
             if (!firstTokenReceived && !streamAbort.signal.aborted) {
-              const overrideMs = firstTokenTimeoutFor(agentPool, actualModelUsed, MODEL_FIRST_TOKEN_TIMEOUT_MS);
-              console.warn(`[Jarvis Orchestrator] First-token timeout (${overrideMs / 1000}s) on stage=${callOptions?.stageLabel ?? "agent"} model=${actualModelUsed} — aborting stream`);
+              console.warn(`[Jarvis Orchestrator] First-token timeout (${firstTokenMs / 1000}s) on stage=${callOptions?.stageLabel ?? "agent"} model=${actualModelUsed} — aborting stream`);
               streamAbort.abort("First-token timeout");
               reader.cancel("First-token timeout").catch(() => {});
             }
-          }, MODEL_FIRST_TOKEN_TIMEOUT_MS);
+          }, firstTokenMs);
           const textStreamSanitizer = new TextToolCallStreamSanitizer();
           const emitTextToken = async (text: string) => {
             if (callOptions?.surfaceAsAnswer) {
@@ -1945,22 +1950,31 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // Agent Loop first-token watchdog. The Agent Loop fetches
         // directly (bypassing chatCompletionWithFallback), so the
         // cascade-advance logic in openrouter.ts does not cover this
-        // path. Aborting on 30s of silence from the response body
-        // surfaces a clear error to the caller instead of the
-        // pre-fix silent 5-min stall.
+        // path. Aborting on the per-model first-token window of
+        // silence from the response body surfaces a clear error to
+        // the caller instead of the pre-fix silent 5-min stall.
+        //
+        // Apply the per-model first-token override (planner/synthesizer
+        // defaults get 55s; the rest stay on the global 30s). The
+        // override MUST be applied to the `setTimeout` delay itself —
+        // a previous revision only used the resolved value in the log
+        // message, so slow cold-starts were still aborted at 30s
+        // despite the override being "in effect". `firstTokenTimeoutFor`
+        // clamps to [1_000, 60_000] so this watchdog can never fire
+        // after the outer 60s stream-stall watchdog would have.
+        const agentLoopPool = new AgentPool(cfg.orchestrator?.agents ?? []);
+        const firstTokenMs = firstTokenTimeoutFor(
+          agentLoopPool,
+          modelName,
+          MODEL_FIRST_TOKEN_TIMEOUT_MS,
+        );
         const firstTokenTimer = setTimeout(() => {
           if (!firstTokenReceived && !streamAbort.signal.aborted) {
-            // Apply the per-model first-token override (planner/synthesizer
-            // defaults get 55s; the rest stay on the global 30s). The agent
-            // loop runs after the orchestrator branch, so it builds its own
-            // pool reference for the override lookup.
-            const agentLoopPool = new AgentPool(cfg.orchestrator?.agents ?? []);
-            const overrideMs = firstTokenTimeoutFor(agentLoopPool, modelName, MODEL_FIRST_TOKEN_TIMEOUT_MS);
-            console.warn(`[Jarvis Agent Loop] First-token timeout (${overrideMs / 1000}s) on model=${modelName} — aborting stream`);
+            console.warn(`[Jarvis Agent Loop] First-token timeout (${firstTokenMs / 1000}s) on model=${modelName} — aborting stream`);
             streamAbort.abort("First-token timeout");
             reader.cancel("First-token timeout").catch(() => {});
           }
-        }, MODEL_FIRST_TOKEN_TIMEOUT_MS);
+        }, firstTokenMs);
         let activeToolCalls: any[] = [];
         const holdVisibleText = !forceFinalAnswerOnly
           && ((requiresVerifiedWebSearch && !verifiedWebSearchDone)
