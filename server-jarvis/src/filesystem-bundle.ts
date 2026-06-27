@@ -27,7 +27,7 @@ const READ_FILE_DEF: ToolDefinition = {
   type: "function",
   function: {
     name: "read_file",
-    description: "Read the contents of a file. Returns the full file content with line numbers. Use this before editing any file.",
+    description: "Read the contents of a single FILE (not a directory). Returns full file content with line numbers. Use this before editing any file. To list a folder's contents, use list_directory instead.",
     parameters: {
       type: "object",
       properties: {
@@ -164,7 +164,7 @@ const LIST_DIR_DEF: ToolDefinition = {
   type: "function",
   function: {
     name: "list_directory",
-    description: "List the contents of a directory with file sizes and types.",
+    description: "List the contents of a DIRECTORY (folder) with file sizes and types. Use this for any path that is a folder — including '.', the workspace root, or a project directory. Do NOT use read_file on a directory.",
     parameters: {
       type: "object",
       properties: {

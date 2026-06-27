@@ -18,7 +18,8 @@ For each task in the plan:
 ## Tool-Use Guidelines Per Bundle
 
 ### Filesystem Bundle
-- `read_file` — Prefer for reading existing files. Use offset/limit for large files.
+- `read_file` — Read a single FILE. Never call this on a directory (e.g. `.`, a project root, or any folder) — it will fail. If you are unsure whether a path is a file or folder, call `list_directory` first.
+- `list_directory` — List a FOLDER's contents. Use this for `.`, the workspace root, or any directory before reading individual files.
 - `write_file` — For creating NEW files or complete rewrites. Creates parent directories automatically.
 - `patch` — For TARGETED edits to existing code. Prefer `mode='replace'` (find unique string, swap it). Use `mode='patch'` only for multi-file changes.
 - `search_files` — Instead of grep. `target='content'` for regex search, `target='files'` for glob.
