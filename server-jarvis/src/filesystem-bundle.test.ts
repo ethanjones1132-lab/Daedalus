@@ -91,6 +91,16 @@ describe("FilesystemBundle > read_file", () => {
     expect(result.is_error).toBe(false);
     expect(result.output).toContain("File not found");
   });
+
+  test("read_file on a directory returns an actionable list_directory hint, not 'File not found'", async () => {
+    const ws = makeTempWorkspace();
+    mkdirSync(join(ws, "subdir"));
+    const result = await makeRuntime().execute(call("read_file", { path: "subdir" }), makeCtx(ws));
+    expect(result.is_error).toBe(false);
+    expect(result.output).toContain("is a directory");
+    expect(result.output).toContain("list_directory");
+    expect(result.output).not.toContain("File not found");
+  });
 });
 
 describe("FilesystemBundle > write_file", () => {

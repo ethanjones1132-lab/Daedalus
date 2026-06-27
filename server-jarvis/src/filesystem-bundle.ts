@@ -186,6 +186,15 @@ async function handleReadFile(args: Record<string, unknown>, ctx: ExecutionConte
   const limit = (args.limit as number) || 500;
 
   try {
+    const stat = await fs.stat(path);
+    if (stat.isDirectory()) {
+      return `Error: "${args.path}" is a directory, not a file. Use list_directory to see its contents, then read_file on a specific file inside it.`;
+    }
+  } catch {
+    // stat failed (path missing) — fall through to readFile's not-found message.
+  }
+
+  try {
     const content = await fs.readFile(path, "utf-8");
     markFileRead(path);
     const lines = content.split("\n");
