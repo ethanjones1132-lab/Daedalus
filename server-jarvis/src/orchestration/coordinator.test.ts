@@ -46,7 +46,7 @@ describe("Coordinator", () => {
     // also misbehaving on the fallback path.
     const coordinator = new Coordinator(async () => ({ content: "not json" }));
 
-    const decision = await coordinator.route("hello", { sessionId: "session-2" });
+    const decision = await coordinator.route("refactor the failing chat stream module", { sessionId: "session-2" });
     expect(decision.task_type).toBe("general");
     expect(decision.topology).toBe("linear");
     // Synthesizer-only fallback — no planner, no executor.
@@ -62,7 +62,41 @@ describe("Coordinator", () => {
       throw new Error("All provider models exhausted. Last error: HTTP 401");
     });
 
-    await expect(coordinator.route("hello", { sessionId: "session-3" })).rejects.toThrow(/exhausted/);
+    await expect(coordinator.route("debug the failing auth module", { sessionId: "session-3" })).rejects.toThrow(/exhausted/);
+  });
+
+  test("trivial conversational turns skip the model call and route synthesizer-only", async () => {
+    let modelCalls = 0;
+    const coordinator = new Coordinator(async () => {
+      modelCalls++;
+      return { content: "{}" };
+    });
+
+    const decision = await coordinator.route("Hey buddy, how are you today?", { sessionId: "triage-1" });
+
+    expect(modelCalls).toBe(0);
+    expect(decision.pipeline).toEqual(["synthesizer"]);
+    expect(decision.task_type).toBe("general");
+    expect(decision.topology).toBe("linear");
+  });
+
+  test("task requests still call the coordinator model", async () => {
+    let modelCalls = 0;
+    const coordinator = new Coordinator(async () => {
+      modelCalls++;
+      return {
+        content: JSON.stringify({
+          task_type: "general",
+          pipeline: ["planner", "executor", "synthesizer"],
+          topology: "linear",
+          context: { needs_workspace_inspection: true, needs_memory: true, estimated_complexity: "medium" },
+          coordinator_rationale: "real task",
+        }),
+      };
+    });
+
+    await coordinator.route("Summarize this repo and name one improvement", { sessionId: "triage-2" });
+    expect(modelCalls).toBe(1);
   });
 
   test("suppresses coordinator activity from the user-visible stream", async () => {

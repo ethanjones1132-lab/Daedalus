@@ -1,4 +1,5 @@
 import { loadPrompt } from "./prompt-loader";
+import { isTrivialConversationalTurn } from "./turn-triage";
 
 export type TaskType = "code_review" | "debug" | "refactor" | "general" | "plan" | "research" | "test" | "docs";
 export type Complexity = "low" | "medium" | "high";
@@ -75,6 +76,14 @@ export class Coordinator {
   constructor(private callModel: CallModelFn) {}
 
   async route(request: string, options: CoordinatorRouteOptions): Promise<CoordinatorResult> {
+    if (isTrivialConversationalTurn(request)) {
+      const state = this.getState(options.sessionId);
+      const decision = this.conversationalRoute();
+      state.turns += 1;
+      state.lastDecision = decision;
+      return decision;
+    }
+
     const state = this.getState(options.sessionId);
     const coordinatorPrompt = loadPrompt("coordinator.md");
     const history = (options.history ?? [])
@@ -158,6 +167,20 @@ export class Coordinator {
       },
       coordinator_rationale:
         "Default route (coordinator output was unparseable): skipping planner/executor and going straight to a streamed synthesizer answer.",
+    };
+  }
+
+  private conversationalRoute(): CoordinatorResult {
+    return {
+      task_type: "general",
+      pipeline: ["synthesizer"],
+      topology: "linear",
+      context: {
+        needs_workspace_inspection: false,
+        needs_memory: false,
+        estimated_complexity: "low",
+      },
+      coordinator_rationale: "Trivial conversational turn — direct synthesizer reply.",
     };
   }
 
