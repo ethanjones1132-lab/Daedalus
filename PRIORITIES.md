@@ -1,6 +1,6 @@
 # Jarvis / home-base — Priority Roadmap
 
-Last updated: 2026-06-26 (Evening pass — per-model first-token timeout override for slow Nemotron cold-starts; new `firstTokenTimeoutFor` helper applied in both orchestrator and agent-loop watchdogs; 9 new bun tests, 267 total passing, 6/6 verify gate green)
+Last updated: 2026-06-27 (Overnight pass — committed uncommitted orchestrator hardening: `sanitizeToolMessages` to fix 400 cascade on multi-turn executor conversations; `suppressActivity:false` on all pipeline stages; coordinator prompt restructured for strict JSON-only output; committed orchestrator quality refinement plan doc; pushed to master. 279 bun tests, 59 cargo tests, 33/33 eval cases — all pass.)
 Working copy: `C:\Projects\home-base-recovered`
 
 Quick status: **Phase 1 done · Phase 2 done · Phase 3 done · Orchestrator v2 substrate live**
