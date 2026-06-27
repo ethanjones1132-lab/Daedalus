@@ -1,15 +1,22 @@
-// ═══════════════════════════════════════════════════════════════
-// ── OpenRouter v2 — Production-Grade Integration ──
-// ═══════════════════════════════════════════════════════════════
-// Full streaming, tool-call compatibility, cost tracking,
-// retry/fallback, and per-model capability gates.
-
+// ═══════════════════════════════════════════════════════════════
+// ── OpenRouter v2 — Production-Grade Integration ──
+// ═══════════════════════════════════════════════════════════════
+// Full streaming, tool-call compatibility, cost tracking,
+// retry/fallback, and per-model capability gates.
+
 import type { JarvisConfig, SurfaceType } from "./config";
-
-// ═══════════════════════════════════════════════════════════════
-// Types
-// ═══════════════════════════════════════════════════════════════
-
+import { AgentPool } from "./orchestration/agent-pool";
+import {
+  resolveProviderTarget,
+  providerChatUrl,
+  providerHeaders,
+  type HttpProviderId,
+} from "./providers";
+
+// ═══════════════════════════════════════════════════════════════
+// Types
+// ═══════════════════════════════════════════════════════════════
+
 export interface OpenRouterPricing {
   prompt?: string;
   completion?: string;
@@ -57,29 +64,29 @@ export interface OpenRouterModel {
   is_router: boolean;
   created: number;
 }
-
-export interface OpenRouterHealth {
-  ok: boolean;
-  latencyMs: number;
-  error?: string;
-}
-
-export interface OpenRouterCostInfo {
-  prompt_tokens: number;
-  completion_tokens: number;
-  total_tokens: number;
-  total_cost_usd: number;
-  generation_id: string;
-  model: string;
-}
-
-export interface OpenRouterError {
-  status: number;
-  code: string;
-  message: string;
-  retry_after?: number;
-}
-
+
+export interface OpenRouterHealth {
+  ok: boolean;
+  latencyMs: number;
+  error?: string;
+}
+
+export interface OpenRouterCostInfo {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  total_cost_usd: number;
+  generation_id: string;
+  model: string;
+}
+
+export interface OpenRouterError {
+  status: number;
+  code: string;
+  message: string;
+  retry_after?: number;
+}
+
 export interface OpenRouterRetryResult {
   ok: boolean;
   model_used: string;
@@ -101,22 +108,22 @@ export interface EffectiveOpenRouterRequestConfig {
   supported_parameters: string[];
   timeout_ms: number;
 }
-
-// ═══════════════════════════════════════════════════════════════
-// In-Memory Cache
-// ═══════════════════════════════════════════════════════════════
-
-let cachedModels: OpenRouterModel[] | null = null;
-let lastFetchTime = 0;
-let lastUsedApiKey = "";
-const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
-
-export function clearOpenRouterCache(): void {
-  cachedModels = null;
-  lastFetchTime = 0;
-  lastUsedApiKey = "";
-}
-
+
+// ═══════════════════════════════════════════════════════════════
+// In-Memory Cache
+// ═══════════════════════════════════════════════════════════════
+
+let cachedModels: OpenRouterModel[] | null = null;
+let lastFetchTime = 0;
+let lastUsedApiKey = "";
+const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+export function clearOpenRouterCache(): void {
+  cachedModels = null;
+  lastFetchTime = 0;
+  lastUsedApiKey = "";
+}
+
 function checkKeyChange(apiKey: string): void {
   if (apiKey !== lastUsedApiKey) {
     cachedModels = null;
@@ -247,16 +254,16 @@ export async function resolveOpenRouterMaxTokens(
 
   return hasExplicitRequest ? requestedTokens : undefined;
 }
-
-// ═══════════════════════════════════════════════════════════════
-// Tool-Call Compatibility (per-model gates)
-// ═══════════════════════════════════════════════════════════════
-
-/**
- * Models known to support native OpenAI-compatible tool calls via OpenRouter.
- * Anthropic, Google, and Mistral models sometimes have partial support.
- * When false, fall back to the text-based <tool_call> protocol.
- */
+
+// ═══════════════════════════════════════════════════════════════
+// Tool-Call Compatibility (per-model gates)
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Models known to support native OpenAI-compatible tool calls via OpenRouter.
+ * Anthropic, Google, and Mistral models sometimes have partial support.
+ * When false, fall back to the text-based <tool_call> protocol.
+ */
 export function isOpenRouterModelSupportsTools(modelOrId: OpenRouterModel | string): boolean {
   const modelId = typeof modelOrId === "string" ? modelOrId : modelOrId.id;
   if (!modelId) return false;
@@ -267,29 +274,29 @@ export function isOpenRouterModelSupportsTools(modelOrId: OpenRouterModel | stri
 
   // OpenAI models: full native tool support
   if (modelId.startsWith("openai/")) return true;
-
-  // Anthropic via OpenRouter: tools supported (Anthropic -> OpenAI format conversion)
-  if (modelId.startsWith("anthropic/")) return true;
-
-  // Google Gemini via OpenRouter: partial tool support (generally works)
-  if (modelId.startsWith("google/")) return true;
-
-  // Mistral Large: tool support works
-  if (modelId.includes("mistral-large")) return true;
-
-  // DeepSeek: tool support works via OpenRouter
-  if (modelId.startsWith("deepseek/")) return true;
-
-  // Qwen on OpenRouter: depends on provider; usually routed toTogether/ Fireworks with OpenAI API
-  // → treat as *no native tools* and use text fallback to be safe
-  if (modelId.startsWith("qwen/")) return false;
-
-  // Meta / Llama: usually no native tools via OpenRouter
-  if (modelId.startsWith("meta-llama/")) return false;
-
-  // Nous / Hermes: text-only via OpenRouter
-  if (modelId.startsWith("nousresearch/")) return false;
-
+
+  // Anthropic via OpenRouter: tools supported (Anthropic -> OpenAI format conversion)
+  if (modelId.startsWith("anthropic/")) return true;
+
+  // Google Gemini via OpenRouter: partial tool support (generally works)
+  if (modelId.startsWith("google/")) return true;
+
+  // Mistral Large: tool support works
+  if (modelId.includes("mistral-large")) return true;
+
+  // DeepSeek: tool support works via OpenRouter
+  if (modelId.startsWith("deepseek/")) return true;
+
+  // Qwen on OpenRouter: depends on provider; usually routed toTogether/ Fireworks with OpenAI API
+  // → treat as *no native tools* and use text fallback to be safe
+  if (modelId.startsWith("qwen/")) return false;
+
+  // Meta / Llama: usually no native tools via OpenRouter
+  if (modelId.startsWith("meta-llama/")) return false;
+
+  // Nous / Hermes: text-only via OpenRouter
+  if (modelId.startsWith("nousresearch/")) return false;
+
   // Default: conservative — no native tools, use text protocol
   return false;
 }
@@ -403,380 +410,597 @@ export async function applyOpenRouterRequestConfig(
   );
   return effective;
 }
-
-// ═══════════════════════════════════════════════════════════════
-// Streaming: Robust SSE Parser
-// ═══════════════════════════════════════════════════════════════
-
-export interface SSEChunk {
-  id?: string;
-  object?: string;
-  created?: number;
-  model?: string;
-  choices: Array<{
-    index: number;
-    delta: {
-      role?: string;
-      content?: string;
-      tool_calls?: any[];
-      reasoning?: string;
-    };
-    finish_reason: string | null;
-    logprobs?: any;
-  }>;
-  usage?: {
-    prompt_tokens: number;
-    completion_tokens: number;
-    total_tokens: number;
-  };
-  // OpenRouter-specific extras
-  or_cost?: number;
-  or_id?: string;
-}
-
-/**
- * Parse a raw SSE line from the stream.
- * Returns null for [DONE], structured data for data: lines, throws on bad JSON.
- */
-function parseSSELine(line: string): SSEChunk | null {
-  const trimmed = line.trim();
-  if (!trimmed || !trimmed.startsWith("data: ")) return null;
-
-  const payload = trimmed.slice(6).trim();
-  if (payload === "[DONE]") return null;
-
-  // Some providers send "data: data: {…}" — strip double prefix
-  if (payload.startsWith("data: ")) {
-    return parseSSELine(`data: ${payload.slice(6)}`);
-  }
-
-  if (!payload) return null;
-
-  try {
-    const parsed = JSON.parse(payload);
-    return parsed as SSEChunk;
-  } catch {
-    // Not valid JSON — likely a provider error or half-line
-    return null;
-  }
-}
-
-/**
- * Read an SSE stream and accumulate chunks.
- * Handles partial lines across buffer boundaries and malformed providers.
- */
-export async function* streamOpenRouterSSE(
-  response: Response,
-): AsyncGenerator<SSEChunk, { cost: OpenRouterCostInfo | null; error: OpenRouterError | null }, unknown> {
-  const reader = response.body?.getReader();
-  if (!reader) {
-    return { cost: null, error: { status: 500, code: "no_body", message: "Response body missing" } };
-  }
-
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let accumulatedCost: OpenRouterCostInfo | null = null;
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || ""; // Keep incomplete last line
-
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        const chunk = parseSSELine(line);
-        if (chunk) {
-          // Accumulate cost from final usage block
-          if (chunk.usage) {
-            accumulatedCost = {
-              prompt_tokens: chunk.usage.prompt_tokens,
-              completion_tokens: chunk.usage.completion_tokens,
-              total_tokens: chunk.usage.total_tokens,
-              total_cost_usd: chunk.or_cost ?? 0,
-              generation_id: chunk.or_id ?? "",
-              model: chunk.model ?? "",
-            };
-          }
-          yield chunk;
-        }
-      }
-    }
-
-    // Flush any remaining buffer content
-    if (buffer.trim()) {
-      const lines = buffer.split("\n").filter(Boolean);
-      for (const line of lines) {
-        const chunk = parseSSELine(line);
-        if (chunk) {
-          if (chunk.usage) {
-            accumulatedCost = {
-              prompt_tokens: chunk.usage.prompt_tokens,
-              completion_tokens: chunk.usage.completion_tokens,
-              total_tokens: chunk.usage.total_tokens,
-              total_cost_usd: chunk.or_cost ?? 0,
-              generation_id: chunk.or_id ?? "",
-              model: chunk.model ?? "",
-            };
-          }
-          yield chunk;
-        }
-      }
-    }
-  } finally {
-    reader.releaseLock();
-  }
-
-  return { cost: accumulatedCost, error: null };
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Retry / Fallback Logic
-// ═══════════════════════════════════════════════════════════════
-
+
+// ═══════════════════════════════════════════════════════════════
+// Streaming: Robust SSE Parser
+// ═══════════════════════════════════════════════════════════════
+
+export interface SSEChunk {
+  id?: string;
+  object?: string;
+  created?: number;
+  model?: string;
+  choices: Array<{
+    index: number;
+    delta: {
+      role?: string;
+      content?: string;
+      tool_calls?: any[];
+      reasoning?: string;
+    };
+    finish_reason: string | null;
+    logprobs?: any;
+  }>;
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  };
+  // OpenRouter-specific extras
+  or_cost?: number;
+  or_id?: string;
+}
+
+/**
+ * Parse a raw SSE line from the stream.
+ * Returns null for [DONE], structured data for data: lines, throws on bad JSON.
+ */
+function parseSSELine(line: string): SSEChunk | null {
+  const trimmed = line.trim();
+  if (!trimmed || !trimmed.startsWith("data: ")) return null;
+
+  const payload = trimmed.slice(6).trim();
+  if (payload === "[DONE]") return null;
+
+  // Some providers send "data: data: {…}" — strip double prefix
+  if (payload.startsWith("data: ")) {
+    return parseSSELine(`data: ${payload.slice(6)}`);
+  }
+
+  if (!payload) return null;
+
+  try {
+    const parsed = JSON.parse(payload);
+    return parsed as SSEChunk;
+  } catch {
+    // Not valid JSON — likely a provider error or half-line
+    return null;
+  }
+}
+
+/**
+ * Read an SSE stream and accumulate chunks.
+ * Handles partial lines across buffer boundaries and malformed providers.
+ */
+export async function* streamOpenRouterSSE(
+  response: Response,
+): AsyncGenerator<SSEChunk, { cost: OpenRouterCostInfo | null; error: OpenRouterError | null }, unknown> {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    return { cost: null, error: { status: 500, code: "no_body", message: "Response body missing" } };
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let accumulatedCost: OpenRouterCostInfo | null = null;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || ""; // Keep incomplete last line
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const chunk = parseSSELine(line);
+        if (chunk) {
+          // Accumulate cost from final usage block
+          if (chunk.usage) {
+            accumulatedCost = {
+              prompt_tokens: chunk.usage.prompt_tokens,
+              completion_tokens: chunk.usage.completion_tokens,
+              total_tokens: chunk.usage.total_tokens,
+              total_cost_usd: chunk.or_cost ?? 0,
+              generation_id: chunk.or_id ?? "",
+              model: chunk.model ?? "",
+            };
+          }
+          yield chunk;
+        }
+      }
+    }
+
+    // Flush any remaining buffer content
+    if (buffer.trim()) {
+      const lines = buffer.split("\n").filter(Boolean);
+      for (const line of lines) {
+        const chunk = parseSSELine(line);
+        if (chunk) {
+          if (chunk.usage) {
+            accumulatedCost = {
+              prompt_tokens: chunk.usage.prompt_tokens,
+              completion_tokens: chunk.usage.completion_tokens,
+              total_tokens: chunk.usage.total_tokens,
+              total_cost_usd: chunk.or_cost ?? 0,
+              generation_id: chunk.or_id ?? "",
+              model: chunk.model ?? "",
+            };
+          }
+          yield chunk;
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  return { cost: accumulatedCost, error: null };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Retry / Fallback Logic
+// ═══════════════════════════════════════════════════════════════
+
 const RETRY_DELAYS = [1000, 2000, 4000]; // ms exponential backoff
 const PREFERRED_FREE_FALLBACKS = [
   "openrouter/free",
   "openrouter/owl-alpha",
-  "nvidia/nemotron-3-ultra-550b-a55b:free",
   "qwen/qwen3-coder:free",
+  "cohere/north-mini-code:free",
+  "nvidia/llama-3.1-nemotron-ultra-253b-v1:free",
   "openai/gpt-oss-120b:free",
   "meta-llama/llama-3.3-70b-instruct:free",
 ];
-
-async function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * Determine if an HTTP status is retryable
- */
+
+async function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Determine if an HTTP status is retryable
+ */
 function isRetryableStatus(status: number): boolean {
   return status === 429 || status === 503 || status === 502 || status === 504;
 }
 
-async function resolveFallbackModels(cfg: JarvisConfig): Promise<string[]> {
+interface FallbackResolveOptions {
+  stage?: string;
+  taskType?: string;
+  cascadeTier?: "cheap" | "strong";
+}
+
+/** One step in the cross-provider fallback cascade. */
+interface CascadeEntry {
+  provider: HttpProviderId;
+  model_id: string;
+}
+
+const SUPPORTED_HTTP_PROVIDERS: ReadonlySet<string> = new Set([
+  "openrouter",
+  "opencode_zen",
+  "opencode_go",
+]);
+
+/**
+ * Resolve the stage's pool agents as an ordered cross-provider cascade. The
+ * AgentPool already orders these optimally (stage default first, then by
+ * overall score), so the cascade walks from the best model to progressively
+ * cheaper/more-available ones — across OpenRouter and the OpenCode providers.
+ */
+function resolvePoolAgents(cfg: JarvisConfig, options: FallbackResolveOptions = {}): CascadeEntry[] {
+  if (!options.stage) return [];
+  const pool = new AgentPool(cfg.orchestrator?.agents ?? []);
+  let agents;
+  if (options.cascadeTier) {
+    const cascade = pool.cascadeChain(options.stage, options.taskType ?? "general");
+    agents = options.cascadeTier === "strong" ? [...cascade].reverse() : cascade;
+  } else {
+    const selected = pool.pickFor(options.stage, options.taskType ?? "general");
+    agents = selected ? pool.fallbackChain(selected) : [];
+  }
+  return agents
+    .filter((agent) => SUPPORTED_HTTP_PROVIDERS.has(agent.provider))
+    .map((agent) => ({ provider: agent.provider as HttpProviderId, model_id: agent.model_id }));
+}
+
+/**
+ * Build the full fallback cascade: the stage's pool agents (cross-provider,
+ * optimally ordered) followed by an OpenRouter-only tail of free/configured
+ * models. Pool agents are trusted as-is (NOT filtered against the OpenRouter
+ * catalog — that catalog only knows OpenRouter ids, and would wrongly drop
+ * valid OpenCode models). The catalog is only consulted to enumerate the free
+ * OpenRouter tail.
+ */
+async function resolveFallbackCascade(cfg: JarvisConfig, options: FallbackResolveOptions = {}): Promise<CascadeEntry[]> {
   const requested = cfg.openrouter.model || "openrouter/free";
+  const seen = new Set<string>();
+  const cascade: CascadeEntry[] = [];
+  const push = (entry: CascadeEntry) => {
+    const key = `${entry.provider}:${entry.model_id}`;
+    if (!entry.model_id || seen.has(key)) return;
+    seen.add(key);
+    cascade.push(entry);
+  };
+
+  // 1. Pool agents first — cross-provider, optimal order.
+  for (const entry of resolvePoolAgents(cfg, options)) push(entry);
+
+  // 2. OpenRouter free/configured tail (catalog-aware).
   try {
     const catalog = await listOpenRouterModels(cfg);
     const byId = new Map(catalog.map((model) => [model.id, model]));
-    const freeCatalogIds = catalog
-      .filter((model) => model.is_free && model.id !== requested)
-      .map((model) => model.id);
     const paidFallbacksAllowed = Boolean((cfg.openrouter as any).enable_paid_fallbacks);
-    const configuredFallbacks = (cfg.openrouter.fallbacks || [])
-      .filter((modelId) => {
-        const model = byId.get(modelId);
-        if (!model) return paidFallbacksAllowed;
-        return model.is_free || paidFallbacksAllowed;
-      });
-
-    return Array.from(new Set([
-      requested,
-      ...PREFERRED_FREE_FALLBACKS.filter((id) => id !== requested && byId.has(id)),
-      ...freeCatalogIds,
-      ...configuredFallbacks,
-    ]));
+    if (byId.has(requested) || requested === "openrouter/free") {
+      push({ provider: "openrouter", model_id: requested });
+    }
+    for (const id of PREFERRED_FREE_FALLBACKS) {
+      if (id !== requested && byId.has(id)) push({ provider: "openrouter", model_id: id });
+    }
+    for (const model of catalog) {
+      if (model.is_free && model.id !== requested) push({ provider: "openrouter", model_id: model.id });
+    }
+    for (const id of cfg.openrouter.fallbacks || []) {
+      const model = byId.get(id);
+      if (!model && !paidFallbacksAllowed) continue;
+      if (model && !model.is_free && !paidFallbacksAllowed) continue;
+      push({ provider: "openrouter", model_id: id });
+    }
   } catch (error) {
-    console.warn("[OpenRouter] Failed to build catalog-aware fallback list:", error);
-    const configuredFreeOnly = (cfg.openrouter.fallbacks || []).filter((id) => id.endsWith(":free") || id === "openrouter/free");
-    return Array.from(new Set([requested, "openrouter/free", ...configuredFreeOnly]));
+    console.warn("[OpenRouter] Failed to build catalog-aware fallback tail:", error);
+    push({ provider: "openrouter", model_id: requested });
+    push({ provider: "openrouter", model_id: "openrouter/free" });
+    for (const id of (cfg.openrouter.fallbacks || []).filter((m) => m.endsWith(":free") || m === "openrouter/free")) {
+      push({ provider: "openrouter", model_id: id });
+    }
   }
+
+  return cascade;
 }
-
-/**
- * Attempt a chat completion with the given model, retrying on transient errors.
- * Falls back to the provided fallback models if the primary model fails.
- */
+
+/**
+ * Build the per-attempt request body for a provider. OpenRouter bodies get the
+ * full catalog-aware massaging (max_tokens, temperature/top_p gating, native
+ * tool support). OpenCode (Zen/Go) are OpenAI-compatible but have no catalog
+ * here, so we send a lean body and drop `tools` (those stages use the text
+ * tool protocol — see callModel's `useTextTools`).
+ */
+async function buildAttemptBody(
+  cfg: JarvisConfig,
+  provider: HttpProviderId,
+  requestBody: any,
+  model: string,
+): Promise<Record<string, any>> {
+  const body: Record<string, any> = { ...requestBody, model };
+  if (provider === "openrouter") {
+    await applyOpenRouterRequestConfig(body, cfg, model, body.messages ?? [], {
+      requestedTemperature: requestBody.temperature,
+      requestedTopP: requestBody.top_p,
+    });
+  } else {
+    delete body.tools;
+    delete body.tool_choice;
+  }
+  return body;
+}
+
+/**
+ * Attempt a chat completion, cascading across the stage's agent pool and an
+ * OpenRouter fallback tail. Fallback policy:
+ *   • Rate-limit (429): retry the SAME model at most twice — after 2 consecutive
+ *     429s, advance to the next optimal pool model (per the orchestrator spec).
+ *   • Other transient (502/503/504) or network errors: one short retry, then
+ *     advance.
+ *   • Non-retryable HTTP (4xx other than 429): advance to the next model rather
+ *     than aborting the whole turn — a single bad model/provider never kills a
+ *     turn that another pool model could answer.
+ *   • First-token watchdog: a model that opens the connection but never sends a
+ *     body byte within the timeout is abandoned and the cascade advances.
+ * Only when EVERY model is exhausted do we throw.
+ */
 export async function chatCompletionWithFallback(
   cfg: JarvisConfig,
   requestBody: any,
   signal?: AbortSignal,
+  options: FallbackResolveOptions = {},
 ): Promise<{ response: Response; model_used: string; retries: number }> {
-  const allModels = await resolveFallbackModels(cfg);
+  const cascade = await resolveFallbackCascade(cfg, options);
+  if (cascade.length === 0) {
+    cascade.push({ provider: "openrouter", model_id: cfg.openrouter.model || "openrouter/free" });
+  }
   let lastError = "";
-  const primaryRetryCount = Math.max(0, Number(cfg.openrouter.max_retries ?? RETRY_DELAYS.length));
+  // `max_retries` is the configured ceiling on per-model attempts. The 2-strike
+  // rate-limit rule and the single-retry transient policy are clamped to it, so
+  // setting max_retries=0 disables all same-model retries (immediate advance).
+  const maxRetries = Math.max(0, Number(cfg.openrouter.max_retries ?? RETRY_DELAYS.length));
+  // User rule: 2 consecutive rate-limit (429) errors on a model → next pool model.
+  const RATE_LIMIT_MAX_ATTEMPTS = Math.max(1, Math.min(2, maxRetries + 1));
+  // Non-429 transient errors (502/503/504, network): at most one short retry.
+  const OTHER_TRANSIENT_MAX_ATTEMPTS = Math.max(1, Math.min(2, maxRetries + 1));
+  // First-token watchdog: how long to wait for the response body's first byte
+  // before declaring the model hung and advancing the cascade. Guards against
+  // a model that opens the HTTP connection but never streams (the post-hang
+  // diagnosis: multi-minute stalls on a free-router call).
+  const firstTokenTimeoutMs = Math.max(1_000, Number((cfg.openrouter as any).first_token_timeout_ms ?? 30_000));
 
-  for (let attempt = 0; attempt < allModels.length; attempt++) {
-    const model = allModels[attempt];
-    const retryDelays = attempt === 0
-      ? RETRY_DELAYS.slice(0, primaryRetryCount)
-      : RETRY_DELAYS.slice(0, Math.min(primaryRetryCount, 1)); // Less retries for fallbacks
-
-    for (let retry = 0; retry <= retryDelays.length; retry++) {
+  for (let modelIdx = 0; modelIdx < cascade.length; modelIdx++) {
+    const { provider, model_id: model } = cascade[modelIdx];
+    const target = resolveProviderTarget(cfg, provider);
+    if (!target.api_key) {
+      lastError = `No API key configured for provider "${provider}" (model ${model}) — skipping`;
+      console.warn(`[Fallback] ${lastError}`);
+      continue;
+    }
+
+    let rateLimitStrikes = 0;
+    let transientRetries = 0;
+
+    // Per-model attempt loop. Each `continue` retries the same model; each
+    // `break` advances to the next model in the cascade.
+    attemptLoop: while (true) {
+      const STALL_REASON = `first-token-timeout:${provider}:${model}`;
+      const attemptCtrl = new AbortController();
+      const onUserAbort = () => attemptCtrl.abort(signal?.reason);
+      if (signal) {
+        if (signal.aborted) attemptCtrl.abort(signal.reason);
+        else signal.addEventListener("abort", onUserAbort, { once: true });
+      }
+      let watchdogTimer: ReturnType<typeof setTimeout> | undefined;
       try {
-        const modelRequestBody = { ...requestBody, model };
-        await applyOpenRouterRequestConfig(
-          modelRequestBody,
-          cfg,
-          model,
-          modelRequestBody.messages ?? [],
-          {
-            requestedTemperature: requestBody.temperature,
-            requestedTopP: requestBody.top_p,
-          },
-        );
-        const res = await fetch(`${cfg.openrouter.base_url}/chat/completions`, {
+        const attemptBody = await buildAttemptBody(cfg, provider, requestBody, model);
+        const res = await fetch(providerChatUrl(target), {
           method: "POST",
-          signal,
-          headers: {
-            "Authorization": `Bearer ${cfg.openrouter.api_key}`,
-            "Content-Type": "application/json",
-            "HTTP-Referer": cfg.openrouter.site_url || "http://localhost:19877",
-            "X-Title": cfg.openrouter.site_name || "Jarvis",
-          },
-          body: JSON.stringify(modelRequestBody),
+          signal: attemptCtrl.signal,
+          headers: providerHeaders(cfg, target),
+          body: JSON.stringify(attemptBody),
         });
-
-        if (res.ok) {
-          return { response: res, model_used: model, retries: retry + attempt };
-        }
-
-        // Non-retryable error
-        if (!isRetryableStatus(res.status)) {
-          const body = await res.text().catch(() => "");
-          throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
-        }
-
-        // Retryable error — wait and retry with same model
-        if (retry < retryDelays.length) {
-          const delayMs = retryDelays[retry] + Math.random() * 500;
-          console.warn(`[OpenRouter] ${model} returned ${res.status}, retrying in ${Math.round(delayMs)}ms (attempt ${retry + 1}/${retryDelays.length})`);
-          await sleep(delayMs);
-          continue;
-        }
-
-        // Exhausted retries for this model, move to next fallback
-        lastError = `Model ${model} failed after ${retryDelays.length + 1} attempts`;
-        break;
-      } catch (e: any) {
-        if (e.name === "AbortError" || e.message?.includes("abort")) {
-          throw e; // Don't retry user-aborted requests
-        }
-        lastError = e.message || String(e);
-        if (retry < retryDelays.length) {
-          await sleep(retryDelays[retry]);
-        }
-      }
-    }
-  }
-
-  throw new Error(`All OpenRouter models exhausted. Last error: ${lastError}`);
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Health Check
-// ═══════════════════════════════════════════════════════════════
-
-export async function checkOpenRouterHealth(cfg: JarvisConfig, forceRefresh = false): Promise<OpenRouterHealth> {
-  checkKeyChange(cfg.openrouter.api_key);
-  const start = Date.now();
-
-  if (!forceRefresh && cachedModels && (Date.now() - lastFetchTime < CACHE_TTL_MS)) {
-    return { ok: true, latencyMs: 0 };
-  }
-
-  try {
-    const ctrl = new AbortController();
-    setTimeout(() => ctrl.abort(), 8000);
-
-    const res = await fetch(`${cfg.openrouter.base_url}/models`, {
-      signal: ctrl.signal,
-      headers: {
-        "Authorization": `Bearer ${cfg.openrouter.api_key}`,
+
+        if (res.ok) {
+          // First-token watchdog: race the first body chunk against the timer.
+          const bodyReader = res.body?.getReader();
+          if (!bodyReader) {
+            return { response: res, model_used: model, retries: modelIdx };
+          }
+          const firstByteTimeout = new Promise<"timeout">((resolve) => {
+            watchdogTimer = setTimeout(() => resolve("timeout"), firstTokenTimeoutMs);
+          });
+          const raceResult = await Promise.race([
+            bodyReader.read().then((chunk) => ({ kind: "chunk" as const, chunk })),
+            firstByteTimeout.then(() => ({ kind: "timeout" as const })),
+          ]);
+          if (raceResult.kind === "timeout") {
+            attemptCtrl.abort(STALL_REASON);
+            try { await bodyReader.cancel().catch(() => {}); } catch {}
+            lastError = `Model ${model} (${provider}) sent no body bytes within ${firstTokenTimeoutMs}ms (first-token timeout)`;
+            console.warn(`[Fallback] ${lastError} — advancing to next model`);
+            break attemptLoop;
+          }
+          clearTimeout(watchdogTimer);
+          const rewrapped = rewrapReadableStreamWithFirstChunk(
+            bodyReader as unknown as ReadableStreamDefaultReader<any>,
+            raceResult.chunk as ReadableStreamReadResult<any>,
+          );
+          const newResponse = new Response(rewrapped, {
+            status: res.status,
+            statusText: res.statusText,
+            headers: res.headers,
+          });
+          return { response: newResponse, model_used: model, retries: modelIdx };
+        }
+
+        // ── Rate limit: 2-strike rule ──
+        if (res.status === 429) {
+          await res.text().catch(() => "");
+          rateLimitStrikes++;
+          lastError = `Model ${model} (${provider}) rate limited (429) [strike ${rateLimitStrikes}/${RATE_LIMIT_MAX_ATTEMPTS}]`;
+          if (rateLimitStrikes >= RATE_LIMIT_MAX_ATTEMPTS) {
+            console.warn(`[Fallback] ${lastError} — advancing to next optimal pool model`);
+            break attemptLoop;
+          }
+          const delayMs = RETRY_DELAYS[rateLimitStrikes - 1] ?? 1000;
+          console.warn(`[Fallback] ${lastError} — retrying same model in ${Math.round(delayMs)}ms`);
+          await sleep(delayMs + Math.random() * 300);
+          continue attemptLoop;
+        }
+
+        // ── Other transient errors (502/503/504): one short retry ──
+        if (isRetryableStatus(res.status)) {
+          await res.text().catch(() => "");
+          transientRetries++;
+          lastError = `Model ${model} (${provider}) returned ${res.status} [retry ${transientRetries}/${OTHER_TRANSIENT_MAX_ATTEMPTS}]`;
+          if (transientRetries >= OTHER_TRANSIENT_MAX_ATTEMPTS) {
+            console.warn(`[Fallback] ${lastError} — advancing to next model`);
+            break attemptLoop;
+          }
+          await sleep((RETRY_DELAYS[transientRetries - 1] ?? 1000) + Math.random() * 300);
+          continue attemptLoop;
+        }
+
+        // ── Non-retryable HTTP error: advance, don't kill the turn ──
+        const body = await res.text().catch(() => "");
+        lastError = `Model ${model} (${provider}) HTTP ${res.status}: ${body.slice(0, 160)}`;
+        console.warn(`[Fallback] ${lastError} — advancing to next model`);
+        break attemptLoop;
+      } catch (e: any) {
+        // Distinguish user-cancel (fatal) from watchdog-abort / network error.
+        const isStall = (e?.message ?? "").includes(STALL_REASON)
+          || (attemptCtrl.signal.reason === STALL_REASON);
+        const isUserCancel = signal?.aborted && !isStall;
+        if (isUserCancel || (e.name === "AbortError" && !isStall)) {
+          throw e; // Don't retry user-aborted requests
+        }
+        if (isStall) {
+          lastError = e.message || lastError;
+          break attemptLoop;
+        }
+        // Network/transport error — one short retry, then advance.
+        transientRetries++;
+        lastError = e.message || String(e);
+        if (transientRetries >= OTHER_TRANSIENT_MAX_ATTEMPTS) {
+          console.warn(`[Fallback] Model ${model} (${provider}) network error: ${lastError} — advancing to next model`);
+          break attemptLoop;
+        }
+        await sleep(RETRY_DELAYS[transientRetries - 1] ?? 1000);
+        continue attemptLoop;
+      } finally {
+        if (watchdogTimer) clearTimeout(watchdogTimer);
+        if (signal) signal.removeEventListener("abort", onUserAbort);
+      }
+    }
+  }
+
+  throw new Error(`All provider models exhausted. Last error: ${lastError}`);
+}
+
+/**
+ * Reassemble a ReadableStream from an already-read first chunk plus
+ * the remaining body of the original stream. Used by
+ * `chatCompletionWithFallback` after the first-token watchdog fires
+ * the first body byte: we already consumed the first chunk (to test
+ * whether bytes were arriving), so we re-prepend it to a tee of the
+ * rest of the original stream and return a Response the caller can
+ * read normally.
+ */
+function rewrapReadableStreamWithFirstChunk(
+  original: ReadableStreamDefaultReader<any>,
+  firstChunk: ReadableStreamReadResult<any>,
+): ReadableStream<any> {
+  let firstEnqueued = false;
+  return new ReadableStream<any>({
+    async pull(controller) {
+      if (!firstEnqueued && !firstChunk.done && firstChunk.value !== undefined) {
+        controller.enqueue(firstChunk.value);
+        firstEnqueued = true;
+      }
+      try {
+        const next = await original.read();
+        if (next.done) {
+          controller.close();
+        } else {
+          controller.enqueue(next.value);
+        }
+      } catch (e) {
+        controller.error(e);
+      }
+    },
+    cancel(reason) {
+      return original.cancel(reason).catch(() => {});
+    },
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Health Check
+// ═══════════════════════════════════════════════════════════════
+
+export async function checkOpenRouterHealth(cfg: JarvisConfig, forceRefresh = false): Promise<OpenRouterHealth> {
+  checkKeyChange(cfg.openrouter.api_key);
+  const start = Date.now();
+
+  if (!forceRefresh && cachedModels && (Date.now() - lastFetchTime < CACHE_TTL_MS)) {
+    return { ok: true, latencyMs: 0 };
+  }
+
+  try {
+    const ctrl = new AbortController();
+    setTimeout(() => ctrl.abort(), 8000);
+
+    const res = await fetch(`${cfg.openrouter.base_url}/models`, {
+      signal: ctrl.signal,
+      headers: {
+        "Authorization": `Bearer ${cfg.openrouter.api_key}`,
         "HTTP-Referer": cfg.openrouter.site_url,
         "X-Title": cfg.openrouter.site_name,
-      },
-    });
-
-    if (res.status === 401) {
-      return { ok: false, latencyMs: Date.now() - start, error: "Invalid API key — check your key at https://openrouter.ai/keys" };
-    }
-    if (res.status === 429) {
-      return { ok: false, latencyMs: Date.now() - start, error: "Rate limited — too many requests to OpenRouter" };
-    }
-    if (res.status === 503) {
-      return { ok: false, latencyMs: Date.now() - start, error: "OpenRouter is overloaded — try again shortly" };
-    }
-    if (!res.ok) {
-      return { ok: false, latencyMs: Date.now() - start, error: `HTTP ${res.status}` };
-    }
-
-    // Cache models
-    const json = await res.json();
+      },
+    });
+
+    if (res.status === 401) {
+      return { ok: false, latencyMs: Date.now() - start, error: "Invalid API key — check your key at https://openrouter.ai/keys" };
+    }
+    if (res.status === 429) {
+      return { ok: false, latencyMs: Date.now() - start, error: "Rate limited — too many requests to OpenRouter" };
+    }
+    if (res.status === 503) {
+      return { ok: false, latencyMs: Date.now() - start, error: "OpenRouter is overloaded — try again shortly" };
+    }
+    if (!res.ok) {
+      return { ok: false, latencyMs: Date.now() - start, error: `HTTP ${res.status}` };
+    }
+
+    // Cache models
+    const json = await res.json();
     const models = (json.data || []).map(normalizeOpenRouterModel).sort(compareOpenRouterModels);
-
-    cachedModels = models;
-    lastFetchTime = Date.now();
-
-    return { ok: true, latencyMs: Date.now() - start };
-  } catch (e: any) {
-    return { ok: false, latencyMs: Date.now() - start, error: e.message || String(e) };
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Model Discovery
-// ═══════════════════════════════════════════════════════════════
-
-export async function listOpenRouterModels(cfg: JarvisConfig, forceRefresh = false): Promise<OpenRouterModel[]> {
-  checkKeyChange(cfg.openrouter.api_key);
-  const now = Date.now();
-
-  if (!forceRefresh && cachedModels && (now - lastFetchTime < CACHE_TTL_MS)) {
-    return cachedModels;
-  }
-
-  try {
-    const ctrl = new AbortController();
-    setTimeout(() => ctrl.abort(), 10000);
-
-    const res = await fetch(`${cfg.openrouter.base_url}/models`, {
-      signal: ctrl.signal,
-      headers: {
-        "Authorization": `Bearer ${cfg.openrouter.api_key}`,
+
+    cachedModels = models;
+    lastFetchTime = Date.now();
+
+    return { ok: true, latencyMs: Date.now() - start };
+  } catch (e: any) {
+    return { ok: false, latencyMs: Date.now() - start, error: e.message || String(e) };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Model Discovery
+// ═══════════════════════════════════════════════════════════════
+
+export async function listOpenRouterModels(cfg: JarvisConfig, forceRefresh = false): Promise<OpenRouterModel[]> {
+  checkKeyChange(cfg.openrouter.api_key);
+  const now = Date.now();
+
+  if (!forceRefresh && cachedModels && (now - lastFetchTime < CACHE_TTL_MS)) {
+    return cachedModels;
+  }
+
+  try {
+    const ctrl = new AbortController();
+    setTimeout(() => ctrl.abort(), 10000);
+
+    const res = await fetch(`${cfg.openrouter.base_url}/models`, {
+      signal: ctrl.signal,
+      headers: {
+        "Authorization": `Bearer ${cfg.openrouter.api_key}`,
         "HTTP-Referer": cfg.openrouter.site_url,
         "X-Title": cfg.openrouter.site_name,
-      },
-    });
-
-    if (!res.ok) return cachedModels || [];
-
-    const json = await res.json();
+      },
+    });
+
+    if (!res.ok) return cachedModels || [];
+
+    const json = await res.json();
     const models = (json.data || []).map(normalizeOpenRouterModel).sort(compareOpenRouterModels);
-
-    cachedModels = models;
-    lastFetchTime = now;
-    return models;
-  } catch (e) {
-    console.error("[OpenRouter] Model listing failed:", e);
-    return cachedModels || [];
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Chat Headers
-// ═══════════════════════════════════════════════════════════════
-
-export function openRouterHeaders(cfg: JarvisConfig): Record<string, string> {
-  return {
-    "Authorization": `Bearer ${cfg.openrouter.api_key}`,
-    "Content-Type": "application/json",
+
+    cachedModels = models;
+    lastFetchTime = now;
+    return models;
+  } catch (e) {
+    console.error("[OpenRouter] Model listing failed:", e);
+    return cachedModels || [];
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Chat Headers
+// ═══════════════════════════════════════════════════════════════
+
+export function openRouterHeaders(cfg: JarvisConfig): Record<string, string> {
+  return {
+    "Authorization": `Bearer ${cfg.openrouter.api_key}`,
+    "Content-Type": "application/json",
     "HTTP-Referer": cfg.openrouter.site_url,
     "X-Title": cfg.openrouter.site_name,
-  };
-}
-
-// ═══════════════════════════════════════════════════════════════
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Cost Tracking
-// ═══════════════════════════════════════════════════════════════
-
-export function logOpenRouterCost(cost: OpenRouterCostInfo | null): void {
-  if (!cost) return;
-  console.log(
-    `[OpenRouter Cost] ${cost.total_tokens} tokens ($${cost.total_cost_usd.toFixed(6)}) via ${cost.model} [${cost.generation_id}]`
-  );
-}
+// ═══════════════════════════════════════════════════════════════
+
+export function logOpenRouterCost(cost: OpenRouterCostInfo | null): void {
+  if (!cost) return;
+  console.log(
+    `[OpenRouter Cost] ${cost.total_tokens} tokens ($${cost.total_cost_usd.toFixed(6)}) via ${cost.model} [${cost.generation_id}]`
+  );
+}

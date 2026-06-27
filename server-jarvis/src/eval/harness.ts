@@ -10,13 +10,19 @@
 //   bun run src/eval/harness.ts --write-baseline # refresh baseline.json
 
 import { PredictiveRouter } from "../orchestration/router";
+import { Coordinator, CoordinatorError } from "../orchestration/coordinator";
+import { AgentPool, DEFAULT_ORCHESTRATOR_AGENTS } from "../orchestration/agent-pool";
 import { getToolsForMode } from "../orchestration/modes";
 import type { ToolDefinition } from "../tool-types";
 import {
   ROUTING_CASES,
   MODE_GATING_CASES,
+  COORDINATOR_CASES,
+  AGENT_POOL_CASES,
   type RoutingCase,
   type ModeGatingCase,
+  type CoordinatorCase,
+  type AgentPoolCase,
 } from "./cases";
 
 export interface EvalCaseResult {
@@ -90,10 +96,85 @@ function runModeGatingCase(c: ModeGatingCase): EvalCaseResult {
   };
 }
 
+async function runCoordinatorCase(c: CoordinatorCase): Promise<EvalCaseResult> {
+  const coordinator = new Coordinator(async () => ({ content: c.modelOutput }));
+
+  if (c.expect.throws) {
+    try {
+      await coordinator.route(c.request, { sessionId: c.sessionId });
+      return { id: c.id, kind: c.kind, pass: false, detail: "Expected CoordinatorError — none thrown" };
+    } catch (e) {
+      const pass = e instanceof CoordinatorError;
+      return { id: c.id, kind: c.kind, pass, detail: pass ? "ok" : `wrong error type: ${String(e)}` };
+    }
+  }
+
+  const r = await coordinator.route(c.request, { sessionId: c.sessionId });
+  const problems: string[] = [];
+
+  if (c.expect.task_type !== undefined && r.task_type !== c.expect.task_type) {
+    problems.push(`task_type=${r.task_type} expected=${c.expect.task_type}`);
+  }
+  if (c.expect.topology !== undefined && r.topology !== c.expect.topology) {
+    problems.push(`topology=${r.topology} expected=${c.expect.topology}`);
+  }
+  if (c.expect.estimated_complexity !== undefined && r.context.estimated_complexity !== c.expect.estimated_complexity) {
+    problems.push(`complexity=${r.context.estimated_complexity} expected=${c.expect.estimated_complexity}`);
+  }
+  if (c.expect.executablePipeline !== undefined) {
+    const ep = coordinator.executablePipeline(r);
+    if (JSON.stringify(ep) !== JSON.stringify(c.expect.executablePipeline)) {
+      problems.push(
+        `executablePipeline=${JSON.stringify(ep)} expected=${JSON.stringify(c.expect.executablePipeline)}`,
+      );
+    }
+  }
+
+  return { id: c.id, kind: c.kind, pass: problems.length === 0, detail: problems.length === 0 ? "ok" : problems.join("; ") };
+}
+
+function runAgentPoolCase(c: AgentPoolCase): EvalCaseResult {
+  const pool = new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS);
+  const coverage = pool.coverage();
+
+  switch (c.check) {
+    case "default_pool_size_gte_12": {
+      const pass = coverage.total >= 12;
+      return { id: c.id, kind: c.kind, pass, detail: pass ? "ok" : `pool total=${coverage.total} expected>=12` };
+    }
+    case "no_critical_stage_gaps": {
+      const critical = ["coordinator", "planner", "executor", "reviewer", "synthesizer"];
+      const gaps = critical.filter((s) => coverage.stage_gaps.includes(s));
+      const pass = gaps.length === 0;
+      return { id: c.id, kind: c.kind, pass, detail: pass ? "ok" : `critical stage gaps: ${gaps.join(", ")}` };
+    }
+    case "coordinator_stage_covered": {
+      const agent = pool.pickFor("coordinator", "general");
+      const pass = agent !== undefined;
+      return { id: c.id, kind: c.kind, pass, detail: pass ? "ok" : "no agent for coordinator stage" };
+    }
+    case "executor_stage_covered": {
+      const agent = pool.pickFor("executor", "code_review");
+      const pass = agent !== undefined;
+      return { id: c.id, kind: c.kind, pass, detail: pass ? "ok" : "no agent for executor stage" };
+    }
+    case "code_strong_diversity_gte_3": {
+      const pass = coverage.diversity.code_strong >= 3;
+      return { id: c.id, kind: c.kind, pass, detail: pass ? "ok" : `code_strong=${coverage.diversity.code_strong} expected>=3` };
+    }
+    case "reasoning_strong_diversity_gte_3": {
+      const pass = coverage.diversity.reasoning_strong >= 3;
+      return { id: c.id, kind: c.kind, pass, detail: pass ? "ok" : `reasoning_strong=${coverage.diversity.reasoning_strong} expected>=3` };
+    }
+  }
+}
+
 export async function runEval(): Promise<EvalReport> {
   const results: EvalCaseResult[] = [];
   for (const c of ROUTING_CASES) results.push(await runRoutingCase(c));
   for (const c of MODE_GATING_CASES) results.push(runModeGatingCase(c));
+  for (const c of COORDINATOR_CASES) results.push(await runCoordinatorCase(c));
+  for (const c of AGENT_POOL_CASES) results.push(runAgentPoolCase(c));
 
   const passed = results.filter((r) => r.pass).length;
   return {
@@ -155,6 +236,23 @@ if (import.meta.main) {
       console.log(`${r.pass ? "PASS" : "FAIL"}  ${r.id}${r.pass ? "" : "  — " + r.detail}`);
     }
     console.log(`\n${report.passed}/${report.total} passed, ${report.failed} failed`);
-    if (report.failed > 0) process.exit(1);
+
+    // Gate on baseline DRIFT too (not just hard failures), so the CLI is a
+    // complete regression gate matching harness.test.ts.
+    const { readFileSync } = await import("fs");
+    let drift: string[] = [];
+    try {
+      const baseline = JSON.parse(readFileSync(baselinePath, "utf8")) as Baseline;
+      drift = diffBaseline(report, baseline);
+      if (drift.length) {
+        console.log("\nBaseline drift detected:");
+        for (const d of drift) console.log(`  - ${d}`);
+        console.log("If intended, re-run with --write-baseline to update the snapshot.");
+      }
+    } catch (e) {
+      console.log(`\n(could not read baseline: ${e})`);
+    }
+
+    if (report.failed > 0 || drift.length > 0) process.exit(1);
   }
 }

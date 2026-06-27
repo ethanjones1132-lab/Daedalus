@@ -9,7 +9,7 @@
 // through separate tool implementations.
 
 import type { JarvisConfig } from "./config";
-import type { ToolDefinition, ToolCall, ToolResult } from "./tool-types";
+import type { ToolDefinition, ToolCall, ToolResult, ToolErrorCode } from "./tool-types";
 
 // ── Re-export tool types so callers import from one place ─────────────────────
 export type { ToolDefinition, ToolCall, ToolResult };
@@ -229,6 +229,7 @@ export function createToolRuntime(): ToolRuntime {
         output: `Unknown tool: ${call.name}`,
         is_error: true,
         error: `Unknown tool: ${call.name}`,
+        error_code: "unknown_tool" satisfies ToolErrorCode,
         duration_ms: Date.now() - start,
       };
     }
@@ -246,6 +247,7 @@ export function createToolRuntime(): ToolRuntime {
         output: msg,
         is_error: true,
         error: msg,
+        error_code: "missing_args" satisfies ToolErrorCode,
         duration_ms: Date.now() - start,
       };
     }
@@ -259,6 +261,7 @@ export function createToolRuntime(): ToolRuntime {
         output: policy.reason,
         is_error: true,
         error: policy.reason,
+        error_code: "policy_denied" satisfies ToolErrorCode,
         duration_ms: Date.now() - start,
       };
     }
@@ -278,6 +281,7 @@ export function createToolRuntime(): ToolRuntime {
           output: msg,
           is_error: true,
           error: msg,
+          error_code: "approval_rejected" satisfies ToolErrorCode,
           duration_ms: Date.now() - start,
         };
       }
@@ -302,6 +306,7 @@ export function createToolRuntime(): ToolRuntime {
         output: "",
         is_error: true,
         error: msg,
+        error_code: "handler_error" satisfies ToolErrorCode,
         duration_ms: Date.now() - start,
       };
     }

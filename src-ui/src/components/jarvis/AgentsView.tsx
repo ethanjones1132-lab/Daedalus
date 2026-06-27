@@ -12,9 +12,10 @@
 // plus list_channels() for the binding picker.
 
 import { invoke } from '@tauri-apps/api/core';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   cn,
+  ConfirmModal,
   GlassCard,
   Pill,
   SectionHeader,
@@ -57,19 +58,6 @@ interface AgentDraft {
 const EMPTY_DRAFT: AgentDraft = { name: '', model: '', description: '', system_prompt: '' };
 
 // ── Helpers ────────────────────────────────────────────────────
-
-function boundChannelIds(agent: Agent): string[] {
-  if (!agent.config) return [];
-  try {
-    const parsed = JSON.parse(agent.config);
-    if (Array.isArray(parsed.channels)) {
-      return parsed.channels.filter((c: unknown): c is string => typeof c === 'string');
-    }
-  } catch {
-    /* ignore malformed config */
-  }
-  return [];
-}
 
 // ── Editor (create + edit) ─────────────────────────────────────
 
@@ -162,7 +150,20 @@ function ChannelBindings({
   onChanged: () => void;
 }) {
   const { error: toastError } = useToast();
-  const bound = useMemo(() => new Set(boundChannelIds(agent)), [agent]);
+  const [bound, setBound] = useState<Set<string>>(new Set());
+
+  const refreshBindings = useCallback(async () => {
+    try {
+      const ids = await invoke<string[]>('list_agent_channel_bindings', { agentId: agent.id });
+      setBound(new Set(ids));
+    } catch {
+      setBound(new Set());
+    }
+  }, [agent.id]);
+
+  useEffect(() => {
+    void refreshBindings();
+  }, [refreshBindings]);
 
   const toggle = useCallback(
     async (channel: Channel) => {
@@ -172,12 +173,13 @@ function ChannelBindings({
           agentId: agent.id,
           channelId: channel.id,
         });
+        await refreshBindings();
         onChanged();
       } catch (e) {
         toastError(String(e), 'Channel binding failed');
       }
     },
-    [agent.id, bound, onChanged, toastError],
+    [agent.id, bound, onChanged, refreshBindings, toastError],
   );
 
   if (channels.length === 0) return null;
@@ -216,6 +218,7 @@ export function AgentsView() {
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<Agent | null>(null);
   const { success, error: toastError } = useToast();
 
   const fetchAll = useCallback(async () => {
@@ -293,21 +296,34 @@ export function AgentsView() {
   );
 
   const remove = useCallback(
-    async (agent: Agent) => {
-      if (!window.confirm(`Delete agent "${agent.name}"? This cannot be undone.`)) return;
-      try {
-        await invoke('delete_agent', { id: agent.id });
-        success(`Deleted ${agent.name}`);
-        await fetchAll();
-      } catch (e) {
-        toastError(String(e), 'Delete failed');
-      }
-    },
-    [fetchAll, success, toastError],
+    async (agent: Agent) => { setPendingDelete(agent); },
+    [],
   );
+
+  const confirmDelete = useCallback(async () => {
+    if (!pendingDelete) return;
+    const agent = pendingDelete;
+    setPendingDelete(null);
+    try {
+      await invoke('delete_agent', { id: agent.id });
+      success(`Deleted ${agent.name}`);
+      await fetchAll();
+    } catch (e) {
+      toastError(String(e), 'Delete failed');
+    }
+  }, [pendingDelete, fetchAll, success, toastError]);
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-hidden">
+      <ConfirmModal
+        open={pendingDelete !== null}
+        message={`Delete agent "${pendingDelete?.name}"?`}
+        detail="This cannot be undone."
+        confirmLabel="Delete"
+        danger
+        onConfirm={confirmDelete}
+        onCancel={() => setPendingDelete(null)}
+      />
       <SectionHeader
         title="Agents"
         subtitle="Create, configure, and bind agents to channels"

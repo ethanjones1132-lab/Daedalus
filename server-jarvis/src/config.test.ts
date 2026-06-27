@@ -95,6 +95,48 @@ describe("top_k sampling", () => {
   });
 });
 
+// ─── Blank saved fields must not clobber non-empty defaults ───────────────────
+// Regression: a persisted partial config such as
+//   {"active_backend":"openrouter","openrouter":{"api_key":"sk-...","base_url":"","model":""}}
+// used to survive normalization verbatim, leaving the OpenRouter URL empty.
+// streamJarvis then built `fetch("/chat/completions")` → "URL is invalid", and
+// every orchestrator stage failed, which made chat appear completely dead.
+describe("normalizeConfig blank-field protection", () => {
+  test("an empty openrouter.base_url falls back to the default URL", () => {
+    const cfg = normalizeConfig({ openrouter: { base_url: "" } });
+    expect(cfg.openrouter.base_url).toBe(defaultConfig().openrouter.base_url);
+    expect(cfg.openrouter.base_url).not.toBe("");
+  });
+
+  test("an empty openrouter.model falls back to the default model", () => {
+    const cfg = normalizeConfig({ openrouter: { model: "" } });
+    expect(cfg.openrouter.model).toBe(defaultConfig().openrouter.model);
+    expect(cfg.openrouter.model).not.toBe("");
+  });
+
+  test("the real-world blanked openrouter config heals on load", () => {
+    const cfg = normalizeConfig({
+      active_backend: "openrouter",
+      openrouter: { api_key: "sk-or-v1-test", base_url: "", model: "" },
+    });
+    expect(cfg.openrouter.base_url).toBe(defaultConfig().openrouter.base_url);
+    expect(cfg.openrouter.model).toBe(defaultConfig().openrouter.model);
+    // A genuinely-supplied value (the key) is still preserved.
+    expect(cfg.openrouter.api_key).toBe("sk-or-v1-test");
+  });
+
+  test("a non-empty override still wins over the default", () => {
+    const cfg = normalizeConfig({ openrouter: { model: "anthropic/claude-sonnet-4" } });
+    expect(cfg.openrouter.model).toBe("anthropic/claude-sonnet-4");
+  });
+
+  test("clearing a field whose default is empty stays empty", () => {
+    // api_key's default is "", so an explicit "" is a no-op, not a fallback.
+    const cfg = normalizeConfig({ openrouter: { api_key: "" } });
+    expect(cfg.openrouter.api_key).toBe("");
+  });
+});
+
 // ─── Interactive tool approval (Track B follow-up) ───────────────────────────
 describe("tools.interactive_approval", () => {
   test("defaults to false (legacy passthrough preserved)", () => {
@@ -108,5 +150,47 @@ describe("tools.interactive_approval", () => {
   test("an explicit interactive_approval:true survives normalization", () => {
     const cfg = normalizeConfig({ tools: { interactive_approval: true } });
     expect(cfg.tools.interactive_approval).toBe(true);
+  });
+});
+
+describe("orchestrator agent pool config", () => {
+  test("defaultConfig provides a sane enabled agent pool", () => {
+    const agents = defaultConfig().orchestrator.agents;
+    expect(agents.length).toBeGreaterThanOrEqual(3);
+    expect(agents.every((agent) => agent.enabled)).toBe(true);
+    expect(agents.some((agent) => agent.default_for.includes("executor"))).toBe(true);
+    expect(agents.some((agent) => agent.default_for.includes("reviewer"))).toBe(true);
+  });
+
+  test("normalizeConfig fills in missing orchestrator agents", () => {
+    const cfg = normalizeConfig({ orchestrator: { enabled: true } });
+    expect(cfg.orchestrator.agents.length).toBe(defaultConfig().orchestrator.agents.length);
+  });
+
+  test("defaultConfig enables a bounded recursive orchestrator depth", () => {
+    expect(defaultConfig().orchestrator.max_recursion_depth).toBe(2);
+  });
+
+  test("normalizeConfig fills in missing orchestrator recursion depth", () => {
+    const cfg = normalizeConfig({ orchestrator: { enabled: true } });
+    expect(cfg.orchestrator.max_recursion_depth).toBe(2);
+  });
+
+  test("explicit orchestrator agents survive normalization", () => {
+    const cfg = normalizeConfig({
+      orchestrator: {
+        agents: [
+          {
+            id: "custom-agent",
+            provider: "openrouter",
+            model_id: "openrouter/free",
+            capabilities: { code: 0.1, reasoning: 0.9, speed: 0.8, cost: 1, json_reliability: 0.7 },
+            default_for: ["coordinator"],
+            enabled: true,
+          },
+        ],
+      },
+    });
+    expect(cfg.orchestrator.agents.map((agent) => agent.id)).toEqual(["custom-agent"]);
   });
 });

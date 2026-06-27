@@ -31,6 +31,28 @@ interface MemoryEntry {
 
 type Tier = 'hot' | 'warm' | 'cold';
 
+// Defensive formatters — the memory backend has drifted shape during recovery, so the
+// render must never throw on a missing/oddly-typed field (that blanks the whole page).
+function safeTags(raw: string | undefined | null): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((t): t is string => typeof t === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function fmtConfidence(c: number | undefined | null): string {
+  return typeof c === 'number' && Number.isFinite(c) ? c.toFixed(2) : '—';
+}
+
+function fmtDate(value: string | undefined | null): string {
+  if (!value) return '';
+  const t = Date.parse(value);
+  return Number.isNaN(t) ? '' : new Date(t).toLocaleDateString();
+}
+
 export default function MemoryView() {
   const [memories, setMemories] = useState<MemoryEntry[]>([]);
   const [tierStats, setTierStats] = useState<Record<Tier, number> | null>(null);
@@ -162,7 +184,7 @@ export default function MemoryView() {
                   <div className="flex items-baseline justify-between gap-2 mb-1">
                     <h3 className="text-sm font-medium text-bone">{m.title}</h3>
                     <span className="text-[10px] font-mono text-bone/40">
-                      conf {m.confidence.toFixed(2)}
+                      conf {fmtConfidence(m.confidence)}
                     </span>
                   </div>
                   <p className="text-xs text-bone/60 line-clamp-2 mb-1.5">
@@ -172,7 +194,7 @@ export default function MemoryView() {
                     <span className="rounded-full bg-white/5 border border-white/10 px-1.5 py-0.5 text-bone/60">
                       {m.category}
                     </span>
-                    {m.tags && JSON.parse(m.tags || '[]').slice(0, 3).map((t: string) => (
+                    {safeTags(m.tags).slice(0, 3).map((t: string) => (
                       <span
                         key={t}
                         className="rounded-full bg-accent/10 border border-accent/20 px-1.5 py-0.5 text-accent/80"
@@ -181,7 +203,7 @@ export default function MemoryView() {
                       </span>
                     ))}
                     <span className="ml-auto text-bone/30 font-mono">
-                      {new Date(m.updated_at).toLocaleDateString()}
+                      {fmtDate(m.updated_at)}
                     </span>
                   </div>
                 </GlassCard>

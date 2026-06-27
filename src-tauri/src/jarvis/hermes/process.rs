@@ -78,6 +78,7 @@ pub struct HermesProcess {
     config: HermesConfig,
     state: Arc<Mutex<HermesState>>,
     /// Pending calls keyed by Rid. Each carries a oneshot for the response.
+    #[allow(clippy::type_complexity)]
     pending: Arc<Mutex<HashMap<Rid, oneshot::Sender<Result<serde_json::Value, BridgeError>>>>>,
     /// Monotonic request id counter, formatted as `j{n}`.
     next_rid: AtomicU64,
@@ -139,16 +140,14 @@ impl HermesProcess {
         for (k, v) in &self.config.extra_env {
             command.env(k, v);
         }
-        let mut child = command.spawn().map_err(|e| BridgeError::Io(e))?;
+        let mut child = command.spawn().map_err(BridgeError::Io)?;
         let stdin = child.stdin.take().ok_or_else(|| {
-            BridgeError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            BridgeError::Io(std::io::Error::other(
                 "child stdin not captured",
             ))
         })?;
         let stdout = child.stdout.take().ok_or_else(|| {
-            BridgeError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            BridgeError::Io(std::io::Error::other(
                 "child stdout not captured",
             ))
         })?;
@@ -212,9 +211,15 @@ impl HermesProcess {
             // process was intentionally drained.
             let current = state.lock().await.clone();
             if !matches!(current, HermesState::Draining) {
+                let reason = "child stdout closed".to_string();
                 *state.lock().await = HermesState::Crashed {
-                    reason: "child stdout closed".to_string(),
+                    reason: reason.clone(),
                 };
+                let _ = events_tx.send(HermesEvent {
+                    event_type: "gateway.crashed".to_string(),
+                    session_id: None,
+                    payload: serde_json::json!({ "reason": reason }),
+                });
             }
             // Drop the child handle to release the OS process; if the user
             // wants to restart, they call `start` again.
@@ -229,7 +234,13 @@ impl HermesProcess {
         let mut sub = self.events.subscribe();
         let start = std::time::Instant::now();
         loop {
+            if matches!(self.state().await, HermesState::Ready) {
+                return Ok(());
+            }
             if start.elapsed() > deadline {
+                if matches!(self.state().await, HermesState::Ready) {
+                    return Ok(());
+                }
                 *self.state.lock().await = HermesState::Crashed {
                     reason: format!("startup timeout after {}ms", deadline.as_millis()),
                 };
@@ -253,15 +264,17 @@ impl HermesProcess {
         &self,
         method: impl Into<String>,
         params: serde_json::Value,
+        timeout_ms: Option<u64>,
     ) -> Result<serde_json::Value, BridgeError> {
         if !matches!(self.state().await, HermesState::Ready) {
             return Err(BridgeError::NotRunning);
         }
+        let method_str = method.into();
         let id = self.next_rid();
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id.clone(), tx);
 
-        let msg = OutgoingMessage::request(id.clone(), method, params);
+        let msg = OutgoingMessage::request(id.clone(), method_str.clone(), params);
         let line = serde_json::to_string(&msg).map_err(BridgeError::Json)?;
         {
             let mut w = self.writer.lock().await;
@@ -272,7 +285,10 @@ impl HermesProcess {
             w.write_all(b"\n").await.map_err(BridgeError::Io)?;
         }
 
-        let timeout = std::time::Duration::from_millis(self.config.request_timeout_ms);
+        let effective_ms = timeout_ms
+            .map(|ms| ms.min(300_000))
+            .unwrap_or(self.config.request_timeout_ms);
+        let timeout = std::time::Duration::from_millis(effective_ms);
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(v)) => v,
             Ok(Err(_canceled)) => Err(BridgeError::NotRunning),
@@ -280,7 +296,7 @@ impl HermesProcess {
                 // Timed out — drop the pending sender to free memory.
                 self.pending.lock().await.remove(&id);
                 Err(BridgeError::Timeout {
-                    method: String::new(),
+                    method: method_str,
                     elapsed_ms: timeout.as_millis() as u64,
                 })
             }

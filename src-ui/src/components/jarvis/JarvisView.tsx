@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
@@ -9,6 +9,11 @@ import {
   OPENROUTER_MODELS,
 } from './types';
 import ControlCenterView from './ControlCenterView';
+import MarkdownView from './MarkdownView';
+import {
+  Send, Square, Bot, User, Wrench, Check, Copy, ChevronDown,
+  ChevronRight, Sparkles, LoaderCircle, Plus, ArrowDown,
+} from 'lucide-react';
 
 // ═══════════════════════════════════════════════════════════════
 // ── Main Jarvis View ──
@@ -20,6 +25,13 @@ interface JarvisViewProps {
   initialSubView?: JarvisSubView;
   onCompanionChange?: (companion: CompanionState | null) => void;
 }
+
+const sessionInvokeArgs = (sessionId: string) => ({
+  sessionId,
+  session_id: sessionId,
+});
+
+const JARVIS_API_URL = 'http://127.0.0.1:19877';
 
 export default function JarvisView({ initialSubView = 'chat', onCompanionChange }: JarvisViewProps) {
   const [subView, setSubView] = useState<JarvisSubView>(initialSubView);
@@ -55,12 +67,12 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
     loadStatus();
   }, [loadSessions, loadConfig, loadStatus]);
 
-  const subNavItems: { id: JarvisSubView; label: string; icon: string }[] = [
-    { id: 'chat', label: 'Chat', icon: '◈' },
-    { id: 'sessions', label: 'Sessions', icon: '◉' },
-    { id: 'config', label: 'Config', icon: '⚙' },
-    { id: 'status', label: 'Status', icon: '♡' },
-    { id: 'control', label: 'Control', icon: '◆' },
+  const subNavItems: { id: JarvisSubView; label: string; icon: React.ReactNode }[] = [
+    { id: 'chat', label: 'Chat', icon: <Sparkles size={11} /> },
+    { id: 'sessions', label: 'Sessions', icon: <ChevronRight size={11} /> },
+    { id: 'config', label: 'Config', icon: <Wrench size={11} /> },
+    { id: 'status', label: 'Status', icon: <ChevronDown size={11} /> },
+    { id: 'control', label: 'Control', icon: <Plus size={11} /> },
   ];
 
   // Load companion and notify parent
@@ -77,6 +89,10 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
     loadCompanion();
   }, [onCompanionChange]);
 
+  // Multi-session sticky tabs: a row of chips just under the top subnav so the
+  // user can quick-switch between recent conversations without leaving Chat.
+  const recentSessions = sessions.slice(0, 6);
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 10 }}
@@ -85,24 +101,76 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
       transition={{ duration: 0.25 }}
       className="h-full flex flex-col"
     >
-      {/* Sub-navigation tabs */}
-      <div className="flex items-center gap-1 mb-4 shrink-0">
-        {subNavItems.map(item => (
+      {/* Sub-navigation tabs — ARIA tablist + tab semantics (Phase 4) */}
+      <div
+        role="tablist"
+        aria-label="Jarvis views"
+        className="flex items-center gap-1 mb-3 shrink-0"
+      >
+        {subNavItems.map(item => {
+          const selected = subView === item.id;
+          return (
+            <button
+              key={item.id}
+              role="tab"
+              aria-selected={selected}
+              aria-current={selected ? 'page' : undefined}
+              onClick={() => setSubView(item.id)}
+              className={cn(
+                'px-3 py-1.5 text-xs font-mono rounded-lg border transition-all duration-150 flex items-center gap-1.5',
+                'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50 focus-visible:ring-offset-1 focus-visible:ring-offset-void',
+                selected
+                  ? 'bg-royal/20 text-royal-light border-royal/40'
+                  : 'text-bone-dim border-iron/30 hover:border-iron/50 hover:text-bone-muted'
+              )}
+            >
+              <span className="opacity-70">{item.icon}</span>
+              {item.label}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Sticky session chips (Phase 3.4) */}
+      {recentSessions.length > 0 && (
+        <div className="flex items-center gap-1.5 mb-3 overflow-x-auto pb-1 shrink-0">
           <button
-            key={item.id}
-            onClick={() => setSubView(item.id)}
+            type="button"
+            onClick={() => { setActiveSession(null); setSubView('chat'); }}
+            aria-label="New chat"
             className={cn(
-              'px-3 py-1.5 text-xs font-mono rounded-lg border transition-all duration-150 flex items-center gap-1.5',
-              subView === item.id
-                ? 'bg-royal/20 text-royal-light border-royal/40'
+              'shrink-0 px-2 py-0.5 rounded-md text-[10px] font-mono border transition-colors',
+              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50',
+              activeSession === null
+                ? 'bg-cyan-neon/15 text-cyan-glow border-cyan-neon/40'
                 : 'text-bone-dim border-iron/30 hover:border-iron/50 hover:text-bone-muted'
             )}
           >
-            <span className="text-[10px]">{item.icon}</span>
-            {item.label}
+            <Plus size={10} className="inline -mt-0.5" /> New
           </button>
-        ))}
-      </div>
+          {recentSessions.map(s => {
+            const selected = activeSession === s.id;
+            const label = (s.name || s.title || s.id.slice(0, 8)) as string;
+            return (
+              <button
+                key={s.id}
+                type="button"
+                onClick={() => { setActiveSession(s.id); setSubView('chat'); }}
+                className={cn(
+                  'shrink-0 px-2 py-0.5 rounded-md text-[10px] font-mono border transition-colors max-w-[160px] truncate',
+                  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50',
+                  selected
+                    ? 'bg-royal/20 text-royal-light border-royal/40'
+                    : 'text-bone-dim border-iron/30 hover:border-iron/50 hover:text-bone-muted'
+                )}
+                title={label}
+              >
+                {label}
+              </button>
+            );
+          })}
+        </div>
+      )}
 
       {/* Content */}
       <div className="flex-1 min-h-0">
@@ -113,6 +181,8 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
                 activeSession={activeSession}
                 setActiveSession={setActiveSession}
                 config={config}
+                backendLabel={config?.active_backend === 'openrouter' ? 'OpenRouter' : (config?.active_backend === 'claude_cli' ? 'Claude CLI' : 'Ollama')}
+                modelLabel={config ? (config.active_backend === 'ollama' ? config.ollama.model : (config.active_backend === 'claude_cli' ? (config.claude_cli.model ?? '') : config.openrouter.model)) : ''}
                 onSessionCreated={loadSessions}
               />
             </motion.div>
@@ -218,15 +288,38 @@ function Pill({ children, variant = 'default' }: { children: React.ReactNode; va
 }
 
 // ═══════════════════════════════════════════════════════════════
-// ── Chat Panel ──
+// ── Chat Panel (Phase 1.1 + 1.3 + 1.4 + 2.3-2.8 + 3.x + 4)
 // ═══════════════════════════════════════════════════════════════
 
+// Helper: a single SSE-stream "SessionHistor§Message" shape, mirroring the
+// SessionMessageOut returned by get_session_history.
+interface SessionHistoryMessage {
+  id: string;
+  session_id: string;
+  role: string;
+  content: string;
+  tokens: number;
+  tool_calls: string | null;
+  created_at: string;
+}
+
+// Curated follow-up suggestion chips. The backend doesn't yet emit a per-turn
+// recommendation, so we surface a small static set so the surface feels alive.
+const CURATED_SUGGESTIONS: string[] = [
+  'Refine the previous answer',
+  'Walk me through the reasoning',
+  'Suggest next steps',
+  'Apply this to my code',
+];
+
 function ChatPanel({
-  activeSession, setActiveSession, config, onSessionCreated,
+  activeSession, setActiveSession, config, backendLabel, modelLabel, onSessionCreated,
 }: {
   activeSession: string | null;
   setActiveSession: (id: string | null) => void;
   config: JarvisConfig | null;
+  backendLabel: string;
+  modelLabel: string;
   onSessionCreated: () => void;
 }) {
   const [messages, setMessages] = useState<JarvisMessage[]>([]);
@@ -234,101 +327,703 @@ function ChatPanel({
   const [isStreaming, setIsStreaming] = useState(false);
   const [sessionId, setSessionId] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
-  const [backendLabel, setBackendLabel] = useState<string>('');
-  const [modelLabel, setModelLabel] = useState<string>('');
+  // Orchestrator pipeline progress: e.g. "planner", "executor", "reviewer"
+  const [pipelineStage, setPipelineStage] = useState<string>('');
+  // Recursive-critique info: set when recursive topology is in a critique/re-enter cycle
+  const [recursionDepth, setRecursionDepth] = useState<number | null>(null);
+  // Reasoning/CoT text accumulated while streaming (cleared on done)
+  const [reasoningText, setReasoningText] = useState<string>('');
+  const [showReasoning, setShowReasoning] = useState(false);
+  // Intermediate agent activity per stage (planner/executor/reviewer/rewriter)
+  const [agentSteps, setAgentSteps] = useState<{ stage: string; text: string }[]>([]);
+  const [showAgents, setShowAgents] = useState(true);
+
+  // Phase 1.1 — pending tool approval surfaced from `jarvis://approval_request`.
+  const [pendingApproval, setPendingApproval] = useState<{
+    call_id: string;
+    name: string;
+    arguments: unknown;
+    session_id: string;
+  } | null>(null);
+  const [approvalError, setApprovalError] = useState<string | null>(null);
+
+  // Phase 3.1 — inline tool-call cards built from `tool_use` / `tool_result`.
+  const [toolCalls, setToolCalls] = useState<{
+    call_id?: string;
+    name: string;
+    arguments: unknown;
+    result?: string;
+    is_error?: boolean;
+    matched?: boolean;
+  }[]>([]);
+
+  // Phase 3.3 — token / cost tally for the current turn.
+  const [turnCost, setTurnCost] = useState<{ tokens: number; costUsd: number } | null>(null);
+
+  // Loading-state for Session history fetch (Phase 2.3).
+  const [loadingHistory, setLoadingHistory] = useState(false);
+
+  // Scroll-aware autoscroll (Phase 2.5). When the user scrolls up we pause
+  // automatic anchoring so the chat isn't yanked away mid-read. A floating
+  // "jump to latest" button re-engages the anchor.
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const [userPinnedToBottom, setUserPinnedToBottom] = useState(true);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
-  useEffect(() => {
-    if (config) {
-      setBackendLabel(config.active_backend === 'openrouter' ? 'OpenRouter' : 'Ollama');
-      setModelLabel((config.active_backend === 'ollama' ? config.ollama.model : config.openrouter.model));
-    }
-  }, [config]);
+  // Stable refs for values the stream handlers need without re-subscribing
+  // listeners mid-turn (see memory/jarvis-tauri-listen-race.md).
+  const activeSessionRef = useRef(activeSession);
+  const sessionIdRef = useRef(sessionId);
+  const onSessionCreatedRef = useRef(onSessionCreated);
+  const streamAbortRef = useRef<AbortController | null>(null);
+  useEffect(() => { activeSessionRef.current = activeSession; }, [activeSession]);
+  useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
+  useEffect(() => { onSessionCreatedRef.current = onSessionCreated; }, [onSessionCreated]);
 
-  const scrollToBottom = useCallback(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  const matchesStreamSession = useCallback((sid: string | undefined) => {
+    const current = activeSessionRef.current || sessionIdRef.current;
+    if (!current) return true;
+    if (!sid) return false;
+    return sid === current;
   }, []);
 
-  useEffect(() => { scrollToBottom(); }, [messages, scrollToBottom]);
+  const appendAssistantText = useCallback((text: string) => {
+    if (!text) return;
+    setError(null);
+    setPipelineStage('');
+    setMessages(prev => {
+      const last = prev[prev.length - 1];
+      if (last && last.role === 'assistant' && last.isStreaming) {
+        return [...prev.slice(0, -1), { ...last, content: last.content + text }];
+      }
+      return [...prev, { role: 'assistant', content: text, isStreaming: true }];
+    });
+  }, []);
 
-  // Listen for streaming tokens
+  const finalizeAssistantMessage = useCallback((sid?: string) => {
+    setIsStreaming(false);
+    setPipelineStage('');
+    setRecursionDepth(null);
+    setPendingApproval(null);
+    setUserPinnedToBottom(true);
+    const effectiveSid = sid || activeSessionRef.current || sessionIdRef.current;
+    setMessages(prev => {
+      const last = prev[prev.length - 1];
+      if (last && last.isStreaming) {
+        const finalized = { ...last, isStreaming: false };
+        if (effectiveSid && finalized.content.trim()) {
+          invoke('append_message', {
+            ...sessionInvokeArgs(effectiveSid),
+            role: 'assistant',
+            content: finalized.content,
+          }).catch((e) => console.error('Failed to persist assistant message:', e));
+        }
+        return [...prev.slice(0, -1), finalized];
+      }
+      return prev;
+    });
+    onSessionCreatedRef.current();
+  }, []);
+
+  // Reduced-motion respect — we use it to disable token fade-in / shimmer.
+  const prefersReducedMotion = useRef(false);
   useEffect(() => {
-    const unlisten = listen<{ text: string; session_id: string }>('jarvis://token', (event) => {
-      const { text } = event.payload;
-      setMessages(prev => {
-        const last = prev[prev.length - 1];
-        if (last && last.role === 'assistant' && last.isStreaming) {
-          return [...prev.slice(0, -1), { ...last, content: last.content + text }];
-        }
-        return [...prev, { role: 'assistant', content: text, isStreaming: true }];
-      });
-    });
+    const mq = window.matchMedia('(prefers-reduced-motion: reduce)');
+    prefersReducedMotion.current = mq.matches;
+    const handler = (e: MediaQueryListEvent) => { prefersReducedMotion.current = e.matches; };
+    mq.addEventListener('change', handler);
+    return () => mq.removeEventListener('change', handler);
+  }, []);
 
-    const unlistenDone = listen<{ session_id: string }>('jarvis://done', () => {
-      setIsStreaming(false);
-      setMessages(prev => {
-        const last = prev[prev.length - 1];
-        if (last && last.isStreaming) {
-          return [...prev.slice(0, -1), { ...last, isStreaming: false }];
-        }
-        return prev;
-      });
-      onSessionCreated();
-    });
+  // Scroll-position watcher. We declare "pinned" as: at most 80px above the
+  // bottom. Anything further up means the user is reading — pause autoscroll.
+  const handleScroll = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    setUserPinnedToBottom(distanceFromBottom < 80);
+  }, []);
 
-    const unlistenError = listen<{ error: string; session_id: string }>('jarvis://error', (event) => {
+  const scrollToBottom = useCallback((behavior: 'smooth' | 'auto' = 'smooth') => {
+    messagesEndRef.current?.scrollIntoView({ behavior });
+  }, []);
+
+  // Throttled scroll during streaming: tokens arrive at 20-50 Hz, but
+  // smooth-scrolling on every character feels laggy and costs layout work.
+  // 100ms ≈ 10 fps — smooth enough to follow the cursor, cheap enough to not
+  // thrash the main thread.
+  useEffect(() => {
+    if (!isStreaming || !userPinnedToBottom) return;
+    const t = setTimeout(() => scrollToBottom('smooth'), 100);
+    return () => clearTimeout(t);
+  }, [messages, isStreaming, userPinnedToBottom, scrollToBottom]);
+
+  // Non-streaming reflow: snap immediately when messages change (history load).
+  useEffect(() => {
+    if (isStreaming) return;
+    if (userPinnedToBottom) scrollToBottom('auto');
+  }, [messages, isStreaming, userPinnedToBottom, scrollToBottom]);
+
+  // Phase 2.3 — load session history from SQLite when the user switches to a
+  // different session. Without this the user sees an empty chat for a session
+  // that has prior messages. Was the #1 audit bug.
+  const prevActiveSessionRef = useRef<string | null>(activeSession);
+  // When handleSend creates a session for the very first message, it sets this
+  // to the new id and optimistically renders the user + streaming-assistant
+  // messages. The history-load effect below would otherwise immediately fetch
+  // the (still-empty) history and overwrite them — the "my message vanished"
+  // bug. We skip the load exactly once for that freshly-created session.
+  const suppressHistoryLoadRef = useRef<string | null>(null);
+  useEffect(() => {
+    const prev = prevActiveSessionRef.current;
+    prevActiveSessionRef.current = activeSession;
+    if (prev && prev !== activeSession) {
+      invoke('cancel_chat_stream', sessionInvokeArgs(prev)).catch(() => {});
       setIsStreaming(false);
+      setPipelineStage('');
+      setRecursionDepth(null);
+      setReasoningText('');
+      setShowReasoning(false);
+      setAgentSteps([]);
+      setShowAgents(true);
+      setToolCalls([]);
+      setTurnCost(null);
+      setPendingApproval(null);
+      setApprovalError(null);
+      setError(null);
+    }
+    if (!activeSession) {
+      setMessages([]);
+      setSessionId('');
+      setToolCalls([]);
+      setTurnCost(null);
+      setError(null);
+      setPipelineStage('');
+      setReasoningText('');
+      setAgentSteps([]);
+      setIsStreaming(false);
+      return;
+    }
+    if (suppressHistoryLoadRef.current && suppressHistoryLoadRef.current === activeSession) {
+      // Freshly created by handleSend — the optimistic messages are already on
+      // screen and the stream is in flight. Loading empty history would wipe
+      // them. Consume the suppression once and leave the messages intact.
+      suppressHistoryLoadRef.current = null;
+      setLoadingHistory(false);
+      return;
+    }
+    let cancelled = false;
+    setLoadingHistory(true);
+    invoke<SessionHistoryMessage[]>('get_session_history', sessionInvokeArgs(activeSession))
+      .then((rows) => {
+        if (cancelled) return;
+        setMessages(rows.map(r => ({
+          role: (r.role === 'user' || r.role === 'assistant' || r.role === 'tool' || r.role === 'system') ? r.role : 'assistant',
+          content: r.content,
+          timestamp: r.created_at,
+        })));
+        // Jump to the bottom without animation on initial history load.
+        requestAnimationFrame(() => {
+          if (!cancelled) {
+            setUserPinnedToBottom(true);
+            scrollToBottom('auto');
+          }
+        });
+      })
+      .catch((e) => {
+        if (!cancelled) console.error('Failed to load session history:', e);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingHistory(false);
+      });
+    return () => { cancelled = true; };
+  }, [activeSession, scrollToBottom]);
+
+  // Register jarvis:// listeners once on mount. Async listen() + deps that
+  // change during streaming causes a re-subscribe storm (jarvis-tauri-listen-race).
+  useEffect(() => {
+    const unsubs: Array<() => void> = [];
+    let disposed = false;
+    const track = (p: Promise<() => void>) => {
+      p.then((f) => {
+        if (disposed) f();
+        else unsubs.push(f);
+      });
+    };
+
+    track(listen<{ text: string; session_id: string }>('jarvis://token', (event) => {
+      const { text, session_id } = event.payload;
+      if (!text || !matchesStreamSession(session_id)) return;
+      appendAssistantText(text);
+    }));
+
+    track(listen<{ session_id: string }>('jarvis://done', (event) => {
+      if (!matchesStreamSession(event.payload.session_id)) return;
+      finalizeAssistantMessage(event.payload.session_id);
+    }));
+
+    track(listen<{ error: string; session_id: string }>('jarvis://error', (event) => {
+      if (!matchesStreamSession(event.payload.session_id)) return;
+      setIsStreaming(false);
+      setPipelineStage('');
+      setRecursionDepth(null);
+      setPendingApproval(null);
       setError(event.payload.error);
+      setUserPinnedToBottom(true);
       setMessages(prev => {
         const last = prev[prev.length - 1];
         if (last && last.isStreaming) {
+          // If nothing streamed before the error (e.g. a turn-fatal auth
+          // failure), drop the empty assistant bubble so the user sees just
+          // their message + the error banner — not a blank reply. Otherwise
+          // finalize whatever partial text did arrive.
+          if (!last.content.trim()) {
+            return prev.slice(0, -1);
+          }
           return [...prev.slice(0, -1), { ...last, isStreaming: false }];
         }
         return prev;
       });
-    });
+    }));
+
+    track(listen<{ stage: string; status: string; agent: string; session_id?: string }>('jarvis://stage', (event) => {
+      if (!matchesStreamSession(event.payload.session_id)) return;
+      const { stage, status } = event.payload;
+      setPipelineStage(status === 'done' ? '' : stage);
+    }));
+
+    track(listen<{ depth: number; status: string; reenter_stage?: string; critique?: string; session_id?: string }>('jarvis://recursion', (event) => {
+      if (!matchesStreamSession(event.payload.session_id)) return;
+      const { depth, status } = event.payload;
+      // Show depth only while an active recursive critique cycle is running
+      setRecursionDepth(status === 'done' || status === 'max_depth' ? null : depth);
+    }));
+
+    track(listen<{ text: string; session_id?: string }>('jarvis://reasoning', (event) => {
+      if (!matchesStreamSession(event.payload.session_id)) return;
+      setReasoningText(prev => prev + event.payload.text);
+    }));
+
+    track(listen<{ trace: unknown; session_id?: string }>('jarvis://reasoning_complete', (event) => {
+      if (!matchesStreamSession(event.payload.session_id)) return;
+      const trace = event.payload.trace as { steps?: Array<{ content?: string }> } | null;
+      if (trace?.steps?.length) {
+        const joined = trace.steps.map((s) => s.content ?? '').filter(Boolean).join('\n');
+        if (joined) setReasoningText(joined);
+      }
+      setShowReasoning(true);
+    }));
+
+    track(listen<{ stage: string; text: string; session_id?: string }>('jarvis://agent_activity', (event) => {
+      if (!matchesStreamSession(event.payload.session_id)) return;
+      const { stage, text } = event.payload;
+      if (stage === 'coordinator') {
+        setPipelineStage('coordinator');
+        return;
+      }
+      setAgentSteps(prev => {
+        const last = prev[prev.length - 1];
+        if (last && last.stage === stage) {
+          return [...prev.slice(0, -1), { stage, text: last.text + text }];
+        }
+        return [...prev, { stage, text }];
+      });
+    }));
+
+    track(listen<{
+      call_id: string;
+      name: string;
+      arguments: unknown;
+      session_id: string;
+    }>('jarvis://approval_request', (event) => {
+      const p = event.payload;
+      if (!matchesStreamSession(p.session_id)) return;
+      setApprovalError(null);
+      setPendingApproval({
+        call_id: p.call_id,
+        name: p.name,
+        arguments: p.arguments,
+        session_id: p.session_id,
+      });
+    }));
+
+    track(listen<{ call_id?: string; name: string; arguments: unknown; session_id?: string }>('jarvis://tool_call', (event) => {
+      if (!matchesStreamSession(event.payload.session_id)) return;
+      setToolCalls(prev => [...prev, {
+        call_id: event.payload.call_id,
+        name: event.payload.name,
+        arguments: event.payload.arguments,
+      }]);
+    }));
+
+    track(listen<{
+      call_id: string;
+      name: string;
+      output: string;
+      is_error: boolean;
+      session_id?: string;
+    }>('jarvis://tool_result', (event) => {
+      if (!matchesStreamSession(event.payload.session_id)) return;
+      const { call_id, name, output, is_error } = event.payload;
+      setToolCalls(prev => {
+        const idx = [...prev].reverse().findIndex((c) => {
+          if (c.result !== undefined) return false;
+          if (call_id && c.call_id) return c.call_id === call_id;
+          return c.name === name;
+        });
+        if (idx >= 0) {
+          const real = prev.length - 1 - idx;
+          const next = [...prev];
+          next[real] = { ...next[real], result: output, is_error, matched: true };
+          return next;
+        }
+        return [...prev, { name, arguments: null, result: output, is_error }];
+      });
+    }));
+
+    track(listen<{ tokens: number; cost_usd: number; session_id?: string }>('jarvis://cost', (event) => {
+      if (!matchesStreamSession(event.payload.session_id)) return;
+      setTurnCost({ tokens: event.payload.tokens, costUsd: event.payload.cost_usd });
+    }));
 
     return () => {
-      unlisten.then(f => f());
-      unlistenDone.then(f => f());
-      unlistenError.then(f => f());
+      disposed = true;
+      unsubs.forEach((f) => f());
     };
-  }, [onSessionCreated]);
+  }, [appendAssistantText, finalizeAssistantMessage, matchesStreamSession]);
+
+  // True autosize composer (Phase 2.4). The previous rows=⟨line-count⟩ approach
+  // overflowed for single-line wrapped text.
+  useLayoutEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 320)}px`;
+  }, [input]);
+
+  // Autofocus + focus-after-send + focus-after-session-switch.
+  useEffect(() => {
+    const t = setTimeout(() => inputRef.current?.focus(), 50);
+    return () => clearTimeout(t);
+  }, [activeSession, isStreaming]);
+
+  const streamFromJarvisApi = useCallback(async (
+    sid: string,
+    userMsg: string,
+    history: Array<{ role: string; content: string }>,
+  ) => {
+    streamAbortRef.current?.abort();
+    const controller = new AbortController();
+    streamAbortRef.current = controller;
+    setPipelineStage('stream relay');
+
+    invoke('append_message', {
+      ...sessionInvokeArgs(sid),
+      role: 'user',
+      content: userMsg,
+    }).catch((e) => console.error('Failed to persist user message:', e));
+
+    const response = await fetch(`${JARVIS_API_URL}/chat/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: userMsg,
+        session_id: sid,
+        history,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new Error(`Jarvis server returned ${response.status}: ${body}`);
+    }
+    if (!response.body) {
+      throw new Error('Jarvis server returned no response stream.');
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let streamedVisibleText = false;
+
+    const handleFrame = (frame: any) => {
+      if (!frame || typeof frame !== 'object') return;
+      if (frame.type === 'stream_event' && frame.delta?.text) {
+        streamedVisibleText = true;
+        appendAssistantText(String(frame.delta.text));
+        return;
+      }
+      if (frame.type === 'agent_activity' && frame.text) {
+        const stage = String(frame.stage || 'agent');
+        if (stage === 'coordinator') {
+          setPipelineStage('coordinator');
+          return;
+        }
+        setAgentSteps(prev => {
+          const last = prev[prev.length - 1];
+          const text = String(frame.text);
+          if (last && last.stage === stage) {
+            return [...prev.slice(0, -1), { stage, text: last.text + text }];
+          }
+          return [...prev, { stage, text }];
+        });
+        return;
+      }
+      if (frame.type === 'orchestrator_stage') {
+        setPipelineStage(frame.status === 'done' ? '' : String(frame.stage || ''));
+        return;
+      }
+      if (frame.type === 'orchestrator_recursion') {
+        const status = String(frame.status || '');
+        setRecursionDepth(status === 'done' || status === 'max_depth' ? null : Number(frame.depth || 0));
+        return;
+      }
+      if (frame.type === 'reasoning_step' || frame.type === 'reasoning_chunk') {
+        const text = frame.content ?? frame.text ?? frame.delta?.text ?? frame.step?.content;
+        if (text) setReasoningText(prev => prev + String(text));
+        return;
+      }
+      if (frame.type === 'reasoning_complete') {
+        setShowReasoning(true);
+        return;
+      }
+      if (frame.type === 'tool_use') {
+        setToolCalls(prev => [...prev, {
+          call_id: frame.id || frame.call_id,
+          name: frame.name || frame.tool_name || 'unknown',
+          arguments: frame.arguments ?? null,
+        }]);
+        return;
+      }
+      if (frame.type === 'tool_result') {
+        const callId = frame.call_id;
+        const name = frame.name || 'tool';
+        const output = String(frame.output ?? frame.result ?? '');
+        const isError = Boolean(frame.is_error || frame.status === 'error');
+        setToolCalls(prev => {
+          const idx = [...prev].reverse().findIndex((c) => {
+            if (c.result !== undefined) return false;
+            if (callId && c.call_id) return c.call_id === callId;
+            return c.name === name;
+          });
+          if (idx >= 0) {
+            const real = prev.length - 1 - idx;
+            const next = [...prev];
+            next[real] = { ...next[real], result: output, is_error: isError, matched: true };
+            return next;
+          }
+          return [...prev, { name, arguments: null, result: output, is_error: isError }];
+        });
+        return;
+      }
+      if (frame.type === 'cost_info') {
+        setTurnCost({
+          tokens: Number(frame.total_tokens ?? frame.tokens ?? 0),
+          costUsd: Number(frame.cost_usd ?? 0),
+        });
+        return;
+      }
+      if (frame.type === 'result' && !streamedVisibleText) {
+        if (frame.is_error) throw new Error(String(frame.result || frame.error || 'Jarvis stream failed.'));
+        const text = String(frame.result || '');
+        if (text) appendAssistantText(text);
+        return;
+      }
+      if (frame.type === 'error') {
+        throw new Error(String(frame.error || 'Jarvis stream failed.'));
+      }
+    };
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split('\n\n');
+      buffer = events.pop() ?? '';
+      for (const eventText of events) {
+        for (const line of eventText.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const data = trimmed.slice(5).trim();
+          if (!data || data === '[DONE]') continue;
+          handleFrame(JSON.parse(data));
+        }
+      }
+    }
+
+    finalizeAssistantMessage(sid);
+    streamAbortRef.current = null;
+  }, [appendAssistantText, finalizeAssistantMessage]);
 
   const handleSend = useCallback(async () => {
     if (!input.trim() || isStreaming) return;
     const userMsg = input.trim();
+    const history = messages
+      .filter((msg) => !msg.isStreaming && msg.content.trim())
+      .map((msg) => ({ role: msg.role, content: msg.content }));
     setInput('');
     setError(null);
     setIsStreaming(true);
-    setMessages(prev => [...prev, { role: 'user', content: userMsg }]);
+    setPipelineStage('');
+    setRecursionDepth(null);
+    setReasoningText('');
+    setShowReasoning(false);
+    setAgentSteps([]);
+    setShowAgents(true);
+    setToolCalls([]);
+    setTurnCost(null);
+    setUserPinnedToBottom(true);
+    setMessages(prev => [
+      ...prev,
+      { role: 'user', content: userMsg },
+      { role: 'assistant', content: '', isStreaming: true },
+    ]);
 
     try {
-      await invoke('jarvis_send_message', {
-        message: userMsg,
-        sessionId: activeSession || sessionId,
-      });
+      let effectiveSessionId = activeSession || sessionId;
+      if (!effectiveSessionId) {
+        const newSession = await invoke<JarvisSession>('jarvis_new_session', {
+          name: userMsg.slice(0, 60),
+        });
+        effectiveSessionId = newSession.id;
+        // Suppress the history-load effect that setActiveSession is about to
+        // trigger — otherwise it overwrites the optimistic messages above with
+        // the empty history of this brand-new session.
+        suppressHistoryLoadRef.current = newSession.id;
+        setSessionId(newSession.id);
+        setActiveSession(newSession.id);
+        onSessionCreated();
+      }
+
+      await streamFromJarvisApi(effectiveSessionId, userMsg, history);
     } catch (e) {
+      streamAbortRef.current = null;
       setIsStreaming(false);
       setError(String(e));
+      setMessages(prev => {
+        const last = prev[prev.length - 1];
+        if (last?.role === 'assistant' && last.isStreaming) {
+          if (!last.content.trim()) {
+            return prev.slice(0, -1);
+          }
+          return [...prev.slice(0, -1), { ...last, isStreaming: false }];
+        }
+        return prev;
+      });
     }
-  }, [input, isStreaming, activeSession, sessionId]);
+  }, [input, isStreaming, messages, activeSession, sessionId, onSessionCreated, setActiveSession, streamFromJarvisApi]);
+
+  // Phase 1.3 — real Stop. POST /chat/cancel on the Bun server; SseRelay now
+  // treats the resulting `cancelled` frame as terminal, so isStreaming flips.
+  const handleStop = useCallback(async () => {
+    const sid = activeSession || sessionId;
+    if (!sid) {
+      setIsStreaming(false);
+      return;
+    }
+    streamAbortRef.current?.abort();
+    streamAbortRef.current = null;
+    fetch(`${JARVIS_API_URL}/chat/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sid }),
+    }).catch(() => {});
+    try {
+      const cancelled = await invoke<boolean>('cancel_chat_stream', sessionInvokeArgs(sid));
+      if (!cancelled) setIsStreaming(false);
+    } catch (e) {
+      console.error('Failed to cancel stream:', e);
+      setIsStreaming(false);
+    }
+  }, [activeSession, sessionId]);
+
+  // Phase 1.1 — approve / deny the pending tool call and forward the decision
+  // to the Bun server. Surface any POST error so the user can retry.
+  const handleApproval = useCallback(async (approved: boolean) => {
+    if (!pendingApproval) return;
+    try {
+      await invoke('jarvis_tool_decision', {
+        ...sessionInvokeArgs(pendingApproval.session_id),
+        toolCallId: pendingApproval.call_id,
+        tool_call_id: pendingApproval.call_id,
+        decision: approved ? 'approve' : 'deny',
+      });
+      setPendingApproval(null);
+      setApprovalError(null);
+    } catch (e) {
+      setApprovalError(String(e));
+    }
+  }, [pendingApproval]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    // Enter sends; Shift+Enter / Ctrl+Enter / Cmd+Enter → newline.
+    if (e.key === 'Enter' && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
       e.preventDefault();
       handleSend();
+      return;
+    }
+    // Esc → stop the stream during streaming, otherwise blur.
+    if (e.key === 'Escape' && isStreaming) {
+      e.preventDefault();
+      handleStop();
+      return;
+    }
+    // Cmd/Ctrl+K → new chat.
+    if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
+      e.preventDefault();
+      handleNewChat();
     }
   };
 
   const handleNewChat = () => {
+    const sid = activeSession || sessionId;
+    if (isStreaming && sid) {
+      invoke('cancel_chat_stream', sessionInvokeArgs(sid)).catch(() => {});
+    }
+    setIsStreaming(false);
     setMessages([]);
     setSessionId('');
     setActiveSession(null);
     setError(null);
+    setPipelineStage('');
+    setRecursionDepth(null);
+    setReasoningText('');
+    setShowReasoning(false);
+    setAgentSteps([]);
+    setToolCalls([]);
+    setTurnCost(null);
+    setPendingApproval(null);
+    setUserPinnedToBottom(true);
+    setTimeout(() => inputRef.current?.focus(), 50);
+  };
+
+  const onSuggestionClick = (s: string) => {
+    setInput(s);
     inputRef.current?.focus();
   };
+
+  const lastAssistant = messages[messages.length - 1];
+  const streamStatusText = (() => {
+    if (!isStreaming) return undefined;
+    if (pendingApproval) return `Jarvis is waiting for approval to run ${pendingApproval.name}.`;
+    if (pipelineStage) return `Jarvis is running ${pipelineStage}...`;
+    const latestAgentStep = agentSteps[agentSteps.length - 1];
+    if (latestAgentStep?.stage) return `Jarvis is working in ${latestAgentStep.stage}...`;
+    return 'Jarvis is preparing the response...';
+  })();
+  const showSkeleton =
+    isStreaming &&
+    !loadingHistory &&
+    (messages.length === 0 ||
+      (lastAssistant && lastAssistant.role !== 'assistant' && !lastAssistant.isStreaming));
+
+  const lastAssistantFinished =
+    messages.length > 0 &&
+    messages[messages.length - 1].role === 'assistant' &&
+    !messages[messages.length - 1].isStreaming &&
+    !isStreaming;
 
   return (
     <div className="h-full flex flex-col">
@@ -346,15 +1041,43 @@ function ChatPanel({
         </div>
         <button
           onClick={handleNewChat}
-          className="px-3 py-1 text-xs font-mono text-bone-dim border border-iron/30 rounded-lg hover:border-iron/50 hover:text-bone-muted transition-colors"
+          className="px-3 py-1 text-xs font-mono text-bone-dim border border-iron/30 rounded-lg hover:border-iron/50 hover:text-bone-muted transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
         >
           + New Chat
         </button>
       </div>
 
-      {/* Messages area */}
-      <div className="flex-1 overflow-y-auto mb-4 space-y-3 pr-1 min-h-0">
-        {messages.length === 0 && (
+      {/* Messages area — ARIA live-region so screen readers announce tokens. */}
+      <div
+        ref={scrollContainerRef}
+        onScroll={handleScroll}
+        role="log"
+        aria-live="polite"
+        aria-relevant="additions"
+        aria-label="Jarvis chat transcript"
+        className="flex-1 overflow-y-auto mb-4 space-y-3 pr-1 min-h-0 scroll-smooth"
+      >
+        {loadingHistory && (
+          <div className="space-y-2">
+            {[0, 1, 2].map(i => (
+              <div
+                key={i}
+                className={cn(
+                  'rounded-xl border border-iron/30 p-3 mr-12',
+                  i % 2 === 0 ? 'bg-cyan-neon/5' : 'bg-royal/5',
+                )}
+              >
+                <div className="mb-2">
+                  <div className="h-2 w-16 rounded bg-iron/50" />
+                </div>
+                <div className="h-3 w-3/4 rounded bg-iron/40 animate-pulse" />
+                <div className="mt-1 h-3 w-1/2 rounded bg-iron/30 animate-pulse" />
+              </div>
+            ))}
+          </div>
+        )}
+
+        {messages.length === 0 && !loadingHistory && (
           <div className="h-full flex items-center justify-center">
             <div className="text-center max-w-md">
               <motion.div
@@ -378,28 +1101,167 @@ function ChatPanel({
                   Powered by Ollama · {config.ollama.model}
                 </p>
               )}
+              {config?.active_backend === 'claude_cli' && (
+                <p className="text-bone-faint text-xs font-mono mt-2">
+                  Powered by Claude CLI · {config.claude_cli.model ?? 'default'}
+                </p>
+              )}
+              {/* Example prompt chips for first impression */}
+              <div className="flex flex-wrap justify-center gap-2 mt-4">
+                {['Refactor a function', 'Debug a stack trace', 'Explain a piece of code'].map(p => (
+                  <button
+                    key={p}
+                    type="button"
+                    onClick={() => onSuggestionClick(p)}
+                    className={cn(
+                      'px-2.5 py-1 rounded-lg text-[11px] font-mono border transition-colors',
+                      'text-bone-dim border-iron/30 hover:border-royal/40 hover:text-bone-muted',
+                      'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50'
+                    )}
+                  >
+                    {p}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
         )}
 
         {messages.map((msg, i) => (
-          <ChatMessage key={i} message={msg} />
+          <ChatMessage
+            key={i}
+            message={msg}
+            index={i}
+            prefersReducedMotion={prefersReducedMotion.current}
+            streamStatus={msg.isStreaming && !msg.content.trim() ? streamStatusText : undefined}
+          />
         ))}
+
+        {/* First-token skeleton (Phase 2.5) — shimmer placeholder for the
+            assistant bubble before any token has landed. */}
+        {showSkeleton && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            className="rounded-xl px-4 py-3 border mr-8 bg-cyan-neon/5 border-cyan-neon/15"
+            aria-hidden="true"
+          >
+            <div className="flex items-center gap-2 mb-1.5">
+              <span className="text-[10px] font-mono uppercase tracking-wider font-bold text-cyan-neon flex items-center gap-1">
+                <Bot size={11} /> JARVIS
+              </span>
+              <motion.span
+                className="text-[10px] font-mono text-cyan-neon flex items-center gap-1"
+                animate={{ opacity: prefersReducedMotion.current ? 1 : [0.4, 1, 0.4] }}
+                transition={{ duration: 1.2, repeat: prefersReducedMotion.current ? 0 : Infinity }}
+              >
+                <LoaderCircle size={10} className={prefersReducedMotion.current ? '' : 'animate-spin'} /> thinking
+              </motion.span>
+            </div>
+            <div className="space-y-1.5">
+              <div className="h-2.5 w-3/4 rounded bg-iron/50 shimmer-bar" />
+              <div className="h-2.5 w-1/2 rounded bg-iron/40 shimmer-bar" />
+              <div className="h-2.5 w-2/3 rounded bg-iron/30 shimmer-bar" />
+            </div>
+          </motion.div>
+        )}
+
+        {/* Inline tool-call cards (Phase 3.1). */}
+        {toolCalls.length > 0 && (
+          <div className="space-y-1.5">
+            {toolCalls.map((call, i) => (
+              <ToolCallCard key={`tc-${i}`} call={call} />
+            ))}
+          </div>
+        )}
+
+        {/* Reasoning + Agents combined disclosure — accordion with per-stage rows */}
+        {(reasoningText || agentSteps.length > 0) && (
+          <ReasoningAgentsAccordion
+            reasoningText={reasoningText}
+            agentSteps={agentSteps}
+            showAgents={showAgents}
+            setShowAgents={setShowAgents}
+            showReasoning={showReasoning}
+            setShowReasoning={setShowReasoning}
+          />
+        )}
+
+        {/* Pipeline stage breadcrumb (orchestrator mode) */}
+        {pipelineStage && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            className="flex items-center gap-2 px-3 py-2 bg-royal/5 border border-royal/15 rounded-lg text-[10px] font-mono text-royal-light"
+            aria-label={`Orchestrator stage: ${pipelineStage}`}
+          >
+            <motion.span
+              animate={{ opacity: prefersReducedMotion.current ? 1 : [0.4, 1, 0.4] }}
+              transition={{ duration: 1.2, repeat: prefersReducedMotion.current ? 0 : Infinity }}
+              aria-hidden="true"
+            >
+              <Sparkles size={11} />
+            </motion.span>
+            <span className="uppercase tracking-wider">{pipelineStage}</span>
+            {recursionDepth !== null && (
+              <span className="text-bone-faint">↩ depth {recursionDepth}</span>
+            )}
+            {recursionDepth === null && <span className="text-bone-faint">running…</span>}
+          </motion.div>
+        )}
 
         {error && (
           <motion.div
             initial={{ opacity: 0, y: 6 }}
             animate={{ opacity: 1, y: 0 }}
             className="p-3 bg-error/10 border border-error/30 rounded-xl"
+            role="alert"
           >
-            <p className="text-error text-xs font-mono">{error}</p>
+            <p className="text-error text-xs font-mono break-words">{error}</p>
           </motion.div>
+        )}
+
+        {/* Follow-up suggestion chips once an assistant message is finalized. */}
+        {lastAssistantFinished && (
+          <div className="flex flex-wrap gap-1.5 pt-1">
+            {CURATED_SUGGESTIONS.map(s => (
+              <button
+                key={s}
+                type="button"
+                onClick={() => onSuggestionClick(s)}
+                className={cn(
+                  'px-2.5 py-1 rounded-lg text-[11px] font-mono border transition-colors',
+                  'text-bone-dim border-iron/30 hover:border-royal/40 hover:text-bone-muted',
+                  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50'
+                )}
+              >
+                {s}
+              </button>
+            ))}
+          </div>
         )}
 
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Input area */}
+      {/* Phase 2.5 — "Jump to latest" pill when the user has scrolled up. */}
+      <AnimatePresence>
+        {!userPinnedToBottom && (
+          <motion.button
+            type="button"
+            onClick={() => { setUserPinnedToBottom(true); scrollToBottom('smooth'); }}
+            initial={{ opacity: 0, y: 4 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 4 }}
+            className="absolute right-8 bottom-28 mb-1 px-2.5 py-1 rounded-full text-[11px] font-mono bg-royal/30 text-royal-light border border-royal/40 hover:bg-royal/50 transition-colors flex items-center gap-1 z-10"
+            aria-label="Jump to latest message"
+          >
+            <ArrowDown size={11} /> Latest
+          </motion.button>
+        )}
+      </AnimatePresence>
+
+      {/* Input area — single-slot morph: Send | Stop (the user's chosen UX). */}
       <div className="shrink-0">
         <div className="relative">
           <textarea
@@ -407,85 +1269,146 @@ function ChatPanel({
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder={isStreaming ? 'Jarvis is thinking...' : 'Ask Jarvis anything... (Enter to send, Shift+Enter for newline)'}
-            disabled={isStreaming}
-            rows={Math.min(Math.max(input.split('\n').length, 1), 8)}
+            placeholder={isStreaming ? 'Jarvis is thinking… (Esc to stop)' : 'Ask Jarvis anything… (Enter to send · Shift+Enter for newline · ⌘K new chat)'}
             className={cn(
               'w-full px-4 py-3 pr-14 text-sm font-mono bg-obsidian/60 border rounded-xl text-bone',
-              'placeholder:text-bone-faint focus:outline-none transition-colors resize-none',
-              isStreaming ? 'border-royal/30 opacity-60' : 'border-iron/40 focus:border-royal/50'
+              'placeholder:text-bone-faint transition-colors resize-none',
+              'focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50',
+              isStreaming ? 'border-royal/30 opacity-80' : 'border-iron/40'
             )}
+            rows={1}
+            aria-label="Chat input"
           />
           <button
-            onClick={handleSend}
-            disabled={isStreaming || !input.trim()}
+            onClick={isStreaming ? handleStop : handleSend}
+            disabled={!isStreaming && !input.trim()}
+            aria-label={isStreaming ? 'Stop streaming' : 'Send message'}
             className={cn(
               'absolute right-2 bottom-2 w-8 h-8 rounded-lg flex items-center justify-center transition-all',
-              isStreaming || !input.trim()
-                ? 'bg-iron/20 text-bone-faint cursor-not-allowed'
-                : 'bg-royal/30 text-royal-light hover:bg-royal/50 cursor-pointer'
+              'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50',
+              isStreaming
+                ? 'bg-error/30 text-error hover:bg-error/50 cursor-pointer'
+                : !input.trim()
+                  ? 'bg-iron/20 text-bone-faint cursor-not-allowed'
+                  : 'bg-royal/30 text-royal-light hover:bg-royal/50 cursor-pointer'
             )}
           >
-            {isStreaming ? (
-              <motion.div
-                className="w-4 h-4 border-2 border-royal/30 border-t-royal-light rounded-full"
-                animate={{ rotate: 360 }}
-                transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
-              />
-            ) : (
-              <span className="text-sm">↑</span>
-            )}
+            <AnimatePresence mode="wait" initial={false}>
+              {isStreaming ? (
+                <motion.span
+                  key="stop"
+                  initial={{ opacity: 0, scale: 0.6 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.6 }}
+                  transition={{ duration: 0.12 }}
+                >
+                  <Square size={14} fill="currentColor" />
+                </motion.span>
+              ) : (
+                <motion.span
+                  key="send"
+                  initial={{ opacity: 0, scale: 0.6 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.6 }}
+                  transition={{ duration: 0.12 }}
+                >
+                  <Send size={14} />
+                </motion.span>
+              )}
+            </AnimatePresence>
           </button>
         </div>
         <div className="flex items-center justify-between mt-1.5 px-1">
           <span className="text-[10px] font-mono text-bone-faint">
-            {isStreaming ? '● Streaming...' : `${messages.filter(m => m.role === 'user').length} messages sent`}
+            {isStreaming ? '● Streaming…' : `${messages.filter(m => m.role === 'user').length} message${messages.filter(m => m.role === 'user').length !== 1 ? 's' : ''} sent`}
           </span>
-          <span className="text-[10px] font-mono text-bone-faint">
-            {config?.active_backend === 'openrouter' ? 'via OpenRouter' : 'via Ollama'}
+          <span className="text-[10px] font-mono text-bone-faint flex items-center gap-2">
+            {turnCost && (
+              <>
+                <span>{turnCost.tokens.toLocaleString()} tok</span>
+                {turnCost.costUsd > 0 && <span>${turnCost.costUsd.toFixed(4)}</span>}
+                <span aria-hidden="true">·</span>
+              </>
+            )}
+            {config?.active_backend === 'openrouter' ? 'via OpenRouter' : config?.active_backend === 'claude_cli' ? 'via Claude CLI' : 'via Ollama'}
           </span>
         </div>
       </div>
+
+      {/* Phase 1.1 — Tool approval modal. Rendered outside the scroll area so
+          it never gets clipped; focus is trapped by Esc / click-backdrop. */}
+      <AnimatePresence>
+        {pendingApproval && (
+          <ApprovalModal
+            call_id={pendingApproval.call_id}
+            name={pendingApproval.name}
+            args={pendingApproval.arguments}
+            error={approvalError}
+            onApprove={() => handleApproval(true)}
+            onReject={() => handleApproval(false)}
+          />
+        )}
+      </AnimatePresence>
     </div>
   );
 }
 
 // ═══════════════════════════════════════════════════════════════
-// ── Chat Message Bubble ──
+// ── Chat Message Bubble (Phase 2.2 + 2.7 + 4) ──
 // ═══════════════════════════════════════════════════════════════
 
-function ChatMessage({ message }: { message: JarvisMessage }) {
+function ChatMessage({
+  message, index, prefersReducedMotion, streamStatus,
+}: {
+  message: JarvisMessage;
+  index: number;
+  prefersReducedMotion: boolean;
+  streamStatus?: string;
+}) {
   const isUser = message.role === 'user';
   const isTool = message.role === 'tool';
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(message.content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch (e) {
+      console.error('Failed to copy:', e);
+    }
+  }, [message.content]);
 
   return (
     <motion.div
-      initial={{ opacity: 0, y: 8 }}
+      initial={prefersReducedMotion ? false : { opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.2 }}
       className={cn(
-        'rounded-xl px-4 py-3 text-sm border',
+        'rounded-xl px-4 py-3 text-sm border shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04)]',
+        'backdrop-blur-xl',
         isUser
-          ? 'bg-royal/10 border-royal/20 ml-12'
+          ? 'glass-strong bg-royal/10 border-royal/25 ml-12'
           : isTool
-            ? 'bg-obsidian/40 border-iron/20 mr-8'
-            : 'bg-cyan-neon/5 border-cyan-neon/15 mr-8'
+            ? 'glass-mythos bg-obsidian/40 border-iron/30 mr-8'
+            : 'glass-strong bg-cyan-neon/5 border-cyan-neon/20 mr-8'
       )}
     >
       <div className="flex items-center gap-2 mb-1.5">
         <span className={cn(
-          'text-[10px] font-mono uppercase tracking-wider font-bold',
+          'text-[10px] font-mono uppercase tracking-wider font-bold flex items-center gap-1',
           isUser ? 'text-royal-light' : isTool ? 'text-bone-dim' : 'text-cyan-neon'
         )}>
-          {isUser ? 'YOU' : isTool ? `TOOL: ${message.tool_name || 'unknown'}` : 'JARVIS'}
+          {isUser ? <><User size={11} /> YOU</> : isTool ? <><Wrench size={11} /> TOOL: {message.tool_name || 'unknown'}</> : <><Bot size={11} /> JARVIS</>}
         </span>
         {message.isStreaming && (
           <motion.span
-            className="text-[10px] font-mono text-cyan-neon"
-            animate={{ opacity: [0.4, 1, 0.4] }}
-            transition={{ duration: 1.2, repeat: Infinity }}
+            className="text-[10px] font-mono text-cyan-neon flex items-center gap-1"
+            animate={prefersReducedMotion ? undefined : { opacity: [0.4, 1, 0.4] }}
+            transition={{ duration: 1.2, repeat: prefersReducedMotion ? 0 : Infinity }}
+            aria-hidden="true"
           >
-            ● streaming
+            <LoaderCircle size={10} className={prefersReducedMotion ? '' : 'animate-spin'} /> streaming
           </motion.span>
         )}
         {message.timestamp && !message.isStreaming && (
@@ -493,20 +1416,285 @@ function ChatMessage({ message }: { message: JarvisMessage }) {
             {new Date(message.timestamp).toLocaleTimeString()}
           </span>
         )}
+        {!message.isStreaming && !isUser && (
+          <button
+            onClick={handleCopy}
+            aria-label={`Copy message ${index + 1}`}
+            className="ml-auto text-bone-faint hover:text-cyan-glow transition-colors p-1 rounded border border-iron/20 hover:border-cyan-neon/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
+          >
+            {copied ? <Check size={10} /> : <Copy size={10} />}
+          </button>
+        )}
       </div>
       <div className={cn(
-        'text-xs font-mono leading-relaxed whitespace-pre-wrap break-words',
+        'leading-relaxed break-words',
+        isUser || isTool ? 'text-xs font-mono whitespace-pre-wrap' : 'text-sm',
         isUser ? 'text-bone' : isTool ? 'text-bone-dim' : 'text-bone-muted'
       )}>
-        {message.content}
+        {isUser || isTool
+          ? message.content
+          : streamStatus
+            ? <span className="text-bone-faint font-mono text-xs">{streamStatus}</span>
+            : <MarkdownView content={message.content} />}
         {message.isStreaming && (
           <motion.span
-            className="inline-block w-1.5 h-3.5 bg-cyan-neon/60 ml-0.5 align-middle"
-            animate={{ opacity: [0, 1, 0] }}
-            transition={{ duration: 0.8, repeat: Infinity }}
+            className="inline-block w-1.5 h-3.5 bg-cyan-neon/70 ml-0.5 align-middle rounded-sm"
+            animate={prefersReducedMotion ? undefined : { opacity: [0, 1, 0] }}
+            transition={{ duration: 0.8, repeat: prefersReducedMotion ? 0 : Infinity }}
+            aria-hidden="true"
           />
         )}
       </div>
+    </motion.div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ── Tool Call Card (Phase 3.1) ──
+// ═══════════════════════════════════════════════════════════════
+
+function ToolCallCard({ call }: {
+  call: { name: string; arguments: unknown; result?: string; is_error?: boolean; matched?: boolean };
+}) {
+  const [open, setOpen] = useState(false);
+  const argText = (() => {
+    try {
+      if (!call.arguments) return '';
+      if (typeof call.arguments === 'string') return call.arguments;
+      return JSON.stringify(call.arguments, null, 2);
+    } catch { return String(call.arguments); }
+  })();
+
+  return (
+    <div
+      className={cn(
+        'rounded-xl border border-iron/30 bg-obsidian/40 overflow-hidden mr-8',
+        call.is_error ? 'border-error/40' : 'border-iron/30'
+      )}
+    >
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        aria-expanded={open}
+        className="w-full flex items-center gap-2 px-3 py-1.5 text-[10px] font-mono text-bone-dim hover:text-bone-muted transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
+      >
+        <Wrench size={10} className="text-royal-light" />
+        <span className="text-bone">{call.name}</span>
+        {call.result === undefined && (
+          <span className="text-amber-400 flex items-center gap-0.5">
+            <LoaderCircle size={9} className="animate-spin" /> running
+          </span>
+        )}
+        {call.is_error && <Pill variant="error">error</Pill>}
+        {call.result !== undefined && !call.is_error && <Pill variant="success">done</Pill>}
+        <span className="ml-auto opacity-70">{open ? <ChevronDown size={10} /> : <ChevronRight size={10} />}</span>
+      </button>
+      <AnimatePresence initial={false}>
+        {open && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.15 }}
+            className="px-3 pb-2 space-y-1.5"
+          >
+            {argText && (
+              <div>
+                <div className="text-[9px] font-mono uppercase tracking-widest text-bone-faint mb-0.5">Args</div>
+                <pre className="text-[10px] font-mono text-bone-dim whitespace-pre-wrap break-words bg-void/40 rounded p-2 max-h-32 overflow-y-auto">{argText}</pre>
+              </div>
+            )}
+            {call.result !== undefined && (
+              <div>
+                <div className="text-[9px] font-mono uppercase tracking-widest text-bone-faint mb-0.5">{call.is_error ? 'Error' : 'Result'}</div>
+                <pre className={cn('text-[10px] font-mono whitespace-pre-wrap break-words bg-void/40 rounded p-2 max-h-48 overflow-y-auto', call.is_error ? 'text-error' : 'text-bone-dim')}>{call.result}</pre>
+              </div>
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ── Reasoning + Agents combined accordion (Phase 3.2) ──
+// ═══════════════════════════════════════════════════════════════
+
+function ReasoningAgentsAccordion({
+  reasoningText, agentSteps, showAgents, setShowAgents, showReasoning, setShowReasoning,
+}: {
+  reasoningText: string;
+  agentSteps: { stage: string; text: string }[];
+  showAgents: boolean;
+  setShowAgents: (f: (v: boolean) => boolean) => void;
+  showReasoning: boolean;
+  setShowReasoning: (f: (v: boolean) => boolean) => void;
+}) {
+  return (
+    <div className="border border-iron/20 rounded-lg overflow-hidden">
+      {reasoningText && (
+        <>
+          <button
+            type="button"
+            onClick={() => setShowReasoning(r => !r)}
+            aria-expanded={showReasoning}
+            className="w-full flex items-center gap-2 px-3 py-1.5 text-[10px] font-mono text-bone-faint hover:text-bone-dim transition-colors bg-obsidian/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
+          >
+            <span aria-hidden="true">{showReasoning ? <ChevronDown size={10} /> : <ChevronRight size={10} />}</span>
+            <span>Thinking</span>
+            <span className="ml-auto opacity-50">{reasoningText.length.toLocaleString()} chars</span>
+          </button>
+          <AnimatePresence initial={false}>
+            {showReasoning && (
+              <motion.div
+                initial={{ height: 0, opacity: 0 }}
+                animate={{ height: 'auto', opacity: 1 }}
+                exit={{ height: 0, opacity: 0 }}
+                transition={{ duration: 0.18 }}
+                className="px-3 py-2 text-[11px] font-mono text-bone-faint whitespace-pre-wrap max-h-40 overflow-y-auto bg-obsidian/20"
+              >
+                {reasoningText}
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </>
+      )}
+      {agentSteps.length > 0 && (
+        <>
+          <button
+            type="button"
+            onClick={() => setShowAgents(a => !a)}
+            aria-expanded={showAgents}
+            className="w-full flex items-center gap-2 px-3 py-1.5 text-[10px] font-mono text-bone-faint hover:text-bone-dim transition-colors bg-obsidian/30 border-t border-iron/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
+          >
+            <span aria-hidden="true">{showAgents ? <ChevronDown size={10} /> : <ChevronRight size={10} />}</span>
+            <span className="text-royal-light">Agents</span>
+            <span className="ml-auto opacity-50">{agentSteps.length} stage{agentSteps.length !== 1 ? 's' : ''}</span>
+          </button>
+          <AnimatePresence initial={false}>
+            {showAgents && (
+              <motion.div
+                initial={{ height: 0, opacity: 0 }}
+                animate={{ height: 'auto', opacity: 1 }}
+                exit={{ height: 0, opacity: 0 }}
+                transition={{ duration: 0.18 }}
+                className="px-3 py-2 space-y-3 max-h-64 overflow-y-auto bg-obsidian/20"
+              >
+                {agentSteps.map((step, i) => (
+                  <div key={i}>
+                    <div className="text-[9px] font-mono text-royal-light uppercase tracking-widest mb-0.5 flex items-center gap-1">
+                      <Sparkles size={9} /> {step.stage}
+                    </div>
+                    <div className="text-[11px] font-mono text-bone-faint whitespace-pre-wrap leading-relaxed">{step.text}</div>
+                  </div>
+                ))}
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ── Tool Approval Modal (Phase 1.1) — local file replacing
+// ├── src-ui/src/components/jarvis/ToolApprovalModal.tsx ─────
+// ═══════════════════════════════════════════════════════════════
+
+function ApprovalModal({ call_id, name, args, error, onApprove, onReject }: {
+  call_id: string;
+  name: string;
+  args: unknown;
+  error: string | null;
+  onApprove: () => void;
+  onReject: () => void;
+}) {
+  const argText = (() => {
+    try {
+      if (!args) return '';
+      if (typeof args === 'string') return args;
+      return JSON.stringify(args, null, 2);
+    } catch { return String(args); }
+  })();
+
+  // Esc to reject. Use a captured keydown listener at modal mount.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onReject();
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        onApprove();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onApprove, onReject]);
+
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.15 }}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      onClick={onReject}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Tool approval required"
+    >
+      <motion.div
+        initial={{ scale: 0.96, opacity: 0 }}
+        animate={{ scale: 1, opacity: 1 }}
+        exit={{ scale: 0.96, opacity: 0 }}
+        transition={{ duration: 0.18 }}
+        className="glass-strong bg-obsidian border border-iron/40 rounded-xl p-6 w-full max-w-md shadow-2xl"
+        onClick={e => e.stopPropagation()}
+      >
+        <h3 className="text-bone font-semibold mb-2 flex items-center gap-2">
+          <Wrench size={14} className="text-cyan-neon" />
+          Tool Approval Required
+        </h3>
+        <p className="text-bone-muted text-sm mb-1">
+          The orchestrator wants to execute <span className="font-mono text-cyan-glow">{name}</span> with:
+        </p>
+        <pre
+          className="my-3 p-3 bg-void/60 border border-iron/30 rounded-lg text-xs font-mono text-bone overflow-x-auto max-h-60 overflow-y-auto"
+          aria-label="Tool arguments"
+        >
+          {argText || '(no arguments)'}
+        </pre>
+        {error && (
+          <p className="text-error text-xs font-mono mb-2 break-words" role="alert">
+            {error}
+          </p>
+        )}
+        <div className="flex gap-3 justify-end mt-4">
+          <button
+            type="button"
+            autoFocus
+            aria-label="Reject tool call"
+            className="px-4 py-2 text-xs font-mono rounded-lg border border-error/40 text-error hover:bg-error/10 transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-error/50"
+            onClick={onReject}
+          >
+            Reject  (Esc)
+          </button>
+          <button
+            type="button"
+            aria-label="Approve tool call"
+            className="px-4 py-2 text-xs font-mono rounded-lg border border-cyan-neon/40 text-cyan-glow hover:bg-cyan-neon/10 transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
+            onClick={onApprove}
+          >
+            Approve  (Enter)
+          </button>
+        </div>
+        <p className="text-[10px] font-mono text-bone-faint mt-3">
+          Call id: <span className="font-mono">{call_id.slice(0, 12)}</span>
+        </p>
+      </motion.div>
     </motion.div>
   );
 }
@@ -540,8 +1728,20 @@ function SessionsPanel({
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-lg font-bold text-bone tracking-tight">Sessions <span className="text-bone-font text-sm font-mono">({sessions.length})</span></h2>
         <div className="flex gap-2">
-          <button onClick={onRefresh} className="px-3 py-1 text-xs font-mono text-bone-dim border border-iron/30 rounded-lg hover:border-iron/50 hover:text-bone-muted transition-colors">↻ Refresh</button>
-          <button onClick={onNew} className="px-3 py-1 text-xs font-mono text-bone-dim border border-iron/30 rounded-lg hover:border-iron/50 hover:text-bone-muted transition-colors">+ New</button>
+          <button
+            onClick={onRefresh}
+            aria-label="Refresh sessions"
+            className="px-3 py-1 text-xs font-mono text-bone-dim border border-iron/30 rounded-lg hover:border-iron/50 hover:text-bone-muted transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
+          >
+            ↻ Refresh
+          </button>
+          <button
+            onClick={onNew}
+            aria-label="New session"
+            className="px-3 py-1 text-xs font-mono text-bone-dim border border-iron/30 rounded-lg hover:border-iron/50 hover:text-bone-muted transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
+          >
+            + New
+          </button>
         </div>
       </div>
 
@@ -564,7 +1764,7 @@ function SessionsPanel({
                 <StatusDot ok={activeSession === session.id} size="sm" />
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 mb-0.5">
-                    <span className="text-sm font-semibold text-bone truncate">{session.name}</span>
+                    <span className="text-sm font-semibold text-bone truncate">{session.name || session.title || 'Untitled'}</span>
                     <Pill>{session.model}</Pill>
                   </div>
                   <div className="text-[11px] font-mono text-bone-faint">
@@ -573,7 +1773,8 @@ function SessionsPanel({
                 </div>
                 <button
                   onClick={(e) => handleDelete(session.id, e)}
-                  className="text-bone-faint hover:text-error text-xs font-mono transition-colors shrink-0"
+                  aria-label={`Delete session ${session.name || session.title || session.id}`}
+                  className="text-bone-faint hover:text-error text-xs font-mono transition-colors shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-error/50 rounded px-1"
                 >
                   ✕
                 </button>
@@ -632,6 +1833,7 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
           onClick={handleSave}
           className={cn(
             'px-4 py-1.5 text-xs font-mono rounded-lg border transition-all',
+            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50',
             saved
               ? 'bg-cyan-neon/20 text-cyan-glow border-cyan-neon/40'
               : 'bg-royal/20 text-royal-light border-royal/40 hover:bg-royal/30'
@@ -650,12 +1852,12 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
               onClick={() => updateField('active_backend', 'ollama')}
               className={cn(
                 'flex-1 px-4 py-3 rounded-xl border text-sm font-mono transition-all text-center',
+                'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50',
                 localConfig.active_backend === 'ollama'
                   ? 'bg-cyan-neon/15 border-cyan-neon/40 text-cyan-glow'
                   : 'bg-obsidian/40 border-iron/30 text-bone-dim hover:border-iron/50'
               )}
             >
-              <div className="text-lg mb-1">◎</div>
               <div className="font-semibold">Ollama</div>
               <div className="text-[10px] text-bone-faint mt-0.5">Local models</div>
             </button>
@@ -663,12 +1865,12 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
               onClick={() => updateField('active_backend', 'openrouter')}
               className={cn(
                 'flex-1 px-4 py-3 rounded-xl border text-sm font-mono transition-all text-center',
+                'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50',
                 localConfig.active_backend === 'openrouter'
                   ? 'bg-royal/15 border-royal/40 text-royal-light'
                   : 'bg-obsidian/40 border-iron/30 text-bone-dim hover:border-iron/50'
               )}
             >
-              <div className="text-lg mb-1">◈</div>
               <div className="font-semibold">OpenRouter</div>
               <div className="text-[10px] text-bone-faint mt-0.5">Cloud models</div>
             </button>
@@ -692,7 +1894,8 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
               />
               <button
                 onClick={() => setShowApiKey(!showApiKey)}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-mono text-bone-dim hover:text-bone-muted transition-colors"
+                aria-label={showApiKey ? 'Hide API key' : 'Show API key'}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-mono text-bone-dim hover:text-bone-muted transition-colors px-1.5 py-0.5 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
               >
                 {showApiKey ? 'Hide' : 'Show'}
               </button>
@@ -724,7 +1927,8 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
                 type="text"
                 value={localConfig.openrouter.model}
                 onChange={(e) => updateField('openrouter', { ...localConfig.openrouter, model: e.target.value })}
-                placeholder="Enter custom model ID (e.g., anthropic/claude-sonnet-4)"
+
+                placeholder="Enter custom model ID"
                 className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors"
               />
             </div>
@@ -783,8 +1987,12 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
               <span className="text-xs font-mono text-bone-dim">Enable Bridge</span>
               <button
                 onClick={() => updateField('bridge_enabled', !localConfig.bridge_enabled)}
+                aria-pressed={localConfig.bridge_enabled}
+                aria-label="Toggle bridge"
+
                 className={cn(
                   'w-10 h-5 rounded-full transition-colors relative',
+                  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50',
                   localConfig.bridge_enabled ? 'bg-cyan-neon/40' : 'bg-iron/40'
                 )}
               >
@@ -836,31 +2044,84 @@ function StatusPanel({ status, onRefresh }: { status: JarvisStatus | null; onRef
     );
   }
 
-  const items = [
-    { label: 'Ollama Running', ok: status.ollama_running, desc: 'Local Ollama service is reachable' },
-    { label: 'Model Available', ok: status.ollama_model_available, desc: 'Configured model is loaded in Ollama' },
-    { label: 'Bridge Active', ok: status.bridge_active, desc: `Agent bridge on port ${status.bridge_port}` },
-    { label: 'Bun Runtime', ok: status.bun_available, desc: 'Bun is installed in WSL' },
+  const isOllama = status.active_backend === 'ollama';
+  const isOpenRouter = status.active_backend === 'openrouter';
+  const isClaudeCli = status.active_backend === 'claude_cli';
+
+  const serviceItems: { label: string; ok: boolean; desc: string; required: boolean }[] = [
+    {
+      label: 'Bun Server',
+      ok: status.bun_server_running,
+      desc: status.bun_server_url,
+      required: true,
+    },
+    {
+      label: 'Ollama',
+      ok: status.ollama_running,
+      desc: isOllama ? `model: ${status.model || '—'}` : 'not required for this backend',
+      required: isOllama,
+    },
+    {
+      label: 'Model loaded',
+      ok: status.model_available,
+      desc: status.model || '—',
+      required: isOllama,
+    },
+    {
+      label: 'OpenRouter key',
+      ok: status.openrouter_key_set,
+      desc: isOpenRouter ? 'API key is set' : 'not required for this backend',
+      required: isOpenRouter,
+    },
+    {
+      label: 'Claude proxy',
+      ok: status.claude_proxy_running,
+      desc: 'port 19878',
+      required: isClaudeCli,
+    },
+    {
+      label: 'Bridge',
+      ok: status.bridge_active,
+      desc: `port ${status.bridge_port}`,
+      required: false,
+    },
   ];
 
   return (
     <div className="h-full overflow-y-auto">
       <div className="flex items-center justify-between mb-4">
-        <h2 className="text-lg font-bold text-bone tracking-tight">Status</h2>
-        <button onClick={onRefresh} className="px-3 py-1 text-xs font-mono text-bone-dim border border-iron/30 rounded-lg hover:border-iron/50 hover:text-bone-muted transition-colors">↻ Refresh</button>
+        <div className="flex items-center gap-3">
+          <h2 className="text-lg font-bold text-bone tracking-tight">Status</h2>
+          <Pill variant={isOllama ? 'success' : 'info'}>
+            {status.active_backend}
+          </Pill>
+          {status.model && <Pill>{status.model}</Pill>}
+        </div>
+        <button
+          onClick={onRefresh}
+          aria-label="Refresh status"
+          className="px-3 py-1 text-xs font-mono text-bone-dim border border-iron/30 rounded-lg hover:border-iron/50 hover:text-bone-muted transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
+        >
+          ↻ Refresh
+        </button>
       </div>
 
-      <div className="space-y-3">
-        {items.map(item => (
-          <GlassCard key={item.label} hoverable={false}>
+      <div className="space-y-2">
+        {serviceItems.map(item => (
+          <GlassCard key={item.label} hoverable={false} className={cn('py-2.5', !item.required && 'opacity-60')}>
             <div className="flex items-center gap-3">
-              <StatusDot ok={item.ok} />
-              <div className="flex-1">
+              <StatusDot ok={item.ok} warn={!item.required && !item.ok} />
+              <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
                   <span className="text-sm font-semibold text-bone">{item.label}</span>
-                  <Pill variant={item.ok ? 'success' : 'error'}>{item.ok ? 'online' : 'offline'}</Pill>
+                  {item.required && (
+                    <Pill variant={item.ok ? 'success' : 'error'}>{item.ok ? 'ok' : 'down'}</Pill>
+                  )}
+                  {!item.required && (
+                    <Pill variant={item.ok ? 'success' : 'default'}>{item.ok ? 'ok' : 'off'}</Pill>
+                  )}
                 </div>
-                <p className="text-[11px] font-mono text-bone-faint mt-0.5">{item.desc}</p>
+                <p className="text-[11px] font-mono text-bone-faint mt-0.5 truncate">{item.desc}</p>
               </div>
             </div>
           </GlassCard>
@@ -868,32 +2129,36 @@ function StatusPanel({ status, onRefresh }: { status: JarvisStatus | null; onRef
       </div>
 
       {/* Quick actions */}
-      <div className="mt-6">
-        <h3 className="text-sm font-semibold text-bone-muted mb-3">Quick Actions</h3>
-        <div className="flex gap-2">
+      <div className="mt-4 flex gap-2">
+        <button
+          onClick={async () => {
+            try { await invoke('jarvis_start_bridge'); onRefresh(); }
+            catch (e) { console.error('Failed to start bridge:', e); }
+          }}
+          className="px-3 py-1.5 text-xs font-mono text-cyan-glow border border-cyan-neon/30 rounded-lg hover:bg-cyan-neon/10 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
+        >
+          Start Bridge
+        </button>
+        <button
+          onClick={async () => {
+            try { await invoke('jarvis_stop_bridge'); onRefresh(); }
+            catch (e) { console.error('Failed to stop bridge:', e); }
+          }}
+          className="px-3 py-1.5 text-xs font-mono text-error border border-error/30 rounded-lg hover:bg-error/10 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-error/50"
+        >
+          Stop Bridge
+        </button>
+        {isOllama && (
           <button
             onClick={async () => {
-              try {
-                await invoke('jarvis_start_bridge');
-                onRefresh();
-              } catch (e) { console.error('Failed to start bridge:', e); }
+              try { await invoke('jarvis_restart_ollama'); onRefresh(); }
+              catch (e) { console.error('Failed to restart Ollama:', e); }
             }}
-            className="px-3 py-1.5 text-xs font-mono text-cyan-glow border border-cyan-neon/30 rounded-lg hover:bg-cyan-neon/10 transition-colors"
+            className="px-3 py-1.5 text-xs font-mono text-amber-300 border border-amber-400/30 rounded-lg hover:bg-amber-400/10 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/50"
           >
-            Start Bridge
+            Restart Ollama
           </button>
-          <button
-            onClick={async () => {
-              try {
-                await invoke('jarvis_stop_bridge');
-                onRefresh();
-              } catch (e) { console.error('Failed to stop bridge:', e); }
-            }}
-            className="px-3 py-1.5 text-xs font-mono text-error border border-error/30 rounded-lg hover:bg-error/10 transition-colors"
-          >
-            Stop Bridge
-          </button>
-        </div>
+        )}
       </div>
     </div>
   );

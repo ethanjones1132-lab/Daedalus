@@ -97,14 +97,9 @@ fn expand_path_safe(path_str: &str) -> Result<std::path::PathBuf, String> {
         return Err("Path traversal or invalid characters detected".to_string());
     }
 
-    let expanded = if path_str.starts_with('~') {
+    let expanded = if let Some(rest) = path_str.strip_prefix('~') {
         let home = crate::get_home_dir();
-        let suffix = &path_str[1..];
-        let suffix = if suffix.starts_with('/') || suffix.starts_with('\\') {
-            &suffix[1..]
-        } else {
-            suffix
-        };
+        let suffix = rest.strip_prefix(['/', '\\']).unwrap_or(rest);
         std::path::PathBuf::from(home).join(suffix)
     } else {
         std::path::PathBuf::from(path_str)
@@ -129,15 +124,13 @@ pub fn list_memory_files(path: String) -> Result<Vec<String>, String> {
         std::fs::read_dir(&expanded).map_err(|e| format!("Failed to read directory: {}", e))?;
 
     let mut files = Vec::new();
-    for entry in entries {
-        if let Ok(entry) = entry {
-            let file_type = entry.file_type();
-            if let Ok(ft) = file_type {
-                if ft.is_file() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if name.ends_with(".md") {
-                        files.push(name);
-                    }
+    for entry in entries.flatten() {
+        let file_type = entry.file_type();
+        if let Ok(ft) = file_type {
+            if ft.is_file() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".md") {
+                    files.push(name);
                 }
             }
         }
@@ -162,48 +155,20 @@ pub fn list_recent_memories(
     limit: Option<i64>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let lim = limit.unwrap_or(10);
+    let lim = limit.unwrap_or(100).max(0) as usize;
 
-    let mut stmt = conn
-        .prepare("SELECT id, title, content, category, confidence, created_at FROM memory ORDER BY created_at DESC LIMIT ?")
-        .map_err(|e| format!("Failed to prepare SQL query: {}", e))?;
-
-    let rows = stmt
-        .query_map([lim], |row| {
-            let id: String = row.get(0)?;
-            let title: String = row.get(1)?;
-            let content: String = row.get(2)?;
-            let category: String = row.get(3)?;
-            let confidence: f64 = row.get(4)?;
-            let created_at: String = row.get(5)?;
-
-            let importance = if confidence >= 0.8 {
-                "high"
-            } else if confidence >= 0.5 {
-                "medium"
-            } else {
-                "low"
-            };
-
-            Ok(serde_json::json!({
-                "id": id,
-                "title": title,
-                "content": content,
-                "category": category,
-                "importance": importance,
-                "created_at": created_at,
-            }))
-        })
-        .map_err(|e| format!("Failed to execute SQL query: {}", e))?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        if let Ok(val) = row {
-            results.push(val);
-        }
-    }
-
-    Ok(results)
+    // Return the canonical MemoryEntry shape (confidence, tags, updated_at, status,
+    // metadata, …) by reusing the engine's schema-correct query. The previous
+    // hand-rolled projection dropped `confidence` and `tags`, so MemoryView's
+    // `m.confidence.toFixed(2)` threw and the whole page rendered "error loading".
+    // `list_memories` orders active rows first, newest first.
+    let memories = crate::jarvis::memory::engine::list_memories(&conn)?;
+    Ok(memories
+        .into_iter()
+        .take(lim)
+        .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
+        .filter(|value| !value.is_null())
+        .collect())
 }
 
 // ── Workspace file commands ──────────────────────────────────────
@@ -222,13 +187,11 @@ pub fn list_workspace_files(path: String) -> Result<Vec<String>, String> {
     let entries =
         std::fs::read_dir(&expanded).map_err(|e| format!("Failed to read directory: {}", e))?;
     let mut files = Vec::new();
-    for entry in entries {
-        if let Ok(entry) = entry {
-            if let Ok(ft) = entry.file_type() {
-                if ft.is_file() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    files.push(name);
-                }
+    for entry in entries.flatten() {
+        if let Ok(ft) = entry.file_type() {
+            if ft.is_file() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                files.push(name);
             }
         }
     }

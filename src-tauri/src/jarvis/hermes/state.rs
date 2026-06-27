@@ -1,7 +1,7 @@
 //! Tauri-managed wrapper around HermesProcess. Owns the singleton instance per
 //! window. Re-emits HermesEvents as typed Tauri events under name "hermes-event".
 
-use crate::jarvis::hermes::process::{HermesConfig, HermesProcess};
+use crate::jarvis::hermes::process::{HermesConfig, HermesProcess, HermesState};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex;
@@ -13,9 +13,13 @@ pub struct HermesAppState {
 
 impl HermesAppState {
     pub fn new() -> Self {
+        Self::with_config(HermesConfig::default())
+    }
+
+    pub fn with_config(config: HermesConfig) -> Self {
         Self {
             process: Mutex::new(None),
-            config: HermesConfig::default(),
+            config,
         }
     }
 
@@ -28,8 +32,13 @@ impl HermesAppState {
     /// events to Tauri's emit system.
     pub async fn spawn_and_attach(&self, app: AppHandle) -> Result<(), String> {
         let mut guard = self.process.lock().await;
-        if guard.is_some() {
-            return Ok(()); // already running — idempotent
+        if let Some(proc) = guard.as_ref() {
+            match proc.state().await {
+                HermesState::Crashed { .. } => {
+                    *guard = None;
+                }
+                _ => return Ok(()), // already running — idempotent
+            }
         }
         let proc = HermesProcess::new(self.config.clone());
         // Subscribe before start so we don't miss early events.

@@ -212,7 +212,13 @@ export function useHermesChat(sessionId: string): UseHermesChat {
 
     if (ev.type === 'stream.done' || ev.type === 'message.complete') {
       setIsStreaming(false);
+      const id = assistantIdRef.current;
       assistantIdRef.current = null;
+      if (id) {
+        setMessages((prev) =>
+          prev.map((m) => (m.id === id ? { ...m, streaming: false } : m)),
+        );
+      }
       return;
     }
 
@@ -293,6 +299,7 @@ export function useHermesChat(sessionId: string): UseHermesChat {
       await hermesInvoke({
         method: 'prompt.submit',
         params: { text: trimmed, session_id: sessionIdRef.current },
+        timeout_ms: 300_000,
       });
     } catch (e) {
       setMessages((prev) =>

@@ -41,6 +41,7 @@ pub(crate) fn command_output_timeout(mut cmd: Command, timeout: Duration) -> Opt
 }
 
 static WINDOWS_HOST_IP: OnceLock<String> = OnceLock::new();
+#[allow(clippy::type_complexity)]
 static WSL_IPS_CACHE: OnceLock<Mutex<Option<(Vec<String>, Instant)>>> = OnceLock::new();
 static CACHED_BUN_URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 

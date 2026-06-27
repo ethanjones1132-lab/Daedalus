@@ -222,6 +222,7 @@ pub async fn dispatch_cron_job(app: &AppHandle, job_id: &str) -> Result<String, 
 }
 
 /// Insert a `cron_runs` row and update the job's `last_run` / `next_run`.
+#[allow(clippy::too_many_arguments)]
 fn record_run(
     app: &AppHandle,
     job_id: &str,

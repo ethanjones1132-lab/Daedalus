@@ -50,7 +50,7 @@ fn handle_agent_connection(mut stream: std::net::TcpStream, queue: Arc<MessageQu
             Err(_) => break,
         };
 
-        let request: BridgeRequest = match serde_json::from_str(&line.trim()) {
+        let request: BridgeRequest = match serde_json::from_str(line.trim()) {
             Ok(r) => r,
             Err(e) => {
                 let response = BridgeResponse {

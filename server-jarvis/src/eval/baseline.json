@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "total": 14,
-  "passed": 14,
+  "total": 33,
+  "passed": 33,
   "outcomes": {
     "routing/code-review-clean-json": "pass",
     "routing/debug-clean-json": "pass",
@@ -11,11 +11,30 @@
     "routing/partial-json-normalizes-pipeline": "pass",
     "routing/garbage-falls-back-to-general": "pass",
     "routing/empty-output-falls-back": "pass",
+    "routing/test-task": "pass",
+    "routing/plan-high-complexity": "pass",
     "gating/reviewer-read-only": "pass",
     "gating/rewriter-write-only": "pass",
     "gating/executor-gets-all": "pass",
     "gating/planner-gets-none": "pass",
     "gating/synthesizer-gets-none": "pass",
-    "gating/unknown-mode-gets-none": "pass"
+    "gating/unknown-mode-gets-none": "pass",
+    "coordinator/linear-topology-explicit": "pass",
+    "coordinator/speculative-parallel-topology": "pass",
+    "coordinator/speculative-cascade-topology": "pass",
+    "coordinator/recursive-topology-with-reenter": "pass",
+    "coordinator/invalid-topology-defaults-linear": "pass",
+    "coordinator/missing-topology-defaults-linear": "pass",
+    "coordinator/executable-pipeline-strips-nulls": "pass",
+    "coordinator/executable-pipeline-empty-returns-synthesizer": "pass",
+    "coordinator/invalid-json-defaults": "pass",
+    "coordinator/invalid-task-type-defaults": "pass",
+    "coordinator/complexity-low-parsed": "pass",
+    "pool/default-pool-size-gte-12": "pass",
+    "pool/no-critical-stage-gaps": "pass",
+    "pool/coordinator-stage-covered": "pass",
+    "pool/executor-stage-covered": "pass",
+    "pool/code-strong-diversity-gte-3": "pass",
+    "pool/reasoning-strong-diversity-gte-3": "pass"
   }
 }

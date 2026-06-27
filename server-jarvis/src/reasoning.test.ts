@@ -61,6 +61,20 @@ describe("ReasoningParser", () => {
     expect(visible).toBe("Prefix Visible");
   });
 
+  test("stripReasoningFromText surfaces reasoning content when stripping leaves nothing visible", () => {
+    // Model returned only reasoning — nothing after the closing think tag.
+    // The user should see the thought content rather than a blank bubble.
+    const visible = stripReasoningFromText("<think>Let me check the file.</think>");
+    expect(visible).toBe("Let me check the file.");
+  });
+
+  test("stripReasoningFromText joins multiple thought steps when all content is reasoning", () => {
+    const visible = stripReasoningFromText(
+      "<think>First step.</think><think>Second step.</think>"
+    );
+    expect(visible).toBe("First step.\n\nSecond step.");
+  });
+
   test("finalize returns a complete trace", () => {
     const parser = new ReasoningParser("session-3");
     parser.processChunk("<think>First</think>");

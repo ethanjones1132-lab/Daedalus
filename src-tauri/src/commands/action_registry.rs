@@ -64,35 +64,87 @@ pub struct ActionRegistryAlert {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct BucketFile {
-    bucket: String,
-    actions: Vec<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 struct NotificationsFile {
     alerts: Vec<ActionRegistryAlert>,
 }
 
 fn registry_root(db: &AppDb) -> Result<PathBuf, String> {
     let config = load_jarvis_config(db)?;
-    let base = if config.jarvis_path.trim().is_empty() {
-        std::env::current_dir().map_err(|e| e.to_string())?
-    } else {
-        PathBuf::from(&config.jarvis_path)
-    };
-    Ok(base.join("workspace").join("action-registry"))
+    Ok(resolve_repo_root(&config.jarvis_path)
+        .join("workspace")
+        .join("action-registry"))
 }
 
+/// Resolve the home-base repo root (the dir that contains `workspace/action-registry`).
+///
+/// The action-registry data lives in the dev tree, but the app may be launched from
+/// anywhere (e.g. a copy of the exe on the Desktop), so we must not rely on the process
+/// CWD. Resolution order, first hit wins:
+///   1. an explicit configured `jarvis_path` (if it exists on disk),
+///   2. the `JARVIS_HOME` environment variable,
+///   3. an upward walk from the current directory looking for `workspace/action-registry`,
+///   4. the compile-time repo root (`<crate>/..`), which is correct for this build,
+///   5. the current directory as a last resort.
+fn resolve_repo_root(configured: &str) -> PathBuf {
+    let has_registry = |p: &Path| p.join("workspace").join("action-registry").is_dir();
+
+    let configured = configured.trim();
+    if !configured.is_empty() {
+        let p = PathBuf::from(configured);
+        if p.is_dir() {
+            return p;
+        }
+    }
+
+    if let Ok(env_home) = std::env::var("JARVIS_HOME") {
+        let p = PathBuf::from(env_home);
+        if p.is_dir() {
+            return p;
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut cur: Option<&Path> = Some(cwd.as_path());
+        while let Some(dir) = cur {
+            if has_registry(dir) {
+                return dir.to_path_buf();
+            }
+            cur = dir.parent();
+        }
+    }
+
+    // `CARGO_MANIFEST_DIR` is `<repo>/src-tauri`; its parent is the repo root.
+    if let Some(repo) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
+        if has_registry(repo) {
+            return repo.to_path_buf();
+        }
+    }
+
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Read an action bucket file. Tolerant of both the `{ "actions": [...] }` object
+/// shape written by the Python adapter and a bare `[...]` array; a missing file is
+/// an empty bucket, not an error. Individual rows that fail to match `RegistryAction`
+/// are skipped rather than failing the whole read.
 fn read_bucket(path: &Path) -> Result<Vec<RegistryAction>, String> {
     if !path.exists() {
         return Ok(vec![]);
     }
     let raw = fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
-    let payload: BucketFile =
+    let parsed: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("parse {}: {}", path.display(), e))?;
-    Ok(payload
-        .actions
+
+    let rows = match parsed {
+        serde_json::Value::Array(rows) => rows,
+        serde_json::Value::Object(mut map) => match map.remove("actions") {
+            Some(serde_json::Value::Array(rows)) => rows,
+            _ => vec![],
+        },
+        _ => vec![],
+    };
+
+    Ok(rows
         .into_iter()
         .filter_map(|value| serde_json::from_value::<RegistryAction>(value).ok())
         .collect())
@@ -257,4 +309,49 @@ pub fn update_action_approval(
     let _ = sync_action_registry(app, db);
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_tmp(name: &str, body: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ar_test_{}_{}", std::process::id(), name));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("active.json");
+        std::fs::write(&f, body).unwrap();
+        f
+    }
+
+    const ROW: &str = r#"{"id":"a1","project":"p","source_system":"s","source_area":"a",
+        "priority":"P1","risk_level":"low","category":"c","action_type":"t","title":"T",
+        "description":"D","status":"open","owner":"o","approval_required":false,
+        "updated_at":"2026-06-22"}"#;
+
+    #[test]
+    fn read_bucket_parses_object_without_bucket_field() {
+        // Regression: the Python adapter writes `{ "actions": [...] }` with no top-level
+        // `bucket` key. The old struct-typed parse required `bucket` and errored, leaving
+        // the Actions view empty/broken.
+        let f = write_tmp("obj", &format!(r#"{{"actions":[{ROW}]}}"#));
+        let actions = read_bucket(&f).expect("object with actions[] must parse");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].id, "a1");
+        let _ = std::fs::remove_dir_all(f.parent().unwrap());
+    }
+
+    #[test]
+    fn read_bucket_parses_bare_array() {
+        let f = write_tmp("arr", &format!(r#"[{ROW}]"#));
+        let actions = read_bucket(&f).expect("bare array must parse");
+        assert_eq!(actions.len(), 1);
+        let _ = std::fs::remove_dir_all(f.parent().unwrap());
+    }
+
+    #[test]
+    fn read_bucket_missing_file_is_empty() {
+        let actions = read_bucket(Path::new("does-not-exist-xyz.json")).unwrap();
+        assert!(actions.is_empty());
+    }
 }

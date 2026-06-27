@@ -186,7 +186,7 @@ pub(crate) fn unbind_channel_row(
     Ok(())
 }
 
-/// Channel ids bound to an agent (used by tests and future read paths).
+/// Channel ids bound to an agent.
 pub(crate) fn channel_bindings(conn: &Connection, agent_id: &str) -> Result<Vec<String>, String> {
     ensure_binding_table(conn)?;
     let mut stmt = conn
@@ -278,6 +278,16 @@ pub fn unbind_agent_channel(
 ) -> Result<(), String> {
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     unbind_channel_row(&conn, &agent_id, &channel_id)
+}
+
+/// List channel ids bound to an agent (from the agent_channels table).
+#[tauri::command]
+pub fn list_agent_channel_bindings(
+    db: State<AppDb>,
+    agent_id: String,
+) -> Result<Vec<String>, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    channel_bindings(&conn, &agent_id)
 }
 
 #[cfg(test)]

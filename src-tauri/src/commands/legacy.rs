@@ -38,7 +38,7 @@ pub async fn legacy_get_dashboard() -> Result<serde_json::Value, String> {
     let status = parse_dashboard_status(&status_json)?;
     let agents = parse_agents(&status_json);
     let mut sessions = parse_sessions_from_list(&sessions_json);
-    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
     Ok(serde_json::json!({ "status": status, "agents": agents, "sessions": sessions }))
 }
 
@@ -156,7 +156,7 @@ pub async fn legacy_get_sessions() -> Result<Vec<SessionSummary>, String> {
     let raw: serde_json::Value = serde_json::from_str(&json_str)
         .map_err(|e| format!("Failed to parse sessions JSON: {}", e))?;
     let mut sessions = parse_sessions_from_list(&raw);
-    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
     Ok(sessions)
 }
 

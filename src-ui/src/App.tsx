@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   PageTransition,
@@ -45,12 +45,13 @@ import CommitmentsView from './components/jarvis/CommitmentsView';
 import ApprovalsView from './components/jarvis/ApprovalsView';
 import PluginsView from './components/jarvis/PluginsView';
 import GatewayView from './components/jarvis/GatewayView';
-
-const APP_VERSION = '3.0.0';
+import HermesChat from './components/jarvis/HermesChat';
+import BuildBadge from './components/jarvis/BuildBadge';
+import CommandPalette from './components/jarvis/CommandPalette';
 
 const NAV_SECTIONS: NavSection[] = [
   { title: 'JARVIS', items: [{ id: 'jarvis', label: 'Jarvis', icon: 'J' }] },
-  { title: 'CHAT', items: [{ id: 'chat-feeds', label: 'Chats', icon: 'C' }] },
+  { title: 'CHAT', items: [{ id: 'jarvis-chat', label: 'Chat', icon: 'C' }] },
   {
     title: 'CONTROL',
     items: [
@@ -76,6 +77,7 @@ const NAV_SECTIONS: NavSection[] = [
       { id: 'nodes', label: 'Nodes', icon: 'N' },
       { id: 'plugins', label: 'Plugins', icon: 'X' },
       { id: 'gateway', label: 'Gateway', icon: 'W' },
+      { id: 'hermes', label: 'Hermes Bridge', icon: 'B' },
     ],
   },
   {
@@ -114,6 +116,15 @@ interface CompanionCronJob {
   name: string;
   prompt: string;
   enabled: boolean;
+}
+
+/** Phase 2.5 — explicit placeholder for ViewId members not yet in the nav. */
+function UnwiredView({ viewId }: { viewId: ViewId }) {
+  return (
+    <EmptyState
+      message={`${viewId} is not wired yet — use the sidebar for active surfaces, or see PRIORITIES.md for the rollout plan.`}
+    />
+  );
 }
 
 function isSelfImprovementCron(job: CompanionCronJob): boolean {
@@ -263,7 +274,7 @@ function Sidebar({ currentView, onNavigate }: { currentView: ViewId; onNavigate:
         ))}
       </nav>
       <div className="px-4 py-3 border-t border-white/[0.04] flex items-center justify-between">
-        <span className="text-[10px] font-mono text-bone-faint">v{APP_VERSION}</span>
+        <BuildBadge />
         <div className="flex items-center gap-1.5">
           <span className="w-1.5 h-1.5 rounded-full bg-cyan-neon animate-pulse" style={{ boxShadow: '0 0 6px rgba(34, 211, 238, 0.7)' }} />
           <span className="text-[9px] font-mono uppercase tracking-widest text-cyan-glow">live</span>
@@ -548,6 +559,11 @@ function AppInner() {
   });
   const [companion, setCompanion] = useState<CompanionState | null>(null);
   const [lastRefresh, setLastRefresh] = useState<Date>(new Date());
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const allNavItems = useMemo(
+    () => NAV_SECTIONS.flatMap((s) => s.items),
+    [],
+  );
   // Feature 2: Luxury companion awareness for self-improvement crons (premium "alive" feel)
   const [cronAwareness, setCronAwareness] = useState<string | null>('Syncing improvement routines…');
 
@@ -558,6 +574,17 @@ function AppInner() {
   useEffect(() => {
     const intervalId = setInterval(() => setLastRefresh(new Date()), 10000);
     return () => clearInterval(intervalId);
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault();
+        setPaletteOpen((o) => !o);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
   }, []);
 
   const refreshCronAwareness = useCallback(async () => {
@@ -609,17 +636,25 @@ function AppInner() {
       })
       .catch(() => {});
 
-    const alertListen = listen<ActionRegistryAlert[]>('action-registry://alerts', (e) => {
+    const unsubs: Array<() => void> = [];
+    let disposed = false;
+    listen<ActionRegistryAlert[]>('action-registry://alerts', (e) => {
       showRegistryAlert(e.payload);
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else unsubs.push(unlisten);
     });
 
     return () => {
-      alertListen.then((unlisten) => unlisten());
+      disposed = true;
+      unsubs.forEach((f) => f());
     };
   }, [warn, toastError]);
 
   useEffect(() => {
-    const missedListen = listen<CompanionCronJob[]>('cron://missed-jobs', (e) => {
+    const unsubs: Array<() => void> = [];
+    let disposed = false;
+    listen<CompanionCronJob[]>('cron://missed-jobs', (e) => {
       const count = e.payload.length;
       if (count > 0) {
         warn(
@@ -639,10 +674,14 @@ function AppInner() {
       } else {
         void refreshCronAwareness();
       }
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else unsubs.push(unlisten);
     });
 
     return () => {
-      missedListen.then((unlisten) => unlisten());
+      disposed = true;
+      unsubs.forEach((f) => f());
     };
   }, [warn, refreshCronAwareness]);
 
@@ -654,7 +693,11 @@ function AppInner() {
 
   const renderView = () => {
     switch (currentView) {
-      case 'jarvis': return <ErrorBoundary><JarvisView onCompanionChange={setCompanion} /></ErrorBoundary>;
+      case 'jarvis':
+      case 'jarvis-hub':
+      case 'jarvis-chat':
+      case 'jarvis-companion':
+        return <ErrorBoundary><JarvisView onCompanionChange={setCompanion} /></ErrorBoundary>;
       case 'chat-feeds': return <ChatFeedsView />;
       case 'overview': return <OverviewView />;
       case 'sessions': return <SessionsView />;
@@ -677,6 +720,18 @@ function AppInner() {
       case 'approvals': return <ErrorBoundary><ApprovalsView /></ErrorBoundary>;
       case 'plugins': return <ErrorBoundary><PluginsView /></ErrorBoundary>;
       case 'gateway': return <ErrorBoundary><GatewayView /></ErrorBoundary>;
+      case 'hermes': return <ErrorBoundary><HermesChat /></ErrorBoundary>;
+      case 'jarvis-sessions':
+        return <ErrorBoundary><JarvisView initialSubView="sessions" onCompanionChange={setCompanion} /></ErrorBoundary>;
+      case 'jarvis-skills':
+        return <SkillsView />;
+      case 'jarvis-tools':
+        return <ErrorBoundary><JarvisView initialSubView="control" onCompanionChange={setCompanion} /></ErrorBoundary>;
+      case 'instances':
+      case 'usage':
+      case 'logs':
+      case 'doctor':
+        return <UnwiredView viewId={currentView} />;
       default: return <OverviewView />;
     }
   };
@@ -711,7 +766,7 @@ function AppInner() {
             >
               {theme === 'dark' ? '☾' : '☀'}
             </button>
-            <span className="text-bone-faint text-[10px] font-mono uppercase tracking-widest">v{APP_VERSION}</span>
+            <BuildBadge />
           </div>
         </motion.header>
         <HealthBanner />
@@ -731,6 +786,12 @@ function AppInner() {
           />
         </motion.div>
       </div>
+      <CommandPalette
+        open={paletteOpen}
+        items={allNavItems}
+        onClose={() => setPaletteOpen(false)}
+        onNavigate={(id) => { setCurrentView(id); }}
+      />
     </div>
   );
 }

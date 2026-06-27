@@ -3,6 +3,7 @@ pub mod cron_scheduler;
 pub mod db;
 pub mod jarvis;
 pub mod parsers;
+pub mod supervisor;
 pub mod types;
 pub mod wsl;
 
@@ -15,6 +16,7 @@ use crate::jarvis::hermes::commands::{
 use crate::jarvis::hermes::state::HermesAppState;
 use jarvis::types::JarvisState;
 use std::sync::Arc;
+use tauri::Manager;
 use tokio::sync::Mutex;
 
 // ─── Jarvis Bun Server Auto-Start ────────────────────────────────────────────
@@ -60,7 +62,7 @@ pub(crate) fn wsl_home() -> String {
 //   • claude_cli_proxy.py (port 19878) — Anthropic /v1/messages -> claude CLI
 // Both are spawned lazily off the main thread so the window paints fast.
 
-static OLLAMA_PROCESS: std::sync::OnceLock<std::sync::Mutex<Option<std::process::Child>>> =
+pub(crate) static OLLAMA_PROCESS: std::sync::OnceLock<std::sync::Mutex<Option<std::process::Child>>> =
     std::sync::OnceLock::new();
 pub(crate) static PROXY_PROCESS: std::sync::OnceLock<
     std::sync::Mutex<Option<std::process::Child>>,
@@ -82,9 +84,14 @@ fn find_ollama_binary() -> Option<String> {
 }
 
 fn find_jarvis_python() -> Option<String> {
-    if let Ok(home) = std::env::var("HOME") {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok();
+    if let Some(home) = home {
         for rel in [
+            ".openclaw/jarvis/hermes/.venv/Scripts/python.exe",
             ".openclaw/jarvis/hermes/.venv/bin/python",
+            ".openclaw/jarvis/hermes/venv/Scripts/python.exe",
             ".openclaw/jarvis/hermes/venv/bin/python",
         ] {
             let p = format!("{home}/{rel}");
@@ -94,6 +101,21 @@ fn find_jarvis_python() -> Option<String> {
         }
     }
     Some("python3".into())
+}
+
+fn build_hermes_config() -> crate::jarvis::hermes::process::HermesConfig {
+    use std::path::PathBuf;
+    let mut config = crate::jarvis::hermes::process::HermesConfig::default();
+    if let Some(py) = find_jarvis_python() {
+        config.python = PathBuf::from(py);
+    }
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        config.hermes_home = PathBuf::from(home)
+            .join(".openclaw")
+            .join("jarvis")
+            .join("hermes");
+    }
+    config
 }
 
 fn spawn_ollama() -> Option<std::process::Child> {
@@ -110,7 +132,7 @@ fn spawn_ollama() -> Option<std::process::Child> {
     Some(child)
 }
 
-fn warm_qwen_model() {
+fn warm_model(model: String) {
     // Best-effort: send a 1-token generate request so the model is hot when
     // the user fires their first chat. Failures are non-fatal.
     let _ = reqwest::blocking::Client::builder()
@@ -119,7 +141,7 @@ fn warm_qwen_model() {
         .and_then(|c| {
             c.post("http://127.0.0.1:11434/api/generate")
                 .json(&serde_json::json!({
-                    "model": "qwen3:8b",
+                    "model": model,
                     "prompt": "ok",
                     "stream": false,
                     "options": {"num_predict": 1}
@@ -128,25 +150,92 @@ fn warm_qwen_model() {
         });
 }
 
-pub(crate) fn spawn_claude_cli_proxy() -> Option<std::process::Child> {
+/// Ensure the local Ollama server is running and warm. Idempotent and best-effort:
+/// if Ollama is already listening it does nothing but warm the model; otherwise it
+/// spawns `ollama serve`, waits up to ~15s for the port, registers the child for
+/// shutdown, and warms the model off-thread. Only called when Ollama is the active
+/// backend, so OpenRouter/Claude-CLI sessions don't pay for a local model server.
+///
+/// `model` is the configured `ollama.model` from the active config. Defaults to
+/// `"qwen3:8b"` only when an empty string is passed (e.g. from the reconcile path
+/// before a config is fully loaded).
+pub(crate) async fn start_ollama_and_warm(model: String) {
+    let model = if model.is_empty() { "qwen3:8b".to_string() } else { model };
+    if is_port_listening(11434) {
+        println!("[Jarvis] Ollama already running on port 11434");
+    } else if let Some(child) = spawn_ollama() {
+        let mut ready = false;
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if is_port_listening(11434) {
+                ready = true;
+                break;
+            }
+        }
+        if !ready {
+            eprintln!("[Jarvis] Ollama did not become ready within 15s");
+        } else {
+            println!("[Jarvis] Ollama ready on 11434");
+        }
+        if let Some(m) = OLLAMA_PROCESS.get() {
+            if let Ok(mut g) = m.lock() {
+                *g = Some(child);
+            }
+        }
+    }
+    // Warm the model off the async runtime so we don't block the boot task.
+    std::thread::spawn(move || warm_model(model));
+}
+
+/// Bring up the servers the given backend needs, in the background. Idempotent —
+/// starting an already-running service is a no-op — so it is safe to call on every
+/// config save / backend switch. Ollama is started + warmed only for the Ollama
+/// backend; the Bun server (needed by every backend for tools/skills/models) is
+/// ensured for all. Fire-and-forget so the caller (e.g. the Save button) returns
+/// immediately rather than blocking on Ollama warm-up.
+///
+/// `ollama_model` is forwarded to `start_ollama_and_warm`; pass an empty string when
+/// the model is not yet known (falls back to the `qwen3:8b` default).
+pub fn reconcile_backend_services(backend: crate::jarvis::types::JarvisBackend, ollama_model: String) {
+    tauri::async_runtime::spawn(async move {
+        if matches!(backend, crate::jarvis::types::JarvisBackend::Ollama) {
+            start_ollama_and_warm(ollama_model).await;
+        }
+        if let Err(e) = ensure_jarvis_server_started().await {
+            eprintln!("[Jarvis] ensure server after backend reconcile failed: {}", e);
+        }
+    });
+}
+
+pub(crate) fn spawn_claude_cli_proxy(ollama_model: String) -> Option<std::process::Child> {
     use std::process::{Command, Stdio};
     let script = find_claude_cli_proxy()?;
     let py = find_jarvis_python()?;
+    let model = if ollama_model.is_empty() { "qwen3:8b".to_string() } else { ollama_model };
     let mut command = Command::new(&py);
     command
         .arg(&script)
         .env("JARVIS_CLAUDE_PROXY_PORT", "19878")
         .env("JARVIS_OLLAMA_URL", "http://127.0.0.1:11434")
-        .env("JARVIS_DEFAULT_MODEL", "qwen3:8b")
+        .env("JARVIS_DEFAULT_MODEL", &model)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     crate::wsl::hide_windows_console(&mut command);
-    let child = command.spawn().ok()?;
+    let child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "[Jarvis] claude_cli_proxy spawn failed: {e} (py={py}, script={script}, model={model})"
+            );
+            return None;
+        }
+    };
     println!(
-        "[Jarvis] claude_cli_proxy started (PID {}, py {}, script {})",
+        "[Jarvis] claude_cli_proxy started (PID {}, py {}, script {}, model {})",
         child.id(),
         py,
-        script
+        script,
+        model,
     );
     Some(child)
 }
@@ -202,6 +291,53 @@ fn find_jarvis_server() -> Option<String> {
                     if cand.exists() {
                         return Some(cand.to_string_lossy().into_owned());
                     }
+                }
+            }
+        }
+
+        // Walk up the current_exe ancestry looking for a repo-rooted
+        // server-jarvis. This catches `cargo tauri build` outputs that
+        // ended up under target/.../home-base.exe and dev runs that point
+        // at a sibling checkout, without hardcoding the home path.
+        if let Ok(exe) = std::env::current_exe() {
+            let mut cursor = exe.parent().map(|p| p.to_path_buf());
+            for _ in 0..8 {
+                let Some(dir) = cursor.as_ref() else { break };
+                for rel in [
+                    "server-jarvis/dist/index.js",
+                    "server-jarvis/src/index.ts",
+                ] {
+                    let cand = dir.join(rel);
+                    if cand.exists() {
+                        return Some(cand.to_string_lossy().into_owned());
+                    }
+                }
+                match dir.parent() {
+                    Some(p) => cursor = Some(p.to_path_buf()),
+                    None => break,
+                }
+            }
+        }
+
+        // Same check relative to CWD — useful when the binary is launched
+        // from a sibling of the repo (e.g. `target\release\home-base.exe`
+        // run from the repo root, or from a CI workspace).
+        if let Ok(cwd) = std::env::current_dir() {
+            let mut cursor = Some(cwd);
+            for _ in 0..8 {
+                let Some(dir) = cursor.as_ref() else { break };
+                for rel in [
+                    "server-jarvis/dist/index.js",
+                    "server-jarvis/src/index.ts",
+                ] {
+                    let cand = dir.join(rel);
+                    if cand.exists() {
+                        return Some(cand.to_string_lossy().into_owned());
+                    }
+                }
+                match dir.parent() {
+                    Some(p) => cursor = Some(p.to_path_buf()),
+                    None => break,
                 }
             }
         }
@@ -383,9 +519,64 @@ fn spawn_jarvis_server(entry: &str) -> Option<std::process::Child> {
             .stderr(jarvis_server_log_stdio("server-jarvis.err.log"))
             .spawn()
     };
-    let child = spawn_result.ok()?;
+    let child = match spawn_result {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[Jarvis] Bun spawn failed: {e} (bun={bun}, entry={entry})");
+            return None;
+        }
+    };
     println!("[Jarvis] Bun server spawned (PID {})", child.id());
     Some(child)
+}
+
+/// Force-restart the Bun server. Bypasses the HEALTHY_TTL fast-path in
+/// `ensure_jarvis_server_started` (the symptom of "clicked restart, nothing
+/// happened" when the server is actually down) and clears the supervisor's
+/// consecutive-failure counter so the auto-restart loop stays healthy after
+/// a user-driven restart. Returns a specific error string on failure so the
+/// UI can show why (missing server bundle, spawn error, health timeout).
+pub async fn force_restart_jarvis_server() -> Result<(), String> {
+    // 1. Re-arm the supervisor so a subsequent auto-restart is allowed even
+    //    if previous ticks drove the counter to the give-up cap.
+    crate::supervisor::reset_failures(crate::supervisor::SupervisedService::Bun);
+
+    // 2. Locate the server entry (the cheap part; surfaces a real error if
+    //    the bundle is genuinely missing on this machine).
+    let server_entry = find_jarvis_server()
+        .ok_or_else(|| "server bundle not found (no index.js / index.ts beside the app or in the repo)".to_string())?;
+
+    // 3. Kill the tracked child (if any) and re-spawn off the runtime.
+    let spawn_result: Result<(), String> = tauri::async_runtime::spawn_blocking(move || {
+        if SERVER_PROCESS.get().is_none() {
+            let _ = SERVER_PROCESS.set(std::sync::Mutex::new(None));
+        }
+        let m = SERVER_PROCESS
+            .get()
+            .ok_or("SERVER_PROCESS not initialized")?;
+        let mut guard = m.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+        }
+        let child = spawn_jarvis_server(&server_entry)
+            .ok_or_else(|| "Failed to spawn Bun server (see [Jarvis] logs above for the OS error)".to_string())?;
+        *guard = Some(child);
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
+
+    spawn_result?;
+
+    // 4. Probe the freshly spawned server (up to ~20s).
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(20) {
+        if probe_jarvis_healthy().await {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    Err("Bun server did not become healthy within 20s of restart".to_string())
 }
 
 pub async fn ensure_jarvis_server_started() -> Result<(), String> {
@@ -552,7 +743,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .manage(jarvis_state)
         .manage(db)
-        .manage(HermesAppState::new())
+        .manage(HermesAppState::with_config(build_hermes_config()))
         .setup(|app| {
             // Ensure the OnceLocks are initialized
             crate::PROXY_PROCESS.get_or_init(|| std::sync::Mutex::new(None));
@@ -561,36 +752,61 @@ pub fn run() {
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                // Start Ollama
-                if crate::is_port_listening(11434) {
-                    println!("[Jarvis] Ollama already running on port 11434");
-                } else if let Some(child) = crate::spawn_ollama() {
-                    let mut ready = false;
-                    for _ in 0..30 {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        if crate::is_port_listening(11434) {
-                            ready = true;
-                            break;
-                        }
+                // Hydrate the in-memory config from SQLite — the single source of
+                // truth for JarvisConfig. JarvisState starts at the Ollama default
+                // until this runs; without it, OpenRouter users would pay for an
+                // Ollama boot and the Control view would revert to Ollama on restart.
+                //
+                // On the first boot after the file→SQLite cutover, import any legacy
+                // file store (`~/.openclaw/jarvis/config.json`) so the user's saved
+                // backend/key survive; thereafter the file is a one-way projection
+                // that only the Bun server reads.
+                let db_state = handle.state::<crate::db::AppDb>();
+                match crate::commands::migrate_file_config_into_sqlite_if_needed(&db_state)
+                {
+                    Ok(true) => println!(
+                        "[Jarvis] Imported legacy file config into SQLite (one-time migration)."
+                    ),
+                    Ok(false) => {}
+                    Err(e) => eprintln!("[Jarvis] config migration check failed: {e}"),
+                }
+                let cfg = crate::commands::load_jarvis_config(&db_state)
+                    .unwrap_or_default();
+                {
+                    let state = handle.state::<crate::jarvis::types::JarvisState>();
+                    *state.config.lock().await = cfg.clone();
+                }
+                let backend = cfg.active_backend.clone();
+                println!("[Jarvis] Boot backend = {}", backend);
+
+                // Backend-specific local dependency: only start Ollama when it's active.
+                match backend {
+                    crate::jarvis::types::JarvisBackend::Ollama => {
+                        crate::start_ollama_and_warm(cfg.ollama.model.clone()).await;
                     }
-                    if !ready {
-                        eprintln!("[Jarvis] Ollama did not become ready within 15s");
-                    } else {
-                        println!("[Jarvis] Ollama ready on 11434");
-                    }
-                    if let Some(m) = crate::OLLAMA_PROCESS.get() {
-                        if let Ok(mut g) = m.lock() {
-                            *g = Some(child);
+                    crate::jarvis::types::JarvisBackend::OpenRouter => {
+                        if cfg.openrouter.api_key.trim().is_empty() {
+                            eprintln!(
+                                "[Jarvis] OpenRouter is the active backend but no API key is set \
+                                 — chats will fail until a key is configured in Control."
+                            );
                         }
+                        println!("[Jarvis] OpenRouter backend — skipping local Ollama startup.");
+                    }
+                    crate::jarvis::types::JarvisBackend::ClaudeCli => {
+                        println!("[Jarvis] Claude CLI backend — skipping local Ollama startup.");
                     }
                 }
 
-                // Warm qwen model
-                std::thread::spawn(crate::warm_qwen_model);
+                // Backend-independent services below: the proxy routes to whichever
+                // backend is active, the Bun server powers tools/skills/models, and the
+                // cron scheduler drives routines — all needed regardless of backend.
 
-                // Start Claude CLI proxy
+                // Start Claude CLI proxy (pass the configured Ollama model so the proxy
+                // knows which model to default to when the active backend is local).
+                let proxy_model = cfg.ollama.model.clone();
                 let proxy_result =
-                    tauri::async_runtime::spawn_blocking(crate::spawn_claude_cli_proxy).await;
+                    tauri::async_runtime::spawn_blocking(move || crate::spawn_claude_cli_proxy(proxy_model)).await;
                 match proxy_result {
                     Ok(Some(child)) => {
                         if let Some(m) = crate::PROXY_PROCESS.get() {
@@ -612,6 +828,10 @@ pub fn run() {
                 if let Err(e) = crate::ensure_jarvis_server_started().await {
                     eprintln!("[Jarvis] Bun server startup failed at boot: {}", e);
                 }
+
+                // Keep the three boot children alive (Ollama/proxy/Bun): detect a
+                // dead required service and relaunch it, with bounded restarts.
+                crate::supervisor::spawn_supervisor(handle.clone());
 
                 // Start cron scheduler.
                 crate::cron_scheduler::start_cron_scheduler(handle).await;
@@ -641,6 +861,8 @@ pub fn run() {
             jarvis_stop_bridge,
             jarvis_restart_server,
             jarvis_restart_ollama,
+            jarvis_restart_proxy,
+            get_build_info,
             get_all_settings,
             get_setting,
             set_setting,
@@ -716,6 +938,7 @@ pub fn run() {
             set_agent_enabled,
             bind_agent_channel,
             unbind_agent_channel,
+            list_agent_channel_bindings,
             get_gateway_status,
             optimize_claude_settings,
             check_updates,

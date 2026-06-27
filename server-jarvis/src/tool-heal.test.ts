@@ -21,6 +21,12 @@ describe("classifyToolError", () => {
   test("falls back to unknown", () => {
     expect(classifyToolError("the model said something weird")).toBe("unknown");
   });
+  test("classifies a directory misuse and hints list_directory", () => {
+    const output = `Error: "src" is a directory, not a file. Use list_directory to see its contents.`;
+    expect(classifyToolError(output)).toBe("is_directory");
+    const hint = healingHint("is_directory", 1);
+    expect(hint).toContain("list_directory");
+  });
 });
 
 describe("healingHint", () => {

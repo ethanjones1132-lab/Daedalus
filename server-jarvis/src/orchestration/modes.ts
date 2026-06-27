@@ -25,7 +25,13 @@ export const BUILTIN_MODES: Record<string, AgentMode> = {
   executor: {
     id: "executor",
     name: "Executor",
-    tools_filter: ["*"],
+    tools_filter: [
+      "read_file", "write_file", "edit_file", "multi_edit", "apply_patch",
+      "glob", "grep", "list_directory",
+      "bash",
+      "web_search", "web_fetch",
+      "agent", "run_background_command",
+    ],
     temperature: 0.3,
     max_tokens: 4096,
     requires_memory: true,

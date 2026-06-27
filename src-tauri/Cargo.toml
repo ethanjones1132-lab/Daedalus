@@ -18,7 +18,14 @@ tauri-build = { version = "2.6.1", features = [] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
-tauri = { version = "2.11.1", features = [] }
+# `custom-protocol` is REQUIRED in release builds. `tauri::generate_context!`
+# reads `cfg!(custom-protocol)` to decide whether the webview should load
+# from the embedded `tauri://` assets or fall back to `build.devUrl`. Without
+# it, a release exe opens a window that tries to reach http://localhost:5173
+# (the Vite dev server) and shows the Edge "localhost refused to connect"
+# error page. The dev workflow is unaffected — `cargo tauri dev` still
+# uses the dev server because it enables the dev feature path on its own.
+tauri = { version = "2.11.1", features = ["custom-protocol"] }
 tauri-plugin-log = "2"
 tauri-plugin-shell = "2"
 

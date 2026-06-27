@@ -13,11 +13,13 @@ export type ToolErrorCategory =
   | "permission"
   | "timeout"
   | "parse"
+  | "is_directory"
   | "unknown";
 
 export function classifyToolError(output: string): ToolErrorCategory {
   const o = (output || "").toLowerCase();
   if (o.includes("has not been read yet")) return "not_read";
+  if (o.includes("is a directory")) return "is_directory";
   if (o.includes("not found") || o.includes("no such file") || o.includes("enoent")) return "not_found";
   if (o.includes("permission denied") || o.includes("eacces") || o.includes("access denied")) return "permission";
   if (o.includes("timed out") || o.includes("timeout") || o.includes("etimedout")) return "timeout";
@@ -31,6 +33,7 @@ const BASE_HINTS: Record<ToolErrorCategory, string> = {
   permission: "Permission was denied for that path. Try an alternative location instead of retrying.",
   timeout: "The operation timed out. Retry once with a narrower scope or smaller input.",
   parse: "The tool arguments were malformed. Re-emit the tool call with valid JSON arguments.",
+  is_directory: "That path is a directory. Use list_directory to list it, or read_file on a specific file inside it.",
   unknown: "",
 };
 

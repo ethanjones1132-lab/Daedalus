@@ -48,13 +48,23 @@ export interface ToolCall {
   arguments: Record<string, unknown>;
 }
 
-// ── Tool Result ──
-
-export interface ToolResult {
-  call_id: string;
-  name: string;
-  output: string;
-  is_error: boolean;
-  error?: string;
-  duration_ms: number;
-}
+// ── Tool Result ──
+
+/** Normalized error classification for tool execution failures. */
+export type ToolErrorCode =
+  | "unknown_tool"
+  | "missing_args"
+  | "policy_denied"
+  | "approval_rejected"
+  | "handler_error";
+
+export interface ToolResult {
+  call_id: string;
+  name: string;
+  output: string;
+  is_error: boolean;
+  error?: string;
+  /** Set when `is_error` is true — stable machine-readable category. */
+  error_code?: ToolErrorCode;
+  duration_ms: number;
+}

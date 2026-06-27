@@ -86,13 +86,74 @@ pub async fn jarvis_get_tools() -> Result<Vec<Value>, String> {
 }
 
 #[tauri::command]
-pub async fn jarvis_invoke_skill(name: String, _args: Option<Value>) -> Result<Value, String> {
-    Err(format!(
-        "jarvis_invoke_skill({}) is not yet wired up in the recovered tree; \
-         restore the skill runner from transcripts or implement against the \
-         Bun-side registry",
-        name
-    ))
+pub async fn jarvis_invoke_skill(name: String, args: Option<Value>) -> Result<Value, String> {
+    // Invoke a skill via the Bun server's `POST /skills/invoke`, which streams the
+    // result as SSE (`init` → `stream_event` deltas → `message_stop`). The command
+    // contract is a single Value, so we collect the stream and return the aggregate
+    // text plus the server-assigned session id.
+    let base = bun_base().await?;
+    let client = http_client()?;
+    let body = serde_json::json!({ "name": name, "args": args.unwrap_or(Value::Null) });
+
+    let resp = client
+        .post(format!("{}/skills/invoke", base))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("skills/invoke request failed: {}", e))?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(format!("Skill not found: {}", name));
+    }
+    if !resp.status().is_success() {
+        return Err(format!("skills/invoke returned HTTP {}", resp.status()));
+    }
+
+    let raw = resp
+        .text()
+        .await
+        .map_err(|e| format!("reading skills/invoke stream: {}", e))?;
+
+    let mut output = String::new();
+    let mut session_id = String::new();
+    for line in raw.lines() {
+        let payload = match line.trim().strip_prefix("data:") {
+            Some(p) => p.trim(),
+            None => continue,
+        };
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let Ok(evt) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        match evt.get("type").and_then(|t| t.as_str()) {
+            Some("init") => {
+                if let Some(s) = evt.get("session_id").and_then(|s| s.as_str()) {
+                    session_id = s.to_string();
+                }
+            }
+            Some("stream_event") => {
+                if let Some(text) = evt
+                    .get("delta")
+                    .and_then(|d| d.get("text"))
+                    .and_then(|t| t.as_str())
+                {
+                    output.push_str(text);
+                }
+            }
+            Some("error") => {
+                return Err(evt
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("skill invocation error")
+                    .to_string());
+            }
+            _ => {}
+        }
+    }
+
+    Ok(serde_json::json!({ "session_id": session_id, "skill": name, "output": output }))
 }
 
 #[tauri::command]
@@ -144,8 +205,32 @@ pub async fn jarvis_test_connection(
 }
 
 #[tauri::command]
-pub async fn jarvis_switch_backend(backend: String) -> Result<(), String> {
-    eprintln!("[jarvis] switch_backend requested: {backend} (no-op in recovered tree)");
+pub async fn jarvis_switch_backend(
+    backend: String,
+    state: State<'_, crate::jarvis::types::JarvisState>,
+    db: State<'_, crate::db::AppDb>,
+) -> Result<(), String> {
+    use crate::jarvis::types::JarvisBackend;
+    let new_backend = match backend.as_str() {
+        "ollama" => JarvisBackend::Ollama,
+        "openrouter" => JarvisBackend::OpenRouter,
+        "claude_cli" => JarvisBackend::ClaudeCli,
+        other => return Err(format!("unknown backend: {other}")),
+    };
+
+    // Persist canonically (SQLite + file projection) and mirror into the
+    // in-memory state so subsequent chats route to the new backend immediately.
+    let mut cfg = { state.config.lock().await.clone() };
+    cfg.active_backend = new_backend.clone();
+    crate::commands::persist_jarvis_config(&db, &cfg)?;
+    let ollama_model = cfg.ollama.model.clone();
+    {
+        let mut guard = state.config.lock().await;
+        *guard = cfg;
+    }
+
+    // Start whatever the new backend needs (Ollama for local; Bun for all).
+    crate::reconcile_backend_services(new_backend, ollama_model);
     Ok(())
 }
 
@@ -157,22 +242,101 @@ pub async fn jarvis_get_companion() -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub async fn jarvis_save_companion(_companion: Value) -> Result<(), String> {
-    Err("jarvis_save_companion is not yet wired up in the recovered tree".to_string())
+pub async fn jarvis_save_companion(companion: Value) -> Result<(), String> {
+    // Persist the full companion state to companion.json (the file the Bun server's
+    // GET /companion reads). The Bun POST /companion route is an interaction, not a
+    // save, so we write the canonical state directly.
+    crate::jarvis::save_companion_state(&companion)
 }
 
 #[tauri::command]
 pub async fn jarvis_restart_server() -> Result<bool, String> {
-    // Trigger a re-probe + re-spawn. The real implementation lives in
-    // lib.rs's `ensure_jarvis_server_started`; this command is a marker
-    // that the caller (UI button) can fire.
-    crate::ensure_jarvis_server_started().await?;
+    // Bypass the TTL fast-path in `ensure_jarvis_server_started` — that path
+    // returns success without re-spawning when the server was last seen
+    // healthy within the 10s window, which silently no-ops a "Restart" click
+    // when the user is staring at a dead UI. `force_restart_jarvis_server`
+    // kills the tracked child, re-spawns, and probes fresh.
+    crate::force_restart_jarvis_server().await?;
     Ok(true)
 }
 
 #[tauri::command]
-pub async fn jarvis_restart_ollama() -> Result<bool, String> {
-    Err("jarvis_restart_ollama is not yet wired up in the recovered tree".to_string())
+pub async fn jarvis_restart_ollama(
+    state: tauri::State<'_, crate::jarvis::types::JarvisState>,
+) -> Result<bool, String> {
+    // Kill the tracked Ollama child (if we spawned one), let the port free up, then
+    // respawn + warm. Returns true once Ollama is listening again. Best-effort: if
+    // Ollama was started outside the app there may be no child to kill, in which case
+    // we simply (re)ensure it is up.
+    crate::supervisor::reset_failures(crate::supervisor::SupervisedService::Ollama);
+    let model = state.config.lock().await.ollama.model.clone();
+    if let Some(m) = crate::OLLAMA_PROCESS.get() {
+        if let Ok(mut g) = m.lock() {
+            if let Some(mut child) = g.take() {
+                let _ = child.kill();
+            }
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    crate::start_ollama_and_warm(model).await;
+    if crate::is_port_listening(11434) {
+        Ok(true)
+    } else {
+        Err("Ollama did not come back up within the startup window".to_string())
+    }
+}
+
+#[tauri::command]
+pub async fn jarvis_restart_proxy(
+    state: tauri::State<'_, crate::jarvis::types::JarvisState>,
+) -> Result<bool, String> {
+    // Re-arm the supervisor (a long silent outage may have driven the proxy
+    // counter to the give-up cap), kill the tracked child, sleep briefly so
+    // the port is released, then re-spawn and probe :19878.
+    crate::supervisor::reset_failures(crate::supervisor::SupervisedService::Proxy);
+    let model = state.config.lock().await.ollama.model.clone();
+
+    if let Some(m) = crate::PROXY_PROCESS.get() {
+        if let Ok(mut g) = m.lock() {
+            if let Some(mut child) = g.take() {
+                let _ = child.kill();
+            }
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // `spawn_claude_cli_proxy` returns `None` when either the script or the
+    // python interpreter can't be located; the underlying spawn error is
+    // already logged via eprintln in lib.rs. Wrap with a specific error
+    // string the UI can surface verbatim.
+    let child = match crate::spawn_claude_cli_proxy(model.clone()) {
+        Some(c) => c,
+        None => {
+            return Err(match (model.is_empty(), true) {
+                _ if !model.is_empty() => {
+                    "claude_cli_proxy: failed to start (check python interpreter and claude_cli_proxy.py path)"
+                        .to_string()
+                }
+                _ => "claude_cli_proxy: failed to start (no model configured)".to_string(),
+            });
+        }
+    };
+
+    if let Some(m) = crate::PROXY_PROCESS.get() {
+        if let Ok(mut g) = m.lock() {
+            *g = Some(child);
+        }
+    }
+
+    // Wait for the proxy to bind :19878.
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(8) {
+        if crate::is_port_listening(19878) {
+            return Ok(true);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    Err("claude_cli_proxy: spawned but not listening on :19878".to_string())
 }
 
 #[tauri::command]
@@ -223,18 +387,22 @@ pub fn jarvis_list_memories_by_tier(db: State<AppDb>, tier: String) -> Result<Ve
 }
 
 #[tauri::command]
-pub async fn jarvis_recall_cold_memory(_id: String) -> Result<Value, String> {
-    Err("jarvis_recall_cold_memory is not yet wired up in the recovered tree".to_string())
+pub async fn jarvis_recall_cold_memory(
+    db: tauri::State<'_, crate::db::AppDb>,
+    id: String,
+) -> Result<Value, String> {
+    // Wired to the real memory engine (was a silent "not wired" stub). Hot/warm
+    // and DB-resident cold memories return their content; Drive-offloaded cold
+    // memories return an explicit deferred error rather than empty content.
+    let content = {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        crate::jarvis::memory::engine::recall_cold_memory(&conn, &id)?
+    };
+    Ok(serde_json::json!({
+        "id": id,
+        "found": content.is_some(),
+        "content": content,
+    }))
 }
 
-// `update_token_count` is referenced by lib.rs but is also a member of the
-// sessions command set; the canonical impl lives in commands/sessions.rs.
-// Stub here as a no-op so the macro can resolve either way.
-#[tauri::command]
-pub async fn update_token_count(
-    _session_id: String,
-    _tokens_in: i64,
-    _tokens_out: i64,
-) -> Result<(), String> {
-    Ok(())
-}
+// `update_token_count` canonical impl: commands/sessions.rs

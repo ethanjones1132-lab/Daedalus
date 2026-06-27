@@ -12,7 +12,7 @@ import { readdirSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 
 import { join } from "path";
 import { homedir } from "os";
 import { spawn, execSync } from "child_process";
-import { loadConfig, normalizeConfig, CONFIG_DIR, COMPANION_FILE, surfaceTemperature } from "./config";
+import { loadConfig, saveConfig, normalizeConfig, CONFIG_DIR, COMPANION_FILE, surfaceTemperature } from "./config";
 import type { JarvisConfig, OllamaConfig, SurfaceType } from "./config";
 import { Database } from "bun:sqlite";
 import { buildLearningPrompt, buildReviewPrompt, buildCodebaseAuditPrompt, buildFootballAuditPrompt } from "./cron-prompts";
@@ -37,6 +37,14 @@ import {
   applyOpenRouterRequestConfig,
 } from "./openrouter";
 import type { OpenRouterCostInfo } from "./openrouter";
+import { resolveProviderTarget, providerChatUrl, providerHeaders } from "./providers";
+import { recordInference, inferenceMetricsSnapshot, type Backend } from "./inference-metrics";
+import { createApprovalRegistry } from "./approval-registry";
+
+// One process-level approval registry: the chat surface emits
+// `tool_approval_request` SSE events and awaits decisions here.
+// The UI resolves them via POST /tool/decision.
+const approvalRegistry = createApprovalRegistry();
 import type { ToolCall } from "./tool-types";
 import {
   buildTextToolInstructions,
@@ -54,16 +62,15 @@ import {
   toApiTools,
 } from "./tool-runtime";
 import type { ToolRuntime, ExecutionContext } from "./tool-runtime";
-import { registerFilesystemBundle } from "./filesystem-bundle";
-import { registerShellBundle } from "./shell-bundle";
-import { registerWebBundle, searchWeb } from "./web-bundle";
-import { registerMetaBundle } from "./meta-bundle";
-import { registerTaskBundle } from "./task-bundle";
-import { registerMcpClientBundle } from "./mcp-client-bundle";
-import { registerInteractiveBundle, getSessionState, clearSessionState } from "./interactive-bundle";
-import { PredictiveRouter } from "./orchestration/router";
+import { registerStandardBundles } from "./bundles-registry";
+import { searchWeb } from "./web-bundle";
+import { getSessionState, clearSessionState } from "./interactive-bundle";
+import { StreamSession, VisibleTextPipe } from "./stream-emitter";
+import { Coordinator } from "./orchestration/coordinator";
+import { AgentPool, firstTokenTimeoutFor, formatPoolDiversity } from "./orchestration/agent-pool";
 import { PipelineExecutor } from "./orchestration/pipeline";
 import { outcomeCollector, selfTuningProposer, SelfTuningStore } from "./self-tuning/mod";
+import { normalizeStreamedToolCalls } from "./streaming-tool-calls";
 
 // ── Structured Logging Override ──────────────────────────────────────────────
 const originalLog = console.log;
@@ -113,8 +120,16 @@ console.warn = (...args: any[]) => {
 };
 
 const MODEL_REQUEST_TIMEOUT_MS = 300_000;
-const MODEL_STREAM_STALL_TIMEOUT_MS = 120_000;
-const MODEL_STREAM_STALL_CHECK_MS = 125_000;
+const MODEL_STREAM_STALL_TIMEOUT_MS = 60_000;
+const MODEL_STREAM_STALL_CHECK_MS = 5_000;
+// First-token watchdog. See chatCompletionWithFallback for the upstream
+// implementation. This constant governs the orchestrator-level defense
+// in depth that aborts the read loop if the response body is open but
+// no content token has arrived in MODEL_FIRST_TOKEN_TIMEOUT_MS. Capped
+// to 60s so it never exceeds the outer MODEL_STREAM_STALL_TIMEOUT_MS
+// (60s) — otherwise the stall watchdog would always fire first and the
+// first-token watchdog would be dead code.
+const MODEL_FIRST_TOKEN_TIMEOUT_MS = 30_000;
 const MAX_TOOL_RESULT_CHARS = 2000;  // Truncate tool results going back to model context
 const MAX_TOOL_EXECUTION_TURNS = 10;
 const activeStreamControllers = new Map<string, AbortController>();
@@ -184,19 +199,38 @@ function buildChatRuntime(cfg: JarvisConfig): {
   ctx: ExecutionContext;
 } {
   const runtime = createToolRuntime();
-  registerFilesystemBundle(runtime);
-  registerShellBundle(runtime);
-  registerWebBundle(runtime);
-  registerMetaBundle(runtime);
-  registerTaskBundle(runtime);
-  registerMcpClientBundle(runtime);
-  registerInteractiveBundle(runtime);
+  registerStandardBundles(runtime);
 
   const ctx = makeExecutionContext("chat", cfg, {
     workspace_path: cfg.jarvis_path,
   });
 
   return { runtime, ctx };
+}
+
+/**
+ * Build a sandbox permissions block describing tool constraints to the model.
+ * Rendered as a stable system-prompt prefix that never changes between turns,
+ * enabling prompt caching for the static portion of the context.
+ */
+function buildSandboxPermissions(cfg: JarvisConfig): string {
+  const mode = cfg.tools?.sandbox_mode ?? "strict";
+  const workspacePath = cfg.jarvis_path || "configured workspace";
+  const lines: string[] = [
+    "## Sandbox & Permissions",
+    "",
+    "You are running within Jarvis's tool runtime. The following constraints apply to every tool call:",
+    "",
+    `- **Workspace scope**: File access is bounded to \`${workspacePath}\`. Paths outside this scope are rejected.`,
+    `- **Shell sandbox**: Shell commands execute under sandbox mode \`${mode}\`.`,
+    "  - `strict`: Dangerous tools (write, edit, bash) are blocked on non-interactive surfaces and require approval on interactive surfaces.",
+    "  - `permissive`: Warnings are shown but tools are allowed.",
+    "  - `off`: No sandbox enforcement (full access).",
+    "- **Network access**: Web searches and HTTP requests may be restricted to approved domains.",
+    "- **Non-interactive surfaces**: Cron and agent runs default to read-only. Write operations are blocked unless explicitly configured.",
+    "- **Prohibited**: Do not attempt to bypass sandbox restrictions, escape the workspace, or execute shell commands that modify system state outside the workspace.",
+  ];
+  return lines.join("\n");
 }
 
 export interface JarvisSession {
@@ -878,6 +912,62 @@ function optimizeContextWindow(
   return [...pinnedSystemMessages, ...retained];
 }
 
+/** Thrown when the client aborts an in-flight stream — not a user-visible error. */
+class StreamCancelledError extends Error {
+  constructor() {
+    super("stream cancelled");
+    this.name = "StreamCancelledError";
+  }
+}
+
+/** Collect aggregate answer from a streamJarvis Response (cron scheduler contract). */
+async function drainStreamJarvisResponse(resp: Response): Promise<{ output: string; error?: string }> {
+  const reader = resp.body?.getReader();
+  if (!reader) return { output: "", error: "No response body" };
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let streamed = "";
+  let aggregate = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data: ")) continue;
+      const payload = trimmed.slice(6);
+      if (payload === "[DONE]") continue;
+      try {
+        const evt = JSON.parse(payload);
+        if (evt.type === "stream_event" && evt.delta?.text) streamed += evt.delta.text;
+        if (evt.type === "result" && typeof evt.result === "string") aggregate = evt.result;
+        if (evt.type === "error" && evt.error) return { output: streamed, error: String(evt.error) };
+        if (evt.type === "cancelled") return { output: streamed, error: "cancelled" };
+      } catch {
+        // skip malformed frames
+      }
+    }
+  }
+  return { output: aggregate || streamed };
+}
+
+/** Non-streaming cron dispatch — matches cron_scheduler.rs JSON contract. */
+async function runCronInference(body: Record<string, unknown>): Promise<{ success: boolean; output: string; error?: string }> {
+  const prompt = String(body.prompt ?? "");
+  if (!prompt.trim()) return { success: false, output: "", error: "prompt required" };
+  const sessionId = String(body.session_id ?? `cron_${crypto.randomUUID()}`);
+  try {
+    const resp = await streamJarvis(prompt, sessionId, { surface: "cron" });
+    const { output, error } = await drainStreamJarvisResponse(resp);
+    if (error) return { success: false, output, error };
+    return { success: true, output };
+  } catch (e: any) {
+    return { success: false, output: "", error: e?.message ?? String(e) };
+  }
+}
+
 async function streamJarvis(message: string, sessionId: string, options: StreamJarvisOptions = {}): Promise<Response> {
   const cfg = resolveConfig(options.config);
   const surface: SurfaceType = options.surface ?? "chat";
@@ -894,10 +984,36 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
   totalRequests++;
+  let _turnStart = Date.now();
 
   (async () => {
     const streamAbort = new AbortController();
     activeStreamControllers.set(sessionId, streamAbort);
+    const streamWrite = async (frame: string): Promise<boolean> => {
+      try {
+        await writer.write(encoder.encode(frame));
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const session = new StreamSession({
+      sessionId,
+      write: streamWrite,
+      isAborted: () => streamAbort.signal.aborted,
+    });
+    const emitCancelled = async (): Promise<never> => {
+      if (!session.hasTerminated()) {
+        session.noteTerminal();
+        await streamWrite(`data: ${JSON.stringify({ type: "cancelled", session_id: sessionId })}\n\n`);
+      }
+      throw new StreamCancelledError();
+    };
+    // Hoisted so the catch block can include them in error-path recordInference calls.
+    // let-in-try is block-scoped and invisible to catch; declare here then reinitialize in the Ollama/OpenRouter path.
+    let sessionCostInfo: OpenRouterCostInfo | null = null;
+    let lastFallbackRetries = 0;
+    let lastFallbackModel: string | undefined;
     try {
       const systemPrompt = options.systemPromptOverride ?? cfg.system_prompt;
       const isOllama = cfg.active_backend === "ollama";
@@ -912,11 +1028,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           : ollamaTarget?.modelName ?? cfg.ollama.model;
 
       console.log(`[Jarvis] Stream start session=${sessionId} backend=${cfg.active_backend} model=${modelLabel}`);
-      await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "init", session_id: sessionId, model: modelLabel })}\n\n`));
+      await session.init(modelLabel);
 
       // ── Claude CLI path ──────────────────────────────────────────
       if (cfg.active_backend === "claude_cli") {
-        const reasoningParser = cfg.reasoning.enabled ? new ReasoningParser(sessionId) : null;
+        const reasoningParser = new ReasoningParser(sessionId);
         const resumedSessionId = cliSessionMap.get(sessionId);
         const historyPrompt = !resumedSessionId && turnHistory.length > 0
           ? `${turnHistory.map(m => {
@@ -943,23 +1059,45 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           cwd: cfg.claude_cli.cwd,
           max_turns: 1,
           cliArgs,
-        })) {
+        }, streamAbort.signal)) {
+          if (streamAbort.signal.aborted) {
+            await emitCancelled();
+          }
           if (evt.type === "stream_event" && evt.delta?.text) {
             const text: string = evt.delta.text;
-            if (reasoningParser) {
-              for (const re of reasoningParser.processChunk(text)) {
-                const visibleText = visibleTextFromReasoningEvent(re);
-                if (!visibleText) continue;
-                if (re.type === "reasoning_step") {
+            for (const re of reasoningParser.processChunk(text)) {
+              const visibleText = visibleTextFromReasoningEvent(re);
+              if (!visibleText) continue;
+              if (re.type === "reasoning_step") {
+                if (cfg.reasoning.enabled) {
                   await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
-                } else if (re.type === "reasoning_chunk") {
-                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
-                } else {
-                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: visibleText }, session_id: sessionId })}\n\n`));
                 }
+              } else if (re.type === "reasoning_chunk") {
+                if (cfg.reasoning.enabled) {
+                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
+                }
+              } else {
+                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: visibleText }, session_id: sessionId })}\n\n`));
               }
             }
-            await writer.write(encoder.encode(`data: ${JSON.stringify({ ...evt, session_id: sessionId })}\n\n`));
+          } else if (evt.type === "tool_use") {
+            await writer.write(encoder.encode(`data: ${JSON.stringify({
+              type: "tool_use",
+              id: (evt as any).id,
+              name: evt.tool_name,
+              input: evt.tool_input,
+              session_id: sessionId,
+            })}\n\n`));
+          } else if (evt.type === "tool_result") {
+            await writer.write(encoder.encode(`data: ${JSON.stringify({
+              type: "tool_result",
+              name: evt.tool_name,
+              output: evt.tool_output,
+              session_id: sessionId,
+            })}\n\n`));
+          } else if (evt.type === "message_stop") {
+            session.noteTerminal();
+            await streamWrite(`data: ${JSON.stringify({ type: "message_stop", session_id: sessionId })}\n\n`);
           } else if (evt.type === "error") {
             if (resumedSessionId) {
               cliSessionMap.delete(sessionId);
@@ -995,10 +1133,31 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       // Patch the execution context with the active session ID so
       // interactive tools (ask_user_question) can scope state per-session.
       ctx.session_id = sessionId;
+      // Wire the approval hook: emit a `tool_approval_request` SSE event so
+      // the Tauri runner relays it to the UI (ToolApprovalModal), then await
+      // the user's decision from the process-level registry. Auto-denies after
+      // 5 minutes so a disconnected client can never wedge the stream.
+      ctx.requestApproval = async (req) => {
+        await writer.write(
+          encoder.encode(
+            `data: ${JSON.stringify({
+              type: "tool_approval_request",
+              call_id: req.call_id,
+              name: req.name,
+              arguments: req.arguments,
+              session_id: sessionId,
+            })}\n\n`,
+          ),
+        );
+        return approvalRegistry.request(req.call_id);
+      };
 
       // ── Orchestrator path (PAMO-SET Phase 2) ─────────────────────
       if (cfg.orchestrator?.enabled) {
         console.log(`[Jarvis Orchestrator] Starting session=${sessionId}`);
+        const agentPool = new AgentPool(cfg.orchestrator.agents ?? []);
+        const poolCoverage = agentPool.coverage();
+        console.log(`[Jarvis Orchestrator] Agent pool coverage: ${formatPoolDiversity(poolCoverage)}${poolCoverage.stage_gaps.length > 0 ? `; gaps=${poolCoverage.stage_gaps.join(",")}` : ""}`);
 
         // Setup context message using turn history if present
         let contextMessage = message;
@@ -1009,27 +1168,74 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           contextMessage = `Conversation History:\n${formattedHistory}\n\nLatest User Request: ${message}`;
         }
 
+        let orchestratorTaskType = "general";
+
         // Custom CallModelFn for pipeline execution
         const callModel = async (messages: any[], callOptions?: any) => {
           const isOllama = cfg.active_backend === "ollama";
           const ollamaTarget = isOllama ? await resolveOllamaChatTarget(cfg) : null;
+
+          // Resolve model from agent pool when a stage label is provided.
+          // Each orchestrator stage gets its designated model directly,
+          // bypassing the generic cfg.openrouter.model default.
+          // When cascadeTier is "cheap" the cascade's first (fastest/cheapest) agent
+          // is used; when "strong" the last (highest-capability) is used. Without a
+          // tier the pool's default_for agent for the stage is used (pickFor).
+          // opencode_zen agents are routed through the same OpenRouter API endpoint
+          // as native openrouter agents — same base_url and api_key apply.
+          let poolModel: string | null = null;
+          // Provider of the pool-selected agent. Drives endpoint + key routing
+          // for the primary request (the fallback cascade routes per-attempt).
+          let poolProvider: "openrouter" | "opencode_zen" | "opencode_go" | null = null;
+          const stageLabel = callOptions?.stageLabel as string | undefined;
+          const cascadeTier = callOptions?.cascadeTier as "cheap" | "strong" | undefined;
+          if (!isOllama && stageLabel && cfg.orchestrator?.enabled) {
+            try {
+              const pool = new AgentPool(cfg.orchestrator?.agents ?? []);
+              let agent: import("./orchestration/agent-pool").OrchestratorAgent | undefined;
+              if (cascadeTier) {
+                const chain = pool.cascadeChain(stageLabel, orchestratorTaskType);
+                agent = cascadeTier === "cheap" ? chain[0] : chain[chain.length - 1];
+              } else {
+                agent = pool.pickFor(stageLabel, orchestratorTaskType);
+              }
+              if (agent && (agent.provider === "openrouter" || agent.provider === "opencode_zen" || agent.provider === "opencode_go")) {
+                poolModel = agent.model_id;
+                poolProvider = agent.provider;
+                console.log(`[Jarvis Orchestrator] Pool resolved model ${agent.model_id} for stage=${stageLabel} cascadeTier=${cascadeTier ?? "none"} task=${orchestratorTaskType} agent=${agent.id} (provider=${agent.provider})`);
+              }
+            } catch (e: any) {
+              console.warn(`[Jarvis Orchestrator] Pool resolution failed for stage=${stageLabel}: ${e.message}`);
+            }
+          }
+
           const resolvedOpenRouterModel = cfg.active_backend === "openrouter"
             ? await resolveOpenRouterModel(cfg)
             : null;
 
           const modelName = isOllama
             ? (ollamaTarget?.modelName ?? cfg.ollama.model)
-            : resolvedOpenRouterModel ?? cfg.openrouter.model;
-          const openRouterEffective = !isOllama
+            : poolModel ?? resolvedOpenRouterModel ?? cfg.openrouter.model;
+          // The effective provider for the PRIMARY request. OpenCode providers
+          // speak OpenAI-compatible /chat/completions but live on their own
+          // base_url + key (resolveProviderTarget). OpenRouter is the default.
+          const effectiveProvider = poolProvider ?? "openrouter";
+          const isOpenCodeProvider = effectiveProvider === "opencode_zen" || effectiveProvider === "opencode_go";
+          const providerTarget = !isOllama ? resolveProviderTarget(cfg, effectiveProvider) : null;
+          // Only the OpenRouter catalog can describe OpenRouter models; skip it
+          // for OpenCode (its models aren't in that catalog).
+          const openRouterEffective = (!isOllama && !isOpenCodeProvider)
             ? await resolveEffectiveOpenRouterRequestConfig(cfg, modelName, messages, { surface })
             : null;
           const baseUrl = isOllama
             ? ollamaTarget!.chatUrl
-            : `${cfg.openrouter.base_url}/chat/completions`;
+            : providerChatUrl(providerTarget!);
 
           const modelSupportsNativeTools = isOllama
             ? (ollamaTarget?.supportsNativeTools ?? false)
-            : (openRouterEffective?.supports_tools ?? isOpenRouterModelSupportsTools(modelName));
+            : isOpenCodeProvider
+              ? false // OpenCode agents use the text tool protocol
+              : (openRouterEffective?.supports_tools ?? isOpenRouterModelSupportsTools(modelName));
           // Use text tool protocol if native tools are disabled/unsupported and tools are requested
           const useTextTools = !modelSupportsNativeTools && callOptions?.tools && callOptions.tools.length > 0;
 
@@ -1071,6 +1277,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               num_thread: activeProfile?.num_threads ?? cfg.ollama.options?.num_thread ?? 8,
               num_batch: activeProfile?.batch_size ?? cfg.ollama.options?.num_batch ?? 256,
             };
+          } else if (isOpenCodeProvider) {
+            // OpenCode (Zen/Go): OpenAI-compatible but not in the OpenRouter
+            // catalog. Apply a lean config from callOptions/cfg directly.
+            if (callOptions?.max_tokens !== undefined) requestBody.max_tokens = callOptions.max_tokens;
+            else if (typeof cfg.max_tokens === "number" && cfg.max_tokens > 0) requestBody.max_tokens = cfg.max_tokens;
+            if (callOptions?.temperature !== undefined) requestBody.temperature = callOptions.temperature;
+            else if (cfg.temperature !== undefined) requestBody.temperature = cfg.temperature;
+            if (cfg.top_p !== undefined) requestBody.top_p = cfg.top_p;
           } else {
             await applyOpenRouterRequestConfig(requestBody, cfg, modelName, normalizedMessages, {
               requestedMaxTokens: callOptions?.max_tokens,
@@ -1082,7 +1296,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
           if (cfg.tools.enabled && !useTextTools && callOptions?.tools && callOptions.tools.length > 0) {
             requestBody.tools = toApiTools(callOptions.tools);
-            if (!isOllama) {
+            if (!isOllama && !isOpenCodeProvider) {
               await applyOpenRouterRequestConfig(requestBody, cfg, modelName, normalizedMessages, {
                 requestedMaxTokens: callOptions?.max_tokens,
                 requestedTemperature: callOptions?.temperature,
@@ -1092,32 +1306,48 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
           }
 
-          const headers: Record<string, string> = {
-            "Authorization": isOllama ? "Bearer ollama" : `Bearer ${cfg.openrouter.api_key}`,
-            "Content-Type": "application/json",
-          };
-          if (!isOllama) {
-            headers["HTTP-Referer"] = cfg.openrouter.site_url || "http://localhost:19877";
-            headers["X-Title"] = cfg.openrouter.site_name || "Jarvis";
-          }
+          const headers: Record<string, string> = isOllama
+            ? { "Authorization": "Bearer ollama", "Content-Type": "application/json" }
+            : providerHeaders(cfg, providerTarget!);
 
+          // Use the same fallback/retry pipeline as the main Agent Loop so the
+          // orchestrator is not single-shot on the OpenRouter free tier (which
+          // 429s frequently and 503s during provider outages). Without this
+          // every orchestrator stage dies on the first transient error and the
+          // user sees a silent stall.
+          const useFallback = !isOllama && cfg.openrouter.enable_fallbacks;
+          const requestTimeout = isOllama ? MODEL_REQUEST_TIMEOUT_MS : (cfg.openrouter.timeout_ms || MODEL_REQUEST_TIMEOUT_MS);
           const ctrl = new AbortController();
-          const timeout = setTimeout(() => ctrl.abort(), MODEL_REQUEST_TIMEOUT_MS);
+          const timeout = setTimeout(() => ctrl.abort(), requestTimeout);
           const onStreamAbort = () => ctrl.abort();
           streamAbort.signal.addEventListener("abort", onStreamAbort);
 
           let fetchRes: Response;
+          let actualModelUsed = modelName;
           try {
-            fetchRes = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(requestBody), signal: ctrl.signal });
+            if (useFallback) {
+              const result = await chatCompletionWithFallback(cfg, requestBody, ctrl.signal, {
+                stage: callOptions?.stageLabel,
+                taskType: orchestratorTaskType,
+                cascadeTier: callOptions?.cascadeTier,
+              });
+              fetchRes = result.response;
+              actualModelUsed = result.model_used;
+              if (result.retries > 0) {
+                console.log(`[Jarvis Orchestrator] callModel used model ${result.model_used} after ${result.retries} retry attempt(s)`);
+                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "fallback_notice", model: result.model_used, retries: result.retries, session_id: sessionId })}\n\n`));
+              }
+            } else {
+              fetchRes = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(requestBody), signal: ctrl.signal });
+            }
           } catch (fetchErr: any) {
             clearTimeout(timeout);
             streamAbort.signal.removeEventListener("abort", onStreamAbort);
             if (fetchErr.name === "AbortError") {
               if (streamAbort.signal.aborted) {
-                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "cancelled", session_id: sessionId })}\n\n`));
-                return { content: "", tool_calls: undefined };
+                await emitCancelled();
               }
-              throw new Error(`Request timed out after ${MODEL_REQUEST_TIMEOUT_MS / 1000}s. The model may be loading or overloaded.`);
+              throw new Error(`Request timed out after ${requestTimeout / 1000}s. The model may be loading or overloaded.`);
             }
             if (isOllama && (fetchErr.message?.includes("ECONNREFUSED") || fetchErr.message?.includes("fetch failed"))) {
               throw new Error(`Cannot connect to Ollama. Tried: ${ollamaTarget?.tried.join("; ") || baseUrl}. Make sure Ollama is running and the model is pulled (ollama pull ${modelName}).`);
@@ -1128,24 +1358,74 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           if (!fetchRes.ok) {
             const errText = await fetchRes.text();
             clearTimeout(timeout);
+            streamAbort.signal.removeEventListener("abort", onStreamAbort);
             throw new Error(`API ${fetchRes.status}: ${errText.slice(0, 300)}`);
           }
           clearTimeout(timeout);
-          streamAbort.signal.removeEventListener("abort", onStreamAbort);
 
           const reader = fetchRes.body?.getReader();
-          if (!reader) throw new Error("No response body from API");
+          if (!reader) {
+            streamAbort.signal.removeEventListener("abort", onStreamAbort);
+            throw new Error("No response body from API");
+          }
 
-          const reasoningParser = cfg.reasoning.enabled ? new ReasoningParser(sessionId) : null;
+          const reasoningParser = new ReasoningParser(sessionId);
           const decoder = new TextDecoder();
           let buffer = "";
           let fullTurnText = "";
           let activeToolCalls: any[] = [];
+          let lastActivity = Date.now();
+          let firstTokenReceived = false;
+          // Defense-in-depth: in case the request bypassed the
+          // chatCompletionWithFallback path (useFallback=false) OR the
+          // upstream race-based watchdog in chatCompletionWithFallback
+          // missed an edge case, the orchestrator's read loop also
+          // enforces a 30s first-token window. If 30s pass after the
+          // response is opened without any choice.delta.content
+          // chunk, abort the stream. This guarantees the user's
+          // perceived latency never exceeds 30s on a hung model —
+          // before this, the read loop silently waited for the 5-min
+          // outer AbortController.
+          const firstTokenTimer = setTimeout(() => {
+            if (!firstTokenReceived && !streamAbort.signal.aborted) {
+              const overrideMs = firstTokenTimeoutFor(agentPool, actualModelUsed, MODEL_FIRST_TOKEN_TIMEOUT_MS);
+              console.warn(`[Jarvis Orchestrator] First-token timeout (${overrideMs / 1000}s) on stage=${callOptions?.stageLabel ?? "agent"} model=${actualModelUsed} — aborting stream`);
+              streamAbort.abort("First-token timeout");
+              reader.cancel("First-token timeout").catch(() => {});
+            }
+          }, MODEL_FIRST_TOKEN_TIMEOUT_MS);
           const textStreamSanitizer = new TextToolCallStreamSanitizer();
+          const emitTextToken = async (text: string) => {
+            if (callOptions?.surfaceAsAnswer) {
+              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text }, session_id: sessionId })}\n\n`));
+            } else if (!callOptions?.suppressActivity) {
+              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "agent_activity", stage: callOptions?.stageLabel ?? "agent", text, session_id: sessionId })}\n\n`));
+            }
+          };
 
+          try {
           while (true) {
-            const { done, value } = await reader.read();
+            if (streamAbort.signal.aborted) {
+              await emitCancelled();
+            }
+            // Stream stall watchdog: cancel the reader if the model stops
+            // sending bytes. Mirrors the Agent Loop's `MODEL_STREAM_STALL_*`
+            // constants — without it, a hung OpenRouter SSE stream blocks the
+            // whole stage until the outer 5-minute AbortController trips.
+            const chunkTimeout = setTimeout(() => {
+              if (Date.now() - lastActivity > MODEL_STREAM_STALL_TIMEOUT_MS) {
+                reader.cancel("Stream stalled").catch(() => {});
+              }
+            }, MODEL_STREAM_STALL_CHECK_MS);
+            let readResult: ReadableStreamReadResult<Uint8Array>;
+            try {
+              readResult = await reader.read();
+            } finally {
+              clearTimeout(chunkTimeout);
+            }
+            const { done, value } = readResult;
             if (done) break;
+            lastActivity = Date.now();
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split("\n");
             buffer = lines.pop() || "";
@@ -1173,6 +1453,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 if (chunkText) {
                   chunkText = chunkText.replace(/<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>|<\|im_sep\|>/g, "");
                   if (chunkText) {
+                    if (!firstTokenReceived) {
+                      firstTokenReceived = true;
+                      clearTimeout(firstTokenTimer);
+                    }
                     fullTurnText += chunkText;
                     if (callOptions?.onChunk) {
                       callOptions.onChunk(chunkText);
@@ -1183,20 +1467,24 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                         const visibleText = visibleTextFromReasoningEvent(re);
                         if (!visibleText) continue;
                         if (re.type === "reasoning_step") {
-                          await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
+                          if (cfg.reasoning.enabled) {
+                            await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
+                          }
                         } else if (re.type === "reasoning_chunk") {
-                          await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
+                          if (cfg.reasoning.enabled) {
+                            await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
+                          }
                         } else {
                           const sanitized = textStreamSanitizer.push(visibleText);
                           if (sanitized) {
-                            await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: sanitized }, session_id: sessionId })}\n\n`));
+                            await emitTextToken(sanitized);
                           }
                         }
                       }
                     } else {
                       const sanitized = textStreamSanitizer.push(chunkText);
                       if (sanitized) {
-                        await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: sanitized }, session_id: sessionId })}\n\n`));
+                        await emitTextToken(sanitized);
                       }
                     }
                   }
@@ -1207,43 +1495,57 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
           }
 
+          // Always clear the first-token timer when the read loop exits,
+          // whether normally (done), via abort, or via the watchdog.
+          clearTimeout(firstTokenTimer);
+
           if (reasoningParser) {
             for (const re of reasoningParser.flush()) {
               const visibleText = visibleTextFromReasoningEvent(re);
               if (!visibleText) continue;
               if (re.type === "reasoning_step") {
-                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
+                if (cfg.reasoning.enabled) {
+                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
+                }
               } else if (re.type === "reasoning_chunk") {
-                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
+                if (cfg.reasoning.enabled) {
+                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
+                }
               } else {
                 const sanitized = textStreamSanitizer.push(visibleText);
                 if (sanitized) {
-                  await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: sanitized }, session_id: sessionId })}\n\n`));
+                  await emitTextToken(sanitized);
                 }
               }
             }
-            const trace = reasoningParser.finalize();
-            await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_complete", trace, session_id: sessionId })}\n\n`));
+            if (cfg.reasoning.enabled) {
+              const trace = reasoningParser.finalize();
+              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_complete", trace, session_id: sessionId })}\n\n`));
+            }
           }
 
           const remaining = textStreamSanitizer.flush();
           if (remaining) {
-            await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: remaining }, session_id: sessionId })}\n\n`));
+            await emitTextToken(remaining);
           }
 
-          let parsedToolCalls = activeToolCalls.filter(Boolean).map((tc) => {
-            let parsedArgs = {};
-            try {
-              parsedArgs = JSON.parse(tc.arguments);
-            } catch {
-              parsedArgs = {};
-            }
-            return {
-              id: tc.id || `call_${crypto.randomUUID().slice(0, 8)}`,
-              name: tc.name,
-              arguments: parsedArgs
-            };
-          });
+          // Normalize the stream-assembled tool-call slots into a dispatchable
+          // list. The old code here silently coerced non-JSON `arguments` to
+          // `{}` and emitted a tool call with an undefined `name` whenever the
+          // model streamed arguments chunks but no function.name delta — both
+          // failure modes are real per the 2026-06-26 live diagnosis (Priority
+          // 3: "executor/provider compatibility is unstable and produces
+          // malformed-tool-message failures during fallback"). The
+          // agent-loop path at line 2041 already filters name-less slots; the
+          // orchestrator path now does the same and additionally surfaces a
+          // one-line `[Jarvis]` warning per malformed entry so the operator
+          // can attribute the failure to a specific model output.
+          const normalizeCtx = `model=${poolModel ?? "<unknown>"} provider=${poolProvider ?? "<unknown>"} stage=${stageLabel ?? "<none>"}`;
+          const normalized = normalizeStreamedToolCalls(activeToolCalls);
+          for (const w of normalized.warnings) {
+            console.warn(`[Jarvis] malformed streamed tool_call (${w.kind}) ${normalizeCtx}: ${w.message}`);
+          }
+          let parsedToolCalls = normalized.calls;
 
           if (useTextTools) {
             const extracted = extractTextToolCalls(fullTurnText, callOptions.tools);
@@ -1261,22 +1563,32 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             content: cleanContent,
             tool_calls: parsedToolCalls.length > 0 ? parsedToolCalls : undefined,
           };
+          } finally {
+            streamAbort.signal.removeEventListener("abort", onStreamAbort);
+          }
         };
 
-        // Route the user request using the predictive router
-        const router = new PredictiveRouter(callModel);
-        const route = await router.route(contextMessage);
-        console.log(`[Jarvis Orchestrator] Router decided task_type=${route.task_type}, pipeline=${route.pipeline.join(" -> ")}`);
+        // Route the user request through the Fugu-style coordinator. The
+        // current executor still consumes a concrete stage list, so null skips
+        // and re-entry directives are materialized at the activation boundary.
+        const coordinator = new Coordinator(callModel);
+        const route = await coordinator.route(contextMessage, {
+          sessionId,
+          history: turnHistory,
+        });
+        orchestratorTaskType = route.task_type;
+        const executablePipeline = coordinator.executablePipeline(route);
+        console.log(`[Jarvis Orchestrator] Coordinator decided task_type=${route.task_type}, topology=${route.topology}, pipeline=${route.pipeline.map((step) => step ?? "skip").join(" -> ")}`);
 
         // Initialize tuned configurations and start run in collector
         const agentRunId = `run_${crypto.randomUUID()}`;
         selfTuningProposer.initializeTunedConfigs();
-        outcomeCollector.startAgentRun(agentRunId, sessionId, contextMessage, route.task_type, route.pipeline);
+        outcomeCollector.startAgentRun(agentRunId, sessionId, contextMessage, route.task_type, executablePipeline);
         const runStartTime = Date.now();
 
         // Execute the pipeline
         const executor = new PipelineExecutor(callModel, runtime, ctx);
-        const result = await executor.execute(contextMessage, route.pipeline, agentRunId, async (state) => {
+        const result = await executor.execute(contextMessage, executablePipeline, agentRunId, async (state) => {
           // Stream stage progress back to client
           await writer.write(encoder.encode(`data: ${JSON.stringify({
             type: "orchestrator_stage",
@@ -1284,6 +1596,19 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             status: state.status,
             session_id: sessionId
           })}\n\n`));
+        }, {
+          topology: route.topology,
+          maxRecursionDepth: cfg.orchestrator.max_recursion_depth,
+          onRecursion: async (event) => {
+            await writer.write(encoder.encode(`data: ${JSON.stringify({
+              type: "orchestrator_recursion",
+              depth: event.depth,
+              status: event.status,
+              reenter_stage: event.reenter_stage,
+              critique: event.critique,
+              session_id: sessionId
+            })}\n\n`));
+          },
         });
 
         // Record metrics and propose tuning options
@@ -1301,13 +1626,40 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }
         } catch {}
 
-        outcomeCollector.completeAgentRun(agentRunId, result, duration, totalToolCalls, totalTokens);
+        outcomeCollector.completeAgentRun(agentRunId, result.answer, duration, totalToolCalls, totalTokens);
         await selfTuningProposer.proposeAndApply(agentRunId, route.task_type);
 
         // Write final done messages
         await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "agent_run_id", agent_run_id: agentRunId, session_id: sessionId })}\n\n`));
-        await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "message_stop", session_id: sessionId })}\n\n`));
-        await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "result", subtype: "success", is_error: false, result: result, session_id: sessionId })}\n\n`));
+        if (result.error) {
+          // Turn-fatal failure (e.g. auth rejected on every stage): surface a
+          // real error frame so the UI shows a banner instead of dropping the
+          // failure text into the chat bubble as if it were an answer.
+          console.error(`[Jarvis Orchestrator] session=${sessionId} failed: ${result.error}`);
+          recordInference({
+            ts: Date.now(),
+            backend: cfg.active_backend as Backend,
+            // claude_cli is handled by an earlier early-return, so here the
+            // backend is ollama | openrouter.
+            model: cfg.active_backend === "openrouter"
+              ? (cfg.openrouter.model ?? "openrouter/free")
+              : cfg.ollama.model,
+            ok: false,
+            latency_ms: duration,
+            tokens_in: 0,
+            tokens_out: 0,
+            error: result.error.slice(0, 200),
+          });
+          await session.finish(result.error, { isError: true });
+        } else {
+          const answer = result.answer?.trim() || "";
+          if (!answer && !result.error) {
+            console.warn(`[Jarvis Orchestrator] Pipeline returned empty answer session=${sessionId} — surfacing fallback`);
+            await session.finish("The orchestrator completed but produced no output. This may be a transient model issue. Try your request again.");
+          } else {
+            await session.finish(answer || result.answer);
+          }
+        }
         return;
       }
 
@@ -1332,8 +1684,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       let forceFinalAnswerOnly = false;
       let verifiedWebSearchDone = false;
       let toolExecutionCount = 0;
-      let sessionCostInfo: OpenRouterCostInfo | null = null;
+      sessionCostInfo = null;
       let prevToolCallCount = 0;  // Track tools called in previous turn for nudge logic
+      lastFallbackRetries = 0;
+      lastFallbackModel = undefined;
       const requiresVerifiedWebSearch = cfg.tools.enabled && hasExplicitWebSearchIntent(message);
       const requiresLocalToolUse = cfg.tools.enabled && hasLocalWorkspaceToolIntent(message);
 
@@ -1343,6 +1697,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
       while (!loopDone && turnCount < MAX_TOOL_EXECUTION_TURNS) {
         turnCount++;
+        _turnStart = Date.now();
         const baseUrl = isOllama
           ? ollamaTarget!.chatUrl
           : `${cfg.openrouter.base_url}/chat/completions`;
@@ -1410,24 +1765,25 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         if (activeHistory.length < previousLength) {
           console.warn(`[Jarvis] Optimizing context: truncated history from ${previousLength} to ${activeHistory.length} messages (context window: ${num_ctx})`);
         }
-        // ~250 tokens per message, capped at 100
-        // Merge system prompt + memory context into a single system message
-        const firstSystemIdx = activeHistory.findIndex((m: any) => m.role === "system");
-        if (firstSystemIdx >= 0 && effectiveSystemPrompt) {
-          const existing = activeHistory[firstSystemIdx];
-          const merged = {
-            role: "system" as const,
-            content: `${effectiveSystemPrompt}\n\n---\n\n${existing.content}`,
-          };
-          const historyWithoutSystem = [...activeHistory];
-          historyWithoutSystem.splice(firstSystemIdx, 1);
-          messages.push(merged);
-          messages.push(...historyWithoutSystem);
-        } else if (effectiveSystemPrompt) {
-          messages.push({ role: "system", content: effectiveSystemPrompt });
-          messages.push(...activeHistory);
-        } else {
-          messages.push(...activeHistory);
+        // Cache-friendly prompt assembly:
+        //   [0] static prefix (identity + sandbox + tools) — NEVER changes between turns
+        //   [1..N] compaction summaries / memory context from history (infrequent changes)
+        //   [N+1..] conversation history (changes every turn)
+        //   [last] current user prompt (changes every turn)
+        // Only the tail changes between turns → prompt cache stays warm for the prefix.
+        {
+          const effectiveTextTools = !forceFinalAnswerOnly ? cachedTextToolInstructions : "";
+          const sandboxBlock = buildSandboxPermissions(cfg);
+          const staticPrefix = [cfg.system_prompt, sandboxBlock, effectiveTextTools].filter(Boolean).join("\n\n");
+          messages.push({ role: "system", content: staticPrefix });
+          // Preserve compaction summaries and memory system messages from history unchanged
+          for (const msg of activeHistory) {
+            if (msg.role === "system") {
+              messages.push(msg);
+            }
+          }
+          // Non-system history
+          messages.push(...activeHistory.filter(m => m.role !== "system"));
         }
         if (currentPrompt) {
           messages.push({ role: "user", content: currentPrompt });
@@ -1506,7 +1862,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             const result = await chatCompletionWithFallback(cfg, requestBody, ctrl.signal);
             fetchRes = result.response;
             actualModelUsed = result.model_used;
+            lastFallbackRetries = result.retries;
             if (result.retries > 0) {
+              lastFallbackModel = result.model_used;
               console.log(`[OpenRouter] Used model ${result.model_used} after ${result.retries} retry attempt(s)`);
               await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "fallback_notice", model: result.model_used, retries: result.retries, session_id: sessionId })}\n\n`));
             }
@@ -1518,8 +1876,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           streamAbort.signal.removeEventListener("abort", onStreamAbortMain);
           if (fetchErr.name === "AbortError") {
             if (streamAbort.signal.aborted) {
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "cancelled", session_id: sessionId })}\n\n`));
-              return;
+              await emitCancelled();
             }
             throw new Error(`Request timed out after ${requestTimeout / 1000}s. The model may be loading or overloaded.`);
           }
@@ -1546,16 +1903,24 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
             const retryCtrl = new AbortController();
             const retryTimeout = setTimeout(() => retryCtrl.abort(), requestTimeout);
+            const onRetryAbort = () => retryCtrl.abort();
+            streamAbort.signal.addEventListener("abort", onRetryAbort);
             try {
               fetchRes = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(requestBody), signal: retryCtrl.signal });
               if (!fetchRes.ok) {
                 const retryErrText = await fetchRes.text();
                 clearTimeout(retryTimeout);
+                streamAbort.signal.removeEventListener("abort", onRetryAbort);
                 throw new Error(`API ${fetchRes.status}: ${retryErrText.slice(0, 300)}`);
               }
               clearTimeout(retryTimeout);
+              streamAbort.signal.removeEventListener("abort", onRetryAbort);
             } catch (retryErr: any) {
               clearTimeout(retryTimeout);
+              streamAbort.signal.removeEventListener("abort", onRetryAbort);
+              if (retryErr.name === "AbortError" && streamAbort.signal.aborted) {
+                await emitCancelled();
+              }
               throw retryErr;
             }
           } else {
@@ -1571,53 +1936,48 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         if (!reader) throw new Error("No response body from API");
         streamAbort.signal.removeEventListener("abort", onStreamAbortMain);
 
-        const reasoningParser = cfg.reasoning.enabled ? new ReasoningParser(sessionId) : null;
+        const textPipe = session.newTextPipe(cfg.reasoning.enabled);
         const decoder = new TextDecoder();
         let buffer = "";
         let turnText = "";
         let lastActivity = Date.now();
+        let firstTokenReceived = false;
+        // Agent Loop first-token watchdog. The Agent Loop fetches
+        // directly (bypassing chatCompletionWithFallback), so the
+        // cascade-advance logic in openrouter.ts does not cover this
+        // path. Aborting on 30s of silence from the response body
+        // surfaces a clear error to the caller instead of the
+        // pre-fix silent 5-min stall.
+        const firstTokenTimer = setTimeout(() => {
+          if (!firstTokenReceived && !streamAbort.signal.aborted) {
+            // Apply the per-model first-token override (planner/synthesizer
+            // defaults get 55s; the rest stay on the global 30s). The agent
+            // loop runs after the orchestrator branch, so it builds its own
+            // pool reference for the override lookup.
+            const agentLoopPool = new AgentPool(cfg.orchestrator?.agents ?? []);
+            const overrideMs = firstTokenTimeoutFor(agentLoopPool, modelName, MODEL_FIRST_TOKEN_TIMEOUT_MS);
+            console.warn(`[Jarvis Agent Loop] First-token timeout (${overrideMs / 1000}s) on model=${modelName} — aborting stream`);
+            streamAbort.abort("First-token timeout");
+            reader.cancel("First-token timeout").catch(() => {});
+          }
+        }, MODEL_FIRST_TOKEN_TIMEOUT_MS);
         let activeToolCalls: any[] = [];
-        const textStreamSanitizer = new TextToolCallStreamSanitizer();
         const holdVisibleText = !forceFinalAnswerOnly
           && ((requiresVerifiedWebSearch && !verifiedWebSearchDone)
             || (requiresLocalToolUse && toolExecutionCount === 0));
         const emitVisibleText = async (text: string) => {
           if (!text) return;
-          if (reasoningParser) {
-            for (const re of reasoningParser.processChunk(text)) {
-              const visibleText = visibleTextFromReasoningEvent(re);
-              if (!visibleText) continue;
-              if (re.type === "reasoning_step") {
-                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
-              } else if (re.type === "reasoning_chunk") {
-                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
-              } else {
-                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: visibleText }, session_id: sessionId })}\n\n`));
-              }
-            }
-          } else {
-            await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text }, session_id: sessionId })}\n\n`));
-          }
+          await textPipe.push(text);
         };
         const completeReasoning = async () => {
-          if (!reasoningParser) return;
-          for (const re of reasoningParser.flush()) {
-            const visibleText = visibleTextFromReasoningEvent(re);
-            if (!visibleText) continue;
-            if (re.type === "reasoning_step") {
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_step", step: re.step, session_id: sessionId })}\n\n`));
-            } else if (re.type === "reasoning_chunk") {
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
-            } else {
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text: visibleText }, session_id: sessionId })}\n\n`));
-            }
-          }
-          const trace = reasoningParser.finalize();
-          await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_complete", trace, session_id: sessionId })}\n\n`));
+          await textPipe.finish();
         };
 
         try {
           while (true) {
+            if (streamAbort.signal.aborted) {
+              await emitCancelled();
+            }
             const chunkTimeout = setTimeout(() => {
               if (Date.now() - lastActivity > MODEL_STREAM_STALL_TIMEOUT_MS) reader.cancel("Stream stalled");
             }, MODEL_STREAM_STALL_CHECK_MS);
@@ -1661,10 +2021,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                   // Strip ChatML leakage tokens
                   content = content.replace(/<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>|<\|im_sep\|>/g, "");
                   if (content) {
+                    if (!firstTokenReceived) {
+                      firstTokenReceived = true;
+                      clearTimeout(firstTokenTimer);
+                    }
                     turnText += content;
                     fullText += content;
-                    const visibleText = textStreamSanitizer.push(content);
-                    if (!holdVisibleText) await emitVisibleText(visibleText);
+                    if (!holdVisibleText) await emitVisibleText(content);
                   }
                 }
 
@@ -1683,6 +2046,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }
         } finally {
           clearTimeout(timeout);
+          clearTimeout(firstTokenTimer);
         }
 
         // Filter activeToolCalls to only contain valid tool calls
@@ -1705,14 +2069,29 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           && requiresLocalToolUse
           && toolExecutionCount === 0
           && !forcedLocalInspectionDone;
-        const safeTail = textStreamSanitizer.flush();
-
-        if (!holdVisibleText) {
-          await emitVisibleText(safeTail);
-        } else if (validCalls.length === 0 && runnableTextCalls.length === 0 && !shouldForceWebSearch && !shouldForceLocalInspection) {
+        if (holdVisibleText && validCalls.length === 0 && runnableTextCalls.length === 0 && !shouldForceWebSearch && !shouldForceLocalInspection) {
           await emitVisibleText(textExtraction.cleanedText);
         }
         await completeReasoning();
+
+        // Record per-turn inference for resilience observability (per-backend retry/fallback telemetry)
+        const _cfgTurn = resolveConfig(options.config);
+        recordInference({
+          ts: Date.now(),
+          backend: _cfgTurn.active_backend as Backend,
+          model: lastFallbackModel ?? (_cfgTurn.active_backend === "openrouter"
+            ? (_cfgTurn.openrouter.model ?? "openrouter/free")
+            : _cfgTurn.active_backend === "claude_cli"
+            ? (_cfgTurn.claude_cli.model ?? "claude_cli")
+            : _cfgTurn.ollama.model),
+          ok: true,
+          latency_ms: Date.now() - _turnStart,
+          tokens_in: sessionCostInfo?.prompt_tokens ?? 0,
+          tokens_out: sessionCostInfo?.completion_tokens ?? 0,
+          fallback_used: lastFallbackRetries > 0,
+          retry_count: lastFallbackRetries,
+          fallback_model: lastFallbackModel,
+        });
 
         if (shouldForceWebSearch) {
           fullText = fullTextBeforeTurn;
@@ -1832,8 +2211,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
             // If the user was asked a question, stop the loop and wait for their response.
             if (call.name === "ask_user_question") {
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "message_stop", session_id: sessionId })}\n\n`));
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "result", subtype: "success", is_error: false, result: toolOutput, session_id: sessionId })}\n\n`));
+              await session.finish(toolOutput);
               loopDone = true;
               break;
             }
@@ -1853,28 +2231,39 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let resultText = toolExecutionCount > 0
             ? finalTurnResultText
             : (cfg.reasoning.enabled ? stripReasoningFromText(fullText) : fullText);
-          if (toolExecutionCount > 0 && finalTurnResultText.trim().length === 0) {
-            if (!emptyFinalAnswerRetryDone) {
-              fullText = fullTextBeforeTurn;
-              currentPrompt = [
-                currentPrompt,
-                "Tool use is complete. Do not call tools or emit <tool_call> blocks. Write the final visible answer now using the tool results already provided. If the requested app or file is not present, say that plainly. Do not emit hidden reasoning tags.",
-              ].filter(Boolean).join("\n\n");
-              emptyFinalAnswerRetryDone = true;
-              forceFinalAnswerOnly = true;
-              useTextToolProtocol = false;
-              prevToolCallCount = 0;
-              console.warn(`[Jarvis] Forcing final-answer-only retry session=${sessionId} after ${toolExecutionCount} tool result(s)`);
-              continue;
-            }
-            resultText = "I completed tool inspection, but the model returned no visible final answer after a final-answer-only retry. The streamed tool results above are preserved for review.";
+
+          // Retry once if the model returned empty content — covers both
+          // the tool-execution case (tools ran but no final answer) and
+          // the no-tool case (model returned nothing at all). Some
+          // providers/models transiently return empty on the first attempt
+          // due to rate-limiting, timing, or model-specific edge cases.
+          if (resultText.trim().length === 0 && !emptyFinalAnswerRetryDone) {
+            fullText = fullTextBeforeTurn;
+            const retryPrompt = toolExecutionCount > 0
+              ? "Tool use is complete. Do not call tools or emit <tool_call> blocks. Write the final visible answer now using the tool results already provided. If the requested app or file is not present, say that plainly. Do not emit hidden reasoning tags."
+              : "Your previous response was empty. Write a final answer now. Do not call tools or emit <tool_call> blocks. If you have no specific result to report, tell the user what you found or why you couldn't complete the request.";
+            currentPrompt = [currentPrompt, retryPrompt].filter(Boolean).join("\n\n");
+            emptyFinalAnswerRetryDone = true;
+            forceFinalAnswerOnly = true;
+            useTextToolProtocol = false;
+            prevToolCallCount = 0;
+            console.warn(`[Jarvis] Empty response retry session=${sessionId} after ${toolExecutionCount} tool execution(s)`);
+            continue;
           }
+
+          if (resultText.trim().length === 0) {
+            // Both the initial attempt and the retry returned empty — surface
+            // a fallback so the user sees something instead of a blank bubble.
+            resultText = toolExecutionCount > 0
+              ? "I completed tool inspection, but the model returned no visible final answer after a final-answer-only retry. The streamed tool results above are preserved for review."
+              : "The model returned no content. This can happen due to transient model issues, provider timeouts, or empty completions on the free tier. Please try sending your message again.";
+          }
+
           if (sessionCostInfo) {
             logOpenRouterCost(sessionCostInfo);
             await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "cost_info", ...sessionCostInfo, session_id: sessionId })}\n\n`));
           }
-          await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "message_stop", session_id: sessionId })}\n\n`));
-          await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "result", subtype: "success", is_error: false, result: resultText, session_id: sessionId })}\n\n`));
+          await session.finish(resultText);
           loopDone = true;
         } else {
           // Model called tools!
@@ -1944,8 +2333,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
             // If the user was asked a question, stop the loop and wait for their response.
             if (tc.function.name === "ask_user_question") {
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "message_stop", session_id: sessionId })}\n\n`));
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "Waiting for user response to question.", session_id: sessionId })}\n\n`));
+              await session.finish("Waiting for user response to question.");
               loopDone = true;
               break;
             }
@@ -1965,19 +2353,49 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       console.log(`[Jarvis] Stream complete session=${sessionId} turns=${turnCount} verified_web_search=${verifiedWebSearchDone}`);
 
     } catch (error: any) {
+      if (error?.name === "StreamCancelledError") {
+        return;
+      }
       const errMsg = error?.message || String(error);
       console.error(`[Jarvis] Stream error session=${sessionId}:`, errMsg);
+      const _cfg3 = resolveConfig(options.config);
+      recordInference({
+        ts: Date.now(),
+        backend: _cfg3.active_backend as Backend,
+        model: _cfg3.active_backend === "openrouter"
+          ? (_cfg3.openrouter.model ?? "openrouter/free")
+          : _cfg3.active_backend === "claude_cli"
+          ? (_cfg3.claude_cli.model ?? "claude_cli")
+          : _cfg3.ollama.model,
+        ok: false,
+        latency_ms: Date.now() - _turnStart,
+        tokens_in: sessionCostInfo?.prompt_tokens ?? 0,
+        tokens_out: sessionCostInfo?.completion_tokens ?? 0,
+        error: errMsg.slice(0, 200),
+        fallback_used: lastFallbackRetries > 0,
+        retry_count: lastFallbackRetries,
+        fallback_model: lastFallbackModel,
+      });
       try {
         await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "error", error: errMsg, session_id: sessionId })}\n\n`));
       } catch {}
     } finally {
       activeStreamControllers.delete(sessionId);
+      try {
+        await session.ensureTerminal();
+      } catch {}
       try { await writer.close(); } catch {}
     }
   })();
 
   return new Response(readable, {
-    headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" },
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    },
   });
 }
 
@@ -2166,9 +2584,29 @@ async function baseFetch(req: Request): Promise<Response> {
       const hcfg = loadConfig();
       return Response.json({ ok: true, uptime: process.uptime(), version: JARVIS_VERSION, backend: hcfg.active_backend, model: hcfg.active_backend === "openrouter" ? hcfg.openrouter.model : hcfg.ollama.model });
     }
+    if (path === "/health/inference") {
+      return Response.json(inferenceMetricsSnapshot());
+    }
+    if (path === "/agents/pool" && req.method === "GET") {
+      const poolCfg = loadConfig();
+      const pool = new AgentPool(poolCfg.orchestrator?.agents ?? []);
+      return Response.json({ pool: pool.list(), coverage: pool.coverage(), max_recursion_depth: poolCfg.orchestrator?.max_recursion_depth ?? 2 });
+    }
+    if (path === "/tool/decision" && req.method === "POST") {
+      const { call_id, approved } = await req.json() as { call_id: string; approved: boolean };
+      const resolved = approvalRegistry.resolve(call_id, Boolean(approved));
+      return Response.json({ ok: resolved, call_id });
+    }
     if (path === "/config" && req.method === "GET") return Response.json(loadConfig());
     if (path === "/config" && req.method === "POST") {
-      return Response.json({ ok: true });
+      const body = await req.json().catch(() => ({}));
+      const saved = saveConfig(body);
+      return Response.json({ ok: true, config: saved });
+    }
+    if (path === "/cron/run" && req.method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      const result = await runCronInference(body as Record<string, unknown>);
+      return Response.json(result);
     }
     if (path === "/chat/stream" && req.method === "POST") {
       const body = await req.json();
@@ -2343,6 +2781,14 @@ async function baseFetch(req: Request): Promise<Response> {
 // ═══════════════════════════════════════════════════════════════
 serve({
   port: PORT,
+  // Disable Bun's idle-connection timeout (default 10s). Chat is a long-lived
+  // SSE stream: during a single model call the server sends no frames, and a
+  // slow local/free model can idle well past 10s — Bun would close the socket
+  // mid-turn and the user would see a silent stall. Bun's max finite idleTimeout
+  // is 255s, which is still under MODEL_REQUEST_TIMEOUT_MS (300s), so the only
+  // safe choice is to disable it here and rely on the per-request abort timeout
+  // (300s) and the Rust relay's own 900s ceiling to bound a genuinely hung turn.
+  idleTimeout: 0,
   fetch: baseFetch,
 });
 

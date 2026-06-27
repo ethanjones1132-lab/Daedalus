@@ -192,14 +192,32 @@ pub fn load_jarvis_config(db: &AppDb) -> Result<JarvisConfig, String> {
         config.agents_root = v.clone();
     }
 
+    // Preserve the file loader's behavior: jarvis_path defaults to the agent
+    // workspace path when not explicitly stored. Boot now hydrates from SQLite,
+    // so this fallback lives here instead of in the (retired) file loader.
+    if config.jarvis_path.is_empty() {
+        config.jarvis_path = format!(
+            "{}/.openclaw/agents/coderclaw/workspace/Jarvis",
+            crate::wsl::wsl_home()
+        );
+    }
+
     normalize_jarvis_config(&mut config);
     Ok(config)
 }
 
-/// Save the full JarvisConfig into the settings table.
-/// Each top-level field is serialized as a JSON blob (or plain string for simple fields).
-#[tauri::command]
-pub fn save_jarvis_config(db: State<AppDb>, mut config: JarvisConfig) -> Result<(), String> {
+/// Persist the full JarvisConfig. **SQLite `settings` is the single source of
+/// truth**; the file store (`~/.openclaw/jarvis/config.json`) is a one-way
+/// projection that the Bun server reads. Writing SQLite first and then
+/// deep-merging into the file means a UI save can never drift from what the
+/// chat path (which reads SQLite via `load_jarvis_config`) sees, while
+/// Bun-only nested keys in the file (e.g. `compaction.ollama_url`) survive.
+///
+/// This is the one canonical write path; every command that mutates config
+/// (`save_jarvis_config`, `jarvis_save_config`, `jarvis_switch_backend`) routes
+/// through it.
+pub fn persist_jarvis_config(db: &AppDb, config: &JarvisConfig) -> Result<(), String> {
+    let mut config = config.clone();
     normalize_jarvis_config(&mut config);
 
     let pairs: Vec<(&str, String)> = vec![
@@ -264,16 +282,109 @@ pub fn save_jarvis_config(db: State<AppDb>, mut config: JarvisConfig) -> Result<
         }
     }
 
-    // Write the same nested config shape that the Bun inference adapter reads.
-    // Older flat configs are still accepted by server-jarvis/src/config.ts.
-    let bun_config = serde_json::to_value(&config).map_err(|e| e.to_string())?;
-    let home = crate::get_home_dir();
-    let config_dir = format!("{}/.openclaw/jarvis", home);
-    let config_file = format!("{}/config.json", config_dir);
-    let _ = std::fs::create_dir_all(&config_dir);
-    let bun_json = serde_json::to_string_pretty(&bun_config).map_err(|e| e.to_string())?;
-    std::fs::write(&config_file, bun_json)
-        .map_err(|e| format!("Failed to write Bun config: {}", e))?;
+    // Project the canonical config onto the Bun-readable file. `save_jarvis_config`
+    // in jarvis/mod.rs deep-merges onto the existing file, so nested keys the Bun
+    // server owns survive a UI save (replacing the previous wholesale overwrite,
+    // which could clobber `compaction.*`, `surface_temperatures`, etc.).
+    crate::jarvis::save_jarvis_config(&config)?;
 
     Ok(())
+}
+
+/// Save the full JarvisConfig (SQLite-canonical). Thin command wrapper over
+/// [`persist_jarvis_config`].
+#[tauri::command]
+pub fn save_jarvis_config(db: State<AppDb>, config: JarvisConfig) -> Result<(), String> {
+    persist_jarvis_config(&db, &config)
+}
+
+/// One-time migration for the file→SQLite cutover. If SQLite has never been
+/// seeded (no `active_backend` row) but a legacy file store exists, import it so
+/// the user's persisted backend/key/etc. survive. Idempotent — once SQLite holds
+/// the row this is a no-op. Returns whether a migration actually ran.
+pub fn migrate_file_config_into_sqlite_if_needed(db: &AppDb) -> Result<bool, String> {
+    {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let seeded: bool = conn
+            .query_row(
+                "SELECT 1 FROM settings WHERE key = 'active_backend' LIMIT 1",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if seeded {
+            return Ok(false);
+        }
+    }
+    // SQLite not seeded yet — pull from the legacy file store if present.
+    if !crate::jarvis::get_config_path().exists() {
+        return Ok(false);
+    }
+    let file_cfg = crate::jarvis::load_jarvis_config();
+    persist_jarvis_config(db, &file_cfg)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{run_migrations, AppDb};
+    use crate::jarvis::types::JarvisBackend;
+    use rusqlite::Connection;
+    use std::sync::Mutex;
+
+    /// In-memory AppDb with migrations applied — no filesystem side effects, so
+    /// no write to the real `~/.openclaw`.
+    fn mem_db() -> AppDb {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        run_migrations(&conn).expect("run migrations");
+        AppDb {
+            conn: Mutex::new(conn),
+            db_path: std::path::PathBuf::from(":memory:"),
+        }
+    }
+
+    fn put(db: &AppDb, key: &str, value: &str) {
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn load_reads_canonical_fields_from_sqlite() {
+        let db = mem_db();
+        put(&db, "active_backend", "openrouter");
+        put(&db, "system_prompt", "be terse");
+        put(&db, "temperature", "0.42");
+
+        let cfg = load_jarvis_config(&db).expect("load");
+        assert!(matches!(cfg.active_backend, JarvisBackend::OpenRouter));
+        assert_eq!(cfg.system_prompt, "be terse");
+        assert!((cfg.temperature - 0.42).abs() < 1e-9);
+    }
+
+    #[test]
+    fn load_fills_jarvis_path_when_unset() {
+        let db = mem_db();
+        let cfg = load_jarvis_config(&db).expect("load");
+        assert!(
+            !cfg.jarvis_path.is_empty(),
+            "jarvis_path should fall back to a non-empty default"
+        );
+    }
+
+    #[test]
+    fn migrate_is_noop_once_sqlite_is_seeded() {
+        let db = mem_db();
+        put(&db, "active_backend", "ollama");
+        // Seeded → migration must not run (and must not touch the file store).
+        assert_eq!(
+            migrate_file_config_into_sqlite_if_needed(&db).expect("migrate"),
+            false
+        );
+    }
 }

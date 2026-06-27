@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import claude_cli_proxy as p
 
 print("== resolve_upstream routing ==")
-for m in ["nvidia/nemotron-ultra:free", "qwen/qwen3-coder:free", "qwen3:8b", "claude-sonnet-4-6"]:
+for m in ["nvidia/llama-3.1-nemotron-ultra-253b-v1:free", "qwen/qwen3-coder:free", "qwen3:8b", "claude-sonnet-4-6"]:
     u = p.resolve_upstream(m)
     print(f"{m:30} -> {u['provider']:10} model={u['model']:30} {u['completions_url']}")
 

@@ -4,10 +4,11 @@
 // Single source of truth for all Jarvis settings.
 // Loaded by both the Bun HTTP server and the Rust backend.
 
-import { readFileSync, existsSync, statSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync } from "fs";
 import { join, resolve } from "path";
 import { homedir } from "os";
 import { execSync } from "child_process";
+import { DEFAULT_ORCHESTRATOR_AGENTS, type OrchestratorAgent } from "./orchestration/agent-pool";
 
 // ── Types ──
 
@@ -78,6 +79,19 @@ export interface OpenRouterConfig {
   timeout_ms: number;
 }
 
+/**
+ * OpenAI-compatible secondary provider (OpenCode Zen / OpenCode Go).
+ * These route through their own base_url + api_key — NOT OpenRouter's — but
+ * speak the same `/chat/completions` SSE protocol, so the existing stream
+ * parser and request builder work unchanged. The orchestrator agent pool
+ * references them by `provider: "opencode_zen" | "opencode_go"`; the fallback
+ * cascade resolves the right endpoint per attempt via `resolveProviderTarget`.
+ */
+export interface OpenCodeProviderConfig {
+  base_url: string;
+  api_key: string;
+}
+
 export interface ClaudeCliConfig {
   enabled: boolean;
   /** Path to the `claude` binary */
@@ -122,6 +136,8 @@ export interface CompanionConfig {
 
 export interface OrchestratorConfig {
   enabled: boolean;
+  agents: OrchestratorAgent[];
+  max_recursion_depth: number;
 }
 
 export interface JarvisConfig {
@@ -129,6 +145,10 @@ export interface JarvisConfig {
   active_backend: BackendType;
   ollama: OllamaConfig;
   openrouter: OpenRouterConfig;
+  /** OpenCode Zen — OpenAI-compatible secondary provider for pool agents. */
+  opencode_zen: OpenCodeProviderConfig;
+  /** OpenCode Go — OpenAI-compatible secondary provider for pool agents. */
+  opencode_go: OpenCodeProviderConfig;
   claude_cli: ClaudeCliConfig;
   tools: ToolConfig;
   reasoning: ReasoningConfig;
@@ -212,19 +232,31 @@ export function defaultConfig(): JarvisConfig {
     openrouter: {
       base_url: "https://openrouter.ai/api/v1",
       api_key: "",
-      model: "openrouter/free",
+      model: "qwen/qwen3-coder:free",
       site_url: "http://localhost:19877",
       site_name: "Jarvis Home-Base",
       fallbacks: [
         "openrouter/free",
         "openrouter/owl-alpha",
-        "nvidia/nemotron-3-ultra-550b-a55b:free",
         "qwen/qwen3-coder:free",
+        "cohere/north-mini-code:free",
+        "nvidia/llama-3.1-nemotron-ultra-253b-v1:free",
       ],
       enable_fallbacks: true,
       enable_paid_fallbacks: false,
       max_retries: 3,
       timeout_ms: 60000,
+    },
+    // Secondary OpenAI-compatible providers. Keys are intentionally blank in
+    // source (no secrets committed) — they are written to the live config.json
+    // store. base_url defaults match the OpenCode Zen/Go endpoints.
+    opencode_zen: {
+      base_url: "https://opencode.ai/zen/v1",
+      api_key: "",
+    },
+    opencode_go: {
+      base_url: "https://opencode.ai/zen/go/v1",
+      api_key: "",
     },
     claude_cli: {
       enabled: true,
@@ -267,6 +299,8 @@ export function defaultConfig(): JarvisConfig {
     },
     orchestrator: {
       enabled: true,
+      agents: DEFAULT_ORCHESTRATOR_AGENTS,
+      max_recursion_depth: 2,
     },
     system_prompt: `You are Jarvis, a local AI coding assistant running on Qwen 3.5 9B in WSL2.
 Workspace: \`/home/ethan/.openclaw/agents/coderclaw/workspace/home-base\`.
@@ -393,22 +427,45 @@ export function invalidateConfigCache(): void {
   configCacheTime = 0;
 }
 
+/** Merge partial updates into the on-disk config (canonical Bun write path). */
+export function saveConfig(partial: Partial<JarvisConfig>): JarvisConfig {
+  const current = loadConfig();
+  const merged = normalizeConfig(deepMerge(current, partial));
+  mkdirSync(CONFIG_DIR, { recursive: true });
+  writeFileSync(CONFIG_FILE, JSON.stringify(merged, null, 2), "utf-8");
+  configCache = merged;
+  configCacheTime = Date.now();
+  return merged;
+}
+
 // ── Helpers ──
 
 export function deepMerge(target: any, source: any): any {
   const result = { ...target };
   for (const key of Object.keys(source)) {
+    const sourceVal = source[key];
     if (
-      source[key] &&
-      typeof source[key] === "object" &&
-      !Array.isArray(source[key]) &&
+      sourceVal &&
+      typeof sourceVal === "object" &&
+      !Array.isArray(sourceVal) &&
       target[key] &&
       typeof target[key] === "object" &&
       !Array.isArray(target[key])
     ) {
-      result[key] = deepMerge(target[key], source[key]);
+      result[key] = deepMerge(target[key], sourceVal);
     } else {
-      result[key] = source[key];
+      // A blank value in the saved config must never wipe out a meaningful
+      // default. A persisted partial config such as
+      //   {"openrouter":{"base_url":"","model":""}}
+      // would otherwise leave the OpenRouter URL/model empty — streamJarvis
+      // then builds `fetch("/chat/completions")` ("URL is invalid") and every
+      // chat turn fails, which is exactly how chat looked "completely dead".
+      // null/undefined are always non-overriding; an empty string only yields
+      // to a *non-empty string* default (so clearing a field whose default is
+      // already "" — e.g. api_key — still works).
+      if (sourceVal === undefined || sourceVal === null) continue;
+      if (sourceVal === "" && typeof target[key] === "string" && target[key] !== "") continue;
+      result[key] = sourceVal;
     }
   }
   return result;

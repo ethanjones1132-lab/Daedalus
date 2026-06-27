@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useState } from 'react';
 import {
   cn,
+  ConfirmModal,
   GlassCard,
   Pill,
   SectionHeader,
@@ -36,6 +37,7 @@ export default function DevicesView() {
   const [error, setError] = useState<string | null>(null);
   const [name, setName] = useState('');
   const [type, setType] = useState(DEVICE_TYPES[0]);
+  const [pendingDelete, setPendingDelete] = useState<Device | null>(null);
   const { success, error: toastError } = useToast();
 
   const fetchDevices = useCallback(async () => {
@@ -66,25 +68,34 @@ export default function DevicesView() {
     }
   }, [name, type, fetchDevices, success, toastError]);
 
-  const remove = useCallback(
-    async (d: Device) => {
-      if (!window.confirm(`Remove device "${d.name}"?`)) return;
-      try {
-        await invoke<boolean>('remove_device', { id: d.id });
-        success(`Removed ${d.name}`);
-        await fetchDevices();
-      } catch (e) {
-        toastError(String(e), 'Remove failed');
-      }
-    },
-    [fetchDevices, success, toastError],
-  );
+  const remove = useCallback((d: Device) => { setPendingDelete(d); }, []);
+
+  const confirmDelete = useCallback(async () => {
+    if (!pendingDelete) return;
+    const d = pendingDelete;
+    setPendingDelete(null);
+    try {
+      await invoke<boolean>('remove_device', { id: d.id });
+      success(`Removed ${d.name}`);
+      await fetchDevices();
+    } catch (e) {
+      toastError(String(e), 'Remove failed');
+    }
+  }, [pendingDelete, fetchDevices, success, toastError]);
 
   const inputCls =
     'px-3 py-2 text-sm rounded-lg bg-white/5 border border-white/10 text-bone placeholder:text-bone/30 focus:outline-none focus:border-accent/50';
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-hidden">
+      <ConfirmModal
+        open={pendingDelete !== null}
+        message={`Remove device "${pendingDelete?.name}"?`}
+        confirmLabel="Remove"
+        danger
+        onConfirm={confirmDelete}
+        onCancel={() => setPendingDelete(null)}
+      />
       <SectionHeader title="Devices" subtitle="Paired devices and their status" count={devices.length} />
 
       <div className="flex gap-2">

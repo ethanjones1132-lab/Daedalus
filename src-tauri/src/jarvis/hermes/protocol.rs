@@ -151,3 +151,73 @@ pub enum BridgeError {
     #[error("bridge is shutting down")]
     ShuttingDown,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn rid_displays_as_its_inner_string() {
+        assert_eq!(Rid("j7".to_string()).to_string(), "j7");
+    }
+
+    #[test]
+    fn outgoing_request_injects_jsonrpc_version() {
+        let msg = OutgoingMessage::request(Rid("j1".to_string()), "skill.invoke", json!({"a": 1}));
+        let v = serde_json::to_value(&msg).expect("serialize");
+        assert_eq!(v.get("jsonrpc").and_then(|x| x.as_str()), Some("2.0"));
+        assert_eq!(v.get("id").and_then(|x| x.as_str()), Some("j1"));
+        assert_eq!(v.get("method").and_then(|x| x.as_str()), Some("skill.invoke"));
+        assert_eq!(v.pointer("/params/a").and_then(|x| x.as_i64()), Some(1));
+    }
+
+    #[test]
+    fn incoming_response_with_result_parses() {
+        let line = r#"{"jsonrpc":"2.0","id":"j1","result":{"ok":true}}"#;
+        match serde_json::from_str::<IncomingMessage>(line).expect("parse") {
+            IncomingMessage::Response { id, result, error } => {
+                assert_eq!(id, Rid("j1".to_string()));
+                assert!(error.is_none());
+                assert_eq!(result.unwrap().pointer("/ok").and_then(|v| v.as_bool()), Some(true));
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incoming_response_with_error_parses() {
+        let line = r#"{"jsonrpc":"2.0","id":"j2","error":{"code":-32601,"message":"no method"}}"#;
+        match serde_json::from_str::<IncomingMessage>(line).expect("parse") {
+            IncomingMessage::Response { id, error, .. } => {
+                assert_eq!(id, Rid("j2".to_string()));
+                let e = error.expect("error present");
+                assert_eq!(e.code, -32601);
+                assert_eq!(e.message, "no method");
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incoming_event_extracts_type_and_strips_envelope_keys() {
+        let line = r#"{"jsonrpc":"2.0","method":"event","params":{"type":"gateway.ready","session_id":"s1","extra":42}}"#;
+        match serde_json::from_str::<IncomingMessage>(line).expect("parse") {
+            IncomingMessage::Event { event_type, session_id, payload } => {
+                assert_eq!(event_type, "gateway.ready");
+                assert_eq!(session_id.as_deref(), Some("s1"));
+                // type/session_id stripped; domain payload preserved.
+                assert!(payload.get("type").is_none());
+                assert!(payload.get("session_id").is_none());
+                assert_eq!(payload.get("extra").and_then(|v| v.as_i64()), Some(42));
+            }
+            other => panic!("expected Event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incoming_rejects_neither_response_nor_event() {
+        let line = r#"{"jsonrpc":"2.0","method":"notify","params":{}}"#;
+        assert!(serde_json::from_str::<IncomingMessage>(line).is_err());
+    }
+}

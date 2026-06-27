@@ -18,6 +18,7 @@ import {
   type ProjectionSnapshot,
   type ActivationBoundary,
 } from "./activation-boundary";
+import { registerStandardBundles } from "./bundles-registry";
 
 export interface CronRunRequest {
   slug: string;
@@ -42,6 +43,7 @@ export function createCronRuntime(
     ? { slug: snapshot.slug || "cron", snapshot }
     : restoreBoundary("cron");
   const runtime: ToolRuntime = createToolRuntime();
+  registerStandardBundles(runtime);
   const ctx = makeExecutionContext("cron", cfg, {
     interactive: false,
     workspace_path: cfg.jarvis_path,
@@ -52,6 +54,7 @@ export function createCronRuntime(
 export async function runCronRequest(req: CronRunRequest, cfg: JarvisConfig): Promise<CronRunResult> {
   const boundary = restoreBoundary(req.slug);
   const runtime: ToolRuntime = createToolRuntime();
+  registerStandardBundles(runtime);
   const ctx = makeExecutionContext("cron", cfg, {
     interactive: false,
     workspace_path: cfg.jarvis_path,

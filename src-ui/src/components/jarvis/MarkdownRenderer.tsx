@@ -78,39 +78,94 @@ export default function MarkdownRenderer({ content, className }: MarkdownRendere
 function renderInlineMarkdown(text: string): React.ReactNode[] {
   const lines = text.split('\n');
   const result: React.ReactNode[] = [];
-  let inList = false;
-  let listItems: React.ReactNode[] = [];
+  let inUnorderedList = false;
+  let inOrderedList = false;
+  let unorderedItems: React.ReactNode[] = [];
+  let orderedItems: React.ReactNode[] = [];
 
-  const flushList = () => {
-    if (inList && listItems.length > 0) {
+  const flushUnordered = () => {
+    if (inUnorderedList && unorderedItems.length > 0) {
       result.push(
-        <ul key={`list-${result.length}`} className="list-disc list-inside space-y-1 my-2">
-          {listItems}
+        <ul key={`ul-${result.length}`} className="list-disc list-inside space-y-1 my-2">
+          {unorderedItems}
         </ul>
       );
-      listItems = [];
-      inList = false;
+      unorderedItems = [];
+      inUnorderedList = false;
     }
+  };
+
+  const flushOrdered = () => {
+    if (inOrderedList && orderedItems.length > 0) {
+      result.push(
+        <ol key={`ol-${result.length}`} className="list-decimal list-inside space-y-1 my-2">
+          {orderedItems}
+        </ol>
+      );
+      orderedItems = [];
+      inOrderedList = false;
+    }
+  };
+
+  const flushLists = () => {
+    flushUnordered();
+    flushOrdered();
   };
 
   lines.forEach((line, lineIdx) => {
     const trimmed = line.trim();
 
-    // Handle list items
+    // Handle blockquotes (collect consecutive `> ` lines into one block)
+    if (trimmed.startsWith('> ')) {
+      flushLists();
+      const quoteText = trimmed.slice(2);
+      result.push(
+        <blockquote
+          key={lineIdx}
+          className="border-l-2 border-royal/40 pl-3 my-2 text-bone/70 italic"
+        >
+          {processInlineStyles(quoteText)}
+        </blockquote>
+      );
+      return;
+    }
+
+    // Unordered list items (- or *)
     if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
-      inList = true;
-      const content = trimmed.slice(2);
-      listItems.push(
+      flushOrdered();
+      inUnorderedList = true;
+      unorderedItems.push(
         <li key={lineIdx} className="text-bone/80">
-          {processInlineStyles(content)}
+          {processInlineStyles(trimmed.slice(2))}
         </li>
       );
       return;
-    } else {
-      flushList();
     }
 
+    // Ordered list items (1. 2. etc.)
+    const orderedMatch = trimmed.match(/^(\d+)\.\s+(.*)/);
+    if (orderedMatch) {
+      flushUnordered();
+      inOrderedList = true;
+      orderedItems.push(
+        <li key={lineIdx} className="text-bone/80">
+          {processInlineStyles(orderedMatch[2])}
+        </li>
+      );
+      return;
+    }
+
+    flushLists();
+
     // Handle headers
+    if (trimmed.startsWith('#### ')) {
+      result.push(
+        <h4 key={lineIdx} className="text-xs font-semibold text-bone mt-2 mb-1">
+          {processInlineStyles(trimmed.slice(5))}
+        </h4>
+      );
+      return;
+    }
     if (trimmed.startsWith('### ')) {
       result.push(
         <h3 key={lineIdx} className="text-sm font-semibold text-bone mt-3 mb-1">
@@ -157,7 +212,7 @@ function renderInlineMarkdown(text: string): React.ReactNode[] {
     }
   });
 
-  flushList();
+  flushLists();
   return result;
 }
 

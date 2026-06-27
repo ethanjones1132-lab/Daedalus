@@ -78,6 +78,11 @@ jobs:
       - name: Test
         run: bun test
 
+      # Orchestration regression gate: drives the real PredictiveRouter + mode→tool
+      # gating against fixtures; fails on any case failure OR drift from baseline.json.
+      - name: Eval regression gate
+        run: bun run src/eval/harness.ts
+
   rust:
     name: Rust (cargo check)
     runs-on: ubuntu-latest
