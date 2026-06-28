@@ -242,8 +242,16 @@ export class AgentPool {
     if (agent) this.agents.set(id, { ...agent, enabled: false });
   }
 
-  pickFor(stage: string, taskType: TaskType | string): OrchestratorAgent | undefined {
-    const candidates = this.enabled();
+  pickFor(stage: string, taskType: TaskType | string, exclude?: ReadonlySet<string>): OrchestratorAgent | undefined {
+    // Filter out excluded `provider:model_id` pairs FIRST so we never re-select
+    // a model that just returned an empty completion (or hit a rate limit). The
+    // exclude set is keyed by `${provider}:${model_id}` to match the format used
+    // by `chatCompletionWithFallback` in `index.ts` so the two layers stay
+    // consistent.
+    const filterExclude = (agent: OrchestratorAgent) =>
+      !exclude || !exclude.has(`${agent.provider}:${agent.model_id}`);
+    const candidates = this.enabled().filter(filterExclude);
+    if (candidates.length === 0) return undefined;
     const stageDefault = candidates.find((agent) => agent.default_for.includes(stage));
     if (stageDefault) return stageDefault;
     return candidates.sort((a, b) => this.score(b, stage, taskType) - this.score(a, stage, taskType))[0];
@@ -257,8 +265,11 @@ export class AgentPool {
     ];
   }
 
-  cascadeChain(stage: string, taskType: TaskType | string): OrchestratorAgent[] {
-    const candidates = this.enabled();
+  cascadeChain(stage: string, taskType: TaskType | string, exclude?: ReadonlySet<string>): OrchestratorAgent[] {
+    const filterExclude = (agent: OrchestratorAgent) =>
+      !exclude || !exclude.has(`${agent.provider}:${agent.model_id}`);
+    const candidates = this.enabled().filter(filterExclude);
+    if (candidates.length === 0) return [];
     const cheapFirst = candidates
       .filter((agent) => agent.capabilities.code >= 0.55 || agent.capabilities.reasoning >= 0.55)
       .sort((a, b) => this.cascadeCheapScore(b, stage, taskType) - this.cascadeCheapScore(a, stage, taskType))[0];

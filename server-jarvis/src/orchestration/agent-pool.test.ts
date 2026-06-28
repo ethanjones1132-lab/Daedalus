@@ -57,6 +57,62 @@ describe("AgentPool", () => {
     expect(pool.pickFor("rewriter", "research")?.id).toBe("verifier");
   });
 
+  test("pickFor honors an exclude set keyed by provider:model_id", () => {
+    const pool = new AgentPool(agents);
+    // The default-for-executor is code-worker. Excluding it must produce a
+    // different agent (the next-best by score).
+    const exclude = new Set<string>(["openrouter:qwen/qwen3-coder:free"]);
+    const picked = pool.pickFor("executor", "refactor", exclude);
+    expect(picked?.id).not.toBe("code-worker");
+    expect(picked).toBeDefined();
+    expect(exclude.has(`${picked!.provider}:${picked!.model_id}`)).toBe(false);
+  });
+
+  test("pickFor returns undefined when exclude set covers every enabled agent", () => {
+    const pool = new AgentPool(agents);
+    const exclude = new Set<string>([
+      "openrouter:openrouter/free",
+      "openrouter:qwen/qwen3-coder:free",
+      "openrouter:nvidia/llama-3.1-nemotron-ultra-253b-v1:free",
+    ]);
+    expect(pool.pickFor("executor", "refactor", exclude)).toBeUndefined();
+    expect(pool.pickFor("coordinator", "general", exclude)).toBeUndefined();
+  });
+
+  test("cascadeChain honors an exclude set and skips the excluded agent", () => {
+    const pool = new AgentPool([
+      {
+        id: "cheap-fast",
+        provider: "openrouter",
+        model_id: "cheap-fast:free",
+        capabilities: { code: 0.6, reasoning: 0.6, speed: 0.95, cost: 0.95, json_reliability: 0.7 },
+        default_for: [],
+        enabled: true,
+      },
+      {
+        id: "strong-worker",
+        provider: "openrouter",
+        model_id: "strong:free",
+        capabilities: { code: 0.95, reasoning: 0.85, speed: 0.4, cost: 0.5, json_reliability: 0.85 },
+        default_for: [],
+        enabled: true,
+      },
+    ]);
+
+    // Sanity: cheap-fast wins the cheap tier (high speed + cost); strong-worker
+    // is the strong tier (high code/reasoning). The cheap-score floor requires
+    // code OR reasoning ≥ 0.55.
+    const baseline = pool.cascadeChain("executor", "debug");
+    expect(baseline.map((agent) => agent.id)).toEqual(["cheap-fast", "strong-worker"]);
+
+    // Excluding cheap-fast should drop it from the chain — the strong tier
+    // (strong-worker) is the only one left that meets the cheap floor.
+    const exclude = new Set<string>(["openrouter:cheap-fast:free"]);
+    const chain = pool.cascadeChain("executor", "debug", exclude);
+    expect(chain.map((agent) => agent.id)).not.toContain("cheap-fast");
+    expect(chain.map((agent) => agent.id)).toContain("strong-worker");
+  });
+
   test("fallbackChain starts with the selected agent and excludes disabled agents", () => {
     const pool = new AgentPool(agents);
     const chain = pool.fallbackChain(pool.pickFor("executor", "refactor")!);

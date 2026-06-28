@@ -1198,11 +1198,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             try {
               const pool = new AgentPool(cfg.orchestrator?.agents ?? []);
               let agent: import("./orchestration/agent-pool").OrchestratorAgent | undefined;
+              // Honor the empty-completion cascade-advance exclude set: a model
+              // that just returned an empty 200 (or hit a 2-strike rate limit)
+              // should never be re-selected by the pool — it would just repeat
+              // the failure. The exclude set is built by the `callModel`
+              // wrapper above when a user-visible stage returns no content.
               if (cascadeTier) {
-                const chain = pool.cascadeChain(stageLabel, orchestratorTaskType);
+                const chain = pool.cascadeChain(stageLabel, orchestratorTaskType, excludeModels);
                 agent = cascadeTier === "cheap" ? chain[0] : chain[chain.length - 1];
               } else {
-                agent = pool.pickFor(stageLabel, orchestratorTaskType);
+                agent = pool.pickFor(stageLabel, orchestratorTaskType, excludeModels);
               }
               if (agent && (agent.provider === "openrouter" || agent.provider === "opencode_zen" || agent.provider === "opencode_go")) {
                 poolModel = agent.model_id;
@@ -1598,13 +1603,33 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const exclude = new Set<string>();
           let last: any = await callModelAttempt(messages, callOptions);
           if (!canAdvance) return last;
-          for (let advance = 0; advance < 1; advance++) {
+          // Bounded empty-completion cascade-advance. If a user-visible stage
+          // returns a semantically-empty 200 (no content + no tool calls) and
+          // we have a fallback cascade, advance PAST that model and try the
+          // next one. A model that just returned empty will almost always
+          // return empty again, so retrying the same model is pointless — we
+          // exclude it via the `exclude` set (now honored by both the pool
+          // selection and `chatCompletionWithFallback`).
+          //
+          // Bound to 2 extra attempts. Stop early if:
+          //   - the new attempt produced content/tool_calls (success)
+          //   - the stream was aborted (user gave up)
+          //   - the pool returned the same model we just excluded (no other
+          //     candidate available) — this prevents a silent infinite loop
+          //     that the previous build hit on the live smoke test.
+          for (let advance = 0; advance < 2; advance++) {
             const hasContent = typeof last?.content === "string" && last.content.trim().length > 0;
             const hasToolCalls = Array.isArray(last?.tool_calls) && last.tool_calls.length > 0;
             if (hasContent || hasToolCalls || streamAbort.signal.aborted) break;
             if (last?._provider && last?._modelUsed) {
-              exclude.add(`${last._provider}:${last._modelUsed}`);
+              const key = `${last._provider}:${last._modelUsed}`;
+              if (exclude.has(key)) {
+                console.warn(`[Jarvis Orchestrator] empty-completion cascade-advance has no different model left in pool (only ${key} available) — stopping`);
+                break;
+              }
+              exclude.add(key);
             }
+            if (exclude.size === 0) break; // no exclusion built → nothing to advance past
             console.warn(`[Jarvis Orchestrator] empty completion from ${last?._provider}:${last?._modelUsed} stage=${callOptions?.stageLabel ?? "?"} — advancing cascade (excluding it)`);
             last = await callModelAttempt(messages, callOptions, exclude);
           }
