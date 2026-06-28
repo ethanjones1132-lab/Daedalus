@@ -302,7 +302,26 @@ describe("ToolRuntime permission policy", () => {
 
   // ── ask path: requires_approval → interactive allowed ─────────────────────
 
-  test("approval-required tool in interactive chat context is allowed through", async () => {
+  test("approval-required tool in interactive chat WITHOUT an approval hook is DENIED (not silently run)", async () => {
+    // Regression: the old behavior let an approval-gated tool fall through and
+    // execute when the surface provided no requestApproval hook. That silently
+    // ran writes/shell unapproved. It must now deny with approval_unavailable.
+    const runtime = createToolRuntime();
+    let handlerRan = false;
+    runtime.register(
+      makeDefWithFlags("gated_chat", { requires_approval: true }),
+      async () => { handlerRan = true; return "should not run"; },
+    );
+    const result = await runtime.execute(
+      { id: "c3", name: "gated_chat", arguments: {} },
+      makeExecutionContext("chat", defaultConfig()),
+    );
+    expect(result.is_error).toBe(true);
+    expect(result.error_code).toBe("approval_unavailable");
+    expect(handlerRan).toBe(false);
+  });
+
+  test("approval-required tool runs when the approval hook approves", async () => {
     const runtime = createToolRuntime();
     runtime.register(
       makeDefWithFlags("gated_chat", { requires_approval: true }),
@@ -310,10 +329,26 @@ describe("ToolRuntime permission policy", () => {
     );
     const result = await runtime.execute(
       { id: "c3", name: "gated_chat", arguments: {} },
-      makeExecutionContext("chat", defaultConfig()),
+      makeExecutionContext("chat", defaultConfig(), { requestApproval: async () => true }),
     );
     expect(result.is_error).toBe(false);
     expect(result.output).toBe("approved result");
+  });
+
+  test("approval-required tool is rejected when the approval hook declines", async () => {
+    const runtime = createToolRuntime();
+    let handlerRan = false;
+    runtime.register(
+      makeDefWithFlags("gated_chat", { requires_approval: true }),
+      async () => { handlerRan = true; return "should not run"; },
+    );
+    const result = await runtime.execute(
+      { id: "c3", name: "gated_chat", arguments: {} },
+      makeExecutionContext("chat", defaultConfig(), { requestApproval: async () => false }),
+    );
+    expect(result.is_error).toBe(true);
+    expect(result.error_code).toBe("approval_rejected");
+    expect(handlerRan).toBe(false);
   });
 
   // ── ask path: requires_approval → non-interactive denied ─────────────────

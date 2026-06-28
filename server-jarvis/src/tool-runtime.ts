@@ -265,9 +265,25 @@ export function createToolRuntime(): ToolRuntime {
         duration_ms: Date.now() - start,
       };
     }
-    // "ask" in interactive mode: prompt the caller if it provided an approval
-    // hook, otherwise fall through (legacy behavior for surfaces that can't ask).
-    if (policy.decision === "ask" && ctx.requestApproval) {
+    // "ask": an approval-required tool. If the caller wired an approval hook,
+    // prompt and honor the decision. If NOT, deny — never silently fall through
+    // to execution. The old fall-through let an approval-gated write/shell tool
+    // run unapproved on any interactive surface that forgot to wire the hook
+    // (defense-in-depth; the policy layer already denies these for
+    // non-interactive surfaces).
+    if (policy.decision === "ask") {
+      if (!ctx.requestApproval) {
+        const msg = `Tool "${call.name}" requires approval, but this surface cannot prompt for it — denying.`;
+        return {
+          call_id: call.id,
+          name: call.name,
+          output: msg,
+          is_error: true,
+          error: msg,
+          error_code: "approval_unavailable" satisfies ToolErrorCode,
+          duration_ms: Date.now() - start,
+        };
+      }
       const approved = await ctx.requestApproval({
         call_id: call.id,
         name: call.name,

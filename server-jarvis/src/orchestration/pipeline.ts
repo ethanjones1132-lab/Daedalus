@@ -3,8 +3,19 @@ import { BUILTIN_MODES, getToolsForMode } from "./modes";
 import type { ToolRuntime, ExecutionContext } from "../tool-runtime";
 import type { CallModelFn, ChatMessage } from "./router";
 import { outcomeCollector } from "../self-tuning/mod";
+import type { StageRun } from "../self-tuning/store";
 import { countTokens } from "../tokens";
 import { buildSynthesizerContext } from "./synth-context";
+import type { ExecutionProfile } from "./route-normalization";
+
+/**
+ * The slice of the outcome collector the pipeline depends on. Injecting this
+ * (rather than importing the global singleton) lets tests pass an in-memory
+ * collector so `bun test` can never pollute the production self-tuning DB.
+ */
+export interface StageRunRecorder {
+  recordStageRun(stage: StageRun): void;
+}
 
 export interface PipelineProgressState {
   stage: "planner" | "executor" | "reviewer" | "rewriter" | "synthesizer";
@@ -18,6 +29,12 @@ export interface PipelineExecuteOptions {
   topology?: PipelineTopology;
   maxRecursionDepth?: number;
   onRecursion?: (event: PipelineRecursionEvent) => void | Promise<void>;
+  /**
+   * Least-authority tool profile for the executor/rewriter stages. Set by the
+   * route-normalization layer from the turn's capability class. Defaults to
+   * `full` so legacy callers are unaffected.
+   */
+  executionProfile?: ExecutionProfile;
 }
 
 export interface PipelineRecursionEvent {
@@ -35,10 +52,23 @@ export interface PipelineRecursionEvent {
  * a successful (but nonsensical) response, which is exactly how an invalid
  * OpenRouter key used to present as a silent stall.
  */
+/**
+ * Outcome classification for a pipeline run.
+ *   success  — produced a non-empty, validated answer.
+ *   degraded — produced an answer but a stage failed / was repaired / empty-and-
+ *              recovered along the way (the user still gets a real answer).
+ *   failed   — no usable answer (hard error, or every model returned empty).
+ */
+export type PipelineOutcome = "success" | "degraded" | "failed";
+
 export interface PipelineResult {
   answer: string;
   error?: string;
   recursion_depth?: number;
+  /** Truthful run outcome. Absent is treated as "success" by legacy callers. */
+  outcome?: PipelineOutcome;
+  /** Machine-readable failure reason (e.g. "empty_completion", "auth_401"). */
+  error_code?: string;
 }
 
 /**
@@ -84,7 +114,10 @@ export class PipelineExecutor {
   constructor(
     private callModel: CallModelFn,
     private runtime: ToolRuntime,
-    private ctx: ExecutionContext
+    private ctx: ExecutionContext,
+    // Injected so tests can supply an in-memory collector. Defaults to the
+    // global production singleton for the live runtime.
+    private collector: StageRunRecorder = outcomeCollector
   ) {}
 
   async execute(
@@ -105,6 +138,11 @@ export class PipelineExecutor {
     let executorSummary = "No execution stage executed.";
     let reviewerFeedback = "No review stage executed.";
     let rewriterSummary = "No rewriting stage executed.";
+
+    // Least-authority tool profile for executor/rewriter. `full` keeps the legacy
+    // behavior; `read_only` caps a workspace-read turn to read-only tools so a
+    // misclassified read can never mutate the workspace.
+    const profile: ExecutionProfile = options.executionProfile ?? "full";
 
     // 1. Planner Stage
     if (pipeline.includes("planner")) {
@@ -128,7 +166,7 @@ export class PipelineExecutor {
         plan = resp.content;
         onStateChange({ stage: "planner", status: "done", output: plan });
 
-        outcomeCollector.recordStageRun({
+        this.collector.recordStageRun({
           id: `stage_${crypto.randomUUID()}`,
           agent_run_id: agentRunId,
           mode_id: "planner",
@@ -144,7 +182,7 @@ export class PipelineExecutor {
         onStateChange({ stage: "planner", status: "failed", output: errText(e) });
         plan = `Failed to generate plan: ${errText(e)}`;
 
-        outcomeCollector.recordStageRun({
+        this.collector.recordStageRun({
           id: `stage_${crypto.randomUUID()}`,
           agent_run_id: agentRunId,
           mode_id: "planner",
@@ -183,7 +221,7 @@ export class PipelineExecutor {
             response = await this.callModel(executorMessages, {
               temperature: BUILTIN_MODES.executor.temperature,
               max_tokens: BUILTIN_MODES.executor.max_tokens,
-              tools: getToolsForMode("executor", this.runtime.listTools()),
+              tools: getToolsForMode("executor", this.runtime.listTools(), profile),
               stream: true,
               stageLabel: "executor",
               suppressActivity: false,
@@ -217,7 +255,7 @@ export class PipelineExecutor {
               executorDone = true;
             }
 
-            outcomeCollector.recordStageRun({
+            this.collector.recordStageRun({
               id: `stage_${crypto.randomUUID()}`,
               agent_run_id: agentRunId,
               mode_id: "executor",
@@ -230,7 +268,7 @@ export class PipelineExecutor {
               had_error: 0,
             });
           } catch (err: any) {
-            outcomeCollector.recordStageRun({
+            this.collector.recordStageRun({
               id: `stage_${crypto.randomUUID()}`,
               agent_run_id: agentRunId,
               mode_id: "executor",
@@ -301,7 +339,7 @@ export class PipelineExecutor {
           reviewerFeedback = reviewerResp.content;
           onStateChange({ stage: "reviewer", status: "done", output: reviewerFeedback });
 
-          outcomeCollector.recordStageRun({
+          this.collector.recordStageRun({
             id: `stage_${crypto.randomUUID()}`,
             agent_run_id: agentRunId,
             mode_id: "reviewer",
@@ -338,7 +376,7 @@ export class PipelineExecutor {
                 rewriteResp = await this.callModel(rewriterMessages, {
                   temperature: BUILTIN_MODES.rewriter.temperature,
                   max_tokens: BUILTIN_MODES.rewriter.max_tokens,
-                  tools: getToolsForMode("rewriter", this.runtime.listTools()),
+                  tools: getToolsForMode("rewriter", this.runtime.listTools(), profile),
                   stream: true,
                   stageLabel: "rewriter",
                   suppressActivity: false,
@@ -372,7 +410,7 @@ export class PipelineExecutor {
                   rewriterDone = true;
                 }
 
-                outcomeCollector.recordStageRun({
+                this.collector.recordStageRun({
                   id: `stage_${crypto.randomUUID()}`,
                   agent_run_id: agentRunId,
                   mode_id: "rewriter",
@@ -385,7 +423,7 @@ export class PipelineExecutor {
                   had_error: 0,
                 });
               } catch (err: any) {
-                outcomeCollector.recordStageRun({
+                this.collector.recordStageRun({
                   id: `stage_${crypto.randomUUID()}`,
                   agent_run_id: agentRunId,
                   mode_id: "rewriter",
@@ -420,7 +458,7 @@ export class PipelineExecutor {
           onStateChange({ stage: "reviewer", status: "failed", output: errText(e) });
           hasPendingIssues = false; // abort review loop on error
 
-          outcomeCollector.recordStageRun({
+          this.collector.recordStageRun({
             id: `stage_${crypto.randomUUID()}`,
             agent_run_id: agentRunId,
             mode_id: "reviewer",
@@ -438,6 +476,7 @@ export class PipelineExecutor {
     // 4. Synthesizer Stage
     let finalAnswer = "";
     let fatalError: string | undefined;
+    let emptyCompletion = false;
     if (pipeline.includes("synthesizer")) {
       onStateChange({ stage: "synthesizer", status: "running" });
       const synthesizerPrompt = loadPrompt("modes/synthesizer.md");
@@ -459,21 +498,46 @@ export class PipelineExecutor {
             onStateChange({ stage: "synthesizer", status: "running", output: chunk });
           }
         });
-        finalAnswer = resp.content;
-        onStateChange({ stage: "synthesizer", status: "done", output: finalAnswer });
+        finalAnswer = resp.content ?? "";
 
-        outcomeCollector.recordStageRun({
-          id: `stage_${crypto.randomUUID()}`,
-          agent_run_id: agentRunId,
-          mode_id: "synthesizer",
-          turn_number: 1,
-          input_tokens: Math.round((synthesizerPrompt.length + request.length + plan.length + executorSummary.length + reviewerFeedback.length + rewriterSummary.length) / 4),
-          output_tokens: countTokens(finalAnswer),
-          tool_calls_json: "[]",
-          duration_ms: Date.now() - synthStartTime,
-          was_successful: 1,
-          had_error: 0,
-        });
+        // Semantic emptiness is a FAILURE, not a success. A 200-OK with empty
+        // visible content (free-tier zero-token completion, model spent its
+        // budget on reasoning, etc.) previously recorded was_successful:1 with
+        // output_tokens:0 — poisoning the self-tuning signal and surfacing a
+        // blank turn. Record it as a failed stage; the caller still shows the
+        // friendly "try again" notice (we leave `fatalError` unset so it is not
+        // an error banner) but the run outcome is truthfully failed.
+        if (!finalAnswer.trim()) {
+          emptyCompletion = true;
+          onStateChange({ stage: "synthesizer", status: "failed", output: "(empty completion)" });
+          this.collector.recordStageRun({
+            id: `stage_${crypto.randomUUID()}`,
+            agent_run_id: agentRunId,
+            mode_id: "synthesizer",
+            turn_number: 1,
+            input_tokens: Math.round((synthesizerPrompt.length + request.length + plan.length + executorSummary.length + reviewerFeedback.length + rewriterSummary.length) / 4),
+            output_tokens: 0,
+            tool_calls_json: "[]",
+            duration_ms: Date.now() - synthStartTime,
+            was_successful: 0,
+            had_error: 1,
+            error_message: "empty_completion",
+          });
+        } else {
+          onStateChange({ stage: "synthesizer", status: "done", output: finalAnswer });
+          this.collector.recordStageRun({
+            id: `stage_${crypto.randomUUID()}`,
+            agent_run_id: agentRunId,
+            mode_id: "synthesizer",
+            turn_number: 1,
+            input_tokens: Math.round((synthesizerPrompt.length + request.length + plan.length + executorSummary.length + reviewerFeedback.length + rewriterSummary.length) / 4),
+            output_tokens: countTokens(finalAnswer),
+            tool_calls_json: "[]",
+            duration_ms: Date.now() - synthStartTime,
+            was_successful: 1,
+            had_error: 0,
+          });
+        }
       } catch (e: any) {
         onStateChange({ stage: "synthesizer", status: "failed", output: errText(e) });
         // The synthesizer produces the turn's actual answer. If it threw, there
@@ -482,7 +546,7 @@ export class PipelineExecutor {
         fatalError = describePipelineError(errText(e));
         finalAnswer = `Synthesis failed: ${errText(e)}`;
 
-        outcomeCollector.recordStageRun({
+        this.collector.recordStageRun({
           id: `stage_${crypto.randomUUID()}`,
           agent_run_id: agentRunId,
           mode_id: "synthesizer",
@@ -499,8 +563,33 @@ export class PipelineExecutor {
       finalAnswer = plan !== "No planning stage executed." ? plan : "No planning stage executed.";
     }
 
-    const result = { answer: finalAnswer, error: fatalError, recursion_depth: 0 };
-    if (!fatalError && pipeline.includes("synthesizer")) {
+    // Truthful run outcome. A failed synthesizer (threw OR empty) is `failed`.
+    // A run whose answer came through but an upstream stage failed is `degraded`.
+    const upstreamDegraded =
+      plan.startsWith("Failed to generate plan") || executorSummary.startsWith("Executor failed");
+    let outcome: PipelineOutcome;
+    let errorCode: string | undefined;
+    if (fatalError) {
+      outcome = "failed";
+      errorCode = "stage_error";
+    } else if (emptyCompletion) {
+      outcome = "failed";
+      errorCode = "empty_completion";
+    } else if (upstreamDegraded) {
+      outcome = "degraded";
+      errorCode = "upstream_stage_failed";
+    } else {
+      outcome = "success";
+    }
+
+    const result: PipelineResult = {
+      answer: emptyCompletion ? "" : finalAnswer,
+      error: fatalError,
+      recursion_depth: 0,
+      outcome,
+      error_code: errorCode,
+    };
+    if (!fatalError && !emptyCompletion && pipeline.includes("synthesizer")) {
       return this.applyRecursiveCritique(request, result, agentRunId, onStateChange, options);
     }
     return result;
@@ -585,7 +674,7 @@ export class PipelineExecutor {
       const finalAnswer = resp.content;
       onStateChange({ stage: "synthesizer", status: "done", output: finalAnswer });
 
-      outcomeCollector.recordStageRun({
+      this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
         agent_run_id: agentRunId,
         mode_id: "synthesizer",
@@ -598,12 +687,12 @@ export class PipelineExecutor {
         had_error: 0,
       });
 
-      return { answer: finalAnswer, recursion_depth: 0 };
+      return { answer: finalAnswer, recursion_depth: 0, outcome: finalAnswer.trim() ? "success" : "failed", error_code: finalAnswer.trim() ? undefined : "empty_completion" };
     } catch (e: any) {
       onStateChange({ stage: "synthesizer", status: "failed", output: errText(e) });
       const fatalError = describePipelineError(errText(e));
 
-      outcomeCollector.recordStageRun({
+      this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
         agent_run_id: agentRunId,
         mode_id: "synthesizer",
@@ -615,7 +704,7 @@ export class PipelineExecutor {
         error_message: errText(e),
       });
 
-      return { answer: `Synthesis failed: ${errText(e)}`, error: fatalError, recursion_depth: 0 };
+      return { answer: `Synthesis failed: ${errText(e)}`, error: fatalError, recursion_depth: 0, outcome: "failed", error_code: "stage_error" };
     }
   }
 
@@ -648,7 +737,7 @@ export class PipelineExecutor {
       const output = resp.content;
       args.onStateChange({ stage: args.stage, status: "done", output });
 
-      outcomeCollector.recordStageRun({
+      this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
         agent_run_id: args.agentRunId,
         mode_id: args.stage,
@@ -666,7 +755,7 @@ export class PipelineExecutor {
       const message = errText(e);
       args.onStateChange({ stage: args.stage, status: "failed", output: message });
 
-      outcomeCollector.recordStageRun({
+      this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
         agent_run_id: args.agentRunId,
         mode_id: args.stage,
@@ -746,7 +835,7 @@ export class PipelineExecutor {
       const finalAnswer = resp.content;
       onStateChange({ stage: "synthesizer", status: "done", output: finalAnswer });
 
-      outcomeCollector.recordStageRun({
+      this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
         agent_run_id: agentRunId,
         mode_id: "synthesizer",
@@ -759,12 +848,12 @@ export class PipelineExecutor {
         had_error: 0,
       });
 
-      return { answer: finalAnswer, recursion_depth: 0 };
+      return { answer: finalAnswer, recursion_depth: 0, outcome: finalAnswer.trim() ? "success" : "failed", error_code: finalAnswer.trim() ? undefined : "empty_completion" };
     } catch (e: any) {
       onStateChange({ stage: "synthesizer", status: "failed", output: errText(e) });
       const fatalError = describePipelineError(errText(e));
 
-      outcomeCollector.recordStageRun({
+      this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
         agent_run_id: agentRunId,
         mode_id: "synthesizer",
@@ -776,7 +865,7 @@ export class PipelineExecutor {
         error_message: errText(e),
       });
 
-      return { answer: `Synthesis failed: ${errText(e)}`, error: fatalError, recursion_depth: 0 };
+      return { answer: `Synthesis failed: ${errText(e)}`, error: fatalError, recursion_depth: 0, outcome: "failed", error_code: "stage_error" };
     }
   }
 
@@ -818,7 +907,7 @@ export class PipelineExecutor {
         stageLabel: "recursion_critique" as any,
       });
 
-      outcomeCollector.recordStageRun({
+      this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
         agent_run_id: agentRunId,
         mode_id: "recursion_critique",
@@ -862,7 +951,9 @@ export class PipelineExecutor {
         ["executor", "synthesizer"],
         agentRunId,
         onStateChange,
-        { topology: "linear" },
+        // Preserve the least-authority profile through recursive re-entry — a
+        // read-only turn must stay read-only when the critique re-runs executor.
+        { topology: "linear", executionProfile: options.executionProfile },
       );
 
       return {
@@ -872,7 +963,7 @@ export class PipelineExecutor {
     } catch (e: any) {
       const message = errText(e);
       await options.onRecursion?.({ depth, status: "failed", critique: message });
-      outcomeCollector.recordStageRun({
+      this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
         agent_run_id: agentRunId,
         mode_id: "recursion_critique",

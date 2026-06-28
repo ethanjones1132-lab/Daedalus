@@ -36,6 +36,14 @@ describe("fs-scope", () => {
     expect(r.endsWith("ws/src/index.ts")).toBe(true);
   });
 
+  test("safePath in permissive mode ALLOWS a path outside the workspace", () => {
+    // permissive must be more lenient than strict: an out-of-workspace path is
+    // returned (resolved), not rejected. Mirrors agent-tools.ts behavior.
+    const perm = { ...cfg, tools: { sandbox_mode: "permissive" } } as unknown as JarvisConfig;
+    const r = safePath("../../etc/passwd", perm).replace(/\\/g, "/");
+    expect(r.endsWith("etc/passwd")).toBe(true);
+  });
+
   test("safePath with sandbox off returns the resolved absolute path", () => {
     const off = { ...cfg, tools: { sandbox_mode: "off" } } as unknown as JarvisConfig;
     const r = safePath("/etc/hosts", off).replace(/\\/g, "/");

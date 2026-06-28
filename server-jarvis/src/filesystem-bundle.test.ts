@@ -38,7 +38,13 @@ function makeCtx(workspace: string, surface: ExecutionContext["surface"] = "chat
   cfg.jarvis_path = workspace;
   cfg.tools.enabled = true;
   cfg.tools.sandbox_mode = "workspace";
-  return makeExecutionContext(surface, cfg, { workspace_path: workspace });
+  // Auto-approving hook: these tests exercise the tool HANDLERS, so they stand
+  // in for a real interactive surface where the user approved the call. Without
+  // a hook, approval-gated tools (write/edit/patch) are now correctly DENIED.
+  return makeExecutionContext(surface, cfg, {
+    workspace_path: workspace,
+    requestApproval: async () => true,
+  });
 }
 
 function call(name: string, args: Record<string, unknown>) {

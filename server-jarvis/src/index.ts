@@ -69,6 +69,8 @@ import { StreamSession, VisibleTextPipe } from "./stream-emitter";
 import { Coordinator } from "./orchestration/coordinator";
 import { AgentPool, firstTokenTimeoutFor, formatPoolDiversity } from "./orchestration/agent-pool";
 import { PipelineExecutor } from "./orchestration/pipeline";
+import { classifyTurnRequirements } from "./orchestration/turn-requirements";
+import { normalizeRoute, type ExecutionProfile } from "./orchestration/route-normalization";
 import { outcomeCollector, selfTuningProposer, SelfTuningStore } from "./self-tuning/mod";
 import { normalizeStreamedToolCalls } from "./streaming-tool-calls";
 
@@ -1170,8 +1172,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
         let orchestratorTaskType = "general";
 
-        // Custom CallModelFn for pipeline execution
-        const callModel = async (messages: any[], callOptions?: any) => {
+        // Custom CallModelFn for pipeline execution. `callModelAttempt` performs a
+        // single model call; the `callModel` wrapper below adds a bounded
+        // empty-completion retry that ADVANCES the provider cascade (the
+        // synthesizer must never silently return nothing).
+        const callModelAttempt = async (messages: any[], callOptions?: any, excludeModels?: Set<string>) => {
           const isOllama = cfg.active_backend === "ollama";
           const ollamaTarget = isOllama ? await resolveOllamaChatTarget(cfg) : null;
 
@@ -1324,15 +1329,18 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
           let fetchRes: Response;
           let actualModelUsed = modelName;
+          let actualProviderUsed: string = effectiveProvider;
           try {
             if (useFallback) {
               const result = await chatCompletionWithFallback(cfg, requestBody, ctrl.signal, {
                 stage: callOptions?.stageLabel,
                 taskType: orchestratorTaskType,
                 cascadeTier: callOptions?.cascadeTier,
+                excludeModels,
               });
               fetchRes = result.response;
               actualModelUsed = result.model_used;
+              actualProviderUsed = result.provider_used;
               if (result.retries > 0) {
                 console.log(`[Jarvis Orchestrator] callModel used model ${result.model_used} after ${result.retries} retry attempt(s)`);
                 await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "fallback_notice", model: result.model_used, retries: result.retries, session_id: sessionId })}\n\n`));
@@ -1567,10 +1575,40 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           return {
             content: cleanContent,
             tool_calls: parsedToolCalls.length > 0 ? parsedToolCalls : undefined,
+            // Wrapper-only metadata so callModel can exclude this model on an
+            // empty-completion retry. Not part of the CallModelFn contract.
+            _modelUsed: actualModelUsed,
+            _provider: actualProviderUsed,
           };
           } finally {
             streamAbort.signal.removeEventListener("abort", onStreamAbort);
           }
+        };
+
+        // CallModelFn seen by the coordinator + pipeline. Adds a bounded
+        // empty-completion retry: if a USER-VISIBLE stage (synthesizer) returns a
+        // semantically-empty 200 (no content + no tool calls) and we have a
+        // fallback cascade, advance PAST that model and try the next one. A model
+        // that just returned empty will almost always return empty again, so
+        // retrying the same model is pointless — we exclude it. Bounded to one
+        // extra advance to cap latency; if both come back empty the pipeline
+        // records `empty_completion` and the user gets the friendly retry notice.
+        const callModel = async (messages: any[], callOptions?: any) => {
+          const canAdvance = callOptions?.surfaceAsAnswer === true && cfg.active_backend !== "ollama" && cfg.openrouter.enable_fallbacks;
+          const exclude = new Set<string>();
+          let last: any = await callModelAttempt(messages, callOptions);
+          if (!canAdvance) return last;
+          for (let advance = 0; advance < 1; advance++) {
+            const hasContent = typeof last?.content === "string" && last.content.trim().length > 0;
+            const hasToolCalls = Array.isArray(last?.tool_calls) && last.tool_calls.length > 0;
+            if (hasContent || hasToolCalls || streamAbort.signal.aborted) break;
+            if (last?._provider && last?._modelUsed) {
+              exclude.add(`${last._provider}:${last._modelUsed}`);
+            }
+            console.warn(`[Jarvis Orchestrator] empty completion from ${last?._provider}:${last?._modelUsed} stage=${callOptions?.stageLabel ?? "?"} — advancing cascade (excluding it)`);
+            last = await callModelAttempt(messages, callOptions, exclude);
+          }
+          return last;
         };
 
         // Route the user request through the Fugu-style coordinator. The
@@ -1582,8 +1620,27 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           history: turnHistory,
         });
         orchestratorTaskType = route.task_type;
-        const executablePipeline = coordinator.executablePipeline(route);
-        console.log(`[Jarvis Orchestrator] Coordinator decided task_type=${route.task_type}, topology=${route.topology}, pipeline=${route.pipeline.map((step) => step ?? "skip").join(" -> ")}`);
+
+        // Deterministic capability classification of the RAW current message —
+        // NOT `contextMessage` (which prepends history and would let a prior
+        // file-read contaminate a follow-up greeting). This is the authoritative
+        // signal; the coordinator model's route is advisory.
+        const turnReq = classifyTurnRequirements(message);
+        const normalized = normalizeRoute(
+          route,
+          turnReq.requirement,
+          turnReq.requirement === "conversational" ? "trivial_short_circuit" : "model",
+        );
+        const executablePipeline = normalized.pipeline;
+        const executionProfile: ExecutionProfile = normalized.profile;
+        console.log(
+          `[Jarvis Orchestrator] task_type=${route.task_type} model_route=${route.pipeline.map((s) => s ?? "skip").join("->")}/${route.topology}; ` +
+          `requirement=${turnReq.requirement} [${turnReq.signals.join(",")}]; ` +
+          `normalized=${executablePipeline.join("->")}/${normalized.topology} profile=${executionProfile} source=${normalized.route_source}`,
+        );
+        if (normalized.override_reason) {
+          console.warn(`[Jarvis Orchestrator] route override: ${normalized.override_reason}`);
+        }
 
         // Initialize tuned configurations and start run in collector
         const agentRunId = `run_${crypto.randomUUID()}`;
@@ -1602,7 +1659,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             session_id: sessionId
           })}\n\n`));
         }, {
-          topology: route.topology,
+          topology: normalized.topology,
+          executionProfile,
           maxRecursionDepth: cfg.orchestrator.max_recursion_depth,
           onRecursion: async (event) => {
             await writer.write(encoder.encode(`data: ${JSON.stringify({
@@ -1631,7 +1689,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }
         } catch {}
 
-        outcomeCollector.completeAgentRun(agentRunId, result.answer, duration, totalToolCalls, totalTokens);
+        // Truthful run outcome. An empty/degraded run must NOT be recorded as a
+        // success — that poisons the self-tuning signal. `completed:1` only means
+        // the run finished; `outcome` records whether it actually succeeded.
+        const trimmedAnswer = result.answer?.trim() || "";
+        const runOutcome: "success" | "degraded" | "failed" =
+          result.outcome ?? (result.error || !trimmedAnswer ? "failed" : "success");
+        const finalOutputForLog = trimmedAnswer || result.error || `(no output: ${result.error_code ?? "empty_completion"})`;
+        outcomeCollector.completeAgentRun(agentRunId, finalOutputForLog, duration, totalToolCalls, totalTokens, runOutcome);
         await selfTuningProposer.proposeAndApply(agentRunId, route.task_type);
 
         // Write final done messages
@@ -1656,14 +1721,26 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             error: result.error.slice(0, 200),
           });
           await session.finish(result.error, { isError: true });
+        } else if (!trimmedAnswer) {
+          // Empty (non-fatal) completion: show the friendly retry notice, but
+          // record the inference as a FAILURE so telemetry is truthful (the run
+          // outcome above is already `failed`/`empty_completion`).
+          console.warn(`[Jarvis Orchestrator] Pipeline returned empty answer session=${sessionId} (outcome=${runOutcome}, code=${result.error_code ?? "empty_completion"}) — surfacing fallback`);
+          recordInference({
+            ts: Date.now(),
+            backend: cfg.active_backend as Backend,
+            model: cfg.active_backend === "openrouter"
+              ? (cfg.openrouter.model ?? "openrouter/free")
+              : cfg.ollama.model,
+            ok: false,
+            latency_ms: duration,
+            tokens_in: 0,
+            tokens_out: 0,
+            error: result.error_code ?? "empty_completion",
+          });
+          await session.finish("The orchestrator completed but produced no output. This may be a transient model issue. Try your request again.");
         } else {
-          const answer = result.answer?.trim() || "";
-          if (!answer && !result.error) {
-            console.warn(`[Jarvis Orchestrator] Pipeline returned empty answer session=${sessionId} — surfacing fallback`);
-            await session.finish("The orchestrator completed but produced no output. This may be a transient model issue. Try your request again.");
-          } else {
-            await session.finish(answer || result.answer);
-          }
+          await session.finish(trimmedAnswer || result.answer);
         }
         return;
       }

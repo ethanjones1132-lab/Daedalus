@@ -33,6 +33,32 @@ describe("Self tuning", () => {
     expect(store.getStageRuns(runId)[0].mode_id).toBe("executor");
   });
 
+  test("completeAgentRun persists a truthful outcome (default success, explicit failed)", () => {
+    const store = new SelfTuningStore(TEST_DB_PATH);
+    const collector = new SessionOutcomeCollector(store);
+
+    collector.startAgentRun("run_ok", "s", "q", "general", ["synthesizer"]);
+    collector.completeAgentRun("run_ok", "answer", 10, 0, 5); // default
+    collector.startAgentRun("run_bad", "s", "q", "general", ["synthesizer"]);
+    collector.completeAgentRun("run_bad", "(no output: empty_completion)", 10, 0, 0, "failed");
+
+    const byId = Object.fromEntries(store.getAgentRuns().map((r) => [r.id, r]));
+    expect(byId["run_ok"].outcome).toBe("success");
+    expect(byId["run_bad"].outcome).toBe("failed");
+  });
+
+  test("an injected in-memory collector is isolated — bun test cannot reach the production DB", () => {
+    // Two independent :memory: stores never share rows. Because every pipeline
+    // test injects a :memory: collector (never the global production singleton),
+    // running `bun test` can never add rows to ~/.openclaw/jarvis/self-tuning.db.
+    const storeA = new SelfTuningStore(":memory:");
+    const storeB = new SelfTuningStore(":memory:");
+    new SessionOutcomeCollector(storeA).startAgentRun("run_isolated", "s", "q", "general", ["synthesizer"]);
+
+    expect(storeA.getAgentRuns().map((r) => r.id)).toContain("run_isolated");
+    expect(storeB.getAgentRuns()).toHaveLength(0);
+  });
+
   test("proposer creates pending proposals after enough negative outcomes", async () => {
     const store = new SelfTuningStore(TEST_DB_PATH);
     const runIds = ["run_a", "run_b", "run_c"];

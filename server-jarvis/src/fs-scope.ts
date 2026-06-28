@@ -49,7 +49,20 @@ export function safePath(inputPath: string, cfg: JarvisConfig): string {
   const workspace = cfg.jarvis_path || process.cwd();
   const resolved = resolve(workspace, wslPath);
   const rel = relative(workspace, resolved);
-  if (rel.startsWith("..") || rel.startsWith("/")) {
+  const escapes = rel.startsWith("..") || rel.startsWith("/") || /^[a-zA-Z]:/.test(rel);
+  // permissive allows access OUTSIDE the workspace (with a log) -- more lenient
+  // than strict. Without this branch the canonical fs bundle treated permissive
+  // exactly like strict, so every read of a path outside jarvis_path (common
+  // when the configured workspace is a container/Linux path on a Windows host)
+  // silently failed: the file looked empty/not-found even though the
+  // orchestrator routed the read correctly. Mirrors agent-tools.ts::safePath.
+  if (cfg.tools.sandbox_mode === "permissive") {
+    if (escapes) {
+      console.log(`[Sandbox] Permissive mode: allowing access to "${resolved}" (outside workspace "${workspace}")`);
+    }
+    return resolved;
+  }
+  if (escapes) {
     throw new Error(`Path "${inputPath}" is outside the workspace. Sandbox mode: ${cfg.tools.sandbox_mode}`);
   }
   return resolved;

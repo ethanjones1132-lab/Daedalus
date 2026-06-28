@@ -16,6 +16,12 @@ export interface AgentRun {
   duration_ms?: number;
   tool_calls_count?: number;
   token_count?: number;
+  /**
+   * Truthful run outcome: "success" | "degraded" | "failed". Distinct from
+   * `completed` (which only marks that the run finished). Added via a guarded
+   * ALTER in getDb() so existing DBs gain the column without a full migration.
+   */
+  outcome?: string;
   created_at?: string;
 }
 
@@ -121,6 +127,7 @@ const SELF_TUNING_SCHEMA = `
     duration_ms INTEGER,
     tool_calls_count INTEGER,
     token_count INTEGER,
+    outcome TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   );
   CREATE TABLE IF NOT EXISTS stage_runs (
@@ -191,6 +198,12 @@ export class SelfTuningStore {
       const db = new Database(dbPath, { create: true });
       if (!schemaEnsuredPaths.has(dbPath)) {
         db.exec(SELF_TUNING_SCHEMA);
+        // Guarded migration: add the `outcome` column to pre-existing agent_runs
+        // tables (CREATE TABLE IF NOT EXISTS won't ALTER an existing table). The
+        // duplicate-column error on an already-migrated DB is expected and ignored.
+        try {
+          db.exec(`ALTER TABLE agent_runs ADD COLUMN outcome TEXT`);
+        } catch { /* column already exists */ }
         schemaEnsuredPaths.add(dbPath);
       }
       return db;

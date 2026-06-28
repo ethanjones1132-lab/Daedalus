@@ -1,4 +1,12 @@
 import type { ToolDefinition } from "../tool-types";
+import type { ExecutionProfile } from "./route-normalization";
+
+/**
+ * Tools permitted under the `read_only` execution profile. A `workspace_read`
+ * turn (and an `answer_only` turn that opts into the executor) is capped to
+ * these — so a misclassified read can never mutate the workspace.
+ */
+export const READ_ONLY_TOOLS: readonly string[] = ["read_file", "list_directory", "glob", "grep"];
 
 export interface AgentMode {
   id: string;
@@ -70,12 +78,22 @@ export const BUILTIN_MODES: Record<string, AgentMode> = {
   },
 };
 
-export function getToolsForMode(modeId: string, allTools: ToolDefinition[]): ToolDefinition[] {
+export function getToolsForMode(
+  modeId: string,
+  allTools: ToolDefinition[],
+  profile: ExecutionProfile = "full",
+): ToolDefinition[] {
   const mode = BUILTIN_MODES[modeId];
   if (!mode) return [];
+  // `none` profile removes ALL tools regardless of the mode's own filter.
+  if (profile === "none") return [];
   const filter = mode.tools_filter;
-  if (filter.includes("*")) {
-    return allTools;
+  let selected = filter.includes("*") ? allTools : allTools.filter((t) => filter.includes(t.function.name));
+  // `read_only` caps the mode's tools to the read-only allowlist. This is the
+  // least-authority intersection: a mode can never gain a tool it lacks, and the
+  // read-only cap can only remove mutating tools it would otherwise have.
+  if (profile === "read_only") {
+    selected = selected.filter((t) => READ_ONLY_TOOLS.includes(t.function.name));
   }
-  return allTools.filter((t) => filter.includes(t.function.name));
+  return selected;
 }

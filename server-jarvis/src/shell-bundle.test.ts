@@ -15,7 +15,10 @@ function makeCtx() {
   cfg.jarvis_path = tmpdir();
   cfg.tools.enabled = true;
   cfg.tools.sandbox_mode = "off";
-  return makeExecutionContext("chat", cfg);
+  // Auto-approving hook stands in for a real interactive surface where the user
+  // approved the bash call. Without a hook, the approval-gated bash tool is now
+  // correctly DENIED rather than silently executed.
+  return makeExecutionContext("chat", cfg, { requestApproval: async () => true });
 }
 
 describe("ShellBundle", () => {

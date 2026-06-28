@@ -31,6 +31,11 @@ recursion could repeat side effects.
 
 Rules:
 - Simple questions can skip planner, executor, and reviewer: [null, null, null, "synthesizer"].
+- Any request that names a file or directory path, or asks to read / inspect / list /
+  search / summarize / analyze files, a folder, the repo, or the codebase MUST include
+  the executor stage — the synthesizer has no tools and cannot read files. Routing such a
+  turn to synthesizer-only produces empty or hallucinated output. (The runtime also
+  enforces this, but choose it correctly here to avoid a correction.)
 - Plan-only requests should use ["planner", null, null, "synthesizer"].
 - Low-risk planning, docs, research, or general-answer requests may use
   ["planner", "reviewer", "synthesizer"] with "speculative_parallel".

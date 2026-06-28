@@ -570,6 +570,12 @@ interface FallbackResolveOptions {
   stage?: string;
   taskType?: string;
   cascadeTier?: "cheap" | "strong";
+  /**
+   * Provider:model keys to drop from the cascade. Used to ADVANCE past a model
+   * that returned a semantically-empty 200 (no content + no tool calls) on the
+   * previous attempt — retrying the same model would just return empty again.
+   */
+  excludeModels?: ReadonlySet<string>;
 }
 
 /** One step in the cross-provider fallback cascade. */
@@ -617,10 +623,11 @@ function resolvePoolAgents(cfg: JarvisConfig, options: FallbackResolveOptions = 
 async function resolveFallbackCascade(cfg: JarvisConfig, options: FallbackResolveOptions = {}): Promise<CascadeEntry[]> {
   const requested = cfg.openrouter.model || "openrouter/free";
   const seen = new Set<string>();
+  const excluded = options.excludeModels ?? new Set<string>();
   const cascade: CascadeEntry[] = [];
   const push = (entry: CascadeEntry) => {
     const key = `${entry.provider}:${entry.model_id}`;
-    if (!entry.model_id || seen.has(key)) return;
+    if (!entry.model_id || seen.has(key) || excluded.has(key)) return;
     seen.add(key);
     cascade.push(entry);
   };
@@ -758,7 +765,7 @@ export async function chatCompletionWithFallback(
   requestBody: any,
   signal?: AbortSignal,
   options: FallbackResolveOptions = {},
-): Promise<{ response: Response; model_used: string; retries: number }> {
+): Promise<{ response: Response; model_used: string; provider_used: HttpProviderId; retries: number }> {
   const cascade = await resolveFallbackCascade(cfg, options);
   if (cascade.length === 0) {
     cascade.push({ provider: "openrouter", model_id: cfg.openrouter.model || "openrouter/free" });
@@ -814,7 +821,7 @@ export async function chatCompletionWithFallback(
           // First-token watchdog: race the first body chunk against the timer.
           const bodyReader = res.body?.getReader();
           if (!bodyReader) {
-            return { response: res, model_used: model, retries: modelIdx };
+            return { response: res, model_used: model, provider_used: provider, retries: modelIdx };
           }
           const firstByteTimeout = new Promise<"timeout">((resolve) => {
             watchdogTimer = setTimeout(() => resolve("timeout"), firstTokenTimeoutMs);
@@ -840,7 +847,7 @@ export async function chatCompletionWithFallback(
             statusText: res.statusText,
             headers: res.headers,
           });
-          return { response: newResponse, model_used: model, retries: modelIdx };
+          return { response: newResponse, model_used: model, provider_used: provider, retries: modelIdx };
         }
 
         // ── Rate limit: 2-strike rule ──

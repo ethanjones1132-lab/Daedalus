@@ -6,6 +6,12 @@ import { createToolRuntime, makeExecutionContext } from "./tool-runtime";
 import type { ToolDefinition } from "./tool-types";
 import { defaultConfig } from "./config";
 import type { ChatMessage } from "./orchestration/router";
+import { SessionOutcomeCollector, SelfTuningStore } from "./self-tuning/mod";
+
+// In-memory collector so PipelineExecutor runs in tests can NEVER write to the
+// production self-tuning DB (~/.openclaw/jarvis/self-tuning.db). Passed as the
+// 4th constructor arg to every executor below.
+const testCollector = new SessionOutcomeCollector(new SelfTuningStore(":memory:"));
 
 describe("Orchestration & Routing Tests", () => {
   test("PredictiveRouter falls back safely when prompt files are absent", async () => {
@@ -45,10 +51,37 @@ describe("Orchestration & Routing Tests", () => {
     expect(getToolsForMode("missing", dummyTools)).toEqual([]);
   });
 
+  test("getToolsForMode respects least-authority execution profiles", () => {
+    const dummyTools: ToolDefinition[] = [
+      { type: "function", function: { name: "read_file", description: "", parameters: { type: "object", properties: {}, required: [] } }, requires_approval: false, dangerous: false },
+      { type: "function", function: { name: "list_directory", description: "", parameters: { type: "object", properties: {}, required: [] } }, requires_approval: false, dangerous: false },
+      { type: "function", function: { name: "write_file", description: "", parameters: { type: "object", properties: {}, required: [] } }, requires_approval: true, dangerous: true },
+      { type: "function", function: { name: "bash", description: "", parameters: { type: "object", properties: {}, required: [] } }, requires_approval: true, dangerous: true },
+      { type: "function", function: { name: "apply_patch", description: "", parameters: { type: "object", properties: {}, required: [] } }, requires_approval: true, dangerous: true },
+    ];
+
+    // read_only caps the executor to read-only tools — NO write/bash/patch.
+    const readOnly = getToolsForMode("executor", dummyTools, "read_only").map((t) => t.function.name);
+    expect(readOnly).toEqual(["read_file", "list_directory"]);
+    expect(readOnly).not.toContain("write_file");
+    expect(readOnly).not.toContain("bash");
+    expect(readOnly).not.toContain("apply_patch");
+
+    // none removes everything.
+    expect(getToolsForMode("executor", dummyTools, "none")).toEqual([]);
+
+    // full (default) keeps the executor's whole filtered set.
+    expect(getToolsForMode("executor", dummyTools, "full").map((t) => t.function.name))
+      .toEqual(["read_file", "list_directory", "write_file", "bash", "apply_patch"]);
+
+    // read_only on the rewriter (a mutation-only mode) yields no tools.
+    expect(getToolsForMode("rewriter", dummyTools, "read_only")).toEqual([]);
+  });
+
   test("PipelineExecutor skips empty pipelines without touching prompts", async () => {
     const runtime = createToolRuntime();
     const ctx = makeExecutionContext("agent", defaultConfig);
-    const executor = new PipelineExecutor(async () => ({ content: "ok" }), runtime, ctx);
+    const executor = new PipelineExecutor(async () => ({ content: "ok" }), runtime, ctx, testCollector);
     const states: Array<{ stage: string; status: string }> = [];
 
     const result = await executor.execute("do nothing", [], "run-empty", (state) => states.push(state as any));
@@ -56,6 +89,60 @@ describe("Orchestration & Routing Tests", () => {
     expect(result.answer).toBe("No planning stage executed.");
     expect(result.error).toBeUndefined();
     expect(states).toEqual([]);
+  });
+
+  test("empty synthesizer completion is recorded as a FAILED outcome, not success", async () => {
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig);
+    const recorded: any[] = [];
+    const collector = { recordStageRun: (s: any) => recorded.push(s) };
+    // Synthesizer returns a 200 with whitespace-only content (the free-tier
+    // empty-completion case that used to record was_successful:1 / 0 tokens).
+    const executor = new PipelineExecutor(async () => ({ content: "   " }), runtime, ctx, collector);
+
+    const result = await executor.execute("read this", ["synthesizer"], "run-empty-synth", () => {});
+
+    expect(result.answer).toBe("");
+    expect(result.error).toBeUndefined(); // not a hard error → friendly notice path
+    expect(result.outcome).toBe("failed");
+    expect(result.error_code).toBe("empty_completion");
+    const synth = recorded.find((s) => s.mode_id === "synthesizer");
+    expect(synth.was_successful).toBe(0);
+    expect(synth.had_error).toBe(1);
+    expect(synth.error_message).toBe("empty_completion");
+  });
+
+  test("read_only profile prevents the executor from receiving mutating tools", async () => {
+    const runtime = createToolRuntime();
+    const def = (name: string, dangerous: boolean) => ({
+      type: "function" as const,
+      function: { name, description: "", parameters: { type: "object" as const, properties: {}, required: [] } },
+      requires_approval: dangerous,
+      dangerous,
+    });
+    runtime.register(def("read_file", false), async () => "ok");
+    runtime.register(def("list_directory", false), async () => "ok");
+    runtime.register(def("write_file", true), async () => "ok");
+    runtime.register(def("bash", true), async () => "ok");
+    const ctx = makeExecutionContext("agent", defaultConfig);
+
+    const executorToolNames: string[] = [];
+    const callModel = async (_messages: any[], options: any = {}) => {
+      if (options.stageLabel === "executor") {
+        for (const t of options.tools ?? []) executorToolNames.push(t.function.name);
+        return { content: "done, no tools needed" }; // no tool_calls → executor turn ends
+      }
+      return { content: "final answer" };
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+
+    await executor.execute("read the repo", ["executor", "synthesizer"], "run-readonly-profile", () => {}, {
+      executionProfile: "read_only",
+    });
+
+    expect(executorToolNames.sort()).toEqual(["list_directory", "read_file"]);
+    expect(executorToolNames).not.toContain("write_file");
+    expect(executorToolNames).not.toContain("bash");
   });
 
   test("PipelineExecutor surfaces a synthesizer failure as a turn-fatal error", async () => {
@@ -66,6 +153,7 @@ describe("Orchestration & Routing Tests", () => {
       async () => { throw new Error("API 401: {\"error\":{\"message\":\"User not found.\",\"code\":401}}"); },
       runtime,
       ctx,
+      testCollector,
     );
     const states: Array<{ stage: string; status: string }> = [];
 
@@ -98,7 +186,7 @@ describe("Orchestration & Routing Tests", () => {
       });
     };
 
-    const executor = new PipelineExecutor(callModel as any, runtime, ctx);
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
     const run = executor.execute(
       "compare two implementation paths",
       ["planner", "reviewer", "synthesizer"],
@@ -144,7 +232,7 @@ describe("Orchestration & Routing Tests", () => {
       return Promise.resolve({ content: "unexpected" });
     };
 
-    const executor = new PipelineExecutor(callModel as any, runtime, ctx);
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
     const result = await executor.execute(
       "answer cheaply unless uncertain",
       ["executor", "synthesizer"],
@@ -185,7 +273,7 @@ describe("Orchestration & Routing Tests", () => {
       return Promise.resolve({ content: "unexpected" });
     };
 
-    const executor = new PipelineExecutor(callModel as any, runtime, ctx);
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
     const result = await executor.execute(
       "finish the task",
       ["executor", "synthesizer"],
@@ -220,7 +308,7 @@ describe("Orchestration & Routing Tests", () => {
       return Promise.resolve({ content: "unexpected" });
     };
 
-    const executor = new PipelineExecutor(callModel as any, runtime, ctx);
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
     const result = await executor.execute(
       "finish the task",
       ["executor", "synthesizer"],

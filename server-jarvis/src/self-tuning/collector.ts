@@ -23,13 +23,24 @@ export class SessionOutcomeCollector {
     this.store.insertStageRun(stage);
   }
 
-  completeAgentRun(runId: string, finalOutput: string, durationMs: number, toolCallsCount: number, tokenCount: number): void {
+  completeAgentRun(
+    runId: string,
+    finalOutput: string,
+    durationMs: number,
+    toolCallsCount: number,
+    tokenCount: number,
+    // Truthful run outcome. `completed:1` only means the run FINISHED — the
+    // `outcome` column records whether it actually succeeded. A failed/degraded
+    // run must NOT be silently indistinguishable from a successful one.
+    outcome: "success" | "degraded" | "failed" = "success",
+  ): void {
     this.store.updateAgentRun(runId, {
       completed: 1,
       final_output: finalOutput,
       duration_ms: durationMs,
       tool_calls_count: toolCallsCount,
       token_count: tokenCount,
+      outcome,
     });
   }
 
