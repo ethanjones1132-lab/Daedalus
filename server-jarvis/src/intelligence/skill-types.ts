@@ -9,6 +9,14 @@ export interface SkillTrigger {
   signals: string[];
 }
 
+export type SkillRejectionReason =
+  | "below_eval_delta"
+  | "wrong_status"
+  | "low_confidence"
+  | "suspicious_paths"
+  | "body_length_out_of_range"
+  | "missing_signals";
+
 export interface SkillCandidate {
   id: string;
   name: string;
@@ -20,6 +28,14 @@ export interface SkillCandidate {
   confidence: number;
   status: SkillCandidateStatus;
   eval_score?: number;
+  /**
+   * Why the promotion pass declined this candidate. Only set when
+   * `status === "rejected"`. Human-readable so it can surface in the UI
+   * diagnostic and in the eval report. Stable, machine-typed via
+   * `SkillRejectionReason`.
+   */
+  rejection_reason?: SkillRejectionReason;
+  rejection_detail?: string;
   created_at: string;
   updated_at: string;
 }

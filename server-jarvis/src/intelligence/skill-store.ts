@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "fs";
 import { join, dirname } from "path";
 import { homedir } from "os";
-import type { SkillCandidate, SkillCandidateStatus } from "./skill-types";
+import type { SkillCandidate, SkillCandidateStatus, SkillRejectionReason } from "./skill-types";
 
 function skillCandidatesDirOverride(): string | undefined {
   return (globalThis as { __skillCandidatesDirOverride?: string }).__skillCandidatesDirOverride;
@@ -51,7 +51,13 @@ export function listSkillCandidates(status?: SkillCandidateStatus): SkillCandida
   return out.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
 }
 
-export function updateSkillCandidateStatus(id: string, status: SkillCandidateStatus, evalScore?: number): SkillCandidate | null {
+export function updateSkillCandidateStatus(
+  id: string,
+  status: SkillCandidateStatus,
+  evalScore?: number,
+  rejectionReason?: SkillRejectionReason,
+  rejectionDetail?: string,
+): SkillCandidate | null {
   const existing = loadSkillCandidate(id);
   if (!existing) return null;
   const updated: SkillCandidate = {
@@ -60,6 +66,16 @@ export function updateSkillCandidateStatus(id: string, status: SkillCandidateSta
     eval_score: evalScore ?? existing.eval_score,
     updated_at: new Date().toISOString(),
   };
+  // Only attach rejection metadata on rejection transitions — preserve
+  // a stale reason on a status change to "candidate" or "promoted"
+  // (the operator can re-arm by saving a fresh candidate).
+  if (status === "rejected") {
+    updated.rejection_reason = rejectionReason;
+    updated.rejection_detail = rejectionDetail;
+  } else {
+    delete updated.rejection_reason;
+    delete updated.rejection_detail;
+  }
   saveSkillCandidate(updated);
   return updated;
 }

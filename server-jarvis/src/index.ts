@@ -1869,10 +1869,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             runOutcome,
           }, distillCfg);
           if (candidate) {
-            const promoted = runSkillPromotionPass(distillCfg);
+            const promotionResult = runSkillPromotionPass(distillCfg);
             console.log(
               `[Jarvis Orchestrator] Distilled skill candidate ${candidate.id} (confidence=${candidate.confidence.toFixed(2)}); ` +
-              `promoted=${promoted.length}`,
+              `evaluated=${promotionResult.total_evaluated} promoted=${promotionResult.promoted.length} rejected=${promotionResult.rejected.length}`,
             );
           }
         }
@@ -2922,8 +2922,13 @@ async function baseFetch(req: Request): Promise<Response> {
     }
     if (path === "/skills/promote" && req.method === "POST") {
       const cfg = loadConfig();
-      const promoted = runSkillPromotionPass(cfg.orchestrator.skill_distillation);
-      return Response.json({ ok: true, promoted });
+      const result = runSkillPromotionPass(cfg.orchestrator.skill_distillation);
+      return Response.json({
+        ok: true,
+        promoted: result.promoted,
+        rejected: result.rejected,
+        total_evaluated: result.total_evaluated,
+      });
     }
     if (path === "/agents/pool" && req.method === "GET") {
       const poolCfg = loadConfig();
