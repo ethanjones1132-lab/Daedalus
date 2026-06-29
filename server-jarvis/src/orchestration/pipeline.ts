@@ -2,6 +2,10 @@ import { loadPrompt } from "./prompt-loader";
 import { BUILTIN_MODES, getToolsForMode } from "./modes";
 import type { ToolRuntime, ExecutionContext } from "../tool-runtime";
 import type { CallModelFn, ChatMessage } from "./router";
+import type { SharedContextHints, StageName, WorkerInstructions } from "./coordinator";
+import type { SessionMemory } from "./session-memory";
+import { resolveStagePrompt, stagePromptFile } from "./worker-prompt";
+import type { ToolCall, ToolResult } from "../tool-types";
 import { outcomeCollector } from "../self-tuning/mod";
 import type { StageRun } from "../self-tuning/store";
 import { countTokens } from "../tokens";
@@ -35,6 +39,39 @@ export interface PipelineExecuteOptions {
    * `full` so legacy callers are unaffected.
    */
   executionProfile?: ExecutionProfile;
+  /** Conductor-generated per-stage instructions; falls back to static prompts when absent. */
+  workerInstructions?: WorkerInstructions;
+  /** Cross-turn context hints to inject into worker prompts. */
+  sharedContext?: SharedContextHints;
+  /** Inter-workflow session memory for tool-cache recording and read short-circuit. */
+  sessionMemory?: SessionMemory;
+  /** Promoted distilled skills block for planner/executor injection. */
+  distilledSkillsBlock?: string;
+}
+
+const READ_CACHE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "web_fetch"]);
+
+function parseStreamedToolCall(raw: any): ToolCall {
+  const name = raw?.function?.name ?? raw?.name ?? "";
+  let args: Record<string, unknown> = {};
+  const rawArgs = raw?.function?.arguments ?? raw?.arguments;
+  if (typeof rawArgs === "string") {
+    try {
+      const parsed = JSON.parse(rawArgs) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        args = parsed as Record<string, unknown>;
+      }
+    } catch {
+      args = {};
+    }
+  } else if (rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
+    args = rawArgs as Record<string, unknown>;
+  }
+  return {
+    id: raw?.id ?? `call_${crypto.randomUUID()}`,
+    name,
+    arguments: args,
+  };
 }
 
 export interface PipelineRecursionEvent {
@@ -110,6 +147,22 @@ export function describePipelineError(raw: string): string {
   return msg;
 }
 
+function stageSystemPrompt(
+  stage: StageName,
+  options: PipelineExecuteOptions,
+): string {
+  const skillsBlock = stage === "planner" || stage === "executor"
+    ? options.distilledSkillsBlock
+    : undefined;
+  return resolveStagePrompt(
+    stage,
+    loadPrompt(stagePromptFile(stage)),
+    options.workerInstructions,
+    options.sharedContext,
+    skillsBlock,
+  );
+}
+
 export class PipelineExecutor {
   constructor(
     private callModel: CallModelFn,
@@ -120,6 +173,42 @@ export class PipelineExecutor {
     private collector: StageRunRecorder = outcomeCollector
   ) {}
 
+  private async runToolCall(raw: any, options: PipelineExecuteOptions): Promise<ToolResult> {
+    const call = parseStreamedToolCall(raw);
+    const sessionId = this.ctx.session_id;
+    const memory = options.sessionMemory;
+
+    if (memory && sessionId && READ_CACHE_TOOLS.has(call.name)) {
+      const cached = memory.lookupCachedToolResult(
+        sessionId,
+        call.name,
+        call.arguments,
+        this.ctx.workspace_path,
+      );
+      if (cached) {
+        return {
+          call_id: call.id,
+          name: call.name,
+          output: cached,
+          is_error: false,
+          duration_ms: 0,
+        };
+      }
+    }
+
+    const result = await this.runtime.execute(call, this.ctx);
+    if (memory && sessionId) {
+      memory.recordToolResult({
+        sessionId,
+        toolName: call.name,
+        args: call.arguments,
+        result,
+        workspacePath: this.ctx.workspace_path,
+      });
+    }
+    return result;
+  }
+
   async execute(
     request: string,
     pipeline: string[],
@@ -128,10 +217,10 @@ export class PipelineExecutor {
     options: PipelineExecuteOptions = {}
   ): Promise<PipelineResult> {
     if (this.canRunSpeculativeParallel(pipeline, options.topology)) {
-      return this.executeSpeculativeParallel(request, pipeline, agentRunId, onStateChange);
+      return this.executeSpeculativeParallel(request, pipeline, agentRunId, onStateChange, options);
     }
     if (this.canRunSpeculativeCascade(pipeline, options.topology)) {
-      return this.executeSpeculativeCascade(request, agentRunId, onStateChange);
+      return this.executeSpeculativeCascade(request, agentRunId, onStateChange, options);
     }
 
     let plan = "No planning stage executed.";
@@ -147,7 +236,7 @@ export class PipelineExecutor {
     // 1. Planner Stage
     if (pipeline.includes("planner")) {
       onStateChange({ stage: "planner", status: "running" });
-      const plannerPrompt = loadPrompt("modes/planner.md");
+      const plannerPrompt = stageSystemPrompt("planner", options);
       const startTime = Date.now();
       try {
         const resp = await this.callModel([
@@ -199,7 +288,7 @@ export class PipelineExecutor {
     // 2. Executor Stage
     if (pipeline.includes("executor")) {
       onStateChange({ stage: "executor", status: "running" });
-      const executorPrompt = loadPrompt("modes/executor.md");
+      const executorPrompt = stageSystemPrompt("executor", options);
       const executorMessages: ChatMessage[] = [
         { role: "system", content: executorPrompt },
         { role: "user", content: `User Request: ${request}\n\nPlan:\n${plan}` }
@@ -238,7 +327,7 @@ export class PipelineExecutor {
 
             if (response.tool_calls && response.tool_calls.length > 0) {
               for (const tc of response.tool_calls) {
-                const toolResult = await this.runtime.execute(tc, this.ctx);
+                const toolResult = await this.runToolCall(tc, options);
                 executorMessages.push({
                   role: "tool",
                   tool_call_id: tc.id,
@@ -307,8 +396,8 @@ export class PipelineExecutor {
 
     // 3. Reviewer & Rewriter Correction Loop
     if (pipeline.includes("reviewer")) {
-      const reviewerPrompt = loadPrompt("modes/reviewer.md");
-      const rewriterPrompt = loadPrompt("modes/rewriter.md");
+      const reviewerPrompt = stageSystemPrompt("reviewer", options);
+      const rewriterPrompt = stageSystemPrompt("rewriter", options);
       let loopCount = 0;
       const maxLoops = 3;
       let hasPendingIssues = true;
@@ -393,7 +482,7 @@ export class PipelineExecutor {
 
                 if (rewriteResp.tool_calls && rewriteResp.tool_calls.length > 0) {
                   for (const tc of rewriteResp.tool_calls) {
-                    const toolResult = await this.runtime.execute(tc, this.ctx);
+                    const toolResult = await this.runToolCall(tc, options);
                     rewriterMessages.push({
                       role: "tool",
                       tool_call_id: tc.id,
@@ -479,7 +568,7 @@ export class PipelineExecutor {
     let emptyCompletion = false;
     if (pipeline.includes("synthesizer")) {
       onStateChange({ stage: "synthesizer", status: "running" });
-      const synthesizerPrompt = loadPrompt("modes/synthesizer.md");
+      const synthesizerPrompt = stageSystemPrompt("synthesizer", options);
       const synthStartTime = Date.now();
       try {
         const resp = await this.callModel([
@@ -618,10 +707,11 @@ export class PipelineExecutor {
     request: string,
     pipeline: string[],
     agentRunId: string,
-    onStateChange: (state: PipelineProgressState) => void
+    onStateChange: (state: PipelineProgressState) => void,
+    options: PipelineExecuteOptions,
   ): Promise<PipelineResult> {
-    const plannerPrompt = loadPrompt("modes/planner.md");
-    const reviewerPrompt = loadPrompt("modes/reviewer.md");
+    const plannerPrompt = stageSystemPrompt("planner", options);
+    const reviewerPrompt = stageSystemPrompt("reviewer", options);
 
     const plannerPromise = this.runModelOnlyStage({
       stage: "planner",
@@ -652,7 +742,7 @@ export class PipelineExecutor {
     }
 
     onStateChange({ stage: "synthesizer", status: "running" });
-    const synthesizerPrompt = loadPrompt("modes/synthesizer.md");
+    const synthesizerPrompt = stageSystemPrompt("synthesizer", options);
     const synthStartTime = Date.now();
     try {
       const resp = await this.callModel([
@@ -774,9 +864,10 @@ export class PipelineExecutor {
   private async executeSpeculativeCascade(
     request: string,
     agentRunId: string,
-    onStateChange: (state: PipelineProgressState) => void
+    onStateChange: (state: PipelineProgressState) => void,
+    options: PipelineExecuteOptions,
   ): Promise<PipelineResult> {
-    const executorPrompt = loadPrompt("modes/executor.md");
+    const executorPrompt = stageSystemPrompt("executor", options);
     const cheapOutput = await this.runModelOnlyStage({
       stage: "executor",
       prompt: executorPrompt,
@@ -810,7 +901,7 @@ export class PipelineExecutor {
     ].join("\n\n");
 
     onStateChange({ stage: "synthesizer", status: "running" });
-    const synthesizerPrompt = loadPrompt("modes/synthesizer.md");
+    const synthesizerPrompt = stageSystemPrompt("synthesizer", options);
     const synthStartTime = Date.now();
     try {
       const resp = await this.callModel([
@@ -953,7 +1044,13 @@ export class PipelineExecutor {
         onStateChange,
         // Preserve the least-authority profile through recursive re-entry — a
         // read-only turn must stay read-only when the critique re-runs executor.
-        { topology: "linear", executionProfile: options.executionProfile },
+        {
+          topology: "linear",
+          executionProfile: options.executionProfile,
+          workerInstructions: options.workerInstructions,
+          sharedContext: options.sharedContext,
+          sessionMemory: options.sessionMemory,
+        },
       );
 
       return {

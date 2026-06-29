@@ -95,7 +95,7 @@ function uniqueStrings(values: string[]): string[] {
   return Array.from(new Set(values.filter(Boolean)));
 }
 
-function ollamaBaseUrlCandidates(cfg: OllamaConfig): string[] {
+export function ollamaBaseUrlCandidates(cfg: OllamaConfig): string[] {
   return uniqueStrings([
     cleanOllamaBaseUrl(cfg.base_url),
     "http://localhost:11434",

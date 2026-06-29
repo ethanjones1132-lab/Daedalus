@@ -913,6 +913,7 @@ pub fn run() {
             invoke_skill,
             skill_revisions_list,
             skill_restore_revision,
+            sync_distilled_skill_candidates,
             list_channels,
             add_channel,
             remove_channel,

@@ -605,7 +605,7 @@ function resolvePoolAgents(cfg: JarvisConfig, options: FallbackResolveOptions = 
     agents = options.cascadeTier === "strong" ? [...cascade].reverse() : cascade;
   } else {
     const selected = pool.pickFor(options.stage, options.taskType ?? "general");
-    agents = selected ? pool.fallbackChain(selected) : [];
+    agents = selected ? pool.fallbackChain(selected, options.stage, options.taskType ?? "general") : [];
   }
   return agents
     .filter((agent) => SUPPORTED_HTTP_PROVIDERS.has(agent.provider))

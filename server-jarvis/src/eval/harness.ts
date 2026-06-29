@@ -14,15 +14,22 @@ import { Coordinator, CoordinatorError } from "../orchestration/coordinator";
 import { AgentPool, DEFAULT_ORCHESTRATOR_AGENTS } from "../orchestration/agent-pool";
 import { getToolsForMode } from "../orchestration/modes";
 import type { ToolDefinition } from "../tool-types";
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+import { saveSkillCandidate } from "../intelligence/skill-store";
+import { resolveSkillsForTurn } from "../intelligence/skill-resolver";
 import {
   ROUTING_CASES,
   MODE_GATING_CASES,
   COORDINATOR_CASES,
   AGENT_POOL_CASES,
+  SKILL_CASES,
   type RoutingCase,
   type ModeGatingCase,
   type CoordinatorCase,
   type AgentPoolCase,
+  type SkillCase,
 } from "./cases";
 
 export interface EvalCaseResult {
@@ -133,6 +140,40 @@ async function runCoordinatorCase(c: CoordinatorCase): Promise<EvalCaseResult> {
   return { id: c.id, kind: c.kind, pass: problems.length === 0, detail: problems.length === 0 ? "ok" : problems.join("; ") };
 }
 
+function runSkillCase(c: SkillCase): EvalCaseResult {
+  const tempRoot = mkdtempSync(join(tmpdir(), "jarvis-eval-skill-"));
+  const g = globalThis as { __skillCandidatesDirOverride?: string };
+  const prev = g.__skillCandidatesDirOverride;
+  g.__skillCandidatesDirOverride = tempRoot;
+
+  try {
+    saveSkillCandidate(c.fixture);
+    const resolved = resolveSkillsForTurn(c.message, c.taskType);
+    const problems: string[] = [];
+
+    if (c.expect.matchedMin !== undefined && resolved.matched.length < c.expect.matchedMin) {
+      problems.push(`matched=${resolved.matched.length} expected>=${c.expect.matchedMin}`);
+    }
+    if (c.expect.matchedMax !== undefined && resolved.matched.length > c.expect.matchedMax) {
+      problems.push(`matched=${resolved.matched.length} expected<=${c.expect.matchedMax}`);
+    }
+    if (c.expect.promptContains && !resolved.promptBlock.includes(c.expect.promptContains)) {
+      problems.push(`prompt missing "${c.expect.promptContains}"`);
+    }
+
+    return {
+      id: c.id,
+      kind: c.kind,
+      pass: problems.length === 0,
+      detail: problems.length === 0 ? "ok" : problems.join("; "),
+    };
+  } finally {
+    if (prev === undefined) delete g.__skillCandidatesDirOverride;
+    else g.__skillCandidatesDirOverride = prev;
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
+}
+
 function runAgentPoolCase(c: AgentPoolCase): EvalCaseResult {
   const pool = new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS);
   const coverage = pool.coverage();
@@ -175,6 +216,7 @@ export async function runEval(): Promise<EvalReport> {
   for (const c of MODE_GATING_CASES) results.push(runModeGatingCase(c));
   for (const c of COORDINATOR_CASES) results.push(await runCoordinatorCase(c));
   for (const c of AGENT_POOL_CASES) results.push(runAgentPoolCase(c));
+  for (const c of SKILL_CASES) results.push(runSkillCase(c));
 
   const passed = results.filter((r) => r.pass).length;
   return {

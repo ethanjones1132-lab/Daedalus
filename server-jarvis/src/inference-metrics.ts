@@ -10,7 +10,48 @@
 // Call `recordInference` at the end of each successful or failed inference
 // turn. Read the snapshot with `inferenceMetricsSnapshot`.
 
-export type Backend = "ollama" | "openrouter" | "claude_cli";
+// The set of backends the inference observability layer tracks. OpenCode Zen
+// and OpenCode Go were added to the orchestrator's pool on 2026-06-24 — the
+// `Backend` type must enumerate them so `recordInference` can attribute the
+// actual provider used for each turn (instead of falling back to
+// `cfg.active_backend`, which is the user's *selected* backend, not the
+// provider the orchestrator's pool routed through). The CLI agent-loop path
+// still only emits "ollama" / "openrouter" / "claude_cli" — those are the
+// three the legacy `cfg.active_backend` value can be.
+export type Backend = "ollama" | "openrouter" | "claude_cli" | "opencode_zen" | "opencode_go";
+
+/**
+ * Map a provider string from the orchestrator's pool (`poolProvider`,
+ * `actualProviderUsed`) to the `Backend` enum used by `recordInference`. The
+ * pool emits provider names from `OrchestratorAgent.provider` (openrouter,
+ * opencode_zen, opencode_go); `cfg.active_backend` emits the three legacy
+ * "selected backend" values (ollama, openrouter, claude_cli). The two sets
+ * overlap on "openrouter" and "ollama" but the opencode providers are pool-
+ * only and would otherwise be silently re-bucketed to "openrouter" by an
+ * unguarded cast.
+ *
+ * The optional `fallback` covers the case where the orchestrator failed
+ * before it ever recorded a provider (network unreachable on the first
+ * attempt, config not loaded, etc.) — we fall back to the user's selected
+ * backend rather than fabricating a value.
+ */
+export function backendForProvider(
+  provider: string | undefined,
+  fallback?: string,
+): Backend {
+  switch (provider) {
+    case "ollama":
+    case "openrouter":
+    case "claude_cli":
+    case "opencode_zen":
+    case "opencode_go":
+      return provider;
+    default:
+      if (fallback === "ollama") return "ollama";
+      if (fallback === "claude_cli") return "claude_cli";
+      return "openrouter";
+  }
+}
 
 export interface InferenceRecord {
   ts: number;       // unix ms

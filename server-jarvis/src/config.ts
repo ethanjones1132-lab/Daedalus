@@ -134,10 +134,95 @@ export interface CompanionConfig {
   rarity: string;
 }
 
+/**
+ * Local persistent Conductor (Phase 1) — Fugu-style coordinator that runs as a
+ * warm Ollama process with per-session message/KV state instead of a cold API
+ * call each turn.
+ */
+export type ConductorOutputMode = "tool_call" | "json_schema" | "prompt";
+
+export interface ConductorConfig {
+  /** When true, coordinator routing uses the local Ollama conductor model. */
+  enabled: boolean;
+  /** Primary local conductor model (Gemma 4 E2B recommended). */
+  model: string;
+  /** Secondary local model when the primary is not installed (Gemma 4 E4B). */
+  fallback_model: string;
+  /** Override Ollama base URL; blank inherits `ollama.base_url`. */
+  base_url: string;
+  /**
+   * How routing JSON is emitted. Gemma 4 supports native `tool_call` and
+   * `json_schema`; `prompt` is the legacy prompt-only path.
+   */
+  output_mode: ConductorOutputMode;
+  temperature: number;
+  top_p: number;
+  top_k: number;
+  max_tokens: number;
+  /** Context window budget for the warm conductor prefix (Gemma 4 supports 128K). */
+  num_ctx: number;
+  /** Fall back to the API coordinator pool when local inference fails. */
+  fallback_to_api: boolean;
+  /** Prune in-memory sessions inactive longer than this (ms). */
+  session_ttl_ms: number;
+  /** Max coordinator turn pairs kept in the hot prefix before pruning oldest. */
+  max_turns_in_cache: number;
+  /** Persist session message state to disk for restart recovery. */
+  persist_sessions: boolean;
+  /** Persist conductor KV/session metadata alongside message history. */
+  kv_persist: boolean;
+  /** KV backend implementation (Ollama message-prefix reuse today). */
+  kv_backend: "ollama";
+}
+
+/** Skill distillation from successful orchestrator trajectories (Track C). */
+export interface SkillDistillationConfig {
+  enabled: boolean;
+  /** Minimum extractor confidence before writing a candidate. */
+  min_confidence: number;
+  /** Eval score delta required for auto-promotion (0–1). */
+  promotion_eval_delta: number;
+  /** Max distilled skill candidates retained on disk. */
+  max_candidates: number;
+}
+
+/** Inter-workflow shared memory for tool results, file snapshots, and failures. */
+export interface SessionMemoryConfig {
+  enabled: boolean;
+  tool_result_ttl_ms: number;
+  max_tool_results: number;
+  max_file_snapshots: number;
+  max_failure_patterns: number;
+  session_ttl_ms: number;
+  persist: boolean;
+}
+
+/**
+ * Phase 4 learning loop — observational telemetry, heuristic pool tuning,
+ * instruction A/B, and trajectory export for future GRPO training.
+ */
+export interface ConductorLearningConfig {
+  enabled: boolean;
+  /** Minimum samples before capability / fallback heuristics apply. */
+  min_samples_for_heuristics: number;
+  /** Per-optimization capability delta magnitude (0–0.1). */
+  capability_adjustment_step: number;
+  /** Persist multi-turn conductor + pipeline trajectories for GRPO export. */
+  trajectory_export: boolean;
+  /** Epsilon-greedy exploration rate for worker-instruction A/B. */
+  instruction_ab_epsilon: number;
+  /** Max trajectories retained (oldest pruned). */
+  max_trajectory_snapshots: number;
+}
+
 export interface OrchestratorConfig {
   enabled: boolean;
   agents: OrchestratorAgent[];
   max_recursion_depth: number;
+  conductor: ConductorConfig;
+  session_memory: SessionMemoryConfig;
+  conductor_learning: ConductorLearningConfig;
+  skill_distillation: SkillDistillationConfig;
 }
 
 export interface JarvisConfig {
@@ -301,6 +386,47 @@ export function defaultConfig(): JarvisConfig {
       enabled: true,
       agents: DEFAULT_ORCHESTRATOR_AGENTS,
       max_recursion_depth: 2,
+      conductor: {
+        enabled: true,
+        model: "gemma4:e2b",
+        fallback_model: "gemma4:e4b",
+        base_url: "",
+        output_mode: "tool_call",
+        temperature: 1.0,
+        top_p: 0.95,
+        top_k: 64,
+        max_tokens: 700,
+        num_ctx: 8192,
+        fallback_to_api: true,
+        session_ttl_ms: 30 * 60 * 1000,
+        max_turns_in_cache: 12,
+        persist_sessions: true,
+        kv_persist: true,
+        kv_backend: "ollama",
+      },
+      session_memory: {
+        enabled: true,
+        tool_result_ttl_ms: 30 * 60 * 1000,
+        max_tool_results: 128,
+        max_file_snapshots: 64,
+        max_failure_patterns: 32,
+        session_ttl_ms: 30 * 60 * 1000,
+        persist: true,
+      },
+      conductor_learning: {
+        enabled: true,
+        min_samples_for_heuristics: 5,
+        capability_adjustment_step: 0.03,
+        trajectory_export: true,
+        instruction_ab_epsilon: 0.15,
+        max_trajectory_snapshots: 500,
+      },
+      skill_distillation: {
+        enabled: true,
+        min_confidence: 0.55,
+        promotion_eval_delta: 0.02,
+        max_candidates: 200,
+      },
     },
     system_prompt: `You are Jarvis, a local AI coding assistant running on Qwen 3.5 9B in WSL2.
 Workspace: \`/home/ethan/.openclaw/agents/coderclaw/workspace/home-base\`.

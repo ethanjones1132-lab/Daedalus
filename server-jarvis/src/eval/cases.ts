@@ -11,6 +11,7 @@
 
 import type { RoutingResult } from "../orchestration/router";
 import type { StageName, Topology, TaskType } from "../orchestration/coordinator";
+import type { SkillCandidate } from "../intelligence/skill-types";
 
 export const DEFAULT_PIPELINE = ["planner", "executor", "reviewer", "synthesizer"];
 
@@ -364,4 +365,70 @@ export const AGENT_POOL_CASES: AgentPoolCase[] = [
   { id: "pool/executor-stage-covered", kind: "agent_pool", check: "executor_stage_covered" },
   { id: "pool/code-strong-diversity-gte-3", kind: "agent_pool", check: "code_strong_diversity_gte_3" },
   { id: "pool/reasoning-strong-diversity-gte-3", kind: "agent_pool", check: "reasoning_strong_diversity_gte_3" },
+];
+
+// ── Skill distillation trigger / regression cases (Track C) ───────────────────
+
+export interface SkillCase {
+  id: string;
+  kind: "skill_trigger" | "skill_regression";
+  message: string;
+  taskType: TaskType;
+  fixture: SkillCandidate;
+  expect: {
+    matchedMin?: number;
+    matchedMax?: number;
+    promptContains?: string;
+  };
+}
+
+const nowIso = "2026-06-28T00:00:00.000Z";
+
+export const SKILL_CASES: SkillCase[] = [
+  {
+    id: "skill/trigger-debug-promoted",
+    kind: "skill_trigger",
+    message: "fix the auth bug in src/auth.ts",
+    taskType: "debug",
+    fixture: {
+      id: "eval_skill_debug",
+      name: "eval-distilled-debug",
+      description: "eval fixture",
+      trigger: {
+        task_types: ["debug"],
+        requirements: ["full_execution"],
+        signals: ["mutation_verb"],
+      },
+      body: "# Debug pattern\nAlways read failing tests first.",
+      source_run_ids: ["eval_run"],
+      confidence: 0.85,
+      status: "promoted",
+      created_at: nowIso,
+      updated_at: nowIso,
+    },
+    expect: { matchedMin: 1, promptContains: "eval-distilled-debug" },
+  },
+  {
+    id: "skill/regression-candidate-not-injected",
+    kind: "skill_regression",
+    message: "refactor the login handler",
+    taskType: "refactor",
+    fixture: {
+      id: "eval_skill_candidate_only",
+      name: "eval-distilled-refactor-candidate",
+      description: "eval fixture",
+      trigger: {
+        task_types: ["refactor"],
+        requirements: ["full_execution"],
+        signals: [],
+      },
+      body: "Candidate-only body — must not inject.",
+      source_run_ids: ["eval_run"],
+      confidence: 0.9,
+      status: "candidate",
+      created_at: nowIso,
+      updated_at: nowIso,
+    },
+    expect: { matchedMax: 0 },
+  },
 ];

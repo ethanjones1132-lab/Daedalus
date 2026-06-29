@@ -1,0 +1,56 @@
+/** Track A: conductor KV / prefix reuse observability. */
+
+export interface ConductorCacheRecord {
+  ts: number;
+  session_id: string;
+  turn_number: number;
+  model: string;
+  latency_ms: number;
+  ok: boolean;
+  conductor_cache_hit: boolean;
+  prefix_tokens_estimated: number;
+  delta_tokens_estimated: number;
+  prefix_tokens_recomputed: number;
+  kv_generation: number;
+}
+
+const RING_SIZE = 100;
+const ring: ConductorCacheRecord[] = [];
+let ringHead = 0;
+
+export function recordConductorCache(rec: ConductorCacheRecord): void {
+  ring[ringHead % RING_SIZE] = rec;
+  ringHead += 1;
+}
+
+export function conductorCacheSnapshot(): {
+  window_size: number;
+  cache_hit_rate: number;
+  avg_prefix_recomputed: number;
+  records: ConductorCacheRecord[];
+  generated_at: number;
+} {
+  const records = ringHead < RING_SIZE ? ring.slice(0, ringHead) : [
+    ...ring.slice(ringHead % RING_SIZE),
+    ...ring.slice(0, ringHead % RING_SIZE),
+  ];
+  const hits = records.filter((r) => r.conductor_cache_hit).length;
+  const prefixSum = records.reduce((s, r) => s + r.prefix_tokens_recomputed, 0);
+  return {
+    window_size: records.length,
+    cache_hit_rate: records.length ? hits / records.length : 0,
+    avg_prefix_recomputed: records.length ? prefixSum / records.length : 0,
+    records: records.slice(-20),
+    generated_at: Date.now(),
+  };
+}
+
+export function __resetConductorCacheMetricsForTests(): void {
+  ring.length = 0;
+  ringHead = 0;
+}
+
+/** Rough token estimate (matches pipeline stage accounting). */
+export function estimateTokens(text: string): number {
+  return Math.max(1, Math.round(text.length / 4));
+}

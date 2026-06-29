@@ -1,5 +1,20 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { Coordinator, CoordinatorError, type ChatMessage } from "./coordinator";
+import {
+  PersistentConductor,
+  __resetPersistentConductorCachesForTests,
+} from "./persistent-conductor";
+import { __resetOllamaHealthCacheForTests } from "../ollama";
+import type { JarvisConfig } from "../config";
+import { defaultConfig } from "../config";
+
+const originalFetch = globalThis.fetch;
+
+afterEach(() => {
+  globalThis.fetch = originalFetch;
+  __resetPersistentConductorCachesForTests();
+  __resetOllamaHealthCacheForTests();
+});
 
 describe("Coordinator", () => {
   test("parses skip and re-enter decisions from coordinator JSON", async () => {
@@ -97,6 +112,129 @@ describe("Coordinator", () => {
 
     await coordinator.route("Summarize this repo and name one improvement", { sessionId: "triage-2" });
     expect(modelCalls).toBe(1);
+  });
+
+  test("uses local persistent conductor when Ollama is available", async () => {
+    let apiCalls = 0;
+    (globalThis as any).fetch = async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) {
+        return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      }
+      if (url.endsWith("/api/chat")) {
+        return Response.json({
+          message: {
+            role: "assistant",
+            content: "",
+            tool_calls: [{
+              function: {
+                name: "route_pipeline",
+                arguments: {
+                  task_type: "debug",
+                  pipeline: ["planner", "executor", "synthesizer"],
+                  topology: "linear",
+                  context: {
+                    needs_workspace_inspection: true,
+                    needs_memory: true,
+                    estimated_complexity: "high",
+                  },
+                  coordinator_rationale: "Local conductor route.",
+                },
+              },
+            }],
+          },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg: JarvisConfig = defaultConfig();
+    cfg.orchestrator.conductor.enabled = true;
+    cfg.orchestrator.conductor.persist_sessions = false;
+    const conductor = new PersistentConductor(() => cfg);
+    const coordinator = new Coordinator(async () => {
+      apiCalls += 1;
+      return { content: "{}" };
+    }, conductor);
+
+    const decision = await coordinator.route("Fix the auth module", { sessionId: "local-1" });
+
+    expect(apiCalls).toBe(0);
+    expect(decision.task_type).toBe("debug");
+    expect(decision.pipeline).toEqual(["planner", "executor", "synthesizer"]);
+  });
+
+  test("falls back to API coordinator when local conductor is unavailable", async () => {
+    (globalThis as any).fetch = async (input: string | URL) => {
+      const url = String(input);
+      if (url.includes("/api/tags")) {
+        return Response.json({ models: [] });
+      }
+      if (url.includes("/api/chat")) {
+        throw new Error("local chat unavailable");
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    let apiCalls = 0;
+    const cfg: JarvisConfig = defaultConfig();
+    cfg.orchestrator.conductor.enabled = true;
+    cfg.orchestrator.conductor.fallback_to_api = true;
+    const conductor = new PersistentConductor(() => cfg);
+    const coordinator = new Coordinator(async () => {
+      apiCalls += 1;
+      return {
+        content: JSON.stringify({
+          task_type: "general",
+          pipeline: ["synthesizer"],
+          topology: "linear",
+          context: {
+            needs_workspace_inspection: false,
+            needs_memory: true,
+            estimated_complexity: "low",
+          },
+          coordinator_rationale: "API fallback.",
+        }),
+      };
+    }, conductor);
+
+    await coordinator.route("Summarize the auth module and list one fix", { sessionId: "fallback-1" });
+    expect(apiCalls).toBe(1);
+  });
+
+  test("parses optional worker_instructions and shared_context", async () => {
+    const coordinator = new Coordinator(async () => ({
+      content: JSON.stringify({
+        task_type: "debug",
+        pipeline: ["planner", "executor", "synthesizer"],
+        topology: "linear",
+        context: {
+          needs_workspace_inspection: true,
+          needs_memory: true,
+          estimated_complexity: "high",
+        },
+        coordinator_rationale: "Needs targeted debugging guidance.",
+        worker_instructions: {
+          planner: "  Inspect server-jarvis/src/index.ts first. ",
+          executor: "Run read_file on the orchestrator path, then propose a minimal fix.",
+          synthesizer: "",
+        },
+        shared_context: {
+          relevant_memories: ["Prior turn hit empty_completion on synthesizer."],
+          failure_patterns: ["Do not route file reads to synthesizer-only."],
+          prior_tool_results: { "grep:coordinator": "3 matches in orchestration/" },
+        },
+      }),
+    }));
+
+    const decision = await coordinator.route("Debug the orchestrator routing path", { sessionId: "worker-inst-1" });
+
+    expect(decision.worker_instructions?.planner).toContain("index.ts");
+    expect(decision.worker_instructions?.executor).toContain("read_file");
+    expect(decision.worker_instructions?.synthesizer).toBeUndefined();
+    expect(decision.shared_context?.relevant_memories).toHaveLength(1);
+    expect(decision.shared_context?.failure_patterns?.[0]).toContain("synthesizer-only");
+    expect(decision.shared_context?.prior_tool_results?.["grep:coordinator"]).toContain("matches");
   });
 
   test("suppresses coordinator activity from the user-visible stream", async () => {

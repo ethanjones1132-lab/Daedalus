@@ -41,3 +41,6 @@ DumpStack.log
 # --- Local UI-automation diagnostic scratch (SkyLocal / ad-hoc screenshot helpers) ---
 sky-*.jpg
 sky-interact.mjs
+
+# --- Conductor terminal session runtime state (PIDs, CWD tracking) ---
+terminals/

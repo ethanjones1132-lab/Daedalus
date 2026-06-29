@@ -176,6 +176,68 @@ describe("orchestrator agent pool config", () => {
     expect(cfg.orchestrator.max_recursion_depth).toBe(2);
   });
 
+  test("defaultConfig uses Gemma 4 E2B as the local persistent conductor", () => {
+    const conductor = defaultConfig().orchestrator.conductor;
+    expect(conductor.model).toBe("gemma4:e2b");
+    expect(conductor.fallback_model).toBe("gemma4:e4b");
+    expect(conductor.output_mode).toBe("tool_call");
+    expect(conductor.enabled).toBe(true);
+  });
+
+  test("normalizeConfig fills in missing conductor settings", () => {
+    const cfg = normalizeConfig({ orchestrator: { enabled: true } });
+    expect(cfg.orchestrator.conductor.model).toBe("gemma4:e2b");
+    expect(cfg.orchestrator.conductor.fallback_model).toBe("gemma4:e4b");
+    expect(cfg.orchestrator.conductor.output_mode).toBe("tool_call");
+  });
+
+  test("defaultConfig enables conductor KV persistence (Track A)", () => {
+    const conductor = defaultConfig().orchestrator.conductor;
+    expect(conductor.kv_persist).toBe(true);
+    expect(conductor.kv_backend).toBe("ollama");
+  });
+
+  test("normalizeConfig fills in missing conductor KV settings", () => {
+    const cfg = normalizeConfig({ orchestrator: { enabled: true } });
+    expect(cfg.orchestrator.conductor.kv_persist).toBe(true);
+    expect(cfg.orchestrator.conductor.kv_backend).toBe("ollama");
+  });
+
+  test("defaultConfig enables skill distillation (Track C)", () => {
+    const distillation = defaultConfig().orchestrator.skill_distillation;
+    expect(distillation.enabled).toBe(true);
+    expect(distillation.min_confidence).toBeGreaterThan(0);
+    expect(distillation.promotion_eval_delta).toBeGreaterThan(0);
+    expect(distillation.max_candidates).toBeGreaterThan(0);
+  });
+
+  test("normalizeConfig fills in missing skill distillation settings", () => {
+    const cfg = normalizeConfig({ orchestrator: { enabled: true } });
+    expect(cfg.orchestrator.skill_distillation.enabled).toBe(true);
+    expect(cfg.orchestrator.skill_distillation.min_confidence).toBe(0.55);
+    expect(cfg.orchestrator.skill_distillation.max_candidates).toBe(200);
+  });
+
+  test("defaultConfig enables orchestrator session memory", () => {
+    const memory = defaultConfig().orchestrator.session_memory;
+    expect(memory.enabled).toBe(true);
+    expect(memory.persist).toBe(true);
+    expect(memory.max_tool_results).toBeGreaterThan(0);
+  });
+
+  test("defaultConfig enables Phase 4 conductor learning loop", () => {
+    const learning = defaultConfig().orchestrator.conductor_learning;
+    expect(learning.enabled).toBe(true);
+    expect(learning.trajectory_export).toBe(true);
+    expect(learning.min_samples_for_heuristics).toBeGreaterThan(0);
+  });
+
+  test("normalizeConfig fills in missing conductor learning settings", () => {
+    const cfg = normalizeConfig({ orchestrator: { enabled: true } });
+    expect(cfg.orchestrator.conductor_learning.enabled).toBe(true);
+    expect(cfg.orchestrator.conductor_learning.instruction_ab_epsilon).toBeGreaterThan(0);
+  });
+
   test("explicit orchestrator agents survive normalization", () => {
     const cfg = normalizeConfig({
       orchestrator: {

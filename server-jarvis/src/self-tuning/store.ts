@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import { Database, SQLQueryBindings } from "bun:sqlite";
 import { existsSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
 import { homedir } from "os";
@@ -59,6 +59,83 @@ export interface TuningOutcome {
   token_delta?: number;
   success_rate_delta?: number;
   measured_at?: string;
+}
+
+/** Phase 4: conductor routing decision paired with eventual pipeline outcome. */
+export interface ConductorRun {
+  id: string;
+  agent_run_id: string;
+  session_id: string;
+  routing_json: string;
+  conductor_source: string;
+  conductor_model?: string;
+  task_type: string;
+  topology: string;
+  pipeline_json: string;
+  normalized_pipeline_json?: string;
+  route_source?: string;
+  run_outcome?: string;
+  created_at?: string;
+}
+
+/** Phase 4: worker instruction variant → stage outcome. */
+export interface WorkerInstructionOutcome {
+  id: string;
+  agent_run_id: string;
+  stage_id: string;
+  instruction_hash: string;
+  instruction_variant: string;
+  instruction_text?: string;
+  was_successful: number;
+  had_error: number;
+  created_at?: string;
+}
+
+/** Phase 4: model/provider attribution per pipeline stage. */
+export interface ModelAttribution {
+  id: string;
+  agent_run_id: string;
+  stage_id: string;
+  agent_id?: string;
+  provider: string;
+  model_id: string;
+  was_successful: number;
+  had_error: number;
+  duration_ms?: number;
+  fallback_used: number;
+  created_at?: string;
+}
+
+/** Phase 4: multi-turn trajectory for future GRPO training. */
+export interface TrajectorySnapshot {
+  id: string;
+  agent_run_id: string;
+  session_id: string;
+  snapshot_json: string;
+  created_at?: string;
+}
+
+/** Phase 4: rolling agent performance aggregates. */
+export interface AgentPerformanceRow {
+  agent_id: string;
+  stage_id: string;
+  task_type: string;
+  success_count: number;
+  failure_count: number;
+  total_duration_ms: number;
+  sample_count: number;
+  last_updated?: string;
+}
+
+/** Phase 4: instruction variant bandit stats. */
+export interface InstructionVariantRow {
+  variant_id: string;
+  stage_id: string;
+  task_type: string;
+  success_count: number;
+  failure_count: number;
+  sample_count: number;
+  last_updated?: string;
 }
 
 function getWindowsHome(): string | null {
@@ -166,6 +243,77 @@ const SELF_TUNING_SCHEMA = `
     measured_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   );
   CREATE INDEX IF NOT EXISTS idx_tuning_outcomes_proposal_id ON tuning_outcomes(proposal_id);
+  CREATE TABLE IF NOT EXISTS conductor_runs (
+    id TEXT PRIMARY KEY,
+    agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    routing_json TEXT NOT NULL,
+    conductor_source TEXT NOT NULL,
+    conductor_model TEXT,
+    task_type TEXT NOT NULL,
+    topology TEXT NOT NULL,
+    pipeline_json TEXT NOT NULL,
+    normalized_pipeline_json TEXT,
+    route_source TEXT,
+    run_outcome TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_conductor_runs_agent_run_id ON conductor_runs(agent_run_id);
+  CREATE TABLE IF NOT EXISTS worker_instruction_outcomes (
+    id TEXT PRIMARY KEY,
+    agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+    stage_id TEXT NOT NULL,
+    instruction_hash TEXT NOT NULL,
+    instruction_variant TEXT NOT NULL,
+    instruction_text TEXT,
+    was_successful INTEGER NOT NULL DEFAULT 0,
+    had_error INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_worker_instruction_outcomes_agent_run_id ON worker_instruction_outcomes(agent_run_id);
+  CREATE TABLE IF NOT EXISTS model_attributions (
+    id TEXT PRIMARY KEY,
+    agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+    stage_id TEXT NOT NULL,
+    agent_id TEXT,
+    provider TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    was_successful INTEGER NOT NULL DEFAULT 0,
+    had_error INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER,
+    fallback_used INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_model_attributions_agent_run_id ON model_attributions(agent_run_id);
+  CREATE TABLE IF NOT EXISTS trajectory_snapshots (
+    id TEXT PRIMARY KEY,
+    agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_trajectory_snapshots_agent_run_id ON trajectory_snapshots(agent_run_id);
+  CREATE TABLE IF NOT EXISTS agent_performance (
+    agent_id TEXT NOT NULL,
+    stage_id TEXT NOT NULL,
+    task_type TEXT NOT NULL,
+    success_count INTEGER NOT NULL DEFAULT 0,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    total_duration_ms INTEGER NOT NULL DEFAULT 0,
+    sample_count INTEGER NOT NULL DEFAULT 0,
+    last_updated TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (agent_id, stage_id, task_type)
+  );
+  CREATE TABLE IF NOT EXISTS instruction_variant_stats (
+    variant_id TEXT NOT NULL,
+    stage_id TEXT NOT NULL,
+    task_type TEXT NOT NULL,
+    success_count INTEGER NOT NULL DEFAULT 0,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    sample_count INTEGER NOT NULL DEFAULT 0,
+    last_updated TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (variant_id, stage_id, task_type)
+  );
 `;
 
 const schemaEnsuredPaths = new Set<string>();
@@ -400,6 +548,268 @@ export class SelfTuningStore {
       db.prepare("UPDATE agent_runs SET user_rating = ? WHERE id = ?").run(rating, runId);
     } catch (e) {
       console.error("[SelfTuningStore] updateUserRating failed:", e);
+    } finally {
+      db.close();
+    }
+  }
+
+  insertConductorRun(run: ConductorRun): void {
+    const db = this.getDb();
+    if (!db) return;
+    try {
+      db.prepare(
+        `INSERT INTO conductor_runs (id, agent_run_id, session_id, routing_json, conductor_source, conductor_model, task_type, topology, pipeline_json, normalized_pipeline_json, route_source, run_outcome)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        run.id,
+        run.agent_run_id,
+        run.session_id,
+        run.routing_json,
+        run.conductor_source,
+        run.conductor_model ?? null,
+        run.task_type,
+        run.topology,
+        run.pipeline_json,
+        run.normalized_pipeline_json ?? null,
+        run.route_source ?? null,
+        run.run_outcome ?? null,
+      );
+    } catch (e) {
+      console.error("[SelfTuningStore] insertConductorRun failed:", e);
+    } finally {
+      db.close();
+    }
+  }
+
+  updateConductorRun(id: string, updates: Partial<ConductorRun>): void {
+    const db = this.getDb();
+    if (!db) return;
+    try {
+      const keys = Object.keys(updates);
+      if (keys.length === 0) return;
+      const setClause = keys.map((k) => `${k} = ?`).join(", ");
+      const params = keys.map((k) => (updates as Record<string, unknown>)[k]);
+      params.push(id);
+      db.prepare(`UPDATE conductor_runs SET ${setClause} WHERE id = ?`).run(...(params as unknown as SQLQueryBindings[]));
+    } catch (e) {
+      console.error("[SelfTuningStore] updateConductorRun failed:", e);
+    } finally {
+      db.close();
+    }
+  }
+
+  insertWorkerInstructionOutcome(row: WorkerInstructionOutcome): void {
+    const db = this.getDb();
+    if (!db) return;
+    try {
+      db.prepare(
+        `INSERT INTO worker_instruction_outcomes (id, agent_run_id, stage_id, instruction_hash, instruction_variant, instruction_text, was_successful, had_error)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        row.id,
+        row.agent_run_id,
+        row.stage_id,
+        row.instruction_hash,
+        row.instruction_variant,
+        row.instruction_text ?? null,
+        row.was_successful,
+        row.had_error,
+      );
+    } catch (e) {
+      console.error("[SelfTuningStore] insertWorkerInstructionOutcome failed:", e);
+    } finally {
+      db.close();
+    }
+  }
+
+  insertModelAttribution(row: ModelAttribution): void {
+    const db = this.getDb();
+    if (!db) return;
+    try {
+      db.prepare(
+        `INSERT INTO model_attributions (id, agent_run_id, stage_id, agent_id, provider, model_id, was_successful, had_error, duration_ms, fallback_used)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        row.id,
+        row.agent_run_id,
+        row.stage_id,
+        row.agent_id ?? null,
+        row.provider,
+        row.model_id,
+        row.was_successful,
+        row.had_error,
+        row.duration_ms ?? null,
+        row.fallback_used,
+      );
+    } catch (e) {
+      console.error("[SelfTuningStore] insertModelAttribution failed:", e);
+    } finally {
+      db.close();
+    }
+  }
+
+  insertTrajectorySnapshot(snapshot: TrajectorySnapshot): void {
+    const db = this.getDb();
+    if (!db) return;
+    try {
+      db.prepare(
+        `INSERT INTO trajectory_snapshots (id, agent_run_id, session_id, snapshot_json)
+         VALUES (?, ?, ?, ?)`,
+      ).run(snapshot.id, snapshot.agent_run_id, snapshot.session_id, snapshot.snapshot_json);
+    } catch (e) {
+      console.error("[SelfTuningStore] insertTrajectorySnapshot failed:", e);
+    } finally {
+      db.close();
+    }
+  }
+
+  pruneTrajectorySnapshots(maxRows: number): void {
+    const db = this.getDb();
+    if (!db) return;
+    try {
+      const count = (db.query("SELECT COUNT(*) as c FROM trajectory_snapshots").get() as { c: number }).c;
+      if (count <= maxRows) return;
+      const excess = count - maxRows;
+      db.prepare(
+        `DELETE FROM trajectory_snapshots WHERE id IN (
+          SELECT id FROM trajectory_snapshots ORDER BY created_at ASC LIMIT ?
+        )`,
+      ).run(excess);
+    } catch (e) {
+      console.error("[SelfTuningStore] pruneTrajectorySnapshots failed:", e);
+    } finally {
+      db.close();
+    }
+  }
+
+  upsertAgentPerformance(
+    agentId: string,
+    stageId: string,
+    taskType: string,
+    success: boolean,
+    durationMs: number,
+  ): void {
+    const db = this.getDb();
+    if (!db) return;
+    try {
+      db.prepare(
+        `INSERT INTO agent_performance (agent_id, stage_id, task_type, success_count, failure_count, total_duration_ms, sample_count)
+         VALUES (?, ?, ?, ?, ?, ?, 1)
+         ON CONFLICT(agent_id, stage_id, task_type) DO UPDATE SET
+           success_count = success_count + excluded.success_count,
+           failure_count = failure_count + excluded.failure_count,
+           total_duration_ms = total_duration_ms + excluded.total_duration_ms,
+           sample_count = sample_count + 1,
+           last_updated = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
+      ).run(
+        agentId,
+        stageId,
+        taskType,
+        success ? 1 : 0,
+        success ? 0 : 1,
+        durationMs,
+      );
+    } catch (e) {
+      console.error("[SelfTuningStore] upsertAgentPerformance failed:", e);
+    } finally {
+      db.close();
+    }
+  }
+
+  upsertInstructionVariantStats(
+    variantId: string,
+    stageId: string,
+    taskType: string,
+    success: boolean,
+  ): void {
+    const db = this.getDb();
+    if (!db) return;
+    try {
+      db.prepare(
+        `INSERT INTO instruction_variant_stats (variant_id, stage_id, task_type, success_count, failure_count, sample_count)
+         VALUES (?, ?, ?, ?, ?, 1)
+         ON CONFLICT(variant_id, stage_id, task_type) DO UPDATE SET
+           success_count = success_count + excluded.success_count,
+           failure_count = failure_count + excluded.failure_count,
+           sample_count = sample_count + 1,
+           last_updated = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
+      ).run(variantId, stageId, taskType, success ? 1 : 0, success ? 0 : 1);
+    } catch (e) {
+      console.error("[SelfTuningStore] upsertInstructionVariantStats failed:", e);
+    } finally {
+      db.close();
+    }
+  }
+
+  getAgentPerformance(taskType?: string): AgentPerformanceRow[] {
+    const db = this.getDb();
+    if (!db) return [];
+    try {
+      if (taskType) {
+        return db.query("SELECT * FROM agent_performance WHERE task_type = ?").all(taskType) as AgentPerformanceRow[];
+      }
+      return db.query("SELECT * FROM agent_performance").all() as AgentPerformanceRow[];
+    } catch (e) {
+      console.error("[SelfTuningStore] getAgentPerformance failed:", e);
+      return [];
+    } finally {
+      db.close();
+    }
+  }
+
+  getInstructionVariantStats(taskType?: string): InstructionVariantRow[] {
+    const db = this.getDb();
+    if (!db) return [];
+    try {
+      if (taskType) {
+        return db.query("SELECT * FROM instruction_variant_stats WHERE task_type = ?").all(taskType) as InstructionVariantRow[];
+      }
+      return db.query("SELECT * FROM instruction_variant_stats").all() as InstructionVariantRow[];
+    } catch (e) {
+      console.error("[SelfTuningStore] getInstructionVariantStats failed:", e);
+      return [];
+    } finally {
+      db.close();
+    }
+  }
+
+  getConductorRuns(agentRunId?: string): ConductorRun[] {
+    const db = this.getDb();
+    if (!db) return [];
+    try {
+      if (agentRunId) {
+        return db.query("SELECT * FROM conductor_runs WHERE agent_run_id = ?").all(agentRunId) as ConductorRun[];
+      }
+      return db.query("SELECT * FROM conductor_runs ORDER BY created_at DESC").all() as ConductorRun[];
+    } catch (e) {
+      console.error("[SelfTuningStore] getConductorRuns failed:", e);
+      return [];
+    } finally {
+      db.close();
+    }
+  }
+
+  getModelAttributions(agentRunId: string): ModelAttribution[] {
+    const db = this.getDb();
+    if (!db) return [];
+    try {
+      return db.query("SELECT * FROM model_attributions WHERE agent_run_id = ?").all(agentRunId) as ModelAttribution[];
+    } catch (e) {
+      console.error("[SelfTuningStore] getModelAttributions failed:", e);
+      return [];
+    } finally {
+      db.close();
+    }
+  }
+
+  getTrajectorySnapshots(limit = 50): TrajectorySnapshot[] {
+    const db = this.getDb();
+    if (!db) return [];
+    try {
+      return db.query("SELECT * FROM trajectory_snapshots ORDER BY created_at DESC LIMIT ?").all(limit) as TrajectorySnapshot[];
+    } catch (e) {
+      console.error("[SelfTuningStore] getTrajectorySnapshots failed:", e);
+      return [];
     } finally {
       db.close();
     }

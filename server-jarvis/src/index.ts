@@ -38,7 +38,7 @@ import {
 } from "./openrouter";
 import type { OpenRouterCostInfo } from "./openrouter";
 import { resolveProviderTarget, providerChatUrl, providerHeaders } from "./providers";
-import { recordInference, inferenceMetricsSnapshot, type Backend } from "./inference-metrics";
+import { recordInference, inferenceMetricsSnapshot, backendForProvider, type Backend } from "./inference-metrics";
 import { createApprovalRegistry } from "./approval-registry";
 
 // One process-level approval registry: the chat surface emits
@@ -67,11 +67,20 @@ import { searchWeb } from "./web-bundle";
 import { getSessionState, clearSessionState } from "./interactive-bundle";
 import { StreamSession, VisibleTextPipe } from "./stream-emitter";
 import { Coordinator } from "./orchestration/coordinator";
+import { PersistentConductor } from "./orchestration/persistent-conductor";
+import { SessionMemory, mergeSharedContextHints } from "./orchestration/session-memory";
 import { AgentPool, firstTokenTimeoutFor, formatPoolDiversity } from "./orchestration/agent-pool";
 import { PipelineExecutor } from "./orchestration/pipeline";
 import { classifyTurnRequirements } from "./orchestration/turn-requirements";
 import { normalizeRoute, type ExecutionProfile } from "./orchestration/route-normalization";
-import { outcomeCollector, selfTuningProposer, SelfTuningStore } from "./self-tuning/mod";
+import { conductorLearning, outcomeCollector, selfTuningProposer, SelfTuningStore } from "./self-tuning/mod";
+import { conductorCacheSnapshot } from "./orchestration/conductor-metrics";
+import {
+  distillSkillCandidate,
+  listSkillCandidates,
+  resolveSkillsForTurn,
+  runSkillPromotionPass,
+} from "./intelligence/mod";
 import { normalizeStreamedToolCalls } from "./streaming-tool-calls";
 
 // ── Structured Logging Override ──────────────────────────────────────────────
@@ -343,6 +352,12 @@ export function saveCompanionState(state: CompanionState): void {
 // ── Constants ──
 // ═══════════════════════════════════════════════════════════════
 const PORT = Number(process.env.JARVIS_SERVER_PORT ?? 19877);
+
+/** Process-wide local conductor — maintains per-session Ollama prefix state. */
+const persistentConductor = new PersistentConductor(loadConfig);
+
+/** Inter-workflow shared memory — tool results, file snapshots, failure patterns. */
+const sessionMemory = new SessionMemory(() => loadConfig().orchestrator.session_memory);
 if (!Number.isInteger(PORT) || PORT <= 0 || PORT > 65535) {
   throw new Error(`JARVIS_SERVER_PORT must be an integer between 1 and 65535, got ${process.env.JARVIS_SERVER_PORT}`);
 }
@@ -1016,6 +1031,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     let sessionCostInfo: OpenRouterCostInfo | null = null;
     let lastFallbackRetries = 0;
     let lastFallbackModel: string | undefined;
+    // Track the actual provider the fallback cascade engaged for THIS turn so
+    // the per-turn `recordInference` call can attribute the request to the
+    // real backend. The cascade can hop from openrouter → opencode_zen →
+    // opencode_go (the 2026-06-24 cross-provider fallback) and `cfg.active_backend`
+    // alone would mis-bucket every non-openrouter turn as "openrouter".
+    let lastProviderUsed: string | undefined;
+    // Hoisted to the outer try scope so the catch block's recordInference call
+    // can read them — the per-turn `actualModelUsed`/`fetchRes` are declared
+    // inside the `while` loop body, which is invisible to a sibling catch.
+    let lastActualModelUsed: string | undefined;
     try {
       const systemPrompt = options.systemPromptOverride ?? cfg.system_prompt;
       const isOllama = cfg.active_backend === "ollama";
@@ -1157,7 +1182,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       // ── Orchestrator path (PAMO-SET Phase 2) ─────────────────────
       if (cfg.orchestrator?.enabled) {
         console.log(`[Jarvis Orchestrator] Starting session=${sessionId}`);
-        const agentPool = new AgentPool(cfg.orchestrator.agents ?? []);
+        conductorLearning.setConfig(cfg.orchestrator.conductor_learning);
+        const pruned = persistentConductor.pruneExpiredDiskSessions();
+        if (pruned > 0) {
+          console.log(`[Jarvis Orchestrator] Pruned ${pruned} expired conductor session file(s)`);
+        }
+        const agentPool = new AgentPool(conductorLearning.applyLearnedAgents(cfg.orchestrator.agents ?? []));
         const poolCoverage = agentPool.coverage();
         console.log(`[Jarvis Orchestrator] Agent pool coverage: ${formatPoolDiversity(poolCoverage)}${poolCoverage.stage_gaps.length > 0 ? `; gaps=${poolCoverage.stage_gaps.join(",")}` : ""}`);
 
@@ -1176,7 +1206,17 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // single model call; the `callModel` wrapper below adds a bounded
         // empty-completion retry that ADVANCES the provider cascade (the
         // synthesizer must never silently return nothing).
+        // Track the actual model + provider used by the last `callModelAttempt`
+        // invocation so the orchestrator's `recordInference` error/empty paths
+        // (lines 1734/1754) can attribute the turn to the real provider, not
+        // the user's selected `cfg.active_backend`. The pool routes through
+        // opencode_zen/opencode_go for planner/executor/synthesizer defaults,
+        // and those paths are otherwise invisible to `/health/inference`.
+        let orchLastModel: string | undefined;
+        let orchLastProvider: string | undefined;
+        let orchestratorAgentRunId: string | undefined;
         const callModelAttempt = async (messages: any[], callOptions?: any, excludeModels?: Set<string>) => {
+          const stageAttemptStart = Date.now();
           const isOllama = cfg.active_backend === "ollama";
           const ollamaTarget = isOllama ? await resolveOllamaChatTarget(cfg) : null;
 
@@ -1192,11 +1232,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // Provider of the pool-selected agent. Drives endpoint + key routing
           // for the primary request (the fallback cascade routes per-attempt).
           let poolProvider: "openrouter" | "opencode_zen" | "opencode_go" | null = null;
+          let poolResolvedAgent: import("./orchestration/agent-pool").OrchestratorAgent | undefined;
           const stageLabel = callOptions?.stageLabel as string | undefined;
           const cascadeTier = callOptions?.cascadeTier as "cheap" | "strong" | undefined;
           if (!isOllama && stageLabel && cfg.orchestrator?.enabled) {
             try {
-              const pool = new AgentPool(cfg.orchestrator?.agents ?? []);
+              const pool = new AgentPool(conductorLearning.applyLearnedAgents(cfg.orchestrator?.agents ?? []));
               let agent: import("./orchestration/agent-pool").OrchestratorAgent | undefined;
               // Honor the empty-completion cascade-advance exclude set: a model
               // that just returned an empty 200 (or hit a 2-strike rate limit)
@@ -1212,6 +1253,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               if (agent && (agent.provider === "openrouter" || agent.provider === "opencode_zen" || agent.provider === "opencode_go")) {
                 poolModel = agent.model_id;
                 poolProvider = agent.provider;
+                poolResolvedAgent = agent;
                 console.log(`[Jarvis Orchestrator] Pool resolved model ${agent.model_id} for stage=${stageLabel} cascadeTier=${cascadeTier ?? "none"} task=${orchestratorTaskType} agent=${agent.id} (provider=${agent.provider})`);
               }
             } catch (e: any) {
@@ -1577,6 +1619,36 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }
 
           const cleanContent = cfg.reasoning.enabled ? stripReasoningFromText(fullTurnText) : fullTurnText;
+          // Capture the actual provider/model used by this attempt so the
+          // orchestrator's `recordInference` error/empty paths can attribute
+          // the turn to the real backend (not the user's selected
+          // `cfg.active_backend`). The orchestrator's pool routinely routes
+          // through opencode_zen / opencode_go for planner/executor/synthesizer
+          // defaults — without this, all of those turns would be misattributed
+          // to "openrouter" in `/health/inference`.
+          orchLastModel = actualModelUsed;
+          orchLastProvider = actualProviderUsed;
+          if (
+            orchestratorAgentRunId &&
+            stageLabel &&
+            cfg.orchestrator?.conductor_learning?.enabled &&
+            actualModelUsed &&
+            actualProviderUsed
+          ) {
+            const hasContent = typeof cleanContent === "string" && cleanContent.trim().length > 0;
+            const hasToolCalls = parsedToolCalls.length > 0;
+            conductorLearning.recordStageModel({
+              agentRunId: orchestratorAgentRunId,
+              stageId: stageLabel,
+              agentId: poolResolvedAgent?.id,
+              provider: actualProviderUsed,
+              modelId: actualModelUsed,
+              durationMs: Date.now() - stageAttemptStart,
+              fallbackUsed: (excludeModels?.size ?? 0) > 0,
+              wasSuccessful: hasContent || hasToolCalls,
+              hadError: !hasContent && !hasToolCalls,
+            });
+          }
           return {
             content: cleanContent,
             tool_calls: parsedToolCalls.length > 0 ? parsedToolCalls : undefined,
@@ -1639,10 +1711,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // Route the user request through the Fugu-style coordinator. The
         // current executor still consumes a concrete stage list, so null skips
         // and re-entry directives are materialized at the activation boundary.
-        const coordinator = new Coordinator(callModel);
+        const coordinator = new Coordinator(callModel, persistentConductor);
+        const memoryHints = sessionMemory.toSharedContextHints(sessionId);
         const route = await coordinator.route(contextMessage, {
           sessionId,
           history: turnHistory,
+          lastOutcome: sessionMemory.getLastOutcome(sessionId),
+          sessionMemoryHints: memoryHints,
         });
         orchestratorTaskType = route.task_type;
 
@@ -1669,11 +1744,27 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
         // Initialize tuned configurations and start run in collector
         const agentRunId = `run_${crypto.randomUUID()}`;
+        orchestratorAgentRunId = agentRunId;
         selfTuningProposer.initializeTunedConfigs();
         outcomeCollector.startAgentRun(agentRunId, sessionId, contextMessage, route.task_type, executablePipeline);
+        const conductorRunId = conductorLearning.recordRouting({
+          agentRunId,
+          sessionId,
+          route,
+          normalizedPipeline: executablePipeline,
+          routeSource: normalized.route_source,
+          conductorSource: route.conductor_source ?? "api",
+          conductorModel: route.conductor_model,
+        });
+        const instructionSelection = conductorLearning.selectInstructionVariants(
+          route.worker_instructions,
+          route.task_type,
+        );
+        const resolvedSkills = resolveSkillsForTurn(message, route.task_type);
         const runStartTime = Date.now();
 
         // Execute the pipeline
+        const mergedSharedContext = mergeSharedContextHints(route.shared_context, memoryHints);
         const executor = new PipelineExecutor(callModel, runtime, ctx);
         const result = await executor.execute(contextMessage, executablePipeline, agentRunId, async (state) => {
           // Stream stage progress back to client
@@ -1686,6 +1777,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         }, {
           topology: normalized.topology,
           executionProfile,
+          workerInstructions: instructionSelection.instructions,
+          sharedContext: mergedSharedContext,
+          sessionMemory: sessionMemory,
+          distilledSkillsBlock: resolvedSkills.promptBlock,
           maxRecursionDepth: cfg.orchestrator.max_recursion_depth,
           onRecursion: async (event) => {
             await writer.write(encoder.encode(`data: ${JSON.stringify({
@@ -1702,11 +1797,15 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // Record metrics and propose tuning options
         const duration = Date.now() - runStartTime;
         let totalTokens = 0;
+        let totalTokensIn = 0;
+        let totalTokensOut = 0;
         let totalToolCalls = 0;
         try {
           const stages = outcomeCollector["store"].getStageRuns(agentRunId);
           for (const s of stages) {
-            totalTokens += (s.input_tokens || 0) + (s.output_tokens || 0);
+            totalTokensIn += s.input_tokens || 0;
+            totalTokensOut += s.output_tokens || 0;
+            totalTokens += totalTokensIn + totalTokensOut;
             if (s.tool_calls_json) {
               const parsed = JSON.parse(s.tool_calls_json);
               totalToolCalls += parsed.length;
@@ -1721,7 +1820,62 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const runOutcome: "success" | "degraded" | "failed" =
           result.outcome ?? (result.error || !trimmedAnswer ? "failed" : "success");
         const finalOutputForLog = trimmedAnswer || result.error || `(no output: ${result.error_code ?? "empty_completion"})`;
+        sessionMemory.recordPipelineOutcome(sessionId, {
+          outcome: runOutcome,
+          errorCode: result.error_code,
+          error: result.error,
+          answer: trimmedAnswer,
+        });
         outcomeCollector.completeAgentRun(agentRunId, finalOutputForLog, duration, totalToolCalls, totalTokens, runOutcome);
+        if (conductorRunId) {
+          const stageRuns = outcomeCollector["store"].getStageRuns(agentRunId);
+          const modelAttributions = outcomeCollector["store"].getModelAttributions(agentRunId);
+          conductorLearning.completeRun({
+            conductorRunId,
+            agentRunId,
+            sessionId,
+            taskType: route.task_type,
+            route,
+            runOutcome,
+            workerInstructions: route.worker_instructions,
+            instructionVariants: instructionSelection,
+            stageRuns,
+            modelAttributions,
+            durationMs: duration,
+            userRequest: contextMessage,
+          });
+          const heuristic = await conductorLearning.optimizeAndApply(
+            agentRunId,
+            route.task_type,
+            cfg.orchestrator.agents ?? [],
+          );
+          if (heuristic.proposals.length > 0) {
+            console.log(
+              `[Jarvis Orchestrator] Phase 4 heuristics applied: ${heuristic.proposals.length} proposals, ` +
+              `${heuristic.agentsAdjusted} agent adjustments, ${heuristic.fallbackBoostsApplied} fallback boosts`,
+            );
+          }
+        }
+        const distillCfg = cfg.orchestrator.skill_distillation;
+        if (distillCfg?.enabled && runOutcome === "success") {
+          const stageRunsForDistill = outcomeCollector["store"].getStageRuns(agentRunId);
+          const candidate = distillSkillCandidate({
+            agentRunId,
+            sessionId,
+            taskType: route.task_type,
+            userRequest: contextMessage,
+            workerInstructions: route.worker_instructions,
+            stageRuns: stageRunsForDistill,
+            runOutcome,
+          }, distillCfg);
+          if (candidate) {
+            const promoted = runSkillPromotionPass(distillCfg);
+            console.log(
+              `[Jarvis Orchestrator] Distilled skill candidate ${candidate.id} (confidence=${candidate.confidence.toFixed(2)}); ` +
+              `promoted=${promoted.length}`,
+            );
+          }
+        }
         await selfTuningProposer.proposeAndApply(agentRunId, route.task_type);
 
         // Write final done messages
@@ -1733,12 +1887,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           console.error(`[Jarvis Orchestrator] session=${sessionId} failed: ${result.error}`);
           recordInference({
             ts: Date.now(),
-            backend: cfg.active_backend as Backend,
-            // claude_cli is handled by an earlier early-return, so here the
-            // backend is ollama | openrouter.
-            model: cfg.active_backend === "openrouter"
+            // Attribute the failure to the actual provider the orchestrator
+            // routed through, not the user's `cfg.active_backend`. The pool
+            // can route planner/executor/synthesizer defaults through
+            // opencode_zen / opencode_go, and those backends are otherwise
+            // invisible to `/health/inference` (Backend type previously only
+            // listed ollama / openrouter / claude_cli).
+            backend: backendForProvider(orchLastProvider, cfg.active_backend),
+            model: orchLastModel ?? (cfg.active_backend === "openrouter"
               ? (cfg.openrouter.model ?? "openrouter/free")
-              : cfg.ollama.model,
+              : cfg.ollama.model),
             ok: false,
             latency_ms: duration,
             tokens_in: 0,
@@ -1753,10 +1911,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           console.warn(`[Jarvis Orchestrator] Pipeline returned empty answer session=${sessionId} (outcome=${runOutcome}, code=${result.error_code ?? "empty_completion"}) — surfacing fallback`);
           recordInference({
             ts: Date.now(),
-            backend: cfg.active_backend as Backend,
-            model: cfg.active_backend === "openrouter"
+            // See note above: attribute to the actual provider so the
+            // empty-completion failure is correctly bucketed.
+            backend: backendForProvider(orchLastProvider, cfg.active_backend),
+            model: orchLastModel ?? (cfg.active_backend === "openrouter"
               ? (cfg.openrouter.model ?? "openrouter/free")
-              : cfg.ollama.model,
+              : cfg.ollama.model),
             ok: false,
             latency_ms: duration,
             tokens_in: 0,
@@ -1765,6 +1925,30 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           });
           await session.finish("The orchestrator completed but produced no output. This may be a transient model issue. Try your request again.");
         } else {
+          // Success path. The orchestrator runs many model calls per user
+          // turn (planner, executor, reviewer, synthesizer, recursion_critique,
+          // etc.); the per-stage tokens are already tracked in the
+          // self-tuning collector (`stage_runs` table). The record below
+          // is a per-TURN summary for `/health/inference` — it tells the
+          // operator that "yes, the orchestrator answered a question, and
+          // the final answer came from this provider." Without it the
+          // success path was invisible to the inference observability layer,
+          // so a healthy turn left the metrics window at the previous
+          // failure's stale data.
+          recordInference({
+            ts: Date.now(),
+            // Same mapping as the error/empty paths — attribute to the
+            // actual provider the orchestrator routed through, not the
+            // user's `cfg.active_backend`.
+            backend: backendForProvider(orchLastProvider, cfg.active_backend),
+            model: orchLastModel ?? (cfg.active_backend === "openrouter"
+              ? (cfg.openrouter.model ?? "openrouter/free")
+              : cfg.ollama.model),
+            ok: true,
+            latency_ms: duration,
+            tokens_in: 0,
+            tokens_out: 0,
+          });
           await session.finish(trimmedAnswer || result.answer);
         }
         return;
@@ -1963,19 +2147,36 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
         let fetchRes: Response;
         let actualModelUsed = modelName;
+        // Mirror to the outer-scope hoisted variable so the catch block can
+        // read the actual model used when the turn errored. The `let` above
+        // is block-scoped to the `while` body and invisible to the catch.
+        lastActualModelUsed = actualModelUsed;
 
         try {
           if (useFallback) {
             const result = await chatCompletionWithFallback(cfg, requestBody, ctrl.signal);
             fetchRes = result.response;
             actualModelUsed = result.model_used;
+            lastActualModelUsed = result.model_used;
+            // Track the actual provider the cascade engaged so the per-turn
+            // `recordInference` call can attribute the request correctly. The
+            // cascade can hop providers (openrouter → opencode_zen → opencode_go
+            // via the 2026-06-24 cross-provider fallback), and `cfg.active_backend`
+            // alone would mis-bucket every non-openrouter turn.
+            lastProviderUsed = result.provider_used;
             lastFallbackRetries = result.retries;
             if (result.retries > 0) {
               lastFallbackModel = result.model_used;
-              console.log(`[OpenRouter] Used model ${result.model_used} after ${result.retries} retry attempt(s)`);
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "fallback_notice", model: result.model_used, retries: result.retries, session_id: sessionId })}\n\n`));
+              console.log(`[OpenRouter] Used model ${result.model_used} (provider=${result.provider_used}) after ${result.retries} retry attempt(s)`);
+              await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "fallback_notice", model: result.model_used, provider: result.provider_used, retries: result.retries, session_id: sessionId })}\n\n`));
             }
           } else {
+            // Non-fallback path: still record the provider we targeted. For
+            // ollama that's "ollama"; for openrouter it's "openrouter". This
+            // covers the case where fallbacks are disabled in config but the
+            // request still happens (recordInference needs SOMETHING to bucket
+            // the turn under).
+            lastProviderUsed = isOllama ? "ollama" : "openrouter";
             fetchRes = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(requestBody), signal: ctrl.signal });
           }
         } catch (fetchErr: any) {
@@ -2194,12 +2395,17 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const _cfgTurn = resolveConfig(options.config);
         recordInference({
           ts: Date.now(),
-          backend: _cfgTurn.active_backend as Backend,
-          model: lastFallbackModel ?? (_cfgTurn.active_backend === "openrouter"
+          // Attribute the turn to the actual provider the cascade engaged, not
+          // the user's `cfg.active_backend`. The cascade can route through
+          // opencode_zen / opencode_go (cross-provider fallback) and without
+          // this all non-openrouter turns would be silently bucketed as
+          // "openrouter" in `/health/inference`.
+          backend: backendForProvider(lastProviderUsed, _cfgTurn.active_backend),
+          model: lastFallbackModel ?? (lastActualModelUsed !== undefined ? lastActualModelUsed : (_cfgTurn.active_backend === "openrouter"
             ? (_cfgTurn.openrouter.model ?? "openrouter/free")
             : _cfgTurn.active_backend === "claude_cli"
-            ? (_cfgTurn.claude_cli.model ?? "claude_cli")
-            : _cfgTurn.ollama.model),
+              ? (_cfgTurn.claude_cli.model ?? "claude_cli")
+              : _cfgTurn.ollama.model)),
           ok: true,
           latency_ms: Date.now() - _turnStart,
           tokens_in: sessionCostInfo?.prompt_tokens ?? 0,
@@ -2477,12 +2683,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       const _cfg3 = resolveConfig(options.config);
       recordInference({
         ts: Date.now(),
-        backend: _cfg3.active_backend as Backend,
-        model: _cfg3.active_backend === "openrouter"
+        // Attribute the error to the actual provider the cascade engaged, not
+        // the user's `cfg.active_backend`. The cascade can route through
+        // opencode_zen / opencode_go and without this every cross-provider
+        // failure would be silently mis-bucketed as "openrouter".
+        backend: backendForProvider(lastProviderUsed, _cfg3.active_backend),
+        model: lastFallbackModel ?? (lastActualModelUsed !== undefined ? lastActualModelUsed : _cfg3.active_backend === "openrouter"
           ? (_cfg3.openrouter.model ?? "openrouter/free")
           : _cfg3.active_backend === "claude_cli"
-          ? (_cfg3.claude_cli.model ?? "claude_cli")
-          : _cfg3.ollama.model,
+            ? (_cfg3.claude_cli.model ?? "claude_cli")
+            : _cfg3.ollama.model),
         ok: false,
         latency_ms: Date.now() - _turnStart,
         tokens_in: sessionCostInfo?.prompt_tokens ?? 0,
@@ -2703,6 +2913,18 @@ async function baseFetch(req: Request): Promise<Response> {
     if (path === "/health/inference") {
       return Response.json(inferenceMetricsSnapshot());
     }
+    if (path === "/health/conductor-cache") {
+      return Response.json(conductorCacheSnapshot());
+    }
+    if (path === "/skills/candidates" && req.method === "GET") {
+      const status = new URL(req.url).searchParams.get("status") as "candidate" | "promoted" | "rejected" | null;
+      return Response.json({ candidates: listSkillCandidates(status ?? undefined) });
+    }
+    if (path === "/skills/promote" && req.method === "POST") {
+      const cfg = loadConfig();
+      const promoted = runSkillPromotionPass(cfg.orchestrator.skill_distillation);
+      return Response.json({ ok: true, promoted });
+    }
     if (path === "/agents/pool" && req.method === "GET") {
       const poolCfg = loadConfig();
       const pool = new AgentPool(poolCfg.orchestrator?.agents ?? []);
@@ -2869,6 +3091,8 @@ async function baseFetch(req: Request): Promise<Response> {
       const body = await req.json();
       const sid = interactionMatch[1];
       clearSessionState(sid);
+      persistentConductor.clearSession(sid);
+      sessionMemory.clearSession(sid);
       return Response.json({ ok: true, session_id: sid, state: body.state || null });
     }
 

@@ -52,7 +52,7 @@ interface SkillRevision {
   created_at: string;
 }
 
-type Filter = 'all' | 'enabled' | 'disabled';
+type Filter = 'all' | 'enabled' | 'disabled' | 'candidates';
 
 // ── Helpers ────────────────────────────────────────────────────
 
@@ -72,6 +72,22 @@ function categoryOf(skill: Skill): string | null {
     /* ignore malformed metadata */
   }
   return null;
+}
+
+function distilledStatus(skill: Skill): string | null {
+  if (!skill.metadata) return null;
+  try {
+    const md = JSON.parse(skill.metadata);
+    if (typeof md.status === 'string') return md.status;
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+function isDistilledCandidate(skill: Skill): boolean {
+  const status = distilledStatus(skill);
+  return status === 'candidate' || skill.name.startsWith('distilled-');
 }
 
 // ── Detail panel ───────────────────────────────────────────────
@@ -260,6 +276,11 @@ export function SkillsView() {
     setLoading(true);
     setError(null);
     try {
+      try {
+        await invoke<number>('sync_distilled_skill_candidates');
+      } catch {
+        /* Bun may not have written candidates yet */
+      }
       const list = await invoke<Skill[]>('list_skills');
       setSkills(list);
     } catch (e) {
@@ -295,6 +316,7 @@ export function SkillsView() {
     return skills.filter((s) => {
       if (filter === 'enabled' && !s.enabled) return false;
       if (filter === 'disabled' && s.enabled) return false;
+      if (filter === 'candidates' && !isDistilledCandidate(s)) return false;
       if (!q) return true;
       return (
         s.name.toLowerCase().includes(q) ||
@@ -340,6 +362,7 @@ export function SkillsView() {
           <option value="all">All</option>
           <option value="enabled">Enabled</option>
           <option value="disabled">Disabled</option>
+          <option value="candidates">Distilled candidates</option>
         </select>
       </div>
 
@@ -371,6 +394,11 @@ export function SkillsView() {
                         {category && (
                           <span className="text-[10px] rounded-full bg-white/5 border border-white/10 px-1.5 py-0.5 text-bone/50">
                             {category}
+                          </span>
+                        )}
+                        {distilledStatus(s) && (
+                          <span className="text-[10px] rounded-full bg-amber-500/10 border border-amber-500/30 px-1.5 py-0.5 text-amber-200/80">
+                            {distilledStatus(s)}
                           </span>
                         )}
                         <button

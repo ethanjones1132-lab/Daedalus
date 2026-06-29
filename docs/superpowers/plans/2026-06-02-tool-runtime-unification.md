@@ -1,1 +1,0 @@
-EROFS: read-only file system, open '\\wsl.localhost\ubuntu\mnt\wslg\distro\home\ethan\.openclaw\agents\coderclaw\workspace\home-base\docs\superpowers\plans\2026-06-02-tool-runtime-unification.md'

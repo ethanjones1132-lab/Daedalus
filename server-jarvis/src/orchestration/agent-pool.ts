@@ -1,4 +1,5 @@
 import type { StageName, TaskType } from "./coordinator";
+import { applyLearnedCapabilities, fallbackBoostKey, getLearnedPoolState } from "../self-tuning/learned-pool-state";
 
 export interface AgentCapabilities {
   code: number;
@@ -250,25 +251,37 @@ export class AgentPool {
     // consistent.
     const filterExclude = (agent: OrchestratorAgent) =>
       !exclude || !exclude.has(`${agent.provider}:${agent.model_id}`);
-    const candidates = this.enabled().filter(filterExclude);
+    const candidates = this.enabled().filter(filterExclude).map(applyLearnedCapabilities);
     if (candidates.length === 0) return undefined;
     const stageDefault = candidates.find((agent) => agent.default_for.includes(stage));
     if (stageDefault) return stageDefault;
     return candidates.sort((a, b) => this.score(b, stage, taskType) - this.score(a, stage, taskType))[0];
   }
 
-  fallbackChain(selected: OrchestratorAgent): OrchestratorAgent[] {
-    const candidates = this.enabled().filter((agent) => agent.id !== selected.id);
+  fallbackChain(selected: OrchestratorAgent, stage?: string, taskType?: TaskType | string): OrchestratorAgent[] {
+    const candidates = this.enabled()
+      .filter((agent) => agent.id !== selected.id)
+      .map(applyLearnedCapabilities);
+    const learned = getLearnedPoolState();
+    const sortWithLearning = (a: OrchestratorAgent, b: OrchestratorAgent): number => {
+      let scoreA = this.overallScore(a);
+      let scoreB = this.overallScore(b);
+      if (stage && taskType) {
+        scoreA += learned.fallbackBoosts.get(fallbackBoostKey(a.id, stage, taskType)) ?? 0;
+        scoreB += learned.fallbackBoosts.get(fallbackBoostKey(b.id, stage, taskType)) ?? 0;
+      }
+      return scoreB - scoreA;
+    };
     return [
-      selected,
-      ...candidates.sort((a, b) => this.overallScore(b) - this.overallScore(a)),
+      applyLearnedCapabilities(selected),
+      ...candidates.sort(sortWithLearning),
     ];
   }
 
   cascadeChain(stage: string, taskType: TaskType | string, exclude?: ReadonlySet<string>): OrchestratorAgent[] {
     const filterExclude = (agent: OrchestratorAgent) =>
       !exclude || !exclude.has(`${agent.provider}:${agent.model_id}`);
-    const candidates = this.enabled().filter(filterExclude);
+    const candidates = this.enabled().filter(filterExclude).map(applyLearnedCapabilities);
     if (candidates.length === 0) return [];
     const cheapFirst = candidates
       .filter((agent) => agent.capabilities.code >= 0.55 || agent.capabilities.reasoning >= 0.55)

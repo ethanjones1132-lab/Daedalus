@@ -604,3 +604,87 @@ pub fn skill_restore_revision(db: State<AppDb>, revision_id: String) -> Result<b
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     engine::restore_skill_revision(&conn, &revision_id)
 }
+
+#[derive(Debug, Deserialize)]
+struct DistilledSkillCandidateFile {
+    id: String,
+    name: String,
+    description: String,
+    body: String,
+    status: String,
+    source_session_id: Option<String>,
+    confidence: f64,
+}
+
+/// Import distilled skill candidates written by the Bun orchestrator into SQLite.
+#[tauri::command]
+pub fn sync_distilled_skill_candidates(db: State<AppDb>) -> Result<usize, String> {
+    use std::fs;
+    use std::path::PathBuf;
+
+    let dir = PathBuf::from(crate::get_home_dir()).join(".openclaw/jarvis/skills/candidates");
+    if !dir.exists() {
+        return Ok(0);
+    }
+
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let mut synced = 0usize;
+
+    for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let file: DistilledSkillCandidateFile =
+            serde_json::from_str(&raw).map_err(|e| format!("Invalid candidate {}: {}", path.display(), e))?;
+
+        let enabled = if file.status == "promoted" { 1 } else { 0 };
+        let metadata = serde_json::json!({
+            "category": "distilled",
+            "source": "trajectory_distillation",
+            "status": file.status,
+            "confidence": file.confidence,
+            "candidate_id": file.id,
+        })
+        .to_string();
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM skills WHERE name = ?)",
+                [&file.name],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        if exists != 0 {
+            conn.execute(
+                "UPDATE skills SET description = ?, body = ?, enabled = ?, metadata = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE name = ?",
+                params![file.description, file.body, enabled, metadata, file.name],
+            )
+            .map_err(|e| e.to_string())?;
+        } else {
+            conn.execute(
+                "INSERT INTO skills (id, name, description, path, enabled, metadata, body, version, created_at, updated_at)
+                 VALUES (?, ?, ?, '', ?, ?, ?, 1, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                params![file.id, file.name, file.description, enabled, metadata, file.body],
+            )
+            .map_err(|e| e.to_string())?;
+            conn.execute(
+                "INSERT INTO skill_revisions (id, skill_id, version, body_before, body_after, change_reason, source_session_id, created_at)
+                 VALUES (?, ?, 1, '', ?, 'trajectory_distillation', ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    file.id,
+                    file.body,
+                    file.source_session_id,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        synced += 1;
+    }
+
+    Ok(synced)
+}
