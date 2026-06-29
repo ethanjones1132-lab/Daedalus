@@ -1,5 +1,9 @@
-import { describe, expect, it } from "bun:test";
+import { beforeEach, describe, expect, it } from "bun:test";
 import { recordInference, inferenceMetricsSnapshot, backendForProvider } from "./inference-metrics";
+import {
+  recordConductorCache,
+  __resetConductorCacheMetricsForTests,
+} from "./orchestration/conductor-metrics";
 
 // Note: the ring is module-level shared state. Each test records distinct
 // backends/models so they stay independently verifiable.
@@ -187,5 +191,106 @@ describe("backendForProvider", () => {
         expect(knownBackends.has(result)).toBe(true);
       }
     }
+  });
+});
+
+describe("inferenceMetricsSnapshot.conductor_cache (Track A)", () => {
+  // The conductor cache ring is module-singleton shared state — reset
+  // before each case so window_size reflects only what THIS case wrote.
+  // Other test files in this repo also touch the ring; resetting in an
+  // isolated describe keeps the assertions hermetic.
+  beforeEach(() => {
+    __resetConductorCacheMetricsForTests();
+  });
+
+  it("reports conductor_cache as null when no conductor turns have been recorded", () => {
+    // After a hard reset the ring is empty. The snapshot must surface
+    // `null` — a fabricated "0% hit rate" with window_size=0 would look
+    // indistinguishable from a real bad measurement to a UI consumer.
+    const snap = inferenceMetricsSnapshot();
+    expect(snap.conductor_cache).toBeNull();
+  });
+
+  it("folds conductor cache observability into the inference snapshot", () => {
+    // Two turns, one cache hit, one miss → 0.5 hit rate. The snapshot
+    // should expose this through `conductor_cache` with the same window
+    // math as the standalone /health/conductor-cache endpoint.
+    recordConductorCache({
+      ts: Date.now(),
+      session_id: "snap-sess-1",
+      turn_number: 1,
+      model: "gemma4:e2b",
+      latency_ms: 250,
+      ok: true,
+      conductor_cache_hit: false,
+      prefix_tokens_estimated: 800,
+      delta_tokens_estimated: 120,
+      prefix_tokens_recomputed: 800,
+      kv_generation: 1,
+    });
+    recordConductorCache({
+      ts: Date.now() + 1,
+      session_id: "snap-sess-1",
+      turn_number: 2,
+      model: "gemma4:e2b",
+      latency_ms: 180,
+      ok: true,
+      conductor_cache_hit: true,
+      prefix_tokens_estimated: 920,
+      delta_tokens_estimated: 80,
+      prefix_tokens_recomputed: 0,
+      kv_generation: 2,
+    });
+
+    const snap = inferenceMetricsSnapshot();
+    expect(snap.conductor_cache).not.toBeNull();
+    const cc = snap.conductor_cache!;
+    expect(cc.window_size).toBe(2);
+    expect(cc.cache_hit_rate).toBe(0.5);
+    // First turn recomputed 800 prefix tokens, second turn 0 → average 400.
+    expect(cc.avg_prefix_recomputed).toBe(400);
+    expect(cc.records).toHaveLength(2);
+    expect(cc.records[0].conductor_cache_hit).toBe(false);
+    expect(cc.records[1].conductor_cache_hit).toBe(true);
+    expect(cc.records[1].kv_generation).toBe(2);
+    expect(typeof cc.generated_at).toBe("number");
+  });
+
+  it("preserves backends stats alongside conductor cache (no double counting, no field collision)", () => {
+    // Regression: pre-Track-A, the snapshot had no `conductor_cache` field.
+    // Adding it must NOT change `backends`, `window_size`, or `generated_at`
+    // shape — those are the contract for SystemHealthView.
+    recordInference({
+      ts: Date.now(),
+      backend: "ollama",
+      model: "qwen3:8b-snap",
+      ok: true,
+      latency_ms: 200,
+      tokens_in: 50,
+      tokens_out: 50,
+    });
+    recordConductorCache({
+      ts: Date.now(),
+      session_id: "snap-sess-2",
+      turn_number: 1,
+      model: "gemma4:e2b",
+      latency_ms: 250,
+      ok: true,
+      conductor_cache_hit: false,
+      prefix_tokens_estimated: 800,
+      delta_tokens_estimated: 120,
+      prefix_tokens_recomputed: 800,
+      kv_generation: 1,
+    });
+
+    const snap = inferenceMetricsSnapshot();
+    const ollama = snap.backends.find((b) => b.backend === "ollama");
+    expect(ollama).toBeDefined();
+    expect(ollama!.requests).toBeGreaterThanOrEqual(1);
+    // Conductor turns are NOT miscounted as ollama backend requests.
+    expect(ollama!.last_model).toBe("qwen3:8b-snap");
+    // Both fields coexist without collision.
+    expect(snap.conductor_cache).not.toBeNull();
+    expect(snap.conductor_cache!.window_size).toBe(1);
   });
 });

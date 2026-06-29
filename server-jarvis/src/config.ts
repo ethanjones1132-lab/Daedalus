@@ -169,7 +169,42 @@ export interface ConductorConfig {
   max_turns_in_cache: number;
   /** Persist session message state to disk for restart recovery. */
   persist_sessions: boolean;
-  /** Persist conductor KV/session metadata alongside message history. */
+  /**
+   * Persist conductor KV/session metadata alongside message history.
+   *
+   * When true, `PersistentConductor` writes one JSON file per session to disk
+   * so the warm Ollama conductor can resume on Bun restart. The on-disk layout
+   * is:
+   *
+   *     <SESSIONS_DIR>/conductor/<sanitized-sessionId>.json
+   *
+   * where `SESSIONS_DIR` is the `sessions_dir` config (default
+   * `~/.openclaw/jarvis/sessions/`). The filename sanitization replaces any
+   * non-`[a-zA-Z0-9._-]` characters with `_` (see `sessionFilePath` in
+   * `persistent-conductor.ts`).
+   *
+   * Each file is the full `ConductorSessionState` serialized via `JSON.stringify`
+   * (no envelope):
+   *
+   *   {
+   *     "sessionId":          string,
+   *     "turns":              number,
+   *     "lastOutcome?":       string,
+   *     "messages":           ConductorMessage[],   // system + user/assistant pairs
+   *     "lastActiveAt":       number,              // unix ms
+   *     "kvGeneration?":      number,              // Track A — prefix-reuse counter
+   *     "systemPromptHash?":  string,              // hex, for cache-hit detection
+   *     "cachedPrefixTokens?":number,              // last turn's reusable prefix estimate
+   *     "lastModel?":         string,              // last model that answered for this session
+   *     "apiFallbackUsed?":   boolean              // next local turn rebuilds prefix
+   *   }
+   *
+   * Pruning is governed by `session_ttl_ms`: disk files older than the TTL are
+   * removed on `pruneExpiredDiskSessions()` (called on each `routeTurn` when
+   * the flag is on). The in-memory cache size is bounded by
+   * `PersistentConductor.MAX_SESSIONS = 256` (oldest first, see
+   * `touchSession`).
+   */
   kv_persist: boolean;
   /** KV backend implementation (Ollama message-prefix reuse today). */
   kv_backend: "ollama";

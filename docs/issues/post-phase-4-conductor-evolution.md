@@ -30,7 +30,8 @@ D-05 (HITL spike, only if D-03 underwhelms)
 ### A-01: Conductor session state contract and cache observability
 
 **Type:** AFK  
-**Blocked by:** None
+**Blocked by:** None  
+**Status:** ✅ Done (2026-06-29 afternoon, Jarvis maintenance pass)
 
 #### What to build
 
@@ -40,10 +41,18 @@ End-to-end: a multi-turn orchestrator session logs measurable cache behavior; te
 
 #### Acceptance criteria
 
-- [ ] `orchestrator.conductor` config includes `kv_persist` (default true) and documents storage layout under `sessions/conductor/`
-- [ ] Each conductor turn records prefix vs delta token estimates in inference metrics
-- [ ] Unit tests cover session state serialization round-trip (messages + metadata)
-- [ ] Existing coordinator tests pass unchanged
+- [x] `orchestrator.conductor` config includes `kv_persist` (default true) and documents storage layout under `sessions/conductor/`
+- [x] Each conductor turn records prefix vs delta token estimates in inference metrics
+- [x] Unit tests cover session state serialization round-trip (messages + metadata)
+- [x] Existing coordinator tests pass unchanged
+
+**Implementation summary:** the conductor cache observability ring (`recordConductorCache` + `conductorCacheSnapshot` in `server-jarvis/src/orchestration/conductor-metrics.ts`) was already capturing the right per-turn data (`conductor_cache_hit`, `prefix_tokens_estimated`, `delta_tokens_estimated`, `prefix_tokens_recomputed`, `kv_generation`). The actual gap was that the data was only exposed at the standalone `/health/conductor-cache` endpoint — the main `/health/inference` snapshot (used by `SystemHealthView`) didn't see it. Fix in commit `fix(track-a): wire conductor cache observability through /health/inference`:
+1. New `ConductorCacheSummary` type in `server-jarvis/src/inference-metrics.ts`; new `conductor_cache: ConductorCacheSummary | null` field on `InferenceMetricsSnapshot`.
+2. `inferenceMetricsSnapshot()` calls `conductorCacheSnapshot()` at runtime; surfaces `null` when `window_size === 0` so the UI can distinguish "no data" from a real bad measurement (avoids the "0% hit rate on a fresh process" trap).
+3. Full JSDoc block on `ConductorConfig.kv_persist` in `server-jarvis/src/config.ts` documenting `<SESSIONS_DIR>/conductor/<sanitized-sessionId>.json` layout, sanitization rule (`[^a-zA-Z0-9._-] → _`), the complete `ConductorSessionState` schema, `session_ttl_ms` pruning, and `MAX_SESSIONS = 256` in-memory cap.
+4. 3 new bun tests in `inference-metrics.test.ts` (now 374 total, was 371): null-when-empty, populated shape (window_size=2, cache_hit_rate=0.5, avg_prefix_recomputed=400, full records array), and that backend stats and conductor cache coexist without double counting. Both tsc jobs clean, 59 cargo tests pass.
+
+**Follow-up not in this pass:** UI's `InferenceMetrics` interface in `src-ui/src/components/jarvis/SystemHealthView.tsx` doesn't yet declare `conductor_cache` — TypeScript structural typing makes this safe (extra server fields are ignored), so existing dashboard keeps working. Surfacing the field in a `ConductorView`/`SelfImprovementView` panel is a low-risk follow-up.
 
 ---
 

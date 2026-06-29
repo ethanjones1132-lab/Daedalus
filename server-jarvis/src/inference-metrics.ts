@@ -9,6 +9,13 @@
 //
 // Call `recordInference` at the end of each successful or failed inference
 // turn. Read the snapshot with `inferenceMetricsSnapshot`.
+//
+// Track A (Conductor Evolution): the snapshot also folds in the conductor
+// KV/prefix-reuse window from `./orchestration/conductor-metrics` so the
+// same dashboard can show "is the warm Ollama conductor actually reusing
+// its prefix on turn 2+?" without a second fetch. The import is
+// dependency-safe: conductor-metrics does not import inference-metrics
+// (verified — the dependency graph is one-way).
 
 // The set of backends the inference observability layer tracks. OpenCode Zen
 // and OpenCode Go were added to the orchestrator's pool on 2026-06-24 — the
@@ -18,6 +25,11 @@
 // provider the orchestrator's pool routed through). The CLI agent-loop path
 // still only emits "ollama" / "openrouter" / "claude_cli" — those are the
 // three the legacy `cfg.active_backend` value can be.
+import {
+  conductorCacheSnapshot,
+  type ConductorCacheRecord,
+} from "./orchestration/conductor-metrics";
+
 export type Backend = "ollama" | "openrouter" | "claude_cli" | "opencode_zen" | "opencode_go";
 
 /**
@@ -110,10 +122,30 @@ function percentile(sorted: number[], p: number): number {
   return sorted[i];
 }
 
+export interface ConductorCacheSummary {
+  /** Number of conductor turns in the rolling window (0 = no turns observed yet). */
+  window_size: number;
+  /** Fraction of turns where the warm Ollama conductor reused its prefix (0..1). */
+  cache_hit_rate: number;
+  /** Average prefix tokens that had to be recomputed across the window (lower = better reuse). */
+  avg_prefix_recomputed: number;
+  /** Last 20 raw records, oldest→newest, for drill-down. */
+  records: ConductorCacheRecord[];
+  /** Unix ms when this snapshot was generated. */
+  generated_at: number;
+}
+
 export interface InferenceMetricsSnapshot {
   window_size: number;
   backends: BackendStats[];
   generated_at: number;
+  /**
+   * Conductor KV/prefix-reuse observability (Track A). `null` when no
+   * conductor turns have been recorded yet in this Bun process — the UI
+   * should render an empty/disabled state, not a "0% hit rate" that looks
+   * like a real measurement.
+   */
+  conductor_cache: ConductorCacheSummary | null;
 }
 
 export function inferenceMetricsSnapshot(): InferenceMetricsSnapshot {
@@ -152,5 +184,25 @@ export function inferenceMetricsSnapshot(): InferenceMetricsSnapshot {
     });
   }
 
-  return { window_size: records.length, backends: stats, generated_at: Date.now() };
+  // Conductor cache is a module-singleton ring in conductor-metrics.ts.
+  // When no turns have been recorded yet, window_size is 0 — we surface
+  // `null` so the UI shows a "no data" state instead of a fake "0% hit rate"
+  // that looks like a real (bad) measurement.
+  const conductorSnap = conductorCacheSnapshot();
+  const conductor_cache: ConductorCacheSummary | null = conductorSnap.window_size === 0
+    ? null
+    : {
+      window_size: conductorSnap.window_size,
+      cache_hit_rate: conductorSnap.cache_hit_rate,
+      avg_prefix_recomputed: conductorSnap.avg_prefix_recomputed,
+      records: conductorSnap.records,
+      generated_at: conductorSnap.generated_at,
+    };
+
+  return {
+    window_size: records.length,
+    backends: stats,
+    generated_at: Date.now(),
+    conductor_cache,
+  };
 }
