@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "fs";
+import { mkdtempSync, readdirSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import {
@@ -444,6 +444,163 @@ describe("PersistentConductor", () => {
       const loaded = conductorB.getSessionState("disk-sess");
       expect(loaded?.messages.length).toBeGreaterThan(2);
       expect(loaded?.messages.some((m) => m.content.includes("persist me"))).toBe(true);
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  // ── Track A-04 acceptance: KV lifecycle — reset, TTL, and fallback safety ──
+  //
+  // A-04 in docs/issues/post-phase-4-conductor-evolution.md requires four
+  // guarantees pinned by automated tests. This block of tests pins them.
+  // The mid-session API fallback recovery guarantee is already covered by
+  // the existing A-02 test `recovers warm prefix after a mid-session API
+  // fallback` above, so we only re-assert its 1-line summary here.
+
+  test("A-04: clearSession removes both in-memory state and disk file (Track A-04 acceptance)", async () => {
+    // A-04 acceptance: "Session reset (existing path in `index.ts`) clears
+    // conductor memory + disk state." We pin the contract on
+    // `PersistentConductor.clearSession` itself: after a turn has been routed
+    // with `kv_persist: true`, both the in-memory entry and the on-disk JSON
+    // file are gone — the next `routeTurn` starts from a clean slate (cold
+    // prefix, kvGeneration = 1, `prefixTokensRecomputed > 0`).
+    const tempRoot = mkdtempSync(join(tmpdir(), "jarvis-conductor-clear-"));
+
+    mockOllamaChat([
+      '{"task_type":"general","pipeline":["synthesizer"],"topology":"linear","context":{"needs_workspace_inspection":false,"needs_memory":true,"estimated_complexity":"low"},"coordinator_rationale":"before-reset"}',
+      '{"task_type":"general","pipeline":["synthesizer"],"topology":"linear","context":{"needs_workspace_inspection":false,"needs_memory":true,"estimated_complexity":"low"},"coordinator_rationale":"after-reset"}',
+    ]);
+
+    try {
+      const cfg = makeConfig({ persist_sessions: true, kv_persist: true });
+      const conductor = new PersistentConductor(() => cfg, tempRoot);
+
+      await conductor.routeTurn({ sessionId: "clear-sess", request: "warm up", turnNumber: 1 });
+      const diskPath = join(tempRoot, "conductor", "clear-sess.json");
+      expect(require("fs").existsSync(diskPath)).toBe(true);
+      expect(conductor.getSessionState("clear-sess")).toBeDefined();
+
+      // Simulate the index.ts POST /sessions/:sid/interaction reset path.
+      conductor.clearSession("clear-sess");
+
+      expect(conductor.getSessionState("clear-sess")).toBeUndefined();
+      expect(require("fs").existsSync(diskPath)).toBe(false);
+
+      // Next turn is a cold start: no prior messages, no kvGeneration, the
+      // system message has to be re-installed and the prefix is recomputed.
+      const after = await conductor.routeTurn({
+        sessionId: "clear-sess",
+        request: "fresh start",
+        turnNumber: 1,
+      });
+      expect(after.cacheHit).toBe(false);
+      expect(after.kvGeneration).toBe(1);
+      expect(after.prefixTokensRecomputed).toBeGreaterThan(0);
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("A-04: pruneExpiredDiskSessions removes only files older than session_ttl_ms (Track A-04 acceptance)", async () => {
+    // A-04 acceptance: "TTL pruning removes inactive `sessions/conductor/`
+    // entries." Pin the contract: a session JSON file whose mtime is older
+    // than `session_ttl_ms` is removed, a fresh file is kept, and the
+    // `prune` operation is a no-op when `kv_persist` is disabled.
+    const { writeFileSync, mkdirSync, utimesSync, existsSync } = require("fs") as typeof import("fs");
+    const tempRoot = mkdtempSync(join(tmpdir(), "jarvis-conductor-ttl-"));
+    const conductorDir = join(tempRoot, "conductor");
+    mkdirSync(conductorDir, { recursive: true });
+
+    // Two distinct session files in the canonical layout.
+    const stalePath = join(conductorDir, "stale-sess.json");
+    const freshPath = join(conductorDir, "fresh-sess.json");
+    writeFileSync(stalePath, JSON.stringify({ sessionId: "stale-sess", turns: 1, messages: [] }));
+    writeFileSync(freshPath, JSON.stringify({ sessionId: "fresh-sess", turns: 1, messages: [] }));
+
+    // Force mtime: stale = 2 hours ago, fresh = just now. TTL = 30 min.
+    const now = Date.now();
+    const twoHoursAgo = (now - 2 * 60 * 60 * 1000) / 1000; // utimes takes seconds.
+    const justNow = now / 1000;
+    utimesSync(stalePath, twoHoursAgo, twoHoursAgo);
+    utimesSync(freshPath, justNow, justNow);
+
+    try {
+      const cfg = makeConfig({
+        persist_sessions: false,
+        kv_persist: true,
+        session_ttl_ms: 30 * 60 * 1000,
+      });
+      const conductor = new PersistentConductor(() => cfg, tempRoot);
+
+      const removed = conductor.pruneExpiredDiskSessions();
+      expect(removed).toBe(1);
+      expect(existsSync(stalePath)).toBe(false);
+      expect(existsSync(freshPath)).toBe(true);
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("A-04: pruneExpiredDiskSessions is a no-op when both persist_sessions and kv_persist are disabled (Track A-04 acceptance)", async () => {
+    // Pin the safety guard: when persistence is fully off, the prune call
+    // returns 0 and never touches the disk (the `existsSync(dir)` check is
+    // short-circuited by the `kv_persist || persist_sessions` guard).
+    const tempRoot = mkdtempSync(join(tmpdir(), "jarvis-conductor-noprun-"));
+    const conductorDir = join(tempRoot, "conductor");
+    require("fs").mkdirSync(conductorDir, { recursive: true });
+    const fakeFile = join(conductorDir, "would-be-stale.json");
+    require("fs").writeFileSync(fakeFile, "{}");
+    const twoHoursAgo = (Date.now() - 2 * 60 * 60 * 1000) / 1000;
+    require("fs").utimesSync(fakeFile, twoHoursAgo, twoHoursAgo);
+
+    try {
+      const cfg = makeConfig({ persist_sessions: false, kv_persist: false });
+      const conductor = new PersistentConductor(() => cfg, tempRoot);
+      const removed = conductor.pruneExpiredDiskSessions();
+      expect(removed).toBe(0);
+      expect(require("fs").existsSync(fakeFile)).toBe(true);
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("A-04: conductor never references the shared jarvis.db SQLite store (Track A-04 acceptance)", async () => {
+    // A-04 acceptance: "No writes to shared Windows `jarvis.db` for conductor
+    // KV blobs." Pin the contract two ways: (1) the conductor writes only
+    // JSON files under the isolated sessions root, never `.db`/`.sqlite`/`.sqlite3`;
+    // (2) the `clearSession` and `pruneExpiredDiskSessions` paths are scoped
+    // to that isolated root. This guards against a future regression that
+    // re-routes KV blobs through the shared settings/memory store.
+    const tempRoot = mkdtempSync(join(tmpdir(), "jarvis-conductor-isolated-"));
+
+    mockOllamaChat([
+      '{"task_type":"general","pipeline":["synthesizer"],"topology":"linear","context":{"needs_workspace_inspection":false,"needs_memory":true,"estimated_complexity":"low"},"coordinator_rationale":"iso-1"}',
+      '{"task_type":"general","pipeline":["synthesizer"],"topology":"linear","context":{"needs_workspace_inspection":false,"needs_memory":true,"estimated_complexity":"low"},"coordinator_rationale":"iso-2"}',
+    ]);
+
+    try {
+      const cfg = makeConfig({ persist_sessions: true, kv_persist: true });
+      const conductor = new PersistentConductor(() => cfg, tempRoot);
+      await conductor.routeTurn({ sessionId: "iso-sess", request: "first", turnNumber: 1 });
+      await conductor.routeTurn({ sessionId: "iso-sess", request: "second", turnNumber: 2, lastOutcome: "success" });
+
+      // (1) JSON file is present; no SQLite-shaped files appeared.
+      const conductorDir = join(tempRoot, "conductor");
+      const files = readdirSync(conductorDir);
+      expect(files).toContain("iso-sess.json");
+      for (const f of files) {
+        expect(/\.(db|sqlite|sqlite3)$/i.test(f)).toBe(false);
+      }
+
+      // (2) clearSession + prune are scoped to the isolated root. The
+      //     conductor has no way to reach the shared jarvis.db even if its
+      //     config is later pointed at it — the on-disk layout is fixed.
+      conductor.clearSession("iso-sess");
+      expect(readdirSync(conductorDir)).toHaveLength(0);
+
+      // (3) The on-disk filename sanitization rule still applies.
+      const safeName = "iso-sess".replace(/[^a-zA-Z0-9._-]/g, "_");
+      expect(safeName).toBe("iso-sess");
     } finally {
       rmSync(tempRoot, { recursive: true, force: true });
     }

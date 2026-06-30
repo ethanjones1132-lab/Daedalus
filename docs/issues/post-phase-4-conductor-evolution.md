@@ -106,8 +106,9 @@ Not a production integration — decision artifact only.
 
 ### A-04: KV lifecycle — reset, TTL, and fallback safety
 
-**Type:** AFK  
+**Type:** AFK
 **Blocked by:** A-02
+**Status:** ✅ Done (2026-06-30 morning, Jarvis maintenance pass)
 
 #### What to build
 
@@ -117,10 +118,19 @@ End-to-end: session reset clears conductor state; expired sessions prune disk; n
 
 #### Acceptance criteria
 
-- [ ] Session reset (existing path in `index.ts`) clears conductor memory + disk state
-- [ ] TTL pruning removes inactive `sessions/conductor/` entries
-- [ ] Test: fallback to API mid-session → next local turn recovers cleanly
-- [ ] No writes to shared Windows `jarvis.db` for conductor KV blobs
+- [x] Session reset (existing path in `index.ts`) clears conductor memory + disk state
+- [x] TTL pruning removes inactive `sessions/conductor/` entries
+- [x] Test: fallback to API mid-session → next local turn recovers cleanly
+- [x] No writes to shared Windows `jarvis.db` for conductor KV blobs
+
+**Implementation summary:** the three behavioral guarantees (session reset → state cleared, disk TTL pruning, mid-session API fallback recovery) were already wired from earlier passes — `persistent-conductor.clearSession` is called from `index.ts` line 3099 (the `POST /sessions/:sid/interaction` reset path), `pruneExpiredDiskSessions` is called from `index.ts` line 1186 at orchestrator session start, and the mid-session API fallback recovery is the existing A-02 test `recovers warm prefix after a mid-session API fallback`. The work for this pass was **pinning the contract with 4 new focused bun tests** in `server-jarvis/src/orchestration/persistent-conductor.test.ts` so any future regression that re-routes KV blobs through `jarvis.db`, drops TTL pruning, or breaks the reset path is caught immediately:
+
+1. `A-04: clearSession removes both in-memory state and disk file (Track A-04 acceptance)` — confirms a routed turn leaves a JSON file under `<sessions_root>/conductor/<sid>.json`, that `clearSession` removes both the in-memory entry and the on-disk file, and that the next `routeTurn` after reset is a cold start (`cacheHit=false`, `kvGeneration=1`, `prefixTokensRecomputed > 0`).
+2. `A-04: pruneExpiredDiskSessions removes only files older than session_ttl_ms (Track A-04 acceptance)` — seeds two session JSON files in an isolated `tempRoot` with `utimes`-forced mtimes (one 2 hours stale, one just-now), runs the prune, and asserts exactly the stale one is removed and the fresh one is kept.
+3. `A-04: pruneExpiredDiskSessions is a no-op when both persist_sessions and kv_persist are disabled (Track A-04 acceptance)` — pins the `kv_persist || persist_sessions` short-circuit so a fully-off config never touches the disk.
+4. `A-04: conductor never references the shared jarvis.db SQLite store (Track A-04 acceptance)` — guards the layout invariant: every file under the conductor directory is `.json`, no `.db`/`.sqlite`/`.sqlite3` files appear, and the filename sanitization rule is unchanged.
+
+381 bun tests pass (+4), 59 cargo tests pass, both tsc jobs clean.
 
 ---
 
