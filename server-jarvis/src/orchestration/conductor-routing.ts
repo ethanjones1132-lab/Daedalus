@@ -13,6 +13,13 @@ export const COORDINATOR_ROUTE_JSON_SCHEMA = {
         anyOf: [
           { type: "string", enum: ["planner", "executor", "reviewer", "rewriter", "synthesizer"] },
           { type: "string", pattern: "^re-enter:(planner|executor|reviewer|rewriter|synthesizer)$" },
+          // B-01 (Track B, Conductor Recursive Self-Selection): "conductor_replan"
+          // is a META decision, not an executable stage. It tells the runtime
+          // to pause and re-invoke the local persistent conductor for revised
+          // worker_instructions / pipeline / shared_context (B-02 will wire the
+          // behavior). Routing is normalized to skip it in the executable
+          // pipeline but preserve it in original_pipeline for telemetry.
+          { type: "string", enum: ["conductor_replan"] },
           { type: "null" },
         ],
       },

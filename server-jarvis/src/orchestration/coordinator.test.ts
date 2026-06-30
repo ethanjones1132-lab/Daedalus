@@ -264,4 +264,116 @@ describe("Coordinator", () => {
       suppressActivity: true,
     });
   });
+
+  // ── Track B / B-01: conductor_replan decision type ────────────────────
+  // B-01 acceptance: Coordinator.validate() accepts replan decisions.
+  // The meta decision must round-trip through the coordinator model output
+  // untouched so the conductor's recursive self-selection has a stable wire
+  // contract.
+  test("B-01: validates a pipeline containing a conductor_replan meta decision", async () => {
+    const coordinator = new Coordinator(async () => ({
+      content: JSON.stringify({
+        task_type: "debug",
+        pipeline: ["planner", "executor", "conductor_replan", "synthesizer"],
+        topology: "linear",
+        context: {
+          needs_workspace_inspection: true,
+          needs_memory: true,
+          estimated_complexity: "high",
+        },
+        coordinator_rationale:
+          "Executor discovered an unexpected schema — pause to replan worker instructions before continuing.",
+      }),
+    }));
+
+    const result = await coordinator.route("Replan after the executor surprises", { sessionId: "b-01-validate" });
+
+    // The meta decision survives the validate() round-trip exactly as
+    // emitted by the model — the runtime never silently rewrites it.
+    expect(result.pipeline).toEqual([
+      "planner",
+      "executor",
+      "conductor_replan",
+      "synthesizer",
+    ]);
+    expect(result.topology).toBe("linear");
+    expect(result.coordinator_rationale).toContain("replan");
+  });
+
+  test("B-01: executablePipeline skips conductor_replan but runs the surrounding stages", async () => {
+    const coordinator = new Coordinator(async () => ({
+      content: JSON.stringify({
+        task_type: "debug",
+        pipeline: ["planner", "executor", "conductor_replan", "synthesizer"],
+        topology: "linear",
+        context: {
+          needs_workspace_inspection: true,
+          needs_memory: true,
+          estimated_complexity: "high",
+        },
+        coordinator_rationale: "Replan mid-pipeline.",
+      }),
+    }));
+
+    const result = await coordinator.route("execute then replan then answer", { sessionId: "b-01-exec" });
+
+    // The meta decision is preserved in decision.pipeline (so B-02 can
+    // intercept it before stage execution) but the executable pipeline
+    // skips it — the surrounding stages run as usual.
+    const executable = coordinator.executablePipeline(result);
+    expect(executable).toEqual(["planner", "executor", "synthesizer"]);
+    expect(executable).not.toContain("conductor_replan");
+  });
+
+  test("B-01: executablePipeline falls back to synthesizer if conductor_replan is the only entry", async () => {
+    // Pathological but well-defined case: a model that emits ONLY the meta
+    // decision. The pipeline is empty after stripping meta decisions, so the
+    // executable pipeline falls back to a single synthesizer (matching the
+    // existing null/empty behavior — the user always sees a final answer).
+    const coordinator = new Coordinator(async () => ({
+      content: JSON.stringify({
+        task_type: "general",
+        pipeline: ["conductor_replan"],
+        topology: "linear",
+        context: {
+          needs_workspace_inspection: false,
+          needs_memory: true,
+          estimated_complexity: "low",
+        },
+        coordinator_rationale: "Just replan, nothing else.",
+      }),
+    }));
+
+    const result = await coordinator.route("only meta decision", { sessionId: "b-01-only-meta" });
+    expect(result.pipeline).toEqual(["conductor_replan"]);
+
+    const executable = coordinator.executablePipeline(result);
+    expect(executable).toEqual(["synthesizer"]);
+  });
+
+  test("B-01: validate() still rejects an unknown stage decision", async () => {
+    // Regression guard: the conductor_replan addition must NOT make the
+    // validator too permissive. An unknown stage name must still throw
+    // CoordinatorError so the routing parse-fallback kicks in.
+    const coordinator = new Coordinator(async () => ({
+      content: JSON.stringify({
+        task_type: "general",
+        pipeline: ["planner", "executor", "totally_made_up_stage", "synthesizer"],
+        topology: "linear",
+        context: {
+          needs_workspace_inspection: false,
+          needs_memory: true,
+          estimated_complexity: "low",
+        },
+        coordinator_rationale: "invalid stage should throw",
+      }),
+    }));
+
+    // The coordinator's resilient route() catches the parse error and
+    // falls back to the default synthesizer-only route. We assert the
+    // decision is the safe default, not the model output.
+    const result = await coordinator.route("inject bad stage", { sessionId: "b-01-bad" });
+    expect(result.pipeline).toEqual(["synthesizer"]);
+    expect(result.coordinator_rationale).toContain("unparseable");
+  });
 });

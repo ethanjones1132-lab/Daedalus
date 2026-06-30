@@ -83,6 +83,12 @@ function toStageList(pipeline: CoordinatorResult["pipeline"]): StageName[] {
   const out: StageName[] = [];
   for (const step of pipeline) {
     if (!step) continue;
+    // B-01 (Track B, Conductor Recursive Self-Selection): `conductor_replan`
+    // is a META decision. It is preserved in `original_pipeline` (see below)
+    // for telemetry + B-02 interception, but it is NEVER a concrete stage in
+    // the executable pipeline — it is a signal to re-invoke the local
+    // persistent conductor, not a worker to schedule.
+    if (step === "conductor_replan") continue;
     const stage = step as string;
     out.push((stage.startsWith("re-enter:") ? stage.slice("re-enter:".length) : stage) as StageName);
   }

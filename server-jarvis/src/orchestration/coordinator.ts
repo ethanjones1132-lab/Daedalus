@@ -6,7 +6,18 @@ export type TaskType = "code_review" | "debug" | "refactor" | "general" | "plan"
 export type Complexity = "low" | "medium" | "high";
 export type StageName = "planner" | "executor" | "reviewer" | "rewriter" | "synthesizer";
 export type Topology = "linear" | "speculative_parallel" | "speculative_cascade" | "recursive";
-export type CoordinatorStageDecision = StageName | null | `re-enter:${StageName}`;
+/**
+ * B-01 (Track B, Conductor Recursive Self-Selection):
+ * `conductor_replan` is a META routing decision. It tells the runtime to pause
+ * the current pipeline and re-invoke the local persistent conductor for revised
+ * worker_instructions / pipeline / shared_context (B-02 will wire the actual
+ * behavior). It is NOT an executable stage: `executablePipeline` skips it.
+ *
+ * Compare with `re-enter:<stage>`, which directly re-runs a worker stage
+ * with the prior routing decision's worker_instructions.
+ */
+export type ConductorMetaDecision = "conductor_replan";
+export type CoordinatorStageDecision = StageName | null | `re-enter:${StageName}` | ConductorMetaDecision;
 
 export interface ChatMessage {
   role: string;
@@ -269,6 +280,14 @@ export class Coordinator {
     const stages: StageName[] = [];
     for (const step of decision.pipeline) {
       if (!step) continue;
+      // B-01 (Track B): "conductor_replan" is a META decision that the
+      // PipelineExecutor does not execute as a stage. It is preserved in
+      // decision.pipeline (and in original_pipeline telemetry) so B-02 can
+      // intercept it before execution and re-invoke the local persistent
+      // conductor. For now, executablePipeline simply skips it, leaving the
+      // remaining stages to run. Existing tests for `null` and `re-enter:`
+      // continue to behave as before.
+      if (step === "conductor_replan") continue;
       const stage = step as string;
       if (stage.startsWith("re-enter:")) {
         stages.push(stage.slice("re-enter:".length) as StageName);
@@ -389,6 +408,11 @@ export class Coordinator {
       const stage = step.slice("re-enter:".length);
       if (VALID_STAGES.has(stage as StageName)) return step as `re-enter:${StageName}`;
     }
+    // B-01 (Track B, Conductor Recursive Self-Selection): accept the
+    // `conductor_replan` meta decision. It is preserved verbatim into
+    // CoordinatorResult.pipeline and skipped by `executablePipeline` so the
+    // B-02 layer can intercept it before stage execution.
+    if (step === "conductor_replan") return "conductor_replan";
     throw new CoordinatorError(`Coordinator returned invalid stage decision: ${step}`);
   }
 

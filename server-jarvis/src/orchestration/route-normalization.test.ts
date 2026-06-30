@@ -91,4 +91,61 @@ describe("normalizeRoute", () => {
     expect(r.route_source).toBe("model");
     expect(r.override_reason).toBeUndefined();
   });
+
+  // ── Track B / B-01: conductor_replan decision type ────────────────────
+  // B-01 acceptance: normalizeRoute preserves conductor_replan in
+  // original_pipeline (telemetry) but strips it from the executable stage
+  // list. The meta decision is a signal to re-invoke the local persistent
+  // conductor, not a worker to schedule.
+  test("B-01: conductor_replan is preserved in original_pipeline and stripped from executable stages", () => {
+    // Use `answer_only` so the required stages set is just {synthesizer} —
+    // this keeps the test focused on the meta-decision filtering without
+    // confounding the expected pipeline with capability-class invariants.
+    const r = normalizeRoute(
+      decision(["planner", "executor", "conductor_replan", "synthesizer"]),
+      "answer_only",
+      "model",
+    );
+    // The meta decision lives on the original wire (B-02 can intercept it).
+    expect(r.original_pipeline).toEqual(["planner", "executor", "conductor_replan", "synthesizer"]);
+    // The executable stage list contains only the model-emitted worker
+    // stages (planner + executor) plus the canonical synthesizer suffix.
+    // The meta decision never leaks into execution.
+    expect(r.pipeline).toContain("planner");
+    expect(r.pipeline).toContain("executor");
+    expect(r.pipeline).toContain("synthesizer");
+    expect(r.pipeline).not.toContain("conductor_replan");
+  });
+
+  test("B-01: conductor_replan alongside re-enter:executor keeps both in original_pipeline", () => {
+    // A model that wants to replan via the conductor AND re-enter executor
+    // (e.g. after a replan decides the executor needs another pass). Both
+    // meta decisions must survive normalization; the re-enter:executor
+    // maps to the executor stage and is deduplicated by the Set-based
+    // include block.
+    const r = normalizeRoute(
+      decision(["planner", "executor", "conductor_replan", "re-enter:executor", "synthesizer"]),
+      "answer_only",
+      "model",
+    );
+    expect(r.original_pipeline).toEqual([
+      "planner",
+      "executor",
+      "conductor_replan",
+      "re-enter:executor",
+      "synthesizer",
+    ]);
+    expect(r.pipeline).toContain("executor");
+    expect(r.pipeline).toContain("synthesizer");
+    expect(r.pipeline).not.toContain("conductor_replan");
+  });
+
+  test("B-01: a pipeline of only conductor_replan still resolves to synthesizer", () => {
+    // Defensive normalization: a model that emits ONLY the meta decision
+    // must still produce a usable pipeline so the user gets an answer.
+    const r = normalizeRoute(decision(["conductor_replan"]), "answer_only", "model");
+    expect(r.original_pipeline).toEqual(["conductor_replan"]);
+    expect(r.pipeline).toEqual(["synthesizer"]);
+    expect(r.profile).toBe("read_only");
+  });
 });
