@@ -241,7 +241,8 @@ End-to-end: user sees distilled candidate, eval result, and can approve or rever
 ### B-01: Routing schema — `conductor_replan` decision type
 
 **Type:** AFK  
-**Blocked by:** A-02
+**Blocked by:** A-02  
+**Status:** ✅ Done (2026-06-30 evening, Jarvis maintenance pass)
 
 #### What to build
 
@@ -251,10 +252,10 @@ End-to-end: fixture routing JSON with `conductor_replan` validates and survives 
 
 #### Acceptance criteria
 
-- [ ] Gemma `route_pipeline` tool schema includes replan field/stage
-- [ ] `Coordinator.validate()` accepts replan decisions
-- [ ] `normalizeRoute` preserves replan where appropriate
-- [ ] New coordinator unit tests
+- [x] Gemma `route_pipeline` tool schema includes replan field/stage
+- [x] `Coordinator.validate()` accepts replan decisions
+- [x] `normalizeRoute` preserves replan where appropriate
+- [x] New coordinator unit tests
 
 ---
 
