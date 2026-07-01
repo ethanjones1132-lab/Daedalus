@@ -429,6 +429,7 @@ export class PipelineExecutor {
                 arguments: call.arguments,
                 output: toolResult.output,
                 is_error: toolResult.is_error,
+                error_code: toolResult.error_code,
                 duration_ms: toolResult.duration_ms ?? 0,
               });
               rewriterMessages.push({ role: "tool", tool_call_id: tc.id, name: tc.name, content: toolResult.output });
@@ -474,6 +475,13 @@ export class PipelineExecutor {
       onStateChange({ stage: "rewriter", status: "done", output: narrative });
       return { ok: true, narrative, toolCalls };
     } catch (e: any) {
+      // NOTE (intentional, reviewed change from pre-extraction behavior): before
+      // this refactor, a rewriter-turn failure rethrew out of the inline rewrite
+      // block and was caught by the outer reviewer-loop catch, which mislabeled
+      // it as a "reviewer" failure (wrong onStateChange stage, a duplicate
+      // mode_id:"reviewer" telemetry row) and aborted the review/rewrite loop
+      // immediately. Catching it here instead gives correct stage attribution
+      // and lets the loop continue past a transient rewriter failure.
       const message = errText(e);
       onStateChange({ stage: "rewriter", status: "failed", output: message });
       return { ok: false, narrative: message, toolCalls };
