@@ -20,6 +20,7 @@ function buildJudgePrompt(request: string, answer: string, rubric: string[]): st
     "Respond with ONLY a single JSON object of the shape:",
     `{"covered": ["<rubric item text>", ...], "missed": ["<rubric item text>", ...]}`,
     "Every rubric item must appear in exactly one of the two arrays. No other text.",
+    "Copy each rubric item's text byte-for-byte/verbatim from the list below — do not paraphrase, reword, or reformat it.",
     "",
     `User request:\n${request}`,
     "",
@@ -33,6 +34,9 @@ function extractJudgeJson(text: string): { covered: string[]; missed: string[] }
   try {
     return JSON.parse(text.trim());
   } catch {}
+  // Judge models often wrap their JSON in prose or markdown code fences despite
+  // being told not to. Fall back to extracting the outermost `{...}` span and
+  // parsing that instead of giving up on the whole response.
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
   if (start !== -1 && end !== -1 && end > start) {
@@ -63,6 +67,10 @@ export async function judgeAnswer(
     return { score: 0, covered: [], missed: rubric, rationale: `Judge output unparseable: ${resp.content.slice(0, 200)}` };
   }
 
+  // Exact-string matching against the rubric: a known, accepted limitation.
+  // If the judge paraphrases a covered item's text instead of echoing it
+  // verbatim, that item is silently NOT credited (it drops into `missed`
+  // below) — this is why the prompt now explicitly asks for verbatim echoing.
   const covered = parsed.covered.filter((item) => rubric.includes(item));
   const missed = rubric.filter((item) => !covered.includes(item));
   return {
