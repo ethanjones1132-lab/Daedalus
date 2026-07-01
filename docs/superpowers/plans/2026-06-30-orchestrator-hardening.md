@@ -595,7 +595,7 @@ git commit -m "refactor(orchestrator): extract runExecutorStage with structured 
 **Files:**
 - Modify: `server-jarvis/src/orchestration/pipeline.ts`
 
-- [ ] **Step 1: Add `runRewriterStage`**
+- [x] **Step 1: Add `runRewriterStage`**
 
 ```typescript
   private async runRewriterStage(
@@ -704,7 +704,7 @@ git commit -m "refactor(orchestrator): extract runExecutorStage with structured 
   }
 ```
 
-- [ ] **Step 2: Add `runReviewerRewriterLoop`**
+- [x] **Step 2: Add `runReviewerRewriterLoop`**
 
 ```typescript
   private async runReviewerRewriterLoop(
@@ -802,7 +802,7 @@ git commit -m "refactor(orchestrator): extract runExecutorStage with structured 
   }
 ```
 
-- [ ] **Step 3: Replace the inline "3. Reviewer & Rewriter Correction Loop" block in `execute()`**
+- [x] **Step 3: Replace the inline "3. Reviewer & Rewriter Correction Loop" block in `execute()`**
 
 ```typescript
     if (pipeline.includes("reviewer")) {
@@ -816,12 +816,12 @@ git commit -m "refactor(orchestrator): extract runExecutorStage with structured 
     const rewriterSummary = renderRewriterSummary(state.rewriter);
 ```
 
-- [ ] **Step 4: Run the test suite**
+- [x] **Step 4: Run the test suite**
 
 Run: `cd server-jarvis && bun test src/orchestration.test.ts src/orchestration/`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server-jarvis/src/orchestration/pipeline.ts
@@ -837,7 +837,7 @@ This is the task that actually enables B-02: `executeSegment` can run any bounde
 **Files:**
 - Modify: `server-jarvis/src/orchestration/pipeline.ts`
 
-- [ ] **Step 1: Widen `PipelineProgressState.stage` to include `"conductor_replan"`**
+- [x] **Step 1: Widen `PipelineProgressState.stage` to include `"conductor_replan"`**
 
 ```typescript
 export interface PipelineProgressState {
@@ -847,7 +847,7 @@ export interface PipelineProgressState {
 }
 ```
 
-- [ ] **Step 2: Add `runSynthesizerStage`**
+- [x] **Step 2: Add `runSynthesizerStage`**
 
 ```typescript
   private async runSynthesizerStage(
@@ -929,7 +929,7 @@ export interface PipelineProgressState {
   }
 ```
 
-- [ ] **Step 3: Add `PipelineSegmentResult` and `executeSegment`**
+- [x] **Step 3: Add `PipelineSegmentResult` and `executeSegment`**
 
 ```typescript
 export interface PipelineSegmentResult {
@@ -992,7 +992,7 @@ export interface PipelineSegmentResult {
   }
 ```
 
-- [ ] **Step 4: Rewrite `execute()`'s linear branch to delegate to `executeSegment`**
+- [x] **Step 4: Rewrite `execute()`'s linear branch to delegate to `executeSegment`**
 
 Replace the ENTIRE body of `execute()` from the `let plan = "No planning stage executed.";` line down through the `const result: PipelineResult = { ... };` / `applyRecursiveCritique` return at the end (i.e. everything after the `canRunSpeculativeCascade` check and before the closing brace of `execute()`) with:
 
@@ -1041,17 +1041,17 @@ Replace the ENTIRE body of `execute()` from the `let plan = "No planning stage e
 
 Also delete the now-dead `hasIssues` private method's caller mismatch check — no, leave `hasIssues` in place, it's still called from `runReviewerRewriterLoop`. Just delete the old local variable declarations (`let plan = ...`, `let executorSummary = ...`, `let reviewerFeedback = ...`, `let rewriterSummary = ...`, `const profile = ...` — wait, `profile` is now computed inside `executeSegment`, so also remove the standalone `const profile: ExecutionProfile = options.executionProfile ?? "full";` line from `execute()` if it's left dangling unused) and the compatibility lines added in Tasks A3–A5 (`const plan = renderPlanSummary(...)`, `const executorSummary = renderExecutorSummary(...)`, etc.) — all of that is replaced by the single `executeSegment` call above.
 
-- [ ] **Step 5: Run the full test suite**
+- [x] **Step 5: Run the full test suite**
 
 Run: `cd server-jarvis && bun test`
 Expected: all 391+ tests pass. This is the highest-risk step in Group A — if anything fails, read the failing assertion carefully; it is almost certainly checking either (a) exact executor-summary text ordering (see Task A4's note — fix the assertion) or (b) a leftover unused variable causing a TS error (remove it).
 
-- [ ] **Step 6: Run `tsc --noEmit`**
+- [x] **Step 6: Run `tsc --noEmit`**
 
 Run: `cd server-jarvis && bunx tsc --noEmit`
 Expected: clean, no errors.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add server-jarvis/src/orchestration/pipeline.ts
@@ -1065,7 +1065,7 @@ git commit -m "refactor(orchestrator): extract runSynthesizerStage, add executeS
 **Files:**
 - Modify: `server-jarvis/src/orchestration.test.ts`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `server-jarvis/src/orchestration.test.ts` (reuse the file's existing `testCollector`/`runtime`/`ctx` test fixtures — read the top of the file for their exact construction before writing this test, since they're already defined there for the other `PipelineExecutor` tests):
 
@@ -1096,17 +1096,17 @@ Add to `server-jarvis/src/orchestration.test.ts` (reuse the file's existing `tes
   });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd server-jarvis && bun test src/orchestration.test.ts -t "executeSegment"`
 Expected: FAIL if `executeSegment` isn't public/exported correctly, or PASS immediately if Task A6 already made it correct (in which case this step confirms the behavior rather than driving new code — still valuable as a regression pin, commit it either way).
 
-- [ ] **Step 3: Fix and re-run until green**
+- [x] **Step 3: Fix and re-run until green**
 
 Run: `cd server-jarvis && bun test src/orchestration.test.ts -t "executeSegment"`
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add server-jarvis/src/orchestration.test.ts

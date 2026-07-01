@@ -24,7 +24,7 @@ export interface StageRunRecorder {
 }
 
 export interface PipelineProgressState {
-  stage: "planner" | "executor" | "reviewer" | "rewriter" | "synthesizer";
+  stage: "planner" | "executor" | "reviewer" | "rewriter" | "synthesizer" | "conductor_replan";
   status: "running" | "done" | "failed";
   output?: string;
 }
@@ -108,6 +108,20 @@ export interface PipelineResult {
   outcome?: PipelineOutcome;
   /** Machine-readable failure reason (e.g. "empty_completion", "auth_401"). */
   error_code?: string;
+}
+
+/**
+ * Result of running a bounded slice of the pipeline (one or more stages from
+ * `{planner, executor, reviewer, rewriter, synthesizer}`). Carries the typed
+ * `PipelineStageState` forward so a B-02 replan loop can hand the conductor
+ * real findings, not truncated strings. Synthesizer outputs are populated
+ * only when `"synthesizer"` was in the segment's `stages` list.
+ */
+export interface PipelineSegmentResult {
+  state: PipelineStageState;
+  synthesizerAnswer?: string;
+  synthesizerFatalError?: string;
+  synthesizerEmptyCompletion?: boolean;
 }
 
 /**
@@ -570,6 +584,152 @@ export class PipelineExecutor {
     };
   }
 
+  /**
+   * Synthesizer stage — produces the user-visible answer from accumulated
+   * pipeline state. Behavior is identical to the previous inline synthesizer
+   * block in `execute()`: same prompts, same telemetry, same empty-completion
+   * fence, same throw-handled fallback. Extracted so `executeSegment()` (and
+   * the B-02 replan loop) can call it with already-built `PipelineStageState`.
+   *
+   * Returns `{ answer, fatalError?, emptyCompletion }` so the caller can
+   * classify the run outcome (success / degraded / failed) without
+   * string-prefix sniffing.
+   */
+  private async runSynthesizerStage(
+    request: string,
+    state: PipelineStageState,
+    agentRunId: string,
+    onStateChange: (state: PipelineProgressState) => void,
+    options: PipelineExecuteOptions,
+  ): Promise<{ answer: string; fatalError?: string; emptyCompletion: boolean }> {
+    onStateChange({ stage: "synthesizer", status: "running" });
+    const synthesizerPrompt = stageSystemPrompt("synthesizer", options);
+    const synthStartTime = Date.now();
+    const contextText = buildSynthesizerContextFromStageState(request, state);
+    try {
+      const resp = await this.callModel([
+        { role: "system", content: synthesizerPrompt },
+        { role: "user", content: contextText }
+      ] as ChatMessage[], {
+        temperature: BUILTIN_MODES.synthesizer.temperature,
+        max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
+        stream: true,
+        stageLabel: "synthesizer",
+        surfaceAsAnswer: true,
+        onChunk: (chunk) => {
+          onStateChange({ stage: "synthesizer", status: "running", output: chunk });
+        }
+      });
+      const finalAnswer = resp.content ?? "";
+
+      // Semantic emptiness is a FAILURE, not a success. A 200-OK with empty
+      // visible content (free-tier zero-token completion, model spent its
+      // budget on reasoning, etc.) previously recorded was_successful:1 with
+      // output_tokens:0 — poisoning the self-tuning signal and surfacing a
+      // blank turn. Record it as a failed stage; the caller still shows the
+      // friendly "try again" notice (we leave `fatalError` unset so it is not
+      // an error banner) but the run outcome is truthfully failed.
+      if (!finalAnswer.trim()) {
+        onStateChange({ stage: "synthesizer", status: "failed", output: "(empty completion)" });
+        this.collector.recordStageRun({
+          id: `stage_${crypto.randomUUID()}`,
+          agent_run_id: agentRunId,
+          mode_id: "synthesizer",
+          turn_number: 1,
+          input_tokens: Math.round((synthesizerPrompt.length + contextText.length) / 4),
+          output_tokens: 0,
+          tool_calls_json: "[]",
+          duration_ms: Date.now() - synthStartTime,
+          was_successful: 0,
+          had_error: 1,
+          error_message: "empty_completion",
+        });
+        return { answer: "", emptyCompletion: true };
+      }
+
+      onStateChange({ stage: "synthesizer", status: "done", output: finalAnswer });
+      this.collector.recordStageRun({
+        id: `stage_${crypto.randomUUID()}`,
+        agent_run_id: agentRunId,
+        mode_id: "synthesizer",
+        turn_number: 1,
+        input_tokens: Math.round((synthesizerPrompt.length + contextText.length) / 4),
+        output_tokens: countTokens(finalAnswer),
+        tool_calls_json: "[]",
+        duration_ms: Date.now() - synthStartTime,
+        was_successful: 1,
+        had_error: 0,
+      });
+      return { answer: finalAnswer, emptyCompletion: false };
+    } catch (e: any) {
+      const message = errText(e);
+      onStateChange({ stage: "synthesizer", status: "failed", output: message });
+      const fatalError = describePipelineError(message);
+      this.collector.recordStageRun({
+        id: `stage_${crypto.randomUUID()}`,
+        agent_run_id: agentRunId,
+        mode_id: "synthesizer",
+        turn_number: 1,
+        tool_calls_json: "[]",
+        duration_ms: Date.now() - synthStartTime,
+        was_successful: 0,
+        had_error: 1,
+        error_message: message,
+      });
+      return { answer: `Synthesis failed: ${message}`, fatalError, emptyCompletion: false };
+    }
+  }
+
+  /**
+   * Run a bounded slice of {planner, executor, reviewer, rewriter, synthesizer}
+   * against a `carry`-forward state. Used directly by `execute()`'s linear
+   * branch (with the full pipeline as `stages`) and by the B-02 replan loop
+   * (`replan-loop.ts`) to run one segment between `conductor_replan` markers.
+   * Synthesizer only runs if `"synthesizer"` is in `stages` — a non-terminal
+   * segment stops right after reviewer/rewriter so the replan loop can
+   * re-invoke the conductor with the accumulated state.
+   */
+  async executeSegment(
+    request: string,
+    stages: StageName[],
+    agentRunId: string,
+    onStateChange: (state: PipelineProgressState) => void,
+    options: PipelineExecuteOptions,
+    carry: PipelineStageState = {},
+  ): Promise<PipelineSegmentResult> {
+    const state: PipelineStageState = { ...carry };
+    const profile: ExecutionProfile = options.executionProfile ?? "full";
+
+    if (stages.includes("planner")) {
+      state.plan = await this.runPlannerStage(request, agentRunId, onStateChange, options);
+    }
+    if (stages.includes("executor")) {
+      state.executor = await this.runExecutorStage(
+        request, renderPlanSummary(state.plan), agentRunId, onStateChange, options, profile,
+      );
+    }
+    if (stages.includes("reviewer")) {
+      const { reviewer, rewriter } = await this.runReviewerRewriterLoop(
+        request, renderPlanSummary(state.plan), renderExecutorSummary(state.executor),
+        agentRunId, onStateChange, options, profile,
+      );
+      state.reviewer = reviewer;
+      if (rewriter) state.rewriter = rewriter;
+    }
+
+    if (!stages.includes("synthesizer")) {
+      return { state };
+    }
+
+    const synth = await this.runSynthesizerStage(request, state, agentRunId, onStateChange, options);
+    return {
+      state,
+      synthesizerAnswer: synth.answer,
+      synthesizerFatalError: synth.fatalError,
+      synthesizerEmptyCompletion: synth.emptyCompletion,
+    };
+  }
+
   async execute(
     request: string,
     pipeline: string[],
@@ -584,153 +744,37 @@ export class PipelineExecutor {
       return this.executeSpeculativeCascade(request, agentRunId, onStateChange, options);
     }
 
-    // Compatibility shim — reviewerFeedback and rewriterSummary are derived
-    // from state.reviewer / state.rewriter below (after runReviewerRewriterLoop
-    // populates them). The old in-place `let` placeholders are gone: the
-    // reviewer/rewriter state is now carried entirely by `state` and the
-    // synthesizer block reads the re-derived consts (deleted in A6 once
-    // the synthesizer block is migrated to read `state` directly).
-
-    // Least-authority tool profile for executor/rewriter. `full` keeps the legacy
-    // behavior; `read_only` caps a workspace-read turn to read-only tools so a
-    // misclassified read can never mutate the workspace.
-    const profile: ExecutionProfile = options.executionProfile ?? "full";
-
-    // 1. Planner Stage
-    let state: PipelineStageState = {};
-    if (pipeline.includes("planner")) {
-      state.plan = await this.runPlannerStage(request, agentRunId, onStateChange, options);
-    }
-    // Compatibility shim — the executor/reviewer/synthesizer blocks below
-    // still reference the old `plan` string. This re-derives it from the
-    // structured state via the canonical renderer. Deleted in A6 once
-    // every block is migrated to read `state` directly.
-    const plan = renderPlanSummary(state.plan);
-
-    // 2. Executor Stage
-    if (pipeline.includes("executor")) {
-      state.executor = await this.runExecutorStage(request, plan, agentRunId, onStateChange, options, profile);
-    }
-    // Compatibility shim — the reviewer/synthesizer blocks below still
-    // reference the old `executorSummary` string. Re-derived from the
-    // structured state via the canonical renderer. Deleted in A6 once
-    // every block is migrated to read `state` directly.
-    const executorSummary = renderExecutorSummary(state.executor);
-
-    if (pipeline.includes("reviewer")) {
-      const { reviewer, rewriter } = await this.runReviewerRewriterLoop(
-        request, plan, executorSummary, agentRunId, onStateChange, options, profile,
-      );
-      state.reviewer = reviewer;
-      if (rewriter) state.rewriter = rewriter;
-    }
-    // Compatibility shims — the synthesizer block below still references
-    // the old `reviewerFeedback` and `rewriterSummary` strings. Re-derived
-    // from the structured state via the canonical renderers. Deleted in A6
-    // once the synthesizer block is migrated to read `state` directly.
-    const reviewerFeedback = renderReviewerSummary(state.reviewer);
-    const rewriterSummary = renderRewriterSummary(state.rewriter);
-
-    // 4. Synthesizer Stage
-    let finalAnswer = "";
-    let fatalError: string | undefined;
-    let emptyCompletion = false;
-    if (pipeline.includes("synthesizer")) {
-      onStateChange({ stage: "synthesizer", status: "running" });
-      const synthesizerPrompt = stageSystemPrompt("synthesizer", options);
-      const synthStartTime = Date.now();
-      try {
-        const resp = await this.callModel([
-          { role: "system", content: synthesizerPrompt },
-          {
-            role: "user",
-            content: buildSynthesizerContext(request, { plan, executorSummary, reviewerFeedback, rewriterSummary })
-          }
-        ] as ChatMessage[], {
-          temperature: BUILTIN_MODES.synthesizer.temperature,
-          max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
-          stream: true,
-          stageLabel: "synthesizer",
-          surfaceAsAnswer: true,
-          onChunk: (chunk) => {
-            onStateChange({ stage: "synthesizer", status: "running", output: chunk });
-          }
-        });
-        finalAnswer = resp.content ?? "";
-
-        // Semantic emptiness is a FAILURE, not a success. A 200-OK with empty
-        // visible content (free-tier zero-token completion, model spent its
-        // budget on reasoning, etc.) previously recorded was_successful:1 with
-        // output_tokens:0 — poisoning the self-tuning signal and surfacing a
-        // blank turn. Record it as a failed stage; the caller still shows the
-        // friendly "try again" notice (we leave `fatalError` unset so it is not
-        // an error banner) but the run outcome is truthfully failed.
-        if (!finalAnswer.trim()) {
-          emptyCompletion = true;
-          onStateChange({ stage: "synthesizer", status: "failed", output: "(empty completion)" });
-          this.collector.recordStageRun({
-            id: `stage_${crypto.randomUUID()}`,
-            agent_run_id: agentRunId,
-            mode_id: "synthesizer",
-            turn_number: 1,
-            input_tokens: Math.round((synthesizerPrompt.length + request.length + plan.length + executorSummary.length + reviewerFeedback.length + rewriterSummary.length) / 4),
-            output_tokens: 0,
-            tool_calls_json: "[]",
-            duration_ms: Date.now() - synthStartTime,
-            was_successful: 0,
-            had_error: 1,
-            error_message: "empty_completion",
-          });
-        } else {
-          onStateChange({ stage: "synthesizer", status: "done", output: finalAnswer });
-          this.collector.recordStageRun({
-            id: `stage_${crypto.randomUUID()}`,
-            agent_run_id: agentRunId,
-            mode_id: "synthesizer",
-            turn_number: 1,
-            input_tokens: Math.round((synthesizerPrompt.length + request.length + plan.length + executorSummary.length + reviewerFeedback.length + rewriterSummary.length) / 4),
-            output_tokens: countTokens(finalAnswer),
-            tool_calls_json: "[]",
-            duration_ms: Date.now() - synthStartTime,
-            was_successful: 1,
-            had_error: 0,
-          });
-        }
-      } catch (e: any) {
-        onStateChange({ stage: "synthesizer", status: "failed", output: errText(e) });
-        // The synthesizer produces the turn's actual answer. If it threw, there
-        // is no answer — record the failure so the caller emits an error frame
-        // instead of passing "Synthesis failed: …" off as a successful result.
-        fatalError = describePipelineError(errText(e));
-        finalAnswer = `Synthesis failed: ${errText(e)}`;
-
-        this.collector.recordStageRun({
-          id: `stage_${crypto.randomUUID()}`,
-          agent_run_id: agentRunId,
-          mode_id: "synthesizer",
-          turn_number: 1,
-          tool_calls_json: "[]",
-          duration_ms: Date.now() - synthStartTime,
-          was_successful: 0,
-          had_error: 1,
-          error_message: errText(e),
-        });
-      }
-    } else {
-      // Fallback: return the last completed phase output.
-      finalAnswer = plan !== "No planning stage executed." ? plan : "No planning stage executed.";
-    }
+    // Linear branch — delegate the full pipeline to executeSegment(). All
+    // stage ordering, telemetry, empty-completion fencing, and review/rewrite
+    // looping live inside the segment helper, so the B-02 replan loop can
+    // run the same code with a partial stages list.
+    const segment = await this.executeSegment(
+      request, pipeline as StageName[], agentRunId, onStateChange, options,
+    );
+    const { state } = segment;
 
     // Truthful run outcome. A failed synthesizer (threw OR empty) is `failed`.
     // A run whose answer came through but an upstream stage failed is `degraded`.
-    const upstreamDegraded =
-      plan.startsWith("Failed to generate plan") || executorSummary.startsWith("Executor failed");
+    const upstreamDegraded = Boolean(
+      (state.plan && !state.plan.ok) || (state.executor && !state.executor.ok),
+    );
+
+    if (segment.synthesizerAnswer === undefined) {
+      // No synthesizer in this pipeline: fall back to the last completed phase.
+      return {
+        answer: state.plan ? renderPlanSummary(state.plan) : "No planning stage executed.",
+        recursion_depth: 0,
+        outcome: upstreamDegraded ? "degraded" : "success",
+        error_code: upstreamDegraded ? "upstream_stage_failed" : undefined,
+      };
+    }
+
     let outcome: PipelineOutcome;
     let errorCode: string | undefined;
-    if (fatalError) {
+    if (segment.synthesizerFatalError) {
       outcome = "failed";
       errorCode = "stage_error";
-    } else if (emptyCompletion) {
+    } else if (segment.synthesizerEmptyCompletion) {
       outcome = "failed";
       errorCode = "empty_completion";
     } else if (upstreamDegraded) {
@@ -741,13 +785,13 @@ export class PipelineExecutor {
     }
 
     const result: PipelineResult = {
-      answer: emptyCompletion ? "" : finalAnswer,
-      error: fatalError,
+      answer: segment.synthesizerEmptyCompletion ? "" : segment.synthesizerAnswer,
+      error: segment.synthesizerFatalError,
       recursion_depth: 0,
       outcome,
       error_code: errorCode,
     };
-    if (!fatalError && !emptyCompletion && pipeline.includes("synthesizer")) {
+    if (!segment.synthesizerFatalError && !segment.synthesizerEmptyCompletion && pipeline.includes("synthesizer")) {
       return this.applyRecursiveCritique(request, result, agentRunId, onStateChange, options);
     }
     return result;

@@ -327,6 +327,104 @@ describe("Orchestration & Routing Tests", () => {
     expect(recursionEvents.some((event) => event.depth === 0 && event.status === "max_depth" && event.reenter_stage === "executor")).toBe(true);
   });
 
+  test("executeSegment runs only the requested stages and returns typed state", async () => {
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig);
+    const stages: string[] = [];
+
+    // Returns predictable content per stageLabel so we can verify the segment
+    // called the right stage helpers and skipped the rest.
+    const callModel = (_messages: ChatMessage[], options: { stageLabel?: string } = {}) => {
+      stages.push(options.stageLabel ?? "unknown");
+      if (options.stageLabel === "planner") return Promise.resolve({ content: "PLAN: read the file" });
+      if (options.stageLabel === "executor") return Promise.resolve({ content: "executor narrative", tool_calls: [] });
+      if (options.stageLabel === "reviewer") return Promise.resolve({ content: "Reviewer: looks complete." });
+      if (options.stageLabel === "synthesizer") return Promise.resolve({ content: "synthesized answer" });
+      return Promise.resolve({ content: "unexpected" });
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+
+    // A non-terminal segment: planner + executor + reviewer (no synthesizer)
+    // — exactly what the B-02 replan loop runs between `conductor_replan`
+    // markers. The result should have a populated typed state but no
+    // synthesizer fields.
+    const partial = await executor.executeSegment(
+      "do the thing",
+      ["planner", "executor", "reviewer"],
+      "run-segment-partial",
+      () => {},
+      {},
+    );
+
+    expect(partial.synthesizerAnswer).toBeUndefined();
+    expect(partial.synthesizerFatalError).toBeUndefined();
+    expect(partial.synthesizerEmptyCompletion).toBeUndefined();
+    expect(partial.state.plan?.ok).toBe(true);
+    expect(partial.state.plan?.narrative).toBe("PLAN: read the file");
+    expect(partial.state.executor?.ok).toBe(true);
+    expect(partial.state.executor?.narrative).toBe("executor narrative");
+    expect(partial.state.reviewer?.ok).toBe(true);
+    expect(partial.state.reviewer?.feedback).toBe("Reviewer: looks complete.");
+    // Planner and executor stages ran; reviewer ran once; synthesizer did NOT.
+    expect(stages).toEqual(["planner", "executor", "reviewer"]);
+
+    // A full segment that includes the synthesizer populates the answer fields.
+    const stages2: string[] = [];
+    const callModel2 = (_messages: ChatMessage[], options: { stageLabel?: string } = {}) => {
+      stages2.push(options.stageLabel ?? "unknown");
+      if (options.stageLabel === "planner") return Promise.resolve({ content: "plan" });
+      if (options.stageLabel === "synthesizer") return Promise.resolve({ content: "final answer" });
+      return Promise.resolve({ content: "noop" });
+    };
+    const executor2 = new PipelineExecutor(callModel2 as any, runtime, ctx, testCollector);
+    const full = await executor2.executeSegment(
+      "skip executor",
+      ["planner", "synthesizer"],
+      "run-segment-full",
+      () => {},
+      {},
+    );
+
+    expect(full.synthesizerAnswer).toBe("final answer");
+    expect(full.synthesizerEmptyCompletion).toBe(false);
+    expect(stages2).toEqual(["planner", "synthesizer"]);
+  });
+
+  test("executeSegment threads carry-forward state into the next segment", async () => {
+    // The B-02 replan loop hands the conductor a summarized carry state from
+    // segment N, and segment N+1 should be able to read those typed values
+    // (not re-derive them from strings). This pins the carry contract.
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig);
+    const callModel = (_messages: ChatMessage[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "synthesizer") return Promise.resolve({ content: "synthesized with carry" });
+      return Promise.resolve({ content: "noop" });
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+
+    const carry = {
+      plan: { ok: true, narrative: "carry plan" },
+      executor: { ok: true, narrative: "carry exec", toolCalls: [] },
+      reviewer: { ok: true, feedback: "carry review", hasIssues: false },
+    } as const;
+
+    const result = await executor.executeSegment(
+      "continue",
+      ["synthesizer"],
+      "run-segment-carry",
+      () => {},
+      {},
+      { ...carry },
+    );
+
+    // The carry state is passed through unchanged; the synthesizer only runs
+    // because the segment asked for it.
+    expect(result.state.plan).toEqual(carry.plan);
+    expect(result.state.executor).toEqual(carry.executor);
+    expect(result.state.reviewer).toEqual(carry.reviewer);
+    expect(result.synthesizerAnswer).toBe("synthesized with carry");
+  });
+
   test("errText safely stringifies non-Error throws without crashing", () => {
     expect(errText(new Error("boom"))).toBe("boom");
     expect(errText("plain string")).toBe("plain string");
