@@ -7,7 +7,12 @@
 
 import type { CoordinatorResult, StageName } from "./coordinator";
 import type { PipelineStageState } from "./stage-output";
-import { renderExecutorSummary, renderPlanSummary, renderReviewerSummary } from "./stage-output";
+import {
+  renderExecutorSummary,
+  renderPlanSummary,
+  renderReviewerSummary,
+  renderRewriterSummary,
+} from "./stage-output";
 
 /**
  * Split a coordinator's raw pipeline into ordered stage-name segments at each
@@ -15,6 +20,11 @@ import { renderExecutorSummary, renderPlanSummary, renderReviewerSummary } from 
  * target stage (matching `Coordinator.executablePipeline`); nulls and empty
  * segments (e.g. two replan markers back to back) are dropped. A pipeline
  * with no `conductor_replan` marker returns exactly one segment.
+ *
+ * If every step is dropped (empty pipeline, or a pipeline consisting only of
+ * `conductor_replan` markers), returns a single `["synthesizer"]` segment
+ * rather than an empty list, so callers can always assume at least one
+ * non-empty segment.
  */
 export function splitPipelineAtReplan(pipeline: CoordinatorResult["pipeline"]): StageName[][] {
   const segments: StageName[][] = [[]];
@@ -27,7 +37,8 @@ export function splitPipelineAtReplan(pipeline: CoordinatorResult["pipeline"]): 
     const stage = step.startsWith("re-enter:") ? step.slice("re-enter:".length) : step;
     segments[segments.length - 1].push(stage as StageName);
   }
-  return segments.filter((segment) => segment.length > 0);
+  const nonEmpty = segments.filter((segment) => segment.length > 0);
+  return nonEmpty.length > 0 ? nonEmpty : [["synthesizer"]];
 }
 
 /**
@@ -45,6 +56,7 @@ export function buildReplanRequest(
     `Plan so far:\n${renderPlanSummary(state.plan)}`,
     `Executor findings so far:\n${renderExecutorSummary(state.executor)}`,
     state.reviewer ? `Reviewer feedback so far:\n${renderReviewerSummary(state.reviewer)}` : "",
+    state.rewriter ? `Rewriter activity so far:\n${renderRewriterSummary(state.rewriter)}` : "",
     remainingStages.length > 0
       ? `Stages the previous route still had queued after this replan point: ${remainingStages.join(", ")}`
       : "No stages were queued after this replan point — re-derive from scratch.",

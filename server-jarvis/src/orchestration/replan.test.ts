@@ -28,6 +28,14 @@ describe("splitPipelineAtReplan", () => {
     const result = splitPipelineAtReplan(["executor", "conductor_replan", "conductor_replan", "synthesizer"]);
     expect(result).toEqual([["executor"], ["synthesizer"]]);
   });
+
+  test("falls back to a synthesizer-only segment for an empty pipeline", () => {
+    expect(splitPipelineAtReplan([])).toEqual([["synthesizer"]]);
+  });
+
+  test("falls back to a synthesizer-only segment when the pipeline is only replan markers", () => {
+    expect(splitPipelineAtReplan(["conductor_replan"])).toEqual([["synthesizer"]]);
+  });
 });
 
 describe("buildReplanRequest", () => {
@@ -48,5 +56,13 @@ describe("buildReplanRequest", () => {
     const text = buildReplanRequest("do something", {}, []);
     expect(text).toContain("[MID-PIPELINE REPLAN]");
     expect(text).toContain("re-derive from scratch");
+  });
+
+  test("includes rewriter activity when present in carried state", () => {
+    const state: PipelineStageState = {
+      rewriter: { ok: true, narrative: "Rewrote the migration to be idempotent.", toolCalls: [] },
+    };
+    const text = buildReplanRequest("migrate the users table", state, []);
+    expect(text).toContain("Rewrote the migration to be idempotent.");
   });
 });
