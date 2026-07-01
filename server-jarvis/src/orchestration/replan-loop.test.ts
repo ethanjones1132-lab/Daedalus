@@ -100,6 +100,17 @@ describe("runPipelineWithReplanning", () => {
     });
 
     expect(coordinatorCalls).toBe(1); // exactly one replan invocation, then budget exhausted
+    // Executor legitimately runs twice here: once in the pre-budget segment,
+    // and again in the final segment, because the coordinator's LAST decision
+    // (returned just before the budget ran out) still explicitly lists
+    // "executor" — and an explicit request in the model's own decision always
+    // wins over "already completed", even across the budget-exhaustion
+    // boundary. This mirrors the deliberate-re-run guarantee (see the
+    // "deliberately re-requested executor runs again" test above): the loop
+    // intentionally trusts the model's latest explicit stage list rather than
+    // inferring staleness, bounded by maxReplans so the worst case is a few
+    // extra model calls, never incorrect output.
+    expect(stageLabels).toEqual(["executor", "executor", "reviewer", "synthesizer"]);
     expect(result.outcome).toBe("success");
   });
 
