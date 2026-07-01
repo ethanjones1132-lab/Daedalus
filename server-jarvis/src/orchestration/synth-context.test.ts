@@ -1,5 +1,6 @@
 import { describe, test, expect } from "bun:test";
-import { buildSynthesizerContext } from "./synth-context";
+import { buildSynthesizerContext, buildSynthesizerContextFromStageState } from "./synth-context";
+import type { PipelineStageState } from "./stage-output";
 
 describe("buildSynthesizerContext", () => {
   test("synthesizer-only turn passes just the user request (no empty scaffolding)", () => {
@@ -43,5 +44,31 @@ describe("buildSynthesizerContext", () => {
     expect(out).toContain("Ran the build successfully.");
     expect(out).not.toContain("<think>");
     expect(out).not.toContain("internal planning");
+  });
+});
+
+describe("buildSynthesizerContextFromStageState", () => {
+  test("omits sections with no meaningful stage output", () => {
+    const state: PipelineStageState = {};
+    const context = buildSynthesizerContextFromStageState("hello", state);
+    expect(context).toBe("User Request: hello");
+  });
+
+  test("renders plan/executor/reviewer/rewriter sections from structured state", () => {
+    const state: PipelineStageState = {
+      plan: { ok: true, narrative: "Read config.ts first." },
+      executor: {
+        ok: true,
+        narrative: "Read the file.",
+        toolCalls: [{ name: "read_file", arguments: { path: "config.ts" }, output: "export const x = 1;", is_error: false, duration_ms: 3 }],
+      },
+      reviewer: { ok: true, feedback: "Complete.", hasIssues: false },
+    };
+    const context = buildSynthesizerContextFromStageState("read config.ts", state);
+    expect(context).toContain("Original Plan:\nRead config.ts first.");
+    expect(context).toContain("Executor Activity:");
+    expect(context).toContain("export const x = 1;");
+    expect(context).toContain("Reviewer Feedback:\nComplete.");
+    expect(context).not.toContain("Rewriter Activity:");
   });
 });
