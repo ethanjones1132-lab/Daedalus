@@ -78,8 +78,18 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
       // already have run in an earlier segment and be sitting in `carry` —
       // re-running it here would silently overwrite that carried state and
       // double-invoke the stage. Drop anything already completed so each
-      // stage in the whole replan run executes at most once.
-      const remainingPipeline = normalized.pipeline.filter((stage) => !isStageCompleted(stage, carry));
+      // stage in the whole replan run executes at most once — UNLESS the
+      // post-replan decision explicitly re-requested that stage (plainly or
+      // via `re-enter:<stage>`), e.g. the coordinator decided the earlier
+      // executor pass was wrong and wants it redone with new instructions.
+      // Explicit presence in the model's own decision always wins over
+      // carry-presence; only a stage that's both already-done AND never
+      // asked for again gets filtered as a spurious `normalizeRoute`
+      // re-injection.
+      const explicitlyRequested = new Set(splitPipelineAtReplan(decision.pipeline).flat());
+      const remainingPipeline = normalized.pipeline.filter(
+        (stage) => explicitlyRequested.has(stage) || !isStageCompleted(stage, carry),
+      );
       const segment = await args.executor.executeSegment(
         args.contextMessage,
         remainingPipeline,

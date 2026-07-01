@@ -103,6 +103,50 @@ describe("runPipelineWithReplanning", () => {
     expect(result.outcome).toBe("success");
   });
 
+  test("deliberately re-requested executor runs again even though carry already has its output", async () => {
+    const stageLabels: string[] = [];
+    const callModel = async (_messages: any[], options?: any) => {
+      stageLabels.push(options?.stageLabel ?? "?");
+      return { content: `output for ${options?.stageLabel}` };
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+
+    let coordinatorCalls = 0;
+    const coordinator = new Coordinator((async () => ({ content: "unused" })) as any);
+    coordinator.route = (async (request: string) => {
+      coordinatorCalls += 1;
+      expect(request).toContain("[MID-PIPELINE REPLAN]");
+      // The coordinator decided the original executor pass was wrong and
+      // explicitly wants it redone with revised instructions.
+      return {
+        task_type: "debug",
+        pipeline: ["executor", "reviewer", "synthesizer"],
+        topology: "linear",
+        context: { needs_workspace_inspection: true, needs_memory: false, estimated_complexity: "medium" },
+        coordinator_rationale: "the original executor pass targeted the wrong table",
+        worker_instructions: { executor: "redo against the correct schema" },
+      } as CoordinatorResult;
+    }) as typeof coordinator.route;
+
+    const result = await runPipelineWithReplanning({
+      contextMessage: "migrate the users table",
+      initialDecision: baseDecision(),
+      turnRequirement: "workspace_read",
+      coordinator,
+      routeOptions: { sessionId: "s1" },
+      executor,
+      agentRunId: "run-replan-4",
+      onStateChange: () => {},
+      baseOptions: {},
+      maxReplans: 2,
+    });
+
+    expect(coordinatorCalls).toBe(1);
+    expect(stageLabels).toEqual(["executor", "executor", "reviewer", "synthesizer"]);
+    expect(stageLabels.filter((s) => s === "executor")).toHaveLength(2);
+    expect(result.outcome).toBe("success");
+  });
+
   test("read_only profile cannot escalate to full even if the replanned decision implies more authority", async () => {
     const profiles: Array<string | undefined> = [];
     const callModel = async () => ({ content: "ok" });
