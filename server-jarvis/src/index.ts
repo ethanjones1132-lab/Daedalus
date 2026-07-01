@@ -73,6 +73,7 @@ import { AgentPool, firstTokenTimeoutFor, formatPoolDiversity } from "./orchestr
 import { PipelineExecutor } from "./orchestration/pipeline";
 import { classifyTurnRequirements } from "./orchestration/turn-requirements";
 import { normalizeRoute, type ExecutionProfile } from "./orchestration/route-normalization";
+import { runPipelineWithReplanning } from "./orchestration/replan-loop";
 import { conductorLearning, outcomeCollector, selfTuningProposer, SelfTuningStore } from "./self-tuning/mod";
 import { conductorCacheSnapshot } from "./orchestration/conductor-metrics";
 import {
@@ -1766,15 +1767,17 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // Execute the pipeline
         const mergedSharedContext = mergeSharedContextHints(route.shared_context, memoryHints);
         const executor = new PipelineExecutor(callModel, runtime, ctx);
-        const result = await executor.execute(contextMessage, executablePipeline, agentRunId, async (state) => {
-          // Stream stage progress back to client
+        const onOrchestratorStateChange = async (state: Parameters<Parameters<typeof executor.execute>[3]>[0]) => {
+          // Stream stage progress back to client — "conductor_replan" (B-02)
+          // rides the same event type as an internal, non-user-facing status.
           await writer.write(encoder.encode(`data: ${JSON.stringify({
             type: "orchestrator_stage",
             stage: state.stage,
             status: state.status,
             session_id: sessionId
           })}\n\n`));
-        }, {
+        };
+        const pipelineOptions = {
           topology: normalized.topology,
           executionProfile,
           workerInstructions: instructionSelection.instructions,
@@ -1782,7 +1785,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           sessionMemory: sessionMemory,
           distilledSkillsBlock: resolvedSkills.promptBlock,
           maxRecursionDepth: cfg.orchestrator.max_recursion_depth,
-          onRecursion: async (event) => {
+          onRecursion: async (event: any) => {
             await writer.write(encoder.encode(`data: ${JSON.stringify({
               type: "orchestrator_recursion",
               depth: event.depth,
@@ -1792,7 +1795,26 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               session_id: sessionId
             })}\n\n`));
           },
-        });
+        };
+        const result = route.pipeline.includes("conductor_replan")
+          ? await runPipelineWithReplanning({
+              contextMessage,
+              initialDecision: route,
+              turnRequirement: turnReq.requirement,
+              coordinator,
+              routeOptions: {
+                sessionId,
+                history: turnHistory,
+                lastOutcome: sessionMemory.getLastOutcome(sessionId),
+                sessionMemoryHints: memoryHints,
+              },
+              executor,
+              agentRunId,
+              onStateChange: onOrchestratorStateChange,
+              baseOptions: pipelineOptions,
+              maxReplans: cfg.orchestrator.max_conductor_replans,
+            })
+          : await executor.execute(contextMessage, executablePipeline, agentRunId, onOrchestratorStateChange, pipelineOptions);
 
         // Record metrics and propose tuning options
         const duration = Date.now() - runStartTime;
