@@ -38,6 +38,9 @@ DumpStack.log
 # --- Local agent session notes (never commit) ---
 .hermes/
 
+# --- Claude Code worktrees (never commit) ---
+.claude/worktrees/
+
 # --- Local UI-automation diagnostic scratch (SkyLocal / ad-hoc screenshot helpers) ---
 sky-*.jpg
 sky-interact.mjs
