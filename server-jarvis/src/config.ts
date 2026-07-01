@@ -254,6 +254,10 @@ export interface OrchestratorConfig {
   enabled: boolean;
   agents: OrchestratorAgent[];
   max_recursion_depth: number;
+  /** B-02: bound on how many times a single turn may re-invoke the conductor
+   *  via `conductor_replan` before the replan loop just runs the remaining
+   *  normalized pipeline to completion. Prevents an unbounded replan loop. */
+  max_conductor_replans: number;
   conductor: ConductorConfig;
   session_memory: SessionMemoryConfig;
   conductor_learning: ConductorLearningConfig;
@@ -421,6 +425,7 @@ export function defaultConfig(): JarvisConfig {
       enabled: true,
       agents: DEFAULT_ORCHESTRATOR_AGENTS,
       max_recursion_depth: 2,
+      max_conductor_replans: 2,
       conductor: {
         enabled: true,
         model: "gemma4:e2b",
