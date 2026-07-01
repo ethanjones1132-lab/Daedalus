@@ -270,6 +270,111 @@ export class PipelineExecutor {
     }
   }
 
+  private async runExecutorStage(
+    request: string,
+    planSummary: string,
+    agentRunId: string,
+    onStateChange: (state: PipelineProgressState) => void,
+    options: PipelineExecuteOptions,
+    profile: ExecutionProfile,
+  ): Promise<ExecutorStageOutput> {
+    onStateChange({ stage: "executor", status: "running" });
+    const executorPrompt = stageSystemPrompt("executor", options);
+    const executorMessages: ChatMessage[] = [
+      { role: "system", content: executorPrompt },
+      { role: "user", content: `User Request: ${request}\n\nPlan:\n${planSummary}` }
+    ];
+    const toolCalls: ToolCallRecord[] = [];
+    const narratives: string[] = [];
+    let turnCount = 0;
+    let executorDone = false;
+    const maxTurns = BUILTIN_MODES.executor.max_turns;
+    let executorTurn = 0;
+
+    try {
+      while (!executorDone && turnCount < maxTurns) {
+        turnCount++;
+        executorTurn++;
+        const turnStartTime = Date.now();
+        let response: any;
+
+        try {
+          response = await this.callModel(executorMessages, {
+            temperature: BUILTIN_MODES.executor.temperature,
+            max_tokens: BUILTIN_MODES.executor.max_tokens,
+            tools: getToolsForMode("executor", this.runtime.listTools(), profile),
+            stream: true,
+            stageLabel: "executor",
+            suppressActivity: false,
+            onChunk: (chunk) => {
+              onStateChange({ stage: "executor", status: "running", output: chunk });
+            }
+          });
+
+          executorMessages.push({ role: "assistant", content: response.content, tool_calls: response.tool_calls });
+          if (response.content) narratives.push(response.content);
+
+          if (response.tool_calls && response.tool_calls.length > 0) {
+            for (const tc of response.tool_calls) {
+              const toolResult = await this.runToolCall(tc, options);
+              const call = parseStreamedToolCall(tc);
+              toolCalls.push({
+                name: call.name,
+                arguments: call.arguments,
+                output: toolResult.output,
+                is_error: toolResult.is_error,
+                error_code: toolResult.error_code,
+                duration_ms: toolResult.duration_ms ?? 0,
+              });
+              executorMessages.push({ role: "tool", tool_call_id: tc.id, name: tc.name, content: toolResult.output });
+              onStateChange({
+                stage: "executor",
+                status: "running",
+                output: `\n[Tool Executed: ${tc.name}]\n`
+              });
+            }
+          } else {
+            executorDone = true;
+          }
+
+          this.collector.recordStageRun({
+            id: `stage_${crypto.randomUUID()}`,
+            agent_run_id: agentRunId,
+            mode_id: "executor",
+            turn_number: executorTurn,
+            input_tokens: countTokens(JSON.stringify(executorMessages)),
+            output_tokens: countTokens(response?.content || ""),
+            tool_calls_json: JSON.stringify(response?.tool_calls || []),
+            duration_ms: Date.now() - turnStartTime,
+            was_successful: 1,
+            had_error: 0,
+          });
+        } catch (err: any) {
+          this.collector.recordStageRun({
+            id: `stage_${crypto.randomUUID()}`,
+            agent_run_id: agentRunId,
+            mode_id: "executor",
+            turn_number: executorTurn,
+            tool_calls_json: "[]",
+            duration_ms: Date.now() - turnStartTime,
+            was_successful: 0,
+            had_error: 1,
+            error_message: errText(err),
+          });
+          throw err;
+        }
+      }
+
+      const narrative = narratives.join("\n\n");
+      onStateChange({ stage: "executor", status: "done", output: narrative });
+      return { ok: true, narrative, toolCalls };
+    } catch (e: any) {
+      const message = errText(e);
+      onStateChange({ stage: "executor", status: "failed", output: message });
+      return { ok: false, narrative: `Executor failed: ${message}`, toolCalls };
+    }
+  }
+
   async execute(
     request: string,
     pipeline: string[],
@@ -284,7 +389,6 @@ export class PipelineExecutor {
       return this.executeSpeculativeCascade(request, agentRunId, onStateChange, options);
     }
 
-    let executorSummary = "No execution stage executed.";
     let reviewerFeedback = "No review stage executed.";
     let rewriterSummary = "No rewriting stage executed.";
 
@@ -302,112 +406,9 @@ export class PipelineExecutor {
 
     // 2. Executor Stage
     if (pipeline.includes("executor")) {
-      onStateChange({ stage: "executor", status: "running" });
-      const executorPrompt = stageSystemPrompt("executor", options);
-      const executorMessages: ChatMessage[] = [
-        { role: "system", content: executorPrompt },
-        { role: "user", content: `User Request: ${request}\n\nPlan:\n${plan}` }
-      ];
-
-      let turnCount = 0;
-      let executorDone = false;
-      const maxTurns = BUILTIN_MODES.executor.max_turns;
-      let executorTurn = 0;
-
-      try {
-        while (!executorDone && turnCount < maxTurns) {
-          turnCount++;
-          executorTurn++;
-          const turnStartTime = Date.now();
-          let response: any;
-
-          try {
-            response = await this.callModel(executorMessages, {
-              temperature: BUILTIN_MODES.executor.temperature,
-              max_tokens: BUILTIN_MODES.executor.max_tokens,
-              tools: getToolsForMode("executor", this.runtime.listTools(), profile),
-              stream: true,
-              stageLabel: "executor",
-              suppressActivity: false,
-              onChunk: (chunk) => {
-                onStateChange({ stage: "executor", status: "running", output: chunk });
-              }
-            });
-
-            executorMessages.push({
-              role: "assistant",
-              content: response.content,
-              tool_calls: response.tool_calls
-            });
-
-            if (response.tool_calls && response.tool_calls.length > 0) {
-              for (const tc of response.tool_calls) {
-                const toolResult = await this.runToolCall(tc, options);
-                executorMessages.push({
-                  role: "tool",
-                  tool_call_id: tc.id,
-                  name: tc.name,
-                  content: toolResult.output
-                });
-                onStateChange({
-                  stage: "executor",
-                  status: "running",
-                  output: `\n[Tool Executed: ${tc.name}]\n`
-                });
-              }
-            } else {
-              executorDone = true;
-            }
-
-            this.collector.recordStageRun({
-              id: `stage_${crypto.randomUUID()}`,
-              agent_run_id: agentRunId,
-              mode_id: "executor",
-              turn_number: executorTurn,
-              input_tokens: countTokens(JSON.stringify(executorMessages)),
-              output_tokens: countTokens(response?.content || ""),
-              tool_calls_json: JSON.stringify(response?.tool_calls || []),
-              duration_ms: Date.now() - turnStartTime,
-              was_successful: 1,
-              had_error: 0,
-            });
-          } catch (err: any) {
-            this.collector.recordStageRun({
-              id: `stage_${crypto.randomUUID()}`,
-              agent_run_id: agentRunId,
-              mode_id: "executor",
-              turn_number: executorTurn,
-              tool_calls_json: "[]",
-              duration_ms: Date.now() - turnStartTime,
-              was_successful: 0,
-              had_error: 1,
-              error_message: errText(err),
-            });
-            throw err;
-          }
-        }
-
-        // Format executor activity logs as summary
-        executorSummary = executorMessages
-          .filter((m) => m.role !== "system")
-          .map((m) => {
-            if (m.role === "assistant" && m.content) {
-              return `[Executor]: ${m.content}`;
-            }
-            if (m.role === "tool") {
-              return `[Tool Call Result (${m.name})]: ${m.content.slice(0, 1000)}${m.content.length > 1000 ? "..." : ""}`;
-            }
-            return "";
-          })
-          .filter(Boolean)
-          .join("\n\n");
-
-        onStateChange({ stage: "executor", status: "done", output: executorSummary });
-      } catch (e: any) {
-        onStateChange({ stage: "executor", status: "failed", output: errText(e) });
-        executorSummary = `Executor failed: ${errText(e)}`;
-      }
+      state.executor = await this.runExecutorStage(request, plan, agentRunId, onStateChange, options, profile);
     }
+    const executorSummary = renderExecutorSummary(state.executor);
 
     // 3. Reviewer & Rewriter Correction Loop
     if (pipeline.includes("reviewer")) {
@@ -670,7 +671,7 @@ export class PipelineExecutor {
     // Truthful run outcome. A failed synthesizer (threw OR empty) is `failed`.
     // A run whose answer came through but an upstream stage failed is `degraded`.
     const upstreamDegraded =
-      plan.startsWith("Failed to generate plan") || executorSummary.startsWith("Executor failed");
+      plan.startsWith("Failed to generate plan") || state.executor?.ok === false;
     let outcome: PipelineOutcome;
     let errorCode: string | undefined;
     if (fatalError) {
