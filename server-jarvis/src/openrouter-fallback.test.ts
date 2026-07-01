@@ -288,4 +288,90 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
     expect(seenChatModels.length).toBeGreaterThanOrEqual(2);
     expect(result.model_used).toBe("cohere/north-mini-code:free");
   });
+
+  test("honors excludeModels when resolving its own internal cascade, preferring the stage-aware next-best over a generically-higher-scored model", async () => {
+    // Regression for the 2026-07-01 live incident: the orchestrator's
+    // empty-completion cascade-advance (index.ts) excludes a model that just
+    // returned empty content and retries with a *different*, stage-optimal
+    // candidate. But chatCompletionWithFallback re-derives its OWN cascade
+    // internally via resolvePoolAgents(), which called pool.pickFor()/
+    // pool.cascadeChain() WITHOUT passing excludeModels through — so the
+    // caller's exclusion was silently dropped, and the excluded model's
+    // fallback chain (sorted by the STAGE-AGNOSTIC overallScore(), not the
+    // stage+taskType-aware score() that pickFor uses when given the same
+    // exclude set) put a merely well-rounded model ahead of the model that
+    // pickFor(stage, taskType, exclude) would directly and correctly select.
+    //
+    // Capabilities below are the REAL production numbers (agent-pool.ts) for
+    // zen-nemotron-ultra-free / zen-deepseek-v4-flash-free / or-nemotron-ultra-free,
+    // task_type="docs" — computed by hand:
+    //   score("synthesizer","docs"): excluded-primary=1.0725, secondary(nemotron/or)=1.064, fast-balanced(deepseek)=1.056
+    //   overallScore(): fast-balanced(deepseek)=0.893, secondary(nemotron/or)=0.824
+    // i.e. the stage-aware ranking (secondary > fast-balanced) is the OPPOSITE
+    // of the generic overallScore ranking (fast-balanced > secondary) — the
+    // exact inversion that caused the live bug.
+    const cfg = cfgWithPool();
+    cfg.openrouter.api_key = "sk-or-key";
+    cfg.opencode_zen.base_url = "https://opencode.ai/zen/v1";
+    cfg.opencode_zen.api_key = "sk-zen-key";
+    cfg.orchestrator.agents = [
+      {
+        id: "reasoning-primary",
+        provider: "opencode_zen",
+        model_id: "reasoning-primary",
+        capabilities: { code: 0.8, reasoning: 0.95, speed: 0.55, cost: 1, json_reliability: 0.88 },
+        default_for: ["synthesizer"],
+        enabled: true,
+      },
+      {
+        id: "fast-balanced",
+        provider: "opencode_zen",
+        model_id: "fast-balanced",
+        capabilities: { code: 0.9, reasoning: 0.86, speed: 0.82, cost: 1, json_reliability: 0.9 },
+        default_for: [],
+        enabled: true,
+      },
+      {
+        id: "reasoning-secondary",
+        provider: "openrouter",
+        model_id: "reasoning-secondary",
+        capabilities: { code: 0.78, reasoning: 0.96, speed: 0.42, cost: 1, json_reliability: 0.88 },
+        default_for: [],
+        enabled: true,
+      },
+    ];
+
+    const seenChatModels: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) {
+        return new Response(JSON.stringify({
+          data: [
+            { id: "reasoning-secondary", name: "Secondary", context_length: 1000000, pricing: { prompt: "0", completion: "0" }, architecture: {}, supported_parameters: [], description: "" },
+          ],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      seenChatModels.push(body.model);
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    const result = await chatCompletionWithFallback(
+      cfg,
+      { model: "reasoning-secondary", messages: [{ role: "user", content: "summarize this" }], stream: true },
+      undefined,
+      {
+        stage: "synthesizer",
+        taskType: "docs",
+        excludeModels: new Set(["opencode_zen:reasoning-primary"]),
+      },
+    );
+
+    // The excluded model must never be attempted.
+    expect(seenChatModels).not.toContain("reasoning-primary");
+    // The FIRST attempt must be the stage-aware next-best (reasoning-secondary),
+    // not the generically-higher-overallScore-but-stage-inferior fast-balanced.
+    expect(seenChatModels[0]).toBe("reasoning-secondary");
+    expect(result.model_used).toBe("reasoning-secondary");
+  });
 });

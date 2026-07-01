@@ -601,10 +601,20 @@ function resolvePoolAgents(cfg: JarvisConfig, options: FallbackResolveOptions = 
   const pool = new AgentPool(cfg.orchestrator?.agents ?? []);
   let agents;
   if (options.cascadeTier) {
-    const cascade = pool.cascadeChain(options.stage, options.taskType ?? "general");
+    const cascade = pool.cascadeChain(options.stage, options.taskType ?? "general", options.excludeModels);
     agents = options.cascadeTier === "strong" ? [...cascade].reverse() : cascade;
   } else {
-    const selected = pool.pickFor(options.stage, options.taskType ?? "general");
+    // Honor excludeModels here too: a model that already returned an empty
+    // completion for this stage (see index.ts's callModel empty-completion
+    // cascade-advance) must not be re-selected as the "selected" agent whose
+    // fallbackChain() we then build — otherwise the excluded model gets
+    // filtered out of the resulting cascade by push()'s own exclusion check,
+    // but the REST of the chain is sorted by fallbackChain's stage-agnostic
+    // overallScore() rather than pickFor's stage+taskType-aware score(),
+    // silently promoting a merely well-rounded model ahead of the model that
+    // pickFor(stage, taskType, exclude) would directly and correctly select
+    // as the true next-best candidate for this specific stage.
+    const selected = pool.pickFor(options.stage, options.taskType ?? "general", options.excludeModels);
     agents = selected ? pool.fallbackChain(selected, options.stage, options.taskType ?? "general") : [];
   }
   return agents
