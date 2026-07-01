@@ -1,4 +1,11 @@
 import { stripReasoningFromText } from "../reasoning";
+import type { PipelineStageState } from "./stage-output";
+import {
+  renderExecutorSummary,
+  renderPlanSummary,
+  renderReviewerSummary,
+  renderRewriterSummary,
+} from "./stage-output";
 
 export interface SynthesizerParts {
   plan?: string;
@@ -8,6 +15,7 @@ export interface SynthesizerParts {
 }
 
 const SKIP_SENTINELS = new Set<string>([
+  "No planning stage executed.",
   "No execution stage executed.",
   "No review stage executed.",
   "No rewriting stage executed.",
@@ -37,4 +45,18 @@ export function buildSynthesizerContext(request: string, parts: SynthesizerParts
   if (isMeaningful(rewrite)) sections.push(`Rewriter Activity:\n${rewrite}`);
 
   return sections.join("\n\n");
+}
+
+/**
+ * Structured-state variant of `buildSynthesizerContext`. Renders each stage's
+ * typed output through stage-output.ts and delegates to the existing
+ * string-based builder so the `SKIP_SENTINELS` filtering stays in one place.
+ */
+export function buildSynthesizerContextFromStageState(request: string, state: PipelineStageState): string {
+  return buildSynthesizerContext(request, {
+    plan: renderPlanSummary(state.plan),
+    executorSummary: renderExecutorSummary(state.executor),
+    reviewerFeedback: renderReviewerSummary(state.reviewer),
+    rewriterSummary: renderRewriterSummary(state.rewriter),
+  });
 }

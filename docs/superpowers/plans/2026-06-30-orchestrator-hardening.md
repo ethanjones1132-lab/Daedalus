@@ -239,13 +239,13 @@ git commit -m "feat(orchestrator): add structured pipeline stage-output types"
 - Modify: `server-jarvis/src/orchestration/synth-context.ts`
 - Test: `server-jarvis/src/orchestration/synth-context.test.ts` (create if it doesn't already exist; check first)
 
-- [ ] **Step 1: Check for an existing test file**
+- [x] **Step 1: Check for an existing test file**
 
 Run: `ls server-jarvis/src/orchestration/synth-context.test.ts 2>/dev/null || echo "none"`
 
 If it exists, add the new test into it; otherwise create it fresh with just this suite.
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 ```typescript
 // Add to server-jarvis/src/orchestration/synth-context.test.ts
@@ -280,12 +280,12 @@ describe("buildSynthesizerContextFromStageState", () => {
 });
 ```
 
-- [ ] **Step 3: Run test to verify it fails**
+- [x] **Step 3: Run test to verify it fails**
 
 Run: `cd server-jarvis && bun test src/orchestration/synth-context.test.ts`
 Expected: FAIL — `buildSynthesizerContextFromStageState` is not exported.
 
-- [ ] **Step 4: Implement (additive — existing `buildSynthesizerContext` is untouched)**
+- [x] **Step 4: Implement (additive — existing `buildSynthesizerContext` is untouched)**
 
 Add to `server-jarvis/src/orchestration/synth-context.ts` (after the existing `buildSynthesizerContext` function):
 
@@ -313,12 +313,12 @@ export function buildSynthesizerContextFromStageState(request: string, state: Pi
 }
 ```
 
-- [ ] **Step 5: Run test to verify it passes**
+- [x] **Step 5: Run test to verify it passes**
 
 Run: `cd server-jarvis && bun test src/orchestration/synth-context.test.ts`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add server-jarvis/src/orchestration/synth-context.ts server-jarvis/src/orchestration/synth-context.test.ts
