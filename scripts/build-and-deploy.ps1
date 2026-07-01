@@ -25,7 +25,8 @@
 .PARAMETER RestartServer
     After deploying, launch the freshly deployed bundle (bun <Desktop>\index.js)
     on port 19877 and wait for it to report healthy, so the next chat prompt
-    streams immediately without relaunching the app.
+    streams immediately without relaunching the app. stdout/stderr are always
+    captured to timestamped files under %USERPROFILE%\.openclaw\jarvis\logs\.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\build-and-deploy.ps1
@@ -146,7 +147,17 @@ Write-Ok 'prompts/'
 if ($RestartServer) {
     Write-Step 'Restarting Jarvis server (bun <Desktop>\index.js on :19877)'
     $deployedJs = Join-Path $desktop 'index.js'
-    Start-Process -FilePath $bun -ArgumentList "`"$deployedJs`"" -WindowStyle Hidden
+    # Server stdout/stderr previously went nowhere (Start-Process -WindowStyle
+    # Hidden with no redirection silently discards it) — that gap made a real
+    # production incident (2026-07-01 empty-completion cascade bug) much
+    # harder to diagnose than it should have been. Always capture output now,
+    # timestamped per restart so history survives across restarts instead of
+    # being overwritten.
+    $logsDir = Join-Path $env:USERPROFILE '.openclaw\jarvis\logs'
+    if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Force -Path $logsDir | Out-Null }
+    $logOut = Join-Path $logsDir "server-stdout-$ts.log"
+    $logErr = Join-Path $logsDir "server-stderr-$ts.log"
+    Start-Process -FilePath $bun -ArgumentList "`"$deployedJs`"" -WindowStyle Hidden -RedirectStandardOutput $logOut -RedirectStandardError $logErr
     $healthy = $false
     for ($i = 0; $i -lt 20; $i++) {
         Start-Sleep -Milliseconds 700
@@ -155,7 +166,10 @@ if ($RestartServer) {
             if ($r.StatusCode -eq 200) { $healthy = $true; break }
         } catch {}
     }
-    if ($healthy) { Write-Ok 'server healthy on http://127.0.0.1:19877' }
+    if ($healthy) {
+        Write-Ok 'server healthy on http://127.0.0.1:19877'
+        Write-Ok "logging to $logOut"
+    }
     else { Write-Host '  [WARN] server did not report healthy within ~14s' -ForegroundColor Yellow }
 }
 
