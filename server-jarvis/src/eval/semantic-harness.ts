@@ -77,6 +77,19 @@ function resolveModelSupportsNativeTools(cfg: JarvisConfig, stage: string): bool
   return isOpenRouterModelSupportsTools(agent.model_id);
 }
 
+// KNOWN LIMITATION: this only resolves the PRIMARY cascade candidate's protocol,
+// before the request is made. If `chatCompletionWithFallback` internally falls
+// back to a differently-protocoled secondary/tertiary candidate mid-request
+// (e.g. on a 429/503/timeout from the primary), the harness still parses that
+// response using the primary's protocol decision — so a tool call made via the
+// *other* protocol on that fallback hop could be missed. This is accepted as a
+// low-probability edge case (only triggers when the primary candidate actually
+// fails live) whose impact is already bounded by the regression-band gating
+// (diffSemanticBaseline) this harness uses to tolerate live-model noise; it is
+// not silently worked around. A real fix would require either propagating the
+// actually-used model/provider back from chatCompletionWithFallback, or
+// re-deriving the protocol choice post-hoc from the response.
+
 /** Inject the text tool-call protocol instructions into the system message,
  *  matching index.ts's `useTextTools` system-prompt augmentation. */
 function withTextToolInstructions(messages: ChatMessage[], tools: ToolDefinition[]): ChatMessage[] {
