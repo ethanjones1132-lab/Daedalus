@@ -455,7 +455,7 @@ git commit -m "refactor(orchestrator): extract runPlannerStage helper (behavior-
 
 This extraction adds one real behavior change worth calling out: tool call results are now collected into a typed `ToolCallRecord[]` array (via `toolResult.is_error` / `toolResult.duration_ms`, which the existing `runToolCall` already returns) instead of being re-derived later from string-formatted chat messages. The rendered text (`renderExecutorSummary`) groups narrative-then-tool-calls rather than the original's strict chronological interleaving of assistant text and tool results — the *content* is identical, only the ordering within the text blob changes. Run the full suite after this step; if any test asserts exact interleaved ordering of executor output text, that's the one place this plan intentionally diverges — fix the test to check for presence/content instead of exact ordering, don't revert the refactor.
 
-- [ ] **Step 1: Add the `runExecutorStage` method**
+- [x] **Step 1: Add the `runExecutorStage` method**
 
 ```typescript
   private async runExecutorStage(
@@ -563,7 +563,7 @@ This extraction adds one real behavior change worth calling out: tool call resul
   }
 ```
 
-- [ ] **Step 2: Replace the inline "2. Executor Stage" block in `execute()`**
+- [x] **Step 2: Replace the inline "2. Executor Stage" block in `execute()`**
 
 Replace the original executor block (the code that built `executorSummary` by filtering `executorMessages`) with:
 
@@ -576,12 +576,12 @@ Replace the original executor block (the code that built `executorSummary` by fi
 
 (`profile` is already computed earlier in `execute()` as `const profile: ExecutionProfile = options.executionProfile ?? "full";` — keep that line where it is.)
 
-- [ ] **Step 3: Run the test suite**
+- [x] **Step 3: Run the test suite**
 
 Run: `cd server-jarvis && bun test src/orchestration.test.ts src/orchestration/`
 Expected: PASS. If a test fails on exact executor-summary text ordering, update that assertion to check `toContain(...)` for the relevant substrings instead of exact string equality — do not revert the structured collection.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add server-jarvis/src/orchestration/pipeline.ts
