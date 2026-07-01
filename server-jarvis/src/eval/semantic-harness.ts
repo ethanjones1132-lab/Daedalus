@@ -5,6 +5,18 @@
 // non-deterministic). Run manually or on a schedule:
 //   JARVIS_EVAL_LIVE=1 bun run src/eval/semantic-harness.ts
 //   JARVIS_EVAL_LIVE=1 bun run src/eval/semantic-harness.ts --write-baseline
+//
+// `makeCallModel` mirrors production's native-vs-text tool-calling branch
+// (see index.ts's `modelSupportsNativeTools` resolution): it resolves the
+// pool agent for the requested stage via `AgentPool.pickFor`, and if that
+// agent's provider/model doesn't support native function calling (OpenCode
+// Zen/Go, or an OpenRouter model `isOpenRouterModelSupportsTools` rejects),
+// it injects the text tool-call protocol instructions and recovers any
+// attempted tool calls via `extractTextToolCalls` instead of reading
+// `choices[0].message.tool_calls`. This closes a previously-flagged gap
+// where cheap/free models using the text protocol were scored as if they
+// never attempted a tool call — eval results now reflect real production
+// tool-use behavior for both protocol types.
 // ═══════════════════════════════════════════════════════════════
 
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "fs";
@@ -16,10 +28,13 @@ import { Coordinator } from "../orchestration/coordinator";
 import { PipelineExecutor } from "../orchestration/pipeline";
 import { classifyTurnRequirements } from "../orchestration/turn-requirements";
 import { normalizeRoute } from "../orchestration/route-normalization";
-import { chatCompletionWithFallback } from "../openrouter";
+import { chatCompletionWithFallback, isOpenRouterModelSupportsTools } from "../openrouter";
+import { buildTextToolInstructions, extractTextToolCalls } from "../text-tools";
+import { AgentPool } from "../orchestration/agent-pool";
 import { judgeAnswer } from "./judge";
 import { SEMANTIC_CASES, type SemanticCase } from "./semantic-cases";
-import type { CallModelFn } from "../orchestration/coordinator";
+import type { CallModelFn, ChatMessage } from "../orchestration/coordinator";
+import type { ToolDefinition } from "../tool-types";
 
 export interface SemanticCaseResult {
   id: string;
@@ -44,19 +59,73 @@ function materializeFixture(root: string, fixture: Record<string, string> | unde
   }
 }
 
-/** Minimal callModel that goes through the real fallback cascade for a fixed stage. */
+/**
+ * Determine whether the agent the pool would actually pick for `stage`
+ * supports native OpenAI-style function calling. Mirrors index.ts's
+ * `modelSupportsNativeTools` resolution (minus the Ollama branch, which the
+ * eval harness never exercises): opencode_zen/opencode_go are hardcoded to
+ * the text-tool protocol; everything else defers to
+ * `isOpenRouterModelSupportsTools`. Falls back to `true` (native) when the
+ * pool can't resolve an agent for the stage, matching the fallback cascade's
+ * own behavior of defaulting to plain OpenRouter in that case.
+ */
+function resolveModelSupportsNativeTools(cfg: JarvisConfig, stage: string): boolean {
+  const pool = new AgentPool(cfg.orchestrator?.agents ?? []);
+  const agent = pool.pickFor(stage, "general");
+  if (!agent) return true;
+  if (agent.provider === "opencode_zen" || agent.provider === "opencode_go") return false;
+  return isOpenRouterModelSupportsTools(agent.model_id);
+}
+
+/** Inject the text tool-call protocol instructions into the system message,
+ *  matching index.ts's `useTextTools` system-prompt augmentation. */
+function withTextToolInstructions(messages: ChatMessage[], tools: ToolDefinition[]): ChatMessage[] {
+  const textInstructions = buildTextToolInstructions(tools);
+  const effectiveMessages = [...messages];
+  const sysIdx = effectiveMessages.findIndex((m) => m.role === "system");
+  if (sysIdx >= 0) {
+    effectiveMessages[sysIdx] = {
+      ...effectiveMessages[sysIdx],
+      content: `${effectiveMessages[sysIdx].content}\n\n${textInstructions}`,
+    };
+  } else {
+    effectiveMessages.unshift({ role: "system", content: textInstructions });
+  }
+  return effectiveMessages;
+}
+
+/** Minimal callModel that goes through the real fallback cascade for a fixed stage.
+ *  Mirrors production's native-vs-text tool-calling branch (index.ts): resolve
+ *  which agent the pool would pick for `stage`, and if it doesn't support
+ *  native function calling, use the text tool-call protocol instead of the
+ *  `tools` request field so cheap/free models are scored on their real
+ *  tool-use behavior rather than being silently marked as tool-call-less. */
 function makeCallModel(cfg: JarvisConfig, stage: string): CallModelFn {
   return async (messages, options) => {
+    const tools: ToolDefinition[] = options?.tools ?? [];
+    const useTextTools = tools.length > 0 && !resolveModelSupportsNativeTools(cfg, stage);
+    const effectiveMessages = useTextTools ? withTextToolInstructions(messages, tools) : messages;
+
     const { response } = await chatCompletionWithFallback(cfg, {
-      messages,
+      messages: effectiveMessages,
       temperature: options?.temperature ?? 0.2,
       max_tokens: options?.max_tokens ?? 1024,
       stream: false,
-      tools: options?.tools,
+      tools: useTextTools ? undefined : options?.tools,
     }, undefined, { stage });
     const json = await response.json();
     const choice = json.choices?.[0]?.message ?? {};
-    return { content: choice.content ?? "", tool_calls: choice.tool_calls };
+    const content: string = choice.content ?? "";
+
+    if (useTextTools) {
+      const extracted = extractTextToolCalls(content, tools);
+      const tool_calls = extracted.calls.length > 0
+        ? extracted.calls.map((c) => ({ id: c.id, name: c.name, arguments: c.arguments }))
+        : undefined;
+      return { content: extracted.cleanedText, tool_calls };
+    }
+
+    return { content, tool_calls: choice.tool_calls };
   };
 }
 
