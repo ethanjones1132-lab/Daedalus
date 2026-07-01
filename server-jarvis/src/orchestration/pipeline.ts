@@ -372,6 +372,204 @@ export class PipelineExecutor {
     }
   }
 
+  private async runRewriterStage(
+    request: string,
+    reviewerFeedback: string,
+    executorSummary: string,
+    agentRunId: string,
+    onStateChange: (state: PipelineProgressState) => void,
+    options: PipelineExecuteOptions,
+    profile: ExecutionProfile,
+  ): Promise<RewriterStageOutput> {
+    const rewriterPrompt = stageSystemPrompt("rewriter", options);
+    const rewriterMessages: ChatMessage[] = [
+      { role: "system", content: rewriterPrompt },
+      {
+        role: "user",
+        content: `User Request: ${request}\n\nReviewer Feedback:\n${reviewerFeedback}\n\nExecutor Activity:\n${executorSummary}`
+      }
+    ];
+    const toolCalls: ToolCallRecord[] = [];
+    const narratives: string[] = [];
+    let rewriterDone = false;
+    let rewriterTurn = 0;
+    const maxRewriterTurns = BUILTIN_MODES.rewriter.max_turns;
+
+    try {
+      while (!rewriterDone && rewriterTurn < maxRewriterTurns) {
+        rewriterTurn++;
+        const rewStartTime = Date.now();
+        let rewriteResp: any;
+
+        try {
+          rewriteResp = await this.callModel(rewriterMessages, {
+            temperature: BUILTIN_MODES.rewriter.temperature,
+            max_tokens: BUILTIN_MODES.rewriter.max_tokens,
+            tools: getToolsForMode("rewriter", this.runtime.listTools(), profile),
+            stream: true,
+            stageLabel: "rewriter",
+            suppressActivity: false,
+            onChunk: (chunk) => {
+              onStateChange({ stage: "rewriter", status: "running", output: chunk });
+            }
+          });
+
+          rewriterMessages.push({ role: "assistant", content: rewriteResp.content, tool_calls: rewriteResp.tool_calls });
+          if (rewriteResp.content) narratives.push(rewriteResp.content);
+
+          if (rewriteResp.tool_calls && rewriteResp.tool_calls.length > 0) {
+            for (const tc of rewriteResp.tool_calls) {
+              const toolResult = await this.runToolCall(tc, options);
+              toolCalls.push({
+                name: tc.name,
+                arguments: (tc as any).arguments ?? {},
+                output: toolResult.output,
+                is_error: toolResult.is_error,
+                duration_ms: toolResult.duration_ms ?? 0,
+              });
+              rewriterMessages.push({ role: "tool", tool_call_id: tc.id, name: tc.name, content: toolResult.output });
+              onStateChange({
+                stage: "rewriter",
+                status: "running",
+                output: `\n[Tool Executed: ${tc.name}]\n`
+              });
+            }
+          } else {
+            rewriterDone = true;
+          }
+
+          this.collector.recordStageRun({
+            id: `stage_${crypto.randomUUID()}`,
+            agent_run_id: agentRunId,
+            mode_id: "rewriter",
+            turn_number: rewriterTurn,
+            input_tokens: countTokens(JSON.stringify(rewriterMessages)),
+            output_tokens: countTokens(rewriteResp?.content || ""),
+            tool_calls_json: JSON.stringify(rewriteResp?.tool_calls || []),
+            duration_ms: Date.now() - rewStartTime,
+            was_successful: 1,
+            had_error: 0,
+          });
+        } catch (err: any) {
+          this.collector.recordStageRun({
+            id: `stage_${crypto.randomUUID()}`,
+            agent_run_id: agentRunId,
+            mode_id: "rewriter",
+            turn_number: rewriterTurn,
+            tool_calls_json: "[]",
+            duration_ms: Date.now() - rewStartTime,
+            was_successful: 0,
+            had_error: 1,
+            error_message: errText(err),
+          });
+          throw err;
+        }
+      }
+
+      const narrative = narratives.join("\n\n");
+      onStateChange({ stage: "rewriter", status: "done", output: narrative });
+      return { ok: true, narrative, toolCalls };
+    } catch (e: any) {
+      const message = errText(e);
+      onStateChange({ stage: "rewriter", status: "failed", output: message });
+      return { ok: false, narrative: message, toolCalls };
+    }
+  }
+
+  private async runReviewerRewriterLoop(
+    request: string,
+    planSummary: string,
+    executorSummary: string,
+    agentRunId: string,
+    onStateChange: (state: PipelineProgressState) => void,
+    options: PipelineExecuteOptions,
+    profile: ExecutionProfile,
+  ): Promise<{ reviewer: ReviewerStageOutput; rewriter?: RewriterStageOutput }> {
+    const reviewerPrompt = stageSystemPrompt("reviewer", options);
+    let loopCount = 0;
+    const maxLoops = 3;
+    let hasPendingIssues = true;
+    let reviewerFeedback = "No review stage executed.";
+    let reviewerOk = true;
+    let rewriterOutput: RewriterStageOutput | undefined;
+    let rewriterSummaryForPrompt = "No rewriting stage executed.";
+
+    while (hasPendingIssues && loopCount < maxLoops) {
+      loopCount++;
+      onStateChange({ stage: "reviewer", status: "running", output: `\nReview Turn ${loopCount}...\n` });
+      const revStartTime = Date.now();
+
+      try {
+        const reviewerResp = await this.callModel([
+          { role: "system", content: reviewerPrompt },
+          {
+            role: "user",
+            content: `User Request: ${request}\n\nOriginal Plan:\n${planSummary}\n\nExecutor Activity:\n${executorSummary}\n\nRewriter Activity:\n${rewriterSummaryForPrompt}`
+          }
+        ] as ChatMessage[], {
+          temperature: BUILTIN_MODES.reviewer.temperature,
+          max_tokens: BUILTIN_MODES.reviewer.max_tokens,
+          stream: true,
+          stageLabel: "reviewer",
+          suppressActivity: false,
+          onChunk: (chunk) => {
+            onStateChange({ stage: "reviewer", status: "running", output: chunk });
+          }
+        });
+
+        reviewerFeedback = reviewerResp.content;
+        onStateChange({ stage: "reviewer", status: "done", output: reviewerFeedback });
+
+        this.collector.recordStageRun({
+          id: `stage_${crypto.randomUUID()}`,
+          agent_run_id: agentRunId,
+          mode_id: "reviewer",
+          turn_number: loopCount,
+          input_tokens: Math.round((reviewerPrompt.length + request.length + planSummary.length + executorSummary.length + rewriterSummaryForPrompt.length) / 4),
+          output_tokens: countTokens(reviewerFeedback),
+          tool_calls_json: "[]",
+          duration_ms: Date.now() - revStartTime,
+          was_successful: 1,
+          had_error: 0,
+        });
+
+        // NOTE (found during extraction, not changed): this mirrors existing
+        // behavior exactly — the rewriter can run whenever the reviewer flags
+        // issues, even on a pipeline that didn't request the "rewriter" stage.
+        // Gating this on stage inclusion is a legitimate follow-up but is out
+        // of scope for this refactor (extract, don't change behavior).
+        hasPendingIssues = this.hasIssues(reviewerFeedback);
+        if (hasPendingIssues) {
+          onStateChange({ stage: "rewriter", status: "running", output: `\nReviewer flagged issues. Rewriting...\n` });
+          rewriterOutput = await this.runRewriterStage(request, reviewerFeedback, executorSummary, agentRunId, onStateChange, options, profile);
+          rewriterSummaryForPrompt = renderRewriterSummary(rewriterOutput);
+        }
+      } catch (e: any) {
+        const message = errText(e);
+        onStateChange({ stage: "reviewer", status: "failed", output: message });
+        hasPendingIssues = false;
+        reviewerOk = false;
+
+        this.collector.recordStageRun({
+          id: `stage_${crypto.randomUUID()}`,
+          agent_run_id: agentRunId,
+          mode_id: "reviewer",
+          turn_number: loopCount,
+          tool_calls_json: "[]",
+          duration_ms: Date.now() - revStartTime,
+          was_successful: 0,
+          had_error: 1,
+          error_message: message,
+        });
+      }
+    }
+
+    return {
+      reviewer: { ok: reviewerOk, feedback: reviewerFeedback, hasIssues: this.hasIssues(reviewerFeedback) },
+      rewriter: rewriterOutput,
+    };
+  }
+
   async execute(
     request: string,
     pipeline: string[],
@@ -386,8 +584,12 @@ export class PipelineExecutor {
       return this.executeSpeculativeCascade(request, agentRunId, onStateChange, options);
     }
 
-    let reviewerFeedback = "No review stage executed.";
-    let rewriterSummary = "No rewriting stage executed.";
+    // Compatibility shim — reviewerFeedback and rewriterSummary are derived
+    // from state.reviewer / state.rewriter below (after runReviewerRewriterLoop
+    // populates them). The old in-place `let` placeholders are gone: the
+    // reviewer/rewriter state is now carried entirely by `state` and the
+    // synthesizer block reads the re-derived consts (deleted in A6 once
+    // the synthesizer block is migrated to read `state` directly).
 
     // Least-authority tool profile for executor/rewriter. `full` keeps the legacy
     // behavior; `read_only` caps a workspace-read turn to read-only tools so a
@@ -415,173 +617,19 @@ export class PipelineExecutor {
     // every block is migrated to read `state` directly.
     const executorSummary = renderExecutorSummary(state.executor);
 
-    // 3. Reviewer & Rewriter Correction Loop
     if (pipeline.includes("reviewer")) {
-      const reviewerPrompt = stageSystemPrompt("reviewer", options);
-      const rewriterPrompt = stageSystemPrompt("rewriter", options);
-      let loopCount = 0;
-      const maxLoops = 3;
-      let hasPendingIssues = true;
-
-      while (hasPendingIssues && loopCount < maxLoops) {
-        loopCount++;
-        onStateChange({ stage: "reviewer", status: "running", output: `\nReview Turn ${loopCount}...\n` });
-        const revStartTime = Date.now();
-
-        try {
-          const reviewerResp = await this.callModel([
-            { role: "system", content: reviewerPrompt },
-            {
-              role: "user",
-              content: `User Request: ${request}\n\nOriginal Plan:\n${plan}\n\nExecutor Activity:\n${executorSummary}\n\nRewriter Activity:\n${rewriterSummary}`
-            }
-          ] as ChatMessage[], {
-            temperature: BUILTIN_MODES.reviewer.temperature,
-            max_tokens: BUILTIN_MODES.reviewer.max_tokens,
-            stream: true,
-            stageLabel: "reviewer",
-            suppressActivity: false,
-            onChunk: (chunk) => {
-              onStateChange({ stage: "reviewer", status: "running", output: chunk });
-            }
-          });
-
-          reviewerFeedback = reviewerResp.content;
-          onStateChange({ stage: "reviewer", status: "done", output: reviewerFeedback });
-
-          this.collector.recordStageRun({
-            id: `stage_${crypto.randomUUID()}`,
-            agent_run_id: agentRunId,
-            mode_id: "reviewer",
-            turn_number: loopCount,
-            input_tokens: Math.round((reviewerPrompt.length + request.length + plan.length + executorSummary.length + rewriterSummary.length) / 4),
-            output_tokens: countTokens(reviewerFeedback),
-            tool_calls_json: "[]",
-            duration_ms: Date.now() - revStartTime,
-            was_successful: 1,
-            had_error: 0,
-          });
-
-          hasPendingIssues = this.hasIssues(reviewerFeedback);
-          if (hasPendingIssues) {
-            onStateChange({ stage: "rewriter", status: "running", output: `\nReviewer flagged issues. Rewriting...\n` });
-            const rewriterMessages: ChatMessage[] = [
-              { role: "system", content: rewriterPrompt },
-              {
-                role: "user",
-                content: `User Request: ${request}\n\nReviewer Feedback:\n${reviewerFeedback}\n\nExecutor Activity:\n${executorSummary}`
-              }
-            ];
-
-            let rewriterDone = false;
-            let rewriterTurn = 0;
-            const maxRewriterTurns = BUILTIN_MODES.rewriter.max_turns;
-
-            while (!rewriterDone && rewriterTurn < maxRewriterTurns) {
-              rewriterTurn++;
-              const rewStartTime = Date.now();
-              let rewriteResp: any;
-
-              try {
-                rewriteResp = await this.callModel(rewriterMessages, {
-                  temperature: BUILTIN_MODES.rewriter.temperature,
-                  max_tokens: BUILTIN_MODES.rewriter.max_tokens,
-                  tools: getToolsForMode("rewriter", this.runtime.listTools(), profile),
-                  stream: true,
-                  stageLabel: "rewriter",
-                  suppressActivity: false,
-                  onChunk: (chunk) => {
-                    onStateChange({ stage: "rewriter", status: "running", output: chunk });
-                  }
-                });
-
-                rewriterMessages.push({
-                  role: "assistant",
-                  content: rewriteResp.content,
-                  tool_calls: rewriteResp.tool_calls
-                });
-
-                if (rewriteResp.tool_calls && rewriteResp.tool_calls.length > 0) {
-                  for (const tc of rewriteResp.tool_calls) {
-                    const toolResult = await this.runToolCall(tc, options);
-                    rewriterMessages.push({
-                      role: "tool",
-                      tool_call_id: tc.id,
-                      name: tc.name,
-                      content: toolResult.output
-                    });
-                    onStateChange({
-                      stage: "rewriter",
-                      status: "running",
-                      output: `\n[Tool Executed: ${tc.name}]\n`
-                    });
-                  }
-                } else {
-                  rewriterDone = true;
-                }
-
-                this.collector.recordStageRun({
-                  id: `stage_${crypto.randomUUID()}`,
-                  agent_run_id: agentRunId,
-                  mode_id: "rewriter",
-                  turn_number: rewriterTurn,
-                  input_tokens: countTokens(JSON.stringify(rewriterMessages)),
-                  output_tokens: countTokens(rewriteResp?.content || ""),
-                  tool_calls_json: JSON.stringify(rewriteResp?.tool_calls || []),
-                  duration_ms: Date.now() - rewStartTime,
-                  was_successful: 1,
-                  had_error: 0,
-                });
-              } catch (err: any) {
-                this.collector.recordStageRun({
-                  id: `stage_${crypto.randomUUID()}`,
-                  agent_run_id: agentRunId,
-                  mode_id: "rewriter",
-                  turn_number: rewriterTurn,
-                  tool_calls_json: "[]",
-                  duration_ms: Date.now() - rewStartTime,
-                  was_successful: 0,
-                  had_error: 1,
-                  error_message: errText(err),
-                });
-                throw err;
-              }
-            }
-
-            rewriterSummary = rewriterMessages
-              .filter((m) => m.role !== "system")
-              .map((m) => {
-                if (m.role === "assistant" && m.content) {
-                  return `[Rewriter]: ${m.content}`;
-                }
-                if (m.role === "tool") {
-                  return `[Tool Call Result (${m.name})]: ${m.content.slice(0, 1000)}${m.content.length > 1000 ? "..." : ""}`;
-                }
-                return "";
-              })
-              .filter(Boolean)
-              .join("\n\n");
-
-            onStateChange({ stage: "rewriter", status: "done", output: rewriterSummary });
-          }
-        } catch (e: any) {
-          onStateChange({ stage: "reviewer", status: "failed", output: errText(e) });
-          hasPendingIssues = false; // abort review loop on error
-
-          this.collector.recordStageRun({
-            id: `stage_${crypto.randomUUID()}`,
-            agent_run_id: agentRunId,
-            mode_id: "reviewer",
-            turn_number: loopCount,
-            tool_calls_json: "[]",
-            duration_ms: Date.now() - revStartTime,
-            was_successful: 0,
-            had_error: 1,
-            error_message: errText(e),
-          });
-        }
-      }
+      const { reviewer, rewriter } = await this.runReviewerRewriterLoop(
+        request, plan, executorSummary, agentRunId, onStateChange, options, profile,
+      );
+      state.reviewer = reviewer;
+      if (rewriter) state.rewriter = rewriter;
     }
+    // Compatibility shims — the synthesizer block below still references
+    // the old `reviewerFeedback` and `rewriterSummary` strings. Re-derived
+    // from the structured state via the canonical renderers. Deleted in A6
+    // once the synthesizer block is migrated to read `state` directly.
+    const reviewerFeedback = renderReviewerSummary(state.reviewer);
+    const rewriterSummary = renderRewriterSummary(state.rewriter);
 
     // 4. Synthesizer Stage
     let finalAnswer = "";
