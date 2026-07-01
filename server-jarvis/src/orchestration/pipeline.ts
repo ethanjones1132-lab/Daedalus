@@ -9,8 +9,10 @@ import type { ToolCall, ToolResult } from "../tool-types";
 import { outcomeCollector } from "../self-tuning/mod";
 import type { StageRun } from "../self-tuning/store";
 import { countTokens } from "../tokens";
-import { buildSynthesizerContext } from "./synth-context";
+import { buildSynthesizerContext, buildSynthesizerContextFromStageState } from "./synth-context";
 import type { ExecutionProfile } from "./route-normalization";
+import type { PipelineStageState, PlannerStageOutput, ExecutorStageOutput, ReviewerStageOutput, RewriterStageOutput, ToolCallRecord } from "./stage-output";
+import { renderExecutorSummary, renderPlanSummary, renderReviewerSummary, renderRewriterSummary } from "./stage-output";
 
 /**
  * The slice of the outcome collector the pipeline depends on. Injecting this
@@ -209,6 +211,64 @@ export class PipelineExecutor {
     return result;
   }
 
+  private async runPlannerStage(
+    request: string,
+    agentRunId: string,
+    onStateChange: (state: PipelineProgressState) => void,
+    options: PipelineExecuteOptions,
+  ): Promise<PlannerStageOutput> {
+    onStateChange({ stage: "planner", status: "running" });
+    const plannerPrompt = stageSystemPrompt("planner", options);
+    const startTime = Date.now();
+    try {
+      const resp = await this.callModel([
+        { role: "system", content: plannerPrompt },
+        { role: "user", content: request }
+      ] as ChatMessage[], {
+        temperature: BUILTIN_MODES.planner.temperature,
+        max_tokens: BUILTIN_MODES.planner.max_tokens,
+        stream: true,
+        stageLabel: "planner",
+        suppressActivity: false,
+        onChunk: (chunk) => {
+          onStateChange({ stage: "planner", status: "running", output: chunk });
+        }
+      });
+      const narrative = resp.content;
+      onStateChange({ stage: "planner", status: "done", output: narrative });
+
+      this.collector.recordStageRun({
+        id: `stage_${crypto.randomUUID()}`,
+        agent_run_id: agentRunId,
+        mode_id: "planner",
+        turn_number: 1,
+        input_tokens: Math.round((plannerPrompt.length + request.length) / 4),
+        output_tokens: countTokens(narrative),
+        tool_calls_json: "[]",
+        duration_ms: Date.now() - startTime,
+        was_successful: 1,
+        had_error: 0,
+      });
+      return { ok: true, narrative };
+    } catch (e: any) {
+      const message = errText(e);
+      onStateChange({ stage: "planner", status: "failed", output: message });
+
+      this.collector.recordStageRun({
+        id: `stage_${crypto.randomUUID()}`,
+        agent_run_id: agentRunId,
+        mode_id: "planner",
+        turn_number: 1,
+        tool_calls_json: "[]",
+        duration_ms: Date.now() - startTime,
+        was_successful: 0,
+        had_error: 1,
+        error_message: message,
+      });
+      return { ok: false, narrative: `Failed to generate plan: ${message}` };
+    }
+  }
+
   async execute(
     request: string,
     pipeline: string[],
@@ -223,7 +283,6 @@ export class PipelineExecutor {
       return this.executeSpeculativeCascade(request, agentRunId, onStateChange, options);
     }
 
-    let plan = "No planning stage executed.";
     let executorSummary = "No execution stage executed.";
     let reviewerFeedback = "No review stage executed.";
     let rewriterSummary = "No rewriting stage executed.";
@@ -234,56 +293,15 @@ export class PipelineExecutor {
     const profile: ExecutionProfile = options.executionProfile ?? "full";
 
     // 1. Planner Stage
+    let state: PipelineStageState = {};
     if (pipeline.includes("planner")) {
-      onStateChange({ stage: "planner", status: "running" });
-      const plannerPrompt = stageSystemPrompt("planner", options);
-      const startTime = Date.now();
-      try {
-        const resp = await this.callModel([
-          { role: "system", content: plannerPrompt },
-          { role: "user", content: request }
-        ] as ChatMessage[], {
-          temperature: BUILTIN_MODES.planner.temperature,
-          max_tokens: BUILTIN_MODES.planner.max_tokens,
-          stream: true,
-          stageLabel: "planner",
-          suppressActivity: false,
-          onChunk: (chunk) => {
-            onStateChange({ stage: "planner", status: "running", output: chunk });
-          }
-        });
-        plan = resp.content;
-        onStateChange({ stage: "planner", status: "done", output: plan });
-
-        this.collector.recordStageRun({
-          id: `stage_${crypto.randomUUID()}`,
-          agent_run_id: agentRunId,
-          mode_id: "planner",
-          turn_number: 1,
-          input_tokens: Math.round((plannerPrompt.length + request.length) / 4),
-          output_tokens: countTokens(plan),
-          tool_calls_json: "[]",
-          duration_ms: Date.now() - startTime,
-          was_successful: 1,
-          had_error: 0,
-        });
-      } catch (e: any) {
-        onStateChange({ stage: "planner", status: "failed", output: errText(e) });
-        plan = `Failed to generate plan: ${errText(e)}`;
-
-        this.collector.recordStageRun({
-          id: `stage_${crypto.randomUUID()}`,
-          agent_run_id: agentRunId,
-          mode_id: "planner",
-          turn_number: 1,
-          tool_calls_json: "[]",
-          duration_ms: Date.now() - startTime,
-          was_successful: 0,
-          had_error: 1,
-          error_message: errText(e),
-        });
-      }
+      state.plan = await this.runPlannerStage(request, agentRunId, onStateChange, options);
     }
+    // Compatibility shim — the executor/reviewer/synthesizer blocks below
+    // still reference the old `plan` string. This re-derives it from the
+    // structured state via the canonical renderer. Deleted in A6 once
+    // every block is migrated to read `state` directly.
+    const plan = renderPlanSummary(state.plan);
 
     // 2. Executor Stage
     if (pipeline.includes("executor")) {

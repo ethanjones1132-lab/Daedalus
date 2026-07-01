@@ -334,12 +334,12 @@ This is a **behavior-preserving extraction** — same prompts, same telemetry, s
 **Files:**
 - Modify: `server-jarvis/src/orchestration/pipeline.ts`
 
-- [ ] **Step 1: Run the full existing test suite first to get a clean baseline**
+- [x] **Step 1: Run the full existing test suite first to get a clean baseline**
 
 Run: `cd server-jarvis && bun test src/orchestration.test.ts src/orchestration/`
 Expected: all currently-passing tests pass (this is your regression baseline — re-run after every sub-step below).
 
-- [ ] **Step 2: Add the import**
+- [x] **Step 2: Add the import**
 
 In `server-jarvis/src/orchestration/pipeline.ts`, add to the top imports:
 
@@ -351,7 +351,7 @@ import { buildSynthesizerContextFromStageState } from "./synth-context";
 
 (The existing `import { buildSynthesizerContext } from "./synth-context";` can stay — `synth-context.ts` now exports both.)
 
-- [ ] **Step 3: Add the `runPlannerStage` private method to the `PipelineExecutor` class**
+- [x] **Step 3: Add the `runPlannerStage` private method to the `PipelineExecutor` class**
 
 Add this method to the class (anywhere after the constructor, e.g. right after `runToolCall`):
 
@@ -415,7 +415,7 @@ Add this method to the class (anywhere after the constructor, e.g. right after `
   }
 ```
 
-- [ ] **Step 4: Replace the inline "1. Planner Stage" block in `execute()` with a call to the new method**
+- [x] **Step 4: Replace the inline "1. Planner Stage" block in `execute()` with a call to the new method**
 
 In `execute()`, replace lines 236-286 (the `if (pipeline.includes("planner")) { ... }` block that assigns to the local `plan` variable) with:
 
@@ -434,12 +434,12 @@ Do **not** delete the rest of `execute()` yet — the executor/reviewer/synthesi
 
 (This compatibility line gets deleted in Task A6 once every block is migrated. Leaving it in for now keeps each extraction step independently testable.)
 
-- [ ] **Step 5: Run the test suite**
+- [x] **Step 5: Run the test suite**
 
 Run: `cd server-jarvis && bun test src/orchestration.test.ts src/orchestration/`
 Expected: PASS, identical results to Step 1's baseline.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add server-jarvis/src/orchestration/pipeline.ts
