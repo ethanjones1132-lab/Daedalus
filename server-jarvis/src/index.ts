@@ -1618,7 +1618,23 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
           }
 
-          const cleanContent = cfg.reasoning.enabled ? stripReasoningFromText(fullTurnText) : fullTurnText;
+          const reasoningStripped = cfg.reasoning.enabled ? stripReasoningFromText(fullTurnText) : fullTurnText;
+          // Defense-in-depth: a stage that was never offered `tools` (e.g.
+          // synthesizer, planner, reviewer, coordinator) has no legitimate
+          // reason to emit <tool_call> syntax — but a free-tier model can
+          // still hallucinate it from prior context (e.g. the synthesizer
+          // echoing the executor's tool-heavy activity summary verbatim,
+          // 2026-07-01 live incident: synthesizer answer was literally just
+          // `<tool_call>{"name":"list_directory",...}</tool_call>`). Stages
+          // that DO use the text-tool protocol already run
+          // extractTextToolCalls above to parse+execute genuine calls; a
+          // stage with no tools never does, so any such tag it emits would
+          // otherwise leak straight into the user-visible answer verbatim.
+          // extractTextToolCalls with an empty tools list can never
+          // match/execute anything (normalizeToolName requires the name to
+          // be in the offered tools), it only performs the cleanup — so this
+          // is safe even when nothing was actually a real tool call.
+          const cleanContent = useTextTools ? reasoningStripped : extractTextToolCalls(reasoningStripped, []).cleanedText;
           // Capture the actual provider/model used by this attempt so the
           // orchestrator's `recordInference` error/empty paths can attribute
           // the turn to the real backend (not the user's selected

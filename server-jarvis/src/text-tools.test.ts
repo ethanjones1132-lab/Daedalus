@@ -94,6 +94,24 @@ describe("text tool extraction", () => {
     expect(parsed.calls[0].arguments).toEqual({ path: "README.md" });
   });
 
+  test("strips a hallucinated tool_call tag even with an empty tools list (no stage-appropriate tools offered)", () => {
+    // Regression for the 2026-07-01 live incident: the synthesizer stage
+    // never passes `tools` (it has none), so it never runs this extraction —
+    // but a free-tier model can still hallucinate <tool_call> syntax from
+    // prior context (e.g. echoing the executor's tool-heavy activity log).
+    // Calling extractTextToolCalls with an empty tools array must still
+    // strip the tag (nothing CAN match against an empty allow-list, so
+    // `calls` stays empty, but the cleanup regex fires independently of
+    // whether any call actually matched).
+    const parsed = extractTextToolCalls(
+      '<tool_call>{"name":"list_directory","arguments":{"path":"C:\\\\Projects\\\\Versutus\\\\src\\\\lib\\\\gateway"}}</tool_call>',
+      [],
+    );
+
+    expect(parsed.calls).toHaveLength(0);
+    expect(parsed.cleanedText).toBe("");
+  });
+
   test("supports legacy find_files blocks with only a closing tag", () => {
     const parsed = extractTextToolCalls(
       '{"tool":"find_files","path":".","limit":100}\n</tool_call>',
