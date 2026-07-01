@@ -71,6 +71,7 @@ import { PersistentConductor } from "./orchestration/persistent-conductor";
 import { SessionMemory, mergeSharedContextHints } from "./orchestration/session-memory";
 import { AgentPool, firstTokenTimeoutFor, formatPoolDiversity } from "./orchestration/agent-pool";
 import { PipelineExecutor } from "./orchestration/pipeline";
+import type { PipelineProgressState, PipelineRecursionEvent } from "./orchestration/pipeline";
 import { classifyTurnRequirements } from "./orchestration/turn-requirements";
 import { normalizeRoute, type ExecutionProfile } from "./orchestration/route-normalization";
 import { runPipelineWithReplanning } from "./orchestration/replan-loop";
@@ -1767,7 +1768,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // Execute the pipeline
         const mergedSharedContext = mergeSharedContextHints(route.shared_context, memoryHints);
         const executor = new PipelineExecutor(callModel, runtime, ctx);
-        const onOrchestratorStateChange = async (state: Parameters<Parameters<typeof executor.execute>[3]>[0]) => {
+        const onOrchestratorStateChange = async (state: PipelineProgressState) => {
           // Stream stage progress back to client — "conductor_replan" (B-02)
           // rides the same event type as an internal, non-user-facing status.
           await writer.write(encoder.encode(`data: ${JSON.stringify({
@@ -1785,7 +1786,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           sessionMemory: sessionMemory,
           distilledSkillsBlock: resolvedSkills.promptBlock,
           maxRecursionDepth: cfg.orchestrator.max_recursion_depth,
-          onRecursion: async (event: any) => {
+          onRecursion: async (event: PipelineRecursionEvent) => {
             await writer.write(encoder.encode(`data: ${JSON.stringify({
               type: "orchestrator_recursion",
               depth: event.depth,
@@ -1796,6 +1797,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             })}\n\n`));
           },
         };
+        // Check the RAW route, not `executablePipeline` — normalizeRoute strips
+        // conductor_replan markers before building the executable stage list,
+        // so executablePipeline never contains it and checking that instead
+        // would make this branch permanently unreachable.
         const result = route.pipeline.includes("conductor_replan")
           ? await runPipelineWithReplanning({
               contextMessage,
