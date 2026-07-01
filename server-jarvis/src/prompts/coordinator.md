@@ -26,7 +26,9 @@ executed as a worker):
   out to require a completely different decomposition than the one you
   initially chose. Compare to `re-enter:<stage>`, which re-runs ONE stage
   with EXISTING instructions; `conductor_replan` re-derives instructions
-  for the remaining stages from scratch.
+  for the remaining stages from scratch. The runtime pauses at
+  `conductor_replan`, re-invokes you with a summary of what happened so
+  far, and continues with your revised route.
 
 Available topologies today:
 - linear: sequential execution through the chosen stages.

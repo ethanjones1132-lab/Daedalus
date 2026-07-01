@@ -272,10 +272,10 @@ End-to-end: forced replan in test fixture re-runs executor with updated instruct
 
 #### Acceptance criteria
 
-- [ ] Replan stage calls local persistent conductor
-- [ ] Revised worker instructions flow to subsequent stages
-- [ ] `read_only` execution profile cannot escalate to `full`
-- [ ] SSE `orchestrator_stage` events include replan (internal status)
+- [x] Replan stage calls local persistent conductor
+- [x] Revised worker instructions flow to subsequent stages
+- [x] `read_only` execution profile cannot escalate to `full`
+- [x] SSE `orchestrator_stage` events include replan (internal status)
 
 ---
 
