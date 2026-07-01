@@ -26,7 +26,7 @@ Groups C and D are independent of A and B and could be built in parallel by a se
 - Create: `server-jarvis/src/orchestration/stage-output.ts`
 - Test: `server-jarvis/src/orchestration/stage-output.test.ts`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```typescript
 // server-jarvis/src/orchestration/stage-output.test.ts
@@ -117,12 +117,12 @@ describe("stage-output renderers", () => {
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cd server-jarvis && bun test src/orchestration/stage-output.test.ts`
 Expected: FAIL — `Cannot find module './stage-output'` (file doesn't exist yet).
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```typescript
 // server-jarvis/src/orchestration/stage-output.ts
@@ -219,12 +219,12 @@ export function renderRewriterSummary(stage: RewriterStageOutput | undefined): s
 }
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cd server-jarvis && bun test src/orchestration/stage-output.test.ts`
 Expected: PASS — 9 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add server-jarvis/src/orchestration/stage-output.ts server-jarvis/src/orchestration/stage-output.test.ts
