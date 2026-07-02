@@ -53,6 +53,7 @@ import {
   hasLocalWorkspaceToolIntent,
   isNativeToolProtocolUnsupportedError,
   TextToolCallStreamSanitizer,
+  VisibleAnswerStreamSanitizer,
   textToolResultsPrompt,
   webSearchQueryFromPrompt,
 } from "./text-tools";
@@ -1464,7 +1465,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               reader.cancel("First-token timeout").catch(() => {});
             }
           }, firstTokenMs);
-          const textStreamSanitizer = new TextToolCallStreamSanitizer();
+          const textStreamSanitizer =
+            !useTextTools && callOptions?.surfaceAsAnswer
+              ? new VisibleAnswerStreamSanitizer()
+              : new TextToolCallStreamSanitizer();
           const emitTextToken = async (text: string) => {
             if (callOptions?.surfaceAsAnswer) {
               await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text }, session_id: sessionId })}\n\n`));

@@ -3,6 +3,7 @@ import {
   extractTextToolCalls,
   hasExplicitWebSearchIntent,
   TextToolCallStreamSanitizer,
+  VisibleAnswerStreamSanitizer,
   webSearchQueryFromPrompt,
 } from "./text-tools";
 import { toApiTools } from "./tool-runtime";
@@ -81,6 +82,11 @@ const tools: ToolDefinition[] = [
   },
 ];
 
+function sanitizeVisibleAnswer(chunks: string[]): string {
+  const sanitizer = new VisibleAnswerStreamSanitizer();
+  return chunks.map((chunk) => sanitizer.push(chunk)).join("") + sanitizer.flush();
+}
+
 describe("text tool extraction", () => {
   test("extracts tagged tool calls without leaking the block", () => {
     const parsed = extractTextToolCalls(
@@ -110,6 +116,47 @@ describe("text tool extraction", () => {
 
     expect(parsed.calls).toHaveLength(0);
     expect(parsed.cleanedText).toBe("");
+  });
+
+  test("strips bare tool JSON lines with an empty tools list (2026-07-02 synthesizer spill)", () => {
+    const spill =
+      '{"name":"read_file","arguments":{"path":"C:\\\\Projects\\\\Versutus\\\\src\\\\lib\\\\gateway\\\\client.ts"}}\n' +
+      '{"name":"read_file","arguments":{"path":"C:\\\\Projects\\\\Versutus\\\\src\\\\lib\\\\gateway\\\\types.ts"}}';
+    const parsed = extractTextToolCalls(spill, []);
+
+    expect(parsed.calls).toHaveLength(0);
+    expect(parsed.cleanedText).toBe("");
+  });
+
+  test("preserves non-tool JSON in answers when tools list is empty", () => {
+    const parsed = extractTextToolCalls('Config: {"theme":"dark","fontSize":14}', []);
+
+    expect(parsed.calls).toHaveLength(0);
+    expect(parsed.cleanedText).toContain("theme");
+  });
+
+  test("strips cosmetic tool echoes only when they occupy a complete line", () => {
+    const toolJson = '{"name":"read_file","arguments":{"path":"README.md"}}';
+    const parsed = extractTextToolCalls(`Before\n${toolJson}\nAfter`, []);
+
+    expect(parsed.calls).toHaveLength(0);
+    expect(parsed.cleanedText).toBe("Before\nAfter");
+  });
+
+  test("preserves cosmetic-tool-shaped JSON in fenced examples and mixed prose", () => {
+    const toolJson = '{"name":"read_file","arguments":{"path":"README.md"}}';
+    const fenced = `\`\`\`json\n${toolJson}\n\`\`\``;
+
+    expect(extractTextToolCalls(fenced, []).cleanedText).toBe(fenced);
+    expect(extractTextToolCalls(`Here: ${toolJson}`, []).cleanedText).toBe(`Here: ${toolJson}`);
+  });
+
+  test("keeps generic name JSON but strips legacy flat tool-key echoes", () => {
+    const generic = 'Search metadata: {"name":"search","query":"x"}';
+    const legacy = '{"tool":"find_files","path":"."}';
+
+    expect(extractTextToolCalls(generic, []).cleanedText).toBe(generic);
+    expect(extractTextToolCalls(legacy, []).cleanedText).toBe("");
   });
 
   test("supports legacy find_files blocks with only a closing tag", () => {
@@ -198,6 +245,79 @@ describe("text tool stream sanitizer", () => {
 
     expect(sanitizer.push("A normal response")).toBe("A normal response");
     expect(sanitizer.push(" keeps streaming.")).toBe(" keeps streaming.");
+    expect(sanitizer.flush()).toBe("");
+  });
+
+  test("suppresses bare tool JSON lines split across stream chunks", () => {
+    const sanitizer = new VisibleAnswerStreamSanitizer();
+
+    expect(sanitizer.push('{"name":"read_file","arguments":{"path":"a.ts"}}\n')).toBe("");
+    expect(sanitizer.push('{"name":"read_file","arguments":{"path":"b.ts"}}\n')).toBe("");
+    expect(sanitizer.push("Here is the summary.")).toBe("Here is the summary.");
+    expect(sanitizer.flush()).toBe("");
+  });
+
+  test("is chunking-invariant and byte-faithful for clean multi-paragraph markdown", () => {
+    const markdown = "# Heading\n\nIntro paragraph.\n\n- first item\n\n- second item\n";
+    const chunkings = [
+      [markdown],
+      [...markdown],
+      markdown.match(/\S+|\s+/g) ?? [],
+      ["# Heading", "\n", "\nIntro paragraph.", "\n\n", "- first item\n", "\n- second item", "\n"],
+      Array.from({ length: Math.ceil(markdown.length / 3) }, (_, index) => markdown.slice(index * 3, index * 3 + 3)),
+    ];
+
+    for (const chunks of chunkings) {
+      expect(sanitizeVisibleAnswer(chunks)).toBe(markdown);
+    }
+  });
+
+  test("preserves paragraph breaks, chunk-boundary newlines, and loose-list spacing", () => {
+    expect(sanitizeVisibleAnswer(["Hello\n\nWorld\n"])).toBe("Hello\n\nWorld\n");
+    expect(sanitizeVisibleAnswer(["Hello", "\nWorld"])).toBe("Hello\nWorld");
+    expect(sanitizeVisibleAnswer(["- one\n\n- two\n"])).toBe("- one\n\n- two\n");
+  });
+
+  test("drops complete bare tool-JSON lines under arbitrary chunking", () => {
+    const toolJson = '{"name":"read_file","arguments":{"path":"README.md"}}';
+    const chunkings = [
+      [toolJson + "\n"],
+      ["{", toolJson.slice(1), "\n"],
+      [...toolJson, "\n"],
+      [toolJson],
+    ];
+
+    for (const chunks of chunkings) {
+      expect(sanitizeVisibleAnswer(chunks)).toBe("");
+    }
+  });
+
+  test("drops multiple cosmetic tool objects when they occupy one complete line", () => {
+    const toolJson = '{"name":"read_file","arguments":{"path":"README.md"}}';
+    expect(sanitizeVisibleAnswer([`${toolJson} ${toolJson}\n`])).toBe("");
+  });
+
+  test("preserves mixed prose and cosmetic tool JSON regardless of chunk boundaries", () => {
+    const toolJson = '{"name":"read_file","arguments":{"path":"README.md"}}';
+    const expected = `Result: ${toolJson}`;
+
+    expect(sanitizeVisibleAnswer([expected])).toBe(expected);
+    expect(sanitizeVisibleAnswer(["Result: ", toolJson])).toBe(expected);
+  });
+
+  test("preserves fenced cosmetic tool JSON examples with fences intact", () => {
+    const toolJson = '{"name":"read_file","arguments":{"path":"README.md"}}';
+    const fenced = `\`\`\`json\n${toolJson}\n\`\`\`\n`;
+
+    expect(sanitizeVisibleAnswer([fenced])).toBe(fenced);
+    expect(sanitizeVisibleAnswer([...fenced])).toBe(fenced);
+  });
+
+  test("does not emit whitespace-only partial chunks", () => {
+    const sanitizer = new VisibleAnswerStreamSanitizer();
+
+    expect(sanitizer.push("   ")).toBe("");
+    expect(sanitizer.push("\t")).toBe("");
     expect(sanitizer.flush()).toBe("");
   });
 });

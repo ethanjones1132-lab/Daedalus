@@ -751,8 +751,9 @@ function ChatPanel({
     const handleFrame = (frame: any) => {
       if (!frame || typeof frame !== 'object') return;
       if (frame.type === 'stream_event' && frame.delta?.text) {
-        streamedVisibleText = true;
-        appendAssistantText(String(frame.delta.text));
+        const text = String(frame.delta.text);
+        if (/\S/.test(text)) streamedVisibleText = true;
+        appendAssistantText(text);
         return;
       }
       if (frame.type === 'agent_activity' && frame.text) {

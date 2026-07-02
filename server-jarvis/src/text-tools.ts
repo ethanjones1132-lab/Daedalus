@@ -15,6 +15,11 @@ interface Candidate {
   value: unknown;
 }
 
+interface TextSpan {
+  start: number;
+  end: number;
+}
+
 const TOOL_ALIASES: Record<string, string> = {
   bash: "bash",
   shell: "bash",
@@ -228,15 +233,29 @@ export function extractTextToolCalls(text: string, tools: ToolDefinition[]): {
   }
 
   let cleanedText = text;
+  const spansToRemove: TextSpan[] = [];
   if (calls.length > 0) {
-    const spans = candidates
-      .filter((candidate) => callsFromValue(candidate.value, candidate.raw, availableNames).length > 0)
-      .sort((a, b) => b.start - a.start);
-    for (const span of spans) {
+    for (const candidate of candidates) {
+      if (callsFromValue(candidate.value, candidate.raw, availableNames).length > 0) {
+        spansToRemove.push(candidate);
+      }
+    }
+  }
+  // Stages with no tools offered (synthesizer, planner, reviewer): strip
+  // tool-shaped JSON the model echoed from executor context even though
+  // nothing can be executed — 2026-07-02 live incident (bare read_file lines).
+  if (availableNames.size === 0) {
+    spansToRemove.push(...findCosmeticToolEchoLineSpans(text, candidates));
+  }
+  const uniqueSpans = dedupeTextSpans(spansToRemove);
+  if (uniqueSpans.length > 0) {
+    const sorted = [...uniqueSpans].sort((a, b) => b.start - a.start);
+    for (const span of sorted) {
       cleanedText = `${cleanedText.slice(0, span.start)}${cleanedText.slice(span.end)}`;
     }
   }
-  if (calls.length > 0 || /<\/?tool_call>/i.test(cleanedText)) {
+  const strippedCosmetic = availableNames.size === 0 && uniqueSpans.length > 0;
+  if (calls.length > 0 || strippedCosmetic || /<\/?tool_call>/i.test(cleanedText)) {
     cleanedText = cleanedText
       .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "")
       .replace(/<\/?tool_call>/gi, "")
@@ -245,6 +264,81 @@ export function extractTextToolCalls(text: string, tools: ToolDefinition[]): {
   }
 
   return { cleanedText, calls };
+}
+
+/** Stream sanitizer for user-visible answers (synthesizer): tags + bare tool JSON lines. */
+export class VisibleAnswerStreamSanitizer {
+  private tagSanitizer = new TextToolCallStreamSanitizer();
+  private pendingLine = "";
+  private lineAlreadyEmitted = false;
+  private inFence = false;
+
+  push(chunk: string): string {
+    const tagCleaned = this.tagSanitizer.push(chunk);
+    return this.drainLines(tagCleaned, false);
+  }
+
+  flush(): string {
+    const tagCleaned = this.tagSanitizer.flush();
+    return this.drainLines(tagCleaned, true);
+  }
+
+  private drainLines(text: string, flush: boolean): string {
+    this.pendingLine += text;
+    let visible = "";
+
+    let newlineIndex = this.pendingLine.indexOf("\n");
+    while (newlineIndex >= 0) {
+      const line = this.pendingLine.slice(0, newlineIndex);
+      this.pendingLine = this.pendingLine.slice(newlineIndex + 1);
+
+      if (this.lineAlreadyEmitted) {
+        visible += `${line}\n`;
+      } else {
+        visible += this.decideLine(line, "\n");
+      }
+      this.lineAlreadyEmitted = false;
+      newlineIndex = this.pendingLine.indexOf("\n");
+    }
+
+    if (flush) {
+      if (this.pendingLine) {
+        if (this.lineAlreadyEmitted) {
+          visible += this.pendingLine;
+        } else if (this.pendingLine.trim()) {
+          visible += this.decideLine(this.pendingLine, "");
+        }
+      }
+      this.pendingLine = "";
+      this.lineAlreadyEmitted = false;
+      this.inFence = false;
+      return visible;
+    }
+
+    if (this.pendingLine) {
+      const pending = this.pendingLine.trimStart();
+      const canEmit = pending
+        && (this.lineAlreadyEmitted || (!pending.startsWith("{") && !pending.startsWith("`")));
+      if (canEmit) {
+        visible += this.pendingLine;
+        this.pendingLine = "";
+        this.lineAlreadyEmitted = true;
+      }
+    }
+    return visible;
+  }
+
+  private decideLine(line: string, terminator: string): string {
+    const isFenceBoundary = line.trimStart().startsWith("```");
+    if (isFenceBoundary) {
+      this.inFence = !this.inFence;
+      return line + terminator;
+    }
+    if (this.inFence || !isCosmeticToolEchoLine(line)) {
+      return line + terminator;
+    }
+    return "";
+  }
 }
 
 export async function executeTextToolCall(
@@ -309,6 +403,112 @@ function collectCandidates(text: string): Candidate[] {
   }
 
   return dedupeCandidates(candidates);
+}
+
+function isCosmeticToolEchoLine(line: string): boolean {
+  const objects = findJsonObjects(line);
+  if (objects.length === 0) return false;
+
+  const allToolEchoes = objects.every((object) => {
+    const value = parseJsonLike(object.raw);
+    return value !== null && isCosmeticToolEchoPayload(value);
+  });
+  if (!allToolEchoes) return false;
+
+  let remainder = line;
+  for (const object of [...objects].sort((a, b) => b.start - a.start)) {
+    remainder = `${remainder.slice(0, object.start)}${remainder.slice(object.end)}`;
+  }
+  return remainder.trim() === "";
+}
+
+function isCosmeticToolEchoPayload(value: unknown): boolean {
+  if (Array.isArray(value)) {
+    return value.length > 0 && value.every((item) => isCosmeticToolEchoPayload(item));
+  }
+  if (!value || typeof value !== "object") return false;
+
+  const record = value as Record<string, unknown>;
+  const nestedCalls = record.tool_calls ?? record.tools ?? record.calls;
+  if (Array.isArray(nestedCalls)) {
+    return nestedCalls.length > 0 && nestedCalls.every((item) => isCosmeticToolEchoPayload(item));
+  }
+
+  const rawTool = stringValue(record.tool);
+  const rawToolName = stringValue(record.tool_name);
+  const rawName = stringValue(record.name ?? record.function) ?? rawToolName ?? rawTool;
+  if (!rawName) return false;
+
+  const key = rawName.trim().replace(/\s+/g, "_").toLowerCase();
+  if (!TOOL_ALIASES[key]) return false;
+
+  if (record.arguments !== undefined || record.args !== undefined || record.input !== undefined) {
+    return true;
+  }
+  // Legacy flat blocks: {"tool":"find_files","path":"."}
+  const legacyName = rawToolName ?? rawTool;
+  if (!legacyName) return false;
+  const legacyKey = legacyName.trim().replace(/\s+/g, "_").toLowerCase();
+  if (!TOOL_ALIASES[legacyKey]) return false;
+  const controlKeys = new Set(["id", "name", "tool", "tool_name", "function", "type"]);
+  const payloadKeys = Object.keys(record).filter((k) => !controlKeys.has(k));
+  return payloadKeys.length > 0;
+}
+
+function findCosmeticToolEchoLineSpans(text: string, candidates: Candidate[]): TextSpan[] {
+  const fencedLines = findFencedLineSpans(text);
+  const groups = new Map<string, { start: number; end: number; candidates: Candidate[] }>();
+
+  for (const candidate of candidates) {
+    if (!isCosmeticToolEchoPayload(candidate.value)) continue;
+    if (fencedLines.some((span) => candidate.start < span.end && candidate.end > span.start)) continue;
+
+    const lineStart = text.lastIndexOf("\n", candidate.start - 1) + 1;
+    const nextNewline = text.indexOf("\n", candidate.end);
+    const lineEnd = nextNewline >= 0 ? nextNewline + 1 : text.length;
+    const key = `${lineStart}:${lineEnd}`;
+    const group = groups.get(key) ?? { start: lineStart, end: lineEnd, candidates: [] };
+    group.candidates.push(candidate);
+    groups.set(key, group);
+  }
+
+  const spans: TextSpan[] = [];
+  for (const group of groups.values()) {
+    let remainder = text.slice(group.start, group.end);
+    for (const candidate of [...group.candidates].sort((a, b) => b.start - a.start)) {
+      const start = candidate.start - group.start;
+      const end = candidate.end - group.start;
+      remainder = `${remainder.slice(0, start)}${remainder.slice(end)}`;
+    }
+    if (remainder.trim() === "") {
+      spans.push({ start: group.start, end: group.end });
+    }
+  }
+  return spans;
+}
+
+function findFencedLineSpans(text: string): TextSpan[] {
+  const spans: TextSpan[] = [];
+  let lineStart = 0;
+  let inFence = false;
+
+  while (lineStart < text.length) {
+    const newlineIndex = text.indexOf("\n", lineStart);
+    const lineEnd = newlineIndex >= 0 ? newlineIndex + 1 : text.length;
+    const line = text.slice(lineStart, newlineIndex >= 0 ? newlineIndex : text.length);
+    const isFenceBoundary = line.trimStart().startsWith("```");
+    if (inFence || isFenceBoundary) spans.push({ start: lineStart, end: lineEnd });
+    if (isFenceBoundary) inFence = !inFence;
+    lineStart = lineEnd;
+  }
+
+  return spans;
+}
+
+function dedupeTextSpans(spans: TextSpan[]): TextSpan[] {
+  const unique = new Map<string, TextSpan>();
+  for (const span of spans) unique.set(`${span.start}:${span.end}`, span);
+  return [...unique.values()].sort((a, b) => a.start - b.start);
 }
 
 function matchingTagPrefixSuffixLength(text: string, tag: string): number {
