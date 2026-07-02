@@ -5,6 +5,8 @@
 **Live runtime (stale):** `C:\Users\ethan\OneDrive\Desktop\Jarvis.exe` + `bun …\Desktop\index.js`  
 **Status:** Plan only — no implementation in this pass.
 
+**Changelog (2026-07-02 verification pass):** Re-ranked stack after parallel sweeps of server streaming/abort, UI chat flow, and orchestration/classifier/spawn. Corrected P0-B (server *does* emit `cancelled`; UI drops it; Agent Loop duplicates first-token watchdog). Rewrote P2-F (permissive **allows** out-of-workspace paths). Added P0-I/J, P1-K/L/M/N, P2-O. Strengthened acceptance criteria, execution order, risks, and test matrix.
+
 ---
 
 ## Executive ordering (impact × blast radius)
@@ -12,13 +14,20 @@
 | Rank | Issue | Why first |
 |------|--------|-----------|
 | **P0-A** | Stale Desktop runtime bundle | Every other fix is invisible until `index.js` / `Jarvis.exe` / `prompts/` match repo HEAD. You are debugging production behavior that does not include `VisibleAnswerStreamSanitizer` or recent orchestrator fixes. |
-| **P0-B** | Turn-wide `streamAbort` on slow first-token (false “cancelled”) | Hard user-visible failure: ~46s, zero tokens, no fallback, blank bubble, no persisted assistant row. Blocks trust in free-tier models (`deepseek-v4-flash-free`). |
-| **P1-C** | Read-only turns over-orchestrated (classifier + routing + executor churn) | Same session: 10 executor passes, 3× HTTP 400, 3 fallback advances for a simple read probe — cost, latency, and wrong tool profile. |
+| **P0-B** | Turn-wide `streamAbort` on slow first-token (false “cancelled” + blank bubble) | Hard user-visible failure: slow/zero-token turns, blank bubble, no persisted assistant row. Blocks trust in free-tier models (`deepseek-v4-flash-free`). |
+| **P0-I** | SSE protocol contract & terminal-frame guarantee | Server emits frame types the UI never handles; non-terminal or silent ends break “fluid chat” even when server logic is partially correct. |
+| **P0-J** | Stream liveness: hangs, stalls, disconnects | No client inactivity timeout; limited server stall coverage; no keepalive during silent pipeline stages; upstream not aborted on client disconnect. |
+| **P1-C** | Read-only turns over-orchestrated (classifier + routing + executor churn) | Same session: many executor passes, HTTP 400s, fallback advances for a simple read probe — cost, latency, wrong tool profile. |
 | **P1-D** | Negation-blind `mutation_verb` (“Do not modify”) → `full_execution` | Safety regression: read-only ask escalates to full tool profile. |
 | **P1-E** | Bun server failed to auto-start (manual `Desktop\index.js`) | App appears “up” but chat path dead until user intervenes; couples to supervisor / spawn / Desktop layout. |
-| **P2-F** | Permissive sandbox + Windows path outside `jarvis_path` | Expected per `fs-scope.ts` design, but user expectation mismatch; config/docs + optional `jarvis_path` alignment. |
-| **P2-G** | Companion sprite overlaps Send (`fixed bottom-6 right-6` vs composer Send) | UX friction, not data loss. |
-| **P2-H** | Build provenance does not cover **Desktop deploy triplet** | Rust `build.rs` stamps exe; **no enforced hash** for copied `index.js` + `prompts/` beside `Jarvis.exe`. Stale server script can persist while exe looks “fresh.” |
+| **P1-K** | UI chat state machine (send/stop/session/history/empty bubble) | Races and edge cases that corrupt messages, lose input, or leave broken UI state during normal chat. |
+| **P1-L** | Server abort-domain races & resource hygiene | Extends P0-B: controller map races, duplicate `reader.cancel()`, shared `streamAbort`, markup leakage on non-answer stages. |
+| **P1-M** | Persistence & history integrity | Assistant history is UI-driven (Tauri `append_message`); server `/sessions` stubs; cancel/error mid-stream loses rows. |
+| **P1-N** | Config integrity | `saveConfig` writes without pre-validation; `deepMerge` blocks intentional empty-string clears; coordinator `<think>`-only output degrades routing. |
+| **P2-F** | Permissive sandbox **allows** paths outside `jarvis_path` | Working-as-coded (not “bypass bug”); user/docs expectation mismatch; align `jarvis_path` or document behavior. |
+| **P2-G** | Companion sprite overlaps Send | Global `z-50` companion vs composer Send (no z-index) — click-target friction, not data loss. |
+| **P2-H** | Build provenance does not cover **Desktop deploy triplet** | Rust `build.rs` stamps exe; **no enforced hash** for copied `index.js` + `prompts/` beside `Jarvis.exe`. |
+| **P2-O** | Ops hardening (spawn, restart TTL, deploy guards, tool truncation) | Restart fast-path stale health, supervisor boot grace, deploy `prompts/` guard, executor result elision. |
 
 ---
 
@@ -32,42 +41,44 @@
 
 ### Root cause
 
-- **Two launch surfaces:** Tauri may run bundled `index.js` next to exe / resources, while day-to-day usage points Bun at **OneDrive Desktop** copy (documented in `NEXT_AGENT_JARVIS_LIVE_MODEL_DIAGNOSIS_2026-06-26.md`, `scripts/build-and-deploy.ps1`).
-- Deploy is manual/scripted, not tied to app start; MD5/SHA can match when source unchanged (PRIORITIES notes deterministic `bun build`), so **hash equality is not sufficient** — must compare to **current git HEAD** build output.
+- **Two launch surfaces:** Tauri may run bundled `index.js` next to exe / resources, while day-to-day usage points Bun at **OneDrive Desktop** copy (`scripts/build-and-deploy.ps1`, live diagnosis docs).
+- Deploy is manual/scripted, not tied to app start; deterministic `bun build` can yield identical hashes when source unchanged — **hash equality is not sufficient**; compare to **current git HEAD** build output.
+- **Prompts are disk-loaded:** `loadPrompt()` resolution order (`server-jarvis/src/orchestration/prompt-loader.ts` ~30–82): `JARVIS_PROMPTS_DIR` → `__dirname/prompts/` → dev walk-ups → cwd/repo walk. Missing `Desktop\prompts\` degrades stages with narrative errors (`pipeline.ts` loads prompts per stage), not a silent single-point kill.
+- **Deploy script gap:** `build-and-deploy.ps1` copies `server-jarvis\src\prompts` via `$promptsSrc` (~55, ~138–144) but does **not** `Test-Path` the source before `Copy-Item` — a bad path fails late or copies nothing useful.
 
 ### Plan
 
 1. **Pre-flight (5 min)**  
    - `git rev-parse HEAD` → note SHA.  
-   - Build fresh: `powershell -ExecutionPolicy Bypass -File scripts\build-and-deploy.ps1 -SkipDeploy` (or stages 1–3 only).  
+   - Build fresh: `powershell -ExecutionPolicy Bypass -File scripts\build-and-deploy.ps1 -SkipDeploy`.  
    - Hash repo `server-jarvis/dist/index.js` vs `OneDrive\Desktop\index.js`.  
-   - Grep deployed file for `VisibleAnswerStreamSanitizer` (string present in fresh bundle).
+   - Grep deployed file for `VisibleAnswerStreamSanitizer`.
 
-2. **Atomic deploy** (`build-and-deploy.ps1` stage 4 — already documents triplet):  
-   - `home-base.exe` → `Jarvis.exe` (+ `home-base.exe` alias if used).  
+2. **Atomic deploy** (`build-and-deploy.ps1` stage 4):  
+   - `home-base.exe` → `Jarvis.exe` (+ alias if used).  
    - `dist/index.js` → `Desktop\index.js`.  
-   - `server-jarvis/src/prompts/` → `Desktop\prompts\` (required — prompts are **not** inlined in bundle).
+   - `server-jarvis/src/prompts/` → `Desktop\prompts\` (required — not inlined in bundle).
 
 3. **Restart contract**  
    - Kill old Bun on port **19877** (or configured port).  
-   - Option: `-RestartServer` on script, or relaunch `Jarvis.exe` and verify supervisor spawns Bun (see P1-E).  
-   - Smoke: one chat turn + confirm log line shows post-`fb63137` sanitizer behavior.
+   - `-RestartServer` on script or relaunch `Jarvis.exe`; verify supervisor spawns Bun (P1-E).  
+   - Smoke: one chat turn + log/sanitizer behavior post-`fb63137`.
 
-4. **Hardening (follow-up task)**  
-   - Write `Desktop\.jarvis-deploy-manifest.json` on each deploy: `{ git_sha, index_js_sha256, exe_mtime, prompts_tree_sha256, deployed_at }`.  
-   - Health UI / Control Center: “runtime drift” when manifest ≠ current build artifacts.  
-   - On app start: prefer **single canonical server entry** (exe-adjacent `index.js` **or** documented Desktop path — not both silently).
+4. **Hardening (follow-up)**  
+   - `Desktop\.jarvis-deploy-manifest.json`: `{ git_sha, index_js_sha256, exe_mtime, prompts_tree_sha256, deployed_at }`.  
+   - Health UI: runtime drift when manifest ≠ current artifacts.  
+   - Single canonical server entry documented (exe-adjacent vs Desktop — not both silently).
 
 ### Acceptance
 
 - `Desktop\index.js` contains `VisibleAnswerStreamSanitizer` wiring for synthesizer.  
-- Chat bubble shows newline-faithful answers; no regression to empty bubble from sanitizer-only bugs fixed in `fb63137`.  
+- Chat bubble shows newline-faithful answers; no empty bubble from sanitizer regressions fixed in `fb63137`.  
 - `coordinator.md` loads from `Desktop\prompts\`.
 
 ### Verify
 
-- `bun -e` against **deployed** `index.js` is awkward (bundled); instead: strings/grep + live SSE frame inspection.  
-- `server-jarvis` tests: `bun test text-tools.test.ts` on repo before deploy.
+- Strings/grep on deployed `index.js` + live SSE inspection (bundled file is awkward for `bun -e`).  
+- Repo: `bun test text-tools.test.ts` before deploy.
 
 ---
 
@@ -76,63 +87,138 @@
 ### Symptoms (observed)
 
 - Model: `deepseek-v4-flash-free`, ~45.967s, zero tokens, zero fallbacks, error: **`stream cancelled`**.
-- Stale bundle: first-token watchdog calls **turn-wide** `streamAbort.abort()` (~line 14955 in Desktop `index.js`; repo equivalent ~1461–1465 in `server-jarvis/src/index.ts`).
-- UI: `JarvisView.tsx` `finalizeAssistantMessage` (~404–425) clears streaming flag; **does not persist** assistant if `content.trim()` empty; stream ends without `error` frame when `StreamCancelledError` short-circuits server catch (~2755–2756).
+- First-token watchdog calls **turn-wide** `streamAbort.abort("First-token timeout")` in **two** code paths:
+  - Orchestrator stage read loop: `server-jarvis/src/index.ts` ~1456–1465.
+  - **Agent Loop** (missed in prior plan): same pattern ~2346–2357 (`[Jarvis Agent Loop] First-token timeout`).
+- Server **does** emit `type: "cancelled"` via `emitCancelled()` (~1033–1038) before throwing `StreamCancelledError`.
+- Catch block (~2755–2756): `StreamCancelledError` → **silent `return`** (no `error` frame — `cancelled` already sent).
+- UI (`JarvisView.tsx` ~751–838): **no handler for `cancelled`** and **no `default` case** → frame dropped; stream ends → `finalizeAssistantMessage` (~404–425) leaves **empty** assistant bubble; **no** `append_message` when `content.trim()` empty (~415).
 
 ### Root cause (layered)
 
-1. **`chatCompletionWithFallback`** (`openrouter.ts` ~812–848): attempt-local `attemptCtrl.abort(STALL_REASON)` on first-byte timeout → **should** advance cascade (correct layer).
+1. **`chatCompletionWithFallback`** (`openrouter.ts` ~792–796): `first_token_timeout_ms` defaults **30_000** ms on attempt-local watchdog; should advance cascade on stall (correct layer).
 
-2. **Orchestrator defense-in-depth** (`index.ts` ~1445–1466): after `fetchRes.ok`, if no **content** token before `firstTokenMs`, calls **`streamAbort.abort("First-token timeout")`** — this is the **session/turn** controller, shared with user cancel (`activeStreamControllers`, `emitCancelled`).
+2. **Orchestrator + Agent Loop defense-in-depth** (`index.ts`): after `fetchRes.ok`, if no content token before `firstTokenTimeoutFor()` (clamped **[1_000, 60_000]** ms, ~1454–1456, ~2342–2350), calls **`streamAbort.abort()`** — session/turn controller shared with user Stop (`activeStreamControllers`, `/chat/cancel` ~3125–3127).
 
-3. **Misclassification:** Slow-but-valid model is treated like **user cancellation** → `StreamCancelledError` → catch returns with **no** `type: "error"` SSE → UI runs normal end-of-stream `finalizeAssistantMessage` → empty optimistic bubble.
+3. **Misclassification:** Slow/hung model is treated like **user cancellation** → `cancelled` SSE → UI ignores it → empty bubble + no persistence.
 
-4. **Fallback gap:** Abort poisons the whole turn before `callModel` can retry/next model; metrics show `stream cancelled` not first-token timeout message.
+4. **Fallback gap:** Turn-wide abort can poison the session before `callModel` / cascade completes; metrics may read `stream cancelled` rather than structured first-token failure.
 
 ### Plan
 
 #### Server (`server-jarvis/src/index.ts` + `openrouter.ts`)
 
 1. **Separate abort domains**  
-   - `userAbort` / `streamAbort` — only user Stop, session supersede, app shutdown.  
-   - `attemptAbort` — first-token stall, per-HTTP-attempt only; **must not** call `streamAbort.abort()`.
+   - `streamAbort` — user Stop, session supersede, app shutdown only.  
+   - `attemptAbort` / per-read-loop abort — first-token stall, per-HTTP-attempt; **must not** call `streamAbort.abort()`.
 
-2. **Orchestrator first-token watchdog behavior**  
-   - On timeout: `reader.cancel()`, throw **`FirstTokenTimeoutError`** (or structured error with `retryable: true`, `reason: "first_token"`).  
-   - **`callModel` loop** catches attempt-level timeout → exclude model → invoke `chatCompletionWithFallback` again / next pool model (same as empty-completion cascade).  
-   - Bound attempts (e.g. max 2–3 per stage) to avoid infinite spin.
+2. **First-token watchdog (both orchestrator read loop and Agent Loop)**  
+   - On timeout: `reader.cancel()`, throw **`FirstTokenTimeoutError`** (or `retryable: true`, `reason: "first_token"`).  
+   - `callModel` / fallback catches attempt-level timeout → exclude model → advance cascade.  
+   - Bound attempts per stage.
 
-3. **Never map attempt timeout → `emitCancelled()`** unless `streamAbort` reason is explicitly user-initiated (`AbortSignal` from `/chat/cancel` or client disconnect).
+3. **Terminal frames for non-user failures**  
+   - Emit `type: "error"` with `code: "first_token_timeout"` **or** `fallback_notice` + continue; exhausted pool → `result` with `is_error: true` and retry text.  
+   - Reserve `type: "cancelled"` for **explicit** user/client cancel only.
 
-4. **Terminal frames for non-user failures**  
-   - Emit `type: "error"` with `code: "first_token_timeout"` **or** `type: "fallback_notice"` + continue pipeline; if all models exhausted, `type: "result", is_error: true` with user-facing retry text.  
-   - Do **not** use `type: "cancelled"` for watchdog.
+4. **Align timeouts**  
+   - Orchestrator uses `firstTokenTimeoutFor(agentPool, model, MODEL_FIRST_TOKEN_TIMEOUT_MS)`; reconcile with `openrouter.first_token_timeout_ms` and observed ~46s on stale bundle (re-verify post P0-A).
 
-5. **Align timeouts**  
-   - Per-model `firstTokenTimeoutFor` (agent pool) for orchestrator read loop.  
-   - Ensure `deepseek-v4-flash-free` (and similar) either has pool override **or** inherits config `openrouter.first_token_timeout_ms` — today orchestrator may fire at 30s while user saw ~46s (stale bundle or different code path — re-verify on fresh deploy).
+#### UI (`src-ui/src/components/jarvis/JarvisView.tsx`)
 
-#### UI (`JarvisView.tsx`)
+1. **Handle `type: "cancelled"`** in `handleFrame`: user Stop → finalize with “(stopped)” or remove empty stub; **do not** treat as success.
 
-1. Handle `type: "cancelled"` explicitly: only then finalize as “stopped by user”; optional persist “(cancelled)” or drop empty bubble.
+2. **`type: "error"` / `result.is_error`:** set error strip; remove empty assistant stub (`handleSend` catch ~902+).
 
-2. On `type: "error"` or `result.is_error`: set `error` state, remove empty assistant stub (already partial in `handleSend` catch ~906–911).
+3. **`finalizeAssistantMessage`:** if assistant empty and stream ended without visible success, **remove** bubble and show error (no blank row).
 
-3. **`finalizeAssistantMessage`:** if streaming assistant is empty and no explicit success, **remove** bubble and show error strip (don’t leave blank assistant row).
-
-4. **`type: "cancelled"`** during non-user watchdog: treat as error (server fix should prevent this).
+4. **Terminal-frame invariant (see P0-I):** every turn must end in UI handling `result` | `error` | `cancelled`.
 
 #### Tests
 
-- Extend `stream-cancel.test.ts`: user cancel still single `cancelled` frame.  
-- New test: simulated first-token timeout → `error` or fallback frames, **not** `cancelled`.  
-- Optional integration: mock slow SSE, assert cascade `excludeModels` advances.
+- `stream-cancel.test.ts`: user cancel → single `cancelled`.  
+- New: first-token timeout → `error` or fallback, **not** `cancelled`.  
+- Both code paths: orchestrator read loop + Agent Loop watchdog.
 
 ### Acceptance
 
-- Slow `deepseek-v4-flash-free` turn: either tokens arrive, or fallback runs, or explicit error message — **never** silent blank bubble.  
-- User Stop still emits one `cancelled` and clears streaming promptly.  
-- Inference metrics: `fallbacks_used` / `retry_count` non-zero when appropriate.
+- Slow `deepseek-v4-flash-free`: tokens, fallback, or explicit error — **never** silent blank bubble.  
+- User Stop: one `cancelled`, UI shows stopped state, streaming clears promptly.  
+- **Invariant:** watchdog timeout never emits `cancelled`; UI handles `cancelled` when user Stop does emit it.  
+- Metrics: `fallbacks_used` / `retry_count` non-zero when appropriate.
+
+### Verify
+
+- Spot-check: `index.ts:1033–1039`, `1461–1465`, `2351–2357`, `2755–2757`; `JarvisView.tsx:751–838`, `404–425`.
+
+---
+
+## P0-I — SSE protocol contract & terminal-frame guarantee
+
+### Symptoms
+
+- Server emits frame types including: `init`, `stream_event`, `agent_activity`, `orchestrator_stage`, `orchestrator_recursion`, `reasoning_*`, `tool_use`, `tool_result`, `cost_info`, `result`, `error`, **`cancelled`**, **`fallback_notice`**, **`message_stop`**, **`agent_run_id`** (`stream-emitter.ts`, `index.ts`, `claude-cli.ts`).
+- UI `handleFrame` (`JarvisView.tsx` ~751–838) handles ~11 kinds; **unhandled:** `cancelled`, `fallback_notice`, `message_stop`, `init`, `agent_run_id`; **no `default`** logging for unknown types.
+- `JSON.parse(data)` at ~852 is **uncaught** → malformed SSE line can freeze/hang the read loop mid-stream.
+- Server `JSON.stringify` in hot paths is not uniformly wrapped — writer failures should not leave ambiguous half-states.
+- **Agent Loop** empty-completion path: orchestrator tool loop has empty fallback text + `session.finish` (~2653–2665); verify Agent Loop parity — any path that ends without `session.finish` / terminal frame leaves UI waiting.
+
+### Root cause
+
+- No shared **SSE contract** document or runtime assertion: “exactly one terminal frame per turn.”
+- UI and server evolved separately; Claude CLI path emits `init` / `message_stop` that direct `fetch` UI path never consumed.
+
+### Plan
+
+1. **Document contract** in `docs/` or `stream-emitter.ts` header: required terminal trio; optional progress frames; versioning rule for new types.
+
+2. **UI:** `switch`/`if-else` with **`default`**: log `unknown SSE type` + optional dev banner; handle `cancelled`, `fallback_notice` (toast or inline), ignore-noop `init`/`message_stop` if redundant.
+
+3. **UI:** wrap `JSON.parse` in try/catch → surface parse error, abort stream cleanly.
+
+4. **Server:** `ensureTerminal()` in `finally` (~2785–2789) must guarantee terminal frame unless already sent; audit Agent Loop exits for parity with orchestrator empty handling.
+
+5. **Tests:** terminal-frame invariant test (mock writer records exactly one of `result`|`error`|`cancelled` per session).
+
+### Acceptance
+
+- Every completed turn: UI receives and processes exactly one terminal outcome (visible answer, error strip, or cancelled/stopped state).  
+- Unknown frame types logged once per type per session (dev).  
+- Malformed `data:` line does not wedge `isStreaming` true forever.
+
+### Verify
+
+- `JarvisView.tsx:751–838`, `852`; `index.ts:1033–1039`, `2785–2789`; `stream-emitter.ts` finish paths.
+
+---
+
+## P0-J — Stream liveness: hangs, stalls, disconnects
+
+### Symptoms
+
+- UI: `reader.read()` loop (~840–855) has **no inactivity timeout** — TCP half-close or hung proxy → wait forever, `isStreaming` stuck.
+- Server: first-token watchdog + **chunk stall** check (`MODEL_STREAM_STALL_*`, ~1485–1493) — no **inter-token** guarantee if bytes trickle (e.g. one byte every 55s).
+- Long silent orchestrator stages (~1833–1850 region): no SSE **keepalive** / heartbeat → reverse-proxy idle timeout risk.
+- No **client disconnect** propagation: failed `writer.write` does not abort upstream model fetch for that session.
+
+### Plan
+
+1. **UI:** `AbortController` + wall-clock inactivity timer (reset on any valid frame); on fire → abort fetch, finalize with error.
+
+2. **Server:** optional `: ping` or `type: "heartbeat"` every N seconds during pipeline gaps (behind flag); **deploy UI default handler first** (P0-I) so heartbeats are not silently dropped.
+
+3. **Server:** inter-token idle timeout on read loops (distinct from first-token).
+
+4. **Server:** on write failure, abort `streamAbort` or upstream `fetch` signal for that session.
+
+### Acceptance
+
+- Simulated network drop: UI recovers within configured timeout (error + `isStreaming` false).  
+- 5+ minute silent pipeline (mock): connection stays open or fails with explicit error, not infinite spinner.
+
+### Verify
+
+- Manual: disable network mid-stream; throttle SSE to 1 byte/min in dev mock.
 
 ---
 
@@ -140,49 +226,47 @@
 
 ### Symptoms (observed)
 
-- Quoted `{"name":"read_file",…}` JSON misclassified as executable workspace intent.  
-- **10 Executor** model passes for a read probe.  
-- **3× HTTP 400** + **3 fallback advances** on provider chain.  
-- First `read_file` omitted `path`; auto-correction recovered (tool-loop churn).
+- Quoted `{"name":"read_file",…}` JSON misclassified as executable workspace intent.
+- **10 Executor** model passes for a read probe (`modes.ts` `max_turns: 10` ~47).
+- **3× HTTP 400** + **3 fallback advances** on provider chain.
+- First `read_file` omitted `path`; recovery via **model-driven retry after tool-error result** (`pipeline.ts` tool loop ~199–233), not deterministic “auto-correction.”
 
-### Root cause hypotheses (verify on fresh logs)
+### Root cause (verified on repo)
 
 1. **`classifyTurnRequirements`** (`turn-requirements.ts`):  
-   - `quoted_path` regex matches JSON strings containing `/` or `\\`.  
-   - Bare tool JSON in user message → **`workspace_read`** or worse **`full_execution`** (see P1-D).  
-   - Coordinator may still route heavy pipeline (`planner` → `executor` × N tool turns).
+   - `quoted_path` regex ~42: `/["'][^"']*[\\/][^"']*["']/`.  
+   - Bare tool JSON → `workspace_read` or **`full_execution`** (P1-D).
 
-2. **Executor tool loop** (`MAX_TOOL_EXECUTION_TURNS` = 10): text-tool protocol on OpenCode models → multi-pass parse/execute.
+2. **Route normalization** (`route-normalization.ts`):  
+   - `ALLOWED_STAGES.workspace_read` = planner, executor, reviewer, synthesizer (~62) — **not** capped to executor→synthesizer only at allowed-set level.  
+   - `REQUIRED_STAGES.workspace_read` = **`["executor", "synthesizer"]`** (~70).  
+   - `PROFILE_FOR.workspace_read` = **`read_only`** (~74–78) — tools capped; coordinator cannot expand to full profile via normalization (~98–164).
 
-3. **OpenCode / tool-message 400s** (orchestrator-tuning skill): providers reject tool-shaped history → fallback churn before successful read.
+3. **Executor tool loop** + OpenCode 400s: tool-shaped history rejected → fallback churn.
 
-4. **Fast path missing:** Trivial “read path X” should be `workspace_read` + `["executor","synthesizer"]` + read-only profile, **not** full planner/reviewer stack when conductor agrees.
+4. **Fast path missing** for trivial read-with-explicit-path.
 
 ### Plan
 
-1. **Log forensics template** (one failing session id):  
-   - Grep: `Jarvis_Orchestrator:`, `normalized=`, `requirement=`, `Pool resolved`, `Fallback:`, `API 400`.  
-   - Correlate with `classifyTurnRequirements` signals in log (add log line if missing).
+1. **Log forensics** per failing `session_id`: `normalized=`, `requirement=`, `Pool resolved`, `Fallback:`, `API 400`.
 
-2. **Classifier hardening** (`turn-requirements.ts`):  
-   - **JSON / tool-call shaped messages:** if message matches `^\s*\{.*"name"\s*:\s*"(read_file|…)"` and lacks mutation intent → `workspace_read` or `answer_only` (if user says “paste/analyze this JSON” without workspace noun).  
-   - **Quoted JSON block:** do not treat as `quoted_path` if entire message is tool-call exemplar (negative lookahead / `isToolCallPayload()` helper).  
-   - Tests in `turn-requirements.test.ts` for pasted tool JSON + “do not execute”.
+2. **Classifier** (`turn-requirements.ts`): tool-call-shaped / quoted JSON exemplar → `answer_only` or `workspace_read` without `quoted_path`; tests in `turn-requirements.test.ts`.
 
-3. **Route normalization** (`route-normalization.ts`):  
-   - `workspace_read` + read-only profile: cap pipeline to `executor → synthesizer` (already partially enforced — verify not expanded by coordinator).
+3. **Route normalization:** optionally tighten `ALLOWED_STAGES.workspace_read` to `{executor, synthesizer}` if product wants minimal pipeline (ADR); today **required** stages already force executor presence.
 
-4. **Executor efficiency:**  
-   - Single-tool read turns: coordinator fast-route (existing turn-triage / trivial paths — compare with `isTrivialConversationalTurn`).  
-   - Reduce redundant LLM passes: deterministic parse of `read_file` from user text when path is explicit (optional Tier-2).
+4. **Executor efficiency:** trivial read fast-route; optional deterministic path extract (Tier-2).
 
-5. **Provider 400:** strip or compress tool messages for OpenCode providers before retry (orchestrator-tuning §7); count 400s in metrics.
+5. **Provider 400:** normalize/strip tool messages for OpenCode providers (config flag).
 
 ### Acceptance
 
-- “Read `C:\…\file`” (or quoted path): ≤2 executor LLM rounds typical, read-only tools only.  
-- Pasted tool JSON with “analyze only / do not run”: no executor loop.  
+- “Read `C:\…\file`”: ≤2 executor LLM rounds typical, **read_only** tools only.  
+- Pasted tool JSON “analyze only / do not run”: no executor loop.  
 - HTTP 400 count logged; fallbacks bounded.
+
+### Verify
+
+- `turn-requirements.ts:42`; `route-normalization.ts:62–71, 74–79`; `modes.ts:47`.
 
 ---
 
@@ -194,22 +278,14 @@
 
 ### Root cause
 
-- `MUTATION_VERB` in `turn-requirements.ts` (~70–71) matches **`modify`** as substring of “**modify**” in “Do **not modify**” — no negation window.  
+- `MUTATION_VERB` matches **`modify`** inside “Do **not modify**” — no negation window (`turn-requirements.ts` ~112–124).  
 - Precedence: mutation wins over `workspace_read` (~121–124).
 
 ### Plan
 
-1. **Negation pass** before verb signals:  
-   - Patterns: `\b(do not|don't|never|without)\s+(\w+)` within ~3 words of mutation lemma; `\bno\s+(modifications|edits|changes)\b`.  
-   - If negated → do not set `mutation_verb` for that lemma.
-
-2. **Conservative default:** negated mutation + read verbs → `workspace_read` or `answer_only`.
-
-3. **Tests:**  
-   - `"Do not modify any files"` → `workspace_read` or `answer_only`, signals include `negated_mutation`, **not** `full_execution`.  
-   - `"Do not delete"` vs `"delete temp"` still `full_execution`.
-
-4. **Eval cases** (`eval/cases.ts`): add regression case for negation.
+1. Negation pass before mutation signals (`do not|don't|never|without` + lemma; `no modifications|edits|changes`).  
+2. Negated mutation + read cues → `workspace_read` or `answer_only`.  
+3. Tests + `eval/cases.ts` regression.
 
 ### Acceptance
 
@@ -225,57 +301,158 @@
 
 ### Root cause candidates
 
-- **Entry resolution** (`lib.rs` ~286–330): exe dir vs `resources/index.js` vs repo path — Desktop layout may not match what Tauri spawn expects.  
-- **Bun discovery** (`find_bun_executable`): WSL vs native `.exe` branch — wrong branch → spawn fails silently (`spawn_jarvis_server` returns `None`).  
-- **Supervisor give-up** after 5 failures (PRIORITIES) — UI shows “down” without obvious recovery.  
-- **User habit:** launching `Jarvis.exe` from Desktop while server expected beside exe but only `index.js` on Desktop without matching exe resources.
+- **Entry resolution** (`lib.rs` `find_jarvis_server` ~271–389): exe dir, `resources/index.js`, repo walk — Desktop layout may not match spawn expectation.  
+- **Bun discovery** (`find_bun_executable` ~417–463): WSL vs native `.exe`.  
+- **`spawn_jarvis_server`** returns `None` silently (~522–527).  
+- **Supervisor** `MAX_CONSECUTIVE_RESTARTS=5` (`supervisor.rs` ~27); first tick after **20s** `TICK` (~77–85) → red health on cold boot until first heartbeat.  
+- Logs: `%LOCALAPPDATA%\com.jarvis.desktop\logs\server-jarvis.log` / `.err.log` (`lib.rs` ~465–486).  
+- No spawn-failure toast; `jarvis://supervisor` heartbeat only.
 
 ### Plan
 
-1. **Diagnose:**  
-   - `%LOCALAPPDATA%\com.jarvis.desktop\logs\server-jarvis.log` + `.err.log` at failed start.  
-   - Control Center: Bun row, `*_give_up` flags.  
-   - Confirm which `index.js` path Tauri selected (`[Jarvis] Bun server spawned` log with entry path).
-
-2. **Fix spawn contract:**  
-   - When `Jarvis.exe` lives on OneDrive Desktop, resolve `index.js` + `prompts/` **same directory** first (document in `jarvis-runtime-ops`).  
-   - Failed spawn → **actionable toast** (“Bun server failed: …” + Restart), not silent chat failure.
-
-3. **Supervisor:**  
-   - Manual restart clears give-up (`system.rs` reset) — verify UI wires Restart.  
-   - Optional: `-RestartServer` in deploy script as standard ops step.
-
-4. **Deploy alignment (P0-A):** exe + index.js + prompts from **one** `build-and-deploy` run.
+1. Diagnose logs + Control Center Bun row + spawn log line with entry path.  
+2. **Desktop contract:** `Jarvis.exe` on OneDrive Desktop → `index.js` + `prompts/` same directory first (document in `jarvis-runtime-ops`).  
+3. Failed spawn → actionable toast + Restart.  
+4. Align with P0-A single deploy triplet.
 
 ### Acceptance
 
-- Cold start: within 30s, `/health` OK without manual `bun`.  
-- Failed start surfaces in Health banner with retry.
+- Cold start: `/health` OK within 30s without manual `bun`.  
+- Failed start visible in Health banner with retry.
+
+### Verify
+
+- `lib.rs:271–389`, `539–579`; `supervisor.rs:77–85`.
 
 ---
 
-## P2-F — Permissive sandbox + path outside workspace
+## P1-K — UI chat state machine
 
-### Symptoms
+### Symptoms / findings (code review)
 
-- `sandbox_mode: permissive` still allowed read of Windows path outside configured `jarvis_path`.
-
-### Root cause (documented, not bug)
-
-- `fs-scope.ts` / `jarvis-runtime-ops`: **`permissive` ≠ path bypass**; only `sandbox_mode: "off"` disables `safePath`.  
-- Default `jarvis_path` may be Linux-shaped; Windows native paths resolve relative to wrong workspace.
+- **Double-send race:** `handleSend` (~862) gates on `isStreaming` only — stale closure can double-send.  
+- **Input cleared early** (~867) before stream confirmed — connection refused → message lost from input.  
+- **Session switch mid-stream** (~478–541): cancels prior stream but history reload can **bleed** streaming bubble until load completes.  
+- **Empty bubble render:** `MarkdownView` + empty streaming assistant (~1439 region).  
+- **`</think>` not filtered client-side** on streamed text.  
+- **Tool-result matching** falls back to tool name (~806–819) — wrong pairing risk.  
+- **Autoscroll vs user scroll** (~456–460).  
+- **Stop** (~921–941): does not clear reasoning panel state.  
+- **Autofocus / IME** (~705–709).  
+- **Error banner a11y** (~1214–1223).
 
 ### Plan
 
-1. **Config:** set `jarvis_path` to `C:\Projects\home-base-recovered` (or intended repo) if reads should work there; or `off` only with user consent.
-
-2. **UX:** when sandbox blocks, SSE/tool_result should surface exact `Path "…" is outside the workspace` (not generic 400).
-
-3. **Optional product:** `permissive` could mean “allow any path on host” — **separate ADR**; today code intentionally differs.
+1. Send lock (ref + `isStreaming`); clear input only after POST accepted or restore on failure.  
+2. On session switch: reset messages/streaming state atomically before history fetch.  
+3. Empty assistant: don’t render markdown shell; strip or collapse `think` tags for display.  
+4. Tool match: prefer `call_id` only; warn on name fallback.  
+5. Stop: clear `reasoningText` / `showReasoning`.  
+6. Manual checklist (see Test matrix).
 
 ### Acceptance
 
-- User understands mode table; read probe succeeds with `off` or in-workspace path.
+- Double-click Send / rapid Enter: one in-flight stream.  
+- Connection refused: user message still in composer or error with recoverable text.  
+- Switch session during stream: no ghost streaming bubble on wrong session.
+
+---
+
+## P1-L — Server abort-domain races & resource hygiene
+
+### Symptoms / findings
+
+- `activeStreamControllers` get/abort/delete race: `/chat/cancel` (~3125–3127) vs stream `finally` (~2786).  
+- Abort listener add/remove scattered (~1386–1691, Agent Loop ~2223–2322).  
+- First-token timer + stall watchdog can both call `reader.cancel()` (~1465, 1491, 2355).  
+- **Single shared `streamAbort`** across all stages (document as design constraint in fix).  
+- Markup leakage when `useTextTools=false` on non-answer stages (~1635–1651).  
+- `MAX_TOOL_RESULT_CHARS=2000` middle-elision (~155, 208–211) — large reads truncated in history.
+
+### Plan
+
+1. Serialize cancel + finally on per-session mutex or “cancel generation” token.  
+2. Centralize abort listener registration (try/finally helper).  
+3. Dedupe `reader.cancel()` — idempotent guard.  
+4. Document `streamAbort` scope; stage-local attempt abort for timeouts.  
+5. Surface truncation in tool_result metadata for UI.
+
+### Acceptance
+
+- Fuzz: cancel during first-token timeout → one terminal frame, no double-free controller map entry.  
+- No duplicate cancel side effects in logs.
+
+---
+
+## P1-M — Persistence & history integrity
+
+### Symptoms
+
+- **Server** `/sessions` GET/POST/delete are **stubs** (`index.ts` ~3133–3135) — no server-side chat history API.  
+- **Persistence is client-driven:** `finalizeAssistantMessage` → Tauri `append_message` only when `content.trim()` non-empty (`JarvisView.tsx` ~415–420).  
+- Cancel/error/crash mid-stream: assistant row **not** saved; blank bubble visible until refresh then may vanish.
+
+### Plan
+
+1. **Product contract (ADR):** persist partials? persist “(stopped)” rows? server-side backup?  
+2. Short term: on `error`/`cancelled`, optionally persist placeholder or delete optimistic row consistently.  
+3. Long term: align Tauri SQLite as source of truth with server stubs or implement real `/sessions` if needed.
+
+### Acceptance
+
+- Documented behavior for stop/error/empty: user sees consistent history after reload.  
+- No “vanished” assistant that existed only in ephemeral UI state without explanation.
+
+---
+
+## P1-N — Config integrity
+
+### Symptoms
+
+- `saveConfig` merge + normalize, **no validate-before-write** (`config.ts` ~608–616).  
+- `deepMerge` skips empty-string overwrite when target has non-empty default (~644–645) — cannot intentionally clear some fields via partial save.  
+- Coordinator reasoning model `<think>`-only → `extractJson` fails → `defaultRoute()` (~135–147) — silent degradation, not user-visible misconfig.
+
+### Plan
+
+1. Call validation helper before `writeFileSync`; reject or strip invalid partials.  
+2. Explicit “clear field” sentinel or separate API for empty overrides.  
+3. Health warning when coordinator model never returns routable JSON in smoke test.
+
+### Acceptance
+
+- Invalid config cannot be persisted without error surfaced to Control Center.  
+- User can clear optional string fields without deepMerge blocking.
+
+---
+
+## P2-F — Permissive sandbox allows paths outside workspace
+
+### Symptoms
+
+- `sandbox_mode: permissive` **allowed** read of Windows path outside configured `jarvis_path`.
+
+### Root cause (**rewrite — prior plan was wrong**)
+
+- `fs-scope.ts` ~59–63: **`permissive` logs and returns `resolved`** for paths outside workspace (`escapes` true).  
+- **Strict** (~65–66) throws `Path "…" is outside the workspace. Sandbox mode: …`.  
+- **`off`** disables containment (see `jarvis-runtime-ops` / agent-tools `safePath`).  
+- User observation is **working-as-coded**, not “permissive ≠ bypass.”
+
+### Plan
+
+1. **Docs / Control Center:** mode table — `strict` (enforce workspace), `permissive` (allow outside with log), `off` (no sandbox).  
+2. **Config:** set `jarvis_path` to intended Windows repo root if strict reads matter.  
+3. Optional ADR if product should change permissive semantics (separate from this bug class).
+
+### Acceptance
+
+- User understands three modes; read probe behaves predictably per chosen mode.  
+- No doc claim that permissive blocks out-of-workspace paths.
+
+### Verify
+
+- `fs-scope.ts:59–66`.
 
 ---
 
@@ -283,19 +460,18 @@
 
 ### Symptoms
 
-- `App.tsx` companion: `fixed bottom-6 right-6 z-50`.  
-- `JarvisView` Send: `absolute right-2 bottom-2` in composer (bottom of chat column).  
-- Global companion sits atop chat chrome on Jarvis view.
+- `App.tsx` companion: `fixed bottom-6 right-6 z-50` (~774–775).  
+- `JarvisView` Send: `absolute right-2 bottom-2` — **no z-index** (~1283–1288).  
+- Companion wins stacking; Send click-target partially blocked.
 
 ### Plan
 
-1. **Layout:** hide companion on `jarvis` / chat view, or offset companion when `currentView === 'jarvis'` (e.g. `bottom-24`).  
-2. **Or:** move companion to left side / reduce `z-index` below composer `z-10` only if click-target remains accessible.  
-3. **Test:** manual + narrow viewport.
+1. Hide companion on `jarvis` view or offset `bottom-24` when chat active.  
+2. Or raise composer Send `z-index` above companion when focused (careful with petdex hit target).
 
 ### Acceptance
 
-- Send button fully clickable on Jarvis chat without dismissing companion.
+- Send fully clickable on Jarvis chat without dismissing companion.
 
 ---
 
@@ -303,23 +479,54 @@
 
 ### Plan
 
-- Extend deploy script to write manifest (P0-A).  
-- `BuildBadge` / System Health: show `index.js` drift vs embedded exe build SHA.  
-- CI gate: `scripts/verify.sh` optional check that `dist/index.js` rebuilt when `server-jarvis/src/**` changes.
+- Manifest (P0-A).  
+- `BuildBadge` / System Health: `index.js` drift vs exe build SHA.  
+- CI optional: `verify.sh` when `server-jarvis/src/**` changes.
+
+---
+
+## P2-O — Ops hardening
+
+### Findings
+
+- **Restart fast-path:** `force_restart_jarvis_server` (`lib.rs` ~539–579) does not clear `LAST_HEALTHY_MS` (~586–595) — Restart may no-op 10s TTL “healthy” skip.  
+- **Supervisor boot:** first heartbeat only after initial `TICK` sleep (~77–85).  
+- **Deploy:** add `Test-Path $promptsSrc` before copy (`build-and-deploy.ps1` ~138–144).  
+- **Bun spawn with spaces:** verify `Command` arg quoting (`lib.rs` ~504–512) before treating as bug — Rust normally passes args without shell split.  
+- **Tool result truncation:** `MAX_TOOL_RESULT_CHARS=2000` — document for quality-sensitive reads.
+
+### Plan
+
+1. Clear `LAST_HEALTHY_MS` on force restart.  
+2. Optional earlier supervisor ping on boot.  
+3. Deploy guard + fail-fast message for missing `prompts/`.  
+4. Executor truncation: raise limit or attach “truncated” flag in SSE.
+
+### Acceptance
+
+- UI Restart always probes/spawns when user requests, regardless of TTL cache.  
+- Deploy fails clearly if `server-jarvis/src/prompts` missing.
 
 ---
 
 ## Recommended execution sequence (implementation phase)
 
 ```text
-1. P0-A  Deploy triplet (script + verify sanitizer string + prompts)
-2. P0-B  Abort-domain split + UI error/empty-bubble handling + tests
-3. P1-D  Negation in turn-requirements (quick, high safety value)
-4. P1-C  Classifier JSON/tool-payload + provider 400 / executor churn
-5. P1-E  Spawn path + supervisor surfacing (with P0-A layout)
-6. P2-G  Companion offset
-7. P2-F  Config/docs (jarvis_path / sandbox expectations)
-8. P2-H  Manifest + drift UI
+1. P0-A     Deploy triplet + verify sanitizer + prompts (Test-Path hardening in script)
+2. P0-I     SSE contract + UI handlers (incl. cancelled, default case, JSON.parse guard)
+3. P0-B     Abort-domain split (orchestrator + Agent Loop) + terminal-frame semantics
+4. P0-J     Liveness (UI inactivity timeout; server keepalive behind flag)
+5. P1-L     Abort races + hygiene (same files as P0-B — one branch)
+6. P1-D     Negation in turn-requirements (quick safety win)
+7. P1-C     Classifier JSON/tool-payload + provider 400 / executor churn
+8. P1-K     UI state machine fixes
+9. P1-M     Persistence contract + short-term stop/error behavior
+10. P1-E    Spawn path + supervisor surfacing (with P0-A layout)
+11. P1-N    Config validate-on-save
+12. P2-G    Companion offset
+13. P2-F    Sandbox docs + jarvis_path guidance
+14. P2-H    Manifest + drift UI
+15. P2-O    Restart TTL, deploy guards, truncation UX
 ```
 
 ---
@@ -329,21 +536,48 @@
 | Risk | Mitigation |
 |------|------------|
 | Fixing P0-B on stale bundle only | **P0-A first** |
-| Over-tight classifier breaks real edit requests | Keep mutation precedence tests; negation only strips signal when negation phrase present |
-| OpenCode 400 fix touches shared normalizeMessages | Stage behind config flag; bun tests for each provider shape |
+| Keepalive / new SSE types dropped silently | **P0-I before P0-J** server heartbeats |
+| Over-tight classifier breaks real edit requests | Mutation precedence tests; negation only strips when phrase present |
+| OpenCode 400 fix touches shared normalizeMessages | Config flag; bun tests per provider shape |
 | OneDrive sync delays deploy | Deploy with exe closed; verify manifest mtime |
+| Shared `streamAbort` refactor breaks user Stop | `stream-cancel.test.ts` + manual Stop checklist |
+| UI persistence ADR delays P1-M | Ship minimal placeholder/delete behavior first |
+
+---
+
+## Test matrix (implementation phase)
+
+| Area | Automated | Manual |
+|------|-----------|--------|
+| P0-B / cancel | Extend `stream-cancel.test.ts`; first-token timeout → not `cancelled` | Slow free model; Stop mid-stream |
+| P0-I | Terminal-frame invariant (one of result/error/cancelled) | Inject unknown `type` in mock SSE |
+| P0-J | — | Network drop; proxy idle timeout sim |
+| P1-D | `turn-requirements.test.ts` negation + tool JSON | “Do not modify …” |
+| P1-C | Classifier pasted JSON cases | Read probe session log grep |
+| P1-K | — | Double-send, session switch mid-stream, connection refused |
+| P1-M | — | Stop with empty bubble → reload history |
+| P2-F | `fs-scope` unit tests if present | permissive vs strict path read |
+| Deploy | — | Missing prompts folder → script error |
 
 ---
 
 ## References (repo)
 
-- `scripts/build-and-deploy.ps1` — canonical deploy stages  
-- `server-jarvis/src/index.ts` — `streamAbort`, `callModel`, first-token timer  
-- `server-jarvis/src/openrouter.ts` — `chatCompletionWithFallback` attempt abort  
+- `scripts/build-and-deploy.ps1` — deploy stages; add `Test-Path` on `$promptsSrc`  
+- `server-jarvis/src/index.ts` — `streamAbort`, `emitCancelled`, `callModel`, first-token timers (orchestrator + Agent Loop), `/sessions` stubs  
+- `server-jarvis/src/openrouter.ts` — `chatCompletionWithFallback`, `first_token_timeout_ms` (~796)  
+- `server-jarvis/src/stream-emitter.ts` — `init`, `message_stop`, `finish`  
+- `server-jarvis/src/fs-scope.ts` — permissive vs strict (~59–66)  
 - `server-jarvis/src/orchestration/turn-requirements.ts` — classifier  
-- `src-ui/src/components/jarvis/JarvisView.tsx` — SSE `finalizeAssistantMessage`  
-- `docs/superpowers/plans/2026-07-02-synthesizer-sanitizer-chat-regression-fable-handoff.md` — sanitizer context  
-- Hermes skill: `jarvis-runtime-ops` — sandbox + deploy + orchestrator diagnosis  
+- `server-jarvis/src/orchestration/route-normalization.ts` — `ALLOWED_STAGES` / `REQUIRED_STAGES`  
+- `server-jarvis/src/orchestration/prompt-loader.ts` — prompt resolution  
+- `server-jarvis/src/config.ts` — `saveConfig`, `deepMerge`  
+- `src-ui/src/components/jarvis/JarvisView.tsx` — SSE `handleFrame`, `finalizeAssistantMessage`, `handleSend`, `handleStop`  
+- `src-ui/src/App.tsx` — companion layout  
+- `src-tauri/src/lib.rs` — spawn, `force_restart_jarvis_server`, `LAST_HEALTHY_MS`  
+- `src-tauri/src/supervisor.rs` — tick interval, give-up  
+- `docs/superpowers/plans/2026-07-02-synthesizer-sanitizer-chat-regression-fable-handoff.md`  
+- Hermes skill: `jarvis-runtime-ops`
 
 ---
 
