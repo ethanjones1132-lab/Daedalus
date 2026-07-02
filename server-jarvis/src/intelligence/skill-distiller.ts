@@ -5,6 +5,7 @@ import { classifyTurnRequirements } from "../orchestration/turn-requirements";
 import type { SkillCandidate, SkillTrigger } from "./skill-types";
 import { saveSkillCandidate, pruneSkillCandidates } from "./skill-store";
 import type { SkillDistillationConfig } from "../config";
+import type { TrajectorySnapshot } from "../self-tuning/store";
 
 export interface DistillationInput {
   agentRunId: string;
@@ -14,6 +15,12 @@ export interface DistillationInput {
   workerInstructions?: WorkerInstructions;
   stageRuns: StageRun[];
   runOutcome: "success" | "degraded" | "failed";
+}
+
+/** Distillation from a stored trajectory snapshot (for audit/replay). */
+export interface TrajectoryDistillationInput {
+  snapshot: TrajectorySnapshot;
+  config: SkillDistillationConfig;
 }
 
 function slugify(text: string): string {
@@ -63,8 +70,14 @@ function buildSkillBody(input: DistillationInput): string {
 }
 
 function computeConfidence(input: DistillationInput): number {
-  if (input.runOutcome !== "success") return 0;
-  let score = 0.45;
+  // Baseline is outcome-dependent: success gets a 0.45 floor, degraded
+  // (e.g., replan-rescued with a clean synthesizer) gets a 0.30 floor so it
+  // can still clear a reasonable min_confidence gate when distill_on allows
+  // it. Failed outcomes are excluded by the distill_on policy gate above
+  // and never reach this function in practice, but the explicit return 0
+  // is a belt-and-braces guard.
+  if (input.runOutcome === "failed") return 0;
+  let score = input.runOutcome === "success" ? 0.45 : 0.30;
   const stagesOk = input.stageRuns.filter((s) => s.was_successful === 1 && s.had_error === 0).length;
   const total = input.stageRuns.length || 1;
   score += (stagesOk / total) * 0.35;
@@ -76,7 +89,10 @@ export function distillSkillCandidate(
   input: DistillationInput,
   config: SkillDistillationConfig,
 ): SkillCandidate | null {
-  if (!config.enabled || input.runOutcome !== "success") return null;
+  if (!config.enabled) return null;
+  
+  const distillOn = config.distill_on ?? ["success"];
+  if (!distillOn.includes(input.runOutcome)) return null;
 
   const confidence = computeConfidence(input);
   if (confidence < config.min_confidence) return null;
@@ -106,5 +122,57 @@ export function distillSkillCandidate(
 
   saveSkillCandidate(candidate);
   pruneSkillCandidates(config.max_candidates);
+  return candidate;
+}
+
+/** Distill a skill candidate from a stored trajectory snapshot (C-01 hardening).
+ *  Used for audit/replay: e.g., CLI `bun run src/intelligence/redistill.ts --agent-run-id=...` */
+export function distillFromTrajectorySnapshot(
+  input: TrajectoryDistillationInput,
+): SkillCandidate | null {
+  const { snapshot, config } = input;
+  if (!config.enabled) return null;
+
+  let traj: {
+    version: number;
+    agent_run_id: string;
+    session_id: string;
+    task_type: TaskType;
+    run_outcome: "success" | "degraded" | "failed";
+    duration_ms: number;
+    routing: any;
+    worker_instructions?: WorkerInstructions;
+    instruction_variants: Record<string, string>;
+    stage_runs: StageRun[];
+    model_attributions: any[];
+    user_request: string;
+  };
+
+  try {
+    traj = JSON.parse(snapshot.snapshot_json);
+  } catch {
+    return null;
+  }
+
+  // Policy: only distill from success outcomes (degraded only if replan-rescued with clean synthesizer)
+  if (traj.run_outcome !== "success") return null;
+
+  // Check if this was a replan-rescued degraded run - if so, allow distillation
+  const distillOn = config.distill_on ?? ["success"];
+  if (!distillOn.includes(traj.run_outcome)) return null;
+
+  const candidate = distillSkillCandidate(
+    {
+      agentRunId: traj.agent_run_id,
+      sessionId: traj.session_id,
+      taskType: traj.task_type,
+      userRequest: traj.user_request,
+      workerInstructions: traj.worker_instructions,
+      stageRuns: traj.stage_runs,
+      runOutcome: traj.run_outcome,
+    },
+    config,
+  );
+
   return candidate;
 }

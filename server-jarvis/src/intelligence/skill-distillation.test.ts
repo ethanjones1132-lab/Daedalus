@@ -2,11 +2,12 @@ import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { distillSkillCandidate } from "./skill-distiller";
+import { distillSkillCandidate, distillFromTrajectorySnapshot } from "./skill-distiller";
 import { listSkillCandidates, saveSkillCandidate, loadSkillCandidate } from "./skill-store";
 import { resolveSkillsForTurn } from "./skill-resolver";
 import { evaluateSkillPromotion, runSkillPromotionPass } from "./skill-promotion";
 import type { SkillCandidate } from "./skill-types";
+import type { TrajectorySnapshot } from "../self-tuning/store";
 
 describe("skill distillation (Track C)", () => {
   let tempRoot = "";
@@ -271,5 +272,175 @@ describe("skill distillation (Track C)", () => {
     expect(promotedRow!.status).toBe("promoted");
     expect(promotedRow!.rejection_reason).toBeUndefined();
     expect(promotedRow!.rejection_detail).toBeUndefined();
+  });
+
+  // ---- C-01 hardening: distill_on policy + audit/replay from trajectory snapshots ----
+
+  const baseStageRun = {
+    id: "st_redistill",
+    agent_run_id: "run_redistill_1",
+    mode_id: "executor",
+    turn_number: 1,
+    was_successful: 1,
+    had_error: 0,
+  } as const;
+
+  const baseDistillInput = {
+    agentRunId: "run_redistill_1",
+    sessionId: "sess_redistill_1",
+    taskType: "debug" as const,
+    userRequest: "fix the failing import in src/auth.ts",
+    workerInstructions: { executor: "Read src/auth.ts before editing." },
+    stageRuns: [baseStageRun],
+  };
+
+  test("distill_on=[success] (default) blocks degraded and failed outcomes", () => {
+    // Default config (no distill_on) → ["success"] implicit
+    const cfgNoPolicy = {
+      enabled: true,
+      min_confidence: 0.5,
+      promotion_eval_delta: 0.02,
+      max_candidates: 50,
+    };
+    expect(
+      distillSkillCandidate({ ...baseDistillInput, runOutcome: "success" }, cfgNoPolicy),
+    ).not.toBeNull();
+    expect(
+      distillSkillCandidate({ ...baseDistillInput, runOutcome: "degraded" }, cfgNoPolicy),
+    ).toBeNull();
+    expect(
+      distillSkillCandidate({ ...baseDistillInput, runOutcome: "failed" }, cfgNoPolicy),
+    ).toBeNull();
+
+    // Explicit ["success"]
+    const cfgSuccessOnly = { ...cfgNoPolicy, distill_on: ["success" as const] };
+    expect(
+      distillSkillCandidate({ ...baseDistillInput, runOutcome: "degraded" }, cfgSuccessOnly),
+    ).toBeNull();
+  });
+
+  test("distill_on=[success,degraded] allows degraded replan-rescued runs to distill", () => {
+    const cfg = {
+      enabled: true,
+      min_confidence: 0.5,
+      promotion_eval_delta: 0.02,
+      max_candidates: 50,
+      distill_on: ["success", "degraded"] as ("success" | "degraded" | "failed")[],
+    };
+    // Use distinct agentRunIds so the two distillations produce distinct candidates.
+    const successCand = distillSkillCandidate(
+      { ...baseDistillInput, agentRunId: "run_redistill_success_1", runOutcome: "success" },
+      cfg,
+    );
+    const degradedCand = distillSkillCandidate(
+      { ...baseDistillInput, agentRunId: "run_redistill_degraded_1", runOutcome: "degraded" },
+      cfg,
+    );
+    expect(successCand).not.toBeNull();
+    expect(degradedCand).not.toBeNull();
+    // Both should be persisted as candidates (distinct rows)
+    expect(listSkillCandidates("candidate").length).toBeGreaterThanOrEqual(2);
+    // Confidence floor for degraded should be lower than success (0.30 vs 0.45)
+    expect(degradedCand!.confidence).toBeLessThan(successCand!.confidence);
+  });
+
+  test("distill_on=[] (empty) blocks all outcomes (sanity check)", () => {
+    const cfg = {
+      enabled: true,
+      min_confidence: 0.5,
+      promotion_eval_delta: 0.02,
+      max_candidates: 50,
+      distill_on: [] as ("success" | "degraded" | "failed")[],
+    };
+    expect(
+      distillSkillCandidate({ ...baseDistillInput, runOutcome: "success" }, cfg),
+    ).toBeNull();
+  });
+
+  test("distillFromTrajectorySnapshot round-trips a stored snapshot into a candidate", () => {
+    // Build a synthetic trajectory JSON matching the shape the distiller expects
+    const snapshot: TrajectorySnapshot = {
+      id: "traj_redistill_1",
+      agent_run_id: "run_redistill_2",
+      session_id: "sess_redistill_2",
+      snapshot_json: JSON.stringify({
+        version: 1,
+        agent_run_id: "run_redistill_2",
+        session_id: "sess_redistill_2",
+        task_type: "debug",
+        run_outcome: "success",
+        duration_ms: 1200,
+        routing: { pipeline: ["planner", "executor", "synthesizer"] },
+        worker_instructions: { executor: "Read src/foo.ts before editing." },
+        instruction_variants: {},
+        stage_runs: [{
+          id: "st_redistill_2",
+          agent_run_id: "run_redistill_2",
+          mode_id: "executor",
+          turn_number: 1,
+          was_successful: 1,
+          had_error: 0,
+        }],
+        model_attributions: [],
+        user_request: "fix the typo in src/foo.ts",
+      }),
+    };
+
+    const cfg = {
+      enabled: true,
+      min_confidence: 0.5,
+      promotion_eval_delta: 0.02,
+      max_candidates: 50,
+    };
+    const candidate = distillFromTrajectorySnapshot({ snapshot, config: cfg });
+    expect(candidate).not.toBeNull();
+    expect(candidate!.trigger.task_types[0]).toBe("debug");
+    expect(candidate!.source_run_ids).toContain("run_redistill_2");
+    expect(candidate!.trigger.task_types).toContain("debug");
+    expect(candidate!.status).toBe("candidate");
+  });
+
+  test("distillFromTrajectorySnapshot returns null on malformed JSON", () => {
+    const snapshot: TrajectorySnapshot = {
+      id: "traj_redistill_bad",
+      agent_run_id: "run_redistill_bad",
+      session_id: "sess_redistill_bad",
+      snapshot_json: "{ not valid json",
+    };
+    const cfg = {
+      enabled: true,
+      min_confidence: 0.5,
+      promotion_eval_delta: 0.02,
+      max_candidates: 50,
+    };
+    expect(distillFromTrajectorySnapshot({ snapshot, config: cfg })).toBeNull();
+  });
+
+  test("distillFromTrajectorySnapshot returns null when distillation is disabled", () => {
+    const snapshot: TrajectorySnapshot = {
+      id: "traj_redistill_disabled",
+      agent_run_id: "run_redistill_disabled",
+      session_id: "sess_redistill_disabled",
+      snapshot_json: JSON.stringify({
+        version: 1,
+        agent_run_id: "run_redistill_disabled",
+        session_id: "sess_redistill_disabled",
+        task_type: "debug",
+        run_outcome: "success",
+        duration_ms: 500,
+        routing: {},
+        instruction_variants: {},
+        stage_runs: [],
+        model_attributions: [],
+        user_request: "noop",
+      }),
+    };
+    const cfg = {
+      enabled: false,
+      min_confidence: 0.5,
+      promotion_eval_delta: 0.02,
+      max_candidates: 50,
+    };
+    expect(distillFromTrajectorySnapshot({ snapshot, config: cfg })).toBeNull();
   });
 });

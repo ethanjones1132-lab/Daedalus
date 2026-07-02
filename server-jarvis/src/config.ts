@@ -219,6 +219,8 @@ export interface SkillDistillationConfig {
   promotion_eval_delta: number;
   /** Max distilled skill candidates retained on disk. */
   max_candidates: number;
+  /** Which run outcomes trigger distillation. Default ["success"]; extend to ["success","degraded"] for replan-rescued runs with clean synthesizer. */
+  distill_on?: ("success" | "degraded" | "failed")[];
 }
 
 /** Inter-workflow shared memory for tool results, file snapshots, and failures. */
@@ -466,6 +468,7 @@ export function defaultConfig(): JarvisConfig {
         min_confidence: 0.55,
         promotion_eval_delta: 0.02,
         max_candidates: 200,
+        distill_on: ["success"],
       },
     },
     system_prompt: `You are Jarvis, a local AI coding assistant running on Qwen 3.5 9B in WSL2.
