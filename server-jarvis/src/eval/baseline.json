@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "total": 35,
-  "passed": 35,
+  "total": 38,
+  "passed": 38,
   "outcomes": {
     "routing/code-review-clean-json": "pass",
     "routing/debug-clean-json": "pass",
@@ -37,6 +37,9 @@
     "pool/code-strong-diversity-gte-3": "pass",
     "pool/reasoning-strong-diversity-gte-3": "pass",
     "skill/trigger-debug-promoted": "pass",
-    "skill/regression-candidate-not-injected": "pass"
+    "skill/regression-candidate-not-injected": "pass",
+    "skill/grounding-clean-promotes": "pass",
+    "skill/grounding-invented-path-fails": "pass",
+    "skill/grounding-no-snapshot-cannot-ground": "pass"
   }
 }

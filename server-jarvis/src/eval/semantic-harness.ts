@@ -28,13 +28,9 @@ import { Coordinator } from "../orchestration/coordinator";
 import { PipelineExecutor } from "../orchestration/pipeline";
 import { classifyTurnRequirements } from "../orchestration/turn-requirements";
 import { normalizeRoute } from "../orchestration/route-normalization";
-import { chatCompletionWithFallback, isOpenRouterModelSupportsTools } from "../openrouter";
-import { buildTextToolInstructions, extractTextToolCalls } from "../text-tools";
-import { AgentPool } from "../orchestration/agent-pool";
 import { judgeAnswer } from "./judge";
+import { makeCallModel } from "./call-model";
 import { SEMANTIC_CASES, type SemanticCase } from "./semantic-cases";
-import type { CallModelFn, ChatMessage } from "../orchestration/coordinator";
-import type { ToolDefinition } from "../tool-types";
 
 export interface SemanticCaseResult {
   id: string;
@@ -59,88 +55,20 @@ function materializeFixture(root: string, fixture: Record<string, string> | unde
   }
 }
 
-/**
- * Determine whether the agent the pool would actually pick for `stage`
- * supports native OpenAI-style function calling. Mirrors index.ts's
- * `modelSupportsNativeTools` resolution (minus the Ollama branch, which the
- * eval harness never exercises): opencode_zen/opencode_go are hardcoded to
- * the text-tool protocol; everything else defers to
- * `isOpenRouterModelSupportsTools`. Falls back to `true` (native) when the
- * pool can't resolve an agent for the stage, matching the fallback cascade's
- * own behavior of defaulting to plain OpenRouter in that case.
- */
-function resolveModelSupportsNativeTools(cfg: JarvisConfig, stage: string): boolean {
-  const pool = new AgentPool(cfg.orchestrator?.agents ?? []);
-  const agent = pool.pickFor(stage, "general");
-  if (!agent) return true;
-  if (agent.provider === "opencode_zen" || agent.provider === "opencode_go") return false;
-  return isOpenRouterModelSupportsTools(agent.model_id);
-}
-
-// KNOWN LIMITATION: this only resolves the PRIMARY cascade candidate's protocol,
-// before the request is made. If `chatCompletionWithFallback` internally falls
-// back to a differently-protocoled secondary/tertiary candidate mid-request
-// (e.g. on a 429/503/timeout from the primary), the harness still parses that
-// response using the primary's protocol decision — so a tool call made via the
-// *other* protocol on that fallback hop could be missed. This is accepted as a
-// low-probability edge case (only triggers when the primary candidate actually
-// fails live) whose impact is already bounded by the regression-band gating
-// (diffSemanticBaseline) this harness uses to tolerate live-model noise; it is
-// not silently worked around. A real fix would require either propagating the
-// actually-used model/provider back from chatCompletionWithFallback, or
-// re-deriving the protocol choice post-hoc from the response.
-
-/** Inject the text tool-call protocol instructions into the system message,
- *  matching index.ts's `useTextTools` system-prompt augmentation. */
-function withTextToolInstructions(messages: ChatMessage[], tools: ToolDefinition[]): ChatMessage[] {
-  const textInstructions = buildTextToolInstructions(tools);
-  const effectiveMessages = [...messages];
-  const sysIdx = effectiveMessages.findIndex((m) => m.role === "system");
-  if (sysIdx >= 0) {
-    effectiveMessages[sysIdx] = {
-      ...effectiveMessages[sysIdx],
-      content: `${effectiveMessages[sysIdx].content}\n\n${textInstructions}`,
-    };
-  } else {
-    effectiveMessages.unshift({ role: "system", content: textInstructions });
-  }
-  return effectiveMessages;
-}
-
-/** Minimal callModel that goes through the real fallback cascade for a fixed stage.
- *  Mirrors production's native-vs-text tool-calling branch (index.ts): resolve
- *  which agent the pool would pick for `stage`, and if it doesn't support
- *  native function calling, use the text tool-call protocol instead of the
- *  `tools` request field so cheap/free models are scored on their real
- *  tool-use behavior rather than being silently marked as tool-call-less. */
-function makeCallModel(cfg: JarvisConfig, stage: string): CallModelFn {
-  return async (messages, options) => {
-    const tools: ToolDefinition[] = options?.tools ?? [];
-    const useTextTools = tools.length > 0 && !resolveModelSupportsNativeTools(cfg, stage);
-    const effectiveMessages = useTextTools ? withTextToolInstructions(messages, tools) : messages;
-
-    const { response } = await chatCompletionWithFallback(cfg, {
-      messages: effectiveMessages,
-      temperature: options?.temperature ?? 0.2,
-      max_tokens: options?.max_tokens ?? 1024,
-      stream: false,
-      tools: useTextTools ? undefined : options?.tools,
-    }, undefined, { stage });
-    const json = await response.json();
-    const choice = json.choices?.[0]?.message ?? {};
-    const content: string = choice.content ?? "";
-
-    if (useTextTools) {
-      const extracted = extractTextToolCalls(content, tools);
-      const tool_calls = extracted.calls.length > 0
-        ? extracted.calls.map((c) => ({ id: c.id, name: c.name, arguments: c.arguments }))
-        : undefined;
-      return { content: extracted.cleanedText, tool_calls };
-    }
-
-    return { content, tool_calls: choice.tool_calls };
-  };
-}
+// KNOWN LIMITATION: `makeCallModel` (see ./call-model.ts) only resolves the
+// PRIMARY cascade candidate's protocol, before the request is made. If
+// `chatCompletionWithFallback` internally falls back to a
+// differently-protocoled secondary/tertiary candidate mid-request (e.g. on a
+// 429/503/timeout from the primary), the harness still parses that response
+// using the primary's protocol decision — so a tool call made via the
+// *other* protocol on that fallback hop could be missed. This is accepted as
+// a low-probability edge case (only triggers when the primary candidate
+// actually fails live) whose impact is already bounded by the
+// regression-band gating (diffSemanticBaseline) this harness uses to
+// tolerate live-model noise; it is not silently worked around. A real fix
+// would require either propagating the actually-used model/provider back
+// from chatCompletionWithFallback, or re-deriving the protocol choice
+// post-hoc from the response.
 
 async function runSemanticCase(cfg: JarvisConfig, c: SemanticCase): Promise<SemanticCaseResult> {
   const workspace = mkdtempSync(join(tmpdir(), "jarvis-semantic-eval-"));

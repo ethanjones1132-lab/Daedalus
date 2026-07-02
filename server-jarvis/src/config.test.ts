@@ -222,6 +222,13 @@ describe("orchestrator agent pool config", () => {
     expect(cfg.orchestrator.skill_distillation.max_candidates).toBe(200);
   });
 
+  test("defaultConfig disables auto_promote by default (organism loop v1 safety default)", () => {
+    const distillation = defaultConfig().orchestrator.skill_distillation;
+    expect(distillation.auto_promote).toBe(false);
+    expect(distillation.min_judge_score).toBeGreaterThan(0);
+    expect(distillation.min_judge_score).toBeLessThanOrEqual(1);
+  });
+
   test("defaultConfig enables orchestrator session memory", () => {
     const memory = defaultConfig().orchestrator.session_memory;
     expect(memory.enabled).toBe(true);

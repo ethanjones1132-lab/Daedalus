@@ -377,3 +377,39 @@ Everything else — including B-03/B-04, UI experiments, AgentPool changes — i
 | Chat pipeline | `references/chat-pipeline.md` (in jarvis-cron skill) |
 | Layer B (Fable output) | `docs/superpowers/plans/2026-07-02-organism-loop-implementation-spec.md` |
 | Outcome (implementer output) | `docs/superpowers/plans/2026-07-02-organism-loop-outcome.md` |
+
+---
+
+## Entry snapshot (2026-07-02, Fable 5 planning session)
+
+Before writing Layer B, this session surveyed the actual repo state (3 parallel Explore agents across
+the server pipeline, eval/self-tuning subsystem, and UI/native bridge, plus follow-up verification of
+the conductor and self-tuning store). The gap table above understates progress on several tracks and
+misses one important architectural finding. Corrections:
+
+| Track | Original claim | Verified state |
+|-------|----------------|-----------------|
+| **C-02** | "Open" — bridge to native store not built | **Partial, further along than claimed.** `sync_distilled_skill_candidates()` Tauri command already exists (`src-tauri/src/commands/skills.rs:620–690`) and correctly upserts skills rows + `skill_revisions` with `change_reason: "trajectory_distillation"`, setting `enabled = (status === "promoted")`. The identity bridge is not the gap. |
+| **C-03** | "Partial... only `promoted` JSON candidates" | Confirmed partial, but precisely: skill injection reaches **planner and executor stage prompts only** (`pipeline.ts:173–187`). The **conductor/coordinator prompt receives no skill signal at all** — this is the real remaining C-03 gap, not the JSON-vs-native distinction. |
+| **C-04** | "Partial... heuristic in `skill-promotion.ts`; judge exists but not wired" | Confirmed judge is unwired — but the heuristic side is a full 6-gate chain with structured `SkillRejectionReason`s and 2 HTTP routes already shipped (`GET /skills/candidates`, `POST /skills/promote`). More importantly: **the post-distill hook (`index.ts:1902–1921`) already auto-runs the full promotion pass on every successful turn today** — every candidate clearing the heuristic gates is already live in production prompts with zero semantic review. This is a bigger and more urgent gap than "judge not wired" suggests; it's an active safety gap, not a missing feature. |
+| **C-04 (eval harness)** | "Extend `eval/harness.ts` with case kinds: `skill_trigger`, `skill_regression`, `skill_grounding`" | `skill_trigger` and `skill_regression` equivalents **already exist** — 2 cases in `eval/cases.ts:371–434`, passing in `eval/baseline.json`. Only `skill_grounding` is genuinely missing. |
+| **C-05** | "No `SelfImprovementView`; no win-rate panel" | Confirmed. Additionally: `SkillsView.tsx` shows no `confidence`, `eval_score`, or `rejection_reason` for candidates today, and has no promote/reject/run-eval actions — the `candidates` filter exists but the panel is read-mostly. `getAgentPerformance` in `self-tuning/store.ts` already exists as the query surface a win-rate panel would use. |
+
+**New finding not in the original gap table — the authority split:** the "two stores" framing in
+the original C-02 description undersells the actual problem. A one-way JSON→SQLite sync already
+exists. The real issue is **authority**: the orchestrator resolver (`resolveSkillsForTurn`) reads
+`status` from the Bun-side JSON candidate store; the operator-facing enable/disable toggle in
+`SkillsView` writes the native SQLite `enabled` column, which the resolver never reads. **Toggling a
+distilled skill off in the UI today does nothing to orchestration.** Layer B's D1 addresses this by
+making Bun the sole owner of distilled-skill lifecycle and replacing the toggle with explicit
+Promote/Demote actions for distilled skills specifically (bundled skills keep the native toggle,
+which is correctly authoritative for them).
+
+**Also confirmed:** Bun cannot open the native `jarvis.db` at all — it's held in WAL mode by the Rust
+process over a Win/WSL 9p mount boundary that breaks `-shm` coordination for a second opener
+(`self-tuning/store.ts:188–193`, existing code comment). This was an implicit assumption in the
+original plan's "SQLite vs JSON" framing; it's now a hard constraint documented in Layer B, not a
+design choice to weigh.
+
+Full detail, decisions, and interfaces are in
+[`docs/superpowers/plans/2026-07-02-organism-loop-implementation-spec.md`](2026-07-02-organism-loop-implementation-spec.md).

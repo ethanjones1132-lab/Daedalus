@@ -52,7 +52,41 @@ interface SkillRevision {
   created_at: string;
 }
 
+// Distilled-skill lifecycle detail, fetched from the Bun orchestrator (the
+// source of truth for distilled skills — see docs/superpowers/plans/
+// 2026-07-02-organism-loop-implementation-spec.md D1). The native `Skill`
+// row's `metadata.candidate_id` links it to one of these.
+interface SkillCandidateDetail {
+  id: string;
+  name: string;
+  description: string;
+  trigger: { task_types: string[]; requirements: string[]; signals: string[] };
+  body: string;
+  source_run_ids: string[];
+  source_session_id?: string;
+  confidence: number;
+  status: 'candidate' | 'promoted' | 'rejected';
+  eval_score?: number;
+  eval_missed?: string[];
+  rejection_reason?: string;
+  rejection_detail?: string;
+  promoted_at?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface CandidatePerformance {
+  id: string;
+  promoted_at: string;
+  task_types: string[];
+  before: { runs: number; successes: number; success_rate: number | null };
+  after: { runs: number; successes: number; success_rate: number | null };
+  delta: number | null;
+}
+
 type Filter = 'all' | 'enabled' | 'disabled' | 'candidates';
+
+const BUN_URL = 'http://127.0.0.1:19877';
 
 // ── Helpers ────────────────────────────────────────────────────
 
@@ -90,15 +124,62 @@ function isDistilledCandidate(skill: Skill): boolean {
   return status === 'candidate' || skill.name.startsWith('distilled-');
 }
 
+function sourceOf(skill: Skill): string | null {
+  if (!skill.metadata) return null;
+  try {
+    const md = JSON.parse(skill.metadata);
+    return typeof md.source === 'string' ? md.source : null;
+  } catch {
+    return null;
+  }
+}
+
+function candidateIdOf(skill: Skill): string | null {
+  if (!skill.metadata) return null;
+  try {
+    const md = JSON.parse(skill.metadata);
+    return typeof md.candidate_id === 'string' ? md.candidate_id : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Distilled skills are owned by the Bun candidate store — their lifecycle
+ *  moves through Promote/Reject/Demote, not the native enable/disable
+ *  toggle (which the orchestrator's resolver never reads for these rows). */
+function isDistilledSkill(skill: Skill): boolean {
+  return sourceOf(skill) === 'trajectory_distillation';
+}
+
+async function postSkillCandidateAction(
+  candidateId: string,
+  action: 'promote' | 'reject' | 'demote' | 'eval',
+  body?: unknown,
+): Promise<{ ok: boolean; data: any }> {
+  try {
+    const res = await fetch(`${BUN_URL}/skills/candidates/${encodeURIComponent(candidateId)}/${action}`, {
+      method: 'POST',
+      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await res.json().catch(() => ({}));
+    return { ok: res.ok, data };
+  } catch (e) {
+    return { ok: false, data: { error: String(e) } };
+  }
+}
+
 // ── Detail panel ───────────────────────────────────────────────
 
 function SkillDetail({
   skill,
+  candidateDetail,
   onClose,
   onToggle,
   onChanged,
 }: {
   skill: Skill;
+  candidateDetail: SkillCandidateDetail | null;
   onClose: () => void;
   onToggle: (skill: Skill) => void;
   onChanged: () => void;
@@ -107,7 +188,39 @@ function SkillDetail({
   const [revisions, setRevisions] = useState<SkillRevision[] | null>(null);
   const [loadingRevs, setLoadingRevs] = useState(false);
   const [revError, setRevError] = useState<string | null>(null);
+  const [performance, setPerformance] = useState<CandidatePerformance | null>(null);
+  const [actionBusy, setActionBusy] = useState(false);
   const { success, error: toastError } = useToast();
+  const distilled = isDistilledSkill(skill);
+
+  useEffect(() => {
+    setPerformance(null);
+    if (candidateDetail?.status === 'promoted') {
+      fetch(`${BUN_URL}/skills/candidates/${encodeURIComponent(candidateDetail.id)}/performance`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data) => setPerformance(data))
+        .catch(() => setPerformance(null));
+    }
+  }, [candidateDetail?.id, candidateDetail?.status]);
+
+  const runAction = useCallback(
+    async (action: 'promote' | 'reject' | 'demote' | 'eval') => {
+      if (!candidateDetail) return;
+      setActionBusy(true);
+      try {
+        const { ok, data } = await postSkillCandidateAction(candidateDetail.id, action);
+        if (!ok) {
+          toastError(data?.detail || data?.error || `${action} failed`, `${action} failed`);
+          return;
+        }
+        success(`${skill.name}: ${action} -> ${data?.status ?? 'ok'}`);
+        onChanged();
+      } finally {
+        setActionBusy(false);
+      }
+    },
+    [candidateDetail, skill.name, onChanged, success, toastError],
+  );
 
   const loadRevisions = useCallback(async () => {
     setLoadingRevs(true);
@@ -165,18 +278,63 @@ function SkillDetail({
       </div>
 
       <div className="flex items-center gap-2 mb-3">
-        <button
-          type="button"
-          onClick={() => onToggle(skill)}
-          className={cn(
-            'px-3 py-1.5 text-xs rounded-lg border transition-colors',
-            skill.enabled
-              ? 'border-amber-500/30 text-amber-200 hover:bg-amber-500/10'
-              : 'border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10',
-          )}
-        >
-          {skill.enabled ? 'Disable' : 'Enable'}
-        </button>
+        {distilled ? (
+          <div className="flex items-center gap-2">
+            {candidateDetail && (
+              <button
+                type="button"
+                disabled={actionBusy}
+                onClick={() => runAction('eval')}
+                className="px-3 py-1.5 text-xs rounded-lg border border-white/10 text-bone/70 hover:bg-white/5 transition-colors disabled:opacity-50"
+              >
+                Run eval
+              </button>
+            )}
+            {candidateDetail?.status === 'candidate' && (
+              <>
+                <button
+                  type="button"
+                  disabled={actionBusy}
+                  onClick={() => runAction('promote')}
+                  className="px-3 py-1.5 text-xs rounded-lg border border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10 transition-colors disabled:opacity-50"
+                >
+                  Promote
+                </button>
+                <button
+                  type="button"
+                  disabled={actionBusy}
+                  onClick={() => runAction('reject')}
+                  className="px-3 py-1.5 text-xs rounded-lg border border-red-500/30 text-red-200 hover:bg-red-500/10 transition-colors disabled:opacity-50"
+                >
+                  Reject
+                </button>
+              </>
+            )}
+            {candidateDetail?.status === 'promoted' && (
+              <button
+                type="button"
+                disabled={actionBusy}
+                onClick={() => runAction('demote')}
+                className="px-3 py-1.5 text-xs rounded-lg border border-amber-500/30 text-amber-200 hover:bg-amber-500/10 transition-colors disabled:opacity-50"
+              >
+                Demote
+              </button>
+            )}
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => onToggle(skill)}
+            className={cn(
+              'px-3 py-1.5 text-xs rounded-lg border transition-colors',
+              skill.enabled
+                ? 'border-amber-500/30 text-amber-200 hover:bg-amber-500/10'
+                : 'border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10',
+            )}
+          >
+            {skill.enabled ? 'Disable' : 'Enable'}
+          </button>
+        )}
         <div
           className="ml-auto flex gap-1 text-[11px]"
           role="tablist"
@@ -214,6 +372,63 @@ function SkillDetail({
           </button>
         </div>
       </div>
+
+      {candidateDetail && (
+        <GlassCard className="p-3 mb-3 text-xs space-y-1.5">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-bone/50">Confidence</span>
+            <Pill variant="default">{candidateDetail.confidence.toFixed(2)}</Pill>
+            {candidateDetail.eval_score !== undefined && (
+              <>
+                <span className="text-bone/50">Eval score</span>
+                <Pill variant={candidateDetail.eval_score >= 0.75 ? 'success' : 'warn'}>
+                  {candidateDetail.eval_score.toFixed(2)}
+                </Pill>
+              </>
+            )}
+            {candidateDetail.status === 'rejected' && candidateDetail.rejection_reason && (
+              <>
+                <span className="text-bone/50">Rejected</span>
+                <Pill variant="error">{candidateDetail.rejection_reason}</Pill>
+              </>
+            )}
+            {candidateDetail.promoted_at && (
+              <>
+                <span className="text-bone/50">Promoted</span>
+                <span className="text-bone/70">{formatDate(candidateDetail.promoted_at)}</span>
+              </>
+            )}
+          </div>
+          {candidateDetail.rejection_detail && (
+            <p className="text-bone/50">{candidateDetail.rejection_detail}</p>
+          )}
+          {candidateDetail.eval_missed && candidateDetail.eval_missed.length > 0 && (
+            <p className="text-bone/50">Missed: {candidateDetail.eval_missed.join('; ')}</p>
+          )}
+          <div className="flex items-center gap-3 text-bone/40 font-mono text-[10px]">
+            {candidateDetail.source_session_id && <span>session {candidateDetail.source_session_id}</span>}
+            {candidateDetail.source_run_ids.length > 0 && (
+              <span>runs {candidateDetail.source_run_ids.join(', ')}</span>
+            )}
+          </div>
+          {performance && (
+            <div className="pt-1.5 mt-1.5 border-t border-white/10 flex items-center gap-2 flex-wrap">
+              <span className="text-bone/50">Since promotion</span>
+              <span className="text-bone/70">
+                {performance.before.success_rate !== null ? `${(performance.before.success_rate * 100).toFixed(0)}%` : '—'}
+                {' → '}
+                {performance.after.success_rate !== null ? `${(performance.after.success_rate * 100).toFixed(0)}%` : '—'}
+              </span>
+              {performance.delta !== null && (
+                <Pill variant={performance.delta >= 0 ? 'success' : 'error'}>
+                  {performance.delta >= 0 ? '+' : ''}
+                  {(performance.delta * 100).toFixed(0)}%
+                </Pill>
+              )}
+            </div>
+          )}
+        </GlassCard>
+      )}
 
       <div className="flex-1 overflow-y-auto min-h-0">
         {tab === 'body' ? (
@@ -265,6 +480,7 @@ function SkillDetail({
 
 export function SkillsView() {
   const [skills, setSkills] = useState<Skill[]>([]);
+  const [candidates, setCandidates] = useState<Record<string, SkillCandidateDetail>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
@@ -287,6 +503,22 @@ export function SkillsView() {
       setError(String(e));
     } finally {
       setLoading(false);
+    }
+    // Distilled skills are owned by Bun (D1) — fetch full lifecycle detail
+    // (confidence, eval score, rejection info, promoted_at) directly from
+    // there rather than relying on the native metadata projection. Best
+    // effort: if the Bun server is down, distilled rows just show without
+    // the extra detail.
+    try {
+      const res = await fetch(`${BUN_URL}/skills/candidates`);
+      if (res.ok) {
+        const body = (await res.json()) as { candidates: SkillCandidateDetail[] };
+        const byId: Record<string, SkillCandidateDetail> = {};
+        for (const c of body.candidates ?? []) byId[c.id] = c;
+        setCandidates(byId);
+      }
+    } catch {
+      /* Bun server unreachable — distilled rows render without candidate detail */
     }
   }, []);
 
@@ -330,8 +562,26 @@ export function SkillsView() {
     () => skills.find((s) => s.id === selectedId) ?? null,
     [skills, selectedId],
   );
+  const selectedCandidate = useMemo(() => {
+    if (!selected) return null;
+    const cid = candidateIdOf(selected);
+    return cid ? candidates[cid] ?? null : null;
+  }, [selected, candidates]);
 
   const enabledCount = skills.filter((s) => s.enabled).length;
+
+  const runRowAction = useCallback(
+    async (skill: Skill, candidateId: string, action: 'promote' | 'reject') => {
+      const { ok, data } = await postSkillCandidateAction(candidateId, action);
+      if (!ok) {
+        toastError(data?.detail || data?.error || `${action} failed`, `${action} failed`);
+        return;
+      }
+      success(`${skill.name}: ${action} -> ${data?.status ?? 'ok'}`);
+      await fetchSkills();
+    },
+    [fetchSkills, success, toastError],
+  );
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-hidden">
@@ -378,6 +628,9 @@ export function SkillsView() {
             <ul className="space-y-2">
               {filtered.map((s) => {
                 const category = categoryOf(s);
+                const distilled = isDistilledSkill(s);
+                const candidateId = candidateIdOf(s);
+                const candidateStatus = candidateId ? candidates[candidateId]?.status : undefined;
                 return (
                   <li key={s.id}>
                     <GlassCard
@@ -401,21 +654,50 @@ export function SkillsView() {
                             {distilledStatus(s)}
                           </span>
                         )}
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            toggle(s);
-                          }}
-                          className={cn(
-                            'ml-auto text-[11px] px-2 py-0.5 rounded-md border transition-colors',
-                            s.enabled
-                              ? 'border-amber-500/30 text-amber-200 hover:bg-amber-500/10'
-                              : 'border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10',
-                          )}
-                        >
-                          {s.enabled ? 'Disable' : 'Enable'}
-                        </button>
+                        {distilled && candidateId ? (
+                          <div className="ml-auto flex gap-1">
+                            {(candidateStatus ?? 'candidate') === 'candidate' && (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    runRowAction(s, candidateId, 'promote');
+                                  }}
+                                  className="text-[11px] px-2 py-0.5 rounded-md border border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10 transition-colors"
+                                >
+                                  Promote
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    runRowAction(s, candidateId, 'reject');
+                                  }}
+                                  className="text-[11px] px-2 py-0.5 rounded-md border border-red-500/30 text-red-200 hover:bg-red-500/10 transition-colors"
+                                >
+                                  Reject
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              toggle(s);
+                            }}
+                            className={cn(
+                              'ml-auto text-[11px] px-2 py-0.5 rounded-md border transition-colors',
+                              s.enabled
+                                ? 'border-amber-500/30 text-amber-200 hover:bg-amber-500/10'
+                                : 'border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10',
+                            )}
+                          >
+                            {s.enabled ? 'Disable' : 'Enable'}
+                          </button>
+                        )}
                       </div>
                       <p className="text-xs text-bone/60 line-clamp-2">{s.description}</p>
                       <div className="flex items-center gap-2 mt-1.5 text-[10px] font-mono text-bone/30">
@@ -439,6 +721,7 @@ export function SkillsView() {
               <SkillDetail
                 key={selected.id}
                 skill={selected}
+                candidateDetail={selectedCandidate}
                 onClose={() => setSelectedId(null)}
                 onToggle={toggle}
                 onChanged={fetchSkills}

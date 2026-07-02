@@ -432,3 +432,99 @@ export const SKILL_CASES: SkillCase[] = [
     expect: { matchedMax: 0 },
   },
 ];
+
+// ── Skill grounding cases (D6, organism loop v1) ───────────────────────────
+//
+// Deterministic tests of `buildGroundingRubric` + the `runGroundingJudge`
+// wiring, using a MOCKED callModel that echoes a canned verdict rather than
+// calling a real model — live semantic judging (does the judge actually
+// notice a hallucinated path?) stays in `semantic-harness.ts` only, per the
+// organism-loop-v1 implementation spec. These cases pin the deterministic
+// plumbing: rubric shape, and that a judge-reported pass/fail (or a missing
+// grounding source) correctly flows into a promote/reject decision.
+
+export interface SkillGroundingCase {
+  id: string;
+  kind: "skill_grounding";
+  fixture: SkillCandidate;
+  /** Fixture trajectory snapshot the candidate is grounded against, or null
+   *  to exercise the "no grounding source available" path. */
+  snapshot: { worker_instructions?: Record<string, string>; user_request?: string } | null;
+  /** Canned judge behavior: "pass" echoes every rubric item back as covered
+   *  (score 1.0); "fail" reports every item as missed (score 0). Ignored
+   *  when `snapshot` is null — the judge is never called in that case. */
+  judgeOutcome: "pass" | "fail";
+  expect: {
+    minRubricItems?: number;
+    rubricContains?: string;
+    groundingPasses: boolean;
+  };
+}
+
+export const SKILL_GROUNDING_CASES: SkillGroundingCase[] = [
+  {
+    id: "skill/grounding-clean-promotes",
+    kind: "skill_grounding",
+    fixture: {
+      id: "eval_skill_grounding_clean",
+      name: "eval-distilled-grounding-clean",
+      description: "eval fixture — clean grounding",
+      trigger: { task_types: ["debug"], requirements: ["workspace_read"], signals: ["mutation_verb"] },
+      body: "## Conductor worker guidance\nRead src/auth.ts before editing. Verify tests pass.",
+      source_run_ids: ["eval_run_grounding_clean"],
+      confidence: 0.85,
+      status: "candidate",
+      created_at: nowIso,
+      updated_at: nowIso,
+    },
+    snapshot: {
+      worker_instructions: { executor: "Read src/auth.ts before editing." },
+      user_request: "fix the auth bug in src/auth.ts",
+    },
+    judgeOutcome: "pass",
+    expect: { minRubricItems: 2, rubricContains: "debug", groundingPasses: true },
+  },
+  {
+    id: "skill/grounding-invented-path-fails",
+    kind: "skill_grounding",
+    fixture: {
+      id: "eval_skill_grounding_bad_path",
+      name: "eval-distilled-grounding-bad-path",
+      description: "eval fixture — invented absolute path not in the source run",
+      trigger: { task_types: ["debug"], requirements: ["workspace_read"], signals: ["mutation_verb"] },
+      body: "## Conductor worker guidance\nEdit C:\\fake\\path\\that\\does\\not\\exist\\config.json before proceeding.",
+      source_run_ids: ["eval_run_grounding_bad_path"],
+      confidence: 0.85,
+      status: "candidate",
+      created_at: nowIso,
+      updated_at: nowIso,
+    },
+    snapshot: {
+      worker_instructions: { executor: "Read src/auth.ts before editing." },
+      user_request: "fix the auth bug in src/auth.ts",
+    },
+    // A real judge should notice the invented path isn't grounded in the
+    // source run and report it missed; this pins what happens when it does.
+    judgeOutcome: "fail",
+    expect: { groundingPasses: false },
+  },
+  {
+    id: "skill/grounding-no-snapshot-cannot-ground",
+    kind: "skill_grounding",
+    fixture: {
+      id: "eval_skill_grounding_no_snapshot",
+      name: "eval-distilled-grounding-no-snapshot",
+      description: "eval fixture — no source trajectory available",
+      trigger: { task_types: ["debug"], requirements: ["workspace_read"], signals: ["mutation_verb"] },
+      body: "## Conductor worker guidance\nRead src/auth.ts before editing.",
+      source_run_ids: ["eval_run_grounding_missing"],
+      confidence: 0.85,
+      status: "candidate",
+      created_at: nowIso,
+      updated_at: nowIso,
+    },
+    snapshot: null,
+    judgeOutcome: "pass", // irrelevant — the judge is never reached without a snapshot
+    expect: { groundingPasses: false },
+  },
+];

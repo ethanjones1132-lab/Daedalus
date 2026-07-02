@@ -15,7 +15,9 @@ export type SkillRejectionReason =
   | "low_confidence"
   | "suspicious_paths"
   | "body_length_out_of_range"
-  | "missing_signals";
+  | "missing_signals"
+  | "eval_failed"
+  | "manual";
 
 export interface SkillCandidate {
   id: string;
@@ -28,6 +30,8 @@ export interface SkillCandidate {
   confidence: number;
   status: SkillCandidateStatus;
   eval_score?: number;
+  /** Rubric items missed on the most recent judge run. Only meaningful after a `POST .../eval` or `.../promote` call. */
+  eval_missed?: string[];
   /**
    * Why the promotion pass declined this candidate. Only set when
    * `status === "rejected"`. Human-readable so it can surface in the UI
@@ -36,6 +40,10 @@ export interface SkillCandidate {
    */
   rejection_reason?: SkillRejectionReason;
   rejection_detail?: string;
+  /** ISO 8601 timestamp set when status transitions to "promoted"; cleared on demote. */
+  promoted_at?: string;
+  /** Hash of the ordered tool names invoked in the source run's stages; feeds the grounding rubric. */
+  tool_sequence_digest?: string;
   created_at: string;
   updated_at: string;
 }

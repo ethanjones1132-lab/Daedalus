@@ -6,6 +6,7 @@ import type { ChatMessage, SharedContextHints } from "./coordinator";
 import type { ConductorConfig, JarvisConfig } from "../config";
 import { SESSIONS_DIR } from "../config";
 import { checkOllamaHealth, ollamaBaseUrlCandidates } from "../ollama";
+import { resolveSkillsForConductor } from "../intelligence/skill-resolver";
 import {
   COORDINATOR_ROUTE_JSON_SCHEMA,
   COORDINATOR_ROUTE_TOOL,
@@ -159,6 +160,20 @@ function estimateMessageTokens(messages: ConductorMessage[]): number {
   return messages.reduce((sum, m) => sum + estimateTokens(m.content), 0);
 }
 
+/**
+ * D4 (organism loop v1): compact hint of promoted skills relevant to this
+ * turn, resolved WITHOUT knowing task_type (routing hasn't happened yet —
+ * see `resolveSkillsForConductor`). Returns "" when nothing matches, which
+ * `buildTurnUserContent`'s `.filter(Boolean)` drops entirely — an unmatched
+ * turn is byte-identical to the pre-D4 output. Rides the per-turn user
+ * delta, never the KV-cache-guarded system prompt (A-02).
+ */
+function formatSkillHint(request: string): string {
+  const hint = resolveSkillsForConductor(request);
+  if (!hint.trim()) return "";
+  return `Promoted skills relevant to this turn:\n${hint}`;
+}
+
 function buildTurnUserContent(input: ConductorRouteTurnInput): string {
   return [
     `Session ID: ${input.sessionId}`,
@@ -166,8 +181,9 @@ function buildTurnUserContent(input: ConductorRouteTurnInput): string {
     `Last outcome: ${input.lastOutcome ?? "none"}`,
     formatSessionMemoryHints(input.sessionMemoryHints),
     formatRecentHistory(input.recentHistory),
+    formatSkillHint(input.request),
     `Current request:\n${input.request}`,
-  ].join("\n\n");
+  ].filter(Boolean).join("\n\n");
 }
 
 export class PersistentConductor {

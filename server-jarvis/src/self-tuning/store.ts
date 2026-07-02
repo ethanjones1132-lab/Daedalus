@@ -490,6 +490,31 @@ export class SelfTuningStore {
     }
   }
 
+  /** Runs matching any of `taskTypes` with `created_at` in `[startIsoInclusive, endIsoExclusive)`.
+   *  Backs the D5 "performance since promotion" panel — see `computeCandidatePerformance`
+   *  in `intelligence/skill-promotion.ts`, which supplies this as its `fetchRuns` callback. */
+  getAgentRunsForTaskTypesInWindow(
+    taskTypes: string[],
+    startIsoInclusive: string,
+    endIsoExclusive: string,
+  ): AgentRun[] {
+    const db = this.getDb();
+    if (!db || taskTypes.length === 0) return [];
+    try {
+      const placeholders = taskTypes.map(() => "?").join(",");
+      return db
+        .query(
+          `SELECT * FROM agent_runs WHERE task_type IN (${placeholders}) AND created_at >= ? AND created_at < ? ORDER BY created_at ASC`,
+        )
+        .all(...taskTypes, startIsoInclusive, endIsoExclusive) as AgentRun[];
+    } catch (e) {
+      console.error("[SelfTuningStore] getAgentRunsForTaskTypesInWindow failed:", e);
+      return [];
+    } finally {
+      db.close();
+    }
+  }
+
   getStageRuns(agentRunId: string): StageRun[] {
     const db = this.getDb();
     if (!db) return [];

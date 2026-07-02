@@ -140,6 +140,7 @@ End-to-end: session reset clears conductor state; expired sessions prune disk; n
 
 **Type:** AFK  
 **Blocked by:** None (Phase 4 `trajectory_snapshots` exists)
+**Status:** ✅ Done (2026-07-02 morning maintenance pass, commit `d0cea3c` — `distillFromTrajectorySnapshot` + `redistill.ts` CLI + `distill_on` policy)
 
 #### What to build
 
@@ -160,6 +161,7 @@ End-to-end: successful orchestrator run produces a logged/stored skill candidate
 
 **Type:** AFK  
 **Blocked by:** C-01
+**Status:** ✅ Done (`sync_distilled_skill_candidates` Tauri command; Bun JSON store remains authoritative for distilled-skill lifecycle, native SQLite is a pulled projection — see D1 in the implementation spec for why)
 
 #### What to build
 
@@ -180,6 +182,7 @@ End-to-end: distillation creates a row visible in `SkillsView` as a disabled can
 
 **Type:** AFK  
 **Blocked by:** C-02
+**Status:** ✅ Done (2026-07-02, organism loop v1 follow-up pass) — planner/executor stage injection (`resolveStagePrompt` in `pipeline.ts`) plus conductor injection (D4: `resolveSkillsForConductor` + `buildTurnUserContent` wiring, KV-safe per-turn delta, never the system prompt)
 
 #### What to build
 
@@ -200,6 +203,7 @@ End-to-end: manually enable a test skill → next matching turn's executor promp
 
 **Type:** AFK  
 **Blocked by:** C-03
+**Status:** ✅ Done (2026-07-02, organism loop v1 — see `docs/superpowers/plans/2026-07-02-organism-loop-outcome.md`)
 
 #### What to build
 
@@ -220,6 +224,7 @@ End-to-end: one fixture skill promotes through eval; one bad skill fails and sta
 
 **Type:** AFK  
 **Blocked by:** C-04
+**Status:** ✅ Done (2026-07-02, organism loop v1) — extended `SkillsView.tsx` rather than a separate `SelfImprovementView` (see D5 in the implementation spec for why); candidate detail shows eval status/score/rejection reason, Promote/Reject/Demote/Run-eval actions, and a performance-since-promotion panel
 
 #### What to build
 

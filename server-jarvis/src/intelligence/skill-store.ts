@@ -57,6 +57,7 @@ export function updateSkillCandidateStatus(
   evalScore?: number,
   rejectionReason?: SkillRejectionReason,
   rejectionDetail?: string,
+  evalMissed?: string[],
 ): SkillCandidate | null {
   const existing = loadSkillCandidate(id);
   if (!existing) return null;
@@ -76,6 +77,35 @@ export function updateSkillCandidateStatus(
     delete updated.rejection_reason;
     delete updated.rejection_detail;
   }
+  if (evalMissed !== undefined) updated.eval_missed = evalMissed;
+  // promoted_at is set on promotion and cleared on any transition away from
+  // "promoted" (demote back to "candidate", or a reject) — it should never
+  // survive a status it no longer describes.
+  if (status === "promoted") {
+    updated.promoted_at = new Date().toISOString();
+  } else {
+    delete updated.promoted_at;
+  }
+  saveSkillCandidate(updated);
+  return updated;
+}
+
+/** Persists a judge run's score/missed items without transitioning status —
+ *  backs the `POST /skills/candidates/:id/eval` endpoint, which lets an
+ *  operator preview a grounding score before committing to promote/reject. */
+export function updateSkillCandidateEval(
+  id: string,
+  evalScore: number,
+  evalMissed: string[],
+): SkillCandidate | null {
+  const existing = loadSkillCandidate(id);
+  if (!existing) return null;
+  const updated: SkillCandidate = {
+    ...existing,
+    eval_score: evalScore,
+    eval_missed: evalMissed,
+    updated_at: new Date().toISOString(),
+  };
   saveSkillCandidate(updated);
   return updated;
 }

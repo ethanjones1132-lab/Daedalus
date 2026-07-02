@@ -78,11 +78,19 @@ import { runPipelineWithReplanning } from "./orchestration/replan-loop";
 import { conductorLearning, outcomeCollector, selfTuningProposer, SelfTuningStore } from "./self-tuning/mod";
 import { conductorCacheSnapshot } from "./orchestration/conductor-metrics";
 import {
+  computeCandidatePerformance,
   distillSkillCandidate,
+  evaluateSkillPromotion,
   listSkillCandidates,
+  loadSkillCandidate,
+  promoteSkillCandidate,
   resolveSkillsForTurn,
+  runGroundingJudge,
   runSkillPromotionPass,
+  updateSkillCandidateEval,
+  updateSkillCandidateStatus,
 } from "./intelligence/mod";
+import { makeCallModel } from "./eval/call-model";
 import { normalizeStreamedToolCalls } from "./streaming-tool-calls";
 
 // ── Structured Logging Override ──────────────────────────────────────────────
@@ -1912,11 +1920,33 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             runOutcome,
           }, distillCfg);
           if (candidate) {
-            const promotionResult = runSkillPromotionPass(distillCfg);
-            console.log(
-              `[Jarvis Orchestrator] Distilled skill candidate ${candidate.id} (confidence=${candidate.confidence.toFixed(2)}); ` +
-              `evaluated=${promotionResult.total_evaluated} promoted=${promotionResult.promoted.length} rejected=${promotionResult.rejected.length}`,
-            );
+            if (distillCfg.auto_promote) {
+              // Judge-gated promotion for THIS candidate only — not the whole
+              // pending queue. The old unconditional `runSkillPromotionPass`
+              // bulk call auto-promoted on heuristics alone with zero
+              // semantic review; that safety gap is why `auto_promote`
+              // defaults to false below.
+              const promotion = await promoteSkillCandidate(candidate.id, callModel, distillCfg);
+              console.log(
+                `[Jarvis Orchestrator] Distilled skill candidate ${candidate.id} (confidence=${candidate.confidence.toFixed(2)}); ` +
+                `auto_promote result: ${promotion.ok ? promotion.candidate?.status : `error=${promotion.error}`}`,
+              );
+            } else {
+              // Default (organism loop v1 safety fix): heuristic screen only.
+              // Junk is rejected immediately via the same 6 gates as before;
+              // candidates that clear them stay in "candidate" status and
+              // wait for an explicit operator Promote action
+              // (POST /skills/candidates/:id/promote), which adds the
+              // semantic judge gate before anything can inject into prompts.
+              const heuristic = evaluateSkillPromotion(candidate, distillCfg);
+              if (!heuristic.promote) {
+                updateSkillCandidateStatus(candidate.id, "rejected", heuristic.score, heuristic.reason, heuristic.detail);
+              }
+              console.log(
+                `[Jarvis Orchestrator] Distilled skill candidate ${candidate.id} (confidence=${candidate.confidence.toFixed(2)}); ` +
+                `heuristic screen: ${heuristic.promote ? "passed, awaiting operator promote" : `rejected (${heuristic.reason})`}`,
+              );
+            }
           }
         }
         await selfTuningProposer.proposeAndApply(agentRunId, route.task_type);
@@ -2972,6 +3002,86 @@ async function baseFetch(req: Request): Promise<Response> {
         rejected: result.rejected,
         total_evaluated: result.total_evaluated,
       });
+    }
+
+    // Per-candidate lifecycle (D5a): judge-gated promote/reject/demote/eval
+    // for a single distilled skill candidate, plus its performance-since-
+    // promotion panel data. Distinct from the bulk /skills/promote above,
+    // which stays heuristic-only.
+    const candidateEvalMatch = path.match(/^\/skills\/candidates\/([^/]+)\/eval$/);
+    if (candidateEvalMatch && req.method === "POST") {
+      const id = decodeURIComponent(candidateEvalMatch[1]);
+      const candidate = loadSkillCandidate(id);
+      if (!candidate) return Response.json({ error: "candidate_not_found" }, { status: 404 });
+      const cfg = loadConfig();
+      const grounding = await runGroundingJudge(candidate, makeCallModel(cfg, "orchestrator"));
+      if (!grounding.ok) {
+        if (grounding.error === "no_grounding_source") {
+          return Response.json({ error: "judge_unavailable", detail: "no grounding source available" }, { status: 503 });
+        }
+        return Response.json({ error: "judge_unavailable", detail: grounding.detail }, { status: 503 });
+      }
+      const updated = updateSkillCandidateEval(id, grounding.verdict.score, grounding.verdict.missed);
+      return Response.json({ id, status: updated?.status ?? candidate.status, verdict: grounding.verdict });
+    }
+
+    const candidatePromoteMatch = path.match(/^\/skills\/candidates\/([^/]+)\/promote$/);
+    if (candidatePromoteMatch && req.method === "POST") {
+      const id = decodeURIComponent(candidatePromoteMatch[1]);
+      const cfg = loadConfig();
+      const result = await promoteSkillCandidate(id, makeCallModel(cfg, "orchestrator"), cfg.orchestrator.skill_distillation);
+      if (!result.ok) {
+        const status = result.error === "candidate_not_found" ? 404 : result.error === "wrong_status" ? 409 : 503;
+        return Response.json({ error: result.error, detail: result.detail }, { status });
+      }
+      return Response.json({
+        id,
+        status: result.candidate?.status,
+        eval_score: result.candidate?.eval_score,
+        promoted_at: result.candidate?.promoted_at,
+        rejection_reason: result.candidate?.rejection_reason,
+        rejection_detail: result.candidate?.rejection_detail,
+      });
+    }
+
+    const candidateRejectMatch = path.match(/^\/skills\/candidates\/([^/]+)\/reject$/);
+    if (candidateRejectMatch && req.method === "POST") {
+      const id = decodeURIComponent(candidateRejectMatch[1]);
+      const candidate = loadSkillCandidate(id);
+      if (!candidate) return Response.json({ error: "candidate_not_found" }, { status: 404 });
+      if (candidate.status !== "candidate") {
+        return Response.json({ error: "wrong_status", detail: `status is ${candidate.status}` }, { status: 409 });
+      }
+      const body = await req.json().catch(() => ({}));
+      const updated = updateSkillCandidateStatus(id, "rejected", undefined, "manual", body?.reason);
+      return Response.json({ id, status: updated?.status ?? "rejected", rejection_reason: "manual" });
+    }
+
+    const candidateDemoteMatch = path.match(/^\/skills\/candidates\/([^/]+)\/demote$/);
+    if (candidateDemoteMatch && req.method === "POST") {
+      const id = decodeURIComponent(candidateDemoteMatch[1]);
+      const candidate = loadSkillCandidate(id);
+      if (!candidate) return Response.json({ error: "candidate_not_found" }, { status: 404 });
+      if (candidate.status !== "promoted") {
+        return Response.json({ error: "wrong_status", detail: `status is ${candidate.status}` }, { status: 409 });
+      }
+      const updated = updateSkillCandidateStatus(id, "candidate");
+      return Response.json({ id, status: updated?.status ?? "candidate" });
+    }
+
+    const candidatePerformanceMatch = path.match(/^\/skills\/candidates\/([^/]+)\/performance$/);
+    if (candidatePerformanceMatch && req.method === "GET") {
+      const id = decodeURIComponent(candidatePerformanceMatch[1]);
+      const candidate = loadSkillCandidate(id);
+      if (!candidate) return Response.json({ error: "candidate_not_found" }, { status: 404 });
+      if (candidate.status !== "promoted") {
+        return Response.json({ error: "wrong_status", detail: `status is ${candidate.status}` }, { status: 409 });
+      }
+      const store = new SelfTuningStore();
+      const perf = computeCandidatePerformance(candidate, (taskTypes, start, end) =>
+        store.getAgentRunsForTaskTypesInWindow(taskTypes, start, end),
+      );
+      return Response.json(perf);
     }
     if (path === "/agents/pool" && req.method === "GET") {
       const poolCfg = loadConfig();

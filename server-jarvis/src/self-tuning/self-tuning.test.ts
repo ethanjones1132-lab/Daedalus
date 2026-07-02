@@ -33,6 +33,34 @@ describe("Self tuning", () => {
     expect(store.getStageRuns(runId)[0].mode_id).toBe("executor");
   });
 
+  test("getAgentRunsForTaskTypesInWindow filters by task type and [start, end) window", () => {
+    const store = new SelfTuningStore(TEST_DB_PATH);
+    const insert = (id: string, taskType: string, createdAt: string, outcome: string) => {
+      store.insertAgentRun({
+        id,
+        session_id: "s",
+        user_request: "q",
+        task_type: taskType,
+        pipeline: JSON.stringify(["synthesizer"]),
+        completed: 1,
+      });
+      // insertAgentRun's fixed column list doesn't take created_at/outcome —
+      // both are set here via the generic updater to pin an exact timestamp.
+      store.updateAgentRun(id, { outcome, created_at: createdAt });
+    };
+    insert("run_in_window", "debug", "2026-06-02T00:00:00.000Z", "success");
+    insert("run_before_window", "debug", "2026-05-30T00:00:00.000Z", "success");
+    insert("run_at_end_boundary", "debug", "2026-06-03T00:00:00.000Z", "success"); // end is exclusive
+    insert("run_wrong_task_type", "refactor", "2026-06-02T00:00:00.000Z", "success");
+
+    const rows = store.getAgentRunsForTaskTypesInWindow(
+      ["debug"],
+      "2026-06-01T00:00:00.000Z",
+      "2026-06-03T00:00:00.000Z",
+    );
+    expect(rows.map((r) => r.id)).toEqual(["run_in_window"]);
+  });
+
   test("completeAgentRun persists a truthful outcome (default success, explicit failed)", () => {
     const store = new SelfTuningStore(TEST_DB_PATH);
     const collector = new SessionOutcomeCollector(store);

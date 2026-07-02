@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readdirSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -10,6 +10,8 @@ import { conductorCacheSnapshot, __resetConductorCacheMetricsForTests } from "./
 import type { JarvisConfig } from "../config";
 import { defaultConfig } from "../config";
 import { __resetOllamaHealthCacheForTests } from "../ollama";
+import { saveSkillCandidate } from "../intelligence/skill-store";
+import type { SkillCandidate } from "../intelligence/skill-types";
 
 const originalFetch = globalThis.fetch;
 
@@ -374,6 +376,131 @@ describe("PersistentConductor", () => {
     expect(chatBodies[0].messages.length).toBe(2);
     expect(chatBodies[1].messages.length).toBe(4);
     expect(chatBodies[2].messages.length).toBe(6);
+  });
+
+  describe("D4: KV-safe conductor skill hint (organism loop v1)", () => {
+    let candidatesDir = "";
+
+    beforeEach(() => {
+      candidatesDir = mkdtempSync(join(tmpdir(), "jarvis-conductor-skills-"));
+      (globalThis as any).__skillCandidatesDirOverride = candidatesDir;
+    });
+
+    afterEach(() => {
+      delete (globalThis as any).__skillCandidatesDirOverride;
+      if (candidatesDir) rmSync(candidatesDir, { recursive: true, force: true });
+    });
+
+    function mockOllamaCapture(chatBodies: Array<{ messages: Array<{ role: string; content: string }> }>) {
+      (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/api/tags")) {
+          return Response.json({ models: [{ name: "gemma4:e2b" }] });
+        }
+        if (url.endsWith("/api/chat")) {
+          chatBodies.push(JSON.parse(String(init?.body ?? "{}")));
+          return Response.json({
+            message: {
+              role: "assistant",
+              content: JSON.stringify({
+                task_type: "general",
+                pipeline: ["synthesizer"],
+                topology: "linear",
+                context: { needs_workspace_inspection: false, needs_memory: true, estimated_complexity: "low" },
+                coordinator_rationale: "ok",
+              }),
+            },
+          });
+        }
+        throw new Error(`Unexpected fetch: ${url}`);
+      };
+    }
+
+    test("unmatched turn (no promoted skills) produces the same user-message shape as before D4 — no skill section, no stray blank lines", async () => {
+      const chatBodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+      mockOllamaCapture(chatBodies);
+
+      const cfg = makeConfig({ persist_sessions: false });
+      const conductor = new PersistentConductor(() => cfg);
+      await conductor.routeTurn({ sessionId: "hint-unmatched", request: "hello there", turnNumber: 1 });
+
+      const userMsg = chatBodies[0].messages.find((m) => m.role === "user")!.content;
+      expect(userMsg).not.toContain("Promoted skills");
+      expect(userMsg).toBe(
+        [
+          "Session ID: hint-unmatched",
+          "Coordinator turn: 1",
+          "Last outcome: none",
+          "Session shared memory: none",
+          "Recent session history: none",
+          "Current request:\nhello there",
+        ].join("\n\n"),
+      );
+    });
+
+    test("matched turn includes the promoted skill hint in the user message delta, never the system prompt", async () => {
+      const candidate: SkillCandidate = {
+        id: "skill_conductor_hint_1",
+        name: "distilled-conductor-hint",
+        description: "Read the file before editing it",
+        trigger: { task_types: ["debug"], requirements: ["workspace_read"], signals: [] },
+        body: "x".repeat(600),
+        source_run_ids: ["run_x"],
+        confidence: 0.9,
+        status: "promoted",
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+      saveSkillCandidate(candidate);
+
+      const chatBodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+      mockOllamaCapture(chatBodies);
+
+      const cfg = makeConfig({ persist_sessions: false });
+      const conductor = new PersistentConductor(() => cfg);
+      await conductor.routeTurn({
+        sessionId: "hint-matched",
+        request: "please look at src/foo.ts and summarize it",
+        turnNumber: 1,
+      });
+
+      const systemMsg = chatBodies[0].messages.find((m) => m.role === "system")!.content;
+      const userMsg = chatBodies[0].messages.find((m) => m.role === "user")!.content;
+      expect(systemMsg).not.toContain("distilled-conductor-hint");
+      expect(userMsg).toContain("distilled-conductor-hint");
+      expect(userMsg).toContain("Promoted skills relevant to this turn");
+    });
+
+    test("system prompt stays byte-identical across turns even when a skill hint is present (KV cache safety)", async () => {
+      const candidate: SkillCandidate = {
+        id: "skill_conductor_hint_2",
+        name: "distilled-conductor-hint-2",
+        description: "Read before editing",
+        trigger: { task_types: ["debug"], requirements: ["workspace_read"], signals: [] },
+        status: "promoted",
+        body: "x".repeat(600),
+        source_run_ids: ["run_x"],
+        confidence: 0.9,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+      saveSkillCandidate(candidate);
+
+      const chatBodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+      mockOllamaCapture(chatBodies);
+
+      const cfg = makeConfig({ persist_sessions: false });
+      const conductor = new PersistentConductor(() => cfg);
+      await conductor.routeTurn({ sessionId: "hint-kv-safe", request: "please look at src/foo.ts", turnNumber: 1 });
+      await conductor.routeTurn({ sessionId: "hint-kv-safe", request: "please look at src/bar.ts", turnNumber: 2 });
+
+      const systemContents = chatBodies.map((b) => b.messages.find((m) => m.role === "system")!.content);
+      expect(systemContents[0]).toBe(systemContents[1]);
+      // Both turns' user deltas carry the hint independently — the hint rides
+      // the delta, not a one-time system-prompt rebuild.
+      expect(chatBodies[0].messages.find((m) => m.role === "user")!.content).toContain("distilled-conductor-hint-2");
+      expect(chatBodies[1].messages.find((m) => m.role === "user")!.content).toContain("distilled-conductor-hint-2");
+    });
   });
 
   test("recovers warm prefix after a mid-session API fallback (Track A-02 acceptance)", async () => {

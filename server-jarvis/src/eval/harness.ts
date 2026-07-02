@@ -19,17 +19,22 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { saveSkillCandidate } from "../intelligence/skill-store";
 import { resolveSkillsForTurn } from "../intelligence/skill-resolver";
+import { buildGroundingRubric, runGroundingJudge } from "../intelligence/skill-promotion";
+import { defaultConfig } from "../config";
+import type { CallModelFn } from "../orchestration/coordinator";
 import {
   ROUTING_CASES,
   MODE_GATING_CASES,
   COORDINATOR_CASES,
   AGENT_POOL_CASES,
   SKILL_CASES,
+  SKILL_GROUNDING_CASES,
   type RoutingCase,
   type ModeGatingCase,
   type CoordinatorCase,
   type AgentPoolCase,
   type SkillCase,
+  type SkillGroundingCase,
 } from "./cases";
 
 export interface EvalCaseResult {
@@ -174,6 +179,51 @@ function runSkillCase(c: SkillCase): EvalCaseResult {
   }
 }
 
+/** Rubric-agnostic mock: echoes every rubric item in the judge prompt back
+ *  as either covered (score 1.0) or missed (score 0), so the case doesn't
+ *  need to hardcode `buildGroundingRubric`'s exact wording. */
+function mockGroundingCallModel(outcome: "pass" | "fail"): CallModelFn {
+  return async (messages) => {
+    const userMsg = messages.find((m) => m.role === "user")?.content ?? "";
+    const rubricLines = userMsg.split("Rubric items")[1] ?? "";
+    const items = [...rubricLines.matchAll(/^- (.+)$/gm)].map((m) => m[1]);
+    return outcome === "pass"
+      ? { content: JSON.stringify({ covered: items, missed: [] }) }
+      : { content: JSON.stringify({ covered: [], missed: items }) };
+  };
+}
+
+async function runSkillGroundingCase(c: SkillGroundingCase): Promise<EvalCaseResult> {
+  const rubric = buildGroundingRubric(c.fixture, c.snapshot);
+  const problems: string[] = [];
+
+  if (c.expect.minRubricItems !== undefined && rubric.length < c.expect.minRubricItems) {
+    problems.push(`rubric.length=${rubric.length} expected>=${c.expect.minRubricItems}`);
+  }
+  if (c.expect.rubricContains && !rubric.some((r) => r.includes(c.expect.rubricContains!))) {
+    problems.push(`rubric missing item containing "${c.expect.rubricContains}"`);
+  }
+
+  const grounding = await runGroundingJudge(
+    c.fixture,
+    mockGroundingCallModel(c.judgeOutcome),
+    () => c.snapshot,
+  );
+  const minJudgeScore = defaultConfig().orchestrator.skill_distillation.min_judge_score ?? 0.75;
+  const passes = grounding.ok && grounding.verdict.score >= minJudgeScore;
+
+  if (passes !== c.expect.groundingPasses) {
+    problems.push(`groundingPasses=${passes} expected=${c.expect.groundingPasses}`);
+  }
+
+  return {
+    id: c.id,
+    kind: c.kind,
+    pass: problems.length === 0,
+    detail: problems.length === 0 ? "ok" : problems.join("; "),
+  };
+}
+
 function runAgentPoolCase(c: AgentPoolCase): EvalCaseResult {
   const pool = new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS);
   const coverage = pool.coverage();
@@ -217,6 +267,7 @@ export async function runEval(): Promise<EvalReport> {
   for (const c of COORDINATOR_CASES) results.push(await runCoordinatorCase(c));
   for (const c of AGENT_POOL_CASES) results.push(runAgentPoolCase(c));
   for (const c of SKILL_CASES) results.push(runSkillCase(c));
+  for (const c of SKILL_GROUNDING_CASES) results.push(await runSkillGroundingCase(c));
 
   const passed = results.filter((r) => r.pass).length;
   return {
