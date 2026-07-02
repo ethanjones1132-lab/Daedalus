@@ -833,7 +833,61 @@ function ChatPanel({
         return;
       }
       if (frame.type === 'error') {
+        // P0-B (2026-07-02): the `code` field discriminates the failure
+        // mode. `first_token_timeout` means the model hung and was
+        // terminated by the server-side watchdog; surface a clearer
+        // message than the raw `frame.error` (which the server now
+        // formats to a per-model "did not produce any output within the
+        // per-model first-token window" string). Other codes fall
+        // through to the raw `frame.error` text.
+        const code = typeof frame.code === 'string' ? frame.code : undefined;
+        if (code) {
+          // eslint-disable-next-line no-console
+          console.warn(`[Jarvis] stream error code=${code}: ${frame.error}`);
+        }
         throw new Error(String(frame.error || 'Jarvis stream failed.'));
+      }
+      if (frame.type === 'cancelled') {
+        // P0-B (2026-07-02): `cancelled` is now reserved for genuine user
+        // / `/chat/cancel` aborts (the server-side fix prevents a hung
+        // model from emitting this). Previously the UI had no handler for
+        // it — the frame was silently dropped, the read loop ended, and
+        // `finalizeAssistantMessage` left an empty assistant bubble
+        // visible. Now we mark the stream as intentionally stopped, clear
+        // the streaming indicator, and surface a non-error "(stopped)"
+        // notice so the user knows the turn ended because they asked.
+        if (streamAbortRef.current) streamAbortRef.current.abort();
+        setIsStreaming(false);
+        setError(null);
+        setMessages(prev => {
+          const last = prev[prev.length - 1];
+          if (last?.role === 'assistant' && last.isStreaming) {
+            if (!last.content.trim()) {
+              // User stopped before any text streamed — drop the
+              // empty bubble entirely instead of leaving a blank row.
+              return prev.slice(0, -1);
+            }
+            return [...prev.slice(0, -1), { ...last, isStreaming: false }];
+          }
+          return prev;
+        });
+        return;
+      }
+      // P0-I (2026-07-02): unknown / unhandled frame types used to be
+      // silently dropped. Log them once per type so operator / dev can
+      // spot contract drift between the server emitter and the UI
+      // handler chain. (P0-B fix relies on this: any future regression
+      // that re-introduces a "hung model emits cancelled" path will
+      // surface here as a `cancelled` log if a handler is later added.)
+      if (typeof frame.type === 'string') {
+        // Avoid spamming: use a Set on the function instance to dedupe.
+        if (!(handleFrame as any)._seenTypes) (handleFrame as any)._seenTypes = new Set<string>();
+        const seen = (handleFrame as any)._seenTypes as Set<string>;
+        if (!seen.has(frame.type)) {
+          seen.add(frame.type);
+          // eslint-disable-next-line no-console
+          console.warn(`[Jarvis] unknown SSE frame type: ${frame.type}`);
+        }
       }
     };
 

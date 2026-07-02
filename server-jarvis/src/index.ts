@@ -948,6 +948,38 @@ class StreamCancelledError extends Error {
   }
 }
 
+/**
+ * Thrown when a model's first-token watchdog fires (per-model window expired
+ * with no `choice.delta.content` chunk arriving). Distinct from
+ * `StreamCancelledError`: a slow/hung model is NOT a user cancellation, and
+ * must surface to the client as a real `error` frame (with
+ * `code: "first_token_timeout"`) — never as a `cancelled` frame.
+ *
+ * Background: the 2026-07-02 P0-B live incident. The previous build's
+ * watchdogs called `streamAbort.abort("First-token timeout")` from inside the
+ * timer callback, which is the SAME `streamAbort` that the user Stop button
+ * / `/chat/cancel` trigger. The shared abort domain conflated "the user
+ * stopped the turn" with "the model is hung" — so a hung model emitted a
+ * `cancelled` SSE frame, the UI had no `cancelled` handler, the frame was
+ * dropped, the assistant bubble was finalized empty, and the user saw a
+ * silent blank bubble with no error message. Per the 2026-07-02 live-issues
+ * plan, first-token timeout now lives in its own abort domain (per-read-loop
+ * `reader.cancel()` only) and surfaces as an explicit `error` frame so the
+ * caller can retry / switch backend without losing the user-visible signal.
+ */
+class FirstTokenTimeoutError extends Error {
+  readonly model: string;
+  readonly stage: string;
+  readonly windowMs: number;
+  constructor(model: string, stage: string, windowMs: number) {
+    super(`First-token timeout (${windowMs}ms) on model=${model} stage=${stage}`);
+    this.name = "FirstTokenTimeoutError";
+    this.model = model;
+    this.stage = stage;
+    this.windowMs = windowMs;
+  }
+}
+
 /** Collect aggregate answer from a streamJarvis Response (cron scheduler contract). */
 async function drainStreamJarvisResponse(resp: Response): Promise<{ output: string; error?: string }> {
   const reader = resp.body?.getReader();
@@ -1458,10 +1490,26 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             actualModelUsed,
             MODEL_FIRST_TOKEN_TIMEOUT_MS,
           );
+          // First-token timeout flag. P0-B (2026-07-02): the previous
+          // build called `streamAbort.abort("First-token timeout")` from
+          // inside this timer, which is the SAME abort domain as the user
+          // Stop button / `/chat/cancel`. A hung model was therefore
+          // indistinguishable from a user cancellation — it emitted a
+          // `cancelled` SSE frame, the UI had no `cancelled` handler, the
+          // assistant bubble was finalized empty, and the user saw a silent
+          // blank bubble.
+          //
+          // The watchdog now lives in its own abort domain: per-read-loop
+          // `reader.cancel()` only, plus a flag that the read loop checks
+          // after the next `read()` returns. The error is raised as
+          // `FirstTokenTimeoutError` and surfaced to the client as a
+          // structured `error` frame with `code: "first_token_timeout"`
+          // (handled in the outer `streamJarvis` catch block).
+          let firstTokenTimeoutFired = false;
           const firstTokenTimer = setTimeout(() => {
             if (!firstTokenReceived && !streamAbort.signal.aborted) {
+              firstTokenTimeoutFired = true;
               console.warn(`[Jarvis Orchestrator] First-token timeout (${firstTokenMs / 1000}s) on stage=${callOptions?.stageLabel ?? "agent"} model=${actualModelUsed} — aborting stream`);
-              streamAbort.abort("First-token timeout");
               reader.cancel("First-token timeout").catch(() => {});
             }
           }, firstTokenMs);
@@ -1499,6 +1547,18 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
             const { done, value } = readResult;
             if (done) break;
+            // P0-B (2026-07-02): the first-token watchdog sets this flag
+            // (and calls `reader.cancel()`) without touching `streamAbort`,
+            // so a hung model is no longer conflated with user cancellation.
+            // The flag is checked here, after the `reader.read()` that
+            // follows `reader.cancel()` has resolved, and surfaces the
+            // timeout as a structured error instead of silently dropping
+            // the turn. The outer `streamJarvis` catch block converts
+            // this into an `error` SSE frame with
+            // `code: "first_token_timeout"`.
+            if (firstTokenTimeoutFired) {
+              throw new FirstTokenTimeoutError(actualModelUsed, callOptions?.stageLabel ?? "agent", firstTokenMs);
+            }
             lastActivity = Date.now();
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split("\n");
@@ -2348,10 +2408,21 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           modelName,
           MODEL_FIRST_TOKEN_TIMEOUT_MS,
         );
+        // P0-B (2026-07-02): see FirstTokenTimeoutError in this file.
+        // The previous build called `streamAbort.abort("First-token timeout")`
+        // from inside this timer — same abort domain as the user Stop
+        // button. A hung model therefore emitted `cancelled`, the UI
+        // dropped it (no handler), and the user saw a silent blank bubble.
+        // The watchdog now lives in its own abort domain
+        // (per-read-loop `reader.cancel()` only); the read loop checks the
+        // flag below and throws FirstTokenTimeoutError, which the outer
+        // `streamJarvis` catch block surfaces as a structured
+        // `error` frame with `code: "first_token_timeout"`.
+        let firstTokenTimeoutFired = false;
         const firstTokenTimer = setTimeout(() => {
           if (!firstTokenReceived && !streamAbort.signal.aborted) {
+            firstTokenTimeoutFired = true;
             console.warn(`[Jarvis Agent Loop] First-token timeout (${firstTokenMs / 1000}s) on model=${modelName} — aborting stream`);
-            streamAbort.abort("First-token timeout");
             reader.cancel("First-token timeout").catch(() => {});
           }
         }, firstTokenMs);
@@ -2383,6 +2454,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
             const { done, value } = readResult;
             if (done) break;
+            // P0-B (2026-07-02): the first-token watchdog sets the flag
+            // (and calls `reader.cancel()`) without touching `streamAbort`.
+            // Check it here, after the cancelled `reader.read()` has
+            // resolved, and surface the timeout as a structured error
+            // instead of silently dropping the turn.
+            if (firstTokenTimeoutFired) {
+              throw new FirstTokenTimeoutError(modelName, "agent_loop", firstTokenMs);
+            }
             lastActivity = Date.now();
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split("\n");
@@ -2756,7 +2835,23 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         return;
       }
       const errMsg = error?.message || String(error);
-      console.error(`[Jarvis] Stream error session=${sessionId}:`, errMsg);
+      // P0-B (2026-07-02): a first-token timeout is a HUNG MODEL, not a
+      // user cancellation. The watchdog (orchestrator + Agent Loop) no
+      // longer touches `streamAbort`, so we are guaranteed to land here
+      // for a timeout — surface it as a structured `error` frame with
+      // `code: "first_token_timeout"` so the UI can show a real "model
+      // timed out" message (or attempt a retry / switch backend) instead
+      // of dropping the frame and finalizing an empty assistant bubble.
+      // `cancelled` is reserved for genuine user / `/chat/cancel` aborts
+      // (handled by `StreamCancelledError` above).
+      const isFirstTokenTimeout = error?.name === "FirstTokenTimeoutError";
+      const errorCode = isFirstTokenTimeout ? "first_token_timeout" : undefined;
+      const userFacingMsg = isFirstTokenTimeout
+        ? `The model did not produce any output within the per-model first-token window. ` +
+          `This usually means the model is loading, overloaded, or the configured backend is unreachable. ` +
+          `Try again, or switch backend in Settings. (${error?.model ?? "unknown model"}, stage=${error?.stage ?? "unknown"}, window=${error?.windowMs ?? "?"}ms)`
+        : errMsg;
+      console.error(`[Jarvis] Stream error session=${sessionId} code=${errorCode ?? "<generic>"}:`, userFacingMsg);
       const _cfg3 = resolveConfig(options.config);
       recordInference({
         ts: Date.now(),
@@ -2774,13 +2869,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         latency_ms: Date.now() - _turnStart,
         tokens_in: sessionCostInfo?.prompt_tokens ?? 0,
         tokens_out: sessionCostInfo?.completion_tokens ?? 0,
-        error: errMsg.slice(0, 200),
+        error: userFacingMsg.slice(0, 200),
         fallback_used: lastFallbackRetries > 0,
         retry_count: lastFallbackRetries,
         fallback_model: lastFallbackModel,
       });
       try {
-        await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "error", error: errMsg, session_id: sessionId })}\n\n`));
+        await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "error", error: userFacingMsg, code: errorCode, session_id: sessionId })}\n\n`));
       } catch {}
     } finally {
       activeStreamControllers.delete(sessionId);
