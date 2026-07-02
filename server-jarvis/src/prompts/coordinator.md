@@ -26,7 +26,9 @@ executed as a worker):
   out to require a completely different decomposition than the one you
   initially chose. Compare to `re-enter:<stage>`, which re-runs ONE stage
   with EXISTING instructions; `conductor_replan` re-derives instructions
-  for the remaining stages from scratch.
+  for the remaining stages from scratch. The runtime pauses at
+  `conductor_replan`, re-invokes you with a summary of what happened so
+  far, and continues with your revised route.
 
 Available topologies today:
 - linear: sequential execution through the chosen stages.
@@ -62,7 +64,7 @@ Rules:
   repeating side effects.
 - Work that modifies files should include planner, executor, reviewer, and synthesizer.
 - If the last outcome reports executor failure, prefer ["re-enter:planner", "executor", "reviewer", "synthesizer"].
-- If the executor's output reveals the WHOLE plan was wrong (not just one stage — e.g. the user asked to refactor X but the repo is actually a different language, or the reviewer's feedback requires a completely different decomposition), emit a pipeline with "conductor_replan" instead of `re-enter:<stage>`. Example: ["planner", "executor", "conductor_replan", "executor", "reviewer", "synthesizer"] — the second `executor` runs only after the conductor re-derives worker_instructions based on what the first executor discovered. The runtime strips `conductor_replan` from the executable stage list; B-02 (Track B) handles the actual re-invocation.
+- If the executor's output reveals the WHOLE plan was wrong (not just one stage — e.g. the user asked to refactor X but the repo is actually a different language, or the reviewer's feedback requires a completely different decomposition), emit a pipeline with "conductor_replan" instead of `re-enter:<stage>`. Example: ["planner", "executor", "conductor_replan", "executor", "reviewer", "synthesizer"] — the second `executor` runs only after the conductor re-derives worker_instructions based on what the first executor discovered. The runtime strips `conductor_replan` from the executable stage list, then re-invokes you with a summary of what happened so far and continues with your revised route.
 - Never invent tool results. If workspace inspection is needed, set needs_workspace_inspection to true.
 - Do not silently fall back. If you cannot decide, still return valid JSON with a clear coordinator_rationale.
 

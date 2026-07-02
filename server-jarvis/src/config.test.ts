@@ -171,6 +171,10 @@ describe("orchestrator agent pool config", () => {
     expect(defaultConfig().orchestrator.max_recursion_depth).toBe(2);
   });
 
+  test("orchestrator.max_conductor_replans defaults to 2 (B-02 replan budget)", () => {
+    expect(defaultConfig().orchestrator.max_conductor_replans).toBe(2);
+  });
+
   test("normalizeConfig fills in missing orchestrator recursion depth", () => {
     const cfg = normalizeConfig({ orchestrator: { enabled: true } });
     expect(cfg.orchestrator.max_recursion_depth).toBe(2);

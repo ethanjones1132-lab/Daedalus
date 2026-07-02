@@ -1,3 +1,4 @@
+// server-jarvis/src/orchestration/stage-output.test.ts
 import { describe, expect, test } from "bun:test";
 import {
   renderExecutorSummary,
@@ -81,5 +82,41 @@ describe("stage-output renderers", () => {
     const rendered = renderRewriterSummary(rewriter);
     expect(rendered).toContain("[Rewriter]: Patched the login handler.");
     expect(rendered).toContain("[Tool Call Result (edit_file)]");
+  });
+
+  test("renderExecutorSummary returns an empty string, not the sentinel, for a stage that ran but produced no narrative and no tool calls", () => {
+    const executor: ExecutorStageOutput = { ok: true, narrative: "", toolCalls: [] };
+    const rendered = renderExecutorSummary(executor);
+    expect(rendered).toBe("");
+    expect(rendered).not.toBe("No execution stage executed.");
+  });
+
+  test("renderRewriterSummary returns an empty string, not the sentinel, for a stage that ran but produced no narrative and no tool calls", () => {
+    const rewriter: RewriterStageOutput = { ok: true, narrative: "", toolCalls: [] };
+    const rendered = renderRewriterSummary(rewriter);
+    expect(rendered).toBe("");
+    expect(rendered).not.toBe("No rewriting stage executed.");
+  });
+
+  test("ToolCallRecord.error_code round-trips through renderExecutorSummary without affecting rendered text", () => {
+    const executor: ExecutorStageOutput = {
+      ok: false,
+      narrative: "Tried to call an unknown tool.",
+      toolCalls: [
+        {
+          name: "nonexistent_tool",
+          arguments: {},
+          output: "Unknown tool: nonexistent_tool",
+          is_error: true,
+          error_code: "unknown_tool",
+          duration_ms: 3,
+        },
+      ],
+    };
+    const rendered = renderExecutorSummary(executor);
+    expect(rendered).toContain("[Executor]: Tried to call an unknown tool.");
+    expect(rendered).toContain("[Tool Call Result (nonexistent_tool)] FAILED");
+    expect(rendered).toContain("Unknown tool: nonexistent_tool");
+    expect(executor.toolCalls[0]?.error_code).toBe("unknown_tool");
   });
 });

@@ -1,3 +1,4 @@
+// server-jarvis/src/orchestration/stage-output.ts
 // ═══════════════════════════════════════════════════════════════
 // Structured pipeline stage output — replaces the ad-hoc truncated
 // string concatenation that used to flow between planner/executor/
@@ -10,11 +11,15 @@
 // needs to hand the conductor summarized findings, not raw strings.
 // ═══════════════════════════════════════════════════════════════
 
+import type { ToolErrorCode } from "../tool-types";
+
 export interface ToolCallRecord {
   name: string;
   arguments: Record<string, unknown>;
   output: string;
   is_error: boolean;
+  /** Set when `is_error` is true — stable machine-readable category (see tool-types.ts). */
+  error_code?: ToolErrorCode;
   duration_ms: number;
 }
 
@@ -73,7 +78,7 @@ export function renderExecutorSummary(stage: ExecutorStageOutput | undefined): s
     stage.narrative ? `[Executor]: ${stage.narrative}` : "",
     renderToolCalls(stage.toolCalls),
   ].filter(Boolean);
-  return parts.length > 0 ? parts.join("\n\n") : "No execution stage executed.";
+  return parts.join("\n\n");
 }
 
 export function renderReviewerSummary(stage: ReviewerStageOutput | undefined): string {
@@ -87,5 +92,5 @@ export function renderRewriterSummary(stage: RewriterStageOutput | undefined): s
     stage.narrative ? `[Rewriter]: ${stage.narrative}` : "",
     renderToolCalls(stage.toolCalls),
   ].filter(Boolean);
-  return parts.length > 0 ? parts.join("\n\n") : "No rewriting stage executed.";
+  return parts.join("\n\n");
 }

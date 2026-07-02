@@ -425,6 +425,33 @@ describe("Orchestration & Routing Tests", () => {
     expect(result.synthesizerAnswer).toBe("synthesized with carry");
   });
 
+  test("executeSegment carries prior state forward and can stop before synthesizer", async () => {
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig);
+    const calls: string[] = [];
+    const callModel = async (_messages: any[], options?: any) => {
+      calls.push(options?.stageLabel ?? "?");
+      return { content: `output for ${options?.stageLabel}` };
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+
+    const first = await executor.executeSegment(
+      "do the thing", ["planner", "executor"], "run-segment-1", () => {}, {},
+    );
+    expect(first.state.plan?.narrative).toBe("output for planner");
+    expect(first.state.executor?.narrative).toBe("output for executor");
+    expect(first.synthesizerAnswer).toBeUndefined();
+
+    const second = await executor.executeSegment(
+      "do the thing", ["reviewer", "synthesizer"], "run-segment-2", () => {}, {}, first.state,
+    );
+    // Carried-forward state survives into the second segment.
+    expect(second.state.plan?.narrative).toBe("output for planner");
+    expect(second.state.executor?.narrative).toBe("output for executor");
+    expect(second.synthesizerAnswer).toBe("output for synthesizer");
+    expect(calls).toEqual(["planner", "executor", "reviewer", "synthesizer"]);
+  });
+
   test("errText safely stringifies non-Error throws without crashing", () => {
     expect(errText(new Error("boom"))).toBe("boom");
     expect(errText("plain string")).toBe("plain string");
