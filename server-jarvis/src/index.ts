@@ -1766,6 +1766,28 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             actualModelUsed &&
             actualProviderUsed
           ) {
+            // Phase 6 (tool normalization warning): if the model emitted a tool
+            // call whose name is not in the offered tools list, log a one-line
+            // warning so operators can attribute the failure to a specific model
+            // output. The native path already filters unknown names via
+            // `normalizeToolName` (returns null for unknown names); the text-tool
+            // path already filters via `normalizeToolName` in `callsFromValue`.
+            // This warning is purely diagnostic — it does not change behavior.
+            if (parsedToolCalls.length > 0 && callOptions?.tools) {
+              const offeredNames = new Set(
+                (callOptions.tools as Array<{ function?: { name?: string }; name?: string }>).map(
+                  (t) => t.function?.name ?? t.name,
+                ),
+              );
+              for (const call of parsedToolCalls) {
+                if (call.name && !offeredNames.has(call.name)) {
+                  console.warn(
+                    `[Jarvis Orchestrator] Stage ${stageLabel ?? "<none>"} emitted tool call "${call.name}" not in offered tools list — possible model hallucination. model=${actualModelUsed ?? "<unknown>"} provider=${actualProviderUsed ?? "<unknown>"}`,
+                  );
+                }
+              }
+            }
+
             const hasContent = typeof cleanContent === "string" && cleanContent.trim().length > 0;
             const hasToolCalls = parsedToolCalls.length > 0;
             conductorLearning.recordStageModel({
