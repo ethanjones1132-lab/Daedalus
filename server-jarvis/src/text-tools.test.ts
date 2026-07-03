@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   extractTextToolCalls,
+  createStageStreamSanitizer,
   hasExplicitWebSearchIntent,
   TextToolCallStreamSanitizer,
   VisibleAnswerStreamSanitizer,
@@ -88,6 +89,14 @@ function sanitizeVisibleAnswer(chunks: string[]): string {
 }
 
 describe("text tool extraction", () => {
+  test("non-tool orchestration stages suppress bare tool markup before activity is emitted", () => {
+    const sanitizer = createStageStreamSanitizer(false);
+
+    expect(sanitizer.push('{"name":"read_file","arguments":{"path":"README.md"}}\n')).toBe("");
+    expect(sanitizer.push("Planner summary follows.\n")).toBe("Planner summary follows.\n");
+    expect(sanitizer.flush()).toBe("");
+  });
+
   test("extracts tagged tool calls without leaking the block", () => {
     const parsed = extractTextToolCalls(
       'I will check.\n<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</tool_call>',

@@ -13,6 +13,7 @@ import { PredictiveRouter } from "../orchestration/router";
 import { Coordinator, CoordinatorError } from "../orchestration/coordinator";
 import { AgentPool, DEFAULT_ORCHESTRATOR_AGENTS } from "../orchestration/agent-pool";
 import { getToolsForMode } from "../orchestration/modes";
+import { classifyTurnRequirements } from "../orchestration/turn-requirements";
 import type { ToolDefinition } from "../tool-types";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
@@ -25,12 +26,14 @@ import type { CallModelFn } from "../orchestration/coordinator";
 import {
   ROUTING_CASES,
   MODE_GATING_CASES,
+  TURN_REQUIREMENT_CASES,
   COORDINATOR_CASES,
   AGENT_POOL_CASES,
   SKILL_CASES,
   SKILL_GROUNDING_CASES,
   type RoutingCase,
   type ModeGatingCase,
+  type TurnRequirementCase,
   type CoordinatorCase,
   type AgentPoolCase,
   type SkillCase,
@@ -105,6 +108,26 @@ function runModeGatingCase(c: ModeGatingCase): EvalCaseResult {
     kind: c.kind,
     pass,
     detail: pass ? "ok" : `allowed=${JSON.stringify(allowed)} expected=${JSON.stringify(expected)}`,
+  };
+}
+
+function runTurnRequirementCase(c: TurnRequirementCase): EvalCaseResult {
+  const result = classifyTurnRequirements(c.request);
+  const problems: string[] = [];
+  if (result.requirement !== c.expect.requirement) {
+    problems.push(`requirement=${result.requirement} expected=${c.expect.requirement}`);
+  }
+  for (const signal of c.expect.signals ?? []) {
+    if (!result.signals.includes(signal)) problems.push(`missing signal=${signal}`);
+  }
+  for (const signal of c.expect.excludedSignals ?? []) {
+    if (result.signals.includes(signal)) problems.push(`unexpected signal=${signal}`);
+  }
+  return {
+    id: c.id,
+    kind: c.kind,
+    pass: problems.length === 0,
+    detail: problems.length === 0 ? "ok" : problems.join("; "),
   };
 }
 
@@ -264,6 +287,7 @@ export async function runEval(): Promise<EvalReport> {
   const results: EvalCaseResult[] = [];
   for (const c of ROUTING_CASES) results.push(await runRoutingCase(c));
   for (const c of MODE_GATING_CASES) results.push(runModeGatingCase(c));
+  for (const c of TURN_REQUIREMENT_CASES) results.push(runTurnRequirementCase(c));
   for (const c of COORDINATOR_CASES) results.push(await runCoordinatorCase(c));
   for (const c of AGENT_POOL_CASES) results.push(runAgentPoolCase(c));
   for (const c of SKILL_CASES) results.push(runSkillCase(c));

@@ -46,6 +46,55 @@ function cfgWithPool(): JarvisConfig {
 }
 
 describe("chatCompletionWithFallback AgentPool integration", () => {
+  test("sanitizes native tool history before an OpenCode attempt", async () => {
+    const cfg = cfgWithPool();
+    cfg.opencode_zen.base_url = "https://opencode.ai/zen/v1";
+    cfg.opencode_zen.api_key = "sk-zen-key";
+    cfg.orchestrator.agents = [{
+      id: "zen-executor",
+      provider: "opencode_zen",
+      model_id: "zen-code",
+      capabilities: { code: 0.95, reasoning: 0.8, speed: 0.8, cost: 1, json_reliability: 0.8 },
+      default_for: ["executor"],
+      enabled: true,
+    }];
+
+    let attemptedBody: Record<string, any> | undefined;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) {
+        return new Response(JSON.stringify({ data: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      attemptedBody = JSON.parse(String(init?.body ?? "{}"));
+      return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n', {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }) as typeof fetch;
+
+    await chatCompletionWithFallback(cfg, {
+      model: "zen-code",
+      messages: [
+        { role: "assistant", content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "read_file", arguments: "{}" } }] },
+        { role: "tool", name: "read_file", tool_call_id: "c1", content: "file contents" },
+      ],
+      tools: [{ type: "function", function: { name: "read_file", parameters: { type: "object" } } }],
+      tool_choice: "auto",
+      stream: true,
+    }, undefined, { stage: "executor", taskType: "general" });
+
+    expect(attemptedBody?.tools).toBeUndefined();
+    expect(attemptedBody?.tool_choice).toBeUndefined();
+    expect(attemptedBody?.messages[0].tool_calls).toBeUndefined();
+    expect(attemptedBody?.messages[1]).toEqual({
+      role: "user",
+      content: "[Tool result from read_file]: file contents",
+    });
+  });
+
   test("uses the stage-specific OpenRouter agent chain before generic fallbacks", async () => {
     const seenChatModels: string[] = [];
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {

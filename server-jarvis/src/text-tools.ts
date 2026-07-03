@@ -341,6 +341,17 @@ export class VisibleAnswerStreamSanitizer {
   }
 }
 
+/**
+ * Choose the stream sanitizer by protocol, not by whether the stage is the
+ * final answer. Non-tool planner/reviewer activity can hallucinate the same
+ * bare tool JSON as a synthesizer and must be cleaned before it reaches SSE.
+ */
+export function createStageStreamSanitizer(useTextTools: boolean): TextToolCallStreamSanitizer | VisibleAnswerStreamSanitizer {
+  return useTextTools
+    ? new TextToolCallStreamSanitizer()
+    : new VisibleAnswerStreamSanitizer();
+}
+
 export async function executeTextToolCall(
   call: ToolCall,
   cfg: JarvisConfig,

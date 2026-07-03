@@ -108,6 +108,9 @@ if ($SkipDeploy) {
 
 Write-Step "Stage 4/4 - Deploying to $desktop"
 if (-not (Test-Path $desktop)) { Die "OneDrive Desktop not found: $desktop" }
+if (-not (Test-Path $promptsSrc -PathType Container)) {
+    Die "Jarvis prompt source not found: $promptsSrc"
+}
 
 # Release file locks: stop the running app and any Bun server bound to 19877
 # (the deployed bundle locks <Desktop>\index.js while running).

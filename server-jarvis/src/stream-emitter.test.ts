@@ -97,10 +97,39 @@ describe("StreamSession terminal guarantee", () => {
     expect(events.filter((e) => e.type === "message_stop").length).toBe(1);
   });
 
+  test("ensureTerminal emits an error outcome when a path ends without any outcome", async () => {
+    const rec = recorder();
+    const session = new StreamSession({ sessionId: "s6-missing", write: rec.write, isAborted: () => false });
+
+    await session.ensureTerminal();
+
+    const events = rec.events();
+    const outcomes = events.filter((e) => ["result", "error", "cancelled"].includes(e.type));
+    expect(outcomes.length).toBe(1);
+    expect(outcomes[0]).toMatchObject({
+      type: "error",
+      code: "stream_ended_without_outcome",
+      session_id: "s6-missing",
+    });
+    expect(events.filter((e) => e.type === "message_stop").length).toBe(1);
+  });
+
+  test("late outcome attempts cannot create a second terminal outcome", async () => {
+    const rec = recorder();
+    const session = new StreamSession({ sessionId: "s6-dedupe", write: rec.write, isAborted: () => false });
+
+    await session.finish("the answer");
+    await session.error("too late");
+    await session.ensureTerminal();
+
+    const outcomes = rec.events().filter((e) => ["result", "error", "cancelled"].includes(e.type));
+    expect(outcomes.length).toBe(1);
+    expect(outcomes[0]).toMatchObject({ type: "result", result: "the answer" });
+  });
   test("ensureTerminal is a no-op once finish has terminated the stream", async () => {
     const rec = recorder();
     const session = new StreamSession({ sessionId: "s7", write: rec.write, isAborted: () => false });
-    await session.finish();
+    await session.finish("done");
     await session.ensureTerminal();
     expect(rec.events().filter((e) => e.type === "message_stop").length).toBe(1);
   });
@@ -113,11 +142,13 @@ describe("StreamSession terminal guarantee", () => {
     expect(session.hasTerminated()).toBe(true);
   });
 
-  test("noteTerminal prevents a duplicate terminator for externally-emitted stops", async () => {
+  test("an external message_stop does not suppress the missing-outcome error", async () => {
     const rec = recorder();
     const session = new StreamSession({ sessionId: "s9", write: rec.write, isAborted: () => false });
-    session.noteTerminal(); // e.g. a forwarded CLI message_stop
+    session.noteTerminal(); // e.g. a forwarded CLI message_stop, which is transport-only
     await session.ensureTerminal();
-    expect(rec.events().length).toBe(0);
+    const events = rec.events();
+    expect(events.filter((e) => e.type === "message_stop").length).toBe(0);
+    expect(events.filter((e) => e.type === "error").length).toBe(1);
   });
 });

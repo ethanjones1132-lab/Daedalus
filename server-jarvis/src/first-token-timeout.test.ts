@@ -126,7 +126,8 @@ describe("first-token timeout abort domain (P0-B)", () => {
     // frame and one `message_stop` terminator.
     let caught: StreamCancelledError | null = null;
     try {
-      if (!session.hasTerminated()) {
+      if (!session.hasOutcome()) {
+        session.noteOutcome();
         session.noteTerminal();
         await rec.write(`data: ${JSON.stringify({ type: "cancelled", session_id: "sess-cancel-1" })}\n\n`);
       }

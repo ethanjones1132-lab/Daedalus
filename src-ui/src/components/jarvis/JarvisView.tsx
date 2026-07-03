@@ -11,6 +11,23 @@ import {
 import ControlCenterView from './ControlCenterView';
 import MarkdownView from './MarkdownView';
 import {
+  createUnknownFrameReporter,
+  InactivityWatchdog,
+  isPassiveSseFrame,
+  parseSseDataLine,
+  readToolResultTruncation,
+  type ToolResultTruncationMetadata,
+} from './sse-protocol';
+import {
+  SendGate,
+  finalizeStreamingMessages,
+  mergeToolResult,
+  recoverComposerAfterFailure,
+  sanitizeAssistantDisplay,
+  shouldSubmitComposerKey,
+  type ToolCallState,
+} from './chat-state';
+import {
   Send, Square, Bot, User, Wrench, Check, Copy, ChevronDown,
   ChevronRight, Sparkles, LoaderCircle, Plus, ArrowDown,
 } from 'lucide-react';
@@ -32,6 +49,7 @@ const sessionInvokeArgs = (sessionId: string) => ({
 });
 
 const JARVIS_API_URL = 'http://127.0.0.1:19877';
+const STREAM_INACTIVITY_TIMEOUT_MS = 90_000;
 
 export default function JarvisView({ initialSubView = 'chat', onCompanionChange }: JarvisViewProps) {
   const [subView, setSubView] = useState<JarvisSubView>(initialSubView);
@@ -312,7 +330,7 @@ const CURATED_SUGGESTIONS: string[] = [
   'Apply this to my code',
 ];
 
-function ChatPanel({
+export function ChatPanel({
   activeSession, setActiveSession, config, backendLabel, modelLabel, onSessionCreated,
 }: {
   activeSession: string | null;
@@ -348,14 +366,7 @@ function ChatPanel({
   const [approvalError, setApprovalError] = useState<string | null>(null);
 
   // Phase 3.1 — inline tool-call cards built from `tool_use` / `tool_result`.
-  const [toolCalls, setToolCalls] = useState<{
-    call_id?: string;
-    name: string;
-    arguments: unknown;
-    result?: string;
-    is_error?: boolean;
-    matched?: boolean;
-  }[]>([]);
+  const [toolCalls, setToolCalls] = useState<ToolCallState[]>([]);
 
   // Phase 3.3 — token / cost tally for the current turn.
   const [turnCost, setTurnCost] = useState<{ tokens: number; costUsd: number } | null>(null);
@@ -377,6 +388,8 @@ function ChatPanel({
   const sessionIdRef = useRef(sessionId);
   const onSessionCreatedRef = useRef(onSessionCreated);
   const streamAbortRef = useRef<AbortController | null>(null);
+  const sendGateRef = useRef(new SendGate());
+  const stopRequestedRef = useRef(false);
   useEffect(() => { activeSessionRef.current = activeSession; }, [activeSession]);
   useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
   useEffect(() => { onSessionCreatedRef.current = onSessionCreated; }, [onSessionCreated]);
@@ -410,16 +423,17 @@ function ChatPanel({
     const effectiveSid = sid || activeSessionRef.current || sessionIdRef.current;
     setMessages(prev => {
       const last = prev[prev.length - 1];
-      if (last && last.isStreaming) {
-        const finalized = { ...last, isStreaming: false };
-        if (effectiveSid && finalized.content.trim()) {
+      const finalizedMessages = finalizeStreamingMessages(prev);
+      const finalized = finalizedMessages[finalizedMessages.length - 1];
+      if (last?.role === 'assistant' && last.isStreaming) {
+        if (effectiveSid && finalized?.role === 'assistant' && finalized.content.trim()) {
           invoke('append_message', {
             ...sessionInvokeArgs(effectiveSid),
             role: 'assistant',
             content: finalized.content,
           }).catch((e) => console.error('Failed to persist assistant message:', e));
         }
-        return [...prev.slice(0, -1), finalized];
+        return finalizedMessages;
       }
       return prev;
     });
@@ -477,9 +491,22 @@ function ChatPanel({
   const suppressHistoryLoadRef = useRef<string | null>(null);
   useEffect(() => {
     const prev = prevActiveSessionRef.current;
+    if (suppressHistoryLoadRef.current && suppressHistoryLoadRef.current === activeSession) {
+      // Freshly created by handleSend: preserve its optimistic turn and make
+      // this Session the new comparison baseline without invalidating the send.
+      prevActiveSessionRef.current = activeSession;
+      suppressHistoryLoadRef.current = null;
+      setLoadingHistory(false);
+      return;
+    }
     prevActiveSessionRef.current = activeSession;
-    if (prev && prev !== activeSession) {
-      invoke('cancel_chat_stream', sessionInvokeArgs(prev)).catch(() => {});
+    if (prev !== activeSession) {
+      if (prev) invoke('cancel_chat_stream', sessionInvokeArgs(prev)).catch(() => {});
+      streamAbortRef.current?.abort('Session switched');
+      streamAbortRef.current = null;
+      sendGateRef.current.invalidate();
+      stopRequestedRef.current = false;
+      setMessages([]);
       setIsStreaming(false);
       setPipelineStage('');
       setRecursionDepth(null);
@@ -503,14 +530,6 @@ function ChatPanel({
       setReasoningText('');
       setAgentSteps([]);
       setIsStreaming(false);
-      return;
-    }
-    if (suppressHistoryLoadRef.current && suppressHistoryLoadRef.current === activeSession) {
-      // Freshly created by handleSend — the optimistic messages are already on
-      // screen and the stream is in flight. Loading empty history would wipe
-      // them. Consume the suppression once and leave the messages intact.
-      suppressHistoryLoadRef.current = null;
-      setLoadingHistory(false);
       return;
     }
     let cancelled = false;
@@ -666,20 +685,12 @@ function ChatPanel({
     }>('jarvis://tool_result', (event) => {
       if (!matchesStreamSession(event.payload.session_id)) return;
       const { call_id, name, output, is_error } = event.payload;
-      setToolCalls(prev => {
-        const idx = [...prev].reverse().findIndex((c) => {
-          if (c.result !== undefined) return false;
-          if (call_id && c.call_id) return c.call_id === call_id;
-          return c.name === name;
-        });
-        if (idx >= 0) {
-          const real = prev.length - 1 - idx;
-          const next = [...prev];
-          next[real] = { ...next[real], result: output, is_error, matched: true };
-          return next;
-        }
-        return [...prev, { name, arguments: null, result: output, is_error }];
-      });
+      setToolCalls(prev => mergeToolResult(prev, {
+        callId: call_id,
+        name,
+        output,
+        isError: is_error,
+      }));
     }));
 
     track(listen<{ tokens: number; cost_usd: number; session_id?: string }>('jarvis://cost', (event) => {
@@ -706,12 +717,14 @@ function ChatPanel({
   useEffect(() => {
     const t = setTimeout(() => inputRef.current?.focus(), 50);
     return () => clearTimeout(t);
-  }, [activeSession, isStreaming]);
+  }, [activeSession]);
 
   const streamFromJarvisApi = useCallback(async (
     sid: string,
     userMsg: string,
     history: Array<{ role: string; content: string }>,
+    sendGeneration: number,
+    onAccepted: () => void,
   ) => {
     streamAbortRef.current?.abort();
     const controller = new AbortController();
@@ -742,17 +755,35 @@ function ChatPanel({
     if (!response.body) {
       throw new Error('Jarvis server returned no response stream.');
     }
+    if (!sendGateRef.current.isCurrent(sendGeneration)) {
+      controller.abort('Stale Session turn');
+      throw new DOMException('Stale Session turn', 'AbortError');
+    }
+    onAccepted();
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
     let streamedVisibleText = false;
+    let streamedRawText = '';
+    let inactivityTimedOut = false;
+    const reportUnknownFrame = createUnknownFrameReporter();
+    const inactivityWatchdog = new InactivityWatchdog(
+      STREAM_INACTIVITY_TIMEOUT_MS,
+      () => {
+        inactivityTimedOut = true;
+        controller.abort('Jarvis stream inactivity timeout');
+        reader.cancel('Jarvis stream inactivity timeout').catch(() => {});
+      },
+    );
 
     const handleFrame = (frame: any) => {
+      if (!sendGateRef.current.isCurrent(sendGeneration)) return;
       if (!frame || typeof frame !== 'object') return;
       if (frame.type === 'stream_event' && frame.delta?.text) {
         const text = String(frame.delta.text);
-        if (/\S/.test(text)) streamedVisibleText = true;
+        streamedRawText += text;
+        streamedVisibleText = /\S/.test(sanitizeAssistantDisplay(streamedRawText));
         appendAssistantText(text);
         return;
       }
@@ -794,7 +825,7 @@ function ChatPanel({
         setToolCalls(prev => [...prev, {
           call_id: frame.id || frame.call_id,
           name: frame.name || frame.tool_name || 'unknown',
-          arguments: frame.arguments ?? null,
+          arguments: frame.arguments ?? frame.input ?? null,
         }]);
         return;
       }
@@ -803,20 +834,14 @@ function ChatPanel({
         const name = frame.name || 'tool';
         const output = String(frame.output ?? frame.result ?? '');
         const isError = Boolean(frame.is_error || frame.status === 'error');
-        setToolCalls(prev => {
-          const idx = [...prev].reverse().findIndex((c) => {
-            if (c.result !== undefined) return false;
-            if (callId && c.call_id) return c.call_id === callId;
-            return c.name === name;
-          });
-          if (idx >= 0) {
-            const real = prev.length - 1 - idx;
-            const next = [...prev];
-            next[real] = { ...next[real], result: output, is_error: isError, matched: true };
-            return next;
-          }
-          return [...prev, { name, arguments: null, result: output, is_error: isError }];
-        });
+        const contextTruncation = readToolResultTruncation(frame);
+        setToolCalls(prev => mergeToolResult(prev, {
+          callId,
+          name,
+          output,
+          isError,
+          contextTruncation: contextTruncation ?? undefined,
+        }));
         return;
       }
       if (frame.type === 'cost_info') {
@@ -826,10 +851,18 @@ function ChatPanel({
         });
         return;
       }
-      if (frame.type === 'result' && !streamedVisibleText) {
+      if (frame.type === 'fallback_notice') {
+        const target = String(frame.model || frame.provider || 'next available backend');
+        setPipelineStage(`fallback → ${target}`);
+        return;
+      }
+      if (isPassiveSseFrame(frame.type)) return;
+      if (frame.type === 'result') {
         if (frame.is_error) throw new Error(String(frame.result || frame.error || 'Jarvis stream failed.'));
-        const text = String(frame.result || '');
-        if (text) appendAssistantText(text);
+        if (!streamedVisibleText) {
+          const text = String(frame.result || '');
+          if (text) appendAssistantText(text);
+        }
         return;
       }
       if (frame.type === 'error') {
@@ -856,21 +889,10 @@ function ChatPanel({
         // visible. Now we mark the stream as intentionally stopped, clear
         // the streaming indicator, and surface a non-error "(stopped)"
         // notice so the user knows the turn ended because they asked.
-        if (streamAbortRef.current) streamAbortRef.current.abort();
         setIsStreaming(false);
+        stopRequestedRef.current = false;
         setError(null);
-        setMessages(prev => {
-          const last = prev[prev.length - 1];
-          if (last?.role === 'assistant' && last.isStreaming) {
-            if (!last.content.trim()) {
-              // User stopped before any text streamed — drop the
-              // empty bubble entirely instead of leaving a blank row.
-              return prev.slice(0, -1);
-            }
-            return [...prev.slice(0, -1), { ...last, isStreaming: false }];
-          }
-          return prev;
-        });
+        setMessages(prev => finalizeStreamingMessages(prev));
         return;
       }
       // P0-I (2026-07-02): unknown / unhandled frame types used to be
@@ -880,45 +902,53 @@ function ChatPanel({
       // that re-introduces a "hung model emits cancelled" path will
       // surface here as a `cancelled` log if a handler is later added.)
       if (typeof frame.type === 'string') {
-        // Avoid spamming: use a Set on the function instance to dedupe.
-        if (!(handleFrame as any)._seenTypes) (handleFrame as any)._seenTypes = new Set<string>();
-        const seen = (handleFrame as any)._seenTypes as Set<string>;
-        if (!seen.has(frame.type)) {
-          seen.add(frame.type);
-          // eslint-disable-next-line no-console
-          console.warn(`[Jarvis] unknown SSE frame type: ${frame.type}`);
-        }
+        reportUnknownFrame(frame.type);
       }
     };
 
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const events = buffer.split('\n\n');
-      buffer = events.pop() ?? '';
-      for (const eventText of events) {
-        for (const line of eventText.split('\n')) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith('data:')) continue;
-          const data = trimmed.slice(5).trim();
-          if (!data || data === '[DONE]') continue;
-          handleFrame(JSON.parse(data));
+    inactivityWatchdog.start();
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split('\n\n');
+        buffer = events.pop() ?? '';
+        for (const eventText of events) {
+          for (const line of eventText.split('\n')) {
+            const frame = parseSseDataLine(line);
+            if (frame) {
+              inactivityWatchdog.touch();
+              handleFrame(frame);
+            }
+          }
         }
       }
+    } catch (error) {
+      if (inactivityTimedOut) {
+        throw new Error(`Jarvis stream was inactive for ${STREAM_INACTIVITY_TIMEOUT_MS / 1000} seconds.`);
+      }
+      throw error;
+    } finally {
+      inactivityWatchdog.stop();
+    }
+    if (inactivityTimedOut) {
+      throw new Error(`Jarvis stream was inactive for ${STREAM_INACTIVITY_TIMEOUT_MS / 1000} seconds.`);
     }
 
-    finalizeAssistantMessage(sid);
-    streamAbortRef.current = null;
+    if (sendGateRef.current.isCurrent(sendGeneration)) finalizeAssistantMessage(sid);
+    if (streamAbortRef.current === controller) streamAbortRef.current = null;
   }, [appendAssistantText, finalizeAssistantMessage]);
 
   const handleSend = useCallback(async () => {
     if (!input.trim() || isStreaming) return;
+    const sendGeneration = sendGateRef.current.tryAcquire();
+    if (sendGeneration === null) return;
+    stopRequestedRef.current = false;
     const userMsg = input.trim();
     const history = messages
       .filter((msg) => !msg.isStreaming && msg.content.trim())
       .map((msg) => ({ role: msg.role, content: msg.content }));
-    setInput('');
     setError(null);
     setIsStreaming(true);
     setPipelineStage('');
@@ -936,8 +966,8 @@ function ChatPanel({
       { role: 'assistant', content: '', isStreaming: true },
     ]);
 
+    let effectiveSessionId = activeSession || sessionId;
     try {
-      let effectiveSessionId = activeSession || sessionId;
       if (!effectiveSessionId) {
         const newSession = await invoke<JarvisSession>('jarvis_new_session', {
           name: userMsg.slice(0, 60),
@@ -952,11 +982,21 @@ function ChatPanel({
         onSessionCreated();
       }
 
-      await streamFromJarvisApi(effectiveSessionId, userMsg, history);
+      await streamFromJarvisApi(effectiveSessionId, userMsg, history, sendGeneration, () => {
+        setInput(current => current.trim() === userMsg ? '' : current);
+      });
     } catch (e) {
+      if (!sendGateRef.current.isCurrent(sendGeneration)) return;
       streamAbortRef.current = null;
       setIsStreaming(false);
+      if (stopRequestedRef.current) {
+        stopRequestedRef.current = false;
+        setError(null);
+        setMessages(prev => finalizeStreamingMessages(prev));
+        return;
+      }
       setError(String(e));
+      setInput(current => recoverComposerAfterFailure(current, userMsg));
       setMessages(prev => {
         const last = prev[prev.length - 1];
         if (last?.role === 'assistant' && last.isStreaming) {
@@ -965,8 +1005,10 @@ function ChatPanel({
           }
           return [...prev.slice(0, -1), { ...last, isStreaming: false }];
         }
-        return prev;
-      });
+          return prev;
+        });
+    } finally {
+      sendGateRef.current.release(sendGeneration);
     }
   }, [input, isStreaming, messages, activeSession, sessionId, onSessionCreated, setActiveSession, streamFromJarvisApi]);
 
@@ -978,8 +1020,11 @@ function ChatPanel({
       setIsStreaming(false);
       return;
     }
+    stopRequestedRef.current = true;
     streamAbortRef.current?.abort();
     streamAbortRef.current = null;
+    setReasoningText('');
+    setShowReasoning(false);
     fetch(`${JARVIS_API_URL}/chat/cancel`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1014,7 +1059,13 @@ function ChatPanel({
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     // Enter sends; Shift+Enter / Ctrl+Enter / Cmd+Enter → newline.
-    if (e.key === 'Enter' && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
+    if (shouldSubmitComposerKey({
+      key: e.key,
+      shiftKey: e.shiftKey,
+      metaKey: e.metaKey,
+      ctrlKey: e.ctrlKey,
+      isComposing: e.nativeEvent.isComposing,
+    })) {
       e.preventDefault();
       handleSend();
       return;
@@ -1037,6 +1088,10 @@ function ChatPanel({
     if (isStreaming && sid) {
       invoke('cancel_chat_stream', sessionInvokeArgs(sid)).catch(() => {});
     }
+    streamAbortRef.current?.abort('New Session');
+    streamAbortRef.current = null;
+    sendGateRef.current.invalidate();
+    stopRequestedRef.current = false;
     setIsStreaming(false);
     setMessages([]);
     setSessionId('');
@@ -1072,7 +1127,9 @@ function ChatPanel({
     isStreaming &&
     !loadingHistory &&
     (messages.length === 0 ||
-      (lastAssistant && lastAssistant.role !== 'assistant' && !lastAssistant.isStreaming));
+      !lastAssistant ||
+      lastAssistant.role !== 'assistant' ||
+      !sanitizeAssistantDisplay(lastAssistant.content));
 
   const lastAssistantFinished =
     messages.length > 0 &&
@@ -1188,7 +1245,7 @@ function ChatPanel({
             message={msg}
             index={i}
             prefersReducedMotion={prefersReducedMotion.current}
-            streamStatus={msg.isStreaming && !msg.content.trim() ? streamStatusText : undefined}
+            streamStatus={msg.isStreaming && !msg.content.trim() && !showSkeleton ? streamStatusText : undefined}
           />
         ))}
 
@@ -1271,6 +1328,7 @@ function ChatPanel({
             animate={{ opacity: 1, y: 0 }}
             className="p-3 bg-error/10 border border-error/30 rounded-xl"
             role="alert"
+            aria-live="assertive"
           >
             <p className="text-error text-xs font-mono break-words">{error}</p>
           </motion.div>
@@ -1422,17 +1480,22 @@ function ChatMessage({
 }) {
   const isUser = message.role === 'user';
   const isTool = message.role === 'tool';
+  const displayContent = isUser || isTool
+    ? message.content
+    : sanitizeAssistantDisplay(message.content);
   const [copied, setCopied] = useState(false);
 
   const handleCopy = useCallback(async () => {
     try {
-      await navigator.clipboard.writeText(message.content);
+      await navigator.clipboard.writeText(displayContent);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch (e) {
       console.error('Failed to copy:', e);
     }
-  }, [message.content]);
+  }, [displayContent]);
+
+  if (!isUser && !isTool && !displayContent && !streamStatus) return null;
 
   return (
     <motion.div
@@ -1487,10 +1550,10 @@ function ChatMessage({
         isUser ? 'text-bone' : isTool ? 'text-bone-dim' : 'text-bone-muted'
       )}>
         {isUser || isTool
-          ? message.content
+          ? displayContent
           : streamStatus
             ? <span className="text-bone-faint font-mono text-xs">{streamStatus}</span>
-            : <MarkdownView content={message.content} />}
+            : <MarkdownView content={displayContent} />}
         {message.isStreaming && (
           <motion.span
             className="inline-block w-1.5 h-3.5 bg-cyan-neon/70 ml-0.5 align-middle rounded-sm"
@@ -1509,7 +1572,14 @@ function ChatMessage({
 // ═══════════════════════════════════════════════════════════════
 
 function ToolCallCard({ call }: {
-  call: { name: string; arguments: unknown; result?: string; is_error?: boolean; matched?: boolean };
+  call: {
+    name: string;
+    arguments: unknown;
+    result?: string;
+    is_error?: boolean;
+    matched?: boolean;
+    contextTruncation?: ToolResultTruncationMetadata;
+  };
 }) {
   const [open, setOpen] = useState(false);
   const argText = (() => {
@@ -1542,6 +1612,7 @@ function ToolCallCard({ call }: {
         )}
         {call.is_error && <Pill variant="error">error</Pill>}
         {call.result !== undefined && !call.is_error && <Pill variant="success">done</Pill>}
+        {call.contextTruncation && <Pill variant="warning">context trimmed</Pill>}
         <span className="ml-auto opacity-70">{open ? <ChevronDown size={10} /> : <ChevronRight size={10} />}</span>
       </button>
       <AnimatePresence initial={false}>
@@ -1562,6 +1633,11 @@ function ToolCallCard({ call }: {
             {call.result !== undefined && (
               <div>
                 <div className="text-[9px] font-mono uppercase tracking-widest text-bone-faint mb-0.5">{call.is_error ? 'Error' : 'Result'}</div>
+                {call.contextTruncation && (
+                  <div className="mb-1 text-[9px] font-mono text-amber-300/80">
+                    Full result shown here; inference context retained {call.contextTruncation.retained_chars.toLocaleString()} of {call.contextTruncation.original_chars.toLocaleString()} characters.
+                  </div>
+                )}
                 <pre className={cn('text-[10px] font-mono whitespace-pre-wrap break-words bg-void/40 rounded p-2 max-h-48 overflow-y-auto', call.is_error ? 'text-error' : 'text-bone-dim')}>{call.result}</pre>
               </div>
             )}

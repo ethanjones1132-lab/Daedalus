@@ -42,6 +42,16 @@ describe("normalizeRoute", () => {
     expect(r.profile).toBe("read_only");
   });
 
+  test("workspace_read: planner and reviewer are stripped to the minimal read route", () => {
+    const r = normalizeRoute(
+      decision(["planner", "executor", "reviewer", "synthesizer"]),
+      "workspace_read",
+      "model",
+    );
+    expect(r.pipeline).toEqual(["executor", "synthesizer"]);
+    expect(r.profile).toBe("read_only");
+  });
+
   test("full_execution: ensures a reviewed executor route with full profile", () => {
     const r = normalizeRoute(decision(["executor", "synthesizer"]), "full_execution", "model");
     expect(r.pipeline).toEqual(["executor", "reviewer", "synthesizer"]);

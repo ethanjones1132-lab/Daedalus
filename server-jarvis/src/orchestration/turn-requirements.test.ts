@@ -70,6 +70,53 @@ describe("classifyTurnRequirements", () => {
     expect(r.requirement).toBe("full_execution");
   });
 
+  test("negated mutation verbs keep explicit workspace probes read-only", () => {
+    for (const message of [
+      "Do not modify any files; read README.md and report what it says.",
+      "Don't edit or delete anything. Inspect this repo only.",
+      "Never run commands; just review src/app.ts.",
+      "Don\u2019t update anything; inspect package.json.",
+      "Inspect this codebase without modifying files.",
+      "Review this repository without writing files.",
+      "No modifications, edits, or changes; summarize the repository.",
+    ]) {
+      const result = classifyTurnRequirements(message);
+      expect(result.requirement).toBe("workspace_read");
+      expect(result.signals).toContain("negated_mutation");
+      expect(result.signals).not.toContain("mutation_verb");
+    }
+  });
+
+  test("negated mutation without workspace cues stays answer_only", () => {
+    const result = classifyTurnRequirements("Do not run anything; explain TCP congestion control.");
+    expect(result.requirement).toBe("answer_only");
+    expect(result.signals).toContain("negated_mutation");
+  });
+
+  test("an unnegated mutation still wins when another mutation is negated", () => {
+    const result = classifyTurnRequirements("Do not edit README.md, but create CHANGELOG.md.");
+    expect(result.requirement).toBe("full_execution");
+    expect(result.signals).toContain("negated_mutation");
+    expect(result.signals).toContain("mutation_verb");
+  });
+
+  test("pasted tool JSON analyzed as an exemplar does not become workspace intent", () => {
+    const result = classifyTurnRequirements(
+      'Analyze only; do not run: {"name":"read_file","arguments":{"path":"C:\\Projects\\demo\\README.md"}}',
+    );
+    expect(result.requirement).toBe("answer_only");
+    expect(result.signals).toContain("tool_call_exemplar");
+    expect(result.signals.some((signal) => signal.startsWith("path:"))).toBe(false);
+  });
+
+  test("intent outside pasted tool JSON still controls authority", () => {
+    const exemplar = '{"name":"read_file","arguments":{"path":"C:\\Projects\\demo\\README.md"}}';
+    expect(classifyTurnRequirements(`Read the file described by this exemplar: ${exemplar}`).requirement)
+      .toBe("workspace_read");
+    expect(classifyTurnRequirements(`Run this exact tool call: ${exemplar}`).requirement)
+      .toBe("full_execution");
+  });
+
   test("classifies the raw message — history is the caller's responsibility", () => {
     // The classifier only sees what it is given; a follow-up greeting passed
     // alone is conversational even if a prior turn read files.

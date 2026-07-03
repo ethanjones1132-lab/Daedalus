@@ -1,5 +1,5 @@
 import { loadPrompt } from "./prompt-loader";
-import { BUILTIN_MODES, getToolsForMode } from "./modes";
+import { BUILTIN_MODES, executorTurnLimit, getToolsForMode } from "./modes";
 import type { ToolRuntime, ExecutionContext } from "../tool-runtime";
 import type { CallModelFn, ChatMessage } from "./router";
 import type { SharedContextHints, StageName, WorkerInstructions } from "./coordinator";
@@ -308,7 +308,7 @@ export class PipelineExecutor {
     const narratives: string[] = [];
     let turnCount = 0;
     let executorDone = false;
-    const maxTurns = BUILTIN_MODES.executor.max_turns;
+    const maxTurns = executorTurnLimit(profile);
     let executorTurn = 0;
 
     try {

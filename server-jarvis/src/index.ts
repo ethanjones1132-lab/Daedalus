@@ -48,12 +48,11 @@ const approvalRegistry = createApprovalRegistry();
 import type { ToolCall } from "./tool-types";
 import {
   buildTextToolInstructions,
+  createStageStreamSanitizer,
   extractTextToolCalls,
   hasExplicitWebSearchIntent,
   hasLocalWorkspaceToolIntent,
   isNativeToolProtocolUnsupportedError,
-  TextToolCallStreamSanitizer,
-  VisibleAnswerStreamSanitizer,
   textToolResultsPrompt,
   webSearchQueryFromPrompt,
 } from "./text-tools";
@@ -67,6 +66,19 @@ import { registerStandardBundles } from "./bundles-registry";
 import { searchWeb } from "./web-bundle";
 import { getSessionState, clearSessionState } from "./interactive-bundle";
 import { StreamSession, VisibleTextPipe } from "./stream-emitter";
+import {
+  createDisconnectAwareWrite,
+  ResettableWatchdog,
+  StreamIdleTimeoutError,
+  startSseHeartbeat,
+} from "./stream-liveness";
+import {
+  ActiveStreamRegistry,
+  createIdempotentReaderCancel,
+  registerAbortHandler,
+  resolveReadStopReason,
+} from "./stream-control";
+import { prepareToolResultForContext } from "./tool-result-truncation";
 import { Coordinator } from "./orchestration/coordinator";
 import { PersistentConductor } from "./orchestration/persistent-conductor";
 import { SessionMemory, mergeSharedContextHints } from "./orchestration/session-memory";
@@ -142,19 +154,21 @@ console.warn = (...args: any[]) => {
 };
 
 const MODEL_REQUEST_TIMEOUT_MS = 300_000;
-const MODEL_STREAM_STALL_TIMEOUT_MS = 60_000;
-const MODEL_STREAM_STALL_CHECK_MS = 5_000;
+const MODEL_INTER_TOKEN_TIMEOUT_MS = 60_000;
 // First-token watchdog. See chatCompletionWithFallback for the upstream
 // implementation. This constant governs the orchestrator-level defense
 // in depth that aborts the read loop if the response body is open but
-// no content token has arrived in MODEL_FIRST_TOKEN_TIMEOUT_MS. Capped
-// to 60s so it never exceeds the outer MODEL_STREAM_STALL_TIMEOUT_MS
-// (60s) — otherwise the stall watchdog would always fire first and the
-// first-token watchdog would be dead code.
+// no semantic content or tool delta has arrived in the configured window.
+// Once the first delta arrives, the separate inter-token watchdog takes over.
 const MODEL_FIRST_TOKEN_TIMEOUT_MS = 30_000;
+const SSE_HEARTBEAT_ENABLED = process.env.JARVIS_SSE_HEARTBEAT_ENABLED !== "0";
+const SSE_HEARTBEAT_INTERVAL_MS = Math.min(
+  60_000,
+  Math.max(5_000, Number(process.env.JARVIS_SSE_HEARTBEAT_INTERVAL_MS ?? 15_000) || 15_000),
+);
 const MAX_TOOL_RESULT_CHARS = 2000;  // Truncate tool results going back to model context
 const MAX_TOOL_EXECUTION_TURNS = 10;
-const activeStreamControllers = new Map<string, AbortController>();
+const activeStreams = new ActiveStreamRegistry();
 
 function visibleTextFromReasoningEvent(event: ReasoningEvent): string {
   switch (event.type) {
@@ -202,13 +216,6 @@ async function applyOutputMaxTokens(
 ): Promise<void> {
   const maxTokens = await resolveOutputMaxTokens(cfg, isOllama, modelName, messages, requested);
   if (maxTokens !== undefined) requestBody.max_tokens = maxTokens;
-}
-
-/** Truncate a tool result for model context. Keeps the beginning and end, with a marker. */
-function truncateToolResult(text: string): string {
-  if (text.length <= MAX_TOOL_RESULT_CHARS) return text;
-  const half = Math.floor(MAX_TOOL_RESULT_CHARS / 2) - 40;
-  return text.slice(0, half) + "\n\n[...truncated — " + (text.length - MAX_TOOL_RESULT_CHARS) + " chars removed. Use read_file for full content...]\n\n" + text.slice(-half);
 }
 
 /**
@@ -1041,14 +1048,29 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       return msg;
     });
   const { readable, writable } = new TransformStream();
-  const writer = writable.getWriter();
+  const rawWriter = writable.getWriter();
   const encoder = new TextEncoder();
   totalRequests++;
   let _turnStart = Date.now();
 
   (async () => {
-    const streamAbort = new AbortController();
-    activeStreamControllers.set(sessionId, streamAbort);
+    // One turn-wide domain is reserved for user Stop, client disconnect, and
+    // supersession by a newer turn in the same Session. Model attempt timeouts
+    // stay stage-local and must never abort this controller.
+    const streamLease = activeStreams.begin(sessionId);
+    const streamAbort = streamLease.controller;
+    let clientDisconnected = false;
+    const writeBytes = createDisconnectAwareWrite(
+      (chunk) => rawWriter.write(chunk),
+      () => {
+        clientDisconnected = true;
+        if (!streamAbort.signal.aborted) streamAbort.abort("Client disconnected");
+      },
+    );
+    const writer = {
+      write: writeBytes,
+      close: () => rawWriter.close(),
+    };
     const streamWrite = async (frame: string): Promise<boolean> => {
       try {
         await writer.write(encoder.encode(frame));
@@ -1063,12 +1085,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       isAborted: () => streamAbort.signal.aborted,
     });
     const emitCancelled = async (): Promise<never> => {
-      if (!session.hasTerminated()) {
+      if (clientDisconnected) throw new StreamCancelledError();
+      if (session.noteOutcome()) {
         session.noteTerminal();
         await streamWrite(`data: ${JSON.stringify({ type: "cancelled", session_id: sessionId })}\n\n`);
       }
       throw new StreamCancelledError();
     };
+    const stopHeartbeat = SSE_HEARTBEAT_ENABLED
+      ? startSseHeartbeat(sessionId, SSE_HEARTBEAT_INTERVAL_MS, streamWrite)
+      : () => {};
     // Hoisted so the catch block can include them in error-path recordInference calls.
     // let-in-try is block-scoped and invisible to catch; declare here then reinitialize in the Ollama/OpenRouter path.
     let sessionCostInfo: OpenRouterCostInfo | null = null;
@@ -1172,7 +1198,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             if (resumedSessionId) {
               cliSessionMap.delete(sessionId);
             }
-            await writer.write(encoder.encode(`data: ${JSON.stringify({ ...evt, session_id: sessionId })}\n\n`));
+            if (session.noteOutcome()) {
+              await writer.write(encoder.encode(`data: ${JSON.stringify({ ...evt, session_id: sessionId })}\n\n`));
+            }
           } else if (evt.type === "result") {
             if (evt.session_id) {
               cliSessionMap.set(sessionId, evt.session_id);
@@ -1192,7 +1220,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               const trace = reasoningParser.finalize();
               await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_complete", trace, session_id: sessionId })}\n\n`));
             }
-            await writer.write(encoder.encode(`data: ${JSON.stringify({ ...evt, session_id: sessionId })}\n\n`));
+            if (session.noteOutcome()) {
+              await writer.write(encoder.encode(`data: ${JSON.stringify({ ...evt, session_id: sessionId })}\n\n`));
+            }
           }
         }
         return;
@@ -1414,8 +1444,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const requestTimeout = isOllama ? MODEL_REQUEST_TIMEOUT_MS : (cfg.openrouter.timeout_ms || MODEL_REQUEST_TIMEOUT_MS);
           const ctrl = new AbortController();
           const timeout = setTimeout(() => ctrl.abort(), requestTimeout);
-          const onStreamAbort = () => ctrl.abort();
-          streamAbort.signal.addEventListener("abort", onStreamAbort);
+          const cleanupRequestAbort = registerAbortHandler(streamAbort.signal, () => ctrl.abort());
 
           let fetchRes: Response;
           let actualModelUsed = modelName;
@@ -1440,7 +1469,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
           } catch (fetchErr: any) {
             clearTimeout(timeout);
-            streamAbort.signal.removeEventListener("abort", onStreamAbort);
+            cleanupRequestAbort();
             if (fetchErr.name === "AbortError") {
               if (streamAbort.signal.aborted) {
                 await emitCancelled();
@@ -1456,23 +1485,27 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           if (!fetchRes.ok) {
             const errText = await fetchRes.text();
             clearTimeout(timeout);
-            streamAbort.signal.removeEventListener("abort", onStreamAbort);
+            cleanupRequestAbort();
             throw new Error(`API ${fetchRes.status}: ${errText.slice(0, 300)}`);
           }
           clearTimeout(timeout);
 
           const reader = fetchRes.body?.getReader();
           if (!reader) {
-            streamAbort.signal.removeEventListener("abort", onStreamAbort);
+            cleanupRequestAbort();
             throw new Error("No response body from API");
           }
+          cleanupRequestAbort();
+          const cancelReader = createIdempotentReaderCancel(reader);
+          const cleanupReaderAbort = registerAbortHandler(streamAbort.signal, () => {
+            void cancelReader("Session turn cancelled");
+          });
 
           const reasoningParser = new ReasoningParser(sessionId);
           const decoder = new TextDecoder();
           let buffer = "";
           let fullTurnText = "";
           let activeToolCalls: any[] = [];
-          let lastActivity = Date.now();
           let firstTokenReceived = false;
           // Defense-in-depth: in case the request bypassed the
           // First-token watchdog (orchestrator). If the response body is open
@@ -1510,13 +1543,29 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             if (!firstTokenReceived && !streamAbort.signal.aborted) {
               firstTokenTimeoutFired = true;
               console.warn(`[Jarvis Orchestrator] First-token timeout (${firstTokenMs / 1000}s) on stage=${callOptions?.stageLabel ?? "agent"} model=${actualModelUsed} — aborting stream`);
-              reader.cancel("First-token timeout").catch(() => {});
+              cancelReader("First-token timeout").catch(() => {});
             }
           }, firstTokenMs);
-          const textStreamSanitizer =
-            !useTextTools && callOptions?.surfaceAsAnswer
-              ? new VisibleAnswerStreamSanitizer()
-              : new TextToolCallStreamSanitizer();
+          let streamIdleTimeoutFired = false;
+          const stageName = callOptions?.stageLabel ?? "agent";
+          const streamIdleWatchdog = new ResettableWatchdog(
+            MODEL_INTER_TOKEN_TIMEOUT_MS,
+            () => {
+              streamIdleTimeoutFired = true;
+              console.warn(`[Jarvis Orchestrator] Inter-token timeout (${MODEL_INTER_TOKEN_TIMEOUT_MS / 1000}s) on stage=${stageName} model=${actualModelUsed} — cancelling reader`);
+              cancelReader("Inter-token timeout").catch(() => {});
+            },
+          );
+          const markSemanticProgress = () => {
+            if (!firstTokenReceived) {
+              firstTokenReceived = true;
+              clearTimeout(firstTokenTimer);
+              streamIdleWatchdog.start();
+            } else {
+              streamIdleWatchdog.touch();
+            }
+          };
+          const textStreamSanitizer = createStageStreamSanitizer(Boolean(useTextTools));
           const emitTextToken = async (text: string) => {
             if (callOptions?.surfaceAsAnswer) {
               await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text }, session_id: sessionId })}\n\n`));
@@ -1530,23 +1579,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             if (streamAbort.signal.aborted) {
               await emitCancelled();
             }
-            // Stream stall watchdog: cancel the reader if the model stops
-            // sending bytes. Mirrors the Agent Loop's `MODEL_STREAM_STALL_*`
-            // constants — without it, a hung OpenRouter SSE stream blocks the
-            // whole stage until the outer 5-minute AbortController trips.
-            const chunkTimeout = setTimeout(() => {
-              if (Date.now() - lastActivity > MODEL_STREAM_STALL_TIMEOUT_MS) {
-                reader.cancel("Stream stalled").catch(() => {});
-              }
-            }, MODEL_STREAM_STALL_CHECK_MS);
-            let readResult: ReadableStreamReadResult<Uint8Array>;
-            try {
-              readResult = await reader.read();
-            } finally {
-              clearTimeout(chunkTimeout);
-            }
+            const readResult = await reader.read();
             const { done, value } = readResult;
-            if (done) break;
             // P0-B (2026-07-02): the first-token watchdog sets this flag
             // (and calls `reader.cancel()`) without touching `streamAbort`,
             // so a hung model is no longer conflated with user cancellation.
@@ -1556,10 +1590,19 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             // the turn. The outer `streamJarvis` catch block converts
             // this into an `error` SSE frame with
             // `code: "first_token_timeout"`.
-            if (firstTokenTimeoutFired) {
+            const stopReason = resolveReadStopReason({
+              firstTokenTimedOut: firstTokenTimeoutFired,
+              streamIdleTimedOut: streamIdleTimeoutFired,
+              signal: streamAbort.signal,
+            });
+            if (stopReason === "first_token_timeout") {
               throw new FirstTokenTimeoutError(actualModelUsed, callOptions?.stageLabel ?? "agent", firstTokenMs);
             }
-            lastActivity = Date.now();
+            if (stopReason === "stream_idle_timeout") {
+              throw new StreamIdleTimeoutError(actualModelUsed, stageName, MODEL_INTER_TOKEN_TIMEOUT_MS);
+            }
+            if (stopReason === "turn_cancelled") await emitCancelled();
+            if (done) break;
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split("\n");
             buffer = lines.pop() || "";
@@ -1573,7 +1616,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 const choice = parsed.choices?.[0];
                 if (!choice) continue;
 
-                if (choice.delta?.tool_calls) {
+                if (choice.delta?.tool_calls?.length) {
+                  markSemanticProgress();
                   for (const tc of choice.delta.tool_calls) {
                     const idx = tc.index ?? 0;
                     const active = ensureActiveToolCall(activeToolCalls, idx);
@@ -1587,10 +1631,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 if (chunkText) {
                   chunkText = chunkText.replace(/<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>|<\|im_sep\|>/g, "");
                   if (chunkText) {
-                    if (!firstTokenReceived) {
-                      firstTokenReceived = true;
-                      clearTimeout(firstTokenTimer);
-                    }
+                    markSemanticProgress();
                     fullTurnText += chunkText;
                     if (callOptions?.onChunk) {
                       callOptions.onChunk(chunkText);
@@ -1748,7 +1789,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             _provider: actualProviderUsed,
           };
           } finally {
-            streamAbort.signal.removeEventListener("abort", onStreamAbort);
+            clearTimeout(firstTokenTimer);
+            streamIdleWatchdog.stop();
+            cleanupReaderAbort();
+            cleanupRequestAbort();
           }
         };
 
@@ -2279,8 +2323,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const requestTimeout = isOllama ? MODEL_REQUEST_TIMEOUT_MS : (cfg.openrouter.timeout_ms || MODEL_REQUEST_TIMEOUT_MS);
         const ctrl = new AbortController();
         const timeout = setTimeout(() => ctrl.abort(), requestTimeout);
-        const onStreamAbortMain = () => ctrl.abort();
-        streamAbort.signal.addEventListener("abort", onStreamAbortMain);
+        const cleanupRequestAbort = registerAbortHandler(streamAbort.signal, () => ctrl.abort());
 
         let fetchRes: Response;
         let actualModelUsed = modelName;
@@ -2318,7 +2361,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }
         } catch (fetchErr: any) {
           clearTimeout(timeout);
-          streamAbort.signal.removeEventListener("abort", onStreamAbortMain);
+          cleanupRequestAbort();
           if (fetchErr.name === "AbortError") {
             if (streamAbort.signal.aborted) {
               await emitCancelled();
@@ -2336,6 +2379,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           clearTimeout(timeout);
           
           if (isNativeToolProtocolUnsupportedError(fetchRes.status, errText) && requestBody.tools) {
+            cleanupRequestAbort();
             console.warn(`[Jarvis] Model ${actualModelUsed} does not support native tools. Retrying without tools...`);
             delete requestBody.tools;
             useTextToolProtocol = true;
@@ -2348,27 +2392,27 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
             const retryCtrl = new AbortController();
             const retryTimeout = setTimeout(() => retryCtrl.abort(), requestTimeout);
-            const onRetryAbort = () => retryCtrl.abort();
-            streamAbort.signal.addEventListener("abort", onRetryAbort);
+            const cleanupRetryAbort = registerAbortHandler(streamAbort.signal, () => retryCtrl.abort());
             try {
               fetchRes = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(requestBody), signal: retryCtrl.signal });
               if (!fetchRes.ok) {
                 const retryErrText = await fetchRes.text();
                 clearTimeout(retryTimeout);
-                streamAbort.signal.removeEventListener("abort", onRetryAbort);
+                cleanupRetryAbort();
                 throw new Error(`API ${fetchRes.status}: ${retryErrText.slice(0, 300)}`);
               }
               clearTimeout(retryTimeout);
-              streamAbort.signal.removeEventListener("abort", onRetryAbort);
+              cleanupRetryAbort();
             } catch (retryErr: any) {
               clearTimeout(retryTimeout);
-              streamAbort.signal.removeEventListener("abort", onRetryAbort);
+              cleanupRetryAbort();
               if (retryErr.name === "AbortError" && streamAbort.signal.aborted) {
                 await emitCancelled();
               }
               throw retryErr;
             }
           } else {
+            cleanupRequestAbort();
             if (fetchRes.status === 404 && isOllama) throw new Error(`Model "${modelName}" not found in Ollama. Run: ollama pull ${modelName}`);
             if (fetchRes.status === 401) throw new Error(`Authentication failed. ${isOllama ? "Ollama accepts any key." : "Check your OpenRouter API key."}`);
             if (fetchRes.status === 429) throw new Error(`Rate limited by ${isOllama ? "Ollama" : "OpenRouter"}. ${useFallback ? "All fallback models also exhausted." : "Enable fallback models in settings."}`);
@@ -2378,14 +2422,20 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         }
 
         const reader = fetchRes.body?.getReader();
-        if (!reader) throw new Error("No response body from API");
-        streamAbort.signal.removeEventListener("abort", onStreamAbortMain);
+        if (!reader) {
+          cleanupRequestAbort();
+          throw new Error("No response body from API");
+        }
+        cleanupRequestAbort();
+        const cancelReader = createIdempotentReaderCancel(reader);
+        const cleanupReaderAbort = registerAbortHandler(streamAbort.signal, () => {
+          void cancelReader("Session turn cancelled");
+        });
 
         const textPipe = session.newTextPipe(cfg.reasoning.enabled);
         const decoder = new TextDecoder();
         let buffer = "";
         let turnText = "";
-        let lastActivity = Date.now();
         let firstTokenReceived = false;
         // Agent Loop first-token watchdog. The Agent Loop fetches
         // directly (bypassing chatCompletionWithFallback), so the
@@ -2423,9 +2473,27 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           if (!firstTokenReceived && !streamAbort.signal.aborted) {
             firstTokenTimeoutFired = true;
             console.warn(`[Jarvis Agent Loop] First-token timeout (${firstTokenMs / 1000}s) on model=${modelName} — aborting stream`);
-            reader.cancel("First-token timeout").catch(() => {});
+            cancelReader("First-token timeout").catch(() => {});
           }
         }, firstTokenMs);
+        let streamIdleTimeoutFired = false;
+        const streamIdleWatchdog = new ResettableWatchdog(
+          MODEL_INTER_TOKEN_TIMEOUT_MS,
+          () => {
+            streamIdleTimeoutFired = true;
+            console.warn(`[Jarvis Agent Loop] Inter-token timeout (${MODEL_INTER_TOKEN_TIMEOUT_MS / 1000}s) on model=${actualModelUsed} — cancelling reader`);
+            cancelReader("Inter-token timeout").catch(() => {});
+          },
+        );
+        const markSemanticProgress = () => {
+          if (!firstTokenReceived) {
+            firstTokenReceived = true;
+            clearTimeout(firstTokenTimer);
+            streamIdleWatchdog.start();
+          } else {
+            streamIdleWatchdog.touch();
+          }
+        };
         let activeToolCalls: any[] = [];
         const holdVisibleText = !forceFinalAnswerOnly
           && ((requiresVerifiedWebSearch && !verifiedWebSearchDone)
@@ -2443,26 +2511,26 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             if (streamAbort.signal.aborted) {
               await emitCancelled();
             }
-            const chunkTimeout = setTimeout(() => {
-              if (Date.now() - lastActivity > MODEL_STREAM_STALL_TIMEOUT_MS) reader.cancel("Stream stalled");
-            }, MODEL_STREAM_STALL_CHECK_MS);
-            let readResult: ReadableStreamReadResult<Uint8Array>;
-            try {
-              readResult = await reader.read();
-            } finally {
-              clearTimeout(chunkTimeout);
-            }
+            const readResult = await reader.read();
             const { done, value } = readResult;
-            if (done) break;
             // P0-B (2026-07-02): the first-token watchdog sets the flag
             // (and calls `reader.cancel()`) without touching `streamAbort`.
             // Check it here, after the cancelled `reader.read()` has
             // resolved, and surface the timeout as a structured error
             // instead of silently dropping the turn.
-            if (firstTokenTimeoutFired) {
+            const stopReason = resolveReadStopReason({
+              firstTokenTimedOut: firstTokenTimeoutFired,
+              streamIdleTimedOut: streamIdleTimeoutFired,
+              signal: streamAbort.signal,
+            });
+            if (stopReason === "first_token_timeout") {
               throw new FirstTokenTimeoutError(modelName, "agent_loop", firstTokenMs);
             }
-            lastActivity = Date.now();
+            if (stopReason === "stream_idle_timeout") {
+              throw new StreamIdleTimeoutError(actualModelUsed, "agent_loop", MODEL_INTER_TOKEN_TIMEOUT_MS);
+            }
+            if (stopReason === "turn_cancelled") await emitCancelled();
+            if (done) break;
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split("\n");
             buffer = lines.pop() || "";
@@ -2477,6 +2545,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 // Parse streaming tool calls
                 const toolCalls = json.choices?.[0]?.delta?.tool_calls;
                 if (toolCalls && toolCalls.length > 0) {
+                  markSemanticProgress();
                   for (const tc of toolCalls) {
                     const idx = tc.index ?? 0;
                     if (!activeToolCalls[idx]) {
@@ -2494,10 +2563,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                   // Strip ChatML leakage tokens
                   content = content.replace(/<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>|<\|im_sep\|>/g, "");
                   if (content) {
-                    if (!firstTokenReceived) {
-                      firstTokenReceived = true;
-                      clearTimeout(firstTokenTimer);
-                    }
+                    markSemanticProgress();
                     turnText += content;
                     fullText += content;
                     if (!holdVisibleText) await emitVisibleText(content);
@@ -2520,6 +2586,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         } finally {
           clearTimeout(timeout);
           clearTimeout(firstTokenTimer);
+          streamIdleWatchdog.stop();
+          cleanupReaderAbort();
+          cleanupRequestAbort();
         }
 
         // Filter activeToolCalls to only contain valid tool calls
@@ -2789,6 +2858,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               ctx,
             );
             const toolOutput = toolResult.is_error ? (toolResult.error || toolResult.output) : toolResult.output;
+            const preparedToolResult = prepareToolResultForContext(toolOutput, MAX_TOOL_RESULT_CHARS);
             toolExecutionCount++;
             if (tc.function.name === "web_search") verifiedWebSearchDone = true;
 
@@ -2799,6 +2869,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               name: tc.function.name,
               output: toolOutput,
               is_error: toolResult.is_error,
+              context_truncation: preparedToolResult.metadata.truncated
+                ? preparedToolResult.metadata
+                : undefined,
               session_id: sessionId
             })}\n\n`));
 
@@ -2806,7 +2879,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             activeHistory.push({
               role: "tool",
               tool_call_id: tc.id,
-              content: truncateToolResult(toolOutput)
+              content: preparedToolResult.context
             });
 
             // If the user was asked a question, stop the loop and wait for their response.
@@ -2845,11 +2918,20 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       // `cancelled` is reserved for genuine user / `/chat/cancel` aborts
       // (handled by `StreamCancelledError` above).
       const isFirstTokenTimeout = error?.name === "FirstTokenTimeoutError";
-      const errorCode = isFirstTokenTimeout ? "first_token_timeout" : undefined;
+      const isStreamIdleTimeout = error?.name === "StreamIdleTimeoutError";
+      const errorCode = isFirstTokenTimeout
+        ? "first_token_timeout"
+        : isStreamIdleTimeout
+          ? "stream_idle_timeout"
+          : undefined;
       const userFacingMsg = isFirstTokenTimeout
         ? `The model did not produce any output within the per-model first-token window. ` +
           `This usually means the model is loading, overloaded, or the configured backend is unreachable. ` +
           `Try again, or switch backend in Settings. (${error?.model ?? "unknown model"}, stage=${error?.stage ?? "unknown"}, window=${error?.windowMs ?? "?"}ms)`
+        : isStreamIdleTimeout
+          ? `The model stopped producing semantic output during the stream. ` +
+            `Jarvis ended the stalled attempt instead of waiting indefinitely. ` +
+            `Try again, or switch backend in Settings. (${error?.model ?? "unknown model"}, stage=${error?.stage ?? "unknown"}, window=${error?.windowMs ?? "?"}ms)`
         : errMsg;
       console.error(`[Jarvis] Stream error session=${sessionId} code=${errorCode ?? "<generic>"}:`, userFacingMsg);
       const _cfg3 = resolveConfig(options.config);
@@ -2875,10 +2957,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         fallback_model: lastFallbackModel,
       });
       try {
-        await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "error", error: userFacingMsg, code: errorCode, session_id: sessionId })}\n\n`));
+        await session.error(userFacingMsg, errorCode);
       } catch {}
     } finally {
-      activeStreamControllers.delete(sessionId);
+      stopHeartbeat();
+      streamLease.release();
       try {
         await session.ensureTerminal();
       } catch {}
@@ -3041,7 +3124,7 @@ async function checkStatus(configOverride?: Partial<JarvisConfig> | null) {
     jarvis_version: JARVIS_VERSION,
     uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
     total_requests: totalRequests,
-    active_sessions: activeStreamControllers.size,
+    active_sessions: activeStreams.size,
     active_backend: cfg.active_backend,
     backend: cfg.active_backend,
     model: cfg.active_backend === "openrouter" ? cfg.openrouter.model : cfg.ollama.model,
@@ -3216,10 +3299,7 @@ async function baseFetch(req: Request): Promise<Response> {
       const body = await req.json();
       const sid = body.session_id;
       if (!sid) return Response.json({ ok: false, error: "session_id required" }, { status: 400 });
-      const ctrl = activeStreamControllers.get(sid);
-      if (ctrl) {
-        ctrl.abort();
-        activeStreamControllers.delete(sid);
+      if (activeStreams.cancel(sid)) {
         console.log(`[Jarvis] Stream cancelled for session=${sid}`);
         return Response.json({ ok: true, cancelled: true });
       }

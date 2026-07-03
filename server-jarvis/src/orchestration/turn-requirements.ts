@@ -64,11 +64,64 @@ function detectPath(text: string): string | null {
   return null;
 }
 
+const TOOL_CALL_EXEMPLAR =
+  /<tool_call>[\s\S]*?<\/tool_call>|\{(?=[^{}\n]{0,200}"(?:name|tool)"\s*:)[\s\S]*?\}\s*\}?/gi;
+
+function maskToolCallExemplars(text: string): { text: string; found: boolean } {
+  let found = false;
+  const maskedText = text.replace(TOOL_CALL_EXEMPLAR, (match) => {
+    found = true;
+    return " ".repeat(match.length);
+  });
+  return { text: maskedText, found };
+}
+
 // ── Verb / noun signals ─────────────────────────────────────────────────────
 // Mutation verbs: any of these (as a whole word) signals the user wants the
 // system to CHANGE something — files, builds, commits, deployments.
 const MUTATION_VERB =
-  /\b(write|edit|create|add|delete|remove|fix|refactor|implement|build|deploy|install|commit|patch|modif(?:y|ies)|rename|move|generate|replace|rewrite|scaffold|migrate|format|append|insert|overwrite|update|push|run)\b/i;
+  /\b(write|edit|create|add|delete|remove|fix|refactor|implement|build|deploy|install|commit|patch|modif(?:y|ies)|rename|move|generate|replace|rewrite|scaffold|migrate|format|append|insert|overwrite|update|push|run)\b/gi;
+
+const NEGATED_MUTATION_NOUN =
+  /\b(?:no\s+(?:(?:file|code)\s+)?|without\s+(?:any\s+)?)(?:modifications?|edits?|changes?)\b|\bwithout\s+(?:writing|editing|creating|adding|deleting|removing|fixing|refactoring|implementing|building|deploying|installing|committing|patching|modifying|renaming|moving|generating|replacing|rewriting|scaffolding|migrating|formatting|appending|inserting|overwriting|updating|pushing|running)\b|\bdo\s+not\s+(?:make|apply)\s+(?:any\s+)?(?:modifications?|edits?|changes?)\b/i;
+
+const NEGATION_MARKER = /\b(do\s+not|don(?:'|\u2019)t|never|without)\b/gi;
+const CONTRAST_MARKER = /\b(but|however|instead|except|yet)\b/gi;
+
+function lastMatchEnd(text: string, re: RegExp): number {
+  let end = -1;
+  for (const match of text.matchAll(re)) {
+    end = Math.max(end, (match.index ?? 0) + match[0].length);
+  }
+  return end;
+}
+
+/** Whether a mutation verb at `index` is governed by a nearby negation. */
+function isNegatedMutation(text: string, index: number): boolean {
+  const windowStart = Math.max(0, index - 120);
+  const prefix = text.slice(windowStart, index);
+  const punctuationBoundary = Math.max(
+    prefix.lastIndexOf("."),
+    prefix.lastIndexOf("!"),
+    prefix.lastIndexOf("?"),
+    prefix.lastIndexOf(";"),
+    prefix.lastIndexOf("\n"),
+  );
+  const contrastBoundary = lastMatchEnd(prefix, CONTRAST_MARKER);
+  const clause = prefix.slice(Math.max(punctuationBoundary + 1, contrastBoundary));
+  const markers = [...clause.matchAll(NEGATION_MARKER)];
+  const marker = markers.at(-1);
+  if (!marker) return false;
+
+  const markerEnd = (marker.index ?? 0) + marker[0].length;
+  const governedText = clause.slice(markerEnd);
+  // `without modifying files, create ...` ends at the comma; coordinated
+  // `do not edit, delete, or rename ...` remains governed by the negation.
+  if (marker[1].toLowerCase() === "without" && governedText.includes(",")) return false;
+
+  const interveningWords = governedText.match(/[\p{L}\p{N}_]+/gu) ?? [];
+  return interveningWords.length <= 8;
+}
 
 // Read / inspection verbs: signal the user wants to LOOK AT something.
 const READ_VERB =
@@ -90,14 +143,14 @@ const WEAK_WORKSPACE =
  * Classify the raw current user message into the capability class the turn
  * requires. Precedence (first match wins):
  *   1. conversational  — trivial greeting/ack (delegates to turn-triage).
- *   2. full_execution  — a mutation verb is present.
+ *   2. full_execution  — an unnegated mutation verb is present.
  *   3. workspace_read  — a concrete path is named, OR a read verb + a workspace
  *                        noun co-occur.
  *   4. answer_only     — everything else.
  *
  * Misclassification bias is intentional: ambiguous-with-path turns land in
- * workspace_read (read-only tools), which is the SAFE side. Only an explicit
- * mutation verb unlocks full_execution.
+ * workspace_read (read-only tools), which is the SAFE side. Only an explicit,
+ * unnegated mutation verb unlocks full_execution.
  */
 export function classifyTurnRequirements(message: string): TurnRequirementResult {
   const text = (message || "").trim();
@@ -107,19 +160,35 @@ export function classifyTurnRequirements(message: string): TurnRequirementResult
     return { requirement: "conversational", signals: ["trivial_conversational"] };
   }
 
-  const pathSignal = detectPath(text);
+  // Pasted tool-call JSON is quoted DATA to analyze, not an instruction to run
+  // the tool and not proof that the surrounding turn targets its embedded path.
+  // Authority is derived only from the user's language outside the exemplar.
+  const masked = maskToolCallExemplars(text);
+  const intentText = masked.text;
+  if (masked.found) signals.push("tool_call_exemplar");
+
+  const pathSignal = detectPath(intentText);
   if (pathSignal) signals.push(`path:${pathSignal}`);
-  const hasMutation = MUTATION_VERB.test(text);
-  const hasReadVerb = READ_VERB.test(text);
-  const hasStrongWorkspace = STRONG_WORKSPACE.test(text);
-  const hasWeakWorkspace = WEAK_WORKSPACE.test(text);
+  const mutationMatches = [...intentText.matchAll(MUTATION_VERB)];
+  const negatedMutationMatches = mutationMatches.filter((match) =>
+    isNegatedMutation(intentText, match.index ?? 0)
+  );
+  const hasMutation = mutationMatches.some((match) =>
+    !isNegatedMutation(intentText, match.index ?? 0)
+  );
+  const hasNegatedMutation = negatedMutationMatches.length > 0 || NEGATED_MUTATION_NOUN.test(intentText);
+  const hasReadVerb = READ_VERB.test(intentText);
+  const hasStrongWorkspace = STRONG_WORKSPACE.test(intentText);
+  const hasWeakWorkspace = WEAK_WORKSPACE.test(intentText);
+  if (hasNegatedMutation) signals.push("negated_mutation");
   if (hasMutation) signals.push("mutation_verb");
   if (hasReadVerb) signals.push("read_verb");
   if (hasStrongWorkspace) signals.push("strong_workspace");
   if (hasWeakWorkspace) signals.push("weak_workspace");
 
-  // Mutation intent wins outright — even with a path present, "fix C:\x.ts" is a
-  // change request, not a read.
+  // Unnegated mutation intent wins outright — even with a path present,
+  // "fix C:\x.ts" is a change request, not a read. Negated mutation language
+  // remains observable in signals but cannot grant write/command authority.
   if (hasMutation) {
     return { requirement: "full_execution", signals };
   }
