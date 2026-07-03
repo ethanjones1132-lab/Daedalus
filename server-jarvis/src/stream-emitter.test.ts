@@ -68,6 +68,42 @@ describe("VisibleTextPipe", () => {
 
     expect(visibleText(rec.events())).toBe("visible");
   });
+
+  // ── Defense-in-depth: bare-JSON tool lines (P0-A follow-up) ──
+  // VisibleTextPipe is the single source of truth for user-visible text in
+  // the direct chat path. It must strip BOTH tagged tool markup AND bare
+  // tool-JSON lines, so a model which hallucinates either form does not
+  // leak it into the visible chat bubble. These three tests pin the
+  // post-VisibleAnswerStreamSanitizer behavior in this class.
+
+  test("VisibleTextPipe strips bare JSON tool lines, not just tags", async () => {
+    const rec = recorder();
+    const pipe = new VisibleTextPipe({ sessionId: "s5", reasoningEnabled: false, write: rec.write });
+    await pipe.push('{"name":"read_file","arguments":{"path":"README.md"}}\n');
+    await pipe.push("Here is the summary.");
+    await pipe.finish();
+
+    expect(visibleText(rec.events())).toBe("Here is the summary.");
+  });
+
+  test("VisibleTextPipe preserves mixed prose + JSON lines", async () => {
+    const rec = recorder();
+    const pipe = new VisibleTextPipe({ sessionId: "s6", reasoningEnabled: false, write: rec.write });
+    await pipe.push('Result: {"name":"read_file","arguments":{"path":"README.md"}}\n');
+    await pipe.finish();
+
+    expect(visibleText(rec.events())).toBe('Result: {"name":"read_file","arguments":{"path":"README.md"}}\n');
+  });
+
+  test("VisibleTextPipe keeps fenced JSON tool examples intact", async () => {
+    const rec = recorder();
+    const pipe = new VisibleTextPipe({ sessionId: "s7", reasoningEnabled: false, write: rec.write });
+    const fenced = "```json\n{\"name\":\"read_file\",\"arguments\":{\"path\":\".\"}}\n```\n";
+    await pipe.push(fenced);
+    await pipe.finish();
+
+    expect(visibleText(rec.events())).toBe(fenced);
+  });
 });
 
 describe("StreamSession terminal guarantee", () => {

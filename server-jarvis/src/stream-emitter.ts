@@ -23,7 +23,7 @@
 // terminal `message_stop` is emitted, even on error or early return.
 
 import { ReasoningParser, type ReasoningEvent } from "./reasoning";
-import { TextToolCallStreamSanitizer } from "./text-tools";
+import { VisibleAnswerStreamSanitizer } from "./text-tools";
 
 /** Writes a single pre-formatted SSE frame. Returns false if the client is gone. */
 export type StreamWriteFn = (frame: string) => Promise<boolean>;
@@ -52,7 +52,15 @@ export class VisibleTextPipe {
   private readonly reasoningEnabled: boolean;
   private readonly write: StreamWriteFn;
   private readonly reasoning: ReasoningParser;
-  private readonly sanitizer = new TextToolCallStreamSanitizer();
+  // VisibleTextPipe is the single source of truth for user-visible text in
+  // the direct chat path. It must strip both tagged tool calls (via
+  // TextToolCallStreamSanitizer, which VisibleAnswerStreamSanitizer wraps)
+  // AND bare-JSON tool lines (via VisibleAnswerStreamSanitizer) so that a
+  // model which hallucinates either form of tool markup does not leak it
+  // into the visible chat bubble. Defense-in-depth: the post-turn
+  // extractTextToolCalls extractor (server-jarvis/src/text-tools.ts) catches
+  // anything that survives streaming.
+  private readonly sanitizer = new VisibleAnswerStreamSanitizer();
   private finished = false;
 
   constructor(opts: VisibleTextPipeOptions) {

@@ -168,6 +168,27 @@ describe("text tool extraction", () => {
     expect(extractTextToolCalls(legacy, []).cleanedText).toBe("");
   });
 
+  // ── isCosmeticToolEchoPayloadStrict — pinned contract for the post-turn ──
+  // cosmetic-strip predicate. The streaming sanitizer uses a looser
+  // predicate (isCosmeticToolEchoPayload) because it has to commit line-by-line,
+  // but the post-turn extractor has the full picture and can afford to be
+  // stricter — these three tests pin the cases where they differ.
+
+  test("strict predicate: generic search JSON in prose is KEPT (no args)", () => {
+    const { cleanedText } = extractTextToolCalls(`{"name":"search","query":"x"}\n`, []);
+    expect(cleanedText).toContain("search");
+  });
+
+  test("strict predicate: legacy flat block with payload is stripped", () => {
+    const { cleanedText } = extractTextToolCalls(`{"tool":"find_files","path":"."}\n`, []);
+    expect(cleanedText).toBe("");
+  });
+
+  test("strict predicate: bare legacy block with no payload is KEPT", () => {
+    const { cleanedText } = extractTextToolCalls(`{"tool":"read_file"}\n`, []);
+    expect(cleanedText).toContain("read_file");
+  });
+
   test("supports legacy find_files blocks with only a closing tag", () => {
     const parsed = extractTextToolCalls(
       '{"tool":"find_files","path":".","limit":100}\n</tool_call>',
