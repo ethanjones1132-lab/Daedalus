@@ -146,6 +146,17 @@ if (Test-Path $promptsDst) {
 Copy-Item $promptsSrc $promptsDst -Recurse -Force
 Write-Ok 'prompts/'
 
+# ── Deploy manifest ──
+$manifest = @{
+    git_sha = (git -C $repo rev-parse HEAD)
+    index_js_sha256 = (Get-FileHash "$desktop\index.js" -Algorithm SHA256).Hash
+    exe_mtime = (Get-Item "$desktop\Jarvis.exe" -ErrorAction SilentlyContinue).LastWriteTimeUtc.ToString("o")
+    prompts_tree_sha256 = (git -C $repo ls-tree HEAD server-jarvis/src/prompts | Select-Object -First 1).Split()[2]
+    deployed_at = (Get-Date -Format "o")
+} | ConvertTo-Json -Depth 2
+$manifest | Out-File "$desktop\.jarvis-deploy-manifest.json" -Encoding utf8
+Write-Ok "deploy manifest -> .jarvis-deploy-manifest.json"
+
 # ── Optional: relaunch the server so the next prompt streams immediately ──────
 if ($RestartServer) {
     Write-Step 'Restarting Jarvis server (bun <Desktop>\index.js on :19877)'
