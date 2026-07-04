@@ -63,7 +63,14 @@ try {
 
 if ($null -ne $health) {
     $runningSha = $health.git_sha
-    if ($runningSha -eq 'dev') {
+    if ([string]::IsNullOrEmpty($runningSha)) {
+        # A reachable server whose /health has no git_sha field predates the
+        # provenance change entirely — that is a STALE build by definition
+        # (every post-provenance bundle reports one). Treat it like a
+        # mismatch, not a warn: this exact shape is the 2026-07 incident.
+        Write-Error "DEPLOY MISMATCH: running server /health has no git_sha field - it predates the provenance change and cannot be the build just verified on disk. Remedy: restart Jarvis (relaunch the deployed Jarvis.exe / index.js), then verify again."
+        exit 1
+    } elseif ($runningSha -eq 'dev') {
         Write-Host "[WARN] Running server reports git_sha 'dev' - it is running from source (bun run), not the deployed bundle. File verification above does not describe what's actually serving requests." -ForegroundColor Yellow
     } elseif ($runningSha -ne $manifest.git_sha) {
         Write-Error "DEPLOY MISMATCH: running server git_sha $runningSha != manifest git_sha $($manifest.git_sha). The running server is a different build than the one just deployed/verified on disk. Remedy: restart Jarvis (relaunch the deployed Jarvis.exe / index.js) or re-run build-and-deploy.ps1, then verify again."

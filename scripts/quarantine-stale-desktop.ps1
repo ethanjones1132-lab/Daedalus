@@ -105,7 +105,14 @@ try {
         }
     }
 } catch {
-    Write-Info "[WARN] Could not query Win32_Process for bun.exe command lines ($($_.Exception.Message)) -- continuing with path-only checks."
+    # Fail CLOSED under -Apply: if the command-line inspection is unavailable,
+    # a `bun <ClassicDesktop>\index.js` launch would go undetected and its
+    # index.js could be moved out from under a live server. Dry-run may
+    # continue (it moves nothing), but a real move must not proceed blind.
+    if ($Apply) {
+        Die "Could not query Win32_Process for bun.exe command lines ($($_.Exception.Message)). Refusing to -Apply while bun-launched runtimes cannot be verified; re-run without -Apply to preview, or resolve the query failure first."
+    }
+    Write-Info "[WARN] Could not query Win32_Process for bun.exe command lines ($($_.Exception.Message)) -- bun-launched runtimes are UNVERIFIED; dry-run continues with path-only checks, but -Apply would refuse."
 }
 
 if ($blockers.Count -gt 0) {
