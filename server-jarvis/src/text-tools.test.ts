@@ -137,6 +137,56 @@ describe("text tool extraction", () => {
     expect(parsed.cleanedText).toBe("");
   });
 
+  test("strips an UNCLOSED tool_call tag on the same line as the JSON (2026-07-03 live leak)", () => {
+    // Exact reproduction of session 1d4727cf / run_81091960: the synthesizer
+    // emitted `<tool_call>{json}` with no closing tag. The cosmetic line-strip
+    // skipped the line (removing the JSON leaves the tag as a non-empty
+    // remainder — "mixed prose" protection), then the lone-tag cleanup deleted
+    // the tag, leaving the naked JSON as the user-visible answer. An unclosed
+    // open tag must suppress everything after it, mirroring the stream
+    // sanitizer's semantics.
+    const leaked =
+      '<tool_call>{"name":"list_directory","arguments":{"path":"C:\\\\Projects\\\\Versutus\\\\src"}}';
+
+    const parsed = extractTextToolCalls(leaked, []);
+    expect(parsed.calls).toHaveLength(0);
+    expect(parsed.cleanedText).toBe("");
+
+    // Prose before the unclosed block survives; the block itself never leaks.
+    const withProse = extractTextToolCalls(`Checking the src folder now.\n${leaked}`, []);
+    expect(withProse.cleanedText).toBe("Checking the src folder now.");
+
+    // Unclosed tag with the JSON on the NEXT line is equally suppressed.
+    const nextLine = extractTextToolCalls(
+      '<tool_call>\n{"name":"list_directory","arguments":{"path":"C:\\\\Projects\\\\Versutus\\\\src"}}',
+      [],
+    );
+    expect(nextLine.cleanedText).toBe("");
+  });
+
+  test("stray closing tag cannot un-mix a line into a leaking tool echo", () => {
+    // Tag removal can turn `</tool_call>{json}` into a pure tool-echo line;
+    // the post-removal cosmetic re-run must strip it.
+    const parsed = extractTextToolCalls(
+      '</tool_call>{"name":"read_file","arguments":{"path":"README.md"}}',
+      [],
+    );
+    expect(parsed.cleanedText).toBe("");
+  });
+
+  test("unclosed tag still yields the executable call for stages WITH tools", () => {
+    // Executor-protocol models sometimes stop before emitting </tool_call>.
+    // The call must still be extracted (bare-JSON candidate scan) and the
+    // visible text must not leak the payload.
+    const parsed = extractTextToolCalls(
+      'Reading it now.\n<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}',
+      tools,
+    );
+    expect(parsed.calls).toHaveLength(1);
+    expect(parsed.calls[0].name).toBe("read_file");
+    expect(parsed.cleanedText).toBe("Reading it now.");
+  });
+
   test("preserves non-tool JSON in answers when tools list is empty", () => {
     const parsed = extractTextToolCalls('Config: {"theme":"dark","fontSize":14}', []);
 

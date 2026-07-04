@@ -1749,7 +1749,15 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // match/execute anything (normalizeToolName requires the name to
           // be in the offered tools), it only performs the cleanup — so this
           // is safe even when nothing was actually a real tool call.
-          const cleanContent = useTextTools ? reasoningStripped : extractTextToolCalls(reasoningStripped, []).cleanedText;
+          // Text-tool stages first remove genuine call blocks (real tools
+          // list), then EVERY stage gets the empty-list cosmetic pass. The
+          // previous `useTextTools ? reasoningStripped : …` ternary returned
+          // the raw text for text-tool stages, so bare hallucinated tool JSON
+          // in executor visible activity was never stripped.
+          const toolAwareCleaned = useTextTools
+            ? extractTextToolCalls(reasoningStripped, callOptions.tools).cleanedText
+            : reasoningStripped;
+          const cleanContent = extractTextToolCalls(toolAwareCleaned, []).cleanedText;
           // Capture the actual provider/model used by this attempt so the
           // orchestrator's `recordInference` error/empty paths can attribute
           // the turn to the real backend (not the user's selected
@@ -1847,8 +1855,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           //     that the previous build hit on the live smoke test.
           for (let advance = 0; advance < 2; advance++) {
             const hasContent = typeof last?.content === "string" && last.content.trim().length > 0;
-            const hasToolCalls = Array.isArray(last?.tool_calls) && last.tool_calls.length > 0;
-            if (hasContent || hasToolCalls || streamAbort.signal.aborted) break;
+            // A user-visible stage is only "done" when it produced clean prose.
+            // Tool calls do NOT count: a synthesizer that emits a tool call has
+            // no tools to run it with, and before 2026-07-04 the leaked call
+            // text itself was accepted as the answer (session 1d4727cf) — and
+            // then reinforced by the tuning loop as a success.
+            if (hasContent || streamAbort.signal.aborted) break;
             if (last?._provider && last?._modelUsed) {
               const key = `${last._provider}:${last._modelUsed}`;
               if (exclude.has(key)) {

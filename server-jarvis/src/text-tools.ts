@@ -258,9 +258,30 @@ export function extractTextToolCalls(text: string, tools: ToolDefinition[]): {
   if (calls.length > 0 || strippedCosmetic || /<\/?tool_call>/i.test(cleanedText)) {
     cleanedText = cleanedText
       .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "")
+      // An UNCLOSED <tool_call> suppresses everything after it, mirroring
+      // TextToolCallStreamSanitizer (which never emits inside an open block
+      // and drops the pending region on flush). Without this, the lone-tag
+      // cleanup below "un-mixes" a `<tool_call>{json}` line — the line-span
+      // strip skips it (removing the JSON leaves the tag as a non-empty
+      // remainder), then the tag strip deletes the tag and leaves the naked
+      // JSON as the user-visible answer (2026-07-03 live leak, session
+      // 1d4727cf / run_81091960).
+      .replace(/<tool_call>[\s\S]*$/i, "")
       .replace(/<\/?tool_call>/gi, "")
       .replace(/\n{3,}/g, "\n\n")
       .trim();
+    // Tag removal can turn a mixed line (e.g. `</tool_call>{json}`) into a
+    // pure tool-echo line — re-run the cosmetic strip on the result so the
+    // streaming and post-turn layers agree on what survives.
+    if (availableNames.size === 0 && cleanedText) {
+      const rerunSpans = findCosmeticToolEchoLineSpans(cleanedText, collectCandidates(cleanedText));
+      if (rerunSpans.length > 0) {
+        for (const span of [...rerunSpans].sort((a, b) => b.start - a.start)) {
+          cleanedText = `${cleanedText.slice(0, span.start)}${cleanedText.slice(span.end)}`;
+        }
+        cleanedText = cleanedText.replace(/\n{3,}/g, "\n\n").trim();
+      }
+    }
   }
 
   return { cleanedText, calls };
