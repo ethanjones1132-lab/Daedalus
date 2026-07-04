@@ -20,7 +20,9 @@ import {
 } from './sse-protocol';
 import {
   SendGate,
+  dedupeMessages,
   finalizeStreamingMessages,
+  isToolCallEchoOnly,
   mergeToolResult,
   recoverComposerAfterFailure,
   sanitizeAssistantDisplay,
@@ -50,6 +52,21 @@ const sessionInvokeArgs = (sessionId: string) => ({
 
 const JARVIS_API_URL = 'http://127.0.0.1:19877';
 const STREAM_INACTIVITY_TIMEOUT_MS = 90_000;
+
+// Task 7 Part C (2026-07-03 incident 1d4727cf): the server's structured
+// `error` frame carries a `code` (e.g. "first_token_timeout") that
+// previously was logged and then discarded — `handleFrame` threw a plain
+// `Error`, so by the time `handleSend`'s catch block ran there was no way
+// to render a distinct error bubble or show the code as detail. This class
+// carries the code through the throw/catch boundary.
+class JarvisStreamError extends Error {
+  code?: string;
+  constructor(message: string, code?: string) {
+    super(message);
+    this.name = 'JarvisStreamError';
+    this.code = code;
+  }
+}
 
 export default function JarvisView({ initialSubView = 'chat', onCompanionChange }: JarvisViewProps) {
   const [subView, setSubView] = useState<JarvisSubView>(initialSubView);
@@ -537,11 +554,16 @@ export function ChatPanel({
     invoke<SessionHistoryMessage[]>('get_session_history', sessionInvokeArgs(activeSession))
       .then((rows) => {
         if (cancelled) return;
-        setMessages(rows.map(r => ({
+        // Map the DB row id into JarvisMessage.id (Task 7 / incident 1d4727cf)
+        // so a message that was already shown optimistically — and is now
+        // reappearing via this history reload — carries the same identity
+        // and can be deduped instead of rendering as a second bubble.
+        setMessages(dedupeMessages(rows.map(r => ({
+          id: r.id,
           role: (r.role === 'user' || r.role === 'assistant' || r.role === 'tool' || r.role === 'system') ? r.role : 'assistant',
           content: r.content,
           timestamp: r.created_at,
-        })));
+        }))));
         // Jump to the bottom without animation on initial history load.
         requestAnimationFrame(() => {
           if (!cancelled) {
@@ -582,7 +604,15 @@ export function ChatPanel({
       finalizeAssistantMessage(event.payload.session_id);
     }));
 
-    track(listen<{ error: string; session_id: string }>('jarvis://error', (event) => {
+    // NOTE (Task 7 / 2026-07-03 incident 1d4727cf): this `jarvis_send_message`
+    // / `jarvis://*` Tauri-event path is wired but not currently invoked by
+    // the chat UI — `handleSend` uses the direct-fetch `streamFromJarvisApi`
+    // path below instead, which has the primary error/cancelled handling.
+    // Hardened here too for defense-in-depth in case something re-enables
+    // this path. The Rust `SseFrameOutcome::Error` variant only carries a
+    // message string, not a `code` (unlike the fetch path's raw JSON
+    // frames) — reported as a gap below rather than changing Rust.
+    track(listen<{ error: string; session_id: string; code?: string }>('jarvis://error', (event) => {
       if (!matchesStreamSession(event.payload.session_id)) return;
       setIsStreaming(false);
       setPipelineStage('');
@@ -594,13 +624,41 @@ export function ChatPanel({
         const last = prev[prev.length - 1];
         if (last && last.isStreaming) {
           // If nothing streamed before the error (e.g. a turn-fatal auth
-          // failure), drop the empty assistant bubble so the user sees just
-          // their message + the error banner — not a blank reply. Otherwise
-          // finalize whatever partial text did arrive.
-          if (!last.content.trim()) {
-            return prev.slice(0, -1);
-          }
-          return [...prev.slice(0, -1), { ...last, isStreaming: false }];
+          // failure), turn the bubble into a designed error bubble showing
+          // the message text (instead of silently dropping it, which left
+          // the user with only their own message + the easy-to-miss banner).
+          const partial = last.content.trim();
+          return [...prev.slice(0, -1), {
+            ...last,
+            content: partial ? last.content : event.payload.error,
+            isStreaming: false,
+            isError: true,
+            errorCode: event.payload.code,
+          }];
+        }
+        return prev;
+      });
+    }));
+
+    // Rust's SseRelay maps a `cancelled` SSE frame straight to `jarvis://done`
+    // (see runner.rs `SseFrameOutcome::Cancelled`) — there is no distinct
+    // `jarvis://cancelled` Tauri event today, so this listener is a no-op
+    // registration for forward-compatibility / documentation of the gap
+    // rather than dead code masking a real handler. If a future Rust change
+    // adds a genuine `jarvis://cancelled` emit, this starts working without
+    // further UI changes.
+    track(listen<{ session_id: string }>('jarvis://cancelled', (event) => {
+      if (!matchesStreamSession(event.payload.session_id)) return;
+      setIsStreaming(false);
+      setPipelineStage('');
+      setRecursionDepth(null);
+      setError(null);
+      setMessages(prev => {
+        const last = prev[prev.length - 1];
+        if (last?.role === 'assistant' && last.isStreaming) {
+          const content = sanitizeAssistantDisplay(last.content);
+          if (!content) return prev.slice(0, -1);
+          return [...prev.slice(0, -1), { ...last, content, isStreaming: false, isCancelled: true }];
         }
         return prev;
       });
@@ -725,16 +783,29 @@ export function ChatPanel({
     history: Array<{ role: string; content: string }>,
     sendGeneration: number,
     onAccepted: () => void,
+    clientMessageId: string,
   ) => {
     streamAbortRef.current?.abort();
     const controller = new AbortController();
     streamAbortRef.current = controller;
     setPipelineStage('stream relay');
 
-    invoke('append_message', {
+    // `append_message` returns the DB row id (sessions.rs `insert_message_row`).
+    // Swap the client-generated id for the persisted one so a later
+    // history-reload (which maps DB row ids into JarvisMessage.id) recognizes
+    // this as the SAME message instance and dedupes it, instead of showing it
+    // twice — the 2026-07-03 incident 1d4727cf "two YOU bubbles" bug.
+    invoke<string>('append_message', {
       ...sessionInvokeArgs(sid),
       role: 'user',
       content: userMsg,
+    }).then((dbId) => {
+      // Guard for a non-empty string specifically — `invoke` is typed as
+      // `Promise<string>` but nothing prevents a stale/mocked backend from
+      // resolving something else (e.g. a bare `true`), which would corrupt
+      // JarvisMessage.id and the `key` it feeds into.
+      if (typeof dbId !== 'string' || !dbId) return;
+      setMessages(prev => prev.map((m) => (m.id === clientMessageId ? { ...m, id: dbId } : m)));
     }).catch((e) => console.error('Failed to persist user message:', e));
 
     const response = await fetch(`${JARVIS_API_URL}/chat/stream`, {
@@ -878,7 +949,7 @@ export function ChatPanel({
           // eslint-disable-next-line no-console
           console.warn(`[Jarvis] stream error code=${code}: ${frame.error}`);
         }
-        throw new Error(String(frame.error || 'Jarvis stream failed.'));
+        throw new JarvisStreamError(String(frame.error || 'Jarvis stream failed.'), code);
       }
       if (frame.type === 'cancelled') {
         // P0-B (2026-07-02): `cancelled` is now reserved for genuine user
@@ -889,10 +960,24 @@ export function ChatPanel({
         // visible. Now we mark the stream as intentionally stopped, clear
         // the streaming indicator, and surface a non-error "(stopped)"
         // notice so the user knows the turn ended because they asked.
+        //
+        // Task 7 Part C: finalize into a muted `isCancelled` bubble (rather
+        // than a plain finalized assistant message) if partial text
+        // streamed, or drop the empty stub entirely if nothing did —
+        // `isStreaming` always ends false either way, so there's no
+        // forever-spinner.
         setIsStreaming(false);
         stopRequestedRef.current = false;
         setError(null);
-        setMessages(prev => finalizeStreamingMessages(prev));
+        setMessages(prev => {
+          const last = prev[prev.length - 1];
+          if (last?.role === 'assistant' && last.isStreaming) {
+            const content = sanitizeAssistantDisplay(last.content);
+            if (!content) return prev.slice(0, -1);
+            return [...prev.slice(0, -1), { ...last, content, isStreaming: false, isCancelled: true }];
+          }
+          return finalizeStreamingMessages(prev);
+        });
         return;
       }
       // P0-I (2026-07-02): unknown / unhandled frame types used to be
@@ -916,7 +1001,20 @@ export function ChatPanel({
         buffer = events.pop() ?? '';
         for (const eventText of events) {
           for (const line of eventText.split('\n')) {
-            const frame = parseSseDataLine(line);
+            // Task 7 Part C: `parseSseDataLine` throws `SseProtocolError` for
+            // a malformed/typeless frame. That used to propagate out of this
+            // whole loop via the outer try/catch below — one bad frame ended
+            // the entire turn with a scary error, even though the stream
+            // itself was fine. Warn + skip that single line instead; only
+            // genuine terminal failures thrown from handleFrame (e.g. an
+            // `error` SSE frame) should still end the turn.
+            let frame: ReturnType<typeof parseSseDataLine>;
+            try {
+              frame = parseSseDataLine(line);
+            } catch (parseError) {
+              console.warn('[Jarvis] skipping malformed SSE frame:', parseError);
+              continue;
+            }
             if (frame) {
               inactivityWatchdog.touch();
               handleFrame(frame);
@@ -960,9 +1058,14 @@ export function ChatPanel({
     setToolCalls([]);
     setTurnCost(null);
     setUserPinnedToBottom(true);
+    // Client-side identity for the optimistic user bubble (Task 7 / incident
+    // 1d4727cf). Upgraded to the DB row id once `append_message` resolves
+    // (see streamFromJarvisApi) so dedupeMessages recognizes the reload-from-
+    // history copy as the same instance rather than rendering it twice.
+    const clientMessageId = crypto.randomUUID();
     setMessages(prev => [
       ...prev,
-      { role: 'user', content: userMsg },
+      { id: clientMessageId, role: 'user', content: userMsg },
       { role: 'assistant', content: '', isStreaming: true },
     ]);
 
@@ -984,7 +1087,7 @@ export function ChatPanel({
 
       await streamFromJarvisApi(effectiveSessionId, userMsg, history, sendGeneration, () => {
         setInput(current => current.trim() === userMsg ? '' : current);
-      });
+      }, clientMessageId);
     } catch (e) {
       if (!sendGateRef.current.isCurrent(sendGeneration)) return;
       streamAbortRef.current = null;
@@ -995,18 +1098,28 @@ export function ChatPanel({
         setMessages(prev => finalizeStreamingMessages(prev));
         return;
       }
-      setError(String(e));
+      // Task 7 Part C (incident 1d4727cf): finalize the streaming bubble into
+      // a designed error bubble — friendly text, `errorCode` as small muted
+      // detail — instead of leaving a plain assistant-looking message and
+      // relying solely on the (dismissable, easy-to-miss) banner below.
+      const errorMessage = String(e instanceof Error ? e.message : e);
+      const errorCode = e instanceof JarvisStreamError ? e.code : undefined;
+      setError(errorMessage);
       setInput(current => recoverComposerAfterFailure(current, userMsg));
       setMessages(prev => {
         const last = prev[prev.length - 1];
         if (last?.role === 'assistant' && last.isStreaming) {
-          if (!last.content.trim()) {
-            return prev.slice(0, -1);
-          }
-          return [...prev.slice(0, -1), { ...last, isStreaming: false }];
+          const partial = last.content.trim();
+          return [...prev.slice(0, -1), {
+            ...last,
+            content: partial ? last.content : errorMessage,
+            isStreaming: false,
+            isError: true,
+            errorCode,
+          }];
         }
-          return prev;
-        });
+        return prev;
+      });
     } finally {
       sendGateRef.current.release(sendGeneration);
     }
@@ -1241,7 +1354,7 @@ export function ChatPanel({
 
         {messages.map((msg, i) => (
           <ChatMessage
-            key={i}
+            key={msg.id ?? i}
             message={msg}
             index={i}
             prefersReducedMotion={prefersReducedMotion.current}
@@ -1483,6 +1596,12 @@ function ChatMessage({
   const displayContent = isUser || isTool
     ? message.content
     : sanitizeAssistantDisplay(message.content);
+  // Task 7 Part B (2026-07-03 incident 1d4727cf): the assistant bubble once
+  // rendered raw tool-call JSON as markdown text when a synthesizer stage
+  // leaked it into the display content instead of routing through the
+  // `tool_call` SSE frame. Pure defense-in-depth — the server should never
+  // send this — so keep the detector conservative (chat-state.ts).
+  const isToolEcho = !isUser && !isTool && isToolCallEchoOnly(displayContent);
   const [copied, setCopied] = useState(false);
 
   const handleCopy = useCallback(async () => {
@@ -1497,6 +1616,13 @@ function ChatMessage({
 
   if (!isUser && !isTool && !displayContent && !streamStatus) return null;
 
+  // Task 7 Part C: a finalized assistant bubble that ended in a server/stream
+  // error or a user-cancelled turn gets a distinct visual treatment instead
+  // of silently looking like a normal reply (or, previously, leaving the
+  // streaming spinner running forever).
+  const isErrorBubble = !isUser && !isTool && message.isError;
+  const isCancelledBubble = !isUser && !isTool && message.isCancelled;
+
   return (
     <motion.div
       initial={prefersReducedMotion ? false : { opacity: 0, y: 8 }}
@@ -1507,18 +1633,36 @@ function ChatMessage({
         'backdrop-blur-xl',
         isUser
           ? 'glass-strong bg-royal/10 border-royal/25 ml-12'
-          : isTool
-            ? 'glass-mythos bg-obsidian/40 border-iron/30 mr-8'
-            : 'glass-strong bg-cyan-neon/5 border-cyan-neon/20 mr-8'
+          : isErrorBubble
+            ? 'glass-mythos bg-error/10 border-error/30 mr-8'
+            : isCancelledBubble
+              ? 'glass-mythos bg-iron/10 border-iron/30 mr-8'
+              : isTool
+                ? 'glass-mythos bg-obsidian/40 border-iron/30 mr-8'
+                : 'glass-strong bg-cyan-neon/5 border-cyan-neon/20 mr-8'
       )}
     >
       <div className="flex items-center gap-2 mb-1.5">
         <span className={cn(
           'text-[10px] font-mono uppercase tracking-wider font-bold flex items-center gap-1',
-          isUser ? 'text-royal-light' : isTool ? 'text-bone-dim' : 'text-cyan-neon'
+          isUser
+            ? 'text-royal-light'
+            : isErrorBubble
+              ? 'text-amber-400'
+              : isCancelledBubble
+                ? 'text-bone-faint'
+                : isTool
+                  ? 'text-bone-dim'
+                  : 'text-cyan-neon'
         )}>
-          {isUser ? <><User size={11} /> YOU</> : isTool ? <><Wrench size={11} /> TOOL: {message.tool_name || 'unknown'}</> : <><Bot size={11} /> JARVIS</>}
+          {isUser
+            ? <><User size={11} /> YOU</>
+            : isTool
+              ? <><Wrench size={11} /> TOOL: {message.tool_name || 'unknown'}</>
+              : <><Bot size={11} /> JARVIS</>}
         </span>
+        {isErrorBubble && <Pill variant="error">error</Pill>}
+        {isCancelledBubble && <Pill>stopped</Pill>}
         {message.isStreaming && (
           <motion.span
             className="text-[10px] font-mono text-cyan-neon flex items-center gap-1"
@@ -1547,13 +1691,25 @@ function ChatMessage({
       <div className={cn(
         'leading-relaxed break-words',
         isUser || isTool ? 'text-xs font-mono whitespace-pre-wrap' : 'text-sm',
-        isUser ? 'text-bone' : isTool ? 'text-bone-dim' : 'text-bone-muted'
+        isUser
+          ? 'text-bone'
+          : isErrorBubble
+            ? 'text-bone-muted'
+            : isCancelledBubble
+              ? 'text-bone-faint italic'
+              : isTool
+                ? 'text-bone-dim'
+                : 'text-bone-muted'
       )}>
         {isUser || isTool
           ? displayContent
-          : streamStatus
-            ? <span className="text-bone-faint font-mono text-xs">{streamStatus}</span>
-            : <MarkdownView content={displayContent} />}
+          : isCancelledBubble
+            ? '(stopped)'
+            : streamStatus
+              ? <span className="text-bone-faint font-mono text-xs">{streamStatus}</span>
+              : isToolEcho
+                ? <ToolCallEchoCard content={displayContent} />
+                : <MarkdownView content={displayContent} />}
         {message.isStreaming && (
           <motion.span
             className="inline-block w-1.5 h-3.5 bg-cyan-neon/70 ml-0.5 align-middle rounded-sm"
@@ -1562,8 +1718,44 @@ function ChatMessage({
             aria-hidden="true"
           />
         )}
+        {isErrorBubble && message.errorCode && (
+          <div className="mt-1.5 text-[10px] font-mono text-bone-faint">
+            code: {message.errorCode}
+          </div>
+        )}
       </div>
     </motion.div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ── Tool-call echo card (Task 7 Part B) ──
+// ═══════════════════════════════════════════════════════════════
+//
+// Minimal inline variant of ToolCallCard's visual language, for the case
+// where an assistant message's ENTIRE display content is bare tool-call
+// JSON (see isToolCallEchoOnly). Collapsed + muted by default since this
+// is leaked internal plumbing, not a real reply.
+function ToolCallEchoCard({ content }: { content: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="rounded-lg border border-iron/30 bg-obsidian/40 overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        aria-expanded={open}
+        className="w-full flex items-center gap-2 px-2.5 py-1 text-[10px] font-mono text-bone-faint hover:text-bone-dim transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
+      >
+        <Wrench size={10} className="text-bone-faint" />
+        <span>tool call echo</span>
+        <span className="ml-auto opacity-70">{open ? <ChevronDown size={10} /> : <ChevronRight size={10} />}</span>
+      </button>
+      {open && (
+        <pre className="px-2.5 pb-2 text-[10px] font-mono text-bone-faint whitespace-pre-wrap break-words max-h-32 overflow-y-auto">
+          {content}
+        </pre>
+      )}
+    </div>
   );
 }
 

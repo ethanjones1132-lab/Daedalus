@@ -85,11 +85,23 @@ export interface JarvisSession {
 }
 
 export interface JarvisMessage {
+  // Message identity (Task 7 / 2026-07-03 incident 1d4727cf): optimistic sends
+  // generate a client-side crypto.randomUUID(); history reload overwrites it
+  // with the persisted DB row id. Legacy rows loaded before this change (or
+  // any code path that forgets to set one) leave `id` undefined — dedupe
+  // falls back to a same-role+content+timestamp check for those.
+  id?: string;
   role: 'user' | 'assistant' | 'system' | 'tool';
   content: string;
   timestamp?: string;
   tool_name?: string;
   isStreaming?: boolean;
+  /** Set on a finalized assistant bubble that ended in a server/stream error (Task 7). */
+  isError?: boolean;
+  /** Machine-readable error code (e.g. "first_token_timeout") shown as muted detail. */
+  errorCode?: string;
+  /** Set on a finalized assistant bubble that ended because the user/stream was cancelled. */
+  isCancelled?: boolean;
 }
 
 export interface ReasoningStep {

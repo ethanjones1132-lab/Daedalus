@@ -1,13 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   SendGate,
+  dedupeMessages,
   finalizeStreamingMessages,
+  isToolCallEchoOnly,
   mergeToolResult,
   recoverComposerAfterFailure,
   sanitizeAssistantDisplay,
   shouldSubmitComposerKey,
   type ToolCallState,
 } from './chat-state';
+import type { JarvisMessage } from './types';
 
 describe('SendGate', () => {
   it('admits one send and prevents a stale completion from unlocking a newer send', () => {
@@ -51,6 +54,100 @@ it('does not submit Enter while an IME composition is active', () => {
   expect(shouldSubmitComposerKey({ key: 'Enter', isComposing: true })).toBe(false);
   expect(shouldSubmitComposerKey({ key: 'Enter', isComposing: false })).toBe(true);
   expect(shouldSubmitComposerKey({ key: 'Enter', shiftKey: true, isComposing: false })).toBe(false);
+});
+
+describe('dedupeMessages', () => {
+  it('collapses the same message instance appearing twice via optimistic+reload overlap', () => {
+    const messages: JarvisMessage[] = [
+      { id: 'a1', role: 'user', content: 'hello' },
+      { id: 'a1', role: 'user', content: 'hello' },
+    ];
+    expect(dedupeMessages(messages)).toEqual([{ id: 'a1', role: 'user', content: 'hello' }]);
+  });
+
+  it('does not collapse distinct identical texts sent as separate instances (different ids)', () => {
+    const messages: JarvisMessage[] = [
+      { id: 'a1', role: 'user', content: 'ping' },
+      { role: 'assistant', content: 'pong' },
+      { id: 'a2', role: 'user', content: 'ping' },
+    ];
+    expect(dedupeMessages(messages)).toHaveLength(3);
+  });
+
+  it('collapses legacy id-less consecutive duplicates (same role+content+timestamp)', () => {
+    const messages: JarvisMessage[] = [
+      { role: 'user', content: 'hi', timestamp: 't1' },
+      { role: 'user', content: 'hi', timestamp: 't1' },
+    ];
+    expect(dedupeMessages(messages)).toEqual([{ role: 'user', content: 'hi', timestamp: 't1' }]);
+  });
+
+  it('does not collapse id-less messages once separated by another message', () => {
+    const messages: JarvisMessage[] = [
+      { role: 'user', content: 'hi', timestamp: 't1' },
+      { role: 'assistant', content: 'hello!', timestamp: 't2' },
+      { role: 'user', content: 'hi', timestamp: 't1' },
+    ];
+    expect(dedupeMessages(messages)).toHaveLength(3);
+  });
+
+  it('does not collapse an id-bearing message against an id-less one even if content matches', () => {
+    const messages: JarvisMessage[] = [
+      { role: 'user', content: 'hi', timestamp: 't1' },
+      { id: 'a1', role: 'user', content: 'hi', timestamp: 't1' },
+    ];
+    expect(dedupeMessages(messages)).toHaveLength(2);
+  });
+});
+
+describe('isToolCallEchoOnly', () => {
+  it('is true for a single-line bare tool-call JSON object', () => {
+    expect(isToolCallEchoOnly('{"name":"read_file","arguments":{"path":"a.ts"}}')).toBe(true);
+  });
+
+  it('is true for multi-line bare tool-call JSON (one call per line)', () => {
+    const content = [
+      '{"name":"read_file","arguments":{"path":"a.ts"}}',
+      '{"name":"write_file","arguments":{"path":"b.ts","content":"x"}}',
+    ].join('\n');
+    expect(isToolCallEchoOnly(content)).toBe(true);
+  });
+
+  it('is true for <tool_call>-wrapped JSON', () => {
+    expect(isToolCallEchoOnly('<tool_call>{"name":"read_file","arguments":{"path":"a.ts"}}</tool_call>')).toBe(true);
+  });
+
+  it('tolerates blank lines between bare tool-call JSON lines', () => {
+    const content = '{"name":"read_file","arguments":{}}\n\n{"name":"write_file","arguments":{}}';
+    expect(isToolCallEchoOnly(content)).toBe(true);
+  });
+
+  it('is false for plain prose', () => {
+    expect(isToolCallEchoOnly('Here is the answer you asked for.')).toBe(false);
+  });
+
+  it('is false for prose mixed with tool-call JSON', () => {
+    const content = 'Let me check that.\n{"name":"read_file","arguments":{"path":"a.ts"}}';
+    expect(isToolCallEchoOnly(content)).toBe(false);
+  });
+
+  it('is false for a fenced JSON code block', () => {
+    const content = '```json\n{"name":"read_file","arguments":{"path":"a.ts"}}\n```';
+    expect(isToolCallEchoOnly(content)).toBe(false);
+  });
+
+  it('is false for JSON that is not tool-call shaped', () => {
+    expect(isToolCallEchoOnly('{"foo":"bar","baz":123}')).toBe(false);
+  });
+
+  it('is false for JSON with a name but non-object arguments', () => {
+    expect(isToolCallEchoOnly('{"name":"read_file","arguments":"a.ts"}')).toBe(false);
+  });
+
+  it('is false for empty or whitespace-only content', () => {
+    expect(isToolCallEchoOnly('')).toBe(false);
+    expect(isToolCallEchoOnly('   \n  ')).toBe(false);
+  });
 });
 
 describe('mergeToolResult', () => {
