@@ -1798,6 +1798,15 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
             const hasContent = typeof cleanContent === "string" && cleanContent.trim().length > 0;
             const hasToolCalls = parsedToolCalls.length > 0;
+            // A user-visible stage (surfaceAsAnswer, i.e. the synthesizer) must
+            // produce actual prose to count as a success — 2026-07-03 session
+            // 1d4727cf / run_81091960: the synthesizer emitted tool-call JSON as
+            // its "answer", cleanContent stripped it to empty, but the reward
+            // signal here still counted `hasToolCalls` as success, so the tuning
+            // loop BOOSTED the capability score of the model that leaked the
+            // JSON. Non-answer stages (executor, etc.) legitimately succeed via
+            // tool calls with no prose, so they keep the original OR logic.
+            const isAnswerStage = callOptions?.surfaceAsAnswer === true;
             conductorLearning.recordStageModel({
               agentRunId: orchestratorAgentRunId,
               stageId: stageLabel,
@@ -1806,8 +1815,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               modelId: actualModelUsed,
               durationMs: Date.now() - stageAttemptStart,
               fallbackUsed: (excludeModels?.size ?? 0) > 0,
-              wasSuccessful: hasContent || hasToolCalls,
-              hadError: !hasContent && !hasToolCalls,
+              wasSuccessful: isAnswerStage ? hasContent : (hasContent || hasToolCalls),
+              hadError: isAnswerStage ? !hasContent : (!hasContent && !hasToolCalls),
             });
           }
           return {
