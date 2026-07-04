@@ -83,6 +83,7 @@ import { Coordinator } from "./orchestration/coordinator";
 import { PersistentConductor } from "./orchestration/persistent-conductor";
 import { SessionMemory, mergeSharedContextHints } from "./orchestration/session-memory";
 import { AgentPool, firstTokenTimeoutFor, formatPoolDiversity } from "./orchestration/agent-pool";
+import { excludedModelKeys } from "./model-failure-memory";
 import { PipelineExecutor } from "./orchestration/pipeline";
 import type { PipelineProgressState, PipelineRecursionEvent } from "./orchestration/pipeline";
 import { classifyTurnRequirements } from "./orchestration/turn-requirements";
@@ -1317,11 +1318,21 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               // should never be re-selected by the pool — it would just repeat
               // the failure. The exclude set is built by the `callModel`
               // wrapper above when a user-visible stage returns no content.
+              //
+              // Also union in the cross-turn hard-failure memory (see
+              // model-failure-memory.ts): a model that hard-failed (e.g. HTTP
+              // 400) twice in a prior turn's cascade must not be re-picked as
+              // THIS turn's pool default either — that was the live incident
+              // (north-mini-code-free 400s every single turn because nothing
+              // remembered the previous failure). Build a fresh union set so
+              // the caller's `excludeModels` is never mutated.
+              const poolExcludeModels = new Set<string>(excludeModels ?? []);
+              for (const key of excludedModelKeys()) poolExcludeModels.add(key);
               if (cascadeTier) {
-                const chain = pool.cascadeChain(stageLabel, orchestratorTaskType, excludeModels);
+                const chain = pool.cascadeChain(stageLabel, orchestratorTaskType, poolExcludeModels);
                 agent = cascadeTier === "cheap" ? chain[0] : chain[chain.length - 1];
               } else {
-                agent = pool.pickFor(stageLabel, orchestratorTaskType, excludeModels);
+                agent = pool.pickFor(stageLabel, orchestratorTaskType, poolExcludeModels);
               }
               if (agent && (agent.provider === "openrouter" || agent.provider === "opencode_zen" || agent.provider === "opencode_go")) {
                 poolModel = agent.model_id;

@@ -12,6 +12,7 @@ import {
   providerHeaders,
   type HttpProviderId,
 } from "./providers";
+import { isTemporarilyExcluded, recordHardFailure, recordSuccess } from "./model-failure-memory";
 
 // ═══════════════════════════════════════════════════════════════
 // Types
@@ -780,6 +781,31 @@ export async function chatCompletionWithFallback(
   if (cascade.length === 0) {
     cascade.push({ provider: "openrouter", model_id: cfg.openrouter.model || "openrouter/free" });
   }
+
+  // Cross-turn hard-failure memory (model-failure-memory.ts): a model that
+  // hard-failed (non-retryable HTTP, e.g. 400) twice in a cooldown window is
+  // skipped here so we don't burn the first cascade attempt on it every
+  // single turn (live incident: north-mini-code-free 400s on every turn,
+  // re-picked every turn because nothing remembered the prior failure).
+  // Never let exclusion leave zero attemptable entries — if everything
+  // remaining is excluded, fall back to the original cascade and warn.
+  const excludedNow = cascade.filter(
+    (entry) => !isTemporarilyExcluded(entry.provider, entry.model_id),
+  );
+  const effectiveCascade = excludedNow.length > 0 ? excludedNow : cascade;
+  if (excludedNow.length < cascade.length) {
+    const skipped = cascade.filter((entry) => !excludedNow.includes(entry));
+    if (excludedNow.length === 0) {
+      console.warn(
+        `[Fallback] All ${cascade.length} cascade entries are in hard-failure cooldown — ignoring exclusions and using the original cascade anyway.`,
+      );
+    } else {
+      for (const entry of skipped) {
+        console.warn(`[Fallback] Skipping ${entry.provider}:${entry.model_id} — in hard-failure cooldown from repeated non-retryable errors.`);
+      }
+    }
+  }
+
   let lastError = "";
   // `max_retries` is the configured ceiling on per-model attempts. The 2-strike
   // rate-limit rule and the single-retry transient policy are clamped to it, so
@@ -795,8 +821,8 @@ export async function chatCompletionWithFallback(
   // diagnosis: multi-minute stalls on a free-router call).
   const firstTokenTimeoutMs = Math.max(1_000, Number((cfg.openrouter as any).first_token_timeout_ms ?? 30_000));
 
-  for (let modelIdx = 0; modelIdx < cascade.length; modelIdx++) {
-    const { provider, model_id: model } = cascade[modelIdx];
+  for (let modelIdx = 0; modelIdx < effectiveCascade.length; modelIdx++) {
+    const { provider, model_id: model } = effectiveCascade[modelIdx];
     const target = resolveProviderTarget(cfg, provider);
     if (!target.api_key) {
       lastError = `No API key configured for provider "${provider}" (model ${model}) — skipping`;
@@ -831,6 +857,7 @@ export async function chatCompletionWithFallback(
           // First-token watchdog: race the first body chunk against the timer.
           const bodyReader = res.body?.getReader();
           if (!bodyReader) {
+            recordSuccess(provider, model);
             return { response: res, model_used: model, provider_used: provider, retries: modelIdx };
           }
           const firstByteTimeout = new Promise<"timeout">((resolve) => {
@@ -857,6 +884,7 @@ export async function chatCompletionWithFallback(
             statusText: res.statusText,
             headers: res.headers,
           });
+          recordSuccess(provider, model);
           return { response: newResponse, model_used: model, provider_used: provider, retries: modelIdx };
         }
 
@@ -892,6 +920,12 @@ export async function chatCompletionWithFallback(
         const body = await res.text().catch(() => "");
         lastError = `Model ${model} (${provider}) HTTP ${res.status}: ${body.slice(0, 160)}`;
         console.warn(`[Fallback] ${lastError} — advancing to next model`);
+        // Cross-turn memory: this is a hard, non-retryable failure (never a
+        // 429, never a retried transient 5xx, never a first-token stall —
+        // those are handled above/below and never reach this branch). Two of
+        // these on the same provider:model within the cooldown window will
+        // exclude it from future cascades until the window lapses.
+        recordHardFailure(provider, model);
         break attemptLoop;
       } catch (e: any) {
         // Distinguish user-cancel (fatal) from watchdog-abort / network error.
