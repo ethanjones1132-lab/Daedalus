@@ -80,13 +80,23 @@ Write-Step 'Stage 1/4 - Building server bundle (bun)'
 # "process.env.X=\"...\""` folds the literal into the output, and running the
 # unbundled source with `bun run` still reads the live env var / "dev"
 # fallback, so source runs are unaffected).
+#
+# QUOTING TRAP (PS 5.1 native-arg passing): the inner quotes around the value
+# MUST be backslash-escaped (\`") not merely backtick-escaped (`"). A bare
+# backtick-escaped quote puts a literal " in the PowerShell string, but PS 5.1
+# does not re-escape embedded quotes when it rebuilds the command line for a
+# native exe, so bun's argv loses them and folds the value as a BARE JS
+# identifier: `var SHA = abc123 ?? "dev"` -> ReferenceError at module load ->
+# the deployed server fails to boot. bun build still exits 0, so the error
+# gate below cannot catch it. \`" survives to bun as \" and folds correctly
+# to a quoted string literal (verified both ways via scratch repro 2026-07-04).
 $buildGitSha = (git -C $repo rev-parse HEAD)
 $buildBuiltAt = (Get-Date -Format 'o')
 Push-Location $serverDir
 try {
     & $bun build ./src/index.ts --outdir ./dist --target bun `
-        --define "process.env.JARVIS_GIT_SHA=`"$buildGitSha`"" `
-        --define "process.env.JARVIS_BUILT_AT=`"$buildBuiltAt`""
+        --define "process.env.JARVIS_GIT_SHA=\`"$buildGitSha\`"" `
+        --define "process.env.JARVIS_BUILT_AT=\`"$buildBuiltAt\`""
     if ($LASTEXITCODE -ne 0) { Die 'server bundle build failed' }
 } finally { Pop-Location }
 if (-not (Test-Path $distJs)) { Die "server bundle not produced at $distJs" }
