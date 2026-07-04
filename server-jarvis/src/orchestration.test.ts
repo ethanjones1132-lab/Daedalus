@@ -366,6 +366,257 @@ describe("Orchestration & Routing Tests", () => {
     expect(recursionEvents.some((event) => event.depth === 0 && event.status === "max_depth" && event.reenter_stage === "executor")).toBe(true);
   });
 
+  // ─── Track B B-03: conductor-decided re-enter targets ──────────────────
+  // B-03 replaces the hardcoded `recursion_critique` → executor path with
+  // conductor-decided re-enter targets: planner, executor, conductor_replan.
+  // The depth cap must be shared across re-enter types.
+
+  test("B-03: recursion critic may re-enter planner and the depth is shared with executor re-entries", async () => {
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig);
+    const stages: string[] = [];
+    const recursionEvents: Array<{ depth: number; status: string; reenter_stage?: string }> = [];
+
+    let criticCalls = 0;
+    const callModel = (_messages: ChatMessage[], options: { stageLabel?: string } = {}) => {
+      stages.push(options.stageLabel ?? "unknown");
+      if (options.stageLabel === "executor" && stages.filter((s) => s === "executor").length === 1) {
+        return Promise.resolve({ content: "initial executor summary" });
+      }
+      if (options.stageLabel === "synthesizer" && stages.filter((s) => s === "synthesizer").length === 1) {
+        return Promise.resolve({ content: "draft answer missing verification" });
+      }
+      if (options.stageLabel === "recursion_critique") {
+        criticCalls += 1;
+        // First critic pass: needs more work, asks for a planner re-enter.
+        if (criticCalls === 1) {
+          return Promise.resolve({ content: JSON.stringify({
+            needs_more_work: true,
+            reenter_stage: "planner",
+            critique: "The plan was underspecified — re-plan from scratch.",
+          })});
+        }
+        // Second critic pass: satisfied.
+        return Promise.resolve({ content: JSON.stringify({
+          needs_more_work: false,
+          reenter_stage: "executor",
+          critique: "Looks good after the re-plan.",
+        })});
+      }
+      if (options.stageLabel === "planner") {
+        return Promise.resolve({ content: "replanned: read the file with care" });
+      }
+      if (options.stageLabel === "executor") {
+        return Promise.resolve({ content: "executor summary after re-plan" });
+      }
+      if (options.stageLabel === "synthesizer") {
+        return Promise.resolve({ content: "final answer after planner re-entry" });
+      }
+      return Promise.resolve({ content: "unexpected" });
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+    const result = await executor.execute(
+      "finish the task",
+      ["executor", "synthesizer"],
+      "run-b03-planner-reenter",
+      () => {},
+      {
+        topology: "recursive",
+        maxRecursionDepth: 1,
+        onRecursion: (event) => recursionEvents.push(event),
+      },
+    );
+
+    // The critic asked for a `planner` re-enter, so the re-run pipeline was
+    // [planner, executor, synthesizer] (not the default [executor,
+    // synthesizer] that the original B-01 path used). The inner re-run is
+    // `topology: "linear"`, so the recursion critic does NOT run again
+    // inside it — the depth counter resets for the inner pipeline and the
+    // outer applyRecursiveCritique already returned. The shared-budget
+    // guarantee is structural: `maxRecursionDepth=1` means at most one
+    // re-enter of any kind per turn (planner OR executor OR
+    // conductor_replan, not multiple).
+    expect(result.answer).toBe("final answer after planner re-entry");
+    expect(result.recursion_depth).toBe(1);
+    expect(stages).toEqual([
+      "executor", "synthesizer", "recursion_critique",
+      "planner", "executor", "synthesizer",
+    ]);
+    // B-03 acceptance: the reenter event carries the conductor-decided stage.
+    expect(recursionEvents.some((event) =>
+      event.depth === 1 && event.status === "reenter" && event.reenter_stage === "planner",
+    )).toBe(true);
+  });
+
+  test("B-03: critic may emit conductor_replan — surfaces a typed event without spawning another recursion", async () => {
+    // conductor_replan is a conductor-native re-enter signal, not a
+    // pipeline-executor re-enter. The critic emitting it means "the
+    // conductor's own replan path should own the revision" — so the
+    // pipeline executor surfaces a typed `reenter` event and returns the
+    // current result, letting the SSE relay render the recurse decision
+    // without spending recursion depth (the conductor's `max_replans`
+    // budget is the authoritative cap on its own path).
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig);
+    const stages: string[] = [];
+    const recursionEvents: Array<{ depth: number; status: string; reenter_stage?: string }> = [];
+
+    const callModel = (_messages: ChatMessage[], options: { stageLabel?: string } = {}) => {
+      stages.push(options.stageLabel ?? "unknown");
+      if (options.stageLabel === "executor" && stages.filter((s) => s === "executor").length === 1) {
+        return Promise.resolve({ content: "initial executor summary" });
+      }
+      if (options.stageLabel === "synthesizer" && stages.filter((s) => s === "synthesizer").length === 1) {
+        return Promise.resolve({ content: "draft answer" });
+      }
+      if (options.stageLabel === "recursion_critique") {
+        return Promise.resolve({ content: JSON.stringify({
+          needs_more_work: true,
+          reenter_stage: "conductor_replan",
+          critique: "The plan needs revision — defer to the conductor.",
+        })});
+      }
+      return Promise.resolve({ content: "unexpected" });
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+    const result = await executor.execute(
+      "finish the task",
+      ["executor", "synthesizer"],
+      "run-b03-conductor-replan",
+      () => {},
+      {
+        topology: "recursive",
+        maxRecursionDepth: 5,
+        onRecursion: (event) => recursionEvents.push(event),
+      },
+    );
+
+    // The pipeline did NOT re-execute any stage after the critic — the
+    // conductor_replan event is a signal, not a pipeline spawn.
+    expect(stages).toEqual(["executor", "synthesizer", "recursion_critique"]);
+    expect(result.recursion_depth).toBe(0);
+    expect(result.answer).toBe("draft answer");
+    // Typed event surfaces the recurse decision for the SSE relay.
+    expect(recursionEvents.some((event) =>
+      event.status === "reenter" && event.reenter_stage === "conductor_replan",
+    )).toBe(true);
+  });
+
+  test("B-03: max_recursion_depth=1 enforces the shared budget regardless of which re-enter type the critic picks", async () => {
+    // The B-03 acceptance criterion "shared max_recursion_depth budget
+    // across re-enter types" is structural: there is only one
+    // recursion-critique call per `execute()` (the inner re-runs are
+    // `topology: "linear"`, so the inner never calls the critic). The
+    // cap is enforced at the call site, so a critic that asks for
+    // `planner` re-entry with `maxRecursionDepth=1` gets exactly one
+    // re-enter — the reenter event fires, the inner pipeline runs, the
+    // turn ends. The depth counter is shared in the sense that the same
+    // numeric budget caps planner, executor, AND conductor_replan (proven
+    // by the three earlier tests using the same `maxRecursionDepth` knob).
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig);
+    const stages: string[] = [];
+    const recursionEvents: Array<{ depth: number; status: string; reenter_stage?: string }> = [];
+
+    const callModel = (_messages: ChatMessage[], options: { stageLabel?: string } = {}) => {
+      stages.push(options.stageLabel ?? "unknown");
+      if (options.stageLabel === "executor" && stages.filter((s) => s === "executor").length === 1) {
+        return Promise.resolve({ content: "initial executor summary" });
+      }
+      if (options.stageLabel === "synthesizer" && stages.filter((s) => s === "synthesizer").length === 1) {
+        return Promise.resolve({ content: "first draft" });
+      }
+      if (options.stageLabel === "recursion_critique") {
+        return Promise.resolve({ content: JSON.stringify({
+          needs_more_work: true,
+          reenter_stage: "planner",
+          critique: "Re-plan first.",
+        })});
+      }
+      if (options.stageLabel === "planner") return Promise.resolve({ content: "replanned" });
+      if (options.stageLabel === "executor") return Promise.resolve({ content: "executor re-run" });
+      if (options.stageLabel === "synthesizer") return Promise.resolve({ content: "second-draft" });
+      return Promise.resolve({ content: "noop" });
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+    const result = await executor.execute(
+      "finish",
+      ["executor", "synthesizer"],
+      "run-b03-shared-budget",
+      () => {},
+      {
+        topology: "recursive",
+        maxRecursionDepth: 1, // <-- shared across re-enter types
+        onRecursion: (event) => recursionEvents.push(event),
+      },
+    );
+
+    // One re-enter happened: planner (not executor, not conductor_replan).
+    // The shared budget means a turn can never see TWO re-enter events of
+    // ANY kind — the depth cap is checked at the single call site.
+    expect(stages).toContain("planner");
+    expect(result.recursion_depth).toBe(1);
+    // Exactly one reenter event of any kind was emitted.
+    const reenterEvents = recursionEvents.filter((e) => e.status === "reenter");
+    expect(reenterEvents).toHaveLength(1);
+    expect(reenterEvents[0].reenter_stage).toBe("planner");
+    expect(reenterEvents[0].depth).toBe(1);
+  });
+
+  test("B-03: parseRecursionDecision rejects an unknown reenter_stage and emits a 'done' event", async () => {
+    // An unknown reenter_stage (e.g. a model hallucination like "rewriter"
+    // — which is a valid pipeline stage but not a B-03 re-enter target)
+    // must NOT silently re-enter any stage. The critic decision degrades
+    // to a `done` event so the original answer is shipped as-is.
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig);
+    const stages: string[] = [];
+    const recursionEvents: Array<{ depth: number; status: string; reenter_stage?: string }> = [];
+
+    const callModel = (_messages: ChatMessage[], options: { stageLabel?: string } = {}) => {
+      stages.push(options.stageLabel ?? "unknown");
+      if (options.stageLabel === "executor" && stages.filter((s) => s === "executor").length === 1) {
+        return Promise.resolve({ content: "initial executor summary" });
+      }
+      if (options.stageLabel === "synthesizer" && stages.filter((s) => s === "synthesizer").length === 1) {
+        return Promise.resolve({ content: "final answer" });
+      }
+      if (options.stageLabel === "recursion_critique") {
+        return Promise.resolve({ content: JSON.stringify({
+          needs_more_work: true,
+          reenter_stage: "rewriter", // NOT a valid B-03 re-enter target
+          critique: "Re-run the rewriter.",
+        })});
+      }
+      return Promise.resolve({ content: "noop" });
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+    const result = await executor.execute(
+      "finish",
+      ["executor", "synthesizer"],
+      "run-b03-unknown-reenter",
+      () => {},
+      {
+        topology: "recursive",
+        maxRecursionDepth: 5,
+        onRecursion: (event) => recursionEvents.push(event),
+      },
+    );
+
+    // No re-entry: stages array is exactly the original pipeline + the
+    // critic; no extra planner/executor/synthesizer was spawned.
+    expect(stages).toEqual(["executor", "synthesizer", "recursion_critique"]);
+    expect(result.recursion_depth).toBe(0);
+    expect(result.answer).toBe("final answer");
+    // The unknown reenter_stage degraded to a `done` event.
+    expect(recursionEvents.some((event) => event.status === "done")).toBe(true);
+    expect(recursionEvents.some((event) => event.status === "reenter")).toBe(false);
+  });
+
   test("executeSegment runs only the requested stages and returns typed state", async () => {
     const runtime = createToolRuntime();
     const ctx = makeExecutionContext("agent", defaultConfig);

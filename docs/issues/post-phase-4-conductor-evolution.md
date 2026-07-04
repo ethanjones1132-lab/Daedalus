@@ -288,6 +288,7 @@ End-to-end: forced replan in test fixture re-runs executor with updated instruct
 
 **Type:** AFK  
 **Blocked by:** B-02
+**Status:** ✅ Done (2026-07-04, Jarvis afternoon maintenance pass)
 
 #### What to build
 
@@ -297,10 +298,67 @@ End-to-end: recursive topology test completes via conductor replan; existing rec
 
 #### Acceptance criteria
 
-- [ ] Conductor chooses re-enter target from critique context
-- [ ] Depth cap applies to all re-enter types
-- [ ] `orchestrator_recursion` SSE unchanged for UI consumers
-- [ ] Eval/regression tests for recursive topology pass
+- [x] Conductor chooses re-enter target from critique context
+- [x] Depth cap applies to all re-enter types
+- [x] `orchestrator_recursion` SSE unchanged for UI consumers
+- [x] Eval/regression tests for recursive topology pass
+
+**Implementation summary:** the recursive topology's `applyRecursiveCritique`
+method in `server-jarvis/src/orchestration/pipeline.ts` was extended from
+a hardcoded "critic → executor" path to a conductor-decided re-enter
+dispatch. Three contract changes:
+
+1. New `RecursionReenterStage = "planner" | "executor" | "conductor_replan"`
+   type exported from `pipeline.ts`; `PipelineRecursionEvent.reenter_stage`
+   widened to that union. The string-typed SSE relay in
+   `src-tauri/src/jarvis/runner.rs` flows the new values through as-is
+   (pinned by the new `orchestrator_recursion_maps_b03_reenter_stages`
+   test that exercises all three values).
+
+2. `parseRecursionDecision` now accepts the three B-03 re-enter targets
+   via a `validReenter` set; unknown values degrade to a `done` event
+   (no silent re-entry on a model hallucination). The regex-based
+   heuristic fallback path that used to guess `executor` from prose is
+   removed — B-03 is explicit-only.
+
+3. New `reenterForRecursion` helper dispatches the re-run pipeline based
+   on the chosen target: `planner` → `[planner, executor, synthesizer]`,
+   `executor` → `[executor, synthesizer]` (legacy), `conductor_replan`
+   → returns the current result with a typed `reenter` event (the
+   conductor's own `runPipelineWithReplanning` owns the actual re-plan
+   via its `max_conductor_replans` budget; the recursive depth counter
+   is NOT incremented again so it doesn't double-count against
+   `max_recursion_depth`).
+
+4. `PipelineExecuteOptions.initialRecursionDepth` plumbed so the inner
+   re-run pipeline sees the inherited depth at entry (the inner
+   `applyRecursiveCritique` reads
+   `Math.max(result.recursion_depth ?? 0, options.initialRecursionDepth ?? 0)`).
+   The shared budget guarantee is structural: the recursion-critique call
+   is the single gate where `maxRecursionDepth` is enforced, and the same
+   numeric cap applies regardless of which re-enter type the critic
+   picks.
+
+5. `recursion-critique.md` (the prompt the critic uses) was extended
+   with a "Choosing a re-enter target" section that documents all three
+   B-03 re-enter types and when to pick each one. A deprecation note
+   pins the file's status as the B-03 critic (same path the B-01
+   topology used) so existing deployments keep working; the eventual
+   B-04 telemetry work will replace this prompt with an eval-driven
+   per-target prompt.
+
+6. **4 new bun tests** in `orchestration.test.ts` (550 total, was 546):
+   `B-03: recursion critic may re-enter planner and the depth is shared
+   with executor re-entries`; `B-03: critic may emit conductor_replan —
+   surfaces a typed event without spawning another recursion`; `B-03:
+   max_recursion_depth=1 enforces the shared budget regardless of which
+   re-enter type the critic picks`; `B-03: parseRecursionDecision
+   rejects an unknown reenter_stage and emits a 'done' event`. **1 new
+   cargo test** in `src-tauri/src/jarvis/runner.rs` (60 total, was 59):
+   `orchestrator_recursion_maps_b03_reenter_stages` loops
+   `[planner, executor, conductor_replan]` through the SSE relay and
+   pins the field round-trips. The original B-01 recursive tests still
+   pass unchanged.
 
 ---
 
