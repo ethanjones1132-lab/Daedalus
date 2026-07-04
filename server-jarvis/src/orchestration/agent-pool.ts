@@ -254,8 +254,45 @@ export class AgentPool {
     const candidates = this.enabled().filter(filterExclude).map(applyLearnedCapabilities);
     if (candidates.length === 0) return undefined;
     const stageDefault = candidates.find((agent) => agent.default_for.includes(stage));
-    if (stageDefault) return stageDefault;
+    if (stageDefault) {
+      if (stage === "synthesizer") return this.preferFastSynthesizer(stageDefault, candidates, taskType);
+      return stageDefault;
+    }
     return candidates.sort((a, b) => this.score(b, stage, taskType) - this.score(a, stage, taskType))[0];
+  }
+
+  /**
+   * Live incident 2026-07-03 (session 1d4727cf, turn 1): a custom config pool
+   * resolved `nemotron-3-ultra-free` — a strong-reasoning but slow model
+   * (pool speed 0.55) — as the `default_for: ["synthesizer"]` pick, which is
+   * the user-visible answer stage. Slow cold-starts there read as the
+   * assistant hanging. Reasoning quality matters less than latency for the
+   * synthesizer specifically (it's turning already-gathered context into
+   * prose, not solving a hard problem), so when the stage default is slow
+   * (speed < 0.7) we demote it to fallback/cascade position and promote the
+   * best-scoring candidate that still clears the speed bar. If nothing
+   * clears the bar, we keep the original default rather than leave the
+   * stage uncovered — a slow answer beats no answer. Reuses the same
+   * `score` machinery `pickFor` already falls back to for other stages, so
+   * this isn't a parallel selection path — just a narrower candidate set.
+   */
+  private preferFastSynthesizer(
+    stageDefault: OrchestratorAgent,
+    candidates: OrchestratorAgent[],
+    taskType: TaskType | string,
+  ): OrchestratorAgent {
+    if (stageDefault.capabilities.speed >= 0.7) return stageDefault;
+    const fastCandidates = candidates.filter((agent) => agent.capabilities.speed >= 0.7);
+    if (fastCandidates.length === 0) return stageDefault;
+    const replacement = fastCandidates.sort(
+      (a, b) => this.score(b, "synthesizer", taskType) - this.score(a, "synthesizer", taskType),
+    )[0]!;
+    console.warn(
+      `[agent-pool] synthesizer default "${stageDefault.model_id}" demoted (speed ${stageDefault.capabilities.speed} < 0.7); ` +
+        `using "${replacement.model_id}" (speed ${replacement.capabilities.speed}) for fast prose instead. ` +
+        `"${stageDefault.model_id}" remains available as a fallback/cascade member.`,
+    );
+    return replacement;
   }
 
   fallbackChain(selected: OrchestratorAgent, stage?: string, taskType?: TaskType | string): OrchestratorAgent[] {
@@ -367,8 +404,24 @@ export function formatPoolDiversity(coverage: AgentPoolCoverage): string {
 /**
  * Resolve the first-token watchdog timeout (in ms) for a model that may be
  * present in the agent pool. Lookup order:
- *   1. Exact `model_id` match in the pool with a `first_token_timeout_ms` set.
- *   2. `baseMs` argument (the caller's default — usually the global 30s).
+ *   1. Exact `model_id` match in the ACTIVE pool with a `first_token_timeout_ms` set.
+ *   2. Exact `model_id` match in the DEFAULT pool with a `first_token_timeout_ms` set.
+ *   3. `baseMs` argument (the caller's default — usually the global 30s).
+ * Step 2 exists because of the 2026-07-03 incident (session 1d4727cf): a
+ * user's live config supplies a fully CUSTOM `orchestrator.agents` array (16
+ * agents, none carrying `first_token_timeout_ms`), and the active pool at the
+ * call site is built straight from that config — so it silently shadows the
+ * DEFAULT pool's per-model overrides. `nemotron-3-ultra-free` has a known
+ * 55s cold-start profile (see DEFAULT_ORCHESTRATOR_AGENTS above), but the
+ * custom pool has no opinion on it, so the lookup fell through to the global
+ * 30s and aborted mid-stream right as content began arriving. A missing
+ * tuning field in a custom pool must not silently discard a model's known
+ * cold-start profile — inherit it from the DEFAULT pool by `model_id` before
+ * giving up and using the generic default. Exception: if the active pool
+ * knows the model_id but has explicitly disabled it, that's a deliberate
+ * "don't trust this model" signal and the DEFAULT pool's override is not
+ * inherited (matches the pre-existing "disabled agents don't get overrides"
+ * contract this helper already had).
  * The returned value is clamped to `[1_000, capMs]` so it can never exceed the
  * outer stream-stall watchdog and can never be zero/negative. Pass
  * `capMs = Infinity` to skip the upper clamp (used by callers that don't have
@@ -382,8 +435,20 @@ export function firstTokenTimeoutFor(
 ): number {
   const fallback = Math.max(1_000, Number(baseMs) || 30_000);
   if (!pool || !modelId) return Math.min(fallback, capMs);
+  const knownButDisabled = pool.list().some(
+    (agent) => agent.model_id === modelId && !agent.enabled,
+  );
   const match = pool.enabled().find((agent) => agent.model_id === modelId);
-  const override = match?.first_token_timeout_ms;
+  let override = match?.first_token_timeout_ms;
+  if ((typeof override !== "number" || !Number.isFinite(override)) && !knownButDisabled) {
+    // Active pool has no opinion for this model — fall back to the DEFAULT
+    // pool's override for the same model_id before giving up entirely. Skip
+    // this when the active pool explicitly disabled the model: disabling is
+    // an intentional "don't trust this model" signal that must not be
+    // silently overridden by the DEFAULT pool's tuning.
+    const defaultMatch = DEFAULT_ORCHESTRATOR_AGENTS.find((agent) => agent.model_id === modelId);
+    override = defaultMatch?.first_token_timeout_ms;
+  }
   if (typeof override !== "number" || !Number.isFinite(override)) {
     return Math.min(fallback, capMs);
   }
