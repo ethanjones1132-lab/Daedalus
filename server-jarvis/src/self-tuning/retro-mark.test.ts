@@ -218,6 +218,42 @@ describe("retro-mark poisoned runs", () => {
     expect(agentBExecutor?.failure_count).toBe(1); // untouched
   });
 
+  test("applying twice is idempotent — second apply is a no-op and counters are unchanged", () => {
+    // Double-apply safety rests on two independent guards: the SQL outcome
+    // filter in findPoisonedRuns (a run already marked 'failed' is no longer
+    // a candidate) and the `was_successful !== 1` guard on attribution
+    // flipping. A future refactor could silently break either one — this
+    // test pins the property.
+    const db = makeDb();
+    insertRun(db, "run_tool_json_leak", '{"name":"read_file","arguments":{"path":"foo.ts"}}', "success");
+    insertRun(db, "run_synthesis_failed", "Synthesis failed: upstream 500", null);
+    insertAttribution(db, "attr_leak_synth", "run_tool_json_leak", "synthesizer", "agent_a", 1);
+    insertAttribution(db, "attr_synfail_synth", "run_synthesis_failed", "synthesizer", "agent_a", 1);
+    insertPerformance(db, "agent_a", "synthesizer", "general", 10, 2);
+
+    const first = retroMarkPoisonedRuns(db, { apply: true });
+    expect(first.runsMarked).toBe(2);
+    expect(first.attributionsFlipped).toBe(2);
+    expect(first.performanceRowsAdjusted).toBe(1);
+
+    const afterFirst = snapshot(db);
+
+    const second = retroMarkPoisonedRuns(db, { apply: true });
+    expect(second.runsMarked).toBe(0);
+    expect(second.attributionsFlipped).toBe(0);
+    expect(second.performanceRowsAdjusted).toBe(0);
+    expect(second.details).toEqual([]);
+
+    // The DB — including agent_performance success/failure counters — is
+    // identical to the state after the first apply.
+    expect(snapshot(db)).toEqual(afterFirst);
+    const perf = db
+      .query("SELECT success_count, failure_count FROM agent_performance WHERE agent_id = ? AND stage_id = ? AND task_type = ?")
+      .get("agent_a", "synthesizer", "general") as { success_count: number; failure_count: number };
+    expect(perf.success_count).toBe(8); // 10 - 2 after first apply, not decremented again
+    expect(perf.failure_count).toBe(4); // 2 + 2 after first apply, not incremented again
+  });
+
   test("clamps success_count/failure_count at >= 0 and leaves missing performance rows alone", () => {
     const db = makeDb();
     insertRun(db, "run_tool_json_leak", '{"name":"read_file","arguments":{"path":"foo.ts"}}', "success");
