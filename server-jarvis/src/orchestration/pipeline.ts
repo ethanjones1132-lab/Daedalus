@@ -160,6 +160,13 @@ export function describePipelineError(raw: string): string {
   if (/\b5\d\d\b/.test(msg) || /bad gateway/i.test(msg) || /unavailable/i.test(msg)) {
     return `The inference provider returned a server error. ${msg}`;
   }
+  // First-token / inter-token stalls (index.ts's FirstTokenTimeoutError and the
+  // stream-idle watchdog) are a hung model, not a user mistake — the bare
+  // "First-token timeout (30000ms) on model=..." text read like a crash to
+  // operators. Keep the raw message in parens so the detail isn't lost.
+  if (/first-token timeout|stream idle timeout/i.test(msg)) {
+    return `The answering model stalled before responding, so I aborted it. Try again — the router will pick a different model. (${msg})`;
+  }
   return msg;
 }
 
@@ -694,7 +701,14 @@ export class PipelineExecutor {
         had_error: 1,
         error_message: message,
       });
-      return { answer: `Synthesis failed: ${message}`, fatalError, emptyCompletion: false };
+      // `answer` must never carry the raw failure text — 20 historical runs
+      // (pre-2026-07-04) shipped "Synthesis failed: ..." as the literal chat
+      // bubble because this catch block returned it as the answer. The real
+      // failure travels via `fatalError` (-> PipelineResult.error), which
+      // index.ts's error branch turns into an SSE error frame instead of
+      // prose (see `if (result.error) ... session.finish(result.error, {
+      // isError: true })`).
+      return { answer: "", fatalError, emptyCompletion: false };
     }
   }
 
@@ -925,7 +939,11 @@ export class PipelineExecutor {
         error_message: errText(e),
       });
 
-      return { answer: `Synthesis failed: ${errText(e)}`, error: fatalError, recursion_depth: 0, outcome: "failed", error_code: "stage_error" };
+      // See the matching comment in runSynthesizerStage: never surface the
+      // raw failure text as the answer bubble. `error` (fatalError) carries
+      // it through PipelineResult.error, which index.ts turns into an SSE
+      // error frame.
+      return { answer: "", error: fatalError, recursion_depth: 0, outcome: "failed", error_code: "stage_error" };
     }
   }
 
@@ -1087,7 +1105,11 @@ export class PipelineExecutor {
         error_message: errText(e),
       });
 
-      return { answer: `Synthesis failed: ${errText(e)}`, error: fatalError, recursion_depth: 0, outcome: "failed", error_code: "stage_error" };
+      // See the matching comment in runSynthesizerStage: never surface the
+      // raw failure text as the answer bubble. `error` (fatalError) carries
+      // it through PipelineResult.error, which index.ts turns into an SSE
+      // error frame.
+      return { answer: "", error: fatalError, recursion_depth: 0, outcome: "failed", error_code: "stage_error" };
     }
   }
 

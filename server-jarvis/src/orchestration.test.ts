@@ -164,9 +164,12 @@ describe("Orchestration & Routing Tests", () => {
 
     const result = await executor.execute("hi", ["synthesizer"], "run-auth-fail", (state) => states.push(state as any));
 
-    // The answer still carries the raw notice for logging, but `error` is set so
-    // the caller emits an error frame instead of a fake "success".
-    expect(result.answer).toContain("Synthesis failed");
+    // `answer` must NEVER carry "Synthesis failed: ..." — 20 historical runs
+    // (pre-2026-07-04) shipped that raw text as the literal chat bubble.
+    // The failure travels via `error` only, which index.ts's error branch
+    // turns into an SSE error frame instead of prose.
+    expect(result.answer).toBe("");
+    expect(result.answer).not.toContain("Synthesis failed");
     expect(result.error).toBeDefined();
     expect(result.error).toMatch(/Authentication failed \(401\)/);
     expect(states.some((s) => s.stage === "synthesizer" && s.status === "failed")).toBe(true);
@@ -214,6 +217,37 @@ describe("Orchestration & Routing Tests", () => {
     expect(starts).toEqual(["planner", "reviewer", "synthesizer"]);
     expect(synthesizerInputs[0]).toContain("planner outline");
     expect(synthesizerInputs[0]).toContain("reviewer cautions");
+  });
+
+  test("speculative-parallel synthesizer failure surfaces as an error, never as answer prose", async () => {
+    // Same "never ship the raw catch text as the chat bubble" contract as the
+    // linear-pipeline test above, but for executeSpeculativeParallel's own
+    // synthesizer catch block (a separate code path with its own try/catch).
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig);
+
+    const callModel = (_messages: ChatMessage[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "planner") return Promise.resolve({ content: "planner outline" });
+      if (options.stageLabel === "reviewer") return Promise.resolve({ content: "reviewer cautions" });
+      if (options.stageLabel === "synthesizer") {
+        return Promise.reject(new Error("API 401: {\"error\":{\"message\":\"User not found.\",\"code\":401}}"));
+      }
+      return Promise.resolve({ content: "unexpected" });
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+    const result = await executor.execute(
+      "compare two implementation paths",
+      ["planner", "reviewer", "synthesizer"],
+      "run-speculative-fail",
+      () => {},
+      { topology: "speculative_parallel" },
+    );
+
+    expect(result.answer).toBe("");
+    expect(result.answer).not.toContain("Synthesis failed");
+    expect(result.error).toBeDefined();
+    expect(result.error).toMatch(/Authentication failed \(401\)/);
   });
 
   test("PipelineExecutor escalates speculative cascade when cheap confidence is low", async () => {
@@ -474,6 +508,23 @@ describe("Orchestration & Routing Tests", () => {
     expect(describePipelineError("API 502: bad gateway")).toMatch(/server error/);
     // Non-transport errors pass through unchanged.
     expect(describePipelineError("boom")).toBe("boom");
+  });
+
+  test("describePipelineError gives a friendly description for stalled-model timeouts", () => {
+    // First-token / inter-token watchdog messages (index.ts's
+    // FirstTokenTimeoutError, openrouter.ts's "(first-token timeout)" text)
+    // used to surface to the user as a raw "First-token timeout (30000ms)
+    // on model=..." string, which read like an internal crash.
+    const firstToken = describePipelineError("First-token timeout (30000ms) on model=foo stage=synthesizer");
+    expect(firstToken).toMatch(/stalled before responding/i);
+    expect(firstToken).toContain("(First-token timeout (30000ms) on model=foo stage=synthesizer)");
+
+    const streamIdle = describePipelineError("stream idle timeout after 45000ms");
+    expect(streamIdle).toMatch(/stalled before responding/i);
+    expect(streamIdle).toContain("(stream idle timeout after 45000ms)");
+
+    // Existing auth mapping must still take priority for unrelated errors.
+    expect(describePipelineError("API 401: invalid api key")).toMatch(/Authentication failed \(401\)/);
   });
 
   test("builtin modes expose expected finality and filters", () => {

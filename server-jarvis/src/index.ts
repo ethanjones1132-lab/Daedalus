@@ -1871,7 +1871,27 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
             if (exclude.size === 0) break; // no exclusion built → nothing to advance past
             console.warn(`[Jarvis Orchestrator] empty completion from ${last?._provider}:${last?._modelUsed} stage=${callOptions?.stageLabel ?? "?"} — advancing cascade (excluding it)`);
-            last = await callModelAttempt(messages, callOptions, exclude);
+            // Nudge the retry model toward plain prose. `normalizeMessagesForLLM`
+            // (above) only merges LEADING system messages into one; a system
+            // message appended at the end would land mid-array and get
+            // demoted to a `[System: ...]`-wrapped user message instead of
+            // staying in the actual system prompt. So we splice the nudge
+            // into the existing leading system message's content (or add one
+            // if the stage somehow has none) rather than pushing a new
+            // trailing message — and we copy the array/message objects so the
+            // original `messages` passed to this closure is never mutated.
+            const nudge = "You have no tools available. Answer the user in plain prose now — do not emit tool_call syntax, tool JSON, or any function-call markup.";
+            const nudgedMessages = [...messages];
+            const leadingSystemIdx = nudgedMessages.findIndex((m) => m?.role === "system");
+            if (leadingSystemIdx >= 0) {
+              nudgedMessages[leadingSystemIdx] = {
+                ...nudgedMessages[leadingSystemIdx],
+                content: `${nudgedMessages[leadingSystemIdx].content ?? ""}\n\n${nudge}`,
+              };
+            } else {
+              nudgedMessages.unshift({ role: "system", content: nudge });
+            }
+            last = await callModelAttempt(nudgedMessages, callOptions, exclude);
           }
           return last;
         };
