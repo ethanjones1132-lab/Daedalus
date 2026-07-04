@@ -58,8 +58,8 @@ const CANONICAL_ORDER: StageName[] = ["planner", "executor", "reviewer", "rewrit
 const ALLOWED_STAGES: Record<TurnRequirement, ReadonlySet<StageName>> = {
   conversational: new Set<StageName>(["synthesizer"]),
   answer_only: new Set<StageName>(["planner", "executor", "reviewer", "synthesizer"]),
-  // No rewriter for read turns — rewriting is a mutation stage.
-  workspace_read: new Set<StageName>(["planner", "executor", "reviewer", "synthesizer"]),
+  // Minimal deterministic read route: one bounded executor, then synthesis.
+  workspace_read: new Set<StageName>(["executor", "synthesizer"]),
   full_execution: new Set<StageName>(["planner", "executor", "reviewer", "rewriter", "synthesizer"]),
 };
 

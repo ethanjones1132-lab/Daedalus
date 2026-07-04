@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { BUILTIN_MODES, getToolsForMode } from "./orchestration/modes";
+import { BUILTIN_MODES, executorTurnLimit, getToolsForMode } from "./orchestration/modes";
 import { PredictiveRouter } from "./orchestration/router";
 import { PipelineExecutor, describePipelineError, errText } from "./orchestration/pipeline";
 import { createToolRuntime, makeExecutionContext } from "./tool-runtime";
@@ -143,6 +143,11 @@ describe("Orchestration & Routing Tests", () => {
     expect(executorToolNames.sort()).toEqual(["list_directory", "read_file"]);
     expect(executorToolNames).not.toContain("write_file");
     expect(executorToolNames).not.toContain("bash");
+  });
+
+  test("read_only executor is bounded to two model rounds", () => {
+    expect(executorTurnLimit("read_only")).toBe(2);
+    expect(executorTurnLimit("full")).toBe(BUILTIN_MODES.executor.max_turns);
   });
 
   test("PipelineExecutor surfaces a synthesizer failure as a turn-fatal error", async () => {

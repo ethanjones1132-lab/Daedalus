@@ -53,7 +53,7 @@ describe("runPipelineWithReplanning", () => {
     const result = await runPipelineWithReplanning({
       contextMessage: "migrate the users table",
       initialDecision: baseDecision(),
-      turnRequirement: "workspace_read",
+      turnRequirement: "full_execution",
       coordinator,
       routeOptions: { sessionId: "s1" },
       executor,
@@ -89,7 +89,7 @@ describe("runPipelineWithReplanning", () => {
     const result = await runPipelineWithReplanning({
       contextMessage: "migrate the users table",
       initialDecision: baseDecision(),
-      turnRequirement: "workspace_read",
+      turnRequirement: "full_execution",
       coordinator,
       routeOptions: { sessionId: "s1" },
       executor,
@@ -142,7 +142,7 @@ describe("runPipelineWithReplanning", () => {
     const result = await runPipelineWithReplanning({
       contextMessage: "migrate the users table",
       initialDecision: baseDecision(),
-      turnRequirement: "workspace_read",
+      turnRequirement: "full_execution",
       coordinator,
       routeOptions: { sessionId: "s1" },
       executor,

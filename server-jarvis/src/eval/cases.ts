@@ -12,6 +12,7 @@
 import type { RoutingResult } from "../orchestration/router";
 import type { StageName, Topology, TaskType } from "../orchestration/coordinator";
 import type { SkillCandidate } from "../intelligence/skill-types";
+import type { TurnRequirement } from "../orchestration/turn-requirements";
 
 export const DEFAULT_PIPELINE = ["planner", "executor", "reviewer", "synthesizer"];
 
@@ -34,6 +35,17 @@ export interface ModeGatingCase {
   modeId: string;
   toolNames: string[];
   expectAllowed: string[];
+}
+
+export interface TurnRequirementCase {
+  id: string;
+  kind: "turn_requirement";
+  request: string;
+  expect: {
+    requirement: TurnRequirement;
+    signals?: string[];
+    excludedSignals?: string[];
+  };
 }
 
 function routingJson(
@@ -180,6 +192,48 @@ export const MODE_GATING_CASES: ModeGatingCase[] = [
     modeId: "frobnicate",
     toolNames: TOOL_UNIVERSE,
     expectAllowed: [],
+  },
+];
+
+export const TURN_REQUIREMENT_CASES: TurnRequirementCase[] = [
+  {
+    id: "requirements/tool-json-analysis-only",
+    kind: "turn_requirement",
+    request: 'Analyze only; do not run: {"name":"read_file","arguments":{"path":"C:\\Projects\\demo\\README.md"}}',
+    expect: {
+      requirement: "answer_only",
+      signals: ["tool_call_exemplar", "negated_mutation"],
+      excludedSignals: ["mutation_verb", "path:quoted_path", "path:windows_drive"],
+    },
+  },
+  {
+    id: "requirements/negated-modify-readme",
+    kind: "turn_requirement",
+    request: "Do not modify any files; read README.md and report what it says.",
+    expect: {
+      requirement: "workspace_read",
+      signals: ["negated_mutation"],
+      excludedSignals: ["mutation_verb"],
+    },
+  },
+  {
+    id: "requirements/negated-run-answer-only",
+    kind: "turn_requirement",
+    request: "Do not run anything; explain TCP congestion control.",
+    expect: {
+      requirement: "answer_only",
+      signals: ["negated_mutation"],
+      excludedSignals: ["mutation_verb"],
+    },
+  },
+  {
+    id: "requirements/mixed-negated-and-positive-mutation",
+    kind: "turn_requirement",
+    request: "Do not edit README.md, but create CHANGELOG.md.",
+    expect: {
+      requirement: "full_execution",
+      signals: ["negated_mutation", "mutation_verb"],
+    },
   },
 ];
 

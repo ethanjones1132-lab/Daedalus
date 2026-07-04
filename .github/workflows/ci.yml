@@ -109,6 +109,19 @@ jobs:
         run: bun install --frozen-lockfile && bun build ./src/index.ts --outdir ./dist --target bun
         working-directory: server-jarvis
 
+      # tauri.conf.json's frontendDist points at ../src-ui/dist, and
+      # generate_context!() validates that path exists at compile time
+      # (cargo check/test fails with "frontendDist ... doesn't exist"
+      # otherwise). src-ui/dist is gitignored, so build it here too —
+      # src-ui ships package-lock.json, so npm is its package manager.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build UI bundle (tauri frontendDist)
+        run: npm ci && npx vite build
+        working-directory: src-ui
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2

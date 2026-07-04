@@ -78,6 +78,11 @@ export const BUILTIN_MODES: Record<string, AgentMode> = {
   },
 };
 
+/** Read-only inspection gets one tool attempt plus one correction/final pass. */
+export function executorTurnLimit(profile: ExecutionProfile): number {
+  return profile === "read_only" ? 2 : BUILTIN_MODES.executor.max_turns;
+}
+
 export function getToolsForMode(
   modeId: string,
   allTools: ToolDefinition[],

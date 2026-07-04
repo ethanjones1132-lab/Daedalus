@@ -23,7 +23,7 @@
 // terminal `message_stop` is emitted, even on error or early return.
 
 import { ReasoningParser, type ReasoningEvent } from "./reasoning";
-import { TextToolCallStreamSanitizer } from "./text-tools";
+import { VisibleAnswerStreamSanitizer } from "./text-tools";
 
 /** Writes a single pre-formatted SSE frame. Returns false if the client is gone. */
 export type StreamWriteFn = (frame: string) => Promise<boolean>;
@@ -52,7 +52,15 @@ export class VisibleTextPipe {
   private readonly reasoningEnabled: boolean;
   private readonly write: StreamWriteFn;
   private readonly reasoning: ReasoningParser;
-  private readonly sanitizer = new TextToolCallStreamSanitizer();
+  // VisibleTextPipe is the single source of truth for user-visible text in
+  // the direct chat path. It must strip both tagged tool calls (via
+  // TextToolCallStreamSanitizer, which VisibleAnswerStreamSanitizer wraps)
+  // AND bare-JSON tool lines (via VisibleAnswerStreamSanitizer) so that a
+  // model which hallucinates either form of tool markup does not leak it
+  // into the visible chat bubble. Defense-in-depth: the post-turn
+  // extractTextToolCalls extractor (server-jarvis/src/text-tools.ts) catches
+  // anything that survives streaming.
+  private readonly sanitizer = new VisibleAnswerStreamSanitizer();
   private finished = false;
 
   constructor(opts: VisibleTextPipeOptions) {
@@ -120,15 +128,16 @@ export interface StreamSessionOptions {
 }
 
 /**
- * Per-request stream coordinator. Its job is to guarantee that every stream
- * ends with exactly one terminal `message_stop`, so the Rust client never sees
- * a byte-stream that ends without a recognised terminator.
+ * Per-request stream coordinator. It independently tracks the transport
+ * `message_stop` and the user-visible terminal outcome (`result`, `error`, or
+ * `cancelled`) so one cannot accidentally suppress the other.
  */
 export class StreamSession {
   private readonly sessionId: string;
   private readonly write: StreamWriteFn;
   private readonly isAborted: () => boolean;
   private terminalSent = false;
+  private outcomeSent = false;
 
   constructor(opts: StreamSessionOptions) {
     this.sessionId = opts.sessionId;
@@ -145,19 +154,36 @@ export class StreamSession {
     return this.terminalSent;
   }
 
-  /** Record that a terminal event was emitted by other code (forwarded CLI
-   *  `message_stop`, a `cancelled` frame, etc.) so we don't double-terminate. */
+  hasOutcome(): boolean {
+    return this.outcomeSent;
+  }
+
+  /** Record a transport-level `message_stop` emitted by another path. */
   noteTerminal(): void {
     this.terminalSent = true;
+  }
+
+  /** Record an externally-emitted result, error, or cancelled outcome.
+   * Returns false when another outcome already won the race. */
+  noteOutcome(): boolean {
+    if (this.outcomeSent) return false;
+    this.outcomeSent = true;
+    return true;
   }
 
   async init(model: string | null | undefined): Promise<void> {
     await this.write(sseFrame({ type: "init", session_id: this.sessionId, model: model ?? null }));
   }
 
-  /** Emit a non-terminal error frame. The terminator is still sent afterwards. */
-  async error(message: string): Promise<void> {
-    await this.write(sseFrame({ type: "error", error: message, session_id: this.sessionId }));
+  /** Emit the terminal error outcome. The transport terminator is sent separately. */
+  async error(message: string, code?: string): Promise<void> {
+    if (!this.noteOutcome()) return;
+    await this.write(sseFrame({
+      type: "error",
+      error: message,
+      ...(code ? { code } : {}),
+      session_id: this.sessionId,
+    }));
   }
 
   /**
@@ -171,20 +197,20 @@ export class StreamSession {
    * as if it were a real answer — which previously made auth failures look
    * like a silent stall.
    */
-  async finish(result?: string, opts?: { isError?: boolean }): Promise<void> {
-    if (this.terminalSent) return;
-    this.terminalSent = true;
-    await this.write(sseFrame({ type: "message_stop", session_id: this.sessionId }));
-    if (result !== undefined) {
-      const isError = opts?.isError ?? false;
-      await this.write(sseFrame({
-        type: "result",
-        subtype: isError ? "error" : "success",
-        is_error: isError,
-        result,
-        session_id: this.sessionId,
-      }));
+  async finish(result: string, opts?: { isError?: boolean }): Promise<void> {
+    if (!this.noteOutcome()) return;
+    if (!this.terminalSent) {
+      this.terminalSent = true;
+      await this.write(sseFrame({ type: "message_stop", session_id: this.sessionId }));
     }
+    const isError = opts?.isError ?? false;
+    await this.write(sseFrame({
+      type: "result",
+      subtype: isError ? "error" : "success",
+      is_error: isError,
+      result,
+      session_id: this.sessionId,
+    }));
   }
 
   /**
@@ -193,9 +219,18 @@ export class StreamSession {
    * (an aborted stream can't be written to and the client has moved on).
    */
   async ensureTerminal(): Promise<void> {
+    if (this.isAborted()) {
+      this.terminalSent = true;
+      return;
+    }
+    if (!this.outcomeSent) {
+      await this.error(
+        "The Jarvis stream ended without a terminal outcome.",
+        "stream_ended_without_outcome",
+      );
+    }
     if (this.terminalSent) return;
     this.terminalSent = true;
-    if (this.isAborted()) return;
     await this.write(sseFrame({ type: "message_stop", session_id: this.sessionId }));
   }
 }

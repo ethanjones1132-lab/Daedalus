@@ -341,6 +341,17 @@ export class VisibleAnswerStreamSanitizer {
   }
 }
 
+/**
+ * Choose the stream sanitizer by protocol, not by whether the stage is the
+ * final answer. Non-tool planner/reviewer activity can hallucinate the same
+ * bare tool JSON as a synthesizer and must be cleaned before it reaches SSE.
+ */
+export function createStageStreamSanitizer(useTextTools: boolean): TextToolCallStreamSanitizer | VisibleAnswerStreamSanitizer {
+  return useTextTools
+    ? new TextToolCallStreamSanitizer()
+    : new VisibleAnswerStreamSanitizer();
+}
+
 export async function executeTextToolCall(
   call: ToolCall,
   cfg: JarvisConfig,
@@ -455,12 +466,65 @@ function isCosmeticToolEchoPayload(value: unknown): boolean {
   return payloadKeys.length > 0;
 }
 
+// ── Shared strict predicate for cosmetic tool echo detection ────────────
+// Used by BOTH the streaming sanitizer and the post-turn extractTextToolCalls
+// cosmetic strip so the two layers agree on what is "hallucinated tool JSON".
+//
+// The looser isCosmeticToolEchoPayload (above) was correct for the streaming
+// path where we want to err on the side of dropping clearly-tool-shaped JSON,
+// but in the post-turn cosmetic strip a too-loose predicate risks swallowing
+// genuine JSON in prose (e.g. `{"name":"search","query":"x"}` in a status line
+// about a search). The strict variant requires EITHER an explicit args field
+// (arguments/args/input) OR a legacy flat block with at least one payload key
+// beyond the control keys (id/name/tool/tool_name/function/type).
+function isCosmeticToolEchoPayloadStrict(value: unknown): boolean {
+  if (Array.isArray(value)) {
+    return value.length > 0 && value.every((item) => isCosmeticToolEchoPayloadStrict(item));
+  }
+  if (!value || typeof value !== "object") return false;
+
+  const record = value as Record<string, unknown>;
+  const nestedCalls = record.tool_calls ?? record.tools ?? record.calls;
+  if (Array.isArray(nestedCalls)) {
+    return nestedCalls.length > 0 && nestedCalls.every((item) => isCosmeticToolEchoPayloadStrict(item));
+  }
+
+  const rawName = stringValue(record.name ?? record.tool ?? record.tool_name ?? record.function);
+  if (!rawName) return false;
+
+  const key = rawName.trim().replace(/\s+/g, "_").toLowerCase();
+  if (!TOOL_ALIASES[key]) return false;
+
+  // Require at least one of the explicit arguments keys — a generic
+  // {"name":"search","query":"x"} in prose has no arguments/args/input
+  // and is therefore KEPT by the strict predicate. Only genuine tool-call
+  // shapes (with arguments) or legacy flat blocks keyed by tool/tool_name
+  // are stripped.
+  const hasExplicitArgs =
+    record.arguments !== undefined ||
+    record.args !== undefined ||
+    record.input !== undefined;
+
+  const legacyToolName = stringValue(record.tool ?? record.tool_name);
+  if (legacyToolName && TOOL_ALIASES[legacyToolName.trim().replace(/\s+/g, "_").toLowerCase()]) {
+    // Legacy flat block: {"tool":"find_files","path":"."} — require at
+    // least one payload key beyond the control keys to avoid matching
+    // bare {"tool":"read_file"} in prose.
+    const controlKeys = new Set(["id", "name", "tool", "tool_name", "function", "type"]);
+    const payloadKeys = Object.keys(record).filter((k) => !controlKeys.has(k));
+    return payloadKeys.length > 0;
+  }
+
+  return hasExplicitArgs;
+}
+
 function findCosmeticToolEchoLineSpans(text: string, candidates: Candidate[]): TextSpan[] {
   const fencedLines = findFencedLineSpans(text);
   const groups = new Map<string, { start: number; end: number; candidates: Candidate[] }>();
 
   for (const candidate of candidates) {
-    if (!isCosmeticToolEchoPayload(candidate.value)) continue;
+    if (!isCosmeticToolEchoPayloadStrict(candidate.value)) continue;
+    // Never strip inside fenced code blocks
     if (fencedLines.some((span) => candidate.start < span.end && candidate.end > span.start)) continue;
 
     const lineStart = text.lastIndexOf("\n", candidate.start - 1) + 1;

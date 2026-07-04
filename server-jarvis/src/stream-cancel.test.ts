@@ -33,7 +33,8 @@ describe("streamJarvis cancel contract", () => {
     });
 
     const emitCancelled = async (): Promise<never> => {
-      if (!session.hasTerminated()) {
+      if (!session.hasOutcome()) {
+        session.noteOutcome();
         session.noteTerminal();
         await rec.write(`data: ${JSON.stringify({ type: "cancelled", session_id: "sess-1" })}\n\n`);
       }

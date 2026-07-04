@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   extractTextToolCalls,
+  createStageStreamSanitizer,
   hasExplicitWebSearchIntent,
   TextToolCallStreamSanitizer,
   VisibleAnswerStreamSanitizer,
@@ -88,6 +89,14 @@ function sanitizeVisibleAnswer(chunks: string[]): string {
 }
 
 describe("text tool extraction", () => {
+  test("non-tool orchestration stages suppress bare tool markup before activity is emitted", () => {
+    const sanitizer = createStageStreamSanitizer(false);
+
+    expect(sanitizer.push('{"name":"read_file","arguments":{"path":"README.md"}}\n')).toBe("");
+    expect(sanitizer.push("Planner summary follows.\n")).toBe("Planner summary follows.\n");
+    expect(sanitizer.flush()).toBe("");
+  });
+
   test("extracts tagged tool calls without leaking the block", () => {
     const parsed = extractTextToolCalls(
       'I will check.\n<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</tool_call>',
@@ -157,6 +166,27 @@ describe("text tool extraction", () => {
 
     expect(extractTextToolCalls(generic, []).cleanedText).toBe(generic);
     expect(extractTextToolCalls(legacy, []).cleanedText).toBe("");
+  });
+
+  // ── isCosmeticToolEchoPayloadStrict — pinned contract for the post-turn ──
+  // cosmetic-strip predicate. The streaming sanitizer uses a looser
+  // predicate (isCosmeticToolEchoPayload) because it has to commit line-by-line,
+  // but the post-turn extractor has the full picture and can afford to be
+  // stricter — these three tests pin the cases where they differ.
+
+  test("strict predicate: generic search JSON in prose is KEPT (no args)", () => {
+    const { cleanedText } = extractTextToolCalls(`{"name":"search","query":"x"}\n`, []);
+    expect(cleanedText).toContain("search");
+  });
+
+  test("strict predicate: legacy flat block with payload is stripped", () => {
+    const { cleanedText } = extractTextToolCalls(`{"tool":"find_files","path":"."}\n`, []);
+    expect(cleanedText).toBe("");
+  });
+
+  test("strict predicate: bare legacy block with no payload is KEPT", () => {
+    const { cleanedText } = extractTextToolCalls(`{"tool":"read_file"}\n`, []);
+    expect(cleanedText).toContain("read_file");
   });
 
   test("supports legacy find_files blocks with only a closing tag", () => {

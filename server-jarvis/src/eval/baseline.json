@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "total": 38,
-  "passed": 38,
+  "total": 42,
+  "passed": 42,
   "outcomes": {
     "routing/code-review-clean-json": "pass",
     "routing/debug-clean-json": "pass",
@@ -19,6 +19,10 @@
     "gating/planner-gets-none": "pass",
     "gating/synthesizer-gets-none": "pass",
     "gating/unknown-mode-gets-none": "pass",
+    "requirements/tool-json-analysis-only": "pass",
+    "requirements/negated-modify-readme": "pass",
+    "requirements/negated-run-answer-only": "pass",
+    "requirements/mixed-negated-and-positive-mutation": "pass",
     "coordinator/linear-topology-explicit": "pass",
     "coordinator/speculative-parallel-topology": "pass",
     "coordinator/speculative-cascade-topology": "pass",
