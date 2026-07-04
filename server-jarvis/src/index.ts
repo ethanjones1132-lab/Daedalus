@@ -383,6 +383,16 @@ if (!Number.isInteger(PORT) || PORT <= 0 || PORT > 65535) {
 const BRIDGE_PORT = 19876;
 const JARVIS_VERSION = "3.0.0";
 
+// Build identity for /health — lets us tell which build is actually serving
+// a request (2026-07 incident: a stale deployed bundle silently served
+// leaked-JSON bugs for days because /health only reported the static
+// version string "3.0.0", identical across every build). build-and-deploy.ps1
+// injects these via `bun build --define` from `git rev-parse HEAD`; running
+// from source (bun run / bunx bun test) never gets --define, so these fall
+// back to reading the real env var and finally to the "dev" sentinel.
+const JARVIS_GIT_SHA = process.env.JARVIS_GIT_SHA ?? "dev";
+const JARVIS_BUILT_AT = process.env.JARVIS_BUILT_AT ?? null;
+
 let totalRequests = 0;
 const startTime = Date.now();
 
@@ -3237,7 +3247,7 @@ async function baseFetch(req: Request): Promise<Response> {
     }
     if (path === "/health") {
       const hcfg = loadConfig();
-      return Response.json({ ok: true, uptime: process.uptime(), version: JARVIS_VERSION, backend: hcfg.active_backend, model: hcfg.active_backend === "openrouter" ? hcfg.openrouter.model : hcfg.ollama.model });
+      return Response.json({ ok: true, uptime: process.uptime(), version: JARVIS_VERSION, backend: hcfg.active_backend, model: hcfg.active_backend === "openrouter" ? hcfg.openrouter.model : hcfg.ollama.model, git_sha: JARVIS_GIT_SHA, built_at: JARVIS_BUILT_AT });
     }
     if (path === "/health/inference") {
       return Response.json(inferenceMetricsSnapshot());

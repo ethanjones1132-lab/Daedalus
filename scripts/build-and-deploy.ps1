@@ -72,9 +72,21 @@ Write-Host "  cargo: $cargo"
 
 # ── Stage 1: server bundle ───────────────────────────────────────────────────
 Write-Step 'Stage 1/4 - Building server bundle (bun)'
+# Bake the build identity into the bundle so /health can report WHICH build is
+# actually serving (2026-07 incident: a stale deploy silently served
+# leaked-JSON bugs for days because /health only ever returned the static
+# "3.0.0" version string). bun's --define replaces process.env.<NAME> member
+# expressions at bundle time (verified: `bun build --define
+# "process.env.X=\"...\""` folds the literal into the output, and running the
+# unbundled source with `bun run` still reads the live env var / "dev"
+# fallback, so source runs are unaffected).
+$buildGitSha = (git -C $repo rev-parse HEAD)
+$buildBuiltAt = (Get-Date -Format 'o')
 Push-Location $serverDir
 try {
-    & $bun build ./src/index.ts --outdir ./dist --target bun
+    & $bun build ./src/index.ts --outdir ./dist --target bun `
+        --define "process.env.JARVIS_GIT_SHA=`"$buildGitSha`"" `
+        --define "process.env.JARVIS_BUILT_AT=`"$buildBuiltAt`""
     if ($LASTEXITCODE -ne 0) { Die 'server bundle build failed' }
 } finally { Pop-Location }
 if (-not (Test-Path $distJs)) { Die "server bundle not produced at $distJs" }
@@ -147,8 +159,12 @@ Copy-Item $promptsSrc $promptsDst -Recurse -Force
 Write-Ok 'prompts/'
 
 # ── Deploy manifest ──
+# Reuse $buildGitSha (captured before Stage 1) rather than re-running
+# `git rev-parse HEAD` here, so the manifest's git_sha is guaranteed to match
+# the SHA actually baked into index.js via --define, even in the (unlikely)
+# case HEAD moves mid-run.
 $manifest = @{
-    git_sha = (git -C $repo rev-parse HEAD)
+    git_sha = $buildGitSha
     index_js_sha256 = (Get-FileHash "$desktop\index.js" -Algorithm SHA256).Hash
     exe_mtime = (Get-Item "$desktop\Jarvis.exe" -ErrorAction SilentlyContinue).LastWriteTimeUtc.ToString("o")
     prompts_tree_sha256 = (git -C $repo ls-tree HEAD server-jarvis/src/prompts | Select-Object -First 1).Split()[2]
