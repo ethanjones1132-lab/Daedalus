@@ -21,7 +21,8 @@ $manifest = Get-Content $manifestPath | ConvertFrom-Json
 $gitSha = git -C $repoRoot rev-parse HEAD
 
 if ($manifest.git_sha -ne $gitSha) {
-    Write-Warning "DEPLOY STALE: manifest git_sha $($manifest.git_sha) != repo HEAD $gitSha"
+    Write-Error "DEPLOY STALE: manifest git_sha $($manifest.git_sha) != repo HEAD $gitSha"
+    exit 1
 } else {
     Write-Host "Deploy matches repo HEAD." -ForegroundColor Green
 }

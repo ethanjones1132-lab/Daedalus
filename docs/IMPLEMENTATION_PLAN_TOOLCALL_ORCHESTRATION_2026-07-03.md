@@ -18,12 +18,12 @@ git rev-parse HEAD
 # Verify bun test baseline
 cd server-jarvis
 bun test
-# Expected: all passing (was 391 at last count)
+# Expected: all passing (523 pass / 0 fail as of d7c65fd, 2026-07-03 evening)
 
-# Verify tsc jobs clean
+# Verify tsc clean
 bun run typecheck
-# And in src-ui
-cd ../src-ui && npm run typecheck  # or equivalent
+# And in src-ui (there is no dedicated typecheck script; build runs tsc -b)
+cd ../src-ui && bun run build
 
 # Verify cargo tests clean
 cd ../src-tauri && cargo test --lib
@@ -103,13 +103,27 @@ Write-Host "Deploy verification passed."
 ```
 
 **Acceptance:**
-- `Desktop\index.js` contains `VisibleAnswerStreamSanitizer` (verified by `Select-String`).
-- `Desktop\prompts\` exists with `coordinator.md`, `planner.md`, `executor.md`, etc.
-- `.jarvis-deploy-manifest.json` exists and `git_sha` matches repo HEAD.
+- `Desktop\index.js` contains `isCosmeticToolEchoPayloadStrict`, NOT just `VisibleAnswerStreamSanitizer`.
+  `VisibleAnswerStreamSanitizer` shipped at `fb63137` and is present even on the stale
+  `3b8b38e` bundle, so it cannot distinguish "deployed" from "deployed-but-behind
+  cae32c9". `isCosmeticToolEchoPayloadStrict` was introduced in cae32c9 (P0-A follow-up
+  sanitizer hardening) and is a valid freshness marker for that fix.
+  Verify: `Select-String -Path "$env:USERPROFILE\OneDrive\Desktop\index.js" -Pattern isCosmeticToolEchoPayloadStrict -Quiet`
+- `Desktop\prompts\` exists with `coordinator.md`, `router.md` at the top level and
+  `planner.md`, `executor.md`, `synthesizer.md`, `reviewer.md`, `rewriter.md`,
+  `recursion-critique.md` under `prompts\modes\` (this is the real deployed layout —
+  do not expect `planner.md` etc. at the `prompts\` root).
+- `.jarvis-deploy-manifest.json` exists and `git_sha` matches repo HEAD — enforced by
+  `scripts\verify-deploy.ps1`, which now exits non-zero (not just a warning) on mismatch.
 
 ---
 
 ## 2. Phase 2 — Sanitizer Hardening (Core Spillage Fix)
+
+**Status (2026-07-03 evening): Landed in repo at commit `cae32c9`. NOT YET redeployed —
+the Desktop bundle's manifest still pins `git_sha=3b8b38e`, which predates this fix.
+The edits below are kept for reference/audit; do not re-apply them. Skip straight to
+§1.3 (redeploy) after confirming §8.3's test rows pass.**
 
 **Goal:** Close the remaining edge cases in `VisibleAnswerStreamSanitizer` and `extractTextToolCalls`.
 
@@ -285,7 +299,7 @@ function findCosmeticToolEchoLineSpans(text: string, candidates: Candidate[]): T
 
 ### 5.2 Negation-aware classifier (P1-D) — Already implemented!
 
-**Finding:** `turn-requirements.ts` lines 85–124 already contain `isNegatedMutation`, `NEGATED_MUTATION_NOUN`, and `NEGATION_MARKER`. The code at line 176 already filters `mutationMatches` through `isNegatedMutation`.
+**Finding:** `server-jarvis/src/orchestration/turn-requirements.ts` (not the repo root) lines 85–124 already contain `isNegatedMutation`, `NEGATED_MUTATION_NOUN`, and `NEGATION_MARKER`. The code at line 176 already filters `mutationMatches` through `isNegatedMutation`.
 
 **Verification:**
 ```typescript
@@ -303,7 +317,7 @@ This is already correct. The bug was **reported on a stale bundle** that predate
 
 ### 5.3 Conductor replan safety bounds (B-04) — Already implemented!
 
-**Finding:** `replan-loop.ts` already has `maxReplans` in `ReplanLoopArgs` (line 48) and the loop already checks `budgetExhausted = replans >= args.maxReplans` (line 71). When exhausted, it runs the remaining pipeline to completion instead of replanning again.
+**Finding:** `server-jarvis/src/orchestration/replan-loop.ts` (not the repo root) already has `maxReplans` in `ReplanLoopArgs` (line 48) and the loop already checks `budgetExhausted = replans >= args.maxReplans` (line 71). When exhausted, it runs the remaining pipeline to completion instead of replanning again.
 
 **No edit required.** The cap is already wired.
 
@@ -314,6 +328,9 @@ This is already correct. The bug was **reported on a stale bundle** that predate
 ---
 
 ## 6. Phase 6 — Tool Normalization Unification (Minor)
+
+**Status (2026-07-03 evening): Landed in repo at commit `4d93deb`. NOT YET redeployed
+for the same reason as Phase 2 — see §1.3.**
 
 **Goal:** Add a server-side warning when a model hallucinates a tool name not in the offered tools list.
 
@@ -477,9 +494,20 @@ Day 3 — Integration & Verification
   3.1  End-to-end smoke test with real chat turns
   3.2  Verify no regressions in direct chat path
   3.3  Document any follow-ups (ADR for fast-read path, persistence contract)
+  3.4  FINAL REDEPLOY (do not skip): re-run
+       `scripts\build-and-deploy.ps1 -RestartServer` at current HEAD, then
+       `scripts\verify-deploy.ps1`. This is the step the original plan
+       omitted — deploying on Day 1 and writing/landing code on Days 2-3
+       leaves production on the Day-1 SHA. The plan is only "done" once the
+       manifest `git_sha` equals the SHA of the code you just verified in
+       Day 2, not the SHA from Day 1.
 ```
 
-**Critical path:** Phase 1 (Deploy) → Phase 2 (Sanitizer). Everything else is already fixed in the repo.
+**Critical path:** Phase 1 (Deploy) → Phase 2 (Sanitizer) → **Phase 1 again (redeploy at
+final HEAD)**. A deploy taken before the sanitizer/tool-normalization commits land does
+not include them — this bit us: Phase 2 (cae32c9) and Phase 6 (4d93deb) landed in the
+repo but the Desktop manifest still pins the pre-Phase-2 SHA `3b8b38e`. Everything else
+is already fixed in the repo.
 
 ---
 
@@ -610,6 +638,9 @@ Day 3 — Integration Verification
   3.2  Verify slow model → error frame, not blank bubble
   3.3  Verify Stop → cancelled, not stuck streaming
   3.4  Document any follow-ups
+  3.5  FINAL REDEPLOY (do not skip) — see §10 Day 3.4. Re-deploy at the SHA
+       that includes Phase 2 (cae32c9) and Phase 6 (4d93deb), then run
+       verify-deploy.ps1 and confirm it exits 0.
 ```
 
 **Risk assessment:**
