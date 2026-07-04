@@ -215,6 +215,14 @@ export const DEFAULT_ORCHESTRATOR_AGENTS: OrchestratorAgent[] = [
   },
 ];
 
+// Minimum `capabilities.speed` for a model to serve as the synthesizer's
+// primary pick (see `preferFastSynthesizer`). Intentionally lower than the
+// 0.8 "fast" diversity bar in `coverage()` — that bar counts genuinely quick
+// models for pool-health reporting, while this one only needs to exclude
+// slow reasoning models (e.g. speed 0.55 nemotron) from the user-visible
+// answer stage.
+const SYNTHESIZER_MIN_SPEED = 0.7;
+
 export class AgentPool {
   private agents = new Map<string, OrchestratorAgent>();
 
@@ -281,14 +289,14 @@ export class AgentPool {
     candidates: OrchestratorAgent[],
     taskType: TaskType | string,
   ): OrchestratorAgent {
-    if (stageDefault.capabilities.speed >= 0.7) return stageDefault;
-    const fastCandidates = candidates.filter((agent) => agent.capabilities.speed >= 0.7);
+    if (stageDefault.capabilities.speed >= SYNTHESIZER_MIN_SPEED) return stageDefault;
+    const fastCandidates = candidates.filter((agent) => agent.capabilities.speed >= SYNTHESIZER_MIN_SPEED);
     if (fastCandidates.length === 0) return stageDefault;
     const replacement = fastCandidates.sort(
       (a, b) => this.score(b, "synthesizer", taskType) - this.score(a, "synthesizer", taskType),
     )[0]!;
     console.warn(
-      `[agent-pool] synthesizer default "${stageDefault.model_id}" demoted (speed ${stageDefault.capabilities.speed} < 0.7); ` +
+      `[agent-pool] synthesizer default "${stageDefault.model_id}" demoted (speed ${stageDefault.capabilities.speed} < ${SYNTHESIZER_MIN_SPEED}); ` +
         `using "${replacement.model_id}" (speed ${replacement.capabilities.speed}) for fast prose instead. ` +
         `"${stageDefault.model_id}" remains available as a fallback/cascade member.`,
     );
@@ -435,10 +443,14 @@ export function firstTokenTimeoutFor(
 ): number {
   const fallback = Math.max(1_000, Number(baseMs) || 30_000);
   if (!pool || !modelId) return Math.min(fallback, capMs);
-  const knownButDisabled = pool.list().some(
-    (agent) => agent.model_id === modelId && !agent.enabled,
-  );
   const match = pool.enabled().find((agent) => agent.model_id === modelId);
+  // The pool is keyed by agent `id`, so the same model_id can exist twice —
+  // once enabled, once disabled. The disable carve-out only applies when NO
+  // enabled copy is live; otherwise a stale disabled duplicate would suppress
+  // DEFAULT-pool inheritance for the enabled copy and resurrect the 30s-abort
+  // bug this helper exists to prevent.
+  const knownButDisabled =
+    !match && pool.list().some((agent) => agent.model_id === modelId && !agent.enabled);
   let override = match?.first_token_timeout_ms;
   if ((typeof override !== "number" || !Number.isFinite(override)) && !knownButDisabled) {
     // Active pool has no opinion for this model — fall back to the DEFAULT

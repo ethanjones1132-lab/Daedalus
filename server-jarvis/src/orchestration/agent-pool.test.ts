@@ -316,6 +316,18 @@ describe("pickFor synthesizer fast-prose preference (2026-07-03 incident)", () =
     expect(chain.map((a) => a.id)).toContain("slow-synth-default");
   });
 
+  test("returns the slow default when the exclude set removes the only fast candidate", () => {
+    // Exclusion happens BEFORE the fast-prose demotion, so a fast candidate
+    // that just failed (rate limit / empty completion) is not re-selected —
+    // and with no fast candidate left, the slow default keeps the stage
+    // covered rather than leaving it empty.
+    const pool = new AgentPool([slowSynthDefault, fastSynthCandidate]);
+    const exclude = new Set<string>([
+      `${fastSynthCandidate.provider}:${fastSynthCandidate.model_id}`,
+    ]);
+    expect(pool.pickFor("synthesizer", "general", exclude)?.id).toBe("slow-synth-default");
+  });
+
   test("does not demote the synthesizer default when it already clears speed >= 0.7", () => {
     const fastDefault: OrchestratorAgent = {
       id: "fast-synth-default",
@@ -469,6 +481,48 @@ describe("firstTokenTimeoutFor", () => {
 
     test("DEFAULT pool inheritance is still clamped to the supplied cap", () => {
       expect(firstTokenTimeoutFor(customPool, "nemotron-3-ultra-free", 30_000, 40_000)).toBe(40_000);
+    });
+
+    test("a model disabled in the active pool (no enabled duplicate) does NOT inherit the DEFAULT override", () => {
+      // Disabling is an intentional "don't trust this model" signal — the
+      // DEFAULT pool's tuning must not silently resurrect it.
+      const disabledOnly = new AgentPool([
+        {
+          id: "custom-nemotron-off",
+          provider: "opencode_zen",
+          model_id: "nemotron-3-ultra-free",
+          capabilities: { code: 0.8, reasoning: 0.95, speed: 0.55, cost: 1, json_reliability: 0.88 },
+          default_for: [],
+          enabled: false,
+        },
+      ]);
+      expect(firstTokenTimeoutFor(disabledOnly, "nemotron-3-ultra-free", 30_000)).toBe(30_000);
+    });
+
+    test("a disabled duplicate model_id does not suppress inheritance for the enabled copy", () => {
+      // The pool is keyed by agent `id`, so the same model_id can appear
+      // once enabled (no override) and once disabled. The enabled copy is
+      // live, so DEFAULT-pool inheritance must still apply — a stale
+      // disabled duplicate must not resurrect the 30s-abort bug.
+      const duplicatePool = new AgentPool([
+        {
+          id: "custom-nemotron-on",
+          provider: "opencode_zen",
+          model_id: "nemotron-3-ultra-free",
+          capabilities: { code: 0.8, reasoning: 0.95, speed: 0.55, cost: 1, json_reliability: 0.88 },
+          default_for: ["synthesizer"],
+          enabled: true,
+        },
+        {
+          id: "custom-nemotron-off",
+          provider: "openrouter",
+          model_id: "nemotron-3-ultra-free",
+          capabilities: { code: 0.8, reasoning: 0.95, speed: 0.55, cost: 1, json_reliability: 0.88 },
+          default_for: [],
+          enabled: false,
+        },
+      ]);
+      expect(firstTokenTimeoutFor(duplicatePool, "nemotron-3-ultra-free", 30_000)).toBe(55_000);
     });
   });
 });
