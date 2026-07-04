@@ -364,8 +364,9 @@ dispatch. Three contract changes:
 
 ### B-04: Replan telemetry and safety bounds
 
-**Type:** AFK  
+**Type:** AFK
 **Blocked by:** B-03
+**Status:** ✅ Done (2026-07-04 evening, Jarvis maintenance pass)
 
 #### What to build
 
@@ -374,11 +375,20 @@ Record replan events in `conductor_runs` and `trajectory_snapshots`. Configurabl
 End-to-end: telemetry row exists per replan; cap prevents infinite loop in test.
 
 #### Acceptance criteria
+- [x] `conductor_runs` or new table captures replan count and outcome
+- [x] Config: `max_replans_per_turn`, `max_conductor_replans_per_session`
+- [x] Test proves loop terminates at cap
+- [x] Replan failures degrade gracefully (surface synthesizer answer)
 
-- [ ] `conductor_runs` or new table captures replan count and outcome
-- [ ] Config: `max_replans_per_turn`, `max_conductor_replans_per_session`
-- [ ] Test proves loop terminates at cap
-- [ ] Replan failures degrade gracefully (surface synthesizer answer)
+**Implementation summary:** the B-02 per-turn cap (`orchestrator.max_conductor_replans`, default 2) already prevents an unbounded replan loop within a single turn. B-04 adds the matching **per-session** cap (`orchestrator.max_conductor_replans_per_session`, default 6) and a **persistent `replan_events` table** so a long-lived session can't slowly accumulate replan spend across many turns, and a "did the conductor start thrashing?" question is answerable with SQL instead of a log scrape. Five contract changes:
+
+1. New SQLite table `replan_events` in `SELF_TUNING_SCHEMA` (`server-jarvis/src/self-tuning/store.ts`) — `id`, `agent_run_id` (FK to `agent_runs`, ON DELETE CASCADE), `session_id`, `replan_index` (1, 2, 3, ... within the turn), `rationale` (truncated to 500 chars), `revised_pipeline` (JSON), `revised_worker_instructions_keys` (comma-separated, e.g. "executor,reviewer"), `segment_outcome` ("success" | "degraded" | "failed"), `capped` ("" | "per_turn" | "per_session"), `created_at`. Two indexes: `(session_id)` and `(agent_run_id)`. Mirrors the existing `trajectory_snapshots` storage pattern — same WSL self-tuning DB, same best-effort insert semantics, telemetry can never break a turn.
+2. New `ReplanEvent` type + `insertReplanEvent(ev)` + `getReplanEventsForSession(sid)` methods on `SelfTuningStore`. Insert errors are logged and swallowed; the store's `getDb()` already returns `null` on WSL-bridge I/O failures so a flaky DB degrades to "no telemetry" rather than "no turn".
+3. New `SessionReplanCounter` class in `server-jarvis/src/orchestration/replan-telemetry.ts` (175 lines) — an in-process `Map<sessionId, used>` keyed by session id, with `used(sid)`, `remaining(sid)`, `effectivePerTurnCap(sid, callerMax)` (returns `min(callerMax, maxPerSession)` so the per-turn cap stays clean), `record({...})` (increments + persists via the store), `clearSession(sid)` (called from the existing session-reset path), and `totalUsed()` (test diagnostic). Rationale text is truncated to 500 chars at write time. Worker-instruction keys are sorted and joined so the column is greppable. The counter is a pure in-process structure — no `await` in the hot path, no DB round-trip on the budget check itself.
+4. `replan-loop.ts` now accepts optional `sessionCounter` + `sessionId` on `ReplanLoopArgs`. The loop recomputes `perTurnCap = sessionCounter.effectivePerTurnCap(sessionId, args.maxReplans)` on every iteration; a separate `sessionCapHit` flag fires when the session's `remaining(sessionId) === 0` and tags the final `PipelineResult.error_code = "session_replan_cap_exceeded"`. The tag is only applied when the rest of the pipeline produced a real answer — a degenerate synthesizer answer (empty_completion, stage_error) keeps its own `error_code` so we don't double-tag or mask a real failure. After every successful re-invocation the loop calls `sessionCounter.record({...})` with the conductor's revised decision + rationale + a `segmentOutcomeFromCarry(segment.state)` classification. The `capped` tag at write time is "" for in-loop records and "per_turn" when the loop is about to terminate via per-turn exhaustion.
+5. `index.ts` constructs a process-wide `replanCounter` at module load (`new SessionReplanCounter({ maxPerSession: loadConfig().orchestrator.max_conductor_replans_per_session, store: new SelfTuningStore() })`) and threads it into the existing `runPipelineWithReplanning` call site alongside `sessionId`. The existing `POST /sessions/:sid/interaction` reset path now also calls `replanCounter.clearSession(sid)` so a user-initiated "new session" frees up the budget; the next turn with the same id starts from zero. **The B-02 per-turn cap and behavior are unchanged** — when no `sessionCounter` is supplied the loop falls back to the B-02 semantics exactly, so the existing 4 B-02 tests pass without modification.
+
+**6 new bun tests** (565 total, was 559): 4 in `orchestration/replan-loop.test.ts` under a new `B-04 session cap + telemetry` describe — `(1) replan events are recorded to the store with replan_index, rationale, revised_pipeline, session_id` (in-memory `SelfTuningStore(":memory:")`, pins the full row shape including `capped=""` and `segment_outcome="success"`); `(2) session-level cap is enforced independently of per-turn cap` (per-turn=5, session=2, replan-on-replan fixture, asserts `counter.used=2` and `error_code="session_replan_cap_exceeded"`); `(3) per-turn cap is preserved when session cap is generous` (per-turn=1, session=10, asserts `counter.used=1` and `error_code=undefined` — the loop terminates via per-turn exhaustion, no session tag); `(4) clearSession resets the counter and isolates sessions` (asserts `used=0` after `clearSession`, plus a second session's counter is untouched when the first is reset). 2 new tests in `config.test.ts` — `orchestrator.max_conductor_replans_per_session defaults to 6` and `normalizeConfig preserves an explicit max_conductor_replans_per_session`. 60 cargo tests pass, both tsc jobs clean.
 
 ---
 
