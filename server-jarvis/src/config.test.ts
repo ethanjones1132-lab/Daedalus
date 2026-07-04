@@ -175,6 +175,17 @@ describe("orchestrator agent pool config", () => {
     expect(defaultConfig().orchestrator.max_conductor_replans).toBe(2);
   });
 
+  test("orchestrator.max_conductor_replans_per_session defaults to 6 (B-04 session replan budget)", () => {
+    expect(defaultConfig().orchestrator.max_conductor_replans_per_session).toBe(6);
+  });
+
+  test("normalizeConfig preserves an explicit max_conductor_replans_per_session (B-04)", () => {
+    const cfg = normalizeConfig({
+      orchestrator: { enabled: true, max_conductor_replans_per_session: 12 },
+    });
+    expect(cfg.orchestrator.max_conductor_replans_per_session).toBe(12);
+  });
+
   test("normalizeConfig fills in missing orchestrator recursion depth", () => {
     const cfg = normalizeConfig({ orchestrator: { enabled: true } });
     expect(cfg.orchestrator.max_recursion_depth).toBe(2);

@@ -138,6 +138,34 @@ export interface InstructionVariantRow {
   last_updated?: string;
 }
 
+/**
+ * B-04: per-replan telemetry row. One row is written every time the
+ * `conductor_replan` loop re-invokes the conductor mid-pipeline. Survives
+ * restart so a "did the conductor start thrashing?" question can be answered
+ * with a single SQL query, not a log scrape. The `capped` column marks
+ * whether the loop terminated because of the per-turn budget (`"per_turn"`)
+ * or the per-session budget (`"per_session"`); empty string means the loop
+ * completed normally without hitting a cap.
+ */
+export interface ReplanEvent {
+  id: string;
+  agent_run_id: string;
+  session_id: string;
+  /** 1-indexed position of THIS replan within its turn (1, 2, 3, ...). */
+  replan_index: number;
+  /** Coordinator's rationale, truncated to a sane bound for the DB. */
+  rationale: string;
+  /** JSON-encoded array of stages the conductor returned. */
+  revised_pipeline: string;
+  /** Comma-separated keys of the `worker_instructions` map, e.g. "executor,reviewer". */
+  revised_worker_instructions_keys: string;
+  /** Outcome of the segment that was just executed before this replan. */
+  segment_outcome: string;
+  /** "" (no cap hit) | "per_turn" | "per_session". */
+  capped: string;
+  created_at?: string;
+}
+
 function getWindowsHome(): string | null {
   try {
     const raw = execSync("cmd.exe /c echo %USERPROFILE%", {
@@ -314,6 +342,20 @@ const SELF_TUNING_SCHEMA = `
     last_updated TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     PRIMARY KEY (variant_id, stage_id, task_type)
   );
+  CREATE TABLE IF NOT EXISTS replan_events (
+    id TEXT PRIMARY KEY,
+    agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    replan_index INTEGER NOT NULL,
+    rationale TEXT NOT NULL,
+    revised_pipeline TEXT NOT NULL,
+    revised_worker_instructions_keys TEXT NOT NULL,
+    segment_outcome TEXT NOT NULL,
+    capped TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_replan_events_session_id ON replan_events(session_id);
+  CREATE INDEX IF NOT EXISTS idx_replan_events_agent_run_id ON replan_events(agent_run_id);
 `;
 
 const schemaEnsuredPaths = new Set<string>();
@@ -834,6 +876,46 @@ export class SelfTuningStore {
       return db.query("SELECT * FROM trajectory_snapshots ORDER BY created_at DESC LIMIT ?").all(limit) as TrajectorySnapshot[];
     } catch (e) {
       console.error("[SelfTuningStore] getTrajectorySnapshots failed:", e);
+      return [];
+    } finally {
+      db.close();
+    }
+  }
+
+  // B-04: replan telemetry. One row per `conductor_replan` re-invocation.
+  // Insert errors are logged and swallowed (telemetry must never break a turn).
+  insertReplanEvent(ev: ReplanEvent): void {
+    const db = this.getDb();
+    if (!db) return;
+    try {
+      db.prepare(
+        `INSERT INTO replan_events (id, agent_run_id, session_id, replan_index, rationale, revised_pipeline, revised_worker_instructions_keys, segment_outcome, capped)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        ev.id,
+        ev.agent_run_id,
+        ev.session_id,
+        ev.replan_index,
+        ev.rationale,
+        ev.revised_pipeline,
+        ev.revised_worker_instructions_keys,
+        ev.segment_outcome,
+        ev.capped ?? "",
+      );
+    } catch (e) {
+      console.error("[SelfTuningStore] insertReplanEvent failed:", e);
+    } finally {
+      db.close();
+    }
+  }
+
+  getReplanEventsForSession(sessionId: string): ReplanEvent[] {
+    const db = this.getDb();
+    if (!db) return [];
+    try {
+      return db.query("SELECT * FROM replan_events WHERE session_id = ? ORDER BY created_at ASC, replan_index ASC").all(sessionId) as ReplanEvent[];
+    } catch (e) {
+      console.error("[SelfTuningStore] getReplanEventsForSession failed:", e);
       return [];
     } finally {
       db.close();

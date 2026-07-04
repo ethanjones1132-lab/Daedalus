@@ -89,6 +89,7 @@ import type { PipelineProgressState, PipelineRecursionEvent } from "./orchestrat
 import { classifyTurnRequirements } from "./orchestration/turn-requirements";
 import { normalizeRoute, type ExecutionProfile } from "./orchestration/route-normalization";
 import { runPipelineWithReplanning } from "./orchestration/replan-loop";
+import { SessionReplanCounter } from "./orchestration/replan-telemetry";
 import { conductorLearning, outcomeCollector, selfTuningProposer, SelfTuningStore } from "./self-tuning/mod";
 import { conductorCacheSnapshot } from "./orchestration/conductor-metrics";
 import {
@@ -377,6 +378,16 @@ const persistentConductor = new PersistentConductor(loadConfig);
 
 /** Inter-workflow shared memory — tool results, file snapshots, failure patterns. */
 const sessionMemory = new SessionMemory(() => loadConfig().orchestrator.session_memory);
+
+/** B-04: per-session cumulative counter for `conductor_replan` re-invocations.
+ *  Backs both the per-session replan cap and the persistent `replan_events`
+ *  telemetry table. The store is the same self-tuning DB the rest of the
+ *  orchestrator writes to; a fresh instance is created per process because
+ *  the store has no meaningful in-process state. */
+const replanCounter = new SessionReplanCounter({
+  maxPerSession: loadConfig().orchestrator.max_conductor_replans_per_session,
+  store: new SelfTuningStore(),
+});
 if (!Number.isInteger(PORT) || PORT <= 0 || PORT > 65535) {
   throw new Error(`JARVIS_SERVER_PORT must be an integer between 1 and 65535, got ${process.env.JARVIS_SERVER_PORT}`);
 }
@@ -2034,6 +2045,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               onStateChange: onOrchestratorStateChange,
               baseOptions: pipelineOptions,
               maxReplans: cfg.orchestrator.max_conductor_replans,
+              // B-04: hand the per-session counter the session id so the
+              // loop can enforce the per-session cap and persist a
+              // `replan_events` row per re-invocation.
+              sessionCounter: replanCounter,
+              sessionId,
             })
           : await executor.execute(contextMessage, executablePipeline, agentRunId, onOrchestratorStateChange, pipelineOptions);
 
@@ -3514,6 +3530,10 @@ async function baseFetch(req: Request): Promise<Response> {
       clearSessionState(sid);
       persistentConductor.clearSession(sid);
       sessionMemory.clearSession(sid);
+      // B-04: reset the per-session replan counter so a user-initiated
+      // "new session" frees up the replan budget. Without this, a fresh
+      // session inheriting the same id would inherit a depleted counter.
+      replanCounter.clearSession(sid);
       return Response.json({ ok: true, session_id: sid, state: body.state || null });
     }
 
