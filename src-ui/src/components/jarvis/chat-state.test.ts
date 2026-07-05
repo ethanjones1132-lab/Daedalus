@@ -105,6 +105,14 @@ describe('isToolCallEchoOnly', () => {
     expect(isToolCallEchoOnly('{"name":"read_file","arguments":{"path":"a.ts"}}')).toBe(true);
   });
 
+  it('is true for the legacy {tool,arguments} echo shape', () => {
+    expect(isToolCallEchoOnly('{"tool":"list_directory","arguments":{"path":"."}}')).toBe(true);
+  });
+
+  it('is false for a {tool} object without arguments', () => {
+    expect(isToolCallEchoOnly('{"tool":"list_directory"}')).toBe(false);
+  });
+
   it('is true for multi-line bare tool-call JSON (one call per line)', () => {
     const content = [
       '{"name":"read_file","arguments":{"path":"a.ts"}}',

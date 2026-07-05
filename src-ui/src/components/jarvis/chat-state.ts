@@ -124,7 +124,9 @@ export function isToolCallEchoOnly(content: string): boolean {
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
     const obj = parsed as Record<string, unknown>;
     return (
-      typeof obj.name === 'string'
+      (typeof obj.name === 'string'
+        || typeof obj.tool === 'string'
+        || typeof obj.tool_name === 'string')
       && obj.arguments !== undefined
       && obj.arguments !== null
       && typeof obj.arguments === 'object'

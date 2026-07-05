@@ -354,11 +354,10 @@ export class VisibleAnswerStreamSanitizer {
       const line = this.pendingLine.slice(0, newlineIndex);
       this.pendingLine = this.pendingLine.slice(newlineIndex + 1);
 
-      if (this.lineAlreadyEmitted) {
-        visible += `${line}\n`;
-      } else {
-        visible += this.decideLine(line, "\n");
-      }
+      // `line` may be only the buffered suffix after prose was already
+      // emitted. It still needs the same cosmetic-JSON decision; otherwise a
+      // split `Result: {tool-json}` line leaks the JSON suffix verbatim.
+      visible += this.decideLine(line, "\n");
       this.lineAlreadyEmitted = false;
       newlineIndex = this.pendingLine.indexOf("\n");
     }
@@ -367,8 +366,6 @@ export class VisibleAnswerStreamSanitizer {
       if (this.pendingLine) {
         if (this.suppressingLegacyJson) {
           this.consumeLegacyJson(this.pendingLine);
-        } else if (this.lineAlreadyEmitted) {
-          visible += this.pendingLine;
         } else if (this.pendingLine.trim()) {
           visible += this.decideLine(this.pendingLine, "");
         }
@@ -380,14 +377,29 @@ export class VisibleAnswerStreamSanitizer {
     }
 
     if (this.pendingLine) {
-      const pending = this.pendingLine.trimStart();
+      // Hold from the first object opener until line completion. We cannot
+      // know whether it is ordinary JSON or a cosmetic tool echo until the
+      // object closes, but prose before it can continue streaming.
+      const objectStart = this.inFence ? -1 : this.pendingLine.indexOf("{");
+      let emitCandidate = objectStart >= 0
+        ? this.pendingLine.slice(0, objectStart)
+        : this.pendingLine;
+      if (!this.inFence) {
+        // Keep trailing horizontal whitespace buffered while the line is
+        // incomplete. Once a tool object begins, that whitespace belongs to
+        // the removable suffix; ordinary text receives it on the next chunk.
+        emitCandidate = emitCandidate.replace(/[ \t]+$/g, "");
+      }
+      const pending = emitCandidate.trimStart();
       const canEmit = pending
         && !this.suppressingLegacyJson
         && !couldBeLegacyToolResultLine(pending)
         && (this.lineAlreadyEmitted || (!pending.startsWith("{") && !pending.startsWith("`")));
       if (canEmit) {
-        visible += this.pendingLine;
-        this.pendingLine = "";
+        visible += emitCandidate;
+        this.pendingLine = objectStart >= 0
+          ? this.pendingLine.slice(objectStart)
+          : this.pendingLine.slice(emitCandidate.length);
         this.lineAlreadyEmitted = true;
       }
     }
@@ -413,10 +425,11 @@ export class VisibleAnswerStreamSanitizer {
       this.inFence = !this.inFence;
       return line + terminator;
     }
-    if (this.inFence || !isCosmeticToolEchoLine(line)) {
-      return line + terminator;
-    }
-    return "";
+    if (this.inFence) return line + terminator;
+    if (isCosmeticToolEchoLine(line)) return "";
+    const cleaned = stripCosmeticToolEchoesFromLine(line);
+    if (cleaned === null) return line + terminator;
+    return cleaned.trim() ? cleaned + terminator : "";
   }
 
   private consumeLegacyJson(text: string): void {
@@ -575,6 +588,21 @@ function isCosmeticToolEchoLine(line: string): boolean {
   return remainder.trim() === "";
 }
 
+/** Remove cosmetic tool-echo JSON embedded in a prose line; null = nothing strippable. */
+function stripCosmeticToolEchoesFromLine(line: string): string | null {
+  const spans = findJsonObjects(line).filter((object) => {
+    const value = parseJsonLike(object.raw);
+    return value !== null && isCosmeticToolEchoPayloadStrict(value);
+  });
+  if (spans.length === 0) return null;
+
+  let out = line;
+  for (const span of [...spans].sort((a, b) => b.start - a.start)) {
+    out = `${out.slice(0, span.start)}${out.slice(span.end)}`;
+  }
+  return out.replace(/[ \t]+$/g, "");
+}
+
 function isCosmeticToolEchoPayload(value: unknown): boolean {
   if (Array.isArray(value)) {
     return value.length > 0 && value.every((item) => isCosmeticToolEchoPayload(item));
@@ -688,6 +716,11 @@ function findCosmeticToolEchoLineSpans(text: string, candidates: Candidate[]): T
     }
     if (remainder.trim() === "") {
       spans.push({ start: group.start, end: group.end });
+    } else {
+      // Mixed prose + cosmetic JSON: keep the prose and remove only the
+      // strict tool-shaped object spans. Fenced candidates were excluded
+      // above, preserving code examples verbatim.
+      spans.push(...group.candidates.map(({ start, end }) => ({ start, end })));
     }
   }
   return spans;

@@ -296,12 +296,23 @@ Here is the actual answer.`;
     expect(parsed.cleanedText).toBe("Before\nAfter");
   });
 
-  test("preserves cosmetic-tool-shaped JSON in fenced examples and mixed prose", () => {
+  test("preserves cosmetic-tool-shaped JSON in fenced examples but strips mixed-prose echoes", () => {
     const toolJson = '{"name":"read_file","arguments":{"path":"README.md"}}';
     const fenced = `\`\`\`json\n${toolJson}\n\`\`\``;
 
     expect(extractTextToolCalls(fenced, []).cleanedText).toBe(fenced);
-    expect(extractTextToolCalls(`Here: ${toolJson}`, []).cleanedText).toBe(`Here: ${toolJson}`);
+    expect(extractTextToolCalls(`Here: ${toolJson}`, []).cleanedText).toBe("Here:");
+  });
+
+  test("post-turn cleanup removes cosmetic tool JSON embedded in prose while keeping the prose", () => {
+    const toolJson = '{"tool":"list_directory","arguments":{"path":"."}}';
+
+    expect(extractTextToolCalls(`Checking the folder now: ${toolJson}`, []).cleanedText)
+      .toBe("Checking the folder now:");
+    expect(extractTextToolCalls('Config is {"name":"search","query":"x"}', []).cleanedText)
+      .toBe('Config is {"name":"search","query":"x"}');
+    expect(extractTextToolCalls('Use {"tool":"hammer","arguments":{}} carefully', []).cleanedText)
+      .toBe('Use {"tool":"hammer","arguments":{}} carefully');
   });
 
   test("keeps generic name JSON but strips legacy flat tool-key echoes", () => {
@@ -535,12 +546,45 @@ Here is the actual answer.`;
     expect(sanitizeVisibleAnswer([`${toolJson} ${toolJson}\n`])).toBe("");
   });
 
-  test("preserves mixed prose and cosmetic tool JSON regardless of chunk boundaries", () => {
+  test("strips cosmetic tool JSON from mixed prose lines regardless of chunk boundaries (2026-07-05 leak)", () => {
+    // Deliberate inversion for the 2026-07-05 P0a batch: mixed prose used to
+    // protect an embedded tool echo, which let the live synthesizer spill it.
     const toolJson = '{"name":"read_file","arguments":{"path":"README.md"}}';
-    const expected = `Result: ${toolJson}`;
+    const full = `Result: ${toolJson}`;
+    const chunkings = [
+      [full],
+      ["Result: ", toolJson],
+      [...full],
+      Array.from({ length: Math.ceil(full.length / 3) }, (_, index) => full.slice(index * 3, index * 3 + 3)),
+    ];
 
-    expect(sanitizeVisibleAnswer([expected])).toBe(expected);
-    expect(sanitizeVisibleAnswer(["Result: ", toolJson])).toBe(expected);
+    for (const chunks of chunkings) {
+      expect(sanitizeVisibleAnswer(chunks)).toBe("Result:");
+    }
+  });
+
+  test("strips today's exact {tool,arguments} leak from pure and mixed lines under arbitrary chunking", () => {
+    const toolJson = '{"tool":"list_directory","arguments":{"path":"."}}';
+    const mixed = `Checking the folder now: ${toolJson}`;
+    const chunkings = [
+      [mixed],
+      ["Checking the folder now: ", toolJson],
+      [...mixed],
+      Array.from({ length: Math.ceil(mixed.length / 4) }, (_, index) => mixed.slice(index * 4, index * 4 + 4)),
+    ];
+
+    expect(sanitizeVisibleAnswer([toolJson])).toBe("");
+    for (const chunks of chunkings) {
+      expect(sanitizeVisibleAnswer(chunks)).toBe("Checking the folder now:");
+    }
+  });
+
+  test("keeps non-tool and unknown-tool JSON embedded in prose", () => {
+    const generic = 'Config is {"name":"search","query":"x"}';
+    const unknown = 'Use {"tool":"hammer","arguments":{}} carefully';
+
+    expect(sanitizeVisibleAnswer([...generic])).toBe(generic);
+    expect(sanitizeVisibleAnswer([...unknown])).toBe(unknown);
   });
 
   test("preserves fenced cosmetic tool JSON examples with fences intact", () => {
