@@ -6,6 +6,7 @@ import {
   makeExecutionContext,
 } from "./tool-runtime";
 import type { ExecutionContext, ToolDefinition } from "./tool-runtime";
+import * as ToolRuntimeModule from "./tool-runtime";
 
 // ─── P1-06: Jarvis Tool Runtime Contract ─────────────────────────────────────
 // Tests verify behavior through the public ToolRuntime interface only.
@@ -38,6 +39,16 @@ function makeDef(name: string, required: string[] = []): ToolDefinition {
 }
 
 describe("ToolRuntime", () => {
+  test("toolResultModelText surfaces error detail and preserves successful output", () => {
+    const helper = (ToolRuntimeModule as typeof ToolRuntimeModule & {
+      toolResultModelText?: (result: any) => string;
+    }).toolResultModelText;
+    expect(typeof helper).toBe("function");
+    expect(helper?.({ output: "", error: "boom", is_error: true })).toBe("boom");
+    expect(helper?.({ output: "ok", is_error: false })).toBe("ok");
+    expect(helper?.({ output: "", is_error: true })).toBe("Tool failed with no error detail.");
+  });
+
   // ── Tracer bullet ──────────────────────────────────────────────────────────
 
   test("registered tool executes and returns ToolResult with is_error:false", async () => {

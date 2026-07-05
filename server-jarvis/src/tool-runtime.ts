@@ -14,6 +14,13 @@ import type { ToolDefinition, ToolCall, ToolResult, ToolErrorCode } from "./tool
 // ── Re-export tool types so callers import from one place ─────────────────────
 export type { ToolDefinition, ToolCall, ToolResult };
 
+/** Text of a tool result as the model should see it (error text on failure). */
+export function toolResultModelText(result: ToolResult): string {
+  return result.is_error
+    ? (result.error || result.output || "Tool failed with no error detail.")
+    : result.output;
+}
+
 /**
  * Map full tool definitions to the OpenAI API shape (drops runtime-only flags).
  * Filters out tools marked `text_protocol_only` so they are never sent to

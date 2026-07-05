@@ -1,6 +1,6 @@
 import { loadPrompt } from "./prompt-loader";
 import { BUILTIN_MODES, executorTurnLimit, getToolsForMode } from "./modes";
-import type { ToolRuntime, ExecutionContext } from "../tool-runtime";
+import { toolResultModelText, type ToolRuntime, type ExecutionContext } from "../tool-runtime";
 import type { CallModelFn, ChatMessage } from "./router";
 import type { SharedContextHints, StageName, WorkerInstructions } from "./coordinator";
 import type { SessionMemory } from "./session-memory";
@@ -370,12 +370,12 @@ export class PipelineExecutor {
               toolCalls.push({
                 name: call.name,
                 arguments: call.arguments,
-                output: toolResult.output,
+                output: toolResultModelText(toolResult),
                 is_error: toolResult.is_error,
                 error_code: toolResult.error_code,
                 duration_ms: toolResult.duration_ms ?? 0,
               });
-              executorMessages.push({ role: "tool", tool_call_id: tc.id, name: tc.name, content: toolResult.output });
+              executorMessages.push({ role: "tool", tool_call_id: tc.id, name: tc.name, content: toolResultModelText(toolResult) });
               onStateChange({
                 stage: "executor",
                 status: "running",
@@ -476,12 +476,12 @@ export class PipelineExecutor {
               toolCalls.push({
                 name: call.name,
                 arguments: call.arguments,
-                output: toolResult.output,
+                output: toolResultModelText(toolResult),
                 is_error: toolResult.is_error,
                 error_code: toolResult.error_code,
                 duration_ms: toolResult.duration_ms ?? 0,
               });
-              rewriterMessages.push({ role: "tool", tool_call_id: tc.id, name: tc.name, content: toolResult.output });
+              rewriterMessages.push({ role: "tool", tool_call_id: tc.id, name: tc.name, content: toolResultModelText(toolResult) });
               onStateChange({
                 stage: "rewriter",
                 status: "running",

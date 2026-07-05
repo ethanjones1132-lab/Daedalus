@@ -86,13 +86,13 @@ describe("VisibleTextPipe", () => {
     expect(visibleText(rec.events())).toBe("Here is the summary.");
   });
 
-  test("VisibleTextPipe preserves mixed prose + JSON lines", async () => {
+  test("VisibleTextPipe strips tool JSON embedded after mixed prose", async () => {
     const rec = recorder();
     const pipe = new VisibleTextPipe({ sessionId: "s6", reasoningEnabled: false, write: rec.write });
     await pipe.push('Result: {"name":"read_file","arguments":{"path":"README.md"}}\n');
     await pipe.finish();
 
-    expect(visibleText(rec.events())).toBe('Result: {"name":"read_file","arguments":{"path":"README.md"}}\n');
+    expect(visibleText(rec.events())).toBe("Result:\n");
   });
 
   test("VisibleTextPipe keeps fenced JSON tool examples intact", async () => {

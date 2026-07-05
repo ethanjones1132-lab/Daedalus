@@ -48,6 +48,29 @@ describe("session-memory", () => {
     expect(hints?.prior_tool_results?.["read_file:src/auth.ts"]).toContain("export const auth");
   });
 
+  test("a failed read_file records a failure pattern, not a snapshot, fact, or cache hit", () => {
+    const memory = new SessionMemory(() => makeConfig());
+    memory.recordToolResult({
+      sessionId: "sess-failed-read",
+      toolName: "read_file",
+      args: { path: "src/missing.ts" },
+      result: { output: "", error: "File not found: /workspace/src/missing.ts", is_error: true },
+      workspacePath: "/workspace",
+    });
+
+    expect(memory.lookupCachedToolResult(
+      "sess-failed-read",
+      "read_file",
+      { path: "src/missing.ts" },
+      "/workspace",
+    )).toBeUndefined();
+
+    const state = memory.getSessionState("sess-failed-read")!;
+    expect(Object.keys(state.fileSnapshots)).toHaveLength(0);
+    expect(Object.keys(state.discoveredFacts)).toHaveLength(0);
+    expect(state.failureHistory[0]?.pattern).toContain("read_file failed: File not found");
+  });
+
   test("invalidates cached reads after write_file", () => {
     const memory = new SessionMemory(() => makeConfig());
     memory.recordToolResult({

@@ -146,12 +146,14 @@ describe("Tier A STABILITY gate: guards + clean failure", () => {
     const ctx = makeCtx(ws, "chat", { requestApproval: async () => true });
 
     const e = await rt.execute(call("edit_file", { path: "g.txt", old_string: "alpha", new_string: "ALPHA" }), ctx);
-    expect(e.output).toContain("has not been read yet");
+    expect(e.is_error).toBe(true);
+    expect(e.error).toContain("has not been read yet");
 
     const patch = createTwoFilesPatch("g.txt", "g.txt", "alpha\nbeta\n", "ALPHA\nbeta\n");
     const p = await rt.execute(call("apply_patch", { path: "g.txt", patch }), ctx);
     // STABILITY GATE: blind patches must be refused.
-    expect(p.output).toContain("has not been read yet");
+    expect(p.is_error).toBe(true);
+    expect(p.error).toContain("has not been read yet");
   });
 
   test("GATE-TA-ST2: apply_patch fails cleanly without writing on a context mismatch", async () => {

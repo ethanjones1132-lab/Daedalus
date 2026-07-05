@@ -7,6 +7,7 @@ import { createToolRuntime, makeExecutionContext } from "./tool-runtime";
 import type { ToolRuntime, ExecutionContext } from "./tool-runtime";
 import { registerFilesystemBundle, registerSearchBundle } from "./filesystem-bundle";
 import { defaultConfig } from "./config";
+import { markFileRead } from "./fs-read-cache";
 
 // These tests run against a real workspace and use WORKSPACE-RELATIVE paths so
 // that fs-scope's Windows->WSL translation is a passthrough — making them valid
@@ -106,21 +107,23 @@ describe("FilesystemBundle > read_file", () => {
     expect(result.output).not.toContain("line 5");
   });
 
-  test("missing file returns the legacy not-found string (not a thrown error)", async () => {
+  test("read_file on a missing path returns is_error with a guidance message", async () => {
+    // Deliberate inversion for the 2026-07-05 P0a batch: filesystem failures
+    // must be typed errors, not successful tool results containing error prose.
     const ws = makeTempWorkspace();
     const result = await makeRuntime().execute(call("read_file", { path: "nope.txt" }), makeCtx(ws));
-    expect(result.is_error).toBe(false);
-    expect(result.output).toContain("File not found");
+    expect(result.is_error).toBe(true);
+    expect(result.error).toContain("File not found");
+    expect(result.error).toContain("glob");
   });
 
-  test("read_file on a directory returns an actionable list_directory hint, not 'File not found'", async () => {
+  test("read_file on a directory returns is_error with an actionable list_directory hint", async () => {
     const ws = makeTempWorkspace();
     mkdirSync(join(ws, "subdir"));
     const result = await makeRuntime().execute(call("read_file", { path: "subdir" }), makeCtx(ws));
-    expect(result.is_error).toBe(false);
-    expect(result.output).toContain("is a directory");
-    expect(result.output).toContain("list_directory");
-    expect(result.output).not.toContain("File not found");
+    expect(result.is_error).toBe(true);
+    expect(result.error).toContain("is a directory");
+    expect(result.error).toContain("list_directory");
   });
 
   test("read_file honors execution-context workspace_path when config.jarvis_path points elsewhere", async () => {
@@ -159,7 +162,43 @@ describe("FilesystemBundle > edit_file (read-before-edit guard)", () => {
       call("edit_file", { path: "f.txt", old_string: "hello", new_string: "hi" }),
       makeCtx(ws),
     );
-    expect(result.output).toContain("has not been read yet");
+    expect(result.is_error).toBe(true);
+    expect(result.error).toContain("has not been read yet");
+  });
+
+  test("returns is_error when old_string is missing or ambiguous", async () => {
+    const ws = makeTempWorkspace();
+    writeFileSync(join(ws, "missing.txt"), "alpha beta");
+    writeFileSync(join(ws, "ambiguous.txt"), "hello hello");
+    const rt = makeRuntime();
+    const ctx = makeCtx(ws);
+    await rt.execute(call("read_file", { path: "missing.txt" }), ctx);
+    await rt.execute(call("read_file", { path: "ambiguous.txt" }), ctx);
+
+    const missing = await rt.execute(
+      call("edit_file", { path: "missing.txt", old_string: "gamma", new_string: "delta" }),
+      ctx,
+    );
+    expect(missing.is_error).toBe(true);
+    expect(missing.error).toContain("old_string not found");
+
+    const ambiguous = await rt.execute(
+      call("edit_file", { path: "ambiguous.txt", old_string: "hello", new_string: "hi" }),
+      ctx,
+    );
+    expect(ambiguous.is_error).toBe(true);
+    expect(ambiguous.error).toContain("appears 2 times");
+  });
+
+  test("multi_edit on a missing file returns is_error", async () => {
+    const ws = makeTempWorkspace();
+    markFileRead(join(ws, "missing.txt"));
+    const result = await makeRuntime().execute(
+      call("multi_edit", { path: "missing.txt", edits: [{ old_string: "a", new_string: "b" }] }),
+      makeCtx(ws),
+    );
+    expect(result.is_error).toBe(true);
+    expect(result.error).toContain("File not found");
   });
 
   test("edits after the file has been read in the same runtime/process", async () => {
@@ -199,7 +238,18 @@ describe("FilesystemBundle > apply_patch (Tier A)", () => {
     writeFileSync(join(ws, "p.txt"), "alpha\nbeta\ngamma\n");
     const patch = createTwoFilesPatch("p.txt", "p.txt", "alpha\nbeta\ngamma\n", "alpha\nBETA\ngamma\n");
     const result = await makeRuntime().execute(call("apply_patch", { path: "p.txt", patch }), makeCtx(ws));
-    expect(result.output).toContain("has not been read yet");
+    expect(result.is_error).toBe(true);
+    expect(result.error).toContain("has not been read yet");
+  });
+
+  test("apply_patch on a missing file returns is_error", async () => {
+    const ws = makeTempWorkspace();
+    const path = join(ws, "missing.txt");
+    markFileRead(path);
+    const patch = createTwoFilesPatch("missing.txt", "missing.txt", "a\n", "b\n");
+    const result = await makeRuntime().execute(call("apply_patch", { path: "missing.txt", patch }), makeCtx(ws));
+    expect(result.is_error).toBe(true);
+    expect(result.error).toContain("File not found");
   });
 
   test("applies a unified diff after the file has been read", async () => {
@@ -226,7 +276,8 @@ describe("FilesystemBundle > apply_patch (Tier A)", () => {
     const ctx = makeCtx(ws);
     await rt.execute(call("read_file", { path: "p.txt" }), ctx);
     const result = await rt.execute(call("apply_patch", { path: "p.txt", patch }), ctx);
-    expect(result.output.toLowerCase()).toMatch(/could not|did not|does not|failed|not apply/);
+    expect(result.is_error).toBe(true);
+    expect(result.error?.toLowerCase()).toMatch(/could not|did not|does not|failed|not apply/);
     expect(readFileSync(join(ws, "p.txt"), "utf-8")).toBe(before);
   });
 });
@@ -258,6 +309,22 @@ describe("FilesystemBundle > grep + glob + list_directory", () => {
     expect(result.is_error).toBe(false);
     expect(result.output).toContain("a.txt");
     expect(result.output).toContain("sub");
+  });
+
+  test("missing search roots return typed errors for glob, grep, and list_directory", async () => {
+    const ws = makeTempWorkspace();
+    const rt = makeRuntime();
+    const ctx = makeCtx(ws);
+
+    for (const [name, args] of [
+      ["glob", { pattern: "**/*.ts", path: "missing" }],
+      ["grep", { pattern: "x", path: "missing" }],
+      ["list_directory", { path: "missing" }],
+    ] as const) {
+      const result = await rt.execute(call(name, args), ctx);
+      expect(result.is_error).toBe(true);
+      expect(result.error).toContain("not found");
+    }
   });
 
   test("glob and list_directory default to execution-context workspace_path when config.jarvis_path is stale", async () => {

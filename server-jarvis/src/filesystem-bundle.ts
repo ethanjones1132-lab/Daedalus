@@ -185,13 +185,9 @@ async function handleReadFile(args: Record<string, unknown>, ctx: ExecutionConte
   const offset = (args.offset as number) || 1;
   const limit = (args.limit as number) || 500;
 
-  try {
-    const stat = await fs.stat(path);
-    if (stat.isDirectory()) {
-      return `Error: "${args.path}" is a directory, not a file. Use list_directory to see its contents, then read_file on a specific file inside it.`;
-    }
-  } catch {
-    // stat failed (path missing) — fall through to readFile's not-found message.
+  const stat = await fs.stat(path).catch(() => null);
+  if (stat?.isDirectory()) {
+    throw new Error(`Error: "${args.path}" is a directory, not a file. Use list_directory to see its contents, then read_file on a specific file inside it.`);
   }
 
   try {
@@ -203,8 +199,8 @@ async function handleReadFile(args: Record<string, unknown>, ctx: ExecutionConte
 
     const numbered = lines.slice(start, end).map((line, i) => `${(start + i + 1).toString().padStart(6)} | ${line}`);
     return numbered.join("\n");
-  } catch (e: any) {
-    return `File not found: ${path}. Use glob with pattern to find the correct path before retrying.`;
+  } catch {
+    throw new Error(`File not found: ${path}. Use glob with pattern to find the correct path before retrying.`);
   }
 }
 
@@ -228,23 +224,23 @@ async function handleEditFile(args: Record<string, unknown>, ctx: ExecutionConte
   const newStr = args.new_string as string;
 
   if (!hasFileBeenRead(path)) {
-    return `Error: File "${args.path}" has not been read yet in this conversation. Call read_file on "${args.path}" first, then retry your edit with the exact content you see.`;
+    throw new Error(`Error: File "${args.path}" has not been read yet in this conversation. Call read_file on "${args.path}" first, then retry your edit with the exact content you see.`);
   }
 
   let content: string;
   try {
     content = await fs.readFile(path, "utf-8");
-  } catch (e: any) {
-    return `File not found: ${path}`;
+  } catch {
+    throw new Error(`File not found: ${path}`);
   }
 
   if (!content.includes(oldStr)) {
-    return `Error: old_string not found in "${args.path}". The file content may have changed. Call read_file on "${args.path}" to see current content, then use the exact text for old_string.`;
+    throw new Error(`Error: old_string not found in "${args.path}". The file content may have changed. Call read_file on "${args.path}" to see current content, then use the exact text for old_string.`);
   }
 
   const occurrences = content.split(oldStr).length - 1;
   if (occurrences > 1) {
-    return `Error: old_string appears ${occurrences} times in ${args.path}. Make it more specific.`;
+    throw new Error(`Error: old_string appears ${occurrences} times in ${args.path}. Make it more specific.`);
   }
 
   const updated = content.replace(oldStr, newStr);
@@ -258,14 +254,14 @@ async function handleMultiEdit(args: Record<string, unknown>, ctx: ExecutionCont
   const edits = args.edits as Array<{ old_string: string; new_string: string }>;
 
   if (!hasFileBeenRead(path)) {
-    return `Error: File "${args.path}" has not been read yet in this conversation. Call read_file on "${args.path}" first, then retry your edit with the exact content you see.`;
+    throw new Error(`Error: File "${args.path}" has not been read yet in this conversation. Call read_file on "${args.path}" first, then retry your edit with the exact content you see.`);
   }
 
   let content: string;
   try {
     content = await fs.readFile(path, "utf-8");
-  } catch (e: any) {
-    return `File not found: ${path}`;
+  } catch {
+    throw new Error(`File not found: ${path}`);
   }
 
   const results: string[] = [];
@@ -289,19 +285,19 @@ async function handleApplyPatch(args: Record<string, unknown>, ctx: ExecutionCon
   const patch = args.patch as string;
 
   if (!hasFileBeenRead(path)) {
-    return `Error: File "${args.path}" has not been read yet in this conversation. Call read_file on "${args.path}" first, then apply the patch.`;
+    throw new Error(`Error: File "${args.path}" has not been read yet in this conversation. Call read_file on "${args.path}" first, then apply the patch.`);
   }
 
   let content: string;
   try {
     content = await fs.readFile(path, "utf-8");
-  } catch (e: any) {
-    return `File not found: ${path}`;
+  } catch {
+    throw new Error(`File not found: ${path}`);
   }
 
   const result = applyUnifiedPatch(content, patch);
   if (!result.ok || result.content === undefined) {
-    return `Error: patch did not apply cleanly to "${args.path}". The file may have changed since it was read — call read_file again and regenerate the patch against the current content.`;
+    throw new Error(`Error: patch did not apply cleanly to "${args.path}". The file may have changed since it was read — call read_file again and regenerate the patch against the current content.`);
   }
 
   await fs.writeFile(path, result.content, "utf-8");
@@ -313,6 +309,7 @@ async function handleGlob(args: Record<string, unknown>, ctx: ExecutionContext):
   const cfg = ctx.config;
   const pattern = args.pattern as string;
   const searchPath = safePath((args.path as string) || ".", cfg, ctx.workspace_path);
+  await assertSearchDirectory(searchPath);
 
   // Simple glob implementation
   const results: string[] = [];
@@ -362,6 +359,7 @@ async function handleGrep(args: Record<string, unknown>, ctx: ExecutionContext):
   const cfg = ctx.config;
   const pattern = args.pattern as string;
   const searchPath = safePath((args.path as string) || ".", cfg, ctx.workspace_path);
+  await assertSearchDirectory(searchPath);
   const outputMode = (args.output_mode as string) || "files_with_matches";
   const headLimit = (args.head_limit as number) || 50;
 
@@ -428,8 +426,15 @@ async function handleListDir(args: Record<string, unknown>, ctx: ExecutionContex
     );
 
     return `${entries.length} items in ${args.path}:\n${items.join("\n")}`;
-  } catch (e: any) {
-    return `Directory not found: ${path}. Use glob with pattern "**" from the workspace root to find the correct directory path.`;
+  } catch {
+    throw new Error(`Directory not found: ${path}. Use glob with pattern "**" from the workspace root to find the correct directory path.`);
+  }
+}
+
+async function assertSearchDirectory(path: string): Promise<void> {
+  const stat = await fs.stat(path).catch(() => null);
+  if (!stat?.isDirectory()) {
+    throw new Error(`Directory not found: ${path}. Use glob with pattern "**" from the workspace root to find the correct directory path.`);
   }
 }
 
