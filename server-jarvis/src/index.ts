@@ -116,6 +116,7 @@ import {
 } from "./intelligence/mod";
 import { makeCallModel } from "./eval/call-model";
 import { normalizeStreamedToolCalls } from "./streaming-tool-calls";
+import { WorkspaceAffinityStore } from "./orchestration/workspace-affinity";
 
 // ── Structured Logging Override ──────────────────────────────────────────────
 const originalLog = console.log;
@@ -245,7 +246,7 @@ async function applyOutputMaxTokens(
  * bundles. Every surface (chat, cron, agent, mcp) now executes through this
  * same ToolRuntime contract; the chat surface composes the full bundle set.
  */
-function buildChatRuntime(cfg: JarvisConfig): {
+function buildChatRuntime(cfg: JarvisConfig, workspacePath = cfg.jarvis_path): {
   runtime: ToolRuntime;
   ctx: ExecutionContext;
 } {
@@ -253,7 +254,7 @@ function buildChatRuntime(cfg: JarvisConfig): {
   registerStandardBundles(runtime);
 
   const ctx = makeExecutionContext("chat", cfg, {
-    workspace_path: cfg.jarvis_path,
+    workspace_path: workspacePath,
   });
 
   return { runtime, ctx };
@@ -264,9 +265,9 @@ function buildChatRuntime(cfg: JarvisConfig): {
  * Rendered as a stable system-prompt prefix that never changes between turns,
  * enabling prompt caching for the static portion of the context.
  */
-function buildSandboxPermissions(cfg: JarvisConfig): string {
+function buildSandboxPermissions(cfg: JarvisConfig, activeWorkspacePath = cfg.jarvis_path): string {
   const mode = cfg.tools?.sandbox_mode ?? "strict";
-  const workspacePath = cfg.jarvis_path || "configured workspace";
+  const workspacePath = activeWorkspacePath || "configured workspace";
   const lines: string[] = [
     "## Sandbox & Permissions",
     "",
@@ -402,6 +403,7 @@ const sessionMemory = new SessionMemory(() => loadConfig().orchestrator.session_
 /** Last effective authority per session, retained for terse continuation turns. */
 const MAX_CONTINUATION_REQUIREMENTS = 256;
 const continuationRequirements = new Map<string, TurnRequirement>();
+const workspaceAffinity = new WorkspaceAffinityStore();
 
 function rememberContinuationRequirement(sessionId: string, requirement: TurnRequirement): void {
   continuationRequirements.delete(sessionId);
@@ -1109,6 +1111,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       if ((m as any).tool_call_id) msg.tool_call_id = (m as any).tool_call_id;
       return msg;
     });
+  const activeWorkspacePath = workspaceAffinity.resolve(
+    sessionId,
+    message,
+    turnHistory,
+    cfg.jarvis_path,
+  );
+  console.log(`[Jarvis] Active workspace session=${sessionId} path=${activeWorkspacePath}`);
   const { readable, writable } = new TransformStream();
   const rawWriter = writable.getWriter();
   const encoder = new TextEncoder();
@@ -1291,7 +1300,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       }
 
       // ── Build canonical tool runtime for this request ───────────
-      const { runtime, ctx } = buildChatRuntime(cfg);
+      const { runtime, ctx } = buildChatRuntime(cfg, activeWorkspacePath);
       // Patch the execution context with the active session ID so
       // interactive tools (ask_user_question) can scope state per-session.
       ctx.session_id = sessionId;
@@ -2077,7 +2086,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const runStartTime = Date.now();
 
         // Execute the pipeline
-        const mergedSharedContext = mergeSharedContextHints(route.shared_context, memoryHints);
+        const mergedSharedContext = mergeSharedContextHints(
+          mergeSharedContextHints(route.shared_context, memoryHints),
+          {
+            relevant_memories: [
+              `Active filesystem workspace root: ${activeWorkspacePath}. Resolve relative filesystem paths against this root.`,
+            ],
+          },
+        );
         const executor = new PipelineExecutor(callModel, runtime, ctx);
         const onOrchestratorStateChange = async (state: PipelineProgressState) => {
           // Stream stage progress back to client — "conductor_replan" (B-02)
@@ -2431,7 +2447,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // Only the tail changes between turns → prompt cache stays warm for the prefix.
         {
           const effectiveTextTools = !forceFinalAnswerOnly ? cachedTextToolInstructions : "";
-          const sandboxBlock = buildSandboxPermissions(cfg);
+          const sandboxBlock = buildSandboxPermissions(cfg, activeWorkspacePath);
           const staticPrefix = [cfg.system_prompt, sandboxBlock, effectiveTextTools].filter(Boolean).join("\n\n");
           messages.push({ role: "system", content: staticPrefix });
           // Preserve compaction summaries and memory system messages from history unchanged
@@ -3656,6 +3672,7 @@ async function baseFetch(req: Request): Promise<Response> {
       persistentConductor.clearSession(sid);
       sessionMemory.clearSession(sid);
       continuationRequirements.delete(sid);
+      workspaceAffinity.clear(sid);
       // B-04: reset the per-session replan counter so a user-initiated
       // "new session" frees up the replan budget. Without this, a fresh
       // session inheriting the same id would inherit a depleted counter.

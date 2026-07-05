@@ -152,6 +152,20 @@ describe("FilesystemBundle > write_file", () => {
     expect(existsSync(join(ws, "nested", "dir", "new.txt"))).toBe(true);
     expect(readFileSync(join(ws, "nested", "dir", "new.txt"), "utf-8")).toBe("a\nb\nc");
   });
+
+  test("write_file honors execution-context workspace_path when config.jarvis_path points elsewhere", async () => {
+    const configWorkspace = makeTempWorkspace();
+    const invocationWorkspace = makeTempWorkspace();
+    const result = await makeRuntime().execute(
+      call("write_file", { path: "outside-root-proof.txt", content: "workspace affinity works\n" }),
+      makeCtxWithRoots(configWorkspace, invocationWorkspace),
+    );
+
+    expect(result.is_error).toBe(false);
+    expect(readFileSync(join(invocationWorkspace, "outside-root-proof.txt"), "utf-8"))
+      .toBe("workspace affinity works\n");
+    expect(existsSync(join(configWorkspace, "outside-root-proof.txt"))).toBe(false);
+  });
 });
 
 describe("FilesystemBundle > edit_file (read-before-edit guard)", () => {

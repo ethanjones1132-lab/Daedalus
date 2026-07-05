@@ -85,6 +85,14 @@ describe("classifyTurnRequirements", () => {
     expect(classifyTurnRequirements("delete the temp directory").requirement).toBe("full_execution");
   });
 
+  test("execute-to-completion language grants the write-capable profile", () => {
+    const result = classifyTurnRequirements(
+      "Read the core files of this application, get a plan together first then execute it to completion",
+    );
+    expect(result.requirement).toBe("full_execution");
+    expect(result.signals).toContain("mutation_verb");
+  });
+
   test("mutation takes precedence over read on a path", () => {
     // "edit C:\x.ts" must be full_execution, not workspace_read.
     const r = classifyTurnRequirements('edit "C:\\src\\x.ts" to add a header');

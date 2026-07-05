@@ -67,6 +67,44 @@ describe("ToolRuntime", () => {
     expect(typeof result.duration_ms).toBe("number");
   });
 
+  test("filesystem path alias is normalized before validation and dispatch", async () => {
+    const runtime = createToolRuntime();
+    let received: Record<string, unknown> | undefined;
+    runtime.register(makeDef("list_directory", ["path"]), async (args) => {
+      received = args;
+      return "listed";
+    });
+
+    const result = await runtime.execute(
+      {
+        id: "call-path-alias",
+        name: "list_directory",
+        arguments: { relative_workspace_path: "src/app" },
+      },
+      makeCtx(),
+    );
+
+    expect(result.is_error).toBe(false);
+    expect(received?.path).toBe("src/app");
+  });
+
+  test("empty filesystem path alias does not bypass required argument validation", async () => {
+    const runtime = createToolRuntime();
+    runtime.register(makeDef("read_file", ["path"]), async () => "unexpected");
+
+    const result = await runtime.execute(
+      {
+        id: "call-empty-path-alias",
+        name: "read_file",
+        arguments: { relative_workspace_path: "   " },
+      },
+      makeCtx(),
+    );
+
+    expect(result.is_error).toBe(true);
+    expect(result.error_code).toBe("missing_args");
+  });
+
   // ── Unknown tool ───────────────────────────────────────────────────────────
 
   test("executing unknown tool returns is_error:true containing the tool name", async () => {

@@ -243,8 +243,20 @@ export function createToolRuntime(): ToolRuntime {
 
     // Input validation — check required parameters before invoking handler
     const required: string[] = entry.def.function.parameters?.required ?? [];
+    // Models occasionally use this descriptive schema alias for filesystem
+    // tools. Canonicalize it before validation so policy, approval, and the
+    // handler all see the same arguments. Empty aliases remain invalid.
+    const callArguments = { ...call.arguments };
+    if (
+      required.includes("path") &&
+      callArguments.path === undefined &&
+      typeof callArguments.relative_workspace_path === "string" &&
+      callArguments.relative_workspace_path.trim().length > 0
+    ) {
+      callArguments.path = callArguments.relative_workspace_path.trim();
+    }
     const missingArgs = required.filter(
-      (param) => !(param in call.arguments) || call.arguments[param] === undefined,
+      (param) => !(param in callArguments) || callArguments[param] === undefined,
     );
     if (missingArgs.length > 0) {
       const msg = `Missing required argument(s) for "${call.name}": ${missingArgs.join(", ")}`;
@@ -294,7 +306,7 @@ export function createToolRuntime(): ToolRuntime {
       const approved = await ctx.requestApproval({
         call_id: call.id,
         name: call.name,
-        arguments: call.arguments,
+        arguments: callArguments,
       });
       if (!approved) {
         const msg = `Tool "${call.name}" was rejected by the user.`;
@@ -313,7 +325,7 @@ export function createToolRuntime(): ToolRuntime {
 
     // Execute handler — catch all throws
     try {
-      const output = await entry.handler(call.arguments, ctx);
+      const output = await entry.handler(callArguments, ctx);
       return {
         call_id: call.id,
         name: call.name,
