@@ -569,13 +569,45 @@ Tools: read_file, write_file, edit_file, multi_edit, list_directory, glob, grep,
   };
 }
 
-export function normalizeConfig(raw: any): JarvisConfig {
+export interface NormalizeConfigOptions {
+  platform?: NodeJS.Platform;
+  exists?: (path: string) => boolean;
+}
+
+/** True when a configured jarvis_path is unusable on this platform. */
+export function isInvalidWorkspacePath(
+  path: string,
+  platform: NodeJS.Platform = process.platform,
+  exists: (path: string) => boolean = existsSync,
+): boolean {
+  if (!path || !path.trim()) return true;
+  if (platform === "win32" && /^\//.test(path)) return true;
+  if (platform !== "win32" && /^[a-zA-Z]:[\\/]/.test(path)) return true;
+  try {
+    return !exists(path);
+  } catch {
+    return true;
+  }
+}
+
+export function normalizeConfig(raw: any, options: NormalizeConfigOptions = {}): JarvisConfig {
   const merged = deepMerge(defaultConfig(), raw);
+  const defaultWorkspacePath = join(homedir(), ".openclaw", "agents", "coderclaw", "workspace", "home-base");
   // Ensure jarvis_path is always set — an empty string or missing value
   // must never cause the workspace to silently resolve to process.cwd()
   // (e.g. the Windows Desktop when spawned from Tauri via wsl.exe).
   if (!merged.jarvis_path || merged.jarvis_path.trim() === "") {
-    merged.jarvis_path = join(homedir(), ".openclaw", "agents", "coderclaw", "workspace", "home-base");
+    merged.jarvis_path = defaultWorkspacePath;
+  }
+  const platform = options.platform ?? process.platform;
+  const exists = options.exists ?? existsSync;
+  if (merged.jarvis_path !== defaultWorkspacePath && isInvalidWorkspacePath(merged.jarvis_path, platform, exists)) {
+    const stalePath = merged.jarvis_path;
+    merged.jarvis_path = defaultWorkspacePath;
+    console.warn(
+      `[Config] jarvis_path "${stalePath}" is unusable on ${platform}; using "${merged.jarvis_path}" in memory. ` +
+      "The on-disk config is not rewritten until the next explicit save.",
+    );
   }
   return merged;
 }

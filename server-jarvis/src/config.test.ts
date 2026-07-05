@@ -3,10 +3,39 @@ import { join } from "path";
 import { homedir } from "os";
 import {
   defaultConfig,
+  isInvalidWorkspacePath,
   normalizeConfig,
   resolveAgentsRoot,
   validateAgentsRootPath,
 } from "./config";
+
+describe("jarvis_path self-healing", () => {
+  test("detects platform-incompatible and missing workspace paths", () => {
+    expect(isInvalidWorkspacePath("/root/workspace", "win32", () => true)).toBe(true);
+    expect(isInvalidWorkspacePath("C:\\Projects\\home-base", "linux", () => true)).toBe(true);
+    expect(isInvalidWorkspacePath("C:\\Projects\\home-base", "win32", () => true)).toBe(false);
+    expect(isInvalidWorkspacePath("C:\\missing", "win32", () => false)).toBe(true);
+  });
+
+  test("normalizeConfig heals the literal stale POSIX workspace on Windows", () => {
+    const stale = "/root/.openclaw/agents/coderclaw/workspace/Jarvis";
+    const cfg = normalizeConfig(
+      { jarvis_path: stale },
+      { platform: "win32", exists: (path) => path !== stale },
+    );
+    expect(cfg.jarvis_path).toBe(join(homedir(), ".openclaw", "agents", "coderclaw", "workspace", "home-base"));
+    expect(cfg.jarvis_path).not.toBe(stale);
+  });
+
+  test("normalizeConfig preserves a valid configured workspace", () => {
+    const valid = "C:\\Projects\\home-base-recovered";
+    const cfg = normalizeConfig(
+      { jarvis_path: valid },
+      { platform: "win32", exists: (path) => path === valid },
+    );
+    expect(cfg.jarvis_path).toBe(valid);
+  });
+});
 
 // ─── P1-02: Agents Root Configuration ────────────────────────────────────────
 // Tests verify behavior through the public config API only.
