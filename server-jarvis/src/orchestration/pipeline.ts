@@ -345,6 +345,7 @@ export class PipelineExecutor {
         turnCount++;
         executorTurn++;
         const turnStartTime = Date.now();
+        const turnStartIdx = toolCalls.length;
         let response: any;
 
         try {
@@ -386,6 +387,7 @@ export class PipelineExecutor {
             executorDone = true;
           }
 
+          const turnToolErrors = toolCalls.slice(turnStartIdx).filter((call) => call.is_error);
           this.collector.recordStageRun({
             id: `stage_${crypto.randomUUID()}`,
             agent_run_id: agentRunId,
@@ -395,8 +397,11 @@ export class PipelineExecutor {
             output_tokens: countTokens(response?.content || ""),
             tool_calls_json: JSON.stringify(response?.tool_calls || []),
             duration_ms: Date.now() - turnStartTime,
-            was_successful: 1,
-            had_error: 0,
+            was_successful: turnToolErrors.length === 0 ? 1 : 0,
+            had_error: turnToolErrors.length === 0 ? 0 : 1,
+            error_message: turnToolErrors[0]
+              ? `${turnToolErrors[0].name}: ${(turnToolErrors[0].output || "").slice(0, 200)}`
+              : undefined,
           });
         } catch (err: any) {
           this.collector.recordStageRun({
@@ -451,6 +456,7 @@ export class PipelineExecutor {
       while (!rewriterDone && rewriterTurn < maxRewriterTurns) {
         rewriterTurn++;
         const rewStartTime = Date.now();
+        const turnStartIdx = toolCalls.length;
         let rewriteResp: any;
 
         try {
@@ -492,6 +498,7 @@ export class PipelineExecutor {
             rewriterDone = true;
           }
 
+          const turnToolErrors = toolCalls.slice(turnStartIdx).filter((call) => call.is_error);
           this.collector.recordStageRun({
             id: `stage_${crypto.randomUUID()}`,
             agent_run_id: agentRunId,
@@ -501,8 +508,11 @@ export class PipelineExecutor {
             output_tokens: countTokens(rewriteResp?.content || ""),
             tool_calls_json: JSON.stringify(rewriteResp?.tool_calls || []),
             duration_ms: Date.now() - rewStartTime,
-            was_successful: 1,
-            had_error: 0,
+            was_successful: turnToolErrors.length === 0 ? 1 : 0,
+            had_error: turnToolErrors.length === 0 ? 0 : 1,
+            error_message: turnToolErrors[0]
+              ? `${turnToolErrors[0].name}: ${(turnToolErrors[0].output || "").slice(0, 200)}`
+              : undefined,
           });
         } catch (err: any) {
           this.collector.recordStageRun({
