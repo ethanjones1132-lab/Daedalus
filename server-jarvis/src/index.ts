@@ -86,7 +86,12 @@ import { AgentPool, firstTokenTimeoutFor, formatPoolDiversity } from "./orchestr
 import { excludedModelKeys } from "./model-failure-memory";
 import { PipelineExecutor } from "./orchestration/pipeline";
 import type { PipelineProgressState, PipelineRecursionEvent } from "./orchestration/pipeline";
-import { classifyTurnRequirements } from "./orchestration/turn-requirements";
+import {
+  classifyTurnRequirements,
+  inheritRequirementForContinuation,
+  type TurnRequirement,
+} from "./orchestration/turn-requirements";
+import { isContinuationTurn } from "./orchestration/turn-triage";
 import { normalizeRoute, type ExecutionProfile } from "./orchestration/route-normalization";
 import { runPipelineWithReplanning } from "./orchestration/replan-loop";
 import { SessionReplanCounter } from "./orchestration/replan-telemetry";
@@ -378,6 +383,20 @@ const persistentConductor = new PersistentConductor(loadConfig);
 
 /** Inter-workflow shared memory — tool results, file snapshots, failure patterns. */
 const sessionMemory = new SessionMemory(() => loadConfig().orchestrator.session_memory);
+
+/** Last effective authority per session, retained for terse continuation turns. */
+const MAX_CONTINUATION_REQUIREMENTS = 256;
+const continuationRequirements = new Map<string, TurnRequirement>();
+
+function rememberContinuationRequirement(sessionId: string, requirement: TurnRequirement): void {
+  continuationRequirements.delete(sessionId);
+  continuationRequirements.set(sessionId, requirement);
+  while (continuationRequirements.size > MAX_CONTINUATION_REQUIREMENTS) {
+    const oldest = continuationRequirements.keys().next().value;
+    if (!oldest) break;
+    continuationRequirements.delete(oldest);
+  }
+}
 
 /** B-04: per-session cumulative counter for `conductor_replan` re-invocations.
  *  Backs both the per-session replan cap and the persistent `replan_events`
@@ -1944,6 +1963,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const memoryHints = sessionMemory.toSharedContextHints(sessionId);
         const route = await coordinator.route(contextMessage, {
           sessionId,
+          rawMessage: message,
           history: turnHistory,
           lastOutcome: sessionMemory.getLastOutcome(sessionId),
           sessionMemoryHints: memoryHints,
@@ -1954,7 +1974,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // NOT `contextMessage` (which prepends history and would let a prior
         // file-read contaminate a follow-up greeting). This is the authoritative
         // signal; the coordinator model's route is advisory.
-        const turnReq = classifyTurnRequirements(message);
+        const turnReq = inheritRequirementForContinuation(
+          classifyTurnRequirements(message),
+          continuationRequirements.get(sessionId),
+          isContinuationTurn(message),
+        );
         const normalized = normalizeRoute(
           route,
           turnReq.requirement,
@@ -1962,6 +1986,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         );
         const executablePipeline = normalized.pipeline;
         const executionProfile: ExecutionProfile = normalized.profile;
+        rememberContinuationRequirement(sessionId, turnReq.requirement);
         console.log(
           `[Jarvis Orchestrator] task_type=${route.task_type} model_route=${route.pipeline.map((s) => s ?? "skip").join("->")}/${route.topology}; ` +
           `requirement=${turnReq.requirement} [${turnReq.signals.join(",")}]; ` +
@@ -2036,6 +2061,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               coordinator,
               routeOptions: {
                 sessionId,
+                rawMessage: message,
                 history: turnHistory,
                 lastOutcome: sessionMemory.getLastOutcome(sessionId),
                 sessionMemoryHints: memoryHints,
@@ -3530,6 +3556,7 @@ async function baseFetch(req: Request): Promise<Response> {
       clearSessionState(sid);
       persistentConductor.clearSession(sid);
       sessionMemory.clearSession(sid);
+      continuationRequirements.delete(sid);
       // B-04: reset the per-session replan counter so a user-initiated
       // "new session" frees up the replan budget. Without this, a fresh
       // session inheriting the same id would inherit a depleted counter.

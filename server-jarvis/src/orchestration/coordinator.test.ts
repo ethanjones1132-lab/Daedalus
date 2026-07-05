@@ -69,6 +69,82 @@ describe("Coordinator", () => {
     expect(decision.coordinator_rationale).toContain("unparseable");
   });
 
+  test("reuses the prior executor route when continuation output is unparseable", async () => {
+    let calls = 0;
+    const coordinator = new Coordinator(async () => ({
+      content: calls++ === 0
+        ? JSON.stringify({
+          task_type: "debug",
+          pipeline: ["planner", "executor", "reviewer", "synthesizer"],
+          topology: "linear",
+          context: { needs_workspace_inspection: true, needs_memory: true, estimated_complexity: "high" },
+          coordinator_rationale: "Execute the requested repair.",
+        })
+        : "not json",
+    }));
+
+    await coordinator.route("Fix the failing stream", {
+      sessionId: "continuation-reuse-1",
+      rawMessage: "Fix the failing stream",
+    });
+    const decision = await coordinator.route("History... Current request: continue", {
+      sessionId: "continuation-reuse-1",
+      rawMessage: "continue",
+    });
+
+    expect(decision.pipeline).toEqual(["planner", "executor", "reviewer", "synthesizer"]);
+    expect(decision.conductor_source).toBe("continuation_reuse");
+    expect(decision.coordinator_rationale).toContain("reusing previous pipeline");
+  });
+
+  test("non-continuation parse failure still uses the safe default", async () => {
+    let calls = 0;
+    const coordinator = new Coordinator(async () => ({
+      content: calls++ === 0
+        ? JSON.stringify({
+          task_type: "debug",
+          pipeline: ["executor", "synthesizer"],
+          topology: "linear",
+          context: { needs_workspace_inspection: true, needs_memory: true, estimated_complexity: "medium" },
+          coordinator_rationale: "Inspect and repair.",
+        })
+        : "not json",
+    }));
+    await coordinator.route("Fix it", { sessionId: "continuation-reuse-2", rawMessage: "Fix it" });
+    const decision = await coordinator.route("Explain a mutex", {
+      sessionId: "continuation-reuse-2",
+      rawMessage: "Explain a mutex",
+    });
+    expect(decision.pipeline).toEqual(["synthesizer"]);
+    expect(decision.conductor_source).toBe("api");
+  });
+
+  test("ok go ahead does not trivially short-circuit after an executor route", async () => {
+    let calls = 0;
+    const coordinator = new Coordinator(async () => ({
+      content: calls++ === 0
+        ? JSON.stringify({
+          task_type: "debug",
+          pipeline: ["executor", "synthesizer"],
+          topology: "linear",
+          context: { needs_workspace_inspection: true, needs_memory: true, estimated_complexity: "medium" },
+          coordinator_rationale: "Executor route.",
+        })
+        : "not json",
+    }));
+    await coordinator.route("Prepare the repair", {
+      sessionId: "continuation-reuse-3",
+      rawMessage: "Prepare the repair",
+    });
+    const decision = await coordinator.route("ok go ahead", {
+      sessionId: "continuation-reuse-3",
+      rawMessage: "ok go ahead",
+    });
+    expect(calls).toBe(2);
+    expect(decision.conductor_source).toBe("continuation_reuse");
+    expect(decision.pipeline).toContain("executor");
+  });
+
   test("propagates a genuine transport failure (callModel throws → caller surfaces an error)", async () => {
     // When the model call itself fails (all providers exhausted, auth, etc.)
     // the error must propagate so the turn surfaces an error banner — only

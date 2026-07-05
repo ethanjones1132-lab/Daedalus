@@ -1,5 +1,19 @@
 import { describe, test, expect } from "bun:test";
-import { isTrivialConversationalTurn } from "./turn-triage";
+import { isContinuationTurn, isTrivialConversationalTurn } from "./turn-triage";
+
+describe("isContinuationTurn", () => {
+  test("recognizes compact continuation commands", () => {
+    for (const message of ["Now task 2, go ahead", "ok go ahead", "continue", "next"]) {
+      expect(isContinuationTurn(message)).toBe(true);
+    }
+  });
+
+  test("rejects standalone tasks, long messages, and acknowledgements", () => {
+    for (const message of ["read the config file", "x".repeat(200), "thanks!"]) {
+      expect(isContinuationTurn(message)).toBe(false);
+    }
+  });
+});
 
 describe("isTrivialConversationalTurn", () => {
   test("greetings and small talk are trivial", () => {

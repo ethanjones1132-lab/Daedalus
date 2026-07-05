@@ -1,5 +1,5 @@
 import { loadPrompt } from "./prompt-loader";
-import { isTrivialConversationalTurn } from "./turn-triage";
+import { isContinuationTurn, isTrivialConversationalTurn } from "./turn-triage";
 import { PersistentConductor, PersistentConductorError } from "./persistent-conductor";
 
 export type TaskType = "code_review" | "debug" | "refactor" | "general" | "plan" | "research" | "test" | "docs";
@@ -73,12 +73,14 @@ export interface CoordinatorResult {
   /** Cross-turn context the conductor wants injected into worker prompts. */
   shared_context?: SharedContextHints;
   /** Phase 4 telemetry: which routing backend produced this decision. */
-  conductor_source?: "local" | "api" | "trivial";
+  conductor_source?: "local" | "api" | "trivial" | "continuation_reuse";
   conductor_model?: string;
 }
 
 export interface CoordinatorRouteOptions {
   sessionId: string;
+  /** Raw current user message, before history/memory augmentation. */
+  rawMessage?: string;
   history?: ChatMessage[];
   lastOutcome?: string;
   /** Inter-workflow shared memory injected into conductor routing turns. */
@@ -114,15 +116,20 @@ export class Coordinator {
   ) {}
 
   async route(request: string, options: CoordinatorRouteOptions): Promise<CoordinatorResult> {
-    if (isTrivialConversationalTurn(request)) {
-      const state = this.getState(options.sessionId);
+    const state = this.getState(options.sessionId);
+    const raw = options.rawMessage ?? request;
+    const continuation = isContinuationTurn(raw)
+      && (state.lastDecision?.pipeline ?? []).some(
+        (stage) => stage === "executor" || stage === "re-enter:executor",
+      );
+
+    if (isTrivialConversationalTurn(raw) && !continuation) {
       const decision = { ...this.conversationalRoute(), conductor_source: "trivial" as const };
       state.turns += 1;
       state.lastDecision = decision;
       return decision;
     }
 
-    const state = this.getState(options.sessionId);
     const lastOutcome = options.lastOutcome ?? state.lastOutcome;
     const response = await this.invokeCoordinatorModel(request, {
       sessionId: options.sessionId,
@@ -142,10 +149,21 @@ export class Coordinator {
       const parsed = this.extractJson<unknown>(response.content);
       decision = this.validate(parsed);
     } catch (e) {
-      console.warn(`[Coordinator] Routing parse failed, using default route: ${e instanceof Error ? e.message : String(e)}`);
-      decision = this.defaultRoute();
+      if (continuation && state.lastDecision) {
+        console.warn(`[Coordinator] Continuation routing parse failed, reusing previous route: ${e instanceof Error ? e.message : String(e)}`);
+        decision = {
+          ...state.lastDecision,
+          conductor_source: "continuation_reuse",
+          coordinator_rationale: "Continuation turn: coordinator output unusable; reusing previous pipeline",
+        };
+      } else {
+        console.warn(`[Coordinator] Routing parse failed, using default route: ${e instanceof Error ? e.message : String(e)}`);
+        decision = this.defaultRoute();
+      }
     }
-    decision.conductor_source = response.source;
+    if (decision.conductor_source !== "continuation_reuse") {
+      decision.conductor_source = response.source;
+    }
     decision.conductor_model = response.model;
     state.turns += 1;
     state.lastOutcome = options.lastOutcome ?? state.lastOutcome;

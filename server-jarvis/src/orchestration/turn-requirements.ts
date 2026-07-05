@@ -34,6 +34,26 @@ export interface TurnRequirementResult {
   signals: string[];
 }
 
+const REQUIREMENT_RANK: Record<TurnRequirement, number> = {
+  conversational: 0,
+  answer_only: 1,
+  workspace_read: 2,
+  full_execution: 3,
+};
+
+export function inheritRequirementForContinuation(
+  current: TurnRequirementResult,
+  previous: TurnRequirement | undefined,
+  isContinuation: boolean,
+): TurnRequirementResult {
+  if (!isContinuation || !previous) return current;
+  if (REQUIREMENT_RANK[previous] <= REQUIREMENT_RANK[current.requirement]) return current;
+  return {
+    requirement: previous,
+    signals: [...current.signals, `continuation_inherit:${previous}`],
+  };
+}
+
 // ── Path detection ────────────────────────────────────────────────────────────
 // Each pattern recognizes one shape of filesystem reference. A match in ANY of
 // these means the message names a concrete path.

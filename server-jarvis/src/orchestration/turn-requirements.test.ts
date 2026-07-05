@@ -1,5 +1,26 @@
 import { describe, test, expect } from "bun:test";
-import { classifyTurnRequirements } from "./turn-requirements";
+import { classifyTurnRequirements, inheritRequirementForContinuation } from "./turn-requirements";
+
+describe("inheritRequirementForContinuation", () => {
+  test("inherits a higher-authority prior requirement on continuation", () => {
+    const current = { requirement: "answer_only" as const, signals: ["default_answer_only"] };
+    expect(inheritRequirementForContinuation(current, "full_execution", true)).toEqual({
+      requirement: "full_execution",
+      signals: ["default_answer_only", "continuation_inherit:full_execution"],
+    });
+  });
+
+  test("never lowers the current requirement", () => {
+    const current = { requirement: "full_execution" as const, signals: ["mutation_verb"] };
+    expect(inheritRequirementForContinuation(current, "workspace_read", true)).toBe(current);
+  });
+
+  test("is a no-op when the turn is not a continuation", () => {
+    const current = { requirement: "answer_only" as const, signals: ["default_answer_only"] };
+    expect(inheritRequirementForContinuation(current, "full_execution", false)).toBe(current);
+    expect(inheritRequirementForContinuation(current, undefined, true)).toBe(current);
+  });
+});
 
 describe("classifyTurnRequirements", () => {
   test("greetings and acknowledgements are conversational", () => {
