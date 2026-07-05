@@ -40,6 +40,18 @@ export interface ReviewerStageOutput {
   hasIssues: boolean;
 }
 
+export type ReviewerVerdict = "accept" | "reject" | "unknown";
+
+/** Parse the reviewer's leading verdict per prompts/modes/reviewer.md. */
+export function parseReviewerVerdict(feedback: string): ReviewerVerdict {
+  const head = feedback.trimStart().slice(0, 200).toUpperCase();
+  if (/^\**\s*ACCEPT\b/.test(head)) return "accept";
+  if (/^\**\s*REJECT\b/.test(head)) return "reject";
+  if (/\bREJECT\b/.test(head) && !/\bACCEPT\b/.test(head)) return "reject";
+  if (/\bACCEPT\b/.test(head) && !/\bREJECT\b/.test(head)) return "accept";
+  return "unknown";
+}
+
 export interface RewriterStageOutput {
   ok: boolean;
   narrative: string;

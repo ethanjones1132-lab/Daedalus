@@ -12,7 +12,7 @@ import { countTokens } from "../tokens";
 import { buildSynthesizerContext, buildSynthesizerContextFromStageState } from "./synth-context";
 import type { ExecutionProfile } from "./route-normalization";
 import type { PipelineStageState, PlannerStageOutput, ExecutorStageOutput, ReviewerStageOutput, RewriterStageOutput, ToolCallRecord } from "./stage-output";
-import { renderExecutorSummary, renderPlanSummary, renderReviewerSummary, renderRewriterSummary } from "./stage-output";
+import { parseReviewerVerdict, renderExecutorSummary, renderPlanSummary, renderReviewerSummary, renderRewriterSummary } from "./stage-output";
 
 /**
  * The slice of the outcome collector the pipeline depends on. Injecting this
@@ -862,6 +862,9 @@ export class PipelineExecutor {
   }
 
   private hasIssues(reviewText: string): boolean {
+    const verdict = parseReviewerVerdict(reviewText);
+    if (verdict === "reject") return true;
+    if (verdict === "accept") return false;
     const normalized = reviewText.toUpperCase();
     return normalized.includes("PARTIAL") || normalized.includes("MISSING");
   }

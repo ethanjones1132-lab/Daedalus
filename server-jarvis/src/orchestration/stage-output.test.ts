@@ -1,6 +1,7 @@
 // server-jarvis/src/orchestration/stage-output.test.ts
 import { describe, expect, test } from "bun:test";
 import {
+  parseReviewerVerdict,
   renderExecutorSummary,
   renderPlanSummary,
   renderReviewerSummary,
@@ -10,6 +11,20 @@ import {
   type ReviewerStageOutput,
   type RewriterStageOutput,
 } from "./stage-output";
+
+describe("parseReviewerVerdict", () => {
+  test("REJECT verdict flags issues", () => {
+    expect(parseReviewerVerdict("**REJECT** — the requested change is missing")).toBe("reject");
+  });
+
+  test("ACCEPT verdict passes even when the rationale mentions PARTIAL items", () => {
+    expect(parseReviewerVerdict("**ACCEPT** — solid; one PARTIAL doc note")).toBe("accept");
+  });
+
+  test("unknown verdict falls back to PARTIAL/MISSING substrings at the caller", () => {
+    expect(parseReviewerVerdict("Review notes: PARTIAL coverage remains")).toBe("unknown");
+  });
+});
 
 describe("stage-output renderers", () => {
   test("renderPlanSummary returns the sentinel when no planner ran", () => {
