@@ -62,7 +62,7 @@ function renderToolCalls(toolCalls: ToolCallRecord[]): string {
       const body = call.output.length > TOOL_OUTPUT_TRUNCATE_AT
         ? `${call.output.slice(0, TOOL_OUTPUT_TRUNCATE_AT)}... (${call.output.length - TOOL_OUTPUT_TRUNCATE_AT} more chars, truncated)`
         : call.output;
-      return `[Tool Call Result (${call.name})]${call.is_error ? " FAILED" : ""}: ${body}`;
+      return `<jarvis_internal_tool_result name="${call.name}">\n[Tool Call Result (${call.name})]${call.is_error ? " FAILED" : ""}: ${body}\n</jarvis_internal_tool_result>`;
     })
     .join("\n\n");
 }

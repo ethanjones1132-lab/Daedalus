@@ -35,8 +35,10 @@ describe("stage-output renderers", () => {
     };
     const rendered = renderExecutorSummary(executor);
     expect(rendered).toContain("[Executor]: Read the config file.");
+    expect(rendered).toContain('<jarvis_internal_tool_result name="read_file">');
     expect(rendered).toContain("[Tool Call Result (read_file)]");
     expect(rendered).toContain("export const x = 1;");
+    expect(rendered).toContain("</jarvis_internal_tool_result>");
   });
 
   test("renderExecutorSummary truncates long tool output with a length marker", () => {

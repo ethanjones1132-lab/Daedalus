@@ -181,7 +181,7 @@ const LIST_DIR_DEF: ToolDefinition = {
 
 async function handleReadFile(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
-  const path = safePath(args.path as string, cfg);
+  const path = safePath(args.path as string, cfg, ctx.workspace_path);
   const offset = (args.offset as number) || 1;
   const limit = (args.limit as number) || 500;
 
@@ -210,7 +210,7 @@ async function handleReadFile(args: Record<string, unknown>, ctx: ExecutionConte
 
 async function handleWriteFile(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
-  const path = safePath(args.path as string, cfg);
+  const path = safePath(args.path as string, cfg, ctx.workspace_path);
   const content = args.content as string;
 
   const dir = dirname(path);
@@ -223,7 +223,7 @@ async function handleWriteFile(args: Record<string, unknown>, ctx: ExecutionCont
 
 async function handleEditFile(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
-  const path = safePath(args.path as string, cfg);
+  const path = safePath(args.path as string, cfg, ctx.workspace_path);
   const oldStr = args.old_string as string;
   const newStr = args.new_string as string;
 
@@ -254,7 +254,7 @@ async function handleEditFile(args: Record<string, unknown>, ctx: ExecutionConte
 
 async function handleMultiEdit(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
-  const path = safePath(args.path as string, cfg);
+  const path = safePath(args.path as string, cfg, ctx.workspace_path);
   const edits = args.edits as Array<{ old_string: string; new_string: string }>;
 
   if (!hasFileBeenRead(path)) {
@@ -285,7 +285,7 @@ async function handleMultiEdit(args: Record<string, unknown>, ctx: ExecutionCont
 
 async function handleApplyPatch(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
-  const path = safePath(args.path as string, cfg);
+  const path = safePath(args.path as string, cfg, ctx.workspace_path);
   const patch = args.patch as string;
 
   if (!hasFileBeenRead(path)) {
@@ -312,7 +312,7 @@ async function handleApplyPatch(args: Record<string, unknown>, ctx: ExecutionCon
 async function handleGlob(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
   const pattern = args.pattern as string;
-  const searchPath = args.path as string || cfg.jarvis_path || cfg.jarvis_path;
+  const searchPath = safePath((args.path as string) || ".", cfg, ctx.workspace_path);
 
   // Simple glob implementation
   const results: string[] = [];
@@ -361,7 +361,7 @@ function formatSize(bytes: number): string {
 async function handleGrep(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
   const pattern = args.pattern as string;
-  const searchPath = args.path as string || cfg.jarvis_path || cfg.jarvis_path;
+  const searchPath = safePath((args.path as string) || ".", cfg, ctx.workspace_path);
   const outputMode = (args.output_mode as string) || "files_with_matches";
   const headLimit = (args.head_limit as number) || 50;
 
@@ -409,7 +409,7 @@ async function handleGrep(args: Record<string, unknown>, ctx: ExecutionContext):
 
 async function handleListDir(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
-  const path = safePath(args.path as string, cfg);
+  const path = safePath(args.path as string, cfg, ctx.workspace_path);
 
   try {
     const entries = await fs.readdir(path);

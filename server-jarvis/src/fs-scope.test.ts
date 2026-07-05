@@ -31,10 +31,15 @@ describe("fs-scope", () => {
   // Note: these assert host-agnostically because the test runner may execute on
   // Windows (win32 path semantics) while production runs in WSL (posix). The
   // meaningful invariant is the resolved suffix, not the separator style.
-  test("safePath resolves a relative path inside the workspace", () => {
-    const r = safePath("src/index.ts", cfg).replace(/\\/g, "/");
-    expect(r.endsWith("ws/src/index.ts")).toBe(true);
-  });
+  test("safePath resolves a relative path inside the workspace", () => {
+    const r = safePath("src/index.ts", cfg).replace(/\\/g, "/");
+    expect(r.endsWith("ws/src/index.ts")).toBe(true);
+  });
+
+  test("safePath prefers an invocation workspace override over config.jarvis_path", () => {
+    const r = safePath("src/index.ts", cfg, "/tmp/turn-workspace").replace(/\\/g, "/");
+    expect(r.endsWith("turn-workspace/src/index.ts")).toBe(true);
+  });
 
   test("safePath in permissive mode ALLOWS a path outside the workspace", () => {
     // permissive must be more lenient than strict: an out-of-workspace path is

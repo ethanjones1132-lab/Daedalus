@@ -5,8 +5,14 @@
 // every filesystem tool. Ported verbatim from the legacy tools.ts so behaviour
 // (and the chat model's expectations) are preserved exactly.
 
-import { resolve, relative } from "path";
-import type { JarvisConfig } from "./config";
+import { resolve, relative } from "path";
+import type { JarvisConfig } from "./config";
+
+function effectiveWorkspaceRoot(cfg: JarvisConfig, workspaceOverride?: string): string {
+  const override = workspaceOverride?.trim();
+  if (override) return override;
+  return cfg.jarvis_path || process.cwd();
+}
 
 /**
  * Translate a Windows-style path into its WSL equivalent.
@@ -39,14 +45,14 @@ export function toWslPath(inputPath: string): string {
  * Resolve a user-supplied path within the workspace sandbox.
  * Throws if the resolved path escapes the workspace, unless sandbox_mode is "off".
  */
-export function safePath(inputPath: string, cfg: JarvisConfig): string {
+export function safePath(inputPath: string, cfg: JarvisConfig, workspaceOverride?: string): string {
   // Only translate Windows paths to WSL when actually running in a posix
   // environment. The production Bun server runs inside WSL (linux), where
   // C:\ -> /mnt/c is needed; on a native Windows host the input is already
   // accessible as-is and translating it would break the path.
   const wslPath = process.platform === "win32" ? inputPath : toWslPath(inputPath);
   if (cfg.tools.sandbox_mode === "off") return resolve(wslPath);
-  const workspace = cfg.jarvis_path || process.cwd();
+  const workspace = effectiveWorkspaceRoot(cfg, workspaceOverride);
   const resolved = resolve(workspace, wslPath);
   const rel = relative(workspace, resolved);
   const escapes = rel.startsWith("..") || rel.startsWith("/") || /^[a-zA-Z]:/.test(rel);

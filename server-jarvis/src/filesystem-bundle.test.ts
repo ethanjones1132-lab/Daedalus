@@ -47,6 +47,21 @@ function makeCtx(workspace: string, surface: ExecutionContext["surface"] = "chat
   });
 }
 
+function makeCtxWithRoots(
+  configWorkspace: string,
+  invocationWorkspace: string,
+  surface: ExecutionContext["surface"] = "chat",
+): ExecutionContext {
+  const cfg = defaultConfig();
+  cfg.jarvis_path = configWorkspace;
+  cfg.tools.enabled = true;
+  cfg.tools.sandbox_mode = "workspace";
+  return makeExecutionContext(surface, cfg, {
+    workspace_path: invocationWorkspace,
+    requestApproval: async () => true,
+  });
+}
+
 function call(name: string, args: Record<string, unknown>) {
   return { id: `test-${name}`, name, arguments: args };
 }
@@ -105,6 +120,20 @@ describe("FilesystemBundle > read_file", () => {
     expect(result.is_error).toBe(false);
     expect(result.output).toContain("is a directory");
     expect(result.output).toContain("list_directory");
+    expect(result.output).not.toContain("File not found");
+  });
+
+  test("read_file honors execution-context workspace_path when config.jarvis_path points elsewhere", async () => {
+    const configWorkspace = makeTempWorkspace();
+    const invocationWorkspace = makeTempWorkspace();
+    mkdirSync(join(invocationWorkspace, "src"));
+    writeFileSync(join(invocationWorkspace, "src", "target.ts"), "export const target = 1;\n");
+    const result = await makeRuntime().execute(
+      call("read_file", { path: "src/target.ts" }),
+      makeCtxWithRoots(configWorkspace, invocationWorkspace),
+    );
+    expect(result.is_error).toBe(false);
+    expect(result.output).toContain("export const target = 1;");
     expect(result.output).not.toContain("File not found");
   });
 });
@@ -229,5 +258,21 @@ describe("FilesystemBundle > grep + glob + list_directory", () => {
     expect(result.is_error).toBe(false);
     expect(result.output).toContain("a.txt");
     expect(result.output).toContain("sub");
+  });
+
+  test("glob and list_directory default to execution-context workspace_path when config.jarvis_path is stale", async () => {
+    const configWorkspace = makeTempWorkspace();
+    const invocationWorkspace = makeTempWorkspace();
+    mkdirSync(join(invocationWorkspace, "src"));
+    writeFileSync(join(invocationWorkspace, "src", "alpha.ts"), "export const alpha = 1;\n");
+
+    const ctx = makeCtxWithRoots(configWorkspace, invocationWorkspace);
+    const list = await makeRuntime().execute(call("list_directory", { path: "." }), ctx);
+    expect(list.is_error).toBe(false);
+    expect(list.output).toContain("src");
+
+    const glob = await makeRuntime().execute(call("glob", { pattern: "**/*.ts" }), ctx);
+    expect(glob.is_error).toBe(false);
+    expect(glob.output).toContain("alpha.ts");
   });
 });

@@ -23,4 +23,10 @@ describe("synthesizer prompt grounding rule", () => {
     expect(prompt).toMatch(/I haven't inspected the repo in this turn/i);
     expect(prompt).toMatch(/synthesizer path was taken directly/i);
   });
+
+  test("forbids copying internal tool evidence into the user-facing answer", () => {
+    const prompt = loadPrompt("modes/synthesizer.md");
+    expect(prompt).toMatch(/never reproduce.*Tool Call Result/i);
+    expect(prompt).toContain("<jarvis_internal_tool_result");
+  });
 });

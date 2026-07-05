@@ -137,6 +137,32 @@ describe("text tool extraction", () => {
     expect(parsed.cleanedText).toBe("");
   });
 
+  test("strips the exact persisted Tool Call Result transcript from the 2026-07-05 session", () => {
+    const spill = `[Tool Call Result (read_file)]: {
+  "name": "Versutus",
+  "version": "1.0.0",
+  "main": "expo-router/entry",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android"
+  }
+}`;
+
+    const parsed = extractTextToolCalls(spill, []);
+    expect(parsed.calls).toHaveLength(0);
+    expect(parsed.cleanedText).toBe("");
+  });
+
+  test("strips explicitly bounded internal tool evidence from post-turn content", () => {
+    const echoed = `<jarvis_internal_tool_result name="read_file">
+[Tool Call Result (read_file)]: arbitrary multiline output
+that must never become assistant prose
+</jarvis_internal_tool_result>
+Here is the actual answer.`;
+
+    expect(extractTextToolCalls(echoed, []).cleanedText).toBe("Here is the actual answer.");
+  });
+
   test("strips an UNCLOSED tool_call tag on the same line as the JSON (2026-07-03 live leak)", () => {
     // Exact reproduction of session 1d4727cf / run_81091960: the synthesizer
     // emitted `<tool_call>{json}` with no closing tag. The cosmetic line-strip
@@ -370,6 +396,35 @@ describe("text tool stream sanitizer", () => {
     for (const chunks of chunkings) {
       expect(sanitizeVisibleAnswer(chunks)).toBe("");
     }
+  });
+
+  test("never streams a legacy Tool Call Result JSON transcript under arbitrary chunking", () => {
+    const spill = `[Tool Call Result (read_file)]: {
+  "name": "Versutus",
+  "version": "1.0.0",
+  "dependencies": {
+    "expo": "~52.0.0"
+  }
+}`;
+    const chunkings = [
+      [spill],
+      [...spill],
+      spill.match(/\S+|\s+/g) ?? [],
+      Array.from({ length: Math.ceil(spill.length / 5) }, (_, index) => spill.slice(index * 5, index * 5 + 5)),
+    ];
+
+    for (const chunks of chunkings) {
+      expect(sanitizeVisibleAnswer(chunks)).toBe("");
+    }
+  });
+
+  test("never streams explicitly bounded internal tool evidence", () => {
+    const echoed = `<jarvis_internal_tool_result name="read_file">
+[Tool Call Result (read_file)]: arbitrary multiline output
+</jarvis_internal_tool_result>
+Here is the actual answer.`;
+
+    expect(sanitizeVisibleAnswer([...echoed])).toBe("\nHere is the actual answer.");
   });
 
   test("drops multiple cosmetic tool objects when they occupy one complete line", () => {

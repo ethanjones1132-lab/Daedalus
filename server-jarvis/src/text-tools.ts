@@ -87,10 +87,18 @@ const TOOL_ALIASES: Record<string, string> = {
 
 const TOOL_CALL_OPEN_TAG = "<tool_call>";
 const TOOL_CALL_CLOSE_TAG = "</tool_call>";
+const INTERNAL_TOOL_RESULT_OPEN_PREFIX = "<jarvis_internal_tool_result";
+const INTERNAL_TOOL_RESULT_CLOSE_TAG = "</jarvis_internal_tool_result>";
+const LEGACY_TOOL_RESULT_LINE_PREFIX = /^\s*\[Tool Call Result \([^)]+\)\](?: FAILED)?:\s*/i;
+
+const SUPPRESSED_STREAM_TAGS = [
+  { openPrefix: TOOL_CALL_OPEN_TAG.slice(0, -1), closeTag: TOOL_CALL_CLOSE_TAG },
+  { openPrefix: INTERNAL_TOOL_RESULT_OPEN_PREFIX, closeTag: INTERNAL_TOOL_RESULT_CLOSE_TAG },
+] as const;
 
 export class TextToolCallStreamSanitizer {
   private pending = "";
-  private insideToolCall = false;
+  private closingTag: string | null = null;
 
   push(chunk: string): string {
     this.pending += chunk;
@@ -105,28 +113,53 @@ export class TextToolCallStreamSanitizer {
     let visible = "";
 
     while (this.pending) {
-      const expectedTag = this.insideToolCall ? TOOL_CALL_CLOSE_TAG : TOOL_CALL_OPEN_TAG;
-      const tagIndex = this.pending.toLowerCase().indexOf(expectedTag);
-
-      if (tagIndex >= 0) {
-        if (!this.insideToolCall) {
-          visible += this.pending.slice(0, tagIndex);
+      const lower = this.pending.toLowerCase();
+      if (this.closingTag) {
+        const closeIndex = lower.indexOf(this.closingTag);
+        if (closeIndex >= 0) {
+          this.pending = this.pending.slice(closeIndex + this.closingTag.length);
+          this.closingTag = null;
+          continue;
         }
-        this.pending = this.pending.slice(tagIndex + expectedTag.length);
-        this.insideToolCall = !this.insideToolCall;
+        if (flush) {
+          this.pending = "";
+          break;
+        }
+        const suffixLength = matchingTagPrefixSuffixLength(this.pending, this.closingTag);
+        this.pending = this.pending.slice(this.pending.length - suffixLength);
+        break;
+      }
+
+      let next: { index: number; openPrefix: string; closeTag: string } | null = null;
+      for (const tag of SUPPRESSED_STREAM_TAGS) {
+        const index = lower.indexOf(tag.openPrefix);
+        if (index >= 0 && (!next || index < next.index)) next = { index, ...tag };
+      }
+
+      if (next) {
+        visible += this.pending.slice(0, next.index);
+        const openEnd = this.pending.indexOf(">", next.index + next.openPrefix.length);
+        if (openEnd < 0) {
+          if (flush) this.pending = "";
+          else this.pending = this.pending.slice(next.index);
+          break;
+        }
+        this.pending = this.pending.slice(openEnd + 1);
+        this.closingTag = next.closeTag;
         continue;
       }
 
       if (flush) {
-        if (!this.insideToolCall) visible += this.pending;
+        visible += this.pending;
         this.pending = "";
         break;
       }
 
-      const suffixLength = matchingTagPrefixSuffixLength(this.pending, expectedTag);
-      if (!this.insideToolCall) {
-        visible += this.pending.slice(0, this.pending.length - suffixLength);
+      let suffixLength = 0;
+      for (const tag of SUPPRESSED_STREAM_TAGS) {
+        suffixLength = Math.max(suffixLength, matchingTagPrefixSuffixLength(this.pending, tag.openPrefix));
       }
+      visible += this.pending.slice(0, this.pending.length - suffixLength);
       this.pending = this.pending.slice(this.pending.length - suffixLength);
       break;
     }
@@ -218,7 +251,8 @@ export function extractTextToolCalls(text: string, tools: ToolDefinition[]): {
   calls: ParsedTextToolCall[];
 } {
   const availableNames = new Set(tools.map((tool) => tool.function.name));
-  const candidates = collectCandidates(text);
+  const boundedInternalCleaned = stripBoundedInternalToolResults(text);
+  const candidates = collectCandidates(boundedInternalCleaned);
   const calls: ParsedTextToolCall[] = [];
   const seen = new Set<string>();
 
@@ -232,7 +266,7 @@ export function extractTextToolCalls(text: string, tools: ToolDefinition[]): {
     }
   }
 
-  let cleanedText = text;
+  let cleanedText = boundedInternalCleaned;
   const spansToRemove: TextSpan[] = [];
   if (calls.length > 0) {
     for (const candidate of candidates) {
@@ -245,8 +279,10 @@ export function extractTextToolCalls(text: string, tools: ToolDefinition[]): {
   // tool-shaped JSON the model echoed from executor context even though
   // nothing can be executed — 2026-07-02 live incident (bare read_file lines).
   if (availableNames.size === 0) {
-    spansToRemove.push(...findCosmeticToolEchoLineSpans(text, candidates));
+    spansToRemove.push(...findCosmeticToolEchoLineSpans(cleanedText, candidates));
   }
+  const legacyToolResultSpans = findLegacyToolResultTranscriptSpans(cleanedText, candidates);
+  spansToRemove.push(...legacyToolResultSpans);
   const uniqueSpans = dedupeTextSpans(spansToRemove);
   if (uniqueSpans.length > 0) {
     const sorted = [...uniqueSpans].sort((a, b) => b.start - a.start);
@@ -254,8 +290,9 @@ export function extractTextToolCalls(text: string, tools: ToolDefinition[]): {
       cleanedText = `${cleanedText.slice(0, span.start)}${cleanedText.slice(span.end)}`;
     }
   }
+  const strippedInternal = boundedInternalCleaned !== text || legacyToolResultSpans.length > 0;
   const strippedCosmetic = availableNames.size === 0 && uniqueSpans.length > 0;
-  if (calls.length > 0 || strippedCosmetic || /<\/?tool_call>/i.test(cleanedText)) {
+  if (calls.length > 0 || strippedInternal || strippedCosmetic || /<\/?tool_call>/i.test(cleanedText)) {
     cleanedText = cleanedText
       .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "")
       // An UNCLOSED <tool_call> suppresses everything after it, mirroring
@@ -293,6 +330,10 @@ export class VisibleAnswerStreamSanitizer {
   private pendingLine = "";
   private lineAlreadyEmitted = false;
   private inFence = false;
+  private suppressingLegacyJson = false;
+  private legacyJsonDepth = 0;
+  private legacyJsonInString = false;
+  private legacyJsonEscaped = false;
 
   push(chunk: string): string {
     const tagCleaned = this.tagSanitizer.push(chunk);
@@ -324,7 +365,9 @@ export class VisibleAnswerStreamSanitizer {
 
     if (flush) {
       if (this.pendingLine) {
-        if (this.lineAlreadyEmitted) {
+        if (this.suppressingLegacyJson) {
+          this.consumeLegacyJson(this.pendingLine);
+        } else if (this.lineAlreadyEmitted) {
           visible += this.pendingLine;
         } else if (this.pendingLine.trim()) {
           visible += this.decideLine(this.pendingLine, "");
@@ -339,6 +382,8 @@ export class VisibleAnswerStreamSanitizer {
     if (this.pendingLine) {
       const pending = this.pendingLine.trimStart();
       const canEmit = pending
+        && !this.suppressingLegacyJson
+        && !couldBeLegacyToolResultLine(pending)
         && (this.lineAlreadyEmitted || (!pending.startsWith("{") && !pending.startsWith("`")));
       if (canEmit) {
         visible += this.pendingLine;
@@ -350,6 +395,19 @@ export class VisibleAnswerStreamSanitizer {
   }
 
   private decideLine(line: string, terminator: string): string {
+    if (this.suppressingLegacyJson) {
+      this.consumeLegacyJson(line + terminator);
+      return "";
+    }
+    const legacyPrefix = line.match(LEGACY_TOOL_RESULT_LINE_PREFIX);
+    if (legacyPrefix) {
+      const payload = line.slice(legacyPrefix[0].length).trimStart();
+      if (payload.startsWith("{") || payload.startsWith("[")) {
+        this.suppressingLegacyJson = true;
+        this.consumeLegacyJson(payload + terminator);
+      }
+      return "";
+    }
     const isFenceBoundary = line.trimStart().startsWith("```");
     if (isFenceBoundary) {
       this.inFence = !this.inFence;
@@ -359,6 +417,31 @@ export class VisibleAnswerStreamSanitizer {
       return line + terminator;
     }
     return "";
+  }
+
+  private consumeLegacyJson(text: string): void {
+    for (const char of text) {
+      if (this.legacyJsonInString) {
+        if (this.legacyJsonEscaped) this.legacyJsonEscaped = false;
+        else if (char === "\\") this.legacyJsonEscaped = true;
+        else if (char === '"') this.legacyJsonInString = false;
+        continue;
+      }
+      if (char === '"') {
+        this.legacyJsonInString = true;
+      } else if (char === "{" || char === "[") {
+        this.legacyJsonDepth += 1;
+      } else if (char === "}" || char === "]") {
+        this.legacyJsonDepth -= 1;
+        if (this.legacyJsonDepth <= 0) {
+          this.suppressingLegacyJson = false;
+          this.legacyJsonDepth = 0;
+          this.legacyJsonInString = false;
+          this.legacyJsonEscaped = false;
+          return;
+        }
+      }
+    }
   }
 }
 
@@ -435,6 +518,35 @@ function collectCandidates(text: string): Candidate[] {
   }
 
   return dedupeCandidates(candidates);
+}
+
+function stripBoundedInternalToolResults(text: string): string {
+  return text
+    .replace(/<jarvis_internal_tool_result\b[^>]*>[\s\S]*?<\/jarvis_internal_tool_result>/gi, "")
+    .replace(/<jarvis_internal_tool_result\b[^>]*>[\s\S]*$/gi, "");
+}
+
+function findLegacyToolResultTranscriptSpans(text: string, candidates: Candidate[]): TextSpan[] {
+  const spans: TextSpan[] = [];
+  const prefix = new RegExp(LEGACY_TOOL_RESULT_LINE_PREFIX.source, "gim");
+  for (const match of text.matchAll(prefix)) {
+    const start = match.index ?? 0;
+    let payloadStart = start + match[0].length;
+    while (payloadStart < text.length && /\s/.test(text[payloadStart])) payloadStart += 1;
+    const json = candidates.find((candidate) => candidate.start === payloadStart);
+    if (!json || (text[payloadStart] !== "{" && text[payloadStart] !== "[")) continue;
+    let end = json.end;
+    if (text[end] === "\r") end += 1;
+    if (text[end] === "\n") end += 1;
+    spans.push({ start, end });
+  }
+  return spans;
+}
+
+function couldBeLegacyToolResultLine(text: string): boolean {
+  const lower = text.toLowerCase();
+  const marker = "[tool call result (";
+  return marker.startsWith(lower) || lower.startsWith(marker);
 }
 
 function isCosmeticToolEchoLine(line: string): boolean {
