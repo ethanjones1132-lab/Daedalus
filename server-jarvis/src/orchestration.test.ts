@@ -774,6 +774,14 @@ describe("Orchestration & Routing Tests", () => {
     expect(streamIdle).toMatch(/stalled before responding/i);
     expect(streamIdle).toContain("(stream idle timeout after 45000ms)");
 
+    const visible = describePipelineError(
+      "No visible output or tool-call progress for 180000ms on model=foo stage=executor (hidden reasoning does not count)",
+    );
+    expect(visible).toMatch(/hidden reasoning/i);
+
+    const deadline = describePipelineError("Total turn deadline (480000ms) exceeded at stage=reviewer");
+    expect(deadline).toMatch(/server-authoritative turn deadline/i);
+
     // Existing auth mapping must still take priority for unrelated errors.
     expect(describePipelineError("API 401: invalid api key")).toMatch(/Authentication failed \(401\)/);
   });

@@ -67,10 +67,13 @@ import { searchWeb } from "./web-bundle";
 import { getSessionState, clearSessionState } from "./interactive-bundle";
 import { StreamSession, VisibleTextPipe } from "./stream-emitter";
 import {
+  createStreamLivenessTracker,
   createDisconnectAwareWrite,
   ResettableWatchdog,
   StreamIdleTimeoutError,
   startSseHeartbeat,
+  TurnDeadlineExceededError,
+  VisibleProgressTimeoutError,
 } from "./stream-liveness";
 import {
   ActiveStreamRegistry,
@@ -162,6 +165,17 @@ console.warn = (...args: any[]) => {
 
 const MODEL_REQUEST_TIMEOUT_MS = 300_000;
 const MODEL_INTER_TOKEN_TIMEOUT_MS = 60_000;
+const MODEL_VISIBLE_PROGRESS_TIMEOUT_MS = Math.min(
+  600_000,
+  Math.max(
+    MODEL_INTER_TOKEN_TIMEOUT_MS,
+    Number(process.env.JARVIS_VISIBLE_PROGRESS_TIMEOUT_MS ?? 180_000) || 180_000,
+  ),
+);
+const TOTAL_TURN_TIMEOUT_MS = Math.min(
+  3_600_000,
+  Math.max(60_000, Number(process.env.JARVIS_TOTAL_TURN_TIMEOUT_MS ?? 480_000) || 480_000),
+);
 // First-token watchdog. See chatCompletionWithFallback for the upstream
 // implementation. This constant governs the orchestrator-level defense
 // in depth that aborts the read loop if the response body is open but
@@ -1077,6 +1091,12 @@ async function runCronInference(body: Record<string, unknown>): Promise<{ succes
 }
 
 async function streamJarvis(message: string, sessionId: string, options: StreamJarvisOptions = {}): Promise<Response> {
+  const turnDeadlineAt = Date.now() + TOTAL_TURN_TIMEOUT_MS;
+  const ensureTurnBudget = (stage: string): void => {
+    if (Date.now() >= turnDeadlineAt) {
+      throw new TurnDeadlineExceededError(stage, TOTAL_TURN_TIMEOUT_MS);
+    }
+  };
   const cfg = resolveConfig(options.config);
   const surface: SurfaceType = options.surface ?? "chat";
   const effectiveTemp = surfaceTemperature(cfg, surface);
@@ -1330,6 +1350,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         let orchLastProvider: string | undefined;
         let orchestratorAgentRunId: string | undefined;
         const callModelAttempt = async (messages: any[], callOptions?: any, excludeModels?: Set<string>) => {
+          ensureTurnBudget(callOptions?.stageLabel ?? "orchestrator_model_attempt");
           const stageAttemptStart = Date.now();
           const isOllama = cfg.active_backend === "ollama";
           const ollamaTarget = isOllama ? await resolveOllamaChatTarget(cfg) : null;
@@ -1494,7 +1515,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const useFallback = !isOllama && cfg.openrouter.enable_fallbacks;
           const requestTimeout = isOllama ? MODEL_REQUEST_TIMEOUT_MS : (cfg.openrouter.timeout_ms || MODEL_REQUEST_TIMEOUT_MS);
           const ctrl = new AbortController();
-          const timeout = setTimeout(() => ctrl.abort(), requestTimeout);
+          const requestBudgetMs = Math.max(1, Math.min(requestTimeout, turnDeadlineAt - Date.now()));
+          let turnDeadlineAbortedRequest = false;
+          const timeout = setTimeout(() => {
+            turnDeadlineAbortedRequest = Date.now() >= turnDeadlineAt;
+            ctrl.abort();
+          }, requestBudgetMs);
           const cleanupRequestAbort = registerAbortHandler(streamAbort.signal, () => ctrl.abort());
 
           let fetchRes: Response;
@@ -1507,6 +1533,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 taskType: orchestratorTaskType,
                 cascadeTier: callOptions?.cascadeTier,
                 excludeModels,
+                deadlineAt: turnDeadlineAt,
+                turnBudgetMs: TOTAL_TURN_TIMEOUT_MS,
               });
               fetchRes = result.response;
               actualModelUsed = result.model_used;
@@ -1521,10 +1549,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           } catch (fetchErr: any) {
             clearTimeout(timeout);
             cleanupRequestAbort();
+            if (fetchErr.name === "AbortError" && streamAbort.signal.aborted) {
+              await emitCancelled();
+            }
+            if (turnDeadlineAbortedRequest || Date.now() >= turnDeadlineAt) {
+              throw new TurnDeadlineExceededError(callOptions?.stageLabel ?? "orchestrator_request", TOTAL_TURN_TIMEOUT_MS);
+            }
             if (fetchErr.name === "AbortError") {
-              if (streamAbort.signal.aborted) {
-                await emitCancelled();
-              }
               throw new Error(`Request timed out after ${requestTimeout / 1000}s. The model may be loading or overloaded.`);
             }
             if (isOllama && (fetchErr.message?.includes("ECONNREFUSED") || fetchErr.message?.includes("fetch failed"))) {
@@ -1598,24 +1629,43 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
           }, firstTokenMs);
           let streamIdleTimeoutFired = false;
+          let visibleProgressTimeoutFired = false;
+          let turnDeadlineExceeded = false;
           const stageName = callOptions?.stageLabel ?? "agent";
-          const streamIdleWatchdog = new ResettableWatchdog(
-            MODEL_INTER_TOKEN_TIMEOUT_MS,
-            () => {
+          const streamLiveness = createStreamLivenessTracker({
+            interTokenMs: MODEL_INTER_TOKEN_TIMEOUT_MS,
+            visibleMs: MODEL_VISIBLE_PROGRESS_TIMEOUT_MS,
+            onTransportStall: () => {
               streamIdleTimeoutFired = true;
               console.warn(`[Jarvis Orchestrator] Inter-token timeout (${MODEL_INTER_TOKEN_TIMEOUT_MS / 1000}s) on stage=${stageName} model=${actualModelUsed} — cancelling reader`);
               cancelReader("Inter-token timeout").catch(() => {});
             },
-          );
-          const markSemanticProgress = () => {
+            onVisibleStall: () => {
+              visibleProgressTimeoutFired = true;
+              console.warn(`[Jarvis Orchestrator] Visible-progress timeout (${MODEL_VISIBLE_PROGRESS_TIMEOUT_MS / 1000}s) on stage=${stageName} model=${actualModelUsed} — cancelling reader`);
+              cancelReader("Visible-progress timeout").catch(() => {});
+            },
+          });
+          const markFirstProgress = () => {
             if (!firstTokenReceived) {
               firstTokenReceived = true;
               clearTimeout(firstTokenTimer);
-              streamIdleWatchdog.start();
-            } else {
-              streamIdleWatchdog.touch();
             }
           };
+          const markTransportProgress = () => {
+            markFirstProgress();
+            streamLiveness.onTransportProgress();
+          };
+          const markVisibleProgress = () => {
+            markFirstProgress();
+            streamLiveness.onVisibleProgress();
+          };
+          const turnDeadlineTimer = setTimeout(() => {
+            if (!streamAbort.signal.aborted) {
+              turnDeadlineExceeded = true;
+              cancelReader("Turn deadline exceeded").catch(() => {});
+            }
+          }, Math.max(0, turnDeadlineAt - Date.now()));
           const textStreamSanitizer = createStageStreamSanitizer(Boolean(useTextTools));
           const emitTextToken = async (text: string) => {
             if (callOptions?.surfaceAsAnswer) {
@@ -1644,6 +1694,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             const stopReason = resolveReadStopReason({
               firstTokenTimedOut: firstTokenTimeoutFired,
               streamIdleTimedOut: streamIdleTimeoutFired,
+              visibleProgressTimedOut: visibleProgressTimeoutFired,
+              turnDeadlineExceeded,
               signal: streamAbort.signal,
             });
             if (stopReason === "first_token_timeout") {
@@ -1653,6 +1705,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               throw new StreamIdleTimeoutError(actualModelUsed, stageName, MODEL_INTER_TOKEN_TIMEOUT_MS);
             }
             if (stopReason === "turn_cancelled") await emitCancelled();
+            if (stopReason === "turn_deadline_exceeded") {
+              throw new TurnDeadlineExceededError(stageName, TOTAL_TURN_TIMEOUT_MS);
+            }
+            if (stopReason === "visible_progress_timeout") {
+              throw new VisibleProgressTimeoutError(actualModelUsed, stageName, MODEL_VISIBLE_PROGRESS_TIMEOUT_MS);
+            }
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split("\n");
@@ -1668,7 +1726,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 if (!choice) continue;
 
                 if (choice.delta?.tool_calls?.length) {
-                  markSemanticProgress();
+                  markVisibleProgress();
                   for (const tc of choice.delta.tool_calls) {
                     const idx = tc.index ?? 0;
                     const active = ensureActiveToolCall(activeToolCalls, idx);
@@ -1682,7 +1740,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 if (chunkText) {
                   chunkText = chunkText.replace(/<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>|<\|im_sep\|>/g, "");
                   if (chunkText) {
-                    markSemanticProgress();
+                    markTransportProgress();
                     fullTurnText += chunkText;
                     if (callOptions?.onChunk) {
                       callOptions.onChunk(chunkText);
@@ -1701,6 +1759,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                             await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
                           }
                         } else {
+                          markVisibleProgress();
                           const sanitized = textStreamSanitizer.push(visibleText);
                           if (sanitized) {
                             await emitTextToken(sanitized);
@@ -1708,6 +1767,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                         }
                       }
                     } else {
+                      markVisibleProgress();
                       const sanitized = textStreamSanitizer.push(chunkText);
                       if (sanitized) {
                         await emitTextToken(sanitized);
@@ -1880,7 +1940,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           };
           } finally {
             clearTimeout(firstTokenTimer);
-            streamIdleWatchdog.stop();
+            clearTimeout(turnDeadlineTimer);
+            streamLiveness.stop();
             cleanupReaderAbort();
             cleanupRequestAbort();
           }
@@ -2294,6 +2355,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         : "";
 
       while (!loopDone && turnCount < MAX_TOOL_EXECUTION_TURNS) {
+        ensureTurnBudget("agent_loop");
         turnCount++;
         _turnStart = Date.now();
         const baseUrl = isOllama
@@ -2448,7 +2510,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const useFallback = !isOllama && cfg.openrouter.enable_fallbacks;
         const requestTimeout = isOllama ? MODEL_REQUEST_TIMEOUT_MS : (cfg.openrouter.timeout_ms || MODEL_REQUEST_TIMEOUT_MS);
         const ctrl = new AbortController();
-        const timeout = setTimeout(() => ctrl.abort(), requestTimeout);
+        const requestBudgetMs = Math.max(1, Math.min(requestTimeout, turnDeadlineAt - Date.now()));
+        let turnDeadlineAbortedRequest = false;
+        const timeout = setTimeout(() => {
+          turnDeadlineAbortedRequest = Date.now() >= turnDeadlineAt;
+          ctrl.abort();
+        }, requestBudgetMs);
         const cleanupRequestAbort = registerAbortHandler(streamAbort.signal, () => ctrl.abort());
 
         let fetchRes: Response;
@@ -2460,7 +2527,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
         try {
           if (useFallback) {
-            const result = await chatCompletionWithFallback(cfg, requestBody, ctrl.signal);
+            ensureTurnBudget("agent_loop_fallback");
+            const result = await chatCompletionWithFallback(cfg, requestBody, ctrl.signal, {
+              stage: "agent_loop",
+              deadlineAt: turnDeadlineAt,
+              turnBudgetMs: TOTAL_TURN_TIMEOUT_MS,
+            });
             fetchRes = result.response;
             actualModelUsed = result.model_used;
             lastActualModelUsed = result.model_used;
@@ -2488,10 +2560,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         } catch (fetchErr: any) {
           clearTimeout(timeout);
           cleanupRequestAbort();
+          if (fetchErr.name === "AbortError" && streamAbort.signal.aborted) {
+            await emitCancelled();
+          }
+          if (turnDeadlineAbortedRequest || Date.now() >= turnDeadlineAt) {
+            throw new TurnDeadlineExceededError("agent_loop_request", TOTAL_TURN_TIMEOUT_MS);
+          }
           if (fetchErr.name === "AbortError") {
-            if (streamAbort.signal.aborted) {
-              await emitCancelled();
-            }
             throw new Error(`Request timed out after ${requestTimeout / 1000}s. The model may be loading or overloaded.`);
           }
           if (isOllama && (fetchErr.message?.includes("ECONNREFUSED") || fetchErr.message?.includes("fetch failed"))) {
@@ -2603,6 +2678,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }
         }, firstTokenMs);
         let streamIdleTimeoutFired = false;
+        let turnDeadlineExceeded = false;
         const streamIdleWatchdog = new ResettableWatchdog(
           MODEL_INTER_TOKEN_TIMEOUT_MS,
           () => {
@@ -2620,6 +2696,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             streamIdleWatchdog.touch();
           }
         };
+        const turnDeadlineTimer = setTimeout(() => {
+          if (!streamAbort.signal.aborted) {
+            turnDeadlineExceeded = true;
+            cancelReader("Turn deadline exceeded").catch(() => {});
+          }
+        }, Math.max(0, turnDeadlineAt - Date.now()));
         let activeToolCalls: any[] = [];
         const holdVisibleText = !forceFinalAnswerOnly
           && ((requiresVerifiedWebSearch && !verifiedWebSearchDone)
@@ -2647,6 +2729,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             const stopReason = resolveReadStopReason({
               firstTokenTimedOut: firstTokenTimeoutFired,
               streamIdleTimedOut: streamIdleTimeoutFired,
+              turnDeadlineExceeded,
               signal: streamAbort.signal,
             });
             if (stopReason === "first_token_timeout") {
@@ -2656,6 +2739,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               throw new StreamIdleTimeoutError(actualModelUsed, "agent_loop", MODEL_INTER_TOKEN_TIMEOUT_MS);
             }
             if (stopReason === "turn_cancelled") await emitCancelled();
+            if (stopReason === "turn_deadline_exceeded") {
+              throw new TurnDeadlineExceededError("agent_loop", TOTAL_TURN_TIMEOUT_MS);
+            }
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split("\n");
@@ -2712,6 +2798,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         } finally {
           clearTimeout(timeout);
           clearTimeout(firstTokenTimer);
+          clearTimeout(turnDeadlineTimer);
           streamIdleWatchdog.stop();
           cleanupReaderAbort();
           cleanupRequestAbort();
@@ -3045,10 +3132,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       // (handled by `StreamCancelledError` above).
       const isFirstTokenTimeout = error?.name === "FirstTokenTimeoutError";
       const isStreamIdleTimeout = error?.name === "StreamIdleTimeoutError";
+      const isVisibleProgressTimeout = error?.name === "VisibleProgressTimeoutError";
+      const isTurnDeadlineExceeded = error?.name === "TurnDeadlineExceededError";
       const errorCode = isFirstTokenTimeout
         ? "first_token_timeout"
         : isStreamIdleTimeout
           ? "stream_idle_timeout"
+          : isVisibleProgressTimeout
+            ? "visible_progress_timeout"
+            : isTurnDeadlineExceeded
+              ? "turn_deadline_exceeded"
           : undefined;
       const userFacingMsg = isFirstTokenTimeout
         ? `The model did not produce any output within the per-model first-token window. ` +
@@ -3058,6 +3151,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           ? `The model stopped producing semantic output during the stream. ` +
             `Jarvis ended the stalled attempt instead of waiting indefinitely. ` +
             `Try again, or switch backend in Settings. (${error?.model ?? "unknown model"}, stage=${error?.stage ?? "unknown"}, window=${error?.windowMs ?? "?"}ms)`
+        : isVisibleProgressTimeout
+          ? `The model kept producing hidden reasoning but made no visible answer or tool-call progress. ` +
+            `Jarvis stopped the stalled stage instead of waiting indefinitely. ` +
+            `Try again, or switch backend in Settings. (${error?.model ?? "unknown model"}, stage=${error?.stage ?? "unknown"}, window=${error?.windowMs ?? "?"}ms)`
+        : isTurnDeadlineExceeded
+          ? `The total server turn deadline expired before Jarvis finished. ` +
+            `The turn was stopped cleanly instead of stalling indefinitely. ` +
+            `(stage=${error?.stage ?? "unknown"}, budget=${error?.budgetMs ?? TOTAL_TURN_TIMEOUT_MS}ms)`
         : errMsg;
       console.error(`[Jarvis] Stream error session=${sessionId} code=${errorCode ?? "<generic>"}:`, userFacingMsg);
       const _cfg3 = resolveConfig(options.config);

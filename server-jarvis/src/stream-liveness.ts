@@ -83,6 +83,68 @@ export class StreamIdleTimeoutError extends Error {
   }
 }
 
+export class VisibleProgressTimeoutError extends Error {
+  constructor(
+    readonly model: string,
+    readonly stage: string,
+    readonly windowMs: number,
+  ) {
+    super(`No visible output or tool-call progress for ${windowMs}ms on model=${model} stage=${stage} (hidden reasoning does not count)`);
+    this.name = "VisibleProgressTimeoutError";
+  }
+}
+
+export class TurnDeadlineExceededError extends Error {
+  constructor(readonly stage: string, readonly budgetMs: number) {
+    super(`Total turn deadline (${budgetMs}ms) exceeded at stage=${stage}`);
+    this.name = "TurnDeadlineExceededError";
+  }
+}
+
+/** Two-tier stream liveness: transport (any delta) + visible (answer text / tool deltas). */
+export function createStreamLivenessTracker(opts: {
+  interTokenMs: number;
+  visibleMs: number;
+  onTransportStall: () => void;
+  onVisibleStall: () => void;
+  scheduler?: TimeoutScheduler;
+}) {
+  const transport = new ResettableWatchdog(
+    opts.interTokenMs,
+    opts.onTransportStall,
+    opts.scheduler,
+  );
+  const visible = new ResettableWatchdog(
+    opts.visibleMs,
+    opts.onVisibleStall,
+    opts.scheduler,
+  );
+  let started = false;
+  const onTransportProgress = () => {
+    if (!started) {
+      started = true;
+      transport.start();
+      visible.start();
+      return;
+    }
+    transport.touch();
+  };
+  return {
+    onTransportProgress,
+    onVisibleProgress() {
+      onTransportProgress();
+      visible.touch();
+    },
+    get started() {
+      return started;
+    },
+    stop() {
+      transport.stop();
+      visible.stop();
+    },
+  };
+}
+
 export function startSseHeartbeat(
   sessionId: string,
   intervalMs: number,

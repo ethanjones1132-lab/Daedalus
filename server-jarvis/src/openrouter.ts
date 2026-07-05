@@ -13,6 +13,7 @@ import {
   type HttpProviderId,
 } from "./providers";
 import { isTemporarilyExcluded, recordHardFailure, recordSuccess } from "./model-failure-memory";
+import { TurnDeadlineExceededError } from "./stream-liveness";
 
 // ═══════════════════════════════════════════════════════════════
 // Types
@@ -577,6 +578,17 @@ interface FallbackResolveOptions {
    * previous attempt — retrying the same model would just return empty again.
    */
   excludeModels?: ReadonlySet<string>;
+  /** Absolute wall-clock deadline shared by the whole server turn. */
+  deadlineAt?: number;
+  /** Original turn budget, retained for actionable timeout metadata. */
+  turnBudgetMs?: number;
+}
+
+function assertFallbackDeadline(options: FallbackResolveOptions): void {
+  if (options.deadlineAt === undefined || Date.now() < options.deadlineAt) return;
+  const error = new TurnDeadlineExceededError(options.stage ?? "fallback_cascade", options.turnBudgetMs ?? 0);
+  error.message = `turn_deadline_exceeded: ${error.message}`;
+  throw error;
 }
 
 /** One step in the cross-provider fallback cascade. */
@@ -777,6 +789,7 @@ export async function chatCompletionWithFallback(
   signal?: AbortSignal,
   options: FallbackResolveOptions = {},
 ): Promise<{ response: Response; model_used: string; provider_used: HttpProviderId; retries: number }> {
+  assertFallbackDeadline(options);
   const cascade = await resolveFallbackCascade(cfg, options);
   if (cascade.length === 0) {
     cascade.push({ provider: "openrouter", model_id: cfg.openrouter.model || "openrouter/free" });
@@ -822,6 +835,7 @@ export async function chatCompletionWithFallback(
   const firstTokenTimeoutMs = Math.max(1_000, Number((cfg.openrouter as any).first_token_timeout_ms ?? 30_000));
 
   for (let modelIdx = 0; modelIdx < effectiveCascade.length; modelIdx++) {
+    assertFallbackDeadline(options);
     const { provider, model_id: model } = effectiveCascade[modelIdx];
     const target = resolveProviderTarget(cfg, provider);
     if (!target.api_key) {
@@ -836,6 +850,7 @@ export async function chatCompletionWithFallback(
     // Per-model attempt loop. Each `continue` retries the same model; each
     // `break` advances to the next model in the cascade.
     attemptLoop: while (true) {
+      assertFallbackDeadline(options);
       const STALL_REASON = `first-token-timeout:${provider}:${model}`;
       const attemptCtrl = new AbortController();
       const onUserAbort = () => attemptCtrl.abort(signal?.reason);

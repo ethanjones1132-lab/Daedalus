@@ -88,16 +88,25 @@ export function createIdempotentReaderCancel(reader: CancellableReader): (reason
   };
 }
 
-export type ReadStopReason = "first_token_timeout" | "stream_idle_timeout" | "turn_cancelled";
+export type ReadStopReason =
+  | "first_token_timeout"
+  | "stream_idle_timeout"
+  | "turn_cancelled"
+  | "turn_deadline_exceeded"
+  | "visible_progress_timeout";
 
 /** Resolve concurrent reader-stop signals once, with model timeout precedence. */
 export function resolveReadStopReason(options: {
   firstTokenTimedOut: boolean;
   streamIdleTimedOut: boolean;
+  visibleProgressTimedOut?: boolean;
+  turnDeadlineExceeded?: boolean;
   signal: AbortSignal;
 }): ReadStopReason | null {
   if (options.firstTokenTimedOut) return "first_token_timeout";
   if (options.streamIdleTimedOut) return "stream_idle_timeout";
   if (options.signal.aborted) return "turn_cancelled";
+  if (options.turnDeadlineExceeded) return "turn_deadline_exceeded";
+  if (options.visibleProgressTimedOut) return "visible_progress_timeout";
   return null;
 }

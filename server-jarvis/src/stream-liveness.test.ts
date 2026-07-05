@@ -1,8 +1,11 @@
 import { describe, expect, mock, test } from "bun:test";
 import {
   createDisconnectAwareWrite,
+  createStreamLivenessTracker,
   ResettableWatchdog,
   StreamIdleTimeoutError,
+  TurnDeadlineExceededError,
+  VisibleProgressTimeoutError,
   startSseHeartbeat,
   type IntervalScheduler,
   type TimeoutScheduler,
@@ -33,6 +36,60 @@ class FakeTimeoutScheduler implements TimeoutScheduler {
     entry[1]();
   }
 }
+
+describe("stream liveness tracker", () => {
+  test("visible watchdog fires when only transport reasoning progress arrives", () => {
+    const scheduler = new FakeTimeoutScheduler();
+    const onTransportStall = mock(() => {});
+    const onVisibleStall = mock(() => {});
+    const tracker = createStreamLivenessTracker({
+      interTokenMs: 60_000,
+      visibleMs: 180_000,
+      onTransportStall,
+      onVisibleStall,
+      scheduler,
+    });
+
+    tracker.onTransportProgress();
+    tracker.onTransportProgress();
+    scheduler.runNext();
+
+    expect(onVisibleStall).toHaveBeenCalledTimes(1);
+    expect(onTransportStall).not.toHaveBeenCalled();
+  });
+
+  test("visible progress touches both watchdog tiers", () => {
+    const scheduler = new FakeTimeoutScheduler();
+    const tracker = createStreamLivenessTracker({
+      interTokenMs: 60_000,
+      visibleMs: 180_000,
+      onTransportStall: () => {},
+      onVisibleStall: () => {},
+      scheduler,
+    });
+    tracker.onVisibleProgress();
+    expect(tracker.started).toBe(true);
+    expect(scheduler.pending).toBe(2);
+    tracker.onVisibleProgress();
+    expect(scheduler.pending).toBe(2);
+  });
+
+  test("tool-call deltas count as visible progress", () => {
+    const scheduler = new FakeTimeoutScheduler();
+    const onVisibleStall = mock(() => {});
+    const tracker = createStreamLivenessTracker({
+      interTokenMs: 60_000,
+      visibleMs: 180_000,
+      onTransportStall: () => {},
+      onVisibleStall,
+      scheduler,
+    });
+    tracker.onTransportProgress();
+    tracker.onVisibleProgress(); // tool-call delta
+    expect(scheduler.pending).toBe(2);
+    expect(onVisibleStall).not.toHaveBeenCalled();
+  });
+});
 
 class FakeIntervalScheduler implements IntervalScheduler {
   callback: (() => void | Promise<void>) | null = null;
@@ -123,4 +180,14 @@ test("StreamIdleTimeoutError preserves model, stage, and window metadata", () =>
   expect(error.model).toBe("test-model");
   expect(error.stage).toBe("synthesizer");
   expect(error.windowMs).toBe(60_000);
+});
+
+test("new liveness errors preserve deadline metadata", () => {
+  const visible = new VisibleProgressTimeoutError("test-model", "executor", 180_000);
+  expect(visible.name).toBe("VisibleProgressTimeoutError");
+  expect(visible.message).toContain("hidden reasoning does not count");
+
+  const deadline = new TurnDeadlineExceededError("reviewer", 480_000);
+  expect(deadline.name).toBe("TurnDeadlineExceededError");
+  expect(deadline.message).toContain("stage=reviewer");
 });

@@ -188,6 +188,12 @@ export function describePipelineError(raw: string): string {
   // stream-idle watchdog) are a hung model, not a user mistake — the bare
   // "First-token timeout (30000ms) on model=..." text read like a crash to
   // operators. Keep the raw message in parens so the detail isn't lost.
+  if (/visible output or tool-call progress/i.test(msg)) {
+    return `The model kept producing hidden reasoning but made no visible answer or tool-call progress, so I stopped the stalled stage. Try again — the router can pick a different model. (${msg})`;
+  }
+  if (/total turn deadline|turn_deadline_exceeded/i.test(msg)) {
+    return `The server-authoritative turn deadline expired before Jarvis could finish. The turn was stopped cleanly instead of stalling indefinitely. (${msg})`;
+  }
   if (/first-token timeout|stream idle timeout/i.test(msg)) {
     return `The answering model stalled before responding, so I aborted it. Try again — the router will pick a different model. (${msg})`;
   }

@@ -95,3 +95,31 @@ test("read completion resolves timeout and user-cancel races to one reason", () 
     signal: new AbortController().signal,
   })).toBeNull();
 });
+
+test("new deadline stop reasons preserve user-cancel and deadline precedence", () => {
+  const cancelled = new AbortController();
+  cancelled.abort("user stopped");
+  expect(resolveReadStopReason({
+    firstTokenTimedOut: false,
+    streamIdleTimedOut: false,
+    visibleProgressTimedOut: true,
+    turnDeadlineExceeded: true,
+    signal: cancelled.signal,
+  })).toBe("turn_cancelled");
+
+  expect(resolveReadStopReason({
+    firstTokenTimedOut: false,
+    streamIdleTimedOut: false,
+    visibleProgressTimedOut: true,
+    turnDeadlineExceeded: true,
+    signal: new AbortController().signal,
+  })).toBe("turn_deadline_exceeded");
+
+  expect(resolveReadStopReason({
+    firstTokenTimedOut: false,
+    streamIdleTimedOut: false,
+    visibleProgressTimedOut: true,
+    turnDeadlineExceeded: false,
+    signal: new AbortController().signal,
+  })).toBe("visible_progress_timeout");
+});

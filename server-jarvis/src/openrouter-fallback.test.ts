@@ -588,4 +588,21 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
     );
     expect(call3.model_used).toBe("only-model");
   });
+
+  test("cascade aborts immediately when the turn deadline has passed", async () => {
+    const cfg = cfgWithPool();
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls++;
+      throw new Error("fetch should not run after deadline");
+    }) as typeof fetch;
+
+    await expect(chatCompletionWithFallback(
+      cfg,
+      { model: cfg.openrouter.model, messages: [{ role: "user", content: "too late" }], stream: true },
+      undefined,
+      { stage: "executor", deadlineAt: Date.now() - 1 },
+    )).rejects.toThrow(/turn_deadline/i);
+    expect(fetchCalls).toBe(0);
+  });
 });
