@@ -29,6 +29,7 @@ import {
   shouldSubmitComposerKey,
   type ToolCallState,
 } from './chat-state';
+import { errorDisplayForCode } from './error-display';
 import {
   Send, Square, Bot, User, Wrench, Check, Copy, ChevronDown,
   ChevronRight, Sparkles, LoaderCircle, Plus, ArrowDown,
@@ -1622,6 +1623,12 @@ function ChatMessage({
   // streaming spinner running forever).
   const isErrorBubble = !isUser && !isTool && message.isError;
   const isCancelledBubble = !isUser && !isTool && message.isCancelled;
+  // P0a follow-up (2026-07-05): per-code error UX. The server emits a small
+  // set of structured `error` codes; render each one with its own label,
+  // pill tone, and actionable hint (see ./error-display.ts). A `turn_deadline_exceeded`
+  // is a soft amber event, not a red hard failure — surfacing it as red makes
+  // the user think the model is broken when really it was just slow.
+  const errorDisplay = isErrorBubble ? errorDisplayForCode(message.errorCode) : null;
 
   return (
     <motion.div
@@ -1661,7 +1668,9 @@ function ChatMessage({
               ? <><Wrench size={11} /> TOOL: {message.tool_name || 'unknown'}</>
               : <><Bot size={11} /> JARVIS</>}
         </span>
-        {isErrorBubble && <Pill variant="error">error</Pill>}
+        {isErrorBubble && errorDisplay && (
+          <Pill variant={errorDisplay.pillVariant}>{errorDisplay.label}</Pill>
+        )}
         {isCancelledBubble && <Pill>stopped</Pill>}
         {message.isStreaming && (
           <motion.span
@@ -1718,9 +1727,9 @@ function ChatMessage({
             aria-hidden="true"
           />
         )}
-        {isErrorBubble && message.errorCode && (
-          <div className="mt-1.5 text-[10px] font-mono text-bone-faint">
-            code: {message.errorCode}
+        {isErrorBubble && errorDisplay && (
+          <div className="mt-2 text-xs italic text-bone-dim">
+            {errorDisplay.hint ?? `code: ${message.errorCode ?? 'unknown'}`}
           </div>
         )}
       </div>
