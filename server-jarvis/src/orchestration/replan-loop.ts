@@ -2,7 +2,9 @@
 // ═══════════════════════════════════════════════════════════════
 // B-02 (Track B, Conductor Recursive Self-Selection): runs a pipeline
 // that contains one or more `conductor_replan` meta-decisions.
-// See docs/issues/post-phase-4-conductor-evolution.md B-02.
+// B-04: persists per-replan telemetry and enforces a per-session
+// cumulative cap alongside the existing per-turn cap. See
+// docs/issues/post-phase-4-conductor-evolution.md B-02 / B-04.
 // ═══════════════════════════════════════════════════════════════
 
 import type { Coordinator, CoordinatorResult, CoordinatorRouteOptions, StageName } from "./coordinator";
@@ -11,6 +13,8 @@ import type { TurnRequirement } from "./turn-requirements";
 import { normalizeRoute } from "./route-normalization";
 import { splitPipelineAtReplan, buildReplanRequest } from "./replan";
 import type { PipelineStageState } from "./stage-output";
+import type { SessionReplanCounter, ReplanCapKind } from "./replan-telemetry";
+import { segmentOutcomeFromCarry } from "./replan-telemetry";
 
 /**
  * A stage counts as "completed" once its carry-state slot is populated by an
@@ -46,6 +50,17 @@ export interface ReplanLoopArgs {
   onStateChange: (state: PipelineProgressState) => void;
   baseOptions: PipelineExecuteOptions;
   maxReplans: number;
+  /**
+   * B-04: session-scoped counter for per-session replan caps and
+   * persistent telemetry. Optional — when omitted the loop falls
+   * back to the B-02 per-turn cap alone (no session cap, no DB
+   * writes). Pass `null` explicitly to skip the per-session cap
+   * but still allow `sessionId` to be omitted (no telemetry).
+   */
+  sessionCounter?: SessionReplanCounter | null;
+  /** B-04: session id for the per-session cap and telemetry. Required
+   *  when `sessionCounter` is supplied. */
+  sessionId?: string;
 }
 
 /**
@@ -59,16 +74,45 @@ export interface ReplanLoopArgs {
  * user message, which doesn't change mid-turn), so re-deriving the execution
  * profile from it on every iteration guarantees a `read_only` turn can never
  * escalate to `full` no matter what the replanned decision asks for.
+ *
+ * B-04: when `sessionCounter` + `sessionId` are supplied, the effective
+ * per-turn cap is `min(callerMaxReplans, sessionCounter.remaining(sessionId))`
+ * and every successful re-invocation is recorded as a `ReplanEvent`. When
+ * the session cap is the binding constraint, the final `PipelineResult`
+ * carries `error_code: "session_replan_cap_exceeded"` so the failure mode
+ * is observable in metrics even though the turn still returns an answer
+ * (graceful degradation — never an aborted turn).
  */
 export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<PipelineResult> {
   let decision = args.initialDecision;
   let carry: PipelineStageState = {};
   let replans = 0;
+  // B-04: track the per-turn and per-session caps independently so we can
+  // tag the final result with the right `error_code` when the session cap
+  // is the binding constraint.
+  let perTurnCap = args.maxReplans;
+  let sessionCapHit = false;
 
   while (true) {
     const normalized = normalizeRoute(decision, args.turnRequirement, "model");
     const hasReplanMarker = decision.pipeline.includes("conductor_replan");
-    const budgetExhausted = replans >= args.maxReplans;
+    // B-04: when a session counter is in play, the per-turn cap is the
+    // min of the caller's per-turn cap and the session's remaining budget.
+    // Recomputed every iteration so an earlier loop in the same turn
+    // (or a parallel turn on the same session) can never leak capacity.
+    if (args.sessionCounter && args.sessionId) {
+      perTurnCap = args.sessionCounter.effectivePerTurnCap(args.sessionId, args.maxReplans);
+    }
+    const perTurnExhausted = replans >= perTurnCap;
+    // B-04: a session-cap hit that beats the per-turn cap is recorded for
+    // the final result tag, but the loop still continues normally to run
+    // the remaining pipeline. The session cap is checked here in
+    // addition to the per-turn cap so a turn that re-runs the loop body
+    // (a re-plan that returns another re-plan) is bounded by it.
+    if (args.sessionCounter && args.sessionId && args.sessionCounter.remaining(args.sessionId) === 0) {
+      sessionCapHit = true;
+    }
+    const budgetExhausted = perTurnExhausted || sessionCapHit;
 
     if (!hasReplanMarker || budgetExhausted) {
       // `normalizeRoute` assumes it is normalizing a FRESH pipeline (its
@@ -104,7 +148,7 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
         },
         carry,
       );
-      return finalizeSegment(segment);
+      return finalizeSegment(segment, sessionCapHit);
     }
 
     const segments = splitPipelineAtReplan(decision.pipeline);
@@ -130,12 +174,33 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
     const remainingStagesHint = segments.slice(1).flat();
     const replanRequestText = buildReplanRequest(args.contextMessage, carry, remainingStagesHint);
     decision = await args.coordinator.route(replanRequestText, args.routeOptions);
+
+    // B-04: record this replan BEFORE incrementing the local counter so
+    // the recorded `replan_index` matches the value the counter just
+    // produced. `record()` returns that new index; we also bump the local
+    // `replans` counter to drive the loop's per-turn guard. The cap tag
+    // we pass is "" (no cap hit) here — we only tag "per_turn" /
+    // "per_session" when the loop actually terminates because of that
+    // cap on a FUTURE iteration (or the final-result path that runs
+    // through `finalizeSegment`).
+    if (args.sessionCounter && args.sessionId) {
+      const capTag: ReplanCapKind = replans + 1 >= args.maxReplans ? "per_turn" : "";
+      args.sessionCounter.record({
+        sessionId: args.sessionId,
+        agentRunId: args.agentRunId,
+        replanIndex: 0, // overwritten by counter with the real index
+        rationale: decision.coordinator_rationale ?? "",
+        revised: decision,
+        segmentOutcome: segmentOutcomeFromCarry(segment.state),
+        cap: capTag,
+      });
+    }
     replans += 1;
     args.onStateChange({ stage: "conductor_replan", status: "done", output: decision.coordinator_rationale });
   }
 }
 
-function finalizeSegment(segment: PipelineSegmentResult): PipelineResult {
+function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean): PipelineResult {
   const upstreamDegraded = Boolean(
     (segment.state.plan && !segment.state.plan.ok) || (segment.state.executor && !segment.state.executor.ok),
   );
@@ -162,6 +227,15 @@ function finalizeSegment(segment: PipelineSegmentResult): PipelineResult {
     errorCode = "upstream_stage_failed";
   } else {
     outcome = "success";
+  }
+
+  // B-04: a session-cap exhaustion is a soft signal, not a stage failure.
+  // It only adds the `session_replan_cap_exceeded` tag if the rest of the
+  // pipeline produced a real answer — a degenerate synthesizer answer
+  // keeps its own `error_code` (empty_completion / stage_error / etc.) so
+  // we don't double-tag or mask a real failure.
+  if (sessionCapHit && !errorCode) {
+    errorCode = "session_replan_cap_exceeded";
   }
 
   return {

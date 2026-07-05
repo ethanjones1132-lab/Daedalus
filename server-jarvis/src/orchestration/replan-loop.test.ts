@@ -5,6 +5,8 @@ import { PipelineExecutor } from "./pipeline";
 import { Coordinator } from "./coordinator";
 import { createToolRuntime, makeExecutionContext } from "../tool-runtime";
 import { defaultConfig } from "../config";
+import { SessionReplanCounter } from "./replan-telemetry";
+import { SelfTuningStore } from "../self-tuning/store";
 import type { StageRunRecorder } from "./pipeline";
 import type { CoordinatorResult } from "./coordinator";
 
@@ -186,5 +188,161 @@ describe("runPipelineWithReplanning", () => {
     });
 
     expect(profiles.every((p) => p === "read_only")).toBe(true);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// B-04: per-session replan cap + persistent `replan_events` telemetry.
+// ═══════════════════════════════════════════════════════════════
+
+describe("runPipelineWithReplanning — B-04 session cap + telemetry", () => {
+  test("B-04: replan events are recorded to the store with replan_index, rationale, revised_pipeline, session_id", async () => {
+    const callModel = async () => ({ content: "ok" });
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+
+    // Coordinator: one replan, then a clean revised route.
+    let calls = 0;
+    const coordinator = new Coordinator((async () => ({ content: "unused" })) as any);
+    coordinator.route = (async () => {
+      calls += 1;
+      return {
+        task_type: "debug",
+        pipeline: ["reviewer", "synthesizer"],
+        topology: "linear",
+        context: { needs_workspace_inspection: true, needs_memory: false, estimated_complexity: "medium" },
+        coordinator_rationale: "the schema turned out to be different from what we expected",
+        worker_instructions: { reviewer: "use the new schema" },
+      } as CoordinatorResult;
+    }) as typeof coordinator.route;
+
+    // In-memory store so the test never touches the production self-tuning DB.
+    const store = new SelfTuningStore(":memory:");
+    const counter = new SessionReplanCounter({ maxPerSession: 6, store });
+
+    await runPipelineWithReplanning({
+      contextMessage: "migrate the users table",
+      initialDecision: baseDecision(),
+      turnRequirement: "full_execution",
+      coordinator,
+      routeOptions: { sessionId: "b04-s1" },
+      executor,
+      agentRunId: "run-b04-1",
+      onStateChange: () => {},
+      baseOptions: {},
+      maxReplans: 2,
+      sessionCounter: counter,
+      sessionId: "b04-s1",
+    });
+
+    expect(calls).toBe(1);
+    expect(counter.used("b04-s1")).toBe(1);
+    const events = store.getReplanEventsForSession("b04-s1");
+    expect(events).toHaveLength(1);
+    expect(events[0].replan_index).toBe(1);
+    expect(events[0].session_id).toBe("b04-s1");
+    expect(events[0].agent_run_id).toBe("run-b04-1");
+    expect(events[0].rationale).toContain("schema");
+    expect(JSON.parse(events[0].revised_pipeline)).toEqual(["reviewer", "synthesizer"]);
+    expect(events[0].revised_worker_instructions_keys).toBe("reviewer");
+    expect(events[0].capped).toBe(""); // no cap hit — loop completed normally
+    expect(events[0].segment_outcome).toBe("success");
+  });
+
+  test("B-04: session-level cap is enforced independently of per-turn cap (binding constraint = session)", async () => {
+    const callModel = async () => ({ content: "ok" });
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+
+    // The coordinator always returns a replan-on-replan decision so the
+    // budget (whichever is binding) is what stops the loop.
+    const coordinator = new Coordinator((async () => ({ content: "unused" })) as any);
+    coordinator.route = (async () => baseDecision()) as typeof coordinator.route;
+
+    // Per-turn cap is generous (5); session cap is tight (2). After 2
+    // replans the loop must terminate, with `error_code: "session_replan_cap_exceeded"`.
+    const counter = new SessionReplanCounter({ maxPerSession: 2, store: null });
+
+    const result = await runPipelineWithReplanning({
+      contextMessage: "migrate the users table",
+      initialDecision: baseDecision(),
+      turnRequirement: "full_execution",
+      coordinator,
+      routeOptions: { sessionId: "b04-s2" },
+      executor,
+      agentRunId: "run-b04-2",
+      onStateChange: () => {},
+      baseOptions: {},
+      maxReplans: 5,
+      sessionCounter: counter,
+      sessionId: "b04-s2",
+    });
+
+    expect(counter.used("b04-s2")).toBe(2);
+    expect(result.outcome).toBe("success"); // graceful degradation, not failed
+    expect(result.error_code).toBe("session_replan_cap_exceeded");
+  });
+
+  test("B-04: per-turn cap is preserved when session cap is generous (binding constraint = per_turn)", async () => {
+    const callModel = async () => ({ content: "ok" });
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+
+    const coordinator = new Coordinator((async () => ({ content: "unused" })) as any);
+    coordinator.route = (async () => baseDecision()) as typeof coordinator.route;
+
+    // Session cap = 10, per-turn cap = 1. Loop must terminate after 1
+    // replan (per-turn wins), session cap untouched, and the result is
+    // NOT tagged with `session_replan_cap_exceeded` — it terminated via
+    // per-turn exhaustion, which is a normal outcome.
+    const counter = new SessionReplanCounter({ maxPerSession: 10, store: null });
+
+    const result = await runPipelineWithReplanning({
+      contextMessage: "migrate the users table",
+      initialDecision: baseDecision(),
+      turnRequirement: "full_execution",
+      coordinator,
+      routeOptions: { sessionId: "b04-s3" },
+      executor,
+      agentRunId: "run-b04-3",
+      onStateChange: () => {},
+      baseOptions: {},
+      maxReplans: 1,
+      sessionCounter: counter,
+      sessionId: "b04-s3",
+    });
+
+    expect(counter.used("b04-s3")).toBe(1);
+    expect(result.outcome).toBe("success");
+    expect(result.error_code).toBeUndefined();
+  });
+
+  test("B-04: clearSession resets the counter so a fresh session can replan again", async () => {
+    const counter = new SessionReplanCounter({ maxPerSession: 1, store: null });
+    counter.record({
+      sessionId: "b04-s4",
+      agentRunId: "run-old",
+      replanIndex: 0,
+      rationale: "old",
+      revised: baseDecision(),
+      segmentOutcome: "success",
+      cap: "",
+    });
+    expect(counter.used("b04-s4")).toBe(1);
+    expect(counter.remaining("b04-s4")).toBe(0);
+
+    counter.clearSession("b04-s4");
+    expect(counter.used("b04-s4")).toBe(0);
+    expect(counter.remaining("b04-s4")).toBe(1);
+
+    // Cross-session isolation: another session's counter is untouched.
+    counter.record({
+      sessionId: "b04-s5",
+      agentRunId: "run-other",
+      replanIndex: 0,
+      rationale: "other",
+      revised: baseDecision(),
+      segmentOutcome: "success",
+      cap: "",
+    });
+    expect(counter.used("b04-s4")).toBe(0);
+    expect(counter.used("b04-s5")).toBe(1);
   });
 });

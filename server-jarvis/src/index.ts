@@ -83,11 +83,13 @@ import { Coordinator } from "./orchestration/coordinator";
 import { PersistentConductor } from "./orchestration/persistent-conductor";
 import { SessionMemory, mergeSharedContextHints } from "./orchestration/session-memory";
 import { AgentPool, firstTokenTimeoutFor, formatPoolDiversity } from "./orchestration/agent-pool";
+import { excludedModelKeys } from "./model-failure-memory";
 import { PipelineExecutor } from "./orchestration/pipeline";
 import type { PipelineProgressState, PipelineRecursionEvent } from "./orchestration/pipeline";
 import { classifyTurnRequirements } from "./orchestration/turn-requirements";
 import { normalizeRoute, type ExecutionProfile } from "./orchestration/route-normalization";
 import { runPipelineWithReplanning } from "./orchestration/replan-loop";
+import { SessionReplanCounter } from "./orchestration/replan-telemetry";
 import { conductorLearning, outcomeCollector, selfTuningProposer, SelfTuningStore } from "./self-tuning/mod";
 import { conductorCacheSnapshot } from "./orchestration/conductor-metrics";
 import {
@@ -376,11 +378,31 @@ const persistentConductor = new PersistentConductor(loadConfig);
 
 /** Inter-workflow shared memory — tool results, file snapshots, failure patterns. */
 const sessionMemory = new SessionMemory(() => loadConfig().orchestrator.session_memory);
+
+/** B-04: per-session cumulative counter for `conductor_replan` re-invocations.
+ *  Backs both the per-session replan cap and the persistent `replan_events`
+ *  telemetry table. The store is the same self-tuning DB the rest of the
+ *  orchestrator writes to; a fresh instance is created per process because
+ *  the store has no meaningful in-process state. */
+const replanCounter = new SessionReplanCounter({
+  maxPerSession: loadConfig().orchestrator.max_conductor_replans_per_session,
+  store: new SelfTuningStore(),
+});
 if (!Number.isInteger(PORT) || PORT <= 0 || PORT > 65535) {
   throw new Error(`JARVIS_SERVER_PORT must be an integer between 1 and 65535, got ${process.env.JARVIS_SERVER_PORT}`);
 }
 const BRIDGE_PORT = 19876;
 const JARVIS_VERSION = "3.0.0";
+
+// Build identity for /health — lets us tell which build is actually serving
+// a request (2026-07 incident: a stale deployed bundle silently served
+// leaked-JSON bugs for days because /health only reported the static
+// version string "3.0.0", identical across every build). build-and-deploy.ps1
+// injects these via `bun build --define` from `git rev-parse HEAD`; running
+// from source (bun run / bunx bun test) never gets --define, so these fall
+// back to reading the real env var and finally to the "dev" sentinel.
+const JARVIS_GIT_SHA = process.env.JARVIS_GIT_SHA ?? "dev";
+const JARVIS_BUILT_AT = process.env.JARVIS_BUILT_AT ?? null;
 
 let totalRequests = 0;
 const startTime = Date.now();
@@ -1317,11 +1339,21 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               // should never be re-selected by the pool — it would just repeat
               // the failure. The exclude set is built by the `callModel`
               // wrapper above when a user-visible stage returns no content.
+              //
+              // Also union in the cross-turn hard-failure memory (see
+              // model-failure-memory.ts): a model that hard-failed (e.g. HTTP
+              // 400) twice in a prior turn's cascade must not be re-picked as
+              // THIS turn's pool default either — that was the live incident
+              // (north-mini-code-free 400s every single turn because nothing
+              // remembered the previous failure). Build a fresh union set so
+              // the caller's `excludeModels` is never mutated.
+              const poolExcludeModels = new Set<string>(excludeModels ?? []);
+              for (const key of excludedModelKeys()) poolExcludeModels.add(key);
               if (cascadeTier) {
-                const chain = pool.cascadeChain(stageLabel, orchestratorTaskType, excludeModels);
+                const chain = pool.cascadeChain(stageLabel, orchestratorTaskType, poolExcludeModels);
                 agent = cascadeTier === "cheap" ? chain[0] : chain[chain.length - 1];
               } else {
-                agent = pool.pickFor(stageLabel, orchestratorTaskType, excludeModels);
+                agent = pool.pickFor(stageLabel, orchestratorTaskType, poolExcludeModels);
               }
               if (agent && (agent.provider === "openrouter" || agent.provider === "opencode_zen" || agent.provider === "opencode_go")) {
                 poolModel = agent.model_id;
@@ -1749,7 +1781,15 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // match/execute anything (normalizeToolName requires the name to
           // be in the offered tools), it only performs the cleanup — so this
           // is safe even when nothing was actually a real tool call.
-          const cleanContent = useTextTools ? reasoningStripped : extractTextToolCalls(reasoningStripped, []).cleanedText;
+          // Text-tool stages first remove genuine call blocks (real tools
+          // list), then EVERY stage gets the empty-list cosmetic pass. The
+          // previous `useTextTools ? reasoningStripped : …` ternary returned
+          // the raw text for text-tool stages, so bare hallucinated tool JSON
+          // in executor visible activity was never stripped.
+          const toolAwareCleaned = useTextTools
+            ? extractTextToolCalls(reasoningStripped, callOptions.tools).cleanedText
+            : reasoningStripped;
+          const cleanContent = extractTextToolCalls(toolAwareCleaned, []).cleanedText;
           // Capture the actual provider/model used by this attempt so the
           // orchestrator's `recordInference` error/empty paths can attribute
           // the turn to the real backend (not the user's selected
@@ -1790,6 +1830,15 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
             const hasContent = typeof cleanContent === "string" && cleanContent.trim().length > 0;
             const hasToolCalls = parsedToolCalls.length > 0;
+            // A user-visible stage (surfaceAsAnswer, i.e. the synthesizer) must
+            // produce actual prose to count as a success — 2026-07-03 session
+            // 1d4727cf / run_81091960: the synthesizer emitted tool-call JSON as
+            // its "answer", cleanContent stripped it to empty, but the reward
+            // signal here still counted `hasToolCalls` as success, so the tuning
+            // loop BOOSTED the capability score of the model that leaked the
+            // JSON. Non-answer stages (executor, etc.) legitimately succeed via
+            // tool calls with no prose, so they keep the original OR logic.
+            const isAnswerStage = callOptions?.surfaceAsAnswer === true;
             conductorLearning.recordStageModel({
               agentRunId: orchestratorAgentRunId,
               stageId: stageLabel,
@@ -1798,8 +1847,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               modelId: actualModelUsed,
               durationMs: Date.now() - stageAttemptStart,
               fallbackUsed: (excludeModels?.size ?? 0) > 0,
-              wasSuccessful: hasContent || hasToolCalls,
-              hadError: !hasContent && !hasToolCalls,
+              wasSuccessful: isAnswerStage ? hasContent : (hasContent || hasToolCalls),
+              hadError: isAnswerStage ? !hasContent : (!hasContent && !hasToolCalls),
             });
           }
           return {
@@ -1847,8 +1896,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           //     that the previous build hit on the live smoke test.
           for (let advance = 0; advance < 2; advance++) {
             const hasContent = typeof last?.content === "string" && last.content.trim().length > 0;
-            const hasToolCalls = Array.isArray(last?.tool_calls) && last.tool_calls.length > 0;
-            if (hasContent || hasToolCalls || streamAbort.signal.aborted) break;
+            // A user-visible stage is only "done" when it produced clean prose.
+            // Tool calls do NOT count: a synthesizer that emits a tool call has
+            // no tools to run it with, and before 2026-07-04 the leaked call
+            // text itself was accepted as the answer (session 1d4727cf) — and
+            // then reinforced by the tuning loop as a success.
+            if (hasContent || streamAbort.signal.aborted) break;
             if (last?._provider && last?._modelUsed) {
               const key = `${last._provider}:${last._modelUsed}`;
               if (exclude.has(key)) {
@@ -1859,7 +1912,27 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
             if (exclude.size === 0) break; // no exclusion built → nothing to advance past
             console.warn(`[Jarvis Orchestrator] empty completion from ${last?._provider}:${last?._modelUsed} stage=${callOptions?.stageLabel ?? "?"} — advancing cascade (excluding it)`);
-            last = await callModelAttempt(messages, callOptions, exclude);
+            // Nudge the retry model toward plain prose. `normalizeMessagesForLLM`
+            // (above) only merges LEADING system messages into one; a system
+            // message appended at the end would land mid-array and get
+            // demoted to a `[System: ...]`-wrapped user message instead of
+            // staying in the actual system prompt. So we splice the nudge
+            // into the existing leading system message's content (or add one
+            // if the stage somehow has none) rather than pushing a new
+            // trailing message — and we copy the array/message objects so the
+            // original `messages` passed to this closure is never mutated.
+            const nudge = "You have no tools available. Answer the user in plain prose now — do not emit tool_call syntax, tool JSON, or any function-call markup.";
+            const nudgedMessages = [...messages];
+            const leadingSystemIdx = nudgedMessages.findIndex((m) => m?.role === "system");
+            if (leadingSystemIdx >= 0) {
+              nudgedMessages[leadingSystemIdx] = {
+                ...nudgedMessages[leadingSystemIdx],
+                content: `${nudgedMessages[leadingSystemIdx].content ?? ""}\n\n${nudge}`,
+              };
+            } else {
+              nudgedMessages.unshift({ role: "system", content: nudge });
+            }
+            last = await callModelAttempt(nudgedMessages, callOptions, exclude);
           }
           return last;
         };
@@ -1972,6 +2045,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               onStateChange: onOrchestratorStateChange,
               baseOptions: pipelineOptions,
               maxReplans: cfg.orchestrator.max_conductor_replans,
+              // B-04: hand the per-session counter the session id so the
+              // loop can enforce the per-session cap and persist a
+              // `replan_events` row per re-invocation.
+              sessionCounter: replanCounter,
+              sessionId,
             })
           : await executor.execute(contextMessage, executablePipeline, agentRunId, onOrchestratorStateChange, pipelineOptions);
 
@@ -3185,7 +3263,7 @@ async function baseFetch(req: Request): Promise<Response> {
     }
     if (path === "/health") {
       const hcfg = loadConfig();
-      return Response.json({ ok: true, uptime: process.uptime(), version: JARVIS_VERSION, backend: hcfg.active_backend, model: hcfg.active_backend === "openrouter" ? hcfg.openrouter.model : hcfg.ollama.model });
+      return Response.json({ ok: true, uptime: process.uptime(), version: JARVIS_VERSION, backend: hcfg.active_backend, model: hcfg.active_backend === "openrouter" ? hcfg.openrouter.model : hcfg.ollama.model, git_sha: JARVIS_GIT_SHA, built_at: JARVIS_BUILT_AT });
     }
     if (path === "/health/inference") {
       return Response.json(inferenceMetricsSnapshot());
@@ -3452,6 +3530,10 @@ async function baseFetch(req: Request): Promise<Response> {
       clearSessionState(sid);
       persistentConductor.clearSession(sid);
       sessionMemory.clearSession(sid);
+      // B-04: reset the per-session replan counter so a user-initiated
+      // "new session" frees up the replan budget. Without this, a fresh
+      // session inheriting the same id would inherit a depleted counter.
+      replanCounter.clearSession(sid);
       return Response.json({ ok: true, session_id: sid, state: body.state || null });
     }
 

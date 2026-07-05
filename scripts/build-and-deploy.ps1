@@ -72,9 +72,31 @@ Write-Host "  cargo: $cargo"
 
 # ── Stage 1: server bundle ───────────────────────────────────────────────────
 Write-Step 'Stage 1/4 - Building server bundle (bun)'
+# Bake the build identity into the bundle so /health can report WHICH build is
+# actually serving (2026-07 incident: a stale deploy silently served
+# leaked-JSON bugs for days because /health only ever returned the static
+# "3.0.0" version string). bun's --define replaces process.env.<NAME> member
+# expressions at bundle time (verified: `bun build --define
+# "process.env.X=\"...\""` folds the literal into the output, and running the
+# unbundled source with `bun run` still reads the live env var / "dev"
+# fallback, so source runs are unaffected).
+#
+# QUOTING TRAP (PS 5.1 native-arg passing): the inner quotes around the value
+# MUST be backslash-escaped (\`") not merely backtick-escaped (`"). A bare
+# backtick-escaped quote puts a literal " in the PowerShell string, but PS 5.1
+# does not re-escape embedded quotes when it rebuilds the command line for a
+# native exe, so bun's argv loses them and folds the value as a BARE JS
+# identifier: `var SHA = abc123 ?? "dev"` -> ReferenceError at module load ->
+# the deployed server fails to boot. bun build still exits 0, so the error
+# gate below cannot catch it. \`" survives to bun as \" and folds correctly
+# to a quoted string literal (verified both ways via scratch repro 2026-07-04).
+$buildGitSha = (git -C $repo rev-parse HEAD)
+$buildBuiltAt = (Get-Date -Format 'o')
 Push-Location $serverDir
 try {
-    & $bun build ./src/index.ts --outdir ./dist --target bun
+    & $bun build ./src/index.ts --outdir ./dist --target bun `
+        --define "process.env.JARVIS_GIT_SHA=\`"$buildGitSha\`"" `
+        --define "process.env.JARVIS_BUILT_AT=\`"$buildBuiltAt\`""
     if ($LASTEXITCODE -ne 0) { Die 'server bundle build failed' }
 } finally { Pop-Location }
 if (-not (Test-Path $distJs)) { Die "server bundle not produced at $distJs" }
@@ -147,8 +169,12 @@ Copy-Item $promptsSrc $promptsDst -Recurse -Force
 Write-Ok 'prompts/'
 
 # ── Deploy manifest ──
+# Reuse $buildGitSha (captured before Stage 1) rather than re-running
+# `git rev-parse HEAD` here, so the manifest's git_sha is guaranteed to match
+# the SHA actually baked into index.js via --define, even in the (unlikely)
+# case HEAD moves mid-run.
 $manifest = @{
-    git_sha = (git -C $repo rev-parse HEAD)
+    git_sha = $buildGitSha
     index_js_sha256 = (Get-FileHash "$desktop\index.js" -Algorithm SHA256).Hash
     exe_mtime = (Get-Item "$desktop\Jarvis.exe" -ErrorAction SilentlyContinue).LastWriteTimeUtc.ToString("o")
     prompts_tree_sha256 = (git -C $repo ls-tree HEAD server-jarvis/src/prompts | Select-Object -First 1).Split()[2]

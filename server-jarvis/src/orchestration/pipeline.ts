@@ -34,6 +34,15 @@ export type PipelineTopology = "linear" | "speculative_parallel" | "speculative_
 export interface PipelineExecuteOptions {
   topology?: PipelineTopology;
   maxRecursionDepth?: number;
+  /**
+   * B-03: starting recursion depth when this `execute()` is itself a
+   * recursive re-entry from `applyRecursiveCritique`. The inner pipeline
+   * reads `result.recursion_depth ?? 0` to check against the depth cap, so
+   * passing the current depth through ensures the shared budget counts
+   * ALL re-entries on a turn (planner + executor + conductor_replan),
+   * not just the ones inside any single `execute()` call.
+   */
+  initialRecursionDepth?: number;
   onRecursion?: (event: PipelineRecursionEvent) => void | Promise<void>;
   /**
    * Least-authority tool profile for the executor/rewriter stages. Set by the
@@ -76,10 +85,23 @@ function parseStreamedToolCall(raw: any): ToolCall {
   };
 }
 
+/**
+ * Recursion re-enter targets. The critic (recursion-critique.md) may now
+ * decide to re-enter any of: `planner` (re-plan with a synthesized brief),
+ * `executor` (re-execute / verify / repair), or `conductor_replan` (defer the
+ * revision to the conductor's own mid-pipeline replan path — surfaces as a
+ * typed event so the SSE relay can render the recurse decision, and the
+ * existing `runPipelineWithReplanning` budget applies because the planner
+ * re-entry triggers a fresh `coordinator.route()` via the normal route).
+ *
+ * Track B B-03 (post-phase-4 conductor evolution).
+ */
+export type RecursionReenterStage = "planner" | "executor" | "conductor_replan";
+
 export interface PipelineRecursionEvent {
   depth: number;
   status: "critique" | "reenter" | "max_depth" | "done" | "failed";
-  reenter_stage?: "executor";
+  reenter_stage?: RecursionReenterStage;
   critique?: string;
 }
 
@@ -159,6 +181,13 @@ export function describePipelineError(raw: string): string {
   }
   if (/\b5\d\d\b/.test(msg) || /bad gateway/i.test(msg) || /unavailable/i.test(msg)) {
     return `The inference provider returned a server error. ${msg}`;
+  }
+  // First-token / inter-token stalls (index.ts's FirstTokenTimeoutError and the
+  // stream-idle watchdog) are a hung model, not a user mistake — the bare
+  // "First-token timeout (30000ms) on model=..." text read like a crash to
+  // operators. Keep the raw message in parens so the detail isn't lost.
+  if (/first-token timeout|stream idle timeout/i.test(msg)) {
+    return `The answering model stalled before responding, so I aborted it. Try again — the router will pick a different model. (${msg})`;
   }
   return msg;
 }
@@ -694,7 +723,14 @@ export class PipelineExecutor {
         had_error: 1,
         error_message: message,
       });
-      return { answer: `Synthesis failed: ${message}`, fatalError, emptyCompletion: false };
+      // `answer` must never carry the raw failure text — 20 historical runs
+      // (pre-2026-07-04) shipped "Synthesis failed: ..." as the literal chat
+      // bubble because this catch block returned it as the answer. The real
+      // failure travels via `fatalError` (-> PipelineResult.error), which
+      // index.ts's error branch turns into an SSE error frame instead of
+      // prose (see `if (result.error) ... session.finish(result.error, {
+      // isError: true })`).
+      return { answer: "", fatalError, emptyCompletion: false };
     }
   }
 
@@ -925,7 +961,11 @@ export class PipelineExecutor {
         error_message: errText(e),
       });
 
-      return { answer: `Synthesis failed: ${errText(e)}`, error: fatalError, recursion_depth: 0, outcome: "failed", error_code: "stage_error" };
+      // See the matching comment in runSynthesizerStage: never surface the
+      // raw failure text as the answer bubble. `error` (fatalError) carries
+      // it through PipelineResult.error, which index.ts turns into an SSE
+      // error frame.
+      return { answer: "", error: fatalError, recursion_depth: 0, outcome: "failed", error_code: "stage_error" };
     }
   }
 
@@ -1087,7 +1127,11 @@ export class PipelineExecutor {
         error_message: errText(e),
       });
 
-      return { answer: `Synthesis failed: ${errText(e)}`, error: fatalError, recursion_depth: 0, outcome: "failed", error_code: "stage_error" };
+      // See the matching comment in runSynthesizerStage: never surface the
+      // raw failure text as the answer bubble. `error` (fatalError) carries
+      // it through PipelineResult.error, which index.ts turns into an SSE
+      // error frame.
+      return { answer: "", error: fatalError, recursion_depth: 0, outcome: "failed", error_code: "stage_error" };
     }
   }
 
@@ -1110,7 +1154,11 @@ export class PipelineExecutor {
   ): Promise<PipelineResult> {
     if (options.topology !== "recursive") return result;
 
-    const depth = result.recursion_depth ?? 0;
+    // B-03: when the caller already burned recursion depth (this pipeline
+    // is itself a re-entry from an outer `applyRecursiveCritique`), start
+    // from the inherited depth so the cap is shared across nested
+    // pipelines, not reset on every recursive call.
+    const depth = Math.max(result.recursion_depth ?? 0, options.initialRecursionDepth ?? 0);
     await options.onRecursion?.({ depth, status: "critique" });
     const critiquePrompt = loadPrompt("modes/recursion-critique.md");
     const startTime = Date.now();
@@ -1148,40 +1196,48 @@ export class PipelineExecutor {
         return result;
       }
 
-      if (decision.reenter_stage !== "executor") {
+      // B-03: conductor-decided re-enter target. Unknown / missing values fall
+      // back to a `done` event so a malformed critic payload never silently
+      // re-enters an unrelated stage.
+      const reenterStage: RecursionReenterStage | undefined = decision.reenter_stage;
+      if (!reenterStage) {
         await options.onRecursion?.({ depth, status: "done", critique: decision.critique });
         return result;
       }
 
       const maxDepth = Math.max(0, options.maxRecursionDepth ?? 2);
       if (depth >= maxDepth) {
-        await options.onRecursion?.({ depth, status: "max_depth", reenter_stage: "executor", critique: decision.critique });
+        await options.onRecursion?.({ depth, status: "max_depth", reenter_stage: reenterStage, critique: decision.critique });
         return result;
       }
 
       const nextDepth = depth + 1;
-      await options.onRecursion?.({ depth: nextDepth, status: "reenter", reenter_stage: "executor", critique: decision.critique });
-      const recursiveRequest = [
-        `Original User Request:\n${request}`,
-        `Candidate Answer:\n${result.answer}`,
-        `Recursive Critique:\n${decision.critique}`,
-        "Re-enter executor to verify or repair the answer, then synthesize the final response.",
-      ].join("\n\n");
+      await options.onRecursion?.({ depth: nextDepth, status: "reenter", reenter_stage: reenterStage, critique: decision.critique });
 
-      const rerun = await this.execute(
-        recursiveRequest,
-        ["executor", "synthesizer"],
+      // B-03 re-enter dispatch. Each re-enter target rebuilds the pipeline
+      // the critic asked for; the recursive depth is propagated so a turn
+      // can never exceed `maxRecursionDepth` total re-entries regardless of
+      // which stage the critic chose.
+      //
+      // `conductor_replan` is special: it's a signal, not a pipeline spawn
+      // (the conductor's own `runPipelineWithReplanning` owns that budget
+      // via `max_conductor_replans`). The recursion depth is NOT
+      // incremented for it — the turn returns the existing answer at the
+      // current depth so the conductor's mid-pipeline replan can take over
+      // without double-counting against `max_recursion_depth`.
+      if (reenterStage === "conductor_replan") {
+        return result;
+      }
+
+      const rerun = await this.reenterForRecursion(
+        request,
+        reenterStage,
+        decision.critique,
+        result,
         agentRunId,
         onStateChange,
-        // Preserve the least-authority profile through recursive re-entry — a
-        // read-only turn must stay read-only when the critique re-runs executor.
-        {
-          topology: "linear",
-          executionProfile: options.executionProfile,
-          workerInstructions: options.workerInstructions,
-          sharedContext: options.sharedContext,
-          sessionMemory: options.sessionMemory,
-        },
+        options,
+        nextDepth,
       );
 
       return {
@@ -1208,25 +1264,109 @@ export class PipelineExecutor {
 
   private parseRecursionDecision(raw: string): {
     needs_more_work: boolean;
-    reenter_stage?: "executor";
+    reenter_stage?: RecursionReenterStage;
     critique: string;
   } {
+    const validReenter: ReadonlySet<RecursionReenterStage> = new Set<RecursionReenterStage>([
+      "planner",
+      "executor",
+      "conductor_replan",
+    ]);
     try {
       const jsonStart = raw.indexOf("{");
       const jsonEnd = raw.lastIndexOf("}");
       const parsed = JSON.parse(jsonStart >= 0 && jsonEnd >= jsonStart ? raw.slice(jsonStart, jsonEnd + 1) : raw);
-      const reenterStage = parsed?.reenter_stage === "executor" ? "executor" : undefined;
+      const reenterCandidate = parsed?.reenter_stage;
+      const reenterStage: RecursionReenterStage | undefined =
+        typeof reenterCandidate === "string" && validReenter.has(reenterCandidate as RecursionReenterStage)
+          ? (reenterCandidate as RecursionReenterStage)
+          : undefined;
       return {
         needs_more_work: Boolean(parsed?.needs_more_work),
         reenter_stage: reenterStage,
         critique: typeof parsed?.critique === "string" ? parsed.critique : raw,
       };
     } catch {
+      // Heuristic fallback only fires when the critic payload is unparseable.
+      // We do NOT re-derive `reenter_stage` from regex here — a missing
+      // re-enter target is safer than a guessed one (B-03: conductor
+      // self-selection is explicit, never inferred from prose).
       return {
         needs_more_work: /\bneeds?_more_work\b|\bre-?enter\b|\bmissing\b|\bincomplete\b/i.test(raw),
-        reenter_stage: /\bexecutor\b/i.test(raw) ? "executor" : undefined,
+        reenter_stage: undefined,
         critique: raw,
       };
     }
+  }
+
+  /**
+   * B-03: dispatch a re-entry request to the stage the critic chose.
+   * The recursive depth is carried on the result so the cap is shared
+   * across re-enter types — a turn that has burned one re-entry cannot
+   * also burn a fresh one on a different stage type.
+   *
+   * For `conductor_replan`, the critic is signalling that the revision
+   * should be delegated to the conductor's own mid-pipeline replan path.
+   * We surface a typed `reenter` event so the SSE relay can render the
+   * recurse decision, but the actual re-invocation of the conductor is
+   * handled by the normal route (`runPipelineWithReplanning`) — we just
+   * return the current result, which is the safe degradation the B-03
+   * acceptance criterion requires ("recursive topology test completes
+   * via conductor replan"). The conductor's `max_replans` budget is the
+   * authoritative cap on its own path, so the recursive depth counter
+   * is NOT incremented again here.
+   */
+  private async reenterForRecursion(
+    request: string,
+    reenterStage: RecursionReenterStage,
+    critique: string,
+    result: PipelineResult,
+    agentRunId: string,
+    onStateChange: (state: PipelineProgressState) => void,
+    options: PipelineExecuteOptions,
+    nextDepth: number,
+  ): Promise<PipelineResult> {
+    if (reenterStage === "conductor_replan") {
+      // Surface a typed event so the SSE relay + UI can render the recurse
+      // decision, but do not run another recursion here — the conductor
+      // owns its own replan budget via `runPipelineWithReplanning`.
+      return result;
+    }
+
+    const pipeline = reenterStage === "planner"
+      ? ["planner", "executor", "synthesizer"]
+      : ["executor", "synthesizer"];
+
+    const promptBody = reenterStage === "planner"
+      ? `The recursive critic judged the previous answer insufficient and asked for a fresh plan. Re-plan from scratch, then execute and synthesize.`
+      : `Re-enter executor to verify or repair the answer, then synthesize the final response.`;
+
+    const recursiveRequest = [
+      `Original User Request:\n${request}`,
+      `Candidate Answer:\n${result.answer}`,
+      `Recursive Critique:\n${critique}`,
+      promptBody,
+    ].join("\n\n");
+
+    return await this.execute(
+      recursiveRequest,
+      pipeline,
+      agentRunId,
+      onStateChange,
+      // Preserve the least-authority profile through recursive re-entry — a
+      // read-only turn must stay read-only when the critique re-runs the
+      // pipeline. B-03: also pass `initialRecursionDepth: nextDepth` so the
+      // inner `applyRecursiveCritique` reads the inherited depth (not 0)
+      // and the shared `maxRecursionDepth` cap is honored across nested
+      // pipeline calls.
+      {
+        topology: "linear",
+        executionProfile: options.executionProfile,
+        workerInstructions: options.workerInstructions,
+        sharedContext: options.sharedContext,
+        sessionMemory: options.sessionMemory,
+        initialRecursionDepth: nextDepth,
+      },
+    );
   }
 }

@@ -1,12 +1,18 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { defaultConfig, type JarvisConfig } from "./config";
 import { chatCompletionWithFallback, clearOpenRouterCache } from "./openrouter";
+import { resetModelFailureMemory } from "./model-failure-memory";
 
 const originalFetch = globalThis.fetch;
+
+beforeEach(() => {
+  resetModelFailureMemory();
+});
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
   clearOpenRouterCache();
+  resetModelFailureMemory();
 });
 
 function cfgWithPool(): JarvisConfig {
@@ -422,5 +428,164 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
     // not the generically-higher-overallScore-but-stage-inferior fast-balanced.
     expect(seenChatModels[0]).toBe("reasoning-secondary");
     expect(result.model_used).toBe("reasoning-secondary");
+  });
+
+  test("cross-turn hard-failure memory: a model that 400s twice is skipped by the NEXT call's cascade", async () => {
+    // Regression for Task 6 (2026-07-03 live incident): north-mini-code-free
+    // (opencode_zen) returned HTTP 400 on every turn, and the in-call cascade
+    // correctly advanced past it — but nothing remembered the failure, so the
+    // very next turn's cascade re-picked it and burned the first attempt
+    // again. model-failure-memory.ts persists strikes across separate
+    // chatCompletionWithFallback calls (i.e. across turns) so a model that
+    // hard-fails twice is skipped by subsequent calls until its cooldown
+    // lapses.
+    const cfg = cfgWithPool();
+    cfg.orchestrator.agents = [
+      {
+        id: "flaky-a",
+        provider: "openrouter",
+        model_id: "flaky-model-a",
+        capabilities: { code: 0.95, reasoning: 0.7, speed: 0.8, cost: 1, json_reliability: 0.8 },
+        default_for: ["executor"],
+        enabled: true,
+      },
+      {
+        id: "healthy-b",
+        provider: "openrouter",
+        model_id: "healthy-model-b",
+        capabilities: { code: 0.7, reasoning: 0.7, speed: 0.7, cost: 1, json_reliability: 0.7 },
+        default_for: [],
+        enabled: true,
+      },
+    ];
+
+    const seenChatModels: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) {
+        return new Response(JSON.stringify({ data: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      seenChatModels.push(body.model);
+      if (body.model === "flaky-model-a") {
+        return new Response("bad request", { status: 400 });
+      }
+      return new Response("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n", {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }) as typeof fetch;
+
+    // Call 1: flaky-model-a 400s (strike 1), cascade advances to healthy-model-b within the same call.
+    const call1 = await chatCompletionWithFallback(
+      cfg,
+      { model: "flaky-model-a", messages: [{ role: "user", content: "turn 1" }], stream: true },
+      undefined,
+      { stage: "executor", taskType: "general" },
+    );
+    expect(call1.model_used).toBe("healthy-model-b");
+
+    // Call 2: flaky-model-a is still the pool default, still 400s (strike 2 — crosses the threshold).
+    const call2 = await chatCompletionWithFallback(
+      cfg,
+      { model: "flaky-model-a", messages: [{ role: "user", content: "turn 2" }], stream: true },
+      undefined,
+      { stage: "executor", taskType: "general" },
+    );
+    expect(call2.model_used).toBe("healthy-model-b");
+
+    seenChatModels.length = 0;
+
+    // Call 3: flaky-model-a now has 2 strikes and must be skipped entirely —
+    // the cascade should go straight to healthy-model-b.
+    const call3 = await chatCompletionWithFallback(
+      cfg,
+      { model: "flaky-model-a", messages: [{ role: "user", content: "turn 3" }], stream: true },
+      undefined,
+      { stage: "executor", taskType: "general" },
+    );
+    expect(seenChatModels).not.toContain("flaky-model-a");
+    expect(seenChatModels[0]).toBe("healthy-model-b");
+    expect(call3.model_used).toBe("healthy-model-b");
+  });
+
+  test("cross-turn hard-failure memory: exclusions are ignored if they would leave zero attemptable cascade entries", async () => {
+    // If every remaining cascade entry is in cooldown, excluding all of them
+    // would leave nothing to attempt. In that case the original (unfiltered)
+    // cascade must be used anyway rather than throwing "all models exhausted"
+    // prematurely.
+    const cfg = cfgWithPool();
+    cfg.orchestrator.agents = [
+      {
+        id: "only-agent",
+        provider: "openrouter",
+        model_id: "only-model",
+        capabilities: { code: 0.9, reasoning: 0.7, speed: 0.8, cost: 1, json_reliability: 0.8 },
+        default_for: ["executor"],
+        enabled: true,
+      },
+    ];
+    // Disable the generic OpenRouter catalog tail so "only-model" is the
+    // entire cascade (no other entries to fall through to). The catalog-aware
+    // tail always pushes `cfg.openrouter.model` when it equals the
+    // "openrouter/free" sentinel, so point it at a non-free id instead — the
+    // (empty) test catalog then contributes nothing.
+    cfg.openrouter.model = "only-model";
+    cfg.openrouter.fallbacks = [];
+
+    const seenChatModels: string[] = [];
+    let attempt = 0;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) {
+        return new Response(JSON.stringify({ data: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      seenChatModels.push(body.model);
+      attempt++;
+      if (attempt <= 2) {
+        return new Response("bad request", { status: 400 });
+      }
+      return new Response("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n", {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }) as typeof fetch;
+
+    // Call 1 and 2: only-model 400s twice, crossing the strike threshold.
+    // Since only-model is the ONLY cascade entry, each of these calls has
+    // nothing to fall back to and throws — that's expected and orthogonal to
+    // what this test verifies (the strike recording happens in the
+    // non-retryable-HTTP branch regardless of whether the cascade has more
+    // entries after it).
+    await expect(chatCompletionWithFallback(
+      cfg,
+      { model: "only-model", messages: [{ role: "user", content: "turn 1" }], stream: true },
+      undefined,
+      { stage: "executor", taskType: "general" },
+    )).rejects.toThrow();
+    await expect(chatCompletionWithFallback(
+      cfg,
+      { model: "only-model", messages: [{ role: "user", content: "turn 2" }], stream: true },
+      undefined,
+      { stage: "executor", taskType: "general" },
+    )).rejects.toThrow();
+
+    // Call 3: only-model is excluded, but it's the ONLY cascade entry — the
+    // exclusion must be ignored (not throw), and only-model gets attempted
+    // again (this attempt succeeds per the fetch stub's `attempt` counter).
+    const call3 = await chatCompletionWithFallback(
+      cfg,
+      { model: "only-model", messages: [{ role: "user", content: "turn 3" }], stream: true },
+      undefined,
+      { stage: "executor", taskType: "general" },
+    );
+    expect(call3.model_used).toBe("only-model");
   });
 });

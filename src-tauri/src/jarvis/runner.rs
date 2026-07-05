@@ -1016,6 +1016,33 @@ mod sse_tests {
     }
 
     #[test]
+    fn orchestrator_recursion_maps_b03_reenter_stages() {
+        // B-03: the recursive critic may now re-enter `planner` (a fresh
+        // plan), `executor` (re-verify), or `conductor_replan` (defer to
+        // the conductor's own replan path). The SSE relay is string-typed
+        // for `reenter_stage` so the new values flow through as-is; this
+        // test pins that the relay doesn't silently drop or normalize
+        // them.
+        for stage in ["planner", "executor", "conductor_replan"] {
+            let mut r = SseRelay::new();
+            let payload = format!(
+                r#"data: {{"type":"orchestrator_recursion","depth":1,"status":"reenter","reenter_stage":"{stage}","critique":"b03 test"}}"#
+            );
+            let out = r.handle_line(&payload);
+            assert!(
+                matches!(
+                    &out,
+                    SseFrameOutcome::Recursion { depth: 1, ref status, ref reenter_stage, ref critique }
+                    if status == "reenter"
+                        && reenter_stage.as_deref() == Some(stage)
+                        && critique.as_deref() == Some("b03 test")
+                ),
+                "expected Recursion for reenter_stage={stage}, got {out:?}",
+            );
+        }
+    }
+
+    #[test]
     fn orchestrator_recursion_handles_missing_optional_fields() {
         let mut r = SseRelay::new();
         let out = r.handle_line(

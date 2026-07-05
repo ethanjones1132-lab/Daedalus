@@ -267,6 +267,11 @@ export interface OrchestratorConfig {
    *  via `conductor_replan` before the replan loop just runs the remaining
    *  normalized pipeline to completion. Prevents an unbounded replan loop. */
   max_conductor_replans: number;
+  /** B-04: cumulative per-session cap. The effective per-turn cap is the
+   *  min of this and `max_conductor_replans`, so a session cannot slowly
+   *  accumulate replan spend across many turns even if no single turn
+   *  trips the per-turn cap. Reset on session reset. */
+  max_conductor_replans_per_session: number;
   conductor: ConductorConfig;
   session_memory: SessionMemoryConfig;
   conductor_learning: ConductorLearningConfig;
@@ -435,6 +440,7 @@ export function defaultConfig(): JarvisConfig {
       agents: DEFAULT_ORCHESTRATOR_AGENTS,
       max_recursion_depth: 2,
       max_conductor_replans: 2,
+      max_conductor_replans_per_session: 6,
       conductor: {
         enabled: true,
         model: "gemma4:e2b",

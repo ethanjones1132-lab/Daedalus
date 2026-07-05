@@ -288,6 +288,7 @@ End-to-end: forced replan in test fixture re-runs executor with updated instruct
 
 **Type:** AFK  
 **Blocked by:** B-02
+**Status:** ✅ Done (2026-07-04, Jarvis afternoon maintenance pass)
 
 #### What to build
 
@@ -297,17 +298,75 @@ End-to-end: recursive topology test completes via conductor replan; existing rec
 
 #### Acceptance criteria
 
-- [ ] Conductor chooses re-enter target from critique context
-- [ ] Depth cap applies to all re-enter types
-- [ ] `orchestrator_recursion` SSE unchanged for UI consumers
-- [ ] Eval/regression tests for recursive topology pass
+- [x] Conductor chooses re-enter target from critique context
+- [x] Depth cap applies to all re-enter types
+- [x] `orchestrator_recursion` SSE unchanged for UI consumers
+- [x] Eval/regression tests for recursive topology pass
+
+**Implementation summary:** the recursive topology's `applyRecursiveCritique`
+method in `server-jarvis/src/orchestration/pipeline.ts` was extended from
+a hardcoded "critic → executor" path to a conductor-decided re-enter
+dispatch. Three contract changes:
+
+1. New `RecursionReenterStage = "planner" | "executor" | "conductor_replan"`
+   type exported from `pipeline.ts`; `PipelineRecursionEvent.reenter_stage`
+   widened to that union. The string-typed SSE relay in
+   `src-tauri/src/jarvis/runner.rs` flows the new values through as-is
+   (pinned by the new `orchestrator_recursion_maps_b03_reenter_stages`
+   test that exercises all three values).
+
+2. `parseRecursionDecision` now accepts the three B-03 re-enter targets
+   via a `validReenter` set; unknown values degrade to a `done` event
+   (no silent re-entry on a model hallucination). The regex-based
+   heuristic fallback path that used to guess `executor` from prose is
+   removed — B-03 is explicit-only.
+
+3. New `reenterForRecursion` helper dispatches the re-run pipeline based
+   on the chosen target: `planner` → `[planner, executor, synthesizer]`,
+   `executor` → `[executor, synthesizer]` (legacy), `conductor_replan`
+   → returns the current result with a typed `reenter` event (the
+   conductor's own `runPipelineWithReplanning` owns the actual re-plan
+   via its `max_conductor_replans` budget; the recursive depth counter
+   is NOT incremented again so it doesn't double-count against
+   `max_recursion_depth`).
+
+4. `PipelineExecuteOptions.initialRecursionDepth` plumbed so the inner
+   re-run pipeline sees the inherited depth at entry (the inner
+   `applyRecursiveCritique` reads
+   `Math.max(result.recursion_depth ?? 0, options.initialRecursionDepth ?? 0)`).
+   The shared budget guarantee is structural: the recursion-critique call
+   is the single gate where `maxRecursionDepth` is enforced, and the same
+   numeric cap applies regardless of which re-enter type the critic
+   picks.
+
+5. `recursion-critique.md` (the prompt the critic uses) was extended
+   with a "Choosing a re-enter target" section that documents all three
+   B-03 re-enter types and when to pick each one. A deprecation note
+   pins the file's status as the B-03 critic (same path the B-01
+   topology used) so existing deployments keep working; the eventual
+   B-04 telemetry work will replace this prompt with an eval-driven
+   per-target prompt.
+
+6. **4 new bun tests** in `orchestration.test.ts` (550 total, was 546):
+   `B-03: recursion critic may re-enter planner and the depth is shared
+   with executor re-entries`; `B-03: critic may emit conductor_replan —
+   surfaces a typed event without spawning another recursion`; `B-03:
+   max_recursion_depth=1 enforces the shared budget regardless of which
+   re-enter type the critic picks`; `B-03: parseRecursionDecision
+   rejects an unknown reenter_stage and emits a 'done' event`. **1 new
+   cargo test** in `src-tauri/src/jarvis/runner.rs` (60 total, was 59):
+   `orchestrator_recursion_maps_b03_reenter_stages` loops
+   `[planner, executor, conductor_replan]` through the SSE relay and
+   pins the field round-trips. The original B-01 recursive tests still
+   pass unchanged.
 
 ---
 
 ### B-04: Replan telemetry and safety bounds
 
-**Type:** AFK  
+**Type:** AFK
 **Blocked by:** B-03
+**Status:** ✅ Done (2026-07-04 evening, Jarvis maintenance pass)
 
 #### What to build
 
@@ -316,11 +375,20 @@ Record replan events in `conductor_runs` and `trajectory_snapshots`. Configurabl
 End-to-end: telemetry row exists per replan; cap prevents infinite loop in test.
 
 #### Acceptance criteria
+- [x] `conductor_runs` or new table captures replan count and outcome
+- [x] Config: `max_replans_per_turn`, `max_conductor_replans_per_session`
+- [x] Test proves loop terminates at cap
+- [x] Replan failures degrade gracefully (surface synthesizer answer)
 
-- [ ] `conductor_runs` or new table captures replan count and outcome
-- [ ] Config: `max_replans_per_turn`, `max_conductor_replans_per_session`
-- [ ] Test proves loop terminates at cap
-- [ ] Replan failures degrade gracefully (surface synthesizer answer)
+**Implementation summary:** the B-02 per-turn cap (`orchestrator.max_conductor_replans`, default 2) already prevents an unbounded replan loop within a single turn. B-04 adds the matching **per-session** cap (`orchestrator.max_conductor_replans_per_session`, default 6) and a **persistent `replan_events` table** so a long-lived session can't slowly accumulate replan spend across many turns, and a "did the conductor start thrashing?" question is answerable with SQL instead of a log scrape. Five contract changes:
+
+1. New SQLite table `replan_events` in `SELF_TUNING_SCHEMA` (`server-jarvis/src/self-tuning/store.ts`) — `id`, `agent_run_id` (FK to `agent_runs`, ON DELETE CASCADE), `session_id`, `replan_index` (1, 2, 3, ... within the turn), `rationale` (truncated to 500 chars), `revised_pipeline` (JSON), `revised_worker_instructions_keys` (comma-separated, e.g. "executor,reviewer"), `segment_outcome` ("success" | "degraded" | "failed"), `capped` ("" | "per_turn" | "per_session"), `created_at`. Two indexes: `(session_id)` and `(agent_run_id)`. Mirrors the existing `trajectory_snapshots` storage pattern — same WSL self-tuning DB, same best-effort insert semantics, telemetry can never break a turn.
+2. New `ReplanEvent` type + `insertReplanEvent(ev)` + `getReplanEventsForSession(sid)` methods on `SelfTuningStore`. Insert errors are logged and swallowed; the store's `getDb()` already returns `null` on WSL-bridge I/O failures so a flaky DB degrades to "no telemetry" rather than "no turn".
+3. New `SessionReplanCounter` class in `server-jarvis/src/orchestration/replan-telemetry.ts` (175 lines) — an in-process `Map<sessionId, used>` keyed by session id, with `used(sid)`, `remaining(sid)`, `effectivePerTurnCap(sid, callerMax)` (returns `min(callerMax, maxPerSession)` so the per-turn cap stays clean), `record({...})` (increments + persists via the store), `clearSession(sid)` (called from the existing session-reset path), and `totalUsed()` (test diagnostic). Rationale text is truncated to 500 chars at write time. Worker-instruction keys are sorted and joined so the column is greppable. The counter is a pure in-process structure — no `await` in the hot path, no DB round-trip on the budget check itself.
+4. `replan-loop.ts` now accepts optional `sessionCounter` + `sessionId` on `ReplanLoopArgs`. The loop recomputes `perTurnCap = sessionCounter.effectivePerTurnCap(sessionId, args.maxReplans)` on every iteration; a separate `sessionCapHit` flag fires when the session's `remaining(sessionId) === 0` and tags the final `PipelineResult.error_code = "session_replan_cap_exceeded"`. The tag is only applied when the rest of the pipeline produced a real answer — a degenerate synthesizer answer (empty_completion, stage_error) keeps its own `error_code` so we don't double-tag or mask a real failure. After every successful re-invocation the loop calls `sessionCounter.record({...})` with the conductor's revised decision + rationale + a `segmentOutcomeFromCarry(segment.state)` classification. The `capped` tag at write time is "" for in-loop records and "per_turn" when the loop is about to terminate via per-turn exhaustion.
+5. `index.ts` constructs a process-wide `replanCounter` at module load (`new SessionReplanCounter({ maxPerSession: loadConfig().orchestrator.max_conductor_replans_per_session, store: new SelfTuningStore() })`) and threads it into the existing `runPipelineWithReplanning` call site alongside `sessionId`. The existing `POST /sessions/:sid/interaction` reset path now also calls `replanCounter.clearSession(sid)` so a user-initiated "new session" frees up the budget; the next turn with the same id starts from zero. **The B-02 per-turn cap and behavior are unchanged** — when no `sessionCounter` is supplied the loop falls back to the B-02 semantics exactly, so the existing 4 B-02 tests pass without modification.
+
+**6 new bun tests** (565 total, was 559): 4 in `orchestration/replan-loop.test.ts` under a new `B-04 session cap + telemetry` describe — `(1) replan events are recorded to the store with replan_index, rationale, revised_pipeline, session_id` (in-memory `SelfTuningStore(":memory:")`, pins the full row shape including `capped=""` and `segment_outcome="success"`); `(2) session-level cap is enforced independently of per-turn cap` (per-turn=5, session=2, replan-on-replan fixture, asserts `counter.used=2` and `error_code="session_replan_cap_exceeded"`); `(3) per-turn cap is preserved when session cap is generous` (per-turn=1, session=10, asserts `counter.used=1` and `error_code=undefined` — the loop terminates via per-turn exhaustion, no session tag); `(4) clearSession resets the counter and isolates sessions` (asserts `used=0` after `clearSession`, plus a second session's counter is untouched when the first is reset). 2 new tests in `config.test.ts` — `orchestrator.max_conductor_replans_per_session defaults to 6` and `normalizeConfig preserves an explicit max_conductor_replans_per_session`. 60 cargo tests pass, both tsc jobs clean.
 
 ---
 

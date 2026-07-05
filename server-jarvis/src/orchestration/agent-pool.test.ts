@@ -269,6 +269,79 @@ describe("AgentPool", () => {
   });
 });
 
+describe("pickFor synthesizer fast-prose preference (2026-07-03 incident)", () => {
+  // The live config had `zen-nemotron-ultra-free` (speed 0.55) as
+  // `default_for: ["planner", "synthesizer"]` — a slow reasoning model
+  // sitting on the user-visible answer stage. The synthesizer should prefer
+  // a fast candidate when one is available, without touching other stages.
+  const slowSynthDefault: OrchestratorAgent = {
+    id: "slow-synth-default",
+    provider: "opencode_zen",
+    model_id: "nemotron-3-ultra-free",
+    capabilities: { code: 0.8, reasoning: 0.95, speed: 0.55, cost: 1, json_reliability: 0.88 },
+    default_for: ["planner", "synthesizer"],
+    enabled: true,
+  };
+  const fastSynthCandidate: OrchestratorAgent = {
+    id: "fast-synth-candidate",
+    provider: "opencode_zen",
+    model_id: "deepseek-v4-flash-free",
+    capabilities: { code: 0.9, reasoning: 0.86, speed: 0.82, cost: 1, json_reliability: 0.9 },
+    default_for: [],
+    enabled: true,
+  };
+
+  test("picks the faster candidate for synthesizer when the default is slow (speed < 0.7)", () => {
+    const pool = new AgentPool([slowSynthDefault, fastSynthCandidate]);
+    const picked = pool.pickFor("synthesizer", "general");
+    expect(picked?.id).toBe("fast-synth-candidate");
+  });
+
+  test("keeps the original slow default when no candidate clears the speed >= 0.7 bar", () => {
+    const onlySlow = new AgentPool([slowSynthDefault]);
+    const picked = onlySlow.pickFor("synthesizer", "general");
+    expect(picked?.id).toBe("slow-synth-default");
+  });
+
+  test("does not affect other stages with a slow default (e.g. planner)", () => {
+    const pool = new AgentPool([slowSynthDefault, fastSynthCandidate]);
+    const picked = pool.pickFor("planner", "general");
+    expect(picked?.id).toBe("slow-synth-default");
+  });
+
+  test("leaves the slow model in the pool as a fallback/cascade candidate", () => {
+    const pool = new AgentPool([slowSynthDefault, fastSynthCandidate]);
+    const picked = pool.pickFor("synthesizer", "general")!;
+    const chain = pool.fallbackChain(picked, "synthesizer", "general");
+    expect(chain.map((a) => a.id)).toContain("slow-synth-default");
+  });
+
+  test("returns the slow default when the exclude set removes the only fast candidate", () => {
+    // Exclusion happens BEFORE the fast-prose demotion, so a fast candidate
+    // that just failed (rate limit / empty completion) is not re-selected —
+    // and with no fast candidate left, the slow default keeps the stage
+    // covered rather than leaving it empty.
+    const pool = new AgentPool([slowSynthDefault, fastSynthCandidate]);
+    const exclude = new Set<string>([
+      `${fastSynthCandidate.provider}:${fastSynthCandidate.model_id}`,
+    ]);
+    expect(pool.pickFor("synthesizer", "general", exclude)?.id).toBe("slow-synth-default");
+  });
+
+  test("does not demote the synthesizer default when it already clears speed >= 0.7", () => {
+    const fastDefault: OrchestratorAgent = {
+      id: "fast-synth-default",
+      provider: "opencode_zen",
+      model_id: "deepseek-v4-flash-free",
+      capabilities: { code: 0.9, reasoning: 0.86, speed: 0.82, cost: 1, json_reliability: 0.9 },
+      default_for: ["synthesizer"],
+      enabled: true,
+    };
+    const pool = new AgentPool([fastDefault, fastSynthCandidate]);
+    expect(pool.pickFor("synthesizer", "general")?.id).toBe("fast-synth-default");
+  });
+});
+
 describe("firstTokenTimeoutFor", () => {
   const poolAgents: OrchestratorAgent[] = [
     {
@@ -351,5 +424,105 @@ describe("firstTokenTimeoutFor", () => {
     // a zero/negative timeout, which would mean "abort immediately."
     expect(firstTokenTimeoutFor(pool, "openrouter/free", Number.NaN)).toBe(30_000);
     expect(firstTokenTimeoutFor(pool, "openrouter/free", -5)).toBe(1_000);
+  });
+
+  describe("DEFAULT pool fallback (2026-07-03 incident, session 1d4727cf)", () => {
+    // A custom config pool with 16 agents, none carrying
+    // `first_token_timeout_ms` for nemotron-3-ultra-free — this reproduces
+    // the live user config that caused the 30s abort on a model with a
+    // known 55s cold-start profile.
+    const customAgents: OrchestratorAgent[] = [
+      {
+        id: "custom-nemotron",
+        provider: "opencode_zen",
+        model_id: "nemotron-3-ultra-free",
+        capabilities: { code: 0.8, reasoning: 0.95, speed: 0.55, cost: 1, json_reliability: 0.88 },
+        default_for: ["synthesizer"],
+        // No first_token_timeout_ms — mirrors the live custom config.
+        enabled: true,
+      },
+      {
+        id: "custom-fast",
+        provider: "opencode_zen",
+        model_id: "deepseek-v4-flash-free",
+        capabilities: { code: 0.9, reasoning: 0.86, speed: 0.82, cost: 1, json_reliability: 0.9 },
+        default_for: ["coordinator"],
+        enabled: true,
+      },
+    ];
+    const customPool = new AgentPool(customAgents);
+
+    test("inherits the DEFAULT pool's override by model_id when the active pool omits it", () => {
+      // DEFAULT_ORCHESTRATOR_AGENTS carries first_token_timeout_ms: 55_000 for
+      // nemotron-3-ultra-free — the active (custom) pool doesn't set it, so
+      // the lookup must inherit it rather than fall through to baseMs.
+      expect(firstTokenTimeoutFor(customPool, "nemotron-3-ultra-free", 30_000)).toBe(55_000);
+    });
+
+    test("a model unknown to both pools still returns the passed default", () => {
+      expect(firstTokenTimeoutFor(customPool, "totally/unknown-model", 30_000)).toBe(30_000);
+    });
+
+    test("an explicit override in the active pool still wins over the DEFAULT pool's", () => {
+      const overridingAgents: OrchestratorAgent[] = [
+        {
+          id: "custom-nemotron-tuned",
+          provider: "opencode_zen",
+          model_id: "nemotron-3-ultra-free",
+          capabilities: { code: 0.8, reasoning: 0.95, speed: 0.55, cost: 1, json_reliability: 0.88 },
+          default_for: ["synthesizer"],
+          first_token_timeout_ms: 20_000,
+          enabled: true,
+        },
+      ];
+      const overridingPool = new AgentPool(overridingAgents);
+      expect(firstTokenTimeoutFor(overridingPool, "nemotron-3-ultra-free", 30_000)).toBe(20_000);
+    });
+
+    test("DEFAULT pool inheritance is still clamped to the supplied cap", () => {
+      expect(firstTokenTimeoutFor(customPool, "nemotron-3-ultra-free", 30_000, 40_000)).toBe(40_000);
+    });
+
+    test("a model disabled in the active pool (no enabled duplicate) does NOT inherit the DEFAULT override", () => {
+      // Disabling is an intentional "don't trust this model" signal — the
+      // DEFAULT pool's tuning must not silently resurrect it.
+      const disabledOnly = new AgentPool([
+        {
+          id: "custom-nemotron-off",
+          provider: "opencode_zen",
+          model_id: "nemotron-3-ultra-free",
+          capabilities: { code: 0.8, reasoning: 0.95, speed: 0.55, cost: 1, json_reliability: 0.88 },
+          default_for: [],
+          enabled: false,
+        },
+      ]);
+      expect(firstTokenTimeoutFor(disabledOnly, "nemotron-3-ultra-free", 30_000)).toBe(30_000);
+    });
+
+    test("a disabled duplicate model_id does not suppress inheritance for the enabled copy", () => {
+      // The pool is keyed by agent `id`, so the same model_id can appear
+      // once enabled (no override) and once disabled. The enabled copy is
+      // live, so DEFAULT-pool inheritance must still apply — a stale
+      // disabled duplicate must not resurrect the 30s-abort bug.
+      const duplicatePool = new AgentPool([
+        {
+          id: "custom-nemotron-on",
+          provider: "opencode_zen",
+          model_id: "nemotron-3-ultra-free",
+          capabilities: { code: 0.8, reasoning: 0.95, speed: 0.55, cost: 1, json_reliability: 0.88 },
+          default_for: ["synthesizer"],
+          enabled: true,
+        },
+        {
+          id: "custom-nemotron-off",
+          provider: "openrouter",
+          model_id: "nemotron-3-ultra-free",
+          capabilities: { code: 0.8, reasoning: 0.95, speed: 0.55, cost: 1, json_reliability: 0.88 },
+          default_for: [],
+          enabled: false,
+        },
+      ]);
+      expect(firstTokenTimeoutFor(duplicatePool, "nemotron-3-ultra-free", 30_000)).toBe(55_000);
+    });
   });
 });
