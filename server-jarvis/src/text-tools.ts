@@ -492,7 +492,16 @@ export function textToolResultsPrompt(results: ToolResult[]): string {
     ...results.map((result) => {
       const status = result.is_error ? "error" : "success";
       const body = result.is_error ? (result.error || result.output) : result.output;
-      return `Tool result (${status}) for ${result.name} [${result.call_id}]:\n${body}`;
+      // Wrap in the bounded <jarvis_internal_tool_result> tags so both the
+      // streaming sanitizer (SUPPRESSED_STREAM_TAGS) and the post-turn
+      // stripper (stripBoundedInternalToolResults) recognize and remove
+      // any verbatim echo the model might reproduce in its next response.
+      // Without this wrapper the line would render as a free-form
+      // `Tool result (status) for X [id]: body` that the legacy
+      // `[Tool Call Result (...)]` stripper does NOT match — same gap
+      // the 2026-07-05 fix closed for the orchestrator path, mirrored
+      // here for the text-tool / agent-loop path.
+      return `<jarvis_internal_tool_result name="${result.name}" call_id="${result.call_id ?? ""}" status="${status}">\nTool result (${status}) for ${result.name} [${result.call_id}]:\n${body}\n</jarvis_internal_tool_result>`;
     }),
   ].join("\n\n");
 }

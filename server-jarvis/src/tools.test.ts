@@ -46,6 +46,7 @@ describe("web tools", () => {
     expect(result.output).toContain("https://example.com/first");
 
     const continuation = textToolResultsPrompt([result]);
+    expect(continuation).toContain('<jarvis_internal_tool_result name="web_search"');
     expect(continuation).toContain("Tool result (success) for web_search");
     expect(continuation).toContain("A useful abstract.");
   });

@@ -3,12 +3,13 @@ import {
   extractTextToolCalls,
   createStageStreamSanitizer,
   hasExplicitWebSearchIntent,
+  textToolResultsPrompt,
   TextToolCallStreamSanitizer,
   VisibleAnswerStreamSanitizer,
   webSearchQueryFromPrompt,
 } from "./text-tools";
 import { toApiTools } from "./tool-runtime";
-import type { ToolDefinition } from "./tool-types";
+import type { ToolDefinition, ToolResult } from "./tool-types";
 
 const tools: ToolDefinition[] = [
   {
@@ -161,6 +162,73 @@ that must never become assistant prose
 Here is the actual answer.`;
 
     expect(extractTextToolCalls(echoed, []).cleanedText).toBe("Here is the actual answer.");
+  });
+
+  // ── 2026-07-05 follow-up: textToolResultsPrompt now wraps each result
+  // in the bounded <jarvis_internal_tool_result> tags (same wrap the
+  // orchestrator path uses via stage-output). The text-tool / agent-loop
+  // path's old free-form `Tool result (status) for X [id]: body` shape was
+  // NOT matched by the legacy `[Tool Call Result (...)]` stripper, so a
+  // model echoing that shape back into its next response could leak
+  // internal evidence. The wrap makes the existing bounded-tag stripper
+  // catch the transcript on both the streaming and post-turn paths.
+  test("textToolResultsPrompt wraps each result in bounded internal tags (text-tool gap, 2026-07-05 follow-up)", () => {
+    const result: ToolResult = {
+      call_id: "call_abc",
+      name: "read_file",
+      output: "file contents here",
+      is_error: false,
+      duration_ms: 12,
+    };
+    const prompt = textToolResultsPrompt([result]);
+    // Wrapped in the bounded tags so the streaming + post-turn strippers
+    // recognize it as private evidence.
+    expect(prompt).toContain('<jarvis_internal_tool_result name="read_file"');
+    expect(prompt).toContain('call_id="call_abc"');
+    expect(prompt).toContain('status="success"');
+    expect(prompt).toContain("</jarvis_internal_tool_result>");
+    // Inner transcript is still readable to the model.
+    expect(prompt).toContain("Tool result (success) for read_file [call_abc]");
+    expect(prompt).toContain("file contents here");
+  });
+
+  test("textToolResultsPrompt wraps error results with status=error and surfaces the error body", () => {
+    const result: ToolResult = {
+      call_id: "call_err",
+      name: "bash",
+      output: "",
+      error: "exit 1",
+      is_error: true,
+      error_code: "execution_error",
+      duration_ms: 5,
+    };
+    const prompt = textToolResultsPrompt([result]);
+    expect(prompt).toContain('<jarvis_internal_tool_result name="bash"');
+    expect(prompt).toContain('status="error"');
+    expect(prompt).toContain("Tool result (error) for bash [call_err]");
+    expect(prompt).toContain("exit 1");
+  });
+
+  test("post-turn stripper removes an echoed textToolResultsPrompt transcript (text-tool gap, regression)", () => {
+    // Simulate a model that quotes the tool-result user message back as part
+    // of its response. Before the 2026-07-05 follow-up, the inner
+    // `Tool result (success) for X [id]: body` line would survive the
+    // post-turn stripper because the legacy `[Tool Call Result (...)]` shape
+    // did not match it. After the wrap, the bounded tags catch it.
+    const result: ToolResult = {
+      call_id: "call_xyz",
+      name: "read_file",
+      output: '{"hello":"world"}',
+      is_error: false,
+      duration_ms: 1,
+    };
+    const echoed = `Here is what I read.\n\n${textToolResultsPrompt([result])}\n\nThe file is short.`;
+    const parsed = extractTextToolCalls(echoed, []);
+    expect(parsed.cleanedText).not.toContain("Tool result (success) for read_file");
+    expect(parsed.cleanedText).not.toContain("call_xyz");
+    expect(parsed.cleanedText).not.toContain("<jarvis_internal_tool_result");
+    expect(parsed.cleanedText).toContain("Here is what I read.");
+    expect(parsed.cleanedText).toContain("The file is short.");
   });
 
   test("strips an UNCLOSED tool_call tag on the same line as the JSON (2026-07-03 live leak)", () => {
@@ -415,6 +483,41 @@ describe("text tool stream sanitizer", () => {
 
     for (const chunks of chunkings) {
       expect(sanitizeVisibleAnswer(chunks)).toBe("");
+    }
+  });
+
+  test("never streams an echoed textToolResultsPrompt transcript under arbitrary chunking (text-tool gap, 2026-07-05 follow-up)", () => {
+    // Streaming regression: the wrap put on by textToolResultsPrompt now
+    // produces `<jarvis_internal_tool_result ...>Tool result (status) for X [id]: body</jarvis_internal_tool_result>`.
+    // If the model echoes that wrap back into its next response, the
+    // streaming layer must drop the entire bounded block on every
+    // chunking — the bounded-tag handling already covers this via
+    // SUPPRESSED_STREAM_TAGS, but pin the contract with a real wrapped
+    // payload so a future regression that drops the wrap re-surfaces
+    // immediately.
+    const result = {
+      call_id: "call_stream",
+      name: "read_file",
+      output: '{"hello":"world"}',
+      is_error: false,
+      duration_ms: 1,
+    };
+    const wrapped = textToolResultsPrompt([result]);
+    const full = `Here is the read.\n\n${wrapped}\n\nThat's the answer.`;
+    const chunkings = [
+      [full],
+      [...full],
+      full.match(/\S+|\s+/g) ?? [],
+      Array.from({ length: Math.ceil(full.length / 5) }, (_, index) => full.slice(index * 5, index * 5 + 5)),
+    ];
+
+    for (const chunks of chunkings) {
+      const visible = sanitizeVisibleAnswer(chunks);
+      expect(visible).not.toContain("Tool result (success) for read_file");
+      expect(visible).not.toContain("call_stream");
+      expect(visible).not.toContain("<jarvis_internal_tool_result");
+      expect(visible).toContain("Here is the read.");
+      expect(visible).toContain("That's the answer.");
     }
   });
 
