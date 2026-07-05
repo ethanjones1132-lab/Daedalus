@@ -498,15 +498,24 @@ export class PersistentConductor {
   }
 
   private pruneSessionMessages(session: ConductorSessionState): void {
-    const maxTurns = Math.max(1, this.config().max_turns_in_cache);
+    const config = this.config();
+    const maxTurns = Math.max(1, config.max_turns_in_cache);
     const system = session.messages.find((m) => m.role === "system");
     const nonSystem = session.messages.filter((m) => m.role !== "system");
 
     // Each turn is a user + assistant pair.
     const maxMessages = maxTurns * 2;
-    if (nonSystem.length <= maxMessages) return;
+    let kept = nonSystem.length > maxMessages
+      ? nonSystem.slice(nonSystem.length - maxMessages)
+      : nonSystem;
 
-    const kept = nonSystem.slice(nonSystem.length - maxMessages);
+    // Keep the reusable non-system prefix within half of the conductor context
+    // window. Drop whole oldest turn pairs so role ordering stays valid.
+    const tokenBudget = Math.floor(config.num_ctx * 0.5);
+    while (kept.length > 0 && estimateMessageTokens(kept) > tokenBudget) {
+      kept = kept.slice(Math.min(2, kept.length));
+    }
+
     session.messages = system ? [system, ...kept] : kept;
   }
 

@@ -248,6 +248,31 @@ describe("PersistentConductor", () => {
     expect(nonSystem).toHaveLength(2);
   });
 
+  test("prunes oldest turn pairs to the conductor token budget while keeping system", async () => {
+    mockOllamaChat([
+      '{"task_type":"general","pipeline":["synthesizer"],"topology":"linear","context":{"needs_workspace_inspection":false,"needs_memory":true,"estimated_complexity":"low"},"coordinator_rationale":"t1"}',
+      '{"task_type":"general","pipeline":["synthesizer"],"topology":"linear","context":{"needs_workspace_inspection":false,"needs_memory":true,"estimated_complexity":"low"},"coordinator_rationale":"t2"}',
+      '{"task_type":"general","pipeline":["synthesizer"],"topology":"linear","context":{"needs_workspace_inspection":false,"needs_memory":true,"estimated_complexity":"low"},"coordinator_rationale":"t3"}',
+    ]);
+    const cfg = makeConfig({ persist_sessions: false, max_turns_in_cache: 10, num_ctx: 1_200 });
+    const conductor = new PersistentConductor(() => cfg);
+
+    for (let turn = 1; turn <= 3; turn++) {
+      await conductor.routeTurn({
+        sessionId: "token-prune-sess",
+        request: `request-${turn} ${"x".repeat(800)}`,
+        turnNumber: turn,
+      });
+    }
+
+    const state = conductor.getSessionState("token-prune-sess");
+    expect(state?.messages[0]?.role).toBe("system");
+    const nonSystem = state!.messages.filter((message) => message.role !== "system");
+    expect(nonSystem.length).toBeLessThan(6);
+    expect(nonSystem.some((message) => message.content.includes("request-1"))).toBe(false);
+    expect(nonSystem.some((message) => message.content.includes("request-3"))).toBe(true);
+  });
+
   test("achieves >80% prefix reuse across a 3-turn session (Track A-02 acceptance)", async () => {
     // A-02 acceptance: metrics show >80% prefix reuse on 3-turn sessions.
     // Concretely: turn 1 is a cold prefix (no system, no prior turns), so its

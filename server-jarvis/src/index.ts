@@ -97,6 +97,7 @@ import {
 import { isContinuationTurn } from "./orchestration/turn-triage";
 import { normalizeRoute, type ExecutionProfile } from "./orchestration/route-normalization";
 import { runPipelineWithReplanning } from "./orchestration/replan-loop";
+import { buildBoundedHistoryBlock } from "./orchestration/context-budget";
 import { SessionReplanCounter } from "./orchestration/replan-telemetry";
 import { conductorLearning, outcomeCollector, selfTuningProposer, SelfTuningStore } from "./self-tuning/mod";
 import { conductorCacheSnapshot } from "./orchestration/conductor-metrics";
@@ -1328,10 +1329,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // Setup context message using turn history if present
         let contextMessage = message;
         if (turnHistory.length > 0) {
-          const formattedHistory = turnHistory
-            .map((m: any) => `[${m.role.toUpperCase()}]: ${m.content.slice(0, 1000)}${m.content.length > 1000 ? "..." : ""}`)
-            .join("\n");
-          contextMessage = `Conversation History:\n${formattedHistory}\n\nLatest User Request: ${message}`;
+          contextMessage = `Conversation History:\n${buildBoundedHistoryBlock(turnHistory)}\n\nLatest User Request: ${message}`;
         }
 
         let orchestratorTaskType = "general";
