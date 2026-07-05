@@ -15,6 +15,7 @@ import { splitPipelineAtReplan, buildReplanRequest } from "./replan";
 import type { PipelineStageState } from "./stage-output";
 import type { SessionReplanCounter, ReplanCapKind } from "./replan-telemetry";
 import { segmentOutcomeFromCarry } from "./replan-telemetry";
+import { applyEffectGate, evaluateEffectGate } from "./effect-gate";
 
 /**
  * A stage counts as "completed" once its carry-state slot is populated by an
@@ -206,11 +207,20 @@ function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean)
   );
 
   if (segment.synthesizerAnswer === undefined) {
+    const gated = applyEffectGate(
+      upstreamDegraded ? "degraded" : "success",
+      upstreamDegraded ? "upstream_stage_failed" : undefined,
+      segment.effectGate ?? evaluateEffectGate({
+        profile: "full",
+        executor: segment.state.executor,
+        rewriter: segment.state.rewriter,
+      }),
+    );
     return {
       answer: segment.state.plan ? segment.state.plan.narrative : "No planning stage executed.",
       recursion_depth: 0,
-      outcome: upstreamDegraded ? "degraded" : "success",
-      error_code: upstreamDegraded ? "upstream_stage_failed" : undefined,
+      outcome: gated.outcome,
+      error_code: gated.errorCode,
     };
   }
 
@@ -228,6 +238,16 @@ function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean)
   } else {
     outcome = "success";
   }
+
+  ({ outcome, errorCode } = applyEffectGate(
+    outcome,
+    errorCode,
+    segment.effectGate ?? evaluateEffectGate({
+      profile: "full",
+      executor: segment.state.executor,
+      rewriter: segment.state.rewriter,
+    }),
+  ));
 
   // B-04: a session-cap exhaustion is a soft signal, not a stage failure.
   // It only adds the `session_replan_cap_exceeded` tag if the rest of the

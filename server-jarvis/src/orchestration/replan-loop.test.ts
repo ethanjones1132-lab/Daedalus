@@ -27,6 +27,60 @@ function baseDecision(overrides: Partial<CoordinatorResult> = {}): CoordinatorRe
 }
 
 describe("runPipelineWithReplanning", () => {
+  test("final segment with a failed executor call is degraded by the effect gate", async () => {
+    const failingRuntime = createToolRuntime();
+    failingRuntime.register({
+      type: "function",
+      function: {
+        name: "boom",
+        description: "deliberately fail",
+        parameters: { type: "object", properties: {}, required: [] },
+      },
+      requires_approval: false,
+      dangerous: false,
+    }, async () => {
+      throw new Error("write failed");
+    });
+    const failingCtx = makeExecutionContext("agent", defaultConfig(), {
+      session_id: "effect-gate-replan",
+      workspace_path: process.cwd(),
+    });
+    let executorTurns = 0;
+    const callModel = async (_messages: any[], options?: any) => {
+      if (options?.stageLabel === "executor" && executorTurns++ === 0) {
+        return {
+          content: "trying",
+          tool_calls: [{
+            id: "call_boom",
+            type: "function",
+            function: { name: "boom", arguments: "{}" },
+          }],
+        };
+      }
+      if (options?.stageLabel === "reviewer") return { content: "ACCEPT" };
+      if (options?.stageLabel === "synthesizer") return { content: "The write failed." };
+      return { content: "done" };
+    };
+    const executor = new PipelineExecutor(callModel as any, failingRuntime, failingCtx, testCollector);
+    const coordinator = new Coordinator((async () => ({ content: "unused" })) as any);
+
+    const result = await runPipelineWithReplanning({
+      contextMessage: "change the target",
+      initialDecision: baseDecision({ pipeline: ["executor", "reviewer", "synthesizer"] }),
+      turnRequirement: "full_execution",
+      coordinator,
+      routeOptions: { sessionId: "effect-gate-replan" },
+      executor,
+      agentRunId: "run-effect-gate-replan",
+      onStateChange: () => {},
+      baseOptions: {},
+      maxReplans: 0,
+    });
+
+    expect(result.outcome).toBe("degraded");
+    expect(result.error_code).toBe("effect_gate_tool_failures");
+  });
+
   test("runs the first segment, re-invokes the conductor, then finishes with the revised route", async () => {
     const stageLabels: string[] = [];
     const callModel = async (_messages: any[], options?: any) => {
@@ -69,7 +123,10 @@ describe("runPipelineWithReplanning", () => {
     expect(stageLabels).toEqual(["executor", "reviewer", "synthesizer"]);
     expect(stateEvents).toContain("conductor_replan:running");
     expect(stateEvents).toContain("conductor_replan:done");
-    expect(result.outcome).toBe("success");
+    // Deliberate effect-gate inversion: this full-execution fixture never
+    // produces a successful write, so a polished answer is still degraded.
+    expect(result.outcome).toBe("degraded");
+    expect(result.error_code).toBe("effect_gate_no_write_effect");
     expect(result.answer).toBe("output for synthesizer");
   });
 
@@ -113,7 +170,8 @@ describe("runPipelineWithReplanning", () => {
     // inferring staleness, bounded by maxReplans so the worst case is a few
     // extra model calls, never incorrect output.
     expect(stageLabels).toEqual(["executor", "executor", "reviewer", "synthesizer"]);
-    expect(result.outcome).toBe("success");
+    expect(result.outcome).toBe("degraded");
+    expect(result.error_code).toBe("effect_gate_no_write_effect");
   });
 
   test("deliberately re-requested executor runs again even though carry already has its output", async () => {
@@ -157,7 +215,8 @@ describe("runPipelineWithReplanning", () => {
     expect(coordinatorCalls).toBe(1);
     expect(stageLabels).toEqual(["executor", "executor", "reviewer", "synthesizer"]);
     expect(stageLabels.filter((s) => s === "executor")).toHaveLength(2);
-    expect(result.outcome).toBe("success");
+    expect(result.outcome).toBe("degraded");
+    expect(result.error_code).toBe("effect_gate_no_write_effect");
   });
 
   test("read_only profile cannot escalate to full even if the replanned decision implies more authority", async () => {
@@ -277,8 +336,9 @@ describe("runPipelineWithReplanning — B-04 session cap + telemetry", () => {
     });
 
     expect(counter.used("b04-s2")).toBe(2);
-    expect(result.outcome).toBe("success"); // graceful degradation, not failed
-    expect(result.error_code).toBe("session_replan_cap_exceeded");
+    expect(result.outcome).toBe("degraded"); // graceful degradation, not failed
+    // A real missing-effect failure outranks the softer session-cap tag.
+    expect(result.error_code).toBe("effect_gate_no_write_effect");
   });
 
   test("B-04: per-turn cap is preserved when session cap is generous (binding constraint = per_turn)", async () => {
@@ -310,8 +370,8 @@ describe("runPipelineWithReplanning — B-04 session cap + telemetry", () => {
     });
 
     expect(counter.used("b04-s3")).toBe(1);
-    expect(result.outcome).toBe("success");
-    expect(result.error_code).toBeUndefined();
+    expect(result.outcome).toBe("degraded");
+    expect(result.error_code).toBe("effect_gate_no_write_effect");
   });
 
   test("B-04: clearSession resets the counter so a fresh session can replan again", async () => {

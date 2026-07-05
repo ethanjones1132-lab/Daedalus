@@ -31,7 +31,11 @@ function isMeaningful(value: string): boolean {
   return value.length > 0 && !SKIP_SENTINELS.has(value);
 }
 
-export function buildSynthesizerContext(request: string, parts: SynthesizerParts): string {
+export function buildSynthesizerContext(
+  request: string,
+  parts: SynthesizerParts,
+  executionVerification = "",
+): string {
   const sections: string[] = [`User Request: ${request}`];
 
   const plan = clean(parts.plan);
@@ -43,6 +47,7 @@ export function buildSynthesizerContext(request: string, parts: SynthesizerParts
   if (isMeaningful(executor)) sections.push(`Executor Activity:\n${executor}`);
   if (isMeaningful(review)) sections.push(`Reviewer Feedback:\n${review}`);
   if (isMeaningful(rewrite)) sections.push(`Rewriter Activity:\n${rewrite}`);
+  if (isMeaningful(clean(executionVerification))) sections.push(clean(executionVerification));
 
   return sections.join("\n\n");
 }
@@ -52,11 +57,15 @@ export function buildSynthesizerContext(request: string, parts: SynthesizerParts
  * typed output through stage-output.ts and delegates to the existing
  * string-based builder so the `SKIP_SENTINELS` filtering stays in one place.
  */
-export function buildSynthesizerContextFromStageState(request: string, state: PipelineStageState): string {
+export function buildSynthesizerContextFromStageState(
+  request: string,
+  state: PipelineStageState,
+  executionVerification = "",
+): string {
   return buildSynthesizerContext(request, {
     plan: renderPlanSummary(state.plan),
     executorSummary: renderExecutorSummary(state.executor),
     reviewerFeedback: renderReviewerSummary(state.reviewer),
     rewriterSummary: renderRewriterSummary(state.rewriter),
-  });
+  }, executionVerification);
 }

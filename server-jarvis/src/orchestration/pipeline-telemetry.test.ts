@@ -99,4 +99,35 @@ describe("pipeline stage telemetry", () => {
     expect(failedTurn?.had_error).toBe(1);
     expect(failedTurn?.error_message).toContain("boom: rewriter tool failure");
   });
+
+  test("a failed executor tool degrades the result and tells the synthesizer", async () => {
+    const { runtime, ctx, collector } = telemetryHarness("boom", async () => {
+      throw new Error("cannot write target");
+    });
+    let executorTurns = 0;
+    let synthesizerInput = "";
+    const callModel = async (messages: Array<{ role: string; content: string }>, options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor" && executorTurns++ === 0) {
+        return { content: "trying", tool_calls: [toolCall("boom")] };
+      }
+      if (options.stageLabel === "synthesizer") {
+        synthesizerInput = messages.find((message) => message.role === "user")?.content ?? "";
+        return { content: "The write failed." };
+      }
+      return { content: "done" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "change the target",
+      ["executor", "synthesizer"],
+      "run-effect-gate",
+      () => {},
+      { executionProfile: "full" },
+    );
+
+    expect(result.outcome).toBe("degraded");
+    expect(result.error_code).toStartWith("effect_gate_");
+    expect(synthesizerInput).toContain("Execution Verification");
+  });
 });

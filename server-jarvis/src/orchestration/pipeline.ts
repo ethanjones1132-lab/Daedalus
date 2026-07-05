@@ -10,6 +10,7 @@ import { outcomeCollector } from "../self-tuning/mod";
 import type { StageRun } from "../self-tuning/store";
 import { countTokens } from "../tokens";
 import { buildSynthesizerContext, buildSynthesizerContextFromStageState } from "./synth-context";
+import { applyEffectGate, evaluateEffectGate, type EffectGateReport } from "./effect-gate";
 import type { ExecutionProfile } from "./route-normalization";
 import type { PipelineStageState, PlannerStageOutput, ExecutorStageOutput, ReviewerStageOutput, RewriterStageOutput, ToolCallRecord } from "./stage-output";
 import { parseReviewerVerdict, renderExecutorSummary, renderPlanSummary, renderReviewerSummary, renderRewriterSummary } from "./stage-output";
@@ -144,6 +145,7 @@ export interface PipelineSegmentResult {
   synthesizerAnswer?: string;
   synthesizerFatalError?: string;
   synthesizerEmptyCompletion?: boolean;
+  effectGate?: EffectGateReport;
 }
 
 /**
@@ -190,13 +192,6 @@ export function describePipelineError(raw: string): string {
     return `The answering model stalled before responding, so I aborted it. Try again — the router will pick a different model. (${msg})`;
   }
   return msg;
-}
-
-export interface PipelineSegmentResult {
-  state: PipelineStageState;
-  synthesizerAnswer?: string;
-  synthesizerFatalError?: string;
-  synthesizerEmptyCompletion?: boolean;
 }
 
 function stageSystemPrompt(
@@ -658,11 +653,12 @@ export class PipelineExecutor {
     agentRunId: string,
     onStateChange: (state: PipelineProgressState) => void,
     options: PipelineExecuteOptions,
+    executionVerification = "",
   ): Promise<{ answer: string; fatalError?: string; emptyCompletion: boolean }> {
     onStateChange({ stage: "synthesizer", status: "running" });
     const synthesizerPrompt = stageSystemPrompt("synthesizer", options);
     const synthStartTime = Date.now();
-    const contextText = buildSynthesizerContextFromStageState(request, state);
+    const contextText = buildSynthesizerContextFromStageState(request, state, executionVerification);
     try {
       const resp = await this.callModel([
         { role: "system", content: synthesizerPrompt },
@@ -781,16 +777,30 @@ export class PipelineExecutor {
       if (rewriter) state.rewriter = rewriter;
     }
 
+    const effectGate = evaluateEffectGate({
+      profile,
+      executor: state.executor,
+      rewriter: state.rewriter,
+    });
+
     if (!stages.includes("synthesizer")) {
-      return { state };
+      return { state, effectGate };
     }
 
-    const synth = await this.runSynthesizerStage(request, state, agentRunId, onStateChange, options);
+    const synth = await this.runSynthesizerStage(
+      request,
+      state,
+      agentRunId,
+      onStateChange,
+      options,
+      effectGate.synthesizerNotice,
+    );
     return {
       state,
       synthesizerAnswer: synth.answer,
       synthesizerFatalError: synth.fatalError,
       synthesizerEmptyCompletion: synth.emptyCompletion,
+      effectGate,
     };
   }
 
@@ -824,12 +834,21 @@ export class PipelineExecutor {
     );
 
     if (segment.synthesizerAnswer === undefined) {
+      const gated = applyEffectGate(
+        upstreamDegraded ? "degraded" : "success",
+        upstreamDegraded ? "upstream_stage_failed" : undefined,
+        segment.effectGate ?? evaluateEffectGate({
+          profile: options.executionProfile ?? "full",
+          executor: state.executor,
+          rewriter: state.rewriter,
+        }),
+      );
       // No synthesizer in this pipeline: fall back to the last completed phase.
       return {
         answer: state.plan ? renderPlanSummary(state.plan) : "No planning stage executed.",
         recursion_depth: 0,
-        outcome: upstreamDegraded ? "degraded" : "success",
-        error_code: upstreamDegraded ? "upstream_stage_failed" : undefined,
+        outcome: gated.outcome,
+        error_code: gated.errorCode,
       };
     }
 
@@ -847,6 +866,16 @@ export class PipelineExecutor {
     } else {
       outcome = "success";
     }
+
+    ({ outcome, errorCode } = applyEffectGate(
+      outcome,
+      errorCode,
+      segment.effectGate ?? evaluateEffectGate({
+        profile: options.executionProfile ?? "full",
+        executor: state.executor,
+        rewriter: state.rewriter,
+      }),
+    ));
 
     const result: PipelineResult = {
       answer: segment.synthesizerEmptyCompletion ? "" : segment.synthesizerAnswer,
