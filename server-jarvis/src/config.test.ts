@@ -3,9 +3,14 @@ import { join } from "path";
 import { homedir } from "os";
 import {
   defaultConfig,
+  InvalidConfigError,
+  invalidateConfigCache,
   isInvalidWorkspacePath,
+  loadConfig,
   normalizeConfig,
   resolveAgentsRoot,
+  saveConfig,
+  saveConfigWithValidation,
   validateAgentsRootPath,
 } from "./config";
 
@@ -305,5 +310,130 @@ describe("orchestrator agent pool config", () => {
       },
     });
     expect(cfg.orchestrator.agents.map((agent) => agent.id)).toEqual(["custom-agent"]);
+  });
+});
+
+// ─── P1-N: saveConfig validate-before-write ───────────────────────────────────
+// Regression: `POST /config` used to write the partial blindly via `saveConfig`
+// with no pre-write validation. A blanked `openrouter.api_key` would persist
+// to disk, the next `streamJarvis` call would build `fetch("")` and fail with
+// "URL is invalid", and the user would see chat as completely dead. The fix
+// wires `validateConfig` into `saveConfig` and returns a 400 from the route.
+//
+// Notes on the validation gate:
+// - The existing `deepMerge` blank-field protection means an empty-string
+//   `api_key` partial does NOT actually blank the persisted key (it preserves
+//   the existing non-empty default).
+// - A persisted `active_backend` that already matches the partial is a no-op
+//   for that field and so cannot trip the per-backend validation.
+// - The reliable way to exercise the new gate is to set a non-empty
+//   value that is still too short for the active backend's validation rule
+//   (e.g. openrouter.api_key with < 10 chars while active_backend is
+//   "openrouter"). This is exactly the kind of bad partial the route is
+//   meant to reject.
+describe("saveConfig validate-before-write (P1-N)", () => {
+  // The single test in cron-run.test.ts writes system_prompt (a free-form
+  // string with no validation). That must continue to work — we never want
+  // the in-tree audit/cron path to trip the new validation gate.
+  test("saveConfig accepts a free-form system_prompt patch without validation errors", () => {
+    const before = defaultConfig();
+    const saved = saveConfig({ system_prompt: `${before.system_prompt}\n# p1n-acceptance` });
+    expect(saved.system_prompt).toContain("# p1n-acceptance");
+    // restore
+    saveConfig({ system_prompt: before.system_prompt });
+  });
+
+  test("saveConfig throws InvalidConfigError when the active backend's required field is invalid", () => {
+    // The persisted config at ~/.openclaw/jarvis/config.json is the
+    // baseline — tests must snapshot it and restore it, because the
+    // validation gate is meant to prevent persisting broken configs and
+    // we want a clean rollback path. The on-disk `openrouter.api_key` is
+    // whatever the operator last set (often a real key, sometimes "").
+    // We use `loadConfig()` so the test is independent of the in-code
+    // defaults.
+    const before = loadConfig();
+    const originalKey = before.openrouter.api_key;
+    const originalBackend = before.active_backend;
+    try {
+      expect(() =>
+        saveConfig({ active_backend: "openrouter", openrouter: { api_key: "x" } }),
+      ).toThrow(InvalidConfigError);
+      try {
+        saveConfig({ active_backend: "openrouter", openrouter: { api_key: "x" } });
+      } catch (err) {
+        expect(err).toBeInstanceOf(InvalidConfigError);
+        const ice = err as InvalidConfigError;
+        expect(ice.validation.valid).toBe(false);
+        expect(ice.validation.errors.some((e) => e.toLowerCase().includes("openrouter"))).toBe(true);
+      }
+    } finally {
+      // restore: use the on-disk snapshot, bypass validation so the
+      // restore never itself trips the gate (e.g. if originalKey was
+      // empty, the gate would reject the restore).
+      invalidateConfigCache();
+      saveConfig(
+        { active_backend: originalBackend, openrouter: { api_key: originalKey } },
+        { validate: false },
+      );
+      invalidateConfigCache();
+    }
+  });
+
+  test("saveConfig with validate:false persists despite validation errors (migration escape hatch)", () => {
+    const before = loadConfig();
+    const originalKey = before.openrouter.api_key;
+    const originalBackend = before.active_backend;
+    try {
+      const saved = saveConfig(
+        { active_backend: "openrouter", openrouter: { api_key: "x" } },
+        { validate: false },
+      );
+      expect(saved.openrouter.api_key).toBe("x");
+    } finally {
+      invalidateConfigCache();
+      saveConfig(
+        { active_backend: originalBackend, openrouter: { api_key: originalKey } },
+        { validate: false },
+      );
+      invalidateConfigCache();
+    }
+  });
+
+  test("saveConfigWithValidation returns the validation object on success (with warnings)", () => {
+    const before = loadConfig();
+    const originalTemp = before.temperature;
+    try {
+      const result = saveConfigWithValidation({ temperature: 5.0 });
+      expect(result.validation.valid).toBe(true);
+      expect(result.validation.warnings.some((w) => w.includes("Temperature"))).toBe(true);
+    } finally {
+      invalidateConfigCache();
+      saveConfig({ temperature: originalTemp });
+      invalidateConfigCache();
+    }
+  });
+
+  test("saveConfigWithValidation surfaces InvalidConfigError carrying the validation object on failure", () => {
+    const before = loadConfig();
+    const originalKey = before.openrouter.api_key;
+    const originalBackend = before.active_backend;
+    try {
+      expect(() =>
+        saveConfigWithValidation({ active_backend: "openrouter", openrouter: { api_key: "x" } }),
+      ).toThrow(InvalidConfigError);
+      try {
+        saveConfigWithValidation({ active_backend: "openrouter", openrouter: { api_key: "x" } });
+      } catch (err) {
+        const ice = err as InvalidConfigError;
+        expect(ice.validation.errors.length).toBeGreaterThan(0);
+      }
+    } finally {
+      invalidateConfigCache();
+      saveConfig(
+        { active_backend: originalBackend, openrouter: { api_key: originalKey } },
+        { validate: false },
+      );
+      invalidateConfigCache();
+    }
   });
 });

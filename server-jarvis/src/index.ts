@@ -12,7 +12,7 @@ import { readdirSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 
 import { join } from "path";
 import { homedir } from "os";
 import { spawn, execSync } from "child_process";
-import { loadConfig, saveConfig, normalizeConfig, CONFIG_DIR, COMPANION_FILE, surfaceTemperature } from "./config";
+import { loadConfig, saveConfig, saveConfigWithValidation, normalizeConfig, InvalidConfigError, CONFIG_DIR, COMPANION_FILE, surfaceTemperature } from "./config";
 import type { JarvisConfig, OllamaConfig, SurfaceType } from "./config";
 import { Database } from "bun:sqlite";
 import { buildLearningPrompt, buildReviewPrompt, buildCodebaseAuditPrompt, buildFootballAuditPrompt } from "./cron-prompts";
@@ -3519,8 +3519,24 @@ async function baseFetch(req: Request): Promise<Response> {
     if (path === "/config" && req.method === "GET") return Response.json(loadConfig());
     if (path === "/config" && req.method === "POST") {
       const body = await req.json().catch(() => ({}));
-      const saved = saveConfig(body);
-      return Response.json({ ok: true, config: saved });
+      // P1-N: validate before write. A partial config that omits the
+      // active backend's required fields (e.g. a blanked openrouter.api_key)
+      // is rejected with a structured 400 so the Control Center can surface
+      // the error rather than silently persisting a config that breaks
+      // chat on the next turn.
+      try {
+        const { config, validation } = saveConfigWithValidation(body);
+        return Response.json({ ok: true, config, validation });
+      } catch (err) {
+        if (err instanceof InvalidConfigError) {
+          console.warn(`[Jarvis] Rejected invalid config save: ${err.validation.errors.join("; ")}`);
+          return Response.json(
+            { ok: false, error: err.message, validation: err.validation },
+            { status: 400 },
+          );
+        }
+        throw err;
+      }
     }
     if (path === "/cron/run" && req.method === "POST") {
       const body = await req.json().catch(() => ({}));

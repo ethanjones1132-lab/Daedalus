@@ -643,15 +643,76 @@ export function invalidateConfigCache(): void {
   configCacheTime = 0;
 }
 
-/** Merge partial updates into the on-disk config (canonical Bun write path). */
-export function saveConfig(partial: Partial<JarvisConfig>): JarvisConfig {
+/**
+ * Merge partial updates into the on-disk config (canonical Bun write path).
+ *
+ * P1-N (live-issues priority plan): validate before write. `validateConfig`
+ * is run on the normalized merge; if it surfaces `errors`, this function
+ * throws an `InvalidConfigError` carrying the full list — the on-disk
+ * config is NOT touched in that case. Warnings (e.g. `temperature` outside
+ * the 0-2 range) are logged. Use `saveConfigWithValidation` when the
+ * caller wants the warnings returned in the response (e.g. the
+ * `POST /config` HTTP route).
+ */
+export class InvalidConfigError extends Error {
+  readonly validation: ConfigValidation;
+  constructor(validation: ConfigValidation) {
+    super(
+      `Refusing to save invalid Jarvis config: ${validation.errors.join("; ")}`,
+    );
+    this.name = "InvalidConfigError";
+    this.validation = validation;
+  }
+}
+
+export interface SaveConfigOptions {
+  /**
+   * If true (default), `saveConfig` runs `validateConfig` on the normalized
+   * result and throws `InvalidConfigError` when there are validation errors.
+   * Set to false only for tests or migration paths that must persist
+   * intermediate partial state.
+   */
+  validate?: boolean;
+}
+
+export interface SaveConfigResult {
+  config: JarvisConfig;
+  validation: ConfigValidation;
+}
+
+export function saveConfig(
+  partial: Partial<JarvisConfig>,
+  options: SaveConfigOptions = {},
+): JarvisConfig {
+  const validate = options.validate !== false;
   const current = loadConfig();
   const merged = normalizeConfig(deepMerge(current, partial));
+  const validation = validateConfig(merged);
+  for (const warning of validation.warnings) {
+    console.warn(`[Config] saveConfig warning: ${warning}`);
+  }
+  if (validate && !validation.valid) {
+    throw new InvalidConfigError(validation);
+  }
   mkdirSync(CONFIG_DIR, { recursive: true });
   writeFileSync(CONFIG_FILE, JSON.stringify(merged, null, 2), "utf-8");
   configCache = merged;
   configCacheTime = Date.now();
   return merged;
+}
+
+/**
+ * Variant of `saveConfig` that returns the `ConfigValidation` alongside the
+ * saved config. Use this from the `POST /config` HTTP route so the response
+ * can surface warnings (and the `InvalidConfigError` can be caught at the
+ * route boundary and rendered as a 400 with the errors list).
+ */
+export function saveConfigWithValidation(
+  partial: Partial<JarvisConfig>,
+  options: SaveConfigOptions = {},
+): SaveConfigResult {
+  const config = saveConfig(partial, options);
+  return { config, validation: validateConfig(config) };
 }
 
 // ── Helpers ──
