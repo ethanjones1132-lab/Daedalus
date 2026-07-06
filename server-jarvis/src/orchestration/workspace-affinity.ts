@@ -49,7 +49,17 @@ export function findExistingWorkspacePath(message: string): string | undefined {
   return undefined;
 }
 
-/** Bounded per-session root selection, recoverable from recent user history. */
+/**
+ * Bounded per-session root selection, recoverable from recent user history.
+ *
+ * Eviction policy: the store caps at `maxSessions` (default 256). When a new
+ * session is inserted past the cap, the OLDEST entry (insertion-ordered) is
+ * evicted. Re-resolving an existing session (no explicit path in the message)
+ * PROMOTES that session to the back of the eviction order, so the effective
+ * policy is LRU-on-touch. This keeps a busy long-running server from
+ * thrashing a few long-lived sessions out of the cache while a flood of
+ * short-lived sessions cycles through.
+ */
 export class WorkspaceAffinityStore {
   private readonly roots = new Map<string, string>();
 

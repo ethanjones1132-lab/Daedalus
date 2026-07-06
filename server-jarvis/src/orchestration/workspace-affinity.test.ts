@@ -58,4 +58,36 @@ describe("workspace affinity", () => {
 
     expect(store.resolve("session-1", "continue", [], "C:\\fallback")).toBe("C:\\fallback");
   });
+
+  test("evicts the oldest session affinity once maxSessions is exceeded", () => {
+    // Regression guard: WorkspaceAffinityStore caps at `maxSessions` and
+    // evicts the OLDEST entry (insertion-ordered) when a new one is inserted
+    // past the cap. Re-resolving an existing session PROMOTES it to the back
+    // of the eviction order (LRU-on-touch — see the doc comment on
+    // WorkspaceAffinityStore). A future refactor that switched to
+    // LRU-on-write or kept all sessions would change observable behavior
+    // in production; pin both contracts here.
+    const rootA = tempWorkspace();
+    const rootB = tempWorkspace();
+    const rootC = tempWorkspace();
+    const store = new WorkspaceAffinityStore(2);
+
+    store.resolve("session-A", `Use "${rootA}"`, [], "C:\\fallback");
+    store.resolve("session-B", `Use "${rootB}"`, [], "C:\\fallback");
+    store.resolve("session-C", `Use "${rootC}"`, [], "C:\\fallback");
+
+    // At this point: cap=2, map = {session-B, session-C}; session-A was the
+    // first-inserted and got evicted when session-C pushed the count past
+    // the cap. Re-resolving session-A with an explicit path lands it back
+    // in the map (and evicts the now-oldest entry, session-B).
+    const freshA = tempWorkspace();
+    expect(store.resolve("session-A", `Now use "${freshA}"`, [], "C:\\fallback")).toBe(freshA);
+
+    // session-B was evicted to make room for the re-inserted session-A.
+    // Re-resolving session-B with no explicit path and no history must
+    // fall back to the fallback root.
+    expect(store.resolve("session-B", "continue", [], "C:\\fallback")).toBe("C:\\fallback");
+    // session-C is still in the cap.
+    expect(store.resolve("session-C", "continue", [], "C:\\fallback")).toBe(rootC);
+  });
 });
