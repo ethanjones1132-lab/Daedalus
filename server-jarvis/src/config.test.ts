@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "path";
 import { homedir } from "os";
+import { existsSync, readFileSync, writeFileSync } from "fs";
 import {
+  CONFIG_FILE,
   defaultConfig,
   InvalidConfigError,
   invalidateConfigCache,
@@ -433,6 +435,108 @@ describe("saveConfig validate-before-write (P1-N)", () => {
         { active_backend: originalBackend, openrouter: { api_key: originalKey } },
         { validate: false },
       );
+      invalidateConfigCache();
+    }
+  });
+});
+
+// ─── Heal-persistence: platform-invalid jarvis_path is rewritten on next save ──
+// Regression: a platform-invalid `jarvis_path` (e.g. a POSIX-style path on
+// Windows, or any path whose `exists()` check fails) is healed in memory by
+// `normalizeConfig`, but the on-disk file is intentionally not rewritten by
+// the heal itself. The deferred follow-up to commit 505784b asks: does the
+// heal persist to disk on the operator's next explicit save? Yes — because
+// `saveConfig` calls `loadConfig()` first, which runs `normalizeConfig` and
+// heals the in-memory value, and the subsequent `writeFileSync` persists
+// the merged (healed) value. These tests pin that contract so a future
+// refactor that bypasses `loadConfig` (e.g. reading the raw disk value
+// directly) can't silently regress the heal-persistence guarantee.
+describe("jarvis_path heal-persistence on next save", () => {
+  const DEFAULT_WORKSPACE = join(
+    homedir(),
+    ".openclaw",
+    "agents",
+    "coderclaw",
+    "workspace",
+    "home-base",
+  );
+  const STALE_POSIX = "/root/.openclaw/agents/coderclaw/workspace/Jarvis";
+
+  test("loadConfig returns the healed path even when disk has a platform-invalid value", () => {
+    const beforeDisk = existsSync(CONFIG_FILE) ? readFileSync(CONFIG_FILE, "utf-8") : null;
+    try {
+      const parsed = beforeDisk ? JSON.parse(beforeDisk) : defaultConfig();
+      parsed.jarvis_path = STALE_POSIX;
+      writeFileSync(CONFIG_FILE, JSON.stringify(parsed, null, 2), "utf-8");
+      invalidateConfigCache();
+
+      const loaded = loadConfig();
+      expect(loaded.jarvis_path).toBe(DEFAULT_WORKSPACE);
+      expect(loaded.jarvis_path).not.toBe(STALE_POSIX);
+    } finally {
+      if (beforeDisk !== null) {
+        writeFileSync(CONFIG_FILE, beforeDisk, "utf-8");
+      } else {
+        // No original to restore — best-effort reset
+        saveConfig({ jarvis_path: DEFAULT_WORKSPACE }, { validate: false });
+      }
+      invalidateConfigCache();
+    }
+  });
+
+  test("saveConfig of an unrelated field persists the healed path to disk", () => {
+    const beforeDisk = existsSync(CONFIG_FILE) ? readFileSync(CONFIG_FILE, "utf-8") : null;
+    const before = loadConfig();
+    const originalSystemPrompt = before.system_prompt;
+    try {
+      // 1. Plant a stale on-disk value
+      const parsed = beforeDisk ? JSON.parse(beforeDisk) : defaultConfig();
+      parsed.jarvis_path = STALE_POSIX;
+      writeFileSync(CONFIG_FILE, JSON.stringify(parsed, null, 2), "utf-8");
+      invalidateConfigCache();
+
+      // 2. saveConfig with an unrelated field — should still persist the heal
+      const saved = saveConfig({
+        system_prompt: `${originalSystemPrompt}\n# heal-persistence-marker-${Date.now()}`,
+      });
+      expect(saved.jarvis_path).toBe(DEFAULT_WORKSPACE);
+      expect(saved.jarvis_path).not.toBe(STALE_POSIX);
+
+      // 3. The on-disk file must show the healed value (not the stale one)
+      const afterDisk = JSON.parse(readFileSync(CONFIG_FILE, "utf-8"));
+      expect(afterDisk.jarvis_path).toBe(DEFAULT_WORKSPACE);
+    } finally {
+      // Restore: write the original disk snapshot back, bypass validation
+      // so the restore itself can never trip the gate.
+      if (beforeDisk !== null) {
+        writeFileSync(CONFIG_FILE, beforeDisk, "utf-8");
+      }
+      invalidateConfigCache();
+    }
+  });
+
+  test("saveConfig of an unrelated field does NOT regress a valid configured workspace", () => {
+    // The heal must only kick in for actually-invalid paths. A valid
+    // Windows-style workspace must round-trip cleanly through saveConfig.
+    const beforeDisk = existsSync(CONFIG_FILE) ? readFileSync(CONFIG_FILE, "utf-8") : null;
+    try {
+      const validWinPath = "C:\\Projects\\home-base-recovered";
+      const parsed = beforeDisk ? JSON.parse(beforeDisk) : defaultConfig();
+      parsed.jarvis_path = validWinPath;
+      writeFileSync(CONFIG_FILE, JSON.stringify(parsed, null, 2), "utf-8");
+      invalidateConfigCache();
+
+      const saved = saveConfig({
+        system_prompt: `${loadConfig().system_prompt}\n# valid-workspace-marker-${Date.now()}`,
+      });
+      expect(saved.jarvis_path).toBe(validWinPath);
+
+      const afterDisk = JSON.parse(readFileSync(CONFIG_FILE, "utf-8"));
+      expect(afterDisk.jarvis_path).toBe(validWinPath);
+    } finally {
+      if (beforeDisk !== null) {
+        writeFileSync(CONFIG_FILE, beforeDisk, "utf-8");
+      }
       invalidateConfigCache();
     }
   });
