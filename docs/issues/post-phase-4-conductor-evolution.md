@@ -397,7 +397,8 @@ End-to-end: telemetry row exists per replan; cap prevents infinite loop in test.
 ### D-01: Trajectory corpus export and composite reward
 
 **Type:** AFK  
-**Blocked by:** C-01, A-02
+**Blocked by:** C-01, A-02  
+**Status:** ✅ Done (2026-07-07 afternoon, Jarvis maintenance pass)
 
 #### What to build
 
@@ -407,10 +408,12 @@ End-to-end: export produces valid JSONL; reward in [0,1]; documents field schema
 
 #### Acceptance criteria
 
-- [ ] JSONL schema documented in module header
-- [ ] Reward weights configurable
-- [ ] Export skips `failed`/`degraded` below quality threshold
-- [ ] Unit test on fixture trajectories
+- [x] JSONL schema documented in module header
+- [x] Reward weights configurable
+- [x] Export skips `failed`/`degraded` below quality threshold
+- [x] Unit test on fixture trajectories
+
+**Implementation summary:** new module `server-jarvis/src/training/` split into the pure library `corpus.ts` (importable, no shebang) and the CLI `export-corpus.ts` (shebang, `bun run` entry point — matches the spec's path verbatim). Pure library exposes `buildExportRow(snapshot, agentRun, options)` for single-row construction and `exportCorpus(store, limit, options)` for the bulk path that scans `trajectory_snapshots` (newest first, up to `limit`), joins each with the corresponding `agent_runs` row, builds the row, applies the `minReward` quality gate, and returns `{rows, stats}` for CLI surfacing. Composite reward is a normalized weighted sum of five components in [0, 1]: `outcome` (success=1.0, degraded=0.5, failed=0.0), `user_rating` ((rating-1)/4 in [1,5], else 0.5 neutral), `eval_replay` (1.0 if eval passed, 0.0 if failed, 0.5 if no eval recorded), `token_efficiency` (1 - tokens/budget clamped to [0, 1], neutral 0.5 if no token data), and `stage_error_absence` (1 - error_stages/total_stages, 1.0 if no stages). Default weights: outcome=0.40, user=0.25, eval=0.15, tokens=0.10, errors=0.10 (sum 1.0 → no normalization stretch in the common case). Default `tokenBudget` = 16 000. CLI flags: `--out`, `--limit`, `--min-reward` (default 0.25 — the spec's "skip failed/degraded below threshold" gate), `--token-budget`, `--eval-results=<json>`, `--replan-counts=<json>`, `--weights=<w1,w2,w3,w4,w5>`, `--dry-run`. JSONL row schema documented in the `corpus.ts` header (one JSON object per line; full field list including `reward` and `reward_components`). 22 new bun tests pin: malformed JSON → null, unknown `run_outcome` → null, missing `agent_run_id` → null, each individual scoring function across the full input range (including neutral fallbacks), custom `rewardWeights` (zeroed weight drops a component from the final reward), `replan_count` lookup, fallback to `snapshot.session_id` and `agent_runs` defaults when fields are missing, `minReward` filtering (failed + no-eval + over-budget + every-stage-errored → reward 0.20, dropped at CLI default 0.25, kept at 0.0), malformed-snapshot counting, `limit` cap, `evalResults`/`replanCounts` plumbing, JSONL round-trip (no Maps / functions / circular refs in serialized rows), and the `DEFAULT_REWARD_WEIGHTS` / `DEFAULT_TOKEN_BUDGET` invariants. 660 bun tests pass across 68 files (was 638, +22), 60 cargo tests pass, both `tsc` jobs clean. Branch: `codex/jarvis-live-p0a` — pushed, merge to `master` is the operator's call.
 
 ---
 
