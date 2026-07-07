@@ -16,10 +16,28 @@ interface BackendStats {
   last_model?: string;
 }
 
+interface ConductorCacheSummary {
+  window_size: number;
+  cache_hit_rate: number;
+  avg_prefix_recomputed: number;
+  records: unknown[];
+  generated_at: number;
+}
+
 interface InferenceMetrics {
   window_size: number;
   backends: BackendStats[];
   generated_at: number;
+  /**
+   * Conductor KV/prefix-reuse observability (Track A follow-up, 2026-07-07).
+   * Server-side lives in `server-jarvis/src/inference-metrics.ts` —
+   * `null` when no conductor turns have been recorded yet, otherwise
+   * contains a windowed snapshot of the warm-conductor cache hit rate
+   * and the average prefix tokens that had to be recomputed. The
+   * System Health view renders a card only when this is non-null so
+   * the operator can distinguish "no data" from a real bad measurement.
+   */
+  conductor_cache?: ConductorCacheSummary | null;
 }
 
 interface OllamaHealth { running: boolean; model: string | null; url: string }
@@ -66,6 +84,24 @@ function statusVariant(status: string): 'success' | 'warn' | 'error' | 'default'
   if (s === 'warn' || s === 'warning') return 'warn';
   if (s === 'error' || s === 'fail') return 'error';
   return 'default';
+}
+
+/**
+ * Map a conductor cache hit rate (0..1) to a pill variant for the
+ * "Conductor cache" card. The A-02 acceptance criterion is >80% prefix
+ * reuse on a 3-turn session, so we treat >=0.8 as the "green" target.
+ * 0.5..0.8 is amber (the conductor is reusing prefix sometimes — could
+ * be a session that's mixing API + local turns, or one that's still
+ * warming). Below 0.5 is red: the warm-conductor machinery is mostly
+ * missing, which is the failure mode the metric exists to surface.
+ *
+ * Exported for unit testing — no React state, no fetch, no DOM.
+ */
+export function conductorCacheVariant(rate: number): 'success' | 'warn' | 'error' {
+  if (!Number.isFinite(rate) || rate < 0) return 'error';
+  if (rate >= 0.8) return 'success';
+  if (rate >= 0.5) return 'warn';
+  return 'error';
 }
 
 const BUN_URL = 'http://127.0.0.1:19877';
@@ -243,6 +279,34 @@ export default function SystemHealthView() {
                       )}
                     </div>
                   ))}
+                </div>
+              </GlassCard>
+            )}
+
+            {/* Conductor cache — warm-prefix reuse observability (Track A follow-up).
+                Server-side is sourced from `conductorCacheSnapshot()` in
+                `server-jarvis/src/orchestration/conductor-metrics.ts` and folded
+                into the `/health/inference` snapshot by
+                `inference-metrics.ts:inferenceMetricsSnapshot()`. Renders only
+                when the server reports at least one conductor turn. */}
+            {inferenceMetrics?.conductor_cache && (
+              <GlassCard className="p-4">
+                <div className="flex items-center gap-2 mb-3">
+                  <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40">
+                    Conductor cache
+                  </div>
+                  <Pill variant={conductorCacheVariant(inferenceMetrics.conductor_cache.cache_hit_rate)}>
+                    {Math.round(inferenceMetrics.conductor_cache.cache_hit_rate * 100)}% hit
+                  </Pill>
+                  <span className="text-[10px] font-mono text-bone/40">
+                    last {inferenceMetrics.conductor_cache.window_size} turns
+                  </span>
+                </div>
+                <div className="text-[10px] font-mono text-bone/50">
+                  avg prefix recomputed: {Math.round(inferenceMetrics.conductor_cache.avg_prefix_recomputed)} tokens
+                </div>
+                <div className="mt-1 text-[10px] font-mono text-bone/30">
+                  A-02 target: 80% hit rate on a 3-turn session
                 </div>
               </GlassCard>
             )}
