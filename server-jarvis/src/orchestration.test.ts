@@ -46,7 +46,7 @@ describe("Orchestration & Routing Tests", () => {
     ];
 
     expect(getToolsForMode("reviewer", dummyTools).map((t) => t.function.name)).toEqual(["read_file"]);
-    expect(getToolsForMode("rewriter", dummyTools).map((t) => t.function.name)).toEqual(["write_file"]);
+    expect(getToolsForMode("rewriter", dummyTools).map((t) => t.function.name)).toEqual(["read_file", "write_file"]);
     expect(getToolsForMode("executor", dummyTools)).toHaveLength(3);
     expect(getToolsForMode("missing", dummyTools)).toEqual([]);
   });
@@ -74,8 +74,8 @@ describe("Orchestration & Routing Tests", () => {
     expect(getToolsForMode("executor", dummyTools, "full").map((t) => t.function.name))
       .toEqual(["read_file", "list_directory", "write_file", "bash", "apply_patch"]);
 
-    // read_only on the rewriter (a mutation-only mode) yields no tools.
-    expect(getToolsForMode("rewriter", dummyTools, "read_only")).toEqual([]);
+    // read_only on the rewriter keeps only the inspection tools it already has.
+    expect(getToolsForMode("rewriter", dummyTools, "read_only").map((t) => t.function.name)).toEqual(["read_file", "list_directory"]);
   });
 
   test("PipelineExecutor skips empty pipelines without touching prompts", async () => {

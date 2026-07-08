@@ -399,7 +399,7 @@ export function defaultConfig(): JarvisConfig {
     claude_cli: {
       enabled: true,
       path: "claude",
-      args: ["--bare", "--print", "--output-format", "stream-json", "--no-telemetry"],
+      args: ["--bare", "--print", "--output-format", "stream-json"],
       timeout_ms: 120000,
       cwd: homedir(),
       model: "",
@@ -592,6 +592,22 @@ export function isInvalidWorkspacePath(
 
 export function normalizeConfig(raw: any, options: NormalizeConfigOptions = {}): JarvisConfig {
   const merged = deepMerge(defaultConfig(), raw);
+  const openRouterKey = process.env.OPENROUTER_API_KEY || process.env.OPENROUTER_KEY;
+  const openCodeKey = process.env.OPENCODE_API_KEY || process.env.OPENCODE_KEY;
+  const openCodeZenKey = process.env.OPENCODE_ZEN_API_KEY || process.env.OPENCODE_ZEN_KEY || openCodeKey;
+  const openCodeGoKey = process.env.OPENCODE_GO_API_KEY || process.env.OPENCODE_GO_KEY || openCodeKey;
+  if ((!merged.openrouter.api_key || merged.openrouter.api_key.length < 10) && openRouterKey) {
+    merged.openrouter.api_key = openRouterKey;
+  }
+  if ((!merged.opencode_zen.api_key || merged.opencode_zen.api_key.length < 10) && openCodeZenKey) {
+    merged.opencode_zen.api_key = openCodeZenKey;
+  }
+  if ((!merged.opencode_go.api_key || merged.opencode_go.api_key.length < 10) && openCodeGoKey) {
+    merged.opencode_go.api_key = openCodeGoKey;
+  }
+  if (Array.isArray(merged.claude_cli?.args)) {
+    merged.claude_cli.args = merged.claude_cli.args.filter((arg: unknown) => arg !== "--no-telemetry");
+  }
   const defaultWorkspacePath = join(homedir(), ".openclaw", "agents", "coderclaw", "workspace", "home-base");
   // Ensure jarvis_path is always set — an empty string or missing value
   // must never cause the workspace to silently resolve to process.cwd()
@@ -626,7 +642,7 @@ export function loadConfig(): JarvisConfig {
 
   try {
     if (existsSync(CONFIG_FILE)) {
-      const raw = JSON.parse(readFileSync(CONFIG_FILE, "utf-8"));
+      const raw = JSON.parse(readFileSync(CONFIG_FILE, "utf-8").replace(/^\uFEFF/, ""));
       configCache = normalizeConfig(raw);
       configCacheTime = now;
       return configCache!;

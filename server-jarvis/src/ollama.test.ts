@@ -4,6 +4,7 @@ import {
   checkOllamaHealth,
   checkOllamaModelSupportsTools,
   listOllamaModels,
+  selectInstalledOllamaModel,
 } from "./ollama";
 import type { OllamaConfig } from "./config";
 
@@ -70,5 +71,18 @@ describe("Ollama integration", () => {
     mockOllamaTags();
     const supportsTools = await checkOllamaModelSupportsTools("http://localhost:11434", "qwen3.5-9b:latest");
     expect(supportsTools).toBe(true);
+  });
+
+  test("selectInstalledOllamaModel prefers installed profile aliases over first tag order", () => {
+    const cfg = {
+      ...({} as any),
+      ollama: { model: "qwen3.5-9b:latest" },
+      active_profile: "quality",
+      profiles: {
+        quality: { model_id: "qwen3.5-9b" },
+      },
+    };
+
+    expect(selectInstalledOllamaModel(cfg, ["gemma4:e2b", "qwen3:8b", "qwen3:4b"])).toBe("qwen3:8b");
   });
 });

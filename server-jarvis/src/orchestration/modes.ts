@@ -59,7 +59,7 @@ export const BUILTIN_MODES: Record<string, AgentMode> = {
   rewriter: {
     id: "rewriter",
     name: "Rewriter",
-    tools_filter: ["edit_file", "write_file", "multi_edit"],
+    tools_filter: ["read_file", "grep", "glob", "list_directory", "edit_file", "write_file", "multi_edit"],
     temperature: 0.3,
     max_tokens: 4096,
     requires_memory: true,

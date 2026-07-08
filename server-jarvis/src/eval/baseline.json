@@ -14,7 +14,7 @@
     "routing/test-task": "pass",
     "routing/plan-high-complexity": "pass",
     "gating/reviewer-read-only": "pass",
-    "gating/rewriter-write-only": "pass",
+    "gating/rewriter-write-plus-read": "pass",
     "gating/executor-gets-all": "pass",
     "gating/planner-gets-none": "pass",
     "gating/synthesizer-gets-none": "pass",

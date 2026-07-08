@@ -32,12 +32,11 @@ describe("Claude CLI local-only launch contract", () => {
     expect(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe("1");
   });
 
-  test("adds hermetic Claude flags without duplicating them", () => {
-    expect(buildLocalClaudeArgs(["--print"])).toEqual(["--bare", "--print", "--no-telemetry"]);
+  test("adds hermetic Claude flags and strips retired CLI flags", () => {
+    expect(buildLocalClaudeArgs(["--print"])).toEqual(["--bare", "--print"]);
     expect(buildLocalClaudeArgs(["--bare", "--print", "--no-telemetry"])).toEqual([
       "--bare",
       "--print",
-      "--no-telemetry",
     ]);
   });
 

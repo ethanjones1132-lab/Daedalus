@@ -8,6 +8,57 @@ import { spawn, execSync } from "child_process";
 import { readFileSync } from "fs";
 import type { JarvisConfig, OllamaConfig } from "./config";
 
+function uniqueStrings(values: Array<string | undefined | null>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of values) {
+    const trimmed = value?.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out;
+}
+
+function equivalentModelName(a: string, b: string): boolean {
+  const normalize = (value: string) => value.trim().toLowerCase().replace(/:latest$/, "");
+  return normalize(a) === normalize(b);
+}
+
+function installedMatch(installedModels: string[], candidate: string | undefined | null): string | null {
+  if (!candidate) return null;
+  return installedModels.find((name) => equivalentModelName(name, candidate)) ?? null;
+}
+
+export function selectInstalledOllamaModel(cfg: JarvisConfig, installedModels: string[]): string {
+  const requested = cfg.ollama.model;
+  const profiles = cfg.profiles ?? {};
+  const activeProfile = profiles[cfg.active_profile]?.model_id;
+  const profileModelIds = Object.values(profiles)
+    .map((profile) => profile?.model_id)
+    .filter(Boolean) as string[];
+
+  const candidates = uniqueStrings([
+    requested,
+    activeProfile,
+    ...profileModelIds,
+    // Local aliases for the current default profiles on machines that have
+    // the shipped Qwen 3 family but not the older qwen3.5/qwen2.5 labels.
+    "qwen3:8b",
+    "qwen3:4b",
+    "gemma4:e2b",
+  ]);
+
+  for (const candidate of candidates) {
+    const match = installedMatch(installedModels, candidate);
+    if (match) return match;
+  }
+
+  return installedModels.find((name) => !name.toLowerCase().includes("embed"))
+    ?? installedModels[0]
+    ?? requested;
+}
+
 // ── WSL2 → Windows Host IP Resolution ──
 
 let cachedHostIP: string | null = null;
@@ -89,10 +140,6 @@ export function effectiveOllamaUrl(cfg: OllamaConfig): string {
 
 function cleanOllamaBaseUrl(url: string): string {
   return url.replace(/\/v1\/?$/, "").replace(/\/+$/, "");
-}
-
-function uniqueStrings(values: string[]): string[] {
-  return Array.from(new Set(values.filter(Boolean)));
 }
 
 export function ollamaBaseUrlCandidates(cfg: OllamaConfig): string[] {

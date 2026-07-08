@@ -79,12 +79,9 @@ export function buildLocalClaudeEnv(baseEnv: NodeJS.ProcessEnv = process.env): R
 }
 
 export function buildLocalClaudeArgs(args: string[]): string[] {
-  const next = [...args];
+  const next = args.filter((arg) => arg !== "--no-telemetry");
   if (!next.includes("--bare")) {
     next.unshift("--bare");
-  }
-  if (!next.includes("--no-telemetry")) {
-    next.push("--no-telemetry");
   }
   return next;
 }

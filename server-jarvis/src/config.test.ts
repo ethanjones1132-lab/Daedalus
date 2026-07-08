@@ -120,6 +120,15 @@ describe("top_k sampling", () => {
     expect(defaultConfig().top_k).toBe(40);
   });
 
+  test("normalizeConfig strips retired Claude CLI telemetry flag", () => {
+    const cfg = normalizeConfig({
+      claude_cli: {
+        args: ["--bare", "--print", "--output-format", "stream-json", "--no-telemetry"],
+      },
+    });
+    expect(cfg.claude_cli.args).toEqual(["--bare", "--print", "--output-format", "stream-json"]);
+  });
+
   test("normalizeConfig fills in a missing top_k with the default 40", () => {
     const cfg = normalizeConfig({});
     expect(cfg.top_k).toBe(40);
@@ -170,6 +179,40 @@ describe("normalizeConfig blank-field protection", () => {
     // api_key's default is "", so an explicit "" is a no-op, not a fallback.
     const cfg = normalizeConfig({ openrouter: { api_key: "" } });
     expect(cfg.openrouter.api_key).toBe("");
+  });
+
+  test("provider API keys can be supplied from environment variables", () => {
+    const before = {
+      openrouter: process.env.OPENROUTER_API_KEY,
+      opencode: process.env.OPENCODE_API_KEY,
+      zen: process.env.OPENCODE_ZEN_API_KEY,
+      go: process.env.OPENCODE_GO_API_KEY,
+    };
+    try {
+      process.env.OPENROUTER_API_KEY = "sk-or-v1-env-test-key";
+      process.env.OPENCODE_API_KEY = "sk-opencode-shared-env-key";
+      delete process.env.OPENCODE_ZEN_API_KEY;
+      delete process.env.OPENCODE_GO_API_KEY;
+
+      const cfg = normalizeConfig({
+        openrouter: { api_key: "x" },
+        opencode_zen: { api_key: "" },
+        opencode_go: { api_key: "" },
+      });
+
+      expect(cfg.openrouter.api_key).toBe("sk-or-v1-env-test-key");
+      expect(cfg.opencode_zen.api_key).toBe("sk-opencode-shared-env-key");
+      expect(cfg.opencode_go.api_key).toBe("sk-opencode-shared-env-key");
+    } finally {
+      if (before.openrouter === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = before.openrouter;
+      if (before.opencode === undefined) delete process.env.OPENCODE_API_KEY;
+      else process.env.OPENCODE_API_KEY = before.opencode;
+      if (before.zen === undefined) delete process.env.OPENCODE_ZEN_API_KEY;
+      else process.env.OPENCODE_ZEN_API_KEY = before.zen;
+      if (before.go === undefined) delete process.env.OPENCODE_GO_API_KEY;
+      else process.env.OPENCODE_GO_API_KEY = before.go;
+    }
   });
 });
 
@@ -338,11 +381,11 @@ describe("saveConfig validate-before-write (P1-N)", () => {
   // string with no validation). That must continue to work — we never want
   // the in-tree audit/cron path to trip the new validation gate.
   test("saveConfig accepts a free-form system_prompt patch without validation errors", () => {
-    const before = defaultConfig();
+    const before = loadConfig();
     const saved = saveConfig({ system_prompt: `${before.system_prompt}\n# p1n-acceptance` });
     expect(saved.system_prompt).toContain("# p1n-acceptance");
     // restore
-    saveConfig({ system_prompt: before.system_prompt });
+    saveConfig({ system_prompt: before.system_prompt }, { validate: false });
   });
 
   test("saveConfig throws InvalidConfigError when the active backend's required field is invalid", () => {

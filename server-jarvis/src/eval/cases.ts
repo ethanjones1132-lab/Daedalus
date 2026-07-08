@@ -159,11 +159,13 @@ export const MODE_GATING_CASES: ModeGatingCase[] = [
     expectAllowed: ["read_file", "grep", "glob", "list_directory"],
   },
   {
-    id: "gating/rewriter-write-only",
+    id: "gating/rewriter-write-plus-read",
     kind: "mode_gating",
     modeId: "rewriter",
     toolNames: TOOL_UNIVERSE,
-    expectAllowed: ["edit_file", "write_file", "multi_edit"],
+    // Rewriter can inspect (read_file/grep/glob/list_directory) before
+    // mutating; the write tools are still the primary capability.
+    expectAllowed: ["edit_file", "write_file", "multi_edit", "read_file", "grep", "glob", "list_directory"],
   },
   {
     id: "gating/executor-gets-all",

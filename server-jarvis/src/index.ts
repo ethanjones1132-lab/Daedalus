@@ -23,7 +23,7 @@ import {
   handleDeactivateAgent,
   handleScanAgents,
 } from "./agent-routes";
-import { effectiveOllamaUrl, checkOllamaHealth, checkOllamaModelSupportsTools, resolveWindowsHostIP } from "./ollama";
+import { effectiveOllamaUrl, checkOllamaHealth, checkOllamaModelSupportsTools, resolveWindowsHostIP, selectInstalledOllamaModel } from "./ollama";
 import { streamClaudeCli, isClaudeCliAvailable, compactTurnHistoryForCli } from "./claude-cli";
 import { ReasoningParser, stripReasoningFromText, type ReasoningEvent } from "./reasoning";
 import {
@@ -687,36 +687,6 @@ function equivalentOllamaModelName(a: string, b: string): boolean {
   return a === b || a === `${b}:latest` || `${a}:latest` === b || normalize(a) === normalize(b);
 }
 
-function selectInstalledOllamaModel(cfg: JarvisConfig, installedModels: string[]): string {
-  const requested = cfg.ollama.model;
-  const activeProfile = (cfg as any).profiles?.[(cfg as any).active_profile]?.model_id;
-  const profileModelIds: string[] = [];
-  if ((cfg as any).profiles) {
-    for (const key of Object.keys((cfg as any).profiles)) {
-      const p = (cfg as any).profiles[key];
-      if (p?.model_id) {
-        profileModelIds.push(p.model_id);
-      }
-    }
-  }
-
-  const candidates = uniqueStrings([
-    requested,
-    activeProfile,
-    ...profileModelIds,
-    "qwen3.5-9b:latest",
-    "qwen3.5-9b",
-  ]);
-
-  const firstUsefulModel = installedModels.find((name) => !name.includes("embed"))
-    ?? installedModels[0]
-    ?? requested;
-  if (firstUsefulModel !== requested) {
-    console.warn(`[Jarvis] Ollama model "${requested}" is not installed; using "${firstUsefulModel}" instead.`);
-  }
-  return firstUsefulModel;
-}
-
 interface CachedOllamaTarget {
   chatUrl: string;
   modelName: string;
@@ -1365,8 +1335,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const callModelAttempt = async (messages: any[], callOptions?: any, excludeModels?: Set<string>) => {
           ensureTurnBudget(callOptions?.stageLabel ?? "orchestrator_model_attempt");
           const stageAttemptStart = Date.now();
-          const isOllama = cfg.active_backend === "ollama";
-          const ollamaTarget = isOllama ? await resolveOllamaChatTarget(cfg) : null;
+          const activeBackendIsOllama = cfg.active_backend === "ollama";
 
           // Resolve model from agent pool when a stage label is provided.
           // Each orchestrator stage gets its designated model directly,
@@ -1383,7 +1352,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let poolResolvedAgent: import("./orchestration/agent-pool").OrchestratorAgent | undefined;
           const stageLabel = callOptions?.stageLabel as string | undefined;
           const cascadeTier = callOptions?.cascadeTier as "cheap" | "strong" | undefined;
-          if (!isOllama && stageLabel && cfg.orchestrator?.enabled) {
+          if (stageLabel && cfg.orchestrator?.enabled) {
             try {
               const pool = new AgentPool(conductorLearning.applyLearnedAgents(cfg.orchestrator?.agents ?? []));
               let agent: import("./orchestration/agent-pool").OrchestratorAgent | undefined;
@@ -1422,6 +1391,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const resolvedOpenRouterModel = cfg.active_backend === "openrouter"
             ? await resolveOpenRouterModel(cfg)
             : null;
+          const isOllama = activeBackendIsOllama && !poolProvider;
+          const ollamaTarget = isOllama ? await resolveOllamaChatTarget(cfg) : null;
 
           const modelName = isOllama
             ? (ollamaTarget?.modelName ?? cfg.ollama.model)
@@ -1538,7 +1509,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
           let fetchRes: Response;
           let actualModelUsed = modelName;
-          let actualProviderUsed: string = effectiveProvider;
+          let actualProviderUsed: string = isOllama ? "ollama" : effectiveProvider;
           try {
             if (useFallback) {
               const result = await chatCompletionWithFallback(cfg, requestBody, ctrl.signal, {
@@ -3410,7 +3381,27 @@ async function baseFetch(req: Request): Promise<Response> {
     }
     if (path === "/health") {
       const hcfg = loadConfig();
-      return Response.json({ ok: true, uptime: process.uptime(), version: JARVIS_VERSION, backend: hcfg.active_backend, model: hcfg.active_backend === "openrouter" ? hcfg.openrouter.model : hcfg.ollama.model, git_sha: JARVIS_GIT_SHA, built_at: JARVIS_BUILT_AT });
+      let model = hcfg.active_backend === "openrouter" ? hcfg.openrouter.model : hcfg.ollama.model;
+      let configured_model: string | undefined;
+      if (hcfg.active_backend === "ollama") {
+        configured_model = hcfg.ollama.model;
+        try {
+          model = (await resolveOllamaChatTarget(hcfg)).modelName;
+        } catch {
+          model = hcfg.ollama.model;
+        }
+      }
+      return Response.json({
+        ok: true,
+        uptime: process.uptime(),
+        version: JARVIS_VERSION,
+        backend: hcfg.active_backend,
+        model,
+        configured_model,
+        model_resolved: configured_model ? equivalentOllamaModelName(model, configured_model) : true,
+        git_sha: JARVIS_GIT_SHA,
+        built_at: JARVIS_BUILT_AT,
+      });
     }
     if (path === "/health/inference") {
       return Response.json(inferenceMetricsSnapshot());
