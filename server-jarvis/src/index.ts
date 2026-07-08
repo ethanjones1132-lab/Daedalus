@@ -24,7 +24,7 @@ import {
   handleScanAgents,
 } from "./agent-routes";
 import { effectiveOllamaUrl, checkOllamaHealth, checkOllamaModelSupportsTools, resolveWindowsHostIP } from "./ollama";
-import { streamClaudeCli, isClaudeCliAvailable } from "./claude-cli";
+import { streamClaudeCli, isClaudeCliAvailable, compactTurnHistoryForCli } from "./claude-cli";
 import { ReasoningParser, stripReasoningFromText, type ReasoningEvent } from "./reasoning";
 import {
   listOpenRouterModels,
@@ -1201,8 +1201,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       if (cfg.active_backend === "claude_cli") {
         const reasoningParser = new ReasoningParser(sessionId);
         const resumedSessionId = cliSessionMap.get(sessionId);
-        const historyPrompt = !resumedSessionId && turnHistory.length > 0
-          ? `${turnHistory.map(m => {
+        const historyForCli = !resumedSessionId
+          ? compactTurnHistoryForCli(
+              turnHistory,
+              process.platform === "win32" ? 16_000 : 200_000,
+            )
+          : [];
+        const historyPrompt = historyForCli.length > 0
+          ? `${historyForCli.map(m => {
               if (m.role === "tool") {
                 return `tool response:\n${m.content}`;
               }

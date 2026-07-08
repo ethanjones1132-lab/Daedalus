@@ -5,8 +5,8 @@
 // and bridges it into the Jarvis SSE event stream.
 
 import { spawn, execSync } from "child_process";
-import { existsSync, mkdirSync } from "fs";
-import { homedir } from "os";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { homedir, tmpdir } from "os";
 import { join } from "path";
 import type { JarvisConfig } from "./config";
 
@@ -101,6 +101,106 @@ function appendNoProxy(existing: string | undefined): string {
   return Array.from(parts).join(",");
 }
 
+/** Windows CreateProcess limit is 8191 chars; leave headroom for quoting. */
+export const WINDOWS_CMDLINE_BUDGET = 7500;
+
+function quoteArgForCmdline(arg: string): string {
+  if (!/[ \t"]/.test(arg)) return arg;
+  return `"${arg.replace(/"/g, '\\"')}"`;
+}
+
+export function estimateCommandLineLength(executable: string, args: string[]): number {
+  return [executable, ...args.map(quoteArgForCmdline)].join(" ").length;
+}
+
+export interface ClaudeCliInvocation {
+  args: string[];
+  /** When true, the user prompt is written to stdin (not a positional arg). */
+  promptOnStdin: boolean;
+  cleanup: () => void;
+}
+
+/**
+ * Avoid Windows "The command line is too long" when system prompt + history
+ * are passed as CLI flags/positionals. Large --append-system-prompt values go
+ * to temp files; oversized user prompts use stdin with --print.
+ */
+export function prepareClaudeCliInvocation(
+  executable: string,
+  cliArgs: string[],
+  prompt: string,
+): ClaudeCliInvocation {
+  const cleanupDirs: string[] = [];
+  const cleanup = () => {
+    for (const dir of cleanupDirs) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        /* best-effort */
+      }
+    }
+  };
+
+  const args = [...cliArgs];
+
+  const rewriteInlinePromptFlag = (inlineFlag: string, fileFlag: string) => {
+    const idx = args.indexOf(inlineFlag);
+    if (idx === -1 || idx >= args.length - 1) return;
+    const content = args[idx + 1];
+    if (!content || content.length < 512) return;
+    const dir = mkdtempSync(join(tmpdir(), "jarvis-cli-"));
+    const filePath = join(dir, "prompt.txt");
+    writeFileSync(filePath, content, "utf8");
+    cleanupDirs.push(dir);
+    args.splice(idx, 2, fileFlag, filePath);
+  };
+
+  rewriteInlinePromptFlag("--append-system-prompt", "--append-system-prompt-file");
+  rewriteInlinePromptFlag("--system-prompt", "--system-prompt-file");
+
+  ensureStreamJsonVerbose(args);
+
+  const withPositionalPrompt = [...args, prompt];
+  const overBudget =
+    process.platform === "win32" &&
+    estimateCommandLineLength(executable, withPositionalPrompt) > WINDOWS_CMDLINE_BUDGET;
+
+  if (overBudget || (process.platform === "win32" && prompt.length > 2000)) {
+    return { args, promptOnStdin: true, cleanup };
+  }
+
+  return { args: withPositionalPrompt, promptOnStdin: false, cleanup };
+}
+
+function ensureStreamJsonVerbose(args: string[]): void {
+  const fmtIdx = args.indexOf("--output-format");
+  const usesStreamJson =
+    fmtIdx !== -1 && fmtIdx < args.length - 1 && args[fmtIdx + 1] === "stream-json";
+  if (usesStreamJson && !args.includes("--verbose")) {
+    args.push("--verbose");
+  }
+}
+
+export function compactTurnHistoryForCli<T extends { role: string; content: string }>(
+  turnHistory: T[],
+  maxChars: number,
+): T[] {
+  if (maxChars <= 0 || turnHistory.length === 0) return turnHistory;
+  let total = 0;
+  const kept: T[] = [];
+  for (let i = turnHistory.length - 1; i >= 0; i--) {
+    const m = turnHistory[i];
+    const piece =
+      m.role === "tool"
+        ? `tool response:\n${m.content}\n\n`
+        : `${m.role}: ${m.content}\n\n`;
+    if (total + piece.length > maxChars && kept.length > 0) break;
+    kept.unshift(m);
+    total += piece.length;
+  }
+  return kept;
+}
+
 // ── Types ──
 
 export interface ClaudeCliRequest {
@@ -145,13 +245,17 @@ export async function invokeClaudeCli(
 ): Promise<{ success: boolean; output: string; session_id?: string; error?: string; tokens_used?: number }> {
   const cliCfg = cfg.claude_cli;
 
-  const args = buildLocalClaudeArgs([...(cliCfg.args || [])]);
-  // Prompt is passed as a positional argument (not --prompt flag)
-  args.push(req.prompt);
-
-  if (req.session_id) args.push("--resume", req.session_id);
+  const baseArgs = buildLocalClaudeArgs([...(cliCfg.args || [])]);
+  if (req.session_id) baseArgs.push("--resume", req.session_id);
   // Note: --cwd is not a valid Claude CLI flag; cwd is set via spawn options
-  if (req.max_turns) args.push("--max-turns", String(req.max_turns));
+  if (req.max_turns) baseArgs.push("--max-turns", String(req.max_turns));
+
+  const resolvedPath = resolveClaudePath(cliCfg.path);
+  const { args, promptOnStdin, cleanup } = prepareClaudeCliInvocation(
+    resolvedPath,
+    baseArgs,
+    req.prompt,
+  );
 
   return new Promise((resolve) => {
     // Use localhost for Ollama — subprocess runs in WSL, same as Bun server
@@ -160,7 +264,6 @@ export async function invokeClaudeCli(
       CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: "1",
     };
 
-    const resolvedPath = resolveClaudePath(cliCfg.path);
     const proc = spawn(resolvedPath, args, {
       stdio: ["pipe", "pipe", "pipe"],
       env: localOnlyEnv,
@@ -168,7 +271,9 @@ export async function invokeClaudeCli(
       cwd: req.cwd || cliCfg.cwd,
     });
 
-    // Close stdin immediately — CLI should use positional prompt arg, not stdin
+    if (promptOnStdin) {
+      proc.stdin?.write(req.prompt, "utf8");
+    }
     proc.stdin?.end();
 
     let stdout = "";
@@ -185,6 +290,7 @@ export async function invokeClaudeCli(
 
     proc.on("close", (code) => {
       clearTimeout(timeout);
+      cleanup();
       if (timedOut) {
         resolve({ success: false, output: "", error: `Claude CLI timed out after ${cliCfg.timeout_ms}ms` });
         return;
@@ -211,6 +317,7 @@ export async function invokeClaudeCli(
 
     proc.on("error", (e) => {
       clearTimeout(timeout);
+      cleanup();
       resolve({ success: false, output: "", error: `Failed to spawn Claude CLI: ${e.message}` });
     });
   });
@@ -238,12 +345,16 @@ export async function* streamClaudeCli(
   const cliCfg = cfg.claude_cli;
 
   // Use provided cliArgs (which may include --append-system-prompt) or fall back to cfg defaults
-  const args = buildLocalClaudeArgs([...(req.cliArgs || cliCfg.args || [])]);
-  // Prompt is passed as a positional argument (not --prompt flag)
-  args.push(req.prompt);
-
-  if (req.session_id) args.push("--resume", req.session_id);
+  const baseArgs = buildLocalClaudeArgs([...(req.cliArgs || cliCfg.args || [])]);
+  if (req.session_id) baseArgs.push("--resume", req.session_id);
   // Note: --cwd is not a valid Claude CLI flag; cwd is set via spawn options below
+
+  const resolvedPath = resolveClaudePath(cliCfg.path);
+  const { args, promptOnStdin, cleanup } = prepareClaudeCliInvocation(
+    resolvedPath,
+    baseArgs,
+    req.prompt,
+  );
 
   yield { type: "init", session_id: req.session_id || crypto.randomUUID() };
 
@@ -253,14 +364,25 @@ export async function* streamClaudeCli(
   // (via resolveWindowsHostIP), not for spawned subprocesses.
   const streamEnv = buildLocalClaudeEnv();
 
-  const resolvedPath = resolveClaudePath(cliCfg.path);
   const proc = spawn(resolvedPath, args, {
     stdio: ["pipe", "pipe", "pipe"],
     env: streamEnv,
     cwd: req.cwd || cliCfg.cwd,
   });
 
-  // Close stdin immediately — CLI should use positional prompt arg, not stdin
+  const spawnError = await new Promise<Error | undefined>((resolve) => {
+    proc.once("error", (err) => resolve(err));
+    proc.once("spawn", () => resolve(undefined));
+  });
+  if (spawnError) {
+    cleanup();
+    yield { type: "error", error: spawnError.message };
+    return;
+  }
+
+  if (promptOnStdin) {
+    proc.stdin?.write(req.prompt, "utf8");
+  }
   proc.stdin?.end();
 
   const decoder = new TextDecoder();
@@ -381,6 +503,7 @@ export async function* streamClaudeCli(
     if (abortSignal) {
       abortSignal.removeEventListener("abort", onAbort);
     }
+    cleanup();
     proc.kill();
   }
 }

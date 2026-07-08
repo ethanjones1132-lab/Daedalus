@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { buildLocalClaudeArgs, buildLocalClaudeEnv } from "./claude-cli";
+import {
+  buildLocalClaudeArgs,
+  buildLocalClaudeEnv,
+  compactTurnHistoryForCli,
+  estimateCommandLineLength,
+  prepareClaudeCliInvocation,
+} from "./claude-cli";
 
 describe("Claude CLI local-only launch contract", () => {
   test("replaces inherited Anthropic and Claude credentials with local proxy settings", () => {
@@ -33,5 +39,29 @@ describe("Claude CLI local-only launch contract", () => {
       "--print",
       "--no-telemetry",
     ]);
+  });
+
+  test("prepareClaudeCliInvocation moves large append-system-prompt to a file on Windows", () => {
+    const longSystem = "x".repeat(2000);
+    const inv = prepareClaudeCliInvocation("claude.exe", ["--print", "--append-system-prompt", longSystem], "hi");
+    expect(inv.args).not.toContain(longSystem);
+    expect(inv.args).toContain("--append-system-prompt-file");
+    inv.cleanup();
+  });
+
+  test("compactTurnHistoryForCli keeps recent turns within char budget", () => {
+    const history = [
+      { role: "user", content: "a".repeat(100) },
+      { role: "assistant", content: "b".repeat(100) },
+      { role: "user", content: "latest" },
+    ];
+    const compact = compactTurnHistoryForCli(history, 80);
+    expect(compact.length).toBeGreaterThan(0);
+    expect(compact[compact.length - 1].content).toBe("latest");
+  });
+
+  test("estimateCommandLineLength accounts for quoting", () => {
+    const len = estimateCommandLineLength("claude.exe", ["--print", "hello world"]);
+    expect(len).toBeGreaterThan(20);
   });
 });
