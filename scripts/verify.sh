@@ -28,6 +28,18 @@ export PATH="$HOME/.local/bin:$HOME/.bun/bin:$HOME/.cargo/bin:/usr/local/bin:/us
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# On Windows under MSYS/Git-Bash, `pwd` returns POSIX-style paths like
+# `/c/Projects/...` that some host tools (notably `cargo --manifest-path`)
+# reject. Detect that and produce a Windows-style sibling for those callers.
+# The WSL/Linux/macOS paths are already accepted by cargo, so we leave them
+# alone. `cygpath` is part of the MSYS/Cygwin runtime and is always present in
+# the environments where MSYS-style paths appear.
+if [ -n "${MSYSTEM:-}" ] || [ "${OSTYPE:-}" = "msys" ] || [ "${OSTYPE:-}" = "cygwin" ]; then
+  ROOT_WIN="$(cygpath -w "$ROOT")"
+else
+  ROOT_WIN="$ROOT"
+fi
+
 C_RED=$'\033[38;5;196m'; C_GRN=$'\033[38;5;034m'
 C_YLW=$'\033[38;5;214m'; RST=$'\033[0m'
 # No color when output isn't a terminal (e.g. captured/piped), so logs stay clean.
@@ -93,9 +105,12 @@ fi
 
 if want rust; then
   if have cargo; then
-    run "rust cargo check" "$ROOT" cargo check --manifest-path "$ROOT/src-tauri/Cargo.toml"
-    [ $DO_CLIPPY -eq 1 ] && run "rust clippy" "$ROOT" cargo clippy --manifest-path "$ROOT/src-tauri/Cargo.toml" -- -D warnings
-    [ $DO_TEST -eq 1 ]   && run "rust cargo test" "$ROOT" cargo test --lib --manifest-path "$ROOT/src-tauri/Cargo.toml"
+    # Use ROOT_WIN (Windows-style under MSYS) for host tools that reject
+    # POSIX-style paths. The two find(1) calls below work with POSIX paths
+    # under MSYS so we keep $ROOT for those.
+    run "rust cargo check" "$ROOT" cargo check --manifest-path "$ROOT_WIN/src-tauri/Cargo.toml"
+    [ $DO_CLIPPY -eq 1 ] && run "rust clippy" "$ROOT" cargo clippy --manifest-path "$ROOT_WIN/src-tauri/Cargo.toml" -- -D warnings
+    [ $DO_TEST -eq 1 ]   && run "rust cargo test" "$ROOT" cargo test --lib --manifest-path "$ROOT_WIN/src-tauri/Cargo.toml"
 
     # Phase 2 completion criterion: a debug Tauri binary exists and isn't stale
     # relative to the Rust source. Cheap (no rebuild) so it runs on every pass.
@@ -132,7 +147,8 @@ if [ $DO_BUILD_TAURI -eq 1 ]; then
   if want rust && have cargo; then
     # `--no-bundle` skips the NSIS installer (slow, not needed for a debug gate);
     # `beforeBuildCommand` in tauri.conf.json still rebuilds server dist + UI.
-    run "tauri debug build" "$ROOT" cargo tauri build --debug --no-bundle
+    # Pass Windows-style manifest path on MSYS hosts.
+    run "tauri debug build" "$ROOT" cargo tauri build --debug --no-bundle --manifest-path "$ROOT_WIN/src-tauri/Cargo.toml"
   else skip "tauri debug build (cargo not found)"; fi
 fi
 
