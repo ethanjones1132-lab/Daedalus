@@ -195,4 +195,124 @@ describe("pipeline stage telemetry", () => {
     const rewriterRow = rows.find((row) => row.mode_id === "rewriter");
     expect(rewriterRow?.tool_calls_json).toContain("write_file");
   });
+
+  // Pin the `hasMutationIntent` gate that lives inside the repair branch
+  // (pipeline.ts ~line 803). The repair should only fire when the user's
+  // request looks like a real write intent; a "read this", "what does",
+  // or "explain the X" prompt must not trigger a needless rewriter run
+  // even though the effect-gate itself reports `no_write_effect`.
+  //
+  // This is the same escalation concern the 2026-07-02 P1-D live issue
+  // called out at the orchestrator classifier level — the repair path
+  // needs the same guarantee so a read-only user message doesn't spawn
+  // an extra LLM call to "fix" a non-existent missing write.
+  test("repair branch does not fire on a read request even when profile=full and effect-gate sees no writes", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("read_file"), async () => "existing content");
+    const cfg = defaultConfig();
+    cfg.tools = { ...cfg.tools, require_approval: [], sandbox_mode: "permissive" };
+    const ctx = makeExecutionContext("agent", cfg, { workspace_path: process.cwd() });
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor" && executorTurns++ === 0) {
+        return { content: "inspecting", tool_calls: [toolCallWithArgs("read_file", { path: "CONTEXT.md" })] };
+      }
+      if (options.stageLabel === "executor") {
+        return { content: "read complete" };
+      }
+      if (options.stageLabel === "synthesizer") {
+        return { content: "Here's the context." };
+      }
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "read CONTEXT.md and summarize what it says",
+      ["executor", "synthesizer"],
+      "run-read-no-repair",
+      () => {},
+      { executionProfile: "full" },
+    );
+
+    // The effect gate still flags no_write_effect (full profile + only reads),
+    // but the repair branch must not run for a read intent.
+    expect(result.outcome).toBe("degraded");
+    expect(result.error_code).toBe("effect_gate_no_write_effect");
+    expect(rows.find((row) => row.mode_id === "rewriter")).toBeUndefined();
+  });
+
+  test("repair branch does not fire on an explanatory request (no mutation verb, no file path)", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("read_file"), async () => "existing content");
+    const cfg = defaultConfig();
+    cfg.tools = { ...cfg.tools, require_approval: [], sandbox_mode: "permissive" };
+    const ctx = makeExecutionContext("agent", cfg, { workspace_path: process.cwd() });
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor" && executorTurns++ === 0) {
+        return { content: "checking", tool_calls: [toolCallWithArgs("read_file", { path: "src/main.ts" })] };
+      }
+      if (options.stageLabel === "executor") {
+        return { content: "read complete" };
+      }
+      if (options.stageLabel === "synthesizer") {
+        return { content: "The code does X then Y." };
+      }
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "what does this code do?",
+      ["executor", "synthesizer"],
+      "run-explain-no-repair",
+      () => {},
+      { executionProfile: "full" },
+    );
+
+    expect(result.outcome).toBe("degraded");
+    expect(result.error_code).toBe("effect_gate_no_write_effect");
+    expect(rows.find((row) => row.mode_id === "rewriter")).toBeUndefined();
+  });
+
+  test("repair branch does not fire on an explain-the-api request (no mutation verb at all)", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("read_file"), async () => "API surface content");
+    const cfg = defaultConfig();
+    cfg.tools = { ...cfg.tools, require_approval: [], sandbox_mode: "permissive" };
+    const ctx = makeExecutionContext("agent", cfg, { workspace_path: process.cwd() });
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor" && executorTurns++ === 0) {
+        return { content: "looking up", tool_calls: [toolCallWithArgs("read_file", { path: "src/api.ts" })] };
+      }
+      if (options.stageLabel === "executor") {
+        return { content: "read complete" };
+      }
+      if (options.stageLabel === "synthesizer") {
+        return { content: "The API has these endpoints." };
+      }
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "explain the api",
+      ["executor", "synthesizer"],
+      "run-explain-api-no-repair",
+      () => {},
+      { executionProfile: "full" },
+    );
+
+    expect(result.outcome).toBe("degraded");
+    expect(result.error_code).toBe("effect_gate_no_write_effect");
+    expect(rows.find((row) => row.mode_id === "rewriter")).toBeUndefined();
+  });
 });
