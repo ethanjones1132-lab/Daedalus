@@ -235,10 +235,12 @@ describe("tools.interactive_approval", () => {
 describe("orchestrator agent pool config", () => {
   test("defaultConfig provides a sane enabled agent pool", () => {
     const agents = defaultConfig().orchestrator.agents;
+    const enabledAgents = agents.filter((agent) => agent.enabled);
     expect(agents.length).toBeGreaterThanOrEqual(3);
-    expect(agents.every((agent) => agent.enabled)).toBe(true);
-    expect(agents.some((agent) => agent.default_for.includes("executor"))).toBe(true);
-    expect(agents.some((agent) => agent.default_for.includes("reviewer"))).toBe(true);
+    expect(enabledAgents.length).toBeGreaterThanOrEqual(3);
+    expect(enabledAgents.some((agent) => agent.default_for.includes("executor"))).toBe(true);
+    expect(enabledAgents.some((agent) => agent.default_for.includes("reviewer"))).toBe(true);
+    expect(enabledAgents.some((agent) => agent.default_for.includes("synthesizer"))).toBe(true);
   });
 
   test("normalizeConfig fills in missing orchestrator agents", () => {

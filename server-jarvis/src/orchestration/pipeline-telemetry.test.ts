@@ -25,6 +25,14 @@ function toolCall(name: string) {
   };
 }
 
+function toolCallWithArgs(name: string, args: Record<string, unknown>) {
+  return {
+    id: `call_${name}_${Math.random().toString(36).slice(2)}`,
+    type: "function",
+    function: { name, arguments: JSON.stringify(args) },
+  };
+}
+
 function telemetryHarness(toolName: string, handler: () => Promise<string>) {
   const rows: StageRun[] = [];
   const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
@@ -129,5 +137,62 @@ describe("pipeline stage telemetry", () => {
     expect(result.outcome).toBe("degraded");
     expect(result.error_code).toStartWith("effect_gate_");
     expect(synthesizerInput).toContain("Execution Verification");
+  });
+
+  test("no-write effect triggers a rewriter repair before synthesis", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("read_file"), async () => "existing content");
+    runtime.register(toolDefinition("write_file"), async () => "wrote file");
+    const cfg = defaultConfig();
+    cfg.tools = { ...cfg.tools, require_approval: [], sandbox_mode: "permissive" };
+    const ctx = makeExecutionContext("agent", cfg, { workspace_path: process.cwd() });
+    let executorTurns = 0;
+    let rewriterTurns = 0;
+    let writeCalls = 0;
+    let synthesizerInput = "";
+    const callModel = async (messages: Array<{ role: string; content: string }>, options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor" && executorTurns++ === 0) {
+        return { content: "inspecting", tool_calls: [toolCallWithArgs("read_file", { path: "CONTEXT.md" })] };
+      }
+      if (options.stageLabel === "executor") {
+        return { content: "read complete" };
+      }
+      if (options.stageLabel === "reviewer") {
+        return { content: "ACCEPT" };
+      }
+      if (options.stageLabel === "rewriter" && rewriterTurns++ === 0) {
+        writeCalls++;
+        return {
+          content: "repairing missing write",
+          tool_calls: [toolCallWithArgs("write_file", { path: "workspace/smoke.md", content: "- done" })],
+        };
+      }
+      if (options.stageLabel === "rewriter") {
+        return { content: "repair complete" };
+      }
+      if (options.stageLabel === "synthesizer") {
+        synthesizerInput = messages.find((message) => message.role === "user")?.content ?? "";
+        return { content: "The file was written." };
+      }
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "write workspace/smoke.md",
+      ["executor", "reviewer", "synthesizer"],
+      "run-effect-gate-repair",
+      () => {},
+      { executionProfile: "full" },
+    );
+
+    expect(writeCalls).toBe(1);
+    expect(result.outcome).toBe("success");
+    expect(result.error_code).toBeUndefined();
+    expect(synthesizerInput).not.toContain("ZERO file mutations succeeded");
+    const rewriterRow = rows.find((row) => row.mode_id === "rewriter");
+    expect(rewriterRow?.tool_calls_json).toContain("write_file");
   });
 });

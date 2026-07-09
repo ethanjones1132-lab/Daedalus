@@ -63,6 +63,15 @@ export interface PipelineExecuteOptions {
 
 const READ_CACHE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "web_fetch"]);
 
+function hasMutationIntent(request: string): boolean {
+  const text = request.toLowerCase();
+  const mutationVerb = /\b(write|create|add|edit|modify|update|change|patch|fix|implement|generate|save|replace|delete|remove)\b/.test(text);
+  const targetHint = /\b(file|repo|code|source|workspace|path|doc|document|config|test|script)\b/.test(text)
+    || /(?:^|[\s"'`])[\w.-]+\/[\w./-]+/.test(text)
+    || /\.[a-z0-9]{1,12}\b/.test(text);
+  return mutationVerb && targetHint;
+}
+
 function parseStreamedToolCall(raw: any): ToolCall {
   const name = raw?.function?.name ?? raw?.name ?? "";
   let args: Record<string, unknown> = {};
@@ -783,11 +792,38 @@ export class PipelineExecutor {
       if (rewriter) state.rewriter = rewriter;
     }
 
-    const effectGate = evaluateEffectGate({
+    let effectGate = evaluateEffectGate({
       profile,
       executor: state.executor,
       rewriter: state.rewriter,
     });
+    if (
+      effectGate.verdict === "no_write_effect" &&
+      profile === "full" &&
+      hasMutationIntent(request) &&
+      state.executor &&
+      !state.rewriter
+    ) {
+      onStateChange({ stage: "rewriter", status: "running", output: "\nNo write effect detected. Repairing before synthesis...\n" });
+      state.rewriter = await this.runRewriterStage(
+        request,
+        [
+          effectGate.synthesizerNotice,
+          "",
+          "Repair requirement: this is a change request and the executor produced zero successful file mutations. Apply the missing requested write/edit now, then verify the changed file.",
+        ].join("\n"),
+        renderExecutorSummary(state.executor),
+        agentRunId,
+        onStateChange,
+        options,
+        profile,
+      );
+      effectGate = evaluateEffectGate({
+        profile,
+        executor: state.executor,
+        rewriter: state.rewriter,
+      });
+    }
 
     if (!stages.includes("synthesizer")) {
       return { state, effectGate };

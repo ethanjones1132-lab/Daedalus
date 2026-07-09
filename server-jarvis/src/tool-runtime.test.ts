@@ -351,11 +351,12 @@ describe("ToolRuntime permission policy", () => {
 
   // ── ask path: requires_approval → interactive allowed ─────────────────────
 
-  test("approval-required tool in interactive chat WITHOUT an approval hook is DENIED (not silently run)", async () => {
+  test("approval-required tool in interactive chat WITHOUT an approval hook is DENIED when interactive approval is enabled", async () => {
     // Regression: the old behavior let an approval-gated tool fall through and
     // execute when the surface provided no requestApproval hook. That silently
     // ran writes/shell unapproved. It must now deny with approval_unavailable.
     const runtime = createToolRuntime();
+    const cfg = makeToolsCfg({ interactive_approval: true });
     let handlerRan = false;
     runtime.register(
       makeDefWithFlags("gated_chat", { requires_approval: true }),
@@ -363,22 +364,40 @@ describe("ToolRuntime permission policy", () => {
     );
     const result = await runtime.execute(
       { id: "c3", name: "gated_chat", arguments: {} },
-      makeExecutionContext("chat", defaultConfig()),
+      makeExecutionContext("chat", cfg),
     );
     expect(result.is_error).toBe(true);
     expect(result.error_code).toBe("approval_unavailable");
     expect(handlerRan).toBe(false);
   });
 
+  test("approval-required tool in interactive chat runs directly when interactive approval is disabled", async () => {
+    const runtime = createToolRuntime();
+    const cfg = makeToolsCfg({ interactive_approval: false });
+    let handlerRan = false;
+    runtime.register(
+      makeDefWithFlags("gated_passthrough", { requires_approval: true }),
+      async () => { handlerRan = true; return "passthrough result"; },
+    );
+    const result = await runtime.execute(
+      { id: "c3b", name: "gated_passthrough", arguments: {} },
+      makeExecutionContext("chat", cfg),
+    );
+    expect(result.is_error).toBe(false);
+    expect(result.output).toBe("passthrough result");
+    expect(handlerRan).toBe(true);
+  });
+
   test("approval-required tool runs when the approval hook approves", async () => {
     const runtime = createToolRuntime();
+    const cfg = makeToolsCfg({ interactive_approval: true });
     runtime.register(
       makeDefWithFlags("gated_chat", { requires_approval: true }),
       async () => "approved result",
     );
     const result = await runtime.execute(
       { id: "c3", name: "gated_chat", arguments: {} },
-      makeExecutionContext("chat", defaultConfig(), { requestApproval: async () => true }),
+      makeExecutionContext("chat", cfg, { requestApproval: async () => true }),
     );
     expect(result.is_error).toBe(false);
     expect(result.output).toBe("approved result");
@@ -386,6 +405,7 @@ describe("ToolRuntime permission policy", () => {
 
   test("approval-required tool is rejected when the approval hook declines", async () => {
     const runtime = createToolRuntime();
+    const cfg = makeToolsCfg({ interactive_approval: true });
     let handlerRan = false;
     runtime.register(
       makeDefWithFlags("gated_chat", { requires_approval: true }),
@@ -393,7 +413,7 @@ describe("ToolRuntime permission policy", () => {
     );
     const result = await runtime.execute(
       { id: "c3", name: "gated_chat", arguments: {} },
-      makeExecutionContext("chat", defaultConfig(), { requestApproval: async () => false }),
+      makeExecutionContext("chat", cfg, { requestApproval: async () => false }),
     );
     expect(result.is_error).toBe(true);
     expect(result.error_code).toBe("approval_rejected");
@@ -465,6 +485,12 @@ describe("ToolRuntime permission policy", () => {
 // only run the handler on approval. No callback → backward-compatible passthrough.
 
 describe("ToolRuntime approval callback", () => {
+  function cfgWithInteractiveApproval(): JarvisConfig {
+    const cfg = defaultConfig();
+    cfg.tools = { ...cfg.tools, interactive_approval: true };
+    return cfg;
+  }
+
   function makeDefWithFlags(
     name: string,
     flags: { requires_approval?: boolean; dangerous?: boolean } = {},
@@ -474,12 +500,13 @@ describe("ToolRuntime approval callback", () => {
 
   test("ask + requestApproval(true) runs the handler and returns success", async () => {
     const runtime = createToolRuntime();
+    const cfg = cfgWithInteractiveApproval();
     let handlerCalled = false;
     runtime.register(
       makeDefWithFlags("gated_ok", { requires_approval: true }),
       async () => { handlerCalled = true; return "did the thing"; },
     );
-    const ctx = makeExecutionContext("chat", defaultConfig(), {
+    const ctx = makeExecutionContext("chat", cfg, {
       requestApproval: async () => true,
     });
     const result = await runtime.execute({ id: "a1", name: "gated_ok", arguments: {} }, ctx);
@@ -490,12 +517,13 @@ describe("ToolRuntime approval callback", () => {
 
   test("ask + requestApproval(false) denies and does NOT run the handler", async () => {
     const runtime = createToolRuntime();
+    const cfg = cfgWithInteractiveApproval();
     let handlerCalled = false;
     runtime.register(
       makeDefWithFlags("gated_no", { requires_approval: true }),
       async () => { handlerCalled = true; return "should not run"; },
     );
-    const ctx = makeExecutionContext("chat", defaultConfig(), {
+    const ctx = makeExecutionContext("chat", cfg, {
       requestApproval: async () => false,
     });
     const result = await runtime.execute({ id: "a2", name: "gated_no", arguments: {} }, ctx);
@@ -506,12 +534,13 @@ describe("ToolRuntime approval callback", () => {
 
   test("requestApproval receives the call id, name, and arguments", async () => {
     const runtime = createToolRuntime();
+    const cfg = cfgWithInteractiveApproval();
     let seen: any = null;
     runtime.register(
       makeDefWithFlags("gated_info", { requires_approval: true }),
       async () => "ok",
     );
-    const ctx = makeExecutionContext("chat", defaultConfig(), {
+    const ctx = makeExecutionContext("chat", cfg, {
       requestApproval: async (req) => { seen = req; return true; },
     });
     await runtime.execute({ id: "a3", name: "gated_info", arguments: { path: "/x" } }, ctx);

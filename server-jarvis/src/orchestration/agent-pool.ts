@@ -55,14 +55,12 @@ export const ORCHESTRATOR_STAGES = [
 // each provider are resolved at request time via `resolveProviderTarget`
 // (see providers.ts), so the same fallback cascade can hop across providers.
 //
-// Stage pinning: the OpenCode Zen models lead each stage (most reliable,
-// dedicated keys, no free-router hangs). OpenCode Go and OpenRouter free
-// models form the cross-provider fallback tail so a single provider's rate
-// limit or outage never kills a turn. OpenCode Go `minimax-m3` IS included (it
-// serves OpenAI-compatible /chat/completions) as a non-default reasoning
-// fallback member; its `<think>` blocks are stripped by buildSynthesizerContext
-// and the chat ReasoningParser. It is never a stage default (would burn budget
-// on reasoning for short JSON like the coordinator needs).
+// Stage pinning: OpenCode Go models lead each stage because the current
+// OpenCode catalog exposes `deepseek-v4-flash`/`deepseek-v4-pro` as runnable
+// model ids. The older Zen `*-free` ids are retained as documented catalog
+// records but disabled by default; on current keys they can 400, require
+// billing, or stall before first token, so they must not be stage defaults or
+// automatic fallback picks.
 export const DEFAULT_ORCHESTRATOR_AGENTS: OrchestratorAgent[] = [
   // ── OpenCode Zen (primary, OpenAI-compatible) ───────────────────
   {
@@ -74,8 +72,8 @@ export const DEFAULT_ORCHESTRATOR_AGENTS: OrchestratorAgent[] = [
     provider: "opencode_zen",
     model_id: "deepseek-v4-flash-free",
     capabilities: { code: 0.9, reasoning: 0.86, speed: 0.82, cost: 1, json_reliability: 0.9 },
-    default_for: ["coordinator", "reviewer"],
-    enabled: true,
+    default_for: [],
+    enabled: false,
   },
   {
     // mimo-v2.5-free stays in the pool as a general fallback member, but NOT as
@@ -85,7 +83,7 @@ export const DEFAULT_ORCHESTRATOR_AGENTS: OrchestratorAgent[] = [
     model_id: "mimo-v2.5-free",
     capabilities: { code: 0.72, reasoning: 0.8, speed: 0.7, cost: 1, json_reliability: 0.7 },
     default_for: [],
-    enabled: true,
+    enabled: false,
   },
   {
     // Planner + synthesizer → strongest reasoning in the Zen catalog.
@@ -93,13 +91,13 @@ export const DEFAULT_ORCHESTRATOR_AGENTS: OrchestratorAgent[] = [
     provider: "opencode_zen",
     model_id: "nemotron-3-ultra-free",
     capabilities: { code: 0.8, reasoning: 0.95, speed: 0.55, cost: 1, json_reliability: 0.88 },
-    default_for: ["planner", "synthesizer"],
+    default_for: [],
     // Live 2026-06-26 diagnosis: this model has reliably-slow cold-start
     // latency and was hitting the 30s first-token watchdog right as valid
     // content began streaming. Per-model override widens the window to 55s
     // (still below the 60s stream-stall cap).
     first_token_timeout_ms: 55_000,
-    enabled: true,
+    enabled: false,
   },
   {
     // Executor + rewriter → code-specialized.
@@ -107,10 +105,18 @@ export const DEFAULT_ORCHESTRATOR_AGENTS: OrchestratorAgent[] = [
     provider: "opencode_zen",
     model_id: "north-mini-code-free",
     capabilities: { code: 0.92, reasoning: 0.72, speed: 0.72, cost: 1, json_reliability: 0.8 },
-    default_for: ["executor", "rewriter"],
-    enabled: true,
+    default_for: [],
+    enabled: false,
   },
   // ── OpenCode Go (OpenAI-compatible tail) ────────────────────────
+  {
+    id: "go-deepseek-v4-flash",
+    provider: "opencode_go",
+    model_id: "deepseek-v4-flash",
+    capabilities: { code: 0.9, reasoning: 0.86, speed: 0.82, cost: 0.85, json_reliability: 0.9 },
+    default_for: ["coordinator", "reviewer", "synthesizer"],
+    enabled: true,
+  },
   {
     id: "go-mimo-v25",
     provider: "opencode_go",
@@ -123,8 +129,8 @@ export const DEFAULT_ORCHESTRATOR_AGENTS: OrchestratorAgent[] = [
     id: "go-deepseek-v4-pro",
     provider: "opencode_go",
     model_id: "deepseek-v4-pro",
-    capabilities: { code: 0.93, reasoning: 0.9, speed: 0.6, cost: 0.7, json_reliability: 0.85 },
-    default_for: ["executor"],
+    capabilities: { code: 0.93, reasoning: 0.9, speed: 0.7, cost: 0.7, json_reliability: 0.85 },
+    default_for: ["planner", "executor", "rewriter", "synthesizer"],
     enabled: true,
   },
   {
@@ -139,10 +145,10 @@ export const DEFAULT_ORCHESTRATOR_AGENTS: OrchestratorAgent[] = [
   },
   // ── OpenRouter (cross-provider fallback tail) ───────────────────
   {
-    id: "or-owl-alpha",
+    id: "or-openrouter-free",
     provider: "openrouter",
-    model_id: "openrouter/owl-alpha",
-    capabilities: { code: 0.6, reasoning: 0.72, speed: 0.8, cost: 1, json_reliability: 0.78 },
+    model_id: "openrouter/free",
+    capabilities: { code: 0.55, reasoning: 0.65, speed: 0.8, cost: 1, json_reliability: 0.72 },
     default_for: [],
     enabled: true,
   },
@@ -151,18 +157,18 @@ export const DEFAULT_ORCHESTRATOR_AGENTS: OrchestratorAgent[] = [
     provider: "openrouter",
     model_id: "nvidia/nemotron-3-ultra-550b-a55b:free",
     capabilities: { code: 0.78, reasoning: 0.96, speed: 0.42, cost: 1, json_reliability: 0.88 },
-    default_for: ["reviewer"],
+    default_for: [],
     // Same family as `zen-nemotron-ultra-free` — large reasoning model with
     // slow cold-start. Same per-model override.
     first_token_timeout_ms: 55_000,
-    enabled: true,
+    enabled: false,
   },
   {
     id: "or-north-code-free",
     provider: "openrouter",
     model_id: "cohere/north-mini-code:free",
     capabilities: { code: 0.92, reasoning: 0.72, speed: 0.7, cost: 1, json_reliability: 0.78 },
-    default_for: ["rewriter"],
+    default_for: [],
     enabled: true,
   },
   {
@@ -170,7 +176,7 @@ export const DEFAULT_ORCHESTRATOR_AGENTS: OrchestratorAgent[] = [
     provider: "openrouter",
     model_id: "deepseek/deepseek-v4-flash",
     capabilities: { code: 0.9, reasoning: 0.86, speed: 0.78, cost: 0.55, json_reliability: 0.82 },
-    default_for: ["executor", "reviewer"],
+    default_for: [],
     enabled: true,
   },
   {

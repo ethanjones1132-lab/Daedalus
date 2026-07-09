@@ -131,8 +131,8 @@ export interface ToolRuntime {
  *
  * - `"allow"`: execute without restriction.
  * - `"ask"`: interactive surface must obtain user approval before proceeding.
- *   The runtime allows the handler to run; approval prompting is the caller's
- *   responsibility. Only returned when `ctx.interactive` is `true`.
+ *   Only returned when `ctx.interactive` and `config.tools.interactive_approval`
+ *   are both true.
  * - `"deny"`: execution blocked; a deterministic error is returned to the caller.
  */
 export type PolicyDecision = "allow" | "ask" | "deny";
@@ -152,9 +152,10 @@ export interface PolicyResult {
  * 1. `config.tools.enabled = false` → deny all tools.
  * 2. `dangerous = true` AND `sandbox_mode = 'strict'` AND `!interactive` → deny.
  * 3. Approval required (def flag OR config list) AND `!interactive` → deny.
- * 4. Approval required AND `interactive` → ask (caller must prompt user).
- * 5. `dangerous = true` AND `sandbox_mode = 'strict'` AND `interactive` → ask.
- * 6. Otherwise → allow.
+ * 4. Approval required AND `interactive` AND `interactive_approval = true` -> ask.
+ * 5. Approval required AND `interactive` AND `interactive_approval = false` -> allow.
+ * 6. `dangerous = true` AND `sandbox_mode = 'strict'` AND `interactive_approval = true` -> ask.
+ * 7. Otherwise -> allow.
  */
 export function evaluatePolicy(
   def: ToolDefinition,
@@ -190,8 +191,10 @@ export function evaluatePolicy(
     };
   }
 
-  // Approval-required in interactive context: surface must ask user
-  if (requiresApproval && interactive) {
+  // Approval-required in interactive context asks only when the chat surface
+  // has explicitly enabled blocking approval. With interactive approval off,
+  // Jarvis preserves the legacy passthrough path used by live chat writes.
+  if (requiresApproval && interactive && toolCfg.interactive_approval) {
     return {
       decision: "ask",
       reason: `Tool "${name}" requires user approval`,
@@ -199,7 +202,7 @@ export function evaluatePolicy(
   }
 
   // Dangerous + strict + interactive: surface should ask user
-  if (def.dangerous && toolCfg.sandbox_mode === "strict" && interactive) {
+  if (def.dangerous && toolCfg.sandbox_mode === "strict" && interactive && toolCfg.interactive_approval) {
     return {
       decision: "ask",
       reason: `Tool "${name}" is dangerous; strict sandbox mode requires user approval`,

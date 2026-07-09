@@ -193,7 +193,7 @@ describe("AgentPool", () => {
     expect(byModel).toContain("deepseek-v4-pro");
     expect(byModel).toContain("minimax-m3");
     // OpenRouter (namespaced ids)
-    expect(byModel).toContain("openrouter/owl-alpha");
+    expect(byModel).toContain("openrouter/free");
     expect(byModel).toContain("nvidia/nemotron-3-ultra-550b-a55b:free");
     expect(byModel).toContain("cohere/north-mini-code:free");
     expect(byModel).toContain("deepseek/deepseek-v4-flash");
@@ -208,22 +208,28 @@ describe("AgentPool", () => {
     expect(providers).toContain("openrouter");
   });
 
-  test("coordinator and planner default to reliable OpenCode Zen models, not the free router", () => {
+  test("stage defaults use runnable OpenCode Go models, not stale free Zen ids", () => {
     // The free router caused multi-minute stalls on the coordinator/planner
     // stages (post-hang diagnosis 2026-06-24). Both stages now default to
     // OpenCode Zen models with dedicated keys.
     const coordinator = DEFAULT_ORCHESTRATOR_AGENTS.find((agent) => agent.default_for.includes("coordinator"));
     const planner = DEFAULT_ORCHESTRATOR_AGENTS.find((agent) => agent.default_for.includes("planner"));
+    const executor = DEFAULT_ORCHESTRATOR_AGENTS.find((agent) => agent.default_for.includes("executor"));
+    const rewriter = DEFAULT_ORCHESTRATOR_AGENTS.find((agent) => agent.default_for.includes("rewriter"));
+    const synthesizer = DEFAULT_ORCHESTRATOR_AGENTS.find((agent) => agent.default_for.includes("synthesizer"));
 
     expect(coordinator).toBeDefined();
-    expect(coordinator?.provider).toBe("opencode_zen");
+    expect(coordinator?.provider).toBe("opencode_go");
     // Non-reasoning, terminal-JSON model — reasoning-heavy models emit no
     // `content` for short coordinator prompts and break routing.
-    expect(coordinator?.model_id).toBe("deepseek-v4-flash-free");
+    expect(coordinator?.model_id).toBe("deepseek-v4-flash");
 
     expect(planner).toBeDefined();
-    expect(planner?.provider).toBe("opencode_zen");
-    expect(planner?.model_id).toBe("nemotron-3-ultra-free");
+    expect(planner?.provider).toBe("opencode_go");
+    expect(planner?.model_id).toBe("deepseek-v4-pro");
+    expect(executor?.model_id).toBe("deepseek-v4-pro");
+    expect(rewriter?.model_id).toBe("deepseek-v4-pro");
+    expect(synthesizer?.model_id).toBe("deepseek-v4-flash");
   });
 
   test("no stage defaults to the unreliable openrouter/free router model", () => {
@@ -235,18 +241,32 @@ describe("AgentPool", () => {
     }
   });
 
-  test("planner + synthesizer defaults carry the 2026-06-26 first-token override", () => {
+  test("synthesizer fallback after OpenCode Go Flash uses OpenCode Go Pro", () => {
+    const pool = new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS);
+    const picked = pool.pickFor(
+      "synthesizer",
+      "general",
+      new Set(["opencode_go:deepseek-v4-flash"]),
+    );
+    expect(picked?.provider).toBe("opencode_go");
+    expect(picked?.model_id).toBe("deepseek-v4-pro");
+  });
+
+  test("stale Zen Nemotron remains disabled with its documented first-token override", () => {
     // The live diagnosis named `nemotron-3-ultra-free` as a model that
     // hits the 30s first-token watchdog right as valid content begins
     // streaming. The override is the seam that prevents the chain from
     // aborting that turn.
     const planner = DEFAULT_ORCHESTRATOR_AGENTS.find((a) => a.default_for.includes("planner"));
     const synth = DEFAULT_ORCHESTRATOR_AGENTS.find((a) => a.default_for.includes("synthesizer"));
-    expect(planner?.first_token_timeout_ms).toBe(55_000);
-    expect(synth?.first_token_timeout_ms).toBe(55_000);
+    const nemotron = DEFAULT_ORCHESTRATOR_AGENTS.find((a) => a.model_id === "nemotron-3-ultra-free");
+    expect(planner?.model_id).not.toBe("nemotron-3-ultra-free");
+    expect(synth?.model_id).not.toBe("nemotron-3-ultra-free");
+    expect(nemotron?.enabled).toBe(false);
+    expect(nemotron?.first_token_timeout_ms).toBe(55_000);
   });
 
-  test("firstTokenTimeoutFor resolves Nemotron planner + synthesizer to 55_000 via the DEFAULT pool", () => {
+  test("firstTokenTimeoutFor does not resurrect disabled DEFAULT Zen Nemotron", () => {
     // Regression guard for the 2026-06-27 first-token watchdog bug. The
     // orchestrator and agent-loop call sites in `index.ts` used to compute
     // the per-model override value but pass the global 30_000 constant to
@@ -258,14 +278,10 @@ describe("AgentPool", () => {
     // re-uses the global constant instead of the resolved value) is caught
     // by the helper's contract.
     const defaultPool = new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS);
-    const planner = DEFAULT_ORCHESTRATOR_AGENTS.find((a) => a.default_for.includes("planner"));
-    const synth = DEFAULT_ORCHESTRATOR_AGENTS.find((a) => a.default_for.includes("synthesizer"));
-    expect(planner?.model_id).toBe("nemotron-3-ultra-free");
-    expect(synth?.model_id).toBe("nemotron-3-ultra-free");
+    const nemotron = DEFAULT_ORCHESTRATOR_AGENTS.find((a) => a.model_id === "nemotron-3-ultra-free");
     // 55_000 must be the resolved value — not 30_000 — so the call site
     // genuinely grants the wider window.
-    expect(firstTokenTimeoutFor(defaultPool, planner!.model_id, 30_000)).toBe(55_000);
-    expect(firstTokenTimeoutFor(defaultPool, synth!.model_id, 30_000)).toBe(55_000);
+    expect(firstTokenTimeoutFor(defaultPool, nemotron!.model_id, 30_000)).toBe(30_000);
   });
 });
 

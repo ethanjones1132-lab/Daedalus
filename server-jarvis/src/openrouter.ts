@@ -549,9 +549,8 @@ export async function* streamOpenRouterSSE(
 const RETRY_DELAYS = [1000, 2000, 4000]; // ms exponential backoff
 const PREFERRED_FREE_FALLBACKS = [
   "openrouter/free",
-  "openrouter/owl-alpha",
-  "qwen/qwen3-coder:free",
   "cohere/north-mini-code:free",
+  "qwen/qwen3-coder:free",
   "nvidia/llama-3.1-nemotron-ultra-253b-v1:free",
   "openai/gpt-oss-120b:free",
   "meta-llama/llama-3.3-70b-instruct:free",

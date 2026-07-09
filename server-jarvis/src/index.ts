@@ -777,7 +777,6 @@ async function resolveOpenRouterModel(cfg: JarvisConfig): Promise<string> {
   const candidates = uniqueStrings([
     requested,
     "openrouter/free",
-    "openrouter/owl-alpha",
     ...cfg.openrouter.fallbacks,
   ]);
 
