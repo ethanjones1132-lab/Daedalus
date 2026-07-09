@@ -127,14 +127,18 @@ describe("Tier A SAFETY gate: policy + approval on mutating tools", () => {
   });
 
   test("GATE-TA-S2: an interactive 'ask' rejected via requestApproval does not run the handler", async () => {
-    const ws = makeTempWorkspace();
-    const rt = makeRuntime();
-    const ctx = makeCtx(ws, "chat", { requestApproval: async () => false });
-    const res = await rt.execute(call("write_file", { path: "blocked.txt", content: "nope" }), ctx);
-    // SAFETY GATE: a rejected approval must block the write.
-    expect(res.is_error).toBe(true);
-    expect(existsSync(join(ws, "blocked.txt"))).toBe(false);
-  });
+      const ws = makeTempWorkspace();
+      const rt = makeRuntime();
+      const cfg = defaultConfig();
+      cfg.jarvis_path = ws;
+      cfg.tools.enabled = true;
+      cfg.tools.interactive_approval = true;
+      const ctx = makeExecutionContext("chat", cfg, { workspace_path: ws, requestApproval: async () => false });
+      const res = await rt.execute(call("write_file", { path: "blocked.txt", content: "nope" }), ctx);
+      // SAFETY GATE: a rejected approval must block the write.
+      expect(res.is_error).toBe(true);
+      expect(existsSync(join(ws, "blocked.txt"))).toBe(false);
+    });
 });
 
 // ── STABILITY GATE ──────────────────────────────────────────────────────────

@@ -100,11 +100,16 @@ export async function runCronRequest(req: CronRunRequest, cfg: JarvisConfig): Pr
       const result = await executeWithTimeout(runtime, call, ctx);
       results.push(result);
     } catch (e: any) {
-      results.push({
-        is_error: true,
-        content: [{ type: "text", text: e?.message ?? String(e) }],
-      } as ToolResult);
-    }
+          results.push({
+            call_id: call.id,
+            name: call.name,
+            output: "",
+            is_error: true,
+            error: e?.message ?? String(e),
+            error_code: "handler_error",
+            duration_ms: 0,
+          });
+        }
   }
 
   return {
