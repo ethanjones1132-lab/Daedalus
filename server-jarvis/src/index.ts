@@ -92,10 +92,15 @@ import type { PipelineProgressState, PipelineRecursionEvent } from "./orchestrat
 import {
   classifyTurnRequirements,
   inheritRequirementForContinuation,
+  shouldShortCircuitCoordinator,
   type TurnRequirement,
 } from "./orchestration/turn-requirements";
 import { isContinuationTurn } from "./orchestration/turn-triage";
-import { normalizeRoute, type ExecutionProfile } from "./orchestration/route-normalization";
+import {
+  buildShortCircuitRoute,
+  normalizeRoute,
+  type ExecutionProfile,
+} from "./orchestration/route-normalization";
 import { runPipelineWithReplanning } from "./orchestration/replan-loop";
 import { buildBoundedHistoryBlock } from "./orchestration/context-budget";
 import { SessionReplanCounter } from "./orchestration/replan-telemetry";
@@ -116,7 +121,14 @@ import {
 } from "./intelligence/mod";
 import { makeCallModel } from "./eval/call-model";
 import { normalizeStreamedToolCalls } from "./streaming-tool-calls";
+import { countTokens } from "./tokens";
 import { WorkspaceAffinityStore } from "./orchestration/workspace-affinity";
+import { createRuntimeMonitor } from "./performance/runtime-monitor";
+import { loadInferenceFeedback } from "./self-tuning/inference-feedback";
+import {
+  INFERENCE_FEEDBACK_CRON_JOB_ID,
+  refreshInferenceFeedback,
+} from "./self-tuning/inference-feedback-refresh";
 
 // ── Structured Logging Override ──────────────────────────────────────────────
 const originalLog = console.log;
@@ -404,6 +416,11 @@ const sessionMemory = new SessionMemory(() => loadConfig().orchestrator.session_
 const MAX_CONTINUATION_REQUIREMENTS = 256;
 const continuationRequirements = new Map<string, TurnRequirement>();
 const workspaceAffinity = new WorkspaceAffinityStore();
+const inferenceFeedbackLoad = loadInferenceFeedback();
+console.log(
+  `[Jarvis Orchestrator] Inference feedback startup load: applied=${inferenceFeedbackLoad.applied} ` +
+  `ignored=${inferenceFeedbackLoad.ignored} status=${inferenceFeedbackLoad.reason ?? "active"}`,
+);
 
 function rememberContinuationRequirement(sessionId: string, requirement: TurnRequirement): void {
   continuationRequirements.delete(sessionId);
@@ -442,6 +459,20 @@ const JARVIS_BUILT_AT = process.env.JARVIS_BUILT_AT ?? null;
 
 let totalRequests = 0;
 const startTime = Date.now();
+const runtimePerformanceMonitor = process.env.JARVIS_PERF_MONITOR === "1"
+  ? createRuntimeMonitor()
+  : undefined;
+runtimePerformanceMonitor?.start();
+const runtimePerformanceLogIntervalMs = Math.max(
+  1_000,
+  Number(process.env.JARVIS_PERF_LOG_INTERVAL_MS ?? 10_000) || 10_000,
+);
+const runtimePerformanceLogTimer = runtimePerformanceMonitor
+  ? setInterval(() => {
+      console.log(`[Jarvis Perf] ${JSON.stringify(runtimePerformanceMonitor.snapshot({ reset: true }))}`);
+    }, runtimePerformanceLogIntervalMs)
+  : undefined;
+(runtimePerformanceLogTimer as any)?.unref?.();
 
 interface CompactionCacheEntry {
   originalLength: number;
@@ -1049,6 +1080,16 @@ async function drainStreamJarvisResponse(resp: Response): Promise<{ output: stri
 
 /** Non-streaming cron dispatch — matches cron_scheduler.rs JSON contract. */
 async function runCronInference(body: Record<string, unknown>): Promise<{ success: boolean; output: string; error?: string }> {
+  if (String(body.job_id ?? "") === INFERENCE_FEEDBACK_CRON_JOB_ID) {
+    const refreshed = await refreshInferenceFeedback();
+    return {
+      success: refreshed.success,
+      output: refreshed.output || (refreshed.success
+        ? `Applied ${refreshed.applied ?? 0} inference feedback adjustment(s).`
+        : ""),
+      error: refreshed.error,
+    };
+  }
   const prompt = String(body.prompt ?? "");
   if (!prompt.trim()) return { success: false, output: "", error: "prompt required" };
   const sessionId = String(body.session_id ?? `cron_${crypto.randomUUID()}`);
@@ -1306,7 +1347,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         if (pruned > 0) {
           console.log(`[Jarvis Orchestrator] Pruned ${pruned} expired conductor session file(s)`);
         }
-        const agentPool = new AgentPool(conductorLearning.applyLearnedAgents(cfg.orchestrator.agents ?? []));
+        // AgentPool applies learned + cron feedback exactly once at selection.
+        const agentPool = new AgentPool(cfg.orchestrator.agents ?? []);
         const poolCoverage = agentPool.coverage();
         console.log(`[Jarvis Orchestrator] Agent pool coverage: ${formatPoolDiversity(poolCoverage)}${poolCoverage.stage_gaps.length > 0 ? `; gaps=${poolCoverage.stage_gaps.join(",")}` : ""}`);
 
@@ -1330,6 +1372,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // and those paths are otherwise invisible to `/health/inference`.
         let orchLastModel: string | undefined;
         let orchLastProvider: string | undefined;
+        let orchLastFirstTokenMs: number | undefined;
         let orchestratorAgentRunId: string | undefined;
         const callModelAttempt = async (messages: any[], callOptions?: any, excludeModels?: Set<string>) => {
           ensureTurnBudget(callOptions?.stageLabel ?? "orchestrator_model_attempt");
@@ -1353,7 +1396,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const cascadeTier = callOptions?.cascadeTier as "cheap" | "strong" | undefined;
           if (stageLabel && cfg.orchestrator?.enabled) {
             try {
-              const pool = new AgentPool(conductorLearning.applyLearnedAgents(cfg.orchestrator?.agents ?? []));
+              const pool = new AgentPool(cfg.orchestrator?.agents ?? []);
               let agent: import("./orchestration/agent-pool").OrchestratorAgent | undefined;
               // Honor the empty-completion cascade-advance exclude set: a model
               // that just returned an empty 200 (or hit a 2-strike rate limit)
@@ -1572,6 +1615,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let fullTurnText = "";
           let activeToolCalls: any[] = [];
           let firstTokenReceived = false;
+          let firstTokenLatencyMs: number | undefined;
           // Defense-in-depth: in case the request bypassed the
           // First-token watchdog (orchestrator). If the response body is open
           // but no `choice.delta.content` chunk has arrived before the per-model
@@ -1587,6 +1631,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             agentPool,
             actualModelUsed,
             MODEL_FIRST_TOKEN_TIMEOUT_MS,
+            60_000,
+            actualProviderUsed,
           );
           // First-token timeout flag. P0-B (2026-07-02): the previous
           // build called `streamAbort.abort("First-token timeout")` from
@@ -1632,6 +1678,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const markFirstProgress = () => {
             if (!firstTokenReceived) {
               firstTokenReceived = true;
+              firstTokenLatencyMs = Date.now() - stageAttemptStart;
               clearTimeout(firstTokenTimer);
             }
           };
@@ -1861,6 +1908,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // to "openrouter" in `/health/inference`.
           orchLastModel = actualModelUsed;
           orchLastProvider = actualProviderUsed;
+          orchLastFirstTokenMs = firstTokenLatencyMs;
           if (
             orchestratorAgentRunId &&
             stageLabel &&
@@ -1908,6 +1956,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               provider: actualProviderUsed,
               modelId: actualModelUsed,
               durationMs: Date.now() - stageAttemptStart,
+              firstTokenMs: firstTokenLatencyMs,
               fallbackUsed: (excludeModels?.size ?? 0) > 0,
               wasSuccessful: isAnswerStage ? hasContent : (hasContent || hasToolCalls),
               hadError: isAnswerStage ? !hasContent : (!hasContent && !hasToolCalls),
@@ -2003,30 +2052,47 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // Route the user request through the Fugu-style coordinator. The
         // current executor still consumes a concrete stage list, so null skips
         // and re-entry directives are materialized at the activation boundary.
-        const coordinator = new Coordinator(callModel, persistentConductor);
-        const memoryHints = sessionMemory.toSharedContextHints(sessionId);
-        const route = await coordinator.route(contextMessage, {
-          sessionId,
-          rawMessage: message,
-          history: turnHistory,
-          lastOutcome: sessionMemory.getLastOutcome(sessionId),
-          sessionMemoryHints: memoryHints,
-        });
-        orchestratorTaskType = route.task_type;
-
         // Deterministic capability classification of the RAW current message —
         // NOT `contextMessage` (which prepends history and would let a prior
         // file-read contaminate a follow-up greeting). This is the authoritative
         // signal; the coordinator model's route is advisory.
+        const continuation = isContinuationTurn(message);
         const turnReq = inheritRequirementForContinuation(
           classifyTurnRequirements(message),
           continuationRequirements.get(sessionId),
-          isContinuationTurn(message),
+          continuation,
         );
+        const shortCircuit = shouldShortCircuitCoordinator(message, turnReq, continuation);
+        const coordinator = new Coordinator(callModel, persistentConductor);
+        const workspaceRootHint = `Active filesystem workspace root: ${activeWorkspacePath}. Resolve relative filesystem paths against this root.`;
+        const memoryHints = mergeSharedContextHints(
+          sessionMemory.toSharedContextHints(sessionId, activeWorkspacePath),
+          { relevant_memories: [workspaceRootHint] },
+        );
+        const coordinatorStartedAt = Date.now();
+        const route = shortCircuit
+          ? buildShortCircuitRoute(
+              turnReq.requirement === "conversational" ? "conversational" : "answer_only",
+            )
+          : await coordinator.route(contextMessage, {
+              sessionId,
+              rawMessage: message,
+              history: turnHistory,
+              lastOutcome: sessionMemory.getLastOutcome(sessionId),
+              sessionMemoryHints: memoryHints,
+            });
+        const coordinatorDurationMs = shortCircuit ? 0 : Date.now() - coordinatorStartedAt;
+        orchestratorTaskType = route.task_type;
+
+        const routeSource = shortCircuit
+          ? "trivial_short_circuit"
+          : route.routing_parse_fallback
+            ? "parse_fallback"
+            : "model";
         const normalized = normalizeRoute(
           route,
           turnReq.requirement,
-          turnReq.requirement === "conversational" ? "trivial_short_circuit" : "model",
+          routeSource,
         );
         const executablePipeline = normalized.pipeline;
         const executionProfile: ExecutionProfile = normalized.profile;
@@ -2054,12 +2120,43 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           conductorSource: route.conductor_source ?? "api",
           conductorModel: route.conductor_model,
         });
+        if (!shortCircuit) {
+          const coordinatorSucceeded = !route.routing_parse_fallback;
+          outcomeCollector.recordStageRun({
+            id: `stage_${crypto.randomUUID()}`,
+            agent_run_id: agentRunId,
+            mode_id: "coordinator",
+            turn_number: 1,
+            input_tokens: countTokens(contextMessage),
+            tool_calls_json: "[]",
+            duration_ms: coordinatorDurationMs,
+            was_successful: coordinatorSucceeded ? 1 : 0,
+            had_error: coordinatorSucceeded ? 0 : 1,
+            error_message: coordinatorSucceeded ? undefined : "routing_parse_fallback",
+          });
+          if (orchLastModel && orchLastProvider) {
+            conductorLearning.recordStageModel({
+              agentRunId,
+              stageId: "coordinator",
+              provider: orchLastProvider,
+              modelId: orchLastModel,
+              durationMs: coordinatorDurationMs,
+              firstTokenMs: orchLastFirstTokenMs,
+              wasSuccessful: coordinatorSucceeded,
+              hadError: !coordinatorSucceeded,
+            });
+          }
+        }
         const instructionSelection = conductorLearning.selectInstructionVariants(
           route.worker_instructions,
           route.task_type,
         );
         const resolvedSkills = resolveSkillsForTurn(message, route.task_type);
-        const runStartTime = Date.now();
+        // The canonical run duration must include model-backed routing now that
+        // coordinator time is a first-class stage. Starting this clock after
+        // route selection would make child stage totals exceed their parent
+        // run and corrupt latency/reward feedback.
+        const runStartTime = coordinatorStartedAt;
 
         // Execute the pipeline
         const mergedSharedContext = mergeSharedContextHints(
@@ -2084,6 +2181,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const pipelineOptions = {
           topology: normalized.topology,
           executionProfile,
+          turnRequirement: turnReq.requirement,
           workerInstructions: instructionSelection.instructions,
           sharedContext: mergedSharedContext,
           sessionMemory: sessionMemory,
@@ -2648,6 +2746,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           agentLoopPool,
           modelName,
           MODEL_FIRST_TOKEN_TIMEOUT_MS,
+          60_000,
+          lastProviderUsed,
         );
         // P0-B (2026-07-02): see FirstTokenTimeoutError in this file.
         // The previous build called `streamAbort.abort("First-token timeout")`
@@ -3404,6 +3504,11 @@ async function baseFetch(req: Request): Promise<Response> {
     }
     if (path === "/health/inference") {
       return Response.json(inferenceMetricsSnapshot());
+    }
+    if (path === "/performance/runtime" && req.method === "GET") {
+      return Response.json(runtimePerformanceMonitor
+        ? { enabled: true, snapshot: runtimePerformanceMonitor.snapshot({ reset: false }) }
+        : { enabled: false });
     }
     if (path === "/health/conductor-cache") {
       return Response.json(conductorCacheSnapshot());

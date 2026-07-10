@@ -34,6 +34,30 @@ export interface TurnRequirementResult {
   signals: string[];
 }
 
+const COMPLEX_ANSWER_MARKER =
+  /\b(compare|contrast|evaluate|analy[sz]e|design|architect|plan|research|audit|review|diagnose|derive|prove|calculate|trade-?offs?|strategy|comprehensive|detailed|deep(?:ly)?|multi-?step|step-by-step)\b/i;
+
+/**
+ * Decide whether the deterministic classifier has enough information to skip
+ * the model-backed Coordinator entirely. The shortcut is intentionally narrow:
+ * conversational turns and short, direct knowledge questions only. Workspace
+ * authority, continuation inheritance, pasted tool payloads, and complex
+ * reasoning stay on the Coordinator path.
+ */
+export function shouldShortCircuitCoordinator(
+  message: string,
+  result: TurnRequirementResult,
+  isContinuation: boolean,
+): boolean {
+  if (isContinuation) return false;
+  if (result.requirement === "conversational") return true;
+  if (result.requirement !== "answer_only") return false;
+  const text = (message || "").trim();
+  if (!text || text.length > 280) return false;
+  if (result.signals.includes("tool_call_exemplar")) return false;
+  return !COMPLEX_ANSWER_MARKER.test(text);
+}
+
 const REQUIREMENT_RANK: Record<TurnRequirement, number> = {
   conversational: 0,
   answer_only: 1,

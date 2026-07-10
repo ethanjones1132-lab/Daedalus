@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { normalizeRoute } from "./route-normalization";
+import { buildShortCircuitRoute, normalizeRoute } from "./route-normalization";
 import type { CoordinatorResult } from "./coordinator";
 
 function decision(pipeline: CoordinatorResult["pipeline"], topology: CoordinatorResult["topology"] = "linear"): CoordinatorResult {
@@ -11,6 +11,23 @@ function decision(pipeline: CoordinatorResult["pipeline"], topology: Coordinator
     coordinator_rationale: "test",
   };
 }
+
+describe("buildShortCircuitRoute", () => {
+  test("builds a canonical observable synthesizer-only route", () => {
+    expect(buildShortCircuitRoute("answer_only")).toEqual({
+      task_type: "general",
+      pipeline: ["synthesizer"],
+      topology: "linear",
+      context: {
+        needs_workspace_inspection: false,
+        needs_memory: true,
+        estimated_complexity: "low",
+      },
+      coordinator_rationale: "Deterministic simple-turn short circuit: direct synthesizer answer.",
+      conductor_source: "trivial",
+    });
+  });
+});
 
 describe("normalizeRoute", () => {
   test("workspace_read: model synthesizer-only is UPGRADED to executor+synthesizer read-only", () => {

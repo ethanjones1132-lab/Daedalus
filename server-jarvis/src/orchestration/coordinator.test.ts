@@ -46,6 +46,7 @@ describe("Coordinator", () => {
     expect(result.pipeline).toEqual(["planner", null, "re-enter:planner", "synthesizer"]);
     expect(result.topology).toBe("linear");
     expect(result.context.estimated_complexity).toBe("high");
+    expect(result.routing_parse_fallback).toBeUndefined();
     expect(result.coordinator_rationale).toContain("re-enter");
     expect(calls[0][0].role).toBe("system");
     expect(calls[0][1].content).toContain("session-1");
@@ -67,6 +68,7 @@ describe("Coordinator", () => {
     // Synthesizer-only fallback — no planner, no executor.
     expect(decision.pipeline).toEqual(["synthesizer"]);
     expect(decision.coordinator_rationale).toContain("unparseable");
+    expect(decision.routing_parse_fallback).toBe(true);
   });
 
   test("reuses the prior executor route when continuation output is unparseable", async () => {
@@ -311,6 +313,40 @@ describe("Coordinator", () => {
     expect(decision.shared_context?.relevant_memories).toHaveLength(1);
     expect(decision.shared_context?.failure_patterns?.[0]).toContain("synthesizer-only");
     expect(decision.shared_context?.prior_tool_results?.["grep:coordinator"]).toContain("matches");
+  });
+
+  test("passes retrieved session workspace evidence to the API coordinator", async () => {
+    const calls: ChatMessage[][] = [];
+    const coordinator = new Coordinator(async (messages) => {
+      calls.push(messages);
+      return {
+        content: JSON.stringify({
+          task_type: "general",
+          pipeline: ["executor", "synthesizer"],
+          topology: "linear",
+          context: {
+            needs_workspace_inspection: true,
+            needs_memory: true,
+            estimated_complexity: "low",
+          },
+          coordinator_rationale: "Use the retrieved repository evidence.",
+        }),
+      };
+    });
+
+    await coordinator.route("Summarize this repo", {
+      sessionId: "api-grounding-1",
+      sessionMemoryHints: {
+        relevant_memories: ["Active filesystem workspace root: C:\\Projects\\home-base-recovered"],
+        prior_tool_results: {
+          "read_file:README.md": "Jarvis is a standalone Tauri desktop platform with a Bun server.",
+        },
+      },
+    });
+
+    const apiUserMessage = calls[0]?.find((message) => message.role === "user")?.content ?? "";
+    expect(apiUserMessage).toContain("C:\\Projects\\home-base-recovered");
+    expect(apiUserMessage).toContain("Jarvis is a standalone Tauri desktop platform");
   });
 
   test("suppresses coordinator activity from the user-visible stream", async () => {

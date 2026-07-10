@@ -228,7 +228,7 @@ function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean)
   let errorCode: string | undefined;
   if (segment.synthesizerFatalError) {
     outcome = "failed";
-    errorCode = "stage_error";
+    errorCode = segment.fatalErrorCode ?? "stage_error";
   } else if (segment.synthesizerEmptyCompletion) {
     outcome = "failed";
     errorCode = "empty_completion";

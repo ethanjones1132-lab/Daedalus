@@ -14,7 +14,8 @@
  * - `pipeline`        — executable pipeline array (string[])
  * - `worker_instructions` — per-stage worker instructions (Record<string,string>)
  * - `stage_runs`      — verbatim stage_runs array (each with was_successful/had_error/duration_ms/tokens)
- * - `model_attributions` — verbatim model_attributions array (provider/model_id/was_successful/had_error)
+ * - `model_attributions` — canonical same-run model attributions when available,
+ *                           otherwise the frozen snapshot copy
  * - `replan_count`    — number of `conductor_replan` events for this agent_run_id
  * - `run_outcome`     — "success" | "degraded" | "failed" (truthful run outcome)
  * - `duration_ms`     — total run duration (number)
@@ -155,6 +156,10 @@ function parseSnapshot(snap: TrajectorySnapshot): ParsedTrajectory | null {
   }
 }
 
+function isRunOutcome(value: unknown): value is ExportedRow["run_outcome"] {
+  return value === "success" || value === "degraded" || value === "failed";
+}
+
 function outcomeScore(o: string | undefined): number {
   if (o === "success") return 1.0;
   if (o === "degraded") return 0.5;
@@ -208,7 +213,17 @@ function computeReward(
   return weighted / totalWeight;
 }
 
-function resolvePipeline(traj: ParsedTrajectory): string[] {
+function resolvePipeline(traj: ParsedTrajectory, agentRun: AgentRun | undefined): string[] {
+  if (agentRun) {
+    try {
+      const executable = JSON.parse(agentRun.pipeline);
+      if (Array.isArray(executable) && executable.every((x) => typeof x === "string")) {
+        return executable;
+      }
+    } catch {
+      // Fall through to the snapshot's raw route for legacy/corrupt run rows.
+    }
+  }
   const p = traj.routing?.pipeline;
   if (!Array.isArray(p)) return [];
   return p.filter((x): x is string => typeof x === "string");
@@ -237,13 +252,18 @@ export function buildExportRow(
   const traj = parseSnapshot(snapshot);
   if (!traj) return null;
   if (typeof traj.agent_run_id !== "string") return null;
-  if (
-    traj.run_outcome !== "success" &&
-    traj.run_outcome !== "degraded" &&
-    traj.run_outcome !== "failed"
-  ) {
-    return null;
-  }
+  if (traj.agent_run_id !== snapshot.agent_run_id) return null;
+  if (agentRun && agentRun.id !== traj.agent_run_id) return null;
+
+  // `agent_runs` is the repairable canonical run record. Historical snapshot
+  // copies can be stale after a retro-repair, so only fall back to the frozen
+  // snapshot outcome when the joined run has no valid outcome yet.
+  const runOutcome = isRunOutcome(agentRun?.outcome)
+    ? agentRun.outcome
+    : isRunOutcome(traj.run_outcome)
+      ? traj.run_outcome
+      : null;
+  if (!runOutcome) return null;
 
   const weights: Required<RewardWeights> = {
     outcome: options.rewardWeights?.outcome ?? DEFAULT_REWARD_WEIGHTS.outcome,
@@ -261,7 +281,7 @@ export function buildExportRow(
   const { inputTokens, outputTokens } = stageTokenTotals(stageRuns);
 
   const components = {
-    outcome: outcomeScore(traj.run_outcome),
+    outcome: outcomeScore(runOutcome),
     user: userRatingScore(agentRun?.user_rating),
     eval: evalReplayScore(evalResults?.get(traj.agent_run_id)),
     tokens: tokenEfficiencyScore(inputTokens, outputTokens, tokenBudget),
@@ -275,12 +295,12 @@ export function buildExportRow(
     session_id: typeof traj.session_id === "string" ? traj.session_id : snapshot.session_id,
     task_type: typeof traj.task_type === "string" ? traj.task_type : (agentRun?.task_type ?? "unknown"),
     user_request: typeof traj.user_request === "string" ? traj.user_request : (agentRun?.user_request ?? ""),
-    pipeline: resolvePipeline(traj),
+    pipeline: resolvePipeline(traj, agentRun),
     worker_instructions: traj.worker_instructions ?? {},
     stage_runs: stageRuns,
     model_attributions: modelAttributions,
     replan_count: replanCounts?.get(traj.agent_run_id) ?? 0,
-    run_outcome: traj.run_outcome,
+    run_outcome: runOutcome,
     duration_ms: typeof traj.duration_ms === "number" ? traj.duration_ms : (agentRun?.duration_ms ?? 0),
     user_rating: typeof agentRun?.user_rating === "number" ? agentRun.user_rating : null,
     reward,
@@ -322,6 +342,14 @@ export function exportCorpus(
     if (!row) {
       droppedMalformed++;
       continue;
+    }
+
+    // The same-run attribution table is the repairable canonical source. A
+    // retro-repair can intentionally flip an attribution after the immutable
+    // trajectory copy was written; do not re-export that stale success signal.
+    const canonicalAttributions = store.getModelAttributions(row.agent_run_id);
+    if (canonicalAttributions.length > 0) {
+      row.model_attributions = canonicalAttributions;
     }
     if (row.reward < minReward) {
       droppedBelowThreshold++;

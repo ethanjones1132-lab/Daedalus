@@ -12,6 +12,7 @@ import { countTokens } from "../tokens";
 import { buildSynthesizerContext, buildSynthesizerContextFromStageState } from "./synth-context";
 import { applyEffectGate, evaluateEffectGate, type EffectGateReport } from "./effect-gate";
 import type { ExecutionProfile } from "./route-normalization";
+import type { TurnRequirement } from "./turn-requirements";
 import type { PipelineStageState, PlannerStageOutput, ExecutorStageOutput, ReviewerStageOutput, RewriterStageOutput, ToolCallRecord } from "./stage-output";
 import { parseReviewerVerdict, renderExecutorSummary, renderPlanSummary, renderReviewerSummary, renderRewriterSummary } from "./stage-output";
 
@@ -59,9 +60,27 @@ export interface PipelineExecuteOptions {
   sessionMemory?: SessionMemory;
   /** Promoted distilled skills block for planner/executor injection. */
   distilledSkillsBlock?: string;
+  /**
+   * Deterministic capability requirement for the raw current turn. The index
+   * activation boundary passes the classifier result here so PipelineExecutor
+   * can enforce evidence invariants without reclassifying history-augmented
+   * request text.
+   */
+  turnRequirement?: TurnRequirement;
 }
 
 const READ_CACHE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "web_fetch"]);
+const WORKSPACE_EVIDENCE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep"]);
+const MISSING_WORKSPACE_EVIDENCE =
+  "Workspace inspection failed: no successful workspace read tool result was produced, so Jarvis will not synthesize repository claims from ungrounded model text.";
+
+function hasSuccessfulWorkspaceEvidence(toolCalls: ToolCallRecord[] | undefined): boolean {
+  return (toolCalls ?? []).some((call) =>
+    WORKSPACE_EVIDENCE_TOOLS.has(call.name) &&
+    !call.is_error &&
+    call.output.trim().length > 0
+  );
+}
 
 function hasMutationIntent(request: string): boolean {
   const text = request.toLowerCase();
@@ -153,6 +172,8 @@ export interface PipelineSegmentResult {
   state: PipelineStageState;
   synthesizerAnswer?: string;
   synthesizerFatalError?: string;
+  /** Precise code for a pre-synthesis runtime fence such as missing evidence. */
+  fatalErrorCode?: string;
   synthesizerEmptyCompletion?: boolean;
   effectGate?: EffectGateReport;
 }
@@ -347,6 +368,8 @@ export class PipelineExecutor {
     const narratives: string[] = [];
     let turnCount = 0;
     let executorDone = false;
+    let workspaceEvidenceNudgeSent = false;
+    const requiresWorkspaceEvidence = options.turnRequirement === "workspace_read";
     const maxTurns = executorTurnLimit(profile);
     let executorTurn = 0;
 
@@ -393,11 +416,28 @@ export class PipelineExecutor {
                 output: `\n[Tool Executed: ${tc.name}]\n`
               });
             }
+          } else if (
+            requiresWorkspaceEvidence &&
+            !hasSuccessfulWorkspaceEvidence(toolCalls) &&
+            !workspaceEvidenceNudgeSent &&
+            turnCount < maxTurns
+          ) {
+            // A workspace_read stage is not grounded merely because an executor
+            // model produced prose. Give it one bounded repair round to call a
+            // real read tool; if it declines again, the runtime fence below
+            // blocks synthesis instead of laundering stale prose as repo facts.
+            workspaceEvidenceNudgeSent = true;
+            executorMessages.push({
+              role: "user",
+              content:
+                "Workspace evidence is required for this turn. Before answering, call at least one relevant read-only workspace tool (read_file, list_directory, glob, or grep) and ground your findings in its result.",
+            });
           } else {
             executorDone = true;
           }
 
           const turnToolErrors = toolCalls.slice(turnStartIdx).filter((call) => call.is_error);
+          const missingRequiredEvidence = requiresWorkspaceEvidence && !hasSuccessfulWorkspaceEvidence(toolCalls);
           this.collector.recordStageRun({
             id: `stage_${crypto.randomUUID()}`,
             agent_run_id: agentRunId,
@@ -407,11 +447,13 @@ export class PipelineExecutor {
             output_tokens: countTokens(response?.content || ""),
             tool_calls_json: JSON.stringify(response?.tool_calls || []),
             duration_ms: Date.now() - turnStartTime,
-            was_successful: turnToolErrors.length === 0 ? 1 : 0,
-            had_error: turnToolErrors.length === 0 ? 0 : 1,
+            was_successful: turnToolErrors.length === 0 && !missingRequiredEvidence ? 1 : 0,
+            had_error: turnToolErrors.length === 0 && !missingRequiredEvidence ? 0 : 1,
             error_message: turnToolErrors[0]
               ? `${turnToolErrors[0].name}: ${(turnToolErrors[0].output || "").slice(0, 200)}`
-              : undefined,
+              : missingRequiredEvidence
+                ? "missing_workspace_evidence"
+                : undefined,
           });
         } catch (err: any) {
           this.collector.recordStageRun({
@@ -430,6 +472,10 @@ export class PipelineExecutor {
       }
 
       const narrative = narratives.join("\n\n");
+      if (requiresWorkspaceEvidence && !hasSuccessfulWorkspaceEvidence(toolCalls)) {
+        onStateChange({ stage: "executor", status: "failed", output: MISSING_WORKSPACE_EVIDENCE });
+        return { ok: false, narrative: MISSING_WORKSPACE_EVIDENCE, toolCalls };
+      }
       onStateChange({ stage: "executor", status: "done", output: narrative });
       return { ok: true, narrative, toolCalls };
     } catch (e: any) {
@@ -829,6 +875,20 @@ export class PipelineExecutor {
       return { state, effectGate };
     }
 
+    if (
+      options.turnRequirement === "workspace_read" &&
+      !hasSuccessfulWorkspaceEvidence(state.executor?.toolCalls)
+    ) {
+      return {
+        state,
+        synthesizerAnswer: "",
+        synthesizerFatalError: MISSING_WORKSPACE_EVIDENCE,
+        synthesizerEmptyCompletion: false,
+        fatalErrorCode: "missing_workspace_evidence",
+        effectGate,
+      };
+    }
+
     const synth = await this.runSynthesizerStage(
       request,
       state,
@@ -853,10 +913,11 @@ export class PipelineExecutor {
     onStateChange: (state: PipelineProgressState) => void,
     options: PipelineExecuteOptions = {}
   ): Promise<PipelineResult> {
-    if (this.canRunSpeculativeParallel(pipeline, options.topology)) {
+    const requiresWorkspaceEvidence = options.turnRequirement === "workspace_read";
+    if (!requiresWorkspaceEvidence && this.canRunSpeculativeParallel(pipeline, options.topology)) {
       return this.executeSpeculativeParallel(request, pipeline, agentRunId, onStateChange, options);
     }
-    if (this.canRunSpeculativeCascade(pipeline, options.topology)) {
+    if (!requiresWorkspaceEvidence && this.canRunSpeculativeCascade(pipeline, options.topology)) {
       return this.executeSpeculativeCascade(request, agentRunId, onStateChange, options);
     }
 
@@ -868,6 +929,20 @@ export class PipelineExecutor {
       request, pipeline as StageName[], agentRunId, onStateChange, options,
     );
     const { state } = segment;
+
+    // Keep the evidence invariant authoritative even for direct/non-normalized
+    // callers that omit the synthesizer stage. The normal activation boundary
+    // always appends a synthesizer, but PipelineExecutor is also reused by tests
+    // and replan slices and must not return a planner sentinel as a repo answer.
+    if (requiresWorkspaceEvidence && !hasSuccessfulWorkspaceEvidence(state.executor?.toolCalls)) {
+      return {
+        answer: "",
+        error: MISSING_WORKSPACE_EVIDENCE,
+        recursion_depth: 0,
+        outcome: "failed",
+        error_code: "missing_workspace_evidence",
+      };
+    }
 
     // Truthful run outcome. A failed synthesizer (threw OR empty) is `failed`.
     // A run whose answer came through but an upstream stage failed is `degraded`.
@@ -898,7 +973,7 @@ export class PipelineExecutor {
     let errorCode: string | undefined;
     if (segment.synthesizerFatalError) {
       outcome = "failed";
-      errorCode = "stage_error";
+      errorCode = segment.fatalErrorCode ?? "stage_error";
     } else if (segment.synthesizerEmptyCompletion) {
       outcome = "failed";
       errorCode = "empty_completion";
@@ -1449,6 +1524,7 @@ export class PipelineExecutor {
         workerInstructions: options.workerInstructions,
         sharedContext: options.sharedContext,
         sessionMemory: options.sessionMemory,
+        turnRequirement: options.turnRequirement,
         initialRecursionDepth: nextDepth,
       },
     );

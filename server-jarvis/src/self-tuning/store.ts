@@ -102,6 +102,8 @@ export interface ModelAttribution {
   was_successful: number;
   had_error: number;
   duration_ms?: number;
+  /** Wall time from request dispatch to first semantic stream progress. */
+  first_token_ms?: number;
   fallback_used: number;
   created_at?: string;
 }
@@ -309,6 +311,7 @@ const SELF_TUNING_SCHEMA = `
     was_successful INTEGER NOT NULL DEFAULT 0,
     had_error INTEGER NOT NULL DEFAULT 0,
     duration_ms INTEGER,
+    first_token_ms INTEGER,
     fallback_used INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   );
@@ -393,6 +396,9 @@ export class SelfTuningStore {
         // duplicate-column error on an already-migrated DB is expected and ignored.
         try {
           db.exec(`ALTER TABLE agent_runs ADD COLUMN outcome TEXT`);
+        } catch { /* column already exists */ }
+        try {
+          db.exec(`ALTER TABLE model_attributions ADD COLUMN first_token_ms INTEGER`);
         } catch { /* column already exists */ }
         schemaEnsuredPaths.add(dbPath);
       }
@@ -694,8 +700,8 @@ export class SelfTuningStore {
     if (!db) return;
     try {
       db.prepare(
-        `INSERT INTO model_attributions (id, agent_run_id, stage_id, agent_id, provider, model_id, was_successful, had_error, duration_ms, fallback_used)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO model_attributions (id, agent_run_id, stage_id, agent_id, provider, model_id, was_successful, had_error, duration_ms, first_token_ms, fallback_used)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         row.id,
         row.agent_run_id,
@@ -706,6 +712,7 @@ export class SelfTuningStore {
         row.was_successful,
         row.had_error,
         row.duration_ms ?? null,
+        row.first_token_ms ?? null,
         row.fallback_used,
       );
     } catch (e) {

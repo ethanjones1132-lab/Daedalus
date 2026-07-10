@@ -362,8 +362,21 @@ pub async fn jarvis_save_config(
 
 #[tauri::command]
 pub async fn jarvis_check_status(state: State<'_, JarvisState>) -> Result<JarvisStatus, String> {
-    let config = state.config.lock().await;
-    Ok(check_jarvis_status(&config))
+    // Clone under the mutex, then release it before the synchronous health
+    // probes. `check_jarvis_status` performs blocking HTTP and WSL process
+    // work, so running it on an async command worker can starve Tauri IPC.
+    let config = state.config.lock().await.clone();
+    run_blocking_status_work(move || check_jarvis_status(&config)).await
+}
+
+async fn run_blocking_status_work<T, F>(work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| format!("status task join error: {e}"))
 }
 
 #[tauri::command]
@@ -375,4 +388,39 @@ pub async fn jarvis_start_bridge(state: State<'_, JarvisState>) -> Result<(), St
 #[tauri::command]
 pub async fn jarvis_stop_bridge() -> Result<(), String> {
     stop_bridge()
+}
+
+#[cfg(test)]
+mod status_check_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_status_work_does_not_starve_the_async_runtime() {
+        let release = Arc::new(AtomicBool::new(false));
+        let timer_release = Arc::clone(&release);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            timer_release.store(true, Ordering::SeqCst);
+        });
+
+        let worker_release = Arc::clone(&release);
+        let started = std::time::Instant::now();
+        let value = run_blocking_status_work(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            while !worker_release.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            42
+        })
+        .await
+        .expect("blocking status task should join");
+
+        assert_eq!(value, 42);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(150),
+            "status work blocked the single-thread async runtime"
+        );
+    }
 }

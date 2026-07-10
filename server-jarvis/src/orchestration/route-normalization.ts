@@ -25,6 +25,29 @@ import type { CoordinatorResult, StageName, Topology } from "./coordinator";
 import type { TurnRequirement } from "./turn-requirements";
 
 /**
+ * Canonical Coordinator-shaped decision for a turn whose deterministic
+ * requirement is sufficient to bypass model-backed routing. Keeping the same
+ * shape lets telemetry, normalization, and the PipelineExecutor remain on the
+ * normal path even though no Coordinator inference call was spent.
+ */
+export function buildShortCircuitRoute(
+  requirement: Extract<TurnRequirement, "conversational" | "answer_only">,
+): CoordinatorResult {
+  return {
+    task_type: "general",
+    pipeline: ["synthesizer"],
+    topology: "linear",
+    context: {
+      needs_workspace_inspection: false,
+      needs_memory: requirement === "answer_only",
+      estimated_complexity: "low",
+    },
+    coordinator_rationale: "Deterministic simple-turn short circuit: direct synthesizer answer.",
+    conductor_source: "trivial",
+  };
+}
+
+/**
  * Least-authority tool profile handed to the executor/rewriter stages.
  *   none      — no tools (conversational / pure-answer turns).
  *   read_only — read_file, list_directory, glob, grep only.

@@ -686,6 +686,104 @@ pub fn get_home_dir() -> String {
     }
 }
 
+fn spawn_background_thread<F>(name: &str, task: F) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(task)
+}
+
+async fn bootstrap_services(handle: tauri::AppHandle) {
+    // Hydrate the in-memory config from SQLite — the single source of truth
+    // for JarvisConfig. This runs on the dedicated startup runtime because
+    // migration and SQLite access are synchronous.
+    let db_state = handle.state::<crate::db::AppDb>();
+    match crate::commands::migrate_file_config_into_sqlite_if_needed(&db_state) {
+        Ok(true) => {
+            println!("[Jarvis] Imported legacy file config into SQLite (one-time migration).")
+        }
+        Ok(false) => {}
+        Err(e) => eprintln!("[Jarvis] config migration check failed: {e}"),
+    }
+    let cfg = crate::commands::load_jarvis_config(&db_state).unwrap_or_default();
+    {
+        let state = handle.state::<crate::jarvis::types::JarvisState>();
+        *state.config.lock().await = cfg.clone();
+    }
+    let backend = cfg.active_backend.clone();
+    println!("[Jarvis] Boot backend = {}", backend);
+
+    // Backend-specific local dependency: only start Ollama when it's active.
+    match backend {
+        crate::jarvis::types::JarvisBackend::Ollama => {
+            crate::start_ollama_and_warm(cfg.ollama.model.clone()).await;
+        }
+        crate::jarvis::types::JarvisBackend::OpenRouter => {
+            if cfg.openrouter.api_key.trim().is_empty() {
+                eprintln!(
+                    "[Jarvis] OpenRouter is the active backend but no API key is set \
+                     — chats will fail until a key is configured in Control."
+                );
+            }
+            println!("[Jarvis] OpenRouter backend — skipping local Ollama startup.");
+        }
+        crate::jarvis::types::JarvisBackend::ClaudeCli => {
+            println!("[Jarvis] Claude CLI backend — skipping local Ollama startup.");
+        }
+    }
+
+    // Backend-independent services: the proxy routes to the selected backend,
+    // while the Bun server powers tools/skills/models for every backend.
+    let proxy_model = cfg.ollama.model.clone();
+    let proxy_result =
+        tauri::async_runtime::spawn_blocking(move || crate::spawn_claude_cli_proxy(proxy_model))
+            .await;
+    match proxy_result {
+        Ok(Some(child)) => {
+            if let Some(m) = crate::PROXY_PROCESS.get() {
+                if let Ok(mut g) = m.lock() {
+                    println!(
+                        "[Jarvis] Claude CLI proxy registered at startup (PID {})",
+                        child.id()
+                    );
+                    *g = Some(child);
+                }
+            }
+        }
+        _ => eprintln!("[Jarvis] Claude CLI proxy not started (not found or spawn failed)"),
+    }
+
+    if let Err(e) = crate::ensure_jarvis_server_started().await {
+        log::error!(target: "jarvis::startup", "Bun server startup failed at boot: {e}");
+    }
+
+    // Keep the three boot children alive (Ollama/proxy/Bun): detect a dead
+    // required service and relaunch it under the bounded supervisor policy.
+    crate::supervisor::spawn_supervisor(handle.clone());
+
+    // The scheduler loop owns this dedicated runtime after boot completes.
+    crate::cron_scheduler::start_cron_scheduler(handle).await;
+}
+
+fn spawn_bootstrap_services(handle: tauri::AppHandle) -> std::io::Result<()> {
+    spawn_background_thread("jarvis-bootstrap", move || {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                log::error!(target: "jarvis::startup", "failed to build startup runtime: {e}");
+                return;
+            }
+        };
+        runtime.block_on(bootstrap_services(handle));
+    })
+    .map(|_| ())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let jarvis_config = Arc::new(Mutex::new(crate::jarvis::types::JarvisConfig::default()));
@@ -751,91 +849,9 @@ pub fn run() {
             crate::SERVER_PROCESS.get_or_init(|| std::sync::Mutex::new(None));
 
             let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                // Hydrate the in-memory config from SQLite — the single source of
-                // truth for JarvisConfig. JarvisState starts at the Ollama default
-                // until this runs; without it, OpenRouter users would pay for an
-                // Ollama boot and the Control view would revert to Ollama on restart.
-                //
-                // On the first boot after the file→SQLite cutover, import any legacy
-                // file store (`~/.openclaw/jarvis/config.json`) so the user's saved
-                // backend/key survive; thereafter the file is a one-way projection
-                // that only the Bun server reads.
-                let db_state = handle.state::<crate::db::AppDb>();
-                match crate::commands::migrate_file_config_into_sqlite_if_needed(&db_state)
-                {
-                    Ok(true) => println!(
-                        "[Jarvis] Imported legacy file config into SQLite (one-time migration)."
-                    ),
-                    Ok(false) => {}
-                    Err(e) => eprintln!("[Jarvis] config migration check failed: {e}"),
-                }
-                let cfg = crate::commands::load_jarvis_config(&db_state)
-                    .unwrap_or_default();
-                {
-                    let state = handle.state::<crate::jarvis::types::JarvisState>();
-                    *state.config.lock().await = cfg.clone();
-                }
-                let backend = cfg.active_backend.clone();
-                println!("[Jarvis] Boot backend = {}", backend);
-
-                // Backend-specific local dependency: only start Ollama when it's active.
-                match backend {
-                    crate::jarvis::types::JarvisBackend::Ollama => {
-                        crate::start_ollama_and_warm(cfg.ollama.model.clone()).await;
-                    }
-                    crate::jarvis::types::JarvisBackend::OpenRouter => {
-                        if cfg.openrouter.api_key.trim().is_empty() {
-                            eprintln!(
-                                "[Jarvis] OpenRouter is the active backend but no API key is set \
-                                 — chats will fail until a key is configured in Control."
-                            );
-                        }
-                        println!("[Jarvis] OpenRouter backend — skipping local Ollama startup.");
-                    }
-                    crate::jarvis::types::JarvisBackend::ClaudeCli => {
-                        println!("[Jarvis] Claude CLI backend — skipping local Ollama startup.");
-                    }
-                }
-
-                // Backend-independent services below: the proxy routes to whichever
-                // backend is active, the Bun server powers tools/skills/models, and the
-                // cron scheduler drives routines — all needed regardless of backend.
-
-                // Start Claude CLI proxy (pass the configured Ollama model so the proxy
-                // knows which model to default to when the active backend is local).
-                let proxy_model = cfg.ollama.model.clone();
-                let proxy_result =
-                    tauri::async_runtime::spawn_blocking(move || crate::spawn_claude_cli_proxy(proxy_model)).await;
-                match proxy_result {
-                    Ok(Some(child)) => {
-                        if let Some(m) = crate::PROXY_PROCESS.get() {
-                            if let Ok(mut g) = m.lock() {
-                                println!(
-                                    "[Jarvis] Claude CLI proxy registered at startup (PID {})",
-                                    child.id()
-                                );
-                                *g = Some(child);
-                            }
-                        }
-                    }
-                    _ => eprintln!(
-                        "[Jarvis] Claude CLI proxy not started (not found or spawn failed)"
-                    ),
-                }
-
-                // Start the Bun server eagerly so the UI is ready on first load.
-                if let Err(e) = crate::ensure_jarvis_server_started().await {
-                    eprintln!("[Jarvis] Bun server startup failed at boot: {}", e);
-                }
-
-                // Keep the three boot children alive (Ollama/proxy/Bun): detect a
-                // dead required service and relaunch it, with bounded restarts.
-                crate::supervisor::spawn_supervisor(handle.clone());
-
-                // Start cron scheduler.
-                crate::cron_scheduler::start_cron_scheduler(handle).await;
-            });
+            if let Err(e) = spawn_bootstrap_services(handle) {
+                log::error!(target: "jarvis::startup", "failed to dispatch startup thread: {e}");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -997,4 +1013,27 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod startup_thread_tests {
+    use super::*;
+
+    #[test]
+    fn startup_dispatch_returns_before_slow_boot_work_finishes() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let started = std::time::Instant::now();
+
+        let worker = spawn_background_thread("jarvis-startup-test", move || {
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(1));
+        })
+        .expect("startup thread should spawn");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "startup dispatch waited for blocking boot work"
+        );
+        release_tx.send(()).expect("release startup worker");
+        worker.join().expect("startup worker should exit cleanly");
+    }
 }

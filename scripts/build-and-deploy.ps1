@@ -53,6 +53,7 @@ $tauriDir   = Join-Path $repo 'src-tauri'
 $exeOut     = Join-Path $repo 'src-tauri\target\release\home-base.exe'
 $distJs     = Join-Path $repo 'server-jarvis\dist\index.js'
 $promptsSrc = Join-Path $repo 'server-jarvis\src\prompts'
+$metricsScript = Join-Path $repo 'automate_inference_metrics.py'
 $desktop    = Join-Path $env:USERPROFILE 'OneDrive\Desktop'
 
 # ── Locate toolchain (prefer PATH, fall back to standard install dirs) ────────
@@ -133,6 +134,9 @@ if (-not (Test-Path $desktop)) { Die "OneDrive Desktop not found: $desktop" }
 if (-not (Test-Path $promptsSrc -PathType Container)) {
     Die "Jarvis prompt source not found: $promptsSrc"
 }
+if (-not (Test-Path $metricsScript -PathType Leaf)) {
+    Die "Inference metrics script not found: $metricsScript"
+}
 
 # Release file locks: stop the running app and any Bun server bound to 19877
 # (the deployed bundle locks <Desktop>\index.js while running).
@@ -159,6 +163,7 @@ function Deploy-File($src, $dstName) {
 Deploy-File $exeOut 'Jarvis.exe'
 Deploy-File $exeOut 'home-base.exe'
 Deploy-File $distJs 'index.js'
+Deploy-File $metricsScript 'automate_inference_metrics.py'
 
 # prompts/ is a directory — replace wholesale (back up the old one first)
 $promptsDst = Join-Path $desktop 'prompts'
@@ -176,6 +181,7 @@ Write-Ok 'prompts/'
 $manifest = @{
     git_sha = $buildGitSha
     index_js_sha256 = (Get-FileHash "$desktop\index.js" -Algorithm SHA256).Hash
+    inference_metrics_sha256 = (Get-FileHash "$desktop\automate_inference_metrics.py" -Algorithm SHA256).Hash
     exe_mtime = (Get-Item "$desktop\Jarvis.exe" -ErrorAction SilentlyContinue).LastWriteTimeUtc.ToString("o")
     prompts_tree_sha256 = (git -C $repo ls-tree HEAD server-jarvis/src/prompts | Select-Object -First 1).Split()[2]
     deployed_at = (Get-Date -Format "o")
@@ -214,4 +220,4 @@ if ($RestartServer) {
 }
 
 $elapsed = (Get-Date) - $startedAt
-Write-Host ("`nDONE in {0:N0}s. Deployed Jarvis.exe + index.js + prompts/ to {1}" -f $elapsed.TotalSeconds, $desktop) -ForegroundColor Green
+Write-Host ("`nDONE in {0:N0}s. Deployed Jarvis.exe + index.js + metrics script + prompts/ to {1}" -f $elapsed.TotalSeconds, $desktop) -ForegroundColor Green

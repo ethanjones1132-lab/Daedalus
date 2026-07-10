@@ -14,9 +14,10 @@
 // again, so a permanently-broken dependency can't cause an endless respawn
 // loop. The tick interval itself also bounds restart frequency.
 
-use crate::jarvis::types::{JarvisBackend, JarvisState};
 use crate::commands::system::SupervisorStatus;
+use crate::jarvis::types::{JarvisBackend, JarvisState};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -34,6 +35,7 @@ const MAX_CONSECUTIVE_RESTARTS: u32 = 5;
 pub(crate) static BUN_FAILS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static PROXY_FAILS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static OLLAMA_FAILS: AtomicU32 = AtomicU32::new(0);
+static BUN_LAST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SupervisedService {
@@ -48,15 +50,68 @@ fn may_restart(consecutive_failures: u32) -> bool {
     consecutive_failures < MAX_CONSECUTIVE_RESTARTS
 }
 
-/// Reset a service's consecutive-failure counter so the supervisor resumes
-/// auto-restarting it. Called when the user forces a manual restart.
-pub(crate) fn reset_failures(service: SupervisedService) {
-    let counter = match service {
+fn failure_counter(service: SupervisedService) -> &'static AtomicU32 {
+    match service {
         SupervisedService::Bun => &BUN_FAILS,
         SupervisedService::Proxy => &PROXY_FAILS,
         SupervisedService::Ollama => &OLLAMA_FAILS,
-    };
-    counter.store(0, Ordering::Relaxed);
+    }
+}
+
+fn bun_last_error() -> Option<String> {
+    BUN_LAST_ERROR
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+fn record_restart_failure(service: SupervisedService, error: &str) -> u32 {
+    let counter = failure_counter(service);
+    let previous = counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(1).min(MAX_CONSECUTIVE_RESTARTS))
+        })
+        .unwrap_or_else(|current| current);
+    let next = previous.saturating_add(1).min(MAX_CONSECUTIVE_RESTARTS);
+
+    if matches!(service, SupervisedService::Bun) {
+        *BUN_LAST_ERROR
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(error.to_string());
+    }
+    next
+}
+
+fn bun_diagnostic(failures: u32, last_error: Option<&str>) -> Option<String> {
+    if failures == 0 {
+        return None;
+    }
+    let error = last_error.unwrap_or("unknown Bun startup failure");
+    if failures >= MAX_CONSECUTIVE_RESTARTS {
+        Some(format!(
+            "Bun server auto-restart exhausted ({failures}/{MAX_CONSECUTIVE_RESTARTS}). \
+             Last error: {error}. Automatic retries are paused; use Restart to re-arm the budget."
+        ))
+    } else {
+        Some(format!(
+            "Bun server restart failed ({failures}/{MAX_CONSECUTIVE_RESTARTS}). \
+             Last error: {error}. Automatic retry remains enabled."
+        ))
+    }
+}
+
+/// Reset a service's consecutive-failure counter so the supervisor resumes
+/// auto-restarting it. Called when the user forces a manual restart.
+pub(crate) fn reset_failures(service: SupervisedService) {
+    failure_counter(service).store(0, Ordering::Relaxed);
+    if matches!(service, SupervisedService::Bun) {
+        *BUN_LAST_ERROR
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+    }
 }
 
 /// Snapshot of which services the supervisor has given up auto-restarting.
@@ -65,17 +120,27 @@ pub(crate) fn reset_failures(service: SupervisedService) {
 /// why the watchdog is no longer poking the port. Pure read of the existing
 /// atomic counters, safe to call from any task.
 pub fn give_up_status() -> SupervisorStatus {
+    let bun_restart_failures = BUN_FAILS.load(Ordering::Relaxed);
+    let bun_last_error = bun_last_error();
     SupervisorStatus {
-        bun_give_up: BUN_FAILS.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_RESTARTS,
+        bun_give_up: bun_restart_failures >= MAX_CONSECUTIVE_RESTARTS,
         proxy_give_up: PROXY_FAILS.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_RESTARTS,
         ollama_give_up: OLLAMA_FAILS.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_RESTARTS,
+        bun_restart_failures,
+        restart_limit: MAX_CONSECUTIVE_RESTARTS,
+        bun_diagnostic: bun_diagnostic(bun_restart_failures, bun_last_error.as_deref()),
+        bun_last_error,
     }
 }
 
 /// Spawn the supervisor loop. Gives boot one tick of grace before the first
 /// check so the eager boot-time starts have a chance to come up first.
+///
+/// This deliberately uses the caller's Tokio runtime. Startup calls it from
+/// the dedicated `jarvis-bootstrap` OS thread, keeping the synchronous Windows
+/// and WSL process probes below off Tauri's WebView/IPC runtime.
 pub fn spawn_supervisor(handle: AppHandle) {
-    tauri::async_runtime::spawn(async move {
+    tokio::spawn(async move {
         tokio::time::sleep(TICK).await;
         loop {
             tick(&handle).await;
@@ -97,25 +162,26 @@ async fn tick(handle: &AppHandle) {
 
     // ── Bun server (required by every backend for tools/skills/models) ──
     if crate::is_port_listening(BUN_PORT) {
-        BUN_FAILS.store(0, Ordering::Relaxed);
+        reset_failures(SupervisedService::Bun);
     } else {
         let fails = BUN_FAILS.load(Ordering::Relaxed);
         if may_restart(fails) {
             // ensure_* is idempotent (it health-probes before spawning).
             match crate::ensure_jarvis_server_started().await {
                 Ok(_) => {
-                    BUN_FAILS.store(0, Ordering::Relaxed);
+                    reset_failures(SupervisedService::Bun);
                     println!("[supervisor] Bun server was down — relaunched.");
                 }
                 Err(e) => {
-                    let next = BUN_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
-                    eprintln!(
-                        "[supervisor] Bun server restart failed ({next}/{MAX_CONSECUTIVE_RESTARTS}): {e}"
+                    let next = record_restart_failure(SupervisedService::Bun, &e);
+                    log::warn!(
+                        target: "jarvis::supervisor",
+                        "Bun server restart failed ({next}/{MAX_CONSECUTIVE_RESTARTS}): {e}"
                     );
                     if next == MAX_CONSECUTIVE_RESTARTS {
-                        eprintln!(
-                            "[supervisor] Bun server: giving up auto-restart until it is healthy again."
-                        );
+                        if let Some(diagnostic) = bun_diagnostic(next, Some(e.as_str())) {
+                            log::error!(target: "jarvis::supervisor", "{diagnostic}");
+                        }
                     }
                 }
             }
@@ -157,9 +223,7 @@ async fn tick(handle: &AppHandle) {
     }
 
     // ── Ollama (only required when it is the active backend) ──
-    if !is_ollama {
-        OLLAMA_FAILS.store(0, Ordering::Relaxed);
-    } else if crate::is_port_listening(OLLAMA_PORT) {
+    if !is_ollama || crate::is_port_listening(OLLAMA_PORT) {
         OLLAMA_FAILS.store(0, Ordering::Relaxed);
     } else {
         let fails = OLLAMA_FAILS.load(Ordering::Relaxed);
@@ -178,6 +242,7 @@ async fn tick(handle: &AppHandle) {
     }
 
     // Heartbeat for any UI that wants to show supervisor activity.
+    let supervisor = give_up_status();
     let _ = handle.emit(
         "jarvis://supervisor",
         serde_json::json!({
@@ -185,9 +250,13 @@ async fn tick(handle: &AppHandle) {
             "proxy_up": crate::is_port_listening(PROXY_PORT),
             "ollama_up": crate::is_port_listening(OLLAMA_PORT),
             "ollama_required": is_ollama,
-            "bun_give_up": BUN_FAILS.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_RESTARTS,
-            "proxy_give_up": PROXY_FAILS.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_RESTARTS,
-            "ollama_give_up": OLLAMA_FAILS.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_RESTARTS,
+            "bun_give_up": supervisor.bun_give_up,
+            "proxy_give_up": supervisor.proxy_give_up,
+            "ollama_give_up": supervisor.ollama_give_up,
+            "bun_restart_failures": supervisor.bun_restart_failures,
+            "restart_limit": supervisor.restart_limit,
+            "bun_last_error": supervisor.bun_last_error,
+            "bun_diagnostic": supervisor.bun_diagnostic,
         }),
     );
 }
@@ -196,8 +265,11 @@ async fn tick(handle: &AppHandle) {
 mod tests {
     use super::*;
 
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn backoff_stops_after_max_consecutive_failures() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         assert!(may_restart(0));
         assert!(may_restart(MAX_CONSECUTIVE_RESTARTS - 1));
         assert!(!may_restart(MAX_CONSECUTIVE_RESTARTS));
@@ -206,6 +278,7 @@ mod tests {
 
     #[test]
     fn reset_failures_clears_counter_so_supervisor_resumes() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Simulate a service that has hit the give-up threshold.
         BUN_FAILS.store(MAX_CONSECUTIVE_RESTARTS, Ordering::Relaxed);
         assert!(!may_restart(BUN_FAILS.load(Ordering::Relaxed)));
@@ -227,6 +300,7 @@ mod tests {
 
     #[test]
     fn give_up_status_reflects_atomic_counters_for_each_service() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Default: fresh boot, nothing has failed — every field is false.
         BUN_FAILS.store(0, Ordering::Relaxed);
         PROXY_FAILS.store(0, Ordering::Relaxed);
@@ -266,5 +340,36 @@ mod tests {
         BUN_FAILS.store(0, Ordering::Relaxed);
         PROXY_FAILS.store(0, Ordering::Relaxed);
         OLLAMA_FAILS.store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn exhausted_bun_budget_exposes_actionable_diagnostic() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_failures(SupervisedService::Bun);
+
+        for _ in 0..MAX_CONSECUTIVE_RESTARTS {
+            record_restart_failure(
+                SupervisedService::Bun,
+                "server bundle missing: index.js was not found",
+            );
+        }
+
+        let status = give_up_status();
+        assert!(status.bun_give_up);
+        assert_eq!(status.bun_restart_failures, MAX_CONSECUTIVE_RESTARTS);
+        assert_eq!(status.restart_limit, MAX_CONSECUTIVE_RESTARTS);
+        assert_eq!(
+            status.bun_last_error.as_deref(),
+            Some("server bundle missing: index.js was not found")
+        );
+        let diagnostic = status
+            .bun_diagnostic
+            .as_deref()
+            .expect("exhausted Bun policy should explain itself");
+        assert!(diagnostic.contains("5/5"));
+        assert!(diagnostic.contains("server bundle missing"));
+        assert!(diagnostic.contains("Restart"));
+
+        reset_failures(SupervisedService::Bun);
     }
 }

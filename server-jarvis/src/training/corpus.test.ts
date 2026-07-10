@@ -25,14 +25,16 @@ function makeSnapshot(overrides: {
   created_at?: string;
 } = {}): TrajectorySnapshot {
   const id = overrides.id ?? "traj_test_1";
+  const agentRunId = overrides.agent_run_id ?? "run_test_1";
+  const sessionId = overrides.session_id ?? "sess_test_1";
   return {
     id,
-    agent_run_id: overrides.agent_run_id ?? "run_test_1",
-    session_id: overrides.session_id ?? "sess_test_1",
+    agent_run_id: agentRunId,
+    session_id: sessionId,
     snapshot_json: overrides.snapshot_json ?? JSON.stringify({
       version: 1,
-      agent_run_id: "run_test_1",
-      session_id: "sess_test_1",
+      agent_run_id: agentRunId,
+      session_id: sessionId,
       task_type: "debug",
       run_outcome: "success",
       duration_ms: 1200,
@@ -123,6 +125,54 @@ describe("D-01 buildExportRow", () => {
       }),
     });
     expect(buildExportRow(snap, undefined, {})).toBeNull();
+  });
+
+  test("returns null when the snapshot row and embedded agent_run_id disagree", () => {
+    const snap = makeSnapshot({
+      agent_run_id: "run_row",
+      snapshot_json: JSON.stringify({
+        version: 1,
+        agent_run_id: "run_embedded",
+        run_outcome: "success",
+        stage_runs: [],
+        model_attributions: [],
+        routing: {},
+      }),
+    });
+
+    expect(buildExportRow(snap, undefined, {})).toBeNull();
+  });
+
+  test("uses the joined agent run's normalized executable pipeline", () => {
+    const snap = makeSnapshot({
+      snapshot_json: JSON.stringify({
+        version: 1,
+        agent_run_id: "run_test_1",
+        run_outcome: "success",
+        routing: { pipeline: ["synthesizer"] },
+        stage_runs: [],
+        model_attributions: [],
+      }),
+    });
+    const run = makeAgentRun({
+      pipeline: JSON.stringify(["executor", "reviewer", "synthesizer"]),
+    });
+
+    expect(buildExportRow(snap, run, {})!.pipeline).toEqual([
+      "executor",
+      "reviewer",
+      "synthesizer",
+    ]);
+  });
+
+  test("uses a corrected agent run outcome and removes the stale 0.40 reward inflation", () => {
+    const snap = makeSnapshot();
+    const staleSnapshotRow = buildExportRow(snap, makeAgentRun({ outcome: "success" }), {})!;
+    const correctedRow = buildExportRow(snap, makeAgentRun({ outcome: "failed" }), {})!;
+
+    expect(correctedRow.run_outcome).toBe("failed");
+    expect(correctedRow.reward_components.outcome).toBe(0);
+    expect(staleSnapshotRow.reward - correctedRow.reward).toBeCloseTo(0.40, 10);
   });
 
   test("computes outcome_score: success=1.0, degraded=0.5, failed=0.0", () => {
@@ -406,6 +456,33 @@ describe("D-01 exportCorpus — quality filtering", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].reward_components.eval).toBe(1.0);
     expect(rows[0].replan_count).toBe(2);
+  });
+
+  test("uses canonical same-run model attributions after a snapshot was retro-repaired", () => {
+    store.insertAgentRun(makeAgentRun());
+    store.insertTrajectorySnapshot(makeSnapshot());
+    store.insertModelAttribution({
+      id: "ma_1",
+      agent_run_id: "run_test_1",
+      stage_id: "executor",
+      provider: "openrouter",
+      model_id: "gemma4:e2b",
+      was_successful: 0,
+      had_error: 1,
+      fallback_used: 0,
+    });
+
+    const { rows } = exportCorpus(store, 100);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].model_attributions).toEqual([
+      expect.objectContaining({
+        id: "ma_1",
+        agent_run_id: "run_test_1",
+        was_successful: 0,
+        had_error: 1,
+      }),
+    ]);
   });
 });
 

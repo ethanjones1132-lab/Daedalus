@@ -116,10 +116,19 @@ pub struct HealthData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct SupervisorStatus {
     pub bun_give_up: bool,
     pub proxy_give_up: bool,
     pub ollama_give_up: bool,
+    /// Consecutive failed Bun relaunches in the current retry budget.
+    pub bun_restart_failures: u32,
+    /// Maximum consecutive failures before automatic Bun relaunch pauses.
+    pub restart_limit: u32,
+    /// Most recent concrete error returned by Bun discovery/spawn/readiness.
+    pub bun_last_error: Option<String>,
+    /// Actionable summary retained after GUI-console output is unavailable.
+    pub bun_diagnostic: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -54,8 +54,11 @@ function formatSharedContext(shared?: SharedContextHints): string {
 }
 
 /**
- * Merge conductor-generated worker guidance with the static stage baseline.
- * When no custom instruction exists for a stage, returns the static prompt only.
+ * Merge conductor-generated worker guidance and retrieved shared context with
+ * the static stage baseline. The shared context is independent of whether the
+ * conductor emitted a stage-specific instruction: parse-fallback routes often
+ * have no `worker_instructions`, but must still receive cached tool results and
+ * the active workspace root.
  */
 export function resolveStagePrompt(
   stage: StageName,
@@ -68,7 +71,7 @@ export function resolveStagePrompt(
   const sharedBlock = formatSharedContext(sharedContext);
   const skills = distilledSkillsBlock?.trim();
 
-  if (!custom && !skills) return basePrompt;
+  if (!custom && !skills && !sharedBlock) return basePrompt;
 
   return [
     custom ? "Conductor instructions for this request:" : "",

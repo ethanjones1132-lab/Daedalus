@@ -59,6 +59,7 @@ describe("Conductor learning (Phase 4)", () => {
       provider: "opencode_zen",
       modelId: "north-mini-code-free",
       durationMs: 1200,
+      firstTokenMs: 275,
       wasSuccessful: true,
     });
 
@@ -98,6 +99,7 @@ describe("Conductor learning (Phase 4)", () => {
 
     expect(store.getConductorRuns("run_p4")[0].run_outcome).toBe("success");
     expect(store.getModelAttributions("run_p4")).toHaveLength(1);
+    expect(store.getModelAttributions("run_p4")[0].first_token_ms).toBe(275);
     expect(store.getTrajectorySnapshots(1)).toHaveLength(1);
     expect(store.getAgentPerformance("debug").some((r) => r.agent_id === sampleAgent.id)).toBe(true);
   });

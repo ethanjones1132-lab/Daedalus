@@ -36,4 +36,22 @@ describe("resolveStagePrompt", () => {
     expect(merged).toContain("read_file:src/a.ts");
     expect(merged).toContain("Answer in three bullets.");
   });
+
+  test("injects retrieved workspace context even without custom instructions or skills", () => {
+    const merged = resolveStagePrompt(
+      "executor",
+      "BASE PROMPT",
+      undefined,
+      {
+        relevant_memories: ["Active filesystem workspace root: C:\\Projects\\home-base-recovered"],
+        prior_tool_results: {
+          "read_file:README.md": "Jarvis is a standalone Tauri desktop platform with a Bun server.",
+        },
+      },
+    );
+
+    expect(merged).toContain("C:\\Projects\\home-base-recovered");
+    expect(merged).toContain("Jarvis is a standalone Tauri desktop platform");
+    expect(merged).toContain("BASE PROMPT");
+  });
 });

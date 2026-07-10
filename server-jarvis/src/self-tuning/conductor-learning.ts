@@ -96,6 +96,7 @@ export class ConductorLearningLoop {
     provider: string;
     modelId: string;
     durationMs?: number;
+    firstTokenMs?: number;
     fallbackUsed?: boolean;
     wasSuccessful?: boolean;
     hadError?: boolean;
@@ -111,6 +112,7 @@ export class ConductorLearningLoop {
       was_successful: args.wasSuccessful === false ? 0 : 1,
       had_error: args.hadError ? 1 : 0,
       duration_ms: args.durationMs,
+      first_token_ms: args.firstTokenMs,
       fallback_used: args.fallbackUsed ? 1 : 0,
     };
     this.store.insertModelAttribution(row);

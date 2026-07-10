@@ -1,5 +1,9 @@
 import { describe, test, expect } from "bun:test";
-import { classifyTurnRequirements, inheritRequirementForContinuation } from "./turn-requirements";
+import {
+  classifyTurnRequirements,
+  inheritRequirementForContinuation,
+  shouldShortCircuitCoordinator,
+} from "./turn-requirements";
 
 describe("inheritRequirementForContinuation", () => {
   test("inherits a higher-authority prior requirement on continuation", () => {
@@ -19,6 +23,41 @@ describe("inheritRequirementForContinuation", () => {
     const current = { requirement: "answer_only" as const, signals: ["default_answer_only"] };
     expect(inheritRequirementForContinuation(current, "full_execution", false)).toBe(current);
     expect(inheritRequirementForContinuation(current, undefined, true)).toBe(current);
+  });
+});
+
+describe("shouldShortCircuitCoordinator", () => {
+  test("bypasses coordinator for conversational and simple direct-answer turns", () => {
+    expect(shouldShortCircuitCoordinator(
+      "thanks!",
+      classifyTurnRequirements("thanks!"),
+      false,
+    )).toBe(true);
+    expect(shouldShortCircuitCoordinator(
+      "What is the capital of France?",
+      classifyTurnRequirements("What is the capital of France?"),
+      false,
+    )).toBe(true);
+  });
+
+  test("keeps coordinator for complex reasoning, continuations, and workspace authority", () => {
+    const complex = "Compare Raft and Paxos across failure semantics, operational tradeoffs, and recovery behavior.";
+    expect(shouldShortCircuitCoordinator(complex, classifyTurnRequirements(complex), false)).toBe(false);
+    expect(shouldShortCircuitCoordinator(
+      "continue",
+      classifyTurnRequirements("continue"),
+      true,
+    )).toBe(false);
+    expect(shouldShortCircuitCoordinator(
+      "summarize this repository",
+      classifyTurnRequirements("summarize this repository"),
+      false,
+    )).toBe(false);
+    expect(shouldShortCircuitCoordinator(
+      "fix src/index.ts",
+      classifyTurnRequirements("fix src/index.ts"),
+      false,
+    )).toBe(false);
   });
 });
 

@@ -38,6 +38,7 @@
     ],
     "resources": {
       "../server-jarvis/dist/index.js": "index.js",
+      "../automate_inference_metrics.py": "automate_inference_metrics.py",
       "../server-jarvis/src/prompts/**/*": "prompts/"
     }
   }

@@ -47,3 +47,8 @@ sky-interact.mjs
 
 # --- Conductor terminal session runtime state (PIDs, CWD tracking) ---
 terminals/
+
+# --- Python bytecode caches (never commit) ---
+__pycache__/
+*.pyc
+*.pyo

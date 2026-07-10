@@ -37,6 +37,15 @@ if ((Get-FileHash "$deployDir\index.js" -Algorithm SHA256).Hash -ne $manifest.in
     Write-Host "index.js hash matches manifest." -ForegroundColor Green
 }
 
+$metricsPath = Join-Path $deployDir 'automate_inference_metrics.py'
+if (-not (Test-Path $metricsPath) -or
+    (Get-FileHash $metricsPath -Algorithm SHA256).Hash -ne $manifest.inference_metrics_sha256) {
+    Write-Error "DEPLOY INCOMPLETE: inference metrics script is missing or its hash differs from the manifest."
+    exit 1
+} else {
+    Write-Host "inference metrics script hash matches manifest." -ForegroundColor Green
+}
+
 if (-not (Test-Path (Join-Path $deployDir 'prompts'))) {
     Write-Error "DEPLOY INCOMPLETE: prompts/ directory missing!"
     exit 1

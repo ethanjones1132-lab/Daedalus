@@ -150,6 +150,152 @@ describe("Orchestration & Routing Tests", () => {
     expect(executorTurnLimit("full")).toBe(BUILTIN_MODES.executor.max_turns);
   });
 
+  test("workspace_read blocks stale repo synthesis when the executor produces no read evidence", async () => {
+    const runtime = createToolRuntime();
+    const def = (name: string) => ({
+      type: "function" as const,
+      function: { name, description: "", parameters: { type: "object" as const, properties: {}, required: [] } },
+      requires_approval: false,
+      dangerous: false,
+    });
+    runtime.register(def("read_file"), async () => "real Jarvis repository evidence");
+    runtime.register(def("list_directory"), async () => "README.md\nserver-jarvis\nsrc-tauri\nsrc-ui");
+    const ctx = makeExecutionContext("agent", defaultConfig());
+    const stages: string[] = [];
+    const callModel = async (_messages: ChatMessage[], options: any = {}) => {
+      stages.push(options.stageLabel ?? "unknown");
+      if (options.stageLabel === "executor") {
+        return {
+          content: "This is a multi-stage Jarvis agent pipeline whose runtime entry point is jarvis/orchestrator.py.",
+        };
+      }
+      return { content: "Inspect jarvis/orchestrator.py first to understand the runtime path." };
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+
+    const result = await executor.execute(
+      "Give me a two-sentence summary of this repo, then name one runtime entry file.",
+      ["executor", "synthesizer"],
+      "run-repo-grounding-missing-evidence",
+      () => {},
+      {
+        executionProfile: "read_only",
+        turnRequirement: "workspace_read",
+      } as any,
+    );
+
+    expect(stages).toEqual(["executor", "executor"]);
+    expect(result.answer).toBe("");
+    expect(result.outcome).toBe("failed");
+    expect(result.error_code).toBe("missing_workspace_evidence");
+    expect(result.error).toContain("no successful workspace read");
+  });
+
+  test("workspace_read accepts successful read evidence and passes it to synthesis", async () => {
+    const runtime = createToolRuntime();
+    const readFile = {
+      type: "function" as const,
+      function: { name: "read_file", description: "", parameters: { type: "object" as const, properties: {}, required: [] } },
+      requires_approval: false,
+      dangerous: false,
+    };
+    runtime.register(readFile, async () => "Jarvis is a Tauri desktop platform backed by a Bun server.");
+    const ctx = makeExecutionContext("agent", defaultConfig());
+    let synthesizerContext = "";
+    let executorCalls = 0;
+    const callModel = async (messages: ChatMessage[], options: any = {}) => {
+      if (options.stageLabel === "executor") {
+        executorCalls += 1;
+        if (executorCalls > 1) {
+          return { content: "Grounded repo summary is ready." };
+        }
+        return {
+          content: "",
+          tool_calls: [{
+            id: "read-readme",
+            type: "function",
+            function: { name: "read_file", arguments: JSON.stringify({ path: "README.md" }) },
+          }],
+        };
+      }
+      synthesizerContext = messages.find((message) => message.role === "user")?.content ?? "";
+      return { content: "Jarvis is a Tauri desktop platform with a Bun server." };
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+
+    const result = await executor.execute(
+      "Summarize this repo.",
+      ["executor", "synthesizer"],
+      "run-repo-grounding-with-evidence",
+      () => {},
+      {
+        executionProfile: "read_only",
+        turnRequirement: "workspace_read",
+      } as any,
+    );
+
+    expect(result.outcome).toBe("success");
+    expect(result.error).toBeUndefined();
+    expect(synthesizerContext).toContain("Jarvis is a Tauri desktop platform backed by a Bun server");
+  });
+
+  test("workspace_read cannot bypass the evidence fence by omitting synthesizer", async () => {
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig());
+    const executor = new PipelineExecutor(
+      async () => ({ content: "The repo is an Expo app." }),
+      runtime,
+      ctx,
+      testCollector,
+    );
+
+    const result = await executor.execute(
+      "Summarize this repo.",
+      ["executor"],
+      "run-repo-grounding-no-synth-bypass",
+      () => {},
+      {
+        executionProfile: "read_only",
+        turnRequirement: "workspace_read",
+      },
+    );
+
+    expect(result).toMatchObject({
+      answer: "",
+      outcome: "failed",
+      error_code: "missing_workspace_evidence",
+    });
+  });
+
+  test("answer_only executor remains free to synthesize without workspace evidence", async () => {
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig());
+    const stages: string[] = [];
+    const executor = new PipelineExecutor(async (_messages, options) => {
+      stages.push(options?.stageLabel ?? "unknown");
+      return options?.stageLabel === "executor"
+        ? { content: "Paris is the capital of France." }
+        : { content: "The capital of France is Paris." };
+    }, runtime, ctx, testCollector);
+
+    const result = await executor.execute(
+      "What is the capital of France?",
+      ["executor", "synthesizer"],
+      "run-answer-only-no-workspace-evidence",
+      () => {},
+      {
+        executionProfile: "read_only",
+        turnRequirement: "answer_only",
+      },
+    );
+
+    expect(stages).toEqual(["executor", "synthesizer"]);
+    expect(result).toMatchObject({
+      answer: "The capital of France is Paris.",
+      outcome: "success",
+    });
+  });
+
   test("PipelineExecutor surfaces a synthesizer failure as a turn-fatal error", async () => {
     const runtime = createToolRuntime();
     const ctx = makeExecutionContext("agent", defaultConfig);

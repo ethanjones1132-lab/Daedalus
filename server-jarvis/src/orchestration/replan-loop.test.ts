@@ -27,6 +27,38 @@ function baseDecision(overrides: Partial<CoordinatorResult> = {}): CoordinatorRe
 }
 
 describe("runPipelineWithReplanning", () => {
+  test("preserves missing_workspace_evidence through the replan finalizer", async () => {
+    const calls: string[] = [];
+    const executor = new PipelineExecutor(async (_messages, options) => {
+      calls.push(options?.stageLabel ?? "unknown");
+      return { content: "This is an Expo app configured by app.json." };
+    }, runtime, ctx, testCollector);
+    const coordinator = new Coordinator((async () => ({ content: "unused" })) as any);
+
+    const result = await runPipelineWithReplanning({
+      contextMessage: "Summarize this repo.",
+      initialDecision: baseDecision({ pipeline: ["executor", "synthesizer"] }),
+      turnRequirement: "workspace_read",
+      coordinator,
+      routeOptions: { sessionId: "workspace-evidence-replan" },
+      executor,
+      agentRunId: "run-workspace-evidence-replan",
+      onStateChange: () => {},
+      baseOptions: {
+        executionProfile: "read_only",
+        turnRequirement: "workspace_read",
+      },
+      maxReplans: 0,
+    });
+
+    expect(calls).toEqual(["executor", "executor"]);
+    expect(result).toMatchObject({
+      answer: "",
+      outcome: "failed",
+      error_code: "missing_workspace_evidence",
+    });
+  });
+
   test("final segment with a failed executor call is degraded by the effect gate", async () => {
     const failingRuntime = createToolRuntime();
     failingRuntime.register({

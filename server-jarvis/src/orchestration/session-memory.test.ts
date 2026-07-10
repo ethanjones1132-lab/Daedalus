@@ -48,6 +48,43 @@ describe("session-memory", () => {
     expect(hints?.prior_tool_results?.["read_file:src/auth.ts"]).toContain("export const auth");
   });
 
+  test("scopes retrieved tool results and file facts to the active workspace", () => {
+    const memory = new SessionMemory(() => makeConfig());
+    memory.recordToolResult({
+      sessionId: "workspace-switch",
+      toolName: "read_file",
+      args: { path: "README.md" },
+      result: { output: "Jarvis is a Tauri desktop platform with a Bun server.", is_error: false },
+      workspacePath: "C:\\Projects\\home-base-recovered",
+    });
+    memory.recordToolResult({
+      sessionId: "workspace-switch",
+      toolName: "read_file",
+      args: { path: "README.md" },
+      result: { output: "Versutus is an Expo React Native mobile application.", is_error: false },
+      workspacePath: "C:\\Projects\\Versutus",
+    });
+
+    const jarvisHints = memory.toSharedContextHints(
+      "workspace-switch",
+      "c:/projects/home-base-recovered/",
+    );
+    expect(jarvisHints?.prior_tool_results?.["read_file:README.md"]).toContain("Tauri desktop");
+    expect(jarvisHints?.prior_tool_results?.["read_file:README.md"]).not.toContain("Expo");
+    expect(jarvisHints?.relevant_memories?.join("\n")).toContain("home-base-recovered/README.md");
+    expect(jarvisHints?.relevant_memories?.join("\n")).not.toContain("Versutus/README.md");
+    expect(memory.lookupCachedToolResult(
+      "workspace-switch",
+      "read_file",
+      { path: "README.md" },
+      "c:/projects/home-base-recovered/",
+    )).toContain("Tauri desktop");
+
+    const versutusHints = memory.toSharedContextHints("workspace-switch", "C:\\Projects\\Versutus");
+    expect(versutusHints?.prior_tool_results?.["read_file:README.md"]).toContain("Expo React Native");
+    expect(versutusHints?.prior_tool_results?.["read_file:README.md"]).not.toContain("Tauri desktop");
+  });
+
   test("a failed read_file records a failure pattern, not a snapshot, fact, or cache hit", () => {
     const memory = new SessionMemory(() => makeConfig());
     memory.recordToolResult({

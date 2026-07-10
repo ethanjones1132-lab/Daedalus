@@ -18,6 +18,8 @@ use tokio::time::{interval, MissedTickBehavior};
 const POLL_INTERVAL_SECS: u64 = 60;
 const INITIAL_DELAY_SECS: u64 = 20;
 const STREAM_TIMEOUT_SECS: u64 = 180;
+pub const INFERENCE_FEEDBACK_CRON_JOB_ID: &str = "jarvis-system-inference-feedback";
+const INFERENCE_FEEDBACK_SCHEDULE: &str = "17 */6 * * *";
 
 use std::sync::OnceLock;
 
@@ -408,6 +410,18 @@ fn detect_missed_jobs(app: &AppHandle) {
 
 /// Scheduler loop — spawned once at app startup.
 pub async fn start_cron_scheduler(app: AppHandle) {
+    {
+        let db = app.state::<AppDb>();
+        let conn = db
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match ensure_inference_feedback_job(&conn) {
+            Ok(true) => println!("[cron] seeded deterministic inference-feedback job"),
+            Ok(false) => {}
+            Err(error) => eprintln!("[cron] {error}"),
+        }
+    }
     tokio::time::sleep(Duration::from_secs(INITIAL_DELAY_SECS)).await;
 
     detect_missed_jobs(&app);
@@ -530,4 +544,72 @@ pub async fn trigger_missed_job(app: &AppHandle, id: &str) -> Result<bool, Strin
     };
 
     execute_job(app, id, &schedule_expr).await.map(|_| true)
+}
+
+fn ensure_inference_feedback_job(conn: &rusqlite::Connection) -> Result<bool, String> {
+    let next_run = compute_next_run(INFERENCE_FEEDBACK_SCHEDULE)
+        .ok_or_else(|| "Could not compute inference-feedback next_run".to_string())?;
+    conn.execute(
+        "INSERT OR IGNORE INTO cron_jobs
+         (id, name, schedule, agent_id, prompt, enabled, next_run, metadata)
+         VALUES (?, 'Inference telemetry feedback', ?, 'jarvis',
+                 '__jarvis_system_inference_feedback__', 1, ?,
+                 '{\"system_job\":\"inference_feedback\",\"deterministic\":true}')",
+        rusqlite::params![
+            INFERENCE_FEEDBACK_CRON_JOB_ID,
+            INFERENCE_FEEDBACK_SCHEDULE,
+            next_run,
+        ],
+    )
+    .map(|affected| affected > 0)
+    .map_err(|error| format!("Failed to seed inference-feedback cron job: {error}"))
+}
+
+#[cfg(test)]
+mod inference_feedback_job_tests {
+    use super::*;
+
+    #[test]
+    fn system_feedback_job_is_seeded_idempotently_without_overriding_operator_disable() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cron_jobs (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, schedule TEXT NOT NULL,
+                agent_id TEXT NOT NULL DEFAULT 'jarvis', session_id TEXT,
+                prompt TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,
+                last_run TEXT, next_run TEXT, run_count INTEGER NOT NULL DEFAULT 0,
+                metadata TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );",
+        )
+        .unwrap();
+
+        assert!(ensure_inference_feedback_job(&conn).unwrap());
+        assert!(!ensure_inference_feedback_job(&conn).unwrap());
+        let seeded: (String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT schedule, enabled, next_run FROM cron_jobs WHERE id = ?",
+                [INFERENCE_FEEDBACK_CRON_JOB_ID],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(seeded.0, "17 */6 * * *");
+        assert_eq!(seeded.1, 1);
+        assert!(seeded.2.is_some());
+
+        conn.execute(
+            "UPDATE cron_jobs SET enabled = 0 WHERE id = ?",
+            [INFERENCE_FEEDBACK_CRON_JOB_ID],
+        )
+        .unwrap();
+        assert!(!ensure_inference_feedback_job(&conn).unwrap());
+        let enabled: i64 = conn
+            .query_row(
+                "SELECT enabled FROM cron_jobs WHERE id = ?",
+                [INFERENCE_FEEDBACK_CRON_JOB_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(enabled, 0);
+    }
 }

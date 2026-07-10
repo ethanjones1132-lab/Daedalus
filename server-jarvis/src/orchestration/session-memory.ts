@@ -14,6 +14,8 @@ export interface ToolResultCacheEntry {
   timestamp: number;
   ttlMs: number;
   isError: boolean;
+  /** Workspace root that bounded the tool invocation. */
+  workspacePath?: string;
 }
 
 export interface FileSnapshotEntry {
@@ -28,6 +30,8 @@ export interface DiscoveredFactEntry {
   source: string;
   confidence: number;
   timestamp: number;
+  /** Workspace root from which this fact was retrieved. */
+  workspacePath?: string;
 }
 
 export interface FailurePatternEntry {
@@ -84,12 +88,28 @@ function stableStringify(value: Record<string, unknown>): string {
   return JSON.stringify(sorted);
 }
 
+/** Stable identity for workspace provenance and cache partitioning. */
+function normalizeWorkspacePath(workspacePath?: string): string | undefined {
+  if (!workspacePath?.trim()) return undefined;
+  let normalized = workspacePath.trim().replace(/\\/g, "/");
+  if (/^[a-zA-Z]:\/+$/i.test(normalized)) {
+    normalized = `${normalized.slice(0, 2)}/`;
+  } else if (normalized !== "/") {
+    normalized = normalized.replace(/\/+$/, "");
+  }
+  // Windows drive and UNC paths are case-insensitive; POSIX paths are not.
+  if (/^[a-zA-Z]:\//.test(normalized) || normalized.startsWith("//")) {
+    normalized = normalized.toLowerCase();
+  }
+  return normalized;
+}
+
 export function toolCallCacheKey(
   toolName: string,
   args: Record<string, unknown>,
   workspacePath?: string,
 ): string {
-  const raw = `${toolName}|${workspacePath ?? ""}|${stableStringify(args)}`;
+  const raw = `${toolName}|${normalizeWorkspacePath(workspacePath) ?? ""}|${stableStringify(args)}`;
   return createHash("sha256").update(raw).digest("hex").slice(0, 16);
 }
 
@@ -179,13 +199,15 @@ export class SessionMemory {
     this.persist(session);
   }
 
-  toSharedContextHints(sessionId: string): SharedContextHints | undefined {
+  toSharedContextHints(sessionId: string, workspacePath?: string): SharedContextHints | undefined {
     if (!this.config().enabled) return undefined;
     const session = this.getSession(sessionId);
     this.pruneExpired(session);
+    const activeWorkspace = normalizeWorkspacePath(workspacePath);
 
     const prior_tool_results: Record<string, string> = {};
     for (const entry of Object.values(session.toolResults)) {
+      if (activeWorkspace && entry.workspacePath !== activeWorkspace) continue;
       prior_tool_results[entry.displayKey] = truncateSnippet(entry.output);
     }
 
@@ -196,6 +218,7 @@ export class SessionMemory {
       .map((f) => (f.count > 1 ? `${f.pattern} (seen ${f.count}x)` : f.pattern));
 
     const relevant_memories = Object.values(session.discoveredFacts)
+      .filter((fact) => !activeWorkspace || fact.workspacePath === activeWorkspace)
       .sort((a, b) => b.timestamp - a.timestamp)
       .slice(0, 16)
       .map((f) => f.value);
@@ -243,6 +266,7 @@ export class SessionMemory {
       timestamp: now,
       ttlMs: cfg.tool_result_ttl_ms,
       isError: input.result.is_error,
+      workspacePath: normalizeWorkspacePath(input.workspacePath),
     };
 
     if (input.result.is_error) {
@@ -263,6 +287,7 @@ export class SessionMemory {
           source: "read_file",
           confidence: 1,
           timestamp: now,
+          workspacePath: normalizeWorkspacePath(input.workspacePath),
         };
       }
     }

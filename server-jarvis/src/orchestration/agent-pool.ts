@@ -1,5 +1,11 @@
 import type { StageName, TaskType } from "./coordinator";
-import { applyLearnedCapabilities, fallbackBoostKey, getLearnedPoolState } from "../self-tuning/learned-pool-state";
+import {
+  applyLearnedCapabilities,
+  empiricalFirstTokenTimeoutFor,
+  fallbackBoostKey,
+  getLearnedPoolState,
+  modelRoutingScoreDelta,
+} from "../self-tuning/learned-pool-state";
 
 export interface AgentCapabilities {
   code: number;
@@ -269,10 +275,19 @@ export class AgentPool {
     if (candidates.length === 0) return undefined;
     const stageDefault = candidates.find((agent) => agent.default_for.includes(stage));
     if (stageDefault) {
+      if (modelRoutingScoreDelta(stageDefault) < 0) {
+        const replacement = candidates
+          .filter((agent) => agent.id !== stageDefault.id)
+          .sort((a, b) => this.scoreWithFeedback(b, stage, taskType) - this.scoreWithFeedback(a, stage, taskType))[0];
+        if (
+          replacement &&
+          this.scoreWithFeedback(replacement, stage, taskType) > this.scoreWithFeedback(stageDefault, stage, taskType)
+        ) return replacement;
+      }
       if (stage === "synthesizer") return this.preferFastSynthesizer(stageDefault, candidates, taskType);
       return stageDefault;
     }
-    return candidates.sort((a, b) => this.score(b, stage, taskType) - this.score(a, stage, taskType))[0];
+    return candidates.sort((a, b) => this.scoreWithFeedback(b, stage, taskType) - this.scoreWithFeedback(a, stage, taskType))[0];
   }
 
   /**
@@ -321,6 +336,8 @@ export class AgentPool {
         scoreA += learned.fallbackBoosts.get(fallbackBoostKey(a.id, stage, taskType)) ?? 0;
         scoreB += learned.fallbackBoosts.get(fallbackBoostKey(b.id, stage, taskType)) ?? 0;
       }
+      scoreA += modelRoutingScoreDelta(a);
+      scoreB += modelRoutingScoreDelta(b);
       return scoreB - scoreA;
     };
     return [
@@ -376,6 +393,10 @@ export class AgentPool {
         ? caps.reasoning * 0.2
         : 0;
     return this.weighted(caps, stageWeights) + taskBoost;
+  }
+
+  private scoreWithFeedback(agent: OrchestratorAgent, stage: string, taskType: TaskType | string): number {
+    return this.score(agent, stage, taskType) + modelRoutingScoreDelta(agent);
   }
 
   private overallScore(agent: OrchestratorAgent): number {
@@ -446,17 +467,25 @@ export function firstTokenTimeoutFor(
   modelId: string | undefined,
   baseMs: number,
   capMs: number = 60_000,
+  provider?: string,
 ): number {
   const fallback = Math.max(1_000, Number(baseMs) || 30_000);
-  if (!pool || !modelId) return Math.min(fallback, capMs);
-  const match = pool.enabled().find((agent) => agent.model_id === modelId);
+  if (!modelId) return Math.min(fallback, capMs);
+  const match = pool?.enabled().find((agent) => agent.model_id === modelId);
   // The pool is keyed by agent `id`, so the same model_id can exist twice —
   // once enabled, once disabled. The disable carve-out only applies when NO
   // enabled copy is live; otherwise a stale disabled duplicate would suppress
   // DEFAULT-pool inheritance for the enabled copy and resurrect the 30s-abort
   // bug this helper exists to prevent.
   const knownButDisabled =
-    !match && pool.list().some((agent) => agent.model_id === modelId && !agent.enabled);
+    Boolean(pool) && !match && pool!.list().some((agent) => agent.model_id === modelId && !agent.enabled);
+  const empirical = knownButDisabled
+    ? undefined
+    : empiricalFirstTokenTimeoutFor(modelId, provider ?? match?.provider);
+  if (empirical !== undefined) {
+    return Math.max(1_000, Math.min(empirical, capMs));
+  }
+  if (!pool) return Math.min(fallback, capMs);
   let override = match?.first_token_timeout_ms;
   if ((typeof override !== "number" || !Number.isFinite(override)) && !knownButDisabled) {
     // Active pool has no opinion for this model — fall back to the DEFAULT

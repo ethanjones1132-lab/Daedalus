@@ -75,6 +75,8 @@ export interface CoordinatorResult {
   /** Phase 4 telemetry: which routing backend produced this decision. */
   conductor_source?: "local" | "api" | "trivial" | "continuation_reuse";
   conductor_model?: string;
+  /** True when a model call completed but its routing payload was unusable. */
+  routing_parse_fallback?: boolean;
 }
 
 export interface CoordinatorRouteOptions {
@@ -105,6 +107,37 @@ const VALID_TASK_TYPES = new Set<TaskType>(["code_review", "debug", "refactor", 
 const VALID_COMPLEXITIES = new Set<Complexity>(["low", "medium", "high"]);
 const VALID_STAGES = new Set<StageName>(["planner", "executor", "reviewer", "rewriter", "synthesizer"]);
 const VALID_TOPOLOGIES = new Set<Topology>(["linear", "speculative_parallel", "speculative_cascade", "recursive"]);
+
+/**
+ * Keep the API coordinator on the same retrieved-context contract as the local
+ * persistent conductor. SessionMemory has already bounded these collections;
+ * the final slices below provide an additional coordinator-specific ceiling so
+ * routing cannot be crowded out by an old session's cache.
+ */
+function formatApiSessionMemoryHints(hints?: SharedContextHints): string {
+  if (!hints) return "Session shared memory: none";
+  const blocks: string[] = [];
+
+  const memories = (hints.relevant_memories ?? []).slice(-16);
+  if (memories.length > 0) {
+    blocks.push(`Relevant memories:\n${memories.map((memory) => `- ${memory.slice(0, 1500)}`).join("\n")}`);
+  }
+
+  const failures = (hints.failure_patterns ?? []).slice(-8);
+  if (failures.length > 0) {
+    blocks.push(`Known failure patterns:\n${failures.map((pattern) => `- ${pattern.slice(0, 600)}`).join("\n")}`);
+  }
+
+  const cached = Object.entries(hints.prior_tool_results ?? {}).slice(-8);
+  if (cached.length > 0) {
+    blocks.push(
+      "Cached tool results:\n" +
+      cached.map(([key, value]) => `### ${key.slice(0, 200)}\n${value.slice(0, 2000)}`).join("\n\n"),
+    );
+  }
+
+  return blocks.length > 0 ? `Session shared memory:\n\n${blocks.join("\n\n")}` : "Session shared memory: none";
+}
 
 export class Coordinator {
   private static readonly MAX_STATES = 256;
@@ -158,7 +191,7 @@ export class Coordinator {
         };
       } else {
         console.warn(`[Coordinator] Routing parse failed, using default route: ${e instanceof Error ? e.message : String(e)}`);
-        decision = this.defaultRoute();
+        decision = { ...this.defaultRoute(), routing_parse_fallback: true };
       }
     }
     if (decision.conductor_source !== "continuation_reuse") {
@@ -252,6 +285,7 @@ export class Coordinator {
           `Session ID: ${options.sessionId}`,
           `Coordinator turn: ${options.turnNumber}`,
           `Last outcome: ${options.lastOutcome ?? "none"}`,
+          formatApiSessionMemoryHints(options.sessionMemoryHints),
           history ? `Recent session history:\n${history}` : "Recent session history: none",
           `Current request:\n${request}`,
         ].join("\n\n"),
