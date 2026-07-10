@@ -93,35 +93,51 @@ pub fn wsl_windows_host_ip() -> String {
 }
 
 /// Retrieve the WSL hostname IPs, cached with a 60-second TTL to avoid spawning wsl.exe repeatedly.
-pub fn wsl_hostname_ips() -> Vec<String> {
-    let cache_mutex = WSL_IPS_CACHE.get_or_init(|| Mutex::new(None));
-    let guard = cache_mutex.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((ips, last_updated)) = &*guard {
-        if last_updated.elapsed() < WSL_IPS_TTL {
-            return ips.clone();
-        }
-    }
-
-    #[allow(unused_mut)]
-    let mut ips = Vec::new();
-    #[cfg(target_os = "windows")]
+fn cached_hostname_ips<F>(
+    cache_mutex: &Mutex<Option<(Vec<String>, Instant)>>,
+    refresh: F,
+) -> Vec<String>
+where
+    F: FnOnce() -> Vec<String>,
+{
     {
-        let mut cmd = Command::new("wsl.exe");
-        cmd.args(["hostname", "-I"]);
-        if let Some(output) = command_output_timeout(cmd, Duration::from_secs(15)) {
-            if output.status.success() {
-                let text = String::from_utf8_lossy(&output.stdout);
-                for ip in text.split_whitespace() {
-                    ips.push(ip.to_string());
-                }
+        let guard = cache_mutex.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((ips, last_updated)) = &*guard {
+            if last_updated.elapsed() < WSL_IPS_TTL {
+                return ips.clone();
             }
         }
     }
 
+    // Do not hold the cache mutex while invoking wsl.exe. Apart from blocking
+    // callers, holding it here deadlocks the publication lock below whenever
+    // the cache is cold.
+    let ips = refresh();
     let mut guard = cache_mutex.lock().unwrap_or_else(|p| p.into_inner());
     *guard = Some((ips.clone(), Instant::now()));
-
     ips
+}
+
+pub fn wsl_hostname_ips() -> Vec<String> {
+    let cache_mutex = WSL_IPS_CACHE.get_or_init(|| Mutex::new(None));
+    cached_hostname_ips(cache_mutex, || {
+        #[allow(unused_mut)]
+        let mut ips = Vec::new();
+        #[cfg(target_os = "windows")]
+        {
+            let mut cmd = Command::new("wsl.exe");
+            cmd.args(["hostname", "-I"]);
+            if let Some(output) = command_output_timeout(cmd, Duration::from_secs(15)) {
+                if output.status.success() {
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    for ip in text.split_whitespace() {
+                        ips.push(ip.to_string());
+                    }
+                }
+            }
+        }
+        ips
+    })
 }
 
 /// Get the cached Bun URL if available.
@@ -285,4 +301,24 @@ fn shlex_join(args: &[&str]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hostname_cache_refresh_does_not_hold_the_mutex_during_refresh() {
+        let cache = Mutex::new(None);
+        let refreshed = cached_hostname_ips(&cache, || {
+            // This re-entrant lock is the regression seam: the refresh closure
+            // must be able to publish/inspect state without deadlocking.
+            let guard = cache.lock().unwrap();
+            drop(guard);
+            vec!["127.0.0.1".to_string()]
+        });
+
+        assert_eq!(refreshed, vec!["127.0.0.1"]);
+        assert_eq!(cache.lock().unwrap().as_ref().unwrap().0, vec!["127.0.0.1"]);
+    }
 }

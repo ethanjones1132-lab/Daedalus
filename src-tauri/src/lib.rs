@@ -547,7 +547,7 @@ pub async fn force_restart_jarvis_server() -> Result<(), String> {
         .ok_or_else(|| "server bundle not found (no index.js / index.ts beside the app or in the repo)".to_string())?;
 
     // 3. Kill the tracked child (if any) and re-spawn off the runtime.
-    let spawn_result: Result<(), String> = tauri::async_runtime::spawn_blocking(move || {
+    let spawn_result: Result<(), String> = spawn_blocking_on_current_runtime(move || {
         if SERVER_PROCESS.get().is_none() {
             let _ = SERVER_PROCESS.set(std::sync::Mutex::new(None));
         }
@@ -614,11 +614,13 @@ pub async fn ensure_jarvis_server_started() -> Result<(), String> {
     }
 
     // Not reachable — spawn the server once.
+    log::info!(target: "jarvis::startup", "Bun health probe failed; locating server entry");
     if SERVER_PROCESS.get().is_none() {
         SERVER_PROCESS.set(std::sync::Mutex::new(None)).ok();
     }
     let server_entry = find_jarvis_server().ok_or("server-jarvis index.ts not found")?;
-    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+    log::info!(target: "jarvis::startup", "Bun server entry resolved: {server_entry}");
+    spawn_blocking_on_current_runtime(move || -> Result<(), String> {
         let m = SERVER_PROCESS
             .get()
             .ok_or("SERVER_PROCESS not initialized")?;
@@ -632,6 +634,7 @@ pub async fn ensure_jarvis_server_started() -> Result<(), String> {
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))??;
+    log::info!(target: "jarvis::startup", "Bun child spawn returned");
 
     // Wait (off the main thread) for the freshly spawned server to come up.
     let start = std::time::Instant::now();
@@ -695,7 +698,22 @@ where
         .spawn(task)
 }
 
+/// Run synchronous boot/process work on the runtime that owns the caller.
+/// Boot now lives on a dedicated current-thread runtime, so routing this
+/// through Tauri's global runtime can leave the bootstrap task waiting on a
+/// different executor and prevent the Bun spawn from completing.
+async fn spawn_blocking_on_current_runtime<T, F>(work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| format!("blocking boot task join error: {error}"))
+}
+
 async fn bootstrap_services(handle: tauri::AppHandle) {
+    log::info!(target: "jarvis::startup", "bootstrap thread entered");
     // Hydrate the in-memory config from SQLite — the single source of truth
     // for JarvisConfig. This runs on the dedicated startup runtime because
     // migration and SQLite access are synchronous.
@@ -707,7 +725,9 @@ async fn bootstrap_services(handle: tauri::AppHandle) {
         Ok(false) => {}
         Err(e) => eprintln!("[Jarvis] config migration check failed: {e}"),
     }
+    log::info!(target: "jarvis::startup", "bootstrap config migration complete");
     let cfg = crate::commands::load_jarvis_config(&db_state).unwrap_or_default();
+    log::info!(target: "jarvis::startup", "bootstrap config load complete");
     {
         let state = handle.state::<crate::jarvis::types::JarvisState>();
         *state.config.lock().await = cfg.clone();
@@ -734,12 +754,20 @@ async fn bootstrap_services(handle: tauri::AppHandle) {
         }
     }
 
-    // Backend-independent services: the proxy routes to the selected backend,
-    // while the Bun server powers tools/skills/models for every backend.
+    // Bun is required by every backend and must become healthy before optional
+    // Claude-proxy discovery touches WSL. A cold/misconfigured WSL install must
+    // not prevent the desktop's core HTTP runtime from starting.
+    if let Err(e) = crate::ensure_jarvis_server_started().await {
+        log::error!(target: "jarvis::startup", "Bun server startup failed at boot: {e}");
+    } else {
+        log::info!(target: "jarvis::startup", "Bun server healthy at boot");
+    }
+
+    // The Claude CLI proxy is optional. Its WSL/python discovery can take
+    // several bounded probes, so keep it after the required Bun listener.
     let proxy_model = cfg.ollama.model.clone();
     let proxy_result =
-        tauri::async_runtime::spawn_blocking(move || crate::spawn_claude_cli_proxy(proxy_model))
-            .await;
+        spawn_blocking_on_current_runtime(move || crate::spawn_claude_cli_proxy(proxy_model)).await;
     match proxy_result {
         Ok(Some(child)) => {
             if let Some(m) = crate::PROXY_PROCESS.get() {
@@ -753,10 +781,6 @@ async fn bootstrap_services(handle: tauri::AppHandle) {
             }
         }
         _ => eprintln!("[Jarvis] Claude CLI proxy not started (not found or spawn failed)"),
-    }
-
-    if let Err(e) = crate::ensure_jarvis_server_started().await {
-        log::error!(target: "jarvis::startup", "Bun server startup failed at boot: {e}");
     }
 
     // Keep the three boot children alive (Ollama/proxy/Bun): detect a dead
@@ -1018,6 +1042,7 @@ pub fn run() {
 #[cfg(test)]
 mod startup_thread_tests {
     use super::*;
+    use std::sync::mpsc;
 
     #[test]
     fn startup_dispatch_returns_before_slow_boot_work_finishes() {
@@ -1035,5 +1060,31 @@ mod startup_thread_tests {
         );
         release_tx.send(()).expect("release startup worker");
         worker.join().expect("startup worker should exit cleanly");
+    }
+
+    #[test]
+    fn dedicated_boot_runtime_completes_blocking_boot_work() {
+        let (result_tx, result_rx) = mpsc::channel::<i32>();
+        let worker = spawn_background_thread("jarvis-startup-blocking-test", move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build");
+            runtime.block_on(async move {
+                let value = spawn_blocking_on_current_runtime(|| 42)
+                    .await
+                    .expect("blocking boot work should join");
+                result_tx.send(value).expect("test receiver should be alive");
+            });
+        })
+        .expect("startup blocking test thread should spawn");
+
+        assert_eq!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("dedicated runtime should complete its blocking work"),
+            42
+        );
+        worker.join().expect("startup blocking test should exit cleanly");
     }
 }
