@@ -905,6 +905,7 @@ pub fn run() {
             jarvis_ping,
             jarvis_discover_models,
             jarvis_test_connection,
+            jarvis_test_provider,
             jarvis_switch_backend,
             jarvis_get_companion,
             jarvis_save_companion,

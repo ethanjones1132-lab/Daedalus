@@ -33,6 +33,8 @@ import {
 } from "./openrouter";
 import type { OpenRouterCostInfo } from "./openrouter";
 import { resolveProviderTarget, providerChatUrl, providerHeaders } from "./providers";
+import { checkHttpProviderHealth } from "./provider-health";
+import type { HttpProviderId } from "./providers";
 import { recordInference, inferenceMetricsSnapshot, backendForProvider, type Backend } from "./inference-metrics";
 import { createApprovalRegistry } from "./approval-registry";
 import { createDiscordAdapter, SqliteDeliveryReceiptStore } from "./channels/discord";
@@ -3872,6 +3874,22 @@ export async function baseFetch(req: Request): Promise<Response> {
     if (path === "/models" && (req.method === "GET" || req.method === "POST")) {
       const body = req.method === "POST" ? await req.json().catch(() => ({})) : {};
       return Response.json(await discoverModels(body.config));
+    }
+    if (path === "/providers/test" && req.method === "POST") {
+      const body = await req.json().catch(() => ({})) as {
+        provider?: string;
+        config?: Partial<JarvisConfig>;
+      };
+      const provider = body.provider;
+      if (provider !== "openrouter" && provider !== "opencode_zen" && provider !== "opencode_go") {
+        return Response.json(
+          { ok: false, latency_ms: 0, error: "Unknown HTTP provider." },
+          { status: 400 },
+        );
+      }
+      return Response.json(
+        await checkHttpProviderHealth(resolveConfig(body.config), provider as HttpProviderId),
+      );
     }
     if (path === "/test" && (req.method === "GET" || req.method === "POST")) {
       const body = req.method === "POST" ? await req.json().catch(() => ({})) : {};

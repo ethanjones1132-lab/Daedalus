@@ -204,6 +204,35 @@ pub async fn jarvis_test_connection(
         .map_err(|e| format!("JSON parse error from /test: {}", e))
 }
 
+/// Test one OpenAI-compatible provider using the Bun server's provider-aware
+/// health probe. The response is proxied unchanged so the UI can surface the
+/// provider-specific status without putting credentials in the native layer.
+#[tauri::command]
+pub async fn jarvis_test_provider(
+    provider: String,
+    config: Option<Value>,
+) -> Result<Value, String> {
+    if !matches!(
+        provider.as_str(),
+        "openrouter" | "opencode_zen" | "opencode_go"
+    ) {
+        return Err("unknown HTTP provider".to_string());
+    }
+
+    let base = bun_base().await?;
+    let client = http_client()?;
+    let body = serde_json::json!({ "provider": provider, "config": config });
+    let resp = client
+        .post(format!("{}/providers/test", base))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Bun server provider test failed: {}", e))?;
+    resp.json::<Value>()
+        .await
+        .map_err(|e| format!("JSON parse error from /providers/test: {}", e))
+}
+
 #[tauri::command]
 pub async fn jarvis_switch_backend(
     backend: String,
