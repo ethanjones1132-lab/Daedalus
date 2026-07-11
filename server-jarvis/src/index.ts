@@ -33,6 +33,7 @@ import {
 } from "./openrouter";
 import type { OpenRouterCostInfo } from "./openrouter";
 import { resolveProviderTarget, providerChatUrl, providerHeaders } from "./providers";
+import { routableOrchestratorAgents, runtimeFactsSystemMessage } from "./provider-availability";
 import { recordInference, inferenceMetricsSnapshot, backendForProvider, type Backend } from "./inference-metrics";
 import { createApprovalRegistry } from "./approval-registry";
 import { createDiscordAdapter, SqliteDeliveryReceiptStore } from "./channels/discord";
@@ -1439,7 +1440,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           console.log(`[Jarvis Orchestrator] Pruned ${pruned} expired conductor session file(s)`);
         }
         // AgentPool applies learned + cron feedback exactly once at selection.
-        const agentPool = new AgentPool(cfg.orchestrator.agents ?? []);
+        const agentPool = new AgentPool(routableOrchestratorAgents(cfg));
         const poolCoverage = agentPool.coverage();
         console.log(`[Jarvis Orchestrator] Agent pool coverage: ${formatPoolDiversity(poolCoverage)}${poolCoverage.stage_gaps.length > 0 ? `; gaps=${poolCoverage.stage_gaps.join(",")}` : ""}`);
 
@@ -1487,7 +1488,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const cascadeTier = callOptions?.cascadeTier as "cheap" | "strong" | undefined;
           if (stageLabel && cfg.orchestrator?.enabled) {
             try {
-              const pool = new AgentPool(cfg.orchestrator?.agents ?? []);
+              const pool = new AgentPool(routableOrchestratorAgents(cfg));
               let agent: import("./orchestration/agent-pool").OrchestratorAgent | undefined;
               // Honor the empty-completion cascade-advance exclude set: a model
               // that just returned an empty 200 (or hit a 2-strike rate limit)
@@ -1553,7 +1554,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // Use text tool protocol if native tools are disabled/unsupported and tools are requested
           const useTextTools = !modelSupportsNativeTools && callOptions?.tools && callOptions.tools.length > 0;
 
-          let effectiveMessages = [...messages];
+          let effectiveMessages = [
+            { role: "system", content: runtimeFactsSystemMessage(cfg) },
+            ...messages,
+          ];
           if (useTextTools) {
             const textInstructions = buildTextToolInstructions(callOptions.tools);
             const sysIdx = effectiveMessages.findIndex((m) => m.role === "system");
@@ -2888,7 +2892,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // despite the override being "in effect". `firstTokenTimeoutFor`
         // clamps to [1_000, 60_000] so this watchdog can never fire
         // after the outer 60s stream-stall watchdog would have.
-        const agentLoopPool = new AgentPool(cfg.orchestrator?.agents ?? []);
+        const agentLoopPool = new AgentPool(routableOrchestratorAgents(cfg));
         const firstTokenMs = firstTokenTimeoutFor(
           agentLoopPool,
           modelName,
@@ -3797,7 +3801,7 @@ export async function baseFetch(req: Request): Promise<Response> {
     }
     if (path === "/agents/pool" && req.method === "GET") {
       const poolCfg = loadConfig();
-      const pool = new AgentPool(poolCfg.orchestrator?.agents ?? []);
+      const pool = new AgentPool(routableOrchestratorAgents(poolCfg));
       return Response.json({ pool: pool.list(), coverage: pool.coverage(), max_recursion_depth: poolCfg.orchestrator?.max_recursion_depth ?? 2 });
     }
     if (path === "/tool/decision" && req.method === "POST") {

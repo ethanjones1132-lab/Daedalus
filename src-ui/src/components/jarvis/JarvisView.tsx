@@ -2156,7 +2156,7 @@ function SessionsPanel({
 function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setConfig: (c: JarvisConfig | null) => void }) {
   const [localConfig, setLocalConfig] = useState<JarvisConfig | null>(config);
   const [saved, setSaved] = useState(false);
-  const [showApiKey, setShowApiKey] = useState(false);
+  const [showApiKeys, setShowApiKeys] = useState(false);
 
   useEffect(() => {
     setLocalConfig(config);
@@ -2239,34 +2239,82 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
           </div>
         </GlassCard>
 
-        {/* OpenRouter API Key */}
-        {localConfig.active_backend === 'openrouter' && (
-          <GlassCard hoverable={false}>
-            <h3 className="text-sm font-semibold text-bone mb-3">OpenRouter API Key</h3>
-            <div className="relative">
-              <input
-                type={showApiKey ? 'text' : 'password'}
-                value={(localConfig.openrouter?.api_key ?? '')}
-                onChange={(e) => setLocalConfig(prev => prev ? {
-                  ...prev,
-                  openrouter: { ...prev.openrouter, api_key: e.target.value }
-                } : prev)}
-                placeholder="sk-or-v1-..."
-                className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors pr-16"
-              />
-              <button
-                onClick={() => setShowApiKey(!showApiKey)}
-                aria-label={showApiKey ? 'Hide API key' : 'Show API key'}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-mono text-bone-dim hover:text-bone-muted transition-colors px-1.5 py-0.5 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
-              >
-                {showApiKey ? 'Hide' : 'Show'}
-              </button>
+        <GlassCard hoverable={false}>
+          <div className="flex items-center justify-between gap-3 mb-3">
+            <div>
+              <h3 className="text-sm font-semibold text-bone">Provider API Keys</h3>
+              <p className="text-[10px] font-mono text-bone-faint mt-1">Used by the runtime fallback cascade; save before starting a chat.</p>
             </div>
-            <p className="text-[10px] font-mono text-bone-faint mt-1.5">
-              Get your key at <span className="text-royal-light">openrouter.ai/keys</span>
-            </p>
-          </GlassCard>
-        )}
+            <button
+              onClick={() => setShowApiKeys(!showApiKeys)}
+              aria-label={showApiKeys ? 'Hide provider API keys' : 'Show provider API keys'}
+              className="text-[10px] font-mono text-bone-dim hover:text-bone-muted transition-colors px-1.5 py-0.5 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
+            >
+              {showApiKeys ? 'Hide keys' : 'Show keys'}
+            </button>
+          </div>
+          <div className="space-y-3">
+            <div>
+              <label className="text-[10px] font-mono text-bone-dim block mb-1">OpenRouter API key</label>
+              <input
+                type={showApiKeys ? 'text' : 'password'}
+                value={localConfig.openrouter?.api_key ?? ''}
+                onChange={(e) => setLocalConfig(prev => prev ? { ...prev, openrouter: { ...prev.openrouter, api_key: e.target.value } } : prev)}
+                placeholder="sk-or-v1-..."
+                className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors"
+              />
+            </div>
+            <div>
+              <label className="text-[10px] font-mono text-bone-dim block mb-1">OpenCode Go API key</label>
+              <input
+                type={showApiKeys ? 'text' : 'password'}
+                value={localConfig.opencode_go?.api_key ?? ''}
+                onChange={(e) => setLocalConfig(prev => prev ? { ...prev, opencode_go: { ...prev.opencode_go, api_key: e.target.value } } : prev)}
+                placeholder="OpenCode Go key"
+                className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors"
+              />
+            </div>
+            <div>
+              <label className="text-[10px] font-mono text-bone-dim block mb-1">OpenCode Zen API key</label>
+              <input
+                type={showApiKeys ? 'text' : 'password'}
+                value={localConfig.opencode_zen?.api_key ?? ''}
+                onChange={(e) => setLocalConfig(prev => prev ? { ...prev, opencode_zen: { ...prev.opencode_zen, api_key: e.target.value } } : prev)}
+                placeholder="OpenCode Zen key"
+                className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors"
+              />
+            </div>
+          </div>
+        </GlassCard>
+
+        <GlassCard hoverable={false}>
+          <h3 className="text-sm font-semibold text-bone mb-3">OpenCode first-token timeout</h3>
+          <p className="text-[10px] font-mono text-bone-faint mb-3">After this many milliseconds with no response bytes, Jarvis abandons that provider and advances the fallback cascade.</p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="text-[10px] font-mono text-bone-dim block mb-1">OpenCode Go (ms)</label>
+              <input
+                type="number"
+                min={1000}
+                step={1000}
+                value={localConfig.opencode_go?.first_token_timeout_ms ?? 45000}
+                onChange={(e) => setLocalConfig(prev => prev ? { ...prev, opencode_go: { ...prev.opencode_go, first_token_timeout_ms: Math.max(1000, Number(e.target.value) || 45000) } } : prev)}
+                className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone focus:outline-none focus:border-royal/50 transition-colors"
+              />
+            </div>
+            <div>
+              <label className="text-[10px] font-mono text-bone-dim block mb-1">OpenCode Zen (ms)</label>
+              <input
+                type="number"
+                min={1000}
+                step={1000}
+                value={localConfig.opencode_zen?.first_token_timeout_ms ?? 45000}
+                onChange={(e) => setLocalConfig(prev => prev ? { ...prev, opencode_zen: { ...prev.opencode_zen, first_token_timeout_ms: Math.max(1000, Number(e.target.value) || 45000) } } : prev)}
+                className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone focus:outline-none focus:border-royal/50 transition-colors"
+              />
+            </div>
+          </div>
+        </GlassCard>
 
         {/* Model Selection */}
         <GlassCard hoverable={false}>

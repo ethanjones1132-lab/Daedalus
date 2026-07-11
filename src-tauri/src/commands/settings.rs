@@ -46,6 +46,8 @@ const KNOWN_SETTING_KEYS: &[&str] = &[
     "active_backend",
     "ollama",
     "openrouter",
+    "opencode_zen",
+    "opencode_go",
     "claude_cli",
     "tools",
     "reasoning",
@@ -154,6 +156,16 @@ pub fn load_jarvis_config_conn(conn: &rusqlite::Connection) -> Result<JarvisConf
     if let Some(v) = settings.get("openrouter") {
         if let Ok(parsed) = serde_json::from_str::<crate::jarvis::types::OpenRouterConfig>(v) {
             config.openrouter = parsed;
+        }
+    }
+    if let Some(v) = settings.get("opencode_zen") {
+        if let Ok(parsed) = serde_json::from_str::<crate::jarvis::types::OpenCodeProviderConfig>(v) {
+            config.opencode_zen = parsed;
+        }
+    }
+    if let Some(v) = settings.get("opencode_go") {
+        if let Ok(parsed) = serde_json::from_str::<crate::jarvis::types::OpenCodeProviderConfig>(v) {
+            config.opencode_go = parsed;
         }
     }
     if let Some(v) = settings.get("claude_cli") {
@@ -283,6 +295,14 @@ pub fn persist_jarvis_config_conn(
         (
             "openrouter",
             serde_json::to_string(&config.openrouter).map_err(|e| e.to_string())?,
+        ),
+        (
+            "opencode_zen",
+            serde_json::to_string(&config.opencode_zen).map_err(|e| e.to_string())?,
+        ),
+        (
+            "opencode_go",
+            serde_json::to_string(&config.opencode_go).map_err(|e| e.to_string())?,
         ),
         (
             "claude_cli",
@@ -446,5 +466,28 @@ mod tests {
         let err =
             set_setting_value(&db, "unknown_key", "value").expect_err("unknown key should fail");
         assert!(err.contains("unknown_setting"));
+    }
+
+    #[test]
+    fn opencode_provider_credentials_round_trip_through_canonical_settings() {
+        let db = mem_db();
+        set_setting_value(
+            &db,
+            "opencode_go",
+            r#"{"base_url":"https://go.example/v1","api_key":"go-secret","first_token_timeout_ms":45000}"#,
+        )
+        .expect("OpenCode Go settings should be accepted");
+        set_setting_value(
+            &db,
+            "opencode_zen",
+            r#"{"base_url":"https://zen.example/v1","api_key":"zen-secret","first_token_timeout_ms":45000}"#,
+        )
+        .expect("OpenCode Zen settings should be accepted");
+
+        let cfg = load_jarvis_config(&db).expect("load config");
+        let json = serde_json::to_value(cfg).expect("serialize config");
+        assert_eq!(json["opencode_go"]["api_key"], "go-secret");
+        assert_eq!(json["opencode_zen"]["api_key"], "zen-secret");
+        assert_eq!(json["opencode_go"]["first_token_timeout_ms"], 45_000);
     }
 }

@@ -90,6 +90,8 @@ export interface OpenRouterConfig {
 export interface OpenCodeProviderConfig {
   base_url: string;
   api_key: string;
+  /** First-byte watchdog before this provider advances to the next fallback. */
+  first_token_timeout_ms: number;
 }
 
 export interface ClaudeCliConfig {
@@ -403,10 +405,12 @@ export function defaultConfig(): JarvisConfig {
     opencode_zen: {
       base_url: "https://opencode.ai/zen/v1",
       api_key: "",
+      first_token_timeout_ms: 45_000,
     },
     opencode_go: {
       base_url: "https://opencode.ai/zen/go/v1",
       api_key: "",
+      first_token_timeout_ms: 45_000,
     },
     claude_cli: {
       enabled: true,

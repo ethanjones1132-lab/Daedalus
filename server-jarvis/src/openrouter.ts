@@ -831,12 +831,11 @@ export async function chatCompletionWithFallback(
   // before declaring the model hung and advancing the cascade. Guards against
   // a model that opens the HTTP connection but never streams (the post-hang
   // diagnosis: multi-minute stalls on a free-router call).
-  const firstTokenTimeoutMs = Math.max(1_000, Number((cfg.openrouter as any).first_token_timeout_ms ?? 30_000));
-
   for (let modelIdx = 0; modelIdx < effectiveCascade.length; modelIdx++) {
     assertFallbackDeadline(options);
     const { provider, model_id: model } = effectiveCascade[modelIdx];
     const target = resolveProviderTarget(cfg, provider);
+    const firstTokenTimeoutMs = Math.max(1_000, target.first_token_timeout_ms);
     if (!target.api_key) {
       lastError = `No API key configured for provider "${provider}" (model ${model}) — skipping`;
       console.warn(`[Fallback] ${lastError}`);

@@ -35,6 +35,10 @@ pub struct JarvisConfig {
     pub active_backend: JarvisBackend,
     pub ollama: OllamaConfig,
     pub openrouter: OpenRouterConfig,
+    #[serde(default)]
+    pub opencode_zen: OpenCodeProviderConfig,
+    #[serde(default)]
+    pub opencode_go: OpenCodeProviderConfig,
     pub claude_cli: ClaudeCliConfig,
     pub tools: ToolConfig,
     pub reasoning: ReasoningConfig,
@@ -62,6 +66,16 @@ impl Default for JarvisConfig {
             active_backend: JarvisBackend::Ollama,
             ollama: OllamaConfig::default(),
             openrouter: OpenRouterConfig::default(),
+            opencode_zen: OpenCodeProviderConfig {
+                base_url: "https://opencode.ai/zen/v1".to_string(),
+                api_key: String::new(),
+                first_token_timeout_ms: default_opencode_first_token_timeout_ms(),
+            },
+            opencode_go: OpenCodeProviderConfig {
+                base_url: "https://opencode.ai/zen/go/v1".to_string(),
+                api_key: String::new(),
+                first_token_timeout_ms: default_opencode_first_token_timeout_ms(),
+            },
             claude_cli: ClaudeCliConfig::default(),
             tools: ToolConfig::default(),
             reasoning: ReasoningConfig::default(),
@@ -142,6 +156,25 @@ pub struct OpenRouterConfig {
     pub max_retries: u32,
     #[serde(default)]
     pub timeout_ms: u64,
+}
+
+/// OpenAI-compatible credentials used by the Bun provider cascade for
+/// OpenCode Zen and OpenCode Go. These are fallback providers, not a new
+/// primary Native surface backend.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct OpenCodeProviderConfig {
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    /// Provider-wide first-byte budget used before the fallback cascade moves
+    /// to the next model. Individual pool-agent overrides still take priority.
+    #[serde(default = "default_opencode_first_token_timeout_ms")]
+    pub first_token_timeout_ms: u64,
+}
+
+fn default_opencode_first_token_timeout_ms() -> u64 {
+    45_000
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]

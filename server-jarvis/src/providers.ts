@@ -16,6 +16,8 @@ export interface ProviderTarget {
   provider: HttpProviderId;
   base_url: string;
   api_key: string;
+  /** First-body-byte watchdog for this provider. */
+  first_token_timeout_ms: number;
   /** Path appended to base_url for chat completions. */
   chat_path: string;
 }
@@ -32,6 +34,7 @@ export function resolveProviderTarget(cfg: JarvisConfig, provider: string): Prov
         provider: "opencode_zen",
         base_url: (cfg.opencode_zen?.base_url || "https://opencode.ai/zen/v1").replace(/\/+$/, ""),
         api_key: cfg.opencode_zen?.api_key || "",
+        first_token_timeout_ms: cfg.opencode_zen?.first_token_timeout_ms || 45_000,
         chat_path: "/chat/completions",
       };
     case "opencode_go":
@@ -39,6 +42,7 @@ export function resolveProviderTarget(cfg: JarvisConfig, provider: string): Prov
         provider: "opencode_go",
         base_url: (cfg.opencode_go?.base_url || "https://opencode.ai/zen/go/v1").replace(/\/+$/, ""),
         api_key: cfg.opencode_go?.api_key || "",
+        first_token_timeout_ms: cfg.opencode_go?.first_token_timeout_ms || 45_000,
         chat_path: "/chat/completions",
       };
     default:
@@ -46,6 +50,7 @@ export function resolveProviderTarget(cfg: JarvisConfig, provider: string): Prov
         provider: "openrouter",
         base_url: (cfg.openrouter.base_url || "https://openrouter.ai/api/v1").replace(/\/+$/, ""),
         api_key: cfg.openrouter.api_key || "",
+        first_token_timeout_ms: Number((cfg.openrouter as any).first_token_timeout_ms ?? 30_000),
         chat_path: "/chat/completions",
       };
   }

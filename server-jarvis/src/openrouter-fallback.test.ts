@@ -344,6 +344,55 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
     expect(result.model_used).toBe("cohere/north-mini-code:free");
   });
 
+  test("uses the configured OpenCode Go first-token budget before falling back", async () => {
+    const cfg = cfgWithPool();
+    cfg.opencode_go.api_key = "go-test-key";
+    cfg.opencode_go.first_token_timeout_ms = 1_000;
+    cfg.orchestrator.agents = [
+      {
+        id: "hung-go-primary",
+        provider: "opencode_go",
+        model_id: "deepseek-v4-pro",
+        capabilities: { code: 0.95, reasoning: 0.9, speed: 0.7, cost: 0.5, json_reliability: 0.9 },
+        default_for: ["executor"],
+        enabled: true,
+      },
+      {
+        id: "healthy-openrouter-secondary",
+        provider: "openrouter",
+        model_id: "cohere/north-mini-code:free",
+        capabilities: { code: 0.8, reasoning: 0.7, speed: 0.9, cost: 1, json_reliability: 0.8 },
+        default_for: ["executor"],
+        enabled: true,
+      },
+    ];
+
+    const seenChatModels: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) {
+        return new Response(JSON.stringify({ data: [{ id: "cohere/north-mini-code:free", name: "North", context_length: 256000, pricing: { prompt: "0", completion: "0" }, architecture: {}, supported_parameters: [], description: "" }] }), { status: 200 });
+      }
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      seenChatModels.push(body.model);
+      if (body.model === "deepseek-v4-pro") {
+        const { readable } = new TransformStream();
+        return new Response(readable, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+      }
+      return new Response("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n", { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    }) as typeof fetch;
+
+    const result = await chatCompletionWithFallback(
+      cfg,
+      { model: "deepseek-v4-pro", messages: [{ role: "user", content: "continue" }], stream: true },
+      undefined,
+      { stage: "executor", taskType: "general" },
+    );
+
+    expect(seenChatModels.slice(0, 2)).toEqual(["deepseek-v4-pro", "cohere/north-mini-code:free"]);
+    expect(result.model_used).toBe("cohere/north-mini-code:free");
+  });
+
   test("honors excludeModels when resolving its own internal cascade, preferring the stage-aware next-best over a generically-higher-scored model", async () => {
     // Regression for the 2026-07-01 live incident: the orchestrator's
     // empty-completion cascade-advance (index.ts) excludes a model that just

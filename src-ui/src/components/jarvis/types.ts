@@ -37,6 +37,16 @@ export interface JarvisConfig {
     max_retries: number;
     timeout_ms: number;
   };
+  opencode_zen: {
+    base_url: string;
+    api_key: string;
+    first_token_timeout_ms: number;
+  };
+  opencode_go: {
+    base_url: string;
+    api_key: string;
+    first_token_timeout_ms: number;
+  };
   claude_cli: {
     enabled: boolean;
     path: string;
