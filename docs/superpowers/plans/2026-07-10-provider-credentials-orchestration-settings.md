@@ -879,7 +879,7 @@ type OrchestratorConfig = { enabled: boolean; [key: string]: unknown };
 
   ```powershell
   Set-Location server-jarvis; bun test; bun run typecheck
-  Set-Location ..\src-ui; bun test; bun run build
+  Set-Location ..\src-ui; bun run test; bun run build
   Set-Location ..\src-tauri; CARGO_INCREMENTAL=0 cargo test --workspace
   ```
 
