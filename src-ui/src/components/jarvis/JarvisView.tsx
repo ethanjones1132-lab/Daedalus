@@ -35,6 +35,12 @@ import {
   Send, Square, Bot, User, Wrench, Check, Copy, ChevronDown,
   ChevronRight, Sparkles, LoaderCircle, Plus, ArrowDown,
 } from 'lucide-react';
+import {
+  providerLabel,
+  providerTestState,
+  type CredentialProvider,
+  type ProviderTestResult,
+} from './provider-settings';
 
 // ═══════════════════════════════════════════════════════════════
 // ── Main Jarvis View ──
@@ -2170,7 +2176,13 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
   const [runtimeConfirmed, setRuntimeConfirmed] = useState(false);
   const [saveWarning, setSaveWarning] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const [showApiKey, setShowApiKey] = useState(false);
+  const [visibleKeys, setVisibleKeys] = useState<Record<CredentialProvider, boolean>>({
+    openrouter: false,
+    opencode_zen: false,
+    opencode_go: false,
+  });
+  const [providerTests, setProviderTests] = useState<Partial<Record<CredentialProvider, ProviderTestResult>>>({});
+  const [testingProvider, setTestingProvider] = useState<CredentialProvider | null>(null);
 
   useEffect(() => {
     setLocalConfig(config);
@@ -2187,7 +2199,6 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
         setSaved(true);
         setRuntimeConfirmed(result.runtime_synced);
         setSaveWarning(result.warning);
-        setTimeout(() => setSaved(false), 3000);
       }
     } catch (e) {
       console.error('Failed to save config:', e);
@@ -2199,7 +2210,35 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
 
   const updateField = <K extends keyof JarvisConfig>(key: K, value: JarvisConfig[K]) => {
     if (!localConfig) return;
+    setSaved(false);
+    setRuntimeConfirmed(false);
+    setSaveWarning(null);
     setLocalConfig({ ...localConfig, [key]: value });
+  };
+
+  const updateProviderKey = (provider: CredentialProvider, value: string) => {
+    if (!localConfig) return;
+    updateField(provider, { ...localConfig[provider], api_key: value } as JarvisConfig[typeof provider]);
+    setProviderTests((previous) => ({ ...previous, [provider]: undefined }));
+  };
+
+  const testProvider = async (provider: CredentialProvider) => {
+    if (!localConfig) return;
+    setTestingProvider(provider);
+    try {
+      const result = await invoke<ProviderTestResult>('jarvis_test_provider', {
+        provider,
+        config: localConfig,
+      });
+      setProviderTests((previous) => ({ ...previous, [provider]: result }));
+    } catch {
+      setProviderTests((previous) => ({
+        ...previous,
+        [provider]: { ok: false, latency_ms: 0, error: 'Connection test failed.' },
+      }));
+    } finally {
+      setTestingProvider(null);
+    }
   };
 
   if (!localConfig) {
@@ -2280,34 +2319,80 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
           </div>
         </GlassCard>
 
-        {/* OpenRouter API Key */}
-        {localConfig.active_backend === 'openrouter' && (
-          <GlassCard hoverable={false}>
-            <h3 className="text-sm font-semibold text-bone mb-3">OpenRouter API Key</h3>
-            <div className="relative">
-              <input
-                type={showApiKey ? 'text' : 'password'}
-                value={(localConfig.openrouter?.api_key ?? '')}
-                onChange={(e) => setLocalConfig(prev => prev ? {
-                  ...prev,
-                  openrouter: { ...prev.openrouter, api_key: e.target.value }
-                } : prev)}
-                placeholder="sk-or-v1-..."
-                className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors pr-16"
-              />
-              <button
-                onClick={() => setShowApiKey(!showApiKey)}
-                aria-label={showApiKey ? 'Hide API key' : 'Show API key'}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-mono text-bone-dim hover:text-bone-muted transition-colors px-1.5 py-0.5 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
-              >
-                {showApiKey ? 'Hide' : 'Show'}
-              </button>
+        {/* Provider credentials remain independently configurable. The API
+            key itself is write-only after load; only safe metadata is shown. */}
+        {(['openrouter', 'opencode_zen', 'opencode_go'] as CredentialProvider[]).map((provider) => {
+          const providerConfig = localConfig[provider];
+          const configured = providerConfig.api_key_configured === true || Boolean(providerConfig.api_key_fingerprint);
+          const testState = providerTestState(providerTests[provider]);
+          const isTesting = testingProvider === provider;
+          return (
+            <GlassCard key={provider} hoverable={false}>
+              <div className="flex items-center justify-between gap-3 mb-3">
+                <h3 className="text-sm font-semibold text-bone">{providerLabel(provider)}</h3>
+                <Pill variant={configured ? 'success' : 'default'}>{configured ? 'Configured' : 'Not configured'}</Pill>
+              </div>
+              <div className="relative">
+                <input
+                  type={visibleKeys[provider] ? 'text' : 'password'}
+                  value={providerConfig.api_key ?? ''}
+                  onChange={(event) => updateProviderKey(provider, event.target.value)}
+                  placeholder={configured ? 'Enter a new key to replace the stored key' : 'Paste API key'}
+                  aria-label={providerLabel(provider)}
+                  className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors pr-16"
+                />
+                <button
+                  type="button"
+                  onClick={() => setVisibleKeys((previous) => ({ ...previous, [provider]: !previous[provider] }))}
+                  aria-label={`${visibleKeys[provider] ? 'Hide' : 'Show'} ${providerLabel(provider)}`}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-mono text-bone-dim hover:text-bone-muted transition-colors px-1.5 py-0.5 rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
+                >
+                  {visibleKeys[provider] ? 'Hide' : 'Show'}
+                </button>
+              </div>
+              <div className="flex items-center justify-between gap-3 mt-2">
+                <span className={cn(
+                  'text-[10px] font-mono',
+                  testState.variant === 'success' ? 'text-emerald-400' : testState.variant === 'error' ? 'text-red-400' : 'text-bone-faint'
+                )}>
+                  {testState.label}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => testProvider(provider)}
+                  disabled={isTesting}
+                  className="shrink-0 px-2 py-1 text-[10px] font-mono rounded border border-royal/40 text-royal-light hover:bg-royal/10 disabled:opacity-50"
+                >
+                  {isTesting ? 'Testing…' : 'Test connection'}
+                </button>
+              </div>
+            </GlassCard>
+          );
+        })}
+
+        {/* Orchestration runtime control */}
+        <GlassCard hoverable={false}>
+          <div className="flex items-start gap-3">
+            <input
+              id="orchestration-enabled"
+              type="checkbox"
+              checked={localConfig.orchestrator.enabled}
+              onChange={(event) => updateField('orchestrator', {
+                ...localConfig.orchestrator,
+                enabled: event.target.checked,
+              })}
+              className="mt-0.5 accent-cyan-400"
+            />
+            <div>
+              <label htmlFor="orchestration-enabled" className="text-sm font-semibold text-bone">
+                Enable orchestration runtime
+              </label>
+              <p className="text-[10px] font-mono text-bone-faint mt-1">
+                When disabled, new Session turns use the selected inference backend directly. Active turns are unchanged.
+              </p>
             </div>
-            <p className="text-[10px] font-mono text-bone-faint mt-1.5">
-              Get your key at <span className="text-royal-light">openrouter.ai/keys</span>
-            </p>
-          </GlassCard>
-        )}
+          </div>
+        </GlassCard>
 
         {/* Model Selection */}
         <GlassCard hoverable={false}>
