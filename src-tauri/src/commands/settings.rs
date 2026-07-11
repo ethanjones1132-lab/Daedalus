@@ -159,8 +159,9 @@ pub fn set_setting(db: State<AppDb>, key: String, value: String) -> Result<(), S
 /// Each top-level field is stored as a JSON blob under its field name.
 /// Falls back to defaults for any missing field.
 #[tauri::command]
-pub fn get_jarvis_config(db: State<AppDb>) -> Result<JarvisConfig, String> {
-    load_jarvis_config(&db)
+pub fn get_jarvis_config(db: State<AppDb>) -> Result<serde_json::Value, String> {
+    let config = load_jarvis_config(&db)?;
+    redact_jarvis_config(&config)
 }
 
 fn normalize_jarvis_config(config: &mut JarvisConfig) {
@@ -607,6 +608,27 @@ mod tests {
             let provider = redacted.get(*key).expect("provider object");
             assert!(provider.get("api_key").is_none());
             assert_eq!(provider["api_key_configured"], serde_json::json!(true));
+        }
+    }
+
+    #[test]
+    fn config_read_payload_redacts_all_provider_keys_and_keeps_metadata() {
+        let mut cfg = JarvisConfig::default();
+        cfg.openrouter.api_key = "router-secret-read".to_string();
+        cfg.opencode_zen.api_key = "zen-secret-read".to_string();
+        cfg.opencode_go.api_key = "go-secret-read".to_string();
+
+        let payload = redact_jarvis_config(&cfg).expect("redact config read payload");
+        let serialized = serde_json::to_string(&payload).expect("serialize config read payload");
+
+        assert!(!serialized.contains("router-secret-read"));
+        assert!(!serialized.contains("zen-secret-read"));
+        assert!(!serialized.contains("go-secret-read"));
+        for key in SENSITIVE_PROVIDER_SETTING_KEYS {
+            let provider = payload.get(*key).expect("provider payload");
+            assert!(provider.get("api_key").is_none());
+            assert_eq!(provider["api_key_configured"], serde_json::json!(true));
+            assert!(provider["api_key_fingerprint"].as_str().is_some());
         }
     }
 
