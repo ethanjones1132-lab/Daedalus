@@ -83,6 +83,7 @@ import {
 } from "./stream-control";
 import { prepareToolResultForContext } from "./tool-result-truncation";
 import { Coordinator } from "./orchestration/coordinator";
+import { isOrchestrationEnabled } from "./orchestration/runtime-mode";
 import { PersistentConductor } from "./orchestration/persistent-conductor";
 import { SessionMemory, mergeSharedContextHints } from "./orchestration/session-memory";
 import { AgentPool, firstTokenTimeoutFor, formatPoolDiversity } from "./orchestration/agent-pool";
@@ -1433,7 +1434,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       };
 
       // ── Orchestrator path (PAMO-SET Phase 2) ─────────────────────
-      if (cfg.orchestrator?.enabled) {
+      if (isOrchestrationEnabled(cfg)) {
         console.log(`[Jarvis Orchestrator] Starting session=${sessionId}`);
         conductorLearning.setConfig(cfg.orchestrator.conductor_learning);
         const pruned = persistentConductor.pruneExpiredDiskSessions();
@@ -1487,7 +1488,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let poolResolvedAgent: import("./orchestration/agent-pool").OrchestratorAgent | undefined;
           const stageLabel = callOptions?.stageLabel as string | undefined;
           const cascadeTier = callOptions?.cascadeTier as "cheap" | "strong" | undefined;
-          if (stageLabel && cfg.orchestrator?.enabled) {
+          if (stageLabel && isOrchestrationEnabled(cfg)) {
             try {
               const pool = new AgentPool(cfg.orchestrator?.agents ?? []);
               let agent: import("./orchestration/agent-pool").OrchestratorAgent | undefined;
