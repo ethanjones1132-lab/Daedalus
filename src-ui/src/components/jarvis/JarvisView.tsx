@@ -2153,9 +2153,23 @@ function SessionsPanel({
 // ── Config Panel ──
 // ═══════════════════════════════════════════════════════════════
 
+type ConfigSaveResult = {
+  persisted: boolean;
+  runtime_synced: boolean;
+  runtime: {
+    config_path: string;
+    credentials: Record<string, { configured: boolean; fingerprint: string | null }>;
+    orchestration_enabled: boolean;
+  } | null;
+  warning: string | null;
+};
+
 function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setConfig: (c: JarvisConfig | null) => void }) {
   const [localConfig, setLocalConfig] = useState<JarvisConfig | null>(config);
   const [saved, setSaved] = useState(false);
+  const [runtimeConfirmed, setRuntimeConfirmed] = useState(false);
+  const [saveWarning, setSaveWarning] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
   const [showApiKey, setShowApiKey] = useState(false);
 
   useEffect(() => {
@@ -2164,13 +2178,22 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
 
   const handleSave = async () => {
     if (!localConfig) return;
+    setSaving(true);
+    setSaveWarning(null);
     try {
-      await invoke('jarvis_save_config', { config: localConfig });
-      setConfig(localConfig);
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
+      const result = await invoke<ConfigSaveResult>('jarvis_save_config', { config: localConfig });
+      if (result.persisted) {
+        setConfig(localConfig);
+        setSaved(true);
+        setRuntimeConfirmed(result.runtime_synced);
+        setSaveWarning(result.warning);
+        setTimeout(() => setSaved(false), 3000);
+      }
     } catch (e) {
       console.error('Failed to save config:', e);
+      setSaveWarning('Configuration could not be saved.');
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -2193,6 +2216,7 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
         <h2 className="text-lg font-bold text-bone tracking-tight">Configuration</h2>
         <button
           onClick={handleSave}
+          disabled={saving}
           className={cn(
             'px-4 py-1.5 text-xs font-mono rounded-lg border transition-all',
             'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50',
@@ -2204,6 +2228,23 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
           {saved ? '✓ Saved' : 'Save Config'}
         </button>
       </div>
+
+      {saved && runtimeConfirmed && (
+        <p className="text-[10px] font-mono text-emerald-400 mb-3">Runtime confirmed</p>
+      )}
+      {saved && !runtimeConfirmed && saveWarning && (
+        <div className="flex items-center justify-between gap-3 mb-3 rounded-lg border border-amber-400/30 bg-amber-400/5 px-3 py-2">
+          <p className="text-[10px] font-mono text-amber-300">{saveWarning}</p>
+          <button
+            type="button"
+            onClick={handleSave}
+            disabled={saving}
+            className="shrink-0 px-2 py-1 text-[10px] font-mono rounded border border-amber-400/40 text-amber-300 hover:bg-amber-400/10 disabled:opacity-50"
+          >
+            Retry runtime sync
+          </button>
+        </div>
+      )}
 
       <div className="space-y-4">
         {/* Backend Selection */}

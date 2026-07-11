@@ -3,6 +3,7 @@ use crate::jarvis::runner::{check_jarvis_status, run_jarvis_message};
 use crate::jarvis::types::*;
 use crate::jarvis_types::JarvisState;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tauri::{AppHandle, State};
 
@@ -342,17 +343,97 @@ pub async fn jarvis_get_config(state: State<'_, JarvisState>) -> Result<serde_js
     crate::commands::redact_jarvis_config(&config)
 }
 
+fn fingerprint(secret: &str) -> Option<String> {
+    if secret.trim().is_empty() {
+        return None;
+    }
+    let digest = Sha256::digest(secret.as_bytes());
+    Some(format!("{:x}", digest)[..12].to_string())
+}
+
+fn expected_fingerprints(config: &JarvisConfig) -> serde_json::Value {
+    serde_json::json!({
+        "openrouter": fingerprint(&config.openrouter.api_key),
+        "opencode_zen": fingerprint(&config.opencode_zen.api_key),
+        "opencode_go": fingerprint(&config.opencode_go.api_key),
+    })
+}
+
+/// Compare persisted credential fingerprints and orchestration state with the
+/// secret-safe evidence returned by the live Bun runtime.
+///
+/// Every provider is checked, including providers without a configured key.
+/// Missing runtime fields never count as a match; an absent expected key must
+/// be explicitly represented as `configured: false, fingerprint: null`.
+fn runtime_matches_expected(
+    expected: &serde_json::Value,
+    orchestration_enabled: bool,
+    runtime: &serde_json::Value,
+) -> bool {
+    let credentials = match runtime.get("credentials").and_then(|v| v.as_object()) {
+        Some(value) => value,
+        None => return false,
+    };
+
+    for provider in ["openrouter", "opencode_zen", "opencode_go"] {
+        let expected_fingerprint = expected.get(provider).unwrap_or(&serde_json::Value::Null);
+        let runtime_credential = match credentials.get(provider).and_then(|v| v.as_object()) {
+            Some(value) => value,
+            None => return false,
+        };
+        let runtime_configured = match runtime_credential
+            .get("configured")
+            .and_then(|v| v.as_bool())
+        {
+            Some(value) => value,
+            None => return false,
+        };
+        let runtime_fingerprint = match runtime_credential.get("fingerprint") {
+            Some(value) => value,
+            None => return false,
+        };
+        match expected_fingerprint.as_str() {
+            Some(expected_fingerprint) => {
+                if !runtime_configured || runtime_fingerprint.as_str() != Some(expected_fingerprint)
+                {
+                    return false;
+                }
+            }
+            None => {
+                if runtime_configured || !runtime_fingerprint.is_null() {
+                    return false;
+                }
+            }
+        }
+    }
+
+    runtime
+        .get("orchestration_enabled")
+        .and_then(|v| v.as_bool())
+        == Some(orchestration_enabled)
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConfigSaveResult {
+    pub persisted: bool,
+    pub runtime_synced: bool,
+    pub runtime: Option<serde_json::Value>,
+    pub warning: Option<String>,
+}
+
 #[tauri::command]
 pub async fn jarvis_save_config(
     config: JarvisConfig,
     state: State<'_, JarvisState>,
     db: State<'_, crate::db::AppDb>,
-) -> Result<(), String> {
+) -> Result<ConfigSaveResult, String> {
     // SQLite is canonical; this also projects to the Bun-readable file store.
     crate::commands::persist_jarvis_config(&db, &config)?;
     let effective_config = crate::commands::load_jarvis_config(&db)?;
     let backend = effective_config.active_backend.clone();
     let ollama_model = effective_config.ollama.model.clone();
+    let expected = expected_fingerprints(&effective_config);
+    let orchestration_enabled = effective_config.orchestrator.enabled;
     {
         let mut guard = state.config.lock().await;
         *guard = effective_config;
@@ -360,7 +441,57 @@ pub async fn jarvis_save_config(
     // Bring up whatever the (possibly newly selected) backend needs — e.g. start
     // Ollama when the user switches to it in Control. Idempotent + non-blocking.
     crate::reconcile_backend_services(backend, ollama_model);
-    Ok(())
+
+    const RUNTIME_SYNC_WARNING: &str =
+        "Configuration was saved, but the Bun runtime did not confirm the reload.";
+    let runtime_result: Result<serde_json::Value, String> = async {
+        crate::ensure_jarvis_server_started().await?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .map_err(|e| format!("Failed to build config reload client: {e}"))?;
+        let response = client
+            .post("http://127.0.0.1:19877/config/reload")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(|e| format!("Config reload request failed: {e}"))?;
+        if !response.status().is_success() {
+            return Err(format!("Config reload returned {}", response.status()));
+        }
+        let payload: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("Invalid config reload response: {e}"))?;
+        if payload.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            return Err("Config reload response was not acknowledged".to_string());
+        }
+        payload
+            .get("runtime")
+            .cloned()
+            .filter(|runtime| runtime.is_object())
+            .ok_or_else(|| "Config reload response did not include runtime evidence".to_string())
+    }
+    .await;
+
+    match runtime_result {
+        Ok(runtime_payload) => {
+            let runtime_synced =
+                runtime_matches_expected(&expected, orchestration_enabled, &runtime_payload);
+            Ok(ConfigSaveResult {
+                persisted: true,
+                runtime_synced,
+                runtime: Some(runtime_payload),
+                warning: (!runtime_synced).then(|| RUNTIME_SYNC_WARNING.to_string()),
+            })
+        }
+        Err(_) => Ok(ConfigSaveResult {
+            persisted: true,
+            runtime_synced: false,
+            runtime: None,
+            warning: Some(RUNTIME_SYNC_WARNING.to_string()),
+        }),
+    }
 }
 
 #[tauri::command]
@@ -398,6 +529,56 @@ mod status_check_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn runtime_fingerprint_match_requires_each_configured_provider_to_match() {
+        let expected = serde_json::json!({
+            "openrouter": "aaaa11111111",
+            "opencode_zen": "bbbb22222222",
+            "opencode_go": "cccc33333333"
+        });
+        let runtime = serde_json::json!({
+            "credentials": {
+                "openrouter": { "configured": true, "fingerprint": "aaaa11111111" },
+                "opencode_zen": { "configured": true, "fingerprint": "bbbb22222222" },
+                "opencode_go": { "configured": true, "fingerprint": "cccc33333333" }
+            },
+            "orchestration_enabled": false
+        });
+        assert!(runtime_matches_expected(&expected, false, &runtime));
+        assert!(!runtime_matches_expected(&expected, true, &runtime));
+    }
+
+    #[test]
+    fn runtime_fingerprint_mismatch_and_missing_fields_never_match() {
+        let expected = serde_json::json!({
+            "openrouter": "aaaa11111111",
+            "opencode_zen": serde_json::Value::Null,
+            "opencode_go": "cccc33333333"
+        });
+        let mismatched = serde_json::json!({
+            "credentials": {
+                "openrouter": { "configured": true, "fingerprint": "stale00000000" },
+                "opencode_zen": { "configured": false, "fingerprint": null },
+                "opencode_go": { "configured": true, "fingerprint": "cccc33333333" }
+            },
+            "orchestration_enabled": true
+        });
+        assert!(!runtime_matches_expected(&expected, true, &mismatched));
+
+        let missing_provider = serde_json::json!({
+            "credentials": {
+                "openrouter": { "configured": true, "fingerprint": "aaaa11111111" },
+                "opencode_zen": { "configured": false, "fingerprint": null }
+            },
+            "orchestration_enabled": true
+        });
+        assert!(!runtime_matches_expected(
+            &expected,
+            true,
+            &missing_provider
+        ));
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn blocking_status_work_does_not_starve_the_async_runtime() {

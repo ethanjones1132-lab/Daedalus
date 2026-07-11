@@ -43,6 +43,8 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 # adapters.yaml / config parsing
 serde_yaml = "0.9"
+# Short, non-secret fingerprints used to confirm the live Bun config.
+sha2 = "0.10"
 # typed error enums
 thiserror = "1"
 # cron expression parsing for the cron scheduler (src/cron_scheduler.rs: `use cron::Schedule;`)
