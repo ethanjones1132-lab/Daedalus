@@ -2182,7 +2182,8 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
     opencode_go: false,
   });
   const [providerTests, setProviderTests] = useState<Partial<Record<CredentialProvider, ProviderTestResult>>>({});
-  const [testingProvider, setTestingProvider] = useState<CredentialProvider | null>(null);
+  const [testingProviders, setTestingProviders] = useState<Partial<Record<CredentialProvider, boolean>>>({});
+  const configRevision = useRef(0);
 
   useEffect(() => {
     setLocalConfig(config);
@@ -2210,6 +2211,8 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
 
   const updateField = <K extends keyof JarvisConfig>(key: K, value: JarvisConfig[K]) => {
     if (!localConfig) return;
+    configRevision.current += 1;
+    setProviderTests({});
     setSaved(false);
     setRuntimeConfirmed(false);
     setSaveWarning(null);
@@ -2219,25 +2222,29 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
   const updateProviderKey = (provider: CredentialProvider, value: string) => {
     if (!localConfig) return;
     updateField(provider, { ...localConfig[provider], api_key: value } as JarvisConfig[typeof provider]);
-    setProviderTests((previous) => ({ ...previous, [provider]: undefined }));
   };
 
   const testProvider = async (provider: CredentialProvider) => {
     if (!localConfig) return;
-    setTestingProvider(provider);
+    const revision = configRevision.current;
+    setTestingProviders((previous) => ({ ...previous, [provider]: true }));
     try {
       const result = await invoke<ProviderTestResult>('jarvis_test_provider', {
         provider,
         config: localConfig,
       });
-      setProviderTests((previous) => ({ ...previous, [provider]: result }));
+      if (revision === configRevision.current) {
+        setProviderTests((previous) => ({ ...previous, [provider]: result }));
+      }
     } catch {
-      setProviderTests((previous) => ({
-        ...previous,
-        [provider]: { ok: false, latency_ms: 0, error: 'Connection test failed.' },
-      }));
+      if (revision === configRevision.current) {
+        setProviderTests((previous) => ({
+          ...previous,
+          [provider]: { ok: false, latency_ms: 0, error: 'Connection test failed.' },
+        }));
+      }
     } finally {
-      setTestingProvider(null);
+      setTestingProviders((previous) => ({ ...previous, [provider]: false }));
     }
   };
 
@@ -2325,7 +2332,7 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
           const providerConfig = localConfig[provider];
           const configured = providerConfig.api_key_configured === true || Boolean(providerConfig.api_key_fingerprint);
           const testState = providerTestState(providerTests[provider]);
-          const isTesting = testingProvider === provider;
+          const isTesting = testingProviders[provider] === true;
           return (
             <GlassCard key={provider} hoverable={false}>
               <div className="flex items-center justify-between gap-3 mb-3">
