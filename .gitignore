@@ -44,6 +44,9 @@ DumpStack.log
 # --- Codex worktrees (never commit) ---
 .worktrees/
 
+# --- Subagent-driven development scratch ledger ---
+.superpowers/
+
 # --- Local UI-automation diagnostic scratch (SkyLocal / ad-hoc screenshot helpers) ---
 sky-*.jpg
 sky-interact.mjs
