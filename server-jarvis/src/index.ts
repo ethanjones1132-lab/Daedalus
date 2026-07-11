@@ -12,7 +12,7 @@ import { readdirSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 
 import { join } from "path";
 import { homedir } from "os";
 import { spawn, execSync } from "child_process";
-import { loadConfig, saveConfig, saveConfigWithValidation, normalizeConfig, InvalidConfigError, CONFIG_DIR, COMPANION_FILE, surfaceTemperature, reloadConfigFromDisk, runtimeConfigEvidence } from "./config";
+import { loadConfig, saveConfig, saveConfigWithValidation, normalizeConfig, InvalidConfigError, CONFIG_DIR, COMPANION_FILE, surfaceTemperature, reloadConfigFromDisk, runtimeConfigReloadResponse } from "./config";
 import type { JarvisConfig, OllamaConfig, SurfaceType } from "./config";
 import { Database } from "bun:sqlite";
 import { buildLearningPrompt, buildReviewPrompt, buildCodebaseAuditPrompt, buildFootballAuditPrompt } from "./cron-prompts";
@@ -3807,7 +3807,7 @@ export async function baseFetch(req: Request): Promise<Response> {
     }
     if (path === "/config/reload" && req.method === "POST") {
       const cfg = reloadConfigFromDisk();
-      return Response.json({ ok: true, runtime: runtimeConfigEvidence(cfg) });
+      return Response.json(runtimeConfigReloadResponse(cfg));
     }
     if (path === "/config" && req.method === "GET") return Response.json(loadConfig());
     if (path === "/config" && req.method === "POST") {

@@ -1,13 +1,19 @@
 import { describe, expect, test } from "bun:test";
-import { homedir } from "os";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { homedir, tmpdir } from "os";
+import { join } from "path";
 import {
   defaultConfig,
   credentialFingerprint,
   isInvalidWorkspacePath,
+  loadConfig,
   normalizeConfig,
+  reloadConfigFromDisk,
   resolveAgentsRoot,
   runtimeConfigEvidence,
+  runtimeConfigReloadResponse,
   validateAgentsRootPath,
+  invalidateConfigCache,
 } from "./config";
 
 describe("configuration regression coverage retained during Task 6", () => {
@@ -83,11 +89,42 @@ describe("configuration regression coverage retained during Task 6", () => {
     expect(evidence.orchestration_enabled).toBe(false);
   });
 
+  test("reload response contract is metadata-only", () => {
+    const cfg = defaultConfig();
+    cfg.openrouter.api_key = "sk-or-v1-route-secret";
+    const response = runtimeConfigReloadResponse(cfg);
+    expect(Object.keys(response).sort()).toEqual(["ok", "runtime"]);
+    expect(response.ok).toBe(true);
+    expect(JSON.stringify(response)).not.toContain("route-secret");
+  });
+
   test("credentialFingerprint is stable, truncated, and blank-safe", () => {
     expect(credentialFingerprint("")).toBeNull();
     expect(credentialFingerprint("same-key")).toBe(credentialFingerprint("same-key"));
     expect(credentialFingerprint("same-key")).toHaveLength(12);
     expect(credentialFingerprint("same-key")).not.toBe(credentialFingerprint("other-key"));
+  });
+
+  test("reloadConfigFromDisk bypasses the five-second cache", () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), "jarvis-config-reload-"));
+    const configPath = join(tempRoot, "config.json");
+    try {
+      const initial = defaultConfig();
+      initial.system_prompt = "initial-runtime-prompt";
+      writeFileSync(configPath, JSON.stringify(initial), "utf-8");
+
+      invalidateConfigCache();
+      expect(loadConfig(configPath).system_prompt).toBe("initial-runtime-prompt");
+
+      const changed = { ...initial, system_prompt: "changed-on-disk-prompt" };
+      writeFileSync(configPath, JSON.stringify(changed), "utf-8");
+      expect(loadConfig(configPath).system_prompt).toBe("initial-runtime-prompt");
+
+      expect(reloadConfigFromDisk(configPath).system_prompt).toBe("changed-on-disk-prompt");
+    } finally {
+      invalidateConfigCache();
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 });
 

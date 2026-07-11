@@ -650,18 +650,25 @@ export function normalizeConfig(raw: any, options: NormalizeConfigOptions = {}):
 
 let configCache: JarvisConfig | null = null;
 let configCacheTime = 0;
+let configCachePath = CONFIG_FILE;
 const CONFIG_CACHE_TTL = 5000; // 5 seconds
 
-export function loadConfig(): JarvisConfig {
+/**
+ * Load the canonical config, optionally from an explicit path for isolated
+ * callers/tests. The path participates in cache identity so a test fixture
+ * cannot accidentally observe another config's cached object.
+ */
+export function loadConfig(configPath: string = CONFIG_FILE): JarvisConfig {
   const now = Date.now();
-  if (configCache && (now - configCacheTime) < CONFIG_CACHE_TTL) {
+  if (configCache && configCachePath === configPath && (now - configCacheTime) < CONFIG_CACHE_TTL) {
     return configCache;
   }
 
   try {
-    if (existsSync(CONFIG_FILE)) {
-      const raw = JSON.parse(readFileSync(CONFIG_FILE, "utf-8").replace(/^\uFEFF/, ""));
+    if (existsSync(configPath)) {
+      const raw = JSON.parse(readFileSync(configPath, "utf-8").replace(/^\uFEFF/, ""));
       configCache = normalizeConfig(raw);
+      configCachePath = configPath;
       configCacheTime = now;
       return configCache!;
     }
@@ -675,6 +682,7 @@ export function loadConfig(): JarvisConfig {
 export function invalidateConfigCache(): void {
   configCache = null;
   configCacheTime = 0;
+  configCachePath = CONFIG_FILE;
 }
 
 export type CredentialProvider = "openrouter" | "opencode_zen" | "opencode_go";
@@ -688,6 +696,11 @@ export interface RuntimeConfigEvidence {
   config_path: string;
   credentials: Record<CredentialProvider, CredentialEvidence>;
   orchestration_enabled: boolean;
+}
+
+export interface RuntimeConfigReloadResponse {
+  ok: true;
+  runtime: RuntimeConfigEvidence;
 }
 
 /** Return a stable, short identifier for a configured secret without exposing it. */
@@ -716,10 +729,15 @@ export function runtimeConfigEvidence(cfg: JarvisConfig = loadConfig()): Runtime
   };
 }
 
+/** Build the secret-safe payload returned by POST /config/reload. */
+export function runtimeConfigReloadResponse(cfg: JarvisConfig = loadConfig()): RuntimeConfigReloadResponse {
+  return { ok: true, runtime: runtimeConfigEvidence(cfg) };
+}
+
 /** Invalidate the short-lived config cache and load the current disk state. */
-export function reloadConfigFromDisk(): JarvisConfig {
+export function reloadConfigFromDisk(configPath: string = CONFIG_FILE): JarvisConfig {
   invalidateConfigCache();
-  return loadConfig();
+  return loadConfig(configPath);
 }
 
 /**
@@ -776,6 +794,7 @@ export function saveConfig(
   mkdirSync(CONFIG_DIR, { recursive: true });
   writeFileSync(CONFIG_FILE, JSON.stringify(merged, null, 2), "utf-8");
   configCache = merged;
+  configCachePath = CONFIG_FILE;
   configCacheTime = Date.now();
   return merged;
 }
