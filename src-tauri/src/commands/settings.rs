@@ -46,6 +46,8 @@ const KNOWN_SETTING_KEYS: &[&str] = &[
     "active_backend",
     "ollama",
     "openrouter",
+    "opencode_zen",
+    "opencode_go",
     "claude_cli",
     "tools",
     "reasoning",
@@ -156,6 +158,20 @@ pub fn load_jarvis_config_conn(conn: &rusqlite::Connection) -> Result<JarvisConf
             config.openrouter = parsed;
         }
     }
+    if let Some(v) = settings.get("opencode_zen") {
+        if let Ok(parsed) =
+            serde_json::from_str::<crate::jarvis::types::OpenCodeProviderConfig>(v)
+        {
+            config.opencode_zen = parsed;
+        }
+    }
+    if let Some(v) = settings.get("opencode_go") {
+        if let Ok(parsed) =
+            serde_json::from_str::<crate::jarvis::types::OpenCodeProviderConfig>(v)
+        {
+            config.opencode_go = parsed;
+        }
+    }
     if let Some(v) = settings.get("claude_cli") {
         if let Ok(parsed) = serde_json::from_str::<crate::jarvis::types::ClaudeCliConfig>(v) {
             config.claude_cli = parsed;
@@ -174,6 +190,11 @@ pub fn load_jarvis_config_conn(conn: &rusqlite::Connection) -> Result<JarvisConf
     if let Some(v) = settings.get("companion") {
         if let Ok(parsed) = serde_json::from_str::<crate::jarvis::types::CompanionConfig>(v) {
             config.companion = parsed;
+        }
+    }
+    if let Some(v) = settings.get("orchestrator") {
+        if let Ok(parsed) = serde_json::from_str::<crate::jarvis::types::OrchestratorConfig>(v) {
+            config.orchestrator = parsed;
         }
     }
     if let Some(v) = settings.get("system_prompt") {
@@ -285,6 +306,14 @@ pub fn persist_jarvis_config_conn(
             serde_json::to_string(&config.openrouter).map_err(|e| e.to_string())?,
         ),
         (
+            "opencode_zen",
+            serde_json::to_string(&config.opencode_zen).map_err(|e| e.to_string())?,
+        ),
+        (
+            "opencode_go",
+            serde_json::to_string(&config.opencode_go).map_err(|e| e.to_string())?,
+        ),
+        (
             "claude_cli",
             serde_json::to_string(&config.claude_cli).map_err(|e| e.to_string())?,
         ),
@@ -299,6 +328,10 @@ pub fn persist_jarvis_config_conn(
         (
             "companion",
             serde_json::to_string(&config.companion).map_err(|e| e.to_string())?,
+        ),
+        (
+            "orchestrator",
+            serde_json::to_string(&config.orchestrator).map_err(|e| e.to_string())?,
         ),
         ("system_prompt", config.system_prompt.clone()),
         ("mode", config.mode.clone()),
@@ -446,5 +479,29 @@ mod tests {
         let err =
             set_setting_value(&db, "unknown_key", "value").expect_err("unknown key should fail");
         assert!(err.contains("unknown_setting"));
+    }
+
+    #[test]
+    fn persist_round_trips_opencode_credentials_and_orchestrator_payload() {
+        let db = mem_db();
+        let mut cfg = JarvisConfig::default();
+        cfg.opencode_zen.api_key = "zen-secret-123".to_string();
+        cfg.opencode_go.api_key = "go-secret-456".to_string();
+        cfg.orchestrator.enabled = false;
+        cfg.orchestrator.extra.insert(
+            "conductor".to_string(),
+            serde_json::json!({ "enabled": true, "model": "gemma" }),
+        );
+
+        persist_jarvis_config(&db, &cfg).expect("persist config");
+        let loaded = load_jarvis_config(&db).expect("load config");
+
+        assert_eq!(loaded.opencode_zen.api_key, "zen-secret-123");
+        assert_eq!(loaded.opencode_go.api_key, "go-secret-456");
+        assert!(!loaded.orchestrator.enabled);
+        assert_eq!(
+            loaded.orchestrator.extra.get("conductor"),
+            Some(&serde_json::json!({ "enabled": true, "model": "gemma" })),
+        );
     }
 }

@@ -35,10 +35,13 @@ pub struct JarvisConfig {
     pub active_backend: JarvisBackend,
     pub ollama: OllamaConfig,
     pub openrouter: OpenRouterConfig,
+    pub opencode_zen: OpenCodeProviderConfig,
+    pub opencode_go: OpenCodeProviderConfig,
     pub claude_cli: ClaudeCliConfig,
     pub tools: ToolConfig,
     pub reasoning: ReasoningConfig,
     pub companion: CompanionConfig,
+    pub orchestrator: OrchestratorConfig,
     pub system_prompt: String,
     pub mode: String,
     pub prizepicks_prompt: String,
@@ -62,10 +65,13 @@ impl Default for JarvisConfig {
             active_backend: JarvisBackend::Ollama,
             ollama: OllamaConfig::default(),
             openrouter: OpenRouterConfig::default(),
+            opencode_zen: OpenCodeProviderConfig::zen_default(),
+            opencode_go: OpenCodeProviderConfig::go_default(),
             claude_cli: ClaudeCliConfig::default(),
             tools: ToolConfig::default(),
             reasoning: ReasoningConfig::default(),
             companion: CompanionConfig::default(),
+            orchestrator: OrchestratorConfig::default(),
             system_prompt: "You are Jarvis, a local AI assistant. Be concise and helpful."
                 .to_string(),
             mode: "general".to_string(),
@@ -81,6 +87,51 @@ impl Default for JarvisConfig {
             active_profile: "default".to_string(),
             api_sports_key: String::new(),
             agents_root: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OpenCodeProviderConfig {
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+}
+
+impl OpenCodeProviderConfig {
+    fn zen_default() -> Self {
+        Self {
+            base_url: "https://opencode.ai/zen/v1".to_string(),
+            api_key: String::new(),
+        }
+    }
+
+    fn go_default() -> Self {
+        Self {
+            base_url: "https://opencode.ai/zen/go/v1".to_string(),
+            api_key: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OrchestratorConfig {
+    #[serde(default = "default_orchestrator_enabled")]
+    pub enabled: bool,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn default_orchestrator_enabled() -> bool {
+    true
+}
+
+impl Default for OrchestratorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            extra: serde_json::Map::new(),
         }
     }
 }

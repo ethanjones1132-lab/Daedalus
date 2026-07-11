@@ -37,6 +37,8 @@ export interface JarvisConfig {
     max_retries: number;
     timeout_ms: number;
   };
+  opencode_zen: { base_url: string; api_key: string };
+  opencode_go: { base_url: string; api_key: string };
   claude_cli: {
     enabled: boolean;
     path: string;
@@ -61,6 +63,7 @@ export interface JarvisConfig {
     species: string;
     rarity: string;
   };
+  orchestrator: { enabled: boolean; [key: string]: unknown };
   system_prompt: string;
   temperature: number;
   max_tokens: number;

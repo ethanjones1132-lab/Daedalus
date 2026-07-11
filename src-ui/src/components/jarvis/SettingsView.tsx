@@ -11,7 +11,7 @@ import {
 } from '../ui';
 
 const KNOWN_SETTING_KEYS = new Set([
-  'version', 'active_backend', 'ollama', 'openrouter', 'claude_cli', 'tools',
+  'version', 'active_backend', 'ollama', 'openrouter', 'opencode_zen', 'opencode_go', 'claude_cli', 'tools',
   'reasoning', 'companion', 'orchestrator', 'system_prompt', 'mode',
   'prizepicks_prompt', 'temperature', 'surface_temperatures', 'max_tokens',
   'top_p', 'top_k', 'bridge_port', 'bridge_enabled', 'jarvis_path', 'compaction',
