@@ -24,8 +24,11 @@ function safeConnectionMessage(name: string, error: unknown, secret: string): st
 /** Probe one OpenAI-compatible provider without exposing its credential. */
 export async function checkHttpProviderHealth(
   cfg: JarvisConfig,
-  provider: HttpProviderId,
+  provider: HttpProviderId | string,
 ): Promise<ProviderHealth> {
+  if (provider !== "openrouter" && provider !== "opencode_zen" && provider !== "opencode_go") {
+    return { ok: false, latency_ms: 0, error: "Unknown HTTP provider." };
+  }
   const target = resolveProviderTarget(cfg, provider);
   const name = providerName[target.provider];
   if (!target.api_key.trim()) {

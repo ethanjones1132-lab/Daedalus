@@ -34,4 +34,17 @@ describe("checkHttpProviderHealth", () => {
     expect(result).toMatchObject({ ok: false, error: "OpenCode Zen rejected this API key (401)." });
     expect(JSON.stringify(result)).not.toContain("zen-key-never-display");
   });
+
+  test("rejects an unknown provider before attempting an OpenRouter fetch", async () => {
+    const cfg = defaultConfig();
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      return new Response(JSON.stringify({ data: [] }), { status: 200 });
+    }) as typeof fetch;
+
+    const result = await checkHttpProviderHealth(cfg, "bogus" as "openrouter");
+    expect(result).toEqual({ ok: false, latency_ms: 0, error: "Unknown HTTP provider." });
+    expect(fetchCalls).toBe(0);
+  });
 });
