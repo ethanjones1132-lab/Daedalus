@@ -56,6 +56,8 @@ export interface RewriterStageOutput {
   ok: boolean;
   narrative: string;
   toolCalls: ToolCallRecord[];
+  terminalStatus?: "completed" | "failed" | "timed_out" | "cancelled" | "partial";
+  errorCode?: string;
 }
 
 /** Accumulated state across a pipeline (or pipeline segment). */

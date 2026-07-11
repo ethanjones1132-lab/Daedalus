@@ -119,7 +119,7 @@ interface CompanionCronJob {
 }
 
 /** Phase 2.5 — explicit placeholder for ViewId members not yet in the nav. */
-function UnwiredView({ viewId }: { viewId: ViewId }) {
+export function UnwiredView({ viewId }: { viewId: ViewId }) {
   return (
     <EmptyState
       message={`${viewId} is not wired yet — use the sidebar for active surfaces, or see PRIORITIES.md for the rollout plan.`}
@@ -731,7 +731,11 @@ function AppInner() {
       case 'usage':
       case 'logs':
       case 'doctor':
-        return <UnwiredView viewId={currentView} />;
+        // These legacy IDs can still be present in a restored local-storage
+        // navigation state, but they are not shipped surfaces. Never expose a
+        // selectable "not wired" placeholder; fall back to the real overview
+        // contract until a dedicated view is implemented.
+        return <OverviewView />;
       default: return <OverviewView />;
     }
   };

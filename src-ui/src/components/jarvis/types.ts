@@ -83,6 +83,17 @@ export interface JarvisSession {
   total_tokens?: number;
   backend: string;
 }
+export interface SessionRunRecord {
+  session_id: string;
+  run_id: string;
+  outcome: 'success' | 'partial' | 'failed' | 'timed_out' | 'cancelled';
+  selected_model?: string;
+  token_count: number;
+  tool_count: number;
+  cancelled_reason?: string;
+  partial_output?: string;
+}
+
 
 export interface JarvisMessage {
   // Message identity (Task 7 / 2026-07-03 incident 1d4727cf): optimistic sends

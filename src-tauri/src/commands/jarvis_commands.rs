@@ -186,7 +186,8 @@ pub async fn jarvis_send_message(
     }
 
     eprintln!("[jarvis-chat] spawning stream relay session={}", session_id);
-    run_jarvis_message(app, base_url, session_id, message, history)
+    let db_path = db.db_path.clone();
+    run_jarvis_message(app, base_url, session_id, message, history, db_path)
 }
 
 #[tauri::command]
@@ -382,7 +383,7 @@ where
 #[tauri::command]
 pub async fn jarvis_start_bridge(state: State<'_, JarvisState>) -> Result<(), String> {
     let queue = state.queue.clone();
-    start_bridge(19876, queue)
+    start_bridge(19876, queue).map(|_| ())
 }
 
 #[tauri::command]

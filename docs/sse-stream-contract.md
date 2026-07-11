@@ -12,6 +12,13 @@ For every connected Session turn, the server emits exactly one user-visible outc
 
 `message_stop` is a transport terminator, not a user-visible outcome. It is emitted at most once and may arrive before `result` on compatibility paths such as Claude CLI. A `cancelled` outcome replaces a trailing `message_stop` because the client has already aborted the stream.
 
+The packaged-runtime smoke (`scripts/smoke-jarvis-runtime.ps1`) parses the
+stream and requires exactly one outcome frame. It records `manifest_sha`,
+`health_sha`, the serving listener command line, `session_id`, elapsed time,
+the terminal type, and the terminal result/error text as one compact JSON
+record. A mismatch between the Desktop manifest, `/health`, or the process
+serving port 19877 fails the smoke before a prompt is sent.
+
 If a connected server path exits without an outcome, `StreamSession.ensureTerminal()` emits `error` with code `stream_ended_without_outcome`, followed by `message_stop` if one has not already been sent. Client disconnects are exempt because the stream can no longer be written.
 
 ## Progress frames

@@ -15,10 +15,12 @@
 // ═══════════════════════════════════════════════════════════════
 
 use crate::db::AppDb;
+use crate::jarvis::bridge::restart_bridge as restart_bridge_service;
 use crate::wsl::wsl_home;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use tauri::State;
 use tokio::sync::Mutex;
@@ -903,13 +905,45 @@ pub async fn check_updates() -> Result<UpdateInfo, String> {
 
 #[tauri::command]
 pub fn restart_bridge() -> Result<bool, String> {
-    // The TCP listener in `jarvis::bridge` is a thread that's tied to the
-    // bridge OnceLock. Re-spawning cleanly here would require the bridge
-    // module to expose a stop primitive, which it does not in the
-    // recovered tree. Until that lands, return a clear error so the UI
-    // shows the limitation rather than pretending success.
-    Err(
-        "restart_bridge is not implemented in the recovered tree; stop and relaunch the app to restart the bridge"
-            .to_string(),
-    )
+    // Restart the bridge listener using a default queue. The bridge is a
+    // local-only service; the queue consumer task is spawned from the
+    // synchronous command path, so we use the same construction pattern as
+    // `jarvis_start_bridge` but without requiring Tauri state.
+    let config = Arc::new(Mutex::new(crate::jarvis::types::JarvisConfig::default()));
+    let queue = Arc::new(crate::jarvis::queue::MessageQueue::new(config));
+    let status = restart_bridge_service(19876, queue)?;
+    Ok(status.running)
+}
+
+#[cfg(test)]
+mod bridge_restart_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn test_queue() -> Arc<crate::jarvis::queue::MessageQueue> {
+        let config = Arc::new(Mutex::new(crate::jarvis::types::JarvisConfig::default()));
+        Arc::new(crate::jarvis::queue::MessageQueue::new(config))
+    }
+
+    #[test]
+    fn restart_bridge_stops_then_rebinds_the_listener() {
+        // Use port 0 so the OS assigns a free port and parallel tests don't collide.
+        let status = restart_bridge_service(0, test_queue()).unwrap();
+        assert!(status.running);
+        assert!(status.port > 0);
+        // Clean stop so subsequent tests are not pinned to the dynamic port.
+        crate::jarvis::bridge::stop_bridge().unwrap();
+    }
+
+    #[test]
+    fn bridge_health_reflects_running_state() {
+        let queue = test_queue();
+        let _before = crate::jarvis::bridge::bridge_health();
+        let started = crate::jarvis::bridge::start_bridge(0, queue).unwrap();
+        assert!(started.running);
+        let health = crate::jarvis::bridge::bridge_health();
+        assert!(health.running);
+        assert_eq!(health.port, started.port);
+        crate::jarvis::bridge::stop_bridge().unwrap();
+    }
 }

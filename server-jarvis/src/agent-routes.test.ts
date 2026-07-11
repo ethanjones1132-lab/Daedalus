@@ -4,6 +4,7 @@ import { join } from "path";
 import { createLifecycleService } from "./agent-lifecycle";
 import {
   handleActivateAgent,
+  handleAgentRequest,
   handleDeactivateAgent,
   handleGetAgent,
   handleListAgents,
@@ -65,5 +66,31 @@ describe("agent routes", () => {
       success: true,
       message: "Agent coder deactivated",
     });
+  });
+
+  test("handleAgentRequest routes GET /agents through the mounted handler", () => {
+    fixture = makeAgentRoot("http");
+    writeSoul(fixture.root, "coder", `slug: coder\nname: Coder\n`);
+    const lifecycle = createLifecycleService(fixture.root);
+
+    const response = handleAgentRequest(
+      new Request("http://local/agents", { method: "GET" }),
+      lifecycle
+    );
+    expect(response).not.toBeNull();
+    expect(response!.status).toBe(200);
+    expect(response!.json()).resolves.toEqual([
+      { id: "coder", slug: "coder", status: "valid" },
+    ]);
+  });
+
+  test("handleAgentRequest returns null for non-agent paths", () => {
+    fixture = makeAgentRoot("fallback");
+    const lifecycle = createLifecycleService(fixture.root);
+    const response = handleAgentRequest(
+      new Request("http://local/skills", { method: "GET" }),
+      lifecycle
+    );
+    expect(response).toBeNull();
   });
 });

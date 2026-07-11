@@ -48,6 +48,12 @@ interface Channel {
   enabled: boolean;
 }
 
+interface LifecycleAgent {
+  id: string;
+  slug: string;
+  status: string;
+}
+
 interface AgentDraft {
   name: string;
   model: string;
@@ -214,12 +220,27 @@ function ChannelBindings({
 export function AgentsView() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [channels, setChannels] = useState<Channel[]>([]);
+  const [lifecycleAgents, setLifecycleAgents] = useState<LifecycleAgent[]>([]);
+  const [lifecycleError, setLifecycleError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<Agent | null>(null);
   const { success, error: toastError } = useToast();
+
+  const fetchLifecycle = useCallback(async () => {
+    setLifecycleError(null);
+    try {
+      const res = await fetch('http://127.0.0.1:19877/agents');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = (await res.json()) as LifecycleAgent[];
+      setLifecycleAgents(data);
+    } catch (e) {
+      setLifecycleError(String(e));
+      setLifecycleAgents([]);
+    }
+  }, []);
 
   const fetchAll = useCallback(async () => {
     setLoading(true);
@@ -236,7 +257,8 @@ export function AgentsView() {
     } finally {
       setLoading(false);
     }
-  }, []);
+    await fetchLifecycle();
+  }, [fetchLifecycle]);
 
   useEffect(() => {
     fetchAll();
@@ -345,6 +367,35 @@ export function AgentsView() {
       {creating && (
         <AgentEditor initial={EMPTY_DRAFT} onSave={create} onCancel={() => setCreating(false)} />
       )}
+
+      <GlassCard className="p-3">
+        <div className="flex items-center justify-between mb-2">
+          <h3 className="text-xs font-medium text-bone/80">Lifecycle agents (disk scan)</h3>
+          <button
+            type="button"
+            onClick={() => void fetchLifecycle()}
+            className="text-[11px] px-2 py-0.5 rounded-md border border-white/10 text-bone/60 hover:text-bone transition-colors"
+          >
+            Refresh
+          </button>
+        </div>
+        {lifecycleError ? (
+          <p className="text-xs text-red-300">{lifecycleError}</p>
+        ) : lifecycleAgents.length === 0 ? (
+          <p className="text-xs text-bone/40">No agents discovered in agents root.</p>
+        ) : (
+          <ul className="space-y-1">
+            {lifecycleAgents.map((a) => (
+              <li key={a.id} className="flex items-center justify-between text-xs">
+                <span className="text-bone truncate">{a.slug}</span>
+                <Pill variant={a.status === 'valid' ? 'success' : a.status === 'invalid' ? 'error' : 'default'}>
+                  {a.status}
+                </Pill>
+              </li>
+            ))}
+          </ul>
+        )}
+      </GlassCard>
 
       <div className="flex-1 overflow-y-auto min-h-0">
         {loading ? (

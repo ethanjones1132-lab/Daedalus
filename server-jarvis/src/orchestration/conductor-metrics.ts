@@ -14,13 +14,31 @@ export interface ConductorCacheRecord {
   kv_generation: number;
 }
 
+export interface ConductorDirectiveRecord {
+  ts: number;
+  session_id: string;
+  stage: string;
+  directive_type: string;
+  reason?: string;
+  new_remaining?: string[];
+  inject_for_stage?: string;
+}
+
 const RING_SIZE = 100;
 const ring: ConductorCacheRecord[] = [];
 let ringHead = 0;
 
+const directiveRing: ConductorDirectiveRecord[] = [];
+let directiveRingHead = 0;
+
 export function recordConductorCache(rec: ConductorCacheRecord): void {
   ring[ringHead % RING_SIZE] = rec;
   ringHead += 1;
+}
+
+export function recordConductorDirective(rec: ConductorDirectiveRecord): void {
+  directiveRing[directiveRingHead % RING_SIZE] = rec;
+  directiveRingHead += 1;
 }
 
 export function conductorCacheSnapshot(): {
@@ -45,9 +63,38 @@ export function conductorCacheSnapshot(): {
   };
 }
 
+export function conductorDirectiveSnapshot(): {
+  window_size: number;
+  by_type: Record<string, number>;
+  records: ConductorDirectiveRecord[];
+  generated_at: number;
+} {
+  const records = directiveRingHead < RING_SIZE
+    ? directiveRing.slice(0, directiveRingHead)
+    : [
+        ...directiveRing.slice(directiveRingHead % RING_SIZE),
+        ...directiveRing.slice(0, directiveRingHead % RING_SIZE),
+      ];
+  const byType: Record<string, number> = {};
+  for (const rec of records) {
+    byType[rec.directive_type] = (byType[rec.directive_type] ?? 0) + 1;
+  }
+  return {
+    window_size: records.length,
+    by_type: byType,
+    records: records.slice(-20),
+    generated_at: Date.now(),
+  };
+}
+
 export function __resetConductorCacheMetricsForTests(): void {
   ring.length = 0;
   ringHead = 0;
+}
+
+export function __resetConductorDirectiveMetricsForTests(): void {
+  directiveRing.length = 0;
+  directiveRingHead = 0;
 }
 
 /** Rough token estimate (matches pipeline stage accounting). */

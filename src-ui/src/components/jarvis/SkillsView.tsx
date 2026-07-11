@@ -294,8 +294,17 @@ function SkillDetail({
               <>
                 <button
                   type="button"
-                  disabled={actionBusy}
+                  disabled={
+                    actionBusy ||
+                    candidateDetail.eval_score === undefined ||
+                    candidateDetail.eval_score < 0.75
+                  }
                   onClick={() => runAction('promote')}
+                  title={
+                    candidateDetail.eval_score === undefined || candidateDetail.eval_score < 0.75
+                      ? 'Run eval first — promotion requires a passing judge decision (≥0.75)'
+                      : 'Promote to live skill'
+                  }
                   className="px-3 py-1.5 text-xs rounded-lg border border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10 transition-colors disabled:opacity-50"
                 >
                   Promote
@@ -630,7 +639,10 @@ export function SkillsView() {
                 const category = categoryOf(s);
                 const distilled = isDistilledSkill(s);
                 const candidateId = candidateIdOf(s);
-                const candidateStatus = candidateId ? candidates[candidateId]?.status : undefined;
+                const candidate = candidateId ? candidates[candidateId] : null;
+                const candidateStatus = candidate?.status;
+                const candidateEvalScore = candidate?.eval_score;
+                const canPromote = candidateEvalScore !== undefined && candidateEvalScore >= 0.75;
                 return (
                   <li key={s.id}>
                     <GlassCard
@@ -660,11 +672,17 @@ export function SkillsView() {
                               <>
                                 <button
                                   type="button"
+                                  disabled={!canPromote}
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     runRowAction(s, candidateId, 'promote');
                                   }}
-                                  className="text-[11px] px-2 py-0.5 rounded-md border border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10 transition-colors"
+                                  title={
+                                    canPromote
+                                      ? 'Promote to live skill'
+                                      : 'Run eval first — promotion requires a passing judge decision (≥0.75)'
+                                  }
+                                  className="text-[11px] px-2 py-0.5 rounded-md border border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10 transition-colors disabled:opacity-50"
                                 >
                                   Promote
                                 </button>

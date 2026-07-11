@@ -61,6 +61,19 @@ export interface TuningOutcome {
   measured_at?: string;
 }
 
+/** Auditable directive emitted by the optional live conductor. */
+export interface ConductorDirectiveRow {
+  id: string;
+  agent_run_id: string;
+  stage: string;
+  directive_type: string;
+  reason?: string;
+  new_remaining_json?: string;
+  inject_note?: string;
+  inject_for_stage?: string;
+  created_at?: string;
+}
+
 /** Phase 4: conductor routing decision paired with eventual pipeline outcome. */
 export interface ConductorRun {
   id: string;
@@ -273,6 +286,18 @@ const SELF_TUNING_SCHEMA = `
     measured_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   );
   CREATE INDEX IF NOT EXISTS idx_tuning_outcomes_proposal_id ON tuning_outcomes(proposal_id);
+  CREATE TABLE IF NOT EXISTS conductor_directives (
+    id TEXT PRIMARY KEY,
+    agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+    stage TEXT NOT NULL,
+    directive_type TEXT NOT NULL,
+    reason TEXT,
+    new_remaining_json TEXT,
+    inject_note TEXT,
+    inject_for_stage TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_conductor_directives_agent_run_id ON conductor_directives(agent_run_id);
   CREATE TABLE IF NOT EXISTS conductor_runs (
     id TEXT PRIMARY KEY,
     agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
@@ -654,6 +679,31 @@ export class SelfTuningStore {
     }
   }
 
+  insertConductorDirective(directive: ConductorDirectiveRow): void {
+    const db = this.getDb();
+    if (!db) return;
+    try {
+      db.prepare(
+        `INSERT INTO conductor_directives
+          (id, agent_run_id, stage, directive_type, reason, new_remaining_json, inject_note, inject_for_stage)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        directive.id,
+        directive.agent_run_id,
+        directive.stage,
+        directive.directive_type,
+        directive.reason ?? null,
+        directive.new_remaining_json ?? null,
+        directive.inject_note ?? null,
+        directive.inject_for_stage ?? null,
+      );
+    } catch (e) {
+      console.error("[SelfTuningStore] insertConductorDirective failed:", e);
+    } finally {
+      db.close();
+    }
+  }
+
   updateConductorRun(id: string, updates: Partial<ConductorRun>): void {
     const db = this.getDb();
     if (!db) return;
@@ -857,6 +907,21 @@ export class SelfTuningStore {
       return db.query("SELECT * FROM conductor_runs ORDER BY created_at DESC").all() as ConductorRun[];
     } catch (e) {
       console.error("[SelfTuningStore] getConductorRuns failed:", e);
+      return [];
+    } finally {
+      db.close();
+    }
+  }
+
+  getConductorDirectives(agentRunId: string): ConductorDirectiveRow[] {
+    const db = this.getDb();
+    if (!db) return [];
+    try {
+      return db.query(
+        "SELECT * FROM conductor_directives WHERE agent_run_id = ? ORDER BY created_at ASC",
+      ).all(agentRunId) as ConductorDirectiveRow[];
+    } catch (e) {
+      console.error("[SelfTuningStore] getConductorDirectives failed:", e);
       return [];
     } finally {
       db.close();

@@ -1,4 +1,4 @@
-import { SelfTuningStore, type AgentRun, type StageRun } from "./store";
+import { SelfTuningStore, type AgentRun, type ConductorDirectiveRow, type StageRun } from "./store";
 
 export class SessionOutcomeCollector {
   private store: SelfTuningStore;
@@ -21,6 +21,14 @@ export class SessionOutcomeCollector {
 
   recordStageRun(stage: StageRun): void {
     this.store.insertStageRun(stage);
+  }
+
+  recordDirective(directive: Omit<ConductorDirectiveRow, "created_at">): void {
+    try {
+      this.store.insertConductorDirective(directive);
+    } catch (e) {
+      console.error("[SessionOutcomeCollector] recordDirective failed:", e);
+    }
   }
 
   completeAgentRun(

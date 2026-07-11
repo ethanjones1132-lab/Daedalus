@@ -31,6 +31,7 @@ import { normalizeRoute } from "../orchestration/route-normalization";
 import { judgeAnswer } from "./judge";
 import { makeCallModel } from "./call-model";
 import { SEMANTIC_CASES, type SemanticCase } from "./semantic-cases";
+import type { ReplayResult } from "../training/promotion-gate";
 
 export interface SemanticCaseResult {
   id: string;
@@ -121,6 +122,21 @@ export function toSemanticBaseline(report: SemanticReport): SemanticBaseline {
   const scores: Record<string, number> = {};
   for (const r of report.results) scores[r.id] = r.score;
   return { version: 1, averageScore: report.averageScore, scores };
+}
+
+/** Convert a semantic report into the replay evidence consumed by the offline
+ * training promotion gate. Keeping this adapter here prevents callers from
+ * inferring pass/fail from raw scores differently across training jobs. */
+export function toPromotionReplayResults(
+  report: SemanticReport,
+  baseline?: SemanticBaseline,
+): ReplayResult[] {
+  return report.results.map((result) => ({
+    case_id: result.id,
+    passed: result.score >= REGRESSION_ABSOLUTE_FLOOR,
+    baseline_score: baseline?.scores[result.id],
+    candidate_score: result.score,
+  }));
 }
 
 // A live model is non-deterministic — only fail on a real regression, not noise.

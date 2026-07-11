@@ -95,6 +95,23 @@ export type ReadStopReason =
   | "turn_deadline_exceeded"
   | "visible_progress_timeout";
 
+export interface StreamTerminalEvent {
+  readonly type?: string;
+  readonly [key: string]: unknown;
+}
+
+/**
+ * Return the first user-visible terminal outcome from a stream event list.
+ * Transport markers such as `message_stop` are deliberately ignored, and
+ * late outcomes are dropped so callers cannot report two completions.
+ */
+export function collectTerminalEvents<T extends StreamTerminalEvent>(events: T[]): T[] {
+  const terminal = events.find((event) =>
+    event.type === "result" || event.type === "error" || event.type === "cancelled",
+  );
+  return terminal ? [terminal] : [];
+}
+
 /** Resolve concurrent reader-stop signals once, with model timeout precedence. */
 export function resolveReadStopReason(options: {
   firstTokenTimedOut: boolean;

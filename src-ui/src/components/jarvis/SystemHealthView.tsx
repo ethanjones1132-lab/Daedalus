@@ -24,6 +24,13 @@ interface ConductorCacheSummary {
   generated_at: number;
 }
 
+interface ConductorDirectiveSummary {
+  window_size: number;
+  by_type: Record<string, number>;
+  records: unknown[];
+  generated_at: number;
+}
+
 interface InferenceMetrics {
   window_size: number;
   backends: BackendStats[];
@@ -55,6 +62,14 @@ interface HealthData {
   disk: DiskHealth;
   memory: MemoryHealth;
   timestamp: string;
+}
+
+interface RuntimeHealth {
+  version?: string;
+  model?: string;
+  model_resolved?: boolean;
+  git_sha?: string;
+  built_at?: string;
 }
 
 interface DoctorCheck { name: string; status: string; detail: string }
@@ -104,12 +119,20 @@ export function conductorCacheVariant(rate: number): 'success' | 'warn' | 'error
   return 'error';
 }
 
+export function formatRuntimeProvenance(runtime: RuntimeHealth | null): string {
+  if (!runtime) return 'Runtime health unavailable';
+  const sha = runtime.git_sha ? runtime.git_sha.slice(0, 12) : 'unknown-sha';
+  return `${runtime.version ?? 'unknown-version'} · ${sha} · ${runtime.model ?? 'unknown-model'}`;
+}
+
 const BUN_URL = 'http://127.0.0.1:19877';
 
 export default function SystemHealthView() {
   const [health, setHealth] = useState<HealthData | null>(null);
   const [doctor, setDoctor] = useState<DoctorReport | null>(null);
   const [inferenceMetrics, setInferenceMetrics] = useState<InferenceMetrics | null>(null);
+  const [directiveMetrics, setDirectiveMetrics] = useState<ConductorDirectiveSummary | null>(null);
+  const [runtimeHealth, setRuntimeHealth] = useState<RuntimeHealth | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lastRefresh, setLastRefresh] = useState<Date>(new Date());
@@ -118,14 +141,18 @@ export default function SystemHealthView() {
     setLoading(true);
     setError(null);
     try {
-      const [h, d, im] = await Promise.all([
+      const [h, d, im, cd, rh] = await Promise.all([
         invoke<HealthData>('get_system_health').catch(() => null),
         invoke<DoctorReport>('get_doctor_report').catch(() => null),
         globalThis.fetch?.(`${BUN_URL}/health/inference`).then(r => r.ok ? r.json() as Promise<InferenceMetrics> : null).catch(() => null) ?? Promise.resolve(null),
+        globalThis.fetch?.(`${BUN_URL}/health/conductor-directives`).then(r => r.ok ? r.json() as Promise<ConductorDirectiveSummary> : null).catch(() => null) ?? Promise.resolve(null),
+        globalThis.fetch?.(`${BUN_URL}/health`).then(r => r.ok ? r.json() as Promise<RuntimeHealth> : null).catch(() => null) ?? Promise.resolve(null),
       ]);
       setHealth(h);
       setDoctor(d);
       setInferenceMetrics(im);
+      setDirectiveMetrics(cd);
+      setRuntimeHealth(rh);
       setLastRefresh(new Date());
     } catch (e) {
       setError(String(e));
@@ -171,6 +198,18 @@ export default function SystemHealthView() {
           <ErrorState error={error} onRetry={fetch} />
         ) : (
           <>
+            <GlassCard className="p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40">Runtime provenance</div>
+                  <div className="mt-1 text-sm text-bone font-mono">{formatRuntimeProvenance(runtimeHealth)}</div>
+                  {runtimeHealth?.built_at && <div className="text-[10px] text-bone/40 mt-1">built {runtimeHealth.built_at}</div>}
+                </div>
+                <Pill variant={runtimeHealth?.model_resolved ? 'success' : 'warn'}>
+                  {runtimeHealth?.model_resolved ? 'model resolved' : 'model unresolved'}
+                </Pill>
+              </div>
+            </GlassCard>
             {/* Subsystem status chips */}
             <GlassCard className="p-4">
               <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40 mb-3">
@@ -307,6 +346,28 @@ export default function SystemHealthView() {
                 </div>
                 <div className="mt-1 text-[10px] font-mono text-bone/30">
                   A-02 target: 80% hit rate on a 3-turn session
+                </div>
+              </GlassCard>
+            )}
+
+            {/* Conductor directives — request-scoped supervision actions (Task 11). */}
+            {directiveMetrics && directiveMetrics.window_size > 0 && (
+              <GlassCard className="p-4">
+                <div className="flex items-center gap-2 mb-3">
+                  <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40">
+                    Conductor directives
+                  </div>
+                  <Pill variant="default">{directiveMetrics.window_size} recent</Pill>
+                </div>
+                <div className="space-y-2">
+                  {Object.entries(directiveMetrics.by_type).map(([type, count]) => (
+                    <div key={type} className="text-xs flex items-center gap-3">
+                      <span className="font-mono text-bone font-medium w-28 shrink-0">{type}</span>
+                      <Pill variant={type === 'continue' ? 'success' : type === 'abort_stage' ? 'error' : 'warn'}>
+                        {count}
+                      </Pill>
+                    </div>
+                  ))}
                 </div>
               </GlassCard>
             )}

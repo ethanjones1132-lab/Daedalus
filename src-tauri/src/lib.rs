@@ -62,8 +62,9 @@ pub(crate) fn wsl_home() -> String {
 //   • claude_cli_proxy.py (port 19878) — Anthropic /v1/messages -> claude CLI
 // Both are spawned lazily off the main thread so the window paints fast.
 
-pub(crate) static OLLAMA_PROCESS: std::sync::OnceLock<std::sync::Mutex<Option<std::process::Child>>> =
-    std::sync::OnceLock::new();
+pub(crate) static OLLAMA_PROCESS: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::process::Child>>,
+> = std::sync::OnceLock::new();
 pub(crate) static PROXY_PROCESS: std::sync::OnceLock<
     std::sync::Mutex<Option<std::process::Child>>,
 > = std::sync::OnceLock::new();
@@ -160,7 +161,11 @@ fn warm_model(model: String) {
 /// `"qwen3:8b"` only when an empty string is passed (e.g. from the reconcile path
 /// before a config is fully loaded).
 pub(crate) async fn start_ollama_and_warm(model: String) {
-    let model = if model.is_empty() { "qwen3:8b".to_string() } else { model };
+    let model = if model.is_empty() {
+        "qwen3:8b".to_string()
+    } else {
+        model
+    };
     if is_port_listening(11434) {
         println!("[Jarvis] Ollama already running on port 11434");
     } else if let Some(child) = spawn_ollama() {
@@ -196,13 +201,19 @@ pub(crate) async fn start_ollama_and_warm(model: String) {
 ///
 /// `ollama_model` is forwarded to `start_ollama_and_warm`; pass an empty string when
 /// the model is not yet known (falls back to the `qwen3:8b` default).
-pub fn reconcile_backend_services(backend: crate::jarvis::types::JarvisBackend, ollama_model: String) {
+pub fn reconcile_backend_services(
+    backend: crate::jarvis::types::JarvisBackend,
+    ollama_model: String,
+) {
     tauri::async_runtime::spawn(async move {
         if matches!(backend, crate::jarvis::types::JarvisBackend::Ollama) {
             start_ollama_and_warm(ollama_model).await;
         }
         if let Err(e) = ensure_jarvis_server_started().await {
-            eprintln!("[Jarvis] ensure server after backend reconcile failed: {}", e);
+            eprintln!(
+                "[Jarvis] ensure server after backend reconcile failed: {}",
+                e
+            );
         }
     });
 }
@@ -211,7 +222,11 @@ pub(crate) fn spawn_claude_cli_proxy(ollama_model: String) -> Option<std::proces
     use std::process::{Command, Stdio};
     let script = find_claude_cli_proxy()?;
     let py = find_jarvis_python()?;
-    let model = if ollama_model.is_empty() { "qwen3:8b".to_string() } else { ollama_model };
+    let model = if ollama_model.is_empty() {
+        "qwen3:8b".to_string()
+    } else {
+        ollama_model
+    };
     let mut command = Command::new(&py);
     command
         .arg(&script)
@@ -303,10 +318,7 @@ fn find_jarvis_server() -> Option<String> {
             let mut cursor = exe.parent().map(|p| p.to_path_buf());
             for _ in 0..8 {
                 let Some(dir) = cursor.as_ref() else { break };
-                for rel in [
-                    "server-jarvis/dist/index.js",
-                    "server-jarvis/src/index.ts",
-                ] {
+                for rel in ["server-jarvis/dist/index.js", "server-jarvis/src/index.ts"] {
                     let cand = dir.join(rel);
                     if cand.exists() {
                         return Some(cand.to_string_lossy().into_owned());
@@ -326,10 +338,7 @@ fn find_jarvis_server() -> Option<String> {
             let mut cursor = Some(cwd);
             for _ in 0..8 {
                 let Some(dir) = cursor.as_ref() else { break };
-                for rel in [
-                    "server-jarvis/dist/index.js",
-                    "server-jarvis/src/index.ts",
-                ] {
+                for rel in ["server-jarvis/dist/index.js", "server-jarvis/src/index.ts"] {
                     let cand = dir.join(rel);
                     if cand.exists() {
                         return Some(cand.to_string_lossy().into_owned());
@@ -543,8 +552,9 @@ pub async fn force_restart_jarvis_server() -> Result<(), String> {
 
     // 2. Locate the server entry (the cheap part; surfaces a real error if
     //    the bundle is genuinely missing on this machine).
-    let server_entry = find_jarvis_server()
-        .ok_or_else(|| "server bundle not found (no index.js / index.ts beside the app or in the repo)".to_string())?;
+    let server_entry = find_jarvis_server().ok_or_else(|| {
+        "server bundle not found (no index.js / index.ts beside the app or in the repo)".to_string()
+    })?;
 
     // 3. Kill the tracked child (if any) and re-spawn off the runtime.
     let spawn_result: Result<(), String> = spawn_blocking_on_current_runtime(move || {
@@ -558,8 +568,9 @@ pub async fn force_restart_jarvis_server() -> Result<(), String> {
         if let Some(mut child) = guard.take() {
             let _ = child.kill();
         }
-        let child = spawn_jarvis_server(&server_entry)
-            .ok_or_else(|| "Failed to spawn Bun server (see [Jarvis] logs above for the OS error)".to_string())?;
+        let child = spawn_jarvis_server(&server_entry).ok_or_else(|| {
+            "Failed to spawn Bun server (see [Jarvis] logs above for the OS error)".to_string()
+        })?;
         *guard = Some(child);
         Ok(())
     })
@@ -920,6 +931,8 @@ pub fn run() {
             create_session,
             delete_session,
             get_session_history,
+            get_session_runs,
+            get_all_session_runs,
             export_session,
             compact_session_db,
             update_token_count,
@@ -1008,6 +1021,7 @@ pub fn run() {
             get_action_registry_alerts,
             sync_action_registry,
             update_action_approval,
+            dispatch_action,
             get_plugins,
             enable_plugin,
             disable_plugin,
@@ -1074,7 +1088,9 @@ mod startup_thread_tests {
                 let value = spawn_blocking_on_current_runtime(|| 42)
                     .await
                     .expect("blocking boot work should join");
-                result_tx.send(value).expect("test receiver should be alive");
+                result_tx
+                    .send(value)
+                    .expect("test receiver should be alive");
             });
         })
         .expect("startup blocking test thread should spawn");
@@ -1085,6 +1101,8 @@ mod startup_thread_tests {
                 .expect("dedicated runtime should complete its blocking work"),
             42
         );
-        worker.join().expect("startup blocking test should exit cleanly");
+        worker
+            .join()
+            .expect("startup blocking test should exit cleanly");
     }
 }

@@ -9,6 +9,8 @@ import type { ToolCall, ToolResult } from "../tool-types";
 import { outcomeCollector } from "../self-tuning/mod";
 import type { StageRun } from "../self-tuning/store";
 import { countTokens } from "../tokens";
+import type { ConductorBus, ConductorDirective } from "./conductor-bus";
+import type { LiveConductor } from "./conductor";
 import { buildSynthesizerContext, buildSynthesizerContextFromStageState } from "./synth-context";
 import { applyEffectGate, evaluateEffectGate, type EffectGateReport } from "./effect-gate";
 import type { ExecutionProfile } from "./route-normalization";
@@ -25,11 +27,21 @@ export interface StageRunRecorder {
   recordStageRun(stage: StageRun): void;
 }
 
+export interface ConductorWiring {
+  bus: ConductorBus;
+  live: LiveConductor;
+  /** Optional collector override; defaults to the global outcome collector. */
+  collector?: StageRunRecorder;
+}
+
 export interface PipelineProgressState {
   stage: "planner" | "executor" | "reviewer" | "rewriter" | "synthesizer" | "conductor_replan";
-  status: "running" | "done" | "failed";
+  status: StageTerminalStatus | "running" | "done";
   output?: string;
+  detail?: string;
 }
+
+export type StageTerminalStatus = "completed" | "failed" | "timed_out" | "cancelled" | "partial";
 
 export type PipelineTopology = "linear" | "speculative_parallel" | "speculative_cascade" | "recursive";
 
@@ -46,6 +58,7 @@ export interface PipelineExecuteOptions {
    */
   initialRecursionDepth?: number;
   onRecursion?: (event: PipelineRecursionEvent) => void | Promise<void>;
+  onDirective?: (directive: ConductorDirective, stage: StageName) => void | Promise<void>;
   /**
    * Least-authority tool profile for the executor/rewriter stages. Set by the
    * route-normalization layer from the turn's capability class. Defaults to
@@ -70,9 +83,16 @@ export interface PipelineExecuteOptions {
 }
 
 const READ_CACHE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "web_fetch"]);
-const WORKSPACE_EVIDENCE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep"]);
+const WORKSPACE_EVIDENCE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "git_metadata"]);
 const MISSING_WORKSPACE_EVIDENCE =
   "Workspace inspection failed: no successful workspace read tool result was produced, so Jarvis will not synthesize repository claims from ungrounded model text.";
+
+function isStageTimeout(error: unknown): boolean {
+  const name = error && typeof error === "object" && "name" in error
+    ? String((error as { name?: unknown }).name ?? "")
+    : "";
+  return /timeout/i.test(name) || /(?:first-token|stream idle|visible-progress|request) timeout/i.test(errText(error));
+}
 
 function hasSuccessfulWorkspaceEvidence(toolCalls: ToolCallRecord[] | undefined): boolean {
   return (toolCalls ?? []).some((call) =>
@@ -149,7 +169,7 @@ export interface PipelineRecursionEvent {
  *              recovered along the way (the user still gets a real answer).
  *   failed   — no usable answer (hard error, or every model returned empty).
  */
-export type PipelineOutcome = "success" | "degraded" | "failed";
+export type PipelineOutcome = "success" | "degraded" | "failed" | "partial";
 
 export interface PipelineResult {
   answer: string;
@@ -176,6 +196,7 @@ export interface PipelineSegmentResult {
   fatalErrorCode?: string;
   synthesizerEmptyCompletion?: boolean;
   effectGate?: EffectGateReport;
+  partialStage?: { stage: StageName; errorCode: string };
 }
 
 /**
@@ -247,14 +268,90 @@ function stageSystemPrompt(
 }
 
 export class PipelineExecutor {
+  private collector: StageRunRecorder;
+  private conductor?: ConductorWiring;
+
   constructor(
     private callModel: CallModelFn,
     private runtime: ToolRuntime,
     private ctx: ExecutionContext,
     // Injected so tests can supply an in-memory collector. Defaults to the
-    // global production singleton for the live runtime.
-    private collector: StageRunRecorder = outcomeCollector
-  ) {}
+    // global production singleton for the live runtime. The conductor wiring
+    // is deliberately accepted in this slot too for backwards compatibility
+    // with the staged live-conductor work; both paths are opt-in.
+    collectorOrConductor: StageRunRecorder | ConductorWiring = outcomeCollector,
+  ) {
+    if ("recordStageRun" in collectorOrConductor) {
+      this.collector = collectorOrConductor;
+    } else {
+      this.collector = collectorOrConductor.collector ?? outcomeCollector;
+      this.conductor = collectorOrConductor;
+    }
+  }
+
+  private registerStageAbort(stage: StageName): AbortSignal | undefined {
+    if (!this.conductor) return undefined;
+    const controller = new AbortController();
+    this.conductor.bus.registerAbortHandle(stage, controller);
+    return controller.signal;
+  }
+
+  private publishStageToken(stage: StageName, chunk: string): void {
+    this.conductor?.bus.publishThrottled({
+      type: "stage_token",
+      stage,
+      textDelta: chunk,
+      cumulativeLen: chunk.length,
+    });
+  }
+
+  private async afterConductorStage(
+    stage: StageName,
+    outcome: "completed" | "failed",
+    output: string,
+    agentRunId: string,
+    options: PipelineExecuteOptions,
+  ): Promise<void> {
+    if (!this.conductor) return;
+    let directive: ConductorDirective;
+    try {
+      // A non-empty remaining queue asks the optional conductor to supervise
+      // this completed stage. The executor owns the real stage ordering; this
+      // adapter deliberately does not let a failed conductor rewrite it.
+      directive = await this.conductor.live.afterStage(stage, outcome, output, [stage]);
+    } catch {
+      return;
+    }
+
+    if (directive.type === "abort_stage") {
+      this.conductor.bus.resolveAbort(directive.stage);
+    }
+    if (directive.type !== "continue") {
+      await options.onDirective?.(directive, stage);
+    }
+    const audit = this.collector as StageRunRecorder & {
+      recordDirective?: (row: {
+        id: string;
+        agent_run_id: string;
+        stage: string;
+        directive_type: string;
+        reason?: string;
+        new_remaining_json?: string;
+        inject_note?: string;
+        inject_for_stage?: string;
+      }) => void;
+    };
+    audit.recordDirective?.({
+      id: `dir_${crypto.randomUUID()}`,
+      agent_run_id: agentRunId,
+      stage,
+      directive_type: directive.type,
+      reason: "reason" in directive ? directive.reason : undefined,
+      new_remaining_json: directive.type === "reroute" ? JSON.stringify(directive.newRemaining) : undefined,
+      inject_note: directive.type === "inject_context" ? directive.note : undefined,
+      inject_for_stage: directive.type === "inject_context" ? directive.forStage : undefined,
+    });
+  }
 
   private async runToolCall(raw: any, options: PipelineExecuteOptions): Promise<ToolResult> {
     const call = parseStreamedToolCall(raw);
@@ -311,12 +408,15 @@ export class PipelineExecutor {
         stream: true,
         stageLabel: "planner",
         suppressActivity: false,
+        stageAbort: this.registerStageAbort("planner"),
         onChunk: (chunk) => {
           onStateChange({ stage: "planner", status: "running", output: chunk });
+          this.publishStageToken("planner", chunk);
         }
       });
       const narrative = resp.content;
-      onStateChange({ stage: "planner", status: "done", output: narrative });
+      onStateChange({ stage: "planner", status: "completed", output: narrative });
+      await this.afterConductorStage("planner", "completed", narrative, agentRunId, options);
 
       this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
@@ -334,6 +434,7 @@ export class PipelineExecutor {
     } catch (e: any) {
       const message = errText(e);
       onStateChange({ stage: "planner", status: "failed", output: message });
+      await this.afterConductorStage("planner", "failed", message, agentRunId, options);
 
       this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
@@ -373,6 +474,43 @@ export class PipelineExecutor {
     const maxTurns = executorTurnLimit(profile);
     let executorTurn = 0;
 
+    // Git/SHA requests are deterministic read-only metadata requests. Some
+    // text-protocol providers decline to emit a tool block even after the
+    // runtime advertises one, so seed the executor with the constrained
+    // capability's real result. This is still scoped to workspace_read and
+    // never falls back to arbitrary shell execution.
+    if (
+      requiresWorkspaceEvidence
+      && /\b(git|sha|commit|branch|dirty)\b/i.test(request)
+      && this.runtime.listTools().some((tool) => tool.function.name === "git_metadata")
+    ) {
+      const preflightCall: ToolCall = {
+        id: `call_${crypto.randomUUID()}`,
+        name: "git_metadata",
+        arguments: { include: ["head", "branch", "dirty"] },
+      };
+      const preflightResult = await this.runToolCall(preflightCall, options);
+      const preflightOutput = toolResultModelText(preflightResult);
+      toolCalls.push({
+        name: preflightCall.name,
+        arguments: preflightCall.arguments,
+        output: preflightOutput,
+        is_error: preflightResult.is_error,
+        error_code: preflightResult.error_code,
+        duration_ms: preflightResult.duration_ms ?? 0,
+      });
+      executorMessages.push({
+        role: "user",
+        content: `[Runtime preflight: git_metadata]\n${preflightOutput}\nUse this exact metadata in your answer; do not claim the tool is unavailable.`,
+      });
+      onStateChange({
+        stage: "executor",
+        status: "running",
+        output: "\n[Tool Executed: git_metadata]\n",
+        detail: "tool:git_metadata",
+      });
+    }
+
     try {
       while (!executorDone && turnCount < maxTurns) {
         turnCount++;
@@ -389,8 +527,10 @@ export class PipelineExecutor {
             stream: true,
             stageLabel: "executor",
             suppressActivity: false,
+            stageAbort: this.registerStageAbort("executor"),
             onChunk: (chunk) => {
               onStateChange({ stage: "executor", status: "running", output: chunk });
+              this.publishStageToken("executor", chunk);
             }
           });
 
@@ -476,11 +616,13 @@ export class PipelineExecutor {
         onStateChange({ stage: "executor", status: "failed", output: MISSING_WORKSPACE_EVIDENCE });
         return { ok: false, narrative: MISSING_WORKSPACE_EVIDENCE, toolCalls };
       }
-      onStateChange({ stage: "executor", status: "done", output: narrative });
+      onStateChange({ stage: "executor", status: "completed", output: narrative });
+      await this.afterConductorStage("executor", "completed", narrative, agentRunId, options);
       return { ok: true, narrative, toolCalls };
     } catch (e: any) {
       const message = errText(e);
       onStateChange({ stage: "executor", status: "failed", output: message });
+      await this.afterConductorStage("executor", "failed", message, agentRunId, options);
       return { ok: false, narrative: `Executor failed: ${message}`, toolCalls };
     }
   }
@@ -522,6 +664,7 @@ export class PipelineExecutor {
             tools: getToolsForMode("rewriter", this.runtime.listTools(), profile),
             stream: true,
             stageLabel: "rewriter",
+            stageAbort: this.registerStageAbort("rewriter"),
             suppressActivity: false,
             onChunk: (chunk) => {
               onStateChange({ stage: "rewriter", status: "running", output: chunk });
@@ -587,7 +730,7 @@ export class PipelineExecutor {
       }
 
       const narrative = narratives.join("\n\n");
-      onStateChange({ stage: "rewriter", status: "done", output: narrative });
+      onStateChange({ stage: "rewriter", status: "completed", output: narrative });
       return { ok: true, narrative, toolCalls };
     } catch (e: any) {
       // NOTE (intentional, reviewed change from pre-extraction behavior): before
@@ -598,8 +741,20 @@ export class PipelineExecutor {
       // immediately. Catching it here instead gives correct stage attribution
       // and lets the loop continue past a transient rewriter failure.
       const message = errText(e);
-      onStateChange({ stage: "rewriter", status: "failed", output: message });
-      return { ok: false, narrative: message, toolCalls };
+      const timedOut = isStageTimeout(e);
+      onStateChange({
+        stage: "rewriter",
+        status: timedOut ? "timed_out" : "failed",
+        output: message,
+        detail: timedOut ? "stage_timeout" : undefined,
+      });
+      return {
+        ok: false,
+        narrative: message,
+        toolCalls,
+        terminalStatus: timedOut ? "timed_out" : "failed",
+        errorCode: timedOut ? "stage_timeout" : "stage_error",
+      };
     }
   }
 
@@ -645,7 +800,7 @@ export class PipelineExecutor {
         });
 
         reviewerFeedback = reviewerResp.content;
-        onStateChange({ stage: "reviewer", status: "done", output: reviewerFeedback });
+        onStateChange({ stage: "reviewer", status: "completed", output: reviewerFeedback });
 
         this.collector.recordStageRun({
           id: `stage_${crypto.randomUUID()}`,
@@ -730,8 +885,10 @@ export class PipelineExecutor {
         stream: true,
         stageLabel: "synthesizer",
         surfaceAsAnswer: true,
+        stageAbort: this.registerStageAbort("synthesizer"),
         onChunk: (chunk) => {
           onStateChange({ stage: "synthesizer", status: "running", output: chunk });
+          this.publishStageToken("synthesizer", chunk);
         }
       });
       const finalAnswer = resp.content ?? "";
@@ -761,7 +918,8 @@ export class PipelineExecutor {
         return { answer: "", emptyCompletion: true };
       }
 
-      onStateChange({ stage: "synthesizer", status: "done", output: finalAnswer });
+      onStateChange({ stage: "synthesizer", status: "completed", output: finalAnswer });
+      await this.afterConductorStage("synthesizer", "completed", finalAnswer, agentRunId, options);
       this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
         agent_run_id: agentRunId,
@@ -778,6 +936,7 @@ export class PipelineExecutor {
     } catch (e: any) {
       const message = errText(e);
       onStateChange({ stage: "synthesizer", status: "failed", output: message });
+      await this.afterConductorStage("synthesizer", "failed", message, agentRunId, options);
       const fatalError = describePipelineError(message);
       this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
@@ -820,6 +979,7 @@ export class PipelineExecutor {
   ): Promise<PipelineSegmentResult> {
     const state: PipelineStageState = { ...carry };
     const profile: ExecutionProfile = options.executionProfile ?? "full";
+    let partialStage: PipelineSegmentResult["partialStage"];
 
     if (stages.includes("planner")) {
       state.plan = await this.runPlannerStage(request, agentRunId, onStateChange, options);
@@ -835,7 +995,12 @@ export class PipelineExecutor {
         agentRunId, onStateChange, options, profile,
       );
       state.reviewer = reviewer;
-      if (rewriter) state.rewriter = rewriter;
+      if (rewriter) {
+        state.rewriter = rewriter;
+        if (rewriter.terminalStatus === "timed_out") {
+          partialStage = { stage: "rewriter", errorCode: rewriter.errorCode ?? "stage_timeout" };
+        }
+      }
     }
 
     let effectGate = evaluateEffectGate({
@@ -869,10 +1034,13 @@ export class PipelineExecutor {
         executor: state.executor,
         rewriter: state.rewriter,
       });
+      if (state.rewriter.terminalStatus === "timed_out") {
+        partialStage = { stage: "rewriter", errorCode: state.rewriter.errorCode ?? "stage_timeout" };
+      }
     }
 
     if (!stages.includes("synthesizer")) {
-      return { state, effectGate };
+      return { state, effectGate, partialStage };
     }
 
     if (
@@ -886,6 +1054,7 @@ export class PipelineExecutor {
         synthesizerEmptyCompletion: false,
         fatalErrorCode: "missing_workspace_evidence",
         effectGate,
+        partialStage,
       };
     }
 
@@ -903,6 +1072,7 @@ export class PipelineExecutor {
       synthesizerFatalError: synth.fatalError,
       synthesizerEmptyCompletion: synth.emptyCompletion,
       effectGate,
+      partialStage,
     };
   }
 
@@ -984,8 +1154,13 @@ export class PipelineExecutor {
       outcome = "success";
     }
 
+    if (segment.partialStage && !segment.synthesizerFatalError && !segment.synthesizerEmptyCompletion) {
+      outcome = "partial";
+      errorCode = segment.partialStage.errorCode;
+    }
+
     ({ outcome, errorCode } = applyEffectGate(
-      outcome,
+      outcome === "partial" ? "degraded" : outcome,
       errorCode,
       segment.effectGate ?? evaluateEffectGate({
         profile: options.executionProfile ?? "full",
@@ -993,6 +1168,10 @@ export class PipelineExecutor {
         rewriter: state.rewriter,
       }),
     ));
+    if (segment.partialStage && outcome !== "failed") {
+      outcome = "partial";
+      errorCode = segment.partialStage.errorCode;
+    }
 
     const result: PipelineResult = {
       answer: segment.synthesizerEmptyCompletion ? "" : segment.synthesizerAnswer,
@@ -1088,7 +1267,7 @@ export class PipelineExecutor {
         }
       });
       const finalAnswer = resp.content;
-      onStateChange({ stage: "synthesizer", status: "done", output: finalAnswer });
+      onStateChange({ stage: "synthesizer", status: "completed", output: finalAnswer });
 
       this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
@@ -1155,7 +1334,7 @@ export class PipelineExecutor {
         }
       });
       const output = resp.content;
-      args.onStateChange({ stage: args.stage, status: "done", output });
+      args.onStateChange({ stage: args.stage, status: "completed", output });
 
       this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
@@ -1254,7 +1433,7 @@ export class PipelineExecutor {
         }
       });
       const finalAnswer = resp.content;
-      onStateChange({ stage: "synthesizer", status: "done", output: finalAnswer });
+      onStateChange({ stage: "synthesizer", status: "completed", output: finalAnswer });
 
       this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,

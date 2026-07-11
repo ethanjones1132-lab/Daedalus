@@ -75,3 +75,44 @@ export function handleScanAgents(
     invalid: result.invalid,
   };
 }
+
+/**
+ * Route one HTTP request through the agent lifecycle handlers.
+ * Returns a `Response` when the path matches the agent namespace,
+ * otherwise `null` so the caller can fall through to other routes.
+ */
+export function handleAgentRequest(
+  req: Request,
+  lifecycle: LifecycleService
+): Response | null {
+  const url = new URL(req.url, "http://local");
+  const path = url.pathname;
+
+  if (path === "/agents" && req.method === "GET") {
+    return Response.json(handleListAgents(lifecycle));
+  }
+
+  if (path === "/agents/scan" && req.method === "POST") {
+    return Response.json(handleScanAgents(lifecycle));
+  }
+
+  const singleMatch = path.match(/^\/agents\/([^/]+)$/);
+  if (singleMatch && req.method === "GET") {
+    const id = decodeURIComponent(singleMatch[1]);
+    return Response.json(handleGetAgent(lifecycle, id));
+  }
+
+  const activateMatch = path.match(/^\/agents\/([^/]+)\/activate$/);
+  if (activateMatch && req.method === "POST") {
+    const id = decodeURIComponent(activateMatch[1]);
+    return Response.json(handleActivateAgent(lifecycle, id));
+  }
+
+  const deactivateMatch = path.match(/^\/agents\/([^/]+)\/deactivate$/);
+  if (deactivateMatch && req.method === "POST") {
+    const id = decodeURIComponent(deactivateMatch[1]);
+    return Response.json(handleDeactivateAgent(lifecycle, id));
+  }
+
+  return null;
+}

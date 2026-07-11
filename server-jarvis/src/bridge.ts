@@ -7,6 +7,7 @@
 import { readFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
+import { BridgeReplayGuard, verifyBridgeEnvelope } from "./bridge-protocol";
 
 const CONFIG_FILE = join(homedir(), ".openclaw", "jarvis", "config.json");
 const JARVIS_API = "http://localhost:19877";
@@ -37,7 +38,7 @@ function safeErrorMessage(e: unknown): string {
   return String(e);
 }
 
-function loadConfig(): { bridge_port: number } {
+function loadConfig(): { bridge_port: number; bridge_secret?: string } {
   try {
     return JSON.parse(readFileSync(CONFIG_FILE, "utf-8"));
   } catch {
@@ -49,30 +50,53 @@ function writeSocket(socket: BridgeSocket, value: string): void {
   try { socket.write?.(value); } catch {}
 }
 
-const { bridge_port } = loadConfig();
+const { bridge_port, bridge_secret } = loadConfig();
+const bridgeSecret = process.env.JARVIS_BRIDGE_SECRET || bridge_secret || "";
+const replayGuard = new BridgeReplayGuard();
+const activeUpstreams = new Map<string, AbortController>();
 
 try {
   Bun.listen({
     hostname: "127.0.0.1",
     port: bridge_port,
     socket: {
-      data(socket: BridgeSocket, data: BridgeData) {
+      async data(socket: BridgeSocket, data: BridgeData) {
         const text = data.toString().trim();
         const lines = text.split("\n");
         for (const line of lines) {
           if (!line.trim()) continue;
           try {
             const req = JSON.parse(line);
-            const session = req.session || "default";
+            const auth = await verifyBridgeEnvelope(req, bridgeSecret);
+            if (!auth.ok) {
+              writeSocket(socket, JSON.stringify({ error: auth.code }) + "\n");
+              continue;
+            }
+            if (!replayGuard.accept(auth.envelope.request_id)) {
+              writeSocket(socket, JSON.stringify({ error: "bridge_replay_detected", request_id: auth.envelope.request_id }) + "\n");
+              continue;
+            }
+            if (auth.envelope.payload.type === "cancel") {
+              const controller = activeUpstreams.get(auth.envelope.payload.target_request_id);
+              if (controller) {
+                controller.abort();
+                writeSocket(socket, JSON.stringify({ type: "cancelled", request_id: auth.envelope.payload.target_request_id }) + "\n");
+              } else {
+                writeSocket(socket, JSON.stringify({ error: "bridge_request_not_found", request_id: auth.envelope.payload.target_request_id }) + "\n");
+              }
+              continue;
+            }
+            const session = auth.envelope.payload.session_id || "default";
 
             const upstreamAbort = new AbortController();
+            activeUpstreams.set(auth.envelope.request_id, upstreamAbort);
             const onSocketClose = () => { try { upstreamAbort.abort(); } catch {} };
             socket.on?.("close", onSocketClose);
 
             fetch(`${JARVIS_API}/chat/stream`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ message: req.message, session_id: session }),
+              body: JSON.stringify({ message: auth.envelope.payload.message, session_id: session }),
               signal: upstreamAbort.signal,
             }).then(async (res) => {
               const reader = res.body?.getReader();
@@ -110,6 +134,7 @@ try {
             }).catch((e) => {
               writeSocket(socket, JSON.stringify({ error: safeErrorMessage(e), session_id: session }) + "\n");
             }).finally(() => {
+              activeUpstreams.delete(auth.envelope.request_id);
               socket.off?.("close", onSocketClose);
             });
 

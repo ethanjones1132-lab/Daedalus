@@ -1,8 +1,8 @@
 # Jarvis Direct Application Diagnosis
 
-**Date:** 2026-07-10  
-**Scope:** Live interaction with the optimized release desktop application, plus read-only runtime and workspace verification.  
-**Artifact exercised:** `C:\Projects\home-base-recovered\src-tauri\target\release\home-base.exe`  
+**Date:** 2026-07-10
+**Scope:** Live interaction with the optimized release desktop application, plus read-only runtime and workspace verification.
+**Artifact exercised:** `C:\Projects\home-base-recovered\src-tauri\target\release\home-base.exe`
 **Build provenance shown by the UI:** commit `9013158ba6bc6600a2546e309fd066d6e53a5223`, built `2026-07-10T15:19:43+00:00`.
 
 ## Executive diagnosis
@@ -172,3 +172,13 @@ The screenshot also clarifies the timeout inconsistency in the broader diagnosis
 ## Conclusion
 
 The release is genuinely bootable and the direct model path is capable of correct answers. It is not yet reliable enough to call the full Jarvis agent path production-complete: workspace/tool execution fails generically, and multi-stage finalization can hang after correct work has already been produced. The next engineering pass should focus on stream/tool error propagation and stage cancellation before adding more orchestration features.
+
+## Implementation follow-up — 2026-07-10
+
+The direct diagnosis above exercised older Desktop artifacts. A later remediation deployment rebuilt the complete stack from source commit `0ca584bb6` and verified that the Desktop manifest, `/health.git_sha`, deployed `index.js` hash, and live Bun command line agree.
+
+- A fresh `Jarvis.exe` launch automatically started the Bun sidecar; `/health` became available with initial uptime under one second.
+- A clean direct `/chat/stream` probe completed in about three seconds and emitted visible text, `message_stop`, and exactly one successful `result` frame.
+- This validates the new sidecar bootstrap and the basic server-side terminal-stream contract. It does **not** invalidate the earlier workspace/tool and multi-stage failure evidence: those higher-complexity scenarios still require a fresh, bounded end-to-end regression on the new deployment.
+- A later read-only workspace probe did complete executor → synthesizer successfully and listed the requested repository entries. It could not report the Git SHA because the workspace profile did not offer a shell/Git capability; this is now a concrete tool-routing limitation rather than a generic fetch failure.
+- A subsequent full-execution code-review probe completed executor → reviewer → synthesizer in about 53.5 seconds and returned the correct one-character fix. The coordinator still failed to parse its selected `deepseek-v4-pro` route and used the safe normalized fallback; this is now a measurable routing-quality gap, while the rewriter stress path remains unverified on the new deployment.

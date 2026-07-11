@@ -175,6 +175,188 @@ pub struct SessionMessageOut {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionRunRecord {
+    pub session_id: String,
+    pub run_id: String,
+    pub outcome: String,
+    pub selected_model: Option<String>,
+    pub token_count: i64,
+    pub tool_count: i64,
+    pub cancelled_reason: Option<String>,
+    pub partial_output: Option<String>,
+}
+
+/// Persist the terminal outcome of one native SSE turn. `run_id` is emitted
+/// by the Bun pipeline and is the durable idempotency key for relay retries.
+pub fn persist_terminal_run(
+    db: &AppDb,
+    session_id: &str,
+    run_id: &str,
+    outcome: &str,
+    selected_model: Option<&str>,
+    token_count: i64,
+    tool_count: i64,
+    cancelled_reason: Option<&str>,
+    partial_output: Option<&str>,
+) -> Result<SessionRunRecord, String> {
+    if !matches!(
+        outcome,
+        "success" | "partial" | "failed" | "timed_out" | "cancelled"
+    ) {
+        return Err(format!("invalid terminal outcome: {outcome}"));
+    }
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    persist_terminal_run_conn(
+        &conn,
+        session_id,
+        run_id,
+        outcome,
+        selected_model,
+        token_count,
+        tool_count,
+        cancelled_reason,
+        partial_output,
+    )
+}
+
+pub fn persist_terminal_run_at(
+    db_path: &std::path::Path,
+    session_id: &str,
+    run_id: &str,
+    outcome: &str,
+    selected_model: Option<&str>,
+    token_count: i64,
+    tool_count: i64,
+    cancelled_reason: Option<&str>,
+    partial_output: Option<&str>,
+) -> Result<SessionRunRecord, String> {
+    let conn = rusqlite::Connection::open(db_path)
+        .map_err(|e| format!("Failed to open session database: {e}"))?;
+    persist_terminal_run_conn(
+        &conn,
+        session_id,
+        run_id,
+        outcome,
+        selected_model,
+        token_count,
+        tool_count,
+        cancelled_reason,
+        partial_output,
+    )
+}
+
+fn persist_terminal_run_conn(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    run_id: &str,
+    outcome: &str,
+    selected_model: Option<&str>,
+    token_count: i64,
+    tool_count: i64,
+    cancelled_reason: Option<&str>,
+    partial_output: Option<&str>,
+) -> Result<SessionRunRecord, String> {
+    if !matches!(
+        outcome,
+        "success" | "partial" | "failed" | "timed_out" | "cancelled"
+    ) {
+        return Err(format!("invalid terminal outcome: {outcome}"));
+    }
+    conn.execute(
+        "INSERT INTO session_runs
+         (run_id, session_id, outcome, selected_model, token_count, tool_count, cancelled_reason, partial_output, finished_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+         ON CONFLICT(run_id) DO UPDATE SET
+           outcome=excluded.outcome, selected_model=excluded.selected_model,
+           token_count=excluded.token_count, tool_count=excluded.tool_count,
+           cancelled_reason=excluded.cancelled_reason, partial_output=excluded.partial_output,
+           finished_at=excluded.finished_at",
+        rusqlite::params![
+            run_id, session_id, outcome, selected_model, token_count.max(0), tool_count.max(0),
+            cancelled_reason, partial_output,
+        ],
+    )
+    .map_err(|e| format!("Failed to persist terminal session run: {e}"))?;
+    Ok(SessionRunRecord {
+        session_id: session_id.to_string(),
+        run_id: run_id.to_string(),
+        outcome: outcome.to_string(),
+        selected_model: selected_model.map(str::to_string),
+        token_count: token_count.max(0),
+        tool_count: tool_count.max(0),
+        cancelled_reason: cancelled_reason.map(str::to_string),
+        partial_output: partial_output.map(str::to_string),
+    })
+}
+
+/// List every terminal run recorded for a single session, newest first.
+pub fn list_session_runs(db: &AppDb, session_id: &str) -> Result<Vec<SessionRunRecord>, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let mut stmt = conn
+        .prepare(
+            "SELECT session_id, run_id, outcome, selected_model, token_count, tool_count,
+                    cancelled_reason, partial_output, finished_at
+             FROM session_runs WHERE session_id = ? ORDER BY finished_at DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([session_id], |row| {
+            Ok(SessionRunRecord {
+                session_id: row.get(0)?,
+                run_id: row.get(1)?,
+                outcome: row.get(2)?,
+                selected_model: row.get(3)?,
+                token_count: row.get(4)?,
+                tool_count: row.get(5)?,
+                cancelled_reason: row.get(6)?,
+                partial_output: row.get(7)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(rows.flatten().collect())
+}
+
+/// List all terminal runs across every session, newest first.
+pub fn list_all_session_runs(db: &AppDb) -> Result<Vec<SessionRunRecord>, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let mut stmt = conn
+        .prepare(
+            "SELECT session_id, run_id, outcome, selected_model, token_count, tool_count,
+                    cancelled_reason, partial_output, finished_at
+             FROM session_runs ORDER BY finished_at DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(SessionRunRecord {
+                session_id: row.get(0)?,
+                run_id: row.get(1)?,
+                outcome: row.get(2)?,
+                selected_model: row.get(3)?,
+                token_count: row.get(4)?,
+                tool_count: row.get(5)?,
+                cancelled_reason: row.get(6)?,
+                partial_output: row.get(7)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(rows.flatten().collect())
+}
+
+#[tauri::command]
+pub fn get_session_runs(
+    db: State<AppDb>,
+    session_id: String,
+) -> Result<Vec<SessionRunRecord>, String> {
+    list_session_runs(&db, &session_id)
+}
+
+#[tauri::command]
+pub fn get_all_session_runs(db: State<AppDb>) -> Result<Vec<SessionRunRecord>, String> {
+    list_all_session_runs(&db)
+}
+
 // ── &AppDb helpers ───────────────────────────────────────────────────
 //
 // These hold the canonical SQLite session logic. Both the native "Sessions"
@@ -329,12 +511,13 @@ pub fn get_session_history(
 }
 
 /// Prior messages for the Bun `/chat/stream` body (excludes the in-flight user turn).
-pub fn history_for_chat_stream(db: &AppDb, session_id: &str) -> Result<Vec<serde_json::Value>, String> {
+pub fn history_for_chat_stream(
+    db: &AppDb,
+    session_id: &str,
+) -> Result<Vec<serde_json::Value>, String> {
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     let mut stmt = conn
-        .prepare(
-            "SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at ASC",
-        )
+        .prepare("SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at ASC")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([session_id], |row| {
@@ -449,7 +632,8 @@ mod tests {
             Some("qwen3:8b".into()),
         )
         .expect("create a");
-        let _b = create_session_row(&db, Some("second".into()), None, None, None).expect("create b");
+        let _b =
+            create_session_row(&db, Some("second".into()), None, None, None).expect("create b");
 
         let listed = list_session_rows(&db).expect("list");
         assert_eq!(listed.len(), 2, "both sessions should be listed");
@@ -464,7 +648,8 @@ mod tests {
     #[test]
     fn history_for_chat_stream_returns_prior_messages_in_order() {
         let db = mem_db();
-        let session = create_session_row(&db, Some("chat".into()), None, None, None).expect("create");
+        let session =
+            create_session_row(&db, Some("chat".into()), None, None, None).expect("create");
         insert_message_row(&db, &session.id, "user", "hello", 0).expect("user");
         insert_message_row(&db, &session.id, "assistant", "hi there", 0).expect("assistant");
         let history = history_for_chat_stream(&db, &session.id).expect("history");
@@ -472,5 +657,27 @@ mod tests {
         assert_eq!(history[0]["role"], "user");
         assert_eq!(history[0]["content"], "hello");
         assert_eq!(history[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn cancelled_run_persists_a_terminal_outcome() {
+        let db = mem_db();
+        let session =
+            create_session_row(&db, Some("cancel test".into()), None, None, None).expect("create");
+        let record = persist_terminal_run(
+            &db,
+            &session.id,
+            "run-cancelled",
+            "cancelled",
+            Some("deepseek-v4-pro"),
+            12,
+            1,
+            Some("user_stop"),
+            Some("partial answer"),
+        )
+        .expect("persist");
+        assert_eq!(record.outcome, "cancelled");
+        assert_eq!(record.cancelled_reason.as_deref(), Some("user_stop"));
+        assert_eq!(record.partial_output.as_deref(), Some("partial answer"));
     }
 }

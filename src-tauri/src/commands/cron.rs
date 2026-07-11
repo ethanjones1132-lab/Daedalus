@@ -25,6 +25,20 @@ pub struct CronJob {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronExecutionEvidence {
+    pub run_id: String,
+    pub status: String,
+    #[serde(default)]
+    pub acceptance_result: Option<String>,
+    #[serde(default)]
+    pub error_code: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub finished_at: Option<String>,
+}
+
 /// A single cron job run record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CronRun {
@@ -39,6 +53,8 @@ pub struct CronRun {
     pub duration_ms: i64,
     pub started_at: String,
     pub finished_at: Option<String>,
+    #[serde(default)]
+    pub execution_evidence: Option<CronExecutionEvidence>,
 }
 
 // ── Commands ─────────────────────────────────────────────────
@@ -327,7 +343,7 @@ pub fn get_cron_runs(db: State<AppDb>, cron_id: String) -> Result<Vec<CronRun>, 
 
     let mut stmt = conn
         .prepare(
-            "SELECT id, cron_job_id, status, output, error, duration_ms, started_at, finished_at
+            "SELECT id, cron_job_id, status, output, error, duration_ms, started_at, finished_at, execution_evidence
              FROM cron_runs
              WHERE cron_job_id = ?
              ORDER BY started_at DESC
@@ -337,6 +353,9 @@ pub fn get_cron_runs(db: State<AppDb>, cron_id: String) -> Result<Vec<CronRun>, 
 
     let runs = stmt
         .query_map([&cron_id], |row| {
+            let evidence_json: Option<String> = row.get(8)?;
+            let execution_evidence =
+                evidence_json.and_then(|j| serde_json::from_str::<CronExecutionEvidence>(&j).ok());
             Ok(CronRun {
                 id: row.get(0)?,
                 cron_id: row.get(1)?,
@@ -346,6 +365,7 @@ pub fn get_cron_runs(db: State<AppDb>, cron_id: String) -> Result<Vec<CronRun>, 
                 duration_ms: row.get(5)?,
                 started_at: row.get(6)?,
                 finished_at: row.get(7)?,
+                execution_evidence,
             })
         })
         .map_err(|e| e.to_string())?

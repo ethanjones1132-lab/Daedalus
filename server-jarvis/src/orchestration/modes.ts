@@ -6,7 +6,7 @@ import type { ExecutionProfile } from "./route-normalization";
  * turn (and an `answer_only` turn that opts into the executor) is capped to
  * these — so a misclassified read can never mutate the workspace.
  */
-export const READ_ONLY_TOOLS: readonly string[] = ["read_file", "list_directory", "glob", "grep"];
+export const READ_ONLY_TOOLS: readonly string[] = ["read_file", "list_directory", "glob", "grep", "git_metadata"];
 
 export interface AgentMode {
   id: string;
@@ -36,6 +36,7 @@ export const BUILTIN_MODES: Record<string, AgentMode> = {
     tools_filter: [
       "read_file", "write_file", "edit_file", "multi_edit", "apply_patch",
       "glob", "grep", "list_directory",
+      "git_metadata",
       "bash",
       "web_search", "web_fetch",
       "agent", "run_background_command",

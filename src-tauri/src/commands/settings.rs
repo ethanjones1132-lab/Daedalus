@@ -39,16 +39,53 @@ pub fn get_setting(db: State<AppDb>, key: String) -> Result<Option<String>, Stri
 }
 
 /// Set a single setting value. Inserts or updates (upsert) with the current timestamp.
-#[tauri::command]
-pub fn set_setting(db: State<AppDb>, key: String, value: String) -> Result<(), String> {
+/// Unknown keys are rejected so the raw settings surface cannot silently store
+/// untyped garbage in the canonical SQLite settings table.
+const KNOWN_SETTING_KEYS: &[&str] = &[
+    "version",
+    "active_backend",
+    "ollama",
+    "openrouter",
+    "claude_cli",
+    "tools",
+    "reasoning",
+    "companion",
+    "orchestrator",
+    "system_prompt",
+    "mode",
+    "prizepicks_prompt",
+    "temperature",
+    "surface_temperatures",
+    "max_tokens",
+    "top_p",
+    "top_k",
+    "bridge_port",
+    "bridge_enabled",
+    "jarvis_path",
+    "compaction",
+    "profiles",
+    "active_profile",
+    "api_sports_key",
+    "agents_root",
+];
+
+pub fn set_setting_value(db: &AppDb, key: &str, value: &str) -> Result<(), String> {
+    if !KNOWN_SETTING_KEYS.contains(&key) {
+        return Err(format!("unknown_setting: {key}"));
+    }
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     conn.execute(
         "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-        [&key, &value],
+        [key, value],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+pub fn set_setting(db: State<AppDb>, key: String, value: String) -> Result<(), String> {
+    set_setting_value(&db, &key, &value)
 }
 
 /// Load the full JarvisConfig from the settings table.
@@ -74,6 +111,12 @@ fn normalize_jarvis_config(config: &mut JarvisConfig) {
 /// turn path before it delegates inference streaming to the Bun server.
 pub fn load_jarvis_config(db: &AppDb) -> Result<JarvisConfig, String> {
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    load_jarvis_config_conn(&conn)
+}
+
+/// Connection-based loader so callers already holding the DB lock can read
+/// the canonical config without re-entering the mutex.
+pub fn load_jarvis_config_conn(conn: &rusqlite::Connection) -> Result<JarvisConfig, String> {
     let mut stmt = conn
         .prepare("SELECT key, value FROM settings")
         .map_err(|e| e.to_string())?;
@@ -217,6 +260,16 @@ pub fn load_jarvis_config(db: &AppDb) -> Result<JarvisConfig, String> {
 /// (`save_jarvis_config`, `jarvis_save_config`, `jarvis_switch_backend`) routes
 /// through it.
 pub fn persist_jarvis_config(db: &AppDb, config: &JarvisConfig) -> Result<(), String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    persist_jarvis_config_conn(&conn, config)
+}
+
+/// Connection-based persister so callers already holding the DB lock can write
+/// the canonical config without re-entering the mutex.
+pub fn persist_jarvis_config_conn(
+    conn: &rusqlite::Connection,
+    config: &JarvisConfig,
+) -> Result<(), String> {
     let mut config = config.clone();
     normalize_jarvis_config(&mut config);
 
@@ -269,23 +322,22 @@ pub fn persist_jarvis_config(db: &AppDb, config: &JarvisConfig) -> Result<(), St
         ("agents_root", config.agents_root.clone()),
     ];
 
-    {
-        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-
-        for (key, value) in &pairs {
-            conn.execute(
+    for (key, value) in &pairs {
+        conn.execute(
                 "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
                 rusqlite::params![key, value],
             )
             .map_err(|e| format!("Failed to save setting '{}': {}", key, e))?;
-        }
     }
 
     // Project the canonical config onto the Bun-readable file. `save_jarvis_config`
     // in jarvis/mod.rs deep-merges onto the existing file, so nested keys the Bun
     // server owns survive a UI save (replacing the previous wholesale overwrite,
     // which could clobber `compaction.*`, `surface_temperatures`, etc.).
+    // In unit-test mode we skip the filesystem side effect so tests cannot
+    // corrupt the developer's real config.
+    #[cfg(not(test))]
     crate::jarvis::save_jarvis_config(&config)?;
 
     Ok(())
@@ -386,5 +438,13 @@ mod tests {
             migrate_file_config_into_sqlite_if_needed(&db).expect("migrate"),
             false
         );
+    }
+
+    #[test]
+    fn set_setting_rejects_unknown_key() {
+        let db = mem_db();
+        let err =
+            set_setting_value(&db, "unknown_key", "value").expect_err("unknown key should fail");
+        assert!(err.contains("unknown_setting"));
     }
 }

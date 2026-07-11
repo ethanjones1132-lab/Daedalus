@@ -367,7 +367,7 @@ describe("ToolRuntime permission policy", () => {
       makeExecutionContext("chat", cfg),
     );
     expect(result.is_error).toBe(true);
-    expect(result.error_code).toBe("approval_unavailable");
+    expect(result.error_code).toBe("approval_required");
     expect(handlerRan).toBe(false);
   });
 
@@ -478,6 +478,21 @@ describe("ToolRuntime permission policy", () => {
     expect(result.is_error).toBe(false);
     expect(result.output).toBe("ran");
   });
+
+  test("dangerous interactive tool requires an approval decision by default", async () => {
+    const runtime = createToolRuntime();
+    const cfg = makeToolsCfg({ sandbox_mode: "strict", interactive_approval: true, require_approval: [] });
+    runtime.register(
+      makeDefWithFlags("shell_execute", { dangerous: true, requires_approval: false }),
+      async () => "unexpected",
+    );
+    const result = await runtime.execute(
+      { id: "d1", name: "shell_execute", arguments: { command: "echo safe" } },
+      makeExecutionContext("chat", cfg),
+    );
+    expect(result.is_error).toBe(true);
+    expect(result.error_code).toBe("approval_required");
+  });
 });
 
 // ─── Track B: blocking approval callback ──────────────────────────────────────
@@ -532,7 +547,7 @@ describe("ToolRuntime approval callback", () => {
     expect(result.error).toMatch(/reject|denied|approval/i);
   });
 
-  test("requestApproval receives the call id, name, and arguments", async () => {
+  test("requestApproval receives the call id, name, arguments, and policy source", async () => {
     const runtime = createToolRuntime();
     const cfg = cfgWithInteractiveApproval();
     let seen: any = null;
@@ -547,6 +562,7 @@ describe("ToolRuntime approval callback", () => {
     expect(seen.call_id).toBe("a3");
     expect(seen.name).toBe("gated_info");
     expect(seen.arguments).toEqual({ path: "/x" });
+    expect(seen.policy_source).toBe("tool_requires_approval");
   });
 
   test("allow-policy tools never invoke requestApproval", async () => {

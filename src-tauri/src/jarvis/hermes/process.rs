@@ -141,16 +141,14 @@ impl HermesProcess {
             command.env(k, v);
         }
         let mut child = command.spawn().map_err(BridgeError::Io)?;
-        let stdin = child.stdin.take().ok_or_else(|| {
-            BridgeError::Io(std::io::Error::other(
-                "child stdin not captured",
-            ))
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            BridgeError::Io(std::io::Error::other(
-                "child stdout not captured",
-            ))
-        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| BridgeError::Io(std::io::Error::other("child stdin not captured")))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| BridgeError::Io(std::io::Error::other("child stdout not captured")))?;
 
         *self.writer.lock().await = Some(stdin);
         *self.child.lock().await = Some(child);

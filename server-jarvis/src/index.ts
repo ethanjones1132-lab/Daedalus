@@ -16,13 +16,8 @@ import { loadConfig, saveConfig, saveConfigWithValidation, normalizeConfig, Inva
 import type { JarvisConfig, OllamaConfig, SurfaceType } from "./config";
 import { Database } from "bun:sqlite";
 import { buildLearningPrompt, buildReviewPrompt, buildCodebaseAuditPrompt, buildFootballAuditPrompt } from "./cron-prompts";
-import {
-  handleListAgents,
-  handleGetAgent,
-  handleActivateAgent,
-  handleDeactivateAgent,
-  handleScanAgents,
-} from "./agent-routes";
+import { createLifecycleService } from "./agent-lifecycle";
+import { handleAgentRequest } from "./agent-routes";
 import { effectiveOllamaUrl, checkOllamaHealth, checkOllamaModelSupportsTools, resolveWindowsHostIP, selectInstalledOllamaModel } from "./ollama";
 import { streamClaudeCli, isClaudeCliAvailable, compactTurnHistoryForCli } from "./claude-cli";
 import { ReasoningParser, stripReasoningFromText, type ReasoningEvent } from "./reasoning";
@@ -40,11 +35,13 @@ import type { OpenRouterCostInfo } from "./openrouter";
 import { resolveProviderTarget, providerChatUrl, providerHeaders } from "./providers";
 import { recordInference, inferenceMetricsSnapshot, backendForProvider, type Backend } from "./inference-metrics";
 import { createApprovalRegistry } from "./approval-registry";
+import { createDiscordAdapter, SqliteDeliveryReceiptStore } from "./channels/discord";
 
 // One process-level approval registry: the chat surface emits
 // `tool_approval_request` SSE events and awaits decisions here.
 // The UI resolves them via POST /tool/decision.
 const approvalRegistry = createApprovalRegistry();
+const discordReceiptStore = new SqliteDeliveryReceiptStore();
 import type { ToolCall } from "./tool-types";
 import {
   buildTextToolInstructions,
@@ -63,6 +60,7 @@ import {
 } from "./tool-runtime";
 import type { ToolRuntime, ExecutionContext } from "./tool-runtime";
 import { registerStandardBundles } from "./bundles-registry";
+import { deprecatedSessionsPostResponse } from "./session-authority";
 import { searchWeb } from "./web-bundle";
 import { getSessionState, clearSessionState } from "./interactive-bundle";
 import { StreamSession, VisibleTextPipe } from "./stream-emitter";
@@ -89,6 +87,10 @@ import { AgentPool, firstTokenTimeoutFor, formatPoolDiversity } from "./orchestr
 import { excludedModelKeys } from "./model-failure-memory";
 import { PipelineExecutor } from "./orchestration/pipeline";
 import type { PipelineProgressState, PipelineRecursionEvent } from "./orchestration/pipeline";
+import { ConductorBus } from "./orchestration/conductor-bus";
+import type { ConductorDirective } from "./orchestration/conductor-bus";
+import { LiveConductor } from "./orchestration/conductor";
+import type { StageName } from "./orchestration/coordinator";
 import {
   classifyTurnRequirements,
   inheritRequirementForContinuation,
@@ -105,13 +107,14 @@ import { runPipelineWithReplanning } from "./orchestration/replan-loop";
 import { buildBoundedHistoryBlock } from "./orchestration/context-budget";
 import { SessionReplanCounter } from "./orchestration/replan-telemetry";
 import { conductorLearning, outcomeCollector, selfTuningProposer, SelfTuningStore } from "./self-tuning/mod";
-import { conductorCacheSnapshot } from "./orchestration/conductor-metrics";
+import { conductorCacheSnapshot, conductorDirectiveSnapshot, recordConductorDirective } from "./orchestration/conductor-metrics";
 import {
   computeCandidatePerformance,
   distillSkillCandidate,
   evaluateSkillPromotion,
   listSkillCandidates,
   loadSkillCandidate,
+  promoteCandidates,
   promoteSkillCandidate,
   resolveSkillsForTurn,
   runGroundingJudge,
@@ -536,6 +539,9 @@ function agentsRootPath(): string {
 }
 
 const cliSessionMap = new Map<string, string>(); // appSessionId → Claude CLI session ID for --resume
+
+/** Process-wide agent lifecycle service. Scans the configured agents root on demand. */
+const agentLifecycle = createLifecycleService(agentsRootPath());
 
 function resolveConfig(configOverride?: Partial<JarvisConfig> | null): JarvisConfig {
   return configOverride ? normalizeConfig(configOverride) : loadConfig();
@@ -1079,27 +1085,104 @@ async function drainStreamJarvisResponse(resp: Response): Promise<{ output: stri
 }
 
 /** Non-streaming cron dispatch — matches cron_scheduler.rs JSON contract. */
-async function runCronInference(body: Record<string, unknown>): Promise<{ success: boolean; output: string; error?: string }> {
+async function runCronInference(body: Record<string, unknown>): Promise<{
+  success: boolean;
+  output: string;
+  error?: string;
+  execution_evidence?: {
+    run_id: string;
+    status: "success" | "failed" | "cancelled" | "timeout";
+    started_at: string;
+    finished_at: string;
+    acceptance_result?: string;
+    error_code?: string;
+  };
+}> {
+  const run_id = crypto.randomUUID();
+  const started_at = new Date().toISOString();
   if (String(body.job_id ?? "") === INFERENCE_FEEDBACK_CRON_JOB_ID) {
     const refreshed = await refreshInferenceFeedback();
+    const finished_at = new Date().toISOString();
+    const status: "success" | "failed" = refreshed.success ? "success" : "failed";
     return {
       success: refreshed.success,
       output: refreshed.output || (refreshed.success
         ? `Applied ${refreshed.applied ?? 0} inference feedback adjustment(s).`
         : ""),
       error: refreshed.error,
+      execution_evidence: {
+        run_id,
+        status,
+        started_at,
+        finished_at,
+        acceptance_result: refreshed.output || status,
+        error_code: refreshed.error ? "refresh_failed" : undefined,
+      },
     };
   }
   const prompt = String(body.prompt ?? "");
-  if (!prompt.trim()) return { success: false, output: "", error: "prompt required" };
+  if (!prompt.trim()) {
+    return {
+      success: false,
+      output: "",
+      error: "prompt required",
+      execution_evidence: {
+        run_id,
+        status: "failed",
+        started_at,
+        finished_at: new Date().toISOString(),
+        acceptance_result: "prompt required",
+        error_code: "missing_prompt",
+      },
+    };
+  }
   const sessionId = String(body.session_id ?? `cron_${crypto.randomUUID()}`);
   try {
     const resp = await streamJarvis(prompt, sessionId, { surface: "cron" });
     const { output, error } = await drainStreamJarvisResponse(resp);
-    if (error) return { success: false, output, error };
-    return { success: true, output };
+    const finished_at = new Date().toISOString();
+    if (error) {
+      return {
+        success: false,
+        output,
+        error,
+        execution_evidence: {
+          run_id,
+          status: "failed",
+          started_at,
+          finished_at,
+          acceptance_result: error,
+          error_code: "inference_failed",
+        },
+      };
+    }
+    return {
+      success: true,
+      output,
+      execution_evidence: {
+        run_id,
+        status: "success",
+        started_at,
+        finished_at,
+        acceptance_result: output.slice(0, 500),
+      },
+    };
   } catch (e: any) {
-    return { success: false, output: "", error: e?.message ?? String(e) };
+    const finished_at = new Date().toISOString();
+    const message = e?.message ?? String(e);
+    return {
+      success: false,
+      output: "",
+      error: message,
+      execution_evidence: {
+        run_id,
+        status: "failed",
+        started_at,
+        finished_at,
+        acceptance_result: message,
+        error_code: "exception",
+      },
+    };
   }
 }
 
@@ -1332,11 +1415,19 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               call_id: req.call_id,
               name: req.name,
               arguments: req.arguments,
+              policy_source: req.policy_source,
               session_id: sessionId,
             })}\n\n`,
           ),
         );
-        return approvalRegistry.request(req.call_id);
+        return approvalRegistry.request({
+          call_id: req.call_id,
+          tool_name: req.name,
+          arguments: req.arguments,
+          policy_source: req.policy_source,
+          session_id: sessionId,
+          surface: "chat",
+        });
       };
 
       // ── Orchestrator path (PAMO-SET Phase 2) ─────────────────────
@@ -2111,6 +2202,17 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         orchestratorAgentRunId = agentRunId;
         selfTuningProposer.initializeTunedConfigs();
         outcomeCollector.startAgentRun(agentRunId, sessionId, contextMessage, route.task_type, executablePipeline);
+        if (route.routing_parse_fallback) {
+          await writer.write(encoder.encode(`data: ${JSON.stringify({
+            type: "fallback_notice",
+            stage: "coordinator",
+            reason: "routing_parse_fallback",
+            model: route.conductor_model,
+            source: route.conductor_source,
+            session_id: sessionId,
+            run_id: agentRunId,
+          })}\n\n`));
+        }
         const conductorRunId = conductorLearning.recordRouting({
           agentRunId,
           sessionId,
@@ -2167,7 +2269,17 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             ],
           },
         );
-        const executor = new PipelineExecutor(callModel, runtime, ctx);
+        // Request-scoped conductor wiring (Task 11). A fresh bus + live conductor
+        // per turn guarantees isolation: a timeout/abort in one request can never
+        // leak handlers or abort handles into another request.
+        const conductorBus = new ConductorBus();
+        const liveConductor = new LiveConductor(
+          callModel,
+          conductorBus,
+          agentPool,
+          cfg.orchestrator.conductor.supervision,
+        );
+        const executor = new PipelineExecutor(callModel, runtime, ctx, { bus: conductorBus, live: liveConductor });
         const onOrchestratorStateChange = async (state: PipelineProgressState) => {
           // Stream stage progress back to client — "conductor_replan" (B-02)
           // rides the same event type as an internal, non-user-facing status.
@@ -2175,6 +2287,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             type: "orchestrator_stage",
             stage: state.stage,
             status: state.status,
+            ...(state.detail ? { detail: state.detail } : {}),
             session_id: sessionId
           })}\n\n`));
         };
@@ -2197,36 +2310,62 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               session_id: sessionId
             })}\n\n`));
           },
+          onDirective: async (directive: ConductorDirective, stage: StageName) => {
+            recordConductorDirective({
+              ts: Date.now(),
+              session_id: sessionId,
+              stage,
+              directive_type: directive.type,
+              reason: "reason" in directive ? directive.reason : undefined,
+              new_remaining: directive.type === "reroute" ? directive.newRemaining : undefined,
+              inject_for_stage: directive.type === "inject_context" ? directive.forStage : undefined,
+            });
+            await writer.write(encoder.encode(`data: ${JSON.stringify({
+              type: "conductor_directive",
+              directive,
+              stage,
+              session_id: sessionId,
+            })}\n\n`));
+          },
         };
+
         // Check the RAW route, not `executablePipeline` — normalizeRoute strips
         // conductor_replan markers before building the executable stage list,
         // so executablePipeline never contains it and checking that instead
         // would make this branch permanently unreachable.
-        const result = route.pipeline.includes("conductor_replan")
-          ? await runPipelineWithReplanning({
-              contextMessage,
-              initialDecision: route,
-              turnRequirement: turnReq.requirement,
-              coordinator,
-              routeOptions: {
+        let pipelineResult;
+        try {
+          pipelineResult = route.pipeline.includes("conductor_replan")
+            ? await runPipelineWithReplanning({
+                contextMessage,
+                initialDecision: route,
+                turnRequirement: turnReq.requirement,
+                coordinator,
+                routeOptions: {
+                  sessionId,
+                  rawMessage: message,
+                  history: turnHistory,
+                  lastOutcome: sessionMemory.getLastOutcome(sessionId),
+                  sessionMemoryHints: memoryHints,
+                },
+                executor,
+                agentRunId,
+                onStateChange: onOrchestratorStateChange,
+                baseOptions: pipelineOptions,
+                maxReplans: cfg.orchestrator.max_conductor_replans,
+                // B-04: hand the per-session counter the session id so the
+                // loop can enforce the per-session cap and persist a
+                // `replan_events` row per re-invocation.
+                sessionCounter: replanCounter,
                 sessionId,
-                rawMessage: message,
-                history: turnHistory,
-                lastOutcome: sessionMemory.getLastOutcome(sessionId),
-                sessionMemoryHints: memoryHints,
-              },
-              executor,
-              agentRunId,
-              onStateChange: onOrchestratorStateChange,
-              baseOptions: pipelineOptions,
-              maxReplans: cfg.orchestrator.max_conductor_replans,
-              // B-04: hand the per-session counter the session id so the
-              // loop can enforce the per-session cap and persist a
-              // `replan_events` row per re-invocation.
-              sessionCounter: replanCounter,
-              sessionId,
-            })
-          : await executor.execute(contextMessage, executablePipeline, agentRunId, onOrchestratorStateChange, pipelineOptions);
+              })
+            : await executor.execute(contextMessage, executablePipeline, agentRunId, onOrchestratorStateChange, pipelineOptions);
+        } finally {
+          // Always tear down the request-scoped conductor wiring so subscribers
+          // and abort handles cannot leak across turns/requests.
+          conductorBus.clear();
+        }
+        const result = pipelineResult;
 
         // Record metrics and propose tuning options
         const duration = Date.now() - runStartTime;
@@ -2251,8 +2390,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // success — that poisons the self-tuning signal. `completed:1` only means
         // the run finished; `outcome` records whether it actually succeeded.
         const trimmedAnswer = result.answer?.trim() || "";
+        // Persistence/training keep their historical three-way vocabulary;
+        // a user-visible partial answer is recorded as degraded, never as a
+        // success. The raw PipelineResult still retains `outcome: "partial"`
+        // for the stream contract and diagnostics.
         const runOutcome: "success" | "degraded" | "failed" =
-          result.outcome ?? (result.error || !trimmedAnswer ? "failed" : "success");
+          result.outcome === "partial"
+            ? "degraded"
+            : (result.outcome ?? (result.error || !trimmedAnswer ? "failed" : "success"));
         const finalOutputForLog = trimmedAnswer || result.error || `(no output: ${result.error_code ?? "empty_completion"})`;
         sessionMemory.recordPipelineOutcome(sessionId, {
           outcome: runOutcome,
@@ -2400,12 +2545,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             model: orchLastModel ?? (cfg.active_backend === "openrouter"
               ? (cfg.openrouter.model ?? "openrouter/free")
               : cfg.ollama.model),
-            ok: true,
+            ok: runOutcome === "success",
             latency_ms: duration,
             tokens_in: 0,
             tokens_out: 0,
           });
-          await session.finish(trimmedAnswer || result.answer);
+          await session.finish(trimmedAnswer || result.answer, result.outcome === "partial"
+            ? { subtype: "partial", code: result.error_code }
+            : undefined);
         }
         return;
       }
@@ -3111,7 +3258,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
           if (sessionCostInfo) {
             logOpenRouterCost(sessionCostInfo);
-            await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "cost_info", ...sessionCostInfo, session_id: sessionId })}\n\n`));
+            await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "cost_info", ...sessionCostInfo, tool_count: toolExecutionCount, session_id: sessionId })}\n\n`));
           }
           await session.finish(resultText);
           loopDone = true;
@@ -3459,7 +3606,7 @@ async function searchDuckDuckGo(query: string): Promise<Record<string, any>> {
   }
 }
 
-async function baseFetch(req: Request): Promise<Response> {
+export async function baseFetch(req: Request): Promise<Response> {
   const requestStart = performance.now();
   const path = new URL(req.url).pathname;
   const isNoisy = path === "/status" || path === "/health";
@@ -3513,19 +3660,56 @@ async function baseFetch(req: Request): Promise<Response> {
     if (path === "/health/conductor-cache") {
       return Response.json(conductorCacheSnapshot());
     }
+    if (path === "/health/conductor-directives") {
+      return Response.json(conductorDirectiveSnapshot());
+    }
+    if (path === "/channels/discord/receipts" && req.method === "GET") {
+      return Response.json({ receipts: discordReceiptStore.list() });
+    }
+    if (path === "/channels/discord/send" && req.method === "POST") {
+      const token = process.env.JARVIS_DISCORD_BOT_TOKEN?.trim();
+      if (!token) {
+        return Response.json({ ok: false, error: "discord_secret_unavailable" }, { status: 503 });
+      }
+      const body = await req.json().catch(() => ({}));
+      const channelId = typeof body?.channel_id === "string" ? body.channel_id.trim() : "";
+      const text = typeof body?.text === "string" ? body.text : "";
+      const correlationId = typeof body?.correlation_id === "string" && body.correlation_id.trim()
+        ? body.correlation_id.trim()
+        : crypto.randomUUID();
+      try {
+        const adapter = createDiscordAdapter({ token, channelId, receiptStore: discordReceiptStore });
+        const receipt = await adapter.send({ text, correlation_id: correlationId });
+        return Response.json({ ok: receipt.status === "delivered", receipt }, { status: receipt.status === "delivered" ? 200 : 502 });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return Response.json({ ok: false, error: message }, { status: 400 });
+      }
+    }
     if (path === "/skills/candidates" && req.method === "GET") {
       const status = new URL(req.url).searchParams.get("status") as "candidate" | "promoted" | "rejected" | null;
       return Response.json({ candidates: listSkillCandidates(status ?? undefined) });
     }
     if (path === "/skills/promote" && req.method === "POST") {
       const cfg = loadConfig();
-      const result = runSkillPromotionPass(cfg.orchestrator.skill_distillation);
-      return Response.json({
-        ok: true,
-        promoted: result.promoted,
-        rejected: result.rejected,
-        total_evaluated: result.total_evaluated,
-      });
+      const distillCfg = cfg.orchestrator.skill_distillation;
+      // Bulk promotion now requires a prior passing judge decision for every
+      // candidate. Default to an empty batch when distillation is disabled.
+      if (!distillCfg?.enabled) {
+        return Response.json({ ok: true, decisions: [] });
+      }
+      const candidateIds = listSkillCandidates("candidate").map((c) => c.id);
+      try {
+        const decisions = await promoteCandidates(
+          candidateIds,
+          makeCallModel(cfg, "orchestrator"),
+          distillCfg,
+        );
+        return Response.json({ ok: true, decisions });
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        return Response.json({ ok: false, error: "judge_required", detail: message }, { status: 428 });
+      }
     }
 
     // Per-candidate lifecycle (D5a): judge-gated promote/reject/demote/eval
@@ -3607,6 +3791,10 @@ async function baseFetch(req: Request): Promise<Response> {
       );
       return Response.json(perf);
     }
+    const agentResponse = handleAgentRequest(req, agentLifecycle);
+    if (agentResponse) {
+      return agentResponse;
+    }
     if (path === "/agents/pool" && req.method === "GET") {
       const poolCfg = loadConfig();
       const pool = new AgentPool(poolCfg.orchestrator?.agents ?? []);
@@ -3663,9 +3851,12 @@ async function baseFetch(req: Request): Promise<Response> {
       }
       return Response.json({ ok: true, cancelled: false });
     }
-    if (path === "/sessions" && req.method === "GET") return Response.json([]);
-    if (path === "/sessions" && req.method === "POST") return Response.json({ id: crypto.randomUUID(), name: (await req.json()).name || "New Session" });
-    if (path === "/sessions/delete" && req.method === "POST") return Response.json({ ok: true });
+    if (path === "/sessions" && (req.method === "GET" || req.method === "POST")) {
+      return deprecatedSessionsPostResponse();
+    }
+    if (path === "/sessions/delete" && req.method === "POST") {
+      return deprecatedSessionsPostResponse();
+    }
     if (path === "/bridge/start" && req.method === "GET") return Response.json({ ok: await startBridge() });
     if (path === "/bridge/stop" && req.method === "GET") return Response.json({ ok: await stopBridge() });
     if (path === "/status" && (req.method === "GET" || req.method === "POST")) {

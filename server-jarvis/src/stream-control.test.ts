@@ -1,10 +1,30 @@
 import { describe, expect, mock, test } from "bun:test";
 import {
   ActiveStreamRegistry,
+  collectTerminalEvents,
   createIdempotentReaderCancel,
   registerAbortHandler,
   resolveReadStopReason,
 } from "./stream-control";
+
+test("terminal smoke records exactly one terminal outcome", () => {
+  const events = collectTerminalEvents([
+    { type: "message_stop" },
+    { type: "result", subtype: "success", result: "ok" },
+  ]);
+
+  expect(events).toEqual([{ type: "result", subtype: "success", result: "ok" }]);
+});
+
+test("terminal smoke ignores late duplicate outcomes", () => {
+  const events = collectTerminalEvents([
+    { type: "result", subtype: "success", result: "first" },
+    { type: "error", code: "late_error" },
+    { type: "cancelled", reason: "late_cancel" },
+  ]);
+
+  expect(events).toEqual([{ type: "result", subtype: "success", result: "first" }]);
+});
 
 describe("ActiveStreamRegistry", () => {
   test("an older stream cannot release a newer stream for the same session", () => {

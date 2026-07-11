@@ -6,7 +6,11 @@
 // canonical ToolRuntime contract.
 
 import { describe, expect, it } from "bun:test";
-import { createCronRuntime, runCronRequest } from "./cron-runtime";
+import { tmpdir } from "os";
+import { mkdtempSync, rmSync } from "fs";
+import { join } from "path";
+import { createCronRuntime, runCronRequest, runCronWithRetries } from "./cron-runtime";
+import { createToolRuntime } from "./tool-runtime";
 import type { ProjectionSnapshot } from "./activation-boundary";
 import { defaultConfig } from "./config";
 import type { ToolDefinition } from "./tool-types";
@@ -151,5 +155,75 @@ describe("runCronRequest contract", () => {
     );
 
     expect(result.boundary.slug).toBe("boundary-pin");
+  });
+});
+
+// ── Retry/evidence contract pins ──
+// A cron run may hit transient failures (network blips, model rate limits,
+// flaky workspace tools). `runCronWithRetries` runs the same request with a
+// reusable ToolRuntime until it succeeds or exhausts its attempts, and it
+// records one `ExecutionEvidence` per attempt so the retry trail is auditable.
+describe("runCronWithRetries contract", () => {
+  it("reuses a stateful runtime across attempts and persists per-attempt evidence", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "cron-retry-"));
+    const cfg = { ...defaultConfig(), jarvis_path: tmp };
+
+    const runtime = createToolRuntime();
+    let calls = 0;
+    runtime.register(makeTool("flaky_ping"), async () => {
+      calls += 1;
+      if (calls === 1) {
+        throw new Error("transient first-attempt failure");
+      }
+      return "pong";
+    });
+
+    const evidence = await runCronWithRetries(
+      {
+        slug: "retry-test",
+        prompt: "ping until success",
+        tools: [{ id: "call-1", name: "flaky_ping", arguments: {} }],
+      },
+      cfg,
+      { maxAttempts: 3, retryDelayMs: 0, runtime },
+    );
+
+    expect(evidence).toHaveLength(2);
+    expect(evidence.map((e) => e.status)).toEqual(["failed", "success"]);
+    expect(calls).toBe(2);
+
+    // Each failed evidence is persisted before the next attempt begins.
+    for (const e of evidence) {
+      const persisted = Bun.file(join(tmp, "cron-evidence", `${e.run_id}.json`));
+      expect(await persisted.exists()).toBe(true);
+    }
+
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("exhausts maxAttempts when the tool keeps failing", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "cron-retry-exhaust-"));
+    const cfg = { ...defaultConfig(), jarvis_path: tmp };
+
+    const runtime = createToolRuntime();
+    runtime.register(makeTool("always_fails"), async () => {
+      throw new Error("persistent failure");
+    });
+
+    const evidence = await runCronWithRetries(
+      {
+        slug: "exhaust-test",
+        prompt: "doomed ping",
+        tools: [{ id: "call-1", name: "always_fails", arguments: {} }],
+      },
+      cfg,
+      { maxAttempts: 3, retryDelayMs: 0, runtime },
+    );
+
+    expect(evidence).toHaveLength(3);
+    expect(evidence.every((e) => e.status === "failed")).toBe(true);
+    expect(evidence[0]?.error_code).toBe("handler_error");
+
+    rmSync(tmp, { recursive: true, force: true });
   });
 });

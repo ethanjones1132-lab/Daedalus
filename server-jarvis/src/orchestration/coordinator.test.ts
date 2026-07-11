@@ -71,6 +71,20 @@ describe("Coordinator", () => {
     expect(decision.routing_parse_fallback).toBe(true);
   });
 
+  test("unparseable coordinator output preserves the selected model identity", async () => {
+    const coordinator = new Coordinator(async () => ({
+      content: "not json",
+      model: "deepseek-v4-pro",
+      _modelUsed: "deepseek-v4-pro",
+    }));
+
+    const decision = await coordinator.route("inspect README", { sessionId: "fallback-model-identity" });
+
+    expect(decision.routing_parse_fallback).toBe(true);
+    expect(decision.conductor_model).toBe("deepseek-v4-pro");
+    expect(decision.conductor_source).toBe("api");
+  });
+
   test("reuses the prior executor route when continuation output is unparseable", async () => {
     let calls = 0;
     const coordinator = new Coordinator(async () => ({

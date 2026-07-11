@@ -140,6 +140,104 @@ export function runSkillPromotionPass(
   return result;
 }
 
+export type SkillPromotionDecision = {
+  candidate_id: string;
+  judge_score: number;
+  decision: "promote" | "reject";
+  rationale: string;
+  /** Snapshot of the candidate JSON before promotion, used for rollback. */
+  rollback_revision_id?: string;
+};
+
+/**
+ * Bulk-promote only candidates that already have a passing judge decision.
+ * Unlike `runSkillPromotionPass` (heuristic-only), this gate refuses to act
+ * on any candidate whose `eval_score` is missing or below `min_judge_score`,
+ * ensuring scheduled/bulk promotion cannot bypass the semantic judge.
+ *
+ * Throws "judge_required" if any requested candidate lacks a passing judge
+ * decision, leaving all candidates untouched.
+ */
+export async function promoteCandidates(
+  ids: string[],
+  callModel: CallModelFn,
+  config: SkillDistillationConfig,
+  fetchSnapshot: SnapshotFetcher = defaultSnapshotFetcher,
+): Promise<SkillPromotionDecision[]> {
+  const minJudgeScore = config.min_judge_score ?? 0.75;
+
+  // Pre-flight: every candidate must have a passing judge decision. This is
+  // intentionally strict — a missing decision aborts the whole batch so an
+  // operator cannot accidentally promote an un-judged candidate through a
+  // bulk call.
+  const pending: { candidate: SkillCandidate; priorJson: string }[] = [];
+  for (const id of ids) {
+    const candidate = loadSkillCandidate(id);
+    if (!candidate) {
+      throw new Error(`judge_required: candidate ${id} not found`);
+    }
+    if (candidate.status !== "candidate") {
+      throw new Error(
+        `judge_required: candidate ${id} status is ${candidate.status}, expected candidate`,
+      );
+    }
+    const score = candidate.eval_score;
+    if (score === undefined || score < minJudgeScore) {
+      throw new Error(
+        `judge_required: candidate ${id} has eval_score ${score ?? "undefined"} < ${minJudgeScore}`,
+      );
+    }
+    pending.push({ candidate, priorJson: JSON.stringify(candidate) });
+  }
+
+  const decisions: SkillPromotionDecision[] = [];
+  for (const { candidate, priorJson } of pending) {
+    const result = await promoteSkillCandidate(candidate.id, callModel, config, fetchSnapshot);
+    if (!result.ok) {
+      // Re-evaluate after a fresh judge call failed: this is an infra issue,
+      // not a grounded rejection. Surface it as a reject decision but do not
+      // leave the candidate promoted.
+      if (result.error === "judge_unavailable") {
+        decisions.push({
+          candidate_id: candidate.id,
+          judge_score: candidate.eval_score ?? 0,
+          decision: "reject",
+          rationale: result.detail ?? "judge unavailable",
+        });
+        continue;
+      }
+      // For other hard errors (should not happen after pre-flight), treat as reject.
+      decisions.push({
+        candidate_id: candidate.id,
+        judge_score: candidate.eval_score ?? 0,
+        decision: "reject",
+        rationale: result.detail ?? result.error ?? "unknown",
+      });
+      continue;
+    }
+
+    const finalScore = result.candidate?.eval_score ?? candidate.eval_score ?? 0;
+    if (result.candidate?.status === "promoted") {
+      decisions.push({
+        candidate_id: candidate.id,
+        judge_score: finalScore,
+        decision: "promote",
+        rationale: "passed judge and heuristic gates",
+        rollback_revision_id: priorJson,
+      });
+    } else {
+      decisions.push({
+        candidate_id: candidate.id,
+        judge_score: finalScore,
+        decision: "reject",
+        rationale: result.candidate?.rejection_detail ?? "failed promotion gates",
+      });
+    }
+  }
+
+  return decisions;
+}
+
 // ═══════════════════════════════════════════════════════════════
 // D2 (organism loop v1): judge-gated promotion. The heuristic gates above
 // are a cheap pre-screen; a candidate that clears them still has to ground

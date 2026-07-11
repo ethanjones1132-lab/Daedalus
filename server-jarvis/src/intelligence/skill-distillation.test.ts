@@ -10,6 +10,7 @@ import {
   runSkillPromotionPass,
   buildGroundingRubric,
   promoteSkillCandidate,
+  promoteCandidates,
   computeCandidatePerformance,
   runGroundingJudge,
 } from "./skill-promotion";
@@ -660,6 +661,86 @@ describe("skill distillation (Track C)", () => {
 
     test("returns null for a missing candidate", () => {
       expect(updateSkillCandidateEval("does_not_exist", 0.5, [])).toBeNull();
+    });
+  });
+
+  describe("promoteCandidates (bulk/scheduled judge-gated promotion)", () => {
+    const bulkCfg = {
+      enabled: true,
+      min_confidence: 0.5,
+      promotion_eval_delta: 0.02,
+      max_candidates: 50,
+      min_judge_score: 0.75,
+    };
+
+    function passingCallModel(): CallModelFn {
+      return async (messages) => {
+        const userMsg = messages.find((m) => m.role === "user")?.content ?? "";
+        const rubricLines = userMsg.split("Rubric items")[1] ?? "";
+        const items = [...rubricLines.matchAll(/^- (.+)$/gm)].map((m) => m[1]);
+        return { content: JSON.stringify({ covered: items, missed: [] }) };
+      };
+    }
+
+    test("bulk promotion refuses a candidate without a passing judge decision", async () => {
+      saveSkillCandidate({
+        id: "candidate-1",
+        name: "candidate-1",
+        description: "x",
+        trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: ["mutation_verb", "read_verb"] },
+        body: "## Conductor worker guidance\nRead the file first. ".repeat(20),
+        source_run_ids: ["run_for_candidate_1"],
+        confidence: 0.9,
+        status: "candidate",
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+      await expect(promoteCandidates(["candidate-1"], passingCallModel(), bulkCfg, () => null))
+        .rejects.toThrow("judge_required");
+    });
+
+    test("bulk promotion promotes a candidate with a passing prior judge decision", async () => {
+      saveSkillCandidate({
+        id: "candidate-2",
+        name: "candidate-2",
+        description: "x",
+        trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: ["mutation_verb", "read_verb"] },
+        body: "## Conductor worker guidance\nRead the file first. ".repeat(20),
+        source_run_ids: ["run_for_candidate_2"],
+        confidence: 0.9,
+        status: "candidate",
+        eval_score: 1.0,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+      const fetcher = (runId: string) =>
+        runId === "run_for_candidate_2" ? { worker_instructions: { executor: "Read first." } } : null;
+      const decisions = await promoteCandidates(["candidate-2"], passingCallModel(), bulkCfg, fetcher);
+      expect(decisions).toHaveLength(1);
+      expect(decisions[0].candidate_id).toBe("candidate-2");
+      expect(decisions[0].decision).toBe("promote");
+      expect(decisions[0].judge_score).toBe(1);
+      expect(decisions[0].rollback_revision_id).toBeTruthy();
+      const reloaded = loadSkillCandidate("candidate-2");
+      expect(reloaded?.status).toBe("promoted");
+    });
+
+    test("bulk promotion rejects a candidate whose prior judge score is below threshold", async () => {
+      saveSkillCandidate({
+        id: "candidate-3",
+        name: "candidate-3",
+        description: "x",
+        trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: ["mutation_verb", "read_verb"] },
+        body: "## Conductor worker guidance\nRead the file first. ".repeat(20),
+        source_run_ids: ["run_for_candidate_3"],
+        confidence: 0.9,
+        status: "candidate",
+        eval_score: 0.5,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+      await expect(promoteCandidates(["candidate-3"], passingCallModel(), bulkCfg, () => null))
+        .rejects.toThrow("judge_required");
     });
   });
 

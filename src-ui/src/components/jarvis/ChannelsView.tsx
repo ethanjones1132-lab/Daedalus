@@ -41,6 +41,16 @@ interface Channel {
   updated_at: string;
 }
 
+interface DeliveryReceipt {
+  message_id: string;
+  channel: string;
+  status: 'queued' | 'delivered' | 'failed';
+  retry_count: number;
+  error_code?: string;
+  correlation_id: string;
+  finished_at: string;
+}
+
 const CHANNEL_TYPES = [
   { value: 'webhook', label: 'Webhook' },
   { value: 'discord', label: 'Discord' },
@@ -51,6 +61,7 @@ const CHANNEL_TYPES = [
   { value: 'http', label: 'HTTP Endpoint' },
   { value: 'websocket', label: 'WebSocket' },
 ];
+const BUN_URL = 'http://127.0.0.1:19877';
 
 // ── Helpers ────────────────────────────────────────────────────
 
@@ -157,6 +168,7 @@ export function ChannelsView() {
   const [error, setError] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<Channel | null>(null);
+  const [receipts, setReceipts] = useState<DeliveryReceipt[]>([]);
   const { success, error: toastError } = useToast();
 
   const fetchChannels = useCallback(async (opts?: { silent?: boolean }) => {
@@ -165,6 +177,13 @@ export function ChannelsView() {
     try {
       const list = await invoke<Channel[]>('list_channels');
       setChannels(list);
+      const receiptResponse = globalThis.fetch
+        ? await globalThis.fetch(`${BUN_URL}/channels/discord/receipts`).catch(() => null)
+        : null;
+      if (receiptResponse?.ok) {
+        const body = await receiptResponse.json() as { receipts?: DeliveryReceipt[] };
+        setReceipts(body.receipts ?? []);
+      }
     } catch (e) {
       setError(String(e));
     } finally {
@@ -265,6 +284,7 @@ export function ChannelsView() {
           <ul className="space-y-2">
             {channels.map((c) => {
               const connected = isConnected(c);
+              const latestReceipt = c.type === 'discord' ? receipts[0] : undefined;
               return (
                 <li key={c.id}>
                   <GlassCard className="p-3">
@@ -297,6 +317,7 @@ export function ChannelsView() {
                     </div>
                     <div className="flex items-center gap-2 mt-1.5 text-[10px] font-mono text-bone/30">
                       <span>last used {formatTimestamp(c.last_used)}</span>
+                      {latestReceipt && <span className={latestReceipt.status === 'delivered' ? 'text-emerald-300/70' : 'text-amber-300/70'}>delivery {latestReceipt.status} · retries {latestReceipt.retry_count}</span>}
                       <span className="ml-auto">added {formatTimestamp(c.created_at)}</span>
                     </div>
                   </GlassCard>

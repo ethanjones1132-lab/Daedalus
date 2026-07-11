@@ -172,8 +172,8 @@ export default function ControlCenterView() {
     async (profile: ModelProfile) => {
       setProfiles((prev) => prev.map((p) => ({ ...p, is_active: p.id === profile.id })));
       try {
-        await invoke<boolean>('set_active_profile', { id: profile.id });
-        success(`Activated ${profile.name}`);
+        const effective = await invoke<{ provider: string; model: string; source: string; applied_at: string; restart_required: boolean }>('set_active_profile', { id: profile.id });
+        success(`Activated ${profile.name} · ${effective.provider}/${effective.model}`);
         await fetchAll();
       } catch (e) {
         toastError(String(e), 'Activation failed');

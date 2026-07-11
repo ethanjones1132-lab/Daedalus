@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { conductorCacheVariant } from './SystemHealthView';
+import { conductorCacheVariant, formatRuntimeProvenance } from './SystemHealthView';
 
 describe('conductorCacheVariant', () => {
   // The Track A-02 acceptance criterion is >80% prefix reuse on a 3-turn
@@ -33,5 +33,16 @@ describe('conductorCacheVariant', () => {
     expect(conductorCacheVariant(Number.POSITIVE_INFINITY)).toBe('error');
     expect(conductorCacheVariant(Number.NEGATIVE_INFINITY)).toBe('error');
     expect(conductorCacheVariant(-0.1)).toBe('error');
+  });
+});
+
+describe('formatRuntimeProvenance', () => {
+  it('shows version, short server SHA, and effective model', () => {
+    expect(formatRuntimeProvenance({ version: '3.0.0', git_sha: '0ca584bb611fbb77e16d45c83bedf74c1d160846', model: 'openrouter/free' }))
+      .toBe('3.0.0 · 0ca584bb611f · openrouter/free');
+  });
+
+  it('reports unavailable runtime health explicitly', () => {
+    expect(formatRuntimeProvenance(null)).toBe('Runtime health unavailable');
   });
 });

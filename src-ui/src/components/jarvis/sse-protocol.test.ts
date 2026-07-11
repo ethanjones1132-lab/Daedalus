@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   createUnknownFrameReporter,
   InactivityWatchdog,
+  isTerminalStageStatus,
   isPassiveSseFrame,
   parseSseDataLine,
   readToolResultTruncation,
@@ -32,6 +33,15 @@ class FakeTimeoutScheduler implements TimeoutScheduler {
 }
 
 describe('Jarvis SSE protocol', () => {
+  it('treats completed, failed, timed_out, cancelled, and partial stages as terminal', () => {
+    expect(isTerminalStageStatus('completed')).toBe(true);
+    expect(isTerminalStageStatus('failed')).toBe(true);
+    expect(isTerminalStageStatus('timed_out')).toBe(true);
+    expect(isTerminalStageStatus('cancelled')).toBe(true);
+    expect(isTerminalStageStatus('partial')).toBe(true);
+    expect(isTerminalStageStatus('running')).toBe(false);
+  });
+
   it('parses data frames and ignores comments, empty data, and DONE', () => {
     expect(parseSseDataLine('data: {"type":"init","session_id":"s1"}')).toEqual({
       type: 'init',

@@ -637,8 +637,8 @@ pub fn sync_distilled_skill_candidates(db: State<AppDb>) -> Result<usize, String
             continue;
         }
         let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        let file: DistilledSkillCandidateFile =
-            serde_json::from_str(&raw).map_err(|e| format!("Invalid candidate {}: {}", path.display(), e))?;
+        let file: DistilledSkillCandidateFile = serde_json::from_str(&raw)
+            .map_err(|e| format!("Invalid candidate {}: {}", path.display(), e))?;
 
         let enabled = if file.status == "promoted" { 1 } else { 0 };
         let metadata = serde_json::json!({

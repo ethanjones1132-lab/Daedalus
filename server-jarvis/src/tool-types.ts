@@ -55,6 +55,7 @@ export type ToolErrorCode =
   | "unknown_tool"
   | "missing_args"
   | "policy_denied"
+  | "approval_required"
   | "approval_rejected"
   | "approval_unavailable"
   | "handler_error";

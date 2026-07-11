@@ -12,6 +12,7 @@ import { registerMetaBundle } from "./meta-bundle";
 import { registerTaskBundle } from "./task-bundle";
 import { registerMcpClientBundle } from "./mcp-client-bundle";
 import { registerInteractiveBundle } from "./interactive-bundle";
+import { registerGitMetadataBundle } from "./git-metadata-bundle";
 
 /** Register the standard Jarvis tool bundles on a fresh runtime. */
 export function registerStandardBundles(runtime: ToolRuntime): void {
@@ -22,4 +23,5 @@ export function registerStandardBundles(runtime: ToolRuntime): void {
   registerTaskBundle(runtime);
   registerMcpClientBundle(runtime);
   registerInteractiveBundle(runtime);
+  registerGitMetadataBundle(runtime);
 }

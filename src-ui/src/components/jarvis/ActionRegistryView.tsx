@@ -23,6 +23,15 @@ interface ActionRegistrySummary {
   alerts: number;
 }
 
+interface ExecutionEvidence {
+  run_id: string;
+  status: string;
+  acceptance_result?: string;
+  error_code?: string;
+  started_at?: string;
+  finished_at?: string;
+}
+
 interface RegistryAction {
   id: string;
   project: string;
@@ -41,6 +50,7 @@ interface RegistryAction {
   next_due?: string;
   escalated?: boolean;
   escalation_note?: string;
+  execution_evidence?: ExecutionEvidence;
   updated_at: string;
 }
 
@@ -123,6 +133,16 @@ export default function ActionRegistryView() {
     }
   };
 
+  const handleDispatch = async (id: string) => {
+    try {
+      await invoke('dispatch_action', { actionId: id });
+      success('Action dispatched and verified.', 'Action Dispatched');
+      await fetchData();
+    } catch (e) {
+      toastError(`Failed to dispatch action: ${e}`, 'Dispatch Error');
+    }
+  };
+
   if (loading) return <LoadingState />;
   if (error) return <ErrorState error={error} />;
 
@@ -170,6 +190,7 @@ export default function ActionRegistryView() {
                   action={action}
                   onApprove={(id) => void handleUpdateApproval(id, 'approved')}
                   onWaive={(id) => void handleUpdateApproval(id, 'waived')}
+                  onDispatch={(id) => void handleDispatch(id)}
                 />
               ))}
             </AnimatedList>
@@ -190,6 +211,7 @@ export default function ActionRegistryView() {
                   action={action}
                   onApprove={(id) => void handleUpdateApproval(id, 'approved')}
                   onWaive={(id) => void handleUpdateApproval(id, 'waived')}
+                  onDispatch={(id) => void handleDispatch(id)}
                 />
               ))}
             </AnimatedList>
@@ -204,11 +226,16 @@ function ActionCard({
   action,
   onApprove,
   onWaive,
+  onDispatch,
 }: {
   action: RegistryAction;
   onApprove: (id: string) => void;
   onWaive: (id: string) => void;
+  onDispatch: (id: string) => void;
 }) {
+  const canDispatch = action.status !== 'done' &&
+    (!action.approval_required || action.approval_status === 'approved' || action.approval_status === 'waived');
+
   return (
     <motion.div layout>
       <GlassCard glowOnHover className="!p-4">
@@ -225,6 +252,11 @@ function ActionCard({
                 </Pill>
               )}
               {action.escalated && <Pill variant="error">escalated</Pill>}
+              {action.execution_evidence && (
+                <Pill variant={action.execution_evidence.status === 'verified' ? 'success' : 'warning'}>
+                  {action.execution_evidence.status}
+                </Pill>
+              )}
             </div>
             <h4 className="text-sm font-semibold text-bone mb-1">{action.title}</h4>
             <p className="text-xs text-bone-muted leading-relaxed">{action.description}</p>
@@ -233,6 +265,11 @@ function ActionCard({
               {action.next_due && <span>due {action.next_due}</span>}
               <span>updated {action.updated_at}</span>
             </div>
+            {action.execution_evidence?.acceptance_result && (
+              <p className="text-[10px] font-mono text-bone-dim mt-2 line-clamp-2">
+                {action.execution_evidence.acceptance_result}
+              </p>
+            )}
             {action.escalation_note && (
               <p className="text-[11px] text-amber-200/80 mt-2 font-mono">{action.escalation_note}</p>
             )}
@@ -251,6 +288,17 @@ function ActionCard({
                   className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider rounded border border-iron/30 bg-iron/5 text-bone-dim hover:bg-iron/15 transition-all duration-150 cursor-pointer"
                 >
                   Waive
+                </button>
+              </div>
+            )}
+            {canDispatch && (
+              <div className="flex items-center gap-2 mt-3">
+                <button
+                  type="button"
+                  onClick={() => onDispatch(action.id)}
+                  className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider rounded border border-cyan-neon/30 bg-cyan-neon/5 text-cyan-glow hover:bg-cyan-neon/15 transition-all duration-150 cursor-pointer"
+                >
+                  ▶ Dispatch
                 </button>
               </div>
             )}

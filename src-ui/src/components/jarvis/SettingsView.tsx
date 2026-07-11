@@ -10,6 +10,14 @@ import {
   useToast,
 } from '../ui';
 
+const KNOWN_SETTING_KEYS = new Set([
+  'version', 'active_backend', 'ollama', 'openrouter', 'claude_cli', 'tools',
+  'reasoning', 'companion', 'orchestrator', 'system_prompt', 'mode',
+  'prizepicks_prompt', 'temperature', 'surface_temperatures', 'max_tokens',
+  'top_p', 'top_k', 'bridge_port', 'bridge_enabled', 'jarvis_path', 'compaction',
+  'profiles', 'active_profile', 'api_sports_key', 'agents_root',
+]);
+
 export function SettingsView() {
   const [settings, setSettings] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
@@ -47,6 +55,10 @@ export function SettingsView() {
   };
 
   const saveKey = async (key: string) => {
+    if (!KNOWN_SETTING_KEYS.has(key)) {
+      toastError(`Unknown setting key: ${key}`, 'Save rejected');
+      return;
+    }
     setSaving(prev => new Set(prev).add(key));
     try {
       await invoke('set_setting', { key, value: editing[key] });

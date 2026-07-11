@@ -323,7 +323,9 @@ mod tests {
         let all = fetch_agents(&conn).unwrap();
         assert_eq!(all.len(), 1);
 
-        let one = fetch_agent(&conn, &created.id).unwrap().expect("agent exists");
+        let one = fetch_agent(&conn, &created.id)
+            .unwrap()
+            .expect("agent exists");
         assert_eq!(one.id, created.id);
         assert_eq!(one.name, "Scout");
         assert_eq!(one.model, "qwen2.5-coder:7b");
@@ -379,7 +381,10 @@ mod tests {
         bind_channel_row(&conn, &a.id, "chan-1").unwrap();
         bind_channel_row(&conn, &a.id, "chan-1").unwrap(); // INSERT OR IGNORE — no dup
         bind_channel_row(&conn, &a.id, "chan-2").unwrap();
-        assert_eq!(channel_bindings(&conn, &a.id).unwrap(), vec!["chan-1", "chan-2"]);
+        assert_eq!(
+            channel_bindings(&conn, &a.id).unwrap(),
+            vec!["chan-1", "chan-2"]
+        );
 
         unbind_channel_row(&conn, &a.id, "chan-1").unwrap();
         assert_eq!(channel_bindings(&conn, &a.id).unwrap(), vec!["chan-2"]);

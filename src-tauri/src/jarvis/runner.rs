@@ -1,7 +1,119 @@
+use crate::commands::sessions::persist_terminal_run_at;
 use crate::jarvis::types::*;
 use crate::wsl::wsl_openclaw;
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
+
+/// Accumulates the evidence needed to persist one durable `session_runs` record.
+/// The Bun server is the source of truth for run identity and outcome, but the
+/// native SQLite store is the only durable authority; this struct bridges the
+/// SSE frame stream to a single terminal write.
+#[derive(Debug, Default)]
+struct TerminalRunAccumulator {
+    run_id: Option<String>,
+    selected_model: Option<String>,
+    token_count: i64,
+    tool_count: i64,
+    tool_use_count: i64,
+    outcome: Option<String>,
+    partial_output: Option<String>,
+    cancelled_reason: Option<String>,
+}
+
+impl TerminalRunAccumulator {
+    fn observe_event(&mut self, evt: &serde_json::Value) {
+        match evt.get("type").and_then(|t| t.as_str()) {
+            Some("agent_run_id") => {
+                self.run_id = evt
+                    .get("agent_run_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+            }
+            Some("cost_info") => {
+                self.selected_model = evt.get("model").and_then(|v| v.as_str()).map(String::from);
+                self.token_count = evt
+                    .get("total_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                self.tool_count = evt.get("tool_count").and_then(|v| v.as_i64()).unwrap_or(0);
+            }
+            Some("tool_use") | Some("tool_call") => {
+                self.tool_use_count += 1;
+            }
+            Some("result") => {
+                let subtype = evt
+                    .get("subtype")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("success");
+                let code = evt.get("code").and_then(|v| v.as_str());
+                let is_error = evt
+                    .get("is_error")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                self.outcome = Some(map_terminal_outcome(subtype, code, is_error));
+                if subtype == "partial" || code == Some("stage_timeout") {
+                    self.partial_output =
+                        evt.get("result").and_then(|v| v.as_str()).map(String::from);
+                }
+            }
+            Some("cancelled") => {
+                self.outcome = Some("cancelled".to_string());
+                self.cancelled_reason = Some("user_stop".to_string());
+            }
+            Some("error") => {
+                // Timeout failures are emitted as structured `error` frames by
+                // Bun (there is no trailing `result` frame on this path). Keep
+                // the durable outcome typed so timeout telemetry is not flattened
+                // into a generic failure.
+                let code = evt.get("code").and_then(|v| v.as_str());
+                self.outcome = Some(map_error_outcome(code));
+                if code.map(is_timeout_code).unwrap_or(false) {
+                    self.partial_output = evt
+                        .get("partial_output")
+                        .or_else(|| evt.get("result"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn is_timeout_code(code: &str) -> bool {
+    matches!(
+        code,
+        "stage_timeout"
+            | "first_token_timeout"
+            | "stream_idle_timeout"
+            | "visible_progress_timeout"
+            | "turn_deadline_exceeded"
+    )
+}
+
+fn map_error_outcome(code: Option<&str>) -> String {
+    if code.map(is_timeout_code).unwrap_or(false) {
+        "timed_out".to_string()
+    } else {
+        "failed".to_string()
+    }
+}
+
+fn map_terminal_outcome(subtype: &str, code: Option<&str>, is_error: bool) -> String {
+    if is_error {
+        return "failed".to_string();
+    }
+    if code == Some("stage_timeout") {
+        return "timed_out".to_string();
+    }
+    match subtype {
+        "success" => "success".to_string(),
+        "partial" => "partial".to_string(),
+        "error" => "failed".to_string(),
+        _ => "success".to_string(),
+    }
+}
 
 /// Send a chat turn to the native Bun server (the JARVIS_API) and relay its SSE
 /// stream back to the UI as `jarvis://token` / `jarvis://done` / `jarvis://error`
@@ -18,6 +130,7 @@ pub fn run_jarvis_message(
     session_id: String,
     message: String,
     history: Vec<serde_json::Value>,
+    db_path: PathBuf,
 ) -> Result<(), String> {
     let effective_session_id = if session_id.is_empty() {
         uuid::Uuid::new_v4().to_string()
@@ -110,11 +223,20 @@ pub fn run_jarvis_message(
         let reader = BufReader::new(resp);
         let mut relay = SseRelay::new();
         let mut terminated = false;
+        let mut run_acc = TerminalRunAccumulator::default();
         for line in reader.lines() {
             let line = match line {
                 Ok(l) => l,
                 Err(_) => break,
             };
+            if let Some(payload) = line.trim().strip_prefix("data:") {
+                let payload = payload.trim();
+                if !payload.is_empty() && payload != "[DONE]" {
+                    if let Ok(evt) = serde_json::from_str::<serde_json::Value>(payload) {
+                        run_acc.observe_event(&evt);
+                    }
+                }
+            }
             match relay.handle_line(&line) {
                 SseFrameOutcome::Continue => {}
                 SseFrameOutcome::Token(text) => {
@@ -287,6 +409,28 @@ pub fn run_jarvis_message(
                     );
                 }
             }
+        }
+
+        // Persist the terminal run outcome to the native SQLite authority. This is
+        // the single durable record for the turn; the Bun server must never own a
+        // parallel writable session table.
+        if let (Some(run_id), Some(outcome)) = (run_acc.run_id.as_ref(), run_acc.outcome.as_ref()) {
+            let tool_count = if run_acc.tool_count > 0 {
+                run_acc.tool_count
+            } else {
+                run_acc.tool_use_count
+            };
+            let _ = persist_terminal_run_at(
+                &db_path,
+                &sid,
+                run_id,
+                outcome,
+                run_acc.selected_model.as_deref(),
+                run_acc.token_count,
+                tool_count,
+                run_acc.cancelled_reason.as_deref(),
+                run_acc.partial_output.as_deref(),
+            );
         }
 
         // Guarantee the UI's streaming spinner is always cleared, even if the stream
@@ -1070,6 +1214,101 @@ mod sse_tests {
                 run_id: "run_abc123".to_string(),
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod terminal_run_tests {
+    use super::*;
+
+    fn temp_migrated_db() -> std::path::PathBuf {
+        let db_path =
+            std::env::temp_dir().join(format!("jarvis_runner_test_{}.db", uuid::Uuid::new_v4()));
+        let conn = rusqlite::Connection::open(&db_path).expect("open temp db");
+        crate::db::run_migrations(&conn).expect("run migrations");
+        db_path
+    }
+
+    #[test]
+    fn accumulator_maps_success_result() {
+        let mut acc = TerminalRunAccumulator::default();
+        acc.observe_event(&serde_json::json!({"type": "agent_run_id", "agent_run_id": "run-1"}));
+        acc.observe_event(&serde_json::json!({"type": "cost_info", "model": "deepseek-v4-pro", "total_tokens": 42, "tool_count": 3}));
+        acc.observe_event(
+            &serde_json::json!({"type": "result", "subtype": "success", "result": "final answer"}),
+        );
+        assert_eq!(acc.run_id, Some("run-1".to_string()));
+        assert_eq!(acc.selected_model, Some("deepseek-v4-pro".to_string()));
+        assert_eq!(acc.token_count, 42);
+        assert_eq!(acc.tool_count, 3);
+        assert_eq!(acc.outcome, Some("success".to_string()));
+        assert_eq!(acc.partial_output, None);
+    }
+
+    #[test]
+    fn accumulator_maps_stage_timeout_to_timed_out() {
+        let mut acc = TerminalRunAccumulator::default();
+        acc.observe_event(&serde_json::json!({"type": "cost_info", "model": "deepseek-v4-pro", "total_tokens": 12, "tool_count": 1}));
+        acc.observe_event(&serde_json::json!({"type": "result", "subtype": "partial", "code": "stage_timeout", "result": "partial answer"}));
+        assert_eq!(acc.outcome, Some("timed_out".to_string()));
+        assert_eq!(acc.partial_output, Some("partial answer".to_string()));
+    }
+
+    #[test]
+    fn accumulator_maps_timeout_error_frame_to_timed_out() {
+        let mut acc = TerminalRunAccumulator::default();
+        acc.observe_event(&serde_json::json!({
+            "type": "error",
+            "code": "first_token_timeout",
+            "error": "model did not start responding",
+            "partial_output": ""
+        }));
+        assert_eq!(acc.outcome, Some("timed_out".to_string()));
+    }
+
+    #[test]
+    fn accumulator_falls_back_to_counting_tool_use_frames() {
+        let mut acc = TerminalRunAccumulator::default();
+        acc.observe_event(&serde_json::json!({"type": "tool_use", "name": "read"}));
+        acc.observe_event(&serde_json::json!({"type": "tool_use", "name": "grep"}));
+        acc.observe_event(
+            &serde_json::json!({"type": "result", "subtype": "success", "result": "ok"}),
+        );
+        assert_eq!(acc.tool_count, 0);
+        assert_eq!(acc.tool_use_count, 2);
+    }
+
+    #[test]
+    fn accumulator_persists_cancelled_run() {
+        let db_path = temp_migrated_db();
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open temp db");
+            conn.execute(
+                "INSERT INTO sessions (id, agent_id, title, backend, model, created_at, updated_at) VALUES (?1, 'main', 'test', 'ollama', 'qwen3:8b', datetime('now'), datetime('now'))",
+                ["s1"],
+            )
+            .expect("insert session");
+        }
+        let mut acc = TerminalRunAccumulator::default();
+        acc.observe_event(
+            &serde_json::json!({"type": "agent_run_id", "agent_run_id": "run-cancel"}),
+        );
+        acc.observe_event(&serde_json::json!({"type": "cancelled"}));
+        let (run_id, outcome) = (acc.run_id.unwrap(), acc.outcome.unwrap());
+        let record = persist_terminal_run_at(
+            &db_path,
+            "s1",
+            &run_id,
+            &outcome,
+            None,
+            0,
+            0,
+            acc.cancelled_reason.as_deref(),
+            None,
+        )
+        .expect("persist");
+        assert_eq!(record.outcome, "cancelled");
+        assert_eq!(record.cancelled_reason.as_deref(), Some("user_stop"));
     }
 }
 

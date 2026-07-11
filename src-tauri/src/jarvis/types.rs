@@ -5,8 +5,7 @@ use std::collections::HashMap;
 // ── Jarvis Config ──
 // ═══════════════════════════════════════════════════════════════
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 pub enum JarvisBackend {
     #[serde(rename = "ollama")]
     #[default]
@@ -16,7 +15,6 @@ pub enum JarvisBackend {
     #[serde(rename = "claude_cli")]
     ClaudeCli,
 }
-
 
 impl std::fmt::Display for JarvisBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -339,17 +339,36 @@ pub async fn jarvis_restart_proxy(
     Err("claude_cli_proxy: spawned but not listening on :19878".to_string())
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CommitSessionResult {
+    pub commit_id: String,
+}
+
+fn stable_commit_id(session_id: &str) -> String {
+    // Deterministic id so repeated commits of the same session report the
+    // same commit_id without needing a dedicated commit table.
+    format!("session-commit-{session_id}")
+}
+
 #[tauri::command]
-pub async fn jarvis_review_session(_session_id: String) -> Result<Value, String> {
-    Ok(serde_json::json!({ "reviewed": false, "note": "stub" }))
+pub async fn jarvis_review_session(
+    session_id: String,
+    db: tauri::State<'_, crate::db::AppDb>,
+) -> Result<Value, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    crate::jarvis::memory::engine::review_session(&conn, &session_id)
 }
 
 #[tauri::command]
 pub async fn jarvis_commit_session_end(
-    _session_id: String,
-    _summary: Option<String>,
-) -> Result<(), String> {
-    Ok(())
+    session_id: String,
+    db: tauri::State<'_, crate::db::AppDb>,
+) -> Result<CommitSessionResult, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    crate::jarvis::memory::engine::commit_session_end(&conn, &session_id)?;
+    Ok(CommitSessionResult {
+        commit_id: stable_commit_id(&session_id),
+    })
 }
 
 #[tauri::command]
@@ -406,3 +425,62 @@ pub async fn jarvis_recall_cold_memory(
 }
 
 // `update_token_count` canonical impl: commands/sessions.rs
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{run_migrations, AppDb};
+    use rusqlite::Connection;
+    use std::sync::Mutex;
+
+    fn mem_db() -> AppDb {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        run_migrations(&conn).expect("run migrations");
+        AppDb {
+            conn: Mutex::new(conn),
+            db_path: std::path::PathBuf::from(":memory:"),
+        }
+    }
+
+    #[test]
+    fn commit_session_end_is_idempotent_for_same_session() {
+        let db = mem_db();
+        let sid = "s1";
+        {
+            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            crate::jarvis::memory::engine::commit_session_end(&conn, sid).unwrap();
+        }
+        let first = stable_commit_id(sid);
+        {
+            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            crate::jarvis::memory::engine::commit_session_end(&conn, sid).unwrap();
+        }
+        let second = stable_commit_id(sid);
+        assert_eq!(first, second, "commit_id must be stable across calls");
+    }
+
+    #[test]
+    fn review_session_returns_structured_result() {
+        let db = mem_db();
+        let sid = "s2";
+        let now = chrono::Utc::now().to_rfc3339();
+        {
+            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            conn.execute(
+                "INSERT INTO session_memory (session_id, summary, current_goal, decisions, next_steps, updated_at)
+                 VALUES (?, 'Test summary', 'Test goal', '[]', '[]', ?)",
+                rusqlite::params![sid, now],
+            )
+            .expect("seed session memory");
+            let result = crate::jarvis::memory::engine::review_session(&conn, sid).unwrap();
+            assert_eq!(result.get("reviewed").and_then(|v| v.as_bool()), Some(true));
+            assert!(
+                result
+                    .get("memories_created")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    > 0
+            );
+        }
+    }
+}

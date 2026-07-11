@@ -5,7 +5,7 @@
 // stored as TEXT (ISO 8601) for portability, or INTEGER (unix
 // epoch) where noted. JSON columns use TEXT with CHECK(json_valid(...)).
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
     // Enable WAL mode for better concurrent read performance and other optimizations
@@ -56,6 +56,23 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS idx_sessions_agent_id   ON sessions(agent_id);
         CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
         CREATE INDEX IF NOT EXISTS idx_sessions_archived   ON sessions(archived);
+
+        -- One durable terminal record per native session turn. This is
+        -- separate from messages so cancellation/partial output survives
+        -- even when no assistant message was persisted.
+        CREATE TABLE IF NOT EXISTS session_runs (
+            run_id            TEXT PRIMARY KEY,
+            session_id        TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            outcome           TEXT NOT NULL CHECK(outcome IN ('success','partial','failed','timed_out','cancelled')),
+            selected_model    TEXT,
+            token_count       INTEGER NOT NULL DEFAULT 0,
+            tool_count        INTEGER NOT NULL DEFAULT 0,
+            cancelled_reason  TEXT,
+            partial_output    TEXT,
+            started_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            finished_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_runs_session_id ON session_runs(session_id);
 
         -- Messages
         CREATE TABLE IF NOT EXISTS messages (
@@ -174,7 +191,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
             top_p           REAL NOT NULL DEFAULT 1.0,
             system_prompt   TEXT NOT NULL DEFAULT '',
             is_active       INTEGER NOT NULL DEFAULT 0,
-            metadata        TEXT CHE
+            metadata        TEXT CHECK(metadata IS NULL OR json_valid(metadata)),
             created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
             updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
@@ -358,7 +375,73 @@ fn run_enterprise_memory_migrations(conn: &Connection) -> Result<(), rusqlite::E
     Ok(())
 }
 
+/// If an older migration left model_profiles with a malformed metadata
+/// column and no created_at, rebuild the table while preserving user data.
+fn fix_model_profiles_schema_if_needed(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let metadata_type: Option<String> = conn
+        .query_row(
+            "SELECT type FROM pragma_table_info('model_profiles') WHERE name = 'metadata'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let has_created_at: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('model_profiles') WHERE name = 'created_at'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)?;
+
+    let needs_fix = metadata_type
+        .as_deref()
+        .map(|t| t.contains("CHE") || !has_created_at)
+        .unwrap_or(false);
+
+    if !needs_fix {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        r#"
+        DROP INDEX IF EXISTS idx_model_profiles_active;
+        DROP INDEX IF EXISTS idx_model_profiles_provider;
+        ALTER TABLE model_profiles RENAME TO model_profiles_old;
+        CREATE TABLE model_profiles (
+            id              TEXT PRIMARY KEY,
+            name            TEXT NOT NULL UNIQUE,
+            provider        TEXT NOT NULL DEFAULT 'ollama',
+            model           TEXT NOT NULL DEFAULT '',
+            api_base        TEXT NOT NULL DEFAULT '',
+            api_key         TEXT NOT NULL DEFAULT '',
+            max_tokens      INTEGER NOT NULL DEFAULT 4096,
+            temperature     REAL NOT NULL DEFAULT 0.7,
+            top_p           REAL NOT NULL DEFAULT 1.0,
+            system_prompt   TEXT NOT NULL DEFAULT '',
+            is_active       INTEGER NOT NULL DEFAULT 0,
+            metadata        TEXT CHECK(metadata IS NULL OR json_valid(metadata)),
+            created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        INSERT INTO model_profiles (id, name, provider, model, api_base, api_key, max_tokens, temperature, top_p, system_prompt, is_active, created_at, updated_at)
+        SELECT id, name, provider, model, api_base, api_key, max_tokens, temperature, top_p, system_prompt, is_active,
+               COALESCE(created_at, strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+               COALESCE(updated_at, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        FROM model_profiles_old;
+        DROP TABLE model_profiles_old;
+        CREATE INDEX idx_model_profiles_active ON model_profiles(is_active);
+        CREATE INDEX idx_model_profiles_provider ON model_profiles(provider);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn apply_schema_patches(conn: &Connection) -> Result<(), rusqlite::Error> {
+    // Recover from a malformed model_profiles schema introduced in an earlier
+    // migration (metadata column was truncated, dropping the created_at column).
+    // If detected, rebuild the table and copy the surviving columns.
+    fix_model_profiles_schema_if_needed(conn)?;
+
     add_column_if_missing(
         conn,
         "memory",
@@ -471,6 +554,52 @@ fn apply_schema_patches(conn: &Connection) -> Result<(), rusqlite::Error> {
         "improvement_score REAL NOT NULL DEFAULT 0.0",
     )?;
 
+    // v3.2 — Cron execution evidence: one durable evidence record per cron run,
+    // mirroring the Bun `ExecutionEvidence` shape and surfacing retries/cancellations.
+    add_column_if_missing(
+        conn,
+        "cron_runs",
+        "execution_evidence",
+        "execution_evidence TEXT CHECK(execution_evidence IS NULL OR json_valid(execution_evidence))",
+    )?;
+
+    // v3.2 — Drive Brain cold cache: local mirror of offloaded cold memory content
+    // keyed by Drive file ID, with fetch provenance and TTL for bounded retrieval.
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS cold_cache (
+            source_id       TEXT PRIMARY KEY,
+            content         TEXT NOT NULL DEFAULT '',
+            fetched_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            redaction_state TEXT NOT NULL DEFAULT 'none',
+            expires_at      TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_cold_cache_expires_at ON cold_cache(expires_at);
+        "#,
+    )?;
+
+    // v3.2 — Live Conductor: directive audit trail (mirrors the server-jarvis
+    // SelfTuningStore schema in server-jarvis/src/self-tuning/store.ts; the
+    // native process owns the migration so the table is present whether the
+    // Bun server creates its own self-tuning DB or shares this one).
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS conductor_directives (
+            id TEXT PRIMARY KEY,
+            agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+            stage TEXT NOT NULL,
+            directive_type TEXT NOT NULL,
+            reason TEXT,
+            new_remaining_json TEXT,
+            inject_note TEXT,
+            inject_for_stage TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_conductor_directives_agent_run_id
+            ON conductor_directives(agent_run_id);
+        "#,
+    )?;
+
     conn.execute_batch(
         r#"
         CREATE INDEX IF NOT EXISTS idx_memory_status ON memory(status);
@@ -513,7 +642,7 @@ fn apply_schema_patches(conn: &Connection) -> Result<(), rusqlite::Error> {
             event_type  TEXT NOT NULL,
             actor       TEXT NOT NULL DEFAULT 'system',
             before_json TEXT,
-   
+            after_json  TEXT,
             reason      TEXT NOT NULL DEFAULT '',
             confidence  REAL NOT NULL DEFAULT 0.0,
             session_id  TEXT,
@@ -522,6 +651,10 @@ fn apply_schema_patches(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS idx_memory_events_memory_id ON memory_events(memory_id);
         CREATE INDEX IF NOT EXISTS idx_memory_events_created_at ON memory_events(created_at);
         CREATE INDEX IF NOT EXISTS idx_memory_events_id_created ON memory_events(memory_id, created_at DESC);
+
+        -- Patch: older schemas created memory_events without the after_json column.
+        -- SQLite does not let us ALTER the CREATE TABLE, but add_column_if_missing
+        -- works because the table now exists.
 
         CREATE TABLE IF NOT EXISTS memory_runs (
             id            TEXT PRIMARY KEY,
@@ -561,6 +694,9 @@ fn apply_schema_patches(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS idx_prompt_deltas_enabled ON prompt_deltas(enabled);
         "#,
     )?;
+
+    // Patch: older schemas created memory_events without the after_json column.
+    add_column_if_missing(conn, "memory_events", "after_json", "after_json TEXT")?;
 
     Ok(())
 }

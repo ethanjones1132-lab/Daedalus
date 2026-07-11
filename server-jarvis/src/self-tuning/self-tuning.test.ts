@@ -126,4 +126,60 @@ describe("Self tuning", () => {
     expect(proposals.length).toBeGreaterThan(0);
     expect(store.getPendingProposals().map((p) => p.proposal_type)).toContain("temperature");
   });
+
+  test("collector records conductor directives for audit / replay", () => {
+    const store = new SelfTuningStore(TEST_DB_PATH);
+    const collector = new SessionOutcomeCollector(store);
+    const runId = "run_dir_audit";
+
+    store.insertAgentRun({
+      id: runId,
+      session_id: "session_dir",
+      user_request: "x",
+      task_type: "general",
+      pipeline: JSON.stringify(["planner", "executor"]),
+      completed: 0,
+    });
+
+    collector.recordDirective({
+      id: "dir_1",
+      agent_run_id: runId,
+      stage: "executor",
+      directive_type: "reroute",
+      reason: "tool errors hit threshold",
+      new_remaining_json: JSON.stringify(["re-enter:planner", "executor", "synthesizer"]),
+    });
+    collector.recordDirective({
+      id: "dir_2",
+      agent_run_id: runId,
+      stage: "executor",
+      directive_type: "abort_stage",
+      reason: "stalled",
+    });
+    collector.recordDirective({
+      id: "dir_3",
+      agent_run_id: runId,
+      stage: "planner",
+      directive_type: "inject_context",
+      reason: "missing info",
+      inject_for_stage: "executor",
+      inject_note: "use the read_file tool from the workspace root",
+    });
+    collector.recordDirective({
+      id: "dir_4",
+      agent_run_id: runId,
+      stage: "synthesizer",
+      directive_type: "continue",
+    });
+
+    const rows = store.getConductorDirectives(runId);
+    expect(rows).toHaveLength(4);
+    expect(rows[0].directive_type).toBe("reroute");
+    expect(JSON.parse(rows[0].new_remaining_json!)).toContain("re-enter:planner");
+    expect(rows[1].directive_type).toBe("abort_stage");
+    expect(rows[1].reason).toBe("stalled");
+    expect(rows[2].inject_for_stage).toBe("executor");
+    expect(rows[2].inject_note).toContain("read_file");
+    expect(rows[3].directive_type).toBe("continue");
+  });
 });

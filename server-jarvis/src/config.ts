@@ -208,6 +208,18 @@ export interface ConductorConfig {
   kv_persist: boolean;
   /** KV backend implementation (Ollama message-prefix reuse today). */
   kv_backend: "ollama";
+  /** Live-conductor supervision policy (request-scoped, never global). */
+  supervision: ConductorSupervisionConfig;
+}
+
+/** Request-scoped live-conductor supervision knobs. */
+export interface ConductorSupervisionConfig {
+  /** Hard timeout for each supervisory inference call. */
+  supervision_timeout_ms: number;
+  /** Re-enter planner after this many consecutive tool errors in one stage. */
+  max_tool_errors_before_reroute: number;
+  /** When false, low-complexity turns skip the supervisory model call. */
+  supervise_low_complexity: boolean;
 }
 
 /** Skill distillation from successful orchestrator trajectories (Track C). */
@@ -458,6 +470,11 @@ export function defaultConfig(): JarvisConfig {
         persist_sessions: true,
         kv_persist: true,
         kv_backend: "ollama",
+        supervision: {
+          supervision_timeout_ms: 5000,
+          max_tool_errors_before_reroute: 3,
+          supervise_low_complexity: false,
+        },
       },
       session_memory: {
         enabled: true,
@@ -835,4 +852,59 @@ export function validateAgentsRootPath(pathStr: string): { valid: boolean; error
   } catch (e: any) {
     return { valid: false, error: e.message, resolved_path: resolved };
   }
+}
+
+
+/** Known top-level setting keys that may be written through the raw settings surface. */
+const KNOWN_SETTING_KEYS = new Set([
+  "version",
+  "active_backend",
+  "ollama",
+  "openrouter",
+  "opencode_zen",
+  "opencode_go",
+  "claude_cli",
+  "tools",
+  "reasoning",
+  "companion",
+  "orchestrator",
+  "system_prompt",
+  "mode",
+  "prizepicks_prompt",
+  "temperature",
+  "surface_temperatures",
+  "max_tokens",
+  "top_p",
+  "top_k",
+  "bridge_port",
+  "bridge_enabled",
+  "jarvis_path",
+  "compaction",
+  "profiles",
+  "active_profile",
+  "api_sports_key",
+  "agents_root",
+]);
+
+export interface SettingMutation {
+  key: string;
+  value: unknown;
+}
+
+/**
+ * Validate and serialize a single raw setting mutation. Rejects unknown keys
+ * so the settings UI cannot silently store untyped garbage in the canonical
+ * SQLite settings table.
+ */
+export function normalizeSettingMutation(mutation: SettingMutation): { key: string; value: string } {
+  if (!KNOWN_SETTING_KEYS.has(mutation.key)) {
+    throw new Error(`unknown_setting: ${mutation.key}`);
+  }
+  const value =
+    mutation.value === null || mutation.value === undefined
+      ? ""
+      : typeof mutation.value === "string"
+        ? mutation.value
+        : JSON.stringify(mutation.value);
+  return { key: mutation.key, value };
 }

@@ -168,7 +168,10 @@ mod tests {
         let v = serde_json::to_value(&msg).expect("serialize");
         assert_eq!(v.get("jsonrpc").and_then(|x| x.as_str()), Some("2.0"));
         assert_eq!(v.get("id").and_then(|x| x.as_str()), Some("j1"));
-        assert_eq!(v.get("method").and_then(|x| x.as_str()), Some("skill.invoke"));
+        assert_eq!(
+            v.get("method").and_then(|x| x.as_str()),
+            Some("skill.invoke")
+        );
         assert_eq!(v.pointer("/params/a").and_then(|x| x.as_i64()), Some(1));
     }
 
@@ -179,7 +182,10 @@ mod tests {
             IncomingMessage::Response { id, result, error } => {
                 assert_eq!(id, Rid("j1".to_string()));
                 assert!(error.is_none());
-                assert_eq!(result.unwrap().pointer("/ok").and_then(|v| v.as_bool()), Some(true));
+                assert_eq!(
+                    result.unwrap().pointer("/ok").and_then(|v| v.as_bool()),
+                    Some(true)
+                );
             }
             other => panic!("expected Response, got {other:?}"),
         }
@@ -203,7 +209,11 @@ mod tests {
     fn incoming_event_extracts_type_and_strips_envelope_keys() {
         let line = r#"{"jsonrpc":"2.0","method":"event","params":{"type":"gateway.ready","session_id":"s1","extra":42}}"#;
         match serde_json::from_str::<IncomingMessage>(line).expect("parse") {
-            IncomingMessage::Event { event_type, session_id, payload } => {
+            IncomingMessage::Event {
+                event_type,
+                session_id,
+                payload,
+            } => {
                 assert_eq!(event_type, "gateway.ready");
                 assert_eq!(session_id.as_deref(), Some("s1"));
                 // type/session_id stripped; domain payload preserved.

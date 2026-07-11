@@ -2048,6 +2048,83 @@ pub fn apply_deferred_review(
     Ok((mem_changed, skill_changed))
 }
 
+/// Review a session: derive durable memories from session memory and
+/// message history, then apply them through the deferred review path.
+/// Returns a machine-readable review result and is safe to call multiple
+/// times (subsequent calls are idempotent at the memory layer).
+pub fn review_session(conn: &Connection, session_id: &str) -> Result<Value, String> {
+    let sm = get_session_memory(conn, session_id)?;
+
+    let mut memories: Vec<Value> = Vec::new();
+    if let Some(sm) = &sm {
+        if !sm.current_goal.trim().is_empty() {
+            memories.push(json!({
+                "title": "Session goal",
+                "content": sm.current_goal.clone(),
+                "category": "general",
+            }));
+        }
+        if !sm.summary.trim().is_empty() {
+            memories.push(json!({
+                "title": "Session summary",
+                "content": sm.summary.clone(),
+                "category": "general",
+            }));
+        }
+    }
+
+    // Pull any user messages as extra review signal, but keep the review small
+    // and deterministic.
+    let user_messages: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT content FROM messages
+                 WHERE session_id = ? AND role = 'user'
+                 ORDER BY created_at ASC LIMIT 20",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([session_id], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+    let combined_user = user_messages
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if !combined_user.is_empty() {
+        memories.push(json!({
+            "title": "User turns",
+            "content": truncate(&combined_user, 1200),
+            "category": "user",
+        }));
+    }
+
+    if memories.is_empty() {
+        return Ok(json!({
+            "reviewed": true,
+            "session_id": session_id,
+            "memories_created": 0,
+            "skills_updated": 0,
+            "note": "no reviewable content",
+        }));
+    }
+
+    let review_json = json!({ "memories": memories, "skill_updates": [] });
+    let (mem_changed, skill_changed) =
+        apply_deferred_review(conn, session_id, &review_json.to_string())?;
+
+    Ok(json!({
+        "reviewed": true,
+        "session_id": session_id,
+        "memories_created": mem_changed,
+        "skills_updated": skill_changed,
+    }))
+}
+
 /// Session-end flush: commit any pending state. Called when a session
 /// ends (/new, app shutdown, context compression).
 pub fn commit_session_end(conn: &Connection, session_id: &str) -> Result<(), String> {
@@ -2266,13 +2343,17 @@ pub fn recall_cold_memory(conn: &Connection, id: &str) -> Result<Option<String>,
         "hot" | "warm" => Ok(Some(content)),
         "cold" => {
             if let Some(fid) = drive_file_id {
-                // Cold content is offloaded to Drive to keep the hot/warm DB lean.
-                // Drive *fetch* is deferred to Phase 2 (see docs/MASTER_PLAN.md). Be
-                // explicit instead of silently returning empty content for a memory
-                // that demonstrably exists — a silent None here looks like data loss.
+                // First, try the bounded local cold cache. This keeps recall fast
+                // and deterministic and avoids repeated Drive round-trips.
+                if let Some(cached) = get_cold_cache_entry(conn, &fid)? {
+                    return Ok(Some(cached.content));
+                }
+                // Cache miss: Drive fetch is required. Be explicit instead of
+                // silently returning empty content for a memory that demonstrably
+                // exists — a silent None here looks like data loss.
                 Err(format!(
-                    "Cold memory '{id}' is archived to Drive (file {fid}); offline \
-                     retrieval is deferred to Phase 2. Its searchable summary remains \
+                    "Cold memory '{id}' is archived to Drive (file {fid}); cache miss \
+                     — fetch from cold storage is required. Its searchable summary remains \
                      in the index."
                 ))
             } else if !content.is_empty() {
@@ -2284,6 +2365,75 @@ pub fn recall_cold_memory(conn: &Connection, id: &str) -> Result<Option<String>,
         }
         _ => Ok(None),
     }
+}
+
+/// Local cache entry for offloaded cold memory content.
+#[derive(Debug, Clone)]
+pub struct ColdCacheEntry {
+    pub source_id: String,
+    pub content: String,
+    pub fetched_at: String,
+    pub redaction_state: String,
+    pub expires_at: Option<String>,
+}
+
+/// Look up a cold-cache entry by Drive source ID. Returns None on cache miss or
+/// if the entry has expired.
+fn get_cold_cache_entry(conn: &Connection, source_id: &str) -> Result<Option<ColdCacheEntry>, String> {
+    let row: Option<ColdCacheEntry> = conn
+        .query_row(
+            "SELECT source_id, content, fetched_at, redaction_state, expires_at
+             FROM cold_cache WHERE source_id = ?",
+            [source_id],
+            |row| {
+                Ok(ColdCacheEntry {
+                    source_id: row.get(0)?,
+                    content: row.get(1)?,
+                    fetched_at: row.get(2)?,
+                    redaction_state: row.get(3)?,
+                    expires_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    let Some(entry) = row else { return Ok(None); };
+
+    if let Some(expires_at) = &entry.expires_at {
+        if let Ok(exp) = DateTime::parse_from_rfc3339(expires_at) {
+            if Utc::now() > exp.with_timezone(&Utc) {
+                return Ok(None);
+            }
+        }
+    }
+
+    Ok(Some(entry))
+}
+
+/// Write (or refresh) a cold-cache entry. `ttl_seconds` controls cache validity;
+/// pass None for an entry that never expires.
+pub fn cache_cold_content(
+    conn: &Connection,
+    source_id: &str,
+    content: &str,
+    redaction_state: &str,
+    ttl_seconds: Option<i64>,
+) -> Result<(), String> {
+    let fetched_at = now();
+    let expires_at = ttl_seconds.map(|secs| (Utc::now() + ChronoDuration::seconds(secs)).to_rfc3339());
+    conn.execute(
+        "INSERT INTO cold_cache (source_id, content, fetched_at, redaction_state, expires_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(source_id) DO UPDATE SET
+             content = excluded.content,
+             fetched_at = excluded.fetched_at,
+             redaction_state = excluded.redaction_state,
+             expires_at = excluded.expires_at",
+        params![source_id, content, fetched_at, redaction_state, expires_at],
+    )
+    .map_err(|e| format!("Failed to cache cold content: {}", e))?;
+    Ok(())
 }
 
 /// Serialize a memory entry to markdown for Drive archival.
@@ -2364,5 +2514,36 @@ mod tests {
         let (score, matched) = score_memory(&memory, &query_terms("rust memory"));
         assert!(score > 0.5);
         assert_eq!(matched.len(), 2);
+    }
+
+    #[test]
+    fn cold_recall_fetches_cached_drive_content_when_network_is_available() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::run_migrations(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO memory
+             (id, title, content, tags, category, tier, drive_file_id, status, updated_at, updated_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                "cold-1",
+                "Cold memory",
+                "",
+                "[]",
+                "reference",
+                "cold",
+                "drive-file-abc",
+                "active",
+                now(),
+                chrono::Utc::now().timestamp_millis(),
+            ],
+        )
+        .unwrap();
+
+        cache_cold_content(&conn, "drive-file-abc", "retrieved content", "none", Some(3600))
+            .unwrap();
+
+        let content = recall_cold_memory(&conn, "cold-1").unwrap().unwrap();
+        assert_eq!(content, "retrieved content");
     }
 }

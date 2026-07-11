@@ -77,7 +77,10 @@ fn deep_merge_obj(
 ) {
     for (k, v) in overlay {
         match (base.get_mut(&k), v) {
-            (Some(serde_json::Value::Object(base_inner)), serde_json::Value::Object(overlay_inner)) => {
+            (
+                Some(serde_json::Value::Object(base_inner)),
+                serde_json::Value::Object(overlay_inner),
+            ) => {
                 deep_merge_obj(base_inner, overlay_inner);
             }
             (slot, v) => {
@@ -154,8 +157,8 @@ pub fn save_companion_state(state: &serde_json::Value) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create companion dir: {}", e))?;
     }
-    let json = serde_json::to_string_pretty(state)
-        .map_err(|e| format!("serialize companion: {}", e))?;
+    let json =
+        serde_json::to_string_pretty(state).map_err(|e| format!("serialize companion: {}", e))?;
     fs::write(&path, json).map_err(|e| format!("write companion: {}", e))?;
     Ok(())
 }

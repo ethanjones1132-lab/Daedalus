@@ -197,17 +197,19 @@ export class StreamSession {
    * as if it were a real answer — which previously made auth failures look
    * like a silent stall.
    */
-  async finish(result: string, opts?: { isError?: boolean }): Promise<void> {
+  async finish(result: string, opts?: { isError?: boolean; subtype?: "success" | "error" | "partial"; code?: string }): Promise<void> {
     if (!this.noteOutcome()) return;
     if (!this.terminalSent) {
       this.terminalSent = true;
       await this.write(sseFrame({ type: "message_stop", session_id: this.sessionId }));
     }
     const isError = opts?.isError ?? false;
+    const subtype = opts?.subtype ?? (isError ? "error" : "success");
     await this.write(sseFrame({
       type: "result",
-      subtype: isError ? "error" : "success",
+      subtype,
       is_error: isError,
+      ...(opts?.code ? { code: opts.code } : {}),
       result,
       session_id: this.sessionId,
     }));

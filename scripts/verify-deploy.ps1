@@ -8,7 +8,8 @@
 param(
     [string]$deployDir = "$env:USERPROFILE\OneDrive\Desktop",
     [string]$repoRoot = "C:\Projects\home-base-recovered",
-    [string]$healthUrl = "http://localhost:19877/health"
+    [string]$healthUrl = "http://localhost:19877/health",
+    [string]$ExpectSha = ""
 )
 
 $ErrorActionPreference = 'Stop'
@@ -22,6 +23,11 @@ if (-not (Test-Path $manifestPath)) {
 
 $manifest = Get-Content $manifestPath | ConvertFrom-Json
 $gitSha = git -C $repoRoot rev-parse HEAD
+
+if (-not [string]::IsNullOrWhiteSpace($ExpectSha) -and $ExpectSha -ne $gitSha) {
+    Write-Error "EXPECTATION INVALID: requested SHA $ExpectSha != repo HEAD $gitSha"
+    exit 1
+}
 
 if ($manifest.git_sha -ne $gitSha) {
     Write-Error "DEPLOY STALE: manifest git_sha $($manifest.git_sha) != repo HEAD $gitSha"
@@ -86,5 +92,20 @@ if ($null -ne $health) {
         exit 1
     } else {
         Write-Host "Running server git_sha matches manifest ($runningSha)." -ForegroundColor Green
+        $listener = Get-NetTCPConnection -State Listen -LocalPort 19877 -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if (-not $listener) {
+            Write-Error "DEPLOY MISMATCH: /health responded but no listener was found on port 19877."
+            exit 1
+        }
+        $listenerProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$($listener.OwningProcess)"
+        $expectedIndex = [IO.Path]::GetFullPath((Join-Path $deployDir 'index.js'))
+        $commandLine = [string]$listenerProcess.CommandLine
+        if ([string]::IsNullOrWhiteSpace($commandLine) -or
+            $commandLine.IndexOf($expectedIndex, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+            Write-Error "DEPLOY MISMATCH: port 19877 is served by an unexpected command line: $commandLine"
+            exit 1
+        }
+        Write-Host "Listener provenance matches deployed index.js (PID $($listener.OwningProcess))." -ForegroundColor Green
     }
 }

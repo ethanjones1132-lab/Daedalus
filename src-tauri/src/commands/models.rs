@@ -7,7 +7,9 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
+use crate::commands::settings::{load_jarvis_config_conn, persist_jarvis_config_conn};
 use crate::db::AppDb;
+use crate::jarvis::types::{JarvisBackend, JarvisConfig};
 
 // ── Structs ─────────────────────────────────────────────────────
 
@@ -108,6 +110,127 @@ pub struct DiscoveredModel {
     pub default_top_p: Option<f64>,
 }
 
+// ── Effective runtime config ────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EffectiveRuntimeConfig {
+    pub provider: String,
+    pub model: String,
+    pub source: String,
+    pub applied_at: String,
+    pub restart_required: bool,
+}
+
+fn apply_profile_to_config(config: &mut JarvisConfig, profile: &ModelProfile) {
+    config.active_profile = profile.name.clone();
+    config.temperature = profile.temperature;
+    config.max_tokens = profile.max_tokens.max(0) as u32;
+    config.top_p = profile.top_p;
+    if !profile.system_prompt.is_empty() {
+        config.system_prompt = profile.system_prompt.clone();
+    }
+
+    if profile.engine == "claude_cli" {
+        config.active_backend = JarvisBackend::ClaudeCli;
+        config.claude_cli.model = Some(profile.model.clone());
+        config.claude_cli.enabled = true;
+        return;
+    }
+
+    match profile.provider.as_str() {
+        "openrouter" => {
+            config.active_backend = JarvisBackend::OpenRouter;
+            config.openrouter.model = profile.model.clone();
+            if !profile.api_base.is_empty() {
+                config.openrouter.base_url = profile.api_base.clone();
+            }
+            if !profile.api_key.is_empty() {
+                config.openrouter.api_key = profile.api_key.clone();
+            }
+        }
+        _ => {
+            config.active_backend = JarvisBackend::Ollama;
+            config.ollama.model = profile.model.clone();
+            if !profile.api_base.is_empty() {
+                config.ollama.base_url = profile.api_base.clone();
+            }
+        }
+    }
+}
+
+/// Atomically activate a model profile and project it onto the canonical runtime
+/// configuration. Returns the effective provider/model so the UI never has to
+/// infer it from profile labels.
+pub fn set_active_profile_and_reconcile(
+    db: &AppDb,
+    id: &str,
+) -> Result<EffectiveRuntimeConfig, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("failed to begin transaction: {e}"))?;
+
+    let profile: ModelProfile = tx
+        .query_row(
+            "SELECT id, name, provider, model, api_base, api_key, max_tokens,
+                    temperature, top_p, system_prompt, is_active, created_at, updated_at, engine
+             FROM model_profiles WHERE id = ?1",
+            [id],
+            |row| {
+                Ok(ModelProfile {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    provider: row.get(2)?,
+                    model: row.get(3)?,
+                    api_base: row.get(4)?,
+                    api_key: row.get(5)?,
+                    max_tokens: row.get(6)?,
+                    temperature: row.get(7)?,
+                    top_p: row.get(8)?,
+                    system_prompt: row.get(9)?,
+                    is_active: {
+                        let val: i64 = row.get(10)?;
+                        val != 0
+                    },
+                    created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
+                    engine: row.get(13)?,
+                })
+            },
+        )
+        .map_err(|e| format!("profile not found: {e}"))?;
+
+    tx.execute("UPDATE model_profiles SET is_active = 0", [])
+        .map_err(|e| format!("failed to clear active profile: {e}"))?;
+    tx.execute(
+        "UPDATE model_profiles SET is_active = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+        [id],
+    )
+    .map_err(|e| format!("failed to set active profile: {e}"))?;
+
+    let mut config = load_jarvis_config_conn(&tx)
+        .map_err(|e| format!("failed to load canonical config: {e}"))?;
+    apply_profile_to_config(&mut config, &profile);
+    persist_jarvis_config_conn(&tx, &config)
+        .map_err(|e| format!("failed to persist reconciled config: {e}"))?;
+
+    tx.commit()
+        .map_err(|e| format!("failed to commit profile activation: {e}"))?;
+
+    let provider = config.active_backend.to_string();
+    Ok(EffectiveRuntimeConfig {
+        provider: provider.clone(),
+        model: match config.active_backend {
+            JarvisBackend::Ollama => config.ollama.model.clone(),
+            JarvisBackend::OpenRouter => config.openrouter.model.clone(),
+            JarvisBackend::ClaudeCli => config.claude_cli.model.clone().unwrap_or_default(),
+        },
+        source: profile.name.clone(),
+        applied_at: chrono::Utc::now().to_rfc3339(),
+        restart_required: profile.engine == "claude_cli" && provider != "claude_cli",
+    })
+}
+
 // ── Commands ─────────────────────────────────────────────────────
 
 /// List all model profiles from the database
@@ -196,21 +319,14 @@ pub async fn get_active_profile(db: State<'_, AppDb>) -> Result<Option<ModelProf
     Ok(result)
 }
 
-/// Set a profile as active: first clears all is_active, then sets the given one
+/// Set a profile as active and reconcile the canonical runtime configuration.
+/// Returns the effective provider/model so the UI never infers it from labels.
 #[tauri::command]
-pub async fn set_active_profile(db: State<'_, AppDb>, id: String) -> Result<bool, String> {
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    // Clear all active flags
-    conn.execute("UPDATE model_profiles SET is_active = 0", [])
-        .map_err(|e| format!("DB update error: {}", e))?;
-    // Set the chosen one
-    let rows = conn
-        .execute(
-            "UPDATE model_profiles SET is_active = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
-            [&id],
-        )
-        .map_err(|e| format!("DB update error: {}", e))?;
-    Ok(rows > 0)
+pub async fn set_active_profile(
+    db: State<'_, AppDb>,
+    id: String,
+) -> Result<EffectiveRuntimeConfig, String> {
+    set_active_profile_and_reconcile(&db, &id)
 }
 
 /// Create a new model profile
@@ -486,5 +602,68 @@ pub async fn import_model(name: String) -> Result<bool, String> {
     } else {
         let err_text = resp.text().await.unwrap_or_default();
         Err(format!("Ollama pull failed: {}", err_text))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{run_migrations, AppDb};
+    use crate::jarvis::types::JarvisBackend;
+    use rusqlite::Connection;
+    use std::sync::Mutex;
+
+    fn mem_db() -> AppDb {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        run_migrations(&conn).expect("run migrations");
+        AppDb {
+            conn: Mutex::new(conn),
+            db_path: std::path::PathBuf::from(":memory:"),
+        }
+    }
+
+    fn insert_profile(db: &AppDb, name: &str, provider: &str, model: &str) -> String {
+        let conn = db.conn.lock().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO model_profiles (id, name, provider, model, api_base, max_tokens, temperature, top_p, system_prompt, is_active, engine, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, '', 4096, 0.7, 1.0, '', 0, 'native', ?5, ?5)",
+            rusqlite::params![&id, name, provider, model, &now],
+        )
+        .expect("insert profile");
+        id
+    }
+
+    #[test]
+    fn activating_a_profile_writes_the_canonical_config_projection() {
+        let db = mem_db();
+        let pid = insert_profile(&db, "profile-a", "openrouter", "model-a");
+
+        let effective = set_active_profile_and_reconcile(&db, &pid).expect("activate");
+
+        assert_eq!(effective.provider, "openrouter");
+        assert_eq!(effective.model, "model-a");
+        assert_eq!(effective.source, "profile-a");
+
+        let config = load_jarvis_config_conn(&db.conn.lock().unwrap()).expect("load config");
+        assert!(matches!(config.active_backend, JarvisBackend::OpenRouter));
+        assert_eq!(config.openrouter.model, "model-a");
+        assert_eq!(config.active_profile, "profile-a");
+    }
+
+    #[test]
+    fn activating_ollama_profile_updates_ollama_model() {
+        let db = mem_db();
+        let pid = insert_profile(&db, "local-qwen", "ollama", "qwen3:8b");
+
+        let effective = set_active_profile_and_reconcile(&db, &pid).expect("activate");
+
+        assert_eq!(effective.provider, "ollama");
+        assert_eq!(effective.model, "qwen3:8b");
+
+        let config = load_jarvis_config_conn(&db.conn.lock().unwrap()).expect("load config");
+        assert!(matches!(config.active_backend, JarvisBackend::Ollama));
+        assert_eq!(config.ollama.model, "qwen3:8b");
     }
 }

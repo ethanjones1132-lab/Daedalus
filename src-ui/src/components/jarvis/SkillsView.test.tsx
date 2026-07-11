@@ -54,8 +54,10 @@ const candidateDetail = {
   source_session_id: 'sess_1',
   confidence: 0.72,
   status: 'candidate',
-  eval_score: undefined,
-  eval_missed: undefined,
+  // A candidate may have low distillation confidence and still be promotable
+  // once the independent judge/eval gate has passed.
+  eval_score: 0.82,
+  eval_missed: false,
   rejection_reason: undefined,
   rejection_detail: undefined,
   promoted_at: undefined,

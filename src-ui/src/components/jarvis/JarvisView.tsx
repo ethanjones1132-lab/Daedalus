@@ -5,7 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { cn } from '../ui';
 import type { CompanionState } from './types';
 import {
-  JarvisSession, JarvisMessage, JarvisConfig, JarvisStatus,
+  JarvisSession, JarvisMessage, JarvisConfig, JarvisStatus, SessionRunRecord,
   OPENROUTER_MODELS,
 } from './types';
 import ControlCenterView from './ControlCenterView';
@@ -13,6 +13,7 @@ import MarkdownView from './MarkdownView';
 import {
   createUnknownFrameReporter,
   InactivityWatchdog,
+  isTerminalStageStatus,
   isPassiveSseFrame,
   parseSseDataLine,
   readToolResultTruncation,
@@ -72,14 +73,25 @@ class JarvisStreamError extends Error {
 export default function JarvisView({ initialSubView = 'chat', onCompanionChange }: JarvisViewProps) {
   const [subView, setSubView] = useState<JarvisSubView>(initialSubView);
   const [sessions, setSessions] = useState<JarvisSession[]>([]);
+  const [sessionRuns, setSessionRuns] = useState<Record<string, SessionRunRecord>>({});
   const [activeSession, setActiveSession] = useState<string | null>(null);
   const [config, setConfig] = useState<JarvisConfig | null>(null);
   const [status, setStatus] = useState<JarvisStatus | null>(null);
 
   const loadSessions = useCallback(async () => {
     try {
-      const result = await invoke<JarvisSession[]>('jarvis_list_sessions');
+      const [result, runs] = await Promise.all([
+        invoke<JarvisSession[]>('jarvis_list_sessions'),
+        invoke<SessionRunRecord[]>('get_all_session_runs').catch(() => [] as SessionRunRecord[]),
+      ]);
       setSessions(result);
+      const runMap: Record<string, SessionRunRecord> = {};
+      for (const run of runs) {
+        if (!runMap[run.session_id]) {
+          runMap[run.session_id] = run;
+        }
+      }
+      setSessionRuns(runMap);
     } catch (e) { console.error('Failed to load sessions:', e); }
   }, []);
 
@@ -227,6 +239,7 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
             <motion.div key="sessions" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="h-full">
               <SessionsPanel
                 sessions={sessions}
+                sessionRuns={sessionRuns}
                 activeSession={activeSession}
                 onSelect={(id) => { setActiveSession(id); setSubView('chat'); }}
                 onNew={() => { setActiveSession(null); setSubView('chat'); }}
@@ -668,7 +681,7 @@ export function ChatPanel({
     track(listen<{ stage: string; status: string; agent: string; session_id?: string }>('jarvis://stage', (event) => {
       if (!matchesStreamSession(event.payload.session_id)) return;
       const { stage, status } = event.payload;
-      setPipelineStage(status === 'done' ? '' : stage);
+      setPipelineStage(isTerminalStageStatus(status) ? '' : stage);
     }));
 
     track(listen<{ depth: number; status: string; reenter_stage?: string; critique?: string; session_id?: string }>('jarvis://recursion', (event) => {
@@ -876,7 +889,7 @@ export function ChatPanel({
         return;
       }
       if (frame.type === 'orchestrator_stage') {
-        setPipelineStage(frame.status === 'done' ? '' : String(frame.stage || ''));
+        setPipelineStage(isTerminalStageStatus(frame.status) ? '' : String(frame.stage || ''));
         return;
       }
       if (frame.type === 'orchestrator_recursion') {
@@ -2036,9 +2049,10 @@ function ApprovalModal({ call_id, name, args, error, onApprove, onReject }: {
 // ═══════════════════════════════════════════════════════════════
 
 function SessionsPanel({
-  sessions, activeSession, onSelect, onNew, onDelete, onRefresh,
+  sessions, sessionRuns, activeSession, onSelect, onNew, onDelete, onRefresh,
 }: {
   sessions: JarvisSession[];
+  sessionRuns: Record<string, SessionRunRecord>;
   activeSession: string | null;
   onSelect: (id: string) => void;
   onNew: () => void;
@@ -2101,6 +2115,22 @@ function SessionsPanel({
                   </div>
                   <div className="text-[11px] font-mono text-bone-faint">
                     {session.message_count} msgs · {new Date(session.created_at).toLocaleDateString()}
+                    {sessionRuns[session.id] && (
+                      <span className="ml-2">
+                        · <span className={{
+                          success: 'text-emerald-400',
+                          partial: 'text-amber-400',
+                          failed: 'text-error',
+                          timed_out: 'text-amber-400',
+                          cancelled: 'text-bone-dim',
+                        }[sessionRuns[session.id]!.outcome]}>
+                          {sessionRuns[session.id]!.outcome}
+                        </span>
+                        {sessionRuns[session.id]!.selected_model && (
+                          <span className="ml-1 text-bone-faint">({sessionRuns[session.id]!.selected_model})</span>
+                        )}
+                      </span>
+                    )}
                   </div>
                 </div>
                 <button

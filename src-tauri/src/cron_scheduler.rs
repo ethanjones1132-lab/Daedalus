@@ -143,6 +143,14 @@ fn query_projection_snapshot(
     .ok()
 }
 
+/// Result of dispatching a cron job to the Bun server.
+#[derive(Debug, Clone)]
+pub struct CronDispatchResult {
+    pub output: String,
+    pub error: Option<String>,
+    pub execution_evidence: Option<String>,
+}
+
 /// Dispatch a cron job via the Bun server's `/cron/run` endpoint.
 ///
 /// Replaces the previous `/chat/stream` path:
@@ -151,7 +159,10 @@ fn query_projection_snapshot(
 ///   - The Bun server creates a non-interactive `ExecutionContext` (surface: "cron")
 ///     and routes all tool calls through the canonical `ToolRuntime`.
 ///   - Returns JSON rather than an SSE stream, eliminating the SSE accumulation loop.
-pub async fn dispatch_cron_job(app: &AppHandle, job_id: &str) -> Result<String, String> {
+pub async fn dispatch_cron_job(
+    app: &AppHandle,
+    job_id: &str,
+) -> Result<CronDispatchResult, String> {
     let (prompt, agent_id, snapshot) = {
         let db = app.state::<AppDb>();
         let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
@@ -213,13 +224,22 @@ pub async fn dispatch_cron_job(app: &AppHandle, job_id: &str) -> Result<String, 
         .await
         .map_err(|e| format!("Failed to parse cron run response: {}", e))?;
 
+    let output = result["output"].as_str().unwrap_or("").to_string();
+    let error = result["error"].as_str().map(|s| s.to_string());
+    let execution_evidence = result.get("execution_evidence").map(|v| v.to_string());
+
     if result["success"].as_bool().unwrap_or(false) {
-        Ok(result["output"].as_str().unwrap_or("").to_string())
+        Ok(CronDispatchResult {
+            output,
+            error: None,
+            execution_evidence,
+        })
     } else {
-        Err(result["error"]
-            .as_str()
-            .unwrap_or("cron run failed with unknown error")
-            .to_string())
+        Ok(CronDispatchResult {
+            output,
+            error: error.or(Some("cron run failed with unknown error".to_string())),
+            execution_evidence,
+        })
     }
 }
 
@@ -234,6 +254,7 @@ fn record_run(
     duration_ms: i64,
     started_at: &str,
     next_run: Option<&str>,
+    execution_evidence: Option<&str>,
 ) {
     let db = app.state::<AppDb>();
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
@@ -242,8 +263,8 @@ fn record_run(
 
     if let Err(e) = conn.execute(
         "INSERT INTO cron_runs \
-         (id, cron_job_id, status, output, error, duration_ms, started_at, finished_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, cron_job_id, status, output, error, duration_ms, started_at, finished_at, execution_evidence) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         rusqlite::params![
             run_id,
             job_id,
@@ -252,7 +273,8 @@ fn record_run(
             error,
             duration_ms,
             started_at,
-            finished_at
+            finished_at,
+            execution_evidence
         ],
     ) {
         eprintln!(
@@ -318,20 +340,26 @@ pub async fn execute_job(
     let duration_ms = start.elapsed().as_millis() as i64;
     let next_run = compute_next_run(schedule_expr);
 
-    match result {
-        Ok(ref text) => {
+    match &result {
+        Ok(dispatch) => {
+            let status = if dispatch.error.is_none() {
+                "success"
+            } else {
+                "failed"
+            };
             record_run(
                 app,
                 job_id,
-                "success",
-                text,
-                "",
+                status,
+                &dispatch.output,
+                dispatch.error.as_deref().unwrap_or(""),
                 duration_ms,
                 &started_at,
                 next_run.as_deref(),
+                dispatch.execution_evidence.as_deref(),
             );
         }
-        Err(ref err) => {
+        Err(err) => {
             record_run(
                 app,
                 job_id,
@@ -341,6 +369,7 @@ pub async fn execute_job(
                 duration_ms,
                 &started_at,
                 next_run.as_deref(),
+                None,
             );
         }
     }
@@ -352,7 +381,7 @@ pub async fn execute_job(
         guard.remove(job_id);
     }
 
-    result
+    result.map(|d| d.output)
 }
 
 /// Detect jobs whose `next_run` has already passed (missed while the app was closed).

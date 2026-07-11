@@ -3,6 +3,17 @@ export interface JarvisSseFrame {
   [key: string]: unknown;
 }
 
+export type StageTerminalStatus = 'completed' | 'failed' | 'timed_out' | 'cancelled' | 'partial';
+
+export function isTerminalStageStatus(status: unknown): status is StageTerminalStatus {
+  return status === 'completed'
+    || status === 'done'
+    || status === 'failed'
+    || status === 'timed_out'
+    || status === 'cancelled'
+    || status === 'partial';
+}
+
 export interface ToolResultTruncationMetadata {
   truncated: true;
   original_chars: number;

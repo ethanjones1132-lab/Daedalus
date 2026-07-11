@@ -18,6 +18,15 @@ import {
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
+interface ExecutionEvidence {
+  run_id: string;
+  status: string;
+  acceptance_result?: string;
+  error_code?: string;
+  started_at?: string;
+  finished_at?: string;
+}
+
 interface CronJob {
   id: string;
   name: string;
@@ -43,6 +52,7 @@ interface CronRun {
   duration_ms: number;
   started_at: string;
   finished_at: string | null;
+  execution_evidence?: ExecutionEvidence;
 }
 
 // ── Job Types ────────────────────────────────────────────────────────────────
@@ -584,11 +594,23 @@ function RunsHistory({ job }: { job: CronJob }) {
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 mb-0.5 flex-wrap">
                         <Pill variant={statusVariant(run.status)}>{run.status}</Pill>
+                        {run.execution_evidence && (
+                          <Pill variant={statusVariant(run.execution_evidence.status)}>
+                            evidence: {run.execution_evidence.status}
+                          </Pill>
+                        )}
                         <span className="text-[10px] font-mono text-bone-faint">{formatAge(run.started_at)}</span>
                         {run.duration_ms > 0 && (
                           <span className="text-[10px] font-mono text-bone-dim">{formatDuration(run.duration_ms)}</span>
                         )}
                       </div>
+                      {run.execution_evidence?.acceptance_result && (
+                        <div className="text-[10px] font-mono text-bone-dim truncate max-w-xs">
+                          {run.execution_evidence.acceptance_result.length > 120
+                            ? run.execution_evidence.acceptance_result.slice(0, 120) + '…'
+                            : run.execution_evidence.acceptance_result}
+                        </div>
+                      )}
                       {run.output && (
                         <div className="text-[10px] font-mono text-bone-dim truncate max-w-xs">
                           {run.output.length > 120 ? run.output.slice(0, 120) + '…' : run.output}
@@ -597,6 +619,11 @@ function RunsHistory({ job }: { job: CronJob }) {
                       {run.error && (
                         <div className="text-[10px] font-mono text-error truncate max-w-xs">
                           {run.error.length > 120 ? run.error.slice(0, 120) + '…' : run.error}
+                        </div>
+                      )}
+                      {run.execution_evidence?.error_code && (
+                        <div className="text-[10px] font-mono text-error truncate max-w-xs">
+                          code: {run.execution_evidence.error_code}
                         </div>
                       )}
                     </div>

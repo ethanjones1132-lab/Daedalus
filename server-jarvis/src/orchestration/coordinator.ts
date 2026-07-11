@@ -39,8 +39,10 @@ export type CallModelFn = (
     cascadeTier?: "cheap" | "strong";
     surfaceAsAnswer?: boolean;
     suppressActivity?: boolean;
+    /** Optional stage-local cancellation. It must not abort the whole turn. */
+    stageAbort?: AbortSignal;
   }
-) => Promise<{ content: string; tool_calls?: any[] }>;
+) => Promise<{ content: string; tool_calls?: any[]; model?: string; _modelUsed?: string; _provider?: string }>;
 
 export interface CoordinatorContext {
   needs_workspace_inspection: boolean;
@@ -296,7 +298,11 @@ export class Coordinator {
       stageLabel: "coordinator",
       suppressActivity: true,
     });
-    return { content: api.content, source: "api" };
+    return {
+      content: api.content,
+      source: "api",
+      model: api.model ?? api._modelUsed,
+    };
   }
 
   private defaultRoute(): CoordinatorResult {
