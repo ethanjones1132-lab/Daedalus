@@ -41,6 +41,9 @@ DumpStack.log
 # --- Claude Code worktrees (never commit) ---
 .claude/worktrees/
 
+# --- Codex worktrees (never commit) ---
+.worktrees/
+
 # --- Local UI-automation diagnostic scratch (SkyLocal / ad-hoc screenshot helpers) ---
 sky-*.jpg
 sky-interact.mjs
