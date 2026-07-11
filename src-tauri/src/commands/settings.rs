@@ -18,7 +18,7 @@ pub fn get_all_settings(db: State<AppDb>) -> Result<HashMap<String, String>, Str
     let mut map = HashMap::new();
     for row in rows {
         let (k, v) = row.map_err(|e| e.to_string())?;
-        map.insert(k, v);
+        map.insert(k.clone(), redact_setting_value(&k, &v));
     }
     Ok(map)
 }
@@ -32,7 +32,7 @@ pub fn get_setting(db: State<AppDb>, key: String) -> Result<Option<String>, Stri
         .map_err(|e| e.to_string())?;
     let result: Result<String, _> = stmt.query_row([&key], |row| row.get(0));
     match result {
-        Ok(v) => Ok(Some(v)),
+        Ok(v) => Ok(Some(redact_setting_value(&key, &v))),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e.to_string()),
     }
@@ -45,9 +45,6 @@ const KNOWN_SETTING_KEYS: &[&str] = &[
     "version",
     "active_backend",
     "ollama",
-    "openrouter",
-    "opencode_zen",
-    "opencode_go",
     "claude_cli",
     "tools",
     "reasoning",
@@ -70,6 +67,74 @@ const KNOWN_SETTING_KEYS: &[&str] = &[
     "api_sports_key",
     "agents_root",
 ];
+
+const SENSITIVE_PROVIDER_SETTING_KEYS: &[&str] = &["openrouter", "opencode_zen", "opencode_go"];
+
+fn credential_fingerprint(api_key: &str) -> String {
+    let mut hash = 14_695_981_039_346_656_037u64;
+    for byte in api_key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1_099_511_628_211);
+    }
+    format!("{hash:016x}")
+}
+
+fn redact_provider_value(value: &mut serde_json::Value) {
+    let Some(object) = value.as_object_mut() else {
+        *value = serde_json::json!({
+            "api_key_configured": false,
+            "api_key_fingerprint": serde_json::Value::Null,
+        });
+        return;
+    };
+
+    let api_key = object
+        .remove("api_key")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    let configured = !api_key.trim().is_empty();
+    object.insert(
+        "api_key_configured".to_string(),
+        serde_json::Value::Bool(configured),
+    );
+    object.insert(
+        "api_key_fingerprint".to_string(),
+        if configured {
+            serde_json::Value::String(credential_fingerprint(&api_key))
+        } else {
+            serde_json::Value::Null
+        },
+    );
+}
+
+fn redact_setting_value(key: &str, value: &str) -> String {
+    if !SENSITIVE_PROVIDER_SETTING_KEYS.contains(&key) {
+        return value.to_string();
+    }
+
+    let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(value) else {
+        return serde_json::json!({
+            "api_key_configured": false,
+            "api_key_fingerprint": serde_json::Value::Null,
+        })
+        .to_string();
+    };
+    redact_provider_value(&mut parsed);
+    parsed.to_string()
+}
+
+pub(crate) fn redact_jarvis_config(config: &JarvisConfig) -> Result<serde_json::Value, String> {
+    let mut value = serde_json::to_value(config).map_err(|e| e.to_string())?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "JarvisConfig did not serialize as an object".to_string())?;
+    for key in SENSITIVE_PROVIDER_SETTING_KEYS {
+        if let Some(provider) = object.get_mut(*key) {
+            redact_provider_value(provider);
+        }
+    }
+    Ok(value)
+}
 
 pub fn set_setting_value(db: &AppDb, key: &str, value: &str) -> Result<(), String> {
     if !KNOWN_SETTING_KEYS.contains(&key) {
@@ -159,15 +224,13 @@ pub fn load_jarvis_config_conn(conn: &rusqlite::Connection) -> Result<JarvisConf
         }
     }
     if let Some(v) = settings.get("opencode_zen") {
-        if let Ok(parsed) =
-            serde_json::from_str::<crate::jarvis::types::OpenCodeProviderConfig>(v)
+        if let Ok(parsed) = serde_json::from_str::<crate::jarvis::types::OpenCodeProviderConfig>(v)
         {
             config.opencode_zen = parsed;
         }
     }
     if let Some(v) = settings.get("opencode_go") {
-        if let Ok(parsed) =
-            serde_json::from_str::<crate::jarvis::types::OpenCodeProviderConfig>(v)
+        if let Ok(parsed) = serde_json::from_str::<crate::jarvis::types::OpenCodeProviderConfig>(v)
         {
             config.opencode_go = parsed;
         }
@@ -292,6 +355,37 @@ pub fn persist_jarvis_config_conn(
     config: &JarvisConfig,
 ) -> Result<(), String> {
     let mut config = config.clone();
+
+    // Provider credentials are write-only at the Native command boundary.
+    // Config reads redact them, so a save originating from a redacted config
+    // must retain the existing SQLite secret when the incoming field is blank.
+    for (key, api_key) in [
+        ("openrouter", &mut config.openrouter.api_key),
+        ("opencode_zen", &mut config.opencode_zen.api_key),
+        ("opencode_go", &mut config.opencode_go.api_key),
+    ] {
+        if api_key.trim().is_empty() {
+            let existing = conn
+                .query_row("SELECT value FROM settings WHERE key = ?", [key], |row| {
+                    row.get::<_, String>(0)
+                })
+                .ok();
+            if let Some(existing) = existing {
+                let existing_key = serde_json::from_str::<serde_json::Value>(&existing)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("api_key")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_default();
+                if !existing_key.trim().is_empty() {
+                    *api_key = existing_key;
+                }
+            }
+        }
+    }
     normalize_jarvis_config(&mut config);
 
     let pairs: Vec<(&str, String)> = vec![
@@ -479,6 +573,70 @@ mod tests {
         let err =
             set_setting_value(&db, "unknown_key", "value").expect_err("unknown key should fail");
         assert!(err.contains("unknown_setting"));
+    }
+
+    #[test]
+    fn redacted_provider_setting_contains_metadata_without_secret() {
+        let raw = serde_json::json!({
+            "base_url": "https://opencode.ai/zen/v1",
+            "api_key": "zen-secret-123",
+        })
+        .to_string();
+
+        let redacted = redact_setting_value("opencode_zen", &raw);
+        assert!(!redacted.contains("zen-secret-123"));
+        let value: serde_json::Value = serde_json::from_str(&redacted).expect("redacted JSON");
+        assert!(value.get("api_key").is_none());
+        assert_eq!(value["api_key_configured"], serde_json::json!(true));
+        assert!(value["api_key_fingerprint"].as_str().is_some());
+    }
+
+    #[test]
+    fn redacted_config_omits_all_provider_secrets() {
+        let mut cfg = JarvisConfig::default();
+        cfg.openrouter.api_key = "router-secret".to_string();
+        cfg.opencode_zen.api_key = "zen-secret".to_string();
+        cfg.opencode_go.api_key = "go-secret".to_string();
+
+        let redacted = redact_jarvis_config(&cfg).expect("redact config");
+        let encoded = redacted.to_string();
+        assert!(!encoded.contains("router-secret"));
+        assert!(!encoded.contains("zen-secret"));
+        assert!(!encoded.contains("go-secret"));
+        for key in SENSITIVE_PROVIDER_SETTING_KEYS {
+            let provider = redacted.get(*key).expect("provider object");
+            assert!(provider.get("api_key").is_none());
+            assert_eq!(provider["api_key_configured"], serde_json::json!(true));
+        }
+    }
+
+    #[test]
+    fn persist_preserves_existing_provider_keys_when_incoming_config_is_redacted() {
+        let db = mem_db();
+        let mut stored = JarvisConfig::default();
+        stored.openrouter.api_key = "router-secret".to_string();
+        stored.opencode_zen.api_key = "zen-secret".to_string();
+        stored.opencode_go.api_key = "go-secret".to_string();
+        persist_jarvis_config(&db, &stored).expect("persist initial config");
+
+        stored.openrouter.api_key.clear();
+        stored.opencode_zen.api_key.clear();
+        stored.opencode_go.api_key.clear();
+        persist_jarvis_config(&db, &stored).expect("persist redacted config");
+
+        let loaded = load_jarvis_config(&db).expect("load config");
+        assert_eq!(loaded.openrouter.api_key, "router-secret");
+        assert_eq!(loaded.opencode_zen.api_key, "zen-secret");
+        assert_eq!(loaded.opencode_go.api_key, "go-secret");
+    }
+
+    #[test]
+    fn provider_keys_are_not_writable_through_raw_settings() {
+        let db = mem_db();
+        for key in ["openrouter", "opencode_zen", "opencode_go"] {
+            let err = set_setting_value(&db, key, "{}").expect_err("provider key should reject");
+            assert!(err.contains("unknown_setting"));
+        }
     }
 
     #[test]

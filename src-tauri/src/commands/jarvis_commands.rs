@@ -337,8 +337,9 @@ pub async fn jarvis_tool_decision(
 }
 
 #[tauri::command]
-pub async fn jarvis_get_config(state: State<'_, JarvisState>) -> Result<JarvisConfig, String> {
-    Ok(state.config.lock().await.clone())
+pub async fn jarvis_get_config(state: State<'_, JarvisState>) -> Result<serde_json::Value, String> {
+    let config = state.config.lock().await.clone();
+    crate::commands::redact_jarvis_config(&config)
 }
 
 #[tauri::command]
@@ -349,11 +350,12 @@ pub async fn jarvis_save_config(
 ) -> Result<(), String> {
     // SQLite is canonical; this also projects to the Bun-readable file store.
     crate::commands::persist_jarvis_config(&db, &config)?;
-    let backend = config.active_backend.clone();
-    let ollama_model = config.ollama.model.clone();
+    let effective_config = crate::commands::load_jarvis_config(&db)?;
+    let backend = effective_config.active_backend.clone();
+    let ollama_model = effective_config.ollama.model.clone();
     {
         let mut guard = state.config.lock().await;
-        *guard = config;
+        *guard = effective_config;
     }
     // Bring up whatever the (possibly newly selected) backend needs — e.g. start
     // Ollama when the user switches to it in Control. Idempotent + non-blocking.

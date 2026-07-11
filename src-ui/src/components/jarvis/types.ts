@@ -27,7 +27,9 @@ export interface JarvisConfig {
   };
   openrouter: {
     base_url: string;
-    api_key: string;
+    api_key?: string;
+    api_key_configured?: boolean;
+    api_key_fingerprint?: string | null;
     model: string;
     site_url: string;
     site_name: string;
@@ -37,8 +39,18 @@ export interface JarvisConfig {
     max_retries: number;
     timeout_ms: number;
   };
-  opencode_zen: { base_url: string; api_key: string };
-  opencode_go: { base_url: string; api_key: string };
+  opencode_zen: {
+    base_url: string;
+    api_key?: string;
+    api_key_configured?: boolean;
+    api_key_fingerprint?: string | null;
+  };
+  opencode_go: {
+    base_url: string;
+    api_key?: string;
+    api_key_configured?: boolean;
+    api_key_fingerprint?: string | null;
+  };
   claude_cli: {
     enabled: boolean;
     path: string;

@@ -35,12 +35,15 @@ pub struct JarvisConfig {
     pub active_backend: JarvisBackend,
     pub ollama: OllamaConfig,
     pub openrouter: OpenRouterConfig,
+    #[serde(default = "default_opencode_zen_config")]
     pub opencode_zen: OpenCodeProviderConfig,
+    #[serde(default = "default_opencode_go_config")]
     pub opencode_go: OpenCodeProviderConfig,
     pub claude_cli: ClaudeCliConfig,
     pub tools: ToolConfig,
     pub reasoning: ReasoningConfig,
     pub companion: CompanionConfig,
+    #[serde(default)]
     pub orchestrator: OrchestratorConfig,
     pub system_prompt: String,
     pub mode: String,
@@ -115,6 +118,14 @@ impl OpenCodeProviderConfig {
     }
 }
 
+fn default_opencode_zen_config() -> OpenCodeProviderConfig {
+    OpenCodeProviderConfig::zen_default()
+}
+
+fn default_opencode_go_config() -> OpenCodeProviderConfig {
+    OpenCodeProviderConfig::go_default()
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OrchestratorConfig {
     #[serde(default = "default_orchestrator_enabled")]
@@ -133,6 +144,30 @@ impl Default for OrchestratorConfig {
             enabled: true,
             extra: serde_json::Map::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JarvisConfig;
+
+    #[test]
+    fn legacy_config_defaults_new_provider_fields_without_losing_existing_settings() {
+        let mut legacy = serde_json::to_value(JarvisConfig::default()).expect("serialize default");
+        let object = legacy.as_object_mut().expect("config object");
+        object.remove("opencode_zen");
+        object.remove("opencode_go");
+        object.remove("orchestrator");
+        object["openrouter"]["api_key"] = serde_json::json!("legacy-openrouter-key");
+        object["temperature"] = serde_json::json!(0.42);
+
+        let loaded: JarvisConfig = serde_json::from_value(legacy).expect("legacy config parses");
+
+        assert_eq!(loaded.openrouter.api_key, "legacy-openrouter-key");
+        assert!((loaded.temperature - 0.42).abs() < f64::EPSILON);
+        assert_eq!(loaded.opencode_zen.base_url, "https://opencode.ai/zen/v1");
+        assert_eq!(loaded.opencode_go.base_url, "https://opencode.ai/zen/go/v1");
+        assert!(loaded.orchestrator.enabled);
     }
 }
 
