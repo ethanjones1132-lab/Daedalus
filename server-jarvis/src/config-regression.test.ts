@@ -2,9 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { homedir } from "os";
 import {
   defaultConfig,
+  credentialFingerprint,
   isInvalidWorkspacePath,
   normalizeConfig,
   resolveAgentsRoot,
+  runtimeConfigEvidence,
   validateAgentsRootPath,
 } from "./config";
 
@@ -66,6 +68,26 @@ describe("configuration regression coverage retained during Task 6", () => {
     expect(cfg.orchestrator.max_recursion_depth).toBeGreaterThan(0);
     expect(cfg.orchestrator.conductor_learning.enabled).toBe(true);
     expect(cfg.orchestrator.skill_distillation.auto_promote).toBe(false);
+  });
+
+  test("credential evidence never returns raw key text", () => {
+    const cfg = defaultConfig();
+    cfg.openrouter.api_key = "sk-or-v1-secret-value";
+    cfg.opencode_zen.api_key = "zen-secret-value";
+    cfg.opencode_go.api_key = "go-secret-value";
+    cfg.orchestrator.enabled = false;
+
+    const evidence = runtimeConfigEvidence(cfg);
+    expect(evidence.credentials.openrouter).toEqual({ configured: true, fingerprint: credentialFingerprint("sk-or-v1-secret-value") });
+    expect(JSON.stringify(evidence)).not.toContain("secret-value");
+    expect(evidence.orchestration_enabled).toBe(false);
+  });
+
+  test("credentialFingerprint is stable, truncated, and blank-safe", () => {
+    expect(credentialFingerprint("")).toBeNull();
+    expect(credentialFingerprint("same-key")).toBe(credentialFingerprint("same-key"));
+    expect(credentialFingerprint("same-key")).toHaveLength(12);
+    expect(credentialFingerprint("same-key")).not.toBe(credentialFingerprint("other-key"));
   });
 });
 

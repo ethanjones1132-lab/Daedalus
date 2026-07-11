@@ -8,6 +8,7 @@ import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync } from "fs
 import { join, resolve } from "path";
 import { homedir } from "os";
 import { execSync } from "child_process";
+import { createHash } from "crypto";
 import { DEFAULT_ORCHESTRATOR_AGENTS, type OrchestratorAgent } from "./orchestration/agent-pool";
 
 // ── Types ──
@@ -674,6 +675,51 @@ export function loadConfig(): JarvisConfig {
 export function invalidateConfigCache(): void {
   configCache = null;
   configCacheTime = 0;
+}
+
+export type CredentialProvider = "openrouter" | "opencode_zen" | "opencode_go";
+
+export interface CredentialEvidence {
+  configured: boolean;
+  fingerprint: string | null;
+}
+
+export interface RuntimeConfigEvidence {
+  config_path: string;
+  credentials: Record<CredentialProvider, CredentialEvidence>;
+  orchestration_enabled: boolean;
+}
+
+/** Return a stable, short identifier for a configured secret without exposing it. */
+export function credentialFingerprint(secret: string): string | null {
+  if (!secret.trim()) return null;
+  return createHash("sha256").update(secret, "utf8").digest("hex").slice(0, 12);
+}
+
+/**
+ * Project only safe runtime metadata for diagnostics and UI confirmation.
+ * Never include the source config object here: it contains provider secrets.
+ */
+export function runtimeConfigEvidence(cfg: JarvisConfig = loadConfig()): RuntimeConfigEvidence {
+  const evidence = (secret: string): CredentialEvidence => ({
+    configured: secret.trim().length > 0,
+    fingerprint: credentialFingerprint(secret),
+  });
+  return {
+    config_path: CONFIG_FILE,
+    credentials: {
+      openrouter: evidence(cfg.openrouter.api_key),
+      opencode_zen: evidence(cfg.opencode_zen.api_key),
+      opencode_go: evidence(cfg.opencode_go.api_key),
+    },
+    orchestration_enabled: cfg.orchestrator.enabled === true,
+  };
+}
+
+/** Invalidate the short-lived config cache and load the current disk state. */
+export function reloadConfigFromDisk(): JarvisConfig {
+  invalidateConfigCache();
+  return loadConfig();
 }
 
 /**
