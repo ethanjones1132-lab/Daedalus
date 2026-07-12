@@ -2797,19 +2797,28 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               "I produced essentially the same answer as last turn without gathering any new evidence, so repeating it would waste your time. " +
               "The underlying problem: the execution stage did not read the files it needed. " +
               "Tell me a specific file or directory to start from, or say 'force deep read' to retry with extended budgets.";
-          } else {
-            // Only record on the non-repeated path: the stored signature must
-            // always reflect the last DISTINCT thing actually shown to the
-            // user, never the canned refusal message above — otherwise a
-            // third consecutive distinct-but-still-looping answer would be
-            // compared against the refusal text instead of the real prior
-            // answer.
+          } else if (evidenceBearing) {
+            // Only record on the non-repeated path, and only for
+            // evidence-bearing turn types: the stored signature must always
+            // reflect the last DISTINCT evidence-bearing answer actually
+            // shown to the user — never the canned refusal message above
+            // (or a third consecutive distinct-but-still-looping answer
+            // would be compared against the refusal text instead of the
+            // real prior answer), and never a conversational/answer_only
+            // turn's unrelated text (or a chatty aside between two
+            // workspace_read attempts would silently reset the comparison
+            // baseline and defeat detection across the gap).
             repetitionStore.record(sessionId, trimmedAnswer, evidenceKeys);
           }
 
-          await session.finish(finalAnswer, result.outcome === "partial"
-            ? { subtype: "partial", code: result.error_code }
-            : (repetitionVerdict.repeated ? { subtype: "partial", code: "no_progress_repetition" } : undefined));
+          // Tag priority: a no-progress repeat always wins the SSE
+          // subtype/code, even when `result.outcome` is independently
+          // "partial" (e.g. a rewriter-stage timeout on a turn that also
+          // happens to be a repeat) — `finalAnswer` was already replaced
+          // with the refusal text above, so the tag must match.
+          await session.finish(finalAnswer, repetitionVerdict.repeated
+            ? { subtype: "partial", code: "no_progress_repetition" }
+            : (result.outcome === "partial" ? { subtype: "partial", code: result.error_code } : undefined));
         }
         return;
       }
