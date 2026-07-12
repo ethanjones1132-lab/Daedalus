@@ -96,6 +96,7 @@ import { excludedModelKeys } from "./model-failure-memory";
 import { PipelineExecutor } from "./orchestration/pipeline";
 import { StageHealthRegistry, type RecoverableFailureKind } from "./orchestration/stage-health";
 import { createTurnBudget } from "./orchestration/turn-budget";
+import { OrchestrationAdmissionController, type AdmissionLease } from "./orchestration/admission-controller";
 import type { PipelineProgressState, PipelineRecursionEvent } from "./orchestration/pipeline";
 import { ConductorBus } from "./orchestration/conductor-bus";
 import type { ConductorDirective } from "./orchestration/conductor-bus";
@@ -217,6 +218,7 @@ const SSE_HEARTBEAT_INTERVAL_MS = Math.min(
 const MAX_TOOL_RESULT_CHARS = 2000;  // Truncate tool results going back to model context
 const MAX_TOOL_EXECUTION_TURNS = 10;
 const activeStreams = new ActiveStreamRegistry();
+const orchestrationAdmission = new OrchestrationAdmissionController({ interactive: 2, background: 1 });
 const stageHealth = new StageHealthRegistry();
 const RECOVERABLE_STAGE_FAILURES = new Set([
   "FirstTokenTimeoutError",
@@ -1272,6 +1274,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     // stay stage-local and must never abort this controller.
     const streamLease = activeStreams.begin(sessionId);
     const streamAbort = streamLease.controller;
+    let admissionLease: AdmissionLease | undefined;
     let clientDisconnected = false;
     const writeBytes = createDisconnectAwareWrite(
       (chunk) => rawWriter.write(chunk),
@@ -1338,6 +1341,17 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
       console.log(`[Jarvis] Stream start session=${sessionId} backend=${cfg.active_backend} model=${modelLabel}`);
       await session.init(modelLabel);
+      admissionLease = await orchestrationAdmission.acquire({
+        workClass: surface === "cron" ? "background" : "interactive",
+        signal: streamAbort.signal,
+        deadlineAt: turnDeadlineAt,
+      });
+      await streamWrite(`data: ${JSON.stringify({
+        type: "orchestrator_queue",
+        queue_wait_ms: admissionLease.queue_wait_ms,
+        work_class: admissionLease.work_class,
+        session_id: sessionId,
+      })}\n\n`);
 
       // ── Claude CLI path ──────────────────────────────────────────
       if (cfg.active_backend === "claude_cli") {
@@ -3583,6 +3597,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       } catch {}
     } finally {
       stopHeartbeat();
+      admissionLease?.release();
       streamLease.release();
       try {
         await session.ensureTerminal();

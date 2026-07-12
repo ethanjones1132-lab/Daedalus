@@ -23,6 +23,7 @@ import {
   type ActivationBoundary,
 } from "./activation-boundary";
 import { registerStandardBundles } from "./bundles-registry";
+import { OrchestrationAdmissionController, type AdmissionLease } from "./orchestration/admission-controller";
 
 export interface CronRunRequest {
   slug: string;
@@ -50,12 +51,13 @@ export interface CronRunResult {
   boundary: ActivationBoundary;
   results: ToolResult[];
   error?: string;
+  queue_wait_ms?: number;
 }
 
 /** Durable execution evidence shared by cron and action-registry runs. */
 export interface ExecutionEvidence {
   run_id: string;
-  status: "success" | "failed" | "cancelled" | "timeout";
+  status: "success" | "failed" | "cancelled" | "timeout" | "background_deferred";
   started_at: string;
   finished_at: string;
   acceptance_result?: string;
@@ -89,6 +91,7 @@ const CRON_TOOL_TIMEOUT_MS = Math.max(
   60_000,
   Number(process.env.JARVIS_CRON_TOOL_TIMEOUT_MS ?? 900_000) || 900_000,
 );
+const cronAdmission = new OrchestrationAdmissionController({ interactive: 2, background: 1 });
 
 /**
  * Execute a single tool call with a timeout.
@@ -133,6 +136,7 @@ function persistEvidence(evidence: ExecutionEvidence, cfg: JarvisConfig): void {
 
 function classifyStatus(result: CronRunResult): ExecutionEvidence["status"] {
   if (result.ok) return "success";
+  if (result.error === "background_deferred") return "background_deferred";
   const timedOut = result.results.some(
     (r) =>
       r.is_error &&
@@ -178,22 +182,42 @@ export async function runCronRequest(
     workspace_path: cfg.jarvis_path,
   });
 
+  let lease: AdmissionLease;
+  try {
+    lease = await cronAdmission.acquire({
+      workClass: "background",
+      deadlineAt: Date.now() + CRON_TOOL_TIMEOUT_MS,
+    });
+  } catch {
+    return {
+      ok: false,
+      slug: req.slug,
+      boundary,
+      results: [],
+      error: "background_deferred",
+    };
+  }
+
   const results: ToolResult[] = [];
-  for (const call of req.tools) {
-    try {
-      const result = await executeWithTimeout(rt, call, ctx);
-      results.push(result);
-    } catch (e: any) {
-      results.push({
-        call_id: call.id,
-        name: call.name,
-        output: "",
-        is_error: true,
-        error: e?.message ?? String(e),
-        error_code: "handler_error",
-        duration_ms: 0,
-      });
+  try {
+    for (const call of req.tools) {
+      try {
+        const result = await executeWithTimeout(rt, call, ctx);
+        results.push(result);
+      } catch (e: any) {
+        results.push({
+          call_id: call.id,
+          name: call.name,
+          output: "",
+          is_error: true,
+          error: e?.message ?? String(e),
+          error_code: "handler_error",
+          duration_ms: 0,
+        });
+      }
     }
+  } finally {
+    lease.release();
   }
 
   return {
@@ -201,6 +225,7 @@ export async function runCronRequest(
     slug: req.slug,
     boundary,
     results,
+    queue_wait_ms: lease.queue_wait_ms,
   };
 }
 
