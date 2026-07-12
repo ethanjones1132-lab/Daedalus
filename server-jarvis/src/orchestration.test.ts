@@ -1127,6 +1127,7 @@ describe("PipelineExecutor Phase 2: live conductor observability + abort", () =>
     const seenSignals: AbortSignal[] = [];
     const callModel = async (_msgs: any[], options: any = {}) => {
       if (options.stageAbort) seenSignals.push(options.stageAbort);
+      if (options.stageLabel === "executor") throw new Error("executor failed");
       return { content: "ok" };
     };
 
@@ -1166,7 +1167,10 @@ describe("PipelineExecutor Phase 2: live conductor observability + abort", () =>
     );
     liveConductor.setContext("general", "high", "run-record");
 
-    const callModel = async () => ({ content: "ok" });
+    const callModel = async (_msgs: any[], options: any = {}) => {
+      if (options.stageLabel === "planner") throw new Error("planner failed");
+      return { content: "ok" };
+    };
     const ex = new PipelineExecutor(callModel, runtime, ctx, { bus, live: liveConductor });
     const runId = "run-record-1";
     await ex.execute("q", ["planner", "synthesizer"], runId, () => {});
@@ -1199,7 +1203,10 @@ describe("PipelineExecutor Phase 2: live conductor observability + abort", () =>
     );
     liveConductor.setContext("general", "high", "run-directive");
 
-    const callModel = async () => ({ content: "ok" });
+    const callModel = async (_msgs: any[], options: any = {}) => {
+      if (options.stageLabel === "planner") throw new Error("planner failed");
+      return { content: "ok" };
+    };
     const directiveEvents: any[] = [];
     const ex = new PipelineExecutor(callModel, runtime, ctx, {
       bus,

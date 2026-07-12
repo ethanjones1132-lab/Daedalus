@@ -12,7 +12,7 @@ import { countTokens } from "../tokens";
 import type { ConductorBus, ConductorDirective } from "./conductor-bus";
 import type { LiveConductor } from "./conductor";
 import { buildSynthesizerContext, buildSynthesizerContextFromStageState } from "./synth-context";
-import { applyEffectGate, evaluateEffectGate, type EffectGateReport } from "./effect-gate";
+import { applyEffectGate, evaluateEffectGate, WRITE_EFFECT_TOOLS, type EffectGateReport } from "./effect-gate";
 import type { ExecutionProfile } from "./route-normalization";
 import type { TurnRequirement } from "./turn-requirements";
 import type { PipelineStageState, PlannerStageOutput, ExecutorStageOutput, ReviewerStageOutput, RewriterStageOutput, ToolCallRecord } from "./stage-output";
@@ -80,12 +80,29 @@ export interface PipelineExecuteOptions {
    * request text.
    */
   turnRequirement?: TurnRequirement;
+  /** Maximum automatic full-profile review -> rewrite repair rounds. */
+  maxReviewRepairRounds?: number;
 }
 
 const READ_CACHE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "web_fetch"]);
 const WORKSPACE_EVIDENCE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "git_metadata"]);
 const MISSING_WORKSPACE_EVIDENCE =
   "Workspace inspection failed: no successful workspace read tool result was produced, so Jarvis will not synthesize repository claims from ungrounded model text.";
+
+export function successfulWriteKeys(calls: ToolCallRecord[]): Set<string> {
+  return new Set(
+    calls
+      .filter((call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name))
+      .map((call) => `${call.name}:${JSON.stringify(call.arguments)}`),
+  );
+}
+
+export function addedWriteProgress(before: Set<string>, after: Set<string>): boolean {
+  for (const key of after) {
+    if (!before.has(key)) return true;
+  }
+  return false;
+}
 
 function isStageTimeout(error: unknown): boolean {
   const name = error && typeof error === "object" && "name" in error
@@ -764,23 +781,28 @@ export class PipelineExecutor {
     request: string,
     planSummary: string,
     executorSummary: string,
+    executorToolCalls: ToolCallRecord[],
     agentRunId: string,
     onStateChange: (state: PipelineProgressState) => void,
     options: PipelineExecuteOptions,
     profile: ExecutionProfile,
   ): Promise<{ reviewer: ReviewerStageOutput; rewriter?: RewriterStageOutput }> {
     const reviewerPrompt = stageSystemPrompt("reviewer", options);
-    let loopCount = 0;
-    const maxLoops = 3;
+    const configuredRepairRounds = Number(options.maxReviewRepairRounds ?? 1);
+    const maxRepairRounds = Number.isFinite(configuredRepairRounds)
+      ? Math.min(2, Math.max(0, Math.floor(configuredRepairRounds)))
+      : 1;
+    let reviewCount = 0;
+    let repairs = 0;
     let hasPendingIssues = true;
     let reviewerFeedback = "No review stage executed.";
     let reviewerOk = true;
     let rewriterOutput: RewriterStageOutput | undefined;
     let rewriterSummaryForPrompt = "No rewriting stage executed.";
 
-    while (hasPendingIssues && loopCount < maxLoops) {
-      loopCount++;
-      onStateChange({ stage: "reviewer", status: "running", output: `\nReview Turn ${loopCount}...\n` });
+    while (hasPendingIssues) {
+      reviewCount++;
+      onStateChange({ stage: "reviewer", status: "running", output: `\nReview Turn ${reviewCount}...\n` });
       const revStartTime = Date.now();
 
       try {
@@ -808,7 +830,7 @@ export class PipelineExecutor {
           id: `stage_${crypto.randomUUID()}`,
           agent_run_id: agentRunId,
           mode_id: "reviewer",
-          turn_number: loopCount,
+          turn_number: reviewCount,
           input_tokens: Math.round((reviewerPrompt.length + request.length + planSummary.length + executorSummary.length + rewriterSummaryForPrompt.length) / 4),
           output_tokens: countTokens(reviewerFeedback),
           tool_calls_json: "[]",
@@ -823,10 +845,25 @@ export class PipelineExecutor {
         // Gating this on stage inclusion is a legitimate follow-up but is out
         // of scope for this refactor (extract, don't change behavior).
         hasPendingIssues = this.hasIssues(reviewerFeedback);
-        if (hasPendingIssues) {
-          onStateChange({ stage: "rewriter", status: "running", output: `\nReviewer flagged issues. Rewriting...\n` });
-          rewriterOutput = await this.runRewriterStage(request, reviewerFeedback, executorSummary, agentRunId, onStateChange, options, profile);
-          rewriterSummaryForPrompt = renderRewriterSummary(rewriterOutput);
+        if (!hasPendingIssues || profile !== "full" || repairs >= maxRepairRounds) {
+          break;
+        }
+
+        const beforeWrites = successfulWriteKeys([
+          ...executorToolCalls,
+          ...(rewriterOutput?.toolCalls ?? []),
+        ]);
+        repairs++;
+        onStateChange({ stage: "rewriter", status: "running", output: `\nReviewer flagged issues. Rewriting...\n` });
+        rewriterOutput = await this.runRewriterStage(request, reviewerFeedback, executorSummary, agentRunId, onStateChange, options, profile);
+        rewriterSummaryForPrompt = renderRewriterSummary(rewriterOutput);
+        const afterWrites = successfulWriteKeys([
+          ...executorToolCalls,
+          ...(rewriterOutput.toolCalls ?? []),
+        ]);
+        if (!addedWriteProgress(beforeWrites, afterWrites)) {
+          hasPendingIssues = true;
+          break;
         }
       } catch (e: any) {
         const message = errText(e);
@@ -838,7 +875,7 @@ export class PipelineExecutor {
           id: `stage_${crypto.randomUUID()}`,
           agent_run_id: agentRunId,
           mode_id: "reviewer",
-          turn_number: loopCount,
+          turn_number: reviewCount,
           tool_calls_json: "[]",
           duration_ms: Date.now() - revStartTime,
           was_successful: 0,
@@ -998,7 +1035,7 @@ export class PipelineExecutor {
     }
     if (stages.includes("reviewer")) {
       const { reviewer, rewriter } = await this.runReviewerRewriterLoop(
-        request, renderPlanSummary(state.plan), renderExecutorSummary(state.executor),
+        request, renderPlanSummary(state.plan), renderExecutorSummary(state.executor), state.executor?.toolCalls ?? [],
         agentRunId, onStateChange, options, profile,
       );
       state.reviewer = reviewer;
@@ -1018,6 +1055,7 @@ export class PipelineExecutor {
     if (
       effectGate.verdict === "no_write_effect" &&
       profile === "full" &&
+      (options.maxReviewRepairRounds ?? 1) > 0 &&
       hasMutationIntent(request) &&
       state.executor &&
       !state.rewriter

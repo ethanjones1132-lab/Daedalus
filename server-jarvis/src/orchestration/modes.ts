@@ -45,7 +45,7 @@ export const BUILTIN_MODES: Record<string, AgentMode> = {
     max_tokens: 4096,
     requires_memory: true,
     is_final: false,
-    max_turns: 10,
+    max_turns: 4,
   },
   reviewer: {
     id: "reviewer",
@@ -65,7 +65,7 @@ export const BUILTIN_MODES: Record<string, AgentMode> = {
     max_tokens: 4096,
     requires_memory: true,
     is_final: false,
-    max_turns: 5,
+    max_turns: 3,
   },
   synthesizer: {
     id: "synthesizer",
