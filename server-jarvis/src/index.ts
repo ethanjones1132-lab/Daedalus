@@ -2432,6 +2432,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           sessionMemory: sessionMemory,
           distilledSkillsBlock: resolvedSkills.promptBlock,
           maxRecursionDepth: cfg.orchestrator.max_recursion_depth,
+          maxReviewRepairRounds: cfg.orchestrator.max_review_repair_rounds,
           onRecursion: async (event: PipelineRecursionEvent) => {
             await writer.write(encoder.encode(`data: ${JSON.stringify({
               type: "orchestrator_recursion",
