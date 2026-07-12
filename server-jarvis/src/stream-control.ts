@@ -93,7 +93,8 @@ export type ReadStopReason =
   | "stream_idle_timeout"
   | "turn_cancelled"
   | "turn_deadline_exceeded"
-  | "visible_progress_timeout";
+  | "visible_progress_timeout"
+  | "degenerate_stream";
 
 export interface StreamTerminalEvent {
   readonly type?: string;
@@ -118,10 +119,13 @@ export function resolveReadStopReason(options: {
   streamIdleTimedOut: boolean;
   visibleProgressTimedOut?: boolean;
   turnDeadlineExceeded?: boolean;
+  /** Set by the periodic tail-repetition check (stream-degeneration.ts). */
+  degenerateStreamDetected?: boolean;
   signal: AbortSignal;
 }): ReadStopReason | null {
   if (options.firstTokenTimedOut) return "first_token_timeout";
   if (options.streamIdleTimedOut) return "stream_idle_timeout";
+  if (options.degenerateStreamDetected) return "degenerate_stream";
   if (options.signal.aborted) return "turn_cancelled";
   if (options.turnDeadlineExceeded) return "turn_deadline_exceeded";
   if (options.visibleProgressTimedOut) return "visible_progress_timeout";

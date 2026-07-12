@@ -197,6 +197,16 @@ export interface PipelineResult {
   outcome?: PipelineOutcome;
   /** Machine-readable failure reason (e.g. "empty_completion", "auth_401"). */
   error_code?: string;
+  /**
+   * Successful/failed tool calls from the final segment's executor stage, if
+   * one ran this turn. Populated so callers (the cross-turn no-progress
+   * guard in orchestration/repetition-guard.ts) can tell whether a turn
+   * gathered any new evidence without re-deriving it from stage state.
+   * Undefined/absent when the executor stage never ran (e.g. a
+   * conversational turn that only hit the synthesizer, or a speculative
+   * topology that has no ToolCallRecord[] to report).
+   */
+  toolCalls?: ToolCallRecord[];
 }
 
 /**
@@ -265,6 +275,14 @@ export function describePipelineError(raw: string): string {
   }
   if (/first-token timeout|stream idle timeout/i.test(msg)) {
     return `The answering model stalled before responding, so I aborted it. Try again — the router will pick a different model. (${msg})`;
+  }
+  // Intra-stream decoding-loop degeneration (index.ts's DegenerateStreamError,
+  // driven by stream-degeneration.ts's periodic tail check). A stage-level
+  // catch (e.g. the synthesizer) absorbs this the same way it absorbs a
+  // first-token/stream-idle timeout, so it needs the same friendly rewrite
+  // instead of the bare "Degenerate stream detected on model=..." text.
+  if (/degenerate stream detected/i.test(msg)) {
+    return `The model got stuck repeating the same phrase instead of producing a real answer, so I stopped the stalled generation. Try again — the router can pick a different model. (${msg})`;
   }
   return msg;
 }
@@ -1163,6 +1181,7 @@ export class PipelineExecutor {
         recursion_depth: 0,
         outcome: "failed",
         error_code: "missing_workspace_evidence",
+        toolCalls: state.executor?.toolCalls,
       };
     }
 
@@ -1188,6 +1207,7 @@ export class PipelineExecutor {
         recursion_depth: 0,
         outcome: gated.outcome,
         error_code: gated.errorCode,
+        toolCalls: state.executor?.toolCalls,
       };
     }
 
@@ -1231,6 +1251,7 @@ export class PipelineExecutor {
       recursion_depth: 0,
       outcome,
       error_code: errorCode,
+      toolCalls: state.executor?.toolCalls,
     };
     if (!segment.synthesizerFatalError && !segment.synthesizerEmptyCompletion && pipeline.includes("synthesizer")) {
       return this.applyRecursiveCritique(request, result, agentRunId, onStateChange, options);

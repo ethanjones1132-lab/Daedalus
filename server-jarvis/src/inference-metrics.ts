@@ -86,6 +86,7 @@ export type InferenceAttemptOutcome =
   | "first_token_timeout"
   | "stream_idle_timeout"
   | "visible_progress_timeout"
+  | "degenerate_stream"
   | "empty_completion"
   | "http_error";
 

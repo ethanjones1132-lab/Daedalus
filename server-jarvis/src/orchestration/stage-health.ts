@@ -4,7 +4,8 @@ export type RecoverableFailureKind =
   | "first_token_timeout"
   | "stream_idle_timeout"
   | "visible_progress_timeout"
-  | "empty_completion";
+  | "empty_completion"
+  | "degenerate_stream";
 
 export interface StageModelFailure {
   provider: string;
@@ -24,6 +25,11 @@ const COOLDOWN_MS: Record<RecoverableFailureKind, number> = {
   stream_idle_timeout: 5 * 60_000,
   visible_progress_timeout: 5 * 60_000,
   empty_completion: 2 * 60_000,
+  // A decoding-loop degeneration is a worse signal than a bare empty
+  // completion (the model didn't just fail to answer, it burned the whole
+  // generation on a repeating phrase) — use the longer stream-failure
+  // cooldown, not the shorter empty_completion one.
+  degenerate_stream: 5 * 60_000,
 };
 
 function modelKey(provider: string, modelId: string): string {

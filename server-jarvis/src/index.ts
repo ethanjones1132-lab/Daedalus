@@ -88,6 +88,8 @@ import {
   resolveReadStopReason,
 } from "./stream-control";
 import { prepareToolResultForContext } from "./tool-result-truncation";
+import { detectDegenerateTail } from "./stream-degeneration";
+import { SessionRepetitionStore, assessRepetition } from "./orchestration/repetition-guard";
 import { Coordinator } from "./orchestration/coordinator";
 import { PersistentConductor } from "./orchestration/persistent-conductor";
 import { SessionMemory, mergeSharedContextHints } from "./orchestration/session-memory";
@@ -220,10 +222,15 @@ const MAX_TOOL_EXECUTION_TURNS = 10;
 const activeStreams = new ActiveStreamRegistry();
 const orchestrationAdmission = new OrchestrationAdmissionController({ interactive: 2, background: 1 });
 const stageHealth = new StageHealthRegistry();
+// Cross-turn no-progress guard (orchestration/repetition-guard.ts): compares
+// a finalized turn's answer + evidence keys against the previous turn's, for
+// the same session. See the 2026-07-12 incident note in repetition-guard.ts.
+const repetitionStore = new SessionRepetitionStore();
 const RECOVERABLE_STAGE_FAILURES = new Set([
   "FirstTokenTimeoutError",
   "StreamIdleTimeoutError",
   "VisibleProgressTimeoutError",
+  "DegenerateStreamError",
 ]);
 
 function recoverableStageFailure(error: unknown): {
@@ -246,7 +253,9 @@ function recoverableStageFailure(error: unknown): {
     ? "first_token_timeout"
     : candidate.name === "StreamIdleTimeoutError"
       ? "stream_idle_timeout"
-      : "visible_progress_timeout";
+      : candidate.name === "DegenerateStreamError"
+        ? "degenerate_stream"
+        : "visible_progress_timeout";
   return { kind, provider, modelId, stage: String(candidate.stage ?? "agent") };
 }
 
@@ -1099,6 +1108,27 @@ class FirstTokenTimeoutError extends Error {
   }
 }
 
+/**
+ * Thrown when the intra-stream degeneration guard (stream-degeneration.ts)
+ * detects a phrase/unit repeating many times within a single generation's
+ * output tail — classic LLM decoding-loop failure. Distinct from
+ * StreamCancelledError (user-initiated) and from the cross-turn
+ * no-progress repetition guard in orchestration/repetition-guard.ts (which
+ * compares ACROSS turns, not within one generation).
+ */
+class DegenerateStreamError extends Error {
+  readonly model: string;
+  readonly stage: string;
+  readonly provider: string;
+  constructor(model: string, stage: string, provider = "unknown") {
+    super(`Degenerate stream detected on model=${model} stage=${stage}`);
+    this.name = "DegenerateStreamError";
+    this.model = model;
+    this.stage = stage;
+    this.provider = provider;
+  }
+}
+
 /** Collect aggregate answer from a streamJarvis Response (cron scheduler contract). */
 async function drainStreamJarvisResponse(resp: Response): Promise<{ output: string; error?: string }> {
   const reader = resp.body?.getReader();
@@ -1842,6 +1872,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let streamIdleTimeoutFired = false;
           let visibleProgressTimeoutFired = false;
           let turnDeadlineExceeded = false;
+          // Intra-stream degeneration guard (stream-degeneration.ts): every 16
+          // content chunks, check whether the accumulated answer's tail has
+          // collapsed into a repeating phrase/unit (decoding-loop failure).
+          // Counted on content-bearing chunks only, not every SSE line/JSON
+          // parse, so the check frequency tracks visible output growth.
+          let degenerateCheckCounter = 0;
+          let degenerateStreamDetected = false;
           const stageName = callOptions?.stageLabel ?? "agent";
           const streamLiveness = createStreamLivenessTracker({
             interTokenMs: MODEL_INTER_TOKEN_TIMEOUT_MS,
@@ -1908,6 +1945,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               streamIdleTimedOut: streamIdleTimeoutFired,
               visibleProgressTimedOut: visibleProgressTimeoutFired,
               turnDeadlineExceeded,
+              degenerateStreamDetected,
               signal: streamAbort.signal,
             });
             if (stopReason === "first_token_timeout") {
@@ -1915,6 +1953,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
             if (stopReason === "stream_idle_timeout") {
               throw new StreamIdleTimeoutError(actualModelUsed, stageName, MODEL_INTER_TOKEN_TIMEOUT_MS, actualProviderUsed);
+            }
+            if (stopReason === "degenerate_stream") {
+              throw new DegenerateStreamError(actualModelUsed, stageName, actualProviderUsed);
             }
             if (stopReason === "turn_cancelled") await emitCancelled();
             if (stopReason === "turn_deadline_exceeded") {
@@ -1954,6 +1995,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                   if (chunkText) {
                     markTransportProgress();
                     fullTurnText += chunkText;
+                    degenerateCheckCounter++;
+                    if (!degenerateStreamDetected && degenerateCheckCounter % 16 === 0 && detectDegenerateTail(fullTurnText)) {
+                      degenerateStreamDetected = true;
+                      console.warn(`[Jarvis Orchestrator] degenerate stream detected model=${actualModelUsed} stage=${stageName} — cancelling reader`);
+                      cancelReader("Degenerate stream detected").catch(() => {});
+                    }
                     if (callOptions?.onChunk) {
                       callOptions.onChunk(chunkText);
                     }
@@ -2173,7 +2220,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 ? "stream_idle_timeout"
                 : name === "VisibleProgressTimeoutError"
                   ? "visible_progress_timeout"
-                  : "http_error";
+                  : name === "DegenerateStreamError"
+                    ? "degenerate_stream"
+                    : "http_error";
             const failure = error as { model?: unknown; provider?: unknown };
             if (typeof failure?.model === "string") attemptModel = failure.model;
             if (typeof failure?.provider === "string") attemptProvider = failure.provider;
@@ -2726,9 +2775,41 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             fallback_used: turnMetrics.fallback_successes > 0,
             retry_count: turnMetrics.failed_attempts,
           });
-          await session.finish(trimmedAnswer || result.answer, result.outcome === "partial"
+
+          // Cross-turn no-progress guard (2026-07-12 incident, Task 1.3):
+          // a turn that produced a real answer can still be a no-progress
+          // repeat of the last turn — same non-answer text, zero new
+          // evidence gathered. Only checked for turn types where evidence
+          // (workspace tool calls) is meaningful; conversational/answer_only
+          // turns never gather tool evidence and are exempt by design.
+          const evidenceBearing = turnReq.requirement === "workspace_read" || turnReq.requirement === "full_execution";
+          const evidenceKeys = (result.toolCalls ?? [])
+            .filter((c) => !c.is_error)
+            .map((c) => `${c.name}:${JSON.stringify(c.arguments)}`);
+          const repetitionVerdict = evidenceBearing
+            ? assessRepetition(repetitionStore.lastSignature(sessionId), trimmedAnswer, evidenceKeys)
+            : { repeated: false, similarity: 0, newEvidence: false };
+
+          let finalAnswer = trimmedAnswer || result.answer;
+          if (repetitionVerdict.repeated) {
+            console.warn(`[Jarvis Orchestrator] no-progress repetition detected session=${sessionId} similarity=${repetitionVerdict.similarity.toFixed(2)} — refusing to re-emit`);
+            finalAnswer =
+              "I produced essentially the same answer as last turn without gathering any new evidence, so repeating it would waste your time. " +
+              "The underlying problem: the execution stage did not read the files it needed. " +
+              "Tell me a specific file or directory to start from, or say 'force deep read' to retry with extended budgets.";
+          } else {
+            // Only record on the non-repeated path: the stored signature must
+            // always reflect the last DISTINCT thing actually shown to the
+            // user, never the canned refusal message above — otherwise a
+            // third consecutive distinct-but-still-looping answer would be
+            // compared against the refusal text instead of the real prior
+            // answer.
+            repetitionStore.record(sessionId, trimmedAnswer, evidenceKeys);
+          }
+
+          await session.finish(finalAnswer, result.outcome === "partial"
             ? { subtype: "partial", code: result.error_code }
-            : undefined);
+            : (repetitionVerdict.repeated ? { subtype: "partial", code: "no_progress_repetition" } : undefined));
         }
         return;
       }
@@ -3092,6 +3173,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         }, firstTokenMs);
         let streamIdleTimeoutFired = false;
         let turnDeadlineExceeded = false;
+        // Intra-stream degeneration guard (stream-degeneration.ts): see the
+        // matching comment in the orchestrator callModel read loop above.
+        let degenerateCheckCounter = 0;
+        let degenerateStreamDetected = false;
         const streamIdleWatchdog = new ResettableWatchdog(
           MODEL_INTER_TOKEN_TIMEOUT_MS,
           () => {
@@ -3143,6 +3228,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               firstTokenTimedOut: firstTokenTimeoutFired,
               streamIdleTimedOut: streamIdleTimeoutFired,
               turnDeadlineExceeded,
+              degenerateStreamDetected,
               signal: streamAbort.signal,
             });
             if (stopReason === "first_token_timeout") {
@@ -3150,6 +3236,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
             if (stopReason === "stream_idle_timeout") {
               throw new StreamIdleTimeoutError(actualModelUsed, "agent_loop", MODEL_INTER_TOKEN_TIMEOUT_MS, lastProviderUsed);
+            }
+            if (stopReason === "degenerate_stream") {
+              throw new DegenerateStreamError(modelName, "agent_loop", lastProviderUsed);
             }
             if (stopReason === "turn_cancelled") await emitCancelled();
             if (stopReason === "turn_deadline_exceeded") {
@@ -3191,6 +3280,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                     markSemanticProgress();
                     turnText += content;
                     fullText += content;
+                    degenerateCheckCounter++;
+                    if (!degenerateStreamDetected && degenerateCheckCounter % 16 === 0 && detectDegenerateTail(turnText)) {
+                      degenerateStreamDetected = true;
+                      console.warn(`[Jarvis Agent Loop] degenerate stream detected model=${modelName} stage=agent_loop — cancelling reader`);
+                      cancelReader("Degenerate stream detected").catch(() => {});
+                    }
                     if (!holdVisibleText) await emitVisibleText(content);
                   }
                 }
@@ -3547,6 +3642,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       const isStreamIdleTimeout = error?.name === "StreamIdleTimeoutError";
       const isVisibleProgressTimeout = error?.name === "VisibleProgressTimeoutError";
       const isTurnDeadlineExceeded = error?.name === "TurnDeadlineExceededError";
+      const isDegenerateStream = error?.name === "DegenerateStreamError";
       const errorCode = isFirstTokenTimeout
         ? "first_token_timeout"
         : isStreamIdleTimeout
@@ -3555,6 +3651,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             ? "visible_progress_timeout"
             : isTurnDeadlineExceeded
               ? "turn_deadline_exceeded"
+              : isDegenerateStream
+                ? "degenerate_stream"
           : undefined;
       const userFacingMsg = isFirstTokenTimeout
         ? `The model did not produce any output within the per-model first-token window. ` +
@@ -3572,6 +3670,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           ? `The total server turn deadline expired before Jarvis finished. ` +
             `The turn was stopped cleanly instead of stalling indefinitely. ` +
             `(stage=${error?.stage ?? "unknown"}, budget=${error?.budgetMs ?? TOTAL_TURN_TIMEOUT_MS}ms)`
+        : isDegenerateStream
+          ? `The model got stuck repeating the same phrase over and over instead of producing a real answer. ` +
+            `Jarvis stopped the stalled generation instead of streaming the loop to you. ` +
+            `Try again — the router will pick a different model. (${error?.model ?? "unknown model"}, stage=${error?.stage ?? "unknown"})`
         : errMsg;
       console.error(`[Jarvis] Stream error session=${sessionId} code=${errorCode ?? "<generic>"}:`, userFacingMsg);
       const _cfg3 = resolveConfig(options.config);

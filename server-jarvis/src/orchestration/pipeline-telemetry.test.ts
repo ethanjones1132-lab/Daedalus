@@ -83,6 +83,67 @@ describe("pipeline stage telemetry", () => {
     expect(successfulTurn?.error_message).toBeUndefined();
   });
 
+  // Task 1.3: PipelineResult.toolCalls is the evidence-plumbing seam the
+  // cross-turn no-progress guard (orchestration/repetition-guard.ts, wired
+  // in index.ts's streamJarvis success branch) reads to build its
+  // `evidenceKeys` set. If this field stops reflecting the executor's real
+  // tool calls, the guard silently degrades to "never sees new evidence".
+  test("PipelineResult.toolCalls surfaces the executor's tool call records", async () => {
+    const { runtime, ctx, collector } = telemetryHarness("read_file", async () => "file contents");
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor" && executorTurns++ === 0) {
+        return { content: "reading", tool_calls: [toolCallWithArgs("read_file", { path: "CONTEXT.md" })] };
+      }
+      if (options.stageLabel === "executor") {
+        return { content: "done reading" };
+      }
+      if (options.stageLabel === "synthesizer") {
+        return { content: "Here is the file summary." };
+      }
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "read CONTEXT.md and summarize it",
+      ["executor", "synthesizer"],
+      "run-toolcalls-surfaced",
+      () => {},
+      { executionProfile: "read_only" },
+    );
+
+    expect(result.outcome).toBe("success");
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls?.[0]).toMatchObject({
+      name: "read_file",
+      arguments: { path: "CONTEXT.md" },
+      is_error: false,
+    });
+  });
+
+  test("PipelineResult.toolCalls is undefined when the executor stage never ran", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "synthesizer") return { content: "Hi there!" };
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "hey",
+      ["synthesizer"],
+      "run-toolcalls-absent",
+      () => {},
+    );
+
+    expect(result.outcome).toBe("success");
+    expect(result.toolCalls).toBeUndefined();
+  });
+
   test("rewriter stage run records a failed tool result as an error", async () => {
     const { rows, runtime, ctx, collector } = telemetryHarness("boom", async () => {
       throw new Error("rewriter tool failure");

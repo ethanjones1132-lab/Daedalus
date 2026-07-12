@@ -221,6 +221,7 @@ function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean)
       recursion_depth: 0,
       outcome: gated.outcome,
       error_code: gated.errorCode,
+      toolCalls: segment.state.executor?.toolCalls,
     };
   }
 
@@ -264,5 +265,6 @@ function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean)
     recursion_depth: 0,
     outcome,
     error_code: errorCode,
+    toolCalls: segment.state.executor?.toolCalls,
   };
 }
