@@ -17,6 +17,7 @@ import type { ExecutionProfile } from "./route-normalization";
 import type { TurnRequirement } from "./turn-requirements";
 import type { PipelineStageState, PlannerStageOutput, ExecutorStageOutput, ReviewerStageOutput, RewriterStageOutput, ToolCallRecord } from "./stage-output";
 import { parseReviewerVerdict, renderExecutorSummary, renderPlanSummary, renderReviewerSummary, renderRewriterSummary } from "./stage-output";
+import { truncateToTokenBudget } from "./context-budget";
 
 /**
  * The slice of the outcome collector the pipeline depends on. Injecting this
@@ -656,11 +657,13 @@ export class PipelineExecutor {
     profile: ExecutionProfile,
   ): Promise<RewriterStageOutput> {
     const rewriterPrompt = stageSystemPrompt("rewriter", options);
+    const boundedReviewerFeedback = truncateToTokenBudget(reviewerFeedback, 2_000);
+    const boundedExecutorSummary = truncateToTokenBudget(executorSummary, 3_000);
     const rewriterMessages: ChatMessage[] = [
       { role: "system", content: rewriterPrompt },
       {
         role: "user",
-        content: `User Request: ${request}\n\nReviewer Feedback:\n${reviewerFeedback}\n\nExecutor Activity:\n${executorSummary}`
+        content: `User Request: ${truncateToTokenBudget(request, 1_000)}\n\nReviewer Feedback:\n${boundedReviewerFeedback}\n\nExecutor Activity:\n${boundedExecutorSummary}`
       }
     ];
     const toolCalls: ToolCallRecord[] = [];
@@ -788,6 +791,9 @@ export class PipelineExecutor {
     profile: ExecutionProfile,
   ): Promise<{ reviewer: ReviewerStageOutput; rewriter?: RewriterStageOutput }> {
     const reviewerPrompt = stageSystemPrompt("reviewer", options);
+    const boundedRequest = truncateToTokenBudget(request, 1_000);
+    const boundedPlanSummary = truncateToTokenBudget(planSummary, 1_000);
+    const boundedExecutorSummary = truncateToTokenBudget(executorSummary, 3_000);
     const configuredRepairRounds = Number(options.maxReviewRepairRounds ?? 1);
     const maxRepairRounds = Number.isFinite(configuredRepairRounds)
       ? Math.min(2, Math.max(0, Math.floor(configuredRepairRounds)))
@@ -810,7 +816,7 @@ export class PipelineExecutor {
           { role: "system", content: reviewerPrompt },
           {
             role: "user",
-            content: `User Request: ${request}\n\nOriginal Plan:\n${planSummary}\n\nExecutor Activity:\n${executorSummary}\n\nRewriter Activity:\n${rewriterSummaryForPrompt}`
+            content: `User Request: ${boundedRequest}\n\nOriginal Plan:\n${boundedPlanSummary}\n\nExecutor Activity:\n${boundedExecutorSummary}\n\nRewriter Activity:\n${truncateToTokenBudget(rewriterSummaryForPrompt, 1_000)}`
           }
         ] as ChatMessage[], {
           temperature: BUILTIN_MODES.reviewer.temperature,
@@ -831,7 +837,7 @@ export class PipelineExecutor {
           agent_run_id: agentRunId,
           mode_id: "reviewer",
           turn_number: reviewCount,
-          input_tokens: Math.round((reviewerPrompt.length + request.length + planSummary.length + executorSummary.length + rewriterSummaryForPrompt.length) / 4),
+          input_tokens: Math.round((reviewerPrompt.length + boundedRequest.length + boundedPlanSummary.length + boundedExecutorSummary.length + truncateToTokenBudget(rewriterSummaryForPrompt, 1_000).length) / 4),
           output_tokens: countTokens(reviewerFeedback),
           tool_calls_json: "[]",
           duration_ms: Date.now() - revStartTime,

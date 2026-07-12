@@ -1,6 +1,7 @@
 import { describe, test, expect } from "bun:test";
 import { buildSynthesizerContext, buildSynthesizerContextFromStageState } from "./synth-context";
 import type { PipelineStageState } from "./stage-output";
+import { countTokens } from "../tokens";
 
 describe("buildSynthesizerContext", () => {
   test("synthesizer-only turn passes just the user request (no empty scaffolding)", () => {
@@ -44,6 +45,28 @@ describe("buildSynthesizerContext", () => {
     expect(out).toContain("Ran the build successfully.");
     expect(out).not.toContain("<think>");
     expect(out).not.toContain("internal planning");
+  });
+
+  test("keeps synthesis payload bounded while preserving the latest request and write evidence", () => {
+    const state: PipelineStageState = {
+      executor: {
+        ok: true,
+        narrative: "executor narrative",
+        toolCalls: Array.from({ length: 20 }, (_, index) => ({
+          name: index === 19 ? "write_file" : "read_file",
+          arguments: { path: `src/file-${index}.ts` },
+          output: index === 19 ? "success" : "x".repeat(1_000),
+          is_error: false,
+          duration_ms: 1,
+        })),
+      },
+    };
+    const request = `Create the release artifact and verify it. ${"details ".repeat(800)}`;
+    const context = buildSynthesizerContextFromStageState(request, state);
+    expect(countTokens(context)).toBeLessThanOrEqual(6_000);
+    expect(context).toContain(request.slice(0, 80));
+    expect(context).toContain("write_file");
+    expect(context).toContain("success");
   });
 });
 

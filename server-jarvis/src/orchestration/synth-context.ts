@@ -1,4 +1,5 @@
 import { stripReasoningFromText } from "../reasoning";
+import { truncateToTokenBudget } from "./context-budget";
 import type { PipelineStageState } from "./stage-output";
 import {
   renderExecutorSummary,
@@ -36,20 +37,20 @@ export function buildSynthesizerContext(
   parts: SynthesizerParts,
   executionVerification = "",
 ): string {
-  const sections: string[] = [`User Request: ${request}`];
+  const sections: string[] = [`User Request: ${truncateToTokenBudget(request, 1_000)}`];
 
-  const plan = clean(parts.plan);
-  const executor = clean(parts.executorSummary);
-  const review = clean(parts.reviewerFeedback);
-  const rewrite = clean(parts.rewriterSummary);
+  const plan = truncateToTokenBudget(clean(parts.plan), 700);
+  const executor = truncateToTokenBudget(clean(parts.executorSummary), 2_600);
+  const review = truncateToTokenBudget(clean(parts.reviewerFeedback), 500);
+  const rewrite = truncateToTokenBudget(clean(parts.rewriterSummary), 800);
 
   if (isMeaningful(plan)) sections.push(`Original Plan:\n${plan}`);
   if (isMeaningful(executor)) sections.push(`Executor Activity:\n${executor}`);
   if (isMeaningful(review)) sections.push(`Reviewer Feedback:\n${review}`);
   if (isMeaningful(rewrite)) sections.push(`Rewriter Activity:\n${rewrite}`);
-  if (isMeaningful(clean(executionVerification))) sections.push(clean(executionVerification));
+  if (isMeaningful(clean(executionVerification))) sections.push(truncateToTokenBudget(clean(executionVerification), 400));
 
-  return sections.join("\n\n");
+  return truncateToTokenBudget(sections.join("\n\n"), 6_000);
 }
 
 /**

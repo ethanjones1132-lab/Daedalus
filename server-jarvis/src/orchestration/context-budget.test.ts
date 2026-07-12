@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { countTokens } from "../tokens";
-import { buildBoundedHistoryBlock } from "./context-budget";
+import { buildBoundedHistoryBlock, truncateToTokenBudget } from "./context-budget";
 
 describe("buildBoundedHistoryBlock", () => {
   test("respects the history-line token budget", () => {
@@ -30,5 +30,17 @@ describe("buildBoundedHistoryBlock", () => {
       { role: "assistant", content: "hi" },
     ];
     expect(buildBoundedHistoryBlock(history)).toBe("[USER]: hello\n[ASSISTANT]: hi");
+  });
+
+  test("zero history budget returns no transcript", () => {
+    expect(buildBoundedHistoryBlock([{ role: "user", content: "do not replay" }], 0)).toBe("");
+  });
+
+  test("truncates dynamic payloads while retaining both ends", () => {
+    const value = `latest request ${"a".repeat(4_000)} final write_file success`;
+    const output = truncateToTokenBudget(value, 80);
+    expect(countTokens(output)).toBeLessThanOrEqual(80);
+    expect(output).toContain("latest request");
+    expect(output).toContain("write_file success");
   });
 });

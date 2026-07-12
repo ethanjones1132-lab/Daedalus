@@ -1,4 +1,30 @@
 import { countTokens } from "../tokens";
+import type { TurnRequirement } from "./turn-requirements";
+
+export const HISTORY_BUDGET_TOKENS: Record<TurnRequirement, number> = {
+  conversational: 0,
+  answer_only: 1_200,
+  workspace_read: 2_000,
+  full_execution: 2_400,
+};
+
+/** Trim dynamic stage text while preserving both the newest request prefix and
+ * the tail where the latest tool effects and terminal status are rendered. */
+export function truncateToTokenBudget(text: string, budgetTokens: number): string {
+  if (!text || budgetTokens <= 0) return "";
+  if (countTokens(text) <= budgetTokens) return text;
+  let headChars = Math.max(80, Math.floor(budgetTokens * 4 * 0.68));
+  let tailChars = Math.max(40, Math.floor(budgetTokens * 4 * 0.24));
+  const marker = "\n...[context truncated for latency budget]...\n";
+  let output = "";
+  while (headChars + tailChars > 120) {
+    output = `${text.slice(0, headChars)}${marker}${text.slice(-tailChars)}`;
+    if (countTokens(output) <= budgetTokens) return output;
+    headChars = Math.floor(headChars * 0.9);
+    tailChars = Math.floor(tailChars * 0.9);
+  }
+  return output || text.slice(0, Math.max(1, budgetTokens * 4));
+}
 
 /** Newest-first token-budgeted history block for the orchestrator contextMessage. */
 export function buildBoundedHistoryBlock(
@@ -6,6 +32,7 @@ export function buildBoundedHistoryBlock(
   budgetTokens = 4_000,
   perMessageChars = 1_000,
 ): string {
+  if (budgetTokens <= 0 || turnHistory.length === 0) return "";
   const lines: string[] = [];
   let used = 0;
   for (let index = turnHistory.length - 1; index >= 0; index--) {

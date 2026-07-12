@@ -115,7 +115,7 @@ import {
   type ExecutionProfile,
 } from "./orchestration/route-normalization";
 import { runPipelineWithReplanning } from "./orchestration/replan-loop";
-import { buildBoundedHistoryBlock } from "./orchestration/context-budget";
+import { buildBoundedHistoryBlock, HISTORY_BUDGET_TOKENS } from "./orchestration/context-budget";
 import { SessionReplanCounter } from "./orchestration/replan-telemetry";
 import { conductorLearning, outcomeCollector, selfTuningProposer, SelfTuningStore } from "./self-tuning/mod";
 import { conductorCacheSnapshot, conductorDirectiveSnapshot, recordConductorDirective } from "./orchestration/conductor-metrics";
@@ -1509,7 +1509,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // Setup context message using turn history if present
         let contextMessage = message;
         if (turnHistory.length > 0) {
-          contextMessage = `Conversation History:\n${buildBoundedHistoryBlock(turnHistory)}\n\nLatest User Request: ${message}`;
+          const historyBudget = HISTORY_BUDGET_TOKENS[initialRequirement];
+          const historyBlock = buildBoundedHistoryBlock(turnHistory, historyBudget, 800);
+          contextMessage = historyBlock
+            ? `Conversation History:\n${historyBlock}\n\nLatest User Request: ${message}`
+            : message;
         }
 
         let orchestratorTaskType = "general";
@@ -2356,7 +2360,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const agentRunId = `run_${crypto.randomUUID()}`;
         orchestratorAgentRunId = agentRunId;
         selfTuningProposer.initializeTunedConfigs();
-        outcomeCollector.startAgentRun(agentRunId, sessionId, contextMessage, route.task_type, executablePipeline);
+        outcomeCollector.startAgentRun(agentRunId, sessionId, message, route.task_type, executablePipeline);
         if (route.routing_parse_fallback) {
           await writer.write(encoder.encode(`data: ${JSON.stringify({
             type: "fallback_notice",
