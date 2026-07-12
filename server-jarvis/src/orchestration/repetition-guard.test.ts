@@ -54,12 +54,31 @@ describe("repetition-guard", () => {
     expect(verdict.repeated).toBe(false);
   });
 
+  test("two unrelated near-empty answers are not flagged as repeated", () => {
+    const store = new SessionRepetitionStore();
+    store.record("s4", "No", ["x"]);
+    const verdict = assessRepetition(store.lastSignature("s4"), "Ok", ["x"]);
+    expect(verdict.repeated).toBe(false);
+    expect(verdict.similarity).toBe(0);
+  });
+
   test("store evicts sessions beyond capacity", () => {
     const store = new SessionRepetitionStore(2);
     store.record("a", "one", []);
     store.record("b", "two", []);
     store.record("c", "three", []);
     expect(store.lastSignature("a")).toBeUndefined();
+    expect(store.lastSignature("c")).toBeDefined();
+  });
+
+  test("re-recording an existing session refreshes its recency and protects it from eviction", () => {
+    const store = new SessionRepetitionStore(2);
+    store.record("a", "one", []);
+    store.record("b", "two", []);
+    store.record("a", "one-again", []);
+    store.record("c", "three", []);
+    expect(store.lastSignature("b")).toBeUndefined();
+    expect(store.lastSignature("a")).toBeDefined();
     expect(store.lastSignature("c")).toBeDefined();
   });
 });

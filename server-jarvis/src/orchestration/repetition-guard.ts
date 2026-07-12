@@ -62,7 +62,21 @@ export function assessRepetition(
       break;
     }
   }
-  const similarity = jaccard(previous.trigrams, trigramsOf(answer));
+  const answerTrigrams = trigramsOf(answer);
+  // jaccard() treats two empty sets as identical (similarity 1), which is the
+  // right convention for the function in isolation but wrong here: two short
+  // answers (e.g. "No" vs "Ok", both under 3 normalized chars) would then be
+  // scored as a maximal-similarity repeat with zero signal behind it. Since
+  // TurnSignature doesn't retain the original answer text, we can't fall back
+  // to string equality — instead, near-empty-on-both-sides is treated as "not
+  // enough signal to call it a repetition" at all. This is conservative: a
+  // genuine short-answer repetition loop won't be caught, but that's out of
+  // scope for this detector (built for the incident's multi-sentence
+  // non-answer case, not one-word replies).
+  const similarity =
+    previous.trigrams.size === 0 && answerTrigrams.size === 0
+      ? 0
+      : jaccard(previous.trigrams, answerTrigrams);
   return {
     repeated: similarity >= REPETITION_SIMILARITY_THRESHOLD && !newEvidence,
     similarity,
