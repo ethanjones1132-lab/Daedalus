@@ -93,11 +93,32 @@ Write-Step 'Stage 1/4 - Building server bundle (bun)'
 # to a quoted string literal (verified both ways via scratch repro 2026-07-04).
 $buildGitSha = (git -C $repo rev-parse HEAD)
 $buildBuiltAt = (Get-Date -Format 'o')
+$buildGitDirty = -not [string]::IsNullOrWhiteSpace((git -C $repo status --porcelain))
+$sourceRoots = @(
+    (Join-Path $repo 'server-jarvis\src'),
+    (Join-Path $repo 'src-tauri\src'),
+    (Join-Path $repo 'src-ui\src'),
+    (Join-Path $repo 'scripts')
+)
+$sourceFiles = Get-ChildItem -LiteralPath $sourceRoots -Recurse -File | Sort-Object FullName
+$sourceTreeText = foreach ($file in $sourceFiles) {
+    $relative = $file.FullName.Substring($repo.Length).TrimStart('\')
+    "${relative}:$((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash)"
+}
+$sha256 = [Security.Cryptography.SHA256]::Create()
+try {
+    $sourceTreeBytes = [Text.Encoding]::UTF8.GetBytes(($sourceTreeText -join "`n"))
+    $sourceTreeSha256 = ([BitConverter]::ToString($sha256.ComputeHash($sourceTreeBytes))).Replace('-', '')
+} finally {
+    $sha256.Dispose()
+}
 Push-Location $serverDir
 try {
     & $bun build ./src/index.ts --outdir ./dist --target bun `
         --define "process.env.JARVIS_GIT_SHA=\`"$buildGitSha\`"" `
-        --define "process.env.JARVIS_BUILT_AT=\`"$buildBuiltAt\`""
+        --define "process.env.JARVIS_BUILT_AT=\`"$buildBuiltAt\`"" `
+        --define "process.env.JARVIS_GIT_DIRTY=$($buildGitDirty.ToString().ToLowerInvariant())" `
+        --define "process.env.JARVIS_SOURCE_TREE_SHA256=\`"$sourceTreeSha256\`""
     if ($LASTEXITCODE -ne 0) { Die 'server bundle build failed' }
 } finally { Pop-Location }
 if (-not (Test-Path $distJs)) { Die "server bundle not produced at $distJs" }
@@ -180,6 +201,8 @@ Write-Ok 'prompts/'
 # case HEAD moves mid-run.
 $manifest = @{
     git_sha = $buildGitSha
+    git_dirty = $buildGitDirty
+    source_tree_sha256 = $sourceTreeSha256
     index_js_sha256 = (Get-FileHash "$desktop\index.js" -Algorithm SHA256).Hash
     inference_metrics_sha256 = (Get-FileHash "$desktop\automate_inference_metrics.py" -Algorithm SHA256).Hash
     exe_mtime = (Get-Item "$desktop\Jarvis.exe" -ErrorAction SilentlyContinue).LastWriteTimeUtc.ToString("o")

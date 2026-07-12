@@ -61,7 +61,8 @@ export function applyInferenceFeedback(
       continue;
     }
     const stageAdj = raw as Record<string, unknown>;
-    if (Number(stageAdj.sample_count) < minSamples) {
+    const sampleCount = Number(stageAdj.sample_count);
+    if (!Number.isFinite(sampleCount) || sampleCount < minSamples) {
       ignored += 1;
       continue;
     }

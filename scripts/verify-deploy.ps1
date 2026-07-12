@@ -23,6 +23,25 @@ if (-not (Test-Path $manifestPath)) {
 
 $manifest = Get-Content $manifestPath | ConvertFrom-Json
 $gitSha = git -C $repoRoot rev-parse HEAD
+$gitDirty = -not [string]::IsNullOrWhiteSpace((git -C $repoRoot status --porcelain))
+$sourceRoots = @(
+    (Join-Path $repoRoot 'server-jarvis\src'),
+    (Join-Path $repoRoot 'src-tauri\src'),
+    (Join-Path $repoRoot 'src-ui\src'),
+    (Join-Path $repoRoot 'scripts')
+)
+$sourceFiles = Get-ChildItem -LiteralPath $sourceRoots -Recurse -File | Sort-Object FullName
+$sourceTreeText = foreach ($file in $sourceFiles) {
+    $relative = $file.FullName.Substring($repoRoot.Length).TrimStart('\')
+    "${relative}:$((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash)"
+}
+$sha256 = [Security.Cryptography.SHA256]::Create()
+try {
+    $sourceTreeBytes = [Text.Encoding]::UTF8.GetBytes(($sourceTreeText -join "`n"))
+    $sourceTreeSha256 = ([BitConverter]::ToString($sha256.ComputeHash($sourceTreeBytes))).Replace('-', '')
+} finally {
+    $sha256.Dispose()
+}
 
 if (-not [string]::IsNullOrWhiteSpace($ExpectSha) -and $ExpectSha -ne $gitSha) {
     Write-Error "EXPECTATION INVALID: requested SHA $ExpectSha != repo HEAD $gitSha"
@@ -41,6 +60,16 @@ if ((Get-FileHash "$deployDir\index.js" -Algorithm SHA256).Hash -ne $manifest.in
     exit 1
 } else {
     Write-Host "index.js hash matches manifest." -ForegroundColor Green
+}
+if ([bool]$manifest.git_dirty -ne $gitDirty) {
+    Write-Error "DEPLOY STALE: manifest git_dirty $($manifest.git_dirty) != current worktree dirty state $gitDirty"
+    exit 1
+}
+if ($manifest.source_tree_sha256 -ne $sourceTreeSha256) {
+    Write-Error "DEPLOY STALE: manifest source_tree_sha256 does not match the current source tree"
+    exit 1
+} else {
+    Write-Host "Source tree digest matches manifest." -ForegroundColor Green
 }
 
 $metricsPath = Join-Path $deployDir 'automate_inference_metrics.py'
@@ -92,6 +121,14 @@ if ($null -ne $health) {
         exit 1
     } else {
         Write-Host "Running server git_sha matches manifest ($runningSha)." -ForegroundColor Green
+        if ([bool]$health.git_dirty -ne [bool]$manifest.git_dirty) {
+            Write-Error "DEPLOY MISMATCH: running server git_dirty $($health.git_dirty) != manifest git_dirty $($manifest.git_dirty)."
+            exit 1
+        }
+        if ($health.source_tree_sha256 -ne $manifest.source_tree_sha256) {
+            Write-Error "DEPLOY MISMATCH: running server source_tree_sha256 differs from manifest."
+            exit 1
+        }
         $listener = Get-NetTCPConnection -State Listen -LocalPort 19877 -ErrorAction SilentlyContinue |
             Select-Object -First 1
         if (-not $listener) {

@@ -73,6 +73,24 @@ describe("inference feedback policy", () => {
     expect(pool.pickFor("synthesizer", "general")?.id).toBe("slow-default");
     expect(firstTokenTimeoutFor(pool, "slow-model", 30_000, 60_000, "openrouter")).toBe(30_000);
   });
+
+  test("ignores stage adjustments with non-numeric sample counts", () => {
+    const result = applyInferenceFeedback({
+      ...policy("2026-07-12T00:00:00.000Z"),
+      routing_policy: {
+        min_samples: 5,
+        model_adjustments: {},
+        stage_adjustments: {
+          "openrouter:slow-model:synthesizer": {
+            sample_count: "not-a-number",
+            routing_score_delta: -0.2,
+          },
+        },
+      },
+    }, { now: new Date("2026-07-10T12:00:00.000Z") });
+
+    expect(result).toEqual({ applied: 0, ignored: 1, reason: undefined });
+  });
 });
 
 describe("cron feedback refresh", () => {

@@ -491,6 +491,12 @@ const JARVIS_VERSION = "3.0.0";
 // back to reading the real env var and finally to the "dev" sentinel.
 const JARVIS_GIT_SHA = process.env.JARVIS_GIT_SHA ?? "dev";
 const JARVIS_BUILT_AT = process.env.JARVIS_BUILT_AT ?? null;
+const JARVIS_GIT_DIRTY = process.env.JARVIS_GIT_DIRTY === "true"
+  ? true
+  : process.env.JARVIS_GIT_DIRTY === "false"
+    ? false
+    : null;
+const JARVIS_SOURCE_TREE_SHA256 = process.env.JARVIS_SOURCE_TREE_SHA256 ?? null;
 
 let totalRequests = 0;
 const startTime = Date.now();
@@ -3718,6 +3724,8 @@ export async function baseFetch(req: Request): Promise<Response> {
         model_resolved: configured_model ? equivalentOllamaModelName(model, configured_model) : true,
         git_sha: JARVIS_GIT_SHA,
         built_at: JARVIS_BUILT_AT,
+        git_dirty: JARVIS_GIT_DIRTY,
+        source_tree_sha256: JARVIS_SOURCE_TREE_SHA256,
       });
     }
     if (path === "/health/inference") {
