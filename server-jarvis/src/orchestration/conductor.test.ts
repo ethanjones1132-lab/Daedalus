@@ -20,6 +20,20 @@ function makeConductor(overrides?: Partial<{
 }
 
 describe("LiveConductor", () => {
+  test("does not call the model after a healthy stage when work remains", async () => {
+    let modelCalled = false;
+    const { conductor } = makeConductor({}, async () => {
+      modelCalled = true;
+      return { content: '{"directive":"continue"}' };
+    });
+    conductor.setContext("general", "high", "run-healthy-stage");
+
+    const dir = await conductor.afterStage("planner", "completed", "plan output", ["executor"]);
+
+    expect(dir).toEqual({ type: "continue" });
+    expect(modelCalled).toBe(false);
+  });
+
   test("returns continue by default", async () => {
     const { conductor } = makeConductor();
     conductor.setContext("general", "medium", "run-1");

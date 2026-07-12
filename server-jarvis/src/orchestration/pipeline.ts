@@ -311,14 +311,14 @@ export class PipelineExecutor {
     output: string,
     agentRunId: string,
     options: PipelineExecuteOptions,
+    remainingQueue: StageName[],
   ): Promise<void> {
     if (!this.conductor) return;
     let directive: ConductorDirective;
     try {
-      // A non-empty remaining queue asks the optional conductor to supervise
-      // this completed stage. The executor owns the real stage ordering; this
-      // adapter deliberately does not let a failed conductor rewrite it.
-      directive = await this.conductor.live.afterStage(stage, outcome, output, [stage]);
+      // The executor owns the real stage ordering; pass the actual remaining
+      // queue so the conductor can avoid work when a stage completed cleanly.
+      directive = await this.conductor.live.afterStage(stage, outcome, output, remainingQueue);
     } catch {
       return;
     }
@@ -394,6 +394,7 @@ export class PipelineExecutor {
     agentRunId: string,
     onStateChange: (state: PipelineProgressState) => void,
     options: PipelineExecuteOptions,
+    remainingQueue: StageName[],
   ): Promise<PlannerStageOutput> {
     onStateChange({ stage: "planner", status: "running" });
     const plannerPrompt = stageSystemPrompt("planner", options);
@@ -416,7 +417,7 @@ export class PipelineExecutor {
       });
       const narrative = resp.content;
       onStateChange({ stage: "planner", status: "completed", output: narrative });
-      await this.afterConductorStage("planner", "completed", narrative, agentRunId, options);
+      await this.afterConductorStage("planner", "completed", narrative, agentRunId, options, remainingQueue);
 
       this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
@@ -434,7 +435,7 @@ export class PipelineExecutor {
     } catch (e: any) {
       const message = errText(e);
       onStateChange({ stage: "planner", status: "failed", output: message });
-      await this.afterConductorStage("planner", "failed", message, agentRunId, options);
+      await this.afterConductorStage("planner", "failed", message, agentRunId, options, remainingQueue);
 
       this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
@@ -458,6 +459,7 @@ export class PipelineExecutor {
     onStateChange: (state: PipelineProgressState) => void,
     options: PipelineExecuteOptions,
     profile: ExecutionProfile,
+    remainingQueue: StageName[],
   ): Promise<ExecutorStageOutput> {
     onStateChange({ stage: "executor", status: "running" });
     const executorPrompt = stageSystemPrompt("executor", options);
@@ -617,12 +619,12 @@ export class PipelineExecutor {
         return { ok: false, narrative: MISSING_WORKSPACE_EVIDENCE, toolCalls };
       }
       onStateChange({ stage: "executor", status: "completed", output: narrative });
-      await this.afterConductorStage("executor", "completed", narrative, agentRunId, options);
+      await this.afterConductorStage("executor", "completed", narrative, agentRunId, options, remainingQueue);
       return { ok: true, narrative, toolCalls };
     } catch (e: any) {
       const message = errText(e);
       onStateChange({ stage: "executor", status: "failed", output: message });
-      await this.afterConductorStage("executor", "failed", message, agentRunId, options);
+      await this.afterConductorStage("executor", "failed", message, agentRunId, options, remainingQueue);
       return { ok: false, narrative: `Executor failed: ${message}`, toolCalls };
     }
   }
@@ -870,6 +872,7 @@ export class PipelineExecutor {
     onStateChange: (state: PipelineProgressState) => void,
     options: PipelineExecuteOptions,
     executionVerification = "",
+    remainingQueue: StageName[] = [],
   ): Promise<{ answer: string; fatalError?: string; emptyCompletion: boolean }> {
     onStateChange({ stage: "synthesizer", status: "running" });
     const synthesizerPrompt = stageSystemPrompt("synthesizer", options);
@@ -919,7 +922,7 @@ export class PipelineExecutor {
       }
 
       onStateChange({ stage: "synthesizer", status: "completed", output: finalAnswer });
-      await this.afterConductorStage("synthesizer", "completed", finalAnswer, agentRunId, options);
+      await this.afterConductorStage("synthesizer", "completed", finalAnswer, agentRunId, options, remainingQueue);
       this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
         agent_run_id: agentRunId,
@@ -936,7 +939,7 @@ export class PipelineExecutor {
     } catch (e: any) {
       const message = errText(e);
       onStateChange({ stage: "synthesizer", status: "failed", output: message });
-      await this.afterConductorStage("synthesizer", "failed", message, agentRunId, options);
+      await this.afterConductorStage("synthesizer", "failed", message, agentRunId, options, remainingQueue);
       const fatalError = describePipelineError(message);
       this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
@@ -979,14 +982,18 @@ export class PipelineExecutor {
   ): Promise<PipelineSegmentResult> {
     const state: PipelineStageState = { ...carry };
     const profile: ExecutionProfile = options.executionProfile ?? "full";
+    const remainingQueueFor = (stage: StageName): StageName[] => {
+      const index = stages.indexOf(stage);
+      return index < 0 ? [] : stages.slice(index + 1);
+    };
     let partialStage: PipelineSegmentResult["partialStage"];
 
     if (stages.includes("planner")) {
-      state.plan = await this.runPlannerStage(request, agentRunId, onStateChange, options);
+      state.plan = await this.runPlannerStage(request, agentRunId, onStateChange, options, remainingQueueFor("planner"));
     }
     if (stages.includes("executor")) {
       state.executor = await this.runExecutorStage(
-        request, renderPlanSummary(state.plan), agentRunId, onStateChange, options, profile,
+        request, renderPlanSummary(state.plan), agentRunId, onStateChange, options, profile, remainingQueueFor("executor"),
       );
     }
     if (stages.includes("reviewer")) {
@@ -1065,6 +1072,7 @@ export class PipelineExecutor {
       onStateChange,
       options,
       effectGate.synthesizerNotice,
+      remainingQueueFor("synthesizer"),
     );
     return {
       state,

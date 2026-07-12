@@ -13,6 +13,17 @@ interface SupervisionDigest {
   remainingQueue: StageName[];
 }
 
+export function shouldSuperviseStage(args: {
+  supervisionEnabled: boolean;
+  outcome: "completed" | "failed";
+  remainingQueue: StageName[];
+  consecutiveToolErrors: number;
+}): boolean {
+  if (!args.supervisionEnabled || args.remainingQueue.length === 0) return false;
+  if (args.outcome === "failed") return true;
+  return args.consecutiveToolErrors > 0;
+}
+
 export class LiveConductor {
   private supervision: "on" | "off" = "on";
   private taskType = "general";
@@ -33,9 +44,7 @@ export class LiveConductor {
   setContext(taskType: string, complexity: "low" | "medium" | "high", runId: string): void {
     this.taskType = taskType;
     this.runId = runId;
-    if (!this.cfg.supervise_low_complexity && complexity === "low") {
-      this.supervision = "off";
-    }
+    this.supervision = !this.cfg.supervise_low_complexity && complexity === "low" ? "off" : "on";
   }
 
   // Called from the executor/rewriter tool loop for each tool result
@@ -67,8 +76,12 @@ export class LiveConductor {
         };
       }
 
-      if (this.supervision === "off") return { type: "continue" };
-      if (outcome === "completed" && remainingQueue.length === 0) return { type: "continue" };
+      if (!shouldSuperviseStage({
+        supervisionEnabled: this.supervision === "on",
+        outcome,
+        remainingQueue,
+        consecutiveToolErrors: this.consecutiveToolErrors,
+      })) return { type: "continue" };
 
       const digest: SupervisionDigest = {
         stage,

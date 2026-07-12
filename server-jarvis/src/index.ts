@@ -2406,6 +2406,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           agentPool,
           cfg.orchestrator.conductor.supervision,
         );
+        liveConductor.setContext(
+          route.task_type,
+          route.context.estimated_complexity,
+          agentRunId,
+        );
         const executor = new PipelineExecutor(callModel, runtime, ctx, { bus: conductorBus, live: liveConductor });
         const onOrchestratorStateChange = async (state: PipelineProgressState) => {
           // Stream stage progress back to client — "conductor_replan" (B-02)
