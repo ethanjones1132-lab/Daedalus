@@ -6,6 +6,7 @@ import {
   formatPoolDiversity,
   type OrchestratorAgent,
 } from "./agent-pool";
+import { getLearnedPoolState } from "../self-tuning/learned-pool-state";
 
 const agents: OrchestratorAgent[] = [
   {
@@ -48,6 +49,31 @@ describe("AgentPool", () => {
 
     expect(pool.pickFor("executor", "refactor")?.id).toBe("code-worker");
     expect(pool.pickFor("reviewer", "debug")?.id).toBe("verifier");
+  });
+
+  test("pickFor keeps a healthy stage default despite a negative learned score", () => {
+    const pool = new AgentPool([
+      {
+        ...agents[0],
+        id: "synth-default",
+        default_for: ["synthesizer"],
+        capabilities: { ...agents[0].capabilities, speed: 0.9 },
+      },
+      {
+        ...agents[2],
+        id: "learned-alternative",
+        default_for: [],
+        capabilities: { ...agents[2].capabilities, reasoning: 1, speed: 0.8 },
+      },
+    ]);
+
+    const state = getLearnedPoolState();
+    state.modelRoutingScoreDeltas.set("openrouter:openrouter/free", -0.25);
+    try {
+      expect(pool.pickFor("synthesizer", "general")?.id).toBe("synth-default");
+    } finally {
+      state.modelRoutingScoreDeltas.delete("openrouter:openrouter/free");
+    }
   });
 
   test("pickFor falls back to capability match when no stage default exists", () => {

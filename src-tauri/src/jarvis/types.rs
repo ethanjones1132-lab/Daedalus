@@ -43,6 +43,8 @@ pub struct JarvisConfig {
     pub tools: ToolConfig,
     pub reasoning: ReasoningConfig,
     pub companion: CompanionConfig,
+    #[serde(default)]
+    pub orchestrator: OrchestratorConfig,
     pub system_prompt: String,
     pub mode: String,
     pub prizepicks_prompt: String,
@@ -80,6 +82,7 @@ impl Default for JarvisConfig {
             tools: ToolConfig::default(),
             reasoning: ReasoningConfig::default(),
             companion: CompanionConfig::default(),
+            orchestrator: OrchestratorConfig::default(),
             system_prompt: "You are Jarvis, a local AI assistant. Be concise and helpful."
                 .to_string(),
             mode: "general".to_string(),
@@ -232,6 +235,29 @@ pub struct CompanionConfig {
     pub species: String,
     #[serde(default = "default_companion_rarity")]
     pub rarity: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OrchestratorConfig {
+    #[serde(default = "default_orchestrator_enabled")]
+    pub enabled: bool,
+    /// The Bun server owns the detailed pipeline policy. Preserve those fields
+    /// while the native surface only exposes the user-facing runtime switch.
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl Default for OrchestratorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            extra: HashMap::new(),
+        }
+    }
+}
+
+fn default_orchestrator_enabled() -> bool {
+    true
 }
 
 fn default_companion_name() -> String {

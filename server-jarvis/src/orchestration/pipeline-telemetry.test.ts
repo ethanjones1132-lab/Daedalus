@@ -239,7 +239,7 @@ describe("pipeline stage telemetry", () => {
 
     // The effect gate still flags no_write_effect (full profile + only reads),
     // but the repair branch must not run for a read intent.
-    expect(result.outcome).toBe("degraded");
+    expect(result.outcome).toBe("failed");
     expect(result.error_code).toBe("effect_gate_no_write_effect");
     expect(rows.find((row) => row.mode_id === "rewriter")).toBeUndefined();
   });
@@ -275,7 +275,7 @@ describe("pipeline stage telemetry", () => {
       { executionProfile: "full" },
     );
 
-    expect(result.outcome).toBe("degraded");
+    expect(result.outcome).toBe("failed");
     expect(result.error_code).toBe("effect_gate_no_write_effect");
     expect(rows.find((row) => row.mode_id === "rewriter")).toBeUndefined();
   });
@@ -311,7 +311,7 @@ describe("pipeline stage telemetry", () => {
       { executionProfile: "full" },
     );
 
-    expect(result.outcome).toBe("degraded");
+    expect(result.outcome).toBe("failed");
     expect(result.error_code).toBe("effect_gate_no_write_effect");
     expect(rows.find((row) => row.mode_id === "rewriter")).toBeUndefined();
   });

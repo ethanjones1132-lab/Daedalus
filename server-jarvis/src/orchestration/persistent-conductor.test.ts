@@ -54,6 +54,26 @@ afterEach(() => {
 });
 
 describe("PersistentConductor", () => {
+  test("uses compact JSON schema output for local routing", async () => {
+    let body: Record<string, any> | undefined;
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/chat")) {
+        body = JSON.parse(String(init?.body ?? "{}"));
+        return Response.json({ message: { role: "assistant", content: '{"task_type":"general","pipeline":["synthesizer"],"topology":"linear","context":{"needs_workspace_inspection":false,"needs_memory":true,"estimated_complexity":"low"},"coordinator_rationale":"ok"}' } });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg = makeConfig({ persist_sessions: false, output_mode: "tool_call", max_tokens: 700 });
+    const conductor = new PersistentConductor(() => cfg);
+    await conductor.routeTurn({ sessionId: "compact-body", request: "hello", turnNumber: 1 });
+
+    expect(body?.tools).toBeUndefined();
+    expect(body?.format?.properties?.worker_instructions).toBeUndefined();
+    expect(body?.options?.num_predict).toBeLessThanOrEqual(320);
+  });
   test("accumulates session messages across turns for KV prefix reuse", async () => {
     const chatBodies: unknown[] = [];
     (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {

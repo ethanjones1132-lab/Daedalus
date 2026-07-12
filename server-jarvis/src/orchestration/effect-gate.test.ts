@@ -48,10 +48,10 @@ describe("effect gate", () => {
     expect(report.verdict).toBe("clean");
   });
 
-  test("applyEffectGate only downgrades an otherwise successful dirty report", () => {
+  test("applyEffectGate fails an otherwise successful no-write report", () => {
     const report = evaluateEffectGate({ profile: "full", executor: executor([]) });
     expect(applyEffectGate("success", undefined, report)).toEqual({
-      outcome: "degraded",
+      outcome: "failed",
       errorCode: "effect_gate_no_write_effect",
     });
     expect(applyEffectGate("failed", "stage_error", report)).toEqual({

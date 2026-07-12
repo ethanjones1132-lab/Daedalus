@@ -5,6 +5,7 @@ import {
   fallbackBoostKey,
   getLearnedPoolState,
   modelRoutingScoreDelta,
+  stageRoutingScoreDelta,
 } from "../self-tuning/learned-pool-state";
 
 export interface AgentCapabilities {
@@ -275,15 +276,6 @@ export class AgentPool {
     if (candidates.length === 0) return undefined;
     const stageDefault = candidates.find((agent) => agent.default_for.includes(stage));
     if (stageDefault) {
-      if (modelRoutingScoreDelta(stageDefault) < 0) {
-        const replacement = candidates
-          .filter((agent) => agent.id !== stageDefault.id)
-          .sort((a, b) => this.scoreWithFeedback(b, stage, taskType) - this.scoreWithFeedback(a, stage, taskType))[0];
-        if (
-          replacement &&
-          this.scoreWithFeedback(replacement, stage, taskType) > this.scoreWithFeedback(stageDefault, stage, taskType)
-        ) return replacement;
-      }
       if (stage === "synthesizer") return this.preferFastSynthesizer(stageDefault, candidates, taskType);
       return stageDefault;
     }
@@ -396,7 +388,7 @@ export class AgentPool {
   }
 
   private scoreWithFeedback(agent: OrchestratorAgent, stage: string, taskType: TaskType | string): number {
-    return this.score(agent, stage, taskType) + modelRoutingScoreDelta(agent);
+    return this.score(agent, stage, taskType) + modelRoutingScoreDelta(agent) + stageRoutingScoreDelta(agent, stage);
   }
 
   private overallScore(agent: OrchestratorAgent): number {

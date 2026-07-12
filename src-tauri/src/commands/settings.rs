@@ -188,6 +188,11 @@ pub fn load_jarvis_config_conn(conn: &rusqlite::Connection) -> Result<JarvisConf
             config.companion = parsed;
         }
     }
+    if let Some(v) = settings.get("orchestrator") {
+        if let Ok(parsed) = serde_json::from_str::<crate::jarvis::types::OrchestratorConfig>(v) {
+            config.orchestrator = parsed;
+        }
+    }
     if let Some(v) = settings.get("system_prompt") {
         config.system_prompt = v.clone();
     }
@@ -319,6 +324,10 @@ pub fn persist_jarvis_config_conn(
         (
             "companion",
             serde_json::to_string(&config.companion).map_err(|e| e.to_string())?,
+        ),
+        (
+            "orchestrator",
+            serde_json::to_string(&config.orchestrator).map_err(|e| e.to_string())?,
         ),
         ("system_prompt", config.system_prompt.clone()),
         ("mode", config.mode.clone()),
@@ -489,5 +498,15 @@ mod tests {
         assert_eq!(json["opencode_go"]["api_key"], "go-secret");
         assert_eq!(json["opencode_zen"]["api_key"], "zen-secret");
         assert_eq!(json["opencode_go"]["first_token_timeout_ms"], 45_000);
+    }
+
+    #[test]
+    fn orchestrator_enabled_round_trips_through_canonical_settings() {
+        let db = mem_db();
+        set_setting_value(&db, "orchestrator", r#"{"enabled":false}"#)
+            .expect("orchestrator settings should be accepted");
+
+        let cfg = load_jarvis_config(&db).expect("load config");
+        assert!(!cfg.orchestrator.enabled);
     }
 }

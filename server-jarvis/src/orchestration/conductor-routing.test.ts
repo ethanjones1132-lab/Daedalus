@@ -2,6 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { COORDINATOR_ROUTE_JSON_SCHEMA, extractConductorRoutingJson, stripGemmaThinkingArtifacts } from "./conductor-routing";
 
 describe("conductor-routing", () => {
+  test("route schema is compact and does not ask the conductor to author worker prompts", () => {
+    expect(COORDINATOR_ROUTE_JSON_SCHEMA.properties.worker_instructions).toBeUndefined();
+    expect(COORDINATOR_ROUTE_JSON_SCHEMA.properties.shared_context).toBeUndefined();
+    expect(COORDINATOR_ROUTE_JSON_SCHEMA.properties.pipeline.maxItems).toBe(5);
+  });
   test("extractConductorRoutingJson prefers route_pipeline tool call arguments", () => {
     const json = extractConductorRoutingJson({
       role: "assistant",

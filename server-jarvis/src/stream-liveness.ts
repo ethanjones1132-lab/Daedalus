@@ -77,6 +77,7 @@ export class StreamIdleTimeoutError extends Error {
     readonly model: string,
     readonly stage: string,
     readonly windowMs: number,
+    readonly provider = "unknown",
   ) {
     super(`Inter-token timeout (${windowMs}ms) on model=${model} stage=${stage}`);
     this.name = "StreamIdleTimeoutError";
@@ -88,6 +89,7 @@ export class VisibleProgressTimeoutError extends Error {
     readonly model: string,
     readonly stage: string,
     readonly windowMs: number,
+    readonly provider = "unknown",
   ) {
     super(`No visible output or tool-call progress for ${windowMs}ms on model=${model} stage=${stage} (hidden reasoning does not count)`);
     this.name = "VisibleProgressTimeoutError";

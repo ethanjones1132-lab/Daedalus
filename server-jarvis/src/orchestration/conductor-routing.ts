@@ -2,6 +2,7 @@
 
 export const COORDINATOR_ROUTE_JSON_SCHEMA = {
   type: "object",
+  additionalProperties: false,
   properties: {
     task_type: {
       type: "string",
@@ -9,6 +10,8 @@ export const COORDINATOR_ROUTE_JSON_SCHEMA = {
     },
     pipeline: {
       type: "array",
+      minItems: 1,
+      maxItems: 5,
       items: {
         anyOf: [
           { type: "string", enum: ["planner", "executor", "reviewer", "rewriter", "synthesizer"] },
@@ -30,6 +33,7 @@ export const COORDINATOR_ROUTE_JSON_SCHEMA = {
     },
     context: {
       type: "object",
+      additionalProperties: false,
       properties: {
         needs_workspace_inspection: { type: "boolean" },
         needs_memory: { type: "boolean" },
@@ -37,28 +41,7 @@ export const COORDINATOR_ROUTE_JSON_SCHEMA = {
       },
       required: ["needs_workspace_inspection", "needs_memory", "estimated_complexity"],
     },
-    coordinator_rationale: { type: "string" },
-    worker_instructions: {
-      type: "object",
-      properties: {
-        planner: { type: "string" },
-        executor: { type: "string" },
-        reviewer: { type: "string" },
-        rewriter: { type: "string" },
-        synthesizer: { type: "string" },
-      },
-    },
-    shared_context: {
-      type: "object",
-      properties: {
-        relevant_memories: { type: "array", items: { type: "string" } },
-        prior_tool_results: {
-          type: "object",
-          additionalProperties: { type: "string" },
-        },
-        failure_patterns: { type: "array", items: { type: "string" } },
-      },
-    },
+    coordinator_rationale: { type: "string", maxLength: 240 },
   },
   required: ["task_type", "pipeline", "topology", "context", "coordinator_rationale"],
 } as const;

@@ -71,6 +71,10 @@ export interface JarvisConfig {
     species: string;
     rarity: string;
   };
+  orchestrator: {
+    enabled: boolean;
+    [key: string]: unknown;
+  };
   system_prompt: string;
   temperature: number;
   max_tokens: number;

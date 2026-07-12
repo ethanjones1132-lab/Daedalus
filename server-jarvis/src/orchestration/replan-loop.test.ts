@@ -156,8 +156,8 @@ describe("runPipelineWithReplanning", () => {
     expect(stateEvents).toContain("conductor_replan:running");
     expect(stateEvents).toContain("conductor_replan:done");
     // Deliberate effect-gate inversion: this full-execution fixture never
-    // produces a successful write, so a polished answer is still degraded.
-    expect(result.outcome).toBe("degraded");
+    // produces a successful write, so a polished answer is still failed.
+    expect(result.outcome).toBe("failed");
     expect(result.error_code).toBe("effect_gate_no_write_effect");
     expect(result.answer).toBe("output for synthesizer");
   });
@@ -202,7 +202,7 @@ describe("runPipelineWithReplanning", () => {
     // inferring staleness, bounded by maxReplans so the worst case is a few
     // extra model calls, never incorrect output.
     expect(stageLabels).toEqual(["executor", "executor", "reviewer", "synthesizer"]);
-    expect(result.outcome).toBe("degraded");
+    expect(result.outcome).toBe("failed");
     expect(result.error_code).toBe("effect_gate_no_write_effect");
   });
 
@@ -247,7 +247,7 @@ describe("runPipelineWithReplanning", () => {
     expect(coordinatorCalls).toBe(1);
     expect(stageLabels).toEqual(["executor", "executor", "reviewer", "synthesizer"]);
     expect(stageLabels.filter((s) => s === "executor")).toHaveLength(2);
-    expect(result.outcome).toBe("degraded");
+    expect(result.outcome).toBe("failed");
     expect(result.error_code).toBe("effect_gate_no_write_effect");
   });
 
@@ -368,7 +368,7 @@ describe("runPipelineWithReplanning — B-04 session cap + telemetry", () => {
     });
 
     expect(counter.used("b04-s2")).toBe(2);
-    expect(result.outcome).toBe("degraded"); // graceful degradation, not failed
+    expect(result.outcome).toBe("failed");
     // A real missing-effect failure outranks the softer session-cap tag.
     expect(result.error_code).toBe("effect_gate_no_write_effect");
   });
@@ -402,7 +402,7 @@ describe("runPipelineWithReplanning — B-04 session cap + telemetry", () => {
     });
 
     expect(counter.used("b04-s3")).toBe(1);
-    expect(result.outcome).toBe("degraded");
+    expect(result.outcome).toBe("failed");
     expect(result.error_code).toBe("effect_gate_no_write_effect");
   });
 

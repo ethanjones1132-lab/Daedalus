@@ -59,5 +59,8 @@ export function applyEffectGate(
   report: EffectGateReport,
 ): { outcome: "success" | "degraded" | "failed"; errorCode?: string } {
   if (outcome !== "success" || report.clean) return { outcome, errorCode };
+  if (report.verdict === "no_write_effect") {
+    return { outcome: "failed", errorCode: "effect_gate_no_write_effect" };
+  }
   return { outcome: "degraded", errorCode: `effect_gate_${report.verdict}` };
 }

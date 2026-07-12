@@ -15,7 +15,8 @@ param(
     [string]$StreamUrl = "http://127.0.0.1:19877/chat/stream",
     [string]$Prompt = "Reply with exactly: smoke ok.",
     [string]$SessionId = ([guid]::NewGuid().ToString()),
-    [int]$TimeoutSeconds = 120
+    [int]$TimeoutSeconds = 120,
+    [switch]$WriteReadSmoke
 )
 
 $ErrorActionPreference = 'Stop'
@@ -117,11 +118,15 @@ $conductorCheck = [ordered]@{
 }
 if ($conductorCheck.status -ne 'pass') { throw 'conductor_health_fixture_failed' }
 
+$writeReadCheck = [ordered]@{ status = 'not_requested'; artifact = $null; content = $null }
+$writeReadArtifact = $null
+if ($WriteReadSmoke) {
+    $writeReadArtifact = Join-Path $env:TEMP ("jarvis-orchestration-smoke-{0}.txt" -f [guid]::NewGuid())
+    $Prompt = "Create the file '$writeReadArtifact' with exactly the text JARVIS_SMOKE, then read it and report the exact contents."
+}
+
 $started = Get-Date
-$events = Read-SseStream $StreamUrl @{
-    message = $Prompt
-    session_id = $SessionId
-} $TimeoutSeconds
+$events = Read-SseStream $StreamUrl @{ message = $Prompt; session_id = $SessionId } $TimeoutSeconds
 $elapsed = ((Get-Date) - $started).TotalMilliseconds
 
 $terminal = @($events | Where-Object {
@@ -132,6 +137,24 @@ if ($terminal.Count -ne 1) {
 }
 
 $terminalEvent = $terminal[0]
+if ($WriteReadSmoke) {
+    try {
+        if (-not (Test-Path -LiteralPath $writeReadArtifact -PathType Leaf)) {
+            throw 'write_read_artifact_missing'
+        }
+        $writeReadContent = (Get-Content -Raw -LiteralPath $writeReadArtifact).Trim()
+        if ($writeReadContent -ne 'JARVIS_SMOKE') {
+            throw "write_read_content_mismatch:$writeReadContent"
+        }
+        $writeReadCheck.status = 'pass'
+        $writeReadCheck.artifact = $writeReadArtifact
+        $writeReadCheck.content = $writeReadContent
+    } finally {
+        if (Test-Path -LiteralPath $writeReadArtifact) {
+            Remove-Item -LiteralPath $writeReadArtifact -Force
+        }
+    }
+}
 $toolNames = @($events |
     Where-Object { $_.type -in @('tool_use', 'tool_result') -or ([string]$_.detail).StartsWith('tool:') } |
     ForEach-Object {
@@ -163,6 +186,7 @@ $record = [ordered]@{
     release_fixtures = [ordered]@{
         session_authority = $authorityCheck
         conductor_health = $conductorCheck
+        write_read = $writeReadCheck
     }
 }
 $record | ConvertTo-Json -Depth 8 -Compress

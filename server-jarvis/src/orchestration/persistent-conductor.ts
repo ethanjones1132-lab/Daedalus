@@ -9,7 +9,6 @@ import { checkOllamaHealth, ollamaBaseUrlCandidates } from "../ollama";
 import { resolveSkillsForConductor } from "../intelligence/skill-resolver";
 import {
   COORDINATOR_ROUTE_JSON_SCHEMA,
-  COORDINATOR_ROUTE_TOOL,
   extractConductorRoutingJson,
   type OllamaChatMessage,
 } from "./conductor-routing";
@@ -419,15 +418,14 @@ export class PersistentConductor {
         top_p: conductor.top_p,
         top_k: conductor.top_k,
         num_ctx: conductor.num_ctx,
-        num_predict: conductor.max_tokens,
+        num_predict: Math.min(320, Math.max(64, conductor.max_tokens)),
       },
     };
 
-    if (conductor.output_mode === "tool_call") {
-      body.tools = [COORDINATOR_ROUTE_TOOL];
-    } else if (conductor.output_mode === "json_schema") {
-      body.format = COORDINATOR_ROUTE_JSON_SCHEMA;
-    }
+    // Route selection is deliberately schema-only. The conductor should emit
+    // a compact decision, not author worker prompts or replay session memory;
+    // those details are assembled by Jarvis-owned code after routing.
+    body.format = COORDINATOR_ROUTE_JSON_SCHEMA;
 
     try {
       const res = await fetch(`${target.baseUrl}/api/chat`, {

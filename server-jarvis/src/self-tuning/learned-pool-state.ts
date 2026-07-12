@@ -10,6 +10,8 @@ export interface LearnedPoolState {
   modelCapabilityDeltas: Map<string, Partial<Record<keyof OrchestratorAgent["capabilities"], number>>>;
   /** Cron-produced primary/fallback score delta keyed by model feedback key. */
   modelRoutingScoreDeltas: Map<string, number>;
+  /** Stage-specific routing adjustments; these may rank fallback candidates. */
+  stageModelRoutingScoreDeltas: Map<string, number>;
   /** Empirical first-token watchdog budgets keyed by model feedback key. */
   modelFirstTokenTimeouts: Map<string, number>;
 }
@@ -19,6 +21,7 @@ const globalState: LearnedPoolState = {
   fallbackBoosts: new Map(),
   modelCapabilityDeltas: new Map(),
   modelRoutingScoreDeltas: new Map(),
+  stageModelRoutingScoreDeltas: new Map(),
   modelFirstTokenTimeouts: new Map(),
 };
 
@@ -33,6 +36,7 @@ export function modelFeedbackKey(provider: string, modelId: string): string {
 export function clearInferenceFeedbackState(): void {
   globalState.modelCapabilityDeltas.clear();
   globalState.modelRoutingScoreDeltas.clear();
+  globalState.stageModelRoutingScoreDeltas.clear();
   globalState.modelFirstTokenTimeouts.clear();
 }
 
@@ -48,6 +52,16 @@ export function fallbackBoostKey(agentId: string, stage: string, taskType: strin
 
 export function modelRoutingScoreDelta(agent: OrchestratorAgent): number {
   return globalState.modelRoutingScoreDeltas.get(modelFeedbackKey(agent.provider, agent.model_id)) ?? 0;
+}
+
+export function stageModelFeedbackKey(provider: string, modelId: string, stage: string): string {
+  return `${provider}:${modelId}:${stage}`;
+}
+
+export function stageRoutingScoreDelta(agent: OrchestratorAgent, stage: string): number {
+  return globalState.stageModelRoutingScoreDeltas.get(
+    stageModelFeedbackKey(agent.provider, agent.model_id, stage),
+  ) ?? 0;
 }
 
 export function empiricalFirstTokenTimeoutFor(modelId: string, provider?: string): number | undefined {

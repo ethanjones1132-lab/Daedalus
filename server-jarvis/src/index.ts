@@ -87,6 +87,7 @@ import { SessionMemory, mergeSharedContextHints } from "./orchestration/session-
 import { AgentPool, firstTokenTimeoutFor, formatPoolDiversity } from "./orchestration/agent-pool";
 import { excludedModelKeys } from "./model-failure-memory";
 import { PipelineExecutor } from "./orchestration/pipeline";
+import { StageHealthRegistry, type RecoverableFailureKind } from "./orchestration/stage-health";
 import type { PipelineProgressState, PipelineRecursionEvent } from "./orchestration/pipeline";
 import { ConductorBus } from "./orchestration/conductor-bus";
 import type { ConductorDirective } from "./orchestration/conductor-bus";
@@ -208,6 +209,36 @@ const SSE_HEARTBEAT_INTERVAL_MS = Math.min(
 const MAX_TOOL_RESULT_CHARS = 2000;  // Truncate tool results going back to model context
 const MAX_TOOL_EXECUTION_TURNS = 10;
 const activeStreams = new ActiveStreamRegistry();
+const stageHealth = new StageHealthRegistry();
+const RECOVERABLE_STAGE_FAILURES = new Set([
+  "FirstTokenTimeoutError",
+  "StreamIdleTimeoutError",
+  "VisibleProgressTimeoutError",
+]);
+
+function recoverableStageFailure(error: unknown): {
+  kind: RecoverableFailureKind;
+  provider: string;
+  modelId: string;
+  stage: string;
+} | undefined {
+  const candidate = error as {
+    name?: string;
+    provider?: string;
+    model?: string;
+    stage?: string;
+  } | undefined;
+  if (!candidate || !RECOVERABLE_STAGE_FAILURES.has(String(candidate.name))) return undefined;
+  const provider = String(candidate.provider ?? "unknown");
+  const modelId = String(candidate.model ?? "unknown");
+  if (provider === "unknown" || modelId === "unknown") return undefined;
+  const kind: RecoverableFailureKind = candidate.name === "FirstTokenTimeoutError"
+    ? "first_token_timeout"
+    : candidate.name === "StreamIdleTimeoutError"
+      ? "stream_idle_timeout"
+      : "stream_idle_timeout";
+  return { kind, provider, modelId, stage: String(candidate.stage ?? "agent") };
+}
 
 function visibleTextFromReasoningEvent(event: ReasoningEvent): string {
   switch (event.type) {
@@ -1043,12 +1074,14 @@ class FirstTokenTimeoutError extends Error {
   readonly model: string;
   readonly stage: string;
   readonly windowMs: number;
-  constructor(model: string, stage: string, windowMs: number) {
+  readonly provider: string;
+  constructor(model: string, stage: string, windowMs: number, provider = "unknown") {
     super(`First-token timeout (${windowMs}ms) on model=${model} stage=${stage}`);
     this.name = "FirstTokenTimeoutError";
     this.model = model;
     this.stage = stage;
     this.windowMs = windowMs;
+    this.provider = provider;
   }
 }
 
@@ -1505,6 +1538,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               // the caller's `excludeModels` is never mutated.
               const poolExcludeModels = new Set<string>(excludeModels ?? []);
               for (const key of excludedModelKeys()) poolExcludeModels.add(key);
+              for (const key of stageHealth.excludedModelKeys(stageLabel)) poolExcludeModels.add(key);
               if (cascadeTier) {
                 const chain = pool.cascadeChain(stageLabel, orchestratorTaskType, poolExcludeModels);
                 agent = cascadeTier === "cheap" ? chain[0] : chain[chain.length - 1];
@@ -1824,17 +1858,17 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               signal: streamAbort.signal,
             });
             if (stopReason === "first_token_timeout") {
-              throw new FirstTokenTimeoutError(actualModelUsed, callOptions?.stageLabel ?? "agent", firstTokenMs);
+              throw new FirstTokenTimeoutError(actualModelUsed, callOptions?.stageLabel ?? "agent", firstTokenMs, actualProviderUsed);
             }
             if (stopReason === "stream_idle_timeout") {
-              throw new StreamIdleTimeoutError(actualModelUsed, stageName, MODEL_INTER_TOKEN_TIMEOUT_MS);
+              throw new StreamIdleTimeoutError(actualModelUsed, stageName, MODEL_INTER_TOKEN_TIMEOUT_MS, actualProviderUsed);
             }
             if (stopReason === "turn_cancelled") await emitCancelled();
             if (stopReason === "turn_deadline_exceeded") {
               throw new TurnDeadlineExceededError(stageName, TOTAL_TURN_TIMEOUT_MS);
             }
             if (stopReason === "visible_progress_timeout") {
-              throw new VisibleProgressTimeoutError(actualModelUsed, stageName, MODEL_VISIBLE_PROGRESS_TIMEOUT_MS);
+              throw new VisibleProgressTimeoutError(actualModelUsed, stageName, MODEL_VISIBLE_PROGRESS_TIMEOUT_MS, actualProviderUsed);
             }
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
@@ -2083,10 +2117,28 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // extra advance to cap latency; if both come back empty the pipeline
         // records `empty_completion` and the user gets the friendly retry notice.
         const callModel = async (messages: any[], callOptions?: any) => {
-          const canAdvance = callOptions?.surfaceAsAnswer === true && cfg.active_backend !== "ollama" && cfg.openrouter.enable_fallbacks;
+          const canRetryStage = Boolean(callOptions?.stageLabel) && cfg.active_backend !== "ollama" && cfg.openrouter.enable_fallbacks;
+          const canAdvanceEmpty = callOptions?.surfaceAsAnswer === true && canRetryStage;
           const exclude = new Set<string>();
-          let last: any = await callModelAttempt(messages, callOptions);
-          if (!canAdvance) return last;
+          let last: any;
+          for (let retry = 0; ; retry++) {
+            try {
+              last = await callModelAttempt(messages, callOptions, exclude);
+              break;
+            } catch (error) {
+              const failure = recoverableStageFailure(error);
+              if (!failure || streamAbort.signal.aborted || !canRetryStage || retry >= 2 || Date.now() + 5_000 >= turnDeadlineAt) {
+                throw error;
+              }
+              exclude.add(`${failure.provider}:${failure.modelId}`);
+              stageHealth.recordFailure(failure);
+              console.warn(
+                `[Jarvis Orchestrator] ${failure.kind} on ${failure.provider}:${failure.modelId} ` +
+                `stage=${failure.stage}; advancing to a different candidate (attempt=${retry + 2})`,
+              );
+            }
+          }
+          if (!canAdvanceEmpty) return last;
           // Bounded empty-completion cascade-advance. If a user-visible stage
           // returns a semantically-empty 200 (no content + no tool calls) and
           // we have a fallback cascade, advance PAST that model and try the
@@ -2108,7 +2160,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             // no tools to run it with, and before 2026-07-04 the leaked call
             // text itself was accepted as the answer (session 1d4727cf) — and
             // then reinforced by the tuning loop as a success.
-            if (hasContent || streamAbort.signal.aborted) break;
+            if (hasContent || streamAbort.signal.aborted) {
+              if (hasContent && last?._provider && last?._modelUsed) {
+                stageHealth.recordSuccess({
+                  provider: last._provider,
+                  modelId: last._modelUsed,
+                  stage: callOptions?.stageLabel ?? "agent",
+                });
+              }
+              break;
+            }
             if (last?._provider && last?._modelUsed) {
               const key = `${last._provider}:${last._modelUsed}`;
               if (exclude.has(key)) {
@@ -2116,6 +2177,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 break;
               }
               exclude.add(key);
+              stageHealth.recordFailure({
+                provider: last._provider,
+                modelId: last._modelUsed,
+                stage: callOptions?.stageLabel ?? "agent",
+                kind: "empty_completion",
+              });
             }
             if (exclude.size === 0) break; // no exclusion built → nothing to advance past
             console.warn(`[Jarvis Orchestrator] empty completion from ${last?._provider}:${last?._modelUsed} stage=${callOptions?.stageLabel ?? "?"} — advancing cascade (excluding it)`);
@@ -2974,10 +3041,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               signal: streamAbort.signal,
             });
             if (stopReason === "first_token_timeout") {
-              throw new FirstTokenTimeoutError(modelName, "agent_loop", firstTokenMs);
+              throw new FirstTokenTimeoutError(modelName, "agent_loop", firstTokenMs, lastProviderUsed);
             }
             if (stopReason === "stream_idle_timeout") {
-              throw new StreamIdleTimeoutError(actualModelUsed, "agent_loop", MODEL_INTER_TOKEN_TIMEOUT_MS);
+              throw new StreamIdleTimeoutError(actualModelUsed, "agent_loop", MODEL_INTER_TOKEN_TIMEOUT_MS, lastProviderUsed);
             }
             if (stopReason === "turn_cancelled") await emitCancelled();
             if (stopReason === "turn_deadline_exceeded") {

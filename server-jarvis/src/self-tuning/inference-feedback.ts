@@ -55,6 +55,20 @@ export function applyInferenceFeedback(
     if (firstToken !== undefined) state.modelFirstTokenTimeouts.set(key, firstToken);
     applied += 1;
   }
+  for (const [key, raw] of Object.entries(report.routing_policy.stage_adjustments ?? {})) {
+    if (key.split(":").length < 3 || !raw || typeof raw !== "object") {
+      ignored += 1;
+      continue;
+    }
+    const stageAdj = raw as Record<string, unknown>;
+    if (Number(stageAdj.sample_count) < minSamples) {
+      ignored += 1;
+      continue;
+    }
+    const routing = finiteClamped(stageAdj.routing_score_delta, -0.25, 0.15);
+    if (routing !== undefined) state.stageModelRoutingScoreDeltas.set(key, routing);
+    applied += 1;
+  }
   return { applied, ignored, reason: undefined };
 }
 

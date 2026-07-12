@@ -2353,6 +2353,37 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
           )}
         </GlassCard>
 
+        <GlassCard hoverable={false}>
+          <h3 className="text-sm font-semibold text-bone mb-1">Orchestration Runtime</h3>
+          <p className="text-[10px] font-mono text-bone-faint mb-3">
+            Runs coordinator, tool, review, and synthesis stages. Turn it off for a faster single-pass response.
+          </p>
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-mono text-bone-dim">
+              {localConfig.orchestrator?.enabled ? 'Multi-stage orchestration' : 'Single-pass runtime'}
+            </span>
+            <button
+              onClick={() => updateField('orchestrator', {
+                ...localConfig.orchestrator,
+                enabled: !localConfig.orchestrator?.enabled,
+              })}
+              aria-pressed={Boolean(localConfig.orchestrator?.enabled)}
+              aria-label="Toggle orchestration runtime"
+              className={cn(
+                'w-10 h-5 rounded-full transition-colors relative',
+                'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50',
+                localConfig.orchestrator?.enabled ? 'bg-cyan-neon/40' : 'bg-iron/40'
+              )}
+            >
+              <motion.div
+                className={cn('w-4 h-4 rounded-full absolute top-0.5', localConfig.orchestrator?.enabled ? 'bg-cyan-neon' : 'bg-bone-dim')}
+                animate={{ left: localConfig.orchestrator?.enabled ? 22 : 2 }}
+                transition={{ duration: 0.15 }}
+              />
+            </button>
+          </div>
+        </GlassCard>
+
         {/* Base URLs */}
         <GlassCard hoverable={false}>
           <h3 className="text-sm font-semibold text-bone mb-3">Base URLs</h3>
