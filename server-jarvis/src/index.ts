@@ -95,6 +95,7 @@ import { AgentPool, firstTokenTimeoutFor, formatPoolDiversity } from "./orchestr
 import { excludedModelKeys } from "./model-failure-memory";
 import { PipelineExecutor } from "./orchestration/pipeline";
 import { StageHealthRegistry, type RecoverableFailureKind } from "./orchestration/stage-health";
+import { createTurnBudget } from "./orchestration/turn-budget";
 import type { PipelineProgressState, PipelineRecursionEvent } from "./orchestration/pipeline";
 import { ConductorBus } from "./orchestration/conductor-bus";
 import type { ConductorDirective } from "./orchestration/conductor-bus";
@@ -243,7 +244,7 @@ function recoverableStageFailure(error: unknown): {
     ? "first_token_timeout"
     : candidate.name === "StreamIdleTimeoutError"
       ? "stream_idle_timeout"
-      : "stream_idle_timeout";
+      : "visible_progress_timeout";
   return { kind, provider, modelId, stage: String(candidate.stage ?? "agent") };
 }
 
@@ -1232,10 +1233,13 @@ async function runCronInference(body: Record<string, unknown>): Promise<{
 }
 
 async function streamJarvis(message: string, sessionId: string, options: StreamJarvisOptions = {}): Promise<Response> {
-  const turnDeadlineAt = Date.now() + TOTAL_TURN_TIMEOUT_MS;
+  const turnStartedAt = Date.now();
+  const initialRequirement = classifyTurnRequirements(message).requirement;
+  const turnBudget = createTurnBudget(initialRequirement, "medium", turnStartedAt);
+  const turnDeadlineAt = turnBudget.deadlineAt;
   const ensureTurnBudget = (stage: string): void => {
     if (Date.now() >= turnDeadlineAt) {
-      throw new TurnDeadlineExceededError(stage, TOTAL_TURN_TIMEOUT_MS);
+      throw new TurnDeadlineExceededError(stage, turnBudget.turn_ms);
     }
   };
   const cfg = resolveConfig(options.config);
@@ -1689,7 +1693,17 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const useFallback = !isOllama && cfg.openrouter.enable_fallbacks;
           const requestTimeout = isOllama ? MODEL_REQUEST_TIMEOUT_MS : (cfg.openrouter.timeout_ms || MODEL_REQUEST_TIMEOUT_MS);
           const ctrl = new AbortController();
-          const requestBudgetMs = Math.max(1, Math.min(requestTimeout, turnDeadlineAt - Date.now()));
+          const stageBudgetMs = stageLabel
+            ? turnBudget.stageRemainingMs(stageLabel, Date.now())
+            : turnBudget.remainingMs(Date.now());
+          const reserveMs = stageLabel === "synthesizer" ? 0 : turnBudget.finalization_reserve_ms;
+          if (stageLabel !== "synthesizer" && !turnBudget.canStart(stageLabel ?? "agent", Date.now())) {
+            throw new TurnDeadlineExceededError(stageLabel ?? "orchestrator_request", turnBudget.turn_ms);
+          }
+          const requestBudgetMs = Math.max(
+            1_000,
+            Math.min(requestTimeout, stageBudgetMs, Math.max(1_000, turnBudget.remainingMs(Date.now()) - reserveMs)),
+          );
           let turnDeadlineAbortedRequest = false;
           const timeout = setTimeout(() => {
             turnDeadlineAbortedRequest = Date.now() >= turnDeadlineAt;
@@ -1729,7 +1743,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               await emitCancelled();
             }
             if (turnDeadlineAbortedRequest || Date.now() >= turnDeadlineAt) {
-              throw new TurnDeadlineExceededError(callOptions?.stageLabel ?? "orchestrator_request", TOTAL_TURN_TIMEOUT_MS);
+              throw new TurnDeadlineExceededError(callOptions?.stageLabel ?? "orchestrator_request", turnBudget.turn_ms);
             }
             if (fetchErr.name === "AbortError") {
               throw new Error(`Request timed out after ${requestTimeout / 1000}s. The model may be loading or overloaded.`);
@@ -1777,13 +1791,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // were still aborted at 30s despite the override being "in effect".
           // `firstTokenTimeoutFor` clamps to [1_000, 60_000] so this watchdog
           // can never fire after the outer 60s stream-stall watchdog would have.
-          const firstTokenMs = firstTokenTimeoutFor(
+          const firstTokenMs = Math.min(requestBudgetMs, firstTokenTimeoutFor(
             agentPool,
             actualModelUsed,
             MODEL_FIRST_TOKEN_TIMEOUT_MS,
             60_000,
             actualProviderUsed,
-          );
+          ));
           // First-token timeout flag. P0-B (2026-07-02): the previous
           // build called `streamAbort.abort("First-token timeout")` from
           // inside this timer, which is the SAME abort domain as the user
@@ -1886,7 +1900,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
             if (stopReason === "turn_cancelled") await emitCancelled();
             if (stopReason === "turn_deadline_exceeded") {
-              throw new TurnDeadlineExceededError(stageName, TOTAL_TURN_TIMEOUT_MS);
+              throw new TurnDeadlineExceededError(stageName, turnBudget.turn_ms);
             }
             if (stopReason === "visible_progress_timeout") {
               throw new VisibleProgressTimeoutError(actualModelUsed, stageName, MODEL_VISIBLE_PROGRESS_TIMEOUT_MS, actualProviderUsed);
@@ -2183,7 +2197,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               break;
             } catch (error) {
               const failure = recoverableStageFailure(error);
-              if (!failure || streamAbort.signal.aborted || !canRetryStage || retry >= 2 || Date.now() + 5_000 >= turnDeadlineAt) {
+              if (!failure || streamAbort.signal.aborted || !canRetryStage || retry >= turnBudget.max_stage_attempts - 1 || Date.now() + 5_000 >= turnDeadlineAt) {
                 throw error;
               }
               exclude.add(`${failure.provider}:${failure.modelId}`);
@@ -2209,7 +2223,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           //   - the pool returned the same model we just excluded (no other
           //     candidate available) — this prevents a silent infinite loop
           //     that the previous build hit on the live smoke test.
-          for (let advance = 0; advance < 2; advance++) {
+          for (let advance = 0; advance < turnBudget.max_stage_attempts - 1; advance++) {
             const hasContent = typeof last?.content === "string" && last.content.trim().length > 0;
             // A user-visible stage is only "done" when it produced clean prose.
             // Tool calls do NOT count: a synthesizer that emits a tool call has
@@ -3121,7 +3135,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
             if (stopReason === "turn_cancelled") await emitCancelled();
             if (stopReason === "turn_deadline_exceeded") {
-              throw new TurnDeadlineExceededError("agent_loop", TOTAL_TURN_TIMEOUT_MS);
+              throw new TurnDeadlineExceededError("agent_loop", turnBudget.turn_ms);
             }
             if (done) break;
             buffer += decoder.decode(value, { stream: true });

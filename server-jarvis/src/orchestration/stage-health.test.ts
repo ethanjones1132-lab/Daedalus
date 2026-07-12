@@ -18,10 +18,23 @@ describe("StageHealthRegistry", () => {
   });
 
   test("success clears a stage-specific cooldown", () => {
-    const health = new StageHealthRegistry(() => 10_000);
+    let now = 10_000;
+    const health = new StageHealthRegistry(() => now);
     const model = { provider: "openrouter", modelId: "fast", stage: "synthesizer" };
     health.recordFailure({ ...model, kind: "stream_idle_timeout" });
+    now += 5 * 60_000;
     health.recordSuccess(model);
+    expect(health.excludedModelKeys("synthesizer")).toEqual(new Set());
+  });
+
+  test("empty completion enters its shorter cooldown immediately", () => {
+    let now = 10_000;
+    const health = new StageHealthRegistry(() => now);
+    const model = { provider: "opencode_go", modelId: "flash", stage: "synthesizer" };
+    health.recordFailure({ ...model, kind: "empty_completion" });
+    health.recordSuccess(model);
+    expect(health.excludedModelKeys("synthesizer")).toEqual(new Set(["opencode_go:flash"]));
+    now += 2 * 60_000;
     expect(health.excludedModelKeys("synthesizer")).toEqual(new Set());
   });
 });
