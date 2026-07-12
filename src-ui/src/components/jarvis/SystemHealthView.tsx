@@ -16,6 +16,25 @@ interface BackendStats {
   last_model?: string;
 }
 
+interface InferenceAttempt {
+  ts?: number;
+  session_id?: string;
+  run_id?: string;
+  stage: string;
+  provider: string;
+  model: string;
+  outcome: string;
+  latency_ms: number;
+  first_token_ms?: number;
+  fallback_attempt: number;
+}
+
+interface RuntimePerformanceSnapshot {
+  event_loop_delay_ms?: { p95?: number; p99?: number };
+  event_loop_utilization?: number;
+  rss_bytes?: number;
+}
+
 interface ConductorCacheSummary {
   window_size: number;
   cache_hit_rate: number;
@@ -35,6 +54,8 @@ interface InferenceMetrics {
   window_size: number;
   backends: BackendStats[];
   generated_at: number;
+  recent_attempts: InferenceAttempt[];
+  runtime?: RuntimePerformanceSnapshot;
   /**
    * Conductor KV/prefix-reuse observability (Track A follow-up, 2026-07-07).
    * Server-side lives in `server-jarvis/src/inference-metrics.ts` —
@@ -123,6 +144,10 @@ export function formatRuntimeProvenance(runtime: RuntimeHealth | null): string {
   if (!runtime) return 'Runtime health unavailable';
   const sha = runtime.git_sha ? runtime.git_sha.slice(0, 12) : 'unknown-sha';
   return `${runtime.version ?? 'unknown-version'} · ${sha} · ${runtime.model ?? 'unknown-model'}`;
+}
+
+export function formatAttemptSummary(attempt: Pick<InferenceAttempt, 'stage' | 'provider' | 'model' | 'outcome' | 'latency_ms'>): string {
+  return `${attempt.stage} Â· ${attempt.provider}/${attempt.model} Â· ${attempt.outcome} Â· ${attempt.latency_ms}ms`;
 }
 
 const BUN_URL = 'http://127.0.0.1:19877';
@@ -319,6 +344,33 @@ export default function SystemHealthView() {
                     </div>
                   ))}
                 </div>
+              </GlassCard>
+            )}
+
+            {inferenceMetrics && (inferenceMetrics.recent_attempts.length > 0 || inferenceMetrics.runtime) && (
+              <GlassCard className="p-4">
+                <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40 mb-3">
+                  Orchestration performance
+                </div>
+                {inferenceMetrics.runtime && (
+                  <div className="flex flex-wrap gap-3 text-[10px] font-mono text-bone/50 mb-3">
+                    <span>event loop p95 {inferenceMetrics.runtime.event_loop_delay_ms?.p95 ?? 0}ms</span>
+                    <span>utilization {Math.round((inferenceMetrics.runtime.event_loop_utilization ?? 0) * 100)}%</span>
+                    <span>RSS {Math.round((inferenceMetrics.runtime.rss_bytes ?? 0) / 1024 / 1024)}MB</span>
+                  </div>
+                )}
+                {inferenceMetrics.recent_attempts.length > 0 ? (
+                  <div className="space-y-1">
+                    {inferenceMetrics.recent_attempts.slice(-5).reverse().map((attempt, index) => (
+                      <div key={`${attempt.ts ?? index}-${index}`} className="text-[10px] font-mono text-bone/50 truncate">
+                        {formatAttemptSummary(attempt)}
+                        {attempt.first_token_ms !== undefined ? ` Â· first ${attempt.first_token_ms}ms` : ''}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-[10px] font-mono text-bone/30">No attempt data yet</div>
+                )}
               </GlassCard>
             )}
 

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   createRuntimeMonitor,
   readDelayHistogram,
+  shouldLogRuntimePerformance,
   type DelayHistogramLike,
 } from "./runtime-monitor";
 
@@ -19,6 +20,12 @@ function fakeHistogram(): DelayHistogramLike & { resetCount: number } {
 }
 
 describe("runtime performance monitor", () => {
+  test("keeps periodic logging opt-in while measurement remains available", () => {
+    expect(shouldLogRuntimePerformance("1")).toBe(true);
+    expect(shouldLogRuntimePerformance("0")).toBe(false);
+    expect(shouldLogRuntimePerformance(undefined)).toBe(false);
+  });
+
   test("converts perf_hooks nanoseconds to bounded millisecond percentiles", () => {
     expect(readDelayHistogram(fakeHistogram())).toEqual({
       min: 1,

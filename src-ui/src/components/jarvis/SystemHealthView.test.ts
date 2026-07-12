@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { conductorCacheVariant, formatRuntimeProvenance } from './SystemHealthView';
+import { conductorCacheVariant, formatRuntimeProvenance, formatAttemptSummary } from './SystemHealthView';
 
 describe('conductorCacheVariant', () => {
   // The Track A-02 acceptance criterion is >80% prefix reuse on a 3-turn
@@ -44,5 +44,17 @@ describe('formatRuntimeProvenance', () => {
 
   it('reports unavailable runtime health explicitly', () => {
     expect(formatRuntimeProvenance(null)).toBe('Runtime health unavailable');
+  });
+});
+
+describe('formatAttemptSummary', () => {
+  it('keeps the stage attempt summary compact and secret-free', () => {
+    expect(formatAttemptSummary({
+      stage: 'synthesizer',
+      provider: 'opencode_go',
+      model: 'deepseek-v4-flash',
+      outcome: 'empty_completion',
+      latency_ms: 21000,
+    })).toBe('synthesizer Â· opencode_go/deepseek-v4-flash Â· empty_completion Â· 21000ms');
   });
 });

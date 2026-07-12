@@ -81,13 +81,41 @@ export interface InferenceRecord {
   fallback_model?: string;
 }
 
+export type InferenceAttemptOutcome =
+  | "success"
+  | "first_token_timeout"
+  | "stream_idle_timeout"
+  | "visible_progress_timeout"
+  | "empty_completion"
+  | "http_error";
+
+export interface InferenceAttemptRecord {
+  ts: number;
+  session_id?: string;
+  run_id?: string;
+  stage: string;
+  provider: Backend;
+  model: string;
+  outcome: InferenceAttemptOutcome;
+  latency_ms: number;
+  first_token_ms?: number;
+  fallback_attempt: number;
+}
+
 const RING_SIZE = 200;
 const ring: InferenceRecord[] = [];
 let ringHead = 0;
+const attemptRing: InferenceAttemptRecord[] = [];
+let attemptRingHead = 0;
 
 export function recordInference(rec: InferenceRecord): void {
   ring[ringHead % RING_SIZE] = rec;
   ringHead += 1;
+}
+
+export function recordInferenceAttempt(rec: InferenceAttemptRecord): void {
+  attemptRing[attemptRingHead % RING_SIZE] = rec;
+  attemptRingHead += 1;
 }
 
 /** Ordered oldest→newest snapshot of up to RING_SIZE recent records. */
@@ -95,6 +123,12 @@ function ringSnapshot(): InferenceRecord[] {
   if (ringHead < RING_SIZE) return ring.slice(0, ringHead);
   const tail = ringHead % RING_SIZE;
   return [...ring.slice(tail), ...ring.slice(0, tail)];
+}
+
+function attemptRingSnapshot(): InferenceAttemptRecord[] {
+  if (attemptRingHead < RING_SIZE) return attemptRing.slice(0, attemptRingHead);
+  const tail = attemptRingHead % RING_SIZE;
+  return [...attemptRing.slice(tail), ...attemptRing.slice(0, tail)];
 }
 
 export interface BackendStats {
@@ -139,6 +173,7 @@ export interface InferenceMetricsSnapshot {
   window_size: number;
   backends: BackendStats[];
   generated_at: number;
+  recent_attempts: InferenceAttemptRecord[];
   /**
    * Conductor KV/prefix-reuse observability (Track A). `null` when no
    * conductor turns have been recorded yet in this Bun process — the UI
@@ -203,6 +238,7 @@ export function inferenceMetricsSnapshot(): InferenceMetricsSnapshot {
     window_size: records.length,
     backends: stats,
     generated_at: Date.now(),
+    recent_attempts: attemptRingSnapshot().slice(-30),
     conductor_cache,
   };
 }

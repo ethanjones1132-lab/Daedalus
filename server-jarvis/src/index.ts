@@ -34,9 +34,16 @@ import {
 import type { OpenRouterCostInfo } from "./openrouter";
 import { resolveProviderTarget, providerChatUrl, providerHeaders } from "./providers";
 import { routableOrchestratorAgents, runtimeFactsSystemMessage } from "./provider-availability";
-import { recordInference, inferenceMetricsSnapshot, backendForProvider, type Backend } from "./inference-metrics";
+import {
+  recordInference,
+  recordInferenceAttempt,
+  inferenceMetricsSnapshot,
+  backendForProvider,
+  type Backend,
+} from "./inference-metrics";
 import { createApprovalRegistry } from "./approval-registry";
 import { createDiscordAdapter, SqliteDeliveryReceiptStore } from "./channels/discord";
+import { summarizeTurnMetrics } from "./orchestration/turn-metrics";
 
 // One process-level approval registry: the chat surface emits
 // `tool_approval_request` SSE events and awaits decisions here.
@@ -128,7 +135,7 @@ import { makeCallModel } from "./eval/call-model";
 import { normalizeStreamedToolCalls } from "./streaming-tool-calls";
 import { countTokens } from "./tokens";
 import { WorkspaceAffinityStore } from "./orchestration/workspace-affinity";
-import { createRuntimeMonitor } from "./performance/runtime-monitor";
+import { createRuntimeMonitor, shouldLogRuntimePerformance } from "./performance/runtime-monitor";
 import { loadInferenceFeedback } from "./self-tuning/inference-feedback";
 import {
   INFERENCE_FEEDBACK_CRON_JOB_ID,
@@ -500,15 +507,13 @@ const JARVIS_SOURCE_TREE_SHA256 = process.env.JARVIS_SOURCE_TREE_SHA256 ?? null;
 
 let totalRequests = 0;
 const startTime = Date.now();
-const runtimePerformanceMonitor = process.env.JARVIS_PERF_MONITOR === "1"
-  ? createRuntimeMonitor()
-  : undefined;
-runtimePerformanceMonitor?.start();
+const runtimePerformanceMonitor = createRuntimeMonitor();
+runtimePerformanceMonitor.start();
 const runtimePerformanceLogIntervalMs = Math.max(
   1_000,
   Number(process.env.JARVIS_PERF_LOG_INTERVAL_MS ?? 10_000) || 10_000,
 );
-const runtimePerformanceLogTimer = runtimePerformanceMonitor
+const runtimePerformanceLogTimer = shouldLogRuntimePerformance(process.env.JARVIS_PERF_MONITOR)
   ? setInterval(() => {
       console.log(`[Jarvis Perf] ${JSON.stringify(runtimePerformanceMonitor.snapshot({ reset: true }))}`);
     }, runtimePerformanceLogIntervalMs)
@@ -1508,6 +1513,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const callModelAttempt = async (messages: any[], callOptions?: any, excludeModels?: Set<string>) => {
           ensureTurnBudget(callOptions?.stageLabel ?? "orchestrator_model_attempt");
           const stageAttemptStart = Date.now();
+          let attemptModel: string | undefined;
+          let attemptProvider: string | undefined;
+          let attemptOutcome: import("./inference-metrics").InferenceAttemptOutcome = "http_error";
+          let attemptFirstTokenMs: number | undefined;
+          const attemptStage = callOptions?.stageLabel as string | undefined;
+          try {
           const activeBackendIsOllama = cfg.active_backend === "ollama";
 
           // Resolve model from agent pool when a stage label is provided.
@@ -1575,6 +1586,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // speak OpenAI-compatible /chat/completions but live on their own
           // base_url + key (resolveProviderTarget). OpenRouter is the default.
           const effectiveProvider = poolProvider ?? "openrouter";
+          attemptModel = modelName;
+          attemptProvider = effectiveProvider;
           const isOpenCodeProvider = effectiveProvider === "opencode_zen" || effectiveProvider === "opencode_go";
           const providerTarget = !isOllama ? resolveProviderTarget(cfg, effectiveProvider) : null;
           // Only the OpenRouter catalog can describe OpenRouter models; skip it
@@ -1700,6 +1713,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               fetchRes = result.response;
               actualModelUsed = result.model_used;
               actualProviderUsed = result.provider_used;
+              attemptModel = actualModelUsed;
+              attemptProvider = actualProviderUsed;
               if (result.retries > 0) {
                 console.log(`[Jarvis Orchestrator] callModel used model ${result.model_used} after ${result.retries} retry attempt(s)`);
                 await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "fallback_notice", model: result.model_used, retries: result.retries, session_id: sessionId })}\n\n`));
@@ -2034,6 +2049,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             ? extractTextToolCalls(reasoningStripped, callOptions.tools).cleanedText
             : reasoningStripped;
           const cleanContent = extractTextToolCalls(toolAwareCleaned, []).cleanedText;
+          attemptModel = actualModelUsed;
+          attemptProvider = actualProviderUsed;
+          attemptFirstTokenMs = firstTokenLatencyMs;
           // Capture the actual provider/model used by this attempt so the
           // orchestrator's `recordInference` error/empty paths can attribute
           // the turn to the real backend (not the user's selected
@@ -2084,6 +2102,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             // JSON. Non-answer stages (executor, etc.) legitimately succeed via
             // tool calls with no prose, so they keep the original OR logic.
             const isAnswerStage = callOptions?.surfaceAsAnswer === true;
+            attemptOutcome = isAnswerStage
+              ? (hasContent ? "success" : "empty_completion")
+              : (hasContent || hasToolCalls ? "success" : "empty_completion");
             conductorLearning.recordStageModel({
               agentRunId: orchestratorAgentRunId,
               stageId: stageLabel,
@@ -2111,6 +2132,35 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             streamLiveness.stop();
             cleanupReaderAbort();
             cleanupRequestAbort();
+          }
+          } catch (error) {
+            const name = String((error as { name?: unknown })?.name ?? "");
+            attemptOutcome = name === "FirstTokenTimeoutError"
+              ? "first_token_timeout"
+              : name === "StreamIdleTimeoutError"
+                ? "stream_idle_timeout"
+                : name === "VisibleProgressTimeoutError"
+                  ? "visible_progress_timeout"
+                  : "http_error";
+            const failure = error as { model?: unknown; provider?: unknown };
+            if (typeof failure?.model === "string") attemptModel = failure.model;
+            if (typeof failure?.provider === "string") attemptProvider = failure.provider;
+            throw error;
+          } finally {
+            if (attemptStage && attemptModel && attemptProvider && !streamAbort.signal.aborted) {
+              recordInferenceAttempt({
+                ts: Date.now(),
+                session_id: sessionId,
+                run_id: orchestratorAgentRunId,
+                stage: attemptStage,
+                provider: backendForProvider(attemptProvider, cfg.active_backend),
+                model: attemptModel,
+                outcome: attemptOutcome,
+                latency_ms: Date.now() - stageAttemptStart,
+                first_token_ms: attemptFirstTokenMs,
+                fallback_attempt: excludeModels?.size ?? 0,
+              });
+            }
           }
         };
 
@@ -2446,21 +2496,21 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
         // Record metrics and propose tuning options
         const duration = Date.now() - runStartTime;
-        let totalTokens = 0;
-        let totalTokensIn = 0;
-        let totalTokensOut = 0;
-        let totalToolCalls = 0;
+        let turnMetrics = {
+          tokens_in: 0,
+          tokens_out: 0,
+          tokens_total: 0,
+          tool_calls: 0,
+          stage_duration_ms: 0,
+          failed_attempts: 0,
+          fallback_successes: 0,
+        };
+        let stageRuns: ReturnType<typeof outcomeCollector["store"]["getStageRuns"]> = [];
+        let modelAttributions: ReturnType<typeof outcomeCollector["store"]["getModelAttributions"]> = [];
         try {
-          const stages = outcomeCollector["store"].getStageRuns(agentRunId);
-          for (const s of stages) {
-            totalTokensIn += s.input_tokens || 0;
-            totalTokensOut += s.output_tokens || 0;
-            totalTokens += totalTokensIn + totalTokensOut;
-            if (s.tool_calls_json) {
-              const parsed = JSON.parse(s.tool_calls_json);
-              totalToolCalls += parsed.length;
-            }
-          }
+          stageRuns = outcomeCollector["store"].getStageRuns(agentRunId);
+          modelAttributions = outcomeCollector["store"].getModelAttributions(agentRunId);
+          turnMetrics = summarizeTurnMetrics({ stages: stageRuns, attributions: modelAttributions });
         } catch {}
 
         // Truthful run outcome. An empty/degraded run must NOT be recorded as a
@@ -2482,10 +2532,15 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           error: result.error,
           answer: trimmedAnswer,
         });
-        outcomeCollector.completeAgentRun(agentRunId, finalOutputForLog, duration, totalToolCalls, totalTokens, runOutcome);
+        outcomeCollector.completeAgentRun(
+          agentRunId,
+          finalOutputForLog,
+          duration,
+          turnMetrics.tool_calls,
+          turnMetrics.tokens_total,
+          runOutcome,
+        );
         if (conductorRunId) {
-          const stageRuns = outcomeCollector["store"].getStageRuns(agentRunId);
-          const modelAttributions = outcomeCollector["store"].getModelAttributions(agentRunId);
           conductorLearning.completeRun({
             conductorRunId,
             agentRunId,
@@ -2498,7 +2553,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             stageRuns,
             modelAttributions,
             durationMs: duration,
-            userRequest: contextMessage,
+            userRequest: message,
           });
           const heuristic = await conductorLearning.optimizeAndApply(
             agentRunId,
@@ -2514,12 +2569,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         }
         const distillCfg = cfg.orchestrator.skill_distillation;
         if (distillCfg?.enabled && runOutcome === "success") {
-          const stageRunsForDistill = outcomeCollector["store"].getStageRuns(agentRunId);
+          const stageRunsForDistill = stageRuns;
           const candidate = distillSkillCandidate({
             agentRunId,
             sessionId,
             taskType: route.task_type,
-            userRequest: contextMessage,
+            userRequest: message,
             workerInstructions: route.worker_instructions,
             stageRuns: stageRunsForDistill,
             runOutcome,
@@ -2577,8 +2632,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               : cfg.ollama.model),
             ok: false,
             latency_ms: duration,
-            tokens_in: 0,
-            tokens_out: 0,
+            tokens_in: turnMetrics.tokens_in,
+            tokens_out: turnMetrics.tokens_out,
+            fallback_used: turnMetrics.fallback_successes > 0,
+            retry_count: turnMetrics.failed_attempts,
             error: result.error.slice(0, 200),
           });
           await session.finish(result.error, { isError: true });
@@ -2597,8 +2654,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               : cfg.ollama.model),
             ok: false,
             latency_ms: duration,
-            tokens_in: 0,
-            tokens_out: 0,
+            tokens_in: turnMetrics.tokens_in,
+            tokens_out: turnMetrics.tokens_out,
+            fallback_used: turnMetrics.fallback_successes > 0,
+            retry_count: turnMetrics.failed_attempts,
             error: result.error_code ?? "empty_completion",
           });
           await session.finish("The orchestrator completed but produced no output. This may be a transient model issue. Try your request again.");
@@ -2624,8 +2683,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               : cfg.ollama.model),
             ok: runOutcome === "success",
             latency_ms: duration,
-            tokens_in: 0,
-            tokens_out: 0,
+            tokens_in: turnMetrics.tokens_in,
+            tokens_out: turnMetrics.tokens_out,
+            fallback_used: turnMetrics.fallback_successes > 0,
+            retry_count: turnMetrics.failed_attempts,
           });
           await session.finish(trimmedAnswer || result.answer, result.outcome === "partial"
             ? { subtype: "partial", code: result.error_code }

@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, it } from "bun:test";
-import { recordInference, inferenceMetricsSnapshot, backendForProvider } from "./inference-metrics";
+import {
+  recordInference,
+  recordInferenceAttempt,
+  inferenceMetricsSnapshot,
+  backendForProvider,
+} from "./inference-metrics";
 import {
   recordConductorCache,
   __resetConductorCacheMetricsForTests,
@@ -143,6 +148,30 @@ describe("inferenceMetricsSnapshot", () => {
     // the openrouter bucket just because they share a model string format.
     expect(zen!.total_tokens_in).toBeGreaterThanOrEqual(800);
     expect(go!.total_tokens_in).toBeGreaterThanOrEqual(100);
+  });
+
+  it("exposes recent stage attempts without prompt or response content", () => {
+    recordInferenceAttempt({
+      ts: Date.now(),
+      session_id: "attempt-session",
+      run_id: "attempt-run",
+      stage: "synthesizer",
+      provider: "opencode_go",
+      model: "deepseek-v4-flash",
+      outcome: "empty_completion",
+      latency_ms: 21_000,
+      first_token_ms: 20_500,
+      fallback_attempt: 0,
+    });
+
+    const attempt = inferenceMetricsSnapshot().recent_attempts.at(-1);
+    expect(attempt).toMatchObject({
+      session_id: "attempt-session",
+      stage: "synthesizer",
+      outcome: "empty_completion",
+      latency_ms: 21_000,
+    });
+    expect(JSON.stringify(attempt)).not.toContain("prompt");
   });
 });
 

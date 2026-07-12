@@ -51,6 +51,10 @@ export interface RuntimeMonitorDependencies {
   eventLoopUtilization?: (previous?: EluLike) => EluLike;
 }
 
+export function shouldLogRuntimePerformance(value: string | undefined): boolean {
+  return value === "1";
+}
+
 function finiteRounded(value: number, digits = 3): number {
   if (!Number.isFinite(value) || value < 0) return 0;
   const scale = 10 ** digits;
