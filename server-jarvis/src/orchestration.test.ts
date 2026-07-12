@@ -283,7 +283,11 @@ describe("Orchestration & Routing Tests", () => {
     const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
 
     const result = await executor.execute(
-      "Summarize this repo.",
+      // Phase 2 Task 2.1: "Summarize this repo" now triggers the deep-read
+      // path (3+ content reads required). A request phrased as a single-file
+      // lookup stays on the shallow path (1 read satisfies), which is the
+      // path this test actually exercises.
+      "What does the README say the platform is built with?",
       ["executor", "synthesizer"],
       "run-repo-grounding-with-evidence",
       () => {},

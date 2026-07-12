@@ -1,0 +1,88 @@
+// server-jarvis/src/orchestration/evidence-sufficiency.ts
+// ═══════════════════════════════════════════════════════════════
+// Replaces the boolean workspace-evidence fence. 2026-07-12 incident: one
+// successful top-level list_directory satisfied hasSuccessfulWorkspaceEvidence,
+// so a "comprehensively diagnose this repo" turn was treated as grounded with
+// zero file contents read. Sufficiency now scales with request depth.
+//
+// Plan reference:
+//   docs/superpowers/plans/2026-07-12-comprehensive-performance-improvement.md
+//   Phase 2 — Executor accuracy, Task 2.1
+// ═══════════════════════════════════════════════════════════════
+
+import type { ToolCallRecord } from "./stage-output";
+
+const DEEP_READ_MARKERS =
+  /\b(comprehensiv\w*|thorough\w*|entire|whole|all files|full|in[- ]depth|architecture|architectural|audit|diagnos\w*|repo|repository|codebase)\b/i;
+const CONTENT_EVIDENCE_TOOLS = new Set(["read_file", "grep", "git_metadata"]);
+const LISTING_TOOLS = new Set(["list_directory", "glob"]);
+
+/**
+ * Deep-read requests (e.g. "comprehensively diagnose this repo") require at
+ * least this many content-bearing tool results before the runtime will allow
+ * synthesis. A lone `list_directory` is no longer sufficient.
+ *
+ * The constant is exported so the 6 unit tests in `evidence-sufficiency.test.ts`
+ * can pin the floor at 3, and the wire-up in `pipeline.ts` (the post-loop
+ * fence and the nudge message) can reference the same value.
+ */
+export const DEEP_READ_MIN_CONTENT_READS = 3;
+
+export interface EvidenceAssessment {
+  sufficient: boolean;
+  contentReads: number;
+  listings: number;
+  deepRead: boolean;
+  reason: string;
+}
+
+/**
+ * Classify the raw user request as "deep" (e.g. "comprehensively diagnose
+ * this repo") or shallow (e.g. "what version is in package.json?"). Deep
+ * requests demand more workspace evidence before the runtime will let the
+ * synthesizer fabricate repo claims.
+ */
+export function isDeepReadRequest(request: string): boolean {
+  return DEEP_READ_MARKERS.test(request);
+}
+
+/**
+ * Decide whether the workspace tool calls the executor has produced so far
+ * are enough to let synthesis proceed. Sufficiency scales with request depth
+ * so a single `list_directory` can no longer pass a "comprehensively diagnose
+ * this repo" turn.
+ */
+export function assessWorkspaceEvidence(
+  toolCalls: ToolCallRecord[] | undefined,
+  request: string,
+): EvidenceAssessment {
+  const calls = (toolCalls ?? []).filter(
+    (c) => !c.is_error && c.output.trim().length > 0,
+  );
+  const contentReads = calls.filter((c) => CONTENT_EVIDENCE_TOOLS.has(c.name)).length;
+  const listings = calls.filter((c) => LISTING_TOOLS.has(c.name)).length;
+  const deepRead = isDeepReadRequest(request);
+
+  if (deepRead) {
+    const sufficient = contentReads >= DEEP_READ_MIN_CONTENT_READS;
+    return {
+      sufficient,
+      contentReads,
+      listings,
+      deepRead,
+      reason: sufficient
+        ? `deep read satisfied: ${contentReads} content reads`
+        : `deep-read request needs >=${DEEP_READ_MIN_CONTENT_READS} content reads (read_file/grep/git_metadata); got ${contentReads} content reads and ${listings} list_directory/glob calls`,
+    };
+  }
+  const sufficient = contentReads + listings >= 1;
+  return {
+    sufficient,
+    contentReads,
+    listings,
+    deepRead,
+    reason: sufficient
+      ? "shallow read satisfied"
+      : "no successful workspace tool result",
+  };
+}

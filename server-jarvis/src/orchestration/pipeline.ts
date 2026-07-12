@@ -17,6 +17,7 @@ import type { ExecutionProfile } from "./route-normalization";
 import type { TurnRequirement } from "./turn-requirements";
 import type { PipelineStageState, PlannerStageOutput, ExecutorStageOutput, ReviewerStageOutput, RewriterStageOutput, ToolCallRecord } from "./stage-output";
 import { parseReviewerVerdict, renderExecutorSummary, renderPlanSummary, renderReviewerSummary, renderRewriterSummary } from "./stage-output";
+import { assessWorkspaceEvidence } from "./evidence-sufficiency";
 import { truncateToTokenBudget } from "./context-budget";
 
 /**
@@ -110,14 +111,6 @@ function isStageTimeout(error: unknown): boolean {
     ? String((error as { name?: unknown }).name ?? "")
     : "";
   return /timeout/i.test(name) || /(?:first-token|stream idle|visible-progress|request) timeout/i.test(errText(error));
-}
-
-function hasSuccessfulWorkspaceEvidence(toolCalls: ToolCallRecord[] | undefined): boolean {
-  return (toolCalls ?? []).some((call) =>
-    WORKSPACE_EVIDENCE_TOOLS.has(call.name) &&
-    !call.is_error &&
-    call.output.trim().length > 0
-  );
 }
 
 function hasMutationIntent(request: string): boolean {
@@ -596,7 +589,7 @@ export class PipelineExecutor {
             }
           } else if (
             requiresWorkspaceEvidence &&
-            !hasSuccessfulWorkspaceEvidence(toolCalls) &&
+            !assessWorkspaceEvidence(toolCalls, request).sufficient &&
             !workspaceEvidenceNudgeSent &&
             turnCount < maxTurns
           ) {
@@ -604,18 +597,25 @@ export class PipelineExecutor {
             // model produced prose. Give it one bounded repair round to call a
             // real read tool; if it declines again, the runtime fence below
             // blocks synthesis instead of laundering stale prose as repo facts.
+            //
+            // The assessment scales with request depth (Phase 2 Task 2.1): a
+            // "comprehensively diagnose this repo" turn needs 3+ content reads
+            // before synthesis is allowed, so the nudge message tells the
+            // executor model exactly what is missing instead of asking for
+            // a single read.
+            const assessment = assessWorkspaceEvidence(toolCalls, request);
             workspaceEvidenceNudgeSent = true;
             executorMessages.push({
               role: "user",
               content:
-                "Workspace evidence is required for this turn. Before answering, call at least one relevant read-only workspace tool (read_file, list_directory, glob, or grep) and ground your findings in its result.",
+                `Workspace evidence is required for this turn. ${assessment.reason}. Call the relevant read-only workspace tools (read_file, list_directory, glob, grep, or git_metadata) and ground your findings in their results before answering.`,
             });
           } else {
             executorDone = true;
           }
 
           const turnToolErrors = toolCalls.slice(turnStartIdx).filter((call) => call.is_error);
-          const missingRequiredEvidence = requiresWorkspaceEvidence && !hasSuccessfulWorkspaceEvidence(toolCalls);
+          const missingRequiredEvidence = requiresWorkspaceEvidence && !assessWorkspaceEvidence(toolCalls, request).sufficient;
           this.collector.recordStageRun({
             id: `stage_${crypto.randomUUID()}`,
             agent_run_id: agentRunId,
@@ -650,7 +650,7 @@ export class PipelineExecutor {
       }
 
       const narrative = narratives.join("\n\n");
-      if (requiresWorkspaceEvidence && !hasSuccessfulWorkspaceEvidence(toolCalls)) {
+      if (requiresWorkspaceEvidence && !assessWorkspaceEvidence(toolCalls, request).sufficient) {
         onStateChange({ stage: "executor", status: "failed", output: MISSING_WORKSPACE_EVIDENCE });
         return { ok: false, narrative: MISSING_WORKSPACE_EVIDENCE, toolCalls };
       }
@@ -1114,7 +1114,7 @@ export class PipelineExecutor {
 
     if (
       options.turnRequirement === "workspace_read" &&
-      !hasSuccessfulWorkspaceEvidence(state.executor?.toolCalls)
+      !assessWorkspaceEvidence(state.executor?.toolCalls, request).sufficient
     ) {
       return {
         state,
@@ -1174,7 +1174,7 @@ export class PipelineExecutor {
     // callers that omit the synthesizer stage. The normal activation boundary
     // always appends a synthesizer, but PipelineExecutor is also reused by tests
     // and replan slices and must not return a planner sentinel as a repo answer.
-    if (requiresWorkspaceEvidence && !hasSuccessfulWorkspaceEvidence(state.executor?.toolCalls)) {
+    if (requiresWorkspaceEvidence && !assessWorkspaceEvidence(state.executor?.toolCalls, request).sufficient) {
       return {
         answer: "",
         error: MISSING_WORKSPACE_EVIDENCE,
