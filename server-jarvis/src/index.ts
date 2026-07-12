@@ -3829,7 +3829,10 @@ export async function baseFetch(req: Request): Promise<Response> {
       });
     }
     if (path === "/health/inference") {
-      return Response.json(inferenceMetricsSnapshot());
+      return Response.json({
+        ...inferenceMetricsSnapshot(),
+        runtime: runtimePerformanceMonitor.snapshot({ reset: false }),
+      });
     }
     if (path === "/performance/runtime" && req.method === "GET") {
       return Response.json(runtimePerformanceMonitor

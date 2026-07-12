@@ -11,6 +11,7 @@
 [CmdletBinding()]
 param(
     [string]$DeployDir = "$env:USERPROFILE\OneDrive\Desktop",
+    [string]$WorkspaceRoot = "$env:USERPROFILE\.openclaw\agents\coderclaw\workspace\home-base",
     [string]$HealthUrl = "http://127.0.0.1:19877/health",
     [string]$StreamUrl = "http://127.0.0.1:19877/chat/stream",
     [string]$Prompt = "Reply with exactly: smoke ok.",
@@ -86,6 +87,10 @@ function Read-SseStream([string]$Url, [hashtable]$Body, [int]$Timeout) {
 $manifestPath = Join-Path $DeployDir '.jarvis-deploy-manifest.json'
 $manifest = Get-JsonFile $manifestPath
 $health = Invoke-RestMethod -Uri $HealthUrl -TimeoutSec 5
+$inferenceHealth = Invoke-RestMethod -Uri ($HealthUrl -replace '/health$', '/health/inference') -TimeoutSec 5
+if ($null -eq $inferenceHealth.recent_attempts -or $null -eq $inferenceHealth.runtime) {
+    throw 'inference_health_contract_missing_recent_attempts_or_runtime'
+}
 $listener = Get-ServingProcess 19877
 
 $expectedIndex = [IO.Path]::GetFullPath((Join-Path $DeployDir 'index.js'))
@@ -121,7 +126,7 @@ if ($conductorCheck.status -ne 'pass') { throw 'conductor_health_fixture_failed'
 $writeReadCheck = [ordered]@{ status = 'not_requested'; artifact = $null; content = $null }
 $writeReadArtifact = $null
 if ($WriteReadSmoke) {
-    $writeReadArtifact = Join-Path $env:TEMP ("jarvis-orchestration-smoke-{0}.txt" -f [guid]::NewGuid())
+    $writeReadArtifact = Join-Path $WorkspaceRoot ("jarvis-orchestration-smoke-{0}.txt" -f [guid]::NewGuid())
     $Prompt = "Create the file '$writeReadArtifact' with exactly the text JARVIS_SMOKE, then read it and report the exact contents."
 }
 
@@ -183,6 +188,8 @@ $record = [ordered]@{
     event_count = $events.Count
     tool_names = $toolNames
     fallback_notices = $fallbackNotices
+    inference_attempts = @($inferenceHealth.recent_attempts | Select-Object -Last 10)
+    runtime = $inferenceHealth.runtime
     release_fixtures = [ordered]@{
         session_authority = $authorityCheck
         conductor_health = $conductorCheck

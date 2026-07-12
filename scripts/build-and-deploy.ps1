@@ -117,7 +117,7 @@ try {
     & $bun build ./src/index.ts --outdir ./dist --target bun `
         --define "process.env.JARVIS_GIT_SHA=\`"$buildGitSha\`"" `
         --define "process.env.JARVIS_BUILT_AT=\`"$buildBuiltAt\`"" `
-        --define "process.env.JARVIS_GIT_DIRTY=$($buildGitDirty.ToString().ToLowerInvariant())" `
+        --define "process.env.JARVIS_GIT_DIRTY=\`"$($buildGitDirty.ToString().ToLowerInvariant())\`"" `
         --define "process.env.JARVIS_SOURCE_TREE_SHA256=\`"$sourceTreeSha256\`""
     if ($LASTEXITCODE -ne 0) { Die 'server bundle build failed' }
 } finally { Pop-Location }
