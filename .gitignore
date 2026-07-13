@@ -55,3 +55,6 @@ terminals/
 __pycache__/
 *.pyc
 *.pyo
+
+# --- Temporary scripts (never commit) ---
+scripts/update-priorities-*.py
