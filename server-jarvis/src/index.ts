@@ -2625,14 +2625,32 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // success — that poisons the self-tuning signal. `completed:1` only means
         // the run finished; `outcome` records whether it actually succeeded.
         const trimmedAnswer = result.answer?.trim() || "";
+
+        // Cross-turn no-progress verdict (Task 1.3), computed BEFORE the
+        // outcome is persisted: the incident's non-answer turns were recorded
+        // as `success` in agent_runs (confirmed in self-tuning.db — runs
+        // run_5ed78a81/run_931c0741, 2026-07-12T13:40-13:41Z), so the
+        // self-tuner was actively rewarding the repetition loop. A repeated
+        // turn is recorded as `degraded`, which also keeps it out of skill
+        // distillation (success-gated below).
+        const evidenceBearing = turnReq.requirement === "workspace_read" || turnReq.requirement === "full_execution";
+        const evidenceKeys = (result.toolCalls ?? [])
+          .filter((c) => !c.is_error)
+          .map((c) => `${c.name}:${JSON.stringify(c.arguments)}`);
+        const repetitionVerdict = evidenceBearing && trimmedAnswer && !result.error
+          ? assessRepetition(repetitionStore.lastSignature(sessionId), trimmedAnswer, evidenceKeys)
+          : { repeated: false, similarity: 0, newEvidence: false };
+
         // Persistence/training keep their historical three-way vocabulary;
         // a user-visible partial answer is recorded as degraded, never as a
         // success. The raw PipelineResult still retains `outcome: "partial"`
         // for the stream contract and diagnostics.
         const runOutcome: "success" | "degraded" | "failed" =
-          result.outcome === "partial"
+          repetitionVerdict.repeated
             ? "degraded"
-            : (result.outcome ?? (result.error || !trimmedAnswer ? "failed" : "success"));
+            : result.outcome === "partial"
+              ? "degraded"
+              : (result.outcome ?? (result.error || !trimmedAnswer ? "failed" : "success"));
         const finalOutputForLog = trimmedAnswer || result.error || `(no output: ${result.error_code ?? "empty_completion"})`;
         sessionMemory.recordPipelineOutcome(sessionId, {
           outcome: runOutcome,
@@ -2804,17 +2822,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // Cross-turn no-progress guard (2026-07-12 incident, Task 1.3):
           // a turn that produced a real answer can still be a no-progress
           // repeat of the last turn — same non-answer text, zero new
-          // evidence gathered. Only checked for turn types where evidence
-          // (workspace tool calls) is meaningful; conversational/answer_only
-          // turns never gather tool evidence and are exempt by design.
-          const evidenceBearing = turnReq.requirement === "workspace_read" || turnReq.requirement === "full_execution";
-          const evidenceKeys = (result.toolCalls ?? [])
-            .filter((c) => !c.is_error)
-            .map((c) => `${c.name}:${JSON.stringify(c.arguments)}`);
-          const repetitionVerdict = evidenceBearing
-            ? assessRepetition(repetitionStore.lastSignature(sessionId), trimmedAnswer, evidenceKeys)
-            : { repeated: false, similarity: 0, newEvidence: false };
-
+          // evidence gathered. The verdict was computed above (before
+          // outcome persistence, so a repeat is durably `degraded`); this
+          // branch acts on it. Only evidence-bearing turn types are checked;
+          // conversational/answer_only turns never gather tool evidence and
+          // are exempt by design.
           let finalAnswer = trimmedAnswer || result.answer;
           if (repetitionVerdict.repeated) {
             console.warn(`[Jarvis Orchestrator] no-progress repetition detected session=${sessionId} similarity=${repetitionVerdict.similarity.toFixed(2)} — refusing to re-emit`);

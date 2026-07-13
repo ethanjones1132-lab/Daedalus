@@ -415,6 +415,12 @@ export class SelfTuningStore {
       const dbPath = this.dbPathOverride || selfTuningDbPath();
       const db = new Database(dbPath, { create: true });
       if (!schemaEnsuredPaths.has(dbPath)) {
+        // Task 4.2: state the resolved sink once per process. The 2026-07-12
+        // re-audit initially declared this collector "dark" because it
+        // queried the vestigial June-era stage_runs tables in jarvis.db —
+        // production telemetry actually lives here. One log line makes the
+        // real sink discoverable from the server log instead of forensics.
+        console.log(`[SelfTuningStore] telemetry sink: ${dbPath}`);
         db.exec(SELF_TUNING_SCHEMA);
         // Guarded migration: add the `outcome` column to pre-existing agent_runs
         // tables (CREATE TABLE IF NOT EXISTS won't ALTER an existing table). The
