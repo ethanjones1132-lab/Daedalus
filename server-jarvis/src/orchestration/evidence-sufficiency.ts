@@ -86,3 +86,32 @@ export function assessWorkspaceEvidence(
       : "no successful workspace tool result",
   };
 }
+
+export interface EvidenceFailure {
+  code: "missing_workspace_evidence" | "insufficient_workspace_evidence";
+  message: string;
+}
+
+/**
+ * Typed failure for an insufficient-evidence turn (Task 2.5). Distinguishes
+ * "nothing was read at all" from "something was read but not enough for the
+ * request's depth", and gives the user an actionable next step instead of a
+ * synthesized apology. The message must NEVER script the user's next message
+ * verbatim — the 2026-07-12 incident loop was manufactured by the assistant
+ * telling the user exactly what to re-send.
+ */
+export function evidenceFailure(assessment: EvidenceAssessment): EvidenceFailure {
+  if (assessment.contentReads + assessment.listings === 0) {
+    return {
+      code: "missing_workspace_evidence",
+      message:
+        "Workspace inspection failed: no successful workspace read tool result was produced, so Jarvis will not synthesize repository claims from ungrounded model text.",
+    };
+  }
+  return {
+    code: "insufficient_workspace_evidence",
+    message:
+      `I could not gather enough evidence to answer this (${assessment.reason}). ` +
+      "Name a specific file or directory to start from, or say 'force deep read' to retry with extended budgets.",
+  };
+}

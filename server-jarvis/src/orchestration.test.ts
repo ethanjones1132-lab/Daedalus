@@ -218,8 +218,12 @@ describe("Orchestration & Routing Tests", () => {
     expect(stages).toEqual(["executor", "executor"]);
     expect(result.answer).toBe("");
     expect(result.outcome).toBe("failed");
-    expect(result.error_code).toBe("missing_workspace_evidence");
-    expect(result.error).toContain("no successful workspace read");
+    // Task 2.2's deep-read preflight now seeds a listing + README anchor read,
+    // so the fence reports partial-but-insufficient evidence (needs 3+ content
+    // reads for a repo-level request) with actionable guidance, rather than
+    // the zero-evidence missing_workspace_evidence code.
+    expect(result.error_code).toBe("insufficient_workspace_evidence");
+    expect(result.error).toContain("force deep read");
   });
 
   test("workspace_read Git requests receive deterministic git metadata preflight evidence", async () => {

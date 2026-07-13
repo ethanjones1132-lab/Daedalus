@@ -18,10 +18,13 @@ describe("synthesizer prompt grounding rule", () => {
 
   test("directs the synthesizer to admit when no executor inspected the workspace", () => {
     const prompt = loadPrompt("modes/synthesizer.md");
-    // The exact fallback copy the synthesizer should fall back to when the
-    // user asks about the repo but the pipeline routed synthesizer-only.
+    // The honest-admission copy for repo questions with no workspace
+    // inspection. Task 2.5 removed the old re-ask coaching from this line
+    // ("ask me to read specific files") — that exact coaching manufactured
+    // the 2026-07-12 repetition loop.
     expect(prompt).toMatch(/I haven't inspected the repo in this turn/i);
-    expect(prompt).toMatch(/synthesizer path was taken directly/i);
+    expect(prompt).toMatch(/never tell the user to re-send, re-phrase, or re-ask/i);
+    expect(prompt.toLowerCase()).not.toContain("ask me to read specific files");
   });
 
   test("forbids copying internal tool evidence into the user-facing answer", () => {

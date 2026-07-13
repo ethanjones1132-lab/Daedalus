@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   DEEP_READ_MIN_CONTENT_READS,
   assessWorkspaceEvidence,
+  evidenceFailure,
   isDeepReadRequest,
 } from "./evidence-sufficiency";
 import type { ToolCallRecord } from "./stage-output";
@@ -161,5 +162,40 @@ describe("assessWorkspaceEvidence", () => {
     expect(a.sufficient).toBe(false);
     expect(a.deepRead).toBe(true);
     expect(a.reason).toContain(`>=${DEEP_READ_MIN_CONTENT_READS}`);
+  });
+});
+
+describe("evidenceFailure", () => {
+  test("zero evidence yields missing_workspace_evidence", () => {
+    const failure = evidenceFailure(assessWorkspaceEvidence([], "comprehensively diagnose this repo"));
+    expect(failure.code).toBe("missing_workspace_evidence");
+    expect(failure.message).toContain("no successful workspace read");
+  });
+
+  test("partial evidence on a deep read yields insufficient_workspace_evidence with actionable guidance", () => {
+    const listing = {
+      name: "list_directory",
+      arguments: { path: "C:/repo" },
+      output: "src/",
+      is_error: false,
+      duration_ms: 5,
+    };
+    const failure = evidenceFailure(assessWorkspaceEvidence([listing], "comprehensively diagnose this repo"));
+    expect(failure.code).toBe("insufficient_workspace_evidence");
+    expect(failure.message).toContain("force deep read");
+  });
+
+  test("failure messages never script the user's next message verbatim", () => {
+    for (const assessment of [
+      assessWorkspaceEvidence([], "audit the codebase"),
+      assessWorkspaceEvidence(
+        [{ name: "glob", arguments: { pattern: "*" }, output: "a.ts", is_error: false, duration_ms: 1 }],
+        "audit the codebase",
+      ),
+    ]) {
+      const failure = evidenceFailure(assessment);
+      expect(failure.message.toLowerCase()).not.toContain("ask me to");
+      expect(failure.message.toLowerCase()).not.toContain("re-send");
+    }
   });
 });

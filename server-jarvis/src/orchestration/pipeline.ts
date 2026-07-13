@@ -18,7 +18,7 @@ import type { TurnRequirement } from "./turn-requirements";
 import type { TurnBudget } from "./turn-budget";
 import type { PipelineStageState, PlannerStageOutput, ExecutorStageOutput, ReviewerStageOutput, RewriterStageOutput, ToolCallRecord } from "./stage-output";
 import { parseReviewerVerdict, renderExecutorSummary, renderPlanSummary, renderReviewerSummary, renderRewriterSummary } from "./stage-output";
-import { assessWorkspaceEvidence, isDeepReadRequest } from "./evidence-sufficiency";
+import { assessWorkspaceEvidence, evidenceFailure, isDeepReadRequest } from "./evidence-sufficiency";
 import { substituteToolCall } from "../tool-heal";
 import { truncateToTokenBudget } from "./context-budget";
 import { findExistingWorkspacePath } from "./workspace-affinity";
@@ -98,9 +98,6 @@ export interface PipelineExecuteOptions {
 }
 
 const READ_CACHE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "web_fetch"]);
-const WORKSPACE_EVIDENCE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "git_metadata"]);
-const MISSING_WORKSPACE_EVIDENCE =
-  "Workspace inspection failed: no successful workspace read tool result was produced, so Jarvis will not synthesize repository claims from ungrounded model text.";
 
 const ANCHOR_FILES = ["package.json", "README.md", "readme.md", "Cargo.toml", "pyproject.toml", "tsconfig.json", "app.json", "go.mod"];
 
@@ -835,9 +832,11 @@ export class PipelineExecutor {
       }
 
       const narrative = narratives.join("\n\n");
-      if (requiresWorkspaceEvidence && !assessWorkspaceEvidence(toolCalls, request).sufficient) {
-        onStateChange({ stage: "executor", status: "failed", output: MISSING_WORKSPACE_EVIDENCE });
-        return { ok: false, narrative: MISSING_WORKSPACE_EVIDENCE, toolCalls };
+      const finalAssessment = assessWorkspaceEvidence(toolCalls, request);
+      if (requiresWorkspaceEvidence && !finalAssessment.sufficient) {
+        const failure = evidenceFailure(finalAssessment);
+        onStateChange({ stage: "executor", status: "failed", output: failure.message });
+        return { ok: false, narrative: failure.message, toolCalls };
       }
       onStateChange({ stage: "executor", status: "completed", output: narrative });
       await this.afterConductorStage("executor", "completed", narrative, agentRunId, options, remainingQueue);
@@ -1297,16 +1296,15 @@ export class PipelineExecutor {
       return { state, effectGate, partialStage };
     }
 
-    if (
-      options.turnRequirement === "workspace_read" &&
-      !assessWorkspaceEvidence(state.executor?.toolCalls, request).sufficient
-    ) {
+    const preSynthAssessment = assessWorkspaceEvidence(state.executor?.toolCalls, request);
+    if (options.turnRequirement === "workspace_read" && !preSynthAssessment.sufficient) {
+      const failure = evidenceFailure(preSynthAssessment);
       return {
         state,
         synthesizerAnswer: "",
-        synthesizerFatalError: MISSING_WORKSPACE_EVIDENCE,
+        synthesizerFatalError: failure.message,
         synthesizerEmptyCompletion: false,
-        fatalErrorCode: "missing_workspace_evidence",
+        fatalErrorCode: failure.code,
         effectGate,
         partialStage,
       };
@@ -1359,13 +1357,15 @@ export class PipelineExecutor {
     // callers that omit the synthesizer stage. The normal activation boundary
     // always appends a synthesizer, but PipelineExecutor is also reused by tests
     // and replan slices and must not return a planner sentinel as a repo answer.
-    if (requiresWorkspaceEvidence && !assessWorkspaceEvidence(state.executor?.toolCalls, request).sufficient) {
+    const executeAssessment = assessWorkspaceEvidence(state.executor?.toolCalls, request);
+    if (requiresWorkspaceEvidence && !executeAssessment.sufficient) {
+      const failure = evidenceFailure(executeAssessment);
       return {
         answer: "",
-        error: MISSING_WORKSPACE_EVIDENCE,
+        error: failure.message,
         recursion_depth: 0,
         outcome: "failed",
-        error_code: "missing_workspace_evidence",
+        error_code: failure.code,
         toolCalls: state.executor?.toolCalls,
       };
     }
