@@ -29,6 +29,67 @@ export class SendGate {
   }
 }
 
+/**
+ * Synchronous in-flight mirror for the React `isStreaming` state.
+ *
+ * `isStreaming` flips via setState, which is async and batched — a rapid
+ * second Enter-press can land in `handleSend` before React has propagated
+ * the prior call's `isStreaming=true` to this render. The 2026-07-13 live
+ * incident (session 7254c3ae) hit exactly this: the user pressed Send three
+ * times while a prior turn was still streaming, the React state guard missed
+ * the second/third, and the server-side `ActiveStreamRegistry` quietly
+ * superseded the in-flight turn — real provider calls were discarded with
+ * no client-side signal.
+ *
+ * `SendInFlightGuard` is a `useRef`-backed synchronous mirror: `begin()` and
+ * `finish()` mutate immediately, so a second `handleSend` in the same tick
+ * sees the in-flight state correctly. `recordBlock()` increments a counter
+ * so the daily report can show "N sends were rejected because a stream was
+ * already in flight" without parsing logs.
+ */
+export class SendInFlightGuard {
+  private inFlight = false;
+  private blockCount = 0;
+
+  isInFlight(): boolean {
+    return this.inFlight;
+  }
+
+  /**
+   * Synchronously try to begin a send. Returns true if the send should
+   * proceed (caller is now responsible for calling `finish()`), false if
+   * a prior send is still in flight (the call is a no-op and the block
+   * counter is incremented).
+   */
+  begin(): boolean {
+    if (this.inFlight) {
+      this.blockCount += 1;
+      return false;
+    }
+    this.inFlight = true;
+    return true;
+  }
+
+  /**
+   * Synchronously mark the send as complete. Idempotent: a finish() call
+   * when nothing is in flight is a no-op (so a try/finally that fires
+   * even on the never-began path can't double-decrement).
+   */
+  finish(): void {
+    this.inFlight = false;
+  }
+
+  /** How many sends have been rejected by this guard since construction. */
+  blocksRecorded(): number {
+    return this.blockCount;
+  }
+
+  /** Reset the block counter (e.g. for a daily-report rollup). */
+  resetBlockCount(): void {
+    this.blockCount = 0;
+  }
+}
+
 export function recoverComposerAfterFailure(currentInput: string, sentText: string): string {
   return currentInput.trim() ? currentInput : sentText;
 }

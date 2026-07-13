@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   SendGate,
+  SendInFlightGuard,
   dedupeMessages,
   finalizeStreamingMessages,
   isToolCallEchoOnly,
@@ -155,6 +156,62 @@ describe('isToolCallEchoOnly', () => {
   it('is false for empty or whitespace-only content', () => {
     expect(isToolCallEchoOnly('')).toBe(false);
     expect(isToolCallEchoOnly('   \n  ')).toBe(false);
+  });
+});
+
+describe('SendInFlightGuard', () => {
+  // 2026-07-13 live incident (session 7254c3ae): a rapid second Enter-press
+  // bypassed the React `isStreaming` state guard because setState is async
+  // and batched. The SendInFlightGuard is a synchronous ref-backed mirror
+  // that closes the race.
+  it('admits one send, rejects a concurrent second send in the same tick', () => {
+    const guard = new SendInFlightGuard();
+    expect(guard.isInFlight()).toBe(false);
+    expect(guard.begin()).toBe(true);
+    expect(guard.isInFlight()).toBe(true);
+    // Second begin() in the same synchronous tick — exactly the case that
+    // raced past the React state guard in the live incident.
+    expect(guard.begin()).toBe(false);
+    expect(guard.isInFlight()).toBe(true);
+  });
+
+  it('counts the rejected sends so the daily report can surface the resend rate', () => {
+    const guard = new SendInFlightGuard();
+    expect(guard.begin()).toBe(true);
+    expect(guard.begin()).toBe(false);
+    expect(guard.begin()).toBe(false);
+    expect(guard.blocksRecorded()).toBe(2);
+    guard.finish();
+    // A new begin() after finish() succeeds and does not affect the prior
+    // block count.
+    expect(guard.begin()).toBe(true);
+    expect(guard.blocksRecorded()).toBe(2);
+  });
+
+  it('finish() releases the in-flight slot and a subsequent begin() succeeds', () => {
+    const guard = new SendInFlightGuard();
+    expect(guard.begin()).toBe(true);
+    guard.finish();
+    expect(guard.isInFlight()).toBe(false);
+    expect(guard.begin()).toBe(true);
+  });
+
+  it('finish() is idempotent so a try/finally that always fires cannot corrupt state', () => {
+    const guard = new SendInFlightGuard();
+    guard.finish(); // nothing in flight
+    guard.finish(); // still nothing
+    expect(guard.isInFlight()).toBe(false);
+    expect(guard.blocksRecorded()).toBe(0);
+  });
+
+  it('resetBlockCount() zeroes the counter without affecting in-flight state', () => {
+    const guard = new SendInFlightGuard();
+    expect(guard.begin()).toBe(true);
+    expect(guard.begin()).toBe(false);
+    expect(guard.blocksRecorded()).toBe(1);
+    guard.resetBlockCount();
+    expect(guard.blocksRecorded()).toBe(0);
+    expect(guard.isInFlight()).toBe(true);
   });
 });
 

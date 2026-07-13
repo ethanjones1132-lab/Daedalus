@@ -21,6 +21,7 @@ import {
 } from './sse-protocol';
 import {
   SendGate,
+  SendInFlightGuard,
   dedupeMessages,
   finalizeStreamingMessages,
   isToolCallEchoOnly,
@@ -420,6 +421,12 @@ export function ChatPanel({
   const onSessionCreatedRef = useRef(onSessionCreated);
   const streamAbortRef = useRef<AbortController | null>(null);
   const sendGateRef = useRef(new SendGate());
+  // 2026-07-13 live incident (session 7254c3ae): a rapid second Enter-press
+  // bypassed the React-state `isStreaming` guard because setState is
+  // async/batched. The server-side ActiveStreamRegistry then silently
+  // superseded the in-flight turn. This ref-backed synchronous guard
+  // closes the race on the client side; see SendInFlightGuard.
+  const sendInFlightRef = useRef(new SendInFlightGuard());
   const stopRequestedRef = useRef(false);
   useEffect(() => { activeSessionRef.current = activeSession; }, [activeSession]);
   useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
@@ -1139,9 +1146,27 @@ export function ChatPanel({
   }, [appendAssistantText, finalizeAssistantMessage]);
 
   const handleSend = useCallback(async () => {
-    if (!input.trim() || isStreaming) return;
+    // 2026-07-13 live incident (session 7254c3ae): the `isStreaming` React
+    // state guard below misses rapid double-Enter presses because setState
+    // is async/batched — a second handleSend in the same tick sees the
+    // pre-flip value. The server-side ActiveStreamRegistry then silently
+    // supersedes the in-flight turn. Check the synchronous in-flight guard
+    // FIRST so the race is closed on the client.
+    if (!sendInFlightRef.current.begin()) {
+      const blocks = sendInFlightRef.current.blocksRecorded();
+      console.warn(`[Jarvis UI] send blocked: stream in flight (blocks=${blocks})`);
+      setError('A turn is still streaming — please wait for it to finish before sending again.');
+      return;
+    }
+    if (!input.trim() || isStreaming) {
+      sendInFlightRef.current.finish();
+      return;
+    }
     const sendGeneration = sendGateRef.current.tryAcquire();
-    if (sendGeneration === null) return;
+    if (sendGeneration === null) {
+      sendInFlightRef.current.finish();
+      return;
+    }
     stopRequestedRef.current = false;
     const userMsg = input.trim();
     const history = messages
@@ -1222,6 +1247,12 @@ export function ChatPanel({
       });
     } finally {
       sendGateRef.current.release(sendGeneration);
+      // Mirror the React `isStreaming` state into the synchronous guard so
+      // the next handleSend call can proceed normally. The `isCurrent`/
+      // `invalidate` dance in sendGateRef handles stale completions, but
+      // the in-flight guard is the simpler "is anything in flight right
+      // now" check that needs a single finish() on every exit.
+      sendInFlightRef.current.finish();
     }
   }, [input, isStreaming, messages, activeSession, sessionId, onSessionCreated, setActiveSession, streamFromJarvisApi]);
 
