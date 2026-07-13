@@ -44,6 +44,16 @@ export interface AgentPoolCoverage {
     cheap: number;
   };
   stage_gaps: string[];
+  /**
+   * Enabled agents per provider (Task 3.4). The 2026-07-11 pool collapse —
+   * every stage funneled to one opencode_go model — happened because zen
+   * agents were disabled in live config while OpenRouter 401'd, leaving one
+   * eligible provider. A single-provider pool is a latency/availability
+   * monoculture the operator should see, not discover from logs.
+   */
+  providers: Record<string, number>;
+  /** Distinct providers among enabled agents. 1 = monoculture warning. */
+  provider_diversity: number;
 }
 
 export const ORCHESTRATOR_STAGES = [
@@ -357,6 +367,10 @@ export class AgentPool {
 
   coverage(): AgentPoolCoverage {
     const enabled = this.enabled();
+    const providers: Record<string, number> = {};
+    for (const agent of enabled) {
+      providers[agent.provider] = (providers[agent.provider] ?? 0) + 1;
+    }
     return {
       total: this.agents.size,
       enabled: enabled.length,
@@ -367,6 +381,8 @@ export class AgentPool {
         cheap: enabled.filter((agent) => agent.capabilities.cost >= 0.8).length,
       },
       stage_gaps: ORCHESTRATOR_STAGES.filter((stage) => !enabled.some((agent) => agent.default_for.includes(stage))),
+      providers,
+      provider_diversity: Object.keys(providers).length,
     };
   }
 

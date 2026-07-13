@@ -3970,9 +3970,17 @@ export async function baseFetch(req: Request): Promise<Response> {
       });
     }
     if (path === "/health/inference") {
+      // Task 3.4: pool composition is part of inference health. A
+      // provider_diversity of 1 is the monoculture that amplified the
+      // 2026-07-11 latency incident (every stage on one slow provider).
+      let pool_coverage: ReturnType<AgentPool["coverage"]> | undefined;
+      try {
+        pool_coverage = new AgentPool(routableOrchestratorAgents(loadConfig())).coverage();
+      } catch {}
       return Response.json({
         ...inferenceMetricsSnapshot(),
         runtime: runtimePerformanceMonitor.snapshot({ reset: false }),
+        pool_coverage,
       });
     }
     if (path === "/performance/runtime" && req.method === "GET") {

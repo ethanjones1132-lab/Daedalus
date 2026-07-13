@@ -200,6 +200,32 @@ describe("AgentPool", () => {
     expect(coverage.stage_gaps).not.toContain("executor");
   });
 
+  // Task 3.4: a provider_diversity of 1 is the monoculture that amplified
+  // the 2026-07-11 latency incident (every stage funneled to one slow
+  // provider after the others lost eligibility). The coverage surface must
+  // make that state visible.
+  test("coverage reports per-provider counts and flags a single-provider monoculture", () => {
+    const singleProvider = new AgentPool(agents); // fixtures are all openrouter
+    const mono = singleProvider.coverage();
+    expect(mono.providers).toEqual({ openrouter: 3 });
+    expect(mono.provider_diversity).toBe(1);
+
+    const mixed = new AgentPool([
+      ...agents,
+      {
+        id: "go-worker",
+        provider: "opencode_go",
+        model_id: "deepseek-v4-pro",
+        capabilities: { code: 0.9, reasoning: 0.85, speed: 0.5, cost: 0.9, json_reliability: 0.8 },
+        default_for: ["executor"],
+        enabled: true,
+      },
+    ]);
+    const diverse = mixed.coverage();
+    expect(diverse.provider_diversity).toBe(2);
+    expect(diverse.providers.opencode_go).toBe(1);
+  });
+
   test("formatPoolDiversity produces the compact metric from the roadmap", () => {
     const pool = new AgentPool(agents);
 
