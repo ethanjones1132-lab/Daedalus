@@ -87,4 +87,28 @@ describe("turn budgets", () => {
     const actualWatchdogDelayMs = Math.min(stageRemainingMs, resolvedFirstTokenMs);
     expect(actualWatchdogDelayMs).toBe(55_000); // was 20_000 before the fix
   });
+
+  test("full_execution's reviewer ceiling no longer undercuts a same-family Nemotron override", () => {
+    // or-nemotron-ultra-free (the reviewer default) shares the identical
+    // 55_000ms override and is currently disabled in live config, but the
+    // ceiling bug is proactively fixed regardless — see the comment on
+    // BUDGETS.full_execution.stage_ms.reviewer in turn-budget.ts.
+    const pool = new AgentPool([{
+      id: "or-nemotron-ultra-free",
+      provider: "openrouter",
+      model_id: "nvidia/nemotron-3-ultra-550b-a55b:free",
+      capabilities: { code: 0.78, reasoning: 0.96, speed: 0.42, cost: 1, json_reliability: 0.88 },
+      default_for: [],
+      first_token_timeout_ms: 55_000,
+      enabled: true,
+    }]);
+    const budget = createTurnBudget("full_execution", "medium", 0);
+
+    const stageRemainingMs = budget.stageRemainingMs("reviewer", 0);
+    const resolvedFirstTokenMs = firstTokenTimeoutFor(pool, "nvidia/nemotron-3-ultra-550b-a55b:free", 30_000);
+    expect(resolvedFirstTokenMs).toBe(55_000);
+
+    const actualWatchdogDelayMs = Math.min(stageRemainingMs, resolvedFirstTokenMs);
+    expect(actualWatchdogDelayMs).toBe(55_000); // was 20_000 before the fix
+  });
 });

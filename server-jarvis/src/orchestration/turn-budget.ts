@@ -33,12 +33,20 @@ const BUDGETS: Record<TurnRequirement, Omit<TurnBudget, "requirement" | "complex
   conversational: { turn_ms: 30_000, finalization_reserve_ms: 15_000, max_stage_attempts: 2, stage_ms: { synthesizer: 25_000 } },
   answer_only: { turn_ms: 45_000, finalization_reserve_ms: 20_000, max_stage_attempts: 2, stage_ms: { planner: 15_000, synthesizer: 30_000 } },
   workspace_read: { turn_ms: 75_000, finalization_reserve_ms: 25_000, max_stage_attempts: 2, stage_ms: { executor: 25_000, synthesizer: 30_000 } },
-  // planner: 60_000 (not the original 20_000) — see the 2026-07-13 finding
-  // below. full_execution's 150-180s total turn_ms leaves ample room; the
-  // per-stage ceilings are independent caps bounded by overall remaining
-  // time, not a strict partition of the total, so this doesn't starve
-  // later stages under normal (non-Nemotron) latency.
-  full_execution: { turn_ms: 150_000, finalization_reserve_ms: 30_000, max_stage_attempts: 2, stage_ms: { planner: 60_000, executor: 30_000, reviewer: 20_000, rewriter: 30_000, synthesizer: 35_000 } },
+  // planner/reviewer: 60_000 (not the original 20_000) — see the
+  // 2026-07-13 finding below. full_execution's 150-180s total turn_ms
+  // leaves ample room; the per-stage ceilings are independent caps bounded
+  // by overall remaining time, not a strict partition of the total, so
+  // this doesn't starve later stages under normal (non-Nemotron) latency.
+  // reviewer's default agent (or-nemotron-ultra-free) shares the exact
+  // same 55_000ms override and is currently disabled in live config (a
+  // separate, already-correct "disabled models don't inherit overrides"
+  // behavior — see agent-pool.test.ts), so this specific ceiling isn't
+  // actively biting today. Raised proactively: it's the identical bug
+  // class as planner's, and would silently recur the moment that model
+  // (or any future reviewer-stage model with a similarly large override)
+  // is enabled.
+  full_execution: { turn_ms: 150_000, finalization_reserve_ms: 30_000, max_stage_attempts: 2, stage_ms: { planner: 60_000, executor: 30_000, reviewer: 60_000, rewriter: 30_000, synthesizer: 35_000 } },
 };
 
 // 2026-07-13 finding: agent-pool.ts's DEFAULT_ORCHESTRATOR_AGENTS gives
