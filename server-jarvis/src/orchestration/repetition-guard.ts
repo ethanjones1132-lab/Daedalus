@@ -84,9 +84,48 @@ export function assessRepetition(
   };
 }
 
+export interface PreviousTurnOutcome {
+  request: string;
+  errorCode: string | undefined;
+}
+
+/**
+ * Failure codes worth short-circuiting a near-identical retry for (Task 3.3):
+ * re-running the full pipeline (~50s on the free-tier pool) would rediscover
+ * the same evidence shortfall. Provider/transport failures are deliberately
+ * NOT in this set — those are transient, and a retry is exactly right.
+ */
+const SHORT_CIRCUIT_CODES = new Set([
+  "no_progress_repetition",
+  "insufficient_workspace_evidence",
+  "missing_workspace_evidence",
+]);
+const FORCE_BYPASS = /\bforce deep read\b/i;
+// A concrete file/path in the retry counts as new information: an extension'd
+// filename ("gateway.ts") or a path separator ("src/api", "C:\repo").
+const CONCRETE_PATH = /[\w.-]+\.[a-z0-9]{1,8}\b|[\w-]+[\\/][\w./\\-]+/i;
+
+/**
+ * True when an incoming request is a near-identical retry of a request that
+ * just failed for lack of evidence/progress, with nothing new to act on.
+ * The caller replies instantly with the prior failure reason instead of
+ * re-running the pipeline to rediscover it.
+ */
+export function shouldShortCircuitRepeat(
+  previous: PreviousTurnOutcome | undefined,
+  request: string,
+): boolean {
+  if (!previous?.errorCode || !SHORT_CIRCUIT_CODES.has(previous.errorCode)) return false;
+  if (FORCE_BYPASS.test(request)) return false;
+  // Naming a concrete file/path the previous request lacked is new signal.
+  if (CONCRETE_PATH.test(request) && !CONCRETE_PATH.test(previous.request)) return false;
+  return jaccard(trigramsOf(previous.request), trigramsOf(request)) >= REPETITION_SIMILARITY_THRESHOLD;
+}
+
 /** Bounded per-session store of the last turn's signature (LRU by insertion). */
 export class SessionRepetitionStore {
   private signatures = new Map<string, TurnSignature>();
+  private outcomes = new Map<string, PreviousTurnOutcome>();
   constructor(private capacity = 200) {}
 
   lastSignature(sessionId: string): TurnSignature | undefined {
@@ -107,7 +146,23 @@ export class SessionRepetitionStore {
     }
   }
 
+  /** Record the turn's request + terminal error code for the retry memo. */
+  recordOutcome(sessionId: string, request: string, errorCode: string | undefined): void {
+    if (this.outcomes.has(sessionId)) this.outcomes.delete(sessionId);
+    this.outcomes.set(sessionId, { request, errorCode });
+    while (this.outcomes.size > this.capacity) {
+      const oldest = this.outcomes.keys().next().value;
+      if (oldest === undefined) break;
+      this.outcomes.delete(oldest);
+    }
+  }
+
+  lastOutcome(sessionId: string): PreviousTurnOutcome | undefined {
+    return this.outcomes.get(sessionId);
+  }
+
   clear(sessionId: string): void {
     this.signatures.delete(sessionId);
+    this.outcomes.delete(sessionId);
   }
 }

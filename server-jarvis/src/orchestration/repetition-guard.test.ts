@@ -3,6 +3,7 @@ import {
   trigramsOf,
   jaccard,
   assessRepetition,
+  shouldShortCircuitRepeat,
   SessionRepetitionStore,
   REPETITION_SIMILARITY_THRESHOLD,
 } from "./repetition-guard";
@@ -80,5 +81,64 @@ describe("repetition-guard", () => {
     expect(store.lastSignature("b")).toBeUndefined();
     expect(store.lastSignature("a")).toBeDefined();
     expect(store.lastSignature("c")).toBeDefined();
+  });
+});
+
+describe("shouldShortCircuitRepeat", () => {
+  test("re-sending a near-identical request after a no-progress failure short-circuits", () => {
+    expect(shouldShortCircuitRepeat(
+      { request: "read the repo and diagnose the gaps", errorCode: "no_progress_repetition" },
+      "read the repo and diagnose the gaps",
+    )).toBe(true);
+  });
+
+  test("insufficient-evidence failures also short-circuit", () => {
+    expect(shouldShortCircuitRepeat(
+      { request: "comprehensively diagnose this repo", errorCode: "insufficient_workspace_evidence" },
+      "complete the comprehensive diagnosis of this repo",
+    )).toBe(true);
+  });
+
+  test("naming a concrete file the previous request lacked bypasses the short-circuit", () => {
+    expect(shouldShortCircuitRepeat(
+      { request: "read the repo and diagnose the gaps", errorCode: "no_progress_repetition" },
+      "read gateway.ts in the repo and diagnose the gaps",
+    )).toBe(false);
+  });
+
+  test("force deep read bypasses the short-circuit", () => {
+    expect(shouldShortCircuitRepeat(
+      { request: "read the repo and diagnose", errorCode: "insufficient_workspace_evidence" },
+      "force deep read: read the repo and diagnose",
+    )).toBe(false);
+  });
+
+  test("a previous success never short-circuits", () => {
+    expect(shouldShortCircuitRepeat(
+      { request: "read the repo and diagnose", errorCode: undefined },
+      "read the repo and diagnose",
+    )).toBe(false);
+  });
+
+  test("transient provider failures never short-circuit (a retry is right)", () => {
+    expect(shouldShortCircuitRepeat(
+      { request: "read the repo and diagnose", errorCode: "first_token_timeout" },
+      "read the repo and diagnose",
+    )).toBe(false);
+  });
+
+  test("a genuinely different follow-up never short-circuits", () => {
+    expect(shouldShortCircuitRepeat(
+      { request: "read the repo and diagnose the gaps", errorCode: "no_progress_repetition" },
+      "what time is it in Tokyo?",
+    )).toBe(false);
+  });
+
+  test("store retains and clears outcomes per session", () => {
+    const store = new SessionRepetitionStore();
+    store.recordOutcome("s1", "read the repo", "insufficient_workspace_evidence");
+    expect(store.lastOutcome("s1")?.errorCode).toBe("insufficient_workspace_evidence");
+    store.clear("s1");
+    expect(store.lastOutcome("s1")).toBeUndefined();
   });
 });

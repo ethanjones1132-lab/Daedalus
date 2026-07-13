@@ -89,7 +89,7 @@ import {
 } from "./stream-control";
 import { prepareToolResultForContext } from "./tool-result-truncation";
 import { detectDegenerateTail } from "./stream-degeneration";
-import { SessionRepetitionStore, assessRepetition } from "./orchestration/repetition-guard";
+import { SessionRepetitionStore, assessRepetition, shouldShortCircuitRepeat } from "./orchestration/repetition-guard";
 import { Coordinator } from "./orchestration/coordinator";
 import { PersistentConductor } from "./orchestration/persistent-conductor";
 import { SessionMemory, mergeSharedContextHints } from "./orchestration/session-memory";
@@ -1524,6 +1524,23 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
       // ── Orchestrator path (PAMO-SET Phase 2) ─────────────────────
       if (cfg.orchestrator?.enabled) {
+        // Task 3.3: fail-fast memo. If this request is a near-identical retry
+        // of a request that just failed for lack of evidence/progress (and
+        // carries nothing new — no concrete file, no 'force deep read'),
+        // reply instantly with the prior failure reason instead of spending
+        // a full pipeline run (~50s on the free-tier pool) rediscovering it.
+        const previousOutcome = repetitionStore.lastOutcome(sessionId);
+        if (previousOutcome && shouldShortCircuitRepeat(previousOutcome, message)) {
+          console.warn(`[Jarvis Orchestrator] short-circuiting near-identical retry session=${sessionId} prior_code=${previousOutcome.errorCode}`);
+          await session.finish(
+            "This is essentially the same request that just failed " +
+            `(${previousOutcome.errorCode === "no_progress_repetition" ? "no new evidence was gathered" : "not enough workspace evidence could be gathered"}), ` +
+            "so re-running it would produce the same result. " +
+            "Name a specific file or directory to start from, or say 'force deep read' to retry with extended budgets.",
+            { subtype: "partial", code: "retry_short_circuited" },
+          );
+          return;
+        }
         console.log(`[Jarvis Orchestrator] Starting session=${sessionId}`);
         conductorLearning.setConfig(cfg.orchestrator.conductor_learning);
         const pruned = persistentConductor.pruneExpiredDiskSessions();
@@ -2729,6 +2746,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             retry_count: turnMetrics.failed_attempts,
             error: result.error.slice(0, 200),
           });
+          // Task 3.3: remember what failed and why, so a near-identical
+          // retry can be short-circuited instead of re-run.
+          repetitionStore.recordOutcome(sessionId, message, result.error_code ?? "stage_error");
           await session.finish(result.error, { isError: true });
         } else if (!trimmedAnswer) {
           // Empty (non-fatal) completion: show the friendly retry notice, but
@@ -2751,6 +2771,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             retry_count: turnMetrics.failed_attempts,
             error: result.error_code ?? "empty_completion",
           });
+          repetitionStore.recordOutcome(sessionId, message, result.error_code ?? "empty_completion");
           await session.finish("The orchestrator completed but produced no output. This may be a transient model issue. Try your request again.");
         } else {
           // Success path. The orchestrator runs many model calls per user
@@ -2814,6 +2835,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             // baseline and defeat detection across the gap).
             repetitionStore.record(sessionId, trimmedAnswer, evidenceKeys);
           }
+
+          // Task 3.3: a repeated turn records its failure code so the NEXT
+          // identical retry short-circuits before the pipeline; a genuine
+          // success clears the memo (errorCode undefined).
+          repetitionStore.recordOutcome(sessionId, message, repetitionVerdict.repeated ? "no_progress_repetition" : undefined);
 
           // Tag priority: a no-progress repeat always wins the SSE
           // subtype/code, even when `result.outcome` is independently
