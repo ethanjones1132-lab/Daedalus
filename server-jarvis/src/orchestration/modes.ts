@@ -79,9 +79,17 @@ export const BUILTIN_MODES: Record<string, AgentMode> = {
   },
 };
 
-/** Read-only inspection gets one tool attempt plus one correction/final pass. */
+/**
+ * Read-only inspection previously capped at 2 turns (one tool attempt plus
+ * one correction/final pass) — combined with the 25s workspace_read stage
+ * budget, that structurally starved deep reads (2026-07-12 incident). The
+ * cap now matches the standard executor limit; the progress-scaled turn
+ * budget (turn-budget.ts, Task 2.4) is the binding constraint instead of
+ * an arbitrary turn count, so a stalled read-only executor still exits
+ * quickly while a progressing one can keep reading.
+ */
 export function executorTurnLimit(profile: ExecutionProfile): number {
-  return profile === "read_only" ? 2 : BUILTIN_MODES.executor.max_turns;
+  return profile === "read_only" ? 4 : BUILTIN_MODES.executor.max_turns;
 }
 
 export function getToolsForMode(

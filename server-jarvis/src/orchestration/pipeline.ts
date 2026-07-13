@@ -15,6 +15,7 @@ import { buildSynthesizerContext, buildSynthesizerContextFromStageState } from "
 import { applyEffectGate, evaluateEffectGate, WRITE_EFFECT_TOOLS, type EffectGateReport } from "./effect-gate";
 import type { ExecutionProfile } from "./route-normalization";
 import type { TurnRequirement } from "./turn-requirements";
+import type { TurnBudget } from "./turn-budget";
 import type { PipelineStageState, PlannerStageOutput, ExecutorStageOutput, ReviewerStageOutput, RewriterStageOutput, ToolCallRecord } from "./stage-output";
 import { parseReviewerVerdict, renderExecutorSummary, renderPlanSummary, renderReviewerSummary, renderRewriterSummary } from "./stage-output";
 import { assessWorkspaceEvidence, isDeepReadRequest } from "./evidence-sufficiency";
@@ -87,6 +88,13 @@ export interface PipelineExecuteOptions {
   turnRequirement?: TurnRequirement;
   /** Maximum automatic full-profile review -> rewrite repair rounds. */
   maxReviewRepairRounds?: number;
+  /**
+   * The live turn budget (Task 2.4). When present, the executor reports
+   * evidence progress after each turn so a demonstrably-progressing stage
+   * earns extra time instead of being starved by the static per-stage
+   * budget (25s executor vs a ~52s-p50 free-tier provider pool).
+   */
+  turnBudget?: TurnBudget;
 }
 
 const READ_CACHE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "web_fetch"]);
@@ -780,6 +788,16 @@ export class PipelineExecutor {
           } else {
             executorDone = true;
           }
+
+          // Task 2.4: a turn that added new successful evidence earns the
+          // executor more budget (bounded inside extendStageOnProgress), so
+          // a deep read on a slow provider isn't cut off mid-progress while
+          // a stalled executor still hits the original tight deadline.
+          const evidenceAddedThisTurn = toolCalls
+            .slice(turnStartIdx)
+            .filter((call) => !call.is_error && call.output.trim().length > 0)
+            .length;
+          options.turnBudget?.extendStageOnProgress("executor", evidenceAddedThisTurn);
 
           const turnToolErrors = toolCalls.slice(turnStartIdx).filter((call) => call.is_error);
           const missingRequiredEvidence = requiresWorkspaceEvidence && !assessWorkspaceEvidence(toolCalls, request).sufficient;

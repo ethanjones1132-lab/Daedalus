@@ -1268,9 +1268,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
   const turnStartedAt = Date.now();
   const initialRequirement = classifyTurnRequirements(message).requirement;
   const turnBudget = createTurnBudget(initialRequirement, "medium", turnStartedAt);
-  const turnDeadlineAt = turnBudget.deadlineAt;
   const ensureTurnBudget = (stage: string): void => {
-    if (Date.now() >= turnDeadlineAt) {
+    if (Date.now() >= turnBudget.deadlineAt) {
       throw new TurnDeadlineExceededError(stage, turnBudget.turn_ms);
     }
   };
@@ -1374,7 +1373,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       admissionLease = await orchestrationAdmission.acquire({
         workClass: surface === "cron" ? "background" : "interactive",
         signal: streamAbort.signal,
-        deadlineAt: turnDeadlineAt,
+        deadlineAt: turnBudget.deadlineAt,
       });
       await streamWrite(`data: ${JSON.stringify({
         type: "orchestrator_queue",
@@ -1754,7 +1753,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           );
           let turnDeadlineAbortedRequest = false;
           const timeout = setTimeout(() => {
-            turnDeadlineAbortedRequest = Date.now() >= turnDeadlineAt;
+            turnDeadlineAbortedRequest = Date.now() >= turnBudget.deadlineAt;
             ctrl.abort();
           }, requestBudgetMs);
           const cleanupRequestAbort = registerAbortHandler(streamAbort.signal, () => ctrl.abort());
@@ -1769,7 +1768,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 taskType: orchestratorTaskType,
                 cascadeTier: callOptions?.cascadeTier,
                 excludeModels,
-                deadlineAt: turnDeadlineAt,
+                deadlineAt: turnBudget.deadlineAt,
                 turnBudgetMs: TOTAL_TURN_TIMEOUT_MS,
               });
               fetchRes = result.response;
@@ -1790,7 +1789,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             if (fetchErr.name === "AbortError" && streamAbort.signal.aborted) {
               await emitCancelled();
             }
-            if (turnDeadlineAbortedRequest || Date.now() >= turnDeadlineAt) {
+            if (turnDeadlineAbortedRequest || Date.now() >= turnBudget.deadlineAt) {
               throw new TurnDeadlineExceededError(callOptions?.stageLabel ?? "orchestrator_request", turnBudget.turn_ms);
             }
             if (fetchErr.name === "AbortError") {
@@ -1914,7 +1913,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               turnDeadlineExceeded = true;
               cancelReader("Turn deadline exceeded").catch(() => {});
             }
-          }, Math.max(0, turnDeadlineAt - Date.now()));
+          }, Math.max(0, turnBudget.deadlineAt - Date.now()));
           const textStreamSanitizer = createStageStreamSanitizer(Boolean(useTextTools));
           const emitTextToken = async (text: string) => {
             if (callOptions?.surfaceAsAnswer) {
@@ -2264,7 +2263,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               break;
             } catch (error) {
               const failure = recoverableStageFailure(error);
-              if (!failure || streamAbort.signal.aborted || !canRetryStage || retry >= turnBudget.max_stage_attempts - 1 || Date.now() + 5_000 >= turnDeadlineAt) {
+              if (!failure || streamAbort.signal.aborted || !canRetryStage || retry >= turnBudget.max_stage_attempts - 1 || Date.now() + 5_000 >= turnBudget.deadlineAt) {
                 throw error;
               }
               exclude.add(`${failure.provider}:${failure.modelId}`);
@@ -2514,6 +2513,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           distilledSkillsBlock: resolvedSkills.promptBlock,
           maxRecursionDepth: cfg.orchestrator.max_recursion_depth,
           maxReviewRepairRounds: cfg.orchestrator.max_review_repair_rounds,
+          // Task 2.4: the executor reports evidence progress into the live
+          // budget so a progressing deep read earns more time (bounded).
+          // All deadline readers below use turnBudget.deadlineAt directly,
+          // so extensions propagate to subsequent stage calls.
+          turnBudget,
           onRecursion: async (event: PipelineRecursionEvent) => {
             await writer.write(encoder.encode(`data: ${JSON.stringify({
               type: "orchestrator_recursion",
@@ -3011,10 +3015,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const useFallback = !isOllama && cfg.openrouter.enable_fallbacks;
         const requestTimeout = isOllama ? MODEL_REQUEST_TIMEOUT_MS : (cfg.openrouter.timeout_ms || MODEL_REQUEST_TIMEOUT_MS);
         const ctrl = new AbortController();
-        const requestBudgetMs = Math.max(1, Math.min(requestTimeout, turnDeadlineAt - Date.now()));
+        const requestBudgetMs = Math.max(1, Math.min(requestTimeout, turnBudget.deadlineAt - Date.now()));
         let turnDeadlineAbortedRequest = false;
         const timeout = setTimeout(() => {
-          turnDeadlineAbortedRequest = Date.now() >= turnDeadlineAt;
+          turnDeadlineAbortedRequest = Date.now() >= turnBudget.deadlineAt;
           ctrl.abort();
         }, requestBudgetMs);
         const cleanupRequestAbort = registerAbortHandler(streamAbort.signal, () => ctrl.abort());
@@ -3031,7 +3035,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             ensureTurnBudget("agent_loop_fallback");
             const result = await chatCompletionWithFallback(cfg, requestBody, ctrl.signal, {
               stage: "agent_loop",
-              deadlineAt: turnDeadlineAt,
+              deadlineAt: turnBudget.deadlineAt,
               turnBudgetMs: TOTAL_TURN_TIMEOUT_MS,
             });
             fetchRes = result.response;
@@ -3064,7 +3068,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           if (fetchErr.name === "AbortError" && streamAbort.signal.aborted) {
             await emitCancelled();
           }
-          if (turnDeadlineAbortedRequest || Date.now() >= turnDeadlineAt) {
+          if (turnDeadlineAbortedRequest || Date.now() >= turnBudget.deadlineAt) {
             throw new TurnDeadlineExceededError("agent_loop_request", TOTAL_TURN_TIMEOUT_MS);
           }
           if (fetchErr.name === "AbortError") {
@@ -3208,7 +3212,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             turnDeadlineExceeded = true;
             cancelReader("Turn deadline exceeded").catch(() => {});
           }
-        }, Math.max(0, turnDeadlineAt - Date.now()));
+        }, Math.max(0, turnBudget.deadlineAt - Date.now()));
         let activeToolCalls: any[] = [];
         const holdVisibleText = !forceFinalAnswerOnly
           && ((requiresVerifiedWebSearch && !verifiedWebSearchDone)

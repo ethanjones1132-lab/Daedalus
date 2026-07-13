@@ -176,8 +176,8 @@ describe("Orchestration & Routing Tests", () => {
     expect(executorToolNames).not.toContain("bash");
   });
 
-  test("read_only executor is bounded to two model rounds", () => {
-    expect(executorTurnLimit("read_only")).toBe(2);
+  test("read_only executor is bounded to four model rounds (Task 2.4: budget is the binding constraint)", () => {
+    expect(executorTurnLimit("read_only")).toBe(4);
     expect(executorTurnLimit("full")).toBe(BUILTIN_MODES.executor.max_turns);
   });
 
