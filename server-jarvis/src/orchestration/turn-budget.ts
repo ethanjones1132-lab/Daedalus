@@ -32,7 +32,17 @@ const ABSOLUTE_TURN_CAP_MS = 180_000;      // matches the high-complexity full_e
 const BUDGETS: Record<TurnRequirement, Omit<TurnBudget, "requirement" | "complexity" | "startedAt" | "deadlineAt" | "remainingMs" | "stageRemainingMs" | "canStart" | "extendStageOnProgress">> = {
   conversational: { turn_ms: 30_000, finalization_reserve_ms: 15_000, max_stage_attempts: 2, stage_ms: { synthesizer: 25_000 } },
   answer_only: { turn_ms: 45_000, finalization_reserve_ms: 20_000, max_stage_attempts: 2, stage_ms: { planner: 15_000, synthesizer: 30_000 } },
-  workspace_read: { turn_ms: 75_000, finalization_reserve_ms: 25_000, max_stage_attempts: 2, stage_ms: { executor: 25_000, synthesizer: 30_000 } },
+  // workspace_read's executor ceiling: 60_000 (not the original 25_000) — same
+  // bug class as the full_execution planner/reviewer fix above. The agent pool's
+  // DEFAULT_ORCHESTRATOR_AGENTS gives slow-start Nemotron models a
+  // first_token_timeout_ms: 55_000 override; if the executor route ever resolves
+  // to such a model (or any future executor-defaulted model with a similar
+  // override), the static 25_000 ceiling would silently undercut it via the
+  // same Math.min(requestBudgetMs, firstTokenTimeoutFor(...)) combinator. The
+  // runtime caps the actual delay at remainingMs (75_000 turn budget −
+  // 25_000 reserve = 50_000), so the wider ceiling just stops the override
+  // being inert — it does NOT extend the turn beyond its total budget.
+  workspace_read: { turn_ms: 75_000, finalization_reserve_ms: 25_000, max_stage_attempts: 2, stage_ms: { executor: 60_000, synthesizer: 30_000 } },
   // planner/reviewer: 60_000 (not the original 20_000) — see the
   // 2026-07-13 finding below. full_execution's 150-180s total turn_ms
   // leaves ample room; the per-stage ceilings are independent caps bounded

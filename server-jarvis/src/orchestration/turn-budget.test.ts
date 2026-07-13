@@ -24,11 +24,11 @@ describe("turn budgets", () => {
 
   test("evidence progress extends the executor stage budget up to the ceiling", () => {
     const budget = createTurnBudget("workspace_read", "medium", 0);
-    expect(budget.stage_ms.executor).toBe(25_000);
+    expect(budget.stage_ms.executor).toBe(60_000);
     budget.extendStageOnProgress("executor", 1);
-    expect(budget.stage_ms.executor).toBe(45_000);
+    expect(budget.stage_ms.executor).toBe(80_000); // 60k + 1*20k = 80k
     budget.extendStageOnProgress("executor", 3);
-    expect(budget.stage_ms.executor).toBe(90_000); // ceiling, not 45k + 60k
+    expect(budget.stage_ms.executor).toBe(90_000); // 80k + 3*20k = 140k, clamped to 90k ceiling
   });
 
   test("extension also relaxes the turn deadline but never past the absolute cap", () => {
@@ -46,7 +46,7 @@ describe("turn budgets", () => {
     expect(budget.stage_ms.executor).toBeUndefined();
     const workspaceBudget = createTurnBudget("workspace_read", "medium", 0);
     workspaceBudget.extendStageOnProgress("executor", 0);
-    expect(workspaceBudget.stage_ms.executor).toBe(25_000);
+    expect(workspaceBudget.stage_ms.executor).toBe(60_000);
   });
 
   // 2026-07-13 finding: index.ts's first-token watchdog computes
@@ -110,5 +110,42 @@ describe("turn budgets", () => {
 
     const actualWatchdogDelayMs = Math.min(stageRemainingMs, resolvedFirstTokenMs);
     expect(actualWatchdogDelayMs).toBe(55_000); // was 20_000 before the fix
+  });
+
+  // workspace_read's executor is the third stage affected by the same bug
+  // class as the planner/reviewer fixes above. Before the fix, the static
+  // 25_000 ceiling would always pick itself via the Math.min combinator
+  // when a slow-start Nemotron-family model (override 55_000) was the
+  // executor route — the same kind of silent inertness the planner test
+  // reproduces. The executor default (go-deepseek-v4-pro) doesn't carry an
+  // override today, but raising the ceiling proactively matches the
+  // pattern set by the two prior commits so a future executor-defaulted
+  // model with a 55_000+ override won't silently under-apply its window.
+  // Note: the actual runtime delay is also bounded by remainingMs (turn
+  // budget − reserve), so the wider ceiling just stops the override being
+  // inert — it does not extend the turn beyond its 75_000ms total.
+  test("workspace_read's executor ceiling no longer undercuts a same-family Nemotron override", () => {
+    const pool = new AgentPool([{
+      id: "zen-nemotron-ultra-free",
+      provider: "opencode_zen",
+      model_id: "nemotron-3-ultra-free",
+      capabilities: { code: 0.8, reasoning: 0.95, speed: 0.55, cost: 1, json_reliability: 0.88 },
+      default_for: [],
+      first_token_timeout_ms: 55_000,
+      enabled: true,
+    }]);
+    const budget = createTurnBudget("workspace_read", "medium", 0);
+
+    const stageRemainingMs = budget.stageRemainingMs("executor", 0);
+    const resolvedFirstTokenMs = firstTokenTimeoutFor(pool, "nemotron-3-ultra-free", 30_000);
+    expect(resolvedFirstTokenMs).toBe(55_000);
+
+    // The EXACT combinator index.ts applies to the orchestrator watchdog.
+    // The static executor ceiling (60_000) is above the override (55_000),
+    // so the override wins the Math.min — the bug the old 25_000 ceiling
+    // caused was that Math.min(25_000, 55_000) always picked 25_000,
+    // making the override completely inert end-to-end.
+    const actualWatchdogDelayMs = Math.min(stageRemainingMs, resolvedFirstTokenMs);
+    expect(actualWatchdogDelayMs).toBe(55_000); // was 25_000 before the fix
   });
 });
