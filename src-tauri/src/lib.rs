@@ -933,6 +933,7 @@ pub fn run() {
             get_session_history,
             get_session_runs,
             get_all_session_runs,
+            record_terminal_run,
             export_session,
             compact_session_db,
             update_token_count,

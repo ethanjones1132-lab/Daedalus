@@ -357,6 +357,39 @@ pub fn get_all_session_runs(db: State<AppDb>) -> Result<Vec<SessionRunRecord>, S
     list_all_session_runs(&db)
 }
 
+/// Task 4.1: the webview streams `/chat/stream` directly from the Bun server
+/// (JarvisView.tsx), bypassing the Rust SSE relay in `jarvis/runner.rs` that
+/// owns terminal-run persistence — which is why `session_runs` stayed empty
+/// while the UI was in daily use (the 2026-07-12 force-stop left no trace).
+/// The UI observes every terminal SSE frame anyway; this command lets it
+/// report the outcome it saw, keeping the native SQLite store the single
+/// durable authority (the Bun server still never writes session tables).
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub fn record_terminal_run(
+    db: State<AppDb>,
+    session_id: String,
+    run_id: String,
+    outcome: String,
+    selected_model: Option<String>,
+    token_count: i64,
+    tool_count: i64,
+    cancelled_reason: Option<String>,
+    partial_output: Option<String>,
+) -> Result<SessionRunRecord, String> {
+    persist_terminal_run(
+        &db,
+        &session_id,
+        &run_id,
+        &outcome,
+        selected_model.as_deref(),
+        token_count,
+        tool_count,
+        cancelled_reason.as_deref(),
+        partial_output.as_deref(),
+    )
+}
+
 // ── &AppDb helpers ───────────────────────────────────────────────────
 //
 // These hold the canonical SQLite session logic. Both the native "Sessions"

@@ -852,6 +852,42 @@ export function ChatPanel({
     let streamedVisibleText = false;
     let streamedRawText = '';
     let inactivityTimedOut = false;
+    // Task 4.1: mirror the Rust relay's TerminalRunAccumulator (jarvis/
+    // runner.rs). This direct-fetch path bypasses that relay, so the UI
+    // reports the terminal outcome it observed via the `record_terminal_run`
+    // Tauri command once the stream ends — otherwise session_runs stays
+    // empty and a force-stopped turn leaves no durable trace.
+    const runAcc: {
+      runId?: string;
+      outcome?: 'success' | 'partial' | 'failed' | 'timed_out' | 'cancelled';
+      selectedModel?: string;
+      tokenCount: number;
+      toolCount: number;
+      cancelledReason?: string;
+      partialOutput?: string;
+    } = { tokenCount: 0, toolCount: 0 };
+    const TIMEOUT_CODES = new Set([
+      'stage_timeout', 'first_token_timeout', 'stream_idle_timeout',
+      'visible_progress_timeout', 'turn_deadline_exceeded',
+    ]);
+    const persistTerminalRun = () => {
+      if (!runAcc.outcome) return;
+      // A force-stop can land before the pipeline ever emitted agent_run_id
+      // (the incident's exact case) — synthesize an id so the cancellation
+      // is still durably recorded. run_id is the idempotency key, so a
+      // client-generated id is safe.
+      const runId = runAcc.runId ?? `run_client_${crypto.randomUUID()}`;
+      invoke('record_terminal_run', {
+        ...sessionInvokeArgs(sid),
+        runId,
+        outcome: runAcc.outcome,
+        selectedModel: runAcc.selectedModel ?? null,
+        tokenCount: runAcc.tokenCount,
+        toolCount: runAcc.toolCount,
+        cancelledReason: runAcc.cancelledReason ?? null,
+        partialOutput: runAcc.partialOutput ?? null,
+      }).catch((e) => console.warn('[Jarvis] failed to persist terminal run:', e));
+    };
     const reportUnknownFrame = createUnknownFrameReporter();
     const inactivityWatchdog = new InactivityWatchdog(
       STREAM_INACTIVITY_TIMEOUT_MS,
@@ -907,6 +943,7 @@ export function ChatPanel({
         return;
       }
       if (frame.type === 'tool_use') {
+        runAcc.toolCount += 1;
         setToolCalls(prev => [...prev, {
           call_id: frame.id || frame.call_id,
           name: frame.name || frame.tool_name || 'unknown',
@@ -930,6 +967,8 @@ export function ChatPanel({
         return;
       }
       if (frame.type === 'cost_info') {
+        runAcc.selectedModel = typeof frame.model === 'string' ? frame.model : runAcc.selectedModel;
+        runAcc.tokenCount = Number(frame.total_tokens ?? frame.tokens ?? 0) || runAcc.tokenCount;
         setTurnCost({
           tokens: Number(frame.total_tokens ?? frame.tokens ?? 0),
           costUsd: Number(frame.cost_usd ?? 0),
@@ -941,8 +980,30 @@ export function ChatPanel({
         setPipelineStage(`fallback → ${target}`);
         return;
       }
+      // Task 4.1: agent_run_id is otherwise passive but carries the durable
+      // run identity — capture before the passive filter swallows it.
+      if (frame.type === 'agent_run_id' && typeof frame.agent_run_id === 'string') {
+        runAcc.runId = frame.agent_run_id;
+        return;
+      }
       if (isPassiveSseFrame(frame.type)) return;
       if (frame.type === 'result') {
+        // Mirror runner.rs map_terminal_outcome: is_error wins, then
+        // stage_timeout, then the subtype's own vocabulary.
+        const subtype = typeof frame.subtype === 'string' ? frame.subtype : 'success';
+        const code = typeof frame.code === 'string' ? frame.code : undefined;
+        runAcc.outcome = frame.is_error
+          ? 'failed'
+          : code === 'stage_timeout'
+            ? 'timed_out'
+            : subtype === 'partial'
+              ? 'partial'
+              : subtype === 'error'
+                ? 'failed'
+                : 'success';
+        if (subtype === 'partial' || code === 'stage_timeout') {
+          runAcc.partialOutput = String(frame.result ?? '') || undefined;
+        }
         if (frame.is_error) throw new Error(String(frame.result || frame.error || 'Jarvis stream failed.'));
         if (!streamedVisibleText) {
           const text = String(frame.result || '');
@@ -959,6 +1020,10 @@ export function ChatPanel({
         // per-model first-token window" string). Other codes fall
         // through to the raw `frame.error` text.
         const code = typeof frame.code === 'string' ? frame.code : undefined;
+        // Task 4.1 (mirrors runner.rs map_error_outcome): timeout codes are
+        // recorded as timed_out so timeout telemetry isn't flattened into a
+        // generic failure.
+        runAcc.outcome = code && TIMEOUT_CODES.has(code) ? 'timed_out' : 'failed';
         if (code) {
           // eslint-disable-next-line no-console
           console.warn(`[Jarvis] stream error code=${code}: ${frame.error}`);
@@ -980,6 +1045,8 @@ export function ChatPanel({
         // streamed, or drop the empty stub entirely if nothing did —
         // `isStreaming` always ends false either way, so there's no
         // forever-spinner.
+        runAcc.outcome = 'cancelled';
+        runAcc.cancelledReason = 'user_stop';
         setIsStreaming(false);
         stopRequestedRef.current = false;
         setError(null);
@@ -1043,6 +1110,19 @@ export function ChatPanel({
       throw error;
     } finally {
       inactivityWatchdog.stop();
+      // Task 4.1: durably record the terminal outcome on every exit path.
+      // Stream ends without a terminal frame: an inactivity timeout is
+      // timed_out; a client-side abort (user Stop that raced ahead of the
+      // server's `cancelled` frame, or component teardown) is cancelled.
+      if (!runAcc.outcome) {
+        if (inactivityTimedOut) {
+          runAcc.outcome = 'timed_out';
+        } else if (controller.signal.aborted || stopRequestedRef.current) {
+          runAcc.outcome = 'cancelled';
+          runAcc.cancelledReason = 'client_abort';
+        }
+      }
+      persistTerminalRun();
     }
     if (inactivityTimedOut) {
       throw new Error(`Jarvis stream was inactive for ${STREAM_INACTIVITY_TIMEOUT_MS / 1000} seconds.`);
