@@ -376,4 +376,161 @@ describe("pipeline stage telemetry", () => {
     expect(result.error_code).toBe("effect_gate_no_write_effect");
     expect(rows.find((row) => row.mode_id === "rewriter")).toBeUndefined();
   });
+
+  // Task 1.4: pin the repair-loop cap in `runReviewerRewriterLoop`
+  // (pipeline.ts ~line 801). A 2026-07-11 live incident showed
+  // reviewer/rewriter ping-ponging 4+ rounds before a fix landed capping
+  // repair rounds. The cap already exists in code
+  // (`Math.min(2, Math.max(0, Math.floor(configuredRepairRounds)))`); these
+  // tests pin that behavior so a future change can't silently regress it
+  // back to unbounded repair.
+  //
+  // Note on row counting: each repair round's rewriter stage runs its own
+  // internal turn loop (BUILTIN_MODES.rewriter.max_turns). A round that
+  // performs a write always records at least 2 "rewriter" stage_run rows --
+  // the turn with the write, and a follow-up turn where the rewriter
+  // reports nothing further to do (only that turn, returning no tool_calls,
+  // can flip `rewriterDone` and let the round's inner loop exit). So "number
+  // of rewriter stage_run rows" is NOT the same as "number of repair
+  // rounds" -- these tests count actual writes instead, which is the
+  // correct proxy for repair-round count.
+  test("repair rounds are hard-capped at 2 even when more are requested and the reviewer keeps flagging issues", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("read_file"), async () => "existing content");
+    runtime.register(toolDefinition("write_file"), async () => "wrote file");
+    const cfg = defaultConfig();
+    cfg.tools = { ...cfg.tools, require_approval: [], sandbox_mode: "permissive" };
+    const ctx = makeExecutionContext("agent", cfg, { workspace_path: process.cwd() });
+    let executorTurns = 0;
+    let rewriterCallCount = 0;
+    let rewriterWriteCount = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor" && executorTurns++ === 0) {
+        return { content: "inspecting", tool_calls: [toolCallWithArgs("read_file", { path: "CONTEXT.md" })] };
+      }
+      if (options.stageLabel === "executor") {
+        return { content: "read complete" };
+      }
+      // Reviewer NEVER accepts -- always flags an issue, so the loop would
+      // run forever without the hard cap.
+      if (options.stageLabel === "reviewer") {
+        return { content: "PARTIAL: repair still needed" };
+      }
+      if (options.stageLabel === "rewriter") {
+        // Odd calls are the "does the work" turn of a round: write to a
+        // NEW path every round, so addedWriteProgress is true every time --
+        // isolating the hard-cap stop condition from the no-progress stop
+        // condition (Test 2 below covers that one separately). Even calls
+        // are the round's follow-up turn that reports nothing more to do,
+        // ending that round's inner turn loop.
+        rewriterCallCount++;
+        if (rewriterCallCount % 2 === 1) {
+          const path = `workspace/repair-${rewriterWriteCount++}.md`;
+          return {
+            content: "repairing",
+            tool_calls: [toolCallWithArgs("write_file", { path, content: "- fix" })],
+          };
+        }
+        return { content: "repair round complete" };
+      }
+      if (options.stageLabel === "synthesizer") {
+        return { content: "Repairs applied." };
+      }
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    await executor.execute(
+      "write workspace/thing.md and fix any issues",
+      ["executor", "reviewer", "synthesizer"],
+      "run-repair-hard-cap",
+      () => {},
+      { executionProfile: "full", maxReviewRepairRounds: 5 },
+    );
+
+    // reviewer never stops flagging issues, so the cap itself is what ends
+    // the loop -- exactly 2 repair rounds ran even though 5 were requested.
+    expect(rewriterWriteCount).toBeLessThanOrEqual(2);
+    expect(rewriterWriteCount).toBe(2);
+
+    const rewriterWriteRows = rows.filter(
+      (row) => row.mode_id === "rewriter" && (row.tool_calls_json ?? "").includes("write_file"),
+    );
+    expect(rewriterWriteRows.length).toBe(2);
+  });
+
+  test("a repair round with no new write-effect progress exits the loop immediately", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("read_file"), async () => "existing content");
+    runtime.register(toolDefinition("write_file"), async () => "wrote file");
+    const cfg = defaultConfig();
+    cfg.tools = { ...cfg.tools, require_approval: [], sandbox_mode: "permissive" };
+    const ctx = makeExecutionContext("agent", cfg, { workspace_path: process.cwd() });
+    let executorTurns = 0;
+    let rewriterTurns = 0;
+    let rewriterWriteCalls = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor" && executorTurns++ === 0) {
+        return {
+          content: "inspecting",
+          tool_calls: [toolCallWithArgs("write_file", { path: "workspace/thing.md", content: "- v1" })],
+        };
+      }
+      if (options.stageLabel === "executor") {
+        return { content: "wrote v1" };
+      }
+      // Reviewer never accepts, so only the no-progress exit (not reviewer
+      // acceptance) can end this loop.
+      if (options.stageLabel === "reviewer") {
+        return { content: "PARTIAL: repair still needed" };
+      }
+      if (options.stageLabel === "rewriter" && rewriterTurns++ === 0) {
+        // SAME path + SAME content as the executor's write: successfulWriteKeys()
+        // produces an identical key, so addedWriteProgress(before, after) is
+        // false on this very first repair round -- `before` already
+        // contains this key (from the executor's write), so the rewriter
+        // re-doing it adds nothing new.
+        rewriterWriteCalls++;
+        return {
+          content: "repairing",
+          tool_calls: [toolCallWithArgs("write_file", { path: "workspace/thing.md", content: "- v1" })],
+        };
+      }
+      if (options.stageLabel === "rewriter") {
+        return { content: "repair round complete" };
+      }
+      if (options.stageLabel === "synthesizer") {
+        return { content: "Repairs applied." };
+      }
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    await executor.execute(
+      "write workspace/thing.md and fix any issues",
+      ["executor", "reviewer", "synthesizer"],
+      "run-repair-no-progress",
+      () => {},
+      { executionProfile: "full", maxReviewRepairRounds: 5 },
+    );
+
+    // Exactly ONE repair round ran before the no-progress exit fired -- even
+    // though 5 rounds were requested and the reviewer never stopped
+    // flagging issues.
+    expect(rewriterWriteCalls).toBe(1);
+
+    // One repair round == two internal rewriter turns recorded (the turn
+    // that writes, and the follow-up turn where the rewriter reports
+    // nothing more to do). If the no-progress exit failed to fire, the
+    // reviewer (which never accepts) would trigger MORE repair rounds and
+    // this count would keep growing in additional 2-turn blocks.
+    const rewriterRows = rows.filter((row) => row.mode_id === "rewriter");
+    expect(rewriterRows.length).toBe(2);
+    const rewriterWriteRows = rewriterRows.filter((row) => (row.tool_calls_json ?? "").includes("write_file"));
+    expect(rewriterWriteRows.length).toBe(1);
+  });
 });
