@@ -614,6 +614,13 @@ export function isInvalidWorkspacePath(
   }
 }
 
+// Task 3.5: normalizeConfig runs on every uncached loadConfig() (the 5s
+// config cache is shorter than the 15s health poll), so a stale jarvis_path
+// previously produced the same WARN ~5,700 times/day. The state is
+// process-lifetime by design: the warning re-fires only after a restart or
+// when a DIFFERENT stale path appears (i.e., new information).
+const warnedStaleWorkspacePaths = new Set<string>();
+
 export function normalizeConfig(raw: any, options: NormalizeConfigOptions = {}): JarvisConfig {
   const merged = deepMerge(defaultConfig(), raw);
   const configuredRepairRounds = Number(merged.orchestrator.max_review_repair_rounds);
@@ -648,10 +655,13 @@ export function normalizeConfig(raw: any, options: NormalizeConfigOptions = {}):
   if (merged.jarvis_path !== defaultWorkspacePath && isInvalidWorkspacePath(merged.jarvis_path, platform, exists)) {
     const stalePath = merged.jarvis_path;
     merged.jarvis_path = defaultWorkspacePath;
-    console.warn(
-      `[Config] jarvis_path "${stalePath}" is unusable on ${platform}; using "${merged.jarvis_path}" in memory. ` +
-      "The on-disk config is not rewritten until the next explicit save.",
-    );
+    if (!warnedStaleWorkspacePaths.has(stalePath)) {
+      warnedStaleWorkspacePaths.add(stalePath);
+      console.warn(
+        `[Config] jarvis_path "${stalePath}" is unusable on ${platform}; using "${merged.jarvis_path}" in memory. ` +
+        "The on-disk config is not rewritten until the next explicit save. (This warning fires once per process per path.)",
+      );
+    }
   }
   return merged;
 }

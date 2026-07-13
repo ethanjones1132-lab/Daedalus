@@ -30,3 +30,31 @@ describe("review repair budget", () => {
     expect(normalizeConfig({ orchestrator: { max_review_repair_rounds: "not-a-number" } }).orchestrator.max_review_repair_rounds).toBe(1);
   });
 });
+
+describe("stale jarvis_path warning dedupe (Task 3.5)", () => {
+  test("warns once per distinct stale path per process, not on every normalization", () => {
+    const originalWarn = console.warn;
+    const warnings: string[] = [];
+    console.warn = (...args: unknown[]) => { warnings.push(String(args[0])); };
+    try {
+      const options = { platform: "win32" as NodeJS.Platform, exists: () => false };
+      const stale = { jarvis_path: "/root/.openclaw/agents/task35-dedupe-fixture/workspace" };
+      normalizeConfig(stale, options);
+      normalizeConfig(stale, options);
+      normalizeConfig(stale, options);
+      const staleWarnings = warnings.filter((w) => w.includes("task35-dedupe-fixture"));
+      expect(staleWarnings.length).toBe(1);
+      // A DIFFERENT stale path is new information and warns again.
+      normalizeConfig({ jarvis_path: "/root/.openclaw/agents/task35-other-fixture/workspace" }, options);
+      expect(warnings.filter((w) => w.includes("task35-other-fixture")).length).toBe(1);
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  test("the stale path is still corrected in memory on every call", () => {
+    const options = { platform: "win32" as NodeJS.Platform, exists: () => false };
+    const cfg = normalizeConfig({ jarvis_path: "/root/.openclaw/agents/task35-dedupe-fixture/workspace" }, options);
+    expect(cfg.jarvis_path).not.toContain("/root/");
+  });
+});
