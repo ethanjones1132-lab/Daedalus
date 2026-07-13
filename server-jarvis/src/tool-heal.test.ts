@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { classifyToolError, healingHint, augmentErrorOutput } from "./tool-heal";
+import { classifyToolError, healingHint, augmentErrorOutput, substituteToolCall } from "./tool-heal";
 
 describe("classifyToolError", () => {
   test("detects file-not-found", () => {
@@ -53,5 +53,34 @@ describe("augmentErrorOutput", () => {
   });
   test("leaves unknown errors unchanged", () => {
     expect(augmentErrorOutput("weird error", 1)).toBe("weird error");
+  });
+});
+
+describe("substituteToolCall", () => {
+  test("read_file on a directory substitutes list_directory on the same path", () => {
+    const dirPath = "C:\\repo\\src";
+    const sub = substituteToolCall(
+      "read_file",
+      { path: dirPath },
+      `Error: "${dirPath}" is a directory, not a file. Use list_directory to see its contents.`,
+    );
+    expect(sub).toEqual({
+      name: "list_directory",
+      arguments: { path: dirPath },
+      note: "read_file targeted a directory; auto-substituted list_directory",
+    });
+  });
+  test("raw EISDIR output also triggers the substitution", () => {
+    const sub = substituteToolCall("read_file", { path: "/repo/src" }, "EISDIR: illegal operation on a directory, read");
+    expect(sub?.name).toBe("list_directory");
+  });
+  test("other errors return null (no substitution)", () => {
+    expect(substituteToolCall("read_file", { path: "C:\\x.ts" }, "ENOENT: no such file")).toBeNull();
+  });
+  test("non-read_file tools never substitute", () => {
+    expect(substituteToolCall("edit_file", { path: "C:\\repo\\src" }, "is a directory")).toBeNull();
+  });
+  test("missing path argument returns null", () => {
+    expect(substituteToolCall("read_file", {}, "is a directory")).toBeNull();
   });
 });

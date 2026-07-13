@@ -18,6 +18,7 @@ import type { TurnRequirement } from "./turn-requirements";
 import type { PipelineStageState, PlannerStageOutput, ExecutorStageOutput, ReviewerStageOutput, RewriterStageOutput, ToolCallRecord } from "./stage-output";
 import { parseReviewerVerdict, renderExecutorSummary, renderPlanSummary, renderReviewerSummary, renderRewriterSummary } from "./stage-output";
 import { assessWorkspaceEvidence, isDeepReadRequest } from "./evidence-sufficiency";
+import { substituteToolCall } from "../tool-heal";
 import { truncateToTokenBudget } from "./context-budget";
 import { findExistingWorkspacePath } from "./workspace-affinity";
 import { join } from "path";
@@ -716,6 +717,42 @@ export class PipelineExecutor {
                 status: "running",
                 output: `\n[Tool Executed: ${tc.name}]\n`
               });
+              // Task 2.3: when a failed call has an unambiguous correct
+              // alternative (read_file on a directory -> list_directory),
+              // execute the substitute immediately instead of spending a
+              // full model round-trip on the healing hint. The original
+              // failed call stays recorded above so evidence accounting
+              // and telemetry still see the model's actual behavior.
+              if (toolResult.is_error) {
+                const sub = substituteToolCall(call.name, call.arguments, toolResultModelText(toolResult));
+                if (sub) {
+                  const subCall: ToolCall = {
+                    id: `call_${crypto.randomUUID()}`,
+                    name: sub.name,
+                    arguments: sub.arguments,
+                  };
+                  const subResult = await this.runToolCall(subCall, options);
+                  const subOutput = toolResultModelText(subResult);
+                  toolCalls.push({
+                    name: subCall.name,
+                    arguments: subCall.arguments,
+                    output: subOutput,
+                    is_error: subResult.is_error,
+                    error_code: subResult.error_code,
+                    duration_ms: subResult.duration_ms ?? 0,
+                  });
+                  executorMessages.push({
+                    role: "user",
+                    content: `[Runtime substitution] ${sub.note}:\n${subOutput}`,
+                  });
+                  onStateChange({
+                    stage: "executor",
+                    status: "running",
+                    output: `\n[Tool Substituted: ${sub.name}]\n`,
+                    detail: `tool:${sub.name}`,
+                  });
+                }
+              }
             }
           } else if (
             requiresWorkspaceEvidence &&

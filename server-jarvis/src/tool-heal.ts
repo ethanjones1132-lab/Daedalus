@@ -19,7 +19,7 @@ export type ToolErrorCategory =
 export function classifyToolError(output: string): ToolErrorCategory {
   const o = (output || "").toLowerCase();
   if (o.includes("has not been read yet")) return "not_read";
-  if (o.includes("is a directory")) return "is_directory";
+  if (o.includes("is a directory") || o.includes("eisdir")) return "is_directory";
   if (o.includes("not found") || o.includes("no such file") || o.includes("enoent")) return "not_found";
   if (o.includes("permission denied") || o.includes("eacces") || o.includes("access denied")) return "permission";
   if (o.includes("timed out") || o.includes("timeout") || o.includes("etimedout")) return "timeout";
@@ -59,6 +59,34 @@ export function augmentErrorOutput(output: string, attempt: number): string {
   const hint = healingHint(classifyToolError(output), attempt);
   if (!hint) return output;
   return `${output}\nHint: ${hint}`;
+}
+
+export interface ToolSubstitution {
+  name: string;
+  arguments: Record<string, unknown>;
+  note: string;
+}
+
+/**
+ * When a failed tool call has an unambiguous correct alternative, return it so
+ * the runtime can execute the substitute immediately instead of spending a
+ * full model round-trip (~50s on the free-tier pool) acting on a text hint.
+ * Currently covers the known executor failure mode of calling read_file on a
+ * directory; returns null for everything else (the hint path still applies).
+ */
+export function substituteToolCall(
+  name: string,
+  args: Record<string, unknown>,
+  errorOutput: string,
+): ToolSubstitution | null {
+  if (name === "read_file" && classifyToolError(errorOutput) === "is_directory" && typeof args.path === "string") {
+    return {
+      name: "list_directory",
+      arguments: { path: args.path },
+      note: "read_file targeted a directory; auto-substituted list_directory",
+    };
+  }
+  return null;
 }
 
 /** Stable signature for counting repeated failures of the "same" tool call. */

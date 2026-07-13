@@ -168,6 +168,54 @@ describe("pipeline stage telemetry", () => {
     expect(result.toolCalls?.[0]?.name).toBe("list_directory");
   });
 
+  // Task 2.3: a model-driven read_file on a directory gets an immediate
+  // runtime list_directory substitution (one tool hop) instead of waiting a
+  // full model round-trip for the healing hint to be acted on. The original
+  // failed call stays recorded for evidence accounting.
+  test("read_file on a directory triggers an immediate list_directory substitution", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("read_file"), async () => {
+      throw new Error('Error: "src" is a directory, not a file. Use list_directory to see its contents.');
+    });
+    runtime.register(toolDefinition("list_directory"), async () => "main.ts\nutil.ts");
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor" && executorTurns++ === 0) {
+        return { content: "reading", tool_calls: [toolCallWithArgs("read_file", { path: "src" })] };
+      }
+      if (options.stageLabel === "executor") {
+        return { content: "done" };
+      }
+      if (options.stageLabel === "synthesizer") {
+        return { content: "The directory has two files." };
+      }
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "what files are in src?",
+      ["executor", "synthesizer"],
+      "run-read-dir-substitution",
+      () => {},
+      { executionProfile: "read_only" },
+    );
+
+    const calls = result.toolCalls ?? [];
+    // Original failed read_file is preserved, and the substituted
+    // list_directory ran immediately after it with the same path.
+    const failedRead = calls.find((c) => c.name === "read_file");
+    const substituted = calls.find((c) => c.name === "list_directory");
+    expect(failedRead?.is_error).toBe(true);
+    expect(substituted).toBeDefined();
+    expect(substituted?.is_error).toBe(false);
+    expect(substituted?.arguments).toEqual({ path: "src" });
+    expect(substituted?.output).toContain("main.ts");
+  });
+
   test("PipelineResult.toolCalls is undefined when the executor stage never ran", async () => {
     const rows: StageRun[] = [];
     const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
