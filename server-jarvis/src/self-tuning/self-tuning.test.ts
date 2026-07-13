@@ -1,12 +1,58 @@
 import { expect, test, describe } from "bun:test";
-import { SelfTuningStore } from "./store";
+import { SelfTuningStore, selfTuningDbPath } from "./store";
 import { SessionOutcomeCollector } from "./collector";
 import { OutcomeAnalyzer } from "./analyzer";
 import { SelfTuningProposer } from "./proposer";
+import { existsSync, statSync } from "fs";
 
 const TEST_DB_PATH = ":memory:";
 
 describe("Self tuning", () => {
+  // 2026-07-13 finding: several orchestration.test.ts cases construct
+  // PipelineExecutor with a ConductorWiring object ({ bus, live }, no
+  // `.collector` field) or with `undefined` for the collector arg. Both
+  // fall through to `outcomeCollector`'s default `new SelfTuningStore()`
+  // (no override) — which, before this fix, wrote straight into the real
+  // production self-tuning.db. Confirmed live: sentinel agent_run_ids
+  // "run-abort" / "run-record-1" (with no parent agent_runs row) were
+  // found polluting the actual production DB, inflating apparent executor/
+  // planner error rates in any aggregate diagnosis. `bun test` sets
+  // NODE_ENV=test automatically (verified), so that's the guard signal.
+  test("SelfTuningStore with no override never touches the real DB file under NODE_ENV=test", () => {
+    expect(process.env.NODE_ENV).toBe("test"); // sanity: bun test really does set this
+    const realPath = selfTuningDbPath();
+    const before = existsSync(realPath) ? statSync(realPath).mtimeMs : null;
+
+    const store = new SelfTuningStore(); // NO override — the exact leak shape
+    const collector = new SessionOutcomeCollector(store);
+    collector.startAgentRun("run-guard-test", "s", "req", "general", ["executor"]);
+    collector.recordStageRun({
+      id: "stage-guard-test",
+      agent_run_id: "run-guard-test",
+      mode_id: "executor",
+      turn_number: 1,
+      tool_calls_json: "[]",
+      duration_ms: 1,
+      was_successful: 0,
+      had_error: 1,
+      error_message: "synthetic test failure",
+    });
+
+    // The write must be readable back (the in-memory fallback is fully
+    // functional, not a silent no-op)...
+    expect(store.getStageRuns("run-guard-test")).toHaveLength(1);
+    // ...but the REAL on-disk file must be untouched.
+    const after = existsSync(realPath) ? statSync(realPath).mtimeMs : null;
+    expect(after).toBe(before);
+  });
+
+  test("an explicit dbPathOverride is still honored under NODE_ENV=test (doesn't force :memory:)", () => {
+    const store = new SelfTuningStore(":memory:");
+    const collector = new SessionOutcomeCollector(store);
+    collector.startAgentRun("run-explicit", "s", "req", "general", ["executor"]);
+    expect(store.getAgentRuns().some((r) => r.id === "run-explicit")).toBe(true);
+  });
+
   test("collector records run and stage telemetry", () => {
     const store = new SelfTuningStore(TEST_DB_PATH);
     const collector = new SessionOutcomeCollector(store);

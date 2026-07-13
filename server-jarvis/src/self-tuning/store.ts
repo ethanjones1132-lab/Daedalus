@@ -402,6 +402,30 @@ export class SelfTuningStore {
 
   private getDb(): Database | null {
     try {
+      // 2026-07-13 finding: several orchestration.test.ts cases construct
+      // PipelineExecutor with a ConductorWiring object ({ bus, live }, no
+      // `.collector` field) or with `undefined` for the collector arg. Both
+      // fall through to the default `new SelfTuningStore()` (no override),
+      // which then wrote straight into the REAL production self-tuning.db
+      // on every `bun test` run — confirmed via sentinel agent_run_ids
+      // "run-abort"/"run-record-1" (no parent agent_runs row) polluting
+      // production data and inflating apparent stage error rates in any
+      // aggregate diagnosis. `bun test` sets NODE_ENV=test automatically
+      // (verified empirically), so a caller with no EXPLICIT override
+      // during a test run gets a safe, fully-functional in-memory DB
+      // instead — this is a systemic guard, not a per-call-site patch, so
+      // it protects every future test that makes the same mistake too. An
+      // explicit dbPathOverride (including passing ":memory:" directly,
+      // handled by the next branch) always wins over this guard.
+      if (!this.dbPathOverride && process.env.NODE_ENV === "test") {
+        if (!this.cachedDb) {
+          const db = new Database(":memory:");
+          db.exec(SELF_TUNING_SCHEMA);
+          db.close = () => {};
+          this.cachedDb = db;
+        }
+        return this.cachedDb;
+      }
       if (this.dbPathOverride === ":memory:") {
         if (!this.cachedDb) {
           const db = new Database(":memory:");
