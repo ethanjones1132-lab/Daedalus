@@ -64,6 +64,27 @@ logs its resolved sink path at startup.
 same un-answerable deep-read request twice in one session; attempt 2 must resolve <5s with
 `retry_short_circuited`.
 
+**Post-merge live-fire fix** (`a2564d5`, 2026-07-13): merged to `master`, pushed, rebuilt
+(`build-and-deploy.ps1 -RestartServer`), and deployed to the OneDrive Desktop; `/health` confirmed
+`git_sha` matched local `HEAD` at each step (Two-Desktops trap avoided). The **first** live
+benchmark run against the deployed instance caught a real gap the plan's own design review missed:
+`repeated_no_progress` attempt 2 did not short-circuit (19.9s instead of <5s). Traced via
+self-tuning.db `stage_runs` to the exact tool calls — the executor satisfied the deep-read
+3-content-reads floor by calling `read_file` once plus `git_metadata` **twice** against a
+single-real-file fixture, never genuinely inspecting more than one file. `git_metadata` (repo
+HEAD/branch/dirty state) counted toward "content reads" alongside `read_file`/`grep`, which let a
+model "diagnose an architecture" by checking git status twice — exactly the kind of gap this whole
+plan exists to close. Fixed: only `read_file`/`grep` count toward the deep-read floor now
+(`git_metadata` still satisfies a *shallow* request alone, preserving the git/SHA preflight's use
+case); the floor also now counts **distinct** `(tool, arguments)` targets, closing the adjacent gap
+where re-reading the same file repeatedly could fake it the same way. Also closed a related
+observability gap: the fatal-error `session.finish()` call never included `code`, so no client
+(including this repo's own benchmark script) could see *why* a turn failed. 4 new tests; one
+existing test corrected (it had pinned `git_metadata` as valid deep-read evidence — that was the
+bug). Re-deployed and re-ran the full benchmark: **all four scenarios pass structurally**, with the
+repeated-request gate resolving attempt 2 in **11ms** (real, this time — `memo_armed: true`,
+`outcome_code: retry_short_circuited`, confirmed via the redeployed instance, not a mock).
+
 ## Before / after
 
 | Metric | Before | After |
@@ -78,18 +99,25 @@ same un-answerable deep-read request twice in one session; attempt 2 must resolv
 | Incident-window logs | zero lines possible | guaranteed self-log independent of spawn path |
 | Pool monoculture | discoverable only by log forensics | `provider_diversity` in `/health/inference` |
 | Config-warning spam | ~5,700 lines/day | once per process per stale path |
-| Benchmark baseline (deployed, 2026-07-12) | Direct 2.16s / Read 9.87s / Full 48.29s p50 | re-run pending deploy (see below) |
+| Deep-read evidence floor gaming | N/A (didn't exist) | closed same-day by live-fire benchmark (see below) |
+| Benchmark, deployed 2026-07-12 baseline | Direct 2.16s / Read 9.87s / Full 48.29s p50 | — |
+| Benchmark, deployed 2026-07-13 (`12b13b7`, pre-fix) | — | Direct 5.68s / Read 11.2s / Full 20.35s p50; repeated-request gate **failed** (19.9s, no short-circuit) |
+| Benchmark, deployed 2026-07-13 (`a2564d5`, post-fix) | — | Direct 2.78s / Read 9.37s / Full 19.97s p50, all structural; repeated-request **11ms**, `retry_short_circuited` confirmed |
+
+Full-execution p50 improved ~2.4x over the 2026-07-12 baseline (48.29s → ~20s), consistent with the
+parallel read-only tool dispatch (Task 3.1) and progress-scaled budgets (Task 2.4). Direct/Read
+p50s show normal live free-tier model variance run-to-run (2.16–5.68s / 9.37–11.2s) — within SLO
+throughout, not a regression signal.
 
 ## Remaining operator steps
 
-1. **Merge + deploy**: fast-forward `master` to `worktree-orchestration-perf`, rebuild
-   (`cargo tauri build`, NOT build-optimized.ps1), deploy the server bundle, verify the RUNNING
-   process via `/health` git_sha (Two-Desktops trap).
-2. **Live benchmark re-run**: `powershell -File scripts/benchmark-jarvis-runtime.ps1 -Iterations 5`
-   against the deployed runtime — fills the last row of the table above and exercises the
-   `repeated_no_progress` gate live.
-3. **Incident replay smoke** (plan Task 5.3): re-send the Versutus diagnosis request; expect
-   either a grounded diagnosis (≥3 real file reads) or a typed evidence failure — never a re-ask
-   coaching loop; force-stop a turn and verify the `cancelled` row in `session_runs`.
-4. **Config decision**: the 4 disabled `opencode_zen` agents in live config are the standing
-   monoculture risk — re-enable or remove them.
+1. ~~Merge + deploy~~ — done: `master` fast-forwarded through `a2564d5`, pushed to `origin/master`,
+   rebuilt via `build-and-deploy.ps1 -RestartServer`, `/health.git_sha` verified against local
+   `HEAD` at each step (Two-Desktops trap avoided).
+2. ~~Live benchmark re-run~~ — done, see the table above. The first run caught and the second run
+   confirmed the fix for the `git_metadata` evidence-gaming gap.
+3. **Incident replay smoke** (plan Task 5.3, still open): re-send the Versutus diagnosis request;
+   expect either a grounded diagnosis (≥3 real file reads) or a typed evidence failure — never a
+   re-ask coaching loop; force-stop a turn and verify the `cancelled` row in `session_runs`.
+4. **Config decision** (still open, operator's call): the 4 disabled `opencode_zen` agents in live
+   config are the standing monoculture risk — re-enable or remove them.
