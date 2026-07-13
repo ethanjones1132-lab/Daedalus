@@ -17,8 +17,10 @@ import type { ExecutionProfile } from "./route-normalization";
 import type { TurnRequirement } from "./turn-requirements";
 import type { PipelineStageState, PlannerStageOutput, ExecutorStageOutput, ReviewerStageOutput, RewriterStageOutput, ToolCallRecord } from "./stage-output";
 import { parseReviewerVerdict, renderExecutorSummary, renderPlanSummary, renderReviewerSummary, renderRewriterSummary } from "./stage-output";
-import { assessWorkspaceEvidence } from "./evidence-sufficiency";
+import { assessWorkspaceEvidence, isDeepReadRequest } from "./evidence-sufficiency";
 import { truncateToTokenBudget } from "./context-budget";
+import { findExistingWorkspacePath } from "./workspace-affinity";
+import { join } from "path";
 
 /**
  * The slice of the outcome collector the pipeline depends on. Injecting this
@@ -90,6 +92,43 @@ const READ_CACHE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep",
 const WORKSPACE_EVIDENCE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "git_metadata"]);
 const MISSING_WORKSPACE_EVIDENCE =
   "Workspace inspection failed: no successful workspace read tool result was produced, so Jarvis will not synthesize repository claims from ungrounded model text.";
+
+const ANCHOR_FILES = ["package.json", "README.md", "readme.md", "Cargo.toml", "pyproject.toml", "tsconfig.json", "app.json", "go.mod"];
+
+/**
+ * Pick which anchor files (from a fixed allowlist of common project-root
+ * manifests/docs) actually exist in a directory listing, capped at 5. Used
+ * by the deep-read preflight (Task 2.2) to seed the executor with real file
+ * contents instead of relying on a weak model to choose the right reads
+ * under a tight turn budget.
+ */
+export function selectAnchorFiles(listingEntries: string[]): string[] {
+  const files = new Set(listingEntries.map((e) => e.replace(/[\\/]+$/, "").trim()));
+  return ANCHOR_FILES.filter((a) => files.has(a)).slice(0, 5);
+}
+
+/**
+ * Turn a `list_directory` tool result's text into bare entry names.
+ *
+ * Handles both the production `handleListDir` format (a "`N items in
+ * <path>:`" header line followed by `"📁 name"` / `"📄 name (size)"` rows)
+ * and a plain newline-separated list of names (e.g. from a test double or a
+ * differently-shaped tool implementation) -- the header/emoji/size stripping
+ * is a no-op on lines that don't have them.
+ */
+function parseListingEntryNames(listingText: string): string[] {
+  const lines = listingText.split(/\r?\n/);
+  const startIdx = /^\d+\s+items?\s+in\b.*:$/i.test(lines[0] ?? "") ? 1 : 0;
+  return lines
+    .slice(startIdx)
+    .map((line) =>
+      line
+        .replace(/^[^\w.]+/, "")
+        .replace(/\s+\([^)]*\)\s*$/, "")
+        .trim(),
+    )
+    .filter((line) => line.length > 0);
+}
 
 export function successfulWriteKeys(calls: ToolCallRecord[]): Set<string> {
   return new Set(
@@ -540,6 +579,97 @@ export class PipelineExecutor {
         output: "\n[Tool Executed: git_metadata]\n",
         detail: "tool:git_metadata",
       });
+    }
+
+    // Task 2.2: deep-read requests (e.g. "comprehensively diagnose this
+    // repo") are the upstream cause of the 2026-07-12 incident -- a weak
+    // executor model, under a tight turn-budget clock, chose a single
+    // top-level list_directory and then narrated prose instead of reading
+    // real files. Task 2.1 already fenced the downstream symptom (a lone
+    // list_directory no longer satisfies evidence sufficiency for these
+    // requests); this seeds the executor's conversation with a real
+    // directory listing plus a few anchor files already read, so the model
+    // starts grounded instead of needing to choose the right tool sequence
+    // itself.
+    if (
+      requiresWorkspaceEvidence
+      && isDeepReadRequest(request)
+      && this.runtime.listTools().some((tool) => tool.function.name === "list_directory")
+    ) {
+      // Mirrors fs-scope.ts's effectiveWorkspaceRoot() fallback chain so the
+      // preflight always has a real root to join anchor paths against, even
+      // when the caller's ExecutionContext omits workspace_path (it's
+      // optional -- tool handlers themselves fall back the same way).
+      const preflightRoot =
+        findExistingWorkspacePath(request) || this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd();
+      const listCall: ToolCall = {
+        id: `call_${crypto.randomUUID()}`,
+        name: "list_directory",
+        arguments: { path: preflightRoot },
+      };
+      const listResult = await this.runToolCall(listCall, options);
+      const listOutput = toolResultModelText(listResult);
+      toolCalls.push({
+        name: listCall.name,
+        arguments: listCall.arguments,
+        output: listOutput,
+        is_error: listResult.is_error,
+        error_code: listResult.error_code,
+        duration_ms: listResult.duration_ms ?? 0,
+      });
+      executorMessages.push({
+        role: "user",
+        content: `[Runtime preflight: list_directory]\n${listOutput}`,
+      });
+      onStateChange({
+        stage: "executor",
+        status: "running",
+        output: "\n[Tool Executed: list_directory]\n",
+        detail: "tool:list_directory",
+      });
+
+      // A failed listing must never block the turn -- record it and fall
+      // through to the normal executor loop rather than attempting anchor
+      // reads against a root that couldn't even be listed.
+      if (!listResult.is_error) {
+        const anchors = selectAnchorFiles(parseListingEntryNames(listOutput));
+        for (const anchor of anchors) {
+          const anchorPath = join(preflightRoot, anchor);
+          const readCall: ToolCall = {
+            id: `call_${crypto.randomUUID()}`,
+            name: "read_file",
+            arguments: { path: anchorPath },
+          };
+          // Each anchor read tolerates its own failure (e.g. a permissions
+          // error on one file) -- record it and continue to the next anchor
+          // instead of aborting the whole preflight.
+          const readResult = await this.runToolCall(readCall, options);
+          const readOutput = toolResultModelText(readResult);
+          toolCalls.push({
+            name: readCall.name,
+            arguments: readCall.arguments,
+            output: readOutput,
+            is_error: readResult.is_error,
+            error_code: readResult.error_code,
+            duration_ms: readResult.duration_ms ?? 0,
+          });
+          executorMessages.push({
+            role: "user",
+            content: `[Runtime preflight: read_file ${anchor}]\n${readOutput}`,
+          });
+          onStateChange({
+            stage: "executor",
+            status: "running",
+            output: "\n[Tool Executed: read_file]\n",
+            detail: "tool:read_file",
+          });
+        }
+        executorMessages.push({
+          role: "user",
+          content:
+            "[Runtime preflight] The listing and anchor files above are already read. Continue by reading the specific source files needed to answer; do not re-list the root.",
+        });
+      }
     }
 
     try {

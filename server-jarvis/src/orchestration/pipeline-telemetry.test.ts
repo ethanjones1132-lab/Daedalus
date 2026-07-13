@@ -122,6 +122,52 @@ describe("pipeline stage telemetry", () => {
     });
   });
 
+  // Task 2.2: deep-read requests get a deterministic list_directory + anchor
+  // read_file preflight (pipeline.ts's runExecutorStage, before the model's
+  // first turn) so a weak executor model starts already grounded instead of
+  // needing to choose the right tool sequence itself under a tight turn
+  // budget -- the upstream fix for the 2026-07-12 incident where the
+  // executor called list_directory once and then narrated prose.
+  test("deep-read preflight seeds list_directory + anchor read_file calls before any model-driven tool call", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("list_directory"), async () => "package.json\nREADME.md\nsrc/");
+    runtime.register(toolDefinition("read_file"), async () => '{"name":"test"}');
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+
+    // The mocked executor-stage model never emits a tool_call of its own --
+    // any workspace evidence in the result MUST have come from the
+    // deterministic preflight, not from a model-driven read.
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") {
+        return { content: "narrating without reading anything" };
+      }
+      if (options.stageLabel === "synthesizer") {
+        return { content: "Here is what I found." };
+      }
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "comprehensively diagnose this repo",
+      ["executor", "synthesizer"],
+      "run-deep-read-preflight",
+      () => {},
+      { executionProfile: "read_only", turnRequirement: "workspace_read" },
+    );
+
+    const listingCalls = result.toolCalls?.filter((call) => call.name === "list_directory") ?? [];
+    const anchorReadCalls = result.toolCalls?.filter((call) => call.name === "read_file") ?? [];
+    expect(listingCalls.length).toBeGreaterThanOrEqual(1);
+    expect(anchorReadCalls.length).toBeGreaterThanOrEqual(1);
+    // The preflight's list_directory call must be the very first tool call
+    // recorded -- proving it ran before the model's (tool_call-less) first
+    // turn could have produced anything.
+    expect(result.toolCalls?.[0]?.name).toBe("list_directory");
+  });
+
   test("PipelineResult.toolCalls is undefined when the executor stage never ran", async () => {
     const rows: StageRun[] = [];
     const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
