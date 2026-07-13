@@ -115,6 +115,13 @@ try {
     [IO.File]::WriteAllBytes((Join-Path $repeatFixtureDir 'payload.bin'), [byte[]](1..64))
     $repeatPrompt = "Comprehensively diagnose the architecture of the repo at '$repeatFixtureDir'."
     $repeatSession = "benchmark-repeat-$([guid]::NewGuid())"
+    # Codes that arm the fail-fast memo (must match repetition-guard.ts's
+    # SHORT_CIRCUIT_CODES). Attempt 1 failing WITH one of these is the
+    # scenario's actual precondition — a live free-tier model can fail (or
+    # even succeed) via an unrelated path, in which case attempt 2 proves
+    # nothing about the short-circuit and must not be scored as a hard gate.
+    $armingCodes = @('no_progress_repetition', 'insufficient_workspace_evidence', 'missing_workspace_evidence')
+    $memoArmed = $false
 
     foreach ($attemptNo in 1, 2) {
         $started = Get-Date
@@ -129,13 +136,23 @@ try {
             $errFrame = $events | Where-Object { $_.type -eq 'error' } | Select-Object -First 1
             if ($errFrame -and $errFrame.PSObject.Properties['code']) { [string]$errFrame.code } else { $null }
         }
-        # Attempt 1 just needs to terminate (arming the memo). Attempt 2 is
-        # the gate: <5s and explicitly short-circuited.
         $limit = if ($attemptNo -eq 1) { 120000 } else { 5000 }
-        $structuralOk = if ($attemptNo -eq 1) {
-            ($terminal.Count -ge 1 -and $null -eq $sampleError)
+        if ($attemptNo -eq 1) {
+            # Precondition: attempt 1 must terminate AND fail with an
+            # arming code (a live model can legitimately fail some other
+            # way, or even satisfy sufficiency by luck — either outcome
+            # means this run can't exercise the short-circuit at all).
+            $memoArmed = ($terminal.Count -ge 1 -and $null -eq $sampleError -and $armingCodes -contains $code)
+            $structuralOk = ($terminal.Count -ge 1 -and $null -eq $sampleError)
         } else {
-            ($null -eq $sampleError -and $elapsed -le 5000 -and $code -eq 'retry_short_circuited')
+            # Only a real gate when attempt 1 actually armed the memo;
+            # otherwise this run is informational (not scored) rather than
+            # a false pass or a misleading hard fail.
+            $structuralOk = if ($memoArmed) {
+                ($null -eq $sampleError -and $elapsed -le 5000 -and $code -eq 'retry_short_circuited')
+            } else {
+                $true
+            }
         }
         $samples.Add([pscustomobject][ordered]@{
             scenario = 'repeated_no_progress'; iteration = $attemptNo; session_id = $repeatSession
@@ -145,7 +162,7 @@ try {
             queue_wait_ms = $null; run_id = $null
             event_types = @($events | ForEach-Object { [string]$_.type } | Where-Object { $_ } | Group-Object | Sort-Object Name | ForEach-Object { "$($_.Name):$($_.Count)" })
             attempt_count = 0; attempts = @(); attempt_candidate_counts = @(); artifact_ok = $true
-            outcome_code = $code
+            outcome_code = $code; memo_armed = $memoArmed
             structural_ok = $structuralOk
         })
     }

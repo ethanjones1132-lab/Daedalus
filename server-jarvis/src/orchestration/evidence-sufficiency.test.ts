@@ -107,13 +107,42 @@ describe("assessWorkspaceEvidence", () => {
     expect(a.reason).toContain("deep read satisfied");
   });
 
-  test("grep and git_metadata count as content reads for a deep read", () => {
+  test("grep counts as a content read for a deep read, but git_metadata never does", () => {
+    // 2026-07-13 live-benchmark finding: a deep-read turn against a
+    // fixture with exactly one real file satisfied the old floor via
+    // read_file(1) + git_metadata(2) — git_metadata reveals nothing about
+    // file contents and must never count toward "comprehensively
+    // diagnosed" evidence, only toward a shallow git-status turn.
     const a = assessWorkspaceEvidence(
-      [ls, read("a.ts"), grep, gitMetadata],
+      [ls, read("a.ts"), read("b.ts"), grep, gitMetadata],
       "comprehensively diagnose the whole repository",
     );
+    expect(a.contentReads).toBe(3); // read_file(a.ts) + read_file(b.ts) + grep; git_metadata excluded
     expect(a.sufficient).toBe(true);
-    expect(a.contentReads).toBe(3);
+  });
+
+  test("git_metadata calls alone never satisfy the deep-read floor, however many times repeated", () => {
+    const a = assessWorkspaceEvidence(
+      [ls, read("a.ts"), gitMetadata, gitMetadata, gitMetadata],
+      "comprehensively diagnose the architecture of this repo",
+    );
+    expect(a.sufficient).toBe(false);
+    expect(a.contentReads).toBe(1); // only the one real read_file counts
+  });
+
+  test("re-reading the same file repeatedly does not inflate the deep-read count", () => {
+    const a = assessWorkspaceEvidence(
+      [ls, read("payload.bin"), read("payload.bin"), read("payload.bin")],
+      "comprehensively diagnose the architecture of the repo",
+    );
+    expect(a.sufficient).toBe(false); // 3 calls, but only 1 DISTINCT target
+    expect(a.contentReads).toBe(1);
+  });
+
+  test("git_metadata alone still satisfies a shallow request (the git/SHA preflight case)", () => {
+    const a = assessWorkspaceEvidence([gitMetadata], "what's the current git sha?");
+    expect(a.sufficient).toBe(true);
+    expect(a.deepRead).toBe(false);
   });
 
   test("the deep-read threshold is exactly DEEP_READ_MIN_CONTENT_READS", () => {

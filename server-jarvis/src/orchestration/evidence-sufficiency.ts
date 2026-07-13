@@ -8,14 +8,38 @@
 // Plan reference:
 //   docs/superpowers/plans/2026-07-12-comprehensive-performance-improvement.md
 //   Phase 2 — Executor accuracy, Task 2.1
+//
+// 2026-07-13 live-benchmark finding: the deep-read floor originally counted
+// `git_metadata` as a "content read" alongside `read_file`/`grep`. A live
+// deep-read turn against a fixture with exactly one real file satisfied the
+// floor by calling `read_file` once plus `git_metadata` twice — git_metadata
+// reads repo HEAD/branch/dirty state, not file contents, and reveals nothing
+// about the thing being "comprehensively diagnosed". `git_metadata` still
+// counts for SHALLOW requests (a bare "what's the git sha" turn should pass
+// on one such call — that's the whole point of the deterministic git
+// preflight in pipeline.ts), but it must never satisfy the deep-read floor.
+// The floor also now counts DISTINCT (tool, arguments) targets rather than
+// raw call count, so re-reading the same file repeatedly can't game it either.
 // ═══════════════════════════════════════════════════════════════
 
 import type { ToolCallRecord } from "./stage-output";
 
 const DEEP_READ_MARKERS =
   /\b(comprehensiv\w*|thorough\w*|entire|whole|all files|full|in[- ]depth|architecture|architectural|audit|diagnos\w*|repo|repository|codebase)\b/i;
-const CONTENT_EVIDENCE_TOOLS = new Set(["read_file", "grep", "git_metadata"]);
+/** Genuine file-content tools — the only ones that count toward the deep-read floor. */
+const DEEP_READ_CONTENT_TOOLS = new Set(["read_file", "grep"]);
+/** Broader shallow-evidence set: file content OR repo metadata satisfies a shallow turn. */
+const SHALLOW_EVIDENCE_TOOLS = new Set(["read_file", "grep", "git_metadata"]);
 const LISTING_TOOLS = new Set(["list_directory", "glob"]);
+
+/** Distinct (tool, arguments) key so re-calling the same read repeatedly counts once. */
+function distinctTargetKeys(calls: ToolCallRecord[], tools: Set<string>): Set<string> {
+  const keys = new Set<string>();
+  for (const call of calls) {
+    if (tools.has(call.name)) keys.add(`${call.name}:${JSON.stringify(call.arguments)}`);
+  }
+  return keys;
+}
 
 /**
  * Deep-read requests (e.g. "comprehensively diagnose this repo") require at
@@ -59,26 +83,31 @@ export function assessWorkspaceEvidence(
   const calls = (toolCalls ?? []).filter(
     (c) => !c.is_error && c.output.trim().length > 0,
   );
-  const contentReads = calls.filter((c) => CONTENT_EVIDENCE_TOOLS.has(c.name)).length;
   const listings = calls.filter((c) => LISTING_TOOLS.has(c.name)).length;
   const deepRead = isDeepReadRequest(request);
 
   if (deepRead) {
-    const sufficient = contentReads >= DEEP_READ_MIN_CONTENT_READS;
+    // Deep-read floor: only genuine file-content reads count, deduped by
+    // (tool, arguments) so reading the same file 3 times can't fake it.
+    const distinctContentReads = distinctTargetKeys(calls, DEEP_READ_CONTENT_TOOLS).size;
+    const sufficient = distinctContentReads >= DEEP_READ_MIN_CONTENT_READS;
     return {
       sufficient,
-      contentReads,
+      contentReads: distinctContentReads,
       listings,
       deepRead,
       reason: sufficient
-        ? `deep read satisfied: ${contentReads} content reads`
-        : `deep-read request needs >=${DEEP_READ_MIN_CONTENT_READS} content reads (read_file/grep/git_metadata); got ${contentReads} content reads and ${listings} list_directory/glob calls`,
+        ? `deep read satisfied: ${distinctContentReads} distinct content reads`
+        : `deep-read request needs >=${DEEP_READ_MIN_CONTENT_READS} distinct content reads (read_file/grep on different targets); got ${distinctContentReads} and ${listings} list_directory/glob calls`,
     };
   }
-  const sufficient = contentReads + listings >= 1;
+  // Shallow floor: any single real read (file content, repo metadata, or a
+  // listing) is enough — this is the path the git/SHA preflight satisfies.
+  const shallowEvidenceCount = calls.filter((c) => SHALLOW_EVIDENCE_TOOLS.has(c.name)).length;
+  const sufficient = shallowEvidenceCount + listings >= 1;
   return {
     sufficient,
-    contentReads,
+    contentReads: shallowEvidenceCount,
     listings,
     deepRead,
     reason: sufficient

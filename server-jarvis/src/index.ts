@@ -2772,7 +2772,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // Task 3.3: remember what failed and why, so a near-identical
           // retry can be short-circuited instead of re-run.
           repetitionStore.recordOutcome(sessionId, message, result.error_code ?? "stage_error");
-          await session.finish(result.error, { isError: true });
+          // 2026-07-13 live-benchmark finding: this frame previously carried
+          // no `code`, so a client (or this repo's own benchmark script)
+          // could see a turn failed but never WHY — the same information
+          // the short-circuit memo already tracks server-side.
+          await session.finish(result.error, { isError: true, code: result.error_code });
         } else if (!trimmedAnswer) {
           // Empty (non-fatal) completion: show the friendly retry notice, but
           // record the inference as a FAILURE so telemetry is truthful (the run
