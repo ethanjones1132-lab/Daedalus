@@ -98,6 +98,30 @@ export interface PipelineExecuteOptions {
 }
 
 const READ_CACHE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "web_fetch"]);
+const READ_ONLY_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "git_metadata", "web_fetch"]);
+
+/**
+ * Split a turn's tool calls into dispatch batches (Task 3.1): consecutive
+ * read-only calls form one concurrent batch; any write/side-effect call is
+ * its own serial barrier, preserving the model's intended ordering for
+ * mutations. A model that emits five read_file calls in one turn previously
+ * paid five sequential waits.
+ */
+export function partitionToolCalls<T extends { name: string }>(calls: T[]): T[][] {
+  const batches: T[][] = [];
+  let current: T[] = [];
+  for (const call of calls) {
+    if (READ_ONLY_TOOLS.has(call.name)) {
+      current.push(call);
+    } else {
+      if (current.length) batches.push(current);
+      batches.push([call]);
+      current = [];
+    }
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
 
 const ANCHOR_FILES = ["package.json", "README.md", "readme.md", "Cargo.toml", "pyproject.toml", "tsconfig.json", "app.json", "go.mod"];
 
@@ -427,6 +451,32 @@ export class PipelineExecutor {
     });
   }
 
+  /**
+   * Dispatch a turn's tool calls with read-parallelism (Task 3.1): read-only
+   * batches run concurrently via Promise.all; writes stay serial barriers in
+   * model order. `record` is invoked once per call in the original batch
+   * order (deterministic tool_call_id pairing regardless of completion
+   * order), after that call's batch has fully settled.
+   */
+  private async dispatchToolCalls(
+    rawToolCalls: any[],
+    options: PipelineExecuteOptions,
+    record: (raw: any, call: ToolCall, result: ToolResult) => Promise<void> | void,
+  ): Promise<void> {
+    const parsed = rawToolCalls.map((raw) => {
+      const call = parseStreamedToolCall(raw);
+      return { raw, call, name: call.name };
+    });
+    for (const batch of partitionToolCalls(parsed)) {
+      const settled = await Promise.all(
+        batch.map(async (entry) => ({ entry, result: await this.runToolCall(entry.raw, options) })),
+      );
+      for (const { entry, result } of settled) {
+        await record(entry.raw, entry.call, result);
+      }
+    }
+  }
+
   private async runToolCall(raw: any, options: PipelineExecuteOptions): Promise<ToolResult> {
     const call = parseStreamedToolCall(raw);
     const sessionId = this.ctx.session_id;
@@ -705,9 +755,7 @@ export class PipelineExecutor {
           if (response.content) narratives.push(response.content);
 
           if (response.tool_calls && response.tool_calls.length > 0) {
-            for (const tc of response.tool_calls) {
-              const toolResult = await this.runToolCall(tc, options);
-              const call = parseStreamedToolCall(tc);
+            await this.dispatchToolCalls(response.tool_calls, options, async (tc, call, toolResult) => {
               toolCalls.push({
                 name: call.name,
                 arguments: call.arguments,
@@ -758,7 +806,7 @@ export class PipelineExecutor {
                   });
                 }
               }
-            }
+            });
           } else if (
             requiresWorkspaceEvidence &&
             !assessWorkspaceEvidence(toolCalls, request).sufficient &&
@@ -899,9 +947,7 @@ export class PipelineExecutor {
           if (rewriteResp.content) narratives.push(rewriteResp.content);
 
           if (rewriteResp.tool_calls && rewriteResp.tool_calls.length > 0) {
-            for (const tc of rewriteResp.tool_calls) {
-              const toolResult = await this.runToolCall(tc, options);
-              const call = parseStreamedToolCall(tc);
+            await this.dispatchToolCalls(rewriteResp.tool_calls, options, (tc, call, toolResult) => {
               toolCalls.push({
                 name: call.name,
                 arguments: call.arguments,
@@ -916,7 +962,7 @@ export class PipelineExecutor {
                 status: "running",
                 output: `\n[Tool Executed: ${tc.name}]\n`
               });
-            }
+            });
           } else {
             rewriterDone = true;
           }

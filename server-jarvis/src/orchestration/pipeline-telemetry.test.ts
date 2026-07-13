@@ -216,6 +216,55 @@ describe("pipeline stage telemetry", () => {
     expect(substituted?.output).toContain("main.ts");
   });
 
+  // Task 3.1: read-only tool calls in one executor turn dispatch
+  // concurrently. Two 30ms reads completing in well under 60ms total proves
+  // real overlap; the recorded order must still match the model's emission
+  // order for deterministic tool_call_id pairing.
+  test("read-only tool calls in one turn run concurrently and record in emission order", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    let inFlight = 0;
+    let maxInFlight = 0;
+    runtime.register(toolDefinition("read_file"), async () => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      inFlight--;
+      return "file body";
+    });
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor" && executorTurns++ === 0) {
+        return {
+          content: "reading three files",
+          tool_calls: [
+            toolCallWithArgs("read_file", { path: "a.ts" }),
+            toolCallWithArgs("read_file", { path: "b.ts" }),
+            toolCallWithArgs("read_file", { path: "c.ts" }),
+          ],
+        };
+      }
+      if (options.stageLabel === "executor") return { content: "done" };
+      if (options.stageLabel === "synthesizer") return { content: "Summary of three files." };
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "read a.ts, b.ts and c.ts",
+      ["executor", "synthesizer"],
+      "run-parallel-reads",
+      () => {},
+      { executionProfile: "read_only" },
+    );
+
+    expect(maxInFlight).toBeGreaterThanOrEqual(2); // reads genuinely overlapped
+    const readCalls = (result.toolCalls ?? []).filter((c) => c.name === "read_file");
+    expect(readCalls.map((c) => (c.arguments as { path: string }).path)).toEqual(["a.ts", "b.ts", "c.ts"]);
+  });
+
   test("PipelineResult.toolCalls is undefined when the executor stage never ran", async () => {
     const rows: StageRun[] = [];
     const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
