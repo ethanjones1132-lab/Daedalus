@@ -3247,7 +3247,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               throw new StreamIdleTimeoutError(actualModelUsed, "agent_loop", MODEL_INTER_TOKEN_TIMEOUT_MS, lastProviderUsed);
             }
             if (stopReason === "degenerate_stream") {
-              throw new DegenerateStreamError(modelName, "agent_loop", lastProviderUsed);
+              throw new DegenerateStreamError(actualModelUsed, "agent_loop", lastProviderUsed);
             }
             if (stopReason === "turn_cancelled") await emitCancelled();
             if (stopReason === "turn_deadline_exceeded") {
@@ -3292,7 +3292,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                     degenerateCheckCounter++;
                     if (!degenerateStreamDetected && degenerateCheckCounter % 16 === 0 && detectDegenerateTail(turnText)) {
                       degenerateStreamDetected = true;
-                      console.warn(`[Jarvis Agent Loop] degenerate stream detected model=${modelName} stage=agent_loop — cancelling reader`);
+                      console.warn(`[Jarvis Agent Loop] degenerate stream detected model=${actualModelUsed} stage=agent_loop — cancelling reader`);
                       cancelReader("Degenerate stream detected").catch(() => {});
                     }
                     if (!holdVisibleText) await emitVisibleText(content);
