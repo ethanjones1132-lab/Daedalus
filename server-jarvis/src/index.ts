@@ -88,6 +88,8 @@ import {
 } from "./stream-liveness";
 import {
   ActiveStreamRegistry,
+  classifyAbortReason,
+  CLIENT_DISCONNECTED_ABORT_REASON,
   createIdempotentReaderCancel,
   registerAbortHandler,
   resolveReadStopReason,
@@ -1314,7 +1316,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       (chunk) => rawWriter.write(chunk),
       () => {
         clientDisconnected = true;
-        if (!streamAbort.signal.aborted) streamAbort.abort("Client disconnected");
+        if (!streamAbort.signal.aborted) streamAbort.abort(CLIENT_DISCONNECTED_ABORT_REASON);
       },
     );
     const writer = {
@@ -1336,9 +1338,21 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     });
     const emitCancelled = async (): Promise<never> => {
       if (clientDisconnected) throw new StreamCancelledError();
+      // 2026-07-13 finding (session 7254c3ae): a "superseded" cancellation
+      // (a new send for the same session raced ahead of an in-flight turn)
+      // previously looked identical to a deliberate Stop click in both the
+      // SSE frame and downstream telemetry — real work was silently
+      // discarded with no distinguishable trace. classifyAbortReason makes
+      // the two cases observable; a supersede also gets a WARN log here
+      // since it means a prior turn's real provider calls/file reads were
+      // just thrown away.
+      const cancelReason = classifyAbortReason(streamAbort.signal.reason);
+      if (cancelReason === "superseded") {
+        console.warn(`[Jarvis] Stream superseded by a newer turn session=${sessionId} — prior in-flight work discarded`);
+      }
       if (session.noteOutcome()) {
         session.noteTerminal();
-        await streamWrite(`data: ${JSON.stringify({ type: "cancelled", session_id: sessionId })}\n\n`);
+        await streamWrite(`data: ${JSON.stringify({ type: "cancelled", session_id: sessionId, reason: cancelReason })}\n\n`);
       }
       throw new StreamCancelledError();
     };

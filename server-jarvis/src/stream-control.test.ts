@@ -1,11 +1,39 @@
 import { describe, expect, mock, test } from "bun:test";
 import {
   ActiveStreamRegistry,
+  classifyAbortReason,
   collectTerminalEvents,
   createIdempotentReaderCancel,
   registerAbortHandler,
   resolveReadStopReason,
 } from "./stream-control";
+
+describe("classifyAbortReason", () => {
+  test("classifies a superseded-turn abort distinctly from a user stop", () => {
+    const registry = new ActiveStreamRegistry();
+    const first = registry.begin("s1");
+    registry.begin("s1"); // a second turn for the same session supersedes the first
+    expect(classifyAbortReason(first.controller.signal.reason)).toBe("superseded");
+  });
+
+  test("classifies an explicit /chat/cancel as user_stop", () => {
+    const registry = new ActiveStreamRegistry();
+    const lease = registry.begin("s2");
+    registry.cancel("s2");
+    expect(classifyAbortReason(lease.controller.signal.reason)).toBe("user_stop");
+  });
+
+  test("classifies a client-disconnect reason", () => {
+    const controller = new AbortController();
+    controller.abort("Client disconnected");
+    expect(classifyAbortReason(controller.signal.reason)).toBe("client_disconnected");
+  });
+
+  test("unrecognized reasons classify as unknown rather than throwing", () => {
+    expect(classifyAbortReason("some other reason")).toBe("unknown");
+    expect(classifyAbortReason(undefined)).toBe("unknown");
+  });
+});
 
 test("terminal smoke records exactly one terminal outcome", () => {
   const events = collectTerminalEvents([

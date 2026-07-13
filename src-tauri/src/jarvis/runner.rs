@@ -59,7 +59,19 @@ impl TerminalRunAccumulator {
             }
             Some("cancelled") => {
                 self.outcome = Some("cancelled".to_string());
-                self.cancelled_reason = Some("user_stop".to_string());
+                // 2026-07-13 finding: this used to hardcode "user_stop"
+                // regardless of cause, so a resend racing an in-flight turn
+                // (server-side ActiveStreamRegistry superseding it) recorded
+                // identically to a deliberate Stop click. The Bun server now
+                // classifies the real reason (index.ts's classifyAbortReason)
+                // and includes it on the frame; fall back to "user_stop" only
+                // if an older server build omits the field.
+                self.cancelled_reason = Some(
+                    evt.get("reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("user_stop")
+                        .to_string(),
+                );
             }
             Some("error") => {
                 // Timeout failures are emitted as structured `error` frames by
@@ -1309,6 +1321,22 @@ mod terminal_run_tests {
         .expect("persist");
         assert_eq!(record.outcome, "cancelled");
         assert_eq!(record.cancelled_reason.as_deref(), Some("user_stop"));
+    }
+
+    #[test]
+    fn accumulator_distinguishes_superseded_from_user_stop() {
+        // 2026-07-13 finding (live session 7254c3ae): a resend racing an
+        // in-flight turn for the same session previously recorded
+        // identically to a deliberate Stop click. The server now includes
+        // the real reason on the cancelled frame; the accumulator must pass
+        // it through rather than hardcoding "user_stop".
+        let mut acc = TerminalRunAccumulator::default();
+        acc.observe_event(&serde_json::json!({
+            "type": "cancelled",
+            "reason": "superseded",
+        }));
+        assert_eq!(acc.outcome.as_deref(), Some("cancelled"));
+        assert_eq!(acc.cancelled_reason.as_deref(), Some("superseded"));
     }
 }
 

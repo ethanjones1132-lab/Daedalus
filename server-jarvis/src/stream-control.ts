@@ -1,3 +1,29 @@
+// 2026-07-13 live-session finding: a real user sent an identical
+// "create the plan" message 3 times, 2-4 minutes apart, while the previous
+// turn for that session was still running (session 7254c3ae). Each resend
+// silently aborted the prior in-flight turn via ActiveStreamRegistry.begin()
+// — real provider calls and file reads were discarded with no user-visible
+// signal and no distinguishable telemetry: the `cancelled` frame carried no
+// reason, so the UI/Rust relay both hardcoded `cancelledReason: "user_stop"`
+// regardless of cause. A superseded turn (impatient duplicate send racing
+// live work) and a deliberate Stop-button click are operationally very
+// different signals; only one of the 3 sends here ever produced an answer,
+// meaning ~2 full turns' worth of compute and wall-clock time were wasted
+// invisibly. classifyAbortReason() makes the two cases distinguishable.
+export const SUPERSEDED_ABORT_REASON = "Superseded by a newer Session turn";
+export const USER_STOP_ABORT_REASON = "User cancelled";
+export const CLIENT_DISCONNECTED_ABORT_REASON = "Client disconnected";
+
+export type CancelReason = "superseded" | "user_stop" | "client_disconnected" | "unknown";
+
+/** Classify an AbortSignal.reason into a stable, telemetry-friendly category. */
+export function classifyAbortReason(reason: unknown): CancelReason {
+  if (reason === SUPERSEDED_ABORT_REASON) return "superseded";
+  if (reason === CLIENT_DISCONNECTED_ABORT_REASON) return "client_disconnected";
+  if (reason === USER_STOP_ABORT_REASON) return "user_stop";
+  return "unknown";
+}
+
 export interface StreamLease {
   readonly controller: AbortController;
   release(): boolean;
@@ -25,7 +51,7 @@ export class ActiveStreamRegistry {
   begin(sessionId: string): StreamLease {
     const previous = this.entries.get(sessionId);
     if (previous && !previous.controller.signal.aborted) {
-      previous.controller.abort("Superseded by a newer Session turn");
+      previous.controller.abort(SUPERSEDED_ABORT_REASON);
     }
 
     const entry: StreamEntry = {
@@ -45,7 +71,7 @@ export class ActiveStreamRegistry {
     };
   }
 
-  cancel(sessionId: string, reason: unknown = "User cancelled"): boolean {
+  cancel(sessionId: string, reason: unknown = USER_STOP_ABORT_REASON): boolean {
     const entry = this.entries.get(sessionId);
     if (!entry || entry.controller.signal.aborted) return false;
     entry.controller.abort(reason);

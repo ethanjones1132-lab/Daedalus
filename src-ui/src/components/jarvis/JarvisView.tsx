@@ -1045,8 +1045,14 @@ export function ChatPanel({
         // streamed, or drop the empty stub entirely if nothing did —
         // `isStreaming` always ends false either way, so there's no
         // forever-spinner.
+        // 2026-07-13 finding: this used to hardcode 'user_stop' regardless
+        // of cause, so a resend racing an in-flight turn (ActiveStreamRegistry
+        // superseding it) recorded identically to a deliberate Stop click.
+        // The server now classifies the real reason (index.ts's
+        // classifyAbortReason); fall back to 'user_stop' only if an older
+        // server build omits the field.
         runAcc.outcome = 'cancelled';
-        runAcc.cancelledReason = 'user_stop';
+        runAcc.cancelledReason = typeof frame.reason === 'string' ? frame.reason : 'user_stop';
         setIsStreaming(false);
         stopRequestedRef.current = false;
         setError(null);
