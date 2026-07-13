@@ -4,6 +4,11 @@
 // WSL-side HTTP server on port 19877.
 // Uses OpenAI-compatible API for both OpenRouter and Ollama.
 // Hosts Qwen 3.5 9B locally via Ollama with OpenRouter fallback.
+// Task 4.3: the self-log tee must install before ANY other module logs, so
+// every line of this process's life is in the guaranteed log regardless of
+// how the server was spawned (Tauri supervisor, deploy script, manual bun).
+import { installSelfLog } from "./self-log";
+installSelfLog();
 import { NFL_2025_PLAYERS, NFL_2025_DEFENSES } from "./football";
 import { PRIZEPICKS_SYSTEM_PROMPT, buildPrizePicksContext, buildFullDatabaseContext, normalizeStatType, findPlayerName, generateWeeklyPicks } from "./prizepicks";
 
