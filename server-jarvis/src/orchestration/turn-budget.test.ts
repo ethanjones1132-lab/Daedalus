@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createTurnBudget } from "./turn-budget";
+import { AgentPool, firstTokenTimeoutFor } from "./agent-pool";
 
 describe("turn budgets", () => {
   test("reserves the finalization window before optional repair work", () => {
@@ -46,5 +47,44 @@ describe("turn budgets", () => {
     const workspaceBudget = createTurnBudget("workspace_read", "medium", 0);
     workspaceBudget.extendStageOnProgress("executor", 0);
     expect(workspaceBudget.stage_ms.executor).toBe(25_000);
+  });
+
+  // 2026-07-13 finding: index.ts's first-token watchdog computes
+  // Math.min(requestBudgetMs, firstTokenTimeoutFor(...)), and
+  // requestBudgetMs is bounded by stageRemainingMs('planner'). Before this
+  // fix, full_execution's planner ceiling (20_000) was always BELOW the
+  // Nemotron pool override (55_000), so Math.min always picked 20_000 —
+  // the override's own unit test passed in isolation while being
+  // completely inert end-to-end. Confirmed live: a real full_execution
+  // turn failed with "First-token timeout (20000ms)" on nemotron, not the
+  // intended 55s. This test reproduces the actual end-to-end computation
+  // (not just one half of it) to pin the fix.
+  test("full_execution's planner ceiling no longer undercuts the Nemotron first-token override", () => {
+    // Mirrors DEFAULT_ORCHESTRATOR_AGENTS's zen-nemotron-ultra-free entry but
+    // enabled — the real-world state as of the 2026-07-13 config fix that
+    // re-enabled the opencode_zen agents (a disabled model intentionally
+    // does NOT inherit its override; that's separately correct behavior,
+    // not what this test is about — see agent-pool.test.ts for that
+    // contract). This test isolates the OTHER bug: even once the model is
+    // enabled and its override resolves, the stage's own static ceiling
+    // must not silently undercut it.
+    const pool = new AgentPool([{
+      id: "zen-nemotron-ultra-free",
+      provider: "opencode_zen",
+      model_id: "nemotron-3-ultra-free",
+      capabilities: { code: 0.8, reasoning: 0.95, speed: 0.55, cost: 1, json_reliability: 0.88 },
+      default_for: [],
+      first_token_timeout_ms: 55_000,
+      enabled: true,
+    }]);
+    const budget = createTurnBudget("full_execution", "medium", 0);
+
+    const stageRemainingMs = budget.stageRemainingMs("planner", 0);
+    const resolvedFirstTokenMs = firstTokenTimeoutFor(pool, "nemotron-3-ultra-free", 30_000);
+    expect(resolvedFirstTokenMs).toBe(55_000); // the pool's own advertised override
+
+    // This is the EXACT combinator index.ts applies to the watchdog delay.
+    const actualWatchdogDelayMs = Math.min(stageRemainingMs, resolvedFirstTokenMs);
+    expect(actualWatchdogDelayMs).toBe(55_000); // was 20_000 before the fix
   });
 });

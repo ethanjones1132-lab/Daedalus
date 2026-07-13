@@ -33,8 +33,36 @@ const BUDGETS: Record<TurnRequirement, Omit<TurnBudget, "requirement" | "complex
   conversational: { turn_ms: 30_000, finalization_reserve_ms: 15_000, max_stage_attempts: 2, stage_ms: { synthesizer: 25_000 } },
   answer_only: { turn_ms: 45_000, finalization_reserve_ms: 20_000, max_stage_attempts: 2, stage_ms: { planner: 15_000, synthesizer: 30_000 } },
   workspace_read: { turn_ms: 75_000, finalization_reserve_ms: 25_000, max_stage_attempts: 2, stage_ms: { executor: 25_000, synthesizer: 30_000 } },
-  full_execution: { turn_ms: 150_000, finalization_reserve_ms: 30_000, max_stage_attempts: 2, stage_ms: { planner: 20_000, executor: 30_000, reviewer: 20_000, rewriter: 30_000, synthesizer: 35_000 } },
+  // planner: 60_000 (not the original 20_000) — see the 2026-07-13 finding
+  // below. full_execution's 150-180s total turn_ms leaves ample room; the
+  // per-stage ceilings are independent caps bounded by overall remaining
+  // time, not a strict partition of the total, so this doesn't starve
+  // later stages under normal (non-Nemotron) latency.
+  full_execution: { turn_ms: 150_000, finalization_reserve_ms: 30_000, max_stage_attempts: 2, stage_ms: { planner: 60_000, executor: 30_000, reviewer: 20_000, rewriter: 30_000, synthesizer: 35_000 } },
 };
+
+// 2026-07-13 finding: agent-pool.ts's DEFAULT_ORCHESTRATOR_AGENTS gives
+// nemotron-3-ultra-free (the planner/synthesizer default) a
+// first_token_timeout_ms: 55_000 override specifically because it's a
+// known slow-starting model — that fix shipped 2026-06-26/27 with its own
+// passing regression test asserting firstTokenTimeoutFor resolves to
+// 55_000. But index.ts's watchdog setup computes
+// `Math.min(requestBudgetMs, firstTokenTimeoutFor(...))`, and
+// requestBudgetMs is bounded by THIS file's stage_ms.planner — which was
+// 20_000 for full_execution (15_000 for answer_only), both far below
+// 55_000. The override's own unit test passed (it correctly resolves the
+// function in isolation) while being completely inert in the actual
+// end-to-end path: Math.min(20_000, 55_000) is always 20_000. Confirmed
+// live via self-tuning.db: a real "create a full comprehensive
+// implementation plan" (full_execution) turn failed with "First-token
+// timeout (20000ms) on model=nemotron-3-ultra-free stage=planner" — the
+// exact 20s value, not the intended 55s. Raised full_execution's planner
+// ceiling above (to 60_000, matching firstTokenTimeoutFor's own capMs) so
+// the override the pool advertises is the override that's actually
+// enforced. answer_only's planner cap (15_000) is deliberately left alone:
+// that tier's 45_000ms total turn budget has no room for a 55s allowance
+// without starving synthesizer entirely, and it's a "fast tier" by design
+// — a slow model there should fall back faster, not wait longer.
 
 export function createTurnBudget(
   requirement: TurnRequirement,
