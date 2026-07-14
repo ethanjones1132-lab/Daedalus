@@ -29,4 +29,14 @@ describe("prepareToolResultForContext", () => {
     expect(prepared.context.endsWith("z".repeat(100))).toBe(true);
     expect(prepared.context).toContain(`${prepared.metadata.removed_chars} chars removed`);
   });
+
+  test("allows the orchestrator to override the truncation note", () => {
+    const prepared = prepareToolResultForContext(
+      "a".repeat(3_000),
+      2_000,
+      "Result recorded in full for verification.",
+    );
+    expect(prepared.context).toContain("Result recorded in full for verification.");
+    expect(prepared.context).not.toContain("Full result remains visible in the tool card");
+  });
 });

@@ -15,7 +15,11 @@ export interface PreparedToolResult {
  * Bound a tool result for inference context while retaining exact provenance
  * metadata for the `tool_result` SSE frame shown by the UI.
  */
-export function prepareToolResultForContext(text: string, limitChars: number): PreparedToolResult {
+export function prepareToolResultForContext(
+  text: string,
+  limitChars: number,
+  noteSuffix?: string,
+): PreparedToolResult {
   const limit = Math.max(0, Math.floor(limitChars));
   if (text.length <= limit) {
     return {
@@ -31,11 +35,21 @@ export function prepareToolResultForContext(text: string, limitChars: number): P
   }
 
   // Reserve enough room for the marker before splitting the retained payload.
-  const retainedChars = Math.max(0, limit - 120);
+  // The orchestrator note is longer than the legacy marker, so calculate the
+  // actual marker width instead of relying on the old fixed 120-char reserve.
+  const markerText = (removedChars: number) => noteSuffix
+    ? `\n\n[...truncated - ${removedChars} chars removed. ${noteSuffix}]\n\n`
+    : `\n\n[...truncated - ${removedChars} chars removed. Full result remains visible in the tool card...]\n\n`;
+  let retainedChars = Math.max(0, limit - 120);
+  let removedChars = text.length - retainedChars;
+  let marker = markerText(removedChars);
+  while (retainedChars + marker.length > limit && retainedChars > 0) {
+    retainedChars -= Math.min(retainedChars, retainedChars + marker.length - limit);
+    removedChars = text.length - retainedChars;
+    marker = markerText(removedChars);
+  }
   const headChars = Math.ceil(retainedChars / 2);
   const tailChars = retainedChars - headChars;
-  const removedChars = text.length - retainedChars;
-  const marker = `\n\n[...truncated - ${removedChars} chars removed. Full result remains visible in the tool card...]\n\n`;
   const context = `${text.slice(0, headChars)}${marker}${tailChars > 0 ? text.slice(-tailChars) : ""}`;
 
   return {

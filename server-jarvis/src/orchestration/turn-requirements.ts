@@ -144,7 +144,7 @@ function maskToolCallExemplars(text: string): { text: string; found: boolean } {
 // Mutation verbs: any of these (as a whole word) signals the user wants the
 // system to CHANGE something — files, builds, commits, deployments.
 const MUTATION_VERB =
-  /\b(write|edit|create|add|delete|remove|fix|refactor|implement|execute|build|deploy|install|commit|patch|modif(?:y|ies)|rename|move|generate|replace|rewrite|scaffold|migrate|format|append|insert|overwrite|update|push|run)\b/gi;
+  /\b(write|edit|create|add|delete|remove|fix|refactor|implement|execute|build|deploy|install|commit|patch|change|modif(?:y|ies)|rename|move|generate|replace|rewrite|scaffold|migrate|format|append|insert|overwrite|update|push|run)\b/gi;
 
 const NEGATED_MUTATION_NOUN =
   /\b(?:no\s+(?:(?:file|code)\s+)?|without\s+(?:any\s+)?)(?:modifications?|edits?|changes?)\b|\bwithout\s+(?:writing|editing|creating|adding|deleting|removing|fixing|refactoring|implementing|building|deploying|installing|committing|patching|modifying|renaming|moving|generating|replacing|rewriting|scaffolding|migrating|formatting|appending|inserting|overwriting|updating|pushing|running)\b|\bdo\s+not\s+(?:make|apply)\s+(?:any\s+)?(?:modifications?|edits?|changes?)\b/i;
@@ -185,6 +185,50 @@ function isNegatedMutation(text: string, index: number): boolean {
 
   const interveningWords = governedText.match(/[\p{L}\p{N}_]+/gu) ?? [];
   return interveningWords.length <= 8;
+}
+
+const ABSTRACT_DELIVERABLE =
+  /\b(plan|report|summary|analysis|roadmap|proposal|assessment|overview|recommendation|strategy|outline|write[- ]?up)\b/i;
+const CONCRETE_WRITE_TARGET =
+  /\b(file|repo(?:sitory)?|path|workspace|code|source|doc(?:ument)?|config(?:uration)?|test|script|directory|folder|module|package|app(?:lication)?|project|table|database|schema|target)\b/i;
+
+/**
+ * Decide whether a raw user message actually asks Jarvis to mutate something.
+ * This is deliberately narrower than `classifyTurnRequirements`: producing an
+ * abstract deliverable such as a plan or report is not a write, even though
+ * those verbs may still route through a full-capability pipeline.
+ */
+export function hasWriteIntent(message: string): boolean {
+  const masked = maskToolCallExemplars((message || "").trim());
+  const intentText = masked.text;
+  const mutationMatches = [...intentText.matchAll(MUTATION_VERB)];
+  const hasNegatedMutation = mutationMatches.some((match) =>
+    isNegatedMutation(intentText, match.index ?? 0)
+  ) || NEGATED_MUTATION_NOUN.test(intentText);
+
+  for (const match of mutationMatches) {
+    const index = match.index ?? 0;
+    if (isNegatedMutation(intentText, index)) continue;
+
+    const objectStart = index + match[0].length;
+    const objectWindow = intentText
+      .slice(objectStart, objectStart + 90)
+      .split(/[!?;\n]|\.(?=\s+[A-Z]|\s*$)/, 1)[0];
+    const hasConcreteTarget = Boolean(detectPath(objectWindow)) || CONCRETE_WRITE_TARGET.test(objectWindow);
+    if (!hasConcreteTarget) continue;
+
+    // A plan/report/etc. is normally an answer artifact, not a file mutation.
+    // A compound such as "plan file" remains concrete and is intentionally
+    // accepted by the target check above.
+    if (ABSTRACT_DELIVERABLE.test(objectWindow)) {
+      const compoundTarget = /\b(?:plan|report|summary|analysis|roadmap|proposal|assessment|overview|recommendation|strategy|outline|write[- ]?up)\s+(?:file|document|doc|path)\b/i.test(objectWindow);
+      if (!compoundTarget && hasNegatedMutation) continue;
+    }
+
+    return true;
+  }
+
+  return false;
 }
 
 // Read / inspection verbs: signal the user wants to LOOK AT something.

@@ -54,4 +54,22 @@ describe("resolveStagePrompt", () => {
     expect(merged).toContain("Jarvis is a standalone Tauri desktop platform");
     expect(merged).toContain("BASE PROMPT");
   });
+
+  test("bounds shared context entries and the assembled block", () => {
+    const merged = resolveStagePrompt(
+      "executor",
+      "BASE PROMPT",
+      undefined,
+      {
+        relevant_memories: Array.from({ length: 20 }, (_, i) => `memory-${i} ${"m".repeat(2_000)}`),
+        failure_patterns: Array.from({ length: 12 }, (_, i) => `failure-${i} ${"f".repeat(1_000)}`),
+        prior_tool_results: Object.fromEntries(
+          Array.from({ length: 20 }, (_, i) => [`result-${i}`, "r".repeat(5_000)]),
+        ),
+      },
+    );
+
+    expect(merged).not.toContain("result-0");
+    expect(merged).toContain("[context truncated for latency budget]");
+  });
 });

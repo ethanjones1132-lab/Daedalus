@@ -131,7 +131,7 @@ describe("Orchestration & Routing Tests", () => {
     const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
 
     const result = await executor.execute(
-      "Review the workspace evidence",
+      "fix workspace/evidence.md",
       ["executor", "reviewer", "synthesizer"],
       "run-rewriter-timeout",
       (state) => states.push(state),

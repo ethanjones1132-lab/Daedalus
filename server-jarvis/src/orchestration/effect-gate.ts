@@ -1,5 +1,6 @@
 import type { ExecutorStageOutput, RewriterStageOutput, ToolCallRecord } from "./stage-output";
 import type { ExecutionProfile } from "./route-normalization";
+import { hasWriteIntent } from "./turn-requirements";
 
 export const WRITE_EFFECT_TOOLS = new Set(["write_file", "edit_file", "multi_edit", "apply_patch"]);
 
@@ -16,6 +17,7 @@ export function evaluateEffectGate(input: {
   profile: ExecutionProfile;
   executor?: ExecutorStageOutput;
   rewriter?: RewriterStageOutput;
+  request?: string;
 }): EffectGateReport {
   const calls: ToolCallRecord[] = [
     ...(input.executor?.toolCalls ?? []),
@@ -24,7 +26,8 @@ export function evaluateEffectGate(input: {
   const failedCalls = calls
     .filter((call) => call.is_error)
     .map((call) => ({ name: call.name, detail: (call.output || "").slice(0, 160) }));
-  const writeIntent = input.profile === "full" && input.executor !== undefined;
+  const writeIntent = input.profile === "full" && input.executor !== undefined
+    && (input.request === undefined ? true : hasWriteIntent(input.request));
   const successfulWrites = calls.filter(
     (call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name),
   ).length;

@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { countTokens } from "../tokens";
-import { buildBoundedHistoryBlock, truncateToTokenBudget } from "./context-budget";
+import {
+  buildBoundedHistoryBlock,
+  enforceTranscriptBudget,
+  truncateToTokenBudget,
+} from "./context-budget";
 
 describe("buildBoundedHistoryBlock", () => {
   test("respects the history-line token budget", () => {
@@ -42,5 +46,57 @@ describe("buildBoundedHistoryBlock", () => {
     expect(countTokens(output)).toBeLessThanOrEqual(80);
     expect(output).toContain("latest request");
     expect(output).toContain("write_file success");
+  });
+});
+
+describe("enforceTranscriptBudget", () => {
+  test("evicts oldest eligible runtime payloads and preserves the newest result", () => {
+    const messages = [
+      { role: "system", content: "system" },
+      { role: "user", content: "request" },
+      { role: "assistant", content: "turn one" },
+      { role: "tool", name: "read_file", tool_call_id: "old", content: "a".repeat(4_000) },
+      { role: "assistant", content: "turn two" },
+      { role: "tool", name: "read_file", tool_call_id: "new", content: "b".repeat(4_000) },
+    ];
+
+    const result = enforceTranscriptBudget(messages, 500);
+
+    expect(result.evicted).toBe(1);
+    expect(messages[3].content).toContain("earlier read_file result");
+    expect(messages[5].content).toBe("b".repeat(4_000));
+    expect(messages[3].tool_call_id).toBe("old");
+    expect(result.inputTokens).toBe(countTokens(JSON.stringify(messages)));
+  });
+
+  test("evicts tagged preflight carriers, but not ordinary user nudges", () => {
+    const messages = [
+      { role: "system", content: "system" },
+      { role: "user", content: "request" },
+      { role: "user", content: `[Runtime preflight: list_directory]\n${"x".repeat(4_000)}` },
+      { role: "user", content: `Remember this: ${"y".repeat(4_000)}` },
+      { role: "assistant", content: "done" },
+    ];
+
+    const result = enforceTranscriptBudget(messages, 500);
+
+    expect(result.evicted).toBe(1);
+    expect(messages[2].content).toContain("elided to fit context budget");
+    expect(messages[3].content).toContain("Remember this:");
+  });
+
+  test("is idempotent and never evicts the turn-one seed", () => {
+    const messages = [
+      { role: "system", content: "system" },
+      { role: "user", content: "request" },
+      { role: "user", content: `[Runtime preflight: list_directory]\n${"x".repeat(4_000)}` },
+    ];
+
+    const first = enforceTranscriptBudget(messages, 1);
+    const second = enforceTranscriptBudget(messages, 1);
+
+    expect(first.evicted).toBe(0);
+    expect(second.evicted).toBe(0);
+    expect(messages[2].content).toContain("Runtime preflight");
   });
 });

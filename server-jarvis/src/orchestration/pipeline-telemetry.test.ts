@@ -326,7 +326,7 @@ describe("pipeline stage telemetry", () => {
     };
 
     const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
-    await executor.execute("repair it", ["reviewer"], "run-rewriter-failure", () => {});
+    await executor.execute("fix workspace/thing.md", ["reviewer"], "run-rewriter-failure", () => {});
 
     const failedTurn = rows.find((row) => row.mode_id === "rewriter" && row.turn_number === 1);
     expect(failedTurn?.was_successful).toBe(0);
@@ -463,10 +463,10 @@ describe("pipeline stage telemetry", () => {
       { executionProfile: "full" },
     );
 
-    // The effect gate still flags no_write_effect (full profile + only reads),
-    // but the repair branch must not run for a read intent.
-    expect(result.outcome).toBe("failed");
-    expect(result.error_code).toBe("effect_gate_no_write_effect");
+    // A full-capability route can still be a read-intent turn; the effect gate
+    // must not demand a mutation that the user never requested.
+    expect(result.outcome).toBe("success");
+    expect(result.error_code).toBeUndefined();
     expect(rows.find((row) => row.mode_id === "rewriter")).toBeUndefined();
   });
 
@@ -501,8 +501,8 @@ describe("pipeline stage telemetry", () => {
       { executionProfile: "full" },
     );
 
-    expect(result.outcome).toBe("failed");
-    expect(result.error_code).toBe("effect_gate_no_write_effect");
+    expect(result.outcome).toBe("success");
+    expect(result.error_code).toBeUndefined();
     expect(rows.find((row) => row.mode_id === "rewriter")).toBeUndefined();
   });
 
@@ -537,8 +537,8 @@ describe("pipeline stage telemetry", () => {
       { executionProfile: "full" },
     );
 
-    expect(result.outcome).toBe("failed");
-    expect(result.error_code).toBe("effect_gate_no_write_effect");
+    expect(result.outcome).toBe("success");
+    expect(result.error_code).toBeUndefined();
     expect(rows.find((row) => row.mode_id === "rewriter")).toBeUndefined();
   });
 

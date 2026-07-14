@@ -14,13 +14,22 @@ import type { LiveConductor } from "./conductor";
 import { buildSynthesizerContext, buildSynthesizerContextFromStageState } from "./synth-context";
 import { applyEffectGate, evaluateEffectGate, WRITE_EFFECT_TOOLS, type EffectGateReport } from "./effect-gate";
 import type { ExecutionProfile } from "./route-normalization";
-import type { TurnRequirement } from "./turn-requirements";
+import { hasWriteIntent, type TurnRequirement } from "./turn-requirements";
 import type { TurnBudget } from "./turn-budget";
 import type { PipelineStageState, PlannerStageOutput, ExecutorStageOutput, ReviewerStageOutput, RewriterStageOutput, ToolCallRecord } from "./stage-output";
 import { parseReviewerVerdict, renderExecutorSummary, renderPlanSummary, renderReviewerSummary, renderRewriterSummary } from "./stage-output";
 import { assessWorkspaceEvidence, evidenceFailure, isDeepReadRequest } from "./evidence-sufficiency";
 import { substituteToolCall } from "../tool-heal";
-import { truncateToTokenBudget } from "./context-budget";
+import {
+  enforceTranscriptBudget,
+  EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS,
+  EXECUTOR_TOOL_RESULT_CONTEXT_CHARS,
+  EXECUTOR_TRANSCRIPT_BUDGET_TOKENS,
+  REWRITER_TOOL_RESULT_CONTEXT_CHARS,
+  REWRITER_TRANSCRIPT_BUDGET_TOKENS,
+  truncateToTokenBudget,
+} from "./context-budget";
+import { prepareToolResultForContext } from "../tool-result-truncation";
 import { findExistingWorkspacePath } from "./workspace-affinity";
 import { join } from "path";
 
@@ -88,6 +97,8 @@ export interface PipelineExecuteOptions {
   turnRequirement?: TurnRequirement;
   /** Maximum automatic full-profile review -> rewrite repair rounds. */
   maxReviewRepairRounds?: number;
+  /** Raw current user message used for write-intent decisions. */
+  rawMessage?: string;
   /**
    * The live turn budget (Task 2.4). When present, the executor reports
    * evidence progress after each turn so a demonstrably-progressing stage
@@ -99,6 +110,8 @@ export interface PipelineExecuteOptions {
 
 const READ_CACHE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "web_fetch"]);
 const READ_ONLY_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "git_metadata", "web_fetch"]);
+const PIPELINE_TOOL_RESULT_NOTE =
+  "Result recorded in full for verification. Re-run the tool with a narrower target if you need the elided middle.";
 
 /**
  * Split a turn's tool calls into dispatch batches (Task 3.1): consecutive
@@ -180,15 +193,6 @@ function isStageTimeout(error: unknown): boolean {
     ? String((error as { name?: unknown }).name ?? "")
     : "";
   return /timeout/i.test(name) || /(?:first-token|stream idle|visible-progress|request) timeout/i.test(errText(error));
-}
-
-function hasMutationIntent(request: string): boolean {
-  const text = request.toLowerCase();
-  const mutationVerb = /\b(write|create|add|edit|modify|update|change|patch|fix|implement|generate|save|replace|delete|remove)\b/.test(text);
-  const targetHint = /\b(file|repo|code|source|workspace|path|doc|document|config|test|script)\b/.test(text)
-    || /(?:^|[\s"'`])[\w.-]+\/[\w./-]+/.test(text)
-    || /\.[a-z0-9]{1,12}\b/.test(text);
-  return mutationVerb && targetHint;
 }
 
 function parseStreamedToolCall(raw: any): ToolCall {
@@ -627,7 +631,7 @@ export class PipelineExecutor {
       });
       executorMessages.push({
         role: "user",
-        content: `[Runtime preflight: git_metadata]\n${preflightOutput}\nUse this exact metadata in your answer; do not claim the tool is unavailable.`,
+        content: `[Runtime preflight: git_metadata]\n${prepareToolResultForContext(preflightOutput, EXECUTOR_TOOL_RESULT_CONTEXT_CHARS, PIPELINE_TOOL_RESULT_NOTE).context}\nUse this exact metadata in your answer; do not claim the tool is unavailable.`,
       });
       onStateChange({
         stage: "executor",
@@ -675,7 +679,7 @@ export class PipelineExecutor {
       });
       executorMessages.push({
         role: "user",
-        content: `[Runtime preflight: list_directory]\n${listOutput}`,
+        content: `[Runtime preflight: list_directory]\n${prepareToolResultForContext(listOutput, EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS, PIPELINE_TOOL_RESULT_NOTE).context}`,
       });
       onStateChange({
         stage: "executor",
@@ -711,7 +715,7 @@ export class PipelineExecutor {
           });
           executorMessages.push({
             role: "user",
-            content: `[Runtime preflight: read_file ${anchor}]\n${readOutput}`,
+            content: `[Runtime preflight: read_file ${anchor}]\n${prepareToolResultForContext(readOutput, EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS, PIPELINE_TOOL_RESULT_NOTE).context}`,
           });
           onStateChange({
             stage: "executor",
@@ -737,6 +741,15 @@ export class PipelineExecutor {
         let response: any;
 
         try {
+          const transcriptBudget = enforceTranscriptBudget(executorMessages, EXECUTOR_TRANSCRIPT_BUDGET_TOKENS);
+          if (transcriptBudget.evicted > 0) {
+            onStateChange({
+              stage: "executor",
+              status: "running",
+              detail: `context_evicted:${transcriptBudget.evicted}`,
+            });
+          }
+          const inputTokens = transcriptBudget.inputTokens;
           response = await this.callModel(executorMessages, {
             temperature: BUILTIN_MODES.executor.temperature,
             max_tokens: BUILTIN_MODES.executor.max_tokens,
@@ -764,7 +777,16 @@ export class PipelineExecutor {
                 error_code: toolResult.error_code,
                 duration_ms: toolResult.duration_ms ?? 0,
               });
-              executorMessages.push({ role: "tool", tool_call_id: tc.id, name: tc.name, content: toolResultModelText(toolResult) });
+              executorMessages.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                name: tc.name,
+                content: prepareToolResultForContext(
+                  toolResultModelText(toolResult),
+                  EXECUTOR_TOOL_RESULT_CONTEXT_CHARS,
+                  PIPELINE_TOOL_RESULT_NOTE,
+                ).context,
+              });
               onStateChange({
                 stage: "executor",
                 status: "running",
@@ -796,7 +818,7 @@ export class PipelineExecutor {
                   });
                   executorMessages.push({
                     role: "user",
-                    content: `[Runtime substitution] ${sub.note}:\n${subOutput}`,
+                    content: `[Runtime substitution] ${sub.note}:\n${prepareToolResultForContext(subOutput, EXECUTOR_TOOL_RESULT_CONTEXT_CHARS, PIPELINE_TOOL_RESULT_NOTE).context}`,
                   });
                   onStateChange({
                     stage: "executor",
@@ -851,7 +873,7 @@ export class PipelineExecutor {
             agent_run_id: agentRunId,
             mode_id: "executor",
             turn_number: executorTurn,
-            input_tokens: countTokens(JSON.stringify(executorMessages)),
+            input_tokens: inputTokens,
             output_tokens: countTokens(response?.content || ""),
             tool_calls_json: JSON.stringify(response?.tool_calls || []),
             duration_ms: Date.now() - turnStartTime,
@@ -930,6 +952,15 @@ export class PipelineExecutor {
         let rewriteResp: any;
 
         try {
+          const transcriptBudget = enforceTranscriptBudget(rewriterMessages, REWRITER_TRANSCRIPT_BUDGET_TOKENS);
+          if (transcriptBudget.evicted > 0) {
+            onStateChange({
+              stage: "rewriter",
+              status: "running",
+              detail: `context_evicted:${transcriptBudget.evicted}`,
+            });
+          }
+          const inputTokens = transcriptBudget.inputTokens;
           rewriteResp = await this.callModel(rewriterMessages, {
             temperature: BUILTIN_MODES.rewriter.temperature,
             max_tokens: BUILTIN_MODES.rewriter.max_tokens,
@@ -956,7 +987,16 @@ export class PipelineExecutor {
                 error_code: toolResult.error_code,
                 duration_ms: toolResult.duration_ms ?? 0,
               });
-              rewriterMessages.push({ role: "tool", tool_call_id: tc.id, name: tc.name, content: toolResultModelText(toolResult) });
+              rewriterMessages.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                name: tc.name,
+                content: prepareToolResultForContext(
+                  toolResultModelText(toolResult),
+                  REWRITER_TOOL_RESULT_CONTEXT_CHARS,
+                  PIPELINE_TOOL_RESULT_NOTE,
+                ).context,
+              });
               onStateChange({
                 stage: "rewriter",
                 status: "running",
@@ -973,7 +1013,7 @@ export class PipelineExecutor {
             agent_run_id: agentRunId,
             mode_id: "rewriter",
             turn_number: rewriterTurn,
-            input_tokens: countTokens(JSON.stringify(rewriterMessages)),
+            input_tokens: inputTokens,
             output_tokens: countTokens(rewriteResp?.content || ""),
             tool_calls_json: JSON.stringify(rewriteResp?.tool_calls || []),
             duration_ms: Date.now() - rewStartTime,
@@ -1053,6 +1093,7 @@ export class PipelineExecutor {
     let reviewerOk = true;
     let rewriterOutput: RewriterStageOutput | undefined;
     let rewriterSummaryForPrompt = "No rewriting stage executed.";
+    const writeIntentForTurn = hasWriteIntent(options.rawMessage ?? request);
 
     while (hasPendingIssues) {
       reviewCount++;
@@ -1096,10 +1137,9 @@ export class PipelineExecutor {
         // NOTE (found during extraction, not changed): this mirrors existing
         // behavior exactly — the rewriter can run whenever the reviewer flags
         // issues, even on a pipeline that didn't request the "rewriter" stage.
-        // Gating this on stage inclusion is a legitimate follow-up but is out
-        // of scope for this refactor (extract, don't change behavior).
+        // The gate below deliberately suppresses repair on non-write turns.
         hasPendingIssues = this.hasIssues(reviewerFeedback);
-        if (!hasPendingIssues || profile !== "full" || repairs >= maxRepairRounds) {
+        if (!hasPendingIssues || profile !== "full" || !writeIntentForTurn || repairs >= maxRepairRounds) {
           break;
         }
 
@@ -1280,6 +1320,7 @@ export class PipelineExecutor {
   ): Promise<PipelineSegmentResult> {
     const state: PipelineStageState = { ...carry };
     const profile: ExecutionProfile = options.executionProfile ?? "full";
+    const intentText = options.rawMessage ?? request;
     const remainingQueueFor = (stage: StageName): StageName[] => {
       const index = stages.indexOf(stage);
       return index < 0 ? [] : stages.slice(index + 1);
@@ -1312,12 +1353,13 @@ export class PipelineExecutor {
       profile,
       executor: state.executor,
       rewriter: state.rewriter,
+      request: intentText,
     });
     if (
       effectGate.verdict === "no_write_effect" &&
       profile === "full" &&
       (options.maxReviewRepairRounds ?? 1) > 0 &&
-      hasMutationIntent(request) &&
+      hasWriteIntent(intentText) &&
       state.executor &&
       !state.rewriter
     ) {
@@ -1339,6 +1381,7 @@ export class PipelineExecutor {
         profile,
         executor: state.executor,
         rewriter: state.rewriter,
+        request: intentText,
       });
       if (state.rewriter.terminalStatus === "timed_out") {
         partialStage = { stage: "rewriter", errorCode: state.rewriter.errorCode ?? "stage_timeout" };

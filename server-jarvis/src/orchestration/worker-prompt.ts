@@ -1,4 +1,5 @@
 import type { SharedContextHints, StageName, WorkerInstructions } from "./coordinator";
+import { truncateToTokenBudget } from "./context-budget";
 
 export interface InstructionVariantSelection {
   instructions?: WorkerInstructions;
@@ -27,30 +28,34 @@ function formatSharedContext(shared?: SharedContextHints): string {
   if (!shared) return "";
   const blocks: string[] = [];
 
-  if (shared.relevant_memories?.length) {
+  const memories = (shared.relevant_memories ?? []).slice(-16);
+  if (memories.length) {
     blocks.push(
       "Relevant memories from prior turns:\n" +
-      shared.relevant_memories.map((m) => `- ${m}`).join("\n"),
+        memories.map((m) => `- ${m.slice(0, 1500)}`).join("\n"),
     );
   }
 
-  if (shared.failure_patterns?.length) {
+  const failures = (shared.failure_patterns ?? []).slice(-8);
+  if (failures.length) {
     blocks.push(
       "Known failure patterns to avoid:\n" +
-      shared.failure_patterns.map((p) => `- ${p}`).join("\n"),
+        failures.map((p) => `- ${p.slice(0, 600)}`).join("\n"),
     );
   }
 
   const cached = shared.prior_tool_results ?? {};
-  const entries = Object.entries(cached).filter(([, value]) => value?.trim());
+  const entries = Object.entries(cached)
+    .filter(([, value]) => value?.trim())
+    .slice(-8);
   if (entries.length > 0) {
     blocks.push(
       "Cached tool results (reuse when still valid; do not rediscover):\n" +
-      entries.map(([key, value]) => `### ${key}\n${value}`).join("\n\n"),
+        entries.map(([key, value]) => `### ${key.slice(0, 200)}\n${value.slice(0, 2000)}`).join("\n\n"),
     );
   }
 
-  return blocks.join("\n\n");
+  return truncateToTokenBudget(blocks.join("\n\n"), 1_500);
 }
 
 /**

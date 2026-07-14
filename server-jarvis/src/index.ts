@@ -2543,6 +2543,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const pipelineOptions = {
           topology: normalized.topology,
           executionProfile,
+          rawMessage: message,
           turnRequirement: turnReq.requirement,
           workerInstructions: instructionSelection.instructions,
           sharedContext: mergedSharedContext,

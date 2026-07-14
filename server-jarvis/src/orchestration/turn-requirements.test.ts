@@ -1,9 +1,31 @@
 import { describe, test, expect } from "bun:test";
 import {
   classifyTurnRequirements,
+  hasWriteIntent,
   inheritRequirementForContinuation,
   shouldShortCircuitCoordinator,
 } from "./turn-requirements";
+
+describe("hasWriteIntent", () => {
+  test("does not treat the incident's plan request as a file mutation", () => {
+    expect(hasWriteIntent(
+      "Identify all remaining gaps in C:\\Projects\\Versutus, create a comprehensive implementation plan for the repo, and do not modify files.",
+    )).toBe(false);
+  });
+
+  test.each([
+    ["create a comprehensive implementation plan. Do not modify files.", false],
+    ["create a plan and save it to docs/plan.md", true],
+    ["create a plan file for the migration", true],
+    ["write a report on the architecture", false],
+    ["fix the crash in auth.ts", true],
+    ["update README.md", true],
+    ["read CONTEXT.md and summarize", false],
+    ["without modifying files, create src/new.ts", true],
+  ])("classifies %s as write=%s", (message, expected) => {
+    expect(hasWriteIntent(message)).toBe(expected);
+  });
+});
 
 describe("inheritRequirementForContinuation", () => {
   test("inherits a higher-authority prior requirement on continuation", () => {

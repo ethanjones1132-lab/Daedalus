@@ -35,9 +35,21 @@ describe("effect gate", () => {
     const report = evaluateEffectGate({
       profile: "full",
       executor: executor([call("read_file")]),
+      request: "explain the api",
+    });
+    expect(report.verdict).toBe("clean");
+    expect(report.writeIntent).toBe(false);
+    expect(report.successfulWrites).toBe(0);
+  });
+
+  test("full profile with an explicit write request still requires a write effect", () => {
+    const report = evaluateEffectGate({
+      profile: "full",
+      executor: executor([call("read_file")]),
+      request: "write workspace/smoke.md",
     });
     expect(report.verdict).toBe("no_write_effect");
-    expect(report.successfulWrites).toBe(0);
+    expect(report.writeIntent).toBe(true);
   });
 
   test("read-only profile with reads remains clean", () => {

@@ -8,6 +8,54 @@ export const HISTORY_BUDGET_TOKENS: Record<TurnRequirement, number> = {
   full_execution: 2_400,
 };
 
+export const EXECUTOR_TOOL_RESULT_CONTEXT_CHARS = 6_000;
+export const EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS = 3_000;
+export const REWRITER_TOOL_RESULT_CONTEXT_CHARS = 4_000;
+export const EXECUTOR_TRANSCRIPT_BUDGET_TOKENS = 12_000;
+export const REWRITER_TRANSCRIPT_BUDGET_TOKENS = 8_000;
+
+export interface TranscriptMessage {
+  role: string;
+  content: string;
+  name?: string;
+  tool_call_id?: string;
+}
+
+/**
+ * Evict only old runtime payloads from a loop transcript. Messages stay in
+ * place so provider tool-call pairing remains valid, and the newest assistant
+ * turn plus its immediately-following results remain intact.
+ */
+export function enforceTranscriptBudget(
+  messages: TranscriptMessage[],
+  budgetTokens: number,
+): { evicted: number; inputTokens: number } {
+  const measure = () => countTokens(JSON.stringify(messages));
+  let inputTokens = measure();
+  if (inputTokens <= budgetTokens) return { evicted: 0, inputTokens };
+
+  const lastAssistantIndex = messages.findLastIndex((message) => message.role === "assistant");
+  if (lastAssistantIndex < 0) return { evicted: 0, inputTokens };
+
+  let evicted = 0;
+  for (let index = 2; index < lastAssistantIndex && inputTokens > budgetTokens; index++) {
+    const message = messages[index];
+    const isPreflightCarrier = message.role === "user"
+      && /^\[Runtime (?:preflight:|substitution\])/i.test(message.content);
+    if (message.role !== "tool" && !isPreflightCarrier) continue;
+    if (message.content.includes("[elided to fit context budget:")) continue;
+
+    const name = message.name || (isPreflightCarrier
+      ? (message.content.match(/^\[Runtime ([^\]]+)/i)?.[1] ?? "runtime result")
+      : "tool result");
+    message.content = `[elided to fit context budget: earlier ${name} result (${message.content.length} chars) removed — re-run the tool if needed]`;
+    evicted++;
+    inputTokens = measure();
+  }
+
+  return { evicted, inputTokens };
+}
+
 /** Trim dynamic stage text while preserving both the newest request prefix and
  * the tail where the latest tool effects and terminal status are rendered. */
 export function truncateToTokenBudget(text: string, budgetTokens: number): string {

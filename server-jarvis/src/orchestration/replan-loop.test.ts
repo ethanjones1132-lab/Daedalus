@@ -152,7 +152,7 @@ describe("runPipelineWithReplanning", () => {
     });
 
     expect(coordinatorCalls).toBe(1);
-    expect(stageLabels).toEqual(["executor", "reviewer", "synthesizer"]);
+    expect(stageLabels).toEqual(["executor", "rewriter", "reviewer", "synthesizer"]);
     expect(stateEvents).toContain("conductor_replan:running");
     expect(stateEvents).toContain("conductor_replan:done");
     // Deliberate effect-gate inversion: this full-execution fixture never
@@ -201,7 +201,7 @@ describe("runPipelineWithReplanning", () => {
     // intentionally trusts the model's latest explicit stage list rather than
     // inferring staleness, bounded by maxReplans so the worst case is a few
     // extra model calls, never incorrect output.
-    expect(stageLabels).toEqual(["executor", "executor", "reviewer", "synthesizer"]);
+    expect(stageLabels).toEqual(["executor", "rewriter", "executor", "reviewer", "synthesizer"]);
     expect(result.outcome).toBe("failed");
     expect(result.error_code).toBe("effect_gate_no_write_effect");
   });
@@ -245,7 +245,7 @@ describe("runPipelineWithReplanning", () => {
     });
 
     expect(coordinatorCalls).toBe(1);
-    expect(stageLabels).toEqual(["executor", "executor", "reviewer", "synthesizer"]);
+    expect(stageLabels).toEqual(["executor", "rewriter", "executor", "reviewer", "synthesizer"]);
     expect(stageLabels.filter((s) => s === "executor")).toHaveLength(2);
     expect(result.outcome).toBe("failed");
     expect(result.error_code).toBe("effect_gate_no_write_effect");
