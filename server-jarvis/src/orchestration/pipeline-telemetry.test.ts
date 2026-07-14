@@ -3,6 +3,7 @@ import { defaultConfig } from "../config";
 import { createToolRuntime, makeExecutionContext } from "../tool-runtime";
 import type { StageRun } from "../self-tuning/store";
 import { PipelineExecutor, type StageRunRecorder } from "./pipeline";
+import { TurnDeadlineExceededError } from "../stream-liveness";
 
 function toolDefinition(name: string) {
   return {
@@ -43,6 +44,27 @@ function telemetryHarness(toolName: string, handler: () => Promise<string>) {
 }
 
 describe("pipeline stage telemetry", () => {
+  test("preserves streamed synthesis as a partial answer when the turn deadline expires", async () => {
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    const collector: StageRunRecorder = { recordStageRun: () => {} };
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string; onChunk?: (chunk: string) => void } = {}) => {
+      if (options.stageLabel === "synthesizer") {
+        options.onChunk?.("Partial plan: inspect the runtime first.");
+        throw new TurnDeadlineExceededError("synthesizer", 150_000);
+      }
+      return { content: "unexpected" };
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+
+    const result = await executor.execute("make a plan", ["synthesizer"], "run-synth-deadline", () => {});
+
+    expect(result.answer).toBe("Partial plan: inspect the runtime first.");
+    expect(result.outcome).toBe("partial");
+    expect(result.error_code).toBe("stage_timeout");
+    expect(result.error).toBeUndefined();
+  });
+
   test("executor stage run records had_error:1 when a tool call fails", async () => {
     const { rows, runtime, ctx, collector } = telemetryHarness("boom", async () => {
       throw new Error("deliberate tool failure");

@@ -1164,11 +1164,12 @@ export class PipelineExecutor {
     options: PipelineExecuteOptions,
     executionVerification = "",
     remainingQueue: StageName[] = [],
-  ): Promise<{ answer: string; fatalError?: string; emptyCompletion: boolean }> {
+  ): Promise<{ answer: string; fatalError?: string; emptyCompletion: boolean; partialErrorCode?: string }> {
     onStateChange({ stage: "synthesizer", status: "running" });
     const synthesizerPrompt = stageSystemPrompt("synthesizer", options);
     const synthStartTime = Date.now();
     const contextText = buildSynthesizerContextFromStageState(request, state, executionVerification);
+    let streamedAnswer = "";
     try {
       const resp = await this.callModel([
         { role: "system", content: synthesizerPrompt },
@@ -1181,6 +1182,7 @@ export class PipelineExecutor {
         surfaceAsAnswer: true,
         stageAbort: this.registerStageAbort("synthesizer"),
         onChunk: (chunk) => {
+          streamedAnswer += chunk;
           onStateChange({ stage: "synthesizer", status: "running", output: chunk });
           this.publishStageToken("synthesizer", chunk);
         }
@@ -1231,6 +1233,8 @@ export class PipelineExecutor {
       const message = errText(e);
       onStateChange({ stage: "synthesizer", status: "failed", output: message });
       await this.afterConductorStage("synthesizer", "failed", message, agentRunId, options, remainingQueue);
+      const hasPartialDeadlineAnswer =
+        e?.name === "TurnDeadlineExceededError" && streamedAnswer.trim().length > 0;
       const fatalError = describePipelineError(message);
       this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
@@ -1250,6 +1254,9 @@ export class PipelineExecutor {
       // index.ts's error branch turns into an SSE error frame instead of
       // prose (see `if (result.error) ... session.finish(result.error, {
       // isError: true })`).
+      if (hasPartialDeadlineAnswer) {
+        return { answer: streamedAnswer, emptyCompletion: false, partialErrorCode: "stage_timeout" };
+      }
       return { answer: "", fatalError, emptyCompletion: false };
     }
   }
@@ -1365,6 +1372,9 @@ export class PipelineExecutor {
       effectGate.synthesizerNotice,
       remainingQueueFor("synthesizer"),
     );
+    if (synth.partialErrorCode) {
+      partialStage = { stage: "synthesizer", errorCode: synth.partialErrorCode };
+    }
     return {
       state,
       synthesizerAnswer: synth.answer,
