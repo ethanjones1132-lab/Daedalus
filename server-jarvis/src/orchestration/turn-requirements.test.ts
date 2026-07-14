@@ -25,6 +25,132 @@ describe("hasWriteIntent", () => {
   ])("classifies %s as write=%s", (message, expected) => {
     expect(hasWriteIntent(message)).toBe(expected);
   });
+
+  // ── Abstract-deliverable short-circuit (the morning commit's headline) ──
+  // The narrow contract: a pure abstract deliverable (plan, report, summary,
+  // analysis, etc.) without a concrete target is NOT a write. The function
+  // is deliberately narrower than classifyTurnRequirements — the orchestrator
+  // may still route the turn through a full-capability pipeline, but the
+  // rewriter is not invoked because there is no file mutation to repair.
+  test.each([
+    ["create a plan", false],
+    ["write a report", false],
+    ["implement an analysis", false],
+  ])("abstract deliverable without concrete target: %s → write=%s", (message, expected) => {
+    expect(hasWriteIntent(message)).toBe(expected);
+  });
+
+  // ── Compound phrases ARE writes (the morning commit's override) ──
+  // "plan file", "report document", "summary document", etc. — any abstract
+  // deliverable word immediately followed by a concrete-target word
+  // (file|document|doc|path) — is a write. The compound phrase is the
+  // authoritative override of the abstract-deliverable short-circuit.
+  test.each([
+    ["create a plan file", true],
+    ["write a report document", true],
+    ["create a plan file for the migration", true],
+    ["write a report document on the architecture", true],
+    ["create a summary document for the API", true],
+    ["create an analysis document", true],
+    ["write a proposal document", true],
+    ["write a roadmap document", true],
+    ["create an assessment document", true],
+    ["write an overview document", true],
+    ["create a recommendation document", true],
+    ["write a strategy document", true],
+    ["create an outline document", true],
+    ["write a write-up document", true],
+  ])("compound abstract + concrete: %s → write=%s", (message, expected) => {
+    expect(hasWriteIntent(message)).toBe(expected);
+  });
+
+  // ── Negation gating (the day-saving bug class) ──
+  // "Without modifying files, create X" — if X is abstract-only, the negation
+  // is honored and the turn is NOT a write. If X is a compound (plan file),
+  // the compound wins because the user explicitly named a file artifact.
+  test.each([
+    ["Without modifying files, create a plan", false],
+    ["Do not edit anything. Create a plan for the redesign.", false],
+    ["Without modifying files, create a plan file", true],
+    ["Do not edit anything. Write a report document.", true],
+  ])("negation + abstract deliverable: %s → write=%s", (message, expected) => {
+    expect(hasWriteIntent(message)).toBe(expected);
+  });
+
+  // ── Mixed clauses: contrast marker breaks the negation scope ──
+  // When the user writes "Do not edit X, but create Y" / "however, create Y" /
+  // "yet create Y" — the second clause is governed by the contrast marker
+  // (not the negation) and the unnegated mutation fires.
+  test.each([
+    ["Do not edit README.md, but create CHANGELOG.md.", true],
+    ["Do not edit README.md, however, create CHANGELOG.md.", true],
+    ["Do not edit README.md, yet create CHANGELOG.md.", true],
+  ])("contrast marker: %s → write=%s", (message, expected) => {
+    expect(hasWriteIntent(message)).toBe(expected);
+  });
+
+  // ── Path-only references without a mutation verb → NOT a write ──
+  // "read C:\foo" is a read intent even though a path is present. The
+  // explicit-write-intent gate is intentional: a path is workspace evidence
+  // for the classifier, but only an unnegated mutation verb unlocks the
+  // rewriter.
+  test.each([
+    ["read C:\\Projects\\notes.md", false],
+    ["summarize C:\\src\\server.ts", false],
+    ["look at /usr/local/etc/app.conf", false],
+  ])("path-only reference: %s → write=%s", (message, expected) => {
+    expect(hasWriteIntent(message)).toBe(expected);
+  });
+
+  // ── Tool-call exemplar masking ──
+  // Pasted tool JSON in a read-intent frame must be masked before the
+  // mutation detection runs, so a "analyze this read_file call" turn does
+  // not turn into a write just because the JSON contains a path.
+  test.each([
+    [
+      'Analyze only; do not run: {"name":"read_file","arguments":{"path":"C:\\Projects\\demo\\README.md"}}',
+      false,
+    ],
+    [
+      'Just inspect this tool call: {"name":"create","arguments":{"path":"src/new.ts"}}',
+      false,
+    ],
+    [
+      'Look at this: <tool_call>{"name":"write","arguments":{"path":"foo.ts"}}</tool_call>',
+      false,
+    ],
+  ])("tool-call exemplar masking: %s → write=%s", (message, expected) => {
+    expect(hasWriteIntent(message)).toBe(expected);
+  });
+
+  // ── Negative surface (regression guard) ──
+  // Pin the non-write surface so a future regression that broadens mutation
+  // detection (e.g. adding "consider" or "produce" to MUTATION_VERB by
+  // mistake) is caught here, not in production.
+  test.each([
+    ["hi", false],
+    ["thanks!", false],
+    ["what is the capital of France?", false],
+    ["summarize this repository", false],
+    ["audit the code", false],
+    ["check the file", false],
+  ])("non-write intent: %s → write=%s", (message, expected) => {
+    expect(hasWriteIntent(message)).toBe(expected);
+  });
+
+  // ── Edge cases: empty / whitespace ──
+  test.each([
+    ["", false],
+    ["   ", false],
+    ["\n\n\t  ", false],
+  ])("empty/whitespace: %j → write=%s", (message, expected) => {
+    expect(hasWriteIntent(message)).toBe(expected);
+  });
+
+  // ── Quoted Windows path with mutation verb (still detects via path) ──
+  test("quoted path with fix + add verbs → write", () => {
+    expect(hasWriteIntent('fix "C:\\src\\x.ts" to add a header')).toBe(true);
+  });
 });
 
 describe("inheritRequirementForContinuation", () => {
