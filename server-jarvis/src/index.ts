@@ -112,12 +112,10 @@ import type { ConductorDirective } from "./orchestration/conductor-bus";
 import { LiveConductor } from "./orchestration/conductor";
 import type { StageName } from "./orchestration/coordinator";
 import {
-  classifyTurnRequirements,
-  inheritRequirementForContinuation,
+  resolveTurnRequirement,
   shouldShortCircuitCoordinator,
   type TurnRequirement,
 } from "./orchestration/turn-requirements";
-import { isContinuationTurn } from "./orchestration/turn-triage";
 import {
   buildShortCircuitRoute,
   normalizeRoute,
@@ -1273,7 +1271,12 @@ async function runCronInference(body: Record<string, unknown>): Promise<{
 
 async function streamJarvis(message: string, sessionId: string, options: StreamJarvisOptions = {}): Promise<Response> {
   const turnStartedAt = Date.now();
-  const initialRequirement = classifyTurnRequirements(message).requirement;
+  // Invariant: the turn budget and coordinator route derive from the same
+  // continuation-aware requirement; do not freeze a raw-message budget first.
+  const initialRequirement = resolveTurnRequirement(
+    message,
+    continuationRequirements.get(sessionId),
+  ).result.requirement;
   const turnBudget = createTurnBudget(initialRequirement, "medium", turnStartedAt);
   const ensureTurnBudget = (stage: string): void => {
     if (Date.now() >= turnBudget.deadlineAt) {
@@ -2390,11 +2393,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // NOT `contextMessage` (which prepends history and would let a prior
         // file-read contaminate a follow-up greeting). This is the authoritative
         // signal; the coordinator model's route is advisory.
-        const continuation = isContinuationTurn(message);
-        const turnReq = inheritRequirementForContinuation(
-          classifyTurnRequirements(message),
+        const { continuation, result: turnReq } = resolveTurnRequirement(
+          message,
           continuationRequirements.get(sessionId),
-          continuation,
         );
         const shortCircuit = shouldShortCircuitCoordinator(message, turnReq, continuation);
         const coordinator = new Coordinator(callModel, persistentConductor);

@@ -20,7 +20,7 @@
 //   full_execution  — explicitly requested edits, builds, commands, deployment,
 //                     or other mutations. Executor REQUIRED, full tools.
 
-import { isTrivialConversationalTurn } from "./turn-triage";
+import { isContinuationTurn, isTrivialConversationalTurn } from "./turn-triage";
 
 export type TurnRequirement =
   | "conversational"
@@ -75,6 +75,26 @@ export function inheritRequirementForContinuation(
   return {
     requirement: previous,
     signals: [...current.signals, `continuation_inherit:${previous}`],
+  };
+}
+
+/**
+ * Resolve the authoritative requirement for one session turn. Budget creation
+ * and route selection must use this exact result so a continuation can never
+ * inherit a heavier pipeline after a lighter turn deadline has been frozen.
+ */
+export function resolveTurnRequirement(
+  message: string,
+  previous: TurnRequirement | undefined,
+): { continuation: boolean; result: TurnRequirementResult } {
+  const continuation = isContinuationTurn(message);
+  return {
+    continuation,
+    result: inheritRequirementForContinuation(
+      classifyTurnRequirements(message),
+      previous,
+      continuation,
+    ),
   };
 }
 

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createTurnBudget } from "./turn-budget";
 import { AgentPool, firstTokenTimeoutFor } from "./agent-pool";
+import { resolveTurnRequirement } from "./turn-requirements";
 
 describe("turn budgets", () => {
   test("reserves the finalization window before optional repair work", () => {
@@ -20,6 +21,24 @@ describe("turn budgets", () => {
     const budget = createTurnBudget("conversational", "medium", 0);
     expect(budget.turn_ms).toBe(30_000);
     expect(budget.canStart("synthesizer", 16_000)).toBe(false);
+  });
+
+  test("continuation budgets inherit the same requirement as their route", () => {
+    const resolved = resolveTurnRequirement("Continue synthesizing the plan", "full_execution");
+    const budget = createTurnBudget(resolved.result.requirement, "medium", 0);
+
+    expect(resolved.continuation).toBe(true);
+    expect(budget.requirement).toBe("full_execution");
+    expect(budget.turn_ms).toBe(150_000);
+  });
+
+  test("caps coordinator work while leaving the terminal synthesizer to the turn deadline", () => {
+    for (const requirement of ["conversational", "answer_only", "workspace_read", "full_execution"] as const) {
+      const budget = createTurnBudget(requirement, "medium", 0);
+      expect(budget.stageRemainingMs("coordinator", 0)).toBe(15_000);
+      expect(budget.stage_ms.synthesizer).toBeUndefined();
+      expect(budget.stageRemainingMs("synthesizer", 0)).toBe(budget.remainingMs(0));
+    }
   });
 
   test("evidence progress extends the executor stage budget up to the ceiling", () => {
