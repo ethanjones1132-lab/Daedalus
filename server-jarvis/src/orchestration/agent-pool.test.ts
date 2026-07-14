@@ -284,6 +284,11 @@ describe("AgentPool", () => {
     expect(synthesizer?.model_id).toBe("deepseek-v4-flash");
   });
 
+  test("deepseek-v4-pro keeps a cold-start first-token allowance", () => {
+    const pool = new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS);
+    expect(firstTokenTimeoutFor(pool, "deepseek-v4-pro", 30_000)).toBe(45_000);
+  });
+
   test("no stage defaults to the unreliable openrouter/free router model", () => {
     const stages = ["coordinator", "planner", "executor", "reviewer", "rewriter", "synthesizer"];
     for (const stage of stages) {

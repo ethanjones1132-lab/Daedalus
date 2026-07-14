@@ -143,11 +143,14 @@ export const DEFAULT_ORCHESTRATOR_AGENTS: OrchestratorAgent[] = [
     enabled: true,
   },
   {
+    // Measured cold starts: 19,278ms and 28,180ms in live stage attribution.
+    // Keep a margin below the 60s stream-stall watchdog for routed pro calls.
     id: "go-deepseek-v4-pro",
     provider: "opencode_go",
     model_id: "deepseek-v4-pro",
     capabilities: { code: 0.93, reasoning: 0.9, speed: 0.7, cost: 0.7, json_reliability: 0.85 },
     default_for: ["planner", "executor", "rewriter", "synthesizer"],
+    first_token_timeout_ms: 45_000,
     enabled: true,
   },
   {
