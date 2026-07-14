@@ -30,8 +30,8 @@ const STAGE_EXTENSION_CEILING_MS = 90_000; // a stage may never exceed this
 const ABSOLUTE_TURN_CAP_MS = 180_000;      // matches the high-complexity full_execution cap
 
 const BUDGETS: Record<TurnRequirement, Omit<TurnBudget, "requirement" | "complexity" | "startedAt" | "deadlineAt" | "remainingMs" | "stageRemainingMs" | "canStart" | "extendStageOnProgress">> = {
-  conversational: { turn_ms: 30_000, finalization_reserve_ms: 15_000, max_stage_attempts: 2, stage_ms: { synthesizer: 25_000 } },
-  answer_only: { turn_ms: 45_000, finalization_reserve_ms: 20_000, max_stage_attempts: 2, stage_ms: { planner: 15_000, synthesizer: 30_000 } },
+  conversational: { turn_ms: 30_000, finalization_reserve_ms: 15_000, max_stage_attempts: 2, stage_ms: { coordinator: 15_000 } },
+  answer_only: { turn_ms: 45_000, finalization_reserve_ms: 20_000, max_stage_attempts: 2, stage_ms: { coordinator: 15_000, planner: 15_000 } },
   // workspace_read's executor ceiling: 60_000 (not the original 25_000) — same
   // bug class as the full_execution planner/reviewer fix above. The agent pool's
   // DEFAULT_ORCHESTRATOR_AGENTS gives slow-start Nemotron models a
@@ -42,7 +42,7 @@ const BUDGETS: Record<TurnRequirement, Omit<TurnBudget, "requirement" | "complex
   // runtime caps the actual delay at remainingMs (75_000 turn budget −
   // 25_000 reserve = 50_000), so the wider ceiling just stops the override
   // being inert — it does NOT extend the turn beyond its total budget.
-  workspace_read: { turn_ms: 75_000, finalization_reserve_ms: 25_000, max_stage_attempts: 2, stage_ms: { executor: 60_000, synthesizer: 30_000 } },
+  workspace_read: { turn_ms: 75_000, finalization_reserve_ms: 25_000, max_stage_attempts: 2, stage_ms: { coordinator: 15_000, executor: 60_000 } },
   // planner/reviewer: 60_000 (not the original 20_000) — see the
   // 2026-07-13 finding below. full_execution's 150-180s total turn_ms
   // leaves ample room; the per-stage ceilings are independent caps bounded
@@ -56,7 +56,7 @@ const BUDGETS: Record<TurnRequirement, Omit<TurnBudget, "requirement" | "complex
   // class as planner's, and would silently recur the moment that model
   // (or any future reviewer-stage model with a similarly large override)
   // is enabled.
-  full_execution: { turn_ms: 150_000, finalization_reserve_ms: 30_000, max_stage_attempts: 2, stage_ms: { planner: 60_000, executor: 30_000, reviewer: 60_000, rewriter: 30_000, synthesizer: 35_000 } },
+  full_execution: { turn_ms: 150_000, finalization_reserve_ms: 30_000, max_stage_attempts: 2, stage_ms: { coordinator: 15_000, planner: 60_000, executor: 30_000, reviewer: 60_000, rewriter: 30_000 } },
 };
 
 // 2026-07-13 finding: agent-pool.ts's DEFAULT_ORCHESTRATOR_AGENTS gives
