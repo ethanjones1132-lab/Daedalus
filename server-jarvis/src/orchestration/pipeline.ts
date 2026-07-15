@@ -1767,7 +1767,6 @@ export class PipelineExecutor {
           || (options.turnRequirement === "full_execution" && requiresWorkspaceEvidence);
         if (
           reviewer?.hasIssues &&
-          !rewriter &&
           wantsSynthesizer &&
           options.allowMidRunReplan !== false &&
           profile === "full" &&

@@ -652,6 +652,7 @@ describe("pipeline stage telemetry", () => {
     let executorTurns = 0;
     let rewriterCallCount = 0;
     let rewriterWriteCount = 0;
+    let synthesizerCallCount = 0;
     const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
       if (options.stageLabel === "executor" && executorTurns++ === 0) {
         return { content: "inspecting", tool_calls: [toolCallWithArgs("read_file", { path: "CONTEXT.md" })] };
@@ -682,6 +683,7 @@ describe("pipeline stage telemetry", () => {
         return { content: "repair round complete" };
       }
       if (options.stageLabel === "synthesizer") {
+        synthesizerCallCount++;
         return { content: "Repairs applied." };
       }
       return { content: "unexpected" };
@@ -705,6 +707,7 @@ describe("pipeline stage telemetry", () => {
       (row) => row.mode_id === "rewriter" && (row.tool_calls_json ?? "").includes("write_file"),
     );
     expect(rewriterWriteRows.length).toBe(2);
+    expect(synthesizerCallCount).toBe(0);
   });
 
   test("a repair round with no new write-effect progress exits the loop immediately", async () => {
