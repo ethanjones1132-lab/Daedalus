@@ -167,7 +167,14 @@ describe("assessWorkspaceEvidence", () => {
 
   test("manifests and overview files do not satisfy the deep-read source floor", () => {
     const a = assessWorkspaceEvidence(
-      [read("package.json"), read("README.md"), read("tsconfig.json")],
+      [
+        read("package.json"),
+        read("README.md"),
+        read("tsconfig.json"),
+        read("OVERVIEW.md"),
+        read("docs/ARCHITECTURE_OVERVIEW.md"),
+        read("docs/system-overview.md"),
+      ],
       "comprehensively diagnose this repo",
     );
 

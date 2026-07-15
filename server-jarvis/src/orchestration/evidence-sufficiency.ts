@@ -72,7 +72,9 @@ function isNonSourceReadTarget(call: ToolCallRecord): boolean {
   const rawPath = typeof args?.path === "string" ? args.path : undefined;
   if (!rawPath) return false;
   const basename = rawPath.replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
-  return NON_SOURCE_READ_BASENAMES.has(basename) || /^readme\./i.test(basename);
+  return NON_SOURCE_READ_BASENAMES.has(basename)
+    || /^readme\./i.test(basename)
+    || /(^|[-_. ])overview([-. _]|$)/i.test(basename);
 }
 
 function distinctDeepReadTargetKeys(calls: ToolCallRecord[]): Set<string> {
