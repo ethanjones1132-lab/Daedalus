@@ -1010,7 +1010,11 @@ export class PipelineExecutor {
           // The first nudge can fire on zero evidence; the second only fires
           // after the previous nudge produced new successful evidence, so a
           // refusing model cannot spin indefinitely.
-          const assessmentAfterTurn = assessWorkspaceEvidence(toolCalls, intentText);
+          const assessmentAfterTurn = assessWorkspaceEvidence(
+            toolCalls,
+            intentText,
+            this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd(),
+          );
           let workspaceEvidenceNudgeSentThisTurn = false;
           if (
             requiresWorkspaceEvidence &&
@@ -1074,7 +1078,11 @@ export class PipelineExecutor {
       }
 
       const narrative = narratives.join("\n\n");
-      const finalAssessment = assessWorkspaceEvidence(toolCalls, intentText);
+      const finalAssessment = assessWorkspaceEvidence(
+        toolCalls,
+        intentText,
+        this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd(),
+      );
       if (requiresWorkspaceEvidence && !finalAssessment.sufficient) {
         const failure = evidenceFailure(finalAssessment);
         onStateChange({ stage: "executor", status: "failed", output: failure.message });
@@ -1930,7 +1938,11 @@ export class PipelineExecutor {
       return { state, effectGate, partialStage, replanRequested };
     }
 
-    const preSynthAssessment = assessWorkspaceEvidence(state.executor?.toolCalls, intentText);
+    const preSynthAssessment = assessWorkspaceEvidence(
+      state.executor?.toolCalls,
+      intentText,
+      this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd(),
+    );
     if (requiresWorkspaceEvidence && !preSynthAssessment.sufficient) {
       const failure = evidenceFailure(preSynthAssessment);
       // T2.4: evidence fence failure requests replan (first occurrence).
@@ -2003,7 +2015,11 @@ export class PipelineExecutor {
     // callers that omit the synthesizer stage. The normal activation boundary
     // always appends a synthesizer, but PipelineExecutor is also reused by tests
     // and replan slices and must not return a planner sentinel as a repo answer.
-    const executeAssessment = assessWorkspaceEvidence(state.executor?.toolCalls, options.rawMessage ?? request);
+    const executeAssessment = assessWorkspaceEvidence(
+      state.executor?.toolCalls,
+      options.rawMessage ?? request,
+      this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd(),
+    );
     if (requiresWorkspaceEvidence && !executeAssessment.sufficient) {
       const failure = evidenceFailure(executeAssessment);
       return {

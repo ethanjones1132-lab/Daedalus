@@ -39,7 +39,7 @@ const SOURCE_FILE_EXTENSIONS = new Set([
 const SHALLOW_EVIDENCE_TOOLS = new Set(["read_file", "grep", "git_metadata"]);
 const LISTING_TOOLS = new Set(["list_directory", "glob"]);
 
-/** Distinct (tool, arguments) key so re-calling the same read repeatedly counts once. */
+/** Distinct tool-target key so re-calling the same read repeatedly counts once. */
 function distinctTargetKeys(calls: ToolCallRecord[], tools: Set<string>): Set<string> {
   const keys = new Set<string>();
   for (const call of calls) {
@@ -70,66 +70,70 @@ function normalizePath(rawPath: string): { path: string; absolute: boolean } {
   return { path: `${prefix}${segments.join("/")}`.toLowerCase(), absolute };
 }
 
-function sourceFilePath(rawPath: string): { path: string; absolute: boolean } | undefined {
+function sourceFileKey(rawPath: string, workspaceRoot?: string): string | undefined {
   const normalized = normalizePath(rawPath);
-  const normalizedPath = normalized.path;
+  let normalizedPath = normalized.path;
+  let absolute = normalized.absolute;
+  if (workspaceRoot) {
+    const root = normalizePath(workspaceRoot);
+    const rootPath = root.path.replace(/\/+$/, "");
+    if (!absolute) {
+      normalizedPath = normalizePath(`${rootPath}/${normalizedPath}`).path;
+      absolute = true;
+    }
+    if (normalizedPath === rootPath || normalizedPath.startsWith(`${rootPath}/`)) {
+      normalizedPath = normalizedPath.slice(rootPath.length).replace(/^\/+/, "");
+      absolute = false;
+    }
+  }
   const basename = normalizedPath.split("/").pop()?.toLowerCase() ?? "";
   const extensionStart = basename.lastIndexOf(".");
   if (extensionStart <= 0 || !SOURCE_FILE_EXTENSIONS.has(basename.slice(extensionStart))) return undefined;
-  return normalized;
+  return `${absolute ? "abs:" : "rel:"}${normalizedPath}`;
 }
 
-function grepOutputSourceFileKeys(output: string): Set<string> {
+function grepOutputSourceFileKeys(call: ToolCallRecord, workspaceRoot?: string): Set<string> {
+  const args = call.arguments as Record<string, unknown> | undefined;
+  const grepPath = typeof args?.path === "string" ? args.path : undefined;
+  const grepPathIsFile = grepPath ? sourceFileKey(grepPath, workspaceRoot) !== undefined : false;
   const keys = new Set<string>();
-  for (const token of output.split(/\s+/)) {
+  for (const token of call.output.split(/\s+/)) {
     const candidate = token
       .replace(/^[([{\"'`]+/g, "")
       .replace(/[,:;"'`]+$/g, "")
       .replace(/:\d+(?::\d+)?$/, "");
-    const key = sourceFilePath(candidate);
-    if (key) keys.add(`${key.absolute ? "abs:" : "rel:"}${key.path}`);
+    const normalizedCandidate = normalizePath(candidate);
+    const candidateHasDirectory = normalizedCandidate.path.includes("/");
+    const rawCandidate = grepPath
+      && !grepPathIsFile
+      && !normalizedCandidate.absolute
+      && !candidateHasDirectory
+      && !/[?*[]/.test(grepPath)
+      ? `${grepPath.replace(/[\\/]+$/, "")}/${candidate}`
+      : candidate;
+    const key = sourceFileKey(rawCandidate, workspaceRoot);
+    if (key) keys.add(key);
   }
   return keys;
 }
 
-function sourceContentTargetKeys(call: ToolCallRecord): Set<string> {
+function sourceContentTargetKeys(call: ToolCallRecord, workspaceRoot?: string): Set<string> {
   if (call.name === "read_file") {
     const args = call.arguments as Record<string, unknown> | undefined;
-    const key = typeof args?.path === "string" ? sourceFilePath(args.path) : undefined;
-    return key ? new Set([`${key.absolute ? "abs:" : "rel:"}${key.path}`]) : new Set();
+    const key = typeof args?.path === "string" ? sourceFileKey(args.path, workspaceRoot) : undefined;
+    return key ? new Set([key]) : new Set();
   }
-  return call.name === "grep" ? grepOutputSourceFileKeys(call.output) : new Set();
+  return call.name === "grep" ? grepOutputSourceFileKeys(call, workspaceRoot) : new Set();
 }
 
-function distinctDeepReadTargetKeys(calls: ToolCallRecord[]): Set<string> {
+function distinctDeepReadTargetKeys(calls: ToolCallRecord[], workspaceRoot?: string): Set<string> {
   const paths = new Set<string>();
   for (const call of calls) {
     if (DEEP_READ_CONTENT_TOOLS.has(call.name)) {
-      for (const key of sourceContentTargetKeys(call)) paths.add(key);
+      for (const key of sourceContentTargetKeys(call, workspaceRoot)) paths.add(key);
     }
   }
-
-  // A model may use a relative target while deterministic preflight uses an
-  // absolute target for the same file. Reconcile those forms when the
-  // absolute path ends at the normalized relative path; otherwise retain the
-  // absolute key so two unrelated same-named files remain distinct.
-  const relativePaths = [...paths]
-    .filter((key) => key.startsWith("rel:"))
-    .map((key) => key.slice(4))
-    .sort((a, b) => b.length - a.length);
-  const canonical = new Set<string>();
-  for (const key of paths) {
-    if (!key.startsWith("abs:")) {
-      canonical.add(key.slice(4));
-      continue;
-    }
-    const absolutePath = key.slice(4);
-    const relativeAlias = relativePaths.find((relativePath) =>
-      absolutePath === relativePath || absolutePath.endsWith(`/${relativePath}`),
-    );
-    canonical.add(relativeAlias ?? absolutePath);
-  }
-  return canonical;
+  return paths;
 }
 
 /**
@@ -180,6 +184,7 @@ export function turnNeedsWorkspaceEvidence(
 export function assessWorkspaceEvidence(
   toolCalls: ToolCallRecord[] | undefined,
   request: string,
+  workspaceRoot?: string,
 ): EvidenceAssessment {
   const calls = (toolCalls ?? []).filter(
     (c) => !c.is_error && c.output.trim().length > 0 && !isDuplicateToolDeflection(c),
@@ -190,7 +195,7 @@ export function assessWorkspaceEvidence(
   if (deepRead) {
     // Deep-read floor: only genuine file-content reads count, deduped by
     // (tool, arguments) so reading the same file 3 times can't fake it.
-    const distinctContentReads = distinctDeepReadTargetKeys(calls).size;
+    const distinctContentReads = distinctDeepReadTargetKeys(calls, workspaceRoot).size;
     const sufficient = distinctContentReads >= DEEP_READ_MIN_CONTENT_READS;
     return {
       sufficient,

@@ -185,9 +185,40 @@ describe("assessWorkspaceEvidence", () => {
     const a = assessWorkspaceEvidence(
       [read("src/a.ts"), read("./src/../src/a.ts"), read("C:/repo/src/a.ts")],
       "comprehensively diagnose the architecture of this repo",
+      "C:/repo",
     );
     expect(a.sufficient).toBe(false);
     expect(a.contentReads).toBe(1);
+  });
+
+  test("grep output relative to its directory shares the read_file target", () => {
+    const a = assessWorkspaceEvidence(
+      [
+        read("src/a.ts"),
+        {
+          name: "grep",
+          arguments: { pattern: "TODO", path: "src" },
+          output: "a.ts:1: matching line",
+          is_error: false,
+          duration_ms: 8,
+        },
+        read("src/b.ts"),
+      ],
+      "comprehensively diagnose the architecture of this repo",
+      "C:/repo",
+    );
+    expect(a.sufficient).toBe(false);
+    expect(a.contentReads).toBe(2);
+  });
+
+  test("workspace-root normalization does not collapse same-suffix files from another root", () => {
+    const a = assessWorkspaceEvidence(
+      [read("C:/repo/src/a.ts"), read("D:/other/src/a.ts"), read("C:/repo/src/b.ts")],
+      "comprehensively diagnose the architecture of this repo",
+      "C:/repo",
+    );
+    expect(a.sufficient).toBe(true);
+    expect(a.contentReads).toBe(3);
   });
 
   test("manifests and overview files do not satisfy the deep-read source floor", () => {
