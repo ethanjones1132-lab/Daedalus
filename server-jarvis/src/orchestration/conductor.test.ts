@@ -20,6 +20,116 @@ function makeConductor(overrides?: Partial<{
 }
 
 describe("LiveConductor", () => {
+  test("supervisor message includes evidence-rich executor digest", async () => {
+    const supervisorMessages: any[][] = [];
+    const { conductor } = makeConductor({}, async (messages) => {
+      supervisorMessages.push(messages);
+      return { content: '{"directive":"continue"}' };
+    });
+    conductor.setContext("general", "high", "run-evidence-digest");
+
+    const longRequest = `What version is in package.json? ${"x".repeat(400)}`;
+    const directive = await conductor.afterStage("executor", "completed", "executor narrative", ["synthesizer"], {
+      request: longRequest,
+      workerInstruction: "Read package metadata and report the version.",
+      toolCalls: [
+        {
+          name: "read_file",
+          arguments: { path: "package.json" },
+          output: '{"version":"1.2.3"}',
+          is_error: false,
+          duration_ms: 12,
+        },
+        {
+          name: "read_file",
+          arguments: { path: "README.md" },
+          output: "# Readme",
+          is_error: false,
+          duration_ms: 8,
+        },
+        {
+          name: "grep",
+          arguments: { pattern: "missing" },
+          output: "Error: no matches",
+          is_error: true,
+          duration_ms: 4,
+        },
+      ],
+    });
+
+    expect(directive).toEqual({ type: "continue" });
+    expect(supervisorMessages).toHaveLength(1);
+    const userContent = supervisorMessages[0][1].content;
+    expect(userContent).toContain("Tool call counts: grep=1, read_file=2");
+    expect(userContent).toContain("Tool error count: 1");
+    expect(userContent).toContain("Recent tool errors: grep: Error: no matches");
+    expect(userContent).toContain('"sufficient":true');
+    expect(userContent).toContain('"deepRead":false');
+    expect(userContent).toContain("Request (300 chars): What version is in package.json?");
+    expect(userContent).not.toContain("x".repeat(320));
+    expect(userContent).toContain("Worker instruction: Read package metadata and report the version.");
+  });
+
+  test("deterministically re-enters executor once for completed deep-read stages with insufficient evidence", async () => {
+    let modelCalls = 0;
+    const { conductor } = makeConductor({}, async () => {
+      modelCalls += 1;
+      return { content: '{"directive":"continue"}' };
+    });
+    conductor.setContext("general", "high", "run-deep-read-reroute");
+
+    const insufficientEvidence = {
+      request: "Comprehensively audit this repository architecture.",
+      workerInstruction: "Read enough source files before summarizing.",
+      toolCalls: [
+        {
+          name: "list_directory",
+          arguments: { path: "." },
+          output: "src\npackage.json\nREADME.md",
+          is_error: false,
+          duration_ms: 10,
+        },
+      ],
+    };
+
+    const first = await conductor.afterStage(
+      "executor",
+      "completed",
+      "I looked at the repo.",
+      ["reviewer", "synthesizer"],
+      insufficientEvidence,
+    );
+
+    expect(modelCalls).toBe(0);
+    expect(first.type).toBe("reroute");
+    if (first.type === "reroute") {
+      expect(first.newRemaining).toEqual(["re-enter:executor", "reviewer", "synthesizer"]);
+      expect(first.reason).toContain("deep-read evidence insufficient");
+    }
+
+    const second = await conductor.afterStage(
+      "executor",
+      "completed",
+      "Still not enough.",
+      ["reviewer", "synthesizer"],
+      insufficientEvidence,
+    );
+
+    expect(second).toEqual({ type: "continue" });
+    expect(modelCalls).toBe(1);
+
+    conductor.setContext("general", "high", "run-deep-read-reroute-reset");
+    const afterReset = await conductor.afterStage(
+      "executor",
+      "completed",
+      "Still not enough.",
+      ["synthesizer"],
+      insufficientEvidence,
+    );
+    expect(modelCalls).toBe(1);
+    expect(afterReset.type).toBe("reroute");
+  });
+
   test("actively supervises a healthy medium/high-complexity stage when work remains", async () => {
     let modelCalled = false;
     const { conductor } = makeConductor({}, async () => {
@@ -116,6 +226,13 @@ describe("LiveConductor", () => {
       throw new Error("model unavailable");
     });
     conductor.setContext("general", "high", "run-5");
+    const dir = await conductor.afterStage("planner", "completed", "plan", ["executor"]);
+    expect(dir).toEqual({ type: "continue" });
+  });
+
+  test("malformed supervisor response returns continue", async () => {
+    const { conductor } = makeConductor({}, async () => ({ content: "not-json" }));
+    conductor.setContext("general", "high", "run-parse-failure");
     const dir = await conductor.afterStage("planner", "completed", "plan", ["executor"]);
     expect(dir).toEqual({ type: "continue" });
   });

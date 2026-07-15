@@ -4,12 +4,26 @@ import { extractJson } from "./json";
 import type { CallModelFn } from "./coordinator";
 import { AgentPool } from "./agent-pool";
 import type { StageName } from "./coordinator";
+import type { EvidenceAssessment } from "./evidence-sufficiency";
+import { assessWorkspaceEvidence, isDeepReadRequest } from "./evidence-sufficiency";
+import type { ToolCallRecord } from "./stage-output";
+
+export interface ConductorStageEvidence {
+  toolCalls?: ToolCallRecord[];
+  request?: string;
+  workerInstruction?: string;
+}
 
 interface SupervisionDigest {
   stage: StageName;
   outcome: "completed" | "failed";
   outputSummary: string;  // first 500 chars of stage output or error
   recentToolErrors: string[];  // last N isError tool results
+  toolCallCounts: Record<string, number>;
+  toolErrorCount: number;
+  evidenceAssessment: EvidenceAssessment;
+  requestSummary: string;
+  workerInstruction: string;
   remainingQueue: StageName[];
 }
 
@@ -32,6 +46,7 @@ export class LiveConductor {
   private consecutiveToolErrors = 0;
   private recentToolErrors: string[] = [];
   private runId = "";
+  private deepReadEvidenceRerouteUsed = false;
 
   constructor(
     private callModel: CallModelFn,
@@ -49,6 +64,7 @@ export class LiveConductor {
   setContext(taskType: string, complexity: "low" | "medium" | "high", runId: string): void {
     this.taskType = taskType;
     this.runId = runId;
+    this.deepReadEvidenceRerouteUsed = false;
     this.supervision = !this.cfg.supervise_low_complexity && complexity === "low" ? "off" : "on";
   }
 
@@ -69,7 +85,8 @@ export class LiveConductor {
     stage: StageName,
     outcome: "completed" | "failed",
     output: string,
-    remainingQueue: StageName[]
+    remainingQueue: StageName[],
+    evidence: ConductorStageEvidence = {},
   ): Promise<ConductorDirective> {
     try {
       // Cheap heuristic pre-filter: if tool errors hit threshold, reroute immediately
@@ -84,6 +101,23 @@ export class LiveConductor {
         };
       }
 
+      const evidenceAssessment = assessWorkspaceEvidence(evidence.toolCalls, evidence.request ?? "");
+      if (
+        stage === "executor" &&
+        outcome === "completed" &&
+        evidence.request &&
+        isDeepReadRequest(evidence.request) &&
+        !evidenceAssessment.sufficient &&
+        !this.deepReadEvidenceRerouteUsed
+      ) {
+        this.deepReadEvidenceRerouteUsed = true;
+        return {
+          type: "reroute",
+          newRemaining: ["re-enter:executor" as StageName, ...remainingQueue],
+          reason: `deep-read evidence insufficient after completed executor stage: ${evidenceAssessment.reason}; re-entering executor once before continuing`,
+        };
+      }
+
       if (!shouldSuperviseStage({
         supervisionEnabled: this.supervision === "on",
         outcome,
@@ -95,7 +129,16 @@ export class LiveConductor {
         stage,
         outcome,
         outputSummary: output.slice(0, 500),
-        recentToolErrors: [...this.recentToolErrors],
+        recentToolErrors: recentToolErrorsFromEvidence(evidence.toolCalls).length > 0
+          ? recentToolErrorsFromEvidence(evidence.toolCalls)
+          : [...this.recentToolErrors],
+        toolCallCounts: toolCallCountsByName(evidence.toolCalls),
+        toolErrorCount: evidence.toolCalls
+          ? evidence.toolCalls.filter((call) => call.is_error).length
+          : this.recentToolErrors.length,
+        evidenceAssessment,
+        requestSummary: (evidence.request ?? "").slice(0, 300),
+        workerInstruction: evidence.workerInstruction ?? "",
         remainingQueue,
       };
 
@@ -114,9 +157,14 @@ export class LiveConductor {
       const userContent = [
         `Stage: ${digest.stage} — ${digest.outcome}`,
         `Output summary: ${digest.outputSummary || "(empty)"}`,
+        `Tool call counts: ${formatToolCallCounts(digest.toolCallCounts)}`,
+        `Tool error count: ${digest.toolErrorCount}`,
         digest.recentToolErrors.length > 0
           ? `Recent tool errors: ${digest.recentToolErrors.join("; ")}`
           : "Recent tool errors: none",
+        `Evidence assessment: ${JSON.stringify(digest.evidenceAssessment)}`,
+        `Request (300 chars): ${digest.requestSummary || "(not provided)"}`,
+        `Worker instruction: ${digest.workerInstruction || "(not provided)"}`,
         `Remaining queue: ${digest.remainingQueue.length > 0 ? digest.remainingQueue.join(" → ") : "(none)"}`,
       ].join("\n");
 
@@ -195,4 +243,25 @@ export class LiveConductor {
       return { type: "continue" };
     }
   }
+}
+
+function toolCallCountsByName(toolCalls: ToolCallRecord[] | undefined): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const call of toolCalls ?? []) {
+    counts[call.name] = (counts[call.name] ?? 0) + 1;
+  }
+  return Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+function formatToolCallCounts(counts: Record<string, number>): string {
+  const entries = Object.entries(counts);
+  if (entries.length === 0) return "none";
+  return entries.map(([name, count]) => `${name}=${count}`).join(", ");
+}
+
+function recentToolErrorsFromEvidence(toolCalls: ToolCallRecord[] | undefined): string[] {
+  return (toolCalls ?? [])
+    .filter((call) => call.is_error)
+    .map((call) => `${call.name}: ${(call.output || "").slice(0, 240)}`)
+    .slice(-3);
 }

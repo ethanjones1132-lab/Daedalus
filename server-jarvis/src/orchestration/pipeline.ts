@@ -10,7 +10,7 @@ import { outcomeCollector } from "../self-tuning/mod";
 import type { StageRun } from "../self-tuning/store";
 import { countTokens } from "../tokens";
 import type { ConductorBus, ConductorDirective } from "./conductor-bus";
-import type { LiveConductor } from "./conductor";
+import type { ConductorStageEvidence, LiveConductor } from "./conductor";
 import { buildSynthesizerContext, buildSynthesizerContextFromStageState } from "./synth-context";
 import { detectDeferralStall, DEFERRAL_STALL_NUDGE } from "./synthesizer-deferral";
 import { applyEffectGate, evaluateEffectGate, WRITE_EFFECT_TOOLS, type EffectGateReport } from "./effect-gate";
@@ -474,13 +474,14 @@ export class PipelineExecutor {
       reroutesApplied?: { n: number };
     },
     remainingQueue: StageName[],
+    evidence?: ConductorStageEvidence,
   ): Promise<ConductorDirective | null> {
     if (!this.conductor) return null;
     let directive: ConductorDirective;
     try {
       // The executor owns the real stage ordering; pass the actual remaining
       // queue so the conductor can avoid work when a stage completed cleanly.
-      directive = await this.conductor.live.afterStage(stage, outcome, output, remainingQueue);
+      directive = await this.conductor.live.afterStage(stage, outcome, output, remainingQueue, evidence);
     } catch {
       return null;
     }
@@ -747,6 +748,11 @@ export class PipelineExecutor {
     const requiresWorkspaceEvidence = turnNeedsWorkspaceEvidence(options.turnRequirement, intentText);
     const deepReadRequest = isDeepReadRequest(intentText);
     const executorPrompt = stageSystemPrompt("executor", options);
+    const executorEvidence = (): ConductorStageEvidence => ({
+      toolCalls,
+      request: options.rawMessage ?? request,
+      workerInstruction: options.workerInstructions?.executor,
+    });
     const executorMessages: ChatMessage[] = [
       { role: "system", content: executorPrompt },
       { role: "user", content: `User Request: ${request}\n\nPlan:\n${planSummary}` }
@@ -1086,6 +1092,15 @@ export class PipelineExecutor {
       if (requiresWorkspaceEvidence && !finalAssessment.sufficient) {
         const failure = evidenceFailure(finalAssessment);
         onStateChange({ stage: "executor", status: "failed", output: failure.message });
+        await this.afterConductorStage(
+          "executor",
+          "completed",
+          narrative || failure.message,
+          agentRunId,
+          options,
+          remainingQueue,
+          executorEvidence(),
+        );
         return { ok: false, narrative: failure.message, toolCalls };
       }
       if (!executorDone) {
@@ -1106,6 +1121,7 @@ export class PipelineExecutor {
           agentRunId,
           options,
           remainingQueue,
+          executorEvidence(),
         );
         return {
           ok: false,
@@ -1116,12 +1132,12 @@ export class PipelineExecutor {
         };
       }
       onStateChange({ stage: "executor", status: "completed", output: narrative });
-      await this.afterConductorStage("executor", "completed", narrative, agentRunId, options, remainingQueue);
+      await this.afterConductorStage("executor", "completed", narrative, agentRunId, options, remainingQueue, executorEvidence());
       return { ok: true, narrative, toolCalls };
     } catch (e: any) {
       const message = errText(e);
       onStateChange({ stage: "executor", status: "failed", output: message });
-      await this.afterConductorStage("executor", "failed", message, agentRunId, options, remainingQueue);
+      await this.afterConductorStage("executor", "failed", message, agentRunId, options, remainingQueue, executorEvidence());
       return { ok: false, narrative: `Executor failed: ${message}`, toolCalls };
     }
   }
