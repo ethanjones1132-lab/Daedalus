@@ -2759,37 +2759,35 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           },
         };
 
-        // Check the RAW route, not `executablePipeline` — normalizeRoute strips
-        // conductor_replan markers before building the executable stage list,
-        // so executablePipeline never contains it and checking that instead
-        // would make this branch permanently unreachable.
+        // T2.4: route ALL orchestrator turns through runPipelineWithReplanning.
+        // Trigger-free turns take the first-iteration no-op path: normalize →
+        // executeSegment → finalize. Pre-declaration gate removed so mid-run
+        // triggers (evidence / executor / reviewer) can fire.
         let pipelineResult;
         try {
-          pipelineResult = route.pipeline.includes("conductor_replan")
-            ? await runPipelineWithReplanning({
-                contextMessage,
-                initialDecision: route,
-                turnRequirement: turnReq.requirement,
-                coordinator,
-                routeOptions: {
-                  sessionId,
-                  rawMessage: message,
-                  history: turnHistory,
-                  lastOutcome: sessionMemory.getLastOutcome(sessionId),
-                  sessionMemoryHints: memoryHints,
-                },
-                executor,
-                agentRunId,
-                onStateChange: onOrchestratorStateChange,
-                baseOptions: pipelineOptions,
-                maxReplans: cfg.orchestrator.max_conductor_replans,
-                // B-04: hand the per-session counter the session id so the
-                // loop can enforce the per-session cap and persist a
-                // `replan_events` row per re-invocation.
-                sessionCounter: replanCounter,
-                sessionId,
-              })
-            : await executor.execute(contextMessage, executablePipeline, agentRunId, onOrchestratorStateChange, pipelineOptions);
+          pipelineResult = await runPipelineWithReplanning({
+            contextMessage,
+            initialDecision: route,
+            turnRequirement: turnReq.requirement,
+            coordinator,
+            routeOptions: {
+              sessionId,
+              rawMessage: message,
+              history: turnHistory,
+              lastOutcome: sessionMemory.getLastOutcome(sessionId),
+              sessionMemoryHints: memoryHints,
+            },
+            executor,
+            agentRunId,
+            onStateChange: onOrchestratorStateChange,
+            baseOptions: pipelineOptions,
+            maxReplans: cfg.orchestrator.max_conductor_replans,
+            // B-04: hand the per-session counter the session id so the
+            // loop can enforce the per-session cap and persist a
+            // `replan_events` row per re-invocation.
+            sessionCounter: replanCounter,
+            sessionId,
+          });
         } finally {
           // Always tear down the request-scoped conductor wiring so subscribers
           // and abort handles cannot leak across turns/requests.

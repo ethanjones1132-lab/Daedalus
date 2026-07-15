@@ -20,6 +20,31 @@ describe("resolveStagePrompt", () => {
     expect(hashInstruction("a")).not.toBe(hashInstruction("b"));
   });
 
+  // T2.3
+  test("renders injected mid-run notes as Conductor mid-run note block", () => {
+    const merged = resolveStagePrompt(
+      "executor",
+      "BASE",
+      undefined,
+      undefined,
+      undefined,
+      ["read tests first", "prefer small diffs"],
+    );
+    expect(merged).toContain("Conductor mid-run note:");
+    expect(merged).toContain("read tests first");
+    expect(merged).toContain("prefer small diffs");
+    expect(merged).toContain("BASE");
+  });
+
+  test("caps injected notes at 3 and 600 chars each", () => {
+    const long = "x".repeat(800);
+    const merged = resolveStagePrompt("executor", "BASE", undefined, undefined, undefined, [
+      long, "b", "c", "d",
+    ]);
+    expect(merged.match(/- /g)?.length).toBe(3);
+    expect(merged).not.toContain("x".repeat(601));
+  });
+
   test("injects shared context blocks into customized prompts", () => {
     const merged = resolveStagePrompt(
       "synthesizer",

@@ -71,18 +71,28 @@ export function resolveStagePrompt(
   workerInstructions?: WorkerInstructions,
   sharedContext?: SharedContextHints,
   distilledSkillsBlock?: string,
+  /** T2.3: mid-run conductor notes (cap 600 chars each, max 3, append-never-replace). */
+  injectedNotes?: string[],
 ): string {
   const custom = workerInstructions?.[stage]?.trim();
   const sharedBlock = formatSharedContext(sharedContext);
   const skills = distilledSkillsBlock?.trim();
+  const notes = (injectedNotes ?? [])
+    .map((n) => n.trim().slice(0, 600))
+    .filter(Boolean)
+    .slice(0, 3);
+  const notesBlock = notes.length
+    ? "Conductor mid-run note:\n" + notes.map((n) => `- ${n}`).join("\n")
+    : "";
 
-  if (!custom && !skills && !sharedBlock) return basePrompt;
+  if (!custom && !skills && !sharedBlock && !notesBlock) return basePrompt;
 
   return [
     custom ? "Conductor instructions for this request:" : "",
     custom ?? "",
     skills,
     sharedBlock,
+    notesBlock,
     "Stage baseline contract (always applies):",
     basePrompt,
   ].filter(Boolean).join("\n\n");

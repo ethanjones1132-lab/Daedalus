@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { buildShortCircuitRoute, normalizeRoute } from "./route-normalization";
+import { buildDeterministicRoute, buildShortCircuitRoute, normalizeRemainingStages, normalizeRoute } from "./route-normalization";
 import type { CoordinatorResult } from "./coordinator";
 
 function decision(pipeline: CoordinatorResult["pipeline"], topology: CoordinatorResult["topology"] = "linear"): CoordinatorResult {
@@ -26,6 +26,42 @@ describe("buildShortCircuitRoute", () => {
       coordinator_rationale: "Deterministic simple-turn short circuit: direct synthesizer answer.",
       conductor_source: "trivial",
     });
+  });
+});
+
+describe("buildDeterministicRoute (T1.2)", () => {
+  test("workspace_read produces executor+synthesizer read-only after normalize", () => {
+    const r = buildDeterministicRoute("workspace_read");
+    expect(r.pipeline).toEqual(["executor", "synthesizer"]);
+    expect(r.conductor_source).toBe("deterministic");
+    const n = normalizeRoute(r, "workspace_read", "deterministic");
+    expect(n.pipeline).toEqual(["executor", "synthesizer"]);
+    expect(n.profile).toBe("read_only");
+  });
+});
+
+describe("normalizeRemainingStages (T2.2)", () => {
+  test("accepts a valid remaining queue", () => {
+    expect(normalizeRemainingStages(["executor", "synthesizer"], "workspace_read", "planner"))
+      .toEqual(["executor", "synthesizer"]);
+  });
+
+  test("rejects empty remaining", () => {
+    expect(normalizeRemainingStages([], "workspace_read", "executor")).toBeNull();
+  });
+
+  test("strips escalation stages on workspace_read", () => {
+    expect(normalizeRemainingStages(["rewriter", "synthesizer"], "workspace_read", "executor"))
+      .toEqual(["synthesizer"]);
+  });
+
+  test("maps re-enter and keeps required stages for full_execution", () => {
+    const r = normalizeRemainingStages(
+      ["re-enter:executor", "conductor_replan", "synthesizer"],
+      "full_execution",
+      "planner",
+    );
+    expect(r).toEqual(["executor", "reviewer", "synthesizer"]);
   });
 });
 

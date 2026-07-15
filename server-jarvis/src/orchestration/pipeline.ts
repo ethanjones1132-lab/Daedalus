@@ -14,7 +14,7 @@ import type { LiveConductor } from "./conductor";
 import { buildSynthesizerContext, buildSynthesizerContextFromStageState } from "./synth-context";
 import { detectDeferralStall, DEFERRAL_STALL_NUDGE } from "./synthesizer-deferral";
 import { applyEffectGate, evaluateEffectGate, WRITE_EFFECT_TOOLS, type EffectGateReport } from "./effect-gate";
-import type { ExecutionProfile } from "./route-normalization";
+import { normalizeRemainingStages, type ExecutionProfile } from "./route-normalization";
 import { hasWriteIntent, type TurnRequirement } from "./turn-requirements";
 import type { TurnBudget } from "./turn-budget";
 import type { PipelineStageState, PlannerStageOutput, ExecutorStageOutput, ReviewerStageOutput, RewriterStageOutput, ToolCallRecord } from "./stage-output";
@@ -274,6 +274,8 @@ export interface PipelineResult {
    * topology that has no ToolCallRecord[] to report).
    */
   toolCalls?: ToolCallRecord[];
+  /** T2.5: recursive critique asked for conductor replan. */
+  replanRequested?: PipelineSegmentResult["replanRequested"];
 }
 
 /**
@@ -292,6 +294,14 @@ export interface PipelineSegmentResult {
   synthesizerEmptyCompletion?: boolean;
   effectGate?: EffectGateReport;
   partialStage?: { stage: StageName; errorCode: string };
+  /**
+   * T2.4: mid-run replan request. When set, the replan-loop wrapper should
+   * re-route via the conductor (if caps allow) instead of synthesizing.
+   */
+  replanRequested?: {
+    trigger: "reviewer_reject" | "evidence_insufficient" | "executor_hard_failure" | "recursive_critique";
+    detail: string;
+  };
 }
 
 /**
@@ -356,17 +366,19 @@ export function describePipelineError(raw: string): string {
 
 function stageSystemPrompt(
   stage: StageName,
-  options: PipelineExecuteOptions,
+  options: PipelineExecuteOptions & { pendingInjections?: Map<StageName, string[]> },
 ): string {
   const skillsBlock = stage === "planner" || stage === "executor"
     ? options.distilledSkillsBlock
     : undefined;
+  const injectedNotes = options.pendingInjections?.get(stage);
   return resolveStagePrompt(
     stage,
     loadPrompt(stagePromptFile(stage)),
     options.workerInstructions,
     options.sharedContext,
     skillsBlock,
+    injectedNotes,
   );
 }
 
@@ -408,27 +420,67 @@ export class PipelineExecutor {
     });
   }
 
+  /**
+   * Run live-conductor afterStage and apply abort / inject / reroute effects.
+   * T2.2/T2.3: returns the directive so executeSegment can mutate its work queue
+   * and pendingInjections. Still fires onDirective + audit for UI/telemetry.
+   */
   private async afterConductorStage(
     stage: StageName,
     outcome: "completed" | "failed",
     output: string,
     agentRunId: string,
-    options: PipelineExecuteOptions,
+    options: PipelineExecuteOptions & {
+      pendingInjections?: Map<StageName, string[]>;
+      /** Mutable remaining work queue for T2.2 reroute application. */
+      workQueue?: StageName[];
+      /** Reroute apply counter; max 1 per segment. */
+      reroutesApplied?: { n: number };
+    },
     remainingQueue: StageName[],
-  ): Promise<void> {
-    if (!this.conductor) return;
+  ): Promise<ConductorDirective | null> {
+    if (!this.conductor) return null;
     let directive: ConductorDirective;
     try {
       // The executor owns the real stage ordering; pass the actual remaining
       // queue so the conductor can avoid work when a stage completed cleanly.
       directive = await this.conductor.live.afterStage(stage, outcome, output, remainingQueue);
     } catch {
-      return;
+      return null;
     }
 
     if (directive.type === "abort_stage") {
       this.conductor.bus.resolveAbort(directive.stage);
     }
+
+    // T2.3: apply inject_context into request-scoped pendingInjections.
+    if (directive.type === "inject_context" && options.pendingInjections) {
+      const list = options.pendingInjections.get(directive.forStage) ?? [];
+      if (list.length < 3) {
+        list.push(directive.note.slice(0, 600));
+        options.pendingInjections.set(directive.forStage, list);
+      }
+    }
+
+    // T2.2: apply reroute to the mutable work queue (at most once per segment).
+    if (directive.type === "reroute" && options.workQueue) {
+      const applied = options.reroutesApplied?.n ?? 0;
+      if (applied >= 1) {
+        console.warn(`[Pipeline] second reroute ignored after ${stage}`);
+      } else {
+        const requirement = options.turnRequirement ?? "full_execution";
+        const normalized = normalizeRemainingStages(directive.newRemaining, requirement, stage);
+        if (normalized) {
+          options.workQueue.length = 0;
+          options.workQueue.push(...normalized);
+          if (options.reroutesApplied) options.reroutesApplied.n += 1;
+          console.log(`[Pipeline] reroute applied after ${stage}: ${normalized.join("->")}`);
+        } else {
+          console.warn(`[Pipeline] reroute rejected after ${stage}: empty/invalid remaining`);
+        }
+      }
+    }
+
     if (directive.type !== "continue") {
       await options.onDirective?.(directive, stage);
     }
@@ -454,6 +506,7 @@ export class PipelineExecutor {
       inject_note: directive.type === "inject_context" ? directive.note : undefined,
       inject_for_stage: directive.type === "inject_context" ? directive.forStage : undefined,
     });
+    return directive;
   }
 
   /**
@@ -1418,31 +1471,100 @@ export class PipelineExecutor {
     const state: PipelineStageState = { ...carry };
     const profile: ExecutionProfile = options.executionProfile ?? "full";
     const intentText = options.rawMessage ?? request;
-    const remainingQueueFor = (stage: StageName): StageName[] => {
-      const index = stages.indexOf(stage);
-      return index < 0 ? [] : stages.slice(index + 1);
-    };
+    // T2.1: ordered work queue (behavior-preserving vs if-ladder; enables T2.2 reroute).
+    const workQueue: StageName[] = stages.filter(
+      (s): s is StageName =>
+        s === "planner" || s === "executor" || s === "reviewer" || s === "rewriter" || s === "synthesizer",
+    );
+    const wantsSynthesizer = stages.includes("synthesizer");
+    // After shift, workQueue is exactly the remaining stages.
+    const remainingNow = (): StageName[] => workQueue.slice();
     let partialStage: PipelineSegmentResult["partialStage"];
+    let replanRequested: PipelineSegmentResult["replanRequested"];
+    const pendingInjections = new Map<StageName, string[]>();
+    const reroutesApplied = { n: 0 };
+    const opts = {
+      ...options,
+      pendingInjections,
+      workQueue,
+      reroutesApplied,
+    };
 
-    if (stages.includes("planner")) {
-      state.plan = await this.runPlannerStage(request, agentRunId, onStateChange, options, remainingQueueFor("planner"));
-    }
-    if (stages.includes("executor")) {
-      state.executor = await this.runExecutorStage(
-        request, renderPlanSummary(state.plan), agentRunId, onStateChange, options, profile, remainingQueueFor("executor"),
-      );
-    }
-    if (stages.includes("reviewer")) {
-      const { reviewer, rewriter } = await this.runReviewerRewriterLoop(
-        request, renderPlanSummary(state.plan), renderExecutorSummary(state.executor), state.executor?.toolCalls ?? [],
-        agentRunId, onStateChange, options, profile,
-      );
-      state.reviewer = reviewer;
-      if (rewriter) {
-        state.rewriter = rewriter;
-        if (rewriter.terminalStatus === "timed_out") {
-          partialStage = { stage: "rewriter", errorCode: rewriter.errorCode ?? "stage_timeout" };
+    // Drain the queue. Synthesizer is a barrier: effect-gate + evidence fence
+    // run when we hit it (or after the queue drains if it was never present).
+    while (workQueue.length > 0) {
+      const stage = workQueue.shift()!;
+      if (stage === "planner") {
+        state.plan = await this.runPlannerStage(request, agentRunId, onStateChange, opts, remainingNow());
+        continue;
+      }
+      if (stage === "executor") {
+        state.executor = await this.runExecutorStage(
+          request, renderPlanSummary(state.plan), agentRunId, onStateChange, opts, profile, remainingNow(),
+        );
+        // T2.4: hard executor failure (non-workspace_read) → replan pre-synthesizer.
+        // workspace_read falls through to the evidence fence for precise codes.
+        if (
+          state.executor &&
+          state.executor.ok === false &&
+          wantsSynthesizer &&
+          options.turnRequirement !== "workspace_read"
+        ) {
+          replanRequested = {
+            trigger: "executor_hard_failure",
+            detail: state.executor.narrative?.slice(0, 400) || "executor failed",
+          };
+          return { state, replanRequested, partialStage };
         }
+        continue;
+      }
+      if (stage === "reviewer") {
+        const { reviewer, rewriter } = await this.runReviewerRewriterLoop(
+          request, renderPlanSummary(state.plan), renderExecutorSummary(state.executor), state.executor?.toolCalls ?? [],
+          agentRunId, onStateChange, opts, profile,
+        );
+        state.reviewer = reviewer;
+        if (rewriter) {
+          state.rewriter = rewriter;
+          if (rewriter.terminalStatus === "timed_out") {
+            partialStage = { stage: "rewriter", errorCode: rewriter.errorCode ?? "stage_timeout" };
+          }
+        }
+        // T2.4: reviewer reject with repairs exhausted on a write-intent turn → replan.
+        // Read-intent turns legitimately skip the rewriter (see pipeline-context test)
+        // and must fall through to synthesizer.
+        if (
+          reviewer?.hasIssues &&
+          !rewriter &&
+          wantsSynthesizer &&
+          profile === "full" &&
+          hasWriteIntent(intentText) &&
+          (options.maxReviewRepairRounds ?? 1) > 0
+        ) {
+          replanRequested = {
+            trigger: "reviewer_reject",
+            detail: reviewer.feedback?.slice(0, 400) || "reviewer rejected",
+          };
+          return { state, replanRequested, partialStage };
+        }
+        continue;
+      }
+      if (stage === "rewriter") {
+        if (!state.rewriter && state.executor) {
+          state.rewriter = await this.runRewriterStage(
+            request,
+            "Standalone rewriter pass from queue.",
+            renderExecutorSummary(state.executor),
+            agentRunId,
+            onStateChange,
+            opts,
+            profile,
+          );
+        }
+        continue;
+      }
+      if (stage === "synthesizer") {
+        break; // effect-gate + evidence fence + synth below
       }
     }
 
@@ -1471,7 +1593,7 @@ export class PipelineExecutor {
         renderExecutorSummary(state.executor),
         agentRunId,
         onStateChange,
-        options,
+        opts,
         profile,
       );
       effectGate = evaluateEffectGate({
@@ -1485,13 +1607,18 @@ export class PipelineExecutor {
       }
     }
 
-    if (!stages.includes("synthesizer")) {
-      return { state, effectGate, partialStage };
+    if (!wantsSynthesizer) {
+      return { state, effectGate, partialStage, replanRequested };
     }
 
     const preSynthAssessment = assessWorkspaceEvidence(state.executor?.toolCalls, request);
     if (options.turnRequirement === "workspace_read" && !preSynthAssessment.sufficient) {
       const failure = evidenceFailure(preSynthAssessment);
+      // T2.4: evidence fence failure requests replan (first occurrence).
+      replanRequested = {
+        trigger: "evidence_insufficient",
+        detail: failure.message,
+      };
       return {
         state,
         synthesizerAnswer: "",
@@ -1500,6 +1627,7 @@ export class PipelineExecutor {
         fatalErrorCode: failure.code,
         effectGate,
         partialStage,
+        replanRequested,
       };
     }
 
@@ -1508,9 +1636,9 @@ export class PipelineExecutor {
       state,
       agentRunId,
       onStateChange,
-      options,
+      opts,
       effectGate.synthesizerNotice,
-      remainingQueueFor("synthesizer"),
+      [],
     );
     if (synth.partialErrorCode) {
       partialStage = { stage: "synthesizer", errorCode: synth.partialErrorCode };
@@ -1522,6 +1650,7 @@ export class PipelineExecutor {
       synthesizerEmptyCompletion: synth.emptyCompletion,
       effectGate,
       partialStage,
+      replanRequested,
     };
   }
 
@@ -2018,7 +2147,12 @@ export class PipelineExecutor {
       // current depth so the conductor's mid-pipeline replan can take over
       // without double-counting against `max_recursion_depth`.
       if (reenterStage === "conductor_replan") {
-        return result;
+        // T2.5: surface replan request; replan wrapper performs one iteration.
+        // Do NOT increment recursion depth (conductor max_replans is the cap).
+        return {
+          ...result,
+          replanRequested: { trigger: "recursive_critique", detail: decision.critique },
+        };
       }
 
       const rerun = await this.reenterForRecursion(
@@ -2119,10 +2253,11 @@ export class PipelineExecutor {
     nextDepth: number,
   ): Promise<PipelineResult> {
     if (reenterStage === "conductor_replan") {
-      // Surface a typed event so the SSE relay + UI can render the recurse
-      // decision, but do not run another recursion here — the conductor
-      // owns its own replan budget via `runPipelineWithReplanning`.
-      return result;
+      // T2.5: load-bearing signal for the replan wrapper.
+      return {
+        ...result,
+        replanRequested: { trigger: "recursive_critique", detail: critique },
+      };
     }
 
     const pipeline = reenterStage === "planner"

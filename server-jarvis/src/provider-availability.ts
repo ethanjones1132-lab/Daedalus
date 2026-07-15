@@ -23,9 +23,25 @@ export function isProviderAvailable(cfg: JarvisConfig, provider: RoutedProvider)
   }
 }
 
-/** Removes agent-pool entries that would only create a guaranteed failed hop. */
+/**
+ * Removes agent-pool entries that would only create a guaranteed failed hop.
+ * T3.4: also filters ollama/claude_cli pool agents (they were never served by
+ * resolveProviderTarget's HTTP path — previously silent OpenRouter retarget).
+ */
 export function routableOrchestratorAgents(cfg: JarvisConfig): OrchestratorAgent[] {
-  return (cfg.orchestrator?.agents ?? []).filter((agent) => isProviderAvailable(cfg, agent.provider));
+  const HTTP_ROUTABLE = new Set(["openrouter", "opencode_zen", "opencode_go"]);
+  return (cfg.orchestrator?.agents ?? []).filter((agent) => {
+    if (!HTTP_ROUTABLE.has(agent.provider)) {
+      if (agent.enabled !== false) {
+        console.warn(
+          `[providers] filtering unroutable pool agent id=${agent.id} provider=${agent.provider} ` +
+          `(only openrouter/opencode_zen/opencode_go are served over HTTP)`,
+        );
+      }
+      return false;
+    }
+    return isProviderAvailable(cfg, agent.provider);
+  });
 }
 
 /** Stable facts supplied to stages so they do not invent Jarvis's active runtime. */

@@ -131,6 +131,54 @@ const REQUIRED_STAGES: Record<TurnRequirement, StageName[]> = {
   full_execution: ["executor", "reviewer", "synthesizer"],
 };
 
+const VALID_STAGE_SET = new Set<StageName>(["planner", "executor", "reviewer", "rewriter", "synthesizer"]);
+
+/**
+ * T2.2: pure normalizer for mid-run reroute directives.
+ * Non-escalation (workspace_read never gains rewriter), keep unrun REQUIRED_STAGES
+ * after currentStage, strip conductor_replan, map re-enter:X→X, exactly one trailing
+ * synthesizer. Empty input ⇒ null (rejected).
+ */
+export function normalizeRemainingStages(
+  newRemaining: Array<StageName | string | null | undefined>,
+  requirement: TurnRequirement,
+  currentStage: StageName,
+): StageName[] | null {
+  if (!newRemaining || newRemaining.length === 0) return null;
+
+  const allowed = ALLOWED_STAGES[requirement];
+  const seen = new Set<StageName>();
+  const collected: StageName[] = [];
+
+  for (const step of newRemaining) {
+    if (!step) continue;
+    if (step === "conductor_replan") continue;
+    const raw = String(step);
+    const stage = (raw.startsWith("re-enter:") ? raw.slice("re-enter:".length) : raw) as StageName;
+    if (!VALID_STAGE_SET.has(stage)) continue;
+    if (!allowed.has(stage)) continue;
+    if (stage === currentStage) continue;
+    if (seen.has(stage)) continue;
+    seen.add(stage);
+    collected.push(stage);
+  }
+
+  const currentIdx = CANONICAL_ORDER.indexOf(currentStage);
+  for (const req of REQUIRED_STAGES[requirement]) {
+    if (seen.has(req)) continue;
+    const reqIdx = CANONICAL_ORDER.indexOf(req);
+    if (reqIdx > currentIdx) {
+      collected.push(req);
+      seen.add(req);
+    }
+  }
+
+  collected.sort((a, b) => CANONICAL_ORDER.indexOf(a) - CANONICAL_ORDER.indexOf(b));
+  const withoutSynth = collected.filter((s) => s !== "synthesizer");
+  const ordered: StageName[] = [...withoutSynth, "synthesizer"];
+  return ordered.length > 0 ? ordered : null;
+}
+
 const PROFILE_FOR: Record<TurnRequirement, ExecutionProfile> = {
   conversational: "none",
   answer_only: "read_only",

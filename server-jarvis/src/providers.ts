@@ -22,13 +22,28 @@ export interface ProviderTarget {
   chat_path: string;
 }
 
+/** T3.4: explicit error instead of silently retargeting ollama/claude_cli to OpenRouter. */
+export class UnroutableProviderError extends Error {
+  constructor(readonly provider: string) {
+    super(`Unroutable orchestrator provider "${provider}" — only openrouter, opencode_zen, opencode_go are served`);
+    this.name = "UnroutableProviderError";
+  }
+}
+
 /**
- * Resolve the HTTP endpoint + key for a provider. Unknown providers (ollama,
- * claude_cli, or anything not configured) fall back to OpenRouter so a stray
- * pool entry can never produce an undefined URL.
+ * Resolve the HTTP endpoint + key for a provider.
+ * T3.4: unknown providers throw UnroutableProviderError (was: silent OpenRouter retarget).
  */
 export function resolveProviderTarget(cfg: JarvisConfig, provider: string): ProviderTarget {
   switch (provider) {
+    case "openrouter":
+      return {
+        provider: "openrouter",
+        base_url: (cfg.openrouter.base_url || "https://openrouter.ai/api/v1").replace(/\/+$/, ""),
+        api_key: cfg.openrouter.api_key || "",
+        first_token_timeout_ms: Number((cfg.openrouter as any).first_token_timeout_ms ?? 30_000),
+        chat_path: "/chat/completions",
+      };
     case "opencode_zen":
       return {
         provider: "opencode_zen",
@@ -46,15 +61,11 @@ export function resolveProviderTarget(cfg: JarvisConfig, provider: string): Prov
         chat_path: "/chat/completions",
       };
     default:
-      return {
-        provider: "openrouter",
-        base_url: (cfg.openrouter.base_url || "https://openrouter.ai/api/v1").replace(/\/+$/, ""),
-        api_key: cfg.openrouter.api_key || "",
-        first_token_timeout_ms: Number((cfg.openrouter as any).first_token_timeout_ms ?? 30_000),
-        chat_path: "/chat/completions",
-      };
+      throw new UnroutableProviderError(provider);
   }
 }
+
+
 
 /** Full chat-completions URL for a provider target. */
 export function providerChatUrl(target: ProviderTarget): string {

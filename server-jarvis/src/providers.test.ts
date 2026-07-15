@@ -4,6 +4,7 @@ import {
   providerChatUrl,
   providerHeaders,
   resolveProviderTarget,
+  UnroutableProviderError,
   type HttpProviderId,
 } from "./providers";
 
@@ -54,14 +55,9 @@ describe("resolveProviderTarget", () => {
     expect(target.chat_path).toBe("/chat/completions");
   });
 
-  test("falls back to openrouter for unknown / non-HTTP providers (ollama, claude_cli, empty)", () => {
-    // ollama and claude_cli are valid RoutedProvider values but NOT in HttpProviderId;
-    // the function must not throw, must return the openrouter target so no URL is undefined.
+  test("T3.4: throws UnroutableProviderError for ollama/claude_cli/unknown (no silent retarget)", () => {
     for (const provider of ["ollama", "claude_cli", "unknown-pool-entry", ""]) {
-      const target = resolveProviderTarget(configWith(), provider);
-      expect(target.provider).toBe("openrouter");
-      expect(target.base_url).toBe("https://openrouter.ai/api/v1");
-      expect(target.chat_path).toBe("/chat/completions");
+      expect(() => resolveProviderTarget(configWith(), provider)).toThrow(UnroutableProviderError);
     }
   });
 

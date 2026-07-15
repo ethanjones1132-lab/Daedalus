@@ -32,6 +32,12 @@ export interface OrchestratorAgent {
    * cannot exceed the outer 60s stream-stall watchdog.
    */
   first_token_timeout_ms?: number;
+  /**
+   * T3.2: optional agent-specific system prompt (≤4000 chars). Spliced into
+   * the leading system message in callModelAttempt when present. Inert until
+   * an agent defines it.
+   */
+  system_prompt?: string;
 }
 
 export interface AgentPoolCoverage {

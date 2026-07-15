@@ -149,6 +149,41 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
         },
         carry,
       );
+      // T2.4: mid-run replan trigger. When caps remain, re-route and continue.
+      if (segment.replanRequested && !budgetExhausted) {
+        carry = segment.state;
+        const budget = args.baseOptions.turnBudget;
+        if (budget && !budget.canStart("coordinator", Date.now())) {
+          console.warn(`[replan-loop] skipping mid-run replan — finalization reserve`);
+          return finalizeSegment(segment, sessionCapHit);
+        }
+        args.onStateChange({
+          stage: "conductor_replan",
+          status: "running",
+          output: `Mid-run replan (${segment.replanRequested.trigger}): ${segment.replanRequested.detail.slice(0, 200)}`,
+        });
+        const replanRequestText = buildReplanRequest(
+          args.contextMessage,
+          carry,
+          remainingPipeline.filter((s) => s !== "synthesizer"),
+        );
+        decision = await args.coordinator.route(replanRequestText, args.routeOptions);
+        if (args.sessionCounter && args.sessionId) {
+          const capTag: ReplanCapKind = replans + 1 >= args.maxReplans ? "per_turn" : "";
+          args.sessionCounter.record({
+            sessionId: args.sessionId,
+            agentRunId: args.agentRunId,
+            replanIndex: 0,
+            rationale: decision.coordinator_rationale ?? segment.replanRequested.detail,
+            revised: decision,
+            segmentOutcome: segmentOutcomeFromCarry(segment.state),
+            cap: capTag,
+          });
+        }
+        replans += 1;
+        args.onStateChange({ stage: "conductor_replan", status: "done", output: decision.coordinator_rationale });
+        continue;
+      }
       return finalizeSegment(segment, sessionCapHit);
     }
 
@@ -205,6 +240,9 @@ function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean)
   const upstreamDegraded = Boolean(
     (segment.state.plan && !segment.state.plan.ok) || (segment.state.executor && !segment.state.executor.ok),
   );
+  // T2.4: propagate partialStage so truncation honesty does not regress when
+  // all turns flow through the replan wrapper.
+  const partialErrorCode = segment.partialStage?.errorCode;
 
   if (segment.synthesizerAnswer === undefined) {
     const gated = applyEffectGate(
@@ -219,9 +257,10 @@ function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean)
     return {
       answer: segment.state.plan ? segment.state.plan.narrative : "No planning stage executed.",
       recursion_depth: 0,
-      outcome: gated.outcome,
-      error_code: gated.errorCode,
+      outcome: partialErrorCode ? "partial" : gated.outcome,
+      error_code: partialErrorCode ?? gated.errorCode,
       toolCalls: segment.state.executor?.toolCalls,
+      replanRequested: segment.replanRequested,
     };
   }
 
@@ -233,6 +272,9 @@ function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean)
   } else if (segment.synthesizerEmptyCompletion) {
     outcome = "failed";
     errorCode = "empty_completion";
+  } else if (partialErrorCode) {
+    outcome = "partial";
+    errorCode = partialErrorCode;
   } else if (upstreamDegraded) {
     outcome = "degraded";
     errorCode = "upstream_stage_failed";
@@ -240,15 +282,18 @@ function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean)
     outcome = "success";
   }
 
-  ({ outcome, errorCode } = applyEffectGate(
-    outcome,
-    errorCode,
-    segment.effectGate ?? evaluateEffectGate({
-      profile: "full",
-      executor: segment.state.executor,
-      rewriter: segment.state.rewriter,
-    }),
-  ));
+  // applyEffectGate keeps the historical 3-way vocabulary; partial stays partial.
+  if (outcome !== "partial") {
+    ({ outcome, errorCode } = applyEffectGate(
+      outcome as "success" | "degraded" | "failed",
+      errorCode,
+      segment.effectGate ?? evaluateEffectGate({
+        profile: "full",
+        executor: segment.state.executor,
+        rewriter: segment.state.rewriter,
+      }),
+    ));
+  }
 
   // B-04: a session-cap exhaustion is a soft signal, not a stage failure.
   // It only adds the `session_replan_cap_exceeded` tag if the rest of the
@@ -266,5 +311,6 @@ function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean)
     outcome,
     error_code: errorCode,
     toolCalls: segment.state.executor?.toolCalls,
+    replanRequested: segment.replanRequested,
   };
 }
