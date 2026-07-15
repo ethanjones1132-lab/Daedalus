@@ -74,6 +74,53 @@ describe("PersistentConductor", () => {
     expect(body?.format?.properties?.worker_instructions).toBeUndefined();
     expect(body?.options?.num_predict).toBeLessThanOrEqual(320);
   });
+
+  test("uses the local Ollama model and directive schema for live supervision", async () => {
+    let body: Record<string, any> | undefined;
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/chat")) {
+        body = JSON.parse(String(init?.body ?? "{}"));
+        return Response.json({ message: { role: "assistant", content: '{"directive":"continue"}' } });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg = makeConfig({ persist_sessions: false });
+    const conductor = new PersistentConductor(() => cfg);
+    const result = await conductor.supervise([
+      { role: "system", content: "supervise" },
+      { role: "user", content: "Stage: executor — completed" },
+    ]);
+
+    expect(result.model).toBe("gemma4:e2b");
+    expect(result.content).toBe('{"directive":"continue"}');
+    expect(body?.format?.properties?.directive?.enum).toContain("reroute");
+    expect(body?.options?.num_predict).toBeLessThanOrEqual(160);
+    expect(body?.think).toBe(false);
+  });
+
+  test("warmUp preloads and retains the conductor model", async () => {
+    let generateBody: Record<string, any> | undefined;
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/generate")) {
+        generateBody = JSON.parse(String(init?.body ?? "{}"));
+        return Response.json({ done: true, done_reason: "load" });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg = makeConfig({ persist_sessions: false });
+    const conductor = new PersistentConductor(() => cfg);
+    const result = await conductor.warmUp();
+
+    expect(result.model).toBe("gemma4:e2b");
+    expect(generateBody).toMatchObject({ model: "gemma4:e2b", prompt: "", keep_alive: "30m" });
+    expect(generateBody?.options).toMatchObject({ num_predict: 1, num_ctx: 8_192 });
+  });
   test("accumulates session messages across turns for KV prefix reuse", async () => {
     const chatBodies: unknown[] = [];
     (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
@@ -228,6 +275,44 @@ describe("PersistentConductor", () => {
 
     expect(result.model).toBe("gemma4:e4b");
     expect(JSON.parse(result.content).pipeline).toEqual(["synthesizer"]);
+  });
+
+  test("quarantines a crashing installed primary and retries the fallback model", async () => {
+    const attemptedModels: string[] = [];
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/api/tags")) {
+        return Response.json({
+          models: [{ name: "gemma4:e2b" }, { name: "gemma4:e4b" }],
+        });
+      }
+      if (url.includes("/api/chat")) {
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        attemptedModels.push(body.model);
+        if (body.model === "gemma4:e2b") {
+          return Response.json({ error: "runner failed to load" }, { status: 500 });
+        }
+        return Response.json({
+          message: {
+            role: "assistant",
+            content: '{"task_type":"general","pipeline":["synthesizer"],"topology":"linear","context":{"needs_workspace_inspection":false,"needs_memory":true,"estimated_complexity":"low"},"coordinator_rationale":"runtime fallback"}',
+          },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg = makeConfig({ persist_sessions: false });
+    const conductor = new PersistentConductor(() => cfg);
+    const result = await conductor.routeTurn({
+      sessionId: "runtime-fallback-model",
+      request: "quick question",
+      turnNumber: 1,
+    });
+
+    expect(attemptedModels).toEqual(["gemma4:e2b", "gemma4:e4b"]);
+    expect(result.model).toBe("gemma4:e4b");
+    expect(JSON.parse(result.content).coordinator_rationale).toBe("runtime fallback");
   });
 
   test("falls back availability check when model is missing", async () => {

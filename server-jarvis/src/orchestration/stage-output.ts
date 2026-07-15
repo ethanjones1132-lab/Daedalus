@@ -32,6 +32,10 @@ export interface ExecutorStageOutput {
   ok: boolean;
   narrative: string;
   toolCalls: ToolCallRecord[];
+  /** Why execution stopped when `ok` is false. */
+  terminalStatus?: "completed" | "failed" | "timed_out" | "cancelled" | "partial";
+  /** Stable reason used by replanning and telemetry. */
+  errorCode?: string;
 }
 
 export interface ReviewerStageOutput {

@@ -20,7 +20,7 @@ function makeConductor(overrides?: Partial<{
 }
 
 describe("LiveConductor", () => {
-  test("does not call the model after a healthy stage when work remains", async () => {
+  test("actively supervises a healthy medium/high-complexity stage when work remains", async () => {
     let modelCalled = false;
     const { conductor } = makeConductor({}, async () => {
       modelCalled = true;
@@ -31,7 +31,38 @@ describe("LiveConductor", () => {
     const dir = await conductor.afterStage("planner", "completed", "plan output", ["executor"]);
 
     expect(dir).toEqual({ type: "continue" });
-    expect(modelCalled).toBe(false);
+    expect(modelCalled).toBe(true);
+  });
+
+  test("uses the dedicated supervisor path instead of the worker model", async () => {
+    const bus = new ConductorBus();
+    const pool = new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS);
+    let workerCalls = 0;
+    let supervisorCalls = 0;
+    const conductor = new LiveConductor(
+      async () => {
+        workerCalls += 1;
+        return { content: '{"directive":"reroute"}' };
+      },
+      bus,
+      pool,
+      {
+        supervision_timeout_ms: 5_000,
+        max_tool_errors_before_reroute: 2,
+        supervise_low_complexity: false,
+      },
+      async () => {
+        supervisorCalls += 1;
+        return { content: '{"directive":"continue"}' };
+      },
+    );
+    conductor.setContext("general", "high", "run-local-supervisor");
+
+    const directive = await conductor.afterStage("planner", "completed", "plan", ["executor"]);
+
+    expect(directive).toEqual({ type: "continue" });
+    expect(supervisorCalls).toBe(1);
+    expect(workerCalls).toBe(0);
   });
 
   test("returns continue by default", async () => {

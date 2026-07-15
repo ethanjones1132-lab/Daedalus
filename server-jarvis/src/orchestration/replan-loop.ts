@@ -146,6 +146,8 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
           executionProfile: normalized.profile,
           workerInstructions: decision.worker_instructions ?? args.baseOptions.workerInstructions,
           sharedContext: decision.shared_context ?? args.baseOptions.sharedContext,
+          allowMidRunReplan: !budgetExhausted,
+          allowEffectGateReplan: replans === 0,
         },
         carry,
       );
@@ -155,7 +157,15 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
         const budget = args.baseOptions.turnBudget;
         if (budget && !budget.canStart("coordinator", Date.now())) {
           console.warn(`[replan-loop] skipping mid-run replan — finalization reserve`);
-          return finalizeSegment(segment, sessionCapHit);
+          const finalSegment = await args.executor.executeSegment(
+            args.contextMessage,
+            ["synthesizer"],
+            args.agentRunId,
+            args.onStateChange,
+            { ...args.baseOptions, allowMidRunReplan: false },
+            carry,
+          );
+          return finalizeSegment(finalSegment, sessionCapHit);
         }
         args.onStateChange({
           stage: "conductor_replan",

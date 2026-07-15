@@ -181,6 +181,52 @@ describe("Orchestration & Routing Tests", () => {
     expect(executorTurnLimit("full")).toBe(BUILTIN_MODES.executor.max_turns);
   });
 
+  test("executor tool-round exhaustion is incomplete and requests a replan", async () => {
+    const runtime = createToolRuntime();
+    runtime.register({
+      type: "function",
+      function: {
+        name: "read_file",
+        description: "read",
+        parameters: { type: "object", properties: {}, required: [] },
+      },
+      requires_approval: false,
+      dangerous: false,
+    }, async () => "evidence");
+    const ctx = makeExecutionContext("agent", defaultConfig());
+    let executorTurns = 0;
+    const callModel = async (_messages: ChatMessage[], options: any = {}) => {
+      if (options.stageLabel === "executor") {
+        executorTurns += 1;
+        return {
+          content: "",
+          tool_calls: [{
+            id: `call_${executorTurns}`,
+            name: "read_file",
+            arguments: { path: `file-${executorTurns}.ts` },
+          }],
+        };
+      }
+      return { content: "must not synthesize an unfinished run" };
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+
+    const segment = await executor.executeSegment(
+      "Inspect and finish the implementation",
+      ["executor", "synthesizer"],
+      "run-executor-turn-cap",
+      () => {},
+      { executionProfile: "full", turnRequirement: "full_execution" },
+    );
+
+    expect(executorTurns).toBe(BUILTIN_MODES.executor.max_turns);
+    expect(segment.state.executor?.ok).toBe(false);
+    expect(segment.state.executor?.terminalStatus).toBe("partial");
+    expect(segment.state.executor?.errorCode).toBe("executor_turn_limit");
+    expect(segment.replanRequested?.trigger).toBe("executor_hard_failure");
+    expect(segment.synthesizerAnswer).toBeUndefined();
+  });
+
   test("workspace_read blocks stale repo synthesis when the executor produces no read evidence", async () => {
     const runtime = createToolRuntime();
     const def = (name: string) => ({
@@ -1067,6 +1113,58 @@ describe("PipelineExecutor with LiveConductor", () => {
 });
 
 describe("PipelineExecutor Phase 2: live conductor observability + abort", () => {
+  test("executor and rewriter tool results are delivered to the live conductor", async () => {
+    const runtime = createToolRuntime();
+    runtime.register({
+      type: "function",
+      function: {
+        name: "read_file",
+        description: "read",
+        parameters: { type: "object", properties: {}, required: [] },
+      },
+      requires_approval: false,
+      dangerous: false,
+    }, async () => {
+      throw new Error("fixture read failure");
+    });
+    const ctx = makeExecutionContext("agent", defaultConfig());
+    const { ConductorBus } = await import("./orchestration/conductor-bus");
+    const bus = new ConductorBus();
+    const observed: Array<{ stage: string; name: string; isError: boolean; summary: string }> = [];
+    const live = {
+      onToolResult(stage: string, name: string, isError: boolean, summary: string) {
+        observed.push({ stage, name, isError, summary });
+      },
+      async afterStage() {
+        return { type: "continue" as const };
+      },
+    };
+    let executorTurns = 0;
+    const callModel = async (_messages: any[], options: any = {}) => {
+      if (options.stageLabel === "executor" && executorTurns++ === 0) {
+        return {
+          content: "",
+          tool_calls: [{ id: "call_read", name: "read_file", arguments: { path: "missing.ts" } }],
+        };
+      }
+      return { content: "done", tool_calls: [] };
+    };
+    const ex = new PipelineExecutor(callModel as any, runtime, ctx, {
+      bus,
+      live: live as any,
+      collector: testCollector,
+    });
+
+    await ex.executeSegment("inspect", ["executor"], "run-tool-result-wire", () => {}, {
+      executionProfile: "read_only",
+    });
+    bus.clear();
+
+    expect(observed).toHaveLength(1);
+    expect(observed[0]).toMatchObject({ stage: "executor", name: "read_file", isError: true });
+    expect(observed[0].summary).toContain("fixture read failure");
+  });
+
   test("onChunk publishes throttled stage_token events to the bus", async () => {
     const runtime = createToolRuntime();
     const ctx = makeExecutionContext("agent", defaultConfig());

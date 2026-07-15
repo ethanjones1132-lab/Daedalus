@@ -55,6 +55,41 @@ export const COORDINATOR_ROUTE_TOOL = {
   },
 } as const;
 
+/** Compact structured-output contract for post-stage live supervision. */
+export const CONDUCTOR_DIRECTIVE_JSON_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    directive: {
+      type: "string",
+      enum: ["continue", "reroute", "inject_context", "abort_stage"],
+    },
+    newRemaining: {
+      type: "array",
+      maxItems: 5,
+      items: {
+        type: "string",
+        enum: [
+          "planner", "executor", "reviewer", "rewriter", "synthesizer",
+          "re-enter:planner", "re-enter:executor", "re-enter:reviewer",
+          "re-enter:rewriter", "re-enter:synthesizer",
+        ],
+      },
+    },
+    forStage: {
+      type: "string",
+      enum: ["planner", "executor", "reviewer", "rewriter", "synthesizer"],
+    },
+    note: { type: "string", maxLength: 600 },
+    stage: {
+      type: "string",
+      enum: ["planner", "executor", "reviewer", "rewriter", "synthesizer"],
+    },
+    reason: { type: "string", maxLength: 240 },
+  },
+  required: ["directive"],
+} as const;
+
 interface OllamaToolCall {
   function?: {
     name?: string;

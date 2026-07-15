@@ -2700,11 +2700,20 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // per turn guarantees isolation: a timeout/abort in one request can never
         // leak handlers or abort handles into another request.
         const conductorBus = new ConductorBus();
+        const localSupervisor = async (messages: any[]) => {
+          const timeoutMs = Math.max(
+            1_000,
+            cfg.orchestrator.conductor.supervision.supervision_timeout_ms - 250,
+          );
+          const result = await persistentConductor.supervise(messages, timeoutMs);
+          return { content: result.content };
+        };
         const liveConductor = new LiveConductor(
           callModel,
           conductorBus,
           agentPool,
           cfg.orchestrator.conductor.supervision,
+          localSupervisor,
         );
         liveConductor.setContext(
           route.task_type,
@@ -4600,3 +4609,16 @@ serve({
 });
 
 console.log(`[Jarvis API] Listening on http://localhost:${PORT}`);
+
+// Load the local conductor in the background at server boot. Without this,
+// the first user turn pays the full 15-30s model-load cost and may fall through
+// to the slower API coordinator before Ollama becomes ready.
+void persistentConductor.warmUp()
+  .then(({ model, latencyMs }) => {
+    console.log(`[PersistentConductor] warm model=${model} latency_ms=${latencyMs}`);
+  })
+  .catch((error) => {
+    console.warn(
+      `[PersistentConductor] warm-up skipped: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  });

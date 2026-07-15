@@ -107,6 +107,10 @@ export interface PipelineExecuteOptions {
    * budget (25s executor vs a ~52s-p50 free-tier provider pool).
    */
   turnBudget?: TurnBudget;
+  /** Replan-loop sets false after caps are exhausted so final synthesis runs. */
+  allowMidRunReplan?: boolean;
+  /** Effect-gate recovery is deliberately one-shot even when other replans remain. */
+  allowEffectGateReplan?: boolean;
 }
 
 const READ_CACHE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "web_fetch"]);
@@ -299,7 +303,7 @@ export interface PipelineSegmentResult {
    * re-route via the conductor (if caps allow) instead of synthesizing.
    */
   replanRequested?: {
-    trigger: "reviewer_reject" | "evidence_insufficient" | "executor_hard_failure" | "recursive_critique";
+    trigger: "reviewer_reject" | "evidence_insufficient" | "executor_hard_failure" | "effect_gate_failure" | "recursive_critique";
     detail: string;
   };
 }
@@ -481,9 +485,9 @@ export class PipelineExecutor {
       }
     }
 
-    if (directive.type !== "continue") {
-      await options.onDirective?.(directive, stage);
-    }
+    // Emit even "continue" so the UI/metrics can distinguish an active
+    // supervisory decision from a conductor that never ran.
+    await options.onDirective?.(directive, stage);
     const audit = this.collector as StageRunRecorder & {
       recordDirective?: (row: {
         id: string;
@@ -517,6 +521,7 @@ export class PipelineExecutor {
    * order), after that call's batch has fully settled.
    */
   private async dispatchToolCalls(
+    stage: "executor" | "rewriter",
     rawToolCalls: any[],
     options: PipelineExecuteOptions,
     record: (raw: any, call: ToolCall, result: ToolResult) => Promise<void> | void,
@@ -530,6 +535,12 @@ export class PipelineExecutor {
         batch.map(async (entry) => ({ entry, result: await this.runToolCall(entry.raw, options) })),
       );
       for (const { entry, result } of settled) {
+        this.conductor?.live.onToolResult(
+          stage,
+          entry.call.name,
+          result.is_error,
+          toolResultModelText(result).slice(0, 500),
+        );
         await record(entry.raw, entry.call, result);
       }
     }
@@ -822,7 +833,7 @@ export class PipelineExecutor {
           if (response.content) narratives.push(response.content);
 
           if (response.tool_calls && response.tool_calls.length > 0) {
-            await this.dispatchToolCalls(response.tool_calls, options, async (tc, call, toolResult) => {
+            await this.dispatchToolCalls("executor", response.tool_calls, options, async (tc, call, toolResult) => {
               toolCalls.push({
                 name: call.name,
                 arguments: call.arguments,
@@ -962,6 +973,33 @@ export class PipelineExecutor {
         onStateChange({ stage: "executor", status: "failed", output: failure.message });
         return { ok: false, narrative: failure.message, toolCalls };
       }
+      if (!executorDone) {
+        const message =
+          `Executor reached its ${maxTurns}-turn tool-call limit while work was still in progress. ` +
+          "The stage is incomplete and must be replanned or resumed before claiming completion.";
+        const incompleteNarrative = [narrative, message].filter(Boolean).join("\n\n");
+        onStateChange({
+          stage: "executor",
+          status: "partial",
+          output: message,
+          detail: "executor_turn_limit",
+        });
+        await this.afterConductorStage(
+          "executor",
+          "failed",
+          incompleteNarrative,
+          agentRunId,
+          options,
+          remainingQueue,
+        );
+        return {
+          ok: false,
+          narrative: incompleteNarrative,
+          toolCalls,
+          terminalStatus: "partial",
+          errorCode: "executor_turn_limit",
+        };
+      }
       onStateChange({ stage: "executor", status: "completed", output: narrative });
       await this.afterConductorStage("executor", "completed", narrative, agentRunId, options, remainingQueue);
       return { ok: true, narrative, toolCalls };
@@ -1032,7 +1070,7 @@ export class PipelineExecutor {
           if (rewriteResp.content) narratives.push(rewriteResp.content);
 
           if (rewriteResp.tool_calls && rewriteResp.tool_calls.length > 0) {
-            await this.dispatchToolCalls(rewriteResp.tool_calls, options, (tc, call, toolResult) => {
+            await this.dispatchToolCalls("rewriter", rewriteResp.tool_calls, options, (tc, call, toolResult) => {
               toolCalls.push({
                 name: call.name,
                 arguments: call.arguments,
@@ -1348,11 +1386,13 @@ export class PipelineExecutor {
         }
         console.warn(`[Pipeline] synthesizer hit token length — one continuation (grace_left_ms=${graceLeftMs})`);
         try {
+          const continuationStartTime = Date.now();
+          const continuationNudge = "Continue exactly where you stopped. Do not repeat prior text.";
           const contResp = await this.callModel([
             { role: "system", content: synthesizerPrompt },
             { role: "user", content: contextText },
             { role: "assistant", content: finalAnswer },
-            { role: "user", content: "Continue exactly where you stopped. Do not repeat prior text." },
+            { role: "user", content: continuationNudge },
           ] as ChatMessage[], {
             temperature: BUILTIN_MODES.synthesizer.temperature,
             max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
@@ -1381,10 +1421,12 @@ export class PipelineExecutor {
             agent_run_id: agentRunId,
             mode_id: "synthesizer",
             turn_number: 2,
-            input_tokens: Math.round((synthesizerPrompt.length + contextText.length) / 4),
+            input_tokens: countTokens(
+              `${synthesizerPrompt}\n${contextText}\n${finalAnswer}\n${continuationNudge}`,
+            ),
             output_tokens: countTokens(contText),
             tool_calls_json: "[]",
-            duration_ms: Date.now() - synthStartTime,
+            duration_ms: Date.now() - continuationStartTime,
             was_successful: contTruncated ? 0 : 1,
             had_error: 0,
             stop_reason: "length_continuation",
@@ -1599,6 +1641,7 @@ export class PipelineExecutor {
           state.executor &&
           state.executor.ok === false &&
           wantsSynthesizer &&
+          options.allowMidRunReplan !== false &&
           options.turnRequirement !== "workspace_read"
         ) {
           replanRequested = {
@@ -1628,6 +1671,7 @@ export class PipelineExecutor {
           reviewer?.hasIssues &&
           !rewriter &&
           wantsSynthesizer &&
+          options.allowMidRunReplan !== false &&
           profile === "full" &&
           hasWriteIntent(intentText) &&
           (options.maxReviewRepairRounds ?? 1) > 0
@@ -1698,6 +1742,26 @@ export class PipelineExecutor {
       }
     }
 
+    // A reviewer/rewriter pass that still produced no requested mutation is
+    // not terminal success. Give the conductor one bounded chance to route a
+    // fresh executor pass; the replan wrapper disables this branch once caps
+    // are exhausted so final synthesis can truthfully report the failure.
+    if (
+      effectGate.verdict === "no_write_effect" &&
+      !partialStage &&
+      wantsSynthesizer &&
+      options.allowMidRunReplan !== false &&
+      options.allowEffectGateReplan === true &&
+      profile === "full" &&
+      hasWriteIntent(intentText)
+    ) {
+      replanRequested = {
+        trigger: "effect_gate_failure",
+        detail: "No successful file mutation was produced after execution and repair.",
+      };
+      return { state, effectGate, replanRequested, partialStage };
+    }
+
     if (!wantsSynthesizer) {
       return { state, effectGate, partialStage, replanRequested };
     }
@@ -1706,10 +1770,12 @@ export class PipelineExecutor {
     if (options.turnRequirement === "workspace_read" && !preSynthAssessment.sufficient) {
       const failure = evidenceFailure(preSynthAssessment);
       // T2.4: evidence fence failure requests replan (first occurrence).
-      replanRequested = {
-        trigger: "evidence_insufficient",
-        detail: failure.message,
-      };
+      if (options.allowMidRunReplan !== false) {
+        replanRequested = {
+          trigger: "evidence_insufficient",
+          detail: failure.message,
+        };
+      }
       return {
         state,
         synthesizerAnswer: "",

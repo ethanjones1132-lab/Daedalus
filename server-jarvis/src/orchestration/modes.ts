@@ -72,7 +72,12 @@ export const BUILTIN_MODES: Record<string, AgentMode> = {
     name: "Synthesizer",
     tools_filter: [],
     temperature: 0.3,
-    max_tokens: 2048,
+    // Reasoning-capable worker providers account for hidden reasoning inside
+    // max_tokens. The former 2K cap routinely left only ~250-750 visible
+    // tokens, forcing a second full prompt round-trip and still cutting off
+    // user-visible answers. One 8K allowance is both faster in practice and
+    // materially less likely to truncate than two capped 2K generations.
+    max_tokens: 8192,
     requires_memory: true,
     is_final: true,
     max_turns: 1,

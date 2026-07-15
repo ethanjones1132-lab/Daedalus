@@ -8,8 +8,10 @@ import { SESSIONS_DIR } from "../config";
 import { checkOllamaHealth, ollamaBaseUrlCandidates } from "../ollama";
 import { resolveSkillsForConductor } from "../intelligence/skill-resolver";
 import {
+  CONDUCTOR_DIRECTIVE_JSON_SCHEMA,
   COORDINATOR_ROUTE_JSON_SCHEMA,
   extractConductorRoutingJson,
+  stripGemmaThinkingArtifacts,
   type OllamaChatMessage,
 } from "./conductor-routing";
 
@@ -57,6 +59,12 @@ export interface ConductorRouteTurnResult {
   kvGeneration: number;
 }
 
+export interface ConductorSupervisionResult {
+  content: string;
+  model: string;
+  latencyMs: number;
+}
+
 export class PersistentConductorError extends Error {
   constructor(message: string) {
     super(message);
@@ -73,11 +81,14 @@ let cachedTarget: ResolvedConductorTarget | null = null;
 let cachedTargetKey = "";
 let cachedTargetAt = 0;
 const TARGET_CACHE_TTL_MS = 10_000;
+const TARGET_RUNTIME_FAILURE_TTL_MS = 5 * 60_000;
+const runtimeFailedTargets = new Map<string, number>();
 
 export function __resetPersistentConductorCachesForTests(): void {
   cachedTarget = null;
   cachedTargetKey = "";
   cachedTargetAt = 0;
+  runtimeFailedTargets.clear();
 }
 
 function cleanOllamaBaseUrl(url: string): string {
@@ -100,13 +111,6 @@ function modelAvailable(models: string[], requested: string): boolean {
 
 function conductorModelCandidates(conductor: ConductorConfig): string[] {
   return Array.from(new Set([conductor.model, conductor.fallback_model].filter(Boolean)));
-}
-
-function pickInstalledConductorModel(models: string[], conductor: ConductorConfig): string | null {
-  for (const candidate of conductorModelCandidates(conductor)) {
-    if (modelAvailable(models, candidate)) return candidate;
-  }
-  return null;
 }
 
 function formatRecentHistory(history: ChatMessage[] | undefined): string {
@@ -272,7 +276,7 @@ export class PersistentConductor {
       throw new PersistentConductorError("Persistent conductor is disabled");
     }
 
-    const target = await this.resolveTarget();
+    let target = await this.resolveTarget();
     const session = this.getSession(input.sessionId);
     const userContent = buildTurnUserContent(input);
     const systemPrompt = loadPrompt("coordinator.md");
@@ -303,7 +307,10 @@ export class PersistentConductor {
     let content: string;
     let ok = true;
     try {
-      content = await this.callOllamaChat(target, session.messages);
+      const routed = await this.withRuntimeFallback(target, (candidate) =>
+        this.callOllamaChat(candidate, session.messages));
+      target = routed.target;
+      content = routed.value;
     } catch (e) {
       ok = false;
       session.messages.pop();
@@ -348,6 +355,69 @@ export class PersistentConductor {
       prefixTokensRecomputed: prefixRecomputed,
       kvGeneration: session.kvGeneration,
     };
+  }
+
+  /** Run a compact post-stage directive on the same local model as routing. */
+  async supervise(messages: ConductorMessage[], timeoutMs = 5_000): Promise<ConductorSupervisionResult> {
+    if (!this.config().enabled) {
+      throw new PersistentConductorError("Persistent conductor is disabled");
+    }
+    let target = await this.resolveTarget();
+    const startedAt = Date.now();
+    const supervised = await this.withRuntimeFallback(target, (candidate) =>
+      this.callOllamaMessage(candidate, messages, {
+        format: CONDUCTOR_DIRECTIVE_JSON_SCHEMA,
+        numPredict: 160,
+        timeoutMs,
+        temperature: 0.1,
+      }));
+    target = supervised.target;
+    const message = supervised.value;
+    const content = stripGemmaThinkingArtifacts(message.content ?? "");
+    if (!content) throw new PersistentConductorError("Ollama conductor returned empty supervision output");
+    return { content, model: target.model, latencyMs: Date.now() - startedAt };
+  }
+
+  /** Load and retain the configured conductor model before the first user turn. */
+  async warmUp(timeoutMs = 30_000): Promise<{ model: string; latencyMs: number }> {
+    if (!this.config().enabled) {
+      throw new PersistentConductorError("Persistent conductor is disabled");
+    }
+    let target = await this.resolveTarget();
+    const ctrl = new AbortController();
+    const timeout = setTimeout(() => ctrl.abort(), timeoutMs);
+    const startedAt = Date.now();
+    try {
+      const res = await fetch(`${target.baseUrl}/api/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: target.model,
+          prompt: "",
+          stream: false,
+          keep_alive: "30m",
+          options: {
+            num_predict: 1,
+            num_ctx: this.config().num_ctx,
+          },
+        }),
+        signal: ctrl.signal,
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new PersistentConductorError(
+          `Ollama warm-up failed: HTTP ${res.status}${body ? ` — ${body.slice(0, 200)}` : ""}`,
+        );
+      }
+      await res.json().catch(() => ({}));
+      return { model: target.model, latencyMs: Date.now() - startedAt };
+    } catch (error) {
+      this.quarantineTarget(target);
+      if (error instanceof PersistentConductorError) throw error;
+      throw new PersistentConductorError(error instanceof Error ? error.message : String(error));
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   /** Mark session after API coordinator fallback so next local turn rebuilds prefix. */
@@ -423,7 +493,11 @@ export class PersistentConductor {
 
         if (models.length === 0) continue;
 
-        const installed = pickInstalledConductorModel(models, this.config());
+        const installedCandidates = conductorModelCandidates(this.config())
+          .filter((candidate) => modelAvailable(models, candidate));
+        const installed = installedCandidates.find((candidate) =>
+          !this.targetIsQuarantined({ baseUrl: cleanUrl, model: candidate }))
+          ?? installedCandidates[0];
         if (!installed) continue;
 
         const target: ResolvedConductorTarget = {
@@ -447,10 +521,74 @@ export class PersistentConductor {
     );
   }
 
-  private async callOllamaChat(target: ResolvedConductorTarget, messages: ConductorMessage[]): Promise<string> {
+  /**
+   * Installed does not necessarily mean runnable: Ollama can discover a model
+   * whose runner then fails during load. Quarantine that target briefly and
+   * retry the configured fallback before escalating the turn to the API.
+   */
+  private async withRuntimeFallback<T>(
+    initial: ResolvedConductorTarget,
+    operation: (target: ResolvedConductorTarget) => Promise<T>,
+  ): Promise<{ target: ResolvedConductorTarget; value: T }> {
+    try {
+      return { target: initial, value: await operation(initial) };
+    } catch (primaryError) {
+      this.quarantineTarget(initial);
+      const alternate = await this.resolveTarget().catch(() => null);
+      if (!alternate || alternate.model === initial.model) throw primaryError;
+
+      console.warn(
+        `[PersistentConductor] Model ${initial.model} failed at runtime; retrying with ${alternate.model}`,
+      );
+      try {
+        return { target: alternate, value: await operation(alternate) };
+      } catch (fallbackError) {
+        this.quarantineTarget(alternate);
+        const primaryMessage = primaryError instanceof Error ? primaryError.message : String(primaryError);
+        const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+        throw new PersistentConductorError(
+          `Primary conductor ${initial.model} failed (${primaryMessage}); ` +
+          `fallback ${alternate.model} failed (${fallbackMessage})`,
+        );
+      }
+    }
+  }
+
+  private targetIsQuarantined(target: ResolvedConductorTarget): boolean {
+    const key = `${target.baseUrl}|${target.model}`;
+    const until = runtimeFailedTargets.get(key) ?? 0;
+    if (until <= Date.now()) {
+      runtimeFailedTargets.delete(key);
+      return false;
+    }
+    return true;
+  }
+
+  private quarantineTarget(target: ResolvedConductorTarget): void {
+    runtimeFailedTargets.set(
+      `${target.baseUrl}|${target.model}`,
+      Date.now() + TARGET_RUNTIME_FAILURE_TTL_MS,
+    );
+    if (cachedTarget?.baseUrl === target.baseUrl && cachedTarget.model === target.model) {
+      cachedTarget = null;
+      cachedTargetKey = "";
+      cachedTargetAt = 0;
+    }
+  }
+
+  private async callOllamaMessage(
+    target: ResolvedConductorTarget,
+    messages: ConductorMessage[],
+    options: {
+      format: Record<string, unknown>;
+      numPredict: number;
+      timeoutMs: number;
+      temperature?: number;
+    },
+  ): Promise<OllamaChatMessage> {
     const conductor = this.config();
     const ctrl = new AbortController();
-    const timeout = setTimeout(() => ctrl.abort(), 30_000);
+    const timeout = setTimeout(() => ctrl.abort(), options.timeoutMs);
 
     const body: Record<string, unknown> = {
       model: target.model,
@@ -459,18 +597,14 @@ export class PersistentConductor {
       keep_alive: "30m",
       think: false,
       options: {
-        temperature: conductor.temperature,
+        temperature: options.temperature ?? conductor.temperature,
         top_p: conductor.top_p,
         top_k: conductor.top_k,
         num_ctx: conductor.num_ctx,
-        num_predict: Math.min(320, Math.max(64, conductor.max_tokens)),
+        num_predict: Math.min(options.numPredict, Math.max(64, conductor.max_tokens)),
       },
+      format: options.format,
     };
-
-    // Route selection is deliberately schema-only. The conductor should emit
-    // a compact decision, not author worker prompts or replay session memory;
-    // those details are assembled by Jarvis-owned code after routing.
-    body.format = COORDINATOR_ROUTE_JSON_SCHEMA;
 
     try {
       const res = await fetch(`${target.baseUrl}/api/chat`, {
@@ -487,12 +621,25 @@ export class PersistentConductor {
       }
 
       const json = await res.json() as { message?: OllamaChatMessage };
-      return extractConductorRoutingJson(json.message);
+      if (!json.message) throw new PersistentConductorError("Ollama conductor returned no message");
+      return json.message;
     } catch (e) {
       clearTimeout(timeout);
       if (e instanceof PersistentConductorError) throw e;
       throw new PersistentConductorError(e instanceof Error ? e.message : String(e));
     }
+  }
+
+  private async callOllamaChat(target: ResolvedConductorTarget, messages: ConductorMessage[]): Promise<string> {
+    // Route selection is deliberately schema-only. The conductor should emit
+    // a compact decision, not author worker prompts or replay session memory;
+    // those details are assembled by Jarvis-owned code after routing.
+    const message = await this.callOllamaMessage(target, messages, {
+      format: COORDINATOR_ROUTE_JSON_SCHEMA,
+      numPredict: 320,
+      timeoutMs: 30_000,
+    });
+    return extractConductorRoutingJson(message);
   }
 
   private getSession(sessionId: string): ConductorSessionState {
