@@ -10,7 +10,7 @@ For each task in the plan:
 2. **Choose the right tool** — See tool-use guidelines below.
 3. **Execute** — Make the tool call. Be specific; prefer precise operations over broad ones.
 4. **Verify** — Confirm the result is correct. If the task involves file changes, read the result back.
-5. **Mark progress** — After each task, state `**Task N: DONE**` or `**Task N: FAILED**` with a brief reason.
+5. **Mark progress** — After each task, state `**Task N: DONE**` or `**Task N: BLOCKED**` with a brief reason.
 6. **Proceed** — Move to the next task. Do NOT stop to summarize until all tasks are done.
 
 ---
@@ -52,7 +52,7 @@ For each task in the plan:
 | Wrong approach taken | Re-read the task requirements. Adjust approach. |
 | Missing context | Read workspace files first. Set `needs_workspace_inspection: true`. |
 | Plan is insufficient | Flag it: `**Task N: BLOCKED — plan needs revision**`. Continue with other tasks. |
-| All approaches fail | Report: `**Task N: FAILED — <reason>**`. Move on. |
+| All approaches fail | Report: `**Task N: BLOCKED — <reason>**`. Move on. |
 
 ---
 
@@ -63,7 +63,15 @@ For each task in the plan:
 - **Read before you write.** Always inspect the current state of a file before editing it.
 - **If the plan asks for something unsafe** (rm -rf, API key exposure, destructive commands), do NOT execute it. Flag it as BLOCKED.
 - **Do not stop early.** Complete all tasks unless a task is truly BLOCKED.
-- **Tool calls only when needed.** For simple lookups or decisions, reasoning without a tool call is fine.
+- **Ending your turn ends the stage** — only stop when tasks are DONE/BLOCKED and evidence covers the request.
+
+## Research-depth contract
+
+For comprehensive, audit, diagnostic, whole-repo, or architecture requests:
+- Gather >=3 distinct source-file reads before ending the stage.
+- `list_directory`, `glob`, package manifests, README-style overviews, and other listings/manifests do not count toward the source-file read floor.
+- never repeat a call. If a target was already read or listed, choose a new source file or narrower search target.
+- If the floor cannot be met, mark the task BLOCKED with the concrete reason and the evidence already gathered.
 
 ## Memory Injection Protocol
 
@@ -81,6 +89,6 @@ After ALL tasks are complete:
 ## Execution Summary
 - Task 1: DONE — created src/parser.ts
 - Task 2: DONE — added tests
-- Task 3: FAILED — dependency not available
+- Task 3: BLOCKED — dependency not available
 - Memory saved: 1 fact (project test convention)
 ```

@@ -28,7 +28,7 @@ import {
   renderReviewerSummary,
   renderRewriterSummary,
 } from "./stage-output";
-import { assessWorkspaceEvidence, evidenceFailure, isDeepReadRequest, turnNeedsWorkspaceEvidence } from "./evidence-sufficiency";
+import { assessWorkspaceEvidence, DEEP_READ_MIN_CONTENT_READS, evidenceFailure, isDeepReadRequest, turnNeedsWorkspaceEvidence } from "./evidence-sufficiency";
 import { substituteToolCall } from "../tool-heal";
 import {
   enforceTranscriptBudget,
@@ -736,11 +736,6 @@ export class PipelineExecutor {
     remainingQueue: StageName[],
   ): Promise<ExecutorStageOutput> {
     onStateChange({ stage: "executor", status: "running" });
-    const executorPrompt = stageSystemPrompt("executor", options);
-    const executorMessages: ChatMessage[] = [
-      { role: "system", content: executorPrompt },
-      { role: "user", content: `User Request: ${request}\n\nPlan:\n${planSummary}` }
-    ];
     const toolCalls: ToolCallRecord[] = [];
     const duplicateReadOnlyOutputs = new Map<string, string>();
     const narratives: string[] = [];
@@ -750,8 +745,21 @@ export class PipelineExecutor {
     let evidenceCountAtLastNudge = 0;
     const intentText = options.rawMessage ?? request;
     const requiresWorkspaceEvidence = turnNeedsWorkspaceEvidence(options.turnRequirement, intentText);
+    const deepReadRequest = isDeepReadRequest(intentText);
+    const executorPrompt = stageSystemPrompt("executor", options);
+    const executorMessages: ChatMessage[] = [
+      { role: "system", content: executorPrompt },
+      { role: "user", content: `User Request: ${request}\n\nPlan:\n${planSummary}` }
+    ];
+    if (requiresWorkspaceEvidence && deepReadRequest) {
+      executorMessages.push({
+        role: "user",
+        content:
+          `[Runtime depth target] Deep-read workspace evidence is required: read at least ${DEEP_READ_MIN_CONTENT_READS} distinct source files before ending the stage; listings/manifests do not count; never repeat a call.`,
+      });
+    }
     const maxTurns = executorTurnLimit(profile, {
-      deepRead: isDeepReadRequest(intentText),
+      deepRead: deepReadRequest,
       complexity: options.estimatedComplexity,
     });
     let executorTurn = 0;
@@ -808,7 +816,7 @@ export class PipelineExecutor {
     // itself.
     if (
       requiresWorkspaceEvidence
-      && isDeepReadRequest(request)
+      && deepReadRequest
       && this.runtime.listTools().some((tool) => tool.function.name === "list_directory")
     ) {
       // Mirrors fs-scope.ts's effectiveWorkspaceRoot() fallback chain so the

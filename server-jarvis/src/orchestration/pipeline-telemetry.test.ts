@@ -4,6 +4,7 @@ import { createToolRuntime, makeExecutionContext } from "../tool-runtime";
 import type { StageRun } from "../self-tuning/store";
 import { PipelineExecutor, type StageRunRecorder } from "./pipeline";
 import { TurnDeadlineExceededError } from "../stream-liveness";
+import { DEEP_READ_MIN_CONTENT_READS } from "./evidence-sufficiency";
 
 function toolDefinition(name: string) {
   return {
@@ -269,6 +270,42 @@ describe("pipeline stage telemetry", () => {
     // recorded -- proving it ran before the model's (tool_call-less) first
     // turn could have produced anything.
     expect(result.toolCalls?.[0]?.name).toBe("list_directory");
+  });
+
+  test("deep-read workspace-evidence turns inject one deterministic depth target before executor model call", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("list_directory"), async () => "package.json\nREADME.md\nsrc/");
+    runtime.register(toolDefinition("read_file"), async () => "file contents");
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    const executorInputs: Array<Array<{ role: string; content?: string }>> = [];
+    const callModel = async (messages: Array<{ role: string; content?: string }>, options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") {
+        executorInputs.push(messages.map((message) => ({ ...message })));
+        return { content: "grounded enough" };
+      }
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    await executor.executeSegment(
+      "comprehensively audit this repo without modifying files",
+      ["executor"],
+      "run-deep-read-depth-target",
+      () => {},
+      {
+        executionProfile: "full",
+        turnRequirement: "full_execution",
+        rawMessage: "comprehensively audit this repo without modifying files",
+      },
+    );
+
+    const firstExecutorInput = executorInputs[0].map((message) => message.content ?? "").join("\n");
+    const expectedLine =
+      `[Runtime depth target] Deep-read workspace evidence is required: read at least ${DEEP_READ_MIN_CONTENT_READS} distinct source files before ending the stage; listings/manifests do not count; never repeat a call.`;
+    expect((firstExecutorInput.match(/\[Runtime depth target\]/g) ?? []).length).toBe(1);
+    expect(firstExecutorInput).toContain(expectedLine);
   });
 
   // Task 2.3: a model-driven read_file on a directory gets an immediate
