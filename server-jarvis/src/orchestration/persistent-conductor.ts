@@ -65,10 +65,23 @@ export interface ConductorSupervisionResult {
   latencyMs: number;
 }
 
+export interface PersistentConductorErrorOptions {
+  status?: number;
+  retryable?: boolean;
+  code?: string;
+}
+
 export class PersistentConductorError extends Error {
-  constructor(message: string) {
+  readonly status?: number;
+  readonly retryable?: boolean;
+  readonly code?: string;
+
+  constructor(message: string, options: PersistentConductorErrorOptions = {}) {
     super(message);
     this.name = "PersistentConductorError";
+    this.status = options.status;
+    this.retryable = options.retryable;
+    this.code = options.code;
   }
 }
 
@@ -166,6 +179,24 @@ function estimateMessageTokens(messages: ConductorMessage[]): number {
   return messages.reduce((sum, m) => sum + estimateTokens(m.content), 0);
 }
 
+function errorText(error: unknown): string {
+  return error instanceof Error ? `${error.name} ${error.message}` : String(error);
+}
+
+function isAbortOrTimeoutError(error: unknown): boolean {
+  const text = errorText(error);
+  return /\bAbortError\b|\bTimeoutError\b|aborted|timed?\s*out|timeout|first-token timeout|stream idle timeout|visible-progress timeout/i.test(text);
+}
+
+function isRetryableRuntimeFailure(error: unknown): boolean {
+  if (isAbortOrTimeoutError(error)) return false;
+  if (error instanceof PersistentConductorError && typeof error.retryable === "boolean") {
+    return error.retryable;
+  }
+  const text = errorText(error);
+  return /HTTP 5\d\d|runner|failed to load|load failed|unavailable|ECONNRESET|ECONNREFUSED/i.test(text);
+}
+
 /**
  * D4 (organism loop v1): compact hint of promoted skills relevant to this
  * turn, resolved WITHOUT knowing task_type (routing hasn't happened yet —
@@ -195,6 +226,9 @@ function buildTurnUserContent(input: ConductorRouteTurnInput): string {
 export class PersistentConductor {
   private static readonly MAX_SESSIONS = 256;
   private sessions = new Map<string, ConductorSessionState>();
+  private keepWarmTimer: ReturnType<typeof setInterval> | null = null;
+  private keepWarmInFlight: Promise<void> | null = null;
+  private lastWarmRenewedAt = 0;
 
   constructor(
     private getConfig: () => JarvisConfig,
@@ -227,6 +261,32 @@ export class PersistentConductor {
 
   shouldFallbackToApi(): boolean {
     return this.config().fallback_to_api;
+  }
+
+  startKeepWarm(): void {
+    const conductor = this.config();
+    if (!conductor.enabled || !conductor.keep_warm) return;
+    if (this.keepWarmTimer) return;
+
+    const intervalMs = this.keepWarmIntervalMs();
+    this.keepWarmTimer = setInterval(() => {
+      void this.keepWarmIfDue(intervalMs);
+    }, intervalMs);
+    const timerWithUnref = this.keepWarmTimer as ReturnType<typeof setInterval> & { unref?: () => void };
+    timerWithUnref.unref?.();
+  }
+
+  stopKeepWarm(): void {
+    if (!this.keepWarmTimer) return;
+    clearInterval(this.keepWarmTimer);
+    this.keepWarmTimer = null;
+  }
+
+  async isWarm(timeoutMs = 2_500): Promise<boolean> {
+    if (!this.config().enabled) return true;
+    const target = await this.resolveTarget().catch(() => null);
+    if (!target) return true;
+    return this.isTargetWarm(target, timeoutMs);
   }
 
   /**
@@ -280,6 +340,21 @@ export class PersistentConductor {
     }
 
     let target = await this.resolveTarget();
+    const warm = await this.isTargetWarm(target);
+    if (!warm) {
+      void this.warmUp().catch((error) => {
+        console.warn(
+          `[PersistentConductor] background warm after cold_start_warming failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
+      throw new PersistentConductorError("cold_start_warming", {
+        code: "cold_start_warming",
+        retryable: false,
+      });
+    }
+
     const session = this.getSession(input.sessionId);
     const userContent = buildTurnUserContent(input);
     const systemPrompt = loadPrompt("coordinator.md");
@@ -314,6 +389,7 @@ export class PersistentConductor {
         this.callOllamaChat(candidate, session.messages));
       target = routed.target;
       content = routed.value;
+      this.lastWarmRenewedAt = Date.now();
     } catch (e) {
       ok = false;
       session.messages.pop();
@@ -413,6 +489,7 @@ export class PersistentConductor {
         );
       }
       await res.json().catch(() => ({}));
+      this.lastWarmRenewedAt = Date.now();
       return { model: target.model, latencyMs: Date.now() - startedAt };
     } catch (error) {
       this.quarantineTarget(target);
@@ -524,6 +601,52 @@ export class PersistentConductor {
     );
   }
 
+  private keepWarmIntervalMs(): number {
+    const configured = Number(this.config().keep_warm_interval_ms);
+    return Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 600_000;
+  }
+
+  private async keepWarmIfDue(intervalMs = this.keepWarmIntervalMs()): Promise<void> {
+    const conductor = this.config();
+    if (!conductor.enabled || !conductor.keep_warm) return;
+    if (Date.now() - this.lastWarmRenewedAt < intervalMs * 2) return;
+    if (this.keepWarmInFlight) return;
+
+    this.keepWarmInFlight = this.warmUp()
+      .then(() => undefined)
+      .catch((error) => {
+        console.warn(
+          `[PersistentConductor] keep-warm skipped: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      })
+      .finally(() => {
+        this.keepWarmInFlight = null;
+      });
+
+    await this.keepWarmInFlight;
+  }
+
+  private async isTargetWarm(target: ResolvedConductorTarget, timeoutMs = 2_500): Promise<boolean> {
+    const ctrl = new AbortController();
+    const timeout = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await fetch(`${target.baseUrl}/api/ps`, { signal: ctrl.signal });
+      if (!res.ok) return true;
+      const json = await res.json().catch(() => null) as { models?: Array<{ name?: string; model?: string }> } | null;
+      if (!json || !Array.isArray(json.models)) return true;
+
+      const loadedModels = json.models
+        .map((model) => model?.name || model?.model || "")
+        .filter(Boolean);
+      if (loadedModels.length === 0) return false;
+      return modelAvailable(loadedModels, target.model);
+    } catch {
+      return true;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   /**
    * Installed does not necessarily mean runnable: Ollama can discover a model
    * whose runner then fails during load. Quarantine that target briefly and
@@ -536,6 +659,7 @@ export class PersistentConductor {
     try {
       return { target: initial, value: await operation(initial) };
     } catch (primaryError) {
+      if (!isRetryableRuntimeFailure(primaryError)) throw primaryError;
       this.quarantineTarget(initial);
       const alternate = await this.resolveTarget().catch(() => null);
       if (!alternate || alternate.model === initial.model) throw primaryError;
@@ -546,12 +670,14 @@ export class PersistentConductor {
       try {
         return { target: alternate, value: await operation(alternate) };
       } catch (fallbackError) {
+        if (!isRetryableRuntimeFailure(fallbackError)) throw fallbackError;
         this.quarantineTarget(alternate);
         const primaryMessage = primaryError instanceof Error ? primaryError.message : String(primaryError);
         const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
         throw new PersistentConductorError(
           `Primary conductor ${initial.model} failed (${primaryMessage}); ` +
           `fallback ${alternate.model} failed (${fallbackMessage})`,
+          { retryable: true },
         );
       }
     }
@@ -620,7 +746,11 @@ export class PersistentConductor {
 
       if (!res.ok) {
         const errBody = await res.text().catch(() => "");
-        throw new PersistentConductorError(`Ollama chat failed: HTTP ${res.status}${errBody ? ` — ${errBody.slice(0, 200)}` : ""}`);
+        const retryable = res.status >= 500 || /runner|failed to load|load failed|unavailable/i.test(errBody);
+        throw new PersistentConductorError(
+          `Ollama chat failed: HTTP ${res.status}${errBody ? ` — ${errBody.slice(0, 200)}` : ""}`,
+          { status: res.status, retryable },
+        );
       }
 
       const json = await res.json() as { message?: OllamaChatMessage };
@@ -628,6 +758,7 @@ export class PersistentConductor {
       return json.message;
     } catch (e) {
       clearTimeout(timeout);
+      if (isAbortOrTimeoutError(e)) throw e;
       if (e instanceof PersistentConductorError) throw e;
       throw new PersistentConductorError(e instanceof Error ? e.message : String(e));
     }

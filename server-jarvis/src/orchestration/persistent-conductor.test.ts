@@ -47,6 +47,10 @@ function mockOllamaChat(responses: string[]) {
   };
 }
 
+function nextTick(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 afterEach(() => {
   globalThis.fetch = originalFetch;
   __resetPersistentConductorCachesForTests();
@@ -125,6 +129,128 @@ describe("PersistentConductor", () => {
     expect(result.model).toBe("gemma4:e2b");
     expect(generateBody).toMatchObject({ model: "gemma4:e2b", prompt: "", keep_alive: "30m" });
     expect(generateBody?.options).toMatchObject({ num_predict: 1, num_ctx: 8_192 });
+  });
+
+  test("isWarm returns false only when the configured model is confidently absent from /api/ps", async () => {
+    const psBodies: unknown[] = [
+      { models: [{ name: "gemma4:e2b" }] },
+      { models: [{ model: "other-model:latest" }] },
+      "not-json",
+    ];
+    let psIndex = 0;
+    (globalThis as any).fetch = async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/ps")) {
+        const body = psBodies[psIndex++];
+        if (typeof body === "string") return new Response(body, { status: 200 });
+        return Response.json(body);
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg = makeConfig({ persist_sessions: false });
+    const conductor = new PersistentConductor(() => cfg);
+
+    expect(await conductor.isWarm()).toBe(true);
+    expect(await conductor.isWarm()).toBe(false);
+    expect(await conductor.isWarm()).toBe(true);
+  });
+
+  test("routeTurn fail-fasts cold local conductor and starts a background warm ping", async () => {
+    const calls: string[] = [];
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/ps")) return Response.json({ models: [] });
+      if (url.endsWith("/api/generate")) {
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        calls.push(`generate:${body.model}:${body.keep_alive}:${body.options?.num_predict}`);
+        return Response.json({ done: true, done_reason: "load" });
+      }
+      if (url.endsWith("/api/chat")) {
+        calls.push("chat");
+        return Response.json({ message: { role: "assistant", content: "{}" } });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg = makeConfig({ persist_sessions: false });
+    const conductor = new PersistentConductor(() => cfg);
+
+    await expect(conductor.routeTurn({
+      sessionId: "cold-fast-fail",
+      request: "continue",
+      turnNumber: 1,
+    })).rejects.toThrow("cold_start_warming");
+    await nextTick();
+
+    expect(calls).toEqual(["generate:gemma4:e2b:30m:1"]);
+  });
+
+  test("keep-warm loop skips a ping when a recent route already renewed warm state", async () => {
+    const calls: string[] = [];
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/ps")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/generate")) {
+        calls.push("generate");
+        return Response.json({ done: true, done_reason: "load" });
+      }
+      if (url.endsWith("/api/chat")) {
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        calls.push(`chat:${body.keep_alive}`);
+        return Response.json({
+          message: {
+            role: "assistant",
+            content: '{"task_type":"general","pipeline":["synthesizer"],"topology":"linear","context":{"needs_workspace_inspection":false,"needs_memory":true,"estimated_complexity":"low"},"coordinator_rationale":"warm"}',
+          },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg = makeConfig({
+      persist_sessions: false,
+      keep_warm: true,
+      keep_warm_interval_ms: 20,
+    });
+    const conductor = new PersistentConductor(() => cfg);
+
+    await conductor.routeTurn({ sessionId: "recent-route", request: "hello", turnNumber: 1 });
+    conductor.startKeepWarm();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    conductor.stopKeepWarm();
+
+    expect(calls).toEqual(["chat:30m"]);
+  });
+
+  test("withRuntimeFallback rethrows timeout-class errors instead of retrying another cold local model", async () => {
+    const attemptedModels: string[] = [];
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) {
+        return Response.json({ models: [{ name: "gemma4:e2b" }, { name: "gemma4:e4b" }] });
+      }
+      if (url.endsWith("/api/ps")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/chat")) {
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        attemptedModels.push(body.model);
+        throw new DOMException("This operation was aborted", "AbortError");
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg = makeConfig({ persist_sessions: false });
+    const conductor = new PersistentConductor(() => cfg);
+
+    await expect(conductor.routeTurn({
+      sessionId: "abort-no-retry",
+      request: "quick question",
+      turnNumber: 1,
+    })).rejects.toThrow(/aborted|Abort/i);
+    expect(attemptedModels).toEqual(["gemma4:e2b"]);
   });
   test("accumulates session messages across turns for KV prefix reuse", async () => {
     const chatBodies: unknown[] = [];

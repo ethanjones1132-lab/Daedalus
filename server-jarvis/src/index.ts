@@ -4699,6 +4699,7 @@ console.log(`[Jarvis API] Listening on http://localhost:${PORT}`);
 void persistentConductor.warmUp()
   .then(({ model, latencyMs }) => {
     console.log(`[PersistentConductor] warm model=${model} latency_ms=${latencyMs}`);
+    persistentConductor.startKeepWarm();
   })
   .catch((error) => {
     console.warn(

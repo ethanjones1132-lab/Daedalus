@@ -67,5 +67,10 @@ describe("configuration regression coverage retained during Task 6", () => {
     expect(cfg.orchestrator.conductor_learning.enabled).toBe(true);
     expect(cfg.orchestrator.skill_distillation.auto_promote).toBe(false);
   });
-});
 
+  test("defaults local conductor keep-warm on with a ten-minute refresh interval", () => {
+    const cfg = normalizeConfig({});
+    expect(cfg.orchestrator.conductor.keep_warm).toBe(true);
+    expect(cfg.orchestrator.conductor.keep_warm_interval_ms).toBe(600_000);
+  });
+});
