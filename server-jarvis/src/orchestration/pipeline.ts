@@ -1771,6 +1771,7 @@ export class PipelineExecutor {
           options.allowMidRunReplan !== false &&
           profile === "full" &&
           reviewerReplanEligible &&
+          (!rewriter || rewriter.ok) &&
           (options.maxReviewRepairRounds ?? 1) > 0
         ) {
           replanRequested = {
