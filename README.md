@@ -7,7 +7,7 @@ Native Rust shell · Bun HTTP server · React UI · SQLite persistence · Multi-
 
 [![License](https://img.shields.io/badge/license-MIT-green)](src-tauri/LICENSE)
 [![Version](https://img.shields.io/badge/version-3.0.0-blue)](package.json)
-[![Tests](https://img.shields.io/badge/tests-925%20bun%20|%2085%20cargo-success)](scripts/verify.sh)
+[![Tests](https://img.shields.io/badge/tests-1102%20bun%20|%2085%20cargo-success)](scripts/verify.sh)
 [![Platform](https://img.shields.io/badge/platform-Windows%20|%20Linux%20|%20macOS-lightgrey)]()
 
 </div>
@@ -115,6 +115,17 @@ Jarvis has three main layers:
 
 ---
 
+## Orchestration reliability safeguards
+
+The live-session orchestration path now protects the stages that matter most to a usable answer:
+
+- Empty planner, reviewer, and rewriter completions are recorded as failures and advance through the fallback cascade. Executor tool-call turns remain valid even when they have no visible prose.
+- Stage-health cooldowns and rolling per-stage model scorecards reach both the agent pool and fallback cascade, so unhealthy candidates are not immediately selected again.
+- Hidden reasoning deltas count as transport liveness without leaking into visible output. Trivial short-circuit turns use the fast synthesizer tier, while routed pipelines shed advisory stages when the remaining turn budget is tight.
+- Local conductor routing fails fast after 10 seconds and can fall back to a deterministic route when coordinator candidates are unavailable or unfit.
+
+The one-off `scripts/retro-correct-empty-stages.ts` utility can repair historical empty-stage labels in `self-tuning.db`. Preview its target rows first, stop the server before applying the update, and treat it as an operator migration rather than a startup task.
+
 ## Platform milestones
 
 Every major system shipped in the last two months:
@@ -136,7 +147,7 @@ Every major system shipped in the last two months:
 | **Track D (eval)** | GRPO-ready JSONL export, composite reward model | Complete |
 | **OpenCode fallback** | Provider credentials, pool availability filtering, per-provider timeouts | Complete |
 
-Latest (2026-07-13): `workspace_read` executor first-token ceiling fix, client-side send-while-streaming guard, live-fire benchmark. See [`PRIORITIES.md`](PRIORITIES.md) for the full changelog with commit SHAs and test counts.
+Latest (2026-07-15): live-session orchestration reliability fixes, stage-health cascade exclusions, reasoning-delta liveness, route-budget reconciliation, and rolling model scorecards. See [`PRIORITIES.md`](PRIORITIES.md) for the full changelog with commit SHAs and test counts.
 
 ---
 
@@ -250,6 +261,8 @@ Auto-created on first run at:
 ---
 
 ## Verification
+
+The current automated baseline is **1,102 Bun tests across 105 files**, **85 Cargo tests**, and clean server/UI TypeScript checks.
 
 The fastest way to check everything is healthy:
 
