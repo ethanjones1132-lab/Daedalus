@@ -75,7 +75,7 @@ export interface CoordinatorResult {
   /** Cross-turn context the conductor wants injected into worker prompts. */
   shared_context?: SharedContextHints;
   /** Phase 4 telemetry: which routing backend produced this decision. */
-  conductor_source?: "local" | "api" | "trivial" | "continuation_reuse";
+  conductor_source?: "local" | "api" | "trivial" | "continuation_reuse" | "deterministic";
   conductor_model?: string;
   /** True when a model call completed but its routing payload was unusable. */
   routing_parse_fallback?: boolean;
@@ -141,6 +141,11 @@ function formatApiSessionMemoryHints(hints?: SharedContextHints): string {
   return blocks.length > 0 ? `Session shared memory:\n\n${blocks.join("\n\n")}` : "Session shared memory: none";
 }
 
+export type LocalUnavailableCallback = (info: {
+  reason: string;
+  sessionId: string;
+}) => void | Promise<void>;
+
 export class Coordinator {
   private static readonly MAX_STATES = 256;
   private static readonly states = new Map<string, CoordinatorState>();
@@ -148,6 +153,8 @@ export class Coordinator {
   constructor(
     private callModel: CallModelFn,
     private persistentConductor?: PersistentConductor,
+    /** T1.7: fired exactly once per fallback turn when local conductor was expected but unavailable. */
+    private onLocalUnavailable?: LocalUnavailableCallback,
   ) {}
 
   async route(request: string, options: CoordinatorRouteOptions): Promise<CoordinatorResult> {
@@ -260,12 +267,25 @@ export class Coordinator {
           );
           return { content: local.content, source: "local", model: local.model };
         }
+        // Config enabled but Ollama/model unavailable — one health frame per fallthrough.
+        if (this.onLocalUnavailable) {
+          await this.onLocalUnavailable({
+            reason: "local_unavailable",
+            sessionId: options.sessionId,
+          });
+        }
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
         if (!conductor.shouldFallbackToApi()) {
           throw e instanceof PersistentConductorError ? e : new CoordinatorError(message);
         }
         console.warn(`[Coordinator] Local conductor failed, falling back to API coordinator: ${message}`);
+        if (this.onLocalUnavailable) {
+          await this.onLocalUnavailable({
+            reason: message,
+            sessionId: options.sessionId,
+          });
+        }
       }
     }
 

@@ -48,6 +48,42 @@ export function buildShortCircuitRoute(
 }
 
 /**
+ * T1.2: sibling of buildShortCircuitRoute for requirements where the API
+ * coordinator is advisory-only (workspace_read) and we skip a known-bad or
+ * unavailable coordinator path. normalizeRoute will still enforce invariants.
+ */
+export function buildDeterministicRoute(
+  requirement: Extract<TurnRequirement, "workspace_read" | "full_execution">,
+): CoordinatorResult {
+  if (requirement === "workspace_read") {
+    return {
+      task_type: "research",
+      pipeline: ["executor", "synthesizer"],
+      topology: "linear",
+      context: {
+        needs_workspace_inspection: true,
+        needs_memory: false,
+        estimated_complexity: "medium",
+      },
+      coordinator_rationale: "Deterministic workspace_read route: local conductor unavailable + advisory coordinator skipped.",
+      conductor_source: "deterministic",
+    };
+  }
+  return {
+    task_type: "general",
+    pipeline: ["planner", "executor", "reviewer", "synthesizer"],
+    topology: "linear",
+    context: {
+      needs_workspace_inspection: true,
+      needs_memory: false,
+      estimated_complexity: "high",
+    },
+    coordinator_rationale: "Deterministic full_execution route: coordinator skipped.",
+    conductor_source: "deterministic",
+  };
+}
+
+/**
  * Least-authority tool profile handed to the executor/rewriter stages.
  *   none      — no tools (conversational / pure-answer turns).
  *   read_only — read_file, list_directory, glob, grep only.
@@ -59,7 +95,8 @@ export type RouteSource =
   | "model"
   | "parse_fallback"
   | "invariant_override"
-  | "trivial_short_circuit";
+  | "trivial_short_circuit"
+  | "deterministic";
 
 export interface NormalizedRoute {
   pipeline: StageName[];

@@ -37,4 +37,23 @@ describe("StageHealthRegistry", () => {
     now += 2 * 60_000;
     expect(health.excludedModelKeys("synthesizer")).toEqual(new Set());
   });
+
+  // T1.6: one parse_failure strike excludes the coordinator pin for 5 min.
+  test("parse_failure excludes coordinator model for 5 minutes", () => {
+    let now = 10_000;
+    const health = new StageHealthRegistry(() => now);
+    health.recordFailure({
+      provider: "opencode_go",
+      modelId: "deepseek-v4-flash",
+      stage: "coordinator",
+      kind: "parse_failure",
+    });
+    expect(health.excludedModelKeys("coordinator")).toEqual(
+      new Set(["opencode_go:deepseek-v4-flash"]),
+    );
+    // Other stages unaffected.
+    expect(health.excludedModelKeys("synthesizer")).toEqual(new Set());
+    now += 5 * 60_000;
+    expect(health.excludedModelKeys("coordinator")).toEqual(new Set());
+  });
 });

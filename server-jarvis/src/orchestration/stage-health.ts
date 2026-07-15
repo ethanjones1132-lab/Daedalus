@@ -5,7 +5,9 @@ export type RecoverableFailureKind =
   | "stream_idle_timeout"
   | "visible_progress_timeout"
   | "empty_completion"
-  | "degenerate_stream";
+  | "degenerate_stream"
+  /** T1.6: coordinator JSON parse failed → route fell back. One strike evicts pin. */
+  | "parse_failure";
 
 export interface StageModelFailure {
   provider: string;
@@ -30,6 +32,8 @@ const COOLDOWN_MS: Record<RecoverableFailureKind, number> = {
   // generation on a repeating phrase) — use the longer stream-failure
   // cooldown, not the shorter empty_completion one.
   degenerate_stream: 5 * 60_000,
+  // T1.6: one parse failure is enough to stop re-pinning the default for 5 min.
+  parse_failure: 5 * 60_000,
 };
 
 function modelKey(provider: string, modelId: string): string {

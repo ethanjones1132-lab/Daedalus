@@ -277,6 +277,14 @@ export class AgentPool {
     if (agent) this.agents.set(id, { ...agent, enabled: false });
   }
 
+  /**
+   * Stage-scoped learned penalty threshold for demoting a `default_for` pin
+   * (T1.6). A model with ≤ -0.15 stage-scoped delta is skipped as the pin and
+   * scored ranking takes over. Milder penalties keep the pin. Stage-scoped so
+   * a model bad at coordinator JSON can still be a fine synthesizer.
+   */
+  static readonly DEFAULT_FOR_DEMOTE_DELTA = -0.15;
+
   pickFor(stage: string, taskType: TaskType | string, exclude?: ReadonlySet<string>): OrchestratorAgent | undefined {
     // Filter out excluded `provider:model_id` pairs FIRST so we never re-select
     // a model that just returned an empty completion (or hit a rate limit). The
@@ -289,8 +297,19 @@ export class AgentPool {
     if (candidates.length === 0) return undefined;
     const stageDefault = candidates.find((agent) => agent.default_for.includes(stage));
     if (stageDefault) {
-      if (stage === "synthesizer") return this.preferFastSynthesizer(stageDefault, candidates, taskType);
-      return stageDefault;
+      // T1.6: heavy stage-scoped learned penalty demotes the pin so a
+      // coordinator with 18% parse success stops being re-selected every turn.
+      // Exclusions still win above via filterExclude.
+      const stageDelta = stageRoutingScoreDelta(stageDefault, stage);
+      if (stageDelta <= AgentPool.DEFAULT_FOR_DEMOTE_DELTA) {
+        console.warn(
+          `[agent-pool] default_for pin demoted for stage=${stage} model=${stageDefault.model_id} ` +
+          `stage_delta=${stageDelta.toFixed(3)} ≤ ${AgentPool.DEFAULT_FOR_DEMOTE_DELTA}; falling through to scored ranking`,
+        );
+      } else {
+        if (stage === "synthesizer") return this.preferFastSynthesizer(stageDefault, candidates, taskType);
+        return stageDefault;
+      }
     }
     return candidates.sort((a, b) => this.scoreWithFeedback(b, stage, taskType) - this.scoreWithFeedback(a, stage, taskType))[0];
   }

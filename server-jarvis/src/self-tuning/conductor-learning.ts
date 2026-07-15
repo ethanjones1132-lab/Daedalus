@@ -20,7 +20,7 @@ export interface RoutingRecordInput {
   route: CoordinatorResult;
   normalizedPipeline: string[];
   routeSource?: string;
-  conductorSource: "local" | "api" | "trivial" | "continuation_reuse";
+  conductorSource: "local" | "api" | "trivial" | "continuation_reuse" | "deterministic";
   conductorModel?: string;
 }
 

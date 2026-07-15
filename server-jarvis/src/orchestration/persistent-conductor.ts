@@ -222,6 +222,51 @@ export class PersistentConductor {
     return this.config().fallback_to_api;
   }
 
+  /**
+   * T1.7: structured health for logs, /health JSON, and per-turn
+   * conductor_health SSE frames when config says enabled but we fell back.
+   */
+  async describeHealth(): Promise<{
+    enabled: boolean;
+    available: boolean;
+    fallback_to_api: boolean;
+    model: string;
+    fallback_model: string;
+    reason?: string;
+  }> {
+    const conductor = this.config();
+    if (!conductor.enabled) {
+      return {
+        enabled: false,
+        available: false,
+        fallback_to_api: conductor.fallback_to_api,
+        model: conductor.model,
+        fallback_model: conductor.fallback_model,
+        reason: "disabled",
+      };
+    }
+    try {
+      const available = await this.isAvailable();
+      return {
+        enabled: true,
+        available,
+        fallback_to_api: conductor.fallback_to_api,
+        model: conductor.model,
+        fallback_model: conductor.fallback_model,
+        reason: available ? undefined : "ollama_unavailable_or_model_missing",
+      };
+    } catch (e) {
+      return {
+        enabled: true,
+        available: false,
+        fallback_to_api: conductor.fallback_to_api,
+        model: conductor.model,
+        fallback_model: conductor.fallback_model,
+        reason: e instanceof Error ? e.message : String(e),
+      };
+    }
+  }
+
   async routeTurn(input: ConductorRouteTurnInput): Promise<ConductorRouteTurnResult> {
     if (!this.config().enabled) {
       throw new PersistentConductorError("Persistent conductor is disabled");

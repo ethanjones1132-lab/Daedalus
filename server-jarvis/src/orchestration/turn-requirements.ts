@@ -58,6 +58,17 @@ export function shouldShortCircuitCoordinator(
   return !COMPLEX_ANSWER_MARKER.test(text);
 }
 
+/**
+ * T1.2: true when the API coordinator is purely advisory for this requirement —
+ * normalizeRoute rebuilds pipeline/topology/profile from the requirement
+ * regardless; only task_type/worker_instructions survive from the model.
+ * When true and local conductor is unavailable and the coordinator has recent
+ * parse-failure strikes, skip the API coordinator entirely.
+ */
+export function coordinatorIsAdvisoryOnly(requirement: TurnRequirement): boolean {
+  return requirement === "workspace_read";
+}
+
 const REQUIREMENT_RANK: Record<TurnRequirement, number> = {
   conversational: 0,
   answer_only: 1,

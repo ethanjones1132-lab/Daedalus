@@ -40,17 +40,37 @@ export function buildSynthesizerContext(
   const sections: string[] = [`User Request: ${truncateToTokenBudget(request, 1_000)}`];
 
   const plan = truncateToTokenBudget(clean(parts.plan), 700);
-  const executor = truncateToTokenBudget(clean(parts.executorSummary), 2_600);
+  // T1.5: prioritize final executor findings over raw tool logs within the
+  // same 2600-token budget (reorder — findings first when the summary has a
+  // "Findings:" / "Result:" style tail; otherwise keep full executor block).
+  const executor = truncateToTokenBudget(prioritizeExecutorFindings(clean(parts.executorSummary)), 2_600);
   const review = truncateToTokenBudget(clean(parts.reviewerFeedback), 500);
   const rewrite = truncateToTokenBudget(clean(parts.rewriterSummary), 800);
 
-  if (isMeaningful(plan)) sections.push(`Original Plan:\n${plan}`);
+  // Prefer executor evidence before plan for workspace_read-style turns so
+  // the synthesizer sees findings first within the total budget.
   if (isMeaningful(executor)) sections.push(`Executor Activity:\n${executor}`);
+  if (isMeaningful(plan)) sections.push(`Original Plan:\n${plan}`);
   if (isMeaningful(review)) sections.push(`Reviewer Feedback:\n${review}`);
   if (isMeaningful(rewrite)) sections.push(`Rewriter Activity:\n${rewrite}`);
   if (isMeaningful(clean(executionVerification))) sections.push(truncateToTokenBudget(clean(executionVerification), 400));
 
   return truncateToTokenBudget(sections.join("\n\n"), 6_000);
+}
+
+/** Prefer trailing findings/result blocks over leading raw tool-call logs. */
+function prioritizeExecutorFindings(summary: string): string {
+  if (!summary) return summary;
+  // If the summary already looks findings-first, leave it alone.
+  if (/^(Findings|Result|Summary|Answer)\b/i.test(summary.trim())) return summary;
+  // Split on a findings-style heading if present and put it first.
+  const match = summary.match(/\n(?:#{1,3}\s*)?(Findings|Result|Summary|Answer)\b[:\s]/i);
+  if (!match || match.index === undefined) return summary;
+  const findings = summary.slice(match.index).trim();
+  const prefix = summary.slice(0, match.index).trim();
+  if (!findings) return summary;
+  // Findings first; keep a truncated prefix of raw logs after.
+  return prefix ? `${findings}\n\n---\nTool log (truncated):\n${prefix}` : findings;
 }
 
 /**

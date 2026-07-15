@@ -117,11 +117,13 @@ import type { ConductorDirective } from "./orchestration/conductor-bus";
 import { LiveConductor } from "./orchestration/conductor";
 import type { StageName } from "./orchestration/coordinator";
 import {
+  coordinatorIsAdvisoryOnly,
   resolveTurnRequirement,
   shouldShortCircuitCoordinator,
   type TurnRequirement,
 } from "./orchestration/turn-requirements";
 import {
+  buildDeterministicRoute,
   buildShortCircuitRoute,
   normalizeRoute,
   type ExecutionProfile,
@@ -2404,6 +2406,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               last = await callModelAttempt(messages, callOptions, exclude);
               break;
             } catch (error) {
+              // T1.1: stage deadline is a hard stop — do not re-arm the cascade.
+              // The deterministic coordinator fallback is free; burning more
+              // candidates after the 15s stage budget is gone only adds latency.
+              if (error instanceof StageDeadlineExceededError) {
+                throw error;
+              }
               const failure = recoverableStageFailure(error);
               if (!failure || streamAbort.signal.aborted || !canRetryStage || retry >= turnBudget.max_stage_attempts - 1 || Date.now() + 5_000 >= turnBudget.deadlineAt) {
                 throw error;
@@ -2501,32 +2509,95 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           continuationRequirements.get(sessionId),
         );
         const shortCircuit = shouldShortCircuitCoordinator(message, turnReq, continuation);
-        const coordinator = new Coordinator(callModel, persistentConductor);
+        // T1.7: emit one conductor_health frame when local is enabled but we fall back.
+        let conductorHealthEmitted = false;
+        const onLocalUnavailable = async (info: { reason: string; sessionId: string }) => {
+          if (conductorHealthEmitted) return;
+          conductorHealthEmitted = true;
+          const health = await persistentConductor.describeHealth();
+          console.warn(
+            `[Jarvis Orchestrator] local conductor unavailable session=${info.sessionId} reason=${info.reason} ` +
+            `available=${health.available} model=${health.model}`,
+          );
+          await writer.write(encoder.encode(`data: ${JSON.stringify({
+            type: "conductor_health",
+            available: false,
+            enabled: health.enabled,
+            reason: info.reason,
+            model: health.model,
+            session_id: sessionId,
+          })}\n\n`));
+        };
+        const coordinator = new Coordinator(callModel, persistentConductor, onLocalUnavailable);
         const workspaceRootHint = `Active filesystem workspace root: ${activeWorkspacePath}. Resolve relative filesystem paths against this root.`;
         const memoryHints = mergeSharedContextHints(
           sessionMemory.toSharedContextHints(sessionId, activeWorkspacePath),
           { relevant_memories: [workspaceRootHint] },
         );
+        // T1.2: skip the API coordinator when purely advisory (workspace_read),
+        // local conductor is unavailable, and coordinator has recent parse-
+        // failure strikes. Deterministic route is free; burns no latency.
+        const localConductorCfgEnabled = Boolean(cfg.orchestrator?.conductor?.enabled);
+        let localConductorAvailable = false;
+        if (localConductorCfgEnabled && !persistentConductor.shouldFallbackToApi()) {
+          try {
+            localConductorAvailable = await persistentConductor.isAvailable();
+          } catch {
+            localConductorAvailable = false;
+          }
+        }
+        const coordinatorParseExcluded = stageHealth.excludedModelKeys("coordinator").size > 0;
+        const skipAdvisoryCoordinator =
+          !shortCircuit &&
+          coordinatorIsAdvisoryOnly(turnReq.requirement) &&
+          !localConductorAvailable &&
+          coordinatorParseExcluded;
         const coordinatorStartedAt = Date.now();
-        const route = shortCircuit
-          ? buildShortCircuitRoute(
-              turnReq.requirement === "conversational" ? "conversational" : "answer_only",
-            )
-          : await coordinator.route(contextMessage, {
-              sessionId,
-              rawMessage: message,
-              history: turnHistory,
-              lastOutcome: sessionMemory.getLastOutcome(sessionId),
-              sessionMemoryHints: memoryHints,
-            });
-        const coordinatorDurationMs = shortCircuit ? 0 : Date.now() - coordinatorStartedAt;
+        let route;
+        if (shortCircuit) {
+          route = buildShortCircuitRoute(
+            turnReq.requirement === "conversational" ? "conversational" : "answer_only",
+          );
+        } else if (skipAdvisoryCoordinator && turnReq.requirement === "workspace_read") {
+          console.warn(
+            `[Jarvis Orchestrator] skipping advisory API coordinator for workspace_read ` +
+            `(local conductor unavailable + parse-failure strikes active)`,
+          );
+          route = buildDeterministicRoute("workspace_read");
+        } else {
+          route = await coordinator.route(contextMessage, {
+            sessionId,
+            rawMessage: message,
+            history: turnHistory,
+            lastOutcome: sessionMemory.getLastOutcome(sessionId),
+            sessionMemoryHints: memoryHints,
+          });
+        }
+        const coordinatorDurationMs = shortCircuit || skipAdvisoryCoordinator ? 0 : Date.now() - coordinatorStartedAt;
         orchestratorTaskType = route.task_type;
+
+        // T1.6: record parse_failure strike so next turn's pickFor / exclude
+        // set demotes the pinned coordinator default after one strike.
+        if (route.routing_parse_fallback && orchLastModel && orchLastProvider) {
+          stageHealth.recordFailure({
+            provider: orchLastProvider,
+            modelId: orchLastModel,
+            stage: "coordinator",
+            kind: "parse_failure",
+          });
+          console.warn(
+            `[Jarvis Orchestrator] coordinator parse_failure strike ` +
+            `${orchLastProvider}:${orchLastModel} — excluded for 5min cooldown`,
+          );
+        }
 
         const routeSource = shortCircuit
           ? "trivial_short_circuit"
-          : route.routing_parse_fallback
-            ? "parse_fallback"
-            : "model";
+          : skipAdvisoryCoordinator
+            ? "deterministic"
+            : route.routing_parse_fallback
+              ? "parse_fallback"
+              : "model";
         const normalized = normalizeRoute(
           route,
           turnReq.requirement,
@@ -4098,6 +4169,10 @@ export async function baseFetch(req: Request): Promise<Response> {
           model = hcfg.ollama.model;
         }
       }
+      let conductor_health: Awaited<ReturnType<typeof persistentConductor.describeHealth>> | undefined;
+      try {
+        conductor_health = await persistentConductor.describeHealth();
+      } catch { /* leave undefined */ }
       return Response.json({
         ok: true,
         uptime: process.uptime(),
@@ -4110,6 +4185,8 @@ export async function baseFetch(req: Request): Promise<Response> {
         built_at: JARVIS_BUILT_AT,
         git_dirty: JARVIS_GIT_DIRTY,
         source_tree_sha256: JARVIS_SOURCE_TREE_SHA256,
+        // T1.7: local PersistentConductor health (enabled/available/model).
+        conductor: conductor_health,
       });
     }
     if (path === "/health/inference") {

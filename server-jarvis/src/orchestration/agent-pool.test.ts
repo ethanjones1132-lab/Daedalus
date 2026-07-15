@@ -68,11 +68,70 @@ describe("AgentPool", () => {
     ]);
 
     const state = getLearnedPoolState();
+    // Model-wide delta alone does not demote a pin (T1.6 is stage-scoped).
     state.modelRoutingScoreDeltas.set("openrouter:openrouter/free", -0.25);
     try {
       expect(pool.pickFor("synthesizer", "general")?.id).toBe("synth-default");
     } finally {
       state.modelRoutingScoreDeltas.delete("openrouter:openrouter/free");
+    }
+  });
+
+  // T1.6: heavy stage-scoped delta demotes the default_for pin.
+  test("pickFor demotes default_for pin when stage-scoped delta is heavily negative", () => {
+    const pool = new AgentPool([
+      {
+        ...agents[0],
+        id: "coord-default",
+        model_id: "bad-coord",
+        default_for: ["coordinator"],
+        capabilities: { ...agents[0].capabilities, json_reliability: 0.5, speed: 0.5 },
+      },
+      {
+        ...agents[2],
+        id: "coord-alt",
+        model_id: "good-coord",
+        default_for: [],
+        capabilities: { ...agents[2].capabilities, json_reliability: 0.95, speed: 0.8 },
+      },
+    ]);
+    const state = getLearnedPoolState();
+    // stageModelFeedbackKey = `${provider}:${modelId}:${stage}`
+    const key = "openrouter:bad-coord:coordinator";
+    state.stageModelRoutingScoreDeltas.set(key, -0.20);
+    try {
+      const picked = pool.pickFor("coordinator", "general");
+      expect(picked?.id).not.toBe("coord-default");
+      expect(picked?.id).toBe("coord-alt");
+    } finally {
+      state.stageModelRoutingScoreDeltas.delete(key);
+    }
+  });
+
+  test("pickFor keeps pin when stage-scoped delta is only mildly negative", () => {
+    const pool = new AgentPool([
+      {
+        ...agents[0],
+        id: "coord-mild",
+        model_id: "mild-coord",
+        default_for: ["coordinator"],
+        capabilities: { ...agents[0].capabilities, json_reliability: 0.9 },
+      },
+      {
+        ...agents[2],
+        id: "coord-other",
+        model_id: "other-coord",
+        default_for: [],
+        capabilities: { ...agents[2].capabilities, json_reliability: 0.95 },
+      },
+    ]);
+    const state = getLearnedPoolState();
+    const key = "openrouter:mild-coord:coordinator";
+    state.stageModelRoutingScoreDeltas.set(key, -0.10); // above demote threshold
+    try {
+      expect(pool.pickFor("coordinator", "general")?.id).toBe("coord-mild");
+    } finally {
+      state.stageModelRoutingScoreDeltas.delete(key);
     }
   });
 

@@ -12,6 +12,7 @@ import { countTokens } from "../tokens";
 import type { ConductorBus, ConductorDirective } from "./conductor-bus";
 import type { LiveConductor } from "./conductor";
 import { buildSynthesizerContext, buildSynthesizerContextFromStageState } from "./synth-context";
+import { detectDeferralStall, DEFERRAL_STALL_NUDGE } from "./synthesizer-deferral";
 import { applyEffectGate, evaluateEffectGate, WRITE_EFFECT_TOOLS, type EffectGateReport } from "./effect-gate";
 import type { ExecutionProfile } from "./route-normalization";
 import { hasWriteIntent, type TurnRequirement } from "./turn-requirements";
@@ -1290,22 +1291,75 @@ export class PipelineExecutor {
         return { answer: finalAnswer, emptyCompletion: false, partialErrorCode };
       }
 
-      onStateChange({ stage: "synthesizer", status: "completed", output: finalAnswer });
-      await this.afterConductorStage("synthesizer", "completed", finalAnswer, agentRunId, options, remainingQueue);
+      // T1.5: deferral-stall detection + one corrective retry.
+      let answerToShip = finalAnswer;
+      let deferralRetried = false;
+      if (detectDeferralStall(finalAnswer)) {
+        const remainingMs = typeof (options as { turnBudgetRemainingMs?: () => number }).turnBudgetRemainingMs === "function"
+          ? (options as { turnBudgetRemainingMs: () => number }).turnBudgetRemainingMs()
+          : 30_000;
+        if (remainingMs >= 20_000) {
+          deferralRetried = true;
+          console.warn(`[Pipeline] synthesizer deferral stall detected — one corrective retry`);
+          try {
+            const retryResp = await this.callModel([
+              { role: "system", content: `${synthesizerPrompt}\n\n${DEFERRAL_STALL_NUDGE}` },
+              { role: "user", content: contextText },
+              { role: "assistant", content: finalAnswer },
+              { role: "user", content: "Continue: deliver the actual answer now. No stand-by narration." },
+            ] as ChatMessage[], {
+              temperature: BUILTIN_MODES.synthesizer.temperature,
+              max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
+              stream: true,
+              stageLabel: "synthesizer",
+              surfaceAsAnswer: true,
+              stageAbort: this.registerStageAbort("synthesizer"),
+              onChunk: (chunk) => {
+                streamedAnswer += chunk;
+                onStateChange({ stage: "synthesizer", status: "running", output: chunk });
+                this.publishStageToken("synthesizer", chunk);
+              },
+            }) as { content?: string; _truncated?: boolean; _stopReason?: string | null };
+            const retryAnswer = retryResp.content ?? "";
+            if (retryAnswer.trim() && !detectDeferralStall(retryAnswer)) {
+              answerToShip = retryAnswer;
+            } else if (detectDeferralStall(retryAnswer) || !retryAnswer.trim()) {
+              this.collector.recordStageRun({
+                id: `stage_${crypto.randomUUID()}`,
+                agent_run_id: agentRunId,
+                mode_id: "synthesizer",
+                turn_number: 2,
+                tool_calls_json: "[]",
+                duration_ms: Date.now() - synthStartTime,
+                was_successful: 0,
+                had_error: 1,
+                error_message: "deferral_stall",
+                stop_reason: stopReason,
+              });
+              return { answer: "", fatalError: "Synthesizer deferred without delivering an answer.", emptyCompletion: false };
+            }
+          } catch (retryErr) {
+            console.warn(`[Pipeline] deferral retry failed: ${errText(retryErr)}`);
+          }
+        }
+      }
+
+      onStateChange({ stage: "synthesizer", status: "completed", output: answerToShip });
+      await this.afterConductorStage("synthesizer", "completed", answerToShip, agentRunId, options, remainingQueue);
       this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
         agent_run_id: agentRunId,
         mode_id: "synthesizer",
-        turn_number: 1,
+        turn_number: deferralRetried ? 2 : 1,
         input_tokens: Math.round((synthesizerPrompt.length + contextText.length) / 4),
-        output_tokens: countTokens(finalAnswer),
+        output_tokens: countTokens(answerToShip),
         tool_calls_json: "[]",
         duration_ms: Date.now() - synthStartTime,
         was_successful: 1,
         had_error: 0,
         stop_reason: stopReason ?? "stop",
       });
-      return { answer: finalAnswer, emptyCompletion: false };
+      return { answer: answerToShip, emptyCompletion: false };
     } catch (e: any) {
       const message = errText(e);
       onStateChange({ stage: "synthesizer", status: "failed", output: message });
