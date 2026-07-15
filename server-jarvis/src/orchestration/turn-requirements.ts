@@ -20,7 +20,7 @@
 //   full_execution  — explicitly requested edits, builds, commands, deployment,
 //                     or other mutations. Executor REQUIRED, full tools.
 
-import { isContinuationTurn, isTrivialConversationalTurn } from "./turn-triage";
+import { isContinuationTurn, isTrivialConversationalTurn, WORK_START_COMMAND } from "./turn-triage";
 
 export type TurnRequirement =
   | "conversational"
@@ -308,16 +308,22 @@ export function classifyTurnRequirements(message: string): TurnRequirementResult
   const hasReadVerb = READ_VERB.test(intentText);
   const hasStrongWorkspace = STRONG_WORKSPACE.test(intentText);
   const hasWeakWorkspace = WEAK_WORKSPACE.test(intentText);
+  const hasWorkStartCommand = WORK_START_COMMAND.test(intentText);
   if (hasNegatedMutation) signals.push("negated_mutation");
   if (hasMutation) signals.push("mutation_verb");
   if (hasReadVerb) signals.push("read_verb");
   if (hasStrongWorkspace) signals.push("strong_workspace");
   if (hasWeakWorkspace) signals.push("weak_workspace");
+  if (hasWorkStartCommand) signals.push("work_start_command");
 
   // Unnegated mutation intent wins outright — even with a path present,
   // "fix C:\x.ts" is a change request, not a read. Negated mutation language
   // remains observable in signals but cannot grant write/command authority.
   if (hasMutation) {
+    return { requirement: "full_execution", signals };
+  }
+
+  if (hasWorkStartCommand) {
     return { requirement: "full_execution", signals };
   }
 

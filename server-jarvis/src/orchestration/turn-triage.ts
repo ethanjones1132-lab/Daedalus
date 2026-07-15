@@ -9,15 +9,18 @@ const TRIVIAL_PATTERNS: RegExp[] = [
 
 const CONTINUATION_PATTERNS: RegExp[] = [
   /^(now|ok(ay)?|yes|yep|yeah|sure|please)?[,.!\s]*(go ahead|continue|proceed|carry on|keep going|do it|next)\b/i,
-  /^(now\s+)?(task|step|item|part)\s*#?\d+\b/i,
+  /^(now\s+)?(task|step|item|part|phase|stage|milestone)\s*#?\d+\b/i,
   /^(and\s+)?(then\s+)?(the\s+)?(next|second|third)\s+(one|task|step|item)\b/i,
   /^same\s+(again|thing)\b/i,
 ];
 
+export const WORK_START_COMMAND =
+  /^(now |ok |please )*(begin|start|execute|launch|resume|implement|kick off|proceed with|do) (the )?(phase|task|step|item|part|stage|plan|milestone|next)\b/i;
+
 export function isContinuationTurn(request: string): boolean {
   const text = (request || "").trim();
   if (!text || text.length > 120) return false;
-  return CONTINUATION_PATTERNS.some((re) => re.test(text));
+  return CONTINUATION_PATTERNS.some((re) => re.test(text)) || WORK_START_COMMAND.test(text);
 }
 
 export function isTrivialConversationalTurn(request: string): boolean {
