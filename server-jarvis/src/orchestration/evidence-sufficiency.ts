@@ -29,29 +29,10 @@ const DEEP_READ_MARKERS =
   /\b(comprehensiv\w*|thorough\w*|entire|whole|all files|full|in[- ]depth|architecture|architectural|audit|diagnos\w*|repo|repository|codebase)\b/i;
 /** Genuine file-content tools — the only ones that count toward the deep-read floor. */
 const DEEP_READ_CONTENT_TOOLS = new Set(["read_file", "grep"]);
-const NON_SOURCE_READ_BASENAMES = new Set([
-  "app.json",
-  "bun.lock",
-  "bun.lockb",
-  "cargo.lock",
-  "cargo.toml",
-  "composer.json",
-  "context.md",
-  "gemfile",
-  "go.mod",
-  "go.sum",
-  "jsconfig.json",
-  "manifest.json",
-  "npm-shrinkwrap.json",
-  "package-lock.json",
-  "package.json",
-  "pnpm-lock.yaml",
-  "pom.xml",
-  "pyproject.toml",
-  "readme",
-  "requirements.txt",
-  "tsconfig.json",
-  "yarn.lock",
+const SOURCE_FILE_EXTENSIONS = new Set([
+  ".c", ".cc", ".cpp", ".cxx", ".cs", ".css", ".dart", ".ex", ".exs", ".go", ".h", ".hpp",
+  ".hs", ".html", ".java", ".js", ".jsx", ".kts", ".kt", ".lua", ".mjs", ".php", ".pl", ".ps1",
+  ".py", ".rb", ".rs", ".scala", ".sh", ".sql", ".svelte", ".swift", ".ts", ".tsx", ".vue",
 ]);
 /** Broader shallow-evidence set: file content OR repo metadata satisfies a shallow turn. */
 const SHALLOW_EVIDENCE_TOOLS = new Set(["read_file", "grep", "git_metadata"]);
@@ -66,38 +47,37 @@ function distinctTargetKeys(calls: ToolCallRecord[], tools: Set<string>): Set<st
   return keys;
 }
 
-function isNonSourceReadTarget(call: ToolCallRecord): boolean {
-  if (!DEEP_READ_CONTENT_TOOLS.has(call.name)) return false;
-  const args = call.arguments as Record<string, unknown> | undefined;
-  const rawPath = typeof args?.path === "string" ? args.path : undefined;
-  if (!rawPath) return false;
+function isSourceFilePath(rawPath: string): boolean {
   const basename = rawPath.replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
-  return NON_SOURCE_READ_BASENAMES.has(basename)
-    || /^readme\./i.test(basename)
-    || /(^|[-_. ])overview([-. _]|$)/i.test(basename);
+  const extensionStart = basename.lastIndexOf(".");
+  return extensionStart > 0 && SOURCE_FILE_EXTENSIONS.has(basename.slice(extensionStart));
+}
+
+function grepOutputHasSourceFile(output: string): boolean {
+  return output.split(/\s+/).some((token) => {
+    const candidate = token
+      .replace(/[,:;"'`]+$/g, "")
+      .replace(/:\d+(?::\d+)?$/, "");
+    return isSourceFilePath(candidate);
+  });
+}
+
+function isSourceContentRead(call: ToolCallRecord): boolean {
+  if (call.name === "read_file") {
+    const args = call.arguments as Record<string, unknown> | undefined;
+    return typeof args?.path === "string" && isSourceFilePath(args.path);
+  }
+  return call.name === "grep" && grepOutputHasSourceFile(call.output);
 }
 
 function distinctDeepReadTargetKeys(calls: ToolCallRecord[]): Set<string> {
-  return new Set(
-    [...distinctTargetKeys(calls, DEEP_READ_CONTENT_TOOLS)].filter((key) => {
-      const separator = key.indexOf(":");
-      const name = key.slice(0, separator);
-      const argsJson = key.slice(separator + 1);
-      let args: Record<string, unknown> | undefined;
-      try {
-        args = JSON.parse(argsJson) as Record<string, unknown>;
-      } catch {
-        return true;
-      }
-      return !isNonSourceReadTarget({
-        name,
-        arguments: args,
-        output: "",
-        is_error: false,
-        duration_ms: 0,
-      });
-    }),
-  );
+  const keys = new Set<string>();
+  for (const call of calls) {
+    if (DEEP_READ_CONTENT_TOOLS.has(call.name) && isSourceContentRead(call)) {
+      keys.add(`${call.name}:${JSON.stringify(call.arguments)}`);
+    }
+  }
+  return keys;
 }
 
 /**

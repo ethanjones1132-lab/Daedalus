@@ -158,7 +158,7 @@ describe("assessWorkspaceEvidence", () => {
 
   test("re-reading the same file repeatedly does not inflate the deep-read count", () => {
     const a = assessWorkspaceEvidence(
-      [ls, read("payload.bin"), read("payload.bin"), read("payload.bin")],
+      [ls, read("payload.ts"), read("payload.ts"), read("payload.ts")],
       "comprehensively diagnose the architecture of the repo",
     );
     expect(a.sufficient).toBe(false); // 3 calls, but only 1 DISTINCT target
@@ -174,6 +174,9 @@ describe("assessWorkspaceEvidence", () => {
         read("OVERVIEW.md"),
         read("docs/ARCHITECTURE_OVERVIEW.md"),
         read("docs/system-overview.md"),
+        read("AGENTS.md"),
+        read("CLAUDE.md"),
+        read("ARCHITECTURE.md"),
       ],
       "comprehensively diagnose this repo",
     );
