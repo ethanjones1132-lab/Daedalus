@@ -241,6 +241,16 @@ const activeStreams = new ActiveStreamRegistry();
 const orchestrationAdmission = new OrchestrationAdmissionController({ interactive: 2, background: 1 });
 const stageHealth = new StageHealthRegistry();
 const modelScorecard = new ModelScorecard();
+const SCORECARD_SEEDED_STAGES = ["coordinator", "planner", "executor", "reviewer", "rewriter", "synthesizer"] as const;
+try {
+  const scorecardSeedStore = new SelfTuningStore();
+  const sinceIso = new Date(Date.now() - (7 * 24 * 60 * 60 * 1000)).toISOString();
+  for (const stage of SCORECARD_SEEDED_STAGES) {
+    modelScorecard.seedFromHistory(stage, scorecardSeedStore.getRecentStageAttributions(stage, sinceIso, 400));
+  }
+} catch (e) {
+  console.warn("[Jarvis Orchestrator] model scorecard history seed skipped:", e);
+}
 // Cross-turn no-progress guard (orchestration/repetition-guard.ts): compares
 // a finalized turn's answer + evidence keys against the previous turn's, for
 // the same session. See the 2026-07-12 incident note in repetition-guard.ts.
@@ -2634,6 +2644,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             modelId: orchLastModel,
             stage: "coordinator",
             kind: "parse_failure",
+          });
+          modelScorecard.record("coordinator", `${orchLastProvider}:${orchLastModel}`, {
+            ok: false,
+            firstTokenMs: orchLastFirstTokenMs,
           });
           console.warn(
             `[Jarvis Orchestrator] coordinator parse_failure strike ` +

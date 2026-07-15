@@ -1,3 +1,5 @@
+import type { ModelAttribution } from "../self-tuning/store";
+
 export interface ScorecardAttempt {
   ok: boolean;
   firstTokenMs?: number;
@@ -25,6 +27,28 @@ export class ModelScorecard {
     const list = this.slot(stage, providerModelKey);
     list.push(attempt);
     if (list.length > WINDOW_SIZE) list.splice(0, list.length - WINDOW_SIZE);
+  }
+
+  seedFromHistory(stage: string, rows: ModelAttribution[]): void {
+    if (rows.length === 0) return;
+    const byProviderModel = new Map<string, ModelAttribution[]>();
+    for (const row of rows) {
+      const providerModelKey = `${row.provider}:${row.model_id}`;
+      const bucket = byProviderModel.get(providerModelKey) ?? [];
+      if (bucket.length < 12) {
+        bucket.push(row);
+        byProviderModel.set(providerModelKey, bucket);
+      }
+    }
+
+    for (const [providerModelKey, bucket] of byProviderModel.entries()) {
+      for (const row of [...bucket].reverse()) {
+        this.record(stage, providerModelKey, {
+          ok: row.was_successful === 1 && row.had_error === 0,
+          firstTokenMs: row.first_token_ms,
+        });
+      }
+    }
   }
 
   errorRate(stage: string, providerModelKey: string): number | undefined {

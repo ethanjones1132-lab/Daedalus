@@ -997,6 +997,25 @@ export class SelfTuningStore {
     }
   }
 
+  getRecentStageAttributions(stageId: string, sinceIso: string, limit = 400): ModelAttribution[] {
+    const db = this.getDb();
+    if (!db) return [];
+    const boundedLimit = Math.max(1, Math.floor(limit || 400));
+    try {
+      return db.query(
+        `SELECT * FROM model_attributions
+         WHERE stage_id = ? AND created_at >= ?
+         ORDER BY created_at DESC, rowid DESC
+         LIMIT ?`,
+      ).all(stageId, sinceIso, boundedLimit) as ModelAttribution[];
+    } catch (e) {
+      console.error("[SelfTuningStore] getRecentStageAttributions failed:", e);
+      return [];
+    } finally {
+      db.close();
+    }
+  }
+
   getTrajectorySnapshots(limit = 50): TrajectorySnapshot[] {
     const db = this.getDb();
     if (!db) return [];
