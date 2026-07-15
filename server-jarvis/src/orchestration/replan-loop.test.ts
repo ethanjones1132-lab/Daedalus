@@ -251,6 +251,65 @@ describe("runPipelineWithReplanning", () => {
     expect(result.error_code).toBe("effect_gate_no_write_effect");
   });
 
+  test("evidence-insufficient replan forces executor even when revised route is synthesizer-only", async () => {
+    const segmentStages: string[][] = [];
+    const executor = {
+      executeSegment: async (
+        _request: string,
+        stages: string[],
+        _agentRunId: string,
+        _onStateChange: unknown,
+        _options: unknown,
+        carry: any = {},
+      ) => {
+        segmentStages.push([...stages]);
+        if (segmentStages.length === 1) {
+          return {
+            state: {
+              ...carry,
+              executor: { ok: false, narrative: "insufficient evidence", toolCalls: [] },
+            },
+            replanRequested: {
+              trigger: "evidence_insufficient",
+              detail: "needs real workspace evidence",
+            },
+          };
+        }
+        return {
+          state: {
+            ...carry,
+            executor: { ok: true, narrative: "executor reran", toolCalls: [] },
+          },
+          synthesizerAnswer: "final answer",
+          synthesizerEmptyCompletion: false,
+        };
+      },
+    } as unknown as PipelineExecutor;
+
+    const coordinator = new Coordinator((async () => ({ content: "unused" })) as any);
+    coordinator.route = (async () => baseDecision({
+      pipeline: ["synthesizer"],
+      coordinator_rationale: "parse fallback/default route",
+    })) as typeof coordinator.route;
+
+    await runPipelineWithReplanning({
+      contextMessage: "comprehensively audit this repo without modifying files",
+      initialDecision: baseDecision({ pipeline: ["executor", "synthesizer"] }),
+      turnRequirement: "full_execution",
+      coordinator,
+      routeOptions: { sessionId: "force-executor-replan" },
+      executor,
+      agentRunId: "run-force-executor-replan",
+      onStateChange: () => {},
+      baseOptions: {},
+      maxReplans: 1,
+    });
+
+    expect(segmentStages[0]).toEqual(["executor", "reviewer", "synthesizer"]);
+    expect(segmentStages[1]).toContain("executor");
+    expect(segmentStages[1]).toContain("synthesizer");
+  });
+
   test("read_only profile cannot escalate to full even if the replanned decision implies more authority", async () => {
     const profiles: Array<string | undefined> = [];
     const callModel = async () => ({ content: "ok" });

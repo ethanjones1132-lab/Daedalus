@@ -93,7 +93,11 @@ export const BUILTIN_MODES: Record<string, AgentMode> = {
  * an arbitrary turn count, so a stalled read-only executor still exits
  * quickly while a progressing one can keep reading.
  */
-export function executorTurnLimit(profile: ExecutionProfile): number {
+export function executorTurnLimit(
+  profile: ExecutionProfile,
+  context: { deepRead?: boolean; complexity?: "low" | "medium" | "high" } = {},
+): number {
+  if (context.deepRead || context.complexity === "high") return 8;
   return profile === "read_only" ? 4 : BUILTIN_MODES.executor.max_turns;
 }
 

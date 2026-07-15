@@ -114,6 +114,7 @@ import { PipelineExecutor } from "./orchestration/pipeline";
 import { combinedStageExclusions, StageHealthRegistry, type RecoverableFailureKind } from "./orchestration/stage-health";
 import { ModelScorecard, type ScorecardAttempt } from "./orchestration/model-scorecard";
 import { createTurnBudget } from "./orchestration/turn-budget";
+import { isDeepReadRequest } from "./orchestration/evidence-sufficiency";
 import { OrchestrationAdmissionController, type AdmissionLease } from "./orchestration/admission-controller";
 import type { PipelineProgressState, PipelineRecursionEvent } from "./orchestration/pipeline";
 import { ConductorBus } from "./orchestration/conductor-bus";
@@ -1301,7 +1302,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     message,
     continuationRequirements.get(sessionId),
   ).result.requirement;
-  const turnBudget = createTurnBudget(initialRequirement, "medium", turnStartedAt);
+  const turnBudget = createTurnBudget(
+    initialRequirement,
+    isDeepReadRequest(message) ? "high" : "medium",
+    turnStartedAt,
+  );
   const ensureTurnBudget = (stage: string): void => {
     if (Date.now() >= turnBudget.deadlineAt) {
       throw new TurnDeadlineExceededError(stage, turnBudget.turn_ms);
@@ -2813,6 +2818,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           executionProfile,
           rawMessage: message,
           turnRequirement: turnReq.requirement,
+          estimatedComplexity: route.context.estimated_complexity,
           workerInstructions: instructionSelection.instructions,
           sharedContext: mergedSharedContext,
           sessionMemory: sessionMemory,

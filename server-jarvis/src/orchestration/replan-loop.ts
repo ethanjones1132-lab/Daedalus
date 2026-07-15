@@ -40,6 +40,12 @@ function isStageCompleted(stage: StageName, carry: PipelineStageState): boolean 
   }
 }
 
+const FORCE_EXECUTOR_REPLAN_TRIGGERS = new Set([
+  "evidence_insufficient",
+  "executor_hard_failure",
+  "reviewer_reject",
+]);
+
 export interface ReplanLoopArgs {
   contextMessage: string;
   initialDecision: CoordinatorResult;
@@ -93,6 +99,7 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
   // is the binding constraint.
   let perTurnCap = args.maxReplans;
   let sessionCapHit = false;
+  const forceStages = new Set<StageName>();
 
   while (true) {
     const normalized = normalizeRoute(decision, args.turnRequirement, "model");
@@ -133,8 +140,9 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
       // re-injection.
       const explicitlyRequested = new Set(splitPipelineAtReplan(decision.pipeline).flat());
       const remainingPipeline = normalized.pipeline.filter(
-        (stage) => explicitlyRequested.has(stage) || !isStageCompleted(stage, carry),
+        (stage) => forceStages.has(stage) || explicitlyRequested.has(stage) || !isStageCompleted(stage, carry),
       );
+      for (const stage of remainingPipeline) forceStages.delete(stage);
       const segment = await args.executor.executeSegment(
         args.contextMessage,
         remainingPipeline,
@@ -154,6 +162,9 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
       // T2.4: mid-run replan trigger. When caps remain, re-route and continue.
       if (segment.replanRequested && !budgetExhausted) {
         carry = segment.state;
+        if (FORCE_EXECUTOR_REPLAN_TRIGGERS.has(segment.replanRequested.trigger)) {
+          forceStages.add("executor");
+        }
         const budget = args.baseOptions.turnBudget;
         if (budget && !budget.canStart("coordinator", Date.now())) {
           console.warn(`[replan-loop] skipping mid-run replan — finalization reserve`);

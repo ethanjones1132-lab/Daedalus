@@ -19,7 +19,7 @@ import { hasWriteIntent, type TurnRequirement } from "./turn-requirements";
 import type { TurnBudget } from "./turn-budget";
 import type { PipelineStageState, PlannerStageOutput, ExecutorStageOutput, ReviewerStageOutput, RewriterStageOutput, ToolCallRecord } from "./stage-output";
 import { isEmptyStageOutput, parseReviewerVerdict, renderExecutorSummary, renderPlanSummary, renderReviewerSummary, renderRewriterSummary } from "./stage-output";
-import { assessWorkspaceEvidence, evidenceFailure, isDeepReadRequest } from "./evidence-sufficiency";
+import { assessWorkspaceEvidence, evidenceFailure, isDeepReadRequest, turnNeedsWorkspaceEvidence } from "./evidence-sufficiency";
 import { substituteToolCall } from "../tool-heal";
 import {
   enforceTranscriptBudget,
@@ -111,6 +111,8 @@ export interface PipelineExecuteOptions {
   allowMidRunReplan?: boolean;
   /** Effect-gate recovery is deliberately one-shot even when other replans remain. */
   allowEffectGateReplan?: boolean;
+  /** Coordinator-estimated route complexity, used for depth-scaled executor limits. */
+  estimatedComplexity?: "low" | "medium" | "high";
   /** Trivial short-circuit turns should use the fastest synthesizer tier. */
   preferFastSynthesizer?: boolean;
 }
@@ -686,10 +688,18 @@ export class PipelineExecutor {
     const narratives: string[] = [];
     let turnCount = 0;
     let executorDone = false;
-    let workspaceEvidenceNudgeSent = false;
-    const requiresWorkspaceEvidence = options.turnRequirement === "workspace_read";
-    const maxTurns = executorTurnLimit(profile);
+    let workspaceEvidenceNudgeCount = 0;
+    let evidenceCountAtLastNudge = 0;
+    const intentText = options.rawMessage ?? request;
+    const requiresWorkspaceEvidence = turnNeedsWorkspaceEvidence(options.turnRequirement, intentText);
+    const maxTurns = executorTurnLimit(profile, {
+      deepRead: isDeepReadRequest(intentText),
+      complexity: options.estimatedComplexity,
+    });
     let executorTurn = 0;
+    const successfulEvidenceCount = () => toolCalls
+      .filter((call) => !call.is_error && call.output.trim().length > 0)
+      .length;
 
     // Git/SHA requests are deterministic read-only metadata requests. Some
     // text-protocol providers decline to emit a tool block even after the
@@ -854,7 +864,8 @@ export class PipelineExecutor {
           executorMessages.push({ role: "assistant", content: response.content, tool_calls: response.tool_calls });
           if (response.content) narratives.push(response.content);
 
-          if (response.tool_calls && response.tool_calls.length > 0) {
+          const emittedToolCalls = Boolean(response.tool_calls && response.tool_calls.length > 0);
+          if (emittedToolCalls) {
             await this.dispatchToolCalls("executor", response.tool_calls, options, async (tc, call, toolResult) => {
               toolCalls.push({
                 name: call.name,
@@ -916,31 +927,6 @@ export class PipelineExecutor {
                 }
               }
             });
-          } else if (
-            requiresWorkspaceEvidence &&
-            !assessWorkspaceEvidence(toolCalls, request).sufficient &&
-            !workspaceEvidenceNudgeSent &&
-            turnCount < maxTurns
-          ) {
-            // A workspace_read stage is not grounded merely because an executor
-            // model produced prose. Give it one bounded repair round to call a
-            // real read tool; if it declines again, the runtime fence below
-            // blocks synthesis instead of laundering stale prose as repo facts.
-            //
-            // The assessment scales with request depth (Phase 2 Task 2.1): a
-            // "comprehensively diagnose this repo" turn needs 3+ content reads
-            // before synthesis is allowed, so the nudge message tells the
-            // executor model exactly what is missing instead of asking for
-            // a single read.
-            const assessment = assessWorkspaceEvidence(toolCalls, request);
-            workspaceEvidenceNudgeSent = true;
-            executorMessages.push({
-              role: "user",
-              content:
-                `Workspace evidence is required for this turn. ${assessment.reason}. Call the relevant read-only workspace tools (read_file, list_directory, glob, grep, or git_metadata) and ground your findings in their results before answering.`,
-            });
-          } else {
-            executorDone = true;
           }
 
           // Task 2.4: a turn that added new successful evidence earns the
@@ -953,8 +939,41 @@ export class PipelineExecutor {
             .length;
           options.turnBudget?.extendStageOnProgress("executor", evidenceAddedThisTurn);
 
+          // A workspace-evidence stage is not grounded merely because an
+          // executor model produced prose. Give it a bounded repair nudge.
+          // The first nudge can fire on zero evidence; the second only fires
+          // after the previous nudge produced new successful evidence, so a
+          // refusing model cannot spin indefinitely.
+          const assessmentAfterTurn = assessWorkspaceEvidence(toolCalls, request);
+          let workspaceEvidenceNudgeSentThisTurn = false;
+          if (
+            requiresWorkspaceEvidence &&
+            !assessmentAfterTurn.sufficient &&
+            workspaceEvidenceNudgeCount < 2 &&
+            turnCount < maxTurns
+          ) {
+            const evidenceNow = successfulEvidenceCount();
+            const mayNudge =
+              workspaceEvidenceNudgeCount === 0 ||
+              evidenceNow > evidenceCountAtLastNudge;
+            if (mayNudge) {
+              workspaceEvidenceNudgeCount++;
+              evidenceCountAtLastNudge = evidenceNow;
+              workspaceEvidenceNudgeSentThisTurn = true;
+              executorMessages.push({
+                role: "user",
+                content:
+                  `Workspace evidence is required for this turn. ${assessmentAfterTurn.reason}. Call the relevant read-only workspace tools (read_file, list_directory, glob, grep, or git_metadata) and ground your findings in their results before answering.`,
+              });
+            }
+          }
+
+          if (!emittedToolCalls && !workspaceEvidenceNudgeSentThisTurn) {
+            executorDone = true;
+          }
+
           const turnToolErrors = toolCalls.slice(turnStartIdx).filter((call) => call.is_error);
-          const missingRequiredEvidence = requiresWorkspaceEvidence && !assessWorkspaceEvidence(toolCalls, request).sufficient;
+          const missingRequiredEvidence = requiresWorkspaceEvidence && !assessmentAfterTurn.sufficient;
           this.collector.recordStageRun({
             id: `stage_${crypto.randomUUID()}`,
             agent_run_id: agentRunId,
@@ -1680,6 +1699,7 @@ export class PipelineExecutor {
     const state: PipelineStageState = { ...carry };
     const profile: ExecutionProfile = options.executionProfile ?? "full";
     const intentText = options.rawMessage ?? request;
+    const requiresWorkspaceEvidence = turnNeedsWorkspaceEvidence(options.turnRequirement, intentText);
     // T2.1: ordered work queue (behavior-preserving vs if-ladder; enables T2.2 reroute).
     const workQueue: StageName[] = stages.filter(
       (s): s is StageName =>
@@ -1718,7 +1738,7 @@ export class PipelineExecutor {
           state.executor.ok === false &&
           wantsSynthesizer &&
           options.allowMidRunReplan !== false &&
-          options.turnRequirement !== "workspace_read"
+          !requiresWorkspaceEvidence
         ) {
           replanRequested = {
             trigger: "executor_hard_failure",
@@ -1749,7 +1769,6 @@ export class PipelineExecutor {
           wantsSynthesizer &&
           options.allowMidRunReplan !== false &&
           profile === "full" &&
-          hasWriteIntent(intentText) &&
           (options.maxReviewRepairRounds ?? 1) > 0
         ) {
           replanRequested = {
@@ -1843,7 +1862,7 @@ export class PipelineExecutor {
     }
 
     const preSynthAssessment = assessWorkspaceEvidence(state.executor?.toolCalls, request);
-    if (options.turnRequirement === "workspace_read" && !preSynthAssessment.sufficient) {
+    if (requiresWorkspaceEvidence && !preSynthAssessment.sufficient) {
       const failure = evidenceFailure(preSynthAssessment);
       // T2.4: evidence fence failure requests replan (first occurrence).
       if (options.allowMidRunReplan !== false) {
@@ -1894,7 +1913,7 @@ export class PipelineExecutor {
     onStateChange: (state: PipelineProgressState) => void,
     options: PipelineExecuteOptions = {}
   ): Promise<PipelineResult> {
-    const requiresWorkspaceEvidence = options.turnRequirement === "workspace_read";
+    const requiresWorkspaceEvidence = turnNeedsWorkspaceEvidence(options.turnRequirement, options.rawMessage ?? request);
     if (!requiresWorkspaceEvidence && this.canRunSpeculativeParallel(pipeline, options.topology)) {
       return this.executeSpeculativeParallel(request, pipeline, agentRunId, onStateChange, options);
     }

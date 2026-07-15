@@ -160,6 +160,16 @@ function maskToolCallExemplars(text: string): { text: string; found: boolean } {
   return { text: maskedText, found };
 }
 
+export function hasWorkspaceSignal(message: string): boolean {
+  const masked = maskToolCallExemplars((message || "").trim());
+  const intentText = masked.text;
+  return Boolean(
+    detectPath(intentText) ||
+    STRONG_WORKSPACE.test(intentText) ||
+    WEAK_WORKSPACE.test(intentText)
+  );
+}
+
 // ── Verb / noun signals ─────────────────────────────────────────────────────
 // Mutation verbs: any of these (as a whole word) signals the user wants the
 // system to CHANGE something — files, builds, commits, deployments.

@@ -209,10 +209,11 @@ export function normalizeRemainingStages(
     if (!step) continue;
     if (step === "conductor_replan") continue;
     const raw = String(step);
-    const stage = (raw.startsWith("re-enter:") ? raw.slice("re-enter:".length) : raw) as StageName;
+    const reenter = raw.startsWith("re-enter:");
+    const stage = (reenter ? raw.slice("re-enter:".length) : raw) as StageName;
     if (!VALID_STAGE_SET.has(stage)) continue;
     if (!allowed.has(stage)) continue;
-    if (stage === currentStage) continue;
+    if (stage === currentStage && !reenter) continue;
     if (seen.has(stage)) continue;
     seen.add(stage);
     collected.push(stage);

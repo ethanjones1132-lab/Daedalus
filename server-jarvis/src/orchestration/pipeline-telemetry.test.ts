@@ -144,6 +144,87 @@ describe("pipeline stage telemetry", () => {
     });
   });
 
+  test("full_execution research turns require workspace evidence and request a replan", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") {
+        return { content: "I can infer the architecture without reading.", tool_calls: [] };
+      }
+      if (options.stageLabel === "synthesizer") {
+        return { content: "Ungrounded architecture summary." };
+      }
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const segment = await executor.executeSegment(
+      "comprehensively audit this repo without modifying files",
+      ["executor", "synthesizer"],
+      "run-full-exec-research-evidence",
+      () => {},
+      {
+        executionProfile: "full",
+        turnRequirement: "full_execution",
+        rawMessage: "comprehensively audit this repo without modifying files",
+        allowMidRunReplan: true,
+      },
+    );
+
+    expect(segment.synthesizerAnswer).toBe("");
+    expect(segment.synthesizerFatalError).toContain("Workspace inspection failed");
+    expect(segment.fatalErrorCode).toBe("missing_workspace_evidence");
+    expect(segment.replanRequested?.trigger).toBe("evidence_insufficient");
+    expect(rows.some((row) => row.mode_id === "synthesizer")).toBe(false);
+  });
+
+  test("workspace evidence nudge is bounded to two and the second requires new evidence", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("read_file"), async () => "file contents");
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    let executorCalls = 0;
+    const executorInputs: any[][] = [];
+    const callModel = async (messages: any[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") {
+        executorCalls += 1;
+        executorInputs.push(messages.map((message) => ({ ...message })));
+        if (executorCalls === 1) {
+          return { content: "I should answer from memory.", tool_calls: [] };
+        }
+        if (executorCalls === 2) {
+          return {
+            content: "Reading one file.",
+            tool_calls: [toolCallWithArgs("read_file", { path: "src/a.ts" })],
+          };
+        }
+        return { content: "I have enough now.", tool_calls: [] };
+      }
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    await executor.executeSegment(
+      "comprehensively audit src without modifying files",
+      ["executor"],
+      "run-progress-aware-nudges",
+      () => {},
+      {
+        executionProfile: "read_only",
+        turnRequirement: "workspace_read",
+        rawMessage: "comprehensively audit src without modifying files",
+      },
+    );
+
+    const thirdExecutorInput = executorInputs[2].map((message) => message.content ?? "").join("\n");
+    const nudgeCount = (thirdExecutorInput.match(/Workspace evidence is required/g) ?? []).length;
+    expect(nudgeCount).toBe(2);
+    expect(executorCalls).toBe(3);
+  });
+
   // Task 2.2: deep-read requests get a deterministic list_directory + anchor
   // read_file preflight (pipeline.ts's runExecutorStage, before the model's
   // first turn) so a weak executor model starts already grounded instead of

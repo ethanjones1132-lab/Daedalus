@@ -79,7 +79,7 @@ const BUDGETS: Record<TurnRequirement, Omit<TurnBudget, "requirement" | "complex
   // class as planner's, and would silently recur the moment that model
   // (or any future reviewer-stage model with a similarly large override)
   // is enabled.
-  full_execution: { turn_ms: 150_000, finalization_reserve_ms: 30_000, max_stage_attempts: 2, stage_ms: { coordinator: 15_000, planner: 60_000, executor: 30_000, reviewer: 60_000, rewriter: 30_000 } },
+  full_execution: { turn_ms: 150_000, finalization_reserve_ms: 30_000, max_stage_attempts: 2, stage_ms: { coordinator: 15_000, planner: 60_000, executor: 60_000, reviewer: 60_000, rewriter: 30_000 } },
 };
 
 // 2026-07-13 finding: agent-pool.ts's DEFAULT_ORCHESTRATOR_AGENTS gives

@@ -14,7 +14,7 @@ describe("turn budgets", () => {
     const budget = createTurnBudget("full_execution", "high", 0);
     expect(budget.max_stage_attempts).toBe(2);
     expect(budget.turn_ms).toBe(180_000);
-    expect(budget.stageRemainingMs("executor", 1_000)).toBe(30_000);
+    expect(budget.stageRemainingMs("executor", 1_000)).toBe(60_000);
   });
 
   test("uses compact budgets for conversational turns", () => {
@@ -129,6 +129,12 @@ describe("turn budgets", () => {
 
     const actualWatchdogDelayMs = Math.min(stageRemainingMs, resolvedFirstTokenMs);
     expect(actualWatchdogDelayMs).toBe(55_000); // was 20_000 before the fix
+  });
+
+  test("full_execution executor has parity with workspace_read at 60s", () => {
+    const budget = createTurnBudget("full_execution", "medium", 0);
+    expect(budget.stage_ms.executor).toBe(60_000);
+    expect(budget.stageRemainingMs("executor", 0)).toBe(60_000);
   });
 
   // workspace_read's executor is the third stage affected by the same bug

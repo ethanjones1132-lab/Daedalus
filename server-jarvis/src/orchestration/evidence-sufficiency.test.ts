@@ -4,7 +4,9 @@ import {
   assessWorkspaceEvidence,
   evidenceFailure,
   isDeepReadRequest,
+  turnNeedsWorkspaceEvidence,
 } from "./evidence-sufficiency";
+import { hasWorkspaceSignal } from "./turn-requirements";
 import type { ToolCallRecord } from "./stage-output";
 
 const ls: ToolCallRecord = {
@@ -80,6 +82,30 @@ describe("isDeepReadRequest", () => {
     // mention 'repo' will be classified as deep — that is by design and
     // is the bug class the depth-scaled sufficiency exists to catch.
     expect(isDeepReadRequest("list the files in C:\\repo")).toBe(true);
+  });
+});
+
+describe("turnNeedsWorkspaceEvidence", () => {
+  test("hasWorkspaceSignal recognizes exported path and workspace signals", () => {
+    expect(hasWorkspaceSignal("audit src/orchestration/pipeline.ts")).toBe(true);
+    expect(hasWorkspaceSignal("summarize this repo")).toBe(true);
+    expect(hasWorkspaceSignal("what is a JSON file?")).toBe(false);
+  });
+
+  test("workspace_read always requires workspace evidence", () => {
+    expect(turnNeedsWorkspaceEvidence("workspace_read", "what version is in package.json?")).toBe(true);
+    expect(turnNeedsWorkspaceEvidence("workspace_read", "thanks")).toBe(true);
+  });
+
+  test("full_execution research requires evidence when deep-read or workspace-scoped but not write intent", () => {
+    expect(turnNeedsWorkspaceEvidence("full_execution", "comprehensively audit this repo without modifying files")).toBe(true);
+    expect(turnNeedsWorkspaceEvidence("full_execution", "create an architecture report for src/index.ts, no edits")).toBe(true);
+  });
+
+  test("full_execution write turns and non-workspace answer turns do not use workspace evidence fences", () => {
+    expect(turnNeedsWorkspaceEvidence("full_execution", "write src/index.ts")).toBe(false);
+    expect(turnNeedsWorkspaceEvidence("full_execution", "write me a poem")).toBe(false);
+    expect(turnNeedsWorkspaceEvidence("answer_only", "explain event loops")).toBe(false);
   });
 });
 

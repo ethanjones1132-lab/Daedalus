@@ -23,6 +23,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 import type { ToolCallRecord } from "./stage-output";
+import { hasWorkspaceSignal, hasWriteIntent, type TurnRequirement } from "./turn-requirements";
 
 const DEEP_READ_MARKERS =
   /\b(comprehensiv\w*|thorough\w*|entire|whole|all files|full|in[- ]depth|architecture|architectural|audit|diagnos\w*|repo|repository|codebase)\b/i;
@@ -68,6 +69,16 @@ export interface EvidenceAssessment {
  */
 export function isDeepReadRequest(request: string): boolean {
   return DEEP_READ_MARKERS.test(request);
+}
+
+export function turnNeedsWorkspaceEvidence(
+  requirement: TurnRequirement | undefined,
+  intentText: string,
+): boolean {
+  if (requirement === "workspace_read") return true;
+  if (requirement !== "full_execution") return false;
+  if (hasWriteIntent(intentText)) return false;
+  return isDeepReadRequest(intentText) || hasWorkspaceSignal(intentText);
 }
 
 /**
