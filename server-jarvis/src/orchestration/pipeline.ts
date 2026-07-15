@@ -564,6 +564,12 @@ export class PipelineExecutor {
       return { raw, call, name: call.name };
     });
     const readOnlyOutputCache = duplicateReadOnlyOutputs;
+    const cacheInvalidatingTools = new Set([
+      ...WRITE_EFFECT_TOOLS,
+      ...this.runtime.listTools()
+        .filter((tool) => tool.dangerous)
+        .map((tool) => tool.function.name),
+    ]);
     for (const batch of partitionToolCalls(parsed)) {
       const settled = await Promise.all(
         batch.map(async (entry) => {
@@ -595,7 +601,7 @@ export class PipelineExecutor {
         );
         await record(entry.raw, entry.call, result);
       }
-      if (readOnlyOutputCache && settled.some(({ entry, deflected }) => !deflected && WRITE_EFFECT_TOOLS.has(entry.call.name))) {
+      if (readOnlyOutputCache && settled.some(({ entry, deflected }) => !deflected && cacheInvalidatingTools.has(entry.call.name))) {
         readOnlyOutputCache.clear();
       }
     }

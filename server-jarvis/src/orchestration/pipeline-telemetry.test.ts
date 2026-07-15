@@ -467,6 +467,55 @@ describe("pipeline stage telemetry", () => {
     ]);
   });
 
+  test("a dangerous side-effect tool also invalidates duplicate read-only deflection", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    let listRuns = 0;
+    let sideEffectRuns = 0;
+    runtime.register(toolDefinition("list_directory"), async () => {
+      listRuns++;
+      return `snapshot-${listRuns}`;
+    });
+    runtime.register({ ...toolDefinition("bash"), requires_approval: false, dangerous: true }, async () => {
+      sideEffectRuns++;
+      return "mutated workspace";
+    });
+    const cfg = defaultConfig();
+    cfg.tools = { ...cfg.tools, require_approval: [], sandbox_mode: "permissive" };
+    const ctx = makeExecutionContext("agent", cfg, { workspace_path: process.cwd() });
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor" && executorTurns++ === 0) {
+        return {
+          content: "list, mutate, list again",
+          tool_calls: [
+            toolCallWithArgs("list_directory", { path: "src" }),
+            toolCallWithArgs("bash", { command: "touch src/generated.txt" }),
+            toolCallWithArgs("list_directory", { path: "src" }),
+          ],
+        };
+      }
+      if (options.stageLabel === "executor") return { content: "done" };
+      if (options.stageLabel === "synthesizer") return { content: "Updated src." };
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "mutate the workspace and relist src",
+      ["executor", "synthesizer"],
+      "run-dangerous-invalidates-duplicate-deflection",
+      () => {},
+      { executionProfile: "full" },
+    );
+
+    expect(sideEffectRuns).toBe(1);
+    expect(listRuns).toBe(2);
+    expect((result.toolCalls ?? []).filter((call) => call.name === "list_directory").map((call) => call.output))
+      .toEqual(["snapshot-1", "snapshot-2"]);
+  });
+
   test("duplicate deflections do not inflate executor evidence progress counts", async () => {
     const rows: StageRun[] = [];
     const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
