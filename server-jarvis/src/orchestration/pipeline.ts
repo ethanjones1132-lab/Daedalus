@@ -1041,6 +1041,7 @@ export class PipelineExecutor {
     onStateChange: (state: PipelineProgressState) => void,
     options: PipelineExecuteOptions,
     profile: ExecutionProfile,
+    remainingQueue: StageName[] = [],
   ): Promise<RewriterStageOutput> {
     const rewriterPrompt = stageSystemPrompt("rewriter", options);
     const boundedReviewerFeedback = truncateToTokenBudget(reviewerFeedback, 2_000);
@@ -1218,6 +1219,7 @@ export class PipelineExecutor {
     onStateChange: (state: PipelineProgressState) => void,
     options: PipelineExecuteOptions,
     profile: ExecutionProfile,
+    remainingQueue: StageName[] = [],
   ): Promise<{ reviewer: ReviewerStageOutput; rewriter?: RewriterStageOutput }> {
     const reviewerPrompt = stageSystemPrompt("reviewer", options);
     const boundedRequest = truncateToTokenBudget(request, 1_000);
@@ -1312,7 +1314,7 @@ export class PipelineExecutor {
         ]);
         repairs++;
         onStateChange({ stage: "rewriter", status: "running", output: `\nReviewer flagged issues. Rewriting...\n` });
-        rewriterOutput = await this.runRewriterStage(request, reviewerFeedback, executorSummary, agentRunId, onStateChange, options, profile);
+        rewriterOutput = await this.runRewriterStage(request, reviewerFeedback, executorSummary, agentRunId, onStateChange, options, profile, remainingQueue);
         rewriterSummaryForPrompt = renderRewriterSummary(rewriterOutput);
         const afterWrites = successfulWriteKeys([
           ...executorToolCalls,
@@ -1729,7 +1731,7 @@ export class PipelineExecutor {
       if (stage === "reviewer") {
         const { reviewer, rewriter } = await this.runReviewerRewriterLoop(
           request, renderPlanSummary(state.plan), renderExecutorSummary(state.executor), state.executor?.toolCalls ?? [],
-          agentRunId, onStateChange, opts, profile,
+          agentRunId, onStateChange, opts, profile, remainingNow(),
         );
         state.reviewer = reviewer;
         if (rewriter) {

@@ -115,7 +115,7 @@ describe("Orchestration & Routing Tests", () => {
 
   test("planner empty completion is recorded as a failed stage and the run degrades", async () => {
     const runtime = createToolRuntime();
-    const ctx = makeExecutionContext("agent", defaultConfig);
+    const ctx = makeExecutionContext("agent", defaultConfig());
     const recorded: any[] = [];
     const collector = { recordStageRun: (row: any) => recorded.push(row) };
     const callModel = async (_messages: any[], options: any) => {
@@ -124,7 +124,7 @@ describe("Orchestration & Routing Tests", () => {
       if (options.stageLabel === "reviewer") return { content: "ACCEPT: fine" };
       return { content: "final answer" };
     };
-    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector as any);
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
 
     const result = await executor.execute(
       "plan something",
@@ -137,7 +137,59 @@ describe("Orchestration & Routing Tests", () => {
     expect(plannerRow.was_successful).toBe(0);
     expect(plannerRow.had_error).toBe(1);
     expect(plannerRow.error_message).toBe("empty_completion");
-    expect(result.outcome).not.toBe("success");
+    expect(result.outcome).toBe("degraded");
+  });
+
+  test("reviewer empty completion is recorded as a failed stage", async () => {
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig());
+    const recorded: any[] = [];
+    const collector = { recordStageRun: (row: any) => recorded.push(row) };
+    const callModel = async (_messages: any[], options: any) => {
+      if (options.stageLabel === "executor") return { content: "did work" };
+      if (options.stageLabel === "reviewer") return { content: "   " };
+      return { content: "final answer" };
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+
+    await executor.execute(
+      "review this",
+      ["executor", "reviewer", "synthesizer"],
+      "run-empty-reviewer",
+      () => {},
+    );
+
+    const reviewerRow = recorded.find((row) => row.mode_id === "reviewer");
+    expect(reviewerRow.was_successful).toBe(0);
+    expect(reviewerRow.had_error).toBe(1);
+    expect(reviewerRow.error_message).toBe("empty_completion");
+  });
+
+  test("tool-free rewriter empty completion is recorded as a failed stage", async () => {
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig());
+    const recorded: any[] = [];
+    const collector = { recordStageRun: (row: any) => recorded.push(row) };
+    const callModel = async (_messages: any[], options: any) => {
+      if (options.stageLabel === "executor") return { content: "did work" };
+      if (options.stageLabel === "reviewer") return { content: "REJECT: make the requested change" };
+      if (options.stageLabel === "rewriter") return { content: "" };
+      return { content: "final answer" };
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+
+    await executor.execute(
+      "fix config.ts",
+      ["executor", "reviewer", "synthesizer"],
+      "run-empty-rewriter",
+      () => {},
+      { rawMessage: "fix config.ts", executionProfile: "full" },
+    );
+
+    const rewriterRow = recorded.find((row) => row.mode_id === "rewriter");
+    expect(rewriterRow.was_successful).toBe(0);
+    expect(rewriterRow.had_error).toBe(1);
+    expect(rewriterRow.error_message).toBe("empty_completion");
   });
 
   test("rewriter timeout yields a partial result and terminal timed_out stage", async () => {
