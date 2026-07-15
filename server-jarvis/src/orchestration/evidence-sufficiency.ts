@@ -29,6 +29,30 @@ const DEEP_READ_MARKERS =
   /\b(comprehensiv\w*|thorough\w*|entire|whole|all files|full|in[- ]depth|architecture|architectural|audit|diagnos\w*|repo|repository|codebase)\b/i;
 /** Genuine file-content tools — the only ones that count toward the deep-read floor. */
 const DEEP_READ_CONTENT_TOOLS = new Set(["read_file", "grep"]);
+const NON_SOURCE_READ_BASENAMES = new Set([
+  "app.json",
+  "bun.lock",
+  "bun.lockb",
+  "cargo.lock",
+  "cargo.toml",
+  "composer.json",
+  "context.md",
+  "gemfile",
+  "go.mod",
+  "go.sum",
+  "jsconfig.json",
+  "manifest.json",
+  "npm-shrinkwrap.json",
+  "package-lock.json",
+  "package.json",
+  "pnpm-lock.yaml",
+  "pom.xml",
+  "pyproject.toml",
+  "readme",
+  "requirements.txt",
+  "tsconfig.json",
+  "yarn.lock",
+]);
 /** Broader shallow-evidence set: file content OR repo metadata satisfies a shallow turn. */
 const SHALLOW_EVIDENCE_TOOLS = new Set(["read_file", "grep", "git_metadata"]);
 const LISTING_TOOLS = new Set(["list_directory", "glob"]);
@@ -40,6 +64,38 @@ function distinctTargetKeys(calls: ToolCallRecord[], tools: Set<string>): Set<st
     if (tools.has(call.name)) keys.add(`${call.name}:${JSON.stringify(call.arguments)}`);
   }
   return keys;
+}
+
+function isNonSourceReadTarget(call: ToolCallRecord): boolean {
+  if (!DEEP_READ_CONTENT_TOOLS.has(call.name)) return false;
+  const args = call.arguments as Record<string, unknown> | undefined;
+  const rawPath = typeof args?.path === "string" ? args.path : undefined;
+  if (!rawPath) return false;
+  const basename = rawPath.replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
+  return NON_SOURCE_READ_BASENAMES.has(basename) || /^readme\./i.test(basename);
+}
+
+function distinctDeepReadTargetKeys(calls: ToolCallRecord[]): Set<string> {
+  return new Set(
+    [...distinctTargetKeys(calls, DEEP_READ_CONTENT_TOOLS)].filter((key) => {
+      const separator = key.indexOf(":");
+      const name = key.slice(0, separator);
+      const argsJson = key.slice(separator + 1);
+      let args: Record<string, unknown> | undefined;
+      try {
+        args = JSON.parse(argsJson) as Record<string, unknown>;
+      } catch {
+        return true;
+      }
+      return !isNonSourceReadTarget({
+        name,
+        arguments: args,
+        output: "",
+        is_error: false,
+        duration_ms: 0,
+      });
+    }),
+  );
 }
 
 /**
@@ -100,7 +156,7 @@ export function assessWorkspaceEvidence(
   if (deepRead) {
     // Deep-read floor: only genuine file-content reads count, deduped by
     // (tool, arguments) so reading the same file 3 times can't fake it.
-    const distinctContentReads = distinctTargetKeys(calls, DEEP_READ_CONTENT_TOOLS).size;
+    const distinctContentReads = distinctDeepReadTargetKeys(calls).size;
     const sufficient = distinctContentReads >= DEEP_READ_MIN_CONTENT_READS;
     return {
       sufficient,

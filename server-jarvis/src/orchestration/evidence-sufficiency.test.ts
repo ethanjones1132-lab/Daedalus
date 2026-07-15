@@ -124,7 +124,7 @@ describe("assessWorkspaceEvidence", () => {
 
   test("listing plus three file reads is sufficient for a deep read", () => {
     const a = assessWorkspaceEvidence(
-      [ls, read("a.ts"), read("b.ts"), read("c.json")],
+      [ls, read("a.ts"), read("b.ts"), read("c.ts")],
       "comprehensively diagnose this repo",
     );
     expect(a.sufficient).toBe(true);
@@ -163,6 +163,16 @@ describe("assessWorkspaceEvidence", () => {
     );
     expect(a.sufficient).toBe(false); // 3 calls, but only 1 DISTINCT target
     expect(a.contentReads).toBe(1);
+  });
+
+  test("manifests and overview files do not satisfy the deep-read source floor", () => {
+    const a = assessWorkspaceEvidence(
+      [read("package.json"), read("README.md"), read("tsconfig.json")],
+      "comprehensively diagnose this repo",
+    );
+
+    expect(a.sufficient).toBe(false);
+    expect(a.contentReads).toBe(0);
   });
 
   test("git_metadata alone still satisfies a shallow request (the git/SHA preflight case)", () => {
