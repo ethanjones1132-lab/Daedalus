@@ -110,7 +110,7 @@ import { SessionMemory, mergeSharedContextHints } from "./orchestration/session-
 import { AgentPool, firstTokenTimeoutFor, formatPoolDiversity } from "./orchestration/agent-pool";
 import { excludedModelKeys } from "./model-failure-memory";
 import { PipelineExecutor } from "./orchestration/pipeline";
-import { StageHealthRegistry, type RecoverableFailureKind } from "./orchestration/stage-health";
+import { combinedStageExclusions, StageHealthRegistry, type RecoverableFailureKind } from "./orchestration/stage-health";
 import { createTurnBudget } from "./orchestration/turn-budget";
 import { OrchestrationAdmissionController, type AdmissionLease } from "./orchestration/admission-controller";
 import type { PipelineProgressState, PipelineRecursionEvent } from "./orchestration/pipeline";
@@ -1635,6 +1635,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let poolResolvedAgent: import("./orchestration/agent-pool").OrchestratorAgent | undefined;
           const stageLabel = callOptions?.stageLabel as string | undefined;
           const cascadeTier = callOptions?.cascadeTier as "cheap" | "strong" | undefined;
+          // F2: one exclusion union for both pool selection and the fallback
+          // cascade. A cooldown that reaches only the pool is not a cooldown.
+          const stageExclusions = stageLabel
+            ? combinedStageExclusions(stageHealth, stageLabel, excludeModels, excludedModelKeys())
+            : new Set<string>(excludeModels ?? []);
           if (stageLabel && cfg.orchestrator?.enabled) {
             try {
               const pool = new AgentPool(routableOrchestratorAgents(cfg));
@@ -1652,9 +1657,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               // (north-mini-code-free 400s every single turn because nothing
               // remembered the previous failure). Build a fresh union set so
               // the caller's `excludeModels` is never mutated.
-              const poolExcludeModels = new Set<string>(excludeModels ?? []);
-              for (const key of excludedModelKeys()) poolExcludeModels.add(key);
-              for (const key of stageHealth.excludedModelKeys(stageLabel)) poolExcludeModels.add(key);
+              const poolExcludeModels = stageExclusions;
               if (cascadeTier) {
                 const chain = pool.cascadeChain(stageLabel, orchestratorTaskType, poolExcludeModels);
                 agent = cascadeTier === "cheap" ? chain[0] : chain[chain.length - 1];
@@ -1829,7 +1832,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 stage: callOptions?.stageLabel,
                 taskType: orchestratorTaskType,
                 cascadeTier: callOptions?.cascadeTier,
-                excludeModels,
+                excludeModels: stageExclusions,
                 deadlineAt: turnBudget.deadlineAt,
                 turnBudgetMs: TOTAL_TURN_TIMEOUT_MS,
               });
@@ -1838,6 +1841,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               actualProviderUsed = result.provider_used;
               attemptModel = actualModelUsed;
               attemptProvider = actualProviderUsed;
+              if (poolModel && actualModelUsed !== poolModel) {
+                console.warn(
+                  `[Jarvis Orchestrator] cascade override: pool resolved ${poolModel} but fallback served ` +
+                  `${actualProviderUsed}:${actualModelUsed} for stage=${callOptions?.stageLabel ?? "agent"}`,
+                );
+              }
               if (result.retries > 0) {
                 console.log(`[Jarvis Orchestrator] callModel used model ${result.model_used} after ${result.retries} retry attempt(s)`);
                 await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "fallback_notice", model: result.model_used, retries: result.retries, session_id: sessionId })}\n\n`));

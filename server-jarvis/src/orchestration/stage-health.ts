@@ -100,3 +100,21 @@ export class StageHealthRegistry {
 export function stageHealthKey(agent: Pick<OrchestratorAgent, "provider" | "model_id">, stage: string): string {
   return failureKey(agent.provider, agent.model_id, stage);
 }
+
+/**
+ * Build the single exclusion set shared by stage-aware pool selection and the
+ * fallback cascade. Without this union, the pool can avoid a cooled-down model
+ * while the fallback resolver immediately selects it again.
+ */
+export function combinedStageExclusions(
+  registry: StageHealthRegistry,
+  stage: string,
+  ...extra: Array<ReadonlySet<string> | undefined>
+): Set<string> {
+  const result = new Set<string>(registry.excludedModelKeys(stage));
+  for (const set of extra) {
+    if (!set) continue;
+    for (const key of set) result.add(key);
+  }
+  return result;
+}
