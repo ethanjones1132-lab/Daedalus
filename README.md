@@ -7,7 +7,7 @@ Native Rust shell · Bun HTTP server · React UI · SQLite persistence · Multi-
 
 [![License](https://img.shields.io/badge/license-MIT-green)](src-tauri/LICENSE)
 [![Version](https://img.shields.io/badge/version-3.0.0-blue)](package.json)
-[![Tests](https://img.shields.io/badge/tests-1102%20bun%20|%2085%20cargo-success)](scripts/verify.sh)
+[![Tests](https://img.shields.io/badge/tests-1104%20bun%20|%2085%20cargo-success)](scripts/verify.sh)
 [![Platform](https://img.shields.io/badge/platform-Windows%20|%20Linux%20|%20macOS-lightgrey)]()
 
 </div>
@@ -262,7 +262,7 @@ Auto-created on first run at:
 
 ## Verification
 
-The current automated baseline is **1,102 Bun tests across 105 files**, **85 Cargo tests**, and clean server/UI TypeScript checks.
+The current automated baseline is **1,104 Bun tests across 105 files**, **85 Cargo tests**, and clean server/UI TypeScript checks.
 
 The fastest way to check everything is healthy:
 
