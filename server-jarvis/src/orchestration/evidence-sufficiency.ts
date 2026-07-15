@@ -103,6 +103,7 @@ function grepOutputSourceFileKeys(call: ToolCallRecord, workspaceRoot?: string):
   const args = call.arguments as Record<string, unknown> | undefined;
   const grepPath = typeof args?.path === "string" ? args.path : undefined;
   const grepPathIsFile = grepPath ? sourceFileKey(grepPath, workspaceRoot) !== undefined : false;
+  const normalizedGrepPath = grepPath ? normalizePath(grepPath).path.replace(/^\.\/+/, "") : "";
   const keys = new Set<string>();
   for (const rawLine of call.output.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -115,11 +116,14 @@ function grepOutputSourceFileKeys(call: ToolCallRecord, workspaceRoot?: string):
       .replace(/^[([{\"'`]+/g, "")
       .replace(/[,:;"'`]+$/g, "");
     const normalizedCandidate = normalizePath(candidate);
-    const candidateHasDirectory = normalizedCandidate.path.includes("/");
+    const normalizedCandidatePath = normalizedCandidate.path.replace(/^\.\/+/, "");
+    const candidateAlreadyUnderGrepPath = !normalizedGrepPath
+      || normalizedCandidatePath === normalizedGrepPath
+      || normalizedCandidatePath.startsWith(`${normalizedGrepPath}/`);
     const rawCandidate = grepPath
       && !grepPathIsFile
       && !normalizedCandidate.absolute
-      && !candidateHasDirectory
+      && !candidateAlreadyUnderGrepPath
       && !/[?*]/.test(grepPath)
       ? `${grepPath.replace(/[\\/]+$/, "")}/${candidate}`
       : candidate;

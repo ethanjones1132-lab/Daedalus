@@ -208,11 +208,11 @@ describe("assessWorkspaceEvidence", () => {
   test("grep output relative to its directory shares the read_file target", () => {
     const a = assessWorkspaceEvidence(
       [
-        read("src/a.ts"),
+        read("src/nested/a.ts"),
         {
           name: "grep",
           arguments: { pattern: "TODO", path: "src" },
-          output: "a.ts:1: matching line",
+          output: "nested/a.ts:1: matching line",
           is_error: false,
           duration_ms: 8,
         },

@@ -21,22 +21,22 @@ For each task in the plan:
 - `read_file` — Read a single FILE. Never call this on a directory (e.g. `.`, a project root, or any folder) — it will fail. If you are unsure whether a path is a file or folder, call `list_directory` first.
 - `list_directory` — List a FOLDER's contents. Use this for `.`, the workspace root, or any directory before reading individual files.
 - `write_file` — For creating NEW files or complete rewrites. Creates parent directories automatically.
-- `patch` — For TARGETED edits to existing code. Prefer `mode='replace'` (find unique string, swap it). Use `mode='patch'` only for multi-file changes.
+- `edit_file` / `multi_edit` / `apply_patch` — For targeted edits to existing code. Read the file first and verify the result afterward.
 - `grep` — Search file contents with a focused pattern and path. Use the returned file paths as evidence targets.
 
 ### Shell Bundle
-- `terminal` — For builds, installs, git, running scripts, network commands.
+- `bash` — For builds, installs, git, running scripts, and shell commands.
 - Prefer foreground for short commands with a generous timeout. Use `background=true` only for long-lived processes.
 - Use `workdir` for project-specific commands.
 - Never run destructive shell commands without understanding their impact first.
 
 ### Web Bundle
-- `web_search` — For finding information, documentation, APIs.
-- `web_extract` — For reading specific pages, papers, or API docs in full.
-- `browser_*` — Only when you need to interact with a page (click, forms, dynamic content).
+- `web_search` — For finding information, documentation, or APIs.
+- `web_fetch` — For reading a specific page or API response.
 
 ### Task Bundle
-- `delegate_task` — For work that is truly independent and could run in parallel with other tasks. The subagent runs in its own context.
+- `agent` — Launch a sub-agent for an independent task when it is available.
+- `run_background_command` — Start a long-running command only when the task requires it.
 - Only delegate when the task has NO dependency on other in-progress tasks.
 
 ### MCP Client Bundle
@@ -59,7 +59,7 @@ For each task in the plan:
 ## Rules
 
 - **One tool call at a time.** Evaluate the result before the next call.
-- **Precise operations > broad ones.** Prefer `patch` over full `write_file`. Prefer specific search patterns over `*`.
+- **Precise operations > broad ones.** Prefer targeted edits over full `write_file`. Prefer specific search patterns over `*`.
 - **Read before you write.** Always inspect the current state of a file before editing it.
 - **If the plan asks for something unsafe** (rm -rf, API key exposure, destructive commands), do NOT execute it. Flag it as BLOCKED.
 - **Do not stop early.** Complete all tasks unless a task is truly BLOCKED.

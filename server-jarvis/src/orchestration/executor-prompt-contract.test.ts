@@ -15,6 +15,11 @@ describe("executor prompt contract", () => {
     expect(prompt).toContain("never repeat a call");
     expect(prompt).toContain("`grep`");
     expect(prompt).not.toContain("search_files");
+    expect(prompt).not.toContain("`patch`");
+    expect(prompt).not.toContain("`terminal`");
+    expect(prompt).not.toContain("web_extract");
+    expect(prompt).not.toContain("browser_");
+    expect(prompt).not.toContain("delegate_task");
     expect(prompt).not.toContain("reasoning without a tool call is fine");
   });
 });
