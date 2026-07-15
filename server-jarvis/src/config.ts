@@ -9,6 +9,7 @@ import { join, resolve } from "path";
 import { homedir } from "os";
 import { execSync } from "child_process";
 import { DEFAULT_ORCHESTRATOR_AGENTS, type OrchestratorAgent } from "./orchestration/agent-pool";
+import { validateOrchestratorAgents } from "./orchestration/agent-validation";
 
 // ── Types ──
 
@@ -273,6 +274,12 @@ export interface ConductorLearningConfig {
   max_trajectory_snapshots: number;
 }
 
+export interface DynamicAgentsConfig {
+  /** T3.3: when false (default), POST /agents/pool/define is rejected. */
+  enabled: boolean;
+  max_dynamic_agents: number;
+}
+
 export interface OrchestratorConfig {
   enabled: boolean;
   agents: OrchestratorAgent[];
@@ -288,6 +295,13 @@ export interface OrchestratorConfig {
   max_conductor_replans_per_session: number;
   /** Maximum automatic review -> rewrite repair rounds for a full turn. */
   max_review_repair_rounds: number;
+  /**
+   * T2.4: when true (default), all orchestrator turns run through
+   * runPipelineWithReplanning so mid-run replan triggers can fire.
+   */
+  mid_run_replan?: boolean;
+  /** T3.3: conductor-facing dynamic agent registration (default OFF). */
+  dynamic_agents?: DynamicAgentsConfig;
   conductor: ConductorConfig;
   session_memory: SessionMemoryConfig;
   conductor_learning: ConductorLearningConfig;
@@ -460,6 +474,11 @@ export function defaultConfig(): JarvisConfig {
       max_conductor_replans: 2,
       max_conductor_replans_per_session: 6,
       max_review_repair_rounds: 1,
+      mid_run_replan: true,
+      dynamic_agents: {
+        enabled: false,
+        max_dynamic_agents: 4,
+      },
       conductor: {
         enabled: true,
         model: "gemma4:e2b",
@@ -833,6 +852,12 @@ export function validateConfig(cfg: JarvisConfig): ConfigValidation {
   }
   if (cfg.max_tokens < 1 || cfg.max_tokens > 131072) {
     warnings.push("max_tokens outside typical range (1-131072)");
+  }
+
+  // T3.1: WARN-level orchestrator agent pool validation (existing configs keep booting).
+  // Even "error"-severity rules surface as warnings so pre-existing pool entries load.
+  for (const issue of validateOrchestratorAgents(cfg.orchestrator?.agents ?? [])) {
+    warnings.push(`orchestrator.agents[${issue.agentId}]: ${issue.message}`);
   }
 
   return { valid: errors.length === 0, errors, warnings };

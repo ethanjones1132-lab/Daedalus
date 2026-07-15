@@ -99,6 +99,8 @@ import {
   createStreamFinishTracker,
   serverCancelFromReadStop,
 } from "./stream-finish";
+import { applyAgentSystemPrompt } from "./orchestration/agent-system-prompt";
+import { defineAgent } from "./orchestration/define-agent";
 import { prepareToolResultForContext } from "./tool-result-truncation";
 import { detectDegenerateTail } from "./stream-degeneration";
 import { SessionRepetitionStore, assessRepetition, shouldShortCircuitRepeat } from "./orchestration/repetition-guard";
@@ -1708,6 +1710,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             { role: "system", content: runtimeFactsSystemMessage(cfg) },
             ...messages,
           ];
+          // T3.2: optional per-agent system_prompt (inert until an agent defines it).
+          if (poolResolvedAgent?.system_prompt) {
+            effectiveMessages = applyAgentSystemPrompt(
+              effectiveMessages,
+              poolResolvedAgent.system_prompt,
+            ) as typeof effectiveMessages;
+          }
           if (useTextTools) {
             const textInstructions = buildTextToolInstructions(callOptions.tools);
             const sysIdx = effectiveMessages.findIndex((m) => m.role === "system");
@@ -4347,7 +4356,24 @@ export async function baseFetch(req: Request): Promise<Response> {
     if (path === "/agents/pool" && req.method === "GET") {
       const poolCfg = loadConfig();
       const pool = new AgentPool(routableOrchestratorAgents(poolCfg));
-      return Response.json({ pool: pool.list(), coverage: pool.coverage(), max_recursion_depth: poolCfg.orchestrator?.max_recursion_depth ?? 2 });
+      return Response.json({
+        pool: pool.list(),
+        coverage: pool.coverage(),
+        max_recursion_depth: poolCfg.orchestrator?.max_recursion_depth ?? 2,
+        dynamic_agents: poolCfg.orchestrator?.dynamic_agents ?? { enabled: false, max_dynamic_agents: 4 },
+      });
+    }
+    // T3.3: guarded define_agent seam (flagged OFF by default).
+    if (path === "/agents/pool/define" && req.method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      const outcome = defineAgent(body as import("./orchestration/agent-pool").OrchestratorAgent);
+      if (!outcome.ok) {
+        return Response.json(
+          { ok: false, error: outcome.error, details: outcome.details },
+          { status: outcome.status },
+        );
+      }
+      return Response.json({ ok: true, agent: outcome.agent, pool_size: outcome.pool_size });
     }
     if (path === "/tool/decision" && req.method === "POST") {
       const { call_id, approved } = await req.json() as { call_id: string; approved: boolean };

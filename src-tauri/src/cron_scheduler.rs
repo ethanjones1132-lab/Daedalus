@@ -17,7 +17,9 @@ use tokio::time::{interval, MissedTickBehavior};
 
 const POLL_INTERVAL_SECS: u64 = 60;
 const INITIAL_DELAY_SECS: u64 = 20;
-const STREAM_TIMEOUT_SECS: u64 = 180;
+// T1.3: final-stream grace window means worst-case orchestrator turn ≈ 210s
+// (180s absolute turn cap + 30s grace). Cron dispatch must tolerate that.
+const STREAM_TIMEOUT_SECS: u64 = 240;
 pub const INFERENCE_FEEDBACK_CRON_JOB_ID: &str = "jarvis-system-inference-feedback";
 const INFERENCE_FEEDBACK_SCHEDULE: &str = "17 */6 * * *";
 

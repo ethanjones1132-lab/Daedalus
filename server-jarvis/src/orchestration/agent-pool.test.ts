@@ -44,6 +44,20 @@ const agents: OrchestratorAgent[] = [
 ];
 
 describe("AgentPool", () => {
+  test("system_prompt field round-trips through AgentPool.add/list (T3.2)", () => {
+    const pool = new AgentPool([]);
+    pool.add({
+      id: "with-prompt",
+      provider: "openrouter",
+      model_id: "m",
+      capabilities: { code: 0.5, reasoning: 0.5, speed: 0.5, cost: 0.5, json_reliability: 0.5 },
+      default_for: [],
+      enabled: true,
+      system_prompt: "Prefer bullet lists.",
+    });
+    expect(pool.list().find((a) => a.id === "with-prompt")?.system_prompt).toBe("Prefer bullet lists.");
+  });
+
   test("pickFor prefers an enabled default_for agent for the stage", () => {
     const pool = new AgentPool(agents);
 

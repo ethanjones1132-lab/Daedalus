@@ -1317,14 +1317,105 @@ export class PipelineExecutor {
         return { answer: "", emptyCompletion: true };
       }
 
+      // T1.4: finish_reason === "length" ⇒ one bounded synthesizer auto-continuation
+      // when ≥15s remain to the final grace deadline. Exactly one follow-up; if
+      // the continuation also caps ⇒ token_cap, no loop.
+      const finishReason = typeof resp._finishReason === "string" ? resp._finishReason : null;
+      const isLengthCap = truncated && (stopReason === "length" || finishReason === "length");
+      if (isLengthCap) {
+        const graceLeftMs = options.turnBudget
+          ? Math.max(0, options.turnBudget.finalStreamDeadlineAt() - Date.now())
+          : 30_000;
+        // Always record the first (capped) attempt.
+        this.collector.recordStageRun({
+          id: `stage_${crypto.randomUUID()}`,
+          agent_run_id: agentRunId,
+          mode_id: "synthesizer",
+          turn_number: 1,
+          input_tokens: Math.round((synthesizerPrompt.length + contextText.length) / 4),
+          output_tokens: countTokens(finalAnswer),
+          tool_calls_json: "[]",
+          duration_ms: Date.now() - synthStartTime,
+          was_successful: 0,
+          had_error: 0,
+          stop_reason: "length",
+          partial_error_code: "token_cap",
+        });
+        if (graceLeftMs < 15_000) {
+          onStateChange({ stage: "synthesizer", status: "completed", output: finalAnswer });
+          await this.afterConductorStage("synthesizer", "completed", finalAnswer, agentRunId, options, remainingQueue);
+          return { answer: finalAnswer, emptyCompletion: false, partialErrorCode: "token_cap" };
+        }
+        console.warn(`[Pipeline] synthesizer hit token length — one continuation (grace_left_ms=${graceLeftMs})`);
+        try {
+          const contResp = await this.callModel([
+            { role: "system", content: synthesizerPrompt },
+            { role: "user", content: contextText },
+            { role: "assistant", content: finalAnswer },
+            { role: "user", content: "Continue exactly where you stopped. Do not repeat prior text." },
+          ] as ChatMessage[], {
+            temperature: BUILTIN_MODES.synthesizer.temperature,
+            max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
+            stream: true,
+            stageLabel: "synthesizer",
+            surfaceAsAnswer: true,
+            stageAbort: this.registerStageAbort("synthesizer"),
+            onChunk: (chunk) => {
+              streamedAnswer += chunk;
+              onStateChange({ stage: "synthesizer", status: "running", output: chunk });
+              this.publishStageToken("synthesizer", chunk);
+            },
+          }) as {
+            content?: string;
+            _finishReason?: string | null;
+            _stopReason?: string | null;
+            _truncated?: boolean;
+          };
+          const contText = contResp.content ?? "";
+          const combined = contText.trim() ? finalAnswer + contText : finalAnswer;
+          const contTruncated = contResp._truncated === true;
+          const contStop = typeof contResp._stopReason === "string" ? contResp._stopReason : null;
+          const contLength = contTruncated && (contStop === "length" || contResp._finishReason === "length");
+          this.collector.recordStageRun({
+            id: `stage_${crypto.randomUUID()}`,
+            agent_run_id: agentRunId,
+            mode_id: "synthesizer",
+            turn_number: 2,
+            input_tokens: Math.round((synthesizerPrompt.length + contextText.length) / 4),
+            output_tokens: countTokens(contText),
+            tool_calls_json: "[]",
+            duration_ms: Date.now() - synthStartTime,
+            was_successful: contTruncated ? 0 : 1,
+            had_error: 0,
+            stop_reason: "length_continuation",
+            partial_error_code: contLength ? "token_cap" : (contTruncated ? "stream_cut" : null),
+          });
+          onStateChange({ stage: "synthesizer", status: "completed", output: combined });
+          await this.afterConductorStage("synthesizer", "completed", combined, agentRunId, options, remainingQueue);
+          if (contLength || contTruncated) {
+            return {
+              answer: combined,
+              emptyCompletion: false,
+              partialErrorCode: contLength ? "token_cap" : "stream_cut",
+            };
+          }
+          return { answer: combined, emptyCompletion: false };
+        } catch (contErr) {
+          console.warn(`[Pipeline] length continuation failed: ${errText(contErr)}`);
+          onStateChange({ stage: "synthesizer", status: "completed", output: finalAnswer });
+          await this.afterConductorStage("synthesizer", "completed", finalAnswer, agentRunId, options, remainingQueue);
+          return { answer: finalAnswer, emptyCompletion: false, partialErrorCode: "token_cap" };
+        }
+      }
+
       // T0.2 / T1.3: clean HTTP return but truncated stream (provider_cut /
-      // length / content_filter) — ship the partial answer with honest
+      // content_filter / other) — ship the partial answer with honest
       // partialErrorCode so agent_runs.outcome can be "partial", not success.
+      // (length case handled above.)
       if (truncated) {
         const partialErrorCode =
-          stopReason === "length" ? "token_cap"
-            : stopReason === "turn_deadline" || stopReason === "stage_deadline" ? "stage_timeout"
-              : "stream_cut";
+          stopReason === "turn_deadline" || stopReason === "stage_deadline" ? "stage_timeout"
+            : "stream_cut";
         onStateChange({ stage: "synthesizer", status: "completed", output: finalAnswer });
         await this.afterConductorStage("synthesizer", "completed", finalAnswer, agentRunId, options, remainingQueue);
         this.collector.recordStageRun({
