@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { buildDeterministicRoute, buildShortCircuitRoute, normalizeRemainingStages, normalizeRoute } from "./route-normalization";
+import { buildDeterministicRoute, buildShortCircuitRoute, normalizeRemainingStages, normalizeRoute, reconcileRouteWithBudget } from "./route-normalization";
 import type { CoordinatorResult } from "./coordinator";
 
 function decision(pipeline: CoordinatorResult["pipeline"], topology: CoordinatorResult["topology"] = "linear"): CoordinatorResult {
@@ -30,6 +30,15 @@ describe("buildShortCircuitRoute", () => {
 });
 
 describe("buildDeterministicRoute (T1.2)", () => {
+  test.each([
+    ["conversational", ["synthesizer"]],
+    ["answer_only", ["synthesizer"]],
+    ["workspace_read", ["executor", "synthesizer"]],
+    ["full_execution", ["planner", "executor", "reviewer", "synthesizer"]],
+  ] as const)("maps %s to its canonical deterministic pipeline", (requirement, pipeline) => {
+    expect(buildDeterministicRoute(requirement).pipeline).toEqual(pipeline);
+  });
+
   test("workspace_read produces executor+synthesizer read-only after normalize", () => {
     const r = buildDeterministicRoute("workspace_read");
     expect(r.pipeline).toEqual(["executor", "synthesizer"]);
@@ -210,5 +219,34 @@ describe("normalizeRoute", () => {
     expect(r.original_pipeline).toEqual(["conductor_replan"]);
     expect(r.pipeline).toEqual(["synthesizer"]);
     expect(r.profile).toBe("read_only");
+  });
+});
+
+describe("reconcileRouteWithBudget", () => {
+  test("an answer_only budget sheds reviewer then planner", () => {
+    const { pipeline, dropped } = reconcileRouteWithBudget(
+      ["planner", "executor", "reviewer", "synthesizer"],
+      45_000,
+      20_000,
+      4_000,
+    );
+    expect(pipeline).toEqual(["executor", "synthesizer"]);
+    expect(dropped).toEqual(["reviewer", "planner"]);
+  });
+
+  test("a full_execution budget keeps the full pipeline", () => {
+    const { pipeline, dropped } = reconcileRouteWithBudget(
+      ["planner", "executor", "reviewer", "synthesizer"],
+      150_000,
+      30_000,
+      4_000,
+    );
+    expect(pipeline).toEqual(["planner", "executor", "reviewer", "synthesizer"]);
+    expect(dropped).toEqual([]);
+  });
+
+  test("executor and synthesizer are never dropped", () => {
+    const { pipeline } = reconcileRouteWithBudget(["executor", "synthesizer"], 20_000, 15_000, 4_000);
+    expect(pipeline).toEqual(["executor", "synthesizer"]);
   });
 });

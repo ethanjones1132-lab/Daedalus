@@ -53,8 +53,22 @@ export function buildShortCircuitRoute(
  * unavailable coordinator path. normalizeRoute will still enforce invariants.
  */
 export function buildDeterministicRoute(
-  requirement: Extract<TurnRequirement, "workspace_read" | "full_execution">,
+  requirement: TurnRequirement,
 ): CoordinatorResult {
+  if (requirement === "conversational" || requirement === "answer_only") {
+    return {
+      task_type: "general",
+      pipeline: ["synthesizer"],
+      topology: "linear",
+      context: {
+        needs_workspace_inspection: false,
+        needs_memory: requirement === "answer_only",
+        estimated_complexity: "low",
+      },
+      coordinator_rationale: `Deterministic ${requirement} route: coordinator skipped.`,
+      conductor_source: "deterministic",
+    };
+  }
   if (requirement === "workspace_read") {
     return {
       task_type: "research",
@@ -81,6 +95,47 @@ export function buildDeterministicRoute(
     coordinator_rationale: "Deterministic full_execution route: coordinator skipped.",
     conductor_source: "deterministic",
   };
+}
+
+/**
+ * Drop advisory stages when the routed pipeline cannot fit the time left in
+ * the turn. Executor and synthesizer are the irreducible answer-producing
+ * pair; planner/reviewer/rewriter are shed in that order of value to the
+ * user's requested result.
+ */
+const STAGE_FLOOR_MS: Record<string, number> = {
+  planner: 12_000,
+  executor: 15_000,
+  reviewer: 12_000,
+  rewriter: 8_000,
+  synthesizer: 20_000,
+};
+const BUDGET_DROP_ORDER = ["rewriter", "reviewer", "planner"] as const;
+
+export function reconcileRouteWithBudget(
+  pipeline: string[],
+  turnMs: number,
+  finalizationReserveMs: number,
+  alreadySpentMs: number,
+): { pipeline: string[]; dropped: string[] } {
+  const available = turnMs - finalizationReserveMs - Math.max(0, alreadySpentMs);
+  const cost = (stages: string[]) => stages.reduce(
+    (sum, stage) => sum + (STAGE_FLOOR_MS[stage] ?? 10_000),
+    0,
+  );
+  const result = [...pipeline];
+  const dropped: string[] = [];
+
+  for (const candidate of BUDGET_DROP_ORDER) {
+    if (cost(result) <= available) break;
+    const index = result.indexOf(candidate);
+    if (index >= 0) {
+      result.splice(index, 1);
+      dropped.push(candidate);
+    }
+  }
+
+  return { pipeline: result, dropped };
 }
 
 /**

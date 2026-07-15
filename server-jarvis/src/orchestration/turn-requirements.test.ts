@@ -3,8 +3,19 @@ import {
   classifyTurnRequirements,
   hasWriteIntent,
   inheritRequirementForContinuation,
+  shouldRememberRequirement,
   shouldShortCircuitCoordinator,
 } from "./turn-requirements";
+
+describe("shouldRememberRequirement", () => {
+  test("substantive turns update memory", () => {
+    expect(shouldRememberRequirement(false)).toBe(true);
+  });
+
+  test("short-circuited trivial turns do not update memory", () => {
+    expect(shouldRememberRequirement(true)).toBe(false);
+  });
+});
 
 describe("hasWriteIntent", () => {
   test("does not treat the incident's plan request as a file mutation", () => {

@@ -84,6 +84,9 @@ const TARGET_CACHE_TTL_MS = 10_000;
 const TARGET_RUNTIME_FAILURE_TTL_MS = 5 * 60_000;
 const runtimeFailedTargets = new Map<string, number>();
 
+/** F7: warm routing must fail fast before API fallback takes over. */
+export const ROUTING_TIMEOUT_MS = 10_000;
+
 export function __resetPersistentConductorCachesForTests(): void {
   cachedTarget = null;
   cachedTargetKey = "";
@@ -637,7 +640,7 @@ export class PersistentConductor {
     const message = await this.callOllamaMessage(target, messages, {
       format: COORDINATOR_ROUTE_JSON_SCHEMA,
       numPredict: 320,
-      timeoutMs: 30_000,
+      timeoutMs: ROUTING_TIMEOUT_MS,
     });
     return extractConductorRoutingJson(message);
   }

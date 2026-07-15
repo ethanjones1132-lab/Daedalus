@@ -103,6 +103,7 @@ import { applyAgentSystemPrompt } from "./orchestration/agent-system-prompt";
 import { defineAgent } from "./orchestration/define-agent";
 import { prepareToolResultForContext } from "./tool-result-truncation";
 import { detectDegenerateTail } from "./stream-degeneration";
+import { extractDeltaText } from "./sse-delta";
 import { SessionRepetitionStore, assessRepetition, shouldShortCircuitRepeat } from "./orchestration/repetition-guard";
 import { Coordinator } from "./orchestration/coordinator";
 import { PersistentConductor } from "./orchestration/persistent-conductor";
@@ -111,6 +112,7 @@ import { AgentPool, firstTokenTimeoutFor, formatPoolDiversity } from "./orchestr
 import { excludedModelKeys } from "./model-failure-memory";
 import { PipelineExecutor } from "./orchestration/pipeline";
 import { combinedStageExclusions, StageHealthRegistry, type RecoverableFailureKind } from "./orchestration/stage-health";
+import { ModelScorecard } from "./orchestration/model-scorecard";
 import { createTurnBudget } from "./orchestration/turn-budget";
 import { OrchestrationAdmissionController, type AdmissionLease } from "./orchestration/admission-controller";
 import type { PipelineProgressState, PipelineRecursionEvent } from "./orchestration/pipeline";
@@ -121,6 +123,7 @@ import type { StageName } from "./orchestration/coordinator";
 import {
   coordinatorIsAdvisoryOnly,
   resolveTurnRequirement,
+  shouldRememberRequirement,
   shouldShortCircuitCoordinator,
   type TurnRequirement,
 } from "./orchestration/turn-requirements";
@@ -128,6 +131,7 @@ import {
   buildDeterministicRoute,
   buildShortCircuitRoute,
   normalizeRoute,
+  reconcileRouteWithBudget,
   type ExecutionProfile,
 } from "./orchestration/route-normalization";
 import { runPipelineWithReplanning } from "./orchestration/replan-loop";
@@ -236,6 +240,7 @@ const MAX_TOOL_EXECUTION_TURNS = 10;
 const activeStreams = new ActiveStreamRegistry();
 const orchestrationAdmission = new OrchestrationAdmissionController({ interactive: 2, background: 1 });
 const stageHealth = new StageHealthRegistry();
+const modelScorecard = new ModelScorecard();
 // Cross-turn no-progress guard (orchestration/repetition-guard.ts): compares
 // a finalized turn's answer + evidence keys against the previous turn's, for
 // the same session. See the 2026-07-12 incident note in repetition-guard.ts.
@@ -1638,7 +1643,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // F2: one exclusion union for both pool selection and the fallback
           // cascade. A cooldown that reaches only the pool is not a cooldown.
           const stageExclusions = stageLabel
-            ? combinedStageExclusions(stageHealth, stageLabel, excludeModels, excludedModelKeys())
+            ? combinedStageExclusions(
+              stageHealth,
+              stageLabel,
+              excludeModels,
+              excludedModelKeys(),
+              modelScorecard.unfitKeys(stageLabel),
+            )
             : new Set<string>(excludeModels ?? []);
           if (stageLabel && cfg.orchestrator?.enabled) {
             try {
@@ -2113,7 +2124,19 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                   }
                 }
 
-                let chunkText = choice.delta?.content || "";
+                const deltaText = extractDeltaText(choice);
+                if (deltaText.reasoning && !firstTokenReceived) {
+                  // Reasoning proves the model is alive, but it is not the
+                  // visible first token used for latency telemetry. Start the
+                  // transport/visible-progress watchdogs without reporting a
+                  // visible token latency.
+                  firstTokenReceived = true;
+                  clearTimeout(firstTokenTimer);
+                  streamLiveness.onTransportProgress();
+                } else if (deltaText.reasoning) {
+                  streamLiveness.onTransportProgress();
+                }
+                let chunkText = deltaText.visible;
                 if (chunkText) {
                   chunkText = chunkText.replace(/<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>|<\|im_sep\|>/g, "");
                   if (chunkText) {
@@ -2390,6 +2413,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             throw error;
           } finally {
             if (attemptStage && attemptModel && attemptProvider && !streamAbort.signal.aborted) {
+              modelScorecard.record(attemptStage, `${attemptProvider}:${attemptModel}`, {
+                ok: attemptOutcome === "success" || attemptOutcome === "truncated",
+                firstTokenMs: attemptFirstTokenMs,
+              });
               recordInferenceAttempt({
                 ts: Date.now(),
                 session_id: sessionId,
@@ -2459,13 +2486,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           //     that the previous build hit on the live smoke test.
           for (let advance = 0; advance < turnBudget.max_stage_attempts - 1; advance++) {
             const hasContent = typeof last?.content === "string" && last.content.trim().length > 0;
+            const hasToolCalls = !callOptions?.surfaceAsAnswer
+              && Array.isArray(last?.tool_calls)
+              && last.tool_calls.length > 0;
             // A user-visible stage is only "done" when it produced clean prose.
-            // Tool calls do NOT count: a synthesizer that emits a tool call has
+            // Tool calls count for model-only stages; synthesizer tool calls do not:
             // no tools to run it with, and before 2026-07-04 the leaked call
             // text itself was accepted as the answer (session 1d4727cf) — and
             // then reinforced by the tuning loop as a success.
-            if (hasContent || streamAbort.signal.aborted) {
-              if (hasContent && last?._provider && last?._modelUsed) {
+            if (hasContent || hasToolCalls || streamAbort.signal.aborted) {
+              if ((hasContent || hasToolCalls) && last?._provider && last?._modelUsed) {
                 stageHealth.recordSuccess({
                   provider: last._provider,
                   modelId: last._modelUsed,
@@ -2499,7 +2529,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             // if the stage somehow has none) rather than pushing a new
             // trailing message — and we copy the array/message objects so the
             // original `messages` passed to this closure is never mutated.
-            const nudge = "You have no tools available. Answer the user in plain prose now — do not emit tool_call syntax, tool JSON, or any function-call markup.";
+            const nudge = callOptions?.surfaceAsAnswer
+              ? "You have no tools available. Answer the user in plain prose now. Do not emit tool_call syntax, tool JSON, or any function-call markup."
+              : "If you need a tool, emit a valid tool call; otherwise answer in plain prose. Do not emit tool-call syntax as visible text.";
             const nudgedMessages = [...messages];
             const leadingSystemIdx = nudgedMessages.findIndex((m) => m?.role === "system");
             if (leadingSystemIdx >= 0) {
@@ -2552,9 +2584,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           sessionMemory.toSharedContextHints(sessionId, activeWorkspacePath),
           { relevant_memories: [workspaceRootHint] },
         );
-        // T1.2: skip the API coordinator when purely advisory (workspace_read),
-        // local conductor is unavailable, and coordinator has recent parse-
-        // failure strikes. Deterministic route is free; burns no latency.
+        // F7: skip the API coordinator when local routing is unavailable and
+        // every remaining coordinator path is struck or scorecard-unfit.
         const localConductorCfgEnabled = Boolean(cfg.orchestrator?.conductor?.enabled);
         let localConductorAvailable = false;
         if (localConductorCfgEnabled && !persistentConductor.shouldFallbackToApi()) {
@@ -2565,23 +2596,24 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }
         }
         const coordinatorParseExcluded = stageHealth.excludedModelKeys("coordinator").size > 0;
+        const coordinatorUnfit = modelScorecard.unfitKeys("coordinator").size > 0;
         const skipAdvisoryCoordinator =
           !shortCircuit &&
-          coordinatorIsAdvisoryOnly(turnReq.requirement) &&
           !localConductorAvailable &&
-          coordinatorParseExcluded;
+          (coordinatorParseExcluded || coordinatorUnfit) &&
+          (coordinatorIsAdvisoryOnly(turnReq.requirement) || coordinatorUnfit);
         const coordinatorStartedAt = Date.now();
         let route;
         if (shortCircuit) {
           route = buildShortCircuitRoute(
             turnReq.requirement === "conversational" ? "conversational" : "answer_only",
           );
-        } else if (skipAdvisoryCoordinator && turnReq.requirement === "workspace_read") {
+        } else if (skipAdvisoryCoordinator) {
           console.warn(
-            `[Jarvis Orchestrator] skipping advisory API coordinator for workspace_read ` +
-            `(local conductor unavailable + parse-failure strikes active)`,
+            `[Jarvis Orchestrator] skipping API coordinator for ${turnReq.requirement} ` +
+            `(local conductor unavailable + coordinator candidate health excluded)`,
           );
-          route = buildDeterministicRoute("workspace_read");
+          route = buildDeterministicRoute(turnReq.requirement);
         } else {
           route = await coordinator.route(contextMessage, {
             sessionId,
@@ -2621,9 +2653,24 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           turnReq.requirement,
           routeSource,
         );
-        const executablePipeline = normalized.pipeline;
+        const reconciled = reconcileRouteWithBudget(
+          normalized.pipeline,
+          turnBudget.turn_ms,
+          turnBudget.finalization_reserve_ms,
+          coordinatorDurationMs,
+        );
+        if (reconciled.dropped.length > 0) {
+          console.warn(
+            `[Jarvis Orchestrator] route_budget_reconciled: dropped ${reconciled.dropped.join(",")} ` +
+            `(requirement=${turnReq.requirement} turn_ms=${turnBudget.turn_ms})`,
+          );
+        }
+        const executablePipeline = reconciled.pipeline;
+        const executableRoute = { ...route, pipeline: executablePipeline as typeof route.pipeline };
         const executionProfile: ExecutionProfile = normalized.profile;
-        rememberContinuationRequirement(sessionId, turnReq.requirement);
+        if (shouldRememberRequirement(shortCircuit)) {
+          rememberContinuationRequirement(sessionId, turnReq.requirement);
+        }
         console.log(
           `[Jarvis Orchestrator] task_type=${route.task_type} model_route=${route.pipeline.map((s) => s ?? "skip").join("->")}/${route.topology}; ` +
           `requirement=${turnReq.requirement} [${turnReq.signals.join(",")}]; ` +
@@ -2749,6 +2796,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           workerInstructions: instructionSelection.instructions,
           sharedContext: mergedSharedContext,
           sessionMemory: sessionMemory,
+          preferFastSynthesizer: routeSource === "trivial_short_circuit",
           distilledSkillsBlock: resolvedSkills.promptBlock,
           maxRecursionDepth: cfg.orchestrator.max_recursion_depth,
           maxReviewRepairRounds: cfg.orchestrator.max_review_repair_rounds,
@@ -2794,7 +2842,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         try {
           pipelineResult = await runPipelineWithReplanning({
             contextMessage,
-            initialDecision: route,
+            initialDecision: executableRoute,
             turnRequirement: turnReq.requirement,
             coordinator,
             routeOptions: {
@@ -3550,7 +3598,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                   }
                 }
 
-                let content: string | undefined = json.choices?.[0]?.delta?.content;
+                const agentDelta = extractDeltaText(json.choices?.[0]);
+                if (agentDelta.reasoning) {
+                  // Hidden reasoning is semantic progress for the watchdog,
+                  // but stays out of the user-visible turn text.
+                  markSemanticProgress();
+                }
+                let content: string | undefined = agentDelta.visible || undefined;
                 if (content) {
                   // Strip ChatML leakage tokens
                   content = content.replace(/<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>|<\|im_sep\|>/g, "");

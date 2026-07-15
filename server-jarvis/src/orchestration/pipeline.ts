@@ -111,6 +111,8 @@ export interface PipelineExecuteOptions {
   allowMidRunReplan?: boolean;
   /** Effect-gate recovery is deliberately one-shot even when other replans remain. */
   allowEffectGateReplan?: boolean;
+  /** Trivial short-circuit turns should use the fastest synthesizer tier. */
+  preferFastSynthesizer?: boolean;
 }
 
 const READ_CACHE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "web_fetch"]);
@@ -1380,6 +1382,7 @@ export class PipelineExecutor {
         max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
         stream: true,
         stageLabel: "synthesizer",
+        cascadeTier: options.preferFastSynthesizer ? "cheap" : undefined,
         surfaceAsAnswer: true,
         stageAbort: this.registerStageAbort("synthesizer"),
         onChunk: (chunk) => {
@@ -1467,6 +1470,7 @@ export class PipelineExecutor {
             max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
             stream: true,
             stageLabel: "synthesizer",
+            cascadeTier: options.preferFastSynthesizer ? "cheap" : undefined,
             surfaceAsAnswer: true,
             stageAbort: this.registerStageAbort("synthesizer"),
             onChunk: (chunk) => {
@@ -1567,6 +1571,7 @@ export class PipelineExecutor {
               max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
               stream: true,
               stageLabel: "synthesizer",
+              cascadeTier: options.preferFastSynthesizer ? "cheap" : undefined,
               surfaceAsAnswer: true,
               stageAbort: this.registerStageAbort("synthesizer"),
               onChunk: (chunk) => {
@@ -2070,6 +2075,7 @@ export class PipelineExecutor {
         max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
         stream: true,
         stageLabel: "synthesizer",
+        cascadeTier: options.preferFastSynthesizer ? "cheap" : undefined,
         surfaceAsAnswer: true,
         onChunk: (chunk) => {
           onStateChange({ stage: "synthesizer", status: "running", output: chunk });
@@ -2236,6 +2242,7 @@ export class PipelineExecutor {
         max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
         stream: true,
         stageLabel: "synthesizer",
+        cascadeTier: options.preferFastSynthesizer ? "cheap" : undefined,
         surfaceAsAnswer: true,
         onChunk: (chunk) => {
           onStateChange({ stage: "synthesizer", status: "running", output: chunk });

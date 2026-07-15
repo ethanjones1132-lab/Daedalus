@@ -5,6 +5,7 @@ import { tmpdir } from "os";
 import {
   PersistentConductor,
   __resetPersistentConductorCachesForTests,
+  ROUTING_TIMEOUT_MS,
 } from "./persistent-conductor";
 import { conductorCacheSnapshot, __resetConductorCacheMetricsForTests } from "./conductor-metrics";
 import type { JarvisConfig } from "../config";
@@ -54,6 +55,10 @@ afterEach(() => {
 });
 
 describe("PersistentConductor", () => {
+  test("routing call timeout is 10s", () => {
+    expect(ROUTING_TIMEOUT_MS).toBe(10_000);
+  });
+
   test("uses compact JSON schema output for local routing", async () => {
     let body: Record<string, any> | undefined;
     (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {

@@ -69,6 +69,15 @@ export function coordinatorIsAdvisoryOnly(requirement: TurnRequirement): boolean
   return requirement === "workspace_read";
 }
 
+/**
+ * Trivial short-circuited turns carry no new task requirement. Preserve the
+ * last substantive requirement so a following continuation can inherit the
+ * original execution budget and capability class.
+ */
+export function shouldRememberRequirement(wasShortCircuited: boolean): boolean {
+  return !wasShortCircuited;
+}
+
 const REQUIREMENT_RANK: Record<TurnRequirement, number> = {
   conversational: 0,
   answer_only: 1,
