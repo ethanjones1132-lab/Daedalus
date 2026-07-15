@@ -1010,7 +1010,7 @@ export class PipelineExecutor {
           // The first nudge can fire on zero evidence; the second only fires
           // after the previous nudge produced new successful evidence, so a
           // refusing model cannot spin indefinitely.
-          const assessmentAfterTurn = assessWorkspaceEvidence(toolCalls, request);
+          const assessmentAfterTurn = assessWorkspaceEvidence(toolCalls, intentText);
           let workspaceEvidenceNudgeSentThisTurn = false;
           if (
             requiresWorkspaceEvidence &&
@@ -1029,7 +1029,7 @@ export class PipelineExecutor {
               executorMessages.push({
                 role: "user",
                 content:
-                  `Workspace evidence is required for this turn. ${assessmentAfterTurn.reason}. Call the relevant read-only workspace tools (read_file, list_directory, glob, grep, or git_metadata) and ground your findings in their results before answering.`,
+                  `Workspace evidence is required for this turn. ${assessmentAfterTurn.reason}. Call the relevant read-only workspace tools (read_file, list_directory, glob, or grep) and ground your findings in their results before answering.`,
               });
             }
           }
@@ -1074,7 +1074,7 @@ export class PipelineExecutor {
       }
 
       const narrative = narratives.join("\n\n");
-      const finalAssessment = assessWorkspaceEvidence(toolCalls, request);
+      const finalAssessment = assessWorkspaceEvidence(toolCalls, intentText);
       if (requiresWorkspaceEvidence && !finalAssessment.sufficient) {
         const failure = evidenceFailure(finalAssessment);
         onStateChange({ stage: "executor", status: "failed", output: failure.message });
@@ -1930,7 +1930,7 @@ export class PipelineExecutor {
       return { state, effectGate, partialStage, replanRequested };
     }
 
-    const preSynthAssessment = assessWorkspaceEvidence(state.executor?.toolCalls, request);
+    const preSynthAssessment = assessWorkspaceEvidence(state.executor?.toolCalls, intentText);
     if (requiresWorkspaceEvidence && !preSynthAssessment.sufficient) {
       const failure = evidenceFailure(preSynthAssessment);
       // T2.4: evidence fence failure requests replan (first occurrence).
@@ -2003,7 +2003,7 @@ export class PipelineExecutor {
     // callers that omit the synthesizer stage. The normal activation boundary
     // always appends a synthesizer, but PipelineExecutor is also reused by tests
     // and replan slices and must not return a planner sentinel as a repo answer.
-    const executeAssessment = assessWorkspaceEvidence(state.executor?.toolCalls, request);
+    const executeAssessment = assessWorkspaceEvidence(state.executor?.toolCalls, options.rawMessage ?? request);
     if (requiresWorkspaceEvidence && !executeAssessment.sufficient) {
       const failure = evidenceFailure(executeAssessment);
       return {

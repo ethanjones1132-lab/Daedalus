@@ -26,7 +26,7 @@ const read = (p: string): ToolCallRecord => ({
 const grep: ToolCallRecord = {
   name: "grep",
   arguments: { pattern: "TODO", path: "." },
-  output: "src/a.ts:1: // TODO: refactor",
+  output: "src/c.ts:1: // TODO: refactor",
   is_error: false,
   duration_ms: 8,
 };
@@ -143,8 +143,24 @@ describe("assessWorkspaceEvidence", () => {
       [ls, read("a.ts"), read("b.ts"), grep, gitMetadata],
       "comprehensively diagnose the whole repository",
     );
-    expect(a.contentReads).toBe(3); // read_file(a.ts) + read_file(b.ts) + grep; git_metadata excluded
+    expect(a.contentReads).toBe(3); // read_file(a.ts) + read_file(b.ts) + grep(c.ts); git_metadata excluded
     expect(a.sufficient).toBe(true);
+  });
+
+  test("repeated grep patterns against one source file do not inflate the deep-read count", () => {
+    const sameFile = (pattern: string): ToolCallRecord => ({
+      name: "grep",
+      arguments: { pattern, path: "src" },
+      output: "src/a.ts:1: matching line",
+      is_error: false,
+      duration_ms: 8,
+    });
+    const a = assessWorkspaceEvidence(
+      [sameFile("TODO"), sameFile("const"), sameFile("export")],
+      "comprehensively audit this repo",
+    );
+    expect(a.sufficient).toBe(false);
+    expect(a.contentReads).toBe(1);
   });
 
   test("git_metadata calls alone never satisfy the deep-read floor, however many times repeated", () => {

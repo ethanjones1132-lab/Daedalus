@@ -18,8 +18,9 @@
 // counts for SHALLOW requests (a bare "what's the git sha" turn should pass
 // on one such call — that's the whole point of the deterministic git
 // preflight in pipeline.ts), but it must never satisfy the deep-read floor.
-// The floor also now counts DISTINCT (tool, arguments) targets rather than
-// raw call count, so re-reading the same file repeatedly can't game it either.
+// The floor also now counts DISTINCT source-file targets rather than raw call
+// count, so re-reading the same file or grepping it with new patterns can't
+// game it either.
 // ═══════════════════════════════════════════════════════════════
 
 import { isDuplicateToolDeflection, type ToolCallRecord } from "./stage-output";
@@ -47,34 +48,41 @@ function distinctTargetKeys(calls: ToolCallRecord[], tools: Set<string>): Set<st
   return keys;
 }
 
-function isSourceFilePath(rawPath: string): boolean {
-  const basename = rawPath.replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
+function sourceFileKey(rawPath: string): string | undefined {
+  const normalizedPath = rawPath.replace(/\\/g, "/").replace(/^\.\/+/, "");
+  const basename = normalizedPath.split("/").pop()?.toLowerCase() ?? "";
   const extensionStart = basename.lastIndexOf(".");
-  return extensionStart > 0 && SOURCE_FILE_EXTENSIONS.has(basename.slice(extensionStart));
+  if (extensionStart <= 0 || !SOURCE_FILE_EXTENSIONS.has(basename.slice(extensionStart))) return undefined;
+  return normalizedPath.toLowerCase();
 }
 
-function grepOutputHasSourceFile(output: string): boolean {
-  return output.split(/\s+/).some((token) => {
+function grepOutputSourceFileKeys(output: string): Set<string> {
+  const keys = new Set<string>();
+  for (const token of output.split(/\s+/)) {
     const candidate = token
+      .replace(/^[([{\"'`]+/g, "")
       .replace(/[,:;"'`]+$/g, "")
       .replace(/:\d+(?::\d+)?$/, "");
-    return isSourceFilePath(candidate);
-  });
+    const key = sourceFileKey(candidate);
+    if (key) keys.add(key);
+  }
+  return keys;
 }
 
-function isSourceContentRead(call: ToolCallRecord): boolean {
+function sourceContentTargetKeys(call: ToolCallRecord): Set<string> {
   if (call.name === "read_file") {
     const args = call.arguments as Record<string, unknown> | undefined;
-    return typeof args?.path === "string" && isSourceFilePath(args.path);
+    const key = typeof args?.path === "string" ? sourceFileKey(args.path) : undefined;
+    return key ? new Set([key]) : new Set();
   }
-  return call.name === "grep" && grepOutputHasSourceFile(call.output);
+  return call.name === "grep" ? grepOutputSourceFileKeys(call.output) : new Set();
 }
 
 function distinctDeepReadTargetKeys(calls: ToolCallRecord[]): Set<string> {
   const keys = new Set<string>();
   for (const call of calls) {
-    if (DEEP_READ_CONTENT_TOOLS.has(call.name) && isSourceContentRead(call)) {
-      keys.add(`${call.name}:${JSON.stringify(call.arguments)}`);
+    if (DEEP_READ_CONTENT_TOOLS.has(call.name)) {
+      for (const key of sourceContentTargetKeys(call)) keys.add(key);
     }
   }
   return keys;

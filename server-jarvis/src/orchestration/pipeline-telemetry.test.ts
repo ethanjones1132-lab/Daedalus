@@ -308,6 +308,36 @@ describe("pipeline stage telemetry", () => {
     expect(firstExecutorInput).toContain(expectedLine);
   });
 
+  test("all runtime evidence fences use the raw deep-read intent", async () => {
+    const collector: StageRunRecorder = { recordStageRun: () => {} };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("list_directory"), async () => "package.json\nREADME.md\nsrc/");
+    runtime.register(toolDefinition("read_file"), async () => "metadata only");
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") return { content: "I can infer the answer.", tool_calls: [] };
+      return { content: "Ungrounded answer should never be synthesized." };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const segment = await executor.executeSegment(
+      "narrow segment request",
+      ["executor", "synthesizer"],
+      "run-raw-deep-read-fence",
+      () => {},
+      {
+        executionProfile: "full",
+        turnRequirement: "full_execution",
+        rawMessage: "comprehensively audit this repo without modifying files",
+        allowMidRunReplan: true,
+      },
+    );
+
+    expect(segment.synthesizerAnswer).toBe("");
+    expect(segment.fatalErrorCode).toBe("insufficient_workspace_evidence");
+    expect(segment.replanRequested?.trigger).toBe("evidence_insufficient");
+  });
+
   // Task 2.3: a model-driven read_file on a directory gets an immediate
   // runtime list_directory substitution (one tool hop) instead of waiting a
   // full model round-trip for the healing hint to be acted on. The original
