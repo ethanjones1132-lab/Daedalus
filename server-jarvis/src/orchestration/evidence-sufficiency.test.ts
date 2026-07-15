@@ -181,6 +181,15 @@ describe("assessWorkspaceEvidence", () => {
     expect(a.contentReads).toBe(1);
   });
 
+  test("path aliases for one source file do not inflate the deep-read count", () => {
+    const a = assessWorkspaceEvidence(
+      [read("src/a.ts"), read("./src/../src/a.ts"), read("C:/repo/src/a.ts")],
+      "comprehensively diagnose the architecture of this repo",
+    );
+    expect(a.sufficient).toBe(false);
+    expect(a.contentReads).toBe(1);
+  });
+
   test("manifests and overview files do not satisfy the deep-read source floor", () => {
     const a = assessWorkspaceEvidence(
       [

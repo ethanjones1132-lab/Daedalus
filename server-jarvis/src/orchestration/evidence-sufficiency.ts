@@ -48,12 +48,35 @@ function distinctTargetKeys(calls: ToolCallRecord[], tools: Set<string>): Set<st
   return keys;
 }
 
-function sourceFileKey(rawPath: string): string | undefined {
-  const normalizedPath = rawPath.replace(/\\/g, "/").replace(/^\.\/+/, "");
+function normalizePath(rawPath: string): { path: string; absolute: boolean } {
+  const slashPath = rawPath.replace(/\\/g, "/");
+  const absolute = /^\/?[a-z]:\//i.test(slashPath) || slashPath.startsWith("/");
+  const prefix = /^[a-z]:\//i.test(slashPath)
+    ? slashPath.slice(0, 3).toLowerCase()
+    : slashPath.startsWith("/")
+      ? "/"
+      : "";
+  const body = slashPath.slice(prefix.length);
+  const segments: string[] = [];
+  for (const segment of body.split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") {
+      if (segments.length > 0 && segments.at(-1) !== "..") segments.pop();
+      else if (!absolute) segments.push(segment);
+      continue;
+    }
+    segments.push(segment);
+  }
+  return { path: `${prefix}${segments.join("/")}`.toLowerCase(), absolute };
+}
+
+function sourceFilePath(rawPath: string): { path: string; absolute: boolean } | undefined {
+  const normalized = normalizePath(rawPath);
+  const normalizedPath = normalized.path;
   const basename = normalizedPath.split("/").pop()?.toLowerCase() ?? "";
   const extensionStart = basename.lastIndexOf(".");
   if (extensionStart <= 0 || !SOURCE_FILE_EXTENSIONS.has(basename.slice(extensionStart))) return undefined;
-  return normalizedPath.toLowerCase();
+  return normalized;
 }
 
 function grepOutputSourceFileKeys(output: string): Set<string> {
@@ -63,8 +86,8 @@ function grepOutputSourceFileKeys(output: string): Set<string> {
       .replace(/^[([{\"'`]+/g, "")
       .replace(/[,:;"'`]+$/g, "")
       .replace(/:\d+(?::\d+)?$/, "");
-    const key = sourceFileKey(candidate);
-    if (key) keys.add(key);
+    const key = sourceFilePath(candidate);
+    if (key) keys.add(`${key.absolute ? "abs:" : "rel:"}${key.path}`);
   }
   return keys;
 }
@@ -72,20 +95,41 @@ function grepOutputSourceFileKeys(output: string): Set<string> {
 function sourceContentTargetKeys(call: ToolCallRecord): Set<string> {
   if (call.name === "read_file") {
     const args = call.arguments as Record<string, unknown> | undefined;
-    const key = typeof args?.path === "string" ? sourceFileKey(args.path) : undefined;
-    return key ? new Set([key]) : new Set();
+    const key = typeof args?.path === "string" ? sourceFilePath(args.path) : undefined;
+    return key ? new Set([`${key.absolute ? "abs:" : "rel:"}${key.path}`]) : new Set();
   }
   return call.name === "grep" ? grepOutputSourceFileKeys(call.output) : new Set();
 }
 
 function distinctDeepReadTargetKeys(calls: ToolCallRecord[]): Set<string> {
-  const keys = new Set<string>();
+  const paths = new Set<string>();
   for (const call of calls) {
     if (DEEP_READ_CONTENT_TOOLS.has(call.name)) {
-      for (const key of sourceContentTargetKeys(call)) keys.add(key);
+      for (const key of sourceContentTargetKeys(call)) paths.add(key);
     }
   }
-  return keys;
+
+  // A model may use a relative target while deterministic preflight uses an
+  // absolute target for the same file. Reconcile those forms when the
+  // absolute path ends at the normalized relative path; otherwise retain the
+  // absolute key so two unrelated same-named files remain distinct.
+  const relativePaths = [...paths]
+    .filter((key) => key.startsWith("rel:"))
+    .map((key) => key.slice(4))
+    .sort((a, b) => b.length - a.length);
+  const canonical = new Set<string>();
+  for (const key of paths) {
+    if (!key.startsWith("abs:")) {
+      canonical.add(key.slice(4));
+      continue;
+    }
+    const absolutePath = key.slice(4);
+    const relativeAlias = relativePaths.find((relativePath) =>
+      absolutePath === relativePath || absolutePath.endsWith(`/${relativePath}`),
+    );
+    canonical.add(relativeAlias ?? absolutePath);
+  }
+  return canonical;
 }
 
 /**
