@@ -609,7 +609,7 @@ export class PersistentConductor {
   private async keepWarmIfDue(intervalMs = this.keepWarmIntervalMs()): Promise<void> {
     const conductor = this.config();
     if (!conductor.enabled || !conductor.keep_warm) return;
-    if (Date.now() - this.lastWarmRenewedAt < intervalMs * 2) return;
+    if (Date.now() - this.lastWarmRenewedAt < intervalMs) return;
     if (this.keepWarmInFlight) return;
 
     this.keepWarmInFlight = this.warmUp()

@@ -214,7 +214,7 @@ describe("PersistentConductor", () => {
     const cfg = makeConfig({
       persist_sessions: false,
       keep_warm: true,
-      keep_warm_interval_ms: 20,
+      keep_warm_interval_ms: 50,
     });
     const conductor = new PersistentConductor(() => cfg);
 
@@ -224,6 +224,44 @@ describe("PersistentConductor", () => {
     conductor.stopKeepWarm();
 
     expect(calls).toEqual(["chat:30m"]);
+  });
+
+  test("keep-warm loop renews after the configured freshness interval elapses", async () => {
+    const calls: string[] = [];
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/ps")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/generate")) {
+        calls.push("generate");
+        return Response.json({ done: true, done_reason: "load" });
+      }
+      if (url.endsWith("/api/chat")) {
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        calls.push(`chat:${body.keep_alive}`);
+        return Response.json({
+          message: {
+            role: "assistant",
+            content: '{"task_type":"general","pipeline":["synthesizer"],"topology":"linear","context":{"needs_workspace_inspection":false,"needs_memory":true,"estimated_complexity":"low"},"coordinator_rationale":"warm"}',
+          },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg = makeConfig({
+      persist_sessions: false,
+      keep_warm: true,
+      keep_warm_interval_ms: 50,
+    });
+    const conductor = new PersistentConductor(() => cfg);
+
+    await conductor.routeTurn({ sessionId: "expired-route", request: "hello", turnNumber: 1 });
+    conductor.startKeepWarm();
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    conductor.stopKeepWarm();
+
+    expect(calls).toEqual(["chat:30m", "generate"]);
   });
 
   test("withRuntimeFallback rethrows timeout-class errors instead of retrying another cold local model", async () => {
