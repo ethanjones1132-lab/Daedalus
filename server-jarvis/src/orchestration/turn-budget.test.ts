@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { createTurnBudget } from "./turn-budget";
+import { createTurnBudget, FINAL_STREAM_GRACE_MS } from "./turn-budget";
 import { AgentPool, firstTokenTimeoutFor } from "./agent-pool";
 import { resolveTurnRequirement } from "./turn-requirements";
 
@@ -166,5 +166,32 @@ describe("turn budgets", () => {
     // making the override completely inert end-to-end.
     const actualWatchdogDelayMs = Math.min(stageRemainingMs, resolvedFirstTokenMs);
     expect(actualWatchdogDelayMs).toBe(55_000); // was 25_000 before the fix
+  });
+
+  // T1.1: beginStage freezes the stage clock so retries cannot re-arm a full
+  // 15s coordinator budget (tonight's 37s serial parse-fail chain).
+  test("beginStage elapsed accounting shrinks stageRemainingMs across retries", () => {
+    const budget = createTurnBudget("workspace_read", "medium", 0);
+    budget.beginStage("coordinator", 1_000);
+    // 10s into the stage → 5s of the 15s budget remain.
+    expect(budget.stageRemainingMs("coordinator", 11_000)).toBe(5_000);
+    // Second "attempt" at t=11s must NOT reset the budget.
+    budget.beginStage("coordinator", 11_000);
+    expect(budget.stageRemainingMs("coordinator", 14_000)).toBe(2_000);
+    expect(budget.stageRemainingMs("coordinator", 16_000)).toBe(0);
+  });
+
+  test("stageStreamDeadlineAt is absolute and bounded by turn deadline", () => {
+    const budget = createTurnBudget("conversational", "medium", 0);
+    budget.beginStage("coordinator", 0);
+    expect(budget.stageStreamDeadlineAt("coordinator", 0)).toBe(15_000);
+    // Synthesizer has no stage budget.
+    expect(budget.stageStreamDeadlineAt("synthesizer", 0)).toBeUndefined();
+  });
+
+  // T1.3: final stream grace window.
+  test("finalStreamDeadlineAt extends past deadlineAt by FINAL_STREAM_GRACE_MS", () => {
+    const budget = createTurnBudget("workspace_read", "medium", 0);
+    expect(budget.finalStreamDeadlineAt()).toBe(budget.deadlineAt + FINAL_STREAM_GRACE_MS);
   });
 });

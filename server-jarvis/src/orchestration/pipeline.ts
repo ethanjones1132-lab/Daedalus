@@ -1226,8 +1226,16 @@ export class PipelineExecutor {
           onStateChange({ stage: "synthesizer", status: "running", output: chunk });
           this.publishStageToken("synthesizer", chunk);
         }
-      });
+      }) as {
+        content?: string;
+        _finishReason?: string | null;
+        _stopReason?: string | null;
+        _truncated?: boolean;
+      };
       const finalAnswer = resp.content ?? "";
+      // T0.1/T0.2: provider finish_reason / stop_reason from callModel.
+      const stopReason = typeof resp._stopReason === "string" ? resp._stopReason : null;
+      const truncated = resp._truncated === true;
 
       // Semantic emptiness is a FAILURE, not a success. A 200-OK with empty
       // visible content (free-tier zero-token completion, model spent its
@@ -1250,8 +1258,36 @@ export class PipelineExecutor {
           was_successful: 0,
           had_error: 1,
           error_message: "empty_completion",
+          stop_reason: stopReason,
         });
         return { answer: "", emptyCompletion: true };
+      }
+
+      // T0.2 / T1.3: clean HTTP return but truncated stream (provider_cut /
+      // length / content_filter) — ship the partial answer with honest
+      // partialErrorCode so agent_runs.outcome can be "partial", not success.
+      if (truncated) {
+        const partialErrorCode =
+          stopReason === "length" ? "token_cap"
+            : stopReason === "turn_deadline" || stopReason === "stage_deadline" ? "stage_timeout"
+              : "stream_cut";
+        onStateChange({ stage: "synthesizer", status: "completed", output: finalAnswer });
+        await this.afterConductorStage("synthesizer", "completed", finalAnswer, agentRunId, options, remainingQueue);
+        this.collector.recordStageRun({
+          id: `stage_${crypto.randomUUID()}`,
+          agent_run_id: agentRunId,
+          mode_id: "synthesizer",
+          turn_number: 1,
+          input_tokens: Math.round((synthesizerPrompt.length + contextText.length) / 4),
+          output_tokens: countTokens(finalAnswer),
+          tool_calls_json: "[]",
+          duration_ms: Date.now() - synthStartTime,
+          was_successful: 0,
+          had_error: 0,
+          stop_reason: stopReason,
+          partial_error_code: partialErrorCode,
+        });
+        return { answer: finalAnswer, emptyCompletion: false, partialErrorCode };
       }
 
       onStateChange({ stage: "synthesizer", status: "completed", output: finalAnswer });
@@ -1267,6 +1303,7 @@ export class PipelineExecutor {
         duration_ms: Date.now() - synthStartTime,
         was_successful: 1,
         had_error: 0,
+        stop_reason: stopReason ?? "stop",
       });
       return { answer: finalAnswer, emptyCompletion: false };
     } catch (e: any) {
@@ -1276,6 +1313,10 @@ export class PipelineExecutor {
       const hasPartialDeadlineAnswer =
         e?.name === "TurnDeadlineExceededError" && streamedAnswer.trim().length > 0;
       const fatalError = describePipelineError(message);
+      const deadlineStopReason =
+        e?.name === "TurnDeadlineExceededError" ? "turn_deadline"
+          : e?.name === "StageDeadlineExceededError" ? "stage_deadline"
+            : null;
       this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
         agent_run_id: agentRunId,
@@ -1286,6 +1327,8 @@ export class PipelineExecutor {
         was_successful: 0,
         had_error: 1,
         error_message: message,
+        stop_reason: deadlineStopReason,
+        partial_error_code: hasPartialDeadlineAnswer ? "stage_timeout" : null,
       });
       // `answer` must never carry the raw failure text — 20 historical runs
       // (pre-2026-07-04) shipped "Synthesis failed: ..." as the literal chat

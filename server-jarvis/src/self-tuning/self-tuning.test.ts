@@ -121,6 +121,75 @@ describe("Self tuning", () => {
     expect(byId["run_bad"].outcome).toBe("failed");
   });
 
+  // T0.2: truncated turns must persist as `partial`, not fold to `degraded`
+  // at the storage boundary (reward math maps partial→degraded separately).
+  test("completeAgentRun persists partial outcome truthfully", () => {
+    const store = new SelfTuningStore(TEST_DB_PATH);
+    const collector = new SessionOutcomeCollector(store);
+    collector.startAgentRun("run_partial", "s", "q", "general", ["synthesizer"]);
+    collector.completeAgentRun("run_partial", "mid-sentence cut", 50_000, 0, 100, "partial");
+    const run = store.getAgentRuns().find((r) => r.id === "run_partial");
+    expect(run?.outcome).toBe("partial");
+  });
+
+  // T0.2: stage_runs stop_reason + partial_error_code round-trip (new columns
+  // + idempotent guarded ALTER on pre-existing DBs).
+  test("insertStageRun persists stop_reason and partial_error_code", () => {
+    const store = new SelfTuningStore(TEST_DB_PATH);
+    const collector = new SessionOutcomeCollector(store);
+    collector.startAgentRun("run_stop", "s", "q", "general", ["synthesizer"]);
+    collector.recordStageRun({
+      id: "stage_stop",
+      agent_run_id: "run_stop",
+      mode_id: "synthesizer",
+      turn_number: 1,
+      was_successful: 0,
+      had_error: 0,
+      stop_reason: "provider_cut",
+      partial_error_code: "stream_cut",
+    });
+    const stage = store.getStageRuns("run_stop")[0];
+    expect(stage.stop_reason).toBe("provider_cut");
+    expect(stage.partial_error_code).toBe("stream_cut");
+  });
+
+  test("stop_reason / partial_error_code migration is idempotent", () => {
+    // Open twice against the same path — second open re-runs guarded ALTERs.
+    const path = ":memory:";
+    const a = new SelfTuningStore(path);
+    a.insertAgentRun({
+      id: "run_mig",
+      session_id: "s",
+      user_request: "q",
+      task_type: "general",
+      pipeline: "[]",
+      completed: 0,
+    });
+    a.insertStageRun({
+      id: "stage_mig",
+      agent_run_id: "run_mig",
+      mode_id: "synthesizer",
+      turn_number: 1,
+      was_successful: 1,
+      had_error: 0,
+      stop_reason: "stop",
+    });
+    // Same :memory: store is process-local; re-ensure path via second insert.
+    a.insertStageRun({
+      id: "stage_mig2",
+      agent_run_id: "run_mig",
+      mode_id: "executor",
+      turn_number: 1,
+      was_successful: 1,
+      had_error: 0,
+      stop_reason: "tool_calls",
+      partial_error_code: null,
+    });
+    const stages = a.getStageRuns("run_mig");
+    expect(stages).toHaveLength(2);
+    expect(stages.map((s) => s.stop_reason).sort()).toEqual(["stop", "tool_calls"]);
+  });
+
   test("an injected in-memory collector is isolated — bun test cannot reach the production DB", () => {
     // Two independent :memory: stores never share rows. Because every pipeline
     // test injects a :memory: collector (never the global production singleton),

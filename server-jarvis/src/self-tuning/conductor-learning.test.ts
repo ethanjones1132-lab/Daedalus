@@ -91,6 +91,16 @@ describe("Conductor learning (Phase 4)", () => {
         turn_number: 1,
         was_successful: 1,
         had_error: 0,
+        stop_reason: "tool_calls",
+      }, {
+        id: "stage_synth",
+        agent_run_id: "run_p4",
+        mode_id: "synthesizer",
+        turn_number: 1,
+        was_successful: 0,
+        had_error: 0,
+        stop_reason: "provider_cut",
+        partial_error_code: "stream_cut",
       }],
       modelAttributions: store.getModelAttributions("run_p4"),
       durationMs: 5000,
@@ -101,6 +111,11 @@ describe("Conductor learning (Phase 4)", () => {
     expect(store.getModelAttributions("run_p4")).toHaveLength(1);
     expect(store.getModelAttributions("run_p4")[0].first_token_ms).toBe(275);
     expect(store.getTrajectorySnapshots(1)).toHaveLength(1);
+    // T0.2: trajectory snapshot carries stop_reason / partial_error_code.
+    const traj = JSON.parse(store.getTrajectorySnapshots(1)[0].snapshot_json);
+    const synth = traj.stage_runs.find((s: { mode_id: string }) => s.mode_id === "synthesizer");
+    expect(synth.stop_reason).toBe("provider_cut");
+    expect(synth.partial_error_code).toBe("stream_cut");
     expect(store.getAgentPerformance("debug").some((r) => r.agent_id === sampleAgent.id)).toBe(true);
   });
 

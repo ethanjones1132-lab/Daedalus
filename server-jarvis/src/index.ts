@@ -81,6 +81,7 @@ import {
   createStreamLivenessTracker,
   createDisconnectAwareWrite,
   ResettableWatchdog,
+  StageDeadlineExceededError,
   StreamIdleTimeoutError,
   startSseHeartbeat,
   TurnDeadlineExceededError,
@@ -94,6 +95,10 @@ import {
   registerAbortHandler,
   resolveReadStopReason,
 } from "./stream-control";
+import {
+  createStreamFinishTracker,
+  serverCancelFromReadStop,
+} from "./stream-finish";
 import { prepareToolResultForContext } from "./tool-result-truncation";
 import { detectDegenerateTail } from "./stream-degeneration";
 import { SessionRepetitionStore, assessRepetition, shouldShortCircuitRepeat } from "./orchestration/repetition-guard";
@@ -1779,6 +1784,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const useFallback = !isOllama && cfg.openrouter.enable_fallbacks;
           const requestTimeout = isOllama ? MODEL_REQUEST_TIMEOUT_MS : (cfg.openrouter.timeout_ms || MODEL_REQUEST_TIMEOUT_MS);
           const ctrl = new AbortController();
+          // T1.1: freeze the stage clock so retries share one stage budget.
+          if (stageLabel) turnBudget.beginStage(stageLabel);
           const stageBudgetMs = stageLabel
             ? turnBudget.stageRemainingMs(stageLabel, Date.now())
             : turnBudget.remainingMs(Date.now());
@@ -1786,6 +1793,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           if (stageLabel !== "synthesizer" && !turnBudget.canStart(stageLabel ?? "agent", Date.now())) {
             throw new TurnDeadlineExceededError(stageLabel ?? "orchestrator_request", turnBudget.turn_ms);
           }
+          // Re-read stage deadline after beginStage (executor may have extended via
+          // extendStageOnProgress between attempts; beginStage only freezes start).
+          const stageStreamDeadline = stageLabel
+            ? turnBudget.stageStreamDeadlineAt(stageLabel)
+            : undefined;
           const requestBudgetMs = Math.max(
             1_000,
             Math.min(requestTimeout, stageBudgetMs, Math.max(1_000, turnBudget.remainingMs(Date.now()) - reserveMs)),
@@ -1910,6 +1922,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let streamIdleTimeoutFired = false;
           let visibleProgressTimeoutFired = false;
           let turnDeadlineExceeded = false;
+          let stageDeadlineExceeded = false;
           // Intra-stream degeneration guard (stream-degeneration.ts): every 16
           // content chunks, check whether the accumulated answer's tail has
           // collapsed into a repeating phrase/unit (decoding-loop failure).
@@ -1947,13 +1960,57 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             markFirstProgress();
             streamLiveness.onVisibleProgress();
           };
+          // T1.3: surfaceAsAnswer gets a grace window past deadlineAt so we
+          // never hard-chop a streaming final answer mid-word. Non-final
+          // stages still abort at deadlineAt. Grace is only armed once first
+          // token is received and soft deadline fires with tokens in flight.
+          const isFinalAnswerStream = callOptions?.surfaceAsAnswer === true;
+          let finalGraceTimer: ReturnType<typeof setTimeout> | null = null;
           const turnDeadlineTimer = setTimeout(() => {
-            if (!streamAbort.signal.aborted) {
-              turnDeadlineExceeded = true;
-              cancelReader("Turn deadline exceeded").catch(() => {});
+            if (streamAbort.signal.aborted) return;
+            if (isFinalAnswerStream && firstTokenReceived) {
+              // Soft deadline: keep streaming under the grace window.
+              const graceMs = Math.max(0, turnBudget.finalStreamDeadlineAt() - Date.now());
+              console.warn(
+                `[Jarvis Orchestrator] finalizing under grace window stage=${stageName} model=${actualModelUsed} grace_ms=${graceMs}`,
+              );
+              void writer.write(encoder.encode(
+                `data: ${JSON.stringify({ type: "agent_activity", stage: stageName, text: "finalizing under grace window", session_id: sessionId })}\n\n`,
+              )).catch(() => {});
+              finalGraceTimer = setTimeout(() => {
+                if (!streamAbort.signal.aborted) {
+                  turnDeadlineExceeded = true;
+                  cancelReader("Turn deadline exceeded (grace)").catch(() => {});
+                }
+              }, graceMs);
+              return;
             }
+            turnDeadlineExceeded = true;
+            cancelReader("Turn deadline exceeded").catch(() => {});
           }, Math.max(0, turnBudget.deadlineAt - Date.now()));
+          // T1.1: per-stage STREAM deadline (elapsed-accounting). Coordinator
+          // must not stream past its 15s budget even after headers arrive.
+          // Re-read deadline when arming (extendStageOnProgress may have mutated).
+          const liveStageDeadline = stageLabel
+            ? turnBudget.stageStreamDeadlineAt(stageLabel)
+            : stageStreamDeadline;
+          const stageDeadlineTimer = liveStageDeadline !== undefined
+            ? setTimeout(() => {
+              if (!streamAbort.signal.aborted) {
+                stageDeadlineExceeded = true;
+                console.warn(
+                  `[Jarvis Orchestrator] Stage deadline exceeded stage=${stageName} model=${actualModelUsed}`,
+                );
+                cancelReader("Stage deadline exceeded").catch(() => {});
+              }
+            }, Math.max(0, liveStageDeadline - Date.now()))
+            : null;
           const textStreamSanitizer = createStageStreamSanitizer(Boolean(useTextTools));
+          // T0.1: track provider finish_reason so truncated streams are not
+          // labeled clean successes. settle() is called on the normal return
+          // path; server-side cancels throw before settle and are mapped via
+          // attemptOutcome in the catch block.
+          const finishTracker = createStreamFinishTracker();
           const emitTextToken = async (text: string) => {
             if (callOptions?.surfaceAsAnswer) {
               await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text }, session_id: sessionId })}\n\n`));
@@ -1983,6 +2040,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               streamIdleTimedOut: streamIdleTimeoutFired,
               visibleProgressTimedOut: visibleProgressTimeoutFired,
               turnDeadlineExceeded,
+              stageDeadlineExceeded,
               degenerateStreamDetected,
               signal: streamAbort.signal,
             });
@@ -1996,6 +2054,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               throw new DegenerateStreamError(actualModelUsed, stageName, actualProviderUsed);
             }
             if (stopReason === "turn_cancelled") await emitCancelled();
+            if (stopReason === "stage_deadline_exceeded") {
+              const budgetMs = stageLabel && turnBudget.stage_ms[stageLabel] !== undefined
+                ? turnBudget.stage_ms[stageLabel]
+                : turnBudget.turn_ms;
+              throw new StageDeadlineExceededError(stageName, budgetMs);
+            }
             if (stopReason === "turn_deadline_exceeded") {
               throw new TurnDeadlineExceededError(stageName, turnBudget.turn_ms);
             }
@@ -2015,6 +2079,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 const parsed = JSON.parse(payload);
                 const choice = parsed.choices?.[0];
                 if (!choice) continue;
+                // T0.1: record provider finish_reason (often null on deltas).
+                finishTracker.observe(choice);
 
                 if (choice.delta?.tool_calls?.length) {
                   markVisibleProgress();
@@ -2179,6 +2245,23 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           orchLastModel = actualModelUsed;
           orchLastProvider = actualProviderUsed;
           orchLastFirstTokenMs = firstTokenLatencyMs;
+          // T0.1: settle finish_reason once. Missing finish_reason ⇒ truncated
+          // only for surfaceAsAnswer stages (some providers omit it elsewhere).
+          const isAnswerStage = callOptions?.surfaceAsAnswer === true;
+          const finishSettle = finishTracker.settle({
+            treatMissingAsTruncated: isAnswerStage,
+          });
+          {
+            const hasContent = typeof cleanContent === "string" && cleanContent.trim().length > 0;
+            const hasToolCalls = parsedToolCalls.length > 0;
+            if (isAnswerStage) {
+              if (!hasContent) attemptOutcome = "empty_completion";
+              else if (finishSettle.truncated) attemptOutcome = "truncated";
+              else attemptOutcome = "success";
+            } else {
+              attemptOutcome = hasContent || hasToolCalls ? "success" : "empty_completion";
+            }
+          }
           if (
             orchestratorAgentRunId &&
             stageLabel &&
@@ -2218,10 +2301,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             // loop BOOSTED the capability score of the model that leaked the
             // JSON. Non-answer stages (executor, etc.) legitimately succeed via
             // tool calls with no prose, so they keep the original OR logic.
-            const isAnswerStage = callOptions?.surfaceAsAnswer === true;
-            attemptOutcome = isAnswerStage
-              ? (hasContent ? "success" : "empty_completion")
-              : (hasContent || hasToolCalls ? "success" : "empty_completion");
+            // Truncation on an answer stage is not a clean success for learning.
+            const answerOk = isAnswerStage
+              ? (hasContent && !finishSettle.truncated)
+              : (hasContent || hasToolCalls);
             conductorLearning.recordStageModel({
               agentRunId: orchestratorAgentRunId,
               stageId: stageLabel,
@@ -2231,9 +2314,22 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               durationMs: Date.now() - stageAttemptStart,
               firstTokenMs: firstTokenLatencyMs,
               fallbackUsed: (excludeModels?.size ?? 0) > 0,
-              wasSuccessful: isAnswerStage ? hasContent : (hasContent || hasToolCalls),
-              hadError: isAnswerStage ? !hasContent : (!hasContent && !hasToolCalls),
+              wasSuccessful: answerOk,
+              hadError: !answerOk,
             });
+          }
+          if (
+            callOptions?.surfaceAsAnswer === true &&
+            finishSettle.truncated &&
+            typeof cleanContent === "string" &&
+            cleanContent.trim().length > 0
+          ) {
+            // Per-model counter log (T0.1): surface missing-finish / length cuts
+            // before we extend treatMissingAsTruncated beyond answer stages.
+            console.warn(
+              `[Jarvis Orchestrator] stream truncated model=${actualModelUsed} stage=${stageLabel ?? "agent"} ` +
+              `finish_reason=${finishSettle.finish_reason ?? "null"} stop_reason=${finishSettle.stop_reason}`,
+            );
           }
           return {
             content: cleanContent,
@@ -2242,10 +2338,15 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             // empty-completion retry. Not part of the CallModelFn contract.
             _modelUsed: actualModelUsed,
             _provider: actualProviderUsed,
+            _finishReason: finishSettle.finish_reason,
+            _stopReason: finishSettle.stop_reason,
+            _truncated: finishSettle.truncated,
           };
           } finally {
             clearTimeout(firstTokenTimer);
             clearTimeout(turnDeadlineTimer);
+            if (finalGraceTimer) clearTimeout(finalGraceTimer);
+            if (stageDeadlineTimer) clearTimeout(stageDeadlineTimer);
             streamLiveness.stop();
             cleanupReaderAbort();
             cleanupRequestAbort();
@@ -2260,7 +2361,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                   ? "visible_progress_timeout"
                   : name === "DegenerateStreamError"
                     ? "degenerate_stream"
-                    : "http_error";
+                    : name === "StageDeadlineExceededError"
+                      ? "http_error" // stage deadline is a hard fail for this attempt
+                      : "http_error";
             const failure = error as { model?: unknown; provider?: unknown };
             if (typeof failure?.model === "string") attemptModel = failure.model;
             if (typeof failure?.provider === "string") attemptProvider = failure.provider;
@@ -2662,19 +2765,22 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           ? assessRepetition(repetitionStore.lastSignature(sessionId), trimmedAnswer, evidenceKeys)
           : { repeated: false, similarity: 0, newEvidence: false };
 
-        // Persistence/training keep their historical three-way vocabulary;
-        // a user-visible partial answer is recorded as degraded, never as a
-        // success. The raw PipelineResult still retains `outcome: "partial"`
-        // for the stream contract and diagnostics.
-        const runOutcome: "success" | "degraded" | "failed" =
+        // T0.2: persist truthful outcome including `partial` (truncated stream,
+        // stage timeout, token cap). Learning/reward keeps a 3-way vocabulary
+        // and maps partial→degraded only at the reward boundary below.
+        const runOutcome: "success" | "degraded" | "failed" | "partial" =
           repetitionVerdict.repeated
             ? "degraded"
             : result.outcome === "partial"
-              ? "degraded"
+              ? "partial"
               : (result.outcome ?? (result.error || !trimmedAnswer ? "failed" : "success"));
+        // Reward boundary: partial folds to degraded so reward math / conductor
+        // learning stay on the historical 3-way vocabulary.
+        const rewardOutcome: "success" | "degraded" | "failed" =
+          runOutcome === "partial" ? "degraded" : runOutcome;
         const finalOutputForLog = trimmedAnswer || result.error || `(no output: ${result.error_code ?? "empty_completion"})`;
         sessionMemory.recordPipelineOutcome(sessionId, {
-          outcome: runOutcome,
+          outcome: rewardOutcome,
           errorCode: result.error_code,
           error: result.error,
           answer: trimmedAnswer,
@@ -2694,7 +2800,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             sessionId,
             taskType: route.task_type,
             route,
-            runOutcome,
+            runOutcome: rewardOutcome,
             workerInstructions: route.worker_instructions,
             instructionVariants: instructionSelection,
             stageRuns,

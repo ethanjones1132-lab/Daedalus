@@ -17,9 +17,13 @@ export interface AgentRun {
   tool_calls_count?: number;
   token_count?: number;
   /**
-   * Truthful run outcome: "success" | "degraded" | "failed". Distinct from
-   * `completed` (which only marks that the run finished). Added via a guarded
-   * ALTER in getDb() so existing DBs gain the column without a full migration.
+   * Truthful run outcome: "success" | "degraded" | "failed" | "partial".
+   * Distinct from `completed` (which only marks that the run finished).
+   * `partial` is a user-visible truncated/incomplete answer (stream cut,
+   * stage timeout, token cap). Learning/reward paths map partial→degraded
+   * at the reward boundary only so reward math keeps its 3-way vocabulary.
+   * Added via a guarded ALTER in getDb() so existing DBs gain the column
+   * without a full migration.
    */
   outcome?: string;
   created_at?: string;
@@ -37,6 +41,17 @@ export interface StageRun {
   was_successful: number;
   had_error: number;
   error_message?: string;
+  /**
+   * Normalized stream stop reason (T0.1/T0.2): stop|length|tool_calls|
+   * provider_cut|turn_deadline|stage_deadline|watchdog|cancelled|…
+   * Guarded-ALTER on existing DBs.
+   */
+  stop_reason?: string | null;
+  /**
+   * When the stage returned partial content (e.g. stage_timeout, stream_cut,
+   * token_cap). Distinct from error_message (hard failures).
+   */
+  partial_error_code?: string | null;
   created_at?: string;
 }
 
@@ -262,6 +277,8 @@ const SELF_TUNING_SCHEMA = `
     was_successful INTEGER NOT NULL DEFAULT 0,
     had_error INTEGER NOT NULL DEFAULT 0,
     error_message TEXT,
+    stop_reason TEXT,
+    partial_error_code TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   );
   CREATE INDEX IF NOT EXISTS idx_stage_runs_agent_run_id ON stage_runs(agent_run_id);
@@ -455,6 +472,13 @@ export class SelfTuningStore {
         try {
           db.exec(`ALTER TABLE model_attributions ADD COLUMN first_token_ms INTEGER`);
         } catch { /* column already exists */ }
+        // T0.2: truncation honesty columns on stage_runs.
+        try {
+          db.exec(`ALTER TABLE stage_runs ADD COLUMN stop_reason TEXT`);
+        } catch { /* column already exists */ }
+        try {
+          db.exec(`ALTER TABLE stage_runs ADD COLUMN partial_error_code TEXT`);
+        } catch { /* column already exists */ }
         schemaEnsuredPaths.add(dbPath);
       }
       return db;
@@ -513,8 +537,8 @@ export class SelfTuningStore {
     if (!db) return;
     try {
       db.prepare(
-        `INSERT INTO stage_runs (id, agent_run_id, mode_id, turn_number, input_tokens, output_tokens, tool_calls_json, duration_ms, was_successful, had_error, error_message)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO stage_runs (id, agent_run_id, mode_id, turn_number, input_tokens, output_tokens, tool_calls_json, duration_ms, was_successful, had_error, error_message, stop_reason, partial_error_code)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         stage.id,
         stage.agent_run_id,
@@ -526,7 +550,9 @@ export class SelfTuningStore {
         stage.duration_ms ?? null,
         stage.was_successful,
         stage.had_error,
-        stage.error_message ?? null
+        stage.error_message ?? null,
+        stage.stop_reason ?? null,
+        stage.partial_error_code ?? null,
       );
     } catch (e) {
       console.error("[SelfTuningStore] insertStageRun failed:", e);

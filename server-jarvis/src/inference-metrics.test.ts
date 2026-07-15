@@ -173,6 +173,25 @@ describe("inferenceMetricsSnapshot", () => {
     });
     expect(JSON.stringify(attempt)).not.toContain("prompt");
   });
+
+  // T0.1: truncated is a first-class attempt outcome (provider_cut / length).
+  it("records truncated attempt outcomes", () => {
+    recordInferenceAttempt({
+      ts: Date.now(),
+      session_id: "trunc-session",
+      run_id: "trunc-run",
+      stage: "synthesizer",
+      provider: "opencode_go",
+      model: "deepseek-v4-pro",
+      outcome: "truncated",
+      latency_ms: 45_000,
+      first_token_ms: 12_000,
+      fallback_attempt: 1,
+    });
+    const attempt = inferenceMetricsSnapshot().recent_attempts.at(-1);
+    expect(attempt?.outcome).toBe("truncated");
+    expect(attempt?.stage).toBe("synthesizer");
+  });
 });
 
 describe("backendForProvider", () => {

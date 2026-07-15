@@ -83,6 +83,7 @@ export interface InferenceRecord {
 
 export type InferenceAttemptOutcome =
   | "success"
+  | "truncated"
   | "first_token_timeout"
   | "stream_idle_timeout"
   | "visible_progress_timeout"

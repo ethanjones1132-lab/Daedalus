@@ -38,9 +38,11 @@ export class SessionOutcomeCollector {
     toolCallsCount: number,
     tokenCount: number,
     // Truthful run outcome. `completed:1` only means the run FINISHED — the
-    // `outcome` column records whether it actually succeeded. A failed/degraded
-    // run must NOT be silently indistinguishable from a successful one.
-    outcome: "success" | "degraded" | "failed" = "success",
+    // `outcome` column records whether it actually succeeded. A failed/degraded/
+    // partial run must NOT be silently indistinguishable from a successful one.
+    // `partial` is persisted truthfully (T0.2); reward/learning maps it to
+    // degraded at the reward boundary only.
+    outcome: "success" | "degraded" | "failed" | "partial" = "success",
   ): void {
     this.store.updateAgentRun(runId, {
       completed: 1,

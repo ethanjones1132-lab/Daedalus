@@ -103,6 +103,14 @@ export class TurnDeadlineExceededError extends Error {
   }
 }
 
+/** T1.1: per-stage stream budget exhausted (does not reset on cascade retry). */
+export class StageDeadlineExceededError extends Error {
+  constructor(readonly stage: string, readonly stageBudgetMs: number) {
+    super(`Stage deadline exceeded (${stageBudgetMs}ms) on stage=${stage}`);
+    this.name = "StageDeadlineExceededError";
+  }
+}
+
 /** Two-tier stream liveness: transport (any delta) + visible (answer text / tool deltas). */
 export function createStreamLivenessTracker(opts: {
   interTokenMs: number;

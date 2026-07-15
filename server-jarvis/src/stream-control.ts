@@ -119,6 +119,7 @@ export type ReadStopReason =
   | "stream_idle_timeout"
   | "turn_cancelled"
   | "turn_deadline_exceeded"
+  | "stage_deadline_exceeded"
   | "visible_progress_timeout"
   | "degenerate_stream";
 
@@ -145,6 +146,8 @@ export function resolveReadStopReason(options: {
   streamIdleTimedOut: boolean;
   visibleProgressTimedOut?: boolean;
   turnDeadlineExceeded?: boolean;
+  /** T1.1: per-stage stream deadline (elapsed-accounting budget). */
+  stageDeadlineExceeded?: boolean;
   /** Set by the periodic tail-repetition check (stream-degeneration.ts). */
   degenerateStreamDetected?: boolean;
   signal: AbortSignal;
@@ -153,6 +156,9 @@ export function resolveReadStopReason(options: {
   if (options.streamIdleTimedOut) return "stream_idle_timeout";
   if (options.degenerateStreamDetected) return "degenerate_stream";
   if (options.signal.aborted) return "turn_cancelled";
+  // Stage deadline precedes turn deadline: a coordinator that burns its 15s
+  // must fail as stage_deadline even if the turn still has room.
+  if (options.stageDeadlineExceeded) return "stage_deadline_exceeded";
   if (options.turnDeadlineExceeded) return "turn_deadline_exceeded";
   if (options.visibleProgressTimedOut) return "visible_progress_timeout";
   return null;
