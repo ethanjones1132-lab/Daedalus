@@ -22,7 +22,7 @@
 // raw call count, so re-reading the same file repeatedly can't game it either.
 // ═══════════════════════════════════════════════════════════════
 
-import type { ToolCallRecord } from "./stage-output";
+import { isDuplicateToolDeflection, type ToolCallRecord } from "./stage-output";
 import { hasWorkspaceSignal, hasWriteIntent, type TurnRequirement } from "./turn-requirements";
 
 const DEEP_READ_MARKERS =
@@ -92,7 +92,7 @@ export function assessWorkspaceEvidence(
   request: string,
 ): EvidenceAssessment {
   const calls = (toolCalls ?? []).filter(
-    (c) => !c.is_error && c.output.trim().length > 0,
+    (c) => !c.is_error && c.output.trim().length > 0 && !isDuplicateToolDeflection(c),
   );
   const listings = calls.filter((c) => LISTING_TOOLS.has(c.name)).length;
   const deepRead = isDeepReadRequest(request);

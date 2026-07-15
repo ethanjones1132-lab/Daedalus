@@ -18,7 +18,16 @@ import { normalizeRemainingStages, type ExecutionProfile } from "./route-normali
 import { hasWriteIntent, type TurnRequirement } from "./turn-requirements";
 import type { TurnBudget } from "./turn-budget";
 import type { PipelineStageState, PlannerStageOutput, ExecutorStageOutput, ReviewerStageOutput, RewriterStageOutput, ToolCallRecord } from "./stage-output";
-import { isEmptyStageOutput, parseReviewerVerdict, renderExecutorSummary, renderPlanSummary, renderReviewerSummary, renderRewriterSummary } from "./stage-output";
+import {
+  DUPLICATE_TOOL_DEFLECTION_MARKER,
+  isDuplicateToolDeflection,
+  isEmptyStageOutput,
+  parseReviewerVerdict,
+  renderExecutorSummary,
+  renderPlanSummary,
+  renderReviewerSummary,
+  renderRewriterSummary,
+} from "./stage-output";
 import { assessWorkspaceEvidence, evidenceFailure, isDeepReadRequest, turnNeedsWorkspaceEvidence } from "./evidence-sufficiency";
 import { substituteToolCall } from "../tool-heal";
 import {
@@ -143,6 +152,25 @@ export function partitionToolCalls<T extends { name: string }>(calls: T[]): T[][
   }
   if (current.length) batches.push(current);
   return batches;
+}
+
+function duplicateToolCallKey(call: ToolCall): string {
+  return `${call.name}:${JSON.stringify(call.arguments)}`;
+}
+
+function duplicateToolCallDeflection(call: ToolCall, firstOutput: string | undefined): ToolResult {
+  const previous = firstOutput && firstOutput.trim().length > 0
+    ? ` Previous result began:\n${firstOutput.slice(0, 500)}`
+    : "";
+  return {
+    call_id: call.id,
+    name: call.name,
+    output:
+      `${DUPLICATE_TOOL_DEFLECTION_MARKER} ${call.name} was already called with these exact arguments in this executor stage.` +
+      `${previous}\nchoose a NEW target instead of repeating the same read-only call.`,
+    is_error: false,
+    duration_ms: 0,
+  };
 }
 
 const ANCHOR_FILES = ["package.json", "README.md", "readme.md", "Cargo.toml", "pyproject.toml", "tsconfig.json", "app.json", "go.mod"];
@@ -529,14 +557,34 @@ export class PipelineExecutor {
     rawToolCalls: any[],
     options: PipelineExecuteOptions,
     record: (raw: any, call: ToolCall, result: ToolResult) => Promise<void> | void,
+    duplicateReadOnlyOutputs?: Map<string, string>,
   ): Promise<void> {
     const parsed = rawToolCalls.map((raw) => {
       const call = parseStreamedToolCall(raw);
       return { raw, call, name: call.name };
     });
+    const readOnlyOutputCache = duplicateReadOnlyOutputs;
     for (const batch of partitionToolCalls(parsed)) {
       const settled = await Promise.all(
-        batch.map(async (entry) => ({ entry, result: await this.runToolCall(entry.raw, options) })),
+        batch.map(async (entry) => {
+          if (readOnlyOutputCache !== undefined && READ_ONLY_TOOLS.has(entry.call.name)) {
+            const duplicateKey = duplicateToolCallKey(entry.call);
+            if (readOnlyOutputCache.has(duplicateKey)) {
+              return {
+                entry,
+                result: duplicateToolCallDeflection(entry.call, readOnlyOutputCache.get(duplicateKey)),
+                duplicateKey,
+                deflected: true,
+              };
+            }
+            readOnlyOutputCache.set(duplicateKey, "");
+            const result = await this.runToolCall(entry.raw, options);
+            readOnlyOutputCache.set(duplicateKey, toolResultModelText(result));
+            return { entry, result, duplicateKey, deflected: false };
+          }
+          const result = await this.runToolCall(entry.raw, options);
+          return { entry, result, duplicateKey: undefined, deflected: false };
+        }),
       );
       for (const { entry, result } of settled) {
         this.conductor?.live.onToolResult(
@@ -546,6 +594,9 @@ export class PipelineExecutor {
           toolResultModelText(result).slice(0, 500),
         );
         await record(entry.raw, entry.call, result);
+      }
+      if (readOnlyOutputCache && settled.some(({ entry, deflected }) => !deflected && WRITE_EFFECT_TOOLS.has(entry.call.name))) {
+        readOnlyOutputCache.clear();
       }
     }
   }
@@ -685,6 +736,7 @@ export class PipelineExecutor {
       { role: "user", content: `User Request: ${request}\n\nPlan:\n${planSummary}` }
     ];
     const toolCalls: ToolCallRecord[] = [];
+    const duplicateReadOnlyOutputs = new Map<string, string>();
     const narratives: string[] = [];
     let turnCount = 0;
     let executorDone = false;
@@ -698,7 +750,7 @@ export class PipelineExecutor {
     });
     let executorTurn = 0;
     const successfulEvidenceCount = () => toolCalls
-      .filter((call) => !call.is_error && call.output.trim().length > 0)
+      .filter((call) => !call.is_error && call.output.trim().length > 0 && !isDuplicateToolDeflection(call))
       .length;
 
     // Git/SHA requests are deterministic read-only metadata requests. Some
@@ -926,7 +978,7 @@ export class PipelineExecutor {
                   });
                 }
               }
-            });
+            }, duplicateReadOnlyOutputs);
           }
 
           // Task 2.4: a turn that added new successful evidence earns the
@@ -935,7 +987,7 @@ export class PipelineExecutor {
           // a stalled executor still hits the original tight deadline.
           const evidenceAddedThisTurn = toolCalls
             .slice(turnStartIdx)
-            .filter((call) => !call.is_error && call.output.trim().length > 0)
+            .filter((call) => !call.is_error && call.output.trim().length > 0 && !isDuplicateToolDeflection(call))
             .length;
           options.turnBudget?.extendStageOnProgress("executor", evidenceAddedThisTurn);
 

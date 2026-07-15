@@ -13,6 +13,8 @@
 
 import type { ToolErrorCode } from "../tool-types";
 
+export const DUPLICATE_TOOL_DEFLECTION_MARKER = "[duplicate call deflected]";
+
 export interface ToolCallRecord {
   name: string;
   arguments: Record<string, unknown>;
@@ -21,6 +23,10 @@ export interface ToolCallRecord {
   /** Set when `is_error` is true — stable machine-readable category (see tool-types.ts). */
   error_code?: ToolErrorCode;
   duration_ms: number;
+}
+
+export function isDuplicateToolDeflection(call: Pick<ToolCallRecord, "output">): boolean {
+  return call.output.trimStart().startsWith(DUPLICATE_TOOL_DEFLECTION_MARKER);
 }
 
 export interface PlannerStageOutput {

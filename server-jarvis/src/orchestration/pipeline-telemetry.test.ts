@@ -368,6 +368,147 @@ describe("pipeline stage telemetry", () => {
     expect(readCalls.map((c) => (c.arguments as { path: string }).path)).toEqual(["a.ts", "b.ts", "c.ts"]);
   });
 
+  test("duplicate read-only tool calls in one executor stage execute once and return a deflection result", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    let listRuns = 0;
+    runtime.register(toolDefinition("list_directory"), async () => {
+      listRuns++;
+      return "src/\npackage.json";
+    });
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor" && executorTurns++ === 0) {
+        return {
+          content: "listing twice",
+          tool_calls: [
+            toolCallWithArgs("list_directory", { path: "src" }),
+            toolCallWithArgs("list_directory", { path: "src" }),
+          ],
+        };
+      }
+      if (options.stageLabel === "executor") return { content: "done" };
+      if (options.stageLabel === "synthesizer") return { content: "Listed src." };
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "list src twice",
+      ["executor", "synthesizer"],
+      "run-duplicate-list-deflection",
+      () => {},
+      { executionProfile: "read_only" },
+    );
+
+    expect(listRuns).toBe(1);
+    const listCalls = (result.toolCalls ?? []).filter((call) => call.name === "list_directory");
+    expect(listCalls).toHaveLength(2);
+    expect(listCalls[0]?.output).toContain("package.json");
+    expect(listCalls[1]?.output).toContain("[duplicate call deflected]");
+    expect(listCalls[1]?.output).toContain("choose a NEW target");
+  });
+
+  test("a write tool invalidates duplicate read-only deflection within the executor stage", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    let listRuns = 0;
+    let writeRuns = 0;
+    runtime.register(toolDefinition("list_directory"), async () => {
+      listRuns++;
+      return "src/\npackage.json";
+    });
+    runtime.register(toolDefinition("write_file"), async () => {
+      writeRuns++;
+      return "wrote file";
+    });
+    const cfg = defaultConfig();
+    cfg.tools = { ...cfg.tools, require_approval: [], sandbox_mode: "permissive" };
+    const ctx = makeExecutionContext("agent", cfg, { workspace_path: process.cwd() });
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor" && executorTurns++ === 0) {
+        return {
+          content: "list, write, list again",
+          tool_calls: [
+            toolCallWithArgs("list_directory", { path: "src" }),
+            toolCallWithArgs("list_directory", { path: "src" }),
+            toolCallWithArgs("write_file", { path: "src/generated.txt", content: "fresh" }),
+            toolCallWithArgs("list_directory", { path: "src" }),
+          ],
+        };
+      }
+      if (options.stageLabel === "executor") return { content: "done" };
+      if (options.stageLabel === "synthesizer") return { content: "Updated src." };
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "create a file and relist src",
+      ["executor", "synthesizer"],
+      "run-write-invalidates-duplicate-deflection",
+      () => {},
+      { executionProfile: "full" },
+    );
+
+    expect(writeRuns).toBe(1);
+    expect(listRuns).toBe(2);
+    const listOutputs = (result.toolCalls ?? [])
+      .filter((call) => call.name === "list_directory")
+      .map((call) => call.output);
+    expect(listOutputs).toEqual([
+      expect.stringContaining("package.json"),
+      expect.stringContaining("[duplicate call deflected]"),
+      expect.stringContaining("package.json"),
+    ]);
+  });
+
+  test("duplicate deflections do not inflate executor evidence progress counts", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("read_file"), async () => "file body");
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    const progressCounts: number[] = [];
+    const turnBudget = {
+      extendStageOnProgress: (_stage: string, count: number) => progressCounts.push(count),
+    };
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor" && executorTurns++ === 0) {
+        return {
+          content: "reading same file twice",
+          tool_calls: [
+            toolCallWithArgs("read_file", { path: "README.md" }),
+            toolCallWithArgs("read_file", { path: "README.md" }),
+          ],
+        };
+      }
+      if (options.stageLabel === "executor") return { content: "done" };
+      if (options.stageLabel === "synthesizer") return { content: "Read README." };
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "read README twice",
+      ["executor", "synthesizer"],
+      "run-duplicate-progress-stability",
+      () => {},
+      { executionProfile: "read_only", turnBudget: turnBudget as any },
+    );
+
+    expect(result.toolCalls?.map((call) => call.output)).toEqual([
+      "file body",
+      expect.stringContaining("[duplicate call deflected]"),
+    ]);
+    expect(progressCounts[0]).toBe(1);
+  });
+
   test("PipelineResult.toolCalls is undefined when the executor stage never ran", async () => {
     const rows: StageRun[] = [];
     const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
