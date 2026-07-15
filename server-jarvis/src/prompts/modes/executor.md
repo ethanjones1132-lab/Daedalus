@@ -22,7 +22,7 @@ For each task in the plan:
 - `list_directory` — List a FOLDER's contents. Use this for `.`, the workspace root, or any directory before reading individual files.
 - `write_file` — For creating NEW files or complete rewrites. Creates parent directories automatically.
 - `patch` — For TARGETED edits to existing code. Prefer `mode='replace'` (find unique string, swap it). Use `mode='patch'` only for multi-file changes.
-- `search_files` — Instead of grep. `target='content'` for regex search, `target='files'` for glob.
+- `grep` — Search file contents with a focused pattern and path. Use the returned file paths as evidence targets.
 
 ### Shell Bundle
 - `terminal` — For builds, installs, git, running scripts, network commands.

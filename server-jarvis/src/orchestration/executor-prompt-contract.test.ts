@@ -13,6 +13,8 @@ describe("executor prompt contract", () => {
     expect(prompt).toContain(`>=${DEEP_READ_MIN_CONTENT_READS} distinct source-file reads`);
     expect(prompt).toContain("listings/manifests do not count");
     expect(prompt).toContain("never repeat a call");
+    expect(prompt).toContain("`grep`");
+    expect(prompt).not.toContain("search_files");
     expect(prompt).not.toContain("reasoning without a tool call is fine");
   });
 });

@@ -183,12 +183,26 @@ describe("assessWorkspaceEvidence", () => {
 
   test("path aliases for one source file do not inflate the deep-read count", () => {
     const a = assessWorkspaceEvidence(
-      [read("src/a.ts"), read("./src/../src/a.ts"), read("C:/repo/src/a.ts")],
+      [read("src/a.ts"), read("./src/../src/a.ts"), read("/C:/repo/src/a.ts")],
       "comprehensively diagnose the architecture of this repo",
       "C:/repo",
     );
     expect(a.sufficient).toBe(false);
     expect(a.contentReads).toBe(1);
+  });
+
+  test("extended Windows path aliases share the workspace-root target", () => {
+    const a = assessWorkspaceEvidence(
+      [
+        read("src/a.ts"),
+        read(String.raw`\\?\C:\repo\src\a.ts`),
+        read("src/b.ts"),
+      ],
+      "comprehensively diagnose the architecture of this repo",
+      "C:/repo",
+    );
+    expect(a.sufficient).toBe(false);
+    expect(a.contentReads).toBe(2);
   });
 
   test("grep output relative to its directory shares the read_file target", () => {
@@ -209,6 +223,22 @@ describe("assessWorkspaceEvidence", () => {
     );
     expect(a.sufficient).toBe(false);
     expect(a.contentReads).toBe(2);
+  });
+
+  test("grep match text cannot manufacture extra source-file targets", () => {
+    const a = assessWorkspaceEvidence(
+      [{
+        name: "grep",
+        arguments: { pattern: "TODO", path: "src" },
+        output: "a.ts:1: import ./b.ts and ./c.ts",
+        is_error: false,
+        duration_ms: 8,
+      }],
+      "comprehensively diagnose the architecture of this repo",
+      "C:/repo",
+    );
+    expect(a.sufficient).toBe(false);
+    expect(a.contentReads).toBe(1);
   });
 
   test("workspace-root normalization does not collapse same-suffix files from another root", () => {

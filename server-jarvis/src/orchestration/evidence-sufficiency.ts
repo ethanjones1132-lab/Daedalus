@@ -49,8 +49,15 @@ function distinctTargetKeys(calls: ToolCallRecord[], tools: Set<string>): Set<st
 }
 
 function normalizePath(rawPath: string): { path: string; absolute: boolean } {
-  const slashPath = rawPath.replace(/\\/g, "/");
-  const absolute = /^\/?[a-z]:\//i.test(slashPath) || slashPath.startsWith("/");
+  let slashPath = rawPath.replace(/\\/g, "/");
+  const extendedPrefix = slashPath.match(/^\/\/\?\//);
+  const absolute = Boolean(extendedPrefix) || /^\/?[a-z]:\//i.test(slashPath) || slashPath.startsWith("/");
+  if (extendedPrefix) {
+    slashPath = slashPath.slice(4);
+    if (/^unc\//i.test(slashPath)) slashPath = `/${slashPath.slice(4)}`;
+  } else if (/^\/[a-z]:\//i.test(slashPath)) {
+    slashPath = slashPath.slice(1);
+  }
   const prefix = /^[a-z]:\//i.test(slashPath)
     ? slashPath.slice(0, 3).toLowerCase()
     : slashPath.startsWith("/")
@@ -97,18 +104,23 @@ function grepOutputSourceFileKeys(call: ToolCallRecord, workspaceRoot?: string):
   const grepPath = typeof args?.path === "string" ? args.path : undefined;
   const grepPathIsFile = grepPath ? sourceFileKey(grepPath, workspaceRoot) !== undefined : false;
   const keys = new Set<string>();
-  for (const token of call.output.split(/\s+/)) {
-    const candidate = token
+  for (const rawLine of call.output.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    // Grep/rg output begins with the matched file path and a line/column
+    // location. Parse only that prefix; filenames mentioned in the matched
+    // source text are evidence about content, not additional file reads.
+    const location = line.match(/^(.*?):\d+(?::\d+)?(?::|$)/);
+    const candidate = (location?.[1] ?? line.split(/\s+/)[0])
       .replace(/^[([{\"'`]+/g, "")
-      .replace(/[,:;"'`]+$/g, "")
-      .replace(/:\d+(?::\d+)?$/, "");
+      .replace(/[,:;"'`]+$/g, "");
     const normalizedCandidate = normalizePath(candidate);
     const candidateHasDirectory = normalizedCandidate.path.includes("/");
     const rawCandidate = grepPath
       && !grepPathIsFile
       && !normalizedCandidate.absolute
       && !candidateHasDirectory
-      && !/[?*[]/.test(grepPath)
+      && !/[?*]/.test(grepPath)
       ? `${grepPath.replace(/[\\/]+$/, "")}/${candidate}`
       : candidate;
     const key = sourceFileKey(rawCandidate, workspaceRoot);
