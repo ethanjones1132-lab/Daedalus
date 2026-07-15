@@ -1763,12 +1763,15 @@ export class PipelineExecutor {
         // T2.4: reviewer reject with repairs exhausted on a write-intent turn → replan.
         // Read-intent turns legitimately skip the rewriter (see pipeline-context test)
         // and must fall through to synthesizer.
+        const reviewerReplanEligible = hasWriteIntent(intentText)
+          || (options.turnRequirement === "full_execution" && requiresWorkspaceEvidence);
         if (
           reviewer?.hasIssues &&
           !rewriter &&
           wantsSynthesizer &&
           options.allowMidRunReplan !== false &&
           profile === "full" &&
+          reviewerReplanEligible &&
           (options.maxReviewRepairRounds ?? 1) > 0
         ) {
           replanRequested = {
