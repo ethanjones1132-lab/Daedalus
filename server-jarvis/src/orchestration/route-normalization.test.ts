@@ -72,6 +72,15 @@ describe("normalizeRemainingStages (T2.2)", () => {
     );
     expect(r).toEqual(["executor", "reviewer", "synthesizer"]);
   });
+
+  test("preserves explicit executor re-entry after executor stage", () => {
+    const r = normalizeRemainingStages(
+      ["re-enter:executor", "reviewer", "synthesizer"],
+      "full_execution",
+      "executor",
+    );
+    expect(r).toEqual(["executor", "reviewer", "synthesizer"]);
+  });
 });
 
 describe("normalizeRoute", () => {
