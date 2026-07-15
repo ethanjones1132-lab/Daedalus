@@ -23,10 +23,16 @@ export class ModelScorecard {
     return list;
   }
 
-  record(stage: string, providerModelKey: string, attempt: ScorecardAttempt): void {
+  record(stage: string, providerModelKey: string, attempt: ScorecardAttempt): ScorecardAttempt {
     const list = this.slot(stage, providerModelKey);
-    list.push(attempt);
+    const trackedAttempt = { ...attempt };
+    list.push(trackedAttempt);
     if (list.length > WINDOW_SIZE) list.splice(0, list.length - WINDOW_SIZE);
+    return trackedAttempt;
+  }
+
+  revise(attempt: ScorecardAttempt, patch: Partial<ScorecardAttempt>): void {
+    Object.assign(attempt, patch);
   }
 
   seedFromHistory(stage: string, rows: ModelAttribution[]): void {

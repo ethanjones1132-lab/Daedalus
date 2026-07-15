@@ -112,7 +112,7 @@ import { AgentPool, firstTokenTimeoutFor, formatPoolDiversity } from "./orchestr
 import { excludedModelKeys } from "./model-failure-memory";
 import { PipelineExecutor } from "./orchestration/pipeline";
 import { combinedStageExclusions, StageHealthRegistry, type RecoverableFailureKind } from "./orchestration/stage-health";
-import { ModelScorecard } from "./orchestration/model-scorecard";
+import { ModelScorecard, type ScorecardAttempt } from "./orchestration/model-scorecard";
 import { createTurnBudget } from "./orchestration/turn-budget";
 import { OrchestrationAdmissionController, type AdmissionLease } from "./orchestration/admission-controller";
 import type { PipelineProgressState, PipelineRecursionEvent } from "./orchestration/pipeline";
@@ -1623,6 +1623,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         let orchLastModel: string | undefined;
         let orchLastProvider: string | undefined;
         let orchLastFirstTokenMs: number | undefined;
+        let orchLastScorecardAttempt: ScorecardAttempt | undefined;
         let orchestratorAgentRunId: string | undefined;
         const callModelAttempt = async (messages: any[], callOptions?: any, excludeModels?: Set<string>) => {
           ensureTurnBudget(callOptions?.stageLabel ?? "orchestrator_model_attempt");
@@ -2423,10 +2424,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             throw error;
           } finally {
             if (attemptStage && attemptModel && attemptProvider && !streamAbort.signal.aborted) {
-              modelScorecard.record(attemptStage, `${attemptProvider}:${attemptModel}`, {
+              const trackedScorecardAttempt = modelScorecard.record(attemptStage, `${attemptProvider}:${attemptModel}`, {
                 ok: attemptOutcome === "success" || attemptOutcome === "truncated",
                 firstTokenMs: attemptFirstTokenMs,
               });
+              if (attemptStage === "coordinator") orchLastScorecardAttempt = trackedScorecardAttempt;
               recordInferenceAttempt({
                 ts: Date.now(),
                 session_id: sessionId,
@@ -2645,10 +2647,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             stage: "coordinator",
             kind: "parse_failure",
           });
-          modelScorecard.record("coordinator", `${orchLastProvider}:${orchLastModel}`, {
-            ok: false,
-            firstTokenMs: orchLastFirstTokenMs,
-          });
+          if (orchLastScorecardAttempt) {
+            modelScorecard.revise(orchLastScorecardAttempt, { ok: false });
+          } else {
+            modelScorecard.record("coordinator", `${orchLastProvider}:${orchLastModel}`, {
+              ok: false,
+              firstTokenMs: orchLastFirstTokenMs,
+            });
+          }
           console.warn(
             `[Jarvis Orchestrator] coordinator parse_failure strike ` +
             `${orchLastProvider}:${orchLastModel} — excluded for 5min cooldown`,

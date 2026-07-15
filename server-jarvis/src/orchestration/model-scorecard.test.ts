@@ -57,6 +57,20 @@ describe("ModelScorecard", () => {
     expect(scorecard.p50FirstToken("synthesizer", KEY)).toBe(2000);
   });
 
+  test("revises a recorded outcome without adding a second sample", () => {
+    const scorecard = new ModelScorecard();
+    for (let i = 0; i < 5; i++) scorecard.record("coordinator", KEY, { ok: true });
+    const recorded = scorecard.record("coordinator", KEY, { ok: true });
+    const revise = (scorecard as unknown as {
+      revise?: (attempt: unknown, patch: { ok: boolean }) => void;
+    }).revise;
+
+    expect(typeof revise).toBe("function");
+    revise?.(recorded, { ok: false });
+
+    expect(scorecard.errorRate("coordinator", KEY)).toBe(1 / 6);
+  });
+
   test("0/8 seeded coordinator history is immediately unfit", () => {
     const scorecard = new ModelScorecard();
     const rows = Array.from({ length: 8 }, (_, index) =>
