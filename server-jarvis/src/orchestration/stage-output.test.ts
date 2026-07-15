@@ -6,11 +6,25 @@ import {
   renderPlanSummary,
   renderReviewerSummary,
   renderRewriterSummary,
+  isEmptyStageOutput,
   type ExecutorStageOutput,
   type PlannerStageOutput,
   type ReviewerStageOutput,
   type RewriterStageOutput,
 } from "./stage-output";
+
+describe("isEmptyStageOutput", () => {
+  test("empty and whitespace-only content is empty", () => {
+    expect(isEmptyStageOutput("")).toBe(true);
+    expect(isEmptyStageOutput("   \n\t ")).toBe(true);
+    expect(isEmptyStageOutput(undefined)).toBe(true);
+    expect(isEmptyStageOutput(null)).toBe(true);
+  });
+
+  test("real content is not empty", () => {
+    expect(isEmptyStageOutput("1. Read the repo")).toBe(false);
+  });
+});
 
 describe("parseReviewerVerdict", () => {
   test("REJECT verdict flags issues", () => {

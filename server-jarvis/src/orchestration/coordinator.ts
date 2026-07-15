@@ -38,6 +38,7 @@ export type CallModelFn = (
     stageLabel?: string;
     cascadeTier?: "cheap" | "strong";
     surfaceAsAnswer?: boolean;
+    advanceOnEmpty?: boolean;
     suppressActivity?: boolean;
     /** Optional stage-local cancellation. It must not abort the whole turn. */
     stageAbort?: AbortSignal;

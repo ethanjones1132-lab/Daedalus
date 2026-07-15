@@ -72,6 +72,16 @@ export interface PipelineStageState {
   rewriter?: RewriterStageOutput;
 }
 
+/**
+ * A model-only stage that resolves with no meaningful visible content has
+ * failed, even when the provider returned HTTP 200. Keeping this predicate at
+ * the stage-output boundary prevents empty completions from being recorded as
+ * successful work by the self-tuning collector.
+ */
+export function isEmptyStageOutput(content: string | null | undefined): boolean {
+  return !content || content.trim().length === 0;
+}
+
 const TOOL_OUTPUT_TRUNCATE_AT = 1000;
 
 function renderToolCalls(toolCalls: ToolCallRecord[]): string {

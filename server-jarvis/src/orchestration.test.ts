@@ -113,6 +113,33 @@ describe("Orchestration & Routing Tests", () => {
     expect(synth.error_message).toBe("empty_completion");
   });
 
+  test("planner empty completion is recorded as a failed stage and the run degrades", async () => {
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig);
+    const recorded: any[] = [];
+    const collector = { recordStageRun: (row: any) => recorded.push(row) };
+    const callModel = async (_messages: any[], options: any) => {
+      if (options.stageLabel === "planner") return { content: "" };
+      if (options.stageLabel === "executor") return { content: "did work" };
+      if (options.stageLabel === "reviewer") return { content: "ACCEPT: fine" };
+      return { content: "final answer" };
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector as any);
+
+    const result = await executor.execute(
+      "plan something",
+      ["planner", "executor", "reviewer", "synthesizer"],
+      "run-empty-planner",
+      () => {},
+    );
+
+    const plannerRow = recorded.find((row) => row.mode_id === "planner");
+    expect(plannerRow.was_successful).toBe(0);
+    expect(plannerRow.had_error).toBe(1);
+    expect(plannerRow.error_message).toBe("empty_completion");
+    expect(result.outcome).not.toBe("success");
+  });
+
   test("rewriter timeout yields a partial result and terminal timed_out stage", async () => {
     const runtime = createToolRuntime();
     const ctx = makeExecutionContext("agent", defaultConfig);

@@ -2407,7 +2407,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // records `empty_completion` and the user gets the friendly retry notice.
         const callModel = async (messages: any[], callOptions?: any) => {
           const canRetryStage = Boolean(callOptions?.stageLabel) && cfg.active_backend !== "ollama" && cfg.openrouter.enable_fallbacks;
-          const canAdvanceEmpty = callOptions?.surfaceAsAnswer === true && canRetryStage;
+          const canAdvanceEmpty = (callOptions?.surfaceAsAnswer === true || callOptions?.advanceOnEmpty === true) && canRetryStage;
           const exclude = new Set<string>();
           let last: any;
           for (let retry = 0; ; retry++) {

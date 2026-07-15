@@ -18,7 +18,7 @@ import { normalizeRemainingStages, type ExecutionProfile } from "./route-normali
 import { hasWriteIntent, type TurnRequirement } from "./turn-requirements";
 import type { TurnBudget } from "./turn-budget";
 import type { PipelineStageState, PlannerStageOutput, ExecutorStageOutput, ReviewerStageOutput, RewriterStageOutput, ToolCallRecord } from "./stage-output";
-import { parseReviewerVerdict, renderExecutorSummary, renderPlanSummary, renderReviewerSummary, renderRewriterSummary } from "./stage-output";
+import { isEmptyStageOutput, parseReviewerVerdict, renderExecutorSummary, renderPlanSummary, renderReviewerSummary, renderRewriterSummary } from "./stage-output";
 import { assessWorkspaceEvidence, evidenceFailure, isDeepReadRequest } from "./evidence-sufficiency";
 import { substituteToolCall } from "../tool-heal";
 import {
@@ -601,6 +601,7 @@ export class PipelineExecutor {
         max_tokens: BUILTIN_MODES.planner.max_tokens,
         stream: true,
         stageLabel: "planner",
+        advanceOnEmpty: true,
         suppressActivity: false,
         stageAbort: this.registerStageAbort("planner"),
         onChunk: (chunk) => {
@@ -609,6 +610,25 @@ export class PipelineExecutor {
         }
       });
       const narrative = resp.content;
+      if (isEmptyStageOutput(narrative)) {
+        const errorMessage = "empty_completion";
+        onStateChange({ stage: "planner", status: "failed", output: errorMessage });
+        await this.afterConductorStage("planner", "failed", errorMessage, agentRunId, options, remainingQueue);
+        this.collector.recordStageRun({
+          id: `stage_${crypto.randomUUID()}`,
+          agent_run_id: agentRunId,
+          mode_id: "planner",
+          turn_number: 1,
+          input_tokens: Math.round((plannerPrompt.length + request.length) / 4),
+          output_tokens: 0,
+          tool_calls_json: "[]",
+          duration_ms: Date.now() - startTime,
+          was_successful: 0,
+          had_error: 1,
+          error_message: errorMessage,
+        });
+        return { ok: false, narrative: "Failed to generate plan: the planner model returned an empty completion." };
+      }
       onStateChange({ stage: "planner", status: "completed", output: narrative });
       await this.afterConductorStage("planner", "completed", narrative, agentRunId, options, remainingQueue);
 
@@ -1059,6 +1079,7 @@ export class PipelineExecutor {
             tools: getToolsForMode("rewriter", this.runtime.listTools(), profile),
             stream: true,
             stageLabel: "rewriter",
+            advanceOnEmpty: true,
             stageAbort: this.registerStageAbort("rewriter"),
             suppressActivity: false,
             onChunk: (chunk) => {
@@ -1066,6 +1087,32 @@ export class PipelineExecutor {
             }
           });
 
+          const hasRewriteToolCalls = Array.isArray(rewriteResp.tool_calls) && rewriteResp.tool_calls.length > 0;
+          if (isEmptyStageOutput(rewriteResp.content) && !hasRewriteToolCalls) {
+            const errorMessage = "empty_completion";
+            onStateChange({ stage: "rewriter", status: "failed", output: errorMessage });
+            await this.afterConductorStage("rewriter", "failed", errorMessage, agentRunId, options, []);
+            this.collector.recordStageRun({
+              id: `stage_${crypto.randomUUID()}`,
+              agent_run_id: agentRunId,
+              mode_id: "rewriter",
+              turn_number: rewriterTurn,
+              input_tokens: inputTokens,
+              output_tokens: 0,
+              tool_calls_json: "[]",
+              duration_ms: Date.now() - rewStartTime,
+              was_successful: 0,
+              had_error: 1,
+              error_message: errorMessage,
+            });
+            return {
+              ok: false,
+              narrative: errorMessage,
+              toolCalls,
+              terminalStatus: "failed",
+              errorCode: errorMessage,
+            };
+          }
           rewriterMessages.push({ role: "assistant", content: rewriteResp.content, tool_calls: rewriteResp.tool_calls });
           if (rewriteResp.content) narratives.push(rewriteResp.content);
 
@@ -1204,6 +1251,7 @@ export class PipelineExecutor {
           max_tokens: BUILTIN_MODES.reviewer.max_tokens,
           stream: true,
           stageLabel: "reviewer",
+          advanceOnEmpty: true,
           suppressActivity: false,
           onChunk: (chunk) => {
             onStateChange({ stage: "reviewer", status: "running", output: chunk });
@@ -1211,6 +1259,27 @@ export class PipelineExecutor {
         });
 
         reviewerFeedback = reviewerResp.content;
+        if (isEmptyStageOutput(reviewerFeedback)) {
+          const errorMessage = "empty_completion";
+          reviewerOk = false;
+          hasPendingIssues = false;
+          onStateChange({ stage: "reviewer", status: "failed", output: errorMessage });
+          await this.afterConductorStage("reviewer", "failed", errorMessage, agentRunId, options, []);
+          this.collector.recordStageRun({
+            id: `stage_${crypto.randomUUID()}`,
+            agent_run_id: agentRunId,
+            mode_id: "reviewer",
+            turn_number: reviewCount,
+            input_tokens: Math.round((reviewerPrompt.length + boundedRequest.length + boundedPlanSummary.length + boundedExecutorSummary.length + truncateToTokenBudget(rewriterSummaryForPrompt, 1_000).length) / 4),
+            output_tokens: 0,
+            tool_calls_json: "[]",
+            duration_ms: Date.now() - revStartTime,
+            was_successful: 0,
+            had_error: 1,
+            error_message: errorMessage,
+          });
+          break;
+        }
         onStateChange({ stage: "reviewer", status: "completed", output: reviewerFeedback });
 
         this.collector.recordStageRun({
