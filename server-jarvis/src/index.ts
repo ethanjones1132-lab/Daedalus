@@ -1635,6 +1635,25 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             ? `Conversation History:\n${historyBlock}\n\nLatest User Request: ${message}`
             : message;
         }
+        // Continuation self-sufficiency (2026-07-16 evening): a bare
+        // "continue" reached the executor/synthesizer as the literal word
+        // whenever the client sent no history, and the stages concluded
+        // "there's no active task". The task-run contract already knows the
+        // objective server-side — inject it so continuation turns never
+        // depend on client-supplied history (which may also be truncated
+        // past the original request by the history budget).
+        if (
+          activeTaskRun.turnCount > 1 &&
+          activeTaskRun.objective &&
+          activeTaskRun.objective.trim() !== message.trim()
+        ) {
+          const priorOutcome = priorTaskRun?.lastOutcome
+            ? ` Last turn outcome: ${priorTaskRun.lastOutcome}.`
+            : "";
+          contextMessage =
+            `[In-progress task, turn ${activeTaskRun.turnCount}] Objective: ` +
+            `${activeTaskRun.objective.slice(0, 600)}${priorOutcome}\n\n${contextMessage}`;
+        }
 
         let orchestratorTaskType = "general";
 
