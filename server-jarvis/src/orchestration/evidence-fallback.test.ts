@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { composeEvidenceFallbackAnswer } from "./pipeline";
+import { composeEvidenceFallbackAnswer, shouldCutToSynthesis, SYNTHESIS_RUNWAY_MS } from "./pipeline";
 import type { PipelineStageState } from "./stage-output";
 import type { ToolCallRecord } from "./stage-output";
 
@@ -64,5 +64,26 @@ describe("composeEvidenceFallbackAnswer", () => {
     const digest = composeEvidenceFallbackAnswer(stateWith(reads));
     expect((digest.match(/### read_file/g) ?? []).length).toBe(6);
     expect(digest.length).toBeLessThan(6 * 1_700 + 2_000);
+  });
+});
+
+describe("shouldCutToSynthesis", () => {
+  const base = { wantsSynthesizer: true, hasEvidence: true, reserveMs: 30_000 };
+
+  test("cuts inside the danger zone (reserve + runway)", () => {
+    expect(shouldCutToSynthesis({ ...base, remainingMs: 30_000 + SYNTHESIS_RUNWAY_MS })).toBe(true);
+    expect(shouldCutToSynthesis({ ...base, remainingMs: 40_000 })).toBe(true);
+  });
+
+  test("does not cut with ample budget", () => {
+    expect(shouldCutToSynthesis({ ...base, remainingMs: 30_001 + SYNTHESIS_RUNWAY_MS })).toBe(false);
+    expect(shouldCutToSynthesis({ ...base, remainingMs: 120_000 })).toBe(false);
+  });
+
+  test("never cuts without a queued synthesizer, evidence, or a budget", () => {
+    expect(shouldCutToSynthesis({ ...base, wantsSynthesizer: false, remainingMs: 10_000 })).toBe(false);
+    expect(shouldCutToSynthesis({ ...base, hasEvidence: false, remainingMs: 10_000 })).toBe(false);
+    expect(shouldCutToSynthesis({ ...base, remainingMs: undefined })).toBe(false);
+    expect(shouldCutToSynthesis({ ...base, remainingMs: 10_000, reserveMs: undefined })).toBe(false);
   });
 });

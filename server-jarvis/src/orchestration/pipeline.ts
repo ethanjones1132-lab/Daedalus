@@ -251,6 +251,32 @@ export function composeEvidenceFallbackAnswer(state: PipelineStageState): string
   return lines.join("\n");
 }
 
+/**
+ * Runway a synthesizer start needs beyond the finalization reserve to
+ * survive one stalled first attempt (~leash window) plus one real fallback
+ * completion (~25-30s warm). Live basis: session 10cf071d — synthesis
+ * starting with 28-40s died three turns in a row; the one turn where it got
+ * ~60s+ (run 6b4ab013) produced a full answer.
+ */
+export const SYNTHESIS_RUNWAY_MS = 30_000;
+
+/**
+ * True when the segment loop should stop starting non-synthesizer stages and
+ * jump to synthesis: a synthesizer is queued, there is evidence worth
+ * synthesizing, and the remaining turn budget is inside the danger zone
+ * (finalization reserve + one stall's worth of runway). Pure for testability.
+ */
+export function shouldCutToSynthesis(args: {
+  wantsSynthesizer: boolean;
+  hasEvidence: boolean;
+  remainingMs: number | undefined;
+  reserveMs: number | undefined;
+}): boolean {
+  if (!args.wantsSynthesizer || !args.hasEvidence) return false;
+  if (args.remainingMs === undefined || args.reserveMs === undefined) return false;
+  return args.remainingMs <= args.reserveMs + SYNTHESIS_RUNWAY_MS;
+}
+
 export function successfulWriteKeys(calls: ToolCallRecord[]): Set<string> {
   return new Set(
     calls
@@ -2165,6 +2191,32 @@ export class PipelineExecutor {
     // run when we hit it (or after the queue drains if it was never present).
     while (workQueue.length > 0) {
       const stage = workQueue.shift()!;
+      // Synthesis runway guard (2026-07-16 evening, session 10cf071d): every
+      // 180s-ceiling turn spent down to ~the finalization reserve on
+      // replan/review ceremony and started synthesis with 28-40s left — one
+      // provider stall from death. Once evidence exists, stop starting
+      // non-synthesizer stages while there is still enough runway for a
+      // stalled first attempt plus one fallback completion.
+      if (
+        stage !== "synthesizer" &&
+        shouldCutToSynthesis({
+          wantsSynthesizer,
+          hasEvidence: (state.executor?.toolCalls?.length ?? 0) > 0,
+          remainingMs: options.turnBudget?.remainingMs(),
+          reserveMs: options.turnBudget?.finalization_reserve_ms,
+        })
+      ) {
+        console.warn(
+          `[Pipeline] synthesis runway guard: skipping ${[stage, ...workQueue].join("->")} ` +
+          `with ${options.turnBudget?.remainingMs()}ms of turn budget left`,
+        );
+        onStateChange({
+          stage: "synthesizer",
+          status: "running",
+          detail: "runway_guard_cut",
+        });
+        break;
+      }
       if (stage === "planner") {
         state.plan = await this.runPlannerStage(request, agentRunId, onStateChange, opts, remainingNow());
         continue;
