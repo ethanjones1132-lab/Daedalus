@@ -2880,6 +2880,23 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           agentPool,
           cfg.orchestrator.conductor.supervision,
           localSupervisor,
+          (attr) => {
+            // F7/F10a: make ~20s/run of supervision visible in model_attributions.
+            // Single write path (collector) — do not also call recordStageModel
+            // or rows would double-insert.
+            outcomeCollector.recordModelAttribution({
+              id: `attr_${crypto.randomUUID()}`,
+              agent_run_id: attr.agentRunId,
+              stage_id: "conductor_supervision",
+              agent_id: "live_conductor",
+              provider: attr.provider ?? "conductor",
+              model_id: attr.modelId ?? "supervision",
+              was_successful: attr.wasSuccessful ? 1 : 0,
+              had_error: attr.hadError ? 1 : 0,
+              duration_ms: attr.durationMs,
+              fallback_used: 0,
+            });
+          },
         );
         liveConductor.setContext(
           route.task_type,

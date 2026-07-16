@@ -1,23 +1,85 @@
 import { describe, test, expect } from "bun:test";
-import { LiveConductor } from "./conductor";
+import { LiveConductor, shouldSuperviseStage } from "./conductor";
 import { ConductorBus } from "./conductor-bus";
 import { AgentPool, DEFAULT_ORCHESTRATOR_AGENTS } from "./agent-pool";
+import type { SupervisionAttribution } from "./conductor";
 
-function makeConductor(overrides?: Partial<{
-  supervision_timeout_ms: number;
-  max_tool_errors_before_reroute: number;
-  supervise_low_complexity: boolean;
-}>, callModelFn?: (messages: any[], options?: any) => Promise<{content: string}>) {
+function makeConductor(
+  overrides?: Partial<{
+    supervision_timeout_ms: number;
+    max_tool_errors_before_reroute: number;
+    supervise_low_complexity: boolean;
+  }>,
+  callModelFn?: (messages: any[], options?: any) => Promise<{ content: string }>,
+  onAttributed?: (row: SupervisionAttribution) => void,
+) {
   const bus = new ConductorBus();
   const pool = new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS);
   const callModel = callModelFn ?? (async () => ({ content: '{"directive":"continue"}' }));
-  const conductor = new LiveConductor(callModel, bus, pool, {
-    supervision_timeout_ms: overrides?.supervision_timeout_ms ?? 5000,
-    max_tool_errors_before_reroute: overrides?.max_tool_errors_before_reroute ?? 2,
-    supervise_low_complexity: overrides?.supervise_low_complexity ?? false,
-  });
+  const conductor = new LiveConductor(
+    callModel,
+    bus,
+    pool,
+    {
+      supervision_timeout_ms: overrides?.supervision_timeout_ms ?? 5000,
+      max_tool_errors_before_reroute: overrides?.max_tool_errors_before_reroute ?? 2,
+      supervise_low_complexity: overrides?.supervise_low_complexity ?? false,
+    },
+    callModel,
+    onAttributed,
+  );
   return { conductor, bus };
 }
+
+describe("shouldSuperviseStage (F7)", () => {
+  test("clean completed planner is free (no inference)", () => {
+    expect(shouldSuperviseStage({
+      supervisionEnabled: true,
+      outcome: "completed",
+      stage: "planner",
+      remainingQueue: ["executor", "synthesizer"],
+      consecutiveToolErrors: 0,
+      evidenceGap: false,
+      supervisionCallsUsed: 0,
+    })).toBe(false);
+  });
+
+  test("failed stage still supervises", () => {
+    expect(shouldSuperviseStage({
+      supervisionEnabled: true,
+      outcome: "failed",
+      stage: "planner",
+      remainingQueue: ["executor"],
+      consecutiveToolErrors: 0,
+      evidenceGap: false,
+      supervisionCallsUsed: 0,
+    })).toBe(true);
+  });
+
+  test("executor evidence gap still supervises", () => {
+    expect(shouldSuperviseStage({
+      supervisionEnabled: true,
+      outcome: "completed",
+      stage: "executor",
+      remainingQueue: ["synthesizer"],
+      consecutiveToolErrors: 0,
+      evidenceGap: true,
+      supervisionCallsUsed: 0,
+    })).toBe(true);
+  });
+
+  test("cap at 4 supervision calls per run", () => {
+    expect(shouldSuperviseStage({
+      supervisionEnabled: true,
+      outcome: "failed",
+      stage: "executor",
+      remainingQueue: ["synthesizer"],
+      consecutiveToolErrors: 0,
+      evidenceGap: true,
+      supervisionCallsUsed: 4,
+    })).toBe(false);
+  });
+});
 
 describe("LiveConductor", () => {
   test("supervisor message includes evidence-rich executor digest", async () => {
@@ -28,15 +90,18 @@ describe("LiveConductor", () => {
     });
     conductor.setContext("general", "high", "run-evidence-digest");
 
-    const longRequest = `What version is in package.json? ${"x".repeat(400)}`;
-    const directive = await conductor.afterStage("executor", "completed", "executor narrative", ["synthesizer"], {
+    // Deep-read with only one source read → evidence gap → supervise (F7).
+    // First deep-read insufficient completion is consumed by the deterministic
+    // re-enter:executor guard; second call is the supervision path.
+    const longRequest = `Comprehensively audit this repository architecture ${"x".repeat(400)}`;
+    const evidence = {
       request: longRequest,
       workerInstruction: "Read package metadata and report the version.",
       toolCalls: [
         {
           name: "read_file",
-          arguments: { path: "package.json" },
-          output: '{"version":"1.2.3"}',
+          arguments: { path: "src/main.ts" },
+          output: "export const main = 1;",
           is_error: false,
           duration_ms: 12,
         },
@@ -55,7 +120,10 @@ describe("LiveConductor", () => {
           duration_ms: 4,
         },
       ],
-    });
+    };
+    // Deterministic deep-read top-up (no model).
+    await conductor.afterStage("executor", "completed", "first pass", ["synthesizer"], evidence);
+    const directive = await conductor.afterStage("executor", "completed", "executor narrative", ["synthesizer"], evidence);
 
     expect(directive).toEqual({ type: "continue" });
     expect(supervisorMessages).toHaveLength(1);
@@ -63,9 +131,9 @@ describe("LiveConductor", () => {
     expect(userContent).toContain("Tool call counts: grep=1, read_file=2");
     expect(userContent).toContain("Tool error count: 1");
     expect(userContent).toContain("Recent tool errors: grep: Error: no matches");
-    expect(userContent).toContain('"sufficient":true');
-    expect(userContent).toContain('"deepRead":false');
-    expect(userContent).toContain("Request (300 chars): What version is in package.json?");
+    expect(userContent).toContain('"sufficient":false');
+    expect(userContent).toContain('"deepRead":true');
+    expect(userContent).toContain("Request (300 chars): Comprehensively audit this repository architecture");
     expect(userContent).not.toContain("x".repeat(320));
     expect(userContent).toContain("Worker instruction: Read package metadata and report the version.");
   });
@@ -197,7 +265,7 @@ describe("LiveConductor", () => {
     expect(userContent).not.toContain("stale failure");
   });
 
-  test("actively supervises a healthy medium/high-complexity stage when work remains", async () => {
+  test("F7: clean completed planner skips supervisor inference", async () => {
     let modelCalled = false;
     const { conductor } = makeConductor({}, async () => {
       modelCalled = true;
@@ -208,10 +276,10 @@ describe("LiveConductor", () => {
     const dir = await conductor.afterStage("planner", "completed", "plan output", ["executor"]);
 
     expect(dir).toEqual({ type: "continue" });
-    expect(modelCalled).toBe(true);
+    expect(modelCalled).toBe(false);
   });
 
-  test("planner-completed digest does not run the workspace evidence rubric", async () => {
+  test("failed planner still supervises and omits workspace evidence rubric", async () => {
     const supervisorMessages: any[][] = [];
     const { conductor } = makeConductor({}, async (messages) => {
       supervisorMessages.push(messages);
@@ -221,8 +289,8 @@ describe("LiveConductor", () => {
 
     await conductor.afterStage(
       "planner",
-      "completed",
-      "plan output naming lib/gateway/dashboard.ts",
+      "failed",
+      "empty_completion",
       ["executor", "reviewer", "synthesizer"],
       {
         request: "Identify all remaining gaps in the repo",
@@ -263,11 +331,45 @@ describe("LiveConductor", () => {
     );
     conductor.setContext("general", "high", "run-local-supervisor");
 
-    const directive = await conductor.afterStage("planner", "completed", "plan", ["executor"]);
+    // Failed stage triggers diet (clean planner would skip entirely).
+    const directive = await conductor.afterStage("planner", "failed", "plan error", ["executor"]);
 
     expect(directive).toEqual({ type: "continue" });
     expect(supervisorCalls).toBe(1);
     expect(workerCalls).toBe(0);
+  });
+
+  test("F7: 5th supervision request in one run is free (cap 4)", async () => {
+    let modelCalls = 0;
+    const { conductor } = makeConductor({}, async () => {
+      modelCalls += 1;
+      return { content: '{"directive":"continue"}' };
+    });
+    conductor.setContext("general", "high", "run-cap");
+
+    for (let i = 0; i < 4; i++) {
+      await conductor.afterStage("executor", "failed", `fail ${i}`, ["synthesizer"]);
+    }
+    expect(modelCalls).toBe(4);
+    const fifth = await conductor.afterStage("executor", "failed", "fail 4", ["synthesizer"]);
+    expect(fifth).toEqual({ type: "continue" });
+    expect(modelCalls).toBe(4);
+  });
+
+  test("F7: attributes successful supervision calls", async () => {
+    const attrs: SupervisionAttribution[] = [];
+    const { conductor } = makeConductor(
+      {},
+      async () => ({ content: '{"directive":"continue"}' }),
+      (row) => attrs.push(row),
+    );
+    conductor.setContext("general", "high", "run_attr");
+    await conductor.afterStage("planner", "failed", "boom", ["executor"]);
+    expect(attrs).toHaveLength(1);
+    expect(attrs[0].agentRunId).toBe("run_attr");
+    expect(attrs[0].wasSuccessful).toBe(true);
+    expect(attrs[0].hadError).toBe(false);
+    expect(attrs[0].durationMs).toBeGreaterThanOrEqual(0);
   });
 
   test("returns continue by default", async () => {
@@ -312,7 +414,8 @@ describe("LiveConductor", () => {
       }
     );
     conductor.setContext("general", "high", "run-4");
-    const dir = await conductor.afterStage("executor", "completed", "done", ["synthesizer"]);
+    // Failed stage forces supervision so the timeout path is exercised.
+    const dir = await conductor.afterStage("executor", "failed", "done", ["synthesizer"]);
     expect(dir.type).toBe("continue");
   }, 2000);
 
@@ -321,14 +424,14 @@ describe("LiveConductor", () => {
       throw new Error("model unavailable");
     });
     conductor.setContext("general", "high", "run-5");
-    const dir = await conductor.afterStage("planner", "completed", "plan", ["executor"]);
+    const dir = await conductor.afterStage("planner", "failed", "plan", ["executor"]);
     expect(dir).toEqual({ type: "continue" });
   });
 
   test("malformed supervisor response returns continue", async () => {
     const { conductor } = makeConductor({}, async () => ({ content: "not-json" }));
     conductor.setContext("general", "high", "run-parse-failure");
-    const dir = await conductor.afterStage("planner", "completed", "plan", ["executor"]);
+    const dir = await conductor.afterStage("planner", "failed", "plan", ["executor"]);
     expect(dir).toEqual({ type: "continue" });
   });
 

@@ -30,17 +30,34 @@ interface SupervisionDigest {
   remainingQueue: StageName[];
 }
 
+/**
+ * F7: supervise only when there is something to supervise — failures, tool
+ * errors, or evidence gaps on evidence-capable stages. Clean planner/reviewer
+ * completions are free (deterministic continue). Cap at 4 inferences/run.
+ */
 export function shouldSuperviseStage(args: {
   supervisionEnabled: boolean;
   outcome: "completed" | "failed";
+  stage: StageName | string;
   remainingQueue: StageName[];
   consecutiveToolErrors: number;
+  evidenceGap: boolean;
+  supervisionCallsUsed: number;
 }): boolean {
   if (!args.supervisionEnabled || args.remainingQueue.length === 0) return false;
-  // Medium/high-complexity turns opted into supervision must actually be
-  // supervised. The previous predicate only called the model after failures,
-  // making a "live" conductor observationally inert on every clean stage.
-  return true;
+  if (args.supervisionCallsUsed >= 4) return false;
+  if (args.outcome === "failed") return true;
+  if (args.consecutiveToolErrors > 0) return true;
+  return EVIDENCE_CAPABLE_STAGES.has(args.stage) && args.evidenceGap;
+}
+
+export interface SupervisionAttribution {
+  agentRunId: string;
+  durationMs: number;
+  wasSuccessful: boolean;
+  hadError: boolean;
+  provider?: string;
+  modelId?: string;
 }
 
 export class LiveConductor {
@@ -50,6 +67,8 @@ export class LiveConductor {
   private recentToolErrors: string[] = [];
   private runId = "";
   private deepReadEvidenceRerouteUsed = false;
+  /** F7: per-run supervision inference counter (reset in setContext). */
+  private supervisionCallsUsed = 0;
 
   constructor(
     private callModel: CallModelFn,
@@ -62,12 +81,15 @@ export class LiveConductor {
     },
     /** Local supervisor path; defaults to callModel for backwards compatibility. */
     private supervisorModel: CallModelFn = callModel,
+    /** F7/F10a: optional attribution sink for conductor_supervision rows. */
+    private onSupervisionAttributed?: (row: SupervisionAttribution) => void,
   ) {}
 
   setContext(taskType: string, complexity: "low" | "medium" | "high", runId: string): void {
     this.taskType = taskType;
     this.runId = runId;
     this.deepReadEvidenceRerouteUsed = false;
+    this.supervisionCallsUsed = 0;
     this.supervision = !this.cfg.supervise_low_complexity && complexity === "low" ? "off" : "on";
   }
 
@@ -130,11 +152,17 @@ export class LiveConductor {
         };
       }
 
+      const evidenceGap = Boolean(
+        evidenceAssessment && !evidenceAssessment.sufficient,
+      );
       if (!shouldSuperviseStage({
         supervisionEnabled: this.supervision === "on",
         outcome,
+        stage,
         remainingQueue,
         consecutiveToolErrors: this.consecutiveToolErrors,
+        evidenceGap,
+        supervisionCallsUsed: this.supervisionCallsUsed,
       })) return { type: "continue" };
 
       const evidenceErrors = evidence.toolCalls === undefined
@@ -155,6 +183,7 @@ export class LiveConductor {
         remainingQueue,
       };
 
+      this.supervisionCallsUsed += 1;
       const directive = await this.supervise(digest);
       this.recentToolErrors = [];
       // Admission is enforced in pipeline.afterConductorStage (rejectReroute)
@@ -167,6 +196,7 @@ export class LiveConductor {
 
   private async supervise(digest: SupervisionDigest): Promise<ConductorDirective> {
     const startedAt = Date.now();
+    let parseOk = false;
     try {
       const conductorPrompt = loadPrompt("conductor.md");
       const userContent = [
@@ -213,19 +243,35 @@ export class LiveConductor {
         throw error;
       }
 
-      const parsed = extractJson<{
+      let parsed: {
         directive: string;
         newRemaining?: string[];
         forStage?: string;
         note?: string;
         stage?: string;
         reason?: string;
-      }>(result.content);
+      };
+      try {
+        parsed = extractJson<{
+          directive: string;
+          newRemaining?: string[];
+          forStage?: string;
+          note?: string;
+          stage?: string;
+          reason?: string;
+        }>(result.content);
+        parseOk = Boolean(parsed.directive);
+      } catch {
+        parseOk = false;
+        parsed = { directive: "continue" };
+      }
 
       console.log(
         `[LiveConductor] supervised run=${this.runId} stage=${digest.stage} ` +
         `outcome=${digest.outcome} directive=${parsed.directive || "continue"} latency_ms=${Date.now() - startedAt}`,
       );
+
+      this.emitAttribution(Date.now() - startedAt, parseOk, !parseOk);
 
       if (parsed.directive === "reroute" && Array.isArray(parsed.newRemaining)) {
         return {
@@ -257,7 +303,27 @@ export class LiveConductor {
         `[LiveConductor] supervision fallback run=${this.runId} stage=${digest.stage} ` +
         `latency_ms=${Date.now() - startedAt} error=${error instanceof Error ? error.message : String(error)}`,
       );
+      this.emitAttribution(Date.now() - startedAt, false, true);
       return { type: "continue" };
+    }
+  }
+
+  private emitAttribution(durationMs: number, wasSuccessful: boolean, hadError: boolean): void {
+    if (!this.onSupervisionAttributed || !this.runId) return;
+    try {
+      this.onSupervisionAttributed({
+        agentRunId: this.runId,
+        durationMs,
+        wasSuccessful,
+        hadError,
+        provider: "conductor",
+        modelId: "supervision",
+      });
+    } catch (e) {
+      console.warn(
+        `[LiveConductor] supervision attribution failed run=${this.runId}: ` +
+        `${e instanceof Error ? e.message : String(e)}`,
+      );
     }
   }
 }

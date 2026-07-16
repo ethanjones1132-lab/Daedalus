@@ -130,7 +130,9 @@ describe("incident 2026-07-16 run_5283dd64 — F1 planner evidence reroute (Phas
     }
   });
 
-  test("F1: planner supervision digest never embeds sufficient:false", async () => {
+  test("F1+F7: clean planner completion never calls supervisor (no sufficient:false path)", async () => {
+    // After F7 diet, clean planner completions are free — the F1 category
+    // error cannot fire because the supervisor is never invoked.
     const supervisorMessages: any[][] = [];
     const bus = new ConductorBus();
     const pool = new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS);
@@ -155,7 +157,7 @@ describe("incident 2026-07-16 run_5283dd64 — F1 planner evidence reroute (Phas
     );
     conductor.setContext("research", "high", "run_5283dd64");
 
-    await conductor.afterStage(
+    const directive = await conductor.afterStage(
       "planner",
       "completed",
       INCIDENT_PLAN_TEXT,
@@ -166,9 +168,7 @@ describe("incident 2026-07-16 run_5283dd64 — F1 planner evidence reroute (Phas
       },
     );
 
-    expect(supervisorMessages).toHaveLength(1);
-    const userContent = supervisorMessages[0][1].content as string;
-    expect(userContent).not.toContain('"sufficient":false');
-    expect(userContent).toContain("not applicable — the planner stage produces no tool calls by design");
+    expect(directive).toEqual({ type: "continue" });
+    expect(supervisorMessages).toHaveLength(0);
   });
 });

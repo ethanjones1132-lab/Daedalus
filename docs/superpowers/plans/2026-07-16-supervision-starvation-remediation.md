@@ -189,7 +189,7 @@ if (requiresWorkspaceEvidence && !preSynthAssessment.sufficient) {
 
 **Files:** modify `server-jarvis/src/orchestration/conductor.ts:31-42` (`shouldSuperviseStage`), `server-jarvis/src/self-tuning/collector.ts`; tests `conductor.test.ts`
 
-- [ ] **6.1** `shouldSuperviseStage` — supervision inference only when there is something to supervise:
+- [x] **6.1** `shouldSuperviseStage` — supervision inference only when there is something to supervise:
 
 ```ts
 export function shouldSuperviseStage(args: {
@@ -210,8 +210,8 @@ export function shouldSuperviseStage(args: {
 ```
 
   A cleanly completed planner/reviewer/synthesizer gets a deterministic `continue` — zero inference. (The 2026-07-15 "observationally inert conductor" concern stays covered: failures, tool errors, and evidence gaps still supervise.) Tests: completed-planner → no supervisor call (assert stub not invoked); 5th supervision request in one run → continue.
-- [ ] **6.2** Attribute supervision: in `supervise()` after the model call resolves, record a `model_attributions` row via the collector (`stage_id: "conductor_supervision"`, duration, `was_successful: 1/0` by parse outcome) — mirror the insert shape at `self-tuning/store.ts:809`. The ~20s/run of invisible inference becomes visible in every future forensic pass.
-- [ ] **6.3** Commit: `perf(orchestration): supervise only on anomaly, cap per run, attribute supervision calls (F7,F10a)`.
+- [x] **6.2** Attribute supervision: in `supervise()` after the model call resolves, record a `model_attributions` row via the collector (`stage_id: "conductor_supervision"`, duration, `was_successful: 1/0` by parse outcome) — mirror the insert shape at `self-tuning/store.ts:809`. The ~20s/run of invisible inference becomes visible in every future forensic pass.
+- [x] **6.3** Commit: `perf(orchestration): supervise only on anomaly, cap per run, attribute supervision calls (F7,F10a)`.
 
 ---
 

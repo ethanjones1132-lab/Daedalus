@@ -1,4 +1,10 @@
-import { SelfTuningStore, type AgentRun, type ConductorDirectiveRow, type StageRun } from "./store";
+import {
+  SelfTuningStore,
+  type AgentRun,
+  type ConductorDirectiveRow,
+  type ModelAttribution,
+  type StageRun,
+} from "./store";
 
 export class SessionOutcomeCollector {
   private store: SelfTuningStore;
@@ -28,6 +34,15 @@ export class SessionOutcomeCollector {
       this.store.insertConductorDirective(directive);
     } catch (e) {
       console.error("[SessionOutcomeCollector] recordDirective failed:", e);
+    }
+  }
+
+  /** F7/F10a: attribute conductor supervision (and other non-stage) model calls. */
+  recordModelAttribution(row: Omit<ModelAttribution, "created_at">): void {
+    try {
+      this.store.insertModelAttribution(row);
+    } catch (e) {
+      console.error("[SessionOutcomeCollector] recordModelAttribution failed:", e);
     }
   }
 
