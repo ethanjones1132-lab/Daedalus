@@ -13,6 +13,7 @@ import {
   type HttpProviderId,
 } from "./providers";
 import { isTemporarilyExcluded, recordHardFailure, recordSuccess } from "./model-failure-memory";
+import { backendForProvider, recordInferenceAttempt } from "./inference-metrics";
 import { TurnDeadlineExceededError } from "./stream-liveness";
 
 // ═══════════════════════════════════════════════════════════════
@@ -889,6 +890,15 @@ export async function chatCompletionWithFallback(
           attemptCtrl.abort(HEADERS_STALL_REASON);
           lastError = `Model ${model} (${provider}) returned no HTTP response headers within ${firstTokenTimeoutMs}ms (headers timeout)`;
           console.warn(`[Fallback] ${lastError} — advancing to next model`);
+          recordInferenceAttempt({
+            ts: Date.now(),
+            stage: options.stage ?? "agent",
+            provider: backendForProvider(provider, "openrouter"),
+            model,
+            outcome: "first_token_timeout",
+            latency_ms: firstTokenTimeoutMs,
+            fallback_attempt: modelIdx,
+          });
           break attemptLoop;
         }
         const res = headersOutcome.res;
@@ -912,6 +922,15 @@ export async function chatCompletionWithFallback(
             try { await bodyReader.cancel().catch(() => {}); } catch {}
             lastError = `Model ${model} (${provider}) sent no body bytes within ${firstTokenTimeoutMs}ms (first-token timeout)`;
             console.warn(`[Fallback] ${lastError} — advancing to next model`);
+            recordInferenceAttempt({
+              ts: Date.now(),
+              stage: options.stage ?? "agent",
+              provider: backendForProvider(provider, "openrouter"),
+              model,
+              outcome: "first_token_timeout",
+              latency_ms: firstTokenTimeoutMs,
+              fallback_attempt: modelIdx,
+            });
             break attemptLoop;
           }
           clearTimeout(watchdogTimer);
