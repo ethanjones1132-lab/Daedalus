@@ -59,6 +59,58 @@ describe("skill distillation (Track C)", () => {
     expect(listSkillCandidates("candidate").length).toBeGreaterThan(0);
   });
 
+  test("uses the inherited task requirement and refuses unaccepted task runs", () => {
+    const candidate = distillSkillCandidate({
+      agentRunId: "run_continue_1",
+      sessionId: "sess_1",
+      taskType: "research",
+      userRequest: "continue",
+      turnRequirement: "workspace_read",
+      taskRunAccepted: false,
+      stageRuns: [{
+        id: "st_continue",
+        agent_run_id: "run_continue_1",
+        mode_id: "executor",
+        turn_number: 2,
+        was_successful: 1,
+        had_error: 0,
+      }],
+      runOutcome: "success",
+    }, {
+      enabled: true,
+      min_confidence: 0.5,
+      promotion_eval_delta: 0.02,
+      max_candidates: 50,
+    });
+
+    expect(candidate).toBeNull();
+    expect(listSkillCandidates("candidate")).toHaveLength(0);
+
+    const accepted = distillSkillCandidate({
+      agentRunId: "run_continue_2",
+      sessionId: "sess_1",
+      taskType: "research",
+      userRequest: "continue",
+      turnRequirement: "workspace_read",
+      taskRunAccepted: true,
+      stageRuns: [{
+        id: "st_continue_2",
+        agent_run_id: "run_continue_2",
+        mode_id: "executor",
+        turn_number: 2,
+        was_successful: 1,
+        had_error: 0,
+      }],
+      runOutcome: "success",
+    }, {
+      enabled: true,
+      min_confidence: 0.5,
+      promotion_eval_delta: 0.02,
+      max_candidates: 50,
+    });
+    expect(accepted?.trigger.requirements).toEqual(["workspace_read"]);
+  });
+
   test("resolveSkillsForTurn matches promoted skills by task type", () => {
     const candidate: SkillCandidate = {
       id: "skill_test_1",

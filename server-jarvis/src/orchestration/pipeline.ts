@@ -42,6 +42,8 @@ import {
 import { prepareToolResultForContext } from "../tool-result-truncation";
 import { findExistingWorkspacePath } from "./workspace-affinity";
 import { join } from "path";
+import { canApplyConductorReroute } from "./reroute-policy";
+import { resolveDeepReadIntent, type TaskRunDepth } from "./task-run";
 
 /**
  * The slice of the outcome collector the pipeline depends on. Injecting this
@@ -122,6 +124,8 @@ export interface PipelineExecuteOptions {
   allowEffectGateReplan?: boolean;
   /** Coordinator-estimated route complexity, used for depth-scaled executor limits. */
   estimatedComplexity?: "low" | "medium" | "high";
+  /** Persisted task-run depth inherited by terse continuation turns. */
+  taskRunDepth?: TaskRunDepth;
   /** Trivial short-circuit turns should use the fastest synthesizer tier. */
   preferFastSynthesizer?: boolean;
   /** Evidence from a previous executor segment being explicitly re-entered. */
@@ -474,6 +478,7 @@ export class PipelineExecutor {
       workQueue?: StageName[];
       /** Reroute apply counter; max 1 per segment. */
       reroutesApplied?: { n: number };
+      maxReroutesPerSegment?: number;
     },
     remainingQueue: StageName[],
     evidence?: ConductorStageEvidence,
@@ -504,8 +509,8 @@ export class PipelineExecutor {
     // T2.2: apply reroute to the mutable work queue (at most once per segment).
     if (directive.type === "reroute" && options.workQueue) {
       const applied = options.reroutesApplied?.n ?? 0;
-      if (applied >= 1) {
-        console.warn(`[Pipeline] second reroute ignored after ${stage}`);
+      if (!canApplyConductorReroute(applied, options.maxReroutesPerSegment)) {
+        console.warn(`[Pipeline] reroute limit reached after ${stage}`);
       } else {
         const requirement = options.turnRequirement ?? "full_execution";
         const normalized = normalizeRemainingStages(directive.newRemaining, requirement, stage);
@@ -759,7 +764,7 @@ export class PipelineExecutor {
     let evidenceCountAtLastNudge = 0;
     const intentText = options.rawMessage ?? request;
     const requiresWorkspaceEvidence = turnNeedsWorkspaceEvidence(options.turnRequirement, intentText);
-    const deepReadRequest = isDeepReadRequest(intentText);
+    const deepReadRequest = resolveDeepReadIntent(intentText, options.taskRunDepth);
     const executorPrompt = stageSystemPrompt("executor", options);
     const executorEvidence = (): ConductorStageEvidence => ({
       toolCalls,
@@ -1848,6 +1853,7 @@ export class PipelineExecutor {
       pendingInjections,
       workQueue,
       reroutesApplied,
+      maxReroutesPerSegment: 3,
     };
 
     // Drain the queue. Synthesizer is a barrier: effect-gate + evidence fence

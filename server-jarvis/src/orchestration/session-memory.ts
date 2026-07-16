@@ -5,6 +5,12 @@ import type { SharedContextHints } from "./coordinator";
 import type { SessionMemoryConfig } from "../config";
 import { SESSIONS_DIR } from "../config";
 import type { ToolResult } from "../tool-types";
+import {
+  resolveTaskRunTurn,
+  type TaskRunContract,
+  type TaskRunDepth,
+} from "./task-run";
+import type { TurnRequirement } from "./turn-requirements";
 
 export interface ToolResultCacheEntry {
   key: string;
@@ -49,6 +55,16 @@ export interface SessionMemoryState {
   fileSnapshots: Record<string, FileSnapshotEntry>;
   discoveredFacts: Record<string, DiscoveredFactEntry>;
   failureHistory: FailurePatternEntry[];
+  /** Durable objective/checkpoint contract shared by continuation turns. */
+  taskRun?: TaskRunContract;
+}
+
+export interface BeginTaskRunInput {
+  message: string;
+  requirement: TurnRequirement;
+  workspacePath?: string;
+  depth?: TaskRunDepth;
+  estimatedComplexity?: "low" | "medium" | "high";
 }
 
 export interface RecordToolResultInput {
@@ -189,6 +205,55 @@ export class SessionMemory {
 
   getLastOutcome(sessionId: string): string | undefined {
     return this.getSession(sessionId).lastOutcome;
+  }
+
+  getTaskRun(sessionId: string): TaskRunContract | undefined {
+    return this.getSession(sessionId).taskRun;
+  }
+
+  beginTaskRun(sessionId: string, input: BeginTaskRunInput): TaskRunContract {
+    const session = this.getSession(sessionId);
+    const resolved = resolveTaskRunTurn(
+      session.taskRun,
+      input.message,
+      input.requirement,
+      {
+        sessionId,
+        workspacePath: input.workspacePath,
+        depth: input.depth,
+        estimatedComplexity: input.estimatedComplexity,
+      },
+    );
+    session.taskRun = {
+      ...resolved.contract,
+      workspacePath: resolved.contract.workspacePath ?? input.workspacePath,
+      ...(resolved.isContinuation
+        ? {}
+        : {
+            depth: input.depth ?? resolved.contract.depth,
+            estimatedComplexity: input.estimatedComplexity ?? resolved.contract.estimatedComplexity,
+          }),
+      updatedAt: new Date().toISOString(),
+    };
+    session.lastActiveAt = Date.now();
+    this.persist(session);
+    return session.taskRun;
+  }
+
+  updateTaskRun(
+    sessionId: string,
+    patch: Partial<Pick<TaskRunContract, "status" | "evidenceCount" | "remainingWork" | "lastOutcome" | "lastTurnId" | "estimatedComplexity">>,
+  ): TaskRunContract | undefined {
+    const session = this.getSession(sessionId);
+    if (!session.taskRun) return undefined;
+    session.taskRun = {
+      ...session.taskRun,
+      ...patch,
+      updatedAt: new Date().toISOString(),
+    };
+    session.lastActiveAt = Date.now();
+    this.persist(session);
+    return session.taskRun;
   }
 
   setLastOutcome(sessionId: string, outcome: string | undefined): void {
@@ -475,6 +540,7 @@ export class SessionMemory {
       raw.fileSnapshots ??= {};
       raw.discoveredFacts ??= {};
       raw.failureHistory ??= [];
+      raw.taskRun ??= undefined;
       raw.lastActiveAt = raw.lastActiveAt ?? Date.now();
       return raw;
     } catch {

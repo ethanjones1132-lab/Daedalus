@@ -15,6 +15,10 @@ export interface DistillationInput {
   workerInstructions?: WorkerInstructions;
   stageRuns: StageRun[];
   runOutcome: "success" | "degraded" | "failed";
+  /** Task-level acceptance gate. Undefined preserves legacy replay behavior. */
+  taskRunAccepted?: boolean;
+  /** Effective requirement inherited from a durable task run. */
+  turnRequirement?: TurnRequirement;
 }
 
 /** Distillation from a stored trajectory snapshot (for audit/replay). */
@@ -90,6 +94,7 @@ export function distillSkillCandidate(
   config: SkillDistillationConfig,
 ): SkillCandidate | null {
   if (!config.enabled) return null;
+  if (input.taskRunAccepted === false) return null;
   
   const distillOn = config.distill_on ?? ["success"];
   if (!distillOn.includes(input.runOutcome)) return null;
@@ -97,7 +102,9 @@ export function distillSkillCandidate(
   const confidence = computeConfidence(input);
   if (confidence < config.min_confidence) return null;
 
-  const turnReq = classifyTurnRequirements(input.userRequest);
+  const turnReq = input.turnRequirement
+    ? { requirement: input.turnRequirement, signals: [`task_run_inherit:${input.turnRequirement}`] }
+    : classifyTurnRequirements(input.userRequest);
   const trigger: SkillTrigger = {
     task_types: [input.taskType],
     requirements: [turnReq.requirement],

@@ -161,6 +161,8 @@ import { countTokens } from "./tokens";
 import { WorkspaceAffinityStore } from "./orchestration/workspace-affinity";
 import { createRuntimeMonitor, shouldLogRuntimePerformance } from "./performance/runtime-monitor";
 import { loadInferenceFeedback } from "./self-tuning/inference-feedback";
+import { assessTaskRunAcceptance, resolveDeepReadIntent, terminalSubtypeForRunOutcome } from "./orchestration/task-run";
+import { assessWorkspaceEvidence } from "./orchestration/evidence-sufficiency";
 import {
   INFERENCE_FEEDBACK_CRON_JOB_ID,
   refreshInferenceFeedback,
@@ -1299,13 +1301,18 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
   const turnStartedAt = Date.now();
   // Invariant: the turn budget and coordinator route derive from the same
   // continuation-aware requirement; do not freeze a raw-message budget first.
+  const priorTaskRun = sessionMemory.getTaskRun(sessionId);
+  const initialResolvedRequirement = resolveTurnRequirement(
+    message,
+    priorTaskRun?.requirement ?? continuationRequirements.get(sessionId),
+  );
   const initialRequirement = resolveTurnRequirement(
     message,
-    continuationRequirements.get(sessionId),
+    priorTaskRun?.requirement ?? continuationRequirements.get(sessionId),
   ).result.requirement;
   const turnBudget = createTurnBudget(
     initialRequirement,
-    isDeepReadRequest(message) ? "high" : "medium",
+    resolveDeepReadIntent(message, priorTaskRun?.depth) ? "high" : "medium",
     turnStartedAt,
   );
   const ensureTurnBudget = (stage: string): void => {
@@ -1331,6 +1338,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     cfg.jarvis_path,
   );
   console.log(`[Jarvis] Active workspace session=${sessionId} path=${activeWorkspacePath}`);
+  const activeTaskRun = sessionMemory.beginTaskRun(sessionId, {
+    message,
+    requirement: initialResolvedRequirement.result.requirement,
+    workspacePath: activeWorkspacePath,
+    depth: resolveDeepReadIntent(message, priorTaskRun?.depth) ? "deep" : "standard",
+    estimatedComplexity: resolveDeepReadIntent(message, priorTaskRun?.depth) ? "high" : "medium",
+  });
   const { readable, writable } = new TransformStream();
   const rawWriter = writable.getWriter();
   const encoder = new TextEncoder();
@@ -1397,6 +1411,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     let sessionCostInfo: OpenRouterCostInfo | null = null;
     let lastFallbackRetries = 0;
     let lastFallbackModel: string | undefined;
+    let orchestratorAgentRunId: string | undefined;
     // Track the actual provider the fallback cascade engaged for THIS turn so
     // the per-turn `recordInference` call can attribute the request to the
     // real backend. The cascade can hop from openrouter → opencode_zen →
@@ -1630,7 +1645,6 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         let orchLastProvider: string | undefined;
         let orchLastFirstTokenMs: number | undefined;
         let orchLastScorecardAttempt: ScorecardAttempt | undefined;
-        let orchestratorAgentRunId: string | undefined;
         const callModelAttempt = async (messages: any[], callOptions?: any, excludeModels?: Set<string>) => {
           ensureTurnBudget(callOptions?.stageLabel ?? "orchestrator_model_attempt");
           const stageAttemptStart = Date.now();
@@ -2583,7 +2597,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // signal; the coordinator model's route is advisory.
         const { continuation, result: turnReq } = resolveTurnRequirement(
           message,
-          continuationRequirements.get(sessionId),
+          activeTaskRun.requirement ?? continuationRequirements.get(sessionId),
         );
         const shortCircuit = shouldShortCircuitCoordinator(message, turnReq, continuation);
         // T1.7: emit one conductor_health frame when local is enabled but we fall back.
@@ -2688,6 +2702,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           turnReq.requirement,
           routeSource,
         );
+        sessionMemory.updateTaskRun(sessionId, {
+          estimatedComplexity: route.context.estimated_complexity,
+        });
         const reconciled = reconcileRouteWithBudget(
           normalized.pipeline,
           turnBudget.turn_ms,
@@ -2771,7 +2788,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           route.worker_instructions,
           route.task_type,
         );
-        const resolvedSkills = resolveSkillsForTurn(message, route.task_type);
+        const resolvedSkills = resolveSkillsForTurn(activeTaskRun.objective, route.task_type);
         // The canonical run duration must include model-backed routing now that
         // coordinator time is a first-class stage. Starting this clock after
         // route selection would make child stage totals exceed their parent
@@ -2829,6 +2846,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           rawMessage: message,
           turnRequirement: turnReq.requirement,
           estimatedComplexity: route.context.estimated_complexity,
+          taskRunDepth: activeTaskRun.depth,
           workerInstructions: instructionSelection.instructions,
           sharedContext: mergedSharedContext,
           sessionMemory: sessionMemory,
@@ -2948,12 +2966,48 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // T0.2: persist truthful outcome including `partial` (truncated stream,
         // stage timeout, token cap). Learning/reward keeps a 3-way vocabulary
         // and maps partial→degraded only at the reward boundary below.
+        const pipelineOutcome: "success" | "degraded" | "failed" | "partial" =
+          result.outcome ?? (result.error || !trimmedAnswer ? "failed" : "success");
+        const successfulToolCalls = (result.toolCalls ?? [])
+          .filter((call) => !call.is_error && call.output.trim().length > 0);
+        // Task acceptance must use the same evidence semantics as the
+        // executor's pre-synthesis fence: deep workspace work requires
+        // distinct source-content targets, while full execution can count a
+        // successful mutation/tool result as progress. Listings and repeated
+        // metadata calls must never satisfy a deep-read contract.
+        const evidenceAssessment = assessWorkspaceEvidence(
+          result.toolCalls,
+          activeTaskRun.depth === "deep" ? `${message}\ncomprehensive deep-read continuation` : message,
+          activeWorkspacePath,
+        );
+        const evidenceCount = turnReq.requirement === "workspace_read"
+          ? (activeTaskRun.depth === "deep"
+            ? evidenceAssessment.contentReads
+            : evidenceAssessment.contentReads + evidenceAssessment.listings)
+          : turnReq.requirement === "full_execution"
+            ? new Set(successfulToolCalls.map((call) => `${call.name}:${JSON.stringify(call.arguments)}`)).size
+            : 0;
+        const taskAcceptance = assessTaskRunAcceptance({
+          requirement: turnReq.requirement,
+          depth: activeTaskRun.depth,
+          pipelineOutcome,
+          answer: trimmedAnswer,
+          evidenceCount,
+        });
         const runOutcome: "success" | "degraded" | "failed" | "partial" =
           repetitionVerdict.repeated
             ? "degraded"
-            : result.outcome === "partial"
-              ? "partial"
-              : (result.outcome ?? (result.error || !trimmedAnswer ? "failed" : "success"));
+            : taskAcceptance.accepted
+              ? pipelineOutcome
+              : taskAcceptance.status === "paused"
+                ? "partial"
+                : "failed";
+        sessionMemory.updateTaskRun(sessionId, {
+          status: repetitionVerdict.repeated ? "paused" : taskAcceptance.status,
+          evidenceCount,
+          lastOutcome: runOutcome,
+          lastTurnId: agentRunId,
+        });
         // Reward boundary: partial folds to degraded so reward math / conductor
         // learning stay on the historical 3-way vocabulary.
         const rewardOutcome: "success" | "degraded" | "failed" =
@@ -3001,7 +3055,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }
         }
         const distillCfg = cfg.orchestrator.skill_distillation;
-        if (distillCfg?.enabled && runOutcome === "success") {
+        if (distillCfg?.enabled && runOutcome === "success" && taskAcceptance.accepted && !repetitionVerdict.repeated) {
           const stageRunsForDistill = stageRuns;
           const candidate = distillSkillCandidate({
             agentRunId,
@@ -3011,6 +3065,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             workerInstructions: route.worker_instructions,
             stageRuns: stageRunsForDistill,
             runOutcome,
+            taskRunAccepted: taskAcceptance.accepted,
+            turnRequirement: turnReq.requirement,
           }, distillCfg);
           if (candidate) {
             if (distillCfg.auto_promote) {
@@ -3169,9 +3225,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // "partial" (e.g. a rewriter-stage timeout on a turn that also
           // happens to be a repeat) — `finalAnswer` was already replaced
           // with the refusal text above, so the tag must match.
-          await session.finish(finalAnswer, repetitionVerdict.repeated
-            ? { subtype: "partial", code: "no_progress_repetition" }
-            : (result.outcome === "partial" ? { subtype: "partial", code: result.error_code } : undefined));
+          await session.finish(finalAnswer, {
+            subtype: terminalSubtypeForRunOutcome(runOutcome),
+            ...(repetitionVerdict.repeated
+              ? { code: "no_progress_repetition" }
+              : (runOutcome === "partial" ? { code: result.error_code } : {})),
+          });
         }
         return;
       }
@@ -3994,6 +4053,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
     } catch (error: any) {
       if (error?.name === "StreamCancelledError") {
+        if (orchestratorAgentRunId) {
+          outcomeCollector.completeAgentRun(
+            orchestratorAgentRunId,
+            "Stream cancelled before the orchestration run reached a terminal answer.",
+            Date.now() - _turnStart,
+            0,
+            sessionCostInfo?.total_tokens ?? 0,
+            "cancelled",
+          );
+        }
         return;
       }
       const errMsg = error?.message || String(error);
@@ -4044,6 +4113,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             `Try again — the router will pick a different model. (${error?.model ?? "unknown model"}, stage=${error?.stage ?? "unknown"})`
         : errMsg;
       console.error(`[Jarvis] Stream error session=${sessionId} code=${errorCode ?? "<generic>"}:`, userFacingMsg);
+      if (orchestratorAgentRunId) {
+        outcomeCollector.completeAgentRun(
+          orchestratorAgentRunId,
+          userFacingMsg,
+          Date.now() - _turnStart,
+          0,
+          sessionCostInfo?.total_tokens ?? 0,
+          "failed",
+        );
+      }
       const _cfg3 = resolveConfig(options.config);
       recordInference({
         ts: Date.now(),

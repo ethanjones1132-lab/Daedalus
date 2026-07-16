@@ -24,6 +24,51 @@ function makeConfig(overrides: Partial<SessionMemoryConfig> = {}): SessionMemory
 }
 
 describe("session-memory", () => {
+  test("persists a task contract and resumes its full depth on continue", () => {
+    const memory = new SessionMemory(() => makeConfig());
+    const first = memory.beginTaskRun("sess-task", {
+      message: "Perform a comprehensive architecture audit",
+      requirement: "workspace_read",
+      workspacePath: "C:\\Projects\\Versutus",
+      depth: "deep",
+      estimatedComplexity: "high",
+    });
+
+    const continued = memory.beginTaskRun("sess-task", {
+      message: "continue",
+      requirement: "conversational",
+      workspacePath: "C:\\Projects\\Versutus",
+      depth: "standard",
+      estimatedComplexity: "medium",
+    });
+
+    expect(continued.taskRunId).toBe(first.taskRunId);
+    expect(continued.objective).toBe(first.objective);
+    expect(continued.requirement).toBe("workspace_read");
+    expect(continued.depth).toBe("deep");
+    expect(continued.estimatedComplexity).toBe("high");
+    expect(continued.turnCount).toBe(2);
+  });
+
+  test("keeps task-run state ephemeral when persistence is disabled", () => {
+    const memory = new SessionMemory(() => makeConfig({ enabled: false, persist: false }));
+    const task = memory.beginTaskRun("ephemeral-task", {
+      message: "read the repository",
+      requirement: "workspace_read",
+      depth: "standard",
+    });
+
+    const updated = memory.updateTaskRun("ephemeral-task", {
+      status: "completed",
+      evidenceCount: 1,
+      lastOutcome: "success",
+    });
+
+    expect(updated?.taskRunId).toBe(task.taskRunId);
+    expect(updated?.status).toBe("completed");
+    expect(memory.getTaskRun("ephemeral-task")?.evidenceCount).toBe(1);
+  });
+
   test("toolCallCacheKey is stable for equivalent args", () => {
     const a = toolCallCacheKey("read_file", { path: "src/a.ts", limit: 10 }, "/workspace");
     const b = toolCallCacheKey("read_file", { limit: 10, path: "src/a.ts" }, "/workspace");
@@ -168,11 +213,19 @@ describe("session-memory", () => {
         args: { pattern: "Coordinator" },
         result: { output: "3 matches", is_error: false },
       });
+      writer.beginTaskRun("disk-sess", {
+        message: "comprehensively audit the repo",
+        requirement: "workspace_read",
+        depth: "deep",
+        estimatedComplexity: "high",
+      });
 
       const reader = new SessionMemory(() => cfg, tempRoot);
       expect(reader.getSessionState("disk-sess")).toBeUndefined();
       const cached = reader.lookupCachedToolResult("disk-sess", "grep", { pattern: "Coordinator" });
       expect(cached).toBe("3 matches");
+      expect(reader.getTaskRun("disk-sess")?.depth).toBe("deep");
+      expect(reader.getTaskRun("disk-sess")?.objective).toContain("comprehensively audit");
     } finally {
       rmSync(tempRoot, { recursive: true, force: true });
     }

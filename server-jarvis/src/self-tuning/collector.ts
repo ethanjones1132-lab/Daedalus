@@ -42,7 +42,7 @@ export class SessionOutcomeCollector {
     // partial run must NOT be silently indistinguishable from a successful one.
     // `partial` is persisted truthfully (T0.2); reward/learning maps it to
     // degraded at the reward boundary only.
-    outcome: "success" | "degraded" | "failed" | "partial" = "success",
+    outcome: "success" | "degraded" | "failed" | "partial" | "cancelled" = "success",
   ): void {
     this.store.updateAgentRun(runId, {
       completed: 1,
