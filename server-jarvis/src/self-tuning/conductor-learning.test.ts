@@ -143,6 +143,73 @@ describe("Conductor learning (Phase 4)", () => {
     expect(adjusted[0].capabilities.code).toBeGreaterThan(sampleAgent.capabilities.code);
   });
 
+  test("completeRun skips instruction learning for stage_window_exhausted rows", () => {
+    const store = new SelfTuningStore(TEST_DB);
+    const loop = new ConductorLearningLoop(store);
+    store.insertAgentRun({
+      id: "run_starve",
+      session_id: "sess_starve",
+      user_request: "audit",
+      task_type: "research",
+      pipeline: JSON.stringify(["planner", "executor"]),
+      completed: 0,
+    });
+    const conductorRunId = loop.recordRouting({
+      agentRunId: "run_starve",
+      sessionId: "sess_starve",
+      route: {
+        task_type: "research",
+        pipeline: ["planner", "executor", "synthesizer"],
+        topology: "linear",
+        context: { needs_workspace_inspection: true, needs_memory: false, estimated_complexity: "high" },
+        coordinator_rationale: "research",
+        worker_instructions: { planner: "Write a gap plan." },
+        conductor_source: "local",
+        conductor_model: "gemma4:e2b",
+      },
+      normalizedPipeline: ["planner", "executor", "synthesizer"],
+      routeSource: "model",
+      conductorSource: "local",
+      conductorModel: "gemma4:e2b",
+    });
+    const selection = loop.selectInstructionVariants(
+      { planner: "Write a gap plan." },
+      "research",
+    );
+    loop.completeRun({
+      conductorRunId,
+      agentRunId: "run_starve",
+      sessionId: "sess_starve",
+      taskType: "research",
+      route: {
+        task_type: "research",
+        pipeline: ["planner", "executor", "synthesizer"],
+        topology: "linear",
+        context: { needs_workspace_inspection: true, needs_memory: false, estimated_complexity: "high" },
+        coordinator_rationale: "research",
+        worker_instructions: { planner: "Write a gap plan." },
+      },
+      runOutcome: "failed",
+      workerInstructions: { planner: "Write a gap plan." },
+      instructionVariants: selection,
+      stageRuns: [{
+        id: "stage_planner_starve",
+        agent_run_id: "run_starve",
+        mode_id: "planner",
+        turn_number: 1,
+        was_successful: 0,
+        had_error: 1,
+        error_message: "Stage budget exhausted on stage=planner",
+        partial_error_code: "stage_window_exhausted",
+      }],
+      modelAttributions: [],
+      durationMs: 90_000,
+      userRequest: "audit",
+    });
+    // Starvation rows must not create instruction-variant trial samples.
+    expect(store.getInstructionVariantStats("research")).toHaveLength(0);
+  });
+
   test("instruction bandit can select baseline variant", () => {
     const store = new SelfTuningStore(TEST_DB);
     const loop = new ConductorLearningLoop(store, {

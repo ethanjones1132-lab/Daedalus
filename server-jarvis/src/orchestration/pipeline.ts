@@ -368,6 +368,19 @@ export function errText(e: unknown): string {
  * and quota failures are the common turn-killers and deserve an actionable hint
  * instead of a bare `API 401: {...}` dump.
  */
+/** F3: map runtime budget errors onto stage_runs.partial_error_code. */
+export function partialErrorCodeForThrowable(error: unknown): "stage_window_exhausted" | "turn_deadline" | null {
+  const name = String((error as { name?: unknown } | null | undefined)?.name ?? "");
+  if (name === "StageBudgetExhaustedError" || name === "StageDeadlineExceededError") {
+    return "stage_window_exhausted";
+  }
+  if (name === "TurnDeadlineExceededError") return "turn_deadline";
+  const msg = errText(error);
+  if (/stage budget exhausted|stage deadline exceeded/i.test(msg)) return "stage_window_exhausted";
+  if (/total turn deadline/i.test(msg)) return "turn_deadline";
+  return null;
+}
+
 export function describePipelineError(raw: string): string {
   const msg = raw || "Unknown error";
   if (/\b401\b/.test(msg) || /unauthor/i.test(msg) || /user not found/i.test(msg) || /invalid api key/i.test(msg)) {
@@ -391,6 +404,11 @@ export function describePipelineError(raw: string): string {
   }
   if (/total turn deadline|turn_deadline_exceeded/i.test(msg)) {
     return `The server-authoritative turn deadline expired before Jarvis could finish. The turn was stopped cleanly instead of stalling indefinitely. (${msg})`;
+  }
+  // F3: stage usage budget exhausted while the turn still has time — distinct
+  // from total-turn deadline so operators do not chase a false 180s cap.
+  if (/stage budget exhausted/i.test(msg)) {
+    return `A stage used its full time budget while the overall turn still had time remaining. The runtime stopped that stage cleanly rather than mislabeling a turn deadline. (${msg})`;
   }
   if (/first-token timeout|stream idle timeout/i.test(msg)) {
     return `The answering model stalled before responding, so I aborted it. Try again — the router will pick a different model. (${msg})`;
@@ -794,6 +812,7 @@ export class PipelineExecutor {
         this.plannerConductorEvidence(request, options),
       );
 
+      const starvationCode = partialErrorCodeForThrowable(e);
       this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
         agent_run_id: agentRunId,
@@ -804,6 +823,8 @@ export class PipelineExecutor {
         was_successful: 0,
         had_error: 1,
         error_message: message,
+        stop_reason: starvationCode,
+        partial_error_code: starvationCode,
       });
       return { ok: false, narrative: `Failed to generate plan: ${message}` };
     }
@@ -1850,9 +1871,11 @@ export class PipelineExecutor {
       const hasPartialDeadlineAnswer =
         e?.name === "TurnDeadlineExceededError" && streamedAnswer.trim().length > 0;
       const fatalError = describePipelineError(message);
+      const starvationCode = partialErrorCodeForThrowable(e);
       const deadlineStopReason =
         e?.name === "TurnDeadlineExceededError" ? "turn_deadline"
-          : e?.name === "StageDeadlineExceededError" ? "stage_deadline"
+          : e?.name === "StageDeadlineExceededError" || e?.name === "StageBudgetExhaustedError"
+            ? "stage_deadline"
             : null;
       this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
@@ -1864,10 +1887,11 @@ export class PipelineExecutor {
         was_successful: 0,
         had_error: 1,
         error_message: message,
-        stop_reason: deadlineStopReason,
-        partial_error_code: deadlineStopReason === "turn_deadline"
-          ? "turn_deadline"
-          : (hasPartialDeadlineAnswer ? "stage_timeout" : null),
+        stop_reason: deadlineStopReason ?? starvationCode,
+        partial_error_code: starvationCode
+          ?? (deadlineStopReason === "turn_deadline"
+            ? "turn_deadline"
+            : (hasPartialDeadlineAnswer ? "stage_timeout" : null)),
       });
       // `answer` must never carry the raw failure text — 20 historical runs
       // (pre-2026-07-04) shipped "Synthesis failed: ..." as the literal chat
@@ -1876,11 +1900,18 @@ export class PipelineExecutor {
       // index.ts's error branch turns into an SSE error frame instead of
       // prose (see `if (result.error) ... session.finish(result.error, {
       // isError: true })`).
-      if (deadlineStopReason === "turn_deadline") {
+      if (deadlineStopReason === "turn_deadline" || starvationCode === "turn_deadline") {
         return {
           answer: hasPartialDeadlineAnswer ? streamedAnswer : "",
           emptyCompletion: false,
           partialErrorCode: "turn_deadline",
+        };
+      }
+      if (starvationCode === "stage_window_exhausted") {
+        return {
+          answer: hasPartialDeadlineAnswer ? streamedAnswer : "",
+          emptyCompletion: false,
+          partialErrorCode: "stage_window_exhausted",
         };
       }
       if (hasPartialDeadlineAnswer) {

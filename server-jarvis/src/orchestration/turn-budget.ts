@@ -11,6 +11,8 @@ export interface TurnBudget {
   deadlineAt: number;
   remainingMs(now?: number): number;
   stageRemainingMs(stage: string, now?: number): number;
+  /** Cumulative stage usage (completed segments + current inflight), in ms. */
+  stageUsedMs(stage: string, now?: number): number;
   canStart(stage: string, now?: number): boolean;
   /**
    * Grant extra stage time when a stage turn produced new successful
@@ -24,13 +26,16 @@ export interface TurnBudget {
    */
   extendStageOnProgress(stage: string, newEvidenceCount: number): void;
   /**
-   * T1.1: Mark that a budgeted stage has started. Subsequent
-   * stageRemainingMs / stageStreamDeadlineAt for that stage account for
-   * elapsed time since beginStage so retries cannot re-arm a full stage
-   * budget (coordinator parse-fail burning 37s was the motivating case).
-   * Only applied for stages with a configured stage_ms entry.
+   * Mark a budgeted stage attempt as inflight. Usage accumulates only while
+   * inflight (paired with endStage). Retries that re-enter before endStage
+   * share the same inflight window (T1.1). Idle gaps after endStage do not
+   * consume stage budget (F2 usage accounting).
    */
   beginStage(stage: string, now?: number): void;
+  /**
+   * Close an inflight stage attempt and add its duration to cumulative usage.
+   */
+  endStage(stage: string, now?: number): void;
   /**
    * Absolute wall-clock when the stage stream must be aborted.
    * undefined when the stage has no per-stage budget (synthesizer).
@@ -52,7 +57,17 @@ const PROGRESS_EXTENSION_MS = 20_000;      // per evidence-producing stage turn
 const STAGE_EXTENSION_CEILING_MS = 90_000; // a stage may never exceed this
 const ABSOLUTE_TURN_CAP_MS = 180_000;      // matches the high-complexity full_execution cap
 
-const BUDGETS: Record<TurnRequirement, Omit<TurnBudget, "requirement" | "complexity" | "startedAt" | "deadlineAt" | "remainingMs" | "stageRemainingMs" | "canStart" | "extendStageOnProgress" | "beginStage" | "stageStreamDeadlineAt" | "finalStreamDeadlineAt">> = {
+/** Runtime starvation codes — not model failure for learning consumers. */
+export const RUNTIME_STARVATION_ERROR_CODES = new Set([
+  "stage_window_exhausted",
+  "turn_deadline",
+]);
+
+export function isRuntimeStarvationErrorCode(code: string | null | undefined): boolean {
+  return typeof code === "string" && RUNTIME_STARVATION_ERROR_CODES.has(code);
+}
+
+const BUDGETS: Record<TurnRequirement, Omit<TurnBudget, "requirement" | "complexity" | "startedAt" | "deadlineAt" | "remainingMs" | "stageRemainingMs" | "stageUsedMs" | "canStart" | "extendStageOnProgress" | "beginStage" | "endStage" | "stageStreamDeadlineAt" | "finalStreamDeadlineAt">> = {
   conversational: { turn_ms: 30_000, finalization_reserve_ms: 15_000, max_stage_attempts: 2, stage_ms: { coordinator: 15_000 } },
   answer_only: { turn_ms: 45_000, finalization_reserve_ms: 20_000, max_stage_attempts: 2, stage_ms: { coordinator: 15_000, planner: 15_000 } },
   // workspace_read's executor ceiling: 60_000 (not the original 25_000) — same
@@ -114,9 +129,10 @@ export function createTurnBudget(
   const turn_ms = requirement === "full_execution" && complexity === "high"
     ? Math.min(180_000, base.turn_ms + 30_000)
     : base.turn_ms;
-  // T1.1: per-stage start timestamps for elapsed accounting (coordinator retries
-  // must not reset the 15s stage budget).
-  const stageStartedAt = new Map<string, number>();
+  // F2: cumulative usage per stage + current inflight start (usage-based,
+  // not wall-clock since first entry).
+  const stageUsedAccumMs = new Map<string, number>();
+  const stageInflightStart = new Map<string, number>();
 
   const budget: TurnBudget = {
     requirement,
@@ -130,19 +146,18 @@ export function createTurnBudget(
     remainingMs(now = Date.now()) {
       return Math.max(0, this.deadlineAt - now);
     },
+    stageUsedMs(stage, now = Date.now()) {
+      const accumulated = stageUsedAccumMs.get(stage) ?? 0;
+      const inflightStart = stageInflightStart.get(stage);
+      const inflight = inflightStart !== undefined ? Math.max(0, now - inflightStart) : 0;
+      return accumulated + inflight;
+    },
     stageRemainingMs(stage, now = Date.now()) {
       const stageBudget = this.stage_ms[stage];
       if (stageBudget === undefined) return this.remainingMs(now);
-      const begun = stageStartedAt.get(stage);
-      // When beginStage has been called, remaining = configured budget − elapsed
-      // since stage start (retries share the same window). Still clamped by turn
-      // remaining so a late-starting stage cannot overshoot the turn.
-      if (begun !== undefined) {
-        const elapsed = Math.max(0, now - begun);
-        const stageLeft = Math.max(0, stageBudget - elapsed);
-        return Math.max(0, Math.min(stageLeft, this.remainingMs(now)));
-      }
-      return Math.max(0, Math.min(stageBudget, this.remainingMs(now)));
+      const used = this.stageUsedMs(stage, now);
+      const stageLeft = Math.max(0, stageBudget - used);
+      return Math.max(0, Math.min(stageLeft, this.remainingMs(now)));
     },
     canStart(stage, now = Date.now()) {
       if (this.remainingMs(now) <= this.finalization_reserve_ms) return false;
@@ -151,18 +166,23 @@ export function createTurnBudget(
     beginStage(stage, now = Date.now()) {
       // Only for budgeted stages; synthesizer has no stage_ms entry.
       if (this.stage_ms[stage] === undefined) return;
-      // First begin wins — retries reuse the original start so elapsed accounts.
-      if (!stageStartedAt.has(stage)) {
-        stageStartedAt.set(stage, now);
+      // Already inflight (retry without endStage) — share the window (T1.1).
+      if (!stageInflightStart.has(stage)) {
+        stageInflightStart.set(stage, now);
       }
+    },
+    endStage(stage, now = Date.now()) {
+      const start = stageInflightStart.get(stage);
+      if (start === undefined) return;
+      stageInflightStart.delete(stage);
+      const slice = Math.max(0, now - start);
+      stageUsedAccumMs.set(stage, (stageUsedAccumMs.get(stage) ?? 0) + slice);
     },
     stageStreamDeadlineAt(stage, now = Date.now()) {
       const stageBudget = this.stage_ms[stage];
       if (stageBudget === undefined) return undefined;
-      const begun = stageStartedAt.get(stage) ?? now;
-      const stageEnd = begun + stageBudget;
-      // Hard bound by turn deadline as well.
-      return Math.min(stageEnd, this.deadlineAt);
+      // Usage-based: remaining budget from *now*, not first-begin wall clock.
+      return Math.min(now + this.stageRemainingMs(stage, now), this.deadlineAt);
     },
     finalStreamDeadlineAt() {
       // Grace applies past the normal turn deadline so a streaming final

@@ -242,6 +242,45 @@ describe("Self tuning", () => {
     expect(store.getPendingProposals().map((p) => p.proposal_type)).toContain("temperature");
   });
 
+  test("OutcomeAnalyzer ignores stage_window_exhausted and turn_deadline rows when computing error rate", () => {
+    // F2/F3: runtime starvation must not drive temperature proposals.
+    const store = new SelfTuningStore(TEST_DB_PATH);
+    for (let i = 0; i < 3; i++) {
+      const runId = `run_starvation_${i}`;
+      store.insertAgentRun({
+        id: runId,
+        session_id: "session_starvation",
+        user_request: "audit the repo",
+        task_type: "research",
+        pipeline: JSON.stringify(["planner", "executor"]),
+        completed: 1,
+        final_output: "failed",
+        user_rating: 5, // high rating so only error-rate path could fire
+        duration_ms: 100,
+        tool_calls_count: 0,
+        token_count: 100,
+      });
+      store.insertStageRun({
+        id: `stage_starve_${i}`,
+        agent_run_id: runId,
+        mode_id: "planner",
+        turn_number: 1,
+        input_tokens: 10,
+        output_tokens: 0,
+        tool_calls_json: "[]",
+        duration_ms: 50,
+        was_successful: 0,
+        had_error: 1,
+        error_message: "Stage budget exhausted on stage=planner",
+        partial_error_code: i === 0 ? "turn_deadline" : "stage_window_exhausted",
+      });
+    }
+
+    const analyzer = new OutcomeAnalyzer(store);
+    const suggestions = analyzer.analyze("research");
+    expect(suggestions.some((s) => /error rate/i.test(s.rationale))).toBe(false);
+  });
+
   test("collector records conductor directives for audit / replay", () => {
     const store = new SelfTuningStore(TEST_DB_PATH);
     const collector = new SessionOutcomeCollector(store);

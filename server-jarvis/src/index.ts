@@ -81,6 +81,7 @@ import {
   createStreamLivenessTracker,
   createDisconnectAwareWrite,
   ResettableWatchdog,
+  StageBudgetExhaustedError,
   StageDeadlineExceededError,
   StreamIdleTimeoutError,
   startSseHeartbeat,
@@ -1652,6 +1653,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let attemptProvider: string | undefined;
           let attemptOutcome: import("./inference-metrics").InferenceAttemptOutcome = "http_error";
           let attemptFirstTokenMs: number | undefined;
+          /** F2/F3: stage/turn budget exhaustion is not model failure. */
+          let runtimeStarvation = false;
           const attemptStage = callOptions?.stageLabel as string | undefined;
           try {
           const activeBackendIsOllama = cfg.active_backend === "ollama";
@@ -1840,17 +1843,32 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const useFallback = !isOllama && cfg.openrouter.enable_fallbacks;
           const requestTimeout = isOllama ? MODEL_REQUEST_TIMEOUT_MS : (cfg.openrouter.timeout_ms || MODEL_REQUEST_TIMEOUT_MS);
           const ctrl = new AbortController();
-          // T1.1: freeze the stage clock so retries share one stage budget.
+          // F3: distinguish true turn exhaustion from per-stage usage exhaustion
+          // *before* arming inflight so a hard refuse does not consume usage.
+          const reserveMs = stageLabel === "synthesizer" ? 0 : turnBudget.finalization_reserve_ms;
+          if (stageLabel !== "synthesizer" && !turnBudget.canStart(stageLabel ?? "agent", Date.now())) {
+            const stage = stageLabel ?? "orchestrator_request";
+            const now = Date.now();
+            if (turnBudget.remainingMs(now) <= turnBudget.finalization_reserve_ms) {
+              throw new TurnDeadlineExceededError(stage, turnBudget.turn_ms);
+            }
+            const configured = turnBudget.stage_ms[stage] ?? 0;
+            throw new StageBudgetExhaustedError(
+              stage,
+              turnBudget.stageUsedMs(stage, now),
+              configured,
+              turnBudget.remainingMs(now),
+            );
+          }
+          // F2/T1.1: mark stage inflight so retries share usage until endStage
+          // (paired in the request finally below). Idle between endStage calls
+          // no longer drains the stage window.
           if (stageLabel) turnBudget.beginStage(stageLabel);
           const stageBudgetMs = stageLabel
             ? turnBudget.stageRemainingMs(stageLabel, Date.now())
             : turnBudget.remainingMs(Date.now());
-          const reserveMs = stageLabel === "synthesizer" ? 0 : turnBudget.finalization_reserve_ms;
-          if (stageLabel !== "synthesizer" && !turnBudget.canStart(stageLabel ?? "agent", Date.now())) {
-            throw new TurnDeadlineExceededError(stageLabel ?? "orchestrator_request", turnBudget.turn_ms);
-          }
           // Re-read stage deadline after beginStage (executor may have extended via
-          // extendStageOnProgress between attempts; beginStage only freezes start).
+          // extendStageOnProgress between attempts).
           const stageStreamDeadline = stageLabel
             ? turnBudget.stageStreamDeadlineAt(stageLabel)
             : undefined;
@@ -2436,6 +2454,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }
           } catch (error) {
             const name = String((error as { name?: unknown })?.name ?? "");
+            if (
+              name === "StageBudgetExhaustedError" ||
+              name === "StageDeadlineExceededError" ||
+              name === "TurnDeadlineExceededError"
+            ) {
+              runtimeStarvation = true;
+            }
             attemptOutcome = name === "FirstTokenTimeoutError"
               ? "first_token_timeout"
               : name === "StreamIdleTimeoutError"
@@ -2444,15 +2469,27 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                   ? "visible_progress_timeout"
                   : name === "DegenerateStreamError"
                     ? "degenerate_stream"
-                    : name === "StageDeadlineExceededError"
-                      ? "http_error" // stage deadline is a hard fail for this attempt
+                    : name === "StageDeadlineExceededError" || name === "StageBudgetExhaustedError"
+                      ? "http_error" // stage budget is a hard fail for this attempt
                       : "http_error";
             const failure = error as { model?: unknown; provider?: unknown };
             if (typeof failure?.model === "string") attemptModel = failure.model;
             if (typeof failure?.provider === "string") attemptProvider = failure.provider;
             throw error;
           } finally {
-            if (attemptStage && attemptModel && attemptProvider && !streamAbort.signal.aborted) {
+            // F2: close inflight usage window for this attempt (idle after this
+            // is free until the next beginStage).
+            if (callOptions?.stageLabel) {
+              turnBudget.endStage(callOptions.stageLabel as string);
+            }
+            // Runtime starvation is not model failure — do not poison scorecard.
+            if (
+              attemptStage &&
+              attemptModel &&
+              attemptProvider &&
+              !streamAbort.signal.aborted &&
+              !runtimeStarvation
+            ) {
               const trackedScorecardAttempt = modelScorecard.record(attemptStage, `${attemptProvider}:${attemptModel}`, {
                 ok: attemptOutcome === "success" || attemptOutcome === "truncated",
                 firstTokenMs: attemptFirstTokenMs,
@@ -2492,10 +2529,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               last = await callModelAttempt(messages, callOptions, exclude);
               break;
             } catch (error) {
-              // T1.1: stage deadline is a hard stop — do not re-arm the cascade.
-              // The deterministic coordinator fallback is free; burning more
-              // candidates after the 15s stage budget is gone only adds latency.
-              if (error instanceof StageDeadlineExceededError) {
+              // T1.1 / F3: stage budget is a hard stop — do not re-arm the cascade.
+              // Burning more candidates after the stage window is gone only adds latency.
+              if (
+                error instanceof StageDeadlineExceededError ||
+                error instanceof StageBudgetExhaustedError
+              ) {
                 throw error;
               }
               const failure = recoverableStageFailure(error);

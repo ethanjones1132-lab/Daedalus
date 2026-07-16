@@ -1120,6 +1120,13 @@ describe("Orchestration & Routing Tests", () => {
     const deadline = describePipelineError("Total turn deadline (480000ms) exceeded at stage=reviewer");
     expect(deadline).toMatch(/server-authoritative turn deadline/i);
 
+    // F3: stage usage exhaustion must not be described as total-turn deadline.
+    const stageBudget = describePipelineError(
+      "Stage budget exhausted on stage=planner (used 60000ms of 60000ms; turn has 92000ms remaining)",
+    );
+    expect(stageBudget).toMatch(/stage used its full time budget/i);
+    expect(stageBudget).not.toMatch(/server-authoritative turn deadline/i);
+
     // Existing auth mapping must still take priority for unrelated errors.
     expect(describePipelineError("API 401: invalid api key")).toMatch(/Authentication failed \(401\)/);
   });

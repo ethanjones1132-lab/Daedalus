@@ -82,7 +82,7 @@ export function rejectReroute(input: RerouteValidationInput): string | null {
 
 **Files:** modify `server-jarvis/src/orchestration/turn-budget.ts`, `server-jarvis/src/stream-liveness.ts`, `server-jarvis/src/index.ts:1844-1906` (beginStage/canStart path); tests `turn-budget.test.ts` (create if absent), `orchestration.test.ts:1120` (describePipelineError mapping)
 
-- [ ] **2.1** `turn-budget.ts` — replace wall-clock anchoring with cumulative usage:
+- [x] **2.1** `turn-budget.ts` — replace wall-clock anchoring with cumulative usage:
 
 ```ts
 const stageUsedMs = new Map<string, number>();
@@ -108,8 +108,8 @@ stageRemainingMs(stage, now = Date.now()) {
 ```
 
   `stageStreamDeadlineAt` becomes `now + stageRemainingMs(stage, now)` clamped by `deadlineAt`. Retries within one attempt window still share budget (each attempt's duration accumulates into `used`) — the T1.1 property that motivated wall-clock anchoring is preserved, but idle time between segments no longer counts. **Every `beginStage` call site must gain a paired `endStage`** — the single chokepoint is `index.ts:1844` (`if (stageLabel) turnBudget.beginStage(stageLabel)`); add `endStage(stageLabel)` in that request wrapper's `finally`.
-- [ ] **2.2** Tests first: (a) two 20s planner attempts separated by 60s of idle leave `stageRemainingMs("planner") === 20_000`; (b) a stage never begun has full budget at any wall-clock time; (c) `extendStageOnProgress` still raises the ceiling. Flip fixture 0.1 green.
-- [ ] **2.3** `stream-liveness.ts` — new error class beside `TurnDeadlineExceededError` (`:101`):
+- [x] **2.2** Tests first: (a) two 20s planner attempts separated by 60s of idle leave `stageRemainingMs("planner") === 20_000`; (b) a stage never begun has full budget at any wall-clock time; (c) `extendStageOnProgress` still raises the ceiling. Flip fixture 0.1 green.
+- [x] **2.3** `stream-liveness.ts` — new error class beside `TurnDeadlineExceededError` (`:101`):
 
 ```ts
 export class StageBudgetExhaustedError extends Error {
@@ -119,9 +119,9 @@ export class StageBudgetExhaustedError extends Error {
 }
 ```
 
-- [ ] **2.4** `index.ts:1849-1850` — the `canStart` failure currently throws `TurnDeadlineExceededError` unconditionally. Distinguish: if `turnBudget.remainingMs() <= turnBudget.finalization_reserve_ms` throw `TurnDeadlineExceededError` (true turn exhaustion); else throw `StageBudgetExhaustedError(stage, usedMs, stage_ms[stage], remainingMs)`. Expose `usedMs` via a new `stageUsedMs(stage)` accessor. Update `describePipelineError` (see `orchestration.test.ts:1120`) to map the new message to a user-safe description. Stage rows recording these failures set `partial_error_code: "stage_window_exhausted"`.
-- [ ] **2.5** Tuner hygiene: in `self-tuning` consumers that aggregate `stage_runs.had_error` for model/instruction learning (grep `had_error` under `server-jarvis/src/self-tuning/` and `orchestration/model-scorecard.ts`), exclude rows with `partial_error_code IN ('stage_window_exhausted','turn_deadline')` — runtime starvation is not model failure. One test per touched query.
-- [ ] **2.6** Commit: `fix(orchestration): usage-based stage budgets + StageBudgetExhaustedError (F2,F3)`.
+- [x] **2.4** `index.ts:1849-1850` — the `canStart` failure currently throws `TurnDeadlineExceededError` unconditionally. Distinguish: if `turnBudget.remainingMs() <= turnBudget.finalization_reserve_ms` throw `TurnDeadlineExceededError` (true turn exhaustion); else throw `StageBudgetExhaustedError(stage, usedMs, stage_ms[stage], remainingMs)`. Expose `usedMs` via a new `stageUsedMs(stage)` accessor. Update `describePipelineError` (see `orchestration.test.ts:1120`) to map the new message to a user-safe description. Stage rows recording these failures set `partial_error_code: "stage_window_exhausted"`.
+- [x] **2.5** Tuner hygiene: in `self-tuning` consumers that aggregate `stage_runs.had_error` for model/instruction learning (grep `had_error` under `server-jarvis/src/self-tuning/` and `orchestration/model-scorecard.ts`), exclude rows with `partial_error_code IN ('stage_window_exhausted','turn_deadline')` — runtime starvation is not model failure. One test per touched query.
+- [x] **2.6** Commit: `fix(orchestration): usage-based stage budgets + StageBudgetExhaustedError (F2,F3)`.
 
 ---
 

@@ -5,10 +5,6 @@
  * Plan:   docs/superpowers/plans/2026-07-16-supervision-starvation-remediation.md (Phase 0)
  *
  * Target run: run_5283dd64 (session a074271b) — Versutus gap-analysis, failed ~142s.
- *
- * Structure:
- *   - "bug pin" tests document today's broken behavior so the diagnosis stays falsifiable.
- *   - "fix contract" tests pin post-remediation invariants (flip green per phase).
  */
 import { describe, expect, test } from "bun:test";
 import { LiveConductor } from "./conductor";
@@ -67,45 +63,39 @@ function admitReroute(
   return rejection ? { type: "continue" } : directive;
 }
 
-describe("incident 2026-07-16 run_5283dd64 — F2 stage-window starvation (Phase 0.1)", () => {
-  test("bug pin: wall-clock stage window refuses planner re-entry at T0+88s", () => {
-    // Live: planner first began ~14s into the turn; by ~88s elapsed the stage
-    // window was dead even though only ~50s of planner inference had run.
-    // T1.1 anti-re-arm: first beginStage wins; remaining = 60s − wall elapsed.
+describe("incident 2026-07-16 run_5283dd64 — F2 stage-window starvation (Phase 0.1 / Phase 2)", () => {
+  test("F2: canStart(planner) at T0+88s is true when only ~50s of stage budget was used", () => {
+    // Live bug: wall-clock from first begin (T0+14) to T0+88 = 74s killed the
+    // 60s stage window even though only ~50s of planner inference ran.
+    // Usage-based accounting: end after 50s of work; idle until T0+88 is free.
     const budget = createTurnBudget("full_execution", "high", T0);
     budget.beginStage("planner", T0 + 14_000);
+    budget.endStage("planner", T0 + 14_000 + 50_000);
 
     const atReplan = T0 + 88_000;
-    expect(budget.stageRemainingMs("planner", atReplan)).toBe(0);
-    expect(budget.canStart("planner", atReplan)).toBe(false);
-    // Turn itself still has budget — the mislabeled "Total turn deadline" path.
+    expect(budget.stageUsedMs("planner", atReplan)).toBe(50_000);
+    expect(budget.stageRemainingMs("planner", atReplan)).toBe(10_000);
+    expect(budget.canStart("planner", atReplan)).toBe(true);
+    // Turn itself still has budget (the mislabeled "Total turn deadline" path).
     expect(budget.remainingMs(atReplan)).toBeGreaterThan(90_000);
   });
 
-  test("bug pin: wall-clock stage window starves reviewer re-entry at T0+109s", () => {
+  test("F2: stageRemainingMs(reviewer) meters usage (60_000 − usedMs), not wall-clock", () => {
     // Live: reviewer first entry ~58s; re-entry at ~109s died after ~8.86s
-    // because remaining was 60_000 − ~51_000 wall-clock, not usage.
+    // because remaining was 60_000 − ~51_000 wall-clock. Usage accounting:
+    // first segment used 8_862ms then ended; idle gap free.
     const budget = createTurnBudget("full_execution", "high", T0);
+    const usedMs = 8_862;
     budget.beginStage("reviewer", T0 + 58_000);
+    budget.endStage("reviewer", T0 + 58_000 + usedMs);
 
     const atReentry = T0 + 109_000;
-    expect(budget.stageRemainingMs("reviewer", atReentry)).toBe(9_000);
+    expect(budget.stageRemainingMs("reviewer", atReentry)).toBe(60_000 - usedMs);
   });
-
-  // Phase 2 target: usage-based accounting + endStage so idle/replan time is free.
-  test.todo(
-    "F2 fix: canStart(planner) at T0+88s is true when only ~50s of stage budget was used",
-  );
-
-  test.todo(
-    "F2 fix: stageRemainingMs(reviewer) meters usage (60_000 − usedMs), not wall-clock since first begin",
-  );
 });
 
 describe("incident 2026-07-16 run_5283dd64 — F1 planner evidence reroute (Phase 0.2 / Phase 1)", () => {
   test("F1: deterministic guard forces continue when supervisor re-enters a cleanly completed planner", async () => {
-    // Live incident: supervisor always answered re-enter:planner after clean
-    // planner completion (evidence category error). Phase 1 admission wins.
     const conductor = makeSupervisingConductor(
       JSON.stringify({
         directive: "reroute",
@@ -126,7 +116,6 @@ describe("incident 2026-07-16 run_5283dd64 — F1 planner evidence reroute (Phas
       },
     );
 
-    // Model may still *request* the illegal reroute; the runtime gate refuses it.
     const admitted = admitReroute("planner", "completed", raw);
     expect(admitted.type).toBe("continue");
     if (raw.type === "reroute") {

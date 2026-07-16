@@ -175,6 +175,13 @@ export class ConductorLearningLoop {
     for (const [stage, variant] of Object.entries(input.instructionVariants.variants)) {
       const stageRun = stageByMode.get(stage);
       if (!stageRun) continue;
+      // F2/F3: runtime starvation must not train instruction variants.
+      if (
+        stageRun.partial_error_code === "stage_window_exhausted" ||
+        stageRun.partial_error_code === "turn_deadline"
+      ) {
+        continue;
+      }
       const custom = input.workerInstructions?.[stage as StageName]?.trim();
       const ok = stageRun.was_successful === 1 && stageRun.had_error === 0;
       this.store.upsertInstructionVariantStats(variant, stage, input.taskType, ok);

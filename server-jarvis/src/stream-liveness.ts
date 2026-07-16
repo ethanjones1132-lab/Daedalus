@@ -111,6 +111,25 @@ export class StageDeadlineExceededError extends Error {
   }
 }
 
+/**
+ * F3: stage usage budget exhausted while the turn still has remaining time.
+ * Distinct from TurnDeadlineExceededError so telemetry does not mislabel
+ * orchestration starvation as total-turn exhaustion.
+ */
+export class StageBudgetExhaustedError extends Error {
+  constructor(
+    readonly stage: string,
+    readonly usedMs: number,
+    readonly budgetMs: number,
+    readonly turnRemainingMs: number,
+  ) {
+    super(
+      `Stage budget exhausted on stage=${stage} (used ${usedMs}ms of ${budgetMs}ms; turn has ${turnRemainingMs}ms remaining)`,
+    );
+    this.name = "StageBudgetExhaustedError";
+  }
+}
+
 /** Two-tier stream liveness: transport (any delta) + visible (answer text / tool deltas). */
 export function createStreamLivenessTracker(opts: {
   interTokenMs: number;

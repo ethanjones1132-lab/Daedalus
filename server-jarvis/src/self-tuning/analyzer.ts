@@ -1,5 +1,6 @@
 import { SelfTuningStore, type AgentRun, type StageRun } from "./store";
 import { BUILTIN_MODES } from "../orchestration/modes";
+import { isRuntimeStarvationErrorCode } from "../orchestration/turn-budget";
 
 export interface TuningSuggestion {
   proposal_type: "temperature" | "prune_mode" | "restrict_tools" | "skip_planner";
@@ -27,9 +28,14 @@ export class OutcomeAnalyzer {
       allStageRuns.push(...this.store.getStageRuns(run.id));
     }
 
-    const totalStages = allStageRuns.length;
+    // F2/F3: exclude runtime starvation rows — they are orchestration budget
+    // failures, not model/instruction failures.
+    const learningStages = allStageRuns.filter(
+      (stage) => !isRuntimeStarvationErrorCode(stage.partial_error_code),
+    );
+    const totalStages = learningStages.length;
     const stageErrors = totalStages > 0
-      ? allStageRuns.filter((stage) => stage.had_error === 1).length / totalStages
+      ? learningStages.filter((stage) => stage.had_error === 1).length / totalStages
       : 0;
 
     if (avgRating !== null && avgRating < 3) {

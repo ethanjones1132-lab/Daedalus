@@ -174,25 +174,47 @@ describe("turn budgets", () => {
     expect(actualWatchdogDelayMs).toBe(55_000); // was 25_000 before the fix
   });
 
-  // T1.1: beginStage freezes the stage clock so retries cannot re-arm a full
-  // 15s coordinator budget (tonight's 37s serial parse-fail chain).
+  // T1.1: retries within one inflight window share stage budget (cannot
+  // re-arm a full 15s coordinator budget — 37s serial parse-fail chain).
   test("beginStage elapsed accounting shrinks stageRemainingMs across retries", () => {
     const budget = createTurnBudget("workspace_read", "medium", 0);
     budget.beginStage("coordinator", 1_000);
     // 10s into the stage → 5s of the 15s budget remain.
     expect(budget.stageRemainingMs("coordinator", 11_000)).toBe(5_000);
-    // Second "attempt" at t=11s must NOT reset the budget.
+    // Second "attempt" at t=11s must NOT reset the budget (still inflight).
     budget.beginStage("coordinator", 11_000);
     expect(budget.stageRemainingMs("coordinator", 14_000)).toBe(2_000);
     expect(budget.stageRemainingMs("coordinator", 16_000)).toBe(0);
   });
 
-  test("stageStreamDeadlineAt is absolute and bounded by turn deadline", () => {
+  // F2: usage-based accounting — idle between ended attempts is free.
+  test("two 20s planner attempts separated by 60s idle leave 20s remaining", () => {
+    const budget = createTurnBudget("full_execution", "high", 0);
+    budget.beginStage("planner", 0);
+    budget.endStage("planner", 20_000);
+    // 60s idle gap (replan / supervision) does not consume planner budget.
+    budget.beginStage("planner", 80_000);
+    budget.endStage("planner", 100_000);
+    expect(budget.stageUsedMs("planner", 100_000)).toBe(40_000);
+    expect(budget.stageRemainingMs("planner", 100_000)).toBe(20_000);
+  });
+
+  test("a stage never begun has full budget at any wall-clock time", () => {
+    const budget = createTurnBudget("full_execution", "high", 0);
+    expect(budget.stageRemainingMs("reviewer", 100_000)).toBe(60_000);
+    expect(budget.canStart("reviewer", 100_000)).toBe(true);
+  });
+
+  test("stageStreamDeadlineAt is now+remaining and bounded by turn deadline", () => {
     const budget = createTurnBudget("conversational", "medium", 0);
     budget.beginStage("coordinator", 0);
     expect(budget.stageStreamDeadlineAt("coordinator", 0)).toBe(15_000);
     // Synthesizer has no stage budget.
     expect(budget.stageStreamDeadlineAt("synthesizer", 0)).toBeUndefined();
+    // After partial use + end, a later re-entry gets a fresh absolute deadline
+    // from *now*, not first-begin wall clock.
+    budget.endStage("coordinator", 5_000);
+    expect(budget.stageStreamDeadlineAt("coordinator", 20_000)).toBe(30_000);
   });
 
   // T1.3: final stream grace window.
