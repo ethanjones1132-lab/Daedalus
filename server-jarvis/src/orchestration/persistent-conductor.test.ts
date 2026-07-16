@@ -210,6 +210,61 @@ describe("PersistentConductor", () => {
     expect((await conductor.describeHealth()).reason).toContain("recent_runtime_failure");
   });
 
+  test("a supervisory timeout does not poison routing availability", async () => {
+    (globalThis as any).fetch = async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/chat")) throw new DOMException("supervisor timed out", "AbortError");
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg = makeConfig({ persist_sessions: false });
+    const conductor = new PersistentConductor(() => cfg);
+
+    await expect(conductor.supervise([
+      { role: "system", content: "supervise" },
+      { role: "user", content: "Stage: executor â€” completed" },
+    ], 1)).rejects.toThrow(/timed out|abort/i);
+
+    expect(await conductor.isAvailable()).toBe(true);
+  });
+
+  test("bounds shared memory before Ollama sees the coordinator request", async () => {
+    let body: Record<string, any> | undefined;
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/chat")) {
+        body = JSON.parse(String(init?.body ?? "{}"));
+        return Response.json({
+          message: {
+            role: "assistant",
+            content: '{"task_type":"general","pipeline":["synthesizer"],"topology":"linear","context":{"needs_workspace_inspection":false,"needs_memory":true,"estimated_complexity":"low"},"coordinator_rationale":"bounded"}',
+          },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg = makeConfig({ persist_sessions: false, num_ctx: 8_192 });
+    const conductor = new PersistentConductor(() => cfg);
+    const priorToolResults = Object.fromEntries(
+      Array.from({ length: 41 }, (_, index) => [`read_file:file-${index}.ts`, "x".repeat(4_000)]),
+    );
+
+    await conductor.routeTurn({
+      sessionId: "bounded-memory",
+      request: "continue the architecture audit",
+      turnNumber: 2,
+      sessionMemoryHints: { prior_tool_results: priorToolResults },
+    });
+
+    const userMessage = (body?.messages as Array<{ role: string; content: string }>)
+      ?.find((message) => message.role === "user")?.content ?? "";
+    expect(userMessage.length).toBeLessThan(12_000);
+    expect(userMessage).toContain("Current request:");
+  });
+
   test("keep-warm loop skips a ping when a recent route already renewed warm state", async () => {
     const calls: string[] = [];
     (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {

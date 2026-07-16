@@ -139,7 +139,14 @@ function formatRecentHistory(history: ChatMessage[] | undefined): string {
   return `Recent session history:\n${lines}`;
 }
 
-function formatSessionMemoryHints(hints?: SharedContextHints): string {
+function truncateContextText(text: string, maxTokens: number): string {
+  const maxChars = Math.max(1_000, Math.floor(maxTokens * 4));
+  if (text.length <= maxChars) return text;
+  const marker = "\n[shared context truncated by runtime]\n";
+  return `${text.slice(0, Math.max(0, maxChars - marker.length))}${marker}`;
+}
+
+function formatSessionMemoryHints(hints?: SharedContextHints, maxTokens = 2_048): string {
   if (!hints) return "Session shared memory: none";
   const blocks: string[] = ["Session shared memory:"];
 
@@ -156,7 +163,10 @@ function formatSessionMemoryHints(hints?: SharedContextHints): string {
     );
   }
   const cached = hints.prior_tool_results ?? {};
-  const entries = Object.entries(cached);
+  // Keep the most recent bounded set. The full cache is still available to
+  // the executor; the local conductor only needs enough context to choose the
+  // next stage without silently exceeding Ollama's context window.
+  const entries = Object.entries(cached).slice(-24);
   if (entries.length > 0) {
     blocks.push(
       "Cached tool results:\n" +
@@ -164,7 +174,9 @@ function formatSessionMemoryHints(hints?: SharedContextHints): string {
     );
   }
 
-  return blocks.length > 1 ? blocks.join("\n\n") : "Session shared memory: none";
+  return blocks.length > 1
+    ? truncateContextText(blocks.join("\n\n"), maxTokens)
+    : "Session shared memory: none";
 }
 
 function hashText(text: string): string {
@@ -212,12 +224,12 @@ function formatSkillHint(request: string): string {
   return `Promoted skills relevant to this turn:\n${hint}`;
 }
 
-function buildTurnUserContent(input: ConductorRouteTurnInput): string {
+function buildTurnUserContent(input: ConductorRouteTurnInput, memoryBudgetTokens = 2_048): string {
   return [
     `Session ID: ${input.sessionId}`,
     `Coordinator turn: ${input.turnNumber}`,
     `Last outcome: ${input.lastOutcome ?? "none"}`,
-    formatSessionMemoryHints(input.sessionMemoryHints),
+    formatSessionMemoryHints(input.sessionMemoryHints, memoryBudgetTokens),
     formatRecentHistory(input.recentHistory),
     formatSkillHint(input.request),
     `Current request:\n${input.request}`,
@@ -232,6 +244,8 @@ export class PersistentConductor {
   private lastWarmRenewedAt = 0;
   private lastRuntimeFailureAt = 0;
   private lastRuntimeFailureMessage = "";
+  private lastSupervisionFailureAt = 0;
+  private lastSupervisionFailureMessage = "";
 
   constructor(
     private getConfig: () => JarvisConfig,
@@ -304,6 +318,7 @@ export class PersistentConductor {
     model: string;
     fallback_model: string;
     reason?: string;
+    supervision_warning?: string;
   }> {
     const conductor = this.config();
     if (!conductor.enabled) {
@@ -329,6 +344,7 @@ export class PersistentConductor {
           : this.hasRecentRuntimeFailure()
             ? `recent_runtime_failure: ${this.lastRuntimeFailureMessage}`
             : "ollama_unavailable_or_model_missing",
+        supervision_warning: this.recentSupervisionWarning(),
       };
     } catch (e) {
       return {
@@ -338,6 +354,7 @@ export class PersistentConductor {
         model: conductor.model,
         fallback_model: conductor.fallback_model,
         reason: e instanceof Error ? e.message : String(e),
+        supervision_warning: this.recentSupervisionWarning(),
       };
     }
   }
@@ -364,7 +381,7 @@ export class PersistentConductor {
     }
 
     const session = this.getSession(input.sessionId);
-    const userContent = buildTurnUserContent(input);
+    const userContent = buildTurnUserContent(input, Math.floor(this.config().num_ctx * 0.25));
     const systemPrompt = loadPrompt("coordinator.md");
     const systemHash = hashText(systemPrompt);
 
@@ -463,14 +480,16 @@ export class PersistentConductor {
           temperature: 0.1,
         }));
     } catch (error) {
-      this.recordRuntimeFailure(error);
+      // Supervision is advisory. A slow/aborted post-stage check must not
+      // poison the route-health circuit breaker for the next user turn.
+      this.recordSupervisionFailure(error);
       throw error;
     }
     target = supervised.target;
     const message = supervised.value;
     const content = stripGemmaThinkingArtifacts(message.content ?? "");
     if (!content) throw new PersistentConductorError("Ollama conductor returned empty supervision output");
-    this.clearRuntimeFailure();
+    this.clearSupervisionFailure();
     return { content, model: target.model, latencyMs: Date.now() - startedAt };
   }
 
@@ -737,6 +756,23 @@ export class PersistentConductor {
   private clearRuntimeFailure(): void {
     this.lastRuntimeFailureAt = 0;
     this.lastRuntimeFailureMessage = "";
+  }
+
+  private recordSupervisionFailure(error: unknown): void {
+    this.lastSupervisionFailureAt = Date.now();
+    this.lastSupervisionFailureMessage = errorText(error).slice(0, 240);
+  }
+
+  private clearSupervisionFailure(): void {
+    this.lastSupervisionFailureAt = 0;
+    this.lastSupervisionFailureMessage = "";
+  }
+
+  private recentSupervisionWarning(): string | undefined {
+    if (!this.lastSupervisionFailureAt || Date.now() - this.lastSupervisionFailureAt >= RUNTIME_HEALTH_FAILURE_TTL_MS) {
+      return undefined;
+    }
+    return this.lastSupervisionFailureMessage;
   }
 
   private async callOllamaMessage(
