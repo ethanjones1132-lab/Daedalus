@@ -14,12 +14,14 @@
 
 **Files:** create `server-jarvis/src/orchestration/incident-20260716.test.ts`
 
-- [ ] **0.1** Write a fixture test replaying run `run_5283dd64`'s exact timing against `createTurnBudget("full_execution","high",T0)`:
+- [x] **0.1** Write a fixture test replaying run `run_5283dd64`'s exact timing against `createTurnBudget("full_execution","high",T0)`:
   - `beginStage("planner", T0+14s)`; advance clock to T0+88s; assert `canStart("planner")` — **currently false (bug), must become true** after Phase 2 (planner *used* only ~50s of its 60s budget; wall-clock elapsed is 74s).
   - `beginStage("reviewer", T0+58s)`; advance to T0+109s; assert `stageRemainingMs("reviewer") === 60_000 − usedMs`, not `60_000 − 51_000`.
   - Mark both assertions `.todo`/failing until Phase 2 lands, then flip them green. This is the falsifiability contract from the diagnosis, executable.
-- [ ] **0.2** Write a fixture test for the conductor digest: `afterStage("planner","completed", "<750-token plan text>", ["executor","reviewer","synthesizer"], { request: "Identify all remaining gaps in the repo…", workspaceRoot: "C:\\Projects\\Versutus" })` with a stub supervisor that *always* answers `{"directive":"reroute","newRemaining":["re-enter:planner"]}` — assert the returned directive is `continue` (deterministic guard must win over the model). Failing until Phase 1.
-- [ ] **0.3** `git commit -m "test(orchestration): pin 2026-07-16 supervision-starvation incident fixtures"`
+  - Landed: `server-jarvis/src/orchestration/incident-20260716.test.ts` (bug pins + F2 todos).
+- [x] **0.2** Write a fixture test for the conductor digest: `afterStage("planner","completed", "<750-token plan text>", ["executor","reviewer","synthesizer"], { request: "Identify all remaining gaps in the repo…", workspaceRoot: "C:\\Projects\\Versutus" })` with a stub supervisor that *always* answers `{"directive":"reroute","newRemaining":["re-enter:planner"]}` — assert the returned directive is `continue` (deterministic guard must win over the model). Failing until Phase 1.
+  - Landed: bug pin (reroute currently admitted) + F1 `test.todo` for the continue contract.
+- [x] **0.3** `git commit -m "test(orchestration): pin 2026-07-16 supervision-starvation incident fixtures"`
 
 ---
 
