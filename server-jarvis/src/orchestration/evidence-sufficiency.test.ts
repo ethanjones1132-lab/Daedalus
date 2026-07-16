@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
   DEEP_READ_MIN_CONTENT_READS,
+  alreadyReadSourceKeys,
   assessWorkspaceEvidence,
   evidenceFailure,
+  extractSourceReadCandidates,
   isDeepReadRequest,
+  parseListingEntryNames,
   turnNeedsWorkspaceEvidence,
 } from "./evidence-sufficiency";
 import { hasWorkspaceSignal } from "./turn-requirements";
@@ -362,5 +365,53 @@ describe("evidenceFailure", () => {
       expect(failure.message.toLowerCase()).not.toContain("force deep read");
       expect(failure.message.toLowerCase()).not.toContain("say '");
     }
+  });
+});
+
+describe("extractSourceReadCandidates (F8)", () => {
+  test("plan-named source files come before listing-derived files (run_94d60dcf shape)", () => {
+    // Incident: replan named lib/gateway/dashboard.ts + client.ts while a
+    // listing of src/app was available — floor-completion must prefer plan order.
+    const planText =
+      "Read lib/gateway/dashboard.ts and client.ts for routing seams; also inspect the app shell.";
+    const listing: ToolCallRecord = {
+      name: "list_directory",
+      arguments: { path: "C:\\Projects\\Versutus\\src\\app" },
+      output: "layout.tsx\npage.tsx\n_layout.tsx",
+      is_error: false,
+      duration_ms: 5,
+    };
+    const candidates = extractSourceReadCandidates(
+      planText,
+      [listing],
+      "C:\\Projects\\Versutus",
+      new Set(),
+    );
+    const joined = candidates.join("\n").toLowerCase();
+    expect(joined).toContain("dashboard.ts");
+    const dashIdx = candidates.findIndex((c) => c.toLowerCase().includes("dashboard.ts"));
+    const listingIdx = candidates.findIndex((c) =>
+      c.toLowerCase().includes("layout.tsx") || c.toLowerCase().includes("page.tsx"),
+    );
+    expect(dashIdx).toBeGreaterThanOrEqual(0);
+    expect(listingIdx).toBeGreaterThan(dashIdx);
+  });
+
+  test("already-read keys are excluded", () => {
+    const planText = "Read src/a.ts and src/b.ts";
+    const already = alreadyReadSourceKeys(
+      [read("C:\\repo\\src\\a.ts")],
+      "C:\\repo",
+    );
+    const candidates = extractSourceReadCandidates(planText, [], "C:\\repo", already);
+    expect(candidates.some((c) => c.toLowerCase().includes("a.ts"))).toBe(false);
+    expect(candidates.some((c) => c.toLowerCase().includes("b.ts"))).toBe(true);
+  });
+
+  test("parseListingEntryNames strips production emoji rows", () => {
+    const names = parseListingEntryNames("3 items in C:\\repo:\n📁 src\n📄 main.ts (1.2 KB)\n📄 README.md (4 KB)");
+    expect(names).toContain("src");
+    expect(names).toContain("main.ts");
+    expect(names).toContain("README.md");
   });
 });

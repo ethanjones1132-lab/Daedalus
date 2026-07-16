@@ -569,6 +569,63 @@ describe("pipeline stage telemetry", () => {
     expect(segment.replanRequested?.trigger).toBe("evidence_insufficient");
   });
 
+  test("F8: floor-completion deterministically reads plan-named sources when model stops short", async () => {
+    const collector: StageRunRecorder = { recordStageRun: () => {} };
+    const runtime = createToolRuntime();
+    const readPaths: string[] = [];
+    runtime.register(toolDefinition("read_file"), async (args) => {
+      const path = String((args as { path?: unknown }).path ?? "");
+      readPaths.push(path);
+      return `// contents of ${path}`;
+    });
+    // No list_directory — skip preflight; only model + floor-completion reads.
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") {
+        if (executorTurns++ === 0) {
+          return {
+            content: "I will read one file then stop.",
+            tool_calls: [toolCallWithArgs("read_file", { path: "src/only.ts" })],
+          };
+        }
+        return { content: "done" };
+      }
+      if (options.stageLabel === "synthesizer") {
+        return { content: "Floor-completed audit of only.ts, dashboard.ts, and client.ts." };
+      }
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const segment = await executor.executeSegment(
+      "comprehensively audit this repo architecture",
+      ["executor", "synthesizer"],
+      "run-f8-floor-completion",
+      () => {},
+      {
+        executionProfile: "full",
+        turnRequirement: "full_execution",
+        rawMessage: "comprehensively audit this repo architecture",
+        workerInstructions: {
+          executor: "Read lib/gateway/dashboard.ts and client.ts next.",
+        },
+        allowMidRunReplan: false,
+      },
+    );
+
+    // Model read one source; floor-completion should add plan-named files
+    // toward DEEP_READ_MIN_CONTENT_READS without a replan cycle.
+    expect(readPaths.some((p) => p.includes("only.ts"))).toBe(true);
+    expect(readPaths.some((p) => p.toLowerCase().includes("dashboard.ts"))).toBe(true);
+    const contentReads = (segment.state.executor?.toolCalls ?? []).filter(
+      (c) => c.name === "read_file" && !c.is_error,
+    ).length;
+    expect(contentReads).toBeGreaterThanOrEqual(DEEP_READ_MIN_CONTENT_READS);
+    expect(segment.synthesizerAnswer).toContain("Floor-completed");
+    expect(segment.fatalErrorCode).toBeUndefined();
+  });
+
   test("F6: deep-read with zero tool results still refuses with missing_workspace_evidence", async () => {
     const collector: StageRunRecorder = { recordStageRun: () => {} };
     const runtime = createToolRuntime();

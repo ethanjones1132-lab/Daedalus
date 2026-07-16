@@ -268,3 +268,96 @@ export function evidenceFailure(assessment: EvidenceAssessment): EvidenceFailure
       "The answer below is limited to what was actually read. Naming a specific file or directory will let me go deeper.",
   };
 }
+
+/**
+ * Turn a `list_directory` tool result's text into bare entry names.
+ * Handles production `handleListDir` emoji rows and plain newline lists.
+ */
+export function parseListingEntryNames(listingText: string): string[] {
+  const lines = listingText.split(/\r?\n/);
+  const startIdx = /^\d+\s+items?\s+in\b.*:$/i.test(lines[0] ?? "") ? 1 : 0;
+  return lines
+    .slice(startIdx)
+    .map((line) =>
+      line
+        .replace(/^[^\w.]+/, "")
+        .replace(/\s+\([^)]*\)\s*$/, "")
+        .trim(),
+    )
+    .filter((line) => line.length > 0);
+}
+
+/** Join a relative entry onto a listing path without importing node:path. */
+function joinWorkspacePath(base: string, entry: string): string {
+  if (!base) return entry;
+  if (/^[a-zA-Z]:[\\/]/.test(entry) || entry.startsWith("/") || entry.startsWith("\\\\")) return entry;
+  const sep = base.includes("\\") ? "\\" : "/";
+  return `${base.replace(/[\\/]+$/, "")}${sep}${entry.replace(/^[\\/]+/, "")}`;
+}
+
+/**
+ * Path-like tokens with source extensions (lib/gateway/dashboard.ts, client.ts).
+ * Prefer longer / more specific matches; plan order is preserved separately.
+ */
+const SOURCE_PATH_TOKEN =
+  /(?:(?:[a-zA-Z]:)?(?:[\\/]|\b))?(?:[\w.-]+[\\/])*[\w.-]+\.(?:c|cc|cpp|cxx|cs|css|dart|ex|exs|go|h|hpp|hs|html|java|js|jsx|kts|kt|lua|mjs|php|pl|ps1|py|rb|rs|scala|sh|sql|svelte|swift|ts|tsx|vue)\b/gi;
+
+/**
+ * F8: harvest plan-named + listing-derived source files the runtime can
+ * deterministically deep-read to finish the evidence floor.
+ * Returns absolute-or-workspace-resolved paths in plan-order-first priority.
+ * `alreadyRead` holds `sourceFileKey` values (same keys as the deep-read floor).
+ */
+export function extractSourceReadCandidates(
+  planText: string,
+  listingCalls: ToolCallRecord[],
+  workspaceRoot: string,
+  alreadyRead: Set<string>,
+): string[] {
+  const seenKeys = new Set<string>(alreadyRead);
+  const ordered: string[] = [];
+
+  const tryAdd = (rawPath: string) => {
+    const key = sourceFileKey(rawPath, workspaceRoot);
+    if (!key || seenKeys.has(key)) return;
+    seenKeys.add(key);
+    // Prefer a workspace-relative path when the key is relative; otherwise
+    // keep the raw token (may already be absolute).
+    const resolved = key.startsWith("rel:")
+      ? joinWorkspacePath(workspaceRoot, key.slice(4))
+      : rawPath;
+    ordered.push(resolved);
+  };
+
+  // Plan / worker-instruction paths first (incident: dashboard.ts before listing noise).
+  const planMatches = planText.match(SOURCE_PATH_TOKEN) ?? [];
+  for (const token of planMatches) {
+    tryAdd(token.replace(/^[\\/]+/, ""));
+  }
+
+  for (const call of listingCalls) {
+    if (call.name !== "list_directory" || call.is_error) continue;
+    const args = call.arguments as { path?: unknown } | undefined;
+    const listPath = typeof args?.path === "string" && args.path.trim()
+      ? args.path
+      : workspaceRoot;
+    for (const entry of parseListingEntryNames(call.output)) {
+      // Skip directory-looking entries without extensions.
+      if (!entry.includes(".")) continue;
+      tryAdd(joinWorkspacePath(listPath, entry));
+    }
+  }
+
+  return ordered;
+}
+
+/** Distinct deep-read source keys already present in tool call records. */
+export function alreadyReadSourceKeys(
+  toolCalls: ToolCallRecord[] | undefined,
+  workspaceRoot?: string,
+): Set<string> {
+  const calls = (toolCalls ?? []).filter(
+    (c) => !c.is_error && c.output.trim().length > 0 && !isDuplicateToolDeflection(c),
+  );
+  return distinctDeepReadTargetKeys(calls, workspaceRoot);
+}

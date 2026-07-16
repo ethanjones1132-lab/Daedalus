@@ -28,7 +28,16 @@ import {
   renderReviewerSummary,
   renderRewriterSummary,
 } from "./stage-output";
-import { assessWorkspaceEvidence, DEEP_READ_MIN_CONTENT_READS, evidenceFailure, isDeepReadRequest, turnNeedsWorkspaceEvidence } from "./evidence-sufficiency";
+import {
+  alreadyReadSourceKeys,
+  assessWorkspaceEvidence,
+  DEEP_READ_MIN_CONTENT_READS,
+  evidenceFailure,
+  extractSourceReadCandidates,
+  isDeepReadRequest,
+  parseListingEntryNames,
+  turnNeedsWorkspaceEvidence,
+} from "./evidence-sufficiency";
 import { substituteToolCall } from "../tool-heal";
 import {
   enforceTranscriptBudget,
@@ -193,28 +202,8 @@ export function selectAnchorFiles(listingEntries: string[]): string[] {
   return ANCHOR_FILES.filter((a) => files.has(a)).slice(0, 5);
 }
 
-/**
- * Turn a `list_directory` tool result's text into bare entry names.
- *
- * Handles both the production `handleListDir` format (a "`N items in
- * <path>:`" header line followed by `"📁 name"` / `"📄 name (size)"` rows)
- * and a plain newline-separated list of names (e.g. from a test double or a
- * differently-shaped tool implementation) -- the header/emoji/size stripping
- * is a no-op on lines that don't have them.
- */
-function parseListingEntryNames(listingText: string): string[] {
-  const lines = listingText.split(/\r?\n/);
-  const startIdx = /^\d+\s+items?\s+in\b.*:$/i.test(lines[0] ?? "") ? 1 : 0;
-  return lines
-    .slice(startIdx)
-    .map((line) =>
-      line
-        .replace(/^[^\w.]+/, "")
-        .replace(/\s+\([^)]*\)\s*$/, "")
-        .trim(),
-    )
-    .filter((line) => line.length > 0);
-}
+// parseListingEntryNames lives in evidence-sufficiency.ts (shared with F8
+// floor-completion candidate harvest); re-exported for local call sites above.
 
 export function successfulWriteKeys(calls: ToolCallRecord[]): Set<string> {
   return new Set(
@@ -1025,6 +1014,88 @@ export class PipelineExecutor {
             detail: "tool:read_file",
           });
         }
+
+        // F4: if anchors were only manifests/docs (0 floor-countable source
+        // reads), list one src/lib/app directory and read its first source file
+        // so preflight contributes ≥1 deep-read floor count.
+        const preflightAssessment = assessWorkspaceEvidence(
+          toolCalls,
+          intentText,
+          preflightRoot,
+        );
+        if (deepReadRequest && preflightAssessment.contentReads === 0) {
+          const rootEntries = parseListingEntryNames(listOutput);
+          const nestedDir = rootEntries.find((entry) =>
+            /^(src|lib|app)[\\/]*$/i.test(entry.replace(/[\\/]+$/, "")),
+          );
+          if (nestedDir) {
+            const nestedPath = join(preflightRoot, nestedDir.replace(/[\\/]+$/, ""));
+            const nestedListCall: ToolCall = {
+              id: `call_${crypto.randomUUID()}`,
+              name: "list_directory",
+              arguments: { path: nestedPath },
+            };
+            const nestedListResult = await this.runToolCall(nestedListCall, options);
+            const nestedListOutput = toolResultModelText(nestedListResult);
+            toolCalls.push({
+              name: nestedListCall.name,
+              arguments: nestedListCall.arguments,
+              output: nestedListOutput,
+              is_error: nestedListResult.is_error,
+              error_code: nestedListResult.error_code,
+              duration_ms: nestedListResult.duration_ms ?? 0,
+            });
+            executorMessages.push({
+              role: "user",
+              content: `[Runtime preflight: list_directory ${nestedDir}]\n${prepareToolResultForContext(nestedListOutput, EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS, PIPELINE_TOOL_RESULT_NOTE).context}`,
+            });
+            onStateChange({
+              stage: "executor",
+              status: "running",
+              output: "\n[Tool Executed: list_directory]\n",
+              detail: "tool:list_directory",
+            });
+            if (!nestedListResult.is_error) {
+              const firstSource = parseListingEntryNames(nestedListOutput).find((entry) => {
+                const base = entry.split(/[\\/]/).pop() ?? entry;
+                const dot = base.lastIndexOf(".");
+                if (dot <= 0) return false;
+                return [
+                  ".ts", ".tsx", ".js", ".jsx", ".py", ".rs", ".go", ".java", ".kt", ".swift",
+                ].includes(base.slice(dot).toLowerCase());
+              });
+              if (firstSource) {
+                const sourcePath = join(nestedPath, firstSource);
+                const sourceRead: ToolCall = {
+                  id: `call_${crypto.randomUUID()}`,
+                  name: "read_file",
+                  arguments: { path: sourcePath },
+                };
+                const sourceResult = await this.runToolCall(sourceRead, options);
+                const sourceOutput = toolResultModelText(sourceResult);
+                toolCalls.push({
+                  name: sourceRead.name,
+                  arguments: sourceRead.arguments,
+                  output: sourceOutput,
+                  is_error: sourceResult.is_error,
+                  error_code: sourceResult.error_code,
+                  duration_ms: sourceResult.duration_ms ?? 0,
+                });
+                executorMessages.push({
+                  role: "user",
+                  content: `[Runtime preflight: read_file ${firstSource}]\n${prepareToolResultForContext(sourceOutput, EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS, PIPELINE_TOOL_RESULT_NOTE).context}`,
+                });
+                onStateChange({
+                  stage: "executor",
+                  status: "running",
+                  output: "\n[Tool Executed: read_file]\n",
+                  detail: "tool:read_file",
+                });
+              }
+            }
+          }
+        }
+
         executorMessages.push({
           role: "user",
           content:
@@ -1217,10 +1288,77 @@ export class PipelineExecutor {
       }
 
       const narrative = narratives.join("\n\n");
+      const workspaceRoot =
+        this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd();
+
+      // F8: deterministic floor-completion — when the model stopped short of
+      // the deep-read floor, read plan-named + listing-derived source files
+      // without another replan cycle.
+      if (requiresWorkspaceEvidence && deepReadRequest && executorDone) {
+        let floorAssessment = assessWorkspaceEvidence(toolCalls, intentText, workspaceRoot);
+        if (!floorAssessment.sufficient) {
+          const already = alreadyReadSourceKeys(toolCalls, workspaceRoot);
+          const listingCalls = toolCalls.filter(
+            (call) => call.name === "list_directory" && !call.is_error && call.output.trim().length > 0,
+          );
+          const planText = [
+            planSummary,
+            options.workerInstructions?.executor ?? "",
+            options.rawMessage ?? request,
+          ].join("\n");
+          const candidates = extractSourceReadCandidates(
+            planText,
+            listingCalls,
+            workspaceRoot,
+            already,
+          );
+          const toRead = Math.min(
+            4,
+            Math.max(0, DEEP_READ_MIN_CONTENT_READS - floorAssessment.contentReads + 1),
+          );
+          let completed = 0;
+          for (const candidate of candidates) {
+            if (completed >= toRead) break;
+            if (
+              options.turnBudget &&
+              options.turnBudget.stageRemainingMs("executor") <= 5_000
+            ) {
+              break;
+            }
+            const readCall: ToolCall = {
+              id: `call_${crypto.randomUUID()}`,
+              name: "read_file",
+              arguments: { path: candidate },
+            };
+            const readResult = await this.runToolCall(readCall, options);
+            const readOutput = toolResultModelText(readResult);
+            toolCalls.push({
+              name: readCall.name,
+              arguments: readCall.arguments,
+              output: readOutput,
+              is_error: readResult.is_error,
+              error_code: readResult.error_code,
+              duration_ms: readResult.duration_ms ?? 0,
+            });
+            executorMessages.push({
+              role: "user",
+              content: `[Runtime floor-completion: read_file ${candidate}]\n${prepareToolResultForContext(readOutput, EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS, PIPELINE_TOOL_RESULT_NOTE).context}`,
+            });
+            onStateChange({
+              stage: "executor",
+              status: "running",
+              output: "\n[Tool Executed: read_file]\n",
+              detail: "tool:read_file",
+            });
+            if (!readResult.is_error && readOutput.trim().length > 0) completed += 1;
+          }
+        }
+      }
+
       const finalAssessment = assessWorkspaceEvidence(
         toolCalls,
         intentText,
-        this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd(),
+        workspaceRoot,
       );
       if (!executorDone) {
         const message =
