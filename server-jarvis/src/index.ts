@@ -1999,7 +1999,19 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // were still aborted at 30s despite the override being "in effect".
           // `firstTokenTimeoutFor` clamps to [1_000, 60_000] so this watchdog
           // can never fire after the outer 60s stream-stall watchdog would have.
-          const firstTokenMs = Math.min(requestBudgetMs, firstTokenTimeoutFor(
+          // Answer-stage affordability cap (2026-07-16 evening, session
+          // livefire-throughput-c): the synthesizer's first candidate can
+          // carry a 55s cold-start allowance; when the turn had exactly ~55s
+          // left, the watchdog dutifully waited the whole allowance and the
+          // deadline killed the stage with zero fallback opportunity. A
+          // final-answer stage may never spend more than half its remaining
+          // turn waiting for the FIRST token — the other half belongs to a
+          // fallback candidate. Floor of 15s so healthy-but-slow models are
+          // not cut absurdly short; no effect while budget is ample.
+          const affordabilityCapMs = callOptions?.surfaceAsAnswer === true
+            ? Math.max(15_000, Math.floor(turnBudget.remainingMs(Date.now()) / 2))
+            : Number.POSITIVE_INFINITY;
+          const firstTokenMs = Math.min(requestBudgetMs, affordabilityCapMs, firstTokenTimeoutFor(
             agentPool,
             actualModelUsed,
             MODEL_FIRST_TOKEN_TIMEOUT_MS,
