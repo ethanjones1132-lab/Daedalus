@@ -306,7 +306,7 @@ describe("Orchestration & Routing Tests", () => {
     expect(segment.synthesizerAnswer).toBeUndefined();
   });
 
-  test("workspace_read blocks stale repo synthesis when the executor produces no read evidence", async () => {
+  test("workspace_read with partial preflight evidence synthesizes instead of refusing (F6)", async () => {
     const runtime = createToolRuntime();
     const def = (name: string) => ({
       type: "function" as const,
@@ -318,12 +318,17 @@ describe("Orchestration & Routing Tests", () => {
     runtime.register(def("list_directory"), async () => "README.md\nserver-jarvis\nsrc-tauri\nsrc-ui");
     const ctx = makeExecutionContext("agent", defaultConfig());
     const stages: string[] = [];
-    const callModel = async (_messages: ChatMessage[], options: any = {}) => {
+    let synthNotice = "";
+    const callModel = async (messages: ChatMessage[], options: any = {}) => {
       stages.push(options.stageLabel ?? "unknown");
       if (options.stageLabel === "executor") {
         return {
           content: "This is a multi-stage Jarvis agent pipeline whose runtime entry point is jarvis/orchestrator.py.",
         };
+      }
+      if (options.stageLabel === "synthesizer") {
+        synthNotice = messages.map((m) => String(m.content ?? "")).join("\n");
+        return { content: "Partial grounded summary from the listing and README only." };
       }
       return { content: "Inspect jarvis/orchestrator.py first to understand the runtime path." };
     };
@@ -332,7 +337,7 @@ describe("Orchestration & Routing Tests", () => {
     const result = await executor.execute(
       "Give me a two-sentence summary of this repo, then name one runtime entry file.",
       ["executor", "synthesizer"],
-      "run-repo-grounding-missing-evidence",
+      "run-repo-grounding-partial-evidence",
       () => {},
       {
         executionProfile: "read_only",
@@ -340,15 +345,13 @@ describe("Orchestration & Routing Tests", () => {
       } as any,
     );
 
-    expect(stages).toEqual(["executor", "executor"]);
-    expect(result.answer).toBe("");
-    expect(result.outcome).toBe("failed");
-    // Task 2.2's deep-read preflight now seeds a listing + README anchor read,
-    // so the fence reports partial-but-insufficient evidence (needs 3+ content
-    // reads for a repo-level request) with actionable guidance, rather than
-    // the zero-evidence missing_workspace_evidence code.
-    expect(result.error_code).toBe("insufficient_workspace_evidence");
-    expect(result.error).toContain("force deep read");
+    // Deep-read preflight seeds listing + README; F6 synthesizes with disclosure
+    // instead of fatal insufficient_workspace_evidence.
+    expect(stages).toContain("synthesizer");
+    expect(result.answer).toContain("Partial grounded summary");
+    expect(result.error_code).not.toBe("insufficient_workspace_evidence");
+    expect(result.error_code).not.toBe("missing_workspace_evidence");
+    expect(synthNotice).toMatch(/Evidence disclosure requirement|INCOMPLETE/i);
   });
 
   test("workspace_read Git requests receive deterministic git metadata preflight evidence", async () => {

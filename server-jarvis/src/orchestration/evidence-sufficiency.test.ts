@@ -333,7 +333,7 @@ describe("evidenceFailure", () => {
     expect(failure.message).toContain("no successful workspace read");
   });
 
-  test("partial evidence on a deep read yields insufficient_workspace_evidence with actionable guidance", () => {
+  test("partial evidence on a deep read yields insufficient_workspace_evidence without scripting the user", () => {
     const listing = {
       name: "list_directory",
       arguments: { path: "C:/repo" },
@@ -343,7 +343,9 @@ describe("evidenceFailure", () => {
     };
     const failure = evidenceFailure(assessWorkspaceEvidence([listing], "comprehensively diagnose this repo"));
     expect(failure.code).toBe("insufficient_workspace_evidence");
-    expect(failure.message).toContain("force deep read");
+    expect(failure.message).toContain("Workspace evidence was incomplete");
+    expect(failure.message).toContain("limited to what was actually read");
+    expect(failure.message.toLowerCase()).not.toContain("force deep read");
   });
 
   test("failure messages never script the user's next message verbatim", () => {
@@ -357,6 +359,8 @@ describe("evidenceFailure", () => {
       const failure = evidenceFailure(assessment);
       expect(failure.message.toLowerCase()).not.toContain("ask me to");
       expect(failure.message.toLowerCase()).not.toContain("re-send");
+      expect(failure.message.toLowerCase()).not.toContain("force deep read");
+      expect(failure.message.toLowerCase()).not.toContain("say '");
     }
   });
 });

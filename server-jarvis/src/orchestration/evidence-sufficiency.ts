@@ -259,10 +259,12 @@ export function evidenceFailure(assessment: EvidenceAssessment): EvidenceFailure
         "Workspace inspection failed: no successful workspace read tool result was produced, so Jarvis will not synthesize repository claims from ungrounded model text.",
     };
   }
+  // F6: never script the user's next message (e.g. "say force deep read") and
+  // never promise budgets the runtime does not grant on that phrase alone.
   return {
     code: "insufficient_workspace_evidence",
     message:
-      `I could not gather enough evidence to answer this (${assessment.reason}). ` +
-      "Name a specific file or directory to start from, or say 'force deep read' to retry with extended budgets.",
+      `Workspace evidence was incomplete for the depth of this request (${assessment.reason}). ` +
+      "The answer below is limited to what was actually read. Naming a specific file or directory will let me go deeper.",
   };
 }

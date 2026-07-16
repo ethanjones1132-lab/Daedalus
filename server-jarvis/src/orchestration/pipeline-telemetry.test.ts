@@ -483,9 +483,14 @@ describe("pipeline stage telemetry", () => {
     runtime.register(toolDefinition("list_directory"), async () => "package.json\nREADME.md\nsrc/");
     runtime.register(toolDefinition("read_file"), async () => "metadata only");
     const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
-    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+    let synthUser = "";
+    const callModel = async (messages: Array<{ role: string; content?: string }>, options: { stageLabel?: string } = {}) => {
       if (options.stageLabel === "executor") return { content: "I can infer the answer.", tool_calls: [] };
-      return { content: "Ungrounded answer should never be synthesized." };
+      if (options.stageLabel === "synthesizer") {
+        synthUser = messages.map((m) => m.content ?? "").join("\n");
+        return { content: "Partial audit from listing + package.json + README only." };
+      }
+      return { content: "unexpected" };
     };
 
     const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
@@ -502,8 +507,94 @@ describe("pipeline stage telemetry", () => {
       },
     );
 
+    // F6: preflight listing/anchors are partial evidence — synthesize with
+    // disclosure; still request replan; never fatal-refuse.
+    expect(segment.synthesizerAnswer).toContain("Partial audit");
+    expect(segment.fatalErrorCode).toBeUndefined();
+    expect(segment.replanRequested?.trigger).toBe("evidence_insufficient");
+    expect(synthUser).toMatch(/Evidence disclosure requirement|INCOMPLETE/i);
+  });
+
+  test("F6: deep-read with two source reads synthesizes partial answer and keeps replan", async () => {
+    const collector: StageRunRecorder = { recordStageRun: () => {} };
+    const runtime = createToolRuntime();
+    // No list_directory → skip deep-read preflight so only model-driven reads count.
+    // Handler receives tool arguments (not the full call object) — match other tests.
+    runtime.register(toolDefinition("read_file"), async (args) => {
+      const path = String((args as { path?: unknown }).path ?? "file.ts");
+      return `// contents of ${path}`;
+    });
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    let executorTurns = 0;
+    let synthCalls = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") {
+        if (executorTurns++ === 0) {
+          return {
+            content: "reading two sources",
+            tool_calls: [
+              toolCallWithArgs("read_file", { path: "src/a.ts" }),
+              toolCallWithArgs("read_file", { path: "src/b.ts" }),
+            ],
+          };
+        }
+        return { content: "done" };
+      }
+      if (options.stageLabel === "synthesizer") {
+        synthCalls += 1;
+        return { content: "Two-file partial audit of a.ts and b.ts." };
+      }
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const segment = await executor.executeSegment(
+      "comprehensively audit this repo architecture",
+      ["executor", "synthesizer"],
+      "run-f6-two-source-partial",
+      () => {},
+      {
+        executionProfile: "full",
+        turnRequirement: "full_execution",
+        rawMessage: "comprehensively audit this repo architecture",
+        allowMidRunReplan: true,
+      },
+    );
+
+    expect(synthCalls).toBe(1);
+    expect(segment.state.executor?.toolCalls?.filter((c) => c.name === "read_file" && !c.is_error).length).toBe(2);
+    expect(segment.synthesizerAnswer).toContain("Two-file partial audit");
+    expect(segment.synthesizerFatalError).toBeUndefined();
+    expect(segment.fatalErrorCode).toBeUndefined();
+    expect(segment.replanRequested?.trigger).toBe("evidence_insufficient");
+  });
+
+  test("F6: deep-read with zero tool results still refuses with missing_workspace_evidence", async () => {
+    const collector: StageRunRecorder = { recordStageRun: () => {} };
+    const runtime = createToolRuntime();
+    // No workspace tools registered → no preflight, zero evidence.
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") return { content: "I can infer everything.", tool_calls: [] };
+      return { content: "Should not synthesize." };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const segment = await executor.executeSegment(
+      "comprehensively audit this repo without modifying files",
+      ["executor", "synthesizer"],
+      "run-f6-zero-evidence-refuse",
+      () => {},
+      {
+        executionProfile: "full",
+        turnRequirement: "full_execution",
+        rawMessage: "comprehensively audit this repo without modifying files",
+        allowMidRunReplan: true,
+      },
+    );
+
     expect(segment.synthesizerAnswer).toBe("");
-    expect(segment.fatalErrorCode).toBe("insufficient_workspace_evidence");
+    expect(segment.fatalErrorCode).toBe("missing_workspace_evidence");
     expect(segment.replanRequested?.trigger).toBe("evidence_insufficient");
   });
 

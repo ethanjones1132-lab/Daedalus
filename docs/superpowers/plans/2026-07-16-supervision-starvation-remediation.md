@@ -129,7 +129,7 @@ export class StageBudgetExhaustedError extends Error {
 
 **Files:** modify `server-jarvis/src/orchestration/pipeline.ts:2008-2032` (pre-synth fence), `server-jarvis/src/orchestration/evidence-sufficiency.ts:254-268`; tests `evidence-sufficiency.test.ts`, `orchestration.test.ts:351`
 
-- [ ] **3.1** Fence change at `pipeline.ts:2013`: refusal is reserved for **zero evidence**. When `!sufficient` but `contentReads >= 1 || listings >= 1`, do not return a fatal error — run the synthesizer with an injected notice and keep the replan request alive:
+- [x] **3.1** Fence change at `pipeline.ts:2013`: refusal is reserved for **zero evidence**. When `!sufficient` but `contentReads >= 1 || listings >= 1`, do not return a fatal error — run the synthesizer with an injected notice and keep the replan request alive:
 
 ```ts
 if (requiresWorkspaceEvidence && !preSynthAssessment.sufficient) {
@@ -152,9 +152,9 @@ if (requiresWorkspaceEvidence && !preSynthAssessment.sufficient) {
 ```
 
   The replan loop still gets first refusal-free shot at topping up evidence; when replans are capped, the segment now ships a grounded partial answer instead of `insufficient_workspace_evidence`.
-- [ ] **3.2** Tests first: (a) deep-read turn, 2 distinct source reads → synthesizer runs, answer non-empty, no fatal code; (b) deep-read turn, 0 calls → refusal preserved with `missing_workspace_evidence`; (c) replanRequested still set in case (a).
-- [ ] **3.3** `evidence-sufficiency.ts:262-267` — rewrite the insufficient message to stop scripting the user (its own `:251` comment forbids it) and stop promising budgets it doesn't grant: `"Workspace evidence was incomplete for the depth of this request (${assessment.reason}). The answer below is limited to what was actually read. Naming a specific file or directory will let me go deeper."` Update `orchestration.test.ts:351` and `evidence-sufficiency.test.ts:346` which assert the old phrase.
-- [ ] **3.4** Commit: `fix(orchestration): partial-evidence synthesis with disclosure; refusal only on zero evidence (F6)`.
+- [x] **3.2** Tests first: (a) deep-read turn, 2 distinct source reads → synthesizer runs, answer non-empty, no fatal code; (b) deep-read turn, 0 calls → refusal preserved with `missing_workspace_evidence`; (c) replanRequested still set in case (a).
+- [x] **3.3** `evidence-sufficiency.ts:262-267` — rewrite the insufficient message to stop scripting the user (its own `:251` comment forbids it) and stop promising budgets it doesn't grant: `"Workspace evidence was incomplete for the depth of this request (${assessment.reason}). The answer below is limited to what was actually read. Naming a specific file or directory will let me go deeper."` Update `orchestration.test.ts:351` and `evidence-sufficiency.test.ts:346` which assert the old phrase.
+- [x] **3.4** Commit: `fix(orchestration): partial-evidence synthesis with disclosure; refusal only on zero evidence (F6)`.
 
 ---
 

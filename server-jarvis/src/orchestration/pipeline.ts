@@ -2118,22 +2118,34 @@ export class PipelineExecutor {
     );
     if (requiresWorkspaceEvidence && !preSynthAssessment.sufficient) {
       const failure = evidenceFailure(preSynthAssessment);
-      // T2.4: evidence fence failure requests replan (first occurrence).
+      // T2.4: evidence fence still requests replan (first refusal-free top-up).
       if (options.allowMidRunReplan !== false) {
         replanRequested = {
           trigger: "evidence_insufficient",
           detail: failure.message,
         };
       }
-      return {
-        state,
-        synthesizerAnswer: "",
-        synthesizerFatalError: failure.message,
-        synthesizerEmptyCompletion: false,
-        fatalErrorCode: failure.code,
-        effectGate,
-        partialStage,
-        replanRequested,
+      // F6: refusal is reserved for *zero* evidence. Partial evidence synthesizes
+      // with an explicit disclosure notice instead of a canned fatal refuse.
+      if (preSynthAssessment.contentReads + preSynthAssessment.listings === 0) {
+        return {
+          state,
+          synthesizerAnswer: "",
+          synthesizerFatalError: failure.message,
+          synthesizerEmptyCompletion: false,
+          fatalErrorCode: failure.code,
+          effectGate,
+          partialStage,
+          replanRequested,
+        };
+      }
+      effectGate = {
+        ...effectGate,
+        synthesizerNotice: [
+          effectGate.synthesizerNotice,
+          `Evidence disclosure requirement: workspace evidence is INCOMPLETE (${preSynthAssessment.reason}). ` +
+          `State plainly which files you actually read, answer only from them, and name what remains unread.`,
+        ].filter(Boolean).join("\n"),
       };
     }
 
@@ -2188,6 +2200,9 @@ export class PipelineExecutor {
     // callers that omit the synthesizer stage. The normal activation boundary
     // always appends a synthesizer, but PipelineExecutor is also reused by tests
     // and replan slices and must not return a planner sentinel as a repo answer.
+    // F6: if the segment already synthesized a grounded partial answer from
+    // incomplete evidence, do not wipe it — only refuse zero-evidence turns
+    // (or partial turns that never produced a synthesizer answer).
     const executeAssessment = assessWorkspaceEvidence(
       state.executor?.toolCalls,
       options.rawMessage ?? request,
@@ -2195,14 +2210,22 @@ export class PipelineExecutor {
     );
     if (requiresWorkspaceEvidence && !executeAssessment.sufficient) {
       const failure = evidenceFailure(executeAssessment);
-      return {
-        answer: "",
-        error: failure.message,
-        recursion_depth: 0,
-        outcome: "failed",
-        error_code: failure.code,
-        toolCalls: state.executor?.toolCalls,
-      };
+      const zeroEvidence =
+        executeAssessment.contentReads + executeAssessment.listings === 0;
+      const synthesizedPartial =
+        !zeroEvidence &&
+        !segment.synthesizerFatalError &&
+        Boolean(segment.synthesizerAnswer?.trim());
+      if (!synthesizedPartial) {
+        return {
+          answer: "",
+          error: failure.message,
+          recursion_depth: 0,
+          outcome: "failed",
+          error_code: failure.code,
+          toolCalls: state.executor?.toolCalls,
+        };
+      }
     }
 
     // Truthful run outcome. A failed synthesizer (threw OR empty) is `failed`.
