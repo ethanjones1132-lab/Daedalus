@@ -857,14 +857,41 @@ export async function chatCompletionWithFallback(
         else signal.addEventListener("abort", onUserAbort, { once: true });
       }
       let watchdogTimer: ReturnType<typeof setTimeout> | undefined;
+      let headersTimer: ReturnType<typeof setTimeout> | undefined;
       try {
         const attemptBody = await buildAttemptBody(cfg, provider, requestBody, model);
-        const res = await fetch(providerChatUrl(target), {
+        // Headers leash (live incident 2026-07-16 PM, session f458849c): the
+        // body-bytes watchdog below only arms AFTER the HTTP response headers
+        // arrive. A provider that accepts the connection and never answers
+        // left the attempt bounded only by the caller's whole-request budget
+        // (47-74s observed), consuming the stage window or the turn deadline.
+        // Bound the pre-header phase by the same per-provider first-token
+        // window and advance the cascade instead.
+        const HEADERS_STALL_REASON = `headers-timeout:${provider}:${model}`;
+        const fetchPromise = fetch(providerChatUrl(target), {
           method: "POST",
           signal: attemptCtrl.signal,
           headers: providerHeaders(cfg, target),
           body: JSON.stringify(attemptBody),
         });
+        // The losing race arm may reject (AbortError) after we've moved on —
+        // register a no-op handler so it can never surface as an unhandled
+        // rejection. The raced arm below still observes the real outcome.
+        fetchPromise.catch(() => {});
+        const headersOutcome = await Promise.race([
+          fetchPromise.then((res) => ({ kind: "response" as const, res })),
+          new Promise<{ kind: "headers-timeout" }>((resolve) => {
+            headersTimer = setTimeout(() => resolve({ kind: "headers-timeout" }), firstTokenTimeoutMs);
+          }),
+        ]);
+        clearTimeout(headersTimer);
+        if (headersOutcome.kind === "headers-timeout") {
+          attemptCtrl.abort(HEADERS_STALL_REASON);
+          lastError = `Model ${model} (${provider}) returned no HTTP response headers within ${firstTokenTimeoutMs}ms (headers timeout)`;
+          console.warn(`[Fallback] ${lastError} — advancing to next model`);
+          break attemptLoop;
+        }
+        const res = headersOutcome.res;
 
         if (res.ok) {
           // First-token watchdog: race the first body chunk against the timer.
@@ -963,6 +990,7 @@ export async function chatCompletionWithFallback(
         continue attemptLoop;
       } finally {
         if (watchdogTimer) clearTimeout(watchdogTimer);
+        if (headersTimer) clearTimeout(headersTimer);
         if (signal) signal.removeEventListener("abort", onUserAbort);
       }
     }

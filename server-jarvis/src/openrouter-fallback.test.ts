@@ -344,6 +344,86 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
     expect(result.model_used).toBe("cohere/north-mini-code:free");
   });
 
+  test("headers leash advances to the next cascade model when fetch never returns HTTP headers", async () => {
+    // Live incident 2026-07-16 PM (session f458849c): a provider accepted the
+    // connection and never returned response headers. The body-bytes watchdog
+    // above only arms AFTER headers arrive, so the hung attempt was bounded
+    // only by the caller's whole-request budget — 47-74s stalls that consumed
+    // the stage window (planner), the turn deadline (executor, synthesizer),
+    // or ended as an opaque provider error. The pre-header phase must be
+    // leashed by the same first-token window and advance the cascade.
+    const cfg = cfgWithPool();
+    cfg.openrouter.model = "openrouter/free";
+    (cfg.openrouter as any).first_token_timeout_ms = 200;
+    cfg.orchestrator.agents = [
+      {
+        id: "hung-headers-primary",
+        provider: "openrouter",
+        model_id: "openrouter/free",
+        capabilities: { code: 0.5, reasoning: 0.5, speed: 0.9, cost: 1, json_reliability: 0.6 },
+        default_for: ["synthesizer"],
+        enabled: true,
+      },
+      {
+        id: "healthy-headers-secondary",
+        provider: "openrouter",
+        model_id: "cohere/north-mini-code:free",
+        capabilities: { code: 0.95, reasoning: 0.7, speed: 0.8, cost: 1, json_reliability: 0.8 },
+        default_for: ["synthesizer"],
+        enabled: true,
+      },
+    ];
+
+    const seenChatModels: string[] = [];
+    let hungFetchStarted = false;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) {
+        return new Response(JSON.stringify({
+          data: [
+            { id: "openrouter/free", name: "Free", context_length: 200000, pricing: { prompt: "0", completion: "0" }, architecture: {}, supported_parameters: [], description: "" },
+            { id: "cohere/north-mini-code:free", name: "North", context_length: 256000, pricing: { prompt: "0", completion: "0" }, architecture: {}, supported_parameters: [], description: "" },
+          ],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      seenChatModels.push(body.model);
+      if (body.model === "openrouter/free") {
+        // Simulate a fetch that never returns headers: pending forever, and —
+        // like the real fetch — rejecting with AbortError once the attempt
+        // controller aborts. The post-race rejection must not crash the
+        // cascade (unhandled rejection) and must not be misread as a
+        // user-cancel.
+        hungFetchStarted = true;
+        return await new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            const err = new Error("The operation was aborted");
+            (err as Error & { name: string }).name = "AbortError";
+            reject(err);
+          }, { once: true });
+        });
+      }
+      return new Response("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n", { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    }) as typeof fetch;
+
+    const startedAt = Date.now();
+    const result = await chatCompletionWithFallback(
+      cfg,
+      { model: "openrouter/free", messages: [{ role: "user", content: "synthesize" }], stream: true },
+      undefined,
+      { stage: "synthesizer", taskType: "general" },
+    );
+
+    expect(hungFetchStarted).toBe(true);
+    expect(seenChatModels[0]).toBe("openrouter/free");
+    expect(seenChatModels.length).toBeGreaterThanOrEqual(2);
+    expect(result.model_used).toBe("cohere/north-mini-code:free");
+    // The hung attempt must cost ~first_token_timeout_ms, not the whole
+    // request budget (2s is generous headroom over the 200ms leash).
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+  });
+
   test("uses the configured OpenCode Go first-token budget before falling back", async () => {
     const cfg = cfgWithPool();
     cfg.opencode_go.api_key = "go-test-key";
