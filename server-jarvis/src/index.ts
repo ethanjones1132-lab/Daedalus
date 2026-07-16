@@ -117,6 +117,7 @@ import { combinedStageExclusions, StageHealthRegistry, type RecoverableFailureKi
 import { ModelScorecard, type ScorecardAttempt } from "./orchestration/model-scorecard";
 import { createTurnBudget } from "./orchestration/turn-budget";
 import { isDeepReadRequest } from "./orchestration/evidence-sufficiency";
+import { FORCE_DEEP_READ_PATTERN } from "./orchestration/repetition-guard";
 import { OrchestrationAdmissionController, type AdmissionLease } from "./orchestration/admission-controller";
 import type { PipelineProgressState, PipelineRecursionEvent } from "./orchestration/pipeline";
 import { ConductorBus } from "./orchestration/conductor-bus";
@@ -131,6 +132,7 @@ import {
   type TurnRequirement,
 } from "./orchestration/turn-requirements";
 import {
+  applyForcedDeepReadRoute,
   buildDeterministicRoute,
   buildShortCircuitRoute,
   normalizeRoute,
@@ -1311,10 +1313,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     message,
     priorTaskRun?.requirement ?? continuationRequirements.get(sessionId),
   ).result.requirement;
+  // F5: "force deep read" is a real contract — extended budget + direct route.
+  const forcedDeepRead = FORCE_DEEP_READ_PATTERN.test(message);
   const turnBudget = createTurnBudget(
     initialRequirement,
-    resolveDeepReadIntent(message, priorTaskRun?.depth) ? "high" : "medium",
+    resolveDeepReadIntent(message, priorTaskRun?.depth) || forcedDeepRead ? "high" : "medium",
     turnStartedAt,
+    { forcedDeepRead },
   );
   const ensureTurnBudget = (stage: string): void => {
     if (Date.now() >= turnBudget.deadlineAt) {
@@ -2704,7 +2709,6 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           });
         }
         const coordinatorDurationMs = shortCircuit || skipAdvisoryCoordinator ? 0 : Date.now() - coordinatorStartedAt;
-        orchestratorTaskType = route.task_type;
 
         // T1.6: record parse_failure strike so next turn's pickFor / exclude
         // set demotes the pinned coordinator default after one strike.
@@ -2736,6 +2740,18 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             : route.routing_parse_fallback
               ? "parse_fallback"
               : "model";
+        // F5: force-deep-read overrides topology to the research route
+        // (executor→synthesizer) so planner/reviewer/supervision tax cannot
+        // re-starve. Applied before normalize for telemetry, then re-asserted
+        // after normalize because full_execution invariants re-add reviewer.
+        if (forcedDeepRead && !shortCircuit) {
+          route = applyForcedDeepReadRoute(route);
+          console.log(
+            `[Jarvis Orchestrator] forced deep read: direct executor route with extended budget ` +
+            `(turn_ms=${turnBudget.turn_ms} executor_ms=${turnBudget.stage_ms.executor ?? "n/a"})`,
+          );
+        }
+        orchestratorTaskType = route.task_type;
         const normalized = normalizeRoute(
           route,
           turnReq.requirement,
@@ -2744,8 +2760,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         sessionMemory.updateTaskRun(sessionId, {
           estimatedComplexity: route.context.estimated_complexity,
         });
+        const forcedPipeline = forcedDeepRead && !shortCircuit
+          ? (["executor", "synthesizer"] as StageName[])
+          : normalized.pipeline;
         const reconciled = reconcileRouteWithBudget(
-          normalized.pipeline,
+          forcedPipeline,
           turnBudget.turn_ms,
           turnBudget.finalization_reserve_ms,
           coordinatorDurationMs,

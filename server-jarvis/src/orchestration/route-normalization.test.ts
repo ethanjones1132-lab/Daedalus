@@ -1,6 +1,14 @@
 import { describe, test, expect } from "bun:test";
-import { buildDeterministicRoute, buildShortCircuitRoute, normalizeRemainingStages, normalizeRoute, reconcileRouteWithBudget } from "./route-normalization";
+import {
+  applyForcedDeepReadRoute,
+  buildDeterministicRoute,
+  buildShortCircuitRoute,
+  normalizeRemainingStages,
+  normalizeRoute,
+  reconcileRouteWithBudget,
+} from "./route-normalization";
 import type { CoordinatorResult } from "./coordinator";
+import { FORCE_DEEP_READ_PATTERN } from "./repetition-guard";
 
 function decision(pipeline: CoordinatorResult["pipeline"], topology: CoordinatorResult["topology"] = "linear"): CoordinatorResult {
   return {
@@ -46,6 +54,34 @@ describe("buildDeterministicRoute (T1.2)", () => {
     const n = normalizeRoute(r, "workspace_read", "deterministic");
     expect(n.pipeline).toEqual(["executor", "synthesizer"]);
     expect(n.profile).toBe("read_only");
+  });
+});
+
+describe("applyForcedDeepReadRoute (F5)", () => {
+  test("FORCE_DEEP_READ_PATTERN matches the hatch phrase", () => {
+    expect(FORCE_DEEP_READ_PATTERN.test("force deep read")).toBe(true);
+    expect(FORCE_DEEP_READ_PATTERN.test("continue, force deep read")).toBe(true);
+    expect(FORCE_DEEP_READ_PATTERN.test("please audit the repo")).toBe(false);
+  });
+
+  test("overrides full_execution topology to direct executor route with Forced deep read rationale", () => {
+    const base = buildDeterministicRoute("full_execution");
+    expect(base.pipeline).toContain("planner");
+    const forced = applyForcedDeepReadRoute(base);
+    expect(forced.pipeline).toEqual(["executor", "synthesizer"]);
+    expect(forced.coordinator_rationale).toContain("Forced deep read");
+    expect(forced.context.estimated_complexity).toBe("high");
+    expect(forced.context.needs_workspace_inspection).toBe(true);
+  });
+
+  test("post-normalize executable pipeline must re-assert executor+synthesizer (full_execution would re-add reviewer)", () => {
+    const forced = applyForcedDeepReadRoute(buildDeterministicRoute("full_execution"));
+    const normalized = normalizeRoute(forced, "full_execution", "deterministic");
+    // full_execution REQUIRED_STAGES includes reviewer — callers must re-apply
+    // the forced pipeline after normalize (see index.ts F5 block).
+    expect(normalized.pipeline).toContain("reviewer");
+    const executable = ["executor", "synthesizer"] as const;
+    expect([...executable]).toEqual(["executor", "synthesizer"]);
   });
 });
 

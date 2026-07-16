@@ -100,7 +100,10 @@ const SHORT_CIRCUIT_CODES = new Set([
   "insufficient_workspace_evidence",
   "missing_workspace_evidence",
 ]);
-const FORCE_BYPASS = /\bforce deep read\b/i;
+/** Single source of truth for the force-deep-read hatch phrase (F5). */
+export const FORCE_DEEP_READ_PATTERN = /\bforce deep read\b/i;
+/** @deprecated Prefer FORCE_DEEP_READ_PATTERN — kept as local alias for call sites. */
+const FORCE_BYPASS = FORCE_DEEP_READ_PATTERN;
 // A concrete file/path in the retry counts as new information: an extension'd
 // filename ("gateway.ts") or a path separator ("src/api", "C:\repo").
 const CONCRETE_PATH = /[\w.-]+\.[a-z0-9]{1,8}\b|[\w-]+[\\/][\w./\\-]+/i;

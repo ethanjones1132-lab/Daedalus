@@ -54,8 +54,16 @@ export interface TurnBudget {
 export const FINAL_STREAM_GRACE_MS = 30_000;
 
 const PROGRESS_EXTENSION_MS = 20_000;      // per evidence-producing stage turn
-const STAGE_EXTENSION_CEILING_MS = 90_000; // a stage may never exceed this
-const ABSOLUTE_TURN_CAP_MS = 180_000;      // matches the high-complexity full_execution cap
+const STAGE_EXTENSION_CEILING_MS = 90_000; // a stage may never exceed this (unforced)
+const ABSOLUTE_TURN_CAP_MS = 180_000;      // default high-complexity full_execution cap
+/** F5: forced deep-read hatch grants a longer absolute turn window. */
+export const FORCED_DEEP_READ_TURN_MS = 240_000;
+export const FORCED_DEEP_READ_EXECUTOR_MS = 150_000;
+
+export interface CreateTurnBudgetOptions {
+  /** User said "force deep read" — extended budget + higher absolute cap. */
+  forcedDeepRead?: boolean;
+}
 
 /** Runtime starvation codes — not model failure for learning consumers. */
 export const RUNTIME_STARVATION_ERROR_CODES = new Set([
@@ -124,15 +132,34 @@ export function createTurnBudget(
   requirement: TurnRequirement,
   complexity: "low" | "medium" | "high" = "medium",
   startedAt = Date.now(),
+  opts: CreateTurnBudgetOptions = {},
 ): TurnBudget {
   const base = BUDGETS[requirement];
-  const turn_ms = requirement === "full_execution" && complexity === "high"
+  const forcedDeepRead = Boolean(opts.forcedDeepRead);
+  // F5: forced deep-read hatch grants 240s absolute turn + 150s executor.
+  const absolute_cap_ms = forcedDeepRead ? FORCED_DEEP_READ_TURN_MS : ABSOLUTE_TURN_CAP_MS;
+  let turn_ms = requirement === "full_execution" && complexity === "high"
     ? Math.min(180_000, base.turn_ms + 30_000)
     : base.turn_ms;
+  const stage_ms = { ...base.stage_ms };
+  if (forcedDeepRead) {
+    turn_ms = FORCED_DEEP_READ_TURN_MS;
+    if (stage_ms.executor !== undefined) {
+      stage_ms.executor = FORCED_DEEP_READ_EXECUTOR_MS;
+    } else {
+      // conversational/answer_only have no executor budget — grant one when forced.
+      stage_ms.executor = FORCED_DEEP_READ_EXECUTOR_MS;
+    }
+  }
   // F2: cumulative usage per stage + current inflight start (usage-based,
   // not wall-clock since first entry).
   const stageUsedAccumMs = new Map<string, number>();
   const stageInflightStart = new Map<string, number>();
+  // Forced stages may start above the default 90s progress ceiling; never
+  // shrink them via extendStageOnProgress, and allow growth up to absolute_cap.
+  const stageExtensionCeilingMs = forcedDeepRead
+    ? Math.max(STAGE_EXTENSION_CEILING_MS, FORCED_DEEP_READ_EXECUTOR_MS)
+    : STAGE_EXTENSION_CEILING_MS;
 
   const budget: TurnBudget = {
     requirement,
@@ -141,7 +168,7 @@ export function createTurnBudget(
     turn_ms,
     finalization_reserve_ms: base.finalization_reserve_ms,
     max_stage_attempts: base.max_stage_attempts,
-    stage_ms: { ...base.stage_ms },
+    stage_ms,
     deadlineAt: startedAt + turn_ms,
     remainingMs(now = Date.now()) {
       return Math.max(0, this.deadlineAt - now);
@@ -187,10 +214,10 @@ export function createTurnBudget(
     finalStreamDeadlineAt() {
       // Grace applies past the normal turn deadline so a streaming final
       // answer is not mid-word chopped. Absolute hard stop still applies.
-      const softCap = Math.min(this.deadlineAt, this.startedAt + ABSOLUTE_TURN_CAP_MS);
+      const softCap = Math.min(this.deadlineAt, this.startedAt + absolute_cap_ms);
       return Math.min(
         softCap + FINAL_STREAM_GRACE_MS,
-        this.startedAt + ABSOLUTE_TURN_CAP_MS + FINAL_STREAM_GRACE_MS,
+        this.startedAt + absolute_cap_ms + FINAL_STREAM_GRACE_MS,
       );
     },
     extendStageOnProgress(stage, newEvidenceCount) {
@@ -198,11 +225,11 @@ export function createTurnBudget(
       const current = this.stage_ms[stage];
       if (current === undefined) return;
       const extension = Math.min(newEvidenceCount, 3) * PROGRESS_EXTENSION_MS;
-      const next = Math.min(STAGE_EXTENSION_CEILING_MS, current + extension);
+      const next = Math.min(stageExtensionCeilingMs, current + extension);
       const granted = next - current;
       if (granted <= 0) return;
       this.stage_ms[stage] = next;
-      this.turn_ms = Math.min(ABSOLUTE_TURN_CAP_MS, this.turn_ms + granted);
+      this.turn_ms = Math.min(absolute_cap_ms, this.turn_ms + granted);
       this.deadlineAt = this.startedAt + this.turn_ms;
     },
   };

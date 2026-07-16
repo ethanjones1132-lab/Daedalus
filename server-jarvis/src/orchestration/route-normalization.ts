@@ -98,6 +98,27 @@ export function buildDeterministicRoute(
 }
 
 /**
+ * F5: "force deep read" hatch — direct research topology (executor→synthesizer)
+ * with an explicit rationale for telemetry / Phase 9 live-fire checks.
+ * Strips planner/reviewer/rewriter so supervision tax cannot re-starve the turn.
+ */
+export function applyForcedDeepReadRoute(route: CoordinatorResult): CoordinatorResult {
+  return {
+    ...route,
+    task_type: route.task_type === "general" ? "research" : route.task_type,
+    pipeline: ["executor", "synthesizer"],
+    topology: "linear",
+    context: {
+      ...route.context,
+      needs_workspace_inspection: true,
+      estimated_complexity: "high",
+    },
+    coordinator_rationale: "Forced deep read: direct executor route with extended budget.",
+    conductor_source: route.conductor_source ?? "deterministic",
+  };
+}
+
+/**
  * Drop advisory stages when the routed pipeline cannot fit the time left in
  * the turn. Executor and synthesizer are the irreducible answer-producing
  * pair; planner/reviewer/rewriter are shed in that order of value to the

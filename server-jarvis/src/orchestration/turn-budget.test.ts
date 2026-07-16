@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { createTurnBudget, FINAL_STREAM_GRACE_MS } from "./turn-budget";
+import {
+  createTurnBudget,
+  FINAL_STREAM_GRACE_MS,
+  FORCED_DEEP_READ_EXECUTOR_MS,
+  FORCED_DEEP_READ_TURN_MS,
+} from "./turn-budget";
 import { AgentPool, firstTokenTimeoutFor } from "./agent-pool";
 import { resolveTurnRequirement } from "./turn-requirements";
 
@@ -15,6 +20,28 @@ describe("turn budgets", () => {
     expect(budget.max_stage_attempts).toBe(2);
     expect(budget.turn_ms).toBe(180_000);
     expect(budget.stageRemainingMs("executor", 1_000)).toBe(60_000);
+  });
+
+  // F5: "force deep read" is a real budget contract, not a prompt slogan.
+  test("forced deep read grants 240s turn deadline and 150s executor budget", () => {
+    const forced = createTurnBudget("full_execution", "high", 0, { forcedDeepRead: true });
+    expect(forced.turn_ms).toBe(FORCED_DEEP_READ_TURN_MS);
+    expect(forced.deadlineAt).toBe(FORCED_DEEP_READ_TURN_MS);
+    expect(forced.stage_ms.executor).toBe(FORCED_DEEP_READ_EXECUTOR_MS);
+    expect(forced.stageRemainingMs("executor", 0)).toBe(FORCED_DEEP_READ_EXECUTOR_MS);
+    expect(forced.finalStreamDeadlineAt()).toBe(FORCED_DEEP_READ_TURN_MS + FINAL_STREAM_GRACE_MS);
+
+    const unforced = createTurnBudget("full_execution", "high", 0);
+    expect(unforced.turn_ms).toBe(180_000);
+    expect(unforced.stage_ms.executor).toBe(60_000);
+  });
+
+  test("forced deep read extendStageOnProgress never shrinks the 150s executor ceiling", () => {
+    const budget = createTurnBudget("workspace_read", "high", 0, { forcedDeepRead: true });
+    expect(budget.stage_ms.executor).toBe(FORCED_DEEP_READ_EXECUTOR_MS);
+    budget.extendStageOnProgress("executor", 1);
+    expect(budget.stage_ms.executor).toBeGreaterThanOrEqual(FORCED_DEEP_READ_EXECUTOR_MS);
+    expect(budget.turn_ms).toBeLessThanOrEqual(FORCED_DEEP_READ_TURN_MS);
   });
 
   test("uses compact budgets for conversational turns", () => {
