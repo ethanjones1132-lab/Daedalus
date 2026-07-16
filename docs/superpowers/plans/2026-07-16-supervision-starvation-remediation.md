@@ -219,7 +219,7 @@ export function shouldSuperviseStage(args: {
 
 **Files:** modify `server-jarvis/src/orchestration/task-run.ts:126-144`; tests `task-run.test.ts`
 
-- [ ] **7.1** Test first: `assessTaskRunAcceptance({ pipelineOutcome: "failed", evidenceCount: 2, … })` → `{ status: "paused", reason: "pipeline_failed_with_evidence" }`; zero-evidence failure still → `failed`. Then implement:
+- [x] **7.1** Test first: `assessTaskRunAcceptance({ pipelineOutcome: "failed", evidenceCount: 2, … })` → `{ status: "paused", reason: "pipeline_failed_with_evidence" }`; zero-evidence failure still → `failed`. Then implement:
 
 ```ts
 if (input.pipelineOutcome === "failed" || !answer) {
@@ -230,7 +230,7 @@ if (input.pipelineOutcome === "failed" || !answer) {
 ```
 
   `resolveTaskRunTurn` already continues from `paused` (`:95`), so "continue…" after a partial failure now inherits the real objective, workspace, depth, and evidence count instead of minting a task run whose objective is the literal word "continue".
-- [ ] **7.2** Commit: `fix(orchestration): failed runs with evidence pause the task run for continuation (F9)`.
+- [x] **7.2** Commit: `fix(orchestration): failed runs with evidence pause the task run for continuation (F9)`.
 
 ---
 

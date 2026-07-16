@@ -125,8 +125,13 @@ export function resolveTaskRunTurn(
 
 export function assessTaskRunAcceptance(input: TaskRunAcceptanceInput): TaskRunAcceptanceResult {
   const answer = input.answer.trim();
+  // F9: a failed/empty turn that still gathered evidence must *pause* so
+  // "continue…" resumes the real objective/workspace/depth instead of minting
+  // a new task run whose objective is the literal word "continue".
   if (input.pipelineOutcome === "failed" || !answer) {
-    return { accepted: false, status: "failed", reason: "pipeline_failed_or_empty" };
+    return input.evidenceCount > 0
+      ? { accepted: false, status: "paused", reason: "pipeline_failed_with_evidence" }
+      : { accepted: false, status: "failed", reason: "pipeline_failed_or_empty" };
   }
   if (input.pipelineOutcome === "partial") {
     return { accepted: false, status: "paused", reason: "pipeline_partial" };

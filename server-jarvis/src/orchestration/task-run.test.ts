@@ -64,6 +64,64 @@ describe("durable task-run contract", () => {
     expect(result.reason).toContain("incomplete");
   });
 
+  // F9: failed-with-evidence pauses so continuation inherits the real objective.
+  test("pipeline failed with evidence pauses the task run for continuation", () => {
+    const result = assessTaskRunAcceptance({
+      requirement: "workspace_read",
+      depth: "deep",
+      pipelineOutcome: "failed",
+      answer: "",
+      evidenceCount: 2,
+    });
+
+    expect(result.accepted).toBe(false);
+    expect(result.status).toBe("paused");
+    expect(result.reason).toBe("pipeline_failed_with_evidence");
+  });
+
+  test("pipeline failed with zero evidence still terminates as failed", () => {
+    const result = assessTaskRunAcceptance({
+      requirement: "workspace_read",
+      depth: "deep",
+      pipelineOutcome: "failed",
+      answer: "",
+      evidenceCount: 0,
+    });
+
+    expect(result.accepted).toBe(false);
+    expect(result.status).toBe("failed");
+    expect(result.reason).toBe("pipeline_failed_or_empty");
+  });
+
+  test("continue after paused failure inherits the original objective (F9)", () => {
+    const original = createTaskRun({
+      taskRunId: "task_audit_fail",
+      sessionId: "session_1",
+      objective: "Identify all remaining gaps in the repo",
+      workspacePath: "C:\\Projects\\Versutus",
+      requirement: "workspace_read",
+      depth: "deep",
+      estimatedComplexity: "high",
+    });
+    // Simulate acceptance marking the run paused after a failed pipeline with evidence.
+    const paused: typeof original = {
+      ...original,
+      status: "paused",
+      evidenceCount: 2,
+      lastOutcome: "failed",
+    };
+
+    const next = resolveTaskRunTurn(paused, "continue, force deep read", "conversational");
+
+    expect(next.isContinuation).toBe(true);
+    expect(next.contract.taskRunId).toBe(original.taskRunId);
+    expect(next.contract.objective).toBe(original.objective);
+    expect(next.contract.workspacePath).toBe(original.workspacePath);
+    expect(next.contract.depth).toBe("deep");
+    expect(next.contract.requirement).toBe("workspace_read");
+    expect(next.contract.evidenceCount).toBe(2);
+  });
+
   test("deep continuation keeps the deep-read execution contract", () => {
     expect(resolveDeepReadIntent("continue", "deep")).toBe(true);
     expect(resolveDeepReadIntent("continue", "standard")).toBe(false);
