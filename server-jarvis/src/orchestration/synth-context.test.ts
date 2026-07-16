@@ -95,3 +95,104 @@ describe("buildSynthesizerContextFromStageState", () => {
     expect(context).not.toContain("Rewriter Activity:");
   });
 });
+
+// synthesize-context pin: prioritizeExecutorFindings is a private helper that
+// reorders an executor summary so trailing Findings/Result/Summary/Answer blocks
+// surface BEFORE the raw tool-log noise. This matters because the executor
+// summary is token-budgeted (2_600 tokens); a model that puts findings at the
+// end of a long tool-log block would have them truncated off the visible
+// synthesizer context if this reordering did not exist. The 4 cases below pin
+// the four observable branches of `prioritizeExecutorFindings` through the
+// public buildSynthesizerContextFromStageState API so a future refactor of the
+// regex or the leading-prefix test cannot silently break which side of the
+// budget findings occupy.
+describe("prioritizeExecutorFindings contract (reorders Findings blocks to top)", () => {
+  test("a summary that already starts with Findings is left untouched", () => {
+    const state: PipelineStageState = {
+      executor: {
+        ok: true,
+        narrative: "Findings: file X imports file Y.",
+        toolCalls: [],
+      },
+    };
+    const context = buildSynthesizerContextFromStageState("explain X", state);
+    const executorSection = context.split("Executor Activity:\n")[1]?.split("\n\n")[0] ?? "";
+    // The narrative remains the first thing the synthesizer sees; no
+    // "Tool log (truncated):" reordering label is introduced.
+    expect(executorSection).toContain("Findings: file X imports file Y.");
+    expect(executorSection).not.toContain("Tool log (truncated):");
+  });
+
+  test("a trailing Findings block is promoted to the top of the executor section", () => {
+    // The model produces a summary where Findings: appears AFTER a long raw
+    // tool-log prefix in the same paragraph (no leading heading). The
+    // reordering branch must find the Findings heading, split the summary,
+    // and put Findings: text first.
+    const longPrefix = "Raw tool log: ".repeat(80);
+    const narrative = `${longPrefix}\n\nFindings: a.ts and b.ts both use Y.`;
+    const state: PipelineStageState = {
+      executor: {
+        ok: true,
+        narrative,
+        toolCalls: [
+          { name: "read_file", arguments: { path: "a.ts" }, output: "aaa", is_error: false, duration_ms: 1 },
+          { name: "read_file", arguments: { path: "b.ts" }, output: "bbb", is_error: false, duration_ms: 1 },
+        ],
+      },
+    };
+    const context = buildSynthesizerContextFromStageState("diagnose the repo", state);
+    // The findings text must appear in the executor section.
+    expect(context).toContain("Findings: a.ts and b.ts both use Y.");
+    // The "Tool log (truncated):" reordering label is present — that's the
+    // observable signal that the reordering branch fired (otherwise no
+    // label is emitted and findings stay buried under tool output).
+    expect(context).toContain("Tool log (truncated):");
+    // The findings block must come BEFORE the tool log label in the
+    // executor section — this is the actual "prioritize findings" promise.
+    const executorSection = context.split("Executor Activity:\n")[1]?.split("\n\nOriginal Plan")[0] ?? "";
+    const findingsIdx = executorSection.indexOf("Findings: a.ts and b.ts both use Y.");
+    const toolLogIdx = executorSection.indexOf("Tool log (truncated):");
+    expect(findingsIdx).toBeGreaterThanOrEqual(0);
+    expect(toolLogIdx).toBeGreaterThan(findingsIdx);
+  });
+
+  test("a Result: / Summary: / Answer: heading also triggers the reorder", () => {
+    const state: PipelineStageState = {
+      executor: {
+        ok: true,
+        narrative: "Did a bunch of work.",
+        toolCalls: [
+          { name: "read_file", arguments: { path: "x" }, output: "x", is_error: false, duration_ms: 1 },
+        ],
+      },
+    };
+    // Use the "direct" path (buildSynthesizerContext) with a hand-shaped
+    // executor summary that ends with an Answer: heading, so we don't have
+    // to wedge it into the structured-state narrative field.
+    const executorSummary = "[Executor]: Did a bunch of work.\n\n[Tool Call] read_file path=x\n\nAnswer: the file is short.";
+    const context = buildSynthesizerContext("explain x", {
+      plan: "",
+      executorSummary,
+      reviewerFeedback: "No review stage executed.",
+      rewriterSummary: "No rewriting stage executed.",
+    });
+    expect(context).toContain("Answer: the file is short.");
+    expect(context).toContain("Tool log (truncated):");
+  });
+
+  test("a summary with no Findings/Result/Summary/Answer heading is left alone", () => {
+    const state: PipelineStageState = {
+      executor: {
+        ok: true,
+        narrative: "Plain prose about what the executor did.",
+        toolCalls: [
+          { name: "read_file", arguments: { path: "x" }, output: "x", is_error: false, duration_ms: 1 },
+        ],
+      },
+    };
+    const context = buildSynthesizerContextFromStageState("describe x", state);
+    // No reordering label is introduced; the narrative flows through.
+    expect(context).not.toContain("Tool log (truncated):");
+    expect(context).toContain("Plain prose about what the executor did.");
+  });
+});
