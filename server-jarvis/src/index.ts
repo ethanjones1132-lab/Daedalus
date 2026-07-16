@@ -1922,7 +1922,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const reasoningParser = new ReasoningParser(sessionId);
           const decoder = new TextDecoder();
           let buffer = "";
+          // Raw text is retained for text-tool extraction and final
+          // reasoning stripping. Visible text is tracked separately because
+          // providers may deliver hidden <think> content through the same
+          // content field before ReasoningParser classifies it.
           let fullTurnText = "";
+          let visibleTurnText = "";
           let activeToolCalls: any[] = [];
           let firstTokenReceived = false;
           let firstTokenLatencyMs: number | undefined;
@@ -2018,7 +2023,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let finalGraceTimer: ReturnType<typeof setTimeout> | null = null;
           const turnDeadlineTimer = setTimeout(() => {
             if (streamAbort.signal.aborted) return;
-            if (shouldArmFinalGrace({ isFinalAnswerStream, visibleChars: fullTurnText.length })) {
+            if (shouldArmFinalGrace({ isFinalAnswerStream, visibleChars: visibleTurnText.length })) {
               // Soft deadline: keep streaming under the grace window.
               const graceMs = Math.max(0, turnBudget.finalStreamDeadlineAt() - Date.now());
               console.warn(
@@ -2067,6 +2072,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             } else if (!callOptions?.suppressActivity) {
               await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "agent_activity", stage: callOptions?.stageLabel ?? "agent", text, session_id: sessionId })}\n\n`));
             }
+          };
+          const emitVisibleChunk = async (text: string) => {
+            if (!text) return;
+            visibleTurnText += text;
+            callOptions?.onChunk?.(text);
+            await emitTextToken(text);
           };
 
           try {
@@ -2167,10 +2178,6 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                       console.warn(`[Jarvis Orchestrator] degenerate stream detected model=${actualModelUsed} stage=${stageName} — cancelling reader`);
                       cancelReader("Degenerate stream detected").catch(() => {});
                     }
-                    if (callOptions?.onChunk) {
-                      callOptions.onChunk(chunkText);
-                    }
-
                     if (reasoningParser) {
                       for (const re of reasoningParser.processChunk(chunkText)) {
                         const visibleText = visibleTextFromReasoningEvent(re);
@@ -2187,7 +2194,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                           markVisibleProgress();
                           const sanitized = textStreamSanitizer.push(visibleText);
                           if (sanitized) {
-                            await emitTextToken(sanitized);
+                            await emitVisibleChunk(sanitized);
                           }
                         }
                       }
@@ -2195,7 +2202,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                       markVisibleProgress();
                       const sanitized = textStreamSanitizer.push(chunkText);
                       if (sanitized) {
-                        await emitTextToken(sanitized);
+                        await emitVisibleChunk(sanitized);
                       }
                     }
                   }
@@ -2225,7 +2232,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               } else {
                 const sanitized = textStreamSanitizer.push(visibleText);
                 if (sanitized) {
-                  await emitTextToken(sanitized);
+                  await emitVisibleChunk(sanitized);
                 }
               }
             }
@@ -2237,7 +2244,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
           const remaining = textStreamSanitizer.flush();
           if (remaining) {
-            await emitTextToken(remaining);
+            await emitVisibleChunk(remaining);
           }
 
           // Normalize the stream-assembled tool-call slots into a dispatchable
