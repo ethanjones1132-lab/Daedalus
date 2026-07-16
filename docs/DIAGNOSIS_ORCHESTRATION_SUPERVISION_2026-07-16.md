@@ -103,3 +103,16 @@ Implementation plan: `docs/superpowers/plans/2026-07-16-supervision-starvation-r
 | F10 telemetry gaps | `first_token_ms` fallback, no empty reward, deep-read smoke | `conductor-learning.test.ts` F10; `scripts/smoke-jarvis-runtime.ps1 -DeepReadSmoke` |
 
 **Still open (operator):** Phase 9.2 deploy (`build-and-deploy.ps1` / Desktop `index.js` + `prompts/`) and Phase 9.3 live-fire SQL against `~/.openclaw/jarvis/self-tuning.db` after replaying Versutus gap-analysis / `continue` / `force deep read`.
+
+---
+
+## Addendum — post-remediation incident, same day (session f458849c, ~12:10 EDT)
+
+With all plan phases deployed (build 4942f0e), three consecutive turns still shipped "produced no output". Forensics showed a **new** failure class, not a plan regression: provider fetches hanging 47–74s **before HTTP response headers** (deepseek-v4-flash on large late-turn contexts), where the cascade's first-token watchdog never arms. The stalls consumed the planner stage window, the executor's turn remainder, and the synthesizer outright; one fallback attempt later the stage gave up `empty_completion` with ~78s of budget left.
+
+Fixed same day (commits f1d028b…dcd8a74, deployed + `/health`-verified):
+1. **Headers leash** — pre-header fetch phase raced against the per-provider first-token window; timeout advances the cascade (regression test in `openrouter-fallback.test.ts`).
+2. **Evidence-digest salvage** — `composeEvidenceFallbackAnswer` ships a deterministic digest of gathered reads/listings/reviewer notes whenever the synthesizer ends empty or dies at a deadline.
+3. **Wider final-answer cascade** — `surfaceAsAnswer` stages walk up to 3 empty-advance candidates while ≥15s remains; stall attempts recorded as `first_token_timeout`; no-output notice is cause-aware.
+
+Live-fire replay of the exact failing prompt: `success`, 187s — reviewer flash stall cost a 2.5s fallback (previously ~50s), synthesizer flash stall advanced to nemotron (1,676-token answer). Remaining watch item: flash's stall rate is now visible to stage-health/scorecard (`ftt=null` rows); if it persists, demote it from the synthesizer default.
