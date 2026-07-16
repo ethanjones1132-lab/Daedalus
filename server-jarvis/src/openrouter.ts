@@ -12,7 +12,7 @@ import {
   providerHeaders,
   type HttpProviderId,
 } from "./providers";
-import { isTemporarilyExcluded, recordHardFailure, recordSuccess } from "./model-failure-memory";
+import { isTemporarilyExcluded, recordHardFailure, recordStall, recordSuccess } from "./model-failure-memory";
 import { backendForProvider, recordInferenceAttempt } from "./inference-metrics";
 import { TurnDeadlineExceededError } from "./stream-liveness";
 
@@ -890,6 +890,7 @@ export async function chatCompletionWithFallback(
           attemptCtrl.abort(HEADERS_STALL_REASON);
           lastError = `Model ${model} (${provider}) returned no HTTP response headers within ${firstTokenTimeoutMs}ms (headers timeout)`;
           console.warn(`[Fallback] ${lastError} — advancing to next model`);
+          recordStall(provider, model);
           recordInferenceAttempt({
             ts: Date.now(),
             stage: options.stage ?? "agent",
@@ -922,6 +923,7 @@ export async function chatCompletionWithFallback(
             try { await bodyReader.cancel().catch(() => {}); } catch {}
             lastError = `Model ${model} (${provider}) sent no body bytes within ${firstTokenTimeoutMs}ms (first-token timeout)`;
             console.warn(`[Fallback] ${lastError} — advancing to next model`);
+            recordStall(provider, model);
             recordInferenceAttempt({
               ts: Date.now(),
               stage: options.stage ?? "agent",

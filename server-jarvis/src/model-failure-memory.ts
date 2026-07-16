@@ -16,8 +16,16 @@
  *
  * Scope: ONLY non-retryable HTTP failures (4xx other than 429) call
  * `recordHardFailure`. 429s are handled by the existing in-call 2-strike
- * rule in `chatCompletionWithFallback`; transient 5xx retries and
- * first-token stalls are NOT hard failures and must not touch this registry.
+ * rule in `chatCompletionWithFallback`; transient 5xx retries are NOT hard
+ * failures and must not touch that registry.
+ *
+ * First-token stalls get their OWN registry (2026-07-16 evening, session
+ * 10cf071d): the cascade advances past a stalled model within a call, but
+ * nothing survived across turns, so every turn burned its synthesis runway
+ * re-probing the same stalling model (deepseek-v4-flash: 20-40s of dead air
+ * per turn, four turns in a row). Stalls use a shorter cooldown than hard
+ * failures because provider load spikes pass — but while one lasts, the
+ * first attempt of every user-visible stage must not pay for it.
  *
  * This is intentionally a simple in-memory Map, not persisted to disk or the
  * DB — it exists to survive across *turns* within one running process, not
@@ -33,6 +41,12 @@ export const HARD_FAILURE_STRIKE_THRESHOLD = 2;
 /** How long a key stays excluded once it crosses the strike threshold. */
 export const HARD_FAILURE_COOLDOWN_MS = 10 * 60_000;
 
+/** Stall strikes at/above this count make a key eligible for cooldown exclusion. */
+export const STALL_STRIKE_THRESHOLD = 2;
+
+/** Stall cooldown — shorter than hard failures; provider load spikes pass. */
+export const STALL_COOLDOWN_MS = 5 * 60_000;
+
 interface FailureRecord {
   strikes: number;
   /** Timestamp (ms) when the strike count first reached the threshold. */
@@ -40,9 +54,44 @@ interface FailureRecord {
 }
 
 const registry = new Map<string, FailureRecord>();
+const stallRegistry = new Map<string, FailureRecord>();
 
 function keyFor(provider: string, modelId: string): string {
   return `${provider}:${modelId}`;
+}
+
+function recordStrike(
+  target: Map<string, FailureRecord>,
+  key: string,
+  threshold: number,
+  now: number,
+): void {
+  const existing = target.get(key);
+  const strikes = (existing?.strikes ?? 0) + 1;
+  const cooldownStartedAt = strikes >= threshold
+    ? (existing && existing.strikes >= threshold ? existing.cooldownStartedAt : now)
+    : 0;
+  target.set(key, { strikes, cooldownStartedAt });
+}
+
+/**
+ * Shared exclusion check with "one probe attempt after cooldown" semantics —
+ * see the `isTemporarilyExcluded` doc comment below for the full rationale.
+ */
+function isExcludedIn(
+  target: Map<string, FailureRecord>,
+  key: string,
+  threshold: number,
+  cooldownMs: number,
+  now: number,
+): boolean {
+  const record = target.get(key);
+  if (!record) return false;
+  if (record.strikes < threshold) return false;
+  const cooldownElapsed = now - record.cooldownStartedAt >= cooldownMs;
+  if (!cooldownElapsed) return true;
+  target.set(key, { strikes: threshold - 1, cooldownStartedAt: 0 });
+  return false;
 }
 
 /**
@@ -52,13 +101,17 @@ function keyFor(provider: string, modelId: string): string {
  * threshold (not the first strike).
  */
 export function recordHardFailure(provider: string, modelId: string, now: number = Date.now()): void {
-  const key = keyFor(provider, modelId);
-  const existing = registry.get(key);
-  const strikes = (existing?.strikes ?? 0) + 1;
-  const cooldownStartedAt = strikes >= HARD_FAILURE_STRIKE_THRESHOLD
-    ? (existing && existing.strikes >= HARD_FAILURE_STRIKE_THRESHOLD ? existing.cooldownStartedAt : now)
-    : 0;
-  registry.set(key, { strikes, cooldownStartedAt });
+  recordStrike(registry, keyFor(provider, modelId), HARD_FAILURE_STRIKE_THRESHOLD, now);
+}
+
+/**
+ * Record a first-token stall (no HTTP headers or no body bytes within the
+ * leash window). After `STALL_STRIKE_THRESHOLD` strikes the model is
+ * excluded from cascade selection for `STALL_COOLDOWN_MS`, then gets one
+ * probe attempt — same shape as hard failures, separate books.
+ */
+export function recordStall(provider: string, modelId: string, now: number = Date.now()): void {
+  recordStrike(stallRegistry, keyFor(provider, modelId), STALL_STRIKE_THRESHOLD, now);
 }
 
 /**
@@ -68,6 +121,7 @@ export function recordHardFailure(provider: string, modelId: string, now: number
  */
 export function recordSuccess(provider: string, modelId: string): void {
   registry.delete(keyFor(provider, modelId));
+  stallRegistry.delete(keyFor(provider, modelId));
 }
 
 /**
@@ -88,17 +142,15 @@ export function recordSuccess(provider: string, modelId: string): void {
  */
 export function isTemporarilyExcluded(provider: string, modelId: string, now: number = Date.now()): boolean {
   const key = keyFor(provider, modelId);
-  const record = registry.get(key);
-  if (!record) return false;
-  if (record.strikes < HARD_FAILURE_STRIKE_THRESHOLD) return false;
-  const cooldownElapsed = now - record.cooldownStartedAt >= HARD_FAILURE_COOLDOWN_MS;
-  if (!cooldownElapsed) return true;
-  // Cooldown window expired: allow exactly one probe attempt by dropping
-  // strikes just below the threshold. Mutate in place so the next
-  // recordHardFailure (if the probe fails) re-crosses the threshold and
-  // starts a brand new cooldown window at that failure's timestamp.
-  registry.set(key, { strikes: HARD_FAILURE_STRIKE_THRESHOLD - 1, cooldownStartedAt: 0 });
-  return false;
+  // Cooldown window expired (either registry): allow exactly one probe
+  // attempt by dropping strikes just below the threshold (inside
+  // isExcludedIn). The next record* call after a failed probe re-crosses
+  // the threshold and starts a brand new cooldown window at that failure's
+  // timestamp; a successful probe clears the entry via recordSuccess.
+  return (
+    isExcludedIn(registry, key, HARD_FAILURE_STRIKE_THRESHOLD, HARD_FAILURE_COOLDOWN_MS, now) ||
+    isExcludedIn(stallRegistry, key, STALL_STRIKE_THRESHOLD, STALL_COOLDOWN_MS, now)
+  );
 }
 
 /**
@@ -112,10 +164,15 @@ export function excludedModelKeys(now: number = Date.now()): Set<string> {
     if (record.strikes < HARD_FAILURE_STRIKE_THRESHOLD) continue;
     if (now - record.cooldownStartedAt < HARD_FAILURE_COOLDOWN_MS) result.add(key);
   }
+  for (const [key, record] of stallRegistry.entries()) {
+    if (record.strikes < STALL_STRIKE_THRESHOLD) continue;
+    if (now - record.cooldownStartedAt < STALL_COOLDOWN_MS) result.add(key);
+  }
   return result;
 }
 
 /** Test-only: clear all state between tests. */
 export function resetModelFailureMemory(): void {
   registry.clear();
+  stallRegistry.clear();
 }

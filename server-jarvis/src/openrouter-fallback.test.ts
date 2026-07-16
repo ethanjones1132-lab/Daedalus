@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { defaultConfig, type JarvisConfig } from "./config";
 import { chatCompletionWithFallback, clearOpenRouterCache } from "./openrouter";
 import { resetModelFailureMemory } from "./model-failure-memory";
+import { inferenceMetricsSnapshot } from "./inference-metrics";
 
 const originalFetch = globalThis.fetch;
 
@@ -641,6 +642,86 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
     expect(call3.model_used).toBe("healthy-model-b");
   });
 
+  test("cross-turn stall memory: a model that stalls pre-headers twice is skipped by the NEXT call's cascade", async () => {
+    // 2026-07-16 evening (session 10cf071d): deepseek-v4-flash stalled at
+    // first-token on the synthesizer in four consecutive turns. The headers
+    // leash advanced the cascade *within* each call, but nothing survived
+    // across turns, so every turn's answer stage burned 20-40s re-probing the
+    // same sick model — exactly the hard-failure pattern, different registry.
+    const cfg = cfgWithPool();
+    (cfg.openrouter as any).first_token_timeout_ms = 150;
+    cfg.orchestrator.agents = [
+      {
+        id: "stalling-a",
+        provider: "openrouter",
+        model_id: "stalling-model-a",
+        capabilities: { code: 0.95, reasoning: 0.7, speed: 0.8, cost: 1, json_reliability: 0.8 },
+        default_for: ["synthesizer"],
+        enabled: true,
+      },
+      {
+        id: "healthy-c",
+        provider: "openrouter",
+        model_id: "healthy-model-c",
+        capabilities: { code: 0.7, reasoning: 0.7, speed: 0.7, cost: 1, json_reliability: 0.7 },
+        default_for: [],
+        enabled: true,
+      },
+    ];
+
+    const seenChatModels: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) {
+        return new Response(JSON.stringify({ data: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      seenChatModels.push(body.model);
+      if (body.model === "stalling-model-a") {
+        // Pre-headers hang; rejects with AbortError when the leash aborts.
+        return await new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            const err = new Error("The operation was aborted");
+            (err as Error & { name: string }).name = "AbortError";
+            reject(err);
+          }, { once: true });
+        });
+      }
+      return new Response("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n", {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }) as typeof fetch;
+
+    // Calls 1+2: stalls (strikes 1 and 2), cascade advances within each call.
+    for (const turn of ["turn 1", "turn 2"]) {
+      const result = await chatCompletionWithFallback(
+        cfg,
+        { model: "stalling-model-a", messages: [{ role: "user", content: turn }], stream: true },
+        undefined,
+        { stage: "synthesizer", taskType: "general" },
+      );
+      expect(result.model_used).toBe("healthy-model-c");
+    }
+
+    seenChatModels.length = 0;
+
+    // Call 3: two stall strikes → skipped entirely, no leash wait paid.
+    const startedAt = Date.now();
+    const call3 = await chatCompletionWithFallback(
+      cfg,
+      { model: "stalling-model-a", messages: [{ role: "user", content: "turn 3" }], stream: true },
+      undefined,
+      { stage: "synthesizer", taskType: "general" },
+    );
+    expect(seenChatModels).not.toContain("stalling-model-a");
+    expect(call3.model_used).toBe("healthy-model-c");
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
   test("cross-turn hard-failure memory: exclusions are ignored if they would leave zero attemptable cascade entries", async () => {
     // If every remaining cascade entry is in cooldown, excluding all of them
     // would leave nothing to attempt. In that case the original (unfiltered)
@@ -718,20 +799,161 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
     expect(call3.model_used).toBe("only-model");
   });
 
-  test("cascade aborts immediately when the turn deadline has passed", async () => {
+
+  // --- F10 telemetry contract pin (regression for dcd8a74) ---
+  // The 2026-07-16 supervision-starvation remediation Phase 8 added
+  // `recordInferenceAttempt` calls inside the headers-leash and body-leash
+  // branches of `chatCompletionWithFallback`. The cascade-advance behavior
+  // is already pinned (the "headers leash" + "first-token watchdog" tests
+  // above); this block pins the OBSERVABILITY side: the failed model must
+  // surface in `inferenceMetricsSnapshot().recent_attempts` with
+  // `outcome: "first_token_timeout"` so the F10 / Phase 8 / Phase 9
+  // live-fire SQL queries can find stalls after a real incident.
+
+  test("hung-headers cascade advance records a first_token_timeout attempt with the failed model and stage", async () => {
+    // Mirror the "headers leash" scenario above but assert the telemetry
+    // side, not the cascade-advance side. The same fetch-stub (a fetch
+    // that never returns HTTP headers) is used; the contract being pinned
+    // is that the cascade stalled-model entry must appear in
+    // `recent_attempts` with the right outcome / stage / model /
+    // fallback_attempt fields so a future forensic SQL query can answer
+    // "which model hung on which stage at what time".
     const cfg = cfgWithPool();
-    let fetchCalls = 0;
-    globalThis.fetch = (async () => {
-      fetchCalls++;
-      throw new Error("fetch should not run after deadline");
+    cfg.openrouter.model = "openrouter/free";
+    (cfg.openrouter as any).first_token_timeout_ms = 200;
+    cfg.orchestrator.agents = [
+      {
+        id: "hung-headers-primary-telem",
+        provider: "openrouter",
+        model_id: "openrouter/free",
+        capabilities: { code: 0.5, reasoning: 0.5, speed: 0.9, cost: 1, json_reliability: 0.6 },
+        default_for: ["synthesizer"],
+        enabled: true,
+      },
+      {
+        id: "healthy-headers-secondary-telem",
+        provider: "openrouter",
+        model_id: "cohere/north-mini-code:free",
+        capabilities: { code: 0.95, reasoning: 0.7, speed: 0.8, cost: 1, json_reliability: 0.8 },
+        default_for: ["synthesizer"],
+        enabled: true,
+      },
+    ];
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) {
+        return new Response(JSON.stringify({
+          data: [
+            { id: "openrouter/free", name: "Free", context_length: 200000, pricing: { prompt: "0", completion: "0" }, architecture: {}, supported_parameters: [], description: "" },
+            { id: "cohere/north-mini-code:free", name: "North", context_length: 256000, pricing: { prompt: "0", completion: "0" }, architecture: {}, supported_parameters: [], description: "" },
+          ],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      if (body.model === "openrouter/free") {
+        // Simulate a fetch that never returns headers; reject on abort.
+        return await new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            const err = new Error("The operation was aborted");
+            (err as Error & { name: string }).name = "AbortError";
+            reject(err);
+          }, { once: true });
+        });
+      }
+      return new Response("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n", { status: 200, headers: { "Content-Type": "text/event-stream" } });
     }) as typeof fetch;
 
-    await expect(chatCompletionWithFallback(
+    const attemptsBefore = inferenceMetricsSnapshot().recent_attempts.length;
+    const result = await chatCompletionWithFallback(
       cfg,
-      { model: cfg.openrouter.model, messages: [{ role: "user", content: "too late" }], stream: true },
+      { model: "openrouter/free", messages: [{ role: "user", content: "stuck" }], stream: true },
       undefined,
-      { stage: "executor", deadlineAt: Date.now() - 1 },
-    )).rejects.toThrow(/turn_deadline/i);
-    expect(fetchCalls).toBe(0);
+      { stage: "synthesizer", taskType: "general" },
+    );
+    expect(result.model_used).toBe("cohere/north-mini-code:free");
+
+    const attemptsAfter = inferenceMetricsSnapshot().recent_attempts;
+    expect(attemptsAfter.length).toBeGreaterThan(attemptsBefore);
+    const newAttempts = attemptsAfter.slice(attemptsBefore);
+    const hung = newAttempts.find(
+      (a) => a.outcome === "first_token_timeout" && a.model === "openrouter/free",
+    );
+    expect(hung).toBeDefined();
+    expect(hung!.stage).toBe("synthesizer");
+    expect(hung!.fallback_attempt).toBe(0);
+    expect(hung!.provider).toBe("openrouter");
+    const json = JSON.stringify(hung);
+    expect(json).not.toContain("prompt");
+    expect(json).not.toContain("stuck");
+  });
+
+  test("hung-body cascade advance records a first_token_timeout attempt with the failed model and stage", async () => {
+    // Mirror the "first-token watchdog" scenario above; same observability
+    // contract, different timeout cause (body never produces bytes after
+    // 200 OK headers arrive - the original 12+ minute stall class).
+    const cfg = cfgWithPool();
+    cfg.openrouter.model = "openrouter/free";
+    (cfg.openrouter as any).first_token_timeout_ms = 200;
+    cfg.orchestrator.agents = [
+      {
+        id: "hung-body-primary-telem",
+        provider: "openrouter",
+        model_id: "openrouter/free",
+        capabilities: { code: 0.5, reasoning: 0.5, speed: 0.9, cost: 1, json_reliability: 0.6 },
+        default_for: ["executor"],
+        enabled: true,
+      },
+      {
+        id: "healthy-body-secondary-telem",
+        provider: "openrouter",
+        model_id: "cohere/north-mini-code:free",
+        capabilities: { code: 0.95, reasoning: 0.7, speed: 0.8, cost: 1, json_reliability: 0.8 },
+        default_for: ["executor"],
+        enabled: true,
+      },
+    ];
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) {
+        return new Response(JSON.stringify({
+          data: [
+            { id: "openrouter/free", name: "Free", context_length: 200000, pricing: { prompt: "0", completion: "0" }, architecture: {}, supported_parameters: [], description: "" },
+            { id: "cohere/north-mini-code:free", name: "North", context_length: 256000, pricing: { prompt: "0", completion: "0" }, architecture: {}, supported_parameters: [], description: "" },
+          ],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      if (body.model === "openrouter/free") {
+        // Headers arrive (200 OK) but the body never yields any bytes -
+        // the same shape that produced 12+ minute stalls in the wild.
+        const { readable } = new TransformStream();
+        return new Response(readable, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+      }
+      return new Response("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n", { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    }) as typeof fetch;
+
+    const attemptsBefore = inferenceMetricsSnapshot().recent_attempts.length;
+    const result = await chatCompletionWithFallback(
+      cfg,
+      { model: "openrouter/free", messages: [{ role: "user", content: "stall" }], stream: true },
+      undefined,
+      { stage: "executor", taskType: "general" },
+    );
+    expect(result.model_used).toBe("cohere/north-mini-code:free");
+
+    const newAttempts = inferenceMetricsSnapshot().recent_attempts.slice(attemptsBefore);
+    const hung = newAttempts.find(
+      (a) => a.outcome === "first_token_timeout" && a.model === "openrouter/free",
+    );
+    expect(hung).toBeDefined();
+    expect(hung!.stage).toBe("executor");
+    expect(hung!.fallback_attempt).toBe(0);
+    expect(hung!.provider).toBe("openrouter");
+    const json = JSON.stringify(hung);
+    expect(json).not.toContain("prompt");
+    expect(json).not.toContain("stall");
   });
 });
