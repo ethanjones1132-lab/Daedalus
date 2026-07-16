@@ -130,6 +130,32 @@ describe("LiveConductor", () => {
     expect(afterReset.type).toBe("reroute");
   });
 
+  test("current clean evidence does not inherit stale tool errors", async () => {
+    const supervisorMessages: any[][] = [];
+    const { conductor } = makeConductor({}, async (messages) => {
+      supervisorMessages.push(messages);
+      return { content: '{"directive":"continue"}' };
+    });
+    conductor.setContext("general", "high", "run-fresh-digest");
+    conductor.onToolResult("executor", "read_file", true, "stale failure");
+
+    await conductor.afterStage("executor", "completed", "current stage", ["synthesizer"], {
+      request: "read the source",
+      toolCalls: [{
+        name: "read_file",
+        arguments: { path: "src/a.ts" },
+        output: "ok",
+        is_error: false,
+        duration_ms: 1,
+      }],
+    });
+
+    const userContent = supervisorMessages[0][1].content;
+    expect(userContent).toContain("Tool error count: 0");
+    expect(userContent).toContain("Recent tool errors: none");
+    expect(userContent).not.toContain("stale failure");
+  });
+
   test("actively supervises a healthy medium/high-complexity stage when work remains", async () => {
     let modelCalled = false;
     const { conductor } = makeConductor({}, async () => {

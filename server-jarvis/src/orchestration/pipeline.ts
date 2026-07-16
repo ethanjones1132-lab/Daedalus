@@ -1089,20 +1089,6 @@ export class PipelineExecutor {
         intentText,
         this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd(),
       );
-      if (requiresWorkspaceEvidence && !finalAssessment.sufficient) {
-        const failure = evidenceFailure(finalAssessment);
-        onStateChange({ stage: "executor", status: "failed", output: failure.message });
-        await this.afterConductorStage(
-          "executor",
-          "completed",
-          narrative || failure.message,
-          agentRunId,
-          options,
-          remainingQueue,
-          executorEvidence(),
-        );
-        return { ok: false, narrative: failure.message, toolCalls };
-      }
       if (!executorDone) {
         const message =
           `Executor reached its ${maxTurns}-turn tool-call limit while work was still in progress. ` +
@@ -1130,6 +1116,20 @@ export class PipelineExecutor {
           terminalStatus: "partial",
           errorCode: "executor_turn_limit",
         };
+      }
+      if (requiresWorkspaceEvidence && !finalAssessment.sufficient) {
+        const failure = evidenceFailure(finalAssessment);
+        onStateChange({ stage: "executor", status: "failed", output: failure.message });
+        await this.afterConductorStage(
+          "executor",
+          "completed",
+          narrative || failure.message,
+          agentRunId,
+          options,
+          remainingQueue,
+          executorEvidence(),
+        );
+        return { ok: false, narrative: failure.message, toolCalls };
       }
       onStateChange({ stage: "executor", status: "completed", output: narrative });
       await this.afterConductorStage("executor", "completed", narrative, agentRunId, options, remainingQueue, executorEvidence());

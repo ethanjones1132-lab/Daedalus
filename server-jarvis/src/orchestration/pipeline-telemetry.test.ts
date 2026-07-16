@@ -3,6 +3,9 @@ import { defaultConfig } from "../config";
 import { createToolRuntime, makeExecutionContext } from "../tool-runtime";
 import type { StageRun } from "../self-tuning/store";
 import { PipelineExecutor, type StageRunRecorder } from "./pipeline";
+import { LiveConductor } from "./conductor";
+import { ConductorBus } from "./conductor-bus";
+import { AgentPool, DEFAULT_ORCHESTRATOR_AGENTS } from "./agent-pool";
 import { TurnDeadlineExceededError } from "../stream-liveness";
 import { DEEP_READ_MIN_CONTENT_READS } from "./evidence-sufficiency";
 
@@ -179,6 +182,64 @@ describe("pipeline stage telemetry", () => {
     expect(segment.fatalErrorCode).toBe("missing_workspace_evidence");
     expect(segment.replanRequested?.trigger).toBe("evidence_insufficient");
     expect(rows.some((row) => row.mode_id === "synthesizer")).toBe(false);
+  });
+
+  test("pipeline applies one deterministic executor re-entry before the evidence replan", async () => {
+    const collector: StageRunRecorder = { recordStageRun: () => {} };
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    let executorCalls = 0;
+    let supervisorCalls = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") {
+        executorCalls++;
+        return { content: "I can infer the architecture without reading.", tool_calls: [] };
+      }
+      return { content: "unexpected" };
+    };
+    const bus = new ConductorBus();
+    const conductor = new LiveConductor(
+      callModel as any,
+      bus,
+      new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS),
+      {
+        supervision_timeout_ms: 5_000,
+        max_tool_errors_before_reroute: 2,
+        supervise_low_complexity: false,
+      },
+      async () => {
+        supervisorCalls++;
+        return { content: '{"directive":"continue"}' };
+      },
+    );
+    conductor.setContext("general", "high", "run-pipeline-evidence-reroute");
+    const directives: string[] = [];
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, {
+      bus,
+      live: conductor,
+      collector,
+    });
+
+    const segment = await executor.executeSegment(
+      "comprehensively audit this repo",
+      ["executor", "synthesizer"],
+      "run-pipeline-evidence-reroute",
+      () => {},
+      {
+        executionProfile: "full",
+        turnRequirement: "full_execution",
+        rawMessage: "comprehensively audit this repo",
+        allowMidRunReplan: true,
+        onDirective: (directive, stage) => {
+          directives.push(`${stage}:${directive.type}`);
+        },
+      },
+    );
+
+    expect(executorCalls).toBeGreaterThanOrEqual(2);
+    expect(directives.filter((entry) => entry === "executor:reroute")).toHaveLength(1);
+    expect(supervisorCalls).toBe(1);
+    expect(segment.replanRequested?.trigger).toBe("evidence_insufficient");
   });
 
   test("workspace evidence nudge is bounded to two and the second requires new evidence", async () => {
