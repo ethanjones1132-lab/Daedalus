@@ -1753,7 +1753,9 @@ export class PipelineExecutor {
         had_error: 1,
         error_message: message,
         stop_reason: deadlineStopReason,
-        partial_error_code: hasPartialDeadlineAnswer ? "stage_timeout" : null,
+        partial_error_code: deadlineStopReason === "turn_deadline"
+          ? "turn_deadline"
+          : (hasPartialDeadlineAnswer ? "stage_timeout" : null),
       });
       // `answer` must never carry the raw failure text — 20 historical runs
       // (pre-2026-07-04) shipped "Synthesis failed: ..." as the literal chat
@@ -1762,6 +1764,13 @@ export class PipelineExecutor {
       // index.ts's error branch turns into an SSE error frame instead of
       // prose (see `if (result.error) ... session.finish(result.error, {
       // isError: true })`).
+      if (deadlineStopReason === "turn_deadline") {
+        return {
+          answer: hasPartialDeadlineAnswer ? streamedAnswer : "",
+          emptyCompletion: false,
+          partialErrorCode: "turn_deadline",
+        };
+      }
       if (hasPartialDeadlineAnswer) {
         return { answer: streamedAnswer, emptyCompletion: false, partialErrorCode: "stage_timeout" };
       }

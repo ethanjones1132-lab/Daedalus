@@ -114,6 +114,14 @@ export function createIdempotentReaderCancel(reader: CancellableReader): (reason
   };
 }
 
+/** Final-answer grace is earned only by visible user-facing prose. */
+export function shouldArmFinalGrace(options: {
+  isFinalAnswerStream: boolean;
+  visibleChars: number;
+}): boolean {
+  return options.isFinalAnswerStream && options.visibleChars > 0;
+}
+
 export type ReadStopReason =
   | "first_token_timeout"
   | "stream_idle_timeout"

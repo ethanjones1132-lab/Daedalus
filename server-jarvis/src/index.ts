@@ -94,6 +94,7 @@ import {
   createIdempotentReaderCancel,
   registerAbortHandler,
   resolveReadStopReason,
+  shouldArmFinalGrace,
 } from "./stream-control";
 import {
   createStreamFinishTracker,
@@ -2010,12 +2011,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // T1.3: surfaceAsAnswer gets a grace window past deadlineAt so we
           // never hard-chop a streaming final answer mid-word. Non-final
           // stages still abort at deadlineAt. Grace is only armed once first
-          // token is received and soft deadline fires with tokens in flight.
+          // visible answer prose has accumulated and soft deadline fires with
+          // tokens in flight. Hidden reasoning keeps transport watchdogs alive
+          // but must not buy final-answer grace by itself.
           const isFinalAnswerStream = callOptions?.surfaceAsAnswer === true;
           let finalGraceTimer: ReturnType<typeof setTimeout> | null = null;
           const turnDeadlineTimer = setTimeout(() => {
             if (streamAbort.signal.aborted) return;
-            if (isFinalAnswerStream && firstTokenReceived) {
+            if (shouldArmFinalGrace({ isFinalAnswerStream, visibleChars: fullTurnText.length })) {
               // Soft deadline: keep streaming under the grace window.
               const graceMs = Math.max(0, turnBudget.finalStreamDeadlineAt() - Date.now());
               console.warn(

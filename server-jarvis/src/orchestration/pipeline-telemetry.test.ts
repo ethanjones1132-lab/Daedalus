@@ -65,7 +65,7 @@ describe("pipeline stage telemetry", () => {
 
     expect(result.answer).toBe("Partial plan: inspect the runtime first.");
     expect(result.outcome).toBe("partial");
-    expect(result.error_code).toBe("stage_timeout");
+    expect(result.error_code).toBe("turn_deadline");
     expect(result.error).toBeUndefined();
   });
 
