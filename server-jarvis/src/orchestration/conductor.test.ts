@@ -130,6 +130,47 @@ describe("LiveConductor", () => {
     expect(afterReset.type).toBe("reroute");
   });
 
+  test("uses the supplied workspace root when assessing deep-read evidence", async () => {
+    const { conductor } = makeConductor();
+    conductor.setContext("general", "high", "run-root-aware-evidence");
+
+    const directive = await conductor.afterStage(
+      "executor",
+      "completed",
+      "read two files",
+      ["synthesizer"],
+      {
+        request: "comprehensively audit this repo",
+        workspaceRoot: "C:/repo",
+        toolCalls: [
+          {
+            name: "read_file",
+            arguments: { path: "src/a.ts" },
+            output: "a",
+            is_error: false,
+            duration_ms: 1,
+          },
+          {
+            name: "read_file",
+            arguments: { path: "C:/repo/src/b.ts" },
+            output: "b",
+            is_error: false,
+            duration_ms: 1,
+          },
+          {
+            name: "read_file",
+            arguments: { path: "src/c.ts" },
+            output: "c",
+            is_error: false,
+            duration_ms: 1,
+          },
+        ],
+      },
+    );
+
+    expect(directive).toEqual({ type: "continue" });
+  });
+
   test("current clean evidence does not inherit stale tool errors", async () => {
     const supervisorMessages: any[][] = [];
     const { conductor } = makeConductor({}, async (messages) => {

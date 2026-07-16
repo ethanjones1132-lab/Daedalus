@@ -27,7 +27,7 @@ import { isDuplicateToolDeflection, type ToolCallRecord } from "./stage-output";
 import { hasWorkspaceSignal, hasWriteIntent, type TurnRequirement } from "./turn-requirements";
 
 const DEEP_READ_MARKERS =
-  /\b(comprehensiv\w*|thorough\w*|entire|whole|all files|full|in[- ]depth|architecture|architectural|audit|diagnos\w*|repo|repository|codebase)\b/i;
+  /\b(comprehensiv\w*|thorough\w*|entire|whole|all files|full|in[- ]depth|deep\s+reads?|architecture|architectural|audit|diagnos\w*|repo|repository|codebase)\b/i;
 /** Genuine file-content tools — the only ones that count toward the deep-read floor. */
 const DEEP_READ_CONTENT_TOOLS = new Set(["read_file", "grep"]);
 const SOURCE_FILE_EXTENSIONS = new Set([

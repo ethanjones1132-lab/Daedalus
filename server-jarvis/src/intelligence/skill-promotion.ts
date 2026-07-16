@@ -5,14 +5,42 @@ import { judgeAnswer, type JudgeVerdict } from "../eval/judge";
 import type { CallModelFn } from "../orchestration/coordinator";
 import { SelfTuningStore, type TrajectorySnapshot } from "../self-tuning/store";
 
+/**
+ * Body-length sweet spot for a distilled skill.
+ *
+ * 2026-07-15 cron observation: in 197 production-distilled candidates the
+ * 400-char floor was rejecting 89 candidates whose bodies were 157-391
+ * chars — all from legitimate short user requests (median 225, p90 305).
+ * The body template is ~110 chars on its own, so 400 over-fitted to the
+ * original "must have substantial guidance" intent. 150 is the smallest
+ * floor that still keeps a blank template from clearing the gate.
+ */
+export const MIN_DISTILLED_BODY_LENGTH = 150;
+/** Above 4000 chars the body is almost certainly copying the full conversation
+ * history into the skill, which makes it brittle and unfocused. */
+export const MAX_DISTILLED_BODY_LENGTH = 4000;
+
+/** Marker that separates the distiller's "guidance" section from the verbatim
+ * user request. Only suspicious paths appearing BEFORE this marker are counted
+ * as evidence the model invented paths in its own guidance. Paths inside the
+ * request context are by definition the user's, not the model's. */
+const REQUEST_CONTEXT_MARKER = "## Request context (abbreviated)";
+
+/** Return the part of the body that the model authored (everything before
+ * the request-context marker). Empty string if the marker is missing. */
+function bodyGuidanceSection(body: string): string {
+  const idx = body.indexOf(REQUEST_CONTEXT_MARKER);
+  return idx === -1 ? body : body.slice(0, idx);
+}
+
 /** Deterministic eval proxy until live replay harness covers distilled skills. */
 export function scoreSkillCandidate(candidate: SkillCandidate): number {
   let score = candidate.confidence;
   if (candidate.body.includes("## Conductor worker guidance")) score += 0.05;
   if (candidate.trigger.signals.length >= 2) score += 0.03;
-  if (candidate.body.length > 400 && candidate.body.length < 4000) score += 0.02;
+  if (candidate.body.length > MIN_DISTILLED_BODY_LENGTH && candidate.body.length < MAX_DISTILLED_BODY_LENGTH) score += 0.02;
   // Penalize likely hallucinated absolute paths not grounded in source runs.
-  const suspiciousPaths = (candidate.body.match(/\b[A-Z]:\\|\b\/etc\/|\b\/usr\//g) ?? []).length;
+  const suspiciousPaths = (bodyGuidanceSection(candidate.body).match(/\b[A-Z]:\\|\b\/etc\/|\b\/usr\//g) ?? []).length;
   if (suspiciousPaths > 2) score -= 0.15;
   return Math.max(0, Math.min(1, score));
 }
@@ -68,23 +96,30 @@ export function evaluateSkillPromotion(
       detail: "trigger has no signals — would match every turn, unsafe to promote",
     };
   }
-  if (candidate.body.length <= 400 || candidate.body.length >= 4000) {
+  if (candidate.body.length <= MIN_DISTILLED_BODY_LENGTH || candidate.body.length >= MAX_DISTILLED_BODY_LENGTH) {
     return {
       promote: false,
       score: scoreSkillCandidate(candidate),
       baseline: 0.5,
       reason: "body_length_out_of_range",
-      detail: `body length ${candidate.body.length} outside 400..4000 sweet spot`,
+      detail: `body length ${candidate.body.length} outside ${MIN_DISTILLED_BODY_LENGTH}..${MAX_DISTILLED_BODY_LENGTH} sweet spot`,
     };
   }
-  const suspiciousPaths = (candidate.body.match(/\b[A-Z]:\\|\b\/etc\/|\b\/usr\//g) ?? []).length;
+  // 2026-07-15 cron fix: only count suspicious paths in the model-authored
+  // "guidance" section. Paths in the user request (everything after the
+  // request-context marker) are legitimate by definition — the model
+  // can't have hallucinated them, the user typed them. Before this fix
+  // the check was rejecting 15 real candidates whose user request
+  // legitimately contained 3+ project paths (median body 1341, p90 2370).
+  const guidanceSection = bodyGuidanceSection(candidate.body);
+  const suspiciousPaths = (guidanceSection.match(/\b[A-Z]:\\|\b\/etc\/|\b\/usr\//g) ?? []).length;
   if (suspiciousPaths > 2) {
     return {
       promote: false,
       score: scoreSkillCandidate(candidate),
       baseline: 0.5,
       reason: "suspicious_paths",
-      detail: `${suspiciousPaths} absolute/rooted paths in body — likely hallucinated`,
+      detail: `${suspiciousPaths} absolute/rooted paths in body guidance — likely hallucinated`,
     };
   }
   const score = scoreSkillCandidate(candidate);

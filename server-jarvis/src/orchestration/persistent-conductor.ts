@@ -95,6 +95,7 @@ let cachedTargetKey = "";
 let cachedTargetAt = 0;
 const TARGET_CACHE_TTL_MS = 10_000;
 const TARGET_RUNTIME_FAILURE_TTL_MS = 5 * 60_000;
+const RUNTIME_HEALTH_FAILURE_TTL_MS = 30_000;
 const runtimeFailedTargets = new Map<string, number>();
 
 /** F7: warm routing must fail fast before API fallback takes over. */
@@ -229,6 +230,8 @@ export class PersistentConductor {
   private keepWarmTimer: ReturnType<typeof setInterval> | null = null;
   private keepWarmInFlight: Promise<void> | null = null;
   private lastWarmRenewedAt = 0;
+  private lastRuntimeFailureAt = 0;
+  private lastRuntimeFailureMessage = "";
 
   constructor(
     private getConfig: () => JarvisConfig,
@@ -251,6 +254,7 @@ export class PersistentConductor {
 
   async isAvailable(): Promise<boolean> {
     if (!this.config().enabled) return false;
+    if (this.hasRecentRuntimeFailure()) return false;
     const conductor = this.config();
     for (const model of conductorModelCandidates(conductor)) {
       const health = await checkOllamaHealth({ ...this.ollamaConfig(), model });
@@ -320,7 +324,11 @@ export class PersistentConductor {
         fallback_to_api: conductor.fallback_to_api,
         model: conductor.model,
         fallback_model: conductor.fallback_model,
-        reason: available ? undefined : "ollama_unavailable_or_model_missing",
+        reason: available
+          ? undefined
+          : this.hasRecentRuntimeFailure()
+            ? `recent_runtime_failure: ${this.lastRuntimeFailureMessage}`
+            : "ollama_unavailable_or_model_missing",
       };
     } catch (e) {
       return {
@@ -390,8 +398,10 @@ export class PersistentConductor {
       target = routed.target;
       content = routed.value;
       this.lastWarmRenewedAt = Date.now();
+      this.clearRuntimeFailure();
     } catch (e) {
       ok = false;
+      this.recordRuntimeFailure(e);
       session.messages.pop();
       throw e;
     }
@@ -443,17 +453,24 @@ export class PersistentConductor {
     }
     let target = await this.resolveTarget();
     const startedAt = Date.now();
-    const supervised = await this.withRuntimeFallback(target, (candidate) =>
-      this.callOllamaMessage(candidate, messages, {
-        format: CONDUCTOR_DIRECTIVE_JSON_SCHEMA,
-        numPredict: 160,
-        timeoutMs,
-        temperature: 0.1,
-      }));
+    let supervised: { target: ResolvedConductorTarget; value: OllamaChatMessage };
+    try {
+      supervised = await this.withRuntimeFallback(target, (candidate) =>
+        this.callOllamaMessage(candidate, messages, {
+          format: CONDUCTOR_DIRECTIVE_JSON_SCHEMA,
+          numPredict: 160,
+          timeoutMs,
+          temperature: 0.1,
+        }));
+    } catch (error) {
+      this.recordRuntimeFailure(error);
+      throw error;
+    }
     target = supervised.target;
     const message = supervised.value;
     const content = stripGemmaThinkingArtifacts(message.content ?? "");
     if (!content) throw new PersistentConductorError("Ollama conductor returned empty supervision output");
+    this.clearRuntimeFailure();
     return { content, model: target.model, latencyMs: Date.now() - startedAt };
   }
 
@@ -492,6 +509,7 @@ export class PersistentConductor {
       this.lastWarmRenewedAt = Date.now();
       return { model: target.model, latencyMs: Date.now() - startedAt };
     } catch (error) {
+      this.recordRuntimeFailure(error);
       this.quarantineTarget(target);
       if (error instanceof PersistentConductorError) throw error;
       throw new PersistentConductorError(error instanceof Error ? error.message : String(error));
@@ -703,6 +721,22 @@ export class PersistentConductor {
       cachedTargetKey = "";
       cachedTargetAt = 0;
     }
+  }
+
+  private hasRecentRuntimeFailure(): boolean {
+    return this.lastRuntimeFailureAt > 0
+      && Date.now() - this.lastRuntimeFailureAt < RUNTIME_HEALTH_FAILURE_TTL_MS;
+  }
+
+  private recordRuntimeFailure(error: unknown): void {
+    if (!isAbortOrTimeoutError(error) && !isRetryableRuntimeFailure(error)) return;
+    this.lastRuntimeFailureAt = Date.now();
+    this.lastRuntimeFailureMessage = errorText(error).slice(0, 240);
+  }
+
+  private clearRuntimeFailure(): void {
+    this.lastRuntimeFailureAt = 0;
+    this.lastRuntimeFailureMessage = "";
   }
 
   private async callOllamaMessage(

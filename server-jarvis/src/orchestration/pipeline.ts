@@ -124,6 +124,8 @@ export interface PipelineExecuteOptions {
   estimatedComplexity?: "low" | "medium" | "high";
   /** Trivial short-circuit turns should use the fastest synthesizer tier. */
   preferFastSynthesizer?: boolean;
+  /** Evidence from a previous executor segment being explicitly re-entered. */
+  priorToolCalls?: ToolCallRecord[];
 }
 
 const READ_CACHE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "web_fetch"]);
@@ -154,7 +156,7 @@ export function partitionToolCalls<T extends { name: string }>(calls: T[]): T[][
   return batches;
 }
 
-function duplicateToolCallKey(call: ToolCall): string {
+function duplicateToolCallKey(call: Pick<ToolCall, "name" | "arguments">): string {
   return `${call.name}:${JSON.stringify(call.arguments)}`;
 }
 
@@ -737,8 +739,19 @@ export class PipelineExecutor {
     remainingQueue: StageName[],
   ): Promise<ExecutorStageOutput> {
     onStateChange({ stage: "executor", status: "running" });
-    const toolCalls: ToolCallRecord[] = [];
+    const priorToolCalls = options.priorToolCalls ?? [];
+    const toolCalls: ToolCallRecord[] = [...priorToolCalls];
     const duplicateReadOnlyOutputs = new Map<string, string>();
+    for (const call of priorToolCalls) {
+      if (
+        READ_ONLY_TOOLS.has(call.name) &&
+        !call.is_error &&
+        call.output.trim().length > 0 &&
+        !isDuplicateToolDeflection(call)
+      ) {
+        duplicateReadOnlyOutputs.set(duplicateToolCallKey(call), call.output);
+      }
+    }
     const narratives: string[] = [];
     let turnCount = 0;
     let executorDone = false;
@@ -752,11 +765,29 @@ export class PipelineExecutor {
       toolCalls,
       request: options.rawMessage ?? request,
       workerInstruction: options.workerInstructions?.executor,
+      workspaceRoot: this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd(),
     });
     const executorMessages: ChatMessage[] = [
       { role: "system", content: executorPrompt },
       { role: "user", content: `User Request: ${request}\n\nPlan:\n${planSummary}` }
     ];
+    if (priorToolCalls.length > 0) {
+      const carriedEvidence = truncateToTokenBudget(
+        priorToolCalls
+          .filter((call) => !call.is_error && !isDuplicateToolDeflection(call))
+          .map((call) => `- ${call.name} ${JSON.stringify(call.arguments)}\n${call.output.slice(0, 1200)}`)
+          .join("\n\n"),
+        3_000,
+      );
+      if (carriedEvidence.trim()) {
+        executorMessages.push({
+          role: "user",
+          content:
+            `[Runtime carried evidence] These results came from an earlier executor segment. ` +
+            `Reuse them; do not rediscover the same targets.\n${carriedEvidence}`,
+        });
+      }
+    }
     if (requiresWorkspaceEvidence && deepReadRequest) {
       executorMessages.push({
         role: "user",
@@ -1049,7 +1080,10 @@ export class PipelineExecutor {
           }
 
           const turnToolErrors = toolCalls.slice(turnStartIdx).filter((call) => call.is_error);
-          const missingRequiredEvidence = requiresWorkspaceEvidence && !assessmentAfterTurn.sufficient;
+          // This row represents the model/tool-call turn, not the final
+          // workspace-evidence verdict. A successful read is not a model error
+          // merely because the deep-read floor still needs another file.
+          const turnHadToolError = turnToolErrors.length > 0;
           this.collector.recordStageRun({
             id: `stage_${crypto.randomUUID()}`,
             agent_run_id: agentRunId,
@@ -1059,13 +1093,11 @@ export class PipelineExecutor {
             output_tokens: countTokens(response?.content || ""),
             tool_calls_json: JSON.stringify(response?.tool_calls || []),
             duration_ms: Date.now() - turnStartTime,
-            was_successful: turnToolErrors.length === 0 && !missingRequiredEvidence ? 1 : 0,
-            had_error: turnToolErrors.length === 0 && !missingRequiredEvidence ? 0 : 1,
+            was_successful: turnHadToolError ? 0 : 1,
+            had_error: turnHadToolError ? 1 : 0,
             error_message: turnToolErrors[0]
               ? `${turnToolErrors[0].name}: ${(turnToolErrors[0].output || "").slice(0, 200)}`
-              : missingRequiredEvidence
-                ? "missing_workspace_evidence"
-                : undefined,
+              : undefined,
           });
         } catch (err: any) {
           this.collector.recordStageRun({
@@ -1827,8 +1859,12 @@ export class PipelineExecutor {
         continue;
       }
       if (stage === "executor") {
+        const executorOptions = {
+          ...opts,
+          priorToolCalls: state.executor?.toolCalls ?? opts.priorToolCalls,
+        };
         state.executor = await this.runExecutorStage(
-          request, renderPlanSummary(state.plan), agentRunId, onStateChange, opts, profile, remainingNow(),
+          request, renderPlanSummary(state.plan), agentRunId, onStateChange, executorOptions, profile, remainingNow(),
         );
         // T2.4: hard executor failure (non-workspace_read) → replan pre-synthesizer.
         // workspace_read falls through to the evidence fence for precise codes.

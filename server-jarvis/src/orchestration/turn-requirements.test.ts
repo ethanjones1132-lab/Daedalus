@@ -286,6 +286,13 @@ describe("classifyTurnRequirements", () => {
     expect(classifyTurnRequirements("list the files in this directory").requirement).toBe("workspace_read");
   });
 
+  test("explicit deep-read escape hatch and read_file instructions stay read-only", () => {
+    expect(classifyTurnRequirements("force deep read").requirement).toBe("workspace_read");
+    expect(classifyTurnRequirements(
+      "Perform Phase 1 deep reads by executing read_file on the six files listed above.",
+    ).requirement).toBe("workspace_read");
+  });
+
   test("definitional question with the word 'file' stays answer_only", () => {
     // "a JSON file" is not a workspace reference — must NOT trigger executor.
     expect(classifyTurnRequirements("Explain what a JSON file is").requirement).toBe("answer_only");

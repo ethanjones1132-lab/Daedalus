@@ -263,7 +263,12 @@ export function hasWriteIntent(message: string): boolean {
 
 // Read / inspection verbs: signal the user wants to LOOK AT something.
 const READ_VERB =
-  /\b(read|inspect|list|search|summari[sz]e|summary|overview|analy[sz]e|show|open|view|examine|explore|cat|look|find|grep|describe|audit|review|check|scan|understand|tell\s+me\s+about|walk\s+me\s+through)\b/i;
+  /\b(read(?:s|ing)?|read_file|inspect|list|search|summari[sz]e|summary|overview|analy[sz]e|show|open|view|examine|explore|cat|look|find|grep|describe|audit|review|check|scan|understand|tell\s+me\s+about|walk\s+me\s+through)\b/i;
+
+// The evidence-failure response advertises this phrase as the retry escape
+// hatch. Keep it explicitly read-only, even when the surrounding sentence says
+// "perform" or "execute read_file".
+const DEEP_READ_INTENT = /\b(?:force\s+)?deep\s+reads?\b|\bread_file\b/i;
 
 // STRONG workspace references — these imply the user's project so directly that
 // even without an explicit read verb the turn needs workspace inspection
@@ -316,12 +321,14 @@ export function classifyTurnRequirements(message: string): TurnRequirementResult
   );
   const hasNegatedMutation = negatedMutationMatches.length > 0 || NEGATED_MUTATION_NOUN.test(intentText);
   const hasReadVerb = READ_VERB.test(intentText);
+  const hasDeepReadIntent = DEEP_READ_INTENT.test(intentText);
   const hasStrongWorkspace = STRONG_WORKSPACE.test(intentText);
   const hasWeakWorkspace = WEAK_WORKSPACE.test(intentText);
   const hasWorkStartCommand = WORK_START_COMMAND.test(intentText);
   if (hasNegatedMutation) signals.push("negated_mutation");
   if (hasMutation) signals.push("mutation_verb");
   if (hasReadVerb) signals.push("read_verb");
+  if (hasDeepReadIntent) signals.push("deep_read_intent");
   if (hasStrongWorkspace) signals.push("strong_workspace");
   if (hasWeakWorkspace) signals.push("weak_workspace");
   if (hasWorkStartCommand) signals.push("work_start_command");
@@ -331,6 +338,10 @@ export function classifyTurnRequirements(message: string): TurnRequirementResult
   // remains observable in signals but cannot grant write/command authority.
   if (hasMutation) {
     return { requirement: "full_execution", signals };
+  }
+
+  if (hasDeepReadIntent) {
+    return { requirement: "workspace_read", signals };
   }
 
   if (hasWorkStartCommand) {

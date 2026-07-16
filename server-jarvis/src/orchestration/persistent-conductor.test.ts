@@ -188,6 +188,28 @@ describe("PersistentConductor", () => {
     expect(calls).toEqual(["generate:gemma4:e2b:30m:1"]);
   });
 
+  test("health reports a recent local runtime abort instead of claiming the conductor is available", async () => {
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/ps")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/chat")) throw new DOMException("The local runner aborted", "AbortError");
+      throw new Error(`Unexpected fetch: ${url} ${String(init?.method ?? "")}`);
+    };
+
+    const cfg = makeConfig({ persist_sessions: false });
+    const conductor = new PersistentConductor(() => cfg);
+
+    await expect(conductor.routeTurn({
+      sessionId: "runtime-health-abort",
+      request: "route this turn",
+      turnNumber: 1,
+    })).rejects.toThrow(/aborted|Abort/i);
+
+    expect(await conductor.isAvailable()).toBe(false);
+    expect((await conductor.describeHealth()).reason).toContain("recent_runtime_failure");
+  });
+
   test("keep-warm loop skips a ping when a recent route already renewed warm state", async () => {
     const calls: string[] = [];
     (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {

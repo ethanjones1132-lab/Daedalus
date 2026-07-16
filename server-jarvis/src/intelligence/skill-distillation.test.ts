@@ -931,4 +931,170 @@ describe("skill distillation (Track C)", () => {
       expect(new Date(capturedBeforeStart).getTime()).toBe(expectedStart.getTime());
     });
   });
+
+  // ---- 2026-07-15 cron: body-floor + suspicious-paths refinements ----
+  // Two real production-rejection bugs identified in the F1-F6 plan's
+  // "out of scope" backlog:
+  //  1. 89 candidates rejected with body_length_out_of_range were
+  //     157-391 chars (median 225, p90 305) — the 400 floor over-fitted
+  //     to "must have substantial guidance" and rejected legitimate
+  //     short user requests (e.g. "continue", "ok", "yes"). New floor
+  //     is 150 (any meaningful body is at least the ~110-char template
+  //     + some signal).
+  //  2. 15 candidates rejected with suspicious_paths had 3+ legitimate
+  //     C:\ project paths in their user-request context (the user
+  //     really did name those paths; the model didn't invent them).
+  //     New check only counts paths in the model-authored "guidance"
+  //     section, before the `## Request context (abbreviated)` marker.
+
+  describe("body-length sweet spot (2026-07-15 cron refinement)", () => {
+    function inRangeCandidate(id: string, bodyLen: number): SkillCandidate {
+      return {
+        id, name: `bl-${id}`, description: "x",
+        trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: ["mutation_verb", "read_verb"] },
+        body: "y".repeat(bodyLen),
+        source_run_ids: ["run_bl"], confidence: 0.9, status: "candidate",
+        created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      };
+    }
+
+    test("body of 100 chars (below new floor) is rejected", () => {
+      const v = evaluateSkillPromotion(inRangeCandidate("bl_too_short", 100), {
+        enabled: true, min_confidence: 0.5, promotion_eval_delta: 0.02, max_candidates: 50,
+      });
+      expect(v.promote).toBe(false);
+      expect(v.reason).toBe("body_length_out_of_range");
+      expect(v.detail).toContain("100");
+    });
+
+    test("body of 200 chars (above new floor, below old floor) is no longer rejected", () => {
+      // The 400-char floor used to reject 200-char bodies; the 150-char
+      // floor accepts them. With baseline 0.5 and the +0.02 sweet-spot
+      // bonus, the score is 0.9 + 0.02 = 0.92 → delta 0.42 ≫ 0.02
+      // promotion_eval_delta, so this candidate promotes.
+      const v = evaluateSkillPromotion(inRangeCandidate("bl_now_passes", 200), {
+        enabled: true, min_confidence: 0.5, promotion_eval_delta: 0.02, max_candidates: 50,
+      });
+      expect(v.promote).toBe(true);
+    });
+
+    test("body of 150 chars (exactly at floor) passes", () => {
+      // Boundary: <= 150 rejected, > 150 accepted. 151 is the smallest
+      // body that clears.
+      const v = evaluateSkillPromotion(inRangeCandidate("bl_at_floor", 151), {
+        enabled: true, min_confidence: 0.5, promotion_eval_delta: 0.02, max_candidates: 50,
+      });
+      expect(v.promote).toBe(true);
+    });
+
+    test("body of 150 chars (exactly at floor) is rejected", () => {
+      const v = evaluateSkillPromotion(inRangeCandidate("bl_at_floor_reject", 150), {
+        enabled: true, min_confidence: 0.5, promotion_eval_delta: 0.02, max_candidates: 50,
+      });
+      expect(v.promote).toBe(false);
+      expect(v.reason).toBe("body_length_out_of_range");
+    });
+
+    test("body of 4000 chars (exactly at ceiling) is rejected", () => {
+      const v = evaluateSkillPromotion(inRangeCandidate("bl_at_ceiling", 4000), {
+        enabled: true, min_confidence: 0.5, promotion_eval_delta: 0.02, max_candidates: 50,
+      });
+      expect(v.promote).toBe(false);
+      expect(v.reason).toBe("body_length_out_of_range");
+    });
+
+    test("body of 3999 chars (just under ceiling) is accepted", () => {
+      const v = evaluateSkillPromotion(inRangeCandidate("bl_under_ceiling", 3999), {
+        enabled: true, min_confidence: 0.5, promotion_eval_delta: 0.02, max_candidates: 50,
+      });
+      expect(v.promote).toBe(true);
+    });
+  });
+
+  describe("suspicious-paths: request-context exception (2026-07-15 cron refinement)", () => {
+    // Build a candidate whose body has 3+ C:\ paths in the REQUEST
+    // section (which is verbatim from the user) and zero paths in the
+    // GUIDANCE section. Pre-fix this would be rejected (15 production
+    // cases). Post-fix it must be accepted.
+    function userRequestPathCandidate(id: string, userRequestPaths: string[]): SkillCandidate {
+      const guidance = "## Conductor worker guidance\nReuse the existing project modules where possible.\n";
+      const requestSection = "## Request context (abbreviated)\n" + userRequestPaths.join(" and ");
+      return {
+        id, name: `sp-${id}`, description: "x",
+        trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: ["mutation_verb", "read_verb"] },
+        body: guidance + requestSection,
+        source_run_ids: ["run_sp"], confidence: 0.9, status: "candidate",
+        created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      };
+    }
+
+    test("3+ paths in the user-request context are not flagged as suspicious", () => {
+      // Build paths using String.raw so the runtime value has single
+      // backslashes (matching what the distiller actually emits when a
+      // user mentions a Windows path). 4 such paths in the request
+      // context would be rejected pre-fix; the request-context exception
+      // must accept them.
+      const v = evaluateSkillPromotion(
+        userRequestPathCandidate("sp_user_paths", [
+          String.raw`C:\Projects\Versutus\src\foo.ts`,
+          String.raw`C:\Projects\Versutus\src\bar.ts`,
+          String.raw`C:\Projects\Versutus\src\baz.ts`,
+          String.raw`C:\Projects\Versutus\README.md`,
+        ]),
+        { enabled: true, min_confidence: 0.5, promotion_eval_delta: 0.02, max_candidates: 50 },
+      );
+      expect(v.promote).toBe(true);
+    });
+
+    test("3+ paths in the model-authored guidance are still flagged", () => {
+      // Same body shape, but the absolute paths are in the guidance section
+      // (BEFORE the request-context marker). The model invented these
+      // — they're not from the user — so they should still be flagged.
+      // Construct the body with String.raw to avoid JS backslash
+      // doubling (each \\ in the runtime string needs to be a single
+      // backslash for the C:\ regex to match). Pad the body so it clears
+      // the new 150-char floor — the test is about the suspicious-paths
+      // gate, not the body-length gate.
+      const pathLine = String.raw`Read C:\foo\bar.ts and C:\baz\qux.ts and C:\etc\hosts and C:\windows\system32. `;
+      const guidancePrefix = "## Conductor worker guidance\nRefer to the existing project knowledge base for prior art and conventions. ";
+      const body = guidancePrefix + pathLine + "## Request context (abbreviated)\nok";
+      const c: SkillCandidate = {
+        id: "sp_guided_paths", name: "sp-guided", description: "x",
+        trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: ["mutation_verb", "read_verb"] },
+        body,
+        source_run_ids: ["run_sp"], confidence: 0.9, status: "candidate",
+        created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      };
+      const v = evaluateSkillPromotion(c, {
+        enabled: true, min_confidence: 0.5, promotion_eval_delta: 0.02, max_candidates: 50,
+      });
+      expect(v.promote).toBe(false);
+      expect(v.reason).toBe("suspicious_paths");
+    });
+
+    test("mixed: paths in BOTH sections are still flagged if guidance has >2", () => {
+      // Two paths in guidance + several in request — guidance is the
+      // model-authored part, so it must be the binding constraint.
+      // Construct paths with String.raw so the runtime value has
+      // single backslashes (the regex anchors on C:\ exactly). Pad
+      // the body so it clears the 150-char floor.
+      const pathA = String.raw`C:\foo\a.ts`;
+      const pathB = String.raw`C:\foo\b.ts`;
+      const pathC = String.raw`C:\foo\c.ts`;
+      const pathD = String.raw`C:\foo\d.ts`;
+      const guidancePrefix = "## Conductor worker guidance\nRefer to the existing project knowledge base for prior art and conventions. ";
+      const body = guidancePrefix + "Read " + pathA + " and " + pathB + ". ## Request context (abbreviated)\nuser mentioned " + pathC + " and " + pathD;
+      const cand: SkillCandidate = {
+        id: "sp_mixed", name: "sp-mixed", description: "x",
+        trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: ["mutation_verb", "read_verb"] },
+        body,
+        source_run_ids: ["run_sp"], confidence: 0.9, status: "candidate",
+        created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      };
+      const v = evaluateSkillPromotion(cand, {
+        enabled: true, min_confidence: 0.5, promotion_eval_delta: 0.02, max_candidates: 50,
+      });
+      expect(v.promote).toBe(true); // 2 paths in guidance is below the >2 threshold
+    });
+  });
 });

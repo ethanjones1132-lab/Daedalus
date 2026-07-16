@@ -109,6 +109,114 @@ describe("pipeline stage telemetry", () => {
     expect(successfulTurn?.error_message).toBeUndefined();
   });
 
+  test("successful executor turns are not marked as model errors while evidence is still pending", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("read_file"), async () => "source contents");
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    let executorCalls = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") {
+        executorCalls++;
+        return {
+          content: "I read one source file and need more evidence.",
+          tool_calls: executorCalls === 1
+            ? [toolCallWithArgs("read_file", { path: "src/a.ts" })]
+            : [],
+        };
+      }
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    await executor.executeSegment(
+      "comprehensively audit this repo",
+      ["executor", "synthesizer"],
+      "run-evidence-pending-telemetry",
+      () => {},
+      {
+        executionProfile: "read_only",
+        turnRequirement: "workspace_read",
+        rawMessage: "comprehensively audit this repo",
+        allowMidRunReplan: true,
+      },
+    );
+
+    const executorRows = rows.filter((row) => row.mode_id === "executor");
+    expect(executorRows.length).toBeGreaterThan(0);
+    expect(executorRows[0]?.was_successful).toBe(1);
+    expect(executorRows[0]?.had_error).toBe(0);
+    expect(executorRows[0]?.error_message).toBeUndefined();
+  });
+
+  test("executor re-entry carries prior successful reads into the evidence ledger", async () => {
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("read_file"), async (args) => `contents of ${String((args as { path?: unknown }).path)}`);
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    let executorCalls = 0;
+    let addedRemainingEvidence = false;
+    const executorInputs: any[][] = [];
+    const callModel = async (messages: any[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") {
+        executorCalls++;
+        executorInputs.push(messages);
+        const hasCarriedEvidence = messages.some((message) => String(message.content).includes("[Runtime carried evidence]"));
+        if (!hasCarriedEvidence && executorCalls === 1) {
+          return {
+            content: "I read two files; I need one more.",
+            tool_calls: [
+              toolCallWithArgs("read_file", { path: "src/a.ts" }),
+              toolCallWithArgs("read_file", { path: "src/b.ts" }),
+            ],
+          };
+        }
+        if (hasCarriedEvidence && !addedRemainingEvidence) {
+          addedRemainingEvidence = true;
+          return {
+            content: "I read the remaining source file.",
+            tool_calls: [toolCallWithArgs("read_file", { path: "src/c.ts" })],
+          };
+        }
+        return { content: "done", tool_calls: [] };
+      }
+      return { content: "final answer" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx);
+    const first = await executor.executeSegment(
+      "comprehensively audit this repo",
+      ["executor"],
+      "run-evidence-carry-1",
+      () => {},
+      {
+        executionProfile: "read_only",
+        turnRequirement: "workspace_read",
+        rawMessage: "comprehensively audit this repo",
+        allowMidRunReplan: false,
+      },
+    );
+    const firstSegmentExecutorCalls = executorCalls;
+    const second = await executor.executeSegment(
+      "comprehensively audit this repo",
+      ["executor", "synthesizer"],
+      "run-evidence-carry-2",
+      () => {},
+      {
+        executionProfile: "read_only",
+        turnRequirement: "workspace_read",
+        rawMessage: "comprehensively audit this repo",
+        allowMidRunReplan: false,
+      },
+      first.state,
+    );
+
+    expect(executorCalls).toBeGreaterThanOrEqual(2);
+    expect(executorInputs[firstSegmentExecutorCalls].some((message) => String(message.content).includes("src/a.ts"))).toBe(true);
+    expect(second.synthesizerFatalError).toBeUndefined();
+    expect(second.state.executor?.toolCalls.filter((call) => call.name === "read_file")).toHaveLength(3);
+  });
+
   // Task 1.3: PipelineResult.toolCalls is the evidence-plumbing seam the
   // cross-turn no-progress guard (orchestration/repetition-guard.ts, wired
   // in index.ts's streamJarvis success branch) reads to build its

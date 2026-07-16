@@ -14,7 +14,7 @@ import type { StageName, Topology, TaskType } from "../orchestration/coordinator
 import type { SkillCandidate } from "../intelligence/skill-types";
 import type { TurnRequirement } from "../orchestration/turn-requirements";
 
-export const DEFAULT_PIPELINE = ["planner", "executor", "reviewer", "synthesizer"];
+export const DEFAULT_PIPELINE: StageName[] = ["planner", "executor", "reviewer", "synthesizer"];
 
 export interface RoutingCase {
   id: string;
@@ -362,19 +362,18 @@ export const COORDINATOR_CASES: CoordinatorCase[] = [
   {
     // Unparseable output → resilient default route (NOT a thrown error), so a
     // misbehaving coordinator model can never kill the turn. The default
-    // route goes straight to the synthesizer (no planner/executor) per the
-    // 2026-06-26 live diagnosis: the planner/executor stages were the ones
-    // also failing on the fallback path, and routing through them leaked
-    // internal planner task text into the user-visible stream.
+    // route is derived from the request's deterministic requirement so a
+    // malformed coordinator response cannot silently discard workspace or
+    // execution capability.
     id: "coordinator/invalid-json-defaults",
     kind: "coordinator",
     request: "add unit tests",
     sessionId: "eval-coord-bad-json",
     modelOutput: "I cannot produce JSON for this request.",
-    expect: { task_type: "general", topology: "linear", executablePipeline: ["synthesizer"] },
+    expect: { task_type: "general", topology: "linear", executablePipeline: DEFAULT_PIPELINE },
   },
   {
-    // Invalid task_type → same default-route recovery (synthesizer-only).
+    // Invalid task_type → deterministic requirement-aware route recovery.
     id: "coordinator/invalid-task-type-defaults",
     kind: "coordinator",
     request: "summarize the codebase",
@@ -386,7 +385,7 @@ export const COORDINATOR_CASES: CoordinatorCase[] = [
       context: { needs_workspace_inspection: false, needs_memory: false, estimated_complexity: "low" },
       coordinator_rationale: "eval fixture",
     }),
-    expect: { task_type: "general", topology: "linear", executablePipeline: ["synthesizer"] },
+    expect: { task_type: "research", topology: "linear", executablePipeline: ["executor", "synthesizer"] },
   },
   {
     id: "coordinator/complexity-low-parsed",

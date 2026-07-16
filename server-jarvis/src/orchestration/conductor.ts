@@ -12,6 +12,7 @@ export interface ConductorStageEvidence {
   toolCalls?: ToolCallRecord[];
   request?: string;
   workerInstruction?: string;
+  workspaceRoot?: string;
 }
 
 interface SupervisionDigest {
@@ -101,7 +102,11 @@ export class LiveConductor {
         };
       }
 
-      const evidenceAssessment = assessWorkspaceEvidence(evidence.toolCalls, evidence.request ?? "");
+      const evidenceAssessment = assessWorkspaceEvidence(
+        evidence.toolCalls,
+        evidence.request ?? "",
+        evidence.workspaceRoot,
+      );
       if (
         stage === "executor" &&
         outcome === "completed" &&

@@ -56,19 +56,19 @@ describe("Coordinator", () => {
   test("falls back to a safe default route when coordinator output is unparseable", async () => {
     // A coordinator model that returns no JSON (e.g. a reasoning model that
     // emits only <think> and leaves content empty) must NOT kill the turn.
-    // The route falls back to a *synthesizer-only* pipeline so the turn still
-    // produces a streamed answer without dragging the user through the noisy
-    // planner/executor stages that the live 2026-06-26 diagnosis showed were
-    // also misbehaving on the fallback path.
-    const coordinator = new Coordinator(async () => ({ content: "not json" }));
+    const optionsSeen: any[] = [];
+    const coordinator = new Coordinator(async (_messages, options) => {
+      optionsSeen.push(options);
+      return { content: "not json" };
+    });
 
     const decision = await coordinator.route("refactor the failing chat stream module", { sessionId: "session-2" });
     expect(decision.task_type).toBe("general");
     expect(decision.topology).toBe("linear");
-    // Synthesizer-only fallback — no planner, no executor.
-    expect(decision.pipeline).toEqual(["synthesizer"]);
+    expect(decision.pipeline).toEqual(["planner", "executor", "reviewer", "synthesizer"]);
     expect(decision.coordinator_rationale).toContain("unparseable");
     expect(decision.routing_parse_fallback).toBe(true);
+    expect(optionsSeen[0]?.max_tokens).toBeGreaterThanOrEqual(4096);
   });
 
   test("unparseable coordinator output preserves the selected model identity", async () => {

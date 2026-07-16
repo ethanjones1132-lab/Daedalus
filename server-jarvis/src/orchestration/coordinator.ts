@@ -1,6 +1,8 @@
 import { loadPrompt } from "./prompt-loader";
 import { isContinuationTurn, isTrivialConversationalTurn } from "./turn-triage";
 import { PersistentConductor, PersistentConductorError } from "./persistent-conductor";
+import { classifyTurnRequirements, type TurnRequirement } from "./turn-requirements";
+import { buildDeterministicRoute } from "./route-normalization";
 
 export type TaskType = "code_review" | "debug" | "refactor" | "general" | "plan" | "research" | "test" | "docs";
 export type Complexity = "low" | "medium" | "high";
@@ -201,7 +203,8 @@ export class Coordinator {
         };
       } else {
         console.warn(`[Coordinator] Routing parse failed, using default route: ${e instanceof Error ? e.message : String(e)}`);
-        decision = { ...this.defaultRoute(), routing_parse_fallback: true };
+        const fallbackRequirement = classifyTurnRequirements(options.rawMessage ?? request).requirement;
+        decision = { ...this.defaultRoute(fallbackRequirement), routing_parse_fallback: true };
       }
     }
     if (decision.conductor_source !== "continuation_reuse") {
@@ -315,7 +318,10 @@ export class Coordinator {
       },
     ], {
       temperature: 0.1,
-      max_tokens: 700,
+      // The declared response can contain worker instructions for up to four
+      // stages. 700 tokens is structurally smaller than that contract and
+      // turns correct routes into truncated JSON.
+      max_tokens: 4096,
       stageLabel: "coordinator",
       suppressActivity: true,
     });
@@ -326,18 +332,11 @@ export class Coordinator {
     };
   }
 
-  private defaultRoute(): CoordinatorResult {
+  private defaultRoute(requirement: TurnRequirement): CoordinatorResult {
     return {
-      task_type: "general",
-      pipeline: ["synthesizer"],
-      topology: "linear",
-      context: {
-        needs_workspace_inspection: false,
-        needs_memory: true,
-        estimated_complexity: "medium",
-      },
+      ...buildDeterministicRoute(requirement),
       coordinator_rationale:
-        "Default route (coordinator output was unparseable): skipping planner/executor and going straight to a streamed synthesizer answer.",
+        `Coordinator output was unparseable; using deterministic ${requirement} route so required workspace capability is preserved.`,
     };
   }
 

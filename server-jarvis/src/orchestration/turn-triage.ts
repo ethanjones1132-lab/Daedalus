@@ -15,7 +15,7 @@ const CONTINUATION_PATTERNS: RegExp[] = [
 ];
 
 export const WORK_START_COMMAND =
-  /^(now |ok |please )*(begin|start|execute|launch|resume|implement|kick off|proceed with|do) (the )?(phase|task|step|item|part|stage|plan|milestone|next)\b/i;
+  /^(now |ok |please )*(begin|start|execute|launch|resume|perform|implement|kick off|proceed with|do) (the )?(phase|task|step|item|part|stage|plan|milestone|next)\b/i;
 
 export function isContinuationTurn(request: string): boolean {
   const text = (request || "").trim();
