@@ -569,6 +569,60 @@ describe("pipeline stage telemetry", () => {
     expect(segment.replanRequested?.trigger).toBe("evidence_insufficient");
   });
 
+  test("F10 smoke: deep-read architecture audit does not fatal-refuse with insufficient_workspace_evidence", async () => {
+    // Closes the smoke blind spot: a single-file write smoke can pass while the
+    // deep-read/full_execution path fails live. This pins the post-remediation
+    // contract at the pipeline boundary (fixture repo = process.cwd()).
+    const collector: StageRunRecorder = { recordStageRun: () => {} };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("list_directory"), async () => "package.json\nREADME.md\nsrc\nlib");
+    runtime.register(toolDefinition("read_file"), async (args) => {
+      const path = String((args as { path?: unknown }).path ?? "file");
+      return `// fixture source for ${path}\nexport const x = 1;\n`;
+    });
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") {
+        if (executorTurns++ === 0) {
+          return {
+            content: "reading sources",
+            tool_calls: [
+              toolCallWithArgs("read_file", { path: "src/a.ts" }),
+              toolCallWithArgs("read_file", { path: "src/b.ts" }),
+              toolCallWithArgs("read_file", { path: "lib/c.ts" }),
+            ],
+          };
+        }
+        return { content: "done" };
+      }
+      if (options.stageLabel === "synthesizer") {
+        return { content: "Architecture gaps: three residual seams in the fixture shell." };
+      }
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const segment = await executor.executeSegment(
+      `Identify all remaining gaps in ${process.cwd()} — architecture audit`,
+      ["executor", "synthesizer"],
+      "run-f10-deep-read-smoke",
+      () => {},
+      {
+        executionProfile: "full",
+        turnRequirement: "full_execution",
+        rawMessage: `Identify all remaining gaps in ${process.cwd()} — architecture audit`,
+        allowMidRunReplan: false,
+      },
+    );
+
+    expect(segment.fatalErrorCode).not.toBe("insufficient_workspace_evidence");
+    expect(segment.fatalErrorCode).not.toBe("missing_workspace_evidence");
+    expect(segment.synthesizerFatalError).toBeUndefined();
+    expect(segment.synthesizerAnswer).toBeTruthy();
+    expect(segment.synthesizerAnswer).not.toMatch(/could not gather enough evidence/i);
+  });
+
   test("F8: floor-completion deterministically reads plan-named sources when model stops short", async () => {
     const collector: StageRunRecorder = { recordStageRun: () => {} };
     const runtime = createToolRuntime();

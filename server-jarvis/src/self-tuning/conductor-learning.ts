@@ -102,6 +102,9 @@ export class ConductorLearningLoop {
     hadError?: boolean;
   }): void {
     if (!this.config.enabled) return;
+    // F10: never default omitted wasSuccessful to success — empty completions
+    // and silent call sites must not reward the model (2026-07-15 F1 class).
+    const ok = args.wasSuccessful === true && args.hadError !== true;
     const row: ModelAttribution = {
       id: `attr_${crypto.randomUUID()}`,
       agent_run_id: args.agentRunId,
@@ -109,8 +112,8 @@ export class ConductorLearningLoop {
       agent_id: args.agentId,
       provider: args.provider,
       model_id: args.modelId,
-      was_successful: args.wasSuccessful === false ? 0 : 1,
-      had_error: args.hadError ? 1 : 0,
+      was_successful: ok ? 1 : 0,
+      had_error: ok ? 0 : 1,
       duration_ms: args.durationMs,
       first_token_ms: args.firstTokenMs,
       fallback_used: args.fallbackUsed ? 1 : 0,

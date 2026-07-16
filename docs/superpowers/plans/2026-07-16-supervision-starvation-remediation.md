@@ -238,17 +238,17 @@ if (input.pipelineOutcome === "failed" || !answer) {
 
 **Files:** modify `server-jarvis/src/self-tuning/collector.ts` (+ its attribution call sites in `index.ts` ~`:2470`); locate the smoke generator (`grep -r "jarvis-orchestration-smoke" server-jarvis/ scripts/`); tests colocated
 
-- [ ] **8.1** `first_token_ms`: `index.ts:2470` already computes `attemptFirstTokenMs`; trace the attribution write path into `collector.ts` and pass it through to the `store.ts:809` insert. Verification query below must show non-null values for new rows.
-- [ ] **8.2** Empty-completion alignment: at the attribution call site, when the completion content is empty/whitespace, record `was_successful: 0, had_error: 1` so `model_attributions` stops rewarding empties that `stage_runs` marks `empty_completion` (the 2026-07-15 F1 class, still live at 13:48:07Z).
-- [ ] **8.3** Smoke coverage: add a second scenario to the orchestration smoke — a deep-read prompt against a fixture repo (`"Identify all remaining gaps in <fixture> — architecture audit"`) asserting `agent_runs.outcome != 'failed'` **and** the final verdict is not `insufficient_workspace_evidence`. Today's smoke (a single file-write) passes while the deep-read path fails live; this closes that blind spot.
-- [ ] **8.4** Commit: `fix(telemetry): attribute first_token_ms, stop rewarding empties, deep-read smoke scenario (F10)`.
+- [x] **8.1** `first_token_ms`: `index.ts:2470` already computes `attemptFirstTokenMs`; trace the attribution write path into `collector.ts` and pass it through to the `store.ts:809` insert. Verification query below must show non-null values for new rows.
+- [x] **8.2** Empty-completion alignment: at the attribution call site, when the completion content is empty/whitespace, record `was_successful: 0, had_error: 1` so `model_attributions` stops rewarding empties that `stage_runs` marks `empty_completion` (the 2026-07-15 F1 class, still live at 13:48:07Z).
+- [x] **8.3** Smoke coverage: add a second scenario to the orchestration smoke — a deep-read prompt against a fixture repo (`"Identify all remaining gaps in <fixture> — architecture audit"`) asserting `agent_runs.outcome != 'failed'` **and** the final verdict is not `insufficient_workspace_evidence`. Today's smoke (a single file-write) passes while the deep-read path fails live; this closes that blind spot.
+- [x] **8.4** Commit: `fix(telemetry): attribute first_token_ms, stop rewarding empties, deep-read smoke scenario (F10)`.
 
 ---
 
 ## Phase 9 — Verification gate (do not deploy without all green)
 
-- [ ] **9.1** `cd server-jarvis && bun test` — full suite green.
-- [ ] **9.2** Build + deploy per the established runbook (`bun build`, ship `prompts/` beside `index.js` on the OneDrive Desktop — the running instance is `bun C:\Users\ethan\OneDrive\Desktop\index.js`); restart; confirm `curl localhost:19877/health` shows the new `source_tree_sha256`.
+- [x] **9.1** `cd server-jarvis && bun test` — full suite green. (**1220 pass / 0 fail**, 2026-07-16 wrap-up.)
+- [ ] **9.2** Build + deploy per the established runbook (`bun build`, ship `prompts/` beside `index.js` on the OneDrive Desktop — the running instance is `bun C:\Users\ethan\OneDrive\Desktop\index.js`); restart; confirm `curl localhost:19877/health` shows the new `source_tree_sha256`. **Operator gate** — not auto-run in this session (deploy is shared/hard-to-reverse).
 - [ ] **9.3** Live-fire replay, same prompts as the incident: (1) the Versutus gap-analysis request, (2) `"continue"`, (3) `"force deep read"`. Then run these against `~/.openclaw/jarvis/self-tuning.db` (all must hold for the replay window):
 
 ```sql
@@ -267,7 +267,9 @@ SELECT COUNT(*) FROM model_attributions WHERE stage_id='conductor_supervision' A
 SELECT COUNT(*) FROM model_attributions WHERE first_token_ms IS NOT NULL AND created_at > '<replay-start>';      -- > 0
 ```
 
-- [ ] **9.4** Update `docs/PRIORITIES.md` and the memory index; record the replay results in the diagnosis doc's Falsifiability section.
+  **Operator gate** after deploy. Unit + pipeline pins for F1–F10 are green; live SQL is the final external falsifier.
+
+- [x] **9.4** Update `docs/PRIORITIES.md` and the diagnosis doc's Falsifiability section (structural status recorded; live-fire SQL pending deploy).
 
 ---
 

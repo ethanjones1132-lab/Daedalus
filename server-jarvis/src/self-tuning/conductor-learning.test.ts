@@ -143,6 +143,55 @@ describe("Conductor learning (Phase 4)", () => {
     expect(adjusted[0].capabilities.code).toBeGreaterThan(sampleAgent.capabilities.code);
   });
 
+  test("F10: recordStageModel persists first_token_ms and never rewards empty success", () => {
+    const store = new SelfTuningStore(TEST_DB);
+    const loop = new ConductorLearningLoop(store);
+    store.insertAgentRun({
+      id: "run_f10",
+      session_id: "sess_f10",
+      user_request: "plan",
+      task_type: "general",
+      pipeline: JSON.stringify(["planner"]),
+      completed: 0,
+    });
+    loop.recordStageModel({
+      agentRunId: "run_f10",
+      stageId: "planner",
+      provider: "opencode_zen",
+      modelId: "nemotron-3-ultra-free",
+      durationMs: 4_000,
+      firstTokenMs: 1_250,
+      wasSuccessful: true,
+    });
+    loop.recordStageModel({
+      agentRunId: "run_f10",
+      stageId: "planner",
+      provider: "opencode_zen",
+      modelId: "nemotron-3-ultra-free",
+      durationMs: 800,
+      // empty completion — explicit failure
+      wasSuccessful: false,
+      hadError: true,
+    });
+    // Omitted wasSuccessful must not default to success.
+    loop.recordStageModel({
+      agentRunId: "run_f10",
+      stageId: "planner",
+      provider: "opencode_zen",
+      modelId: "empty-default",
+      durationMs: 10,
+    });
+
+    const rows = store.getModelAttributions("run_f10");
+    expect(rows).toHaveLength(3);
+    expect(rows[0].first_token_ms).toBe(1_250);
+    expect(rows[0].was_successful).toBe(1);
+    expect(rows[1].was_successful).toBe(0);
+    expect(rows[1].had_error).toBe(1);
+    expect(rows[2].was_successful).toBe(0);
+    expect(rows[2].had_error).toBe(1);
+  });
+
   test("completeRun skips instruction learning for stage_window_exhausted rows", () => {
     const store = new SelfTuningStore(TEST_DB);
     const loop = new ConductorLearningLoop(store);

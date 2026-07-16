@@ -17,7 +17,10 @@ param(
     [string]$Prompt = "Reply with exactly: smoke ok.",
     [string]$SessionId = ([guid]::NewGuid().ToString()),
     [int]$TimeoutSeconds = 120,
-    [switch]$WriteReadSmoke
+    [switch]$WriteReadSmoke,
+    # F10: deep-read/full_execution path that the single-file write smoke is blind to.
+    [switch]$DeepReadSmoke,
+    [string]$DeepReadFixture = $WorkspaceRoot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -125,9 +128,17 @@ if ($conductorCheck.status -ne 'pass') { throw 'conductor_health_fixture_failed'
 
 $writeReadCheck = [ordered]@{ status = 'not_requested'; artifact = $null; content = $null }
 $writeReadArtifact = $null
+$deepReadCheck = [ordered]@{ status = 'not_requested'; fatal_code = $null }
+if ($WriteReadSmoke -and $DeepReadSmoke) {
+    throw 'mutually_exclusive:WriteReadSmoke_and_DeepReadSmoke'
+}
 if ($WriteReadSmoke) {
     $writeReadArtifact = Join-Path $WorkspaceRoot ("jarvis-orchestration-smoke-{0}.txt" -f [guid]::NewGuid())
     $Prompt = "Create the file '$writeReadArtifact' with exactly the text JARVIS_SMOKE, then read it and report the exact contents."
+}
+if ($DeepReadSmoke) {
+    $TimeoutSeconds = [Math]::Max($TimeoutSeconds, 240)
+    $Prompt = "Identify all remaining gaps in '$DeepReadFixture' — architecture audit. Force deep read."
 }
 
 $started = Get-Date
@@ -159,6 +170,24 @@ if ($WriteReadSmoke) {
             Remove-Item -LiteralPath $writeReadArtifact -Force
         }
     }
+}
+if ($DeepReadSmoke) {
+    $text = if ($null -ne $terminalEvent.result) { [string]$terminalEvent.result } else { [string]$terminalEvent.error }
+    $code = [string]$terminalEvent.code
+    $deepReadCheck.fatal_code = $code
+    if ($terminalEvent.type -eq 'error') {
+        throw "deep_read_smoke_terminal_error:$code"
+    }
+    if ($code -in @('insufficient_workspace_evidence', 'missing_workspace_evidence')) {
+        throw "deep_read_smoke_fatal_code:$code"
+    }
+    if ($text -match 'could not gather enough evidence|insufficient_workspace_evidence') {
+        throw 'deep_read_smoke_refusal_text'
+    }
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        throw 'deep_read_smoke_empty_answer'
+    }
+    $deepReadCheck.status = 'pass'
 }
 $toolNames = @($events |
     Where-Object { $_.type -in @('tool_use', 'tool_result') -or ([string]$_.detail).StartsWith('tool:') } |
@@ -194,6 +223,7 @@ $record = [ordered]@{
         session_authority = $authorityCheck
         conductor_health = $conductorCheck
         write_read = $writeReadCheck
+        deep_read = $deepReadCheck
     }
 }
 $record | ConvertTo-Json -Depth 8 -Compress

@@ -84,3 +84,22 @@ Loop exits when a turn emits no tool calls and no nudge was sent (`pipeline.ts:1
 ## Falsifiability
 
 Each finding predicts a specific observable: after F1, `conductor_directives` must show zero `re-enter:planner` reroutes with evidence-rubric reasons on completed planners; after F2, a post-replan reviewer entry at t+110s must receive a fresh window rather than dying at `60s − elapsed`; after F6, a 2-read deep-read turn must produce a caveated synthesis rather than `insufficient_workspace_evidence`. Re-run the same Versutus gap-analysis prompt to verify end-to-end.
+
+### Structural remediation status (2026-07-16 evening wrap-up)
+
+Implementation plan: `docs/superpowers/plans/2026-07-16-supervision-starvation-remediation.md` (Phases 0–8 landed on `master`; Phase 9.1 unit suite green at **1220/1220** `server-jarvis` bun tests).
+
+| Finding | Structural fix landed | Unit / fixture falsifier |
+|---|---|---|
+| F1 planner evidence category error | Stage-aware digests + `rejectReroute` | `incident-20260716.test.ts`, `reroute-policy.test.ts` |
+| F2 stage-window starvation | Usage-based `beginStage`/`endStage` budgets | `turn-budget.test.ts`, incident F2 fixtures |
+| F3 mislabeled deadlines | `StageBudgetExhaustedError` + starvation learning exclusions | `orchestration.test.ts` describePipelineError; analyzer tests |
+| F4 uncountable anchor reads | Preflight dips into `src`/`lib`/`app` for ≥1 source read | pipeline preflight path + floor tests |
+| F5 force-deep-read no-op | 240s/150s budget + direct executor route | `turn-budget.test.ts`, `route-normalization.test.ts` |
+| F6 binary fence refusals | Partial evidence synthesizes with disclosure | `pipeline-telemetry.test.ts` F6/F10 |
+| F7 supervision tax | Diet to anomaly + cap 4/run + attributions | `conductor.test.ts` F7 |
+| F8 executor stops short | Deterministic floor-completion reads | `extractSourceReadCandidates` + F8 telemetry |
+| F9 failed kills continuation | Failed-with-evidence → task-run `paused` | `task-run.test.ts` F9 |
+| F10 telemetry gaps | `first_token_ms` fallback, no empty reward, deep-read smoke | `conductor-learning.test.ts` F10; `scripts/smoke-jarvis-runtime.ps1 -DeepReadSmoke` |
+
+**Still open (operator):** Phase 9.2 deploy (`build-and-deploy.ps1` / Desktop `index.js` + `prompts/`) and Phase 9.3 live-fire SQL against `~/.openclaw/jarvis/self-tuning.db` after replaying Versutus gap-analysis / `continue` / `force deep read`.

@@ -2408,9 +2408,23 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             // JSON. Non-answer stages (executor, etc.) legitimately succeed via
             // tool calls with no prose, so they keep the original OR logic.
             // Truncation on an answer stage is not a clean success for learning.
-            const answerOk = isAnswerStage
-              ? (hasContent && !finishSettle.truncated)
-              : (hasContent || hasToolCalls);
+            // F10: empty_completion must never be rewarded even if a prior
+            // branch mis-set attemptOutcome.
+            const emptyCompletion =
+              attemptOutcome === "empty_completion" || (!hasContent && !hasToolCalls);
+            const answerOk = emptyCompletion
+              ? false
+              : isAnswerStage
+                ? (hasContent && !finishSettle.truncated)
+                : (hasContent || hasToolCalls);
+            // F10: populate first_token_ms. Prefer the measured first-progress
+            // latency; if the model produced content/tools in one chunk without
+            // arming the progressive timer, fall back to stage duration so the
+            // column is not systematically NULL on successful rows.
+            const firstTokenMs = firstTokenLatencyMs
+              ?? ((hasContent || hasToolCalls)
+                ? Math.max(0, Date.now() - stageAttemptStart)
+                : undefined);
             conductorLearning.recordStageModel({
               agentRunId: orchestratorAgentRunId,
               stageId: stageLabel,
@@ -2418,7 +2432,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               provider: actualProviderUsed,
               modelId: actualModelUsed,
               durationMs: Date.now() - stageAttemptStart,
-              firstTokenMs: firstTokenLatencyMs,
+              firstTokenMs,
               fallbackUsed: (excludeModels?.size ?? 0) > 0,
               wasSuccessful: answerOk,
               hadError: !answerOk,
