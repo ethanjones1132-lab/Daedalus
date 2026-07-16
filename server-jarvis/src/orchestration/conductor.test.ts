@@ -211,6 +211,34 @@ describe("LiveConductor", () => {
     expect(modelCalled).toBe(true);
   });
 
+  test("planner-completed digest does not run the workspace evidence rubric", async () => {
+    const supervisorMessages: any[][] = [];
+    const { conductor } = makeConductor({}, async (messages) => {
+      supervisorMessages.push(messages);
+      return { content: '{"directive":"continue"}' };
+    });
+    conductor.setContext("general", "high", "run-planner-digest");
+
+    await conductor.afterStage(
+      "planner",
+      "completed",
+      "plan output naming lib/gateway/dashboard.ts",
+      ["executor", "reviewer", "synthesizer"],
+      {
+        request: "Identify all remaining gaps in the repo",
+        workspaceRoot: "C:\\Projects\\Versutus",
+      },
+    );
+
+    expect(supervisorMessages).toHaveLength(1);
+    const userContent = supervisorMessages[0][1].content as string;
+    expect(userContent).toContain(
+      "Evidence assessment: not applicable — the planner stage produces no tool calls by design",
+    );
+    expect(userContent).not.toContain('"sufficient":false');
+    expect(userContent).not.toContain('"sufficient":true');
+  });
+
   test("uses the dedicated supervisor path instead of the worker model", async () => {
     const bus = new ConductorBus();
     const pool = new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS);

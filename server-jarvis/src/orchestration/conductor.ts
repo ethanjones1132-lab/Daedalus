@@ -6,6 +6,7 @@ import { AgentPool } from "./agent-pool";
 import type { StageName } from "./coordinator";
 import type { EvidenceAssessment } from "./evidence-sufficiency";
 import { assessWorkspaceEvidence, isDeepReadRequest } from "./evidence-sufficiency";
+import { EVIDENCE_CAPABLE_STAGES } from "./reroute-policy";
 import type { ToolCallRecord } from "./stage-output";
 
 export interface ConductorStageEvidence {
@@ -22,7 +23,8 @@ interface SupervisionDigest {
   recentToolErrors: string[];  // last N isError tool results
   toolCallCounts: Record<string, number>;
   toolErrorCount: number;
-  evidenceAssessment: EvidenceAssessment;
+  /** Only set for evidence-capable stages (executor/rewriter). */
+  evidenceAssessment?: EvidenceAssessment;
   requestSummary: string;
   workerInstruction: string;
   remainingQueue: StageName[];
@@ -102,16 +104,21 @@ export class LiveConductor {
         };
       }
 
-      const evidenceAssessment = assessWorkspaceEvidence(
-        evidence.toolCalls,
-        evidence.request ?? "",
-        evidence.workspaceRoot,
-      );
+      // F1: only evidence-capable stages get a workspace-evidence rubric.
+      // Planner/reviewer/synthesizer digests must not claim "sufficient:false".
+      const evidenceAssessment = EVIDENCE_CAPABLE_STAGES.has(stage)
+        ? assessWorkspaceEvidence(
+          evidence.toolCalls,
+          evidence.request ?? "",
+          evidence.workspaceRoot,
+        )
+        : undefined;
       if (
         stage === "executor" &&
         outcome === "completed" &&
         evidence.request &&
         isDeepReadRequest(evidence.request) &&
+        evidenceAssessment &&
         !evidenceAssessment.sufficient &&
         !this.deepReadEvidenceRerouteUsed
       ) {
@@ -150,6 +157,8 @@ export class LiveConductor {
 
       const directive = await this.supervise(digest);
       this.recentToolErrors = [];
+      // Admission is enforced in pipeline.afterConductorStage (rejectReroute)
+      // so illegal model directives are audited as directive_type=reroute_rejected.
       return directive;
     } catch {
       return { type: "continue" };
@@ -168,7 +177,9 @@ export class LiveConductor {
         digest.recentToolErrors.length > 0
           ? `Recent tool errors: ${digest.recentToolErrors.join("; ")}`
           : "Recent tool errors: none",
-        `Evidence assessment: ${JSON.stringify(digest.evidenceAssessment)}`,
+        digest.evidenceAssessment
+          ? `Evidence assessment: ${JSON.stringify(digest.evidenceAssessment)}`
+          : `Evidence assessment: not applicable — the ${digest.stage} stage produces no tool calls by design`,
         `Request (300 chars): ${digest.requestSummary || "(not provided)"}`,
         `Worker instruction: ${digest.workerInstruction || "(not provided)"}`,
         `Remaining queue: ${digest.remainingQueue.length > 0 ? digest.remainingQueue.join(" → ") : "(none)"}`,

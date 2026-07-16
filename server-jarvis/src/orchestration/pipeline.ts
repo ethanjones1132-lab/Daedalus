@@ -42,7 +42,7 @@ import {
 import { prepareToolResultForContext } from "../tool-result-truncation";
 import { findExistingWorkspacePath } from "./workspace-affinity";
 import { join } from "path";
-import { canApplyConductorReroute } from "./reroute-policy";
+import { canApplyConductorReroute, rejectReroute } from "./reroute-policy";
 import { resolveDeepReadIntent, type TaskRunDepth } from "./task-run";
 
 /**
@@ -467,6 +467,17 @@ export class PipelineExecutor {
    * T2.2/T2.3: returns the directive so executeSegment can mutate its work queue
    * and pendingInjections. Still fires onDirective + audit for UI/telemetry.
    */
+  /** Request/workspace context for planner supervision — never assess against "". */
+  private plannerConductorEvidence(
+    request: string,
+    options: PipelineExecuteOptions,
+  ): ConductorStageEvidence {
+    return {
+      request: options.rawMessage ?? request,
+      workspaceRoot: this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd(),
+    };
+  }
+
   private async afterConductorStage(
     stage: StageName,
     outcome: "completed" | "failed",
@@ -506,7 +517,47 @@ export class PipelineExecutor {
       }
     }
 
-    // T2.2: apply reroute to the mutable work queue (at most once per segment).
+    // F1: deterministic admission before any queue mutation. Model may still
+    // *request* an illegal reroute; the runtime refuses and audits it.
+    if (directive.type === "reroute") {
+      const rejection = rejectReroute({
+        triggerStage: stage,
+        triggerOutcome: outcome,
+        newRemaining: directive.newRemaining,
+        reason: directive.reason ?? "",
+      });
+      if (rejection) {
+        console.warn(
+          `[Pipeline] reroute rejected after ${stage}: ${rejection} ` +
+          `(reason=${(directive.reason ?? "").slice(0, 160)})`,
+        );
+        const rejected: ConductorDirective = { type: "continue" };
+        await options.onDirective?.(rejected, stage);
+        const rejectAudit = this.collector as StageRunRecorder & {
+          recordDirective?: (row: {
+            id: string;
+            agent_run_id: string;
+            stage: string;
+            directive_type: string;
+            reason?: string;
+            new_remaining_json?: string;
+            inject_note?: string;
+            inject_for_stage?: string;
+          }) => void;
+        };
+        rejectAudit.recordDirective?.({
+          id: `dir_${crypto.randomUUID()}`,
+          agent_run_id: agentRunId,
+          stage,
+          directive_type: "reroute_rejected",
+          reason: `${rejection}: ${directive.reason ?? ""}`.slice(0, 500),
+          new_remaining_json: JSON.stringify(directive.newRemaining),
+        });
+        return rejected;
+      }
+    }
+
+    // T2.2: apply reroute to the mutable work queue (bounded per segment).
     if (directive.type === "reroute" && options.workQueue) {
       const applied = options.reroutesApplied?.n ?? 0;
       if (!canApplyConductorReroute(applied, options.maxReroutesPerSegment)) {
@@ -682,7 +733,15 @@ export class PipelineExecutor {
       if (isEmptyStageOutput(narrative)) {
         const errorMessage = "empty_completion";
         onStateChange({ stage: "planner", status: "failed", output: errorMessage });
-        await this.afterConductorStage("planner", "failed", errorMessage, agentRunId, options, remainingQueue);
+        await this.afterConductorStage(
+          "planner",
+          "failed",
+          errorMessage,
+          agentRunId,
+          options,
+          remainingQueue,
+          this.plannerConductorEvidence(request, options),
+        );
         this.collector.recordStageRun({
           id: `stage_${crypto.randomUUID()}`,
           agent_run_id: agentRunId,
@@ -699,7 +758,15 @@ export class PipelineExecutor {
         return { ok: false, narrative: "Failed to generate plan: the planner model returned an empty completion." };
       }
       onStateChange({ stage: "planner", status: "completed", output: narrative });
-      await this.afterConductorStage("planner", "completed", narrative, agentRunId, options, remainingQueue);
+      await this.afterConductorStage(
+        "planner",
+        "completed",
+        narrative,
+        agentRunId,
+        options,
+        remainingQueue,
+        this.plannerConductorEvidence(request, options),
+      );
 
       this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,
@@ -717,7 +784,15 @@ export class PipelineExecutor {
     } catch (e: any) {
       const message = errText(e);
       onStateChange({ stage: "planner", status: "failed", output: message });
-      await this.afterConductorStage("planner", "failed", message, agentRunId, options, remainingQueue);
+      await this.afterConductorStage(
+        "planner",
+        "failed",
+        message,
+        agentRunId,
+        options,
+        remainingQueue,
+        this.plannerConductorEvidence(request, options),
+      );
 
       this.collector.recordStageRun({
         id: `stage_${crypto.randomUUID()}`,

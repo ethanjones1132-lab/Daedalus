@@ -8,14 +8,15 @@
  *
  * Structure:
  *   - "bug pin" tests document today's broken behavior so the diagnosis stays falsifiable.
- *   - "fix contract" tests (test.todo) pin the post-remediation invariants.
- *     Flip them green in Phase 1 (F1 reroute guard) and Phase 2 (usage-based budgets).
+ *   - "fix contract" tests pin post-remediation invariants (flip green per phase).
  */
 import { describe, expect, test } from "bun:test";
 import { LiveConductor } from "./conductor";
 import { ConductorBus } from "./conductor-bus";
 import { AgentPool, DEFAULT_ORCHESTRATOR_AGENTS } from "./agent-pool";
 import { createTurnBudget } from "./turn-budget";
+import { rejectReroute } from "./reroute-policy";
+import type { ConductorDirective } from "./conductor-bus";
 
 /** Approximate plan body from the incident (planner produced ~750 output tokens). */
 const INCIDENT_PLAN_TEXT = [
@@ -50,6 +51,22 @@ function makeSupervisingConductor(
   return conductor;
 }
 
+/** Same admission gate pipeline.afterConductorStage applies (F1). */
+function admitReroute(
+  stage: string,
+  outcome: "completed" | "failed",
+  directive: ConductorDirective,
+): ConductorDirective {
+  if (directive.type !== "reroute") return directive;
+  const rejection = rejectReroute({
+    triggerStage: stage,
+    triggerOutcome: outcome,
+    newRemaining: directive.newRemaining,
+    reason: directive.reason ?? "",
+  });
+  return rejection ? { type: "continue" } : directive;
+}
+
 describe("incident 2026-07-16 run_5283dd64 — F2 stage-window starvation (Phase 0.1)", () => {
   test("bug pin: wall-clock stage window refuses planner re-entry at T0+88s", () => {
     // Live: planner first began ~14s into the turn; by ~88s elapsed the stage
@@ -76,23 +93,19 @@ describe("incident 2026-07-16 run_5283dd64 — F2 stage-window starvation (Phase
   });
 
   // Phase 2 target: usage-based accounting + endStage so idle/replan time is free.
-  // Planner used only ~50s of its 60s budget across the run; at T0+88s it must
-  // still be startable. Flip green after Phase 2 lands.
   test.todo(
     "F2 fix: canStart(planner) at T0+88s is true when only ~50s of stage budget was used",
   );
 
-  // Reviewer used ~8.86s before the kill; after idle gap to T0+109s remaining
-  // must be 60_000 − usedMs (~51_138), not 60_000 − 51_000 wall (~9_000).
   test.todo(
     "F2 fix: stageRemainingMs(reviewer) meters usage (60_000 − usedMs), not wall-clock since first begin",
   );
 });
 
-describe("incident 2026-07-16 run_5283dd64 — F1 planner evidence reroute (Phase 0.2)", () => {
-  test("bug pin: supervisor re-enter:planner after clean planner completion is currently admitted", async () => {
-    // Live: 8 planner-completed→reroute directives; reason class was
-    // "failed to gather workspace evidence" on a toolless stage.
+describe("incident 2026-07-16 run_5283dd64 — F1 planner evidence reroute (Phase 0.2 / Phase 1)", () => {
+  test("F1: deterministic guard forces continue when supervisor re-enters a cleanly completed planner", async () => {
+    // Live incident: supervisor always answered re-enter:planner after clean
+    // planner completion (evidence category error). Phase 1 admission wins.
     const conductor = makeSupervisingConductor(
       JSON.stringify({
         directive: "reroute",
@@ -102,7 +115,7 @@ describe("incident 2026-07-16 run_5283dd64 — F1 planner evidence reroute (Phas
       }),
     );
 
-    const directive = await conductor.afterStage(
+    const raw = await conductor.afterStage(
       "planner",
       "completed",
       INCIDENT_PLAN_TEXT,
@@ -113,16 +126,60 @@ describe("incident 2026-07-16 run_5283dd64 — F1 planner evidence reroute (Phas
       },
     );
 
-    expect(directive.type).toBe("reroute");
-    if (directive.type === "reroute") {
-      expect(directive.newRemaining).toEqual(["re-enter:planner"]);
+    // Model may still *request* the illegal reroute; the runtime gate refuses it.
+    const admitted = admitReroute("planner", "completed", raw);
+    expect(admitted.type).toBe("continue");
+    if (raw.type === "reroute") {
+      expect(
+        rejectReroute({
+          triggerStage: "planner",
+          triggerOutcome: "completed",
+          newRemaining: raw.newRemaining,
+          reason: raw.reason ?? "",
+        }),
+      ).toBe("self_reroute_after_clean_completion");
     }
   });
 
-  // Phase 1 target: rejectReroute / pipeline admission wins over the model.
-  // AfterStage (or its admission wrapper) must return continue for a cleanly
-  // completed planner that the supervisor wants to re-enter on evidence grounds.
-  test.todo(
-    "F1 fix: deterministic guard forces continue when supervisor re-enters a cleanly completed planner",
-  );
+  test("F1: planner supervision digest never embeds sufficient:false", async () => {
+    const supervisorMessages: any[][] = [];
+    const bus = new ConductorBus();
+    const pool = new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS);
+    const conductor = new LiveConductor(
+      async (messages) => {
+        supervisorMessages.push(messages);
+        return {
+          content: JSON.stringify({
+            directive: "reroute",
+            newRemaining: ["re-enter:planner"],
+            reason: "no workspace evidence",
+          }),
+        };
+      },
+      bus,
+      pool,
+      {
+        supervision_timeout_ms: 5_000,
+        max_tool_errors_before_reroute: 2,
+        supervise_low_complexity: false,
+      },
+    );
+    conductor.setContext("research", "high", "run_5283dd64");
+
+    await conductor.afterStage(
+      "planner",
+      "completed",
+      INCIDENT_PLAN_TEXT,
+      ["executor", "reviewer", "synthesizer"],
+      {
+        request: INCIDENT_REQUEST,
+        workspaceRoot: INCIDENT_WORKSPACE,
+      },
+    );
+
+    expect(supervisorMessages).toHaveLength(1);
+    const userContent = supervisorMessages[0][1].content as string;
+    expect(userContent).not.toContain('"sufficient":false');
+    expect(userContent).toContain("not applicable — the planner stage produces no tool calls by design");
+  });
 });

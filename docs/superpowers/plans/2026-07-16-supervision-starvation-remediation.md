@@ -29,7 +29,7 @@
 
 **Files:** modify `server-jarvis/src/orchestration/conductor.ts`, `server-jarvis/src/orchestration/reroute-policy.ts`, `server-jarvis/src/orchestration/pipeline.ts:685-720` (planner call sites); tests `conductor.test.ts`, `reroute-policy.test.ts`
 
-- [ ] **1.1** `reroute-policy.ts` — grow the module into the actual policy (it currently only holds the counter check):
+- [x] **1.1** `reroute-policy.ts` — grow the module into the actual policy (it currently only holds the counter check):
 
 ```ts
 export const EVIDENCE_CAPABLE_STAGES = new Set<string>(["executor", "rewriter"]);
@@ -70,11 +70,11 @@ export function rejectReroute(input: RerouteValidationInput): string | null {
 }
 ```
 
-- [ ] **1.2** Tests first in `reroute-policy.test.ts`: completed-planner self-reroute rejected; failed-planner self-reroute admitted (genuine retry); evidence-reasoned planner reroute rejected even from executor trigger; executor evidence reroute to `re-enter:executor` admitted.
-- [ ] **1.3** Wire into `pipeline.ts` `afterConductorStage` (currently at `:509-526`): before `normalizeRemainingStages`, call `rejectReroute({ triggerStage: stage, triggerOutcome: outcome, newRemaining: directive.newRemaining, reason: directive.reason ?? "" })`; on rejection `console.warn` with the rejection reason, record the directive in `conductor_directives` with `directive_type: "reroute_rejected"`, and treat as `continue`. The audit row is load-bearing: Phase 9 queries it.
-- [ ] **1.4** `conductor.ts` — stage-aware digests. In `afterStage` (`:105`), compute `evidenceAssessment` **only when** `EVIDENCE_CAPABLE_STAGES.has(stage)`; make `SupervisionDigest.evidenceAssessment` optional; in `supervise()` (`:171`) render the line as `Evidence assessment: not applicable — the ${stage} stage produces no tool calls by design` when absent. Test: planner-completed digest text must not contain `"sufficient":false`.
-- [ ] **1.5** Pass real context at the planner call sites — `pipeline.ts:685/:702/:720` currently omit the evidence arg entirely; pass `{ request: options.rawMessage ?? request, workspaceRoot: this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd() }` so nothing downstream ever assesses against `request: ""` again.
-- [ ] **1.6** Flip fixture 0.2 green. Run `bun test src/orchestration/reroute-policy.test.ts src/orchestration/conductor.test.ts src/orchestration/incident-20260716.test.ts`. Commit: `fix(orchestration): stage-aware supervision digests + deterministic reroute admission (F1)`.
+- [x] **1.2** Tests first in `reroute-policy.test.ts`: completed-planner self-reroute rejected; failed-planner self-reroute admitted (genuine retry); evidence-reasoned planner reroute rejected even from executor trigger; executor evidence reroute to `re-enter:executor` admitted.
+- [x] **1.3** Wire into `pipeline.ts` `afterConductorStage` (currently at `:509-526`): before `normalizeRemainingStages`, call `rejectReroute({ triggerStage: stage, triggerOutcome: outcome, newRemaining: directive.newRemaining, reason: directive.reason ?? "" })`; on rejection `console.warn` with the rejection reason, record the directive in `conductor_directives` with `directive_type: "reroute_rejected"`, and treat as `continue`. The audit row is load-bearing: Phase 9 queries it.
+- [x] **1.4** `conductor.ts` — stage-aware digests. In `afterStage` (`:105`), compute `evidenceAssessment` **only when** `EVIDENCE_CAPABLE_STAGES.has(stage)`; make `SupervisionDigest.evidenceAssessment` optional; in `supervise()` (`:171`) render the line as `Evidence assessment: not applicable — the ${stage} stage produces no tool calls by design` when absent. Test: planner-completed digest text must not contain `"sufficient":false`.
+- [x] **1.5** Pass real context at the planner call sites — `pipeline.ts:685/:702/:720` currently omit the evidence arg entirely; pass `{ request: options.rawMessage ?? request, workspaceRoot: this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd() }` so nothing downstream ever assesses against `request: ""` again.
+- [x] **1.6** Flip fixture 0.2 green. Run `bun test src/orchestration/reroute-policy.test.ts src/orchestration/conductor.test.ts src/orchestration/incident-20260716.test.ts`. Commit: `fix(orchestration): stage-aware supervision digests + deterministic reroute admission (F1)`.
 
 ---
 
