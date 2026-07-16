@@ -205,6 +205,52 @@ export function selectAnchorFiles(listingEntries: string[]): string[] {
 // parseListingEntryNames lives in evidence-sufficiency.ts (shared with F8
 // floor-completion candidate harvest); re-exported for local call sites above.
 
+/**
+ * Deterministic, zero-model-cost final answer composed from the evidence a
+ * run actually gathered. Used when the synthesizer ends empty or dies at a
+ * deadline: shipping the grounded digest beats shipping "(no output)". Live
+ * motivation (2026-07-16 PM, session f458849c): three consecutive turns did
+ * real tool work — file reads, listings, reviewer feedback — then told the
+ * user a transient model issue produced nothing.
+ */
+export function composeEvidenceFallbackAnswer(state: PipelineStageState): string {
+  const calls = (state.executor?.toolCalls ?? []).filter(
+    (c) => !c.is_error && c.output.trim().length > 0 && !isDuplicateToolDeflection(c),
+  );
+  if (calls.length === 0) return "";
+  const reads = calls.filter((c) => c.name === "read_file" || c.name === "grep");
+  const listings = calls.filter((c) => c.name === "list_directory" || c.name === "glob");
+  const other = calls.filter((c) => !reads.includes(c) && !listings.includes(c));
+  const target = (c: ToolCallRecord): string => {
+    const args = c.arguments as Record<string, unknown> | undefined;
+    if (typeof args?.path === "string") return args.path;
+    if (typeof args?.pattern === "string") return args.pattern;
+    return JSON.stringify(c.arguments ?? {});
+  };
+  const lines: string[] = [
+    "The synthesis model produced no final answer this turn, so here is the evidence that was actually gathered, unsummarized:",
+    "",
+  ];
+  for (const call of reads.slice(0, 6)) {
+    lines.push(`### ${call.name}: \`${target(call)}\``, "", "```", call.output.slice(0, 1_500), "```", "");
+  }
+  if (listings.length > 0) {
+    lines.push(
+      `**Directories inspected:** ${listings.slice(0, 8).map((c) => `\`${target(c)}\``).join(", ")}`,
+      "",
+    );
+  }
+  for (const call of other.slice(0, 3)) {
+    lines.push(`**${call.name}** \`${target(call)}\`: ${call.output.slice(0, 300)}`, "");
+  }
+  const reviewerNotes = state.reviewer?.feedback?.trim();
+  if (reviewerNotes && reviewerNotes !== "No review stage executed.") {
+    lines.push(`**Reviewer notes:** ${reviewerNotes.slice(0, 600)}`, "");
+  }
+  lines.push("_Runtime-composed digest (no synthesizer output). A follow-up request continues from this evidence._");
+  return lines.join("\n");
+}
+
 export function successfulWriteKeys(calls: ToolCallRecord[]): Set<string> {
   return new Set(
     calls
@@ -1806,6 +1852,16 @@ export class PipelineExecutor {
           error_message: "empty_completion",
           stop_reason: stopReason,
         });
+        // The empty-completion cascade-advance inside callModel already walked
+        // past empty models (surfaceAsAnswer). If everything still came back
+        // empty, ship the deterministic evidence digest instead of nothing —
+        // the stage row above stays truthful about the model failure.
+        const salvage = composeEvidenceFallbackAnswer(state);
+        if (salvage) {
+          onStateChange({ stage: "synthesizer", status: "completed", output: salvage });
+          await this.afterConductorStage("synthesizer", "completed", salvage, agentRunId, options, remainingQueue);
+          return { answer: salvage, emptyCompletion: false, partialErrorCode: "empty_completion_salvaged" };
+        }
         return { answer: "", emptyCompletion: true };
       }
 
@@ -2038,16 +2094,21 @@ export class PipelineExecutor {
       // index.ts's error branch turns into an SSE error frame instead of
       // prose (see `if (result.error) ... session.finish(result.error, {
       // isError: true })`).
+      // Deadline/starvation deaths with no streamed prose still have the
+      // run's gathered evidence in `state` — composing a digest costs zero
+      // model time even at the deadline, so the user gets grounded content
+      // instead of "(no output: turn_deadline)".
+      const deadlineSalvage = hasPartialDeadlineAnswer ? streamedAnswer : composeEvidenceFallbackAnswer(state);
       if (deadlineStopReason === "turn_deadline" || starvationCode === "turn_deadline") {
         return {
-          answer: hasPartialDeadlineAnswer ? streamedAnswer : "",
+          answer: deadlineSalvage,
           emptyCompletion: false,
           partialErrorCode: "turn_deadline",
         };
       }
       if (starvationCode === "stage_window_exhausted") {
         return {
-          answer: hasPartialDeadlineAnswer ? streamedAnswer : "",
+          answer: deadlineSalvage,
           emptyCompletion: false,
           partialErrorCode: "stage_window_exhausted",
         };

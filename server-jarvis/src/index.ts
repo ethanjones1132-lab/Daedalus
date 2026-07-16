@@ -2583,7 +2583,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           //   - the pool returned the same model we just excluded (no other
           //     candidate available) — this prevents a silent infinite loop
           //     that the previous build hit on the live smoke test.
-          for (let advance = 0; advance < turnBudget.max_stage_attempts - 1; advance++) {
+          // Final-answer stages may walk more of the pool than internal
+          // stages: the 2026-07-16 PM incident (session f458849c) gave up
+          // after one advance with ~78s of turn budget left and shipped
+          // nothing. The wall-clock guard below keeps this from overrunning.
+          const maxEmptyAdvances = callOptions?.surfaceAsAnswer === true
+            ? 3
+            : turnBudget.max_stage_attempts - 1;
+          for (let advance = 0; advance < maxEmptyAdvances; advance++) {
             const hasContent = typeof last?.content === "string" && last.content.trim().length > 0;
             const hasToolCalls = !callOptions?.surfaceAsAnswer
               && Array.isArray(last?.tool_calls)
@@ -2618,6 +2625,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               });
             }
             if (exclude.size === 0) break; // no exclusion built → nothing to advance past
+            if (Date.now() + 15_000 >= turnBudget.deadlineAt) {
+              console.warn(`[Jarvis Orchestrator] empty-completion cascade-advance stopped: <15s of turn budget remaining`);
+              break;
+            }
             console.warn(`[Jarvis Orchestrator] empty completion from ${last?._provider}:${last?._modelUsed} stage=${callOptions?.stageLabel ?? "?"} — advancing cascade (excluding it)`);
             // Nudge the retry model toward plain prose. `normalizeMessagesForLLM`
             // (above) only merges LEADING system messages into one; a system
@@ -3246,7 +3257,15 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             error: result.error_code ?? "empty_completion",
           });
           repetitionStore.recordOutcome(sessionId, message, result.error_code ?? "empty_completion");
-          await session.finish("The orchestrator completed but produced no output. This may be a transient model issue. Try your request again.");
+          // With the evidence-digest salvage in runSynthesizerStage, reaching
+          // this branch means the run gathered NO usable evidence either. Be
+          // honest about the cause instead of always blaming a transient
+          // model issue (the 2026-07-16 PM incident showed this exact notice
+          // three turns in a row while deadline exhaustion was the cause).
+          const noOutputNotice = result.error_code === "turn_deadline" || result.error_code === "stage_window_exhausted"
+            ? "The turn ran out of time before producing an answer, and no workspace evidence was gathered to summarize. A narrower request (name a specific file or directory) fits the budget better."
+            : "The orchestrator completed but produced no output. This may be a transient model issue. Try your request again.";
+          await session.finish(noOutputNotice);
         } else {
           // Success path. The orchestrator runs many model calls per user
           // turn (planner, executor, reviewer, synthesizer, recursion_critique,
