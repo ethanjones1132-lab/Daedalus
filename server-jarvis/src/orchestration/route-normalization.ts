@@ -119,6 +119,29 @@ export function applyForcedDeepReadRoute(route: CoordinatorResult): CoordinatorR
 }
 
 /**
+ * Throughput (2026-07-16 evening, session 10cf071d): a continuation turn of
+ * an in-progress deep task re-paid planner+reviewer ceremony (30-60s of the
+ * 180s turn) for a task that is already planned, leaving synthesis a starved
+ * stub. Continuations with prior evidence go straight to the research
+ * topology so the whole turn buys reads + synthesis.
+ */
+export function applyContinuationLeanRoute(route: CoordinatorResult): CoordinatorResult {
+  return {
+    ...route,
+    task_type: route.task_type === "general" ? "research" : route.task_type,
+    pipeline: ["executor", "synthesizer"],
+    topology: "linear",
+    context: {
+      ...route.context,
+      needs_workspace_inspection: true,
+    },
+    coordinator_rationale:
+      "Continuation of in-progress deep task: direct executor route (plan already established).",
+    conductor_source: route.conductor_source ?? "deterministic",
+  };
+}
+
+/**
  * Drop advisory stages when the routed pipeline cannot fit the time left in
  * the turn. Executor and synthesizer are the irreducible answer-producing
  * pair; planner/reviewer/rewriter are shed in that order of value to the

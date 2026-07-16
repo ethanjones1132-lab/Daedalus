@@ -1,5 +1,6 @@
 import { describe, test, expect } from "bun:test";
 import {
+  applyContinuationLeanRoute,
   applyForcedDeepReadRoute,
   buildDeterministicRoute,
   buildShortCircuitRoute,
@@ -294,5 +295,21 @@ describe("reconcileRouteWithBudget", () => {
   test("executor and synthesizer are never dropped", () => {
     const { pipeline } = reconcileRouteWithBudget(["executor", "synthesizer"], 20_000, 15_000, 4_000);
     expect(pipeline).toEqual(["executor", "synthesizer"]);
+  });
+});
+
+describe("applyContinuationLeanRoute", () => {
+  test("strips ceremony down to executor→synthesizer and marks research", () => {
+    const lean = applyContinuationLeanRoute({
+      task_type: "general",
+      pipeline: ["planner", "executor", "reviewer", "synthesizer"],
+      topology: "linear",
+      context: { needs_workspace_inspection: true, needs_memory: false, estimated_complexity: "high" },
+      coordinator_rationale: "Deterministic full_execution route: coordinator skipped.",
+      conductor_source: "deterministic",
+    } as any);
+    expect(lean.pipeline).toEqual(["executor", "synthesizer"]);
+    expect(lean.task_type).toBe("research");
+    expect(lean.coordinator_rationale).toContain("Continuation of in-progress deep task");
   });
 });

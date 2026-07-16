@@ -132,6 +132,7 @@ import {
   type TurnRequirement,
 } from "./orchestration/turn-requirements";
 import {
+  applyContinuationLeanRoute,
   applyForcedDeepReadRoute,
   buildDeterministicRoute,
   buildShortCircuitRoute,
@@ -2776,6 +2777,21 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             `(turn_ms=${turnBudget.turn_ms} executor_ms=${turnBudget.stage_ms.executor ?? "n/a"})`,
           );
         }
+        // Throughput: continuation turns of an in-progress deep task with
+        // prior evidence skip planner+reviewer ceremony (the plan already
+        // exists; ceremony cost 30-60s/turn live and starved synthesis).
+        const leanContinuation = !shortCircuit
+          && !forcedDeepRead
+          && activeTaskRun.depth === "deep"
+          && activeTaskRun.turnCount > 1
+          && activeTaskRun.evidenceCount > 0;
+        if (leanContinuation) {
+          route = applyContinuationLeanRoute(route);
+          console.log(
+            `[Jarvis Orchestrator] continuation lean route: executor→synthesizer ` +
+            `(task_turn=${activeTaskRun.turnCount} evidence=${activeTaskRun.evidenceCount})`,
+          );
+        }
         orchestratorTaskType = route.task_type;
         const normalized = normalizeRoute(
           route,
@@ -2785,7 +2801,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         sessionMemory.updateTaskRun(sessionId, {
           estimatedComplexity: route.context.estimated_complexity,
         });
-        const forcedPipeline = forcedDeepRead && !shortCircuit
+        const forcedPipeline = (forcedDeepRead || leanContinuation) && !shortCircuit
           ? (["executor", "synthesizer"] as StageName[])
           : normalized.pipeline;
         const reconciled = reconcileRouteWithBudget(

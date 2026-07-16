@@ -2202,7 +2202,10 @@ export class PipelineExecutor {
         shouldCutToSynthesis({
           wantsSynthesizer,
           hasEvidence: (state.executor?.toolCalls?.length ?? 0) > 0,
-          remainingMs: options.turnBudget?.remainingMs(),
+          // Tolerate partial TurnBudget stubs (tests inject extend-only fakes).
+          remainingMs: typeof options.turnBudget?.remainingMs === "function"
+            ? options.turnBudget.remainingMs()
+            : undefined,
           reserveMs: options.turnBudget?.finalization_reserve_ms,
         })
       ) {
