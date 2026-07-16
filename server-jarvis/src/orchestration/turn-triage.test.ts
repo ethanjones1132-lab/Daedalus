@@ -8,8 +8,14 @@ describe("isContinuationTurn", () => {
     }
   });
 
+  test("recognizes work-start commands and ordinal phase/stage milestones as continuations", () => {
+    for (const message of ["begin phase 1", "start phase 2", "resume step 2", "proceed with the plan"]) {
+      expect(isContinuationTurn(message)).toBe(true);
+    }
+  });
+
   test("rejects standalone tasks, long messages, and acknowledgements", () => {
-    for (const message of ["read the config file", "x".repeat(200), "thanks!"]) {
+    for (const message of ["read the config file", "x".repeat(200), "thanks!", "beginners guide to rust", "phase transitions in physics"]) {
       expect(isContinuationTurn(message)).toBe(false);
     }
   });

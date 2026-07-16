@@ -6,6 +6,7 @@ import {
   createIdempotentReaderCancel,
   registerAbortHandler,
   resolveReadStopReason,
+  shouldArmFinalGrace,
 } from "./stream-control";
 
 describe("classifyAbortReason", () => {
@@ -170,4 +171,14 @@ test("new deadline stop reasons preserve user-cancel and deadline precedence", (
     turnDeadlineExceeded: false,
     signal: new AbortController().signal,
   })).toBe("visible_progress_timeout");
+});
+
+describe("shouldArmFinalGrace", () => {
+  test("arms only for final-answer streams with visible accumulated prose", () => {
+    expect(shouldArmFinalGrace({ isFinalAnswerStream: false, visibleChars: 0 })).toBe(false);
+    expect(shouldArmFinalGrace({ isFinalAnswerStream: false, visibleChars: 12 })).toBe(false);
+    expect(shouldArmFinalGrace({ isFinalAnswerStream: true, visibleChars: 0 })).toBe(false);
+    expect(shouldArmFinalGrace({ isFinalAnswerStream: true, visibleChars: 1 })).toBe(true);
+    expect(shouldArmFinalGrace({ isFinalAnswerStream: true, visibleChars: 24 })).toBe(true);
+  });
 });

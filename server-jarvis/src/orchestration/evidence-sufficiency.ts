@@ -18,27 +18,138 @@
 // counts for SHALLOW requests (a bare "what's the git sha" turn should pass
 // on one such call — that's the whole point of the deterministic git
 // preflight in pipeline.ts), but it must never satisfy the deep-read floor.
-// The floor also now counts DISTINCT (tool, arguments) targets rather than
-// raw call count, so re-reading the same file repeatedly can't game it either.
+// The floor also now counts DISTINCT source-file targets rather than raw call
+// count, so re-reading the same file or grepping it with new patterns can't
+// game it either.
 // ═══════════════════════════════════════════════════════════════
 
-import type { ToolCallRecord } from "./stage-output";
+import { isDuplicateToolDeflection, type ToolCallRecord } from "./stage-output";
+import { hasWorkspaceSignal, hasWriteIntent, type TurnRequirement } from "./turn-requirements";
 
 const DEEP_READ_MARKERS =
   /\b(comprehensiv\w*|thorough\w*|entire|whole|all files|full|in[- ]depth|architecture|architectural|audit|diagnos\w*|repo|repository|codebase)\b/i;
 /** Genuine file-content tools — the only ones that count toward the deep-read floor. */
 const DEEP_READ_CONTENT_TOOLS = new Set(["read_file", "grep"]);
+const SOURCE_FILE_EXTENSIONS = new Set([
+  ".c", ".cc", ".cpp", ".cxx", ".cs", ".css", ".dart", ".ex", ".exs", ".go", ".h", ".hpp",
+  ".hs", ".html", ".java", ".js", ".jsx", ".kts", ".kt", ".lua", ".mjs", ".php", ".pl", ".ps1",
+  ".py", ".rb", ".rs", ".scala", ".sh", ".sql", ".svelte", ".swift", ".ts", ".tsx", ".vue",
+]);
 /** Broader shallow-evidence set: file content OR repo metadata satisfies a shallow turn. */
 const SHALLOW_EVIDENCE_TOOLS = new Set(["read_file", "grep", "git_metadata"]);
 const LISTING_TOOLS = new Set(["list_directory", "glob"]);
 
-/** Distinct (tool, arguments) key so re-calling the same read repeatedly counts once. */
+/** Distinct tool-target key so re-calling the same read repeatedly counts once. */
 function distinctTargetKeys(calls: ToolCallRecord[], tools: Set<string>): Set<string> {
   const keys = new Set<string>();
   for (const call of calls) {
     if (tools.has(call.name)) keys.add(`${call.name}:${JSON.stringify(call.arguments)}`);
   }
   return keys;
+}
+
+function normalizePath(rawPath: string): { path: string; absolute: boolean } {
+  let slashPath = rawPath.replace(/\\/g, "/");
+  const extendedPrefix = slashPath.match(/^\/\/\?\//);
+  const absolute = Boolean(extendedPrefix) || /^\/?[a-z]:\//i.test(slashPath) || slashPath.startsWith("/");
+  if (extendedPrefix) {
+    slashPath = slashPath.slice(4);
+    if (/^unc\//i.test(slashPath)) slashPath = `/${slashPath.slice(4)}`;
+  } else if (/^\/[a-z]:\//i.test(slashPath)) {
+    slashPath = slashPath.slice(1);
+  }
+  const prefix = /^[a-z]:\//i.test(slashPath)
+    ? slashPath.slice(0, 3).toLowerCase()
+    : slashPath.startsWith("/")
+      ? "/"
+      : "";
+  const body = slashPath.slice(prefix.length);
+  const segments: string[] = [];
+  for (const segment of body.split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") {
+      if (segments.length > 0 && segments.at(-1) !== "..") segments.pop();
+      else if (!absolute) segments.push(segment);
+      continue;
+    }
+    segments.push(segment);
+  }
+  return { path: `${prefix}${segments.join("/")}`.toLowerCase(), absolute };
+}
+
+function sourceFileKey(rawPath: string, workspaceRoot?: string): string | undefined {
+  const normalized = normalizePath(rawPath);
+  let normalizedPath = normalized.path;
+  let absolute = normalized.absolute;
+  if (workspaceRoot) {
+    const root = normalizePath(workspaceRoot);
+    const rootPath = root.path.replace(/\/+$/, "");
+    if (!absolute) {
+      normalizedPath = normalizePath(`${rootPath}/${normalizedPath}`).path;
+      absolute = true;
+    }
+    if (normalizedPath === rootPath || normalizedPath.startsWith(`${rootPath}/`)) {
+      normalizedPath = normalizedPath.slice(rootPath.length).replace(/^\/+/, "");
+      absolute = false;
+    }
+  }
+  const basename = normalizedPath.split("/").pop()?.toLowerCase() ?? "";
+  const extensionStart = basename.lastIndexOf(".");
+  if (extensionStart <= 0 || !SOURCE_FILE_EXTENSIONS.has(basename.slice(extensionStart))) return undefined;
+  return `${absolute ? "abs:" : "rel:"}${normalizedPath}`;
+}
+
+function grepOutputSourceFileKeys(call: ToolCallRecord, workspaceRoot?: string): Set<string> {
+  const args = call.arguments as Record<string, unknown> | undefined;
+  const grepPath = typeof args?.path === "string" ? args.path : undefined;
+  const grepPathIsFile = grepPath ? sourceFileKey(grepPath, workspaceRoot) !== undefined : false;
+  const normalizedGrepPath = grepPath ? normalizePath(grepPath).path.replace(/^\.\/+/, "") : "";
+  const keys = new Set<string>();
+  for (const rawLine of call.output.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    // Grep/rg output begins with the matched file path and a line/column
+    // location. Parse only that prefix; filenames mentioned in the matched
+    // source text are evidence about content, not additional file reads.
+    const location = line.match(/^(.*?):\d+(?::\d+)?(?::|$)/);
+    const candidate = (location?.[1] ?? line.split(/\s+/)[0])
+      .replace(/^[([{\"'`]+/g, "")
+      .replace(/[,:;"'`]+$/g, "");
+    const normalizedCandidate = normalizePath(candidate);
+    const normalizedCandidatePath = normalizedCandidate.path.replace(/^\.\/+/, "");
+    const candidateAlreadyUnderGrepPath = !normalizedGrepPath
+      || normalizedCandidatePath === normalizedGrepPath
+      || normalizedCandidatePath.startsWith(`${normalizedGrepPath}/`);
+    const rawCandidate = grepPath
+      && !grepPathIsFile
+      && !normalizedCandidate.absolute
+      && !candidateAlreadyUnderGrepPath
+      && !/[?*]/.test(grepPath)
+      ? `${grepPath.replace(/[\\/]+$/, "")}/${candidate}`
+      : candidate;
+    const key = sourceFileKey(rawCandidate, workspaceRoot);
+    if (key) keys.add(key);
+  }
+  return keys;
+}
+
+function sourceContentTargetKeys(call: ToolCallRecord, workspaceRoot?: string): Set<string> {
+  if (call.name === "read_file") {
+    const args = call.arguments as Record<string, unknown> | undefined;
+    const key = typeof args?.path === "string" ? sourceFileKey(args.path, workspaceRoot) : undefined;
+    return key ? new Set([key]) : new Set();
+  }
+  return call.name === "grep" ? grepOutputSourceFileKeys(call, workspaceRoot) : new Set();
+}
+
+function distinctDeepReadTargetKeys(calls: ToolCallRecord[], workspaceRoot?: string): Set<string> {
+  const paths = new Set<string>();
+  for (const call of calls) {
+    if (DEEP_READ_CONTENT_TOOLS.has(call.name)) {
+      for (const key of sourceContentTargetKeys(call, workspaceRoot)) paths.add(key);
+    }
+  }
+  return paths;
 }
 
 /**
@@ -70,6 +181,16 @@ export function isDeepReadRequest(request: string): boolean {
   return DEEP_READ_MARKERS.test(request);
 }
 
+export function turnNeedsWorkspaceEvidence(
+  requirement: TurnRequirement | undefined,
+  intentText: string,
+): boolean {
+  if (requirement === "workspace_read") return true;
+  if (requirement !== "full_execution") return false;
+  if (hasWriteIntent(intentText)) return false;
+  return isDeepReadRequest(intentText) || hasWorkspaceSignal(intentText);
+}
+
 /**
  * Decide whether the workspace tool calls the executor has produced so far
  * are enough to let synthesis proceed. Sufficiency scales with request depth
@@ -79,9 +200,10 @@ export function isDeepReadRequest(request: string): boolean {
 export function assessWorkspaceEvidence(
   toolCalls: ToolCallRecord[] | undefined,
   request: string,
+  workspaceRoot?: string,
 ): EvidenceAssessment {
   const calls = (toolCalls ?? []).filter(
-    (c) => !c.is_error && c.output.trim().length > 0,
+    (c) => !c.is_error && c.output.trim().length > 0 && !isDuplicateToolDeflection(c),
   );
   const listings = calls.filter((c) => LISTING_TOOLS.has(c.name)).length;
   const deepRead = isDeepReadRequest(request);
@@ -89,7 +211,7 @@ export function assessWorkspaceEvidence(
   if (deepRead) {
     // Deep-read floor: only genuine file-content reads count, deduped by
     // (tool, arguments) so reading the same file 3 times can't fake it.
-    const distinctContentReads = distinctTargetKeys(calls, DEEP_READ_CONTENT_TOOLS).size;
+    const distinctContentReads = distinctDeepReadTargetKeys(calls, workspaceRoot).size;
     const sufficient = distinctContentReads >= DEEP_READ_MIN_CONTENT_READS;
     return {
       sufficient,

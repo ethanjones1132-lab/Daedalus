@@ -4,7 +4,9 @@ import {
   assessWorkspaceEvidence,
   evidenceFailure,
   isDeepReadRequest,
+  turnNeedsWorkspaceEvidence,
 } from "./evidence-sufficiency";
+import { hasWorkspaceSignal } from "./turn-requirements";
 import type { ToolCallRecord } from "./stage-output";
 
 const ls: ToolCallRecord = {
@@ -24,7 +26,7 @@ const read = (p: string): ToolCallRecord => ({
 const grep: ToolCallRecord = {
   name: "grep",
   arguments: { pattern: "TODO", path: "." },
-  output: "src/a.ts:1: // TODO: refactor",
+  output: "src/c.ts:1: // TODO: refactor",
   is_error: false,
   duration_ms: 8,
 };
@@ -83,6 +85,30 @@ describe("isDeepReadRequest", () => {
   });
 });
 
+describe("turnNeedsWorkspaceEvidence", () => {
+  test("hasWorkspaceSignal recognizes exported path and workspace signals", () => {
+    expect(hasWorkspaceSignal("audit src/orchestration/pipeline.ts")).toBe(true);
+    expect(hasWorkspaceSignal("summarize this repo")).toBe(true);
+    expect(hasWorkspaceSignal("what is a JSON file?")).toBe(false);
+  });
+
+  test("workspace_read always requires workspace evidence", () => {
+    expect(turnNeedsWorkspaceEvidence("workspace_read", "what version is in package.json?")).toBe(true);
+    expect(turnNeedsWorkspaceEvidence("workspace_read", "thanks")).toBe(true);
+  });
+
+  test("full_execution research requires evidence when deep-read or workspace-scoped but not write intent", () => {
+    expect(turnNeedsWorkspaceEvidence("full_execution", "comprehensively audit this repo without modifying files")).toBe(true);
+    expect(turnNeedsWorkspaceEvidence("full_execution", "create an architecture report for src/index.ts, no edits")).toBe(true);
+  });
+
+  test("full_execution write turns and non-workspace answer turns do not use workspace evidence fences", () => {
+    expect(turnNeedsWorkspaceEvidence("full_execution", "write src/index.ts")).toBe(false);
+    expect(turnNeedsWorkspaceEvidence("full_execution", "write me a poem")).toBe(false);
+    expect(turnNeedsWorkspaceEvidence("answer_only", "explain event loops")).toBe(false);
+  });
+});
+
 describe("assessWorkspaceEvidence", () => {
   test("a lone list_directory is insufficient for a deep read", () => {
     const a = assessWorkspaceEvidence(
@@ -98,7 +124,7 @@ describe("assessWorkspaceEvidence", () => {
 
   test("listing plus three file reads is sufficient for a deep read", () => {
     const a = assessWorkspaceEvidence(
-      [ls, read("a.ts"), read("b.ts"), read("c.json")],
+      [ls, read("a.ts"), read("b.ts"), read("c.ts")],
       "comprehensively diagnose this repo",
     );
     expect(a.sufficient).toBe(true);
@@ -117,8 +143,24 @@ describe("assessWorkspaceEvidence", () => {
       [ls, read("a.ts"), read("b.ts"), grep, gitMetadata],
       "comprehensively diagnose the whole repository",
     );
-    expect(a.contentReads).toBe(3); // read_file(a.ts) + read_file(b.ts) + grep; git_metadata excluded
+    expect(a.contentReads).toBe(3); // read_file(a.ts) + read_file(b.ts) + grep(c.ts); git_metadata excluded
     expect(a.sufficient).toBe(true);
+  });
+
+  test("repeated grep patterns against one source file do not inflate the deep-read count", () => {
+    const sameFile = (pattern: string): ToolCallRecord => ({
+      name: "grep",
+      arguments: { pattern, path: "src" },
+      output: "src/a.ts:1: matching line",
+      is_error: false,
+      duration_ms: 8,
+    });
+    const a = assessWorkspaceEvidence(
+      [sameFile("TODO"), sameFile("const"), sameFile("export")],
+      "comprehensively audit this repo",
+    );
+    expect(a.sufficient).toBe(false);
+    expect(a.contentReads).toBe(1);
   });
 
   test("git_metadata calls alone never satisfy the deep-read floor, however many times repeated", () => {
@@ -132,11 +174,101 @@ describe("assessWorkspaceEvidence", () => {
 
   test("re-reading the same file repeatedly does not inflate the deep-read count", () => {
     const a = assessWorkspaceEvidence(
-      [ls, read("payload.bin"), read("payload.bin"), read("payload.bin")],
+      [ls, read("payload.ts"), read("payload.ts"), read("payload.ts")],
       "comprehensively diagnose the architecture of the repo",
     );
     expect(a.sufficient).toBe(false); // 3 calls, but only 1 DISTINCT target
     expect(a.contentReads).toBe(1);
+  });
+
+  test("path aliases for one source file do not inflate the deep-read count", () => {
+    const a = assessWorkspaceEvidence(
+      [read("src/a.ts"), read("./src/../src/a.ts"), read("/C:/repo/src/a.ts")],
+      "comprehensively diagnose the architecture of this repo",
+      "C:/repo",
+    );
+    expect(a.sufficient).toBe(false);
+    expect(a.contentReads).toBe(1);
+  });
+
+  test("extended Windows path aliases share the workspace-root target", () => {
+    const a = assessWorkspaceEvidence(
+      [
+        read("src/a.ts"),
+        read(String.raw`\\?\C:\repo\src\a.ts`),
+        read("src/b.ts"),
+      ],
+      "comprehensively diagnose the architecture of this repo",
+      "C:/repo",
+    );
+    expect(a.sufficient).toBe(false);
+    expect(a.contentReads).toBe(2);
+  });
+
+  test("grep output relative to its directory shares the read_file target", () => {
+    const a = assessWorkspaceEvidence(
+      [
+        read("src/nested/a.ts"),
+        {
+          name: "grep",
+          arguments: { pattern: "TODO", path: "src" },
+          output: "nested/a.ts:1: matching line",
+          is_error: false,
+          duration_ms: 8,
+        },
+        read("src/b.ts"),
+      ],
+      "comprehensively diagnose the architecture of this repo",
+      "C:/repo",
+    );
+    expect(a.sufficient).toBe(false);
+    expect(a.contentReads).toBe(2);
+  });
+
+  test("grep match text cannot manufacture extra source-file targets", () => {
+    const a = assessWorkspaceEvidence(
+      [{
+        name: "grep",
+        arguments: { pattern: "TODO", path: "src" },
+        output: "a.ts:1: import ./b.ts and ./c.ts",
+        is_error: false,
+        duration_ms: 8,
+      }],
+      "comprehensively diagnose the architecture of this repo",
+      "C:/repo",
+    );
+    expect(a.sufficient).toBe(false);
+    expect(a.contentReads).toBe(1);
+  });
+
+  test("workspace-root normalization does not collapse same-suffix files from another root", () => {
+    const a = assessWorkspaceEvidence(
+      [read("C:/repo/src/a.ts"), read("D:/other/src/a.ts"), read("C:/repo/src/b.ts")],
+      "comprehensively diagnose the architecture of this repo",
+      "C:/repo",
+    );
+    expect(a.sufficient).toBe(true);
+    expect(a.contentReads).toBe(3);
+  });
+
+  test("manifests and overview files do not satisfy the deep-read source floor", () => {
+    const a = assessWorkspaceEvidence(
+      [
+        read("package.json"),
+        read("README.md"),
+        read("tsconfig.json"),
+        read("OVERVIEW.md"),
+        read("docs/ARCHITECTURE_OVERVIEW.md"),
+        read("docs/system-overview.md"),
+        read("AGENTS.md"),
+        read("CLAUDE.md"),
+        read("ARCHITECTURE.md"),
+      ],
+      "comprehensively diagnose this repo",
+    );
+
+    expect(a.sufficient).toBe(false);
+    expect(a.contentReads).toBe(0);
   });
 
   test("git_metadata alone still satisfies a shallow request (the git/SHA preflight case)", () => {

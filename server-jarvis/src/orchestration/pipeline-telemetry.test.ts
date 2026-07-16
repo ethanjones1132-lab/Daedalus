@@ -3,7 +3,11 @@ import { defaultConfig } from "../config";
 import { createToolRuntime, makeExecutionContext } from "../tool-runtime";
 import type { StageRun } from "../self-tuning/store";
 import { PipelineExecutor, type StageRunRecorder } from "./pipeline";
+import { LiveConductor } from "./conductor";
+import { ConductorBus } from "./conductor-bus";
+import { AgentPool, DEFAULT_ORCHESTRATOR_AGENTS } from "./agent-pool";
 import { TurnDeadlineExceededError } from "../stream-liveness";
+import { DEEP_READ_MIN_CONTENT_READS } from "./evidence-sufficiency";
 
 function toolDefinition(name: string) {
   return {
@@ -61,7 +65,7 @@ describe("pipeline stage telemetry", () => {
 
     expect(result.answer).toBe("Partial plan: inspect the runtime first.");
     expect(result.outcome).toBe("partial");
-    expect(result.error_code).toBe("stage_timeout");
+    expect(result.error_code).toBe("turn_deadline");
     expect(result.error).toBeUndefined();
   });
 
@@ -144,6 +148,145 @@ describe("pipeline stage telemetry", () => {
     });
   });
 
+  test("full_execution research turns require workspace evidence and request a replan", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") {
+        return { content: "I can infer the architecture without reading.", tool_calls: [] };
+      }
+      if (options.stageLabel === "synthesizer") {
+        return { content: "Ungrounded architecture summary." };
+      }
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const segment = await executor.executeSegment(
+      "comprehensively audit this repo without modifying files",
+      ["executor", "synthesizer"],
+      "run-full-exec-research-evidence",
+      () => {},
+      {
+        executionProfile: "full",
+        turnRequirement: "full_execution",
+        rawMessage: "comprehensively audit this repo without modifying files",
+        allowMidRunReplan: true,
+      },
+    );
+
+    expect(segment.synthesizerAnswer).toBe("");
+    expect(segment.synthesizerFatalError).toContain("Workspace inspection failed");
+    expect(segment.fatalErrorCode).toBe("missing_workspace_evidence");
+    expect(segment.replanRequested?.trigger).toBe("evidence_insufficient");
+    expect(rows.some((row) => row.mode_id === "synthesizer")).toBe(false);
+  });
+
+  test("pipeline applies one deterministic executor re-entry before the evidence replan", async () => {
+    const collector: StageRunRecorder = { recordStageRun: () => {} };
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    let executorCalls = 0;
+    let supervisorCalls = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") {
+        executorCalls++;
+        return { content: "I can infer the architecture without reading.", tool_calls: [] };
+      }
+      return { content: "unexpected" };
+    };
+    const bus = new ConductorBus();
+    const conductor = new LiveConductor(
+      callModel as any,
+      bus,
+      new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS),
+      {
+        supervision_timeout_ms: 5_000,
+        max_tool_errors_before_reroute: 2,
+        supervise_low_complexity: false,
+      },
+      async () => {
+        supervisorCalls++;
+        return { content: '{"directive":"continue"}' };
+      },
+    );
+    conductor.setContext("general", "high", "run-pipeline-evidence-reroute");
+    const directives: string[] = [];
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, {
+      bus,
+      live: conductor,
+      collector,
+    });
+
+    const segment = await executor.executeSegment(
+      "comprehensively audit this repo",
+      ["executor", "synthesizer"],
+      "run-pipeline-evidence-reroute",
+      () => {},
+      {
+        executionProfile: "full",
+        turnRequirement: "full_execution",
+        rawMessage: "comprehensively audit this repo",
+        allowMidRunReplan: true,
+        onDirective: (directive, stage) => {
+          directives.push(`${stage}:${directive.type}`);
+        },
+      },
+    );
+
+    expect(executorCalls).toBeGreaterThanOrEqual(2);
+    expect(directives.filter((entry) => entry === "executor:reroute")).toHaveLength(1);
+    expect(supervisorCalls).toBe(1);
+    expect(segment.replanRequested?.trigger).toBe("evidence_insufficient");
+  });
+
+  test("workspace evidence nudge is bounded to two and the second requires new evidence", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("read_file"), async () => "file contents");
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    let executorCalls = 0;
+    const executorInputs: any[][] = [];
+    const callModel = async (messages: any[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") {
+        executorCalls += 1;
+        executorInputs.push(messages.map((message) => ({ ...message })));
+        if (executorCalls === 1) {
+          return { content: "I should answer from memory.", tool_calls: [] };
+        }
+        if (executorCalls === 2) {
+          return {
+            content: "Reading one file.",
+            tool_calls: [toolCallWithArgs("read_file", { path: "src/a.ts" })],
+          };
+        }
+        return { content: "I have enough now.", tool_calls: [] };
+      }
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    await executor.executeSegment(
+      "comprehensively audit src without modifying files",
+      ["executor"],
+      "run-progress-aware-nudges",
+      () => {},
+      {
+        executionProfile: "read_only",
+        turnRequirement: "workspace_read",
+        rawMessage: "comprehensively audit src without modifying files",
+      },
+    );
+
+    const thirdExecutorInput = executorInputs[2].map((message) => message.content ?? "").join("\n");
+    const nudgeCount = (thirdExecutorInput.match(/Workspace evidence is required/g) ?? []).length;
+    expect(nudgeCount).toBe(2);
+    expect(executorCalls).toBe(3);
+  });
+
   // Task 2.2: deep-read requests get a deterministic list_directory + anchor
   // read_file preflight (pipeline.ts's runExecutorStage, before the model's
   // first turn) so a weak executor model starts already grounded instead of
@@ -188,6 +331,72 @@ describe("pipeline stage telemetry", () => {
     // recorded -- proving it ran before the model's (tool_call-less) first
     // turn could have produced anything.
     expect(result.toolCalls?.[0]?.name).toBe("list_directory");
+  });
+
+  test("deep-read workspace-evidence turns inject one deterministic depth target before executor model call", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("list_directory"), async () => "package.json\nREADME.md\nsrc/");
+    runtime.register(toolDefinition("read_file"), async () => "file contents");
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    const executorInputs: Array<Array<{ role: string; content?: string }>> = [];
+    const callModel = async (messages: Array<{ role: string; content?: string }>, options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") {
+        executorInputs.push(messages.map((message) => ({ ...message })));
+        return { content: "grounded enough" };
+      }
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    await executor.executeSegment(
+      "comprehensively audit this repo without modifying files",
+      ["executor"],
+      "run-deep-read-depth-target",
+      () => {},
+      {
+        executionProfile: "full",
+        turnRequirement: "full_execution",
+        rawMessage: "comprehensively audit this repo without modifying files",
+      },
+    );
+
+    const firstExecutorInput = executorInputs[0].map((message) => message.content ?? "").join("\n");
+    const expectedLine =
+      `[Runtime depth target] Deep-read workspace evidence is required: read at least ${DEEP_READ_MIN_CONTENT_READS} distinct source files before ending the stage; listings/manifests do not count; never repeat a call.`;
+    expect((firstExecutorInput.match(/\[Runtime depth target\]/g) ?? []).length).toBe(1);
+    expect(firstExecutorInput).toContain(expectedLine);
+  });
+
+  test("all runtime evidence fences use the raw deep-read intent", async () => {
+    const collector: StageRunRecorder = { recordStageRun: () => {} };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("list_directory"), async () => "package.json\nREADME.md\nsrc/");
+    runtime.register(toolDefinition("read_file"), async () => "metadata only");
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") return { content: "I can infer the answer.", tool_calls: [] };
+      return { content: "Ungrounded answer should never be synthesized." };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const segment = await executor.executeSegment(
+      "narrow segment request",
+      ["executor", "synthesizer"],
+      "run-raw-deep-read-fence",
+      () => {},
+      {
+        executionProfile: "full",
+        turnRequirement: "full_execution",
+        rawMessage: "comprehensively audit this repo without modifying files",
+        allowMidRunReplan: true,
+      },
+    );
+
+    expect(segment.synthesizerAnswer).toBe("");
+    expect(segment.fatalErrorCode).toBe("insufficient_workspace_evidence");
+    expect(segment.replanRequested?.trigger).toBe("evidence_insufficient");
   });
 
   // Task 2.3: a model-driven read_file on a directory gets an immediate
@@ -285,6 +494,196 @@ describe("pipeline stage telemetry", () => {
     expect(maxInFlight).toBeGreaterThanOrEqual(2); // reads genuinely overlapped
     const readCalls = (result.toolCalls ?? []).filter((c) => c.name === "read_file");
     expect(readCalls.map((c) => (c.arguments as { path: string }).path)).toEqual(["a.ts", "b.ts", "c.ts"]);
+  });
+
+  test("duplicate read-only tool calls in one executor stage execute once and return a deflection result", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    let listRuns = 0;
+    runtime.register(toolDefinition("list_directory"), async () => {
+      listRuns++;
+      return "src/\npackage.json";
+    });
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor" && executorTurns++ === 0) {
+        return {
+          content: "listing twice",
+          tool_calls: [
+            toolCallWithArgs("list_directory", { path: "src" }),
+            toolCallWithArgs("list_directory", { path: "src" }),
+          ],
+        };
+      }
+      if (options.stageLabel === "executor") return { content: "done" };
+      if (options.stageLabel === "synthesizer") return { content: "Listed src." };
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "list src twice",
+      ["executor", "synthesizer"],
+      "run-duplicate-list-deflection",
+      () => {},
+      { executionProfile: "read_only" },
+    );
+
+    expect(listRuns).toBe(1);
+    const listCalls = (result.toolCalls ?? []).filter((call) => call.name === "list_directory");
+    expect(listCalls).toHaveLength(2);
+    expect(listCalls[0]?.output).toContain("package.json");
+    expect(listCalls[1]?.output).toContain("[duplicate call deflected]");
+    expect(listCalls[1]?.output).toContain("choose a NEW target");
+  });
+
+  test("a write tool invalidates duplicate read-only deflection within the executor stage", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    let listRuns = 0;
+    let writeRuns = 0;
+    runtime.register(toolDefinition("list_directory"), async () => {
+      listRuns++;
+      return "src/\npackage.json";
+    });
+    runtime.register(toolDefinition("write_file"), async () => {
+      writeRuns++;
+      return "wrote file";
+    });
+    const cfg = defaultConfig();
+    cfg.tools = { ...cfg.tools, require_approval: [], sandbox_mode: "permissive" };
+    const ctx = makeExecutionContext("agent", cfg, { workspace_path: process.cwd() });
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor" && executorTurns++ === 0) {
+        return {
+          content: "list, write, list again",
+          tool_calls: [
+            toolCallWithArgs("list_directory", { path: "src" }),
+            toolCallWithArgs("list_directory", { path: "src" }),
+            toolCallWithArgs("write_file", { path: "src/generated.txt", content: "fresh" }),
+            toolCallWithArgs("list_directory", { path: "src" }),
+          ],
+        };
+      }
+      if (options.stageLabel === "executor") return { content: "done" };
+      if (options.stageLabel === "synthesizer") return { content: "Updated src." };
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "create a file and relist src",
+      ["executor", "synthesizer"],
+      "run-write-invalidates-duplicate-deflection",
+      () => {},
+      { executionProfile: "full" },
+    );
+
+    expect(writeRuns).toBe(1);
+    expect(listRuns).toBe(2);
+    const listOutputs = (result.toolCalls ?? [])
+      .filter((call) => call.name === "list_directory")
+      .map((call) => call.output);
+    expect(listOutputs).toEqual([
+      expect.stringContaining("package.json"),
+      expect.stringContaining("[duplicate call deflected]"),
+      expect.stringContaining("package.json"),
+    ]);
+  });
+
+  test("a dangerous side-effect tool also invalidates duplicate read-only deflection", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    let listRuns = 0;
+    let sideEffectRuns = 0;
+    runtime.register(toolDefinition("list_directory"), async () => {
+      listRuns++;
+      return `snapshot-${listRuns}`;
+    });
+    runtime.register({ ...toolDefinition("bash"), requires_approval: false, dangerous: true }, async () => {
+      sideEffectRuns++;
+      return "mutated workspace";
+    });
+    const cfg = defaultConfig();
+    cfg.tools = { ...cfg.tools, require_approval: [], sandbox_mode: "permissive" };
+    const ctx = makeExecutionContext("agent", cfg, { workspace_path: process.cwd() });
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor" && executorTurns++ === 0) {
+        return {
+          content: "list, mutate, list again",
+          tool_calls: [
+            toolCallWithArgs("list_directory", { path: "src" }),
+            toolCallWithArgs("bash", { command: "touch src/generated.txt" }),
+            toolCallWithArgs("list_directory", { path: "src" }),
+          ],
+        };
+      }
+      if (options.stageLabel === "executor") return { content: "done" };
+      if (options.stageLabel === "synthesizer") return { content: "Updated src." };
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "mutate the workspace and relist src",
+      ["executor", "synthesizer"],
+      "run-dangerous-invalidates-duplicate-deflection",
+      () => {},
+      { executionProfile: "full" },
+    );
+
+    expect(sideEffectRuns).toBe(1);
+    expect(listRuns).toBe(2);
+    expect((result.toolCalls ?? []).filter((call) => call.name === "list_directory").map((call) => call.output))
+      .toEqual(["snapshot-1", "snapshot-2"]);
+  });
+
+  test("duplicate deflections do not inflate executor evidence progress counts", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("read_file"), async () => "file body");
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    const progressCounts: number[] = [];
+    const turnBudget = {
+      extendStageOnProgress: (_stage: string, count: number) => progressCounts.push(count),
+    };
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor" && executorTurns++ === 0) {
+        return {
+          content: "reading same file twice",
+          tool_calls: [
+            toolCallWithArgs("read_file", { path: "README.md" }),
+            toolCallWithArgs("read_file", { path: "README.md" }),
+          ],
+        };
+      }
+      if (options.stageLabel === "executor") return { content: "done" };
+      if (options.stageLabel === "synthesizer") return { content: "Read README." };
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "read README twice",
+      ["executor", "synthesizer"],
+      "run-duplicate-progress-stability",
+      () => {},
+      { executionProfile: "read_only", turnBudget: turnBudget as any },
+    );
+
+    expect(result.toolCalls?.map((call) => call.output)).toEqual([
+      "file body",
+      expect.stringContaining("[duplicate call deflected]"),
+    ]);
+    expect(progressCounts[0]).toBe(1);
   });
 
   test("PipelineResult.toolCalls is undefined when the executor stage never ran", async () => {
@@ -571,6 +970,7 @@ describe("pipeline stage telemetry", () => {
     let executorTurns = 0;
     let rewriterCallCount = 0;
     let rewriterWriteCount = 0;
+    let synthesizerCallCount = 0;
     const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
       if (options.stageLabel === "executor" && executorTurns++ === 0) {
         return { content: "inspecting", tool_calls: [toolCallWithArgs("read_file", { path: "CONTEXT.md" })] };
@@ -601,6 +1001,7 @@ describe("pipeline stage telemetry", () => {
         return { content: "repair round complete" };
       }
       if (options.stageLabel === "synthesizer") {
+        synthesizerCallCount++;
         return { content: "Repairs applied." };
       }
       return { content: "unexpected" };
@@ -624,6 +1025,7 @@ describe("pipeline stage telemetry", () => {
       (row) => row.mode_id === "rewriter" && (row.tool_calls_json ?? "").includes("write_file"),
     );
     expect(rewriterWriteRows.length).toBe(2);
+    expect(synthesizerCallCount).toBe(0);
   });
 
   test("a repair round with no new write-effect progress exits the loop immediately", async () => {

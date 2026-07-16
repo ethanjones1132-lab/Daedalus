@@ -111,11 +111,7 @@ describe("pipeline truncation honesty (T1.3 / T1.4)", () => {
     expect(result.error_code).toBe("token_cap");
   });
 
-  test("deadline-partial still pins stage_timeout via TurnDeadlineExceededError", async () => {
-    // Existing behavior: catch block ships streamed partial with stage_timeout.
-    // Verified by orchestration.test.ts "rewriter timeout yields a partial result".
-    // This test documents the synthesizer path for stage_timeout partialErrorCode
-    // when callModel throws TurnDeadlineExceededError after streaming.
+  test("deadline-partial keeps visible prose and returns typed turn_deadline", async () => {
     const rows: StageRun[] = [];
     const callModel = async (_m: any, options: any = {}) => {
       options.onChunk?.("partial stream content here ");
@@ -132,7 +128,30 @@ describe("pipeline truncation honesty (T1.3 / T1.4)", () => {
       {},
     );
     expect(result.outcome).toBe("partial");
-    expect(result.error_code).toBe("stage_timeout");
+    expect(result.error_code).toBe("turn_deadline");
     expect(result.answer).toContain("partial stream");
+  });
+
+  test("reasoning-only turn deadline returns empty answer with typed turn_deadline", async () => {
+    const rows: StageRun[] = [];
+    const callModel = async () => {
+      const err = new Error("Total turn deadline (30000ms) exceeded at stage=synthesizer");
+      err.name = "TurnDeadlineExceededError";
+      throw err;
+    };
+    const ex = makeExecutor(callModel, rows);
+    const result = await ex.execute(
+      "answer me",
+      ["synthesizer"],
+      "run-deadline-reasoning-only",
+      () => {},
+      {},
+    );
+    expect(result.outcome).toBe("partial");
+    expect(result.error_code).toBe("turn_deadline");
+    expect(result.answer).toBe("");
+    const synth = rows.find((r) => r.mode_id === "synthesizer");
+    expect(synth?.stop_reason).toBe("turn_deadline");
+    expect(synth?.partial_error_code).toBe("turn_deadline");
   });
 });

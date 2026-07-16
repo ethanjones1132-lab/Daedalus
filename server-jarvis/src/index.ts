@@ -94,6 +94,7 @@ import {
   createIdempotentReaderCancel,
   registerAbortHandler,
   resolveReadStopReason,
+  shouldArmFinalGrace,
 } from "./stream-control";
 import {
   createStreamFinishTracker,
@@ -112,8 +113,9 @@ import { AgentPool, firstTokenTimeoutFor, formatPoolDiversity } from "./orchestr
 import { excludedModelKeys } from "./model-failure-memory";
 import { PipelineExecutor } from "./orchestration/pipeline";
 import { combinedStageExclusions, StageHealthRegistry, type RecoverableFailureKind } from "./orchestration/stage-health";
-import { ModelScorecard } from "./orchestration/model-scorecard";
+import { ModelScorecard, type ScorecardAttempt } from "./orchestration/model-scorecard";
 import { createTurnBudget } from "./orchestration/turn-budget";
+import { isDeepReadRequest } from "./orchestration/evidence-sufficiency";
 import { OrchestrationAdmissionController, type AdmissionLease } from "./orchestration/admission-controller";
 import type { PipelineProgressState, PipelineRecursionEvent } from "./orchestration/pipeline";
 import { ConductorBus } from "./orchestration/conductor-bus";
@@ -241,6 +243,16 @@ const activeStreams = new ActiveStreamRegistry();
 const orchestrationAdmission = new OrchestrationAdmissionController({ interactive: 2, background: 1 });
 const stageHealth = new StageHealthRegistry();
 const modelScorecard = new ModelScorecard();
+const SCORECARD_SEEDED_STAGES = ["coordinator", "planner", "executor", "reviewer", "rewriter", "synthesizer"] as const;
+try {
+  const scorecardSeedStore = new SelfTuningStore();
+  const sinceIso = new Date(Date.now() - (7 * 24 * 60 * 60 * 1000)).toISOString();
+  for (const stage of SCORECARD_SEEDED_STAGES) {
+    modelScorecard.seedFromHistory(stage, scorecardSeedStore.getRecentStageAttributions(stage, sinceIso, 400));
+  }
+} catch (e) {
+  console.warn("[Jarvis Orchestrator] model scorecard history seed skipped:", e);
+}
 // Cross-turn no-progress guard (orchestration/repetition-guard.ts): compares
 // a finalized turn's answer + evidence keys against the previous turn's, for
 // the same session. See the 2026-07-12 incident note in repetition-guard.ts.
@@ -1291,7 +1303,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     message,
     continuationRequirements.get(sessionId),
   ).result.requirement;
-  const turnBudget = createTurnBudget(initialRequirement, "medium", turnStartedAt);
+  const turnBudget = createTurnBudget(
+    initialRequirement,
+    isDeepReadRequest(message) ? "high" : "medium",
+    turnStartedAt,
+  );
   const ensureTurnBudget = (stage: string): void => {
     if (Date.now() >= turnBudget.deadlineAt) {
       throw new TurnDeadlineExceededError(stage, turnBudget.turn_ms);
@@ -1613,6 +1629,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         let orchLastModel: string | undefined;
         let orchLastProvider: string | undefined;
         let orchLastFirstTokenMs: number | undefined;
+        let orchLastScorecardAttempt: ScorecardAttempt | undefined;
         let orchestratorAgentRunId: string | undefined;
         const callModelAttempt = async (messages: any[], callOptions?: any, excludeModels?: Set<string>) => {
           ensureTurnBudget(callOptions?.stageLabel ?? "orchestrator_model_attempt");
@@ -1905,7 +1922,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const reasoningParser = new ReasoningParser(sessionId);
           const decoder = new TextDecoder();
           let buffer = "";
+          // Raw text is retained for text-tool extraction and final
+          // reasoning stripping. Visible text is tracked separately because
+          // providers may deliver hidden <think> content through the same
+          // content field before ReasoningParser classifies it.
           let fullTurnText = "";
+          let visibleTurnText = "";
           let activeToolCalls: any[] = [];
           let firstTokenReceived = false;
           let firstTokenLatencyMs: number | undefined;
@@ -1994,12 +2016,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // T1.3: surfaceAsAnswer gets a grace window past deadlineAt so we
           // never hard-chop a streaming final answer mid-word. Non-final
           // stages still abort at deadlineAt. Grace is only armed once first
-          // token is received and soft deadline fires with tokens in flight.
+          // visible answer prose has accumulated and soft deadline fires with
+          // tokens in flight. Hidden reasoning keeps transport watchdogs alive
+          // but must not buy final-answer grace by itself.
           const isFinalAnswerStream = callOptions?.surfaceAsAnswer === true;
           let finalGraceTimer: ReturnType<typeof setTimeout> | null = null;
           const turnDeadlineTimer = setTimeout(() => {
             if (streamAbort.signal.aborted) return;
-            if (isFinalAnswerStream && firstTokenReceived) {
+            if (shouldArmFinalGrace({ isFinalAnswerStream, visibleChars: visibleTurnText.length })) {
               // Soft deadline: keep streaming under the grace window.
               const graceMs = Math.max(0, turnBudget.finalStreamDeadlineAt() - Date.now());
               console.warn(
@@ -2048,6 +2072,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             } else if (!callOptions?.suppressActivity) {
               await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "agent_activity", stage: callOptions?.stageLabel ?? "agent", text, session_id: sessionId })}\n\n`));
             }
+          };
+          const emitVisibleChunk = async (text: string) => {
+            if (!text) return;
+            visibleTurnText += text;
+            callOptions?.onChunk?.(text);
+            await emitTextToken(text);
           };
 
           try {
@@ -2148,10 +2178,6 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                       console.warn(`[Jarvis Orchestrator] degenerate stream detected model=${actualModelUsed} stage=${stageName} — cancelling reader`);
                       cancelReader("Degenerate stream detected").catch(() => {});
                     }
-                    if (callOptions?.onChunk) {
-                      callOptions.onChunk(chunkText);
-                    }
-
                     if (reasoningParser) {
                       for (const re of reasoningParser.processChunk(chunkText)) {
                         const visibleText = visibleTextFromReasoningEvent(re);
@@ -2168,7 +2194,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                           markVisibleProgress();
                           const sanitized = textStreamSanitizer.push(visibleText);
                           if (sanitized) {
-                            await emitTextToken(sanitized);
+                            await emitVisibleChunk(sanitized);
                           }
                         }
                       }
@@ -2176,7 +2202,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                       markVisibleProgress();
                       const sanitized = textStreamSanitizer.push(chunkText);
                       if (sanitized) {
-                        await emitTextToken(sanitized);
+                        await emitVisibleChunk(sanitized);
                       }
                     }
                   }
@@ -2206,7 +2232,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               } else {
                 const sanitized = textStreamSanitizer.push(visibleText);
                 if (sanitized) {
-                  await emitTextToken(sanitized);
+                  await emitVisibleChunk(sanitized);
                 }
               }
             }
@@ -2218,7 +2244,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
           const remaining = textStreamSanitizer.flush();
           if (remaining) {
-            await emitTextToken(remaining);
+            await emitVisibleChunk(remaining);
           }
 
           // Normalize the stream-assembled tool-call slots into a dispatchable
@@ -2413,10 +2439,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             throw error;
           } finally {
             if (attemptStage && attemptModel && attemptProvider && !streamAbort.signal.aborted) {
-              modelScorecard.record(attemptStage, `${attemptProvider}:${attemptModel}`, {
+              const trackedScorecardAttempt = modelScorecard.record(attemptStage, `${attemptProvider}:${attemptModel}`, {
                 ok: attemptOutcome === "success" || attemptOutcome === "truncated",
                 firstTokenMs: attemptFirstTokenMs,
               });
+              if (attemptStage === "coordinator") orchLastScorecardAttempt = trackedScorecardAttempt;
               recordInferenceAttempt({
                 ts: Date.now(),
                 session_id: sessionId,
@@ -2635,6 +2662,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             stage: "coordinator",
             kind: "parse_failure",
           });
+          if (orchLastScorecardAttempt) {
+            modelScorecard.revise(orchLastScorecardAttempt, { ok: false });
+          } else {
+            modelScorecard.record("coordinator", `${orchLastProvider}:${orchLastModel}`, {
+              ok: false,
+              firstTokenMs: orchLastFirstTokenMs,
+            });
+          }
           console.warn(
             `[Jarvis Orchestrator] coordinator parse_failure strike ` +
             `${orchLastProvider}:${orchLastModel} — excluded for 5min cooldown`,
@@ -2793,6 +2828,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           executionProfile,
           rawMessage: message,
           turnRequirement: turnReq.requirement,
+          estimatedComplexity: route.context.estimated_complexity,
           workerInstructions: instructionSelection.instructions,
           sharedContext: mergedSharedContext,
           sessionMemory: sessionMemory,
@@ -4679,6 +4715,7 @@ console.log(`[Jarvis API] Listening on http://localhost:${PORT}`);
 void persistentConductor.warmUp()
   .then(({ model, latencyMs }) => {
     console.log(`[PersistentConductor] warm model=${model} latency_ms=${latencyMs}`);
+    persistentConductor.startKeepWarm();
   })
   .catch((error) => {
     console.warn(

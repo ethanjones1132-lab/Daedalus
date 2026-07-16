@@ -166,6 +166,10 @@ export interface ConductorConfig {
   num_ctx: number;
   /** Fall back to the API coordinator pool when local inference fails. */
   fallback_to_api: boolean;
+  /** Keep the local conductor resident with periodic tiny pings. */
+  keep_warm: boolean;
+  /** Interval between local conductor keep-warm pings (ms). */
+  keep_warm_interval_ms: number;
   /** Prune in-memory sessions inactive longer than this (ms). */
   session_ttl_ms: number;
   /** Max coordinator turn pairs kept in the hot prefix before pruning oldest. */
@@ -491,6 +495,8 @@ export function defaultConfig(): JarvisConfig {
         max_tokens: 700,
         num_ctx: 8192,
         fallback_to_api: true,
+        keep_warm: true,
+        keep_warm_interval_ms: 600_000,
         session_ttl_ms: 30 * 60 * 1000,
         max_turns_in_cache: 12,
         persist_sessions: true,

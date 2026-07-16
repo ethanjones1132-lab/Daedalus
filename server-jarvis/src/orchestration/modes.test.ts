@@ -189,6 +189,16 @@ describe("executorTurnLimit", () => {
     // here. The resolved value is whatever the mode's own setting says.
     expect(executorTurnLimit("full")).toBe(BUILTIN_MODES.executor.max_turns);
   });
+
+  test("deep-read and high-complexity executor turns get the expanded 8-turn cap", () => {
+    expect(executorTurnLimit("read_only", { deepRead: true, complexity: "medium" })).toBe(8);
+    expect(executorTurnLimit("full", { deepRead: false, complexity: "high" })).toBe(8);
+  });
+
+  test("ordinary executor turns stay capped at 4", () => {
+    expect(executorTurnLimit("read_only", { deepRead: false, complexity: "medium" })).toBe(4);
+    expect(executorTurnLimit("full", { deepRead: false, complexity: "low" })).toBe(4);
+  });
 });
 
 describe("getToolsForMode — modeId handling", () => {

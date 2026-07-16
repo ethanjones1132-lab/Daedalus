@@ -73,13 +73,14 @@ describe("normalizeRemainingStages (T2.2)", () => {
     expect(r).toEqual(["executor", "reviewer", "synthesizer"]);
   });
 
-  test("preserves explicit executor re-entry after executor stage", () => {
-    const r = normalizeRemainingStages(
-      ["re-enter:executor", "reviewer", "synthesizer"],
-      "full_execution",
-      "executor",
-    );
-    expect(r).toEqual(["executor", "reviewer", "synthesizer"]);
+  test("preserves explicit re-entry of the current stage while dropping plain echoes", () => {
+    expect(
+      normalizeRemainingStages(["re-enter:executor", "synthesizer"], "full_execution", "executor"),
+    ).toEqual(["executor", "reviewer", "synthesizer"]);
+
+    expect(
+      normalizeRemainingStages(["executor", "synthesizer"], "full_execution", "executor"),
+    ).toEqual(["reviewer", "synthesizer"]);
   });
 });
 

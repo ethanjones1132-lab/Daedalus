@@ -125,13 +125,14 @@ export class LiveConductor {
         consecutiveToolErrors: this.consecutiveToolErrors,
       })) return { type: "continue" };
 
+      const evidenceErrors = evidence.toolCalls === undefined
+        ? undefined
+        : recentToolErrorsFromEvidence(evidence.toolCalls);
       const digest: SupervisionDigest = {
         stage,
         outcome,
         outputSummary: output.slice(0, 500),
-        recentToolErrors: recentToolErrorsFromEvidence(evidence.toolCalls).length > 0
-          ? recentToolErrorsFromEvidence(evidence.toolCalls)
-          : [...this.recentToolErrors],
+        recentToolErrors: evidenceErrors ?? [...this.recentToolErrors],
         toolCallCounts: toolCallCountsByName(evidence.toolCalls),
         toolErrorCount: evidence.toolCalls
           ? evidence.toolCalls.filter((call) => call.is_error).length

@@ -217,6 +217,26 @@ describe("shouldShortCircuitCoordinator", () => {
       classifyTurnRequirements("fix src/index.ts"),
       false,
     )).toBe(false);
+    expect(shouldShortCircuitCoordinator(
+      "begin phase 1",
+      classifyTurnRequirements("begin phase 1"),
+      false,
+    )).toBe(false);
+    expect(shouldShortCircuitCoordinator(
+      "start phase 2",
+      classifyTurnRequirements("start phase 2"),
+      false,
+    )).toBe(false);
+    expect(shouldShortCircuitCoordinator(
+      "resume step 2",
+      classifyTurnRequirements("resume step 2"),
+      false,
+    )).toBe(false);
+    expect(shouldShortCircuitCoordinator(
+      "proceed with the plan",
+      classifyTurnRequirements("proceed with the plan"),
+      false,
+    )).toBe(false);
   });
 });
 
@@ -291,6 +311,17 @@ describe("classifyTurnRequirements", () => {
     expect(result.signals).toContain("mutation_verb");
   });
 
+  test.each([
+    ["begin phase 1"],
+    ["start phase 2"],
+    ["resume step 2"],
+    ["proceed with the plan"],
+  ])("work-start command: %s → full_execution with work_start_command", (message) => {
+    const result = classifyTurnRequirements(message);
+    expect(result.requirement).toBe("full_execution");
+    expect(result.signals).toContain("work_start_command");
+  });
+
   test("mutation takes precedence over read on a path", () => {
     // "edit C:\x.ts" must be full_execution, not workspace_read.
     const r = classifyTurnRequirements('edit "C:\\src\\x.ts" to add a header');
@@ -348,5 +379,10 @@ describe("classifyTurnRequirements", () => {
     // The classifier only sees what it is given; a follow-up greeting passed
     // alone is conversational even if a prior turn read files.
     expect(classifyTurnRequirements("thanks, that's perfect!").requirement).toBe("conversational");
+  });
+
+  test("work-start commands stay unaffected by unrelated answer-only language", () => {
+    expect(classifyTurnRequirements("beginners guide to rust").requirement).toBe("answer_only");
+    expect(classifyTurnRequirements("phase transitions in physics").requirement).toBe("answer_only");
   });
 });
