@@ -58,3 +58,4 @@ __pycache__/
 
 # --- Temporary scripts (never commit) ---
 scripts/update-priorities-*.py
+scripts/pin-first-token-timeout-telemetry.py
