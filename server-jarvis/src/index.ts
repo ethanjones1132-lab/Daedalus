@@ -1316,11 +1316,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
   ).result.requirement;
   // F5: "force deep read" is a real contract — extended budget + direct route.
   const forcedDeepRead = FORCE_DEEP_READ_PATTERN.test(message);
+  // Deep-task turns (fresh deep-read intent or continuation of a deep task
+  // run) get the same long-haul window: a multi-file audit structurally
+  // cannot fit the 180s tier, and the 600s ceiling only binds when there is
+  // real work left (turns end at synthesis completion regardless).
+  const deepTaskIntent = resolveDeepReadIntent(message, priorTaskRun?.depth);
   const turnBudget = createTurnBudget(
     initialRequirement,
-    resolveDeepReadIntent(message, priorTaskRun?.depth) || forcedDeepRead ? "high" : "medium",
+    deepTaskIntent || forcedDeepRead ? "high" : "medium",
     turnStartedAt,
-    { forcedDeepRead },
+    { forcedDeepRead, deepTask: deepTaskIntent },
   );
   const ensureTurnBudget = (stage: string): void => {
     if (Date.now() >= turnBudget.deadlineAt) {

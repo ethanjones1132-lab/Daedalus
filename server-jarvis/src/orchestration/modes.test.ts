@@ -190,8 +190,12 @@ describe("executorTurnLimit", () => {
     expect(executorTurnLimit("full")).toBe(BUILTIN_MODES.executor.max_turns);
   });
 
-  test("deep-read and high-complexity executor turns get the expanded 8-turn cap", () => {
-    expect(executorTurnLimit("read_only", { deepRead: true, complexity: "medium" })).toBe(8);
+  test("deep reads scale to the 600s contract's 16-turn cap; high complexity keeps 8", () => {
+    // 2026-07-16 evening: deep reads carry the EXTENDED_DEEP (600s/420s
+    // executor) budget, so the turn cap scales with the window; the loop
+    // still exits early on a no-tool-call turn or budget exhaustion.
+    expect(executorTurnLimit("read_only", { deepRead: true, complexity: "medium" })).toBe(16);
+    expect(executorTurnLimit("full", { deepRead: true, complexity: "high" })).toBe(16);
     expect(executorTurnLimit("full", { deepRead: false, complexity: "high" })).toBe(8);
   });
 

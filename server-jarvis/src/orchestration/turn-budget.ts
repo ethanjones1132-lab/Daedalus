@@ -56,13 +56,26 @@ export const FINAL_STREAM_GRACE_MS = 30_000;
 const PROGRESS_EXTENSION_MS = 20_000;      // per evidence-producing stage turn
 const STAGE_EXTENSION_CEILING_MS = 90_000; // a stage may never exceed this (unforced)
 const ABSOLUTE_TURN_CAP_MS = 180_000;      // default high-complexity full_execution cap
-/** F5: forced deep-read hatch grants a longer absolute turn window. */
-export const FORCED_DEEP_READ_TURN_MS = 240_000;
-export const FORCED_DEEP_READ_EXECUTOR_MS = 150_000;
+/**
+ * Deep-task contract (2026-07-16 evening): any turn classified deep — a
+ * deep-read request, a continuation of a deep task, or the explicit "force
+ * deep read" hatch — gets a long-haul window. A ~14-file audit structurally
+ * cannot fit 180s; 600s is a CEILING, not a target: turns still end the
+ * moment synthesis completes, and the loop-bounding guards (replan cap,
+ * reroute cap, supervision cap, executor turn limit, runway guard) are what
+ * prevent pathological spend, not the clock.
+ */
+export const EXTENDED_DEEP_TURN_MS = 600_000;
+export const EXTENDED_DEEP_EXECUTOR_MS = 420_000;
+/** F5 aliases: the forced hatch now grants the same deep-task contract. */
+export const FORCED_DEEP_READ_TURN_MS = EXTENDED_DEEP_TURN_MS;
+export const FORCED_DEEP_READ_EXECUTOR_MS = EXTENDED_DEEP_EXECUTOR_MS;
 
 export interface CreateTurnBudgetOptions {
   /** User said "force deep read" — extended budget + higher absolute cap. */
   forcedDeepRead?: boolean;
+  /** Turn classified deep (deep-read intent or deep task-run continuation). */
+  deepTask?: boolean;
 }
 
 /** Runtime starvation codes — not model failure for learning consumers. */
@@ -135,30 +148,28 @@ export function createTurnBudget(
   opts: CreateTurnBudgetOptions = {},
 ): TurnBudget {
   const base = BUDGETS[requirement];
-  const forcedDeepRead = Boolean(opts.forcedDeepRead);
-  // F5: forced deep-read hatch grants 240s absolute turn + 150s executor.
-  const absolute_cap_ms = forcedDeepRead ? FORCED_DEEP_READ_TURN_MS : ABSOLUTE_TURN_CAP_MS;
+  // Deep-task contract: the explicit force hatch and turns classified deep
+  // (deep-read intent / deep task-run continuation) share the same
+  // long-haul window.
+  const extendedDeep = Boolean(opts.forcedDeepRead || opts.deepTask);
+  const absolute_cap_ms = extendedDeep ? EXTENDED_DEEP_TURN_MS : ABSOLUTE_TURN_CAP_MS;
   let turn_ms = requirement === "full_execution" && complexity === "high"
     ? Math.min(180_000, base.turn_ms + 30_000)
     : base.turn_ms;
   const stage_ms = { ...base.stage_ms };
-  if (forcedDeepRead) {
-    turn_ms = FORCED_DEEP_READ_TURN_MS;
-    if (stage_ms.executor !== undefined) {
-      stage_ms.executor = FORCED_DEEP_READ_EXECUTOR_MS;
-    } else {
-      // conversational/answer_only have no executor budget — grant one when forced.
-      stage_ms.executor = FORCED_DEEP_READ_EXECUTOR_MS;
-    }
+  if (extendedDeep) {
+    turn_ms = EXTENDED_DEEP_TURN_MS;
+    // conversational/answer_only have no executor budget — grant one too.
+    stage_ms.executor = EXTENDED_DEEP_EXECUTOR_MS;
   }
   // F2: cumulative usage per stage + current inflight start (usage-based,
   // not wall-clock since first entry).
   const stageUsedAccumMs = new Map<string, number>();
   const stageInflightStart = new Map<string, number>();
-  // Forced stages may start above the default 90s progress ceiling; never
+  // Extended stages may start above the default 90s progress ceiling; never
   // shrink them via extendStageOnProgress, and allow growth up to absolute_cap.
-  const stageExtensionCeilingMs = forcedDeepRead
-    ? Math.max(STAGE_EXTENSION_CEILING_MS, FORCED_DEEP_READ_EXECUTOR_MS)
+  const stageExtensionCeilingMs = extendedDeep
+    ? Math.max(STAGE_EXTENSION_CEILING_MS, EXTENDED_DEEP_EXECUTOR_MS)
     : STAGE_EXTENSION_CEILING_MS;
 
   const budget: TurnBudget = {

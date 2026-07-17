@@ -97,7 +97,12 @@ export function executorTurnLimit(
   profile: ExecutionProfile,
   context: { deepRead?: boolean; complexity?: "low" | "medium" | "high" } = {},
 ): number {
-  if (context.deepRead || context.complexity === "high") return 8;
+  // Deep reads carry the 600s/420s-executor contract (turn-budget.ts,
+  // 2026-07-16): 8 turns of ~20-30s each would exit the loop long before the
+  // budget binds, so the ceiling scales with the window. The loop still ends
+  // early when the model stops emitting tool calls or the budget runs out.
+  if (context.deepRead) return 16;
+  if (context.complexity === "high") return 8;
   return profile === "read_only" ? 4 : BUILTIN_MODES.executor.max_turns;
 }
 

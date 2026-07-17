@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
   createTurnBudget,
+  EXTENDED_DEEP_EXECUTOR_MS,
+  EXTENDED_DEEP_TURN_MS,
   FINAL_STREAM_GRACE_MS,
   FORCED_DEEP_READ_EXECUTOR_MS,
   FORCED_DEEP_READ_TURN_MS,
@@ -36,12 +38,30 @@ describe("turn budgets", () => {
     expect(unforced.stage_ms.executor).toBe(60_000);
   });
 
-  test("forced deep read extendStageOnProgress never shrinks the 150s executor ceiling", () => {
+  test("forced deep read extendStageOnProgress never shrinks the extended executor ceiling", () => {
     const budget = createTurnBudget("workspace_read", "high", 0, { forcedDeepRead: true });
     expect(budget.stage_ms.executor).toBe(FORCED_DEEP_READ_EXECUTOR_MS);
     budget.extendStageOnProgress("executor", 1);
     expect(budget.stage_ms.executor).toBeGreaterThanOrEqual(FORCED_DEEP_READ_EXECUTOR_MS);
     expect(budget.turn_ms).toBeLessThanOrEqual(FORCED_DEEP_READ_TURN_MS);
+  });
+
+  // 2026-07-16 evening: deep-classified turns (fresh deep-read intent or a
+  // continuation of a deep task run) share the forced hatch's long-haul
+  // contract — 600s ceiling, 420s executor — without needing the magic phrase.
+  test("deepTask option grants the same extended contract as the forced hatch", () => {
+    const deep = createTurnBudget("full_execution", "high", 0, { deepTask: true });
+    expect(deep.turn_ms).toBe(EXTENDED_DEEP_TURN_MS);
+    expect(deep.turn_ms).toBe(600_000);
+    expect(deep.stage_ms.executor).toBe(EXTENDED_DEEP_EXECUTOR_MS);
+    expect(deep.finalStreamDeadlineAt()).toBe(EXTENDED_DEEP_TURN_MS + FINAL_STREAM_GRACE_MS);
+
+    const forced = createTurnBudget("full_execution", "high", 0, { forcedDeepRead: true });
+    expect(forced.turn_ms).toBe(deep.turn_ms);
+    expect(forced.stage_ms.executor).toBe(deep.stage_ms.executor);
+
+    const standard = createTurnBudget("full_execution", "high", 0);
+    expect(standard.turn_ms).toBe(180_000);
   });
 
   test("uses compact budgets for conversational turns", () => {
