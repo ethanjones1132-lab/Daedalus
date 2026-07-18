@@ -104,6 +104,22 @@ describe("durable task-run contract", () => {
     expect(next.contract.writeIntent).toBe(true);
   });
 
+  // 2026-07-18 live fixture (run_22676bb4): this literal answer was ACCEPTED
+  // as completed, dropping the task run's objective/workspace so "re-execute"
+  // wandered into the default workspace.
+  test("a 'partially applied' answer pauses the task run instead of completing it", () => {
+    const result = assessTaskRunAcceptance({
+      requirement: "full_execution",
+      depth: "standard",
+      pipelineOutcome: "success",
+      answer:
+        "## Summary\n\nThe Phase 1 changes were partially applied in this turn. The header file (`PluginProcessor.h`) was successfully updated with the new member variable. The corresponding C++ modification for `PluginProcessor.cpp` could not be confirmed as completed from the available pipeline output.",
+      evidenceCount: 4,
+    });
+    expect(result.accepted).toBe(false);
+    expect(result.status).toBe("paused");
+  });
+
   test("completed task: a work order starts fresh instead of resuming", () => {
     const original = {
       ...createTaskRun({

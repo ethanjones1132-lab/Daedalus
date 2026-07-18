@@ -67,7 +67,16 @@ export function terminalSubtypeForRunOutcome(
   return "partial";
 }
 
-const INCOMPLETE_PROGRESS_PATTERN = /\b(?:incomplete|unfinished|cut short|more (?:files|work|evidence)|still need|not enough evidence|could not gather|unable to complete|remaining work|partially complete)\b/i;
+// 2026-07-18 live gap: the synthesizer honestly wrote "partially applied"
+// and "could not be confirmed as completed", but this pattern only knew
+// "partially complete" — the half-done write task was ACCEPTED as completed,
+// the task run's objective/workspace evaporated, and the user's "re-execute"
+// minted a fresh objective-less task that wandered into the default
+// workspace. Match the honesty vocabulary broadly: a false "paused" merely
+// keeps continuation stickiness armed (cheap), a false "completed" strands
+// the task (expensive).
+const INCOMPLETE_PROGRESS_PATTERN =
+  /\b(?:incomplete|unfinished|cut short|partial(?:ly)?|could not be (?:confirmed|completed|applied|written|verified)|not (?:yet )?(?:applied|completed|confirmed|written)|was not (?:applied|modified|updated|written)|remains? (?:unchanged|unmodified|unapplied|to be)|more (?:files|work|evidence)|still (?:need|needs|needed|remains?|pending)|not enough evidence|could not gather|unable to complete|remaining work)\b/i;
 
 function newTaskRunId(): string {
   return `task_${crypto.randomUUID()}`;
