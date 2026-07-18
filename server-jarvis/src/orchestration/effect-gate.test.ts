@@ -115,4 +115,29 @@ describe("effect gate", () => {
     expect(report.verdict).toBe("clean");
     expect(report.successfulWrites).toBe(1);
   });
+
+  // ── 2026-07-18: sticky task-run write intent ──
+  // "re-execute"/"continue" mid-implementation name no mutation themselves;
+  // without the sticky flag the gate declared such turns clean and a
+  // zero-write "re-execute" shipped as success.
+  test("assumeWriteIntent arms the gate for text that names no mutation", () => {
+    const report = evaluateEffectGate({
+      profile: "full",
+      executor: executor([call("read_file")]),
+      request: "re-execute",
+      assumeWriteIntent: true,
+    });
+    expect(report.writeIntent).toBe(true);
+    expect(report.verdict).toBe("no_write_effect");
+  });
+
+  test("assumeWriteIntent satisfied by a successful write stays clean", () => {
+    const report = evaluateEffectGate({
+      profile: "full",
+      executor: executor([call("read_file"), call("write_file")]),
+      request: "continue",
+      assumeWriteIntent: true,
+    });
+    expect(report.verdict).toBe("clean");
+  });
 });

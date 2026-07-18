@@ -35,6 +35,28 @@ export function isContinuationTurn(request: string): boolean {
   return CONTINUATION_PATTERNS.some((re) => re.test(text)) || WORK_START_COMMAND.test(text);
 }
 
+const QUESTION_OPENER =
+  /^(what|why|how|when|where|who|which|whose|is|are|was|were|does|do|did|can|could|should|would|will|explain|describe|summari[sz]e|tell me|walk me|what's|whats)\b/i;
+
+/**
+ * 2026-07-18 polarity flip: during an ACTIVE full-execution task run, the
+ * question is no longer "does this message match a continuation pattern?"
+ * but "is there any reason NOT to keep working?". Live sessions produced
+ * "re-execute", "Please apply the edits oh my goodness", "go" — imperative
+ * work orders that no finite pattern list will ever fully enumerate, and
+ * every miss silently downgraded the turn to a tool-less pipeline. A short
+ * non-question, non-smalltalk message during active work IS a work order.
+ * Questions and pleasantries still break the inheritance.
+ */
+export function isWorkOrderFollowup(request: string): boolean {
+  const text = (request || "").trim();
+  if (!text || text.length > 160) return false;
+  if (text.includes("?")) return false;
+  if (QUESTION_OPENER.test(text)) return false;
+  if (isTrivialConversationalTurn(text)) return false;
+  return true;
+}
+
 export function isTrivialConversationalTurn(request: string): boolean {
   const text = (request || "").trim();
   if (text.length === 0) return true;

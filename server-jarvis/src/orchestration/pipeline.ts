@@ -44,6 +44,8 @@ import {
   EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS,
   EXECUTOR_TOOL_RESULT_CONTEXT_CHARS,
   EXECUTOR_TRANSCRIPT_BUDGET_TOKENS,
+  WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS,
+  WRITE_TURN_TRANSCRIPT_BUDGET_TOKENS,
   REWRITER_TOOL_RESULT_CONTEXT_CHARS,
   REWRITER_TRANSCRIPT_BUDGET_TOKENS,
   truncateToTokenBudget,
@@ -131,6 +133,13 @@ export interface PipelineExecuteOptions {
   allowMidRunReplan?: boolean;
   /** Effect-gate recovery is deliberately one-shot even when other replans remain. */
   allowEffectGateReplan?: boolean;
+  /**
+   * 2026-07-18: sticky write intent inherited from the session's active task
+   * run. Keeps the executor's write contract, the effect gate, and the
+   * file-scale visibility caps armed on mid-task follow-ups ("re-execute",
+   * "continue") whose own text names no mutation.
+   */
+  taskRunWriteIntent?: boolean;
   /** Coordinator-estimated route complexity, used for depth-scaled executor limits. */
   estimatedComplexity?: "low" | "medium" | "high";
   /** Persisted task-run depth inherited by terse continuation turns. */
@@ -173,16 +182,24 @@ function duplicateToolCallKey(call: Pick<ToolCall, "name" | "arguments">): strin
   return `${call.name}:${JSON.stringify(call.arguments)}`;
 }
 
-function duplicateToolCallDeflection(call: ToolCall, firstOutput: string | undefined): ToolResult {
+// 2026-07-18: a repeated identical read now REPLAYS the full cached output
+// instead of a 500-char preview + lecture. The live incident executor
+// legitimately needed the file again to compose an edit, got the lecture,
+// and reported "duplicate read-call restriction" as the reason no write
+// happened. Serving the cache costs zero tool time, the deflection marker
+// still excludes the replay from evidence accounting (so repeat-loops earn
+// no progress credit — the 2026-07-12 repetition guard's actual purpose),
+// and the per-result context cap bounds what reaches the transcript.
+export function duplicateToolCallDeflection(call: ToolCall, firstOutput: string | undefined): ToolResult {
   const previous = firstOutput && firstOutput.trim().length > 0
-    ? ` Previous result began:\n${firstOutput.slice(0, 500)}`
-    : "";
+    ? ` Serving the cached result of that identical call below — do not repeat it again; use offset/limit or a new target for anything more.\n${firstOutput}`
+    : "\nchoose a NEW target instead of repeating the same read-only call.";
   return {
     call_id: call.id,
     name: call.name,
     output:
       `${DUPLICATE_TOOL_DEFLECTION_MARKER} ${call.name} was already called with these exact arguments in this executor stage.` +
-      `${previous}\nchoose a NEW target instead of repeating the same read-only call.`,
+      previous,
     is_error: false,
     duration_ms: 0,
   };
@@ -925,8 +942,23 @@ export class PipelineExecutor {
     // 2026-07-17 incident: on live write turns the executor read files and
     // then narrated the change as prose — nothing in the loop demanded an
     // actual mutation (the only nudge was the READ-evidence rubric). Write
-    // turns now carry an explicit in-loop write contract.
-    const requiresWriteEffect = profile === "full" && hasWriteIntent(intentText);
+    // turns now carry an explicit in-loop write contract. 2026-07-18: the
+    // task run's sticky write intent counts too, so "re-execute"/"continue"
+    // follow-ups of an implementation task keep the contract even though the
+    // follow-up text names no mutation.
+    const requiresWriteEffect = profile === "full" &&
+      (hasWriteIntent(intentText) || options.taskRunWriteIntent === true);
+    // Write turns get file-scale visibility (see context-budget.ts): a model
+    // cannot compose a correct edit for code it never saw.
+    const toolResultContextChars = requiresWriteEffect
+      ? WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS
+      : EXECUTOR_TOOL_RESULT_CONTEXT_CHARS;
+    const transcriptBudgetTokens = requiresWriteEffect
+      ? WRITE_TURN_TRANSCRIPT_BUDGET_TOKENS
+      : EXECUTOR_TRANSCRIPT_BUDGET_TOKENS;
+    const toolResultNote = requiresWriteEffect
+      ? "Call read_file again with offset/limit to view the elided lines BEFORE composing any edit."
+      : PIPELINE_TOOL_RESULT_NOTE;
     const successfulWriteCount = () =>
       toolCalls.filter((call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name)).length;
     const deepReadRequest = resolveDeepReadIntent(intentText, options.taskRunDepth);
@@ -1200,7 +1232,7 @@ export class PipelineExecutor {
         let response: any;
 
         try {
-          const transcriptBudget = enforceTranscriptBudget(executorMessages, EXECUTOR_TRANSCRIPT_BUDGET_TOKENS);
+          const transcriptBudget = enforceTranscriptBudget(executorMessages, transcriptBudgetTokens);
           if (transcriptBudget.evicted > 0) {
             onStateChange({
               stage: "executor",
@@ -1243,8 +1275,8 @@ export class PipelineExecutor {
                 name: tc.name,
                 content: prepareToolResultForContext(
                   toolResultModelText(toolResult),
-                  EXECUTOR_TOOL_RESULT_CONTEXT_CHARS,
-                  PIPELINE_TOOL_RESULT_NOTE,
+                  toolResultContextChars,
+                  toolResultNote,
                 ).context,
               });
               onStateChange({
@@ -1278,7 +1310,7 @@ export class PipelineExecutor {
                   });
                   executorMessages.push({
                     role: "user",
-                    content: `[Runtime substitution] ${sub.note}:\n${prepareToolResultForContext(subOutput, EXECUTOR_TOOL_RESULT_CONTEXT_CHARS, PIPELINE_TOOL_RESULT_NOTE).context}`,
+                    content: `[Runtime substitution] ${sub.note}:\n${prepareToolResultForContext(subOutput, toolResultContextChars, toolResultNote).context}`,
                   });
                   onStateChange({
                     stage: "executor",
@@ -1550,6 +1582,20 @@ export class PipelineExecutor {
     let rewriterDone = false;
     let rewriterTurn = 0;
     const maxRewriterTurns = BUILTIN_MODES.rewriter.max_turns;
+    // The rewriter is the write-REPAIR stage: on write turns it needs the
+    // same file-scale visibility as the executor (2026-07-18 — see
+    // context-budget.ts) or it cannot compose the edit it was invoked to make.
+    const rewriterWriteTurn = profile === "full" &&
+      (hasWriteIntent(options.rawMessage ?? request) || options.taskRunWriteIntent === true);
+    const rewriterResultContextChars = rewriterWriteTurn
+      ? WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS
+      : REWRITER_TOOL_RESULT_CONTEXT_CHARS;
+    const rewriterTranscriptBudget = rewriterWriteTurn
+      ? WRITE_TURN_TRANSCRIPT_BUDGET_TOKENS
+      : REWRITER_TRANSCRIPT_BUDGET_TOKENS;
+    const rewriterResultNote = rewriterWriteTurn
+      ? "Call read_file again with offset/limit to view the elided lines BEFORE composing any edit."
+      : PIPELINE_TOOL_RESULT_NOTE;
 
     try {
       while (!rewriterDone && rewriterTurn < maxRewriterTurns) {
@@ -1559,7 +1605,7 @@ export class PipelineExecutor {
         let rewriteResp: any;
 
         try {
-          const transcriptBudget = enforceTranscriptBudget(rewriterMessages, REWRITER_TRANSCRIPT_BUDGET_TOKENS);
+          const transcriptBudget = enforceTranscriptBudget(rewriterMessages, rewriterTranscriptBudget);
           if (transcriptBudget.evicted > 0) {
             onStateChange({
               stage: "rewriter",
@@ -1627,8 +1673,8 @@ export class PipelineExecutor {
                 name: tc.name,
                 content: prepareToolResultForContext(
                   toolResultModelText(toolResult),
-                  REWRITER_TOOL_RESULT_CONTEXT_CHARS,
-                  PIPELINE_TOOL_RESULT_NOTE,
+                  rewriterResultContextChars,
+                  rewriterResultNote,
                 ).context,
               });
               onStateChange({
@@ -2342,17 +2388,19 @@ export class PipelineExecutor {
       }
     }
 
+    const turnWriteIntent = hasWriteIntent(intentText) || options.taskRunWriteIntent === true;
     let effectGate = evaluateEffectGate({
       profile,
       executor: state.executor,
       rewriter: state.rewriter,
       request: intentText,
+      assumeWriteIntent: options.taskRunWriteIntent,
     });
     if (
       effectGate.verdict === "no_write_effect" &&
       profile === "full" &&
       (options.maxReviewRepairRounds ?? 1) > 0 &&
-      hasWriteIntent(intentText) &&
+      turnWriteIntent &&
       state.executor &&
       !state.rewriter
     ) {
@@ -2375,6 +2423,7 @@ export class PipelineExecutor {
         executor: state.executor,
         rewriter: state.rewriter,
         request: intentText,
+        assumeWriteIntent: options.taskRunWriteIntent,
       });
       if (state.rewriter.terminalStatus === "timed_out") {
         partialStage = { stage: "rewriter", errorCode: state.rewriter.errorCode ?? "stage_timeout" };
@@ -2392,7 +2441,7 @@ export class PipelineExecutor {
       options.allowMidRunReplan !== false &&
       options.allowEffectGateReplan === true &&
       profile === "full" &&
-      hasWriteIntent(intentText)
+      turnWriteIntent
     ) {
       replanRequested = {
         trigger: "effect_gate_failure",

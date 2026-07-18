@@ -1307,14 +1307,18 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
   // Invariant: the turn budget and coordinator route derive from the same
   // continuation-aware requirement; do not freeze a raw-message budget first.
   const priorTaskRun = sessionMemory.getTaskRun(sessionId);
+  // 2026-07-18: a LIVE task run flips continuation polarity — short work
+  // orders ("re-execute", "apply the edits") inherit the task's authority
+  // instead of being re-classified from scratch (see resolveTurnRequirement).
+  const priorTaskRunLive = Boolean(
+    priorTaskRun && !["completed", "failed", "cancelled"].includes(priorTaskRun.status),
+  );
   const initialResolvedRequirement = resolveTurnRequirement(
     message,
     priorTaskRun?.requirement ?? continuationRequirements.get(sessionId),
+    priorTaskRunLive,
   );
-  const initialRequirement = resolveTurnRequirement(
-    message,
-    priorTaskRun?.requirement ?? continuationRequirements.get(sessionId),
-  ).result.requirement;
+  const initialRequirement = initialResolvedRequirement.result.requirement;
   // F5: "force deep read" is a real contract — extended budget + direct route.
   const forcedDeepRead = FORCE_DEEP_READ_PATTERN.test(message);
   // Deep-task turns (fresh deep-read intent or continuation of a deep task
@@ -1327,7 +1331,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
   // 150-180s tier on the live free-tier pool (run_35d30e5c needed 213s and
   // still shipped zero writes); like deep reads, the 600s ceiling only binds
   // while real work remains.
-  const writeTaskIntent = initialRequirement === "full_execution" && hasWriteIntent(message);
+  const writeTaskIntent = initialRequirement === "full_execution" &&
+    (hasWriteIntent(message) || (priorTaskRunLive && priorTaskRun?.writeIntent === true));
   const turnBudget = createTurnBudget(
     initialRequirement,
     deepTaskIntent || forcedDeepRead || writeTaskIntent ? "high" : "medium",
@@ -2711,6 +2716,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const { continuation, result: turnReq } = resolveTurnRequirement(
           message,
           activeTaskRun.requirement ?? continuationRequirements.get(sessionId),
+          !["completed", "failed", "cancelled"].includes(activeTaskRun.status),
         );
         const shortCircuit = shouldShortCircuitCoordinator(message, turnReq, continuation);
         // T1.7: emit one conductor_health frame when local is enabled but we fall back.
@@ -3006,6 +3012,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           turnRequirement: turnReq.requirement,
           estimatedComplexity: route.context.estimated_complexity,
           taskRunDepth: activeTaskRun.depth,
+          // 2026-07-18: sticky write intent — "re-execute"/"continue" during
+          // an implementation task keep the write contract, visibility caps,
+          // and effect gate armed even though the follow-up names no mutation.
+          taskRunWriteIntent: activeTaskRun.writeIntent === true,
           workerInstructions: instructionSelection.instructions,
           sharedContext: mergedSharedContext,
           sessionMemory: sessionMemory,

@@ -18,6 +18,14 @@ export function evaluateEffectGate(input: {
   executor?: ExecutorStageOutput;
   rewriter?: RewriterStageOutput;
   request?: string;
+  /**
+   * 2026-07-18: sticky task-run write intent. Mid-task follow-ups
+   * ("re-execute", "continue") carry the task's write contract even though
+   * the follow-up text itself names no mutation — without this the gate
+   * declared such turns clean and a zero-write "re-execute" shipped as
+   * success.
+   */
+  assumeWriteIntent?: boolean;
 }): EffectGateReport {
   const calls: ToolCallRecord[] = [
     ...(input.executor?.toolCalls ?? []),
@@ -34,9 +42,11 @@ export function evaluateEffectGate(input: {
   // invented diffs. A change request that produced zero mutations must be
   // reported as such no matter how the turn was routed. The profile-based
   // fallback survives only for legacy callers that cannot supply the request.
-  const writeIntent = input.request !== undefined
-    ? hasWriteIntent(input.request)
-    : (input.profile === "full" && input.executor !== undefined);
+  const writeIntent = input.assumeWriteIntent === true || (
+    input.request !== undefined
+      ? hasWriteIntent(input.request)
+      : (input.profile === "full" && input.executor !== undefined)
+  );
   const successfulWrites = calls.filter(
     (call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name),
   ).length;

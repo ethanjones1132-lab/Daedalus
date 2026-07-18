@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { isContinuationTurn, isTrivialConversationalTurn } from "./turn-triage";
+import { isContinuationTurn, isTrivialConversationalTurn, isWorkOrderFollowup } from "./turn-triage";
 
 describe("isContinuationTurn", () => {
   test("recognizes compact continuation commands", () => {
@@ -47,6 +47,32 @@ describe("isContinuationTurn", () => {
 
   test("fresh verification questions about concepts are not continuations", () => {
     expect(isContinuationTurn("verify my understanding of TCP: is it stream oriented?")).toBe(false);
+  });
+});
+
+// 2026-07-18: during an ACTIVE full-execution task the polarity flips — any
+// short non-question, non-smalltalk message is a work order that inherits the
+// task's authority. This helper is the flip's gate.
+describe("isWorkOrderFollowup", () => {
+  test("imperative work orders qualify", () => {
+    for (const message of [
+      "re-execute",
+      "Please apply the edits oh my goodness",
+      "go",
+      "polish it up",
+      "try again with the full file this time",
+    ]) {
+      expect(isWorkOrderFollowup(message)).toBe(true);
+    }
+  });
+
+  test("questions, smalltalk, and long fresh prompts do not qualify", () => {
+    expect(isWorkOrderFollowup("what's the status?")).toBe(false);
+    expect(isWorkOrderFollowup("how does the smoothing work")).toBe(false);
+    expect(isWorkOrderFollowup("thanks!")).toBe(false);
+    expect(isWorkOrderFollowup("did it work?")).toBe(false);
+    expect(isWorkOrderFollowup("x".repeat(200))).toBe(false);
+    expect(isWorkOrderFollowup("")).toBe(false);
   });
 });
 

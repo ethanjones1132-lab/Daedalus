@@ -20,7 +20,7 @@
 //   full_execution  — explicitly requested edits, builds, commands, deployment,
 //                     or other mutations. Executor REQUIRED, full tools.
 
-import { isContinuationTurn, isTrivialConversationalTurn, WORK_START_COMMAND } from "./turn-triage";
+import { isContinuationTurn, isTrivialConversationalTurn, isWorkOrderFollowup, WORK_START_COMMAND } from "./turn-triage";
 
 export type TurnRequirement =
   | "conversational"
@@ -102,12 +102,24 @@ export function inheritRequirementForContinuation(
  * Resolve the authoritative requirement for one session turn. Budget creation
  * and route selection must use this exact result so a continuation can never
  * inherit a heavier pipeline after a lighter turn deadline has been frozen.
+ *
+ * `previousActive` (2026-07-18): true when the session has an ACTIVE (not
+ * completed/failed/cancelled) task run behind `previous`. During an active
+ * full-execution task, authority inheritance flips polarity: any short
+ * non-question work order ("re-execute", "Please apply the edits") inherits
+ * the task's authority instead of being re-classified from scratch — the
+ * live failure mode where each pattern-list miss silently produced a
+ * tool-less pipeline mid-implementation. Once the task concludes, the
+ * narrow continuation patterns are again the only inheritance path, so a
+ * casual remark after finished work cannot summon a full pipeline.
  */
 export function resolveTurnRequirement(
   message: string,
   previous: TurnRequirement | undefined,
+  previousActive = false,
 ): { continuation: boolean; result: TurnRequirementResult } {
-  const continuation = isContinuationTurn(message);
+  const continuation = isContinuationTurn(message) ||
+    (previousActive && previous === "full_execution" && isWorkOrderFollowup(message));
   return {
     continuation,
     result: inheritRequirementForContinuation(
@@ -179,7 +191,7 @@ export function hasWorkspaceSignal(message: string): boolean {
 // questions or nouns ("what are the latest changes?", "is the server
 // running?"), so "running" and "changes" must never grant write authority.
 const MUTATION_VERB =
-  /\b(writ(?:e|ing)|edit(?:ing)?|creat(?:e|ing)|add(?:ing)?|delet(?:e|ing)|remov(?:e|ing)|fix(?:ing)?|refactor(?:ing)?|implement(?:ing)?|execut(?:e|ing)|build(?:ing)?|deploy(?:ing)?|install(?:ing)?|commit(?:ting)?|patch(?:ing)?|chang(?:e|ing)|modif(?:y|ies|ying)|renam(?:e|ing)|mov(?:e|ing)|generat(?:e|ing)|replac(?:e|ing)|rewrit(?:e|ing)|scaffold(?:ing)?|migrat(?:e|ing)|format(?:ting)?|append(?:ing)?|insert(?:ing)?|overwrit(?:e|ing)|updat(?:e|ing)|push(?:ing)?|run)\b/gi;
+  /\b(writ(?:e|ing)|edit(?:ing)?|creat(?:e|ing)|add(?:ing)?|delet(?:e|ing)|remov(?:e|ing)|fix(?:ing)?|refactor(?:ing)?|implement(?:ing)?|execut(?:e|ing)|build(?:ing)?|deploy(?:ing)?|install(?:ing)?|commit(?:ting)?|patch(?:ing)?|chang(?:e|ing)|modif(?:y|ies|ying)|renam(?:e|ing)|mov(?:e|ing)|generat(?:e|ing)|replac(?:e|ing)|rewrit(?:e|ing)|scaffold(?:ing)?|migrat(?:e|ing)|format(?:ting)?|append(?:ing)?|insert(?:ing)?|overwrit(?:e|ing)|updat(?:e|ing)|push(?:ing)?|appl(?:y|ies|ying)|land|ship(?:ping)?|wir(?:e|ing)|integrat(?:e|ing)|run)\b/gi;
 
 const NEGATED_MUTATION_NOUN =
   /\b(?:no\s+(?:(?:file|code)\s+)?|without\s+(?:any\s+)?)(?:modifications?|edits?|changes?)\b|\bwithout\s+(?:writing|editing|creating|adding|deleting|removing|fixing|refactoring|implementing|building|deploying|installing|committing|patching|modifying|renaming|moving|generating|replacing|rewriting|scaffolding|migrating|formatting|appending|inserting|overwriting|updating|pushing|running)\b|\bdo\s+not\s+(?:make|apply)\s+(?:any\s+)?(?:modifications?|edits?|changes?)\b/i;
@@ -228,8 +240,11 @@ const ABSTRACT_DELIVERABLE =
 // means "do the work of phase 1", which in an implementation session means
 // mutating files. (2026-07-17 incident: "Begin implementing phase 1" carried
 // no write intent, so no gate demanded actual mutations.)
+// Mutation-artifact nouns (changes/edits/patch/diff/...) are concrete write
+// targets: "apply the Phase 1 smoothing changes to X.h" routed READ-ONLY on
+// 2026-07-18 because nothing in this list matched the object.
 const CONCRETE_WRITE_TARGET =
-  /\b(file|repo(?:sitory)?|path|workspace|code|source|doc(?:ument)?|config(?:uration)?|test|script|directory|folder|module|package|app(?:lication)?|project|table|database|schema|target|phase|task|step|item|milestone|feature|functionality|fix|bug|crash|issue)\b/i;
+  /\b(file|repo(?:sitory)?|path|workspace|code|source|doc(?:ument)?|config(?:uration)?|test|script|directory|folder|module|package|app(?:lication)?|project|table|database|schema|target|phase|task|step|item|milestone|feature|functionality|fix|bug|crash|issue|chang(?:e|es)|edit(?:s)?|modification(?:s)?|patch(?:es)?|diff(?:s)?|update(?:s)?|improvement(?:s)?)\b/i;
 
 /**
  * Decide whether a raw user message actually asks Jarvis to mutate something.

@@ -1,5 +1,5 @@
-import { isContinuationTurn } from "./turn-triage";
-import type { TurnRequirement } from "./turn-requirements";
+import { isContinuationTurn, isWorkOrderFollowup } from "./turn-triage";
+import { hasWriteIntent, type TurnRequirement } from "./turn-requirements";
 import { isDeepReadRequest } from "./evidence-sufficiency";
 
 export type TaskRunDepth = "standard" | "deep";
@@ -17,6 +17,14 @@ export interface TaskRunContract {
   status: TaskRunStatus;
   evidenceCount: number;
   remainingWork: string[];
+  /**
+   * 2026-07-18: sticky write intent for the whole task run. Derived from the
+   * objective at creation and escalated by any later write-phrased turn, so
+   * mid-task follow-ups ("re-execute", "continue") keep the executor's write
+   * contract even though the follow-up text itself names no mutation.
+   * Optional because pre-existing persisted sessions lack the field.
+   */
+  writeIntent?: boolean;
   lastOutcome?: string;
   lastTurnId?: string;
   createdAt: string;
@@ -79,6 +87,7 @@ export function createTaskRun(input: CreateTaskRunInput): TaskRunContract {
     status: "active",
     evidenceCount: 0,
     remainingWork: [],
+    writeIntent: input.requirement === "full_execution" && hasWriteIntent(input.objective),
     createdAt: now,
     updatedAt: now,
   };
@@ -90,10 +99,17 @@ export function resolveTaskRunTurn(
   classifiedRequirement: TurnRequirement,
   options: Partial<Pick<CreateTaskRunInput, "sessionId" | "workspacePath" | "estimatedComplexity" | "depth">> = {},
 ): { contract: TaskRunContract; isContinuation: boolean } {
-  const continuation = Boolean(
-    previous &&
-    !["completed", "failed", "cancelled"].includes(previous.status) &&
-    isContinuationTurn(message),
+  const previousLive = Boolean(
+    previous && !["completed", "failed", "cancelled"].includes(previous.status),
+  );
+  // 2026-07-18 polarity flip (mirrors resolveTurnRequirement): during a live
+  // full-execution task, any short non-question work order resumes the task
+  // run — otherwise "re-execute" mints a NEW task whose objective is the
+  // literal word "re-execute" and every sticky property (workspace, depth,
+  // write intent) is lost.
+  const continuation = previousLive && (
+    isContinuationTurn(message) ||
+    (previous!.requirement === "full_execution" && isWorkOrderFollowup(message))
   );
 
   if (continuation && previous) {
@@ -103,6 +119,10 @@ export function resolveTaskRunTurn(
         ...previous,
         turnCount: previous.turnCount + 1,
         status: "active",
+        // A write-phrased follow-up escalates a read task's contract; write
+        // intent never de-escalates while the same task run is live.
+        writeIntent: previous.writeIntent === true ||
+          (previous.requirement === "full_execution" && hasWriteIntent(message)),
         lastOutcome: undefined,
         updatedAt: new Date().toISOString(),
       },

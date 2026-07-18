@@ -3,6 +3,7 @@ import {
   classifyTurnRequirements,
   hasWriteIntent,
   inheritRequirementForContinuation,
+  resolveTurnRequirement,
   shouldRememberRequirement,
   shouldShortCircuitCoordinator,
 } from "./turn-requirements";
@@ -438,5 +439,58 @@ describe("inflected mutation language (2026-07-17 write-path incident)", () => {
   test("verification follow-ups classify as read work, not conversation", () => {
     expect(classifyTurnRequirements("verify the implementation in src/app.ts").requirement)
       .toBe("workspace_read");
+  });
+});
+
+// ── 2026-07-18 live incident (runs 04:43Z–04:53Z): "apply" and sticky authority ──
+// "Apply the Phase 1 smoothing changes to PluginProcessor.h and
+// PluginProcessor.cpp" routed READ-ONLY (no verb match, "changes" not a
+// target), and "Please apply the edits oh my goodness" went to a tool-less
+// synthesizer. Mid-task work orders must inherit the task's authority.
+describe("apply-verbs and sticky task authority (2026-07-18 incident)", () => {
+  test.each([
+    ["Apply the Phase 1 smoothing changes to PluginProcessor.h and PluginProcessor.cpp"],
+    ["Please apply the edits oh my goodness"],
+    ["apply the patch to src/main.rs"],
+    ["ship the fix"],
+    ["wire up the new handler in router.ts"],
+  ])("apply/ship/wire phrasing → full_execution: %s", (message) => {
+    expect(classifyTurnRequirements(message).requirement).toBe("full_execution");
+  });
+
+  test("mutation-artifact nouns count as concrete write targets", () => {
+    expect(hasWriteIntent("Apply the Phase 1 smoothing changes to PluginProcessor.h and PluginProcessor.cpp")).toBe(true);
+    expect(hasWriteIntent("Please apply the edits oh my goodness")).toBe(true);
+  });
+
+  test("noun-form status questions still carry no authority", () => {
+    expect(classifyTurnRequirements("what are the latest changes?").requirement).toBe("answer_only");
+    expect(hasWriteIntent("what are the latest changes?")).toBe(false);
+  });
+
+  test("active full-execution task: short work orders inherit full authority", () => {
+    for (const message of ["re-execute", "polish it up", "Please apply the edits oh my goodness"]) {
+      const resolved = resolveTurnRequirement(message, "full_execution", true);
+      expect(resolved.continuation).toBe(true);
+      expect(resolved.result.requirement).toBe("full_execution");
+    }
+  });
+
+  test("active task: questions and pleasantries do NOT inherit", () => {
+    const question = resolveTurnRequirement("what does the smoothing actually do?", "full_execution", true);
+    expect(question.continuation).toBe(false);
+    expect(question.result.requirement).toBe("answer_only");
+
+    const thanks = resolveTurnRequirement("thanks!", "full_execution", true);
+    expect(thanks.result.requirement).toBe("conversational");
+  });
+
+  test("no active task: work-order inheritance is off", () => {
+    // "polish it up" carries no classifiable authority of its own; without a
+    // live task run it stays answer_only — a casual remark after finished
+    // work cannot summon a full pipeline.
+    const resolved = resolveTurnRequirement("polish it up", "full_execution", false);
+    expect(resolved.continuation).toBe(false);
+    expect(resolved.result.requirement).toBe("answer_only");
   });
 });

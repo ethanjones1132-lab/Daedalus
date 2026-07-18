@@ -228,6 +228,70 @@ describe("FilesystemBundle > edit_file (read-before-edit guard)", () => {
     expect(result.is_error).toBe(false);
     expect(readFileSync(join(ws, "f.txt"), "utf-8")).toBe("hi world");
   });
+
+  // ── 2026-07-18: line-number-gutter tolerance ──
+  // read_file returns "    42 | code" but edits must match the RAW file; weak
+  // models paste the gutter verbatim and previously fell into a
+  // read→edit-fail→re-read death spiral.
+  test("edit_file tolerates old/new strings pasted with the read_file gutter", async () => {
+    const ws = makeTempWorkspace();
+    writeFileSync(join(ws, "g.txt"), "function a() {\n  return 1;\n}\n");
+    const rt = makeRuntime();
+    const ctx = makeCtx(ws);
+    await rt.execute(call("read_file", { path: "g.txt" }), ctx);
+    const result = await rt.execute(
+      call("edit_file", {
+        path: "g.txt",
+        old_string: "     2 |   return 1;",
+        new_string: "     2 |   return 2;",
+      }),
+      ctx,
+    );
+    expect(result.is_error).toBe(false);
+    // The gutter must be stripped from BOTH sides — never written into the file.
+    expect(readFileSync(join(ws, "g.txt"), "utf-8")).toBe("function a() {\n  return 2;\n}\n");
+  });
+
+  test("multi_edit tolerates the gutter the same way", async () => {
+    const ws = makeTempWorkspace();
+    writeFileSync(join(ws, "h.txt"), "alpha\nbeta\n");
+    const rt = makeRuntime();
+    const ctx = makeCtx(ws);
+    await rt.execute(call("read_file", { path: "h.txt" }), ctx);
+    const result = await rt.execute(
+      call("multi_edit", {
+        path: "h.txt",
+        edits: [{ old_string: "     1 | alpha", new_string: "     1 | ALPHA" }],
+      }),
+      ctx,
+    );
+    expect(result.is_error).toBe(false);
+    expect(readFileSync(join(ws, "h.txt"), "utf-8")).toBe("ALPHA\nbeta\n");
+  });
+});
+
+describe("FilesystemBundle > read_file continuation note (2026-07-18)", () => {
+  test("a cut-off read names the window and the exact continuation call", async () => {
+    const ws = makeTempWorkspace();
+    writeFileSync(join(ws, "big.txt"), Array.from({ length: 10 }, (_, i) => `line ${i + 1}`).join("\n"));
+    const result = await makeRuntime().execute(
+      call("read_file", { path: "big.txt", limit: 4 }),
+      makeCtx(ws),
+    );
+    expect(result.is_error).toBe(false);
+    expect(result.output).toContain("showing lines 1-4 of 10 total");
+    expect(result.output).toContain("offset=5");
+  });
+
+  test("a complete read carries no continuation note", async () => {
+    const ws = makeTempWorkspace();
+    writeFileSync(join(ws, "small.txt"), "one\ntwo\n");
+    const result = await makeRuntime().execute(
+      call("read_file", { path: "small.txt" }),
+      makeCtx(ws),
+    );
+    expect(result.output).not.toContain("showing lines");
+  });
 });
 
 describe("FilesystemBundle > apply_patch (Tier A)", () => {

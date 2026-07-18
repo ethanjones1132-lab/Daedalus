@@ -14,6 +14,18 @@ export const REWRITER_TOOL_RESULT_CONTEXT_CHARS = 4_000;
 export const EXECUTOR_TRANSCRIPT_BUDGET_TOKENS = 12_000;
 export const REWRITER_TRANSCRIPT_BUDGET_TOKENS = 8_000;
 
+// ── Write-turn visibility (2026-07-18) ───────────────────────────────────────
+// A model cannot compose a correct edit_file old_string for code it never
+// saw: the live incident file (PluginProcessor.cpp) is 22,335 chars while the
+// 6,000-char read cap showed the executor barely a quarter of it, making
+// every real implementation task structurally impossible regardless of
+// routing or nudges. Write turns therefore run with a per-result cap that
+// admits real source files whole, and a transcript budget sized to hold two
+// such files plus the working conversation. Read-only turns keep the tight
+// caps — summarization does not need byte-exact visibility.
+export const WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS = 24_000;
+export const WRITE_TURN_TRANSCRIPT_BUDGET_TOKENS = 24_000;
+
 export interface TranscriptMessage {
   role: string;
   content: string;

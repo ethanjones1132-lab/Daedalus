@@ -50,6 +50,76 @@ describe("durable task-run contract", () => {
     expect(next.contract.depth).toBe("standard");
   });
 
+  // ── 2026-07-18 sticky write authority (live incident 04:43Z–04:53Z) ──
+  // "re-execute" mid-implementation minted a NEW task run whose objective was
+  // the literal word "re-execute", losing workspace, depth, and write intent.
+  test("write task: creation derives sticky writeIntent from the objective", () => {
+    const writeTask = createTaskRun({
+      taskRunId: "task_write_1",
+      sessionId: "session_1",
+      objective: "Apply the Phase 1 smoothing changes to PluginProcessor.h and PluginProcessor.cpp",
+      requirement: "full_execution",
+    });
+    expect(writeTask.writeIntent).toBe(true);
+
+    const planTask = createTaskRun({
+      taskRunId: "task_plan_1",
+      sessionId: "session_1",
+      objective: "create a comprehensive implementation plan. Do not modify files.",
+      requirement: "full_execution",
+    });
+    expect(planTask.writeIntent).toBe(false);
+  });
+
+  test("active full-execution task: a bare work order resumes the run and keeps writeIntent", () => {
+    const original = createTaskRun({
+      taskRunId: "task_write_2",
+      sessionId: "session_1",
+      objective: "Apply the Phase 1 smoothing changes to PluginProcessor.h and PluginProcessor.cpp",
+      workspacePath: "C:\\Users\\ethan\\Downloads\\Perihelion",
+      requirement: "full_execution",
+    });
+
+    const next = resolveTaskRunTurn(original, "re-execute", "full_execution");
+
+    expect(next.isContinuation).toBe(true);
+    expect(next.contract.taskRunId).toBe(original.taskRunId);
+    expect(next.contract.objective).toBe(original.objective);
+    expect(next.contract.workspacePath).toBe(original.workspacePath);
+    expect(next.contract.writeIntent).toBe(true);
+  });
+
+  test("a write-phrased follow-up escalates a non-write full task's contract", () => {
+    const original = createTaskRun({
+      taskRunId: "task_plan_2",
+      sessionId: "session_1",
+      objective: "create a comprehensive implementation plan. Do not modify files.",
+      requirement: "full_execution",
+    });
+    expect(original.writeIntent).toBe(false);
+
+    const next = resolveTaskRunTurn(original, "now apply the changes to the config file", "full_execution");
+
+    expect(next.isContinuation).toBe(true);
+    expect(next.contract.writeIntent).toBe(true);
+  });
+
+  test("completed task: a work order starts fresh instead of resuming", () => {
+    const original = {
+      ...createTaskRun({
+        taskRunId: "task_done_1",
+        sessionId: "session_1",
+        objective: "Apply the smoothing changes to PluginProcessor.cpp",
+        requirement: "full_execution",
+      }),
+      status: "completed" as const,
+    };
+
+    const next = resolveTaskRunTurn(original, "polish it up", "answer_only");
+    expect(next.isContinuation).toBe(false);
+    expect(next.contract.taskRunId).not.toBe(original.taskRunId);
+  });
+
   test("incomplete progress cannot be accepted or distilled as success", () => {
     const result = assessTaskRunAcceptance({
       requirement: "workspace_read",

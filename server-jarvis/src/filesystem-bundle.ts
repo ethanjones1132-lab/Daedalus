@@ -183,7 +183,10 @@ async function handleReadFile(args: Record<string, unknown>, ctx: ExecutionConte
   const cfg = ctx.config;
   const path = safePath(args.path as string, cfg, ctx.workspace_path);
   const offset = (args.offset as number) || 1;
-  const limit = (args.limit as number) || 500;
+  // 2000-line default (2026-07-18, formerly 500): the old default silently
+  // cut real source files with NO indication anything was missing, so
+  // executors composed edits against a file they had only partially seen.
+  const limit = (args.limit as number) || 2000;
 
   const stat = await fs.stat(path).catch(() => null);
   if (stat?.isDirectory()) {
@@ -198,10 +201,46 @@ async function handleReadFile(args: Record<string, unknown>, ctx: ExecutionConte
     const end = Math.min(lines.length, start + limit);
 
     const numbered = lines.slice(start, end).map((line, i) => `${(start + i + 1).toString().padStart(6)} | ${line}`);
-    return numbered.join("\n");
+    // A cut-off read must SAY so, with the exact call that continues it —
+    // silence here previously read as "that was the whole file".
+    const continuation = end < lines.length
+      ? `\n[showing lines ${start + 1}-${end} of ${lines.length} total — call read_file with offset=${end + 1} to continue]`
+      : "";
+    return numbered.join("\n") + continuation;
   } catch {
     throw new Error(`File not found: ${path}. Use glob with pattern to find the correct path before retrying.`);
   }
+}
+
+/**
+ * read_file returns line-numbered content ("    42 | code"), but edit
+ * old_strings must match the RAW file. Weak models routinely paste the
+ * numbered text verbatim; instead of failing them into a read→edit death
+ * spiral, strip the number gutter when (and only when) the literal string
+ * does not match. Exported for tests.
+ */
+export function stripLineNumberGutter(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => line.replace(/^\s*\d+ \| /, ""))
+    .join("\n");
+}
+
+/** Resolve the old/new pair against raw content, tolerating a pasted number gutter. */
+function resolveEditStrings(
+  content: string,
+  oldStr: string,
+  newStr: string,
+): { oldStr: string; newStr: string } | null {
+  if (content.includes(oldStr)) return { oldStr, newStr };
+  const strippedOld = stripLineNumberGutter(oldStr);
+  if (strippedOld !== oldStr && content.includes(strippedOld)) {
+    // The model pasted the gutter into old_string; assume the replacement
+    // carries the same gutter and strip both so we never write line numbers
+    // into the file.
+    return { oldStr: strippedOld, newStr: stripLineNumberGutter(newStr) };
+  }
+  return null;
 }
 
 async function handleWriteFile(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
@@ -234,18 +273,19 @@ async function handleEditFile(args: Record<string, unknown>, ctx: ExecutionConte
     throw new Error(`File not found: ${path}`);
   }
 
-  if (!content.includes(oldStr)) {
-    throw new Error(`Error: old_string not found in "${args.path}". The file content may have changed. Call read_file on "${args.path}" to see current content, then use the exact text for old_string.`);
+  const resolved = resolveEditStrings(content, oldStr, newStr);
+  if (!resolved) {
+    throw new Error(`Error: old_string not found in "${args.path}". The file content may have changed. Call read_file on "${args.path}" to see current content, then use the exact text for old_string WITHOUT the line-number gutter ("   42 | ").`);
   }
 
-  const occurrences = content.split(oldStr).length - 1;
+  const occurrences = content.split(resolved.oldStr).length - 1;
   if (occurrences > 1) {
     throw new Error(`Error: old_string appears ${occurrences} times in ${args.path}. Make it more specific.`);
   }
 
-  const updated = content.replace(oldStr, newStr);
+  const updated = content.replace(resolved.oldStr, resolved.newStr);
   await fs.writeFile(path, updated, "utf-8");
-  return `Edited ${args.path}: replaced ${oldStr.length} chars with ${newStr.length} chars`;
+  return `Edited ${args.path}: replaced ${resolved.oldStr.length} chars with ${resolved.newStr.length} chars`;
 }
 
 async function handleMultiEdit(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
@@ -267,12 +307,13 @@ async function handleMultiEdit(args: Record<string, unknown>, ctx: ExecutionCont
   const results: string[] = [];
 
   for (const edit of edits) {
-    if (!content.includes(edit.old_string)) {
+    const resolved = resolveEditStrings(content, edit.old_string, edit.new_string);
+    if (!resolved) {
       results.push(`SKIP: "${edit.old_string.slice(0, 40)}..." not found`);
       continue;
     }
-    content = content.replace(edit.old_string, edit.new_string);
-    results.push(`OK: replaced "${edit.old_string.slice(0, 40)}..."`);
+    content = content.replace(resolved.oldStr, resolved.newStr);
+    results.push(`OK: replaced "${resolved.oldStr.slice(0, 40)}..."`);
   }
 
   await fs.writeFile(path, content, "utf-8");
