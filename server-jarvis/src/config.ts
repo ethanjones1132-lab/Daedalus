@@ -485,15 +485,22 @@ export function defaultConfig(): JarvisConfig {
       },
       conductor: {
         enabled: true,
-        model: "gemma4:e2b",
-        fallback_model: "gemma4:e4b",
+        // 2026-07-18 measured on the live Ollama host: qwen3.5:4b answers a
+        // conductor directive in ~1.8s vs gemma4:e2b's ~4.4s (both with
+        // think:false; both otherwise burn the whole budget in the thinking
+        // channel and emit empty content). Fast primary, gemma as fallback.
+        model: "qwen3.5:4b",
+        fallback_model: "gemma4:e2b",
         base_url: "",
         output_mode: "tool_call",
         temperature: 1.0,
         top_p: 0.95,
         top_k: 64,
-        max_tokens: 700,
-        num_ctx: 8192,
+        // 700 structurally truncated multi-stage replan decisions (2026-07-16
+        // incident memory) — routing itself stays capped by per-call
+        // numPredict, so the wider ceiling only helps the bigger decisions.
+        max_tokens: 1600,
+        num_ctx: 16384,
         fallback_to_api: true,
         keep_warm: true,
         keep_warm_interval_ms: 600_000,
@@ -503,7 +510,9 @@ export function defaultConfig(): JarvisConfig {
         kv_persist: true,
         kv_backend: "ollama",
         supervision: {
-          supervision_timeout_ms: 5000,
+          // 5s left no headroom above the ~2-4.5s measured local latency;
+          // a single GC pause turned supervision into fallback-continue.
+          supervision_timeout_ms: 8000,
           max_tool_errors_before_reroute: 3,
           supervise_low_complexity: false,
         },

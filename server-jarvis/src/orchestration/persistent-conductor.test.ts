@@ -128,7 +128,9 @@ describe("PersistentConductor", () => {
 
     expect(result.model).toBe("gemma4:e2b");
     expect(generateBody).toMatchObject({ model: "gemma4:e2b", prompt: "", keep_alive: "30m" });
-    expect(generateBody?.options).toMatchObject({ num_predict: 1, num_ctx: 8_192 });
+    // 2026-07-18: default num_ctx raised 8192→16384 (supervision digests +
+    // session prefixes were crowding the old window).
+    expect(generateBody?.options).toMatchObject({ num_predict: 1, num_ctx: 16_384 });
   });
 
   test("isWarm returns false only when the configured model is confidently absent from /api/ps", async () => {
@@ -480,11 +482,12 @@ describe("PersistentConductor", () => {
     (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.includes("/api/tags")) {
-        return Response.json({ models: [{ name: "gemma4:e4b" }] });
+        // Only the fallback (gemma4:e2b) is installed; primary qwen3.5:4b is not.
+        return Response.json({ models: [{ name: "gemma4:e2b" }] });
       }
       if (url.includes("/api/chat")) {
         const body = JSON.parse(String(init?.body ?? "{}"));
-        expect(body.model).toBe("gemma4:e4b");
+        expect(body.model).toBe("gemma4:e2b");
         return Response.json({
           message: {
             role: "assistant",
@@ -519,7 +522,7 @@ describe("PersistentConductor", () => {
       turnNumber: 1,
     });
 
-    expect(result.model).toBe("gemma4:e4b");
+    expect(result.model).toBe("gemma4:e2b");
     expect(JSON.parse(result.content).pipeline).toEqual(["synthesizer"]);
   });
 
@@ -529,13 +532,13 @@ describe("PersistentConductor", () => {
       const url = String(input);
       if (url.includes("/api/tags")) {
         return Response.json({
-          models: [{ name: "gemma4:e2b" }, { name: "gemma4:e4b" }],
+          models: [{ name: "qwen3.5:4b" }, { name: "gemma4:e2b" }],
         });
       }
       if (url.includes("/api/chat")) {
         const body = JSON.parse(String(init?.body ?? "{}"));
         attemptedModels.push(body.model);
-        if (body.model === "gemma4:e2b") {
+        if (body.model === "qwen3.5:4b") {
           return Response.json({ error: "runner failed to load" }, { status: 500 });
         }
         return Response.json({
@@ -556,8 +559,8 @@ describe("PersistentConductor", () => {
       turnNumber: 1,
     });
 
-    expect(attemptedModels).toEqual(["gemma4:e2b", "gemma4:e4b"]);
-    expect(result.model).toBe("gemma4:e4b");
+    expect(attemptedModels).toEqual(["qwen3.5:4b", "gemma4:e2b"]);
+    expect(result.model).toBe("gemma4:e2b");
     expect(JSON.parse(result.content).coordinator_rationale).toBe("runtime fallback");
   });
 

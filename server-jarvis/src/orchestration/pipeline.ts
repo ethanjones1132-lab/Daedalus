@@ -968,6 +968,7 @@ export class PipelineExecutor {
       request: options.rawMessage ?? request,
       workerInstruction: options.workerInstructions?.executor,
       workspaceRoot: this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd(),
+      writeIntent: requiresWriteEffect,
     });
     const executorMessages: ChatMessage[] = [
       { role: "system", content: executorPrompt },
@@ -1243,7 +1244,9 @@ export class PipelineExecutor {
           const inputTokens = transcriptBudget.inputTokens;
           response = await this.callModel(executorMessages, {
             temperature: BUILTIN_MODES.executor.temperature,
-            max_tokens: BUILTIN_MODES.executor.max_tokens,
+            // Write turns may emit a whole-file write_file payload; the 4096
+            // default truncates anything past ~16KB of content (2026-07-18).
+            max_tokens: requiresWriteEffect ? 8192 : BUILTIN_MODES.executor.max_tokens,
             tools: getToolsForMode("executor", this.runtime.listTools(), profile),
             stream: true,
             stageLabel: "executor",
@@ -1616,7 +1619,7 @@ export class PipelineExecutor {
           const inputTokens = transcriptBudget.inputTokens;
           rewriteResp = await this.callModel(rewriterMessages, {
             temperature: BUILTIN_MODES.rewriter.temperature,
-            max_tokens: BUILTIN_MODES.rewriter.max_tokens,
+            max_tokens: rewriterWriteTurn ? 8192 : BUILTIN_MODES.rewriter.max_tokens,
             tools: getToolsForMode("rewriter", this.runtime.listTools(), profile),
             stream: true,
             stageLabel: "rewriter",

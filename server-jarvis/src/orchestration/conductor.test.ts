@@ -451,3 +451,90 @@ describe("LiveConductor", () => {
     }
   });
 });
+
+// ── 2026-07-18: write-effect supervision ──
+// The conductor was WRITE-BLIND: a change-request executor stage that
+// completed with zero mutations had no failure, no tool errors, and no
+// read-evidence gap, so every directive in the incident DB was "continue".
+describe("LiveConductor write-effect fence", () => {
+  const readOnlyCall = {
+    name: "read_file",
+    arguments: { path: "src/main.ts" },
+    output: "export const main = 1;",
+    is_error: false,
+    duration_ms: 10,
+  };
+  const writeCall = {
+    name: "edit_file",
+    arguments: { path: "src/main.ts" },
+    output: "Edited src/main.ts",
+    is_error: false,
+    duration_ms: 20,
+  };
+
+  test("write-intent executor with zero mutations reroutes re-enter:executor once", async () => {
+    const { conductor } = makeConductor();
+    conductor.setContext("general", "high", "run-write-fence-1");
+    const evidence = {
+      request: "Apply the smoothing changes to PluginProcessor.cpp",
+      toolCalls: [readOnlyCall],
+      writeIntent: true,
+    };
+    const first = await conductor.afterStage("executor", "completed", "read the file, described the edit", ["reviewer", "synthesizer"], evidence);
+    expect(first.type).toBe("reroute");
+    if (first.type === "reroute") {
+      expect(first.newRemaining[0]).toBe("re-enter:executor");
+      expect(first.reason).toContain("zero successful mutations");
+    }
+  });
+
+  test("the fence fires at most once per run", async () => {
+    const supervisorCalls: any[][] = [];
+    const { conductor } = makeConductor({}, async (messages) => {
+      supervisorCalls.push(messages);
+      return { content: '{"directive":"continue"}' };
+    });
+    conductor.setContext("general", "high", "run-write-fence-2");
+    const evidence = {
+      request: "Apply the smoothing changes to PluginProcessor.cpp",
+      toolCalls: [readOnlyCall],
+      writeIntent: true,
+    };
+    const first = await conductor.afterStage("executor", "completed", "no writes", ["synthesizer"], evidence);
+    expect(first.type).toBe("reroute");
+    // Second write-less completion: fence used up — the WRITE GAP now counts
+    // as an evidence gap, so model supervision runs instead of a free pass.
+    const second = await conductor.afterStage("executor", "completed", "still no writes", ["synthesizer"], evidence);
+    expect(second.type).toBe("continue");
+    expect(supervisorCalls.length).toBe(1);
+    expect(supervisorCalls[0][1].content).toContain("Write intent: TRUE");
+    expect(supervisorCalls[0][1].content).toContain("successful mutations so far: 0");
+  });
+
+  test("a successful mutation satisfies the fence", async () => {
+    const supervisorCalls: any[][] = [];
+    const { conductor } = makeConductor({}, async (messages) => {
+      supervisorCalls.push(messages);
+      return { content: '{"directive":"continue"}' };
+    });
+    conductor.setContext("general", "high", "run-write-fence-3");
+    const directive = await conductor.afterStage("executor", "completed", "applied the edit", ["synthesizer"], {
+      request: "Apply the smoothing changes to PluginProcessor.cpp",
+      toolCalls: [readOnlyCall, writeCall],
+      writeIntent: true,
+    });
+    expect(directive).toEqual({ type: "continue" });
+    expect(supervisorCalls.length).toBe(0); // clean write turn — no inference spent
+  });
+
+  test("read turns are unaffected by the fence", async () => {
+    const { conductor } = makeConductor();
+    conductor.setContext("general", "high", "run-write-fence-4");
+    const directive = await conductor.afterStage("executor", "completed", "summarized files", ["synthesizer"], {
+      request: "summarize src/main.ts",
+      toolCalls: [readOnlyCall],
+      writeIntent: false,
+    });
+    expect(directive).toEqual({ type: "continue" });
+  });
+});

@@ -2748,7 +2748,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // every remaining coordinator path is struck or scorecard-unfit.
         const localConductorCfgEnabled = Boolean(cfg.orchestrator?.conductor?.enabled);
         let localConductorAvailable = false;
-        if (localConductorCfgEnabled && !persistentConductor.shouldFallbackToApi()) {
+        // 2026-07-18: availability is a HEALTH question, not a fallback-policy
+        // question. The old `!shouldFallbackToApi()` gate meant that with the
+        // standard `fallback_to_api: true` config this probe never ran,
+        // `localConductorAvailable` was permanently false, and every turn with
+        // coordinator health strikes skipped straight to deterministic routes —
+        // while a warm, healthy local conductor sat unused ("local conductor
+        // unavailable" logged seconds after a successful keep-warm ping).
+        if (localConductorCfgEnabled) {
           try {
             localConductorAvailable = await persistentConductor.isAvailable();
           } catch {

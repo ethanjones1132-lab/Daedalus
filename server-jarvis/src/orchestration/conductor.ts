@@ -7,6 +7,7 @@ import type { StageName } from "./coordinator";
 import type { EvidenceAssessment } from "./evidence-sufficiency";
 import { assessWorkspaceEvidence, isDeepReadRequest } from "./evidence-sufficiency";
 import { EVIDENCE_CAPABLE_STAGES } from "./reroute-policy";
+import { WRITE_EFFECT_TOOLS } from "./effect-gate";
 import type { ToolCallRecord } from "./stage-output";
 
 export interface ConductorStageEvidence {
@@ -14,6 +15,14 @@ export interface ConductorStageEvidence {
   request?: string;
   workerInstruction?: string;
   workspaceRoot?: string;
+  /**
+   * 2026-07-18: sticky/derived write intent for the turn. Without it the
+   * conductor was WRITE-BLIND — a change-request executor stage that
+   * completed with zero mutations had no failure, no tool errors, and no
+   * read-evidence gap, so supervision returned a free "continue" (every
+   * directive in the incident DB was "continue").
+   */
+  writeIntent?: boolean;
 }
 
 interface SupervisionDigest {
@@ -28,6 +37,9 @@ interface SupervisionDigest {
   requestSummary: string;
   workerInstruction: string;
   remainingQueue: StageName[];
+  /** 2026-07-18: write contract visibility for the supervisor model. */
+  writeIntent: boolean;
+  successfulWrites: number;
 }
 
 /**
@@ -67,6 +79,8 @@ export class LiveConductor {
   private recentToolErrors: string[] = [];
   private runId = "";
   private deepReadEvidenceRerouteUsed = false;
+  /** 2026-07-18: one deterministic write-effect reroute per run (mirrors deep-read). */
+  private writeEffectRerouteUsed = false;
   /** F7: per-run supervision inference counter (reset in setContext). */
   private supervisionCallsUsed = 0;
 
@@ -89,6 +103,7 @@ export class LiveConductor {
     this.taskType = taskType;
     this.runId = runId;
     this.deepReadEvidenceRerouteUsed = false;
+    this.writeEffectRerouteUsed = false;
     this.supervisionCallsUsed = 0;
     this.supervision = !this.cfg.supervise_low_complexity && complexity === "low" ? "off" : "on";
   }
@@ -152,9 +167,35 @@ export class LiveConductor {
         };
       }
 
+      // 2026-07-18: write-effect fence — the write-side mirror of the
+      // deep-read reroute above. A change-request executor stage that ends
+      // with ZERO successful mutations is not "clean"; re-enter the executor
+      // once (fresh stage window) with an explicit apply-the-change note
+      // before letting the pipeline drift toward synthesis. Deterministic —
+      // costs no supervisory inference.
+      const successfulWrites = (evidence.toolCalls ?? []).filter(
+        (call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name),
+      ).length;
+      if (
+        stage === "executor" &&
+        outcome === "completed" &&
+        evidence.writeIntent === true &&
+        successfulWrites === 0 &&
+        remainingQueue.length > 0 &&
+        !this.writeEffectRerouteUsed
+      ) {
+        this.writeEffectRerouteUsed = true;
+        return {
+          type: "reroute",
+          newRemaining: ["re-enter:executor" as StageName, ...remainingQueue],
+          reason: "write-intent executor stage completed with zero successful mutations; re-entering executor once to APPLY the change with write_file/edit_file before continuing",
+        };
+      }
+
+      const writeGap = evidence.writeIntent === true && successfulWrites === 0;
       const evidenceGap = Boolean(
         evidenceAssessment && !evidenceAssessment.sufficient,
-      );
+      ) || writeGap;
       if (!shouldSuperviseStage({
         supervisionEnabled: this.supervision === "on",
         outcome,
@@ -181,6 +222,8 @@ export class LiveConductor {
         requestSummary: (evidence.request ?? "").slice(0, 300),
         workerInstruction: evidence.workerInstruction ?? "",
         remainingQueue,
+        writeIntent: evidence.writeIntent === true,
+        successfulWrites,
       };
 
       this.supervisionCallsUsed += 1;
@@ -210,6 +253,7 @@ export class LiveConductor {
         digest.evidenceAssessment
           ? `Evidence assessment: ${JSON.stringify(digest.evidenceAssessment)}`
           : `Evidence assessment: not applicable — the ${digest.stage} stage produces no tool calls by design`,
+        `Write intent: ${digest.writeIntent ? `TRUE — successful mutations so far: ${digest.successfulWrites}` : "no"}`,
         `Request (300 chars): ${digest.requestSummary || "(not provided)"}`,
         `Worker instruction: ${digest.workerInstruction || "(not provided)"}`,
         `Remaining queue: ${digest.remainingQueue.length > 0 ? digest.remainingQueue.join(" → ") : "(none)"}`,
