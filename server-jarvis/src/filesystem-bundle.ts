@@ -400,12 +400,35 @@ async function handleGrep(args: Record<string, unknown>, ctx: ExecutionContext):
   const cfg = ctx.config;
   const pattern = args.pattern as string;
   const searchPath = safePath((args.path as string) || ".", cfg, ctx.workspace_path);
-  await assertSearchDirectory(searchPath);
   const outputMode = (args.output_mode as string) || "files_with_matches";
   const headLimit = (args.head_limit as number) || 50;
 
   const results: string[] = [];
   const regex = new RegExp(pattern);
+
+  // 2026-07-18: grep on a single FILE is legitimate ("grep prepareToPlay in
+  // PluginProcessor.cpp") — the old directory-only assertion threw
+  // "Directory not found" at exactly the moment a live write-repair stage
+  // was locating its edit target, derailing the whole repair.
+  const searchStat = await fs.stat(searchPath).catch(() => null);
+  if (searchStat?.isFile()) {
+    try {
+      const content = await fs.readFile(searchPath, "utf-8");
+      if (outputMode === "files_with_matches") {
+        return regex.test(content) ? (args.path as string) : "No matches found";
+      }
+      const lines = content.split("\n");
+      for (let i = 0; i < lines.length && results.length < headLimit; i++) {
+        if (regex.test(lines[i])) results.push(`${i + 1}: ${lines[i].trim()}`);
+      }
+      return results.join("\n") || "No matches found";
+    } catch {
+      return "No matches found";
+    }
+  }
+  if (!searchStat?.isDirectory()) {
+    throw new Error(`Path not found: ${searchPath}. Use glob with pattern "**" from the workspace root to find the correct path.`);
+  }
 
   async function walk(dir: string) {
     if (results.length >= headLimit) return;

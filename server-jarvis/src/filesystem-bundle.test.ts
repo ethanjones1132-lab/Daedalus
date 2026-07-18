@@ -270,6 +270,32 @@ describe("FilesystemBundle > edit_file (read-before-edit guard)", () => {
   });
 });
 
+describe("FilesystemBundle > grep on a single file (2026-07-18)", () => {
+  // Live incident: the write-repair rewriter located its edit target with
+  // grep(path=<file>) and got "Directory not found", derailing the repair.
+  test("grep accepts a FILE path and searches just that file", async () => {
+    const ws = makeTempWorkspace();
+    writeFileSync(join(ws, "proc.cpp"), "void prepareToPlay() {\n  reset();\n}\nvoid other() {}\n");
+    const result = await makeRuntime().execute(
+      call("grep", { pattern: "prepareToPlay", path: "proc.cpp", output_mode: "content" }),
+      makeCtx(ws),
+    );
+    expect(result.is_error).toBe(false);
+    expect(result.output).toContain("prepareToPlay");
+    expect(result.output).toContain("1:");
+  });
+
+  test("grep on a missing path still errors with glob guidance", async () => {
+    const ws = makeTempWorkspace();
+    const result = await makeRuntime().execute(
+      call("grep", { pattern: "x", path: "nope-dir" }),
+      makeCtx(ws),
+    );
+    expect(result.is_error).toBe(true);
+    expect(result.error).toContain("glob");
+  });
+});
+
 describe("FilesystemBundle > read_file continuation note (2026-07-18)", () => {
   test("a cut-off read names the window and the exact continuation call", async () => {
     const ws = makeTempWorkspace();
