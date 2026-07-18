@@ -173,8 +173,13 @@ export function hasWorkspaceSignal(message: string): boolean {
 // ── Verb / noun signals ─────────────────────────────────────────────────────
 // Mutation verbs: any of these (as a whole word) signals the user wants the
 // system to CHANGE something — files, builds, commits, deployments.
+// Gerund (-ing) forms are matched deliberately (2026-07-17 incident: "Begin
+// implementing phase 1" matched nothing and routed to a tool-less
+// synthesizer). Past/-s forms are deliberately EXCLUDED — they read as status
+// questions or nouns ("what are the latest changes?", "is the server
+// running?"), so "running" and "changes" must never grant write authority.
 const MUTATION_VERB =
-  /\b(write|edit|create|add|delete|remove|fix|refactor|implement|execute|build|deploy|install|commit|patch|change|modif(?:y|ies)|rename|move|generate|replace|rewrite|scaffold|migrate|format|append|insert|overwrite|update|push|run)\b/gi;
+  /\b(writ(?:e|ing)|edit(?:ing)?|creat(?:e|ing)|add(?:ing)?|delet(?:e|ing)|remov(?:e|ing)|fix(?:ing)?|refactor(?:ing)?|implement(?:ing)?|execut(?:e|ing)|build(?:ing)?|deploy(?:ing)?|install(?:ing)?|commit(?:ting)?|patch(?:ing)?|chang(?:e|ing)|modif(?:y|ies|ying)|renam(?:e|ing)|mov(?:e|ing)|generat(?:e|ing)|replac(?:e|ing)|rewrit(?:e|ing)|scaffold(?:ing)?|migrat(?:e|ing)|format(?:ting)?|append(?:ing)?|insert(?:ing)?|overwrit(?:e|ing)|updat(?:e|ing)|push(?:ing)?|run)\b/gi;
 
 const NEGATED_MUTATION_NOUN =
   /\b(?:no\s+(?:(?:file|code)\s+)?|without\s+(?:any\s+)?)(?:modifications?|edits?|changes?)\b|\bwithout\s+(?:writing|editing|creating|adding|deleting|removing|fixing|refactoring|implementing|building|deploying|installing|committing|patching|modifying|renaming|moving|generating|replacing|rewriting|scaffolding|migrating|formatting|appending|inserting|overwriting|updating|pushing|running)\b|\bdo\s+not\s+(?:make|apply)\s+(?:any\s+)?(?:modifications?|edits?|changes?)\b/i;
@@ -219,8 +224,12 @@ function isNegatedMutation(text: string, index: number): boolean {
 
 const ABSTRACT_DELIVERABLE =
   /\b(plan|report|summary|analysis|roadmap|proposal|assessment|overview|recommendation|strategy|outline|write[- ]?up)\b/i;
+// Work-item nouns (phase/task/step/...) are concrete: "implement phase 1"
+// means "do the work of phase 1", which in an implementation session means
+// mutating files. (2026-07-17 incident: "Begin implementing phase 1" carried
+// no write intent, so no gate demanded actual mutations.)
 const CONCRETE_WRITE_TARGET =
-  /\b(file|repo(?:sitory)?|path|workspace|code|source|doc(?:ument)?|config(?:uration)?|test|script|directory|folder|module|package|app(?:lication)?|project|table|database|schema|target)\b/i;
+  /\b(file|repo(?:sitory)?|path|workspace|code|source|doc(?:ument)?|config(?:uration)?|test|script|directory|folder|module|package|app(?:lication)?|project|table|database|schema|target|phase|task|step|item|milestone|feature|functionality|fix|bug|crash|issue)\b/i;
 
 /**
  * Decide whether a raw user message actually asks Jarvis to mutate something.
@@ -263,7 +272,7 @@ export function hasWriteIntent(message: string): boolean {
 
 // Read / inspection verbs: signal the user wants to LOOK AT something.
 const READ_VERB =
-  /\b(read(?:s|ing)?|read_file|inspect|list|search|summari[sz]e|summary|overview|analy[sz]e|show|open|view|examine|explore|cat|look|find|grep|describe|audit|review|check|scan|understand|tell\s+me\s+about|walk\s+me\s+through)\b/i;
+  /\b(read(?:s|ing)?|read_file|inspect|list|search|summari[sz]e|summary|overview|analy[sz]e|show|open|view|examine|explore|cat|look|find|grep|describe|audit|review|check|scan|understand|verif(?:y|ies|ying)|validat(?:e|ing)|confirm(?:ing)?|tell\s+me\s+about|walk\s+me\s+through)\b/i;
 
 // The evidence-failure response advertises this phrase as the retry escape
 // hatch. Keep it explicitly read-only, even when the surrounding sentence says
@@ -333,15 +342,19 @@ export function classifyTurnRequirements(message: string): TurnRequirementResult
   if (hasWeakWorkspace) signals.push("weak_workspace");
   if (hasWorkStartCommand) signals.push("work_start_command");
 
+  // The deep-read escape hatch is checked FIRST: it is advertised as
+  // explicitly read-only even when the sentence says "perform" or "executing
+  // read_file" — and with gerund mutation verbs now matched, "executing"
+  // would otherwise steal the hatch into full_execution.
+  if (hasDeepReadIntent) {
+    return { requirement: "workspace_read", signals };
+  }
+
   // Unnegated mutation intent wins outright — even with a path present,
   // "fix C:\x.ts" is a change request, not a read. Negated mutation language
   // remains observable in signals but cannot grant write/command authority.
   if (hasMutation) {
     return { requirement: "full_execution", signals };
-  }
-
-  if (hasDeepReadIntent) {
-    return { requirement: "workspace_read", signals };
   }
 
   if (hasWorkStartCommand) {

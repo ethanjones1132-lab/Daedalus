@@ -26,8 +26,17 @@ export function evaluateEffectGate(input: {
   const failedCalls = calls
     .filter((call) => call.is_error)
     .map((call) => ({ name: call.name, detail: (call.output || "").slice(0, 160) }));
-  const writeIntent = input.profile === "full" && input.executor !== undefined
-    && (input.request === undefined ? true : hasWriteIntent(input.request));
+  // When the raw request is available, write intent comes from the request
+  // TEXT alone — not from whether an executor happened to run. 2026-07-17
+  // incident: "Begin implementing phase 1" was routed synthesizer-only
+  // (profile "none", no executor), the old profile/executor precondition kept
+  // the gate "clean", and the synthesizer fabricated a completion claim with
+  // invented diffs. A change request that produced zero mutations must be
+  // reported as such no matter how the turn was routed. The profile-based
+  // fallback survives only for legacy callers that cannot supply the request.
+  const writeIntent = input.request !== undefined
+    ? hasWriteIntent(input.request)
+    : (input.profile === "full" && input.executor !== undefined);
   const successfulWrites = calls.filter(
     (call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name),
   ).length;
@@ -66,4 +75,35 @@ export function applyEffectGate(
     return { outcome: "failed", errorCode: "effect_gate_no_write_effect" };
   }
   return { outcome: "degraded", errorCode: `effect_gate_${report.verdict}` };
+}
+
+/**
+ * In-loop write pressure for the executor (2026-07-17 incident): on live
+ * write-intent turns the executor read a couple of files and then narrated
+ * the change as prose — the only mid-loop nudge in the runtime was the
+ * READ-evidence rubric, which actively steers toward read-only tools. When
+ * the model is about to end a full-profile write turn with zero successful
+ * mutations, the loop sends a bounded write nudge instead of accepting the
+ * prose. Bounded at 2 so a refusing/incapable model still exits quickly.
+ */
+export const WRITE_EFFECT_NUDGE =
+  "This turn is a CHANGE request. You have write tools available " +
+  "(write_file, edit_file, multi_edit, apply_patch). Apply the requested " +
+  "change by CALLING one of them now — code or diffs written as prose do " +
+  "not modify any file and do not count. After writing, read the file back " +
+  "to verify, then finish.";
+
+export function shouldPressWriteEffect(input: {
+  writeIntent: boolean;
+  profile: ExecutionProfile;
+  successfulWrites: number;
+  nudgesSent: number;
+  turnCount: number;
+  maxTurns: number;
+}): boolean {
+  return input.writeIntent
+    && input.profile === "full"
+    && input.successfulWrites === 0
+    && input.nudgesSent < 2
+    && input.turnCount < input.maxTurns;
 }

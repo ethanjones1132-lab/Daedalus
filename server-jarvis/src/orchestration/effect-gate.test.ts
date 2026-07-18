@@ -71,4 +71,48 @@ describe("effect gate", () => {
       errorCode: "stage_error",
     });
   });
+
+  // ── 2026-07-17 incident: executor-less pipelines bypassed the gate ──
+  // "Begin implementing phase 1" was routed synthesizer-only (profile "none",
+  // no executor). writeIntent required profile==="full" && executor present,
+  // so the gate stayed "clean" and the synthesizer fabricated a completion
+  // claim with fake diffs. A write-intent request must fire the gate even
+  // when no executor ran at all.
+  test("write-intent request with no executor stage fires no_write_effect", () => {
+    const report = evaluateEffectGate({
+      profile: "none",
+      request: "Begin implementing phase 1",
+    });
+    expect(report.verdict).toBe("no_write_effect");
+    expect(report.writeIntent).toBe(true);
+    expect(report.synthesizerNotice).toContain("ZERO file mutations");
+  });
+
+  test("write-intent request under a read_only profile still fires the gate", () => {
+    const report = evaluateEffectGate({
+      profile: "read_only",
+      executor: executor([call("read_file")]),
+      request: "update README.md",
+    });
+    expect(report.verdict).toBe("no_write_effect");
+  });
+
+  test("non-write request with no executor stays clean", () => {
+    const report = evaluateEffectGate({
+      profile: "none",
+      request: "what did we decide about the smoothing approach?",
+    });
+    expect(report.verdict).toBe("clean");
+    expect(report.writeIntent).toBe(false);
+  });
+
+  test("write-intent request satisfied by a successful write is clean", () => {
+    const report = evaluateEffectGate({
+      profile: "full",
+      executor: executor([call("read_file"), call("edit_file")]),
+      request: "Begin implementing phase 1",
+    });
+    expect(report.verdict).toBe("clean");
+    expect(report.successfulWrites).toBe(1);
+  });
 });

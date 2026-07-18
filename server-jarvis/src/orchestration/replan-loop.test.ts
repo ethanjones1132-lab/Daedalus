@@ -152,7 +152,11 @@ describe("runPipelineWithReplanning", () => {
     });
 
     expect(coordinatorCalls).toBe(1);
-    expect(stageLabels).toEqual(["executor", "rewriter", "reviewer", "synthesizer"]);
+    // "migrate the users table" carries write intent, and this fixture model
+    // only ever answers prose — so the executor stage presses its bounded
+    // write-effect nudge twice (2026-07-17) before accepting the prose
+    // ending: 3 executor model calls for the single executor stage entry.
+    expect(stageLabels).toEqual(["executor", "executor", "executor", "rewriter", "reviewer", "synthesizer"]);
     expect(stateEvents).toContain("conductor_replan:running");
     expect(stateEvents).toContain("conductor_replan:done");
     // Deliberate effect-gate inversion: this full-execution fixture never
@@ -191,17 +195,20 @@ describe("runPipelineWithReplanning", () => {
     });
 
     expect(coordinatorCalls).toBe(1); // exactly one replan invocation, then budget exhausted
-    // Executor legitimately runs twice here: once in the pre-budget segment,
-    // and again in the final segment, because the coordinator's LAST decision
-    // (returned just before the budget ran out) still explicitly lists
-    // "executor" — and an explicit request in the model's own decision always
-    // wins over "already completed", even across the budget-exhaustion
-    // boundary. This mirrors the deliberate-re-run guarantee (see the
-    // "deliberately re-requested executor runs again" test above): the loop
-    // intentionally trusts the model's latest explicit stage list rather than
-    // inferring staleness, bounded by maxReplans so the worst case is a few
-    // extra model calls, never incorrect output.
-    expect(stageLabels).toEqual(["executor", "rewriter", "executor", "reviewer", "synthesizer"]);
+    // The executor STAGE legitimately runs twice here: once in the pre-budget
+    // segment, and again in the final segment, because the coordinator's LAST
+    // decision (returned just before the budget ran out) still explicitly
+    // lists "executor" — and an explicit request in the model's own decision
+    // always wins over "already completed", even across the budget-exhaustion
+    // boundary. Each stage entry additionally makes 3 model calls (initial +
+    // 2 bounded write-effect nudges, 2026-07-17) because this write-intent
+    // fixture only ever answers prose.
+    expect(stageLabels).toEqual([
+      "executor", "executor", "executor",
+      "rewriter",
+      "executor", "executor", "executor",
+      "reviewer", "synthesizer",
+    ]);
     expect(result.outcome).toBe("failed");
     expect(result.error_code).toBe("effect_gate_no_write_effect");
   });
@@ -245,8 +252,15 @@ describe("runPipelineWithReplanning", () => {
     });
 
     expect(coordinatorCalls).toBe(1);
-    expect(stageLabels).toEqual(["executor", "rewriter", "executor", "reviewer", "synthesizer"]);
-    expect(stageLabels.filter((s) => s === "executor")).toHaveLength(2);
+    // Two executor STAGE entries (original + deliberate re-run), each pressed
+    // by the bounded write-effect nudge into 3 model calls (2026-07-17).
+    expect(stageLabels).toEqual([
+      "executor", "executor", "executor",
+      "rewriter",
+      "executor", "executor", "executor",
+      "reviewer", "synthesizer",
+    ]);
+    expect(stageLabels.filter((s) => s === "executor")).toHaveLength(6);
     expect(result.outcome).toBe("failed");
     expect(result.error_code).toBe("effect_gate_no_write_effect");
   });
@@ -338,6 +352,78 @@ describe("runPipelineWithReplanning", () => {
     });
 
     expect(profiles.every((p) => p === "read_only")).toBe(true);
+  });
+
+  // ── 2026-07-17 incident (run_cce0482e): mid-run replan coordinator hit its
+  // 15s stage deadline, the unguarded `coordinator.route` throw aborted the
+  // whole turn, and the user's chat bubble was the raw
+  // "Stage deadline exceeded (15000ms) on stage=coordinator" string.
+  // A replan-coordinator failure must degrade to "continue without replan",
+  // never abort the turn.
+  test("marker-path coordinator failure continues with the remaining planned stages", async () => {
+    const stageLabels: string[] = [];
+    const callModel = async (_messages: any[], options?: any) => {
+      stageLabels.push(options?.stageLabel ?? "?");
+      return { content: `output for ${options?.stageLabel}` };
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+    const coordinator = new Coordinator((async () => ({ content: "unused" })) as any);
+    coordinator.route = (async () => {
+      throw new Error("Stage deadline exceeded (15000ms) on stage=coordinator");
+    }) as typeof coordinator.route;
+
+    const result = await runPipelineWithReplanning({
+      contextMessage: "migrate the users table",
+      initialDecision: baseDecision(), // ["executor","conductor_replan","reviewer","synthesizer"]
+      turnRequirement: "full_execution",
+      coordinator,
+      routeOptions: { sessionId: "coordinator-crash-marker" },
+      executor,
+      agentRunId: "run-coordinator-crash-marker",
+      onStateChange: () => {},
+      baseOptions: {},
+      maxReplans: 2,
+    });
+
+    // The turn survives: remaining stages run and the synthesizer's honest
+    // (effect-gated) answer ships instead of a raw deadline error.
+    expect(stageLabels).toContain("synthesizer");
+    expect(result.answer).toBe("output for synthesizer");
+    expect(result.outcome).toBe("failed");
+    expect(result.error_code).toBe("effect_gate_no_write_effect");
+  });
+
+  test("mid-run replan coordinator failure falls through to final synthesis", async () => {
+    const stageLabels: string[] = [];
+    const callModel = async (_messages: any[], options?: any) => {
+      stageLabels.push(options?.stageLabel ?? "?");
+      return { content: `output for ${options?.stageLabel}` };
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+    const coordinator = new Coordinator((async () => ({ content: "unused" })) as any);
+    coordinator.route = (async () => {
+      throw new Error("Stage deadline exceeded (15000ms) on stage=coordinator");
+    }) as typeof coordinator.route;
+
+    const result = await runPipelineWithReplanning({
+      contextMessage: "migrate the users table",
+      // No conductor_replan marker: the replan is requested mid-run by the
+      // effect gate (write intent + zero successful mutations).
+      initialDecision: baseDecision({ pipeline: ["executor", "reviewer", "synthesizer"] }),
+      turnRequirement: "full_execution",
+      coordinator,
+      routeOptions: { sessionId: "coordinator-crash-midrun" },
+      executor,
+      agentRunId: "run-coordinator-crash-midrun",
+      onStateChange: () => {},
+      baseOptions: {},
+      maxReplans: 1,
+    });
+
+    expect(stageLabels).toContain("synthesizer");
+    expect(result.answer).toBe("output for synthesizer");
+    expect(result.outcome).toBe("failed");
+    expect(result.error_code).toBe("effect_gate_no_write_effect");
   });
 });
 

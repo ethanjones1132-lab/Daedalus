@@ -19,6 +19,35 @@ describe("isContinuationTurn", () => {
       expect(isContinuationTurn(message)).toBe(false);
     }
   });
+
+  // 2026-07-17 incident: "Begin implementing phase 1" missed WORK_START_COMMAND
+  // because the pattern required the work object directly after the verb.
+  test("work-start commands with a gerund before the object are continuations", () => {
+    for (const message of [
+      "Begin implementing phase 1",
+      "start implementing the plan",
+      "ok begin writing the next task",
+    ]) {
+      expect(isContinuationTurn(message)).toBe(true);
+    }
+  });
+
+  // 2026-07-17 incident: "Verify implementation completed" classified as a
+  // fresh answer_only turn, short-circuited to a tool-less synthesizer, and
+  // hallucinated a verification. It must inherit the prior turn's authority.
+  test("verification-of-prior-work follow-ups are continuations", () => {
+    for (const message of [
+      "Verify implementation completed",
+      "verify the implementation is complete",
+      "check that the changes work",
+    ]) {
+      expect(isContinuationTurn(message)).toBe(true);
+    }
+  });
+
+  test("fresh verification questions about concepts are not continuations", () => {
+    expect(isContinuationTurn("verify my understanding of TCP: is it stream oriented?")).toBe(false);
+  });
 });
 
 describe("isTrivialConversationalTurn", () => {

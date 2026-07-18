@@ -80,12 +80,25 @@ describe("turn budgets", () => {
   });
 
   test("caps coordinator work while leaving the terminal synthesizer to the turn deadline", () => {
-    for (const requirement of ["conversational", "answer_only", "workspace_read", "full_execution"] as const) {
+    for (const requirement of ["conversational", "answer_only", "workspace_read"] as const) {
       const budget = createTurnBudget(requirement, "medium", 0);
       expect(budget.stageRemainingMs("coordinator", 0)).toBe(15_000);
       expect(budget.stage_ms.synthesizer).toBeUndefined();
       expect(budget.stageRemainingMs("synthesizer", 0)).toBe(budget.remainingMs(0));
     }
+    // full_execution grants the coordinator 20s: mid-run replans share the
+    // coordinator window with the initial route, and the live pool's first
+    // token alone runs 10-20s (2026-07-17 run_cce0482e died here at 15s).
+    const fullBudget = createTurnBudget("full_execution", "medium", 0);
+    expect(fullBudget.stageRemainingMs("coordinator", 0)).toBe(20_000);
+    expect(fullBudget.stage_ms.synthesizer).toBeUndefined();
+  });
+
+  // 2026-07-17: the rewriter is the effect-gate write-repair stage on change
+  // turns; its former 30s window died mid-repair on live free-tier latency.
+  test("full_execution rewriter window matches the executor-class 60s", () => {
+    const budget = createTurnBudget("full_execution", "high", 0);
+    expect(budget.stage_ms.rewriter).toBe(60_000);
   });
 
   test("evidence progress extends the executor stage budget up to the ceiling", () => {

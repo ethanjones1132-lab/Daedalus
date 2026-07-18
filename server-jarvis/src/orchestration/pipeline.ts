@@ -13,7 +13,7 @@ import type { ConductorBus, ConductorDirective } from "./conductor-bus";
 import type { ConductorStageEvidence, LiveConductor } from "./conductor";
 import { buildSynthesizerContext, buildSynthesizerContextFromStageState } from "./synth-context";
 import { detectDeferralStall, DEFERRAL_STALL_NUDGE } from "./synthesizer-deferral";
-import { applyEffectGate, evaluateEffectGate, WRITE_EFFECT_TOOLS, type EffectGateReport } from "./effect-gate";
+import { applyEffectGate, evaluateEffectGate, shouldPressWriteEffect, WRITE_EFFECT_NUDGE, WRITE_EFFECT_TOOLS, type EffectGateReport } from "./effect-gate";
 import { normalizeRemainingStages, type ExecutionProfile } from "./route-normalization";
 import { hasWriteIntent, type TurnRequirement } from "./turn-requirements";
 import type { TurnBudget } from "./turn-budget";
@@ -919,8 +919,16 @@ export class PipelineExecutor {
     let executorDone = false;
     let workspaceEvidenceNudgeCount = 0;
     let evidenceCountAtLastNudge = 0;
+    let writeEffectNudgeCount = 0;
     const intentText = options.rawMessage ?? request;
     const requiresWorkspaceEvidence = turnNeedsWorkspaceEvidence(options.turnRequirement, intentText);
+    // 2026-07-17 incident: on live write turns the executor read files and
+    // then narrated the change as prose — nothing in the loop demanded an
+    // actual mutation (the only nudge was the READ-evidence rubric). Write
+    // turns now carry an explicit in-loop write contract.
+    const requiresWriteEffect = profile === "full" && hasWriteIntent(intentText);
+    const successfulWriteCount = () =>
+      toolCalls.filter((call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name)).length;
     const deepReadRequest = resolveDeepReadIntent(intentText, options.taskRunDepth);
     const executorPrompt = stageSystemPrompt("executor", options);
     const executorEvidence = (): ConductorStageEvidence => ({
@@ -955,6 +963,13 @@ export class PipelineExecutor {
         role: "user",
         content:
           `[Runtime depth target] Deep-read workspace evidence is required: read at least ${DEEP_READ_MIN_CONTENT_READS} distinct source files before ending the stage; listings/manifests do not count; never repeat a call.`,
+      });
+    }
+    if (requiresWriteEffect) {
+      executorMessages.push({
+        role: "user",
+        content:
+          "[Runtime write contract] This is a CHANGE request. The stage is complete only after at least one successful write_file / edit_file / multi_edit / apply_patch call. Read what you need first, then APPLY the change with a tool call and read the file back to verify — code or diffs written as prose do not modify any file.",
       });
     }
     const maxTurns = executorTurnLimit(profile, {
@@ -1314,12 +1329,37 @@ export class PipelineExecutor {
               executorMessages.push({
                 role: "user",
                 content:
-                  `Workspace evidence is required for this turn. ${assessmentAfterTurn.reason}. Call the relevant read-only workspace tools (read_file, list_directory, glob, or grep) and ground your findings in their results before answering.`,
+                  `Workspace evidence is required for this turn. ${assessmentAfterTurn.reason}. Call the relevant read-only workspace tools (read_file, list_directory, glob, or grep) and ground your findings in their results before answering.` +
+                  (requiresWriteEffect
+                    ? " This is ALSO a change request: after reading, apply the requested change with write_file/edit_file/multi_edit/apply_patch."
+                    : ""),
               });
             }
           }
 
-          if (!emittedToolCalls && !workspaceEvidenceNudgeSentThisTurn) {
+          // Write pressure (2026-07-17): the model is about to end a
+          // full-profile change turn with zero successful mutations. Press it
+          // (bounded) to actually call a write tool instead of accepting the
+          // prose ending — but never into a nearly-exhausted stage window.
+          let writeEffectNudgeSentThisTurn = false;
+          if (
+            !emittedToolCalls &&
+            (options.turnBudget?.stageRemainingMs("executor") ?? Number.POSITIVE_INFINITY) > 8_000 &&
+            shouldPressWriteEffect({
+              writeIntent: requiresWriteEffect,
+              profile,
+              successfulWrites: successfulWriteCount(),
+              nudgesSent: writeEffectNudgeCount,
+              turnCount,
+              maxTurns,
+            })
+          ) {
+            writeEffectNudgeCount++;
+            writeEffectNudgeSentThisTurn = true;
+            executorMessages.push({ role: "user", content: WRITE_EFFECT_NUDGE });
+          }
+
+          if (!emittedToolCalls && !workspaceEvidenceNudgeSentThisTurn && !writeEffectNudgeSentThisTurn) {
             executorDone = true;
           }
 

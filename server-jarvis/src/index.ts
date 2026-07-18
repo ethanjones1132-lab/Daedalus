@@ -126,6 +126,7 @@ import { LiveConductor } from "./orchestration/conductor";
 import type { StageName } from "./orchestration/coordinator";
 import {
   coordinatorIsAdvisoryOnly,
+  hasWriteIntent,
   resolveTurnRequirement,
   shouldRememberRequirement,
   shouldShortCircuitCoordinator,
@@ -1321,11 +1322,17 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
   // cannot fit the 180s tier, and the 600s ceiling only binds when there is
   // real work left (turns end at synthesis completion regardless).
   const deepTaskIntent = resolveDeepReadIntent(message, priorTaskRun?.depth);
+  // 2026-07-17: write/implementation turns share the deep-task contract.
+  // Read-plan-write-verify against multiple files structurally cannot fit the
+  // 150-180s tier on the live free-tier pool (run_35d30e5c needed 213s and
+  // still shipped zero writes); like deep reads, the 600s ceiling only binds
+  // while real work remains.
+  const writeTaskIntent = initialRequirement === "full_execution" && hasWriteIntent(message);
   const turnBudget = createTurnBudget(
     initialRequirement,
-    deepTaskIntent || forcedDeepRead ? "high" : "medium",
+    deepTaskIntent || forcedDeepRead || writeTaskIntent ? "high" : "medium",
     turnStartedAt,
-    { forcedDeepRead, deepTask: deepTaskIntent },
+    { forcedDeepRead, deepTask: deepTaskIntent || writeTaskIntent },
   );
   const ensureTurnBudget = (stage: string): void => {
     if (Date.now() >= turnBudget.deadlineAt) {

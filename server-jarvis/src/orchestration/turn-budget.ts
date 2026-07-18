@@ -115,7 +115,12 @@ const BUDGETS: Record<TurnRequirement, Omit<TurnBudget, "requirement" | "complex
   // class as planner's, and would silently recur the moment that model
   // (or any future reviewer-stage model with a similarly large override)
   // is enabled.
-  full_execution: { turn_ms: 150_000, finalization_reserve_ms: 30_000, max_stage_attempts: 2, stage_ms: { coordinator: 15_000, planner: 60_000, executor: 60_000, reviewer: 60_000, rewriter: 30_000 } },
+  // 2026-07-17: rewriter raised 30s→60s — it is the effect-gate's write-repair
+  // stage on change turns and was dying at its own deadline mid-repair
+  // (run_35d30e5c). Coordinator raised 15s→20s — mid-run replans share the
+  // coordinator window with the initial route (usage-based), and the live
+  // pool's first token alone runs 10-20s; 15s made every replan a coin flip.
+  full_execution: { turn_ms: 150_000, finalization_reserve_ms: 30_000, max_stage_attempts: 2, stage_ms: { coordinator: 20_000, planner: 60_000, executor: 60_000, reviewer: 60_000, rewriter: 60_000 } },
 };
 
 // 2026-07-13 finding: agent-pool.ts's DEFAULT_ORCHESTRATOR_AGENTS gives

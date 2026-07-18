@@ -1,4 +1,8 @@
-const TASK_SIGNAL = /\b(read|write|edit|create|delete|run|build|fix|refactor|implement|add|remove|search|find|list|summari[sz]e|review|debug|test|deploy|install|configure|analyze|explain|generate|update|change|file|repo|code|function|class|directory|folder|commit|branch)\b/i;
+// 2026-07-17 incident note: every alternation here must match INFLECTED verb
+// forms ("implementing", "writing", "fixing"), not just the base verb.
+// "Begin implementing phase 1" matched nothing, classified answer_only, and
+// short-circuited to a tool-less synthesizer that fabricated a completion.
+const TASK_SIGNAL = /\b(read(?:ing)?|writ(?:e|ing)|edit(?:ing)?|creat(?:e|ing)|delet(?:e|ing)|run(?:ning)?|build(?:ing)?|fix(?:ing)?|refactor(?:ing)?|implement(?:ing)?|add(?:ing)?|remov(?:e|ing)|search(?:ing)?|find(?:ing)?|list(?:ing)?|summari[sz]e|review(?:ing)?|debug(?:ging)?|test(?:ing)?|deploy(?:ing)?|install(?:ing)?|configur(?:e|ing)|analyz(?:e|ing)|explain(?:ing)?|generat(?:e|ing)|updat(?:e|ing)|chang(?:e|ing)|verify(?:ing)?|file|repo|code|function|class|directory|folder|commit|branch|phase|task|step|plan)\b/i;
 
 const TRIVIAL_PATTERNS: RegExp[] = [
   /^(hi|hey|hello|yo|sup|howdy|hiya)\b/i,
@@ -12,10 +16,18 @@ const CONTINUATION_PATTERNS: RegExp[] = [
   /^(now\s+)?(task|step|item|part|phase|stage|milestone)\s*#?\d+\b/i,
   /^(and\s+)?(then\s+)?(the\s+)?(next|second|third)\s+(one|task|step|item)\b/i,
   /^same\s+(again|thing)\b/i,
+  // Verification of just-completed work ("Verify implementation completed",
+  // "check that the changes work") inherits the prior turn's authority so the
+  // executor actually goes and looks, instead of a tool-less synthesizer
+  // guessing. Concept questions ("verify my understanding of TCP") don't
+  // mention prior-work nouns and stay non-continuation.
+  /^(?:please\s+|now\s+|ok(?:ay)?\s+|and\s+)*(?:verify|check|confirm|validate)\b.{0,80}?\b(?:implement\w*|complet\w*|done|work(?:s|ed|ing)?|chang\w*|edit\w*|fix\w*|finish\w*|written|wrote|appl(?:y|ied))\b/i,
 ];
 
+// `(?:\w+ing\s+)?` lets a gerund sit between the command verb and the work
+// object: "begin implementing phase 1", "start writing the plan".
 export const WORK_START_COMMAND =
-  /^(now |ok |please )*(begin|start|execute|launch|resume|perform|implement|kick off|proceed with|do) (the )?(phase|task|step|item|part|stage|plan|milestone|next)\b/i;
+  /^(?:now |ok |okay |please |actually |just )*(begin|start|execute|launch|resume|perform|implement|kick off|proceed with|do)\s+(?:\w+ing\s+)?(?:the\s+|this\s+)?(phase|task|step|item|part|stage|plan|milestone|next|implementation)\b/i;
 
 export function isContinuationTurn(request: string): boolean {
   const text = (request || "").trim();

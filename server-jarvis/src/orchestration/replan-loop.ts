@@ -188,7 +188,31 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
           carry,
           remainingPipeline.filter((s) => s !== "synthesizer"),
         );
-        decision = await args.coordinator.route(replanRequestText, args.routeOptions);
+        // 2026-07-17 incident (run_cce0482e): an unguarded route() throw
+        // (coordinator stage deadline) aborted the whole turn and shipped
+        // the raw "Stage deadline exceeded" string as the user's answer.
+        // A replan-coordinator failure degrades to "skip the replan and
+        // synthesize honestly from the gathered state" — never an abort.
+        let replanDecision: CoordinatorResult | undefined;
+        try {
+          replanDecision = await args.coordinator.route(replanRequestText, args.routeOptions);
+        } catch (routeErr) {
+          console.warn(
+            `[replan-loop] mid-run replan coordinator failed (${(routeErr as Error)?.message ?? routeErr}) — finishing without replan`,
+          );
+        }
+        if (!replanDecision) {
+          const finalSegment = await args.executor.executeSegment(
+            args.contextMessage,
+            ["synthesizer"],
+            args.agentRunId,
+            args.onStateChange,
+            { ...args.baseOptions, allowMidRunReplan: false },
+            carry,
+          );
+          return finalizeSegment(finalSegment, sessionCapHit);
+        }
+        decision = replanDecision;
         if (args.sessionCounter && args.sessionId) {
           const capTag: ReplanCapKind = replans + 1 >= args.maxReplans ? "per_turn" : "";
           args.sessionCounter.record({
@@ -230,7 +254,25 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
 
     const remainingStagesHint = segments.slice(1).flat();
     const replanRequestText = buildReplanRequest(args.contextMessage, carry, remainingStagesHint);
-    decision = await args.coordinator.route(replanRequestText, args.routeOptions);
+    // Same guard as the mid-run branch: a coordinator failure at the
+    // conductor_replan marker continues with the originally planned remaining
+    // stages instead of aborting the turn. The next loop iteration sees no
+    // replan marker and runs the remainder to completion.
+    try {
+      decision = await args.coordinator.route(replanRequestText, args.routeOptions);
+    } catch (routeErr) {
+      console.warn(
+        `[replan-loop] conductor_replan coordinator failed (${(routeErr as Error)?.message ?? routeErr}) — continuing with planned stages`,
+      );
+      // splitPipelineAtReplan already strips the markers, so the hint holds
+      // only concrete stages; normalizeRoute dedupes the trailing synthesizer.
+      decision = {
+        ...decision,
+        pipeline: [...remainingStagesHint, "synthesizer"],
+        coordinator_rationale: "Replan coordinator unavailable — continuing with the remaining planned stages.",
+      };
+      continue;
+    }
 
     // B-04: record this replan BEFORE incrementing the local counter so
     // the recorded `replan_index` matches the value the counter just

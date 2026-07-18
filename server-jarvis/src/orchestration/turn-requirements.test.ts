@@ -393,3 +393,50 @@ describe("classifyTurnRequirements", () => {
     expect(classifyTurnRequirements("phase transitions in physics").requirement).toBe("answer_only");
   });
 });
+
+// ── 2026-07-17 live incident (runs 02:57Z–03:02Z): inflected mutation verbs ──
+// "Begin implementing phase 1" classified answer_only because MUTATION_VERB
+// only matched base verb forms — the turn short-circuited to a tool-less
+// synthesizer, which fabricated a completion claim with fake diffs.
+describe("inflected mutation language (2026-07-17 write-path incident)", () => {
+  test.each([
+    ["Begin implementing phase 1"],
+    ["start implementing the plan now"],
+    ["continue fixing the smoothing code"],
+    ["keep adding the missing tests"],
+    ["Actually implement Phase 1 – Write the missing smoothing code to PluginProcessor.h and PluginProcessor.cpp"],
+  ])("gerund/inflected mutation → full_execution: %s", (message) => {
+    expect(classifyTurnRequirements(message).requirement).toBe("full_execution");
+  });
+
+  test("work items after an implement verb carry write intent", () => {
+    expect(hasWriteIntent("Begin implementing phase 1")).toBe(true);
+    expect(hasWriteIntent("implement task 3")).toBe(true);
+    expect(hasWriteIntent(
+      "Actually implement Phase 1 – Write the missing smoothing code to PluginProcessor.h and PluginProcessor.cpp",
+    )).toBe(true);
+  });
+
+  test("deep-read escape hatch still beats an inflected execute verb", () => {
+    expect(classifyTurnRequirements(
+      "Perform Phase 1 deep reads by executing read_file on the six files listed above.",
+    ).requirement).toBe("workspace_read");
+  });
+
+  test("negated gerunds stay non-mutating", () => {
+    const result = classifyTurnRequirements("Review this repository without writing files.");
+    expect(result.requirement).toBe("workspace_read");
+    expect(result.signals).not.toContain("mutation_verb");
+  });
+
+  test("noun-like verb forms in status questions stay non-write", () => {
+    expect(classifyTurnRequirements("is the server running?").requirement).toBe("answer_only");
+    expect(classifyTurnRequirements("what are the latest changes?").requirement).toBe("answer_only");
+    expect(hasWriteIntent("what are the latest changes?")).toBe(false);
+  });
+
+  test("verification follow-ups classify as read work, not conversation", () => {
+    expect(classifyTurnRequirements("verify the implementation in src/app.ts").requirement)
+      .toBe("workspace_read");
+  });
+});
