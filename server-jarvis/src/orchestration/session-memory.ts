@@ -433,8 +433,16 @@ export class SessionMemory {
     delete session.fileSnapshots[path];
     delete session.discoveredFacts[`file:${path}`];
 
+    // 2026-07-18: separator- and case-insensitive matching. `path` arrives
+    // slash-normalized from normalizePath, but displayKey/output are built
+    // from RAW args — Windows backslash paths never matched, stale pre-edit
+    // reads survived a successful edit, and the executor's verify read served
+    // old content ("changes did not persist" reported about an edit that IS
+    // on disk — live session livefire-conductor-20260718).
+    const needle = path.replace(/\\/g, "/").toLowerCase();
     for (const [key, entry] of Object.entries(session.toolResults)) {
-      if (entry.displayKey.includes(path) || entry.output.includes(path)) {
+      const haystack = `${entry.displayKey}\n${entry.output}`.replace(/\\/g, "/").toLowerCase();
+      if (haystack.includes(needle)) {
         delete session.toolResults[key];
       }
     }

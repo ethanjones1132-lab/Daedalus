@@ -171,6 +171,51 @@ describe("session-memory", () => {
     expect(memory.lookupCachedToolResult("sess-2", "read_file", { path: "src/auth.ts" })).toBeUndefined();
   });
 
+  // ── 2026-07-18 live incident (session livefire-conductor): the executor's
+  // verify read AFTER a successful edit_file served the PRE-EDIT cached
+  // content, so the synthesizer truthfully-but-wrongly reported "changes did
+  // not persist" about an edit that IS on disk. Cause: invalidateFile
+  // compares a forward-slash-normalized path against displayKey/output built
+  // from raw BACKSLASH args — includes() can never match on Windows paths.
+  test("invalidates cached reads after an edit with Windows backslash paths", () => {
+    const memory = new SessionMemory(() => makeConfig());
+    const winPath = "C:\\Users\\ethan\\workspace\\math.js";
+    memory.recordToolResult({
+      sessionId: "sess-win",
+      toolName: "read_file",
+      args: { path: winPath },
+      result: { output: "module.exports = { subtract };", is_error: false },
+    });
+    memory.recordToolResult({
+      sessionId: "sess-win",
+      toolName: "edit_file",
+      args: { path: winPath, old_string: "subtract };", new_string: "subtract, add };" },
+      result: { output: `Edited ${winPath}`, is_error: false },
+    });
+
+    expect(memory.lookupCachedToolResult("sess-win", "read_file", { path: winPath })).toBeUndefined();
+  });
+
+  test("invalidation is separator- and case-insensitive across mixed path styles", () => {
+    const memory = new SessionMemory(() => makeConfig());
+    memory.recordToolResult({
+      sessionId: "sess-mixed",
+      toolName: "read_file",
+      args: { path: "C:/Users/Ethan/Workspace/Math.js" },
+      result: { output: "old", is_error: false },
+    });
+    memory.recordToolResult({
+      sessionId: "sess-mixed",
+      toolName: "write_file",
+      args: { path: "C:\\users\\ethan\\workspace\\math.js", content: "new" },
+      result: { output: "written", is_error: false },
+    });
+
+    expect(
+      memory.lookupCachedToolResult("sess-mixed", "read_file", { path: "C:/Users/Ethan/Workspace/Math.js" }),
+    ).toBeUndefined();
+  });
+
   test("records pipeline failures into failure patterns", () => {
     const memory = new SessionMemory(() => makeConfig());
     memory.recordPipelineOutcome("sess-3", {
