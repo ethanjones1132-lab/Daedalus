@@ -234,6 +234,42 @@ function isNegatedMutation(text: string, index: number): boolean {
   return interveningWords.length <= 8;
 }
 
+// ── Work commencement over mutation NOUNS ───────────────────────────────────
+// 2026-07-18 23:23 incident: "begin complete and total implementation of
+// phase 1" and "Now complete phase 2 please" carried no MUTATION_VERB match —
+// "implementation" is a noun that verb list can never cover, and "complete"
+// was in no list. Both classified answer_only and short-circuited to a
+// tool-less synthesizer; the first fabricated a "## Changes Made" report with
+// invented diffs. A commencement verb targeting a work-item noun IS an order
+// to do the work, which mid-session means mutating files.
+const WORK_COMMENCEMENT_RE =
+  /\b(begin|start|commence|complete|finish|resume|continue|execute|perform|tackle|carry\s+out|kick\s+off|wrap\s+up|knock\s+out|proceed\s+with|move\s+on\s+to)(?!\s+(?:you|we|they|i)\b)\s+(?:[\w'’-]+\s+){0,4}?((?:phase|task|step|item|part|stage|milestone|plan|implementation|migration|integration|deployment|rollout|remainder|rest|work|fixe?|change|edit|feature|functionality)s?)\b/gi;
+
+// Status questions ("did you complete the phase?") and failure descriptions
+// ("fails to start the sync task") contain the same verb→noun shape but are
+// not orders; both guards inspect the text immediately before the verb.
+const PAST_AUX_BEFORE_COMMENCEMENT = /\b(?:did|have|has|had|was|were)\s+(?:you|we|they|i|it|jarvis)\s*$/i;
+const NON_IMPERATIVE_AUX_BEFORE =
+  /(?:won'?t|can'?t|cannot|couldn'?t|doesn'?t|didn'?t|isn'?t|aren'?t|wasn'?t|weren'?t|fail(?:s|ed|ing)?\s+to|unable\s+to|trying\s+to|tried\s+to)\s*$/i;
+
+interface WorkCommencementMatch {
+  index: number;
+  /** The matched work-object noun (lowercased), e.g. "implementation". */
+  object: string;
+}
+
+function findWorkCommencement(text: string): WorkCommencementMatch | null {
+  for (const match of text.matchAll(WORK_COMMENCEMENT_RE)) {
+    const index = match.index ?? 0;
+    const prefix = text.slice(Math.max(0, index - 48), index);
+    if (PAST_AUX_BEFORE_COMMENCEMENT.test(prefix)) continue;
+    if (NON_IMPERATIVE_AUX_BEFORE.test(prefix)) continue;
+    if (isNegatedMutation(text, index)) continue;
+    return { index, object: (match[2] ?? "").toLowerCase() };
+  }
+  return null;
+}
+
 const ABSTRACT_DELIVERABLE =
   /\b(plan|report|summary|analysis|roadmap|proposal|assessment|overview|recommendation|strategy|outline|write[- ]?up)\b/i;
 // Work-item nouns (phase/task/step/...) are concrete: "implement phase 1"
@@ -279,6 +315,15 @@ export function hasWriteIntent(message: string): boolean {
       if (!compoundTarget && hasNegatedMutation) continue;
     }
 
+    return true;
+  }
+
+  // Commencing concrete work ("begin … implementation of phase 1", "Now
+  // complete phase 2") is write intent even without a bare mutation verb, so
+  // the effect gate demands actual mutations on those turns. Commencing an
+  // abstract deliverable ("complete the plan") stays an answer artifact.
+  const commencement = findWorkCommencement(intentText);
+  if (commencement && !ABSTRACT_DELIVERABLE.test(commencement.object)) {
     return true;
   }
 
@@ -369,6 +414,17 @@ export function classifyTurnRequirements(message: string): TurnRequirementResult
   // "fix C:\x.ts" is a change request, not a read. Negated mutation language
   // remains observable in signals but cannot grant write/command authority.
   if (hasMutation) {
+    return { requirement: "full_execution", signals };
+  }
+
+  // Commencement verb + work noun ("begin … implementation of phase 1",
+  // "Now complete phase 2") is an order to do the work even though no
+  // mutation VERB is present. Checked after the mutation verbs so their
+  // negation semantics stay authoritative, before the anchored work-start
+  // shortcut because this variant also matches mid-sentence.
+  const commencement = findWorkCommencement(intentText);
+  if (commencement) {
+    signals.push("work_commencement");
     return { requirement: "full_execution", signals };
   }
 

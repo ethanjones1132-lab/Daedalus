@@ -120,6 +120,58 @@ describe("buildSynthesizerContextFromStageState", () => {
   });
 });
 
+// ── 2026-07-18 23:23 fabrication incident ──
+// A misrouted work order ("begin complete and total implementation of phase 1")
+// reached a synthesizer-only route and streamed a fully fabricated
+// "## Changes Made" report with invented diffs — zero tools had executed. The
+// synthesizer context must carry an authoritative no-execution contract on any
+// non-conversational turn where nothing ran, so the model cannot honestly-
+// looking claim performed work.
+describe("no-execution fence (2026-07-18 23:23 fabrication incident)", () => {
+  test("zero-tool non-conversational turns get the authoritative no-execution contract", () => {
+    const context = buildSynthesizerContextFromStageState(
+      "begin complete and total implementation of phase 1",
+      {},
+    );
+    expect(context).toContain("No-Execution Contract (authoritative)");
+    expect(context).toContain("Zero tools ran this turn");
+  });
+
+  test("speculative planner/reviewer turns without execution also get the fence", () => {
+    const out = buildSynthesizerContext("Create a plan for phase 1", {
+      plan: "1. Smooth parameters. 2. Clamp gain.",
+      executorSummary: "No execution stage executed. Planner and reviewer ran speculatively without tool execution.",
+      reviewerFeedback: "Plan looks coherent.",
+      rewriterSummary: "No rewriting stage executed.",
+    });
+    expect(out).toContain("No-Execution Contract (authoritative)");
+  });
+
+  test("conversational turns stay fence-free (no scaffolding)", () => {
+    const out = buildSynthesizerContext("Hey buddy, how are you?", {
+      plan: "",
+      executorSummary: "No execution stage executed.",
+      reviewerFeedback: "No review stage executed.",
+      rewriterSummary: "No rewriting stage executed.",
+    });
+    expect(out).toBe("User Request: Hey buddy, how are you?");
+  });
+
+  test("turns with executed tools never get the fence", () => {
+    const state: PipelineStageState = {
+      executor: {
+        ok: true,
+        narrative: "Read the header file.",
+        toolCalls: [
+          { name: "read_file", arguments: { path: "src/PluginProcessor.h" }, output: "header", is_error: false, duration_ms: 2 },
+        ],
+      },
+    };
+    const context = buildSynthesizerContextFromStageState("audit the repo", state);
+    expect(context).not.toContain("No-Execution Contract");
+  });
+});
+
 // synthesize-context pin: prioritizeExecutorFindings is a private helper that
 // reorders an executor summary so trailing Findings/Result/Summary/Answer blocks
 // surface BEFORE the raw tool-log noise. This matters because the executor

@@ -360,7 +360,23 @@ export class SessionMemory {
     if (WRITE_TOOLS.has(input.toolName)) {
       const path = extractPathArg(input.args);
       if (path) {
-        this.invalidateFile(session, normalizePath(path, input.workspacePath));
+        const normalized = normalizePath(path, input.workspacePath);
+        this.invalidateFile(session, normalized);
+        // 2026-07-18 23:42 incident: a continuation turn ("Now complete phase
+        // 2 please") had no idea the plan file written one turn earlier
+        // existed, and asked the user for its contents. Successful writes are
+        // durable session facts — later turns must know where this session's
+        // artifacts live so they read them instead of re-asking.
+        if (!input.result.is_error) {
+          session.discoveredFacts[`artifact:${normalized}`] = {
+            key: `artifact:${normalized}`,
+            value: `Artifact written this session: ${normalized} (${input.toolName}). Read this file before asking the user for its contents.`,
+            source: input.toolName,
+            confidence: 1,
+            timestamp: now,
+            workspacePath: normalizeWorkspacePath(input.workspacePath),
+          };
+        }
       }
     }
 

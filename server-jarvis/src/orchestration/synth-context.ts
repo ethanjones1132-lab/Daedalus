@@ -1,5 +1,6 @@
 import { stripReasoningFromText } from "../reasoning";
 import { truncateToTokenBudget } from "./context-budget";
+import { classifyTurnRequirements } from "./turn-requirements";
 import type { PipelineStageState } from "./stage-output";
 import {
   isDuplicateToolDeflection,
@@ -33,6 +34,19 @@ function isMeaningful(value: string): boolean {
   return value.length > 0 && !SKIP_SENTINELS.has(value);
 }
 
+// 2026-07-18 23:23 incident: a misrouted work order reached a synthesizer-only
+// route and streamed a fabricated "## Changes Made" report with invented diffs
+// — zero tools had executed. On any non-conversational turn with no execution
+// evidence, the synthesizer must receive this contract so it cannot claim
+// performed work. Conversational turns skip it to preserve the minimal
+// no-scaffolding context those turns are pinned to.
+const NO_EXECUTION_CONTRACT = [
+  "No-Execution Contract (authoritative)",
+  "Zero tools ran this turn: no files were read, created, or modified, and no commands executed.",
+  "Do NOT claim any action was performed. Do NOT present diffs, \"Changes Made\" sections, or completion reports.",
+  "If the request asks for work to be performed, state plainly that nothing has been executed yet and that the request should be re-sent as an execution turn.",
+].join("\n");
+
 export function buildSynthesizerContext(
   request: string,
   parts: SynthesizerParts,
@@ -51,6 +65,14 @@ export function buildSynthesizerContext(
   // Verification is authoritative and must survive truncation, so place it
   // immediately after the user request rather than behind verbose stage text.
   if (isMeaningful(clean(executionVerification))) sections.push(truncateToTokenBudget(clean(executionVerification), 700));
+
+  // No execution evidence anywhere in this turn: arm the anti-fabrication
+  // contract (same early position, must survive truncation).
+  const hasExecutionEvidence = isMeaningful(executor)
+    || /Executed Tool Ledger/i.test(executionVerification);
+  if (!hasExecutionEvidence && classifyTurnRequirements(request).requirement !== "conversational") {
+    sections.push(NO_EXECUTION_CONTRACT);
+  }
 
   // Prefer executor evidence before plan for workspace_read-style turns so
   // the synthesizer sees findings first within the total budget.

@@ -48,6 +48,32 @@ describe("isContinuationTurn", () => {
   test("fresh verification questions about concepts are not continuations", () => {
     expect(isContinuationTurn("verify my understanding of TCP: is it stream oriented?")).toBe(false);
   });
+
+  // 2026-07-18 23:23 incident: "begin complete and total implementation of
+  // phase 1" and "Now complete phase 2 please" both missed WORK_START_COMMAND
+  // ("complete" absent from the verb list; adjectives between verb and object
+  // broke the narrow verb→gerund→object shape). Both short-circuited to a
+  // tool-less synthesizer; the first fabricated an entire "## Changes Made"
+  // report with fake diffs.
+  test("work-start commands with adjectives before the object are continuations", () => {
+    for (const message of [
+      "begin complete and total implementation of phase 1",
+      "Now complete phase 2 please",
+      "finish the migration",
+      "complete the remaining tasks",
+    ]) {
+      expect(isContinuationTurn(message)).toBe(true);
+    }
+  });
+
+  test("adjectival 'complete' over non-work nouns is not a continuation", () => {
+    for (const message of [
+      "complete beginners guide to python",
+      "complete history of the roman empire",
+    ]) {
+      expect(isContinuationTurn(message)).toBe(false);
+    }
+  });
 });
 
 // 2026-07-18: during an ACTIVE full-execution task the polarity flips — any

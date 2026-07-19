@@ -153,6 +153,41 @@ describe("session-memory", () => {
     expect(state.failureHistory[0]?.pattern).toContain("read_file failed: File not found");
   });
 
+  // 2026-07-18 23:42 incident: "Now complete phase 2 please" failed because
+  // the turn had no idea IMPLEMENTATION_PLAN.md had been written one turn
+  // earlier — the synthesizer asked the user for the Phase 2 requirements that
+  // were sitting in that file. Successful writes must become durable session
+  // facts so continuation turns know where this session's artifacts live.
+  test("successful writes surface as artifact hints for later turns", () => {
+    const memory = new SessionMemory(() => makeConfig());
+    memory.recordToolResult({
+      sessionId: "artifact-sess",
+      toolName: "write_file",
+      args: { path: "IMPLEMENTATION_PLAN.md" },
+      result: { output: "wrote 22000 bytes", is_error: false },
+      workspacePath: "C:\\Users\\ethan\\Downloads\\Perihelion",
+    });
+
+    const hints = memory.toSharedContextHints("artifact-sess", "C:\\Users\\ethan\\Downloads\\Perihelion");
+    const artifactHint = (hints?.relevant_memories ?? []).find((m) => m.includes("IMPLEMENTATION_PLAN.md"));
+    expect(artifactHint).toBeDefined();
+    expect(artifactHint).toContain("written");
+  });
+
+  test("failed writes leave no artifact hint", () => {
+    const memory = new SessionMemory(() => makeConfig());
+    memory.recordToolResult({
+      sessionId: "artifact-fail-sess",
+      toolName: "write_file",
+      args: { path: "broken.md" },
+      result: { output: "EACCES: permission denied", is_error: true },
+      workspacePath: "/workspace",
+    });
+
+    const hints = memory.toSharedContextHints("artifact-fail-sess", "/workspace");
+    expect((hints?.relevant_memories ?? []).find((m) => m.includes("broken.md"))).toBeUndefined();
+  });
+
   test("invalidates cached reads after write_file", () => {
     const memory = new SessionMemory(() => makeConfig());
     memory.recordToolResult({

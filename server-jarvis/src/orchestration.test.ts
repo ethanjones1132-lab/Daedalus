@@ -708,7 +708,7 @@ describe("Orchestration & Routing Tests", () => {
 
     const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
     const result = await executor.execute(
-      "finish the task",
+      "summarize the findings",
       ["executor", "synthesizer"],
       "run-recursive",
       () => {},
@@ -743,7 +743,7 @@ describe("Orchestration & Routing Tests", () => {
 
     const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
     const result = await executor.execute(
-      "finish the task",
+      "summarize the findings",
       ["executor", "synthesizer"],
       "run-recursive-cap",
       () => {},
@@ -811,7 +811,7 @@ describe("Orchestration & Routing Tests", () => {
 
     const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
     const result = await executor.execute(
-      "finish the task",
+      "summarize the findings",
       ["executor", "synthesizer"],
       "run-b03-planner-reenter",
       () => {},
@@ -876,7 +876,7 @@ describe("Orchestration & Routing Tests", () => {
 
     const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
     const result = await executor.execute(
-      "finish the task",
+      "summarize the findings",
       ["executor", "synthesizer"],
       "run-b03-conductor-replan",
       () => {},

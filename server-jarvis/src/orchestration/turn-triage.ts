@@ -24,10 +24,16 @@ const CONTINUATION_PATTERNS: RegExp[] = [
   /^(?:please\s+|now\s+|ok(?:ay)?\s+|and\s+)*(?:verify|check|confirm|validate)\b.{0,80}?\b(?:implement\w*|complet\w*|done|work(?:s|ed|ing)?|chang\w*|edit\w*|fix\w*|finish\w*|written|wrote|appl(?:y|ied))\b/i,
 ];
 
-// `(?:\w+ing\s+)?` lets a gerund sit between the command verb and the work
-// object: "begin implementing phase 1", "start writing the plan".
+// `(?:[\w'’-]+\s+){0,4}?` lets up to four words — a gerund, determiners, or
+// adjectives — sit between the command verb and the work object: "begin
+// implementing phase 1", "start writing the plan", and (2026-07-18 23:23
+// incident) "begin complete and total implementation of phase 1". The verb
+// list must include completion verbs too: "Now complete phase 2 please" had
+// no matching verb anywhere and short-circuited to a tool-less synthesizer
+// that fabricated an implementation report. The `(?!\s+(?:you|we|they|i)\b)`
+// guard keeps aux usage ("do you think…") from reading as a command.
 export const WORK_START_COMMAND =
-  /^(?:now |ok |okay |please |actually |just )*(begin|start|execute|launch|resume|perform|implement|kick off|proceed with|do)\s+(?:\w+ing\s+)?(?:the\s+|this\s+)?(phase|task|step|item|part|stage|plan|milestone|next|implementation)\b/i;
+  /^(?:now |ok |okay |please |actually |just |alright |and |then )*(begin|start|complete|finish|resume|continue|execute|launch|perform|implement|tackle|kick off|wrap up|carry out|proceed with|do)(?!\s+(?:you|we|they|i)\b)\s+(?:[\w'’-]+\s+){0,4}?(phase|task|step|item|part|stage|plan|milestone|next|implementation|migration|integration|deployment|rollout|remainder|rest|work|fixe?|change|edit|feature|functionality)s?\b/i;
 
 export function isContinuationTurn(request: string): boolean {
   const text = (request || "").trim();

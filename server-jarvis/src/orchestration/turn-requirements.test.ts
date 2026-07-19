@@ -494,3 +494,67 @@ describe("apply-verbs and sticky task authority (2026-07-18 incident)", () => {
     expect(resolved.result.requirement).toBe("answer_only");
   });
 });
+
+// ── 2026-07-18 23:23 live incident: commencement verbs over mutation NOUNS ──
+// "begin complete and total implementation of phase 1" (23:23) and "Now
+// complete phase 2 please" (23:42) both classified answer_only — "implementation"
+// is a noun the MUTATION_VERB list can never match, and "complete" was in no
+// verb list at all. Both short-circuited to a tool-less synthesizer-only
+// route; the first streamed a fully fabricated "## Changes Made" report with
+// invented diffs (zero tool calls), the second asked the user for Phase 2
+// requirements that were sitting in the plan file written one turn earlier.
+describe("work commencement over mutation nouns (2026-07-18 23:23 incident)", () => {
+  test.each([
+    ["begin complete and total implementation of phase 1"],
+    ["Now complete phase 2 please"],
+    ["start the implementation"],
+    ["finish the migration"],
+    ["wrap up phase 3"],
+    ["proceed with the rollout"],
+    ["complete the remaining tasks"],
+    ["alright, let's now complete phase 2"],
+  ])("commencement + work noun → full_execution: %s", (message) => {
+    expect(classifyTurnRequirements(message).requirement).toBe("full_execution");
+  });
+
+  test("polite modal requests to complete work are executive", () => {
+    expect(classifyTurnRequirements("can you complete phase 2?").requirement).toBe("full_execution");
+  });
+
+  test("status questions about completed work stay non-executive", () => {
+    expect(classifyTurnRequirements("is the implementation complete?").requirement).toBe("answer_only");
+    expect(classifyTurnRequirements("did you complete the phase?").requirement).toBe("answer_only");
+  });
+
+  test("negated commencement grants no authority", () => {
+    expect(classifyTurnRequirements("don't start the implementation yet").requirement)
+      .not.toBe("full_execution");
+  });
+
+  test("the live phrases can never short-circuit the coordinator", () => {
+    for (const message of [
+      "begin complete and total implementation of phase 1",
+      "Now complete phase 2 please",
+    ]) {
+      const result = classifyTurnRequirements(message);
+      expect(shouldShortCircuitCoordinator(message, result, false)).toBe(false);
+    }
+  });
+
+  test("commencement work orders arm write intent (effect gate)", () => {
+    expect(hasWriteIntent("begin complete and total implementation of phase 1")).toBe(true);
+    expect(hasWriteIntent("Now complete phase 2 please")).toBe(true);
+  });
+
+  test("commencing an abstract deliverable is not write intent", () => {
+    // "complete the plan" asks for the plan text to be finished — an answer
+    // artifact, not a file mutation; the effect gate must not demand writes.
+    expect(hasWriteIntent("complete the plan")).toBe(false);
+  });
+
+  test("aux-governed 'start' in failure reports is not a commencement", () => {
+    // Diagnostic phrasing must not read as a work order.
+    expect(classifyTurnRequirements("why does the app fail to start the sync task?").requirement)
+      .not.toBe("full_execution");
+  });
+});

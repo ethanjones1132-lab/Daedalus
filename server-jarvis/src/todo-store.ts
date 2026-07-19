@@ -86,16 +86,10 @@ export class TodoStore {
       const records: TodoRecord[] = [];
       for (const item of items) {
         const id = typeof item.id === "string" && item.id.trim() ? item.id.trim() : crypto.randomUUID();
-        const record: TodoRecord = {
-          id,
-          text: String(item.text ?? ""),
-          status: String(item.status ?? "pending"),
-          source: opts.source ?? item.source,
-          session_id: opts.session_id,
-          created_at: now,
-          updated_at: now,
-        };
-        db.prepare(
+        // RETURNING gives back the row as stored — on upsert the DB preserves
+        // the original created_at (and may COALESCE source/session_id), so the
+        // returned record must come from the database, not the input echo.
+        const row = db.prepare(
           `INSERT INTO todos (id, text, status, source, session_id, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
@@ -103,17 +97,27 @@ export class TodoStore {
              status = excluded.status,
              source = COALESCE(excluded.source, todos.source),
              session_id = COALESCE(excluded.session_id, todos.session_id),
-             updated_at = excluded.updated_at`
-        ).run(
-          record.id,
-          record.text,
-          record.status,
-          record.source ?? null,
-          record.session_id ?? null,
-          record.created_at,
-          record.updated_at,
-        );
-        records.push(record);
+             updated_at = excluded.updated_at
+           RETURNING id, text, status, source, session_id, created_at, updated_at`
+        ).get(
+          id,
+          String(item.text ?? ""),
+          String(item.status ?? "pending"),
+          opts.source ?? item.source ?? null,
+          opts.session_id ?? null,
+          now,
+          now,
+        ) as (Omit<TodoRecord, "source" | "session_id"> & { source: string | null; session_id: string | null }) | undefined;
+        if (!row) continue;
+        records.push({
+          id: row.id,
+          text: row.text,
+          status: row.status,
+          source: row.source ?? undefined,
+          session_id: row.session_id ?? undefined,
+          created_at: row.created_at,
+          updated_at: row.updated_at,
+        });
       }
       return records;
     } finally {

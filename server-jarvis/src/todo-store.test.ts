@@ -83,9 +83,13 @@ describe("TodoStore.write — upsert semantics on duplicate id", () => {
     expect(second.updated_at >= first.updated_at).toBe(true);
   });
 
-  test("the `write` return value reports the new state, not the prior row", () => {
+  test("the `write` return value reports the new state, not the prior row", async () => {
     const store = newStore();
     const [first] = store.write([{ id: "dup", text: "v1" }]);
+    // Deterministically straddle a millisecond boundary: before the RETURNING
+    // fix, the upsert preserved created_at in the DB but the RETURN value
+    // carried a fresh timestamp — a flake that only fired under suite load.
+    await new Promise((r) => setTimeout(r, 5));
     const [second] = store.write([{ id: "dup", text: "v2" }]);
     expect(first?.text).toBe("v1");
     expect(second?.text).toBe("v2");
