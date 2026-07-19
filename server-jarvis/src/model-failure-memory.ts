@@ -14,10 +14,10 @@
  * from pool selection for a cooldown window, then gets one probe attempt to
  * see if it recovered.
  *
- * Scope: ONLY non-retryable HTTP failures (4xx other than 429) call
- * `recordHardFailure`. 429s are handled by the existing in-call 2-strike
- * rule in `chatCompletionWithFallback`; transient 5xx retries are NOT hard
- * failures and must not touch that registry.
+ * Non-retryable HTTP failures (4xx other than 429) call `recordHardFailure`.
+ * Repeated 429s use a separate, shorter provider-level cooldown because a
+ * quota window commonly affects every model on the endpoint. Transient 5xx
+ * retries are NOT hard failures and must not touch either registry.
  *
  * First-token stalls get their OWN registry (2026-07-16 evening, session
  * 10cf071d): the cascade advances past a stalled model within a call, but
@@ -47,6 +47,12 @@ export const STALL_STRIKE_THRESHOLD = 2;
 /** Stall cooldown — shorter than hard failures; provider load spikes pass. */
 export const STALL_COOLDOWN_MS = 5 * 60_000;
 
+/** Provider quota/rate-limit strikes before all of its models cool down. */
+export const RATE_LIMIT_STRIKE_THRESHOLD = 2;
+
+/** 429s are usually short-lived quota windows, so probe sooner than stalls. */
+export const RATE_LIMIT_COOLDOWN_MS = 2 * 60_000;
+
 interface FailureRecord {
   strikes: number;
   /** Timestamp (ms) when the strike count first reached the threshold. */
@@ -55,6 +61,7 @@ interface FailureRecord {
 
 const registry = new Map<string, FailureRecord>();
 const stallRegistry = new Map<string, FailureRecord>();
+const providerRateLimitRegistry = new Map<string, FailureRecord>();
 
 function keyFor(provider: string, modelId: string): string {
   return `${provider}:${modelId}`;
@@ -115,6 +122,15 @@ export function recordStall(provider: string, modelId: string, now: number = Dat
 }
 
 /**
+ * Remember repeated 429s at provider scope. Live OpenCode Go quota failures
+ * affected every model on that endpoint; model-only memory simply moved from
+ * deepseek-v4-pro to deepseek-v4-flash and paid the same retry tax again.
+ */
+export function recordRateLimit(provider: string, _modelId: string, now: number = Date.now()): void {
+  recordStrike(providerRateLimitRegistry, provider, RATE_LIMIT_STRIKE_THRESHOLD, now);
+}
+
+/**
  * Clear all strikes/cooldown state for a model. Call on any successful
  * completion so a model that recovers is no longer penalized for past
  * failures.
@@ -122,6 +138,7 @@ export function recordStall(provider: string, modelId: string, now: number = Dat
 export function recordSuccess(provider: string, modelId: string): void {
   registry.delete(keyFor(provider, modelId));
   stallRegistry.delete(keyFor(provider, modelId));
+  providerRateLimitRegistry.delete(provider);
 }
 
 /**
@@ -149,7 +166,8 @@ export function isTemporarilyExcluded(provider: string, modelId: string, now: nu
   // timestamp; a successful probe clears the entry via recordSuccess.
   return (
     isExcludedIn(registry, key, HARD_FAILURE_STRIKE_THRESHOLD, HARD_FAILURE_COOLDOWN_MS, now) ||
-    isExcludedIn(stallRegistry, key, STALL_STRIKE_THRESHOLD, STALL_COOLDOWN_MS, now)
+    isExcludedIn(stallRegistry, key, STALL_STRIKE_THRESHOLD, STALL_COOLDOWN_MS, now) ||
+    isExcludedIn(providerRateLimitRegistry, provider, RATE_LIMIT_STRIKE_THRESHOLD, RATE_LIMIT_COOLDOWN_MS, now)
   );
 }
 
@@ -168,6 +186,10 @@ export function excludedModelKeys(now: number = Date.now()): Set<string> {
     if (record.strikes < STALL_STRIKE_THRESHOLD) continue;
     if (now - record.cooldownStartedAt < STALL_COOLDOWN_MS) result.add(key);
   }
+  for (const [provider, record] of providerRateLimitRegistry.entries()) {
+    if (record.strikes < RATE_LIMIT_STRIKE_THRESHOLD) continue;
+    if (now - record.cooldownStartedAt < RATE_LIMIT_COOLDOWN_MS) result.add(`${provider}:*`);
+  }
   return result;
 }
 
@@ -175,4 +197,5 @@ export function excludedModelKeys(now: number = Date.now()): Set<string> {
 export function resetModelFailureMemory(): void {
   registry.clear();
   stallRegistry.clear();
+  providerRateLimitRegistry.clear();
 }

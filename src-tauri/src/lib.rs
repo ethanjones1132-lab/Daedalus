@@ -494,6 +494,10 @@ fn jarvis_server_log_stdio(file_name: &str) -> std::process::Stdio {
         .unwrap_or_else(|_| std::process::Stdio::null())
 }
 
+fn should_hide_jarvis_server_console(is_windows: bool, _looks_like_local_bun: bool) -> bool {
+    is_windows
+}
+
 fn spawn_jarvis_server(entry: &str) -> Option<std::process::Child> {
     let bun = find_bun_executable();
     let is_windows = cfg!(target_os = "windows");
@@ -514,11 +518,15 @@ fn spawn_jarvis_server(entry: &str) -> Option<std::process::Child> {
         // NEW: Native Windows execution using bundled/portable bun.exe + bundled server .js .
         // This path is taken for installers on new hardware (no WSL checkout needed).
         // The entry should be a .js (the one we added via tauri resources or placed next to exe).
-        std::process::Command::new(&bun)
+        let mut command = std::process::Command::new(&bun);
+        command
             .arg(entry)
             .stdout(jarvis_server_log_stdio("server-jarvis.log"))
-            .stderr(jarvis_server_log_stdio("server-jarvis.err.log"))
-            .spawn()
+            .stderr(jarvis_server_log_stdio("server-jarvis.err.log"));
+        if should_hide_jarvis_server_console(is_windows, looks_like_local_bun) {
+            crate::wsl::hide_windows_console(&mut command);
+        }
+        command.spawn()
     } else {
         let bun = find_bun_executable();
         std::process::Command::new(&bun)
@@ -1105,5 +1113,12 @@ mod startup_thread_tests {
         worker
             .join()
             .expect("startup blocking test should exit cleanly");
+    }
+
+    #[test]
+    fn native_windows_bun_launch_uses_hidden_console_policy() {
+        assert!(should_hide_jarvis_server_console(true, true));
+        assert!(should_hide_jarvis_server_console(true, false));
+        assert!(!should_hide_jarvis_server_console(false, true));
     }
 }

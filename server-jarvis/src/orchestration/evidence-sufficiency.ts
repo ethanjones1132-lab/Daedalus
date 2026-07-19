@@ -39,6 +39,122 @@ const SOURCE_FILE_EXTENSIONS = new Set([
 const SHALLOW_EVIDENCE_TOOLS = new Set(["read_file", "grep", "git_metadata"]);
 const LISTING_TOOLS = new Set(["list_directory", "glob"]);
 
+const SHELL_TOOLS = new Set(["bash", "shell", "run_background_command"]);
+const NETWORK_TOOLS = new Set(["web_fetch", "web_search"]);
+const WRITE_TOOLS = new Set(["write_file", "edit_file", "multi_edit", "apply_patch"]);
+
+/**
+ * A user-authored least-authority contract. Unlike the depth heuristic, this
+ * is a hard allowlist: broad words such as "audit" never widen an explicit
+ * "read only README.md" instruction.
+ */
+export interface WorkspaceReadScope {
+  explicit: true;
+  workspaceRoot: string;
+  allowedPaths: string[];
+  optionalPaths: string[];
+  allowRootListing: boolean;
+  denyShell: boolean;
+  denyNetwork: boolean;
+}
+
+const PATH_TOKEN = /(?:[a-zA-Z]:[\\/][^,;\n]*?\.[a-zA-Z0-9_-]+|(?:[\w.-]+[\\/])*[\w.-]+\.[a-zA-Z0-9_-]+)/g;
+
+function cleanScopedPathToken(value: string): string {
+  return value
+    .replace(/^[`'"(\[]+|[`'")\],;:]+$/g, "")
+    .replace(/\s+if\s+(?:it|they)\s+exists?.*$/i, "")
+    .trim();
+}
+
+/**
+ * Parse narrow read language such as "read only README.md" or
+ * "only read src/a.ts and src/b.ts". Returns undefined when there is no
+ * concrete file allowlist; an ambiguous "read only what is relevant" must
+ * not accidentally turn into a deny-everything policy.
+ */
+export function resolveWorkspaceReadScope(
+  request: string,
+  workspaceRoot = "",
+): WorkspaceReadScope | undefined {
+  const clauseEnd = "(?=\\s+if\\s+(?:it|they)\\s+exists?\\b|\\.\\s|[!?](?:\\s|$)|$)";
+  const onlyMatch =
+    new RegExp(`\\bread\\s+only\\s+([^\\n]+?)${clauseEnd}`, "i").exec(request) ??
+    new RegExp(`\\bonly\\s+read\\s+([^\\n]+?)${clauseEnd}`, "i").exec(request) ??
+    /\bread\s+([^\n]+?)\s+only\b/i.exec(request);
+  if (!onlyMatch) return undefined;
+
+  const rawClause = onlyMatch[1]
+    .replace(/\s+if\s+(?:it|they)\s+exists?.*$/i, "")
+    .replace(/\s+(?:and|but)\s+(?:do\s+not|don't)\b.*$/i, "");
+  const allowedPaths = Array.from(
+    new Set(
+      (rawClause.match(PATH_TOKEN) ?? [])
+        .map(cleanScopedPathToken)
+        .filter(Boolean),
+    ),
+  );
+  if (allowedPaths.length === 0) return undefined;
+
+  const optionalClause = /\bif\s+(?:it|they)\s+exists?\b/i.test(
+    request.slice(onlyMatch.index, onlyMatch.index + onlyMatch[0].length + 40),
+  );
+  return {
+    explicit: true,
+    workspaceRoot,
+    allowedPaths,
+    optionalPaths: optionalClause ? [...allowedPaths] : [],
+    allowRootListing: /\b(?:top[- ]level\s+(?:structure|contents?|files?|listing)|identify\s+(?:the\s+)?top[- ]level|list\s+(?:the\s+)?top[- ]level)\b/i.test(request),
+    denyShell: /\b(?:do\s+not|don't|without|no)\b[^.!?\n]*\b(?:run\s+)?(?:shell|command|bash|powershell)\b/i.test(request),
+    denyNetwork: /\b(?:do\s+not|don't|without|no)\b[^.!?\n]*\b(?:network|web|internet)\b/i.test(request),
+  };
+}
+
+function resolvedScopePath(rawPath: string, scope: WorkspaceReadScope): string {
+  const normalized = normalizePath(rawPath);
+  if (normalized.absolute || !scope.workspaceRoot) return normalized.path;
+  return normalizePath(`${scope.workspaceRoot}/${rawPath}`).path;
+}
+
+function isAllowedScopePath(rawPath: string, scope: WorkspaceReadScope): boolean {
+  const candidate = resolvedScopePath(rawPath, scope);
+  return scope.allowedPaths.some((allowed) => resolvedScopePath(allowed, scope) === candidate);
+}
+
+/** Return a stable policy error when a tool call would exceed an explicit scope. */
+export function workspaceReadScopeViolation(
+  call: { name: string; arguments?: Record<string, unknown> },
+  scope: WorkspaceReadScope | undefined,
+): string | undefined {
+  if (!scope) return undefined;
+  if (scope.denyShell && SHELL_TOOLS.has(call.name)) return "shell access denied by explicit read scope";
+  if (scope.denyNetwork && NETWORK_TOOLS.has(call.name)) return "network access denied by explicit read scope";
+  if (WRITE_TOOLS.has(call.name)) return "write access denied by explicit read-only scope";
+
+  if (call.name === "list_directory" || call.name === "glob") {
+    const rawPath = typeof call.arguments?.path === "string" ? call.arguments.path : scope.workspaceRoot;
+    const atRoot = resolvedScopePath(rawPath || scope.workspaceRoot, scope) ===
+      resolvedScopePath(scope.workspaceRoot || ".", scope);
+    if (!scope.allowRootListing || !atRoot) {
+      return "only the requested top-level listing is allowed by explicit read scope";
+    }
+    return undefined;
+  }
+
+  if (call.name === "read_file" || call.name === "grep") {
+    const rawPath = typeof call.arguments?.path === "string" ? call.arguments.path : "";
+    if (!rawPath || !isAllowedScopePath(rawPath, scope)) {
+      return `tool target is outside explicit read scope (allowed: ${scope.allowedPaths.join(", ")})`;
+    }
+    return undefined;
+  }
+
+  if (call.name === "git_metadata") {
+    return "repository metadata is outside explicit read scope";
+  }
+  return undefined;
+}
+
 /** Distinct tool-target key so re-calling the same read repeatedly counts once. */
 function distinctTargetKeys(calls: ToolCallRecord[], tools: Set<string>): Set<string> {
   const keys = new Set<string>();
@@ -178,6 +294,11 @@ export interface EvidenceAssessment {
  * synthesizer fabricate repo claims.
  */
 export function isDeepReadRequest(request: string): boolean {
+  // Explicit least-authority instructions outrank broad lexical markers. The
+  // live Perihelion audit said "audit" and "read only README.md" in the same
+  // sentence; treating "audit" as permission to read three source files was
+  // both wasteful and a direct scope violation.
+  if (resolveWorkspaceReadScope(request)) return false;
   return DEEP_READ_MARKERS.test(request);
 }
 
@@ -206,7 +327,48 @@ export function assessWorkspaceEvidence(
     (c) => !c.is_error && c.output.trim().length > 0 && !isDuplicateToolDeflection(c),
   );
   const listings = calls.filter((c) => LISTING_TOOLS.has(c.name)).length;
+  const explicitScope = resolveWorkspaceReadScope(request, workspaceRoot);
   const deepRead = isDeepReadRequest(request);
+
+  if (explicitScope) {
+    const matched = new Set<string>();
+    for (const call of calls) {
+      if (call.name !== "read_file" && call.name !== "grep") continue;
+      const rawPath = typeof call.arguments?.path === "string" ? call.arguments.path : "";
+      for (const allowed of explicitScope.allowedPaths) {
+        if (rawPath && resolvedScopePath(rawPath, explicitScope) === resolvedScopePath(allowed, explicitScope)) {
+          matched.add(allowed);
+        }
+      }
+    }
+
+    // "if it exists" is satisfied by a successful root listing that proves
+    // the named file is absent. If the listing says it exists, the read remains
+    // mandatory.
+    const rootListings = calls.filter((call) => {
+      if (!LISTING_TOOLS.has(call.name)) return false;
+      const rawPath = typeof call.arguments?.path === "string" ? call.arguments.path : explicitScope.workspaceRoot;
+      return resolvedScopePath(rawPath || explicitScope.workspaceRoot, explicitScope) ===
+        resolvedScopePath(explicitScope.workspaceRoot || ".", explicitScope);
+    });
+    for (const optional of explicitScope.optionalPaths) {
+      const basename = normalizePath(optional).path.split("/").pop() ?? optional.toLowerCase();
+      if (rootListings.length > 0 && rootListings.every((call) => !call.output.toLowerCase().includes(basename))) {
+        matched.add(optional);
+      }
+    }
+
+    const missing = explicitScope.allowedPaths.filter((path) => !matched.has(path));
+    return {
+      sufficient: missing.length === 0,
+      contentReads: explicitScope.allowedPaths.filter((path) => matched.has(path)).length,
+      listings,
+      deepRead: false,
+      reason: missing.length === 0
+        ? `explicit scope satisfied: ${explicitScope.allowedPaths.join(", ")}`
+        : `explicit scope still requires: ${missing.join(", ")}`,
+    };
+  }
 
   if (deepRead) {
     // Deep-read floor: only genuine file-content reads count, deduped by

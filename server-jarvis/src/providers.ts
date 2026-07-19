@@ -8,6 +8,7 @@
 // attempt must resolve its target here rather than assuming OpenRouter.
 
 import type { JarvisConfig } from "./config";
+import { openCodeGoProtocolForModel } from "./orchestration/live-model-catalog";
 
 /** Providers that are reachable over the OpenAI-compatible HTTP path. */
 export type HttpProviderId = "openrouter" | "opencode_zen" | "opencode_go";
@@ -68,12 +69,15 @@ export function resolveProviderTarget(cfg: JarvisConfig, provider: string): Prov
 
 
 /** Full chat-completions URL for a provider target. */
-export function providerChatUrl(target: ProviderTarget): string {
-  return `${target.base_url}${target.chat_path}`;
+export function providerChatUrl(target: ProviderTarget, modelId?: string): string {
+  const path = target.provider === "opencode_go" && modelId && openCodeGoProtocolForModel(modelId) === "anthropic"
+    ? "/messages"
+    : target.chat_path;
+  return `${target.base_url}${path}`;
 }
 
 /** Standard auth + attribution headers for an OpenAI-compatible provider. */
-export function providerHeaders(cfg: JarvisConfig, target: ProviderTarget): Record<string, string> {
+export function providerHeaders(cfg: JarvisConfig, target: ProviderTarget, modelId?: string): Record<string, string> {
   const headers: Record<string, string> = {
     "Authorization": `Bearer ${target.api_key}`,
     "Content-Type": "application/json",
@@ -82,5 +86,12 @@ export function providerHeaders(cfg: JarvisConfig, target: ProviderTarget): Reco
   // OpenCode providers ignore them harmlessly, so we send them everywhere.
   headers["HTTP-Referer"] = cfg.openrouter.site_url || "http://localhost:19877";
   headers["X-Title"] = cfg.openrouter.site_name || "Jarvis";
+  if (target.provider === "opencode_go" && modelId && openCodeGoProtocolForModel(modelId) === "anthropic") {
+    // OpenCode Go's /messages models use the Anthropic wire protocol. Keep the
+    // Bearer header for gateway compatibility and add the canonical Anthropic
+    // headers expected by the same endpoint.
+    headers["x-api-key"] = target.api_key;
+    headers["anthropic-version"] = "2023-06-01";
+  }
   return headers;
 }

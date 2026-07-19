@@ -12,9 +12,10 @@ import {
   providerHeaders,
   type HttpProviderId,
 } from "./providers";
-import { isTemporarilyExcluded, recordHardFailure, recordStall, recordSuccess } from "./model-failure-memory";
+import { isTemporarilyExcluded, recordHardFailure, recordRateLimit, recordStall, recordSuccess } from "./model-failure-memory";
 import { backendForProvider, recordInferenceAttempt } from "./inference-metrics";
 import { TurnDeadlineExceededError } from "./stream-liveness";
+import { openCodeGoProtocolForModel } from "./orchestration/live-model-catalog";
 
 // ═══════════════════════════════════════════════════════════════
 // Types
@@ -650,7 +651,7 @@ async function resolveFallbackCascade(cfg: JarvisConfig, options: FallbackResolv
   const cascade: CascadeEntry[] = [];
   const push = (entry: CascadeEntry) => {
     const key = `${entry.provider}:${entry.model_id}`;
-    if (!entry.model_id || seen.has(key) || excluded.has(key)) return;
+    if (!entry.model_id || seen.has(key) || excluded.has(key) || excluded.has(`${entry.provider}:*`)) return;
     seen.add(key);
     cascade.push(entry);
   };
@@ -728,6 +729,154 @@ function sanitizeToolMessages(msgs: Array<any>): Array<any> {
   });
 }
 
+function anthropicMessageContent(content: unknown): string | Array<Record<string, unknown>> {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return String(content ?? "");
+  const blocks = content.flatMap((block) => {
+    if (typeof block === "string") return [{ type: "text", text: block }];
+    if (!block || typeof block !== "object") return [];
+    const value = block as Record<string, unknown>;
+    if (value.type === "text" && typeof value.text === "string") return [{ type: "text", text: value.text }];
+    return [];
+  });
+  return blocks.length > 0 ? blocks : "";
+}
+
+/** Convert Jarvis's OpenAI-shaped stage request to OpenCode Go /messages. */
+function buildAnthropicAttemptBody(body: Record<string, any>, model: string): Record<string, any> {
+  const system: string[] = [];
+  const messages: Array<{ role: "user" | "assistant"; content: string | Array<Record<string, unknown>> }> = [];
+  for (const raw of Array.isArray(body.messages) ? body.messages : []) {
+    if (!raw || typeof raw !== "object") continue;
+    if (raw.role === "system") {
+      const content = anthropicMessageContent(raw.content);
+      if (typeof content === "string" && content.trim()) system.push(content);
+      continue;
+    }
+    const role: "user" | "assistant" = raw.role === "assistant" ? "assistant" : "user";
+    const content = anthropicMessageContent(raw.content);
+    const previous = messages[messages.length - 1];
+    if (previous?.role === role && typeof previous.content === "string" && typeof content === "string") {
+      previous.content = `${previous.content}\n\n${content}`;
+    } else {
+      messages.push({ role, content });
+    }
+  }
+
+  const maxTokens = Math.max(1, Number(body.max_tokens ?? body.max_completion_tokens ?? 8_192) || 8_192);
+  const converted: Record<string, any> = {
+    model,
+    messages,
+    max_tokens: maxTokens,
+    stream: body.stream !== false,
+  };
+  if (system.length > 0) converted.system = system.join("\n\n---\n\n");
+  if (Number.isFinite(Number(body.temperature))) converted.temperature = Number(body.temperature);
+  if (Number.isFinite(Number(body.top_p))) converted.top_p = Number(body.top_p);
+  if (body.stop !== undefined) converted.stop_sequences = Array.isArray(body.stop) ? body.stop : [body.stop];
+  return converted;
+}
+
+function mapAnthropicStopReason(reason: unknown): string | null {
+  if (reason === "max_tokens") return "length";
+  if (reason === "tool_use") return "tool_calls";
+  if (typeof reason === "string" && reason) return "stop";
+  return null;
+}
+
+/**
+ * Normalize Anthropic /messages SSE into the OpenAI-compatible SSE contract
+ * consumed by both Jarvis streaming loops. Hidden thinking stays hidden via
+ * `delta.reasoning`; visible text and final usage retain their normal fields.
+ */
+function normalizeAnthropicSse(response: Response, requestedModel: string): Response {
+  const source = response.body;
+  if (!source) return response;
+  const reader = source.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buffer = "";
+  let messageId = "";
+  let responseModel = requestedModel;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let doneEmitted = false;
+
+  const readable = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const emit = (payload: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+      const handleLine = (line: string) => {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) return;
+        const payload = trimmed.slice(5).trim();
+        if (!payload || payload === "[DONE]") return;
+        let event: any;
+        try { event = JSON.parse(payload); } catch { return; }
+
+        if (event.type === "message_start") {
+          messageId = String(event.message?.id ?? messageId);
+          responseModel = String(event.message?.model ?? responseModel);
+          inputTokens = Number(event.message?.usage?.input_tokens ?? inputTokens) || inputTokens;
+          return;
+        }
+        if (event.type === "content_block_delta") {
+          if (event.delta?.type === "text_delta" && typeof event.delta.text === "string") {
+            emit({ id: messageId, model: responseModel, choices: [{ index: 0, delta: { content: event.delta.text }, finish_reason: null }] });
+          } else if ((event.delta?.type === "thinking_delta" || event.delta?.type === "reasoning_delta") && typeof (event.delta.thinking ?? event.delta.reasoning) === "string") {
+            emit({ id: messageId, model: responseModel, choices: [{ index: 0, delta: { reasoning: event.delta.thinking ?? event.delta.reasoning }, finish_reason: null }] });
+          }
+          return;
+        }
+        if (event.type === "message_delta") {
+          outputTokens = Number(event.usage?.output_tokens ?? outputTokens) || outputTokens;
+          emit({
+            id: messageId,
+            model: responseModel,
+            choices: [{ index: 0, delta: {}, finish_reason: mapAnthropicStopReason(event.delta?.stop_reason) }],
+            usage: {
+              prompt_tokens: inputTokens,
+              completion_tokens: outputTokens,
+              total_tokens: inputTokens + outputTokens,
+            },
+          });
+          return;
+        }
+        if (event.type === "error") {
+          emit({ error: event.error ?? { message: "Anthropic protocol stream error" } });
+          return;
+        }
+        if (event.type === "message_stop" && !doneEmitted) {
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          doneEmitted = true;
+        }
+      };
+
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split(/\r?\n/);
+          buffer = lines.pop() ?? "";
+          for (const line of lines) handleLine(line);
+        }
+        buffer += decoder.decode();
+        if (buffer) handleLine(buffer);
+        if (!doneEmitted) controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason).catch(() => {});
+    },
+  });
+  const headers = new Headers(response.headers);
+  headers.set("Content-Type", "text/event-stream; charset=utf-8");
+  return new Response(readable, { status: response.status, statusText: response.statusText, headers });
+}
+
 /**
  * Build the per-attempt request body for a provider. OpenRouter bodies get the
  * full catalog-aware massaging (max_tokens, temperature/top_p gating, native
@@ -765,6 +914,9 @@ async function buildAttemptBody(
     if (Array.isArray(body.messages)) {
       body.messages = sanitizeToolMessages(body.messages);
     }
+    if (provider === "opencode_go" && openCodeGoProtocolForModel(model) === "anthropic") {
+      return buildAnthropicAttemptBody(body, model);
+    }
   }
   return body;
 }
@@ -788,18 +940,25 @@ export async function chatCompletionWithFallback(
   requestBody: any,
   signal?: AbortSignal,
   options: FallbackResolveOptions = {},
-): Promise<{ response: Response; model_used: string; provider_used: HttpProviderId; retries: number }> {
+): Promise<{
+  response: Response;
+  model_used: string;
+  provider_used: HttpProviderId;
+  /** Actual failed HTTP/transport attempts before the successful response. */
+  retries: number;
+  /** Number of distinct cascade entries advanced past. */
+  fallback_depth: number;
+  fallback_reason?: string;
+}> {
   assertFallbackDeadline(options);
   const cascade = await resolveFallbackCascade(cfg, options);
   if (cascade.length === 0) {
     cascade.push({ provider: "openrouter", model_id: cfg.openrouter.model || "openrouter/free" });
   }
 
-  // Cross-turn hard-failure memory (model-failure-memory.ts): a model that
-  // hard-failed (non-retryable HTTP, e.g. 400) twice in a cooldown window is
-  // skipped here so we don't burn the first cascade attempt on it every
-  // single turn (live incident: north-mini-code-free 400s on every turn,
-  // re-picked every turn because nothing remembered the prior failure).
+  // Cross-turn failure memory (model-failure-memory.ts): a model that hard
+  // failed or stalled repeatedly, or a provider that repeatedly returned
+  // 429, is skipped here so later stages do not pay the same retry tax.
   // Never let exclusion leave zero attemptable entries — if everything
   // remaining is excluded, fall back to the original cascade and warn.
   const excludedNow = cascade.filter(
@@ -810,16 +969,18 @@ export async function chatCompletionWithFallback(
     const skipped = cascade.filter((entry) => !excludedNow.includes(entry));
     if (excludedNow.length === 0) {
       console.warn(
-        `[Fallback] All ${cascade.length} cascade entries are in hard-failure cooldown — ignoring exclusions and using the original cascade anyway.`,
+        `[Fallback] All ${cascade.length} cascade entries are in temporary failure cooldown — ignoring exclusions and using the original cascade anyway.`,
       );
     } else {
       for (const entry of skipped) {
-        console.warn(`[Fallback] Skipping ${entry.provider}:${entry.model_id} — in hard-failure cooldown from repeated non-retryable errors.`);
+        console.warn(`[Fallback] Skipping ${entry.provider}:${entry.model_id} — in temporary failure or rate-limit cooldown.`);
       }
     }
   }
 
   let lastError = "";
+  let totalAttempts = 0;
+  let fallbackReason: string | undefined;
   // `max_retries` is the configured ceiling on per-model attempts. The 2-strike
   // rate-limit rule and the single-retry transient policy are clamped to it, so
   // setting max_retries=0 disables all same-model retries (immediate advance).
@@ -860,6 +1021,7 @@ export async function chatCompletionWithFallback(
       let watchdogTimer: ReturnType<typeof setTimeout> | undefined;
       let headersTimer: ReturnType<typeof setTimeout> | undefined;
       try {
+        totalAttempts += 1;
         const attemptBody = await buildAttemptBody(cfg, provider, requestBody, model);
         // Headers leash (live incident 2026-07-16 PM, session f458849c): the
         // body-bytes watchdog below only arms AFTER the HTTP response headers
@@ -869,10 +1031,10 @@ export async function chatCompletionWithFallback(
         // Bound the pre-header phase by the same per-provider first-token
         // window and advance the cascade instead.
         const HEADERS_STALL_REASON = `headers-timeout:${provider}:${model}`;
-        const fetchPromise = fetch(providerChatUrl(target), {
+        const fetchPromise = fetch(providerChatUrl(target, model), {
           method: "POST",
           signal: attemptCtrl.signal,
-          headers: providerHeaders(cfg, target),
+          headers: providerHeaders(cfg, target, model),
           body: JSON.stringify(attemptBody),
         });
         // The losing race arm may reject (AbortError) after we've moved on —
@@ -890,6 +1052,7 @@ export async function chatCompletionWithFallback(
           attemptCtrl.abort(HEADERS_STALL_REASON);
           lastError = `Model ${model} (${provider}) returned no HTTP response headers within ${firstTokenTimeoutMs}ms (headers timeout)`;
           console.warn(`[Fallback] ${lastError} — advancing to next model`);
+          fallbackReason = "first_token_timeout";
           recordStall(provider, model);
           recordInferenceAttempt({
             ts: Date.now(),
@@ -909,7 +1072,16 @@ export async function chatCompletionWithFallback(
           const bodyReader = res.body?.getReader();
           if (!bodyReader) {
             recordSuccess(provider, model);
-            return { response: res, model_used: model, provider_used: provider, retries: modelIdx };
+            return {
+              response: provider === "opencode_go" && openCodeGoProtocolForModel(model) === "anthropic"
+                ? normalizeAnthropicSse(res, model)
+                : res,
+              model_used: model,
+              provider_used: provider,
+              retries: Math.max(0, totalAttempts - 1),
+              fallback_depth: modelIdx,
+              fallback_reason: fallbackReason,
+            };
           }
           const firstByteTimeout = new Promise<"timeout">((resolve) => {
             watchdogTimer = setTimeout(() => resolve("timeout"), firstTokenTimeoutMs);
@@ -923,6 +1095,7 @@ export async function chatCompletionWithFallback(
             try { await bodyReader.cancel().catch(() => {}); } catch {}
             lastError = `Model ${model} (${provider}) sent no body bytes within ${firstTokenTimeoutMs}ms (first-token timeout)`;
             console.warn(`[Fallback] ${lastError} — advancing to next model`);
+            fallbackReason = "first_token_timeout";
             recordStall(provider, model);
             recordInferenceAttempt({
               ts: Date.now(),
@@ -940,19 +1113,31 @@ export async function chatCompletionWithFallback(
             bodyReader as unknown as ReadableStreamDefaultReader<any>,
             raceResult.chunk as ReadableStreamReadResult<any>,
           );
-          const newResponse = new Response(rewrapped, {
+          let newResponse = new Response(rewrapped, {
             status: res.status,
             statusText: res.statusText,
             headers: res.headers,
           });
+          if (provider === "opencode_go" && openCodeGoProtocolForModel(model) === "anthropic") {
+            newResponse = normalizeAnthropicSse(newResponse, model);
+          }
           recordSuccess(provider, model);
-          return { response: newResponse, model_used: model, provider_used: provider, retries: modelIdx };
+          return {
+            response: newResponse,
+            model_used: model,
+            provider_used: provider,
+            retries: Math.max(0, totalAttempts - 1),
+            fallback_depth: modelIdx,
+            fallback_reason: fallbackReason,
+          };
         }
 
         // ── Rate limit: 2-strike rule ──
         if (res.status === 429) {
           await res.text().catch(() => "");
           rateLimitStrikes++;
+          recordRateLimit(provider, model);
+          fallbackReason = "rate_limited";
           lastError = `Model ${model} (${provider}) rate limited (429) [strike ${rateLimitStrikes}/${RATE_LIMIT_MAX_ATTEMPTS}]`;
           if (rateLimitStrikes >= RATE_LIMIT_MAX_ATTEMPTS) {
             console.warn(`[Fallback] ${lastError} — advancing to next optimal pool model`);
@@ -968,6 +1153,7 @@ export async function chatCompletionWithFallback(
         if (isRetryableStatus(res.status)) {
           await res.text().catch(() => "");
           transientRetries++;
+          fallbackReason = `http_${res.status}`;
           lastError = `Model ${model} (${provider}) returned ${res.status} [retry ${transientRetries}/${OTHER_TRANSIENT_MAX_ATTEMPTS}]`;
           if (transientRetries >= OTHER_TRANSIENT_MAX_ATTEMPTS) {
             console.warn(`[Fallback] ${lastError} — advancing to next model`);
@@ -986,6 +1172,7 @@ export async function chatCompletionWithFallback(
         // those are handled above/below and never reach this branch). Two of
         // these on the same provider:model within the cooldown window will
         // exclude it from future cascades until the window lapses.
+        fallbackReason = `http_${res.status}`;
         recordHardFailure(provider, model);
         break attemptLoop;
       } catch (e: any) {
@@ -1002,6 +1189,7 @@ export async function chatCompletionWithFallback(
         }
         // Network/transport error — one short retry, then advance.
         transientRetries++;
+        fallbackReason = "network_error";
         lastError = e.message || String(e);
         if (transientRetries >= OTHER_TRANSIENT_MAX_ATTEMPTS) {
           console.warn(`[Fallback] Model ${model} (${provider}) network error: ${lastError} — advancing to next model`);

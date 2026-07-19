@@ -6,14 +6,15 @@
 // is healthy; shows amber (degraded) or red (down) the moment something
 // needs attention.
 
-import { useCallback, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { AnimatePresence, motion } from 'framer-motion';
 import { cn } from '../ui';
 import { usePolling } from '../../hooks/usePolling';
 import type { JarvisStatus } from './types';
 
-type Level = 'ok' | 'warn' | 'down';
+type Level = 'ok' | 'starting' | 'warn' | 'down';
+export const STARTUP_GRACE_MS = 20_000;
 
 // ── Health derivation using the new JarvisStatus shape ─────────
 
@@ -25,10 +26,10 @@ function backendOk(s: JarvisStatus): boolean {
   return false;
 }
 
-function overallLevel(s: JarvisStatus, fetchError: string | null): Level {
+function overallLevel(s: JarvisStatus, fetchError: string | null, mountedForMs: number): Level {
   if (fetchError) return 'down';
   if (!backendOk(s)) return 'down';
-  if (!s.bun_server_running) return 'warn';
+  if (!s.bun_server_running) return mountedForMs < STARTUP_GRACE_MS ? 'starting' : 'warn';
   return 'ok';
 }
 
@@ -38,11 +39,17 @@ function summaryFor(s: JarvisStatus, level: Level, fetchError: string | null): s
     if (!backendOk(s)) return `Backend "${s.active_backend}" is unreachable`;
     return 'Status check failed';
   }
+  if (level === 'starting') return 'Starting Bun server — tools and skills are warming up';
   if (!s.bun_server_running) return 'Bun server is not running — tools and skills unavailable';
   return 'Inference is responding slowly';
 }
 
 const LEVEL_STYLES: Record<Exclude<Level, 'ok'>, { bar: string; dot: string; label: string }> = {
+  starting: {
+    bar: 'bg-cyan-500/10 border-cyan-500/30 text-cyan-100',
+    dot: 'bg-cyan-400 shadow-[0_0_6px_rgba(34,211,238,0.6)]',
+    label: 'Starting',
+  },
   warn: {
     bar: 'bg-amber-500/10 border-amber-500/30 text-amber-100',
     dot: 'bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.6)]',
@@ -55,9 +62,23 @@ const LEVEL_STYLES: Record<Exclude<Level, 'ok'>, { bar: string; dot: string; lab
   },
 };
 
+export function deriveHealthPresentation(
+  status: JarvisStatus,
+  fetchError: string | null,
+  mountedForMs: number,
+): { level: Level; label: string; summary: string } {
+  const level = overallLevel(status, fetchError, mountedForMs);
+  return {
+    level,
+    label: level === 'ok' ? 'Ready' : LEVEL_STYLES[level].label,
+    summary: level === 'ok' ? 'All systems ready' : summaryFor(status, level, fetchError),
+  };
+}
+
 // ── Component ──────────────────────────────────────────────────
 
 export default function HealthBanner() {
+  const mountedAtRef = useRef(Date.now());
   const [status, setStatus] = useState<JarvisStatus | null>(null);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
@@ -75,7 +96,8 @@ export default function HealthBanner() {
   usePolling(fetchStatus, 15000, [fetchStatus]);
 
   if (!status) return null;
-  const level = overallLevel(status, fetchError);
+  const presentation = deriveHealthPresentation(status, fetchError, Date.now() - mountedAtRef.current);
+  const level = presentation.level;
   if (level === 'ok') return null;
 
   const style = LEVEL_STYLES[level];
@@ -96,8 +118,8 @@ export default function HealthBanner() {
         className="flex items-center gap-2 w-full text-left"
       >
         <span className={cn('w-2 h-2 rounded-full animate-pulse', style.dot)} />
-        <span className="font-medium uppercase tracking-wider text-[10px]">{style.label}</span>
-        <span className="truncate opacity-90">{summaryFor(status, level, fetchError)}</span>
+        <span className="font-medium uppercase tracking-wider text-[10px]">{presentation.label}</span>
+        <span className="truncate opacity-90">{presentation.summary}</span>
         <span className="ml-auto opacity-60 font-mono text-[10px]">
           {expanded ? 'hide ▲' : 'details ▼'}
         </span>

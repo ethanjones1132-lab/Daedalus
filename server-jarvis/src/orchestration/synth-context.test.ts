@@ -94,6 +94,30 @@ describe("buildSynthesizerContextFromStageState", () => {
     expect(context).toContain("Reviewer Feedback:\nComplete.");
     expect(context).not.toContain("Rewriter Activity:");
   });
+
+  test("adds an authoritative executed-tool ledger that cannot be confused with the plan", () => {
+    const state: PipelineStageState = {
+      plan: { ok: true, narrative: "List the root, read README.md, then inspect Editor.cpp." },
+      executor: {
+        ok: true,
+        narrative: "Finished the requested inspection.",
+        toolCalls: [
+          { name: "read_file", arguments: { path: "src/PluginProcessor.h" }, output: "header", is_error: false, duration_ms: 3 },
+          { name: "read_file", arguments: { path: "src/PluginProcessor.cpp" }, output: "source", is_error: false, duration_ms: 4 },
+        ],
+      },
+    };
+
+    const context = buildSynthesizerContextFromStageState("audit the repo", state);
+    expect(context).toContain("Executed Tool Ledger (authoritative)");
+    expect(context).toContain("Only entries in this ledger actually executed");
+    const ledger = (context.split("Executed Tool Ledger (authoritative)")[1] ?? "")
+      .split("\n\nExecutor Activity")[0];
+    expect(ledger).toContain("read_file {\"path\":\"src/PluginProcessor.h\"}");
+    expect(ledger).toContain("read_file {\"path\":\"src/PluginProcessor.cpp\"}");
+    expect(ledger).not.toContain("README.md");
+    expect(ledger).not.toContain("Editor.cpp");
+  });
 });
 
 // synthesize-context pin: prioritizeExecutorFindings is a private helper that

@@ -44,6 +44,129 @@ const agents: OrchestratorAgent[] = [
 ];
 
 describe("AgentPool", () => {
+  test("free OpenRouter and Zen capacity outranks an OpenCode Go stage pin", () => {
+    const pool = new AgentPool([
+      {
+        id: "go-pinned",
+        provider: "opencode_go",
+        model_id: "deepseek-v4-flash",
+        capabilities: { code: 1, reasoning: 1, speed: 1, cost: 1, json_reliability: 1 },
+        default_for: ["synthesizer"],
+        enabled: true,
+        cost_rank: 1,
+      },
+      {
+        id: "zen-free",
+        provider: "opencode_zen",
+        model_id: "mimo-v2.5-free",
+        capabilities: { code: 0.7, reasoning: 0.8, speed: 0.7, cost: 1, json_reliability: 0.75 },
+        default_for: [],
+        enabled: true,
+      },
+      {
+        id: "router-free",
+        provider: "openrouter",
+        model_id: "vendor/live-zero-cost",
+        capabilities: { code: 0.92, reasoning: 0.75, speed: 0.62, cost: 1, json_reliability: 0.8 },
+        default_for: [],
+        enabled: true,
+        billing_tier: "free",
+      },
+    ]);
+
+    const picked = pool.pickFor("synthesizer", "general");
+    expect(picked?.provider).not.toBe("opencode_go");
+    expect(["opencode_zen", "openrouter"]).toContain(picked?.provider);
+  });
+
+  test("fallbacks exhaust every enabled free model before OpenCode Go, then order Go by cost", () => {
+    const freeZen: OrchestratorAgent = {
+      id: "zen-free",
+      provider: "opencode_zen",
+      model_id: "deepseek-v4-flash-free",
+      capabilities: { code: 0.8, reasoning: 0.8, speed: 0.8, cost: 1, json_reliability: 0.8 },
+      default_for: [],
+      enabled: true,
+    };
+    const freeRouter: OrchestratorAgent = {
+      ...freeZen,
+      id: "router-free",
+      provider: "openrouter",
+      model_id: "meta-llama/llama-3.3-70b-instruct:free",
+    };
+    const expensiveGo: OrchestratorAgent = {
+      ...freeZen,
+      id: "go-expensive",
+      provider: "opencode_go",
+      model_id: "glm-5.2",
+      cost_rank: 90,
+    };
+    const cheapGo: OrchestratorAgent = {
+      ...freeZen,
+      id: "go-cheap",
+      provider: "opencode_go",
+      model_id: "deepseek-v4-flash",
+      default_for: ["executor"],
+      cost_rank: 1,
+    };
+    const mediumGo: OrchestratorAgent = {
+      ...freeZen,
+      id: "go-medium",
+      provider: "opencode_go",
+      model_id: "minimax-m3",
+      cost_rank: 20,
+    };
+    const pool = new AgentPool([expensiveGo, freeZen, mediumGo, freeRouter, cheapGo]);
+
+    const selected = pool.pickFor("executor", "debug")!;
+    const chain = pool.fallbackChain(selected, "executor", "debug");
+    const firstGo = chain.findIndex((agent) => agent.provider === "opencode_go");
+    expect(firstGo).toBe(2);
+    expect(chain.slice(0, firstGo).every((agent) => agent.provider !== "opencode_go")).toBe(true);
+    expect(chain.slice(firstGo).map((agent) => agent.model_id)).toEqual([
+      "deepseek-v4-flash",
+      "minimax-m3",
+      "glm-5.2",
+    ]);
+  });
+
+  test("cheap and strong cascades stay inside the free tier until it is excluded", () => {
+    const pool = new AgentPool([
+      {
+        id: "free-fast",
+        provider: "opencode_zen",
+        model_id: "deepseek-v4-flash-free",
+        capabilities: { code: 0.75, reasoning: 0.78, speed: 0.95, cost: 1, json_reliability: 0.85 },
+        default_for: [],
+        enabled: true,
+      },
+      {
+        id: "free-strong",
+        provider: "openrouter",
+        model_id: "qwen/qwen3-coder:free",
+        capabilities: { code: 0.96, reasoning: 0.9, speed: 0.5, cost: 1, json_reliability: 0.9 },
+        default_for: [],
+        enabled: true,
+      },
+      {
+        id: "go-perfect",
+        provider: "opencode_go",
+        model_id: "deepseek-v4-pro",
+        capabilities: { code: 1, reasoning: 1, speed: 1, cost: 1, json_reliability: 1 },
+        default_for: ["executor"],
+        enabled: true,
+        cost_rank: 10,
+      },
+    ]);
+
+    expect(pool.cascadeChain("executor", "debug").map((agent) => agent.id)).toEqual([
+      "free-fast",
+      "free-strong",
+    ]);
+    expect(pool.cascadeChain("executor", "debug", new Set(["opencode_zen:*", "openrouter:*"]))
+      .map((agent) => agent.id)).toEqual(["go-perfect"]);
+  });
+
   test("system_prompt field round-trips through AgentPool.add/list (T3.2)", () => {
     const pool = new AgentPool([]);
     pool.add({
@@ -63,6 +186,17 @@ describe("AgentPool", () => {
 
     expect(pool.pickFor("executor", "refactor")?.id).toBe("code-worker");
     expect(pool.pickFor("reviewer", "debug")?.id).toBe("verifier");
+  });
+
+  test("provider wildcard exclusions skip every model on a rate-limited endpoint", () => {
+    const pool = new AgentPool([
+      { ...agents[1], id: "go-pro", provider: "opencode_go", model_id: "deepseek-v4-pro" },
+      { ...agents[1], id: "go-flash", provider: "opencode_go", model_id: "deepseek-v4-flash" },
+      { ...agents[2], id: "zen-fallback", provider: "opencode_zen", model_id: "deepseek-v4-flash-free", default_for: [] },
+    ]);
+
+    expect(pool.pickFor("executor", "debug", new Set(["opencode_go:*"]))?.id).toBe("zen-fallback");
+    expect(pool.cascadeChain("executor", "debug", new Set(["opencode_go:*"])).every((agent) => agent.provider !== "opencode_go")).toBe(true);
   });
 
   test("pickFor keeps a healthy stage default despite a negative learned score", () => {
@@ -234,7 +368,7 @@ describe("AgentPool", () => {
       {
         id: "strong-worker",
         provider: "openrouter",
-        model_id: "deepseek/deepseek-v4-flash",
+        model_id: "deepseek/deepseek-v4-flash:free",
         capabilities: { code: 0.95, reasoning: 0.88, speed: 0.62, cost: 0.45, json_reliability: 0.85 },
         default_for: ["executor"],
         enabled: true,
@@ -371,15 +505,14 @@ describe("AgentPool", () => {
     }
   });
 
-  test("synthesizer fallback after OpenCode Go Flash uses OpenCode Go Pro", () => {
+  test("synthesizer still uses free capacity when an OpenCode Go model is excluded", () => {
     const pool = new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS);
     const picked = pool.pickFor(
       "synthesizer",
       "general",
       new Set(["opencode_go:deepseek-v4-flash"]),
     );
-    expect(picked?.provider).toBe("opencode_go");
-    expect(picked?.model_id).toBe("deepseek-v4-pro");
+    expect(["openrouter", "opencode_zen"]).toContain(picked?.provider);
   });
 
   test("stale Zen Nemotron remains disabled with its documented first-token override", () => {

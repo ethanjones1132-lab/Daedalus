@@ -149,6 +149,13 @@ describe("providerChatUrl", () => {
     const target = resolveProviderTarget(cfg, "opencode_go");
     expect(providerChatUrl(target)).toBe("https://opencode.ai/zen/go/v1/chat/completions");
   });
+
+  test("routes OpenCode Go Anthropic-protocol models to /messages", () => {
+    const target = resolveProviderTarget(configWith(), "opencode_go");
+    expect(providerChatUrl(target, "minimax-m3")).toBe("https://opencode.ai/zen/go/v1/messages");
+    expect(providerChatUrl(target, "qwen3.7-plus")).toBe("https://opencode.ai/zen/go/v1/messages");
+    expect(providerChatUrl(target, "deepseek-v4-flash")).toBe("https://opencode.ai/zen/go/v1/chat/completions");
+  });
 });
 
 describe("providerHeaders", () => {
@@ -191,6 +198,16 @@ describe("providerHeaders", () => {
     expect(providerHeaders(cfg, zen)["Authorization"]).toBe("Bearer opencode-zen-test-key");
     expect(providerHeaders(cfg, go)["Authorization"]).toBe("Bearer opencode-go-test-key");
     expect(providerHeaders(cfg, or)["Authorization"]).toBe("Bearer openrouter-test-key");
+  });
+
+  test("adds Anthropic-compatible authentication only for Go /messages models", () => {
+    const cfg = configWith();
+    const target = resolveProviderTarget(cfg, "opencode_go");
+    const headers = providerHeaders(cfg, target, "minimax-m3");
+
+    expect(headers["x-api-key"]).toBe("opencode-go-test-key");
+    expect(headers["anthropic-version"]).toBe("2023-06-01");
+    expect(providerHeaders(cfg, target, "deepseek-v4-flash")["x-api-key"]).toBeUndefined();
   });
 });
 

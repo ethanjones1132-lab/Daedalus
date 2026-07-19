@@ -5,11 +5,14 @@ import {
   HARD_FAILURE_STRIKE_THRESHOLD,
   isTemporarilyExcluded,
   recordHardFailure,
+  recordRateLimit,
   recordStall,
   recordSuccess,
   resetModelFailureMemory,
   STALL_COOLDOWN_MS,
   STALL_STRIKE_THRESHOLD,
+  RATE_LIMIT_COOLDOWN_MS,
+  RATE_LIMIT_STRIKE_THRESHOLD,
 } from "./model-failure-memory";
 
 beforeEach(() => {
@@ -237,5 +240,31 @@ describe("stall registry (cross-turn stall memory)", () => {
     }
     // Key A's hard-fail cooldown has not been touched.
     expect(isTemporarilyExcluded("opencode_zen", "model-a", aCooldownEnd - 1)).toBe(true);
+  });
+});
+
+describe("provider rate-limit memory", () => {
+  test("two 429 strikes cool down the whole provider, not just one model", () => {
+    const now = 1_000_000;
+    expect(RATE_LIMIT_STRIKE_THRESHOLD).toBe(2);
+    recordRateLimit("opencode_go", "deepseek-v4-pro", now);
+    expect(isTemporarilyExcluded("opencode_go", "deepseek-v4-flash", now + 1)).toBe(false);
+    recordRateLimit("opencode_go", "deepseek-v4-pro", now + 2);
+
+    expect(isTemporarilyExcluded("opencode_go", "deepseek-v4-pro", now + 3)).toBe(true);
+    expect(isTemporarilyExcluded("opencode_go", "deepseek-v4-flash", now + 3)).toBe(true);
+    expect(excludedModelKeys(now + 3)).toContain("opencode_go:*");
+  });
+
+  test("provider cooldown expires to one probe and success clears it", () => {
+    const now = 1_000_000;
+    recordRateLimit("opencode_go", "deepseek-v4-pro", now);
+    recordRateLimit("opencode_go", "deepseek-v4-pro", now + 1);
+    expect(isTemporarilyExcluded("opencode_go", "another-model", now + 2)).toBe(true);
+
+    const afterCooldown = now + 1 + RATE_LIMIT_COOLDOWN_MS + 1;
+    expect(isTemporarilyExcluded("opencode_go", "another-model", afterCooldown)).toBe(false);
+    recordSuccess("opencode_go", "another-model");
+    expect(excludedModelKeys(afterCooldown + 1)).not.toContain("opencode_go:*");
   });
 });

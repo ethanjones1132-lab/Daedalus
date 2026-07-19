@@ -2,6 +2,7 @@ import { stripReasoningFromText } from "../reasoning";
 import { truncateToTokenBudget } from "./context-budget";
 import type { PipelineStageState } from "./stage-output";
 import {
+  isDuplicateToolDeflection,
   renderExecutorSummary,
   renderPlanSummary,
   renderReviewerSummary,
@@ -47,15 +48,38 @@ export function buildSynthesizerContext(
   const review = truncateToTokenBudget(clean(parts.reviewerFeedback), 500);
   const rewrite = truncateToTokenBudget(clean(parts.rewriterSummary), 800);
 
+  // Verification is authoritative and must survive truncation, so place it
+  // immediately after the user request rather than behind verbose stage text.
+  if (isMeaningful(clean(executionVerification))) sections.push(truncateToTokenBudget(clean(executionVerification), 700));
+
   // Prefer executor evidence before plan for workspace_read-style turns so
   // the synthesizer sees findings first within the total budget.
   if (isMeaningful(executor)) sections.push(`Executor Activity:\n${executor}`);
   if (isMeaningful(plan)) sections.push(`Original Plan:\n${plan}`);
   if (isMeaningful(review)) sections.push(`Reviewer Feedback:\n${review}`);
   if (isMeaningful(rewrite)) sections.push(`Rewriter Activity:\n${rewrite}`);
-  if (isMeaningful(clean(executionVerification))) sections.push(truncateToTokenBudget(clean(executionVerification), 400));
-
   return truncateToTokenBudget(sections.join("\n\n"), 6_000);
+}
+
+function buildExecutedToolLedger(state: PipelineStageState): string {
+  const calls = [
+    ...(state.executor?.toolCalls ?? []),
+    ...(state.rewriter?.toolCalls ?? []),
+  ];
+  if (calls.length === 0) return "";
+  const rows = calls.map((call, index) => {
+    const status = isDuplicateToolDeflection(call)
+      ? "DEFLECTED (not executed again)"
+      : call.is_error
+        ? `FAILED${call.error_code ? ` (${call.error_code})` : ""}`
+        : "SUCCEEDED";
+    return `${index + 1}. ${call.name} ${JSON.stringify(call.arguments)} — ${status}`;
+  });
+  return [
+    "Executed Tool Ledger (authoritative)",
+    "Only entries in this ledger actually executed. A user request, plan, or narrative is not execution evidence; never claim any other tool or file was inspected.",
+    ...rows,
+  ].join("\n");
 }
 
 /** Prefer trailing findings/result blocks over leading raw tool-call logs. */
@@ -83,10 +107,12 @@ export function buildSynthesizerContextFromStageState(
   state: PipelineStageState,
   executionVerification = "",
 ): string {
+  const ledger = buildExecutedToolLedger(state);
+  const verification = [ledger, executionVerification].filter((part) => part.trim()).join("\n\n");
   return buildSynthesizerContext(request, {
     plan: renderPlanSummary(state.plan),
     executorSummary: renderExecutorSummary(state.executor),
     reviewerFeedback: renderReviewerSummary(state.reviewer),
     rewriterSummary: renderRewriterSummary(state.rewriter),
-  }, executionVerification);
+  }, verification);
 }

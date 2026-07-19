@@ -228,6 +228,94 @@ export interface IncomingToolResult {
   contextTruncation?: ToolResultTruncationMetadata;
 }
 
+export interface AgentProgressUpdate {
+  stage: string;
+  text: string;
+  /** Raw model activity is untrusted; stage/tool updates are deterministic runtime events. */
+  source: 'activity' | 'stage' | 'tool';
+}
+
+/**
+ * Keep the Agents disclosure as a compact execution log, never a raw model
+ * scratchpad. This is defense-in-depth beside the server's activity
+ * suppression: legacy relays may still deliver agent_activity frames.
+ */
+export function appendAgentProgress(
+  steps: Array<{ stage: string; text: string }>,
+  update: AgentProgressUpdate,
+  maxRows = 12,
+): Array<{ stage: string; text: string }> {
+  const stage = update.stage.trim().toLowerCase() || 'agent';
+  let text = update.text.replace(/\s+/g, ' ').trim();
+  if (!text) return steps;
+
+  if (update.source === 'activity') {
+    const tool = /\[Tool (?:Executed|Substituted):\s*([^\]]+)\]/i.exec(text);
+    if (tool) text = `used ${tool[1].trim()}`;
+    else if (/finalizing under grace window/i.test(text)) text = 'finalizing under grace window';
+    else return steps;
+  }
+
+  text = text.slice(0, 160);
+  if (steps.some((step) => step.stage === stage && step.text === text)) return steps;
+  return [...steps, { stage, text }].slice(-Math.max(1, maxRows));
+}
+
+export function formatAgentProgressSummary(
+  steps: Array<{ stage: string; text: string }>,
+): string {
+  const stageCount = new Set(
+    steps.map((step) => step.stage.trim().toLowerCase()).filter(Boolean),
+  ).size;
+  return `${stageCount} stage${stageCount === 1 ? '' : 's'} · `
+    + `${steps.length} event${steps.length === 1 ? '' : 's'}`;
+}
+
+export function formatRunDuration(durationMs: number): string {
+  const safeMs = Math.max(0, Number.isFinite(durationMs) ? durationMs : 0);
+  const totalSeconds = safeMs / 1000;
+  if (totalSeconds < 60) return `${totalSeconds.toFixed(1)}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  return `${minutes}m ${(totalSeconds - minutes * 60).toFixed(1)}s`;
+}
+
+const INFERENCE_PROVIDER_LABELS: Record<string, string> = {
+  opencode_zen: 'OpenCode Zen',
+  opencode_go: 'OpenCode Go',
+  openrouter: 'OpenRouter',
+  ollama: 'Ollama',
+  claude_cli: 'Claude CLI',
+};
+
+/** Format the provider/model that actually served a run for compact UI use. */
+export function formatInferenceRoute(provider?: string, model?: string): string {
+  const normalizedProvider = provider?.trim();
+  const normalizedModel = model?.trim();
+  const providerLabel = normalizedProvider
+    ? (INFERENCE_PROVIDER_LABELS[normalizedProvider.toLowerCase()] ?? normalizedProvider)
+    : '';
+  if (providerLabel && normalizedModel) return `${providerLabel} · ${normalizedModel}`;
+  return providerLabel || normalizedModel || 'configured backend';
+}
+
+export function formatFallbackProgress(frame: {
+  model?: unknown;
+  provider?: unknown;
+  retries?: unknown;
+  reason?: unknown;
+}): string {
+  const target = String(frame.model || frame.provider || 'next available backend');
+  const retries = Math.max(0, Number(frame.retries ?? 0));
+  const reason = typeof frame.reason === 'string'
+    ? frame.reason.replace(/_/g, ' ')
+    : '';
+  const details = [
+    retries > 0 ? `${retries} ${retries === 1 ? 'retry' : 'retries'}` : '',
+    reason,
+  ].filter(Boolean).join(' · ');
+  return `fallback${details ? ` (${details})` : ''} → ${target}`;
+}
+
 export function mergeToolResult(
   calls: ToolCallState[],
   result: IncomingToolResult,

@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { ChatPanel } from './JarvisView';
+import JarvisView, { ChatPanel } from './JarvisView';
 
 const { invokeMock, listenMock } = vi.hoisted(() => ({
   invokeMock: vi.fn(),
@@ -23,6 +23,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   invokeMock.mockImplementation(async (command: string) => {
     if (command === 'get_session_history') return [];
+    if (command === 'jarvis_list_sessions' || command === 'get_all_session_runs') return [];
+    if (command === 'jarvis_get_config' || command === 'jarvis_check_status' || command === 'jarvis_get_companion') return null;
     return true;
   });
   Object.defineProperty(window, 'matchMedia', {
@@ -87,5 +89,38 @@ describe('ChatPanel state machine', () => {
 
     await waitFor(() => expect(within(transcript).queryByText('belongs to session one')).not.toBeInTheDocument());
     expect(screen.queryByLabelText('Stop streaming')).not.toBeInTheDocument();
+  });
+
+  it('shows the actual routed provider, model, and visible TTFT from run telemetry', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response([
+      'data: {"type":"orchestration_metrics","duration_ms":5151,"tokens_total":2123,"tool_calls":2,"fallback_retries":0,"actual_provider":"opencode_zen","actual_model":"deepseek-v4-flash-free","first_visible_token_ms":3227}',
+      'data: {"type":"result","result":"done"}',
+      '',
+    ].join('\n\n'), {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })));
+    render(<ChatPanel {...props} />);
+    const composer = await screen.findByLabelText('Chat input');
+
+    fireEvent.change(composer, { target: { value: 'audit this run' } });
+    fireEvent.keyDown(composer, { key: 'Enter' });
+
+    const metrics = await screen.findByLabelText('Orchestration run metrics');
+    expect(metrics).toHaveTextContent('OpenCode Zen · deepseek-v4-flash-free');
+    expect(metrics).toHaveTextContent('TTFT 3.2s');
+  });
+});
+
+describe('Jarvis viewport navigation', () => {
+  it('keeps view and session navigation outside the scrolling transcript', async () => {
+    render(<JarvisView />);
+
+    const rail = await screen.findByTestId('jarvis-persistent-nav');
+    const transcript = screen.getByRole('log', { name: 'Jarvis chat transcript' });
+
+    expect(rail).toHaveClass('sticky', 'top-0', 'shrink-0');
+    expect(rail).not.toContainElement(transcript);
+    expect(transcript).toHaveClass('flex-1', 'min-h-0', 'overflow-y-auto');
   });
 });

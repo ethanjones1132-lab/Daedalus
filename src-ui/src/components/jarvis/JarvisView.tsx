@@ -22,8 +22,13 @@ import {
 import {
   SendGate,
   SendInFlightGuard,
+  appendAgentProgress,
   dedupeMessages,
   finalizeStreamingMessages,
+  formatAgentProgressSummary,
+  formatFallbackProgress,
+  formatInferenceRoute,
+  formatRunDuration,
   isToolCallEchoOnly,
   mergeToolResult,
   recoverComposerAfterFailure,
@@ -148,13 +153,19 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, y: -6 }}
       transition={{ duration: 0.25 }}
-      className="h-full flex flex-col"
+      className="h-full min-h-0 flex flex-col overflow-hidden"
     >
+      {/* Persistent command rail: view tabs and recent sessions never leave
+          reach while the nested feature surface (notably Chat) scrolls. */}
+      <div
+        data-testid="jarvis-persistent-nav"
+        className="sticky top-0 z-20 shrink-0 mb-3 -mx-1 px-1 pb-2 bg-void/95 backdrop-blur-md border-b border-white/[0.04]"
+      >
       {/* Sub-navigation tabs — ARIA tablist + tab semantics (Phase 4) */}
       <div
         role="tablist"
         aria-label="Jarvis views"
-        className="flex items-center gap-1 mb-3 shrink-0"
+        className="flex items-center gap-1 mb-2 overflow-x-auto"
       >
         {subNavItems.map(item => {
           const selected = subView === item.id;
@@ -166,7 +177,7 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
               aria-current={selected ? 'page' : undefined}
               onClick={() => setSubView(item.id)}
               className={cn(
-                'px-3 py-1.5 text-xs font-mono rounded-lg border transition-all duration-150 flex items-center gap-1.5',
+                'shrink-0 px-3 py-1.5 text-xs font-mono rounded-lg border transition-all duration-150 flex items-center gap-1.5',
                 'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50 focus-visible:ring-offset-1 focus-visible:ring-offset-void',
                 selected
                   ? 'bg-royal/20 text-royal-light border-royal/40'
@@ -182,7 +193,7 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
 
       {/* Sticky session chips (Phase 3.4) */}
       {recentSessions.length > 0 && (
-        <div className="flex items-center gap-1.5 mb-3 overflow-x-auto pb-1 shrink-0">
+        <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
           <button
             type="button"
             onClick={() => { setActiveSession(null); setSubView('chat'); }}
@@ -220,6 +231,7 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
           })}
         </div>
       )}
+      </div>
 
       {/* Content */}
       <div className="flex-1 min-h-0">
@@ -402,6 +414,25 @@ export function ChatPanel({
 
   // Phase 3.3 — token / cost tally for the current turn.
   const [turnCost, setTurnCost] = useState<{ tokens: number; costUsd: number } | null>(null);
+  const [turnElapsedMs, setTurnElapsedMs] = useState(0);
+  const turnStartedAtRef = useRef<number | null>(null);
+  const [scopeNotice, setScopeNotice] = useState<{
+    paths: string[];
+    rootListing: boolean;
+    shell: string;
+    network: string;
+  } | null>(null);
+  const [runMetrics, setRunMetrics] = useState<{
+    durationMs: number;
+    tokens: number;
+    tools: number;
+    fallbackRetries: number;
+    fallbackReason?: string;
+    scopeCompliant?: boolean;
+    provider?: string;
+    model?: string;
+    firstVisibleTokenMs?: number;
+  } | null>(null);
 
   // Loading-state for Session history fetch (Phase 2.3).
   const [loadingHistory, setLoadingHistory] = useState(false);
@@ -429,6 +460,13 @@ export function ChatPanel({
   const sendInFlightRef = useRef(new SendInFlightGuard());
   const stopRequestedRef = useRef(false);
   useEffect(() => { activeSessionRef.current = activeSession; }, [activeSession]);
+  useEffect(() => {
+    if (!isStreaming || turnStartedAtRef.current === null) return;
+    const tick = () => setTurnElapsedMs(Date.now() - (turnStartedAtRef.current ?? Date.now()));
+    tick();
+    const id = window.setInterval(tick, 250);
+    return () => window.clearInterval(id);
+  }, [isStreaming]);
   useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
   useEffect(() => { onSessionCreatedRef.current = onSessionCreated; }, [onSessionCreated]);
 
@@ -689,6 +727,11 @@ export function ChatPanel({
       if (!matchesStreamSession(event.payload.session_id)) return;
       const { stage, status } = event.payload;
       setPipelineStage(isTerminalStageStatus(status) ? '' : stage);
+      setAgentSteps(prev => appendAgentProgress(prev, {
+        stage,
+        text: isTerminalStageStatus(status) ? status : 'started',
+        source: 'stage',
+      }));
     }));
 
     track(listen<{ depth: number; status: string; reenter_stage?: string; critique?: string; session_id?: string }>('jarvis://recursion', (event) => {
@@ -720,13 +763,7 @@ export function ChatPanel({
         setPipelineStage('coordinator');
         return;
       }
-      setAgentSteps(prev => {
-        const last = prev[prev.length - 1];
-        if (last && last.stage === stage) {
-          return [...prev.slice(0, -1), { stage, text: last.text + text }];
-        }
-        return [...prev, { stage, text }];
-      });
+      setAgentSteps(prev => appendAgentProgress(prev, { stage, text, source: 'activity' }));
     }));
 
     track(listen<{
@@ -921,18 +958,29 @@ export function ChatPanel({
           setPipelineStage('coordinator');
           return;
         }
-        setAgentSteps(prev => {
-          const last = prev[prev.length - 1];
-          const text = String(frame.text);
-          if (last && last.stage === stage) {
-            return [...prev.slice(0, -1), { stage, text: last.text + text }];
-          }
-          return [...prev, { stage, text }];
-        });
+        setAgentSteps(prev => appendAgentProgress(prev, {
+          stage,
+          text: String(frame.text),
+          source: 'activity',
+        }));
         return;
       }
       if (frame.type === 'orchestrator_stage') {
-        setPipelineStage(isTerminalStageStatus(frame.status) ? '' : String(frame.stage || ''));
+        const stage = String(frame.stage || 'agent');
+        const terminal = isTerminalStageStatus(frame.status);
+        setPipelineStage(terminal ? '' : stage);
+        const detail = typeof frame.detail === 'string' ? frame.detail : '';
+        const elapsed = Number(frame.elapsed_ms);
+        const progressText = detail.startsWith('tool:')
+          ? `used ${detail.slice(5)}`
+          : terminal
+            ? `${String(frame.status)}${Number.isFinite(elapsed) ? ` in ${(elapsed / 1000).toFixed(1)}s` : ''}`
+            : 'started';
+        setAgentSteps(prev => appendAgentProgress(prev, {
+          stage,
+          text: progressText,
+          source: detail.startsWith('tool:') ? 'tool' : 'stage',
+        }));
         return;
       }
       if (frame.type === 'orchestrator_recursion') {
@@ -982,9 +1030,55 @@ export function ChatPanel({
         });
         return;
       }
+      if (frame.type === 'scope_notice') {
+        setScopeNotice({
+          paths: Array.isArray(frame.allowed_paths) ? frame.allowed_paths.map(String) : [],
+          rootListing: Boolean(frame.allow_root_listing),
+          shell: String(frame.shell || 'unchanged'),
+          network: String(frame.network || 'unchanged'),
+        });
+        return;
+      }
+      if (frame.type === 'orchestration_metrics') {
+        const durationMs = Math.max(0, Number(frame.duration_ms ?? 0));
+        const tokens = Math.max(0, Number(frame.tokens_total ?? 0));
+        const tools = Math.max(0, Number(frame.tool_calls ?? 0));
+        runAcc.tokenCount = tokens || runAcc.tokenCount;
+        runAcc.toolCount = tools || runAcc.toolCount;
+        setTurnElapsedMs(durationMs);
+        setRunMetrics({
+          durationMs,
+          tokens,
+          tools,
+          fallbackRetries: Math.max(0, Number(frame.fallback_retries ?? 0)),
+          fallbackReason: typeof frame.fallback_reason === 'string' ? frame.fallback_reason : undefined,
+          scopeCompliant: typeof frame.scope_compliant === 'boolean' ? frame.scope_compliant : undefined,
+          provider: typeof frame.actual_provider === 'string' ? frame.actual_provider : undefined,
+          model: typeof frame.actual_model === 'string' ? frame.actual_model : undefined,
+          firstVisibleTokenMs: Number.isFinite(Number(frame.first_visible_token_ms))
+            ? Math.max(0, Number(frame.first_visible_token_ms))
+            : undefined,
+        });
+        if (Array.isArray(frame.executed_tools)) {
+          const ledgerCalls: ToolCallState[] = frame.executed_tools.map((value: unknown, index: number) => {
+            const entry = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+            const ok = entry.ok !== false;
+            return {
+              call_id: `ledger-${index}`,
+              name: String(entry.name || 'tool'),
+              arguments: typeof entry.path === 'string' ? { path: entry.path } : {},
+              result: ok ? 'Succeeded · recorded in executed-tool ledger' : `Failed · ${String(entry.error_code || 'tool error')}`,
+              is_error: !ok,
+              matched: true,
+            };
+          });
+          setToolCalls(prev => prev.length > 0 ? prev : ledgerCalls);
+        }
+        if (tokens > 0) setTurnCost(prev => ({ tokens, costUsd: prev?.costUsd ?? 0 }));
+        return;
+      }
       if (frame.type === 'fallback_notice') {
-        const target = String(frame.model || frame.provider || 'next available backend');
-        setPipelineStage(`fallback → ${target}`);
+        setPipelineStage(formatFallbackProgress(frame));
         return;
       }
       // Task 4.1: agent_run_id is otherwise passive but carries the durable
@@ -1174,6 +1268,8 @@ export function ChatPanel({
       .map((msg) => ({ role: msg.role, content: msg.content }));
     setError(null);
     setIsStreaming(true);
+    turnStartedAtRef.current = Date.now();
+    setTurnElapsedMs(0);
     setPipelineStage('');
     setRecursionDepth(null);
     setReasoningText('');
@@ -1182,6 +1278,8 @@ export function ChatPanel({
     setShowAgents(true);
     setToolCalls([]);
     setTurnCost(null);
+    setScopeNotice(null);
+    setRunMetrics(null);
     setUserPinnedToBottom(true);
     // Client-side identity for the optimistic user bubble (Task 7 / incident
     // 1d4727cf). Upgraded to the DB row id once `append_message` resolves
@@ -1381,6 +1479,14 @@ export function ChatPanel({
     !messages[messages.length - 1].isStreaming &&
     !isStreaming;
 
+  const displayedProvider = runMetrics?.provider
+    ? formatInferenceRoute(runMetrics.provider)
+    : backendLabel;
+  const displayedModel = runMetrics?.model ?? modelLabel;
+  const displayedRoute = runMetrics?.provider || runMetrics?.model
+    ? formatInferenceRoute(runMetrics.provider, runMetrics.model)
+    : formatInferenceRoute(config?.active_backend, modelLabel);
+
   return (
     <div className="h-full flex flex-col">
       {/* Chat header bar */}
@@ -1389,8 +1495,8 @@ export function ChatPanel({
           <h2 className="text-lg font-bold text-bone tracking-tight">Jarvis</h2>
           {config && (
             <>
-              <Pill variant={config.active_backend === 'openrouter' ? 'info' : 'success'}>{backendLabel}</Pill>
-              <Pill>{modelLabel}</Pill>
+              <Pill variant={config.active_backend === 'openrouter' ? 'info' : 'success'}>{displayedProvider}</Pill>
+              <Pill>{displayedModel}</Pill>
             </>
           )}
           {activeSession && <Pill variant="active">Session: {activeSession.slice(0, 8)}</Pill>}
@@ -1522,12 +1628,57 @@ export function ChatPanel({
           </motion.div>
         )}
 
+        {scopeNotice && (
+          <div
+            className="flex flex-wrap items-center gap-x-2 gap-y-1 px-3 py-2 rounded-lg border border-cyan-neon/20 bg-cyan-neon/5 text-[10px] font-mono text-cyan-glow"
+            aria-label="Explicit workspace scope"
+          >
+            <span className="uppercase tracking-wider font-bold">scope locked</span>
+            {scopeNotice.rootListing && <span>top-level listing</span>}
+            {scopeNotice.paths.map(path => <span key={path}>read: {path}</span>)}
+            {scopeNotice.shell === 'denied' && <span>shell denied</span>}
+            {scopeNotice.network === 'denied' && <span>network denied</span>}
+          </div>
+        )}
+
         {/* Inline tool-call cards (Phase 3.1). */}
         {toolCalls.length > 0 && (
           <div className="space-y-1.5">
             {toolCalls.map((call, i) => (
               <ToolCallCard key={`tc-${i}`} call={call} />
             ))}
+          </div>
+        )}
+
+        {runMetrics && (
+          <div
+            className={cn(
+              'flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 rounded-lg border text-[10px] font-mono',
+              runMetrics.scopeCompliant === false
+                ? 'border-error/30 bg-error/5 text-error'
+                : 'border-iron/30 bg-obsidian/40 text-bone-dim',
+            )}
+            aria-label="Orchestration run metrics"
+          >
+            <span className="uppercase tracking-wider text-bone-muted">run</span>
+            <span>{formatRunDuration(runMetrics.durationMs)}</span>
+            <span>{runMetrics.tokens.toLocaleString()} tok</span>
+            <span>{runMetrics.tools} tool{runMetrics.tools === 1 ? '' : 's'}</span>
+            {(runMetrics.provider || runMetrics.model) && (
+              <span>{formatInferenceRoute(runMetrics.provider, runMetrics.model)}</span>
+            )}
+            {runMetrics.firstVisibleTokenMs !== undefined && (
+              <span>TTFT {formatRunDuration(runMetrics.firstVisibleTokenMs)}</span>
+            )}
+            {runMetrics.fallbackRetries > 0 && (
+              <span>
+                {runMetrics.fallbackRetries} fallback {runMetrics.fallbackRetries === 1 ? 'retry' : 'retries'}
+                {runMetrics.fallbackReason ? ` · ${runMetrics.fallbackReason.replace(/_/g, ' ')}` : ''}
+              </span>
+            )}
+            {runMetrics.scopeCompliant !== undefined && (
+              <span>{runMetrics.scopeCompliant ? 'scope verified' : 'scope violation'}</span>
+            )}
           </div>
         )}
 
@@ -1562,7 +1713,7 @@ export function ChatPanel({
             {recursionDepth !== null && (
               <span className="text-bone-faint">↩ depth {recursionDepth}</span>
             )}
-            {recursionDepth === null && <span className="text-bone-faint">running…</span>}
+            {recursionDepth === null && <span className="text-bone-faint">{formatRunDuration(turnElapsedMs)}</span>}
           </motion.div>
         )}
 
@@ -1677,7 +1828,7 @@ export function ChatPanel({
         </div>
         <div className="flex items-center justify-between mt-1.5 px-1">
           <span className="text-[10px] font-mono text-bone-faint">
-            {isStreaming ? '● Streaming…' : `${messages.filter(m => m.role === 'user').length} message${messages.filter(m => m.role === 'user').length !== 1 ? 's' : ''} sent`}
+            {isStreaming ? `● Streaming · ${formatRunDuration(turnElapsedMs)}` : `${messages.filter(m => m.role === 'user').length} message${messages.filter(m => m.role === 'user').length !== 1 ? 's' : ''} sent`}
           </span>
           <span className="text-[10px] font-mono text-bone-faint flex items-center gap-2">
             {turnCost && (
@@ -1687,7 +1838,7 @@ export function ChatPanel({
                 <span aria-hidden="true">·</span>
               </>
             )}
-            {config?.active_backend === 'openrouter' ? 'via OpenRouter' : config?.active_backend === 'claude_cli' ? 'via Claude CLI' : 'via Ollama'}
+            via {displayedRoute}
           </span>
         </div>
       </div>
@@ -1993,6 +2144,7 @@ function ReasoningAgentsAccordion({
   showReasoning: boolean;
   setShowReasoning: (f: (v: boolean) => boolean) => void;
 }) {
+  const progressSummary = formatAgentProgressSummary(agentSteps);
   return (
     <div className="border border-iron/20 rounded-lg overflow-hidden">
       {reasoningText && (
@@ -2032,7 +2184,7 @@ function ReasoningAgentsAccordion({
           >
             <span aria-hidden="true">{showAgents ? <ChevronDown size={10} /> : <ChevronRight size={10} />}</span>
             <span className="text-royal-light">Agents</span>
-            <span className="ml-auto opacity-50">{agentSteps.length} stage{agentSteps.length !== 1 ? 's' : ''}</span>
+            <span className="ml-auto opacity-50">{progressSummary}</span>
           </button>
           <AnimatePresence initial={false}>
             {showAgents && (

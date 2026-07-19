@@ -2,8 +2,13 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   SendGate,
   SendInFlightGuard,
+  appendAgentProgress,
   dedupeMessages,
   finalizeStreamingMessages,
+  formatAgentProgressSummary,
+  formatFallbackProgress,
+  formatInferenceRoute,
+  formatRunDuration,
   isToolCallEchoOnly,
   mergeToolResult,
   recoverComposerAfterFailure,
@@ -251,5 +256,79 @@ describe('mergeToolResult', () => {
     expect(merged.slice(0, 2).every((call) => call.result === undefined)).toBe(true);
     expect(merged[2]).toMatchObject({ call_id: 'missing', result: 'orphan', is_error: true });
     expect(warn).toHaveBeenCalledOnce();
+  });
+});
+
+describe('appendAgentProgress', () => {
+  it('drops raw model narration from agent_activity frames', () => {
+    expect(appendAgentProgress([], {
+      stage: 'executor',
+      text: 'Reading third distinct source file because the audit requires it...',
+      source: 'activity',
+    })).toEqual([]);
+  });
+
+  it('keeps deterministic tool and stage progress, deduped and bounded', () => {
+    let steps = appendAgentProgress([], { stage: 'executor', text: 'started', source: 'stage' });
+    steps = appendAgentProgress(steps, { stage: 'executor', text: '[Tool Executed: read_file]', source: 'activity' });
+    steps = appendAgentProgress(steps, { stage: 'executor', text: '[Tool Executed: read_file]', source: 'activity' });
+    steps = appendAgentProgress(steps, { stage: 'executor', text: 'completed in 1.2s', source: 'stage' });
+
+    expect(steps).toEqual([
+      { stage: 'executor', text: 'started' },
+      { stage: 'executor', text: 'used read_file' },
+      { stage: 'executor', text: 'completed in 1.2s' },
+    ]);
+  });
+
+  it('caps retained progress rows so a long run cannot flood the chat', () => {
+    let steps: Array<{ stage: string; text: string }> = [];
+    for (let i = 0; i < 20; i += 1) {
+      steps = appendAgentProgress(steps, { stage: 'executor', text: `step ${i}`, source: 'stage' }, 6);
+    }
+    expect(steps).toHaveLength(6);
+    expect(steps[0].text).toBe('step 14');
+    expect(steps[5].text).toBe('step 19');
+  });
+});
+
+describe('orchestration status formatting', () => {
+  it('labels the provider and model that actually served the run', () => {
+    expect(formatInferenceRoute('opencode_zen', 'deepseek-v4-flash-free'))
+      .toBe('OpenCode Zen · deepseek-v4-flash-free');
+    expect(formatInferenceRoute('opencode_go', 'minimax-m3'))
+      .toBe('OpenCode Go · minimax-m3');
+    expect(formatInferenceRoute('openrouter', 'openrouter/free'))
+      .toBe('OpenRouter · openrouter/free');
+  });
+
+  it('falls back cleanly when only a provider or model is known', () => {
+    expect(formatInferenceRoute('ollama')).toBe('Ollama');
+    expect(formatInferenceRoute(undefined, 'local-model')).toBe('local-model');
+    expect(formatInferenceRoute()).toBe('configured backend');
+  });
+
+  it('counts unique stages separately from progress events', () => {
+    expect(formatAgentProgressSummary([
+      { stage: 'executor', text: 'started' },
+      { stage: 'executor', text: 'used list_directory' },
+      { stage: 'executor', text: 'used read_file' },
+      { stage: 'executor', text: 'completed in 0.1s' },
+      { stage: 'synthesizer', text: 'started' },
+      { stage: 'synthesizer', text: 'completed in 18.7s' },
+    ])).toBe('2 stages · 6 events');
+  });
+
+  it('shows retry count and a human-readable fallback reason', () => {
+    expect(formatFallbackProgress({
+      model: 'deepseek-v4-flash-free',
+      retries: 2,
+      reason: 'rate_limited',
+    })).toBe('fallback (2 retries · rate limited) → deepseek-v4-flash-free');
+  });
+
+  it('formats sub-minute and multi-minute run durations compactly', () => {
+    expect(formatRunDuration(5_528)).toBe('5.5s');
+    expect(formatRunDuration(74_215)).toBe('1m 14.2s');
   });
 });

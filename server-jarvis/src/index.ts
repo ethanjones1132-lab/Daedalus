@@ -44,11 +44,15 @@ import {
   recordInferenceAttempt,
   inferenceMetricsSnapshot,
   backendForProvider,
+  observeFirstTokenProgress,
+  resolveCascadeTelemetry,
   type Backend,
+  type FirstTokenProgress,
 } from "./inference-metrics";
 import { createApprovalRegistry } from "./approval-registry";
 import { createDiscordAdapter, SqliteDeliveryReceiptStore } from "./channels/discord";
 import { summarizeTurnMetrics } from "./orchestration/turn-metrics";
+import { actualInferenceRouteTelemetry } from "./orchestration/inference-route-telemetry";
 
 // One process-level approval registry: the chat surface emits
 // `tool_approval_request` SSE events and awaits decisions here.
@@ -110,13 +114,17 @@ import { SessionRepetitionStore, assessRepetition, shouldShortCircuitRepeat } fr
 import { Coordinator } from "./orchestration/coordinator";
 import { PersistentConductor } from "./orchestration/persistent-conductor";
 import { SessionMemory, mergeSharedContextHints } from "./orchestration/session-memory";
-import { AgentPool, firstTokenTimeoutFor, formatPoolDiversity } from "./orchestration/agent-pool";
+import { AgentPool, firstTokenTimeoutFor, formatPoolDiversity, orchestrationRoutingTier } from "./orchestration/agent-pool";
+import {
+  discoverLiveOrchestratorAgents,
+  latestLiveModelCatalogSnapshot,
+} from "./orchestration/live-model-catalog";
 import { excludedModelKeys } from "./model-failure-memory";
 import { PipelineExecutor } from "./orchestration/pipeline";
 import { combinedStageExclusions, StageHealthRegistry, type RecoverableFailureKind } from "./orchestration/stage-health";
 import { ModelScorecard, type ScorecardAttempt } from "./orchestration/model-scorecard";
 import { createTurnBudget } from "./orchestration/turn-budget";
-import { isDeepReadRequest } from "./orchestration/evidence-sufficiency";
+import { assessWorkspaceEvidence, isDeepReadRequest, resolveWorkspaceReadScope } from "./orchestration/evidence-sufficiency";
 import { FORCE_DEEP_READ_PATTERN } from "./orchestration/repetition-guard";
 import { OrchestrationAdmissionController, type AdmissionLease } from "./orchestration/admission-controller";
 import type { PipelineProgressState, PipelineRecursionEvent } from "./orchestration/pipeline";
@@ -167,7 +175,6 @@ import { WorkspaceAffinityStore } from "./orchestration/workspace-affinity";
 import { createRuntimeMonitor, shouldLogRuntimePerformance } from "./performance/runtime-monitor";
 import { loadInferenceFeedback } from "./self-tuning/inference-feedback";
 import { assessTaskRunAcceptance, resolveDeepReadIntent, terminalSubtypeForRunOutcome } from "./orchestration/task-run";
-import { assessWorkspaceEvidence } from "./orchestration/evidence-sufficiency";
 import {
   INFERENCE_FEEDBACK_CRON_JOB_ID,
   refreshInferenceFeedback,
@@ -1361,6 +1368,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     turnHistory,
     cfg.jarvis_path,
   );
+  const workspaceReadScope = resolveWorkspaceReadScope(message, activeWorkspacePath);
   console.log(`[Jarvis] Active workspace session=${sessionId} path=${activeWorkspacePath}`);
   const activeTaskRun = sessionMemory.beginTaskRun(sessionId, {
     message,
@@ -1633,6 +1641,20 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           return;
         }
         console.log(`[Jarvis Orchestrator] Starting session=${sessionId}`);
+        // Refresh all three provider catalogs before constructing the pool.
+        // This runs inside the already-open SSE stream (so the UI heartbeat is
+        // alive), is cached for five minutes, and makes catalog membership the
+        // source of truth for retired/new free models and the current Go plan.
+        try {
+          const liveCatalog = await discoverLiveOrchestratorAgents(cfg);
+          cfg.orchestrator.agents = liveCatalog.agents;
+          const catalogSummary = Object.entries(liveCatalog.catalogs)
+            .map(([provider, state]) => `${provider}=${state.status}:${state.eligible_count}/${state.model_count}`)
+            .join(", ");
+          console.log(`[Jarvis Orchestrator] Live model catalogs: ${catalogSummary}`);
+        } catch (error) {
+          console.warn(`[Jarvis Orchestrator] Live catalog enrichment failed; retaining configured pool: ${error instanceof Error ? error.message : String(error)}`);
+        }
         conductorLearning.setConfig(cfg.orchestrator.conductor_learning);
         const pruned = persistentConductor.pruneExpiredDiskSessions();
         if (pruned > 0) {
@@ -1688,6 +1710,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         let orchLastProvider: string | undefined;
         let orchLastFirstTokenMs: number | undefined;
         let orchLastScorecardAttempt: ScorecardAttempt | undefined;
+        let orchFallbackRetryCount = 0;
+        let orchFallbackEvents = 0;
+        let orchLastFallbackReason: string | undefined;
+        let orchLastFallbackModel: string | undefined;
         const callModelAttempt = async (messages: any[], callOptions?: any, excludeModels?: Set<string>) => {
           ensureTurnBudget(callOptions?.stageLabel ?? "orchestrator_model_attempt");
           const stageAttemptStart = Date.now();
@@ -1695,6 +1721,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let attemptProvider: string | undefined;
           let attemptOutcome: import("./inference-metrics").InferenceAttemptOutcome = "http_error";
           let attemptFirstTokenMs: number | undefined;
+          let attemptFallbackRetries = excludeModels?.size ?? 0;
+          let attemptFallbackDepth = 0;
+          let attemptFallbackReason: string | undefined;
           /** F2/F3: stage/turn budget exhaustion is not model failure. */
           let runtimeStarvation = false;
           const attemptStage = callOptions?.stageLabel as string | undefined;
@@ -1941,6 +1970,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               fetchRes = result.response;
               actualModelUsed = result.model_used;
               actualProviderUsed = result.provider_used;
+              const cascadeTelemetry = resolveCascadeTelemetry(result, excludeModels?.size ?? 0);
+              attemptFallbackRetries = cascadeTelemetry.attempts;
+              attemptFallbackDepth = cascadeTelemetry.depth;
+              attemptFallbackReason = cascadeTelemetry.reason;
+              if (cascadeTelemetry.used) {
+                orchFallbackRetryCount += cascadeTelemetry.attempts;
+                orchFallbackEvents += 1;
+                orchLastFallbackReason = cascadeTelemetry.reason;
+                orchLastFallbackModel = result.model_used;
+              }
               attemptModel = actualModelUsed;
               attemptProvider = actualProviderUsed;
               if (poolModel && actualModelUsed !== poolModel) {
@@ -1951,7 +1990,15 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               }
               if (result.retries > 0) {
                 console.log(`[Jarvis Orchestrator] callModel used model ${result.model_used} after ${result.retries} retry attempt(s)`);
-                await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "fallback_notice", model: result.model_used, retries: result.retries, session_id: sessionId })}\n\n`));
+                await writer.write(encoder.encode(`data: ${JSON.stringify({
+                  type: "fallback_notice",
+                  model: result.model_used,
+                  provider: result.provider_used,
+                  retries: result.retries,
+                  fallback_depth: result.fallback_depth,
+                  reason: result.fallback_reason,
+                  session_id: sessionId,
+                })}\n\n`));
               }
             } else {
               fetchRes = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(requestBody), signal: ctrl.signal });
@@ -2003,7 +2050,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let fullTurnText = "";
           let visibleTurnText = "";
           let activeToolCalls: any[] = [];
-          let firstTokenReceived = false;
+          let firstTokenProgress: FirstTokenProgress | undefined;
           let firstTokenLatencyMs: number | undefined;
           // Defense-in-depth: in case the request bypassed the
           // First-token watchdog (orchestrator). If the response body is open
@@ -2052,7 +2099,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // (handled in the outer `streamJarvis` catch block).
           let firstTokenTimeoutFired = false;
           const firstTokenTimer = setTimeout(() => {
-            if (!firstTokenReceived && !streamAbort.signal.aborted) {
+            if (!firstTokenProgress?.transportReceived && !streamAbort.signal.aborted) {
               firstTokenTimeoutFired = true;
               console.warn(`[Jarvis Orchestrator] First-token timeout (${firstTokenMs / 1000}s) on stage=${callOptions?.stageLabel ?? "agent"} model=${actualModelUsed} — aborting stream`);
               cancelReader("First-token timeout").catch(() => {});
@@ -2084,19 +2131,22 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               cancelReader("Visible-progress timeout").catch(() => {});
             },
           });
-          const markFirstProgress = () => {
-            if (!firstTokenReceived) {
-              firstTokenReceived = true;
-              firstTokenLatencyMs = Date.now() - stageAttemptStart;
-              clearTimeout(firstTokenTimer);
-            }
+          const observeProgress = (kind: "transport" | "visible") => {
+            const hadTransport = firstTokenProgress?.transportReceived === true;
+            firstTokenProgress = observeFirstTokenProgress(
+              firstTokenProgress,
+              kind,
+              Date.now() - stageAttemptStart,
+            );
+            firstTokenLatencyMs = firstTokenProgress.firstTokenMs;
+            if (!hadTransport) clearTimeout(firstTokenTimer);
           };
           const markTransportProgress = () => {
-            markFirstProgress();
+            observeProgress("transport");
             streamLiveness.onTransportProgress();
           };
           const markVisibleProgress = () => {
-            markFirstProgress();
+            observeProgress("visible");
             streamLiveness.onVisibleProgress();
           };
           // T1.3: surfaceAsAnswer gets a grace window past deadlineAt so we
@@ -2241,16 +2291,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 }
 
                 const deltaText = extractDeltaText(choice);
-                if (deltaText.reasoning && !firstTokenReceived) {
+                if (deltaText.reasoning) {
                   // Reasoning proves the model is alive, but it is not the
                   // visible first token used for latency telemetry. Start the
                   // transport/visible-progress watchdogs without reporting a
                   // visible token latency.
-                  firstTokenReceived = true;
-                  clearTimeout(firstTokenTimer);
-                  streamLiveness.onTransportProgress();
-                } else if (deltaText.reasoning) {
-                  streamLiveness.onTransportProgress();
+                  markTransportProgress();
                 }
                 let chunkText = deltaText.visible;
                 if (chunkText) {
@@ -2316,6 +2362,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                   await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_chunk", text: visibleText, session_id: sessionId })}\n\n`));
                 }
               } else {
+                markVisibleProgress();
                 const sanitized = textStreamSanitizer.push(visibleText);
                 if (sanitized) {
                   await emitVisibleChunk(sanitized);
@@ -2466,14 +2513,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               : isAnswerStage
                 ? (hasContent && !finishSettle.truncated)
                 : (hasContent || hasToolCalls);
-            // F10: populate first_token_ms. Prefer the measured first-progress
-            // latency; if the model produced content/tools in one chunk without
-            // arming the progressive timer, fall back to stage duration so the
-            // column is not systematically NULL on successful rows.
-            const firstTokenMs = firstTokenLatencyMs
-              ?? ((hasContent || hasToolCalls)
-                ? Math.max(0, Date.now() - stageAttemptStart)
-                : undefined);
+            // F10: persist only a measured visible first-token/tool latency.
+            // A missing observation stays NULL; substituting total stage
+            // duration made TTFT indistinguishable from completion latency.
+            const firstTokenMs = firstTokenLatencyMs;
             conductorLearning.recordStageModel({
               agentRunId: orchestratorAgentRunId,
               stageId: stageLabel,
@@ -2482,7 +2525,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               modelId: actualModelUsed,
               durationMs: Date.now() - stageAttemptStart,
               firstTokenMs,
-              fallbackUsed: (excludeModels?.size ?? 0) > 0,
+              fallbackUsed: attemptFallbackRetries > 0,
               wasSuccessful: answerOk,
               hadError: !answerOk,
             });
@@ -2510,6 +2553,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             _finishReason: finishSettle.finish_reason,
             _stopReason: finishSettle.stop_reason,
             _truncated: finishSettle.truncated,
+            _fallbackRetries: attemptFallbackRetries,
+            _fallbackDepth: attemptFallbackDepth,
+            _fallbackReason: attemptFallbackReason,
           };
           } finally {
             clearTimeout(firstTokenTimer);
@@ -2573,7 +2619,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 outcome: attemptOutcome,
                 latency_ms: Date.now() - stageAttemptStart,
                 first_token_ms: attemptFirstTokenMs,
-                fallback_attempt: excludeModels?.size ?? 0,
+                fallback_attempt: attemptFallbackRetries,
               });
             }
           }
@@ -2892,6 +2938,19 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         orchestratorAgentRunId = agentRunId;
         selfTuningProposer.initializeTunedConfigs();
         outcomeCollector.startAgentRun(agentRunId, sessionId, message, route.task_type, executablePipeline);
+        if (workspaceReadScope) {
+          await writer.write(encoder.encode(`data: ${JSON.stringify({
+            type: "scope_notice",
+            mode: "explicit_allowlist",
+            workspace_root: workspaceReadScope.workspaceRoot,
+            allowed_paths: workspaceReadScope.allowedPaths,
+            allow_root_listing: workspaceReadScope.allowRootListing,
+            shell: workspaceReadScope.denyShell ? "denied" : "unchanged",
+            network: workspaceReadScope.denyNetwork ? "denied" : "unchanged",
+            session_id: sessionId,
+            run_id: agentRunId,
+          })}\n\n`));
+        }
         if (route.routing_parse_fallback) {
           await writer.write(encoder.encode(`data: ${JSON.stringify({
             type: "fallback_notice",
@@ -3001,7 +3060,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           agentRunId,
         );
         const executor = new PipelineExecutor(callModel, runtime, ctx, { bus: conductorBus, live: liveConductor });
+        const stageStartedAt = new Map<string, number>();
         const onOrchestratorStateChange = async (state: PipelineProgressState) => {
+          const now = Date.now();
+          if (state.status === "running" && !stageStartedAt.has(state.stage)) {
+            stageStartedAt.set(state.stage, now);
+          }
+          const elapsedMs = Math.max(0, now - (stageStartedAt.get(state.stage) ?? now));
+          if (["completed", "done", "failed", "timed_out", "cancelled", "partial"].includes(state.status)) {
+            stageStartedAt.delete(state.stage);
+          }
           // Stream stage progress back to client — "conductor_replan" (B-02)
           // rides the same event type as an internal, non-user-facing status.
           await writer.write(encoder.encode(`data: ${JSON.stringify({
@@ -3009,6 +3077,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             stage: state.stage,
             status: state.status,
             ...(state.detail ? { detail: state.detail } : {}),
+            elapsed_ms: elapsedMs,
             session_id: sessionId
           })}\n\n`));
         };
@@ -3023,10 +3092,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // an implementation task keep the write contract, visibility caps,
           // and effect gate armed even though the follow-up names no mutation.
           taskRunWriteIntent: activeTaskRun.writeIntent === true,
+          workspaceReadScope,
           workerInstructions: instructionSelection.instructions,
           sharedContext: mergedSharedContext,
           sessionMemory: sessionMemory,
-          preferFastSynthesizer: routeSource === "trivial_short_circuit",
+          preferFastSynthesizer: routeSource === "trivial_short_circuit" || Boolean(workspaceReadScope),
           distilledSkillsBlock: resolvedSkills.promptBlock,
           maxRecursionDepth: cfg.orchestrator.max_recursion_depth,
           maxReviewRepairRounds: cfg.orchestrator.max_review_repair_rounds,
@@ -3277,6 +3347,39 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         await selfTuningProposer.proposeAndApply(agentRunId, route.task_type);
 
         // Write final done messages
+        await writer.write(encoder.encode(`data: ${JSON.stringify({
+          type: "orchestration_metrics",
+          run_id: agentRunId,
+          ...actualInferenceRouteTelemetry({
+            provider: orchLastProvider,
+            model: orchLastModel,
+            firstVisibleTokenMs: orchLastFirstTokenMs,
+          }),
+          duration_ms: duration,
+          stage_duration_ms: turnMetrics.stage_duration_ms,
+          tokens_in: turnMetrics.tokens_in,
+          tokens_out: turnMetrics.tokens_out,
+          tokens_total: turnMetrics.tokens_total,
+          tool_calls: (result.toolCalls ?? []).length,
+          fallback_retries: orchFallbackRetryCount,
+          fallback_events: orchFallbackEvents,
+          fallback_reason: orchLastFallbackReason,
+          fallback_model: orchLastFallbackModel,
+          scope_mode: workspaceReadScope ? "explicit_allowlist" : "inferred",
+          scope_compliant: workspaceReadScope
+            ? (result.toolCalls ?? []).every((call) => call.error_code !== "policy_denied")
+            : undefined,
+          executed_tools: (result.toolCalls ?? [])
+            .filter((call) => call.error_code !== "policy_denied")
+            .slice(0, 25)
+            .map((call) => ({
+              name: call.name,
+              path: typeof call.arguments?.path === "string" ? call.arguments.path : undefined,
+              ok: !call.is_error,
+              error_code: call.error_code,
+            })),
+          session_id: sessionId,
+        })}\n\n`));
         await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "agent_run_id", agent_run_id: agentRunId, session_id: sessionId })}\n\n`));
         if (result.error) {
           // Turn-fatal failure (e.g. auth rejected on every stage): surface a
@@ -3299,8 +3402,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             latency_ms: duration,
             tokens_in: turnMetrics.tokens_in,
             tokens_out: turnMetrics.tokens_out,
-            fallback_used: turnMetrics.fallback_successes > 0,
-            retry_count: turnMetrics.failed_attempts,
+            fallback_used: orchFallbackEvents > 0,
+            retry_count: orchFallbackRetryCount,
+            fallback_model: orchLastFallbackModel,
             error: result.error.slice(0, 200),
           });
           // Task 3.3: remember what failed and why, so a near-identical
@@ -3328,8 +3432,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             latency_ms: duration,
             tokens_in: turnMetrics.tokens_in,
             tokens_out: turnMetrics.tokens_out,
-            fallback_used: turnMetrics.fallback_successes > 0,
-            retry_count: turnMetrics.failed_attempts,
+            fallback_used: orchFallbackEvents > 0,
+            retry_count: orchFallbackRetryCount,
+            fallback_model: orchLastFallbackModel,
             error: result.error_code ?? "empty_completion",
           });
           repetitionStore.recordOutcome(sessionId, message, result.error_code ?? "empty_completion");
@@ -3366,8 +3471,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             latency_ms: duration,
             tokens_in: turnMetrics.tokens_in,
             tokens_out: turnMetrics.tokens_out,
-            fallback_used: turnMetrics.fallback_successes > 0,
-            retry_count: turnMetrics.failed_attempts,
+            fallback_used: orchFallbackEvents > 0,
+            retry_count: orchFallbackRetryCount,
+            fallback_model: orchLastFallbackModel,
           });
 
           // Cross-turn no-progress guard (2026-07-12 incident, Task 1.3):
@@ -4572,13 +4678,23 @@ export async function baseFetch(req: Request): Promise<Response> {
       // provider_diversity of 1 is the monoculture that amplified the
       // 2026-07-11 latency incident (every stage on one slow provider).
       let pool_coverage: ReturnType<AgentPool["coverage"]> | undefined;
+      let live_model_catalog = latestLiveModelCatalogSnapshot();
       try {
-        pool_coverage = new AgentPool(routableOrchestratorAgents(loadConfig())).coverage();
+        const healthCfg = loadConfig();
+        live_model_catalog = await discoverLiveOrchestratorAgents(healthCfg);
+        healthCfg.orchestrator.agents = live_model_catalog.agents;
+        pool_coverage = new AgentPool(routableOrchestratorAgents(healthCfg)).coverage();
       } catch {}
       return Response.json({
         ...inferenceMetricsSnapshot(),
         runtime: runtimePerformanceMonitor.snapshot({ reset: false }),
         pool_coverage,
+        live_model_catalog: live_model_catalog ? {
+          discovered_at: live_model_catalog.discovered_at,
+          catalogs: live_model_catalog.catalogs,
+          free_models: live_model_catalog.agents.filter((agent) => orchestrationRoutingTier(agent) === 0).length,
+          go_models: live_model_catalog.agents.filter((agent) => agent.provider === "opencode_go").length,
+        } : undefined,
       });
     }
     if (path === "/performance/runtime" && req.method === "GET") {
@@ -4726,10 +4842,13 @@ export async function baseFetch(req: Request): Promise<Response> {
     }
     if (path === "/agents/pool" && req.method === "GET") {
       const poolCfg = loadConfig();
+      const liveCatalog = await discoverLiveOrchestratorAgents(poolCfg);
+      poolCfg.orchestrator.agents = liveCatalog.agents;
       const pool = new AgentPool(routableOrchestratorAgents(poolCfg));
       return Response.json({
         pool: pool.list(),
         coverage: pool.coverage(),
+        live_model_catalog: liveCatalog.catalogs,
         max_recursion_depth: poolCfg.orchestrator?.max_recursion_depth ?? 2,
         dynamic_agents: poolCfg.orchestrator?.dynamic_agents ?? { enabled: false, max_dynamic_agents: 4 },
       });

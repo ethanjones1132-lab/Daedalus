@@ -8,6 +8,7 @@ import { defaultConfig } from "./config";
 import type { ChatMessage } from "./orchestration/router";
 import { SessionOutcomeCollector, SelfTuningStore } from "./self-tuning/mod";
 import { registerGitMetadataBundle } from "./git-metadata-bundle";
+import { resolveWorkspaceReadScope } from "./orchestration/evidence-sufficiency";
 
 // In-memory collector so PipelineExecutor runs in tests can NEVER write to the
 // production self-tuning DB (~/.openclaw/jarvis/self-tuning.db). Passed as the
@@ -258,6 +259,58 @@ describe("Orchestration & Routing Tests", () => {
   test("read_only executor is bounded to four model rounds (Task 2.4: budget is the binding constraint)", () => {
     expect(executorTurnLimit("read_only")).toBe(4);
     expect(executorTurnLimit("full")).toBe(BUILTIN_MODES.executor.max_turns);
+  });
+
+  test("explicit bounded reads use deterministic tools and skip executor model rounds", async () => {
+    const runtime = createToolRuntime();
+    const root = "C:\\Users\\ethan\\Downloads\\Perihelion";
+    const request =
+      `For an orchestration performance audit, work read-only in ${root}. ` +
+      "First identify top-level structure, then read only README.md if it exists. " +
+      "Do not read any other files, run shell, or use the network.";
+    const executed: Array<{ name: string; path: unknown }> = [];
+    const def = (name: string) => ({
+      type: "function" as const,
+      function: { name, description: "", parameters: { type: "object" as const, properties: {}, required: [] } },
+      requires_approval: false,
+      dangerous: false,
+    });
+    runtime.register(def("list_directory"), async (args) => {
+      executed.push({ name: "list_directory", path: args.path });
+      return "README.md\nsrc/\nCMakeLists.txt";
+    });
+    runtime.register(def("read_file"), async (args) => {
+      executed.push({ name: "read_file", path: args.path });
+      return "# Perihelion\nA JUCE audio plugin.";
+    });
+    const modelStages: string[] = [];
+    const callModel = async (_messages: ChatMessage[], options: any) => {
+      modelStages.push(options.stageLabel);
+      return { content: "Perihelion is a JUCE audio plugin." };
+    };
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: root });
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+
+    const result = await executor.execute(
+      request,
+      ["executor", "synthesizer"],
+      "run-explicit-read-scope",
+      () => {},
+      {
+        executionProfile: "read_only",
+        turnRequirement: "workspace_read",
+        rawMessage: request,
+        workspaceReadScope: resolveWorkspaceReadScope(request, root),
+      },
+    );
+
+    expect(modelStages).toEqual(["synthesizer"]);
+    expect(executed).toEqual([
+      { name: "list_directory", path: root },
+      { name: "read_file", path: `${root}\\README.md` },
+    ]);
+    expect(result.toolCalls?.map((call) => call.name)).toEqual(["list_directory", "read_file"]);
+    expect(result.answer).toContain("Perihelion");
   });
 
   test("executor tool-round exhaustion is incomplete and requests a replan", async () => {

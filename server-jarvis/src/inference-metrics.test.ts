@@ -4,6 +4,8 @@ import {
   recordInferenceAttempt,
   inferenceMetricsSnapshot,
   backendForProvider,
+  observeFirstTokenProgress,
+  resolveCascadeTelemetry,
 } from "./inference-metrics";
 import {
   recordConductorCache,
@@ -191,6 +193,56 @@ describe("inferenceMetricsSnapshot", () => {
     const attempt = inferenceMetricsSnapshot().recent_attempts.at(-1);
     expect(attempt?.outcome).toBe("truncated");
     expect(attempt?.stage).toBe("synthesizer");
+  });
+});
+
+describe("resolveCascadeTelemetry", () => {
+  it("prefers real provider retry metadata over the exclusion-set proxy", () => {
+    expect(resolveCascadeTelemetry({
+      retries: 2,
+      fallback_depth: 1,
+      fallback_reason: "rate_limited",
+    }, 0)).toEqual({
+      attempts: 2,
+      used: true,
+      depth: 1,
+      reason: "rate_limited",
+    });
+  });
+
+  it("retains outer empty-completion exclusions when they exceed provider retries", () => {
+    expect(resolveCascadeTelemetry({ retries: 0, fallback_depth: 0 }, 2)).toMatchObject({
+      attempts: 2,
+      used: true,
+    });
+  });
+});
+
+describe("observeFirstTokenProgress", () => {
+  it("keeps reasoning-only transport separate from visible first-token latency", () => {
+    const reasoning = observeFirstTokenProgress(undefined, "transport", 1_200);
+    expect(reasoning).toEqual({
+      transportReceived: true,
+      visibleReceived: false,
+      firstTokenMs: undefined,
+    });
+
+    const visible = observeFirstTokenProgress(reasoning, "visible", 3_450);
+    expect(visible).toEqual({
+      transportReceived: true,
+      visibleReceived: true,
+      firstTokenMs: 3_450,
+    });
+
+    expect(observeFirstTokenProgress(visible, "visible", 8_000).firstTokenMs).toBe(3_450);
+  });
+
+  it("records a visible first chunk as both transport and visible progress", () => {
+    expect(observeFirstTokenProgress(undefined, "visible", 275)).toEqual({
+      transportReceived: true,
+      visibleReceived: true,
+      firstTokenMs: 275,
+    });
   });
 });
 

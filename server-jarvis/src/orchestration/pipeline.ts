@@ -37,6 +37,8 @@ import {
   isDeepReadRequest,
   parseListingEntryNames,
   turnNeedsWorkspaceEvidence,
+  workspaceReadScopeViolation,
+  type WorkspaceReadScope,
 } from "./evidence-sufficiency";
 import { substituteToolCall } from "../tool-heal";
 import {
@@ -148,6 +150,8 @@ export interface PipelineExecuteOptions {
   preferFastSynthesizer?: boolean;
   /** Evidence from a previous executor segment being explicitly re-entered. */
   priorToolCalls?: ToolCallRecord[];
+  /** Hard user-authored least-authority contract for bounded workspace reads. */
+  workspaceReadScope?: WorkspaceReadScope;
 }
 
 const READ_CACHE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "web_fetch"]);
@@ -767,6 +771,19 @@ export class PipelineExecutor {
     const sessionId = this.ctx.session_id;
     const memory = options.sessionMemory;
 
+    const scopeViolation = workspaceReadScopeViolation(call, options.workspaceReadScope);
+    if (scopeViolation) {
+      return {
+        call_id: call.id,
+        name: call.name,
+        output: `Scope denied: ${scopeViolation}`,
+        is_error: true,
+        error: scopeViolation,
+        error_code: "policy_denied",
+        duration_ms: 0,
+      };
+    }
+
     if (memory && sessionId && READ_CACHE_TOOLS.has(call.name)) {
       const cached = memory.lookupCachedToolResult(
         sessionId,
@@ -818,7 +835,7 @@ export class PipelineExecutor {
         stream: true,
         stageLabel: "planner",
         advanceOnEmpty: true,
-        suppressActivity: false,
+        suppressActivity: true,
         stageAbort: this.registerStageAbort("planner"),
         onChunk: (chunk) => {
           onStateChange({ stage: "planner", status: "running", output: chunk });
@@ -1013,6 +1030,103 @@ export class PipelineExecutor {
     const successfulEvidenceCount = () => toolCalls
       .filter((call) => !call.is_error && call.output.trim().length > 0 && !isDuplicateToolDeflection(call))
       .length;
+
+    // Explicit bounded-read fast path. The user has already chosen the exact
+    // filesystem authority, so a free-form executor model can add no useful
+    // discovery and can only widen scope. Execute the root listing + concrete
+    // allowlist deterministically, then hand that canonical ledger directly to
+    // the synthesizer. This removes multiple model round-trips and makes the
+    // runtime, not prompt obedience, the scope enforcement boundary.
+    if (options.workspaceReadScope?.explicit) {
+      const scopedStart = Date.now();
+      const scope = options.workspaceReadScope;
+      const workspaceRoot = scope.workspaceRoot ||
+        this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd();
+      const startIdx = toolCalls.length;
+      let rootListingOutput = "";
+
+      const executeScoped = async (call: ToolCall): Promise<ToolResult> => {
+        const result = await this.runToolCall(call, options);
+        const output = toolResultModelText(result);
+        toolCalls.push({
+          name: call.name,
+          arguments: call.arguments,
+          output,
+          is_error: result.is_error,
+          error_code: result.error_code,
+          duration_ms: result.duration_ms ?? 0,
+        });
+        onStateChange({
+          stage: "executor",
+          status: "running",
+          output: `\n[Tool Executed: ${call.name}]\n`,
+          detail: `tool:${call.name}`,
+        });
+        return result;
+      };
+
+      if (scope.allowRootListing) {
+        const listResult = await executeScoped({
+          id: `call_${crypto.randomUUID()}`,
+          name: "list_directory",
+          arguments: { path: workspaceRoot },
+        });
+        rootListingOutput = toolResultModelText(listResult);
+      }
+
+      for (const allowedPath of scope.allowedPaths) {
+        const basename = allowedPath.replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
+        const optionalAndAbsent = scope.optionalPaths.includes(allowedPath)
+          && rootListingOutput.trim().length > 0
+          && !rootListingOutput.toLowerCase().includes(basename);
+        if (optionalAndAbsent) continue;
+        const resolvedPath = /^(?:[a-z]:[\\/]|\\\\|\/)/i.test(allowedPath)
+          ? allowedPath
+          : join(workspaceRoot, allowedPath);
+        await executeScoped({
+          id: `call_${crypto.randomUUID()}`,
+          name: "read_file",
+          arguments: { path: resolvedPath },
+        });
+      }
+
+      const scopedCalls = toolCalls.slice(startIdx);
+      const assessment = assessWorkspaceEvidence(toolCalls, intentText, workspaceRoot);
+      const ledger = scopedCalls
+        .map((call) => `- ${call.name} ${JSON.stringify(call.arguments)}: ${call.is_error ? "FAILED" : "SUCCEEDED"}`)
+        .join("\n");
+      const narrative = [
+        "Deterministic explicit-scope execution complete.",
+        "Only the calls in this executed-tool ledger ran; requested or planned files outside it were not inspected:",
+        ledger || "- No tools executed.",
+        `Scope result: ${assessment.reason}.`,
+      ].join("\n");
+      const firstError = scopedCalls.find((call) => call.is_error);
+      this.collector.recordStageRun({
+        id: `stage_${crypto.randomUUID()}`,
+        agent_run_id: agentRunId,
+        mode_id: "executor",
+        turn_number: 1,
+        input_tokens: 0,
+        output_tokens: countTokens(narrative),
+        tool_calls_json: JSON.stringify(scopedCalls.map((call) => ({ name: call.name, arguments: call.arguments }))),
+        duration_ms: Date.now() - scopedStart,
+        was_successful: assessment.sufficient && !firstError ? 1 : 0,
+        had_error: assessment.sufficient && !firstError ? 0 : 1,
+        error_message: firstError?.output ?? (assessment.sufficient ? undefined : assessment.reason),
+      });
+
+      if (!assessment.sufficient) {
+        const failure = evidenceFailure(assessment);
+        onStateChange({ stage: "executor", status: "failed", output: failure.message, detail: "explicit_scope_incomplete" });
+        await this.afterConductorStage("executor", "failed", narrative, agentRunId, options, remainingQueue, executorEvidence());
+        return { ok: false, narrative: failure.message, toolCalls };
+      }
+
+      onStateChange({ stage: "executor", status: "completed", output: narrative, detail: "explicit_scope_complete" });
+      await this.afterConductorStage("executor", "completed", narrative, agentRunId, options, remainingQueue, executorEvidence());
+      return { ok: true, narrative, toolCalls };
+    }
 
     // Git/SHA requests are deterministic read-only metadata requests. Some
     // text-protocol providers decline to emit a tool block even after the
@@ -1250,7 +1364,7 @@ export class PipelineExecutor {
             tools: getToolsForMode("executor", this.runtime.listTools(), profile),
             stream: true,
             stageLabel: "executor",
-            suppressActivity: false,
+            suppressActivity: true,
             stageAbort: this.registerStageAbort("executor"),
             onChunk: (chunk) => {
               onStateChange({ stage: "executor", status: "running", output: chunk });
@@ -1625,7 +1739,7 @@ export class PipelineExecutor {
             stageLabel: "rewriter",
             advanceOnEmpty: true,
             stageAbort: this.registerStageAbort("rewriter"),
-            suppressActivity: false,
+            suppressActivity: true,
             onChunk: (chunk) => {
               onStateChange({ stage: "rewriter", status: "running", output: chunk });
             }
@@ -1797,7 +1911,7 @@ export class PipelineExecutor {
           stream: true,
           stageLabel: "reviewer",
           advanceOnEmpty: true,
-          suppressActivity: false,
+          suppressActivity: true,
           onChunk: (chunk) => {
             onStateChange({ stage: "reviewer", status: "running", output: chunk });
           }

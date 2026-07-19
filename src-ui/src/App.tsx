@@ -48,6 +48,7 @@ import GatewayView from './components/jarvis/GatewayView';
 import HermesChat from './components/jarvis/HermesChat';
 import BuildBadge from './components/jarvis/BuildBadge';
 import CommandPalette from './components/jarvis/CommandPalette';
+import { MainSurface } from './components/layout/MainSurface';
 
 const NAV_SECTIONS: NavSection[] = [
   { title: 'JARVIS', items: [{ id: 'jarvis', label: 'Jarvis', icon: 'J' }] },
@@ -774,7 +775,7 @@ function AppInner() {
           </div>
         </motion.header>
         <HealthBanner />
-        <main className="flex-1 overflow-y-auto p-6"><AnimatePresence mode="wait"><div key={currentView}><ErrorBoundary>{renderView()}</ErrorBoundary></div></AnimatePresence></main>
+        <MainSurface><AnimatePresence mode="wait"><div key={currentView} className="h-full min-h-0"><ErrorBoundary>{renderView()}</ErrorBoundary></div></AnimatePresence></MainSurface>
         <motion.div
           className="fixed bottom-6 right-6 z-50"
           initial={{ y: 20, opacity: 0 }}

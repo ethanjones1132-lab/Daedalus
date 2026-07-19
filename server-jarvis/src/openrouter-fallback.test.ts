@@ -53,6 +53,82 @@ function cfgWithPool(): JarvisConfig {
 }
 
 describe("chatCompletionWithFallback AgentPool integration", () => {
+  test("adapts MiniMax M3 on OpenCode Go through the Anthropic /messages protocol", async () => {
+    const cfg = cfgWithPool();
+    cfg.openrouter.api_key = "";
+    cfg.opencode_zen.api_key = "";
+    cfg.opencode_go.api_key = "sk-go-key";
+    cfg.opencode_go.base_url = "https://opencode.ai/zen/go/v1";
+    cfg.orchestrator.agents = [{
+      id: "go-minimax-m3",
+      provider: "opencode_go",
+      model_id: "minimax-m3",
+      capabilities: { code: 0.85, reasoning: 0.9, speed: 0.65, cost: 0.8, json_reliability: 0.8 },
+      default_for: ["synthesizer"],
+      enabled: true,
+      cost_rank: 20,
+    }];
+
+    let attemptedUrl = "";
+    let attemptedBody: Record<string, any> | undefined;
+    let attemptedHeaders: Record<string, string> | undefined;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) {
+        return new Response(JSON.stringify({ data: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      attemptedUrl = url;
+      attemptedBody = JSON.parse(String(init?.body ?? "{}"));
+      attemptedHeaders = init?.headers as Record<string, string>;
+      return new Response([
+        'event: message_start',
+        'data: {"type":"message_start","message":{"id":"msg_1","model":"minimax-m3","usage":{"input_tokens":12}}}',
+        '',
+        'event: content_block_delta',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"checking"}}',
+        '',
+        'event: content_block_delta',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello from M3"}}',
+        '',
+        'event: message_delta',
+        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}',
+        '',
+        'event: message_stop',
+        'data: {"type":"message_stop"}',
+        '',
+      ].join("\n"), {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }) as typeof fetch;
+
+    const result = await chatCompletionWithFallback(cfg, {
+      messages: [
+        { role: "system", content: "Be concise." },
+        { role: "user", content: "Say hello." },
+      ],
+      max_tokens: 64,
+      stream: true,
+    }, undefined, { stage: "synthesizer", taskType: "general" });
+    const normalized = await result.response.text();
+
+    expect(attemptedUrl).toBe("https://opencode.ai/zen/go/v1/messages");
+    expect(attemptedHeaders?.["x-api-key"]).toBe("sk-go-key");
+    expect(attemptedHeaders?.["anthropic-version"]).toBe("2023-06-01");
+    expect(attemptedBody?.system).toBe("Be concise.");
+    expect(attemptedBody?.messages).toEqual([{ role: "user", content: "Say hello." }]);
+    expect(attemptedBody?.max_tokens).toBe(64);
+    expect(normalized).toContain('"reasoning":"checking"');
+    expect(normalized).toContain('"content":"Hello from M3"');
+    expect(normalized).toContain('"prompt_tokens":12');
+    expect(normalized).toContain("data: [DONE]");
+    expect(result.provider_used).toBe("opencode_go");
+    expect(result.model_used).toBe("minimax-m3");
+  });
+
   test("sanitizes native tool history before an OpenCode attempt", async () => {
     const cfg = cfgWithPool();
     cfg.opencode_zen.base_url = "https://opencode.ai/zen/v1";
@@ -153,8 +229,8 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
       {
         id: "strong-worker",
         provider: "openrouter",
-        model_id: "deepseek/deepseek-v4-flash",
-        capabilities: { code: 0.95, reasoning: 0.88, speed: 0.62, cost: 0.45, json_reliability: 0.85 },
+        model_id: "deepseek/deepseek-v4-flash:free",
+        capabilities: { code: 0.95, reasoning: 0.88, speed: 0.62, cost: 1, json_reliability: 0.85 },
         default_for: ["executor"],
         enabled: true,
       },
@@ -167,7 +243,7 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
         return new Response(JSON.stringify({
           data: [
             { id: "openrouter/free", name: "Free", context_length: 200000, pricing: { prompt: "0", completion: "0" }, architecture: {}, supported_parameters: [], description: "" },
-            { id: "deepseek/deepseek-v4-flash", name: "DeepSeek", context_length: 128000, pricing: { prompt: "0.0000002", completion: "0.0000002" }, architecture: {}, supported_parameters: [], description: "" },
+            { id: "deepseek/deepseek-v4-flash:free", name: "DeepSeek", context_length: 128000, pricing: { prompt: "0", completion: "0" }, architecture: {}, supported_parameters: [], description: "" },
           ],
         }), { status: 200, headers: { "Content-Type": "application/json" } });
       }
@@ -191,10 +267,10 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
     );
 
     expect(cheap.model_used).toBe("openrouter/free");
-    expect(strong.model_used).toBe("deepseek/deepseek-v4-flash");
+    expect(strong.model_used).toBe("deepseek/deepseek-v4-flash:free");
     expect(seenChatModels.slice(0, 2)).toEqual([
       "openrouter/free",
-      "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-v4-flash:free",
     ]);
   });
 
@@ -269,6 +345,25 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
     expect(zenCalls[0].url).toBe("https://opencode.ai/zen/v1/chat/completions");
     expect(zenCalls[0].auth).toBe("Bearer sk-zen-key");
     expect(result.model_used).toBe("nemotron-3-ultra-free");
+    expect(result.retries).toBe(2);
+    expect(result.fallback_depth).toBe(1);
+    expect(result.fallback_reason).toBe("rate_limited");
+
+    // The two 429s represent an endpoint quota window, so a later stage must
+    // skip every model on that provider instead of paying the same tax again.
+    const primaryCallsBeforeSecondStage = primaryCalls.length;
+    const secondStage = await chatCompletionWithFallback(
+      cfg,
+      { model: "cohere/north-mini-code:free", messages: [{ role: "user", content: "next stage" }], stream: true },
+      undefined,
+      { stage: "synthesizer", taskType: "debug" },
+    );
+    const primaryCallsAfterSecondStage = calls.filter(
+      (c) => c.url.includes("/chat/completions") && c.model === "cohere/north-mini-code:free",
+    ).length;
+    expect(primaryCallsAfterSecondStage).toBe(primaryCallsBeforeSecondStage);
+    expect(secondStage.provider_used).toBe("opencode_zen");
+    expect(secondStage.retries).toBe(0);
   });
 
   test("first-token watchdog advances to the next cascade model on a hung response body", async () => {
@@ -441,8 +536,8 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
       {
         id: "healthy-openrouter-secondary",
         provider: "openrouter",
-        model_id: "cohere/north-mini-code:free",
-        capabilities: { code: 0.8, reasoning: 0.7, speed: 0.9, cost: 1, json_reliability: 0.8 },
+        model_id: "cohere/north-mini-code",
+        capabilities: { code: 0.8, reasoning: 0.7, speed: 0.9, cost: 0.5, json_reliability: 0.8 },
         default_for: ["executor"],
         enabled: true,
       },
@@ -452,7 +547,7 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/models")) {
-        return new Response(JSON.stringify({ data: [{ id: "cohere/north-mini-code:free", name: "North", context_length: 256000, pricing: { prompt: "0", completion: "0" }, architecture: {}, supported_parameters: [], description: "" }] }), { status: 200 });
+        return new Response(JSON.stringify({ data: [{ id: "cohere/north-mini-code", name: "North", context_length: 256000, pricing: { prompt: "0.000001", completion: "0.000001" }, architecture: {}, supported_parameters: [], description: "" }] }), { status: 200 });
       }
       const body = JSON.parse(String(init?.body ?? "{}"));
       seenChatModels.push(body.model);
@@ -470,8 +565,8 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
       { stage: "executor", taskType: "general" },
     );
 
-    expect(seenChatModels.slice(0, 2)).toEqual(["deepseek-v4-pro", "cohere/north-mini-code:free"]);
-    expect(result.model_used).toBe("cohere/north-mini-code:free");
+    expect(seenChatModels.slice(0, 2)).toEqual(["deepseek-v4-pro", "cohere/north-mini-code"]);
+    expect(result.model_used).toBe("cohere/north-mini-code");
   });
 
   test("honors excludeModels when resolving its own internal cascade, preferring the stage-aware next-best over a generically-higher-scored model", async () => {

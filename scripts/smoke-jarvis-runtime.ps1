@@ -138,7 +138,7 @@ if ($WriteReadSmoke) {
 }
 if ($DeepReadSmoke) {
     $TimeoutSeconds = [Math]::Max($TimeoutSeconds, 240)
-    $Prompt = "Identify all remaining gaps in '$DeepReadFixture' — architecture audit. Force deep read."
+    $Prompt = "Identify all remaining gaps in '$DeepReadFixture' -- architecture audit. Force deep read."
 }
 
 $started = Get-Date

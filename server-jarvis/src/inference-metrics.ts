@@ -65,6 +65,72 @@ export function backendForProvider(
   }
 }
 
+export interface CascadeTelemetry {
+  attempts: number;
+  used: boolean;
+  depth: number;
+  reason?: string;
+}
+
+export interface FirstTokenProgress {
+  /** Any model output arrived, including hidden reasoning. Used by watchdogs. */
+  transportReceived: boolean;
+  /** User-visible prose or a tool call arrived. Used by TTFT telemetry. */
+  visibleReceived: boolean;
+  /** Milliseconds to the first visible token/tool call, recorded once. */
+  firstTokenMs?: number;
+}
+
+/**
+ * Keep transport liveness separate from visible first-token telemetry.
+ * Providers may stream hidden reasoning before answer prose; treating that as
+ * the visible token used to prevent the later real token from being timed,
+ * causing successful stages to fall back to their full duration as TTFT.
+ */
+export function observeFirstTokenProgress(
+  current: FirstTokenProgress | undefined,
+  kind: "transport" | "visible",
+  elapsedMs: number,
+): FirstTokenProgress {
+  const previous = current ?? {
+    transportReceived: false,
+    visibleReceived: false,
+    firstTokenMs: undefined,
+  };
+  const elapsed = Number.isFinite(elapsedMs)
+    ? Math.max(0, Math.round(elapsedMs))
+    : 0;
+  if (kind === "transport") {
+    return { ...previous, transportReceived: true };
+  }
+  return {
+    transportReceived: true,
+    visibleReceived: true,
+    firstTokenMs: previous.firstTokenMs ?? elapsed,
+  };
+}
+
+/**
+ * Normalize fallback metadata at the stage boundary. Historically index.ts
+ * used `excludeModels.size`, which is only an outer retry proxy and remains
+ * zero when chatCompletionWithFallback internally retries 429s or advances a
+ * cascade. The provider result is authoritative; outer exclusions are kept
+ * only when they represent additional empty/stall advances.
+ */
+export function resolveCascadeTelemetry(
+  result: { retries?: number; fallback_depth?: number; fallback_reason?: string } | undefined,
+  outerExclusions = 0,
+): CascadeTelemetry {
+  const providerRetries = Math.max(0, Number(result?.retries ?? 0));
+  const attempts = Math.max(providerRetries, Math.max(0, outerExclusions));
+  return {
+    attempts,
+    used: attempts > 0,
+    depth: Math.max(0, Number(result?.fallback_depth ?? 0)),
+    ...(result?.fallback_reason ? { reason: result.fallback_reason } : {}),
+  };
+}
+
 export interface InferenceRecord {
   ts: number;       // unix ms
   backend: Backend;

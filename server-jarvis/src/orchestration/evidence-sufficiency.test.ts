@@ -7,7 +7,9 @@ import {
   extractSourceReadCandidates,
   isDeepReadRequest,
   parseListingEntryNames,
+  resolveWorkspaceReadScope,
   turnNeedsWorkspaceEvidence,
+  workspaceReadScopeViolation,
 } from "./evidence-sufficiency";
 import { hasWorkspaceSignal } from "./turn-requirements";
 import type { ToolCallRecord } from "./stage-output";
@@ -85,6 +87,57 @@ describe("isDeepReadRequest", () => {
     // mention 'repo' will be classified as deep — that is by design and
     // is the bug class the depth-scaled sufficiency exists to catch.
     expect(isDeepReadRequest("list the files in C:\\repo")).toBe(true);
+  });
+
+  test("an explicit read-only allowlist overrides broad audit/deep markers", () => {
+    const request =
+      "For an orchestration performance audit, work read-only in C:\\Users\\ethan\\Downloads\\Perihelion. " +
+      "First identify top-level structure, then read only README.md if it exists. " +
+      "Do not read any other files, run shell, or use the network.";
+
+    expect(isDeepReadRequest(request)).toBe(false);
+  });
+});
+
+describe("explicit workspace read scope", () => {
+  const request =
+    "For an orchestration performance audit, work read-only in C:\\Users\\ethan\\Downloads\\Perihelion. " +
+    "First identify top-level structure, then read only README.md if it exists. " +
+    "Do not read any other files, run shell, or use the network.";
+  const root = "C:\\Users\\ethan\\Downloads\\Perihelion";
+
+  test("extracts the requested root listing and the single allowed file", () => {
+    expect(resolveWorkspaceReadScope(request, root)).toMatchObject({
+      explicit: true,
+      workspaceRoot: root,
+      allowedPaths: ["README.md"],
+      allowRootListing: true,
+      denyShell: true,
+      denyNetwork: true,
+    });
+  });
+
+  test("requires the allowlisted file read instead of accepting the listing alone", () => {
+    const listing = { ...ls, arguments: { path: root }, output: "src/\nREADME.md" };
+    const listingOnly = assessWorkspaceEvidence([listing], request, root);
+    expect(listingOnly.deepRead).toBe(false);
+    expect(listingOnly.sufficient).toBe(false);
+    expect(listingOnly.reason).toContain("README.md");
+
+    const scoped = assessWorkspaceEvidence([listing, read(`${root}\\README.md`)], request, root);
+    expect(scoped.sufficient).toBe(true);
+    expect(scoped.contentReads).toBe(1);
+    expect(scoped.reason).toContain("explicit scope satisfied");
+  });
+
+  test("allows only the root listing and allowlisted file reads", () => {
+    const scope = resolveWorkspaceReadScope(request, root)!;
+    expect(workspaceReadScopeViolation({ id: "1", name: "list_directory", arguments: { path: root } }, scope)).toBeUndefined();
+    expect(workspaceReadScopeViolation({ id: "2", name: "read_file", arguments: { path: `${root}\\README.md` } }, scope)).toBeUndefined();
+    expect(workspaceReadScopeViolation({ id: "3", name: "read_file", arguments: { path: `${root}\\src\\PluginProcessor.cpp` } }, scope)).toContain("outside explicit read scope");
+    expect(workspaceReadScopeViolation({ id: "4", name: "list_directory", arguments: { path: `${root}\\src` } }, scope)).toContain("top-level listing");
+    expect(workspaceReadScopeViolation({ id: "5", name: "web_fetch", arguments: { url: "https://example.com" } }, scope)).toContain("network access denied");
+    expect(workspaceReadScopeViolation({ id: "6", name: "bash", arguments: { command: "dir" } }, scope)).toContain("shell access denied");
   });
 });
 

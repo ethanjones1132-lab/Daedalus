@@ -23,6 +23,16 @@ export interface OrchestratorAgent {
   capabilities: AgentCapabilities;
   default_for: string[];
   enabled: boolean;
+  /** Authoritative billing class supplied by live provider metadata. */
+  billing_tier?: "free" | "go" | "paid";
+  /**
+   * Stable provider price ordering. Lower values are cheaper. Live catalog
+   * enrichment supplies this for OpenCode Go models from the provider's
+   * published plan pricing; it is intentionally separate from the learned
+   * quality/speed scores so feedback can never silently spend past free
+   * capacity or promote a more expensive Go model ahead of a cheaper one.
+   */
+  cost_rank?: number;
   /**
    * Optional per-model first-token timeout override in milliseconds. Use when a
    * known-good model has reliably-slow cold-start latency (e.g. large reasoning
@@ -255,6 +265,30 @@ export const DEFAULT_ORCHESTRATOR_AGENTS: OrchestratorAgent[] = [
 // answer stage.
 const SYNTHESIZER_MIN_SPEED = 0.7;
 
+const FREE_ZEN_MODEL_IDS = new Set([
+  "big-pickle",
+  "deepseek-v4-flash-free",
+  "mimo-v2.5-free",
+  "north-mini-code-free",
+  "nemotron-3-ultra-free",
+  "hy3-free",
+]);
+
+/** User capacity policy: free OpenRouter + free Zen, then Go, then paid tail. */
+export function orchestrationRoutingTier(agent: OrchestratorAgent): number {
+  if (agent.billing_tier === "free") return 0;
+  if (agent.billing_tier === "go") return 1;
+  if (
+    (agent.provider === "openrouter" && (agent.model_id === "openrouter/free" || agent.model_id.endsWith(":free"))) ||
+    (agent.provider === "opencode_zen" && (FREE_ZEN_MODEL_IDS.has(agent.model_id) || agent.model_id.endsWith("-free")))
+  ) {
+    return 0;
+  }
+  if (agent.provider === "opencode_go") return 1;
+  if (agent.provider === "openrouter" || agent.provider === "opencode_zen") return 2;
+  return 3;
+}
+
 export class AgentPool {
   private agents = new Map<string, OrchestratorAgent>();
 
@@ -298,10 +332,19 @@ export class AgentPool {
     // by `chatCompletionWithFallback` in `index.ts` so the two layers stay
     // consistent.
     const filterExclude = (agent: OrchestratorAgent) =>
-      !exclude || !exclude.has(`${agent.provider}:${agent.model_id}`);
+      !exclude || (
+        !exclude.has(`${agent.provider}:${agent.model_id}`) &&
+        !exclude.has(`${agent.provider}:*`)
+      );
     const candidates = this.enabled().filter(filterExclude).map(applyLearnedCapabilities);
     if (candidates.length === 0) return undefined;
-    const stageDefault = candidates.find((agent) => agent.default_for.includes(stage));
+    // Cost/capacity policy is a hard boundary, not another weighted hint. A
+    // perfect Go stage pin must not leapfrog any healthy free OpenRouter/Zen
+    // model. Only after the entire active tier is excluded does the next tier
+    // become eligible.
+    const activeTier = Math.min(...candidates.map(orchestrationRoutingTier));
+    const tierCandidates = candidates.filter((agent) => orchestrationRoutingTier(agent) === activeTier);
+    const stageDefault = tierCandidates.find((agent) => agent.default_for.includes(stage));
     if (stageDefault) {
       // T1.6: heavy stage-scoped learned penalty demotes the pin so a
       // coordinator with 18% parse success stops being re-selected every turn.
@@ -313,11 +356,11 @@ export class AgentPool {
           `stage_delta=${stageDelta.toFixed(3)} ≤ ${AgentPool.DEFAULT_FOR_DEMOTE_DELTA}; falling through to scored ranking`,
         );
       } else {
-        if (stage === "synthesizer") return this.preferFastSynthesizer(stageDefault, candidates, taskType);
+        if (stage === "synthesizer") return this.preferFastSynthesizer(stageDefault, tierCandidates, taskType);
         return stageDefault;
       }
     }
-    return candidates.sort((a, b) => this.scoreWithFeedback(b, stage, taskType) - this.scoreWithFeedback(a, stage, taskType))[0];
+    return tierCandidates.sort((a, b) => this.compareWithinTier(a, b, stage, taskType))[0];
   }
 
   /**
@@ -360,6 +403,15 @@ export class AgentPool {
       .map(applyLearnedCapabilities);
     const learned = getLearnedPoolState();
     const sortWithLearning = (a: OrchestratorAgent, b: OrchestratorAgent): number => {
+      const tierDelta = orchestrationRoutingTier(a) - orchestrationRoutingTier(b);
+      if (tierDelta !== 0) return tierDelta;
+      const goCostDelta = this.goCostDelta(a, b);
+      if (goCostDelta !== 0) return goCostDelta;
+      // Preserve the stage-selected model at the head of its own tier. This
+      // keeps fallback metadata truthful while still allowing a lower-cost
+      // tier to move ahead if a caller supplied a stale/non-policy selection.
+      if (a.id === selected.id) return -1;
+      if (b.id === selected.id) return 1;
       let scoreA = this.overallScore(a);
       let scoreB = this.overallScore(b);
       if (stage && taskType) {
@@ -370,25 +422,32 @@ export class AgentPool {
       scoreB += modelRoutingScoreDelta(b);
       return scoreB - scoreA;
     };
-    return [
-      applyLearnedCapabilities(selected),
-      ...candidates.sort(sortWithLearning),
-    ];
+    return [applyLearnedCapabilities(selected), ...candidates].sort(sortWithLearning);
   }
 
   cascadeChain(stage: string, taskType: TaskType | string, exclude?: ReadonlySet<string>): OrchestratorAgent[] {
     const filterExclude = (agent: OrchestratorAgent) =>
-      !exclude || !exclude.has(`${agent.provider}:${agent.model_id}`);
+      !exclude || (
+        !exclude.has(`${agent.provider}:${agent.model_id}`) &&
+        !exclude.has(`${agent.provider}:*`)
+      );
     const candidates = this.enabled().filter(filterExclude).map(applyLearnedCapabilities);
     if (candidates.length === 0) return [];
-    const cheapFirst = candidates
+    const activeTier = Math.min(...candidates.map(orchestrationRoutingTier));
+    const tierCandidates = candidates.filter((agent) => orchestrationRoutingTier(agent) === activeTier);
+    const cheapFirst = tierCandidates
       .filter((agent) => agent.capabilities.code >= 0.55 || agent.capabilities.reasoning >= 0.55)
-      .sort((a, b) => this.cascadeCheapScore(b, stage, taskType) - this.cascadeCheapScore(a, stage, taskType))[0];
+      .sort((a, b) => {
+        const goCostDelta = this.goCostDelta(a, b);
+        return goCostDelta !== 0
+          ? goCostDelta
+          : this.cascadeCheapScore(b, stage, taskType) - this.cascadeCheapScore(a, stage, taskType);
+      })[0];
     if (!cheapFirst) return [];
 
-    const strongSecond = candidates
+    const strongSecond = tierCandidates
       .filter((agent) => agent.id !== cheapFirst.id)
-      .sort((a, b) => this.score(b, stage, taskType) - this.score(a, stage, taskType))[0];
+      .sort((a, b) => this.compareWithinTier(a, b, stage, taskType))[0];
 
     return [cheapFirst, strongSecond].filter((agent): agent is OrchestratorAgent => Boolean(agent));
   }
@@ -433,6 +492,24 @@ export class AgentPool {
 
   private scoreWithFeedback(agent: OrchestratorAgent, stage: string, taskType: TaskType | string): number {
     return this.score(agent, stage, taskType) + modelRoutingScoreDelta(agent) + stageRoutingScoreDelta(agent, stage);
+  }
+
+  private goCostDelta(a: OrchestratorAgent, b: OrchestratorAgent): number {
+    if (a.provider !== "opencode_go" || b.provider !== "opencode_go") return 0;
+    const rankA = Number.isFinite(a.cost_rank) ? Number(a.cost_rank) : (1 - a.capabilities.cost) * 1000;
+    const rankB = Number.isFinite(b.cost_rank) ? Number(b.cost_rank) : (1 - b.capabilities.cost) * 1000;
+    return rankA - rankB;
+  }
+
+  private compareWithinTier(
+    a: OrchestratorAgent,
+    b: OrchestratorAgent,
+    stage: string,
+    taskType: TaskType | string,
+  ): number {
+    const goCostDelta = this.goCostDelta(a, b);
+    if (goCostDelta !== 0) return goCostDelta;
+    return this.scoreWithFeedback(b, stage, taskType) - this.scoreWithFeedback(a, stage, taskType);
   }
 
   private overallScore(agent: OrchestratorAgent): number {
