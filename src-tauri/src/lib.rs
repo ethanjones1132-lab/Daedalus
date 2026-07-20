@@ -288,25 +288,53 @@ fn configure_proxy_credential(
     const KEY: &str = "JARVIS_OPENROUTER_API_KEY";
     command.env(KEY, openrouter_api_key);
     if through_wsl {
-        let mut forwarded = std::env::var("WSLENV")
-            .unwrap_or_default()
-            .split(':')
-            .filter(|name| !name.is_empty())
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        if !forwarded.iter().any(|name| name == KEY) {
-            forwarded.push(KEY.to_string());
-        }
-        command.env("WSLENV", forwarded.join(":"));
+        forward_env_to_wsl(command, &[KEY]);
     }
 }
 
-fn configure_proxy_runtime(command: &mut std::process::Command, model: &str) {
+fn forward_env_to_wsl(command: &mut std::process::Command, required: &[&str]) {
+    let staged = command
+        .get_envs()
+        .find(|(name, _)| *name == std::ffi::OsStr::new("WSLENV"))
+        .and_then(|(_, value)| value)
+        .map(|value| value.to_string_lossy().into_owned())
+        .or_else(|| std::env::var("WSLENV").ok())
+        .unwrap_or_default();
+    let mut forwarded = staged
+        .split(':')
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for name in required {
+        if !forwarded
+            .iter()
+            .any(|entry| entry.split('/').next() == Some(name))
+        {
+            forwarded.push((*name).to_string());
+        }
+    }
+    command.env("WSLENV", forwarded.join(":"));
+}
+
+fn configure_proxy_runtime(
+    command: &mut std::process::Command,
+    model: &str,
+    through_wsl: bool,
+) {
+    const RUNTIME_ENV: [&str; 4] = [
+        "JARVIS_CLAUDE_PROXY_PORT",
+        "JARVIS_CLAUDE_PROXY_BIND",
+        "JARVIS_OLLAMA_URL",
+        "JARVIS_DEFAULT_MODEL",
+    ];
     command
-        .env("JARVIS_CLAUDE_PROXY_PORT", "19878")
-        .env("JARVIS_CLAUDE_PROXY_BIND", "127.0.0.1")
-        .env("JARVIS_OLLAMA_URL", "http://127.0.0.1:11434")
-        .env("JARVIS_DEFAULT_MODEL", model);
+        .env(RUNTIME_ENV[0], "19878")
+        .env(RUNTIME_ENV[1], "127.0.0.1")
+        .env(RUNTIME_ENV[2], "http://127.0.0.1:11434")
+        .env(RUNTIME_ENV[3], model);
+    if through_wsl {
+        forward_env_to_wsl(command, &RUNTIME_ENV);
+    }
 }
 
 pub(crate) fn spawn_claude_cli_proxy(
@@ -329,14 +357,15 @@ pub(crate) fn spawn_claude_cli_proxy(
     };
     let mut command = Command::new(&py.program);
     command.args(&py.prefix_args).arg(&script.path);
-    configure_proxy_runtime(&mut command, &model);
+    let through_wsl = matches!(script.kind, ProxyScriptKind::Wsl);
+    configure_proxy_runtime(&mut command, &model, through_wsl);
     command
         .stdout(jarvis_server_log_stdio("claude-proxy.log"))
         .stderr(jarvis_server_log_stdio("claude-proxy.err.log"));
     configure_proxy_credential(
         &mut command,
         &openrouter_api_key,
-        matches!(script.kind, ProxyScriptKind::Wsl),
+        through_wsl,
     );
     crate::wsl::hide_windows_console(&mut command);
     let child = match command.spawn() {
@@ -1414,22 +1443,45 @@ mod startup_thread_tests {
         );
 
         let mut wsl = std::process::Command::new("wsl.exe");
+        wsl.env("WSLENV", "EXISTING/u");
+        configure_proxy_runtime(&mut wsl, "qwen3:8b", true);
         configure_proxy_credential(&mut wsl, "secret-key", true);
         let wsl_env: std::collections::HashMap<_, _> = wsl.get_envs().collect();
+        for (name, expected) in [
+            ("JARVIS_CLAUDE_PROXY_PORT", "19878"),
+            ("JARVIS_CLAUDE_PROXY_BIND", "127.0.0.1"),
+            ("JARVIS_OLLAMA_URL", "http://127.0.0.1:11434"),
+            ("JARVIS_DEFAULT_MODEL", "qwen3:8b"),
+        ] {
+            assert_eq!(
+                wsl_env.get(std::ffi::OsStr::new(name)),
+                Some(&Some(std::ffi::OsStr::new(expected)))
+            );
+        }
         let wslenv = wsl_env
             .get(std::ffi::OsStr::new("WSLENV"))
             .and_then(|value| *value)
             .expect("WSL launch should opt the credential into environment forwarding");
-        assert!(wslenv
-            .to_string_lossy()
-            .split(':')
-            .any(|name| name == "JARVIS_OPENROUTER_API_KEY"));
+        let forwarded = wslenv.to_string_lossy();
+        for required in [
+            "EXISTING/u",
+            "JARVIS_CLAUDE_PROXY_PORT",
+            "JARVIS_CLAUDE_PROXY_BIND",
+            "JARVIS_OLLAMA_URL",
+            "JARVIS_DEFAULT_MODEL",
+            "JARVIS_OPENROUTER_API_KEY",
+        ] {
+            assert!(
+                forwarded.split(':').any(|name| name == required),
+                "missing WSLENV entry {required}: {forwarded}"
+            );
+        }
     }
 
     #[test]
     fn proxy_launch_and_python_default_are_loopback_only() {
         let mut command = std::process::Command::new("python");
-        configure_proxy_runtime(&mut command, "qwen3:8b");
+        configure_proxy_runtime(&mut command, "qwen3:8b", false);
         let env: std::collections::HashMap<_, _> = command.get_envs().collect();
         assert_eq!(
             env.get(std::ffi::OsStr::new("JARVIS_CLAUDE_PROXY_BIND")),
@@ -1462,6 +1514,16 @@ mod startup_thread_tests {
         let verify = include_str!("../../scripts/verify-deploy.ps1");
         assert!(verify.contains("'resources\\claude_cli_proxy.py'"));
         assert!(verify.contains("$manifest.claude_proxy_sha256"));
+
+        let build_helper = include_str!("../build.rs");
+        assert!(build_helper
+            .contains("cargo:rerun-if-changed=../scripts/claude_cli_proxy.py"));
+        assert!(build_helper.contains(
+            "let proxy_dest = release_dir.join(\"resources\").join(\"claude_cli_proxy.py\")"
+        ));
+        assert!(build_helper.contains(
+            "copy_if_newer(&proxy_src, &proxy_dest, \"Claude proxy script\")"
+        ));
     }
 
     #[test]

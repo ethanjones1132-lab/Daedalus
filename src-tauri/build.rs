@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Embed build provenance (git SHA, dirty flag, build time) into the binary so
@@ -9,9 +9,10 @@ fn main() {
     // Rebuild when HEAD moves so the embedded SHA stays accurate.
     println!("cargo:rerun-if-changed=../.git/HEAD");
     println!("cargo:rerun-if-changed=../.git/index");
-    // Rebuild when the server bundle changes so the post-build copy step
-    // re-stages index.js next to the release exe.
+    // Rebuild when runtime resources change so the post-build copy step
+    // re-stages them next to the bare release exe.
     println!("cargo:rerun-if-changed=../server-jarvis/dist/index.js");
+    println!("cargo:rerun-if-changed=../scripts/claude_cli_proxy.py");
 
     let sha = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
     let dirty = match git(&["status", "--porcelain"]) {
@@ -27,20 +28,20 @@ fn main() {
     println!("cargo:rustc-env=JARVIS_GIT_DIRTY={dirty}");
     println!("cargo:rustc-env=JARVIS_BUILD_UNIX={build_unix}");
 
-    // Best-effort: in release builds, copy the server bundle next to the
+    // Best-effort: in release builds, copy runtime resources next to the
     // produced exe. Tauri `bundle.resources` only stages files inside the
     // NSIS installer; a bare `cargo tauri build` output (target/release/home-base.exe)
     // would otherwise ship with no index.js beside it and the runtime's
     // portable lookup would still find the repo-rooted dev copy, masking
     // the issue. Doing it here makes the bare exe self-contained.
     if std::env::var("PROFILE").as_deref() == Ok("release") {
-        copy_server_bundle_next_to_exe();
+        copy_release_resources_next_to_exe();
     }
 
     tauri_build::build();
 }
 
-fn copy_server_bundle_next_to_exe() {
+fn copy_release_resources_next_to_exe() {
     // OUT_DIR is `target/<profile>/build/<pkg>-<hash>/out`; the release exe
     // lives at `target/<profile>/<exe>`. Two `..` jumps lands us there.
     let out_dir = match std::env::var("OUT_DIR") {
@@ -60,6 +61,12 @@ fn copy_server_bundle_next_to_exe() {
         .parent()
         .map(|p| p.join("server-jarvis").join("dist").join("index.js"));
     let Some(bundle_src) = bundle_src else { return };
+    let proxy_src = manifest_dir
+        .parent()
+        .map(|path| path.join("scripts").join("claude_cli_proxy.py"))
+        .unwrap_or_default();
+    let proxy_dest = release_dir.join("resources").join("claude_cli_proxy.py");
+    copy_if_newer(&proxy_src, &proxy_dest, "Claude proxy script");
     if !bundle_src.exists() {
         // The Tauri beforeBuildCommand bakes the bundle; if it isn't there,
         // we can't stage it. Stay quiet — Tauri will already have complained
@@ -87,6 +94,49 @@ fn copy_server_bundle_next_to_exe() {
             bundle_src.display(),
             dest.display(),
             e
+        );
+    }
+}
+
+fn copy_if_newer(source: &Path, destination: &Path, label: &str) {
+    if !source.exists() {
+        println!(
+            "cargo:warning=Cannot stage {label}; source is missing: {}",
+            source.display()
+        );
+        return;
+    }
+    if destination.exists() {
+        let source_is_newer = source
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .zip(
+                destination
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .ok(),
+            )
+            .map(|(source_time, destination_time)| source_time > destination_time)
+            .unwrap_or(true);
+        if !source_is_newer {
+            return;
+        }
+    }
+    if let Some(parent) = destination.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            println!(
+                "cargo:warning=Failed to create {label} directory {}: {error}",
+                parent.display()
+            );
+            return;
+        }
+    }
+    if let Err(error) = std::fs::copy(source, destination) {
+        println!(
+            "cargo:warning=Failed to copy {label} {} -> {}: {error}",
+            source.display(),
+            destination.display(),
         );
     }
 }
