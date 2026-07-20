@@ -665,6 +665,7 @@ def main() -> None:
     logging.basicConfig(
         level=os.environ.get("JARVIS_LOG_LEVEL", "INFO"),
         format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+        stream=sys.stdout,
     )
 
     # Auto-patch Claude settings on start
