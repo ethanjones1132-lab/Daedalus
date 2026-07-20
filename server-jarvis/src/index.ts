@@ -124,7 +124,7 @@ import { PipelineExecutor } from "./orchestration/pipeline";
 import { extractRootGrants } from "./orchestration/workspace-grants";
 import { combinedStageExclusions, StageHealthRegistry, type RecoverableFailureKind } from "./orchestration/stage-health";
 import { ModelScorecard, type ScorecardAttempt } from "./orchestration/model-scorecard";
-import { createTurnBudget } from "./orchestration/turn-budget";
+import { computeRequestTimeoutMs, createTurnBudget } from "./orchestration/turn-budget";
 import { assessWorkspaceEvidence, isDeepReadRequest, resolveWorkspaceReadScope } from "./orchestration/evidence-sufficiency";
 import { FORCE_DEEP_READ_PATTERN } from "./orchestration/repetition-guard";
 import { OrchestrationAdmissionController, type AdmissionLease } from "./orchestration/admission-controller";
@@ -1949,9 +1949,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const stageStreamDeadline = stageLabel
             ? turnBudget.stageStreamDeadlineAt(stageLabel)
             : undefined;
+          const computedRequestTimeoutMs = computeRequestTimeoutMs(stageLabel ?? "agent", turnBudget, requestTimeout);
           const requestBudgetMs = Math.max(
             1_000,
-            Math.min(requestTimeout, stageBudgetMs, Math.max(1_000, turnBudget.remainingMs(Date.now()) - reserveMs)),
+            Math.min(computedRequestTimeoutMs, stageBudgetMs, Math.max(1_000, turnBudget.remainingMs(Date.now()) - reserveMs)),
           );
           let turnDeadlineAbortedRequest = false;
           const timeout = setTimeout(() => {
@@ -3723,7 +3724,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const useFallback = !isOllama && cfg.openrouter.enable_fallbacks;
         const requestTimeout = isOllama ? MODEL_REQUEST_TIMEOUT_MS : (cfg.openrouter.timeout_ms || MODEL_REQUEST_TIMEOUT_MS);
         const ctrl = new AbortController();
-        const requestBudgetMs = Math.max(1, Math.min(requestTimeout, turnBudget.deadlineAt - Date.now()));
+        const computedRequestTimeoutMs = computeRequestTimeoutMs("agent_loop", turnBudget, requestTimeout);
+        const requestBudgetMs = Math.max(1, Math.min(computedRequestTimeoutMs, turnBudget.deadlineAt - Date.now()));
         let turnDeadlineAbortedRequest = false;
         const timeout = setTimeout(() => {
           turnDeadlineAbortedRequest = Date.now() >= turnBudget.deadlineAt;
@@ -3805,7 +3807,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               requestBody.messages.unshift({ role: "system", content: instructions });
             }
             const retryCtrl = new AbortController();
-            const retryTimeout = setTimeout(() => retryCtrl.abort(), requestTimeout);
+            const retryTimeout = setTimeout(() => retryCtrl.abort(), requestBudgetMs);
             const cleanupRetryAbort = registerAbortHandler(streamAbort.signal, () => retryCtrl.abort());
             try {
               fetchRes = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(requestBody), signal: retryCtrl.signal });

@@ -109,6 +109,39 @@ describe("pipeline stage telemetry", () => {
     expect(successfulTurn?.error_message).toBeUndefined();
   });
 
+  test("executor salvages a request timeout after successful evidence", async () => {
+    const { rows, runtime, ctx, collector } = telemetryHarness("read_file", async () => "grounded evidence");
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor" && executorTurns++ === 0) {
+        return { content: "reading", tool_calls: [toolCallWithArgs("read_file", { path: "src/app.ts" })] };
+      }
+      throw new Error("Request timed out after 60s");
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+
+    const result = await executor.execute("inspect src/app.ts", ["executor"], "run-timeout-salvage", () => {});
+
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls?.[0]?.output).toBe("grounded evidence");
+    const timeoutRow = rows.find((row) => row.mode_id === "executor" && row.had_error === 1);
+    expect(timeoutRow?.error_message).toContain("Request timed out");
+  });
+
+  test("executor keeps zero-evidence request timeouts loud", async () => {
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    const executor = new PipelineExecutor(
+      (async () => { throw new Error("Stream idle timeout after 60s"); }) as any,
+      runtime,
+      ctx,
+      { recordStageRun: () => {} },
+    );
+
+    expect(executor.executeSegment("inspect src/app.ts", ["executor"], "run-timeout-loud", () => {}, {}))
+      .rejects.toThrow("Stream idle timeout");
+  });
+
   test("successful executor turns are not marked as model errors while evidence is still pending", async () => {
     const rows: StageRun[] = [];
     const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
@@ -994,6 +1027,38 @@ describe("pipeline stage telemetry", () => {
       expect.stringContaining("[duplicate call deflected]"),
     ]);
     expect(progressCounts[0]).toBe(1);
+  });
+
+  test("duplicate-read write pressure is injected in-loop and bounded to three directives", async () => {
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("read_file"), async () => "source body");
+    runtime.register(toolDefinition("write_file"), async () => "unused write");
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    let executorTurns = 0;
+    let finalMessages: Array<{ role: string; content?: string }> = [];
+    const callModel = async (messages: Array<{ role: string; content?: string }>, options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel !== "executor") return { content: "unexpected" };
+      executorTurns++;
+      finalMessages = messages.map((message) => ({ ...message }));
+      return {
+        content: "reading again",
+        tool_calls: [
+          toolCallWithArgs("read_file", { path: "src/app.ts" }),
+          toolCallWithArgs("read_file", { path: "src/app.ts" }),
+        ],
+      };
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, { recordStageRun: () => {} });
+
+    await executor.execute("update src/app.ts", ["executor"], "run-write-read-loop", () => {}, {
+      executionProfile: "full",
+    });
+
+    const directives = finalMessages.filter((message) => message.content?.includes("Expected write target"));
+    expect(executorTurns).toBe(12);
+    expect(directives).toHaveLength(3);
+    expect(directives.every((message) => message.content?.includes("write_file"))).toBe(true);
+    expect(directives.every((message) => message.content?.includes("src/app.ts"))).toBe(true);
   });
 
   test("PipelineResult.toolCalls is undefined when the executor stage never ran", async () => {

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   createTurnBudget,
+  computeRequestTimeoutMs,
   EXTENDED_DEEP_EXECUTOR_MS,
   EXTENDED_DEEP_TURN_MS,
   FINAL_STREAM_GRACE_MS,
@@ -11,6 +12,18 @@ import { AgentPool, firstTokenTimeoutFor } from "./agent-pool";
 import { resolveTurnRequirement } from "./turn-requirements";
 
 describe("turn budgets", () => {
+  test("request timeouts follow stage remaining time with a 60s floor", () => {
+    const budget = {
+      turn_ms: 150_000,
+      stageRemainingMs: () => 42_000,
+    } as any;
+    expect(computeRequestTimeoutMs("planner", budget, 300_000)).toBe(60_000);
+  });
+
+  test("extended-deep request timeouts are capped at 180s", () => {
+    const budget = createTurnBudget("full_execution", "high", Date.now(), { deepTask: true });
+    expect(computeRequestTimeoutMs("executor", budget, 300_000)).toBe(180_000);
+  });
   test("reserves the finalization window before optional repair work", () => {
     const budget = createTurnBudget("full_execution", "high", 1_000);
     expect(budget.canStart("rewriter", 151_000)).toBe(false);

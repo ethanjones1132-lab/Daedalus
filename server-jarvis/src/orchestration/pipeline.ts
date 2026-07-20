@@ -13,7 +13,7 @@ import type { ConductorBus, ConductorDirective } from "./conductor-bus";
 import type { ConductorStageEvidence, LiveConductor } from "./conductor";
 import { buildSynthesizerContext, buildSynthesizerContextFromStageState } from "./synth-context";
 import { detectDeferralStall, DEFERRAL_STALL_NUDGE } from "./synthesizer-deferral";
-import { applyEffectGate, evaluateEffectGate, shouldPressWriteEffect, WRITE_EFFECT_NUDGE, WRITE_EFFECT_TOOLS, type EffectGateReport } from "./effect-gate";
+import { applyEffectGate, buildWriteEffectNudge, evaluateEffectGate, shouldPressWriteEffect, WRITE_EFFECT_NUDGE, WRITE_EFFECT_TOOLS, type EffectGateReport } from "./effect-gate";
 import { normalizeRemainingStages, type ExecutionProfile } from "./route-normalization";
 import { hasWriteIntent, type TurnRequirement } from "./turn-requirements";
 import type { TurnBudget } from "./turn-budget";
@@ -837,10 +837,11 @@ export class PipelineExecutor {
     const plannerPrompt = stageSystemPrompt("planner", options);
     const startTime = Date.now();
     try {
-      const resp = await this.callModel([
+      const plannerMessages = [
         { role: "system", content: plannerPrompt },
-        { role: "user", content: request }
-      ] as ChatMessage[], {
+        { role: "user", content: request },
+      ] as ChatMessage[];
+      const plannerOptions = {
         temperature: BUILTIN_MODES.planner.temperature,
         max_tokens: BUILTIN_MODES.planner.max_tokens,
         stream: true,
@@ -848,11 +849,18 @@ export class PipelineExecutor {
         advanceOnEmpty: true,
         suppressActivity: true,
         stageAbort: this.registerStageAbort("planner"),
-        onChunk: (chunk) => {
+        onChunk: (chunk: string) => {
           onStateChange({ stage: "planner", status: "running", output: chunk });
           this.publishStageToken("planner", chunk);
-        }
-      });
+        },
+      };
+      let resp = await this.callModel(plannerMessages, plannerOptions);
+      // Planner resilience: one fresh callModel invocation lets stage-health
+      // cooldowns steer the retry to another candidate. A second empty result
+      // degrades to executor-without-plan below; it never requests a replan.
+      if (isEmptyStageOutput(resp.content)) {
+        resp = await this.callModel(plannerMessages, plannerOptions);
+      }
       const narrative = resp.content;
       if (isEmptyStageOutput(narrative)) {
         const errorMessage = "empty_completion";
@@ -1036,12 +1044,42 @@ export class PipelineExecutor {
     }
     const maxTurns = executorTurnLimit(profile, {
       deepRead: deepReadRequest,
+      writeIntent: requiresWriteEffect,
       complexity: options.estimatedComplexity,
     });
     let executorTurn = 0;
     const successfulEvidenceCount = () => toolCalls
       .filter((call) => !call.is_error && call.output.trim().length > 0 && !isDuplicateToolDeflection(call))
       .length;
+    const stageCalls = () => toolCalls.slice(priorToolCalls.length);
+    const duplicateReadDeflectionCount = () => stageCalls()
+      .filter((call) => READ_ONLY_TOOLS.has(call.name) && isDuplicateToolDeflection(call))
+      .length;
+    const distinctSuccessfulReadCount = () => new Set(
+      stageCalls()
+        .filter((call) => READ_ONLY_TOOLS.has(call.name) && !call.is_error && call.output.trim().length > 0 && !isDuplicateToolDeflection(call))
+        .map((call) => duplicateToolCallKey(call)),
+    ).size;
+    const mostReadTarget = () => {
+      const counts = new Map<string, number>();
+      for (const call of stageCalls()) {
+        if (!READ_ONLY_TOOLS.has(call.name) || call.is_error) continue;
+        const path = typeof call.arguments.path === "string" ? call.arguments.path.trim() : "";
+        if (path) counts.set(path, (counts.get(path) ?? 0) + 1);
+      }
+      let target = "the requested workspace file";
+      let max = 0;
+      for (const [path, count] of counts) {
+        if (count > max) {
+          target = path;
+          max = count;
+        }
+      }
+      return target;
+    };
+    const availableWriteTools = getToolsForMode("executor", this.runtime.listTools(), profile)
+      .map((tool) => tool.function.name)
+      .filter((name) => WRITE_EFFECT_TOOLS.has(name));
 
     // Explicit bounded-read fast path. The user has already chosen the exact
     // filesystem authority, so a free-form executor model can add no useful
@@ -1504,12 +1542,14 @@ export class PipelineExecutor {
           // prose ending — but never into a nearly-exhausted stage window.
           let writeEffectNudgeSentThisTurn = false;
           if (
-            !emittedToolCalls &&
             (options.turnBudget?.stageRemainingMs("executor") ?? Number.POSITIVE_INFINITY) > 8_000 &&
             shouldPressWriteEffect({
               writeIntent: requiresWriteEffect,
               profile,
               successfulWrites: successfulWriteCount(),
+              toolCallsEmitted: emittedToolCalls,
+              duplicateReadDeflections: duplicateReadDeflectionCount(),
+              distinctSuccessfulReads: distinctSuccessfulReadCount(),
               nudgesSent: writeEffectNudgeCount,
               turnCount,
               maxTurns,
@@ -1517,7 +1557,12 @@ export class PipelineExecutor {
           ) {
             writeEffectNudgeCount++;
             writeEffectNudgeSentThisTurn = true;
-            executorMessages.push({ role: "user", content: WRITE_EFFECT_NUDGE });
+            executorMessages.push({
+              role: "user",
+              content: emittedToolCalls
+                ? buildWriteEffectNudge(availableWriteTools, mostReadTarget())
+                : WRITE_EFFECT_NUDGE,
+            });
           }
 
           if (!emittedToolCalls && !workspaceEvidenceNudgeSentThisTurn && !writeEffectNudgeSentThisTurn) {
@@ -1556,6 +1601,13 @@ export class PipelineExecutor {
             had_error: 1,
             error_message: errText(err),
           });
+          if (isStageTimeout(err) && successfulEvidenceCount() > 0) {
+            executorDone = true;
+            narratives.push(
+              `Executor request timed out after gathering ${successfulEvidenceCount()} successful evidence result(s); continuing with gathered evidence.`,
+            );
+            break;
+          }
           throw err;
         }
       }
@@ -1679,6 +1731,9 @@ export class PipelineExecutor {
       await this.afterConductorStage("executor", "completed", narrative, agentRunId, options, remainingQueue, executorEvidence());
       return { ok: true, narrative, toolCalls };
     } catch (e: any) {
+      if (isStageTimeout(e) && successfulEvidenceCount() === 0) {
+        throw e;
+      }
       const message = errText(e);
       onStateChange({ stage: "executor", status: "failed", output: message });
       await this.afterConductorStage("executor", "failed", message, agentRunId, options, remainingQueue, executorEvidence());

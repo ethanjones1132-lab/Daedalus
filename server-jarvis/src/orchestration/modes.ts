@@ -25,7 +25,7 @@ export const BUILTIN_MODES: Record<string, AgentMode> = {
     name: "Planner",
     tools_filter: [],
     temperature: 0.2,
-    max_tokens: 1024,
+    max_tokens: 2048,
     requires_memory: true,
     is_final: false,
     max_turns: 1,
@@ -95,13 +95,14 @@ export const BUILTIN_MODES: Record<string, AgentMode> = {
  */
 export function executorTurnLimit(
   profile: ExecutionProfile,
-  context: { deepRead?: boolean; complexity?: "low" | "medium" | "high" } = {},
+  context: { deepRead?: boolean; writeIntent?: boolean; complexity?: "low" | "medium" | "high" } = {},
 ): number {
   // Deep reads carry the 600s/420s-executor contract (turn-budget.ts,
   // 2026-07-16): 8 turns of ~20-30s each would exit the loop long before the
   // budget binds, so the ceiling scales with the window. The loop still ends
   // early when the model stops emitting tool calls or the budget runs out.
   if (context.deepRead) return 16;
+  if (profile === "full" && context.writeIntent) return 12;
   if (context.complexity === "high") return 8;
   return profile === "read_only" ? 4 : BUILTIN_MODES.executor.max_turns;
 }

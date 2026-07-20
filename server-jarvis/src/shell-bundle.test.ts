@@ -1,5 +1,7 @@
 import { describe, test, expect } from "bun:test";
 import { tmpdir } from "os";
+import { mkdtempSync, rmSync } from "fs";
+import { basename, join } from "path";
 import { createToolRuntime, makeExecutionContext } from "./tool-runtime";
 import { registerShellBundle } from "./shell-bundle";
 import { defaultConfig } from "./config";
@@ -36,5 +38,49 @@ describe("ShellBundle", () => {
     );
     expect(result.is_error).toBe(false);
     expect(result.output).toContain("hi");
+  }, { timeout: 15_000 });
+
+  test("resolves cwd inside a session-granted root under strict policy", async () => {
+    const workspace = mkdtempSync(join(tmpdir(), "jarvis-shell-workspace-"));
+    const granted = tmpdir();
+    try {
+      const cfg = defaultConfig();
+      cfg.jarvis_path = workspace;
+      cfg.tools.enabled = true;
+      cfg.tools.sandbox_mode = "strict";
+      const ctx = makeExecutionContext("chat", cfg, {
+        session_grants: [granted],
+        requestApproval: async () => true,
+      });
+      const result = await makeRuntime().execute(
+        { id: "cwd-grant", name: "bash", arguments: { command: "pwd; cd /", cwd: granted } },
+        ctx,
+      );
+      expect(result.is_error).toBe(false);
+      expect(result.output.replace(/\\/g, "/").toLowerCase()).toContain(basename(granted).toLowerCase());
+    } finally {
+      rmSync(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  }, { timeout: 15_000 });
+
+  test("rejects cwd outside allowed roots under strict policy", async () => {
+    const workspace = mkdtempSync(join(tmpdir(), "jarvis-shell-workspace-"));
+    const outside = mkdtempSync(join(tmpdir(), "jarvis-shell-outside-"));
+    try {
+      const cfg = defaultConfig();
+      cfg.jarvis_path = workspace;
+      cfg.tools.enabled = true;
+      cfg.tools.sandbox_mode = "strict";
+      const ctx = makeExecutionContext("chat", cfg, { requestApproval: async () => true });
+      const result = await makeRuntime().execute(
+        { id: "cwd-outside", name: "bash", arguments: { command: "pwd", cwd: outside } },
+        ctx,
+      );
+      expect(result.is_error).toBe(true);
+      expect(result.output).toContain("outside the workspace");
+    } finally {
+      rmSync(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+      rmSync(outside, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
   }, { timeout: 15_000 });
 });

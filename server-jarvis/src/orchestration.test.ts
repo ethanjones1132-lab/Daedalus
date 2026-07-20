@@ -351,7 +351,7 @@ describe("Orchestration & Routing Tests", () => {
       { executionProfile: "full", turnRequirement: "full_execution" },
     );
 
-    expect(executorTurns).toBe(BUILTIN_MODES.executor.max_turns);
+    expect(executorTurns).toBe(executorTurnLimit("full", { writeIntent: true }));
     expect(segment.state.executor?.ok).toBe(false);
     expect(segment.state.executor?.terminalStatus).toBe("partial");
     expect(segment.state.executor?.errorCode).toBe("executor_turn_limit");

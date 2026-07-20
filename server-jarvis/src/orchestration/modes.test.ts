@@ -203,6 +203,16 @@ describe("executorTurnLimit", () => {
     expect(executorTurnLimit("read_only", { deepRead: false, complexity: "medium" })).toBe(4);
     expect(executorTurnLimit("full", { deepRead: false, complexity: "low" })).toBe(4);
   });
+
+  test("full-profile write intent gets 12 turns with deep-read precedence", () => {
+    expect(executorTurnLimit("full", { writeIntent: true, complexity: "low" })).toBe(12);
+    expect(executorTurnLimit("full", { writeIntent: true, complexity: "high" })).toBe(12);
+    expect(executorTurnLimit("full", { deepRead: true, writeIntent: true, complexity: "high" })).toBe(16);
+  });
+
+  test("write intent never widens the read-only profile", () => {
+    expect(executorTurnLimit("read_only", { writeIntent: true, complexity: "low" })).toBe(4);
+  });
 });
 
 describe("getToolsForMode — modeId handling", () => {

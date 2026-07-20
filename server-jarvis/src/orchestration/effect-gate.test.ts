@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { applyEffectGate, evaluateEffectGate } from "./effect-gate";
+import { applyEffectGate, buildWriteEffectNudge, evaluateEffectGate, shouldPressWriteEffect } from "./effect-gate";
 import type { ExecutorStageOutput, ToolCallRecord } from "./stage-output";
 
 function call(name: string, is_error = false, output = "ok"): ToolCallRecord {
@@ -139,5 +139,47 @@ describe("effect gate", () => {
       assumeWriteIntent: true,
     });
     expect(report.verdict).toBe("clean");
+  });
+});
+
+describe("executor write pressure", () => {
+  const base = {
+    writeIntent: true,
+    profile: "full" as const,
+    successfulWrites: 0,
+    toolCallsEmitted: true,
+    duplicateReadDeflections: 0,
+    distinctSuccessfulReads: 0,
+    nudgesSent: 0,
+    turnCount: 2,
+    maxTurns: 12,
+  };
+
+  test("escalates a duplicate-read loop before the model stops calling tools", () => {
+    expect(shouldPressWriteEffect({ ...base, duplicateReadDeflections: 2 })).toBe(true);
+  });
+
+  test("escalates four distinct reads in the final two turns", () => {
+    expect(shouldPressWriteEffect({
+      ...base,
+      distinctSuccessfulReads: 4,
+      turnCount: 10,
+    })).toBe(true);
+    expect(shouldPressWriteEffect({
+      ...base,
+      distinctSuccessfulReads: 4,
+      turnCount: 9,
+    })).toBe(false);
+  });
+
+  test("keeps prose-only pressure and bounds all injections at three", () => {
+    expect(shouldPressWriteEffect({ ...base, toolCallsEmitted: false })).toBe(true);
+    expect(shouldPressWriteEffect({ ...base, duplicateReadDeflections: 3, nudgesSent: 3 })).toBe(false);
+  });
+
+  test("directive names available write tools and the expected target", () => {
+    const directive = buildWriteEffectNudge(["write_file", "apply_patch"], "src/app.ts");
+    expect(directive).toContain("write_file, apply_patch");
+    expect(directive).toContain("src/app.ts");
   });
 });

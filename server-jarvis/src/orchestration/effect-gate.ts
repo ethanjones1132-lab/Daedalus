@@ -94,7 +94,7 @@ export function applyEffectGate(
  * READ-evidence rubric, which actively steers toward read-only tools. When
  * the model is about to end a full-profile write turn with zero successful
  * mutations, the loop sends a bounded write nudge instead of accepting the
- * prose. Bounded at 2 so a refusing/incapable model still exits quickly.
+ * prose. Bounded at 3 so a refusing/incapable model still exits predictably.
  */
 export const WRITE_EFFECT_NUDGE =
   "This turn is a CHANGE request. You have write tools available " +
@@ -103,17 +103,38 @@ export const WRITE_EFFECT_NUDGE =
   "not modify any file and do not count. After writing, read the file back " +
   "to verify, then finish.";
 
+export function buildWriteEffectNudge(writeTools: string[], expectedTarget: string): string {
+  const available = writeTools.length > 0 ? writeTools.join(", ") : "no write tools exposed";
+  return [
+    "This turn is a CHANGE request and the executor is still in a read loop.",
+    `Available write tools: ${available}.`,
+    `Expected write target based on the gathered evidence: ${expectedTarget}.`,
+    "Call an available write tool now; prose or an unexecuted diff does not modify the workspace. Read the target back after writing to verify it.",
+  ].join(" ");
+}
+
 export function shouldPressWriteEffect(input: {
   writeIntent: boolean;
   profile: ExecutionProfile;
   successfulWrites: number;
+  toolCallsEmitted: boolean;
+  duplicateReadDeflections: number;
+  distinctSuccessfulReads: number;
   nudgesSent: number;
   turnCount: number;
   maxTurns: number;
 }): boolean {
+  const readLoopEscalation = input.toolCallsEmitted && (
+    input.duplicateReadDeflections >= 2
+    || (
+      input.turnCount >= input.maxTurns - 2
+      && input.distinctSuccessfulReads >= 4
+    )
+  );
   return input.writeIntent
     && input.profile === "full"
     && input.successfulWrites === 0
-    && input.nudgesSent < 2
-    && input.turnCount < input.maxTurns;
+    && input.nudgesSent < 3
+    && input.turnCount < input.maxTurns
+    && (!input.toolCallsEmitted || readLoopEscalation);
 }
