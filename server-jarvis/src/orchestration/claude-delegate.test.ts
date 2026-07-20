@@ -83,6 +83,7 @@ describe("Claude executor delegate", () => {
       "--add-dir", "D:\\extra",
       "--tools", "Read",
       "--allowedTools", "Read",
+      "--",
       "make the change",
     ]);
     expect(invocation.args).not.toContain("--bare");
@@ -109,6 +110,20 @@ describe("Claude executor delegate", () => {
     expect(invocation.timeoutMs).toBe(12_000);
   });
 
+  test("normalizes Jarvis run identifiers to the UUID format required by stock Claude", () => {
+    const invocation = buildClaudeDelegateInvocation({
+      config: defaultConfig(),
+      prompt: "make the change",
+      sessionId: "run_07f80253-0f76-4184-8f30-bfdcccecfc2a",
+      allowedRoots: ["C:\\primary"],
+      stageRemainingMs: 12_000,
+      executable: "claude",
+      baseEnv: {},
+    });
+    const index = invocation.args.indexOf("--session-id");
+    expect(invocation.args[index + 1]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  });
+
   test("default invocation exposes only root-confinable direct tools and strips configured shell auto-allows", () => {
     const config = defaultConfig();
     config.claude_cli.delegate.allowed_tools.push("Bash(powershell:*)");
@@ -124,6 +139,7 @@ describe("Claude executor delegate", () => {
     const serialized = invocation.args.join(" ");
 
     expect(serialized).toContain("--tools Read,Edit,Write,MultiEdit,Grep,Glob,WebSearch,WebFetch,TodoWrite");
+    expect(invocation.args[invocation.args.indexOf("--allowedTools") + 2]).toBe("--");
     expect(serialized).not.toContain("Bash(");
     expect(config.claude_cli.delegate.allowed_tools).toContain("Bash(powershell:*)");
   });

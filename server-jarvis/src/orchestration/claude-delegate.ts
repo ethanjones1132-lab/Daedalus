@@ -203,6 +203,14 @@ export interface ClaudeDelegateInvocation {
   timeoutMs: number;
 }
 
+/** Claude Code 2.1.88 rejects Jarvis run/session identifiers such as `run_*`. */
+function stockClaudeSessionId(sessionId: string): string {
+  const value = sessionId.trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
+    ? value
+    : crypto.randomUUID();
+}
+
 export function buildClaudeDelegateInvocation(
   input: BuildClaudeDelegateInvocationInput,
 ): ClaudeDelegateInvocation {
@@ -216,7 +224,7 @@ export function buildClaudeDelegateInvocation(
     "--verbose",
     "--include-partial-messages",
     "--permission-mode", delegate.permission_mode,
-    "--session-id", input.sessionId,
+    "--session-id", stockClaudeSessionId(input.sessionId),
     "--no-session-persistence",
   ];
   if (delegate.model.trim()) args.push("--model", delegate.model.trim());
@@ -225,7 +233,11 @@ export function buildClaudeDelegateInvocation(
   // --allowedTools only controls auto-approval. --tools is the actual
   // availability boundary that prevents Bash/Task from escaping P0 roots.
   args.push("--tools", rootConfinableTools.join(","));
-  if (rootConfinableTools.length > 0) args.push("--allowedTools", rootConfinableTools.join(","));
+  if (rootConfinableTools.length > 0) {
+    // Claude 2.1.88 parses --allowedTools as variadic. Terminate its values so
+    // prepareClaudeCliInvocation's positional prompt is not swallowed as a tool.
+    args.push("--allowedTools", rootConfinableTools.join(","), "--");
+  }
 
   const executable = input.executable ?? resolveClaudePath(input.config.claude_cli.path);
   const launchOptions = { authMode: input.config.claude_cli.auth_mode } as const;
