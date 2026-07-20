@@ -1224,15 +1224,19 @@ export class PipelineExecutor {
       const hasVerifiedWrite = delegated.toolCalls.some(
         (call) => WRITE_EFFECT_TOOLS.has(call.name) && !call.is_error,
       );
+      const cleanupUnconfirmed = delegated.errorCode === "delegate_cleanup_unconfirmed"
+        || delegated.toolCalls.some((call) => call.name === "delegate_cleanup" && call.is_error);
       // Filesystem evidence is ground truth. If a delegate mutates the
       // workspace and only then times out/cancels, falling back to native can
       // duplicate a non-idempotent write. A verified write therefore closes
       // the executor stage regardless of the process's later terminal status.
       const cancelled = delegated.terminalStatus === "cancelled";
-      const accepted = hasVerifiedWrite;
+      const accepted = hasVerifiedWrite && !cleanupUnconfirmed;
       const stageSucceeded = accepted && !cancelled;
-      const downgradeCode = delegated.errorCode
-        ?? (cancelled ? "delegate_aborted" : hasVerifiedWrite ? undefined : "delegate_no_write");
+      const downgradeCode = cleanupUnconfirmed
+        ? "delegate_cleanup_unconfirmed"
+        : delegated.errorCode
+          ?? (cancelled ? "delegate_aborted" : hasVerifiedWrite ? undefined : "delegate_no_write");
       this.collector.recordStageRun({
         id: stageId,
         agent_run_id: agentRunId,
@@ -1264,6 +1268,22 @@ export class PipelineExecutor {
       });
 
       toolCalls.push(...delegated.toolCalls);
+      if (cleanupUnconfirmed) {
+        const unsafeOutput: ExecutorStageOutput = {
+          ...delegated,
+          ok: false,
+          terminalStatus: "failed",
+          errorCode: "delegate_cleanup_unconfirmed",
+          toolCalls,
+        };
+        onStateChange({
+          stage: "executor",
+          status: "failed",
+          output: delegated.narrative,
+          detail: "delegate_cleanup_unconfirmed",
+        });
+        return unsafeOutput;
+      }
       if (cancelled) {
         const cancelledOutput: ExecutorStageOutput = { ...delegated, toolCalls };
         onStateChange({
@@ -2808,6 +2828,9 @@ export class PipelineExecutor {
           request, renderPlanSummary(state.plan), agentRunId, onStateChange, executorOptions, profile, remainingNow(),
         );
         if (state.executor.terminalStatus === "cancelled") {
+          return { state, partialStage };
+        }
+        if (state.executor.errorCode === "delegate_cleanup_unconfirmed") {
           return { state, partialStage };
         }
         if (state.executor.errorCode === "effect_gate_no_write_effect") {

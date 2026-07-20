@@ -6,6 +6,11 @@ import { PipelineExecutor } from "./pipeline";
 import { runPipelineWithReplanning } from "./replan-loop";
 import { Coordinator, type CoordinatorResult } from "./coordinator";
 import { SessionOutcomeCollector, SelfTuningStore } from "../self-tuning/mod";
+import {
+  DelegateHealth,
+  runClaudeDelegate,
+  type DelegateRootSnapshot,
+} from "./claude-delegate";
 
 function verifiedDelegateOutput(): ExecutorStageOutput {
   return {
@@ -148,6 +153,337 @@ describe("executor delegate pipeline integration", () => {
       terminalStatus: "completed",
     });
   });
+
+  test("real delegate core verifies a write after timeout and pipeline never enters native fallback", async () => {
+    const config = defaultConfig();
+    const root = process.cwd();
+    const claimedPath = `${root}\\claimed.ts`.toLowerCase();
+    config.jarvis_path = root;
+    config.claude_cli.delegate.policy = "delegate_first";
+    const ctx = makeExecutionContext("agent", config, {
+      session_id: "session-real-core-write-timeout",
+      workspace_path: config.jarvis_path,
+    });
+    const before: DelegateRootSnapshot = {
+      root,
+      kind: "git",
+      status: "",
+      diffStat: "",
+      fingerprint: "before",
+      files: { [claimedPath]: "100:10" },
+    };
+    const after: DelegateRootSnapshot = {
+      ...before,
+      status: " M claimed.ts",
+      diffStat: " claimed.ts | 2 ++",
+      fingerprint: "after",
+      files: { [claimedPath]: "200:12" },
+    };
+    let captures = 0;
+    let nativeCalls = 0;
+    let finish!: (exit: { code: number | null; signal: string | null }) => void;
+    const exit = new Promise<{ code: number | null; signal: string | null }>((resolve) => { finish = resolve; });
+    const health = new DelegateHealth();
+    const snapshotFactory = {
+      capture: async () => {
+        captures += 1;
+        return captures === 1 ? [before] : [after];
+      },
+    };
+    const processFactory = async () => ({
+      events: (async function* () {
+        yield { type: "assistant", message: { content: [{
+          type: "tool_use", id: "write-1", name: "Write", input: { file_path: "claimed.ts" },
+        }] } };
+        yield { type: "user", message: { content: [{
+          type: "tool_result", tool_use_id: "write-1", content: "claimed write",
+        }] } };
+        await new Promise(() => {});
+      })(),
+      exit,
+      kill: (signal?: NodeJS.Signals) => {
+        if (signal === "SIGKILL") finish({ code: null, signal });
+      },
+    });
+    const executor = new PipelineExecutor(
+      async () => {
+        nativeCalls += 1;
+        return { content: "native must not duplicate the verified write", tool_calls: [] };
+      },
+      createToolRuntime(),
+      ctx,
+      { recordStageRun: () => {} },
+      {
+        availability: { isAvailable: async () => true },
+        health,
+        run: (input) => runClaudeDelegate({
+          ...input,
+          health,
+          snapshotFactory,
+          processFactory,
+          terminationGraceMs: 1,
+          cleanupTimeoutMs: 20,
+          verificationTimeoutMs: 30,
+        }),
+      },
+    );
+
+    const segment = await executor.executeSegment(
+      "Change claimed.ts",
+      ["executor"],
+      "run-real-core-write-timeout",
+      () => {},
+      {
+        executionProfile: "full",
+        rawMessage: "Change claimed.ts",
+        turnRequirement: "full_execution",
+        turnBudget: {
+          stageRemainingMs: () => 15,
+          extendStageOnProgress: () => 0,
+        } as any,
+      },
+    );
+
+    expect(captures).toBe(2);
+    expect(nativeCalls).toBe(0);
+    expect(segment.state.executor).toMatchObject({ ok: true, terminalStatus: "completed" });
+    expect(segment.state.executor?.toolCalls).toContainEqual(expect.objectContaining({
+      name: "write_file",
+      is_error: false,
+    }));
+  }, 250);
+
+  test("unconfirmed delegate cleanup after a claimed write is terminal and never launches native", async () => {
+    const config = defaultConfig();
+    const root = process.cwd();
+    const claimedPath = `${root}\\claimed.ts`.toLowerCase();
+    config.jarvis_path = root;
+    config.claude_cli.delegate.policy = "delegate_first";
+    const ctx = makeExecutionContext("agent", config, {
+      session_id: "session-unsafe-cleanup",
+      workspace_path: root,
+    });
+    const snapshot: DelegateRootSnapshot = {
+      root, kind: "git", status: "", diffStat: "", fingerprint: "before",
+      files: { [claimedPath]: "100:10" },
+    };
+    let nativeCalls = 0;
+    const health = new DelegateHealth();
+    const executor = new PipelineExecutor(
+      async () => {
+        nativeCalls += 1;
+        return { content: "native must not run while delegate process state is unsafe", tool_calls: [] };
+      },
+      createToolRuntime(),
+      ctx,
+      { recordStageRun: () => {} },
+      {
+        availability: { isAvailable: async () => true },
+        health,
+        run: (input) => runClaudeDelegate({
+          ...input,
+          health,
+          terminationGraceMs: 1,
+          cleanupTimeoutMs: 10,
+          verificationTimeoutMs: 30,
+          treeKiller: { signalTree: async () => {} },
+          snapshotFactory: { capture: async () => [snapshot] },
+          processFactory: async () => ({
+            events: (async function* () {
+              yield { type: "assistant", message: { content: [{
+                type: "tool_use", id: "write-1", name: "Write", input: { file_path: "claimed.ts" },
+              }] } };
+              yield { type: "user", message: { content: [{
+                type: "tool_result", tool_use_id: "write-1", content: "claimed write",
+              }] } };
+              await new Promise(() => {});
+            })(),
+            exit: new Promise(() => {}),
+            kill: () => {},
+          }),
+        }),
+      },
+    );
+
+    const segment = await executor.executeSegment(
+      "Change claimed.ts",
+      ["executor", "reviewer", "synthesizer"],
+      "run-unsafe-cleanup",
+      () => {},
+      {
+        executionProfile: "full",
+        rawMessage: "Change claimed.ts",
+        turnRequirement: "full_execution",
+        maxReviewRepairRounds: 0,
+        turnBudget: {
+          stageRemainingMs: () => 15,
+          extendStageOnProgress: () => 0,
+        } as any,
+      },
+    );
+
+    expect(nativeCalls).toBe(0);
+    expect(segment.state.executor).toMatchObject({
+      ok: false,
+      terminalStatus: "failed",
+      errorCode: "delegate_cleanup_unconfirmed",
+    });
+    expect(health.snapshot().lastReason).toBe("termination_unconfirmed");
+  }, 300);
+
+  test("late-factory cleanup uncertainty is terminal across the full replan wrapper", async () => {
+    const config = defaultConfig();
+    const root = process.cwd();
+    config.jarvis_path = root;
+    config.claude_cli.delegate.policy = "delegate_first";
+    const ctx = makeExecutionContext("agent", config, {
+      session_id: "session-late-factory-unsafe",
+      workspace_path: root,
+    });
+    const snapshot: DelegateRootSnapshot = {
+      root, kind: "git", status: "", diffStat: "", fingerprint: "before", files: {},
+    };
+    let modelCalls = 0;
+    let replanCalls = 0;
+    const health = new DelegateHealth();
+    const executor = new PipelineExecutor(
+      async () => {
+        modelCalls += 1;
+        return { content: "no native or downstream model may run", tool_calls: [] };
+      },
+      createToolRuntime(),
+      ctx,
+      { recordStageRun: () => {} },
+      {
+        availability: { isAvailable: async () => true },
+        health,
+        run: (input) => runClaudeDelegate({
+          ...input,
+          health,
+          terminationGraceMs: 1,
+          cleanupTimeoutMs: 10,
+          snapshotFactory: { capture: async () => [snapshot] },
+          processFactory: async () => new Promise(() => {}),
+        }),
+      },
+    );
+    const coordinator = new Coordinator(async () => ({ content: "unused" }));
+    coordinator.route = async () => {
+      replanCalls += 1;
+      throw new Error("unsafe cleanup must not replan");
+    };
+    const initialDecision: CoordinatorResult = {
+      task_type: "debug",
+      pipeline: ["executor", "reviewer", "synthesizer"],
+      topology: "linear",
+      context: { needs_workspace_inspection: true, needs_memory: false, estimated_complexity: "medium" },
+      coordinator_rationale: "Late factory cleanup fixture.",
+    };
+
+    const result = await runPipelineWithReplanning({
+      contextMessage: "Change claimed.ts",
+      initialDecision,
+      turnRequirement: "full_execution",
+      coordinator,
+      routeOptions: { sessionId: "session-late-factory-unsafe" },
+      executor,
+      agentRunId: "run-late-factory-unsafe",
+      onStateChange: () => {},
+      baseOptions: {
+        executionProfile: "full",
+        rawMessage: "Change claimed.ts",
+        turnRequirement: "full_execution",
+        maxReviewRepairRounds: 0,
+        turnBudget: {
+          stageRemainingMs: () => 5,
+          extendStageOnProgress: () => 0,
+          canStart: () => true,
+        } as any,
+      },
+      maxReplans: 1,
+    });
+
+    expect(modelCalls).toBe(0);
+    expect(replanCalls).toBe(0);
+    expect(result).toMatchObject({
+      outcome: "failed",
+      error_code: "delegate_cleanup_unconfirmed",
+    });
+  }, 300);
+
+  test("aborted late-factory cleanup uncertainty is failed rather than routine cancellation", async () => {
+    const config = defaultConfig();
+    const root = process.cwd();
+    config.jarvis_path = root;
+    config.claude_cli.delegate.policy = "delegate_first";
+    const ctx = makeExecutionContext("agent", config, {
+      session_id: "session-abort-late-factory-unsafe",
+      workspace_path: root,
+    });
+    const turnAbort = new AbortController();
+    const snapshot: DelegateRootSnapshot = {
+      root, kind: "git", status: "", diffStat: "", fingerprint: "before", files: {},
+    };
+    let modelCalls = 0;
+    const health = new DelegateHealth();
+    const executor = new PipelineExecutor(
+      async () => {
+        modelCalls += 1;
+        return { content: "downstream model must not run", tool_calls: [] };
+      },
+      createToolRuntime(),
+      ctx,
+      { recordStageRun: () => {} },
+      {
+        availability: { isAvailable: async () => true },
+        health,
+        run: (input) => runClaudeDelegate({
+          ...input,
+          health,
+          terminationGraceMs: 1,
+          cleanupTimeoutMs: 10,
+          snapshotFactory: { capture: async () => [snapshot] },
+          processFactory: async () => {
+            queueMicrotask(() => turnAbort.abort("user_stop"));
+            return new Promise(() => {});
+          },
+        }),
+      },
+    );
+    const coordinator = new Coordinator(async () => ({ content: "unused" }));
+    coordinator.route = async () => { throw new Error("unsafe cleanup must not replan"); };
+    const result = await runPipelineWithReplanning({
+      contextMessage: "Change claimed.ts",
+      initialDecision: {
+        task_type: "debug",
+        pipeline: ["executor", "reviewer", "synthesizer"],
+        topology: "linear",
+        context: { needs_workspace_inspection: true, needs_memory: false, estimated_complexity: "medium" },
+        coordinator_rationale: "Abort late factory fixture.",
+      },
+      turnRequirement: "full_execution",
+      coordinator,
+      routeOptions: { sessionId: "session-abort-late-factory-unsafe" },
+      executor,
+      agentRunId: "run-abort-late-factory-unsafe",
+      onStateChange: () => {},
+      baseOptions: {
+        executionProfile: "full",
+        rawMessage: "Change claimed.ts",
+        turnRequirement: "full_execution",
+        maxReviewRepairRounds: 0,
+        turnAbort: turnAbort.signal,
+      },
+      maxReplans: 1,
+    });
+
+    expect(modelCalls).toBe(0);
+    expect(result.cancelled).toBeUndefined();
+    expect(result).toMatchObject({
+      outcome: "failed",
+      error_code: "delegate_cleanup_unconfirmed",
+    });
+  }, 300);
 
   test("escalation invokes the delegate only after a native executor pass produces no write", async () => {
     const config = defaultConfig();

@@ -422,7 +422,175 @@ describe("Claude executor delegate", () => {
       arguments: { status: "terminated" },
       is_error: false,
     }));
-  }, 200);
+  }, 1_000);
+
+  test("verifies a claimed write after execution timeout using a separate bounded snapshot", async () => {
+    const config = defaultConfig();
+    const before: DelegateRootSnapshot = {
+      root: "C:\\repo",
+      kind: "git",
+      status: "",
+      diffStat: "",
+      fingerprint: "before",
+      files: { "c:\\repo\\claimed.ts": "100:10" },
+    };
+    const after: DelegateRootSnapshot = {
+      ...before,
+      status: " M claimed.ts",
+      diffStat: " claimed.ts | 2 ++",
+      fingerprint: "after",
+      files: { "c:\\repo\\claimed.ts": "200:12" },
+    };
+    let captures = 0;
+    let finish!: (exit: { code: number | null; signal: string | null }) => void;
+    const exit = new Promise<{ code: number | null; signal: string | null }>((resolve) => { finish = resolve; });
+    const output = await runClaudeDelegate({
+      config,
+      prompt: "change it",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 15,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      health: new DelegateHealth(),
+      terminationGraceMs: 1,
+      cleanupTimeoutMs: 20,
+      verificationTimeoutMs: 30,
+      snapshotFactory: {
+        capture: async () => {
+          captures += 1;
+          return captures === 1 ? [before] : [after];
+        },
+      },
+      processFactory: async () => ({
+        events: (async function* () {
+          yield { type: "assistant", message: { content: [{
+            type: "tool_use", id: "write-1", name: "Write", input: { file_path: "claimed.ts" },
+          }] } };
+          yield { type: "user", message: { content: [{
+            type: "tool_result", tool_use_id: "write-1", content: "claimed write",
+          }] } };
+          await new Promise(() => {});
+        })(),
+        exit,
+        kill: (signal) => {
+          if (signal === "SIGKILL") finish({ code: null, signal });
+        },
+      }),
+    });
+
+    expect(captures).toBe(2);
+    expect(output).toMatchObject({ ok: false, terminalStatus: "timed_out", errorCode: "delegate_timeout" });
+    expect(output.toolCalls).toContainEqual(expect.objectContaining({
+      name: "write_file",
+      is_error: false,
+    }));
+    expect(output.toolCalls.at(-1)).toMatchObject({ name: "git_metadata", is_error: false });
+  }, 250);
+
+  test("abort remains terminal after bounded verification of an already-claimed write", async () => {
+    const config = defaultConfig();
+    const controller = new AbortController();
+    const before: DelegateRootSnapshot = {
+      root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "before",
+      files: { "c:\\repo\\claimed.ts": "100:10" },
+    };
+    const after: DelegateRootSnapshot = {
+      ...before, fingerprint: "after", status: " M claimed.ts", diffStat: " claimed.ts | 1 +",
+      files: { "c:\\repo\\claimed.ts": "200:11" },
+    };
+    let captures = 0;
+    let finish!: (exit: { code: number | null; signal: string | null }) => void;
+    const exit = new Promise<{ code: number | null; signal: string | null }>((resolve) => { finish = resolve; });
+    const output = await runClaudeDelegate({
+      config,
+      prompt: "change it",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 1_000,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      health: new DelegateHealth(),
+      signal: controller.signal,
+      terminationGraceMs: 1,
+      cleanupTimeoutMs: 20,
+      verificationTimeoutMs: 30,
+      snapshotFactory: { capture: async () => (++captures === 1 ? [before] : [after]) },
+      processFactory: async () => ({
+        events: (async function* () {
+          yield { type: "assistant", message: { content: [{
+            type: "tool_use", id: "write-1", name: "Write", input: { file_path: "claimed.ts" },
+          }] } };
+          yield { type: "user", message: { content: [{
+            type: "tool_result", tool_use_id: "write-1", content: "claimed write",
+          }] } };
+          controller.abort("user_stop");
+          await new Promise(() => {});
+        })(),
+        exit,
+        kill: (signal) => { if (signal === "SIGKILL") finish({ code: null, signal }); },
+      }),
+    });
+
+    expect(captures).toBe(2);
+    expect(output).toMatchObject({ ok: false, terminalStatus: "cancelled", errorCode: "delegate_aborted" });
+    expect(output.toolCalls).toContainEqual(expect.objectContaining({ name: "write_file", is_error: false }));
+  }, 250);
+
+  test("unconfirmed cleanup makes a timed-out claimed write unsafe without post-run verification", async () => {
+    const config = defaultConfig();
+    const snapshot: DelegateRootSnapshot = {
+      root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "before",
+      files: { "c:\\repo\\claimed.ts": "100:10" },
+    };
+    const health = new DelegateHealth();
+    let captures = 0;
+    const started = Date.now();
+    const output = await runClaudeDelegate({
+      config,
+      prompt: "change it",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 15,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      health,
+      terminationGraceMs: 1,
+      cleanupTimeoutMs: 10,
+      verificationTimeoutMs: 30,
+      treeKiller: { signalTree: async () => {} },
+      snapshotFactory: { capture: async () => { captures += 1; return [snapshot]; } },
+      processFactory: async () => ({
+        events: (async function* () {
+          yield { type: "assistant", message: { content: [{
+            type: "tool_use", id: "write-1", name: "Write", input: { file_path: "claimed.ts" },
+          }] } };
+          yield { type: "user", message: { content: [{
+            type: "tool_result", tool_use_id: "write-1", content: "claimed write",
+          }] } };
+          await new Promise(() => {});
+        })(),
+        exit: new Promise(() => {}),
+        kill: () => {},
+      }),
+    });
+
+    expect(Date.now() - started).toBeLessThan(250);
+    expect(captures).toBe(1);
+    expect(output).toMatchObject({
+      ok: false,
+      terminalStatus: "failed",
+      errorCode: "delegate_cleanup_unconfirmed",
+    });
+    expect(output.toolCalls).toContainEqual(expect.objectContaining({
+      name: "write_file",
+      error_code: "delegate_write_unverified",
+    }));
+    expect(health.snapshot().lastReason).toBe("termination_unconfirmed");
+  }, 300);
 
   test("uses the injected tree killer for TERM then forced KILL so grandchildren cannot leak", async () => {
     const config = defaultConfig();
@@ -511,7 +679,7 @@ describe("Claude executor delegate", () => {
       ["/PID", "424242", "/T"],
       ["/PID", "424242", "/T", "/F"],
     ]);
-    expect(output).toMatchObject({ ok: false, terminalStatus: "timed_out", errorCode: "delegate_timeout" });
+    expect(output).toMatchObject({ ok: false, terminalStatus: "failed", errorCode: "delegate_cleanup_unconfirmed" });
     expect(output.toolCalls).toContainEqual(expect.objectContaining({
       name: "delegate_cleanup",
       arguments: { status: "signal_error" },
@@ -559,7 +727,7 @@ describe("Claude executor delegate", () => {
     });
 
     expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
-    expect(output).toMatchObject({ ok: false, terminalStatus: "timed_out", errorCode: "delegate_timeout" });
+    expect(output).toMatchObject({ ok: false, terminalStatus: "failed", errorCode: "delegate_cleanup_unconfirmed" });
     expect(output.toolCalls).toContainEqual(expect.objectContaining({
       name: "delegate_cleanup",
       arguments: { status: "signal_error" },
@@ -609,7 +777,7 @@ describe("Claude executor delegate", () => {
 
     expect(Date.now() - started).toBeLessThan(500);
     expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
-    expect(output).toMatchObject({ ok: false, terminalStatus: "timed_out", errorCode: "delegate_timeout" });
+    expect(output).toMatchObject({ ok: false, terminalStatus: "failed", errorCode: "delegate_cleanup_unconfirmed" });
     expect(output.toolCalls).toContainEqual(expect.objectContaining({
       name: "delegate_cleanup",
       is_error: true,
@@ -894,6 +1062,7 @@ describe("Claude executor delegate", () => {
       writeEffectRequired: true,
       nativeNoWrite: false,
       health: new DelegateHealth(),
+      verificationTimeoutMs: 25,
       snapshotFactory: {
         capture: async () => {
           captures += 1;

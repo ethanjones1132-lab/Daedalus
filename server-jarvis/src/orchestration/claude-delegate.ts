@@ -487,6 +487,8 @@ export interface RunClaudeDelegateInput {
   terminationGraceMs?: number;
   /** Hard wall-time cap for teardown, including TERM grace and post-KILL observation. */
   cleanupTimeoutMs?: number;
+  /** Independent post-termination filesystem verification cap. */
+  verificationTimeoutMs?: number;
   treeKiller?: DelegateProcessTreeKiller;
   /** Standard executor streaming hooks supplied by the pipeline adapter. */
   onTextDelta?: (text: string) => void;
@@ -662,6 +664,24 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, Math.max(0, ms)));
 }
 
+type BoundedVerificationResult<T> =
+  | { kind: "value"; value: T }
+  | { kind: "error"; error: unknown }
+  | { kind: "timeout" };
+
+async function boundedVerification<T>(promise: Promise<T>, timeoutMs: number): Promise<BoundedVerificationResult<T>> {
+  // Keep the capture promise observed even if the finite verification window
+  // wins, so a late filesystem error can never become an unhandled rejection.
+  const settled = promise.then<BoundedVerificationResult<T>, BoundedVerificationResult<T>>(
+    (value) => ({ kind: "value", value }),
+    (error) => ({ kind: "error", error }),
+  );
+  return Promise.race([
+    settled,
+    delay(timeoutMs).then((): BoundedVerificationResult<T> => ({ kind: "timeout" })),
+  ]);
+}
+
 type DelegateCleanupOutcome =
   | { status: "terminated"; detail: string }
   | { status: "exit_unconfirmed"; detail: string }
@@ -830,6 +850,15 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
   // Teardown is permitted to outlive the execution deadline, but never this
   // explicit finite wall-time cap.
   const cleanupTimeoutMs = Math.max(1, Math.min(requestedCleanupTimeoutMs, 30_000));
+  // Verification is deliberately independent of the execution deadline: a
+  // child may successfully mutate a file immediately before timing out. The
+  // this separate cap permits only a read-only ground-truth snapshot. The
+  // snapshot is admitted only after normal exit or confirmed cleanup provides
+  // a stable process boundary.
+  const requestedVerificationTimeoutMs = Number.isFinite(input.verificationTimeoutMs)
+    ? input.verificationTimeoutMs!
+    : 5_000;
+  const verificationTimeoutMs = Math.max(1, Math.min(requestedVerificationTimeoutMs, 30_000));
   const permittedStockTools = new Set(rootConfinableDelegateTools(input.config.claude_cli.delegate.allowed_tools));
   const terminalOutput = (
     kind: DelegateOperationTerminal,
@@ -981,9 +1010,22 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
     }
 
     const terminalBeforePostSnapshot = operation.state();
-    const afterResult: GuardedResult<DelegateRootSnapshot[]> = terminalBeforePostSnapshot
-      ? (terminalBeforePostSnapshot === "timeout" ? { kind: "timeout" } : { kind: "aborted" })
-      : await operation.race(input.snapshotFactory.capture(input.allowedRoots));
+    const hasClaimedWrite = records.some(
+      (record) => DELEGATE_WRITE_TOOLS.has(record.name) && record.error_code !== "policy_denied",
+    );
+    const cleanupUnconfirmed = records.some(
+      (record) => record.name === "delegate_cleanup" && record.is_error,
+    );
+    const afterResult: GuardedResult<DelegateRootSnapshot[]> = cleanupUnconfirmed
+      ? { kind: "error", error: new Error("Delegate process cleanup was not confirmed.") }
+      : hasClaimedWrite
+        ? await boundedVerification(
+            input.snapshotFactory.capture(input.allowedRoots),
+            verificationTimeoutMs,
+          )
+        : terminalBeforePostSnapshot
+          ? (terminalBeforePostSnapshot === "timeout" ? { kind: "timeout" } : { kind: "aborted" })
+          : await operation.race(input.snapshotFactory.capture(input.allowedRoots));
     const verificationAvailable = afterResult.kind === "value";
     const afterSnapshots = verificationAvailable ? afterResult.value : beforeSnapshots;
     const before = snapshotMap(beforeSnapshots);
@@ -1006,11 +1048,7 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
 
     const terminal = operation.state()
       ?? (afterResult.kind === "timeout" || afterResult.kind === "aborted" ? afterResult.kind : undefined);
-    if (terminal) {
-      if (unverifiedWrite) input.health.strike("unverified_write");
-      return terminalOutput(terminal, records, narrative.join(""));
-    }
-    if (records.some((record) => record.name === "delegate_cleanup" && record.is_error)) {
+    if (cleanupUnconfirmed) {
       input.health.strike("termination_unconfirmed");
       return {
         ok: false,
@@ -1019,6 +1057,10 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
         terminalStatus: "failed",
         errorCode: "delegate_cleanup_unconfirmed",
       };
+    }
+    if (terminal) {
+      if (unverifiedWrite) input.health.strike("unverified_write");
+      return terminalOutput(terminal, records, narrative.join(""));
     }
     if (afterResult.kind === "error") narrative.push(`Ground-truth verification failed: ${String(afterResult.error)}`);
     if (unverifiedWrite) {

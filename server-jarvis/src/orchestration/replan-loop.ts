@@ -316,6 +316,15 @@ function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean)
       toolCalls: segment.state.executor.toolCalls,
     };
   }
+  if (segment.state.executor?.errorCode === "delegate_cleanup_unconfirmed") {
+    return {
+      answer: "",
+      error: segment.state.executor.narrative || "Claude delegate cleanup could not be confirmed.",
+      outcome: "failed",
+      error_code: "delegate_cleanup_unconfirmed",
+      toolCalls: segment.state.executor.toolCalls,
+    };
+  }
   const upstreamDegraded = Boolean(
     (segment.state.plan && !segment.state.plan.ok) || (segment.state.executor && !segment.state.executor.ok),
   );
