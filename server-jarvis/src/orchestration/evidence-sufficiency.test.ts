@@ -344,6 +344,29 @@ describe("assessWorkspaceEvidence", () => {
     }
   });
 
+  test("POSIX backslash-relative and absolute granted-root aliases share one evidence key", () => {
+    const existing = new Set(["/grant/src/a.ts", "/grant/src/b.ts"]);
+    const a = assessWorkspaceEvidence(
+      [read("src\\a.ts"), read("/grant/src/a.ts"), read("/grant/src/b.ts")],
+      "comprehensively diagnose the architecture of this repo",
+      ["/workspace", "/grant"],
+      { platform: "linux", home: "/home/tester", exists: (path) => existing.has(path) },
+    );
+    expect(a.sufficient).toBe(false);
+    expect(a.contentReads).toBe(2);
+  });
+
+  test("POSIX home and absolute granted-root aliases share one evidence key", () => {
+    const a = assessWorkspaceEvidence(
+      [read("~/src/a.ts"), read("/home/tester/src/a.ts"), read("/home/tester/src/b.ts")],
+      "comprehensively diagnose the architecture of this repo",
+      ["/workspace", "/home/tester"],
+      { platform: "linux", home: "/home/tester", exists: () => true },
+    );
+    expect(a.sufficient).toBe(false);
+    expect(a.contentReads).toBe(2);
+  });
+
   test("manifests and overview files do not satisfy the deep-read source floor", () => {
     const a = assessWorkspaceEvidence(
       [

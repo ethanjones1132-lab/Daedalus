@@ -2,7 +2,7 @@ import { afterEach, describe, test, expect } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
 import { homedir, tmpdir } from "os";
 import { basename, join, resolve } from "path";
-import { expandHomePath, pathSegmentsEqual, resolveAllowedRoots, toWslPath, safePath } from "./fs-scope";
+import { expandHomePath, normalizePathInput, pathSegmentsEqual, resolveAllowedRoots, toWslPath, safePath } from "./fs-scope";
 import type { JarvisConfig } from "./config";
 
 const tempRoots: string[] = [];
@@ -45,6 +45,11 @@ describe("fs-scope", () => {
     expect(expandHomePath("~")).toBe(homedir());
     expect(expandHomePath("~/project")).toBe(join(homedir(), "project"));
     expect(expandHomePath("~\\project")).toBe(join(homedir(), "project"));
+  });
+
+  test("normalizePathInput deterministically applies POSIX separators and home expansion", () => {
+    expect(normalizePathInput("src\\a.ts", "linux", "/home/tester")).toBe("src/a.ts");
+    expect(normalizePathInput("~/src/a.ts", "linux", "/home/tester")).toBe("/home/tester/src/a.ts");
   });
 
   test("resolveAllowedRoots preserves deterministic order and deduplicates existing roots", () => {

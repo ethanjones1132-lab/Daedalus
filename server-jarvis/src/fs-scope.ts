@@ -2,7 +2,7 @@
 
 import { existsSync, statSync } from "fs";
 import { homedir } from "os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
+import { basename, dirname, isAbsolute, posix, relative, resolve, win32 } from "path";
 import type { JarvisConfig } from "./config";
 
 export interface SafePathOptions {
@@ -15,13 +15,18 @@ export function effectiveWorkspaceRoot(cfg: JarvisConfig): string {
   return cfg.jarvis_path || process.cwd();
 }
 
-/** Expand only a leading home token; embedded tildes remain literal. */
-export function expandHomePath(inputPath: string): string {
-  if (inputPath === "~") return homedir();
+function expandHomeToken(inputPath: string, platform: NodeJS.Platform, home: string): string {
+  const pathApi = platform === "win32" ? win32 : posix;
+  if (inputPath === "~") return home;
   if (/^~[\\/]/.test(inputPath)) {
-    return join(homedir(), inputPath.slice(2));
+    return pathApi.join(home, ...inputPath.slice(2).split(/[\\/]+/).filter(Boolean));
   }
   return inputPath;
+}
+
+/** Expand only a leading home token; embedded tildes remain literal. */
+export function expandHomePath(inputPath: string): string {
+  return expandHomeToken(inputPath, process.platform, homedir());
 }
 
 /**
@@ -47,9 +52,15 @@ export function toWslPath(inputPath: string): string {
   return normalized;
 }
 
-function platformPath(inputPath: string): string {
-  const expanded = expandHomePath(inputPath.trim());
-  return process.platform === "win32" ? expanded : toWslPath(expanded);
+/** Canonical user-path normalization shared by scope resolution and evidence accounting. */
+export function normalizePathInput(
+  inputPath: string,
+  platform: NodeJS.Platform = process.platform,
+  home: string = homedir(),
+): string {
+  const trimmed = inputPath.trim();
+  const expanded = expandHomeToken(trimmed, platform, home);
+  return platform === "win32" ? expanded : toWslPath(expanded);
 }
 
 function rootKey(path: string): string {
@@ -89,7 +100,7 @@ export function resolveAllowedRoots(
   const roots: string[] = [];
   for (const candidate of candidates) {
     if (!candidate?.trim()) continue;
-    const normalized = resolve(platformPath(candidate));
+    const normalized = resolve(normalizePathInput(candidate));
     const key = rootKey(normalized);
     if (seen.has(key) || !existingDirectory(normalized)) continue;
     seen.add(key);
@@ -129,7 +140,7 @@ export function safePath(
   workspaceOrOptions?: string | SafePathOptions,
 ): string {
   const options = optionsFrom(workspaceOrOptions);
-  const normalizedInput = platformPath(inputPath);
+  const normalizedInput = normalizePathInput(inputPath);
 
   if (cfg.tools.sandbox_mode === "off") return resolve(normalizedInput);
 
@@ -162,7 +173,7 @@ export function safePath(
     if (isContained(roots[0], fallback)) return fallback;
   }
 
-  const permissiveBase = roots[0] ?? resolve(platformPath(effectiveWorkspaceRoot(cfg)));
+  const permissiveBase = roots[0] ?? resolve(normalizePathInput(effectiveWorkspaceRoot(cfg)));
   const permissiveCandidate = resolve(permissiveBase, normalizedInput);
   if (cfg.tools.sandbox_mode === "permissive") {
     console.log(`[Sandbox] Permissive mode: allowing access to "${permissiveCandidate}" (outside allowed roots: ${roots.join(", ") || "none"})`);
