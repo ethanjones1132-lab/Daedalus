@@ -25,6 +25,12 @@
 import { ReasoningParser, type ReasoningEvent } from "./reasoning";
 import { VisibleAnswerStreamSanitizer } from "./text-tools";
 
+export const EFFECT_GATE_NO_WRITE_ERROR_CODE = "effect_gate_no_write_effect";
+
+export function isTerminalPipelineErrorCode(code: string | undefined): boolean {
+  return code === EFFECT_GATE_NO_WRITE_ERROR_CODE;
+}
+
 /** Writes a single pre-formatted SSE frame. Returns false if the client is gone. */
 export type StreamWriteFn = (frame: string) => Promise<boolean>;
 
@@ -198,6 +204,16 @@ export class StreamSession {
    * like a silent stall.
    */
   async finish(result: string, opts?: { isError?: boolean; subtype?: "success" | "error" | "partial"; code?: string }): Promise<void> {
+    // A terminal effect-gate fence may still carry planner/synthesizer prose
+    // in `result`. That text predates the verified no-write outcome and must
+    // never cross the public stream boundary as an answer.
+    if (isTerminalPipelineErrorCode(opts?.code)) {
+      await this.error(
+        "The requested write could not be completed because no write effect was produced.",
+        opts?.code,
+      );
+      return;
+    }
     if (!this.noteOutcome()) return;
     if (!this.terminalSent) {
       this.terminalSent = true;

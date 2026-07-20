@@ -80,7 +80,7 @@ import { registerStandardBundles } from "./bundles-registry";
 import { deprecatedSessionsPostResponse } from "./session-authority";
 import { searchWeb } from "./web-bundle";
 import { getSessionState, clearSessionState } from "./interactive-bundle";
-import { StreamSession, VisibleTextPipe } from "./stream-emitter";
+import { StreamSession, VisibleTextPipe, isTerminalPipelineErrorCode } from "./stream-emitter";
 import {
   createStreamLivenessTracker,
   createDisconnectAwareWrite,
@@ -3201,7 +3201,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // Truthful run outcome. An empty/degraded run must NOT be recorded as a
         // success — that poisons the self-tuning signal. `completed:1` only means
         // the run finished; `outcome` records whether it actually succeeded.
-        const trimmedAnswer = result.answer?.trim() || "";
+        const terminalPipelineFailure = isTerminalPipelineErrorCode(result.error_code);
+        // A no-write effect-gate failure is terminal. Any nonempty answer on
+        // that result predates the fence (typically planner prose), so it is
+        // neither retained as the run's final answer nor exposed over SSE.
+        const trimmedAnswer = terminalPipelineFailure ? "" : (result.answer?.trim() || "");
 
         // Cross-turn no-progress verdict (Task 1.3), computed BEFORE the
         // outcome is persisted: the incident's non-answer turns were recorded
@@ -3390,7 +3394,26 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           session_id: sessionId,
         })}\n\n`));
         await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "agent_run_id", agent_run_id: agentRunId, session_id: sessionId })}\n\n`));
-        if (result.error) {
+        if (terminalPipelineFailure) {
+          console.error(`[Jarvis Orchestrator] session=${sessionId} failed: ${result.error_code}`);
+          recordInference({
+            ts: Date.now(),
+            backend: backendForProvider(orchLastProvider, cfg.active_backend),
+            model: orchLastModel ?? (cfg.active_backend === "openrouter"
+              ? (cfg.openrouter.model ?? "openrouter/free")
+              : cfg.ollama.model),
+            ok: false,
+            latency_ms: duration,
+            tokens_in: turnMetrics.tokens_in,
+            tokens_out: turnMetrics.tokens_out,
+            fallback_used: orchFallbackEvents > 0,
+            retry_count: orchFallbackRetryCount,
+            fallback_model: orchLastFallbackModel,
+            error: result.error_code,
+          });
+          repetitionStore.recordOutcome(sessionId, message, result.error_code);
+          await session.finish("", { isError: true, code: result.error_code });
+        } else if (result.error) {
           // Turn-fatal failure (e.g. auth rejected on every stage): surface a
           // real error frame so the UI shows a banner instead of dropping the
           // failure text into the chat bubble as if it were an answer.

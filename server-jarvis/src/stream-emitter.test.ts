@@ -107,6 +107,53 @@ describe("VisibleTextPipe", () => {
 });
 
 describe("StreamSession terminal guarantee", () => {
+  test("terminal no-write pipeline failure emits a typed SSE error without stale answer text", async () => {
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+    const encoder = new TextEncoder();
+    const response = new Response(readable, {
+      headers: { "Content-Type": "text/event-stream" },
+    });
+    const pipelineResult = {
+      answer: "### Task 1: stale planner prose that must never reach the client",
+      error_code: "effect_gate_no_write_effect",
+    };
+    const session = new StreamSession({
+      sessionId: "s-effect-gate",
+      write: async (frame) => {
+        await writer.write(encoder.encode(frame));
+        return true;
+      },
+      isAborted: () => false,
+    });
+
+    const emission = (async () => {
+      await session.finish(pipelineResult.answer, {
+        isError: true,
+        code: pipelineResult.error_code,
+      });
+      await session.ensureTerminal();
+      await writer.close();
+    })();
+    const body = await response.text();
+    await emission;
+    const events = body
+      .split("\n\n")
+      .filter((frame) => frame.startsWith("data: "))
+      .map((frame) => JSON.parse(frame.slice("data: ".length)) as Record<string, any>);
+
+    expect(events.filter((event) => event.type === "error")).toEqual([
+      expect.objectContaining({
+        type: "error",
+        code: "effect_gate_no_write_effect",
+        session_id: "s-effect-gate",
+      }),
+    ]);
+    expect(events.some((event) => event.type === "result")).toBe(false);
+    expect(body).not.toContain(pipelineResult.answer);
+    expect(events.filter((event) => event.type === "message_stop")).toHaveLength(1);
+  });
+
   test("finish emits exactly one message_stop plus result and is idempotent", async () => {
     const rec = recorder();
     const session = new StreamSession({ sessionId: "s5", write: rec.write, isAborted: () => false });
