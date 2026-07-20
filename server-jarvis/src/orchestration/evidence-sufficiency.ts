@@ -43,7 +43,20 @@ const SOURCE_FILE_EXTENSIONS = new Set([
 const SHALLOW_EVIDENCE_TOOLS = new Set(["read_file", "grep", "git_metadata"]);
 const LISTING_TOOLS = new Set(["list_directory", "glob"]);
 
-const SHELL_TOOLS = new Set(["bash", "shell", "run_background_command"]);
+/**
+ * What KIND of work the turn requires, which decides WHICH evidence floor
+ * applies. A research turn cannot satisfy a workspace read floor and vice
+ * versa; before this distinction existed, only the workspace floor was ever
+ * applied and every other kind of turn scored zero.
+ */
+export type EvidenceTaskKind = "workspace" | "research" | "command" | "mixed";
+
+/** Successful fetches required when the turn also ran a search. */
+const RESEARCH_MIN_FETCHES = 2;
+/** Successful fetches required with no search to corroborate them. */
+const RESEARCH_MIN_FETCHES_WITHOUT_SEARCH = 3;
+
+const SHELL_TOOLS = new Set(["bash", "shell", "powershell", "run_background_command"]);
 const NETWORK_TOOLS = new Set(["web_fetch", "web_search"]);
 const WRITE_TOOLS = new Set(["write_file", "edit_file", "multi_edit", "apply_patch"]);
 
@@ -391,6 +404,7 @@ export function assessWorkspaceEvidence(
   request: string,
   workspaceRoot?: WorkspaceRoots,
   pathSemantics: EvidencePathSemantics = {},
+  taskKind: EvidenceTaskKind = "workspace",
 ): EvidenceAssessment {
   const calls = (toolCalls ?? []).filter(
     (c) => !c.is_error && c.output.trim().length > 0 && !isDuplicateToolDeflection(c),
@@ -398,6 +412,60 @@ export function assessWorkspaceEvidence(
   const listings = calls.filter((c) => LISTING_TOOLS.has(c.name)).length;
   const explicitScope = resolveWorkspaceReadScope(request, rootList(workspaceRoot)[0]);
   const deepRead = isDeepReadRequest(request);
+
+  // ── Task-kind floors ──
+  // A research turn that fetched three sources, and a command turn that ran a
+  // build, both used to score ZERO evidence: the floors only counted
+  // read_file/grep/listings. Such a turn was failed as ungrounded, which
+  // pushed the model back toward answering from memory — precisely the
+  // fabrication the floor exists to prevent.
+  //
+  // The fence itself is unchanged: these floors still require SUCCESSFUL
+  // result records, so a turn that called nothing (or whose calls all errored)
+  // remains insufficient.
+  const fetches = calls.filter((c) => c.name === "web_fetch").length;
+  const searches = calls.filter((c) => c.name === "web_search").length;
+  const executions = calls.filter((c) => SHELL_TOOLS.has(c.name)).length;
+
+  const researchSatisfied =
+    (fetches >= RESEARCH_MIN_FETCHES && searches >= 1) || fetches >= RESEARCH_MIN_FETCHES_WITHOUT_SEARCH;
+  const commandSatisfied = executions >= 1;
+
+  if (taskKind === "research") {
+    return {
+      sufficient: researchSatisfied,
+      contentReads: fetches,
+      listings,
+      deepRead: false,
+      reason: researchSatisfied
+        ? `research evidence satisfied: ${fetches} web_fetch, ${searches} web_search`
+        : `research request needs >=${RESEARCH_MIN_FETCHES} successful web_fetch plus a web_search (or >=${RESEARCH_MIN_FETCHES_WITHOUT_SEARCH} fetches); got ${fetches} fetch / ${searches} search`,
+    };
+  }
+
+  if (taskKind === "command") {
+    return {
+      sufficient: commandSatisfied,
+      contentReads: executions,
+      listings,
+      deepRead: false,
+      reason: commandSatisfied
+        ? `command evidence satisfied: ${executions} successful execution result(s)`
+        : "command request produced no successful shell execution result",
+    };
+  }
+
+  // `mixed` accepts network or execution evidence, and otherwise falls through
+  // to the workspace floors below unchanged.
+  if (taskKind === "mixed" && (researchSatisfied || commandSatisfied)) {
+    return {
+      sufficient: true,
+      contentReads: fetches + executions,
+      listings,
+      deepRead: false,
+      reason: `mixed evidence satisfied: ${fetches} web_fetch, ${searches} web_search, ${executions} execution(s)`,
+    };
+  }
 
   if (explicitScope) {
     const matched = new Set<string>();

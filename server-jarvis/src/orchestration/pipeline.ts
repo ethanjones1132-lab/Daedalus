@@ -1,5 +1,6 @@
 import { loadPrompt } from "./prompt-loader";
 import { defaultCapabilityIndex } from "../tool-capabilities-default";
+import { deriveEvidenceTaskKind } from "./turn-requirements";
 import { BUILTIN_MODES, executorTurnLimit, getToolsForMode } from "./modes";
 import { toolResultModelText, type ToolRuntime, type ExecutionContext } from "../tool-runtime";
 import type { CallModelFn, ChatMessage } from "./router";
@@ -1414,7 +1415,13 @@ export class PipelineExecutor {
       }
 
       const scopedCalls = toolCalls.slice(startIdx);
-      const assessment = assessWorkspaceEvidence(toolCalls, intentText, workspaceRoot);
+      const assessment = assessWorkspaceEvidence(
+        toolCalls,
+        intentText,
+        workspaceRoot,
+        {},
+        deriveEvidenceTaskKind(options.rawMessage ?? intentText),
+      );
       const ledger = scopedCalls
         .map((call) => `- ${call.name} ${JSON.stringify(call.arguments)}: ${call.is_error ? "FAILED" : "SUCCEEDED"}`)
         .join("\n");
@@ -1579,6 +1586,8 @@ export class PipelineExecutor {
           toolCalls,
           intentText,
           preflightRoot,
+          {},
+          deriveEvidenceTaskKind(options.rawMessage ?? intentText),
         );
         if (deepReadRequest && preflightAssessment.contentReads === 0) {
           const rootEntries = parseListingEntryNames(listOutput);
@@ -1797,6 +1806,8 @@ export class PipelineExecutor {
             toolCalls,
             intentText,
             this.evidenceRoots(options),
+            {},
+            deriveEvidenceTaskKind(options.rawMessage ?? intentText),
           );
           let workspaceEvidenceNudgeSentThisTurn = false;
           if (
@@ -1909,7 +1920,13 @@ export class PipelineExecutor {
       // the deep-read floor, read plan-named + listing-derived source files
       // without another replan cycle.
       if (requiresWorkspaceEvidence && deepReadRequest && executorDone) {
-        let floorAssessment = assessWorkspaceEvidence(toolCalls, intentText, this.evidenceRoots(options));
+        let floorAssessment = assessWorkspaceEvidence(
+          toolCalls,
+          intentText,
+          this.evidenceRoots(options),
+          {},
+          deriveEvidenceTaskKind(options.rawMessage ?? intentText),
+        );
         if (!floorAssessment.sufficient) {
           const already = alreadyReadSourceKeys(toolCalls, workspaceRoot);
           const listingCalls = toolCalls.filter(
@@ -1986,6 +2003,8 @@ export class PipelineExecutor {
         toolCalls,
         intentText,
         this.evidenceRoots(options),
+        {},
+        deriveEvidenceTaskKind(options.rawMessage ?? intentText),
       );
       if (repeatedWriteFailureReached) {
         const message = "Repeated write attempts failed; zero file mutations succeeded.";
@@ -2998,6 +3017,8 @@ export class PipelineExecutor {
       state.executor?.toolCalls,
       intentText,
       this.evidenceRoots(options),
+      {},
+      deriveEvidenceTaskKind(options.rawMessage ?? intentText),
     );
     if (requiresWorkspaceEvidence && !preSynthAssessment.sufficient) {
       const failure = evidenceFailure(preSynthAssessment);
@@ -3090,6 +3111,8 @@ export class PipelineExecutor {
       state.executor?.toolCalls,
       options.rawMessage ?? request,
       this.evidenceRoots(options),
+      {},
+      deriveEvidenceTaskKind(options.rawMessage ?? request),
     );
     if (requiresWorkspaceEvidence && !executeAssessment.sufficient) {
       const failure = evidenceFailure(executeAssessment);

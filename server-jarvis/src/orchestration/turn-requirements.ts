@@ -441,3 +441,32 @@ export function classifyTurnRequirements(message: string): TurnRequirementResult
 
   return { requirement: "answer_only", signals: signals.length ? signals : ["default_answer_only"] };
 }
+
+// ── Task kind derivation ──
+
+/** Research intent: the turn is about finding things out from the network. */
+const RESEARCH_MARKERS =
+  /\b(research|fact[- ]check|look\s+up|search\s+(?:the\s+)?(?:web|online|internet)|google|find\s+(?:out\s+)?(?:online|sources?)|cite\s+sources?|latest\s+news|according\s+to\s+the\s+web)\b/i;
+
+/** Command intent: the turn is about RUNNING something, not reading files. */
+const COMMAND_MARKERS =
+  /\b(run|execute|invoke|launch|build|compile|install|npm\s+\w+|bun\s+\w+|cargo\s+\w+|pytest|make\b|shell\s+command|command\s+line)\b/i;
+
+/**
+ * Decide WHICH evidence floor a turn should be held to.
+ *
+ * Deliberately conservative: `workspace` is the default and the only kind that
+ * demands file reads, so a misread here can loosen a floor but never invents
+ * evidence — every floor still requires successful result records.
+ */
+export function deriveEvidenceTaskKind(message: string): "workspace" | "research" | "command" | "mixed" {
+  const research = RESEARCH_MARKERS.test(message);
+  const command = COMMAND_MARKERS.test(message);
+  const workspace = hasWorkspaceSignal(message);
+
+  if (research && (workspace || command)) return "mixed";
+  if (command && workspace) return "mixed";
+  if (research) return "research";
+  if (command) return "command";
+  return "workspace";
+}
