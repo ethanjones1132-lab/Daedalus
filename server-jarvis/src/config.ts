@@ -464,11 +464,7 @@ export function defaultConfig(): JarvisConfig {
         permission_mode: "acceptEdits",
         allowed_tools: [
           "Read", "Edit", "Write", "MultiEdit", "Grep", "Glob",
-          "WebSearch", "WebFetch", "TodoWrite", "Task",
-          "Bash(git:*)",
-          "Bash(bun:*)",
-          "Bash(npm:*)",
-          "Bash(python:*)",
+          "WebSearch", "WebFetch", "TodoWrite",
         ],
         model: "",
         timeout_ms: 420_000,

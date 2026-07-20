@@ -272,11 +272,6 @@ fn default_delegate_allowed_tools() -> Vec<String> {
         "WebSearch".to_string(),
         "WebFetch".to_string(),
         "TodoWrite".to_string(),
-        "Task".to_string(),
-        "Bash(git:*)".to_string(),
-        "Bash(bun:*)".to_string(),
-        "Bash(npm:*)".to_string(),
-        "Bash(python:*)".to_string(),
     ]
 }
 

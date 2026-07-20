@@ -569,12 +569,7 @@ mod tests {
                 "Glob",
                 "WebSearch",
                 "WebFetch",
-                "TodoWrite",
-                "Task",
-                "Bash(git:*)",
-                "Bash(bun:*)",
-                "Bash(npm:*)",
-                "Bash(python:*)"
+                "TodoWrite"
             ])
         );
 

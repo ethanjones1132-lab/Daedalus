@@ -79,7 +79,8 @@ describe("Claude executor delegate", () => {
       "--no-session-persistence",
       "--model", "sonnet",
       "--add-dir", "D:\\extra",
-      "--allowedTools", "Read,Bash(git *)",
+      "--tools", "Read",
+      "--allowedTools", "Read",
       "make the change",
     ]);
     expect(invocation.args).not.toContain("--bare");
@@ -104,6 +105,25 @@ describe("Claude executor delegate", () => {
     expect(invocation.env.ANTHROPIC_API_KEY).toBe("ollama");
     expect(invocation.env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:19878");
     expect(invocation.timeoutMs).toBe(12_000);
+  });
+
+  test("default invocation exposes only root-confinable direct tools and strips configured shell auto-allows", () => {
+    const config = defaultConfig();
+    config.claude_cli.delegate.allowed_tools.push("Bash(powershell:*)");
+    const invocation = buildClaudeDelegateInvocation({
+      config,
+      prompt: "make the change",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\primary"],
+      stageRemainingMs: 12_000,
+      executable: "claude",
+      baseEnv: {},
+    });
+    const serialized = invocation.args.join(" ");
+
+    expect(serialized).toContain("--tools Read,Edit,Write,MultiEdit,Grep,Glob,WebSearch,WebFetch,TodoWrite");
+    expect(serialized).not.toContain("Bash(");
+    expect(config.claude_cli.delegate.allowed_tools).toContain("Bash(powershell:*)");
   });
 
   test("cools down for ten minutes after delegate integrity strikes", () => {
@@ -235,6 +255,81 @@ describe("Claude executor delegate", () => {
     expect(output.toolCalls.at(-1)?.output).toContain("claimed.ts | 2 ++");
   });
 
+  test("rejects an out-of-root Bash write as unverifiable policy evidence", async () => {
+    const config = defaultConfig();
+    config.claude_cli.delegate.allowed_tools.push("Bash(python:*)");
+    const snapshot: DelegateRootSnapshot = {
+      root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
+    };
+    const output = await runClaudeDelegate({
+      config,
+      prompt: "write outside",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 30_000,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      health: new DelegateHealth(),
+      snapshotFactory: { capture: async () => [snapshot] },
+      processFactory: async () => ({
+        events: (async function* () {
+          yield { type: "assistant", message: { content: [{
+            type: "tool_use",
+            id: "bash-1",
+            name: "Bash",
+            input: { command: "python -c write C:\\outside\\escape.txt" },
+          }] } };
+          yield { type: "user", message: { content: [{
+            type: "tool_result", tool_use_id: "bash-1", content: "wrote outside",
+          }] } };
+          yield { type: "result", result: "done" };
+        })(),
+        exit: Promise.resolve({ code: 0, signal: null }),
+        kill: () => {},
+      }),
+    });
+
+    expect(output).toMatchObject({ ok: false, errorCode: "delegate_tool_not_permitted" });
+    expect(output.toolCalls[0]).toMatchObject({ name: "bash", is_error: true, error_code: "policy_denied" });
+  });
+
+  test("rejects a safe stock tool event that was not enabled in delegate config", async () => {
+    const config = defaultConfig();
+    config.claude_cli.delegate.allowed_tools = ["Read"];
+    const snapshot: DelegateRootSnapshot = {
+      root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
+    };
+    const output = await runClaudeDelegate({
+      config,
+      prompt: "read only",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 30_000,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      health: new DelegateHealth(),
+      snapshotFactory: { capture: async () => [snapshot] },
+      processFactory: async () => ({
+        events: (async function* () {
+          yield { type: "assistant", message: { content: [{
+            type: "tool_use", id: "write-1", name: "Write", input: { file_path: "forged.ts" },
+          }] } };
+          yield { type: "user", message: { content: [{
+            type: "tool_result", tool_use_id: "write-1", content: "claimed write",
+          }] } };
+          yield { type: "result", result: "done" };
+        })(),
+        exit: Promise.resolve({ code: 0, signal: null }),
+        kill: () => {},
+      }),
+    });
+
+    expect(output).toMatchObject({ ok: false, errorCode: "delegate_tool_not_permitted" });
+    expect(output.toolCalls[0]).toMatchObject({ name: "write_file", is_error: true, error_code: "policy_denied" });
+  });
+
   test("terminates then kills a timed-out child and cools down when it produced zero writes", async () => {
     const config = defaultConfig();
     const kills: string[] = [];
@@ -247,6 +342,7 @@ describe("Claude executor delegate", () => {
       files: {},
     };
     const health = new DelegateHealth();
+    let captures = 0;
     let finish!: (exit: { code: number | null; signal: string | null }) => void;
     const exit = new Promise<{ code: number | null; signal: string | null }>((resolve) => { finish = resolve; });
     const output = await runClaudeDelegate({
@@ -260,7 +356,7 @@ describe("Claude executor delegate", () => {
       nativeNoWrite: false,
       health,
       terminationGraceMs: 5,
-      snapshotFactory: { capture: async () => [snapshot] },
+      snapshotFactory: { capture: async () => { captures += 1; return [snapshot]; } },
       processFactory: async () => ({
         events: { [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }) },
         exit,
@@ -274,7 +370,54 @@ describe("Claude executor delegate", () => {
     expect(output).toMatchObject({ ok: false, terminalStatus: "timed_out", errorCode: "delegate_timeout" });
     expect(kills).toEqual(["SIGTERM", "SIGKILL"]);
     expect(health.snapshot().lastReason).toBe("timeout_without_write");
+    expect(captures).toBe(1);
   }, 200);
+
+  test("uses the injected tree killer for TERM then forced KILL so grandchildren cannot leak", async () => {
+    const config = defaultConfig();
+    const snapshot: DelegateRootSnapshot = {
+      root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
+    };
+    const signals: string[] = [];
+    let parentAlive = true;
+    let grandchildAlive = true;
+    let finish!: (exit: { code: number | null; signal: string | null }) => void;
+    const exit = new Promise<{ code: number | null; signal: string | null }>((resolve) => { finish = resolve; });
+    const output = await runClaudeDelegate({
+      config,
+      prompt: "change it",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 5,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      health: new DelegateHealth(),
+      terminationGraceMs: 5,
+      snapshotFactory: { capture: async () => [snapshot] },
+      treeKiller: {
+        signalTree: async (_process, signal) => {
+          signals.push(signal);
+          if (signal === "SIGTERM") {
+            parentAlive = false;
+            finish({ code: null, signal });
+          } else {
+            grandchildAlive = false;
+          }
+        },
+      },
+      processFactory: async () => ({
+        events: { [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }) },
+        exit,
+        kill: () => { throw new Error("direct-child kill must not be used"); },
+      }),
+    });
+
+    expect(output.terminalStatus).toBe("timed_out");
+    expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(parentAlive).toBe(false);
+    expect(grandchildAlive).toBe(false);
+  });
 
   test("wires caller abort to child termination and returns cancelled output", async () => {
     const config = defaultConfig();
@@ -311,8 +454,208 @@ describe("Claude executor delegate", () => {
     const output = await outputPromise;
 
     expect(output).toMatchObject({ ok: false, terminalStatus: "cancelled", errorCode: "delegate_aborted" });
-    expect(kills).toEqual(["SIGTERM"]);
+    expect(kills).toEqual(["SIGTERM", "SIGKILL"]);
   });
+
+  test("abort during the pre-snapshot cancels the whole operation without launching a child", async () => {
+    const config = defaultConfig();
+    const controller = new AbortController();
+    const snapshot: DelegateRootSnapshot = {
+      root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
+    };
+    let launches = 0;
+    const outputPromise = runClaudeDelegate({
+      config,
+      prompt: "change it",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 100,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      health: new DelegateHealth(),
+      signal: controller.signal,
+      snapshotFactory: {
+        capture: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          return [snapshot];
+        },
+      },
+      processFactory: async () => {
+        launches += 1;
+        return {
+          events: (async function* () { yield { type: "result", result: "too late" }; })(),
+          exit: Promise.resolve({ code: 0, signal: null }),
+          kill: () => {},
+        };
+      },
+    });
+    setTimeout(() => controller.abort(), 1);
+    const output = await outputPromise;
+
+    expect(output).toMatchObject({ ok: false, terminalStatus: "cancelled", errorCode: "delegate_aborted" });
+    expect(launches).toBe(0);
+  });
+
+  test("an already-aborted operation starts neither snapshots nor child launch", async () => {
+    const config = defaultConfig();
+    const controller = new AbortController();
+    controller.abort();
+    let captures = 0;
+    let launches = 0;
+    const output = await runClaudeDelegate({
+      config,
+      prompt: "change it",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 100,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      health: new DelegateHealth(),
+      signal: controller.signal,
+      snapshotFactory: { capture: async () => { captures += 1; return []; } },
+      processFactory: async () => {
+        launches += 1;
+        throw new Error("must not launch");
+      },
+    });
+
+    expect(output).toMatchObject({ terminalStatus: "cancelled", errorCode: "delegate_aborted" });
+    expect(captures).toBe(0);
+    expect(launches).toBe(0);
+  });
+
+  test("deadline covers a non-cancellable delayed pre-snapshot and prevents launch", async () => {
+    const config = defaultConfig();
+    const snapshot: DelegateRootSnapshot = {
+      root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
+    };
+    let launches = 0;
+    const started = Date.now();
+    const output = await runClaudeDelegate({
+      config,
+      prompt: "change it",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 10,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      health: new DelegateHealth(),
+      snapshotFactory: {
+        capture: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 60));
+          return [snapshot];
+        },
+      },
+      processFactory: async () => {
+        launches += 1;
+        throw new Error("must not launch");
+      },
+    });
+
+    expect(output).toMatchObject({ terminalStatus: "timed_out", errorCode: "delegate_timeout" });
+    expect(launches).toBe(0);
+    expect(Date.now() - started).toBeLessThan(50);
+  });
+
+  test("deadline covers delayed process-factory launch and fences a late child", async () => {
+    const config = defaultConfig();
+    const snapshot: DelegateRootSnapshot = {
+      root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
+    };
+    const kills: string[] = [];
+    let resolveLaunch!: (process: {
+      events: AsyncIterable<unknown>;
+      exit: Promise<{ code: number | null; signal: string | null }>;
+      kill: (signal: "SIGTERM" | "SIGKILL") => void;
+    }) => void;
+    const launch = new Promise<{
+      events: AsyncIterable<unknown>;
+      exit: Promise<{ code: number | null; signal: string | null }>;
+      kill: (signal: "SIGTERM" | "SIGKILL") => void;
+    }>((resolve) => { resolveLaunch = resolve; });
+    const output = await runClaudeDelegate({
+      config,
+      prompt: "change it",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 10,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      health: new DelegateHealth(),
+      terminationGraceMs: 1,
+      snapshotFactory: { capture: async () => [snapshot] },
+      processFactory: async () => launch,
+    });
+    expect(output).toMatchObject({ terminalStatus: "timed_out", errorCode: "delegate_timeout" });
+
+    let finish!: (exit: { code: number | null; signal: string | null }) => void;
+    const exit = new Promise<{ code: number | null; signal: string | null }>((resolve) => { finish = resolve; });
+    resolveLaunch({
+      events: (async function* () {})(),
+      exit,
+      kill: (signal) => {
+        kills.push(signal);
+        if (signal === "SIGKILL") finish({ code: null, signal });
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(kills).toEqual(["SIGTERM", "SIGKILL"]);
+  });
+
+  test("deadline covers delayed post-snapshot and downgrades unverifiable writes", async () => {
+    const config = defaultConfig();
+    const snapshot: DelegateRootSnapshot = {
+      root: "C:\\repo",
+      kind: "git",
+      status: "",
+      diffStat: "",
+      fingerprint: "before",
+      files: { "c:\\repo\\claimed.ts": "100:10" },
+    };
+    let captures = 0;
+    const output = await runClaudeDelegate({
+      config,
+      prompt: "change it",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 100,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      health: new DelegateHealth(),
+      snapshotFactory: {
+        capture: async () => {
+          captures += 1;
+          if (captures > 1) await new Promise((resolve) => setTimeout(resolve, 150));
+          return [snapshot];
+        },
+      },
+      processFactory: async () => ({
+        events: (async function* () {
+          yield { type: "assistant", message: { content: [{
+            type: "tool_use", id: "write-1", name: "Write", input: { file_path: "claimed.ts" },
+          }] } };
+          yield { type: "user", message: { content: [{
+            type: "tool_result", tool_use_id: "write-1", content: "claimed write",
+          }] } };
+          yield { type: "result", result: "done" };
+        })(),
+        exit: Promise.resolve({ code: 0, signal: null }),
+        kill: () => {},
+      }),
+    });
+
+    expect(output).toMatchObject({ terminalStatus: "timed_out", errorCode: "delegate_timeout" });
+    expect(output.toolCalls[0]).toMatchObject({
+      name: "write_file", is_error: true, error_code: "delegate_write_unverified",
+    });
+    expect(output.toolCalls.at(-1)).toMatchObject({ name: "git_metadata", is_error: true });
+    expect(output.toolCalls.at(-1)?.output).toContain("verification unavailable");
+  }, 250);
 
   test("strikes health on spawn errors and clean no-event exits", async () => {
     const config = defaultConfig();

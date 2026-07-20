@@ -33,6 +33,19 @@ const DELEGATE_TOOL_NAMES: Record<string, string> = {
   task: "task",
 };
 
+const ROOT_CONFINABLE_CLAUDE_TOOLS = [
+  "Read", "Edit", "Write", "MultiEdit", "Grep", "Glob",
+  "WebSearch", "WebFetch", "TodoWrite",
+] as const;
+const ROOT_CONFINABLE_CLAUDE_TOOL_SET = new Set<string>(ROOT_CONFINABLE_CLAUDE_TOOLS);
+
+/** Unsafe/indirect configured entries remain stored but never reach stock CLI authority. */
+function rootConfinableDelegateTools(configured: string[]): string[] {
+  return configured.filter((name, index) =>
+    ROOT_CONFINABLE_CLAUDE_TOOL_SET.has(name) && configured.indexOf(name) === index,
+  );
+}
+
 export type DelegateHealthStrikeReason =
   | "spawn_error"
   | "no_event_exit"
@@ -150,9 +163,11 @@ export function buildClaudeDelegateInvocation(
   ];
   if (delegate.model.trim()) args.push("--model", delegate.model.trim());
   if (input.allowedRoots.length > 1) args.push("--add-dir", ...input.allowedRoots.slice(1));
-  if (delegate.allowed_tools.length > 0) {
-    args.push("--allowedTools", delegate.allowed_tools.join(","));
-  }
+  const rootConfinableTools = rootConfinableDelegateTools(delegate.allowed_tools);
+  // --allowedTools only controls auto-approval. --tools is the actual
+  // availability boundary that prevents Bash/Task from escaping P0 roots.
+  args.push("--tools", rootConfinableTools.join(","));
+  if (rootConfinableTools.length > 0) args.push("--allowedTools", rootConfinableTools.join(","));
 
   const executable = input.executable ?? resolveClaudePath(input.config.claude_cli.path);
   const launchOptions = { authMode: input.config.claude_cli.auth_mode } as const;
@@ -197,6 +212,8 @@ export interface DelegateProcessExit {
 }
 
 export interface DelegateProcess {
+  /** Native root PID of the spawned process tree, when available. */
+  pid?: number;
   events: AsyncIterable<unknown>;
   exit: Promise<DelegateProcessExit>;
   writeStdin?: (text: string) => void;
@@ -205,9 +222,15 @@ export interface DelegateProcess {
 
 export interface DelegateProcessLaunch extends ClaudeDelegateInvocation {
   prompt: string;
+  /** Operation-wide cancellation signal; factories should refuse new work once aborted. */
+  signal: AbortSignal;
 }
 
 export type DelegateProcessFactory = (launch: DelegateProcessLaunch) => Promise<DelegateProcess>;
+
+export interface DelegateProcessTreeKiller {
+  signalTree(process: DelegateProcess, signal: "SIGTERM" | "SIGKILL"): Promise<void>;
+}
 
 async function* readJsonLines(stream: NodeJS.ReadableStream): AsyncGenerator<unknown> {
   const lines = createInterface({ input: stream, crlfDelay: Infinity });
@@ -229,11 +252,15 @@ async function* readJsonLines(stream: NodeJS.ReadableStream): AsyncGenerator<unk
 
 /** Native process boundary used by Task 6; tests inject a deterministic factory. */
 export const nodeDelegateProcessFactory: DelegateProcessFactory = async (launch) => {
+  if (launch.signal.aborted) throw new Error("Claude delegate launch cancelled");
   const child = spawn(launch.executable, launch.args, {
     cwd: launch.cwd,
     env: launch.env,
     stdio: [launch.promptOnStdin ? "pipe" : "ignore", "pipe", "pipe"],
     windowsHide: true,
+    // A new Unix process group lets the tree killer address every descendant
+    // with a negative PID. Windows uses taskkill /T instead.
+    detached: process.platform !== "win32",
   });
   const exit = new Promise<DelegateProcessExit>((resolveExit) => {
     child.once("exit", (code, signal) => resolveExit({ code, signal }));
@@ -253,6 +280,7 @@ export const nodeDelegateProcessFactory: DelegateProcessFactory = async (launch)
   // never block on a full pipe while the caller waits for JSON events.
   child.stderr?.resume();
   return {
+    pid: child.pid,
     events: readJsonLines(stdout),
     exit,
     writeStdin: stdin ? (text) => stdin.end(text) : undefined,
@@ -272,6 +300,33 @@ function execFileText(executable: string, args: string[]): Promise<string> {
     });
   });
 }
+
+/** Platform tree signaling: taskkill /T on Windows, process-group kill on Unix. */
+export const platformDelegateProcessTreeKiller: DelegateProcessTreeKiller = {
+  async signalTree(childProcess, signal): Promise<void> {
+    const pid = childProcess.pid;
+    if (pid && process.platform === "win32") {
+      const args = ["/PID", String(pid), "/T"];
+      if (signal === "SIGKILL") args.push("/F");
+      try {
+        await execFileText("taskkill", args);
+      } catch {
+        // taskkill reports an error when the tree already exited; that is the
+        // desired terminal state and forced cleanup still proceeds safely.
+      }
+      return;
+    }
+    if (pid) {
+      try {
+        process.kill(-pid, signal);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+      return;
+    }
+    childProcess.kill(signal);
+  },
+};
 
 async function fileIdentity(path: string): Promise<string> {
   try {
@@ -361,6 +416,7 @@ export interface RunClaudeDelegateInput {
   baseEnv?: NodeJS.ProcessEnv;
   now?: () => number;
   terminationGraceMs?: number;
+  treeKiller?: DelegateProcessTreeKiller;
 }
 
 const DELEGATE_WRITE_TOOLS = new Set(["write_file", "edit_file", "multi_edit"]);
@@ -433,9 +489,11 @@ function writeVerified(
     : snapshotChanged(roots, before, after);
 }
 
-function gitMetadataRecord(snapshots: DelegateRootSnapshot[]): ToolCallRecord {
+function gitMetadataRecord(snapshots: DelegateRootSnapshot[], verified = true): ToolCallRecord {
   const gitSnapshots = snapshots.filter((snapshot) => snapshot.kind === "git");
-  const output = gitSnapshots.length > 0
+  const output = !verified
+    ? "Post-run ground-truth verification unavailable; no diffstat is verified."
+    : gitSnapshots.length > 0
     ? gitSnapshots.map((snapshot) => [
         `root: ${snapshot.root}`,
         "git status --porcelain:",
@@ -448,9 +506,72 @@ function gitMetadataRecord(snapshots: DelegateRootSnapshot[]): ToolCallRecord {
     name: "git_metadata",
     arguments: { roots: snapshots.map((snapshot) => snapshot.root) },
     output: prepareToolResultForContext(output, EXECUTOR_TOOL_RESULT_CONTEXT_CHARS).context,
-    is_error: false,
+    is_error: !verified,
     duration_ms: 0,
   };
+}
+
+type DelegateOperationTerminal = "timeout" | "aborted";
+type GuardedTerminal = { kind: "timeout" } | { kind: "aborted" };
+
+type GuardedResult<T> =
+  | { kind: "value"; value: T }
+  | { kind: "error"; error: unknown }
+  | GuardedTerminal;
+
+/** One cancellation/deadline state spanning snapshots, launch, stream, and verification. */
+class DelegateOperationGuard {
+  private terminal: DelegateOperationTerminal | undefined;
+  private readonly terminalPromise: Promise<GuardedTerminal>;
+  private resolveTerminal!: (result: GuardedTerminal) => void;
+  private readonly controller = new AbortController();
+  private readonly startedAt = Date.now();
+  private readonly timer: ReturnType<typeof setTimeout>;
+  private readonly abortListener: () => void;
+
+  constructor(private readonly externalSignal: AbortSignal | undefined, private readonly budgetMs: number) {
+    this.terminalPromise = new Promise((resolveTerminal) => { this.resolveTerminal = resolveTerminal; });
+    this.abortListener = () => this.stop("aborted");
+    externalSignal?.addEventListener("abort", this.abortListener, { once: true });
+    this.timer = setTimeout(() => this.stop("timeout"), Math.max(0, budgetMs));
+    if (externalSignal?.aborted) this.stop("aborted");
+  }
+
+  get signal(): AbortSignal {
+    return this.controller.signal;
+  }
+
+  state(): DelegateOperationTerminal | undefined {
+    return this.terminal;
+  }
+
+  remainingMs(): number {
+    return Math.max(0, this.budgetMs - (Date.now() - this.startedAt));
+  }
+
+  async race<T>(promise: Promise<T>): Promise<GuardedResult<T>> {
+    if (this.terminal) return this.terminal === "timeout" ? { kind: "timeout" } : { kind: "aborted" };
+    const settled = promise.then<GuardedResult<T>, GuardedResult<T>>(
+      (value) => ({ kind: "value", value }),
+      (error): GuardedResult<T> => ({ kind: "error", error }),
+    );
+    return Promise.race<GuardedResult<T>>([
+      settled,
+      this.terminalPromise,
+    ]);
+  }
+
+  dispose(): void {
+    clearTimeout(this.timer);
+    this.externalSignal?.removeEventListener("abort", this.abortListener);
+  }
+
+  private stop(kind: DelegateOperationTerminal): void {
+    if (this.terminal) return;
+    this.terminal = kind;
+    this.controller.abort(kind);
+    this.resolveTerminal(kind === "timeout" ? { kind: "timeout" } : { kind: "aborted" });
+  }
 }
 
 function delegateFailure(errorCode: string, narrative: string): ExecutorStageOutput {
@@ -467,17 +588,17 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, Math.max(0, ms)));
 }
 
-async function terminateDelegateProcess(process: DelegateProcess, graceMs: number): Promise<void> {
-  let exited = false;
-  const exitedPromise = process.exit.then(() => { exited = true; });
-  process.kill("SIGTERM");
-  await Promise.race([exitedPromise, delay(graceMs)]);
-  if (!exited) {
-    process.kill("SIGKILL");
-    // Do not return while a spawned child is still alive. Node's exit promise
-    // settles after SIGKILL; injected factories must uphold the same contract.
-    await exitedPromise;
-  }
+async function terminateDelegateProcess(
+  childProcess: DelegateProcess,
+  graceMs: number,
+  treeKiller: DelegateProcessTreeKiller,
+): Promise<void> {
+  await treeKiller.signalTree(childProcess, "SIGTERM");
+  await delay(graceMs);
+  // Always force-signal the whole tree after grace, even when the direct
+  // parent already exited: a grandchild may have ignored TERM and outlived it.
+  await treeKiller.signalTree(childProcess, "SIGKILL");
+  await childProcess.exit;
 }
 
 /**
@@ -496,208 +617,205 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
   if (!eligibility.eligible) {
     return delegateFailure(`delegate_ineligible_${eligibility.reason}`, "Claude delegate was not eligible.");
   }
-  if (input.signal?.aborted) {
+  const configuredTimeout = input.config.claude_cli.delegate.timeout_ms > 0
+    ? input.config.claude_cli.delegate.timeout_ms
+    : 420_000;
+  const operation = new DelegateOperationGuard(
+    input.signal,
+    Math.max(0, Math.min(input.stageRemainingMs, configuredTimeout, 420_000)),
+  );
+  const now = input.now ?? Date.now;
+  const treeKiller = input.treeKiller ?? platformDelegateProcessTreeKiller;
+  const permittedStockTools = new Set(rootConfinableDelegateTools(input.config.claude_cli.delegate.allowed_tools));
+  const terminalOutput = (
+    kind: DelegateOperationTerminal,
+    toolCalls: ToolCallRecord[] = [],
+    narrative = "",
+  ): ExecutorStageOutput => {
+    if (kind === "timeout" && !toolCalls.some((record) => DELEGATE_WRITE_TOOLS.has(record.name) && !record.is_error)) {
+      input.health.strike("timeout_without_write");
+    }
     return {
       ok: false,
-      narrative: "Claude delegate was cancelled before launch.",
-      toolCalls: [],
-      terminalStatus: "cancelled",
-      errorCode: "delegate_aborted",
+      narrative,
+      toolCalls,
+      terminalStatus: kind === "timeout" ? "timed_out" : "cancelled",
+      errorCode: kind === "timeout" ? "delegate_timeout" : "delegate_aborted",
     };
-  }
-  const now = input.now ?? Date.now;
-  const delegateStartedAt = now();
+  };
 
-  let beforeSnapshots: DelegateRootSnapshot[];
+  let invocation: ClaudeDelegateInvocation | undefined;
   try {
-    beforeSnapshots = await input.snapshotFactory.capture(input.allowedRoots);
-  } catch (error) {
-    return delegateFailure("delegate_snapshot_error", `Delegate ground-truth snapshot failed: ${String(error)}`);
-  }
+    if (operation.state()) return terminalOutput(operation.state()!);
+    const beforeResult = await operation.race(input.snapshotFactory.capture(input.allowedRoots));
+    if (beforeResult.kind === "timeout" || beforeResult.kind === "aborted") return terminalOutput(beforeResult.kind);
+    if (beforeResult.kind === "error") {
+      return delegateFailure("delegate_snapshot_error", `Delegate ground-truth snapshot failed: ${String(beforeResult.error)}`);
+    }
+    const beforeSnapshots = beforeResult.value;
 
-  let invocation: ClaudeDelegateInvocation;
-  try {
-    invocation = buildClaudeDelegateInvocation({
-      config: input.config,
-      prompt: input.prompt,
-      sessionId: input.sessionId,
-      allowedRoots: input.allowedRoots,
-      stageRemainingMs: Math.max(0, input.stageRemainingMs - (now() - delegateStartedAt)),
-      executable: input.executable,
-      baseEnv: input.baseEnv,
-    });
-  } catch (error) {
-    input.health.strike("spawn_error");
-    return delegateFailure("delegate_spawn_error", `Failed to prepare Claude delegate: ${String(error)}`);
-  }
-  let delegatedProcess: DelegateProcess;
-  try {
-    delegatedProcess = await input.processFactory({ ...invocation, prompt: input.prompt });
-  } catch (error) {
-    invocation.cleanup();
-    input.health.strike("spawn_error");
-    return delegateFailure("delegate_spawn_error", `Failed to spawn Claude delegate: ${String(error)}`);
-  }
-
-  if (invocation.promptOnStdin) delegatedProcess.writeStdin?.(input.prompt);
-
-  const records: ToolCallRecord[] = [];
-  const pending = new Map<string, { record: ToolCallRecord; startedAt: number }>();
-  const narrative: string[] = [];
-  const decodeState: ClaudeStreamDecodeState = { partialTextSeen: false };
-  let eventCount = 0;
-  const execution = (async (): Promise<
-    | { kind: "completed"; exit: DelegateProcessExit }
-    | { kind: "stream_error"; error: unknown }
-  > => {
+    if (operation.state()) return terminalOutput(operation.state()!);
     try {
-      for await (const rawEvent of delegatedProcess.events) {
-        const events = decodeClaudeCliMessage(rawEvent, decodeState);
-        eventCount += events.length;
-        for (const event of events) {
-          if (event.type === "stream_event" && event.delta?.text) {
-            narrative.push(event.delta.text);
-          } else if (event.type === "result" && event.content) {
-            narrative.push(event.content);
-          } else if (event.type === "tool_use") {
-            const record: ToolCallRecord = {
-              name: mapClaudeDelegateToolName(event.tool_name ?? "unknown"),
-              arguments: event.tool_input ?? {},
-              output: "",
-              is_error: false,
-              duration_ms: 0,
-            };
-            records.push(record);
-            pending.set(event.tool_use_id ?? `anonymous-${records.length}`, { record, startedAt: now() });
-          } else if (event.type === "tool_result") {
-            const match = event.tool_use_id ? pending.get(event.tool_use_id) : undefined;
-            if (match) {
-              match.record.output = prepareToolResultForContext(
-                event.tool_output ?? "",
-                EXECUTOR_TOOL_RESULT_CONTEXT_CHARS,
-              ).context;
-              match.record.is_error = event.is_error === true;
-              match.record.duration_ms = Math.max(0, now() - match.startedAt);
-              pending.delete(event.tool_use_id!);
+      invocation = buildClaudeDelegateInvocation({
+        config: input.config,
+        prompt: input.prompt,
+        sessionId: input.sessionId,
+        allowedRoots: input.allowedRoots,
+        stageRemainingMs: operation.remainingMs(),
+        executable: input.executable,
+        baseEnv: input.baseEnv,
+      });
+    } catch (error) {
+      input.health.strike("spawn_error");
+      return delegateFailure("delegate_spawn_error", `Failed to prepare Claude delegate: ${String(error)}`);
+    }
+
+    if (operation.state()) return terminalOutput(operation.state()!);
+    const launchPromise = input.processFactory({ ...invocation, prompt: input.prompt, signal: operation.signal });
+    const launchResult = await operation.race(launchPromise);
+    if (launchResult.kind === "timeout" || launchResult.kind === "aborted") {
+      // A non-cancellable factory may resolve after this method returns. Fence
+      // it to cleanup immediately and never continue into stream processing.
+      void launchPromise.then(
+        (lateProcess) => terminateDelegateProcess(lateProcess, input.terminationGraceMs ?? 10_000, treeKiller),
+        () => {},
+      );
+      return terminalOutput(launchResult.kind);
+    }
+    if (launchResult.kind === "error") {
+      input.health.strike("spawn_error");
+      return delegateFailure("delegate_spawn_error", `Failed to spawn Claude delegate: ${String(launchResult.error)}`);
+    }
+    const delegatedProcess = launchResult.value;
+    if (operation.state()) {
+      await terminateDelegateProcess(delegatedProcess, input.terminationGraceMs ?? 10_000, treeKiller);
+      return terminalOutput(operation.state()!);
+    }
+    if (invocation.promptOnStdin) delegatedProcess.writeStdin?.(input.prompt);
+
+    const records: ToolCallRecord[] = [];
+    const pending = new Map<string, { record: ToolCallRecord; startedAt: number }>();
+    const narrative: string[] = [];
+    const decodeState: ClaudeStreamDecodeState = { partialTextSeen: false };
+    let eventCount = 0;
+    let policyViolation = false;
+    const execution = (async (): Promise<
+      | { kind: "completed"; exit: DelegateProcessExit }
+      | { kind: "stream_error"; error: unknown }
+    > => {
+      try {
+        for await (const rawEvent of delegatedProcess.events) {
+          const events = decodeClaudeCliMessage(rawEvent, decodeState);
+          eventCount += events.length;
+          for (const event of events) {
+            if (event.type === "stream_event" && event.delta?.text) narrative.push(event.delta.text);
+            else if (event.type === "result" && event.content) narrative.push(event.content);
+            else if (event.type === "tool_use") {
+              const stockToolName = event.tool_name ?? "unknown";
+              const permitted = permittedStockTools.has(stockToolName);
+              const record: ToolCallRecord = {
+                name: mapClaudeDelegateToolName(stockToolName),
+                arguments: event.tool_input ?? {},
+                output: permitted ? "" : "delegate_tool_not_permitted: tool is outside the root-confinable delegate set.",
+                is_error: !permitted,
+                ...(!permitted ? { error_code: "policy_denied" as const } : {}),
+                duration_ms: 0,
+              };
+              if (!permitted) policyViolation = true;
+              records.push(record);
+              pending.set(event.tool_use_id ?? `anonymous-${records.length}`, { record, startedAt: now() });
+            } else if (event.type === "tool_result") {
+              const match = event.tool_use_id ? pending.get(event.tool_use_id) : undefined;
+              if (match) {
+                const resultOutput = event.tool_output ?? "";
+                match.record.output = prepareToolResultForContext(
+                  match.record.error_code === "policy_denied"
+                    ? `${match.record.output}\n\nRejected delegate output: ${resultOutput}`
+                    : resultOutput,
+                  EXECUTOR_TOOL_RESULT_CONTEXT_CHARS,
+                ).context;
+                if (match.record.error_code !== "policy_denied") match.record.is_error = event.is_error === true;
+                match.record.duration_ms = Math.max(0, now() - match.startedAt);
+                pending.delete(event.tool_use_id!);
+              }
             }
           }
         }
+        return { kind: "completed", exit: await delegatedProcess.exit };
+      } catch (error) {
+        return { kind: "stream_error", error };
       }
-      return { kind: "completed", exit: await delegatedProcess.exit };
-    } catch (error) {
-      return { kind: "stream_error", error };
+    })();
+
+    const executionResult = await operation.race(execution);
+    let streamOutcome: { kind: "completed"; exit: DelegateProcessExit } | { kind: "stream_error"; error: unknown };
+    if (executionResult.kind === "timeout" || executionResult.kind === "aborted") {
+      await terminateDelegateProcess(delegatedProcess, input.terminationGraceMs ?? 10_000, treeKiller);
+      streamOutcome = { kind: "stream_error", error: executionResult.kind };
+    } else if (executionResult.kind === "error") {
+      await terminateDelegateProcess(delegatedProcess, input.terminationGraceMs ?? 10_000, treeKiller);
+      streamOutcome = { kind: "stream_error", error: executionResult.error };
+    } else {
+      streamOutcome = executionResult.value;
+      if (streamOutcome.kind === "stream_error") {
+        await terminateDelegateProcess(delegatedProcess, input.terminationGraceMs ?? 10_000, treeKiller);
+      }
     }
-  })();
 
-  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<{ kind: "timeout" }>((resolveTimeout) => {
-    timeoutHandle = setTimeout(() => resolveTimeout({ kind: "timeout" }), invocation.timeoutMs);
-  });
-  let abortListener: (() => void) | undefined;
-  const aborted = new Promise<{ kind: "aborted" }>((resolveAbort) => {
-    abortListener = () => resolveAbort({ kind: "aborted" });
-    input.signal?.addEventListener("abort", abortListener, { once: true });
-  });
-  const outcome = await Promise.race([execution, timeout, aborted]);
-  if (timeoutHandle) clearTimeout(timeoutHandle);
-  if (abortListener) input.signal?.removeEventListener("abort", abortListener);
-  if (outcome.kind === "timeout" || outcome.kind === "aborted" || outcome.kind === "stream_error") {
-    await terminateDelegateProcess(delegatedProcess, input.terminationGraceMs ?? 10_000);
-  }
-  invocation.cleanup();
-
-  let afterSnapshots: DelegateRootSnapshot[];
-  try {
-    afterSnapshots = await input.snapshotFactory.capture(input.allowedRoots);
-  } catch (error) {
-    afterSnapshots = beforeSnapshots;
-    narrative.push(`Ground-truth verification failed: ${String(error)}`);
-  }
-  const before = snapshotMap(beforeSnapshots);
-  const after = snapshotMap(afterSnapshots);
-  let unverifiedWrite = false;
-  for (const record of records) {
-    if (!DELEGATE_WRITE_TOOLS.has(record.name)) continue;
-    if (!writeVerified(record, input.allowedRoots, before, after)) {
-      record.is_error = true;
-      record.error_code = "delegate_write_unverified";
-      const unverifiedOutput = record.output
-        ? `${record.output}\n\ndelegate_write_unverified: no matching filesystem change was observed.`
-        : "delegate_write_unverified: no matching filesystem change was observed.";
-      record.output = prepareToolResultForContext(
-        unverifiedOutput,
-        EXECUTOR_TOOL_RESULT_CONTEXT_CHARS,
-      ).context;
-      unverifiedWrite = true;
+    const terminalBeforePostSnapshot = operation.state();
+    const afterResult: GuardedResult<DelegateRootSnapshot[]> = terminalBeforePostSnapshot
+      ? (terminalBeforePostSnapshot === "timeout" ? { kind: "timeout" } : { kind: "aborted" })
+      : await operation.race(input.snapshotFactory.capture(input.allowedRoots));
+    const verificationAvailable = afterResult.kind === "value";
+    const afterSnapshots = verificationAvailable ? afterResult.value : beforeSnapshots;
+    const before = snapshotMap(beforeSnapshots);
+    const after = snapshotMap(afterSnapshots);
+    let unverifiedWrite = false;
+    for (const record of records) {
+      if (!DELEGATE_WRITE_TOOLS.has(record.name)) continue;
+      if (record.error_code === "policy_denied") continue;
+      if (!verificationAvailable || !writeVerified(record, input.allowedRoots, before, after)) {
+        record.is_error = true;
+        record.error_code = "delegate_write_unverified";
+        const unverifiedOutput = record.output
+          ? `${record.output}\n\ndelegate_write_unverified: no matching filesystem change was observed.`
+          : "delegate_write_unverified: no matching filesystem change was observed.";
+        record.output = prepareToolResultForContext(unverifiedOutput, EXECUTOR_TOOL_RESULT_CONTEXT_CHARS).context;
+        unverifiedWrite = true;
+      }
     }
-  }
-  records.push(gitMetadataRecord(afterSnapshots));
+    records.push(gitMetadataRecord(afterSnapshots, verificationAvailable));
 
-  if (unverifiedWrite) {
-    input.health.strike("unverified_write");
-    return {
-      ok: false,
-      narrative: narrative.join(""),
-      toolCalls: records,
-      terminalStatus: "failed",
-      errorCode: "delegate_write_unverified",
-    };
+    const terminal = operation.state()
+      ?? (afterResult.kind === "timeout" || afterResult.kind === "aborted" ? afterResult.kind : undefined);
+    if (terminal) {
+      if (unverifiedWrite) input.health.strike("unverified_write");
+      return terminalOutput(terminal, records, narrative.join(""));
+    }
+    if (afterResult.kind === "error") narrative.push(`Ground-truth verification failed: ${String(afterResult.error)}`);
+    if (unverifiedWrite) {
+      input.health.strike("unverified_write");
+      return { ok: false, narrative: narrative.join(""), toolCalls: records, terminalStatus: "failed", errorCode: "delegate_write_unverified" };
+    }
+    if (policyViolation) {
+      return { ok: false, narrative: narrative.join(""), toolCalls: records, terminalStatus: "failed", errorCode: "delegate_tool_not_permitted" };
+    }
+    if (streamOutcome.kind === "stream_error") {
+      return { ok: false, narrative: `Claude delegate stream failed: ${String(streamOutcome.error)}`, toolCalls: records, terminalStatus: "failed", errorCode: "delegate_stream_error" };
+    }
+    if (eventCount === 0) {
+      input.health.strike("no_event_exit");
+      return { ok: false, narrative: "Claude delegate exited without emitting stream events.", toolCalls: records, terminalStatus: "failed", errorCode: "delegate_no_events" };
+    }
+    if (streamOutcome.exit.code !== 0) {
+      return { ok: false, narrative: narrative.join(""), toolCalls: records, terminalStatus: "failed", errorCode: "delegate_exit_nonzero" };
+    }
+    input.health.markHealthy();
+    return { ok: true, narrative: narrative.join(""), toolCalls: records, terminalStatus: "completed" };
+  } finally {
+    invocation?.cleanup();
+    operation.dispose();
   }
-  const verifiedWrites = records.filter((record) => DELEGATE_WRITE_TOOLS.has(record.name) && !record.is_error);
-  if (outcome.kind === "timeout") {
-    if (verifiedWrites.length === 0) input.health.strike("timeout_without_write");
-    return {
-      ok: false,
-      narrative: narrative.join(""),
-      toolCalls: records,
-      terminalStatus: "timed_out",
-      errorCode: "delegate_timeout",
-    };
-  }
-  if (outcome.kind === "aborted") {
-    return {
-      ok: false,
-      narrative: narrative.join(""),
-      toolCalls: records,
-      terminalStatus: "cancelled",
-      errorCode: "delegate_aborted",
-    };
-  }
-  if (outcome.kind === "stream_error") {
-    return {
-      ok: false,
-      narrative: `Claude delegate stream failed: ${String(outcome.error)}`,
-      toolCalls: records,
-      terminalStatus: "failed",
-      errorCode: "delegate_stream_error",
-    };
-  }
-  if (eventCount === 0) {
-    input.health.strike("no_event_exit");
-    return {
-      ok: false,
-      narrative: "Claude delegate exited without emitting stream events.",
-      toolCalls: records,
-      terminalStatus: "failed",
-      errorCode: "delegate_no_events",
-    };
-  }
-  if (outcome.exit.code !== 0) {
-    return {
-      ok: false,
-      narrative: narrative.join(""),
-      toolCalls: records,
-      terminalStatus: "failed",
-      errorCode: "delegate_exit_nonzero",
-    };
-  }
-  input.health.markHealthy();
-  return {
-    ok: true,
-    narrative: narrative.join(""),
-    toolCalls: records,
-    terminalStatus: "completed",
-  };
 }
 
 export type { ExecutionProfile };
