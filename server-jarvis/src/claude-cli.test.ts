@@ -3,12 +3,13 @@ import {
   buildLocalClaudeArgs,
   buildLocalClaudeEnv,
   compactTurnHistoryForCli,
+  decodeClaudeCliMessage,
   estimateCommandLineLength,
   prepareClaudeCliInvocation,
 } from "./claude-cli";
 
 describe("Claude CLI local-only launch contract", () => {
-  test("replaces inherited Anthropic and Claude credentials with local proxy settings", () => {
+  test("proxy mode replaces inherited Anthropic and Claude credentials with local proxy settings", () => {
     const env = buildLocalClaudeEnv({
       PATH: "/usr/bin",
       HOME: "/home/tester",
@@ -18,7 +19,7 @@ describe("Claude CLI local-only launch contract", () => {
       CLAUDE_CODE_OAUTH_TOKEN: "real-oauth-token",
       CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR: "4",
       CLAUDE_CONFIG_DIR: "/home/tester/.claude",
-    });
+    }, { authMode: "proxy" });
 
     expect(env.PATH).toBe("/usr/bin");
     expect(env.HOME).toBe("/home/tester");
@@ -32,19 +33,46 @@ describe("Claude CLI local-only launch contract", () => {
     expect(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe("1");
   });
 
-  test("adds hermetic Claude flags and strips retired CLI flags", () => {
-    expect(buildLocalClaudeArgs(["--print"])).toEqual(["--bare", "--print"]);
-    expect(buildLocalClaudeArgs(["--bare", "--print", "--no-telemetry"])).toEqual([
+  test("subscription mode preserves credentials without proxy overrides", () => {
+    const env = buildLocalClaudeEnv({
+      PATH: "/usr/bin",
+      ANTHROPIC_API_KEY: "subscription-api-key",
+      ANTHROPIC_AUTH_TOKEN: "subscription-auth-token",
+      ANTHROPIC_BASE_URL: "https://api.anthropic.com",
+      CLAUDE_CODE_OAUTH_TOKEN: "oauth-token",
+      CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR: "4",
+      CLAUDE_CONFIG_DIR: "/home/tester/.claude",
+    }, { authMode: "subscription" });
+
+    expect(env.ANTHROPIC_API_KEY).toBe("subscription-api-key");
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe("subscription-auth-token");
+    expect(env.ANTHROPIC_BASE_URL).toBe("https://api.anthropic.com");
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("oauth-token");
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR).toBe("4");
+    expect(env.CLAUDE_CONFIG_DIR).toBe("/home/tester/.claude");
+    expect(env.CLAUDE_CODE_SIMPLE).toBeUndefined();
+  });
+
+  test("proxy args add bare and strip only the retired telemetry flag", () => {
+    expect(buildLocalClaudeArgs(["--print"], { authMode: "proxy" })).toEqual(["--bare", "--print"]);
+    expect(buildLocalClaudeArgs(["--bare", "--print", "--no-telemetry"], { authMode: "proxy" })).toEqual([
       "--bare",
       "--print",
     ]);
   });
 
-  test("prepareClaudeCliInvocation moves large append-system-prompt to a file on Windows", () => {
+  test("subscription args preserve caller flags without adding bare", () => {
+    expect(buildLocalClaudeArgs(["--bare", "--print", "--model", "sonnet", "--no-telemetry"], {
+      authMode: "subscription",
+    })).toEqual(["--print", "--model", "sonnet"]);
+  });
+
+  test("prepareClaudeCliInvocation never emits unsupported prompt-file flags", () => {
     const longSystem = "x".repeat(2000);
     const inv = prepareClaudeCliInvocation("claude.exe", ["--print", "--append-system-prompt", longSystem], "hi");
-    expect(inv.args).not.toContain(longSystem);
-    expect(inv.args).toContain("--append-system-prompt-file");
+    expect(inv.args).toContain(longSystem);
+    expect(inv.args).not.toContain("--append-system-prompt-file");
+    expect(inv.args).not.toContain("--system-prompt-file");
     inv.cleanup();
   });
 
@@ -62,5 +90,112 @@ describe("Claude CLI local-only launch contract", () => {
   test("estimateCommandLineLength accounts for quoting", () => {
     const len = estimateCommandLineLength("claude.exe", ["--print", "hello world"]);
     expect(len).toBeGreaterThan(20);
+  });
+});
+
+describe("Claude CLI stream-json decoder", () => {
+  test("decodes stock system, assistant, user, stream_event, and result records", () => {
+    expect(decodeClaudeCliMessage({
+      type: "system",
+      subtype: "init",
+      session_id: "stock-session",
+      tools: ["Read", "Bash"],
+      model: "claude-sonnet-4-6",
+    })).toEqual([{
+      type: "init",
+      session_id: "stock-session",
+      tools: ["Read", "Bash"],
+      model: "claude-sonnet-4-6",
+    }]);
+
+    expect(decodeClaudeCliMessage({
+      type: "assistant",
+      session_id: "stock-session",
+      message: {
+        content: [
+          { type: "text", text: "I will inspect it." },
+          { type: "tool_use", id: "toolu_123", name: "Read", input: { file_path: "README.md" } },
+        ],
+      },
+    })).toEqual([
+      { type: "stream_event", delta: { text: "I will inspect it." }, session_id: "stock-session" },
+      {
+        type: "tool_use",
+        tool_use_id: "toolu_123",
+        tool_name: "Read",
+        tool_input: { file_path: "README.md" },
+        session_id: "stock-session",
+      },
+    ]);
+
+    expect(decodeClaudeCliMessage({
+      type: "user",
+      session_id: "stock-session",
+      message: {
+        content: [{ type: "tool_result", tool_use_id: "toolu_123", content: "contents", is_error: false }],
+      },
+    })).toEqual([{
+      type: "tool_result",
+      tool_use_id: "toolu_123",
+      tool_output: "contents",
+      is_error: false,
+      session_id: "stock-session",
+    }]);
+
+    expect(decodeClaudeCliMessage({
+      type: "stream_event",
+      session_id: "stock-session",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: "partial" } },
+    })).toEqual([{
+      type: "stream_event",
+      delta: { text: "partial" },
+      session_id: "stock-session",
+    }]);
+
+    expect(decodeClaudeCliMessage({
+      type: "result",
+      session_id: "stock-session",
+      result: "done",
+      usage: { input_tokens: 10, output_tokens: 5 },
+      total_cost_usd: 0.012,
+      num_turns: 2,
+    })).toEqual([{
+      type: "result",
+      content: "done",
+      session_id: "stock-session",
+      usage: { input_tokens: 10, output_tokens: 5 },
+      cost_usd: 0.012,
+      num_turns: 2,
+    }]);
+  });
+
+  test("preserves flat legacy assistant and tool event shapes", () => {
+    expect(decodeClaudeCliMessage({ type: "assistant", session_id: "legacy", content: "hello" })).toEqual([{
+      type: "stream_event",
+      delta: { text: "hello" },
+      session_id: "legacy",
+    }]);
+    expect(decodeClaudeCliMessage({
+      type: "tool_use",
+      session_id: "legacy",
+      tool_use: { id: "legacy-tool", name: "search_files", input: { pattern: "auth_mode" } },
+    })).toEqual([{
+      type: "tool_use",
+      tool_use_id: "legacy-tool",
+      tool_name: "search_files",
+      tool_input: { pattern: "auth_mode" },
+      session_id: "legacy",
+    }]);
+    expect(decodeClaudeCliMessage({
+      type: "tool_result",
+      session_id: "legacy",
+      tool_result: { tool_use_id: "legacy-tool", content: "match", is_error: true },
+    })).toEqual([{
+      type: "tool_result",
+      tool_use_id: "legacy-tool",
+      tool_output: "match",
+      is_error: true,
+      session_id: "legacy",
+    }]);
   });
 });

@@ -511,6 +511,35 @@ mod tests {
     }
 
     #[test]
+    fn claude_cli_auth_mode_defaults_for_legacy_settings_and_round_trips() {
+        let db = mem_db();
+        set_setting_value(
+            &db,
+            "claude_cli",
+            r#"{"enabled":true,"path":"claude","args":[],"timeout_ms":120000,"cwd":"","model":null}"#,
+        )
+        .expect("legacy Claude CLI settings should be accepted");
+
+        let legacy = load_jarvis_config(&db).expect("load legacy config");
+        let legacy_json =
+            serde_json::to_value(&legacy.claude_cli).expect("serialize legacy config");
+        assert_eq!(legacy_json["auth_mode"], "proxy");
+
+        set_setting_value(
+            &db,
+            "claude_cli",
+            r#"{"enabled":true,"path":"claude","args":[],"timeout_ms":120000,"cwd":"","model":null,"auth_mode":"subscription"}"#,
+        )
+        .expect("subscription Claude CLI settings should be accepted");
+        let subscription = load_jarvis_config(&db).expect("load subscription config");
+        persist_jarvis_config(&db, &subscription).expect("persist subscription config");
+        let round_trip = load_jarvis_config(&db).expect("reload subscription config");
+        let round_trip_json =
+            serde_json::to_value(round_trip.claude_cli).expect("serialize round trip");
+        assert_eq!(round_trip_json["auth_mode"], "subscription");
+    }
+
+    #[test]
     fn tool_root_settings_load_from_sqlite_and_persist_back_to_it() {
         let db = mem_db();
         set_setting_value(

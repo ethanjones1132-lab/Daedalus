@@ -5,8 +5,8 @@
 // and bridges it into the Jarvis SSE event stream.
 
 import { spawn, execSync } from "child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
-import { homedir, tmpdir } from "os";
+import { existsSync, mkdirSync } from "fs";
+import { homedir } from "os";
 import { join } from "path";
 import type { JarvisConfig } from "./config";
 
@@ -21,6 +21,12 @@ const CREDENTIAL_ENV_KEYS = new Set([
   "ANTHROPIC_API_KEY_FILE_DESCRIPTOR",
   "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
 ]);
+
+export type ClaudeCliAuthMode = "proxy" | "subscription";
+
+export interface ClaudeCliLaunchOptions {
+  authMode: ClaudeCliAuthMode;
+}
 
 // ── Path Resolution ──
 
@@ -50,7 +56,16 @@ export function resolveClaudePath(configPath: string): string {
   return configPath || "claude";
 }
 
-export function buildLocalClaudeEnv(baseEnv: NodeJS.ProcessEnv = process.env): Record<string, string> {
+export function buildLocalClaudeEnv(
+  baseEnv: NodeJS.ProcessEnv = process.env,
+  { authMode }: ClaudeCliLaunchOptions = { authMode: "proxy" },
+): Record<string, string> {
+  if (authMode === "subscription") {
+    return Object.fromEntries(
+      Object.entries(baseEnv).filter((entry): entry is [string, string] => entry[1] !== undefined),
+    );
+  }
+
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(baseEnv)) {
     if (value === undefined) continue;
@@ -78,9 +93,14 @@ export function buildLocalClaudeEnv(baseEnv: NodeJS.ProcessEnv = process.env): R
   };
 }
 
-export function buildLocalClaudeArgs(args: string[]): string[] {
-  const next = args.filter((arg) => arg !== "--no-telemetry");
-  if (!next.includes("--bare")) {
+export function buildLocalClaudeArgs(
+  args: string[],
+  { authMode }: ClaudeCliLaunchOptions = { authMode: "proxy" },
+): string[] {
+  const next = args.filter((arg) =>
+    arg !== "--no-telemetry" && (authMode === "proxy" || arg !== "--bare")
+  );
+  if (authMode === "proxy" && !next.includes("--bare")) {
     next.unshift("--bare");
   }
   return next;
@@ -127,33 +147,9 @@ export function prepareClaudeCliInvocation(
   cliArgs: string[],
   prompt: string,
 ): ClaudeCliInvocation {
-  const cleanupDirs: string[] = [];
-  const cleanup = () => {
-    for (const dir of cleanupDirs) {
-      try {
-        rmSync(dir, { recursive: true, force: true });
-      } catch {
-        /* best-effort */
-      }
-    }
-  };
+  const cleanup = () => {};
 
   const args = [...cliArgs];
-
-  const rewriteInlinePromptFlag = (inlineFlag: string, fileFlag: string) => {
-    const idx = args.indexOf(inlineFlag);
-    if (idx === -1 || idx >= args.length - 1) return;
-    const content = args[idx + 1];
-    if (!content || content.length < 512) return;
-    const dir = mkdtempSync(join(tmpdir(), "jarvis-cli-"));
-    const filePath = join(dir, "prompt.txt");
-    writeFileSync(filePath, content, "utf8");
-    cleanupDirs.push(dir);
-    args.splice(idx, 2, fileFlag, filePath);
-  };
-
-  rewriteInlinePromptFlag("--append-system-prompt", "--append-system-prompt-file");
-  rewriteInlinePromptFlag("--system-prompt", "--system-prompt-file");
 
   ensureStreamJsonVerbose(args);
 
@@ -204,30 +200,39 @@ export interface ClaudeCliRequest {
   prompt: string;
   session_id?: string;
   cwd?: string;
-  max_turns?: number;
   cliArgs?: string[];
 }
 
 export interface ClaudeCliMessage {
   type: string;
-  content?: string | Array<{ type?: string; text?: string }>;
-  delta?: { text: string };
+  subtype?: string;
+  content?: unknown;
+  message?: { content?: unknown };
+  event?: { delta?: { text?: string } };
+  delta?: { text?: string };
   result?: string;
   session_id?: string;
+  tools?: string[];
+  model?: string;
   usage?: { input_tokens: number; output_tokens: number };
-  tool_use?: { name: string; input: Record<string, unknown> };
-  tool_result?: { content: string; is_error?: boolean };
+  total_cost_usd?: number;
+  num_turns?: number;
+  tool_use?: { id?: string; tool_use_id?: string; name: string; input: Record<string, unknown> };
+  tool_result?: { tool_use_id?: string; content?: unknown; output?: unknown; is_error?: boolean };
   [key: string]: unknown;
 }
 
 // ── Check Availability ──
 
-export async function isClaudeCliAvailable(path: string): Promise<boolean> {
+export async function isClaudeCliAvailable(
+  path: string,
+  authMode: ClaudeCliAuthMode = "proxy",
+): Promise<boolean> {
   const resolved = resolveClaudePath(path);
   return new Promise((resolve) => {
     const proc = spawn(resolved, ["--version"], {
       timeout: 5000,
-      env: buildLocalClaudeEnv(),
+      env: buildLocalClaudeEnv(process.env, { authMode }),
     });
     proc.on("close", (code) => resolve(code === 0));
     proc.on("error", () => resolve(false));
@@ -242,10 +247,10 @@ export async function invokeClaudeCli(
 ): Promise<{ success: boolean; output: string; session_id?: string; error?: string; tokens_used?: number }> {
   const cliCfg = cfg.claude_cli;
 
-  const baseArgs = buildLocalClaudeArgs([...(cliCfg.args || [])]);
+  const launchOptions = { authMode: cliCfg.auth_mode };
+  const baseArgs = buildLocalClaudeArgs([...(cliCfg.args || [])], launchOptions);
   if (req.session_id) baseArgs.push("--resume", req.session_id);
   // Note: --cwd is not a valid Claude CLI flag; cwd is set via spawn options
-  if (req.max_turns) baseArgs.push("--max-turns", String(req.max_turns));
 
   const resolvedPath = resolveClaudePath(cliCfg.path);
   const { args, promptOnStdin, cleanup } = prepareClaudeCliInvocation(
@@ -257,7 +262,7 @@ export async function invokeClaudeCli(
   return new Promise((resolve) => {
     // Use localhost for Ollama — subprocess runs in WSL, same as Bun server
     const localOnlyEnv = {
-      ...buildLocalClaudeEnv(),
+      ...buildLocalClaudeEnv(process.env, launchOptions),
       CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: "1",
     };
 
@@ -327,11 +332,139 @@ export interface ClaudeStreamEvent {
   content?: string;
   delta?: { text: string };
   tool_name?: string;
+  tool_use_id?: string;
   tool_input?: Record<string, unknown>;
   tool_output?: string;
+  is_error?: boolean;
   session_id?: string;
+  tools?: string[];
+  model?: string;
   usage?: { input_tokens: number; output_tokens: number };
+  cost_usd?: number;
+  num_turns?: number;
   error?: string;
+}
+
+type ContentBlock = {
+  type?: string;
+  text?: string;
+  id?: string;
+  tool_use_id?: string;
+  name?: string;
+  input?: Record<string, unknown>;
+  content?: unknown;
+  output?: unknown;
+  is_error?: boolean;
+};
+
+function contentBlocks(value: unknown): ContentBlock[] {
+  return Array.isArray(value)
+    ? value.filter((block): block is ContentBlock => !!block && typeof block === "object")
+    : [];
+}
+
+function toolOutput(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    return value.map((block) => {
+      if (typeof block === "string") return block;
+      if (block && typeof block === "object" && "text" in block && typeof block.text === "string") {
+        return block.text;
+      }
+      return JSON.stringify(block);
+    }).join("");
+  }
+  if (value === undefined || value === null) return "";
+  return typeof value === "object" ? JSON.stringify(value) : String(value);
+}
+
+/** Map both stock Claude stream-json records and Jarvis' legacy flat records. */
+export function decodeClaudeCliMessage(input: unknown): ClaudeStreamEvent[] {
+  if (!input || typeof input !== "object") return [];
+  const msg = input as ClaudeCliMessage;
+  const session_id = typeof msg.session_id === "string" ? msg.session_id : undefined;
+
+  if (msg.type === "system" && msg.subtype === "init") {
+    return [{
+      type: "init",
+      session_id,
+      tools: Array.isArray(msg.tools) ? msg.tools : [],
+      model: typeof msg.model === "string" ? msg.model : undefined,
+    }];
+  }
+
+  if (msg.type === "assistant") {
+    if (typeof msg.content === "string") {
+      return [{ type: "stream_event", delta: { text: msg.content }, session_id }];
+    }
+    const events: ClaudeStreamEvent[] = [];
+    for (const block of contentBlocks(msg.message?.content ?? msg.content)) {
+      if (block.type === "text" && typeof block.text === "string" && block.text) {
+        events.push({ type: "stream_event", delta: { text: block.text }, session_id });
+      } else if (block.type === "tool_use") {
+        events.push({
+          type: "tool_use",
+          tool_use_id: block.id ?? block.tool_use_id,
+          tool_name: block.name ?? "unknown",
+          tool_input: block.input ?? {},
+          session_id,
+        });
+      }
+    }
+    return events;
+  }
+
+  if (msg.type === "user") {
+    return contentBlocks(msg.message?.content ?? msg.content)
+      .filter((block) => block.type === "tool_result")
+      .map((block) => ({
+        type: "tool_result" as const,
+        tool_use_id: block.tool_use_id,
+        tool_output: toolOutput(block.output ?? block.content),
+        is_error: block.is_error,
+        session_id,
+      }));
+  }
+
+  if (msg.type === "stream_event") {
+    const text = msg.event?.delta?.text ?? msg.delta?.text;
+    return typeof text === "string" && text
+      ? [{ type: "stream_event", delta: { text }, session_id }]
+      : [];
+  }
+
+  if (msg.type === "tool_use") {
+    return [{
+      type: "tool_use",
+      tool_use_id: msg.tool_use?.tool_use_id ?? msg.tool_use?.id,
+      tool_name: msg.tool_use?.name || "unknown",
+      tool_input: msg.tool_use?.input || {},
+      session_id,
+    }];
+  }
+
+  if (msg.type === "tool_result") {
+    return [{
+      type: "tool_result",
+      tool_use_id: msg.tool_result?.tool_use_id,
+      tool_output: toolOutput(msg.tool_result?.output ?? msg.tool_result?.content),
+      is_error: msg.tool_result?.is_error,
+      session_id,
+    }];
+  }
+
+  if (msg.type === "result") {
+    return [{
+      type: "result",
+      content: typeof msg.result === "string" ? msg.result : undefined,
+      session_id,
+      usage: msg.usage,
+      cost_usd: typeof msg.total_cost_usd === "number" ? msg.total_cost_usd : undefined,
+      num_turns: typeof msg.num_turns === "number" ? msg.num_turns : undefined,
+    }];
+  }
+
+  return [];
 }
 
 export async function* streamClaudeCli(
@@ -342,7 +475,8 @@ export async function* streamClaudeCli(
   const cliCfg = cfg.claude_cli;
 
   // Use provided cliArgs (which may include --append-system-prompt) or fall back to cfg defaults
-  const baseArgs = buildLocalClaudeArgs([...(req.cliArgs || cliCfg.args || [])]);
+  const launchOptions = { authMode: cliCfg.auth_mode };
+  const baseArgs = buildLocalClaudeArgs([...(req.cliArgs || cliCfg.args || [])], launchOptions);
   if (req.session_id) baseArgs.push("--resume", req.session_id);
   // Note: --cwd is not a valid Claude CLI flag; cwd is set via spawn options below
 
@@ -359,7 +493,7 @@ export async function* streamClaudeCli(
   // also runs in WSL, so localhost reaches WSL's Ollama directly.
   // The Windows host IP is only needed for the HTTP server's own Ollama calls
   // (via resolveWindowsHostIP), not for spawned subprocesses.
-  const streamEnv = buildLocalClaudeEnv();
+  const streamEnv = buildLocalClaudeEnv(process.env, launchOptions);
 
   const proc = spawn(resolvedPath, args, {
     stdio: ["pipe", "pipe", "pipe"],
@@ -416,60 +550,13 @@ export async function* streamClaudeCli(
 
         try {
           const msg: ClaudeCliMessage = JSON.parse(trimmed);
-
-          switch (msg.type) {
-            case "assistant": {
-              // Content can be a string or an array of content blocks
-              let text = "";
-              if (typeof msg.content === "string") {
-                text = msg.content;
-              } else if (Array.isArray(msg.content)) {
-                for (const block of msg.content) {
-                  if (block && typeof block === "object" && block.type === "text" && block.text) {
-                    text += block.text;
-                  }
-                }
-              }
-              if (text) {
-                fullOutput += text;
-                yield { type: "stream_event", delta: { text }, session_id: msg.session_id };
-              }
-              break;
+          for (const event of decodeClaudeCliMessage(msg)) {
+            if (event.type === "stream_event" && event.delta?.text) {
+              fullOutput += event.delta.text;
+            } else if (event.type === "result" && !event.content) {
+              event.content = fullOutput;
             }
-            case "stream_event": {
-              if (msg.delta?.text) {
-                fullOutput += msg.delta.text;
-                yield { type: "stream_event", delta: msg.delta, session_id: msg.session_id };
-              }
-              break;
-            }
-            case "tool_use": {
-              yield {
-                type: "tool_use",
-                tool_name: msg.tool_use?.name || "unknown",
-                tool_input: msg.tool_use?.input || {},
-                session_id: msg.session_id,
-              };
-              break;
-            }
-            case "tool_result": {
-              yield {
-                type: "tool_result",
-                tool_output: msg.tool_result?.content || "",
-                session_id: msg.session_id,
-              };
-              break;
-            }
-            case "result": {
-              const resultText = typeof msg.result === "string" ? msg.result : fullOutput || "";
-              yield {
-                type: "result",
-                content: resultText,
-                session_id: msg.session_id,
-                usage: msg.usage,
-              };
-              break;
-            }
+            yield event;
           }
         } catch {
           // Non-JSON line — treat as plain text

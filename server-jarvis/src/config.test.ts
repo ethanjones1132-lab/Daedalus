@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { normalizeConfig, normalizeSettingMutation } from "./config";
+import { defaultConfig, normalizeConfig, normalizeSettingMutation } from "./config";
 
 describe("normalizeSettingMutation", () => {
   test("rejects an unknown key", () => {
@@ -28,6 +28,19 @@ describe("review repair budget", () => {
     expect(normalizeConfig({ orchestrator: { max_review_repair_rounds: 99 } }).orchestrator.max_review_repair_rounds).toBe(2);
     expect(normalizeConfig({ orchestrator: { max_review_repair_rounds: -3 } }).orchestrator.max_review_repair_rounds).toBe(0);
     expect(normalizeConfig({ orchestrator: { max_review_repair_rounds: "not-a-number" } }).orchestrator.max_review_repair_rounds).toBe(1);
+  });
+});
+
+describe("Claude CLI auth mode config", () => {
+  test("defaults legacy config inputs to proxy mode", () => {
+    expect(defaultConfig().claude_cli.auth_mode).toBe("proxy");
+    expect(normalizeConfig({ claude_cli: { enabled: true } }).claude_cli.auth_mode).toBe("proxy");
+  });
+
+  test("round-trips an explicit subscription mode", () => {
+    const config = normalizeConfig({ claude_cli: { auth_mode: "subscription" } });
+    const roundTrip = normalizeConfig(JSON.parse(JSON.stringify(config)));
+    expect(roundTrip.claude_cli.auth_mode).toBe("subscription");
   });
 });
 

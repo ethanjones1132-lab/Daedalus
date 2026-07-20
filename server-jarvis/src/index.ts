@@ -792,7 +792,7 @@ async function testConnection(configOverride?: Partial<JarvisConfig>): Promise<{
   }
   if (cfg.active_backend === "claude_cli") {
     const path = cfg.claude_cli.path || "claude";
-    const available = await isClaudeCliAvailable(path);
+    const available = await isClaudeCliAvailable(path, cfg.claude_cli.auth_mode);
     return { ok: available, latency_ms: 0, error: available ? undefined : `Claude CLI not found at '${path}'. Make sure 'claude' is on PATH.` };
   }
   // OpenRouter
@@ -1519,7 +1519,6 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           prompt: promptBody,
           session_id: resumedSessionId,
           cwd: cfg.claude_cli.cwd,
-          max_turns: 1,
           cliArgs,
         }, streamAbort.signal)) {
           if (streamAbort.signal.aborted) {
@@ -1545,7 +1544,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           } else if (evt.type === "tool_use") {
             await writer.write(encoder.encode(`data: ${JSON.stringify({
               type: "tool_use",
-              id: (evt as any).id,
+              id: evt.tool_use_id,
               name: evt.tool_name,
               input: evt.tool_input,
               session_id: sessionId,
@@ -1553,8 +1552,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           } else if (evt.type === "tool_result") {
             await writer.write(encoder.encode(`data: ${JSON.stringify({
               type: "tool_result",
-              name: evt.tool_name,
+              id: evt.tool_use_id,
               output: evt.tool_output,
+              is_error: evt.is_error,
               session_id: sessionId,
             })}\n\n`));
           } else if (evt.type === "message_stop") {
@@ -4597,7 +4597,10 @@ async function checkStatus(configOverride?: Partial<JarvisConfig> | null) {
 
   let claudeCliAvailable = false;
   try {
-    claudeCliAvailable = await isClaudeCliAvailable(cfg.claude_cli.path || "claude");
+    claudeCliAvailable = await isClaudeCliAvailable(
+      cfg.claude_cli.path || "claude",
+      cfg.claude_cli.auth_mode,
+    );
   } catch { /* false */ }
 
   const bridgeActive = await isBridgeListening();

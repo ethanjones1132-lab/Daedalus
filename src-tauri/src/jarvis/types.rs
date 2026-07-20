@@ -180,10 +180,21 @@ fn default_opencode_first_token_timeout_ms() -> u64 {
     45_000
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+pub enum ClaudeCliAuthMode {
+    #[serde(rename = "proxy")]
+    #[default]
+    Proxy,
+    #[serde(rename = "subscription")]
+    Subscription,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ClaudeCliConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub auth_mode: ClaudeCliAuthMode,
     pub path: String,
     #[serde(default)]
     pub args: Vec<String>,

@@ -97,6 +97,8 @@ export interface OpenCodeProviderConfig {
 
 export interface ClaudeCliConfig {
   enabled: boolean;
+  /** Proxy uses Jarvis' local Anthropic-compatible endpoint; subscription uses Claude OAuth/keychain auth. */
+  auth_mode: 'proxy' | 'subscription';
   /** Path to the `claude` binary */
   path: string;
   args: string[];
@@ -438,8 +440,9 @@ export function defaultConfig(): JarvisConfig {
     },
     claude_cli: {
       enabled: true,
+      auth_mode: "proxy",
       path: "claude",
-      args: ["--bare", "--print", "--output-format", "stream-json"],
+      args: ["--print", "--output-format", "stream-json"],
       timeout_ms: 120000,
       cwd: homedir(),
       model: "",

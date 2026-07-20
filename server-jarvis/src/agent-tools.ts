@@ -446,7 +446,8 @@ async function runPromptOnce(prompt: string, cfg: JarvisConfig, timeoutMs: numbe
 }
 
 async function runClaudeCliPrompt(prompt: string, cfg: JarvisConfig, timeoutMs: number, taskId?: string): Promise<string> {
-  const args = buildLocalClaudeArgs([...(cfg.claude_cli.args || []), prompt]);
+  const launchOptions = { authMode: cfg.claude_cli.auth_mode };
+  const args = buildLocalClaudeArgs([...(cfg.claude_cli.args || []), prompt], launchOptions);
   const resolvedPath = resolveClaudePath(cfg.claude_cli.path);
 
   return new Promise((resolve) => {
@@ -454,7 +455,7 @@ async function runClaudeCliPrompt(prompt: string, cfg: JarvisConfig, timeoutMs: 
       stdio: ["pipe", "pipe", "pipe"],
       cwd: cfg.jarvis_path || cfg.claude_cli.cwd || cfg.jarvis_path,
       env: {
-        ...buildLocalClaudeEnv(),
+        ...buildLocalClaudeEnv(process.env, launchOptions),
         CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: "1",
       },
     });
