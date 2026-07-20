@@ -13,7 +13,7 @@ import type { ConductorBus, ConductorDirective } from "./conductor-bus";
 import type { ConductorStageEvidence, LiveConductor } from "./conductor";
 import { buildSynthesizerContext, buildSynthesizerContextFromStageState } from "./synth-context";
 import { detectDeferralStall, DEFERRAL_STALL_NUDGE } from "./synthesizer-deferral";
-import { applyEffectGate, buildWriteEffectNudge, evaluateEffectGate, shouldPressWriteEffect, WRITE_EFFECT_NUDGE, WRITE_EFFECT_TOOLS, type EffectGateReport } from "./effect-gate";
+import { applyEffectGate, buildWriteEffectNudge, evaluateEffectGate, mostReadSuccessfulFile, shouldPressWriteEffect, WRITE_EFFECT_NUDGE, WRITE_EFFECT_TOOLS, type EffectGateReport } from "./effect-gate";
 import { normalizeRemainingStages, type ExecutionProfile } from "./route-normalization";
 import { hasWriteIntent, type TurnRequirement } from "./turn-requirements";
 import type { TurnBudget } from "./turn-budget";
@@ -865,15 +865,10 @@ export class PipelineExecutor {
       if (isEmptyStageOutput(narrative)) {
         const errorMessage = "empty_completion";
         onStateChange({ stage: "planner", status: "failed", output: errorMessage });
-        await this.afterConductorStage(
-          "planner",
-          "failed",
-          errorMessage,
-          agentRunId,
-          options,
-          remainingQueue,
-          this.plannerConductorEvidence(request, options),
-        );
+        // Two empty planner callModel invocations are terminal for this stage.
+        // Do not expose this failure to live-conductor queue mutation: a
+        // re-enter:planner directive would create a third planner attempt and
+        // consume reroute accounting instead of degrading to executor-without-plan.
         this.collector.recordStageRun({
           id: `stage_${crypto.randomUUID()}`,
           agent_run_id: agentRunId,
@@ -1060,23 +1055,7 @@ export class PipelineExecutor {
         .filter((call) => READ_ONLY_TOOLS.has(call.name) && !call.is_error && call.output.trim().length > 0 && !isDuplicateToolDeflection(call))
         .map((call) => duplicateToolCallKey(call)),
     ).size;
-    const mostReadTarget = () => {
-      const counts = new Map<string, number>();
-      for (const call of stageCalls()) {
-        if (!READ_ONLY_TOOLS.has(call.name) || call.is_error) continue;
-        const path = typeof call.arguments.path === "string" ? call.arguments.path.trim() : "";
-        if (path) counts.set(path, (counts.get(path) ?? 0) + 1);
-      }
-      let target = "the requested workspace file";
-      let max = 0;
-      for (const [path, count] of counts) {
-        if (count > max) {
-          target = path;
-          max = count;
-        }
-      }
-      return target;
-    };
+    const mostReadTarget = () => mostReadSuccessfulFile(stageCalls()) ?? "the requested workspace file";
     const availableWriteTools = getToolsForMode("executor", this.runtime.listTools(), profile)
       .map((tool) => tool.function.name)
       .filter((name) => WRITE_EFFECT_TOOLS.has(name));

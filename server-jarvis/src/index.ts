@@ -124,7 +124,7 @@ import { PipelineExecutor } from "./orchestration/pipeline";
 import { extractRootGrants } from "./orchestration/workspace-grants";
 import { combinedStageExclusions, StageHealthRegistry, type RecoverableFailureKind } from "./orchestration/stage-health";
 import { ModelScorecard, type ScorecardAttempt } from "./orchestration/model-scorecard";
-import { computeRequestTimeoutMs, createTurnBudget } from "./orchestration/turn-budget";
+import { computeBoundedRequestTimeoutMs, createTurnBudget, requestTimeoutMessage } from "./orchestration/turn-budget";
 import { assessWorkspaceEvidence, isDeepReadRequest, resolveWorkspaceReadScope } from "./orchestration/evidence-sufficiency";
 import { FORCE_DEEP_READ_PATTERN } from "./orchestration/repetition-guard";
 import { OrchestrationAdmissionController, type AdmissionLease } from "./orchestration/admission-controller";
@@ -1941,18 +1941,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // (paired in the request finally below). Idle between endStage calls
           // no longer drains the stage window.
           if (stageLabel) turnBudget.beginStage(stageLabel);
-          const stageBudgetMs = stageLabel
-            ? turnBudget.stageRemainingMs(stageLabel, Date.now())
-            : turnBudget.remainingMs(Date.now());
           // Re-read stage deadline after beginStage (executor may have extended via
           // extendStageOnProgress between attempts).
           const stageStreamDeadline = stageLabel
             ? turnBudget.stageStreamDeadlineAt(stageLabel)
             : undefined;
-          const computedRequestTimeoutMs = computeRequestTimeoutMs(stageLabel ?? "agent", turnBudget, requestTimeout);
-          const requestBudgetMs = Math.max(
-            1_000,
-            Math.min(computedRequestTimeoutMs, stageBudgetMs, Math.max(1_000, turnBudget.remainingMs(Date.now()) - reserveMs)),
+          const requestBudgetMs = computeBoundedRequestTimeoutMs(
+            stageLabel ?? "agent",
+            turnBudget,
+            requestTimeout,
+            reserveMs,
           );
           let turnDeadlineAbortedRequest = false;
           const timeout = setTimeout(() => {
@@ -2020,7 +2018,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               throw new TurnDeadlineExceededError(callOptions?.stageLabel ?? "orchestrator_request", turnBudget.turn_ms);
             }
             if (fetchErr.name === "AbortError") {
-              throw new Error(`Request timed out after ${requestTimeout / 1000}s. The model may be loading or overloaded.`);
+              throw new Error(requestTimeoutMessage(requestBudgetMs));
             }
             if (isOllama && (fetchErr.message?.includes("ECONNREFUSED") || fetchErr.message?.includes("fetch failed"))) {
               throw new Error(`Cannot connect to Ollama. Tried: ${ollamaTarget?.tried.join("; ") || baseUrl}. Make sure Ollama is running and the model is pulled (ollama pull ${modelName}).`);
@@ -3724,8 +3722,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const useFallback = !isOllama && cfg.openrouter.enable_fallbacks;
         const requestTimeout = isOllama ? MODEL_REQUEST_TIMEOUT_MS : (cfg.openrouter.timeout_ms || MODEL_REQUEST_TIMEOUT_MS);
         const ctrl = new AbortController();
-        const computedRequestTimeoutMs = computeRequestTimeoutMs("agent_loop", turnBudget, requestTimeout);
-        const requestBudgetMs = Math.max(1, Math.min(computedRequestTimeoutMs, turnBudget.deadlineAt - Date.now()));
+        const requestBudgetMs = computeBoundedRequestTimeoutMs("agent_loop", turnBudget, requestTimeout);
         let turnDeadlineAbortedRequest = false;
         const timeout = setTimeout(() => {
           turnDeadlineAbortedRequest = Date.now() >= turnBudget.deadlineAt;
@@ -3782,7 +3779,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             throw new TurnDeadlineExceededError("agent_loop_request", TOTAL_TURN_TIMEOUT_MS);
           }
           if (fetchErr.name === "AbortError") {
-            throw new Error(`Request timed out after ${requestTimeout / 1000}s. The model may be loading or overloaded.`);
+            throw new Error(requestTimeoutMessage(requestBudgetMs));
           }
           if (isOllama && (fetchErr.message?.includes("ECONNREFUSED") || fetchErr.message?.includes("fetch failed"))) {
             throw new Error(`Cannot connect to Ollama. Tried: ${ollamaTarget?.tried.join("; ") || baseUrl}. Make sure Ollama is running and the model is pulled (ollama pull ${modelName}).`);
@@ -3807,7 +3804,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               requestBody.messages.unshift({ role: "system", content: instructions });
             }
             const retryCtrl = new AbortController();
-            const retryTimeout = setTimeout(() => retryCtrl.abort(), requestBudgetMs);
+            // Recompute immediately before the fallback fetch. Time consumed by
+            // the first request must not be re-granted to this retry.
+            const retryRequestBudgetMs = computeBoundedRequestTimeoutMs("agent_loop", turnBudget, requestTimeout);
+            const retryTimeout = setTimeout(() => retryCtrl.abort(), retryRequestBudgetMs);
             const cleanupRetryAbort = registerAbortHandler(streamAbort.signal, () => retryCtrl.abort());
             try {
               fetchRes = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(requestBody), signal: retryCtrl.signal });
@@ -3824,6 +3824,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               cleanupRetryAbort();
               if (retryErr.name === "AbortError" && streamAbort.signal.aborted) {
                 await emitCancelled();
+              }
+              if (retryErr.name === "AbortError") {
+                throw new Error(requestTimeoutMessage(retryRequestBudgetMs));
               }
               throw retryErr;
             }

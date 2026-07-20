@@ -113,6 +113,32 @@ export function buildWriteEffectNudge(writeTools: string[], expectedTarget: stri
   ].join(" ");
 }
 
+/** Select the file with the most genuine successful content reads. */
+export function mostReadSuccessfulFile(calls: ToolCallRecord[]): string | undefined {
+  const counts = new Map<string, number>();
+  for (const call of calls) {
+    if (
+      call.name !== "read_file"
+      || call.is_error
+      || call.output.trim().length === 0
+      || call.output.includes("[duplicate call deflected]")
+    ) {
+      continue;
+    }
+    const path = typeof call.arguments.path === "string" ? call.arguments.path.trim() : "";
+    if (path) counts.set(path, (counts.get(path) ?? 0) + 1);
+  }
+  let target: string | undefined;
+  let max = 0;
+  for (const [path, count] of counts) {
+    if (count > max) {
+      target = path;
+      max = count;
+    }
+  }
+  return target;
+}
+
 export function shouldPressWriteEffect(input: {
   writeIntent: boolean;
   profile: ExecutionProfile;

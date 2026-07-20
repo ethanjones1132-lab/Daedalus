@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { applyEffectGate, buildWriteEffectNudge, evaluateEffectGate, shouldPressWriteEffect } from "./effect-gate";
+import { applyEffectGate, buildWriteEffectNudge, evaluateEffectGate, mostReadSuccessfulFile, shouldPressWriteEffect } from "./effect-gate";
 import type { ExecutorStageOutput, ToolCallRecord } from "./stage-output";
 
 function call(name: string, is_error = false, output = "ok"): ToolCallRecord {
@@ -181,5 +181,22 @@ describe("executor write pressure", () => {
     const directive = buildWriteEffectNudge(["write_file", "apply_patch"], "src/app.ts");
     expect(directive).toContain("write_file, apply_patch");
     expect(directive).toContain("src/app.ts");
+  });
+
+  test("most-read target counts only successful file-content reads", () => {
+    const calls: ToolCallRecord[] = [
+      { ...call("read_file", false, "chunk one"), arguments: { path: "src/app.ts", offset: 0 } },
+      { ...call("read_file", false, "chunk two"), arguments: { path: "src/app.ts", offset: 100 } },
+      { ...call("read_file", false, "other source"), arguments: { path: "src/other.ts" } },
+      ...Array.from({ length: 5 }, () => ({ ...call("list_directory"), arguments: { path: "src/listing-winner" } })),
+      ...Array.from({ length: 4 }, () => ({ ...call("grep"), arguments: { path: "src/grep-winner" } })),
+      {
+        ...call("read_file", false, "[duplicate call deflected] Reuse the prior result."),
+        arguments: { path: "src/decoy.ts" },
+      },
+      { ...call("read_file", true, "permission denied"), arguments: { path: "src/error.ts" } },
+    ];
+
+    expect(mostReadSuccessfulFile(calls)).toBe("src/app.ts");
   });
 });

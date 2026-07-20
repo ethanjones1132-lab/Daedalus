@@ -9,6 +9,9 @@ import { SessionReplanCounter } from "./replan-telemetry";
 import { SelfTuningStore } from "../self-tuning/store";
 import type { StageRunRecorder } from "./pipeline";
 import type { CoordinatorResult } from "./coordinator";
+import { ConductorBus } from "./conductor-bus";
+import { LiveConductor } from "./conductor";
+import { AgentPool, DEFAULT_ORCHESTRATOR_AGENTS } from "./agent-pool";
 
 // In-memory collector so this test can never touch the production self-tuning DB.
 const testCollector: StageRunRecorder = { recordStageRun: () => {} };
@@ -63,6 +66,73 @@ describe("runPipelineWithReplanning", () => {
     expect(coordinatorCalls).toBe(0);
     expect(result.outcome).toBe("degraded");
     expect(result.error_code).toBe("upstream_stage_failed");
+  });
+
+  test("planner double-empty bypasses live-conductor self-reroute accounting", async () => {
+    const stageLabels: string[] = [];
+    const callModel = async (_messages: any[], options?: any) => {
+      const stage = options?.stageLabel ?? "?";
+      stageLabels.push(stage);
+      if (stage === "planner") return { content: "" };
+      if (stage === "reviewer") return { content: "ACCEPT" };
+      if (stage === "synthesizer") return { content: "Executor evidence synthesized." };
+      return { content: "Executor continued without a plan." };
+    };
+    const bus = new ConductorBus();
+    const supervisionStages: string[] = [];
+    const live = new LiveConductor(
+      callModel as any,
+      bus,
+      new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS),
+      { supervision_timeout_ms: 1_000, max_tool_errors_before_reroute: 1, supervise_low_complexity: true },
+      (async (messages: Array<{ role: string; content: string }>) => {
+        const content = messages.map((message) => message.content).join("\n");
+        const stage = content.match(/Stage:\s*(\w+)/)?.[1] ?? "unknown";
+        supervisionStages.push(stage);
+        return stage === "planner"
+          ? {
+              content: JSON.stringify({
+                directive: "reroute",
+                newRemaining: ["re-enter:planner", "executor", "reviewer", "synthesizer"],
+                reason: "retry planner",
+              }),
+            }
+          : { content: JSON.stringify({ directive: "continue" }) };
+      }) as any,
+    );
+    live.setContext("general", "medium", "run-planner-live-double-empty");
+    const directives: unknown[] = [];
+    const collector = {
+      recordStageRun: () => {},
+      recordDirective: (row: unknown) => directives.push(row),
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, { bus, live, collector });
+    const coordinator = new Coordinator((async () => ({ content: "unused" })) as any);
+    let coordinatorCalls = 0;
+    coordinator.route = (async () => {
+      coordinatorCalls++;
+      throw new Error("planner degradation must not enter the replan loop");
+    }) as typeof coordinator.route;
+
+    const result = await runPipelineWithReplanning({
+      contextMessage: "explain the runtime architecture",
+      initialDecision: baseDecision({ pipeline: ["planner", "executor", "reviewer", "synthesizer"] }),
+      turnRequirement: "full_execution",
+      coordinator,
+      routeOptions: { sessionId: "planner-live-double-empty" },
+      executor,
+      agentRunId: "run-planner-live-double-empty",
+      onStateChange: () => {},
+      baseOptions: {},
+      maxReplans: 2,
+    });
+    bus.clear();
+
+    expect(stageLabels.filter((stage) => stage === "planner")).toHaveLength(2);
+    expect(supervisionStages.filter((stage) => stage === "planner")).toHaveLength(0);
+    expect(directives.filter((row: any) => row.stage === "planner" && row.directive_type === "reroute")).toHaveLength(0);
+    expect(coordinatorCalls).toBe(0);
+    expect(result.outcome).toBe("degraded");
   });
 
   test("preserves missing_workspace_evidence through the replan finalizer", async () => {

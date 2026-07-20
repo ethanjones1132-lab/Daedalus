@@ -101,6 +101,23 @@ export function computeRequestTimeoutMs(
     : usefulWindow;
 }
 
+/** Intersect the useful provider window with binding live stage/turn time. */
+export function computeBoundedRequestTimeoutMs(
+  stageLabel: string,
+  budget: TurnBudget,
+  base: number,
+  reserveMs = 0,
+): number {
+  const usefulWindow = computeRequestTimeoutMs(stageLabel, budget, base);
+  const stageRemaining = budget.stageRemainingMs(stageLabel);
+  const turnRemaining = Math.max(1, budget.remainingMs() - reserveMs);
+  return Math.max(1, Math.min(usefulWindow, stageRemaining, turnRemaining));
+}
+
+export function requestTimeoutMessage(timeoutMs: number): string {
+  return `Request timed out after ${timeoutMs / 1000}s. The model may be loading or overloaded.`;
+}
+
 const BUDGETS: Record<TurnRequirement, Omit<TurnBudget, "requirement" | "complexity" | "startedAt" | "deadlineAt" | "remainingMs" | "stageRemainingMs" | "stageUsedMs" | "canStart" | "extendStageOnProgress" | "beginStage" | "endStage" | "stageStreamDeadlineAt" | "finalStreamDeadlineAt">> = {
   conversational: { turn_ms: 30_000, finalization_reserve_ms: 15_000, max_stage_attempts: 2, stage_ms: { coordinator: 15_000 } },
   answer_only: { turn_ms: 45_000, finalization_reserve_ms: 20_000, max_stage_attempts: 2, stage_ms: { coordinator: 15_000, planner: 15_000 } },

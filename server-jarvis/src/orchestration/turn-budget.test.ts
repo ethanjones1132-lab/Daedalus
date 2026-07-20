@@ -1,12 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import {
   createTurnBudget,
+  computeBoundedRequestTimeoutMs,
   computeRequestTimeoutMs,
   EXTENDED_DEEP_EXECUTOR_MS,
   EXTENDED_DEEP_TURN_MS,
   FINAL_STREAM_GRACE_MS,
   FORCED_DEEP_READ_EXECUTOR_MS,
   FORCED_DEEP_READ_TURN_MS,
+  requestTimeoutMessage,
 } from "./turn-budget";
 import { AgentPool, firstTokenTimeoutFor } from "./agent-pool";
 import { resolveTurnRequirement } from "./turn-requirements";
@@ -23,6 +25,26 @@ describe("turn budgets", () => {
   test("extended-deep request timeouts are capped at 180s", () => {
     const budget = createTurnBudget("full_execution", "high", Date.now(), { deepTask: true });
     expect(computeRequestTimeoutMs("executor", budget, 300_000)).toBe(180_000);
+  });
+
+  test("fallback retry recomputes against the actual remaining stage and turn budget", () => {
+    let stageRemaining = 150_000;
+    let turnRemaining = 200_000;
+    const budget = {
+      turn_ms: EXTENDED_DEEP_TURN_MS,
+      stageRemainingMs: () => stageRemaining,
+      remainingMs: () => turnRemaining,
+    } as any;
+
+    expect(computeBoundedRequestTimeoutMs("agent_loop", budget, 300_000)).toBe(150_000);
+    stageRemaining = 12_000;
+    turnRemaining = 18_000;
+    expect(computeBoundedRequestTimeoutMs("agent_loop", budget, 300_000)).toBe(12_000);
+  });
+
+  test("request timeout diagnostic reports the computed watchdog duration", () => {
+    expect(requestTimeoutMessage(12_000)).toContain("12s");
+    expect(requestTimeoutMessage(12_000)).not.toContain("300s");
   });
   test("reserves the finalization window before optional repair work", () => {
     const budget = createTurnBudget("full_execution", "high", 1_000);
