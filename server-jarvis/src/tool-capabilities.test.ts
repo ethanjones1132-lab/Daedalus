@@ -36,6 +36,17 @@ const LEGACY = {
   listingEvidence: ["list_directory", "glob"],
   /** evidence-sufficiency.ts NETWORK_TOOLS */
   networkEvidence: ["web_fetch", "web_search"],
+  /** The single tool that declares `evidence: "metadata"` (git_metadata-bundle.ts).
+   *  Note: SHALLOW_EVIDENCE_TOOLS in evidence-sufficiency.ts is a UNION of
+   *  content + metadata evidence for the shallow floor; the metadata-evidence
+   *  set itself is just the metadata tools. */
+  metadataEvidence: ["git_metadata"],
+  /** Every tool that declares `class: "shell"` (bash + powershell today; the
+   *  legacy SHELL_TOOLS set in evidence-sufficiency.ts also lists `shell` and
+   *  `run_background_command`, but those names are not registered as tools in
+   *  the live runtime — the keystone pins the LIVE registry, not the alias
+   *  table). */
+  executionEvidence: ["bash", "powershell"],
 } as const;
 
 function standardRuntimeIndex() {
