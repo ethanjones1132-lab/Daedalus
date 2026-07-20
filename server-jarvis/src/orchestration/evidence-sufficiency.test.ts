@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import {
   DEEP_READ_MIN_CONTENT_READS,
   alreadyReadSourceKeys,
@@ -318,6 +321,27 @@ describe("assessWorkspaceEvidence", () => {
     );
     expect(a.sufficient).toBe(true);
     expect(a.contentReads).toBe(3);
+  });
+
+  test("relative and absolute reads of a file selected from a granted root share one evidence key", () => {
+    const workspace = mkdtempSync(join(tmpdir(), "jarvis-evidence-workspace-"));
+    const grant = mkdtempSync(join(tmpdir(), "jarvis-evidence-grant-"));
+    try {
+      mkdirSync(join(grant, "src"));
+      writeFileSync(join(grant, "src", "a.ts"), "export const a = 1;");
+      writeFileSync(join(grant, "src", "b.ts"), "export const b = 1;");
+
+      const a = assessWorkspaceEvidence(
+        [read("src/a.ts"), read(join(grant, "src", "a.ts")), read(join(grant, "src", "b.ts"))],
+        "comprehensively diagnose the architecture of this repo",
+        [workspace, grant],
+      );
+      expect(a.sufficient).toBe(false);
+      expect(a.contentReads).toBe(2);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+      rmSync(grant, { recursive: true, force: true });
+    }
   });
 
   test("manifests and overview files do not satisfy the deep-read source floor", () => {

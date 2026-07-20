@@ -2,7 +2,7 @@ import { afterEach, describe, test, expect } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
 import { homedir, tmpdir } from "os";
 import { basename, join, resolve } from "path";
-import { expandHomePath, resolveAllowedRoots, toWslPath, safePath } from "./fs-scope";
+import { expandHomePath, pathSegmentsEqual, resolveAllowedRoots, toWslPath, safePath } from "./fs-scope";
 import type { JarvisConfig } from "./config";
 
 const tempRoots: string[] = [];
@@ -65,6 +65,14 @@ describe("fs-scope", () => {
     const cfg = config(tempRoot("escape"));
     expect(() => safePath("../../etc/passwd", cfg)).toThrow(/outside the workspace/);
   });
+
+  test("strict mode rejects UNC and rooted POSIX paths outside every allowed root", () => {
+    const cfg = config(tempRoot("absolute-escapes"));
+    expect(() => safePath(String.raw`\\outside-server\share\file.ts`, cfg))
+      .toThrow(/outside the workspace/);
+    expect(() => safePath("/definitely-outside-jarvis-scope/file.ts", cfg))
+      .toThrow(/outside the workspace/);
+  });
 
   // Note: these assert host-agnostically because the test runner may execute on
   // Windows (win32 path semantics) while production runs in WSL (posix). The
@@ -112,6 +120,12 @@ describe("fs-scope", () => {
     const repeated = `${basename(root)}/README.md`;
     expect(safePath(repeated, config(root))).toBe(resolve(root, "README.md"));
     expect(safePath(`${basename(root)}/missing.md`, config(root))).toBe(resolve(root, basename(root), "missing.md"));
+  });
+
+  test("root basename comparison is case-sensitive on POSIX and case-insensitive on Windows", () => {
+    expect(pathSegmentsEqual("Project", "project", "linux")).toBe(false);
+    expect(pathSegmentsEqual("Project", "project", "darwin")).toBe(false);
+    expect(pathSegmentsEqual("Project", "project", "win32")).toBe(true);
   });
 
   test("safePath falls back to the first allowed root for a new path", () => {

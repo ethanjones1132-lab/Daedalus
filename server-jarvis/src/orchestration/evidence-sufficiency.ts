@@ -23,6 +23,8 @@
 // game it either.
 // ═══════════════════════════════════════════════════════════════
 
+import { existsSync } from "fs";
+import { isAbsolute, relative, resolve } from "path";
 import { isDuplicateToolDeflection, type ToolCallRecord } from "./stage-output";
 import { hasWorkspaceSignal, hasWriteIntent, type TurnRequirement } from "./turn-requirements";
 
@@ -201,11 +203,25 @@ function rootList(workspaceRoots: WorkspaceRoots): string[] {
     : workspaceRoots?.trim() ? [workspaceRoots] : [];
 }
 
+function firstExistingRootCandidate(rawPath: string, roots: string[]): string | undefined {
+  for (const root of roots) {
+    const candidate = resolve(root, rawPath);
+    const rel = relative(root, candidate);
+    const contained = rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+    if (contained && existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
 function sourceFileKey(rawPath: string, workspaceRoots?: WorkspaceRoots): string | undefined {
-  const normalized = normalizePath(rawPath);
+  const roots = rootList(workspaceRoots);
+  const rawNormalized = normalizePath(rawPath);
+  const selectedPath = rawNormalized.absolute
+    ? rawPath
+    : firstExistingRootCandidate(rawPath, roots) ?? rawPath;
+  const normalized = normalizePath(selectedPath);
   let normalizedPath = normalized.path;
   let absolute = normalized.absolute;
-  const roots = rootList(workspaceRoots);
   if (roots.length > 0 && !absolute) {
     const root = normalizePath(roots[0]);
     const rootPath = root.path.replace(/\/+$/, "");

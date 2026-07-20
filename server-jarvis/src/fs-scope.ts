@@ -57,6 +57,15 @@ function rootKey(path: string): string {
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
+/** Compare path segments using the host filesystem's case semantics. */
+export function pathSegmentsEqual(
+  left: string,
+  right: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+
 function existingDirectory(path: string): boolean {
   try {
     return existsSync(path) && statSync(path).isDirectory();
@@ -138,7 +147,7 @@ export function safePath(
 
   for (const root of roots) {
     const segments = normalizedInput.split(/[\\/]+/).filter(Boolean);
-    if (segments.length > 1 && basename(root).toLowerCase() === segments[0].toLowerCase()) {
+    if (segments.length > 1 && pathSegmentsEqual(basename(root), segments[0])) {
       const deduplicated = resolve(root, ...segments.slice(1));
       if (isContained(root, deduplicated) && existsSync(deduplicated)) return deduplicated;
     }
