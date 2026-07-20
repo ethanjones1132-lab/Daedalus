@@ -524,6 +524,7 @@ mod tests {
         let legacy_json =
             serde_json::to_value(&legacy.claude_cli).expect("serialize legacy config");
         assert_eq!(legacy_json["auth_mode"], "proxy");
+        assert!(crate::claude_proxy_enabled(&legacy));
 
         set_setting_value(
             &db,
@@ -535,8 +536,9 @@ mod tests {
         persist_jarvis_config(&db, &subscription).expect("persist subscription config");
         let round_trip = load_jarvis_config(&db).expect("reload subscription config");
         let round_trip_json =
-            serde_json::to_value(round_trip.claude_cli).expect("serialize round trip");
+            serde_json::to_value(&round_trip.claude_cli).expect("serialize round trip");
         assert_eq!(round_trip_json["auth_mode"], "subscription");
+        assert!(!crate::claude_proxy_enabled(&round_trip));
     }
 
     #[test]

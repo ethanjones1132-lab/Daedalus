@@ -354,7 +354,10 @@ pub fn get_build_info() -> BuildInfo {
 // ── Health & Doctor ─────────────────────────────────────────
 
 #[tauri::command]
-pub async fn get_system_health(app: tauri::AppHandle) -> Result<HealthData, String> {
+pub async fn get_system_health(
+    app: tauri::AppHandle,
+    state: State<'_, crate::jarvis::types::JarvisState>,
+) -> Result<HealthData, String> {
     let ollama_running = crate::is_port_listening(11434);
     let ollama_url = "http://127.0.0.1:11434".to_string();
     let ollama_model = if ollama_running {
@@ -379,7 +382,11 @@ pub async fn get_system_health(app: tauri::AppHandle) -> Result<HealthData, Stri
     // Bun server: probe the cached health URL via crate helper if available
     let bun_running = crate::is_port_listening(19877);
     let bridge_running = crate::is_port_listening(19876);
-    let proxy_running = crate::is_port_listening(19878);
+    let proxy_required = {
+        let config = state.config.lock().await;
+        crate::claude_proxy_enabled(&config)
+    };
+    let proxy_running = proxy_required && crate::is_port_listening(19878);
 
     let disk = disk_health().await;
     let mem = memory_health();
@@ -479,9 +486,44 @@ fn memory_health() -> MemoryHealth {
     }
 }
 
+fn claude_proxy_doctor_check(
+    config: &crate::jarvis::types::JarvisConfig,
+    probe: impl FnOnce() -> bool,
+) -> DoctorCheck {
+    if !config.claude_cli.enabled {
+        return DoctorCheck {
+            name: "claude_proxy".into(),
+            status: "ok".into(),
+            detail: "claude_cli_proxy not required because Claude CLI is disabled".into(),
+        };
+    }
+    if matches!(
+        config.claude_cli.auth_mode,
+        crate::jarvis::types::ClaudeCliAuthMode::Subscription
+    ) {
+        return DoctorCheck {
+            name: "claude_proxy".into(),
+            status: "ok".into(),
+            detail: "claude_cli_proxy not required in subscription auth mode".into(),
+        };
+    }
+    let running = probe();
+    DoctorCheck {
+        name: "claude_proxy".into(),
+        status: if running { "ok".into() } else { "warn".into() },
+        detail: format!(
+            "claude_cli_proxy {} on port 19878",
+            if running { "active" } else { "not running" }
+        ),
+    }
+}
+
 #[tauri::command]
-pub async fn get_doctor_report() -> Result<DoctorReport, String> {
+pub async fn get_doctor_report(
+    state: State<'_, crate::jarvis::types::JarvisState>,
+) -> Result<DoctorReport, String> {
     let mut checks: Vec<DoctorCheck> = Vec::new();
+    let config = state.config.lock().await.clone();
 
     // Ollama
     let ollama = crate::is_port_listening(11434);
@@ -519,15 +561,9 @@ pub async fn get_doctor_report() -> Result<DoctorReport, String> {
     });
 
     // Claude CLI proxy
-    let proxy = crate::is_port_listening(19878);
-    checks.push(DoctorCheck {
-        name: "claude_proxy".into(),
-        status: if proxy { "ok".into() } else { "warn".into() },
-        detail: format!(
-            "claude_cli_proxy {} on port 19878",
-            if proxy { "active" } else { "not running" }
-        ),
-    });
+    checks.push(claude_proxy_doctor_check(&config, || {
+        crate::is_port_listening(19878)
+    }));
 
     // System store
     let store_ok = system_store_path().exists()
@@ -923,6 +959,20 @@ mod bridge_restart_tests {
     fn test_queue() -> Arc<crate::jarvis::queue::MessageQueue> {
         let config = Arc::new(Mutex::new(crate::jarvis::types::JarvisConfig::default()));
         Arc::new(crate::jarvis::queue::MessageQueue::new(config))
+    }
+
+    #[test]
+    fn doctor_skips_proxy_port_probe_when_proxy_is_not_required() {
+        use crate::jarvis::types::ClaudeCliAuthMode;
+
+        let mut config = crate::jarvis::types::JarvisConfig::default();
+        config.claude_cli.enabled = true;
+        config.claude_cli.auth_mode = ClaudeCliAuthMode::Subscription;
+        let check = claude_proxy_doctor_check(&config, || {
+            panic!("subscription mode must not probe port 19878")
+        });
+        assert_eq!(check.status, "ok");
+        assert!(check.detail.contains("subscription"));
     }
 
     #[test]

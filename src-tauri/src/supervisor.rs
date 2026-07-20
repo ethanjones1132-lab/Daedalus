@@ -151,12 +151,14 @@ pub fn spawn_supervisor(handle: AppHandle) {
 
 async fn tick(handle: &AppHandle) {
     // Read the active backend + model once per tick.
-    let (is_ollama, ollama_model) = {
+    let (is_ollama, ollama_model, proxy_required, openrouter_api_key) = {
         let state = handle.state::<JarvisState>();
         let cfg = state.config.lock().await;
         (
             matches!(cfg.active_backend, JarvisBackend::Ollama),
             cfg.ollama.model.clone(),
+            crate::claude_proxy_enabled(&cfg),
+            cfg.openrouter.api_key.clone(),
         )
     };
 
@@ -189,7 +191,17 @@ async fn tick(handle: &AppHandle) {
     }
 
     // ── claude_cli_proxy (routes to whichever backend is active) ──
-    if crate::is_port_listening(PROXY_PORT) {
+    if !proxy_required {
+        PROXY_FAILS.store(0, Ordering::Relaxed);
+        if let Some(m) = crate::PROXY_PROCESS.get() {
+            if let Ok(mut g) = m.lock() {
+                if let Some(mut old) = g.take() {
+                    let _ = old.kill();
+                    println!("[supervisor] claude_cli_proxy stopped; proxy auth is not enabled.");
+                }
+            }
+        }
+    } else if crate::is_port_listening(PROXY_PORT) {
         PROXY_FAILS.store(0, Ordering::Relaxed);
     } else {
         let fails = PROXY_FAILS.load(Ordering::Relaxed);
@@ -202,7 +214,7 @@ async fn tick(handle: &AppHandle) {
                     }
                 }
             }
-            match crate::spawn_claude_cli_proxy(ollama_model.clone()) {
+            match crate::spawn_claude_cli_proxy(ollama_model.clone(), openrouter_api_key.clone()) {
                 Some(child) => {
                     if let Some(m) = crate::PROXY_PROCESS.get() {
                         if let Ok(mut g) = m.lock() {

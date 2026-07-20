@@ -84,10 +84,17 @@ fn find_ollama_binary() -> Option<String> {
     .find(|p| std::path::Path::new(p).exists())
 }
 
-fn find_jarvis_python() -> Option<String> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok();
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PythonInvocation {
+    program: std::path::PathBuf,
+    prefix_args: Vec<String>,
+}
+
+fn find_jarvis_python_with(
+    home: Option<&std::path::Path>,
+    mut works: impl FnMut(&PythonInvocation) -> bool,
+) -> Option<PythonInvocation> {
+    let mut candidates = Vec::new();
     if let Some(home) = home {
         for rel in [
             ".openclaw/jarvis/hermes/.venv/Scripts/python.exe",
@@ -95,20 +102,56 @@ fn find_jarvis_python() -> Option<String> {
             ".openclaw/jarvis/hermes/venv/Scripts/python.exe",
             ".openclaw/jarvis/hermes/venv/bin/python",
         ] {
-            let p = format!("{home}/{rel}");
-            if std::path::Path::new(&p).exists() {
-                return Some(p);
+            let program = home.join(rel);
+            if program.exists() {
+                candidates.push(PythonInvocation {
+                    program,
+                    prefix_args: Vec::new(),
+                });
             }
         }
     }
-    Some("python3".into())
+    candidates.extend([
+        PythonInvocation {
+            program: "py".into(),
+            prefix_args: vec!["-3".to_string()],
+        },
+        PythonInvocation {
+            program: "python".into(),
+            prefix_args: Vec::new(),
+        },
+        PythonInvocation {
+            program: "python3".into(),
+            prefix_args: Vec::new(),
+        },
+    ]);
+    candidates.into_iter().find(|candidate| works(candidate))
+}
+
+fn find_jarvis_python() -> Option<PythonInvocation> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from);
+    find_jarvis_python_with(home.as_deref(), |candidate| {
+        let mut command = std::process::Command::new(&candidate.program);
+        command
+            .args(&candidate.prefix_args)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        crate::wsl::hide_windows_console(&mut command);
+        command
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    })
 }
 
 fn build_hermes_config() -> crate::jarvis::hermes::process::HermesConfig {
     use std::path::PathBuf;
     let mut config = crate::jarvis::hermes::process::HermesConfig::default();
     if let Some(py) = find_jarvis_python() {
-        config.python = PathBuf::from(py);
+        config.python = py.program;
     }
     if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
         config.hermes_home = PathBuf::from(home)
@@ -218,69 +261,242 @@ pub fn reconcile_backend_services(
     });
 }
 
-pub(crate) fn spawn_claude_cli_proxy(ollama_model: String) -> Option<std::process::Child> {
-    use std::process::{Command, Stdio};
+pub(crate) fn claude_proxy_enabled(config: &crate::jarvis::types::JarvisConfig) -> bool {
+    config.claude_cli.enabled
+        && matches!(
+            config.claude_cli.auth_mode,
+            crate::jarvis::types::ClaudeCliAuthMode::Proxy
+        )
+}
+
+fn configure_proxy_credential(
+    command: &mut std::process::Command,
+    openrouter_api_key: &str,
+    through_wsl: bool,
+) {
+    if openrouter_api_key.trim().is_empty() {
+        return;
+    }
+    const KEY: &str = "JARVIS_OPENROUTER_API_KEY";
+    command.env(KEY, openrouter_api_key);
+    if through_wsl {
+        let mut forwarded = std::env::var("WSLENV")
+            .unwrap_or_default()
+            .split(':')
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if !forwarded.iter().any(|name| name == KEY) {
+            forwarded.push(KEY.to_string());
+        }
+        command.env("WSLENV", forwarded.join(":"));
+    }
+}
+
+pub(crate) fn spawn_claude_cli_proxy(
+    ollama_model: String,
+    openrouter_api_key: String,
+) -> Option<std::process::Child> {
+    use std::process::Command;
     let script = find_claude_cli_proxy()?;
-    let py = find_jarvis_python()?;
+    let py = match script.kind {
+        ProxyScriptKind::Native => find_jarvis_python()?,
+        ProxyScriptKind::Wsl => PythonInvocation {
+            program: "wsl.exe".into(),
+            prefix_args: vec!["--".to_string(), "python3".to_string()],
+        },
+    };
     let model = if ollama_model.is_empty() {
         "qwen3:8b".to_string()
     } else {
         ollama_model
     };
-    let mut command = Command::new(&py);
+    let mut command = Command::new(&py.program);
     command
-        .arg(&script)
+        .args(&py.prefix_args)
+        .arg(&script.path)
         .env("JARVIS_CLAUDE_PROXY_PORT", "19878")
         .env("JARVIS_OLLAMA_URL", "http://127.0.0.1:11434")
         .env("JARVIS_DEFAULT_MODEL", &model)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(jarvis_server_log_stdio("claude-proxy.log"))
+        .stderr(jarvis_server_log_stdio("claude-proxy.err.log"));
+    configure_proxy_credential(
+        &mut command,
+        &openrouter_api_key,
+        matches!(script.kind, ProxyScriptKind::Wsl),
+    );
     crate::wsl::hide_windows_console(&mut command);
     let child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
-                "[Jarvis] claude_cli_proxy spawn failed: {e} (py={py}, script={script}, model={model})"
+                "[Jarvis] claude_cli_proxy spawn failed: {e} (interpreter={:?} {:?}, script={}, source={:?}, model={model})",
+                py.program,
+                py.prefix_args,
+                script.path.display(),
+                script.kind,
             );
             return None;
         }
     };
     println!(
-        "[Jarvis] claude_cli_proxy started (PID {}, py {}, script {}, model {})",
+        "[Jarvis] claude_cli_proxy started (PID {}, interpreter {:?} {:?}, script {}, source {:?}, model {})",
         child.id(),
-        py,
-        script,
+        py.program,
+        py.prefix_args,
+        script.path.display(),
+        script.kind,
         model,
     );
     Some(child)
 }
 
-fn find_claude_cli_proxy() -> Option<String> {
-    let home = wsl_home();
-    // Prefer the version-controlled copy in the repo; fall back to the legacy
-    // deployed copy under ~/.openclaw/jarvis/hermes for older installs.
-    let candidates = [
-        format!(
-            "{}/.openclaw/agents/coderclaw/workspace/home-base/scripts/claude_cli_proxy.py",
-            home
-        ),
-        format!("{}/.openclaw/jarvis/hermes/claude_cli_proxy.py", home),
-    ];
-    for path in candidates {
-        let exists = if cfg!(target_os = "windows") {
-            let mut cmd = std::process::Command::new("wsl.exe");
-            cmd.args(["--", "test", "-f", &path]);
-            crate::wsl::command_output_timeout(cmd, std::time::Duration::from_secs(15))
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        } else {
-            std::path::Path::new(&path).exists()
-        };
-        if exists {
-            return Some(path);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProxyScriptKind {
+    Native,
+    Wsl,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProxyScript {
+    path: std::path::PathBuf,
+    kind: ProxyScriptKind,
+}
+
+struct ProxyDiscoveryContext {
+    override_path: Option<std::path::PathBuf>,
+    exe_path: Option<std::path::PathBuf>,
+    cwd: Option<std::path::PathBuf>,
+    fixed_windows_path: std::path::PathBuf,
+    user_profile: Option<std::path::PathBuf>,
+    wsl_candidates: Vec<std::path::PathBuf>,
+}
+
+fn ancestry_proxy_script(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut cursor = if start.is_dir() {
+        Some(start.to_path_buf())
+    } else {
+        start.parent().map(std::path::Path::to_path_buf)
+    };
+    for _ in 0..8 {
+        let Some(dir) = cursor.as_ref() else { break };
+        let candidate = dir.join("scripts").join("claude_cli_proxy.py");
+        if candidate.exists() {
+            return Some(candidate);
         }
+        cursor = dir.parent().map(std::path::Path::to_path_buf);
     }
     None
+}
+
+fn find_claude_cli_proxy_with(
+    context: &ProxyDiscoveryContext,
+    mut wsl_exists: impl FnMut(&std::path::Path) -> bool,
+) -> Option<ProxyScript> {
+    if let Some(path) = context.override_path.as_ref().filter(|path| path.exists()) {
+        return Some(ProxyScript {
+            path: path.clone(),
+            kind: ProxyScriptKind::Native,
+        });
+    }
+    if let Some(exe_dir) = context
+        .exe_path
+        .as_deref()
+        .and_then(std::path::Path::parent)
+    {
+        let path = exe_dir.join("resources").join("claude_cli_proxy.py");
+        if path.exists() {
+            return Some(ProxyScript {
+                path,
+                kind: ProxyScriptKind::Native,
+            });
+        }
+    }
+    for start in [context.exe_path.as_deref(), context.cwd.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(path) = ancestry_proxy_script(start) {
+            return Some(ProxyScript {
+                path,
+                kind: ProxyScriptKind::Native,
+            });
+        }
+    }
+    if context.fixed_windows_path.exists() {
+        return Some(ProxyScript {
+            path: context.fixed_windows_path.clone(),
+            kind: ProxyScriptKind::Native,
+        });
+    }
+    if let Some(profile) = &context.user_profile {
+        let path = profile
+            .join(".openclaw")
+            .join("jarvis")
+            .join("hermes")
+            .join("claude_cli_proxy.py");
+        if path.exists() {
+            return Some(ProxyScript {
+                path,
+                kind: ProxyScriptKind::Native,
+            });
+        }
+    }
+    context
+        .wsl_candidates
+        .iter()
+        .find(|path| wsl_exists(path))
+        .cloned()
+        .map(|path| ProxyScript {
+            path,
+            kind: ProxyScriptKind::Wsl,
+        })
+}
+
+fn find_claude_cli_proxy() -> Option<ProxyScript> {
+    let native = ProxyDiscoveryContext {
+        override_path: std::env::var_os("JARVIS_CLAUDE_PROXY_PATH").map(Into::into),
+        exe_path: std::env::current_exe().ok(),
+        cwd: std::env::current_dir().ok(),
+        fixed_windows_path: r"C:\Projects\home-base-recovered\scripts\claude_cli_proxy.py".into(),
+        user_profile: std::env::var_os("USERPROFILE").map(Into::into),
+        wsl_candidates: Vec::new(),
+    };
+    if let Some(script) = find_claude_cli_proxy_with(&native, |_| false) {
+        return Some(script);
+    }
+
+    let home = wsl_home();
+    let wsl = ProxyDiscoveryContext {
+        override_path: None,
+        exe_path: None,
+        cwd: None,
+        fixed_windows_path: std::path::PathBuf::new(),
+        user_profile: None,
+        wsl_candidates: vec![
+            format!(
+                "{home}/.openclaw/agents/coderclaw/workspace/home-base/scripts/claude_cli_proxy.py"
+            )
+            .into(),
+            format!("{home}/.openclaw/jarvis/hermes/claude_cli_proxy.py").into(),
+        ],
+    };
+    let mut script = find_claude_cli_proxy_with(&wsl, |path| {
+        if cfg!(target_os = "windows") {
+            let path = path.to_string_lossy();
+            let mut command = std::process::Command::new("wsl.exe");
+            command.args(["--", "test", "-f", path.as_ref()]);
+            crate::wsl::command_output_timeout(command, std::time::Duration::from_secs(15))
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        } else {
+            path.exists()
+        }
+    })?;
+    if !cfg!(target_os = "windows") {
+        script.kind = ProxyScriptKind::Native;
+    }
+    Some(script)
 }
 
 fn find_jarvis_server() -> Option<String> {
@@ -782,24 +998,34 @@ async fn bootstrap_services(handle: tauri::AppHandle) {
         log::info!(target: "jarvis::startup", "Bun server healthy at boot");
     }
 
-    // The Claude CLI proxy is optional. Its WSL/python discovery can take
-    // several bounded probes, so keep it after the required Bun listener.
-    let proxy_model = cfg.ollama.model.clone();
-    let proxy_result =
-        spawn_blocking_on_current_runtime(move || crate::spawn_claude_cli_proxy(proxy_model)).await;
-    match proxy_result {
-        Ok(Some(child)) => {
-            if let Some(m) = crate::PROXY_PROCESS.get() {
-                if let Ok(mut g) = m.lock() {
-                    println!(
-                        "[Jarvis] Claude CLI proxy registered at startup (PID {})",
-                        child.id()
-                    );
-                    *g = Some(child);
+    // Proxy auth requires the compatibility listener. Subscription auth uses
+    // the stock Claude CLI directly and must never require or spawn port 19878.
+    if crate::claude_proxy_enabled(&cfg) {
+        let proxy_model = cfg.ollama.model.clone();
+        let openrouter_api_key = cfg.openrouter.api_key.clone();
+        let proxy_result = spawn_blocking_on_current_runtime(move || {
+            crate::spawn_claude_cli_proxy(proxy_model, openrouter_api_key)
+        })
+        .await;
+        match proxy_result {
+            Ok(Some(child)) => {
+                if let Some(m) = crate::PROXY_PROCESS.get() {
+                    if let Ok(mut g) = m.lock() {
+                        println!(
+                            "[Jarvis] Claude CLI proxy registered at startup (PID {})",
+                            child.id()
+                        );
+                        *g = Some(child);
+                    }
                 }
             }
+            _ => eprintln!("[Jarvis] Claude CLI proxy not started (not found or spawn failed)"),
         }
-        _ => eprintln!("[Jarvis] Claude CLI proxy not started (not found or spawn failed)"),
+    } else {
+        println!(
+            "[Jarvis] Claude CLI proxy not required (enabled={}, auth_mode={:?})",
+            cfg.claude_cli.enabled, cfg.claude_cli.auth_mode
+        );
     }
 
     // Keep the three boot children alive (Ollama/proxy/Bun): detect a dead
@@ -1065,7 +1291,114 @@ pub fn run() {
 #[cfg(test)]
 mod startup_thread_tests {
     use super::*;
+    use std::path::{Path, PathBuf};
     use std::sync::mpsc;
+
+    fn test_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "jarvis-proxy-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).expect("create test directory");
+        path
+    }
+
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().expect("test file parent"))
+            .expect("create test file parent");
+        std::fs::write(path, b"# test\n").expect("write test file");
+    }
+
+    #[test]
+    fn python_discovery_prefers_venv_and_preserves_launcher_prefix_args() {
+        let home = test_dir("python");
+        let venv = home.join(".openclaw/jarvis/hermes/.venv/Scripts/python.exe");
+        touch(&venv);
+
+        let selected = find_jarvis_python_with(Some(&home), |candidate| {
+            candidate.program == venv || candidate.program == PathBuf::from("py")
+        })
+        .expect("a working interpreter");
+        assert_eq!(selected.program, venv);
+        assert!(selected.prefix_args.is_empty());
+
+        std::fs::remove_file(&selected.program).expect("remove venv interpreter");
+        let launcher = find_jarvis_python_with(Some(&home), |candidate| {
+            candidate.program == PathBuf::from("py")
+                && candidate.prefix_args == vec!["-3".to_string()]
+        })
+        .expect("py launcher should be retained with its selector");
+        assert_eq!(launcher.program, PathBuf::from("py"));
+        assert_eq!(launcher.prefix_args, vec!["-3"]);
+
+        std::fs::remove_dir_all(home).expect("remove test directory");
+    }
+
+    #[test]
+    fn proxy_discovery_prefers_windows_candidates_before_wsl() {
+        let root = test_dir("discovery");
+        let exe = root.join("repo/target/release/home-base.exe");
+        touch(&exe);
+        let ancestry_script = root.join("repo/scripts/claude_cli_proxy.py");
+        touch(&ancestry_script);
+        let user_script = root.join("user/.openclaw/jarvis/hermes/claude_cli_proxy.py");
+        touch(&user_script);
+        let wsl_script = PathBuf::from("/home/test/.openclaw/jarvis/hermes/claude_cli_proxy.py");
+        let context = ProxyDiscoveryContext {
+            override_path: None,
+            exe_path: Some(exe),
+            cwd: None,
+            fixed_windows_path: root.join("missing/claude_cli_proxy.py"),
+            user_profile: Some(root.join("user")),
+            wsl_candidates: vec![wsl_script],
+        };
+
+        let selected = find_claude_cli_proxy_with(&context, |_| true)
+            .expect("native ancestry script should win");
+        assert_eq!(selected.path, ancestry_script);
+        assert_eq!(selected.kind, ProxyScriptKind::Native);
+
+        let override_script = root.join("override/claude_cli_proxy.py");
+        touch(&override_script);
+        let selected = find_claude_cli_proxy_with(
+            &ProxyDiscoveryContext {
+                override_path: Some(override_script.clone()),
+                ..context
+            },
+            |_| panic!("WSL must not be probed when a native override exists"),
+        )
+        .expect("override script should win");
+        assert_eq!(selected.path, override_script);
+
+        std::fs::remove_dir_all(root).expect("remove test directory");
+    }
+
+    #[test]
+    fn proxy_credential_is_forwarded_through_native_and_wsl_launches() {
+        let mut native = std::process::Command::new("python");
+        configure_proxy_credential(&mut native, "secret-key", false);
+        let native_env: std::collections::HashMap<_, _> = native.get_envs().collect();
+        assert_eq!(
+            native_env.get(std::ffi::OsStr::new("JARVIS_OPENROUTER_API_KEY")),
+            Some(&Some(std::ffi::OsStr::new("secret-key")))
+        );
+
+        let mut wsl = std::process::Command::new("wsl.exe");
+        configure_proxy_credential(&mut wsl, "secret-key", true);
+        let wsl_env: std::collections::HashMap<_, _> = wsl.get_envs().collect();
+        let wslenv = wsl_env
+            .get(std::ffi::OsStr::new("WSLENV"))
+            .and_then(|value| *value)
+            .expect("WSL launch should opt the credential into environment forwarding");
+        assert!(wslenv
+            .to_string_lossy()
+            .split(':')
+            .any(|name| name == "JARVIS_OPENROUTER_API_KEY"));
+    }
 
     #[test]
     fn startup_dispatch_returns_before_slow_boot_work_finishes() {

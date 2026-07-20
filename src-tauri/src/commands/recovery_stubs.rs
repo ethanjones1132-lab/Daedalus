@@ -286,15 +286,51 @@ pub async fn jarvis_restart_ollama(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProxyRestartAction {
+    Restart,
+    NoopDisabled,
+    NoopSubscription,
+}
+
+fn proxy_restart_action(config: &crate::jarvis::types::JarvisConfig) -> ProxyRestartAction {
+    if !config.claude_cli.enabled {
+        ProxyRestartAction::NoopDisabled
+    } else if matches!(
+        config.claude_cli.auth_mode,
+        crate::jarvis::types::ClaudeCliAuthMode::Subscription
+    ) {
+        ProxyRestartAction::NoopSubscription
+    } else {
+        ProxyRestartAction::Restart
+    }
+}
+
 #[tauri::command]
 pub async fn jarvis_restart_proxy(
     state: tauri::State<'_, crate::jarvis::types::JarvisState>,
 ) -> Result<bool, String> {
+    let config = state.config.lock().await.clone();
+    match proxy_restart_action(&config) {
+        ProxyRestartAction::NoopDisabled => {
+            println!("[Jarvis] Claude CLI proxy restart skipped: Claude CLI is disabled.");
+            return Ok(false);
+        }
+        ProxyRestartAction::NoopSubscription => {
+            println!(
+                "[Jarvis] Claude CLI proxy restart skipped: subscription auth uses the stock CLI directly."
+            );
+            return Ok(false);
+        }
+        ProxyRestartAction::Restart => {}
+    }
+
     // Re-arm the supervisor (a long silent outage may have driven the proxy
     // counter to the give-up cap), kill the tracked child, sleep briefly so
     // the port is released, then re-spawn and probe :19878.
     crate::supervisor::reset_failures(crate::supervisor::SupervisedService::Proxy);
-    let model = state.config.lock().await.ollama.model.clone();
+    let model = config.ollama.model.clone();
+    let openrouter_api_key = config.openrouter.api_key;
 
     if let Some(m) = crate::PROXY_PROCESS.get() {
         if let Ok(mut g) = m.lock() {
@@ -309,7 +345,7 @@ pub async fn jarvis_restart_proxy(
     // python interpreter can't be located; the underlying spawn error is
     // already logged via eprintln in lib.rs. Wrap with a specific error
     // string the UI can surface verbatim.
-    let child = match crate::spawn_claude_cli_proxy(model.clone()) {
+    let child = match crate::spawn_claude_cli_proxy(model.clone(), openrouter_api_key) {
         Some(c) => c,
         None => {
             return Err(match (model.is_empty(), true) {
@@ -440,6 +476,28 @@ mod tests {
             conn: Mutex::new(conn),
             db_path: std::path::PathBuf::from(":memory:"),
         }
+    }
+
+    #[test]
+    fn proxy_restart_is_noop_unless_proxy_auth_is_enabled() {
+        use crate::jarvis::types::ClaudeCliAuthMode;
+
+        let mut config = crate::jarvis::types::JarvisConfig::default();
+        config.claude_cli.enabled = false;
+        assert_eq!(
+            proxy_restart_action(&config),
+            ProxyRestartAction::NoopDisabled
+        );
+
+        config.claude_cli.enabled = true;
+        config.claude_cli.auth_mode = ClaudeCliAuthMode::Subscription;
+        assert_eq!(
+            proxy_restart_action(&config),
+            ProxyRestartAction::NoopSubscription
+        );
+
+        config.claude_cli.auth_mode = ClaudeCliAuthMode::Proxy;
+        assert_eq!(proxy_restart_action(&config), ProxyRestartAction::Restart);
     }
 
     #[test]
