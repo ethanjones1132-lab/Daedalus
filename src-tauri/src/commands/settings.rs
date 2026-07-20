@@ -636,4 +636,35 @@ mod tests {
         );
         assert!(round_trip.tools.grant_session_roots);
     }
+
+    #[test]
+    fn tool_shell_settings_default_when_absent_and_survive_round_trip() {
+        // The projection trap: a key the Bun config knows about but the Rust
+        // mirror does not is silently DROPPED the next time settings are
+        // persisted from this side. Stored JSON here deliberately omits both
+        // shell keys, so this pins that they default rather than fail to
+        // deserialize, and that a set value survives persist -> reload.
+        let db = mem_db();
+        set_setting_value(
+            &db,
+            "tools",
+            r#"{"enabled":true,"require_approval":[],"sandbox_mode":"strict","allowed_roots":[]}"#,
+        )
+        .expect("tool settings should be accepted");
+
+        let mut cfg = load_jarvis_config(&db).expect("load config");
+        assert_eq!(cfg.tools.bash_path, "");
+        assert_eq!(cfg.tools.shell_timeout_max_ms, 120_000);
+
+        cfg.tools.bash_path = "C:\\Program Files\\Git\\bin\\bash.exe".to_string();
+        cfg.tools.shell_timeout_max_ms = 45_000;
+        persist_jarvis_config(&db, &cfg).expect("persist config");
+
+        let round_trip = load_jarvis_config(&db).expect("reload config");
+        assert_eq!(
+            round_trip.tools.bash_path,
+            "C:\\Program Files\\Git\\bin\\bash.exe"
+        );
+        assert_eq!(round_trip.tools.shell_timeout_max_ms, 45_000);
+    }
 }

@@ -308,6 +308,14 @@ pub struct ToolConfig {
     pub allowed_roots: Vec<String>,
     #[serde(default = "default_true")]
     pub grant_session_roots: bool,
+    #[serde(default)]
+    pub bash_path: String,
+    #[serde(default = "default_shell_timeout_max_ms")]
+    pub shell_timeout_max_ms: u64,
+}
+
+fn default_shell_timeout_max_ms() -> u64 {
+    120_000
 }
 
 impl Default for ToolConfig {
@@ -320,6 +328,8 @@ impl Default for ToolConfig {
             denylist: Vec::new(),
             allowed_roots: Vec::new(),
             grant_session_roots: true,
+            bash_path: String::new(),
+            shell_timeout_max_ms: default_shell_timeout_max_ms(),
         }
     }
 }
