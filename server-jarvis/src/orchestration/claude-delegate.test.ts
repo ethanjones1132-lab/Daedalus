@@ -503,7 +503,11 @@ describe("Claude executor delegate", () => {
       is_error: false,
     }));
     expect(output.toolCalls.at(-1)).toMatchObject({ name: "git_metadata", is_error: false });
-  }, 250);
+    // 250ms was tight under suite load — this test runs two snapshot captures plus
+    // a SIGTERM-then-SIGKILL teardown under a 15ms stage budget. The behavior
+    // under test is the verification-snapshot path, not the timing precision, so
+    // 1000ms gives the same signal without flaking.
+  }, 1000);
 
   test("abort remains terminal after bounded verification of an already-claimed write", async () => {
     const config = defaultConfig();
