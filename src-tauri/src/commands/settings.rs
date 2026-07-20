@@ -542,6 +542,79 @@ mod tests {
     }
 
     #[test]
+    fn claude_cli_delegate_defaults_for_legacy_settings_and_round_trips() {
+        let db = mem_db();
+        set_setting_value(
+            &db,
+            "claude_cli",
+            r#"{"enabled":true,"path":"claude","args":[],"timeout_ms":120000,"cwd":"","model":null}"#,
+        )
+        .expect("legacy Claude CLI settings should be accepted");
+
+        let legacy = load_jarvis_config(&db).expect("load legacy config");
+        let delegate = serde_json::to_value(&legacy.claude_cli.delegate)
+            .expect("serialize legacy delegate config");
+        assert_eq!(delegate["enabled"], true);
+        assert_eq!(delegate["policy"], "delegate_first");
+        assert_eq!(delegate["permission_mode"], "acceptEdits");
+        assert_eq!(delegate["timeout_ms"], 420_000);
+        assert_eq!(
+            delegate["allowed_tools"],
+            serde_json::json!([
+                "Read",
+                "Edit",
+                "Write",
+                "MultiEdit",
+                "Grep",
+                "Glob",
+                "WebSearch",
+                "WebFetch",
+                "TodoWrite",
+                "Task",
+                "Bash(git:*)",
+                "Bash(bun:*)",
+                "Bash(npm:*)",
+                "Bash(python:*)"
+            ])
+        );
+
+        set_setting_value(
+            &db,
+            "claude_cli",
+            r#"{"enabled":true,"path":"claude","args":[],"timeout_ms":120000,"cwd":"","model":null,"delegate":{"enabled":false,"policy":"escalation","permission_mode":"bypassPermissions","allowed_tools":["Read","Edit"],"model":"opus","timeout_ms":12345}}"#,
+        )
+        .expect("explicit delegate settings should be accepted");
+        let explicit = load_jarvis_config(&db).expect("load explicit delegate config");
+        persist_jarvis_config(&db, &explicit).expect("persist delegate config");
+        let round_trip = load_jarvis_config(&db).expect("reload delegate config");
+        let round_trip_json = serde_json::to_value(&round_trip.claude_cli.delegate)
+            .expect("serialize round-trip delegate config");
+        assert_eq!(round_trip_json["enabled"], false);
+        assert_eq!(round_trip_json["policy"], "escalation");
+        assert_eq!(round_trip_json["permission_mode"], "bypassPermissions");
+        assert_eq!(
+            round_trip_json["allowed_tools"],
+            serde_json::json!(["Read", "Edit"])
+        );
+        assert_eq!(round_trip_json["model"], "opus");
+        assert_eq!(round_trip_json["timeout_ms"], 12_345);
+
+        set_setting_value(
+            &db,
+            "claude_cli",
+            r#"{"enabled":true,"path":"claude","args":[],"timeout_ms":120000,"cwd":"","model":null,"delegate":{"enabled":false}}"#,
+        )
+        .expect("partial delegate settings should be accepted");
+        let partial = load_jarvis_config(&db).expect("load partial delegate config");
+        let partial_json = serde_json::to_value(&partial.claude_cli.delegate)
+            .expect("serialize partial delegate config");
+        assert_eq!(partial_json["enabled"], false);
+        assert_eq!(partial_json["policy"], "delegate_first");
+        assert_eq!(partial_json["permission_mode"], "acceptEdits");
+        assert_eq!(partial_json["timeout_ms"], 420_000);
+    }
+
+    #[test]
     fn tool_root_settings_load_from_sqlite_and_persist_back_to_it() {
         let db = mem_db();
         set_setting_value(

@@ -107,6 +107,18 @@ export interface ClaudeCliConfig {
   cwd: string;
   /** Model id the Claude-CLI engine drives the proxy with (set per active profile). */
   model?: string;
+  /** Stock Claude executor delegation, projected independently from chat CLI settings. */
+  delegate: ClaudeDelegateConfig;
+}
+
+export interface ClaudeDelegateConfig {
+  enabled: boolean;
+  policy: "delegate_first" | "escalation";
+  permission_mode: "acceptEdits" | "bypassPermissions";
+  allowed_tools: string[];
+  /** Blank delegates model selection to the configured auth-mode default. */
+  model: string;
+  timeout_ms: number;
 }
 
 export interface ToolConfig {
@@ -446,6 +458,21 @@ export function defaultConfig(): JarvisConfig {
       timeout_ms: 120000,
       cwd: homedir(),
       model: "",
+      delegate: {
+        enabled: true,
+        policy: "delegate_first",
+        permission_mode: "acceptEdits",
+        allowed_tools: [
+          "Read", "Edit", "Write", "MultiEdit", "Grep", "Glob",
+          "WebSearch", "WebFetch", "TodoWrite", "Task",
+          "Bash(git:*)",
+          "Bash(bun:*)",
+          "Bash(npm:*)",
+          "Bash(python:*)",
+        ],
+        model: "",
+        timeout_ms: 420_000,
+      },
     },
     tools: {
       enabled: true,

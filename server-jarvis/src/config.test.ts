@@ -44,6 +44,47 @@ describe("Claude CLI auth mode config", () => {
   });
 });
 
+describe("Claude CLI delegate config", () => {
+  test("projects safe delegate defaults into legacy Claude CLI config", () => {
+    const delegate = normalizeConfig({ claude_cli: { enabled: true } }).claude_cli.delegate;
+
+    expect(delegate).toEqual({
+      enabled: true,
+      policy: "delegate_first",
+      permission_mode: "acceptEdits",
+      allowed_tools: [
+        "Read", "Edit", "Write", "MultiEdit", "Grep", "Glob",
+        "WebSearch", "WebFetch", "TodoWrite", "Task",
+        "Bash(git:*)",
+        "Bash(bun:*)",
+        "Bash(npm:*)",
+        "Bash(python:*)",
+      ],
+      model: "",
+      timeout_ms: 420_000,
+    });
+  });
+
+  test("round-trips explicit delegate settings", () => {
+    const config = normalizeConfig({
+      claude_cli: {
+        delegate: {
+          enabled: false,
+          policy: "escalation",
+          permission_mode: "bypassPermissions",
+          allowed_tools: ["Read", "Edit"],
+          model: "opus",
+          timeout_ms: 12_345,
+        },
+      },
+    });
+
+    expect(normalizeConfig(JSON.parse(JSON.stringify(config))).claude_cli.delegate).toEqual(
+      config.claude_cli.delegate,
+    );
+  });
+});
+
 describe("stale jarvis_path warning dedupe (Task 3.5)", () => {
   test("warns once per distinct stale path per process, not on every normalization", () => {
     const originalWarn = console.warn;

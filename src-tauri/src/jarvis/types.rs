@@ -189,7 +189,7 @@ pub enum ClaudeCliAuthMode {
     Subscription,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClaudeCliConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -204,6 +204,97 @@ pub struct ClaudeCliConfig {
     pub cwd: String,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub delegate: ClaudeDelegateConfig,
+}
+
+impl Default for ClaudeCliConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auth_mode: ClaudeCliAuthMode::default(),
+            path: String::new(),
+            args: Vec::new(),
+            timeout_ms: 0,
+            cwd: String::new(),
+            model: None,
+            delegate: ClaudeDelegateConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+pub enum ClaudeDelegatePolicy {
+    #[serde(rename = "delegate_first")]
+    #[default]
+    DelegateFirst,
+    #[serde(rename = "escalation")]
+    Escalation,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+pub enum ClaudeDelegatePermissionMode {
+    #[serde(rename = "acceptEdits")]
+    #[default]
+    AcceptEdits,
+    #[serde(rename = "bypassPermissions")]
+    BypassPermissions,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ClaudeDelegateConfig {
+    #[serde(default = "default_delegate_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub policy: ClaudeDelegatePolicy,
+    #[serde(default)]
+    pub permission_mode: ClaudeDelegatePermissionMode,
+    #[serde(default = "default_delegate_allowed_tools")]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default = "default_delegate_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_delegate_enabled() -> bool {
+    true
+}
+
+fn default_delegate_allowed_tools() -> Vec<String> {
+    vec![
+        "Read".to_string(),
+        "Edit".to_string(),
+        "Write".to_string(),
+        "MultiEdit".to_string(),
+        "Grep".to_string(),
+        "Glob".to_string(),
+        "WebSearch".to_string(),
+        "WebFetch".to_string(),
+        "TodoWrite".to_string(),
+        "Task".to_string(),
+        "Bash(git:*)".to_string(),
+        "Bash(bun:*)".to_string(),
+        "Bash(npm:*)".to_string(),
+        "Bash(python:*)".to_string(),
+    ]
+}
+
+fn default_delegate_timeout_ms() -> u64 {
+    420_000
+}
+
+impl Default for ClaudeDelegateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_delegate_enabled(),
+            policy: ClaudeDelegatePolicy::DelegateFirst,
+            permission_mode: ClaudeDelegatePermissionMode::AcceptEdits,
+            allowed_tools: default_delegate_allowed_tools(),
+            model: String::new(),
+            timeout_ms: default_delegate_timeout_ms(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
