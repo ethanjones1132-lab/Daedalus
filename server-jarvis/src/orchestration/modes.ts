@@ -1,12 +1,19 @@
 import type { ToolDefinition } from "../tool-types";
 import type { ExecutionProfile } from "./route-normalization";
+import { defaultCapabilityIndex } from "../tool-capabilities-default";
 
 /**
  * Tools permitted under the `read_only` execution profile. A `workspace_read`
  * turn (and an `answer_only` turn that opts into the executor) is capped to
  * these — so a misclassified read can never mutate the workspace.
+ *
+ * Derived from `capability.read_only_profile`. This is deliberately NARROWER
+ * than "does not mutate": `web_fetch` is non-mutating and parallel-safe but
+ * still reaches the network, so it is not admitted into a read-only workspace
+ * turn. That distinction is why this set and the pipeline's parallel-batch set
+ * are two different predicates rather than one drifting list.
  */
-export const READ_ONLY_TOOLS: readonly string[] = ["read_file", "list_directory", "glob", "grep", "git_metadata"];
+export const READ_ONLY_TOOLS: readonly string[] = [...defaultCapabilityIndex().readOnlyProfile];
 
 export interface AgentMode {
   id: string;

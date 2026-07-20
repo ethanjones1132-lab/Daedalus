@@ -61,6 +61,7 @@ const GIT_METADATA_DEF: ToolDefinition = {
   },
   requires_approval: false,
   dangerous: false,
+  capability: { class: "read", evidence: "metadata", parallel_safe: true, read_only_profile: true },
 };
 
 async function handleGitMetadata(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {

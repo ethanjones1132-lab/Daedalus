@@ -27,6 +27,7 @@ const BASH_DEF: ToolDefinition = {
   },
   requires_approval: true,
   dangerous: true,
+  capability: { class: "shell", evidence: "execution" },
 };
 
 async function handleBash(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {

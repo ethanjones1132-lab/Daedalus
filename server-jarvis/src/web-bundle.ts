@@ -23,6 +23,7 @@ const WEB_SEARCH_DEF: ToolDefinition = {
   },
   requires_approval: false,
   dangerous: false,
+  capability: { class: "network", evidence: "network", parallel_safe: true },
 };
 
 const WEB_FETCH_DEF: ToolDefinition = {
@@ -41,6 +42,7 @@ const WEB_FETCH_DEF: ToolDefinition = {
   },
   requires_approval: false,
   dangerous: false,
+  capability: { class: "network", evidence: "network", parallel_safe: true, cacheable: true },
 };
 
 async function toolWebFetch(args: Record<string, unknown>): Promise<string> {

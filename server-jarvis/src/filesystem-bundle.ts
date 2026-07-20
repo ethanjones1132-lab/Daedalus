@@ -40,6 +40,7 @@ const READ_FILE_DEF: ToolDefinition = {
   },
   requires_approval: false,
   dangerous: false,
+  capability: { class: "read", evidence: "content", parallel_safe: true, cacheable: true, read_only_profile: true },
 };
 
 const WRITE_FILE_DEF: ToolDefinition = {
@@ -58,6 +59,7 @@ const WRITE_FILE_DEF: ToolDefinition = {
   },
   requires_approval: true,
   dangerous: true,
+  capability: { class: "write", evidence: "none" },
 };
 
 const EDIT_FILE_DEF: ToolDefinition = {
@@ -77,6 +79,7 @@ const EDIT_FILE_DEF: ToolDefinition = {
   },
   requires_approval: true,
   dangerous: true,
+  capability: { class: "write", evidence: "none" },
 };
 
 const MULTI_EDIT_DEF: ToolDefinition = {
@@ -102,6 +105,7 @@ const MULTI_EDIT_DEF: ToolDefinition = {
   },
   requires_approval: true,
   dangerous: true,
+  capability: { class: "write", evidence: "none" },
 };
 
 const APPLY_PATCH_DEF: ToolDefinition = {
@@ -120,6 +124,7 @@ const APPLY_PATCH_DEF: ToolDefinition = {
   },
   requires_approval: true,
   dangerous: true,
+  capability: { class: "write", evidence: "none" },
 };
 
 const GLOB_DEF: ToolDefinition = {
@@ -138,6 +143,7 @@ const GLOB_DEF: ToolDefinition = {
   },
   requires_approval: false,
   dangerous: false,
+  capability: { class: "list", evidence: "listing", parallel_safe: true, cacheable: true, read_only_profile: true },
 };
 
 const GREP_DEF: ToolDefinition = {
@@ -158,6 +164,7 @@ const GREP_DEF: ToolDefinition = {
   },
   requires_approval: false,
   dangerous: false,
+  capability: { class: "read", evidence: "content", parallel_safe: true, cacheable: true, read_only_profile: true },
 };
 
 const LIST_DIR_DEF: ToolDefinition = {
@@ -175,6 +182,7 @@ const LIST_DIR_DEF: ToolDefinition = {
   },
   requires_approval: false,
   dangerous: false,
+  capability: { class: "list", evidence: "listing", parallel_safe: true, cacheable: true, read_only_profile: true },
 };
 
 // ── Handlers (ported from tools.ts) ─────────────────────────────────────────────

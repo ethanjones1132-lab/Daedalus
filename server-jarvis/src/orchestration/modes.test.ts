@@ -52,12 +52,16 @@ describe("READ_ONLY_TOOLS", () => {
     // The set is the security fence — a future "let me also add git_metadata
     // to allow extra context" change would silently expand a misclassified
     // workspace_read's reach. Pin the exact contents.
-    expect(READ_ONLY_TOOLS).toEqual([
-      "read_file",
-      "list_directory",
+    //
+    // Compared order-insensitively: the list is now DERIVED from the capability
+    // taxonomy, so its order follows bundle registration order rather than the
+    // order someone typed. Membership is the security property; sequence is not.
+    expect([...READ_ONLY_TOOLS].sort()).toEqual([
+      "git_metadata",
       "glob",
       "grep",
-      "git_metadata",
+      "list_directory",
+      "read_file",
     ]);
   });
 

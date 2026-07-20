@@ -14,6 +14,53 @@ export interface ToolParameter {
   default?: unknown;
 }
 
+// ── Tool Capability Taxonomy ──
+
+/**
+ * What a tool DOES. Supervision code (effect gate, profile allowlists,
+ * evidence accounting, batch partitioning) branches on this instead of
+ * hard-coding tool names, so registering a new tool can no longer silently
+ * omit it from a name-list somewhere.
+ */
+export type ToolCapabilityClass =
+  | "read"
+  | "list"
+  | "write"
+  | "shell"
+  | "network"
+  | "delegate"
+  | "meta"
+  | "interactive";
+
+/**
+ * What KIND of evidence a SUCCESSFUL call produces. Distinct from `class`
+ * because two tools in the same class can be worth different evidence:
+ * `glob` lists, `read_file` yields content, and both are class `read`-adjacent.
+ */
+export type ToolEvidenceClass =
+  | "content"
+  | "listing"
+  | "metadata"
+  | "execution"
+  | "network"
+  | "none";
+
+export interface ToolCapability {
+  class: ToolCapabilityClass;
+  evidence: ToolEvidenceClass;
+  /** Safe to execute concurrently with other parallel-safe calls in one batch. */
+  parallel_safe?: boolean;
+  /** Output may be served from the per-turn read cache. */
+  cacheable?: boolean;
+  /**
+   * Admissible under the `read_only` execution profile. This is a SECURITY
+   * allowlist and deliberately narrower than "does not write": `web_fetch` is
+   * parallel-safe and non-mutating but still reaches the network, so it is not
+   * admitted into a read-only workspace turn.
+   */
+  read_only_profile?: boolean;
+}
+
 // ── Tool Definition (OpenAI format) ──
 
 export interface ToolDefinition {
@@ -38,6 +85,14 @@ export interface ToolDefinition {
    * but toApiTools() will filter it out of the schema sent to the LLM.
    */
   text_protocol_only?: boolean;
+  /**
+   * Capability taxonomy for this tool. Optional on the type so third-party and
+   * dynamically-registered tools (MCP) still typecheck, but every tool
+   * registered by a standard bundle sets it — `bundles-registry.test.ts` pins
+   * that, and `tool-capabilities.ts` treats an absent capability as the most
+   * restrictive interpretation rather than a free pass.
+   */
+  capability?: ToolCapability;
 }
 
 // ── Tool Call ──

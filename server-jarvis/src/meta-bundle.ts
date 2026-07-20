@@ -35,6 +35,7 @@ const TODO_WRITE_DEF: ToolDefinition = {
   },
   requires_approval: false,
   dangerous: false,
+  capability: { class: "meta", evidence: "none" },
 };
 
 const TODO_LIST_DEF: ToolDefinition = {
@@ -46,6 +47,7 @@ const TODO_LIST_DEF: ToolDefinition = {
   },
   requires_approval: false,
   dangerous: false,
+  capability: { class: "meta", evidence: "none" },
 };
 
 const TOOLS_ENUM_DEF: ToolDefinition = {
@@ -57,6 +59,7 @@ const TOOLS_ENUM_DEF: ToolDefinition = {
   },
   requires_approval: false,
   dangerous: false,
+  capability: { class: "meta", evidence: "none" },
   // Hidden from native-function-calling models (they already know their tools
   // from the API schema). Only dispatched via the text-tool fallback protocol,
   // where models that can't use native tools need to discover available tools.

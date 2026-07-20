@@ -35,6 +35,7 @@ function def(
     requires_approval: false,
     dangerous: false,
     text_protocol_only: true,
+    capability: { class: "interactive", evidence: "none" },
   };
 }
 

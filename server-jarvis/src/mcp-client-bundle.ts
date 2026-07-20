@@ -12,7 +12,7 @@
 // list/read tools are safe.
 
 import type { ToolRuntime } from "./tool-runtime";
-import type { ToolDefinition, ToolParameter } from "./tool-types";
+import type { ToolCapability, ToolDefinition, ToolParameter } from "./tool-types";
 import {
   toolMcpListServers, toolMcpListTools, toolMcpCallTool,
   toolMcpListResources, toolMcpReadResource,
@@ -24,12 +24,14 @@ function def(
   properties: Record<string, ToolParameter>,
   required: string[],
   dangerous = false,
+  capability: ToolCapability = { class: "meta", evidence: "none" },
 ): ToolDefinition {
   return {
     type: "function",
     function: { name, description, parameters: { type: "object", properties, required } },
     requires_approval: dangerous,
     dangerous,
+    capability,
   };
 }
 
@@ -46,7 +48,7 @@ const CALL_TOOL_DEF = def("mcp_call_tool",
     server: { type: "string", description: "MCP server name" },
     tool: { type: "string", description: "Tool name to call on the server" },
     arguments: { type: "object", description: "Arguments object for the tool" },
-  }, ["server", "tool"], true);
+  }, ["server", "tool"], true, { class: "delegate", evidence: "execution" });
 
 const LIST_RESOURCES_DEF = def("mcp_list_resources",
   "List resources exposed by one or all configured MCP servers.",
@@ -57,7 +59,7 @@ const READ_RESOURCE_DEF = def("mcp_read_resource",
   {
     server: { type: "string", description: "MCP server name" },
     uri: { type: "string", description: "Resource URI to read" },
-  }, ["server", "uri"]);
+  }, ["server", "uri"], false, { class: "network", evidence: "network" });
 
 export function registerMcpClientBundle(rt: ToolRuntime): void {
   rt.register(LIST_SERVERS_DEF, (a, c) => toolMcpListServers(a, c.config));

@@ -1,8 +1,17 @@
 import type { ExecutorStageOutput, RewriterStageOutput, ToolCallRecord } from "./stage-output";
 import type { ExecutionProfile } from "./route-normalization";
 import { hasWriteIntent } from "./turn-requirements";
+import { defaultCapabilityIndex } from "../tool-capabilities-default";
 
-export const WRITE_EFFECT_TOOLS = new Set(["write_file", "edit_file", "multi_edit", "apply_patch"]);
+/**
+ * Tools whose success is a real workspace mutation.
+ *
+ * Derived from the capability taxonomy (`class: "write"`) rather than hand
+ * maintained, so a newly-registered write tool earns write credit without
+ * anyone remembering to edit this file. `tool-capabilities.test.ts` pins that
+ * the derived set still covers every name this list used to carry.
+ */
+export const WRITE_EFFECT_TOOLS: ReadonlySet<string> = defaultCapabilityIndex().writeEffect;
 export const MAX_FAILED_WRITE_ATTEMPTS_WITHOUT_EFFECT = 2;
 
 export interface EffectGateReport {

@@ -1,4 +1,5 @@
 import { loadPrompt } from "./prompt-loader";
+import { defaultCapabilityIndex } from "../tool-capabilities-default";
 import { BUILTIN_MODES, executorTurnLimit, getToolsForMode } from "./modes";
 import { toolResultModelText, type ToolRuntime, type ExecutionContext } from "../tool-runtime";
 import type { CallModelFn, ChatMessage } from "./router";
@@ -203,8 +204,13 @@ export interface PipelineExecuteOptions {
   turnAbort?: AbortSignal;
 }
 
-const READ_CACHE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "web_fetch"]);
-const READ_ONLY_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "git_metadata", "web_fetch"]);
+// Derived from the capability taxonomy. READ_CACHE_TOOLS is `cacheable`
+// (output may be replayed from the per-turn cache); READ_ONLY_TOOLS here is
+// `parallel_safe` — the non-mutating batchable set, which is a DIFFERENT
+// predicate from modes.ts READ_ONLY_TOOLS (the read_only profile security
+// allowlist). Naming both explicitly is the point of the taxonomy.
+const READ_CACHE_TOOLS = defaultCapabilityIndex().cacheable;
+const READ_ONLY_TOOLS = defaultCapabilityIndex().parallelSafe;
 const PIPELINE_TOOL_RESULT_NOTE =
   "Result recorded in full for verification. Re-run the tool with a narrower target if you need the elided middle.";
 

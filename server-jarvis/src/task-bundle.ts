@@ -9,7 +9,7 @@
 // dangerous + approval-required. Read/control tools are safe.
 
 import type { ToolRuntime } from "./tool-runtime";
-import type { ToolDefinition, ToolParameter } from "./tool-types";
+import type { ToolCapability, ToolDefinition, ToolParameter } from "./tool-types";
 import {
   toolRunBackgroundCommand, toolAgent, toolTaskCreate,
   toolTaskList, toolTaskGet, toolTaskOutput, toolTaskStop,
@@ -21,12 +21,14 @@ function def(
   properties: Record<string, ToolParameter>,
   required: string[],
   dangerous = false,
+  capability: ToolCapability = { class: "meta", evidence: "none" },
 ): ToolDefinition {
   return {
     type: "function",
     function: { name, description, parameters: { type: "object", properties, required } },
     requires_approval: dangerous,
     dangerous,
+    capability,
   };
 }
 
@@ -37,7 +39,7 @@ const RUN_BG_DEF = def("run_background_command",
     powershell: { type: "boolean", description: "Run via PowerShell instead of bash" },
     cwd: { type: "string", description: "Working directory" },
     description: { type: "string", description: "Short label for the task" },
-  }, ["command"], true);
+  }, ["command"], true, { class: "shell", evidence: "execution" });
 
 const AGENT_DEF = def("agent",
   "Run a sub-agent to completion and return its final output (blocking).",
@@ -46,7 +48,7 @@ const AGENT_DEF = def("agent",
     description: { type: "string", description: "Short label" },
     subagent_type: { type: "string", description: "Agent type (default: general)" },
     timeout_ms: { type: "number", description: "Max run time in milliseconds" },
-  }, ["prompt"], true);
+  }, ["prompt"], true, { class: "delegate", evidence: "execution" });
 
 const TASK_CREATE_DEF = def("task_create",
   "Start a background sub-agent task and return its id.",
@@ -55,7 +57,7 @@ const TASK_CREATE_DEF = def("task_create",
     description: { type: "string", description: "Short label" },
     subagent_type: { type: "string", description: "Agent type (default: general)" },
     cwd: { type: "string", description: "Working directory" },
-  }, ["prompt"], true);
+  }, ["prompt"], true, { class: "delegate", evidence: "none" });
 
 const TASK_LIST_DEF = def("task_list",
   "List background tasks, optionally filtered by status.",
