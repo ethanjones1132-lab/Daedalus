@@ -371,6 +371,11 @@ describe("Claude executor delegate", () => {
     expect(kills).toEqual(["SIGTERM", "SIGKILL"]);
     expect(health.snapshot().lastReason).toBe("timeout_without_write");
     expect(captures).toBe(1);
+    expect(output.toolCalls).toContainEqual(expect.objectContaining({
+      name: "delegate_cleanup",
+      arguments: { status: "terminated" },
+      is_error: false,
+    }));
   }, 200);
 
   test("uses the injected tree killer for TERM then forced KILL so grandchildren cannot leak", async () => {
@@ -418,6 +423,51 @@ describe("Claude executor delegate", () => {
     expect(parentAlive).toBe(false);
     expect(grandchildAlive).toBe(false);
   });
+
+  test("bounds teardown after forced KILL when the child exit promise never settles", async () => {
+    const config = defaultConfig();
+    const snapshot: DelegateRootSnapshot = {
+      root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
+    };
+    const signals: string[] = [];
+    const health = new DelegateHealth();
+    const started = Date.now();
+    const output = await Promise.race([
+      runClaudeDelegate({
+        config,
+        prompt: "change it",
+        sessionId: "123e4567-e89b-42d3-a456-426614174000",
+        allowedRoots: ["C:\\repo"],
+        stageRemainingMs: 1,
+        profile: "full",
+        writeEffectRequired: true,
+        nativeNoWrite: false,
+        health,
+        terminationGraceMs: 2,
+        cleanupTimeoutMs: 8,
+        snapshotFactory: { capture: async () => [snapshot] },
+        treeKiller: {
+          signalTree: async (_process, signal) => { signals.push(signal); },
+        },
+        processFactory: async () => ({
+          events: { [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }) },
+          exit: new Promise(() => {}),
+          kill: () => {},
+        }),
+      }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("delegate teardown did not resolve")), 500)),
+    ]);
+
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(output).toMatchObject({ ok: false, terminalStatus: "timed_out", errorCode: "delegate_timeout" });
+    expect(output.toolCalls).toContainEqual(expect.objectContaining({
+      name: "delegate_cleanup",
+      is_error: true,
+      error_code: "delegate_cleanup_unconfirmed",
+    }));
+    expect(health.snapshot().lastReason).toBe("termination_unconfirmed");
+  }, 1_000);
 
   test("wires caller abort to child termination and returns cancelled output", async () => {
     const config = defaultConfig();
@@ -591,6 +641,11 @@ describe("Claude executor delegate", () => {
       processFactory: async () => launch,
     });
     expect(output).toMatchObject({ terminalStatus: "timed_out", errorCode: "delegate_timeout" });
+    expect(output.toolCalls).toContainEqual(expect.objectContaining({
+      name: "delegate_cleanup",
+      arguments: { status: "factory_unsettled" },
+      is_error: true,
+    }));
 
     let finish!: (exit: { code: number | null; signal: string | null }) => void;
     const exit = new Promise<{ code: number | null; signal: string | null }>((resolve) => { finish = resolve; });
@@ -605,6 +660,64 @@ describe("Claude executor delegate", () => {
     await new Promise((resolve) => setTimeout(resolve, 15));
     expect(kills).toEqual(["SIGTERM", "SIGKILL"]);
   });
+
+  test("observes a late factory cleanup rejection and returns a bounded known outcome", async () => {
+    const config = defaultConfig();
+    const snapshot: DelegateRootSnapshot = {
+      root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
+    };
+    const signals: string[] = [];
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const started = Date.now();
+      const output = await Promise.race([
+        runClaudeDelegate({
+          config,
+          prompt: "change it",
+          sessionId: "123e4567-e89b-42d3-a456-426614174000",
+          allowedRoots: ["C:\\repo"],
+          stageRemainingMs: 1,
+          profile: "full",
+          writeEffectRequired: true,
+          nativeNoWrite: false,
+          health: new DelegateHealth(),
+          terminationGraceMs: 2,
+          cleanupTimeoutMs: 300,
+          snapshotFactory: { capture: async () => [snapshot] },
+          processFactory: async () => {
+            await new Promise((resolve) => setTimeout(resolve, 4));
+            return {
+              events: (async function* () {})(),
+              exit: new Promise<{ code: number | null; signal: string | null }>(() => {}),
+              kill: () => {},
+            };
+          },
+          treeKiller: {
+            signalTree: async (_process, signal) => {
+              signals.push(signal);
+              if (signal === "SIGKILL") throw new Error("forced tree kill failed");
+            },
+          },
+        }),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("late cleanup did not resolve")), 1_000)),
+      ]);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(Date.now() - started).toBeLessThan(1_000);
+      expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+      expect(unhandled).toEqual([]);
+      expect(output).toMatchObject({ ok: false, terminalStatus: "timed_out", errorCode: "delegate_timeout" });
+      expect(output.toolCalls).toContainEqual(expect.objectContaining({
+        name: "delegate_cleanup",
+        is_error: true,
+        error_code: "delegate_cleanup_signal_error",
+      }));
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  }, 1_000);
 
   test("deadline covers delayed post-snapshot and downgrades unverifiable writes", async () => {
     const config = defaultConfig();

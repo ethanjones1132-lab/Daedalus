@@ -50,7 +50,8 @@ export type DelegateHealthStrikeReason =
   | "spawn_error"
   | "no_event_exit"
   | "timeout_without_write"
-  | "unverified_write";
+  | "unverified_write"
+  | "termination_unconfirmed";
 
 export const DELEGATE_HEALTH_COOLDOWN_MS = 10 * 60 * 1_000;
 
@@ -416,6 +417,8 @@ export interface RunClaudeDelegateInput {
   baseEnv?: NodeJS.ProcessEnv;
   now?: () => number;
   terminationGraceMs?: number;
+  /** Hard wall-time cap for teardown, including TERM grace and post-KILL observation. */
+  cleanupTimeoutMs?: number;
   treeKiller?: DelegateProcessTreeKiller;
 }
 
@@ -588,17 +591,123 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, Math.max(0, ms)));
 }
 
+type DelegateCleanupOutcome =
+  | { status: "terminated"; detail: string }
+  | { status: "exit_unconfirmed"; detail: string }
+  | { status: "signal_error"; detail: string }
+  | { status: "factory_unsettled"; detail: string }
+  | { status: "factory_error"; detail: string };
+
+interface ObservedOperation {
+  settled: Promise<void>;
+  state: () => { kind: "pending" } | { kind: "success" } | { kind: "error"; error: unknown };
+}
+
+function observeOperation(operation: () => Promise<unknown>): ObservedOperation {
+  let state: ReturnType<ObservedOperation["state"]> = { kind: "pending" };
+  let result: Promise<unknown>;
+  try {
+    result = operation();
+  } catch (error) {
+    result = Promise.reject(error);
+  }
+  const settled = Promise.resolve(result)
+    .then(
+      () => { state = { kind: "success" }; },
+      (error) => { state = { kind: "error", error }; },
+    );
+  return { settled, state: () => state };
+}
+
+function cleanupRecord(outcome: DelegateCleanupOutcome): ToolCallRecord {
+  const isError = outcome.status !== "terminated";
+  const signalError = outcome.status === "signal_error";
+  return {
+    name: "delegate_cleanup",
+    arguments: { status: outcome.status },
+    output: outcome.detail,
+    is_error: isError,
+    ...(isError ? {
+      error_code: signalError ? "delegate_cleanup_signal_error" as const : "delegate_cleanup_unconfirmed" as const,
+    } : {}),
+    duration_ms: 0,
+  };
+}
+
 async function terminateDelegateProcess(
   childProcess: DelegateProcess,
   graceMs: number,
+  cleanupTimeoutMs: number,
   treeKiller: DelegateProcessTreeKiller,
-): Promise<void> {
-  await treeKiller.signalTree(childProcess, "SIGTERM");
-  await delay(graceMs);
+): Promise<DelegateCleanupOutcome> {
+  const startedAt = Date.now();
+  const capMs = Math.max(1, cleanupTimeoutMs);
+  const boundedGraceMs = Math.min(Math.max(0, graceMs), capMs);
+  const exit = observeOperation(() => childProcess.exit);
+  const term = observeOperation(() => treeKiller.signalTree(childProcess, "SIGTERM"));
+
+  await delay(boundedGraceMs);
   // Always force-signal the whole tree after grace, even when the direct
   // parent already exited: a grandchild may have ignored TERM and outlived it.
-  await treeKiller.signalTree(childProcess, "SIGKILL");
-  await childProcess.exit;
+  const kill = observeOperation(() => treeKiller.signalTree(childProcess, "SIGKILL"));
+  // Let an immediately fulfilled/rejected signal operation become observable
+  // even if the TERM timer consumed the nominal cleanup wall-time.
+  await Promise.resolve();
+  let remainingMs = Math.max(0, capMs - (Date.now() - startedAt));
+  if (kill.state().kind === "pending" && remainingMs > 0) {
+    await Promise.race([kill.settled, delay(remainingMs)]);
+  }
+
+  const killState = kill.state();
+  const termState = term.state();
+  if (killState.kind === "error") {
+    return { status: "signal_error", detail: `Forced process-tree kill failed: ${String(killState.error)}` };
+  }
+  if (killState.kind === "pending") {
+    return { status: "signal_error", detail: "Forced process-tree kill did not settle before the cleanup deadline." };
+  }
+  remainingMs = Math.max(0, capMs - (Date.now() - startedAt));
+  if (exit.state().kind === "pending" && remainingMs > 0) {
+    await Promise.race([exit.settled, delay(remainingMs)]);
+  }
+  const exitState = exit.state();
+  if (exitState.kind === "error") {
+    return { status: "exit_unconfirmed", detail: `Child exit observation failed after forced kill: ${String(exitState.error)}` };
+  }
+  if (exitState.kind === "pending") {
+    return { status: "exit_unconfirmed", detail: "Child exit was not observed before the cleanup deadline after forced process-tree kill." };
+  }
+  const termDetail = termState.kind === "error" ? ` TERM reported: ${String(termState.error)}.` : "";
+  return { status: "terminated", detail: `Process-tree termination was confirmed after forced kill.${termDetail}` };
+}
+
+async function cleanupLateLaunch(
+  launchPromise: Promise<DelegateProcess>,
+  graceMs: number,
+  cleanupTimeoutMs: number,
+  treeKiller: DelegateProcessTreeKiller,
+): Promise<DelegateCleanupOutcome> {
+  // This promise is deliberately total: both a late factory rejection and
+  // every termination failure become data, so no detached rejection escapes.
+  const cleanup = launchPromise.then<DelegateCleanupOutcome, DelegateCleanupOutcome>(
+    (lateProcess) => terminateDelegateProcess(lateProcess, graceMs, cleanupTimeoutMs, treeKiller),
+    (error) => ({ status: "factory_error", detail: `Late process factory rejected: ${String(error)}` }),
+  ).then(
+    (outcome) => outcome,
+    (error): DelegateCleanupOutcome => ({ status: "signal_error", detail: `Late process cleanup failed: ${String(error)}` }),
+  );
+  const observed = await Promise.race([
+    cleanup.then((outcome) => ({ kind: "outcome" as const, outcome })),
+    delay(cleanupTimeoutMs).then(() => ({ kind: "deadline" as const })),
+  ]);
+  if (observed.kind === "outcome") return observed.outcome;
+  // `cleanup` remains attached and total. If the factory eventually returns a
+  // child, process-tree termination starts immediately and is itself bounded.
+  void cleanup.then(() => undefined);
+  return {
+    status: "factory_unsettled",
+    detail: "Process factory did not settle within the cleanup deadline; late resolution remains fenced for bounded tree termination.",
+  };
 }
 
 /**
@@ -626,6 +735,15 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
   );
   const now = input.now ?? Date.now;
   const treeKiller = input.treeKiller ?? platformDelegateProcessTreeKiller;
+  const terminationGraceMs = Number.isFinite(input.terminationGraceMs)
+    ? Math.max(0, input.terminationGraceMs!)
+    : 10_000;
+  const requestedCleanupTimeoutMs = Number.isFinite(input.cleanupTimeoutMs)
+    ? input.cleanupTimeoutMs!
+    : terminationGraceMs + 2_000;
+  // Teardown is permitted to outlive the execution deadline, but never this
+  // explicit finite wall-time cap.
+  const cleanupTimeoutMs = Math.max(1, Math.min(requestedCleanupTimeoutMs, 30_000));
   const permittedStockTools = new Set(rootConfinableDelegateTools(input.config.claude_cli.delegate.allowed_tools));
   const terminalOutput = (
     kind: DelegateOperationTerminal,
@@ -634,6 +752,9 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
   ): ExecutorStageOutput => {
     if (kind === "timeout" && !toolCalls.some((record) => DELEGATE_WRITE_TOOLS.has(record.name) && !record.is_error)) {
       input.health.strike("timeout_without_write");
+    }
+    if (toolCalls.some((record) => record.name === "delegate_cleanup" && record.is_error)) {
+      input.health.strike("termination_unconfirmed");
     }
     return {
       ok: false,
@@ -671,16 +792,13 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
     }
 
     if (operation.state()) return terminalOutput(operation.state()!);
+    const records: ToolCallRecord[] = [];
     const launchPromise = input.processFactory({ ...invocation, prompt: input.prompt, signal: operation.signal });
     const launchResult = await operation.race(launchPromise);
     if (launchResult.kind === "timeout" || launchResult.kind === "aborted") {
-      // A non-cancellable factory may resolve after this method returns. Fence
-      // it to cleanup immediately and never continue into stream processing.
-      void launchPromise.then(
-        (lateProcess) => terminateDelegateProcess(lateProcess, input.terminationGraceMs ?? 10_000, treeKiller),
-        () => {},
-      );
-      return terminalOutput(launchResult.kind);
+      const cleanup = await cleanupLateLaunch(launchPromise, terminationGraceMs, cleanupTimeoutMs, treeKiller);
+      records.push(cleanupRecord(cleanup));
+      return terminalOutput(launchResult.kind, records);
     }
     if (launchResult.kind === "error") {
       input.health.strike("spawn_error");
@@ -688,12 +806,13 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
     }
     const delegatedProcess = launchResult.value;
     if (operation.state()) {
-      await terminateDelegateProcess(delegatedProcess, input.terminationGraceMs ?? 10_000, treeKiller);
-      return terminalOutput(operation.state()!);
+      records.push(cleanupRecord(await terminateDelegateProcess(
+        delegatedProcess, terminationGraceMs, cleanupTimeoutMs, treeKiller,
+      )));
+      return terminalOutput(operation.state()!, records);
     }
     if (invocation.promptOnStdin) delegatedProcess.writeStdin?.(input.prompt);
 
-    const records: ToolCallRecord[] = [];
     const pending = new Map<string, { record: ToolCallRecord; startedAt: number }>();
     const narrative: string[] = [];
     const decodeState: ClaudeStreamDecodeState = { partialTextSeen: false };
@@ -750,15 +869,21 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
     const executionResult = await operation.race(execution);
     let streamOutcome: { kind: "completed"; exit: DelegateProcessExit } | { kind: "stream_error"; error: unknown };
     if (executionResult.kind === "timeout" || executionResult.kind === "aborted") {
-      await terminateDelegateProcess(delegatedProcess, input.terminationGraceMs ?? 10_000, treeKiller);
+      records.push(cleanupRecord(await terminateDelegateProcess(
+        delegatedProcess, terminationGraceMs, cleanupTimeoutMs, treeKiller,
+      )));
       streamOutcome = { kind: "stream_error", error: executionResult.kind };
     } else if (executionResult.kind === "error") {
-      await terminateDelegateProcess(delegatedProcess, input.terminationGraceMs ?? 10_000, treeKiller);
+      records.push(cleanupRecord(await terminateDelegateProcess(
+        delegatedProcess, terminationGraceMs, cleanupTimeoutMs, treeKiller,
+      )));
       streamOutcome = { kind: "stream_error", error: executionResult.error };
     } else {
       streamOutcome = executionResult.value;
       if (streamOutcome.kind === "stream_error") {
-        await terminateDelegateProcess(delegatedProcess, input.terminationGraceMs ?? 10_000, treeKiller);
+        records.push(cleanupRecord(await terminateDelegateProcess(
+          delegatedProcess, terminationGraceMs, cleanupTimeoutMs, treeKiller,
+        )));
       }
     }
 
@@ -791,6 +916,16 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
     if (terminal) {
       if (unverifiedWrite) input.health.strike("unverified_write");
       return terminalOutput(terminal, records, narrative.join(""));
+    }
+    if (records.some((record) => record.name === "delegate_cleanup" && record.is_error)) {
+      input.health.strike("termination_unconfirmed");
+      return {
+        ok: false,
+        narrative: narrative.join(""),
+        toolCalls: records,
+        terminalStatus: "failed",
+        errorCode: "delegate_cleanup_unconfirmed",
+      };
     }
     if (afterResult.kind === "error") narrative.push(`Ground-truth verification failed: ${String(afterResult.error)}`);
     if (unverifiedWrite) {
