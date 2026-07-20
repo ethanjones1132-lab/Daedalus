@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { defaultConfig } from "../config";
 import {
   buildClaudeDelegateInvocation,
+  ClaudeDelegateAvailabilityCache,
   createPlatformDelegateProcessTreeKiller,
   DelegateHealth,
   delegateEligibility,
@@ -146,6 +147,44 @@ describe("Claude executor delegate", () => {
     expect(health.snapshot().strikes).toBe(0);
   });
 
+  test("availability caches for five minutes and requires port 19878 in proxy mode", async () => {
+    let now = 10_000;
+    let cliChecks = 0;
+    let proxyChecks = 0;
+    let proxyListening = false;
+    const availability = new ClaudeDelegateAvailabilityCache({
+      now: () => now,
+      checkCli: async () => {
+        cliChecks += 1;
+        return true;
+      },
+      checkProxyPort: async (port) => {
+        proxyChecks += 1;
+        expect(port).toBe(19_878);
+        return proxyListening;
+      },
+    });
+    const config = defaultConfig();
+    config.claude_cli.auth_mode = "proxy";
+
+    expect(await availability.isAvailable(config)).toBe(false);
+    proxyListening = true;
+    now += 299_999;
+    expect(await availability.isAvailable(config)).toBe(false);
+    expect(cliChecks).toBe(1);
+    expect(proxyChecks).toBe(1);
+
+    now += 1;
+    expect(await availability.isAvailable(config)).toBe(true);
+    expect(cliChecks).toBe(2);
+    expect(proxyChecks).toBe(2);
+
+    config.claude_cli.auth_mode = "subscription";
+    expect(await availability.isAvailable(config)).toBe(true);
+    expect(cliChecks).toBe(3);
+    expect(proxyChecks).toBe(2);
+  });
+
   test("downgrades each claimed write without matching ground-truth change before effect gating", async () => {
     const config = defaultConfig();
     const before: DelegateRootSnapshot = {
@@ -219,6 +258,8 @@ describe("Claude executor delegate", () => {
       files: { "c:\\repo\\claimed.ts": "200:12" },
     }]];
     const health = new DelegateHealth();
+    const streamedText: string[] = [];
+    const streamedTools: string[] = [];
     const output = await runClaudeDelegate({
       config,
       prompt: "write claimed.ts",
@@ -229,6 +270,8 @@ describe("Claude executor delegate", () => {
       writeEffectRequired: true,
       nativeNoWrite: false,
       health,
+      onTextDelta: (text) => streamedText.push(text),
+      onToolUse: (record) => streamedTools.push(record.name),
       snapshotFactory: { capture: async () => snapshots.shift()! },
       processFactory: async () => ({
         events: (async function* () {
@@ -254,6 +297,8 @@ describe("Claude executor delegate", () => {
     expect(output.toolCalls[0].output.length).toBeLessThanOrEqual(6_000);
     expect(output.toolCalls[0].output).toContain("truncated");
     expect(output.toolCalls.at(-1)?.output).toContain("claimed.ts | 2 ++");
+    expect(streamedText).toEqual(["Applied the change."]);
+    expect(streamedTools).toEqual(["write_file"]);
   });
 
   test("rejects an out-of-root Bash write as unverifiable policy evidence", async () => {

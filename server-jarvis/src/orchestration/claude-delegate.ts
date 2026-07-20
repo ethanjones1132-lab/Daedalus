@@ -3,6 +3,7 @@ import {
   buildLocalClaudeArgs,
   buildLocalClaudeEnv,
   decodeClaudeCliMessage,
+  isClaudeCliAvailable,
   prepareClaudeCliInvocation,
   resolveClaudePath,
   type ClaudeStreamDecodeState,
@@ -12,6 +13,7 @@ import { execFile, spawn } from "child_process";
 import { lstat, readdir } from "fs/promises";
 import { createInterface } from "readline";
 import { isAbsolute, join, relative, resolve } from "path";
+import { createConnection } from "net";
 import { prepareToolResultForContext } from "../tool-result-truncation";
 import { EXECUTOR_TOOL_RESULT_CONTEXT_CHARS } from "./context-budget";
 import type { ExecutorStageOutput, ToolCallRecord } from "./stage-output";
@@ -54,6 +56,61 @@ export type DelegateHealthStrikeReason =
   | "termination_unconfirmed";
 
 export const DELEGATE_HEALTH_COOLDOWN_MS = 10 * 60 * 1_000;
+export const DELEGATE_AVAILABILITY_CACHE_MS = 5 * 60 * 1_000;
+
+export interface ClaudeDelegateAvailabilityChecks {
+  now?: () => number;
+  checkCli?: (config: JarvisConfig) => Promise<boolean>;
+  checkProxyPort?: (port: number) => Promise<boolean>;
+}
+
+function proxyPortListening(port: number): Promise<boolean> {
+  return new Promise((resolveAvailable) => {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    let settled = false;
+    const finish = (available: boolean) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolveAvailable(available);
+    };
+    socket.setTimeout(1_000);
+    socket.once("connect", () => finish(true));
+    socket.once("timeout", () => finish(false));
+    socket.once("error", () => finish(false));
+  });
+}
+
+/** Cached launch readiness; proxy auth additionally requires its live listener. */
+export class ClaudeDelegateAvailabilityCache {
+  private readonly cache = new Map<string, { available: boolean; expiresAt: number }>();
+  private readonly now: () => number;
+  private readonly checkCli: (config: JarvisConfig) => Promise<boolean>;
+  private readonly checkProxyPort: (port: number) => Promise<boolean>;
+
+  constructor(checks: ClaudeDelegateAvailabilityChecks = {}) {
+    this.now = checks.now ?? Date.now;
+    this.checkCli = checks.checkCli ?? ((config) =>
+      isClaudeCliAvailable(config.claude_cli.path, config.claude_cli.auth_mode));
+    this.checkProxyPort = checks.checkProxyPort ?? proxyPortListening;
+  }
+
+  async isAvailable(config: JarvisConfig): Promise<boolean> {
+    const key = `${config.claude_cli.auth_mode}:${config.claude_cli.path}`;
+    const cached = this.cache.get(key);
+    if (cached && this.now() < cached.expiresAt) return cached.available;
+
+    const cliAvailable = await this.checkCli(config);
+    const proxyAvailable = config.claude_cli.auth_mode !== "proxy"
+      || await this.checkProxyPort(19_878);
+    const available = cliAvailable && proxyAvailable;
+    this.cache.set(key, {
+      available,
+      expiresAt: this.now() + DELEGATE_AVAILABILITY_CACHE_MS,
+    });
+    return available;
+  }
+}
 
 export class DelegateHealth {
   private strikes = 0;
@@ -431,6 +488,9 @@ export interface RunClaudeDelegateInput {
   /** Hard wall-time cap for teardown, including TERM grace and post-KILL observation. */
   cleanupTimeoutMs?: number;
   treeKiller?: DelegateProcessTreeKiller;
+  /** Standard executor streaming hooks supplied by the pipeline adapter. */
+  onTextDelta?: (text: string) => void;
+  onToolUse?: (record: ToolCallRecord) => void;
 }
 
 const DELEGATE_WRITE_TOOLS = new Set(["write_file", "edit_file", "multi_edit"]);
@@ -853,8 +913,14 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
           const events = decodeClaudeCliMessage(rawEvent, decodeState);
           eventCount += events.length;
           for (const event of events) {
-            if (event.type === "stream_event" && event.delta?.text) narrative.push(event.delta.text);
-            else if (event.type === "result" && event.content) narrative.push(event.content);
+            if (event.type === "stream_event" && event.delta?.text) {
+              narrative.push(event.delta.text);
+              input.onTextDelta?.(event.delta.text);
+            }
+            else if (event.type === "result" && event.content) {
+              narrative.push(event.content);
+              input.onTextDelta?.(event.content);
+            }
             else if (event.type === "tool_use") {
               const stockToolName = event.tool_name ?? "unknown";
               const permitted = permittedStockTools.has(stockToolName);
@@ -868,6 +934,7 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
               };
               if (!permitted) policyViolation = true;
               records.push(record);
+              input.onToolUse?.(record);
               pending.set(event.tool_use_id ?? `anonymous-${records.length}`, { record, startedAt: now() });
             } else if (event.type === "tool_result") {
               const match = event.tool_use_id ? pending.get(event.tool_use_id) : undefined;

@@ -120,7 +120,7 @@ import {
   latestLiveModelCatalogSnapshot,
 } from "./orchestration/live-model-catalog";
 import { excludedModelKeys } from "./model-failure-memory";
-import { PipelineExecutor } from "./orchestration/pipeline";
+import { PipelineExecutor, productionExecutorDelegateRuntime } from "./orchestration/pipeline";
 import { extractRootGrants } from "./orchestration/workspace-grants";
 import { combinedStageExclusions, StageHealthRegistry, type RecoverableFailureKind } from "./orchestration/stage-health";
 import { ModelScorecard, type ScorecardAttempt } from "./orchestration/model-scorecard";
@@ -3071,7 +3071,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           route.context.estimated_complexity,
           agentRunId,
         );
-        const executor = new PipelineExecutor(callModel, runtime, ctx, { bus: conductorBus, live: liveConductor });
+        const executor = new PipelineExecutor(
+          callModel,
+          runtime,
+          ctx,
+          { bus: conductorBus, live: liveConductor },
+          productionExecutorDelegateRuntime,
+        );
         const stageStartedAt = new Map<string, number>();
         const onOrchestratorStateChange = async (state: PipelineProgressState) => {
           const now = Date.now();
@@ -3105,6 +3111,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // and effect gate armed even though the follow-up names no mutation.
           taskRunWriteIntent: activeTaskRun.writeIntent === true,
           workspaceReadScope,
+          turnAbort: streamAbort.signal,
           workerInstructions: instructionSelection.instructions,
           sharedContext: mergedSharedContext,
           sessionMemory: sessionMemory,
@@ -3182,6 +3189,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           conductorBus.clear();
         }
         const result = pipelineResult;
+        if (result.cancelled) {
+          await emitCancelled();
+        }
 
         // Record metrics and propose tuning options
         const duration = Date.now() - runStartTime;

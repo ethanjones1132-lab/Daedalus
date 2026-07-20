@@ -58,6 +58,16 @@ import { join } from "path";
 import { canApplyConductorReroute, rejectReroute } from "./reroute-policy";
 import { resolveDeepReadIntent, type TaskRunDepth } from "./task-run";
 import { resolveAllowedRoots } from "../fs-scope";
+import {
+  ClaudeDelegateAvailabilityCache,
+  DelegateHealth,
+  delegateEligibility,
+  nodeDelegateProcessFactory,
+  nodeDelegateSnapshotFactory,
+  runClaudeDelegate,
+  type RunClaudeDelegateInput,
+} from "./claude-delegate";
+import type { JarvisConfig } from "../config";
 
 /**
  * The slice of the outcome collector the pipeline depends on. Injecting this
@@ -66,7 +76,41 @@ import { resolveAllowedRoots } from "../fs-scope";
  */
 export interface StageRunRecorder {
   recordStageRun(stage: StageRun): void;
+  recordModelAttribution?(row: {
+    id: string;
+    agent_run_id: string;
+    stage_id: string;
+    agent_id?: string;
+    provider: string;
+    model_id: string;
+    was_successful: number;
+    had_error: number;
+    duration_ms?: number;
+    first_token_ms?: number;
+    fallback_used: number;
+  }): void;
 }
+
+export interface ExecutorDelegateRuntime {
+  availability: { isAvailable(config: JarvisConfig): Promise<boolean> };
+  health?: Pick<DelegateHealth, "isAvailable">;
+  run(input: Omit<RunClaudeDelegateInput, "health" | "snapshotFactory" | "processFactory"> & {
+    onTextDelta?: (text: string) => void;
+    onToolUse?: (record: ToolCallRecord) => void;
+  }): Promise<ExecutorStageOutput>;
+}
+
+const productionDelegateHealth = new DelegateHealth();
+export const productionExecutorDelegateRuntime: ExecutorDelegateRuntime = {
+  availability: new ClaudeDelegateAvailabilityCache(),
+  health: productionDelegateHealth,
+  run: (input) => runClaudeDelegate({
+    ...input,
+    health: productionDelegateHealth,
+    snapshotFactory: nodeDelegateSnapshotFactory,
+    processFactory: nodeDelegateProcessFactory,
+  }),
+};
 
 export interface ConductorWiring {
   bus: ConductorBus;
@@ -155,6 +199,8 @@ export interface PipelineExecuteOptions {
   priorToolCalls?: ToolCallRecord[];
   /** Hard user-authored least-authority contract for bounded workspace reads. */
   workspaceReadScope?: WorkspaceReadScope;
+  /** Request-wide cancellation (Stop, disconnect, or supersession). */
+  turnAbort?: AbortSignal;
 }
 
 const READ_CACHE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep", "web_fetch"]);
@@ -323,6 +369,36 @@ function isStageTimeout(error: unknown): boolean {
   return /timeout/i.test(name) || /(?:first-token|stream idle|visible-progress|request) timeout/i.test(errText(error));
 }
 
+function combineAbortSignals(...signals: Array<AbortSignal | undefined>): {
+  signal: AbortSignal | undefined;
+  dispose: () => void;
+} {
+  const active = signals.filter((signal): signal is AbortSignal => signal !== undefined);
+  if (active.length === 0) return { signal: undefined, dispose: () => {} };
+  const controller = new AbortController();
+  const listeners: Array<{ signal: AbortSignal; listener: () => void }> = [];
+  const abortFrom = (signal: AbortSignal) => {
+    if (!controller.signal.aborted) controller.abort(signal.reason);
+  };
+  for (const signal of active) {
+    if (signal.aborted) {
+      abortFrom(signal);
+      break;
+    }
+    const listener = () => abortFrom(signal);
+    signal.addEventListener("abort", listener, { once: true });
+    listeners.push({ signal, listener });
+  }
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      for (const { signal, listener } of listeners) {
+        signal.removeEventListener("abort", listener);
+      }
+    },
+  };
+}
+
 function parseStreamedToolCall(raw: any): ToolCall {
   const name = raw?.function?.name ?? raw?.name ?? "";
   let args: Record<string, unknown> = {};
@@ -386,6 +462,8 @@ export type PipelineOutcome = "success" | "degraded" | "failed" | "partial";
 export interface PipelineResult {
   answer: string;
   error?: string;
+  /** Terminal request cancellation; production maps this to StreamCancelledError. */
+  cancelled?: boolean;
   recursion_depth?: number;
   /** Truthful run outcome. Absent is treated as "success" by legacy callers. */
   outcome?: PipelineOutcome;
@@ -530,6 +608,8 @@ function stageSystemPrompt(
 export class PipelineExecutor {
   private collector: StageRunRecorder;
   private conductor?: ConductorWiring;
+  /** One delegate process maximum per logical agent run, including replans. */
+  private delegateAttemptedRuns = new Set<string>();
 
   constructor(
     private callModel: CallModelFn,
@@ -540,6 +620,7 @@ export class PipelineExecutor {
     // is deliberately accepted in this slot too for backwards compatibility
     // with the staged live-conductor work; both paths are opt-in.
     collectorOrConductor: StageRunRecorder | ConductorWiring = outcomeCollector,
+    private delegateRuntime?: ExecutorDelegateRuntime,
   ) {
     if ("recordStageRun" in collectorOrConductor) {
       this.collector = collectorOrConductor;
@@ -1060,6 +1141,187 @@ export class PipelineExecutor {
     const availableWriteTools = getToolsForMode("executor", this.runtime.listTools(), profile)
       .map((tool) => tool.function.name)
       .filter((name) => WRITE_EFFECT_TOOLS.has(name));
+
+    const runDelegate = async (nativeNoWrite: boolean): Promise<ExecutorStageOutput | undefined> => {
+      const delegateRuntime = this.delegateRuntime;
+      if (!delegateRuntime || this.delegateAttemptedRuns.has(agentRunId)) return undefined;
+      const allowedRoots = this.evidenceRoots(options);
+      const eligibility = delegateEligibility({
+        config: this.ctx.config,
+        profile,
+        writeEffectRequired: requiresWriteEffect,
+        nativeNoWrite,
+        healthAvailable: delegateRuntime.health?.isAvailable() ?? true,
+        allowedRoots,
+      });
+      if (!eligibility.eligible) {
+        return undefined;
+      }
+      let available = false;
+      try {
+        available = await delegateRuntime.availability.isAvailable(this.ctx.config);
+      } catch {
+        // Availability is an optimization boundary, not a reason to fail the
+        // native executor. A later replan may probe again because no delegate
+        // process was launched.
+        return undefined;
+      }
+      if (!available) return undefined;
+
+      const delegateStart = Date.now();
+      const stageId = `stage_${crypto.randomUUID()}`;
+      const prompt = [
+        executorPrompt,
+        `User Request: ${request}`,
+        `Plan:\n${planSummary}`,
+        "[Runtime write contract] Apply the requested change with a stock write tool and verify the resulting filesystem mutation.",
+      ].join("\n\n");
+      const combinedAbort = combineAbortSignals(
+        this.registerStageAbort("executor"),
+        options.turnAbort,
+      );
+      this.delegateAttemptedRuns.add(agentRunId);
+      let delegated: ExecutorStageOutput;
+      try {
+        delegated = await delegateRuntime.run({
+          config: this.ctx.config,
+          prompt,
+          sessionId: this.ctx.session_id ?? `delegate_${crypto.randomUUID()}`,
+          allowedRoots,
+          stageRemainingMs: options.turnBudget?.stageRemainingMs("executor")
+            ?? this.ctx.config.claude_cli.delegate.timeout_ms,
+          profile,
+          writeEffectRequired: requiresWriteEffect,
+          nativeNoWrite,
+          signal: combinedAbort.signal,
+          onTextDelta: (chunk) => {
+            onStateChange({ stage: "executor", status: "running", output: chunk });
+            this.publishStageToken("executor", chunk);
+          },
+          onToolUse: (record) => {
+            onStateChange({
+              stage: "executor",
+              status: "running",
+              output: `\n[Tool Executed: ${record.name}]\n`,
+              detail: `tool:${record.name}`,
+            });
+          },
+        });
+      } catch (error) {
+        const cancelled = combinedAbort.signal?.aborted === true;
+        delegated = {
+          ok: false,
+          narrative: cancelled
+            ? "Claude delegate cancelled."
+            : `Claude delegate integration failed: ${errText(error)}`,
+          terminalStatus: cancelled ? "cancelled" : "failed",
+          errorCode: cancelled ? "delegate_aborted" : "delegate_integration_error",
+          toolCalls: [],
+        };
+      } finally {
+        combinedAbort.dispose();
+      }
+      const hasVerifiedWrite = delegated.toolCalls.some(
+        (call) => WRITE_EFFECT_TOOLS.has(call.name) && !call.is_error,
+      );
+      // Filesystem evidence is ground truth. If a delegate mutates the
+      // workspace and only then times out/cancels, falling back to native can
+      // duplicate a non-idempotent write. A verified write therefore closes
+      // the executor stage regardless of the process's later terminal status.
+      const cancelled = delegated.terminalStatus === "cancelled";
+      const accepted = hasVerifiedWrite;
+      const stageSucceeded = accepted && !cancelled;
+      const downgradeCode = delegated.errorCode
+        ?? (cancelled ? "delegate_aborted" : hasVerifiedWrite ? undefined : "delegate_no_write");
+      this.collector.recordStageRun({
+        id: stageId,
+        agent_run_id: agentRunId,
+        mode_id: "executor",
+        turn_number: 1,
+        input_tokens: Math.round(prompt.length / 4),
+        output_tokens: countTokens(delegated.narrative),
+        tool_calls_json: JSON.stringify(delegated.toolCalls),
+        duration_ms: Date.now() - delegateStart,
+        was_successful: stageSucceeded ? 1 : 0,
+        had_error: stageSucceeded ? 0 : 1,
+        error_message: stageSucceeded ? undefined : downgradeCode,
+        stop_reason: stageSucceeded ? "completed" : delegated.terminalStatus,
+        partial_error_code: stageSucceeded ? undefined : downgradeCode,
+      });
+      this.collector.recordModelAttribution?.({
+        id: `attr_${crypto.randomUUID()}`,
+        agent_run_id: agentRunId,
+        stage_id: stageId,
+        agent_id: "claude_delegate",
+        provider: "claude_cli",
+        model_id: this.ctx.config.claude_cli.delegate.model.trim()
+          || this.ctx.config.claude_cli.model?.trim()
+          || "claude_cli",
+        was_successful: stageSucceeded ? 1 : 0,
+        had_error: stageSucceeded ? 0 : 1,
+        duration_ms: Date.now() - delegateStart,
+        fallback_used: nativeNoWrite || (!accepted && delegated.terminalStatus !== "cancelled") ? 1 : 0,
+      });
+
+      toolCalls.push(...delegated.toolCalls);
+      if (cancelled) {
+        const cancelledOutput: ExecutorStageOutput = { ...delegated, toolCalls };
+        onStateChange({
+          stage: "executor",
+          status: "cancelled",
+          output: delegated.narrative,
+          detail: delegated.errorCode,
+        });
+        return cancelledOutput;
+      }
+      if (!accepted) {
+        onStateChange({
+          stage: "executor",
+          status: "running",
+          output: delegated.narrative,
+          detail: `delegate_fallback:${downgradeCode ?? "delegate_failed"}`,
+        });
+        const carried = delegated.toolCalls
+          .map((call) => `- ${call.name} ${JSON.stringify(call.arguments)}\n${call.output}`)
+          .join("\n\n");
+        for (const call of delegated.toolCalls) {
+          if (
+            READ_ONLY_TOOLS.has(call.name)
+            && !call.is_error
+            && call.output.trim().length > 0
+            && !isDuplicateToolDeflection(call)
+          ) {
+            duplicateReadOnlyOutputs.set(duplicateToolCallKey(call), call.output);
+          }
+        }
+        executorMessages.push({
+          role: "user",
+          content: `[Runtime delegate evidence] The delegate did not produce a verified write. Preserve this evidence and make one native attempt; do not delegate again.\n${carried}`,
+        });
+        return undefined;
+      }
+
+      const acceptedOutput: ExecutorStageOutput = {
+        ...delegated,
+        ok: true,
+        terminalStatus: "completed",
+        errorCode: undefined,
+        toolCalls,
+      };
+      onStateChange({ stage: "executor", status: "completed", output: delegated.narrative });
+      await this.afterConductorStage(
+        "executor", "completed", delegated.narrative, agentRunId, options, remainingQueue, executorEvidence(),
+      );
+      return acceptedOutput;
+    };
+
+    if (
+      this.delegateRuntime
+      && this.ctx.config.claude_cli?.delegate?.policy === "delegate_first"
+    ) {
+      const delegated = await runDelegate(false);
+      if (delegated) return delegated;
+    }
 
     // Explicit bounded-read fast path. The user has already chosen the exact
     // filesystem authority, so a free-form executor model can add no useful
@@ -1676,6 +1938,19 @@ export class PipelineExecutor {
         }
       }
 
+      // Escalation deliberately runs only after the native executor has
+      // completed one bounded pass with zero successful mutations. Whether
+      // the delegate succeeds or fails, this stage never bounces back into a
+      // second native pass.
+      if (
+        this.delegateRuntime
+        && this.ctx.config.claude_cli?.delegate?.policy === "escalation"
+        && successfulWriteCount() === 0
+      ) {
+        const delegated = await runDelegate(true);
+        if (delegated) return delegated;
+      }
+
       const finalAssessment = assessWorkspaceEvidence(
         toolCalls,
         intentText,
@@ -1753,6 +2028,14 @@ export class PipelineExecutor {
       await this.afterConductorStage("executor", "completed", narrative, agentRunId, options, remainingQueue, executorEvidence());
       return { ok: true, narrative, toolCalls };
     } catch (e: any) {
+      if (
+        this.delegateRuntime
+        && this.ctx.config.claude_cli?.delegate?.policy === "escalation"
+        && successfulWriteCount() === 0
+      ) {
+        const delegated = await runDelegate(true);
+        if (delegated) return delegated;
+      }
       if (isStageTimeout(e) && successfulEvidenceCount() === 0) {
         throw e;
       }
@@ -2524,6 +2807,9 @@ export class PipelineExecutor {
         state.executor = await this.runExecutorStage(
           request, renderPlanSummary(state.plan), agentRunId, onStateChange, executorOptions, profile, remainingNow(),
         );
+        if (state.executor.terminalStatus === "cancelled") {
+          return { state, partialStage };
+        }
         if (state.executor.errorCode === "effect_gate_no_write_effect") {
           const effectGate = evaluateEffectGate({
             profile,

@@ -307,6 +307,15 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
 }
 
 function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean): PipelineResult {
+  if (segment.state.executor?.terminalStatus === "cancelled") {
+    return {
+      answer: "",
+      cancelled: true,
+      outcome: "failed",
+      error_code: segment.state.executor.errorCode ?? "delegate_aborted",
+      toolCalls: segment.state.executor.toolCalls,
+    };
+  }
   const upstreamDegraded = Boolean(
     (segment.state.plan && !segment.state.plan.ok) || (segment.state.executor && !segment.state.executor.ok),
   );
