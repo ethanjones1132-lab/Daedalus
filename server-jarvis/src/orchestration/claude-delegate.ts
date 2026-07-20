@@ -659,10 +659,8 @@ async function terminateDelegateProcess(
 
   await delay(boundedGraceMs);
   await Promise.resolve();
-  if (exit.state().kind === "success") {
-    const termState = term.state();
-    const termDetail = termState.kind === "error" ? ` TERM reported: ${String(termState.error)}.` : "";
-    return { status: "terminated", detail: `Direct child exit was confirmed during TERM grace.${termDetail}` };
+  if (exit.state().kind === "success" && term.state().kind === "success") {
+    return { status: "terminated", detail: "TERM tree signal and direct child exit were confirmed during grace." };
   }
   // Always force-signal the whole tree after grace, even when the direct
   // child has not produced a confirmed exit.
@@ -683,6 +681,18 @@ async function terminateDelegateProcess(
   if (killState.kind === "pending") {
     return { status: "signal_error", detail: "Forced process-tree kill did not settle before the cleanup deadline." };
   }
+  if (termState.kind === "error") {
+    return {
+      status: "signal_error",
+      detail: `TERM process-tree signal failed; forced kill was still issued: ${String(termState.error)}`,
+    };
+  }
+  if (termState.kind === "pending") {
+    return {
+      status: "signal_error",
+      detail: "TERM process-tree signal did not settle; forced kill was still issued but cleanup remains uncertain.",
+    };
+  }
   remainingMs = Math.max(0, capMs - (Date.now() - startedAt));
   if (exit.state().kind === "pending" && remainingMs > 0) {
     await Promise.race([exit.settled, delay(remainingMs)]);
@@ -694,8 +704,7 @@ async function terminateDelegateProcess(
   if (exitState.kind === "pending") {
     return { status: "exit_unconfirmed", detail: "Child exit was not observed before the cleanup deadline after forced process-tree kill." };
   }
-  const termDetail = termState.kind === "error" ? ` TERM reported: ${String(termState.error)}.` : "";
-  return { status: "terminated", detail: `Process-tree termination was confirmed after forced kill.${termDetail}` };
+  return { status: "terminated", detail: "TERM and forced process-tree kill completed with confirmed direct child exit." };
 }
 
 async function cleanupLateLaunch(

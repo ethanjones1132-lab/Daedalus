@@ -480,6 +480,54 @@ describe("Claude executor delegate", () => {
     expect(health.snapshot().lastReason).toBe("termination_unconfirmed");
   }, 1_000);
 
+  test("forces KILL and reports uncertainty when TERM fails despite direct child exit", async () => {
+    const config = defaultConfig();
+    const snapshot: DelegateRootSnapshot = {
+      root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
+    };
+    const health = new DelegateHealth();
+    const signals: string[] = [];
+    const output = await runClaudeDelegate({
+      config,
+      prompt: "change it",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 1,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      health,
+      terminationGraceMs: 2,
+      cleanupTimeoutMs: 300,
+      snapshotFactory: { capture: async () => [snapshot] },
+      treeKiller: {
+        signalTree: async (_process, signal) => {
+          signals.push(signal);
+          if (signal === "SIGTERM") throw new Error("TERM tree signal failed");
+        },
+      },
+      processFactory: async () => ({
+        events: { [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }) },
+        exit: Promise.resolve({ code: 0, signal: null }),
+        kill: () => {},
+      }),
+    });
+
+    expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(output).toMatchObject({ ok: false, terminalStatus: "timed_out", errorCode: "delegate_timeout" });
+    expect(output.toolCalls).toContainEqual(expect.objectContaining({
+      name: "delegate_cleanup",
+      arguments: { status: "signal_error" },
+      is_error: true,
+      error_code: "delegate_cleanup_signal_error",
+    }));
+    expect(output.toolCalls).not.toContainEqual(expect.objectContaining({
+      name: "delegate_cleanup",
+      arguments: { status: "terminated" },
+    }));
+    expect(health.snapshot().lastReason).toBe("termination_unconfirmed");
+  }, 1_000);
+
   test("bounds teardown after forced KILL when the child exit promise never settles", async () => {
     const config = defaultConfig();
     const snapshot: DelegateRootSnapshot = {
