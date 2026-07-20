@@ -33,7 +33,7 @@ LOG = logging.getLogger("jarvis.claude_cli_proxy")
 PORT = int(os.environ.get("JARVIS_CLAUDE_PROXY_PORT", "19878"))
 BIND_HOST = os.environ.get("JARVIS_CLAUDE_PROXY_BIND", "127.0.0.1")
 OLLAMA_URL = os.environ.get("JARVIS_OLLAMA_URL", "http://127.0.0.1:11434")
-DEFAULT_MODEL = os.environ.get("JARVIS_DEFAULT_MODEL", "gemma4:e4b")
+DEFAULT_MODEL = os.environ.get("JARVIS_DEFAULT_MODEL", "qwen3:8b")
 CLAUDE_TIMEOUT = float(os.environ.get("JARVIS_CLAUDE_TIMEOUT", "180"))
 LOCAL_ONLY = os.environ.get("JARVIS_CLAUDE_PROXY_LOCAL_ONLY", "1").lower() not in ("0", "false", "no", "off")
 LOCAL_HOSTNAMES = {"localhost", "host.docker.internal", "host.containers.internal"}
@@ -493,6 +493,13 @@ class Handler(BaseHTTPRequestHandler):
         )
 
         LOG.info("Bilateral proxying %s request to %s [%s] (stream=%s)", model, completions_url, upstream["provider"], stream)
+        LOG.info(
+            "Upstream turn shape: %s",
+            [
+                m.get("role") + ("+tool_calls" if m.get("tool_calls") else "")
+                for m in payload.get("messages", [])
+            ],
+        )
         LOG.info("Upstream payload: %s", json.dumps(payload, indent=2)[:2000])
 
         if not stream:
@@ -515,13 +522,28 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "keep-alive")
+                # The SSE body has neither Content-Length nor chunked framing, so
+                # it is delimited only by connection close. Advertising
+                # keep-alive here makes strict clients (Node/undici, which the
+                # Claude CLI uses) wait forever for a delimiter that never
+                # arrives; curl is lenient and masks this.
+                self.send_header("Connection", "close")
+                self.close_connection = True
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
 
                 msg_id = f"msg_{uuid.uuid4().hex[:24]}"
-                content_block_started = False
+                # Anthropic requires content block indices to start at 0 and be
+                # contiguous, so blocks are numbered in emission order rather
+                # than reserving index 0 for text that may never arrive.
+                next_block_index = 0
+                text_block_index = None
                 active_tool_calls = {}
+
+                def emit(event_type: str, payload: dict) -> None:
+                    self.wfile.write(f"event: {event_type}\n".encode("utf-8"))
+                    self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode("utf-8"))
+                    self.wfile.flush()
 
                 # Send initial message_start
                 message_start = {
@@ -537,8 +559,7 @@ class Handler(BaseHTTPRequestHandler):
                         "usage": {"input_tokens": 0, "output_tokens": 0}
                     }
                 }
-                self.wfile.write(f"data: {json.dumps(message_start)}\n\n".encode("utf-8"))
-                self.wfile.flush()
+                emit("message_start", message_start)
 
                 with urllib.request.urlopen(req_obj, timeout=CLAUDE_TIMEOUT) as response:
                     for line_bytes in response:
@@ -563,22 +584,20 @@ class Handler(BaseHTTPRequestHandler):
                             # Text chunks mapping
                             content = delta.get("content")
                             if content:
-                                if not content_block_started:
-                                    block_start = {
+                                if text_block_index is None:
+                                    text_block_index = next_block_index
+                                    next_block_index += 1
+                                    emit("content_block_start", {
                                         "type": "content_block_start",
-                                        "index": 0,
+                                        "index": text_block_index,
                                         "content_block": {"type": "text", "text": ""}
-                                    }
-                                    self.wfile.write(f"data: {json.dumps(block_start)}\n\n".encode("utf-8"))
-                                    content_block_started = True
+                                    })
 
-                                block_delta = {
+                                emit("content_block_delta", {
                                     "type": "content_block_delta",
-                                    "index": 0,
+                                    "index": text_block_index,
                                     "delta": {"type": "text_delta", "text": content}
-                                }
-                                self.wfile.write(f"data: {json.dumps(block_delta)}\n\n".encode("utf-8"))
-                                self.wfile.flush()
+                                })
 
                             # Tool chunks mapping
                             tool_calls = delta.get("tool_calls")
@@ -588,44 +607,50 @@ class Handler(BaseHTTPRequestHandler):
                                     if idx not in active_tool_calls:
                                         tc_id = tc.get("id") or f"toolu_{uuid.uuid4().hex[:12]}"
                                         tc_name = tc.get("function", {}).get("name") or ""
+                                        block_index = next_block_index
+                                        next_block_index += 1
                                         active_tool_calls[idx] = {
                                             "id": tc_id,
                                             "name": tc_name,
-                                            "arguments": ""
+                                            "arguments": "",
+                                            "block_index": block_index
                                         }
-                                        block_start = {
+                                        emit("content_block_start", {
                                             "type": "content_block_start",
-                                            "index": idx + 1,
+                                            "index": block_index,
                                             "content_block": {
                                                 "type": "tool_use",
                                                 "id": tc_id,
                                                 "name": tc_name,
                                                 "input": {}
                                             }
-                                        }
-                                        self.wfile.write(f"data: {json.dumps(block_start)}\n\n".encode("utf-8"))
-                                        self.wfile.flush()
+                                        })
 
                                     active_tc = active_tool_calls[idx]
                                     tc_args_delta = tc.get("function", {}).get("arguments") or ""
                                     if tc_args_delta:
                                         active_tc["arguments"] += tc_args_delta
-                                        block_delta = {
+                                        emit("content_block_delta", {
                                             "type": "content_block_delta",
-                                            "index": idx + 1,
-                                            "delta": {"type": "input_delta", "partial_json": tc_args_delta}
-                                        }
-                                        self.wfile.write(f"data: {json.dumps(block_delta)}\n\n".encode("utf-8"))
-                                        self.wfile.flush()
+                                            "index": active_tc["block_index"],
+                                            "delta": {
+                                                "type": "input_json_delta",
+                                                "partial_json": tc_args_delta
+                                            }
+                                        })
 
                 # Clean up stream blocks
-                if content_block_started:
-                    block_stop = {"type": "content_block_stop", "index": 0}
-                    self.wfile.write(f"data: {json.dumps(block_stop)}\n\n".encode("utf-8"))
+                if text_block_index is not None:
+                    emit("content_block_stop", {
+                        "type": "content_block_stop",
+                        "index": text_block_index
+                    })
 
-                for idx in active_tool_calls:
-                    block_stop = {"type": "content_block_stop", "index": idx + 1}
-                    self.wfile.write(f"data: {json.dumps(block_stop)}\n\n".encode("utf-8"))
+                for active_tc in active_tool_calls.values():
+                    emit("content_block_stop", {
+                        "type": "content_block_stop",
+                        "index": active_tc["block_index"]
+                    })
 
                 stop_reason = "tool_use" if active_tool_calls else "end_turn"
                 message_delta = {
@@ -636,11 +661,8 @@ class Handler(BaseHTTPRequestHandler):
                     },
                     "usage": {"output_tokens": 0}
                 }
-                self.wfile.write(f"data: {json.dumps(message_delta)}\n\n".encode("utf-8"))
-
-                message_stop = {"type": "message_stop"}
-                self.wfile.write(f"data: {json.dumps(message_stop)}\n\n".encode("utf-8"))
-                self.wfile.flush()
+                emit("message_delta", message_delta)
+                emit("message_stop", {"type": "message_stop"})
 
             except Exception as exc:
                 LOG.error("Streaming error: %s", exc)
@@ -649,6 +671,7 @@ class Handler(BaseHTTPRequestHandler):
                     "error": {"type": "api_error", "message": str(exc)}
                 }
                 try:
+                    self.wfile.write(b"event: error\n")
                     self.wfile.write(f"data: {json.dumps(error_event)}\n\n".encode("utf-8"))
                     self.wfile.flush()
                 except Exception:
