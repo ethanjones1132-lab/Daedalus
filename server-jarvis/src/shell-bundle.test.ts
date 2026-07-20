@@ -42,7 +42,13 @@ describe("ShellBundle", () => {
 
   test("resolves cwd inside a session-granted root under strict policy", async () => {
     const workspace = mkdtempSync(join(tmpdir(), "jarvis-shell-workspace-"));
-    const granted = tmpdir();
+    // Use a unique subdirectory under tmpdir as the granted root so the cwd
+    // assertion works across platforms: on Windows MSYS, `bash` reports the
+    // POSIX path mapping of the Windows temp dir (typically `/tmp`), not the
+    // literal Windows basename — so asserting on `tmpdir()` directly would be
+    // a false negative. A unique grant-leaf name is portable: bash on any
+    // platform will include the leaf in its `pwd` output.
+    const granted = mkdtempSync(join(tmpdir(), "jarvis-shell-grant-"));
     try {
       const cfg = defaultConfig();
       cfg.jarvis_path = workspace;
@@ -57,9 +63,12 @@ describe("ShellBundle", () => {
         ctx,
       );
       expect(result.is_error).toBe(false);
-      expect(result.output.replace(/\\/g, "/").toLowerCase()).toContain(basename(granted).toLowerCase());
+      expect(result.output.replace(/\\/g, "/").toLowerCase()).toContain(
+        basename(granted).toLowerCase(),
+      );
     } finally {
       rmSync(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+      rmSync(granted, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     }
   }, { timeout: 15_000 });
 
