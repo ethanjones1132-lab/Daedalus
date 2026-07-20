@@ -7,6 +7,10 @@ pub mod supervisor;
 pub mod types;
 pub mod wsl;
 
+#[cfg(test)]
+#[path = "../release_resource_staging.rs"]
+mod release_resource_staging;
+
 pub use commands::*;
 pub use jarvis::types as jarvis_types;
 
@@ -300,16 +304,16 @@ fn forward_env_to_wsl(command: &mut std::process::Command, required: &[&str]) {
         .map(|value| value.to_string_lossy().into_owned())
         .or_else(|| std::env::var("WSLENV").ok())
         .unwrap_or_default();
-    let mut forwarded = staged
-        .split(':')
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
+    let mut forwarded = Vec::new();
+    for entry in staged.split(':').filter(|name| !name.is_empty()) {
+        let base = entry.split('/').next().unwrap_or(entry);
+        let normalized = if required.contains(&base) { base } else { entry };
+        if !forwarded.iter().any(|existing| existing == normalized) {
+            forwarded.push(normalized.to_owned());
+        }
+    }
     for name in required {
-        if !forwarded
-            .iter()
-            .any(|entry| entry.split('/').next() == Some(name))
-        {
+        if !forwarded.iter().any(|entry| entry == name) {
             forwarded.push((*name).to_string());
         }
     }
@@ -1443,7 +1447,10 @@ mod startup_thread_tests {
         );
 
         let mut wsl = std::process::Command::new("wsl.exe");
-        wsl.env("WSLENV", "EXISTING/u");
+        wsl.env(
+            "WSLENV",
+            "EXISTING/u:JARVIS_OLLAMA_URL/w:JARVIS_DEFAULT_MODEL/p",
+        );
         configure_proxy_runtime(&mut wsl, "qwen3:8b", true);
         configure_proxy_credential(&mut wsl, "secret-key", true);
         let wsl_env: std::collections::HashMap<_, _> = wsl.get_envs().collect();
@@ -1476,6 +1483,12 @@ mod startup_thread_tests {
                 "missing WSLENV entry {required}: {forwarded}"
             );
         }
+        for disallowed in ["JARVIS_OLLAMA_URL/w", "JARVIS_DEFAULT_MODEL/p"] {
+            assert!(
+                !forwarded.split(':').any(|name| name == disallowed),
+                "required WSLENV entry kept an incompatible flag {disallowed}: {forwarded}"
+            );
+        }
     }
 
     #[test]
@@ -1495,6 +1508,40 @@ mod startup_thread_tests {
             ),
             "the shipped Python fallback must not expose the proxy on all interfaces"
         );
+    }
+
+    #[test]
+    fn release_resource_staging_replaces_newer_stale_proxy() {
+        let root = test_dir("release-resource-staging");
+        let source = root.join("source").join("claude_cli_proxy.py");
+        let destination = root.join("release").join("resources").join("claude_cli_proxy.py");
+        std::fs::create_dir_all(source.parent().expect("source parent"))
+            .expect("create source directory");
+        std::fs::write(&source, b"current proxy\n").expect("write source proxy");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::create_dir_all(destination.parent().expect("destination parent"))
+            .expect("create destination directory");
+        std::fs::write(&destination, b"stale proxy\n").expect("write stale proxy");
+        assert!(
+            destination.metadata().unwrap().modified().unwrap()
+                >= source.metadata().unwrap().modified().unwrap(),
+            "test precondition requires the stale destination to be at least as new"
+        );
+
+        assert!(
+            release_resource_staging::copy_if_different(&source, &destination)
+                .expect("replace stale proxy")
+        );
+        assert_eq!(
+            std::fs::read(&destination).expect("read staged proxy"),
+            b"current proxy\n"
+        );
+        assert!(
+            !release_resource_staging::copy_if_different(&source, &destination)
+                .expect("skip identical proxy")
+        );
+
+        std::fs::remove_dir_all(root).expect("remove test directory");
     }
 
     #[test]
@@ -1522,7 +1569,7 @@ mod startup_thread_tests {
             "let proxy_dest = release_dir.join(\"resources\").join(\"claude_cli_proxy.py\")"
         ));
         assert!(build_helper.contains(
-            "copy_if_newer(&proxy_src, &proxy_dest, \"Claude proxy script\")"
+            "release_resource_staging::copy_if_different(&proxy_src, &proxy_dest)"
         ));
     }
 

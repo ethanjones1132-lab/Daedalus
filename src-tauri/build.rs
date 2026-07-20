@@ -1,4 +1,6 @@
-use std::path::{Path, PathBuf};
+mod release_resource_staging;
+
+use std::path::PathBuf;
 use std::process::Command;
 
 /// Embed build provenance (git SHA, dirty flag, build time) into the binary so
@@ -66,7 +68,13 @@ fn copy_release_resources_next_to_exe() {
         .map(|path| path.join("scripts").join("claude_cli_proxy.py"))
         .unwrap_or_default();
     let proxy_dest = release_dir.join("resources").join("claude_cli_proxy.py");
-    copy_if_newer(&proxy_src, &proxy_dest, "Claude proxy script");
+    if let Err(error) = release_resource_staging::copy_if_different(&proxy_src, &proxy_dest) {
+        println!(
+            "cargo:warning=Failed to stage Claude proxy script {} -> {}: {error}",
+            proxy_src.display(),
+            proxy_dest.display(),
+        );
+    }
     if !bundle_src.exists() {
         // The Tauri beforeBuildCommand bakes the bundle; if it isn't there,
         // we can't stage it. Stay quiet — Tauri will already have complained
@@ -94,49 +102,6 @@ fn copy_release_resources_next_to_exe() {
             bundle_src.display(),
             dest.display(),
             e
-        );
-    }
-}
-
-fn copy_if_newer(source: &Path, destination: &Path, label: &str) {
-    if !source.exists() {
-        println!(
-            "cargo:warning=Cannot stage {label}; source is missing: {}",
-            source.display()
-        );
-        return;
-    }
-    if destination.exists() {
-        let source_is_newer = source
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .zip(
-                destination
-                    .metadata()
-                    .and_then(|metadata| metadata.modified())
-                    .ok(),
-            )
-            .map(|(source_time, destination_time)| source_time > destination_time)
-            .unwrap_or(true);
-        if !source_is_newer {
-            return;
-        }
-    }
-    if let Some(parent) = destination.parent() {
-        if let Err(error) = std::fs::create_dir_all(parent) {
-            println!(
-                "cargo:warning=Failed to create {label} directory {}: {error}",
-                parent.display()
-            );
-            return;
-        }
-    }
-    if let Err(error) = std::fs::copy(source, destination) {
-        println!(
-            "cargo:warning=Failed to copy {label} {} -> {}: {error}",
-            source.display(),
-            destination.display(),
         );
     }
 }
