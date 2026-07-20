@@ -658,7 +658,9 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     # Ignore SIGPIPE so `python3 claude_cli_proxy.py | head -N` pipelines don't
     # kill the server when the reader closes early.
-    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    sigpipe = getattr(signal, "SIGPIPE", None)
+    if sigpipe is not None:
+        signal.signal(sigpipe, signal.SIG_IGN)
 
     logging.basicConfig(
         level=os.environ.get("JARVIS_LOG_LEVEL", "INFO"),
