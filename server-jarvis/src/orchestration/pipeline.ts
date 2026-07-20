@@ -1221,11 +1221,21 @@ export class PipelineExecutor {
       } finally {
         combinedAbort.dispose();
       }
+      const cleanupUnconfirmed = delegated.errorCode === "delegate_cleanup_unconfirmed"
+        || delegated.toolCalls.some((call) => call.name === "delegate_cleanup" && call.is_error);
+      // Normalize safety-critical process state before telemetry so persisted
+      // rows and the public executor result describe the same terminal fact.
+      if (cleanupUnconfirmed) {
+        delegated = {
+          ...delegated,
+          ok: false,
+          terminalStatus: "failed",
+          errorCode: "delegate_cleanup_unconfirmed",
+        };
+      }
       const hasVerifiedWrite = delegated.toolCalls.some(
         (call) => WRITE_EFFECT_TOOLS.has(call.name) && !call.is_error,
       );
-      const cleanupUnconfirmed = delegated.errorCode === "delegate_cleanup_unconfirmed"
-        || delegated.toolCalls.some((call) => call.name === "delegate_cleanup" && call.is_error);
       // Filesystem evidence is ground truth. If a delegate mutates the
       // workspace and only then times out/cancels, falling back to native can
       // duplicate a non-idempotent write. A verified write therefore closes
@@ -1233,6 +1243,7 @@ export class PipelineExecutor {
       const cancelled = delegated.terminalStatus === "cancelled";
       const accepted = hasVerifiedWrite && !cleanupUnconfirmed;
       const stageSucceeded = accepted && !cancelled;
+      const willRunNativeFallback = !accepted && !cancelled && !cleanupUnconfirmed;
       const downgradeCode = cleanupUnconfirmed
         ? "delegate_cleanup_unconfirmed"
         : delegated.errorCode
@@ -1264,18 +1275,12 @@ export class PipelineExecutor {
         was_successful: stageSucceeded ? 1 : 0,
         had_error: stageSucceeded ? 0 : 1,
         duration_ms: Date.now() - delegateStart,
-        fallback_used: nativeNoWrite || (!accepted && delegated.terminalStatus !== "cancelled") ? 1 : 0,
+        fallback_used: nativeNoWrite || willRunNativeFallback ? 1 : 0,
       });
 
       toolCalls.push(...delegated.toolCalls);
       if (cleanupUnconfirmed) {
-        const unsafeOutput: ExecutorStageOutput = {
-          ...delegated,
-          ok: false,
-          terminalStatus: "failed",
-          errorCode: "delegate_cleanup_unconfirmed",
-          toolCalls,
-        };
+        const unsafeOutput: ExecutorStageOutput = { ...delegated, toolCalls };
         onStateChange({
           stage: "executor",
           status: "failed",

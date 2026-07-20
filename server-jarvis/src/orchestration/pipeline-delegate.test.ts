@@ -345,6 +345,8 @@ describe("executor delegate pipeline integration", () => {
     };
     let modelCalls = 0;
     let replanCalls = 0;
+    const rows: any[] = [];
+    const attributions: any[] = [];
     const health = new DelegateHealth();
     const executor = new PipelineExecutor(
       async () => {
@@ -353,7 +355,10 @@ describe("executor delegate pipeline integration", () => {
       },
       createToolRuntime(),
       ctx,
-      { recordStageRun: () => {} },
+      {
+        recordStageRun: (row) => rows.push(row),
+        recordModelAttribution: (row) => attributions.push(row),
+      },
       {
         availability: { isAvailable: async () => true },
         health,
@@ -409,6 +414,18 @@ describe("executor delegate pipeline integration", () => {
       outcome: "failed",
       error_code: "delegate_cleanup_unconfirmed",
     });
+    expect(rows).toContainEqual(expect.objectContaining({
+      stop_reason: "failed",
+      partial_error_code: "delegate_cleanup_unconfirmed",
+      was_successful: 0,
+      had_error: 1,
+    }));
+    expect(attributions).toContainEqual(expect.objectContaining({
+      provider: "claude_cli",
+      was_successful: 0,
+      had_error: 1,
+      fallback_used: 0,
+    }));
   }, 300);
 
   test("aborted late-factory cleanup uncertainty is failed rather than routine cancellation", async () => {
@@ -425,6 +442,8 @@ describe("executor delegate pipeline integration", () => {
       root, kind: "git", status: "", diffStat: "", fingerprint: "before", files: {},
     };
     let modelCalls = 0;
+    const rows: any[] = [];
+    const attributions: any[] = [];
     const health = new DelegateHealth();
     const executor = new PipelineExecutor(
       async () => {
@@ -433,7 +452,10 @@ describe("executor delegate pipeline integration", () => {
       },
       createToolRuntime(),
       ctx,
-      { recordStageRun: () => {} },
+      {
+        recordStageRun: (row) => rows.push(row),
+        recordModelAttribution: (row) => attributions.push(row),
+      },
       {
         availability: { isAvailable: async () => true },
         health,
@@ -483,6 +505,18 @@ describe("executor delegate pipeline integration", () => {
       outcome: "failed",
       error_code: "delegate_cleanup_unconfirmed",
     });
+    expect(rows).toContainEqual(expect.objectContaining({
+      stop_reason: "failed",
+      partial_error_code: "delegate_cleanup_unconfirmed",
+      was_successful: 0,
+      had_error: 1,
+    }));
+    expect(attributions).toContainEqual(expect.objectContaining({
+      provider: "claude_cli",
+      was_successful: 0,
+      had_error: 1,
+      fallback_used: 0,
+    }));
   }, 300);
 
   test("escalation invokes the delegate only after a native executor pass produces no write", async () => {
@@ -545,6 +579,7 @@ describe("executor delegate pipeline integration", () => {
       workspace_path: config.jarvis_path,
     });
     const rows: any[] = [];
+    const attributions: any[] = [];
     let delegateCalls = 0;
     let nativeCalls = 0;
     const executor = new PipelineExecutor(
@@ -554,7 +589,10 @@ describe("executor delegate pipeline integration", () => {
       },
       createToolRuntime(),
       ctx,
-      { recordStageRun: (row) => rows.push(row) },
+      {
+        recordStageRun: (row) => rows.push(row),
+        recordModelAttribution: (row) => attributions.push(row),
+      },
       {
         availability: { isAvailable: async () => true },
         run: async () => {
@@ -601,6 +639,10 @@ describe("executor delegate pipeline integration", () => {
     const delegateRows = rows.filter((row) => row.partial_error_code === "delegate_no_write");
     expect(delegateRows).toHaveLength(1);
     expect(JSON.parse(delegateRows[0].tool_calls_json)[0].name).toBe("read_file");
+    expect(attributions).toContainEqual(expect.objectContaining({
+      provider: "claude_cli",
+      fallback_used: 1,
+    }));
   });
 
   test("executor abort registry cancels the delegate without launching native fallback", async () => {
