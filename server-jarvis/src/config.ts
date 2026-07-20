@@ -138,6 +138,15 @@ export interface ToolConfig {
   allowed_roots: string[];
   /** Whether absolute roots in the raw user message become Session grants. */
   grant_session_roots: boolean;
+  /**
+   * Explicit interpreter for the `bash` tool. Empty means auto-resolve. On
+   * Windows this matters: `C:\Windows\System32\bash.exe` is the WSL launcher,
+   * not Git Bash, and running workspace commands through it silently crosses
+   * into a different filesystem namespace.
+   */
+  bash_path: string;
+  /** Ceiling for a single shell invocation, in milliseconds. */
+  shell_timeout_max_ms: number;
 }
 
 export interface ReasoningConfig {
@@ -491,6 +500,8 @@ export function defaultConfig(): JarvisConfig {
       interactive_approval: false,
       allowed_roots: [],
       grant_session_roots: true,
+      bash_path: "",
+      shell_timeout_max_ms: 120_000,
     },
     reasoning: {
       enabled: true,

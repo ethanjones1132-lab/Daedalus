@@ -45,8 +45,8 @@ const tools: ToolDefinition[] = [
   {
     type: "function",
     function: {
-      name: "browse",
-      description: "Browse a URL",
+      name: "web_fetch",
+      description: "Fetch a URL",
       parameters: { type: "object", properties: { url: { type: "string", description: "URL" } }, required: ["url"] },
     },
     requires_approval: false,
@@ -356,7 +356,12 @@ Here is the actual answer.`;
     expect(parsed.calls[0].arguments).toMatchObject({ path: "." });
   });
 
-  test("maps browse blocks to the browse tool", () => {
+  test("maps browse blocks to web_fetch", () => {
+    // `browse` was never a registered tool — the alias resolved to a name
+    // nothing could dispatch, so a model that emitted a browse block got an
+    // "unknown tool" error that read like a model mistake. web_fetch is the
+    // real capability; text-tools-aliases.test.ts pins that no alias target
+    // can go dangling again.
     const parsed = extractTextToolCalls(
       '<tool_call>{"tool":"browse","url":"example.com"}</tool_call>',
       tools,
@@ -364,7 +369,7 @@ Here is the actual answer.`;
 
     expect(parsed.cleanedText).toBe("");
     expect(parsed.calls).toHaveLength(1);
-    expect(parsed.calls[0].name).toBe("browse");
+    expect(parsed.calls[0].name).toBe("web_fetch");
     expect(parsed.calls[0].arguments).toEqual({ url: "example.com" });
   });
 

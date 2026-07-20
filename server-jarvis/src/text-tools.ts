@@ -20,7 +20,7 @@ interface TextSpan {
   end: number;
 }
 
-const TOOL_ALIASES: Record<string, string> = {
+export const TOOL_ALIASES: Record<string, string> = {
   bash: "bash",
   shell: "bash",
   run_command: "bash",
@@ -52,9 +52,11 @@ const TOOL_ALIASES: Record<string, string> = {
   web_search: "web_search",
   websearch: "web_search",
   search_web: "web_search",
-  browse: "browse",
-  browser: "browse",
-  open_url: "browse",
+  // No `browse` tool has ever been registered; these aliases resolved to
+  // nothing. web_fetch is the real capability they were reaching for.
+  browse: "web_fetch",
+  browser: "web_fetch",
+  open_url: "web_fetch",
   mcp_list_servers: "mcp_list_servers",
   list_mcp_servers: "mcp_list_servers",
   mcp_servers: "mcp_list_servers",
