@@ -149,6 +149,10 @@ pub fn spawn_supervisor(handle: AppHandle) {
     });
 }
 
+fn proxy_heartbeat_status(proxy_required: bool, probe: impl FnOnce() -> bool) -> bool {
+    proxy_required && probe()
+}
+
 async fn tick(handle: &AppHandle) {
     // Read the active backend + model once per tick.
     let (is_ollama, ollama_model, proxy_required, openrouter_api_key) = {
@@ -259,7 +263,9 @@ async fn tick(handle: &AppHandle) {
         "jarvis://supervisor",
         serde_json::json!({
             "bun_up": crate::is_port_listening(BUN_PORT),
-            "proxy_up": crate::is_port_listening(PROXY_PORT),
+            "proxy_up": proxy_heartbeat_status(proxy_required, || {
+                crate::is_port_listening(PROXY_PORT)
+            }),
             "ollama_up": crate::is_port_listening(OLLAMA_PORT),
             "ollama_required": is_ollama,
             "bun_give_up": supervisor.bun_give_up,
@@ -278,6 +284,29 @@ mod tests {
     use super::*;
 
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn heartbeat_skips_proxy_probe_when_runtime_gate_is_closed() {
+        let mut config = crate::jarvis::types::JarvisConfig::default();
+        config.claude_cli.enabled = false;
+        assert!(!proxy_heartbeat_status(
+            crate::claude_proxy_enabled(&config),
+            || panic!("disabled proxy must not be probed by heartbeat")
+        ));
+
+        config.claude_cli.enabled = true;
+        config.claude_cli.auth_mode = crate::jarvis::types::ClaudeCliAuthMode::Subscription;
+        assert!(!proxy_heartbeat_status(
+            crate::claude_proxy_enabled(&config),
+            || panic!("subscription proxy must not be probed by heartbeat")
+        ));
+
+        config.claude_cli.auth_mode = crate::jarvis::types::ClaudeCliAuthMode::Proxy;
+        assert!(proxy_heartbeat_status(
+            crate::claude_proxy_enabled(&config),
+            || true
+        ));
+    }
 
     #[test]
     fn backoff_stops_after_max_consecutive_failures() {

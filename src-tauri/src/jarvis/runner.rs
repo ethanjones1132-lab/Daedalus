@@ -1342,6 +1342,10 @@ mod terminal_run_tests {
 
 /// Check Jarvis status: Ollama, Bun server, proxy, bridge, model availability.
 /// Uses blocking threads for HTTP checks to avoid tokio runtime issues.
+fn check_claude_proxy_status(config: &JarvisConfig, probe: impl FnOnce() -> bool) -> bool {
+    crate::claude_proxy_enabled(config) && probe()
+}
+
 pub fn check_jarvis_status(config: &JarvisConfig) -> JarvisStatus {
     let is_ollama = matches!(config.active_backend, JarvisBackend::Ollama);
 
@@ -1398,7 +1402,8 @@ pub fn check_jarvis_status(config: &JarvisConfig) -> JarvisStatus {
     };
 
     // ── Claude CLI proxy ─────────────────────────────────────────
-    let claude_proxy_running = crate::is_port_listening(19878);
+    let claude_proxy_running =
+        check_claude_proxy_status(config, || crate::is_port_listening(19878));
 
     // ── Bridge ───────────────────────────────────────────────────
     let bridge_active =
@@ -1431,5 +1436,28 @@ pub fn check_jarvis_status(config: &JarvisConfig) -> JarvisStatus {
         active_backend,
         model,
         openrouter_key_set: !config.openrouter.api_key.trim().is_empty(),
+    }
+}
+
+#[cfg(test)]
+mod proxy_status_tests {
+    use super::*;
+
+    #[test]
+    fn status_skips_proxy_probe_for_disabled_and_subscription_configs() {
+        let mut config = JarvisConfig::default();
+        config.claude_cli.enabled = false;
+        assert!(!check_claude_proxy_status(&config, || {
+            panic!("disabled proxy must not be probed by status")
+        }));
+
+        config.claude_cli.enabled = true;
+        config.claude_cli.auth_mode = crate::jarvis::types::ClaudeCliAuthMode::Subscription;
+        assert!(!check_claude_proxy_status(&config, || {
+            panic!("subscription proxy must not be probed by status")
+        }));
+
+        config.claude_cli.auth_mode = crate::jarvis::types::ClaudeCliAuthMode::Proxy;
+        assert!(check_claude_proxy_status(&config, || true));
     }
 }

@@ -147,11 +147,19 @@ fn find_jarvis_python() -> Option<PythonInvocation> {
     })
 }
 
+fn apply_python_invocation_to_hermes(
+    config: &mut crate::jarvis::hermes::process::HermesConfig,
+    invocation: PythonInvocation,
+) {
+    config.python = invocation.program;
+    config.python_prefix_args = invocation.prefix_args;
+}
+
 fn build_hermes_config() -> crate::jarvis::hermes::process::HermesConfig {
     use std::path::PathBuf;
     let mut config = crate::jarvis::hermes::process::HermesConfig::default();
     if let Some(py) = find_jarvis_python() {
-        config.python = py.program;
+        apply_python_invocation_to_hermes(&mut config, py);
     }
     if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
         config.hermes_home = PathBuf::from(home)
@@ -293,6 +301,14 @@ fn configure_proxy_credential(
     }
 }
 
+fn configure_proxy_runtime(command: &mut std::process::Command, model: &str) {
+    command
+        .env("JARVIS_CLAUDE_PROXY_PORT", "19878")
+        .env("JARVIS_CLAUDE_PROXY_BIND", "127.0.0.1")
+        .env("JARVIS_OLLAMA_URL", "http://127.0.0.1:11434")
+        .env("JARVIS_DEFAULT_MODEL", model);
+}
+
 pub(crate) fn spawn_claude_cli_proxy(
     ollama_model: String,
     openrouter_api_key: String,
@@ -312,12 +328,9 @@ pub(crate) fn spawn_claude_cli_proxy(
         ollama_model
     };
     let mut command = Command::new(&py.program);
+    command.args(&py.prefix_args).arg(&script.path);
+    configure_proxy_runtime(&mut command, &model);
     command
-        .args(&py.prefix_args)
-        .arg(&script.path)
-        .env("JARVIS_CLAUDE_PROXY_PORT", "19878")
-        .env("JARVIS_OLLAMA_URL", "http://127.0.0.1:11434")
-        .env("JARVIS_DEFAULT_MODEL", &model)
         .stdout(jarvis_server_log_stdio("claude-proxy.log"))
         .stderr(jarvis_server_log_stdio("claude-proxy.err.log"));
     configure_proxy_credential(
@@ -1339,6 +1352,19 @@ mod startup_thread_tests {
     }
 
     #[test]
+    fn hermes_config_keeps_python_launcher_prefix_args() {
+        let invocation = PythonInvocation {
+            program: PathBuf::from("py"),
+            prefix_args: vec!["-3".to_string()],
+        };
+        let mut config = crate::jarvis::hermes::process::HermesConfig::default();
+        apply_python_invocation_to_hermes(&mut config, invocation);
+
+        assert_eq!(config.python, PathBuf::from("py"));
+        assert_eq!(config.python_prefix_args, vec!["-3"]);
+    }
+
+    #[test]
     fn proxy_discovery_prefers_windows_candidates_before_wsl() {
         let root = test_dir("discovery");
         let exe = root.join("repo/target/release/home-base.exe");
@@ -1398,6 +1424,44 @@ mod startup_thread_tests {
             .to_string_lossy()
             .split(':')
             .any(|name| name == "JARVIS_OPENROUTER_API_KEY"));
+    }
+
+    #[test]
+    fn proxy_launch_and_python_default_are_loopback_only() {
+        let mut command = std::process::Command::new("python");
+        configure_proxy_runtime(&mut command, "qwen3:8b");
+        let env: std::collections::HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("JARVIS_CLAUDE_PROXY_BIND")),
+            Some(&Some(std::ffi::OsStr::new("127.0.0.1")))
+        );
+
+        let source = include_str!("../../scripts/claude_cli_proxy.py");
+        assert!(
+            source.contains(
+                "BIND_HOST = os.environ.get(\"JARVIS_CLAUDE_PROXY_BIND\", \"127.0.0.1\")"
+            ),
+            "the shipped Python fallback must not expose the proxy on all interfaces"
+        );
+    }
+
+    #[test]
+    fn release_and_desktop_contracts_ship_the_proxy_with_hash_provenance() {
+        let tauri: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
+            .expect("tauri config should be valid JSON");
+        assert_eq!(
+            tauri["bundle"]["resources"]["../scripts/claude_cli_proxy.py"],
+            "resources/claude_cli_proxy.py"
+        );
+
+        let build = include_str!("../../scripts/build-and-deploy.ps1");
+        assert!(build.contains("$proxyScript = Join-Path $repo 'scripts\\claude_cli_proxy.py'"));
+        assert!(build.contains("Deploy-File $proxyScript 'resources\\claude_cli_proxy.py'"));
+        assert!(build.contains("claude_proxy_sha256 ="));
+
+        let verify = include_str!("../../scripts/verify-deploy.ps1");
+        assert!(verify.contains("'resources\\claude_cli_proxy.py'"));
+        assert!(verify.contains("$manifest.claude_proxy_sha256"));
     }
 
     #[test]

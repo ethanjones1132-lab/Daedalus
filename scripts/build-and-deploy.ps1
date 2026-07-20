@@ -13,6 +13,7 @@
       4. Deploy  -> copy the freshly built artifacts to the OneDrive Desktop:
                       home-base.exe  -> <Desktop>\Jarvis.exe   (and \home-base.exe)
                       dist/index.js  -> <Desktop>\index.js
+                      proxy script  -> <Desktop>\resources\claude_cli_proxy.py
                       src/prompts/   -> <Desktop>\prompts\
                     The Bun server reads prompts/*.md from disk at runtime (they are
                     NOT compiled into index.js), so index.js + prompts/ must ship
@@ -54,6 +55,7 @@ $exeOut     = Join-Path $repo 'src-tauri\target\release\home-base.exe'
 $distJs     = Join-Path $repo 'server-jarvis\dist\index.js'
 $promptsSrc = Join-Path $repo 'server-jarvis\src\prompts'
 $metricsScript = Join-Path $repo 'automate_inference_metrics.py'
+$proxyScript = Join-Path $repo 'scripts\claude_cli_proxy.py'
 $desktop    = Join-Path $env:USERPROFILE 'OneDrive\Desktop'
 
 # ── Locate toolchain (prefer PATH, fall back to standard install dirs) ────────
@@ -158,6 +160,9 @@ if (-not (Test-Path $promptsSrc -PathType Container)) {
 if (-not (Test-Path $metricsScript -PathType Leaf)) {
     Die "Inference metrics script not found: $metricsScript"
 }
+if (-not (Test-Path $proxyScript -PathType Leaf)) {
+    Die "Claude proxy script not found: $proxyScript"
+}
 
 # Release file locks: stop the running app and any Bun server bound to 19877
 # (the deployed bundle locks <Desktop>\index.js while running).
@@ -176,6 +181,8 @@ Start-Sleep -Seconds 1
 $ts = Get-Date -Format 'yyyyMMdd-HHmmss'
 function Deploy-File($src, $dstName) {
     $dst = Join-Path $desktop $dstName
+    $dstParent = Split-Path -Parent $dst
+    if (-not (Test-Path $dstParent)) { New-Item -ItemType Directory -Force -Path $dstParent | Out-Null }
     if (Test-Path $dst) { Copy-Item $dst "$dst.bak-$ts" -Force }
     Copy-Item $src $dst -Force
     Write-Ok "$dstName"
@@ -185,6 +192,7 @@ Deploy-File $exeOut 'Jarvis.exe'
 Deploy-File $exeOut 'home-base.exe'
 Deploy-File $distJs 'index.js'
 Deploy-File $metricsScript 'automate_inference_metrics.py'
+Deploy-File $proxyScript 'resources\claude_cli_proxy.py'
 
 # prompts/ is a directory — replace wholesale (back up the old one first)
 $promptsDst = Join-Path $desktop 'prompts'
@@ -205,6 +213,7 @@ $manifest = @{
     source_tree_sha256 = $sourceTreeSha256
     index_js_sha256 = (Get-FileHash "$desktop\index.js" -Algorithm SHA256).Hash
     inference_metrics_sha256 = (Get-FileHash "$desktop\automate_inference_metrics.py" -Algorithm SHA256).Hash
+    claude_proxy_sha256 = (Get-FileHash "$desktop\resources\claude_cli_proxy.py" -Algorithm SHA256).Hash
     exe_mtime = (Get-Item "$desktop\Jarvis.exe" -ErrorAction SilentlyContinue).LastWriteTimeUtc.ToString("o")
     prompts_tree_sha256 = (git -C $repo ls-tree HEAD server-jarvis/src/prompts | Select-Object -First 1).Split()[2]
     deployed_at = (Get-Date -Format "o")
@@ -243,4 +252,4 @@ if ($RestartServer) {
 }
 
 $elapsed = (Get-Date) - $startedAt
-Write-Host ("`nDONE in {0:N0}s. Deployed Jarvis.exe + index.js + metrics script + prompts/ to {1}" -f $elapsed.TotalSeconds, $desktop) -ForegroundColor Green
+Write-Host ("`nDONE in {0:N0}s. Deployed Jarvis.exe + index.js + proxy + metrics script + prompts/ to {1}" -f $elapsed.TotalSeconds, $desktop) -ForegroundColor Green

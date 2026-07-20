@@ -38,6 +38,7 @@
     ],
     "resources": {
       "../server-jarvis/dist/index.js": "index.js",
+      "../scripts/claude_cli_proxy.py": "resources/claude_cli_proxy.py",
       "../automate_inference_metrics.py": "automate_inference_metrics.py",
       "../server-jarvis/src/prompts/**/*": "prompts/"
     }
