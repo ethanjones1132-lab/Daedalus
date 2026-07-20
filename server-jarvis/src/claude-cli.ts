@@ -62,7 +62,13 @@ export function buildLocalClaudeEnv(
 ): Record<string, string> {
   if (authMode === "subscription") {
     return Object.fromEntries(
-      Object.entries(baseEnv).filter((entry): entry is [string, string] => entry[1] !== undefined),
+      Object.entries(baseEnv).filter((entry): entry is [string, string] => {
+        const [key, value] = entry;
+        if (value === undefined) return false;
+        if (key === "ANTHROPIC_BASE_URL" && value === LOCAL_PROXY_BASE_URL) return false;
+        if (key === "CLAUDE_CONFIG_DIR" && value === LOCAL_CLAUDE_CONFIG_DIR) return false;
+        return true;
+      }),
     );
   }
 
@@ -97,13 +103,35 @@ export function buildLocalClaudeArgs(
   args: string[],
   { authMode }: ClaudeCliLaunchOptions = { authMode: "proxy" },
 ): string[] {
-  const next = args.filter((arg) =>
-    arg !== "--no-telemetry" && (authMode === "proxy" || arg !== "--bare")
-  );
+  const next: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === "--max-turns") {
+      index += 1;
+      continue;
+    }
+    if (arg === "--no-telemetry") continue;
+    if (authMode === "subscription" && arg === "--bare") continue;
+    next.push(arg);
+  }
   if (authMode === "proxy" && !next.includes("--bare")) {
     next.unshift("--bare");
   }
   return next;
+}
+
+export interface ClaudeCliChatArgsOptions extends ClaudeCliLaunchOptions {
+  claudeModel?: string;
+  proxyModel: string;
+}
+
+/** Project the configured auth mode onto the model argument at the chat call site. */
+export function buildClaudeCliChatArgs(
+  args: string[],
+  { authMode, claudeModel, proxyModel }: ClaudeCliChatArgsOptions,
+): string[] {
+  const selectedModel = authMode === "proxy" ? proxyModel.trim() : claudeModel?.trim();
+  return selectedModel ? [...args, "--model", selectedModel] : [...args];
 }
 
 function appendNoProxy(existing: string | undefined): string {
@@ -138,9 +166,9 @@ export interface ClaudeCliInvocation {
 }
 
 /**
- * Avoid Windows "The command line is too long" when system prompt + history
- * are passed as CLI flags/positionals. Large --append-system-prompt values go
- * to temp files; oversized user prompts use stdin with --print.
+ * Avoid Windows "The command line is too long" when the user prompt can be
+ * moved off the command line. Stock Claude has no system-prompt-file flag, so
+ * supported system-prompt flags remain inline while oversized user prompts use stdin.
  */
 export function prepareClaudeCliInvocation(
   executable: string,
@@ -345,6 +373,10 @@ export interface ClaudeStreamEvent {
   error?: string;
 }
 
+export interface ClaudeStreamDecodeState {
+  partialTextSeen: boolean;
+}
+
 type ContentBlock = {
   type?: string;
   text?: string;
@@ -379,7 +411,10 @@ function toolOutput(value: unknown): string {
 }
 
 /** Map both stock Claude stream-json records and Jarvis' legacy flat records. */
-export function decodeClaudeCliMessage(input: unknown): ClaudeStreamEvent[] {
+export function decodeClaudeCliMessage(
+  input: unknown,
+  state?: ClaudeStreamDecodeState,
+): ClaudeStreamEvent[] {
   if (!input || typeof input !== "object") return [];
   const msg = input as ClaudeCliMessage;
   const session_id = typeof msg.session_id === "string" ? msg.session_id : undefined;
@@ -411,7 +446,11 @@ export function decodeClaudeCliMessage(input: unknown): ClaudeStreamEvent[] {
         });
       }
     }
-    return events;
+    const decoded = state?.partialTextSeen
+      ? events.filter((event) => event.type !== "stream_event")
+      : events;
+    if (state) state.partialTextSeen = false;
+    return decoded;
   }
 
   if (msg.type === "user") {
@@ -427,7 +466,11 @@ export function decodeClaudeCliMessage(input: unknown): ClaudeStreamEvent[] {
   }
 
   if (msg.type === "stream_event") {
-    const text = msg.event?.delta?.text ?? msg.delta?.text;
+    const stockPartialText = msg.event?.delta?.text;
+    const text = stockPartialText ?? msg.delta?.text;
+    if (state && typeof stockPartialText === "string" && stockPartialText) {
+      state.partialTextSeen = true;
+    }
     return typeof text === "string" && text
       ? [{ type: "stream_event", delta: { text }, session_id }]
       : [];
@@ -517,6 +560,7 @@ export async function* streamClaudeCli(
   proc.stdin?.end();
 
   const decoder = new TextDecoder();
+  const decodeState: ClaudeStreamDecodeState = { partialTextSeen: false };
   let buffer = "";
   let fullOutput = "";
 
@@ -550,7 +594,7 @@ export async function* streamClaudeCli(
 
         try {
           const msg: ClaudeCliMessage = JSON.parse(trimmed);
-          for (const event of decodeClaudeCliMessage(msg)) {
+          for (const event of decodeClaudeCliMessage(msg, decodeState)) {
             if (event.type === "stream_event" && event.delta?.text) {
               fullOutput += event.delta.text;
             } else if (event.type === "result" && !event.content) {

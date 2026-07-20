@@ -24,7 +24,7 @@ import { buildLearningPrompt, buildReviewPrompt, buildCodebaseAuditPrompt, build
 import { createLifecycleService } from "./agent-lifecycle";
 import { handleAgentRequest } from "./agent-routes";
 import { effectiveOllamaUrl, checkOllamaHealth, checkOllamaModelSupportsTools, resolveWindowsHostIP, selectInstalledOllamaModel } from "./ollama";
-import { streamClaudeCli, isClaudeCliAvailable, compactTurnHistoryForCli } from "./claude-cli";
+import { buildClaudeCliChatArgs, streamClaudeCli, isClaudeCliAvailable, compactTurnHistoryForCli } from "./claude-cli";
 import { ReasoningParser, stripReasoningFromText, type ReasoningEvent } from "./reasoning";
 import {
   listOpenRouterModels,
@@ -1507,10 +1507,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const promptBody = `${historyPrompt}user: ${message}`;
 
         // Build CLI args: system prompt via --append-system-prompt, model, prompt as positional
-        const cliArgs = [...(cfg.claude_cli.args || ["--print", "--verbose", "--output-format", "stream-json"])];
-        // When using Claude CLI with Ollama, pass the model via --model
-        const ollamaModel = cfg.ollama?.model || "qwen3:8b";
-        cliArgs.push("--model", ollamaModel);
+        const cliArgs = buildClaudeCliChatArgs(
+          [...(cfg.claude_cli.args || ["--print", "--verbose", "--output-format", "stream-json"])],
+          {
+            authMode: cfg.claude_cli.auth_mode,
+            claudeModel: cfg.claude_cli.model,
+            proxyModel: cfg.ollama?.model || "qwen3:8b",
+          },
+        );
         if (systemPrompt) {
           cliArgs.push("--append-system-prompt", systemPrompt);
         }

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  buildClaudeCliChatArgs,
   buildLocalClaudeArgs,
   buildLocalClaudeEnv,
   compactTurnHistoryForCli,
@@ -53,6 +54,22 @@ describe("Claude CLI local-only launch contract", () => {
     expect(env.CLAUDE_CODE_SIMPLE).toBeUndefined();
   });
 
+  test("subscription mode removes inherited Jarvis proxy overrides but retains real credentials", () => {
+    const proxyEnv = buildLocalClaudeEnv({ PATH: "/usr/bin" }, { authMode: "proxy" });
+    const env = buildLocalClaudeEnv({
+      ...proxyEnv,
+      ANTHROPIC_API_KEY: "subscription-api-key",
+      ANTHROPIC_AUTH_TOKEN: "subscription-auth-token",
+      CLAUDE_CODE_OAUTH_TOKEN: "oauth-token",
+    }, { authMode: "subscription" });
+
+    expect(env.ANTHROPIC_API_KEY).toBe("subscription-api-key");
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe("subscription-auth-token");
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("oauth-token");
+    expect(env.ANTHROPIC_BASE_URL).toBeUndefined();
+    expect(env.CLAUDE_CONFIG_DIR).toBeUndefined();
+  });
+
   test("proxy args add bare and strip only the retired telemetry flag", () => {
     expect(buildLocalClaudeArgs(["--print"], { authMode: "proxy" })).toEqual(["--bare", "--print"]);
     expect(buildLocalClaudeArgs(["--bare", "--print", "--no-telemetry"], { authMode: "proxy" })).toEqual([
@@ -65,6 +82,35 @@ describe("Claude CLI local-only launch contract", () => {
     expect(buildLocalClaudeArgs(["--bare", "--print", "--model", "sonnet", "--no-telemetry"], {
       authMode: "subscription",
     })).toEqual(["--print", "--model", "sonnet"]);
+  });
+
+  test("both auth modes remove persisted max-turns pairs", () => {
+    expect(buildLocalClaudeArgs(
+      ["--print", "--max-turns", "4", "--model", "sonnet"],
+      { authMode: "proxy" },
+    )).toEqual(["--bare", "--print", "--model", "sonnet"]);
+    expect(buildLocalClaudeArgs(
+      ["--print", "--max-turns", "2", "--model", "opus"],
+      { authMode: "subscription" },
+    )).toEqual(["--print", "--model", "opus"]);
+  });
+
+  test("chat model args use Claude config for subscription and Ollama for proxy", () => {
+    expect(buildClaudeCliChatArgs(["--print"], {
+      authMode: "subscription",
+      claudeModel: "claude-opus-4-6",
+      proxyModel: "qwen3.5-9b:latest",
+    })).toEqual(["--print", "--model", "claude-opus-4-6"]);
+    expect(buildClaudeCliChatArgs(["--print"], {
+      authMode: "subscription",
+      claudeModel: "",
+      proxyModel: "qwen3.5-9b:latest",
+    })).toEqual(["--print"]);
+    expect(buildClaudeCliChatArgs(["--print"], {
+      authMode: "proxy",
+      claudeModel: "claude-opus-4-6",
+      proxyModel: "qwen3.5-9b:latest",
+    })).toEqual(["--print", "--model", "qwen3.5-9b:latest"]);
   });
 
   test("prepareClaudeCliInvocation never emits unsupported prompt-file flags", () => {
@@ -197,5 +243,51 @@ describe("Claude CLI stream-json decoder", () => {
       is_error: true,
       session_id: "legacy",
     }]);
+  });
+
+  test("does not duplicate completed assistant text after ordered partial deltas", () => {
+    const state = { partialTextSeen: false };
+    const fixture = [
+      {
+        type: "stream_event",
+        session_id: "partial-session",
+        event: { type: "content_block_delta", delta: { type: "text_delta", text: "Hel" } },
+      },
+      {
+        type: "stream_event",
+        session_id: "partial-session",
+        event: { type: "content_block_delta", delta: { type: "text_delta", text: "lo" } },
+      },
+      {
+        type: "assistant",
+        session_id: "partial-session",
+        message: {
+          content: [
+            { type: "text", text: "Hello" },
+            { type: "tool_use", id: "toolu_partial", name: "Read", input: { file_path: "README.md" } },
+          ],
+        },
+      },
+      {
+        type: "user",
+        session_id: "partial-session",
+        message: {
+          content: [{ type: "tool_result", tool_use_id: "toolu_partial", content: "ok", is_error: false }],
+        },
+      },
+      {
+        type: "assistant",
+        session_id: "partial-session",
+        message: { content: [{ type: "text", text: "Done" }] },
+      },
+    ];
+
+    const events = fixture.flatMap((message) => decodeClaudeCliMessage(message, state));
+    const visible = events
+      .filter((event) => event.type === "stream_event")
+      .map((event) => event.delta?.text ?? "")
+      .join("");
+    expect(visible).toBe("HelloDone");
+    expect(events.filter((event) => event.type === "tool_use")).toHaveLength(1);
   });
 });
