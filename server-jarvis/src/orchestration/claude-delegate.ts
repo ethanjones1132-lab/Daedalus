@@ -302,32 +302,43 @@ function execFileText(executable: string, args: string[]): Promise<string> {
   });
 }
 
+export interface PlatformDelegateProcessTreeKillerOptions {
+  platform: NodeJS.Platform;
+  execute: (executable: string, args: string[]) => Promise<string>;
+}
+
 /** Platform tree signaling: taskkill /T on Windows, process-group kill on Unix. */
-export const platformDelegateProcessTreeKiller: DelegateProcessTreeKiller = {
-  async signalTree(childProcess, signal): Promise<void> {
-    const pid = childProcess.pid;
-    if (pid && process.platform === "win32") {
-      const args = ["/PID", String(pid), "/T"];
-      if (signal === "SIGKILL") args.push("/F");
-      try {
-        await execFileText("taskkill", args);
-      } catch {
-        // taskkill reports an error when the tree already exited; that is the
-        // desired terminal state and forced cleanup still proceeds safely.
+export function createPlatformDelegateProcessTreeKiller(
+  options: PlatformDelegateProcessTreeKillerOptions,
+): DelegateProcessTreeKiller {
+  return {
+    async signalTree(childProcess, signal): Promise<void> {
+      const pid = childProcess.pid;
+      if (pid && options.platform === "win32") {
+        const args = ["/PID", String(pid), "/T"];
+        if (signal === "SIGKILL") args.push("/F");
+        // A taskkill error is not proof the descendant tree is gone. Propagate
+        // it so forced cleanup is conservatively reported as uncertain.
+        await options.execute("taskkill", args);
+        return;
       }
-      return;
-    }
-    if (pid) {
-      try {
-        process.kill(-pid, signal);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      if (pid) {
+        try {
+          process.kill(-pid, signal);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+        }
+        return;
       }
-      return;
-    }
-    childProcess.kill(signal);
-  },
-};
+      childProcess.kill(signal);
+    },
+  };
+}
+
+export const platformDelegateProcessTreeKiller = createPlatformDelegateProcessTreeKiller({
+  platform: process.platform,
+  execute: execFileText,
+});
 
 async function fileIdentity(path: string): Promise<string> {
   try {
@@ -647,8 +658,14 @@ async function terminateDelegateProcess(
   const term = observeOperation(() => treeKiller.signalTree(childProcess, "SIGTERM"));
 
   await delay(boundedGraceMs);
+  await Promise.resolve();
+  if (exit.state().kind === "success") {
+    const termState = term.state();
+    const termDetail = termState.kind === "error" ? ` TERM reported: ${String(termState.error)}.` : "";
+    return { status: "terminated", detail: `Direct child exit was confirmed during TERM grace.${termDetail}` };
+  }
   // Always force-signal the whole tree after grace, even when the direct
-  // parent already exited: a grandchild may have ignored TERM and outlived it.
+  // child has not produced a confirmed exit.
   const kill = observeOperation(() => treeKiller.signalTree(childProcess, "SIGKILL"));
   // Let an immediately fulfilled/rejected signal operation become observable
   // even if the TERM timer consumed the nominal cleanup wall-time.
