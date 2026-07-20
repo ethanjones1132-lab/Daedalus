@@ -15,7 +15,7 @@ import { splitPipelineAtReplan, buildReplanRequest } from "./replan";
 import type { PipelineStageState } from "./stage-output";
 import type { SessionReplanCounter, ReplanCapKind } from "./replan-telemetry";
 import { segmentOutcomeFromCarry } from "./replan-telemetry";
-import { applyEffectGate, evaluateEffectGate } from "./effect-gate";
+import { applyEffectGate, evaluateEffectGate, isTerminalNoWriteEffect } from "./effect-gate";
 
 /**
  * A stage counts as "completed" once its carry-state slot is populated by an
@@ -252,6 +252,13 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
     );
     carry = segment.state;
 
+    // The executor exhausted its bounded failed-write recovery and already
+    // reached the terminal honesty fence. Do not spend an explicit conductor
+    // replan marker or any reviewer/rewriter work after that typed outcome.
+    if (segment.effectGate && isTerminalNoWriteEffect(segment.effectGate)) {
+      return finalizeSegment(segment, sessionCapHit);
+    }
+
     const remainingStagesHint = segments.slice(1).flat();
     const replanRequestText = buildReplanRequest(args.contextMessage, carry, remainingStagesHint);
     // Same guard as the mid-run branch: a coordinator failure at the
@@ -300,6 +307,24 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
 }
 
 function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean): PipelineResult {
+  if (segment.state.executor?.terminalStatus === "cancelled") {
+    return {
+      answer: "",
+      cancelled: true,
+      outcome: "failed",
+      error_code: segment.state.executor.errorCode ?? "delegate_aborted",
+      toolCalls: segment.state.executor.toolCalls,
+    };
+  }
+  if (segment.state.executor?.errorCode === "delegate_cleanup_unconfirmed") {
+    return {
+      answer: "",
+      error: segment.state.executor.narrative || "Claude delegate cleanup could not be confirmed.",
+      outcome: "failed",
+      error_code: "delegate_cleanup_unconfirmed",
+      toolCalls: segment.state.executor.toolCalls,
+    };
+  }
   const upstreamDegraded = Boolean(
     (segment.state.plan && !segment.state.plan.ok) || (segment.state.executor && !segment.state.executor.ok),
   );

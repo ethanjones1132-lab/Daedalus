@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import {
   DEEP_READ_MIN_CONTENT_READS,
   alreadyReadSourceKeys,
@@ -165,6 +168,19 @@ describe("turnNeedsWorkspaceEvidence", () => {
   });
 });
 
+describe("session-granted workspace evidence", () => {
+  test("counts distinct source reads inside any allowed workspace root", () => {
+    const roots = ["C:\\workspace", "D:\\granted"];
+    const assessment = assessWorkspaceEvidence(
+      [read("D:\\granted\\src\\a.ts"), read("D:\\granted\\src\\b.ts"), read("D:\\granted\\src\\c.ts")],
+      "Do a comprehensive audit of this repo",
+      roots,
+    );
+    expect(assessment.sufficient).toBe(true);
+    expect(assessment.contentReads).toBe(DEEP_READ_MIN_CONTENT_READS);
+  });
+});
+
 describe("assessWorkspaceEvidence", () => {
   test("a lone list_directory is insufficient for a deep read", () => {
     const a = assessWorkspaceEvidence(
@@ -305,6 +321,50 @@ describe("assessWorkspaceEvidence", () => {
     );
     expect(a.sufficient).toBe(true);
     expect(a.contentReads).toBe(3);
+  });
+
+  test("relative and absolute reads of a file selected from a granted root share one evidence key", () => {
+    const workspace = mkdtempSync(join(tmpdir(), "jarvis-evidence-workspace-"));
+    const grant = mkdtempSync(join(tmpdir(), "jarvis-evidence-grant-"));
+    try {
+      mkdirSync(join(grant, "src"));
+      writeFileSync(join(grant, "src", "a.ts"), "export const a = 1;");
+      writeFileSync(join(grant, "src", "b.ts"), "export const b = 1;");
+
+      const a = assessWorkspaceEvidence(
+        [read("src/a.ts"), read(join(grant, "src", "a.ts")), read(join(grant, "src", "b.ts"))],
+        "comprehensively diagnose the architecture of this repo",
+        [workspace, grant],
+      );
+      expect(a.sufficient).toBe(false);
+      expect(a.contentReads).toBe(2);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+      rmSync(grant, { recursive: true, force: true });
+    }
+  });
+
+  test("POSIX backslash-relative and absolute granted-root aliases share one evidence key", () => {
+    const existing = new Set(["/grant/src/a.ts", "/grant/src/b.ts"]);
+    const a = assessWorkspaceEvidence(
+      [read("src\\a.ts"), read("/grant/src/a.ts"), read("/grant/src/b.ts")],
+      "comprehensively diagnose the architecture of this repo",
+      ["/workspace", "/grant"],
+      { platform: "linux", home: "/home/tester", exists: (path) => existing.has(path) },
+    );
+    expect(a.sufficient).toBe(false);
+    expect(a.contentReads).toBe(2);
+  });
+
+  test("POSIX home and absolute granted-root aliases share one evidence key", () => {
+    const a = assessWorkspaceEvidence(
+      [read("~/src/a.ts"), read("/home/tester/src/a.ts"), read("/home/tester/src/b.ts")],
+      "comprehensively diagnose the architecture of this repo",
+      ["/workspace", "/home/tester"],
+      { platform: "linux", home: "/home/tester", exists: () => true },
+    );
+    expect(a.sufficient).toBe(false);
+    expect(a.contentReads).toBe(2);
   });
 
   test("manifests and overview files do not satisfy the deep-read source floor", () => {

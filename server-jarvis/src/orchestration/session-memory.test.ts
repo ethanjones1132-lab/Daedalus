@@ -50,6 +50,24 @@ describe("session-memory", () => {
     expect(continued.turnCount).toBe(2);
   });
 
+  test("persists and unions session root grants across continuation turns", () => {
+    const memory = new SessionMemory(() => makeConfig());
+    const first = memory.beginTaskRun("sess-grants", {
+      message: "Inspect C:\\Projects\\one",
+      requirement: "workspace_read",
+      sessionGrants: ["C:\\Projects\\one"],
+    });
+    const continued = memory.beginTaskRun("sess-grants", {
+      message: "continue with D:\\Data",
+      requirement: "workspace_read",
+      sessionGrants: ["D:\\Data", "C:\\Projects\\one"],
+    });
+
+    expect(first.sessionGrants).toEqual(["C:\\Projects\\one"]);
+    expect(continued.taskRunId).toBe(first.taskRunId);
+    expect(continued.sessionGrants).toEqual(["C:\\Projects\\one", "D:\\Data"]);
+  });
+
   test("keeps task-run state ephemeral when persistence is disabled", () => {
     const memory = new SessionMemory(() => makeConfig({ enabled: false, persist: false }));
     const task = memory.beginTaskRun("ephemeral-task", {

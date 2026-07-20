@@ -3,6 +3,7 @@ import type { ExecutionProfile } from "./route-normalization";
 import { hasWriteIntent } from "./turn-requirements";
 
 export const WRITE_EFFECT_TOOLS = new Set(["write_file", "edit_file", "multi_edit", "apply_patch"]);
+export const MAX_FAILED_WRITE_ATTEMPTS_WITHOUT_EFFECT = 2;
 
 export interface EffectGateReport {
   clean: boolean;
@@ -51,7 +52,8 @@ export function evaluateEffectGate(input: {
     (call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name),
   ).length;
   let verdict: EffectGateReport["verdict"] = "clean";
-  if (failedCalls.length > 0) verdict = "tool_failures";
+  if (hasRepeatedWriteFailureWithoutEffect(calls, writeIntent)) verdict = "no_write_effect";
+  else if (failedCalls.length > 0) verdict = "tool_failures";
   else if (writeIntent && successfulWrites === 0) verdict = "no_write_effect";
   const clean = verdict === "clean";
   return {
@@ -80,11 +82,35 @@ export function applyEffectGate(
   errorCode: string | undefined,
   report: EffectGateReport,
 ): { outcome: "success" | "degraded" | "failed"; errorCode?: string } {
-  if (outcome !== "success" || report.clean) return { outcome, errorCode };
-  if (report.verdict === "no_write_effect") {
+  // Repeated verified write failures are terminal even when the executor is
+  // already degraded. A fresh zero-write result keeps the historical recovery
+  // path, and a pre-existing hard failure remains authoritative.
+  if (
+    report.verdict === "no_write_effect"
+    && (outcome === "success" || isTerminalNoWriteEffect(report))
+  ) {
     return { outcome: "failed", errorCode: "effect_gate_no_write_effect" };
   }
+  if (outcome !== "success" || report.clean) return { outcome, errorCode };
   return { outcome: "degraded", errorCode: `effect_gate_${report.verdict}` };
+}
+
+/** Two failed mutation attempts with no success exhaust bounded recovery. */
+export function hasRepeatedWriteFailureWithoutEffect(
+  calls: ToolCallRecord[],
+  writeIntent: boolean,
+): boolean {
+  if (!writeIntent) return false;
+  const writes = calls.filter((call) => WRITE_EFFECT_TOOLS.has(call.name));
+  return !writes.some((call) => !call.is_error)
+    && writes.filter((call) => call.is_error).length >= MAX_FAILED_WRITE_ATTEMPTS_WITHOUT_EFFECT;
+}
+
+export function isTerminalNoWriteEffect(report: EffectGateReport): boolean {
+  return report.verdict === "no_write_effect"
+    && report.successfulWrites === 0
+    && report.failedCalls.filter((call) => WRITE_EFFECT_TOOLS.has(call.name)).length
+      >= MAX_FAILED_WRITE_ATTEMPTS_WITHOUT_EFFECT;
 }
 
 /**
@@ -94,7 +120,7 @@ export function applyEffectGate(
  * READ-evidence rubric, which actively steers toward read-only tools. When
  * the model is about to end a full-profile write turn with zero successful
  * mutations, the loop sends a bounded write nudge instead of accepting the
- * prose. Bounded at 2 so a refusing/incapable model still exits quickly.
+ * prose. Bounded at 3 so a refusing/incapable model still exits predictably.
  */
 export const WRITE_EFFECT_NUDGE =
   "This turn is a CHANGE request. You have write tools available " +
@@ -103,17 +129,64 @@ export const WRITE_EFFECT_NUDGE =
   "not modify any file and do not count. After writing, read the file back " +
   "to verify, then finish.";
 
+export function buildWriteEffectNudge(writeTools: string[], expectedTarget: string): string {
+  const available = writeTools.length > 0 ? writeTools.join(", ") : "no write tools exposed";
+  return [
+    "This turn is a CHANGE request and the executor is still in a read loop.",
+    `Available write tools: ${available}.`,
+    `Expected write target based on the gathered evidence: ${expectedTarget}.`,
+    "Call an available write tool now; prose or an unexecuted diff does not modify the workspace. Read the target back after writing to verify it.",
+  ].join(" ");
+}
+
+/** Select the file with the most genuine successful content reads. */
+export function mostReadSuccessfulFile(calls: ToolCallRecord[]): string | undefined {
+  const counts = new Map<string, number>();
+  for (const call of calls) {
+    if (
+      call.name !== "read_file"
+      || call.is_error
+      || call.output.trim().length === 0
+      || call.output.includes("[duplicate call deflected]")
+    ) {
+      continue;
+    }
+    const path = typeof call.arguments.path === "string" ? call.arguments.path.trim() : "";
+    if (path) counts.set(path, (counts.get(path) ?? 0) + 1);
+  }
+  let target: string | undefined;
+  let max = 0;
+  for (const [path, count] of counts) {
+    if (count > max) {
+      target = path;
+      max = count;
+    }
+  }
+  return target;
+}
+
 export function shouldPressWriteEffect(input: {
   writeIntent: boolean;
   profile: ExecutionProfile;
   successfulWrites: number;
+  toolCallsEmitted: boolean;
+  duplicateReadDeflections: number;
+  distinctSuccessfulReads: number;
   nudgesSent: number;
   turnCount: number;
   maxTurns: number;
 }): boolean {
+  const readLoopEscalation = input.toolCallsEmitted && (
+    input.duplicateReadDeflections >= 2
+    || (
+      input.turnCount >= input.maxTurns - 2
+      && input.distinctSuccessfulReads >= 4
+    )
+  );
   return input.writeIntent
     && input.profile === "full"
     && input.successfulWrites === 0
-    && input.nudgesSent < 2
-    && input.turnCount < input.maxTurns;
+    && input.nudgesSent < 3
+    && input.turnCount < input.maxTurns
+    && (!input.toolCallsEmitted || readLoopEscalation);
 }

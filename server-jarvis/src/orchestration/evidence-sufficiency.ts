@@ -23,6 +23,10 @@
 // game it either.
 // ═══════════════════════════════════════════════════════════════
 
+import { existsSync } from "fs";
+import { homedir } from "os";
+import { posix, win32 } from "path";
+import { normalizePathInput } from "../fs-scope";
 import { isDuplicateToolDeflection, type ToolCallRecord } from "./stage-output";
 import { hasWorkspaceSignal, hasWriteIntent, type TurnRequirement } from "./turn-requirements";
 
@@ -193,20 +197,72 @@ function normalizePath(rawPath: string): { path: string; absolute: boolean } {
   return { path: `${prefix}${segments.join("/")}`.toLowerCase(), absolute };
 }
 
-function sourceFileKey(rawPath: string, workspaceRoot?: string): string | undefined {
-  const normalized = normalizePath(rawPath);
+type WorkspaceRoots = string | string[] | undefined;
+
+export interface EvidencePathSemantics {
+  platform?: NodeJS.Platform;
+  home?: string;
+  exists?: (path: string) => boolean;
+}
+
+function rootList(workspaceRoots: WorkspaceRoots): string[] {
+  return Array.isArray(workspaceRoots)
+    ? workspaceRoots.filter((root) => root.trim().length > 0)
+    : workspaceRoots?.trim() ? [workspaceRoots] : [];
+}
+
+function firstExistingRootCandidate(
+  rawPath: string,
+  roots: string[],
+  semantics: EvidencePathSemantics,
+): string | undefined {
+  const platform = semantics.platform ?? process.platform;
+  const pathApi = platform === "win32" ? win32 : posix;
+  const exists = semantics.exists ?? existsSync;
+  for (const root of roots) {
+    const normalizedRoot = normalizePathInput(root, platform, semantics.home ?? homedir());
+    const candidate = pathApi.resolve(normalizedRoot, rawPath);
+    const rel = pathApi.relative(normalizedRoot, candidate);
+    const contained = rel === "" || (!rel.startsWith("..") && !pathApi.isAbsolute(rel));
+    if (contained && exists(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+function sourceFileKey(
+  rawPath: string,
+  workspaceRoots?: WorkspaceRoots,
+  semantics: EvidencePathSemantics = {},
+): string | undefined {
+  const roots = rootList(workspaceRoots);
+  const canonicalInput = normalizePathInput(
+    rawPath,
+    semantics.platform ?? process.platform,
+    semantics.home ?? homedir(),
+  );
+  const rawNormalized = normalizePath(canonicalInput);
+  const selectedPath = rawNormalized.absolute
+    ? canonicalInput
+    : firstExistingRootCandidate(canonicalInput, roots, semantics) ?? canonicalInput;
+  const normalized = normalizePath(selectedPath);
   let normalizedPath = normalized.path;
   let absolute = normalized.absolute;
-  if (workspaceRoot) {
+  if (roots.length > 0 && !absolute) {
+    const root = normalizePath(roots[0]);
+    const rootPath = root.path.replace(/\/+$/, "");
+    normalizedPath = normalizePath(`${rootPath}/${normalizedPath}`).path;
+    absolute = true;
+  }
+  for (const workspaceRoot of roots) {
     const root = normalizePath(workspaceRoot);
     const rootPath = root.path.replace(/\/+$/, "");
-    if (!absolute) {
-      normalizedPath = normalizePath(`${rootPath}/${normalizedPath}`).path;
-      absolute = true;
-    }
     if (normalizedPath === rootPath || normalizedPath.startsWith(`${rootPath}/`)) {
       normalizedPath = normalizedPath.slice(rootPath.length).replace(/^\/+/, "");
-      absolute = false;
+      // Preserve legacy rel: keys for the primary workspace. Granted roots use
+      // their normalized absolute identity so same-suffix files stay distinct.
+      absolute = workspaceRoot !== roots[0];
+      if (absolute) normalizedPath = `${rootPath}/${normalizedPath}`;
+      break;
     }
   }
   const basename = normalizedPath.split("/").pop()?.toLowerCase() ?? "";
@@ -215,10 +271,14 @@ function sourceFileKey(rawPath: string, workspaceRoot?: string): string | undefi
   return `${absolute ? "abs:" : "rel:"}${normalizedPath}`;
 }
 
-function grepOutputSourceFileKeys(call: ToolCallRecord, workspaceRoot?: string): Set<string> {
+function grepOutputSourceFileKeys(
+  call: ToolCallRecord,
+  workspaceRoot?: WorkspaceRoots,
+  semantics: EvidencePathSemantics = {},
+): Set<string> {
   const args = call.arguments as Record<string, unknown> | undefined;
   const grepPath = typeof args?.path === "string" ? args.path : undefined;
-  const grepPathIsFile = grepPath ? sourceFileKey(grepPath, workspaceRoot) !== undefined : false;
+  const grepPathIsFile = grepPath ? sourceFileKey(grepPath, workspaceRoot, semantics) !== undefined : false;
   const normalizedGrepPath = grepPath ? normalizePath(grepPath).path.replace(/^\.\/+/, "") : "";
   const keys = new Set<string>();
   for (const rawLine of call.output.split(/\r?\n/)) {
@@ -243,26 +303,34 @@ function grepOutputSourceFileKeys(call: ToolCallRecord, workspaceRoot?: string):
       && !/[?*]/.test(grepPath)
       ? `${grepPath.replace(/[\\/]+$/, "")}/${candidate}`
       : candidate;
-    const key = sourceFileKey(rawCandidate, workspaceRoot);
+    const key = sourceFileKey(rawCandidate, workspaceRoot, semantics);
     if (key) keys.add(key);
   }
   return keys;
 }
 
-function sourceContentTargetKeys(call: ToolCallRecord, workspaceRoot?: string): Set<string> {
+function sourceContentTargetKeys(
+  call: ToolCallRecord,
+  workspaceRoot?: WorkspaceRoots,
+  semantics: EvidencePathSemantics = {},
+): Set<string> {
   if (call.name === "read_file") {
     const args = call.arguments as Record<string, unknown> | undefined;
-    const key = typeof args?.path === "string" ? sourceFileKey(args.path, workspaceRoot) : undefined;
+    const key = typeof args?.path === "string" ? sourceFileKey(args.path, workspaceRoot, semantics) : undefined;
     return key ? new Set([key]) : new Set();
   }
-  return call.name === "grep" ? grepOutputSourceFileKeys(call, workspaceRoot) : new Set();
+  return call.name === "grep" ? grepOutputSourceFileKeys(call, workspaceRoot, semantics) : new Set();
 }
 
-function distinctDeepReadTargetKeys(calls: ToolCallRecord[], workspaceRoot?: string): Set<string> {
+function distinctDeepReadTargetKeys(
+  calls: ToolCallRecord[],
+  workspaceRoot?: WorkspaceRoots,
+  semantics: EvidencePathSemantics = {},
+): Set<string> {
   const paths = new Set<string>();
   for (const call of calls) {
     if (DEEP_READ_CONTENT_TOOLS.has(call.name)) {
-      for (const key of sourceContentTargetKeys(call, workspaceRoot)) paths.add(key);
+      for (const key of sourceContentTargetKeys(call, workspaceRoot, semantics)) paths.add(key);
     }
   }
   return paths;
@@ -321,13 +389,14 @@ export function turnNeedsWorkspaceEvidence(
 export function assessWorkspaceEvidence(
   toolCalls: ToolCallRecord[] | undefined,
   request: string,
-  workspaceRoot?: string,
+  workspaceRoot?: WorkspaceRoots,
+  pathSemantics: EvidencePathSemantics = {},
 ): EvidenceAssessment {
   const calls = (toolCalls ?? []).filter(
     (c) => !c.is_error && c.output.trim().length > 0 && !isDuplicateToolDeflection(c),
   );
   const listings = calls.filter((c) => LISTING_TOOLS.has(c.name)).length;
-  const explicitScope = resolveWorkspaceReadScope(request, workspaceRoot);
+  const explicitScope = resolveWorkspaceReadScope(request, rootList(workspaceRoot)[0]);
   const deepRead = isDeepReadRequest(request);
 
   if (explicitScope) {
@@ -373,7 +442,7 @@ export function assessWorkspaceEvidence(
   if (deepRead) {
     // Deep-read floor: only genuine file-content reads count, deduped by
     // (tool, arguments) so reading the same file 3 times can't fake it.
-    const distinctContentReads = distinctDeepReadTargetKeys(calls, workspaceRoot).size;
+    const distinctContentReads = distinctDeepReadTargetKeys(calls, workspaceRoot, pathSemantics).size;
     const sufficient = distinctContentReads >= DEEP_READ_MIN_CONTENT_READS;
     return {
       sufficient,
@@ -516,7 +585,7 @@ export function extractSourceReadCandidates(
 /** Distinct deep-read source keys already present in tool call records. */
 export function alreadyReadSourceKeys(
   toolCalls: ToolCallRecord[] | undefined,
-  workspaceRoot?: string,
+  workspaceRoot?: WorkspaceRoots,
 ): Set<string> {
   const calls = (toolCalls ?? []).filter(
     (c) => !c.is_error && c.output.trim().length > 0 && !isDuplicateToolDeflection(c),

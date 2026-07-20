@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Verifies that the deployed Jarvis runtime matches the repo HEAD.
-    Checks git SHA, index.js hash, prompts/ directory, manifest existence,
+    Checks git SHA, index.js/proxy hashes, prompts/ directory, manifest existence,
     and (if a server is actually listening) that the RUNNING process is
     serving that same build — not just that the files on disk look right.
 #>
@@ -79,6 +79,15 @@ if (-not (Test-Path $metricsPath) -or
     exit 1
 } else {
     Write-Host "inference metrics script hash matches manifest." -ForegroundColor Green
+}
+
+$proxyPath = Join-Path $deployDir 'resources\claude_cli_proxy.py'
+if (-not (Test-Path $proxyPath) -or
+    (Get-FileHash $proxyPath -Algorithm SHA256).Hash -ne $manifest.claude_proxy_sha256) {
+    Write-Error "DEPLOY INCOMPLETE: Claude proxy script is missing or its hash differs from the manifest."
+    exit 1
+} else {
+    Write-Host "Claude proxy script hash matches manifest." -ForegroundColor Green
 }
 
 if (-not (Test-Path (Join-Path $deployDir 'prompts'))) {

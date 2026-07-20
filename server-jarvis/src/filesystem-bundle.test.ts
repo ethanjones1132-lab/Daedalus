@@ -139,6 +139,19 @@ describe("FilesystemBundle > read_file", () => {
     expect(result.output).toContain("export const target = 1;");
     expect(result.output).not.toContain("File not found");
   });
+
+  test("read_file resolves relative paths through execution-context session grants", async () => {
+    const workspace = makeTempWorkspace();
+    const granted = makeTempWorkspace();
+    mkdirSync(join(granted, "src"));
+    writeFileSync(join(granted, "src", "granted.ts"), "export const granted = true;\n");
+    const ctx = makeCtx(workspace);
+    ctx.session_grants = [granted];
+
+    const result = await makeRuntime().execute(call("read_file", { path: "src/granted.ts" }), ctx);
+    expect(result.is_error).toBe(false);
+    expect(result.output).toContain("granted = true");
+  });
 });
 
 describe("FilesystemBundle > write_file", () => {
@@ -165,6 +178,22 @@ describe("FilesystemBundle > write_file", () => {
     expect(readFileSync(join(invocationWorkspace, "outside-root-proof.txt"), "utf-8"))
       .toBe("workspace affinity works\n");
     expect(existsSync(join(configWorkspace, "outside-root-proof.txt"))).toBe(false);
+  });
+
+  test("write_file selects a granted root when only its candidate parent exists", async () => {
+    const workspace = makeTempWorkspace();
+    const granted = makeTempWorkspace();
+    mkdirSync(join(granted, "generated"));
+    const ctx = makeCtx(workspace);
+    ctx.session_grants = [granted];
+
+    const result = await makeRuntime().execute(
+      call("write_file", { path: "generated/new.txt", content: "granted write\n" }),
+      ctx,
+    );
+    expect(result.is_error).toBe(false);
+    expect(readFileSync(join(granted, "generated", "new.txt"), "utf-8")).toBe("granted write\n");
+    expect(existsSync(join(workspace, "generated", "new.txt"))).toBe(false);
   });
 });
 

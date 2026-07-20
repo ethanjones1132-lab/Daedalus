@@ -181,7 +181,10 @@ const LIST_DIR_DEF: ToolDefinition = {
 
 async function handleReadFile(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
-  const path = safePath(args.path as string, cfg, ctx.workspace_path);
+  const path = safePath(args.path as string, cfg, {
+    workspaceOverride: ctx.workspace_path,
+    sessionGrants: ctx.session_grants,
+  });
   const offset = (args.offset as number) || 1;
   // 2000-line default (2026-07-18, formerly 500): the old default silently
   // cut real source files with NO indication anything was missing, so
@@ -245,7 +248,11 @@ function resolveEditStrings(
 
 async function handleWriteFile(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
-  const path = safePath(args.path as string, cfg, ctx.workspace_path);
+  const path = safePath(args.path as string, cfg, {
+    workspaceOverride: ctx.workspace_path,
+    sessionGrants: ctx.session_grants,
+    forWrite: true,
+  });
   const content = args.content as string;
 
   const dir = dirname(path);
@@ -258,7 +265,11 @@ async function handleWriteFile(args: Record<string, unknown>, ctx: ExecutionCont
 
 async function handleEditFile(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
-  const path = safePath(args.path as string, cfg, ctx.workspace_path);
+  const path = safePath(args.path as string, cfg, {
+    workspaceOverride: ctx.workspace_path,
+    sessionGrants: ctx.session_grants,
+    forWrite: true,
+  });
   const oldStr = args.old_string as string;
   const newStr = args.new_string as string;
 
@@ -290,7 +301,11 @@ async function handleEditFile(args: Record<string, unknown>, ctx: ExecutionConte
 
 async function handleMultiEdit(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
-  const path = safePath(args.path as string, cfg, ctx.workspace_path);
+  const path = safePath(args.path as string, cfg, {
+    workspaceOverride: ctx.workspace_path,
+    sessionGrants: ctx.session_grants,
+    forWrite: true,
+  });
   const edits = args.edits as Array<{ old_string: string; new_string: string }>;
 
   if (!hasFileBeenRead(path)) {
@@ -322,7 +337,11 @@ async function handleMultiEdit(args: Record<string, unknown>, ctx: ExecutionCont
 
 async function handleApplyPatch(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
-  const path = safePath(args.path as string, cfg, ctx.workspace_path);
+  const path = safePath(args.path as string, cfg, {
+    workspaceOverride: ctx.workspace_path,
+    sessionGrants: ctx.session_grants,
+    forWrite: true,
+  });
   const patch = args.patch as string;
 
   if (!hasFileBeenRead(path)) {
@@ -349,7 +368,10 @@ async function handleApplyPatch(args: Record<string, unknown>, ctx: ExecutionCon
 async function handleGlob(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
   const pattern = args.pattern as string;
-  const searchPath = safePath((args.path as string) || ".", cfg, ctx.workspace_path);
+  const searchPath = safePath((args.path as string) || ".", cfg, {
+    workspaceOverride: ctx.workspace_path,
+    sessionGrants: ctx.session_grants,
+  });
   await assertSearchDirectory(searchPath);
 
   // Simple glob implementation
@@ -399,7 +421,10 @@ function formatSize(bytes: number): string {
 async function handleGrep(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
   const pattern = args.pattern as string;
-  const searchPath = safePath((args.path as string) || ".", cfg, ctx.workspace_path);
+  const searchPath = safePath((args.path as string) || ".", cfg, {
+    workspaceOverride: ctx.workspace_path,
+    sessionGrants: ctx.session_grants,
+  });
   const outputMode = (args.output_mode as string) || "files_with_matches";
   const headLimit = (args.head_limit as number) || 50;
 
@@ -471,7 +496,10 @@ async function handleGrep(args: Record<string, unknown>, ctx: ExecutionContext):
 
 async function handleListDir(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
-  const path = safePath(args.path as string, cfg, ctx.workspace_path);
+  const path = safePath(args.path as string, cfg, {
+    workspaceOverride: ctx.workspace_path,
+    sessionGrants: ctx.session_grants,
+  });
 
   try {
     const entries = await fs.readdir(path);

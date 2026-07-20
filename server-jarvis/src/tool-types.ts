@@ -58,7 +58,10 @@ export type ToolErrorCode =
   | "approval_required"
   | "approval_rejected"
   | "approval_unavailable"
-  | "handler_error";
+  | "handler_error"
+  | "delegate_write_unverified"
+  | "delegate_cleanup_unconfirmed"
+  | "delegate_cleanup_signal_error";
 
 export interface ToolResult {
   call_id: string;

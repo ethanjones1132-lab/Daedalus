@@ -9,6 +9,9 @@ import { SessionReplanCounter } from "./replan-telemetry";
 import { SelfTuningStore } from "../self-tuning/store";
 import type { StageRunRecorder } from "./pipeline";
 import type { CoordinatorResult } from "./coordinator";
+import { ConductorBus } from "./conductor-bus";
+import { LiveConductor } from "./conductor";
+import { AgentPool, DEFAULT_ORCHESTRATOR_AGENTS } from "./agent-pool";
 
 // In-memory collector so this test can never touch the production self-tuning DB.
 const testCollector: StageRunRecorder = { recordStageRun: () => {} };
@@ -27,6 +30,111 @@ function baseDecision(overrides: Partial<CoordinatorResult> = {}): CoordinatorRe
 }
 
 describe("runPipelineWithReplanning", () => {
+  test("planner empty completion retries once then executes without a plan or replan", async () => {
+    const stageLabels: string[] = [];
+    const callModel = async (_messages: any[], options?: any) => {
+      const stage = options?.stageLabel ?? "?";
+      stageLabels.push(stage);
+      if (stage === "planner") return { content: "" };
+      if (stage === "reviewer") return { content: "ACCEPT" };
+      if (stage === "synthesizer") return { content: "Grounded answer without a plan." };
+      return { content: "Executor continued without a plan." };
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+    const coordinator = new Coordinator((async () => ({ content: "unused" })) as any);
+    let coordinatorCalls = 0;
+    coordinator.route = (async () => {
+      coordinatorCalls++;
+      throw new Error("planner degradation must not consume a replan");
+    }) as typeof coordinator.route;
+
+    const result = await runPipelineWithReplanning({
+      contextMessage: "explain the runtime architecture",
+      initialDecision: baseDecision({ pipeline: ["planner", "executor", "reviewer", "synthesizer"] }),
+      turnRequirement: "full_execution",
+      coordinator,
+      routeOptions: { sessionId: "planner-empty-degrade" },
+      executor,
+      agentRunId: "run-planner-empty-degrade",
+      onStateChange: () => {},
+      baseOptions: {},
+      maxReplans: 2,
+    });
+
+    expect(stageLabels.filter((stage) => stage === "planner")).toHaveLength(2);
+    expect(stageLabels).toContain("executor");
+    expect(coordinatorCalls).toBe(0);
+    expect(result.outcome).toBe("degraded");
+    expect(result.error_code).toBe("upstream_stage_failed");
+  });
+
+  test("planner double-empty bypasses live-conductor self-reroute accounting", async () => {
+    const stageLabels: string[] = [];
+    const callModel = async (_messages: any[], options?: any) => {
+      const stage = options?.stageLabel ?? "?";
+      stageLabels.push(stage);
+      if (stage === "planner") return { content: "" };
+      if (stage === "reviewer") return { content: "ACCEPT" };
+      if (stage === "synthesizer") return { content: "Executor evidence synthesized." };
+      return { content: "Executor continued without a plan." };
+    };
+    const bus = new ConductorBus();
+    const supervisionStages: string[] = [];
+    const live = new LiveConductor(
+      callModel as any,
+      bus,
+      new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS),
+      { supervision_timeout_ms: 1_000, max_tool_errors_before_reroute: 1, supervise_low_complexity: true },
+      (async (messages: Array<{ role: string; content: string }>) => {
+        const content = messages.map((message) => message.content).join("\n");
+        const stage = content.match(/Stage:\s*(\w+)/)?.[1] ?? "unknown";
+        supervisionStages.push(stage);
+        return stage === "planner"
+          ? {
+              content: JSON.stringify({
+                directive: "reroute",
+                newRemaining: ["re-enter:planner", "executor", "reviewer", "synthesizer"],
+                reason: "retry planner",
+              }),
+            }
+          : { content: JSON.stringify({ directive: "continue" }) };
+      }) as any,
+    );
+    live.setContext("general", "medium", "run-planner-live-double-empty");
+    const directives: unknown[] = [];
+    const collector = {
+      recordStageRun: () => {},
+      recordDirective: (row: unknown) => directives.push(row),
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, { bus, live, collector });
+    const coordinator = new Coordinator((async () => ({ content: "unused" })) as any);
+    let coordinatorCalls = 0;
+    coordinator.route = (async () => {
+      coordinatorCalls++;
+      throw new Error("planner degradation must not enter the replan loop");
+    }) as typeof coordinator.route;
+
+    const result = await runPipelineWithReplanning({
+      contextMessage: "explain the runtime architecture",
+      initialDecision: baseDecision({ pipeline: ["planner", "executor", "reviewer", "synthesizer"] }),
+      turnRequirement: "full_execution",
+      coordinator,
+      routeOptions: { sessionId: "planner-live-double-empty" },
+      executor,
+      agentRunId: "run-planner-live-double-empty",
+      onStateChange: () => {},
+      baseOptions: {},
+      maxReplans: 2,
+    });
+    bus.clear();
+
+    expect(stageLabels.filter((stage) => stage === "planner")).toHaveLength(2);
+    expect(supervisionStages.filter((stage) => stage === "planner")).toHaveLength(0);
+    expect(directives.filter((row: any) => row.stage === "planner" && row.directive_type === "reroute")).toHaveLength(0);
+    expect(coordinatorCalls).toBe(0);
+    expect(result.outcome).toBe("degraded");
+  });
+
   test("preserves missing_workspace_evidence through the replan finalizer", async () => {
     const calls: string[] = [];
     const executor = new PipelineExecutor(async (_messages, options) => {
@@ -113,6 +221,115 @@ describe("runPipelineWithReplanning", () => {
     expect(result.error_code).toBe("effect_gate_tool_failures");
   });
 
+  test("repeated failed writes terminate at the no-write fence before live replan or review", async () => {
+    const impossibleRuntime = createToolRuntime();
+    impossibleRuntime.register({
+      type: "function",
+      function: {
+        name: "write_file",
+        description: "write a file",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string" },
+            content: { type: "string" },
+          },
+          required: ["path", "content"],
+        },
+      },
+      requires_approval: false,
+      dangerous: false,
+    }, async () => {
+      throw new Error("EPERM: Z:\\JarvisImpossibleRoot does not exist");
+    });
+    const impossibleCtx = makeExecutionContext("chat", defaultConfig(), {
+      session_id: "impossible-write-fence",
+      workspace_path: process.cwd(),
+    });
+
+    const stageLabels: string[] = [];
+    let writeAttempts = 0;
+    const request = "Create Z:\\JarvisImpossibleRoot\\never-created\\proof.txt with exact content proof and do not simulate success.";
+    const callModel = async (_messages: any[], options?: any) => {
+      const stage = options?.stageLabel ?? "unknown";
+      stageLabels.push(stage);
+      if (stage === "executor") {
+        writeAttempts++;
+        return {
+          content: "Attempting the requested write.",
+          tool_calls: [{
+            id: `call_write_${writeAttempts}`,
+            type: "function",
+            function: {
+              name: "write_file",
+              arguments: JSON.stringify({
+                path: "Z:\\JarvisImpossibleRoot\\never-created\\proof.txt",
+                content: "proof",
+              }),
+            },
+          }],
+        };
+      }
+      if (stage === "reviewer") return { content: "REJECT: no file was created" };
+      if (stage === "rewriter") return { content: "Unable to repair the impossible path." };
+      if (stage === "synthesizer") return { content: "The write did not complete." };
+      return { content: "continue" };
+    };
+
+    const bus = new ConductorBus();
+    const live = new LiveConductor(
+      callModel as any,
+      bus,
+      new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS),
+      { supervision_timeout_ms: 1_000, max_tool_errors_before_reroute: 1, supervise_low_complexity: true },
+      (async () => ({ content: JSON.stringify({ directive: "continue" }) })) as any,
+    );
+    live.setContext("debug", "medium", "run-impossible-write-fence");
+    const executor = new PipelineExecutor(callModel as any, impossibleRuntime, impossibleCtx, {
+      bus,
+      live,
+      collector: testCollector,
+    });
+    const coordinator = new Coordinator((async () => ({ content: "unused" })) as any);
+    let coordinatorCalls = 0;
+    coordinator.route = (async () => {
+      coordinatorCalls++;
+      return baseDecision({ pipeline: ["executor", "reviewer", "synthesizer"] });
+    }) as typeof coordinator.route;
+
+    const result = await runPipelineWithReplanning({
+      contextMessage: request,
+      initialDecision: baseDecision({ pipeline: ["executor", "reviewer", "synthesizer"] }),
+      turnRequirement: "full_execution",
+      coordinator,
+      routeOptions: { sessionId: "impossible-write-fence" },
+      executor,
+      agentRunId: "run-impossible-write-fence",
+      onStateChange: () => {},
+      baseOptions: {
+        executionProfile: "full",
+        turnRequirement: "full_execution",
+        rawMessage: request,
+      },
+      maxReplans: 1,
+    });
+    bus.clear();
+
+    expect(result).toMatchObject({
+      outcome: "failed",
+      error_code: "effect_gate_no_write_effect",
+    });
+    expect(writeAttempts).toBe(2);
+    expect(result.toolCalls?.map((call) => call.output)).toEqual([
+      expect.stringContaining("EPERM"),
+      expect.stringContaining("EPERM"),
+    ]);
+    expect(coordinatorCalls).toBe(0);
+    expect(stageLabels).not.toContain("reviewer");
+    expect(stageLabels).not.toContain("rewriter");
+    expect(stageLabels).not.toContain("synthesizer");
+  });
+
   test("runs the first segment, re-invokes the conductor, then finishes with the revised route", async () => {
     const stageLabels: string[] = [];
     const callModel = async (_messages: any[], options?: any) => {
@@ -154,9 +371,9 @@ describe("runPipelineWithReplanning", () => {
     expect(coordinatorCalls).toBe(1);
     // "migrate the users table" carries write intent, and this fixture model
     // only ever answers prose — so the executor stage presses its bounded
-    // write-effect nudge twice (2026-07-17) before accepting the prose
-    // ending: 3 executor model calls for the single executor stage entry.
-    expect(stageLabels).toEqual(["executor", "executor", "executor", "rewriter", "reviewer", "synthesizer"]);
+    // write-effect nudge three times before accepting the prose ending:
+    // 4 executor model calls for the single executor stage entry.
+    expect(stageLabels).toEqual(["executor", "executor", "executor", "executor", "rewriter", "reviewer", "synthesizer"]);
     expect(stateEvents).toContain("conductor_replan:running");
     expect(stateEvents).toContain("conductor_replan:done");
     // Deliberate effect-gate inversion: this full-execution fixture never
@@ -200,13 +417,13 @@ describe("runPipelineWithReplanning", () => {
     // decision (returned just before the budget ran out) still explicitly
     // lists "executor" — and an explicit request in the model's own decision
     // always wins over "already completed", even across the budget-exhaustion
-    // boundary. Each stage entry additionally makes 3 model calls (initial +
-    // 2 bounded write-effect nudges, 2026-07-17) because this write-intent
+    // boundary. Each stage entry additionally makes 4 model calls (initial +
+    // 3 bounded write-effect nudges) because this write-intent
     // fixture only ever answers prose.
     expect(stageLabels).toEqual([
-      "executor", "executor", "executor",
+      "executor", "executor", "executor", "executor",
       "rewriter",
-      "executor", "executor", "executor",
+      "executor", "executor", "executor", "executor",
       "reviewer", "synthesizer",
     ]);
     expect(result.outcome).toBe("failed");
@@ -253,14 +470,14 @@ describe("runPipelineWithReplanning", () => {
 
     expect(coordinatorCalls).toBe(1);
     // Two executor STAGE entries (original + deliberate re-run), each pressed
-    // by the bounded write-effect nudge into 3 model calls (2026-07-17).
+    // by the bounded write-effect nudge into 4 model calls.
     expect(stageLabels).toEqual([
-      "executor", "executor", "executor",
+      "executor", "executor", "executor", "executor",
       "rewriter",
-      "executor", "executor", "executor",
+      "executor", "executor", "executor", "executor",
       "reviewer", "synthesizer",
     ]);
-    expect(stageLabels.filter((s) => s === "executor")).toHaveLength(6);
+    expect(stageLabels.filter((s) => s === "executor")).toHaveLength(8);
     expect(result.outcome).toBe("failed");
     expect(result.error_code).toBe("effect_gate_no_write_effect");
   });

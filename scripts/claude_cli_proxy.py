@@ -31,7 +31,7 @@ from typing import Any
 LOG = logging.getLogger("jarvis.claude_cli_proxy")
 
 PORT = int(os.environ.get("JARVIS_CLAUDE_PROXY_PORT", "19878"))
-BIND_HOST = os.environ.get("JARVIS_CLAUDE_PROXY_BIND", "0.0.0.0")
+BIND_HOST = os.environ.get("JARVIS_CLAUDE_PROXY_BIND", "127.0.0.1")
 OLLAMA_URL = os.environ.get("JARVIS_OLLAMA_URL", "http://127.0.0.1:11434")
 DEFAULT_MODEL = os.environ.get("JARVIS_DEFAULT_MODEL", "gemma4:e4b")
 CLAUDE_TIMEOUT = float(os.environ.get("JARVIS_CLAUDE_TIMEOUT", "180"))

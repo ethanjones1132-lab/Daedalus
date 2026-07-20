@@ -41,6 +41,8 @@ pub struct HermesConfig {
     pub hermes_home: PathBuf,
     /// Path to the Python interpreter inside the Hermes venv.
     pub python: PathBuf,
+    /// Launcher arguments that precede Python's own arguments (for example `py -3`).
+    pub python_prefix_args: Vec<String>,
     /// Path to the tui_gateway entry point (e.g. `-m tui_gateway`).
     pub entry: String,
     /// Per-request timeout, in milliseconds.
@@ -56,6 +58,7 @@ impl Default for HermesConfig {
         Self {
             hermes_home: PathBuf::from("/tmp/hermes-home"),
             python: PathBuf::from("python3"),
+            python_prefix_args: Vec::new(),
             entry: "-m tui_gateway".to_string(),
             request_timeout_ms: 30_000,
             startup_timeout_ms: 15_000,
@@ -129,10 +132,8 @@ impl HermesProcess {
         }
         *self.state.lock().await = HermesState::Starting;
 
-        let mut command = Command::new(&self.config.python);
+        let mut command = self.config.python_command();
         command
-            .arg("-u") // unbuffered, so the parent reads lines as they're written
-            .arg(&self.config.entry)
             .env("HERMES_HOME", &self.config.hermes_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -316,3 +317,37 @@ impl HermesProcess {
 
 // (the broken CloneArc trait helper was removed in the recovery; Arc::clone
 // on the now-Arc-wrapped fields is sufficient.)
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn python_command_preserves_launcher_prefix_before_gateway_args() {
+        let config = HermesConfig {
+            python: PathBuf::from("py"),
+            python_prefix_args: vec!["-3".to_string()],
+            entry: "-m tui_gateway".to_string(),
+            ..HermesConfig::default()
+        };
+
+        let command = config.python_command();
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args, vec!["-3", "-u", "-m tui_gateway"]);
+    }
+}
+
+impl HermesConfig {
+    fn python_command(&self) -> Command {
+        let mut command = Command::new(&self.python);
+        command
+            .args(&self.python_prefix_args)
+            .arg("-u")
+            .arg(&self.entry);
+        command
+    }
+}

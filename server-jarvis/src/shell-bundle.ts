@@ -4,8 +4,10 @@
 // The `bash` tool registered into the ToolRuntime. Dangerous + approval-required.
 
 import { spawn } from "child_process";
+import { statSync } from "fs";
 import type { ToolRuntime, ExecutionContext } from "./tool-runtime";
 import type { ToolDefinition } from "./tool-types";
+import { safePath } from "./fs-scope";
 
 const BASH_DEF: ToolDefinition = {
   type: "function",
@@ -16,6 +18,7 @@ const BASH_DEF: ToolDefinition = {
       type: "object",
       properties: {
         command: { type: "string", description: "Shell command to execute" },
+        cwd: { type: "string", description: "Working directory within the active workspace or a Session-granted root" },
         description: { type: "string", description: "Brief description of what this command does" },
         timeout_ms: { type: "number", description: "Timeout in milliseconds (max 60000)", default: 30000 },
       },
@@ -30,10 +33,20 @@ async function handleBash(args: Record<string, unknown>, ctx: ExecutionContext):
   const cfg = ctx.config;
   const command = args.command as string;
   const timeout = Math.min((args.timeout_ms as number) || 30000, 60000);
+  const requestedCwd = typeof args.cwd === "string" && args.cwd.trim().length > 0
+    ? args.cwd
+    : (ctx.workspace_path || cfg.jarvis_path || process.cwd());
+  const cwd = safePath(requestedCwd, cfg, {
+    workspaceOverride: ctx.workspace_path,
+    sessionGrants: ctx.session_grants,
+  });
+  if (!statSync(cwd).isDirectory()) {
+    throw new Error(`Shell cwd is not a directory: ${requestedCwd}`);
+  }
 
   return new Promise((resolve) => {
     const proc = spawn("bash", ["-c", command], {
-      cwd: cfg.jarvis_path || process.cwd(),
+      cwd,
       timeout,
       env: { ...process.env, PATH: process.env.PATH },
     });

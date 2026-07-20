@@ -26,8 +26,8 @@ For each task in the plan:
 
 ### Shell Bundle
 - `bash` — For builds, installs, git, running scripts, and shell commands.
-- Prefer foreground for short commands with a generous timeout. Use `background=true` only for long-lived processes.
-- Use `workdir` for project-specific commands.
+- `bash` accepts `command`, optional `cwd`, optional `description`, and optional `timeout_ms` (maximum 60000). It does not accept `workdir` or `background`.
+- Use `cwd` for project-specific commands. It must resolve within the active workspace or a Session-granted filesystem root.
 - Never run destructive shell commands without understanding their impact first.
 
 ### Web Bundle

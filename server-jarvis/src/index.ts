@@ -24,7 +24,7 @@ import { buildLearningPrompt, buildReviewPrompt, buildCodebaseAuditPrompt, build
 import { createLifecycleService } from "./agent-lifecycle";
 import { handleAgentRequest } from "./agent-routes";
 import { effectiveOllamaUrl, checkOllamaHealth, checkOllamaModelSupportsTools, resolveWindowsHostIP, selectInstalledOllamaModel } from "./ollama";
-import { streamClaudeCli, isClaudeCliAvailable, compactTurnHistoryForCli } from "./claude-cli";
+import { buildClaudeCliChatArgs, streamClaudeCli, isClaudeCliAvailable, compactTurnHistoryForCli } from "./claude-cli";
 import { ReasoningParser, stripReasoningFromText, type ReasoningEvent } from "./reasoning";
 import {
   listOpenRouterModels,
@@ -80,7 +80,7 @@ import { registerStandardBundles } from "./bundles-registry";
 import { deprecatedSessionsPostResponse } from "./session-authority";
 import { searchWeb } from "./web-bundle";
 import { getSessionState, clearSessionState } from "./interactive-bundle";
-import { StreamSession, VisibleTextPipe } from "./stream-emitter";
+import { StreamSession, VisibleTextPipe, isTerminalPipelineErrorCode } from "./stream-emitter";
 import {
   createStreamLivenessTracker,
   createDisconnectAwareWrite,
@@ -120,10 +120,11 @@ import {
   latestLiveModelCatalogSnapshot,
 } from "./orchestration/live-model-catalog";
 import { excludedModelKeys } from "./model-failure-memory";
-import { PipelineExecutor } from "./orchestration/pipeline";
+import { PipelineExecutor, productionExecutorDelegateRuntime } from "./orchestration/pipeline";
+import { extractRootGrants } from "./orchestration/workspace-grants";
 import { combinedStageExclusions, StageHealthRegistry, type RecoverableFailureKind } from "./orchestration/stage-health";
 import { ModelScorecard, type ScorecardAttempt } from "./orchestration/model-scorecard";
-import { createTurnBudget } from "./orchestration/turn-budget";
+import { computeBoundedRequestTimeoutMs, createTurnBudget, requestTimeoutMessage } from "./orchestration/turn-budget";
 import { assessWorkspaceEvidence, isDeepReadRequest, resolveWorkspaceReadScope } from "./orchestration/evidence-sufficiency";
 import { FORCE_DEEP_READ_PATTERN } from "./orchestration/repetition-guard";
 import { OrchestrationAdmissionController, type AdmissionLease } from "./orchestration/admission-controller";
@@ -791,7 +792,7 @@ async function testConnection(configOverride?: Partial<JarvisConfig>): Promise<{
   }
   if (cfg.active_backend === "claude_cli") {
     const path = cfg.claude_cli.path || "claude";
-    const available = await isClaudeCliAvailable(path);
+    const available = await isClaudeCliAvailable(path, cfg.claude_cli.auth_mode);
     return { ok: available, latency_ms: 0, error: available ? undefined : `Claude CLI not found at '${path}'. Make sure 'claude' is on PATH.` };
   }
   // OpenRouter
@@ -1368,12 +1369,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     turnHistory,
     cfg.jarvis_path,
   );
+  const turnSessionGrants = cfg.tools.grant_session_roots
+    ? extractRootGrants(message)
+    : [];
   const workspaceReadScope = resolveWorkspaceReadScope(message, activeWorkspacePath);
   console.log(`[Jarvis] Active workspace session=${sessionId} path=${activeWorkspacePath}`);
   const activeTaskRun = sessionMemory.beginTaskRun(sessionId, {
     message,
     requirement: initialResolvedRequirement.result.requirement,
     workspacePath: activeWorkspacePath,
+    sessionGrants: turnSessionGrants,
     depth: resolveDeepReadIntent(message, priorTaskRun?.depth) ? "deep" : "standard",
     estimatedComplexity: resolveDeepReadIntent(message, priorTaskRun?.depth) ? "high" : "medium",
   });
@@ -1502,10 +1507,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const promptBody = `${historyPrompt}user: ${message}`;
 
         // Build CLI args: system prompt via --append-system-prompt, model, prompt as positional
-        const cliArgs = [...(cfg.claude_cli.args || ["--print", "--verbose", "--output-format", "stream-json"])];
-        // When using Claude CLI with Ollama, pass the model via --model
-        const ollamaModel = cfg.ollama?.model || "qwen3:8b";
-        cliArgs.push("--model", ollamaModel);
+        const cliArgs = buildClaudeCliChatArgs(
+          [...(cfg.claude_cli.args || ["--print", "--verbose", "--output-format", "stream-json"])],
+          {
+            authMode: cfg.claude_cli.auth_mode,
+            claudeModel: cfg.claude_cli.model,
+            proxyModel: cfg.ollama?.model || "qwen3:8b",
+          },
+        );
         if (systemPrompt) {
           cliArgs.push("--append-system-prompt", systemPrompt);
         }
@@ -1514,7 +1523,6 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           prompt: promptBody,
           session_id: resumedSessionId,
           cwd: cfg.claude_cli.cwd,
-          max_turns: 1,
           cliArgs,
         }, streamAbort.signal)) {
           if (streamAbort.signal.aborted) {
@@ -1540,7 +1548,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           } else if (evt.type === "tool_use") {
             await writer.write(encoder.encode(`data: ${JSON.stringify({
               type: "tool_use",
-              id: (evt as any).id,
+              id: evt.tool_use_id,
               name: evt.tool_name,
               input: evt.tool_input,
               session_id: sessionId,
@@ -1548,8 +1556,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           } else if (evt.type === "tool_result") {
             await writer.write(encoder.encode(`data: ${JSON.stringify({
               type: "tool_result",
-              name: evt.tool_name,
+              id: evt.tool_use_id,
               output: evt.tool_output,
+              is_error: evt.is_error,
               session_id: sessionId,
             })}\n\n`));
           } else if (evt.type === "message_stop") {
@@ -1594,6 +1603,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       // Patch the execution context with the active session ID so
       // interactive tools (ask_user_question) can scope state per-session.
       ctx.session_id = sessionId;
+      ctx.session_grants = activeTaskRun.sessionGrants ?? [];
       // Wire the approval hook: emit a `tool_approval_request` SSE event so
       // the Tauri runner relays it to the UI (ToolApprovalModal), then await
       // the user's decision from the process-level registry. Auto-denies after
@@ -1935,17 +1945,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // (paired in the request finally below). Idle between endStage calls
           // no longer drains the stage window.
           if (stageLabel) turnBudget.beginStage(stageLabel);
-          const stageBudgetMs = stageLabel
-            ? turnBudget.stageRemainingMs(stageLabel, Date.now())
-            : turnBudget.remainingMs(Date.now());
           // Re-read stage deadline after beginStage (executor may have extended via
           // extendStageOnProgress between attempts).
           const stageStreamDeadline = stageLabel
             ? turnBudget.stageStreamDeadlineAt(stageLabel)
             : undefined;
-          const requestBudgetMs = Math.max(
-            1_000,
-            Math.min(requestTimeout, stageBudgetMs, Math.max(1_000, turnBudget.remainingMs(Date.now()) - reserveMs)),
+          const requestBudgetMs = computeBoundedRequestTimeoutMs(
+            stageLabel ?? "agent",
+            turnBudget,
+            requestTimeout,
+            reserveMs,
           );
           let turnDeadlineAbortedRequest = false;
           const timeout = setTimeout(() => {
@@ -2013,7 +2022,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               throw new TurnDeadlineExceededError(callOptions?.stageLabel ?? "orchestrator_request", turnBudget.turn_ms);
             }
             if (fetchErr.name === "AbortError") {
-              throw new Error(`Request timed out after ${requestTimeout / 1000}s. The model may be loading or overloaded.`);
+              throw new Error(requestTimeoutMessage(requestBudgetMs));
             }
             if (isOllama && (fetchErr.message?.includes("ECONNREFUSED") || fetchErr.message?.includes("fetch failed"))) {
               throw new Error(`Cannot connect to Ollama. Tried: ${ollamaTarget?.tried.join("; ") || baseUrl}. Make sure Ollama is running and the model is pulled (ollama pull ${modelName}).`);
@@ -2785,7 +2794,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           })}\n\n`));
         };
         const coordinator = new Coordinator(callModel, persistentConductor, onLocalUnavailable);
-        const workspaceRootHint = `Active filesystem workspace root: ${activeWorkspacePath}. Resolve relative filesystem paths against this root.`;
+        const grantedRootsHint = activeTaskRun.sessionGrants?.length
+          ? ` Session-granted filesystem roots: ${activeTaskRun.sessionGrants.join(", ")}.`
+          : "";
+        const workspaceRootHint = `Active filesystem workspace root: ${activeWorkspacePath}. Resolve relative filesystem paths against the ordered allowed roots.${grantedRootsHint}`;
         const memoryHints = mergeSharedContextHints(
           sessionMemory.toSharedContextHints(sessionId, activeWorkspacePath),
           { relevant_memories: [workspaceRootHint] },
@@ -3059,7 +3071,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           route.context.estimated_complexity,
           agentRunId,
         );
-        const executor = new PipelineExecutor(callModel, runtime, ctx, { bus: conductorBus, live: liveConductor });
+        const executor = new PipelineExecutor(
+          callModel,
+          runtime,
+          ctx,
+          { bus: conductorBus, live: liveConductor },
+          productionExecutorDelegateRuntime,
+        );
         const stageStartedAt = new Map<string, number>();
         const onOrchestratorStateChange = async (state: PipelineProgressState) => {
           const now = Date.now();
@@ -3093,9 +3111,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // and effect gate armed even though the follow-up names no mutation.
           taskRunWriteIntent: activeTaskRun.writeIntent === true,
           workspaceReadScope,
+          turnAbort: streamAbort.signal,
           workerInstructions: instructionSelection.instructions,
           sharedContext: mergedSharedContext,
           sessionMemory: sessionMemory,
+          sessionGrants: activeTaskRun.sessionGrants,
           preferFastSynthesizer: routeSource === "trivial_short_circuit" || Boolean(workspaceReadScope),
           distilledSkillsBlock: resolvedSkills.promptBlock,
           maxRecursionDepth: cfg.orchestrator.max_recursion_depth,
@@ -3169,6 +3189,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           conductorBus.clear();
         }
         const result = pipelineResult;
+        if (result.cancelled) {
+          await emitCancelled();
+        }
 
         // Record metrics and propose tuning options
         const duration = Date.now() - runStartTime;
@@ -3192,7 +3215,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // Truthful run outcome. An empty/degraded run must NOT be recorded as a
         // success — that poisons the self-tuning signal. `completed:1` only means
         // the run finished; `outcome` records whether it actually succeeded.
-        const trimmedAnswer = result.answer?.trim() || "";
+        const terminalPipelineFailure = isTerminalPipelineErrorCode(result.error_code);
+        // A no-write effect-gate failure is terminal. Any nonempty answer on
+        // that result predates the fence (typically planner prose), so it is
+        // neither retained as the run's final answer nor exposed over SSE.
+        const trimmedAnswer = terminalPipelineFailure ? "" : (result.answer?.trim() || "");
 
         // Cross-turn no-progress verdict (Task 1.3), computed BEFORE the
         // outcome is persisted: the incident's non-answer turns were recorded
@@ -3381,7 +3408,26 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           session_id: sessionId,
         })}\n\n`));
         await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "agent_run_id", agent_run_id: agentRunId, session_id: sessionId })}\n\n`));
-        if (result.error) {
+        if (terminalPipelineFailure) {
+          console.error(`[Jarvis Orchestrator] session=${sessionId} failed: ${result.error_code}`);
+          recordInference({
+            ts: Date.now(),
+            backend: backendForProvider(orchLastProvider, cfg.active_backend),
+            model: orchLastModel ?? (cfg.active_backend === "openrouter"
+              ? (cfg.openrouter.model ?? "openrouter/free")
+              : cfg.ollama.model),
+            ok: false,
+            latency_ms: duration,
+            tokens_in: turnMetrics.tokens_in,
+            tokens_out: turnMetrics.tokens_out,
+            fallback_used: orchFallbackEvents > 0,
+            retry_count: orchFallbackRetryCount,
+            fallback_model: orchLastFallbackModel,
+            error: result.error_code,
+          });
+          repetitionStore.recordOutcome(sessionId, message, result.error_code);
+          await session.finish("", { isError: true, code: result.error_code });
+        } else if (result.error) {
           // Turn-fatal failure (e.g. auth rejected on every stage): surface a
           // real error frame so the UI shows a banner instead of dropping the
           // failure text into the chat bubble as if it were an answer.
@@ -3713,7 +3759,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const useFallback = !isOllama && cfg.openrouter.enable_fallbacks;
         const requestTimeout = isOllama ? MODEL_REQUEST_TIMEOUT_MS : (cfg.openrouter.timeout_ms || MODEL_REQUEST_TIMEOUT_MS);
         const ctrl = new AbortController();
-        const requestBudgetMs = Math.max(1, Math.min(requestTimeout, turnBudget.deadlineAt - Date.now()));
+        const requestBudgetMs = computeBoundedRequestTimeoutMs("agent_loop", turnBudget, requestTimeout);
         let turnDeadlineAbortedRequest = false;
         const timeout = setTimeout(() => {
           turnDeadlineAbortedRequest = Date.now() >= turnBudget.deadlineAt;
@@ -3770,7 +3816,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             throw new TurnDeadlineExceededError("agent_loop_request", TOTAL_TURN_TIMEOUT_MS);
           }
           if (fetchErr.name === "AbortError") {
-            throw new Error(`Request timed out after ${requestTimeout / 1000}s. The model may be loading or overloaded.`);
+            throw new Error(requestTimeoutMessage(requestBudgetMs));
           }
           if (isOllama && (fetchErr.message?.includes("ECONNREFUSED") || fetchErr.message?.includes("fetch failed"))) {
             throw new Error(`Cannot connect to Ollama. Tried: ${ollamaTarget?.tried.join("; ") || baseUrl}. Make sure Ollama is running and the model is pulled (ollama pull ${modelName}).`);
@@ -3795,7 +3841,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               requestBody.messages.unshift({ role: "system", content: instructions });
             }
             const retryCtrl = new AbortController();
-            const retryTimeout = setTimeout(() => retryCtrl.abort(), requestTimeout);
+            // Recompute immediately before the fallback fetch. Time consumed by
+            // the first request must not be re-granted to this retry.
+            const retryRequestBudgetMs = computeBoundedRequestTimeoutMs("agent_loop", turnBudget, requestTimeout);
+            const retryTimeout = setTimeout(() => retryCtrl.abort(), retryRequestBudgetMs);
             const cleanupRetryAbort = registerAbortHandler(streamAbort.signal, () => retryCtrl.abort());
             try {
               fetchRes = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(requestBody), signal: retryCtrl.signal });
@@ -3812,6 +3861,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               cleanupRetryAbort();
               if (retryErr.name === "AbortError" && streamAbort.signal.aborted) {
                 await emitCancelled();
+              }
+              if (retryErr.name === "AbortError") {
+                throw new Error(requestTimeoutMessage(retryRequestBudgetMs));
               }
               throw retryErr;
             }
@@ -4559,7 +4611,10 @@ async function checkStatus(configOverride?: Partial<JarvisConfig> | null) {
 
   let claudeCliAvailable = false;
   try {
-    claudeCliAvailable = await isClaudeCliAvailable(cfg.claude_cli.path || "claude");
+    claudeCliAvailable = await isClaudeCliAvailable(
+      cfg.claude_cli.path || "claude",
+      cfg.claude_cli.auth_mode,
+    );
   } catch { /* false */ }
 
   const bridgeActive = await isBridgeListening();
