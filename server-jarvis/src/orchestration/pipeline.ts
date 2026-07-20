@@ -13,7 +13,7 @@ import type { ConductorBus, ConductorDirective } from "./conductor-bus";
 import type { ConductorStageEvidence, LiveConductor } from "./conductor";
 import { buildSynthesizerContext, buildSynthesizerContextFromStageState } from "./synth-context";
 import { detectDeferralStall, DEFERRAL_STALL_NUDGE } from "./synthesizer-deferral";
-import { applyEffectGate, buildWriteEffectNudge, evaluateEffectGate, mostReadSuccessfulFile, shouldPressWriteEffect, WRITE_EFFECT_NUDGE, WRITE_EFFECT_TOOLS, type EffectGateReport } from "./effect-gate";
+import { applyEffectGate, buildWriteEffectNudge, evaluateEffectGate, hasRepeatedWriteFailureWithoutEffect, isTerminalNoWriteEffect, mostReadSuccessfulFile, shouldPressWriteEffect, WRITE_EFFECT_NUDGE, WRITE_EFFECT_TOOLS, type EffectGateReport } from "./effect-gate";
 import { normalizeRemainingStages, type ExecutionProfile } from "./route-normalization";
 import { hasWriteIntent, type TurnRequirement } from "./turn-requirements";
 import type { TurnBudget } from "./turn-budget";
@@ -968,6 +968,7 @@ export class PipelineExecutor {
     let workspaceEvidenceNudgeCount = 0;
     let evidenceCountAtLastNudge = 0;
     let writeEffectNudgeCount = 0;
+    let repeatedWriteFailureReached = false;
     const intentText = options.rawMessage ?? request;
     const requiresWorkspaceEvidence = turnNeedsWorkspaceEvidence(options.turnRequirement, intentText);
     // 2026-07-17 incident: on live write turns the executor read files and
@@ -1479,6 +1480,21 @@ export class PipelineExecutor {
             .length;
           options.turnBudget?.extendStageOnProgress("executor", evidenceAddedThisTurn);
 
+          // A first failed mutation remains recoverable inside this executor
+          // loop. A second verified failure with zero successful mutations is
+          // the bounded honesty fence: stop spending model turns and let the
+          // segment return the typed no-write outcome before replan/review.
+          repeatedWriteFailureReached = hasRepeatedWriteFailureWithoutEffect(
+            toolCalls,
+            requiresWriteEffect,
+          );
+          if (repeatedWriteFailureReached) {
+            executorDone = true;
+            narratives.push(
+              "Execution stopped after two failed mutation attempts with zero successful file mutations.",
+            );
+          }
+
           // A workspace-evidence stage is not grounded merely because an
           // executor model produced prose. Give it a bounded repair nudge.
           // The first nudge can fire on zero evidence; the second only fires
@@ -1521,6 +1537,7 @@ export class PipelineExecutor {
           // prose ending — but never into a nearly-exhausted stage window.
           let writeEffectNudgeSentThisTurn = false;
           if (
+            !repeatedWriteFailureReached &&
             (options.turnBudget?.stageRemainingMs("executor") ?? Number.POSITIVE_INFINITY) > 8_000 &&
             shouldPressWriteEffect({
               writeIntent: requiresWriteEffect,
@@ -1664,6 +1681,32 @@ export class PipelineExecutor {
         intentText,
         this.evidenceRoots(options),
       );
+      if (repeatedWriteFailureReached) {
+        const message = "Repeated write attempts failed; zero file mutations succeeded.";
+        const failedNarrative = [narrative, message].filter(Boolean).join("\n\n");
+        onStateChange({
+          stage: "executor",
+          status: "failed",
+          output: message,
+          detail: "effect_gate_no_write_effect",
+        });
+        await this.afterConductorStage(
+          "executor",
+          "failed",
+          failedNarrative,
+          agentRunId,
+          options,
+          remainingQueue,
+          executorEvidence(),
+        );
+        return {
+          ok: false,
+          narrative: failedNarrative,
+          toolCalls,
+          terminalStatus: "failed",
+          errorCode: "effect_gate_no_write_effect",
+        };
+      }
       if (!executorDone) {
         const message =
           `Executor reached its ${maxTurns}-turn tool-call limit while work was still in progress. ` +
@@ -2481,6 +2524,16 @@ export class PipelineExecutor {
         state.executor = await this.runExecutorStage(
           request, renderPlanSummary(state.plan), agentRunId, onStateChange, executorOptions, profile, remainingNow(),
         );
+        if (state.executor.errorCode === "effect_gate_no_write_effect") {
+          const effectGate = evaluateEffectGate({
+            profile,
+            executor: state.executor,
+            rewriter: state.rewriter,
+            request: intentText,
+            assumeWriteIntent: options.taskRunWriteIntent,
+          });
+          return { state, effectGate, partialStage };
+        }
         // T2.4: hard executor failure (non-workspace_read) → replan pre-synthesizer.
         // workspace_read falls through to the evidence fence for precise codes.
         if (
@@ -2591,6 +2644,10 @@ export class PipelineExecutor {
       if (state.rewriter.terminalStatus === "timed_out") {
         partialStage = { stage: "rewriter", errorCode: state.rewriter.errorCode ?? "stage_timeout" };
       }
+    }
+
+    if (isTerminalNoWriteEffect(effectGate)) {
+      return { state, effectGate, partialStage };
     }
 
     // A reviewer/rewriter pass that still produced no requested mutation is

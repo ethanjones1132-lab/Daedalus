@@ -3,6 +3,7 @@ import type { ExecutionProfile } from "./route-normalization";
 import { hasWriteIntent } from "./turn-requirements";
 
 export const WRITE_EFFECT_TOOLS = new Set(["write_file", "edit_file", "multi_edit", "apply_patch"]);
+export const MAX_FAILED_WRITE_ATTEMPTS_WITHOUT_EFFECT = 2;
 
 export interface EffectGateReport {
   clean: boolean;
@@ -51,7 +52,8 @@ export function evaluateEffectGate(input: {
     (call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name),
   ).length;
   let verdict: EffectGateReport["verdict"] = "clean";
-  if (failedCalls.length > 0) verdict = "tool_failures";
+  if (hasRepeatedWriteFailureWithoutEffect(calls, writeIntent)) verdict = "no_write_effect";
+  else if (failedCalls.length > 0) verdict = "tool_failures";
   else if (writeIntent && successfulWrites === 0) verdict = "no_write_effect";
   const clean = verdict === "clean";
   return {
@@ -80,11 +82,35 @@ export function applyEffectGate(
   errorCode: string | undefined,
   report: EffectGateReport,
 ): { outcome: "success" | "degraded" | "failed"; errorCode?: string } {
-  if (outcome !== "success" || report.clean) return { outcome, errorCode };
-  if (report.verdict === "no_write_effect") {
+  // Repeated verified write failures are terminal even when the executor is
+  // already degraded. A fresh zero-write result keeps the historical recovery
+  // path, and a pre-existing hard failure remains authoritative.
+  if (
+    report.verdict === "no_write_effect"
+    && (outcome === "success" || isTerminalNoWriteEffect(report))
+  ) {
     return { outcome: "failed", errorCode: "effect_gate_no_write_effect" };
   }
+  if (outcome !== "success" || report.clean) return { outcome, errorCode };
   return { outcome: "degraded", errorCode: `effect_gate_${report.verdict}` };
+}
+
+/** Two failed mutation attempts with no success exhaust bounded recovery. */
+export function hasRepeatedWriteFailureWithoutEffect(
+  calls: ToolCallRecord[],
+  writeIntent: boolean,
+): boolean {
+  if (!writeIntent) return false;
+  const writes = calls.filter((call) => WRITE_EFFECT_TOOLS.has(call.name));
+  return !writes.some((call) => !call.is_error)
+    && writes.filter((call) => call.is_error).length >= MAX_FAILED_WRITE_ATTEMPTS_WITHOUT_EFFECT;
+}
+
+export function isTerminalNoWriteEffect(report: EffectGateReport): boolean {
+  return report.verdict === "no_write_effect"
+    && report.successfulWrites === 0
+    && report.failedCalls.filter((call) => WRITE_EFFECT_TOOLS.has(call.name)).length
+      >= MAX_FAILED_WRITE_ATTEMPTS_WITHOUT_EFFECT;
 }
 
 /**

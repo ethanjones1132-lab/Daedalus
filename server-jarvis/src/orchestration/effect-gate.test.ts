@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { applyEffectGate, buildWriteEffectNudge, evaluateEffectGate, mostReadSuccessfulFile, shouldPressWriteEffect } from "./effect-gate";
+import { applyEffectGate, buildWriteEffectNudge, evaluateEffectGate, isTerminalNoWriteEffect, mostReadSuccessfulFile, shouldPressWriteEffect } from "./effect-gate";
 import type { ExecutorStageOutput, ToolCallRecord } from "./stage-output";
 
 function call(name: string, is_error = false, output = "ok"): ToolCallRecord {
@@ -29,6 +29,39 @@ describe("effect gate", () => {
     expect(report.verdict).toBe("tool_failures");
     expect(report.failedCalls).toEqual([{ name: "write_file", detail: "permission denied" }]);
     expect(report.synthesizerNotice).toContain("Execution Verification");
+  });
+
+  test("two failed mutations with zero success become terminal no_write_effect", () => {
+    const report = evaluateEffectGate({
+      profile: "full",
+      executor: executor([
+        call("write_file", true, "permission denied"),
+        call("write_file", true, "permission denied again"),
+      ]),
+      request: "write workspace/proof.txt",
+    });
+
+    expect(report.verdict).toBe("no_write_effect");
+    expect(isTerminalNoWriteEffect(report)).toBe(true);
+    expect(applyEffectGate("degraded", "upstream_stage_failed", report)).toEqual({
+      outcome: "failed",
+      errorCode: "effect_gate_no_write_effect",
+    });
+  });
+
+  test("a successful mutation prevents repeated failures from becoming no_write_effect", () => {
+    const report = evaluateEffectGate({
+      profile: "full",
+      executor: executor([
+        call("write_file", true, "first attempt failed"),
+        call("edit_file", false, "updated"),
+      ]),
+      request: "update workspace/proof.txt",
+    });
+
+    expect(report.successfulWrites).toBe(1);
+    expect(report.verdict).toBe("tool_failures");
+    expect(isTerminalNoWriteEffect(report)).toBe(false);
   });
 
   test("full profile with only reads produces no_write_effect", () => {

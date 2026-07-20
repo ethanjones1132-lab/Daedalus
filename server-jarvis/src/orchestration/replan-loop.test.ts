@@ -221,6 +221,115 @@ describe("runPipelineWithReplanning", () => {
     expect(result.error_code).toBe("effect_gate_tool_failures");
   });
 
+  test("repeated failed writes terminate at the no-write fence before live replan or review", async () => {
+    const impossibleRuntime = createToolRuntime();
+    impossibleRuntime.register({
+      type: "function",
+      function: {
+        name: "write_file",
+        description: "write a file",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string" },
+            content: { type: "string" },
+          },
+          required: ["path", "content"],
+        },
+      },
+      requires_approval: false,
+      dangerous: false,
+    }, async () => {
+      throw new Error("EPERM: Z:\\JarvisImpossibleRoot does not exist");
+    });
+    const impossibleCtx = makeExecutionContext("chat", defaultConfig(), {
+      session_id: "impossible-write-fence",
+      workspace_path: process.cwd(),
+    });
+
+    const stageLabels: string[] = [];
+    let writeAttempts = 0;
+    const request = "Create Z:\\JarvisImpossibleRoot\\never-created\\proof.txt with exact content proof and do not simulate success.";
+    const callModel = async (_messages: any[], options?: any) => {
+      const stage = options?.stageLabel ?? "unknown";
+      stageLabels.push(stage);
+      if (stage === "executor") {
+        writeAttempts++;
+        return {
+          content: "Attempting the requested write.",
+          tool_calls: [{
+            id: `call_write_${writeAttempts}`,
+            type: "function",
+            function: {
+              name: "write_file",
+              arguments: JSON.stringify({
+                path: "Z:\\JarvisImpossibleRoot\\never-created\\proof.txt",
+                content: "proof",
+              }),
+            },
+          }],
+        };
+      }
+      if (stage === "reviewer") return { content: "REJECT: no file was created" };
+      if (stage === "rewriter") return { content: "Unable to repair the impossible path." };
+      if (stage === "synthesizer") return { content: "The write did not complete." };
+      return { content: "continue" };
+    };
+
+    const bus = new ConductorBus();
+    const live = new LiveConductor(
+      callModel as any,
+      bus,
+      new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS),
+      { supervision_timeout_ms: 1_000, max_tool_errors_before_reroute: 1, supervise_low_complexity: true },
+      (async () => ({ content: JSON.stringify({ directive: "continue" }) })) as any,
+    );
+    live.setContext("debug", "medium", "run-impossible-write-fence");
+    const executor = new PipelineExecutor(callModel as any, impossibleRuntime, impossibleCtx, {
+      bus,
+      live,
+      collector: testCollector,
+    });
+    const coordinator = new Coordinator((async () => ({ content: "unused" })) as any);
+    let coordinatorCalls = 0;
+    coordinator.route = (async () => {
+      coordinatorCalls++;
+      return baseDecision({ pipeline: ["executor", "reviewer", "synthesizer"] });
+    }) as typeof coordinator.route;
+
+    const result = await runPipelineWithReplanning({
+      contextMessage: request,
+      initialDecision: baseDecision({ pipeline: ["executor", "reviewer", "synthesizer"] }),
+      turnRequirement: "full_execution",
+      coordinator,
+      routeOptions: { sessionId: "impossible-write-fence" },
+      executor,
+      agentRunId: "run-impossible-write-fence",
+      onStateChange: () => {},
+      baseOptions: {
+        executionProfile: "full",
+        turnRequirement: "full_execution",
+        rawMessage: request,
+      },
+      maxReplans: 1,
+    });
+    bus.clear();
+
+    expect(result).toMatchObject({
+      outcome: "failed",
+      error_code: "effect_gate_no_write_effect",
+    });
+    expect(writeAttempts).toBe(2);
+    expect(result.toolCalls?.map((call) => call.output)).toEqual([
+      expect.stringContaining("EPERM"),
+      expect.stringContaining("EPERM"),
+    ]);
+    expect(coordinatorCalls).toBe(0);
+    expect(stageLabels).not.toContain("reviewer");
+    expect(stageLabels).not.toContain("rewriter");
+    expect(stageLabels).not.toContain("synthesizer");
+  });
+
   test("runs the first segment, re-invokes the conductor, then finishes with the revised route", async () => {
     const stageLabels: string[] = [];
     const callModel = async (_messages: any[], options?: any) => {
