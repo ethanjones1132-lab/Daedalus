@@ -63,6 +63,7 @@ export interface BeginTaskRunInput {
   message: string;
   requirement: TurnRequirement;
   workspacePath?: string;
+  sessionGrants?: string[];
   depth?: TaskRunDepth;
   estimatedComplexity?: "low" | "medium" | "high";
 }
@@ -220,6 +221,7 @@ export class SessionMemory {
       {
         sessionId,
         workspacePath: input.workspacePath,
+        sessionGrants: input.sessionGrants,
         depth: input.depth,
         estimatedComplexity: input.estimatedComplexity,
       },

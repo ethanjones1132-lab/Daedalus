@@ -509,4 +509,32 @@ mod tests {
         let cfg = load_jarvis_config(&db).expect("load config");
         assert!(!cfg.orchestrator.enabled);
     }
+
+    #[test]
+    fn tool_root_settings_load_from_sqlite_and_persist_back_to_it() {
+        let db = mem_db();
+        set_setting_value(
+            &db,
+            "tools",
+            r#"{"enabled":true,"require_approval":[],"sandbox_mode":"strict","allowlist":[],"denylist":[],"allowed_roots":["C:\\Projects\\one","D:\\Data"],"grant_session_roots":false}"#,
+        )
+        .expect("tool settings should be accepted");
+
+        let mut cfg = load_jarvis_config(&db).expect("load config");
+        assert_eq!(
+            cfg.tools.allowed_roots,
+            vec!["C:\\Projects\\one", "D:\\Data"]
+        );
+        assert!(!cfg.tools.grant_session_roots);
+
+        cfg.tools.allowed_roots.push("E:\\Archive".to_string());
+        cfg.tools.grant_session_roots = true;
+        persist_jarvis_config(&db, &cfg).expect("persist config");
+        let round_trip = load_jarvis_config(&db).expect("reload config");
+        assert_eq!(
+            round_trip.tools.allowed_roots,
+            vec!["C:\\Projects\\one", "D:\\Data", "E:\\Archive"]
+        );
+        assert!(round_trip.tools.grant_session_roots);
+    }
 }

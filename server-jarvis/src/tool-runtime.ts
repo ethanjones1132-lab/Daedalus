@@ -61,6 +61,8 @@ export interface ExecutionContext {
    * Absent → unrestricted (tool's own policy applies).
    */
   workspace_path?: string;
+  /** Absolute roots explicitly granted by raw user messages for this Session. */
+  session_grants?: string[];
   /**
    * Optional approval prompt for tools whose policy resolves to "ask".
    * When present, `execute()` awaits it on an "ask" decision and only runs the

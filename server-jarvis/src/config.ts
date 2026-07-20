@@ -120,6 +120,10 @@ export interface ToolConfig {
    * through to legacy passthrough so chat writes are not gated.
    */
   interactive_approval: boolean;
+  /** Persistent filesystem roots available to every invocation. */
+  allowed_roots: string[];
+  /** Whether absolute roots in the raw user message become Session grants. */
+  grant_session_roots: boolean;
 }
 
 export interface ReasoningConfig {
@@ -459,6 +463,8 @@ export function defaultConfig(): JarvisConfig {
       ],
       sandbox_mode: "strict",
       interactive_approval: false,
+      allowed_roots: [],
+      grant_session_roots: true,
     },
     reasoning: {
       enabled: true,

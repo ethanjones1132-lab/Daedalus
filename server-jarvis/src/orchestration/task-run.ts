@@ -10,6 +10,8 @@ export interface TaskRunContract {
   sessionId: string;
   objective: string;
   workspacePath?: string;
+  /** Absolute filesystem roots explicitly granted during this task run. */
+  sessionGrants?: string[];
   requirement: TurnRequirement;
   depth: TaskRunDepth;
   estimatedComplexity: "low" | "medium" | "high";
@@ -36,6 +38,7 @@ export interface CreateTaskRunInput {
   sessionId: string;
   objective: string;
   workspacePath?: string;
+  sessionGrants?: string[];
   requirement: TurnRequirement;
   depth?: TaskRunDepth;
   estimatedComplexity?: "low" | "medium" | "high";
@@ -89,6 +92,7 @@ export function createTaskRun(input: CreateTaskRunInput): TaskRunContract {
     sessionId: input.sessionId,
     objective: input.objective.trim(),
     workspacePath: input.workspacePath,
+    sessionGrants: input.sessionGrants ?? [],
     requirement: input.requirement,
     depth: input.depth ?? "standard",
     estimatedComplexity: input.estimatedComplexity ?? "medium",
@@ -106,7 +110,7 @@ export function resolveTaskRunTurn(
   previous: TaskRunContract | undefined,
   message: string,
   classifiedRequirement: TurnRequirement,
-  options: Partial<Pick<CreateTaskRunInput, "sessionId" | "workspacePath" | "estimatedComplexity" | "depth">> = {},
+  options: Partial<Pick<CreateTaskRunInput, "sessionId" | "workspacePath" | "sessionGrants" | "estimatedComplexity" | "depth">> = {},
 ): { contract: TaskRunContract; isContinuation: boolean } {
   const previousLive = Boolean(
     previous && !["completed", "failed", "cancelled"].includes(previous.status),
@@ -126,6 +130,10 @@ export function resolveTaskRunTurn(
       isContinuation: true,
       contract: {
         ...previous,
+        sessionGrants: Array.from(new Set([
+          ...(previous.sessionGrants ?? []),
+          ...(options.sessionGrants ?? []),
+        ])),
         turnCount: previous.turnCount + 1,
         status: "active",
         // A write-phrased follow-up escalates a read task's contract; write
@@ -145,6 +153,7 @@ export function resolveTaskRunTurn(
       sessionId: options.sessionId ?? previous?.sessionId ?? "unknown",
       objective: message,
       workspacePath: options.workspacePath ?? previous?.workspacePath,
+      sessionGrants: options.sessionGrants,
       requirement: classifiedRequirement,
       depth: options.depth ?? "standard",
       estimatedComplexity: options.estimatedComplexity ?? "medium",

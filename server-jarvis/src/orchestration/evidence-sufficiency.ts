@@ -193,20 +193,35 @@ function normalizePath(rawPath: string): { path: string; absolute: boolean } {
   return { path: `${prefix}${segments.join("/")}`.toLowerCase(), absolute };
 }
 
-function sourceFileKey(rawPath: string, workspaceRoot?: string): string | undefined {
+type WorkspaceRoots = string | string[] | undefined;
+
+function rootList(workspaceRoots: WorkspaceRoots): string[] {
+  return Array.isArray(workspaceRoots)
+    ? workspaceRoots.filter((root) => root.trim().length > 0)
+    : workspaceRoots?.trim() ? [workspaceRoots] : [];
+}
+
+function sourceFileKey(rawPath: string, workspaceRoots?: WorkspaceRoots): string | undefined {
   const normalized = normalizePath(rawPath);
   let normalizedPath = normalized.path;
   let absolute = normalized.absolute;
-  if (workspaceRoot) {
+  const roots = rootList(workspaceRoots);
+  if (roots.length > 0 && !absolute) {
+    const root = normalizePath(roots[0]);
+    const rootPath = root.path.replace(/\/+$/, "");
+    normalizedPath = normalizePath(`${rootPath}/${normalizedPath}`).path;
+    absolute = true;
+  }
+  for (const workspaceRoot of roots) {
     const root = normalizePath(workspaceRoot);
     const rootPath = root.path.replace(/\/+$/, "");
-    if (!absolute) {
-      normalizedPath = normalizePath(`${rootPath}/${normalizedPath}`).path;
-      absolute = true;
-    }
     if (normalizedPath === rootPath || normalizedPath.startsWith(`${rootPath}/`)) {
       normalizedPath = normalizedPath.slice(rootPath.length).replace(/^\/+/, "");
-      absolute = false;
+      // Preserve legacy rel: keys for the primary workspace. Granted roots use
+      // their normalized absolute identity so same-suffix files stay distinct.
+      absolute = workspaceRoot !== roots[0];
+      if (absolute) normalizedPath = `${rootPath}/${normalizedPath}`;
+      break;
     }
   }
   const basename = normalizedPath.split("/").pop()?.toLowerCase() ?? "";
@@ -215,7 +230,7 @@ function sourceFileKey(rawPath: string, workspaceRoot?: string): string | undefi
   return `${absolute ? "abs:" : "rel:"}${normalizedPath}`;
 }
 
-function grepOutputSourceFileKeys(call: ToolCallRecord, workspaceRoot?: string): Set<string> {
+function grepOutputSourceFileKeys(call: ToolCallRecord, workspaceRoot?: WorkspaceRoots): Set<string> {
   const args = call.arguments as Record<string, unknown> | undefined;
   const grepPath = typeof args?.path === "string" ? args.path : undefined;
   const grepPathIsFile = grepPath ? sourceFileKey(grepPath, workspaceRoot) !== undefined : false;
@@ -249,7 +264,7 @@ function grepOutputSourceFileKeys(call: ToolCallRecord, workspaceRoot?: string):
   return keys;
 }
 
-function sourceContentTargetKeys(call: ToolCallRecord, workspaceRoot?: string): Set<string> {
+function sourceContentTargetKeys(call: ToolCallRecord, workspaceRoot?: WorkspaceRoots): Set<string> {
   if (call.name === "read_file") {
     const args = call.arguments as Record<string, unknown> | undefined;
     const key = typeof args?.path === "string" ? sourceFileKey(args.path, workspaceRoot) : undefined;
@@ -258,7 +273,7 @@ function sourceContentTargetKeys(call: ToolCallRecord, workspaceRoot?: string): 
   return call.name === "grep" ? grepOutputSourceFileKeys(call, workspaceRoot) : new Set();
 }
 
-function distinctDeepReadTargetKeys(calls: ToolCallRecord[], workspaceRoot?: string): Set<string> {
+function distinctDeepReadTargetKeys(calls: ToolCallRecord[], workspaceRoot?: WorkspaceRoots): Set<string> {
   const paths = new Set<string>();
   for (const call of calls) {
     if (DEEP_READ_CONTENT_TOOLS.has(call.name)) {
@@ -321,13 +336,13 @@ export function turnNeedsWorkspaceEvidence(
 export function assessWorkspaceEvidence(
   toolCalls: ToolCallRecord[] | undefined,
   request: string,
-  workspaceRoot?: string,
+  workspaceRoot?: WorkspaceRoots,
 ): EvidenceAssessment {
   const calls = (toolCalls ?? []).filter(
     (c) => !c.is_error && c.output.trim().length > 0 && !isDuplicateToolDeflection(c),
   );
   const listings = calls.filter((c) => LISTING_TOOLS.has(c.name)).length;
-  const explicitScope = resolveWorkspaceReadScope(request, workspaceRoot);
+  const explicitScope = resolveWorkspaceReadScope(request, rootList(workspaceRoot)[0]);
   const deepRead = isDeepReadRequest(request);
 
   if (explicitScope) {
@@ -516,7 +531,7 @@ export function extractSourceReadCandidates(
 /** Distinct deep-read source keys already present in tool call records. */
 export function alreadyReadSourceKeys(
   toolCalls: ToolCallRecord[] | undefined,
-  workspaceRoot?: string,
+  workspaceRoot?: WorkspaceRoots,
 ): Set<string> {
   const calls = (toolCalls ?? []).filter(
     (c) => !c.is_error && c.output.trim().length > 0 && !isDuplicateToolDeflection(c),

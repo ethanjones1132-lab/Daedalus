@@ -195,7 +195,7 @@ pub struct ClaudeCliConfig {
     pub model: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ToolConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -207,10 +207,32 @@ pub struct ToolConfig {
     pub allowlist: Vec<String>,
     #[serde(default)]
     pub denylist: Vec<String>,
+    #[serde(default)]
+    pub allowed_roots: Vec<String>,
+    #[serde(default = "default_true")]
+    pub grant_session_roots: bool,
+}
+
+impl Default for ToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            require_approval: Vec::new(),
+            sandbox_mode: String::new(),
+            allowlist: Vec::new(),
+            denylist: Vec::new(),
+            allowed_roots: Vec::new(),
+            grant_session_roots: true,
+        }
+    }
 }
 
 fn default_sandbox() -> String {
     "permissive".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]

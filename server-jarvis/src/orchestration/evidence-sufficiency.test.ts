@@ -165,6 +165,19 @@ describe("turnNeedsWorkspaceEvidence", () => {
   });
 });
 
+describe("session-granted workspace evidence", () => {
+  test("counts distinct source reads inside any allowed workspace root", () => {
+    const roots = ["C:\\workspace", "D:\\granted"];
+    const assessment = assessWorkspaceEvidence(
+      [read("D:\\granted\\src\\a.ts"), read("D:\\granted\\src\\b.ts"), read("D:\\granted\\src\\c.ts")],
+      "Do a comprehensive audit of this repo",
+      roots,
+    );
+    expect(assessment.sufficient).toBe(true);
+    expect(assessment.contentReads).toBe(DEEP_READ_MIN_CONTENT_READS);
+  });
+});
+
 describe("assessWorkspaceEvidence", () => {
   test("a lone list_directory is insufficient for a deep read", () => {
     const a = assessWorkspaceEvidence(

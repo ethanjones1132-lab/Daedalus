@@ -121,6 +121,7 @@ import {
 } from "./orchestration/live-model-catalog";
 import { excludedModelKeys } from "./model-failure-memory";
 import { PipelineExecutor } from "./orchestration/pipeline";
+import { extractRootGrants } from "./orchestration/workspace-grants";
 import { combinedStageExclusions, StageHealthRegistry, type RecoverableFailureKind } from "./orchestration/stage-health";
 import { ModelScorecard, type ScorecardAttempt } from "./orchestration/model-scorecard";
 import { createTurnBudget } from "./orchestration/turn-budget";
@@ -1368,12 +1369,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     turnHistory,
     cfg.jarvis_path,
   );
+  const turnSessionGrants = cfg.tools.grant_session_roots
+    ? extractRootGrants(message)
+    : [];
   const workspaceReadScope = resolveWorkspaceReadScope(message, activeWorkspacePath);
   console.log(`[Jarvis] Active workspace session=${sessionId} path=${activeWorkspacePath}`);
   const activeTaskRun = sessionMemory.beginTaskRun(sessionId, {
     message,
     requirement: initialResolvedRequirement.result.requirement,
     workspacePath: activeWorkspacePath,
+    sessionGrants: turnSessionGrants,
     depth: resolveDeepReadIntent(message, priorTaskRun?.depth) ? "deep" : "standard",
     estimatedComplexity: resolveDeepReadIntent(message, priorTaskRun?.depth) ? "high" : "medium",
   });
@@ -1594,6 +1599,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       // Patch the execution context with the active session ID so
       // interactive tools (ask_user_question) can scope state per-session.
       ctx.session_id = sessionId;
+      ctx.session_grants = activeTaskRun.sessionGrants ?? [];
       // Wire the approval hook: emit a `tool_approval_request` SSE event so
       // the Tauri runner relays it to the UI (ToolApprovalModal), then await
       // the user's decision from the process-level registry. Auto-denies after
@@ -2785,7 +2791,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           })}\n\n`));
         };
         const coordinator = new Coordinator(callModel, persistentConductor, onLocalUnavailable);
-        const workspaceRootHint = `Active filesystem workspace root: ${activeWorkspacePath}. Resolve relative filesystem paths against this root.`;
+        const grantedRootsHint = activeTaskRun.sessionGrants?.length
+          ? ` Session-granted filesystem roots: ${activeTaskRun.sessionGrants.join(", ")}.`
+          : "";
+        const workspaceRootHint = `Active filesystem workspace root: ${activeWorkspacePath}. Resolve relative filesystem paths against the ordered allowed roots.${grantedRootsHint}`;
         const memoryHints = mergeSharedContextHints(
           sessionMemory.toSharedContextHints(sessionId, activeWorkspacePath),
           { relevant_memories: [workspaceRootHint] },
@@ -3096,6 +3105,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           workerInstructions: instructionSelection.instructions,
           sharedContext: mergedSharedContext,
           sessionMemory: sessionMemory,
+          sessionGrants: activeTaskRun.sessionGrants,
           preferFastSynthesizer: routeSource === "trivial_short_circuit" || Boolean(workspaceReadScope),
           distilledSkillsBlock: resolvedSkills.promptBlock,
           maxRecursionDepth: cfg.orchestrator.max_recursion_depth,

@@ -1,75 +1,163 @@
-// ═══════════════════════════════════════════════════════════════
-// ── Filesystem path scoping ──
-// ═══════════════════════════════════════════════════════════════
-// Windows↔WSL path translation plus workspace sandbox enforcement, shared by
-// every filesystem tool. Ported verbatim from the legacy tools.ts so behaviour
-// (and the chat model's expectations) are preserved exactly.
-
-import { resolve, relative } from "path";
+// Filesystem path scoping shared by every canonical filesystem tool.
+
+import { existsSync, statSync } from "fs";
+import { homedir } from "os";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
 import type { JarvisConfig } from "./config";
 
-function effectiveWorkspaceRoot(cfg: JarvisConfig, workspaceOverride?: string): string {
-  const override = workspaceOverride?.trim();
-  if (override) return override;
+export interface SafePathOptions {
+  workspaceOverride?: string;
+  sessionGrants?: string[];
+  forWrite?: boolean;
+}
+
+export function effectiveWorkspaceRoot(cfg: JarvisConfig): string {
   return cfg.jarvis_path || process.cwd();
 }
-
-/**
- * Translate a Windows-style path into its WSL equivalent.
- * Handles `\\wsl.localhost\<distro>\...` / `\\wsl$\<distro>\...` UNC paths and
- * `C:\...` drive paths. POSIX paths pass through unchanged.
- */
-export function toWslPath(inputPath: string): string {
-  let normalized = inputPath.replace(/\\/g, "/");
-
-  // 1. Handle WSL UNC path: \\wsl.localhost\Ubuntu\home\... or \\wsl$\Ubuntu\home\...
-  for (const prefix of ["//wsl.localhost/", "//wsl$/"]) {
-    if (normalized.startsWith(prefix)) {
-      const parts = normalized.slice(prefix.length).split("/");
-      return "/" + parts.slice(1).join("/");
-    }
-  }
-
-  // 2. Handle Windows absolute path with drive letter: C:/Users/ethan/...
-  const driveMatch = normalized.match(/^([a-zA-Z]):\/(.*)$/);
-  if (driveMatch) {
-    const drive = driveMatch[1].toLowerCase();
-    const subPath = driveMatch[2];
-    return `/mnt/${drive}/${subPath}`;
-  }
-
-  return normalized;
-}
-
-/**
- * Resolve a user-supplied path within the workspace sandbox.
- * Throws if the resolved path escapes the workspace, unless sandbox_mode is "off".
- */
-export function safePath(inputPath: string, cfg: JarvisConfig, workspaceOverride?: string): string {
-  // Only translate Windows paths to WSL when actually running in a posix
-  // environment. The production Bun server runs inside WSL (linux), where
-  // C:\ -> /mnt/c is needed; on a native Windows host the input is already
-  // accessible as-is and translating it would break the path.
-  const wslPath = process.platform === "win32" ? inputPath : toWslPath(inputPath);
-  if (cfg.tools.sandbox_mode === "off") return resolve(wslPath);
-  const workspace = effectiveWorkspaceRoot(cfg, workspaceOverride);
-  const resolved = resolve(workspace, wslPath);
-  const rel = relative(workspace, resolved);
-  const escapes = rel.startsWith("..") || rel.startsWith("/") || /^[a-zA-Z]:/.test(rel);
-  // permissive allows access OUTSIDE the workspace (with a log) -- more lenient
-  // than strict. Without this branch the canonical fs bundle treated permissive
-  // exactly like strict, so every read of a path outside jarvis_path (common
-  // when the configured workspace is a container/Linux path on a Windows host)
-  // silently failed: the file looked empty/not-found even though the
-  // orchestrator routed the read correctly. Mirrors agent-tools.ts::safePath.
-  if (cfg.tools.sandbox_mode === "permissive") {
-    if (escapes) {
-      console.log(`[Sandbox] Permissive mode: allowing access to "${resolved}" (outside workspace "${workspace}")`);
-    }
-    return resolved;
-  }
-  if (escapes) {
-    throw new Error(`Path "${inputPath}" is outside the workspace. Sandbox mode: ${cfg.tools.sandbox_mode}`);
-  }
-  return resolved;
-}
+
+/** Expand only a leading home token; embedded tildes remain literal. */
+export function expandHomePath(inputPath: string): string {
+  if (inputPath === "~") return homedir();
+  if (/^~[\\/]/.test(inputPath)) {
+    return join(homedir(), inputPath.slice(2));
+  }
+  return inputPath;
+}
+
+/**
+ * Translate a Windows-style path into its WSL equivalent.
+ * Handles `\\wsl.localhost\<distro>\...` / `\\wsl$\<distro>\...` UNC paths and
+ * `C:\...` drive paths. POSIX paths pass through unchanged.
+ */
+export function toWslPath(inputPath: string): string {
+  let normalized = inputPath.replace(/\\/g, "/");
+
+  for (const prefix of ["//wsl.localhost/", "//wsl$/"]) {
+    if (normalized.startsWith(prefix)) {
+      const parts = normalized.slice(prefix.length).split("/");
+      return "/" + parts.slice(1).join("/");
+    }
+  }
+
+  const driveMatch = normalized.match(/^([a-zA-Z]):\/(.*)$/);
+  if (driveMatch) {
+    return `/mnt/${driveMatch[1].toLowerCase()}/${driveMatch[2]}`;
+  }
+
+  return normalized;
+}
+
+function platformPath(inputPath: string): string {
+  const expanded = expandHomePath(inputPath.trim());
+  return process.platform === "win32" ? expanded : toWslPath(expanded);
+}
+
+function rootKey(path: string): string {
+  const normalized = resolve(path).replace(/[\\/]+$/, "");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function existingDirectory(path: string): boolean {
+  try {
+    return existsSync(path) && statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** Ordered, normalized filesystem authority for one invocation. */
+export function resolveAllowedRoots(
+  cfg: JarvisConfig,
+  options: Pick<SafePathOptions, "workspaceOverride" | "sessionGrants"> = {},
+): string[] {
+  const candidates = [
+    options.workspaceOverride,
+    effectiveWorkspaceRoot(cfg),
+    ...(options.sessionGrants ?? []),
+    ...(cfg.tools?.allowed_roots ?? []),
+  ];
+  const seen = new Set<string>();
+  const roots: string[] = [];
+  for (const candidate of candidates) {
+    if (!candidate?.trim()) continue;
+    const normalized = resolve(platformPath(candidate));
+    const key = rootKey(normalized);
+    if (seen.has(key) || !existingDirectory(normalized)) continue;
+    seen.add(key);
+    roots.push(normalized);
+  }
+  return roots;
+}
+
+function absoluteLike(path: string): boolean {
+  return isAbsolute(path)
+    || /^[a-zA-Z]:[\\/]/.test(path)
+    || /^\\\\/.test(path)
+    || /^\/\//.test(path)
+    || /^\//.test(path);
+}
+
+function isContained(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel) && !/^[a-zA-Z]:/.test(rel));
+}
+
+function outsideError(inputPath: string, cfg: JarvisConfig, roots: string[]): Error {
+  return new Error(
+    `Path "${inputPath}" is outside the workspace. Sandbox mode: ${cfg.tools.sandbox_mode}. ` +
+    `Allowed roots: ${roots.length > 0 ? roots.join(", ") : "(none)"}`,
+  );
+}
+
+function optionsFrom(third?: string | SafePathOptions): SafePathOptions {
+  return typeof third === "string" ? { workspaceOverride: third } : (third ?? {});
+}
+
+/** Resolve a user path against the invocation's ordered allowed roots. */
+export function safePath(
+  inputPath: string,
+  cfg: JarvisConfig,
+  workspaceOrOptions?: string | SafePathOptions,
+): string {
+  const options = optionsFrom(workspaceOrOptions);
+  const normalizedInput = platformPath(inputPath);
+
+  if (cfg.tools.sandbox_mode === "off") return resolve(normalizedInput);
+
+  const roots = resolveAllowedRoots(cfg, options);
+  const inputIsAbsolute = absoluteLike(normalizedInput);
+  if (inputIsAbsolute) {
+    const candidate = resolve(normalizedInput);
+    if (roots.some((root) => isContained(root, candidate))) return candidate;
+    if (cfg.tools.sandbox_mode === "permissive") {
+      console.log(`[Sandbox] Permissive mode: allowing access to "${candidate}" (outside allowed roots: ${roots.join(", ") || "none"})`);
+      return candidate;
+    }
+    throw outsideError(inputPath, cfg, roots);
+  }
+
+  for (const root of roots) {
+    const segments = normalizedInput.split(/[\\/]+/).filter(Boolean);
+    if (segments.length > 1 && basename(root).toLowerCase() === segments[0].toLowerCase()) {
+      const deduplicated = resolve(root, ...segments.slice(1));
+      if (isContained(root, deduplicated) && existsSync(deduplicated)) return deduplicated;
+    }
+
+    const candidate = resolve(root, normalizedInput);
+    if (!isContained(root, candidate)) continue;
+    if (options.forWrite ? existingDirectory(dirname(candidate)) : existsSync(candidate)) return candidate;
+  }
+
+  if (roots.length > 0) {
+    const fallback = resolve(roots[0], normalizedInput);
+    if (isContained(roots[0], fallback)) return fallback;
+  }
+
+  const permissiveBase = roots[0] ?? resolve(platformPath(effectiveWorkspaceRoot(cfg)));
+  const permissiveCandidate = resolve(permissiveBase, normalizedInput);
+  if (cfg.tools.sandbox_mode === "permissive") {
+    console.log(`[Sandbox] Permissive mode: allowing access to "${permissiveCandidate}" (outside allowed roots: ${roots.join(", ") || "none"})`);
+    return permissiveCandidate;
+  }
+  throw outsideError(inputPath, cfg, roots);
+}

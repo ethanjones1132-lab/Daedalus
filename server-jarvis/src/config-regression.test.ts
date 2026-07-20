@@ -63,9 +63,23 @@ describe("configuration regression coverage retained during Task 6", () => {
   test("normalizes approval and orchestrator safety defaults", () => {
     const cfg = defaultConfig();
     expect(cfg.tools.interactive_approval).toBe(false);
+    expect(cfg.tools.allowed_roots).toEqual([]);
+    expect(cfg.tools.grant_session_roots).toBe(true);
     expect(cfg.orchestrator.max_recursion_depth).toBeGreaterThan(0);
     expect(cfg.orchestrator.conductor_learning.enabled).toBe(true);
     expect(cfg.orchestrator.skill_distillation.auto_promote).toBe(false);
+  });
+
+  test("round-trips explicit filesystem root settings through Bun normalization", () => {
+    const cfg = normalizeConfig({
+      tools: {
+        allowed_roots: ["C:\\Projects\\one", "D:\\Data"],
+        grant_session_roots: false,
+      },
+    });
+    const roundTrip = normalizeConfig(JSON.parse(JSON.stringify(cfg)));
+    expect(roundTrip.tools.allowed_roots).toEqual(["C:\\Projects\\one", "D:\\Data"]);
+    expect(roundTrip.tools.grant_session_roots).toBe(false);
   });
 
   test("defaults local conductor keep-warm on with a ten-minute refresh interval", () => {

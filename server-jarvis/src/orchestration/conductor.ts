@@ -15,6 +15,7 @@ export interface ConductorStageEvidence {
   request?: string;
   workerInstruction?: string;
   workspaceRoot?: string;
+  workspaceRoots?: string[];
   /**
    * 2026-07-18: sticky/derived write intent for the turn. Without it the
    * conductor was WRITE-BLIND — a change-request executor stage that
@@ -147,7 +148,7 @@ export class LiveConductor {
         ? assessWorkspaceEvidence(
           evidence.toolCalls,
           evidence.request ?? "",
-          evidence.workspaceRoot,
+          evidence.workspaceRoots ?? evidence.workspaceRoot,
         )
         : undefined;
       if (

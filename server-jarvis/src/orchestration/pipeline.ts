@@ -57,6 +57,7 @@ import { findExistingWorkspacePath } from "./workspace-affinity";
 import { join } from "path";
 import { canApplyConductorReroute, rejectReroute } from "./reroute-policy";
 import { resolveDeepReadIntent, type TaskRunDepth } from "./task-run";
+import { resolveAllowedRoots } from "../fs-scope";
 
 /**
  * The slice of the outcome collector the pipeline depends on. Injecting this
@@ -111,6 +112,8 @@ export interface PipelineExecuteOptions {
   sharedContext?: SharedContextHints;
   /** Inter-workflow session memory for tool-cache recording and read short-circuit. */
   sessionMemory?: SessionMemory;
+  /** Absolute filesystem roots granted by raw user messages for this Session. */
+  sessionGrants?: string[];
   /** Promoted distilled skills block for planner/executor injection. */
   distilledSkillsBlock?: string;
   /**
@@ -546,6 +549,13 @@ export class PipelineExecutor {
     }
   }
 
+  private evidenceRoots(options: PipelineExecuteOptions): string[] {
+    return resolveAllowedRoots(this.ctx.config, {
+      workspaceOverride: this.ctx.workspace_path,
+      sessionGrants: options.sessionGrants ?? this.ctx.session_grants,
+    });
+  }
+
   private registerStageAbort(stage: StageName): AbortSignal | undefined {
     if (!this.conductor) return undefined;
     const controller = new AbortController();
@@ -575,6 +585,7 @@ export class PipelineExecutor {
     return {
       request: options.rawMessage ?? request,
       workspaceRoot: this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd(),
+      workspaceRoots: this.evidenceRoots(options),
     };
   }
 
@@ -985,6 +996,7 @@ export class PipelineExecutor {
       request: options.rawMessage ?? request,
       workerInstruction: options.workerInstructions?.executor,
       workspaceRoot: this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd(),
+      workspaceRoots: this.evidenceRoots(options),
       writeIntent: requiresWriteEffect,
     });
     const executorMessages: ChatMessage[] = [
@@ -1458,7 +1470,7 @@ export class PipelineExecutor {
           const assessmentAfterTurn = assessWorkspaceEvidence(
             toolCalls,
             intentText,
-            this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd(),
+            this.evidenceRoots(options),
           );
           let workspaceEvidenceNudgeSentThisTurn = false;
           if (
@@ -1556,7 +1568,7 @@ export class PipelineExecutor {
       // the deep-read floor, read plan-named + listing-derived source files
       // without another replan cycle.
       if (requiresWorkspaceEvidence && deepReadRequest && executorDone) {
-        let floorAssessment = assessWorkspaceEvidence(toolCalls, intentText, workspaceRoot);
+        let floorAssessment = assessWorkspaceEvidence(toolCalls, intentText, this.evidenceRoots(options));
         if (!floorAssessment.sufficient) {
           const already = alreadyReadSourceKeys(toolCalls, workspaceRoot);
           const listingCalls = toolCalls.filter(
@@ -1619,7 +1631,7 @@ export class PipelineExecutor {
       const finalAssessment = assessWorkspaceEvidence(
         toolCalls,
         intentText,
-        workspaceRoot,
+        this.evidenceRoots(options),
       );
       if (!executorDone) {
         const message =
@@ -2574,7 +2586,7 @@ export class PipelineExecutor {
     const preSynthAssessment = assessWorkspaceEvidence(
       state.executor?.toolCalls,
       intentText,
-      this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd(),
+      this.evidenceRoots(options),
     );
     if (requiresWorkspaceEvidence && !preSynthAssessment.sufficient) {
       const failure = evidenceFailure(preSynthAssessment);
@@ -2666,7 +2678,7 @@ export class PipelineExecutor {
     const executeAssessment = assessWorkspaceEvidence(
       state.executor?.toolCalls,
       options.rawMessage ?? request,
-      this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd(),
+      this.evidenceRoots(options),
     );
     if (requiresWorkspaceEvidence && !executeAssessment.sufficient) {
       const failure = evidenceFailure(executeAssessment);
@@ -3287,6 +3299,7 @@ export class PipelineExecutor {
         workerInstructions: options.workerInstructions,
         sharedContext: options.sharedContext,
         sessionMemory: options.sessionMemory,
+        sessionGrants: options.sessionGrants,
         turnRequirement: options.turnRequirement,
         initialRecursionDepth: nextDepth,
       },
