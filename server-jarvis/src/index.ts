@@ -2974,6 +2974,18 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             run_id: agentRunId,
           })}\n\n`));
         }
+        // P5.1: routing source/model/latency previously required cross-referencing
+        // console.log lines with the conductor_runs table by hand to diagnose
+        // (the exact friction hit while diagnosing F1/F2). Emit it as a normal
+        // frame on every turn, not only the rare parse-fallback case.
+        await writer.write(encoder.encode(`data: ${JSON.stringify({
+          type: "conductor_info",
+          source: route.conductor_source ?? "api",
+          model: route.conductor_model,
+          latency_ms: coordinatorDurationMs,
+          session_id: sessionId,
+          run_id: agentRunId,
+        })}\n\n`));
         const conductorRunId = conductorLearning.recordRouting({
           agentRunId,
           sessionId,
@@ -2982,6 +2994,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           routeSource: normalized.route_source,
           conductorSource: route.conductor_source ?? "api",
           conductorModel: route.conductor_model,
+          latencyMs: coordinatorDurationMs,
         });
         if (!shortCircuit) {
           const coordinatorSucceeded = !route.routing_parse_fallback;
