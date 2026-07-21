@@ -341,6 +341,126 @@ fn configure_proxy_runtime(
     }
 }
 
+/// The port `claude_cli_proxy.py` binds. Shared with `supervisor.rs` so both
+/// sides agree on what "the proxy port" means.
+pub(crate) const CLAUDE_PROXY_PORT: u16 = 19878;
+
+/// Parse `netstat -ano` output for PIDs LISTENING on `port` (Windows-format
+/// rows: `  TCP    127.0.0.1:19878   0.0.0.0:0   LISTENING   29084`). Pure and
+/// unit-tested; the real netstat invocation is a thin, untested wrapper below
+/// (consistent with `is_port_listening` itself doing real I/O, untested).
+fn parse_listening_pids(netstat_output: &str, port: u16) -> Vec<u32> {
+    let local_suffix = format!(":{port}");
+    let mut pids = Vec::new();
+    for line in netstat_output.lines() {
+        if !line.contains("LISTENING") {
+            continue;
+        }
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        // Expected shape: [Proto, LocalAddress, ForeignAddress, State, PID].
+        let Some(local_addr) = cols.get(1) else { continue };
+        if !local_addr.ends_with(&local_suffix) {
+            continue;
+        }
+        if let Some(pid) = cols.last().and_then(|s| s.parse::<u32>().ok()) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+fn pids_listening_on_port(port: u16) -> Vec<u32> {
+    if !cfg!(target_os = "windows") {
+        return Vec::new();
+    }
+    let Ok(output) = std::process::Command::new("netstat").args(["-ano"]).output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_listening_pids(&String::from_utf8_lossy(&output.stdout), port)
+}
+
+/// Reap any process currently bound to the proxy port before spawning a fresh
+/// one. Closes the stale-code hazard: an orphaned `claude_cli_proxy.py` from a
+/// previous app instance/deploy can survive indefinitely once nothing tracks
+/// it (observed live: 3 simultaneous listeners on :19878 from prior sessions).
+/// `is_port_listening` alone cannot distinguish "healthy current proxy" from
+/// "stale proxy squatting the port" — both answer the TCP probe the same way,
+/// so the supervisor's own `is_port_listening` health check would never flag
+/// an orphan as a problem. This runs unconditionally right before every spawn
+/// attempt (manual restart, supervisor auto-restart, and app startup all funnel
+/// through `spawn_claude_cli_proxy`), so the newest deployed script always wins
+/// the port. Best-effort: a kill failure is logged, never fatal to the spawn.
+fn reap_stale_proxy_listeners() {
+    for pid in pids_listening_on_port(CLAUDE_PROXY_PORT) {
+        println!(
+            "[Jarvis] reaping process PID {pid} already listening on :{CLAUDE_PROXY_PORT} before spawning claude_cli_proxy"
+        );
+        match std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output()
+        {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => eprintln!(
+                "[Jarvis] taskkill PID {pid} exited non-zero: {}",
+                String::from_utf8_lossy(&o.stderr)
+            ),
+            Err(e) => eprintln!("[Jarvis] taskkill PID {pid} failed to spawn: {e}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod proxy_reap_tests {
+    use super::parse_listening_pids;
+
+    // Realistic `netstat -ano` excerpt: the multi-listener situation actually
+    // observed live (3 stale processes bound to :19878 from prior sessions),
+    // plus an unrelated port and a non-LISTENING row that must be ignored.
+    const NETSTAT_FIXTURE: &str = "\
+Active Connections
+
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    127.0.0.1:19878        0.0.0.0:0              LISTENING       29084
+  TCP    127.0.0.1:19878        0.0.0.0:0              LISTENING       33496
+  TCP    127.0.0.1:19878        0.0.0.0:0              LISTENING       32900
+  TCP    127.0.0.1:19877        0.0.0.0:0              LISTENING       11223
+  TCP    127.0.0.1:53872        127.0.0.1:19878        TIME_WAIT       0
+";
+
+    #[test]
+    fn finds_every_pid_listening_on_the_target_port() {
+        let pids = parse_listening_pids(NETSTAT_FIXTURE, 19878);
+        assert_eq!(pids, vec![29084, 33496, 32900]);
+    }
+
+    #[test]
+    fn ignores_a_different_port() {
+        let pids = parse_listening_pids(NETSTAT_FIXTURE, 19877);
+        assert_eq!(pids, vec![11223]);
+    }
+
+    #[test]
+    fn ignores_non_listening_rows_on_the_target_port() {
+        // The TIME_WAIT row's Local Address is an ephemeral client port, not
+        // :19878, and its state isn't LISTENING either -- verify neither
+        // condition alone produces a false match.
+        assert!(!NETSTAT_FIXTURE.lines().any(|l| l.contains("53872") && l.contains("LISTENING")));
+    }
+
+    #[test]
+    fn empty_output_yields_no_pids() {
+        assert_eq!(parse_listening_pids("", 19878), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn a_port_with_nothing_listening_yields_no_pids() {
+        assert_eq!(parse_listening_pids(NETSTAT_FIXTURE, 60000), Vec::<u32>::new());
+    }
+}
+
 pub(crate) fn spawn_claude_cli_proxy(
     ollama_model: String,
     openrouter_api_key: String,
@@ -372,6 +492,10 @@ pub(crate) fn spawn_claude_cli_proxy(
         through_wsl,
     );
     crate::wsl::hide_windows_console(&mut command);
+    // Script and interpreter are both confirmed to exist at this point, so
+    // reaping now cannot leave the user with nothing: any process squatting
+    // the port is cleared immediately before this exact spawn attempt claims it.
+    reap_stale_proxy_listeners();
     let child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
