@@ -8,6 +8,7 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  HOST_PROVIDED_TOOLS_NOTICE,
   injectToolGuidelines,
   renderToolGuidelines,
   TOOL_GUIDELINES_MARKER,
@@ -58,6 +59,39 @@ describe("injectToolGuidelines", () => {
     const tools = runtimeTools();
     expect(injectToolGuidelines("before {{TOOL_GUIDELINES}} after", tools)).not.toContain(TOOL_GUIDELINES_MARKER);
     expect(injectToolGuidelines("no marker here", tools)).toBe("no marker here");
+  });
+
+  // 2026-07-21 (delegate reliability): the claude_cli delegate calls
+  // stageSystemPrompt("executor", options, []) to avoid teaching the CLI the
+  // canonical vocabulary (write_file/edit_file) — the CLI has its OWN stock
+  // tools (Write/Edit) and a model taught both got delegate_tool_not_permitted
+  // (F1). But `[]` triggers the "no tools available" branch, which is FALSE for
+  // the delegate (it has real tools, just under different names) and directly
+  // contradicts executor.md's own "You have ALL available tools" opening line
+  // plus the tool-by-name behavioral guidance right below the marker. Every
+  // observed delegate_no_write failure showed the model reading a file and then
+  // stopping without writing — consistent with a model told it has no write
+  // capability. "host_provided" fixes the false claim without reintroducing the
+  // canonical-vocabulary problem.
+  test('"host_provided" renders a notice that tools EXIST under the environment\'s own names, not "no tools"', () => {
+    const rendered = injectToolGuidelines("before {{TOOL_GUIDELINES}} after", "host_provided");
+    expect(rendered).not.toContain(TOOL_GUIDELINES_MARKER);
+    expect(rendered.toLowerCase()).not.toContain("no tools available");
+    expect(rendered).toBe(`before ${HOST_PROVIDED_TOOLS_NOTICE} after`);
+  });
+
+  test("the host-provided notice tells the model not to conclude it lacks a capability from a name mismatch", () => {
+    // This is the exact failure mode being guarded against: a model seeing
+    // "write_file" in the behavioral prose below, not finding a tool by that
+    // exact name in its own toolset, and concluding it cannot write at all.
+    expect(HOST_PROVIDED_TOOLS_NOTICE.toLowerCase()).toContain("not conclude");
+  });
+
+  test("an empty array (genuinely no tools, e.g. planner/synthesizer) still renders the real no-tools notice", () => {
+    // Regression guard: "host_provided" must be an ADDITIONAL mode, not a
+    // replacement for the existing empty-array semantics other stages rely on.
+    const rendered = injectToolGuidelines("before {{TOOL_GUIDELINES}} after", []);
+    expect(rendered.toLowerCase()).toContain("no tools available");
   });
 });
 

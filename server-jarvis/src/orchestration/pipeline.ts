@@ -605,7 +605,7 @@ export function describePipelineError(raw: string): string {
 function stageSystemPrompt(
   stage: StageName,
   options: PipelineExecuteOptions & { pendingInjections?: Map<StageName, string[]> },
-  stageTools: ToolDefinition[] = [],
+  stageTools: ToolDefinition[] | "host_provided" = [],
 ): string {
   const skillsBlock = stage === "planner" || stage === "executor"
     ? options.distilledSkillsBlock
@@ -1198,12 +1198,20 @@ export class PipelineExecutor {
       // write_file) into the stock Claude CLI — the CLI already describes its
       // own stock tools (Write/Edit). Teaching both vocabularies is what made
       // the model emit write_file and get policy_denied (F1 / 2026-07-21).
-      const delegateSystemPrompt = stageSystemPrompt("executor", options, []);
+      //
+      // "host_provided" (not `[]`): `[]` renders "this stage has no tools
+      // available", which is FALSE for the delegate and directly contradicted
+      // executor.md's own "You have ALL available tools" opening line plus the
+      // tool-by-name behavioral guidance right below it. Every observed
+      // delegate_no_write failure showed the model reading a file and then
+      // stopping without writing — consistent with a model told it had no
+      // write capability (2026-07-21 delegate-reliability investigation).
+      const delegateSystemPrompt = stageSystemPrompt("executor", options, "host_provided");
       const prompt = [
         delegateSystemPrompt,
         `User Request: ${request}`,
         `Plan:\n${planSummary}`,
-        "[Runtime write contract] Apply the requested change with a stock write tool and verify the resulting filesystem mutation.",
+        "[Runtime write contract] This is a CHANGE request. The stage is complete only after you actually invoke a file-writing tool (your environment's Write/Edit or equivalent) and it succeeds — describing the change in your response text does NOT modify any file. Read what you need first, then CALL the write/edit tool now, then read the file back to verify.",
       ].join("\n\n");
       const combinedAbort = combineAbortSignals(
         this.registerStageAbort("executor"),
