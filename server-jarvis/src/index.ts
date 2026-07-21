@@ -3128,7 +3128,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           sharedContext: mergedSharedContext,
           sessionMemory: sessionMemory,
           sessionGrants: activeTaskRun.sessionGrants,
-          preferFastSynthesizer: routeSource === "trivial_short_circuit" || Boolean(workspaceReadScope),
+          // F6 latency: a low-complexity turn's synthesis does not need the
+          // strongest (slowest) synthesizer — route it to the cheap/fast tier
+          // like trivial short-circuits and workspace reads already do. Medium/
+          // high complexity keep the strong model.
+          preferFastSynthesizer: routeSource === "trivial_short_circuit"
+            || Boolean(workspaceReadScope)
+            || route.context.estimated_complexity === "low",
           distilledSkillsBlock: resolvedSkills.promptBlock,
           maxRecursionDepth: cfg.orchestrator.max_recursion_depth,
           maxReviewRepairRounds: cfg.orchestrator.max_review_repair_rounds,

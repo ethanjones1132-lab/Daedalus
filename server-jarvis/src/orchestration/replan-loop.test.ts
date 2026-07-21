@@ -68,6 +68,46 @@ describe("runPipelineWithReplanning", () => {
     expect(result.error_code).toBe("upstream_stage_failed");
   });
 
+  test("reviewer empty completion retries once then proceeds", async () => {
+    // F7: reasoning models sometimes emit empty visible content (whole budget
+    // burned in the thinking channel). One retry on a fresh callModel lets
+    // stage-health steer to another candidate before an empty verdict silently
+    // skips the review gate. Mirrors the planner retry.
+    const stageLabels: string[] = [];
+    let reviewerCalls = 0;
+    const callModel = async (_messages: any[], options?: any) => {
+      const stage = options?.stageLabel ?? "?";
+      stageLabels.push(stage);
+      if (stage === "planner") return { content: "PLAN: do the thing" };
+      if (stage === "reviewer") {
+        reviewerCalls++;
+        return { content: reviewerCalls === 1 ? "" : "ACCEPT" };
+      }
+      if (stage === "synthesizer") return { content: "Final grounded answer." };
+      return { content: "Executor did the thing." };
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+    const coordinator = new Coordinator((async () => ({ content: "unused" })) as any);
+
+    const result = await runPipelineWithReplanning({
+      contextMessage: "explain the runtime architecture",
+      initialDecision: baseDecision({ pipeline: ["planner", "executor", "reviewer", "synthesizer"] }),
+      turnRequirement: "full_execution",
+      coordinator,
+      routeOptions: { sessionId: "reviewer-empty-retry" },
+      executor,
+      agentRunId: "run-reviewer-empty-retry",
+      onStateChange: () => {},
+      baseOptions: {},
+      maxReplans: 2,
+    });
+
+    // Reviewer invoked twice (empty → retry → ACCEPT); pipeline still reaches synthesizer.
+    expect(reviewerCalls).toBe(2);
+    expect(stageLabels).toContain("synthesizer");
+    expect(result.outcome).not.toBe("degraded");
+  });
+
   test("planner double-empty bypasses live-conductor self-reroute accounting", async () => {
     const stageLabels: string[] = [];
     const callModel = async (_messages: any[], options?: any) => {

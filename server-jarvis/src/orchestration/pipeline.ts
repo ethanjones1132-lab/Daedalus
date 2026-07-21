@@ -2357,23 +2357,33 @@ export class PipelineExecutor {
       const revStartTime = Date.now();
 
       try {
-        const reviewerResp = await this.callModel([
+        const reviewerMessages = [
           { role: "system", content: reviewerPrompt },
           {
             role: "user",
             content: `User Request: ${boundedRequest}\n\nOriginal Plan:\n${boundedPlanSummary}\n\nExecutor Activity:\n${boundedExecutorSummary}\n\nRewriter Activity:\n${truncateToTokenBudget(rewriterSummaryForPrompt, 1_000)}`
           }
-        ] as ChatMessage[], {
+        ] as ChatMessage[];
+        const reviewerOptions = {
           temperature: BUILTIN_MODES.reviewer.temperature,
           max_tokens: BUILTIN_MODES.reviewer.max_tokens,
           stream: true,
-          stageLabel: "reviewer",
+          stageLabel: "reviewer" as const,
           advanceOnEmpty: true,
           suppressActivity: true,
-          onChunk: (chunk) => {
+          onChunk: (chunk: string) => {
             onStateChange({ stage: "reviewer", status: "running", output: chunk });
           }
-        });
+        };
+        let reviewerResp = await this.callModel(reviewerMessages, reviewerOptions);
+        // Reviewer resilience (mirrors the planner retry above): reasoning
+        // models sometimes burn the whole budget in the thinking channel and
+        // emit empty visible content. One fresh callModel invocation lets
+        // stage-health cooldowns steer the retry to another candidate before an
+        // empty verdict silently skips the review gate.
+        if (isEmptyStageOutput(reviewerResp.content)) {
+          reviewerResp = await this.callModel(reviewerMessages, reviewerOptions);
+        }
 
         reviewerFeedback = reviewerResp.content;
         if (isEmptyStageOutput(reviewerFeedback)) {
