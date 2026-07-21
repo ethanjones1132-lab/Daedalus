@@ -58,5 +58,6 @@ __pycache__/
 
 # --- Temporary scripts (never commit) ---
 scripts/update-priorities-*.py
+scripts/insert-priorities-*.py
 scripts/pin-first-token-timeout-telemetry.py
 scripts/loosen-claude-delegate-timeout.py
