@@ -41,6 +41,7 @@ const FULL_TOOLBOX: ToolDefinition[] = [
   tool("list_directory"),
   tool("git_metadata"),
   tool("bash"),
+  tool("powershell"),
   tool("web_search"),
   tool("web_fetch"),
   tool("agent"),
@@ -102,6 +103,7 @@ describe("BUILTIN_MODES — per-mode contract", () => {
     expect(BUILTIN_MODES.executor.is_final).toBe(false);
     expect(BUILTIN_MODES.executor.tools_filter).toContain("write_file");
     expect(BUILTIN_MODES.executor.tools_filter).toContain("bash");
+    expect(BUILTIN_MODES.executor.tools_filter).toContain("powershell");
     expect(BUILTIN_MODES.executor.tools_filter).toContain("web_search");
     expect(BUILTIN_MODES.executor.tools_filter).toContain("agent");
     expect(BUILTIN_MODES.executor.max_turns).toBe(4);
@@ -380,5 +382,25 @@ describe("getToolsForMode — defaults and edges", () => {
     const names = getToolsForMode("executor", withExtra, "full")
       .map((t) => t.function.name);
     expect(names).not.toContain("brand_new_tool");
+  });
+
+  test("powershell is included when registered and dropped by intersection when absent (F3)", () => {
+    // shell-bundle registers powershell on win32 only. The filter lists it
+    // unconditionally; getToolsForMode intersects with the live registry so
+    // non-win32 runtimes never see a phantom tool.
+    const withPs = getToolsForMode("executor", FULL_TOOLBOX, "full")
+      .map((t) => t.function.name);
+    expect(withPs).toContain("powershell");
+
+    const withoutPs = getToolsForMode(
+      "executor",
+      FULL_TOOLBOX.filter((t) => t.function.name !== "powershell"),
+      "full",
+    ).map((t) => t.function.name);
+    expect(withoutPs).not.toContain("powershell");
+
+    const rewriterWith = getToolsForMode("rewriter", FULL_TOOLBOX, "full")
+      .map((t) => t.function.name);
+    expect(rewriterWith).toContain("powershell");
   });
 });

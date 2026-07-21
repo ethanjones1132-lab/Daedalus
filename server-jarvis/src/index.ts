@@ -3075,7 +3075,19 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           callModel,
           runtime,
           ctx,
-          { bus: conductorBus, live: liveConductor },
+          {
+            bus: conductorBus,
+            live: liveConductor,
+            reWarmLocalConductor: () => {
+              void persistentConductor.warmUp().catch((error) => {
+                console.warn(
+                  `[Pipeline] post-delegate conductor re-warm failed: ${
+                    error instanceof Error ? error.message : String(error)
+                  }`,
+                );
+              });
+            },
+          },
           productionExecutorDelegateRuntime,
         );
         const stageStartedAt = new Map<string, number>();

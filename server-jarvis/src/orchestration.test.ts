@@ -1195,6 +1195,7 @@ describe("Orchestration & Routing Tests", () => {
       "glob", "grep", "list_directory",
       "git_metadata",
       "bash",
+      "powershell",
       "web_search", "web_fetch",
       "agent", "run_background_command",
     ]);

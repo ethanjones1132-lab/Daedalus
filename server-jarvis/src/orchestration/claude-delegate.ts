@@ -23,16 +23,28 @@ const DELEGATE_TOOL_NAMES: Record<string, string> = {
   edit: "edit_file",
   "edit-file": "edit_file",
   editfile: "edit_file",
+  "edit_file": "edit_file",
   write: "write_file",
+  "write_file": "write_file",
   multiedit: "multi_edit",
+  "multi_edit": "multi_edit",
   read: "read_file",
+  "read_file": "read_file",
   grep: "grep",
   glob: "glob",
   bash: "bash",
   websearch: "web_search",
+  "web_search": "web_search",
   webfetch: "web_fetch",
+  "web_fetch": "web_fetch",
   todowrite: "todo_write",
+  "todo_write": "todo_write",
   task: "task",
+  // Canonical self-aliases for tools the model may emit after reading native
+  // executor guidelines (or any other prompt that lists Jarvis names).
+  apply_patch: "apply_patch",
+  list_directory: "list_directory",
+  git_metadata: "git_metadata",
 };
 
 const ROOT_CONFINABLE_CLAUDE_TOOLS = [
@@ -879,7 +891,14 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
     ? input.verificationTimeoutMs!
     : 5_000;
   const verificationTimeoutMs = Math.max(1, Math.min(requestedVerificationTimeoutMs, 30_000));
+  // Permit on stock identity (Write) OR canonical identity (write_file). The
+  // stock CLI emits capitalized names; a model that read native TOOL_GUIDELINES
+  // may emit canonical names instead. Both must be accepted when the stock tool
+  // is in allowed_tools (F1 / 2026-07-21 eval).
   const permittedStockTools = new Set(rootConfinableDelegateTools(input.config.claude_cli.delegate.allowed_tools));
+  const permittedCanonical = new Set(
+    [...permittedStockTools].map((name) => mapClaudeDelegateToolName(name)),
+  );
   const terminalOutput = (
     kind: DelegateOperationTerminal,
     toolCalls: ToolCallRecord[] = [],
@@ -972,9 +991,11 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
             }
             else if (event.type === "tool_use") {
               const stockToolName = event.tool_name ?? "unknown";
-              const permitted = permittedStockTools.has(stockToolName);
+              const canonicalName = mapClaudeDelegateToolName(stockToolName);
+              const permitted = permittedStockTools.has(stockToolName)
+                || permittedCanonical.has(canonicalName);
               const record: ToolCallRecord = {
-                name: mapClaudeDelegateToolName(stockToolName),
+                name: canonicalName,
                 arguments: event.tool_input ?? {},
                 output: permitted ? "" : "delegate_tool_not_permitted: tool is outside the root-confinable delegate set.",
                 is_error: !permitted,

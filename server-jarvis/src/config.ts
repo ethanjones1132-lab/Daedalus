@@ -125,7 +125,13 @@ export interface ToolConfig {
   enabled: boolean;
   /** Tools that require user approval before execution */
   require_approval: string[];
-  /** Sandbox mode: 'strict' | 'permissive' | 'off' */
+  /**
+   * Sandbox mode: 'strict' | 'permissive' | 'off'.
+   * - strict: all paths confined to allowed_roots ∪ session_grants
+   * - permissive: reads outside roots allowed (logged); writes always confined
+   *   to allowed_roots ∪ session_grants (same write fence as strict)
+   * - off: no path containment
+   */
   sandbox_mode: 'strict' | 'permissive' | 'off';
   /**
    * When true, tools whose policy resolves to "ask" in the interactive chat

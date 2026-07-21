@@ -120,6 +120,12 @@ export interface ConductorWiring {
   live: LiveConductor;
   /** Optional collector override; defaults to the global outcome collector. */
   collector?: StageRunRecorder;
+  /**
+   * After a Claude delegate exits (and releases the GPU), re-warm the local
+   * conductor model so the next turn does not hit cold_start_warming. Fire-and-
+   * forget; failures are non-fatal.
+   */
+  reWarmLocalConductor?: () => void;
 }
 
 export interface PipelineProgressState {
@@ -1187,8 +1193,13 @@ export class PipelineExecutor {
 
       const delegateStart = Date.now();
       const stageId = `stage_${crypto.randomUUID()}`;
+      // Do not feed the native executor TOOL_GUIDELINES (canonical names like
+      // write_file) into the stock Claude CLI — the CLI already describes its
+      // own stock tools (Write/Edit). Teaching both vocabularies is what made
+      // the model emit write_file and get policy_denied (F1 / 2026-07-21).
+      const delegateSystemPrompt = stageSystemPrompt("executor", options, []);
       const prompt = [
-        executorPrompt,
+        delegateSystemPrompt,
         `User Request: ${request}`,
         `Plan:\n${planSummary}`,
         "[Runtime write contract] Apply the requested change with a stock write tool and verify the resulting filesystem mutation.",
@@ -1237,6 +1248,13 @@ export class PipelineExecutor {
         };
       } finally {
         combinedAbort.dispose();
+        // Delegate unload frees GPU VRAM; re-warm the local conductor so the
+        // next turn does not sit in the multi-minute cold window (F2).
+        try {
+          this.conductor?.reWarmLocalConductor?.();
+        } catch {
+          // Fire-and-forget; re-warm is best-effort.
+        }
       }
       const cleanupUnconfirmed = delegated.errorCode === "delegate_cleanup_unconfirmed"
         || delegated.toolCalls.some((call) => call.name === "delegate_cleanup" && call.is_error);

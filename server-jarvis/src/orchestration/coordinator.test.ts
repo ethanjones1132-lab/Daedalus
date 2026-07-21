@@ -294,6 +294,70 @@ describe("Coordinator", () => {
     expect(apiCalls).toBe(1);
   });
 
+  test("cold_start_warming degrades to deterministic route, not remote API (F2)", async () => {
+    // Primary cold after a write-turn eviction: routeTurn throws cold_start_warming.
+    // Must return buildDeterministicRoute — remote API coordinator times out past deadline.
+    (globalThis as any).fetch = async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/ps")) return Response.json({ models: [] });
+      if (url.endsWith("/api/generate")) return Response.json({ done: true, done_reason: "load" });
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    let apiCalls = 0;
+    const cfg: JarvisConfig = defaultConfig();
+    cfg.orchestrator.conductor.enabled = true;
+    cfg.orchestrator.conductor.fallback_to_api = true;
+    cfg.orchestrator.conductor.persist_sessions = false;
+    const conductor = new PersistentConductor(() => cfg);
+    const coordinator = new Coordinator(async () => {
+      apiCalls += 1;
+      return { content: "{}" };
+    }, conductor);
+
+    const decision = await coordinator.route("fix the failing chat stream module", {
+      sessionId: "cold-degrade-1",
+      rawMessage: "fix the failing chat stream module",
+    });
+
+    expect(apiCalls).toBe(0);
+    expect(decision.conductor_source).toBe("deterministic");
+    expect(decision.local_conductor_degraded).toBe(true);
+    expect(decision.pipeline).toContain("executor");
+    expect(decision.pipeline).toContain("synthesizer");
+  });
+
+  test("routing abort degrades to deterministic route without calling remote API", async () => {
+    (globalThis as any).fetch = async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/ps")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/chat")) throw new DOMException("This operation was aborted", "AbortError");
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    let apiCalls = 0;
+    const cfg: JarvisConfig = defaultConfig();
+    cfg.orchestrator.conductor.enabled = true;
+    cfg.orchestrator.conductor.fallback_to_api = true;
+    cfg.orchestrator.conductor.persist_sessions = false;
+    const conductor = new PersistentConductor(() => cfg);
+    const coordinator = new Coordinator(async () => {
+      apiCalls += 1;
+      return { content: "{}" };
+    }, conductor);
+
+    const decision = await coordinator.route("read README.md and summarize", {
+      sessionId: "abort-degrade-1",
+      rawMessage: "read README.md and summarize",
+    });
+
+    expect(apiCalls).toBe(0);
+    expect(decision.conductor_source).toBe("deterministic");
+    expect(decision.local_conductor_degraded).toBe(true);
+  });
+
   test("parses optional worker_instructions and shared_context", async () => {
     const coordinator = new Coordinator(async () => ({
       content: JSON.stringify({

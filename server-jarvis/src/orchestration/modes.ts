@@ -45,6 +45,9 @@ export const BUILTIN_MODES: Record<string, AgentMode> = {
       "glob", "grep", "list_directory",
       "git_metadata",
       "bash",
+      // win32-only registry entry (shell-bundle); intersection with the live
+      // registry drops it on non-win32, so no platform branch is needed here.
+      "powershell",
       "web_search", "web_fetch",
       "agent", "run_background_command",
     ],
@@ -67,7 +70,10 @@ export const BUILTIN_MODES: Record<string, AgentMode> = {
   rewriter: {
     id: "rewriter",
     name: "Rewriter",
-    tools_filter: ["read_file", "grep", "glob", "list_directory", "edit_file", "write_file", "multi_edit"],
+    tools_filter: [
+      "read_file", "grep", "glob", "list_directory", "edit_file", "write_file", "multi_edit",
+      "powershell",
+    ],
     temperature: 0.3,
     max_tokens: 4096,
     requires_memory: true,

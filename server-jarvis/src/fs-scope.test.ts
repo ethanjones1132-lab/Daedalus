@@ -23,20 +23,20 @@ function config(root: string, mode: "strict" | "permissive" | "off" = "strict"):
 afterEach(() => {
   for (const root of tempRoots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
-
-describe("fs-scope", () => {
-  test("toWslPath converts a Windows drive path", () => {
-    expect(toWslPath("C:/Users/ethan/x")).toBe("/mnt/c/Users/ethan/x");
-  });
-
-  test("toWslPath converts a backslash drive path", () => {
-    expect(toWslPath("C:\\Users\\ethan\\x")).toBe("/mnt/c/Users/ethan/x");
-  });
-
-  test("toWslPath converts a \\\\wsl.localhost UNC path", () => {
-    expect(toWslPath("\\\\wsl.localhost\\Ubuntu\\home\\ethan")).toBe("/home/ethan");
-  });
-
+
+describe("fs-scope", () => {
+  test("toWslPath converts a Windows drive path", () => {
+    expect(toWslPath("C:/Users/ethan/x")).toBe("/mnt/c/Users/ethan/x");
+  });
+
+  test("toWslPath converts a backslash drive path", () => {
+    expect(toWslPath("C:\\Users\\ethan\\x")).toBe("/mnt/c/Users/ethan/x");
+  });
+
+  test("toWslPath converts a \\\\wsl.localhost UNC path", () => {
+    expect(toWslPath("\\\\wsl.localhost\\Ubuntu\\home\\ethan")).toBe("/home/ethan");
+  });
+
   test("toWslPath passes a POSIX path through unchanged", () => {
     expect(toWslPath("/home/ethan/file.ts")).toBe("/home/ethan/file.ts");
   });
@@ -78,10 +78,10 @@ describe("fs-scope", () => {
     expect(() => safePath("/definitely-outside-jarvis-scope/file.ts", cfg))
       .toThrow(/outside the workspace/);
   });
-
-  // Note: these assert host-agnostically because the test runner may execute on
-  // Windows (win32 path semantics) while production runs in WSL (posix). The
-  // meaningful invariant is the resolved suffix, not the separator style.
+
+  // Note: these assert host-agnostically because the test runner may execute on
+  // Windows (win32 path semantics) while production runs in WSL (posix). The
+  // meaningful invariant is the resolved suffix, not the separator style.
   test("safePath resolves a relative path inside the workspace", () => {
     const root = tempRoot("relative");
     mkdirSync(join(root, "src"));
@@ -152,18 +152,62 @@ describe("fs-scope", () => {
     expect(() => safePath(join(outside, "file.ts"), cfg, { sessionGrants: [grant] }))
       .toThrow(new RegExp(`outside the workspace.*${basename(grant)}`, "s"));
   });
-
-  test("safePath in permissive mode ALLOWS a path outside the workspace", () => {
-    // permissive must be more lenient than strict: an out-of-workspace path is
-    // returned (resolved), not rejected. Mirrors agent-tools.ts behavior.
+
+  test("safePath in permissive mode ALLOWS a read path outside the workspace", () => {
+    // permissive reads remain lenient: an out-of-workspace path is returned
+    // (resolved), not rejected. Writes are confined separately (F4).
     const perm = config(tempRoot("permissive"), "permissive");
-    const r = safePath("../../etc/passwd", perm).replace(/\\/g, "/");
-    expect(r.endsWith("etc/passwd")).toBe(true);
-  });
-
+    const r = safePath("../../etc/passwd", perm).replace(/\\/g, "/");
+    expect(r.endsWith("etc/passwd")).toBe(true);
+  });
+
+  test("permissive mode denies writes outside roots and grants (F4 confined writes)", () => {
+    const workspace = tempRoot("perm-write-ws");
+    const grant = tempRoot("perm-write-grant");
+    const outside = tempRoot("perm-write-outside");
+    const cfg = config(workspace, "permissive");
+
+    expect(() => safePath(join(outside, "escape.ts"), cfg, {
+      sessionGrants: [grant],
+      forWrite: true,
+    })).toThrow(/outside the workspace/);
+
+    // Relative escapes that leave every allowed root must also be denied for writes.
+    expect(() => safePath("../../NonexistentDir99/escape.ts", cfg, {
+      sessionGrants: [grant],
+      forWrite: true,
+    })).toThrow(/outside the workspace/);
+  });
+
+  test("permissive mode still allows writes inside a granted root, including not-yet-existing children", () => {
+    const workspace = tempRoot("perm-grant-ws");
+    const grant = tempRoot("perm-grant-root");
+    const cfg = config(workspace, "permissive");
+    const child = join(grant, "NonexistentDir99", "new.ts");
+
+    // Absolute under grant: containment holds even when intermediate dirs do not exist yet.
+    expect(safePath(child, cfg, { sessionGrants: [grant], forWrite: true }))
+      .toBe(resolve(child));
+
+    // Relative write whose parent already exists under a grant root.
+    mkdirSync(join(grant, "generated"));
+    expect(safePath("generated/new.ts", cfg, { sessionGrants: [grant], forWrite: true }))
+      .toBe(resolve(grant, "generated", "new.ts"));
+  });
+
+  test("permissive mode still allows and logs reads outside roots and grants", () => {
+    const workspace = tempRoot("perm-read-ws");
+    const outside = tempRoot("perm-read-outside");
+    writeFileSync(join(outside, "notes.md"), "ok");
+    const cfg = config(workspace, "permissive");
+
+    expect(safePath(join(outside, "notes.md"), cfg, { sessionGrants: [] }))
+      .toBe(resolve(outside, "notes.md"));
+  });
+
   test("safePath with sandbox off returns the resolved absolute path", () => {
     const off = config(tempRoot("off"), "off");
-    const r = safePath("/etc/hosts", off).replace(/\\/g, "/");
-    expect(r.endsWith("etc/hosts")).toBe(true);
-  });
-});
+    const r = safePath("/etc/hosts", off).replace(/\\/g, "/");
+    expect(r.endsWith("etc/hosts")).toBe(true);
+  });
+});

@@ -260,7 +260,10 @@ describe("PersistentConductor", () => {
     expect(generateCalled).toBe(false);
   });
 
-  test("health reports a recent local runtime abort instead of claiming the conductor is available", async () => {
+  test("routing abort/timeout does not poison isAvailable (F2 eviction-class miss)", async () => {
+    // Under GPU pressure a write turn evicts the conductor; the next route
+    // aborts on cold reload. That must NOT flip isAvailable() false — doing so
+    // forces sustained remote-API coordinator degradation (2026-07-21 F2).
     (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
@@ -277,6 +280,30 @@ describe("PersistentConductor", () => {
       request: "route this turn",
       turnNumber: 1,
     })).rejects.toThrow(/aborted|Abort/i);
+
+    expect(await conductor.isAvailable()).toBe(true);
+    expect((await conductor.describeHealth()).reason).toBeUndefined();
+  });
+
+  test("genuine retryable runtime failures still strike health", async () => {
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/ps")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/chat")) {
+        throw new Error("HTTP 503: runner failed to load model");
+      }
+      throw new Error(`Unexpected fetch: ${url} ${String(init?.method ?? "")}`);
+    };
+
+    const cfg = makeConfig({ persist_sessions: false });
+    const conductor = new PersistentConductor(() => cfg);
+
+    await expect(conductor.routeTurn({
+      sessionId: "runtime-health-5xx",
+      request: "route this turn",
+      turnNumber: 1,
+    })).rejects.toThrow(/503|failed to load/i);
 
     expect(await conductor.isAvailable()).toBe(false);
     expect((await conductor.describeHealth()).reason).toContain("recent_runtime_failure");

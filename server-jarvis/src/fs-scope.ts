@@ -133,7 +133,16 @@ function optionsFrom(third?: string | SafePathOptions): SafePathOptions {
   return typeof third === "string" ? { workspaceOverride: third } : (third ?? {});
 }
 
-/** Resolve a user path against the invocation's ordered allowed roots. */
+/**
+ * Resolve a user path against the invocation's ordered allowed roots.
+ *
+ * Sandbox modes:
+ * - `off` — no containment
+ * - `strict` — reads and writes must stay in `allowed_roots ∪ session_grants`
+ * - `permissive` — **reads** outside roots are allowed (logged); **writes**
+ *   (`forWrite: true`) remain confined to roots∪grants (F4 / 2026-07-21).
+ *   Effectively a permissive-reads / confined-writes policy.
+ */
 export function safePath(
   inputPath: string,
   cfg: JarvisConfig,
@@ -145,11 +154,15 @@ export function safePath(
   if (cfg.tools.sandbox_mode === "off") return resolve(normalizedInput);
 
   const roots = resolveAllowedRoots(cfg, options);
+  // Writes under permissive use the same containment as strict (F4).
+  const allowOutside =
+    cfg.tools.sandbox_mode === "permissive" && !options.forWrite;
+
   const inputIsAbsolute = absoluteLike(normalizedInput);
   if (inputIsAbsolute) {
     const candidate = resolve(normalizedInput);
     if (roots.some((root) => isContained(root, candidate))) return candidate;
-    if (cfg.tools.sandbox_mode === "permissive") {
+    if (allowOutside) {
       console.log(`[Sandbox] Permissive mode: allowing access to "${candidate}" (outside allowed roots: ${roots.join(", ") || "none"})`);
       return candidate;
     }
@@ -175,7 +188,7 @@ export function safePath(
 
   const permissiveBase = roots[0] ?? resolve(normalizePathInput(effectiveWorkspaceRoot(cfg)));
   const permissiveCandidate = resolve(permissiveBase, normalizedInput);
-  if (cfg.tools.sandbox_mode === "permissive") {
+  if (allowOutside) {
     console.log(`[Sandbox] Permissive mode: allowing access to "${permissiveCandidate}" (outside allowed roots: ${roots.join(", ") || "none"})`);
     return permissiveCandidate;
   }

@@ -786,7 +786,12 @@ export class PersistentConductor {
   }
 
   private recordRuntimeFailure(error: unknown): void {
-    if (!isAbortOrTimeoutError(error) && !isRetryableRuntimeFailure(error)) return;
+    // Eviction/cold aborts and routing timeouts are expected under GPU pressure
+    // (write turns unload the conductor). They must not flip isAvailable() false
+    // for later turns — that sustained API degradation is F2 (2026-07-21).
+    if (isAbortOrTimeoutError(error)) return;
+    if (error instanceof PersistentConductorError && error.code === "cold_start_warming") return;
+    if (!isRetryableRuntimeFailure(error)) return;
     this.lastRuntimeFailureAt = Date.now();
     this.lastRuntimeFailureMessage = errorText(error).slice(0, 240);
   }

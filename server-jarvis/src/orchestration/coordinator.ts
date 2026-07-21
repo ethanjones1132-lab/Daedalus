@@ -82,6 +82,8 @@ export interface CoordinatorResult {
   conductor_model?: string;
   /** True when a model call completed but its routing payload was unusable. */
   routing_parse_fallback?: boolean;
+  /** True when local conductor cold/abort degraded to the deterministic route. */
+  local_conductor_degraded?: boolean;
 }
 
 export interface CoordinatorRouteOptions {
@@ -149,6 +151,19 @@ export type LocalUnavailableCallback = (info: {
   sessionId: string;
 }) => void | Promise<void>;
 
+/**
+ * Cold-start warming and routing aborts/timeouts are expected under GPU
+ * eviction pressure (write turns unload the conductor model). They must
+ * degrade to the deterministic route rather than the remote API coordinator.
+ */
+function isExpectedLocalConductorMiss(error: unknown): boolean {
+  if (error instanceof PersistentConductorError && error.code === "cold_start_warming") {
+    return true;
+  }
+  const text = error instanceof Error ? `${error.name} ${error.message}` : String(error);
+  return /\bAbortError\b|\bTimeoutError\b|aborted|timed?\s*out|timeout|first-token timeout|stream idle timeout|visible-progress timeout/i.test(text);
+}
+
 export class Coordinator {
   private static readonly MAX_STATES = 256;
   private static readonly states = new Map<string, CoordinatorState>();
@@ -182,6 +197,7 @@ export class Coordinator {
       lastOutcome,
       history: options.history,
       sessionMemoryHints: options.sessionMemoryHints,
+      rawMessage: options.rawMessage,
     });
 
     // Resilient routing: a coordinator model that returns empty/garbled output
@@ -209,6 +225,9 @@ export class Coordinator {
     }
     if (decision.conductor_source !== "continuation_reuse") {
       decision.conductor_source = response.source;
+    }
+    if (response.source === "deterministic") {
+      decision.local_conductor_degraded = true;
     }
     decision.conductor_model = response.model;
     state.turns += 1;
@@ -251,8 +270,10 @@ export class Coordinator {
       lastOutcome?: string;
       history?: ChatMessage[];
       sessionMemoryHints?: SharedContextHints;
+      /** Raw user message for deterministic degradation classification. */
+      rawMessage?: string;
     },
-  ): Promise<{ content: string; source: "local" | "api"; model?: string }> {
+  ): Promise<{ content: string; source: "local" | "api" | "deterministic"; model?: string }> {
     const conductor = this.persistentConductor;
     if (conductor) {
       try {
@@ -280,6 +301,34 @@ export class Coordinator {
         }
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
+        // F2: cold-start / routing-timeout under GPU eviction must degrade to
+        // the deterministic route (sub-ms, correct pipeline) — NOT the remote
+        // API coordinator, which cold-starts past the stage deadline.
+        if (isExpectedLocalConductorMiss(e)) {
+          console.warn(
+            `[Coordinator] Local conductor cold/abort; using deterministic route: ${message}`,
+          );
+          if (this.onLocalUnavailable) {
+            await this.onLocalUnavailable({
+              reason: message,
+              sessionId: options.sessionId,
+            });
+          }
+          const requirement = classifyTurnRequirements(options.rawMessage ?? request).requirement;
+          const route = buildDeterministicRoute(requirement);
+          return {
+            content: JSON.stringify({
+              task_type: route.task_type,
+              pipeline: route.pipeline,
+              topology: route.topology,
+              context: route.context,
+              coordinator_rationale:
+                `Local conductor cold/abort (${message}); using deterministic ${requirement} route.`,
+              local_conductor_degraded: true,
+            }),
+            source: "deterministic",
+          };
+        }
         if (!conductor.shouldFallbackToApi()) {
           throw e instanceof PersistentConductorError ? e : new CoordinatorError(message);
         }

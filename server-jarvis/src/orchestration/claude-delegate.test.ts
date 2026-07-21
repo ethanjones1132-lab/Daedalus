@@ -22,6 +22,20 @@ describe("Claude executor delegate", () => {
     ]);
   });
 
+  test("maps canonical Jarvis names to themselves (not delegate_* fallback)", () => {
+    // Models that read native TOOL_GUIDELINES emit write_file rather than Write.
+    // Without self-aliases those become delegate_write_file and fail policy.
+    expect([
+      "write_file", "edit_file", "multi_edit", "read_file",
+      "web_search", "web_fetch", "todo_write", "apply_patch",
+      "list_directory", "git_metadata",
+    ].map(mapClaudeDelegateToolName)).toEqual([
+      "write_file", "edit_file", "multi_edit", "read_file",
+      "web_search", "web_fetch", "todo_write", "apply_patch",
+      "list_directory", "git_metadata",
+    ]);
+  });
+
   test("admits only healthy full-profile write work under the configured policy", () => {
     const config = defaultConfig();
     const base = {
@@ -439,6 +453,103 @@ describe("Claude executor delegate", () => {
 
     expect(output).toMatchObject({ ok: false, errorCode: "delegate_tool_not_permitted" });
     expect(output.toolCalls[0]).toMatchObject({ name: "write_file", is_error: true, error_code: "policy_denied" });
+  });
+
+  test("permits canonical write_file when Write is in allowed_tools (F1 vocabulary mismatch)", async () => {
+    // Eval 2026-07-21 T1: model emitted write_file; permit gate only checked
+    // stock names → delegate_tool_not_permitted. Canonical identity must pass
+    // when the corresponding stock tool is allowed.
+    const config = defaultConfig();
+    // Default allowed_tools includes Write (root-confinable set).
+    const snapshots: DelegateRootSnapshot[][] = [[{
+      root: "C:\\repo",
+      kind: "git",
+      status: "",
+      diffStat: "",
+      fingerprint: "before",
+      files: { "c:\\repo\\claimed.ts": "100:10" },
+    }], [{
+      root: "C:\\repo",
+      kind: "git",
+      status: " M claimed.ts",
+      diffStat: " claimed.ts | 2 ++",
+      fingerprint: "after",
+      files: { "c:\\repo\\claimed.ts": "200:12" },
+    }]];
+    const health = new DelegateHealth();
+    const output = await runClaudeDelegate({
+      config,
+      prompt: "write claimed.ts",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 30_000,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      health,
+      snapshotFactory: { capture: async () => snapshots.shift()! },
+      processFactory: async () => ({
+        events: (async function* () {
+          yield { type: "assistant", message: { content: [
+            { type: "text", text: "Applied via canonical name." },
+            { type: "tool_use", id: "write-1", name: "write_file", input: { file_path: "claimed.ts" } },
+          ] } };
+          yield { type: "user", message: { content: [{
+            type: "tool_result",
+            tool_use_id: "write-1",
+            content: "wrote claimed.ts",
+          }] } };
+          yield { type: "result" };
+        })(),
+        exit: Promise.resolve({ code: 0, signal: null }),
+        kill: () => {},
+      }),
+    });
+
+    expect(output.ok).toBe(true);
+    expect(output.toolCalls[0]).toMatchObject({
+      name: "write_file",
+      is_error: false,
+    });
+    expect(output.toolCalls[0].error_code).toBeUndefined();
+    expect(health.snapshot().lastReason).toBeUndefined();
+  });
+
+  test("still denies Bash when only Read is allowed (canonical permit is not a free pass)", async () => {
+    const config = defaultConfig();
+    config.claude_cli.delegate.allowed_tools = ["Read"];
+    const snapshot: DelegateRootSnapshot = {
+      root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
+    };
+    const output = await runClaudeDelegate({
+      config,
+      prompt: "no shell",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 30_000,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      health: new DelegateHealth(),
+      snapshotFactory: { capture: async () => [snapshot] },
+      processFactory: async () => ({
+        events: (async function* () {
+          yield { type: "assistant", message: { content: [{
+            type: "tool_use", id: "bash-1", name: "Bash",
+            input: { command: "echo hi" },
+          }] } };
+          yield { type: "user", message: { content: [{
+            type: "tool_result", tool_use_id: "bash-1", content: "hi",
+          }] } };
+          yield { type: "result", result: "done" };
+        })(),
+        exit: Promise.resolve({ code: 0, signal: null }),
+        kill: () => {},
+      }),
+    });
+
+    expect(output).toMatchObject({ ok: false, errorCode: "delegate_tool_not_permitted" });
+    expect(output.toolCalls[0]).toMatchObject({ name: "bash", is_error: true, error_code: "policy_denied" });
   });
 
   test("terminates then kills a timed-out child and cools down when it produced zero writes", async () => {
