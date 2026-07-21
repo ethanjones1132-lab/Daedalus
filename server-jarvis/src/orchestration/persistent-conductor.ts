@@ -364,9 +364,9 @@ export class PersistentConductor {
       throw new PersistentConductorError("Persistent conductor is disabled");
     }
 
-    let target = await this.resolveTarget();
-    const warm = await this.isTargetWarm(target);
-    if (!warm) {
+    const primary = await this.resolveTarget();
+    let target = await this.resolveWarmInferenceTarget(primary);
+    if (!target) {
       void this.warmUp().catch((error) => {
         console.warn(
           `[PersistentConductor] background warm after cold_start_warming failed: ${
@@ -468,7 +468,11 @@ export class PersistentConductor {
     if (!this.config().enabled) {
       throw new PersistentConductorError("Persistent conductor is disabled");
     }
-    let target = await this.resolveTarget();
+    // Prefer the resident conductor candidate. During a delegate write turn the
+    // fallback_model is already loaded; supervising through it avoids forcing a
+    // reload of the evicted primary (which would in turn evict the delegate).
+    const primary = await this.resolveTarget();
+    let target = (await this.resolveWarmInferenceTarget(primary)) ?? primary;
     const startedAt = Date.now();
     let supervised: { target: ResolvedConductorTarget; value: OllamaChatMessage };
     try {
@@ -663,25 +667,59 @@ export class PersistentConductor {
     await this.keepWarmInFlight;
   }
 
-  private async isTargetWarm(target: ResolvedConductorTarget, timeoutMs = 2_500): Promise<boolean> {
+  /**
+   * The models Ollama currently has RESIDENT (`/api/ps`). Returns `null` when
+   * warmth cannot be determined (unreachable / malformed) so callers can
+   * fail-open, and `[]` when the runtime confidently reports nothing loaded.
+   */
+  private async loadedModels(baseUrl: string, timeoutMs = 2_500): Promise<string[] | null> {
     const ctrl = new AbortController();
     const timeout = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      const res = await fetch(`${target.baseUrl}/api/ps`, { signal: ctrl.signal });
-      if (!res.ok) return true;
+      const res = await fetch(`${baseUrl}/api/ps`, { signal: ctrl.signal });
+      if (!res.ok) return null;
       const json = await res.json().catch(() => null) as { models?: Array<{ name?: string; model?: string }> } | null;
-      if (!json || !Array.isArray(json.models)) return true;
-
-      const loadedModels = json.models
+      if (!json || !Array.isArray(json.models)) return null;
+      return json.models
         .map((model) => model?.name || model?.model || "")
         .filter(Boolean);
-      if (loadedModels.length === 0) return false;
-      return modelAvailable(loadedModels, target.model);
     } catch {
-      return true;
+      return null;
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  private async isTargetWarm(target: ResolvedConductorTarget, timeoutMs = 2_500): Promise<boolean> {
+    const loaded = await this.loadedModels(target.baseUrl, timeoutMs);
+    if (loaded === null) return true; // indeterminate → fail open (don't mark a working conductor cold)
+    if (loaded.length === 0) return false;
+    return modelAvailable(loaded, target.model);
+  }
+
+  /**
+   * Prefer whichever conductor candidate is ACTUALLY resident, not merely the
+   * installed primary. On a VRAM-constrained host the delegate's model — which
+   * is also the configured `fallback_model` — evicts the primary conductor
+   * mid-turn; following the resident model keeps supervision/routing LOCAL
+   * instead of forcing a slow reload (which would evict the delegate) or a
+   * remote coordinator that blows the stage deadline. Returns the primary when
+   * warmth is indeterminate (fail-open), or `null` when nothing is loaded.
+   */
+  private async resolveWarmInferenceTarget(
+    primary: ResolvedConductorTarget,
+  ): Promise<ResolvedConductorTarget | null> {
+    const loaded = await this.loadedModels(primary.baseUrl);
+    if (loaded === null) return primary;
+    if (loaded.length === 0) return null;
+    // Candidate order is [model, fallback_model]: prefer the fast primary when
+    // it is resident, otherwise the resident fallback.
+    for (const model of conductorModelCandidates(this.config())) {
+      if (modelAvailable(loaded, model)) {
+        return { baseUrl: primary.baseUrl, model };
+      }
+    }
+    return null;
   }
 
   /**

@@ -190,6 +190,76 @@ describe("PersistentConductor", () => {
     expect(calls).toEqual(["generate:gemma4:e2b:30m:1"]);
   });
 
+  test("routeTurn uses a warm fallback_model when the primary conductor model is evicted", async () => {
+    // On an 8GB GPU the delegate's model (also the conductor's fallback_model)
+    // evicts the primary conductor mid-turn. Before this fix, routeTurn saw the
+    // primary cold and threw cold_start_warming, forcing the slow remote
+    // coordinator (the 20s stage-deadline timeout). It should instead route via
+    // the fallback_model that is ALREADY resident from the delegate.
+    const chatBodies: Array<Record<string, any>> = [];
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      // Both models installed…
+      if (url.endsWith("/api/tags")) {
+        return Response.json({ models: [{ name: "qwen3.5:4b" }, { name: "gemma4:e2b" }] });
+      }
+      // …but only the fallback (gemma) is currently loaded — the primary was evicted.
+      if (url.endsWith("/api/ps")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/chat")) {
+        chatBodies.push(JSON.parse(String(init?.body ?? "{}")));
+        return Response.json({
+          message: {
+            role: "assistant",
+            content: '{"task_type":"general","pipeline":["synthesizer"],"topology":"linear","context":{"needs_workspace_inspection":false,"needs_memory":false,"estimated_complexity":"low"},"coordinator_rationale":"ok"}',
+          },
+        });
+      }
+      if (url.endsWith("/api/generate")) return Response.json({ done: true });
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg = makeConfig({ model: "qwen3.5:4b", fallback_model: "gemma4:e2b", persist_sessions: false });
+    const conductor = new PersistentConductor(() => cfg);
+
+    const result = await conductor.routeTurn({ sessionId: "warm-fallback", request: "hello", turnNumber: 1 });
+    expect(result.model).toBe("gemma4:e2b");
+    expect(result.usedLocal).toBe(true);
+    expect(chatBodies[0]?.model).toBe("gemma4:e2b");
+  });
+
+  test("supervise runs on the resident fallback_model instead of reloading the evicted primary", async () => {
+    // The reload symptom: with the primary evicted, supervise used to call it
+    // anyway, forcing Ollama to reload it — which on a tight GPU evicts the
+    // delegate the supervision is meant to be watching. It must instead use the
+    // already-resident fallback and never touch /api/generate.
+    const chatModels: string[] = [];
+    let generateCalled = false;
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) {
+        return Response.json({ models: [{ name: "qwen3.5:4b" }, { name: "gemma4:e2b" }] });
+      }
+      if (url.endsWith("/api/ps")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/generate")) { generateCalled = true; return Response.json({ done: true }); }
+      if (url.endsWith("/api/chat")) {
+        chatModels.push(JSON.parse(String(init?.body ?? "{}")).model);
+        return Response.json({ message: { role: "assistant", content: '{"directive":"continue"}' } });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg = makeConfig({ model: "qwen3.5:4b", fallback_model: "gemma4:e2b", persist_sessions: false });
+    const conductor = new PersistentConductor(() => cfg);
+    const result = await conductor.supervise([
+      { role: "system", content: "supervise" },
+      { role: "user", content: "Stage: executor — running" },
+    ]);
+
+    expect(result.model).toBe("gemma4:e2b");
+    expect(chatModels).toEqual(["gemma4:e2b"]);
+    expect(generateCalled).toBe(false);
+  });
+
   test("health reports a recent local runtime abort instead of claiming the conductor is available", async () => {
     (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
       const url = String(input);
