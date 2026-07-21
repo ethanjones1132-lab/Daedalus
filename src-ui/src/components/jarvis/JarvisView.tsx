@@ -10,6 +10,7 @@ import {
 } from './types';
 import ControlCenterView from './ControlCenterView';
 import MarkdownView from './MarkdownView';
+import WorkspaceGrantsChip from './WorkspaceGrantsChip';
 import {
   createUnknownFrameReporter,
   InactivityWatchdog,
@@ -1641,6 +1642,8 @@ export function ChatPanel({
           </div>
         )}
 
+        <WorkspaceGrantsChip sessionId={sessionId} isStreaming={isStreaming} />
+
         {/* Inline tool-call cards (Phase 3.1). */}
         {toolCalls.length > 0 && (
           <div className="space-y-1.5">
@@ -2735,6 +2738,138 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
             className="w-full px-3 py-2 text-xs font-mono bg-obsidian/30 border border-iron/20 rounded-lg text-bone-faint cursor-not-allowed"
           />
           <p className="text-[10px] font-mono text-bone-faint mt-1">Auto-detected from workspace</p>
+        </GlassCard>
+
+        {/* Web Search Provider */}
+        <GlassCard hoverable={false}>
+          <h3 className="text-sm font-semibold text-bone mb-3">Web Search Provider</h3>
+          <p className="text-[10px] font-mono text-bone-faint mb-3">
+            DuckDuckGo needs no key. Brave/Tavily are higher quality but require a key — with a
+            provider selected and no key set, search silently falls back to DuckDuckGo.
+          </p>
+          <div className="grid grid-cols-3 gap-2 mb-3">
+            {(['duckduckgo', 'brave', 'tavily'] as const).map((p) => (
+              <button
+                key={p}
+                onClick={() => setLocalConfig(prev => prev ? { ...prev, web_search: { ...prev.web_search, provider: p } } : prev)}
+                className={cn(
+                  'px-3 py-2 rounded-xl border text-xs font-mono transition-all text-center capitalize',
+                  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50',
+                  localConfig.web_search.provider === p
+                    ? 'bg-cyan-neon/15 border-cyan-neon/40 text-cyan-glow'
+                    : 'bg-obsidian/40 border-iron/30 text-bone-dim hover:border-iron/50'
+                )}
+              >
+                {p}
+              </button>
+            ))}
+          </div>
+          {localConfig.web_search.provider !== 'duckduckgo' && (
+            <div className="space-y-3">
+              {localConfig.web_search.provider === 'brave' && (
+                <div>
+                  <label className="text-[10px] font-mono text-bone-dim block mb-1">Brave API key</label>
+                  <input
+                    type="password"
+                    value={localConfig.web_search.brave_api_key}
+                    onChange={(e) => setLocalConfig(prev => prev ? { ...prev, web_search: { ...prev.web_search, brave_api_key: e.target.value } } : prev)}
+                    placeholder="Brave Search API key"
+                    className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors"
+                  />
+                </div>
+              )}
+              {localConfig.web_search.provider === 'tavily' && (
+                <div>
+                  <label className="text-[10px] font-mono text-bone-dim block mb-1">Tavily API key</label>
+                  <input
+                    type="password"
+                    value={localConfig.web_search.tavily_api_key}
+                    onChange={(e) => setLocalConfig(prev => prev ? { ...prev, web_search: { ...prev.web_search, tavily_api_key: e.target.value } } : prev)}
+                    placeholder="Tavily API key"
+                    className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors"
+                  />
+                </div>
+              )}
+            </div>
+          )}
+        </GlassCard>
+
+        {/* Shell / bash resolution */}
+        <GlassCard hoverable={false}>
+          <h3 className="text-sm font-semibold text-bone mb-3">Shell</h3>
+          <div className="space-y-3">
+            <div>
+              <label className="text-[10px] font-mono text-bone-dim block mb-1">
+                Bash interpreter path <span className="text-bone-faint">(blank = auto-resolve Git Bash)</span>
+              </label>
+              <input
+                type="text"
+                value={localConfig.tools.bash_path}
+                onChange={(e) => setLocalConfig(prev => prev ? { ...prev, tools: { ...prev.tools, bash_path: e.target.value } } : prev)}
+                placeholder="C:\Program Files\Git\bin\bash.exe"
+                className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors"
+              />
+              <p className="text-[10px] font-mono text-bone-faint mt-1">
+                Never point this at System32\bash.exe — that is the WSL launcher, not Git Bash, and
+                resolves paths in a different filesystem namespace.
+              </p>
+            </div>
+            <div>
+              <label className="text-[10px] font-mono text-bone-dim block mb-1">Shell timeout ceiling (ms)</label>
+              <input
+                type="number"
+                min={1000}
+                step={1000}
+                value={localConfig.tools.shell_timeout_max_ms}
+                onChange={(e) => setLocalConfig(prev => prev ? { ...prev, tools: { ...prev.tools, shell_timeout_max_ms: Math.max(1000, Number(e.target.value) || 120000) } } : prev)}
+                className="w-40 px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone focus:outline-none focus:border-royal/50 transition-colors"
+              />
+            </div>
+          </div>
+        </GlassCard>
+
+        {/* Claude CLI auth mode — the free-routing imperative lives here */}
+        <GlassCard hoverable={false}>
+          <h3 className="text-sm font-semibold text-bone mb-3">Claude CLI Auth Mode</h3>
+          <div className="grid grid-cols-2 gap-2 mb-3">
+            <button
+              onClick={() => setLocalConfig(prev => prev ? { ...prev, claude_cli: { ...prev.claude_cli, auth_mode: 'proxy' } } : prev)}
+              className={cn(
+                'px-4 py-3 rounded-xl border text-sm font-mono transition-all text-center',
+                'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50',
+                localConfig.claude_cli.auth_mode === 'proxy'
+                  ? 'bg-cyan-neon/15 border-cyan-neon/40 text-cyan-glow'
+                  : 'bg-obsidian/40 border-iron/30 text-bone-dim hover:border-iron/50'
+              )}
+            >
+              <div className="font-semibold">Proxy</div>
+              <div className="text-[10px] text-bone-faint mt-0.5">Free — local Ollama / OpenRouter</div>
+            </button>
+            <button
+              onClick={() => setLocalConfig(prev => prev ? { ...prev, claude_cli: { ...prev.claude_cli, auth_mode: 'subscription' } } : prev)}
+              className={cn(
+                'px-4 py-3 rounded-xl border text-sm font-mono transition-all text-center',
+                'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400/50',
+                localConfig.claude_cli.auth_mode === 'subscription'
+                  ? 'bg-red-500/15 border-red-500/40 text-red-200'
+                  : 'bg-obsidian/40 border-iron/30 text-bone-dim hover:border-iron/50'
+              )}
+            >
+              <div className="font-semibold">Subscription</div>
+              <div className="text-[10px] text-bone-faint mt-0.5">Spends your Claude quota</div>
+            </button>
+          </div>
+          {localConfig.claude_cli.auth_mode === 'subscription' && (
+            <div className="px-3 py-2.5 rounded-lg border bg-red-500/10 border-red-500/30 text-red-100 text-xs font-mono flex items-start gap-2">
+              <span className="text-sm leading-none mt-0.5">⚠</span>
+              <span>
+                Subscription mode bypasses the free local proxy and talks to Anthropic directly —
+                every request here spends your Claude subscription quota. The automated executor
+                delegate always refuses subscription mode and falls back to the free native path
+                regardless of this setting, so this only affects manual/interactive CLI use.
+              </span>
+            </div>
+          )}
         </GlassCard>
       </div>
     </div>

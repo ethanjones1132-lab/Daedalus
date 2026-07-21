@@ -5014,6 +5014,25 @@ export async function baseFetch(req: Request): Promise<Response> {
       const body = req.method === "POST" ? await req.json().catch(() => ({})) : {};
       return Response.json(await checkStatus(body.config));
     }
+    // P5.3d: "what did this session open?" had no answer surface — session
+    // grants (absolute filesystem roots granted from a raw message,
+    // workspace-grants.ts) persisted in the task-run contract but were never
+    // exposed. Read + narrow revoke (does not touch other session memory).
+    if (path === "/session/grants" && req.method === "GET") {
+      const sessionId = new URL(req.url).searchParams.get("session_id");
+      if (!sessionId) return Response.json({ error: "session_id required" }, { status: 400 });
+      return Response.json({ session_id: sessionId, grants: sessionMemory.getSessionGrants(sessionId) });
+    }
+    if (path === "/session/grants/revoke" && req.method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      const sessionId = typeof body.session_id === "string" ? body.session_id : "";
+      const root = typeof body.root === "string" ? body.root : "";
+      if (!sessionId || !root) {
+        return Response.json({ error: "session_id and root are required" }, { status: 400 });
+      }
+      const grants = sessionMemory.revokeSessionGrant(sessionId, root);
+      return Response.json({ session_id: sessionId, grants });
+    }
     if (path === "/skills" && req.method === "GET") return Response.json(loadSkills());
     if (path === "/tools" && req.method === "GET") return Response.json(loadTools());
     if (path === "/models" && (req.method === "GET" || req.method === "POST")) {

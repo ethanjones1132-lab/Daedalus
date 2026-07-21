@@ -460,6 +460,46 @@ pub async fn jarvis_recall_cold_memory(
     }))
 }
 
+// P5.3d: workspace-grants chip. Proxies to the two new Bun routes
+// (GET/POST /session/grants*) the same way jarvis_get_skills proxies to
+// GET /skills — the Bun JSON already matches the shape the UI expects.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct SessionGrantsResponse {
+    pub session_id: String,
+    pub grants: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn jarvis_get_session_grants(session_id: String) -> Result<SessionGrantsResponse, String> {
+    let base = bun_base().await?;
+    let client = http_client()?;
+    let resp = client
+        .get(format!("{}/session/grants", base))
+        .query(&[("session_id", &session_id)])
+        .send()
+        .await
+        .map_err(|e| format!("session/grants request failed: {}", e))?;
+    resp.json::<SessionGrantsResponse>()
+        .await
+        .map_err(|e| format!("JSON parse error from session/grants: {}", e))
+}
+
+#[tauri::command]
+pub async fn jarvis_revoke_session_grant(session_id: String, root: String) -> Result<SessionGrantsResponse, String> {
+    let base = bun_base().await?;
+    let client = http_client()?;
+    let body = serde_json::json!({ "session_id": session_id, "root": root });
+    let resp = client
+        .post(format!("{}/session/grants/revoke", base))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("session/grants/revoke request failed: {}", e))?;
+    resp.json::<SessionGrantsResponse>()
+        .await
+        .map_err(|e| format!("JSON parse error from session/grants/revoke: {}", e))
+}
+
 // `update_token_count` canonical impl: commands/sessions.rs
 
 #[cfg(test)]

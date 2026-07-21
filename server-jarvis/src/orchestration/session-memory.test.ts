@@ -68,6 +68,42 @@ describe("session-memory", () => {
     expect(continued.sessionGrants).toEqual(["C:\\Projects\\one", "D:\\Data"]);
   });
 
+  // P5.3d: getSessionGrants/revokeSessionGrant back the workspace-grants chip.
+  test("getSessionGrants reads the persisted grants; empty for a session with none", () => {
+    const memory = new SessionMemory(() => makeConfig());
+    memory.beginTaskRun("sess-grants-read", {
+      message: "Inspect C:\\Projects\\one",
+      requirement: "workspace_read",
+      sessionGrants: ["C:\\Projects\\one", "D:\\Data"],
+    });
+
+    expect(memory.getSessionGrants("sess-grants-read")).toEqual(["C:\\Projects\\one", "D:\\Data"]);
+    expect(memory.getSessionGrants("sess-never-seen")).toEqual([]);
+  });
+
+  test("revokeSessionGrant removes exactly one root and leaves the rest of the task run intact", () => {
+    const memory = new SessionMemory(() => makeConfig());
+    memory.beginTaskRun("sess-grants-revoke", {
+      message: "Inspect C:\\Projects\\one",
+      requirement: "full_execution",
+      sessionGrants: ["C:\\Projects\\one", "D:\\Data"],
+    });
+
+    const remaining = memory.revokeSessionGrant("sess-grants-revoke", "C:\\Projects\\one");
+
+    expect(remaining).toEqual(["D:\\Data"]);
+    expect(memory.getSessionGrants("sess-grants-revoke")).toEqual(["D:\\Data"]);
+    // Revoking a grant must not touch the rest of the task-run contract.
+    const task = memory.getTaskRun("sess-grants-revoke");
+    expect(task?.requirement).toBe("full_execution");
+    expect(task?.status).toBe("active");
+  });
+
+  test("revoking a grant from a session with no task run is a no-op, not an error", () => {
+    const memory = new SessionMemory(() => makeConfig());
+    expect(memory.revokeSessionGrant("sess-nonexistent", "C:\\anything")).toEqual([]);
+  });
+
   test("keeps task-run state ephemeral when persistence is disabled", () => {
     const memory = new SessionMemory(() => makeConfig({ enabled: false, persist: false }));
     const task = memory.beginTaskRun("ephemeral-task", {

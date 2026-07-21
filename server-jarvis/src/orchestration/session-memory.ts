@@ -258,6 +258,37 @@ export class SessionMemory {
     return session.taskRun;
   }
 
+  /**
+   * P5.3d: the "what did this session open?" question had no answer surface —
+   * `taskRun.sessionGrants` (absolute filesystem roots granted from a raw
+   * message, see `workspace-grants.ts`) persisted across turns but nothing
+   * exposed it. Read-only; UI-facing.
+   */
+  getSessionGrants(sessionId: string): string[] {
+    return this.getSession(sessionId).taskRun?.sessionGrants ?? [];
+  }
+
+  /**
+   * Remove exactly one granted root, leaving every other task-run field
+   * (objective, status, etc.) untouched. Deliberately narrower than
+   * `clearSession` (which wipes ALL session memory — tool results, discovered
+   * facts, the task run itself) — revoking a grant must not also discard
+   * legitimate cross-turn memory.
+   */
+  revokeSessionGrant(sessionId: string, root: string): string[] {
+    const session = this.getSession(sessionId);
+    if (!session.taskRun?.sessionGrants) return [];
+    const remaining = session.taskRun.sessionGrants.filter((g) => g !== root);
+    session.taskRun = {
+      ...session.taskRun,
+      sessionGrants: remaining,
+      updatedAt: new Date().toISOString(),
+    };
+    session.lastActiveAt = Date.now();
+    this.persist(session);
+    return remaining;
+  }
+
   setLastOutcome(sessionId: string, outcome: string | undefined): void {
     if (!outcome?.trim()) return;
     const session = this.getSession(sessionId);
