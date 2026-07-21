@@ -11,6 +11,11 @@ export const HISTORY_BUDGET_TOKENS: Record<TurnRequirement, number> = {
 export const EXECUTOR_TOOL_RESULT_CONTEXT_CHARS = 6_000;
 export const EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS = 3_000;
 export const REWRITER_TOOL_RESULT_CONTEXT_CHARS = 4_000;
+// Network results (web_fetch/web_search) carry the evidence for research turns,
+// where the readable article is the whole point. The 5,000-char strip that
+// web_fetch used truncated mid-article on any real page; this budget admits a
+// full extracted article while staying well under the write-turn cap.
+export const NETWORK_TOOL_RESULT_CONTEXT_CHARS = 12_000;
 export const EXECUTOR_TRANSCRIPT_BUDGET_TOKENS = 12_000;
 export const REWRITER_TRANSCRIPT_BUDGET_TOKENS = 8_000;
 

@@ -5,8 +5,10 @@
 // the legacy tools.ts. `searchWeb` is re-exported for the chat loop's explicit
 // web-search shortcut.
 
-import type { ToolRuntime } from "./tool-runtime";
+import type { ToolRuntime, ExecutionContext } from "./tool-runtime";
 import type { ToolDefinition } from "./tool-types";
+import type { WebSearchConfig } from "./config";
+import { NETWORK_TOOL_RESULT_CONTEXT_CHARS } from "./orchestration/context-budget";
 
 const WEB_SEARCH_DEF: ToolDefinition = {
   type: "function",
@@ -65,15 +67,7 @@ async function toolWebFetch(args: Record<string, unknown>): Promise<string> {
       throw new Error(`HTTP ${res.status} ${res.statusText}`.trim());
     }
     const text = await res.text();
-
-    // Simple extraction — strip HTML tags for text content
-    const stripped = text
-      .replace(/<script[\s\S]*?<\/script>/gi, "")
-      .replace(/<style[\s\S]*?<\/style>/gi, "")
-      .replace(/<[^>]+>/g, " ")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 5000);
+    const stripped = extractReadableContent(text).slice(0, NETWORK_TOOL_RESULT_CONTEXT_CHARS);
 
     return `Content from ${url} (extraction prompt: ${prompt}):\n\n${stripped}`;
   } finally {
@@ -81,15 +75,91 @@ async function toolWebFetch(args: Record<string, unknown>): Promise<string> {
   }
 }
 
-async function toolWebSearch(args: Record<string, unknown>): Promise<string> {
-  const query = typeof args.query === "string" ? args.query.trim() : "";
-  if (!query) throw new Error("web_search requires a query.");
-  return JSON.stringify(await searchWeb(query), null, 2);
+/**
+ * Readability-style extraction: prefer the main article region and drop
+ * chrome (nav/header/footer/aside) so a research turn's evidence is the page's
+ * actual content, not its menus. Falls back to the whole body when no article
+ * region is marked up. Kept dependency-free — a heuristic, not a DOM parser.
+ */
+export function extractReadableContent(html: string): string {
+  const withoutNoise = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<nav[\s\S]*?<\/nav>/gi, " ")
+    .replace(/<header[\s\S]*?<\/header>/gi, " ")
+    .replace(/<footer[\s\S]*?<\/footer>/gi, " ")
+    .replace(/<aside[\s\S]*?<\/aside>/gi, " ");
+
+  // Prefer the largest <article> or <main> region if present.
+  const region = largestRegion(withoutNoise, "article") ?? largestRegion(withoutNoise, "main");
+  const source = region ?? withoutNoise;
+
+  return source
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-export async function searchWeb(query: string): Promise<Record<string, unknown>> {
+function largestRegion(html: string, tag: string): string | null {
+  const matches = [...html.matchAll(new RegExp(`<${tag}[\\s\\S]*?<\\/${tag}>`, "gi"))];
+  if (matches.length === 0) return null;
+  return matches.reduce((longest, m) => (m[0].length > longest.length ? m[0] : longest), "");
+}
+
+async function toolWebSearch(args: Record<string, unknown>, ctx?: ExecutionContext): Promise<string> {
+  const query = typeof args.query === "string" ? args.query.trim() : "";
+  if (!query) throw new Error("web_search requires a query.");
+  return JSON.stringify(await searchWeb(query, ctx?.config?.web_search), null, 2);
+}
+
+/**
+ * Resolve the effective provider: only use brave/tavily when their key is
+ * actually present, otherwise there is nothing to try and DuckDuckGo is used
+ * directly. Exported for pinning the routing decision without a live request.
+ */
+export function resolveSearchProvider(cfg?: WebSearchConfig): "duckduckgo" | "brave" | "tavily" {
+  if (cfg?.provider === "brave" && cfg.brave_api_key.trim()) return "brave";
+  if (cfg?.provider === "tavily" && cfg.tavily_api_key.trim()) return "tavily";
+  return "duckduckgo";
+}
+
+export async function searchWeb(
+  query: string,
+  cfg?: WebSearchConfig,
+): Promise<Record<string, unknown>> {
   const normalizedQuery = query.trim();
   if (!normalizedQuery) throw new Error("web_search requires a query.");
+
+  const provider = resolveSearchProvider(cfg);
+  if (provider !== "duckduckgo") {
+    try {
+      const ctrl = new AbortController();
+      const timeout = setTimeout(() => ctrl.abort(), 10000);
+      try {
+        const result = provider === "brave"
+          ? await searchBrave(normalizedQuery, cfg!.brave_api_key.trim(), ctrl.signal)
+          : await searchTavily(normalizedQuery, cfg!.tavily_api_key.trim(), ctrl.signal);
+        return { ...result, provider };
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch {
+      // Keyed providers are an upgrade, never a hard dependency: any failure
+      // falls back to the keyless DuckDuckGo path below so a bad key or an
+      // outage degrades quality rather than breaking web_search entirely.
+    }
+  }
+
+  return { ...(await searchDuckDuckGo(normalizedQuery)), provider: "duckduckgo" };
+}
+
+async function searchDuckDuckGo(normalizedQuery: string): Promise<Record<string, unknown>> {
   const ctrl = new AbortController();
   const timeout = setTimeout(() => ctrl.abort(), 10000);
   try {
@@ -122,6 +192,63 @@ export async function searchWeb(query: string): Promise<Record<string, unknown>>
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function searchBrave(
+  query: string,
+  apiKey: string,
+  signal: AbortSignal,
+): Promise<Record<string, unknown>> {
+  const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}`;
+  const res = await fetch(url, {
+    signal,
+    headers: { "Accept": "application/json", "X-Subscription-Token": apiKey },
+  });
+  if (!res.ok) throw new Error(`Brave HTTP ${res.status} ${res.statusText}`.trim());
+  const json = await res.json() as any;
+  const results = (json?.web?.results ?? []).slice(0, 8).map((r: any) => ({
+    title: String(r.title ?? ""),
+    url: String(r.url ?? ""),
+    snippet: stripWebHtml(String(r.description ?? "")),
+  }));
+  return {
+    query,
+    answer: "",
+    abstract: String(json?.web?.results?.[0]?.description ?? ""),
+    abstract_url: String(json?.web?.results?.[0]?.url ?? ""),
+    related_topics: [],
+    results,
+    results_count: results.length,
+  };
+}
+
+async function searchTavily(
+  query: string,
+  apiKey: string,
+  signal: AbortSignal,
+): Promise<Record<string, unknown>> {
+  const res = await fetch("https://api.tavily.com/search", {
+    method: "POST",
+    signal,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ api_key: apiKey, query, max_results: 8, include_answer: true }),
+  });
+  if (!res.ok) throw new Error(`Tavily HTTP ${res.status} ${res.statusText}`.trim());
+  const json = await res.json() as any;
+  const results = (json?.results ?? []).slice(0, 8).map((r: any) => ({
+    title: String(r.title ?? ""),
+    url: String(r.url ?? ""),
+    snippet: stripWebHtml(String(r.content ?? "")),
+  }));
+  return {
+    query,
+    answer: String(json?.answer ?? ""),
+    abstract: "",
+    abstract_url: "",
+    related_topics: [],
+    results,
+    results_count: results.length,
+  };
 }
 
 async function fetchDuckDuckGoInstantAnswer(query: string, signal: AbortSignal): Promise<Record<string, any>> {
@@ -228,6 +355,6 @@ function normalizeWebUrl(rawUrl: string): string {
 }
 
 export function registerWebBundle(rt: ToolRuntime): void {
-  rt.register(WEB_SEARCH_DEF, (a) => toolWebSearch(a));
+  rt.register(WEB_SEARCH_DEF, (a, c) => toolWebSearch(a, c));
   rt.register(WEB_FETCH_DEF, (a) => toolWebFetch(a));
 }

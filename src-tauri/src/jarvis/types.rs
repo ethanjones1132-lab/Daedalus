@@ -42,6 +42,8 @@ pub struct JarvisConfig {
     pub claude_cli: ClaudeCliConfig,
     pub tools: ToolConfig,
     pub reasoning: ReasoningConfig,
+    #[serde(default)]
+    pub web_search: WebSearchConfig,
     pub companion: CompanionConfig,
     #[serde(default)]
     pub orchestrator: OrchestratorConfig,
@@ -81,6 +83,7 @@ impl Default for JarvisConfig {
             claude_cli: ClaudeCliConfig::default(),
             tools: ToolConfig::default(),
             reasoning: ReasoningConfig::default(),
+            web_search: WebSearchConfig::default(),
             companion: CompanionConfig::default(),
             orchestrator: OrchestratorConfig::default(),
             system_prompt: "You are Jarvis, a local AI assistant. Be concise and helpful."
@@ -352,6 +355,30 @@ pub struct ReasoningConfig {
     pub max_tokens: u32,
     #[serde(default)]
     pub backend: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WebSearchConfig {
+    #[serde(default = "default_web_search_provider")]
+    pub provider: String,
+    #[serde(default)]
+    pub brave_api_key: String,
+    #[serde(default)]
+    pub tavily_api_key: String,
+}
+
+fn default_web_search_provider() -> String {
+    "duckduckgo".to_string()
+}
+
+impl Default for WebSearchConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_web_search_provider(),
+            brave_api_key: String::new(),
+            tavily_api_key: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]

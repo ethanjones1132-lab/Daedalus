@@ -157,6 +157,17 @@ export interface ReasoningConfig {
   max_tokens: number;
 }
 
+export interface WebSearchConfig {
+  /**
+   * Search backend. `duckduckgo` is the keyless default and needs no config;
+   * `brave` and `tavily` are higher-quality but require an API key and fall
+   * back to DuckDuckGo when their key is missing or the request fails.
+   */
+  provider: "duckduckgo" | "brave" | "tavily";
+  brave_api_key: string;
+  tavily_api_key: string;
+}
+
 export interface CompanionConfig {
   enabled: boolean;
   name: string;
@@ -351,6 +362,7 @@ export interface JarvisConfig {
   claude_cli: ClaudeCliConfig;
   tools: ToolConfig;
   reasoning: ReasoningConfig;
+  web_search: WebSearchConfig;
   companion: CompanionConfig;
   orchestrator: OrchestratorConfig;
   /** Global system prompt override */
@@ -507,6 +519,11 @@ export function defaultConfig(): JarvisConfig {
       enabled: true,
       show_trace_by_default: false,
       max_tokens: 2048,
+    },
+    web_search: {
+      provider: "duckduckgo",
+      brave_api_key: "",
+      tavily_api_key: "",
     },
     companion: {
       enabled: true,

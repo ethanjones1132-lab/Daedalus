@@ -2,7 +2,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { defaultConfig } from "./config";
 import { createToolRuntime, makeExecutionContext } from "./tool-runtime";
 import type { ExecutionContext } from "./tool-runtime";
-import { registerWebBundle } from "./web-bundle";
+import { registerWebBundle, extractReadableContent, resolveSearchProvider, searchWeb } from "./web-bundle";
+import type { WebSearchConfig } from "./config";
 
 // Ported from the legacy tools.test.ts "web tools" suite — now exercised through
 // the canonical ToolRuntime instead of executeTool().
@@ -97,5 +98,61 @@ describe("web bundle", () => {
     expect(result.is_error).toBe(true);
     expect(result.error).toContain("Missing required argument");
     expect(requested).toBe(false);
+  });
+});
+
+describe("readability extraction", () => {
+  test("prefers the article region and drops nav/header/footer chrome", () => {
+    const html = `
+      <html><body>
+        <nav>Home About Contact NAVNOISE</nav>
+        <header>SITE HEADER NOISE</header>
+        <article><h1>Real Title</h1><p>The actual body content here.</p></article>
+        <footer>FOOTERNOISE copyright</footer>
+      </body></html>`;
+    const text = extractReadableContent(html);
+    expect(text).toContain("Real Title");
+    expect(text).toContain("The actual body content here.");
+    expect(text).not.toContain("NAVNOISE");
+    expect(text).not.toContain("SITE HEADER NOISE");
+    expect(text).not.toContain("FOOTERNOISE");
+  });
+
+  test("strips scripts and styles, falls back to body when no article", () => {
+    const html = `<body><script>evil()</script><style>.x{}</style><p>Plain page text.</p></body>`;
+    const text = extractReadableContent(html);
+    expect(text).toContain("Plain page text.");
+    expect(text).not.toContain("evil()");
+    expect(text).not.toContain(".x{}");
+  });
+});
+
+describe("search provider routing", () => {
+  const base: WebSearchConfig = { provider: "duckduckgo", brave_api_key: "", tavily_api_key: "" };
+
+  test("defaults to duckduckgo, and only uses a keyed provider when its key is present", () => {
+    expect(resolveSearchProvider(undefined)).toBe("duckduckgo");
+    expect(resolveSearchProvider(base)).toBe("duckduckgo");
+    expect(resolveSearchProvider({ ...base, provider: "brave" })).toBe("duckduckgo");
+    expect(resolveSearchProvider({ ...base, provider: "brave", brave_api_key: "k" })).toBe("brave");
+    expect(resolveSearchProvider({ ...base, provider: "tavily" })).toBe("duckduckgo");
+    expect(resolveSearchProvider({ ...base, provider: "tavily", tavily_api_key: "k" })).toBe("tavily");
+  });
+
+  test("a failing keyed provider falls back to duckduckgo rather than throwing", async () => {
+    let braveHit = false;
+    globalThis.fetch = (async (url: any) => {
+      const u = String(url);
+      if (u.includes("brave")) { braveHit = true; return new Response("nope", { status: 500 }); }
+      // DuckDuckGo fallback path.
+      return new Response(JSON.stringify({ Answer: "fallback-answer" }), {
+        status: 200, headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    const result = await searchWeb("q", { provider: "brave", brave_api_key: "k", tavily_api_key: "" });
+    expect(braveHit).toBe(true);
+    expect(result.provider).toBe("duckduckgo");
+    expect(result.answer).toBe("fallback-answer");
   });
 });

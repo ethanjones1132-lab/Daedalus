@@ -51,6 +51,7 @@ const KNOWN_SETTING_KEYS: &[&str] = &[
     "claude_cli",
     "tools",
     "reasoning",
+    "web_search",
     "companion",
     "orchestrator",
     "system_prompt",
@@ -181,6 +182,11 @@ pub fn load_jarvis_config_conn(conn: &rusqlite::Connection) -> Result<JarvisConf
     if let Some(v) = settings.get("reasoning") {
         if let Ok(parsed) = serde_json::from_str::<crate::jarvis::types::ReasoningConfig>(v) {
             config.reasoning = parsed;
+        }
+    }
+    if let Some(v) = settings.get("web_search") {
+        if let Ok(parsed) = serde_json::from_str::<crate::jarvis::types::WebSearchConfig>(v) {
+            config.web_search = parsed;
         }
     }
     if let Some(v) = settings.get("companion") {
@@ -320,6 +326,10 @@ pub fn persist_jarvis_config_conn(
         (
             "reasoning",
             serde_json::to_string(&config.reasoning).map_err(|e| e.to_string())?,
+        ),
+        (
+            "web_search",
+            serde_json::to_string(&config.web_search).map_err(|e| e.to_string())?,
         ),
         (
             "companion",
@@ -635,6 +645,26 @@ mod tests {
             vec!["C:\\Projects\\one", "D:\\Data", "E:\\Archive"]
         );
         assert!(round_trip.tools.grant_session_roots);
+    }
+
+    #[test]
+    fn web_search_settings_default_when_absent_and_survive_round_trip() {
+        // Projection trap again: web_search is a new key. A legacy config JSON
+        // (no web_search block) must deserialize to the keyless DuckDuckGo
+        // default, and a configured provider + key must survive persist/reload.
+        let db = mem_db();
+        let cfg = load_jarvis_config(&db).expect("load config");
+        assert_eq!(cfg.web_search.provider, "duckduckgo");
+        assert_eq!(cfg.web_search.brave_api_key, "");
+
+        let mut cfg = cfg;
+        cfg.web_search.provider = "brave".to_string();
+        cfg.web_search.brave_api_key = "brave-key".to_string();
+        persist_jarvis_config(&db, &cfg).expect("persist config");
+
+        let round_trip = load_jarvis_config(&db).expect("reload config");
+        assert_eq!(round_trip.web_search.provider, "brave");
+        assert_eq!(round_trip.web_search.brave_api_key, "brave-key");
     }
 
     #[test]
