@@ -162,6 +162,7 @@ export interface DelegateEligibilityInput {
 export type DelegateIneligibilityReason =
   | "claude_cli_disabled"
   | "delegate_disabled"
+  | "subscription_mode"
   | "profile"
   | "write_not_required"
   | "cooldown"
@@ -173,6 +174,13 @@ export function delegateEligibility(
 ): { eligible: true } | { eligible: false; reason: DelegateIneligibilityReason } {
   if (!input.config.claude_cli.enabled) return { eligible: false, reason: "claude_cli_disabled" };
   if (!input.config.claude_cli.delegate.enabled) return { eligible: false, reason: "delegate_disabled" };
+  // Free-routing imperative: the delegate is an AUTOMATED path, so it must never
+  // select subscription mode — that bypasses the local proxy and spends the
+  // user's Claude quota. Subscription stays a manual, interactive opt-in; here
+  // it makes the delegate ineligible and the free native local loop runs instead.
+  if (input.config.claude_cli.auth_mode !== "proxy") {
+    return { eligible: false, reason: "subscription_mode" };
+  }
   if (input.profile !== "full") return { eligible: false, reason: "profile" };
   if (!input.writeEffectRequired) return { eligible: false, reason: "write_not_required" };
   if (!input.healthAvailable) return { eligible: false, reason: "cooldown" };

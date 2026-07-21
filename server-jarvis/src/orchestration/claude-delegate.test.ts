@@ -48,6 +48,55 @@ describe("Claude executor delegate", () => {
     expect(delegateEligibility({ ...base, nativeNoWrite: true })).toEqual({ eligible: true });
   });
 
+  test("refuses subscription mode so the automated delegate never spends Claude quota", () => {
+    // Free-routing imperative: the delegate is automated, so subscription mode
+    // (which bypasses the local proxy and bills the user's Anthropic quota) must
+    // make it ineligible — the free native local loop runs instead. Subscription
+    // remains a manual, interactive opt-in; it is never auto-selected here.
+    const config = defaultConfig();
+    config.claude_cli.auth_mode = "subscription";
+    const base = {
+      config,
+      profile: "full" as const,
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      healthAvailable: true,
+      allowedRoots: ["C:\\repo"],
+    };
+    expect(delegateEligibility(base)).toEqual({ eligible: false, reason: "subscription_mode" });
+
+    config.claude_cli.auth_mode = "proxy";
+    expect(delegateEligibility(base)).toEqual({ eligible: true });
+  });
+
+  test("proxy-mode spawn env is routed to the local proxy and carries no real credential", () => {
+    // The single regression that would silently route to Anthropic is a spawn
+    // env missing the local BASE_URL (or leaking a real key). Pin both: the CLI
+    // this invocation launches can only reach 127.0.0.1:19878, and --bare is
+    // present so the CLI restricts auth to the (dummy) key we inject.
+    const config = defaultConfig();
+    expect(config.claude_cli.auth_mode).toBe("proxy");
+    const invocation = buildClaudeDelegateInvocation({
+      config,
+      prompt: "make the change",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\primary"],
+      stageRemainingMs: 500_000,
+      executable: "claude",
+      baseEnv: {
+        PATH: "test-path",
+        ANTHROPIC_API_KEY: "real-secret-should-be-dropped",
+        ANTHROPIC_BASE_URL: "https://api.anthropic.com",
+        CLAUDE_CODE_OAUTH_TOKEN: "real-oauth-should-be-dropped",
+      },
+    });
+
+    expect(invocation.env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:19878");
+    expect(invocation.env.ANTHROPIC_API_KEY).not.toBe("real-secret-should-be-dropped");
+    expect(invocation.env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    expect(invocation.args).toContain("--bare");
+  });
+
   test("builds only installed stock-CLI flags, auth environment, and P0 root cwd", () => {
     const config = defaultConfig();
     config.claude_cli.auth_mode = "subscription";
