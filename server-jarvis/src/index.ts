@@ -2974,6 +2974,18 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             run_id: agentRunId,
           })}\n\n`));
         }
+        // P5.1: routing source/model/latency previously required cross-referencing
+        // console.log lines with the conductor_runs table by hand to diagnose
+        // (the exact friction hit while diagnosing F1/F2). Emit it as a normal
+        // frame on every turn, not only the rare parse-fallback case.
+        await writer.write(encoder.encode(`data: ${JSON.stringify({
+          type: "conductor_info",
+          source: route.conductor_source ?? "api",
+          model: route.conductor_model,
+          latency_ms: coordinatorDurationMs,
+          session_id: sessionId,
+          run_id: agentRunId,
+        })}\n\n`));
         const conductorRunId = conductorLearning.recordRouting({
           agentRunId,
           sessionId,
@@ -2982,6 +2994,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           routeSource: normalized.route_source,
           conductorSource: route.conductor_source ?? "api",
           conductorModel: route.conductor_model,
+          latencyMs: coordinatorDurationMs,
         });
         if (!shortCircuit) {
           const coordinatorSucceeded = !route.routing_parse_fallback;
@@ -5000,6 +5013,25 @@ export async function baseFetch(req: Request): Promise<Response> {
     if (path === "/status" && (req.method === "GET" || req.method === "POST")) {
       const body = req.method === "POST" ? await req.json().catch(() => ({})) : {};
       return Response.json(await checkStatus(body.config));
+    }
+    // P5.3d: "what did this session open?" had no answer surface — session
+    // grants (absolute filesystem roots granted from a raw message,
+    // workspace-grants.ts) persisted in the task-run contract but were never
+    // exposed. Read + narrow revoke (does not touch other session memory).
+    if (path === "/session/grants" && req.method === "GET") {
+      const sessionId = new URL(req.url).searchParams.get("session_id");
+      if (!sessionId) return Response.json({ error: "session_id required" }, { status: 400 });
+      return Response.json({ session_id: sessionId, grants: sessionMemory.getSessionGrants(sessionId) });
+    }
+    if (path === "/session/grants/revoke" && req.method === "POST") {
+      const body = await req.json().catch(() => ({}));
+      const sessionId = typeof body.session_id === "string" ? body.session_id : "";
+      const root = typeof body.root === "string" ? body.root : "";
+      if (!sessionId || !root) {
+        return Response.json({ error: "session_id and root are required" }, { status: 400 });
+      }
+      const grants = sessionMemory.revokeSessionGrant(sessionId, root);
+      return Response.json({ session_id: sessionId, grants });
     }
     if (path === "/skills" && req.method === "GET") return Response.json(loadSkills());
     if (path === "/tools" && req.method === "GET") return Response.json(loadTools());

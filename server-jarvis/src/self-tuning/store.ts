@@ -103,6 +103,9 @@ export interface ConductorRun {
   normalized_pipeline_json?: string;
   route_source?: string;
   run_outcome?: string;
+  /** Wall-clock time the routing decision itself took, covering every path
+   *  (local conductor, API coordinator, deterministic, trivial). */
+  latency_ms?: number;
   created_at?: string;
 }
 
@@ -328,6 +331,7 @@ const SELF_TUNING_SCHEMA = `
     normalized_pipeline_json TEXT,
     route_source TEXT,
     run_outcome TEXT,
+    latency_ms INTEGER,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   );
   CREATE INDEX IF NOT EXISTS idx_conductor_runs_agent_run_id ON conductor_runs(agent_run_id);
@@ -478,6 +482,11 @@ export class SelfTuningStore {
         } catch { /* column already exists */ }
         try {
           db.exec(`ALTER TABLE stage_runs ADD COLUMN partial_error_code TEXT`);
+        } catch { /* column already exists */ }
+        // P5.1: conductor routing latency was only ever a console.log line —
+        // querying "how long did routing take" always meant grepping logs.
+        try {
+          db.exec(`ALTER TABLE conductor_runs ADD COLUMN latency_ms INTEGER`);
         } catch { /* column already exists */ }
         schemaEnsuredPaths.add(dbPath);
       }
@@ -712,8 +721,8 @@ export class SelfTuningStore {
     if (!db) return;
     try {
       db.prepare(
-        `INSERT INTO conductor_runs (id, agent_run_id, session_id, routing_json, conductor_source, conductor_model, task_type, topology, pipeline_json, normalized_pipeline_json, route_source, run_outcome)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO conductor_runs (id, agent_run_id, session_id, routing_json, conductor_source, conductor_model, task_type, topology, pipeline_json, normalized_pipeline_json, route_source, run_outcome, latency_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         run.id,
         run.agent_run_id,
@@ -727,6 +736,7 @@ export class SelfTuningStore {
         run.normalized_pipeline_json ?? null,
         run.route_source ?? null,
         run.run_outcome ?? null,
+        run.latency_ms ?? null,
       );
     } catch (e) {
       console.error("[SelfTuningStore] insertConductorRun failed:", e);

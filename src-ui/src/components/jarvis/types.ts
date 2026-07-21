@@ -54,16 +54,40 @@ export interface JarvisConfig {
     timeout_ms: number;
     cwd: string;
     model?: string;
+    /** "proxy" (default, free — routes through the local claude_cli_proxy to
+     *  Ollama/OpenRouter) vs "subscription" (bypasses the proxy, talks to
+     *  Anthropic directly, and spends the user's Claude quota). */
+    auth_mode: 'proxy' | 'subscription';
+    delegate: {
+      enabled: boolean;
+      policy: 'delegate_first' | 'escalation';
+      permission_mode: string;
+      allowed_tools: string[];
+      model: string;
+      timeout_ms: number;
+    };
   };
   tools: {
     enabled: boolean;
     require_approval: string[];
     sandbox_mode: 'strict' | 'permissive' | 'off';
+    allowlist: string[];
+    denylist: string[];
+    allowed_roots: string[];
+    grant_session_roots: boolean;
+    /** Explicit bash interpreter path; empty = auto-resolve (Git Bash on Windows). */
+    bash_path: string;
+    shell_timeout_max_ms: number;
   };
   reasoning: {
     enabled: boolean;
     show_trace_by_default: boolean;
     max_tokens: number;
+  };
+  web_search: {
+    provider: 'duckduckgo' | 'brave' | 'tavily';
+    brave_api_key: string;
+    tavily_api_key: string;
   };
   companion: {
     enabled: boolean;
@@ -226,6 +250,23 @@ export interface JarvisSkill {
   source: string;
   usage_count: number;
   last_used?: string;
+}
+
+/** `.mcp.json` entry shape, mirrored from `src-tauri/src/commands/mcp.rs::McpServerEntry`. */
+export interface McpServerEntry {
+  command?: string;
+  args: string[];
+  env: Record<string, string>;
+  cwd?: string;
+  url?: string;
+  disabled: boolean;
+  type?: string;
+}
+
+export type McpServerMap = Record<string, McpServerEntry>;
+
+export function emptyMcpServerEntry(): McpServerEntry {
+  return { args: [], env: {}, disabled: false };
 }
 
 export interface JarvisTool {

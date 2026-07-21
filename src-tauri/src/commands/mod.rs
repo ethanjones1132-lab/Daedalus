@@ -48,3 +48,7 @@ pub use legacy::*;
 
 pub mod recovery_stubs;
 pub use recovery_stubs::*;
+
+// MCP server config command handlers (.mcp.json read/write)
+pub mod mcp;
+pub use mcp::*;

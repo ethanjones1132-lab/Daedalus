@@ -22,6 +22,8 @@ export interface RoutingRecordInput {
   routeSource?: string;
   conductorSource: "local" | "api" | "trivial" | "continuation_reuse" | "deterministic";
   conductorModel?: string;
+  /** Wall-clock time the routing decision itself took (any path). */
+  latencyMs?: number;
 }
 
 export interface RunCompletionInput {
@@ -84,6 +86,7 @@ export class ConductorLearningLoop {
       pipeline_json: JSON.stringify(input.route.pipeline),
       normalized_pipeline_json: JSON.stringify(input.normalizedPipeline),
       route_source: input.routeSource,
+      latency_ms: input.latencyMs,
     });
     this.pendingAttributions.set(input.agentRunId, []);
     return id;

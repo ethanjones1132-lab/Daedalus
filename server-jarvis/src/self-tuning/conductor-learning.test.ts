@@ -50,6 +50,7 @@ describe("Conductor learning (Phase 4)", () => {
       routeSource: "model",
       conductorSource: "local",
       conductorModel: "gemma4:e2b",
+      latencyMs: 2770,
     });
 
     loop.recordStageModel({
@@ -108,6 +109,8 @@ describe("Conductor learning (Phase 4)", () => {
     });
 
     expect(store.getConductorRuns("run_p4")[0].run_outcome).toBe("success");
+    // P5.1: routing latency was only ever a console.log line, never queryable.
+    expect(store.getConductorRuns("run_p4")[0].latency_ms).toBe(2770);
     expect(store.getModelAttributions("run_p4")).toHaveLength(1);
     expect(store.getModelAttributions("run_p4")[0].first_token_ms).toBe(275);
     expect(store.getTrajectorySnapshots(1)).toHaveLength(1);

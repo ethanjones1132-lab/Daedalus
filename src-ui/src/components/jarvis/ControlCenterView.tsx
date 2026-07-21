@@ -23,6 +23,7 @@ import {
   EmptyState,
   useToast,
 } from '../ui';
+import McpPanel from './McpPanel';
 
 // ── Types (mirror the Rust command return shapes) ──────────────
 
@@ -95,12 +96,13 @@ interface DoctorReport {
   timestamp: string;
 }
 
-type Tab = 'overview' | 'profiles' | 'diagnostics';
+type Tab = 'overview' | 'profiles' | 'diagnostics' | 'mcp';
 
 const TABS: Array<{ id: Tab; label: string }> = [
   { id: 'overview', label: 'Overview' },
   { id: 'profiles', label: 'Profiles' },
   { id: 'diagnostics', label: 'Diagnostics' },
+  { id: 'mcp', label: 'MCP' },
 ];
 
 // ── Helpers ────────────────────────────────────────────────────
@@ -359,7 +361,7 @@ export default function ControlCenterView() {
               ))}
             </ul>
           )
-        ) : (
+        ) : tab === 'diagnostics' ? (
           // ── Diagnostics ──
           <div className="space-y-3">
             {health ? (
@@ -469,6 +471,8 @@ export default function ControlCenterView() {
               </GlassCard>
             )}
           </div>
+        ) : (
+          <McpPanel />
         )}
       </div>
     </div>
