@@ -85,6 +85,62 @@ function newTaskRunId(): string {
   return `task_${crypto.randomUUID()}`;
 }
 
+// 2026-07-21 (F5): isWorkOrderFollowup is deliberately topic-agnostic — any
+// short, non-question message during a live task IS a work order, by design
+// (see the comment above isWorkOrderFollowup). That is correct for bare
+// continuation cues ("go", "continue", "re-execute") which carry no topic of
+// their own to compare. It is NOT correct once the message is substantial
+// enough to express its own distinct objective: a live repro against a
+// PAUSED (incomplete/partial) task run showed an unrelated new request
+// ("create a different file in a different directory") being classified as a
+// continuation and inheriting the previous, unrelated objective verbatim —
+// which then got injected into the new turn's context ("[In-progress task]
+// Objective: ...") and drove the executor to attempt the stale sub-task.
+//
+// This gate only applies to the isWorkOrderFollowup branch of the
+// continuation OR-condition; isContinuationTurn (the narrow, explicit
+// continuation-phrase list) is untouched — bare cues always continue.
+const GENERIC_FOLLOWUP_MAX_CHARS = 48;
+const OBJECTIVE_STOPWORDS = new Set([
+  "this", "that", "with", "from", "into", "onto", "then", "just", "please",
+  "also", "using", "make", "makes", "made", "have", "having", "does", "each",
+  "your", "will", "would", "could", "should", "about", "which", "there",
+]);
+
+function significantTokens(text: string): Set<string> {
+  return new Set(
+    text
+      .toLowerCase()
+      .split(/[^a-z0-9_./\\-]+/i)
+      .filter((tok) => tok.length >= 4 && !OBJECTIVE_STOPWORDS.has(tok)),
+  );
+}
+
+/**
+ * Whether `message` plausibly continues `objective`'s topic. A short/generic
+ * message (<=48 chars — "go", "continue", "re-execute", "please apply the
+ * edits") has no topic of its own to conflict with, so it passes through
+ * unconditionally — that preserves the bare-continuation use case this
+ * heuristic exists for. A longer, substantial message must share at least one
+ * significant token (>=4 chars, path-like tokens included) with the previous
+ * objective; otherwise it is treated as an unrelated new request rather than
+ * a continuation, so its own objective is not silently discarded.
+ */
+export function sharesObjectiveSignal(objective: string, message: string): boolean {
+  const trimmedMessage = message.trim();
+  if (trimmedMessage.length <= GENERIC_FOLLOWUP_MAX_CHARS) return true;
+  const objectiveTokens = significantTokens(objective);
+  const messageTokens = significantTokens(trimmedMessage);
+  // Fail open when there is nothing concrete to compare — do not regress a
+  // case this heuristic previously admitted just because both sides happen
+  // to be token-poor.
+  if (objectiveTokens.size === 0 || messageTokens.size === 0) return true;
+  for (const token of messageTokens) {
+    if (objectiveTokens.has(token)) return true;
+  }
+  return false;
+}
+
 export function createTaskRun(input: CreateTaskRunInput): TaskRunContract {
   const now = new Date().toISOString();
   return {
@@ -122,7 +178,9 @@ export function resolveTaskRunTurn(
   // write intent) is lost.
   const continuation = previousLive && (
     isContinuationTurn(message) ||
-    (previous!.requirement === "full_execution" && isWorkOrderFollowup(message))
+    (previous!.requirement === "full_execution" &&
+      isWorkOrderFollowup(message) &&
+      sharesObjectiveSignal(previous!.objective, message))
   );
 
   if (continuation && previous) {

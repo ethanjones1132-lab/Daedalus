@@ -318,6 +318,53 @@ describe("task-run > resolveTaskRunTurn", () => {
     expect(result.contract.sessionId).toBe("sess_new");
     expect(result.contract.workspacePath).toBe("/new/path");
   });
+
+  // F5 (2026-07-21): a paused (incomplete/partial) task-run's objective was
+  // leaking into the NEXT unrelated turn's context. Root cause verified by
+  // direct repro against these exact functions: isWorkOrderFollowup accepts
+  // ANY short (<=160 char), non-question message as a "work order followup"
+  // during a live (active/paused) full_execution task, with no check that the
+  // new message has anything to do with the previous objective. A partial
+  // Get-Date turn's objective was inherited verbatim by a wholly unrelated
+  // "create this other file" turn two turns later, and the stale objective
+  // was injected into that turn's context ("[In-progress task] Objective: ...
+  // Get-Date..."), causing the executor to attempt the stale sub-task.
+  test("F5 repro: an unrelated substantial follow-up after a PAUSED task does NOT inherit the stale objective", () => {
+    const prev: TaskRunContract = {
+      ...makeTaskRun({
+        objective: "Use the powershell tool to run the command Get-Date and report the current date and time it returns.",
+      }),
+      status: "paused",
+      lastOutcome: "outcome=partial",
+    };
+    const unrelated =
+      "In C:\\Users\\ethan\\Downloads\\Perihelion, create a new file named SHOULD_NOT_EXIST.md containing the word test. Use a write tool.";
+    const result = resolveTaskRunTurn(prev, unrelated, "full_execution");
+    expect(result.isContinuation).toBe(false);
+    expect(result.contract.objective).toBe(unrelated);
+    expect(result.contract.objective).not.toContain("Get-Date");
+  });
+
+  test("F5 fix preserves bare continuation phrases (go/continue/re-execute) regardless of topic", () => {
+    const prev: TaskRunContract = {
+      ...makeTaskRun({ objective: "Use the powershell tool to run the command Get-Date." }),
+      status: "paused",
+    };
+    for (const msg of ["re-execute", "go", "do it", "Please apply the edits oh my goodness"]) {
+      const result = resolveTaskRunTurn(prev, msg, "full_execution");
+      expect(result.isContinuation).toBe(true);
+    }
+  });
+
+  test("F5 fix preserves a genuine same-topic follow-up that shares a token with the objective", () => {
+    const prev: TaskRunContract = {
+      ...makeTaskRun({ objective: "Read src/foo.ts and summarize what the exported function does." }),
+      status: "paused",
+    };
+    const followup = "Now also add a unit test for the exported function in src/foo.ts covering the empty-input case.";
+    const result = resolveTaskRunTurn(prev, followup, "full_execution");
+    expect(result.isContinuation).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
