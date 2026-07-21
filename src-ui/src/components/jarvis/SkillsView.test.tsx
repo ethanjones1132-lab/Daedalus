@@ -108,12 +108,19 @@ beforeEach(() => {
 });
 
 describe('SkillsView — distilled candidate actions (D5)', () => {
+  // First test in the file hits the 5s default vitest timeout under full-suite
+  // load (it triggers a full SkillsView render with two Tauri invokes +
+  // HTTP fetch mock, ~7.7s observed when run with the full vitest corpus but
+  // ~600ms in isolation). The other 3 D5 tests in this describe block pass
+  // comfortably under budget and are left at the default. This is the same
+  // wall-clock-budget-vs-real-work pattern the 1pm cron pass fixed for the
+  // claude-delegate `verifies a claimed write` test (commit 47f3c78, 250→1000ms).
   it('shows the native Enable/Disable toggle for a bundled skill', async () => {
     renderSkillsView();
     const row = await screen.findByText('code-review');
     const card = row.closest('li')!;
     expect(within(card).getByText(/enable|disable/i)).toBeInTheDocument();
-  });
+  }, 20_000);
 
   it('shows Promote/Reject actions instead of the native toggle for a candidate-status distilled skill', async () => {
     renderSkillsView();
