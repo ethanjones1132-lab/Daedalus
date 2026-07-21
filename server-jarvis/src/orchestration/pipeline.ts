@@ -1,13 +1,14 @@
 import { loadPrompt } from "./prompt-loader";
 import { defaultCapabilityIndex } from "../tool-capabilities-default";
 import { deriveEvidenceTaskKind } from "./turn-requirements";
+import { injectToolGuidelines } from "./tool-guidelines";
 import { BUILTIN_MODES, executorTurnLimit, getToolsForMode } from "./modes";
 import { toolResultModelText, type ToolRuntime, type ExecutionContext } from "../tool-runtime";
 import type { CallModelFn, ChatMessage } from "./router";
 import type { SharedContextHints, StageName, WorkerInstructions } from "./coordinator";
 import type { SessionMemory } from "./session-memory";
 import { resolveStagePrompt, stagePromptFile } from "./worker-prompt";
-import type { ToolCall, ToolResult } from "../tool-types";
+import type { ToolCall, ToolDefinition, ToolResult } from "../tool-types";
 import { outcomeCollector } from "../self-tuning/mod";
 import type { StageRun } from "../self-tuning/store";
 import { countTokens } from "../tokens";
@@ -597,14 +598,19 @@ export function describePipelineError(raw: string): string {
 function stageSystemPrompt(
   stage: StageName,
   options: PipelineExecuteOptions & { pendingInjections?: Map<StageName, string[]> },
+  stageTools: ToolDefinition[] = [],
 ): string {
   const skillsBlock = stage === "planner" || stage === "executor"
     ? options.distilledSkillsBlock
     : undefined;
   const injectedNotes = options.pendingInjections?.get(stage);
+  // Prompt truth: render the `{{TOOL_GUIDELINES}}` marker (if present) from the
+  // exact tools this stage will be given, before conductor/shared-context
+  // wrapping. A prompt without the marker is untouched.
+  const basePrompt = injectToolGuidelines(loadPrompt(stagePromptFile(stage)), stageTools);
   return resolveStagePrompt(
     stage,
-    loadPrompt(stagePromptFile(stage)),
+    basePrompt,
     options.workerInstructions,
     options.sharedContext,
     skillsBlock,
@@ -1082,7 +1088,11 @@ export class PipelineExecutor {
     const successfulWriteCount = () =>
       toolCalls.filter((call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name)).length;
     const deepReadRequest = resolveDeepReadIntent(intentText, options.taskRunDepth);
-    const executorPrompt = stageSystemPrompt("executor", options);
+    const executorPrompt = stageSystemPrompt(
+      "executor",
+      options,
+      getToolsForMode("executor", this.runtime.listTools(), profile),
+    );
     const executorEvidence = (): ConductorStageEvidence => ({
       toolCalls,
       request: options.rawMessage ?? request,
@@ -2106,7 +2116,11 @@ export class PipelineExecutor {
     profile: ExecutionProfile,
     remainingQueue: StageName[] = [],
   ): Promise<RewriterStageOutput> {
-    const rewriterPrompt = stageSystemPrompt("rewriter", options);
+    const rewriterPrompt = stageSystemPrompt(
+      "rewriter",
+      options,
+      getToolsForMode("rewriter", this.runtime.listTools(), profile),
+    );
     const boundedReviewerFeedback = truncateToTokenBudget(reviewerFeedback, 2_000);
     const boundedExecutorSummary = truncateToTokenBudget(executorSummary, 3_000);
     const rewriterMessages: ChatMessage[] = [
@@ -2298,7 +2312,11 @@ export class PipelineExecutor {
     profile: ExecutionProfile,
     remainingQueue: StageName[] = [],
   ): Promise<{ reviewer: ReviewerStageOutput; rewriter?: RewriterStageOutput }> {
-    const reviewerPrompt = stageSystemPrompt("reviewer", options);
+    const reviewerPrompt = stageSystemPrompt(
+      "reviewer",
+      options,
+      getToolsForMode("reviewer", this.runtime.listTools(), profile),
+    );
     const boundedRequest = truncateToTokenBudget(request, 1_000);
     const boundedPlanSummary = truncateToTokenBudget(planSummary, 1_000);
     const boundedExecutorSummary = truncateToTokenBudget(executorSummary, 3_000);
@@ -3399,7 +3417,11 @@ export class PipelineExecutor {
     onStateChange: (state: PipelineProgressState) => void,
     options: PipelineExecuteOptions,
   ): Promise<PipelineResult> {
-    const executorPrompt = stageSystemPrompt("executor", options);
+    const executorPrompt = stageSystemPrompt(
+      "executor",
+      options,
+      getToolsForMode("executor", this.runtime.listTools(), options.executionProfile ?? "full"),
+    );
     const cheapOutput = await this.runModelOnlyStage({
       stage: "executor",
       prompt: executorPrompt,

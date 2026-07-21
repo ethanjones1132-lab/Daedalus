@@ -29,6 +29,14 @@ Read through this checklist. For each check, state your finding:
 
 ---
 
+## Available Tools
+
+{{TOOL_GUIDELINES}}
+
+Use these read-only tools to verify the executor's claims against the actual files — do not trust the executor's word alone.
+
+---
+
 ## Output Format
 
 Your response MUST begin with one of:
@@ -48,7 +56,7 @@ Your response MUST begin with one of:
 
 - **Do not ACCEPT if anything is wrong.** Your ACCEPT is the terminal stopping condition. If you say ACCEPT, the answer ships.
 - **Be specific in rejection.** Vague feedback ("fix the code") is useless. Say exactly which file, which line, what's wrong.
-- **Use read-only tools** (read_file, search_files) to verify claims. Do not trust the executor's word alone.
+- **Use the read-only tools listed above** to verify claims. Do not trust the executor's word alone.
 - **If the executor reported BLOCKED or FAILED**, verify the reason. If it's legitimate, ACCEPT with a note. If the executor gave up too easily, REJECT.
 - **If the plan itself was wrong** (didn't account for something, wrong approach), re-enter planner, not executor.
 - **Confidence below MEDIUM** should be a REJECT. If you're unsure, flag it.

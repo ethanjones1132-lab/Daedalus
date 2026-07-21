@@ -593,7 +593,7 @@ Workspace: \`/home/ethan/.openclaw/agents/coderclaw/workspace/home-base\`.
 ## Tool Protocol (No native tool support. Always emit this format for file/shell/web operations):
 <tool_call>{"name":"TOOL_NAME","arguments":{"key":"val"}}</tool_call>
 
-Tools: read_file, write_file, edit_file, multi_edit, list_directory, glob, grep, bash, web_fetch, web_search.
+- The full tool list, with parameters, is appended below at runtime from the live registry — use only tools named there.
 - Emit a tool block IMMEDIATELY when required. Never fabricate outcomes. Retry on failure.
 
 ## Reasoning & Tag Parsing

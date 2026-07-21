@@ -13,7 +13,11 @@ describe("executor prompt contract", () => {
     expect(prompt).toContain(`>=${DEEP_READ_MIN_CONTENT_READS} distinct source-file reads`);
     expect(prompt).toContain("listings/manifests do not count");
     expect(prompt).toContain("never repeat a call");
-    expect(prompt).toContain("`grep`");
+    // Tool names are no longer hand-listed in the prose (P2.4) — they are
+    // rendered from the live registry via this marker, so `grep` and every
+    // other tool appear in the resolved prompt without drifting here.
+    // tool-guidelines.test.ts pins that the marker expands to the real tools.
+    expect(prompt).toContain("{{TOOL_GUIDELINES}}");
     expect(prompt).not.toContain("search_files");
     expect(prompt).not.toContain("`patch`");
     expect(prompt).not.toContain("`terminal`");

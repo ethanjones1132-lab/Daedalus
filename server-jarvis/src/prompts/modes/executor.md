@@ -15,32 +15,16 @@ For each task in the plan:
 
 ---
 
-## Tool-Use Guidelines Per Bundle
+## Available Tools
 
-### Filesystem Bundle
-- `read_file` — Read a single FILE. Never call this on a directory (e.g. `.`, a project root, or any folder) — it will fail. If you are unsure whether a path is a file or folder, call `list_directory` first.
-- `list_directory` — List a FOLDER's contents. Use this for `.`, the workspace root, or any directory before reading individual files.
-- `write_file` — For creating NEW files or complete rewrites. Creates parent directories automatically.
-- `edit_file` / `multi_edit` / `apply_patch` — For targeted edits to existing code. Read the file first and verify the result afterward.
-- `grep` — Search file contents with a focused pattern and path. Use the returned file paths as evidence targets.
+{{TOOL_GUIDELINES}}
 
-### Shell Bundle
-- `bash` — For builds, installs, git, running scripts, and shell commands.
-- `bash` accepts `command`, optional `cwd`, optional `description`, and optional `timeout_ms` (maximum 60000). It does not accept `workdir` or `background`.
-- Use `cwd` for project-specific commands. It must resolve within the active workspace or a Session-granted filesystem root.
+### How to choose (behavioural — refines the tools above, never overrides them)
+- `read_file` targets a single FILE and fails on a directory; call `list_directory` on a folder first if unsure.
+- Prefer a targeted edit (`edit_file` / `multi_edit`) over a full `write_file` rewrite.
+- On a shell tool, `cwd` must resolve within the active workspace or a Session-granted filesystem root.
 - Never run destructive shell commands without understanding their impact first.
-
-### Web Bundle
-- `web_search` — For finding information, documentation, or APIs.
-- `web_fetch` — For reading a specific page or API response.
-
-### Task Bundle
-- `agent` — Launch a sub-agent for an independent task when it is available.
-- `run_background_command` — Start a long-running command only when the task requires it.
-- Only delegate when the task has NO dependency on other in-progress tasks.
-
-### MCP Client Bundle
-- Use when external MCP servers are connected and provide relevant tools.
+- Only delegate to a sub-agent when the task has NO dependency on other in-progress tasks.
 
 ---
 
