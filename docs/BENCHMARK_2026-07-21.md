@@ -92,6 +92,35 @@ Codegen 5–20× slower (35–116s vs ~5s). Agentic worse: 37–268s per turn vs
 4. **Keep the resilience wins** — retry-on-empty and multi-turn execution are the
    demonstrated value; do not regress them while fixing the edit path.
 
+## Post-fix re-run (same day, deploy `ba953a1`)
+
+The three recommendations above were implemented and the agentic suite re-run (same
+model, K=3):
+
+| Task | Baseline | Architecture (before) | **Architecture (after fixes)** |
+|---|---|---|---|
+| binary_search | 3/3 | 2/3 | **3/3** |
+| is_leap_year | 3/3 | 0/3 | **3/3** |
+| flatten | 3/3 | 1/3 | **3/3** |
+| rotate_right | 0/3 | 3/3 | **3/3** |
+| **Total** | **9/12** | **6/12** | **12/12** |
+
+**The architecture went from *below* baseline (6/12) to *above* it (12/12).** Verified
+real: the `is_leap_year` file that previously shipped `... == 0) rule` (SyntaxError) is
+now a clean full-line rewrite; `rewriter` stages fired (the syntax gate engaged and
+reopened the repair loop), while most turns produced clean code directly (the small-file
+full-rewrite guidance avoided the corruption up front — only 2 rewrites needed across 12
+turns). The `rotate_right` resilience win (3/3 vs baseline 0/3 empties) is preserved.
+
+The large deltas (`is_leap_year` 0→3, `flatten` 1→3) are unambiguous, not noise;
+`binary_search` 2→3 is within sample variance. Latency is unchanged (60–177s/task) — the
+fixes closed the correctness pitfall, not the speed one.
+
+**Net:** with the fixes, the architecture now performs at-or-above the single-shot
+baseline on both codegen (9/9) and agentic edits (12/12 vs 9/12), keeping its resilience
+edge — a clean instance of benchmark-driven improvement (found a pitfall → targeted fix →
+re-benchmark confirmed).
+
 ## Caveats
 
 - Free local/remote models (deepseek-flash, gemma) — a stronger executor would likely
