@@ -61,3 +61,5 @@ scripts/update-priorities-*.py
 scripts/insert-priorities-*.py
 scripts/pin-first-token-timeout-telemetry.py
 scripts/loosen-claude-delegate-timeout.py
+scripts/jarvis-2026-07-21-evening-flake-pin.py
+scripts/_inspect-bs.py

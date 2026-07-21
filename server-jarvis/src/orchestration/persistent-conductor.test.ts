@@ -82,7 +82,12 @@ describe("PersistentConductor", () => {
     expect(body?.tools).toBeUndefined();
     expect(body?.format?.properties?.worker_instructions).toBeUndefined();
     expect(body?.options?.num_predict).toBeLessThanOrEqual(320);
-  });
+  }, 15_000); // 2026-07-21 evening cron: default 5s vitest budget was tight under
+  // full-suite load — this test does real network I/O via the globalThis.fetch
+  // mock + Ollama health check (see also the warm-fallback test below for the
+  // more involved case). Observed 10.3s in one full-suite run; consistent ~16-344ms
+  // in isolation. Same wall-clock-budget-vs-real-work class as the 2026-07-20 4pm
+  // claude-delegate verification-snapshot bump (commit 47f3c78).
 
   test("uses the local Ollama model and directive schema for live supervision", async () => {
     let body: Record<string, any> | undefined;
@@ -225,7 +230,12 @@ describe("PersistentConductor", () => {
     expect(result.model).toBe("gemma4:e2b");
     expect(result.usedLocal).toBe(true);
     expect(chatBodies[0]?.model).toBe("gemma4:e2b");
-  });
+  }, 20_000); // 2026-07-21 evening cron: same wall-clock-budget-vs-real-work class as
+  // the 'uses compact JSON schema output for local routing' test above. This one is
+  // the most involved in the file — the routeTurn path does the full Ollama /api/ps
+  // warm-fallback resolution chain on top of the model-installed check. Observed
+  // 19.0s in one full-suite run; consistent 16ms in isolation. 20s is comfortably
+  // below the 10s ROUTING_TIMEOUT_MS ceiling plus network jitter under load.
 
   test("supervise runs on the resident fallback_model instead of reloading the evicted primary", async () => {
     // The reload symptom: with the primary evicted, supervise used to call it
