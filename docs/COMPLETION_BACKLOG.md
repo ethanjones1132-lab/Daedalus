@@ -85,6 +85,32 @@ checking off.
   `app.emit`. *Verified:* 10 unit tests cover token/reasoning/stage/error/result-
   suppression/`[DONE]`/malformed frames; `cargo test --lib` 31 pass.
 
+## Follow-up backlog (from the P0–P3 orchestration-frontier work, 2026-07-20)
+
+These are UI/enablement surfaces for capabilities whose runtime + config now
+exist and are tested; each is a settings-view affordance, not a code gap.
+
+- [ ] **Search-provider keys UI.** `config.web_search { provider, brave_api_key,
+  tavily_api_key }` is live (Bun + Rust projection, DDG fallback) but only
+  editable by hand-writing config JSON. Add a Control-view field to pick the
+  provider and enter the key. (`server-jarvis/src/web-bundle.ts`,
+  `config.web_search`)
+- [ ] **Workspace-grants UI chip.** Absolute roots in a user message become
+  session filesystem grants (`tools.grant_session_roots`, default on). Surface
+  the active grants as removable chips so the user can see/revoke what a message
+  opened. (`server-jarvis/src/orchestration/workspace-grants.ts`)
+- [ ] **Subscription auth-mode enablement.** `claude_cli.auth_mode` supports a
+  `subscription` opt-in, but the delegate refuses it (proxy-only, to protect
+  Claude quota — see `delegateEligibility`). If subscription is ever wanted for
+  an interactive run, add an explicit, clearly-labelled toggle that warns it
+  spends Claude usage. Default must stay `proxy`. (`server-jarvis/src/orchestration/claude-delegate.ts`)
+- [ ] **MCP config UI.** The outbound MCP client bundle is registered and
+  contract-pinned, but servers are configured via `.mcp.json` only. Add a view
+  to list/add MCP servers. (`server-jarvis/src/mcp-client-bundle.ts`)
+- [ ] **`bash_path` / shell-timeout UI.** `tools.bash_path` and
+  `tools.shell_timeout_max_ms` are live and Rust-mirrored; expose them in the
+  Control view for machines where Git Bash is in a non-standard location.
+
 ## Needs user action (not a code bug)
 
 - ⚠️ **OpenRouter API key is invalid.** The persisted key returns `401 "User not found"`
