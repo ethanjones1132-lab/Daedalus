@@ -108,6 +108,48 @@ describe("runPipelineWithReplanning", () => {
     expect(result.outcome).not.toBe("degraded");
   });
 
+  test("a written-file syntax error forces a rewrite even when the reviewer says ACCEPT", async () => {
+    // Post-write syntax gate: weak models botch surgical edits (orphaned tokens
+    // -> SyntaxError) and the reviewer model often ACCEPTs anyway. A non-parsing
+    // written file must deterministically reopen the repair loop.
+    const stageLabels: string[] = [];
+    const callModel = async (_messages: any[], options?: any) => {
+      const stage = options?.stageLabel ?? "?";
+      stageLabels.push(stage);
+      if (stage === "planner") return { content: "PLAN: fix it" };
+      if (stage === "reviewer") return { content: "ACCEPT" };   // reviewer misses the defect
+      if (stage === "synthesizer") return { content: "Done." };
+      return { content: "Executor wrote the file." };
+    };
+    // Subclass overrides the gate: broken on the first check, clean after the rewrite.
+    let checks = 0;
+    class GatedExecutor extends PipelineExecutor {
+      protected async gateWrittenSyntax() {
+        checks++;
+        return checks === 1 ? [{ path: "solution.py", error: "SyntaxError: invalid syntax" }] : [];
+      }
+    }
+    const executor = new GatedExecutor(callModel as any, runtime, ctx, testCollector);
+    const coordinator = new Coordinator((async () => ({ content: "unused" })) as any);
+
+    const result = await runPipelineWithReplanning({
+      contextMessage: "fix the bug in solution.py and write the change",
+      initialDecision: baseDecision({ pipeline: ["planner", "executor", "reviewer", "rewriter", "synthesizer"] }),
+      turnRequirement: "full_execution",
+      coordinator,
+      routeOptions: { sessionId: "syntax-gate-repair" },
+      executor,
+      agentRunId: "run-syntax-gate-repair",
+      onStateChange: () => {},
+      baseOptions: { rawMessage: "fix the bug in solution.py and write it", maxReviewRepairRounds: 1 },
+      maxReplans: 2,
+    });
+
+    // Despite the reviewer ACCEPTing, the syntax gate reopened the loop -> rewriter ran.
+    expect(stageLabels).toContain("rewriter");
+    expect(result.outcome).not.toBe("degraded");
+  });
+
   test("planner double-empty bypasses live-conductor self-reroute accounting", async () => {
     const stageLabels: string[] = [];
     const callModel = async (_messages: any[], options?: any) => {

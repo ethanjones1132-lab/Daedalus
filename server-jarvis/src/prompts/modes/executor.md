@@ -21,7 +21,7 @@ For each task in the plan:
 
 ### How to choose (behavioural — refines the tools above, never overrides them)
 - `read_file` targets a single FILE and fails on a directory; call `list_directory` on a folder first if unsure.
-- Prefer a targeted edit (`edit_file` / `multi_edit`) over a full `write_file` rewrite.
+- **For a small file (under ~60 lines), rewrite the WHOLE file with `write_file`** rather than a surgical edit — a mismatched `edit_file` `old_string` leaves orphaned text or applies nothing, shipping a broken file. Reserve `edit_file` / `multi_edit` for large files, with an EXACT complete `old_string` (whole line, comments included). Verify the file parses after writing.
 - On a shell tool, `cwd` must resolve within the active workspace or a Session-granted filesystem root.
 - Never run destructive shell commands without understanding their impact first.
 - Only delegate to a sub-agent when the task has NO dependency on other in-progress tasks.

@@ -2,6 +2,7 @@ import { loadPrompt } from "./prompt-loader";
 import { defaultCapabilityIndex } from "../tool-capabilities-default";
 import { deriveEvidenceTaskKind } from "./turn-requirements";
 import { injectToolGuidelines } from "./tool-guidelines";
+import { checkWrittenFilesSyntax, renderSyntaxIssues, type SyntaxIssue } from "./syntax-gate";
 import { BUILTIN_MODES, executorTurnLimit, getToolsForMode } from "./modes";
 import { toolResultModelText, type ToolRuntime, type ExecutionContext } from "../tool-runtime";
 import type { CallModelFn, ChatMessage } from "./router";
@@ -2319,6 +2320,15 @@ export class PipelineExecutor {
     }
   }
 
+  /**
+   * Test seam for the post-write syntax gate. Defaults to the real parse-check;
+   * overridable so the "syntax error reopens the repair loop" wiring can be
+   * unit-tested without spawning a compiler on real files.
+   */
+  protected async gateWrittenSyntax(toolCalls: ToolCallRecord[]): Promise<SyntaxIssue[]> {
+    return checkWrittenFilesSyntax(toolCalls);
+  }
+
   private async runReviewerRewriterLoop(
     request: string,
     planSummary: string,
@@ -2355,6 +2365,13 @@ export class PipelineExecutor {
       reviewCount++;
       onStateChange({ stage: "reviewer", status: "running", output: `\nReview Turn ${reviewCount}...\n` });
       const revStartTime = Date.now();
+      // Deterministic syntax gate (2026-07-21 benchmark): parse-check the files
+      // this turn wrote so a non-parsing file forces a repair even when the
+      // reviewer model returns empty or a false ACCEPT.
+      const syntaxIssues = await this.gateWrittenSyntax([
+        ...executorToolCalls,
+        ...(rewriterOutput?.toolCalls ?? []),
+      ]);
 
       try {
         const reviewerMessages = [
@@ -2386,7 +2403,7 @@ export class PipelineExecutor {
         }
 
         reviewerFeedback = reviewerResp.content;
-        if (isEmptyStageOutput(reviewerFeedback)) {
+        if (isEmptyStageOutput(reviewerFeedback) && syntaxIssues.length === 0) {
           const errorMessage = "empty_completion";
           reviewerOk = false;
           hasPendingIssues = false;
@@ -2406,6 +2423,11 @@ export class PipelineExecutor {
             error_message: errorMessage,
           });
           break;
+        }
+        if (isEmptyStageOutput(reviewerFeedback)) {
+          // Reviewer produced nothing, but the syntax gate found a real defect —
+          // drive the repair from the parse error rather than shipping a broken file.
+          reviewerFeedback = renderSyntaxIssues(syntaxIssues);
         }
         onStateChange({ stage: "reviewer", status: "completed", output: reviewerFeedback });
 
@@ -2427,6 +2449,14 @@ export class PipelineExecutor {
         // issues, even on a pipeline that didn't request the "rewriter" stage.
         // The gate below deliberately suppresses repair on non-write turns.
         hasPendingIssues = this.hasIssues(reviewerFeedback);
+        if (syntaxIssues.length > 0) {
+          // A non-parsing written file ALWAYS reopens the repair loop, whatever
+          // the reviewer model concluded, and feeds it the parse error.
+          if (!reviewerFeedback.includes("SYNTAX ERROR")) {
+            reviewerFeedback = renderSyntaxIssues(syntaxIssues) + "\n\n" + reviewerFeedback;
+          }
+          hasPendingIssues = true;
+        }
         if (!hasPendingIssues || profile !== "full" || !writeIntentForTurn || repairs >= maxRepairRounds) {
           break;
         }
