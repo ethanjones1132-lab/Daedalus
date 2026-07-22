@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { findRunnableTarget, runWrittenCodeGate } from "./run-gate";
+import { findRunnableTarget, isTestFile, runWrittenCodeGate } from "./run-gate";
 import type { ToolCallRecord } from "./stage-output";
 
 function writeCall(path: string): ToolCallRecord {
@@ -19,6 +19,49 @@ function tempRoot(): string {
   return mkdtempSync(join(tmpdir(), "jarvis-run-gate-test-"));
 }
 
+describe("isTestFile", () => {
+  test("recognizes the codebase's own _t naming convention plus test_/_test", () => {
+    const shouldMatch = [
+      "_t.py",
+      "_t2.py",
+      "solution_t.py",
+      "test_foo.py",
+      "foo_test.py",
+      "my_test.py",
+    ];
+    for (const name of shouldMatch) {
+      expect(isTestFile(name)).toBe(true);
+    }
+  });
+
+  test("rejects non-test files, including ones that merely contain the substring _t", () => {
+    const shouldNotMatch = [
+      "solution.py",
+      "calc.py",
+      "rules.py",
+      "config_store.py",
+      "session.py",
+      "tokens.py",
+      "process_runner.py",
+      // These plausible module names contain "_t" as a substring but are not
+      // test files — the fixed regex must not false-positive on them.
+      "_temp.py",
+      "output_transform.py",
+      "data_target.py",
+      "session_token.py",
+      "_tools.py",
+    ];
+    for (const name of shouldNotMatch) {
+      expect(isTestFile(name)).toBe(false);
+    }
+  });
+
+  test("matches against the basename only, ignoring directory components", () => {
+    expect(isTestFile(join("some", "nested", "dir", "_t.py"))).toBe(true);
+    expect(isTestFile(join("test", "solution.py"))).toBe(false);
+  });
+});
+
 describe("run gate target selection", () => {
   test("prefers a test explicitly named by the request", async () => {
     const root = tempRoot();
@@ -33,6 +76,63 @@ describe("run gate target selection", () => {
       );
       expect(target?.path).toBe(join(root, "named_test.py"));
       expect(target?.reason).toBe("explicit_test");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("selects _t.py named explicitly, matching this codebase's own test-oracle convention", async () => {
+    const root = tempRoot();
+    try {
+      writeFileSync(join(root, "solution.py"), "print('solution')\n");
+      writeFileSync(join(root, "_t.py"), "print('oracle')\n");
+      const target = await findRunnableTarget(
+        [writeCall("solution.py")],
+        "Implement solution.py and verify with _t.py",
+        "",
+        { root },
+      );
+      expect(target?.path).toBe(join(root, "_t.py"));
+      expect(target?.reason).toBe("explicit_test");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("trusts an explicitly named test path even when it doesn't match the naming convention", async () => {
+    const root = tempRoot();
+    try {
+      writeFileSync(join(root, "app.py"), "print('app')\n");
+      writeFileSync(join(root, "verify.py"), "print('verify')\n");
+      const target = await findRunnableTarget(
+        [writeCall("app.py")],
+        "Update app.py, then run verify.py to confirm it works",
+        "",
+        { root },
+      );
+      expect(target?.path).toBe(join(root, "verify.py"));
+      expect(target?.reason).toBe("explicit_test");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not let the edited file's own name masquerade as an explicit test target", async () => {
+    const root = tempRoot();
+    try {
+      writeFileSync(join(root, "app.py"), "print('app')\n");
+      writeFileSync(join(root, "test_app.py"), "print('test')\n");
+      // Only the edited file is mentioned in the request/plan text — it must
+      // not be picked up by the Priority-A fallback, or the adjacent
+      // conventional test (Priority B) would never get a chance to run.
+      const target = await findRunnableTarget(
+        [writeCall("app.py")],
+        "Please update app.py to fix the bug",
+        "",
+        { root },
+      );
+      expect(target?.path).toBe(join(root, "test_app.py"));
+      expect(target?.reason).toBe("adjacent_test");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

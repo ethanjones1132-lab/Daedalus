@@ -6,7 +6,16 @@ import type { ToolCallRecord } from "./stage-output";
 
 const WRITE_TOOL_NAMES = new Set(["write_file", "edit_file", "multi_edit", "apply_patch"]);
 const PYTHON_PATH = /(?:[A-Za-z]:[\\/])?[A-Za-z0-9_.\\/-]+\.py\b/gi;
-const TEST_FILE = /(?:^test[_-].*|.*[_-]test|_t[^.]+)\.py$/i;
+// The third alternative recognizes this codebase's own "_t" test-oracle
+// convention (`_t.py`, `_t2.py`, `solution_t.py`) — the basename must end in
+// exactly "_t" optionally followed by digits, right before ".py". This is
+// intentionally narrower than "_t" followed by ANY characters: an unanchored
+// "_t[^.]*\.py$" would also match plausible non-test module names that merely
+// contain "_t" as a substring somewhere before a later ".py", e.g.
+// "output_transform.py" or "session_token.py" or "_temp.py" — none of which
+// are test files. Requiring digits-only after "_t" closes that hole while
+// still matching the real "_t"/"_t2"/"_t3" naming convention.
+const TEST_FILE = /(?:^test[_-].*|.*[_-]test|_t\d*)\.py$/i;
 const MAIN_GUARD = /if\s+__name__\s*==\s*["']__main__["']\s*:/;
 
 export interface RunGateIssue {
@@ -57,7 +66,8 @@ function testPathTokens(text: string): string[] {
   return [...text.matchAll(PYTHON_PATH)].map((match) => match[0].replace(/[),.;:]+$/, ""));
 }
 
-function isTestFile(path: string): boolean {
+/** Pure — no I/O — so it is trivially testable in isolation from findRunnableTarget. */
+export function isTestFile(path: string): boolean {
   return TEST_FILE.test(basename(path));
 }
 
@@ -82,9 +92,34 @@ export async function findRunnableTarget(
     .filter((path) => isWithinRoot(options.root, path));
 
   // Priority A: a test path named explicitly in the request or plan.
-  for (const token of testPathTokens(`${request}\n${plan}`)) {
-    const candidate = absoluteTarget(token, options.root);
-    if (isWithinRoot(options.root, candidate) && isTestFile(candidate) && exists(candidate)) {
+  //
+  // Any ".py" path mentioned in the request/plan text is a candidate here —
+  // including, harmlessly, the implementation file itself (e.g. "update
+  // app.py" mentions app.py, and app.py is also in `written`). So we cannot
+  // simply trust the FIRST mentioned path that exists: that would make
+  // Priority A fire on the file under edit and starve Priority B/C. Two
+  // passes:
+  //   1. Prefer a mentioned path that already matches the test-file naming
+  //      convention (isTestFile) — this is the original, safe behavior.
+  //   2. Only if no mentioned path matches the convention, fall back to
+  //      trusting an explicitly named path that exists AND is not one of the
+  //      files the executor just wrote. This covers a test file whose name
+  //      the convention regex cannot anticipate (e.g. "verify.py",
+  //      "checks.py") while still being named explicitly by the human or the
+  //      plan, without letting the implementation file's own filename (which
+  //      is mentioned in nearly every request/plan) masquerade as the
+  //      explicit run target.
+  const writtenSet = new Set(written);
+  const explicitCandidates = testPathTokens(`${request}\n${plan}`)
+    .map((token) => absoluteTarget(token, options.root))
+    .filter((candidate) => isWithinRoot(options.root, candidate));
+  for (const candidate of explicitCandidates) {
+    if (isTestFile(candidate) && exists(candidate)) {
+      return { path: candidate, reason: "explicit_test" };
+    }
+  }
+  for (const candidate of explicitCandidates) {
+    if (!writtenSet.has(candidate) && exists(candidate)) {
       return { path: candidate, reason: "explicit_test" };
     }
   }
