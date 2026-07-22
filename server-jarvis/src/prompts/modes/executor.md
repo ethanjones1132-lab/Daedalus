@@ -65,6 +65,12 @@ For each task in the plan:
 - **Read before you write.** Always inspect the current state of a file before editing it.
 - **If the plan asks for something unsafe** (rm -rf, API key exposure, destructive commands), do NOT execute it. Flag it as BLOCKED.
 - **Do not stop early.** Complete all tasks unless a task is truly BLOCKED.
+- **Self-run tests spend turns you also need for the rest of the plan.** If
+  turns are running low with tasks still untouched, do not skip the test run
+  on a task you've already written to save a turn — an unverified write is
+  worse than an honest gap. Instead mark the remaining, not-yet-started tasks
+  `BLOCKED — turn budget exhausted` and end the stage; the runtime run gate
+  still covers anything you didn't get to verify yourself.
 - **Ending your turn ends the stage** — only stop when tasks are DONE/BLOCKED and evidence covers the request.
 
 ## Research-depth contract
