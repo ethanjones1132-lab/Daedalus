@@ -87,48 +87,57 @@ const PYTHON: InterpreterInvocation = { command: "python", prefixArgs: [] };
 describe("ensureClaudeCliProxyRunning gating", () => {
   test("does nothing when claude_cli.enabled is false", async () => {
     const { calls, spawnFn } = makeSpawnRecorder();
-    let portChecked = false;
+    let scriptResolved = false;
     await ensureClaudeCliProxyRunning(baseConfig({ enabled: false }), {
-      isPortListening: async () => {
-        portChecked = true;
-        return false;
+      resolveScriptPath: () => {
+        scriptResolved = true;
+        return "C:/fake/jarvis/scripts/claude_cli_proxy.py";
       },
       spawnFn,
     });
     expect(calls).toHaveLength(0);
-    // Fully short-circuits before ever probing the port.
-    expect(portChecked).toBe(false);
+    // Fully short-circuits at the config gate — never even resolves a script.
+    expect(scriptResolved).toBe(false);
   });
 
   test("does nothing when auth_mode is not proxy", async () => {
     const { calls, spawnFn } = makeSpawnRecorder();
+    let scriptResolved = false;
     await ensureClaudeCliProxyRunning(baseConfig({ auth_mode: "subscription" }), {
-      isPortListening: async () => false,
+      resolveScriptPath: () => {
+        scriptResolved = true;
+        return "C:/fake/jarvis/scripts/claude_cli_proxy.py";
+      },
       spawnFn,
     });
     expect(calls).toHaveLength(0);
+    expect(scriptResolved).toBe(false);
   });
 
-  test("skips spawning when the port is already listening (idempotent)", async () => {
+  test("reaps unconditionally on every call — no port-probe idempotency guard", async () => {
+    // Regression guard: an earlier version short-circuited on an is_port_listening
+    // probe BEFORE reaping, so reap only ran when there was nothing to reap. That
+    // let each restart's orphaned proxy (detached:false does not clean it up) look
+    // "already running" and accumulate forever. Rust reaps unconditionally right
+    // before the spawn; so must we. This test asserts reap+spawn happen with no
+    // port probe available to short-circuit them.
     const { calls, spawnFn } = makeSpawnRecorder();
-    let reaped = false;
+    const reapedPorts: number[] = [];
     await ensureClaudeCliProxyRunning(baseConfig(), {
-      isPortListening: async () => true,
-      reapStaleProxyListeners: async () => {
-        reaped = true;
+      reapStaleProxyListeners: async (port) => {
+        reapedPorts.push(port);
       },
       resolveScriptPath: () => "C:/fake/jarvis/scripts/claude_cli_proxy.py",
       resolveInterpreter: async () => PYTHON,
       spawnFn,
     });
-    expect(calls).toHaveLength(0);
-    expect(reaped).toBe(false);
+    expect(reapedPorts).toEqual([CLAUDE_PROXY_PORT]);
+    expect(calls).toHaveLength(1);
   });
 
   test("fails open (no spawn) when the proxy script cannot be found", async () => {
     const { calls, spawnFn } = makeSpawnRecorder();
     await ensureClaudeCliProxyRunning(baseConfig(), {
-      isPortListening: async () => false,
       resolveScriptPath: () => undefined,
       resolveInterpreter: async () => PYTHON,
       spawnFn,
@@ -139,7 +148,6 @@ describe("ensureClaudeCliProxyRunning gating", () => {
   test("fails open (no spawn) when no interpreter is available", async () => {
     const { calls, spawnFn } = makeSpawnRecorder();
     await ensureClaudeCliProxyRunning(baseConfig(), {
-      isPortListening: async () => false,
       resolveScriptPath: () => "C:/fake/jarvis/scripts/claude_cli_proxy.py",
       resolveInterpreter: async () => undefined,
       spawnFn,
@@ -147,11 +155,10 @@ describe("ensureClaudeCliProxyRunning gating", () => {
     expect(calls).toHaveLength(0);
   });
 
-  test("reaps then spawns with the exact runtime env when port is free", async () => {
+  test("reaps then spawns with the exact runtime env", async () => {
     const { calls, spawnFn } = makeSpawnRecorder();
     const order: string[] = [];
     await ensureClaudeCliProxyRunning(baseConfig(), {
-      isPortListening: async () => false,
       reapStaleProxyListeners: async () => {
         order.push("reap");
       },
@@ -178,7 +185,6 @@ describe("ensureClaudeCliProxyRunning gating", () => {
   test("threads the interpreter prefix args (py -3) ahead of the script path", async () => {
     const { calls, spawnFn } = makeSpawnRecorder();
     await ensureClaudeCliProxyRunning(baseConfig(), {
-      isPortListening: async () => false,
       reapStaleProxyListeners: async () => {},
       resolveScriptPath: () => "C:/fake/jarvis/scripts/claude_cli_proxy.py",
       resolveInterpreter: async () => ({ command: "py", prefixArgs: ["-3"] }),
@@ -193,7 +199,6 @@ describe("ensureClaudeCliProxyRunning gating", () => {
     const cfg = baseConfig();
     (cfg as any).openrouter.api_key = "sk-or-secret";
     await ensureClaudeCliProxyRunning(cfg, {
-      isPortListening: async () => false,
       reapStaleProxyListeners: async () => {},
       resolveScriptPath: () => "C:/fake/jarvis/scripts/claude_cli_proxy.py",
       resolveInterpreter: async () => PYTHON,
@@ -207,7 +212,6 @@ describe("ensureClaudeCliProxyRunning gating", () => {
     const cfg = baseConfig();
     (cfg as any).ollama.model = "";
     await ensureClaudeCliProxyRunning(cfg, {
-      isPortListening: async () => false,
       reapStaleProxyListeners: async () => {},
       resolveScriptPath: () => "C:/fake/jarvis/scripts/claude_cli_proxy.py",
       resolveInterpreter: async () => PYTHON,
@@ -219,7 +223,6 @@ describe("ensureClaudeCliProxyRunning gating", () => {
   test("never throws when the default spawn path rejects", async () => {
     await expect(
       ensureClaudeCliProxyRunning(baseConfig(), {
-        isPortListening: async () => false,
         reapStaleProxyListeners: async () => {},
         resolveScriptPath: () => "C:/fake/jarvis/scripts/claude_cli_proxy.py",
         resolveInterpreter: async () => PYTHON,

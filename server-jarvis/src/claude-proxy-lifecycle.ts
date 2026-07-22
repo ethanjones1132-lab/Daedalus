@@ -20,8 +20,7 @@
 
 import { execFile, spawn as nodeSpawn } from "child_process";
 import type { SpawnOptions } from "child_process";
-import { existsSync, mkdirSync, openSync } from "fs";
-import { connect } from "net";
+import { closeSync, existsSync, mkdirSync, openSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import type { JarvisConfig } from "./config";
@@ -63,36 +62,6 @@ export function parseListeningPids(netstatOutput: string, port: number): number[
 }
 
 /**
- * Lightweight TCP connect probe — is anything accepting connections on `port`?
- * Deliberately does NOT shell out to netstat (that is reserved for the heavier
- * PID-listing/reaping step); a plain connect answers the "is the proxy up?"
- * question the same way the Rust supervisor's `is_port_listening` does.
- *
- * Real I/O; untested (matches run-gate.ts's own untested `runPythonCommand`
- * wrapper). Resolves true on connect, false on error/timeout.
- */
-export function isPortListening(
-  port: number,
-  host = "127.0.0.1",
-  timeoutMs = 750,
-): Promise<boolean> {
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (result: boolean, socket: ReturnType<typeof connect>) => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      resolve(result);
-    };
-    const socket = connect({ port, host });
-    socket.setTimeout(timeoutMs);
-    socket.once("connect", () => finish(true, socket));
-    socket.once("timeout", () => finish(false, socket));
-    socket.once("error", () => finish(false, socket));
-  });
-}
-
-/**
  * PIDs currently LISTENING on `port`, via a real `netstat -ano` invocation fed
  * through the pure `parseListeningPids`. Windows-only: returns `[]` immediately
  * on any other platform, matching Rust's `cfg!(target_os = "windows")` guard.
@@ -109,11 +78,15 @@ export function pidsListeningOnPort(port: number): Promise<number[]> {
 }
 
 /**
- * Reap any process squatting `port` before a fresh spawn claims it. Closes the
- * stale-listener hazard (an orphaned proxy from a previous deploy can survive
- * indefinitely once nothing tracks it — observed live as 3 simultaneous :19878
- * listeners). Best-effort and a direct port of Rust's `reap_stale_proxy_listeners`:
- * a kill failure is logged, never thrown.
+ * Reap any process squatting `port` before a fresh spawn claims it. Called
+ * UNCONDITIONALLY right before every spawn attempt (see
+ * `ensureClaudeCliProxyRunning`), which is what closes the stale-listener hazard:
+ * an orphaned proxy from a previous deploy can survive indefinitely once nothing
+ * tracks it (observed live as 3 simultaneous :19878 listeners), and a plain port
+ * probe cannot tell a healthy proxy from a stale one — so only an unconditional
+ * reap-before-spawn guarantees the newest deployed script wins the port.
+ * Best-effort and a direct port of Rust's `reap_stale_proxy_listeners`: a kill
+ * failure is logged, never thrown.
  */
 export async function reapStaleProxyListeners(port: number): Promise<void> {
   const pids = await pidsListeningOnPort(port);
@@ -197,13 +170,23 @@ export async function resolveInterpreter(
  * server log dir (same dir as server-jarvis.self.log), mirroring the Rust
  * `jarvis_server_log_stdio` approach. Falls back to "ignore" on any fs error. */
 function proxyLogStdio(): SpawnOptions["stdio"] {
+  let out: number | undefined;
   try {
     const dir = selfLogDir();
     mkdirSync(dir, { recursive: true });
-    const out = openSync(join(dir, "claude-proxy.log"), "a");
+    out = openSync(join(dir, "claude-proxy.log"), "a");
     const err = openSync(join(dir, "claude-proxy.err.log"), "a");
     return ["ignore", out, err];
   } catch {
+    // If the stdout fd opened but the stderr open (or anything after) threw, the
+    // stdout fd would otherwise leak — close it before falling back to "ignore".
+    if (out !== undefined) {
+      try {
+        closeSync(out);
+      } catch {
+        /* best effort */
+      }
+    }
     return ["ignore", "ignore", "ignore"];
   }
 }
@@ -223,6 +206,10 @@ function defaultSpawn(command: string, args: string[], options: SpawnOptions): S
       `[ClaudeProxy] proxy process error: ${error instanceof Error ? error.message : String(error)} — delegate unavailable, server continues`,
     );
   });
+  // The proxy is a long-lived background service; don't let it hold the server's
+  // event loop open. Its lifecycle is bounded instead by the unconditional reap
+  // on the next boot, which clears any orphan before the fresh spawn.
+  child.unref();
   return child;
 }
 
@@ -230,7 +217,6 @@ function defaultSpawn(command: string, args: string[], options: SpawnOptions): S
  * subprocess/network I/O (mirrors run-gate.ts/syntax-gate.ts's options.exists
  * pattern). Every field defaults to the real implementation above. */
 export interface EnsureProxyDeps {
-  isPortListening?: (port: number) => Promise<boolean>;
   resolveScriptPath?: (cfg: JarvisConfig) => string | undefined;
   resolveInterpreter?: () => Promise<InterpreterInvocation | undefined>;
   reapStaleProxyListeners?: (port: number) => Promise<void>;
@@ -238,15 +224,28 @@ export interface EnsureProxyDeps {
 }
 
 /**
- * Ensure the Claude-CLI proxy is running, best-effort. Idempotent and fail-open:
+ * Ensure the Claude-CLI proxy is running, best-effort. Fail-open, and — like the
+ * Rust reference `spawn_claude_cli_proxy` — it reaps then spawns UNCONDITIONALLY
+ * on every call rather than trusting a port probe:
  *   • skip entirely unless `claude_cli.enabled && auth_mode === "proxy"`;
- *   • skip the spawn if the port is already listening (matches Rust's Ollama
- *     idempotency stance — never double-spawn a healthy listener);
  *   • warn-and-return if the script or an interpreter is missing;
- *   • reap stale listeners, then spawn with the exact runtime env the proxy
- *     expects (JARVIS_CLAUDE_PROXY_PORT/BIND, JARVIS_OLLAMA_URL, JARVIS_DEFAULT_MODEL,
- *     and JARVIS_OPENROUTER_API_KEY ONLY when a non-empty key is configured).
- * Never throws; any failure logs a warning and leaves the server running.
+ *   • reap any stale/orphaned listener on the port, then spawn a fresh proxy with
+ *     the exact runtime env (JARVIS_CLAUDE_PROXY_PORT/BIND, JARVIS_OLLAMA_URL,
+ *     JARVIS_DEFAULT_MODEL, and JARVIS_OPENROUTER_API_KEY ONLY when a non-empty
+ *     key is configured).
+ *
+ * There is deliberately NO `is_port_listening`-style idempotency guard here (that
+ * IS used for Ollama, but NOT for the proxy). A TCP probe cannot distinguish a
+ * healthy current proxy from a stale one squatting the port — both answer a
+ * connect the same way. Because `detached: false` means the proxy does not
+ * outlive the server cleanly, every restart would otherwise orphan its own proxy
+ * and the next restart would see that orphan as "already running" and skip both
+ * reap and spawn — orphans would accumulate forever, a script update would never
+ * take effect, and a half-dead orphan could never be recovered by the obvious
+ * lever (restart the server). Reaping unconditionally right before the spawn is
+ * what actually closes the stale-listener hazard: the newest deployed script
+ * always wins the port. Never throws; any failure logs a warning and leaves the
+ * server running.
  */
 export async function ensureClaudeCliProxyRunning(
   cfg: JarvisConfig,
@@ -257,12 +256,6 @@ export async function ensureClaudeCliProxyRunning(
     console.log(
       `[ClaudeProxy] not required (enabled=${cfg.claude_cli?.enabled}, auth_mode=${cfg.claude_cli?.auth_mode})`,
     );
-    return;
-  }
-
-  const isPortUp = deps.isPortListening ?? isPortListening;
-  if (await isPortUp(CLAUDE_PROXY_PORT)) {
-    console.log(`[ClaudeProxy] already running on :${CLAUDE_PROXY_PORT} — skipping spawn`);
     return;
   }
 
