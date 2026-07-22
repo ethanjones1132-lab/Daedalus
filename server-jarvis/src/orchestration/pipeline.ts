@@ -409,6 +409,105 @@ export function addedWriteProgress(before: Set<string>, after: Set<string>): boo
 }
 
 /**
+ * B1 (review follow-up) — source-file extensions whose written content the
+ * deterministic run gate can only be trusted to have exercised if its single
+ * passing target actually corresponds to the file. Non-code artifacts written
+ * alongside code (docs, data, config) need no run-coverage and are ignored.
+ */
+const RUN_COVERAGE_CODE_EXTENSIONS: ReadonlySet<string> = new Set([
+  ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go", ".rs", ".java",
+  ".rb", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".cs", ".php", ".kt",
+  ".swift", ".scala", ".sh", ".bash",
+]);
+
+function pathBasename(path: string): string {
+  return path.replace(/\\/g, "/").split("/").pop() ?? "";
+}
+
+function pathExtension(path: string): string {
+  const base = pathBasename(path);
+  const dot = base.lastIndexOf(".");
+  return dot > 0 ? base.slice(dot).toLowerCase() : "";
+}
+
+function pathStem(path: string): string {
+  const base = pathBasename(path);
+  const dot = base.lastIndexOf(".");
+  return (dot > 0 ? base.slice(0, dot) : base).toLowerCase();
+}
+
+/** Distinct source-code file paths written (successfully) by this turn's tool calls. */
+export function writtenCodeFilePaths(calls: ToolCallRecord[]): string[] {
+  const seen = new Set<string>();
+  for (const call of calls) {
+    if (call.is_error || !WRITE_EFFECT_TOOLS.has(call.name)) continue;
+    const path = typeof call.arguments?.path === "string" ? call.arguments.path.trim() : "";
+    if (path && RUN_COVERAGE_CODE_EXTENSIONS.has(pathExtension(path))) seen.add(path);
+  }
+  return [...seen];
+}
+
+/**
+ * How the run gate's PASSING target relates to one written file:
+ *  - "direct":  the target IS that file (a standalone script the gate ran), or
+ *               the target is a test named after the file's module stem
+ *               (`solution_t.py`, `test_solution.py`, `solution_test.py`,
+ *               `run_solution.py`) — strong evidence the test exercised it.
+ *  - "generic": the target is a bare test-convention marker with no module
+ *               identity (`_t.py`, `_t2.py`) — plausibly the file's oracle only
+ *               when it is the SOLE written code file this turn (resolved by the
+ *               caller); a bare oracle cannot contradict a single written file.
+ *  - "none":    the target names a DIFFERENT module (`test_app.py` next to a
+ *               freshly written `utils.py`) — no reason to believe it ran the
+ *               written code.
+ * Name-coupling is a deliberately conservative proxy for "this test covers this
+ * code": it errs toward "none"/"generic" (an unrecognized test name keeps the
+ * reviewer running — safe, just slower), never toward a false "direct" that
+ * would skip review of un-exercised code.
+ */
+export function runTargetCoverageOf(targetPath: string, writtenPath: string): "direct" | "generic" | "none" {
+  if (pathBasename(targetPath).toLowerCase() === pathBasename(writtenPath).toLowerCase()) return "direct";
+  const ws = pathStem(writtenPath);
+  const ts = pathStem(targetPath);
+  if (!ws) return "none";
+  if (ts === ws) return "direct";
+  const core = ts
+    .replace(/^test[_-]/, "")
+    .replace(/[_-]test$/, "")
+    .replace(/_t\d*$/, "");
+  if (core === ws) return "direct";
+  if (core === "") return "generic";
+  return ts.split(/[^a-z0-9]+/).filter(Boolean).includes(ws) ? "direct" : "none";
+}
+
+/**
+ * B1 gate-green coverage guard. A passing run gate proves ONE discovered target
+ * exited 0 — NOT that every file written this turn was exercised (run-gate.ts
+ * runs a single target and Priority B picks the alphabetically-first sibling
+ * test with no relatedness check). The reviewer-skip fast path may fire only
+ * when EVERY source-code file written this turn is covered by that one passing
+ * target. Closes two real gaps: a multi-file turn whose one passing test touches
+ * only one written file, and a single written file sitting next to a
+ * pre-existing, unrelated, passing adjacent test the gate happened to select.
+ */
+export function passingTargetCoversAllWrittenCode(
+  targetPath: string | undefined,
+  writtenToolCalls: ToolCallRecord[],
+): boolean {
+  if (!targetPath) return false;
+  const codeFiles = writtenCodeFilePaths(writtenToolCalls);
+  if (codeFiles.length === 0) return false;
+  return codeFiles.every((path) => {
+    const coverage = runTargetCoverageOf(targetPath, path);
+    if (coverage === "direct") return true;
+    // A bare `_t.py`-style oracle carries no module name to contradict, so it is
+    // trusted only when it is the sole written code file this turn.
+    if (coverage === "generic") return codeFiles.length === 1;
+    return false;
+  });
+}
+
+/**
  * A3 — progress-gated repair budget. The reviewer→rewriter loop runs up to
  * `baseCap` repair rounds unconditionally (the configured
  * `max_review_repair_rounds`, default 2). Beyond that it grants exactly ONE
@@ -2522,10 +2621,19 @@ export class PipelineExecutor {
       // qualify and the reviewer still runs. Disable via
       // orchestrator.gate_green_skips_reviewer=false (mirrors the direct-off-
       // this.ctx.config flag read used by high_complexity_executor_retry).
+      //
+      // Review follow-up: a passing run gate proves ONE discovered target exited
+      // 0 — not that the whole turn's written code was validated. So the skip
+      // additionally requires that every source-code file written this turn is
+      // plausibly covered by that single passing target
+      // (passingTargetCoversAllWrittenCode). Without this, a multi-file turn
+      // whose one test touches only one file, or a lone written file next to a
+      // pre-existing unrelated passing test, would wrongly skip review.
       if (
         this.ctx.config.orchestrator?.gate_green_skips_reviewer !== false
         && syntaxIssues.length === 0
         && runGate.status === "passed"
+        && passingTargetCoversAllWrittenCode(runGate.target, writtenToolCalls)
       ) {
         // Synthetic verdict must parse as ACCEPT for hasIssues()/
         // parseReviewerVerdict() (leading ACCEPT token → verdict "accept" →
@@ -2557,6 +2665,9 @@ export class PipelineExecutor {
           input_tokens: 0,
           output_tokens: 0,
           tool_calls_json: "[]",
+          // Gate-execution wall time (same revStartTime basis as real reviewer
+          // rows, so it is apples-to-apples comparable to them) — this is the
+          // deterministic-gate cost of the turn, NOT "reviewer time saved."
           duration_ms: Date.now() - revStartTime,
           was_successful: 1,
           had_error: 0,
