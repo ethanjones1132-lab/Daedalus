@@ -93,33 +93,27 @@ export async function findRunnableTarget(
 
   // Priority A: a test path named explicitly in the request or plan.
   //
-  // Any ".py" path mentioned in the request/plan text is a candidate here —
-  // including, harmlessly, the implementation file itself (e.g. "update
-  // app.py" mentions app.py, and app.py is also in `written`). So we cannot
-  // simply trust the FIRST mentioned path that exists: that would make
-  // Priority A fire on the file under edit and starve Priority B/C. Two
-  // passes:
-  //   1. Prefer a mentioned path that already matches the test-file naming
-  //      convention (isTestFile) — this is the original, safe behavior.
-  //   2. Only if no mentioned path matches the convention, fall back to
-  //      trusting an explicitly named path that exists AND is not one of the
-  //      files the executor just wrote. This covers a test file whose name
-  //      the convention regex cannot anticipate (e.g. "verify.py",
-  //      "checks.py") while still being named explicitly by the human or the
-  //      plan, without letting the implementation file's own filename (which
-  //      is mentioned in nearly every request/plan) masquerade as the
-  //      explicit run target.
-  const writtenSet = new Set(written);
-  const explicitCandidates = testPathTokens(`${request}\n${plan}`)
-    .map((token) => absoluteTarget(token, options.root))
-    .filter((candidate) => isWithinRoot(options.root, candidate));
-  for (const candidate of explicitCandidates) {
-    if (isTestFile(candidate) && exists(candidate)) {
-      return { path: candidate, reason: "explicit_test" };
-    }
-  }
-  for (const candidate of explicitCandidates) {
-    if (!writtenSet.has(candidate) && exists(candidate)) {
+  // This only trusts a mentioned path that ALSO matches the test-file naming
+  // convention (isTestFile) — a bare "wasn't written this turn" fallback was
+  // tried and reverted (see git history) after a reproduced false positive:
+  // request text like "Update app.py per the config values defined in
+  // settings.py" mentions settings.py, a plain non-test config module that is
+  // not written this turn, so a fallback lacking any test-intent signal
+  // selected it as the run target and never even reached Priority B, which
+  // would have correctly found the real adjacent test. A keyword-proximity
+  // heuristic (e.g. requiring "test"/"verify"/"run" near the mention) was
+  // considered instead, but it trades one false-positive class for another —
+  // "the test suite depends on settings.py" would still wrongly select
+  // settings.py. Given this file's own safety stance (never execute an
+  // arbitrary file — see the Priority C comment below), the naming-convention
+  // requirement stays on Priority A too. The regex fix that motivated this
+  // Priority A revisit (bare "_t.py" now matches TEST_FILE) already covers the
+  // real-world case of an explicitly named test that follows this codebase's
+  // own test-oracle convention; Priority B and Priority C remain the intended
+  // mechanisms for a test file whose name doesn't match the convention at all.
+  for (const token of testPathTokens(`${request}\n${plan}`)) {
+    const candidate = absoluteTarget(token, options.root);
+    if (isWithinRoot(options.root, candidate) && isTestFile(candidate) && exists(candidate)) {
       return { path: candidate, reason: "explicit_test" };
     }
   }

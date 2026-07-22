@@ -99,19 +99,25 @@ describe("run gate target selection", () => {
     }
   });
 
-  test("trusts an explicitly named test path even when it doesn't match the naming convention", async () => {
+  test("does not select an unrelated, non-test, unwritten file merely mentioned in the request", async () => {
+    // Regression case: "settings.py" is mentioned in the request text (as
+    // context, not as a run target), is not a test by naming convention, and
+    // is not among the files written this turn. It must be rejected by
+    // Priority A so Priority B can find the real adjacent test instead of the
+    // gate running an arbitrary, unrelated config module.
     const root = tempRoot();
     try {
       writeFileSync(join(root, "app.py"), "print('app')\n");
-      writeFileSync(join(root, "verify.py"), "print('verify')\n");
+      writeFileSync(join(root, "settings.py"), "DEBUG = True\n");
+      writeFileSync(join(root, "test_app.py"), "print('test')\n");
       const target = await findRunnableTarget(
         [writeCall("app.py")],
-        "Update app.py, then run verify.py to confirm it works",
+        "Update app.py per the config values defined in settings.py",
         "",
         { root },
       );
-      expect(target?.path).toBe(join(root, "verify.py"));
-      expect(target?.reason).toBe("explicit_test");
+      expect(target?.path).toBe(join(root, "test_app.py"));
+      expect(target?.reason).toBe("adjacent_test");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
