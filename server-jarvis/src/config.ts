@@ -116,7 +116,7 @@ export interface ClaudeDelegateConfig {
   policy: "delegate_first" | "escalation";
   permission_mode: "acceptEdits" | "bypassPermissions";
   allowed_tools: string[];
-  /** Blank delegates model selection to the configured auth-mode default. */
+  /** Proxy-routable model used by the stock Claude CLI delegate. */
   model: string;
   timeout_ms: number;
 }
@@ -345,6 +345,8 @@ export interface OrchestratorConfig {
   max_conductor_replans_per_session: number;
   /** Maximum automatic review -> rewrite repair rounds for a full turn. */
   max_review_repair_rounds: number;
+  /** Retry a high-complexity change once with a different strong executor after a deterministic gate failure. */
+  high_complexity_executor_retry?: boolean;
   /**
    * T2.4: when true (default), all orchestrator turns run through
    * runPipelineWithReplanning so mid-run replan triggers can fire.
@@ -495,7 +497,7 @@ export function defaultConfig(): JarvisConfig {
           "Read", "Edit", "Write", "MultiEdit", "Grep", "Glob",
           "WebSearch", "WebFetch", "TodoWrite",
         ],
-        model: "",
+        model: "deepseek-v4-pro",
         timeout_ms: 420_000,
       },
     },
@@ -547,6 +549,7 @@ export function defaultConfig(): JarvisConfig {
       max_conductor_replans: 2,
       max_conductor_replans_per_session: 6,
       max_review_repair_rounds: 1,
+      high_complexity_executor_retry: true,
       mid_run_replan: true,
       dynamic_agents: {
         enabled: false,
@@ -726,6 +729,12 @@ const warnedStaleWorkspacePaths = new Set<string>();
 
 export function normalizeConfig(raw: any, options: NormalizeConfigOptions = {}): JarvisConfig {
   const merged = deepMerge(defaultConfig(), raw);
+  // Stock Claude delegation must not silently fall back to the proxy's weak
+  // implicit model. Preserve an explicitly configured model, but migrate old
+  // blank configs to the strongest currently proxy-routable free model.
+  if (!merged.claude_cli.delegate.model || !merged.claude_cli.delegate.model.trim()) {
+    merged.claude_cli.delegate.model = "deepseek-v4-pro";
+  }
   const configuredRepairRounds = Number(merged.orchestrator.max_review_repair_rounds);
   merged.orchestrator.max_review_repair_rounds = Number.isFinite(configuredRepairRounds)
     ? Math.min(2, Math.max(0, Math.floor(configuredRepairRounds)))

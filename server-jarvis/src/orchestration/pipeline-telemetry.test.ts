@@ -48,6 +48,61 @@ function telemetryHarness(toolName: string, handler: () => Promise<string>) {
 }
 
 describe("pipeline stage telemetry", () => {
+  test("high-complexity gate failure retries the executor once with a different model", async () => {
+    class GateRetryExecutor extends PipelineExecutor {
+      private syntaxGateCalls = 0;
+
+      protected async gateWrittenSyntax(_toolCalls: any[]): Promise<any[]> {
+        this.syntaxGateCalls++;
+        return this.syntaxGateCalls === 1
+          ? [{ path: "p2-retry.py", message: "invalid syntax", kind: "syntax" }]
+          : [];
+      }
+
+      protected async gateWrittenRun(): Promise<any> {
+        return { status: "skipped", reason: "test", issues: [] };
+      }
+    }
+
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("write_file"), async () => "written");
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    ctx.config.tools.require_approval = [];
+    const exclusions: string[][] = [];
+    let executorCalls = 0;
+    const callModel = async (_messages: unknown[], options: any = {}) => {
+      if (options.stageLabel === "executor") {
+        exclusions.push(options.excludeModels ?? []);
+        const model = executorCalls < 2 ? "model-one" : "model-two";
+        const writeTurn = executorCalls % 2 === 0;
+        executorCalls++;
+        return {
+          content: writeTurn ? "candidate write" : "candidate complete",
+          ...(writeTurn ? { tool_calls: [toolCallWithArgs("write_file", { path: "p2-retry.py", content: "fixed" })] } : {}),
+          _provider: "openrouter",
+          _modelUsed: model,
+        };
+      }
+      if (options.stageLabel === "reviewer") return { content: "ACCEPT" };
+      if (options.stageLabel === "synthesizer") return { content: "final answer" };
+      return { content: "plan" };
+    };
+
+    const executor = new GateRetryExecutor(callModel as any, runtime, ctx, { recordStageRun: () => {} });
+    const result = await executor.execute("fix p2-retry.py", ["executor", "reviewer", "synthesizer"], "run-p2-retry", () => {}, {
+      executionProfile: "full",
+      estimatedComplexity: "high",
+      rawMessage: "fix p2-retry.py",
+      maxReviewRepairRounds: 0,
+      allowMidRunReplan: false,
+    });
+
+    expect(result.answer).toBe("final answer");
+    expect(executorCalls).toBe(4);
+    expect(exclusions[0]).toEqual([]);
+    expect(exclusions[2]).toEqual(["openrouter:model-one"]);
+  });
+
   test("preserves streamed synthesis as a partial answer when the turn deadline expires", async () => {
     const runtime = createToolRuntime();
     const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });

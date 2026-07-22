@@ -301,6 +301,50 @@ describe("AgentPool", () => {
     expect(exclude.has(`${picked!.provider}:${picked!.model_id}`)).toBe(false);
   });
 
+  test("high-complexity planner/executor selection prefers the strongest active-tier brain", () => {
+    const pool = new AgentPool([
+      {
+        id: "default-fast",
+        provider: "openrouter",
+        model_id: "fast-default:free",
+        capabilities: { code: 0.62, reasoning: 0.62, speed: 0.95, cost: 1, json_reliability: 0.8 },
+        default_for: ["planner", "executor"],
+        enabled: true,
+      },
+      {
+        id: "strong-free",
+        provider: "openrouter",
+        model_id: "nemotron-strong:free",
+        capabilities: { code: 0.95, reasoning: 0.96, speed: 0.45, cost: 1, json_reliability: 0.9 },
+        default_for: [],
+        enabled: true,
+      },
+      {
+        id: "strong-go",
+        provider: "opencode_go",
+        model_id: "deepseek-v4-pro",
+        capabilities: { code: 1, reasoning: 1, speed: 0.5, cost: 0.8, json_reliability: 0.95 },
+        default_for: [],
+        enabled: true,
+      },
+    ]);
+
+    expect(pool.pickFor("planner", "debug", undefined, { complexity: "medium" })?.id).toBe("default-fast");
+    expect(pool.pickFor("planner", "debug", undefined, { complexity: "high" })?.id).toBe("strong-free");
+    expect(pool.pickFor("executor", "debug", undefined, { complexity: "high" })?.id).toBe("strong-free");
+    // Cost policy remains authoritative: high complexity biases within the
+    // active tier and only reaches Go when the free tier is excluded.
+    expect(pool.pickFor("executor", "debug", new Set(["openrouter:*"]), { complexity: "high" })?.id).toBe("strong-go");
+  });
+
+  test("reviewer default is cross-family from the deepseek executor defaults", () => {
+    const executor = DEFAULT_ORCHESTRATOR_AGENTS.find((agent) => agent.default_for.includes("executor"));
+    const reviewer = DEFAULT_ORCHESTRATOR_AGENTS.find((agent) => agent.default_for.includes("reviewer"));
+    expect(executor?.model_id).toContain("deepseek");
+    expect(reviewer?.model_id).toContain("nemotron");
+    expect(reviewer?.model_id).not.toBe(executor?.model_id);
+  });
+
   test("pickFor returns undefined when exclude set covers every enabled agent", () => {
     const pool = new AgentPool(agents);
     const exclude = new Set<string>([

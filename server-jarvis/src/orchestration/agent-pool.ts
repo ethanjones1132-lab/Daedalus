@@ -1,4 +1,4 @@
-import type { StageName, TaskType } from "./coordinator";
+import type { Complexity, StageName, TaskType } from "./coordinator";
 import {
   applyLearnedCapabilities,
   empiricalFirstTokenTimeoutFor,
@@ -48,6 +48,13 @@ export interface OrchestratorAgent {
    * an agent defines it.
    */
   system_prompt?: string;
+}
+
+export interface AgentSelectionOptions {
+  /** Coordinator difficulty signal; high favors capability over stage pins. */
+  complexity?: Complexity;
+  /** A bounded retry should ask for the strongest eligible alternative. */
+  preferStrong?: boolean;
 }
 
 export interface AgentPoolCoverage {
@@ -147,7 +154,7 @@ export const DEFAULT_ORCHESTRATOR_AGENTS: OrchestratorAgent[] = [
     provider: "opencode_go",
     model_id: "deepseek-v4-flash",
     capabilities: { code: 0.9, reasoning: 0.86, speed: 0.82, cost: 0.85, json_reliability: 0.9 },
-    default_for: ["coordinator", "reviewer", "synthesizer"],
+    default_for: ["coordinator", "synthesizer"],
     enabled: true,
   },
   {
@@ -193,11 +200,12 @@ export const DEFAULT_ORCHESTRATOR_AGENTS: OrchestratorAgent[] = [
     provider: "openrouter",
     model_id: "nvidia/nemotron-3-ultra-550b-a55b:free",
     capabilities: { code: 0.78, reasoning: 0.96, speed: 0.42, cost: 1, json_reliability: 0.88 },
-    default_for: [],
-    // Same family as `zen-nemotron-ultra-free` — large reasoning model with
-    // slow cold-start. Same per-model override.
+    // Cross-family reviewer: executor defaults use DeepSeek, so review uses
+    // Nemotron to reduce shared blind spots. The large model needs the wider
+    // first-token allowance below when it is selected.
+    default_for: ["reviewer"],
     first_token_timeout_ms: 55_000,
-    enabled: false,
+    enabled: true,
   },
   {
     id: "or-north-code-free",
@@ -325,7 +333,12 @@ export class AgentPool {
    */
   static readonly DEFAULT_FOR_DEMOTE_DELTA = -0.15;
 
-  pickFor(stage: string, taskType: TaskType | string, exclude?: ReadonlySet<string>): OrchestratorAgent | undefined {
+  pickFor(
+    stage: string,
+    taskType: TaskType | string,
+    exclude?: ReadonlySet<string>,
+    selection: AgentSelectionOptions = {},
+  ): OrchestratorAgent | undefined {
     // Filter out excluded `provider:model_id` pairs FIRST so we never re-select
     // a model that just returned an empty completion (or hit a rate limit). The
     // exclude set is keyed by `${provider}:${model_id}` to match the format used
@@ -344,7 +357,11 @@ export class AgentPool {
     // become eligible.
     const activeTier = Math.min(...candidates.map(orchestrationRoutingTier));
     const tierCandidates = candidates.filter((agent) => orchestrationRoutingTier(agent) === activeTier);
-    const stageDefault = tierCandidates.find((agent) => agent.default_for.includes(stage));
+    const highComplexityBrain = selection.complexity === "high"
+      && (stage === "planner" || stage === "executor");
+    const stageDefault = highComplexityBrain
+      ? undefined
+      : tierCandidates.find((agent) => agent.default_for.includes(stage));
     if (stageDefault) {
       // T1.6: heavy stage-scoped learned penalty demotes the pin so a
       // coordinator with 18% parse success stops being re-selected every turn.
@@ -360,7 +377,7 @@ export class AgentPool {
         return stageDefault;
       }
     }
-    return tierCandidates.sort((a, b) => this.compareWithinTier(a, b, stage, taskType))[0];
+    return tierCandidates.sort((a, b) => this.compareWithinTier(a, b, stage, taskType, selection))[0];
   }
 
   /**
@@ -490,8 +507,23 @@ export class AgentPool {
     return this.weighted(caps, stageWeights) + taskBoost;
   }
 
-  private scoreWithFeedback(agent: OrchestratorAgent, stage: string, taskType: TaskType | string): number {
-    return this.score(agent, stage, taskType) + modelRoutingScoreDelta(agent) + stageRoutingScoreDelta(agent, stage);
+  private scoreWithFeedback(
+    agent: OrchestratorAgent,
+    stage: string,
+    taskType: TaskType | string,
+    selection: AgentSelectionOptions = {},
+  ): number {
+    let score = this.score(agent, stage, taskType) + modelRoutingScoreDelta(agent) + stageRoutingScoreDelta(agent, stage);
+    if (selection.preferStrong || (selection.complexity === "high" && (stage === "planner" || stage === "executor"))) {
+      // Keep the cost tier and learned penalties hard constraints, then bias
+      // the remaining candidates toward the capability the stage actually
+      // needs. This is deliberately a score adjustment, not a model pin.
+      const capability = stage === "planner"
+        ? agent.capabilities.reasoning
+        : agent.capabilities.code;
+      score += capability * 0.35 + agent.capabilities.reasoning * 0.15 + agent.capabilities.code * 0.1;
+    }
+    return score;
   }
 
   private goCostDelta(a: OrchestratorAgent, b: OrchestratorAgent): number {
@@ -506,10 +538,11 @@ export class AgentPool {
     b: OrchestratorAgent,
     stage: string,
     taskType: TaskType | string,
+    selection: AgentSelectionOptions = {},
   ): number {
     const goCostDelta = this.goCostDelta(a, b);
     if (goCostDelta !== 0) return goCostDelta;
-    return this.scoreWithFeedback(b, stage, taskType) - this.scoreWithFeedback(a, stage, taskType);
+    return this.scoreWithFeedback(b, stage, taskType, selection) - this.scoreWithFeedback(a, stage, taskType, selection);
   }
 
   private overallScore(agent: OrchestratorAgent): number {

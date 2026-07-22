@@ -202,6 +202,10 @@ export interface PipelineExecuteOptions {
   taskRunWriteIntent?: boolean;
   /** Coordinator-estimated route complexity, used for depth-scaled executor limits. */
   estimatedComplexity?: "low" | "medium" | "high";
+  /** Provider/model keys excluded by a bounded alternate-brain executor retry. */
+  modelExclusions?: string[];
+  /** Internal one-shot guard for high-complexity executor escalation. */
+  executorRetryUsed?: boolean;
   /** Persisted task-run depth inherited by terse continuation turns. */
   taskRunDepth?: TaskRunDepth;
   /** Trivial short-circuit turns should use the fastest synthesizer tier. */
@@ -948,6 +952,7 @@ export class PipelineExecutor {
         max_tokens: BUILTIN_MODES.planner.max_tokens,
         stream: true,
         stageLabel: "planner",
+        complexity: options.estimatedComplexity,
         advanceOnEmpty: true,
         suppressActivity: true,
         stageAbort: this.registerStageAbort("planner"),
@@ -1065,6 +1070,7 @@ export class PipelineExecutor {
       }
     }
     const narratives: string[] = [];
+    let lastModelKey: string | undefined;
     let turnCount = 0;
     let executorDone = false;
     let workspaceEvidenceNudgeCount = 0;
@@ -1734,6 +1740,9 @@ export class PipelineExecutor {
             tools: getToolsForMode("executor", this.runtime.listTools(), profile),
             stream: true,
             stageLabel: "executor",
+            complexity: options.estimatedComplexity,
+            preferStrongModel: options.executorRetryUsed === true,
+            excludeModels: options.modelExclusions,
             suppressActivity: true,
             stageAbort: this.registerStageAbort("executor"),
             onChunk: (chunk) => {
@@ -1741,6 +1750,9 @@ export class PipelineExecutor {
               this.publishStageToken("executor", chunk);
             }
           });
+          if (response?._provider && response?._modelUsed) {
+            lastModelKey = `${response._provider}:${response._modelUsed}`;
+          }
 
           executorMessages.push({ role: "assistant", content: response.content, tool_calls: response.tool_calls });
           if (response.content) narratives.push(response.content);
@@ -2068,6 +2080,7 @@ export class PipelineExecutor {
           toolCalls,
           terminalStatus: "failed",
           errorCode: "effect_gate_no_write_effect",
+          modelKey: lastModelKey,
         };
       }
       if (!executorDone) {
@@ -2096,6 +2109,7 @@ export class PipelineExecutor {
           toolCalls,
           terminalStatus: "partial",
           errorCode: "executor_turn_limit",
+          modelKey: lastModelKey,
         };
       }
       if (requiresWorkspaceEvidence && !finalAssessment.sufficient) {
@@ -2110,11 +2124,11 @@ export class PipelineExecutor {
           remainingQueue,
           executorEvidence(),
         );
-        return { ok: false, narrative: failure.message, toolCalls };
+        return { ok: false, narrative: failure.message, toolCalls, modelKey: lastModelKey };
       }
       onStateChange({ stage: "executor", status: "completed", output: narrative });
       await this.afterConductorStage("executor", "completed", narrative, agentRunId, options, remainingQueue, executorEvidence());
-      return { ok: true, narrative, toolCalls };
+      return { ok: true, narrative, toolCalls, modelKey: lastModelKey };
     } catch (e: any) {
       if (
         this.delegateRuntime
@@ -2130,7 +2144,7 @@ export class PipelineExecutor {
       const message = errText(e);
       onStateChange({ stage: "executor", status: "failed", output: message });
       await this.afterConductorStage("executor", "failed", message, agentRunId, options, remainingQueue, executorEvidence());
-      return { ok: false, narrative: `Executor failed: ${message}`, toolCalls };
+      return { ok: false, narrative: `Executor failed: ${message}`, toolCalls, modelKey: lastModelKey };
     }
   }
 
@@ -2201,6 +2215,7 @@ export class PipelineExecutor {
             tools: getToolsForMode("rewriter", this.runtime.listTools(), profile),
             stream: true,
             stageLabel: "rewriter",
+            complexity: options.estimatedComplexity,
             advanceOnEmpty: true,
             stageAbort: this.registerStageAbort("rewriter"),
             suppressActivity: true,
@@ -2422,6 +2437,7 @@ export class PipelineExecutor {
           max_tokens: BUILTIN_MODES.reviewer.max_tokens,
           stream: true,
           stageLabel: "reviewer" as const,
+          complexity: options.estimatedComplexity,
           advanceOnEmpty: true,
           suppressActivity: true,
           onChunk: (chunk: string) => {
@@ -2579,6 +2595,7 @@ export class PipelineExecutor {
         max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
         stream: true,
         stageLabel: "synthesizer",
+        complexity: options.estimatedComplexity,
         cascadeTier: options.preferFastSynthesizer ? "cheap" : undefined,
         surfaceAsAnswer: true,
         stageAbort: this.registerStageAbort("synthesizer"),
@@ -2677,6 +2694,7 @@ export class PipelineExecutor {
             max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
             stream: true,
             stageLabel: "synthesizer",
+            complexity: options.estimatedComplexity,
             cascadeTier: options.preferFastSynthesizer ? "cheap" : undefined,
             surfaceAsAnswer: true,
             stageAbort: this.registerStageAbort("synthesizer"),
@@ -2778,6 +2796,7 @@ export class PipelineExecutor {
               max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
               stream: true,
               stageLabel: "synthesizer",
+              complexity: options.estimatedComplexity,
               cascadeTier: options.preferFastSynthesizer ? "cheap" : undefined,
               surfaceAsAnswer: true,
               stageAbort: this.registerStageAbort("synthesizer"),
@@ -2975,6 +2994,67 @@ export class PipelineExecutor {
         state.executor = await this.runExecutorStage(
           request, renderPlanSummary(state.plan), agentRunId, onStateChange, executorOptions, profile, remainingNow(),
         );
+        // P2.3: a high-complexity CHANGE gets one alternate strong executor
+        // only when deterministic verification says candidate one failed.
+        // The retry starts from the current workspace, carries no stale model
+        // transcript, and excludes the actual first provider/model key so the
+        // pool must choose a different brain while retaining its cooldown and
+        // cost-tier policy.
+        if (
+          state.executor
+          && profile === "full"
+          && options.estimatedComplexity === "high"
+          && hasWriteIntent(intentText)
+          && options.executorRetryUsed !== true
+          && this.ctx.config.orchestrator?.high_complexity_executor_retry !== false
+          && state.executor.modelKey
+        ) {
+          const candidateOne = state.executor;
+          const candidateSyntax = await this.gateWrittenSyntax(candidateOne.toolCalls);
+          const candidateRun = candidateSyntax.length === 0
+            ? await this.gateWrittenRun(candidateOne.toolCalls, request, renderPlanSummary(state.plan))
+            : { status: "skipped", reason: "syntax gate failed", issues: [] } satisfies RunGateResult;
+          const candidateEffect = evaluateEffectGate({
+            profile,
+            executor: candidateOne,
+            request: intentText,
+            assumeWriteIntent: options.taskRunWriteIntent,
+            contentEffects: this.ctx.write_effects,
+          });
+          const gateFailure = candidateSyntax.length > 0
+            || candidateRun.issues.length > 0
+            || candidateEffect.verdict === "no_write_effect";
+          if (gateFailure) {
+            const firstModelKey = candidateOne.modelKey!;
+            onStateChange({
+              stage: "executor",
+              status: "running",
+              detail: `high_complexity_retry:${firstModelKey}`,
+            });
+            const alternateOptions = {
+              ...opts,
+              priorToolCalls: [],
+              modelExclusions: [firstModelKey],
+              executorRetryUsed: true,
+            };
+            const candidateTwo = await this.runExecutorStage(
+              request,
+              renderPlanSummary(state.plan),
+              agentRunId,
+              onStateChange,
+              alternateOptions,
+              profile,
+              remainingNow(),
+            );
+            state.executor = {
+              ...candidateTwo,
+              narrative: [candidateOne.narrative, "[Alternate executor candidate]", candidateTwo.narrative]
+                .filter(Boolean)
+                .join("\n\n"),
+              toolCalls: [...candidateOne.toolCalls, ...candidateTwo.toolCalls],
+            };
+          }
+        }
         if (state.executor.terminalStatus === "cancelled") {
           return { state, partialStage };
         }
@@ -3410,6 +3490,7 @@ export class PipelineExecutor {
         max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
         stream: true,
         stageLabel: "synthesizer",
+        complexity: options.estimatedComplexity,
         cascadeTier: options.preferFastSynthesizer ? "cheap" : undefined,
         surfaceAsAnswer: true,
         onChunk: (chunk) => {
@@ -3581,6 +3662,7 @@ export class PipelineExecutor {
         max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
         stream: true,
         stageLabel: "synthesizer",
+        complexity: options.estimatedComplexity,
         cascadeTier: options.preferFastSynthesizer ? "cheap" : undefined,
         surfaceAsAnswer: true,
         onChunk: (chunk) => {

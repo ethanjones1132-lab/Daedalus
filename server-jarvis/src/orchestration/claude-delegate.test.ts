@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "fs/promises";
+import { tmpdir } from "os";
+import { join } from "path";
 import { defaultConfig } from "../config";
 import {
   buildClaudeDelegateInvocation,
@@ -7,11 +10,30 @@ import {
   DelegateHealth,
   delegateEligibility,
   mapClaudeDelegateToolName,
+  nodeDelegateSnapshotFactory,
   runClaudeDelegate,
   type DelegateRootSnapshot,
 } from "./claude-delegate";
 
 describe("Claude executor delegate", () => {
+  test("filesystem snapshots use content hashes instead of mtime/size identity", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jarvis-delegate-"));
+    const target = join(root, "same-size.txt");
+    try {
+      await writeFile(target, "aaaa");
+      const before = await nodeDelegateSnapshotFactory.capture([root]);
+      await writeFile(target, "bbbb");
+      const after = await nodeDelegateSnapshotFactory.capture([root]);
+      const beforeIdentity = Object.values(before[0]!.files)[0];
+      const afterIdentity = Object.values(after[0]!.files)[0];
+      expect(beforeIdentity).toMatch(/^sha256:[0-9a-f]{64}$/);
+      expect(afterIdentity).toMatch(/^sha256:[0-9a-f]{64}$/);
+      expect(afterIdentity).not.toBe(beforeIdentity);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("maps stock Claude tools into canonical Jarvis tool records", () => {
     expect([
       "Edit", "Edit-file", "Write", "MultiEdit", "Read", "Grep", "Glob",

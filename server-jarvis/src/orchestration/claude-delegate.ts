@@ -10,7 +10,7 @@ import {
 } from "../claude-cli";
 import { createHash } from "crypto";
 import { execFile, spawn } from "child_process";
-import { lstat, readdir } from "fs/promises";
+import { readFile, readdir } from "fs/promises";
 import { createInterface } from "readline";
 import { isAbsolute, join, relative, resolve } from "path";
 import { createConnection } from "net";
@@ -431,8 +431,8 @@ export const platformDelegateProcessTreeKiller = createPlatformDelegateProcessTr
 
 async function fileIdentity(path: string): Promise<string> {
   try {
-    const info = await lstat(path);
-    return `${info.mtimeMs}:${info.size}:${info.mode}`;
+    const content = await readFile(path);
+    return `sha256:${createHash("sha256").update(content).digest("hex")}`;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") return "missing";

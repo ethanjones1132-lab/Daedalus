@@ -38,6 +38,12 @@ export type CallModelFn = (
     onChunk?: (chunk: string) => void;
     tools?: any[];
     stageLabel?: string;
+    /** Coordinator difficulty used by the agent-pool model selector. */
+    complexity?: Complexity;
+    /** Ask the pool for a capability-biased candidate within policy bounds. */
+    preferStrongModel?: boolean;
+    /** Provider/model keys that this bounded retry must not reuse. */
+    excludeModels?: string[];
     cascadeTier?: "cheap" | "strong";
     surfaceAsAnswer?: boolean;
     advanceOnEmpty?: boolean;

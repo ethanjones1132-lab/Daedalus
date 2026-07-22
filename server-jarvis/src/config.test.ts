@@ -56,9 +56,14 @@ describe("Claude CLI delegate config", () => {
         "Read", "Edit", "Write", "MultiEdit", "Grep", "Glob",
         "WebSearch", "WebFetch", "TodoWrite",
       ],
-      model: "",
+      model: "deepseek-v4-pro",
       timeout_ms: 420_000,
     });
+  });
+
+  test("projects the strongest proxy-routable model into an unset delegate", () => {
+    const delegate = normalizeConfig({ claude_cli: { enabled: true, delegate: { model: "" } } }).claude_cli.delegate;
+    expect(delegate.model).toBe("deepseek-v4-pro");
   });
 
   test("round-trips explicit delegate settings", () => {

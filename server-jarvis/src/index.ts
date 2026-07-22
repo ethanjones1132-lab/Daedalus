@@ -1755,6 +1755,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let poolResolvedAgent: import("./orchestration/agent-pool").OrchestratorAgent | undefined;
           const stageLabel = callOptions?.stageLabel as string | undefined;
           const cascadeTier = callOptions?.cascadeTier as "cheap" | "strong" | undefined;
+          const modelComplexity = callOptions?.complexity
+            ?? activeTaskRun.estimatedComplexity
+            ?? "medium";
+          const modelSelection = {
+            complexity: modelComplexity as "low" | "medium" | "high",
+            preferStrong: callOptions?.preferStrongModel === true,
+          };
           // F2: one exclusion union for both pool selection and the fallback
           // cascade. A cooldown that reaches only the pool is not a cooldown.
           const stageExclusions = stageLabel
@@ -1788,7 +1795,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 const chain = pool.cascadeChain(stageLabel, orchestratorTaskType, poolExcludeModels);
                 agent = cascadeTier === "cheap" ? chain[0] : chain[chain.length - 1];
               } else {
-                agent = pool.pickFor(stageLabel, orchestratorTaskType, poolExcludeModels);
+                agent = pool.pickFor(stageLabel, orchestratorTaskType, poolExcludeModels, modelSelection);
               }
               if (agent && (agent.provider === "openrouter" || agent.provider === "opencode_zen" || agent.provider === "opencode_go")) {
                 poolModel = agent.model_id;
@@ -2645,7 +2652,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const callModel = async (messages: any[], callOptions?: any) => {
           const canRetryStage = Boolean(callOptions?.stageLabel) && cfg.active_backend !== "ollama" && cfg.openrouter.enable_fallbacks;
           const canAdvanceEmpty = (callOptions?.surfaceAsAnswer === true || callOptions?.advanceOnEmpty === true) && canRetryStage;
-          const exclude = new Set<string>();
+          const exclude = new Set<string>(callOptions?.excludeModels ?? []);
           let last: any;
           for (let retry = 0; ; retry++) {
             try {

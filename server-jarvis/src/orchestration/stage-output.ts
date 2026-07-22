@@ -42,6 +42,8 @@ export interface ExecutorStageOutput {
   terminalStatus?: "completed" | "failed" | "timed_out" | "cancelled" | "partial";
   /** Stable reason used by replanning and telemetry. */
   errorCode?: string;
+  /** Actual provider/model used by the final native candidate, for bounded escalation. */
+  modelKey?: string;
 }
 
 export interface ReviewerStageOutput {
