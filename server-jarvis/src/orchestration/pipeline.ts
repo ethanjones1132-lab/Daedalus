@@ -247,6 +247,10 @@ const GATE_VERIFIED_SYNTHESIZER_DIRECTIVE = [
   "Concise Verified-Turn Mode (authoritative for this turn):",
   "Deterministic gates already confirmed this turn's work (syntax clean and a real test passed). Do NOT re-argue correctness or narrate exploration.",
   "Produce a SHORT, direct change summary only: what changed and the one-line evidence it is verified. Prefer a few tight sentences or a small bullet list; no preamble, no restating the request.",
+  // The gates prove only syntax-clean + one passing test on the touched files —
+  // NOT design trade-offs, security, or edge cases outside that test. Brevity
+  // must never suppress something the user would want to know.
+  "If there is a genuine caveat or limitation the tests do not cover (a design trade-off, a security or input-validation concern, an untested edge case, a known follow-up), state it in one line; otherwise omit it.",
 ].join("\n");
 
 /**
