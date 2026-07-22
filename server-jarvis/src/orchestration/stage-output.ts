@@ -50,6 +50,18 @@ export interface ReviewerStageOutput {
   ok: boolean;
   feedback: string;
   hasIssues: boolean;
+  /**
+   * True ONLY when this turn's review was satisfied by the B1 deterministic
+   * gate-green fast path (syntax gate clean AND run gate executed a real test
+   * that passed AND that test covers every file written this turn) — i.e. the
+   * model reviewer was skipped because deterministic evidence confirmed the
+   * work. A model reviewer returning ACCEPT is a weaker signal and does NOT set
+   * this. Consumed by the synthesizer (B3) to emit a short, direct change
+   * summary under a reduced token cap on mechanically-verified turns. Absent /
+   * false on every other exit path (research turns, failed turns, reviewer ran,
+   * fast path did not engage).
+   */
+  gateVerified?: boolean;
 }
 
 export type ReviewerVerdict = "accept" | "reject" | "unknown";

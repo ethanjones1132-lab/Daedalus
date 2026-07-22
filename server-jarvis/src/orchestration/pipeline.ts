@@ -230,6 +230,25 @@ const READ_ONLY_TOOLS = defaultCapabilityIndex().parallelSafe;
 const PIPELINE_TOOL_RESULT_NOTE =
   "Result recorded in full for verification. Re-run the tool with a narrower target if you need the elided middle.";
 
+// B3: reduced synthesizer output cap for gate-green (deterministically verified)
+// turns. Live forensics put the synthesizer stage at ~30s/call under the default
+// 8192-token cap (BUILTIN_MODES.synthesizer.max_tokens); a turn whose gates
+// already confirmed success only needs a short "here's what changed, here's why
+// it's verified" summary, which a ~1K cap generates far faster. Applies ONLY
+// when ReviewerStageOutput.gateVerified is true — every other turn keeps the
+// full 8192 cap unchanged.
+const GATE_VERIFIED_SYNTHESIZER_MAX_TOKENS = 1024;
+
+// B3: appended to the synthesizer system prompt only on gate-green turns, so the
+// model matches its output length to the reduced token cap instead of being
+// truncated mid-prose. Kept as an instruction (not evidence) so it lives in the
+// system channel and applies uniformly to every synthesizer callModel site.
+const GATE_VERIFIED_SYNTHESIZER_DIRECTIVE = [
+  "Concise Verified-Turn Mode (authoritative for this turn):",
+  "Deterministic gates already confirmed this turn's work (syntax clean and a real test passed). Do NOT re-argue correctness or narrate exploration.",
+  "Produce a SHORT, direct change summary only: what changed and the one-line evidence it is verified. Prefer a few tight sentences or a small bullet list; no preamble, no restating the request.",
+].join("\n");
+
 /**
  * Split a turn's tool calls into dispatch batches (Task 3.1): consecutive
  * read-only calls form one concurrent batch; any write/side-effect call is
@@ -2586,6 +2605,12 @@ export class PipelineExecutor {
     let rewriterOutput: RewriterStageOutput | undefined;
     let rewriterSummaryForPrompt = "No rewriting stage executed.";
     const writeIntentForTurn = hasWriteIntent(options.rawMessage ?? request);
+    // B3: set true ONLY on the B1 gate-green fast-path exit below, where
+    // deterministic gates confirmed the turn. Every other exit (normal reviewer
+    // ACCEPT, reviewer reject, empty completion, throw) leaves this false — a
+    // model reviewer approving is a weaker signal than a deterministic gate, so
+    // the synthesizer's concise mode must not engage for it.
+    let gateVerified = false;
 
     while (hasPendingIssues) {
       reviewCount++;
@@ -2672,6 +2697,9 @@ export class PipelineExecutor {
           was_successful: 1,
           had_error: 0,
         });
+        // B3: deterministic gates verified this turn — signal the synthesizer to
+        // emit a short, direct change summary under a reduced token cap.
+        gateVerified = true;
         break;
       }
 
@@ -2837,7 +2865,7 @@ export class PipelineExecutor {
     }
 
     return {
-      reviewer: { ok: reviewerOk, feedback: reviewerFeedback, hasIssues: this.hasIssues(reviewerFeedback) },
+      reviewer: { ok: reviewerOk, feedback: reviewerFeedback, hasIssues: this.hasIssues(reviewerFeedback), gateVerified },
       rewriter: rewriterOutput,
     };
   }
@@ -2863,7 +2891,21 @@ export class PipelineExecutor {
     remainingQueue: StageName[] = [],
   ): Promise<{ answer: string; fatalError?: string; emptyCompletion: boolean; partialErrorCode?: string }> {
     onStateChange({ stage: "synthesizer", status: "running" });
-    const synthesizerPrompt = stageSystemPrompt("synthesizer", options);
+    // B3: concise synthesizer on gate-green turns. When the reviewer stage was
+    // satisfied by the B1 deterministic gate-green fast path (state.reviewer.
+    // gateVerified === true), emit a short, direct change summary under a reduced
+    // token cap instead of full exploratory prose. Any other value (undefined or
+    // false — research turns, failed turns, reviewer actually ran, fast path did
+    // not engage) leaves BOTH the prompt and the token cap byte-for-byte
+    // identical to the pre-B3 default path.
+    const gateVerified = state.reviewer?.gateVerified === true;
+    const basePrompt = stageSystemPrompt("synthesizer", options);
+    const synthesizerPrompt = gateVerified
+      ? `${basePrompt}\n\n${GATE_VERIFIED_SYNTHESIZER_DIRECTIVE}`
+      : basePrompt;
+    const synthMaxTokens = gateVerified
+      ? GATE_VERIFIED_SYNTHESIZER_MAX_TOKENS
+      : BUILTIN_MODES.synthesizer.max_tokens;
     const synthStartTime = Date.now();
     const contextText = buildSynthesizerContextFromStageState(request, state, executionVerification);
     let streamedAnswer = "";
@@ -2873,7 +2915,7 @@ export class PipelineExecutor {
         { role: "user", content: contextText }
       ] as ChatMessage[], {
         temperature: BUILTIN_MODES.synthesizer.temperature,
-        max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
+        max_tokens: synthMaxTokens,
         stream: true,
         stageLabel: "synthesizer",
         complexity: options.estimatedComplexity,
@@ -2972,7 +3014,11 @@ export class PipelineExecutor {
             { role: "user", content: continuationNudge },
           ] as ChatMessage[], {
             temperature: BUILTIN_MODES.synthesizer.temperature,
-            max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
+            // B3: a gate-green turn stays capped small even on the (rare)
+            // length-continuation path — a "concise" turn should not balloon
+            // back to the full 8192 cap. Falls through to the default cap when
+            // gateVerified is false, unchanged from pre-B3.
+            max_tokens: synthMaxTokens,
             stream: true,
             stageLabel: "synthesizer",
             complexity: options.estimatedComplexity,
@@ -3074,7 +3120,9 @@ export class PipelineExecutor {
               { role: "user", content: "Continue: deliver the actual answer now. No stand-by narration." },
             ] as ChatMessage[], {
               temperature: BUILTIN_MODES.synthesizer.temperature,
-              max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
+              // B3: same rationale as the length-continuation site — stay capped
+              // on gate-green turns, unchanged from pre-B3 when gateVerified is false.
+              max_tokens: synthMaxTokens,
               stream: true,
               stageLabel: "synthesizer",
               complexity: options.estimatedComplexity,

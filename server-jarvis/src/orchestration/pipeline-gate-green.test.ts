@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { defaultConfig } from "../config";
+import { BUILTIN_MODES } from "./modes";
 import { createToolRuntime, makeExecutionContext } from "../tool-runtime";
 import type { StageRun } from "../self-tuning/store";
 import {
@@ -69,7 +70,11 @@ function makeGatedExecutor(opts: {
 
   let reviewerCalls = 0;
   let executorTurns = 0;
-  const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+  const synthCalls: Array<{ max_tokens?: number; systemPrompt?: string }> = [];
+  const callModel = async (
+    messages: Array<{ role?: string; content?: string }>,
+    options: { stageLabel?: string; max_tokens?: number } = {},
+  ) => {
     if (options.stageLabel === "executor") {
       if (executorTurns++ === 0) {
         return {
@@ -83,7 +88,13 @@ function makeGatedExecutor(opts: {
       reviewerCalls++;
       return { content: "ACCEPT" };
     }
-    if (options.stageLabel === "synthesizer") return { content: "final answer" };
+    if (options.stageLabel === "synthesizer") {
+      synthCalls.push({
+        max_tokens: options.max_tokens,
+        systemPrompt: messages.find((m) => m.role === "system")?.content,
+      });
+      return { content: "final answer" };
+    }
     return { content: "plan" };
   };
 
@@ -100,8 +111,13 @@ function makeGatedExecutor(opts: {
   return {
     executor,
     reviewerCalls: () => reviewerCalls,
+    synthCalls: () => synthCalls,
   };
 }
+
+// Default synthesizer cap. B3 leaves this untouched on every non-gate-verified
+// turn and drops to a smaller cap on gate-green turns.
+const DEFAULT_SYNTH_MAX_TOKENS = BUILTIN_MODES.synthesizer.max_tokens; // 8192
 
 const WRITE_REQUEST = "fix the bug in solution.py and write the change";
 
@@ -313,6 +329,123 @@ describe("B1 gate-green fast path", () => {
     expect(reviewerCalls()).toBeGreaterThanOrEqual(1);
     expect(rows.some((r) => r.mode_id === "reviewer")).toBe(true);
     expect(rows.some((r) => r.mode_id === "reviewer_gate_skip")).toBe(false);
+  });
+});
+
+// B3: the reviewer loop stamps ReviewerStageOutput.gateVerified true ONLY on the
+// B1 gate-green fast-path exit (deterministic gates confirmed the turn), and
+// false on every other exit — a model reviewer ACCEPT is a weaker signal. These
+// tests read the typed carry-state directly via executeSegment (which returns
+// PipelineStageState) rather than inferring it from stage_runs rows.
+describe("B3 reviewer.gateVerified plumbing", () => {
+  test("is true when the gate-green fast path skipped the model reviewer", async () => {
+    const { executor, reviewerCalls } = makeGatedExecutor({
+      syntaxIssues: [],
+      runGate: { status: "passed", target: "solution_t.py", issues: [] },
+      writtenFiles: ["solution.py"],
+    });
+
+    const segment = await executor.executeSegment(
+      WRITE_REQUEST,
+      ["executor", "reviewer"],
+      "b3-gateverified-true",
+      () => {},
+      { executionProfile: "full", rawMessage: WRITE_REQUEST, maxReviewRepairRounds: 2, allowMidRunReplan: false },
+    );
+
+    expect(reviewerCalls()).toBe(0);
+    expect(segment.state.reviewer?.gateVerified).toBe(true);
+  });
+
+  test("is false when the model reviewer actually ran (run gate 'skipped')", async () => {
+    const { executor, reviewerCalls } = makeGatedExecutor({
+      syntaxIssues: [],
+      runGate: { status: "skipped", reason: "no runnable target", issues: [] },
+      writtenFiles: ["solution.py"],
+    });
+
+    const segment = await executor.executeSegment(
+      WRITE_REQUEST,
+      ["executor", "reviewer"],
+      "b3-gateverified-reviewer-ran",
+      () => {},
+      { executionProfile: "full", rawMessage: WRITE_REQUEST, maxReviewRepairRounds: 2, allowMidRunReplan: false },
+    );
+
+    expect(reviewerCalls()).toBeGreaterThanOrEqual(1);
+    expect(segment.state.reviewer?.gateVerified).toBeFalsy();
+  });
+
+  test("is false on a multi-file turn whose passing test covers only one file (fast path declined)", async () => {
+    const { executor, reviewerCalls } = makeGatedExecutor({
+      syntaxIssues: [],
+      runGate: { status: "passed", target: "solution_t.py", issues: [] },
+      writtenFiles: ["solution.py", "helper.py"],
+    });
+
+    const segment = await executor.executeSegment(
+      WRITE_REQUEST,
+      ["executor", "reviewer"],
+      "b3-gateverified-multifile",
+      () => {},
+      { executionProfile: "full", rawMessage: WRITE_REQUEST, maxReviewRepairRounds: 2, allowMidRunReplan: false },
+    );
+
+    expect(reviewerCalls()).toBeGreaterThanOrEqual(1);
+    expect(segment.state.reviewer?.gateVerified).toBeFalsy();
+  });
+});
+
+// B3: the synthesizer drops to a reduced max_tokens cap AND appends a concise
+// directive to its system prompt ONLY on gate-verified turns. Every other turn
+// keeps the full default cap and the unmodified prompt (default-path invariant).
+describe("B3 concise synthesizer on gate-green turns", () => {
+  test("gate-green turn: synthesizer runs at the reduced cap with the concise directive", async () => {
+    const { executor, synthCalls } = makeGatedExecutor({
+      syntaxIssues: [],
+      runGate: { status: "passed", target: "solution_t.py", issues: [] },
+      writtenFiles: ["solution.py"],
+    });
+
+    const result = await executor.execute(
+      WRITE_REQUEST,
+      ["executor", "reviewer", "synthesizer"],
+      "b3-synth-concise",
+      () => {},
+      { executionProfile: "full", rawMessage: WRITE_REQUEST, maxReviewRepairRounds: 2, allowMidRunReplan: false },
+    );
+
+    expect(result.answer).toBe("final answer");
+    const calls = synthCalls();
+    expect(calls.length).toBeGreaterThanOrEqual(1);
+    // Reduced cap (1024), strictly below the default 8192.
+    expect(calls[0]?.max_tokens).toBe(1024);
+    expect(calls[0]?.max_tokens).toBeLessThan(DEFAULT_SYNTH_MAX_TOKENS);
+    // Concise directive injected into the synthesizer system prompt.
+    expect(calls[0]?.systemPrompt).toContain("Concise Verified-Turn Mode");
+  });
+
+  test("non-gate-verified turn (reviewer ran): synthesizer keeps the default cap and unmodified prompt", async () => {
+    const { executor, synthCalls } = makeGatedExecutor({
+      syntaxIssues: [],
+      // "skipped" run gate ⇒ reviewer runs ⇒ gateVerified falsy ⇒ default path.
+      runGate: { status: "skipped", reason: "no runnable target", issues: [] },
+      writtenFiles: ["solution.py"],
+    });
+
+    await executor.execute(
+      WRITE_REQUEST,
+      ["executor", "reviewer", "synthesizer"],
+      "b3-synth-default-path",
+      () => {},
+      { executionProfile: "full", rawMessage: WRITE_REQUEST, maxReviewRepairRounds: 2, allowMidRunReplan: false },
+    );
+
+    const calls = synthCalls();
+    expect(calls.length).toBeGreaterThanOrEqual(1);
+    // Byte-for-byte default: full cap, no concise directive.
+    expect(calls[0]?.max_tokens).toBe(DEFAULT_SYNTH_MAX_TOKENS);
+    expect(calls[0]?.systemPrompt).not.toContain("Concise Verified-Turn Mode");
   });
 });
 
