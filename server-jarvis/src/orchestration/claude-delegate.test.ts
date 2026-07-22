@@ -684,6 +684,33 @@ describe("Claude executor delegate", () => {
       files: { "c:\\repo\\claimed.ts": "200:11" },
     };
     let captures = 0;
+    let eventIteratorReturns = 0;
+    let releaseBlockedNext: ((result: IteratorResult<unknown>) => void) | undefined;
+    const eventValues: unknown[] = [
+      { type: "assistant", message: { content: [{
+        type: "tool_use", id: "write-1", name: "Write", input: { file_path: "claimed.ts" },
+      }] } },
+      { type: "user", message: { content: [{
+        type: "tool_result", tool_use_id: "write-1", content: "claimed write",
+      }] } },
+    ];
+    const events: AsyncIterable<unknown> = {
+      [Symbol.asyncIterator]: () => {
+        let index = 0;
+        return {
+          next: async (): Promise<IteratorResult<unknown>> => {
+            if (index < eventValues.length) return { done: false, value: eventValues[index++] };
+            controller.abort("user_stop");
+            return new Promise((resolve) => { releaseBlockedNext = resolve; });
+          },
+          return: async (): Promise<IteratorResult<unknown>> => {
+            eventIteratorReturns += 1;
+            releaseBlockedNext?.({ done: true, value: undefined });
+            return { done: true, value: undefined };
+          },
+        };
+      },
+    };
     let finish!: (exit: { code: number | null; signal: string | null }) => void;
     const exit = new Promise<{ code: number | null; signal: string | null }>((resolve) => { finish = resolve; });
     const output = await runClaudeDelegate({
@@ -702,25 +729,17 @@ describe("Claude executor delegate", () => {
       verificationTimeoutMs: 30,
       snapshotFactory: { capture: async () => (++captures === 1 ? [before] : [after]) },
       processFactory: async () => ({
-        events: (async function* () {
-          yield { type: "assistant", message: { content: [{
-            type: "tool_use", id: "write-1", name: "Write", input: { file_path: "claimed.ts" },
-          }] } };
-          yield { type: "user", message: { content: [{
-            type: "tool_result", tool_use_id: "write-1", content: "claimed write",
-          }] } };
-          controller.abort("user_stop");
-          await new Promise(() => {});
-        })(),
+        events,
         exit,
         kill: (signal) => { if (signal === "SIGKILL") finish({ code: null, signal }); },
       }),
     });
 
+    expect(eventIteratorReturns).toBe(1);
     expect(captures).toBe(2);
     expect(output).toMatchObject({ ok: false, terminalStatus: "cancelled", errorCode: "delegate_aborted" });
     expect(output.toolCalls).toContainEqual(expect.objectContaining({ name: "write_file", is_error: false }));
-  }, 250);
+  }, 1_000);
 
   test("unconfirmed cleanup makes a timed-out claimed write unsafe without post-run verification", async () => {
     const config = defaultConfig();

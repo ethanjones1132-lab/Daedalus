@@ -3,6 +3,7 @@ import { defaultCapabilityIndex } from "../tool-capabilities-default";
 import { deriveEvidenceTaskKind } from "./turn-requirements";
 import { injectToolGuidelines } from "./tool-guidelines";
 import { checkWrittenFilesSyntax, renderSyntaxIssues, type SyntaxIssue } from "./syntax-gate";
+import { renderRunIssues, runWrittenCodeGate, type RunGateResult } from "./run-gate";
 import { BUILTIN_MODES, executorTurnLimit, getToolsForMode } from "./modes";
 import { toolResultModelText, type ToolRuntime, type ExecutionContext } from "../tool-runtime";
 import type { CallModelFn, ChatMessage } from "./router";
@@ -2337,6 +2338,22 @@ export class PipelineExecutor {
     return checkWrittenFilesSyntax(toolCalls);
   }
 
+  /** Test seam for the post-write run gate; disabled only by its config kill switch. */
+  protected async gateWrittenRun(
+    toolCalls: ToolCallRecord[],
+    request: string,
+    planSummary: string,
+  ): Promise<RunGateResult> {
+    if (!this.ctx.config?.tools || this.ctx.config.tools.run_gate === false) {
+      return { status: "skipped", reason: "tools.run_gate disabled", issues: [] };
+    }
+    const root = this.evidenceRoots({})[0]
+      || this.ctx.workspace_path
+      || this.ctx.config.jarvis_path
+      || process.cwd();
+    return runWrittenCodeGate(toolCalls, request, planSummary, { root });
+  }
+
   private async runReviewerRewriterLoop(
     request: string,
     planSummary: string,
@@ -2380,13 +2397,24 @@ export class PipelineExecutor {
         ...executorToolCalls,
         ...(rewriterOutput?.toolCalls ?? []),
       ]);
+      const writtenToolCalls = [
+        ...executorToolCalls,
+        ...(rewriterOutput?.toolCalls ?? []),
+      ];
+      const runGate = syntaxIssues.length === 0
+        ? await this.gateWrittenRun(writtenToolCalls, request, planSummary)
+        : { status: "skipped", reason: "syntax gate failed", issues: [] } satisfies RunGateResult;
+      const deterministicGateFeedback = [
+        renderSyntaxIssues(syntaxIssues),
+        renderRunIssues(runGate),
+      ].filter(Boolean).join("\n\n");
 
       try {
         const reviewerMessages = [
           { role: "system", content: reviewerPrompt },
           {
             role: "user",
-            content: `User Request: ${boundedRequest}\n\nOriginal Plan:\n${boundedPlanSummary}\n\nExecutor Activity:\n${boundedExecutorSummary}\n\nRewriter Activity:\n${truncateToTokenBudget(rewriterSummaryForPrompt, 1_000)}`
+            content: `User Request: ${boundedRequest}\n\nOriginal Plan:\n${boundedPlanSummary}\n\nExecutor Activity:\n${boundedExecutorSummary}\n\nRewriter Activity:\n${truncateToTokenBudget(rewriterSummaryForPrompt, 1_000)}\n\nDeterministic verification evidence:\n${deterministicGateFeedback || "Syntax and run gates produced no deterministic failures."}`
           }
         ] as ChatMessage[];
         const reviewerOptions = {
@@ -2411,7 +2439,7 @@ export class PipelineExecutor {
         }
 
         reviewerFeedback = reviewerResp.content;
-        if (isEmptyStageOutput(reviewerFeedback) && syntaxIssues.length === 0) {
+        if (isEmptyStageOutput(reviewerFeedback) && deterministicGateFeedback.length === 0) {
           const errorMessage = "empty_completion";
           reviewerOk = false;
           hasPendingIssues = false;
@@ -2433,9 +2461,9 @@ export class PipelineExecutor {
           break;
         }
         if (isEmptyStageOutput(reviewerFeedback)) {
-          // Reviewer produced nothing, but the syntax gate found a real defect —
-          // drive the repair from the parse error rather than shipping a broken file.
-          reviewerFeedback = renderSyntaxIssues(syntaxIssues);
+          // A deterministic gate found a real defect; drive the repair from its
+          // evidence rather than shipping a broken or unverified file.
+          reviewerFeedback = deterministicGateFeedback;
         }
         onStateChange({ stage: "reviewer", status: "completed", output: reviewerFeedback });
 
@@ -2462,6 +2490,12 @@ export class PipelineExecutor {
           // the reviewer model concluded, and feeds it the parse error.
           if (!reviewerFeedback.includes("SYNTAX ERROR")) {
             reviewerFeedback = renderSyntaxIssues(syntaxIssues) + "\n\n" + reviewerFeedback;
+          }
+          hasPendingIssues = true;
+        }
+        if (runGate.issues.length > 0) {
+          if (!reviewerFeedback.includes("run gate failed")) {
+            reviewerFeedback = renderRunIssues(runGate) + "\n\n" + reviewerFeedback;
           }
           hasPendingIssues = true;
         }
@@ -2954,6 +2988,7 @@ export class PipelineExecutor {
             rewriter: state.rewriter,
             request: intentText,
             assumeWriteIntent: options.taskRunWriteIntent,
+            contentEffects: this.ctx.write_effects,
           });
           return { state, effectGate, partialStage };
         }
@@ -3034,6 +3069,7 @@ export class PipelineExecutor {
       rewriter: state.rewriter,
       request: intentText,
       assumeWriteIntent: options.taskRunWriteIntent,
+      contentEffects: this.ctx.write_effects,
     });
     if (
       effectGate.verdict === "no_write_effect" &&
@@ -3063,6 +3099,7 @@ export class PipelineExecutor {
         rewriter: state.rewriter,
         request: intentText,
         assumeWriteIntent: options.taskRunWriteIntent,
+        contentEffects: this.ctx.write_effects,
       });
       if (state.rewriter.terminalStatus === "timed_out") {
         partialStage = { stage: "rewriter", errorCode: state.rewriter.errorCode ?? "stage_timeout" };
@@ -3167,6 +3204,10 @@ export class PipelineExecutor {
     onStateChange: (state: PipelineProgressState) => void,
     options: PipelineExecuteOptions = {}
   ): Promise<PipelineResult> {
+    // Content observations belong to this logical turn. Replans and repair
+    // segments intentionally share the same array so the final gate can see
+    // every native write attempt made before synthesis.
+    this.ctx.write_effects = [];
     const requiresWorkspaceEvidence = turnNeedsWorkspaceEvidence(options.turnRequirement, options.rawMessage ?? request);
     if (!requiresWorkspaceEvidence && this.canRunSpeculativeParallel(pipeline, options.topology)) {
       return this.executeSpeculativeParallel(request, pipeline, agentRunId, onStateChange, options);
@@ -3232,6 +3273,7 @@ export class PipelineExecutor {
           profile: options.executionProfile ?? "full",
           executor: state.executor,
           rewriter: state.rewriter,
+          contentEffects: this.ctx.write_effects,
         }),
       );
       // No synthesizer in this pipeline: fall back to the last completed phase.
@@ -3271,6 +3313,7 @@ export class PipelineExecutor {
         profile: options.executionProfile ?? "full",
         executor: state.executor,
         rewriter: state.rewriter,
+        contentEffects: this.ctx.write_effects,
       }),
     ));
     if (segment.partialStage && outcome !== "failed") {

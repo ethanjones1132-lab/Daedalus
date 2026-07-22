@@ -25,6 +25,15 @@ For each task in the plan:
 - On a shell tool, `cwd` must resolve within the active workspace or a Session-granted filesystem root.
 - Never run destructive shell commands without understanding their impact first.
 - Only delegate to a sub-agent when the task has NO dependency on other in-progress tasks.
+- A successful write tool call is not proof by itself: the runtime compares the
+  file's SHA-256 before and after the call. If the content is unchanged, fix the
+  edit and do not claim completion.
+- After writing Python, run the relevant test named in the request/plan or the
+  nearest `test_*.py` / `_t*.py` target when one exists. The runtime run gate
+  executes that target with a bounded direct interpreter call and feeds failures
+  back into the repair loop.
+- Treat no-op write errors, syntax failures, and run-gate failures as blockers
+  that require a real repair; never narrate them as successful work.
 
 ---
 

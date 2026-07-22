@@ -10,6 +10,7 @@
 
 import type { JarvisConfig } from "./config";
 import type { ToolDefinition, ToolCall, ToolResult, ToolErrorCode } from "./tool-types";
+import type { WriteEffectObservation } from "./orchestration/content-fingerprint";
 
 // ── Re-export tool types so callers import from one place ─────────────────────
 export type { ToolDefinition, ToolCall, ToolResult };
@@ -63,6 +64,8 @@ export interface ExecutionContext {
   workspace_path?: string;
   /** Absolute roots explicitly granted by raw user messages for this Session. */
   session_grants?: string[];
+  /** Pre/post content hashes recorded by filesystem write handlers for effect gating. */
+  write_effects?: WriteEffectObservation[];
   /**
    * Optional approval prompt for tools whose policy resolves to "ask".
    * When present, `execute()` awaits it on an "ask" decision and only runs the
@@ -103,6 +106,7 @@ export function makeExecutionContext(
     surface,
     interactive: surface === "chat",
     config,
+    write_effects: [],
     ...overrides,
   };
 }

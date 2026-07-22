@@ -1,5 +1,6 @@
 import type { ExecutorStageOutput, RewriterStageOutput, ToolCallRecord } from "./stage-output";
 import type { ExecutionProfile } from "./route-normalization";
+import type { WriteEffectObservation } from "./content-fingerprint";
 import { hasWriteIntent } from "./turn-requirements";
 import { defaultCapabilityIndex } from "../tool-capabilities-default";
 
@@ -20,6 +21,8 @@ export interface EffectGateReport {
   failedCalls: Array<{ name: string; detail: string }>;
   writeIntent: boolean;
   successfulWrites: number;
+  /** Number of successful write calls whose post-write bytes differ from pre-write bytes. */
+  contentDeltas: number;
   synthesizerNotice: string;
 }
 
@@ -36,6 +39,8 @@ export function evaluateEffectGate(input: {
    * success.
    */
   assumeWriteIntent?: boolean;
+  /** Pre/post hashes captured by filesystem handlers during this pipeline run. */
+  contentEffects?: readonly WriteEffectObservation[];
 }): EffectGateReport {
   const calls: ToolCallRecord[] = [
     ...(input.executor?.toolCalls ?? []),
@@ -60,10 +65,19 @@ export function evaluateEffectGate(input: {
   const successfulWrites = calls.filter(
     (call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name),
   ).length;
+  // The delegate reports canonical write tool names but mutates outside the
+  // native ToolRuntime, so it has no handler-side observation. Preserve the
+  // call-level success in that case. Native write calls always append an
+  // observation, including a zero-delta observation for an unchanged patch.
+  const canUseContentEffects = input.contentEffects !== undefined
+    && (input.contentEffects.length > 0 || successfulWrites === 0);
+  const contentDeltas = canUseContentEffects
+    ? input.contentEffects!.filter((effect) => effect.changed).length
+    : successfulWrites;
   let verdict: EffectGateReport["verdict"] = "clean";
   if (hasRepeatedWriteFailureWithoutEffect(calls, writeIntent)) verdict = "no_write_effect";
   else if (failedCalls.length > 0) verdict = "tool_failures";
-  else if (writeIntent && successfulWrites === 0) verdict = "no_write_effect";
+  else if (writeIntent && contentDeltas === 0) verdict = "no_write_effect";
   const clean = verdict === "clean";
   return {
     clean,
@@ -71,15 +85,23 @@ export function evaluateEffectGate(input: {
     failedCalls,
     writeIntent,
     successfulWrites,
-    synthesizerNotice: clean ? "" : buildNotice(verdict, failedCalls),
+    contentDeltas,
+    synthesizerNotice: clean ? "" : buildNotice(verdict, failedCalls, successfulWrites, contentDeltas),
   };
 }
 
-function buildNotice(verdict: string, failed: Array<{ name: string; detail: string }>): string {
+function buildNotice(
+  verdict: string,
+  failed: Array<{ name: string; detail: string }>,
+  successfulWrites = 0,
+  contentDeltas = 0,
+): string {
   return [
     "Execution Verification (authoritative — do NOT contradict this):",
     verdict === "tool_failures"
       ? `- ${failed.length} tool call(s) FAILED: ${failed.map((failure) => failure.name).join(", ")}.`
+      : successfulWrites > 0 && contentDeltas === 0
+        ? "- Write tool calls completed, but your edits did not change any file content."
       : "- This was a change request but ZERO file mutations succeeded.",
     "- Do not state or imply that the task completed successfully.",
     "- Report what actually happened and what failed.",

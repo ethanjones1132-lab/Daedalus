@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { applyEffectGate, buildWriteEffectNudge, evaluateEffectGate, isTerminalNoWriteEffect, mostReadSuccessfulFile, shouldPressWriteEffect } from "./effect-gate";
 import type { ExecutorStageOutput, ToolCallRecord } from "./stage-output";
+import type { WriteEffectObservation } from "./content-fingerprint";
 
 function call(name: string, is_error = false, output = "ok"): ToolCallRecord {
   return { name, arguments: {}, output, is_error, duration_ms: 1 };
@@ -171,6 +172,46 @@ describe("effect gate", () => {
       request: "continue",
       assumeWriteIntent: true,
     });
+    expect(report.verdict).toBe("clean");
+  });
+
+  test("successful write tools with zero content deltas become no_write_effect", () => {
+    const unchanged: WriteEffectObservation = {
+      toolName: "edit_file",
+      path: "workspace/proof.txt",
+      before: { path: "workspace/proof.txt", exists: true, bytes: 12, sha256: "same" },
+      after: { path: "workspace/proof.txt", exists: true, bytes: 12, sha256: "same" },
+      changed: false,
+    };
+    const report = evaluateEffectGate({
+      profile: "full",
+      executor: executor([call("edit_file")]),
+      request: "update workspace/proof.txt",
+      contentEffects: [unchanged],
+    });
+
+    expect(report.successfulWrites).toBe(1);
+    expect(report.contentDeltas).toBe(0);
+    expect(report.verdict).toBe("no_write_effect");
+    expect(report.synthesizerNotice).toContain("your edits did not change any file content");
+  });
+
+  test("one content delta satisfies the write effect gate", () => {
+    const changed: WriteEffectObservation = {
+      toolName: "edit_file",
+      path: "workspace/proof.txt",
+      before: { path: "workspace/proof.txt", exists: true, bytes: 12, sha256: "before" },
+      after: { path: "workspace/proof.txt", exists: true, bytes: 13, sha256: "after" },
+      changed: true,
+    };
+    const report = evaluateEffectGate({
+      profile: "full",
+      executor: executor([call("edit_file")]),
+      request: "update workspace/proof.txt",
+      contentEffects: [changed],
+    });
+
+    expect(report.contentDeltas).toBe(1);
     expect(report.verdict).toBe("clean");
   });
 });

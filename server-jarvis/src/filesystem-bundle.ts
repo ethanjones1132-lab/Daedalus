@@ -20,6 +20,7 @@ import type { ToolDefinition } from "./tool-types";
 import { safePath } from "./fs-scope";
 import { markFileRead, hasFileBeenRead } from "./fs-read-cache";
 import { applyUnifiedPatch, buildUnifiedDiff } from "./diff";
+import { fingerprintBytes, fingerprintFile, recordWriteEffect } from "./orchestration/content-fingerprint";
 
 // ── Tool Definitions (copied byte-for-byte from legacy getAllTools) ──────────────
 
@@ -262,11 +263,18 @@ async function handleWriteFile(args: Record<string, unknown>, ctx: ExecutionCont
     forWrite: true,
   });
   const content = args.content as string;
+  const before = await fingerprintFile(path);
+  const requested = fingerprintBytes(content, path);
+  if (before.exists && before.sha256 === requested.sha256) {
+    throw new Error(`wrote identical content — file unchanged: ${args.path}`);
+  }
 
   const dir = dirname(path);
   await fs.mkdir(dir, { recursive: true });
 
   await fs.writeFile(path, content, "utf-8");
+  const after = await fingerprintFile(path);
+  recordWriteEffect(ctx, { toolName: "write_file", path, before, after });
   const lines = content.split("\n").length;
   return `Wrote ${lines} lines to ${args.path}`;
 }
@@ -303,7 +311,13 @@ async function handleEditFile(args: Record<string, unknown>, ctx: ExecutionConte
   }
 
   const updated = content.replace(resolved.oldStr, resolved.newStr);
+  if (resolved.oldStr === resolved.newStr) {
+    throw new Error(`edit is a no-op — old_string equals new_string: ${args.path}`);
+  }
+  const before = await fingerprintFile(path);
   await fs.writeFile(path, updated, "utf-8");
+  const after = await fingerprintFile(path);
+  recordWriteEffect(ctx, { toolName: "edit_file", path, before, after });
   return `Edited ${args.path}: replaced ${resolved.oldStr.length} chars with ${resolved.newStr.length} chars`;
 }
 
@@ -328,6 +342,7 @@ async function handleMultiEdit(args: Record<string, unknown>, ctx: ExecutionCont
   }
 
   const results: string[] = [];
+  const before = await fingerprintFile(path);
 
   for (const edit of edits) {
     const resolved = resolveEditStrings(content, edit.old_string, edit.new_string);
@@ -339,7 +354,13 @@ async function handleMultiEdit(args: Record<string, unknown>, ctx: ExecutionCont
     results.push(`OK: replaced "${resolved.oldStr.slice(0, 40)}..."`);
   }
 
+  if (!results.some((result) => result.startsWith("OK:"))) {
+    throw new Error(`multi_edit has no applicable edits — every requested edit was skipped: ${args.path}`);
+  }
+
   await fs.writeFile(path, content, "utf-8");
+  const after = await fingerprintFile(path);
+  recordWriteEffect(ctx, { toolName: "multi_edit", path, before, after });
   return `Multi-edit on ${args.path}:\n${results.join("\n")}`;
 }
 
@@ -368,7 +389,10 @@ async function handleApplyPatch(args: Record<string, unknown>, ctx: ExecutionCon
     throw new Error(`Error: patch did not apply cleanly to "${args.path}". The file may have changed since it was read — call read_file again and regenerate the patch against the current content.`);
   }
 
+  const before = await fingerprintFile(path);
   await fs.writeFile(path, result.content, "utf-8");
+  const after = await fingerprintFile(path);
+  recordWriteEffect(ctx, { toolName: "apply_patch", path, before, after });
   const diff = buildUnifiedDiff(content, result.content, args.path as string);
   return `Patched ${args.path}: +${diff.additions}/-${diff.deletions}`;
 }

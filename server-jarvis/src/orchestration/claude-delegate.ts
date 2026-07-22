@@ -714,6 +714,17 @@ async function boundedVerification<T>(promise: Promise<T>, timeoutMs: number): P
   ]);
 }
 
+async function closeDelegateEventIterator(
+  iterator: AsyncIterator<unknown>,
+  timeoutMs: number,
+): Promise<void> {
+  if (!iterator.return) return;
+  await boundedVerification(
+    Promise.resolve().then(() => iterator.return!()),
+    Math.max(1, timeoutMs),
+  );
+}
+
 type DelegateCleanupOutcome =
   | { status: "terminated"; detail: string }
   | { status: "exit_unconfirmed"; detail: string }
@@ -970,6 +981,7 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
     const pending = new Map<string, { record: ToolCallRecord; startedAt: number }>();
     const narrative: string[] = [];
     const decodeState: ClaudeStreamDecodeState = { partialTextSeen: false };
+    const eventIterator = delegatedProcess.events[Symbol.asyncIterator]();
     let eventCount = 0;
     let policyViolation = false;
     const execution = (async (): Promise<
@@ -977,7 +989,10 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
       | { kind: "stream_error"; error: unknown }
     > => {
       try {
-        for await (const rawEvent of delegatedProcess.events) {
+        while (true) {
+          const next = await eventIterator.next();
+          if (next.done) break;
+          const rawEvent = next.value;
           const events = decodeClaudeCliMessage(rawEvent, decodeState);
           eventCount += events.length;
           for (const event of events) {
@@ -1029,24 +1044,28 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
       }
     })();
 
+    const terminateAndCloseEventStream = async (): Promise<DelegateCleanupOutcome> => {
+      const startedAt = Date.now();
+      const cleanup = await terminateDelegateProcess(
+        delegatedProcess, terminationGraceMs, cleanupTimeoutMs, treeKiller,
+      );
+      const closeBudgetMs = Math.max(1, cleanupTimeoutMs - (Date.now() - startedAt));
+      await closeDelegateEventIterator(eventIterator, closeBudgetMs);
+      return cleanup;
+    };
+
     const executionResult = await operation.race(execution);
     let streamOutcome: { kind: "completed"; exit: DelegateProcessExit } | { kind: "stream_error"; error: unknown };
     if (executionResult.kind === "timeout" || executionResult.kind === "aborted") {
-      records.push(cleanupRecord(await terminateDelegateProcess(
-        delegatedProcess, terminationGraceMs, cleanupTimeoutMs, treeKiller,
-      )));
+      records.push(cleanupRecord(await terminateAndCloseEventStream()));
       streamOutcome = { kind: "stream_error", error: executionResult.kind };
     } else if (executionResult.kind === "error") {
-      records.push(cleanupRecord(await terminateDelegateProcess(
-        delegatedProcess, terminationGraceMs, cleanupTimeoutMs, treeKiller,
-      )));
+      records.push(cleanupRecord(await terminateAndCloseEventStream()));
       streamOutcome = { kind: "stream_error", error: executionResult.error };
     } else {
       streamOutcome = executionResult.value;
       if (streamOutcome.kind === "stream_error") {
-        records.push(cleanupRecord(await terminateDelegateProcess(
-          delegatedProcess, terminationGraceMs, cleanupTimeoutMs, treeKiller,
-        )));
+        records.push(cleanupRecord(await terminateAndCloseEventStream()));
       }
     }
 

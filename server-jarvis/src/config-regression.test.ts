@@ -68,6 +68,11 @@ describe("configuration regression coverage retained during Task 6", () => {
     expect(cfg.orchestrator.max_recursion_depth).toBeGreaterThan(0);
     expect(cfg.orchestrator.conductor_learning.enabled).toBe(true);
     expect(cfg.orchestrator.skill_distillation.auto_promote).toBe(false);
+    expect(cfg.tools.run_gate).toBe(true);
+  });
+
+  test("preserves the run-gate kill switch through normalization", () => {
+    expect(normalizeConfig({ tools: { run_gate: false } }).tools.run_gate).toBe(false);
   });
 
   test("round-trips explicit filesystem root settings through Bun normalization", () => {

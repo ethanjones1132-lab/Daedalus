@@ -195,6 +195,20 @@ describe("FilesystemBundle > write_file", () => {
     expect(readFileSync(join(granted, "generated", "new.txt"), "utf-8")).toBe("granted write\n");
     expect(existsSync(join(workspace, "generated", "new.txt"))).toBe(false);
   });
+
+  test("write_file returns is_error and preserves the file when content is identical", async () => {
+    const ws = makeTempWorkspace();
+    const path = join(ws, "same.txt");
+    writeFileSync(path, "unchanged\n");
+    const result = await makeRuntime().execute(
+      call("write_file", { path: "same.txt", content: "unchanged\n" }),
+      makeCtx(ws),
+    );
+
+    expect(result.is_error).toBe(true);
+    expect(result.error).toContain("wrote identical content");
+    expect(readFileSync(path, "utf-8")).toBe("unchanged\n");
+  });
 });
 
 describe("FilesystemBundle > edit_file (read-before-edit guard)", () => {
@@ -256,6 +270,41 @@ describe("FilesystemBundle > edit_file (read-before-edit guard)", () => {
     );
     expect(result.is_error).toBe(false);
     expect(readFileSync(join(ws, "f.txt"), "utf-8")).toBe("hi world");
+  });
+
+  test("edit_file returns is_error for a no-op replacement", async () => {
+    const ws = makeTempWorkspace();
+    writeFileSync(join(ws, "noop.txt"), "hello world");
+    const rt = makeRuntime();
+    const ctx = makeCtx(ws);
+    await rt.execute(call("read_file", { path: "noop.txt" }), ctx);
+    const result = await rt.execute(
+      call("edit_file", { path: "noop.txt", old_string: "hello", new_string: "hello" }),
+      ctx,
+    );
+
+    expect(result.is_error).toBe(true);
+    expect(result.error).toContain("edit is a no-op");
+    expect(readFileSync(join(ws, "noop.txt"), "utf-8")).toBe("hello world");
+  });
+
+  test("multi_edit returns is_error when every requested edit is skipped", async () => {
+    const ws = makeTempWorkspace();
+    writeFileSync(join(ws, "multi-noop.txt"), "alpha\nbeta\n");
+    const rt = makeRuntime();
+    const ctx = makeCtx(ws);
+    await rt.execute(call("read_file", { path: "multi-noop.txt" }), ctx);
+    const result = await rt.execute(
+      call("multi_edit", {
+        path: "multi-noop.txt",
+        edits: [{ old_string: "missing", new_string: "still missing" }],
+      }),
+      ctx,
+    );
+
+    expect(result.is_error).toBe(true);
+    expect(result.error).toContain("no applicable edits");
+    expect(readFileSync(join(ws, "multi-noop.txt"), "utf-8")).toBe("alpha\nbeta\n");
   });
 
   // ── 2026-07-18: line-number-gutter tolerance ──

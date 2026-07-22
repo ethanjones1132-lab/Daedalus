@@ -153,6 +153,8 @@ export interface ToolConfig {
   bash_path: string;
   /** Ceiling for a single shell invocation, in milliseconds. */
   shell_timeout_max_ms: number;
+  /** Run a bounded direct-argv verification target after successful writes. */
+  run_gate: boolean;
 }
 
 export interface ReasoningConfig {
@@ -520,6 +522,7 @@ export function defaultConfig(): JarvisConfig {
       grant_session_roots: true,
       bash_path: "",
       shell_timeout_max_ms: 120_000,
+      run_gate: true,
     },
     reasoning: {
       enabled: true,

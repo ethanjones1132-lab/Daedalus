@@ -150,6 +150,62 @@ describe("runPipelineWithReplanning", () => {
     expect(result.outcome).not.toBe("degraded");
   });
 
+  test("a deterministic run-gate failure forces a rewrite even when the reviewer says ACCEPT", async () => {
+    const stageLabels: string[] = [];
+    const callModel = async (_messages: any[], options?: any) => {
+      const stage = options?.stageLabel ?? "?";
+      stageLabels.push(stage);
+      if (stage === "planner") return { content: "PLAN: fix it" };
+      if (stage === "executor") {
+        return {
+          content: "Executor wrote the file.",
+          tool_calls: [{ id: "write-1", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: "solution.py", content: "print('ok')" }) } }],
+        };
+      }
+      if (stage === "reviewer") return { content: "ACCEPT" };
+      if (stage === "synthesizer") return { content: "Done." };
+      return { content: "Rewriter repaired the file." };
+    };
+    const gatedRuntime = createToolRuntime();
+    gatedRuntime.register({
+      type: "function",
+      function: { name: "write_file", description: "test write", parameters: { type: "object", properties: {}, required: [] } },
+      dangerous: false,
+      requires_approval: false,
+    }, async () => "wrote");
+    let checks = 0;
+    class GatedExecutor extends PipelineExecutor {
+      protected async gateWrittenRun() {
+        checks++;
+        return checks === 1
+          ? { status: "failed" as const, target: "solution.py", issues: [{ path: "solution.py", error: "RuntimeError: broken" }] }
+          : { status: "passed" as const, target: "solution.py", issues: [] };
+      }
+    }
+    const runCtx = makeExecutionContext("agent", defaultConfig(), {
+      workspace_path: process.cwd(),
+      skip_approval_gate: true,
+    });
+    const executor = new GatedExecutor(callModel as any, gatedRuntime, runCtx, testCollector);
+    const coordinator = new Coordinator((async () => ({ content: "unused" })) as any);
+
+    const result = await runPipelineWithReplanning({
+      contextMessage: "fix the bug in solution.py and write the change",
+      initialDecision: baseDecision({ pipeline: ["planner", "executor", "reviewer", "synthesizer"] }),
+      turnRequirement: "full_execution",
+      coordinator,
+      routeOptions: { sessionId: "run-gate-repair" },
+      executor,
+      agentRunId: "run-run-gate-repair",
+      onStateChange: () => {},
+      baseOptions: { rawMessage: "fix the bug in solution.py and write it", maxReviewRepairRounds: 1 },
+      maxReplans: 2,
+    });
+
+    expect(checks).toBe(1);
+    expect(stageLabels).toContain("rewriter");
+  });
+
   test("planner double-empty bypasses live-conductor self-reroute accounting", async () => {
     const stageLabels: string[] = [];
     const callModel = async (_messages: any[], options?: any) => {
