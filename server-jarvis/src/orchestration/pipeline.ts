@@ -3324,6 +3324,10 @@ export class PipelineExecutor {
           ...opts,
           priorToolCalls: state.executor?.toolCalls ?? opts.priorToolCalls,
         };
+        // B5: snapshot the shared content-effect log before candidate one runs
+        // so we can isolate the byte-level effects THIS executor run produced
+        // (same length-mark + post-run slice idiom A3 uses in the repair loop).
+        const candidateOneContentMark = this.ctx.write_effects?.length ?? 0;
         state.executor = await this.runExecutorStage(
           request, renderPlanSummary(state.plan), agentRunId, onStateChange, executorOptions, profile, remainingNow(),
         );
@@ -3357,7 +3361,19 @@ export class PipelineExecutor {
           const gateFailure = candidateSyntax.length > 0
             || candidateRun.issues.length > 0
             || candidateEffect.verdict === "no_write_effect";
-          if (gateFailure) {
+          // B5: only escalate to a second, independently-reasoning executor
+          // when candidate one changed ZERO file content. If candidate one
+          // already mutated the workspace (even flawed/incomplete per the
+          // gates), a fresh candidate two that never saw those writes would
+          // start from a clean transcript over a dirty filesystem and risk
+          // compounding rather than replacing the change. In that case leave
+          // candidate one's own result in place and let the existing
+          // reviewer/rewriter repair loop (progress-gated, A3) refine it with
+          // full context of what was actually written. Escalate only when
+          // there is nothing on disk for a second attempt to trample.
+          const candidateOneEffects = this.ctx.write_effects?.slice(candidateOneContentMark) ?? [];
+          const candidateOneHadContentDelta = hasContentDelta(candidateOneEffects);
+          if (gateFailure && !candidateOneHadContentDelta) {
             const firstModelKey = candidateOne.modelKey!;
             onStateChange({
               stage: "executor",

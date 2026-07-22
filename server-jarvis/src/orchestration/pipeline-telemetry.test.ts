@@ -103,6 +103,152 @@ describe("pipeline stage telemetry", () => {
     expect(exclusions[2]).toEqual(["openrouter:model-one"]);
   });
 
+  // B5: the high-complexity alternate-executor escalation only fires when
+  // candidate one's own executor run changed ZERO file content. A gate-failing
+  // candidate one that DID mutate content must NOT be trampled by a second,
+  // independently-reasoning executor that never saw those writes; it flows to
+  // the reviewer/rewriter repair loop with full context instead.
+  describe("B5: alternate executor gated on candidate-one content delta", () => {
+    // Shared executor subclass: syntax gate fails on the FIRST candidate only,
+    // then passes — identical to the existing P2.3 regression harness above.
+    class GateFailFirstExecutor extends PipelineExecutor {
+      private syntaxGateCalls = 0;
+      protected async gateWrittenSyntax(_toolCalls: any[]): Promise<any[]> {
+        this.syntaxGateCalls++;
+        return this.syntaxGateCalls === 1
+          ? [{ path: "p2-retry.py", message: "invalid syntax", kind: "syntax" }]
+          : [];
+      }
+      protected async gateWrittenRun(): Promise<any> {
+        return { status: "skipped", reason: "test", issues: [] };
+      }
+    }
+
+    // Executor subclass whose gates all PASS (case c).
+    class GatePassExecutor extends PipelineExecutor {
+      protected async gateWrittenSyntax(_toolCalls: any[]): Promise<any[]> {
+        return [];
+      }
+      protected async gateWrittenRun(): Promise<any> {
+        return { status: "skipped", reason: "test", issues: [] };
+      }
+    }
+
+    function recordDelta(ctx: any) {
+      // Mirror what a native write handler appends: a changed:true observation.
+      ctx.write_effects?.push({
+        toolName: "write_file",
+        path: "p2-retry.py",
+        before: { path: "p2-retry.py", exists: false, bytes: 0, sha256: null },
+        after: { path: "p2-retry.py", exists: true, bytes: 5, sha256: "deadbeef" },
+        changed: true,
+      });
+    }
+
+    function makeExecutorCallModel(exclusions: string[][], counter: { n: number }) {
+      return async (_messages: unknown[], options: any = {}) => {
+        if (options.stageLabel === "executor") {
+          exclusions.push(options.excludeModels ?? []);
+          const model = counter.n < 2 ? "model-one" : "model-two";
+          const writeTurn = counter.n % 2 === 0;
+          counter.n++;
+          return {
+            content: writeTurn ? "candidate write" : "candidate complete",
+            ...(writeTurn ? { tool_calls: [toolCallWithArgs("write_file", { path: "p2-retry.py", content: "fixed" })] } : {}),
+            _provider: "openrouter",
+            _modelUsed: model,
+          };
+        }
+        if (options.stageLabel === "reviewer") return { content: "ACCEPT" };
+        if (options.stageLabel === "synthesizer") return { content: "final answer" };
+        return { content: "plan" };
+      };
+    }
+
+    // Case (a) — regression guard: candidate one fails gates AND its writes
+    // changed nothing (empty write_effects) → the alternate executor runs, as
+    // before this fix existed.
+    test("candidate one fails gates with ZERO content delta -> alternate executor runs", async () => {
+      const runtime = createToolRuntime();
+      runtime.register(toolDefinition("write_file"), async () => "written"); // records no effect
+      const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+      ctx.config.tools.require_approval = [];
+      const exclusions: string[][] = [];
+      const counter = { n: 0 };
+
+      const executor = new GateFailFirstExecutor(makeExecutorCallModel(exclusions, counter) as any, runtime, ctx, { recordStageRun: () => {} });
+      const result = await executor.execute("fix p2-retry.py", ["executor", "reviewer", "synthesizer"], "run-b5-a", () => {}, {
+        executionProfile: "full",
+        estimatedComplexity: "high",
+        rawMessage: "fix p2-retry.py",
+        maxReviewRepairRounds: 0,
+        allowMidRunReplan: false,
+      });
+
+      expect(result.answer).toBe("final answer");
+      expect(counter.n).toBe(4); // candidate one (2 calls) + candidate two (2 calls)
+      expect(exclusions[2]).toEqual(["openrouter:model-one"]); // candidate two excludes model one
+      expect(result.toolCalls).toHaveLength(2); // merged: candidate one + candidate two writes
+    });
+
+    // Case (b) — the fix: candidate one fails gates BUT its writes changed real
+    // file content → the alternate executor does NOT run; candidate one's own
+    // (unmerged) result stands and flows to the reviewer/rewriter loop.
+    test("candidate one fails gates WITH a content delta -> alternate executor is skipped", async () => {
+      const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+      const runtime = createToolRuntime();
+      runtime.register(toolDefinition("write_file"), async () => {
+        recordDelta(ctx); // candidate one really changed content
+        return "written";
+      });
+      ctx.config.tools.require_approval = [];
+      const exclusions: string[][] = [];
+      const counter = { n: 0 };
+
+      const executor = new GateFailFirstExecutor(makeExecutorCallModel(exclusions, counter) as any, runtime, ctx, { recordStageRun: () => {} });
+      const result = await executor.execute("fix p2-retry.py", ["executor", "reviewer", "synthesizer"], "run-b5-b", () => {}, {
+        executionProfile: "full",
+        estimatedComplexity: "high",
+        rawMessage: "fix p2-retry.py",
+        maxReviewRepairRounds: 0,
+        allowMidRunReplan: false,
+      });
+
+      expect(result.answer).toBe("final answer");
+      expect(counter.n).toBe(2); // ONLY candidate one ran (2 model calls)
+      expect(exclusions).toHaveLength(2); // no third executor call => no exclusion entry
+      expect(result.toolCalls).toHaveLength(1); // candidate one's own single write, not a merge
+    });
+
+    // Case (c) — unchanged: candidate one PASSES its gates → no escalation at
+    // all, regardless of content delta.
+    test("candidate one passes its gates -> no escalation", async () => {
+      const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+      const runtime = createToolRuntime();
+      runtime.register(toolDefinition("write_file"), async () => {
+        recordDelta(ctx); // real write so the effect gate is clean
+        return "written";
+      });
+      ctx.config.tools.require_approval = [];
+      const exclusions: string[][] = [];
+      const counter = { n: 0 };
+
+      const executor = new GatePassExecutor(makeExecutorCallModel(exclusions, counter) as any, runtime, ctx, { recordStageRun: () => {} });
+      const result = await executor.execute("fix p2-retry.py", ["executor", "reviewer", "synthesizer"], "run-b5-c", () => {}, {
+        executionProfile: "full",
+        estimatedComplexity: "high",
+        rawMessage: "fix p2-retry.py",
+        maxReviewRepairRounds: 0,
+        allowMidRunReplan: false,
+      });
+
+      expect(result.answer).toBe("final answer");
+      expect(counter.n).toBe(2); // no alternate executor
+      expect(exclusions).toHaveLength(2);
+      expect(result.toolCalls).toHaveLength(1);
+    });
+  });
+
   test("preserves streamed synthesis as a partial answer when the turn deadline expires", async () => {
     const runtime = createToolRuntime();
     const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
