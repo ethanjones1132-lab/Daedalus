@@ -40,6 +40,7 @@ import {
 } from './chat-state';
 import { errorDisplayForCode } from './error-display';
 import { formatSessionStatsLine, shouldShowSessionStats } from './session-stats';
+import { filterSessions, formatFilterResultCount } from './session-filter';
 import {
   Send, Square, Bot, User, Wrench, Check, Copy, ChevronDown,
   ChevronRight, Sparkles, LoaderCircle, Plus, ArrowDown,
@@ -2372,6 +2373,12 @@ function SessionsPanel({
   onDelete: () => void;
   onRefresh: () => void;
 }) {
+  // Free-text filter — case-insensitive subsequence match against name /
+  // title / id / model / backend. See `session-filter.ts` for the contract.
+  const [filterQuery, setFilterQuery] = useState('');
+  const filteredSessions = filterSessions(sessions, filterQuery);
+  const isFiltering = filterQuery.trim().length > 0;
+
   const handleDelete = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
     try {
@@ -2385,7 +2392,9 @@ function SessionsPanel({
   return (
     <div className="h-full flex flex-col">
       <div className="flex items-center justify-between mb-4">
-        <h2 className="text-lg font-bold text-bone tracking-tight">Sessions <span className="text-bone-font text-sm font-mono">({sessions.length})</span></h2>
+        <h2 className="text-lg font-bold text-bone tracking-tight">
+          Sessions <span className="text-bone-font text-sm font-mono">{formatFilterResultCount(filteredSessions.length, sessions.length)}</span>
+        </h2>
         <div className="flex gap-2">
           <button
             onClick={onRefresh}
@@ -2404,6 +2413,36 @@ function SessionsPanel({
         </div>
       </div>
 
+      {/* Search input — narrows the list to matches on name / title / id /
+          model / backend. Hidden when the session list is empty (no point in
+          filtering zero rows). The X button only appears while a query is
+          active, so the empty input takes the same visual space as before. */}
+      {sessions.length > 0 && (
+        <div className="mb-3 flex items-center gap-2">
+          <div className="relative flex-1">
+            <input
+              type="text"
+              value={filterQuery}
+              onChange={(e) => setFilterQuery(e.target.value)}
+              placeholder="Filter by name, model, or id…"
+              aria-label="Filter sessions"
+              data-testid="sessions-filter-input"
+              className="w-full px-3 py-1.5 pr-7 text-xs font-mono text-bone bg-iron/10 border border-iron/30 rounded-lg placeholder:text-bone-faint focus:outline-none focus:border-cyan-neon/40 focus:ring-1 focus:ring-cyan-neon/30"
+            />
+            {isFiltering && (
+              <button
+                type="button"
+                onClick={() => setFilterQuery('')}
+                aria-label="Clear filter"
+                className="absolute right-1.5 top-1/2 -translate-y-1/2 text-bone-faint hover:text-bone-dim text-xs font-mono px-1 rounded focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-neon/40"
+              >
+                ✕
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       <div className="flex-1 overflow-y-auto space-y-2">
         {sessions.length === 0 ? (
           <div className="flex items-center justify-center h-48">
@@ -2412,8 +2451,15 @@ function SessionsPanel({
               <p className="text-bone-faint text-xs font-mono mt-1">Start a chat to create one</p>
             </div>
           </div>
+        ) : filteredSessions.length === 0 ? (
+          <div className="flex items-center justify-center h-48">
+            <div className="text-center">
+              <p className="text-bone-dim text-sm font-mono">No sessions match "{filterQuery}"</p>
+              <p className="text-bone-faint text-xs font-mono mt-1">Try a different name, model, or id prefix</p>
+            </div>
+          </div>
         ) : (
-          sessions.map(session => (
+          filteredSessions.map(session => (
             <GlassCard
               key={session.id}
               className={cn(activeSession === session.id && 'border-royal/40 bg-royal/10')}
@@ -2430,13 +2476,16 @@ function SessionsPanel({
                     {session.message_count} msgs · {new Date(session.created_at).toLocaleDateString()}
                     {sessionRuns[session.id] && (
                       <span className="ml-2">
-                        · <span className={{
-                          success: 'text-emerald-400',
-                          partial: 'text-amber-400',
-                          failed: 'text-error',
-                          timed_out: 'text-amber-400',
-                          cancelled: 'text-bone-dim',
-                        }[sessionRuns[session.id]!.outcome]}>
+                        ·{' '}
+                        <span
+                          className={cn(
+                            sessionRuns[session.id]!.outcome === 'success' && 'text-emerald-400',
+                            sessionRuns[session.id]!.outcome === 'partial' && 'text-amber-400',
+                            sessionRuns[session.id]!.outcome === 'failed' && 'text-error',
+                            sessionRuns[session.id]!.outcome === 'timed_out' && 'text-amber-400',
+                            sessionRuns[session.id]!.outcome === 'cancelled' && 'text-bone-dim',
+                          )}
+                        >
                           {sessionRuns[session.id]!.outcome}
                         </span>
                         {sessionRuns[session.id]!.selected_model && (
