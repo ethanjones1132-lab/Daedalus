@@ -41,9 +41,11 @@ describe("orchestration performance guardrails", () => {
       expect(repairBudgetExhausted({ repairs: 3, baseCap: 2, lastRoundHadContentDelta: true })).toBe(true);
     });
 
-    test("fails safe when progress cannot be proven", () => {
-      // No observed delta => the base cap is the hard cap; no bonus round.
-      expect(repairBudgetExhausted({ repairs: 2, baseCap: 2, lastRoundHadContentDelta: false })).toBe(true);
+    test("the ceiling holds even well past it and regardless of delta", () => {
+      // Defensive: a caller that somehow overshoots the ceiling is still
+      // stopped, and a lingering delta signal cannot reopen the budget.
+      expect(repairBudgetExhausted({ repairs: 4, baseCap: 2, lastRoundHadContentDelta: true })).toBe(true);
+      expect(repairBudgetExhausted({ repairs: 9, baseCap: 3, lastRoundHadContentDelta: true })).toBe(true);
     });
 
     test("a zero base cap disables repair entirely", () => {

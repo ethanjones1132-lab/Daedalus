@@ -74,6 +74,7 @@ import {
   type RunClaudeDelegateInput,
 } from "./claude-delegate";
 import type { JarvisConfig } from "../config";
+import { DEFAULT_REVIEW_REPAIR_ROUNDS, MAX_REVIEW_REPAIR_ROUNDS } from "../config";
 
 /**
  * The slice of the outcome collector the pipeline depends on. Injecting this
@@ -2421,10 +2422,10 @@ export class PipelineExecutor {
     // but this stays defensive for callers that pass a raw value. A conditional
     // bonus round beyond this cap is granted by repairBudgetExhausted() only on
     // proven content progress.
-    const configuredRepairRounds = Number(options.maxReviewRepairRounds ?? 2);
+    const configuredRepairRounds = Number(options.maxReviewRepairRounds ?? DEFAULT_REVIEW_REPAIR_ROUNDS);
     const maxRepairRounds = Number.isFinite(configuredRepairRounds)
-      ? Math.min(3, Math.max(0, Math.floor(configuredRepairRounds)))
-      : 2;
+      ? Math.min(MAX_REVIEW_REPAIR_ROUNDS, Math.max(0, Math.floor(configuredRepairRounds)))
+      : DEFAULT_REVIEW_REPAIR_ROUNDS;
     let reviewCount = 0;
     let repairs = 0;
     // Tracks whether the most recent rewriter round changed file bytes. Seeds
@@ -2550,6 +2551,22 @@ export class PipelineExecutor {
             reviewerFeedback = renderRunIssues(runGate) + "\n\n" + reviewerFeedback;
           }
           hasPendingIssues = true;
+        }
+        // A3 telemetry: at the base-cap boundary the next round would be the
+        // progress-gated bonus round. Emit one distinguishable log line for
+        // whether it is GRANTED (prior round changed file bytes) or REFUSED
+        // (no proven progress) so this deliberate latency tradeoff is
+        // observable in production — grep `[Pipeline] repair bonus round`.
+        const atBonusBoundary = maxRepairRounds >= 1
+          && repairs === maxRepairRounds
+          && hasPendingIssues
+          && profile === "full"
+          && writeIntentForTurn;
+        if (atBonusBoundary) {
+          console.log(
+            `[Pipeline] repair bonus round ${lastRoundHadContentDelta ? "granted (content delta confirmed)" : "refused (no content delta)"}`
+            + ` at base cap ${maxRepairRounds}, run=${agentRunId}`,
+          );
         }
         if (
           !hasPendingIssues
@@ -3163,7 +3180,7 @@ export class PipelineExecutor {
           profile === "full" &&
           reviewerReplanEligible &&
           (!rewriter || rewriter.ok) &&
-          (options.maxReviewRepairRounds ?? 1) > 0
+          (options.maxReviewRepairRounds ?? DEFAULT_REVIEW_REPAIR_ROUNDS) > 0
         ) {
           replanRequested = {
             trigger: "reviewer_reject",
@@ -3204,7 +3221,7 @@ export class PipelineExecutor {
     if (
       effectGate.verdict === "no_write_effect" &&
       profile === "full" &&
-      (options.maxReviewRepairRounds ?? 1) > 0 &&
+      (options.maxReviewRepairRounds ?? DEFAULT_REVIEW_REPAIR_ROUNDS) > 0 &&
       turnWriteIntent &&
       state.executor &&
       !state.rewriter

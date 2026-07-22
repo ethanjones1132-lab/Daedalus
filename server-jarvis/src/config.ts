@@ -11,6 +11,15 @@ import { execSync } from "child_process";
 import { DEFAULT_ORCHESTRATOR_AGENTS, type OrchestratorAgent } from "./orchestration/agent-pool";
 import { validateOrchestratorAgents } from "./orchestration/agent-validation";
 
+// ── A3: review→rewrite repair budget ──
+// Base cap of repair rounds that run unconditionally on a gate/reviewer
+// failure. The pipeline grants at most ONE progress-gated bonus round beyond
+// this (only on a real content delta), so the absolute ceiling is base + 1.
+// Single source of truth: referenced by defaultConfig(), the normalizeConfig
+// clamp, and the pipeline's defensive clamp + replan-eligibility guards.
+export const DEFAULT_REVIEW_REPAIR_ROUNDS = 2;
+export const MAX_REVIEW_REPAIR_ROUNDS = 3;
+
 // ── Types ──
 
 export type BackendType = 'ollama' | 'openrouter' | 'claude_cli';
@@ -546,7 +555,7 @@ export function defaultConfig(): JarvisConfig {
       max_recursion_depth: 2,
       max_conductor_replans: 2,
       max_conductor_replans_per_session: 6,
-      max_review_repair_rounds: 2,
+      max_review_repair_rounds: DEFAULT_REVIEW_REPAIR_ROUNDS,
       high_complexity_executor_retry: true,
       mid_run_replan: true,
       dynamic_agents: {
@@ -738,8 +747,8 @@ export function normalizeConfig(raw: any, options: NormalizeConfigOptions = {}):
   // (the loop grants one conditional 3rd round only on a real content delta).
   const configuredRepairRounds = Number(merged.orchestrator.max_review_repair_rounds);
   merged.orchestrator.max_review_repair_rounds = Number.isFinite(configuredRepairRounds)
-    ? Math.min(3, Math.max(0, Math.floor(configuredRepairRounds)))
-    : 2;
+    ? Math.min(MAX_REVIEW_REPAIR_ROUNDS, Math.max(0, Math.floor(configuredRepairRounds)))
+    : DEFAULT_REVIEW_REPAIR_ROUNDS;
   const openRouterKey = process.env.OPENROUTER_API_KEY || process.env.OPENROUTER_KEY;
   const openCodeKey = process.env.OPENCODE_API_KEY || process.env.OPENCODE_KEY;
   const openCodeZenKey = process.env.OPENCODE_ZEN_API_KEY || process.env.OPENCODE_ZEN_KEY || openCodeKey;
