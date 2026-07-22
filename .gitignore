@@ -67,6 +67,9 @@ scripts/jarvis-2026-07-21-evening-priorities.py
 scripts/render-session-stats-pill.py
 scripts/fix-session-stats-pill-props.py
 scripts/verify-session-stats-feature.py
+scripts/prepend-priorities-session-stats.py
+scripts/diagnose-priorities.py
+scripts/verify-priorities-update.py
 
 # --- Live benchmark output ---
 scripts/benchmark-tier2b/results-tier2b.json
