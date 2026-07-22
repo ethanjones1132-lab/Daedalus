@@ -352,7 +352,11 @@ export interface OrchestratorConfig {
   max_conductor_replans_per_session: number;
   /** Maximum automatic review -> rewrite repair rounds for a full turn. */
   max_review_repair_rounds: number;
-  /** Retry a high-complexity change once with a different strong executor after a deterministic gate failure. */
+  /** Retry a high-complexity change once with a different strong executor after
+   *  a deterministic gate failure — but only when candidate one changed ZERO
+   *  file content (B5). If it failed the gates yet still mutated content, the
+   *  retry is skipped and the reviewer/rewriter loop repairs that output
+   *  instead, so a second model never tramples candidate one's writes. */
   high_complexity_executor_retry?: boolean;
   /**
    * B1: when true (default), a turn whose deterministic gates BOTH positively

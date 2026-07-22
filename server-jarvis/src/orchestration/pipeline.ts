@@ -3373,6 +3373,15 @@ export class PipelineExecutor {
           // there is nothing on disk for a second attempt to trample.
           const candidateOneEffects = this.ctx.write_effects?.slice(candidateOneContentMark) ?? [];
           const candidateOneHadContentDelta = hasContentDelta(candidateOneEffects);
+          if (gateFailure && candidateOneHadContentDelta) {
+            // Distinguishable in logs from "gates passed, no attempt" (no line)
+            // and "escalation ran" (high_complexity_retry state change): the
+            // gate failed but candidate one already changed content, so we
+            // preserve it for the reviewer/rewriter loop instead of retrying.
+            console.log(
+              `[Pipeline] P2.3 escalation skipped: candidate one has a content delta, run=${agentRunId}`,
+            );
+          }
           if (gateFailure && !candidateOneHadContentDelta) {
             const firstModelKey = candidateOne.modelKey!;
             onStateChange({
