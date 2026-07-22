@@ -1198,6 +1198,7 @@ describe("Orchestration & Routing Tests", () => {
       "powershell",
       "web_search", "web_fetch",
       "agent", "run_background_command",
+      "mcp_list_tools", "mcp_call_tool", "mcp_read_resource",
     ]);
   });
 });

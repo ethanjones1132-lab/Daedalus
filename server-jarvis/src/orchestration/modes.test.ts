@@ -46,6 +46,9 @@ const FULL_TOOLBOX: ToolDefinition[] = [
   tool("web_fetch"),
   tool("agent"),
   tool("run_background_command"),
+  tool("mcp_list_tools"),
+  tool("mcp_call_tool"),
+  tool("mcp_read_resource"),
 ];
 
 describe("READ_ONLY_TOOLS", () => {
@@ -106,7 +109,26 @@ describe("BUILTIN_MODES — per-mode contract", () => {
     expect(BUILTIN_MODES.executor.tools_filter).toContain("powershell");
     expect(BUILTIN_MODES.executor.tools_filter).toContain("web_search");
     expect(BUILTIN_MODES.executor.tools_filter).toContain("agent");
+    expect(BUILTIN_MODES.executor.tools_filter).toEqual(expect.arrayContaining([
+      "mcp_list_tools",
+      "mcp_call_tool",
+      "mcp_read_resource",
+    ]));
     expect(BUILTIN_MODES.executor.max_turns).toBe(4);
+  });
+
+  test("executor exposes MCP discovery, execution, and resource reads without widening reviewer access", () => {
+    const executorTools = getToolsForMode("executor", FULL_TOOLBOX).map((t) => t.function.name);
+    expect(executorTools).toEqual(expect.arrayContaining([
+      "mcp_list_tools",
+      "mcp_call_tool",
+      "mcp_read_resource",
+    ]));
+
+    const reviewerTools = getToolsForMode("reviewer", FULL_TOOLBOX).map((t) => t.function.name);
+    expect(reviewerTools).not.toContain("mcp_list_tools");
+    expect(reviewerTools).not.toContain("mcp_call_tool");
+    expect(reviewerTools).not.toContain("mcp_read_resource");
   });
 
   test("reviewer is inspection-only (no write, no bash, no network, no agent)", () => {

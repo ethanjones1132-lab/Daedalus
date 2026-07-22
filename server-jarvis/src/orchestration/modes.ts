@@ -50,6 +50,9 @@ export const BUILTIN_MODES: Record<string, AgentMode> = {
       "powershell",
       "web_search", "web_fetch",
       "agent", "run_background_command",
+      // MCP discovery/resource reads are safe for the executor; tool calls
+      // remain approval-gated by the MCP client bundle's capability metadata.
+      "mcp_list_tools", "mcp_call_tool", "mcp_read_resource",
     ],
     temperature: 0.3,
     max_tokens: 4096,
