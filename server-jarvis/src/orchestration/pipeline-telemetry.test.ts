@@ -1388,7 +1388,7 @@ describe("pipeline stage telemetry", () => {
   // of rewriter stage_run rows" is NOT the same as "number of repair
   // rounds" -- these tests count actual writes instead, which is the
   // correct proxy for repair-round count.
-  test("repair rounds are hard-capped at 2 even when more are requested and the reviewer keeps flagging issues", async () => {
+  test("repair rounds are hard-capped at the base budget (3) even when more are requested and the reviewer keeps flagging issues", async () => {
     const rows: StageRun[] = [];
     const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
     const runtime = createToolRuntime();
@@ -1446,15 +1446,19 @@ describe("pipeline stage telemetry", () => {
       { executionProfile: "full", maxReviewRepairRounds: 5 },
     );
 
-    // reviewer never stops flagging issues, so the cap itself is what ends
-    // the loop -- exactly 2 repair rounds ran even though 5 were requested.
-    expect(rewriterWriteCount).toBeLessThanOrEqual(2);
-    expect(rewriterWriteCount).toBe(2);
+    // reviewer never stops flagging issues, so the cap itself is what ends the
+    // loop -- exactly 3 repair rounds ran even though 5 were requested (A3
+    // raised the base cap from 2 to 3). The mock write_file here does not
+    // record content effects (only the real filesystem handlers call
+    // recordWriteEffect), so `write_effects` stays empty and the progress-gated
+    // bonus round can never fire -- the base cap is the hard cap.
+    expect(rewriterWriteCount).toBeLessThanOrEqual(3);
+    expect(rewriterWriteCount).toBe(3);
 
     const rewriterWriteRows = rows.filter(
       (row) => row.mode_id === "rewriter" && (row.tool_calls_json ?? "").includes("write_file"),
     );
-    expect(rewriterWriteRows.length).toBe(2);
+    expect(rewriterWriteRows.length).toBe(3);
     expect(synthesizerCallCount).toBe(0);
   });
 

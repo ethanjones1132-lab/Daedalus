@@ -546,7 +546,7 @@ export function defaultConfig(): JarvisConfig {
       max_recursion_depth: 2,
       max_conductor_replans: 2,
       max_conductor_replans_per_session: 6,
-      max_review_repair_rounds: 1,
+      max_review_repair_rounds: 2,
       high_complexity_executor_retry: true,
       mid_run_replan: true,
       dynamic_agents: {
@@ -733,10 +733,13 @@ export function normalizeConfig(raw: any, options: NormalizeConfigOptions = {}):
   if (!merged.claude_cli.delegate.model || !merged.claude_cli.delegate.model.trim()) {
     merged.claude_cli.delegate.model = "deepseek-v4-pro";
   }
+  // A3: base cap of unconditional review→rewrite repair rounds. Default 2, and
+  // the ceiling is 3 so the pipeline's progress-gated bonus round has headroom
+  // (the loop grants one conditional 3rd round only on a real content delta).
   const configuredRepairRounds = Number(merged.orchestrator.max_review_repair_rounds);
   merged.orchestrator.max_review_repair_rounds = Number.isFinite(configuredRepairRounds)
-    ? Math.min(2, Math.max(0, Math.floor(configuredRepairRounds)))
-    : 1;
+    ? Math.min(3, Math.max(0, Math.floor(configuredRepairRounds)))
+    : 2;
   const openRouterKey = process.env.OPENROUTER_API_KEY || process.env.OPENROUTER_KEY;
   const openCodeKey = process.env.OPENCODE_API_KEY || process.env.OPENCODE_KEY;
   const openCodeZenKey = process.env.OPENCODE_ZEN_API_KEY || process.env.OPENCODE_ZEN_KEY || openCodeKey;

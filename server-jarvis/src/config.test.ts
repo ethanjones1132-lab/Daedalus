@@ -24,10 +24,16 @@ describe("normalizeSettingMutation", () => {
 });
 
 describe("review repair budget", () => {
-  test("clamps configured repair rounds to the safe 0..2 range", () => {
-    expect(normalizeConfig({ orchestrator: { max_review_repair_rounds: 99 } }).orchestrator.max_review_repair_rounds).toBe(2);
+  test("clamps configured repair rounds to the safe 0..3 range", () => {
+    // A3: ceiling raised to 3 (base cap) so the progress-gated bonus round has
+    // headroom; default raised to 2.
+    expect(normalizeConfig({ orchestrator: { max_review_repair_rounds: 99 } }).orchestrator.max_review_repair_rounds).toBe(3);
     expect(normalizeConfig({ orchestrator: { max_review_repair_rounds: -3 } }).orchestrator.max_review_repair_rounds).toBe(0);
-    expect(normalizeConfig({ orchestrator: { max_review_repair_rounds: "not-a-number" } }).orchestrator.max_review_repair_rounds).toBe(1);
+    expect(normalizeConfig({ orchestrator: { max_review_repair_rounds: "not-a-number" } }).orchestrator.max_review_repair_rounds).toBe(2);
+  });
+
+  test("defaults the base repair cap to 2", () => {
+    expect(defaultConfig().orchestrator.max_review_repair_rounds).toBe(2);
   });
 });
 

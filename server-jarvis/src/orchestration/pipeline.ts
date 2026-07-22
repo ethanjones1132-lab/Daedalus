@@ -4,6 +4,7 @@ import { deriveEvidenceTaskKind } from "./turn-requirements";
 import { injectToolGuidelines } from "./tool-guidelines";
 import { checkWrittenFilesSyntax, renderSyntaxIssues, type SyntaxIssue } from "./syntax-gate";
 import { renderRunIssues, runWrittenCodeGate, type RunGateResult } from "./run-gate";
+import { hasContentDelta } from "./content-fingerprint";
 import { BUILTIN_MODES, executorTurnLimit, getToolsForMode } from "./modes";
 import { toolResultModelText, type ToolRuntime, type ExecutionContext } from "../tool-runtime";
 import type { CallModelFn, ChatMessage } from "./router";
@@ -380,6 +381,33 @@ export function addedWriteProgress(before: Set<string>, after: Set<string>): boo
     if (!before.has(key)) return true;
   }
   return false;
+}
+
+/**
+ * A3 — progress-gated repair budget. The reviewer→rewriter loop runs up to
+ * `baseCap` repair rounds unconditionally (the configured
+ * `max_review_repair_rounds`, default 2). Beyond that it grants exactly ONE
+ * additional "progress" round — the conditional 3rd on the default budget —
+ * and only when the immediately preceding round produced a real byte-level
+ * content delta (`lastRoundHadContentDelta`), i.e. proof of forward progress,
+ * never merely because a reviewer or gate re-flagged an issue.
+ *
+ * Returns `true` when no further repair round may run.
+ *
+ * Fails safe by design: a `baseCap` of 0 disables repair outright, and when no
+ * content delta can be observed the base cap is the hard cap — an unprovable
+ * round is refused rather than granted.
+ */
+export function repairBudgetExhausted(args: {
+  repairs: number;
+  baseCap: number;
+  lastRoundHadContentDelta: boolean;
+}): boolean {
+  const { repairs, baseCap, lastRoundHadContentDelta } = args;
+  if (baseCap <= 0) return true; // repair disabled
+  if (repairs >= baseCap + 1) return true; // hard ceiling: base rounds + one bonus
+  if (repairs < baseCap) return false; // still within the unconditional base budget
+  return !lastRoundHadContentDelta; // at the base cap: bonus round hinges on progress
 }
 
 function isStageTimeout(error: unknown): boolean {
@@ -2388,12 +2416,20 @@ export class PipelineExecutor {
     const boundedRequest = truncateToTokenBudget(request, 1_000);
     const boundedPlanSummary = truncateToTokenBudget(planSummary, 1_000);
     const boundedExecutorSummary = truncateToTokenBudget(executorSummary, 3_000);
-    const configuredRepairRounds = Number(options.maxReviewRepairRounds ?? 1);
+    // A3: base cap of unconditional repair rounds (default 2). Mirrors the
+    // normalizeConfig clamp — the configured value is normally already clamped,
+    // but this stays defensive for callers that pass a raw value. A conditional
+    // bonus round beyond this cap is granted by repairBudgetExhausted() only on
+    // proven content progress.
+    const configuredRepairRounds = Number(options.maxReviewRepairRounds ?? 2);
     const maxRepairRounds = Number.isFinite(configuredRepairRounds)
-      ? Math.min(2, Math.max(0, Math.floor(configuredRepairRounds)))
-      : 1;
+      ? Math.min(3, Math.max(0, Math.floor(configuredRepairRounds)))
+      : 2;
     let reviewCount = 0;
     let repairs = 0;
+    // Tracks whether the most recent rewriter round changed file bytes. Seeds
+    // false so the bonus round is never granted before any round has run.
+    let lastRoundHadContentDelta = false;
     let hasPendingIssues = true;
     let reviewerFeedback = "No review stage executed.";
     let reviewerOk = true;
@@ -2515,7 +2551,12 @@ export class PipelineExecutor {
           }
           hasPendingIssues = true;
         }
-        if (!hasPendingIssues || profile !== "full" || !writeIntentForTurn || repairs >= maxRepairRounds) {
+        if (
+          !hasPendingIssues
+          || profile !== "full"
+          || !writeIntentForTurn
+          || repairBudgetExhausted({ repairs, baseCap: maxRepairRounds, lastRoundHadContentDelta })
+        ) {
           break;
         }
 
@@ -2523,10 +2564,19 @@ export class PipelineExecutor {
           ...executorToolCalls,
           ...(rewriterOutput?.toolCalls ?? []),
         ]);
+        // A3: snapshot the turn-wide content-effect log so we can isolate the
+        // byte-level effects produced by THIS round's rewriter. `write_effects`
+        // is a single array shared across every repair round (never reset
+        // per-round), so a length mark + post-round slice is the per-round view.
+        // Optional/undefined-safe: an absent log yields an empty slice, so the
+        // progress check fails safe (no bonus round).
+        const contentEffectMark = this.ctx.write_effects?.length ?? 0;
         repairs++;
         onStateChange({ stage: "rewriter", status: "running", output: `\nReviewer flagged issues. Rewriting...\n` });
         rewriterOutput = await this.runRewriterStage(request, reviewerFeedback, executorSummary, agentRunId, onStateChange, options, profile, remainingQueue);
         rewriterSummaryForPrompt = renderRewriterSummary(rewriterOutput);
+        const roundContentEffects = this.ctx.write_effects?.slice(contentEffectMark) ?? [];
+        lastRoundHadContentDelta = hasContentDelta(roundContentEffects);
         const afterWrites = successfulWriteKeys([
           ...executorToolCalls,
           ...(rewriterOutput.toolCalls ?? []),
