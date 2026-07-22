@@ -109,6 +109,16 @@ export interface ConductorRun {
   created_at?: string;
 }
 
+/** Compact routing-quality aggregate consumed by the persistent conductor. */
+export interface ConductorOutcomeSummary {
+  task_type: string;
+  pipeline_shape: string;
+  sample_count: number;
+  success_count: number;
+  success_rate: number;
+  latest_at?: string;
+}
+
 /** Phase 4: worker instruction variant → stage outcome. */
 export interface WorkerInstructionOutcome {
   id: string;
@@ -973,6 +983,40 @@ export class SelfTuningStore {
       return db.query("SELECT * FROM conductor_runs ORDER BY created_at DESC").all() as ConductorRun[];
     } catch (e) {
       console.error("[SelfTuningStore] getConductorRuns failed:", e);
+      return [];
+    } finally {
+      db.close();
+    }
+  }
+
+  /**
+   * Return recent routing outcomes grouped by task type and effective pipeline
+   * shape. The aggregation intentionally happens in SQLite so the conductor
+   * never scans or ships the full routing history into a prompt.
+   */
+  getRecentConductorOutcomeSummaries(days = 7, limit = 3): ConductorOutcomeSummary[] {
+    const db = this.getDb();
+    if (!db) return [];
+    try {
+      const boundedDays = Math.min(30, Math.max(1, Math.floor(days)));
+      const boundedLimit = Math.min(3, Math.max(1, Math.floor(limit)));
+      return db.query(
+        `SELECT
+           task_type,
+           COALESCE(NULLIF(normalized_pipeline_json, ''), pipeline_json) AS pipeline_shape,
+           COUNT(*) AS sample_count,
+           SUM(CASE WHEN run_outcome = 'success' THEN 1 ELSE 0 END) AS success_count,
+           CAST(SUM(CASE WHEN run_outcome = 'success' THEN 1 ELSE 0 END) AS REAL) / COUNT(*) AS success_rate,
+           MAX(created_at) AS latest_at
+         FROM conductor_runs
+         WHERE created_at >= datetime('now', '-' || ? || ' days')
+           AND run_outcome IS NOT NULL
+         GROUP BY task_type, pipeline_shape
+         ORDER BY sample_count DESC, latest_at DESC
+         LIMIT ?`,
+      ).all(boundedDays, boundedLimit) as ConductorOutcomeSummary[];
+    } catch (e) {
+      console.error("[SelfTuningStore] getRecentConductorOutcomeSummaries failed:", e);
       return [];
     } finally {
       db.close();

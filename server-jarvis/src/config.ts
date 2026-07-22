@@ -288,10 +288,8 @@ export interface SkillDistillationConfig {
   distill_on?: ("success" | "degraded" | "failed")[];
   /** Minimum judge score (0-1) required to pass the semantic grounding gate on promotion. */
   min_judge_score?: number;
-  /** When false (default), the post-distill hook only runs the heuristic screen — candidates that
-   *  clear the 6 heuristic gates stay in "candidate" status awaiting an explicit operator promote
-   *  call (which adds the judge gate). When true, restores full automatic promotion including the
-   *  judge gate, same call site as before this flag existed. */
+  /** When true, the post-distill hook runs the existing heuristic screen and
+   *  semantic judge gate before promoting the candidate. */
   auto_promote?: boolean;
 }
 
@@ -613,7 +611,7 @@ export function defaultConfig(): JarvisConfig {
         max_candidates: 200,
         distill_on: ["success"],
         min_judge_score: 0.75,
-        auto_promote: false,
+        auto_promote: true,
       },
     },
     system_prompt: `You are Jarvis, a local AI coding assistant running on Qwen 3.5 9B in WSL2.

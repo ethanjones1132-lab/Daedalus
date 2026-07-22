@@ -86,6 +86,14 @@ describe("Claude CLI delegate config", () => {
   });
 });
 
+describe("skill distillation config", () => {
+  test("enables judge-gated automatic promotion by default", () => {
+    const config = defaultConfig().orchestrator.skill_distillation;
+    expect(config.auto_promote).toBe(true);
+    expect(config.min_judge_score).toBe(0.75);
+  });
+});
+
 describe("stale jarvis_path warning dedupe (Task 3.5)", () => {
   test("warns once per distinct stale path per process, not on every normalization", () => {
     const originalWarn = console.warn;

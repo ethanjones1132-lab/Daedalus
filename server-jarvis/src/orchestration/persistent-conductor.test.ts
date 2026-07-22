@@ -13,6 +13,7 @@ import { defaultConfig } from "../config";
 import { __resetOllamaHealthCacheForTests } from "../ollama";
 import { saveSkillCandidate } from "../intelligence/skill-store";
 import type { SkillCandidate } from "../intelligence/skill-types";
+import { SelfTuningStore } from "../self-tuning/store";
 
 const originalFetch = globalThis.fetch;
 
@@ -88,6 +89,52 @@ describe("PersistentConductor", () => {
   // more involved case). Observed 10.3s in one full-suite run; consistent ~16-344ms
   // in isolation. Same wall-clock-budget-vs-real-work class as the 2026-07-20 4pm
   // claude-delegate verification-snapshot bump (commit 47f3c78).
+
+  test("injects bounded recent conductor outcomes into the local routing turn", async () => {
+    const store = new SelfTuningStore(":memory:");
+    for (const [index, outcome] of (["success", "failed", "success"] as const).entries()) {
+      const runId = `conductor-hint-run-${index}`;
+      store.insertAgentRun({
+        id: runId,
+        session_id: "conductor-hint-session",
+        user_request: "fixture",
+        task_type: "debug",
+        pipeline: JSON.stringify(["planner", "executor", "synthesizer"]),
+        completed: 1,
+      });
+      store.insertConductorRun({
+        id: `conductor-hint-${index}`,
+        agent_run_id: runId,
+        session_id: "conductor-hint-session",
+        routing_json: "{}",
+        conductor_source: "local",
+        task_type: "debug",
+        topology: "linear",
+        pipeline_json: JSON.stringify(["planner", "executor", "synthesizer"]),
+        normalized_pipeline_json: JSON.stringify(["planner", "executor", "synthesizer"]),
+        run_outcome: outcome,
+      });
+    }
+
+    let body: Record<string, any> | undefined;
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/chat")) {
+        body = JSON.parse(String(init?.body ?? "{}"));
+        return Response.json({ message: { role: "assistant", content: '{"task_type":"debug","pipeline":["planner","executor","synthesizer"],"topology":"linear","context":{"needs_workspace_inspection":true,"needs_memory":true,"estimated_complexity":"high"},"coordinator_rationale":"history"}' } });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg = makeConfig({ persist_sessions: false });
+    const conductor = new PersistentConductor(() => cfg, undefined, store);
+    await conductor.routeTurn({ sessionId: "conductor-hint-session", request: "debug this", turnNumber: 1 });
+
+    const userContent = body?.messages?.find((message: any) => message.role === "user")?.content ?? "";
+    expect(userContent).toContain("Recent conductor outcomes by task and pipeline (last 7 days):");
+    expect(userContent).toContain("- debug | planner > executor > synthesizer | 67% success (3 runs)");
+  });
 
   test("uses the local Ollama model and directive schema for live supervision", async () => {
     let body: Record<string, any> | undefined;

@@ -7,6 +7,7 @@ import type { ConductorConfig, JarvisConfig } from "../config";
 import { SESSIONS_DIR } from "../config";
 import { checkOllamaHealth, ollamaBaseUrlCandidates } from "../ollama";
 import { resolveSkillsForConductor } from "../intelligence/skill-resolver";
+import { SelfTuningStore, type ConductorOutcomeSummary } from "../self-tuning/store";
 import {
   CONDUCTOR_DIRECTIVE_JSON_SCHEMA,
   COORDINATOR_ROUTE_JSON_SCHEMA,
@@ -224,7 +225,36 @@ function formatSkillHint(request: string): string {
   return `Promoted skills relevant to this turn:\n${hint}`;
 }
 
-function buildTurnUserContent(input: ConductorRouteTurnInput, memoryBudgetTokens = 2_048): string {
+function formatPipelineShape(shape: string): string {
+  try {
+    const parsed = JSON.parse(shape);
+    if (Array.isArray(parsed)) {
+      return parsed
+        .filter((stage): stage is string => typeof stage === "string" && stage.length > 0)
+        .map((stage) => stage.replace(/^re-enter:/, ""))
+        .join(" > ") || "empty";
+    }
+  } catch {
+    // Keep a malformed historical row bounded and visible rather than hiding
+    // the fact that the stored shape could not be parsed.
+  }
+  return shape.slice(0, 120) || "unknown";
+}
+
+function formatRecentOutcomeHint(summaries: ConductorOutcomeSummary[]): string {
+  if (summaries.length === 0) return "";
+  const lines = summaries.slice(0, 3).map((summary) => {
+    const rate = Math.round(Math.max(0, Math.min(1, Number(summary.success_rate) || 0)) * 100);
+    return `- ${summary.task_type} | ${formatPipelineShape(summary.pipeline_shape)} | ${rate}% success (${summary.sample_count} runs)`;
+  });
+  return `Recent conductor outcomes by task and pipeline (last 7 days):\n${lines.join("\n")}`;
+}
+
+function buildTurnUserContent(
+  input: ConductorRouteTurnInput,
+  memoryBudgetTokens = 2_048,
+  recentOutcomeHint = "",
+): string {
   return [
     `Session ID: ${input.sessionId}`,
     `Coordinator turn: ${input.turnNumber}`,
@@ -232,6 +262,7 @@ function buildTurnUserContent(input: ConductorRouteTurnInput, memoryBudgetTokens
     formatSessionMemoryHints(input.sessionMemoryHints, memoryBudgetTokens),
     formatRecentHistory(input.recentHistory),
     formatSkillHint(input.request),
+    recentOutcomeHint,
     `Current request:\n${input.request}`,
   ].filter(Boolean).join("\n\n");
 }
@@ -250,6 +281,7 @@ export class PersistentConductor {
   constructor(
     private getConfig: () => JarvisConfig,
     private sessionsRoot: string = SESSIONS_DIR,
+    private readonly outcomeStore: SelfTuningStore = new SelfTuningStore(),
   ) {}
 
   private config(): ConductorConfig {
@@ -381,7 +413,14 @@ export class PersistentConductor {
     }
 
     const session = this.getSession(input.sessionId);
-    const userContent = buildTurnUserContent(input, Math.floor(this.config().num_ctx * 0.25));
+    const recentOutcomeHint = formatRecentOutcomeHint(
+      this.outcomeStore.getRecentConductorOutcomeSummaries(7, 3),
+    );
+    const userContent = buildTurnUserContent(
+      input,
+      Math.floor(this.config().num_ctx * 0.25),
+      recentOutcomeHint,
+    );
     const systemPrompt = loadPrompt("coordinator.md");
     const systemHash = hashText(systemPrompt);
 

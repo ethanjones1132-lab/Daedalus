@@ -67,7 +67,7 @@ describe("configuration regression coverage retained during Task 6", () => {
     expect(cfg.tools.grant_session_roots).toBe(true);
     expect(cfg.orchestrator.max_recursion_depth).toBeGreaterThan(0);
     expect(cfg.orchestrator.conductor_learning.enabled).toBe(true);
-    expect(cfg.orchestrator.skill_distillation.auto_promote).toBe(false);
+    expect(cfg.orchestrator.skill_distillation.auto_promote).toBe(true);
     expect(cfg.tools.run_gate).toBe(true);
   });
 
