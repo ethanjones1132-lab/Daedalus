@@ -549,6 +549,15 @@ export async function* streamOpenRouterSSE(
 // ═══════════════════════════════════════════════════════════════
 
 const RETRY_DELAYS = [1000, 2000, 4000]; // ms exponential backoff
+// Cap how many DISTINCT models one chatCompletionWithFallback invocation will
+// grind through before it fails honestly. resolveFallbackCascade appends the
+// ENTIRE free OpenRouter catalog as a tail (see the catalog enumeration in that
+// function), so a single call's cascade can be a dozen-plus models deep. Live
+// telemetry saw up to 17 distinct models served across one benchmark session —
+// "model roulette": long tail latency from sequentially probing many bad picks.
+// Three attempts (stage default + two fallbacks) keep real cross-provider
+// resilience while bounding the pathological tail on any single stage call.
+const MAX_FALLBACK_MODELS = 3;
 const PREFERRED_FREE_FALLBACKS = [
   "openrouter/free",
   "cohere/north-mini-code:free",
@@ -993,9 +1002,15 @@ export async function chatCompletionWithFallback(
   // before declaring the model hung and advancing the cascade. Guards against
   // a model that opens the HTTP connection but never streams (the post-hang
   // diagnosis: multi-minute stalls on a free-router call).
-  for (let modelIdx = 0; modelIdx < effectiveCascade.length; modelIdx++) {
+  // Bound the cascade to at most MAX_FALLBACK_MODELS distinct models per call.
+  // `capHit` records whether we deliberately stopped short of a longer cascade
+  // (so the final error can distinguish "we capped at 3" from "the whole small
+  // pool was genuinely exhausted") for operator diagnosis.
+  const cappedCascade = effectiveCascade.slice(0, MAX_FALLBACK_MODELS);
+  const capHit = effectiveCascade.length > cappedCascade.length;
+  for (let modelIdx = 0; modelIdx < cappedCascade.length; modelIdx++) {
     assertFallbackDeadline(options);
-    const { provider, model_id: model } = effectiveCascade[modelIdx];
+    const { provider, model_id: model } = cappedCascade[modelIdx];
     const target = resolveProviderTarget(cfg, provider);
     const firstTokenTimeoutMs = Math.max(1_000, target.first_token_timeout_ms);
     if (!target.api_key) {
@@ -1205,7 +1220,11 @@ export async function chatCompletionWithFallback(
     }
   }
 
-  throw new Error(`All provider models exhausted. Last error: ${lastError}`);
+  throw new Error(
+    capHit
+      ? `All ${cappedCascade.length} attempted provider models exhausted (fallback cap ${MAX_FALLBACK_MODELS} of ${effectiveCascade.length} available). Last error: ${lastError}`
+      : `All provider models exhausted. Last error: ${lastError}`,
+  );
 }
 
 /**

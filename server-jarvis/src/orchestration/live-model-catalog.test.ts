@@ -3,6 +3,7 @@ import { defaultConfig } from "../config";
 import { AgentPool } from "./agent-pool";
 import {
   discoverLiveOrchestratorAgents,
+  isOpenRouterFreeTextModel,
   resetLiveModelCatalogCache,
 } from "./live-model-catalog";
 
@@ -12,6 +13,59 @@ function json(data: unknown): Response {
     headers: { "content-type": "application/json" },
   });
 }
+
+describe("isOpenRouterFreeTextModel output-modality filter", () => {
+  // OpenRouter's `architecture.modality` is an "<input>-><output>" pair. Only
+  // the OUTPUT side (after the arrow) disqualifies a model from this text/code
+  // orchestration pool. The old check tested `!modality.includes("text")`
+  // against the WHOLE string, so "text->audio" (Lyria's real shape) slipped
+  // through because "text" appears on the INPUT side.
+  const freeAudio = (modality: string) => ({
+    id: "vendor/model:free",
+    name: "Some Model",
+    pricing: { prompt: "0", completion: "0" },
+    architecture: { modality },
+  });
+
+  test("excludes a text-input audio-output model (Lyria's shape)", () => {
+    expect(isOpenRouterFreeTextModel(freeAudio("text->audio"))).toBe(false);
+  });
+
+  test("excludes an explicit image-output model", () => {
+    expect(isOpenRouterFreeTextModel(freeAudio("text->image"))).toBe(false);
+    expect(isOpenRouterFreeTextModel(freeAudio("->image"))).toBe(false);
+  });
+
+  test("admits a text-output model", () => {
+    expect(isOpenRouterFreeTextModel(freeAudio("text->text"))).toBe(true);
+  });
+
+  test("admits a bare text modality with no arrow", () => {
+    expect(isOpenRouterFreeTextModel(freeAudio("text"))).toBe(true);
+  });
+
+  test("admits a vision-input text-output multimodal model", () => {
+    // Input side may contain image/audio; only the output side disqualifies.
+    expect(isOpenRouterFreeTextModel(freeAudio("text+image->text"))).toBe(true);
+  });
+
+  test("output_modalities array still takes precedence over the modality string", () => {
+    // First check (array) is authoritative: an audio-only array excludes even
+    // if the modality string looks text-capable, and a text array admits.
+    expect(isOpenRouterFreeTextModel({
+      id: "vendor/model:free",
+      name: "Some Model",
+      pricing: { prompt: "0", completion: "0" },
+      architecture: { output_modalities: ["audio"], modality: "text->text" },
+    })).toBe(false);
+    expect(isOpenRouterFreeTextModel({
+      id: "vendor/model:free",
+      name: "Some Model",
+      pricing: { prompt: "0", completion: "0" },
+      architecture: { output_modalities: ["text"], modality: "text+image->text" },
+    })).toBe(true);
+  });
+});
 
 describe("live orchestration model catalog", () => {
   test("enables every live free text model, drops stale ids, and includes the live Go plan", async () => {
@@ -99,11 +153,72 @@ describe("live orchestration model catalog", () => {
     expect(keys).toContain("opencode_go:deepseek-v4-flash");
     expect(keys).toContain("opencode_go:minimax-m3");
     expect(keys).toContain("opencode_go:glm-5.2");
-    expect(snapshot.agents.find((agent) => agent.model_id === "deepseek-v4-flash-free")?.enabled).toBe(true);
+    // A configured agent explicitly disabled in static config (`disabled-live-zen`,
+    // enabled:false) must STAY disabled even though the live catalog confirms
+    // `deepseek-v4-flash-free` is free-tier-eligible. The old behavior force-
+    // re-enabled it; DEFAULT_ORCHESTRATOR_AGENTS deliberately disables these
+    // Zen `*-free` ids (they 400 / stall on current keys), so their explicit
+    // enabled:false is authoritative. It remains a documented pool member
+    // (present in `keys`) but never an automatic fallback pick.
+    expect(snapshot.agents.find((agent) => agent.model_id === "deepseek-v4-flash-free")?.enabled).toBe(false);
     expect(snapshot.agents.find((agent) => agent.model_id === "vendor/zero-cost-without-suffix")?.billing_tier).toBe("free");
     expect(snapshot.catalogs.openrouter.status).toBe("live");
     expect(snapshot.catalogs.opencode_zen.status).toBe("live");
     expect(snapshot.catalogs.opencode_go.status).toBe("live");
+  });
+
+  test("respects an explicitly disabled configured agent even when the live catalog confirms it is free", async () => {
+    // Sub-fix B: a configured Zen `*-free` id with enabled:false in static
+    // config (DEFAULT_ORCHESTRATOR_AGENTS deliberately disables these — they
+    // 400 / require billing / stall on current keys) must STAY disabled after
+    // merge, while a newly-discovered free model the catalog surfaces on its
+    // own is still enabled via the separate dynamicAgent() path.
+    resetLiveModelCatalogCache();
+    const cfg = defaultConfig();
+    cfg.openrouter.api_key = "openrouter-test-key";
+    cfg.opencode_zen.api_key = "zen-test-key";
+    cfg.opencode_go.api_key = "go-test-key";
+    cfg.orchestrator.agents = [
+      {
+        id: "zen-nemotron-ultra-free",
+        provider: "opencode_zen",
+        model_id: "nemotron-3-ultra-free",
+        capabilities: { code: 0.8, reasoning: 0.95, speed: 0.55, cost: 1, json_reliability: 0.88 },
+        default_for: [],
+        enabled: false,
+      },
+      {
+        id: "zen-enabled-free",
+        provider: "opencode_zen",
+        model_id: "mimo-v2.5-free",
+        capabilities: { code: 0.72, reasoning: 0.8, speed: 0.7, cost: 1, json_reliability: 0.7 },
+        default_for: [],
+        enabled: true,
+      },
+    ];
+
+    const fetcher: typeof fetch = async (input) => {
+      const url = String(input);
+      if (url.includes("openrouter.ai")) return json([]);
+      if (url.includes("/zen/go/")) return json([]);
+      return json([
+        { id: "nemotron-3-ultra-free" }, // configured + disabled, catalog-free
+        { id: "mimo-v2.5-free" },        // configured + enabled, catalog-free
+        { id: "big-pickle" },            // brand-new free model → dynamicAgent
+      ]);
+    };
+
+    const snapshot = await discoverLiveOrchestratorAgents(cfg, { fetcher, forceRefresh: true });
+    const byModel = (id: string) => snapshot.agents.find((agent) => agent.model_id === id);
+
+    // Explicit enabled:false is authoritative — NOT force-flipped to true.
+    expect(byModel("nemotron-3-ultra-free")?.enabled).toBe(false);
+    // Its free billing tier is still recorded, only its enabled flag is honored.
+    expect(byModel("nemotron-3-ultra-free")?.billing_tier).toBe("free");
+    // A configured agent left enabled stays enabled.
+    expect(byModel("mimo-v2.5-free")?.enabled).toBe(true);
+    // A brand-new free model discovered by the catalog is enabled independently.
+    expect(byModel("big-pickle")?.enabled).toBe(true);
   });
 
   test("uses free capacity first and sorts the discovered Go tail by official cost rank", async () => {
