@@ -46,7 +46,7 @@ import {
   workspaceReadScopeViolation,
   type WorkspaceReadScope,
 } from "./evidence-sufficiency";
-import { substituteToolCall } from "../tool-heal";
+import { substituteToolCall, toolCallSignature, augmentErrorOutput } from "../tool-heal";
 import {
   enforceTranscriptBudget,
   EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS,
@@ -255,6 +255,30 @@ export function partitionToolCalls<T extends { name: string }>(calls: T[]): T[][
 
 function duplicateToolCallKey(call: Pick<ToolCall, "name" | "arguments">): string {
   return `${call.name}:${JSON.stringify(call.arguments)}`;
+}
+
+// Task A5 (missing-artifact damper): count how many times a tool-call signature
+// has ALREADY failed in the executor's history, so the healing hint escalates
+// after the 2nd identical failure instead of the model re-globbing/re-reading a
+// path that isn't there. We count across the WHOLE history — including
+// carried-over prior-segment calls — rather than just this stage's own calls,
+// because the "keep searching for a missing file" spiral this dampens routinely
+// crosses replan-segment boundaries: a file that was absent last segment is
+// still absent, and a fresh segment repeating the same doomed read should reach
+// the escalated "stop repeating" hint immediately, not restart the count.
+// Distinct from `duplicateToolCallKey` (which deflects repeated SUCCESSFUL
+// read-only calls); this counts FAILURES only, via the tool-heal signature.
+export function priorFailureCount(
+  history: Pick<ToolCallRecord, "name" | "arguments" | "is_error">[],
+  signature: string,
+): number {
+  let count = 0;
+  for (const record of history) {
+    if (record.is_error && toolCallSignature(record.name, record.arguments) === signature) {
+      count++;
+    }
+  }
+  return count;
 }
 
 // 2026-07-18: a repeated identical read now REPLAYS the full cached output
@@ -1789,10 +1813,38 @@ export class PipelineExecutor {
           const emittedToolCalls = Boolean(response.tool_calls && response.tool_calls.length > 0);
           if (emittedToolCalls) {
             await this.dispatchToolCalls("executor", response.tool_calls, options, async (tc, call, toolResult) => {
+              const rawOutput = toolResultModelText(toolResult);
+              // Task 2.3 / A5: decide substitution eligibility FIRST. A
+              // directory-misuse error is auto-corrected below (read_file on a
+              // directory -> list_directory), so it must NOT also carry a
+              // redundant healing hint. Every OTHER failure gets the escalating
+              // missing-artifact hint appended (Task A5).
+              const substitution = toolResult.is_error
+                ? substituteToolCall(call.name, call.arguments, rawOutput)
+                : null;
+              let modelOutput = rawOutput;
+              if (toolResult.is_error && !substitution) {
+                // Count prior identical FAILURES across the whole executor
+                // history BEFORE recording this one, so attempt = prior + 1:
+                // first failure -> 1 -> base hint; second identical failure ->
+                // 2 -> escalated "stop repeating, report the limitation" hint.
+                // This is the deterministic note the task asks for after the
+                // 2nd occurrence, and it stops the re-glob/re-read spiral.
+                const signature = toolCallSignature(call.name, call.arguments);
+                const attempt = priorFailureCount(toolCalls, signature) + 1;
+                modelOutput = augmentErrorOutput(rawOutput, attempt);
+              }
+              // The augmented text is the single source of truth: it feeds both
+              // the stored ToolCallRecord.output (read by UI/ToolCallCard, which
+              // renders the `Hint:` line as an actionable suggestion, and by
+              // error telemetry) AND the model-facing tool message, so what the
+              // model saw matches what is recorded/audited. Evidence accounting
+              // filters on `!is_error`, so augmenting error output never inflates
+              // evidence credit.
               toolCalls.push({
                 name: call.name,
                 arguments: call.arguments,
-                output: toolResultModelText(toolResult),
+                output: modelOutput,
                 is_error: toolResult.is_error,
                 error_code: toolResult.error_code,
                 duration_ms: toolResult.duration_ms ?? 0,
@@ -1802,7 +1854,7 @@ export class PipelineExecutor {
                 tool_call_id: tc.id,
                 name: tc.name,
                 content: prepareToolResultForContext(
-                  toolResultModelText(toolResult),
+                  modelOutput,
                   toolResultContextChars,
                   toolResultNote,
                 ).context,
@@ -1818,35 +1870,33 @@ export class PipelineExecutor {
               // full model round-trip on the healing hint. The original
               // failed call stays recorded above so evidence accounting
               // and telemetry still see the model's actual behavior.
-              if (toolResult.is_error) {
-                const sub = substituteToolCall(call.name, call.arguments, toolResultModelText(toolResult));
-                if (sub) {
-                  const subCall: ToolCall = {
-                    id: `call_${crypto.randomUUID()}`,
-                    name: sub.name,
-                    arguments: sub.arguments,
-                  };
-                  const subResult = await this.runToolCall(subCall, options);
-                  const subOutput = toolResultModelText(subResult);
-                  toolCalls.push({
-                    name: subCall.name,
-                    arguments: subCall.arguments,
-                    output: subOutput,
-                    is_error: subResult.is_error,
-                    error_code: subResult.error_code,
-                    duration_ms: subResult.duration_ms ?? 0,
-                  });
-                  executorMessages.push({
-                    role: "user",
-                    content: `[Runtime substitution] ${sub.note}:\n${prepareToolResultForContext(subOutput, toolResultContextChars, toolResultNote).context}`,
-                  });
-                  onStateChange({
-                    stage: "executor",
-                    status: "running",
-                    output: `\n[Tool Substituted: ${sub.name}]\n`,
-                    detail: `tool:${sub.name}`,
-                  });
-                }
+              if (substitution) {
+                const sub = substitution;
+                const subCall: ToolCall = {
+                  id: `call_${crypto.randomUUID()}`,
+                  name: sub.name,
+                  arguments: sub.arguments,
+                };
+                const subResult = await this.runToolCall(subCall, options);
+                const subOutput = toolResultModelText(subResult);
+                toolCalls.push({
+                  name: subCall.name,
+                  arguments: subCall.arguments,
+                  output: subOutput,
+                  is_error: subResult.is_error,
+                  error_code: subResult.error_code,
+                  duration_ms: subResult.duration_ms ?? 0,
+                });
+                executorMessages.push({
+                  role: "user",
+                  content: `[Runtime substitution] ${sub.note}:\n${prepareToolResultForContext(subOutput, toolResultContextChars, toolResultNote).context}`,
+                });
+                onStateChange({
+                  stage: "executor",
+                  status: "running",
+                  output: `\n[Tool Substituted: ${sub.name}]\n`,
+                  detail: `tool:${sub.name}`,
+                });
               }
             }, duplicateReadOnlyOutputs);
           }
