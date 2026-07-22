@@ -49,6 +49,8 @@ def run_test(directory, source):
 def seed(directory, task):
     for name, content in task["files"].items():
         (directory / name).write_text(content, encoding="utf-8")
+    # Pre-seed the test file (will be overwritten by run_test before scoring for integrity)
+    (directory / "_t.py").write_text(task["test"], encoding="utf-8")
 
 
 def baseline_prompt(task):
@@ -141,6 +143,7 @@ def main():
         rows = []
         for task in TASKS:
             passes = 0
+            samples = []
             for sample in range(args.k):
                 if arm == "baseline":
                     ok, detail, seconds = run_baseline(task, sample, live)
@@ -150,7 +153,13 @@ def main():
                     passes += 1
                 state = "PASS" if ok else ("SKIP" if ok is None else "FAIL")
                 print(f"[{arm}] {task['name']:22s} s{sample} {state} ({seconds:.1f}s) {detail}", flush=True)
-            rows.append({"name": task["name"], "category": task["category"], "passes": passes, "k": args.k})
+                # Collect per-sample telemetry
+                samples.append({
+                    "secs": seconds,
+                    "detail": detail,
+                    "pass": ok
+                })
+            rows.append({"name": task["name"], "category": task["category"], "passes": passes, "k": args.k, "samples": samples})
         report["arms"][arm] = rows
     print(json.dumps(report, indent=2))
     if live:
