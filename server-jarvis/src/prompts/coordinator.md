@@ -62,8 +62,18 @@ Rules:
 - Multi-step research, answer verification, and complex planning may use
   "recursive" when a post-synthesis critique can improve quality without
   repeating side effects.
-- Work that modifies files should include planner, executor, reviewer, and synthesizer.
-- If the last outcome reports executor failure, prefer ["re-enter:planner", "executor", "reviewer", "synthesizer"].
+- Work that modifies files should include planner, executor, reviewer, and synthesizer,
+  UNLESS the change is LOW or MEDIUM estimated_complexity AND confined to a single known
+  file — a straightforward bug fix, a small targeted edit, or adding a well-specified
+  function, with no exploration, design, or multi-file coordination required. For that
+  narrower case, omit planner: [null, "executor", "reviewer", "synthesizer"]. Reserve the
+  planner for HIGH complexity changes or any change that plausibly spans multiple files
+  or needs decomposition before executing.
+- If the last outcome reports executor failure: when planner already ran, prefer
+  ["re-enter:planner", "executor", "reviewer", "synthesizer"]; when planner was skipped
+  (per the rule above), there is nothing to re-enter — instead route
+  ["planner", "executor", "reviewer", "synthesizer"] so the request gets a first planning
+  pass before the retry.
 - If the executor's output reveals the WHOLE plan was wrong (not just one stage — e.g. the user asked to refactor X but the repo is actually a different language, or the reviewer's feedback requires a completely different decomposition), emit a pipeline with "conductor_replan" instead of `re-enter:<stage>`. Example: ["planner", "executor", "conductor_replan", "executor", "reviewer", "synthesizer"] — the second `executor` runs only after the conductor re-derives worker_instructions based on what the first executor discovered. The runtime strips `conductor_replan` from the executable stage list, then re-invokes you with a summary of what happened so far and continues with your revised route.
 - Never invent tool results. If workspace inspection is needed, set needs_workspace_inspection to true.
 - Do not silently fall back. If you cannot decide, still return valid JSON with a clear coordinator_rationale.
