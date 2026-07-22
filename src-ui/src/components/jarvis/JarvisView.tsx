@@ -39,6 +39,7 @@ import {
   type ToolCallState,
 } from './chat-state';
 import { errorDisplayForCode } from './error-display';
+import { formatSessionStatsLine, shouldShowSessionStats } from './session-stats';
 import {
   Send, Square, Bot, User, Wrench, Check, Copy, ChevronDown,
   ChevronRight, Sparkles, LoaderCircle, Plus, ArrowDown,
@@ -420,6 +421,12 @@ export function ChatPanel({
   const [turnCost, setTurnCost] = useState<{ tokens: number; costUsd: number } | null>(null);
   const [turnElapsedMs, setTurnElapsedMs] = useState(0);
   const turnStartedAtRef = useRef<number | null>(null);
+  // Last agent_run_id that we accumulated into `sessionStats`. We use this
+  // to make the per-turn accumulation idempotent: the `orchestration_metrics`
+  // frame is the natural "turn done" signal, but a re-stream or
+  // re-sent metrics frame must not double-count the same turn's tokens in
+  // the session pill. Cleared on session switch.
+  const lastAccumulatedRunIdRef = useRef<string | undefined>(undefined);
   const [scopeNotice, setScopeNotice] = useState<{
     paths: string[];
     rootListing: boolean;
@@ -437,6 +444,16 @@ export function ChatPanel({
     model?: string;
     firstVisibleTokenMs?: number;
   } | null>(null);
+
+  // Per-session cumulative rollup for the chat header Session Stats pill.
+  // Accumulates the `runMetrics.tokens` from every completed turn in the
+  // active session; resets to 0 on session switch (`+ New Chat` or session
+  // picker) and on every load. The pill is hidden while `turnCount === 0`
+  // (no completed turns yet) so a brand-new session doesn't show "0 tok".
+  // The completion check is `turnCount` rather than `tokens > 0` so that
+  // an extremely cheap turn that round-trips 0 tokens still surfaces the
+  // "1 turn" line in the stats pill.
+  const [sessionStats, setSessionStats] = useState<{ tokens: number; turnCount: number }>({ tokens: 0, turnCount: 0 });
 
   // Loading-state for Session history fetch (Phase 2.3).
   const [loadingHistory, setLoadingHistory] = useState(false);
@@ -599,6 +616,12 @@ export function ChatPanel({
       setPendingApproval(null);
       setApprovalError(null);
       setError(null);
+      // Reset the per-session rollup so the Session Stats pill starts
+      // empty for the new session. The accumulation-ref is cleared in
+      // lockstep so a re-sent metrics frame from a previous stream
+      // can't bridge the gap.
+      setSessionStats({ tokens: 0, turnCount: 0 });
+      lastAccumulatedRunIdRef.current = undefined;
     }
     if (!activeSession) {
       setMessages([]);
@@ -1063,6 +1086,18 @@ export function ChatPanel({
             ? Math.max(0, Number(frame.first_visible_token_ms))
             : undefined,
         });
+        // Per-session cumulative rollup: accumulate this turn's tokens onto
+        // the session total, but only the first time we see this runId. The
+        // server emits the metrics frame once per turn, but a re-stream or a
+        // downstream re-send would otherwise double-count the same turn.
+        // The `runAcc.runId` is set by the `agent_run_id` frame earlier in
+        // the same stream — if it never arrived, we silently skip (the pill
+        // will only count turns that had a complete run identity, which
+        // matches what gets durably recorded via `record_terminal_run`).
+        if (runAcc.runId && runAcc.runId !== lastAccumulatedRunIdRef.current) {
+          lastAccumulatedRunIdRef.current = runAcc.runId;
+          setSessionStats(prev => ({ tokens: prev.tokens + tokens, turnCount: prev.turnCount + 1 }));
+        }
         if (Array.isArray(frame.executed_tools)) {
           const ledgerCalls: ToolCallState[] = frame.executed_tools.map((value: unknown, index: number) => {
             const entry = value && typeof value === 'object' ? value as Record<string, unknown> : {};
@@ -1501,6 +1536,9 @@ export function ChatPanel({
             <>
               <Pill variant={config.active_backend === 'openrouter' ? 'info' : 'success'}>{displayedProvider}</Pill>
               <Pill>{displayedModel}</Pill>
+              {shouldShowSessionStats(sessionStats.turnCount) && (
+                <Pill variant="info">{formatSessionStatsLine(sessionStats)}</Pill>
+              )}
             </>
           )}
           {activeSession && <Pill variant="active">Session: {activeSession.slice(0, 8)}</Pill>}
