@@ -6,7 +6,16 @@ import type { ToolCallRecord } from "./stage-output";
 
 const WRITE_TOOL_NAMES = new Set(["write_file", "edit_file", "multi_edit", "apply_patch"]);
 const PYTHON_PATH = /(?:[A-Za-z]:[\\/])?[A-Za-z0-9_.\\/-]+\.py\b/gi;
-const TEST_FILE = /(?:^test[_-].*|.*[_-]test|_t[^.]+)\.py$/i;
+// The third alternative recognizes this codebase's own "_t" test-oracle
+// convention (`_t.py`, `_t2.py`, `solution_t.py`) — the basename must end in
+// exactly "_t" optionally followed by digits, right before ".py". This is
+// intentionally narrower than "_t" followed by ANY characters: an unanchored
+// "_t[^.]*\.py$" would also match plausible non-test module names that merely
+// contain "_t" as a substring somewhere before a later ".py", e.g.
+// "output_transform.py" or "session_token.py" or "_temp.py" — none of which
+// are test files. Requiring digits-only after "_t" closes that hole while
+// still matching the real "_t"/"_t2"/"_t3" naming convention.
+const TEST_FILE = /(?:^test[_-].*|.*[_-]test|_t\d*)\.py$/i;
 const MAIN_GUARD = /if\s+__name__\s*==\s*["']__main__["']\s*:/;
 
 export interface RunGateIssue {
@@ -57,7 +66,8 @@ function testPathTokens(text: string): string[] {
   return [...text.matchAll(PYTHON_PATH)].map((match) => match[0].replace(/[),.;:]+$/, ""));
 }
 
-function isTestFile(path: string): boolean {
+/** Pure — no I/O — so it is trivially testable in isolation from findRunnableTarget. */
+export function isTestFile(path: string): boolean {
   return TEST_FILE.test(basename(path));
 }
 
@@ -82,6 +92,25 @@ export async function findRunnableTarget(
     .filter((path) => isWithinRoot(options.root, path));
 
   // Priority A: a test path named explicitly in the request or plan.
+  //
+  // This only trusts a mentioned path that ALSO matches the test-file naming
+  // convention (isTestFile) — a bare "wasn't written this turn" fallback was
+  // tried and reverted (see git history) after a reproduced false positive:
+  // request text like "Update app.py per the config values defined in
+  // settings.py" mentions settings.py, a plain non-test config module that is
+  // not written this turn, so a fallback lacking any test-intent signal
+  // selected it as the run target and never even reached Priority B, which
+  // would have correctly found the real adjacent test. A keyword-proximity
+  // heuristic (e.g. requiring "test"/"verify"/"run" near the mention) was
+  // considered instead, but it trades one false-positive class for another —
+  // "the test suite depends on settings.py" would still wrongly select
+  // settings.py. Given this file's own safety stance (never execute an
+  // arbitrary file — see the Priority C comment below), the naming-convention
+  // requirement stays on Priority A too. The regex fix that motivated this
+  // Priority A revisit (bare "_t.py" now matches TEST_FILE) already covers the
+  // real-world case of an explicitly named test that follows this codebase's
+  // own test-oracle convention; Priority B and Priority C remain the intended
+  // mechanisms for a test file whose name doesn't match the convention at all.
   for (const token of testPathTokens(`${request}\n${plan}`)) {
     const candidate = absoluteTarget(token, options.root);
     if (isWithinRoot(options.root, candidate) && isTestFile(candidate) && exists(candidate)) {

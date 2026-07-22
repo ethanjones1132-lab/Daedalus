@@ -62,8 +62,27 @@ Rules:
 - Multi-step research, answer verification, and complex planning may use
   "recursive" when a post-synthesis critique can improve quality without
   repeating side effects.
-- Work that modifies files should include planner, executor, reviewer, and synthesizer.
-- If the last outcome reports executor failure, prefer ["re-enter:planner", "executor", "reviewer", "synthesizer"].
+- Work that modifies files should include planner, executor, reviewer, and synthesizer,
+  UNLESS the change is LOW or MEDIUM estimated_complexity AND confined to a single known
+  file being MODIFIED — a straightforward bug fix, a small targeted edit, or adding a
+  well-specified function, with no exploration, design, or multi-file coordination
+  required. "Single file" limits what gets WRITTEN, not what the executor may READ —
+  reading a few other files for context before patching the one file does not disqualify
+  this path. Since exploration hasn't happened yet at routing time, judge "no exploration
+  required" from how precisely the USER'S REQUEST already pins down the file, function,
+  and fix: naming an exact file and describing an exact change is low-ambiguity and
+  qualifies; a vague "fix the bug somewhere in X" does not and still needs planner. For
+  the qualifying case, omit planner: [null, "executor", "reviewer", "synthesizer"].
+  Reserve the planner for HIGH complexity changes or any change that plausibly spans
+  multiple files or needs decomposition before executing.
+- Estimate `estimated_complexity` honestly, from the request alone — never lower it just
+  to justify a pipeline you'd otherwise prefer; the pipeline should follow the complexity
+  estimate, not the other way around.
+- If the last outcome reports executor failure: when planner already ran, prefer
+  ["re-enter:planner", "executor", "reviewer", "synthesizer"]; when planner was skipped
+  (per the rule above), there is nothing to re-enter — instead route
+  ["planner", "executor", "reviewer", "synthesizer"] so the request gets a first planning
+  pass before the retry.
 - If the executor's output reveals the WHOLE plan was wrong (not just one stage — e.g. the user asked to refactor X but the repo is actually a different language, or the reviewer's feedback requires a completely different decomposition), emit a pipeline with "conductor_replan" instead of `re-enter:<stage>`. Example: ["planner", "executor", "conductor_replan", "executor", "reviewer", "synthesizer"] — the second `executor` runs only after the conductor re-derives worker_instructions based on what the first executor discovered. The runtime strips `conductor_replan` from the executable stage list, then re-invokes you with a summary of what happened so far and continues with your revised route.
 - Never invent tool results. If workspace inspection is needed, set needs_workspace_inspection to true.
 - Do not silently fall back. If you cannot decide, still return valid JSON with a clear coordinator_rationale.
@@ -85,7 +104,7 @@ You MUST respond with a single valid JSON object. No text before it. No text aft
 
 Use this exact shape:
 
-{"task_type": "general", "pipeline": ["planner", "executor", "reviewer", "synthesizer"], "topology": "linear", "context": {"needs_workspace_inspection": false, "needs_memory": true, "estimated_complexity": "low"}, "coordinator_rationale": "brief reason for the route", "worker_instructions": {"planner": "Break the request into concrete file-level steps.", "executor": "Read src/foo.ts first, then patch only the login handler.", "reviewer": "Verify the patch compiles and does not break auth tests.", "synthesizer": "Summarize what changed and what the user should run to verify."}, "shared_context": {"relevant_memories": [], "prior_tool_results": {}, "failure_patterns": []}}
+{"task_type": "general", "pipeline": [null, "executor", "reviewer", "synthesizer"], "topology": "linear", "context": {"needs_workspace_inspection": false, "needs_memory": true, "estimated_complexity": "low"}, "coordinator_rationale": "brief reason for the route", "worker_instructions": {"executor": "Read src/foo.ts first, then patch only the login handler.", "reviewer": "Verify the patch compiles and does not break auth tests.", "synthesizer": "Summarize what changed and what the user should run to verify."}, "shared_context": {"relevant_memories": [], "prior_tool_results": {}, "failure_patterns": []}}
 
 Note: no whitespace padding around values, no trailing commas, no comments. Just a single line of valid JSON.
 

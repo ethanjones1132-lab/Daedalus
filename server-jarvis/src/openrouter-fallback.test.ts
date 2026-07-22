@@ -366,6 +366,58 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
     expect(secondStage.retries).toBe(0);
   });
 
+  test("caps the fallback chain at 3 distinct models even when the pool is larger", async () => {
+    // Sub-fix C: resolveFallbackCascade can build a very long cascade (it
+    // appends the entire free OpenRouter catalog as a tail), producing "model
+    // roulette" — long tail latency from sequentially grinding through many
+    // bad picks. chatCompletionWithFallback must attempt AT MOST 3 distinct
+    // models per invocation, then fail honestly, rather than exhausting a
+    // dozen-plus candidates.
+    const cfg = cfgWithPool();
+    cfg.openrouter.api_key = "sk-or-key";
+    cfg.openrouter.max_retries = 0; // one attempt per model → deterministic advance
+    // Keep the cascade to exactly the pool: a non-free `model` id + empty
+    // catalog contributes no OpenRouter free tail.
+    cfg.openrouter.model = "unused-primary";
+    cfg.openrouter.fallbacks = [];
+    cfg.orchestrator.agents = [
+      { id: "m1", provider: "openrouter", model_id: "model-1", capabilities: { code: 0.95, reasoning: 0.7, speed: 0.8, cost: 1, json_reliability: 0.8 }, default_for: ["executor"], enabled: true },
+      { id: "m2", provider: "openrouter", model_id: "model-2", capabilities: { code: 0.9, reasoning: 0.7, speed: 0.8, cost: 1, json_reliability: 0.8 }, default_for: [], enabled: true },
+      { id: "m3", provider: "openrouter", model_id: "model-3", capabilities: { code: 0.85, reasoning: 0.7, speed: 0.8, cost: 1, json_reliability: 0.8 }, default_for: [], enabled: true },
+      { id: "m4", provider: "openrouter", model_id: "model-4", capabilities: { code: 0.8, reasoning: 0.7, speed: 0.8, cost: 1, json_reliability: 0.8 }, default_for: [], enabled: true },
+      { id: "m5", provider: "openrouter", model_id: "model-5", capabilities: { code: 0.75, reasoning: 0.7, speed: 0.8, cost: 1, json_reliability: 0.8 }, default_for: [], enabled: true },
+      { id: "m6", provider: "openrouter", model_id: "model-6", capabilities: { code: 0.7, reasoning: 0.7, speed: 0.8, cost: 1, json_reliability: 0.8 }, default_for: [], enabled: true },
+    ];
+
+    const seenChatModels: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/models")) {
+        return new Response(JSON.stringify({ data: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      seenChatModels.push(body.model);
+      // Every model hard-fails (400, non-retryable → immediate advance).
+      return new Response("bad request", { status: 400 });
+    }) as typeof fetch;
+
+    await expect(chatCompletionWithFallback(
+      cfg,
+      { model: "unused-primary", messages: [{ role: "user", content: "go" }], stream: true },
+      undefined,
+      { stage: "executor", taskType: "general" },
+    )).rejects.toThrow(/fallback cap 3/);
+
+    // At most 3 DISTINCT models attempted, and exactly 3 total attempts here
+    // (one per model since max_retries=0) — never the full 6-agent pool.
+    const distinct = new Set(seenChatModels);
+    expect(distinct.size).toBe(3);
+    expect(seenChatModels.length).toBe(3);
+  });
+
   test("first-token watchdog advances to the next cascade model on a hung response body", async () => {
     // Regression: openrouter/free opened the response stream then never
     // sent any body bytes (12+ minute stalls, post-hang diagnosis

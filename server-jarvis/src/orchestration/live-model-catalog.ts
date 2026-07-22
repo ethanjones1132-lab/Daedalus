@@ -103,8 +103,26 @@ export function isOpenRouterFreeTextModel(raw: RawCatalogModel): boolean {
     ? raw.architecture!.output_modalities!.filter((value): value is string => typeof value === "string")
     : [];
   if (outputs.length > 0 && !outputs.includes("text")) return false;
+  // OpenRouter's `architecture.modality` is an "<input>-><output>" pair (e.g.
+  // "text->audio" for Lyria, a text-prompted audio generator, or
+  // "text+image->text" for a vision LLM). Only the OUTPUT side disqualifies
+  // this text/code orchestration pool. The previous check tested
+  // `!modality.includes("text")` against the whole string, so "text->audio"
+  // slipped through — "text" appears on the INPUT side — and the audio model
+  // was wrongly admitted. Parse the arrow and inspect only the output side.
   const modality = typeof raw.architecture?.modality === "string" ? raw.architecture.modality.toLowerCase() : "";
-  if (modality && !modality.includes("text") && (modality.includes("audio") || modality.includes("image"))) return false;
+  if (modality) {
+    const arrowIdx = modality.indexOf("->");
+    const output = arrowIdx >= 0 ? modality.slice(arrowIdx + 2) : modality;
+    if (output.includes("audio") || output.includes("image")) {
+      // With an explicit arrow the output side is authoritative → exclude.
+      // Without an arrow (a bare descriptor), the output_modalities array
+      // above is the primary signal, so only exclude when this backstop is
+      // unambiguously non-text (e.g. a bare "audio"), never a mixed blob
+      // that still mentions text.
+      if (arrowIdx >= 0 || !output.includes("text")) return false;
+    }
+  }
 
   // Catalog zero-price utilities such as moderation/content-safety classifiers
   // are live endpoints, but they cannot synthesize an orchestration stage.
@@ -297,7 +315,15 @@ function mergeAgents(
       ...agent,
       capabilities: { ...agent.capabilities },
       default_for: [...agent.default_for],
-      enabled: free ? true : agent.enabled,
+      // A CONFIGURED agent's explicit `enabled` is authoritative. We used to
+      // force `enabled: true` whenever the live catalog confirmed the model
+      // was free-tier-eligible, which silently re-enabled the static Zen
+      // `*-free` ids that DEFAULT_ORCHESTRATOR_AGENTS deliberately disables
+      // (they can 400, require billing, or stall before first token — see the
+      // comment block above that array in agent-pool.ts). Brand-new free
+      // models the catalog discovers are unaffected: they take the separate
+      // dynamicAgent() path below, which sets enabled:true on its own.
+      enabled: agent.enabled,
       billing_tier: free ? "free" : provider === "opencode_go" ? "go" : (agent.billing_tier ?? "paid"),
       ...(provider === "opencode_go" ? { cost_rank: openCodeGoCostRank(agent.model_id) } : {}),
     });

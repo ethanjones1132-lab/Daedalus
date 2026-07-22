@@ -4,6 +4,7 @@ import { deriveEvidenceTaskKind } from "./turn-requirements";
 import { injectToolGuidelines } from "./tool-guidelines";
 import { checkWrittenFilesSyntax, renderSyntaxIssues, type SyntaxIssue } from "./syntax-gate";
 import { renderRunIssues, runWrittenCodeGate, type RunGateResult } from "./run-gate";
+import { hasContentDelta } from "./content-fingerprint";
 import { BUILTIN_MODES, executorTurnLimit, getToolsForMode } from "./modes";
 import { toolResultModelText, type ToolRuntime, type ExecutionContext } from "../tool-runtime";
 import type { CallModelFn, ChatMessage } from "./router";
@@ -45,7 +46,7 @@ import {
   workspaceReadScopeViolation,
   type WorkspaceReadScope,
 } from "./evidence-sufficiency";
-import { substituteToolCall } from "../tool-heal";
+import { substituteToolCall, toolCallSignature, augmentErrorOutput } from "../tool-heal";
 import {
   enforceTranscriptBudget,
   EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS,
@@ -73,6 +74,7 @@ import {
   type RunClaudeDelegateInput,
 } from "./claude-delegate";
 import type { JarvisConfig } from "../config";
+import { DEFAULT_REVIEW_REPAIR_ROUNDS, MAX_REVIEW_REPAIR_ROUNDS } from "../config";
 
 /**
  * The slice of the outcome collector the pipeline depends on. Injecting this
@@ -228,6 +230,29 @@ const READ_ONLY_TOOLS = defaultCapabilityIndex().parallelSafe;
 const PIPELINE_TOOL_RESULT_NOTE =
   "Result recorded in full for verification. Re-run the tool with a narrower target if you need the elided middle.";
 
+// B3: reduced synthesizer output cap for gate-green (deterministically verified)
+// turns. Live forensics put the synthesizer stage at ~30s/call under the default
+// 8192-token cap (BUILTIN_MODES.synthesizer.max_tokens); a turn whose gates
+// already confirmed success only needs a short "here's what changed, here's why
+// it's verified" summary, which a ~1K cap generates far faster. Applies ONLY
+// when ReviewerStageOutput.gateVerified is true — every other turn keeps the
+// full 8192 cap unchanged.
+const GATE_VERIFIED_SYNTHESIZER_MAX_TOKENS = 1024;
+
+// B3: appended to the synthesizer system prompt only on gate-green turns, so the
+// model matches its output length to the reduced token cap instead of being
+// truncated mid-prose. Kept as an instruction (not evidence) so it lives in the
+// system channel and applies uniformly to every synthesizer callModel site.
+const GATE_VERIFIED_SYNTHESIZER_DIRECTIVE = [
+  "Concise Verified-Turn Mode (authoritative for this turn):",
+  "Deterministic gates already confirmed this turn's work (syntax clean and a real test passed). Do NOT re-argue correctness or narrate exploration.",
+  "Produce a SHORT, direct change summary only: what changed and the one-line evidence it is verified. Prefer a few tight sentences or a small bullet list; no preamble, no restating the request.",
+  // The gates prove only syntax-clean + one passing test on the touched files —
+  // NOT design trade-offs, security, or edge cases outside that test. Brevity
+  // must never suppress something the user would want to know.
+  "If there is a genuine caveat or limitation the tests do not cover (a design trade-off, a security or input-validation concern, an untested edge case, a known follow-up), state it in one line; otherwise omit it.",
+].join("\n");
+
 /**
  * Split a turn's tool calls into dispatch batches (Task 3.1): consecutive
  * read-only calls form one concurrent batch; any write/side-effect call is
@@ -253,6 +278,30 @@ export function partitionToolCalls<T extends { name: string }>(calls: T[]): T[][
 
 function duplicateToolCallKey(call: Pick<ToolCall, "name" | "arguments">): string {
   return `${call.name}:${JSON.stringify(call.arguments)}`;
+}
+
+// Task A5 (missing-artifact damper): count how many times a tool-call signature
+// has ALREADY failed in the executor's history, so the healing hint escalates
+// after the 2nd identical failure instead of the model re-globbing/re-reading a
+// path that isn't there. We count across the WHOLE history — including
+// carried-over prior-segment calls — rather than just this stage's own calls,
+// because the "keep searching for a missing file" spiral this dampens routinely
+// crosses replan-segment boundaries: a file that was absent last segment is
+// still absent, and a fresh segment repeating the same doomed read should reach
+// the escalated "stop repeating" hint immediately, not restart the count.
+// Distinct from `duplicateToolCallKey` (which deflects repeated SUCCESSFUL
+// read-only calls); this counts FAILURES only, via the tool-heal signature.
+export function priorFailureCount(
+  history: Pick<ToolCallRecord, "name" | "arguments" | "is_error">[],
+  signature: string,
+): number {
+  let count = 0;
+  for (const record of history) {
+    if (record.is_error && toolCallSignature(record.name, record.arguments) === signature) {
+      count++;
+    }
+  }
+  return count;
 }
 
 // 2026-07-18: a repeated identical read now REPLAYS the full cached output
@@ -380,6 +429,132 @@ export function addedWriteProgress(before: Set<string>, after: Set<string>): boo
     if (!before.has(key)) return true;
   }
   return false;
+}
+
+/**
+ * B1 (review follow-up) — source-file extensions whose written content the
+ * deterministic run gate can only be trusted to have exercised if its single
+ * passing target actually corresponds to the file. Non-code artifacts written
+ * alongside code (docs, data, config) need no run-coverage and are ignored.
+ */
+const RUN_COVERAGE_CODE_EXTENSIONS: ReadonlySet<string> = new Set([
+  ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go", ".rs", ".java",
+  ".rb", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".cs", ".php", ".kt",
+  ".swift", ".scala", ".sh", ".bash",
+]);
+
+function pathBasename(path: string): string {
+  return path.replace(/\\/g, "/").split("/").pop() ?? "";
+}
+
+function pathExtension(path: string): string {
+  const base = pathBasename(path);
+  const dot = base.lastIndexOf(".");
+  return dot > 0 ? base.slice(dot).toLowerCase() : "";
+}
+
+function pathStem(path: string): string {
+  const base = pathBasename(path);
+  const dot = base.lastIndexOf(".");
+  return (dot > 0 ? base.slice(0, dot) : base).toLowerCase();
+}
+
+/** Distinct source-code file paths written (successfully) by this turn's tool calls. */
+export function writtenCodeFilePaths(calls: ToolCallRecord[]): string[] {
+  const seen = new Set<string>();
+  for (const call of calls) {
+    if (call.is_error || !WRITE_EFFECT_TOOLS.has(call.name)) continue;
+    const path = typeof call.arguments?.path === "string" ? call.arguments.path.trim() : "";
+    if (path && RUN_COVERAGE_CODE_EXTENSIONS.has(pathExtension(path))) seen.add(path);
+  }
+  return [...seen];
+}
+
+/**
+ * How the run gate's PASSING target relates to one written file:
+ *  - "direct":  the target IS that file (a standalone script the gate ran), or
+ *               the target is a test named after the file's module stem
+ *               (`solution_t.py`, `test_solution.py`, `solution_test.py`,
+ *               `run_solution.py`) — strong evidence the test exercised it.
+ *  - "generic": the target is a bare test-convention marker with no module
+ *               identity (`_t.py`, `_t2.py`) — plausibly the file's oracle only
+ *               when it is the SOLE written code file this turn (resolved by the
+ *               caller); a bare oracle cannot contradict a single written file.
+ *  - "none":    the target names a DIFFERENT module (`test_app.py` next to a
+ *               freshly written `utils.py`) — no reason to believe it ran the
+ *               written code.
+ * Name-coupling is a deliberately conservative proxy for "this test covers this
+ * code": it errs toward "none"/"generic" (an unrecognized test name keeps the
+ * reviewer running — safe, just slower), never toward a false "direct" that
+ * would skip review of un-exercised code.
+ */
+export function runTargetCoverageOf(targetPath: string, writtenPath: string): "direct" | "generic" | "none" {
+  if (pathBasename(targetPath).toLowerCase() === pathBasename(writtenPath).toLowerCase()) return "direct";
+  const ws = pathStem(writtenPath);
+  const ts = pathStem(targetPath);
+  if (!ws) return "none";
+  if (ts === ws) return "direct";
+  const core = ts
+    .replace(/^test[_-]/, "")
+    .replace(/[_-]test$/, "")
+    .replace(/_t\d*$/, "");
+  if (core === ws) return "direct";
+  if (core === "") return "generic";
+  return ts.split(/[^a-z0-9]+/).filter(Boolean).includes(ws) ? "direct" : "none";
+}
+
+/**
+ * B1 gate-green coverage guard. A passing run gate proves ONE discovered target
+ * exited 0 — NOT that every file written this turn was exercised (run-gate.ts
+ * runs a single target and Priority B picks the alphabetically-first sibling
+ * test with no relatedness check). The reviewer-skip fast path may fire only
+ * when EVERY source-code file written this turn is covered by that one passing
+ * target. Closes two real gaps: a multi-file turn whose one passing test touches
+ * only one written file, and a single written file sitting next to a
+ * pre-existing, unrelated, passing adjacent test the gate happened to select.
+ */
+export function passingTargetCoversAllWrittenCode(
+  targetPath: string | undefined,
+  writtenToolCalls: ToolCallRecord[],
+): boolean {
+  if (!targetPath) return false;
+  const codeFiles = writtenCodeFilePaths(writtenToolCalls);
+  if (codeFiles.length === 0) return false;
+  return codeFiles.every((path) => {
+    const coverage = runTargetCoverageOf(targetPath, path);
+    if (coverage === "direct") return true;
+    // A bare `_t.py`-style oracle carries no module name to contradict, so it is
+    // trusted only when it is the sole written code file this turn.
+    if (coverage === "generic") return codeFiles.length === 1;
+    return false;
+  });
+}
+
+/**
+ * A3 — progress-gated repair budget. The reviewer→rewriter loop runs up to
+ * `baseCap` repair rounds unconditionally (the configured
+ * `max_review_repair_rounds`, default 2). Beyond that it grants exactly ONE
+ * additional "progress" round — the conditional 3rd on the default budget —
+ * and only when the immediately preceding round produced a real byte-level
+ * content delta (`lastRoundHadContentDelta`), i.e. proof of forward progress,
+ * never merely because a reviewer or gate re-flagged an issue.
+ *
+ * Returns `true` when no further repair round may run.
+ *
+ * Fails safe by design: a `baseCap` of 0 disables repair outright, and when no
+ * content delta can be observed the base cap is the hard cap — an unprovable
+ * round is refused rather than granted.
+ */
+export function repairBudgetExhausted(args: {
+  repairs: number;
+  baseCap: number;
+  lastRoundHadContentDelta: boolean;
+}): boolean {
+  const { repairs, baseCap, lastRoundHadContentDelta } = args;
+  if (baseCap <= 0) return true; // repair disabled
+  if (repairs >= baseCap + 1) return true; // hard ceiling: base rounds + one bonus
+  if (repairs < baseCap) return false; // still within the unconditional base budget
+  return !lastRoundHadContentDelta; // at the base cap: bonus round hinges on progress
 }
 
 function isStageTimeout(error: unknown): boolean {
@@ -1760,10 +1935,38 @@ export class PipelineExecutor {
           const emittedToolCalls = Boolean(response.tool_calls && response.tool_calls.length > 0);
           if (emittedToolCalls) {
             await this.dispatchToolCalls("executor", response.tool_calls, options, async (tc, call, toolResult) => {
+              const rawOutput = toolResultModelText(toolResult);
+              // Task 2.3 / A5: decide substitution eligibility FIRST. A
+              // directory-misuse error is auto-corrected below (read_file on a
+              // directory -> list_directory), so it must NOT also carry a
+              // redundant healing hint. Every OTHER failure gets the escalating
+              // missing-artifact hint appended (Task A5).
+              const substitution = toolResult.is_error
+                ? substituteToolCall(call.name, call.arguments, rawOutput)
+                : null;
+              let modelOutput = rawOutput;
+              if (toolResult.is_error && !substitution) {
+                // Count prior identical FAILURES across the whole executor
+                // history BEFORE recording this one, so attempt = prior + 1:
+                // first failure -> 1 -> base hint; second identical failure ->
+                // 2 -> escalated "stop repeating, report the limitation" hint.
+                // This is the deterministic note the task asks for after the
+                // 2nd occurrence, and it stops the re-glob/re-read spiral.
+                const signature = toolCallSignature(call.name, call.arguments);
+                const attempt = priorFailureCount(toolCalls, signature) + 1;
+                modelOutput = augmentErrorOutput(rawOutput, attempt);
+              }
+              // The augmented text is the single source of truth: it feeds both
+              // the stored ToolCallRecord.output (read by UI/ToolCallCard, which
+              // renders the `Hint:` line as an actionable suggestion, and by
+              // error telemetry) AND the model-facing tool message, so what the
+              // model saw matches what is recorded/audited. Evidence accounting
+              // filters on `!is_error`, so augmenting error output never inflates
+              // evidence credit.
               toolCalls.push({
                 name: call.name,
                 arguments: call.arguments,
-                output: toolResultModelText(toolResult),
+                output: modelOutput,
                 is_error: toolResult.is_error,
                 error_code: toolResult.error_code,
                 duration_ms: toolResult.duration_ms ?? 0,
@@ -1773,7 +1976,7 @@ export class PipelineExecutor {
                 tool_call_id: tc.id,
                 name: tc.name,
                 content: prepareToolResultForContext(
-                  toolResultModelText(toolResult),
+                  modelOutput,
                   toolResultContextChars,
                   toolResultNote,
                 ).context,
@@ -1789,35 +1992,33 @@ export class PipelineExecutor {
               // full model round-trip on the healing hint. The original
               // failed call stays recorded above so evidence accounting
               // and telemetry still see the model's actual behavior.
-              if (toolResult.is_error) {
-                const sub = substituteToolCall(call.name, call.arguments, toolResultModelText(toolResult));
-                if (sub) {
-                  const subCall: ToolCall = {
-                    id: `call_${crypto.randomUUID()}`,
-                    name: sub.name,
-                    arguments: sub.arguments,
-                  };
-                  const subResult = await this.runToolCall(subCall, options);
-                  const subOutput = toolResultModelText(subResult);
-                  toolCalls.push({
-                    name: subCall.name,
-                    arguments: subCall.arguments,
-                    output: subOutput,
-                    is_error: subResult.is_error,
-                    error_code: subResult.error_code,
-                    duration_ms: subResult.duration_ms ?? 0,
-                  });
-                  executorMessages.push({
-                    role: "user",
-                    content: `[Runtime substitution] ${sub.note}:\n${prepareToolResultForContext(subOutput, toolResultContextChars, toolResultNote).context}`,
-                  });
-                  onStateChange({
-                    stage: "executor",
-                    status: "running",
-                    output: `\n[Tool Substituted: ${sub.name}]\n`,
-                    detail: `tool:${sub.name}`,
-                  });
-                }
+              if (substitution) {
+                const sub = substitution;
+                const subCall: ToolCall = {
+                  id: `call_${crypto.randomUUID()}`,
+                  name: sub.name,
+                  arguments: sub.arguments,
+                };
+                const subResult = await this.runToolCall(subCall, options);
+                const subOutput = toolResultModelText(subResult);
+                toolCalls.push({
+                  name: subCall.name,
+                  arguments: subCall.arguments,
+                  output: subOutput,
+                  is_error: subResult.is_error,
+                  error_code: subResult.error_code,
+                  duration_ms: subResult.duration_ms ?? 0,
+                });
+                executorMessages.push({
+                  role: "user",
+                  content: `[Runtime substitution] ${sub.note}:\n${prepareToolResultForContext(subOutput, toolResultContextChars, toolResultNote).context}`,
+                });
+                onStateChange({
+                  stage: "executor",
+                  status: "running",
+                  output: `\n[Tool Substituted: ${sub.name}]\n`,
+                  detail: `tool:${sub.name}`,
+                });
               }
             }, duplicateReadOnlyOutputs);
           }
@@ -2388,18 +2589,32 @@ export class PipelineExecutor {
     const boundedRequest = truncateToTokenBudget(request, 1_000);
     const boundedPlanSummary = truncateToTokenBudget(planSummary, 1_000);
     const boundedExecutorSummary = truncateToTokenBudget(executorSummary, 3_000);
-    const configuredRepairRounds = Number(options.maxReviewRepairRounds ?? 1);
+    // A3: base cap of unconditional repair rounds (default 2). Mirrors the
+    // normalizeConfig clamp — the configured value is normally already clamped,
+    // but this stays defensive for callers that pass a raw value. A conditional
+    // bonus round beyond this cap is granted by repairBudgetExhausted() only on
+    // proven content progress.
+    const configuredRepairRounds = Number(options.maxReviewRepairRounds ?? DEFAULT_REVIEW_REPAIR_ROUNDS);
     const maxRepairRounds = Number.isFinite(configuredRepairRounds)
-      ? Math.min(2, Math.max(0, Math.floor(configuredRepairRounds)))
-      : 1;
+      ? Math.min(MAX_REVIEW_REPAIR_ROUNDS, Math.max(0, Math.floor(configuredRepairRounds)))
+      : DEFAULT_REVIEW_REPAIR_ROUNDS;
     let reviewCount = 0;
     let repairs = 0;
+    // Tracks whether the most recent rewriter round changed file bytes. Seeds
+    // false so the bonus round is never granted before any round has run.
+    let lastRoundHadContentDelta = false;
     let hasPendingIssues = true;
     let reviewerFeedback = "No review stage executed.";
     let reviewerOk = true;
     let rewriterOutput: RewriterStageOutput | undefined;
     let rewriterSummaryForPrompt = "No rewriting stage executed.";
     const writeIntentForTurn = hasWriteIntent(options.rawMessage ?? request);
+    // B3: set true ONLY on the B1 gate-green fast-path exit below, where
+    // deterministic gates confirmed the turn. Every other exit (normal reviewer
+    // ACCEPT, reviewer reject, empty completion, throw) leaves this false — a
+    // model reviewer approving is a weaker signal than a deterministic gate, so
+    // the synthesizer's concise mode must not engage for it.
+    let gateVerified = false;
 
     while (hasPendingIssues) {
       reviewCount++;
@@ -2423,6 +2638,74 @@ export class PipelineExecutor {
         renderSyntaxIssues(syntaxIssues),
         renderRunIssues(runGate),
       ].filter(Boolean).join("\n\n");
+
+      // B1: gate-green fast path. When BOTH deterministic gates positively
+      // confirm the written code — syntax gate clean AND the run gate actually
+      // EXECUTED a real test that passed (status "passed", not "skipped") — that
+      // execution evidence strictly outranks a 20-60s weak-model read-only
+      // review that live telemetry shows also sometimes times out/retries. Skip
+      // the reviewer model call entirely for this iteration. A "skipped" run
+      // gate is an ABSENCE of evidence ("no runnable target / interpreter
+      // unavailable — we don't know"), NOT positive confirmation, so it does not
+      // qualify and the reviewer still runs. Disable via
+      // orchestrator.gate_green_skips_reviewer=false (mirrors the direct-off-
+      // this.ctx.config flag read used by high_complexity_executor_retry).
+      //
+      // Review follow-up: a passing run gate proves ONE discovered target exited
+      // 0 — not that the whole turn's written code was validated. So the skip
+      // additionally requires that every source-code file written this turn is
+      // plausibly covered by that single passing target
+      // (passingTargetCoversAllWrittenCode). Without this, a multi-file turn
+      // whose one test touches only one file, or a lone written file next to a
+      // pre-existing unrelated passing test, would wrongly skip review.
+      if (
+        this.ctx.config.orchestrator?.gate_green_skips_reviewer !== false
+        && syntaxIssues.length === 0
+        && runGate.status === "passed"
+        && passingTargetCoversAllWrittenCode(runGate.target, writtenToolCalls)
+      ) {
+        // Synthetic verdict must parse as ACCEPT for hasIssues()/
+        // parseReviewerVerdict() (leading ACCEPT token → verdict "accept" →
+        // hasIssues false), so the downstream replan trigger (reviewer?.hasIssues)
+        // correctly stays quiet and no rewriter/repair is attempted.
+        reviewerFeedback = `ACCEPT — deterministic gates verified this turn: syntax gate clean and run gate executed a real test that passed${runGate.target ? ` (${runGate.target})` : ""}. Model reviewer skipped per orchestrator.gate_green_skips_reviewer.`;
+        reviewerOk = true;
+        hasPendingIssues = false;
+        console.log(
+          `[Pipeline] gate-green fast path: skipping model reviewer`
+          + ` (syntax clean, run gate passed${runGate.target ? ` on ${runGate.target}` : ""}), run=${agentRunId}`,
+        );
+        onStateChange({
+          stage: "reviewer",
+          status: "completed",
+          output: "\nGate-verified (syntax + run gate passed); model reviewer skipped.\n",
+        });
+        // Record a distinguishable stage_run so the skip is observable in the
+        // same stage_runs table real reviewer calls populate. A dedicated
+        // mode_id ("reviewer_gate_skip") + output_tokens:0 keeps the self-tuning
+        // collector from training reviewer instruction/latency stats on a
+        // synthetic zero-cost row (conductor-learning maps stageByMode on the
+        // canonical "reviewer" id, which this deliberately does not use).
+        this.collector.recordStageRun({
+          id: `stage_${crypto.randomUUID()}`,
+          agent_run_id: agentRunId,
+          mode_id: "reviewer_gate_skip",
+          turn_number: reviewCount,
+          input_tokens: 0,
+          output_tokens: 0,
+          tool_calls_json: "[]",
+          // Gate-execution wall time (same revStartTime basis as real reviewer
+          // rows, so it is apples-to-apples comparable to them) — this is the
+          // deterministic-gate cost of the turn, NOT "reviewer time saved."
+          duration_ms: Date.now() - revStartTime,
+          was_successful: 1,
+          had_error: 0,
+        });
+        // B3: deterministic gates verified this turn — signal the synthesizer to
+        // emit a short, direct change summary under a reduced token cap.
+        gateVerified = true;
+        break;
+      }
 
       try {
         const reviewerMessages = [
@@ -2515,7 +2798,28 @@ export class PipelineExecutor {
           }
           hasPendingIssues = true;
         }
-        if (!hasPendingIssues || profile !== "full" || !writeIntentForTurn || repairs >= maxRepairRounds) {
+        // A3 telemetry: at the base-cap boundary the next round would be the
+        // progress-gated bonus round. Emit one distinguishable log line for
+        // whether it is GRANTED (prior round changed file bytes) or REFUSED
+        // (no proven progress) so this deliberate latency tradeoff is
+        // observable in production — grep `[Pipeline] repair bonus round`.
+        const atBonusBoundary = maxRepairRounds >= 1
+          && repairs === maxRepairRounds
+          && hasPendingIssues
+          && profile === "full"
+          && writeIntentForTurn;
+        if (atBonusBoundary) {
+          console.log(
+            `[Pipeline] repair bonus round ${lastRoundHadContentDelta ? "granted (content delta confirmed)" : "refused (no content delta)"}`
+            + ` at base cap ${maxRepairRounds}, run=${agentRunId}`,
+          );
+        }
+        if (
+          !hasPendingIssues
+          || profile !== "full"
+          || !writeIntentForTurn
+          || repairBudgetExhausted({ repairs, baseCap: maxRepairRounds, lastRoundHadContentDelta })
+        ) {
           break;
         }
 
@@ -2523,10 +2827,19 @@ export class PipelineExecutor {
           ...executorToolCalls,
           ...(rewriterOutput?.toolCalls ?? []),
         ]);
+        // A3: snapshot the turn-wide content-effect log so we can isolate the
+        // byte-level effects produced by THIS round's rewriter. `write_effects`
+        // is a single array shared across every repair round (never reset
+        // per-round), so a length mark + post-round slice is the per-round view.
+        // Optional/undefined-safe: an absent log yields an empty slice, so the
+        // progress check fails safe (no bonus round).
+        const contentEffectMark = this.ctx.write_effects?.length ?? 0;
         repairs++;
         onStateChange({ stage: "rewriter", status: "running", output: `\nReviewer flagged issues. Rewriting...\n` });
         rewriterOutput = await this.runRewriterStage(request, reviewerFeedback, executorSummary, agentRunId, onStateChange, options, profile, remainingQueue);
         rewriterSummaryForPrompt = renderRewriterSummary(rewriterOutput);
+        const roundContentEffects = this.ctx.write_effects?.slice(contentEffectMark) ?? [];
+        lastRoundHadContentDelta = hasContentDelta(roundContentEffects);
         const afterWrites = successfulWriteKeys([
           ...executorToolCalls,
           ...(rewriterOutput.toolCalls ?? []),
@@ -2556,7 +2869,7 @@ export class PipelineExecutor {
     }
 
     return {
-      reviewer: { ok: reviewerOk, feedback: reviewerFeedback, hasIssues: this.hasIssues(reviewerFeedback) },
+      reviewer: { ok: reviewerOk, feedback: reviewerFeedback, hasIssues: this.hasIssues(reviewerFeedback), gateVerified },
       rewriter: rewriterOutput,
     };
   }
@@ -2582,7 +2895,21 @@ export class PipelineExecutor {
     remainingQueue: StageName[] = [],
   ): Promise<{ answer: string; fatalError?: string; emptyCompletion: boolean; partialErrorCode?: string }> {
     onStateChange({ stage: "synthesizer", status: "running" });
-    const synthesizerPrompt = stageSystemPrompt("synthesizer", options);
+    // B3: concise synthesizer on gate-green turns. When the reviewer stage was
+    // satisfied by the B1 deterministic gate-green fast path (state.reviewer.
+    // gateVerified === true), emit a short, direct change summary under a reduced
+    // token cap instead of full exploratory prose. Any other value (undefined or
+    // false — research turns, failed turns, reviewer actually ran, fast path did
+    // not engage) leaves BOTH the prompt and the token cap byte-for-byte
+    // identical to the pre-B3 default path.
+    const gateVerified = state.reviewer?.gateVerified === true;
+    const basePrompt = stageSystemPrompt("synthesizer", options);
+    const synthesizerPrompt = gateVerified
+      ? `${basePrompt}\n\n${GATE_VERIFIED_SYNTHESIZER_DIRECTIVE}`
+      : basePrompt;
+    const synthMaxTokens = gateVerified
+      ? GATE_VERIFIED_SYNTHESIZER_MAX_TOKENS
+      : BUILTIN_MODES.synthesizer.max_tokens;
     const synthStartTime = Date.now();
     const contextText = buildSynthesizerContextFromStageState(request, state, executionVerification);
     let streamedAnswer = "";
@@ -2592,7 +2919,7 @@ export class PipelineExecutor {
         { role: "user", content: contextText }
       ] as ChatMessage[], {
         temperature: BUILTIN_MODES.synthesizer.temperature,
-        max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
+        max_tokens: synthMaxTokens,
         stream: true,
         stageLabel: "synthesizer",
         complexity: options.estimatedComplexity,
@@ -2691,7 +3018,11 @@ export class PipelineExecutor {
             { role: "user", content: continuationNudge },
           ] as ChatMessage[], {
             temperature: BUILTIN_MODES.synthesizer.temperature,
-            max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
+            // B3: a gate-green turn stays capped small even on the (rare)
+            // length-continuation path — a "concise" turn should not balloon
+            // back to the full 8192 cap. Falls through to the default cap when
+            // gateVerified is false, unchanged from pre-B3.
+            max_tokens: synthMaxTokens,
             stream: true,
             stageLabel: "synthesizer",
             complexity: options.estimatedComplexity,
@@ -2793,7 +3124,9 @@ export class PipelineExecutor {
               { role: "user", content: "Continue: deliver the actual answer now. No stand-by narration." },
             ] as ChatMessage[], {
               temperature: BUILTIN_MODES.synthesizer.temperature,
-              max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
+              // B3: same rationale as the length-continuation site — stay capped
+              // on gate-green turns, unchanged from pre-B3 when gateVerified is false.
+              max_tokens: synthMaxTokens,
               stream: true,
               stageLabel: "synthesizer",
               complexity: options.estimatedComplexity,
@@ -2991,6 +3324,10 @@ export class PipelineExecutor {
           ...opts,
           priorToolCalls: state.executor?.toolCalls ?? opts.priorToolCalls,
         };
+        // B5: snapshot the shared content-effect log before candidate one runs
+        // so we can isolate the byte-level effects THIS executor run produced
+        // (same length-mark + post-run slice idiom A3 uses in the repair loop).
+        const candidateOneContentMark = this.ctx.write_effects?.length ?? 0;
         state.executor = await this.runExecutorStage(
           request, renderPlanSummary(state.plan), agentRunId, onStateChange, executorOptions, profile, remainingNow(),
         );
@@ -3024,7 +3361,28 @@ export class PipelineExecutor {
           const gateFailure = candidateSyntax.length > 0
             || candidateRun.issues.length > 0
             || candidateEffect.verdict === "no_write_effect";
-          if (gateFailure) {
+          // B5: only escalate to a second, independently-reasoning executor
+          // when candidate one changed ZERO file content. If candidate one
+          // already mutated the workspace (even flawed/incomplete per the
+          // gates), a fresh candidate two that never saw those writes would
+          // start from a clean transcript over a dirty filesystem and risk
+          // compounding rather than replacing the change. In that case leave
+          // candidate one's own result in place and let the existing
+          // reviewer/rewriter repair loop (progress-gated, A3) refine it with
+          // full context of what was actually written. Escalate only when
+          // there is nothing on disk for a second attempt to trample.
+          const candidateOneEffects = this.ctx.write_effects?.slice(candidateOneContentMark) ?? [];
+          const candidateOneHadContentDelta = hasContentDelta(candidateOneEffects);
+          if (gateFailure && candidateOneHadContentDelta) {
+            // Distinguishable in logs from "gates passed, no attempt" (no line)
+            // and "escalation ran" (high_complexity_retry state change): the
+            // gate failed but candidate one already changed content, so we
+            // preserve it for the reviewer/rewriter loop instead of retrying.
+            console.log(
+              `[Pipeline] P2.3 escalation skipped: candidate one has a content delta, run=${agentRunId}`,
+            );
+          }
+          if (gateFailure && !candidateOneHadContentDelta) {
             const firstModelKey = candidateOne.modelKey!;
             onStateChange({
               stage: "executor",
@@ -3113,7 +3471,7 @@ export class PipelineExecutor {
           profile === "full" &&
           reviewerReplanEligible &&
           (!rewriter || rewriter.ok) &&
-          (options.maxReviewRepairRounds ?? 1) > 0
+          (options.maxReviewRepairRounds ?? DEFAULT_REVIEW_REPAIR_ROUNDS) > 0
         ) {
           replanRequested = {
             trigger: "reviewer_reject",
@@ -3154,7 +3512,7 @@ export class PipelineExecutor {
     if (
       effectGate.verdict === "no_write_effect" &&
       profile === "full" &&
-      (options.maxReviewRepairRounds ?? 1) > 0 &&
+      (options.maxReviewRepairRounds ?? DEFAULT_REVIEW_REPAIR_ROUNDS) > 0 &&
       turnWriteIntent &&
       state.executor &&
       !state.rewriter

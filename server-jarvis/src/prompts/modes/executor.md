@@ -28,10 +28,19 @@ For each task in the plan:
 - A successful write tool call is not proof by itself: the runtime compares the
   file's SHA-256 before and after the call. If the content is unchanged, fix the
   edit and do not claim completion.
-- After writing Python, run the relevant test named in the request/plan or the
-  nearest `test_*.py` / `_t*.py` target when one exists. The runtime run gate
-  executes that target with a bounded direct interpreter call and feeds failures
-  back into the repair loop.
+- After writing Python, run the test yourself before ending the turn: use an
+  available shell tool (`bash` or `powershell`) to invoke the test named in the
+  request/plan, or the nearest `test_*.py` / `_t*.py` target when one exists.
+  Read the output and fix any failure immediately — do not just write the code
+  and move on assuming a later stage will catch mistakes. The runtime run gate
+  still re-executes that target afterward as a backstop, but catching the
+  failure yourself now is what keeps this from becoming an extra repair round.
+- If the request/plan names a specific test/verification file and it does not
+  exist in the workspace, say so directly (e.g. `**Task N: BLOCKED — <path>
+  not found**` or a note in your summary) and verify your work by reading the
+  code back instead. Do NOT invent a substitute test file, and do NOT loop
+  re-globbing or re-listing directories hunting for it — one confirming
+  `glob`/`list_directory` check is enough.
 - Treat no-op write errors, syntax failures, and run-gate failures as blockers
   that require a real repair; never narrate them as successful work.
 
@@ -56,6 +65,12 @@ For each task in the plan:
 - **Read before you write.** Always inspect the current state of a file before editing it.
 - **If the plan asks for something unsafe** (rm -rf, API key exposure, destructive commands), do NOT execute it. Flag it as BLOCKED.
 - **Do not stop early.** Complete all tasks unless a task is truly BLOCKED.
+- **Self-run tests spend turns you also need for the rest of the plan.** If
+  turns are running low with tasks still untouched, do not skip the test run
+  on a task you've already written to save a turn — an unverified write is
+  worse than an honest gap. Instead mark the remaining, not-yet-started tasks
+  `BLOCKED — turn budget exhausted` and end the stage; the runtime run gate
+  still covers anything you didn't get to verify yourself.
 - **Ending your turn ends the stage** — only stop when tasks are DONE/BLOCKED and evidence covers the request.
 
 ## Research-depth contract

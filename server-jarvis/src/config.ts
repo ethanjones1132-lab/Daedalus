@@ -11,6 +11,15 @@ import { execSync } from "child_process";
 import { DEFAULT_ORCHESTRATOR_AGENTS, type OrchestratorAgent } from "./orchestration/agent-pool";
 import { validateOrchestratorAgents } from "./orchestration/agent-validation";
 
+// ── A3: review→rewrite repair budget ──
+// Base cap of repair rounds that run unconditionally on a gate/reviewer
+// failure. The pipeline grants at most ONE progress-gated bonus round beyond
+// this (only on a real content delta), so the absolute ceiling is base + 1.
+// Single source of truth: referenced by defaultConfig(), the normalizeConfig
+// clamp, and the pipeline's defensive clamp + replan-eligibility guards.
+export const DEFAULT_REVIEW_REPAIR_ROUNDS = 2;
+export const MAX_REVIEW_REPAIR_ROUNDS = 3;
+
 // ── Types ──
 
 export type BackendType = 'ollama' | 'openrouter' | 'claude_cli';
@@ -343,8 +352,22 @@ export interface OrchestratorConfig {
   max_conductor_replans_per_session: number;
   /** Maximum automatic review -> rewrite repair rounds for a full turn. */
   max_review_repair_rounds: number;
-  /** Retry a high-complexity change once with a different strong executor after a deterministic gate failure. */
+  /** Retry a high-complexity change once with a different strong executor after
+   *  a deterministic gate failure — but only when candidate one changed ZERO
+   *  file content (B5). If it failed the gates yet still mutated content, the
+   *  retry is skipped and the reviewer/rewriter loop repairs that output
+   *  instead, so a second model never tramples candidate one's writes. */
   high_complexity_executor_retry?: boolean;
+  /**
+   * B1: when true (default), a turn whose deterministic gates BOTH positively
+   * confirm the written code (syntax gate clean AND run gate actually executed
+   * a real test that passed) skips the weak-model reviewer call for that loop
+   * iteration — deterministic execution evidence outranks a 20-60s read-only
+   * review. The reviewer still runs whenever the run gate was "skipped" (no
+   * runnable target / interpreter unavailable — an absence of evidence, not a
+   * pass) or "failed". Set false to always run the model reviewer.
+   */
+  gate_green_skips_reviewer?: boolean;
   /**
    * T2.4: when true (default), all orchestrator turns run through
    * runPipelineWithReplanning so mid-run replan triggers can fire.
@@ -546,8 +569,9 @@ export function defaultConfig(): JarvisConfig {
       max_recursion_depth: 2,
       max_conductor_replans: 2,
       max_conductor_replans_per_session: 6,
-      max_review_repair_rounds: 1,
+      max_review_repair_rounds: DEFAULT_REVIEW_REPAIR_ROUNDS,
       high_complexity_executor_retry: true,
+      gate_green_skips_reviewer: true,
       mid_run_replan: true,
       dynamic_agents: {
         enabled: false,
@@ -733,10 +757,13 @@ export function normalizeConfig(raw: any, options: NormalizeConfigOptions = {}):
   if (!merged.claude_cli.delegate.model || !merged.claude_cli.delegate.model.trim()) {
     merged.claude_cli.delegate.model = "deepseek-v4-pro";
   }
+  // A3: base cap of unconditional review→rewrite repair rounds. Default 2, and
+  // the ceiling is 3 so the pipeline's progress-gated bonus round has headroom
+  // (the loop grants one conditional 3rd round only on a real content delta).
   const configuredRepairRounds = Number(merged.orchestrator.max_review_repair_rounds);
   merged.orchestrator.max_review_repair_rounds = Number.isFinite(configuredRepairRounds)
-    ? Math.min(2, Math.max(0, Math.floor(configuredRepairRounds)))
-    : 1;
+    ? Math.min(MAX_REVIEW_REPAIR_ROUNDS, Math.max(0, Math.floor(configuredRepairRounds)))
+    : DEFAULT_REVIEW_REPAIR_ROUNDS;
   const openRouterKey = process.env.OPENROUTER_API_KEY || process.env.OPENROUTER_KEY;
   const openCodeKey = process.env.OPENCODE_API_KEY || process.env.OPENCODE_KEY;
   const openCodeZenKey = process.env.OPENCODE_ZEN_API_KEY || process.env.OPENCODE_ZEN_KEY || openCodeKey;
