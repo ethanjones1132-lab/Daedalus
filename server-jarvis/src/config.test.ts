@@ -35,6 +35,15 @@ describe("review repair budget", () => {
   test("defaults the base repair cap to 2", () => {
     expect(defaultConfig().orchestrator.max_review_repair_rounds).toBe(2);
   });
+
+  // B1: gate-green fast path is opt-out (default on); an explicit false survives
+  // normalization so operators can force the model reviewer to always run.
+  test("defaults gate_green_skips_reviewer to true and preserves an explicit false", () => {
+    expect(defaultConfig().orchestrator.gate_green_skips_reviewer).toBe(true);
+    expect(
+      normalizeConfig({ orchestrator: { gate_green_skips_reviewer: false } }).orchestrator.gate_green_skips_reviewer,
+    ).toBe(false);
+  });
 });
 
 describe("Claude CLI auth mode config", () => {

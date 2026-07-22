@@ -355,6 +355,16 @@ export interface OrchestratorConfig {
   /** Retry a high-complexity change once with a different strong executor after a deterministic gate failure. */
   high_complexity_executor_retry?: boolean;
   /**
+   * B1: when true (default), a turn whose deterministic gates BOTH positively
+   * confirm the written code (syntax gate clean AND run gate actually executed
+   * a real test that passed) skips the weak-model reviewer call for that loop
+   * iteration — deterministic execution evidence outranks a 20-60s read-only
+   * review. The reviewer still runs whenever the run gate was "skipped" (no
+   * runnable target / interpreter unavailable — an absence of evidence, not a
+   * pass) or "failed". Set false to always run the model reviewer.
+   */
+  gate_green_skips_reviewer?: boolean;
+  /**
    * T2.4: when true (default), all orchestrator turns run through
    * runPipelineWithReplanning so mid-run replan triggers can fire.
    */
@@ -557,6 +567,7 @@ export function defaultConfig(): JarvisConfig {
       max_conductor_replans_per_session: 6,
       max_review_repair_rounds: DEFAULT_REVIEW_REPAIR_ROUNDS,
       high_complexity_executor_retry: true,
+      gate_green_skips_reviewer: true,
       mid_run_replan: true,
       dynamic_agents: {
         enabled: false,

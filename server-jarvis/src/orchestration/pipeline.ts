@@ -2511,6 +2511,59 @@ export class PipelineExecutor {
         renderRunIssues(runGate),
       ].filter(Boolean).join("\n\n");
 
+      // B1: gate-green fast path. When BOTH deterministic gates positively
+      // confirm the written code — syntax gate clean AND the run gate actually
+      // EXECUTED a real test that passed (status "passed", not "skipped") — that
+      // execution evidence strictly outranks a 20-60s weak-model read-only
+      // review that live telemetry shows also sometimes times out/retries. Skip
+      // the reviewer model call entirely for this iteration. A "skipped" run
+      // gate is an ABSENCE of evidence ("no runnable target / interpreter
+      // unavailable — we don't know"), NOT positive confirmation, so it does not
+      // qualify and the reviewer still runs. Disable via
+      // orchestrator.gate_green_skips_reviewer=false (mirrors the direct-off-
+      // this.ctx.config flag read used by high_complexity_executor_retry).
+      if (
+        this.ctx.config.orchestrator?.gate_green_skips_reviewer !== false
+        && syntaxIssues.length === 0
+        && runGate.status === "passed"
+      ) {
+        // Synthetic verdict must parse as ACCEPT for hasIssues()/
+        // parseReviewerVerdict() (leading ACCEPT token → verdict "accept" →
+        // hasIssues false), so the downstream replan trigger (reviewer?.hasIssues)
+        // correctly stays quiet and no rewriter/repair is attempted.
+        reviewerFeedback = `ACCEPT — deterministic gates verified this turn: syntax gate clean and run gate executed a real test that passed${runGate.target ? ` (${runGate.target})` : ""}. Model reviewer skipped per orchestrator.gate_green_skips_reviewer.`;
+        reviewerOk = true;
+        hasPendingIssues = false;
+        console.log(
+          `[Pipeline] gate-green fast path: skipping model reviewer`
+          + ` (syntax clean, run gate passed${runGate.target ? ` on ${runGate.target}` : ""}), run=${agentRunId}`,
+        );
+        onStateChange({
+          stage: "reviewer",
+          status: "completed",
+          output: "\nGate-verified (syntax + run gate passed); model reviewer skipped.\n",
+        });
+        // Record a distinguishable stage_run so the skip is observable in the
+        // same stage_runs table real reviewer calls populate. A dedicated
+        // mode_id ("reviewer_gate_skip") + output_tokens:0 keeps the self-tuning
+        // collector from training reviewer instruction/latency stats on a
+        // synthetic zero-cost row (conductor-learning maps stageByMode on the
+        // canonical "reviewer" id, which this deliberately does not use).
+        this.collector.recordStageRun({
+          id: `stage_${crypto.randomUUID()}`,
+          agent_run_id: agentRunId,
+          mode_id: "reviewer_gate_skip",
+          turn_number: reviewCount,
+          input_tokens: 0,
+          output_tokens: 0,
+          tool_calls_json: "[]",
+          duration_ms: Date.now() - revStartTime,
+          was_successful: 1,
+          had_error: 0,
+        });
+        break;
+      }
+
       try {
         const reviewerMessages = [
           { role: "system", content: reviewerPrompt },
