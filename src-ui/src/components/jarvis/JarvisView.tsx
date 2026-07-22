@@ -11,6 +11,7 @@ import {
 import ControlCenterView from './ControlCenterView';
 import MarkdownView from './MarkdownView';
 import WorkspaceGrantsChip from './WorkspaceGrantsChip';
+import SystemStatusBar from './SystemStatusBar';
 import {
   createUnknownFrameReporter,
   InactivityWatchdog,
@@ -157,12 +158,14 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
       className="h-full min-h-0 flex flex-col overflow-hidden"
     >
       {/* Persistent command rail: view tabs and recent sessions never leave
-          reach while the nested feature surface (notably Chat) scrolls. */}
-      <div
-        data-testid="jarvis-persistent-nav"
-        className="sticky top-0 z-20 shrink-0 mb-3 -mx-1 px-1 pb-2 bg-void/95 backdrop-blur-md border-b border-white/[0.04]"
-      >
-      {/* Sub-navigation tabs — ARIA tablist + tab semantics (Phase 4) */}
+                reach while the nested feature surface (notably Chat) scrolls. */}
+            <div
+              data-testid="jarvis-persistent-nav"
+              className="sticky top-0 z-20 shrink-0 mb-3 -mx-1 px-1 pb-2 bg-void/95 backdrop-blur-md border-b border-white/[0.04]"
+            >
+            {/* System status bar — compact at-a-glance health */}
+            <SystemStatusBar />
+            {/* Sub-navigation tabs — ARIA tablist + tab semantics (Phase 4) */}
       <div
         role="tablist"
         aria-label="Jarvis views"
