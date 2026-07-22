@@ -64,3 +64,6 @@ scripts/loosen-claude-delegate-timeout.py
 scripts/jarvis-2026-07-21-evening-flake-pin.py
 scripts/_inspect-bs.py
 scripts/jarvis-2026-07-21-evening-priorities.py
+
+# --- Live benchmark output ---
+scripts/benchmark-tier2b/results-tier2b.json

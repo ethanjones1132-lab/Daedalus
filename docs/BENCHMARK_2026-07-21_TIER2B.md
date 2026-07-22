@@ -3,13 +3,51 @@
 ## Status
 
 The Tier-2B fixture and runner are implemented in
-`scripts/benchmark-tier2b/`. The prior Tier-2 artifacts were temporary and
-were not part of the repository, so this report makes the corrected suite
-reproducible before recording a new live score.
+`scripts/benchmark-tier2b/`. A live K=3 measurement was completed on
+2026-07-22 against the deployed server release `186613af6e4c3ac4afc233d3cd8842353127cb1d`.
+The generated result is preserved in
+`scripts/benchmark-tier2b/results-tier2b.json` (ignored by source control).
 
-No live K=3 measurement is claimed in this commit. Live mode is intentionally
-opt-in because the suite makes 60 inference calls at K=3 (10 tasks × 3 × 2
-arms), which is not appropriate for an unbounded default validation run.
+Live mode remains intentionally opt-in because the suite makes 60 inference
+calls at K=3 (10 tasks × 3 × 2 arms).
+
+## Live K=3 result (2026-07-22)
+
+| Arm | Passes | Rate |
+| --- | ---: | ---: |
+| Baseline | 18/30 | 60.0% |
+| Architecture | 20/30 | 66.7% |
+
+The architecture arm produced a net lift of 2 passes (+6.7 percentage points).
+The category breakdown shows where the lift came from:
+
+| Category | Baseline | Architecture |
+| --- | ---: | ---: |
+| A — matched-information logic | 6/12 | 8/12 |
+| B — multi-file exploration | 0/6 | 3/6 |
+| C — iteration-required | 6/6 | 5/6 |
+| D — execution-required | 6/6 | 4/6 |
+
+Per-task results:
+
+| Task | Baseline | Architecture |
+| --- | ---: | ---: |
+| `merge_intervals` | 2/3 | 2/3 |
+| `lru_cache` | 3/3 | 2/3 |
+| `topological_sort` | 1/3 | 2/3 |
+| `parse_csv_line` | 0/3 | 2/3 |
+| `pkg_discount` | 0/3 | 1/3 |
+| `pkg_auth` | 0/3 | 2/3 |
+| `safe_divide_batch` | 3/3 | 2/3 |
+| `retry_with_backoff` | 3/3 | 3/3 |
+| `load_or_create_json` | 3/3 | 2/3 |
+| `run_checked` | 3/3 | 2/3 |
+
+The result supports the intended architecture hypothesis for tasks requiring
+repository context and cross-file reasoning, especially categories A and B.
+It also shows that the current orchestration path can regress on already
+solved utility tasks; the next improvement should target regression control,
+not simply add more context.
 
 ## Fixture corrections
 

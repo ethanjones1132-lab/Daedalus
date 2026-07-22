@@ -100,7 +100,12 @@ def run_baseline(task, sample, live):
 def run_architecture(task, sample, stream_url, live):
     if not live:
         return None, "not run", 0.0
-    with tempfile.TemporaryDirectory(prefix=f"tier2b-arch-{task['name']}-") as raw:
+    # A model-written workspace can contain Windows device names such as
+    # `nul`. The test result is already collected before cleanup; a cleanup
+    # permission/device error must not discard the benchmark sample.
+    with tempfile.TemporaryDirectory(
+        prefix=f"tier2b-arch-{task['name']}-", ignore_cleanup_errors=True,
+    ) as raw:
         directory = Path(raw)
         seed(directory, task)
         body = json.dumps({
