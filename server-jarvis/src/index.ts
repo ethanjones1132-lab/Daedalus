@@ -19,6 +19,7 @@ import { homedir } from "os";
 import { spawn, execSync } from "child_process";
 import { loadConfig, saveConfig, saveConfigWithValidation, normalizeConfig, InvalidConfigError, CONFIG_DIR, COMPANION_FILE, surfaceTemperature } from "./config";
 import type { JarvisConfig, OllamaConfig, SurfaceType } from "./config";
+import { ensureClaudeCliProxyRunning } from "./claude-proxy-lifecycle";
 import { Database } from "bun:sqlite";
 import { buildLearningPrompt, buildReviewPrompt, buildCodebaseAuditPrompt, buildFootballAuditPrompt } from "./cron-prompts";
 import { createLifecycleService } from "./agent-lifecycle";
@@ -5214,5 +5215,19 @@ void persistentConductor.warmUp()
   .catch((error) => {
     console.warn(
       `[PersistentConductor] warm-up skipped: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  });
+
+// Bring up the Claude-CLI proxy from the SERVER's own boot, not only from the
+// desktop app's Rust boot. The `claude_cli` delegate defaults to `delegate_first`,
+// but the deploy path restarts only this Bun server — so without this the proxy
+// port never listened and every delegate turn silently fell back to native
+// execution. Fire-and-forget and fail-open (mirrors the warm-up block above and
+// the Rust side's stance): a missing script/interpreter or a failed spawn logs a
+// warning and never blocks serve() or takes down the HTTP server.
+void ensureClaudeCliProxyRunning(loadConfig())
+  .catch((error) => {
+    console.warn(
+      `[ClaudeProxy] ensure-running skipped: ${error instanceof Error ? error.message : String(error)}`,
     );
   });
