@@ -3196,10 +3196,15 @@ export class PipelineExecutor {
           opts.taskRunContract
         ) {
           try {
+            // Force reseed only for intentional reconstruction; live multi-turn
+            // plans must not be clobbered when the planner re-runs.
+            const force =
+              opts.taskRunContract.reconstruction === "reconstruction_required";
             const seeded = seedTaskPlanFromPlannerProposal(
               opts.taskRunContract,
               state.plan.narrative,
               opts.ownedPlanning.plan_brief,
+              { force },
             );
             opts.taskRunContract = seeded.contract;
             opts.onTaskPlanUpdate?.(seeded.contract);

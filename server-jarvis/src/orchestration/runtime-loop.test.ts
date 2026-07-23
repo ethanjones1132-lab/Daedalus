@@ -414,6 +414,57 @@ describe("runtime-loop > multi-turn plan reseeding (non-clobber)", () => {
     expect(reseeds.plan?.items.every((i) => i.status !== "verified")).toBe(true);
   });
 
+  test("planner re-run preserves verified items when shouldSeed is false", () => {
+    const brief = buildConductorPlanBrief("build multi-step adapter", "medium");
+    const narrative = [
+      "# Plan",
+      "1. Scaffold adapter module",
+      "2. Wire unit tests",
+      "3. Document usage",
+    ].join("\n");
+
+    let contract = baseContract({ estimatedComplexity: "medium" });
+    const first = seedTaskPlanFromPlannerProposal(contract, narrative, brief);
+    contract = first.contract;
+    expect(shouldSeedTaskPlan(contract)).toBe(false);
+    expect(contract.plan?.items.length).toBe(3);
+
+    const firstItemId = first.items[0].id!;
+    contract = applySufficientVerdict(contract, {
+      itemId: firstItemId,
+      gradingMode: "conductor_direct_diff",
+      evidence: { ref: "run_1:executor", summary: "scaffolded" },
+      advance: true,
+    });
+    expect(getPlanItem(contract, firstItemId)?.status).toBe("verified");
+    const verifiedBefore = listVerifiedPlanItems(contract).map((i) => i.id);
+    const activeBefore = getActivePlanItem(contract)?.id;
+
+    // Planner re-runs on a continuation turn with a different narrative.
+    // Without shouldSeed guard this would wipe verified progress.
+    const replanNarrative = [
+      "# Plan",
+      "1. Totally different first step",
+      "2. Another brand new step",
+    ].join("\n");
+    const second = seedTaskPlanFromPlannerProposal(contract, replanNarrative, brief);
+    expect(shouldSeedTaskPlan(contract)).toBe(false);
+    expect(second.notes).toMatch(/preserved|shouldSeed=false/);
+    expect(second.contract).toBe(contract);
+    expect(getPlanItem(second.contract, firstItemId)?.status).toBe("verified");
+    expect(listVerifiedPlanItems(second.contract).map((i) => i.id)).toEqual(verifiedBefore);
+    expect(getActivePlanItem(second.contract)?.id).toBe(activeBefore);
+    expect(second.contract.plan?.items).toHaveLength(3);
+    expect(second.contract.plan?.items[0].title).toMatch(/Scaffold/i);
+
+    // force still reseeds intentionally
+    const forced = seedTaskPlanFromPlannerProposal(contract, replanNarrative, brief, {
+      force: true,
+    });
+    expect(forced.contract.plan?.items).toHaveLength(2);
+    expect(forced.contract.plan?.items.every((i) => i.status !== "verified")).toBe(true);
+  });
+
   test("formatConductorPlanBrief includes objective, constraints, memory, failures", () => {
     const brief = buildConductorPlanBrief(
       "refactor auth module",

@@ -436,13 +436,34 @@ export function formatConductorPlanBrief(brief: ConductorPlanBrief): string {
 
 /**
  * After planner stage on planner_mediated path: validate proposal and persist.
+ *
+ * Multi-turn: does NOT wipe verified/blocked/repair state when a live v2 plan
+ * already exists — same shouldSeedTaskPlan policy as conductor_direct.
+ * Pass force only for intentional reconstruction/replan.
  */
 export function seedTaskPlanFromPlannerProposal(
   contract: TaskRunContract,
   plannerNarrative: string,
   brief?: ConductorPlanBrief,
-  opts: { activateFirst?: boolean } = {},
+  opts: { activateFirst?: boolean; force?: boolean } = {},
 ): { contract: TaskRunContract; items: CreateTaskPlanItemInput[]; notes: string } {
+  if (!shouldSeedTaskPlan(contract, { force: opts.force === true })) {
+    // Preserve live ledger progress; still surface current items for callers.
+    const existing = (contract.plan?.items ?? []).map(
+      (item): CreateTaskPlanItemInput => ({
+        id: item.id,
+        title: item.title,
+        description: item.description,
+        dependsOn: item.dependsOn,
+        acceptanceChecks: item.acceptanceChecks,
+      }),
+    );
+    return {
+      contract,
+      items: existing,
+      notes: "preserved existing TaskPlan (shouldSeed=false)",
+    };
+  }
   const proposed = extractPlanItemsFromPlannerNarrative(plannerNarrative, brief);
   const validated = conductorValidatePlanItems(proposed, brief);
   const next = setTaskPlan(contract, validated.items, {
