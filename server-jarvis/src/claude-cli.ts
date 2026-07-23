@@ -9,8 +9,10 @@ import { existsSync, mkdirSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import type { JarvisConfig } from "./config";
+import { openCodeGoProtocolForModel } from "./orchestration/live-model-catalog";
 
 const LOCAL_PROXY_BASE_URL = "http://127.0.0.1:19878";
+const OPENCODE_GO_DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1";
 const LOCAL_CLAUDE_CONFIG_DIR =
   process.env.JARVIS_CLAUDE_CONFIG_DIR ||
   join(homedir(), ".openclaw", "jarvis", "hermes", "claude-local-config");
@@ -22,10 +24,46 @@ const CREDENTIAL_ENV_KEYS = new Set([
   "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
 ]);
 
-export type ClaudeCliAuthMode = "proxy" | "subscription";
+/** Effective launch mode for a Claude CLI subprocess. `opencode_go` is resolved
+ *  at the call site for Anthropic-native OpenCode Go models — it is not a
+ *  user-facing config.claude_cli.auth_mode value. */
+export type ClaudeCliAuthMode = "proxy" | "subscription" | "opencode_go";
 
 export interface ClaudeCliLaunchOptions {
   authMode: ClaudeCliAuthMode;
+  /** OpenCode Go API key used when authMode is `opencode_go`. */
+  opencodeGoApiKey?: string;
+  /** OpenCode Go base URL; defaults to https://opencode.ai/zen/go/v1. */
+  opencodeGoBaseUrl?: string;
+}
+
+export interface ResolveClaudeCliLaunchOptionsInput {
+  authMode: "proxy" | "subscription";
+  modelId?: string;
+  opencodeGoApiKey?: string;
+  opencodeGoBaseUrl?: string;
+}
+
+/**
+ * Map configured auth mode + model to the effective CLI launch contract.
+ * Anthropic-native OpenCode Go models skip the Python proxy and talk to
+ * OpenCode Go's `/messages` surface point-to-point (same pattern as subscription).
+ */
+export function resolveClaudeCliLaunchOptions(
+  input: ResolveClaudeCliLaunchOptionsInput,
+): ClaudeCliLaunchOptions {
+  if (input.authMode === "subscription") {
+    return { authMode: "subscription" };
+  }
+  const modelId = input.modelId?.trim() ?? "";
+  if (modelId && openCodeGoProtocolForModel(modelId) === "anthropic") {
+    return {
+      authMode: "opencode_go",
+      opencodeGoApiKey: input.opencodeGoApiKey ?? "",
+      opencodeGoBaseUrl: input.opencodeGoBaseUrl,
+    };
+  }
+  return { authMode: "proxy" };
 }
 
 // ── Path Resolution ──
@@ -56,10 +94,22 @@ export function resolveClaudePath(configPath: string): string {
   return configPath || "claude";
 }
 
+function stripCredentialEnv(baseEnv: NodeJS.ProcessEnv): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(baseEnv)) {
+    if (value === undefined) continue;
+    if (CREDENTIAL_ENV_KEYS.has(key)) continue;
+    if (CREDENTIAL_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) continue;
+    env[key] = value;
+  }
+  return env;
+}
+
 export function buildLocalClaudeEnv(
   baseEnv: NodeJS.ProcessEnv = process.env,
-  { authMode }: ClaudeCliLaunchOptions = { authMode: "proxy" },
+  options: ClaudeCliLaunchOptions = { authMode: "proxy" },
 ): Record<string, string> {
+  const { authMode } = options;
   if (authMode === "subscription") {
     return Object.fromEntries(
       Object.entries(baseEnv).filter((entry): entry is [string, string] => {
@@ -72,13 +122,19 @@ export function buildLocalClaudeEnv(
     );
   }
 
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(baseEnv)) {
-    if (value === undefined) continue;
-    if (CREDENTIAL_ENV_KEYS.has(key)) continue;
-    if (CREDENTIAL_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) continue;
-    env[key] = value;
+  if (authMode === "opencode_go") {
+    // Point-to-point OpenCode Go: same credential stripping as proxy, then pin
+    // Anthropic-compatible base URL + API key (Claude CLI sends it as x-api-key).
+    const env = stripCredentialEnv(baseEnv);
+    const baseUrl = (options.opencodeGoBaseUrl || OPENCODE_GO_DEFAULT_BASE_URL).replace(/\/+$/, "");
+    return {
+      ...env,
+      ANTHROPIC_API_KEY: options.opencodeGoApiKey ?? "",
+      ANTHROPIC_BASE_URL: baseUrl,
+    };
   }
+
+  const env = stripCredentialEnv(baseEnv);
 
   mkdirSync(LOCAL_CLAUDE_CONFIG_DIR, { recursive: true });
 
@@ -104,6 +160,8 @@ export function buildLocalClaudeArgs(
   { authMode }: ClaudeCliLaunchOptions = { authMode: "proxy" },
 ): string[] {
   const next: string[] = [];
+  // opencode_go is point-to-point like subscription: no --bare local-model mode.
+  const stripBare = authMode === "subscription" || authMode === "opencode_go";
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
     if (arg === "--max-turns") {
@@ -111,7 +169,7 @@ export function buildLocalClaudeArgs(
       continue;
     }
     if (arg === "--no-telemetry") continue;
-    if (authMode === "subscription" && arg === "--bare") continue;
+    if (stripBare && arg === "--bare") continue;
     next.push(arg);
   }
   if (authMode === "proxy" && !next.includes("--bare")) {
@@ -130,7 +188,7 @@ export function buildClaudeCliChatArgs(
   args: string[],
   { authMode, claudeModel, proxyModel }: ClaudeCliChatArgsOptions,
 ): string[] {
-  const selectedModel = authMode === "proxy" ? proxyModel.trim() : claudeModel?.trim();
+  const selectedModel = authMode === "subscription" ? claudeModel?.trim() : proxyModel.trim();
   return selectedModel ? [...args, "--model", selectedModel] : [...args];
 }
 

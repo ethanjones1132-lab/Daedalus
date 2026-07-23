@@ -105,12 +105,11 @@ describe("Claude executor delegate", () => {
     expect(delegateEligibility(base)).toEqual({ eligible: true });
   });
 
-  test("proxy-mode spawn env is routed to the local proxy and carries no real credential", () => {
-    // The single regression that would silently route to Anthropic is a spawn
-    // env missing the local BASE_URL (or leaking a real key). Pin both: the CLI
-    // this invocation launches can only reach 127.0.0.1:19878, and --bare is
-    // present so the CLI restricts auth to the (dummy) key we inject.
+  test("proxy-mode OpenAI-compatible models route to the local proxy and carry no real credential", () => {
+    // Non-Anthropic OpenCode Go models still use the Python proxy. Pin both the
+    // local BASE_URL and --bare so the CLI cannot reach real Anthropic.
     const config = defaultConfig();
+    config.claude_cli.delegate.model = "deepseek-v4-pro";
     expect(config.claude_cli.auth_mode).toBe("proxy");
     const invocation = buildClaudeDelegateInvocation({
       config,
@@ -131,6 +130,34 @@ describe("Claude executor delegate", () => {
     expect(invocation.env.ANTHROPIC_API_KEY).not.toBe("real-secret-should-be-dropped");
     expect(invocation.env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
     expect(invocation.args).toContain("--bare");
+  });
+
+  test("Anthropic-native delegate models skip the proxy and talk to OpenCode Go directly", () => {
+    const config = defaultConfig();
+    config.claude_cli.auth_mode = "proxy";
+    config.claude_cli.delegate.model = "minimax-m3";
+    config.opencode_go.api_key = "go-delegate-key";
+    config.opencode_go.base_url = "https://opencode.ai/zen/go/v1";
+    const invocation = buildClaudeDelegateInvocation({
+      config,
+      prompt: "make the change",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\primary"],
+      stageRemainingMs: 500_000,
+      executable: "claude",
+      baseEnv: {
+        PATH: "test-path",
+        ANTHROPIC_API_KEY: "real-secret-should-be-dropped",
+        ANTHROPIC_BASE_URL: "http://127.0.0.1:19878",
+        CLAUDE_CODE_OAUTH_TOKEN: "real-oauth-should-be-dropped",
+      },
+    });
+
+    expect(invocation.env.ANTHROPIC_BASE_URL).toBe("https://opencode.ai/zen/go/v1");
+    expect(invocation.env.ANTHROPIC_API_KEY).toBe("go-delegate-key");
+    expect(invocation.env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    expect(invocation.args).not.toContain("--bare");
+    expect(invocation.args).toContain("minimax-m3");
   });
 
   test("builds only installed stock-CLI flags, auth environment, and P0 root cwd", () => {
@@ -267,6 +294,8 @@ describe("Claude executor delegate", () => {
     });
     const config = defaultConfig();
     config.claude_cli.auth_mode = "proxy";
+    // OpenAI-compatible proxy models still need the local Python proxy.
+    config.claude_cli.delegate.model = "deepseek-v4-pro";
 
     expect(await availability.isAvailable(config)).toBe(false);
     proxyListening = true;
@@ -284,6 +313,23 @@ describe("Claude executor delegate", () => {
     expect(await availability.isAvailable(config)).toBe(true);
     expect(cliChecks).toBe(3);
     expect(proxyChecks).toBe(2);
+  });
+
+  test("Anthropic-native proxy-mode delegates do not require the local proxy port", async () => {
+    let proxyChecks = 0;
+    const availability = new ClaudeDelegateAvailabilityCache({
+      checkCli: async () => true,
+      checkProxyPort: async () => {
+        proxyChecks += 1;
+        return false;
+      },
+    });
+    const config = defaultConfig();
+    config.claude_cli.auth_mode = "proxy";
+    config.claude_cli.delegate.model = "minimax-m3";
+
+    expect(await availability.isAvailable(config)).toBe(true);
+    expect(proxyChecks).toBe(0);
   });
 
   test("downgrades each claimed write without matching ground-truth change before effect gating", async () => {

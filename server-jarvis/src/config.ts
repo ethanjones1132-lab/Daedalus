@@ -116,7 +116,7 @@ export interface ClaudeDelegateConfig {
   policy: "delegate_first" | "escalation";
   permission_mode: "acceptEdits" | "bypassPermissions";
   allowed_tools: string[];
-  /** Proxy-routable model used by the stock Claude CLI delegate. */
+  /** Model used by the stock Claude CLI delegate (OpenCode Go id or Claude model). */
   model: string;
   timeout_ms: number;
 }
@@ -495,7 +495,7 @@ export function defaultConfig(): JarvisConfig {
           "Read", "Edit", "Write", "MultiEdit", "Grep", "Glob",
           "WebSearch", "WebFetch", "TodoWrite",
         ],
-        model: "deepseek-v4-pro",
+        model: "minimax-m3",
         timeout_ms: 420_000,
       },
     },
@@ -727,11 +727,11 @@ const warnedStaleWorkspacePaths = new Set<string>();
 
 export function normalizeConfig(raw: any, options: NormalizeConfigOptions = {}): JarvisConfig {
   const merged = deepMerge(defaultConfig(), raw);
-  // Stock Claude delegation must not silently fall back to the proxy's weak
-  // implicit model. Preserve an explicitly configured model, but migrate old
-  // blank configs to the strongest currently proxy-routable free model.
+  // Stock Claude delegation must not silently fall back to a blank/implicit
+  // model. Preserve an explicitly configured model, but migrate old blank
+  // configs to the Anthropic-native OpenCode Go primary (point-to-point).
   if (!merged.claude_cli.delegate.model || !merged.claude_cli.delegate.model.trim()) {
-    merged.claude_cli.delegate.model = "deepseek-v4-pro";
+    merged.claude_cli.delegate.model = "minimax-m3";
   }
   const configuredRepairRounds = Number(merged.orchestrator.max_review_repair_rounds);
   merged.orchestrator.max_review_repair_rounds = Number.isFinite(configuredRepairRounds)

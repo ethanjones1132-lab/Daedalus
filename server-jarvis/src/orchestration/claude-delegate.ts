@@ -5,9 +5,11 @@ import {
   decodeClaudeCliMessage,
   isClaudeCliAvailable,
   prepareClaudeCliInvocation,
+  resolveClaudeCliLaunchOptions,
   resolveClaudePath,
   type ClaudeStreamDecodeState,
 } from "../claude-cli";
+import { openCodeGoProtocolForModel } from "./live-model-catalog";
 import { createHash } from "crypto";
 import { execFile, spawn } from "child_process";
 import { readFile, readdir } from "fs/promises";
@@ -108,13 +110,17 @@ export class ClaudeDelegateAvailabilityCache {
   }
 
   async isAvailable(config: JarvisConfig): Promise<boolean> {
-    const key = `${config.claude_cli.auth_mode}:${config.claude_cli.path}`;
+    const delegateModel = config.claude_cli.delegate.model.trim();
+    const key = `${config.claude_cli.auth_mode}:${config.claude_cli.path}:${delegateModel}`;
     const cached = this.cache.get(key);
     if (cached && this.now() < cached.expiresAt) return cached.available;
 
     const cliAvailable = await this.checkCli(config);
-    const proxyAvailable = config.claude_cli.auth_mode !== "proxy"
-      || await this.checkProxyPort(19_878);
+    // Anthropic-native OpenCode Go models skip the Python proxy entirely, so
+    // availability only needs the stock Claude binary (same as subscription).
+    const needsProxy = config.claude_cli.auth_mode === "proxy"
+      && !(delegateModel && openCodeGoProtocolForModel(delegateModel) === "anthropic");
+    const proxyAvailable = !needsProxy || await this.checkProxyPort(19_878);
     const available = cliAvailable && proxyAvailable;
     this.cache.set(key, {
       available,
@@ -260,7 +266,12 @@ export function buildClaudeDelegateInvocation(
   }
 
   const executable = input.executable ?? resolveClaudePath(input.config.claude_cli.path);
-  const launchOptions = { authMode: input.config.claude_cli.auth_mode } as const;
+  const launchOptions = resolveClaudeCliLaunchOptions({
+    authMode: input.config.claude_cli.auth_mode,
+    modelId: delegate.model,
+    opencodeGoApiKey: input.config.opencode_go.api_key,
+    opencodeGoBaseUrl: input.config.opencode_go.base_url,
+  });
   const prepared = prepareClaudeCliInvocation(
     executable,
     buildLocalClaudeArgs(args, launchOptions),

@@ -7,6 +7,7 @@ import {
   decodeClaudeCliMessage,
   estimateCommandLineLength,
   prepareClaudeCliInvocation,
+  resolveClaudeCliLaunchOptions,
 } from "./claude-cli";
 
 describe("Claude CLI local-only launch contract", () => {
@@ -70,6 +71,55 @@ describe("Claude CLI local-only launch contract", () => {
     expect(env.CLAUDE_CONFIG_DIR).toBeUndefined();
   });
 
+  test("opencode_go mode points at OpenCode Go with the configured key and strips inherited credentials", () => {
+    const env = buildLocalClaudeEnv({
+      PATH: "/usr/bin",
+      HOME: "/home/tester",
+      ANTHROPIC_API_KEY: "real-api-key",
+      ANTHROPIC_AUTH_TOKEN: "real-auth-token",
+      ANTHROPIC_BASE_URL: "http://127.0.0.1:19878",
+      CLAUDE_CODE_OAUTH_TOKEN: "real-oauth-token",
+      CLAUDE_CONFIG_DIR: "/home/tester/.openclaw/jarvis/hermes/claude-local-config",
+    }, {
+      authMode: "opencode_go",
+      opencodeGoApiKey: "go-test-key",
+      opencodeGoBaseUrl: "https://opencode.ai/zen/go/v1/",
+    });
+
+    expect(env.PATH).toBe("/usr/bin");
+    expect(env.HOME).toBe("/home/tester");
+    expect(env.ANTHROPIC_API_KEY).toBe("go-test-key");
+    expect(env.ANTHROPIC_BASE_URL).toBe("https://opencode.ai/zen/go/v1");
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    expect(env.CLAUDE_CONFIG_DIR).toBeUndefined();
+    expect(env.CLAUDE_CODE_SIMPLE).toBeUndefined();
+    expect(env.CLAUDE_CODE_USE_LOCAL_MODEL).toBeUndefined();
+  });
+
+  test("resolveClaudeCliLaunchOptions routes Anthropic-native models to opencode_go under proxy mode", () => {
+    expect(resolveClaudeCliLaunchOptions({
+      authMode: "proxy",
+      modelId: "minimax-m3",
+      opencodeGoApiKey: "go-key",
+      opencodeGoBaseUrl: "https://opencode.ai/zen/go/v1",
+    })).toEqual({
+      authMode: "opencode_go",
+      opencodeGoApiKey: "go-key",
+      opencodeGoBaseUrl: "https://opencode.ai/zen/go/v1",
+    });
+    expect(resolveClaudeCliLaunchOptions({
+      authMode: "proxy",
+      modelId: "deepseek-v4-pro",
+      opencodeGoApiKey: "go-key",
+    })).toEqual({ authMode: "proxy" });
+    expect(resolveClaudeCliLaunchOptions({
+      authMode: "subscription",
+      modelId: "minimax-m3",
+      opencodeGoApiKey: "go-key",
+    })).toEqual({ authMode: "subscription" });
+  });
+
   test("proxy args add bare and strip only the retired telemetry flag", () => {
     expect(buildLocalClaudeArgs(["--print"], { authMode: "proxy" })).toEqual(["--bare", "--print"]);
     expect(buildLocalClaudeArgs(["--bare", "--print", "--no-telemetry"], { authMode: "proxy" })).toEqual([
@@ -78,10 +128,13 @@ describe("Claude CLI local-only launch contract", () => {
     ]);
   });
 
-  test("subscription args preserve caller flags without adding bare", () => {
+  test("subscription and opencode_go args preserve caller flags without adding bare", () => {
     expect(buildLocalClaudeArgs(["--bare", "--print", "--model", "sonnet", "--no-telemetry"], {
       authMode: "subscription",
     })).toEqual(["--print", "--model", "sonnet"]);
+    expect(buildLocalClaudeArgs(["--bare", "--print", "--model", "minimax-m3", "--no-telemetry"], {
+      authMode: "opencode_go",
+    })).toEqual(["--print", "--model", "minimax-m3"]);
   });
 
   test("both auth modes remove persisted max-turns pairs", () => {
