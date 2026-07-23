@@ -104,22 +104,45 @@ export class ClaudeDelegateAvailabilityCache {
 
   constructor(checks: ClaudeDelegateAvailabilityChecks = {}) {
     this.now = checks.now ?? Date.now;
-    this.checkCli = checks.checkCli ?? ((config) =>
-      isClaudeCliAvailable(config.claude_cli.path, config.claude_cli.auth_mode));
+    this.checkCli = checks.checkCli ?? ((config) => {
+      const launch = resolveClaudeCliLaunchOptions({
+        authMode: config.claude_cli.auth_mode,
+        modelId: config.claude_cli.delegate.model,
+        opencodeGoApiKey: config.opencode_go.api_key,
+        opencodeGoBaseUrl: config.opencode_go.base_url,
+      });
+      return isClaudeCliAvailable(config.claude_cli.path, launch);
+    });
     this.checkProxyPort = checks.checkProxyPort ?? proxyPortListening;
   }
 
   async isAvailable(config: JarvisConfig): Promise<boolean> {
     const delegateModel = config.claude_cli.delegate.model.trim();
-    const key = `${config.claude_cli.auth_mode}:${config.claude_cli.path}:${delegateModel}`;
+    const launch = resolveClaudeCliLaunchOptions({
+      authMode: config.claude_cli.auth_mode,
+      modelId: delegateModel,
+      opencodeGoApiKey: config.opencode_go.api_key,
+      opencodeGoBaseUrl: config.opencode_go.base_url,
+    });
+    const hasOpenCodeGoKey = Boolean(config.opencode_go.api_key?.trim());
+    // Include effective auth + key presence so adding/removing a Go key invalidates cache.
+    const key = `${config.claude_cli.auth_mode}:${launch.authMode}:${config.claude_cli.path}:${delegateModel}:goKey=${hasOpenCodeGoKey ? "1" : "0"}`;
     const cached = this.cache.get(key);
     if (cached && this.now() < cached.expiresAt) return cached.available;
+
+    // Don't report the delegate healthy when opencode_go would fail at spawn for a missing key.
+    if (launch.authMode === "opencode_go" && !hasOpenCodeGoKey) {
+      this.cache.set(key, {
+        available: false,
+        expiresAt: this.now() + DELEGATE_AVAILABILITY_CACHE_MS,
+      });
+      return false;
+    }
 
     const cliAvailable = await this.checkCli(config);
     // Anthropic-native OpenCode Go models skip the Python proxy entirely, so
     // availability only needs the stock Claude binary (same as subscription).
-    const needsProxy = config.claude_cli.auth_mode === "proxy"
-      && !(delegateModel && openCodeGoProtocolForModel(delegateModel) === "anthropic");
+    const needsProxy = launch.authMode === "proxy";
     const proxyAvailable = !needsProxy || await this.checkProxyPort(19_878);
     const available = cliAvailable && proxyAvailable;
     this.cache.set(key, {
@@ -181,6 +204,7 @@ export type DelegateIneligibilityReason =
   | "claude_cli_disabled"
   | "delegate_disabled"
   | "subscription_mode"
+  | "missing_opencode_go_key"
   | "profile"
   | "write_not_required"
   | "cooldown"
@@ -198,6 +222,15 @@ export function delegateEligibility(
   // it makes the delegate ineligible and the free native local loop runs instead.
   if (input.config.claude_cli.auth_mode !== "proxy") {
     return { eligible: false, reason: "subscription_mode" };
+  }
+  // Anthropic-native OpenCode Go models under proxy mode resolve to opencode_go
+  // at launch. Refuse early when the key is empty so we never mark the path
+  // eligible and then fail at spawn with a blank ANTHROPIC_API_KEY.
+  const delegateModel = input.config.claude_cli.delegate.model.trim();
+  if (delegateModel && openCodeGoProtocolForModel(delegateModel) === "anthropic") {
+    if (!input.config.opencode_go.api_key?.trim()) {
+      return { eligible: false, reason: "missing_opencode_go_key" };
+    }
   }
   if (input.profile !== "full") return { eligible: false, reason: "profile" };
   if (!input.writeEffectRequired) return { eligible: false, reason: "write_not_required" };

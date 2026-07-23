@@ -7,6 +7,7 @@ import {
   decodeClaudeCliMessage,
   estimateCommandLineLength,
   prepareClaudeCliInvocation,
+  projectOpenCodeGoBaseUrlForClaudeCli,
   resolveClaudeCliLaunchOptions,
 } from "./claude-cli";
 
@@ -71,7 +72,9 @@ describe("Claude CLI local-only launch contract", () => {
     expect(env.CLAUDE_CONFIG_DIR).toBeUndefined();
   });
 
-  test("opencode_go mode points at OpenCode Go with the configured key and strips inherited credentials", () => {
+  test("opencode_go mode points at OpenCode Go host root with the configured key and strips inherited credentials", () => {
+    // Claude CLI appends /v1/messages to ANTHROPIC_BASE_URL; OpenAI-style
+    // …/zen/go/v1 must be projected to …/zen/go so the final path is correct.
     const env = buildLocalClaudeEnv({
       PATH: "/usr/bin",
       HOME: "/home/tester",
@@ -89,12 +92,20 @@ describe("Claude CLI local-only launch contract", () => {
     expect(env.PATH).toBe("/usr/bin");
     expect(env.HOME).toBe("/home/tester");
     expect(env.ANTHROPIC_API_KEY).toBe("go-test-key");
-    expect(env.ANTHROPIC_BASE_URL).toBe("https://opencode.ai/zen/go/v1");
+    expect(env.ANTHROPIC_BASE_URL).toBe("https://opencode.ai/zen/go");
     expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
     expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
     expect(env.CLAUDE_CONFIG_DIR).toBeUndefined();
     expect(env.CLAUDE_CODE_SIMPLE).toBeUndefined();
     expect(env.CLAUDE_CODE_USE_LOCAL_MODEL).toBeUndefined();
+  });
+
+  test("opencode_go mode defaults ANTHROPIC_BASE_URL to the CLI host root when base URL is omitted", () => {
+    const env = buildLocalClaudeEnv({ PATH: "/usr/bin" }, {
+      authMode: "opencode_go",
+      opencodeGoApiKey: "go-test-key",
+    });
+    expect(env.ANTHROPIC_BASE_URL).toBe("https://opencode.ai/zen/go");
   });
 
   test("resolveClaudeCliLaunchOptions routes Anthropic-native models to opencode_go under proxy mode", () => {
@@ -106,7 +117,7 @@ describe("Claude CLI local-only launch contract", () => {
     })).toEqual({
       authMode: "opencode_go",
       opencodeGoApiKey: "go-key",
-      opencodeGoBaseUrl: "https://opencode.ai/zen/go/v1",
+      opencodeGoBaseUrl: "https://opencode.ai/zen/go",
     });
     expect(resolveClaudeCliLaunchOptions({
       authMode: "proxy",
@@ -118,6 +129,23 @@ describe("Claude CLI local-only launch contract", () => {
       modelId: "minimax-m3",
       opencodeGoApiKey: "go-key",
     })).toEqual({ authMode: "subscription" });
+  });
+
+  test("projectOpenCodeGoBaseUrlForClaudeCli strips trailing /v1 and slashes", () => {
+    expect(projectOpenCodeGoBaseUrlForClaudeCli("https://opencode.ai/zen/go/v1")).toBe(
+      "https://opencode.ai/zen/go",
+    );
+    expect(projectOpenCodeGoBaseUrlForClaudeCli("https://opencode.ai/zen/go/v1/")).toBe(
+      "https://opencode.ai/zen/go",
+    );
+    expect(projectOpenCodeGoBaseUrlForClaudeCli("https://opencode.ai/zen/go")).toBe(
+      "https://opencode.ai/zen/go",
+    );
+    expect(projectOpenCodeGoBaseUrlForClaudeCli("")).toBe("https://opencode.ai/zen/go");
+    expect(projectOpenCodeGoBaseUrlForClaudeCli(undefined)).toBe("https://opencode.ai/zen/go");
+    expect(projectOpenCodeGoBaseUrlForClaudeCli("https://custom.example/go/v1")).toBe(
+      "https://custom.example/go",
+    );
   });
 
   test("proxy args add bare and strip only the retired telemetry flag", () => {

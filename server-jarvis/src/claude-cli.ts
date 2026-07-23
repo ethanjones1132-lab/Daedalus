@@ -12,7 +12,13 @@ import type { JarvisConfig } from "./config";
 import { openCodeGoProtocolForModel } from "./orchestration/live-model-catalog";
 
 const LOCAL_PROXY_BASE_URL = "http://127.0.0.1:19878";
-const OPENCODE_GO_DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1";
+/**
+ * Claude CLI treats ANTHROPIC_BASE_URL as a host root and appends `/v1/messages`.
+ * Config/HTTP use the OpenAI-style root `…/zen/go/v1` (+ `/messages` or
+ * `/chat/completions`); the CLI host root must therefore be `…/zen/go` so the
+ * final request becomes `…/zen/go/v1/messages` rather than `…/v1/v1/messages`.
+ */
+const OPENCODE_GO_CLI_DEFAULT_BASE_URL = "https://opencode.ai/zen/go";
 const LOCAL_CLAUDE_CONFIG_DIR =
   process.env.JARVIS_CLAUDE_CONFIG_DIR ||
   join(homedir(), ".openclaw", "jarvis", "hermes", "claude-local-config");
@@ -33,7 +39,11 @@ export interface ClaudeCliLaunchOptions {
   authMode: ClaudeCliAuthMode;
   /** OpenCode Go API key used when authMode is `opencode_go`. */
   opencodeGoApiKey?: string;
-  /** OpenCode Go base URL; defaults to https://opencode.ai/zen/go/v1. */
+  /**
+   * OpenCode Go host root for Claude CLI (ANTHROPIC_BASE_URL).
+   * Accepts the OpenAI-style `…/zen/go/v1` config value; projected to `…/zen/go`.
+   * Defaults to https://opencode.ai/zen/go.
+   */
   opencodeGoBaseUrl?: string;
 }
 
@@ -42,6 +52,17 @@ export interface ResolveClaudeCliLaunchOptionsInput {
   modelId?: string;
   opencodeGoApiKey?: string;
   opencodeGoBaseUrl?: string;
+}
+
+/**
+ * Project an OpenCode Go base URL onto the Claude CLI host root.
+ * Strips trailing slashes and a trailing `/v1` segment so the CLI's own
+ * `/v1/messages` append lands on the correct path.
+ */
+export function projectOpenCodeGoBaseUrlForClaudeCli(baseUrl?: string): string {
+  const trimmed = (baseUrl ?? "").trim().replace(/\/+$/, "");
+  if (!trimmed) return OPENCODE_GO_CLI_DEFAULT_BASE_URL;
+  return trimmed.replace(/\/v1$/i, "") || OPENCODE_GO_CLI_DEFAULT_BASE_URL;
 }
 
 /**
@@ -60,7 +81,7 @@ export function resolveClaudeCliLaunchOptions(
     return {
       authMode: "opencode_go",
       opencodeGoApiKey: input.opencodeGoApiKey ?? "",
-      opencodeGoBaseUrl: input.opencodeGoBaseUrl,
+      opencodeGoBaseUrl: projectOpenCodeGoBaseUrlForClaudeCli(input.opencodeGoBaseUrl),
     };
   }
   return { authMode: "proxy" };
@@ -124,13 +145,13 @@ export function buildLocalClaudeEnv(
 
   if (authMode === "opencode_go") {
     // Point-to-point OpenCode Go: same credential stripping as proxy, then pin
-    // Anthropic-compatible base URL + API key (Claude CLI sends it as x-api-key).
+    // Anthropic-compatible host root + API key (Claude CLI sends it as x-api-key
+    // and appends /v1/messages itself — never pass the OpenAI-style …/v1 root).
     const env = stripCredentialEnv(baseEnv);
-    const baseUrl = (options.opencodeGoBaseUrl || OPENCODE_GO_DEFAULT_BASE_URL).replace(/\/+$/, "");
     return {
       ...env,
       ANTHROPIC_API_KEY: options.opencodeGoApiKey ?? "",
-      ANTHROPIC_BASE_URL: baseUrl,
+      ANTHROPIC_BASE_URL: projectOpenCodeGoBaseUrlForClaudeCli(options.opencodeGoBaseUrl),
     };
   }
 
@@ -310,15 +331,24 @@ export interface ClaudeCliMessage {
 
 // ── Check Availability ──
 
+/**
+ * Probe whether the Claude CLI binary answers `--version`.
+ * Accepts either a bare auth mode or full launch options so the probe env
+ * matches the intended route (proxy vs subscription vs opencode_go).
+ */
 export async function isClaudeCliAvailable(
   path: string,
-  authMode: ClaudeCliAuthMode = "proxy",
+  authModeOrOptions: ClaudeCliAuthMode | ClaudeCliLaunchOptions = "proxy",
 ): Promise<boolean> {
+  const launchOptions: ClaudeCliLaunchOptions =
+    typeof authModeOrOptions === "string"
+      ? { authMode: authModeOrOptions }
+      : authModeOrOptions;
   const resolved = resolveClaudePath(path);
   return new Promise((resolve) => {
     const proc = spawn(resolved, ["--version"], {
       timeout: 5000,
-      env: buildLocalClaudeEnv(process.env, { authMode }),
+      env: buildLocalClaudeEnv(process.env, launchOptions),
     });
     proc.on("close", (code) => resolve(code === 0));
     proc.on("error", () => resolve(false));

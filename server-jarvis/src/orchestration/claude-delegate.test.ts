@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
-import { defaultConfig } from "../config";
+import { defaultConfig, type JarvisConfig } from "../config";
 import {
   buildClaudeDelegateInvocation,
   ClaudeDelegateAvailabilityCache,
@@ -14,6 +14,13 @@ import {
   runClaudeDelegate,
   type DelegateRootSnapshot,
 } from "./claude-delegate";
+
+/** Default delegate model is Anthropic-native (minimax-m3); give tests a Go key. */
+function testConfig(): JarvisConfig {
+  const config = defaultConfig();
+  config.opencode_go.api_key = "go-test-key";
+  return config;
+}
 
 describe("Claude executor delegate", () => {
   test("filesystem snapshots use content hashes instead of mtime/size identity", async () => {
@@ -59,7 +66,9 @@ describe("Claude executor delegate", () => {
   });
 
   test("admits only healthy full-profile write work under the configured policy", () => {
-    const config = defaultConfig();
+    const config = testConfig();
+    // Default delegate model is Anthropic-native (minimax-m3) → needs a Go key.
+    config.opencode_go.api_key = "go-test-key";
     const base = {
       config,
       profile: "full" as const,
@@ -89,7 +98,8 @@ describe("Claude executor delegate", () => {
     // (which bypasses the local proxy and bills the user's Anthropic quota) must
     // make it ineligible — the free native local loop runs instead. Subscription
     // remains a manual, interactive opt-in; it is never auto-selected here.
-    const config = defaultConfig();
+    const config = testConfig();
+    config.opencode_go.api_key = "go-test-key";
     config.claude_cli.auth_mode = "subscription";
     const base = {
       config,
@@ -105,10 +115,37 @@ describe("Claude executor delegate", () => {
     expect(delegateEligibility(base)).toEqual({ eligible: true });
   });
 
+  test("refuses Anthropic-native opencode_go models when the Go API key is missing", () => {
+    const config = testConfig();
+    config.claude_cli.auth_mode = "proxy";
+    config.claude_cli.delegate.model = "minimax-m3";
+    config.opencode_go.api_key = "";
+    const base = {
+      config,
+      profile: "full" as const,
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      healthAvailable: true,
+      allowedRoots: ["C:\\repo"],
+    };
+    expect(delegateEligibility(base)).toEqual({ eligible: false, reason: "missing_opencode_go_key" });
+
+    config.opencode_go.api_key = "   ";
+    expect(delegateEligibility(base)).toEqual({ eligible: false, reason: "missing_opencode_go_key" });
+
+    config.opencode_go.api_key = "go-test-key";
+    expect(delegateEligibility(base)).toEqual({ eligible: true });
+
+    // OpenAI-compatible proxy models do not need the Go key for eligibility.
+    config.claude_cli.delegate.model = "deepseek-v4-pro";
+    config.opencode_go.api_key = "";
+    expect(delegateEligibility(base)).toEqual({ eligible: true });
+  });
+
   test("proxy-mode OpenAI-compatible models route to the local proxy and carry no real credential", () => {
     // Non-Anthropic OpenCode Go models still use the Python proxy. Pin both the
     // local BASE_URL and --bare so the CLI cannot reach real Anthropic.
-    const config = defaultConfig();
+    const config = testConfig();
     config.claude_cli.delegate.model = "deepseek-v4-pro";
     expect(config.claude_cli.auth_mode).toBe("proxy");
     const invocation = buildClaudeDelegateInvocation({
@@ -133,10 +170,11 @@ describe("Claude executor delegate", () => {
   });
 
   test("Anthropic-native delegate models skip the proxy and talk to OpenCode Go directly", () => {
-    const config = defaultConfig();
+    const config = testConfig();
     config.claude_cli.auth_mode = "proxy";
     config.claude_cli.delegate.model = "minimax-m3";
     config.opencode_go.api_key = "go-delegate-key";
+    // Config stores the OpenAI-style root; CLI env must project to host root.
     config.opencode_go.base_url = "https://opencode.ai/zen/go/v1";
     const invocation = buildClaudeDelegateInvocation({
       config,
@@ -153,7 +191,7 @@ describe("Claude executor delegate", () => {
       },
     });
 
-    expect(invocation.env.ANTHROPIC_BASE_URL).toBe("https://opencode.ai/zen/go/v1");
+    expect(invocation.env.ANTHROPIC_BASE_URL).toBe("https://opencode.ai/zen/go");
     expect(invocation.env.ANTHROPIC_API_KEY).toBe("go-delegate-key");
     expect(invocation.env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
     expect(invocation.args).not.toContain("--bare");
@@ -161,7 +199,7 @@ describe("Claude executor delegate", () => {
   });
 
   test("builds only installed stock-CLI flags, auth environment, and P0 root cwd", () => {
-    const config = defaultConfig();
+    const config = testConfig();
     config.claude_cli.auth_mode = "subscription";
     config.claude_cli.delegate.model = "sonnet";
     config.claude_cli.delegate.permission_mode = "bypassPermissions";
@@ -202,7 +240,7 @@ describe("Claude executor delegate", () => {
   });
 
   test("uses Task 3 proxy projection while leaving an empty delegate model to the proxy default", () => {
-    const config = defaultConfig();
+    const config = testConfig();
     config.claude_cli.auth_mode = "proxy";
     config.claude_cli.delegate.model = "";
     const invocation = buildClaudeDelegateInvocation({
@@ -224,7 +262,7 @@ describe("Claude executor delegate", () => {
 
   test("normalizes Jarvis run identifiers to the UUID format required by stock Claude", () => {
     const invocation = buildClaudeDelegateInvocation({
-      config: defaultConfig(),
+      config: testConfig(),
       prompt: "make the change",
       sessionId: "run_07f80253-0f76-4184-8f30-bfdcccecfc2a",
       allowedRoots: ["C:\\primary"],
@@ -237,7 +275,7 @@ describe("Claude executor delegate", () => {
   });
 
   test("default invocation exposes only root-confinable direct tools and strips configured shell auto-allows", () => {
-    const config = defaultConfig();
+    const config = testConfig();
     config.claude_cli.delegate.allowed_tools.push("Bash(powershell:*)");
     const invocation = buildClaudeDelegateInvocation({
       config,
@@ -292,7 +330,7 @@ describe("Claude executor delegate", () => {
         return proxyListening;
       },
     });
-    const config = defaultConfig();
+    const config = testConfig();
     config.claude_cli.auth_mode = "proxy";
     // OpenAI-compatible proxy models still need the local Python proxy.
     config.claude_cli.delegate.model = "deepseek-v4-pro";
@@ -324,16 +362,40 @@ describe("Claude executor delegate", () => {
         return false;
       },
     });
-    const config = defaultConfig();
+    const config = testConfig();
     config.claude_cli.auth_mode = "proxy";
     config.claude_cli.delegate.model = "minimax-m3";
+    config.opencode_go.api_key = "go-test-key";
 
     expect(await availability.isAvailable(config)).toBe(true);
     expect(proxyChecks).toBe(0);
   });
 
+  test("Anthropic-native opencode_go delegates are unavailable without a Go API key", async () => {
+    let cliChecks = 0;
+    const availability = new ClaudeDelegateAvailabilityCache({
+      checkCli: async () => {
+        cliChecks += 1;
+        return true;
+      },
+      checkProxyPort: async () => true,
+    });
+    const config = testConfig();
+    config.claude_cli.auth_mode = "proxy";
+    config.claude_cli.delegate.model = "minimax-m3";
+    config.opencode_go.api_key = "";
+
+    expect(await availability.isAvailable(config)).toBe(false);
+    // Short-circuit before spawning a CLI probe that would only fail later.
+    expect(cliChecks).toBe(0);
+
+    config.opencode_go.api_key = "go-test-key";
+    expect(await availability.isAvailable(config)).toBe(true);
+    expect(cliChecks).toBe(1);
+  });
+
   test("downgrades each claimed write without matching ground-truth change before effect gating", async () => {
-    const config = defaultConfig();
+    const config = testConfig();
     const before: DelegateRootSnapshot = {
       root: "C:\\repo",
       kind: "git",
@@ -388,7 +450,7 @@ describe("Claude executor delegate", () => {
   });
 
   test("accepts verified writes and truncates delegate tool output with the shared context policy", async () => {
-    const config = defaultConfig();
+    const config = testConfig();
     const snapshots: DelegateRootSnapshot[][] = [[{
       root: "C:\\repo",
       kind: "git",
@@ -449,7 +511,7 @@ describe("Claude executor delegate", () => {
   });
 
   test("rejects an out-of-root Bash write as unverifiable policy evidence", async () => {
-    const config = defaultConfig();
+    const config = testConfig();
     config.claude_cli.delegate.allowed_tools.push("Bash(python:*)");
     const snapshot: DelegateRootSnapshot = {
       root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
@@ -488,7 +550,7 @@ describe("Claude executor delegate", () => {
   });
 
   test("rejects a safe stock tool event that was not enabled in delegate config", async () => {
-    const config = defaultConfig();
+    const config = testConfig();
     config.claude_cli.delegate.allowed_tools = ["Read"];
     const snapshot: DelegateRootSnapshot = {
       root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
@@ -527,7 +589,7 @@ describe("Claude executor delegate", () => {
     // Eval 2026-07-21 T1: model emitted write_file; permit gate only checked
     // stock names → delegate_tool_not_permitted. Canonical identity must pass
     // when the corresponding stock tool is allowed.
-    const config = defaultConfig();
+    const config = testConfig();
     // Default allowed_tools includes Write (root-confinable set).
     const snapshots: DelegateRootSnapshot[][] = [[{
       root: "C:\\repo",
@@ -584,7 +646,7 @@ describe("Claude executor delegate", () => {
   });
 
   test("still denies Bash when only Read is allowed (canonical permit is not a free pass)", async () => {
-    const config = defaultConfig();
+    const config = testConfig();
     config.claude_cli.delegate.allowed_tools = ["Read"];
     const snapshot: DelegateRootSnapshot = {
       root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
@@ -621,7 +683,7 @@ describe("Claude executor delegate", () => {
   });
 
   test("terminates then kills a timed-out child and cools down when it produced zero writes", async () => {
-    const config = defaultConfig();
+    const config = testConfig();
     const kills: string[] = [];
     const snapshot: DelegateRootSnapshot = {
       root: "C:\\repo",
@@ -669,7 +731,7 @@ describe("Claude executor delegate", () => {
   }, 1_000);
 
   test("verifies a claimed write after execution timeout using a separate bounded snapshot", async () => {
-    const config = defaultConfig();
+    const config = testConfig();
     const before: DelegateRootSnapshot = {
       root: "C:\\repo",
       kind: "git",
@@ -741,7 +803,7 @@ describe("Claude executor delegate", () => {
   }, 3000);
 
   test("abort remains terminal after bounded verification of an already-claimed write", async () => {
-    const config = defaultConfig();
+    const config = testConfig();
     const controller = new AbortController();
     const before: DelegateRootSnapshot = {
       root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "before",
@@ -810,7 +872,7 @@ describe("Claude executor delegate", () => {
   }, 1_000);
 
   test("unconfirmed cleanup makes a timed-out claimed write unsafe without post-run verification", async () => {
-    const config = defaultConfig();
+    const config = testConfig();
     const snapshot: DelegateRootSnapshot = {
       root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "before",
       files: { "c:\\repo\\claimed.ts": "100:10" },
@@ -872,7 +934,7 @@ describe("Claude executor delegate", () => {
   // assertion above. Same pattern as the 2026-07-20 4pm claude-delegate bump (47f3c78).
 
   test("uses the injected tree killer for TERM then forced KILL so grandchildren cannot leak", async () => {
-    const config = defaultConfig();
+    const config = testConfig();
     const snapshot: DelegateRootSnapshot = {
       root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
     };
@@ -917,7 +979,7 @@ describe("Claude executor delegate", () => {
   });
 
   test("treats a failed Windows forced taskkill as uncertain termination", async () => {
-    const config = defaultConfig();
+    const config = testConfig();
     const snapshot: DelegateRootSnapshot = {
       root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
     };
@@ -973,7 +1035,7 @@ describe("Claude executor delegate", () => {
   }, 1_000);
 
   test("forces KILL and reports uncertainty when TERM fails despite direct child exit", async () => {
-    const config = defaultConfig();
+    const config = testConfig();
     const snapshot: DelegateRootSnapshot = {
       root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
     };
@@ -1021,7 +1083,7 @@ describe("Claude executor delegate", () => {
   }, 1_000);
 
   test("bounds teardown after forced KILL when the child exit promise never settles", async () => {
-    const config = defaultConfig();
+    const config = testConfig();
     const snapshot: DelegateRootSnapshot = {
       root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
     };
@@ -1066,7 +1128,7 @@ describe("Claude executor delegate", () => {
   }, 1_000);
 
   test("wires caller abort to child termination and returns cancelled output", async () => {
-    const config = defaultConfig();
+    const config = testConfig();
     const controller = new AbortController();
     const kills: string[] = [];
     const snapshot: DelegateRootSnapshot = {
@@ -1109,7 +1171,7 @@ describe("Claude executor delegate", () => {
   });
 
   test("abort during the pre-snapshot cancels the whole operation without launching a child", async () => {
-    const config = defaultConfig();
+    const config = testConfig();
     const controller = new AbortController();
     const snapshot: DelegateRootSnapshot = {
       root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
@@ -1149,7 +1211,7 @@ describe("Claude executor delegate", () => {
   });
 
   test("an already-aborted operation starts neither snapshots nor child launch", async () => {
-    const config = defaultConfig();
+    const config = testConfig();
     const controller = new AbortController();
     controller.abort();
     let captures = 0;
@@ -1178,7 +1240,7 @@ describe("Claude executor delegate", () => {
   });
 
   test("deadline covers a non-cancellable delayed pre-snapshot and prevents launch", async () => {
-    const config = defaultConfig();
+    const config = testConfig();
     const snapshot: DelegateRootSnapshot = {
       root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
     };
@@ -1212,7 +1274,7 @@ describe("Claude executor delegate", () => {
   });
 
   test("deadline covers delayed process-factory launch and fences a late child", async () => {
-    const config = defaultConfig();
+    const config = testConfig();
     const snapshot: DelegateRootSnapshot = {
       root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
     };
@@ -1263,7 +1325,7 @@ describe("Claude executor delegate", () => {
   });
 
   test("observes a late factory cleanup rejection and returns a bounded known outcome", async () => {
-    const config = defaultConfig();
+    const config = testConfig();
     const snapshot: DelegateRootSnapshot = {
       root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
     };
@@ -1321,7 +1383,7 @@ describe("Claude executor delegate", () => {
   }, 1_000);
 
   test("deadline covers delayed post-snapshot and downgrades unverifiable writes", async () => {
-    const config = defaultConfig();
+    const config = testConfig();
     const snapshot: DelegateRootSnapshot = {
       root: "C:\\repo",
       kind: "git",
@@ -1373,7 +1435,7 @@ describe("Claude executor delegate", () => {
   }, 250);
 
   test("strikes health on spawn errors and clean no-event exits", async () => {
-    const config = defaultConfig();
+    const config = testConfig();
     const snapshot: DelegateRootSnapshot = {
       root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
     };
