@@ -5,13 +5,35 @@
 // The adapter intentionally stays small: initialize/ping plus tools/list and
 // tools/call are enough for another MCP client to discover and invoke Jarvis
 // tools through the same runtime used by chat, cron, and agent surfaces.
+//
+// The Claude executor delegate reuses this adapter (via a stdio entrypoint and
+// generated --mcp-config) for filesystem/git/task control tools — never shell
+// or Task-spawning, which remain the root-confinement boundary.
 
+import { createInterface } from "readline";
+import { join } from "path";
 import { defaultConfig, type JarvisConfig } from "./config";
-import { makeExecutionContext, type ToolCall, type ToolRuntime } from "./tool-runtime";
+import { registerFilesystemBundle } from "./filesystem-bundle";
+import { registerGitMetadataBundle } from "./git-metadata-bundle";
+import { registerTaskControlBundle } from "./task-bundle";
+import {
+  createToolRuntime,
+  makeExecutionContext,
+  type ExecutionContext,
+  type ToolCall,
+  type ToolRuntime,
+} from "./tool-runtime";
 import type { ToolDefinition } from "./tool-types";
 
 export const MCP_SCHEMA_VERSION = "1.0.0";
 export const MCP_PROTOCOL_VERSION = "2024-11-05";
+
+/** MCP server name exposed to Claude CLI for the executor delegate. */
+export const DELEGATE_MCP_SERVER_NAME = "jarvis";
+
+/** Env vars the stdio MCP server reads for workspace scoping. */
+export const DELEGATE_MCP_WORKSPACE_ENV = "JARVIS_MCP_WORKSPACE";
+export const DELEGATE_MCP_SESSION_GRANTS_ENV = "JARVIS_MCP_SESSION_GRANTS";
 
 export interface McpToolSchema {
   name: string;
@@ -67,6 +89,26 @@ export interface McpAdapter {
   listTools(): McpListToolsResult;
 }
 
+export interface McpServerLaunchConfig {
+  command: string;
+  args: string[];
+  env?: Record<string, string>;
+  type?: "stdio";
+}
+
+export interface DelegateMcpConfigFile {
+  mcpServers: Record<string, McpServerLaunchConfig>;
+}
+
+export interface BuildDelegateMcpConfigInput {
+  workspacePath: string;
+  allowedRoots: string[];
+  /** Bun/node executable that can run TypeScript entrypoints. Defaults to process.execPath. */
+  bunExecutable?: string;
+  /** Absolute path to mcp-stdio-server.ts. Defaults to the sibling of this module. */
+  serverScriptPath?: string;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -91,8 +133,23 @@ function toMcpToolSchema(def: ToolDefinition): McpToolSchema {
   };
 }
 
-export function createMcpAdapter(runtime: ToolRuntime, config: JarvisConfig = defaultConfig()): McpAdapter {
-  const ctx = makeExecutionContext("mcp", config);
+/**
+ * Register the filesystem + git + task-control bundles the Claude delegate MCP
+ * surface exposes. Shell and Task-spawning tools are intentionally omitted —
+ * they remain the root-confinement boundary of the stock CLI --tools allowlist.
+ */
+export function registerDelegateMcpBundles(runtime: ToolRuntime): void {
+  registerFilesystemBundle(runtime);
+  registerGitMetadataBundle(runtime);
+  registerTaskControlBundle(runtime);
+}
+
+export function createMcpAdapter(
+  runtime: ToolRuntime,
+  config: JarvisConfig = defaultConfig(),
+  contextOverrides?: Partial<Omit<ExecutionContext, "surface" | "config">>,
+): McpAdapter {
+  const ctx = makeExecutionContext("mcp", config, contextOverrides);
 
   return {
     listTools(): McpListToolsResult {
@@ -147,4 +204,105 @@ export function createMcpAdapter(runtime: ToolRuntime, config: JarvisConfig = de
       }
     },
   };
+}
+
+/**
+ * Build the ToolRuntime + MCP adapter used by the Claude executor delegate.
+ * Approvals are skipped (the delegate already enforces P0 roots + write
+ * verification); workspace scope is projected from the allowed roots.
+ */
+export function createDelegateMcpAdapter(
+  config: JarvisConfig,
+  options: { workspacePath: string; allowedRoots: string[] },
+): McpAdapter {
+  const runtime = createToolRuntime();
+  registerDelegateMcpBundles(runtime);
+  return createMcpAdapter(runtime, config, {
+    workspace_path: options.workspacePath,
+    session_grants: options.allowedRoots,
+    // Delegate is automated; stock CLI already confines roots and verifies writes.
+    skip_approval_gate: true,
+  });
+}
+
+/** Resolve the default stdio entrypoint next to this module. */
+export function defaultDelegateMcpServerScriptPath(): string {
+  return join(import.meta.dir, "mcp-stdio-server.ts");
+}
+
+/**
+ * Build a Claude-compatible `.mcp.json` / `--mcp-config` payload that launches
+ * the Jarvis stdio MCP server with the delegate tool bundles.
+ */
+export function buildDelegateMcpConfig(input: BuildDelegateMcpConfigInput): DelegateMcpConfigFile {
+  const workspacePath = input.workspacePath.trim() || input.allowedRoots[0] || process.cwd();
+  const allowedRoots = input.allowedRoots.length > 0 ? input.allowedRoots : [workspacePath];
+  return {
+    mcpServers: {
+      [DELEGATE_MCP_SERVER_NAME]: {
+        type: "stdio",
+        command: input.bunExecutable ?? process.execPath,
+        args: [input.serverScriptPath ?? defaultDelegateMcpServerScriptPath()],
+        env: {
+          [DELEGATE_MCP_WORKSPACE_ENV]: workspacePath,
+          [DELEGATE_MCP_SESSION_GRANTS_ENV]: JSON.stringify(allowedRoots),
+        },
+      },
+    },
+  };
+}
+
+/**
+ * True when a stock Claude tool name is an MCP tool from the Jarvis delegate
+ * server (`mcp__jarvis__…`).
+ */
+export function isJarvisDelegateMcpTool(toolName: string): boolean {
+  const normalized = toolName.trim().toLowerCase();
+  return normalized.startsWith(`mcp__${DELEGATE_MCP_SERVER_NAME}__`);
+}
+
+/**
+ * Extract the underlying Jarvis tool name from `mcp__jarvis__tool_name`.
+ * Returns null when the name is not a Jarvis delegate MCP tool.
+ */
+export function jarvisDelegateMcpToolName(toolName: string): string | null {
+  if (!isJarvisDelegateMcpTool(toolName)) return null;
+  const parts = toolName.trim().split("__");
+  if (parts.length < 3) return null;
+  return parts.slice(2).join("__");
+}
+
+/**
+ * NDJSON stdio loop for MCP clients (Claude CLI, mcp-tools.ts, etc.).
+ * Writes only JSON-RPC messages to stdout; log on stderr if needed.
+ */
+export async function runMcpStdioLoop(
+  adapter: McpAdapter,
+  options: {
+    input?: NodeJS.ReadableStream;
+    output?: { write(chunk: string): unknown };
+  } = {},
+): Promise<void> {
+  const input = options.input ?? process.stdin;
+  const output = options.output ?? process.stdout;
+  const rl = createInterface({ input, crlfDelay: Infinity, terminal: false });
+
+  for await (const line of rl) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let req: McpJsonRpcRequest;
+    try {
+      req = JSON.parse(trimmed) as McpJsonRpcRequest;
+    } catch {
+      // Ignore malformed lines; keep the loop alive for the next frame.
+      continue;
+    }
+    if (!req || typeof req !== "object" || req.jsonrpc !== "2.0" || typeof req.method !== "string") {
+      continue;
+    }
+    const response = await adapter.handle(req);
+    if (response !== undefined) {
+      output.write(`${JSON.stringify(response)}\n`);
+    }
+  }
 }

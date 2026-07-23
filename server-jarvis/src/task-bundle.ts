@@ -80,12 +80,20 @@ const TASK_STOP_DEF = def("task_stop",
   "Stop a running background task.",
   { id: { type: "string", description: "Task id" } }, ["id"]);
 
-export function registerTaskBundle(rt: ToolRuntime): void {
-  rt.register(RUN_BG_DEF, (a, c) => toolRunBackgroundCommand(a, c.config));
-  rt.register(AGENT_DEF, (a, c) => toolAgent(a, c.config));
-  rt.register(TASK_CREATE_DEF, (a, c) => toolTaskCreate(a, c.config));
+/**
+ * Safe task control plane only (list/get/output/stop). Used by the Claude
+ * delegate MCP surface so process-spawning tools cannot escape root confinement.
+ */
+export function registerTaskControlBundle(rt: ToolRuntime): void {
   rt.register(TASK_LIST_DEF, (a) => toolTaskList(a));
   rt.register(TASK_GET_DEF, (a) => toolTaskGet(a));
   rt.register(TASK_OUTPUT_DEF, (a) => toolTaskOutput(a));
   rt.register(TASK_STOP_DEF, (a) => toolTaskStop(a));
+}
+
+export function registerTaskBundle(rt: ToolRuntime): void {
+  rt.register(RUN_BG_DEF, (a, c) => toolRunBackgroundCommand(a, c.config));
+  rt.register(AGENT_DEF, (a, c) => toolAgent(a, c.config));
+  rt.register(TASK_CREATE_DEF, (a, c) => toolTaskCreate(a, c.config));
+  registerTaskControlBundle(rt);
 }

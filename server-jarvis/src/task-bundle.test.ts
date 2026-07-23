@@ -1,6 +1,6 @@
 import { describe, test, expect } from "bun:test";
 import { createToolRuntime, makeExecutionContext } from "./tool-runtime";
-import { registerTaskBundle } from "./task-bundle";
+import { registerTaskBundle, registerTaskControlBundle } from "./task-bundle";
 import { defaultConfig } from "./config";
 
 function makeRuntime() {
@@ -22,6 +22,14 @@ describe("task bundle", () => {
     const names = makeRuntime().listTools().map((t) => t.function.name).sort();
     expect(names).toEqual([
       "agent", "run_background_command", "task_create",
+      "task_get", "task_list", "task_output", "task_stop",
+    ]);
+  });
+
+  test("task-control registration is the non-spawning subset for delegate MCP", () => {
+    const rt = createToolRuntime();
+    registerTaskControlBundle(rt);
+    expect(rt.listTools().map((t) => t.function.name).sort()).toEqual([
       "task_get", "task_list", "task_output", "task_stop",
     ]);
   });

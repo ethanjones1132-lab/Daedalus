@@ -3,17 +3,24 @@ import { mkdtemp, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { defaultConfig, type JarvisConfig } from "../config";
+import { readFileSync } from "fs";
 import {
   buildClaudeDelegateInvocation,
   ClaudeDelegateAvailabilityCache,
   createPlatformDelegateProcessTreeKiller,
   DelegateHealth,
   delegateEligibility,
+  isPermittedDelegateTool,
   mapClaudeDelegateToolName,
   nodeDelegateSnapshotFactory,
   runClaudeDelegate,
   type DelegateRootSnapshot,
 } from "./claude-delegate";
+import {
+  DELEGATE_MCP_SERVER_NAME,
+  DELEGATE_MCP_SESSION_GRANTS_ENV,
+  DELEGATE_MCP_WORKSPACE_ENV,
+} from "../mcp-adapter";
 
 /** Default delegate model is Anthropic-native (minimax-m3); give tests a Go key. */
 function testConfig(): JarvisConfig {
@@ -218,25 +225,36 @@ describe("Claude executor delegate", () => {
       },
     });
 
-    expect(invocation.cwd).toBe("C:\\primary");
-    expect(invocation.timeoutMs).toBe(420_000);
-    expect(invocation.env.ANTHROPIC_API_KEY).toBe("subscription-secret");
-    expect(invocation.args).toEqual([
-      "--print",
-      "--output-format", "stream-json",
-      "--verbose",
-      "--include-partial-messages",
-      "--permission-mode", "bypassPermissions",
-      "--session-id", "123e4567-e89b-42d3-a456-426614174000",
-      "--no-session-persistence",
-      "--model", "sonnet",
-      "--add-dir", "D:\\extra",
-      "--tools", "Read",
-      "--allowedTools", "Read",
-      "--",
-      "make the change",
-    ]);
-    expect(invocation.args).not.toContain("--bare");
+    try {
+      expect(invocation.cwd).toBe("C:\\primary");
+      expect(invocation.timeoutMs).toBe(420_000);
+      expect(invocation.env.ANTHROPIC_API_KEY).toBe("subscription-secret");
+      const mcpConfigIdx = invocation.args.indexOf("--mcp-config");
+      expect(invocation.args).toContain("--strict-mcp-config");
+      expect(mcpConfigIdx).toBeGreaterThan(-1);
+      const mcpConfigPath = invocation.args[mcpConfigIdx + 1];
+      expect(invocation.args).toEqual([
+        "--print",
+        "--output-format", "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        "--permission-mode", "bypassPermissions",
+        "--session-id", "123e4567-e89b-42d3-a456-426614174000",
+        "--no-session-persistence",
+        "--model", "sonnet",
+        "--add-dir", "D:\\extra",
+        "--strict-mcp-config",
+        "--mcp-config", mcpConfigPath,
+        "--tools", "Read",
+        "--allowedTools", "Read",
+        "mcp__jarvis",
+        "--",
+        "make the change",
+      ]);
+      expect(invocation.args).not.toContain("--bare");
+    } finally {
+      invocation.cleanup();
+    }
   });
 
   test("uses Task 3 proxy projection while leaving an empty delegate model to the proxy default", () => {
@@ -286,12 +304,83 @@ describe("Claude executor delegate", () => {
       executable: "claude",
       baseEnv: {},
     });
-    const serialized = invocation.args.join(" ");
+    try {
+      const serialized = invocation.args.join(" ");
 
-    expect(serialized).toContain("--tools Read,Edit,Write,MultiEdit,Grep,Glob,WebSearch,WebFetch,TodoWrite");
-    expect(invocation.args[invocation.args.indexOf("--allowedTools") + 2]).toBe("--");
-    expect(serialized).not.toContain("Bash(");
-    expect(config.claude_cli.delegate.allowed_tools).toContain("Bash(powershell:*)");
+      expect(serialized).toContain("--tools Read,Edit,Write,MultiEdit,Grep,Glob,WebSearch,WebFetch,TodoWrite");
+      // --allowedTools is root-confinable floor + jarvis MCP server, then `--`.
+      const allowedIdx = invocation.args.indexOf("--allowedTools");
+      expect(invocation.args[allowedIdx + 1]).toBe(
+        "Read,Edit,Write,MultiEdit,Grep,Glob,WebSearch,WebFetch,TodoWrite",
+      );
+      expect(invocation.args[allowedIdx + 2]).toBe("mcp__jarvis");
+      expect(invocation.args[allowedIdx + 3]).toBe("--");
+      expect(serialized).not.toContain("Bash(");
+      expect(serialized).not.toMatch(/(?:^|[\s,])Bash(?:[\s,]|$)/);
+      expect(serialized).not.toMatch(/(?:^|[\s,])Task(?:[\s,]|$)/);
+      expect(config.claude_cli.delegate.allowed_tools).toContain("Bash(powershell:*)");
+    } finally {
+      invocation.cleanup();
+    }
+  });
+
+  test("delegate invocation wires --mcp-config for Jarvis filesystem/git/task-control bundles", () => {
+    const invocation = buildClaudeDelegateInvocation({
+      config: testConfig(),
+      prompt: "make the change",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\primary", "D:\\extra"],
+      stageRemainingMs: 12_000,
+      executable: "claude",
+      baseEnv: {},
+    });
+    try {
+      expect(invocation.args).toContain("--strict-mcp-config");
+      const mcpIdx = invocation.args.indexOf("--mcp-config");
+      expect(mcpIdx).toBeGreaterThan(-1);
+      const mcpPath = invocation.args[mcpIdx + 1];
+      expect(typeof mcpPath).toBe("string");
+      const parsed = JSON.parse(readFileSync(mcpPath!, "utf-8")) as {
+        mcpServers: Record<string, {
+          command: string;
+          args: string[];
+          env?: Record<string, string>;
+          type?: string;
+        }>;
+      };
+      const server = parsed.mcpServers[DELEGATE_MCP_SERVER_NAME];
+      expect(server).toBeDefined();
+      expect(server!.type).toBe("stdio");
+      expect(server!.command.length).toBeGreaterThan(0);
+      expect(server!.args.some((arg) => arg.replace(/\\/g, "/").endsWith("mcp-stdio-server.ts"))).toBe(true);
+      expect(server!.env?.[DELEGATE_MCP_WORKSPACE_ENV]).toBe("C:\\primary");
+      expect(JSON.parse(server!.env?.[DELEGATE_MCP_SESSION_GRANTS_ENV] ?? "[]")).toEqual([
+        "C:\\primary",
+        "D:\\extra",
+      ]);
+      // Root confinement floor: no Bash/Task in stock tool availability.
+      const toolsArg = invocation.args[invocation.args.indexOf("--tools") + 1] ?? "";
+      expect(toolsArg).not.toContain("Bash");
+      expect(toolsArg).not.toContain("Task");
+    } finally {
+      invocation.cleanup();
+    }
+  });
+
+  test("maps Jarvis MCP tool names to canonical identities and permits non-spawn tools", () => {
+    expect(mapClaudeDelegateToolName("mcp__jarvis__write_file")).toBe("write_file");
+    expect(mapClaudeDelegateToolName("mcp__jarvis__git_metadata")).toBe("git_metadata");
+    expect(mapClaudeDelegateToolName("mcp__jarvis__task_list")).toBe("task_list");
+    expect(mapClaudeDelegateToolName("mcp__other__read_file")).toBe("delegate_mcp_other_read_file");
+
+    const stock = new Set(["Read", "Write"]);
+    const canonical = new Set(["read_file", "write_file"]);
+    expect(isPermittedDelegateTool("mcp__jarvis__git_metadata", "git_metadata", stock, canonical)).toBe(true);
+    expect(isPermittedDelegateTool("mcp__jarvis__task_list", "task_list", stock, canonical)).toBe(true);
+    expect(isPermittedDelegateTool("mcp__jarvis__run_background_command", "run_background_command", stock, canonical)).toBe(false);
+    expect(isPermittedDelegateTool("mcp__jarvis__agent", "agent", stock, canonical)).toBe(false);
+    expect(isPermittedDelegateTool("Bash", "bash", stock, canonical)).toBe(false);
+    expect(isPermittedDelegateTool("Task", "task", stock, canonical)).toBe(false);
   });
 
   test("cools down for ten minutes after delegate integrity strikes", () => {

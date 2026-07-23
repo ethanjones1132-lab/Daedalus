@@ -36,9 +36,16 @@ function verifiedDelegateOutput(): ExecutorStageOutput {
   };
 }
 
+/** Default delegate model is Anthropic-native (minimax-m3); eligibility requires a Go key. */
+function delegateTestConfig() {
+  const config = defaultConfig();
+  config.opencode_go.api_key = "go-test-key";
+  return config;
+}
+
 describe("executor delegate pipeline integration", () => {
   test("delegate-first returns a verified delegated write without entering the native executor", async () => {
-    const config = defaultConfig();
+    const config = delegateTestConfig();
     config.jarvis_path = process.cwd();
     config.claude_cli.enabled = true;
     config.claude_cli.delegate.enabled = true;
@@ -107,7 +114,7 @@ describe("executor delegate pipeline integration", () => {
   });
 
   test("verified delegate writes are authoritative even when the delegate reports a later timeout", async () => {
-    const config = defaultConfig();
+    const config = delegateTestConfig();
     config.jarvis_path = process.cwd();
     config.claude_cli.delegate.policy = "delegate_first";
     const ctx = makeExecutionContext("agent", config, {
@@ -155,7 +162,7 @@ describe("executor delegate pipeline integration", () => {
   });
 
   test("real delegate core verifies a write after timeout and pipeline never enters native fallback", async () => {
-    const config = defaultConfig();
+    const config = delegateTestConfig();
     const root = process.cwd();
     const claimedPath = `${root}\\claimed.ts`.toLowerCase();
     config.jarvis_path = root;
@@ -254,7 +261,7 @@ describe("executor delegate pipeline integration", () => {
   }, 250);
 
   test("unconfirmed delegate cleanup after a claimed write is terminal and never launches native", async () => {
-    const config = defaultConfig();
+    const config = delegateTestConfig();
     const root = process.cwd();
     const claimedPath = `${root}\\claimed.ts`.toLowerCase();
     config.jarvis_path = root;
@@ -332,7 +339,7 @@ describe("executor delegate pipeline integration", () => {
   }, 300);
 
   test("late-factory cleanup uncertainty is terminal across the full replan wrapper", async () => {
-    const config = defaultConfig();
+    const config = delegateTestConfig();
     const root = process.cwd();
     config.jarvis_path = root;
     config.claude_cli.delegate.policy = "delegate_first";
@@ -429,7 +436,7 @@ describe("executor delegate pipeline integration", () => {
   }, 300);
 
   test("aborted late-factory cleanup uncertainty is failed rather than routine cancellation", async () => {
-    const config = defaultConfig();
+    const config = delegateTestConfig();
     const root = process.cwd();
     config.jarvis_path = root;
     config.claude_cli.delegate.policy = "delegate_first";
@@ -520,7 +527,7 @@ describe("executor delegate pipeline integration", () => {
   }, 300);
 
   test("escalation invokes the delegate only after a native executor pass produces no write", async () => {
-    const config = defaultConfig();
+    const config = delegateTestConfig();
     config.jarvis_path = process.cwd();
     config.claude_cli.enabled = true;
     config.claude_cli.delegate.enabled = true;
@@ -571,7 +578,7 @@ describe("executor delegate pipeline integration", () => {
   });
 
   test("delegate-first zero-write preserves delegate evidence and falls through to native exactly once", async () => {
-    const config = defaultConfig();
+    const config = delegateTestConfig();
     config.jarvis_path = process.cwd();
     config.claude_cli.delegate.policy = "delegate_first";
     const ctx = makeExecutionContext("agent", config, {
@@ -646,7 +653,7 @@ describe("executor delegate pipeline integration", () => {
   });
 
   test("executor abort registry cancels the delegate without launching native fallback", async () => {
-    const config = defaultConfig();
+    const config = delegateTestConfig();
     config.jarvis_path = process.cwd();
     config.claude_cli.delegate.policy = "delegate_first";
     const ctx = makeExecutionContext("agent", config, {
@@ -719,7 +726,7 @@ describe("executor delegate pipeline integration", () => {
   });
 
   test("request-wide abort cancels the delegate without conductor wiring or native fallback", async () => {
-    const config = defaultConfig();
+    const config = delegateTestConfig();
     config.jarvis_path = process.cwd();
     config.claude_cli.delegate.policy = "delegate_first";
     const ctx = makeExecutionContext("agent", config, {
@@ -777,7 +784,7 @@ describe("executor delegate pipeline integration", () => {
 
   for (const verifiedWrite of [false, true]) {
     test(`request cancellation propagates through the full replan wrapper ${verifiedWrite ? "after a verified write" : "with zero writes"}`, async () => {
-      const config = defaultConfig();
+      const config = delegateTestConfig();
       config.jarvis_path = process.cwd();
       config.claude_cli.delegate.policy = "delegate_first";
       const ctx = makeExecutionContext("agent", config, {
@@ -855,7 +862,7 @@ describe("executor delegate pipeline integration", () => {
   }
 
   test("a conductor replan never delegates again after the first attempt falls back to native", async () => {
-    const config = defaultConfig();
+    const config = delegateTestConfig();
     config.jarvis_path = process.cwd();
     config.claude_cli.delegate.policy = "delegate_first";
     const ctx = makeExecutionContext("agent", config, {
@@ -938,7 +945,7 @@ describe("executor delegate pipeline integration", () => {
   });
 
   test("escalation still delegates after a native executor exception", async () => {
-    const config = defaultConfig();
+    const config = delegateTestConfig();
     config.jarvis_path = process.cwd();
     config.claude_cli.delegate.policy = "escalation";
     const ctx = makeExecutionContext("agent", config, {
@@ -985,7 +992,7 @@ describe("executor delegate pipeline integration", () => {
   });
 
   test("delegate integration rejection records a downgrade and falls back to native once", async () => {
-    const config = defaultConfig();
+    const config = delegateTestConfig();
     config.jarvis_path = process.cwd();
     config.claude_cli.delegate.policy = "delegate_first";
     const ctx = makeExecutionContext("agent", config, {
@@ -1034,7 +1041,7 @@ describe("executor delegate pipeline integration", () => {
   });
 
   test("delegate streams through standard executor SSE hooks and persists stage/model attribution", async () => {
-    const config = defaultConfig();
+    const config = delegateTestConfig();
     config.jarvis_path = process.cwd();
     config.claude_cli.delegate.policy = "delegate_first";
     config.claude_cli.delegate.model = "sonnet";
@@ -1111,7 +1118,7 @@ describe("executor delegate pipeline integration", () => {
   });
 
   test("unverified escalation is downgraded and never bounces back to native", async () => {
-    const config = defaultConfig();
+    const config = delegateTestConfig();
     config.jarvis_path = process.cwd();
     config.claude_cli.delegate.policy = "escalation";
     const ctx = makeExecutionContext("agent", config, {

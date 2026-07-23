@@ -9,10 +9,17 @@ import {
   resolveClaudePath,
   type ClaudeStreamDecodeState,
 } from "../claude-cli";
+import {
+  buildDelegateMcpConfig,
+  isJarvisDelegateMcpTool,
+  jarvisDelegateMcpToolName,
+} from "../mcp-adapter";
 import { openCodeGoProtocolForModel } from "./live-model-catalog";
 import { createHash } from "crypto";
 import { execFile, spawn } from "child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
 import { readFile, readdir } from "fs/promises";
+import { tmpdir } from "os";
 import { createInterface } from "readline";
 import { isAbsolute, join, relative, resolve } from "path";
 import { createConnection } from "net";
@@ -47,7 +54,21 @@ const DELEGATE_TOOL_NAMES: Record<string, string> = {
   apply_patch: "apply_patch",
   list_directory: "list_directory",
   git_metadata: "git_metadata",
+  // Task-control MCP tools (no spawn) exposed via the Jarvis MCP adapter.
+  task_list: "task_list",
+  task_get: "task_get",
+  task_output: "task_output",
+  task_stop: "task_stop",
 };
+
+/** Tools that must never be admitted even if they arrive via MCP. */
+const DELEGATE_MCP_BLOCKED_TOOLS = new Set([
+  "bash",
+  "task",
+  "run_background_command",
+  "agent",
+  "task_create",
+]);
 
 const ROOT_CONFINABLE_CLAUDE_TOOLS = [
   "Read", "Edit", "Write", "MultiEdit", "Grep", "Glob",
@@ -186,9 +207,34 @@ export class DelegateHealth {
 }
 
 export function mapClaudeDelegateToolName(name: string): string {
+  const mcpTool = jarvisDelegateMcpToolName(name);
+  if (mcpTool) {
+    const mcpNormalized = mcpTool.trim().toLowerCase();
+    const mapped = DELEGATE_TOOL_NAMES[mcpNormalized]
+      ?? mcpNormalized.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+    return mapped || "unknown";
+  }
   const normalized = name.trim().toLowerCase();
   return DELEGATE_TOOL_NAMES[normalized]
     ?? `delegate_${normalized.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "unknown"}`;
+}
+
+/**
+ * Whether a stock-Claude or MCP tool event is permitted for the delegate.
+ * Stock tools use the root-confinable floor; Jarvis MCP tools are allowed when
+ * they are not shell/Task-spawning escapes.
+ */
+export function isPermittedDelegateTool(
+  stockToolName: string,
+  canonicalName: string,
+  permittedStockTools: Set<string>,
+  permittedCanonical: Set<string>,
+): boolean {
+  if (permittedStockTools.has(stockToolName) || permittedCanonical.has(canonicalName)) {
+    return true;
+  }
+  if (!isJarvisDelegateMcpTool(stockToolName)) return false;
+  return !DELEGATE_MCP_BLOCKED_TOOLS.has(canonicalName);
 }
 
 export interface DelegateEligibilityInput {
@@ -270,6 +316,32 @@ function stockClaudeSessionId(sessionId: string): string {
     : crypto.randomUUID();
 }
 
+/**
+ * Materialize a temporary --mcp-config file for the Claude delegate, exposing
+ * Jarvis filesystem/git/task-control tools via mcp-adapter (stdio).
+ */
+function materializeDelegateMcpConfig(
+  allowedRoots: string[],
+): { path: string; cleanup: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), "jarvis-delegate-mcp-"));
+  const path = join(dir, "mcp.json");
+  const config = buildDelegateMcpConfig({
+    workspacePath: allowedRoots[0],
+    allowedRoots,
+  });
+  writeFileSync(path, JSON.stringify(config), "utf-8");
+  return {
+    path,
+    cleanup: () => {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // Best-effort; temp dir is under OS tmp.
+      }
+    },
+  };
+}
+
 export function buildClaudeDelegateInvocation(
   input: BuildClaudeDelegateInvocationInput,
 ): ClaudeDelegateInvocation {
@@ -277,6 +349,7 @@ export function buildClaudeDelegateInvocation(
     throw new Error("Claude delegate requires a P0-authorized primary root");
   }
   const delegate = input.config.claude_cli.delegate;
+  const mcpConfig = materializeDelegateMcpConfig(input.allowedRoots);
   const args = [
     "--print",
     "--output-format", "stream-json",
@@ -288,14 +361,24 @@ export function buildClaudeDelegateInvocation(
   ];
   if (delegate.model.trim()) args.push("--model", delegate.model.trim());
   if (input.allowedRoots.length > 1) args.push("--add-dir", ...input.allowedRoots.slice(1));
+  // Isolate MCP to the generated Jarvis bundle (filesystem/git/task-control).
+  args.push("--strict-mcp-config", "--mcp-config", mcpConfig.path);
   const rootConfinableTools = rootConfinableDelegateTools(delegate.allowed_tools);
   // --allowedTools only controls auto-approval. --tools is the actual
   // availability boundary that prevents Bash/Task from escaping P0 roots.
+  // MCP tools are separate from the built-in --tools set; keep the stock
+  // allowlist as the floor and let --mcp-config supply richer Jarvis tools.
   args.push("--tools", rootConfinableTools.join(","));
   if (rootConfinableTools.length > 0) {
     // Claude 2.1.88 parses --allowedTools as variadic. Terminate its values so
     // prepareClaudeCliInvocation's positional prompt is not swallowed as a tool.
-    args.push("--allowedTools", rootConfinableTools.join(","), "--");
+    // Allow all tools from the generated jarvis MCP server for auto-approval.
+    args.push(
+      "--allowedTools",
+      rootConfinableTools.join(","),
+      `mcp__jarvis`,
+      "--",
+    );
   }
 
   const executable = input.executable ?? resolveClaudePath(input.config.claude_cli.path);
@@ -311,12 +394,16 @@ export function buildClaudeDelegateInvocation(
     input.prompt,
   );
   const configuredTimeout = delegate.timeout_ms > 0 ? delegate.timeout_ms : 420_000;
+  const preparedCleanup = prepared.cleanup;
 
   return {
     executable,
     args: prepared.args,
     promptOnStdin: prepared.promptOnStdin,
-    cleanup: prepared.cleanup,
+    cleanup: () => {
+      preparedCleanup();
+      mcpConfig.cleanup();
+    },
     cwd: input.allowedRoots[0],
     env: buildLocalClaudeEnv(input.baseEnv ?? process.env, launchOptions),
     timeoutMs: Math.max(0, Math.min(input.stageRemainingMs, configuredTimeout, 420_000)),
@@ -1051,8 +1138,12 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
             else if (event.type === "tool_use") {
               const stockToolName = event.tool_name ?? "unknown";
               const canonicalName = mapClaudeDelegateToolName(stockToolName);
-              const permitted = permittedStockTools.has(stockToolName)
-                || permittedCanonical.has(canonicalName);
+              const permitted = isPermittedDelegateTool(
+                stockToolName,
+                canonicalName,
+                permittedStockTools,
+                permittedCanonical,
+              );
               const record: ToolCallRecord = {
                 name: canonicalName,
                 arguments: event.tool_input ?? {},
