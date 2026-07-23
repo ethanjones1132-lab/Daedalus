@@ -6,6 +6,7 @@ import type { SessionMemoryConfig } from "../config";
 import { SESSIONS_DIR } from "../config";
 import type { ToolResult } from "../tool-types";
 import {
+  normalizeTaskRunOnRead,
   resolveTaskRunTurn,
   type TaskRunContract,
   type TaskRunDepth,
@@ -597,7 +598,12 @@ export class SessionMemory {
       raw.fileSnapshots ??= {};
       raw.discoveredFacts ??= {};
       raw.failureHistory ??= [];
-      raw.taskRun ??= undefined;
+      // Legacy task-run rows (no schemaVersion / v1) are marked
+      // reconstruction_required — remainingWork was never populated, so there
+      // is no structural migration, only a version check on read.
+      raw.taskRun = raw.taskRun
+        ? normalizeTaskRunOnRead(raw.taskRun) ?? undefined
+        : undefined;
       raw.lastActiveAt = raw.lastActiveAt ?? Date.now();
       return raw;
     } catch {

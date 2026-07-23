@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import {
@@ -360,6 +360,55 @@ describe("session-memory", () => {
       expect(cached).toBe("3 matches");
       expect(reader.getTaskRun("disk-sess")?.depth).toBe("deep");
       expect(reader.getTaskRun("disk-sess")?.objective).toContain("comprehensively audit");
+      // Fresh v2 contracts round-trip without reconstruction.
+      expect(reader.getTaskRun("disk-sess")?.schemaVersion).toBe(2);
+      expect(reader.getTaskRun("disk-sess")?.reconstruction).toBe("none");
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  // Task 6: legacy task-run rows (no schemaVersion) need reconstruction on read —
+  // remainingWork was never populated, so there is no structural migration.
+  test("loads a legacy task-run blob as reconstruction_required", () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), "jarvis-memory-legacy-"));
+    try {
+      const cfg = makeConfig({ persist: true });
+      const memoryDir = join(tempRoot, "memory");
+      mkdirSync(memoryDir, { recursive: true });
+      writeFileSync(
+        join(memoryDir, "legacy-sess.json"),
+        JSON.stringify({
+          sessionId: "legacy-sess",
+          lastActiveAt: Date.now(),
+          toolResults: {},
+          fileSnapshots: {},
+          discoveredFacts: {},
+          failureHistory: [],
+          taskRun: {
+            taskRunId: "task_legacy",
+            sessionId: "legacy-sess",
+            objective: "old flat objective",
+            requirement: "full_execution",
+            depth: "standard",
+            estimatedComplexity: "medium",
+            turnCount: 2,
+            status: "active",
+            evidenceCount: 0,
+            remainingWork: [],
+            createdAt: "2026-07-01T00:00:00.000Z",
+            updatedAt: "2026-07-01T00:00:00.000Z",
+          },
+        }, null, 2),
+        "utf-8",
+      );
+
+      const reader = new SessionMemory(() => cfg, tempRoot);
+      const task = reader.getTaskRun("legacy-sess");
+      expect(task?.schemaVersion).toBe(1);
+      expect(task?.reconstruction).toBe("reconstruction_required");
+      expect(task?.plan).toBeUndefined();
+      expect(task?.objective).toBe("old flat objective");
     } finally {
       rmSync(tempRoot, { recursive: true, force: true });
     }

@@ -1,10 +1,33 @@
 import { describe, expect, test } from "bun:test";
 import {
+  activatePlanItem,
+  advancePlanQueue,
   assessTaskRunAcceptance,
+  countItemizedEvidence,
+  createAcceptanceCheck,
+  createTaskPlan,
+  createTaskPlanItem,
   createTaskRun,
+  deriveTaskStatusFromPlan,
+  getActivePlanItem,
+  getPlanItem,
+  hasEvidencePointer,
+  incrementPlanItemRepairCycle,
+  isTaskRunV2,
+  listBlockedPlanItems,
+  listPendingPlanItems,
+  listVerifiedPlanItems,
+  makeEvidencePointer,
+  markPlanItemBlocked,
+  markPlanItemVerified,
+  normalizeTaskRunOnRead,
+  remainingWorkFromPlan,
   resolveDeepReadIntent,
   resolveTaskRunTurn,
+  setPlanItemEvidence,
+  setTaskPlan,
   terminalSubtypeForRunOutcome,
+  unblockPlanItem,
   type TaskRunContract,
   type TurnRequirement,
 } from "./task-run";
@@ -96,6 +119,10 @@ describe("task-run > createTaskRun", () => {
     expect(run.remainingWork).toEqual([]);
     expect(run.depth).toBe("standard");
     expect(run.estimatedComplexity).toBe("medium");
+    expect(run.schemaVersion).toBe(2);
+    expect(run.reconstruction).toBe("none");
+    expect(run.plan).toEqual({ items: [], activeItemId: null });
+    expect(isTaskRunV2(run)).toBe(true);
   });
 
   test("trims leading/trailing whitespace from objective", () => {
@@ -625,5 +652,438 @@ describe("task-run > assessTaskRunAcceptance", () => {
       evidenceCount: 5,
     });
     expect(r.status).toBe("paused");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TaskPlan ledger (TaskRunContract v2)
+// ---------------------------------------------------------------------------
+
+function makePlanRun(planItems: Parameters<typeof createTaskRun>[0]["planItems"]): TaskRunContract {
+  return createTaskRun({
+    ...BASE_INPUT,
+    planItems,
+  });
+}
+
+describe("task-run > TaskPlan constructors", () => {
+  test("createTaskPlanItem defaults: pending, repairCycleCount 0, empty deps/checks", () => {
+    const item = createTaskPlanItem({ title: " Write the adapter " });
+    expect(item.title).toBe("Write the adapter");
+    expect(item.status).toBe("pending");
+    expect(item.repairCycleCount).toBe(0);
+    expect(item.dependsOn).toEqual([]);
+    expect(item.acceptanceChecks).toEqual([]);
+    expect(item.id).toMatch(/^pi_/);
+    expect(hasEvidencePointer(item)).toBe(false);
+  });
+
+  test("createTaskPlanItem rejects empty title", () => {
+    expect(() => createTaskPlanItem({ title: "   " })).toThrow(/title/);
+  });
+
+  test("createAcceptanceCheck + string shorthand on plan item", () => {
+    const check = createAcceptanceCheck("diff matches fixture", { kind: "diff_match", id: "ac_1" });
+    expect(check).toEqual({
+      id: "ac_1",
+      description: "diff matches fixture",
+      kind: "diff_match",
+    });
+    const item = createTaskPlanItem({
+      id: "a",
+      title: "A",
+      acceptanceChecks: ["tests pass", check],
+    });
+    expect(item.acceptanceChecks).toHaveLength(2);
+    expect(item.acceptanceChecks[0].description).toBe("tests pass");
+    expect(item.acceptanceChecks[1].id).toBe("ac_1");
+  });
+
+  test("makeEvidencePointer requires non-empty ref and records timestamp", () => {
+    expect(() => makeEvidencePointer("  ")).toThrow(/ref/);
+    const pointer = makeEvidencePointer("turn_abc", "diff clean");
+    expect(pointer.ref).toBe("turn_abc");
+    expect(pointer.summary).toBe("diff clean");
+    expect(pointer.recordedAt).toBeTruthy();
+  });
+
+  test("createTaskRun seeds plan and activates first ready item", () => {
+    const run = makePlanRun([
+      { id: "i1", title: "Scaffold module", acceptanceChecks: ["files exist"] },
+      { id: "i2", title: "Wire tests", dependsOn: ["i1"] },
+    ]);
+    expect(run.schemaVersion).toBe(2);
+    expect(run.plan?.items).toHaveLength(2);
+    expect(run.plan?.activeItemId).toBe("i1");
+    expect(getActivePlanItem(run)?.status).toBe("active");
+    expect(getPlanItem(run, "i2")?.status).toBe("pending");
+    expect(run.remainingWork).toEqual(["Scaffold module", "Wire tests"]);
+  });
+
+  test("createTaskPlan builds ordered items without activating", () => {
+    const plan = createTaskPlan([{ id: "x", title: "Only item" }]);
+    expect(plan.activeItemId).toBeNull();
+    expect(plan.items[0].status).toBe("pending");
+  });
+});
+
+describe("task-run > TaskPlan status transitions", () => {
+  test("markPlanItemVerified stores grading mode + evidence pointer and advances queue", () => {
+    let run = makePlanRun([
+      { id: "i1", title: "Step one" },
+      { id: "i2", title: "Step two", dependsOn: ["i1"] },
+    ]);
+    run = markPlanItemVerified(run, "i1", {
+      gradingMode: "conductor_direct_diff",
+      evidence: makeEvidencePointer("ev_1", "diff matched"),
+    });
+    const verified = getPlanItem(run, "i1")!;
+    expect(verified.status).toBe("verified");
+    expect(verified.gradingMode).toBe("conductor_direct_diff");
+    expect(verified.evidence?.ref).toBe("ev_1");
+    expect(verified.evidence?.summary).toBe("diff matched");
+    expect(verified.verifiedAt).toBeTruthy();
+    expect(verified.blockedReason).toBeUndefined();
+    // Queue advances to next dep-satisfied item.
+    expect(run.plan?.activeItemId).toBe("i2");
+    expect(getPlanItem(run, "i2")?.status).toBe("active");
+    expect(run.remainingWork).toEqual(["Step two"]);
+    expect(listVerifiedPlanItems(run)).toHaveLength(1);
+    expect(countItemizedEvidence(run.plan!)).toBe(1);
+  });
+
+  test("markPlanItemVerified with advance=false leaves queue on the verified item", () => {
+    let run = makePlanRun([
+      { id: "i1", title: "A" },
+      { id: "i2", title: "B" },
+    ]);
+    run = markPlanItemVerified(run, "i1", {
+      gradingMode: "reviewer_mediated",
+      evidence: { ref: "ev_r1" },
+      advance: false,
+    });
+    expect(getPlanItem(run, "i1")?.status).toBe("verified");
+    expect(getPlanItem(run, "i1")?.gradingMode).toBe("reviewer_mediated");
+    // No active item until advancePlanQueue is called.
+    expect(run.plan?.activeItemId).toBeNull();
+    expect(getPlanItem(run, "i2")?.status).toBe("pending");
+    run = advancePlanQueue(run);
+    expect(run.plan?.activeItemId).toBe("i2");
+  });
+
+  test("markPlanItemBlocked sets reason and derives overall paused status", () => {
+    let run = makePlanRun([
+      { id: "i1", title: "Hard step" },
+      { id: "i2", title: "Later", dependsOn: ["i1"] },
+    ]);
+    run = markPlanItemBlocked(run, "i1", "  needs human input  ");
+    expect(getPlanItem(run, "i1")?.status).toBe("blocked");
+    expect(getPlanItem(run, "i1")?.blockedReason).toBe("needs human input");
+    expect(listBlockedPlanItems(run)).toHaveLength(1);
+    expect(run.status).toBe("paused");
+    expect(deriveTaskStatusFromPlan(run.plan!)).toBe("paused");
+  });
+
+  test("unblockPlanItem returns item to pending without auto-activating", () => {
+    let run = makePlanRun([{ id: "i1", title: "Step" }]);
+    run = markPlanItemBlocked(run, "i1", "stuck");
+    run = unblockPlanItem(run, "i1");
+    expect(getPlanItem(run, "i1")?.status).toBe("pending");
+    expect(getPlanItem(run, "i1")?.blockedReason).toBeUndefined();
+    expect(run.plan?.activeItemId).toBeNull();
+    run = advancePlanQueue(run);
+    expect(run.plan?.activeItemId).toBe("i1");
+  });
+
+  test("advancePlanQueue respects dependsOn ordering", () => {
+    let run = makePlanRun([
+      { id: "a", title: "A" },
+      { id: "b", title: "B", dependsOn: ["a"] },
+      { id: "c", title: "C", dependsOn: ["b"] },
+    ]);
+    expect(run.plan?.activeItemId).toBe("a");
+    // B cannot activate while A is still active/unverified.
+    expect(() => activatePlanItem(run, "b")).toThrow(/dependencies/);
+
+    run = markPlanItemVerified(run, "a", {
+      gradingMode: "conductor_direct_diff",
+      evidence: { ref: "ev_a" },
+    });
+    expect(run.plan?.activeItemId).toBe("b");
+
+    run = markPlanItemVerified(run, "b", {
+      gradingMode: "reviewer_mediated",
+      evidence: { ref: "ev_b" },
+    });
+    expect(run.plan?.activeItemId).toBe("c");
+
+    run = markPlanItemVerified(run, "c", {
+      gradingMode: "conductor_direct_diff",
+      evidence: { ref: "ev_c" },
+    });
+    expect(run.plan?.activeItemId).toBeNull();
+    expect(run.status).toBe("completed");
+    expect(run.remainingWork).toEqual([]);
+    expect(listPendingPlanItems(run)).toEqual([]);
+    expect(listVerifiedPlanItems(run)).toHaveLength(3);
+  });
+
+  test("advancePlanQueue is a no-op when an item is already active", () => {
+    const run = makePlanRun([
+      { id: "a", title: "A" },
+      { id: "b", title: "B" },
+    ]);
+    const again = advancePlanQueue(run);
+    expect(again.plan?.activeItemId).toBe("a");
+    expect(getPlanItem(again, "b")?.status).toBe("pending");
+  });
+
+  test("activatePlanItem demotes previous active back to pending", () => {
+    let run = makePlanRun([
+      { id: "a", title: "A" },
+      { id: "b", title: "B" },
+    ]);
+    expect(run.plan?.activeItemId).toBe("a");
+    run = activatePlanItem(run, "b");
+    expect(run.plan?.activeItemId).toBe("b");
+    expect(getPlanItem(run, "a")?.status).toBe("pending");
+    expect(getPlanItem(run, "b")?.status).toBe("active");
+  });
+
+  test("activatePlanItem rejects verified and blocked items", () => {
+    let run = makePlanRun([
+      { id: "a", title: "A" },
+      { id: "b", title: "B" },
+    ]);
+    run = markPlanItemVerified(run, "a", {
+      gradingMode: "conductor_direct_diff",
+      evidence: { ref: "ev" },
+      advance: false,
+    });
+    expect(() => activatePlanItem(run, "a")).toThrow(/verified/);
+    run = markPlanItemBlocked(run, "b", "nope");
+    expect(() => activatePlanItem(run, "b")).toThrow(/blocked/);
+  });
+
+  test("incrementPlanItemRepairCycle counts Reviewer→Rewriter→Executor passes", () => {
+    let run = makePlanRun([{ id: "a", title: "A" }]);
+    run = incrementPlanItemRepairCycle(run, "a");
+    run = incrementPlanItemRepairCycle(run, "a", 2);
+    expect(getPlanItem(run, "a")?.repairCycleCount).toBe(3);
+    expect(() => incrementPlanItemRepairCycle(run, "a", 0)).toThrow(/positive/);
+  });
+
+  test("setPlanItemEvidence attaches pointer without changing status", () => {
+    let run = makePlanRun([{ id: "a", title: "A" }]);
+    expect(getActivePlanItem(run)?.status).toBe("active");
+    run = setPlanItemEvidence(run, "a", makeEvidencePointer("partial_ev", "wip"));
+    const item = getPlanItem(run, "a")!;
+    expect(item.status).toBe("active");
+    expect(item.evidence?.ref).toBe("partial_ev");
+    expect(hasEvidencePointer(item)).toBe(true);
+  });
+
+  test("setTaskPlan reconstructs a plan on a reconstruction_required contract", () => {
+    const legacy = normalizeTaskRunOnRead({
+      taskRunId: "task_old",
+      sessionId: "sess",
+      objective: "old objective",
+      requirement: "full_execution",
+      depth: "standard",
+      estimatedComplexity: "medium",
+      turnCount: 3,
+      status: "paused",
+      evidenceCount: 0,
+      remainingWork: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    })!;
+    expect(legacy.reconstruction).toBe("reconstruction_required");
+    expect(isTaskRunV2(legacy)).toBe(false);
+
+    const rebuilt = setTaskPlan(legacy, [
+      { id: "n1", title: "Rebuild step 1" },
+      { id: "n2", title: "Rebuild step 2", dependsOn: ["n1"] },
+    ]);
+    expect(rebuilt.schemaVersion).toBe(2);
+    expect(rebuilt.reconstruction).toBe("none");
+    expect(isTaskRunV2(rebuilt)).toBe(true);
+    expect(rebuilt.plan?.activeItemId).toBe("n1");
+    expect(rebuilt.status).toBe("active");
+  });
+
+  test("ledger mutations throw when reconstruction is required", () => {
+    const legacy = normalizeTaskRunOnRead({
+      taskRunId: "task_old",
+      sessionId: "sess",
+      objective: "obj",
+      requirement: "full_execution",
+      status: "active",
+      turnCount: 1,
+      evidenceCount: 0,
+      remainingWork: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    })!;
+    expect(() => advancePlanQueue(legacy)).toThrow(/reconstruction_required|schemaVersion 2/);
+  });
+
+  test("deriveTaskStatusFromPlan: empty→active, all verified→completed, blocked→paused", () => {
+    expect(deriveTaskStatusFromPlan(createTaskPlan([]))).toBe("active");
+    const pending = createTaskPlan([{ id: "a", title: "A" }]);
+    expect(deriveTaskStatusFromPlan(pending)).toBe("active");
+    let run = makePlanRun([{ id: "a", title: "A" }]);
+    run = markPlanItemVerified(run, "a", {
+      gradingMode: "conductor_direct_diff",
+      evidence: { ref: "ev" },
+    });
+    expect(deriveTaskStatusFromPlan(run.plan!)).toBe("completed");
+    expect(remainingWorkFromPlan(run.plan!)).toEqual([]);
+  });
+
+  test("failed/cancelled overall status is not clobbered by plan derivation", () => {
+    let run = makePlanRun([{ id: "a", title: "A" }]);
+    run = { ...run, status: "failed" };
+    run = markPlanItemBlocked(run, "a", "x");
+    expect(run.status).toBe("failed");
+  });
+
+  test("unknown item id throws on mark helpers", () => {
+    const run = makePlanRun([{ id: "a", title: "A" }]);
+    expect(() => markPlanItemVerified(run, "missing", {
+      gradingMode: "conductor_direct_diff",
+      evidence: { ref: "ev" },
+    })).toThrow(/not found/);
+    expect(() => markPlanItemBlocked(run, "missing", "x")).toThrow(/not found/);
+  });
+});
+
+describe("task-run > normalizeTaskRunOnRead (legacy → reconstruction_required)", () => {
+  test("missing schemaVersion is treated as legacy v1", () => {
+    const legacy = {
+      taskRunId: "task_legacy",
+      sessionId: "sess_legacy",
+      objective: "Refactor auth",
+      requirement: "full_execution",
+      depth: "standard",
+      estimatedComplexity: "high",
+      turnCount: 2,
+      status: "active",
+      evidenceCount: 0,
+      remainingWork: [],
+      createdAt: "2026-07-01T00:00:00.000Z",
+      updatedAt: "2026-07-01T00:00:00.000Z",
+    };
+    const normalized = normalizeTaskRunOnRead(legacy)!;
+    expect(normalized.schemaVersion).toBe(1);
+    expect(normalized.reconstruction).toBe("reconstruction_required");
+    expect(normalized.plan).toBeUndefined();
+    expect(isTaskRunV2(normalized)).toBe(false);
+  });
+
+  test("schemaVersion 1 is reconstruction_required even if a plan blob is present", () => {
+    const normalized = normalizeTaskRunOnRead({
+      schemaVersion: 1,
+      taskRunId: "task_v1",
+      sessionId: "sess",
+      objective: "obj",
+      requirement: "workspace_read",
+      depth: "deep",
+      estimatedComplexity: "low",
+      turnCount: 1,
+      status: "paused",
+      evidenceCount: 2,
+      remainingWork: ["ghost"],
+      plan: { items: [{ id: "x", title: "should be ignored" }], activeItemId: "x" },
+      createdAt: "2026-07-01T00:00:00.000Z",
+      updatedAt: "2026-07-01T00:00:00.000Z",
+    })!;
+    expect(normalized.reconstruction).toBe("reconstruction_required");
+    expect(normalized.plan).toBeUndefined();
+    expect(normalized.remainingWork).toEqual(["ghost"]);
+  });
+
+  test("schemaVersion 2 preserves plan items, evidence, repair cycles, grading mode", () => {
+    const normalized = normalizeTaskRunOnRead({
+      schemaVersion: 2,
+      reconstruction: "none",
+      taskRunId: "task_v2",
+      sessionId: "sess",
+      objective: "obj",
+      requirement: "full_execution",
+      depth: "standard",
+      estimatedComplexity: "medium",
+      turnCount: 4,
+      status: "active",
+      evidenceCount: 3,
+      remainingWork: [],
+      plan: {
+        activeItemId: "i2",
+        items: [
+          {
+            id: "i1",
+            title: "Done",
+            dependsOn: [],
+            acceptanceChecks: [{ id: "ac1", description: "ok", kind: "diff_match" }],
+            status: "verified",
+            gradingMode: "conductor_direct_diff",
+            repairCycleCount: 0,
+            evidence: { ref: "ev1", summary: "clean" },
+            verifiedAt: "2026-07-20T00:00:00.000Z",
+          },
+          {
+            id: "i2",
+            title: "In progress",
+            dependsOn: ["i1"],
+            acceptanceChecks: [],
+            status: "active",
+            repairCycleCount: 2,
+          },
+        ],
+      },
+      createdAt: "2026-07-01T00:00:00.000Z",
+      updatedAt: "2026-07-20T00:00:00.000Z",
+    })!;
+    expect(normalized.schemaVersion).toBe(2);
+    expect(normalized.reconstruction).toBe("none");
+    expect(isTaskRunV2(normalized)).toBe(true);
+    expect(normalized.plan?.activeItemId).toBe("i2");
+    expect(getPlanItem(normalized, "i1")?.gradingMode).toBe("conductor_direct_diff");
+    expect(getPlanItem(normalized, "i1")?.evidence?.ref).toBe("ev1");
+    expect(getPlanItem(normalized, "i2")?.repairCycleCount).toBe(2);
+    expect(normalized.remainingWork).toEqual(["In progress"]);
+  });
+
+  test("invalid / incomplete raw returns undefined", () => {
+    expect(normalizeTaskRunOnRead(null)).toBeUndefined();
+    expect(normalizeTaskRunOnRead({})).toBeUndefined();
+    expect(normalizeTaskRunOnRead({ taskRunId: "x" })).toBeUndefined();
+    expect(normalizeTaskRunOnRead({ taskRunId: "x", sessionId: "s" })).toBeUndefined();
+  });
+
+  test("fresh createTaskRun round-trips through normalize without reconstruction", () => {
+    const run = makePlanRun([
+      { id: "a", title: "A", acceptanceChecks: ["pass"] },
+    ]);
+    const again = normalizeTaskRunOnRead(JSON.parse(JSON.stringify(run)))!;
+    expect(again.schemaVersion).toBe(2);
+    expect(again.reconstruction).toBe("none");
+    expect(again.plan?.items[0].title).toBe("A");
+    expect(again.plan?.activeItemId).toBe("a");
+  });
+});
+
+describe("task-run > resolveTaskRunTurn preserves v2 plan on continuation", () => {
+  test("continuation keeps plan ledger and increments turnCount", () => {
+    const prev = makePlanRun([
+      { id: "a", title: "A" },
+      { id: "b", title: "B", dependsOn: ["a"] },
+    ]);
+    const result = resolveTaskRunTurn(prev, "continue", "full_execution");
+    expect(result.isContinuation).toBe(true);
+    expect(result.contract.schemaVersion).toBe(2);
+    expect(result.contract.plan?.items).toHaveLength(2);
+    expect(result.contract.plan?.activeItemId).toBe("a");
+    expect(result.contract.turnCount).toBe(prev.turnCount + 1);
   });
 });
