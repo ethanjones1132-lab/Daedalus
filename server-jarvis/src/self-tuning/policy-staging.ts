@@ -27,6 +27,9 @@ import {
   type PolicySnapshot,
 } from "./learned-pool-state";
 
+/** Re-export so consumers can import staged-policy types from one module. */
+export type { PolicySnapshot } from "./learned-pool-state";
+
 // ── Thresholds (from plan) ──────────────────────────────────────────────────
 
 export const POLICY_STAGING_THRESHOLDS = {
