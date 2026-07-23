@@ -3,8 +3,12 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
+  applyPolicySnapshotToPool,
   getLearnedPoolState,
+  modelRoutingScoreDelta,
   resetLearnedPoolStateForTests,
+  runWithPolicyOverlay,
+  snapshotStagedPolicyFields,
 } from "./learned-pool-state";
 import {
   POLICY_STAGING_THRESHOLDS,
@@ -23,6 +27,7 @@ import {
   shouldApplyCanary,
   type PolicyPatch,
 } from "./policy-staging";
+import type { OrchestratorAgent } from "../orchestration/agent-pool";
 
 const routingPatch: PolicyPatch = {
   domain: "routing",
@@ -341,5 +346,135 @@ describe("recovery + budget domains", () => {
     }
     expect(getLearnedPoolState().recoveryPolicy.get("prefer_fallback_on_timeout")).toBe(true);
     expect(getLearnedPoolState().recoveryPolicy.get("max_recovery_attempts")).toBe(2);
+  });
+});
+
+describe("merge apply + live shadow progress + canary overlay", () => {
+  beforeEach(() => {
+    resetPolicyStagingForTests();
+    resetLearnedPoolStateForTests();
+  });
+
+  test("applyPolicySnapshotToPool merges keys and preserves concurrent learning", () => {
+    const state = getLearnedPoolState();
+    state.modelRoutingScoreDeltas.set("openrouter:concurrent-learn", 0.07);
+    state.modelFirstTokenTimeouts.set("openrouter:concurrent-learn", 12_000);
+
+    applyPolicySnapshotToPool({
+      modelRoutingScoreDeltas: { "opencode_go:deepseek-v4-flash": 0.12 },
+      stageModelRoutingScoreDeltas: {},
+      fallbackBoosts: {},
+      modelFirstTokenTimeouts: { "opencode_go:deepseek-v4-flash": 40_000 },
+      recovery: {},
+    });
+
+    expect(state.modelRoutingScoreDeltas.get("opencode_go:deepseek-v4-flash")).toBe(0.12);
+    expect(state.modelRoutingScoreDeltas.get("openrouter:concurrent-learn")).toBe(0.07);
+    expect(state.modelFirstTokenTimeouts.get("openrouter:concurrent-learn")).toBe(12_000);
+    expect(state.modelFirstTokenTimeouts.get("opencode_go:deepseek-v4-flash")).toBe(40_000);
+  });
+
+  test("promote merges canary keys without wiping concurrent inference-feedback keys", () => {
+    // Concurrent operational feedback present before promote.
+    getLearnedPoolState().modelRoutingScoreDeltas.set("openrouter:ops-feedback", -0.05);
+
+    advanceToCanary(1.0);
+    for (let i = 0; i < POLICY_STAGING_THRESHOLDS.minCanaryRunsBeforePromotion; i++) {
+      recordCanaryOutcome("canary", true);
+      recordCanaryOutcome("production", true);
+    }
+
+    expect(
+      getLearnedPoolState().modelRoutingScoreDeltas.get("opencode_go:deepseek-v4-flash"),
+    ).toBe(0.12);
+    expect(
+      getLearnedPoolState().modelRoutingScoreDeltas.get("openrouter:ops-feedback"),
+    ).toBe(-0.05);
+  });
+
+  test("rollback drops canary-only keys but keeps concurrent learning", () => {
+    getLearnedPoolState().modelRoutingScoreDeltas.set("openrouter:ops-feedback", 0.03);
+
+    advanceToCanary(1.0);
+    for (let i = 0; i < POLICY_STAGING_THRESHOLDS.minCanaryRunsBeforePromotion; i++) {
+      recordCanaryOutcome("canary", true);
+      recordCanaryOutcome("production", true);
+    }
+    expect(
+      getLearnedPoolState().modelRoutingScoreDeltas.get("opencode_go:deepseek-v4-flash"),
+    ).toBe(0.12);
+
+    const rolled = rollbackPolicy("operator_requested");
+    expect(rolled.action).toBe("rolled_back");
+    // Canary-only key removed via previous=active on merge.
+    expect(
+      getLearnedPoolState().modelRoutingScoreDeltas.get("opencode_go:deepseek-v4-flash"),
+    ).toBeUndefined();
+    // Concurrent operational key preserved.
+    expect(
+      getLearnedPoolState().modelRoutingScoreDeltas.get("openrouter:ops-feedback"),
+    ).toBe(0.03);
+  });
+
+  test("live shadow outcomes auto-complete shadow without offline replay job", () => {
+    advanceToShadow();
+    expect(getPolicyVersionStore().candidate?.stage).toBe("shadow");
+
+    for (let i = 0; i < POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow - 1; i++) {
+      const r = recordEligibleOutcome("success");
+      expect(r.action).toBe("eligible_recorded");
+      expect(r.reason).toContain("shadow_live_");
+    }
+    const entered = recordEligibleOutcome("success");
+    expect(entered.action).toBe("entered_canary");
+    expect(entered.version?.stage).toBe("canary");
+    expect(getPolicyVersionStore().canary?.id).toBe(entered.version?.id);
+    // Still held back from production maps until promote.
+    expect(getLearnedPoolState().modelRoutingScoreDeltas.size).toBe(0);
+  });
+
+  test("live shadow rejects catastrophic success rate without offline job", () => {
+    advanceToShadow();
+    let last = recordEligibleOutcome("failed");
+    for (let i = 1; i < POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow; i++) {
+      last = recordEligibleOutcome("failed");
+    }
+    expect(last.action).toBe("rejected");
+    expect(last.reason).toBe("shadow_failed_quality_gate");
+    expect(getPolicyVersionStore().candidate).toBeNull();
+    expect(getPolicyVersionStore().canary).toBeNull();
+  });
+
+  test("runWithPolicyOverlay surfaces canary snapshot for routing without mutating pool", () => {
+    advanceToCanary();
+    const canarySnap = activeSnapshotForArm("canary");
+    const agent: OrchestratorAgent = {
+      id: "a",
+      provider: "opencode_go",
+      model_id: "deepseek-v4-flash",
+      capabilities: { code: 0.7, reasoning: 0.7, speed: 0.7, cost: 0.7, json_reliability: 0.7 },
+      default_for: [],
+      enabled: true,
+    };
+
+    expect(modelRoutingScoreDelta(agent)).toBe(0);
+    expect(getLearnedPoolState().modelRoutingScoreDeltas.size).toBe(0);
+
+    const scored = runWithPolicyOverlay(canarySnap, () => modelRoutingScoreDelta(agent));
+    expect(scored).toBe(0.12);
+    // Global maps still production (empty).
+    expect(getLearnedPoolState().modelRoutingScoreDeltas.size).toBe(0);
+    expect(modelRoutingScoreDelta(agent)).toBe(0);
+  });
+
+  test("snapshotStagedPolicyFields round-trips merge apply", () => {
+    const state = getLearnedPoolState();
+    state.fallbackBoosts.set("agent:executor:refactor", 0.1);
+    state.recoveryPolicy.set("max_recovery_attempts", 3);
+    const snap = snapshotStagedPolicyFields();
+    resetLearnedPoolStateForTests();
+    applyPolicySnapshotToPool(snap);
+    expect(getLearnedPoolState().fallbackBoosts.get("agent:executor:refactor")).toBe(0.1);
+    expect(getLearnedPoolState().recoveryPolicy.get("max_recovery_attempts")).toBe(3);
   });
 });

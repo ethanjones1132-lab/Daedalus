@@ -2,7 +2,7 @@ import { describe, expect, test, beforeEach } from "bun:test";
 import { ConductorLearningLoop } from "./conductor-learning";
 import { SelfTuningStore } from "./store";
 import { resetLearnedPoolStateForTests } from "./learned-pool-state";
-import { resetPolicyStagingForTests } from "./policy-staging";
+import { getPolicyVersionStore, resetPolicyStagingForTests } from "./policy-staging";
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
 import { hashInstruction } from "../orchestration/worker-prompt";
 
@@ -332,5 +332,59 @@ describe("Conductor learning (Phase 4)", () => {
     const entered = loop.noteEligiblePolicyOutcome("success");
     expect(entered.action).toBe("entered_shadow");
     expect(getLearnedPoolState().modelFirstTokenTimeouts.size).toBe(0);
+  });
+
+  test("live path helpers: eligible → live shadow → canary → noteCanary with overlay", async () => {
+    const store = new SelfTuningStore(TEST_DB);
+    const loop = new ConductorLearningLoop(store, {
+      enabled: true,
+      min_samples_for_heuristics: 3,
+      capability_adjustment_step: 0.05,
+      trajectory_export: false,
+      instruction_ab_epsilon: 0,
+      max_trajectory_snapshots: 100,
+    });
+
+    const staged = loop.proposeStagedPolicy(
+      {
+        domain: "routing",
+        modelRoutingScoreDeltas: { "opencode_go:deepseek-v4-flash": 0.11 },
+      },
+      "wire-path canary",
+    );
+    expect(staged.action).toBe("proposed");
+
+    for (let i = 0; i < 20; i++) {
+      loop.noteEligiblePolicyOutcome("success");
+    }
+    expect(getPolicyVersionStore().candidate?.stage).toBe("shadow");
+
+    // Live shadow progress (no completeShadowReplay offline job).
+    for (let i = 0; i < 19; i++) {
+      const r = loop.noteEligiblePolicyOutcome("success");
+      expect(r.action).toBe("eligible_recorded");
+    }
+    const canaryEnter = loop.noteEligiblePolicyOutcome("success");
+    expect(canaryEnter.action).toBe("entered_canary");
+    expect(getPolicyVersionStore().canary?.stage).toBe("canary");
+
+    // Coin-flip can return true while canary active (force via rng).
+    expect(loop.shouldRouteToCanaryPolicy(() => 0.0)).toBe(true);
+    expect(loop.shouldRouteToCanaryPolicy(() => 0.99)).toBe(false);
+
+    const { modelRoutingScoreDelta, getLearnedPoolState } = await import("./learned-pool-state");
+    const routedAgent: OrchestratorAgent = {
+      ...sampleAgent,
+      provider: "opencode_go",
+      model_id: "deepseek-v4-flash",
+    };
+    const overlaid = loop.runTurnWithPolicyArm("canary", () => modelRoutingScoreDelta(routedAgent));
+    expect(overlaid).toBe(0.11);
+    expect(getLearnedPoolState().modelRoutingScoreDeltas.size).toBe(0);
+
+    // Production arm outcomes during canary do not apply maps until promote.
+    const noted = loop.noteCanaryPolicyOutcome("production", true);
+    expect(noted.action).toBe("canary_outcome_recorded");
+    expect(getLearnedPoolState().modelRoutingScoreDeltas.size).toBe(0);
   });
 });

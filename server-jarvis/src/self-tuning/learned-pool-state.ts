@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
 
 /** In-memory learned adjustments applied across orchestrator turns. */
@@ -44,6 +45,13 @@ const globalState: LearnedPoolState = {
   recoveryPolicy: new Map(),
 };
 
+/**
+ * Request-scoped policy overlay (canary arm). Score/timeout readers prefer
+ * overlay keys when present so a canary turn can use a staged snapshot without
+ * permanently mutating the global production maps.
+ */
+const policyOverlayAls = new AsyncLocalStorage<PolicySnapshot>();
+
 export function getLearnedPoolState(): LearnedPoolState {
   return globalState;
 }
@@ -77,31 +85,122 @@ export function snapshotStagedPolicyFields(state: LearnedPoolState = globalState
   };
 }
 
+function mergeNumberMap(
+  target: Map<string, number>,
+  next: Record<string, number> | undefined,
+  previous?: Record<string, number>,
+): void {
+  // Drop keys that were exclusive to the previous snapshot (rollback of
+  // canary-only keys) without wiping concurrent learning outside either snap.
+  if (previous) {
+    for (const key of Object.keys(previous)) {
+      if (!(next && Object.prototype.hasOwnProperty.call(next, key))) {
+        target.delete(key);
+      }
+    }
+  }
+  for (const [key, value] of Object.entries(next ?? {})) {
+    target.set(key, value);
+  }
+}
+
+function mergeRecoveryMap(
+  target: Map<string, number | string | boolean>,
+  next: Record<string, number | string | boolean> | undefined,
+  previous?: Record<string, number | string | boolean>,
+): void {
+  if (previous) {
+    for (const key of Object.keys(previous)) {
+      if (!(next && Object.prototype.hasOwnProperty.call(next, key))) {
+        target.delete(key);
+      }
+    }
+  }
+  for (const [key, value] of Object.entries(next ?? {})) {
+    target.set(key, value);
+  }
+}
+
 /**
- * Replace staged-policy fields from a snapshot. Capability deltas and
- * modelCapabilityDeltas are left untouched (immediate low-risk path).
+ * Merge staged-policy fields from a snapshot into the live pool.
+ *
+ * Keys present in `snapshot` are written. Keys absent from the snapshot are
+ * left alone so concurrent inference-feedback / heuristic learning is not
+ * wiped on promote. When `previous` is supplied (promote/rollback), keys that
+ * existed only on the outgoing snapshot are removed so canary-only keys do not
+ * linger after rollback.
+ *
+ * Capability deltas and modelCapabilityDeltas are never touched.
  */
 export function applyPolicySnapshotToPool(
   snapshot: PolicySnapshot,
   state: LearnedPoolState = globalState,
+  options: { previous?: PolicySnapshot } = {},
 ): void {
-  state.modelRoutingScoreDeltas = new Map(Object.entries(snapshot.modelRoutingScoreDeltas ?? {}));
-  state.stageModelRoutingScoreDeltas = new Map(
-    Object.entries(snapshot.stageModelRoutingScoreDeltas ?? {}),
+  const prev = options.previous;
+  mergeNumberMap(
+    state.modelRoutingScoreDeltas,
+    snapshot.modelRoutingScoreDeltas,
+    prev?.modelRoutingScoreDeltas,
   );
-  state.fallbackBoosts = new Map(Object.entries(snapshot.fallbackBoosts ?? {}));
-  state.modelFirstTokenTimeouts = new Map(
-    Object.entries(snapshot.modelFirstTokenTimeouts ?? {}),
+  mergeNumberMap(
+    state.stageModelRoutingScoreDeltas,
+    snapshot.stageModelRoutingScoreDeltas,
+    prev?.stageModelRoutingScoreDeltas,
   );
-  state.recoveryPolicy = new Map(Object.entries(snapshot.recovery ?? {}));
+  mergeNumberMap(state.fallbackBoosts, snapshot.fallbackBoosts, prev?.fallbackBoosts);
+  mergeNumberMap(
+    state.modelFirstTokenTimeouts,
+    snapshot.modelFirstTokenTimeouts,
+    prev?.modelFirstTokenTimeouts,
+  );
+  mergeRecoveryMap(state.recoveryPolicy, snapshot.recovery, prev?.recovery);
+}
+
+/**
+ * Run `fn` with a request-scoped policy overlay. Overlay keys win for score
+ * and timeout reads; global maps are not mutated. Nested calls restore the
+ * prior overlay on exit.
+ */
+export function runWithPolicyOverlay<T>(snapshot: PolicySnapshot | null | undefined, fn: () => T): T {
+  if (!snapshot) return fn();
+  return policyOverlayAls.run(snapshot, fn);
+}
+
+function overlayNumber(
+  field: keyof Pick<
+    PolicySnapshot,
+    | "modelRoutingScoreDeltas"
+    | "stageModelRoutingScoreDeltas"
+    | "fallbackBoosts"
+    | "modelFirstTokenTimeouts"
+  >,
+  key: string,
+): number | undefined {
+  const overlay = policyOverlayAls.getStore();
+  if (!overlay) return undefined;
+  const map = overlay[field];
+  if (!map || !Object.prototype.hasOwnProperty.call(map, key)) return undefined;
+  return map[key];
 }
 
 export function fallbackBoostKey(agentId: string, stage: string, taskType: string): string {
   return `${agentId}:${stage}:${taskType}`;
 }
 
+/** Fallback boost with request-scoped canary overlay support. */
+export function fallbackBoostFor(agentId: string, stage: string, taskType: string): number {
+  const key = fallbackBoostKey(agentId, stage, taskType);
+  const overlay = overlayNumber("fallbackBoosts", key);
+  if (overlay !== undefined) return overlay;
+  return globalState.fallbackBoosts.get(key) ?? 0;
+}
+
 export function modelRoutingScoreDelta(agent: OrchestratorAgent): number {
-  return globalState.modelRoutingScoreDeltas.get(modelFeedbackKey(agent.provider, agent.model_id)) ?? 0;
+  const key = modelFeedbackKey(agent.provider, agent.model_id);
+  const overlay = overlayNumber("modelRoutingScoreDeltas", key);
+  if (overlay !== undefined) return overlay;
+  return globalState.modelRoutingScoreDeltas.get(key) ?? 0;
 }
 
 export function stageModelFeedbackKey(provider: string, modelId: string, stage: string): string {
@@ -109,12 +208,27 @@ export function stageModelFeedbackKey(provider: string, modelId: string, stage: 
 }
 
 export function stageRoutingScoreDelta(agent: OrchestratorAgent, stage: string): number {
-  return globalState.stageModelRoutingScoreDeltas.get(
-    stageModelFeedbackKey(agent.provider, agent.model_id, stage),
-  ) ?? 0;
+  const key = stageModelFeedbackKey(agent.provider, agent.model_id, stage);
+  const overlay = overlayNumber("stageModelRoutingScoreDeltas", key);
+  if (overlay !== undefined) return overlay;
+  return globalState.stageModelRoutingScoreDeltas.get(key) ?? 0;
 }
 
 export function empiricalFirstTokenTimeoutFor(modelId: string, provider?: string): number | undefined {
+  const overlay = policyOverlayAls.getStore();
+  if (overlay?.modelFirstTokenTimeouts) {
+    if (provider) {
+      const key = modelFeedbackKey(provider, modelId);
+      if (Object.prototype.hasOwnProperty.call(overlay.modelFirstTokenTimeouts, key)) {
+        return overlay.modelFirstTokenTimeouts[key];
+      }
+    } else {
+      const matches = Object.entries(overlay.modelFirstTokenTimeouts)
+        .filter(([key]) => key.endsWith(`:${modelId}`))
+        .map(([, value]) => value);
+      if (matches.length > 0) return Math.max(...matches);
+    }
+  }
   if (provider) return globalState.modelFirstTokenTimeouts.get(modelFeedbackKey(provider, modelId));
   const matches = [...globalState.modelFirstTokenTimeouts.entries()]
     .filter(([key]) => key.endsWith(`:${modelId}`))

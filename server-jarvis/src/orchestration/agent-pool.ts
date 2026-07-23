@@ -2,8 +2,7 @@ import type { Complexity, StageName, TaskType } from "./coordinator";
 import {
   applyLearnedCapabilities,
   empiricalFirstTokenTimeoutFor,
-  fallbackBoostKey,
-  getLearnedPoolState,
+  fallbackBoostFor,
   modelRoutingScoreDelta,
   stageRoutingScoreDelta,
 } from "../self-tuning/learned-pool-state";
@@ -418,7 +417,6 @@ export class AgentPool {
     const candidates = this.enabled()
       .filter((agent) => agent.id !== selected.id)
       .map(applyLearnedCapabilities);
-    const learned = getLearnedPoolState();
     const sortWithLearning = (a: OrchestratorAgent, b: OrchestratorAgent): number => {
       const tierDelta = orchestrationRoutingTier(a) - orchestrationRoutingTier(b);
       if (tierDelta !== 0) return tierDelta;
@@ -432,8 +430,9 @@ export class AgentPool {
       let scoreA = this.overallScore(a);
       let scoreB = this.overallScore(b);
       if (stage && taskType) {
-        scoreA += learned.fallbackBoosts.get(fallbackBoostKey(a.id, stage, taskType)) ?? 0;
-        scoreB += learned.fallbackBoosts.get(fallbackBoostKey(b.id, stage, taskType)) ?? 0;
+        // fallbackBoostFor honors request-scoped canary policy overlay.
+        scoreA += fallbackBoostFor(a.id, stage, taskType);
+        scoreB += fallbackBoostFor(b.id, stage, taskType);
       }
       scoreA += modelRoutingScoreDelta(a);
       scoreB += modelRoutingScoreDelta(b);

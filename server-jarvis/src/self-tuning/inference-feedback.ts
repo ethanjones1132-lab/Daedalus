@@ -1,3 +1,19 @@
+/**
+ * Operational inference-feedback loader.
+ *
+ * Domain ownership:
+ * - This path is **immediate operational feedback** from the cron-produced
+ *   inference-feedback report (routing score deltas, stage adjustments,
+ *   empirical first-token budgets, model capability nudges). It is NOT the
+ *   staged shadow→canary→promote lifecycle.
+ * - Explicit staged proposals for routing / budget / recovery go through
+ *   `ConductorLearningLoop.proposeStagedPolicy` → policy-staging holdback.
+ * - Instruction A/B and per-agent capability deltas remain immediate via
+ *   conductor-learning (optimizeAndApply / selectInstructionVariants).
+ *
+ * Promote/rollback of staged policy merges keys into the same maps without
+ * clobbering concurrent operational feedback for keys outside the snapshot.
+ */
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +35,10 @@ function finiteClamped(value: unknown, low: number, high: number): number | unde
   return Math.max(low, Math.min(high, numeric));
 }
 
+/**
+ * Apply operational inference-feedback into live learned-pool maps immediately.
+ * Staged policy proposals must not use this path — use proposeStagedPolicy.
+ */
 export function applyInferenceFeedback(
   value: unknown,
   options: { now?: Date } = {},

@@ -3099,6 +3099,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           route.task_type,
         );
         const resolvedSkills = resolveSkillsForTurn(activeTaskRun.objective, route.task_type);
+        // Staged policy canary arm: ~10% of turns while a canary is active use
+        // request-scoped overlay for routing/budget reads (global maps stay production).
+        const policyCanaryTurn = conductorLearning.shouldRouteToCanaryPolicy();
         // The canonical run duration must include model-backed routing now that
         // coordinator time is a first-class stage. Starting this clock after
         // route selection would make child stage totals exceed their parent
@@ -3275,31 +3278,37 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // Trigger-free turns take the first-iteration no-op path: normalize →
         // executeSegment → finalize. Pre-declaration gate removed so mid-run
         // triggers (evidence / executor / reviewer) can fire.
+        // Canary arm wraps the pipeline so agent-pool score/timeout reads prefer
+        // activeSnapshotForArm("canary") without permanently mutating global maps.
         let pipelineResult;
         try {
-          pipelineResult = await runPipelineWithReplanning({
-            contextMessage,
-            initialDecision: executableRoute,
-            turnRequirement: turnReq.requirement,
-            coordinator,
-            routeOptions: {
-              sessionId,
-              rawMessage: message,
-              history: turnHistory,
-              lastOutcome: sessionMemory.getLastOutcome(sessionId),
-              sessionMemoryHints: memoryHints,
-            },
-            executor,
-            agentRunId,
-            onStateChange: onOrchestratorStateChange,
-            baseOptions: pipelineOptions,
-            maxReplans: cfg.orchestrator.max_conductor_replans,
-            // B-04: hand the per-session counter the session id so the
-            // loop can enforce the per-session cap and persist a
-            // `replan_events` row per re-invocation.
-            sessionCounter: replanCounter,
-            sessionId,
-          });
+          pipelineResult = await conductorLearning.runTurnWithPolicyArm(
+            policyCanaryTurn ? "canary" : "production",
+            () =>
+              runPipelineWithReplanning({
+                contextMessage,
+                initialDecision: executableRoute,
+                turnRequirement: turnReq.requirement,
+                coordinator,
+                routeOptions: {
+                  sessionId,
+                  rawMessage: message,
+                  history: turnHistory,
+                  lastOutcome: sessionMemory.getLastOutcome(sessionId),
+                  sessionMemoryHints: memoryHints,
+                },
+                executor,
+                agentRunId,
+                onStateChange: onOrchestratorStateChange,
+                baseOptions: pipelineOptions,
+                maxReplans: cfg.orchestrator.max_conductor_replans,
+                // B-04: hand the per-session counter the session id so the
+                // loop can enforce the per-session cap and persist a
+                // `replan_events` row per re-invocation.
+                sessionCounter: replanCounter,
+                sessionId,
+              }),
+          );
         } finally {
           // Always tear down the request-scoped conductor wiring so subscribers
           // and abort handles cannot leak across turns/requests.
@@ -3432,6 +3441,38 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             durationMs: duration,
             userRequest: message,
           });
+          // Staged policy lifecycle on the live request path:
+          // - canary arm → noteCanaryPolicyOutcome (may auto-promote/rollback)
+          // - candidate/shadow → noteEligiblePolicyOutcome (eligible → shadow →
+          //   live shadow progress → canary without an offline job)
+          // Instruction A/B + capability deltas stay immediate in optimizeAndApply.
+          const policySuccess = rewardOutcome === "success";
+          const policyStore = getPolicyVersionStore();
+          if (policyStore.canary?.stage === "canary") {
+            const arm = policyCanaryTurn ? "canary" : "production";
+            const transition = conductorLearning.noteCanaryPolicyOutcome(arm, policySuccess);
+            if (transition.action === "promoted" || transition.action === "rolled_back") {
+              console.log(
+                `[Jarvis Orchestrator] Staged policy ${transition.action}: ${transition.reason} ` +
+                `(version=${transition.version?.id ?? "none"})`,
+              );
+            }
+          } else if (
+            policyStore.candidate &&
+            (policyStore.candidate.stage === "candidate" || policyStore.candidate.stage === "shadow")
+          ) {
+            const transition = conductorLearning.noteEligiblePolicyOutcome(rewardOutcome);
+            if (
+              transition.action === "entered_shadow" ||
+              transition.action === "entered_canary" ||
+              transition.action === "rejected"
+            ) {
+              console.log(
+                `[Jarvis Orchestrator] Staged policy ${transition.action}: ${transition.reason} ` +
+                `(version=${transition.version?.id ?? "none"})`,
+              );
+            }
+          }
           const heuristic = await conductorLearning.optimizeAndApply(
             agentRunId,
             route.task_type,

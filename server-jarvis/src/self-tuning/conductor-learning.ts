@@ -13,6 +13,7 @@ import {
   getLearnedPoolState,
 } from "./learned-pool-state";
 import {
+  activeSnapshotForArm,
   evaluatePromotion,
   getPolicyVersionStore,
   persistPolicyVersions,
@@ -22,8 +23,10 @@ import {
   runShadowReplay,
   shouldApplyCanary,
   type PolicyPatch,
+  type PolicySnapshot,
   type TransitionResult,
 } from "./policy-staging";
+import { runWithPolicyOverlay } from "./learned-pool-state";
 import { hashInstruction, type InstructionVariantSelection } from "../orchestration/worker-prompt";
 
 export interface RoutingRecordInput {
@@ -358,10 +361,19 @@ export class ConductorLearningLoop {
     return result;
   }
 
-  /** Advance held-back candidates with an eligible production outcome. */
+  /**
+   * Advance held-back candidates with an eligible production outcome.
+   * Also drives live shadow progress so candidates leave shadow without an
+   * offline replay job (see policy-staging recordEligibleOutcome).
+   */
   noteEligiblePolicyOutcome(outcome: "success" | "degraded" | "failed"): TransitionResult {
     const result = recordEligibleOutcome(outcome);
-    if (result.action === "entered_shadow" || result.action === "eligible_recorded") {
+    if (
+      result.action === "entered_shadow" ||
+      result.action === "eligible_recorded" ||
+      result.action === "entered_canary" ||
+      result.action === "rejected"
+    ) {
       persistPolicyVersions();
     }
     return result;
@@ -377,6 +389,27 @@ export class ConductorLearningLoop {
   /** Live canary traffic coin-flip (10% default). */
   shouldRouteToCanaryPolicy(rng?: () => number): boolean {
     return shouldApplyCanary(rng);
+  }
+
+  /**
+   * Snapshot for the canary arm when a canary is active. Used with
+   * {@link runTurnWithPolicyArm} so agent-pool scoring prefers canary keys
+   * without permanently mutating production maps.
+   */
+  canaryPolicySnapshot(): PolicySnapshot | null {
+    const store = getPolicyVersionStore();
+    if (!store.canary || store.canary.stage !== "canary") return null;
+    return activeSnapshotForArm("canary");
+  }
+
+  /**
+   * Run a turn under the canary (or production) policy arm. Canary uses a
+   * request-scoped overlay so global maps stay on production until promote.
+   */
+  runTurnWithPolicyArm<T>(arm: "canary" | "production", fn: () => T): T {
+    if (arm !== "canary") return fn();
+    const snap = this.canaryPolicySnapshot();
+    return runWithPolicyOverlay(snap, fn);
   }
 
   /** Record a canary-phase outcome; may auto-promote or auto-rollback. */

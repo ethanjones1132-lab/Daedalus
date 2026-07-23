@@ -284,18 +284,38 @@ export function proposePolicy(
 // ── Eligible outcomes → shadow ──────────────────────────────────────────────
 
 /**
- * Record an eligible production outcome while a candidate is held back.
- * After {@link POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow}
- * outcomes the candidate automatically enters the `shadow` stage.
+ * Record an eligible production outcome while a candidate is held back, or
+ * accumulate live shadow progress once the candidate has entered `shadow`.
+ *
+ * Candidate stage: after {@link POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow}
+ * outcomes the candidate automatically enters `shadow`.
+ *
+ * Shadow stage: further live outcomes feed shadow counters so candidates can
+ * leave shadow without an offline replay job. After the same threshold of
+ * additional outcomes the quality gate runs and may advance into canary.
  */
 export function recordEligibleOutcome(
   outcome: "success" | "degraded" | "failed",
 ): TransitionResult {
   const candidate = store.candidate;
-  if (!candidate || candidate.stage !== "candidate") {
+  if (!candidate) {
     return {
       action: "none",
-      reason: candidate ? `stage_${candidate.stage}` : "no_candidate",
+      reason: "no_candidate",
+      version: null,
+      store,
+    };
+  }
+
+  // Live shadow progress (no offline job required).
+  if (candidate.stage === "shadow") {
+    return recordShadowLiveOutcome(candidate, outcome === "success");
+  }
+
+  if (candidate.stage !== "candidate") {
+    return {
+      action: "none",
+      reason: `stage_${candidate.stage}`,
       version: candidate,
       store,
     };
@@ -327,35 +347,43 @@ export function recordEligibleOutcome(
   };
 }
 
-// ── Shadow replay ───────────────────────────────────────────────────────────
-
 /**
- * Feed offline / historical replay results into a shadow-stage candidate.
- * Completing the required replay count advances the candidate into canary.
+ * Feed one live outcome into a shadow-stage candidate. Completing the required
+ * count advances into canary (or rejects) using the same gates as offline replay.
  */
-export function runShadowReplay(
-  outcomes: ReadonlyArray<{ success: boolean }>,
+function recordShadowLiveOutcome(
+  candidate: PolicyVersion,
+  success: boolean,
 ): TransitionResult {
-  const candidate = store.candidate;
-  if (!candidate || candidate.stage !== "shadow") {
+  if (!candidate.shadow) {
+    candidate.shadow = { replayed: 0, successCount: 0, failureCount: 0 };
+  }
+  candidate.shadow.replayed += 1;
+  if (success) candidate.shadow.successCount += 1;
+  else candidate.shadow.failureCount += 1;
+  candidate.updatedAt = nowIso();
+
+  if (candidate.shadow.replayed < POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow) {
     return {
-      action: "none",
-      reason: candidate ? `stage_${candidate.stage}` : "no_candidate",
+      action: "eligible_recorded",
+      reason: `shadow_live_${candidate.shadow.replayed}_of_${POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow}`,
       version: candidate,
       store,
     };
   }
 
+  return finalizeShadowReplay(candidate);
+}
+
+// ── Shadow replay ───────────────────────────────────────────────────────────
+
+/**
+ * Shared shadow completion gate used by offline replay and live shadow progress.
+ */
+function finalizeShadowReplay(candidate: PolicyVersion): TransitionResult {
   if (!candidate.shadow) {
     candidate.shadow = { replayed: 0, successCount: 0, failureCount: 0 };
   }
-
-  for (const row of outcomes) {
-    candidate.shadow.replayed += 1;
-    if (row.success) candidate.shadow.successCount += 1;
-    else candidate.shadow.failureCount += 1;
-  }
-  candidate.updatedAt = nowIso();
 
   // Require a full shadow pass of at least minEligibleOutcomesBeforeShadow replays.
   if (candidate.shadow.replayed < POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow) {
@@ -398,6 +426,39 @@ export function runShadowReplay(
     version: candidate,
     store,
   };
+}
+
+/**
+ * Feed offline / historical replay results into a shadow-stage candidate.
+ * Completing the required replay count advances the candidate into canary.
+ * Prefer live progress via {@link recordEligibleOutcome} when an offline job
+ * is not available.
+ */
+export function runShadowReplay(
+  outcomes: ReadonlyArray<{ success: boolean }>,
+): TransitionResult {
+  const candidate = store.candidate;
+  if (!candidate || candidate.stage !== "shadow") {
+    return {
+      action: "none",
+      reason: candidate ? `stage_${candidate.stage}` : "no_candidate",
+      version: candidate,
+      store,
+    };
+  }
+
+  if (!candidate.shadow) {
+    candidate.shadow = { replayed: 0, successCount: 0, failureCount: 0 };
+  }
+
+  for (const row of outcomes) {
+    candidate.shadow.replayed += 1;
+    if (row.success) candidate.shadow.successCount += 1;
+    else candidate.shadow.failureCount += 1;
+  }
+  candidate.updatedAt = nowIso();
+
+  return finalizeShadowReplay(candidate);
 }
 
 // ── Canary traffic selection ────────────────────────────────────────────────
@@ -555,6 +616,10 @@ function promoteCanary(reason: string): TransitionResult {
   }
 
   // Preserve prior production as last-known-good before mutating maps.
+  // `previous` for merge is only the staged production snapshot — never the
+  // full live maps — so concurrent inference-feedback keys outside staged
+  // versions are not treated as "outgoing" and deleted on promote.
+  const previousProductionSnapshot = store.production?.snapshot;
   if (store.production) {
     store.lastKnownGood = cloneVersion(store.production);
   } else if (!store.lastKnownGood) {
@@ -577,7 +642,11 @@ function promoteCanary(reason: string): TransitionResult {
     store.lastKnownGood = seed;
   }
 
-  applyPolicySnapshotToPool(version.snapshot);
+  // Merge canary keys into the live pool; drop keys exclusive to prior staged
+  // production so concurrent learning outside either snapshot is preserved.
+  applyPolicySnapshotToPool(version.snapshot, getLearnedPoolState(), {
+    previous: previousProductionSnapshot,
+  });
   recordTransition(version, "production", reason);
   store.production = version;
   store.candidate = null;
@@ -606,7 +675,10 @@ export function rollbackPolicy(reason: string): TransitionResult {
   }
 
   if (lkg) {
-    applyPolicySnapshotToPool(lkg.snapshot);
+    // Merge LKG keys and drop keys exclusive to the rolled-back version.
+    applyPolicySnapshotToPool(lkg.snapshot, getLearnedPoolState(), {
+      previous: active?.snapshot,
+    });
     // Re-assert LKG as production.
     const restored = cloneVersion(lkg);
     restored.stage = "production";
