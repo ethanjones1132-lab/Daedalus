@@ -21,6 +21,7 @@ import {
   markPlanItemBlocked,
   markPlanItemVerified,
   normalizeTaskRunOnRead,
+  reconcileTaskRunStatus,
   remainingWorkFromPlan,
   resolveDeepReadIntent,
   resolveTaskRunTurn,
@@ -652,6 +653,206 @@ describe("task-run > assessTaskRunAcceptance", () => {
       evidenceCount: 5,
     });
     expect(r.status).toBe("paused");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// reconcileTaskRunStatus — ledger vs turn acceptance
+// ---------------------------------------------------------------------------
+
+describe("task-run > reconcileTaskRunStatus", () => {
+  test("multi-item partial progress: turn completed → overall stays active", () => {
+    let run = createTaskRun({
+      ...BASE_INPUT,
+      planItems: [
+        { id: "i1", title: "Step one" },
+        { id: "i2", title: "Step two" },
+        { id: "i3", title: "Step three" },
+      ],
+    });
+    run = markPlanItemVerified(run, "i1", {
+      gradingMode: "conductor_direct_diff",
+      evidence: { ref: "ev_1" },
+    });
+    // Item 1 verified, 2 active, 3 pending — synthesizer may still claim done.
+    expect(deriveTaskStatusFromPlan(run.plan!)).toBe("active");
+    expect(
+      reconcileTaskRunStatus({
+        contract: run,
+        turnAcceptanceStatus: "completed",
+      }),
+    ).toBe("active");
+  });
+
+  test("all items verified: turn completed → completed", () => {
+    let run = createTaskRun({
+      ...BASE_INPUT,
+      planItems: [
+        { id: "i1", title: "Only step" },
+      ],
+    });
+    run = markPlanItemVerified(run, "i1", {
+      gradingMode: "conductor_direct_diff",
+      evidence: { ref: "ev" },
+    });
+    expect(deriveTaskStatusFromPlan(run.plan!)).toBe("completed");
+    expect(
+      reconcileTaskRunStatus({
+        contract: run,
+        turnAcceptanceStatus: "completed",
+      }),
+    ).toBe("completed");
+  });
+
+  test("all items verified: turn paused still yields completed (ledger authority)", () => {
+    let run = createTaskRun({
+      ...BASE_INPUT,
+      planItems: [{ id: "i1", title: "Done" }],
+    });
+    run = markPlanItemVerified(run, "i1", {
+      gradingMode: "reviewer_mediated",
+      evidence: { ref: "ev" },
+    });
+    expect(
+      reconcileTaskRunStatus({
+        contract: run,
+        turnAcceptanceStatus: "paused",
+      }),
+    ).toBe("completed");
+  });
+
+  test("blocked item: plan paused beats turn completed", () => {
+    let run = createTaskRun({
+      ...BASE_INPUT,
+      planItems: [
+        { id: "i1", title: "Hard step" },
+        { id: "i2", title: "Later", dependsOn: ["i1"] },
+      ],
+    });
+    run = markPlanItemBlocked(run, "i1", "needs human input");
+    expect(deriveTaskStatusFromPlan(run.plan!)).toBe("paused");
+    expect(
+      reconcileTaskRunStatus({
+        contract: run,
+        turnAcceptanceStatus: "completed",
+      }),
+    ).toBe("paused");
+  });
+
+  test("forcePaused (repetition): always paused", () => {
+    let run = createTaskRun({
+      ...BASE_INPUT,
+      planItems: [{ id: "i1", title: "A" }],
+    });
+    run = markPlanItemVerified(run, "i1", {
+      gradingMode: "conductor_direct_diff",
+      evidence: { ref: "ev" },
+    });
+    expect(
+      reconcileTaskRunStatus({
+        contract: run,
+        turnAcceptanceStatus: "completed",
+        forcePaused: true,
+      }),
+    ).toBe("paused");
+    // Also when plan is still active.
+    const open = createTaskRun({
+      ...BASE_INPUT,
+      planItems: [
+        { id: "a", title: "A" },
+        { id: "b", title: "B" },
+      ],
+    });
+    expect(
+      reconcileTaskRunStatus({
+        contract: open,
+        turnAcceptanceStatus: "completed",
+        forcePaused: true,
+      }),
+    ).toBe("paused");
+  });
+
+  test("failed turn: failed even with open or completed plan", () => {
+    const open = createTaskRun({
+      ...BASE_INPUT,
+      planItems: [
+        { id: "a", title: "A" },
+        { id: "b", title: "B" },
+      ],
+    });
+    expect(
+      reconcileTaskRunStatus({
+        contract: open,
+        turnAcceptanceStatus: "failed",
+      }),
+    ).toBe("failed");
+
+    let done = createTaskRun({
+      ...BASE_INPUT,
+      planItems: [{ id: "a", title: "A" }],
+    });
+    done = markPlanItemVerified(done, "a", {
+      gradingMode: "conductor_direct_diff",
+      evidence: { ref: "ev" },
+    });
+    expect(
+      reconcileTaskRunStatus({
+        contract: done,
+        turnAcceptanceStatus: "failed",
+      }),
+    ).toBe("failed");
+  });
+
+  test("legacy / no plan items: turn acceptance status is used as-is", () => {
+    const emptyPlan = createTaskRun({ ...BASE_INPUT, planItems: [] });
+    expect(
+      reconcileTaskRunStatus({
+        contract: emptyPlan,
+        turnAcceptanceStatus: "completed",
+      }),
+    ).toBe("completed");
+    expect(
+      reconcileTaskRunStatus({
+        contract: emptyPlan,
+        turnAcceptanceStatus: "paused",
+      }),
+    ).toBe("paused");
+
+    const legacy = normalizeTaskRunOnRead({
+      taskRunId: "task_old",
+      sessionId: "sess",
+      objective: "obj",
+      requirement: "full_execution",
+      status: "active",
+      turnCount: 1,
+      evidenceCount: 0,
+      remainingWork: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    })!;
+    expect(legacy.reconstruction).toBe("reconstruction_required");
+    expect(
+      reconcileTaskRunStatus({
+        contract: legacy,
+        turnAcceptanceStatus: "completed",
+      }),
+    ).toBe("completed");
+  });
+
+  test("turn paused + plan active → paused (conservative open)", () => {
+    const run = createTaskRun({
+      ...BASE_INPUT,
+      planItems: [
+        { id: "a", title: "A" },
+        { id: "b", title: "B" },
+      ],
+    });
+    expect(
+      reconcileTaskRunStatus({
+        contract: run,
+        turnAcceptanceStatus: "paused",
+      }),
+    ).toBe("paused");
   });
 });
 

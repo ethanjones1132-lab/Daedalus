@@ -178,6 +178,7 @@ import { loadInferenceFeedback } from "./self-tuning/inference-feedback";
 import { loadPolicyVersions, getPolicyVersionStore } from "./self-tuning/policy-staging";
 import {
   assessTaskRunAcceptance,
+  reconcileTaskRunStatus,
   resolveDeepReadIntent,
   terminalSubtypeForRunOutcome,
   type TaskRunContract,
@@ -3393,6 +3394,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           answer: trimmedAnswer,
           evidenceCount,
         });
+        // Prefer the post-pipeline TaskPlan ledger over turn-level acceptance:
+        // synthesizer prose must not mark multi-item plans completed while
+        // items remain pending/blocked. Latest contract may have mid-turn
+        // plan mutations via onTaskPlanUpdate.
+        const latestTaskRun = sessionMemory.getTaskRun(sessionId) ?? activeTaskRun;
+        const reconciledStatus = reconcileTaskRunStatus({
+          contract: latestTaskRun,
+          turnAcceptanceStatus: taskAcceptance.status,
+          forcePaused: repetitionVerdict.repeated,
+        });
         const runOutcome: "success" | "degraded" | "failed" | "partial" =
           repetitionVerdict.repeated
             ? "degraded"
@@ -3402,7 +3413,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 ? "partial"
                 : "failed";
         sessionMemory.updateTaskRun(sessionId, {
-          status: repetitionVerdict.repeated ? "paused" : taskAcceptance.status,
+          status: reconciledStatus,
           evidenceCount,
           lastOutcome: runOutcome,
           lastTurnId: agentRunId,

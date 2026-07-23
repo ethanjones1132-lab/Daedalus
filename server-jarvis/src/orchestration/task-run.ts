@@ -402,6 +402,60 @@ export function deriveTaskStatusFromPlan(
   return "active";
 }
 
+/**
+ * Reconcile end-of-turn acceptance status with the TaskPlan ledger.
+ *
+ * Mid-turn ledger mutations set overall status via {@link deriveTaskStatusFromPlan}.
+ * Historically, post-pipeline {@link assessTaskRunAcceptance} then *unconditionally*
+ * overwrote that status from synthesizer prose / evidence floors — so a multi-item
+ * plan with only item 1 verified could become `completed` while items 2–N remained
+ * pending. Prefer the ledger when it still has work; keep turn authority for
+ * terminal failure and for legacy/no-plan contracts.
+ *
+ * - forcePaused (repetition guard) → paused
+ * - turn failed → failed (terminal failure authority)
+ * - v2 plan with items and reconstruction === "none":
+ *   - plan active/paused (work remaining or blocked) beats turn `completed`
+ *   - plan completed (all verified) → completed (failed already handled)
+ *   - turn paused with plan still open → paused (pipeline partial / incomplete prose)
+ * - no plan / legacy / reconstruction_required → turnAcceptanceStatus
+ */
+export function reconcileTaskRunStatus(input: {
+  contract: TaskRunContract;
+  turnAcceptanceStatus: Extract<TaskRunStatus, "completed" | "paused" | "failed">;
+  forcePaused?: boolean;
+}): TaskRunStatus {
+  if (input.forcePaused) return "paused";
+
+  const turn = input.turnAcceptanceStatus;
+  if (turn === "failed") return "failed";
+
+  const { contract } = input;
+  const plan = contract.plan;
+  const hasLivePlan =
+    contract.schemaVersion === 2 &&
+    contract.reconstruction === "none" &&
+    !!plan &&
+    plan.items.length > 0;
+
+  if (!hasLivePlan) {
+    return turn;
+  }
+
+  const planStatus = deriveTaskStatusFromPlan(plan);
+
+  // Ledger still has open work (pending/active) or blocked items: never promote
+  // to completed from turn-level synthesizer acceptance alone.
+  if (planStatus === "active" || planStatus === "paused") {
+    if (turn === "completed") return planStatus;
+    // turn is paused: keep paused whether plan is active or blocked.
+    return "paused";
+  }
+
+  // All items verified → overall completed (turn failed already returned above).
+  return "completed";
+}
+
 export function isTaskRunV2(contract: TaskRunContract): boolean {
   return contract.schemaVersion === 2 && contract.reconstruction !== "reconstruction_required";
 }
