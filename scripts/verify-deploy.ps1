@@ -90,6 +90,19 @@ if (-not (Test-Path $proxyPath) -or
     Write-Host "Claude proxy script hash matches manifest." -ForegroundColor Green
 }
 
+$proxyModelsPath = Join-Path $deployDir 'resources\opencode_go_openai_models.json'
+if (-not (Test-Path $proxyModelsPath)) {
+    Write-Error "DEPLOY INCOMPLETE: OpenCode Go proxy model list is missing."
+    exit 1
+}
+if ($manifest.opencode_go_models_sha256 -and
+    (Get-FileHash $proxyModelsPath -Algorithm SHA256).Hash -ne $manifest.opencode_go_models_sha256) {
+    Write-Error "DEPLOY INCOMPLETE: OpenCode Go proxy model list hash differs from the manifest."
+    exit 1
+} else {
+    Write-Host "OpenCode Go proxy model list present." -ForegroundColor Green
+}
+
 if (-not (Test-Path (Join-Path $deployDir 'prompts'))) {
     Write-Error "DEPLOY INCOMPLETE: prompts/ directory missing!"
     exit 1

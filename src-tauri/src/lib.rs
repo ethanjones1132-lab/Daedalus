@@ -1680,24 +1680,38 @@ mod startup_thread_tests {
             tauri["bundle"]["resources"]["../scripts/claude_cli_proxy.py"],
             "resources/claude_cli_proxy.py"
         );
+        assert_eq!(
+            tauri["bundle"]["resources"]["../scripts/opencode_go_openai_models.json"],
+            "resources/opencode_go_openai_models.json"
+        );
 
         let build = include_str!("../../scripts/build-and-deploy.ps1");
         assert!(build.contains("$proxyScript = Join-Path $repo 'scripts\\claude_cli_proxy.py'"));
         assert!(build.contains("Deploy-File $proxyScript 'resources\\claude_cli_proxy.py'"));
+        assert!(build.contains(
+            "Deploy-File $proxyModelsJson 'resources\\opencode_go_openai_models.json'"
+        ));
         assert!(build.contains("claude_proxy_sha256 ="));
+        assert!(build.contains("opencode_go_models_sha256 ="));
 
         let verify = include_str!("../../scripts/verify-deploy.ps1");
         assert!(verify.contains("'resources\\claude_cli_proxy.py'"));
         assert!(verify.contains("$manifest.claude_proxy_sha256"));
+        assert!(verify.contains("'resources\\opencode_go_openai_models.json'"));
 
         let build_helper = include_str!("../build.rs");
         assert!(build_helper
             .contains("cargo:rerun-if-changed=../scripts/claude_cli_proxy.py"));
+        assert!(build_helper
+            .contains("cargo:rerun-if-changed=../scripts/opencode_go_openai_models.json"));
         assert!(build_helper.contains(
             "let proxy_dest = release_dir.join(\"resources\").join(\"claude_cli_proxy.py\")"
         ));
         assert!(build_helper.contains(
             "release_resource_staging::copy_if_different(&proxy_src, &proxy_dest)"
+        ));
+        assert!(build_helper.contains(
+            "let proxy_models_dest = release_dir\n        .join(\"resources\")\n        .join(\"opencode_go_openai_models.json\")"
         ));
     }
 

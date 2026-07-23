@@ -119,30 +119,36 @@ export function isOpenCodeZenFreeModelId(id: string): boolean {
  * Lower means cheaper. The order follows OpenCode Go's published per-token
  * plan prices; exact-price ties use the user's preferred models first.
  * Unknown newly-added catalog models remain usable at the end of the Go tail.
+ *
+ * This map is the source of truth for known OpenCode Go model ids. The Claude
+ * CLI proxy imports the OpenAI-format subset via
+ * `scripts/opencode_go_openai_models.json` (kept in sync by tests) — do not
+ * hand-maintain a second list in Python.
  */
+export const OPENCODE_GO_COST_RANKS: Readonly<Record<string, number>> = {
+  "deepseek-v4-flash": 1,
+  "mimo-v2.5": 2,
+  "deepseek-v4-pro": 10,
+  "mimo-v2.5-pro": 11,
+  "minimax-m3": 20,
+  "minimax-m2.7": 21,
+  "minimax-m2.5": 22,
+  "qwen3.5-plus": 23,
+  "qwen3.7-plus": 30,
+  "qwen3.6-plus": 31,
+  "glm-5": 35,
+  "kimi-k2.5": 36,
+  "kimi-k2.7-code": 40,
+  "kimi-k2.6": 41,
+  "glm-5.2": 45,
+  "glm-5.1": 46,
+  "grok-4.5": 50,
+  "qwen3.7-max": 55,
+  "kimi-k3": 60,
+};
+
 export function openCodeGoCostRank(id: string): number {
-  const ranks: Record<string, number> = {
-    "deepseek-v4-flash": 1,
-    "mimo-v2.5": 2,
-    "deepseek-v4-pro": 10,
-    "mimo-v2.5-pro": 11,
-    "minimax-m3": 20,
-    "minimax-m2.7": 21,
-    "minimax-m2.5": 22,
-    "qwen3.5-plus": 23,
-    "qwen3.7-plus": 30,
-    "qwen3.6-plus": 31,
-    "glm-5": 35,
-    "kimi-k2.5": 36,
-    "kimi-k2.7-code": 40,
-    "kimi-k2.6": 41,
-    "glm-5.2": 45,
-    "glm-5.1": 46,
-    "grok-4.5": 50,
-    "qwen3.7-max": 55,
-    "kimi-k3": 60,
-  };
-  return ranks[id] ?? 1_000;
+  return OPENCODE_GO_COST_RANKS[id] ?? 1_000;
 }
 
 export type OpenCodeProtocol = "openai" | "anthropic";
@@ -158,6 +164,22 @@ export function openCodeGoProtocolForModel(id: string): OpenCodeProtocol {
     return "anthropic";
   }
   return "openai";
+}
+
+/** Known OpenCode Go model ids from {@link OPENCODE_GO_COST_RANKS}. */
+export function openCodeGoKnownModelIds(): string[] {
+  return Object.keys(OPENCODE_GO_COST_RANKS);
+}
+
+/**
+ * OpenCode Go models that speak OpenAI chat-completions (proxy path).
+ * Anthropic-native ids (minimax-m*, qwen3.*-plus/max) skip the proxy and go
+ * point-to-point — see resolveClaudeCliLaunchOptions.
+ */
+export function openCodeGoOpenaiFormatModelIds(): string[] {
+  return openCodeGoKnownModelIds()
+    .filter((id) => openCodeGoProtocolForModel(id) === "openai")
+    .sort();
 }
 
 const KNOWN_CAPABILITIES: Record<string, Partial<AgentCapabilities>> = {

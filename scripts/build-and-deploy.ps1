@@ -56,6 +56,7 @@ $distJs     = Join-Path $repo 'server-jarvis\dist\index.js'
 $promptsSrc = Join-Path $repo 'server-jarvis\src\prompts'
 $metricsScript = Join-Path $repo 'automate_inference_metrics.py'
 $proxyScript = Join-Path $repo 'scripts\claude_cli_proxy.py'
+$proxyModelsJson = Join-Path $repo 'scripts\opencode_go_openai_models.json'
 $desktop    = Join-Path $env:USERPROFILE 'OneDrive\Desktop'
 
 # ── Locate toolchain (prefer PATH, fall back to standard install dirs) ────────
@@ -193,6 +194,7 @@ Deploy-File $exeOut 'home-base.exe'
 Deploy-File $distJs 'index.js'
 Deploy-File $metricsScript 'automate_inference_metrics.py'
 Deploy-File $proxyScript 'resources\claude_cli_proxy.py'
+Deploy-File $proxyModelsJson 'resources\opencode_go_openai_models.json'
 
 # prompts/ is a directory — replace wholesale (back up the old one first)
 $promptsDst = Join-Path $desktop 'prompts'
@@ -214,6 +216,7 @@ $manifest = @{
     index_js_sha256 = (Get-FileHash "$desktop\index.js" -Algorithm SHA256).Hash
     inference_metrics_sha256 = (Get-FileHash "$desktop\automate_inference_metrics.py" -Algorithm SHA256).Hash
     claude_proxy_sha256 = (Get-FileHash "$desktop\resources\claude_cli_proxy.py" -Algorithm SHA256).Hash
+    opencode_go_models_sha256 = (Get-FileHash "$desktop\resources\opencode_go_openai_models.json" -Algorithm SHA256).Hash
     exe_mtime = (Get-Item "$desktop\Jarvis.exe" -ErrorAction SilentlyContinue).LastWriteTimeUtc.ToString("o")
     prompts_tree_sha256 = (git -C $repo ls-tree HEAD server-jarvis/src/prompts | Select-Object -First 1).Split()[2]
     deployed_at = (Get-Date -Format "o")

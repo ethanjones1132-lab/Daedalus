@@ -1,0 +1,17 @@
+{
+  "source": "server-jarvis/src/orchestration/live-model-catalog.ts#OPENCODE_GO_COST_RANKS openai subset via openCodeGoProtocolForModel",
+  "models": [
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "glm-5",
+    "glm-5.1",
+    "glm-5.2",
+    "grok-4.5",
+    "kimi-k2.5",
+    "kimi-k2.6",
+    "kimi-k2.7-code",
+    "kimi-k3",
+    "mimo-v2.5",
+    "mimo-v2.5-pro"
+  ]
+}

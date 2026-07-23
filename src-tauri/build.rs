@@ -15,6 +15,7 @@ fn main() {
     // re-stages them next to the bare release exe.
     println!("cargo:rerun-if-changed=../server-jarvis/dist/index.js");
     println!("cargo:rerun-if-changed=../scripts/claude_cli_proxy.py");
+    println!("cargo:rerun-if-changed=../scripts/opencode_go_openai_models.json");
 
     let sha = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
     let dirty = match git(&["status", "--porcelain"]) {
@@ -73,6 +74,22 @@ fn copy_release_resources_next_to_exe() {
             "cargo:warning=Failed to stage Claude proxy script {} -> {}: {error}",
             proxy_src.display(),
             proxy_dest.display(),
+        );
+    }
+    let proxy_models_src = manifest_dir
+        .parent()
+        .map(|path| path.join("scripts").join("opencode_go_openai_models.json"))
+        .unwrap_or_default();
+    let proxy_models_dest = release_dir
+        .join("resources")
+        .join("opencode_go_openai_models.json");
+    if let Err(error) =
+        release_resource_staging::copy_if_different(&proxy_models_src, &proxy_models_dest)
+    {
+        println!(
+            "cargo:warning=Failed to stage OpenCode Go proxy model list {} -> {}: {error}",
+            proxy_models_src.display(),
+            proxy_models_dest.display(),
         );
     }
     if !bundle_src.exists() {

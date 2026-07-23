@@ -1,12 +1,24 @@
 import os, sys, json
 os.environ.setdefault("JARVIS_OPENROUTER_API_KEY", "test-key-xxxx")
+os.environ.setdefault("JARVIS_OPENCODE_GO_API_KEY", "go-test-key-xxxx")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import claude_cli_proxy as p
 
 print("== resolve_upstream routing ==")
-for m in ["nvidia/llama-3.1-nemotron-ultra-253b-v1:free", "qwen/qwen3-coder:free", "qwen3:8b", "claude-sonnet-4-6"]:
+for m in [
+    "nvidia/llama-3.1-nemotron-ultra-253b-v1:free",
+    "qwen/qwen3-coder:free",
+    "qwen3:8b",
+    "claude-sonnet-4-6",
+    "deepseek-v4-pro",
+    "deepseek-v4-flash",
+    "opencode_go/deepseek-v4-flash",
+    "minimax-m3",
+]:
     u = p.resolve_upstream(m)
-    print(f"{m:30} -> {u['provider']:10} model={u['model']:30} {u['completions_url']}")
+    print(f"{m:45} -> {u['provider']:12} model={u['model']:30} {u['completions_url']}")
+print("opencode_go openai models:", sorted(p.get_opencode_go_openai_models())[:6], "...")
+print("allowed remote hosts:", sorted(p.ALLOWED_REMOTE_HOSTS))
 
 print("== live OpenRouter key in config (env override cleared) ==")
 os.environ.pop("JARVIS_OPENROUTER_API_KEY", None)

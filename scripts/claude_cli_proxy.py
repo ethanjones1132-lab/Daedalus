@@ -6,10 +6,14 @@ bridge Claude Code with a backing model, enabling tool calls and optimal
 performance.
 
 Upstream routing is per-request, keyed off the requested model id:
-  - "vendor/model[:tag]"  + an OpenRouter key  ->  OpenRouter (hosted, remote)
-  - bare "qwen3:8b"-style ids                  ->  local Ollama
+  - known OpenCode Go OpenAI-format ids + Go key  ->  OpenCode Go (hosted)
+  - "vendor/model[:tag]"  + an OpenRouter key     ->  OpenRouter (hosted, remote)
+  - bare "qwen3:8b"-style ids                     ->  local Ollama
 This lets a Jarvis model profile drive Claude Code with either a large hosted
 model or a local quantized one, without restarting the proxy.
+
+OpenCode Go Anthropic-native models (minimax-m*, qwen3.*-plus/max) skip this
+proxy entirely and talk point-to-point from the Bun server (see claude-cli.ts).
 """
 
 from __future__ import annotations
@@ -38,19 +42,52 @@ CLAUDE_TIMEOUT = float(os.environ.get("JARVIS_CLAUDE_TIMEOUT", "180"))
 LOCAL_ONLY = os.environ.get("JARVIS_CLAUDE_PROXY_LOCAL_ONLY", "1").lower() not in ("0", "false", "no", "off")
 LOCAL_HOSTNAMES = {"localhost", "host.docker.internal", "host.containers.internal"}
 
-# ── OpenRouter routing ──────────────────────────────────────────────────────
+# ── Remote hosted routing (OpenRouter + OpenCode Go) ────────────────────────
 OPENROUTER_URL = os.environ.get("JARVIS_OPENROUTER_URL", "https://openrouter.ai/api/v1")
 OPENROUTER_REFERER = os.environ.get("JARVIS_OPENROUTER_REFERER", "http://localhost:19877")
 OPENROUTER_TITLE = os.environ.get("JARVIS_OPENROUTER_TITLE", "Jarvis")
+DEFAULT_OPENCODE_GO_URL = "https://opencode.ai/zen/go/v1"
 # Only these remote hosts may ever be dialed (deliberate exception to LOCAL_ONLY).
-OPENROUTER_HOSTS = {"openrouter.ai"}
-# Where to find the user's OpenRouter key if it isn't passed via env.
-CONFIG_CANDIDATES = [
-    os.environ.get("JARVIS_CONFIG_PATH", ""),
-    os.path.expanduser("~/.openclaw/jarvis/config.json"),
-]
+ALLOWED_REMOTE_HOSTS = {"openrouter.ai", "opencode.ai"}
+# Back-compat alias — older call sites/tests may still reference this name.
+OPENROUTER_HOSTS = ALLOWED_REMOTE_HOSTS
+# Default on-disk config path (always last). JARVIS_CONFIG_PATH is resolved at
+# read time so tests can isolate from the live ~/.openclaw config.
+DEFAULT_CONFIG_PATH = os.path.expanduser("~/.openclaw/jarvis/config.json")
+# Synced export of openCodeGoOpenaiFormatModelIds() — see live-model-catalog.ts.
+OPENCODE_GO_MODELS_JSON = "opencode_go_openai_models.json"
+
+
+def config_candidates() -> list[str]:
+    """Ordered config paths: env override first, then the default home path."""
+    return [
+        os.environ.get("JARVIS_CONFIG_PATH", ""),
+        DEFAULT_CONFIG_PATH,
+    ]
+
+
+# Back-compat for callers that still read the module-level list.
+CONFIG_CANDIDATES = config_candidates()
 
 _OR_KEY_CACHE: dict[str, Any] = {"key": "", "ts": 0.0}
+_GO_KEY_CACHE: dict[str, Any] = {"key": "", "ts": 0.0}
+_GO_URL_CACHE: dict[str, Any] = {"url": "", "ts": 0.0}
+_GO_MODELS_CACHE: dict[str, Any] = {"models": frozenset(), "ts": 0.0}
+
+
+def _load_jarvis_config() -> dict[str, Any]:
+    """Return the first readable Jarvis config dict, or {}."""
+    for path in config_candidates():
+        if not path:
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            if isinstance(cfg, dict):
+                return cfg
+        except Exception:
+            continue
+    return {}
 
 
 def get_openrouter_key() -> str:
@@ -65,22 +102,111 @@ def get_openrouter_key() -> str:
     if _OR_KEY_CACHE["key"] and (now - _OR_KEY_CACHE["ts"]) < 10:
         return _OR_KEY_CACHE["key"]
 
-    key = ""
-    for path in CONFIG_CANDIDATES:
-        if not path:
-            continue
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            key = (cfg.get("openrouter") or {}).get("api_key") or ""
-            if key:
-                break
-        except Exception:
-            continue
+    key = (_load_jarvis_config().get("openrouter") or {}).get("api_key") or ""
 
     _OR_KEY_CACHE["key"] = key
     _OR_KEY_CACHE["ts"] = now
     return key
+
+
+def get_opencode_go_key() -> str:
+    """Resolve the OpenCode Go API key: env override first, else cfg.opencode_go."""
+    env_key = (
+        os.environ.get("JARVIS_OPENCODE_GO_API_KEY", "")
+        or os.environ.get("OPENCODE_GO_API_KEY", "")
+        or os.environ.get("OPENCODE_GO_KEY", "")
+    )
+    if env_key:
+        return env_key
+
+    now = time.time()
+    if _GO_KEY_CACHE["key"] and (now - _GO_KEY_CACHE["ts"]) < 10:
+        return _GO_KEY_CACHE["key"]
+
+    key = (_load_jarvis_config().get("opencode_go") or {}).get("api_key") or ""
+
+    _GO_KEY_CACHE["key"] = key
+    _GO_KEY_CACHE["ts"] = now
+    return key
+
+
+def get_opencode_go_base_url() -> str:
+    """Resolve OpenCode Go base URL: env, then cfg.opencode_go.base_url, then default."""
+    env_url = os.environ.get("JARVIS_OPENCODE_GO_URL", "").strip()
+    if env_url:
+        return env_url.rstrip("/")
+
+    now = time.time()
+    if _GO_URL_CACHE["url"] and (now - _GO_URL_CACHE["ts"]) < 10:
+        return _GO_URL_CACHE["url"]
+
+    url = ((_load_jarvis_config().get("opencode_go") or {}).get("base_url") or "").strip()
+    if not url:
+        url = DEFAULT_OPENCODE_GO_URL
+    url = url.rstrip("/")
+
+    _GO_URL_CACHE["url"] = url
+    _GO_URL_CACHE["ts"] = now
+    return url
+
+
+def _opencode_go_model_json_candidates() -> list[str]:
+    """Paths that may hold the synced OpenAI-format OpenCode Go model list."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.environ.get("JARVIS_OPENCODE_GO_MODELS_PATH", ""),
+        os.path.join(here, OPENCODE_GO_MODELS_JSON),
+        # Deployed next to the proxy under resources/
+        os.path.join(here, "resources", OPENCODE_GO_MODELS_JSON),
+        os.path.expanduser(f"~/.openclaw/jarvis/{OPENCODE_GO_MODELS_JSON}"),
+    ]
+    for cfg_path in config_candidates():
+        if cfg_path:
+            candidates.append(os.path.join(os.path.dirname(cfg_path), OPENCODE_GO_MODELS_JSON))
+    return candidates
+
+
+def get_opencode_go_openai_models() -> frozenset[str]:
+    """OpenAI-format OpenCode Go model ids the proxy may route.
+
+    Source of truth is OPENCODE_GO_COST_RANKS in live-model-catalog.ts (openai
+    protocol subset). Resolution order:
+      1. JARVIS_OPENCODE_GO_OPENAI_MODELS env (comma-separated; tests)
+      2. cfg.opencode_go.openai_format_models (optional runtime override)
+      3. scripts/opencode_go_openai_models.json (synced export next to proxy)
+    """
+    env_list = os.environ.get("JARVIS_OPENCODE_GO_OPENAI_MODELS", "").strip()
+    if env_list:
+        return frozenset(m.strip() for m in env_list.split(",") if m.strip())
+
+    now = time.time()
+    if _GO_MODELS_CACHE["models"] and (now - _GO_MODELS_CACHE["ts"]) < 10:
+        return _GO_MODELS_CACHE["models"]
+
+    models: set[str] = set()
+
+    cfg_models = (_load_jarvis_config().get("opencode_go") or {}).get("openai_format_models")
+    if isinstance(cfg_models, list) and cfg_models:
+        models = {str(m).strip() for m in cfg_models if str(m).strip()}
+    else:
+        for path in _opencode_go_model_json_candidates():
+            if not path or not os.path.isfile(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                raw = payload.get("models") if isinstance(payload, dict) else payload
+                if isinstance(raw, list):
+                    models = {str(m).strip() for m in raw if str(m).strip()}
+                    if models:
+                        break
+            except Exception:
+                continue
+
+    frozen = frozenset(models)
+    _GO_MODELS_CACHE["models"] = frozen
+    _GO_MODELS_CACHE["ts"] = now
+    return frozen
 
 
 def is_local_upstream(url: str) -> bool:
@@ -158,17 +284,40 @@ def get_ollama_url() -> str:
     return url
 
 
+def _normalize_opencode_go_model_id(req_model: str) -> str:
+    """Strip optional opencode_go/ provider prefix from a requested model id."""
+    model = (req_model or "").strip()
+    if model.startswith("opencode_go/"):
+        return model.split("/", 1)[1].strip()
+    return model
+
+
 def resolve_upstream(req_model: str) -> dict[str, Any]:
     """Pick the upstream provider for a request based on its model id.
 
-    OpenRouter model ids are namespaced ("vendor/model[:tag]") and need a key.
-    Ollama models are bare ("qwen3:8b"). Claude Code may also send sonnet/opus
-    placeholders, which fall back to the local default model.
+    Priority (single-shot; no cascade — Conductor owns multi-candidate retry):
+      1. Known OpenCode Go OpenAI-format model + Go key  -> opencode_go
+      2. Namespaced "vendor/model[:tag]" + OpenRouter key -> openrouter
+      3. Bare Ollama ids / claude-* placeholders          -> ollama
     """
     model = req_model or DEFAULT_MODEL
-    or_key = get_openrouter_key()
 
-    if or_key and "/" in model and not model.startswith("claude-"):
+    go_model = _normalize_opencode_go_model_id(model)
+    go_key = get_opencode_go_key()
+    if go_key and go_model in get_opencode_go_openai_models():
+        base = get_opencode_go_base_url()
+        return {
+            "provider": "opencode_go",
+            "base_url": base,
+            "completions_url": f"{base}/chat/completions",
+            "model": go_model,
+            "auth": f"Bearer {go_key}",
+            "extra_headers": {},
+            "local": False,
+        }
+
+    or_key = get_openrouter_key()
+    if or_key and "/" in model and not model.startswith("claude-") and not model.startswith("opencode_go/"):
         base = OPENROUTER_URL.rstrip("/")
         return {
             "provider": "openrouter",
@@ -458,8 +607,8 @@ class Handler(BaseHTTPRequestHandler):
         if openai_tools:
             payload["tools"] = openai_tools
 
-        # Validate the chosen upstream. Local upstreams honour LOCAL_ONLY; the
-        # OpenRouter exception is constrained to the known host + a present key.
+        # Validate the chosen upstream. Local upstreams honour LOCAL_ONLY; remote
+        # exceptions are constrained to the allow-listed host + a present key.
         if upstream["local"]:
             try:
                 require_local_upstream(upstream["base_url"])
@@ -469,12 +618,21 @@ class Handler(BaseHTTPRequestHandler):
                 return
         else:
             host = (urllib.parse.urlparse(upstream["base_url"]).hostname or "").lower()
-            if host not in OPENROUTER_HOSTS:
+            if host not in ALLOWED_REMOTE_HOSTS:
                 msg = f"Refusing unknown remote upstream host: {host}"
                 LOG.error("%s", msg)
                 self._write_json(502, {"error": {"type": "upstream_rejected", "message": msg}})
                 return
-            if not get_openrouter_key():
+            if upstream["provider"] == "opencode_go":
+                if not get_opencode_go_key():
+                    self._write_json(401, {
+                        "error": {
+                            "type": "authentication_error",
+                            "message": "OpenCode Go API key not configured",
+                        }
+                    })
+                    return
+            elif not get_openrouter_key():
                 self._write_json(401, {"error": {"type": "authentication_error", "message": "OpenRouter API key not configured"}})
                 return
 

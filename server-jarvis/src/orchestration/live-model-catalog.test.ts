@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "fs";
+import { join } from "path";
 import { defaultConfig } from "../config";
 import { AgentPool } from "./agent-pool";
 import {
   discoverLiveOrchestratorAgents,
+  openCodeGoOpenaiFormatModelIds,
+  openCodeGoProtocolForModel,
   resetLiveModelCatalogCache,
 } from "./live-model-catalog";
 
@@ -157,5 +161,23 @@ describe("live orchestration model catalog", () => {
 
     expect(snapshot.agents.map((agent) => agent.model_id)).toContain("deepseek-v4-flash");
     expect(snapshot.catalogs.opencode_go.status).toBe("unavailable");
+  });
+
+  test("proxy openai model list JSON matches openCodeGoCostRank openai subset", () => {
+    // scripts/opencode_go_openai_models.json is the Claude CLI proxy's model
+    // allow-list. Keep it generated from OPENCODE_GO_COST_RANKS — never hand-edit
+    // a parallel list in Python.
+    const expected = openCodeGoOpenaiFormatModelIds();
+    expect(expected).toContain("deepseek-v4-flash");
+    expect(expected).toContain("deepseek-v4-pro");
+    expect(expected).not.toContain("minimax-m3"); // anthropic-native, proxy-skipped
+    for (const id of expected) {
+      expect(openCodeGoProtocolForModel(id)).toBe("openai");
+    }
+
+    const jsonPath = join(import.meta.dir, "../../../scripts/opencode_go_openai_models.json");
+    const payload = JSON.parse(readFileSync(jsonPath, "utf-8")) as { models?: unknown };
+    expect(Array.isArray(payload.models)).toBe(true);
+    expect([...(payload.models as string[])].sort()).toEqual(expected);
   });
 });
