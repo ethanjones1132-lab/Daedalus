@@ -5,7 +5,18 @@ import {
   buildInferenceFeedbackCommand,
   refreshInferenceFeedback,
 } from "./inference-feedback-refresh";
-import { resetLearnedPoolStateForTests } from "./learned-pool-state";
+import {
+  applyPolicySnapshotToPool,
+  clearInferenceFeedbackState,
+  getLearnedPoolState,
+  resetLearnedPoolStateForTests,
+} from "./learned-pool-state";
+import {
+  getPolicyVersionStore,
+  reapplyProductionPolicySnapshot,
+  resetPolicyStagingForTests,
+  type PolicyVersion,
+} from "./policy-staging";
 
 const slowDefault: OrchestratorAgent = {
   id: "slow-default",
@@ -129,5 +140,90 @@ describe("cron feedback refresh", () => {
     });
     expect(seen).toHaveLength(1);
     expect(result).toEqual({ success: true, output: "Policy written", applied: 2, ignored: 0 });
+  });
+});
+
+describe("production policy durability across inference-feedback clear/apply", () => {
+  const productionKey = "opencode_go:promoted-model";
+
+  function seedProductionSnapshot(): void {
+    const snapshot = {
+      modelRoutingScoreDeltas: { [productionKey]: 0.12 },
+      stageModelRoutingScoreDeltas: {},
+      fallbackBoosts: {},
+      modelFirstTokenTimeouts: { [productionKey]: 40_000 },
+      recovery: { prefer_fallback_on_timeout: true },
+    };
+    applyPolicySnapshotToPool(snapshot);
+    const production: PolicyVersion = {
+      id: "pv-durability-test",
+      version: 1,
+      stage: "production",
+      domain: "routing",
+      snapshot,
+      patch: {
+        domain: "routing",
+        modelRoutingScoreDeltas: { [productionKey]: 0.12 },
+      },
+      rationale: "seeded for durability test",
+      createdAt: "2026-07-10T00:00:00.000Z",
+      updatedAt: "2026-07-10T00:00:00.000Z",
+      eligibleOutcomes: 0,
+      eligibleSuccessCount: 0,
+      eligibleFailureCount: 0,
+      history: [],
+    };
+    getPolicyVersionStore().production = production;
+  }
+
+  beforeEach(() => {
+    resetPolicyStagingForTests();
+    resetLearnedPoolStateForTests();
+  });
+
+  test("reapplyProductionPolicySnapshot restores keys wiped by clearInferenceFeedbackState", () => {
+    seedProductionSnapshot();
+    const state = getLearnedPoolState();
+    expect(state.modelRoutingScoreDeltas.get(productionKey)).toBe(0.12);
+
+    clearInferenceFeedbackState();
+    expect(state.modelRoutingScoreDeltas.get(productionKey)).toBeUndefined();
+    expect(state.modelFirstTokenTimeouts.get(productionKey)).toBeUndefined();
+    // recovery is not cleared by clearInferenceFeedbackState
+    expect(state.recoveryPolicy.get("prefer_fallback_on_timeout")).toBe(true);
+
+    expect(reapplyProductionPolicySnapshot()).toBe(true);
+    expect(state.modelRoutingScoreDeltas.get(productionKey)).toBe(0.12);
+    expect(state.modelFirstTokenTimeouts.get(productionKey)).toBe(40_000);
+  });
+
+  test("applyInferenceFeedback re-merges production so promote is not undone in-process", () => {
+    seedProductionSnapshot();
+    const state = getLearnedPoolState();
+    expect(state.modelRoutingScoreDeltas.get(productionKey)).toBe(0.12);
+
+    // This path clears the four cron-managed maps then reloads feedback — the
+    // durability hole before reapply would drop productionKey until restart.
+    const result = applyInferenceFeedback(policy("2026-07-12T00:00:00.000Z"), {
+      now: new Date("2026-07-10T12:00:00.000Z"),
+    });
+    expect(result).toEqual({ applied: 2, ignored: 0, reason: undefined });
+
+    // Production key survives clear + operational reload.
+    expect(state.modelRoutingScoreDeltas.get(productionKey)).toBe(0.12);
+    expect(state.modelFirstTokenTimeouts.get(productionKey)).toBe(40_000);
+    // Operational feedback coexists.
+    expect(state.modelRoutingScoreDeltas.get("openrouter:slow-model")).toBe(-0.25);
+    expect(state.modelRoutingScoreDeltas.get("openrouter:fast-model")).toBe(0.15);
+    expect(state.modelFirstTokenTimeouts.get("openrouter:slow-model")).toBe(42_000);
+  });
+
+  test("expired feedback still re-applies production after clear", () => {
+    seedProductionSnapshot();
+    const result = applyInferenceFeedback(policy("2026-07-09T00:00:00.000Z"), {
+      now: new Date("2026-07-10T12:00:00.000Z"),
+    });
+    expect(result.reason).toBe("expired");
+    expect(getLearnedPoolState().modelRoutingScoreDeltas.get(productionKey)).toBe(0.12);
   });
 });

@@ -742,6 +742,22 @@ export function persistPolicyVersions(root: string = SESSIONS_DIR): void {
   }
 }
 
+/**
+ * Re-merge the staged production snapshot into live learned-pool maps.
+ *
+ * Call after any path that clears inference-feedback maps (cron refresh /
+ * loadInferenceFeedback / applyInferenceFeedback) so promoted routing /
+ * budget / recovery keys survive in-process without requiring a restart.
+ * Merge is additive for keys present in the snapshot; concurrent operational
+ * feedback for other keys is preserved.
+ */
+export function reapplyProductionPolicySnapshot(): boolean {
+  const production = store.production;
+  if (!production?.snapshot) return false;
+  applyPolicySnapshotToPool(production.snapshot);
+  return true;
+}
+
 /** Load persisted policy versions. No-op when the file is missing. */
 export function loadPolicyVersions(root: string = SESSIONS_DIR): void {
   const path = policyVersionsPath(root);
@@ -761,9 +777,7 @@ export function loadPolicyVersions(root: string = SESSIONS_DIR): void {
       lastKnownGood: (raw.lastKnownGood as PolicyVersion | null) ?? null,
     };
     // Re-apply production snapshot so routing/budget maps match disk after restart.
-    if (store.production?.snapshot) {
-      applyPolicySnapshotToPool(store.production.snapshot);
-    }
+    reapplyProductionPolicySnapshot();
   } catch (e) {
     console.warn(
       `[PolicyStaging] Failed to load: ${e instanceof Error ? e.message : String(e)}`,

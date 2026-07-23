@@ -18,6 +18,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { clearInferenceFeedbackState, getLearnedPoolState } from "./learned-pool-state";
+import { reapplyProductionPolicySnapshot } from "./policy-staging";
 
 export interface FeedbackApplyResult {
   applied: number;
@@ -38,70 +39,81 @@ function finiteClamped(value: unknown, low: number, high: number): number | unde
 /**
  * Apply operational inference-feedback into live learned-pool maps immediately.
  * Staged policy proposals must not use this path — use proposeStagedPolicy.
+ *
+ * Always clears the four cron-managed maps first, then reloads feedback, then
+ * re-merges staged production so a promote cannot be undone in-process by a
+ * feedback refresh (until restart would re-load policy-versions.json).
  */
 export function applyInferenceFeedback(
   value: unknown,
   options: { now?: Date } = {},
 ): FeedbackApplyResult {
   clearInferenceFeedbackState();
-  if (!value || typeof value !== "object") return { applied: 0, ignored: 0, reason: "invalid" };
-  const report = value as Record<string, any>;
-  if (report.schema_version !== 1 || !report.routing_policy?.model_adjustments) {
-    return { applied: 0, ignored: 0, reason: "invalid" };
-  }
-  const expiresAt = Date.parse(String(report.expires_at ?? ""));
-  if (!Number.isFinite(expiresAt) || expiresAt <= (options.now ?? new Date()).getTime()) {
-    return { applied: 0, ignored: 0, reason: "expired" };
-  }
+  try {
+    if (!value || typeof value !== "object") return { applied: 0, ignored: 0, reason: "invalid" };
+    const report = value as Record<string, any>;
+    if (report.schema_version !== 1 || !report.routing_policy?.model_adjustments) {
+      return { applied: 0, ignored: 0, reason: "invalid" };
+    }
+    const expiresAt = Date.parse(String(report.expires_at ?? ""));
+    if (!Number.isFinite(expiresAt) || expiresAt <= (options.now ?? new Date()).getTime()) {
+      return { applied: 0, ignored: 0, reason: "expired" };
+    }
 
-  const state = getLearnedPoolState();
-  const minSamples = Math.max(1, Number(report.routing_policy.min_samples) || 1);
-  let applied = 0;
-  let ignored = 0;
-  for (const [key, raw] of Object.entries(report.routing_policy.model_adjustments as Record<string, any>)) {
-    if (!key.includes(":") || !raw || typeof raw !== "object" || Number(raw.sample_count) < minSamples) {
-      ignored += 1;
-      continue;
+    const state = getLearnedPoolState();
+    const minSamples = Math.max(1, Number(report.routing_policy.min_samples) || 1);
+    let applied = 0;
+    let ignored = 0;
+    for (const [key, raw] of Object.entries(report.routing_policy.model_adjustments as Record<string, any>)) {
+      if (!key.includes(":") || !raw || typeof raw !== "object" || Number(raw.sample_count) < minSamples) {
+        ignored += 1;
+        continue;
+      }
+      const routing = finiteClamped(raw.routing_score_delta, -0.25, 0.15);
+      const speed = finiteClamped(raw.speed_capability_delta, -0.15, 0.10);
+      const reliability = finiteClamped(raw.reliability_capability_delta, -0.15, 0.10);
+      const firstToken = finiteClamped(raw.first_token_timeout_ms, 1_000, 55_000);
+      if (routing !== undefined) state.modelRoutingScoreDeltas.set(key, routing);
+      const deltas: Record<string, number> = {};
+      if (speed !== undefined) deltas.speed = speed;
+      if (reliability !== undefined) deltas.json_reliability = reliability;
+      if (Object.keys(deltas).length > 0) state.modelCapabilityDeltas.set(key, deltas);
+      if (firstToken !== undefined) state.modelFirstTokenTimeouts.set(key, firstToken);
+      applied += 1;
     }
-    const routing = finiteClamped(raw.routing_score_delta, -0.25, 0.15);
-    const speed = finiteClamped(raw.speed_capability_delta, -0.15, 0.10);
-    const reliability = finiteClamped(raw.reliability_capability_delta, -0.15, 0.10);
-    const firstToken = finiteClamped(raw.first_token_timeout_ms, 1_000, 55_000);
-    if (routing !== undefined) state.modelRoutingScoreDeltas.set(key, routing);
-    const deltas: Record<string, number> = {};
-    if (speed !== undefined) deltas.speed = speed;
-    if (reliability !== undefined) deltas.json_reliability = reliability;
-    if (Object.keys(deltas).length > 0) state.modelCapabilityDeltas.set(key, deltas);
-    if (firstToken !== undefined) state.modelFirstTokenTimeouts.set(key, firstToken);
-    applied += 1;
+    for (const [key, raw] of Object.entries(report.routing_policy.stage_adjustments ?? {})) {
+      if (key.split(":").length < 3 || !raw || typeof raw !== "object") {
+        ignored += 1;
+        continue;
+      }
+      const stageAdj = raw as Record<string, unknown>;
+      const sampleCount = Number(stageAdj.sample_count);
+      if (!Number.isFinite(sampleCount) || sampleCount < minSamples) {
+        ignored += 1;
+        continue;
+      }
+      const routing = finiteClamped(stageAdj.routing_score_delta, -0.25, 0.15);
+      if (routing !== undefined) state.stageModelRoutingScoreDeltas.set(key, routing);
+      applied += 1;
+    }
+    return { applied, ignored, reason: undefined };
+  } finally {
+    // Promote keys share these maps; re-merge so cron refresh cannot undo production.
+    reapplyProductionPolicySnapshot();
   }
-  for (const [key, raw] of Object.entries(report.routing_policy.stage_adjustments ?? {})) {
-    if (key.split(":").length < 3 || !raw || typeof raw !== "object") {
-      ignored += 1;
-      continue;
-    }
-    const stageAdj = raw as Record<string, unknown>;
-    const sampleCount = Number(stageAdj.sample_count);
-    if (!Number.isFinite(sampleCount) || sampleCount < minSamples) {
-      ignored += 1;
-      continue;
-    }
-    const routing = finiteClamped(stageAdj.routing_score_delta, -0.25, 0.15);
-    if (routing !== undefined) state.stageModelRoutingScoreDeltas.set(key, routing);
-    applied += 1;
-  }
-  return { applied, ignored, reason: undefined };
 }
 
 export function loadInferenceFeedback(path = inferenceFeedbackPath()): FeedbackApplyResult {
   if (!existsSync(path)) {
     clearInferenceFeedbackState();
+    reapplyProductionPolicySnapshot();
     return { applied: 0, ignored: 0, reason: "missing" };
   }
   try {
     return applyInferenceFeedback(JSON.parse(readFileSync(path, "utf8")));
   } catch {
     clearInferenceFeedbackState();
+    reapplyProductionPolicySnapshot();
     return { applied: 0, ignored: 0, reason: "invalid" };
   }
 }
