@@ -195,9 +195,34 @@ export class LiveConductor {
         };
       }
 
+      const successfulWrites = (evidence.toolCalls ?? []).filter(
+        (call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name),
+      ).length;
+
+      // 2026-07-18 / Task 5 review: write-effect fence MUST run before
+      // runtime-loop escalate_reviewer. Otherwise medium/high complexity + plan
+      // item returns escalate and skips the one free executor re-enter that
+      // actually applies the mutation. Prefer fence first when
+      // writeIntent && successfulWrites===0.
+      if (
+        stage === "executor" &&
+        outcome === "completed" &&
+        evidence.writeIntent === true &&
+        successfulWrites === 0 &&
+        remainingQueue.length > 0 &&
+        !this.writeEffectRerouteUsed
+      ) {
+        this.writeEffectRerouteUsed = true;
+        return {
+          type: "reroute",
+          newRemaining: ["re-enter:executor" as StageName, ...remainingQueue],
+          reason: "write-intent executor stage completed with zero successful mutations; re-entering executor once to APPLY the change with write_file/edit_file before continuing",
+        };
+      }
+
       // Owned-runtime-loop: per-item completion / repair directives (deterministic
-      // first — no supervisory model call). Extends directive set; does not replace
-      // existing evidence fences or supervision below.
+      // first — no supervisory model call). Runs after write-effect fence so
+      // escalate_reviewer cannot skip a needed write re-enter.
       const runtimeDirective = this.runtimeLoopDirective(stage, outcome, output, remainingQueue, evidence);
       if (runtimeDirective) return runtimeDirective;
 
@@ -224,31 +249,6 @@ export class LiveConductor {
           type: "reroute",
           newRemaining: ["re-enter:executor" as StageName, ...remainingQueue],
           reason: `deep-read evidence insufficient after completed executor stage: ${evidenceAssessment.reason}; re-entering executor once before continuing`,
-        };
-      }
-
-      // 2026-07-18: write-effect fence — the write-side mirror of the
-      // deep-read reroute above. A change-request executor stage that ends
-      // with ZERO successful mutations is not "clean"; re-enter the executor
-      // once (fresh stage window) with an explicit apply-the-change note
-      // before letting the pipeline drift toward synthesis. Deterministic —
-      // costs no supervisory inference.
-      const successfulWrites = (evidence.toolCalls ?? []).filter(
-        (call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name),
-      ).length;
-      if (
-        stage === "executor" &&
-        outcome === "completed" &&
-        evidence.writeIntent === true &&
-        successfulWrites === 0 &&
-        remainingQueue.length > 0 &&
-        !this.writeEffectRerouteUsed
-      ) {
-        this.writeEffectRerouteUsed = true;
-        return {
-          type: "reroute",
-          newRemaining: ["re-enter:executor" as StageName, ...remainingQueue],
-          reason: "write-intent executor stage completed with zero successful mutations; re-entering executor once to APPLY the change with write_file/edit_file before continuing",
         };
       }
 

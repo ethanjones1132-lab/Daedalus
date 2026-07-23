@@ -10,7 +10,9 @@ import {
   conductorValidatePlanItems,
   decideRepairChain,
   extractPlanItemsFromPlannerNarrative,
+  formatConductorPlanBrief,
   gradeViaDirectDiff,
+  isMaterialObjectiveChange,
   mergeRepairChainIntoRemaining,
   planAuthorshipPath,
   reviewerFeedbackIsInsufficient,
@@ -18,6 +20,7 @@ import {
   seedTaskPlanFromPlanning,
   shouldBackstopFromConsecutiveFailures,
   shouldEscalateToReviewer,
+  shouldSeedTaskPlan,
   DEFAULT_MAX_CONSECUTIVE_FAILURES,
   DEFAULT_MAX_REPAIR_CYCLES,
 } from "./runtime-loop";
@@ -330,5 +333,105 @@ describe("runtime-loop > authorSimplePlanItems", () => {
     expect(items[0].id).toBe("pi_fixed");
     expect(items[0].title!.length).toBeLessThanOrEqual(120);
     expect(items[0].acceptanceChecks?.length).toBe(1);
+  });
+});
+
+describe("runtime-loop > multi-turn plan reseeding (non-clobber)", () => {
+  test("shouldSeedTaskPlan is false when a live v2 plan already has items", () => {
+    const planning = attachOwnedPlanning("add a README note about setup", "low");
+    let contract = seedTaskPlanFromPlanning(baseContract(), planning);
+    expect(shouldSeedTaskPlan(contract)).toBe(false);
+    expect(shouldSeedTaskPlan(contract, { force: true })).toBe(true);
+  });
+
+  test("continuation reseed does not wipe verified items or repair cycles", () => {
+    const planning = attachOwnedPlanning("implement the feature end to end", "low");
+    let contract = seedTaskPlanFromPlanning(baseContract({ objective: "implement the feature end to end" }), planning);
+    const active = getActivePlanItem(contract)!;
+    contract = applySufficientVerdict(contract, {
+      itemId: active.id,
+      gradingMode: "conductor_direct_diff",
+      evidence: { ref: "run_1:executor", summary: "done" },
+      advance: false,
+    });
+    // Simulate status still active for multi-item, but mark verified:
+    expect(getPlanItem(contract, active.id)?.status).toBe("verified");
+
+    // Same objective re-authored on a follow-up turn (intake always re-attaches planning).
+    const again = attachOwnedPlanning("implement the feature end to end", "low");
+    const preserved = seedTaskPlanFromPlanning(contract, again);
+    expect(getPlanItem(preserved, active.id)?.status).toBe("verified");
+    expect(preserved.plan?.items).toHaveLength(contract.plan!.items.length);
+    expect(getPlanItem(preserved, active.id)?.gradingMode).toBe("conductor_direct_diff");
+  });
+
+  test("empty plan and reconstruction_required still seed", () => {
+    const empty = baseContract();
+    expect(empty.plan?.items ?? []).toHaveLength(0);
+    expect(shouldSeedTaskPlan(empty)).toBe(true);
+
+    const planning = attachOwnedPlanning("fresh objective needs a plan item now", "low");
+    const seeded = seedTaskPlanFromPlanning(empty, planning);
+    expect(seeded.plan?.items.length).toBe(1);
+
+    const needsReconstruction: TaskRunContract = {
+      ...seeded,
+      reconstruction: "reconstruction_required",
+    };
+    expect(shouldSeedTaskPlan(needsReconstruction)).toBe(true);
+    const rebuilt = seedTaskPlanFromPlanning(needsReconstruction, planning);
+    expect(rebuilt.reconstruction).toBe("none");
+    expect(rebuilt.schemaVersion).toBe(2);
+    expect(rebuilt.plan?.items[0].status).toBe("active");
+  });
+
+  test("material objective change forces reseed", () => {
+    const first = attachOwnedPlanning(
+      "implement authentication middleware with session cookies and tests",
+      "low",
+    );
+    let contract = seedTaskPlanFromPlanning(
+      baseContract({
+        objective: "implement authentication middleware with session cookies and tests",
+      }),
+      first,
+    );
+    const active = getActivePlanItem(contract)!;
+    contract = applySufficientVerdict(contract, {
+      itemId: active.id,
+      gradingMode: "conductor_direct_diff",
+      evidence: { ref: "r1", summary: "ok" },
+      advance: false,
+    });
+
+    const different = attachOwnedPlanning(
+      "rewrite the billing invoice PDF renderer for multi-currency support",
+      "low",
+    );
+    expect(isMaterialObjectiveChange(contract, different)).toBe(true);
+    const reseeds = seedTaskPlanFromPlanning(contract, different);
+    expect(reseeds.plan?.items[0].title).toMatch(/billing|invoice|currency/i);
+    expect(reseeds.plan?.items.every((i) => i.status !== "verified")).toBe(true);
+  });
+
+  test("formatConductorPlanBrief includes objective, constraints, memory, failures", () => {
+    const brief = buildConductorPlanBrief(
+      "refactor auth module",
+      "high",
+      {
+        relevant_memories: ["JWT today"],
+        failure_patterns: ["empty planner"],
+      },
+      ["keep public API"],
+    );
+    const text = formatConductorPlanBrief(brief);
+    expect(text).toContain("Objective:");
+    expect(text).toContain("refactor auth module");
+    expect(text).toContain("Constraints:");
+    expect(text).toContain("keep public API");
+    expect(text).toContain("Relevant memory:");
+    expect(text).toContain("JWT today");
+    expect(text).toContain("Failure patterns");
+    expect(text).toContain("empty planner");
   });
 });

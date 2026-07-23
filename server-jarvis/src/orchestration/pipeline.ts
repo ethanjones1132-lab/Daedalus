@@ -62,6 +62,8 @@ import { findExistingWorkspacePath } from "./workspace-affinity";
 import { join } from "path";
 import { canApplyConductorReroute, rejectReroute } from "./reroute-policy";
 import {
+  getActivePlanItem,
+  incrementPlanItemRepairCycle,
   markPlanItemBlocked,
   resolveDeepReadIntent,
   type TaskRunContract,
@@ -72,6 +74,7 @@ import {
   applyReviewerAccept,
   applySufficientVerdict,
   decideRepairChain,
+  formatConductorPlanBrief,
   mergeRepairChainIntoRemaining,
   seedTaskPlanFromPlannerProposal,
   type OwnedPlanningAttachment,
@@ -1063,9 +1066,19 @@ export class PipelineExecutor {
     const plannerPrompt = stageSystemPrompt("planner", options);
     const startTime = Date.now();
     try {
+      // planner_mediated: inject Conductor plan_brief into model messages so
+      // the planner sees objective/constraints/memory/failure patterns before
+      // proposing items (not only post-hoc for extract/validate).
+      const planBrief =
+        options.ownedPlanning?.plan_authorship === "planner_mediated"
+          ? options.ownedPlanning.plan_brief
+          : undefined;
+      const plannerUserContent = planBrief
+        ? `${formatConductorPlanBrief(planBrief)}\n\nDecompose this into concrete, ordered plan steps.`
+        : request;
       const plannerMessages = [
         { role: "system", content: plannerPrompt },
-        { role: "user", content: request },
+        { role: "user", content: plannerUserContent },
       ] as ChatMessage[];
       const plannerOptions = {
         temperature: BUILTIN_MODES.planner.temperature,
@@ -1101,7 +1114,7 @@ export class PipelineExecutor {
           agent_run_id: agentRunId,
           mode_id: "planner",
           turn_number: 1,
-          input_tokens: Math.round((plannerPrompt.length + request.length) / 4),
+          input_tokens: Math.round((plannerPrompt.length + plannerUserContent.length) / 4),
           output_tokens: 0,
           tool_calls_json: "[]",
           duration_ms: Date.now() - startTime,
@@ -1127,7 +1140,7 @@ export class PipelineExecutor {
         agent_run_id: agentRunId,
         mode_id: "planner",
         turn_number: 1,
-        input_tokens: Math.round((plannerPrompt.length + request.length) / 4),
+        input_tokens: Math.round((plannerPrompt.length + plannerUserContent.length) / 4),
         output_tokens: countTokens(narrative),
         tool_calls_json: "[]",
         duration_ms: Date.now() - startTime,
@@ -2489,6 +2502,15 @@ export class PipelineExecutor {
     return runWrittenCodeGate(toolCalls, request, planSummary, { root });
   }
 
+  /**
+   * In-loop repair owner (Task 5): Reviewer ↔ Rewriter passes for write-intent
+   * full-profile turns. Each rewriter pass MUST increment the active plan item's
+   * repairCycleCount via {@link applyInsufficientVerdict} so the ledger stays
+   * truthful. After this loop returns, the segment-level path may still inject
+   * one Executor re-entry when issues remain and the item is not backstopped —
+   * it must NOT re-fire a full Rewriter→Executor→Reviewer chain when the loop
+   * already consumed rewriter budget.
+   */
   private async runReviewerRewriterLoop(
     request: string,
     planSummary: string,
@@ -2499,7 +2521,14 @@ export class PipelineExecutor {
     options: PipelineExecuteOptions,
     profile: ExecutionProfile,
     remainingQueue: StageName[] = [],
-  ): Promise<{ reviewer: ReviewerStageOutput; rewriter?: RewriterStageOutput }> {
+  ): Promise<{
+    reviewer: ReviewerStageOutput;
+    rewriter?: RewriterStageOutput;
+    /** How many in-loop rewriter repair passes ran (ledger increments). */
+    loopRepairsUsed: number;
+    /** True when applyInsufficientVerdict blocked the active item. */
+    itemBackstopped: boolean;
+  }> {
     const reviewerPrompt = stageSystemPrompt(
       "reviewer",
       options,
@@ -2519,7 +2548,9 @@ export class PipelineExecutor {
     let reviewerOk = true;
     let rewriterOutput: RewriterStageOutput | undefined;
     let rewriterSummaryForPrompt = "No rewriting stage executed.";
-    const writeIntentForTurn = hasWriteIntent(options.rawMessage ?? request);
+    let itemBackstopped = false;
+    const writeIntentForTurn =
+      hasWriteIntent(options.rawMessage ?? request) || options.taskRunWriteIntent === true;
 
     while (hasPendingIssues) {
       reviewCount++;
@@ -2639,6 +2670,57 @@ export class PipelineExecutor {
           break;
         }
 
+        // Ledger: decide with pre-increment count, then increment when a repair
+        // pass actually runs. applyInsufficientVerdict checks post-increment
+        // (>= max → backstop), which would block the first pass when max=1 —
+        // so the loop uses decideRepairChain(current) + incrementPlanItemRepairCycle.
+        const activeForRepair = options.taskRunContract
+          ? getActivePlanItem(options.taskRunContract)
+          : undefined;
+        if (options.taskRunContract && activeForRepair) {
+          try {
+            const preCount = activeForRepair.repairCycleCount ?? 0;
+            const maxCycles = options.maxReviewRepairRounds ?? maxRepairRounds;
+            const ledgerDecision = decideRepairChain({
+              reviewerHasIssues: true,
+              writeIntent: true,
+              profile,
+              repairCycleCount: preCount,
+              maxRepairCycles: maxCycles,
+              consecutiveFailures: this.conductor?.live.getConsecutiveToolErrors?.() ?? 0,
+            });
+            if (ledgerDecision.backstop) {
+              const applied = applyInsufficientVerdict(options.taskRunContract, {
+                itemId: activeForRepair.id,
+                flaggedIssues: reviewerFeedback.slice(0, 400) || "reviewer rejected",
+                maxRepairCycles: maxCycles,
+                consecutiveFailures: this.conductor?.live.getConsecutiveToolErrors?.() ?? 0,
+              });
+              options.taskRunContract = applied.contract;
+              options.onTaskPlanUpdate?.(applied.contract);
+              this.conductor?.live.setPlanContext(applied.contract);
+              itemBackstopped = true;
+              console.warn(
+                `[Pipeline] in-loop repair backstop for ${activeForRepair.id}: ${ledgerDecision.reason}`,
+              );
+              break;
+            }
+            // Count this rewriter pass on the TaskPlan ledger.
+            options.taskRunContract = incrementPlanItemRepairCycle(
+              options.taskRunContract,
+              activeForRepair.id,
+              1,
+            );
+            options.onTaskPlanUpdate?.(options.taskRunContract);
+            this.conductor?.live.setPlanContext(options.taskRunContract);
+          } catch (e) {
+            console.warn(
+              `[Pipeline] in-loop repair ledger update failed: ` +
+              `${e instanceof Error ? e.message : String(e)}`,
+            );
+          }
+        }
+
         const beforeWrites = successfulWriteKeys([
           ...executorToolCalls,
           ...(rewriterOutput?.toolCalls ?? []),
@@ -2678,6 +2760,8 @@ export class PipelineExecutor {
     return {
       reviewer: { ok: reviewerOk, feedback: reviewerFeedback, hasIssues: this.hasIssues(reviewerFeedback) },
       rewriter: rewriterOutput,
+      loopRepairsUsed: repairs,
+      itemBackstopped,
     };
   }
 
@@ -3236,7 +3320,20 @@ export class PipelineExecutor {
         continue;
       }
       if (stage === "reviewer") {
-        const { reviewer, rewriter } = await this.runReviewerRewriterLoop(
+        // Repair ownership (Task 5 — two cooperating paths, not a third system):
+        // 1) In-loop: runReviewerRewriterLoop owns Reviewer↔Rewriter and ledger
+        //    increments (applyInsufficientVerdict) for each rewriter pass.
+        // 2) Segment-level (here): only fires when the loop did not already
+        //    handle repair, OR when Executor re-entry is still needed after the
+        //    loop exhausted rewriter-only passes. Prefer one automatic
+        //    Executor→Reviewer re-entry after in-loop rewrite when write-intent
+        //    and the item is not backstopped.
+        const {
+          reviewer,
+          rewriter,
+          loopRepairsUsed,
+          itemBackstopped,
+        } = await this.runReviewerRewriterLoop(
           request, renderPlanSummary(state.plan), renderExecutorSummary(state.executor), state.executor?.toolCalls ?? [],
           agentRunId, onStateChange, opts, profile, remainingNow(),
         );
@@ -3247,44 +3344,43 @@ export class PipelineExecutor {
             partialStage = { stage: "rewriter", errorCode: rewriter.errorCode ?? "stage_timeout" };
           }
         }
-        // Owned-runtime-loop (Task 5): on Reviewer insufficient, fire the
-        // automatic Reviewer→Rewriter→Executor chain WITHOUT a Conductor
-        // re-decision (no coordinator.route / conductor_replan). The older
-        // mid-run replan path remains only when the repair-chain backstop
-        // trips and allowMidRunReplan is still true — infrastructure may
-        // still replan after backstop, but the chain itself is deterministic.
         const writeIntentForRepair = hasWriteIntent(intentText) || options.taskRunWriteIntent === true;
         const activeItem = opts.taskRunContract?.plan
           ? opts.taskRunContract.plan.items.find(
               (i) => i.id === opts.taskRunContract?.plan?.activeItemId,
             )
           : undefined;
-        // runReviewerRewriterLoop already consumes up to maxReviewRepairRounds
-        // of Reviewer→Rewriter cycles. Count a completed rewriter pass against
-        // the same budget so we do not immediately re-enter executor/reviewer
-        // and double-run gates. Remaining budget > 0 → inject Executor (and
-        // Rewriter only if the loop skipped it) without a Conductor re-decision.
-        const loopRepairsUsed = rewriter ? 1 : 0;
+        // Ledger already reflects in-loop increments; use current count only.
         const ledgerCycles = activeItem?.repairCycleCount ?? 0;
+        const maxRepairCycles = options.maxReviewRepairRounds ?? 1;
         const repairDecision = decideRepairChain({
           reviewerHasIssues: Boolean(reviewer?.hasIssues),
           writeIntent: writeIntentForRepair,
           profile,
-          repairCycleCount: ledgerCycles + loopRepairsUsed,
-          maxRepairCycles: options.maxReviewRepairRounds ?? 1,
+          repairCycleCount: ledgerCycles,
+          maxRepairCycles,
           consecutiveFailures: this.conductor?.live.getConsecutiveToolErrors?.() ?? 0,
         });
-        if (repairDecision.fire) {
-          // Loop already ran Rewriter → only re-queue Executor then Reviewer.
-          // Loop skipped Rewriter → full Rewriter→Executor→Reviewer chain.
-          const chainStages = rewriter
-            ? (["executor", "reviewer"] as StageName[])
-            : repairDecision.stages;
+
+        // Case A: loop did not run rewriter (e.g. maxRepairRounds=0) but budget
+        // remains → full automatic Rewriter→Executor→Reviewer chain + ledger.
+        // Case B: loop already rewrote; issues remain; not backstopped → one
+        // Executor→Reviewer re-entry (do not re-increment; loop owned the cycle).
+        // Allow re-entry even when decideRepairChain would treat the completed
+        // loop cycle as at-cap — the loop already paid for that cycle.
+        const allowExecutorReentryAfterLoop =
+          Boolean(reviewer?.hasIssues)
+          && writeIntentForRepair
+          && profile === "full"
+          && !itemBackstopped
+          && loopRepairsUsed > 0
+          && ledgerCycles <= maxRepairCycles;
+
+        if (repairDecision.fire && loopRepairsUsed === 0) {
           const chainRemaining = mergeRepairChainIntoRemaining(
             remainingNow().length > 0 ? remainingNow() : (wantsSynthesizer ? ["synthesizer"] : []),
-            chainStages,
+            repairDecision.stages,
           );
-          // Mutate the segment's live queue (opts.workQueue === workQueue).
           workQueue.length = 0;
           workQueue.push(...chainRemaining);
           if (opts.taskRunContract && activeItem) {
@@ -3292,7 +3388,7 @@ export class PipelineExecutor {
               const applied = applyInsufficientVerdict(opts.taskRunContract, {
                 itemId: activeItem.id,
                 flaggedIssues: reviewer.feedback?.slice(0, 400) || "reviewer rejected",
-                maxRepairCycles: options.maxReviewRepairRounds ?? 1,
+                maxRepairCycles,
                 consecutiveFailures: this.conductor?.live.getConsecutiveToolErrors?.() ?? 0,
               });
               opts.taskRunContract = applied.contract;
@@ -3300,25 +3396,39 @@ export class PipelineExecutor {
               this.conductor?.live.setPlanContext(applied.contract);
             } catch (e) {
               console.warn(
-                `[Pipeline] repair-chain ledger update failed: ` +
+                `[Pipeline] segment repair-chain ledger update failed: ` +
                 `${e instanceof Error ? e.message : String(e)}`,
               );
             }
           }
           console.log(
-            `[Pipeline] automatic repair chain (no conductor re-decision): ${chainRemaining.join("->")}`,
+            `[Pipeline] automatic repair chain (segment-level, loop did not repair): ${chainRemaining.join("->")}`,
           );
           continue;
         }
-        // Budget already consumed by the in-loop rewriter (or backstop): fall
-        // through to synthesizer. Mid-run replan remains only for true
-        // backstop with remaining replan budget — not for ordinary exhausted
-        // repair rounds (those already applied fixes; synthesizer should speak).
+
+        if (allowExecutorReentryAfterLoop) {
+          const chainStages = ["executor", "reviewer"] as StageName[];
+          const chainRemaining = mergeRepairChainIntoRemaining(
+            remainingNow().length > 0 ? remainingNow() : (wantsSynthesizer ? ["synthesizer"] : []),
+            chainStages,
+          );
+          workQueue.length = 0;
+          workQueue.push(...chainRemaining);
+          console.log(
+            `[Pipeline] post-loop executor re-entry after in-loop rewrite ` +
+            `(ledger cycles=${ledgerCycles}): ${chainRemaining.join("->")}`,
+          );
+          continue;
+        }
+
+        // Backstop / exhausted: fall through to synthesizer. Mid-run replan
+        // remains only for true backstop with no loop repairs applied.
         const reviewerReplanEligible = writeIntentForRepair
           || (options.turnRequirement === "full_execution" && requiresWorkspaceEvidence);
         if (
           reviewer?.hasIssues &&
-          repairDecision.backstop &&
+          (repairDecision.backstop || itemBackstopped) &&
           loopRepairsUsed === 0 &&
           wantsSynthesizer &&
           options.allowMidRunReplan !== false &&

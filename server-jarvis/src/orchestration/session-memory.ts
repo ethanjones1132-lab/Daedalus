@@ -266,17 +266,22 @@ export class SessionMemory {
   }
 
   /**
-   * Owned-runtime-loop (Task 5): seed or replace the TaskPlan ledger from
-   * Coordinator intake planning. Simple path seeds immediately; complex path
-   * no-ops until planner validation calls replaceTaskPlan.
+   * Owned-runtime-loop (Task 5): seed the TaskPlan ledger from Coordinator
+   * intake planning. Simple (conductor_direct) seeds only when the ledger is
+   * empty/unusable or the objective materially changed — never clobbers
+   * verified/blocked progress on multi-turn continuation. Complex path no-ops
+   * until planner validation calls replaceTaskPlan.
    */
   applyOwnedPlanning(
     sessionId: string,
     planning: OwnedPlanningAttachment,
+    opts: { force?: boolean } = {},
   ): TaskRunContract | undefined {
     const session = this.getSession(sessionId);
     if (!session.taskRun) return undefined;
-    session.taskRun = seedTaskPlanFromPlanning(session.taskRun, planning);
+    session.taskRun = seedTaskPlanFromPlanning(session.taskRun, planning, {
+      force: opts.force,
+    });
     session.lastActiveAt = Date.now();
     this.persist(session);
     return session.taskRun;

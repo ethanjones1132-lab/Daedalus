@@ -316,17 +316,88 @@ export function conductorValidatePlanItems(
 }
 
 /**
+ * Whether intake should (re)seed the TaskPlan ledger.
+ *
+ * Seed only when:
+ * - no usable v2 plan (missing schema, reconstruction_required, empty items), OR
+ * - caller forces reseed (new task run / material objective change)
+ *
+ * Never clobber a live v2 plan on multi-turn continuation — that wipes
+ * verified / blocked / repairCycleCount progress.
+ */
+export function shouldSeedTaskPlan(
+  contract: TaskRunContract,
+  opts: { force?: boolean } = {},
+): boolean {
+  if (opts.force === true) return true;
+  if (contract.reconstruction === "reconstruction_required") return true;
+  if (contract.schemaVersion !== 2) return true;
+  const items = contract.plan?.items ?? [];
+  return items.length === 0;
+}
+
+/**
+ * Normalize objective text for coarse continuity comparison.
+ */
+function normalizeObjectiveKey(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
+}
+
+/**
+ * True when the new planning objective is materially different from the live
+ * task-run objective (fresh work, not a terse continuation cue).
+ */
+export function isMaterialObjectiveChange(
+  contract: TaskRunContract,
+  planning: OwnedPlanningAttachment,
+): boolean {
+  if (planning.plan_authorship !== "conductor_direct" || planning.plan_items.length === 0) {
+    return false;
+  }
+  const prior = normalizeObjectiveKey(contract.objective ?? "");
+  const next = normalizeObjectiveKey(
+    planning.plan_items[0]?.description
+      || planning.plan_items[0]?.title
+      || "",
+  );
+  if (!prior || !next) return false;
+  if (prior === next) return false;
+  // Terse follow-ups ("continue", "now fix the tests") still re-author a
+  // simple plan from the message — only treat as material when both sides
+  // look like real objectives and share little lexical overlap.
+  if (next.length < 24 || prior.length < 24) return false;
+  const priorTokens = new Set(prior.split(" ").filter((t) => t.length > 2));
+  const nextTokens = next.split(" ").filter((t) => t.length > 2);
+  if (nextTokens.length === 0) return false;
+  const overlap = nextTokens.filter((t) => priorTokens.has(t)).length;
+  return overlap / nextTokens.length < 0.35;
+}
+
+/**
  * Persist planning into the TaskPlan ledger (v2).
- * - conductor_direct: seeds from plan_items immediately
+ * - conductor_direct: seeds from plan_items when ledger is empty/unusable, or
+ *   when force / material objective change demands a new plan
  * - planner_mediated: only after validate; pass validated items
+ *
+ * Multi-turn: does NOT wipe verified/blocked state on continuation.
  */
 export function seedTaskPlanFromPlanning(
   contract: TaskRunContract,
   planning: OwnedPlanningAttachment,
-  opts: { activateFirst?: boolean } = {},
+  opts: { activateFirst?: boolean; force?: boolean } = {},
 ): TaskRunContract {
   if (planning.plan_authorship === "conductor_direct") {
     if (planning.plan_items.length === 0) {
+      return contract;
+    }
+    const force =
+      opts.force === true || isMaterialObjectiveChange(contract, planning);
+    if (!shouldSeedTaskPlan(contract, { force })) {
       return contract;
     }
     return setTaskPlan(contract, planning.plan_items, {
@@ -335,6 +406,32 @@ export function seedTaskPlanFromPlanning(
   }
   // Complex path: ledger stays empty until planner proposal is validated.
   return contract;
+}
+
+/**
+ * Format Conductor plan brief for injection into Planner model messages
+ * (planner_mediated path). Structured, not a full transcript dump.
+ */
+export function formatConductorPlanBrief(brief: ConductorPlanBrief): string {
+  const lines: string[] = [
+    "## Conductor plan brief",
+    `Objective: ${brief.objective}`,
+    `Estimated complexity: ${brief.estimatedComplexity}`,
+  ];
+  if (brief.constraints.length > 0) {
+    lines.push("Constraints:");
+    for (const c of brief.constraints) lines.push(`- ${c}`);
+  }
+  if (brief.relevantMemory.length > 0) {
+    lines.push("Relevant memory:");
+    for (const m of brief.relevantMemory) lines.push(`- ${m}`);
+  }
+  if (brief.failurePatterns.length > 0) {
+    lines.push("Failure patterns to avoid:");
+    for (const p of brief.failurePatterns) lines.push(`- ${p}`);
+  }
+  lines.push("", `User request: ${brief.request}`);
+  return lines.join("\n");
 }
 
 /**

@@ -722,4 +722,42 @@ describe("LiveConductor owned-runtime-loop directives (Task 5)", () => {
       expect(directive.newRemaining?.[0]).toBe("reviewer");
     }
   });
+
+  test("write-effect fence wins over escalate_reviewer when zero mutations", async () => {
+    const { conductor } = makeConductor();
+    conductor.setContext("general", "medium", "run-fence-before-escalate");
+    const planItem = {
+      id: "pi_write_first",
+      title: "Apply the change",
+      dependsOn: [] as string[],
+      acceptanceChecks: [] as Array<{ id: string; description: string }>,
+      status: "active" as const,
+      repairCycleCount: 0,
+    };
+    const directive = await conductor.afterStage(
+      "executor",
+      "completed",
+      "described the edit but did not write",
+      ["synthesizer"],
+      {
+        planItem,
+        writeIntent: true,
+        toolCalls: [
+          {
+            name: "read_file",
+            arguments: { path: "src/main.ts" },
+            output: "export const main = 1;",
+            is_error: false,
+            duration_ms: 10,
+          },
+        ],
+      },
+    );
+    // Must re-enter executor for the mutation — not jump to escalate_reviewer.
+    expect(directive.type).toBe("reroute");
+    if (directive.type === "reroute") {
+      expect(directive.newRemaining[0]).toBe("re-enter:executor");
+      expect(directive.reason).toContain("zero successful mutations");
+    }
+  });
 });

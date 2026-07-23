@@ -9,6 +9,8 @@ import {
   toolCallDisplayKey,
 } from "./session-memory";
 import type { SessionMemoryConfig } from "../config";
+import { attachOwnedPlanning, applySufficientVerdict, seedTaskPlanFromPlanning } from "./runtime-loop";
+import { getActivePlanItem, getPlanItem } from "./task-run";
 
 function makeConfig(overrides: Partial<SessionMemoryConfig> = {}): SessionMemoryConfig {
   return {
@@ -48,6 +50,34 @@ describe("session-memory", () => {
     expect(continued.depth).toBe("deep");
     expect(continued.estimatedComplexity).toBe("high");
     expect(continued.turnCount).toBe(2);
+  });
+
+  test("applyOwnedPlanning does not clobber verified plan items on continuation", () => {
+    const memory = new SessionMemory(() => makeConfig());
+    const objective = "implement the cache layer with unit tests included";
+    memory.beginTaskRun("sess-plan-preserve", {
+      message: objective,
+      requirement: "full_execution",
+      estimatedComplexity: "low",
+    });
+    const planning = attachOwnedPlanning(objective, "low");
+    let contract = memory.applyOwnedPlanning("sess-plan-preserve", planning)!;
+    expect(contract.plan?.items.length).toBe(1);
+    const active = getActivePlanItem(contract)!;
+    contract = applySufficientVerdict(contract, {
+      itemId: active.id,
+      gradingMode: "conductor_direct_diff",
+      evidence: { ref: "run:exec", summary: "written" },
+      advance: false,
+    });
+    memory.setTaskRunContract("sess-plan-preserve", contract);
+
+    // Second turn re-applies intake planning (as index.ts does every turn).
+    const again = attachOwnedPlanning(objective, "low");
+    const preserved = memory.applyOwnedPlanning("sess-plan-preserve", again)!;
+    expect(getPlanItem(preserved, active.id)?.status).toBe("verified");
+    expect(getPlanItem(preserved, active.id)?.gradingMode).toBe("conductor_direct_diff");
+    expect(preserved.plan?.items).toHaveLength(1);
   });
 
   test("persists and unions session root grants across continuation turns", () => {

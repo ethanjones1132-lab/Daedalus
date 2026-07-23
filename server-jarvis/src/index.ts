@@ -2945,9 +2945,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           estimatedComplexity: route.context.estimated_complexity,
         });
         // Owned-runtime-loop (Task 5): seed TaskPlan from intake planning.
-        // Simple (low): Conductor-authored items land immediately.
+        // Simple (low): Conductor-authored items land only when ledger is empty
+        // or unusable — never wipe verified/blocked progress on continuation.
         // Complex: brief only — ledger filled after Planner validate in pipeline.
         if (route.plan_authorship) {
+          const priorPlanItems = activeTaskRun.plan?.items?.length ?? 0;
           const seeded = sessionMemory.applyOwnedPlanning(sessionId, {
             plan_authorship: route.plan_authorship,
             plan_items: route.plan_items ?? [],
@@ -2955,10 +2957,18 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           });
           if (seeded) {
             activeTaskRun = seeded;
+            const itemCount = seeded.plan?.items.length ?? 0;
+            const preserved = route.plan_authorship === "conductor_direct"
+              && priorPlanItems > 0
+              && itemCount === priorPlanItems
+              && seeded.plan?.items.some((i) => i.status === "verified" || i.status === "blocked"
+                || (i.repairCycleCount ?? 0) > 0);
             console.log(
               `[Jarvis Orchestrator] TaskPlan ${route.plan_authorship}` +
               (route.plan_authorship === "conductor_direct"
-                ? ` seeded ${seeded.plan?.items.length ?? 0} item(s)`
+                ? (preserved
+                  ? ` preserved ${itemCount} item(s) (continuation — no reseed)`
+                  : ` seeded ${itemCount} item(s)`)
                 : " brief ready for planner"),
             );
           }
