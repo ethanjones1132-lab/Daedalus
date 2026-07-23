@@ -8,10 +8,16 @@ import type { ToolResult } from "../tool-types";
 import {
   normalizeTaskRunOnRead,
   resolveTaskRunTurn,
+  setTaskPlan,
+  type CreateTaskPlanItemInput,
   type TaskRunContract,
   type TaskRunDepth,
 } from "./task-run";
 import type { TurnRequirement } from "./turn-requirements";
+import {
+  seedTaskPlanFromPlanning,
+  type OwnedPlanningAttachment,
+} from "./runtime-loop";
 
 export interface ToolResultCacheEntry {
   key: string;
@@ -245,7 +251,7 @@ export class SessionMemory {
 
   updateTaskRun(
     sessionId: string,
-    patch: Partial<Pick<TaskRunContract, "status" | "evidenceCount" | "remainingWork" | "lastOutcome" | "lastTurnId" | "estimatedComplexity">>,
+    patch: Partial<Pick<TaskRunContract, "status" | "evidenceCount" | "remainingWork" | "lastOutcome" | "lastTurnId" | "estimatedComplexity" | "plan" | "reconstruction" | "schemaVersion">>,
   ): TaskRunContract | undefined {
     const session = this.getSession(sessionId);
     if (!session.taskRun) return undefined;
@@ -254,6 +260,46 @@ export class SessionMemory {
       ...patch,
       updatedAt: new Date().toISOString(),
     };
+    session.lastActiveAt = Date.now();
+    this.persist(session);
+    return session.taskRun;
+  }
+
+  /**
+   * Owned-runtime-loop (Task 5): seed or replace the TaskPlan ledger from
+   * Coordinator intake planning. Simple path seeds immediately; complex path
+   * no-ops until planner validation calls replaceTaskPlan.
+   */
+  applyOwnedPlanning(
+    sessionId: string,
+    planning: OwnedPlanningAttachment,
+  ): TaskRunContract | undefined {
+    const session = this.getSession(sessionId);
+    if (!session.taskRun) return undefined;
+    session.taskRun = seedTaskPlanFromPlanning(session.taskRun, planning);
+    session.lastActiveAt = Date.now();
+    this.persist(session);
+    return session.taskRun;
+  }
+
+  /** Replace the full TaskPlan ledger (planner-mediated validate, or reconstruction). */
+  replaceTaskPlan(
+    sessionId: string,
+    items: CreateTaskPlanItemInput[],
+    opts: { activateFirst?: boolean } = {},
+  ): TaskRunContract | undefined {
+    const session = this.getSession(sessionId);
+    if (!session.taskRun) return undefined;
+    session.taskRun = setTaskPlan(session.taskRun, items, opts);
+    session.lastActiveAt = Date.now();
+    this.persist(session);
+    return session.taskRun;
+  }
+
+  /** Full contract write-back after pipeline plan mutations. */
+  setTaskRunContract(sessionId: string, contract: TaskRunContract): TaskRunContract {
+    const session = this.getSession(sessionId);
+    session.taskRun = contract;
     session.lastActiveAt = Date.now();
     this.persist(session);
     return session.taskRun;

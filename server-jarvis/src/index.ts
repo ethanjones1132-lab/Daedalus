@@ -175,7 +175,13 @@ import { countTokens } from "./tokens";
 import { WorkspaceAffinityStore } from "./orchestration/workspace-affinity";
 import { createRuntimeMonitor, shouldLogRuntimePerformance } from "./performance/runtime-monitor";
 import { loadInferenceFeedback } from "./self-tuning/inference-feedback";
-import { assessTaskRunAcceptance, resolveDeepReadIntent, terminalSubtypeForRunOutcome } from "./orchestration/task-run";
+import {
+  assessTaskRunAcceptance,
+  resolveDeepReadIntent,
+  terminalSubtypeForRunOutcome,
+  type TaskRunContract,
+} from "./orchestration/task-run";
+import { attachOwnedPlanning } from "./orchestration/runtime-loop";
 import {
   INFERENCE_FEEDBACK_CRON_JOB_ID,
   refreshInferenceFeedback,
@@ -1374,7 +1380,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     : [];
   const workspaceReadScope = resolveWorkspaceReadScope(message, activeWorkspacePath);
   console.log(`[Jarvis] Active workspace session=${sessionId} path=${activeWorkspacePath}`);
-  const activeTaskRun = sessionMemory.beginTaskRun(sessionId, {
+  let activeTaskRun = sessionMemory.beginTaskRun(sessionId, {
     message,
     requirement: initialResolvedRequirement.result.requirement,
     workspacePath: activeWorkspacePath,
@@ -2857,6 +2863,22 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         }
         const coordinatorDurationMs = shortCircuit || skipAdvisoryCoordinator ? 0 : Date.now() - coordinatorStartedAt;
 
+        // Owned-runtime-loop: short-circuit / deterministic routes skip
+        // Coordinator.route, so attach planning ownership here when missing.
+        if (!route.plan_authorship) {
+          const planning = attachOwnedPlanning(
+            message,
+            route.context?.estimated_complexity ?? "low",
+            { taskType: route.task_type },
+          );
+          route = {
+            ...route,
+            plan_authorship: planning.plan_authorship,
+            plan_items: planning.plan_items,
+            plan_brief: planning.plan_brief,
+          };
+        }
+
         // T1.6: record parse_failure strike so next turn's pickFor / exclude
         // set demotes the pinned coordinator default after one strike.
         if (route.routing_parse_fallback && orchLastModel && orchLastProvider) {
@@ -2922,6 +2944,25 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         sessionMemory.updateTaskRun(sessionId, {
           estimatedComplexity: route.context.estimated_complexity,
         });
+        // Owned-runtime-loop (Task 5): seed TaskPlan from intake planning.
+        // Simple (low): Conductor-authored items land immediately.
+        // Complex: brief only — ledger filled after Planner validate in pipeline.
+        if (route.plan_authorship) {
+          const seeded = sessionMemory.applyOwnedPlanning(sessionId, {
+            plan_authorship: route.plan_authorship,
+            plan_items: route.plan_items ?? [],
+            plan_brief: route.plan_brief,
+          });
+          if (seeded) {
+            activeTaskRun = seeded;
+            console.log(
+              `[Jarvis Orchestrator] TaskPlan ${route.plan_authorship}` +
+              (route.plan_authorship === "conductor_direct"
+                ? ` seeded ${seeded.plan?.items.length ?? 0} item(s)`
+                : " brief ready for planner"),
+            );
+          }
+        }
         const forcedPipeline = (forcedDeepRead || leanContinuation) && !shortCircuit
           ? (["executor", "synthesizer"] as StageName[])
           : normalized.pipeline;
@@ -3091,6 +3132,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           route.context.estimated_complexity,
           agentRunId,
         );
+        // Bind TaskPlan ledger for per-item grading in afterStage.
+        liveConductor.setPlanContext(sessionMemory.getTaskRun(sessionId) ?? activeTaskRun);
         const executor = new PipelineExecutor(
           callModel,
           runtime,
@@ -3142,6 +3185,19 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // an implementation task keep the write contract, visibility caps,
           // and effect gate armed even though the follow-up names no mutation.
           taskRunWriteIntent: activeTaskRun.writeIntent === true,
+          // Owned-runtime-loop: TaskPlan ledger + planning ownership for this turn.
+          taskRunContract: sessionMemory.getTaskRun(sessionId) ?? activeTaskRun,
+          ownedPlanning: route.plan_authorship
+            ? {
+                plan_authorship: route.plan_authorship,
+                plan_items: route.plan_items ?? [],
+                plan_brief: route.plan_brief,
+              }
+            : undefined,
+          onTaskPlanUpdate: (contract: TaskRunContract) => {
+            sessionMemory.setTaskRunContract(sessionId, contract);
+            liveConductor.setPlanContext(contract);
+          },
           workspaceReadScope,
           turnAbort: streamAbort.signal,
           workerInstructions: instructionSelection.instructions,

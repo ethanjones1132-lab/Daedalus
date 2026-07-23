@@ -16,11 +16,49 @@ export type StageEvent =
 // Directive types emitted BY the conductor
 // ---------------------------------------------------------------------------
 
+/**
+ * Directives emitted by LiveConductor.afterStage (and owned-runtime-loop helpers).
+ *
+ * Runtime-loop extensions (Task 5):
+ * - mark_verified: item graded sufficient — ledger mark-off + advance
+ * - escalate_reviewer: local grade capacity exceeded — send to Reviewer
+ * - start_repair_chain: Reviewer insufficient — deterministic Rewriter→Executor→Reviewer
+ *   (no further Conductor re-decision between those stages)
+ * - block_item: consecutive-failure / repair-cycle backstop
+ */
 export type ConductorDirective =
   | { type: "continue" }
   | { type: "abort_stage"; stage: StageName; reason: string }
   | { type: "reroute"; newRemaining: StageName[]; reason: string }
   | { type: "inject_context"; forStage: StageName; note: string; reason: string }
+  | {
+      type: "mark_verified";
+      itemId: string;
+      evidenceRef: string;
+      evidenceSummary?: string;
+      gradingMode: "conductor_direct_diff" | "reviewer_mediated";
+      reason: string;
+    }
+  | {
+      type: "escalate_reviewer";
+      itemId?: string;
+      reason: string;
+      /** Remaining queue to place after reviewer when re-routing. */
+      newRemaining?: StageName[];
+    }
+  | {
+      type: "start_repair_chain";
+      itemId?: string;
+      reason: string;
+      flaggedIssues?: string;
+      /** Deterministic stages: rewriter → executor → reviewer [→ synthesizer…] */
+      newRemaining: StageName[];
+    }
+  | {
+      type: "block_item";
+      itemId: string;
+      reason: string;
+    }
 
 // ---------------------------------------------------------------------------
 // Internal throttle state per stage

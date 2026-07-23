@@ -3,6 +3,8 @@ import { isContinuationTurn, isTrivialConversationalTurn } from "./turn-triage";
 import { PersistentConductor, PersistentConductorError } from "./persistent-conductor";
 import { classifyTurnRequirements, type TurnRequirement } from "./turn-requirements";
 import { buildDeterministicRoute } from "./route-normalization";
+import { attachOwnedPlanning, type ConductorPlanBrief, type OwnedPlanningAttachment } from "./runtime-loop";
+import type { CreateTaskPlanItemInput } from "./task-run";
 
 export type TaskType = "code_review" | "debug" | "refactor" | "general" | "plan" | "research" | "test" | "docs";
 export type Complexity = "low" | "medium" | "high";
@@ -90,6 +92,16 @@ export interface CoordinatorResult {
   routing_parse_fallback?: boolean;
   /** True when local conductor cold/abort degraded to the deterministic route. */
   local_conductor_degraded?: boolean;
+  /**
+   * Owned-runtime-loop (Task 5): planning ownership for this request.
+   * - conductor_direct (low complexity): plan_items ready to seed TaskPlan
+   * - planner_mediated (medium/high): plan_brief for Planner; items after validate
+   */
+  plan_authorship?: OwnedPlanningAttachment["plan_authorship"];
+  /** Conductor-authored plan items (simple path) or empty until planner validates. */
+  plan_items?: CreateTaskPlanItemInput[];
+  /** Brief handed to Planner on the complex path (request + relevant memory). */
+  plan_brief?: ConductorPlanBrief;
 }
 
 export interface CoordinatorRouteOptions {
@@ -191,6 +203,10 @@ export class Coordinator {
 
     if (isTrivialConversationalTurn(raw) && !continuation) {
       const decision = { ...this.conversationalRoute(), conductor_source: "trivial" as const };
+      // Trivial turns are always low-complexity conductor_direct (single synth item).
+      const planning = attachOwnedPlanning(raw, "low", { taskType: decision.task_type });
+      decision.plan_authorship = planning.plan_authorship;
+      decision.plan_items = planning.plan_items;
       state.turns += 1;
       state.lastDecision = decision;
       return decision;
@@ -236,6 +252,25 @@ export class Coordinator {
       decision.local_conductor_degraded = true;
     }
     decision.conductor_model = response.model;
+
+    // Owned-runtime-loop (Task 5): intake complexity gate — Conductor output
+    // for a new request is a queued TaskPlan (simple: author directly; complex:
+    // brief for Planner). Continuation reuse keeps prior planning attachment
+    // when present; otherwise re-attaches from the reused route complexity.
+    if (!decision.plan_authorship) {
+      const planning = attachOwnedPlanning(
+        options.rawMessage ?? request,
+        decision.context.estimated_complexity,
+        {
+          taskType: decision.task_type,
+          memory: options.sessionMemoryHints ?? decision.shared_context,
+        },
+      );
+      decision.plan_authorship = planning.plan_authorship;
+      decision.plan_items = planning.plan_items;
+      decision.plan_brief = planning.plan_brief;
+    }
+
     state.turns += 1;
     state.lastOutcome = options.lastOutcome ?? state.lastOutcome;
     state.lastDecision = decision;

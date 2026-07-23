@@ -51,6 +51,34 @@ describe("Coordinator", () => {
     expect(calls[0][0].role).toBe("system");
     expect(calls[0][1].content).toContain("session-1");
     expect(calls[0][1].content).toContain("executor failed: API 503");
+    // Owned-runtime-loop: high complexity → planner_mediated brief, no items yet.
+    expect(result.plan_authorship).toBe("planner_mediated");
+    expect(result.plan_items).toEqual([]);
+    expect(result.plan_brief?.objective).toContain("chat stream");
+  });
+
+  test("low-complexity route attaches conductor_direct plan items", async () => {
+    const coordinator = new Coordinator(async () => ({
+      content: JSON.stringify({
+        task_type: "docs",
+        pipeline: ["executor", "synthesizer"],
+        topology: "linear",
+        context: {
+          needs_workspace_inspection: false,
+          needs_memory: false,
+          estimated_complexity: "low",
+        },
+        coordinator_rationale: "Simple docs tweak.",
+      }),
+    }));
+    const result = await coordinator.route("add one line to the README", {
+      sessionId: "session-plan-low",
+      rawMessage: "add one line to the README",
+    });
+    expect(result.plan_authorship).toBe("conductor_direct");
+    expect(result.plan_items?.length).toBe(1);
+    expect(result.plan_items?.[0].title).toMatch(/README/i);
+    expect(result.plan_brief).toBeUndefined();
   });
 
   test("falls back to a safe default route when coordinator output is unparseable", async () => {

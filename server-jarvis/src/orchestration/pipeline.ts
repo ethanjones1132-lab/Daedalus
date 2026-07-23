@@ -61,7 +61,21 @@ import { prepareToolResultForContext } from "../tool-result-truncation";
 import { findExistingWorkspacePath } from "./workspace-affinity";
 import { join } from "path";
 import { canApplyConductorReroute, rejectReroute } from "./reroute-policy";
-import { resolveDeepReadIntent, type TaskRunDepth } from "./task-run";
+import {
+  markPlanItemBlocked,
+  resolveDeepReadIntent,
+  type TaskRunContract,
+  type TaskRunDepth,
+} from "./task-run";
+import {
+  applyInsufficientVerdict,
+  applyReviewerAccept,
+  applySufficientVerdict,
+  decideRepairChain,
+  mergeRepairChainIntoRemaining,
+  seedTaskPlanFromPlannerProposal,
+  type OwnedPlanningAttachment,
+} from "./runtime-loop";
 import { resolveAllowedRoots } from "../fs-scope";
 import {
   ClaudeDelegateAvailabilityCache,
@@ -214,6 +228,16 @@ export interface PipelineExecuteOptions {
   priorToolCalls?: ToolCallRecord[];
   /** Hard user-authored least-authority contract for bounded workspace reads. */
   workspaceReadScope?: WorkspaceReadScope;
+  /**
+   * Owned-runtime-loop (Task 5): mutable TaskPlan ledger for this turn.
+   * Pipeline applies mark_verified / repair-chain / planner-seed mutations
+   * and writes back via onTaskPlanUpdate when provided.
+   */
+  taskRunContract?: TaskRunContract;
+  /** Called whenever the pipeline mutates the TaskPlan ledger. */
+  onTaskPlanUpdate?: (contract: TaskRunContract) => void;
+  /** Planning ownership metadata from Coordinator intake. */
+  ownedPlanning?: OwnedPlanningAttachment;
   /** Request-wide cancellation (Stop, disconnect, or supersession). */
   turnAbort?: AbortSignal;
 }
@@ -793,6 +817,94 @@ export class PipelineExecutor {
       }
     }
 
+    // Owned-runtime-loop (Task 5): apply ledger + queue effects for the
+    // extended directive set. Repair-chain stages are injected deterministically
+    // — no further Conductor re-decision between Rewriter and Executor.
+    if (directive.type === "mark_verified" && options.taskRunContract) {
+      try {
+        const next = applySufficientVerdict(options.taskRunContract, {
+          itemId: directive.itemId,
+          gradingMode: directive.gradingMode,
+          evidence: {
+            ref: directive.evidenceRef,
+            summary: directive.evidenceSummary,
+          },
+        });
+        options.taskRunContract = next;
+        options.onTaskPlanUpdate?.(next);
+        this.conductor?.live.setPlanContext(next);
+      } catch (e) {
+        console.warn(
+          `[Pipeline] mark_verified failed for ${directive.itemId}: ` +
+          `${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    }
+
+    if (directive.type === "start_repair_chain") {
+      if (options.taskRunContract && directive.itemId) {
+        try {
+          const { contract, decision } = applyInsufficientVerdict(options.taskRunContract, {
+            itemId: directive.itemId,
+            flaggedIssues: directive.flaggedIssues ?? directive.reason,
+            maxRepairCycles: options.maxReviewRepairRounds,
+            consecutiveFailures: this.conductor?.live.getConsecutiveToolErrors?.() ?? 0,
+          });
+          options.taskRunContract = contract;
+          options.onTaskPlanUpdate?.(contract);
+          this.conductor?.live.setPlanContext(contract);
+          if (decision.backstop) {
+            console.warn(`[Pipeline] repair-chain backstop for ${directive.itemId}: ${decision.reason}`);
+          }
+        } catch (e) {
+          console.warn(
+            `[Pipeline] start_repair_chain ledger update failed: ` +
+            `${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      }
+      if (options.workQueue && directive.newRemaining.length > 0) {
+        const requirement = options.turnRequirement ?? "full_execution";
+        const normalized = normalizeRemainingStages(directive.newRemaining, requirement, stage);
+        if (normalized) {
+          options.workQueue.length = 0;
+          options.workQueue.push(...normalized);
+          console.log(
+            `[Pipeline] automatic repair chain after ${stage} (no conductor re-decision): ` +
+            `${normalized.join("->")}`,
+          );
+        }
+      }
+    }
+
+    if (directive.type === "escalate_reviewer" && options.workQueue && directive.newRemaining) {
+      const requirement = options.turnRequirement ?? "full_execution";
+      const normalized = normalizeRemainingStages(directive.newRemaining, requirement, stage);
+      if (normalized) {
+        options.workQueue.length = 0;
+        options.workQueue.push(...normalized);
+        console.log(`[Pipeline] escalate_reviewer after ${stage}: ${normalized.join("->")}`);
+      }
+    }
+
+    if (directive.type === "block_item" && options.taskRunContract) {
+      try {
+        const next = markPlanItemBlocked(
+          options.taskRunContract,
+          directive.itemId,
+          directive.reason,
+        );
+        options.taskRunContract = next;
+        options.onTaskPlanUpdate?.(next);
+        this.conductor?.live.setPlanContext(next);
+      } catch (e) {
+        console.warn(
+          `[Pipeline] block_item failed for ${directive.itemId}: ` +
+          `${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    }
+
     // Emit even "continue" so the UI/metrics can distinguish an active
     // supervisory decision from a conductor that never ran.
     await options.onDirective?.(directive, stage);
@@ -808,13 +920,21 @@ export class PipelineExecutor {
         inject_for_stage?: string;
       }) => void;
     };
+    const remainingJson =
+      directive.type === "reroute" ||
+      directive.type === "start_repair_chain" ||
+      directive.type === "escalate_reviewer"
+        ? JSON.stringify(
+            "newRemaining" in directive ? directive.newRemaining : undefined,
+          )
+        : undefined;
     audit.recordDirective?.({
       id: `dir_${crypto.randomUUID()}`,
       agent_run_id: agentRunId,
       stage,
       directive_type: directive.type,
       reason: "reason" in directive ? directive.reason : undefined,
-      new_remaining_json: directive.type === "reroute" ? JSON.stringify(directive.newRemaining) : undefined,
+      new_remaining_json: remainingJson,
       inject_note: directive.type === "inject_context" ? directive.note : undefined,
       inject_for_stage: directive.type === "inject_context" ? directive.forStage : undefined,
     });
@@ -2984,6 +3104,32 @@ export class PipelineExecutor {
       }
       if (stage === "planner") {
         state.plan = await this.runPlannerStage(request, agentRunId, onStateChange, opts, remainingNow());
+        // Owned-runtime-loop: complex path — Conductor validates Planner
+        // decomposition and persists TaskPlan ledger before dispatch.
+        if (
+          state.plan?.ok &&
+          opts.ownedPlanning?.plan_authorship === "planner_mediated" &&
+          opts.taskRunContract
+        ) {
+          try {
+            const seeded = seedTaskPlanFromPlannerProposal(
+              opts.taskRunContract,
+              state.plan.narrative,
+              opts.ownedPlanning.plan_brief,
+            );
+            opts.taskRunContract = seeded.contract;
+            opts.onTaskPlanUpdate?.(seeded.contract);
+            this.conductor?.live.setPlanContext(seeded.contract);
+            console.log(
+              `[Pipeline] planner_mediated TaskPlan seeded (${seeded.items.length} items): ${seeded.notes}`,
+            );
+          } catch (e) {
+            console.warn(
+              `[Pipeline] planner_mediated TaskPlan seed failed: ` +
+              `${e instanceof Error ? e.message : String(e)}`,
+            );
+          }
+        }
         continue;
       }
       if (stage === "executor") {
@@ -3101,25 +3247,112 @@ export class PipelineExecutor {
             partialStage = { stage: "rewriter", errorCode: rewriter.errorCode ?? "stage_timeout" };
           }
         }
-        // T2.4: reviewer reject with repairs exhausted on a write-intent turn → replan.
-        // Read-intent turns legitimately skip the rewriter (see pipeline-context test)
-        // and must fall through to synthesizer.
-        const reviewerReplanEligible = hasWriteIntent(intentText)
+        // Owned-runtime-loop (Task 5): on Reviewer insufficient, fire the
+        // automatic Reviewer→Rewriter→Executor chain WITHOUT a Conductor
+        // re-decision (no coordinator.route / conductor_replan). The older
+        // mid-run replan path remains only when the repair-chain backstop
+        // trips and allowMidRunReplan is still true — infrastructure may
+        // still replan after backstop, but the chain itself is deterministic.
+        const writeIntentForRepair = hasWriteIntent(intentText) || options.taskRunWriteIntent === true;
+        const activeItem = opts.taskRunContract?.plan
+          ? opts.taskRunContract.plan.items.find(
+              (i) => i.id === opts.taskRunContract?.plan?.activeItemId,
+            )
+          : undefined;
+        // runReviewerRewriterLoop already consumes up to maxReviewRepairRounds
+        // of Reviewer→Rewriter cycles. Count a completed rewriter pass against
+        // the same budget so we do not immediately re-enter executor/reviewer
+        // and double-run gates. Remaining budget > 0 → inject Executor (and
+        // Rewriter only if the loop skipped it) without a Conductor re-decision.
+        const loopRepairsUsed = rewriter ? 1 : 0;
+        const ledgerCycles = activeItem?.repairCycleCount ?? 0;
+        const repairDecision = decideRepairChain({
+          reviewerHasIssues: Boolean(reviewer?.hasIssues),
+          writeIntent: writeIntentForRepair,
+          profile,
+          repairCycleCount: ledgerCycles + loopRepairsUsed,
+          maxRepairCycles: options.maxReviewRepairRounds ?? 1,
+          consecutiveFailures: this.conductor?.live.getConsecutiveToolErrors?.() ?? 0,
+        });
+        if (repairDecision.fire) {
+          // Loop already ran Rewriter → only re-queue Executor then Reviewer.
+          // Loop skipped Rewriter → full Rewriter→Executor→Reviewer chain.
+          const chainStages = rewriter
+            ? (["executor", "reviewer"] as StageName[])
+            : repairDecision.stages;
+          const chainRemaining = mergeRepairChainIntoRemaining(
+            remainingNow().length > 0 ? remainingNow() : (wantsSynthesizer ? ["synthesizer"] : []),
+            chainStages,
+          );
+          // Mutate the segment's live queue (opts.workQueue === workQueue).
+          workQueue.length = 0;
+          workQueue.push(...chainRemaining);
+          if (opts.taskRunContract && activeItem) {
+            try {
+              const applied = applyInsufficientVerdict(opts.taskRunContract, {
+                itemId: activeItem.id,
+                flaggedIssues: reviewer.feedback?.slice(0, 400) || "reviewer rejected",
+                maxRepairCycles: options.maxReviewRepairRounds ?? 1,
+                consecutiveFailures: this.conductor?.live.getConsecutiveToolErrors?.() ?? 0,
+              });
+              opts.taskRunContract = applied.contract;
+              opts.onTaskPlanUpdate?.(applied.contract);
+              this.conductor?.live.setPlanContext(applied.contract);
+            } catch (e) {
+              console.warn(
+                `[Pipeline] repair-chain ledger update failed: ` +
+                `${e instanceof Error ? e.message : String(e)}`,
+              );
+            }
+          }
+          console.log(
+            `[Pipeline] automatic repair chain (no conductor re-decision): ${chainRemaining.join("->")}`,
+          );
+          continue;
+        }
+        // Budget already consumed by the in-loop rewriter (or backstop): fall
+        // through to synthesizer. Mid-run replan remains only for true
+        // backstop with remaining replan budget — not for ordinary exhausted
+        // repair rounds (those already applied fixes; synthesizer should speak).
+        const reviewerReplanEligible = writeIntentForRepair
           || (options.turnRequirement === "full_execution" && requiresWorkspaceEvidence);
         if (
           reviewer?.hasIssues &&
+          repairDecision.backstop &&
+          loopRepairsUsed === 0 &&
           wantsSynthesizer &&
           options.allowMidRunReplan !== false &&
           profile === "full" &&
-          reviewerReplanEligible &&
-          (!rewriter || rewriter.ok) &&
-          (options.maxReviewRepairRounds ?? 1) > 0
+          reviewerReplanEligible
         ) {
           replanRequested = {
             trigger: "reviewer_reject",
             detail: reviewer.feedback?.slice(0, 400) || "reviewer rejected",
           };
           return { state, replanRequested, partialStage };
+        }
+        // Reviewer accept with active plan item → mark verified (reviewer_mediated).
+        if (
+          reviewer &&
+          !reviewer.hasIssues &&
+          reviewer.ok &&
+          opts.taskRunContract &&
+          activeItem
+        ) {
+          try {
+            const next = applyReviewerAccept(opts.taskRunContract, activeItem.id, {
+              ref: `${agentRunId}:reviewer:${activeItem.id}`,
+              summary: reviewer.feedback?.slice(0, 240),
+            });
+            opts.taskRunContract = next;
+            opts.onTaskPlanUpdate?.(next);
+            this.conductor?.live.setPlanContext(next);
+          } catch (e) {
+            console.warn(
+              `[Pipeline] reviewer accept mark-verified failed: ` +
+              `${e instanceof Error ? e.message : String(e)}`,
+            );
+          }
         }
         continue;
       }

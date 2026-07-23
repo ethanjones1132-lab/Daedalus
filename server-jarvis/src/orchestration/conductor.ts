@@ -1,7 +1,7 @@
 import { loadPrompt } from "./prompt-loader";
 import { ConductorBus, type ConductorDirective, type StageEvent } from "./conductor-bus";
 import { extractJson } from "./json";
-import type { CallModelFn } from "./coordinator";
+import type { CallModelFn, Complexity } from "./coordinator";
 import { AgentPool } from "./agent-pool";
 import type { StageName } from "./coordinator";
 import type { EvidenceAssessment } from "./evidence-sufficiency";
@@ -9,6 +9,19 @@ import { assessWorkspaceEvidence, isDeepReadRequest } from "./evidence-sufficien
 import { EVIDENCE_CAPABLE_STAGES } from "./reroute-policy";
 import { WRITE_EFFECT_TOOLS } from "./effect-gate";
 import type { ToolCallRecord } from "./stage-output";
+import type { TaskPlanItem, TaskRunContract } from "./task-run";
+import { getActivePlanItem } from "./task-run";
+import {
+  buildAutomaticRepairChainStages,
+  decideRepairChain,
+  gradeViaDirectDiff,
+  mergeRepairChainIntoRemaining,
+  reviewerFeedbackIsInsufficient,
+  shouldEscalateToReviewer,
+  DEFAULT_MAX_CONSECUTIVE_FAILURES,
+  DEFAULT_MAX_REPAIR_CYCLES,
+} from "./runtime-loop";
+import { parseReviewerVerdict } from "./stage-output";
 
 export interface ConductorStageEvidence {
   toolCalls?: ToolCallRecord[];
@@ -24,6 +37,15 @@ export interface ConductorStageEvidence {
    * directive in the incident DB was "continue").
    */
   writeIntent?: boolean;
+  /**
+   * Owned-runtime-loop: active plan item id for per-item grading. When set
+   * with planItem (or resolved via setPlanContext), afterStage can emit
+   * mark_verified / escalate_reviewer / start_repair_chain.
+   */
+  planItemId?: string;
+  planItem?: TaskPlanItem;
+  /** Evidence pointer ref when marking verified (defaults to runId:stage). */
+  evidenceRef?: string;
 }
 
 interface SupervisionDigest {
@@ -76,6 +98,7 @@ export interface SupervisionAttribution {
 export class LiveConductor {
   private supervision: "on" | "off" = "on";
   private taskType = "general";
+  private complexity: Complexity = "medium";
   private consecutiveToolErrors = 0;
   private recentToolErrors: string[] = [];
   private runId = "";
@@ -84,6 +107,10 @@ export class LiveConductor {
   private writeEffectRerouteUsed = false;
   /** F7: per-run supervision inference counter (reset in setContext). */
   private supervisionCallsUsed = 0;
+  /** Owned-runtime-loop: optional TaskPlan contract for per-item grading. */
+  private planContract: TaskRunContract | undefined;
+  /** Max repair cycles per item (from cfg or default). */
+  private maxRepairCycles = DEFAULT_MAX_REPAIR_CYCLES;
 
   constructor(
     private callModel: CallModelFn,
@@ -93,20 +120,44 @@ export class LiveConductor {
       supervision_timeout_ms: number;
       max_tool_errors_before_reroute: number;
       supervise_low_complexity: boolean;
+      /** Optional override for automatic repair-chain cycles. */
+      max_repair_cycles?: number;
     },
     /** Local supervisor path; defaults to callModel for backwards compatibility. */
     private supervisorModel: CallModelFn = callModel,
     /** F7/F10a: optional attribution sink for conductor_supervision rows. */
     private onSupervisionAttributed?: (row: SupervisionAttribution) => void,
-  ) {}
+  ) {
+    if (typeof cfg.max_repair_cycles === "number" && Number.isFinite(cfg.max_repair_cycles)) {
+      this.maxRepairCycles = Math.max(0, Math.floor(cfg.max_repair_cycles));
+    }
+  }
 
   setContext(taskType: string, complexity: "low" | "medium" | "high", runId: string): void {
     this.taskType = taskType;
+    this.complexity = complexity;
     this.runId = runId;
     this.deepReadEvidenceRerouteUsed = false;
     this.writeEffectRerouteUsed = false;
     this.supervisionCallsUsed = 0;
     this.supervision = !this.cfg.supervise_low_complexity && complexity === "low" ? "off" : "on";
+  }
+
+  /**
+   * Bind the current TaskPlan ledger for per-item grading in afterStage.
+   * Pass undefined to clear (e.g. end of turn).
+   */
+  setPlanContext(contract: TaskRunContract | undefined): void {
+    this.planContract = contract;
+  }
+
+  getPlanContext(): TaskRunContract | undefined {
+    return this.planContract;
+  }
+
+  /** Expose consecutive tool-error count for runtime-loop backstop reuse. */
+  getConsecutiveToolErrors(): number {
+    return this.consecutiveToolErrors;
   }
 
   // Called from the executor/rewriter tool loop for each tool result
@@ -132,6 +183,8 @@ export class LiveConductor {
     try {
       // Cheap heuristic pre-filter: if tool errors hit threshold, reroute immediately
       // without spending a supervisory inference call.
+      // Reuses consecutiveToolErrors as the sole no-progress / backstop signal
+      // (owned-runtime-loop model §9 — do not invent a parallel counter).
       if (this.cfg.max_tool_errors_before_reroute > 0 && this.consecutiveToolErrors >= this.cfg.max_tool_errors_before_reroute) {
         this.consecutiveToolErrors = 0;
         this.recentToolErrors = [];
@@ -141,6 +194,12 @@ export class LiveConductor {
           reason: "consecutive tool errors reached threshold — re-entering planner",
         };
       }
+
+      // Owned-runtime-loop: per-item completion / repair directives (deterministic
+      // first — no supervisory model call). Extends directive set; does not replace
+      // existing evidence fences or supervision below.
+      const runtimeDirective = this.runtimeLoopDirective(stage, outcome, output, remainingQueue, evidence);
+      if (runtimeDirective) return runtimeDirective;
 
       // F1: only evidence-capable stages get a workspace-evidence rubric.
       // Planner/reviewer/synthesizer digests must not claim "sufficient:false".
@@ -236,6 +295,137 @@ export class LiveConductor {
     } catch {
       return { type: "continue" };
     }
+  }
+
+  /**
+   * Owned-runtime-loop verdict path (Task 5).
+   * - Executor completed + low complexity → direct-diff grade → mark_verified or continue
+   * - Executor completed + medium/high (or reviewer_pass checks) → escalate_reviewer
+   * - Reviewer completed + accept → mark_verified (reviewer_mediated)
+   * - Reviewer completed + insufficient → start_repair_chain (deterministic; no model)
+   * - Backstop via consecutiveToolErrors / repairCycleCount → block_item
+   *
+   * Returns null when the runtime-loop has nothing to say (fall through to
+   * existing evidence fences + supervision).
+   */
+  private runtimeLoopDirective(
+    stage: StageName,
+    outcome: "completed" | "failed",
+    output: string,
+    remainingQueue: StageName[],
+    evidence: ConductorStageEvidence,
+  ): ConductorDirective | null {
+    const item = this.resolvePlanItem(evidence);
+    if (!item) return null;
+
+    // --- Reviewer stage: accept → verify; insufficient → automatic repair chain ---
+    if (stage === "reviewer" && outcome === "completed") {
+      const insufficient = reviewerFeedbackIsInsufficient(output);
+      if (!insufficient) {
+        const verdict = parseReviewerVerdict(output);
+        if (verdict === "accept" || !this.hasIssuesHeuristic(output)) {
+          return {
+            type: "mark_verified",
+            itemId: item.id,
+            evidenceRef: evidence.evidenceRef ?? `${this.runId || "run"}:reviewer:${item.id}`,
+            evidenceSummary: output.slice(0, 240),
+            gradingMode: "reviewer_mediated",
+            reason: "reviewer accepted — mark verified and advance",
+          };
+        }
+      }
+
+      const decision = decideRepairChain({
+        reviewerHasIssues: true,
+        writeIntent: evidence.writeIntent === true,
+        repairCycleCount: item.repairCycleCount,
+        maxRepairCycles: this.maxRepairCycles,
+        consecutiveFailures: this.consecutiveToolErrors,
+        maxConsecutiveFailures:
+          this.cfg.max_tool_errors_before_reroute > 0
+            ? this.cfg.max_tool_errors_before_reroute
+            : DEFAULT_MAX_CONSECUTIVE_FAILURES,
+      });
+
+      if (decision.backstop) {
+        return {
+          type: "block_item",
+          itemId: item.id,
+          reason: decision.reason,
+        };
+      }
+      if (decision.fire) {
+        return {
+          type: "start_repair_chain",
+          itemId: item.id,
+          reason: decision.reason,
+          flaggedIssues: output.slice(0, 400),
+          newRemaining: mergeRepairChainIntoRemaining(
+            remainingQueue,
+            buildAutomaticRepairChainStages(),
+          ),
+        };
+      }
+      return null;
+    }
+
+    // --- Executor stage: direct-diff grade or escalate to reviewer ---
+    if (stage === "executor" && outcome === "completed") {
+      const localGrade = gradeViaDirectDiff({
+        item,
+        output,
+        toolCalls: evidence.toolCalls,
+        writeIntent: evidence.writeIntent,
+      });
+
+      if (
+        shouldEscalateToReviewer({
+          complexity: this.complexity,
+          item,
+          localGrade,
+        })
+      ) {
+        // Only emit escalate when reviewer is not already queued (avoid noise).
+        if (!remainingQueue.includes("reviewer")) {
+          return {
+            type: "escalate_reviewer",
+            itemId: item.id,
+            reason: localGrade.sufficient
+              ? `complexity=${this.complexity} requires reviewer mediation`
+              : localGrade.reason,
+            newRemaining: ["reviewer", ...remainingQueue.filter((s) => s !== "reviewer")],
+          };
+        }
+        return null;
+      }
+
+      if (localGrade.sufficient) {
+        return {
+          type: "mark_verified",
+          itemId: item.id,
+          evidenceRef: evidence.evidenceRef ?? `${this.runId || "run"}:executor:${item.id}`,
+          evidenceSummary: localGrade.reason,
+          gradingMode: "conductor_direct_diff",
+          reason: localGrade.reason,
+        };
+      }
+    }
+
+    return null;
+  }
+
+  private resolvePlanItem(evidence: ConductorStageEvidence): TaskPlanItem | undefined {
+    if (evidence.planItem) return evidence.planItem;
+    if (evidence.planItemId && this.planContract?.plan) {
+      return this.planContract.plan.items.find((i) => i.id === evidence.planItemId);
+    }
+    if (this.planContract) return getActivePlanItem(this.planContract);
+    return undefined;
+  }
+
+  private hasIssuesHeuristic(reviewText: string): boolean {
+    const normalized = reviewText.toUpperCase();
+    return normalized.includes("PARTIAL") || normalized.includes("MISSING");
   }
 
   private async supervise(digest: SupervisionDigest): Promise<ConductorDirective> {

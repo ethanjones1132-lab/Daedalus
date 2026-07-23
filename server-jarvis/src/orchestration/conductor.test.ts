@@ -538,3 +538,188 @@ describe("LiveConductor write-effect fence", () => {
     expect(directive).toEqual({ type: "continue" });
   });
 });
+
+describe("LiveConductor owned-runtime-loop directives (Task 5)", () => {
+  test("low-complexity executor with write evidence emits mark_verified", async () => {
+    const supervisorCalls: unknown[] = [];
+    const { conductor } = makeConductor({}, async (messages) => {
+      supervisorCalls.push(messages);
+      return { content: '{"directive":"continue"}' };
+    });
+    conductor.setContext("general", "low", "run-mark-verified");
+    const planItem = {
+      id: "pi_main",
+      title: "Write helper",
+      dependsOn: [] as string[],
+      acceptanceChecks: [
+        { id: "ac", description: "file written", kind: "diff_match" as const },
+      ],
+      status: "active" as const,
+      repairCycleCount: 0,
+    };
+    const directive = await conductor.afterStage(
+      "executor",
+      "completed",
+      "Applied write to helper.ts",
+      ["synthesizer"],
+      {
+        planItem,
+        writeIntent: true,
+        toolCalls: [
+          {
+            name: "write_file",
+            arguments: { path: "helper.ts" },
+            output: "ok",
+            is_error: false,
+            duration_ms: 5,
+          },
+        ],
+      },
+    );
+    expect(directive.type).toBe("mark_verified");
+    if (directive.type === "mark_verified") {
+      expect(directive.itemId).toBe("pi_main");
+      expect(directive.gradingMode).toBe("conductor_direct_diff");
+    }
+    // Deterministic grade — no supervisory model call.
+    expect(supervisorCalls.length).toBe(0);
+  });
+
+  test("reviewer REJECT fires start_repair_chain without Conductor re-decision", async () => {
+    const supervisorCalls: unknown[] = [];
+    const { conductor } = makeConductor({}, async (messages) => {
+      supervisorCalls.push(messages);
+      return { content: '{"directive":"continue"}' };
+    });
+    conductor.setContext("general", "medium", "run-repair-chain");
+    const planItem = {
+      id: "pi_fix",
+      title: "Fix bug",
+      dependsOn: [] as string[],
+      acceptanceChecks: [] as Array<{ id: string; description: string }>,
+      status: "active" as const,
+      repairCycleCount: 0,
+    };
+    const directive = await conductor.afterStage(
+      "reviewer",
+      "completed",
+      "REJECT — missing error handling on the write path",
+      ["synthesizer"],
+      { planItem, writeIntent: true },
+    );
+    expect(directive.type).toBe("start_repair_chain");
+    if (directive.type === "start_repair_chain") {
+      expect(directive.newRemaining).toEqual([
+        "rewriter",
+        "executor",
+        "reviewer",
+        "synthesizer",
+      ]);
+      expect(directive.reason).toMatch(/automatic/i);
+    }
+    expect(supervisorCalls.length).toBe(0);
+  });
+
+  test("reviewer ACCEPT emits mark_verified with reviewer_mediated", async () => {
+    const { conductor } = makeConductor();
+    conductor.setContext("general", "medium", "run-reviewer-accept");
+    const planItem = {
+      id: "pi_ok",
+      title: "Done item",
+      dependsOn: [] as string[],
+      acceptanceChecks: [] as Array<{ id: string; description: string }>,
+      status: "active" as const,
+      repairCycleCount: 1,
+    };
+    const directive = await conductor.afterStage(
+      "reviewer",
+      "completed",
+      "ACCEPT — all acceptance checks met",
+      ["synthesizer"],
+      { planItem },
+    );
+    expect(directive.type).toBe("mark_verified");
+    if (directive.type === "mark_verified") {
+      expect(directive.gradingMode).toBe("reviewer_mediated");
+      expect(directive.itemId).toBe("pi_ok");
+    }
+  });
+
+  test("repair-cycle backstop emits block_item", async () => {
+    const { conductor } = makeConductor({ max_tool_errors_before_reroute: 3 }, async () => ({
+      content: '{"directive":"continue"}',
+    }));
+    // max_repair_cycles is on cfg — set via constructor override by recreating
+    const bus = (await import("./conductor-bus")).ConductorBus;
+    const { AgentPool, DEFAULT_ORCHESTRATOR_AGENTS } = await import("./agent-pool");
+    const { LiveConductor } = await import("./conductor");
+    const limited = new LiveConductor(
+      async () => ({ content: '{"directive":"continue"}' }),
+      new bus(),
+      new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS),
+      {
+        supervision_timeout_ms: 1000,
+        max_tool_errors_before_reroute: 3,
+        supervise_low_complexity: true,
+        max_repair_cycles: 1,
+      },
+    );
+    limited.setContext("general", "high", "run-backstop");
+    const planItem = {
+      id: "pi_stuck",
+      title: "Stuck item",
+      dependsOn: [] as string[],
+      acceptanceChecks: [] as Array<{ id: string; description: string }>,
+      status: "active" as const,
+      repairCycleCount: 1, // already at max
+    };
+    const directive = await limited.afterStage(
+      "reviewer",
+      "completed",
+      "REJECT — still broken",
+      ["synthesizer"],
+      { planItem, writeIntent: true },
+    );
+    expect(directive.type).toBe("block_item");
+    if (directive.type === "block_item") {
+      expect(directive.itemId).toBe("pi_stuck");
+      expect(directive.reason).toMatch(/backstop/);
+    }
+  });
+
+  test("medium complexity executor without reviewer in queue escalates", async () => {
+    const { conductor } = makeConductor();
+    conductor.setContext("general", "medium", "run-escalate");
+    const planItem = {
+      id: "pi_complex",
+      title: "Complex change",
+      dependsOn: [] as string[],
+      acceptanceChecks: [] as Array<{ id: string; description: string }>,
+      status: "active" as const,
+      repairCycleCount: 0,
+    };
+    const directive = await conductor.afterStage(
+      "executor",
+      "completed",
+      "made changes",
+      ["synthesizer"],
+      {
+        planItem,
+        writeIntent: true,
+        toolCalls: [
+          {
+            name: "write_file",
+            arguments: { path: "x.ts" },
+            output: "ok",
+            is_error: false,
+            duration_ms: 3,
+          },
+        ],
+      },
+    );
+    expect(directive.type).toBe("escalate_reviewer");
+    if (directive.type === "escalate_reviewer") {
+      expect(directive.newRemaining?.[0]).toBe("reviewer");
+    }
+  });
+});
