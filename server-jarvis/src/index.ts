@@ -4827,7 +4827,13 @@ export async function baseFetch(req: Request): Promise<Response> {
       }
       let conductor_health: Awaited<ReturnType<typeof persistentConductor.describeHealth>> | undefined;
       try {
-        conductor_health = await persistentConductor.describeHealth();
+        // Task 8: wire TaskPlan ledger (most recent active session task),
+        // Claude-CLI delegate backend, and policy staging into conductor health.
+        const activeTask = sessionMemory.getMostRecentActiveTaskRun();
+        conductor_health = await persistentConductor.describeHealth({
+          taskRun: activeTask?.taskRun,
+          sessionId: activeTask?.sessionId,
+        });
       } catch { /* leave undefined */ }
       return Response.json({
         ok: true,

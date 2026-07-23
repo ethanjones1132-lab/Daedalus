@@ -514,6 +514,28 @@ export class SessionMemory {
     return this.sessions.get(sessionId);
   }
 
+  /**
+   * Task 8 telemetry: most recently active non-terminal TaskRun across
+   * in-memory sessions. Used by `/health` conductor surface when no
+   * request-scoped session is available. Returns null when nothing is live.
+   */
+  getMostRecentActiveTaskRun(): { sessionId: string; taskRun: TaskRunContract } | null {
+    let best: { sessionId: string; taskRun: TaskRunContract; lastActiveAt: number } | null = null;
+    for (const session of this.sessions.values()) {
+      const taskRun = session.taskRun;
+      if (!taskRun) continue;
+      if (["completed", "failed", "cancelled"].includes(taskRun.status)) continue;
+      if (!best || session.lastActiveAt > best.lastActiveAt) {
+        best = {
+          sessionId: session.sessionId,
+          taskRun,
+          lastActiveAt: session.lastActiveAt,
+        };
+      }
+    }
+    return best ? { sessionId: best.sessionId, taskRun: best.taskRun } : null;
+  }
+
   private recordFailure(session: SessionMemoryState, pattern: string, source?: string): void {
     const existing = session.failureHistory.find((f) => f.pattern === pattern);
     if (existing) {

@@ -52,6 +52,34 @@ describe("session-memory", () => {
     expect(continued.turnCount).toBe(2);
   });
 
+  test("getMostRecentActiveTaskRun returns the newest non-terminal task", () => {
+    const memory = new SessionMemory(() => makeConfig());
+    memory.beginTaskRun("sess-old", {
+      message: "old active task",
+      requirement: "full_execution",
+      estimatedComplexity: "low",
+    });
+    // Force older timestamp so the second session wins.
+    const old = memory.getSessionState("sess-old")!;
+    old.lastActiveAt = Date.now() - 10_000;
+
+    memory.beginTaskRun("sess-new", {
+      message: "newer active task about the orchestrator",
+      requirement: "full_execution",
+      estimatedComplexity: "medium",
+    });
+    memory.updateTaskRun("sess-old", { status: "completed" });
+
+    const active = memory.getMostRecentActiveTaskRun();
+    expect(active).not.toBeNull();
+    expect(active!.sessionId).toBe("sess-new");
+    expect(active!.taskRun.status).toBe("active");
+    expect(active!.taskRun.objective).toContain("newer active task");
+
+    memory.updateTaskRun("sess-new", { status: "completed" });
+    expect(memory.getMostRecentActiveTaskRun()).toBeNull();
+  });
+
   test("applyOwnedPlanning does not clobber verified plan items on continuation", () => {
     const memory = new SessionMemory(() => makeConfig());
     const objective = "implement the cache layer with unit tests included";

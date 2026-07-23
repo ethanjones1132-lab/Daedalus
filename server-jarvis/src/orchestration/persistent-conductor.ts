@@ -5,9 +5,21 @@ import { loadPrompt } from "./prompt-loader";
 import type { ChatMessage, SharedContextHints } from "./coordinator";
 import type { ConductorConfig, JarvisConfig } from "../config";
 import { SESSIONS_DIR } from "../config";
+import {
+  resolveClaudeCliLaunchOptions,
+  type ClaudeCliAuthMode,
+} from "../claude-cli";
 import { checkOllamaHealth, ollamaBaseUrlCandidates } from "../ollama";
 import { resolveSkillsForConductor } from "../intelligence/skill-resolver";
 import { SelfTuningStore, type ConductorOutcomeSummary } from "../self-tuning/store";
+import { getPolicyVersionStore } from "../self-tuning/policy-staging";
+import {
+  getActivePlanItem,
+  type TaskPlanGradingMode,
+  type TaskPlanItemStatus,
+  type TaskRunContract,
+  type TaskRunStatus,
+} from "./task-run";
 import {
   CONDUCTOR_DIRECTIVE_JSON_SCHEMA,
   COORDINATOR_ROUTE_JSON_SCHEMA,
@@ -70,6 +82,193 @@ export interface PersistentConductorErrorOptions {
   status?: number;
   retryable?: boolean;
   code?: string;
+}
+
+/**
+ * Optional context for {@link PersistentConductor.describeHealth}.
+ * Task-plan fields come from SessionMemory (or a bound plan contract);
+ * when omitted, ledger fields are null.
+ */
+export interface DescribeHealthOptions {
+  taskRun?: TaskRunContract | null;
+  sessionId?: string | null;
+}
+
+/**
+ * Structured conductor / orchestration health for `/health`, logs, and SSE.
+ * Extends the original T1.7 shape with TaskPlan ledger, Claude-CLI delegate
+ * backend, and policy-staging version — all snake_case.
+ */
+export interface ConductorHealthSnapshot {
+  enabled: boolean;
+  available: boolean;
+  fallback_to_api: boolean;
+  model: string;
+  fallback_model: string;
+  reason?: string;
+  supervision_warning?: string;
+
+  /** Active TaskRun id, or null when no non-terminal task is in view. */
+  active_task_run_id: string | null;
+  active_task_session_id: string | null;
+  active_task_status: TaskRunStatus | null;
+  active_task_objective: string | null;
+  /** Currently active TaskPlan item (Task 6 ledger). */
+  active_plan_item_id: string | null;
+  active_plan_item_title: string | null;
+  active_plan_item_status: TaskPlanItemStatus | null;
+  /**
+   * Grading path for the active item:
+   * conductor_direct_diff vs reviewer_mediated (null when no active item).
+   */
+  grading_mode: TaskPlanGradingMode | null;
+  /**
+   * Repair-cycle count on the active item (Reviewer→Rewriter→Executor chain).
+   * null when no active item.
+   */
+  repair_cycle_count: number | null;
+
+  /**
+   * Effective Claude CLI delegate backend in use:
+   * proxy | subscription | opencode_go (Anthropic-native OpenCode Go).
+   */
+  delegate_backend: ClaudeCliAuthMode;
+  /** Configured claude_cli.auth_mode before model-based opencode_go projection. */
+  delegate_auth_mode: "proxy" | "subscription";
+  delegate_model: string | null;
+
+  /** Production policy version number (Task 7), null when none staged. */
+  policy_version: number | null;
+  policy_version_id: string | null;
+  policy_stage: string | null;
+  policy_canary_id: string | null;
+  policy_canary_version: number | null;
+  policy_lkg_id: string | null;
+  policy_candidate_id: string | null;
+}
+
+/** Null ledger fields used when no active task is available. */
+export function emptyTaskPlanHealthFields(): Pick<
+  ConductorHealthSnapshot,
+  | "active_task_run_id"
+  | "active_task_session_id"
+  | "active_task_status"
+  | "active_task_objective"
+  | "active_plan_item_id"
+  | "active_plan_item_title"
+  | "active_plan_item_status"
+  | "grading_mode"
+  | "repair_cycle_count"
+> {
+  return {
+    active_task_run_id: null,
+    active_task_session_id: null,
+    active_task_status: null,
+    active_task_objective: null,
+    active_plan_item_id: null,
+    active_plan_item_title: null,
+    active_plan_item_status: null,
+    grading_mode: null,
+    repair_cycle_count: null,
+  };
+}
+
+/**
+ * Infer which grading path is currently active for a plan item.
+ * Prefer an explicit gradingMode (set on verify); otherwise repair cycles and
+ * acceptance checks imply reviewer mediation; low complexity defaults to
+ * conductor-direct.
+ */
+export function resolveActiveGradingMode(
+  item: {
+    gradingMode?: TaskPlanGradingMode;
+    repairCycleCount?: number;
+    acceptanceChecks?: Array<{ kind?: string }>;
+  },
+  estimatedComplexity?: "low" | "medium" | "high",
+): TaskPlanGradingMode {
+  if (item.gradingMode) return item.gradingMode;
+  if ((item.repairCycleCount ?? 0) > 0) return "reviewer_mediated";
+  if (item.acceptanceChecks?.some((c) => c.kind === "reviewer_pass")) {
+    return "reviewer_mediated";
+  }
+  if (estimatedComplexity === "medium" || estimatedComplexity === "high") {
+    return "reviewer_mediated";
+  }
+  return "conductor_direct_diff";
+}
+
+/**
+ * Pure TaskPlan ledger slice for the health surface.
+ * Graceful nulls when no active / non-terminal task is provided.
+ */
+export function taskPlanHealthFields(
+  taskRun?: TaskRunContract | null,
+  sessionId?: string | null,
+): ReturnType<typeof emptyTaskPlanHealthFields> {
+  if (!taskRun) return emptyTaskPlanHealthFields();
+  if (["completed", "failed", "cancelled"].includes(taskRun.status)) {
+    return emptyTaskPlanHealthFields();
+  }
+
+  const active = getActivePlanItem(taskRun);
+  return {
+    active_task_run_id: taskRun.taskRunId,
+    active_task_session_id: sessionId ?? taskRun.sessionId ?? null,
+    active_task_status: taskRun.status,
+    active_task_objective: taskRun.objective || null,
+    active_plan_item_id: active?.id ?? taskRun.plan?.activeItemId ?? null,
+    active_plan_item_title: active?.title ?? null,
+    active_plan_item_status: active?.status ?? null,
+    grading_mode: active
+      ? resolveActiveGradingMode(active, taskRun.estimatedComplexity)
+      : null,
+    repair_cycle_count: active ? (active.repairCycleCount ?? 0) : null,
+  };
+}
+
+/** Policy staging (Task 7) fields for the health surface. */
+export function policyStagingHealthFields(): Pick<
+  ConductorHealthSnapshot,
+  | "policy_version"
+  | "policy_version_id"
+  | "policy_stage"
+  | "policy_canary_id"
+  | "policy_canary_version"
+  | "policy_lkg_id"
+  | "policy_candidate_id"
+> {
+  const store = getPolicyVersionStore();
+  const production = store.production;
+  return {
+    policy_version: production?.version ?? null,
+    policy_version_id: production?.id ?? null,
+    policy_stage: production?.stage ?? null,
+    policy_canary_id: store.canary?.id ?? null,
+    policy_canary_version: store.canary?.version ?? null,
+    policy_lkg_id: store.lastKnownGood?.id ?? null,
+    policy_candidate_id: store.candidate?.id ?? null,
+  };
+}
+
+/** Claude CLI delegate backend fields (Task 1 launch modes). */
+export function delegateBackendHealthFields(cfg: JarvisConfig): Pick<
+  ConductorHealthSnapshot,
+  "delegate_backend" | "delegate_auth_mode" | "delegate_model"
+> {
+  const authMode = cfg.claude_cli?.auth_mode === "subscription" ? "subscription" : "proxy";
+  const model = cfg.claude_cli?.delegate?.model?.trim() || "";
+  const launch = resolveClaudeCliLaunchOptions({
+    authMode,
+    modelId: model,
+    opencodeGoApiKey: cfg.opencode_go?.api_key,
+    opencodeGoBaseUrl: cfg.opencode_go?.base_url,
+  });
+  return {
+    delegate_backend: launch.authMode,
+    delegate_auth_mode: authMode,
+    delegate_model: model || null,
+  };
 }
 
 export class PersistentConductorError extends Error {
@@ -340,19 +539,23 @@ export class PersistentConductor {
   }
 
   /**
-   * T1.7: structured health for logs, /health JSON, and per-turn
+   * T1.7 + Task 8: structured health for logs, /health JSON, and per-turn
    * conductor_health SSE frames when config says enabled but we fell back.
+   *
+   * Core conductor fields (model / fallback_model / reason) keep their
+   * existing snake_case names. New fields: active TaskPlan item, grading
+   * mode, repair-cycle count, Claude-CLI delegate backend, policy version.
+   * Ledger fields are null when no active task is supplied.
    */
-  async describeHealth(): Promise<{
-    enabled: boolean;
-    available: boolean;
-    fallback_to_api: boolean;
-    model: string;
-    fallback_model: string;
-    reason?: string;
-    supervision_warning?: string;
-  }> {
+  async describeHealth(options: DescribeHealthOptions = {}): Promise<ConductorHealthSnapshot> {
+    const jarvisCfg = this.getConfig();
     const conductor = this.config();
+    const extras = {
+      ...taskPlanHealthFields(options.taskRun, options.sessionId),
+      ...delegateBackendHealthFields(jarvisCfg),
+      ...policyStagingHealthFields(),
+    };
+
     if (!conductor.enabled) {
       return {
         enabled: false,
@@ -361,6 +564,7 @@ export class PersistentConductor {
         model: conductor.model,
         fallback_model: conductor.fallback_model,
         reason: "disabled",
+        ...extras,
       };
     }
     try {
@@ -377,6 +581,7 @@ export class PersistentConductor {
             ? `recent_runtime_failure: ${this.lastRuntimeFailureMessage}`
             : "ollama_unavailable_or_model_missing",
         supervision_warning: this.recentSupervisionWarning(),
+        ...extras,
       };
     } catch (e) {
       return {
@@ -387,6 +592,7 @@ export class PersistentConductor {
         fallback_model: conductor.fallback_model,
         reason: e instanceof Error ? e.message : String(e),
         supervision_warning: this.recentSupervisionWarning(),
+        ...extras,
       };
     }
   }
