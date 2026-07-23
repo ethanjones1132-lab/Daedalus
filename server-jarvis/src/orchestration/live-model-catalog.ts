@@ -182,7 +182,14 @@ export function openCodeGoOpenaiFormatModelIds(): string[] {
     .sort();
 }
 
-const KNOWN_CAPABILITIES: Record<string, Partial<AgentCapabilities>> = {
+/**
+ * Hand-authored capability priors used by live discovery for known catalog
+ * ids. These are NOT measured scores — replace via the opt-in live benchmark
+ * (`JARVIS_EVAL_LIVE=1 bun run src/eval/model-benchmark.ts` once scaffolded)
+ * or organic self-tuning traffic. The model-pool eligibility audit surfaces
+ * these so reviewers can see which priors are still guesses.
+ */
+export const KNOWN_CAPABILITIES: Readonly<Record<string, Partial<AgentCapabilities>>> = {
   "deepseek-v4-flash": { code: 0.9, reasoning: 0.86, speed: 0.86, json_reliability: 0.9 },
   "deepseek-v4-flash-free": { code: 0.9, reasoning: 0.86, speed: 0.82, json_reliability: 0.9 },
   "deepseek-v4-pro": { code: 0.93, reasoning: 0.9, speed: 0.7, json_reliability: 0.85 },

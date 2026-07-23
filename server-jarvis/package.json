@@ -11,6 +11,7 @@
     "test": "bun test",
     "eval": "bun run src/eval/harness.ts",
     "eval:nightly": "bun run src/eval/nightly-semantic-eval.ts",
+    "audit:pool": "bun run src/orchestration/model-pool-eligibility-audit.ts",
     "test:gate": "bun test src/eval/harness.test.ts && bun run src/eval/harness.ts"
   },
   "dependencies": {
