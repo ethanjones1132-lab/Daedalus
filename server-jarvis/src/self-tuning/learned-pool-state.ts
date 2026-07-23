@@ -14,6 +14,24 @@ export interface LearnedPoolState {
   stageModelRoutingScoreDeltas: Map<string, number>;
   /** Empirical first-token watchdog budgets keyed by model feedback key. */
   modelFirstTokenTimeouts: Map<string, number>;
+  /**
+   * Free-form recovery knobs held back via policy staging (not applied by
+   * capability-delta / instruction A/B paths). Keys are stable policy ids.
+   */
+  recoveryPolicy: Map<string, number | string | boolean>;
+}
+
+/**
+ * Serializable slice of learned-pool fields that routing / budget / recovery
+ * policy staging is allowed to mutate. Capability deltas are intentionally
+ * excluded — those remain the immediate low-risk path.
+ */
+export interface PolicySnapshot {
+  modelRoutingScoreDeltas: Record<string, number>;
+  stageModelRoutingScoreDeltas: Record<string, number>;
+  fallbackBoosts: Record<string, number>;
+  modelFirstTokenTimeouts: Record<string, number>;
+  recovery: Record<string, number | string | boolean>;
 }
 
 const globalState: LearnedPoolState = {
@@ -23,6 +41,7 @@ const globalState: LearnedPoolState = {
   modelRoutingScoreDeltas: new Map(),
   stageModelRoutingScoreDeltas: new Map(),
   modelFirstTokenTimeouts: new Map(),
+  recoveryPolicy: new Map(),
 };
 
 export function getLearnedPoolState(): LearnedPoolState {
@@ -43,7 +62,38 @@ export function clearInferenceFeedbackState(): void {
 export function resetLearnedPoolStateForTests(): void {
   globalState.capabilityDeltas.clear();
   globalState.fallbackBoosts.clear();
+  globalState.recoveryPolicy.clear();
   clearInferenceFeedbackState();
+}
+
+/** Snapshot the staged-policy fields (routing / budget / recovery). */
+export function snapshotStagedPolicyFields(state: LearnedPoolState = globalState): PolicySnapshot {
+  return {
+    modelRoutingScoreDeltas: Object.fromEntries(state.modelRoutingScoreDeltas),
+    stageModelRoutingScoreDeltas: Object.fromEntries(state.stageModelRoutingScoreDeltas),
+    fallbackBoosts: Object.fromEntries(state.fallbackBoosts),
+    modelFirstTokenTimeouts: Object.fromEntries(state.modelFirstTokenTimeouts),
+    recovery: Object.fromEntries(state.recoveryPolicy),
+  };
+}
+
+/**
+ * Replace staged-policy fields from a snapshot. Capability deltas and
+ * modelCapabilityDeltas are left untouched (immediate low-risk path).
+ */
+export function applyPolicySnapshotToPool(
+  snapshot: PolicySnapshot,
+  state: LearnedPoolState = globalState,
+): void {
+  state.modelRoutingScoreDeltas = new Map(Object.entries(snapshot.modelRoutingScoreDeltas ?? {}));
+  state.stageModelRoutingScoreDeltas = new Map(
+    Object.entries(snapshot.stageModelRoutingScoreDeltas ?? {}),
+  );
+  state.fallbackBoosts = new Map(Object.entries(snapshot.fallbackBoosts ?? {}));
+  state.modelFirstTokenTimeouts = new Map(
+    Object.entries(snapshot.modelFirstTokenTimeouts ?? {}),
+  );
+  state.recoveryPolicy = new Map(Object.entries(snapshot.recovery ?? {}));
 }
 
 export function fallbackBoostKey(agentId: string, stage: string, taskType: string): string {

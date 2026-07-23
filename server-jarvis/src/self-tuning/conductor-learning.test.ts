@@ -2,6 +2,7 @@ import { describe, expect, test, beforeEach } from "bun:test";
 import { ConductorLearningLoop } from "./conductor-learning";
 import { SelfTuningStore } from "./store";
 import { resetLearnedPoolStateForTests } from "./learned-pool-state";
+import { resetPolicyStagingForTests } from "./policy-staging";
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
 import { hashInstruction } from "../orchestration/worker-prompt";
 
@@ -19,6 +20,7 @@ const sampleAgent: OrchestratorAgent = {
 describe("Conductor learning (Phase 4)", () => {
   beforeEach(() => {
     resetLearnedPoolStateForTests();
+    resetPolicyStagingForTests();
   });
 
   test("records routing, model attribution, and trajectory on run completion", () => {
@@ -288,5 +290,47 @@ describe("Conductor learning (Phase 4)", () => {
     );
     expect(selection.variants.executor).toBe("baseline");
     expect(selection.instructions?.executor).toBeUndefined();
+  });
+
+  test("proposeStagedPolicy layers on top of immediate capability path without replacing it", async () => {
+    const store = new SelfTuningStore(TEST_DB);
+    const loop = new ConductorLearningLoop(store, {
+      enabled: true,
+      min_samples_for_heuristics: 3,
+      capability_adjustment_step: 0.05,
+      trajectory_export: false,
+      instruction_ab_epsilon: 0,
+      max_trajectory_snapshots: 100,
+    });
+
+    for (let i = 0; i < 5; i++) {
+      store.upsertAgentPerformance(sampleAgent.id, "executor", "refactor", true, 800);
+    }
+    const heuristic = await loop.optimizeAndApply("run_both", "refactor", [sampleAgent]);
+    expect(heuristic.agentsAdjusted).toBeGreaterThan(0);
+
+    const staged = loop.proposeStagedPolicy(
+      {
+        domain: "budget",
+        modelFirstTokenTimeouts: { "opencode_zen:north-mini-code-free": 30_000 },
+      },
+      "budget canary candidate",
+    );
+    expect(staged.action).toBe("proposed");
+    expect(staged.version?.stage).toBe("candidate");
+
+    // Capability delta from optimizeAndApply remains applied immediately.
+    const adjusted = loop.applyLearnedAgents([sampleAgent]);
+    expect(adjusted[0].capabilities.code).toBeGreaterThan(sampleAgent.capabilities.code);
+
+    // Budget candidate is held back — pool timeout map still empty.
+    const { getLearnedPoolState } = await import("./learned-pool-state");
+    expect(getLearnedPoolState().modelFirstTokenTimeouts.size).toBe(0);
+
+    // Eligible outcomes advance toward shadow without mutating production maps.
+    for (let i = 0; i < 19; i++) loop.noteEligiblePolicyOutcome("success");
+    const entered = loop.noteEligiblePolicyOutcome("success");
+    expect(entered.action).toBe("entered_shadow");
+    expect(getLearnedPoolState().modelFirstTokenTimeouts.size).toBe(0);
   });
 });

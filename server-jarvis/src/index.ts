@@ -175,6 +175,7 @@ import { countTokens } from "./tokens";
 import { WorkspaceAffinityStore } from "./orchestration/workspace-affinity";
 import { createRuntimeMonitor, shouldLogRuntimePerformance } from "./performance/runtime-monitor";
 import { loadInferenceFeedback } from "./self-tuning/inference-feedback";
+import { loadPolicyVersions, getPolicyVersionStore } from "./self-tuning/policy-staging";
 import {
   assessTaskRunAcceptance,
   resolveDeepReadIntent,
@@ -527,6 +528,18 @@ console.log(
   `[Jarvis Orchestrator] Inference feedback startup load: applied=${inferenceFeedbackLoad.applied} ` +
   `ignored=${inferenceFeedbackLoad.ignored} status=${inferenceFeedbackLoad.reason ?? "active"}`,
 );
+// Staged routing/budget/recovery policy versions (production/candidate/canary/LKG).
+// Loaded after inference feedback so a promoted production snapshot re-applies
+// over the cron report when both touch the same maps; restart keeps rollback.
+loadPolicyVersions();
+{
+  const pol = getPolicyVersionStore();
+  console.log(
+    `[Jarvis Orchestrator] Policy staging startup load: production=${pol.production?.id ?? "none"} ` +
+    `candidate=${pol.candidate?.id ?? "none"} canary=${pol.canary?.id ?? "none"} ` +
+    `lkg=${pol.lastKnownGood?.id ?? "none"}`,
+  );
+}
 
 function rememberContinuationRequirement(sessionId: string, requirement: TurnRequirement): void {
   continuationRequirements.delete(sessionId);

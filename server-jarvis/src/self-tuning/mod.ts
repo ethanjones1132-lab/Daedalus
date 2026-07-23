@@ -3,4 +3,5 @@ export * from "./collector";
 export * from "./analyzer";
 export * from "./proposer";
 export * from "./learned-pool-state";
+export * from "./policy-staging";
 export * from "./conductor-learning";

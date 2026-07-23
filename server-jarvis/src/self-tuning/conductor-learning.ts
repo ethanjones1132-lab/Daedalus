@@ -12,6 +12,18 @@ import {
   fallbackBoostKey,
   getLearnedPoolState,
 } from "./learned-pool-state";
+import {
+  evaluatePromotion,
+  getPolicyVersionStore,
+  persistPolicyVersions,
+  proposePolicy,
+  recordCanaryOutcome,
+  recordEligibleOutcome,
+  runShadowReplay,
+  shouldApplyCanary,
+  type PolicyPatch,
+  type TransitionResult,
+} from "./policy-staging";
 import { hashInstruction, type InstructionVariantSelection } from "../orchestration/worker-prompt";
 
 export interface RoutingRecordInput {
@@ -45,6 +57,8 @@ export interface HeuristicOptimizationResult {
   proposals: TuningProposal[];
   agentsAdjusted: number;
   fallbackBoostsApplied: number;
+  /** Staged routing/budget/recovery transitions observed during this pass. */
+  policyTransitions?: TransitionResult[];
 }
 
 function successRate(success: number, failure: number): number {
@@ -323,6 +337,68 @@ export class ConductorLearningLoop {
 
   applyLearnedAgents(agents: OrchestratorAgent[]): OrchestratorAgent[] {
     return agents.map(applyLearnedCapabilities);
+  }
+
+  /**
+   * Hold back a routing / budget / recovery policy change for the
+   * shadow → canary → promotion lifecycle. Capability deltas and instruction
+   * A/B remain immediate (see optimizeAndApply / selectInstructionVariants).
+   */
+  proposeStagedPolicy(patch: PolicyPatch, rationale: string): TransitionResult {
+    if (!this.config.enabled) {
+      return {
+        action: "rejected",
+        reason: "learning_disabled",
+        version: null,
+        store: getPolicyVersionStore(),
+      };
+    }
+    const result = proposePolicy(patch, rationale);
+    if (result.action === "proposed") persistPolicyVersions();
+    return result;
+  }
+
+  /** Advance held-back candidates with an eligible production outcome. */
+  noteEligiblePolicyOutcome(outcome: "success" | "degraded" | "failed"): TransitionResult {
+    const result = recordEligibleOutcome(outcome);
+    if (result.action === "entered_shadow" || result.action === "eligible_recorded") {
+      persistPolicyVersions();
+    }
+    return result;
+  }
+
+  /** Feed shadow-replay results; may advance into canary. */
+  completeShadowReplay(outcomes: ReadonlyArray<{ success: boolean }>): TransitionResult {
+    const result = runShadowReplay(outcomes);
+    if (result.action !== "none") persistPolicyVersions();
+    return result;
+  }
+
+  /** Live canary traffic coin-flip (10% default). */
+  shouldRouteToCanaryPolicy(rng?: () => number): boolean {
+    return shouldApplyCanary(rng);
+  }
+
+  /** Record a canary-phase outcome; may auto-promote or auto-rollback. */
+  noteCanaryPolicyOutcome(arm: "canary" | "production", success: boolean): TransitionResult {
+    const result = recordCanaryOutcome(arm, success);
+    if (
+      result.action === "promoted" ||
+      result.action === "rolled_back" ||
+      result.action === "canary_outcome_recorded"
+    ) {
+      persistPolicyVersions();
+    }
+    return result;
+  }
+
+  /** Explicit promotion evaluation (also runs automatically on canary outcomes). */
+  evaluateStagedPolicyPromotion(): TransitionResult {
+    const result = evaluatePromotion();
+    if (result.action === "promoted" || result.action === "rolled_back") {
+      persistPolicyVersions();
+    }
+    return result;
   }
 }
 
