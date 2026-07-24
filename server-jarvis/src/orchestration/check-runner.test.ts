@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { classifyRunGateTier, mergeToCheckResult } from "./check-runner";
+import { classifyRunGateTier, mergeToCheckResult, runVerificationCheck } from "./check-runner";
 import type { RunGateResult } from "./run-gate";
+import type { ToolCallRecord } from "./stage-output";
 
 describe("check-runner tier mapping", () => {
   test("adjacent/explicit test → existing tier", () => {
@@ -42,5 +43,36 @@ describe("check-runner tier mapping", () => {
     const run: RunGateResult = { status: "skipped", reason: "no python written", issues: [] };
     const result = mergeToCheckResult({ syntaxIssues: [], run, hadWrittenCode: false });
     expect(result).toMatchObject({ tier: "none", ran: false, passed: null });
+  });
+});
+
+describe("runVerificationCheck", () => {
+  test("delegates to injected gates and returns a merged result", async () => {
+    const toolCalls: ToolCallRecord[] = [
+      { name: "write_file", arguments: { path: "sol.py" }, output: "ok", is_error: false, duration_ms: 1 },
+    ];
+    const result = await runVerificationCheck({
+      toolCalls,
+      request: "fix sol.py",
+      plan: "",
+      workspaceRoot: "/ws",
+      timeoutMs: 1000,
+      runSyntax: async () => [],
+      runTests: async () => ({ status: "passed", target: "sol/_t.py", reason: "adjacent_test", issues: [] }),
+    });
+    expect(result).toMatchObject({ tier: "existing", ran: true, passed: true });
+  });
+
+  test("reports none when no code was written", async () => {
+    const result = await runVerificationCheck({
+      toolCalls: [{ name: "read_file", arguments: { path: "sol.py" }, output: "x", is_error: false, duration_ms: 1 }],
+      request: "explain sol.py",
+      plan: "",
+      workspaceRoot: "/ws",
+      timeoutMs: 1000,
+      runSyntax: async () => [],
+      runTests: async () => ({ status: "skipped", reason: "no python written", issues: [] }),
+    });
+    expect(result.tier).toBe("none");
   });
 });

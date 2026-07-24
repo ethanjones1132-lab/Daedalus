@@ -1,4 +1,5 @@
 import type { RunGateResult, RunTarget } from "./run-gate";
+import type { ToolCallRecord } from "./stage-output";
 import type { SyntaxIssue } from "./syntax-gate";
 
 export type CheckTier = "existing" | "builtin" | "synth" | "none";
@@ -10,6 +11,23 @@ export interface CheckResult {
   detail: string;           // failing assertion / compiler error, truncated
   command: string;          // what was executed / checked, for telemetry
   durationMs: number;
+}
+
+const WRITE_TOOL_NAMES = new Set(["write_file", "edit_file", "multi_edit", "apply_patch"]);
+
+function hadWrittenCode(toolCalls: readonly ToolCallRecord[]): boolean {
+  return toolCalls.some((c) => !c.is_error && WRITE_TOOL_NAMES.has(c.name));
+}
+
+export interface RunVerificationInput {
+  toolCalls: readonly ToolCallRecord[];
+  request: string;
+  plan: string;
+  workspaceRoot: string;
+  timeoutMs: number;
+  /** Injected gates (default to the real module functions in the pipeline caller). */
+  runSyntax: (toolCalls: readonly ToolCallRecord[]) => Promise<SyntaxIssue[]>;
+  runTests: (toolCalls: readonly ToolCallRecord[], request: string, plan: string) => Promise<RunGateResult>;
 }
 
 /** Map a run-gate target reason to a reward tier. */
@@ -60,4 +78,22 @@ export function mergeToCheckResult(input: {
     command: "syntax_check",
     durationMs,
   };
+}
+
+/**
+ * Orchestration entry for verification-gated conductor: detect whether code
+ * was written, run injected syntax + test gates in parallel, and merge into
+ * a single tiered CheckResult.
+ */
+export async function runVerificationCheck(input: RunVerificationInput): Promise<CheckResult> {
+  const startedAt = Date.now();
+  const written = hadWrittenCode(input.toolCalls);
+  if (!written) {
+    return { tier: "none", ran: false, passed: null, detail: "", command: "", durationMs: Date.now() - startedAt };
+  }
+  const [syntaxIssues, run] = await Promise.all([
+    input.runSyntax(input.toolCalls),
+    input.runTests(input.toolCalls, input.request, input.plan),
+  ]);
+  return mergeToCheckResult({ syntaxIssues, run, hadWrittenCode: true, durationMs: Date.now() - startedAt });
 }
