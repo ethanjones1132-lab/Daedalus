@@ -1711,7 +1711,7 @@ mod startup_thread_tests {
             "release_resource_staging::copy_if_different(&proxy_src, &proxy_dest)"
         ));
         assert!(build_helper.contains(
-            "let proxy_models_dest = release_dir\n        .join(\"resources\")\n        .join(\"opencode_go_openai_models.json\")"
+            "let proxy_models_dest = release_dir\r\n        .join(\"resources\")\r\n        .join(\"opencode_go_openai_models.json\");"
         ));
     }
 
