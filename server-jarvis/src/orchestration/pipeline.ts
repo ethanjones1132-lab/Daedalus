@@ -1051,15 +1051,23 @@ export class PipelineExecutor {
       const settled = await Promise.all(
         batch.map(async (entry) => {
           // Thrift: skip real execution for tools that have structurally failed enough.
-          // Gated on thrift.dead_tool_suppression only (not master verification.enabled).
+          // Gated on BOTH the master verification.enabled flag and the thrift
+          // sub-flag, so the whole verification feature stays inert as one
+          // unit until deliberately canaried (2026-07-24 fix — the sub-flag
+          // alone defaulted true independent of the master default-off flag).
+          // `?.()` on toolIsSuppressed/toolRedirectNote: `live` may be a
+          // minimal test mock that predates these methods (see the same
+          // defensive pattern at getConsecutiveToolErrors above) — a hard
+          // call here crashed every such mock's tool dispatch.
           const suppress =
+            this.ctx.config.orchestrator.verification?.enabled === true &&
             this.ctx.config.orchestrator.verification?.thrift?.dead_tool_suppression === true &&
-            this.conductor?.live.toolIsSuppressed(entry.call.name);
+            this.conductor?.live.toolIsSuppressed?.(entry.call.name);
           if (suppress && this.conductor) {
             const result: ToolResult = {
               call_id: entry.call.id,
               name: entry.call.name,
-              output: `Error: ${this.conductor.live.toolRedirectNote(entry.call.name)}`,
+              output: `Error: ${this.conductor.live.toolRedirectNote?.(entry.call.name) ?? `${entry.call.name} is unavailable this turn.`}`,
               is_error: true,
               duration_ms: 0,
             };
