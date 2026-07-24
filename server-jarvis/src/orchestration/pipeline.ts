@@ -4,6 +4,7 @@ import { deriveEvidenceTaskKind } from "./turn-requirements";
 import { injectToolGuidelines } from "./tool-guidelines";
 import { checkWrittenFilesSyntax, renderSyntaxIssues, type SyntaxIssue } from "./syntax-gate";
 import { renderRunIssues, runWrittenCodeGate, type RunGateResult } from "./run-gate";
+import { mergeToCheckResult, runVerificationCheck, type CheckResult } from "./check-runner";
 import { BUILTIN_MODES, executorTurnLimit, getToolsForMode } from "./modes";
 import { toolResultModelText, type ToolRuntime, type ExecutionContext } from "../tool-runtime";
 import type { CallModelFn, ChatMessage } from "./router";
@@ -526,6 +527,10 @@ export interface PipelineResult {
    * topology that has no ToolCallRecord[] to report).
    */
   toolCalls?: ToolCallRecord[];
+  /** Verification-gated check result for this turn (when verification enabled). */
+  checkResult?: CheckResult;
+  /** True when the reviewer stage accepted (feeds synth-tier reward floor). */
+  reviewerAccepted?: boolean;
   /** T2.5: recursive critique asked for conductor replan. */
   replanRequested?: PipelineSegmentResult["replanRequested"];
 }
@@ -662,6 +667,10 @@ export class PipelineExecutor {
   private conductor?: ConductorWiring;
   /** One delegate process maximum per logical agent run, including replans. */
   private delegateAttemptedRuns = new Set<string>();
+  /** Last verification check for this execute() turn (feeds conductor + reward). */
+  private lastCheckResult: CheckResult | undefined;
+  /** Reviewer accepted this turn (synth-tier reward upgrade). */
+  private lastReviewerAccepted = false;
 
   constructor(
     private callModel: CallModelFn,
@@ -687,6 +696,38 @@ export class PipelineExecutor {
       workspaceOverride: this.ctx.workspace_path,
       sessionGrants: options.sessionGrants ?? this.ctx.session_grants,
     });
+  }
+
+  /**
+   * Verification-gated conductor (Task 5.3): run syntax + run gates and merge
+   * into a tiered CheckResult. No-op when `orchestrator.verification.enabled`
+   * is false (default) so existing behavior stays inert.
+   */
+  private async runTurnVerification(
+    toolCalls: ToolCallRecord[],
+    request: string,
+    planSummary: string,
+  ): Promise<CheckResult | undefined> {
+    if (!this.ctx.config.orchestrator?.verification?.enabled) return undefined;
+    const workspaceRoot =
+      this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd();
+    const timeoutMs = this.ctx.config.orchestrator.verification.check_timeout_ms ?? 15000;
+    try {
+      return await runVerificationCheck({
+        toolCalls,
+        request,
+        plan: planSummary,
+        workspaceRoot,
+        timeoutMs,
+        runSyntax: (tc) => this.gateWrittenSyntax([...tc]),
+        runTests: (tc, req, pl) => this.gateWrittenRun([...tc], req, pl),
+      });
+    } catch (e) {
+      console.warn(
+        `[Pipeline] verification check failed: ${e instanceof Error ? e.message : String(e)}`,
+      );
+      return undefined;
+    }
   }
 
   private registerStageAbort(stage: StageName): AbortSignal | undefined {
@@ -845,21 +886,31 @@ export class PipelineExecutor {
         }
       }
 
-      // Task 4.3 thrift: achieved-effect early-stop — green existing/builtin
-      // verification skips remaining intermediate stages and goes to synthesizer.
-      // Flag is set by LiveConductor verify branch; thrift gate applied here.
-      const live = this.conductor?.live;
-      if (
-        live?.lastVerificationEarlyStop === true &&
-        this.ctx.config.orchestrator.verification?.thrift?.achieved_effect_early_stop === true &&
-        options.workQueue
-      ) {
-        options.workQueue.length = 0;
-        options.workQueue.push("synthesizer");
-        console.log(`[Pipeline] achieved-effect early-stop after ${stage}: synthesizer`);
+      // Task 4.3 thrift + Task 5.3 dropReviewer: green existing/builtin can
+      // skip intermediate stages (early-stop → synthesizer) or just drop reviewer.
+      // Flags are set by LiveConductor verify branch; thrift gate applied here.
+      if (directive.gradingMode === "reviewer_mediated") {
+        this.lastReviewerAccepted = true;
       }
-      if (live) {
+      const live = this.conductor?.live;
+      if (options.workQueue && live) {
+        if (
+          live.lastVerificationEarlyStop === true &&
+          this.ctx.config.orchestrator.verification?.thrift?.achieved_effect_early_stop === true
+        ) {
+          options.workQueue.length = 0;
+          options.workQueue.push("synthesizer");
+          console.log(`[Pipeline] achieved-effect early-stop after ${stage}: synthesizer`);
+        } else if (live.lastVerificationDroppedReviewer === true) {
+          const filtered = options.workQueue.filter(
+            (s) => s !== "reviewer" && s !== ("re-enter:reviewer" as StageName),
+          );
+          options.workQueue.length = 0;
+          options.workQueue.push(...filtered);
+          console.log(`[Pipeline] drop-reviewer thrift after ${stage}: ${filtered.join("->") || "(empty)"}`);
+        }
         live.lastVerificationEarlyStop = false;
+        live.lastVerificationDroppedReviewer = false;
       }
     }
 
@@ -1282,6 +1333,21 @@ export class PipelineExecutor {
       workspaceRoots: this.evidenceRoots(options),
       writeIntent: requiresWriteEffect,
     });
+    /** Attach verification CheckResult for conductor verify branch (inert when disabled). */
+    const withCheckResult = async (
+      base: ConductorStageEvidence = executorEvidence(),
+    ): Promise<ConductorStageEvidence> => {
+      const check = await this.runTurnVerification(
+        toolCalls,
+        options.rawMessage ?? request,
+        planSummary,
+      );
+      if (check) {
+        this.lastCheckResult = check;
+        return { ...base, checkResult: check };
+      }
+      return base;
+    };
     const executorMessages: ChatMessage[] = [
       { role: "system", content: executorPrompt },
       { role: "user", content: `User Request: ${request}\n\nPlan:\n${planSummary}` }
@@ -1553,7 +1619,7 @@ export class PipelineExecutor {
       };
       onStateChange({ stage: "executor", status: "completed", output: delegated.narrative });
       await this.afterConductorStage(
-        "executor", "completed", delegated.narrative, agentRunId, options, remainingQueue, executorEvidence(),
+        "executor", "completed", delegated.narrative, agentRunId, options, remainingQueue, await withCheckResult(),
       );
       return acceptedOutput;
     };
@@ -1665,7 +1731,7 @@ export class PipelineExecutor {
       }
 
       onStateChange({ stage: "executor", status: "completed", output: narrative, detail: "explicit_scope_complete" });
-      await this.afterConductorStage("executor", "completed", narrative, agentRunId, options, remainingQueue, executorEvidence());
+      await this.afterConductorStage("executor", "completed", narrative, agentRunId, options, remainingQueue, await withCheckResult());
       return { ok: true, narrative, toolCalls };
     }
 
@@ -2289,12 +2355,20 @@ export class PipelineExecutor {
           agentRunId,
           options,
           remainingQueue,
-          executorEvidence(),
+          await withCheckResult(),
         );
         return { ok: false, narrative: failure.message, toolCalls, modelKey: lastModelKey };
       }
       onStateChange({ stage: "executor", status: "completed", output: narrative });
-      await this.afterConductorStage("executor", "completed", narrative, agentRunId, options, remainingQueue, executorEvidence());
+      await this.afterConductorStage(
+        "executor",
+        "completed",
+        narrative,
+        agentRunId,
+        options,
+        remainingQueue,
+        await withCheckResult(),
+      );
       return { ok: true, narrative, toolCalls, modelKey: lastModelKey };
     } catch (e: any) {
       if (
@@ -2631,6 +2705,18 @@ export class PipelineExecutor {
       const runGate = syntaxIssues.length === 0
         ? await this.gateWrittenRun(writtenToolCalls, request, planSummary)
         : { status: "skipped", reason: "syntax gate failed", issues: [] } satisfies RunGateResult;
+      // When verification is enabled, store a CheckResult for reward/provenance.
+      // Prefer the executor-completion result (avoid re-running heavy tests);
+      // otherwise merge the gates already executed above.
+      if (this.ctx.config.orchestrator?.verification?.enabled && !this.lastCheckResult) {
+        this.lastCheckResult = mergeToCheckResult({
+          syntaxIssues,
+          run: runGate,
+          hadWrittenCode: writtenToolCalls.some(
+            (c) => !c.is_error && WRITE_EFFECT_TOOLS.has(c.name),
+          ),
+        });
+      }
       const deterministicGateFeedback = [
         renderSyntaxIssues(syntaxIssues),
         renderRunIssues(runGate),
@@ -2832,8 +2918,12 @@ export class PipelineExecutor {
       }
     }
 
+    const reviewerHasIssues = this.hasIssues(reviewerFeedback);
+    if (reviewerOk && !reviewerHasIssues) {
+      this.lastReviewerAccepted = true;
+    }
     return {
-      reviewer: { ok: reviewerOk, feedback: reviewerFeedback, hasIssues: this.hasIssues(reviewerFeedback) },
+      reviewer: { ok: reviewerOk, feedback: reviewerFeedback, hasIssues: reviewerHasIssues },
       rewriter: rewriterOutput,
       loopRepairsUsed: repairs,
       loopAddedProgress,
@@ -3574,6 +3664,7 @@ export class PipelineExecutor {
           opts.taskRunContract &&
           activeItem
         ) {
+          this.lastReviewerAccepted = true;
           try {
             const next = applyReviewerAccept(opts.taskRunContract, activeItem.id, {
               ref: `${agentRunId}:reviewer:${activeItem.id}`,
@@ -3756,6 +3847,9 @@ export class PipelineExecutor {
     // segments intentionally share the same array so the final gate can see
     // every native write attempt made before synthesis.
     this.ctx.write_effects = [];
+    // Reset verification side-channels so prior turns cannot leak into reward.
+    this.lastCheckResult = undefined;
+    this.lastReviewerAccepted = false;
     const requiresWorkspaceEvidence = turnNeedsWorkspaceEvidence(options.turnRequirement, options.rawMessage ?? request);
     if (!requiresWorkspaceEvidence && this.canRunSpeculativeParallel(pipeline, options.topology)) {
       return this.executeSpeculativeParallel(request, pipeline, agentRunId, onStateChange, options);
@@ -3803,6 +3897,8 @@ export class PipelineExecutor {
           outcome: "failed",
           error_code: failure.code,
           toolCalls: state.executor?.toolCalls,
+          checkResult: this.lastCheckResult,
+          reviewerAccepted: this.lastReviewerAccepted,
         };
       }
     }
@@ -3831,6 +3927,8 @@ export class PipelineExecutor {
         outcome: gated.outcome,
         error_code: gated.errorCode,
         toolCalls: state.executor?.toolCalls,
+        checkResult: this.lastCheckResult,
+        reviewerAccepted: this.lastReviewerAccepted,
       };
     }
 
@@ -3876,6 +3974,8 @@ export class PipelineExecutor {
       outcome,
       error_code: errorCode,
       toolCalls: state.executor?.toolCalls,
+      checkResult: this.lastCheckResult,
+      reviewerAccepted: this.lastReviewerAccepted,
     };
     if (!segment.synthesizerFatalError && !segment.synthesizerEmptyCompletion && pipeline.includes("synthesizer")) {
       return this.applyRecursiveCritique(request, result, agentRunId, onStateChange, options);

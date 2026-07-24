@@ -151,6 +151,7 @@ import {
   type ExecutionProfile,
 } from "./orchestration/route-normalization";
 import { runPipelineWithReplanning } from "./orchestration/replan-loop";
+import { mapCheckToReward } from "./orchestration/verification-reward";
 import { buildBoundedHistoryBlock, HISTORY_BUDGET_TOKENS } from "./orchestration/context-budget";
 import { SessionReplanCounter } from "./orchestration/replan-telemetry";
 import { conductorLearning, outcomeCollector, selfTuningProposer, SelfTuningStore } from "./self-tuning/mod";
@@ -3412,16 +3413,32 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               : taskAcceptance.status === "paused"
                 ? "partial"
                 : "failed";
+        // Task 5.3: verification-gated reward floor. When no check ran (disabled
+        // or tier none), outcomeFloor is null and runOutcome passes through.
+        const reward = result.checkResult
+          ? mapCheckToReward(
+              result.checkResult,
+              cfg.orchestrator.verification?.tier_reward ?? {
+                existing: 1,
+                builtin: 1,
+                synth: 0.5,
+                none: 0,
+              },
+              result.reviewerAccepted === true,
+            )
+          : null;
+        const verifiedRunOutcome =
+          reward?.outcomeFloor != null ? reward.outcomeFloor : runOutcome;
         sessionMemory.updateTaskRun(sessionId, {
           status: reconciledStatus,
           evidenceCount,
-          lastOutcome: runOutcome,
+          lastOutcome: verifiedRunOutcome,
           lastTurnId: agentRunId,
         });
         // Reward boundary: partial folds to degraded so reward math / conductor
         // learning stay on the historical 3-way vocabulary.
         const rewardOutcome: "success" | "degraded" | "failed" =
-          runOutcome === "partial" ? "degraded" : runOutcome;
+          verifiedRunOutcome === "partial" ? "degraded" : verifiedRunOutcome;
         const finalOutputForLog = trimmedAnswer || result.error || `(no output: ${result.error_code ?? "empty_completion"})`;
         sessionMemory.recordPipelineOutcome(sessionId, {
           outcome: rewardOutcome,
@@ -3435,7 +3452,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           duration,
           turnMetrics.tool_calls,
           turnMetrics.tokens_total,
-          runOutcome,
+          verifiedRunOutcome,
+          // Only set provenance columns when a verification check actually ran;
+          // leave null when verification is off / no checkResult.
+          reward?.verifiedVia,
+          reward?.checkTier,
         );
         if (conductorRunId) {
           conductorLearning.completeRun({
@@ -3497,7 +3518,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }
         }
         const distillCfg = cfg.orchestrator.skill_distillation;
-        if (distillCfg?.enabled && runOutcome === "success" && taskAcceptance.accepted && !repetitionVerdict.repeated) {
+        if (distillCfg?.enabled && verifiedRunOutcome === "success" && taskAcceptance.accepted && !repetitionVerdict.repeated) {
           const stageRunsForDistill = stageRuns;
           const candidate = distillSkillCandidate({
             agentRunId,
@@ -3506,7 +3527,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             userRequest: message,
             workerInstructions: route.worker_instructions,
             stageRuns: stageRunsForDistill,
-            runOutcome,
+            runOutcome: rewardOutcome,
             taskRunAccepted: taskAcceptance.accepted,
             turnRequirement: turnReq.requirement,
           }, distillCfg);
@@ -3634,7 +3655,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // Empty (non-fatal) completion: show the friendly retry notice, but
           // record the inference as a FAILURE so telemetry is truthful (the run
           // outcome above is already `failed`/`empty_completion`).
-          console.warn(`[Jarvis Orchestrator] Pipeline returned empty answer session=${sessionId} (outcome=${runOutcome}, code=${result.error_code ?? "empty_completion"}) — surfacing fallback`);
+          console.warn(`[Jarvis Orchestrator] Pipeline returned empty answer session=${sessionId} (outcome=${verifiedRunOutcome}, code=${result.error_code ?? "empty_completion"}) — surfacing fallback`);
           recordInference({
             ts: Date.now(),
             // See note above: attribute to the actual provider so the
@@ -3682,7 +3703,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             model: orchLastModel ?? (cfg.active_backend === "openrouter"
               ? (cfg.openrouter.model ?? "openrouter/free")
               : cfg.ollama.model),
-            ok: runOutcome === "success",
+            ok: verifiedRunOutcome === "success",
             latency_ms: duration,
             tokens_in: turnMetrics.tokens_in,
             tokens_out: turnMetrics.tokens_out,
@@ -3731,10 +3752,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // happens to be a repeat) — `finalAnswer` was already replaced
           // with the refusal text above, so the tag must match.
           await session.finish(finalAnswer, {
-            subtype: terminalSubtypeForRunOutcome(runOutcome),
+            subtype: terminalSubtypeForRunOutcome(verifiedRunOutcome),
             ...(repetitionVerdict.repeated
               ? { code: "no_progress_repetition" }
-              : (runOutcome === "partial" ? { code: result.error_code } : {})),
+              : (verifiedRunOutcome === "partial" ? { code: result.error_code } : {})),
           });
         }
         return;
