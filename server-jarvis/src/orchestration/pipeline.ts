@@ -972,6 +972,21 @@ export class PipelineExecutor {
     for (const batch of partitionToolCalls(parsed)) {
       const settled = await Promise.all(
         batch.map(async (entry) => {
+          // Thrift: skip real execution for tools that have structurally failed enough.
+          // Gated on thrift.dead_tool_suppression only (not master verification.enabled).
+          const suppress =
+            this.ctx.config.orchestrator.verification?.thrift?.dead_tool_suppression === true &&
+            this.conductor?.live.toolIsSuppressed(entry.call.name);
+          if (suppress && this.conductor) {
+            const result: ToolResult = {
+              call_id: entry.call.id,
+              name: entry.call.name,
+              output: `Error: ${this.conductor.live.toolRedirectNote(entry.call.name)}`,
+              is_error: true,
+              duration_ms: 0,
+            };
+            return { entry, result, duplicateKey: undefined, deflected: false };
+          }
           if (readOnlyOutputCache !== undefined && READ_ONLY_TOOLS.has(entry.call.name)) {
             const duplicateKey = duplicateToolCallKey(entry.call);
             if (readOnlyOutputCache.has(duplicateKey)) {

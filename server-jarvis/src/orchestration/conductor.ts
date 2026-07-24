@@ -23,6 +23,7 @@ import {
 } from "./runtime-loop";
 import { parseReviewerVerdict } from "./stage-output";
 import { decideVerificationDirective } from "./verification-decision";
+import { DeadToolTracker } from "./dead-tool-suppression";
 
 export interface ConductorStageEvidence {
   toolCalls?: ToolCallRecord[];
@@ -118,6 +119,8 @@ export class LiveConductor {
   private maxRepairCycles = DEFAULT_MAX_REPAIR_CYCLES;
   /** Side-channel: last verification decision asked pipeline to drop reviewer. */
   lastVerificationDroppedReviewer = false;
+  /** Thrift: structural dead-tool failures — suppress further calls this turn. */
+  private deadTools = new DeadToolTracker();
 
   constructor(
     private callModel: CallModelFn,
@@ -148,6 +151,7 @@ export class LiveConductor {
     this.writeEffectRerouteUsed = false;
     this.supervisionCallsUsed = 0;
     this.lastVerificationDroppedReviewer = false;
+    this.deadTools.reset();
     this.supervision = !this.cfg.supervise_low_complexity && complexity === "low" ? "off" : "on";
   }
 
@@ -177,8 +181,13 @@ export class LiveConductor {
     } else {
       this.consecutiveToolErrors = 0;
     }
+    this.deadTools.record(name, isError, summary);
     this.bus.publish({ type: "tool_result", stage, name, isError, summary });
   }
+
+  /** Thrift: whether a tool has structurally failed enough to stop calling it. */
+  toolIsSuppressed(name: string): boolean { return this.deadTools.isSuppressed(name); }
+  toolRedirectNote(name: string): string { return this.deadTools.redirectNote(name); }
 
   // Called after each stage completes or fails. NEVER throws — always returns a directive.
   async afterStage(
