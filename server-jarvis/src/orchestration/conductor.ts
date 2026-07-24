@@ -119,6 +119,13 @@ export class LiveConductor {
   private maxRepairCycles = DEFAULT_MAX_REPAIR_CYCLES;
   /** Side-channel: last verification decision asked pipeline to drop reviewer. */
   lastVerificationDroppedReviewer = false;
+  /**
+   * Side-channel: green existing/builtin check marked verified — pipeline may
+   * route remaining work straight to synthesizer (achieved-effect early-stop).
+   * Thrift gate (`verification.thrift.achieved_effect_early_stop`) is applied
+   * by the pipeline when honoring this flag.
+   */
+  lastVerificationEarlyStop = false;
   /** Thrift: structural dead-tool failures — suppress further calls this turn. */
   private deadTools = new DeadToolTracker();
 
@@ -151,6 +158,7 @@ export class LiveConductor {
     this.writeEffectRerouteUsed = false;
     this.supervisionCallsUsed = 0;
     this.lastVerificationDroppedReviewer = false;
+    this.lastVerificationEarlyStop = false;
     this.deadTools.reset();
     this.supervision = !this.cfg.supervise_low_complexity && complexity === "low" ? "off" : "on";
   }
@@ -198,8 +206,9 @@ export class LiveConductor {
     evidence: ConductorStageEvidence = {},
   ): Promise<ConductorDirective> {
     try {
-      // Reset verification side-channel each afterStage so stale drop flags do not leak.
+      // Reset verification side-channels each afterStage so stale flags do not leak.
       this.lastVerificationDroppedReviewer = false;
+      this.lastVerificationEarlyStop = false;
 
       // Cheap heuristic pre-filter: if tool errors hit threshold, reroute immediately
       // without spending a supervisory inference call.
@@ -255,6 +264,8 @@ export class LiveConductor {
           });
           if (decision.kind === "directive") {
             this.lastVerificationDroppedReviewer = decision.dropReviewer === true;
+            // Green existing/builtin → mark_verified; start_repair_chain must not early-stop.
+            this.lastVerificationEarlyStop = decision.directive.type === "mark_verified";
             return decision.directive;
           }
         }

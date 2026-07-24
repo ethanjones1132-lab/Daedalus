@@ -823,24 +823,43 @@ export class PipelineExecutor {
     // Owned-runtime-loop (Task 5): apply ledger + queue effects for the
     // extended directive set. Repair-chain stages are injected deterministically
     // — no further Conductor re-decision between Rewriter and Executor.
-    if (directive.type === "mark_verified" && options.taskRunContract) {
-      try {
-        const next = applySufficientVerdict(options.taskRunContract, {
-          itemId: directive.itemId,
-          gradingMode: directive.gradingMode,
-          evidence: {
-            ref: directive.evidenceRef,
-            summary: directive.evidenceSummary,
-          },
-        });
-        options.taskRunContract = next;
-        options.onTaskPlanUpdate?.(next);
-        this.conductor?.live.setPlanContext(next);
-      } catch (e) {
-        console.warn(
-          `[Pipeline] mark_verified failed for ${directive.itemId}: ` +
-          `${e instanceof Error ? e.message : String(e)}`,
-        );
+    if (directive.type === "mark_verified") {
+      if (options.taskRunContract) {
+        try {
+          const next = applySufficientVerdict(options.taskRunContract, {
+            itemId: directive.itemId,
+            gradingMode: directive.gradingMode,
+            evidence: {
+              ref: directive.evidenceRef,
+              summary: directive.evidenceSummary,
+            },
+          });
+          options.taskRunContract = next;
+          options.onTaskPlanUpdate?.(next);
+          this.conductor?.live.setPlanContext(next);
+        } catch (e) {
+          console.warn(
+            `[Pipeline] mark_verified failed for ${directive.itemId}: ` +
+            `${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      }
+
+      // Task 4.3 thrift: achieved-effect early-stop — green existing/builtin
+      // verification skips remaining intermediate stages and goes to synthesizer.
+      // Flag is set by LiveConductor verify branch; thrift gate applied here.
+      const live = this.conductor?.live;
+      if (
+        live?.lastVerificationEarlyStop === true &&
+        this.ctx.config.orchestrator.verification?.thrift?.achieved_effect_early_stop === true &&
+        options.workQueue
+      ) {
+        options.workQueue.length = 0;
+        options.workQueue.push("synthesizer");
+        console.log(`[Pipeline] achieved-effect early-stop after ${stage}: synthesizer`);
+      }
+      if (live) {
+        live.lastVerificationEarlyStop = false;
       }
     }
 
