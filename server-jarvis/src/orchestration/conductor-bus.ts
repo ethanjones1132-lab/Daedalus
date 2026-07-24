@@ -36,7 +36,7 @@ export type ConductorDirective =
       itemId: string;
       evidenceRef: string;
       evidenceSummary?: string;
-      gradingMode: "conductor_direct_diff" | "reviewer_mediated";
+      gradingMode: "conductor_direct_diff" | "reviewer_mediated" | "runtime_check";
       reason: string;
     }
   | {
