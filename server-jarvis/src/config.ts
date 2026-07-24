@@ -328,6 +328,16 @@ export interface DynamicAgentsConfig {
   max_dynamic_agents: number;
 }
 
+export interface VerificationConfig {
+  /** Master flag — off by default; canary via policy-staging before default-on. */
+  enabled: boolean;
+  /** Bounded check execution timeout. */
+  check_timeout_ms: number;
+  /** Reward weight per tier (feeds verification-reward.ts). */
+  tier_reward: { existing: number; builtin: number; synth: number; none: number };
+  thrift: { dead_tool_suppression: boolean; achieved_effect_early_stop: boolean };
+}
+
 export interface OrchestratorConfig {
   enabled: boolean;
   agents: OrchestratorAgent[];
@@ -356,6 +366,8 @@ export interface OrchestratorConfig {
   session_memory: SessionMemoryConfig;
   conductor_learning: ConductorLearningConfig;
   skill_distillation: SkillDistillationConfig;
+  /** Verification-gated conductor checks (Phase 0; default OFF). */
+  verification: VerificationConfig;
 }
 
 export interface JarvisConfig {
@@ -612,6 +624,12 @@ export function defaultConfig(): JarvisConfig {
         distill_on: ["success"],
         min_judge_score: 0.75,
         auto_promote: true,
+      },
+      verification: {
+        enabled: false,
+        check_timeout_ms: 15000,
+        tier_reward: { existing: 1, builtin: 1, synth: 0.5, none: 0 },
+        thrift: { dead_tool_suppression: true, achieved_effect_early_stop: true },
       },
     },
     system_prompt: `You are Jarvis, a local AI coding assistant running on Qwen 3.5 9B in WSL2.
