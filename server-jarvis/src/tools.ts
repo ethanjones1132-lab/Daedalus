@@ -8,6 +8,7 @@ import { promises as fs } from "fs";
 import { join, resolve, relative, dirname } from "path";
 import { spawn } from "child_process";
 import type { JarvisConfig } from "./config";
+import { applyEditMatch, locateEditMatch } from "./edit-match";
 
 // ── Tool Parameter Schema ──
 
@@ -453,18 +454,22 @@ async function toolEditFile(args: Record<string, unknown>, cfg: JarvisConfig): P
     return `File not found: ${path}`;
   }
 
-  if (!content.includes(oldStr)) {
+  // Exact match first, then a whitespace-tolerant fallback (trailing spaces,
+  // CRLF/LF, indentation drift). Free-tier models routinely reproduce the right
+  // code with slightly-off whitespace; the tolerant path only fires when it
+  // maps to exactly one location, so it cannot patch the wrong place.
+  const match = locateEditMatch(content, oldStr);
+  if (match.kind === "not_found") {
     return `Error: old_string not found in ${args.path}. Use read_file to see the current content.`;
   }
-
-  const occurrences = content.split(oldStr).length - 1;
-  if (occurrences > 1) {
-    return `Error: old_string appears ${occurrences} times in ${args.path}. Make it more specific.`;
+  if (match.kind === "ambiguous") {
+    return `Error: old_string appears multiple times in ${args.path}. Make it more specific.`;
   }
 
-  const updated = content.replace(oldStr, newStr);
+  const updated = applyEditMatch(content, match, newStr);
   await fs.writeFile(path, updated, "utf-8");
-  return `Edited ${args.path}: replaced ${oldStr.length} chars with ${newStr.length} chars`;
+  const how = match.tolerant ? " (whitespace-tolerant match)" : "";
+  return `Edited ${args.path}: replaced ${oldStr.length} chars with ${newStr.length} chars${how}`;
 }
 
 async function toolMultiEdit(args: Record<string, unknown>, cfg: JarvisConfig): Promise<string> {
@@ -485,12 +490,17 @@ async function toolMultiEdit(args: Record<string, unknown>, cfg: JarvisConfig): 
   const results: string[] = [];
 
   for (const edit of edits) {
-    if (!content.includes(edit.old_string)) {
+    const match = locateEditMatch(content, edit.old_string);
+    if (match.kind === "not_found") {
       results.push(`SKIP: "${edit.old_string.slice(0, 40)}..." not found`);
       continue;
     }
-    content = content.replace(edit.old_string, edit.new_string);
-    results.push(`OK: replaced "${edit.old_string.slice(0, 40)}..."`);
+    if (match.kind === "ambiguous") {
+      results.push(`SKIP: "${edit.old_string.slice(0, 40)}..." appears multiple times`);
+      continue;
+    }
+    content = applyEditMatch(content, match, edit.new_string);
+    results.push(`OK: replaced "${edit.old_string.slice(0, 40)}..."${match.tolerant ? " (tolerant)" : ""}`);
   }
 
   await fs.writeFile(path, content, "utf-8");
