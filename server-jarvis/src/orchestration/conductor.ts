@@ -22,6 +22,7 @@ import {
   DEFAULT_MAX_REPAIR_CYCLES,
 } from "./runtime-loop";
 import { parseReviewerVerdict } from "./stage-output";
+import { decideVerificationDirective } from "./verification-decision";
 
 export interface ConductorStageEvidence {
   toolCalls?: ToolCallRecord[];
@@ -46,6 +47,8 @@ export interface ConductorStageEvidence {
   planItem?: TaskPlanItem;
   /** Evidence pointer ref when marking verified (defaults to runId:stage). */
   evidenceRef?: string;
+  /** 2026-07-24: deterministic verification result for this change turn. */
+  checkResult?: import("./check-runner").CheckResult;
 }
 
 interface SupervisionDigest {
@@ -111,6 +114,8 @@ export class LiveConductor {
   private planContract: TaskRunContract | undefined;
   /** Max repair cycles per item (from cfg or default). */
   private maxRepairCycles = DEFAULT_MAX_REPAIR_CYCLES;
+  /** Side-channel: last verification decision asked pipeline to drop reviewer. */
+  lastVerificationDroppedReviewer = false;
 
   constructor(
     private callModel: CallModelFn,
@@ -140,6 +145,7 @@ export class LiveConductor {
     this.deepReadEvidenceRerouteUsed = false;
     this.writeEffectRerouteUsed = false;
     this.supervisionCallsUsed = 0;
+    this.lastVerificationDroppedReviewer = false;
     this.supervision = !this.cfg.supervise_low_complexity && complexity === "low" ? "off" : "on";
   }
 
@@ -181,6 +187,9 @@ export class LiveConductor {
     evidence: ConductorStageEvidence = {},
   ): Promise<ConductorDirective> {
     try {
+      // Reset verification side-channel each afterStage so stale drop flags do not leak.
+      this.lastVerificationDroppedReviewer = false;
+
       // Cheap heuristic pre-filter: if tool errors hit threshold, reroute immediately
       // without spending a supervisory inference call.
       // Reuses consecutiveToolErrors as the sole no-progress / backstop signal
@@ -218,6 +227,26 @@ export class LiveConductor {
           newRemaining: ["re-enter:executor" as StageName, ...remainingQueue],
           reason: "write-intent executor stage completed with zero successful mutations; re-entering executor once to APPLY the change with write_file/edit_file before continuing",
         };
+      }
+
+      // 2026-07-24 verification gate: a deterministic executed check decides
+      // completion for the unambiguous cases (green trustworthy tier → verify;
+      // red → repair). synth/none/ambiguous fall through to runtime-loop +
+      // resident supervision below.
+      if (stage === "executor" && outcome === "completed" && evidence.checkResult) {
+        const item = this.resolvePlanItem(evidence);
+        if (item) {
+          const decision = decideVerificationDirective({
+            check: evidence.checkResult,
+            item,
+            runId: this.runId,
+            remainingQueue,
+          });
+          if (decision.kind === "directive") {
+            this.lastVerificationDroppedReviewer = decision.dropReviewer === true;
+            return decision.directive;
+          }
+        }
       }
 
       // Owned-runtime-loop: per-item completion / repair directives (deterministic
