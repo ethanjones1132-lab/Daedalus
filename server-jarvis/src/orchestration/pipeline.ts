@@ -559,6 +559,14 @@ export interface PipelineSegmentResult {
     trigger: "reviewer_reject" | "evidence_insufficient" | "executor_hard_failure" | "effect_gate_failure" | "recursive_critique";
     detail: string;
   };
+  /**
+   * Verification-gated check for this segment (when verification enabled).
+   * Surfaced so `finalizeSegment` can put it on `PipelineResult` — the live
+   * path never calls `execute()`, which is the only place these were copied.
+   */
+  checkResult?: CheckResult;
+  /** True when the reviewer stage accepted (feeds synth-tier reward floor). */
+  reviewerAccepted?: boolean;
 }
 
 /**
@@ -3310,6 +3318,15 @@ export class PipelineExecutor {
     const remainingNow = (): StageName[] => workQueue.slice();
     let partialStage: PipelineSegmentResult["partialStage"];
     let replanRequested: PipelineSegmentResult["replanRequested"];
+    // Attach verification side-channels on every exit so replan-loop's
+    // finalizeSegment can thread them into PipelineResult (reward/provenance).
+    const finish = (
+      segment: Omit<PipelineSegmentResult, "checkResult" | "reviewerAccepted">,
+    ): PipelineSegmentResult => ({
+      ...segment,
+      checkResult: this.lastCheckResult,
+      reviewerAccepted: this.lastReviewerAccepted,
+    });
     const pendingInjections = new Map<StageName, string[]>();
     const reroutesApplied = { n: 0 };
     // Post-loop executor re-entry is bounded to one per segment: the in-loop
@@ -3466,10 +3483,10 @@ export class PipelineExecutor {
           }
         }
         if (state.executor.terminalStatus === "cancelled") {
-          return { state, partialStage };
+          return finish({ state, partialStage });
         }
         if (state.executor.errorCode === "delegate_cleanup_unconfirmed") {
-          return { state, partialStage };
+          return finish({ state, partialStage });
         }
         if (state.executor.errorCode === "effect_gate_no_write_effect") {
           const effectGate = evaluateEffectGate({
@@ -3480,7 +3497,7 @@ export class PipelineExecutor {
             assumeWriteIntent: options.taskRunWriteIntent,
             contentEffects: this.ctx.write_effects,
           });
-          return { state, effectGate, partialStage };
+          return finish({ state, effectGate, partialStage });
         }
         // T2.4: hard executor failure (non-workspace_read) → replan pre-synthesizer.
         // workspace_read falls through to the evidence fence for precise codes.
@@ -3495,7 +3512,7 @@ export class PipelineExecutor {
             trigger: "executor_hard_failure",
             detail: state.executor.narrative?.slice(0, 400) || "executor failed",
           };
-          return { state, replanRequested, partialStage };
+          return finish({ state, replanRequested, partialStage });
         }
         continue;
       }
@@ -3634,7 +3651,7 @@ export class PipelineExecutor {
             `(repairs=${loopRepairsUsed}, max=${options.maxReviewRepairRounds ?? "default"}) with reviewer issues outstanding; ` +
             `skipping synthesizer to avoid a misleading best-effort answer`,
           );
-          return { state, partialStage: { stage: "reviewer" as StageName, errorCode: "repair_cap_exhausted" } };
+          return finish({ state, partialStage: { stage: "reviewer" as StageName, errorCode: "repair_cap_exhausted" } });
         }
 
         // Backstop / exhausted: fall through to synthesizer. Mid-run replan
@@ -3654,7 +3671,7 @@ export class PipelineExecutor {
             trigger: "reviewer_reject",
             detail: reviewer.feedback?.slice(0, 400) || "reviewer rejected",
           };
-          return { state, replanRequested, partialStage };
+          return finish({ state, replanRequested, partialStage });
         }
         // Reviewer accept with active plan item → mark verified (reviewer_mediated).
         if (
@@ -3746,7 +3763,7 @@ export class PipelineExecutor {
     }
 
     if (isTerminalNoWriteEffect(effectGate)) {
-      return { state, effectGate, partialStage };
+      return finish({ state, effectGate, partialStage });
     }
 
     // A reviewer/rewriter pass that still produced no requested mutation is
@@ -3766,11 +3783,11 @@ export class PipelineExecutor {
         trigger: "effect_gate_failure",
         detail: "No successful file mutation was produced after execution and repair.",
       };
-      return { state, effectGate, replanRequested, partialStage };
+      return finish({ state, effectGate, replanRequested, partialStage });
     }
 
     if (!wantsSynthesizer) {
-      return { state, effectGate, partialStage, replanRequested };
+      return finish({ state, effectGate, partialStage, replanRequested });
     }
 
     const preSynthAssessment = assessWorkspaceEvidence(
@@ -3792,7 +3809,7 @@ export class PipelineExecutor {
       // F6: refusal is reserved for *zero* evidence. Partial evidence synthesizes
       // with an explicit disclosure notice instead of a canned fatal refuse.
       if (preSynthAssessment.contentReads + preSynthAssessment.listings === 0) {
-        return {
+        return finish({
           state,
           synthesizerAnswer: "",
           synthesizerFatalError: failure.message,
@@ -3801,7 +3818,7 @@ export class PipelineExecutor {
           effectGate,
           partialStage,
           replanRequested,
-        };
+        });
       }
       effectGate = {
         ...effectGate,
@@ -3825,7 +3842,7 @@ export class PipelineExecutor {
     if (synth.partialErrorCode) {
       partialStage = { stage: "synthesizer", errorCode: synth.partialErrorCode };
     }
-    return {
+    return finish({
       state,
       synthesizerAnswer: synth.answer,
       synthesizerFatalError: synth.fatalError,
@@ -3833,7 +3850,7 @@ export class PipelineExecutor {
       effectGate,
       partialStage,
       replanRequested,
-    };
+    });
   }
 
   async execute(
