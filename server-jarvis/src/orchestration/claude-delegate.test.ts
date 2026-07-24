@@ -1521,7 +1521,19 @@ describe("Claude executor delegate", () => {
     });
     expect(output.toolCalls.at(-1)).toMatchObject({ name: "git_metadata", is_error: true });
     expect(output.toolCalls.at(-1)?.output).toContain("verification unavailable");
-  }, 250);
+  }, 1_500);
+  // 2026-07-24 (cron: afternoon) flake pin: the 250ms budget was
+  // measuring wall-clock precision, not the behavior under test.
+  // Observed 265ms in a single full-suite run (over budget by 15ms);
+  // this test does real work (process spawn + 150ms designed wait
+  // inside snapshotFactory.capture + write-effect verification with
+  // a 25ms verificationTimeoutMs). Same wall-clock-budget-vs-real-
+  // work class as the 2026-07-20 4pm commit (47f3c78) that bumped
+  // the adjacent "verifies a claimed write" test from 250 to 1000ms
+  // for the same reason. Bumped to 1500ms to keep headroom under
+  // full-suite load (where other 250ms tests in this file cluster
+  // around 109-187ms in isolation but stretch under shared worker
+  // contention).
 
   test("strikes health on spawn errors and clean no-event exits", async () => {
     const config = testConfig();
