@@ -216,6 +216,74 @@ describe("effect gate", () => {
   });
 });
 
+// ── 2026-07-24 tier-2B calibration: recovered/benign failures must not
+// downgrade an otherwise-correct run. Every correct A/C/D run that night was
+// mislabeled `degraded` by a broken glob/grep, a disallowed bash, a probe read,
+// or a retried edit — none of which affected the delivered result. ──
+describe("effect gate — recovered/benign failure forgiveness", () => {
+  function callWith(name: string, is_error: boolean, path?: string, output = "ok"): ToolCallRecord {
+    return { name, arguments: path ? { path } : {}, output, is_error, duration_ms: 1 };
+  }
+
+  test("an edit miss recovered by a later write to the same file is clean", () => {
+    const report = evaluateEffectGate({
+      profile: "full",
+      executor: executor([
+        callWith("edit_file", true, "sol/solution.py", "Error: old_string not found"),
+        callWith("write_file", false, "solution.py", "File created"),
+      ]),
+      request: "fix the bug in solution.py",
+    });
+    expect(report.verdict).toBe("clean");
+    expect(report.consequentialFailures).toBe(0);
+    // The failure is still visible in telemetry, just not counted against us.
+    expect(report.failedCalls).toHaveLength(1);
+    expect(applyEffectGate("success", undefined, report)).toEqual({ outcome: "success" });
+  });
+
+  test("dead-end probes (broken glob, disallowed bash) are benign once a mutation lands", () => {
+    const report = evaluateEffectGate({
+      profile: "full",
+      executor: executor([
+        callWith("glob", true, undefined, "Executable not found in $PATH"),
+        callWith("bash", true, undefined, "delegate_tool_not_permitted"),
+        callWith("read_file", true, undefined, "File does not exist"),
+        callWith("edit_file", false, "solution.py", "edited"),
+      ]),
+      request: "fix the bug in solution.py",
+    });
+    expect(report.verdict).toBe("clean");
+    expect(report.consequentialFailures).toBe(0);
+  });
+
+  test("a failed write to the REAL target is NOT masked by a different file's success", () => {
+    const report = evaluateEffectGate({
+      profile: "full",
+      executor: executor([
+        callWith("write_file", true, "target.py", "permission denied"),
+        callWith("write_file", false, "scratch.py", "File created"),
+      ]),
+      request: "update target.py",
+    });
+    expect(report.verdict).toBe("tool_failures");
+    expect(report.consequentialFailures).toBe(1);
+    expect(applyEffectGate("success", undefined, report)).toEqual({
+      outcome: "degraded",
+      errorCode: "effect_gate_tool_failures",
+    });
+  });
+
+  test("a failed read on a read-only turn still surfaces (no verified mutation to excuse it)", () => {
+    const report = evaluateEffectGate({
+      profile: "read_only",
+      executor: executor([callWith("read_file", true, undefined, "File does not exist")]),
+      request: "explain the auth flow",
+    });
+    expect(report.verdict).toBe("tool_failures");
+    expect(report.consequentialFailures).toBe(1);
+  });
+});
+
 describe("executor write pressure", () => {
   const base = {
     writeIntent: true,

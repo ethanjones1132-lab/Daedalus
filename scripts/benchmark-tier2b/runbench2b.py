@@ -110,6 +110,13 @@ def run_architecture(task, sample, stream_url, live):
     ) as raw:
         directory = Path(raw)
         seed(directory, task)
+        # Seed the test file BEFORE the turn so the model can actually run it.
+        # The architecture prompt instructs "run the adjacent _t.py test before
+        # finishing" — without the file on disk that instruction is impossible
+        # and the self-verify loop can never fire (21/30 runs on 2026-07-24
+        # reported _t.py absent). run_test() below rewrites this canonical copy
+        # before scoring, so seeding it cannot let a model tamper with the grade.
+        (directory / "_t.py").write_text(task["test"], encoding="utf-8")
         body = json.dumps({
             "message": architecture_prompt(task, directory),
             "session_id": f"tier2b-{task['name']}-{sample}-{uuid.uuid4().hex[:8]}",

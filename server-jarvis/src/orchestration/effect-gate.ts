@@ -18,7 +18,15 @@ export const MAX_FAILED_WRITE_ATTEMPTS_WITHOUT_EFFECT = 2;
 export interface EffectGateReport {
   clean: boolean;
   verdict: "clean" | "tool_failures" | "no_write_effect";
+  /** Every failed tool call this turn, for telemetry — includes recovered ones. */
   failedCalls: Array<{ name: string; detail: string }>;
+  /**
+   * Count of failed calls that were NOT recovered or benign — the ones that
+   * actually drive the `tool_failures` verdict. A run whose only failures were
+   * a retried edit or a dead-end probe (broken glob, disallowed bash) that it
+   * routed around has `consequentialFailures === 0` and is not degraded for it.
+   */
+  consequentialFailures: number;
   writeIntent: boolean;
   successfulWrites: number;
   /** Number of successful write calls whose post-write bytes differ from pre-write bytes. */
@@ -74,20 +82,72 @@ export function evaluateEffectGate(input: {
   const contentDeltas = canUseContentEffects
     ? input.contentEffects!.filter((effect) => effect.changed).length
     : successfulWrites;
+  // A single failed tool call used to flip an otherwise-successful run to
+  // `degraded`. On the 2026-07-24 tier-2B run that mislabeled every correct
+  // A/C/D run: they were downgraded by a broken glob/grep, a disallowed bash,
+  // a probe read, or an edit miss the model then recovered — none of which
+  // affected the delivered result. Only *consequential* failures (not recovered
+  // by a later same-file write, not a benign probe on a verified-mutation turn)
+  // drive the verdict now. no_write_effect / repeated-write-failure protections
+  // are evaluated separately and are unchanged.
+  const consequentialFailed = calls.filter(
+    (call) => call.is_error && !isForgivableFailure(call, calls, contentDeltas, writeIntent),
+  );
   let verdict: EffectGateReport["verdict"] = "clean";
   if (hasRepeatedWriteFailureWithoutEffect(calls, writeIntent)) verdict = "no_write_effect";
-  else if (failedCalls.length > 0) verdict = "tool_failures";
+  else if (consequentialFailed.length > 0) verdict = "tool_failures";
   else if (writeIntent && contentDeltas === 0) verdict = "no_write_effect";
   const clean = verdict === "clean";
+  const consequentialForNotice = consequentialFailed.map(
+    (call) => ({ name: call.name, detail: (call.output || "").slice(0, 160) }),
+  );
   return {
     clean,
     verdict,
     failedCalls,
+    consequentialFailures: consequentialFailed.length,
     writeIntent,
     successfulWrites,
     contentDeltas,
-    synthesizerNotice: clean ? "" : buildNotice(verdict, failedCalls, successfulWrites, contentDeltas),
+    synthesizerNotice: clean ? "" : buildNotice(verdict, consequentialForNotice, successfulWrites, contentDeltas),
   };
+}
+
+function normBasename(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const cleaned = value.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  return (cleaned.split("/").pop() ?? "").toLowerCase();
+}
+
+/**
+ * A failed call should not, by itself, flip an otherwise-successful run to
+ * `degraded` when it was recovered or is inconsequential:
+ *   1. a failed write/edit whose target file was later written successfully
+ *      (same basename) — the model retried and the file did change; or
+ *   2. a failed read/search/shell probe on a turn that still produced a
+ *      verified mutation (writeIntent && contentDeltas > 0) — the model routed
+ *      around a dead-end tool (broken glob/grep, disallowed bash) and still
+ *      delivered the effect.
+ * Write failures with no same-file recovery stay consequential, so a failed
+ * write to the REAL target is never masked by an unrelated file's success.
+ */
+function isForgivableFailure(
+  failed: ToolCallRecord,
+  calls: ToolCallRecord[],
+  contentDeltas: number,
+  writeIntent: boolean,
+): boolean {
+  if (WRITE_EFFECT_TOOLS.has(failed.name)) {
+    const target = normBasename(failed.arguments?.path);
+    if (!target) return false;
+    return calls.some(
+      (candidate) => candidate !== failed
+        && !candidate.is_error
+        && WRITE_EFFECT_TOOLS.has(candidate.name)
+        && normBasename(candidate.arguments?.path) === target,
+    );
+  }
+  return writeIntent && contentDeltas > 0;
 }
 
 function buildNotice(
