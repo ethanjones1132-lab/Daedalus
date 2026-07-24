@@ -58,6 +58,10 @@ export class SessionOutcomeCollector {
     // `partial` is persisted truthfully (T0.2); reward/learning maps it to
     // degraded at the reward boundary only.
     outcome: "success" | "degraded" | "failed" | "partial" | "cancelled" = "success",
+    /** How success was verified (e.g. runtime_check). Optional; defaults to null. */
+    verifiedVia?: string,
+    /** Verification depth tier (e.g. existing). Optional; defaults to null. */
+    checkTier?: string,
   ): void {
     this.store.updateAgentRun(runId, {
       completed: 1,
@@ -66,6 +70,8 @@ export class SessionOutcomeCollector {
       tool_calls_count: toolCallsCount,
       token_count: tokenCount,
       outcome,
+      verified_via: verifiedVia ?? null,
+      check_tier: checkTier ?? null,
     });
   }
 
