@@ -66,6 +66,8 @@ interface SupervisionDigest {
   /** 2026-07-18: write contract visibility for the supervisor model. */
   writeIntent: boolean;
   successfulWrites: number;
+  /** 2026-07-24: executed verification result, when this was a change turn. */
+  checkResult?: import("./check-runner").CheckResult;
 }
 
 /**
@@ -313,6 +315,7 @@ export class LiveConductor {
         remainingQueue,
         writeIntent: evidence.writeIntent === true,
         successfulWrites,
+        checkResult: evidence.checkResult,
       };
 
       this.supervisionCallsUsed += 1;
@@ -474,6 +477,9 @@ export class LiveConductor {
           ? `Evidence assessment: ${JSON.stringify(digest.evidenceAssessment)}`
           : `Evidence assessment: not applicable — the ${digest.stage} stage produces no tool calls by design`,
         `Write intent: ${digest.writeIntent ? `TRUE — successful mutations so far: ${digest.successfulWrites}` : "no"}`,
+        digest.checkResult
+          ? `Executed check (authoritative — do NOT contradict): tier=${digest.checkResult.tier} ran=${digest.checkResult.ran} passed=${digest.checkResult.passed}${digest.checkResult.detail ? ` detail=${digest.checkResult.detail.slice(0, 200)}` : ""}`
+          : "Executed check: none",
         `Request (300 chars): ${digest.requestSummary || "(not provided)"}`,
         `Worker instruction: ${digest.workerInstruction || "(not provided)"}`,
         `Remaining queue: ${digest.remainingQueue.length > 0 ? digest.remainingQueue.join(" → ") : "(none)"}`,
