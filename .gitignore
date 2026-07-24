@@ -30,6 +30,14 @@ nul
 DumpStack.log
 *.tmp
 
+# --- Build artifacts (never commit) ---
+Users/
+server-jarvis/Users/
+
+# --- Firebase CLI debug logs (transient, never commit) ---
+firebase-debug.log
+firebase-debug.*.log
+
 # --- Local secrets / config ---
 .env
 .env.*

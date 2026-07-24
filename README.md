@@ -7,7 +7,7 @@ Native Rust shell · Bun HTTP server · React UI · SQLite persistence · Multi-
 
 [![License](https://img.shields.io/badge/license-MIT-green)](src-tauri/LICENSE)
 [![Version](https://img.shields.io/badge/version-3.0.0-blue)](package.json)
-[![Tests](https://img.shields.io/badge/tests-1104%20bun%20|%2085%20cargo-success)](scripts/verify.sh)
+[![Tests](https://img.shields.io/badge/tests-1914%20bun%20|%2085%20cargo-success)](scripts/verify.sh)
 [![Platform](https://img.shields.io/badge/platform-Windows%20|%20Linux%20|%20macOS-lightgrey)]()
 
 </div>
@@ -123,6 +123,7 @@ The live-session orchestration path now protects the stages that matter most to 
 - Stage-health cooldowns and rolling per-stage model scorecards reach both the agent pool and fallback cascade, so unhealthy candidates are not immediately selected again.
 - Hidden reasoning deltas count as transport liveness without leaking into visible output. Trivial short-circuit turns use the fast synthesizer tier, while routed pipelines shed advisory stages when the remaining turn budget is tight.
 - Local conductor routing fails fast after 10 seconds and can fall back to a deterministic route when coordinator candidates are unavailable or unfit.
+- Post-loop executor↔reviewer repair re-entry is capped at one attempt per segment and terminates cleanly at the reviewer repair-round cap (`repair_cap_exhausted`) instead of re-firing indefinitely. This closes an unbounded-loop path on contract-less turns (e.g. single-shot benchmark/API calls with no TaskPlan ledger), where the repair-cycle counter never advanced and the old cap check was a no-op — verified against a full 30-sample Tier-2B live benchmark run with no stalls.
 
 The one-off `scripts/retro-correct-empty-stages.ts` utility can repair historical empty-stage labels in `self-tuning.db`. Preview its target rows first, stop the server before applying the update, and treat it as an operator migration rather than a startup task.
 
@@ -147,7 +148,7 @@ Every major system shipped in the last two months:
 | **Track D (eval)** | GRPO-ready JSONL export, composite reward model | Complete |
 | **OpenCode fallback** | Provider credentials, pool availability filtering, per-provider timeouts | Complete |
 
-Latest (2026-07-15): live-session orchestration reliability fixes, stage-health cascade exclusions, reasoning-delta liveness, route-budget reconciliation, and rolling model scorecards. See [`PRIORITIES.md`](PRIORITIES.md) for the full changelog with commit SHAs and test counts.
+Latest (2026-07-24): bounded post-loop repair re-entry — fixes an unbounded executor↔reviewer loop on contract-less turns, verified against a full 30-sample Tier-2B live benchmark run. See [`PRIORITIES.md`](PRIORITIES.md) for the full changelog with commit SHAs and test counts.
 
 ---
 
@@ -262,7 +263,7 @@ Auto-created on first run at:
 
 ## Verification
 
-The current automated baseline is **1,104 Bun tests across 105 files**, **85 Cargo tests**, and clean server/UI TypeScript checks.
+The current automated baseline is **1,914 Bun tests across 136 files**, **85 Cargo tests**, and clean server/UI TypeScript checks.
 
 The fastest way to check everything is healthy:
 
@@ -336,7 +337,7 @@ This codebase started as `home-base-recovered` after a **2026-06 WSL disk wipe**
 
 The Rust crate is `home-base` (v0.1.0), the Bun server is `server-jarvis` (v3.0.0), and the app surface is branded **Jarvis** (`com.jarvis.desktop`). These different names come from different layers of the stack — they all point to the same desktop agent platform.
 
-**Current test health:** 925 Bun tests across 90+ files · 85 Cargo tests · both `tsc` jobs clean.
+**Current test health:** 1,914 Bun tests across 136 files · 85 Cargo tests · both `tsc` jobs clean.
 
 ---
 

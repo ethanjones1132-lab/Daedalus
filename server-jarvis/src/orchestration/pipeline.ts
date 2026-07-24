@@ -2526,6 +2526,22 @@ export class PipelineExecutor {
     rewriter?: RewriterStageOutput;
     /** How many in-loop rewriter repair passes ran (ledger increments). */
     loopRepairsUsed: number;
+    /**
+     * True when at least one rewriter round produced new write progress
+     * (addedWriteProgress). The post-loop re-entry path skips re-firing the
+     * executor→reviewer chain when this is false, since the loop has
+     * already established that re-running the same chain would not advance.
+     */
+    loopAddedProgress: boolean;
+    /**
+     * True when the in-loop loop exited because the repair-round cap was
+     * reached (repairs >= maxRepairRounds). The post-loop re-entry path
+     * skips re-firing the chain when the cap is the bound, because the cap
+     * IS the budget decision and re-entering would just burn more cycles
+     * inside the same cap. Set false when the loop exited for any other
+     * reason (no issues, no write intent, no-progress, or backstop).
+     */
+    loopHitCap: boolean;
     /** True when applyInsufficientVerdict blocked the active item. */
     itemBackstopped: boolean;
   }> {
@@ -2549,6 +2565,17 @@ export class PipelineExecutor {
     let rewriterOutput: RewriterStageOutput | undefined;
     let rewriterSummaryForPrompt = "No rewriting stage executed.";
     let itemBackstopped = false;
+    // Tracks whether the in-loop rewriter produced new write progress on at
+    // least one round. Starts true so a loop that exits with repairs=0 (no
+    // rewriter ran, e.g. reviewer accepted on first pass) is treated as
+    // "progress made" -- the post-loop re-entry only needs to skip when the
+    // loop's own rewriter established that re-running would stall.
+    let loopAddedProgress = true;
+    // Tracks whether the in-loop loop exited because the repair-round cap
+    // was reached. Set inside the cap-detection break; preserved on return
+    // so the caller can decide whether the post-loop re-entry is worthwhile
+    // (it isn't when the cap is the bound).
+    let loopHitCap = false;
     const writeIntentForTurn =
       hasWriteIntent(options.rawMessage ?? request) || options.taskRunWriteIntent === true;
 
@@ -2667,6 +2694,12 @@ export class PipelineExecutor {
           hasPendingIssues = true;
         }
         if (!hasPendingIssues || profile !== "full" || !writeIntentForTurn || repairs >= maxRepairRounds) {
+          // The cap is the budget decision -- once the in-loop loop has
+          // spent its allowed repair rounds, the segment-level cap is the
+          // final bound and a post-loop re-entry would just burn another
+          // pair of executor+reviewer cycles inside the same cap. Signal
+          // that so the caller can skip the re-entry.
+          if (repairs >= maxRepairRounds) loopHitCap = true;
           break;
         }
 
@@ -2734,9 +2767,17 @@ export class PipelineExecutor {
           ...(rewriterOutput.toolCalls ?? []),
         ]);
         if (!addedWriteProgress(beforeWrites, afterWrites)) {
+          // The rewriter's writes are a strict subset of what the executor
+          // already produced. Re-firing executor→reviewer after the loop
+          // would hit the same no-progress wall, so signal the caller to
+          // skip the post-loop re-entry.
+          loopAddedProgress = false;
           hasPendingIssues = true;
           break;
         }
+        // At least one repair round produced new write progress; preserve
+        // that signal even if a later round regresses.
+        loopAddedProgress = true;
       } catch (e: any) {
         const message = errText(e);
         onStateChange({ stage: "reviewer", status: "failed", output: message });
@@ -2761,6 +2802,8 @@ export class PipelineExecutor {
       reviewer: { ok: reviewerOk, feedback: reviewerFeedback, hasIssues: this.hasIssues(reviewerFeedback) },
       rewriter: rewriterOutput,
       loopRepairsUsed: repairs,
+      loopAddedProgress,
+      loopHitCap,
       itemBackstopped,
     };
   }
@@ -3145,6 +3188,14 @@ export class PipelineExecutor {
     let replanRequested: PipelineSegmentResult["replanRequested"];
     const pendingInjections = new Map<StageName, string[]>();
     const reroutesApplied = { n: 0 };
+    // Post-loop executor re-entry is bounded to one per segment: the in-loop
+    // already paid for its cycle (`loopRepairsUsed > 0`) and the ledger cap is
+    // already enforced inside `runReviewerRewriterLoop`. Re-firing the segment
+    // chain without incrementing any counter would loop forever when the
+    // reviewer never accepts (the 2026-07-23 "repair rounds hard-capped at 2"
+    // regression — `ledgerCycles` stays 0 for tests that don't pass a contract
+    // plan, so the prior `ledgerCycles <= maxRepairCycles` check was a no-op).
+    let postLoopReentriesUsed = 0;
     const opts = {
       ...options,
       pendingInjections,
@@ -3337,6 +3388,8 @@ export class PipelineExecutor {
           reviewer,
           rewriter,
           loopRepairsUsed,
+          loopAddedProgress,
+          loopHitCap,
           itemBackstopped,
         } = await this.runReviewerRewriterLoop(
           request, renderPlanSummary(state.plan), renderExecutorSummary(state.executor), state.executor?.toolCalls ?? [],
@@ -3372,14 +3425,27 @@ export class PipelineExecutor {
         // Case B: loop already rewrote; issues remain; not backstopped → one
         // Executor→Reviewer re-entry (do not re-increment; loop owned the cycle).
         // Allow re-entry even when decideRepairChain would treat the completed
-        // loop cycle as at-cap — the loop already paid for that cycle.
+        // loop cycle as at-cap — the loop already paid for that cycle. Skip
+        // the re-entry when the in-loop rewriter established no new write
+        // progress (`loopAddedProgress === false`): re-firing the same chain
+        // would hit the same no-progress wall, and the synthesizer should
+        // surface the unverifiable state instead of burning another budget
+        // cycle. Also skip when the in-loop exited at the repair-round cap
+        // (`loopHitCap === true`): the cap is the budget decision and a
+        // post-loop re-entry would just burn more cycles inside the same
+        // cap. This is the 2026-07-23 "repair rounds hard-capped at 2"
+        // regression fix — `ledgerCycles` stays 0 for tests that don't pass
+        // a contract plan, and the prior unbounded re-entry looped forever
+        // when the reviewer never accepts.
         const allowExecutorReentryAfterLoop =
           Boolean(reviewer?.hasIssues)
           && writeIntentForRepair
           && profile === "full"
           && !itemBackstopped
           && loopRepairsUsed > 0
-          && ledgerCycles <= maxRepairCycles;
+          && loopAddedProgress
+          && !loopHitCap
+          && postLoopReentriesUsed === 0;
 
         if (repairDecision.fire && loopRepairsUsed === 0) {
           const chainRemaining = mergeRepairChainIntoRemaining(
@@ -3420,11 +3486,31 @@ export class PipelineExecutor {
           );
           workQueue.length = 0;
           workQueue.push(...chainRemaining);
+          postLoopReentriesUsed += 1;
           console.log(
             `[Pipeline] post-loop executor re-entry after in-loop rewrite ` +
-            `(ledger cycles=${ledgerCycles}): ${chainRemaining.join("->")}`,
+            `(ledger cycles=${ledgerCycles}, post-loop re-entries=${postLoopReentriesUsed}): ${chainRemaining.join("->")}`,
           );
           continue;
+        }
+
+        // Cap-hit termination: when the in-loop loop exhausted its repair-
+        // round cap with issues still outstanding, the segment-level cap IS
+        // the budget decision. Surface the unverifiable state in the run
+        // outcome via `degraded` (reviewer rejected at cap) and skip the
+        // synthesizer -- a synthesizer that runs after a reviewer-rejected
+        // cap would produce a "best effort" answer that the reviewer has
+        // already flagged as incorrect, which is worse than a typed failure
+        // the operator can see. The finalizer's reviewer-reject path
+        // already produces the right outcome envelope; this is the
+        // segment-level companion.
+        if (loopHitCap && reviewer?.hasIssues && profile === "full") {
+          console.warn(
+            `[Pipeline] terminating at repair-round cap ` +
+            `(repairs=${loopRepairsUsed}, max=${options.maxReviewRepairRounds ?? "default"}) with reviewer issues outstanding; ` +
+            `skipping synthesizer to avoid a misleading best-effort answer`,
+          );
+          return { state, partialStage: { stage: "reviewer" as StageName, errorCode: "repair_cap_exhausted" } };
         }
 
         // Backstop / exhausted: fall through to synthesizer. Mid-run replan

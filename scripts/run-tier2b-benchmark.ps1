@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [ValidateSet('baseline', 'architecture', 'both')]
-    [string]$Arm = 'both',
+    [string]$Arm = 'architecture',
     [ValidateRange(1, 3)]
     [int]$K = 3,
     [switch]$Live,
