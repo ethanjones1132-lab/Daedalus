@@ -3942,6 +3942,8 @@ export class PipelineExecutor {
           profile: options.executionProfile ?? "full",
           executor: state.executor,
           rewriter: state.rewriter,
+          request,
+          assumeWriteIntent: options.taskRunWriteIntent,
           contentEffects: this.ctx.write_effects,
         }),
       );
@@ -3984,6 +3986,8 @@ export class PipelineExecutor {
         profile: options.executionProfile ?? "full",
         executor: state.executor,
         rewriter: state.rewriter,
+        request,
+        assumeWriteIntent: options.taskRunWriteIntent,
         contentEffects: this.ctx.write_effects,
       }),
     ));
