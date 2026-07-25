@@ -24,6 +24,7 @@ import {
 import { parseReviewerVerdict } from "./stage-output";
 import { decideVerificationDirective } from "./verification-decision";
 import { DeadToolTracker } from "./dead-tool-suppression";
+import { decideMidLoopIntervention, type LoopIntervention, type MidLoopSignal } from "./mid-loop-intervention";
 
 export interface ConductorStageEvidence {
   toolCalls?: ToolCallRecord[];
@@ -113,6 +114,9 @@ export class LiveConductor {
   private writeEffectRerouteUsed = false;
   /** F7: per-run supervision inference counter (reset in setContext). */
   private supervisionCallsUsed = 0;
+  /** Rung 2: per-run cap on mid-loop resident-model escalations. */
+  private midLoopEscalationsUsed = 0;
+  private static readonly MAX_MID_LOOP_ESCALATIONS = 3;
   /** Owned-runtime-loop: optional TaskPlan contract for per-item grading. */
   private planContract: TaskRunContract | undefined;
   /** Max repair cycles per item (from cfg or default). */
@@ -157,6 +161,7 @@ export class LiveConductor {
     this.deepReadEvidenceRerouteUsed = false;
     this.writeEffectRerouteUsed = false;
     this.supervisionCallsUsed = 0;
+    this.midLoopEscalationsUsed = 0;
     this.lastVerificationDroppedReviewer = false;
     this.lastVerificationEarlyStop = false;
     this.deadTools.reset();
@@ -197,7 +202,66 @@ export class LiveConductor {
   toolIsSuppressed(name: string): boolean { return this.deadTools.isSuppressed(name); }
   toolRedirectNote(name: string): string { return this.deadTools.redirectNote(name); }
 
-  // Called after each stage completes or fails. NEVER throws — always returns a directive.
+  /**
+   * Rung 2: real-time in-turn ownership. Deterministic reflexes handle the
+   * unambiguous cases with zero inference; only the ambiguous middle (some
+   * signal, but not enough to trust a reflex) escalates to the resident
+   * conductor, bounded per run so cost stays predictable.
+   */
+  async checkMidLoop(signal: MidLoopSignal): Promise<LoopIntervention> {
+    const reflex = decideMidLoopIntervention(signal);
+    if (reflex.kind !== "continue") return reflex;
+
+    // Only escalate when there is SOME signal worth asking about - a clean
+    // turn with no reads/writes yet must not spend an inference for nothing.
+    const worthAsking = signal.writeIntent && signal.successfulWrites === 0 && signal.distinctSuccessfulReads > 0;
+    if (!worthAsking || this.midLoopEscalationsUsed >= LiveConductor.MAX_MID_LOOP_ESCALATIONS) {
+      return { kind: "continue" };
+    }
+    this.midLoopEscalationsUsed += 1;
+
+    try {
+      const userContent = [
+        "Mid-loop checkpoint - the executor is still running.",
+        `Turn ${signal.turnCount}/${signal.maxTurns}, stage budget remaining: ${Math.round(signal.stageRemainingMs / 1000)}s.`,
+        `Write intent: true. Successful writes so far: ${signal.successfulWrites}. Distinct successful reads: ${signal.distinctSuccessfulReads}.`,
+        "Decide: is this productive exploration (continue), should the executor be pressed to write now (force_write), " +
+          "or has it spiraled beyond recovery (abort_stage)?",
+      ].join("\n");
+      const conductorPrompt = loadPrompt("conductor.md");
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(
+          () => reject(new Error("mid-loop escalation timeout")),
+          this.cfg.supervision_timeout_ms,
+        );
+      });
+      let result: Awaited<ReturnType<typeof this.supervisorModel>>;
+      try {
+        result = await Promise.race([
+          this.supervisorModel(
+            [{ role: "system", content: conductorPrompt }, { role: "user", content: userContent }],
+            { temperature: 0.1, max_tokens: 120, stageLabel: "coordinator", suppressActivity: true },
+          ),
+          timeoutPromise,
+        ]);
+      } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+      }
+      const parsed = extractJson<{ directive: string; reason?: string }>(result.content);
+      if (parsed.directive === "abort_stage") {
+        return { kind: "abort", reason: parsed.reason ?? "resident conductor judged the turn unrecoverable" };
+      }
+      if (parsed.directive === "force_write") {
+        return { kind: "force_write", note: parsed.reason ?? "resident conductor: apply the change now" };
+      }
+      return { kind: "continue" };
+    } catch {
+      return { kind: "continue" }; // fail-open: escalation must never abort a turn
+    }
+  }
+
+  // Called after each stage completes or fails. NEVER throws - always returns a directive.
   async afterStage(
     stage: StageName,
     outcome: "completed" | "failed",

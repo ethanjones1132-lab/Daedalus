@@ -875,4 +875,50 @@ describe("LiveConductor verification early-stop side-channel (Task 4.3)", () => 
     expect(conductor.lastVerificationEarlyStop).toBe(false);
     expect(conductor.lastVerificationDroppedReviewer).toBe(false);
   });
+
+  describe("checkMidLoop", () => {
+    const baseSignal = {
+      writeIntent: true, successfulWrites: 0, distinctSuccessfulReads: 3,
+      turnCount: 5, maxTurns: 20, stageRemainingMs: 200_000,
+      deadToolSuppressed: false, suppressedToolName: undefined,
+    };
+
+    test("reflex fast-path never calls the supervisor model", async () => {
+      let called = false;
+      const conductor = new LiveConductor(
+        async () => ({ content: "{}" }), new ConductorBus(), new AgentPool([]),
+        { supervision_timeout_ms: 1000, max_tool_errors_before_reroute: 3, supervise_low_complexity: true },
+        async () => { called = true; return { content: "{}" }; },
+      );
+      conductor.setContext("general", "medium", "run-1");
+      const result = await conductor.checkMidLoop({ ...baseSignal, deadToolSuppressed: true, suppressedToolName: "glob" });
+      expect(result).toMatchObject({ kind: "redirect", tool: "glob" });
+      expect(called).toBe(false);
+    });
+
+    test("ambiguous middle escalates to the resident supervisor and applies its directive", async () => {
+      const supervisorModel = async () => ({ content: JSON.stringify({ directive: "abort_stage", stage: "executor", reason: "spiral" }) });
+      const conductor = new LiveConductor(
+        async () => ({ content: "{}" }), new ConductorBus(), new AgentPool([]),
+        { supervision_timeout_ms: 2000, max_tool_errors_before_reroute: 3, supervise_low_complexity: true },
+        supervisorModel,
+      );
+      conductor.setContext("general", "medium", "run-2");
+      const result = await conductor.checkMidLoop(baseSignal);
+      expect(result.kind).toBe("abort");
+    });
+
+    test("escalation is capped per turn - further ambiguous calls fall back to continue", async () => {
+      let calls = 0;
+      const supervisorModel = async () => { calls++; return { content: JSON.stringify({ directive: "continue" }) }; };
+      const conductor = new LiveConductor(
+        async () => ({ content: "{}" }), new ConductorBus(), new AgentPool([]),
+        { supervision_timeout_ms: 2000, max_tool_errors_before_reroute: 3, supervise_low_complexity: true },
+        supervisorModel,
+      );
+      conductor.setContext("general", "medium", "run-3");
+      for (let i = 0; i < 5; i++) await conductor.checkMidLoop(baseSignal);
+      expect(calls).toBeLessThanOrEqual(3);
+    });
+  });
 });
