@@ -132,6 +132,26 @@ describe("Self tuning", () => {
     expect(run?.outcome).toBe("partial");
   });
 
+  // Task 5.2: verification provenance columns on agent_runs.
+  test("completeAgentRun persists verified_via and check_tier", () => {
+    const store = new SelfTuningStore(TEST_DB_PATH);
+    const collector = new SessionOutcomeCollector(store);
+    collector.startAgentRun("run_verified", "s", "q", "coding", ["executor"]);
+    collector.completeAgentRun(
+      "run_verified",
+      "tests passed",
+      42,
+      1,
+      10,
+      "success",
+      "runtime_check",
+      "existing",
+    );
+    const run = store.getAgentRuns().find((r) => r.id === "run_verified");
+    expect(run?.verified_via).toBe("runtime_check");
+    expect(run?.check_tier).toBe("existing");
+  });
+
   // T0.2: stage_runs stop_reason + partial_error_code round-trip (new columns
   // + idempotent guarded ALTER on pre-existing DBs).
   test("insertStageRun persists stop_reason and partial_error_code", () => {

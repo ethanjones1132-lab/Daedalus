@@ -307,6 +307,14 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
 }
 
 function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean): PipelineResult {
+  // Task 5.3: thread verification fields from the segment so index.ts reward
+  // mapping (`result.checkResult` → mapCheckToReward → verified_via/check_tier)
+  // works on the production replan-loop path (not only PipelineExecutor.execute).
+  const checkFields = {
+    checkResult: segment.checkResult,
+    reviewerAccepted: segment.reviewerAccepted,
+  };
+
   if (segment.state.executor?.terminalStatus === "cancelled") {
     return {
       answer: "",
@@ -314,6 +322,7 @@ function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean)
       outcome: "failed",
       error_code: segment.state.executor.errorCode ?? "delegate_aborted",
       toolCalls: segment.state.executor.toolCalls,
+      ...checkFields,
     };
   }
   if (segment.state.executor?.errorCode === "delegate_cleanup_unconfirmed") {
@@ -323,6 +332,7 @@ function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean)
       outcome: "failed",
       error_code: "delegate_cleanup_unconfirmed",
       toolCalls: segment.state.executor.toolCalls,
+      ...checkFields,
     };
   }
   const upstreamDegraded = Boolean(
@@ -349,6 +359,7 @@ function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean)
       error_code: partialErrorCode ?? gated.errorCode,
       toolCalls: segment.state.executor?.toolCalls,
       replanRequested: segment.replanRequested,
+      ...checkFields,
     };
   }
 
@@ -400,5 +411,6 @@ function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean)
     error_code: errorCode,
     toolCalls: segment.state.executor?.toolCalls,
     replanRequested: segment.replanRequested,
+    ...checkFields,
   };
 }

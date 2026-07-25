@@ -761,3 +761,118 @@ describe("LiveConductor owned-runtime-loop directives (Task 5)", () => {
     }
   });
 });
+
+describe("LiveConductor verification early-stop side-channel (Task 4.3)", () => {
+  const planItem = {
+    id: "pi_verify",
+    title: "Verified change",
+    dependsOn: [] as string[],
+    acceptanceChecks: [] as Array<{ id: string; description: string }>,
+    status: "active" as const,
+    repairCycleCount: 0,
+  };
+
+  test("green existing check sets lastVerificationEarlyStop + dropReviewer when reviewer queued", async () => {
+    const { conductor } = makeConductor();
+    conductor.setContext("general", "high", "run-early-stop-existing");
+    const directive = await conductor.afterStage(
+      "executor",
+      "completed",
+      "applied change",
+      ["reviewer", "synthesizer"],
+      {
+        planItem,
+        checkResult: {
+          tier: "existing",
+          ran: true,
+          passed: true,
+          detail: "",
+          command: "run:npm test",
+          durationMs: 12,
+        },
+      },
+    );
+    expect(directive.type).toBe("mark_verified");
+    if (directive.type === "mark_verified") {
+      expect(directive.gradingMode).toBe("runtime_check");
+    }
+    expect(conductor.lastVerificationEarlyStop).toBe(true);
+    expect(conductor.lastVerificationDroppedReviewer).toBe(true);
+  });
+
+  test("green builtin check sets lastVerificationEarlyStop without dropReviewer when no reviewer", async () => {
+    const { conductor } = makeConductor();
+    conductor.setContext("general", "high", "run-early-stop-builtin");
+    const directive = await conductor.afterStage(
+      "executor",
+      "completed",
+      "applied change",
+      ["synthesizer"],
+      {
+        planItem,
+        checkResult: {
+          tier: "builtin",
+          ran: true,
+          passed: true,
+          detail: "",
+          command: "syntax_check",
+          durationMs: 3,
+        },
+      },
+    );
+    expect(directive.type).toBe("mark_verified");
+    expect(conductor.lastVerificationEarlyStop).toBe(true);
+    expect(conductor.lastVerificationDroppedReviewer).toBe(false);
+  });
+
+  test("failed check starts repair chain and does not early-stop", async () => {
+    const { conductor } = makeConductor();
+    conductor.setContext("general", "high", "run-no-early-stop-fail");
+    const directive = await conductor.afterStage(
+      "executor",
+      "completed",
+      "applied change",
+      ["reviewer", "synthesizer"],
+      {
+        planItem,
+        checkResult: {
+          tier: "existing",
+          ran: true,
+          passed: false,
+          detail: "AssertionError: expected 1",
+          command: "run:npm test",
+          durationMs: 20,
+        },
+      },
+    );
+    expect(directive.type).toBe("start_repair_chain");
+    expect(conductor.lastVerificationEarlyStop).toBe(false);
+    expect(conductor.lastVerificationDroppedReviewer).toBe(false);
+  });
+
+  test("side-channels reset at start of next afterStage", async () => {
+    const { conductor } = makeConductor();
+    conductor.setContext("general", "high", "run-early-stop-reset");
+    await conductor.afterStage(
+      "executor",
+      "completed",
+      "applied change",
+      ["reviewer", "synthesizer"],
+      {
+        planItem,
+        checkResult: {
+          tier: "existing",
+          ran: true,
+          passed: true,
+          detail: "",
+          command: "run:npm test",
+          durationMs: 12,
+        },
+      },
+    );
+    expect(conductor.lastVerificationEarlyStop).toBe(true);
+    await conductor.afterStage("planner", "completed", "plan", ["executor"]);
+    expect(conductor.lastVerificationEarlyStop).toBe(false);
+    expect(conductor.lastVerificationDroppedReviewer).toBe(false);
+  });
+});

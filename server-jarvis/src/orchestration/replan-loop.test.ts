@@ -679,6 +679,50 @@ describe("runPipelineWithReplanning", () => {
     expect(segmentStages[1]).toContain("synthesizer");
   });
 
+  // Task 5.3: production path is replan-loop → finalizeSegment, not execute().
+  // checkResult / reviewerAccepted must survive finalize so index.ts can map
+  // reward + verified_via / check_tier.
+  test("finalizeSegment copies checkResult and reviewerAccepted onto PipelineResult", async () => {
+    const checkResult = {
+      tier: "builtin" as const,
+      ran: true,
+      passed: true,
+      detail: "syntax ok",
+      command: "syntax-gate",
+      durationMs: 12,
+    };
+    const executor = {
+      executeSegment: async () => ({
+        state: {
+          executor: { ok: true, narrative: "wrote file", toolCalls: [] },
+          reviewer: { ok: true, hasIssues: false, feedback: "ACCEPT" },
+        },
+        synthesizerAnswer: "Change applied and verified.",
+        synthesizerEmptyCompletion: false,
+        checkResult,
+        reviewerAccepted: true,
+      }),
+    } as unknown as PipelineExecutor;
+
+    const coordinator = new Coordinator((async () => ({ content: "unused" })) as any);
+    const result = await runPipelineWithReplanning({
+      contextMessage: "fix the bug",
+      initialDecision: baseDecision({ pipeline: ["executor", "reviewer", "synthesizer"] }),
+      turnRequirement: "full_execution",
+      coordinator,
+      routeOptions: { sessionId: "check-fields-finalize" },
+      executor,
+      agentRunId: "run-check-fields-finalize",
+      onStateChange: () => {},
+      baseOptions: {},
+      maxReplans: 0,
+    });
+
+    expect(result.checkResult).toEqual(checkResult);
+    expect(result.reviewerAccepted).toBe(true);
+    expect(result.answer).toBe("Change applied and verified.");
+  });
+
   test("read_only profile cannot escalate to full even if the replanned decision implies more authority", async () => {
     const profiles: Array<string | undefined> = [];
     const callModel = async () => ({ content: "ok" });

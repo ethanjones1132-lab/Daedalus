@@ -4,6 +4,7 @@ import { deriveEvidenceTaskKind } from "./turn-requirements";
 import { injectToolGuidelines } from "./tool-guidelines";
 import { checkWrittenFilesSyntax, renderSyntaxIssues, type SyntaxIssue } from "./syntax-gate";
 import { renderRunIssues, runWrittenCodeGate, type RunGateResult } from "./run-gate";
+import { mergeToCheckResult, runVerificationCheck, type CheckResult } from "./check-runner";
 import { BUILTIN_MODES, executorTurnLimit, getToolsForMode } from "./modes";
 import { toolResultModelText, type ToolRuntime, type ExecutionContext } from "../tool-runtime";
 import type { CallModelFn, ChatMessage } from "./router";
@@ -526,6 +527,10 @@ export interface PipelineResult {
    * topology that has no ToolCallRecord[] to report).
    */
   toolCalls?: ToolCallRecord[];
+  /** Verification-gated check result for this turn (when verification enabled). */
+  checkResult?: CheckResult;
+  /** True when the reviewer stage accepted (feeds synth-tier reward floor). */
+  reviewerAccepted?: boolean;
   /** T2.5: recursive critique asked for conductor replan. */
   replanRequested?: PipelineSegmentResult["replanRequested"];
 }
@@ -554,6 +559,14 @@ export interface PipelineSegmentResult {
     trigger: "reviewer_reject" | "evidence_insufficient" | "executor_hard_failure" | "effect_gate_failure" | "recursive_critique";
     detail: string;
   };
+  /**
+   * Verification-gated check for this segment (when verification enabled).
+   * Surfaced so `finalizeSegment` can put it on `PipelineResult` — the live
+   * path never calls `execute()`, which is the only place these were copied.
+   */
+  checkResult?: CheckResult;
+  /** True when the reviewer stage accepted (feeds synth-tier reward floor). */
+  reviewerAccepted?: boolean;
 }
 
 /**
@@ -662,6 +675,10 @@ export class PipelineExecutor {
   private conductor?: ConductorWiring;
   /** One delegate process maximum per logical agent run, including replans. */
   private delegateAttemptedRuns = new Set<string>();
+  /** Last verification check for this execute() turn (feeds conductor + reward). */
+  private lastCheckResult: CheckResult | undefined;
+  /** Reviewer accepted this turn (synth-tier reward upgrade). */
+  private lastReviewerAccepted = false;
 
   constructor(
     private callModel: CallModelFn,
@@ -687,6 +704,38 @@ export class PipelineExecutor {
       workspaceOverride: this.ctx.workspace_path,
       sessionGrants: options.sessionGrants ?? this.ctx.session_grants,
     });
+  }
+
+  /**
+   * Verification-gated conductor (Task 5.3): run syntax + run gates and merge
+   * into a tiered CheckResult. No-op when `orchestrator.verification.enabled`
+   * is false (default) so existing behavior stays inert.
+   */
+  private async runTurnVerification(
+    toolCalls: ToolCallRecord[],
+    request: string,
+    planSummary: string,
+  ): Promise<CheckResult | undefined> {
+    if (!this.ctx.config.orchestrator?.verification?.enabled) return undefined;
+    const workspaceRoot =
+      this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd();
+    const timeoutMs = this.ctx.config.orchestrator.verification.check_timeout_ms ?? 15000;
+    try {
+      return await runVerificationCheck({
+        toolCalls,
+        request,
+        plan: planSummary,
+        workspaceRoot,
+        timeoutMs,
+        runSyntax: (tc) => this.gateWrittenSyntax([...tc]),
+        runTests: (tc, req, pl) => this.gateWrittenRun([...tc], req, pl),
+      });
+    } catch (e) {
+      console.warn(
+        `[Pipeline] verification check failed: ${e instanceof Error ? e.message : String(e)}`,
+      );
+      return undefined;
+    }
   }
 
   private registerStageAbort(stage: StageName): AbortSignal | undefined {
@@ -823,24 +872,53 @@ export class PipelineExecutor {
     // Owned-runtime-loop (Task 5): apply ledger + queue effects for the
     // extended directive set. Repair-chain stages are injected deterministically
     // — no further Conductor re-decision between Rewriter and Executor.
-    if (directive.type === "mark_verified" && options.taskRunContract) {
-      try {
-        const next = applySufficientVerdict(options.taskRunContract, {
-          itemId: directive.itemId,
-          gradingMode: directive.gradingMode,
-          evidence: {
-            ref: directive.evidenceRef,
-            summary: directive.evidenceSummary,
-          },
-        });
-        options.taskRunContract = next;
-        options.onTaskPlanUpdate?.(next);
-        this.conductor?.live.setPlanContext(next);
-      } catch (e) {
-        console.warn(
-          `[Pipeline] mark_verified failed for ${directive.itemId}: ` +
-          `${e instanceof Error ? e.message : String(e)}`,
-        );
+    if (directive.type === "mark_verified") {
+      if (options.taskRunContract) {
+        try {
+          const next = applySufficientVerdict(options.taskRunContract, {
+            itemId: directive.itemId,
+            gradingMode: directive.gradingMode,
+            evidence: {
+              ref: directive.evidenceRef,
+              summary: directive.evidenceSummary,
+            },
+          });
+          options.taskRunContract = next;
+          options.onTaskPlanUpdate?.(next);
+          this.conductor?.live.setPlanContext(next);
+        } catch (e) {
+          console.warn(
+            `[Pipeline] mark_verified failed for ${directive.itemId}: ` +
+            `${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      }
+
+      // Task 4.3 thrift + Task 5.3 dropReviewer: green existing/builtin can
+      // skip intermediate stages (early-stop → synthesizer) or just drop reviewer.
+      // Flags are set by LiveConductor verify branch; thrift gate applied here.
+      if (directive.gradingMode === "reviewer_mediated") {
+        this.lastReviewerAccepted = true;
+      }
+      const live = this.conductor?.live;
+      if (options.workQueue && live) {
+        if (
+          live.lastVerificationEarlyStop === true &&
+          this.ctx.config.orchestrator.verification?.thrift?.achieved_effect_early_stop === true
+        ) {
+          options.workQueue.length = 0;
+          options.workQueue.push("synthesizer");
+          console.log(`[Pipeline] achieved-effect early-stop after ${stage}: synthesizer`);
+        } else if (live.lastVerificationDroppedReviewer === true) {
+          const filtered = options.workQueue.filter(
+            (s) => s !== "reviewer" && s !== ("re-enter:reviewer" as StageName),
+          );
+          options.workQueue.length = 0;
+          options.workQueue.push(...filtered);
+          console.log(`[Pipeline] drop-reviewer thrift after ${stage}: ${filtered.join("->") || "(empty)"}`);
+        }
+        live.lastVerificationEarlyStop = false;
+        live.lastVerificationDroppedReviewer = false;
       }
     }
 
@@ -972,6 +1050,29 @@ export class PipelineExecutor {
     for (const batch of partitionToolCalls(parsed)) {
       const settled = await Promise.all(
         batch.map(async (entry) => {
+          // Thrift: skip real execution for tools that have structurally failed enough.
+          // Gated on BOTH the master verification.enabled flag and the thrift
+          // sub-flag, so the whole verification feature stays inert as one
+          // unit until deliberately canaried (2026-07-24 fix — the sub-flag
+          // alone defaulted true independent of the master default-off flag).
+          // `?.()` on toolIsSuppressed/toolRedirectNote: `live` may be a
+          // minimal test mock that predates these methods (see the same
+          // defensive pattern at getConsecutiveToolErrors above) — a hard
+          // call here crashed every such mock's tool dispatch.
+          const suppress =
+            this.ctx.config.orchestrator.verification?.enabled === true &&
+            this.ctx.config.orchestrator.verification?.thrift?.dead_tool_suppression === true &&
+            this.conductor?.live.toolIsSuppressed?.(entry.call.name);
+          if (suppress && this.conductor) {
+            const result: ToolResult = {
+              call_id: entry.call.id,
+              name: entry.call.name,
+              output: `Error: ${this.conductor.live.toolRedirectNote?.(entry.call.name) ?? `${entry.call.name} is unavailable this turn.`}`,
+              is_error: true,
+              duration_ms: 0,
+            };
+            return { entry, result, duplicateKey: undefined, deflected: false };
+          }
           if (readOnlyOutputCache !== undefined && READ_ONLY_TOOLS.has(entry.call.name)) {
             const duplicateKey = duplicateToolCallKey(entry.call);
             if (readOnlyOutputCache.has(duplicateKey)) {
@@ -1248,6 +1349,21 @@ export class PipelineExecutor {
       workspaceRoots: this.evidenceRoots(options),
       writeIntent: requiresWriteEffect,
     });
+    /** Attach verification CheckResult for conductor verify branch (inert when disabled). */
+    const withCheckResult = async (
+      base: ConductorStageEvidence = executorEvidence(),
+    ): Promise<ConductorStageEvidence> => {
+      const check = await this.runTurnVerification(
+        toolCalls,
+        options.rawMessage ?? request,
+        planSummary,
+      );
+      if (check) {
+        this.lastCheckResult = check;
+        return { ...base, checkResult: check };
+      }
+      return base;
+    };
     const executorMessages: ChatMessage[] = [
       { role: "system", content: executorPrompt },
       { role: "user", content: `User Request: ${request}\n\nPlan:\n${planSummary}` }
@@ -1519,7 +1635,7 @@ export class PipelineExecutor {
       };
       onStateChange({ stage: "executor", status: "completed", output: delegated.narrative });
       await this.afterConductorStage(
-        "executor", "completed", delegated.narrative, agentRunId, options, remainingQueue, executorEvidence(),
+        "executor", "completed", delegated.narrative, agentRunId, options, remainingQueue, await withCheckResult(),
       );
       return acceptedOutput;
     };
@@ -1631,7 +1747,7 @@ export class PipelineExecutor {
       }
 
       onStateChange({ stage: "executor", status: "completed", output: narrative, detail: "explicit_scope_complete" });
-      await this.afterConductorStage("executor", "completed", narrative, agentRunId, options, remainingQueue, executorEvidence());
+      await this.afterConductorStage("executor", "completed", narrative, agentRunId, options, remainingQueue, await withCheckResult());
       return { ok: true, narrative, toolCalls };
     }
 
@@ -2255,12 +2371,20 @@ export class PipelineExecutor {
           agentRunId,
           options,
           remainingQueue,
-          executorEvidence(),
+          await withCheckResult(),
         );
         return { ok: false, narrative: failure.message, toolCalls, modelKey: lastModelKey };
       }
       onStateChange({ stage: "executor", status: "completed", output: narrative });
-      await this.afterConductorStage("executor", "completed", narrative, agentRunId, options, remainingQueue, executorEvidence());
+      await this.afterConductorStage(
+        "executor",
+        "completed",
+        narrative,
+        agentRunId,
+        options,
+        remainingQueue,
+        await withCheckResult(),
+      );
       return { ok: true, narrative, toolCalls, modelKey: lastModelKey };
     } catch (e: any) {
       if (
@@ -2597,6 +2721,18 @@ export class PipelineExecutor {
       const runGate = syntaxIssues.length === 0
         ? await this.gateWrittenRun(writtenToolCalls, request, planSummary)
         : { status: "skipped", reason: "syntax gate failed", issues: [] } satisfies RunGateResult;
+      // When verification is enabled, store a CheckResult for reward/provenance.
+      // Prefer the executor-completion result (avoid re-running heavy tests);
+      // otherwise merge the gates already executed above.
+      if (this.ctx.config.orchestrator?.verification?.enabled && !this.lastCheckResult) {
+        this.lastCheckResult = mergeToCheckResult({
+          syntaxIssues,
+          run: runGate,
+          hadWrittenCode: writtenToolCalls.some(
+            (c) => !c.is_error && WRITE_EFFECT_TOOLS.has(c.name),
+          ),
+        });
+      }
       const deterministicGateFeedback = [
         renderSyntaxIssues(syntaxIssues),
         renderRunIssues(runGate),
@@ -2798,8 +2934,12 @@ export class PipelineExecutor {
       }
     }
 
+    const reviewerHasIssues = this.hasIssues(reviewerFeedback);
+    if (reviewerOk && !reviewerHasIssues) {
+      this.lastReviewerAccepted = true;
+    }
     return {
-      reviewer: { ok: reviewerOk, feedback: reviewerFeedback, hasIssues: this.hasIssues(reviewerFeedback) },
+      reviewer: { ok: reviewerOk, feedback: reviewerFeedback, hasIssues: reviewerHasIssues },
       rewriter: rewriterOutput,
       loopRepairsUsed: repairs,
       loopAddedProgress,
@@ -3186,6 +3326,15 @@ export class PipelineExecutor {
     const remainingNow = (): StageName[] => workQueue.slice();
     let partialStage: PipelineSegmentResult["partialStage"];
     let replanRequested: PipelineSegmentResult["replanRequested"];
+    // Attach verification side-channels on every exit so replan-loop's
+    // finalizeSegment can thread them into PipelineResult (reward/provenance).
+    const finish = (
+      segment: Omit<PipelineSegmentResult, "checkResult" | "reviewerAccepted">,
+    ): PipelineSegmentResult => ({
+      ...segment,
+      checkResult: this.lastCheckResult,
+      reviewerAccepted: this.lastReviewerAccepted,
+    });
     const pendingInjections = new Map<StageName, string[]>();
     const reroutesApplied = { n: 0 };
     // Post-loop executor re-entry is bounded to one per segment: the in-loop
@@ -3342,10 +3491,10 @@ export class PipelineExecutor {
           }
         }
         if (state.executor.terminalStatus === "cancelled") {
-          return { state, partialStage };
+          return finish({ state, partialStage });
         }
         if (state.executor.errorCode === "delegate_cleanup_unconfirmed") {
-          return { state, partialStage };
+          return finish({ state, partialStage });
         }
         if (state.executor.errorCode === "effect_gate_no_write_effect") {
           const effectGate = evaluateEffectGate({
@@ -3356,7 +3505,7 @@ export class PipelineExecutor {
             assumeWriteIntent: options.taskRunWriteIntent,
             contentEffects: this.ctx.write_effects,
           });
-          return { state, effectGate, partialStage };
+          return finish({ state, effectGate, partialStage });
         }
         // T2.4: hard executor failure (non-workspace_read) → replan pre-synthesizer.
         // workspace_read falls through to the evidence fence for precise codes.
@@ -3371,7 +3520,7 @@ export class PipelineExecutor {
             trigger: "executor_hard_failure",
             detail: state.executor.narrative?.slice(0, 400) || "executor failed",
           };
-          return { state, replanRequested, partialStage };
+          return finish({ state, replanRequested, partialStage });
         }
         continue;
       }
@@ -3510,7 +3659,7 @@ export class PipelineExecutor {
             `(repairs=${loopRepairsUsed}, max=${options.maxReviewRepairRounds ?? "default"}) with reviewer issues outstanding; ` +
             `skipping synthesizer to avoid a misleading best-effort answer`,
           );
-          return { state, partialStage: { stage: "reviewer" as StageName, errorCode: "repair_cap_exhausted" } };
+          return finish({ state, partialStage: { stage: "reviewer" as StageName, errorCode: "repair_cap_exhausted" } });
         }
 
         // Backstop / exhausted: fall through to synthesizer. Mid-run replan
@@ -3530,7 +3679,7 @@ export class PipelineExecutor {
             trigger: "reviewer_reject",
             detail: reviewer.feedback?.slice(0, 400) || "reviewer rejected",
           };
-          return { state, replanRequested, partialStage };
+          return finish({ state, replanRequested, partialStage });
         }
         // Reviewer accept with active plan item → mark verified (reviewer_mediated).
         if (
@@ -3540,6 +3689,7 @@ export class PipelineExecutor {
           opts.taskRunContract &&
           activeItem
         ) {
+          this.lastReviewerAccepted = true;
           try {
             const next = applyReviewerAccept(opts.taskRunContract, activeItem.id, {
               ref: `${agentRunId}:reviewer:${activeItem.id}`,
@@ -3621,7 +3771,7 @@ export class PipelineExecutor {
     }
 
     if (isTerminalNoWriteEffect(effectGate)) {
-      return { state, effectGate, partialStage };
+      return finish({ state, effectGate, partialStage });
     }
 
     // A reviewer/rewriter pass that still produced no requested mutation is
@@ -3641,11 +3791,11 @@ export class PipelineExecutor {
         trigger: "effect_gate_failure",
         detail: "No successful file mutation was produced after execution and repair.",
       };
-      return { state, effectGate, replanRequested, partialStage };
+      return finish({ state, effectGate, replanRequested, partialStage });
     }
 
     if (!wantsSynthesizer) {
-      return { state, effectGate, partialStage, replanRequested };
+      return finish({ state, effectGate, partialStage, replanRequested });
     }
 
     const preSynthAssessment = assessWorkspaceEvidence(
@@ -3667,7 +3817,7 @@ export class PipelineExecutor {
       // F6: refusal is reserved for *zero* evidence. Partial evidence synthesizes
       // with an explicit disclosure notice instead of a canned fatal refuse.
       if (preSynthAssessment.contentReads + preSynthAssessment.listings === 0) {
-        return {
+        return finish({
           state,
           synthesizerAnswer: "",
           synthesizerFatalError: failure.message,
@@ -3676,7 +3826,7 @@ export class PipelineExecutor {
           effectGate,
           partialStage,
           replanRequested,
-        };
+        });
       }
       effectGate = {
         ...effectGate,
@@ -3700,7 +3850,7 @@ export class PipelineExecutor {
     if (synth.partialErrorCode) {
       partialStage = { stage: "synthesizer", errorCode: synth.partialErrorCode };
     }
-    return {
+    return finish({
       state,
       synthesizerAnswer: synth.answer,
       synthesizerFatalError: synth.fatalError,
@@ -3708,7 +3858,7 @@ export class PipelineExecutor {
       effectGate,
       partialStage,
       replanRequested,
-    };
+    });
   }
 
   async execute(
@@ -3722,6 +3872,9 @@ export class PipelineExecutor {
     // segments intentionally share the same array so the final gate can see
     // every native write attempt made before synthesis.
     this.ctx.write_effects = [];
+    // Reset verification side-channels so prior turns cannot leak into reward.
+    this.lastCheckResult = undefined;
+    this.lastReviewerAccepted = false;
     const requiresWorkspaceEvidence = turnNeedsWorkspaceEvidence(options.turnRequirement, options.rawMessage ?? request);
     if (!requiresWorkspaceEvidence && this.canRunSpeculativeParallel(pipeline, options.topology)) {
       return this.executeSpeculativeParallel(request, pipeline, agentRunId, onStateChange, options);
@@ -3769,6 +3922,8 @@ export class PipelineExecutor {
           outcome: "failed",
           error_code: failure.code,
           toolCalls: state.executor?.toolCalls,
+          checkResult: this.lastCheckResult,
+          reviewerAccepted: this.lastReviewerAccepted,
         };
       }
     }
@@ -3797,6 +3952,8 @@ export class PipelineExecutor {
         outcome: gated.outcome,
         error_code: gated.errorCode,
         toolCalls: state.executor?.toolCalls,
+        checkResult: this.lastCheckResult,
+        reviewerAccepted: this.lastReviewerAccepted,
       };
     }
 
@@ -3842,6 +3999,8 @@ export class PipelineExecutor {
       outcome,
       error_code: errorCode,
       toolCalls: state.executor?.toolCalls,
+      checkResult: this.lastCheckResult,
+      reviewerAccepted: this.lastReviewerAccepted,
     };
     if (!segment.synthesizerFatalError && !segment.synthesizerEmptyCompletion && pipeline.includes("synthesizer")) {
       return this.applyRecursiveCritique(request, result, agentRunId, onStateChange, options);

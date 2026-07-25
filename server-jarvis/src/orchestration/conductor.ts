@@ -22,6 +22,8 @@ import {
   DEFAULT_MAX_REPAIR_CYCLES,
 } from "./runtime-loop";
 import { parseReviewerVerdict } from "./stage-output";
+import { decideVerificationDirective } from "./verification-decision";
+import { DeadToolTracker } from "./dead-tool-suppression";
 
 export interface ConductorStageEvidence {
   toolCalls?: ToolCallRecord[];
@@ -46,6 +48,8 @@ export interface ConductorStageEvidence {
   planItem?: TaskPlanItem;
   /** Evidence pointer ref when marking verified (defaults to runId:stage). */
   evidenceRef?: string;
+  /** 2026-07-24: deterministic verification result for this change turn. */
+  checkResult?: import("./check-runner").CheckResult;
 }
 
 interface SupervisionDigest {
@@ -63,6 +67,8 @@ interface SupervisionDigest {
   /** 2026-07-18: write contract visibility for the supervisor model. */
   writeIntent: boolean;
   successfulWrites: number;
+  /** 2026-07-24: executed verification result, when this was a change turn. */
+  checkResult?: import("./check-runner").CheckResult;
 }
 
 /**
@@ -111,6 +117,17 @@ export class LiveConductor {
   private planContract: TaskRunContract | undefined;
   /** Max repair cycles per item (from cfg or default). */
   private maxRepairCycles = DEFAULT_MAX_REPAIR_CYCLES;
+  /** Side-channel: last verification decision asked pipeline to drop reviewer. */
+  lastVerificationDroppedReviewer = false;
+  /**
+   * Side-channel: green existing/builtin check marked verified — pipeline may
+   * route remaining work straight to synthesizer (achieved-effect early-stop).
+   * Thrift gate (`verification.thrift.achieved_effect_early_stop`) is applied
+   * by the pipeline when honoring this flag.
+   */
+  lastVerificationEarlyStop = false;
+  /** Thrift: structural dead-tool failures — suppress further calls this turn. */
+  private deadTools = new DeadToolTracker();
 
   constructor(
     private callModel: CallModelFn,
@@ -140,6 +157,9 @@ export class LiveConductor {
     this.deepReadEvidenceRerouteUsed = false;
     this.writeEffectRerouteUsed = false;
     this.supervisionCallsUsed = 0;
+    this.lastVerificationDroppedReviewer = false;
+    this.lastVerificationEarlyStop = false;
+    this.deadTools.reset();
     this.supervision = !this.cfg.supervise_low_complexity && complexity === "low" ? "off" : "on";
   }
 
@@ -169,8 +189,13 @@ export class LiveConductor {
     } else {
       this.consecutiveToolErrors = 0;
     }
+    this.deadTools.record(name, isError, summary);
     this.bus.publish({ type: "tool_result", stage, name, isError, summary });
   }
+
+  /** Thrift: whether a tool has structurally failed enough to stop calling it. */
+  toolIsSuppressed(name: string): boolean { return this.deadTools.isSuppressed(name); }
+  toolRedirectNote(name: string): string { return this.deadTools.redirectNote(name); }
 
   // Called after each stage completes or fails. NEVER throws — always returns a directive.
   async afterStage(
@@ -181,6 +206,10 @@ export class LiveConductor {
     evidence: ConductorStageEvidence = {},
   ): Promise<ConductorDirective> {
     try {
+      // Reset verification side-channels each afterStage so stale flags do not leak.
+      this.lastVerificationDroppedReviewer = false;
+      this.lastVerificationEarlyStop = false;
+
       // Cheap heuristic pre-filter: if tool errors hit threshold, reroute immediately
       // without spending a supervisory inference call.
       // Reuses consecutiveToolErrors as the sole no-progress / backstop signal
@@ -218,6 +247,28 @@ export class LiveConductor {
           newRemaining: ["re-enter:executor" as StageName, ...remainingQueue],
           reason: "write-intent executor stage completed with zero successful mutations; re-entering executor once to APPLY the change with write_file/edit_file before continuing",
         };
+      }
+
+      // 2026-07-24 verification gate: a deterministic executed check decides
+      // completion for the unambiguous cases (green trustworthy tier → verify;
+      // red → repair). synth/none/ambiguous fall through to runtime-loop +
+      // resident supervision below.
+      if (stage === "executor" && outcome === "completed" && evidence.checkResult) {
+        const item = this.resolvePlanItem(evidence);
+        if (item) {
+          const decision = decideVerificationDirective({
+            check: evidence.checkResult,
+            item,
+            runId: this.runId,
+            remainingQueue,
+          });
+          if (decision.kind === "directive") {
+            this.lastVerificationDroppedReviewer = decision.dropReviewer === true;
+            // Green existing/builtin → mark_verified; start_repair_chain must not early-stop.
+            this.lastVerificationEarlyStop = decision.directive.type === "mark_verified";
+            return decision.directive;
+          }
+        }
       }
 
       // Owned-runtime-loop: per-item completion / repair directives (deterministic
@@ -284,6 +335,7 @@ export class LiveConductor {
         remainingQueue,
         writeIntent: evidence.writeIntent === true,
         successfulWrites,
+        checkResult: evidence.checkResult,
       };
 
       this.supervisionCallsUsed += 1;
@@ -445,6 +497,9 @@ export class LiveConductor {
           ? `Evidence assessment: ${JSON.stringify(digest.evidenceAssessment)}`
           : `Evidence assessment: not applicable — the ${digest.stage} stage produces no tool calls by design`,
         `Write intent: ${digest.writeIntent ? `TRUE — successful mutations so far: ${digest.successfulWrites}` : "no"}`,
+        digest.checkResult
+          ? `Executed check (authoritative — do NOT contradict): tier=${digest.checkResult.tier} ran=${digest.checkResult.ran} passed=${digest.checkResult.passed}${digest.checkResult.detail ? ` detail=${digest.checkResult.detail.slice(0, 200)}` : ""}`
+          : "Executed check: none",
         `Request (300 chars): ${digest.requestSummary || "(not provided)"}`,
         `Worker instruction: ${digest.workerInstruction || "(not provided)"}`,
         `Remaining queue: ${digest.remainingQueue.length > 0 ? digest.remainingQueue.join(" → ") : "(none)"}`,

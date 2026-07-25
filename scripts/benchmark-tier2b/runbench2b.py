@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -49,6 +50,8 @@ def run_test(directory, source):
 def seed(directory, task):
     for name, content in task["files"].items():
         (directory / name).write_text(content, encoding="utf-8")
+    # Pre-seed the test file (will be overwritten by run_test before scoring for integrity)
+    (directory / "_t.py").write_text(task["test"], encoding="utf-8")
 
 
 def baseline_prompt(task):
@@ -101,12 +104,23 @@ def run_architecture(task, sample, stream_url, live):
     if not live:
         return None, "not run", 0.0
     # A model-written workspace can contain Windows device names such as
-    # `nul`. The test result is already collected before cleanup; a cleanup
-    # permission/device error must not discard the benchmark sample.
-    with tempfile.TemporaryDirectory(
-        prefix=f"tier2b-arch-{task['name']}-", ignore_cleanup_errors=True,
-    ) as raw:
+    # `nul`. The test result is already collected before cleanup, so a cleanup
+    # error must never discard the benchmark sample. tempfile's own
+    # ignore_cleanup_errors=True is NOT sufficient here: on a PermissionError
+    # its recovery path calls os.chmod on the offending path before giving up,
+    # and chmod on a Windows reserved device name (`nul`, `con`, ...) raises a
+    # SECOND, different, unguarded OSError ([WinError 1] Incorrect function)
+    # that escapes ignore_cleanup_errors entirely and crashed the whole run
+    # (2026-07-25 live-fire). Plain shutil.rmtree(ignore_errors=True) has no
+    # such recovery step — it truly ignores every error — so manage the
+    # directory manually instead of via the TemporaryDirectory context manager.
+    raw = tempfile.mkdtemp(prefix=f"tier2b-arch-{task['name']}-")
+    try:
         directory = Path(raw)
+        # seed() writes task["test"] to _t.py so the model can actually run it
+        # (the architecture prompt says "run the adjacent _t.py test before
+        # finishing"); run_test() below rewrites this canonical copy before
+        # scoring, so seeding it cannot let a model tamper with the grade.
         seed(directory, task)
         # Seed the test file BEFORE the turn so the model can actually run it.
         # The architecture prompt instructs "run the adjacent _t.py test before
@@ -130,6 +144,8 @@ def run_architecture(task, sample, stream_url, live):
             return False, f"stream error: {exc}"[:240], round(time.monotonic() - started, 1)
         ok, detail = run_test(directory, task["test"])
         return ok, detail, round(time.monotonic() - started, 1)
+    finally:
+        shutil.rmtree(raw, ignore_errors=True)
 
 
 def main():
@@ -148,6 +164,7 @@ def main():
         rows = []
         for task in TASKS:
             passes = 0
+            samples = []
             for sample in range(args.k):
                 if arm == "baseline":
                     ok, detail, seconds = run_baseline(task, sample, live)
@@ -157,7 +174,13 @@ def main():
                     passes += 1
                 state = "PASS" if ok else ("SKIP" if ok is None else "FAIL")
                 print(f"[{arm}] {task['name']:22s} s{sample} {state} ({seconds:.1f}s) {detail}", flush=True)
-            rows.append({"name": task["name"], "category": task["category"], "passes": passes, "k": args.k})
+                # Collect per-sample telemetry
+                samples.append({
+                    "secs": seconds,
+                    "detail": detail,
+                    "pass": ok
+                })
+            rows.append({"name": task["name"], "category": task["category"], "passes": passes, "k": args.k, "samples": samples})
         report["arms"][arm] = rows
     print(json.dumps(report, indent=2))
     if live:

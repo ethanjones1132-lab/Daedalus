@@ -23,6 +23,12 @@ Return ONLY valid JSON. No markdown, no commentary. One of:
 {"directive":"inject_context","forStage":"executor","note":"context to inject","reason":"brief reason"}
 {"directive":"abort_stage","stage":"executor","reason":"brief reason"}
 
+## Verification evidence
+If an "Executed check (authoritative)" line is present, treat it as ground truth
+about whether the change works. If passed=true from a model-authored (synth)
+check, prefer `escalate_reviewer` to judge coverage. If passed=false, prefer
+`reroute` back to the executor to repair. Never contradict the executed result.
+
 ## Rules
 
 - **Default to continue.** Only deviate when there is clear, specific evidence the pipeline needs correction.

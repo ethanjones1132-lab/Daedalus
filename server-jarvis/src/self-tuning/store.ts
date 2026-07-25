@@ -26,6 +26,10 @@ export interface AgentRun {
    * without a full migration.
    */
   outcome?: string;
+  /** How the run's success was verified (e.g. runtime_check, none). */
+  verified_via?: string | null;
+  /** Verification depth tier (e.g. existing, deep). */
+  check_tier?: string | null;
   created_at?: string;
 }
 
@@ -276,6 +280,8 @@ const SELF_TUNING_SCHEMA = `
     tool_calls_count INTEGER,
     token_count INTEGER,
     outcome TEXT,
+    verified_via TEXT,
+    check_tier TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   );
   CREATE TABLE IF NOT EXISTS stage_runs (
@@ -482,6 +488,12 @@ export class SelfTuningStore {
         // duplicate-column error on an already-migrated DB is expected and ignored.
         try {
           db.exec(`ALTER TABLE agent_runs ADD COLUMN outcome TEXT`);
+        } catch { /* column already exists */ }
+        try {
+          db.exec(`ALTER TABLE agent_runs ADD COLUMN verified_via TEXT`);
+        } catch { /* column already exists */ }
+        try {
+          db.exec(`ALTER TABLE agent_runs ADD COLUMN check_tier TEXT`);
         } catch { /* column already exists */ }
         try {
           db.exec(`ALTER TABLE model_attributions ADD COLUMN first_token_ms INTEGER`);

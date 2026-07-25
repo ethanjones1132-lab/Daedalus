@@ -23,7 +23,7 @@ export type TaskPlanItemStatus = "pending" | "active" | "verified" | "blocked";
  * - conductor_direct_diff: Conductor graded the item via direct diff / evidence
  * - reviewer_mediated: Reviewer accepted after Reviewer→Rewriter→Executor cycle(s)
  */
-export type TaskPlanGradingMode = "conductor_direct_diff" | "reviewer_mediated";
+export type TaskPlanGradingMode = "conductor_direct_diff" | "reviewer_mediated" | "runtime_check";
 
 /**
  * Pointer to durable evidence for a plan item — not a full transcript.
