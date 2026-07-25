@@ -7,7 +7,7 @@ Native Rust shell · Bun HTTP server · React UI · SQLite persistence · Multi-
 
 [![License](https://img.shields.io/badge/license-MIT-green)](src-tauri/LICENSE)
 [![Version](https://img.shields.io/badge/version-3.0.0-blue)](package.json)
-[![Tests](https://img.shields.io/badge/tests-1914%20bun%20|%2085%20cargo-success)](scripts/verify.sh)
+[![Tests](https://img.shields.io/badge/tests-1964%20bun%20|%20115%20cargo-success)](scripts/verify.sh)
 [![Platform](https://img.shields.io/badge/platform-Windows%20|%20Linux%20|%20macOS-lightgrey)]()
 
 </div>
@@ -42,6 +42,7 @@ Native Rust shell · Bun HTTP server · React UI · SQLite persistence · Multi-
 | **Self-improving over time** | The **self-tuning system** tracks how each AI model performs on every type of task — response speed, quality, how often it stalls — and automatically adjusts timeouts, routing preferences, and fallback ordering. The **organism loop** goes further: it captures "trajectories" (snapshots of how a task was solved), has a judge evaluate them, and promotes the good ones into reusable skills. |
 | **Won't repeat itself** | A **repetition guard** detects when the AI starts producing the same content turn after turn (using Jaccard trigram similarity + degenerate-stream detection) and redirects it to try something genuinely new. |
 | **Thorough analysis** | The **evidence sufficiency system** ensures the AI actually reads enough material before answering — it sets minimum read requirements based on how deep the question goes, and won't skip past them. |
+| **Verifies its own work before finishing** | When a task changes code, Jarvis runs an actual check before calling the job done — the project's own tests if they exist, a syntax/type check otherwise. A failing check triggers an automatic repair pass instead of a false "done." The check's exit code decides the outcome, not the model's own claim, so the system can't talk itself into believing broken work succeeded. |
 | **Your choice of AI models** | Supports local models via Ollama, cloud models via OpenRouter/OpenCode, or Claude CLI — with automatic fallback if the primary is slow or unavailable. OpenCode Zen and Go are available as backup providers. |
 | **Connect external tools (MCP)** | Implements the Model Context Protocol (MCP) — a standard for plugging in external tools and data sources — so you can wire up custom capabilities without changing the core. |
 | **Agent lifecycle management** | Portable agent directories (a `soul.md` file with capabilities, constraints, and personality). Jarvis discovers, validates, and activates agents from a local store. |
@@ -106,6 +107,7 @@ Jarvis has three main layers:
 |--------|-------------|--------------|
 | **Orchestrator** | Routes every request through the right pipeline | Configurable per `orchestrator.enabled`. Has a coordinator, planner, executor pool, reviewer, and synthesizer. Supports multi-model pipelines with fallback across OpenRouter, OpenCode Zen/Go, Ollama, and Claude CLI. |
 | **Conductor** | Mid-pipeline re-planning | A persistent KV database that tracks the execution state. When a stage fails or returns unexpected results, the conductor can pause and re-invoke with a summary of what's happened so far. Per-turn and per-session caps prevent infinite re-plans. |
+| **Verification gate** | Proves work before scoring it | A tiered check-runner — existing project tests, then a syntax/type check, then a model-authored check, in that order of trust — runs after any code change. The *runtime* executes the check and reads the exit code; the model never gets to claim success on its own word. A pass on a trusted tier marks the work done immediately, a failure triggers automatic repair, and only the ambiguous middle case goes to the reviewer stage for judgment. Two cost-neutral thrift governors (dead-tool suppression, achieved-effect early-stop) fund the extra step out of the waste it removes. This is also what makes the self-tuning reward signal below trustworthy — it now trains on a verified outcome instead of the model's own narration. |
 | **Self-tuning** | Automatic performance optimization | An inference feedback loop that scores each model on speed, stall rate, and completion quality. Periodically updates routing preferences, per-model first-token timeouts, and capability adjustments — all from live telemetry, no manual tuning. |
 | **Repetition guard** | Prevents repetitive loops | Computes Jaccard trigram similarity between consecutive turns. If similarity exceeds a threshold or the model is detected in a degenerate stream (no-progress loop), it intervenes with a fresh directive. |
 | **Evidence sufficiency** | Ensures thorough research | Sets minimum deep-read requirements (3+ content reads) for analysis-style questions, and enforces them. Pre-flight listing commands (like `ls` or `search_files`) don't count — the model must actually read the content. |
@@ -119,6 +121,7 @@ Jarvis has three main layers:
 
 The live-session orchestration path now protects the stages that matter most to a usable answer:
 
+- **Verification-gated completion** (2026-07-25): change turns are gated on an actually-executed check rather than the model's own narration, closing a gap where a wrong or unapplied fix could be scored `success` while genuinely correct work got mislabeled `degraded`. On a live 30-sample Tier-2B benchmark this took the score from 27/30 — with the self-tuner training on an inverted reward signal — to **30/30**, with every run's completion now backed by a real check result and median tool-calls-per-turn down from the high-20s/40s range to single digits.
 - Empty planner, reviewer, and rewriter completions are recorded as failures and advance through the fallback cascade. Executor tool-call turns remain valid even when they have no visible prose.
 - Stage-health cooldowns and rolling per-stage model scorecards reach both the agent pool and fallback cascade, so unhealthy candidates are not immediately selected again.
 - Hidden reasoning deltas count as transport liveness without leaking into visible output. Trivial short-circuit turns use the fast synthesizer tier, while routed pipelines shed advisory stages when the remaining turn budget is tight.
@@ -135,6 +138,7 @@ Every major system shipped in the last two months:
 |------|-------------|------|
 | **Phase 1–3 core** | Tool runtime, eval harness, MCP protocol support | Complete |
 | **Orchestrator v2** | Coordinator, agent pool, route normalization, conductor replan, persistent conductor KV | Live |
+| **Verification-gated conductor** | Runtime-executed check-runner (tests → syntax/type check → model-authored check) gates task completion and grounds the self-tuner's reward in a real outcome instead of model narration; cost-neutral thrift governors fund the extra step | Live — 30/30 on a live Tier-2B benchmark |
 | **Organism loop** | Judge-gated skill promotion, trajectory-backed distillation, conductor injection | Live |
 | **Self-tuning** | Inference feedback loop, stage-specific routing deltas, per-model first-token overrides | Live |
 | **Repetition guard** | Cross-turn Jaccard similarity + degenerate-stream detection | Live |
@@ -148,7 +152,7 @@ Every major system shipped in the last two months:
 | **Track D (eval)** | GRPO-ready JSONL export, composite reward model | Complete |
 | **OpenCode fallback** | Provider credentials, pool availability filtering, per-provider timeouts | Complete |
 
-Latest (2026-07-24): bounded post-loop repair re-entry — fixes an unbounded executor↔reviewer loop on contract-less turns, verified against a full 30-sample Tier-2B live benchmark run. See [`PRIORITIES.md`](PRIORITIES.md) for the full changelog with commit SHAs and test counts.
+Latest (2026-07-25): verification-gated conductor shipped and live-fire validated — a runtime-executed check now gates task completion and grounds the self-tuner's reward signal, turning a 27/30 Tier-2B benchmark run into **30/30** with tool-calls-per-turn cut roughly 4–5x. See [`PRIORITIES.md`](PRIORITIES.md) for the full changelog with commit SHAs and test counts.
 
 ---
 
@@ -263,7 +267,7 @@ Auto-created on first run at:
 
 ## Verification
 
-The current automated baseline is **1,914 Bun tests across 136 files**, **85 Cargo tests**, and clean server/UI TypeScript checks.
+The current automated baseline is **1,964 Bun tests across 142 files**, **115 Cargo tests**, and clean server/UI TypeScript checks.
 
 The fastest way to check everything is healthy:
 
@@ -337,7 +341,7 @@ This codebase started as `home-base-recovered` after a **2026-06 WSL disk wipe**
 
 The Rust crate is `home-base` (v0.1.0), the Bun server is `server-jarvis` (v3.0.0), and the app surface is branded **Jarvis** (`com.jarvis.desktop`). These different names come from different layers of the stack — they all point to the same desktop agent platform.
 
-**Current test health:** 1,914 Bun tests across 136 files · 85 Cargo tests · both `tsc` jobs clean.
+**Current test health:** 1,964 Bun tests across 142 files · 115 Cargo tests · both `tsc` jobs clean.
 
 ---
 
