@@ -32,13 +32,13 @@ export type ConductorDirective =
   | { type: "reroute"; newRemaining: StageName[]; reason: string }
   | { type: "inject_context"; forStage: StageName; note: string; reason: string }
   | {
-        type: "mark_verified";
-        itemId: string;
-        evidenceRef: string;
-        evidenceSummary?: string;
-        gradingMode: "conductor_direct_diff" | "reviewer_mediated" | "runtime_check";
-        reason: string;
-      }
+      type: "mark_verified";
+      itemId: string;
+      evidenceRef: string;
+      evidenceSummary?: string;
+      gradingMode: "conductor_direct_diff" | "reviewer_mediated";
+      reason: string;
+    }
   | {
       type: "escalate_reviewer";
       itemId?: string;

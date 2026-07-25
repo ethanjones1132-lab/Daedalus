@@ -328,16 +328,6 @@ export interface DynamicAgentsConfig {
   max_dynamic_agents: number;
 }
 
-export interface VerificationConfig {
-  /** Master flag — off by default; canary via policy-staging before default-on. */
-  enabled: boolean;
-  /** Bounded check execution timeout. */
-  check_timeout_ms: number;
-  /** Reward weight per tier (feeds verification-reward.ts). */
-  tier_reward: { existing: number; builtin: number; synth: number; none: number };
-  thrift: { dead_tool_suppression: boolean; achieved_effect_early_stop: boolean };
-}
-
 export interface OrchestratorConfig {
   enabled: boolean;
   agents: OrchestratorAgent[];
@@ -355,8 +345,10 @@ export interface OrchestratorConfig {
   max_review_repair_rounds: number;
   /** Retry a high-complexity change once with a different strong executor after a deterministic gate failure. */
   high_complexity_executor_retry?: boolean;
-  /** T2.4: when true (default), all orchestrator turns run through
-   * runPipelineWithReplanning so mid-run replan triggers can fire. */
+  /**
+   * T2.4: when true (default), all orchestrator turns run through
+   * runPipelineWithReplanning so mid-run replan triggers can fire.
+   */
   mid_run_replan?: boolean;
   /** T3.3: conductor-facing dynamic agent registration (default OFF). */
   dynamic_agents?: DynamicAgentsConfig;
@@ -364,7 +356,6 @@ export interface OrchestratorConfig {
   session_memory: SessionMemoryConfig;
   conductor_learning: ConductorLearningConfig;
   skill_distillation: SkillDistillationConfig;
-  verification: VerificationConfig;
 }
 
 export interface JarvisConfig {
@@ -614,21 +605,15 @@ export function defaultConfig(): JarvisConfig {
         max_trajectory_snapshots: 500,
       },
       skill_distillation: {
-              enabled: true,
-              min_confidence: 0.55,
-              promotion_eval_delta: 0.02,
-              max_candidates: 200,
-              distill_on: ["success"],
-              min_judge_score: 0.75,
-              auto_promote: true,
-            },
-            verification: {
-              enabled: false,
-              check_timeout_ms: 15000,
-              tier_reward: { existing: 1, builtin: 1, synth: 0.5, none: 0 },
-              thrift: { dead_tool_suppression: true, achieved_effect_early_stop: true },
-            },
-          },
+        enabled: true,
+        min_confidence: 0.55,
+        promotion_eval_delta: 0.02,
+        max_candidates: 200,
+        distill_on: ["success"],
+        min_judge_score: 0.75,
+        auto_promote: true,
+      },
+    },
     system_prompt: `You are Jarvis, a local AI coding assistant running on Qwen 3.5 9B in WSL2.
 Workspace: \`/home/ethan/.openclaw/agents/coderclaw/workspace/home-base\`.
 
