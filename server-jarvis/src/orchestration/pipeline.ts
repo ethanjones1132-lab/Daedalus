@@ -2164,6 +2164,36 @@ export class PipelineExecutor {
             });
           }
 
+          // Rung 2 (2026-07-25): real-time in-turn ownership. Gated behind
+          // orchestrator.conductor.in_turn_driver so it stays inert until
+          // canaried, mirroring the verification-gate rollout pattern.
+          const inTurnDriverEnabled = this.ctx.config.orchestrator?.conductor?.in_turn_driver?.enabled === true;
+          if (inTurnDriverEnabled && this.conductor?.live && requiresWriteEffect) {
+            const midLoop = await this.conductor.live.checkMidLoop({
+              writeIntent: requiresWriteEffect,
+              successfulWrites: successfulWriteCount(),
+              distinctSuccessfulReads: distinctSuccessfulReadCount(),
+              turnCount,
+              maxTurns,
+              stageRemainingMs: options.turnBudget?.stageRemainingMs("executor") ?? Number.POSITIVE_INFINITY,
+              deadToolSuppressed: false,
+              suppressedToolName: undefined,
+            });
+            if (midLoop.kind === "abort") {
+              executorDone = true;
+              narratives.push(`[Conductor] ${midLoop.reason}`);
+              onStateChange({ stage: "executor", status: "running", detail: "mid_loop_abort" });
+            } else if (midLoop.kind === "force_write" && !writeEffectNudgeSentThisTurn) {
+              writeEffectNudgeCount++;
+              writeEffectNudgeSentThisTurn = true;
+              executorMessages.push({ role: "user", content: midLoop.note });
+            } else if (midLoop.kind === "inject") {
+              executorMessages.push({ role: "user", content: midLoop.note });
+            } else if (midLoop.kind === "redirect") {
+              executorMessages.push({ role: "user", content: midLoop.note });
+            }
+          }
+
           if (!emittedToolCalls && !workspaceEvidenceNudgeSentThisTurn && !writeEffectNudgeSentThisTurn) {
             executorDone = true;
           }
