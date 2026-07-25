@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -103,20 +104,24 @@ def run_architecture(task, sample, stream_url, live):
     if not live:
         return None, "not run", 0.0
     # A model-written workspace can contain Windows device names such as
-    # `nul`. The test result is already collected before cleanup; a cleanup
-    # permission/device error must not discard the benchmark sample.
-    with tempfile.TemporaryDirectory(
-        prefix=f"tier2b-arch-{task['name']}-", ignore_cleanup_errors=True,
-    ) as raw:
+    # `nul`. The test result is already collected before cleanup, so a cleanup
+    # error must never discard the benchmark sample. tempfile's own
+    # ignore_cleanup_errors=True is NOT sufficient here: on a PermissionError
+    # its recovery path calls os.chmod on the offending path before giving up,
+    # and chmod on a Windows reserved device name (`nul`, `con`, ...) raises a
+    # SECOND, different, unguarded OSError ([WinError 1] Incorrect function)
+    # that escapes ignore_cleanup_errors entirely and crashed the whole run
+    # (2026-07-25 live-fire). Plain shutil.rmtree(ignore_errors=True) has no
+    # such recovery step — it truly ignores every error — so manage the
+    # directory manually instead of via the TemporaryDirectory context manager.
+    raw = tempfile.mkdtemp(prefix=f"tier2b-arch-{task['name']}-")
+    try:
         directory = Path(raw)
+        # seed() writes task["test"] to _t.py so the model can actually run it
+        # (the architecture prompt says "run the adjacent _t.py test before
+        # finishing"); run_test() below rewrites this canonical copy before
+        # scoring, so seeding it cannot let a model tamper with the grade.
         seed(directory, task)
-        # Seed the test file BEFORE the turn so the model can actually run it.
-        # The architecture prompt instructs "run the adjacent _t.py test before
-        # finishing" — without the file on disk that instruction is impossible
-        # and the self-verify loop can never fire (21/30 runs on 2026-07-24
-        # reported _t.py absent). run_test() below rewrites this canonical copy
-        # before scoring, so seeding it cannot let a model tamper with the grade.
-        (directory / "_t.py").write_text(task["test"], encoding="utf-8")
         body = json.dumps({
             "message": architecture_prompt(task, directory),
             "session_id": f"tier2b-{task['name']}-{sample}-{uuid.uuid4().hex[:8]}",
@@ -132,6 +137,8 @@ def run_architecture(task, sample, stream_url, live):
             return False, f"stream error: {exc}"[:240], round(time.monotonic() - started, 1)
         ok, detail = run_test(directory, task["test"])
         return ok, detail, round(time.monotonic() - started, 1)
+    finally:
+        shutil.rmtree(raw, ignore_errors=True)
 
 
 def main():
