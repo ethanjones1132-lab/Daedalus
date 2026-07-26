@@ -101,10 +101,12 @@ describe("pipeline stage telemetry", () => {
       );
 
       expect(midLoopCalls).toBeGreaterThan(0);
-      const rows = store.getConductorDirectives(runId)
-        .filter((row) => row.directive_type === intervention.directiveType);
-      expect(rows).toHaveLength(midLoopCalls);
-      for (const row of rows) {
+      const midLoopRows = store.getConductorDirectives(runId)
+        .filter((row) => row.directive_type.startsWith("mid_loop_"));
+      expect(midLoopRows).toHaveLength(midLoopCalls);
+      expect(new Set(midLoopRows.map((row) => row.directive_type)))
+        .toEqual(new Set([intervention.directiveType]));
+      for (const row of midLoopRows) {
         expect(row).toMatchObject({ stage: "executor", directive_type: intervention.directiveType });
         expect(row.inject_note).toBe(intervention.note ?? null);
         expect(row.reason).toBe(intervention.reason ?? null);
@@ -116,6 +118,7 @@ describe("pipeline stage telemetry", () => {
     for (const scenario of [
       { name: "driver disabled", driverEnabled: false, executionProfile: "full" as const, request: "Update the target config file" },
       { name: "read-only executor", driverEnabled: true, executionProfile: "read_only" as const, request: "Inspect the target config file" },
+      { name: "full executor without write intent", driverEnabled: true, executionProfile: "full" as const, request: "Explain the target config file" },
     ]) {
       const runId = `run-mid-loop-skipped-${scenario.name}`;
       const store = new SelfTuningStore(":memory:");
