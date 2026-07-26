@@ -1476,4 +1476,43 @@ describe("PipelineExecutor Phase 2: live conductor observability + abort", () =>
     expect(inject).toBeTruthy();
     expect(inject.stage).toBe("planner");
   });
+
+  test("execute fallback effect gates preserve write intent across topologies", async () => {
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig());
+    const request = "please fix the bug in solution.py";
+
+    for (const topology of ["linear", "recursive"] as const) {
+      const noSynthExecutor = new PipelineExecutor(async () => ({ content: "unused" }), runtime, ctx, { collector: testCollector });
+      (noSynthExecutor as any).executeSegment = async () => ({ state: {} });
+      const noSynthResult = await noSynthExecutor.execute(
+        request,
+        ["executor"],
+        `run-topology-no-synth-${topology}`,
+        () => {},
+        { executionProfile: "read_only", topology },
+      );
+      expect(noSynthResult.outcome).toBe("failed");
+      expect(noSynthResult.error_code).toBe("effect_gate_no_write_effect");
+
+      const withSynthExecutor = new PipelineExecutor(
+        async (_messages: any[], options: any = {}) => options.stageLabel === "recursion_critique"
+          ? { content: JSON.stringify({ needs_more_work: false, critique: "sufficient" }) }
+          : { content: "unused" },
+        runtime,
+        ctx,
+        { collector: testCollector },
+      );
+      (withSynthExecutor as any).executeSegment = async () => ({ state: {}, synthesizerAnswer: "done" });
+      const withSynthResult = await withSynthExecutor.execute(
+        request,
+        ["executor", "synthesizer"],
+        `run-topology-with-synth-${topology}`,
+        () => {},
+        { executionProfile: "read_only", topology },
+      );
+      expect(withSynthResult.outcome).toBe("failed");
+      expect(withSynthResult.error_code).toBe("effect_gate_no_write_effect");
+    }
+  });
 });

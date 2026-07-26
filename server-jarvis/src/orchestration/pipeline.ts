@@ -91,6 +91,12 @@ import {
   runClaudeDelegate,
   type RunClaudeDelegateInput,
 } from "./claude-delegate";
+import {
+  buildMidLoopToolEvidence,
+  shouldRunMidLoopCheck,
+  type LoopIntervention,
+  type MidLoopSignal,
+} from "./mid-loop-intervention";
 import type { JarvisConfig } from "../config";
 
 /**
@@ -100,6 +106,18 @@ import type { JarvisConfig } from "../config";
  */
 export interface StageRunRecorder {
   recordStageRun(stage: StageRun): void;
+  recordDirective?(row: {
+    id: string;
+    agent_run_id: string;
+    stage: string;
+    directive_type: string;
+    decision_source?: string;
+    escalation_id?: string;
+    reason?: string;
+    new_remaining_json?: string;
+    inject_note?: string;
+    inject_for_stage?: string;
+  }): void;
   recordModelAttribution?(row: {
     id: string;
     agent_run_id: string;
@@ -112,6 +130,7 @@ export interface StageRunRecorder {
     duration_ms?: number;
     first_token_ms?: number;
     fallback_used: number;
+    escalation_id?: string;
   }): void;
 }
 
@@ -121,6 +140,7 @@ export interface ExecutorDelegateRuntime {
   run(input: Omit<RunClaudeDelegateInput, "health" | "snapshotFactory" | "processFactory"> & {
     onTextDelta?: (text: string) => void;
     onToolUse?: (record: ToolCallRecord) => void;
+    onToolResult?: (record: ToolCallRecord) => void | Promise<void>;
   }): Promise<ExecutorStageOutput>;
 }
 
@@ -708,19 +728,17 @@ export class PipelineExecutor {
   }
 
   /**
-   * Verification-gated conductor (Task 5.3): run syntax + run gates and merge
-   * into a tiered CheckResult. No-op when `orchestrator.verification.enabled`
-   * is false (default) so existing behavior stays inert.
+   * Shared check-runner core: syntax + run gates → tiered CheckResult.
+   * Callers decide policy (end-of-turn flag vs mid-loop driver).
    */
-  private async runTurnVerification(
+  private async runVerificationCheckCore(
     toolCalls: ToolCallRecord[],
     request: string,
     planSummary: string,
   ): Promise<CheckResult | undefined> {
-    if (!this.ctx.config.orchestrator?.verification?.enabled) return undefined;
     const workspaceRoot =
       this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd();
-    const timeoutMs = this.ctx.config.orchestrator.verification.check_timeout_ms ?? 90000;
+    const timeoutMs = this.ctx.config.orchestrator?.verification?.check_timeout_ms ?? 90000;
     try {
       return await runVerificationCheck({
         toolCalls,
@@ -741,6 +759,36 @@ export class PipelineExecutor {
       );
       return undefined;
     }
+  }
+
+  /**
+   * Verification-gated conductor (Task 5.3): end-of-stage check. No-op when
+   * `orchestrator.verification.enabled` is false so stage completion stays
+   * inert unless explicitly opted in.
+   */
+  private async runTurnVerification(
+    toolCalls: ToolCallRecord[],
+    request: string,
+    planSummary: string,
+  ): Promise<CheckResult | undefined> {
+    if (!this.ctx.config.orchestrator?.verification?.enabled) return undefined;
+    return this.runVerificationCheckCore(toolCalls, request, planSummary);
+  }
+
+  /**
+   * Mid-loop bounded check-runner: available whenever the in-turn driver is
+   * on (does not require verification.enabled). Grounds post-write supervision
+   * in executable evidence rather than model confidence alone.
+   */
+  private async runMidLoopVerification(
+    toolCalls: ToolCallRecord[],
+    request: string,
+    planSummary: string,
+  ): Promise<CheckResult | undefined> {
+    if (this.ctx.config.orchestrator?.conductor?.in_turn_driver?.enabled !== true) {
+      return undefined;
+    }
+    return this.runVerificationCheckCore(toolCalls, request, planSummary);
   }
 
   private registerStageAbort(stage: StageName): AbortSignal | undefined {
@@ -1098,7 +1146,7 @@ export class PipelineExecutor {
         }),
       );
       for (const { entry, result } of settled) {
-        this.conductor?.live.onToolResult(
+        this.conductor?.live?.onToolResult?.(
           stage,
           entry.call.name,
           result.is_error,
@@ -1427,6 +1475,145 @@ export class PipelineExecutor {
       .map((tool) => tool.function.name)
       .filter((name) => WRITE_EFFECT_TOOLS.has(name));
 
+    // Rung 2 mid-loop state: shared by the native turn loop and delegate_first
+    // stream supervision so both paths produce auditable conductor_directives.
+    const inTurnDriverEnabled =
+      this.ctx.config.orchestrator?.conductor?.in_turn_driver?.enabled === true;
+    let midLoopLastSuccessfulWrites = successfulWriteCount();
+    /** Successful writes covered by the last mid-loop check-runner invocation. */
+    let midLoopSuccessfulWritesAtLastCheck = 0;
+    let midLoopChecksUsed = 0;
+    type MidLoopStop =
+      | { kind: "abort"; reason: string }
+      | { kind: "handoff"; note: string };
+    let midLoopStop: MidLoopStop | null = null;
+    const midLoopAbortController = new AbortController();
+
+    const buildMidLoopSignal = (
+      calls: ToolCallRecord[],
+      turnCountForSignal: number,
+      extras: {
+        writeLandedSinceLastCheck?: boolean;
+        progressSinceLastCheckpoint?: string;
+        deadToolSuppressed?: boolean;
+        suppressedToolName?: string;
+      } = {},
+    ): MidLoopSignal => {
+      const evidence = buildMidLoopToolEvidence(calls, {
+        taskObjective: intentText,
+        activePlanItem: planSummary,
+        verification: this.lastCheckResult
+          ? {
+              tier: this.lastCheckResult.tier,
+              ran: this.lastCheckResult.ran,
+              passed: this.lastCheckResult.passed,
+              detail: this.lastCheckResult.detail,
+              command: this.lastCheckResult.command,
+            }
+          : undefined,
+        progressSinceLastCheckpoint: extras.progressSinceLastCheckpoint,
+        writeLandedSinceLastCheck: extras.writeLandedSinceLastCheck,
+      });
+      return {
+        writeIntent: requiresWriteEffect,
+        successfulWrites: evidence.successfulWrites ?? 0,
+        distinctSuccessfulReads: evidence.distinctSuccessfulReads ?? distinctSuccessfulReadCount(),
+        turnCount: turnCountForSignal,
+        maxTurns,
+        stageRemainingMs: options.turnBudget?.stageRemainingMs("executor") ?? Number.POSITIVE_INFINITY,
+        deadToolSuppressed: extras.deadToolSuppressed === true,
+        suppressedToolName: extras.suppressedToolName,
+        // Re-entered executor after a prior segment carries tool evidence →
+        // treat as post-reroute priority for #5 escalation reservation.
+        afterReroute: priorToolCalls.length > 0,
+        ...evidence,
+      };
+    };
+
+    const recordMidLoopDirective = (midLoop: LoopIntervention): void => {
+      this.collector.recordDirective?.({
+        id: `dir_${crypto.randomUUID()}`,
+        agent_run_id: agentRunId,
+        stage: "executor",
+        directive_type: `mid_loop_${midLoop.kind}`,
+        decision_source: midLoop.decisionSource,
+        escalation_id: midLoop.escalationId,
+        reason: "reason" in midLoop ? midLoop.reason : undefined,
+        inject_note: "note" in midLoop ? midLoop.note : undefined,
+      });
+    };
+
+    const runMidLoopCheckpoint = async (
+      calls: ToolCallRecord[],
+      turnCountForSignal: number,
+      extras: {
+        writeLandedSinceLastCheck?: boolean;
+        progressSinceLastCheckpoint?: string;
+        deadToolSuppressed?: boolean;
+        suppressedToolName?: string;
+        /** Pre-completion quality gate: re-check unchecked writes before accepting done. */
+        forcePreCompletion?: boolean;
+      } = {},
+    ): Promise<LoopIntervention | null> => {
+      if (!inTurnDriverEnabled || !this.conductor?.live || !requiresWriteEffect) return null;
+      const writes = calls.filter((call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name)).length;
+      const writeLanded = extras.writeLandedSinceLastCheck
+        ?? writes > midLoopLastSuccessfulWrites;
+
+      // Follow-up #3: bounded check-runner after a meaningful write (or before
+      // accepting completion with unchecked mutations). Feeds CheckResult into
+      // the mid-loop signal so reflexes / resident judgment see executable evidence.
+      if (
+        shouldRunMidLoopCheck({
+          writeLanded,
+          forcePreCompletion: extras.forcePreCompletion === true,
+          successfulWrites: writes,
+          successfulWritesAtLastCheck: midLoopSuccessfulWritesAtLastCheck,
+          checksUsed: midLoopChecksUsed,
+        })
+      ) {
+        midLoopChecksUsed += 1;
+        onStateChange({
+          stage: "executor",
+          status: "running",
+          detail: "mid_loop_check_runner",
+        });
+        const check = await this.runMidLoopVerification(
+          calls,
+          options.rawMessage ?? request,
+          planSummary,
+        );
+        if (check) {
+          this.lastCheckResult = check;
+          midLoopSuccessfulWritesAtLastCheck = writes;
+          this.collector.recordDirective?.({
+            id: `dir_${crypto.randomUUID()}`,
+            agent_run_id: agentRunId,
+            stage: "executor",
+            directive_type: "mid_loop_check",
+            decision_source: "deterministic_reflex",
+            reason:
+              `tier=${check.tier} ran=${check.ran} passed=${String(check.passed)}` +
+              (check.command ? ` cmd=${check.command}` : "") +
+              (check.detail ? ` detail=${check.detail.slice(0, 120)}` : ""),
+          });
+        } else {
+          // Count the attempt so a hard failure cannot spin unbounded retries.
+          midLoopSuccessfulWritesAtLastCheck = writes;
+        }
+      }
+
+      const midLoop = await this.conductor.live.checkMidLoop(
+        buildMidLoopSignal(calls, turnCountForSignal, {
+          ...extras,
+          writeLandedSinceLastCheck: writeLanded,
+        }),
+      );
+      midLoopLastSuccessfulWrites = writes;
+      recordMidLoopDirective(midLoop);
+      return midLoop;
+    };
+
     const runDelegate = async (nativeNoWrite: boolean): Promise<ExecutorStageOutput | undefined> => {
       const delegateRuntime = this.delegateRuntime;
       if (!delegateRuntime || this.delegateAttemptedRuns.has(agentRunId)) return undefined;
@@ -1474,11 +1661,14 @@ export class PipelineExecutor {
         `Plan:\n${planSummary}`,
         "[Runtime write contract] This is a CHANGE request. The stage is complete only after you actually invoke a file-writing tool (your environment's Write/Edit or equivalent) and it succeeds — describing the change in your response text does NOT modify any file. Read what you need first, then CALL the write/edit tool now, then read the file back to verify.",
       ].join("\n\n");
+      // Mid-loop abort is merged so force_write/abort can stop the CLI stream.
       const combinedAbort = combineAbortSignals(
         this.registerStageAbort("executor"),
         options.turnAbort,
+        midLoopAbortController.signal,
       );
       this.delegateAttemptedRuns.add(agentRunId);
+      const delegateStreamCalls: ToolCallRecord[] = [];
       let delegated: ExecutorStageOutput;
       try {
         delegated = await delegateRuntime.run({
@@ -1503,6 +1693,68 @@ export class PipelineExecutor {
               output: `\n[Tool Executed: ${record.name}]\n`,
               detail: `tool:${record.name}`,
             });
+          },
+          onToolResult: async (record) => {
+            // Snapshot completed outcomes for mid-loop signal building. The
+            // delegate stream is external (Claude CLI) so message inject is
+            // impossible; abort/handoff is the enactment path.
+            delegateStreamCalls.push({
+              name: record.name,
+              arguments: record.arguments,
+              output: record.output,
+              is_error: record.is_error,
+              error_code: record.error_code,
+              duration_ms: record.duration_ms,
+            });
+            this.conductor?.live?.onToolResult?.(
+              "executor",
+              record.name,
+              record.is_error,
+              (record.output || "").slice(0, 500),
+            );
+            const midLoop = await runMidLoopCheckpoint(
+              [...priorToolCalls, ...delegateStreamCalls],
+              delegateStreamCalls.length,
+              {
+                progressSinceLastCheckpoint: `${record.is_error ? "failed" : "ok"} ${record.name}`,
+              },
+            );
+            if (!midLoop || midLoopStop) return;
+            if (midLoop.kind === "abort") {
+              midLoopStop = { kind: "abort", reason: midLoop.reason };
+              midLoopAbortController.abort();
+              onStateChange({ stage: "executor", status: "running", detail: "mid_loop_abort" });
+              return;
+            }
+            if (
+              (midLoop.kind === "force_write" || midLoop.kind === "redirect" || midLoop.kind === "inject")
+              && "note" in midLoop
+            ) {
+              const streamWrites = delegateStreamCalls.filter(
+                (call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name),
+              ).length;
+              // Claude CLI cannot accept mid-stream user notes. Handoff to
+              // native with the intervention when no verified write exists yet;
+              // after a write, only record the directive (already done) so a
+              // quality inject does not discard a landed mutation.
+              if (streamWrites === 0 && midLoop.kind !== "inject") {
+                midLoopStop = { kind: "handoff", note: midLoop.note };
+                midLoopAbortController.abort();
+                onStateChange({
+                  stage: "executor",
+                  status: "running",
+                  detail: `mid_loop_handoff:${midLoop.kind}`,
+                });
+              } else if (midLoop.kind === "inject" && streamWrites === 0) {
+                midLoopStop = { kind: "handoff", note: midLoop.note };
+                midLoopAbortController.abort();
+                onStateChange({
+                  stage: "executor",
+                  status: "running",
+                  detail: "mid_loop_handoff:inject",
+                });
+              }
+            }
           },
         });
       } catch (error) {
@@ -1545,13 +1797,19 @@ export class PipelineExecutor {
       // workspace and only then times out/cancels, falling back to native can
       // duplicate a non-idempotent write. A verified write therefore closes
       // the executor stage regardless of the process's later terminal status.
-      const cancelled = delegated.terminalStatus === "cancelled";
-      const accepted = hasVerifiedWrite && !cleanupUnconfirmed;
+      const conductorAborted = midLoopStop?.kind === "abort";
+      const conductorHandoff = midLoopStop?.kind === "handoff";
+      const cancelled = delegated.terminalStatus === "cancelled" && !conductorAborted && !conductorHandoff;
+      const accepted = hasVerifiedWrite && !cleanupUnconfirmed && !conductorAborted;
       const stageSucceeded = accepted && !cancelled;
-      const willRunNativeFallback = !accepted && !cancelled && !cleanupUnconfirmed;
+      const willRunNativeFallback = !accepted && !cancelled && !cleanupUnconfirmed && !conductorAborted;
       const downgradeCode = cleanupUnconfirmed
         ? "delegate_cleanup_unconfirmed"
-        : delegated.errorCode
+        : conductorAborted
+          ? "mid_loop_abort"
+          : conductorHandoff
+            ? "mid_loop_handoff"
+          : delegated.errorCode
           ?? (cancelled ? "delegate_aborted" : hasVerifiedWrite ? undefined : "delegate_no_write");
       this.collector.recordStageRun({
         id: stageId,
@@ -1565,7 +1823,13 @@ export class PipelineExecutor {
         was_successful: stageSucceeded ? 1 : 0,
         had_error: stageSucceeded ? 0 : 1,
         error_message: stageSucceeded ? undefined : downgradeCode,
-        stop_reason: stageSucceeded ? "completed" : delegated.terminalStatus,
+        stop_reason: stageSucceeded
+          ? "completed"
+          : conductorAborted
+            ? "mid_loop_abort"
+            : conductorHandoff
+              ? "mid_loop_handoff"
+              : delegated.terminalStatus,
         partial_error_code: stageSucceeded ? undefined : downgradeCode,
       });
       this.collector.recordModelAttribution?.({
@@ -1593,6 +1857,22 @@ export class PipelineExecutor {
           detail: "delegate_cleanup_unconfirmed",
         });
         return unsafeOutput;
+      }
+      if (conductorAborted && midLoopStop?.kind === "abort") {
+        const abortOutput: ExecutorStageOutput = {
+          ok: false,
+          narrative: `[Conductor] ${midLoopStop.reason}${delegated.narrative ? `\n${delegated.narrative}` : ""}`,
+          terminalStatus: "partial",
+          errorCode: "mid_loop_abort",
+          toolCalls,
+        };
+        onStateChange({
+          stage: "executor",
+          status: "failed",
+          output: abortOutput.narrative,
+          detail: "mid_loop_abort",
+        });
+        return abortOutput;
       }
       if (cancelled) {
         const cancelledOutput: ExecutorStageOutput = { ...delegated, toolCalls };
@@ -1623,6 +1903,12 @@ export class PipelineExecutor {
           ) {
             duplicateReadOnlyOutputs.set(duplicateToolCallKey(call), call.output);
           }
+        }
+        if (conductorHandoff && midLoopStop?.kind === "handoff") {
+          executorMessages.push({
+            role: "user",
+            content: `[Conductor mid-loop] ${midLoopStop.note}`,
+          });
         }
         executorMessages.push({
           role: "user",
@@ -2169,7 +2455,74 @@ export class PipelineExecutor {
             });
           }
 
-          if (!emittedToolCalls && !workspaceEvidenceNudgeSentThisTurn && !writeEffectNudgeSentThisTurn) {
+          // Rung 2: real-time in-turn ownership (default on). Quality-aware:
+          // successfulWrites alone no longer end supervision — a write that
+          // just landed triggers a post-write checkpoint (+ bounded check-runner).
+          const midLoop = await runMidLoopCheckpoint(toolCalls, turnCount, {
+            progressSinceLastCheckpoint: emittedToolCalls
+              ? `native turn ${turnCount}: ${toolCalls.slice(turnStartIdx).map((c) => c.name).join(", ") || "no tools"}`
+              : `native turn ${turnCount}: no tool calls`,
+          });
+          let midLoopHeldOpen = false;
+          if (midLoop) {
+            if (midLoop.kind === "abort") {
+              executorDone = true;
+              narratives.push(`[Conductor] ${midLoop.reason}`);
+              onStateChange({ stage: "executor", status: "running", detail: "mid_loop_abort" });
+            } else if (midLoop.kind === "force_write" && !writeEffectNudgeSentThisTurn) {
+              writeEffectNudgeCount++;
+              writeEffectNudgeSentThisTurn = true;
+              midLoopHeldOpen = true;
+              executorMessages.push({ role: "user", content: midLoop.note });
+            } else if (midLoop.kind === "inject") {
+              midLoopHeldOpen = true;
+              executorMessages.push({ role: "user", content: midLoop.note });
+            } else if (midLoop.kind === "redirect") {
+              midLoopHeldOpen = true;
+              executorMessages.push({ role: "user", content: midLoop.note });
+            }
+          }
+
+          // About to accept completion: one last quality gate when writes exist
+          // but have not been covered by a mid-loop check yet.
+          if (
+            !executorDone &&
+            !emittedToolCalls &&
+            !workspaceEvidenceNudgeSentThisTurn &&
+            !writeEffectNudgeSentThisTurn &&
+            !midLoopHeldOpen &&
+            successfulWriteCount() > midLoopSuccessfulWritesAtLastCheck
+          ) {
+            const preComplete = await runMidLoopCheckpoint(toolCalls, turnCount, {
+              forcePreCompletion: true,
+              progressSinceLastCheckpoint: "pre-completion quality gate",
+            });
+            if (preComplete) {
+              if (preComplete.kind === "abort") {
+                executorDone = true;
+                narratives.push(`[Conductor] ${preComplete.reason}`);
+                onStateChange({ stage: "executor", status: "running", detail: "mid_loop_abort" });
+              } else if (preComplete.kind === "force_write" || preComplete.kind === "inject" || preComplete.kind === "redirect") {
+                midLoopHeldOpen = true;
+                if (preComplete.kind === "force_write") {
+                  writeEffectNudgeCount++;
+                  writeEffectNudgeSentThisTurn = true;
+                }
+                executorMessages.push({
+                  role: "user",
+                  content: "note" in preComplete ? preComplete.note : "Continue fixing before completing.",
+                });
+              }
+            }
+          }
+
+          if (
+            !executorDone &&
+            !emittedToolCalls &&
+            !workspaceEvidenceNudgeSentThisTurn &&
+            !writeEffectNudgeSentThisTurn &&
+            !midLoopHeldOpen
+          ) {
             executorDone = true;
           }
 
@@ -3961,6 +4314,8 @@ export class PipelineExecutor {
           profile: options.executionProfile ?? "full",
           executor: state.executor,
           rewriter: state.rewriter,
+          request,
+          assumeWriteIntent: options.taskRunWriteIntent,
           contentEffects: this.ctx.write_effects,
         }),
       );
@@ -4003,6 +4358,8 @@ export class PipelineExecutor {
         profile: options.executionProfile ?? "full",
         executor: state.executor,
         rewriter: state.rewriter,
+        request,
+        assumeWriteIntent: options.taskRunWriteIntent,
         contentEffects: this.ctx.write_effects,
       }),
     ));

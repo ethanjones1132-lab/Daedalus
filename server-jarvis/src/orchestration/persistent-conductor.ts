@@ -76,6 +76,7 @@ export interface ConductorSupervisionResult {
   content: string;
   model: string;
   latencyMs: number;
+  fallbackUsed: boolean;
 }
 
 export interface PersistentConductorErrorOptions {
@@ -290,6 +291,11 @@ interface ResolvedConductorTarget {
   model: string;
 }
 
+export interface ConductorTimerApi {
+  setTimeout: typeof globalThis.setTimeout;
+  clearTimeout: typeof globalThis.clearTimeout;
+}
+
 let cachedTarget: ResolvedConductorTarget | null = null;
 let cachedTargetKey = "";
 let cachedTargetAt = 0;
@@ -299,7 +305,7 @@ const RUNTIME_HEALTH_FAILURE_TTL_MS = 30_000;
 const runtimeFailedTargets = new Map<string, number>();
 
 /** F7: warm routing must fail fast before API fallback takes over. */
-export const ROUTING_TIMEOUT_MS = 10_000;
+export const ROUTING_TIMEOUT_MS = 20_000;
 
 export function __resetPersistentConductorCachesForTests(): void {
   cachedTarget = null;
@@ -481,6 +487,7 @@ export class PersistentConductor {
     private getConfig: () => JarvisConfig,
     private sessionsRoot: string = SESSIONS_DIR,
     private readonly outcomeStore: SelfTuningStore = new SelfTuningStore(),
+    private readonly timers: ConductorTimerApi = globalThis,
   ) {}
 
   private config(): ConductorConfig {
@@ -739,17 +746,22 @@ export class PersistentConductor {
     const content = stripGemmaThinkingArtifacts(message.content ?? "");
     if (!content) throw new PersistentConductorError("Ollama conductor returned empty supervision output");
     this.clearSupervisionFailure();
-    return { content, model: target.model, latencyMs: Date.now() - startedAt };
+    return {
+      content,
+      model: target.model,
+      latencyMs: Date.now() - startedAt,
+      fallbackUsed: target.model !== this.config().model,
+    };
   }
 
   /** Load and retain the configured conductor model before the first user turn. */
-  async warmUp(timeoutMs = 30_000): Promise<{ model: string; latencyMs: number }> {
+  async warmUp(timeoutMs = 90_000): Promise<{ model: string; latencyMs: number }> {
     if (!this.config().enabled) {
       throw new PersistentConductorError("Persistent conductor is disabled");
     }
     let target = await this.resolveTarget();
     const ctrl = new AbortController();
-    const timeout = setTimeout(() => ctrl.abort(), timeoutMs);
+    const timeout = this.timers.setTimeout(() => ctrl.abort(), timeoutMs);
     const startedAt = Date.now();
     try {
       const res = await fetch(`${target.baseUrl}/api/generate`, {
@@ -782,7 +794,7 @@ export class PersistentConductor {
       if (error instanceof PersistentConductorError) throw error;
       throw new PersistentConductorError(error instanceof Error ? error.message : String(error));
     } finally {
-      clearTimeout(timeout);
+      this.timers.clearTimeout(timeout);
     }
   }
 
@@ -1075,7 +1087,7 @@ export class PersistentConductor {
   ): Promise<OllamaChatMessage> {
     const conductor = this.config();
     const ctrl = new AbortController();
-    const timeout = setTimeout(() => ctrl.abort(), options.timeoutMs);
+    const timeout = this.timers.setTimeout(() => ctrl.abort(), options.timeoutMs);
 
     const body: Record<string, unknown> = {
       model: target.model,
@@ -1100,7 +1112,7 @@ export class PersistentConductor {
         body: JSON.stringify(body),
         signal: ctrl.signal,
       });
-      clearTimeout(timeout);
+      this.timers.clearTimeout(timeout);
 
       if (!res.ok) {
         const errBody = await res.text().catch(() => "");
@@ -1115,7 +1127,7 @@ export class PersistentConductor {
       if (!json.message) throw new PersistentConductorError("Ollama conductor returned no message");
       return json.message;
     } catch (e) {
-      clearTimeout(timeout);
+      this.timers.clearTimeout(timeout);
       if (isAbortOrTimeoutError(e)) throw e;
       if (e instanceof PersistentConductorError) throw e;
       throw new PersistentConductorError(e instanceof Error ? e.message : String(e));

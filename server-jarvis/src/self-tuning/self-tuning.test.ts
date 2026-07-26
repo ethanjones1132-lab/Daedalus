@@ -344,6 +344,21 @@ describe("Self tuning", () => {
       agent_run_id: runId,
       stage: "synthesizer",
       directive_type: "continue",
+      decision_source: "resident_error",
+      escalation_id: "mid_shared_1",
+    });
+    collector.recordModelAttribution({
+      id: "attr_1",
+      agent_run_id: runId,
+      stage_id: "conductor_supervision",
+      agent_id: "live_conductor",
+      provider: "ollama",
+      model_id: "qwen3.5:4b",
+      was_successful: 0,
+      had_error: 1,
+      duration_ms: 8000,
+      fallback_used: 1,
+      escalation_id: "mid_shared_1",
     });
 
     const rows = store.getConductorDirectives(runId);
@@ -355,5 +370,13 @@ describe("Self tuning", () => {
     expect(rows[2].inject_for_stage).toBe("executor");
     expect(rows[2].inject_note).toContain("read_file");
     expect(rows[3].directive_type).toBe("continue");
+    expect(rows[3].decision_source).toBe("resident_error");
+    expect(rows[3].escalation_id).toBe("mid_shared_1");
+    expect(store.getModelAttributions(runId)[0]).toMatchObject({
+      provider: "ollama",
+      model_id: "qwen3.5:4b",
+      fallback_used: 1,
+      escalation_id: "mid_shared_1",
+    });
   });
 });

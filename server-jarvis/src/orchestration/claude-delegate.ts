@@ -656,6 +656,12 @@ export interface RunClaudeDelegateInput {
   /** Standard executor streaming hooks supplied by the pipeline adapter. */
   onTextDelta?: (text: string) => void;
   onToolUse?: (record: ToolCallRecord) => void;
+  /**
+   * Fired after a tool_result lands and the matching ToolCallRecord is fully
+   * populated. Used by the in-turn conductor to supervise delegate_first
+   * streams the same way it supervises the native executor loop.
+   */
+  onToolResult?: (record: ToolCallRecord) => void | Promise<void>;
 }
 
 const DELEGATE_WRITE_TOOLS = new Set(["write_file", "edit_file", "multi_edit"]);
@@ -1169,6 +1175,14 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
                 if (match.record.error_code !== "policy_denied") match.record.is_error = event.is_error === true;
                 match.record.duration_ms = Math.max(0, now() - match.startedAt);
                 pending.delete(event.tool_use_id!);
+                // Mid-loop supervision observes completed tool outcomes. Await
+                // so an abort/handoff decision can cancel the stream promptly.
+                try {
+                  await input.onToolResult?.(match.record);
+                } catch {
+                  // Supervision must never kill the stream on its own throw;
+                  // pipeline handlers are expected to fail-open.
+                }
               }
             }
           }
