@@ -60,8 +60,8 @@ afterEach(() => {
 });
 
 describe("PersistentConductor", () => {
-  test("routing call timeout is 10s", () => {
-    expect(ROUTING_TIMEOUT_MS).toBe(10_000);
+  test("routing call timeout is 20s", () => {
+    expect(ROUTING_TIMEOUT_MS).toBe(20_000);
   });
 
   test("uses compact JSON schema output for local routing", async () => {
@@ -164,6 +164,12 @@ describe("PersistentConductor", () => {
 
   test("warmUp preloads and retains the conductor model", async () => {
     let generateBody: Record<string, any> | undefined;
+    const timeoutDelays: number[] = [];
+    const originalSetTimeout = globalThis.setTimeout;
+    (globalThis as any).setTimeout = ((handler: TimerHandler, timeout?: number, ...args: any[]) => {
+      if (typeof timeout === "number") timeoutDelays.push(timeout);
+      return originalSetTimeout(handler, timeout, ...args);
+    }) as typeof globalThis.setTimeout;
     (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
@@ -176,13 +182,18 @@ describe("PersistentConductor", () => {
 
     const cfg = makeConfig({ persist_sessions: false });
     const conductor = new PersistentConductor(() => cfg);
-    const result = await conductor.warmUp();
+    try {
+      const result = await conductor.warmUp();
 
-    expect(result.model).toBe("gemma4:e2b");
-    expect(generateBody).toMatchObject({ model: "gemma4:e2b", prompt: "", keep_alive: "30m" });
-    // 2026-07-18: default num_ctx raised 8192→16384 (supervision digests +
-    // session prefixes were crowding the old window).
-    expect(generateBody?.options).toMatchObject({ num_predict: 1, num_ctx: 16_384 });
+      expect(result.model).toBe("gemma4:e2b");
+      expect(generateBody).toMatchObject({ model: "gemma4:e2b", prompt: "", keep_alive: "30m" });
+      expect(timeoutDelays).toContain(90_000);
+      // 2026-07-18: default num_ctx raised 8192→16384 (supervision digests +
+      // session prefixes were crowding the old window).
+      expect(generateBody?.options).toMatchObject({ num_predict: 1, num_ctx: 16_384 });
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+    }
   });
 
   test("isWarm returns false only when the configured model is confidently absent from /api/ps", async () => {
