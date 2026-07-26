@@ -1,9 +1,24 @@
-export type LoopIntervention =
+export type MidLoopDecisionSource =
+  | "deterministic_reflex"
+  | "resident_model"
+  | "resident_error"
+  | "no_signal"
+  | "cap_exhausted";
+
+export interface MidLoopDecisionMeta {
+  /** Truthful origin for audit/replay; populated by LiveConductor.checkMidLoop. */
+  decisionSource?: MidLoopDecisionSource;
+  /** Shared with the model attribution when a resident escalation was attempted. */
+  escalationId?: string;
+}
+
+export type LoopIntervention = (
   | { kind: "continue" }
   | { kind: "inject"; note: string }
   | { kind: "force_write"; note: string }
   | { kind: "redirect"; tool: string; note: string }
-  | { kind: "abort"; reason: string };
+  | { kind: "abort"; reason: string }
+) & MidLoopDecisionMeta;
 
 export interface MidLoopSignal {
   writeIntent: boolean;

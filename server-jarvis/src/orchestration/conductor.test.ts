@@ -894,7 +894,7 @@ describe("LiveConductor verification early-stop side-channel (Task 4.3)", () => 
       );
       conductor.setContext("general", "medium", "run-1");
       const result = await conductor.checkMidLoop({ ...baseSignal, deadToolSuppressed: true, suppressedToolName: "glob" });
-      expect(result).toMatchObject({ kind: "redirect", tool: "glob" });
+      expect(result).toMatchObject({ kind: "redirect", tool: "glob", decisionSource: "deterministic_reflex" });
       expect(called).toBe(false);
       expect(attributions).toEqual([]);
     });
@@ -910,7 +910,11 @@ describe("LiveConductor verification early-stop side-channel (Task 4.3)", () => 
       );
       conductor.setContext("general", "medium", "run-2");
       const result = await conductor.checkMidLoop(baseSignal);
-      expect(result.kind).toBe("abort");
+      expect(result).toMatchObject({
+        kind: "abort",
+        decisionSource: "resident_model",
+        escalationId: expect.any(String),
+      });
       expect(attributions).toHaveLength(1);
       expect(attributions[0]).toMatchObject({
         agentRunId: "run-2",
@@ -918,6 +922,34 @@ describe("LiveConductor verification early-stop side-channel (Task 4.3)", () => 
         hadError: false,
         provider: "conductor",
         modelId: "supervision",
+        escalationId: result.escalationId,
+      });
+    });
+
+    test("resident attribution preserves actual model and fallback provenance", async () => {
+      const attributions: SupervisionAttribution[] = [];
+      const conductor = new LiveConductor(
+        async () => ({ content: "{}" }), new ConductorBus(), new AgentPool([]),
+        { supervision_timeout_ms: 2000, max_tool_errors_before_reroute: 3, supervise_low_complexity: true },
+        async () => ({
+          content: JSON.stringify({ directive: "force_write", reason: "enough evidence" }),
+          _provider: "ollama",
+          _modelUsed: "qwen3.5:4b",
+          _fallbackUsed: true,
+        }),
+        (row) => attributions.push(row),
+      );
+      conductor.setContext("general", "medium", "run-model-provenance");
+
+      const result = await conductor.checkMidLoop(baseSignal);
+
+      expect(result).toMatchObject({ kind: "force_write", decisionSource: "resident_model" });
+      expect(attributions).toHaveLength(1);
+      expect(attributions[0]).toMatchObject({
+        provider: "ollama",
+        modelId: "qwen3.5:4b",
+        fallbackUsed: true,
+        escalationId: result.escalationId,
       });
     });
 
@@ -931,7 +963,11 @@ describe("LiveConductor verification early-stop side-channel (Task 4.3)", () => 
       );
       conductor.setContext("general", "medium", "run-2-failure");
       const result = await conductor.checkMidLoop(baseSignal);
-      expect(result).toEqual({ kind: "continue" });
+      expect(result).toMatchObject({
+        kind: "continue",
+        decisionSource: "resident_error",
+        escalationId: expect.any(String),
+      });
       expect(attributions).toHaveLength(1);
       expect(attributions[0]).toMatchObject({
         agentRunId: "run-2-failure",
@@ -939,6 +975,7 @@ describe("LiveConductor verification early-stop side-channel (Task 4.3)", () => 
         hadError: true,
         provider: "conductor",
         modelId: "supervision",
+        escalationId: result.escalationId,
       });
     });
 
@@ -955,12 +992,17 @@ describe("LiveConductor verification early-stop side-channel (Task 4.3)", () => 
       );
       conductor.setContext("general", "medium", "run-2-timeout");
       const result = await conductor.checkMidLoop(baseSignal);
-      expect(result).toEqual({ kind: "continue" });
+      expect(result).toMatchObject({
+        kind: "continue",
+        decisionSource: "resident_error",
+        escalationId: expect.any(String),
+      });
       expect(attributions).toHaveLength(1);
       expect(attributions[0]).toMatchObject({
         agentRunId: "run-2-timeout",
         wasSuccessful: false,
         hadError: true,
+        escalationId: result.escalationId,
       });
     }, 2000);
 
@@ -979,6 +1021,29 @@ describe("LiveConductor verification early-stop side-channel (Task 4.3)", () => 
       expect(calls).toBe(3);
       expect(attributions).toHaveLength(3);
       expect(attributions.every((row) => row.agentRunId === "run-3" && row.wasSuccessful && !row.hadError)).toBe(true);
+    });
+
+    test("mid-loop and after-stage supervision share the existing four-call run cap", async () => {
+      let calls = 0;
+      const supervisorModel = async () => {
+        calls++;
+        return { content: JSON.stringify({ directive: "continue" }) };
+      };
+      const conductor = new LiveConductor(
+        async () => ({ content: "{}" }), new ConductorBus(), new AgentPool([]),
+        { supervision_timeout_ms: 2000, max_tool_errors_before_reroute: 3, supervise_low_complexity: true },
+        supervisorModel,
+      );
+      conductor.setContext("general", "high", "run-shared-cap");
+
+      for (let i = 0; i < 3; i++) await conductor.checkMidLoop(baseSignal);
+      await conductor.afterStage("planner", "failed", "first failure", ["executor"]);
+      await conductor.afterStage("planner", "failed", "second failure", ["executor"]);
+
+      expect(calls).toBe(4);
+      const capped = await conductor.checkMidLoop(baseSignal);
+      expect(capped).toMatchObject({ kind: "continue", decisionSource: "cap_exhausted" });
+      expect(calls).toBe(4);
     });
   });
 });

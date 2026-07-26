@@ -3129,7 +3129,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             cfg.orchestrator.conductor.supervision.supervision_timeout_ms - 250,
           );
           const result = await persistentConductor.supervise(messages, timeoutMs);
-          return { content: result.content };
+          return {
+            content: result.content,
+            _provider: "ollama",
+            _modelUsed: result.model,
+            _fallbackUsed: result.fallbackUsed,
+          };
         };
         const liveConductor = new LiveConductor(
           callModel,
@@ -3151,7 +3156,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               was_successful: attr.wasSuccessful ? 1 : 0,
               had_error: attr.hadError ? 1 : 0,
               duration_ms: attr.durationMs,
-              fallback_used: 0,
+              fallback_used: attr.fallbackUsed ? 1 : 0,
+              escalation_id: attr.escalationId,
             });
           },
         );

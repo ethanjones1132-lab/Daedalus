@@ -23,8 +23,18 @@ evidence to judge implementation completeness or quality.
 - TypeScript typecheck: passed.
 - Mid-loop decisions are persisted in `conductor_directives`.
 - Resident model calls are attributed as `stage_id='conductor_supervision'`.
+- Each in-turn row now records whether it came from a deterministic reflex,
+  resident-model decision, no-signal fast path, exhausted cap, or fail-open
+  model error. Resident attempts share an escalation ID with their model
+  attribution.
+- Model attributions now retain the actual Ollama model and whether the
+  configured fallback served the request.
+- `force_write` is present in the production structured-output schema, not
+  merely the prompt and parser.
 - Deterministic reflexes remain available when the model is disabled,
   unavailable, timed out, or capped.
+- Mid-loop and post-stage judgment share the existing four-inference run cap;
+  mid-loop judgment may consume at most three of those calls.
 - Resident warm-up and route deadlines are now independently configurable and
   default to 90 seconds and 20 seconds respectively.
 
@@ -106,6 +116,12 @@ progress, chose `mid_loop_continue` every time, and ultimately failed the
 fixture's required write. The deterministic zero-write reroute fired, but the
 replacement executor also failed to produce a correct write.
 
+Historical note: these canary rows were produced before model/fallback metadata
+was threaded through the supervision adapter, so their stored model ID was the
+generic `supervision` label. Candidate identity in this table was cross-checked
+against the active config and server logs. Future comparisons will record the
+actual Ollama model and fallback flag directly.
+
 The current conductor telemetry records wall-clock call latency but not
 generated-token counts, so reliable tokens-per-second cannot be calculated
 from these runs. Wall-clock route and supervision latency is reported instead.
@@ -139,4 +155,3 @@ Qwythos remains registered for later experiments. The live default remains
    model-selection criterion.
 5. Resolve Nanbeige runtime compatibility or replace it with a loadable compact
    candidate before repeating the model comparison.
-

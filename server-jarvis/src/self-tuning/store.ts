@@ -86,6 +86,10 @@ export interface ConductorDirectiveRow {
   agent_run_id: string;
   stage: string;
   directive_type: string;
+  /** Origin of the decision (resident model, deterministic reflex, or fail-open path). */
+  decision_source?: string;
+  /** Correlates a resident decision/failure with its model attribution row. */
+  escalation_id?: string;
   reason?: string;
   new_remaining_json?: string;
   inject_note?: string;
@@ -150,6 +154,8 @@ export interface ModelAttribution {
   /** Wall time from request dispatch to first semantic stream progress. */
   first_token_ms?: number;
   fallback_used: number;
+  /** Correlates an in-turn supervision call with its persisted directive. */
+  escalation_id?: string;
   created_at?: string;
 }
 
@@ -327,6 +333,8 @@ const SELF_TUNING_SCHEMA = `
     agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
     stage TEXT NOT NULL,
     directive_type TEXT NOT NULL,
+    decision_source TEXT,
+    escalation_id TEXT,
     reason TEXT,
     new_remaining_json TEXT,
     inject_note TEXT,
@@ -375,6 +383,7 @@ const SELF_TUNING_SCHEMA = `
     duration_ms INTEGER,
     first_token_ms INTEGER,
     fallback_used INTEGER NOT NULL DEFAULT 0,
+    escalation_id TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   );
   CREATE INDEX IF NOT EXISTS idx_model_attributions_agent_run_id ON model_attributions(agent_run_id);
@@ -497,6 +506,15 @@ export class SelfTuningStore {
         } catch { /* column already exists */ }
         try {
           db.exec(`ALTER TABLE model_attributions ADD COLUMN first_token_ms INTEGER`);
+        } catch { /* column already exists */ }
+        try {
+          db.exec(`ALTER TABLE model_attributions ADD COLUMN escalation_id TEXT`);
+        } catch { /* column already exists */ }
+        try {
+          db.exec(`ALTER TABLE conductor_directives ADD COLUMN decision_source TEXT`);
+        } catch { /* column already exists */ }
+        try {
+          db.exec(`ALTER TABLE conductor_directives ADD COLUMN escalation_id TEXT`);
         } catch { /* column already exists */ }
         // T0.2: truncation honesty columns on stage_runs.
         try {
@@ -773,13 +791,15 @@ export class SelfTuningStore {
     try {
       db.prepare(
         `INSERT INTO conductor_directives
-          (id, agent_run_id, stage, directive_type, reason, new_remaining_json, inject_note, inject_for_stage)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          (id, agent_run_id, stage, directive_type, decision_source, escalation_id, reason, new_remaining_json, inject_note, inject_for_stage)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         directive.id,
         directive.agent_run_id,
         directive.stage,
         directive.directive_type,
+        directive.decision_source ?? null,
+        directive.escalation_id ?? null,
         directive.reason ?? null,
         directive.new_remaining_json ?? null,
         directive.inject_note ?? null,
@@ -838,8 +858,8 @@ export class SelfTuningStore {
     if (!db) return;
     try {
       db.prepare(
-        `INSERT INTO model_attributions (id, agent_run_id, stage_id, agent_id, provider, model_id, was_successful, had_error, duration_ms, first_token_ms, fallback_used)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO model_attributions (id, agent_run_id, stage_id, agent_id, provider, model_id, was_successful, had_error, duration_ms, first_token_ms, fallback_used, escalation_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         row.id,
         row.agent_run_id,
@@ -852,6 +872,7 @@ export class SelfTuningStore {
         row.duration_ms ?? null,
         row.first_token_ms ?? null,
         row.fallback_used,
+        row.escalation_id ?? null,
       );
     } catch (e) {
       console.error("[SelfTuningStore] insertModelAttribution failed:", e);

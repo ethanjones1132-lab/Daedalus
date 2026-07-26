@@ -100,6 +100,8 @@ export interface SupervisionAttribution {
   hadError: boolean;
   provider?: string;
   modelId?: string;
+  fallbackUsed?: boolean;
+  escalationId?: string;
 }
 
 export class LiveConductor {
@@ -210,15 +212,25 @@ export class LiveConductor {
    */
   async checkMidLoop(signal: MidLoopSignal): Promise<LoopIntervention> {
     const reflex = decideMidLoopIntervention(signal);
-    if (reflex.kind !== "continue") return reflex;
+    if (reflex.kind !== "continue") {
+      return { ...reflex, decisionSource: "deterministic_reflex" };
+    }
 
     // Only escalate when there is SOME signal worth asking about - a clean
     // turn with no reads/writes yet must not spend an inference for nothing.
     const worthAsking = signal.writeIntent && signal.successfulWrites === 0 && signal.distinctSuccessfulReads > 0;
-    if (!worthAsking || this.midLoopEscalationsUsed >= LiveConductor.MAX_MID_LOOP_ESCALATIONS) {
-      return { kind: "continue" };
+    if (!worthAsking) {
+      return { kind: "continue", decisionSource: "no_signal" };
+    }
+    if (
+      this.midLoopEscalationsUsed >= LiveConductor.MAX_MID_LOOP_ESCALATIONS ||
+      this.supervisionCallsUsed >= 4
+    ) {
+      return { kind: "continue", decisionSource: "cap_exhausted" };
     }
     this.midLoopEscalationsUsed += 1;
+    this.supervisionCallsUsed += 1;
+    const escalationId = `mid_${crypto.randomUUID()}`;
 
     const startedAt = Date.now();
     try {
@@ -250,17 +262,31 @@ export class LiveConductor {
         if (timeoutHandle) clearTimeout(timeoutHandle);
       }
       const parsed = extractJson<{ directive: string; reason?: string }>(result.content);
-      this.emitAttribution(Date.now() - startedAt, true, false);
+      this.emitAttribution(Date.now() - startedAt, true, false, result, escalationId);
       if (parsed.directive === "abort_stage") {
-        return { kind: "abort", reason: parsed.reason ?? "resident conductor judged the turn unrecoverable" };
+        return {
+          kind: "abort",
+          reason: parsed.reason ?? "resident conductor judged the turn unrecoverable",
+          decisionSource: "resident_model",
+          escalationId,
+        };
       }
       if (parsed.directive === "force_write") {
-        return { kind: "force_write", note: parsed.reason ?? "resident conductor: apply the change now" };
+        return {
+          kind: "force_write",
+          note: parsed.reason ?? "resident conductor: apply the change now",
+          decisionSource: "resident_model",
+          escalationId,
+        };
       }
-      return { kind: "continue" };
+      return { kind: "continue", decisionSource: "resident_model", escalationId };
     } catch {
-      this.emitAttribution(Date.now() - startedAt, false, true);
-      return { kind: "continue" }; // fail-open: escalation must never abort a turn
+      this.emitAttribution(Date.now() - startedAt, false, true, undefined, escalationId);
+      return {
+        kind: "continue",
+        decisionSource: "resident_error",
+        escalationId,
+      }; // fail-open: escalation must never abort a turn
     }
   }
 
@@ -628,7 +654,7 @@ export class LiveConductor {
         `outcome=${digest.outcome} directive=${parsed.directive || "continue"} latency_ms=${Date.now() - startedAt}`,
       );
 
-      this.emitAttribution(Date.now() - startedAt, parseOk, !parseOk);
+      this.emitAttribution(Date.now() - startedAt, parseOk, !parseOk, result);
 
       if (parsed.directive === "reroute" && Array.isArray(parsed.newRemaining)) {
         return {
@@ -665,7 +691,13 @@ export class LiveConductor {
     }
   }
 
-  private emitAttribution(durationMs: number, wasSuccessful: boolean, hadError: boolean): void {
+  private emitAttribution(
+    durationMs: number,
+    wasSuccessful: boolean,
+    hadError: boolean,
+    result?: Awaited<ReturnType<CallModelFn>>,
+    escalationId?: string,
+  ): void {
     if (!this.onSupervisionAttributed || !this.runId) return;
     try {
       this.onSupervisionAttributed({
@@ -673,8 +705,10 @@ export class LiveConductor {
         durationMs,
         wasSuccessful,
         hadError,
-        provider: "conductor",
-        modelId: "supervision",
+        provider: result?._provider ?? "conductor",
+        modelId: result?._modelUsed ?? result?.model ?? "supervision",
+        fallbackUsed: result?._fallbackUsed === true,
+        escalationId,
       });
     } catch (e) {
       console.warn(

@@ -53,7 +53,15 @@ export type CallModelFn = (
     /** Optional stage-local cancellation. It must not abort the whole turn. */
     stageAbort?: AbortSignal;
   }
-) => Promise<{ content: string; tool_calls?: any[]; model?: string; _modelUsed?: string; _provider?: string }>;
+) => Promise<{
+  content: string;
+  tool_calls?: any[];
+  model?: string;
+  _modelUsed?: string;
+  _provider?: string;
+  /** True when the requested resident model was replaced by its configured fallback. */
+  _fallbackUsed?: boolean;
+}>;
 
 export interface CoordinatorContext {
   needs_workspace_inspection: boolean;

@@ -62,7 +62,7 @@ export const CONDUCTOR_DIRECTIVE_JSON_SCHEMA = {
   properties: {
     directive: {
       type: "string",
-      enum: ["continue", "reroute", "inject_context", "abort_stage"],
+      enum: ["continue", "reroute", "inject_context", "force_write", "abort_stage"],
     },
     newRemaining: {
       type: "array",

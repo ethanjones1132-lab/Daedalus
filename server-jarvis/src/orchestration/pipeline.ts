@@ -104,6 +104,8 @@ export interface StageRunRecorder {
     agent_run_id: string;
     stage: string;
     directive_type: string;
+    decision_source?: string;
+    escalation_id?: string;
     reason?: string;
     new_remaining_json?: string;
     inject_note?: string;
@@ -121,6 +123,7 @@ export interface StageRunRecorder {
     duration_ms?: number;
     first_token_ms?: number;
     fallback_used: number;
+    escalation_id?: string;
   }): void;
 }
 
@@ -2194,6 +2197,8 @@ export class PipelineExecutor {
               agent_run_id: agentRunId,
               stage: "executor",
               directive_type: `mid_loop_${midLoop.kind}`,
+              decision_source: midLoop.decisionSource,
+              escalation_id: midLoop.escalationId,
               reason: "reason" in midLoop ? midLoop.reason : undefined,
               inject_note: "note" in midLoop ? midLoop.note : undefined,
             });

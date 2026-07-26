@@ -76,6 +76,7 @@ export interface ConductorSupervisionResult {
   content: string;
   model: string;
   latencyMs: number;
+  fallbackUsed: boolean;
 }
 
 export interface PersistentConductorErrorOptions {
@@ -745,7 +746,12 @@ export class PersistentConductor {
     const content = stripGemmaThinkingArtifacts(message.content ?? "");
     if (!content) throw new PersistentConductorError("Ollama conductor returned empty supervision output");
     this.clearSupervisionFailure();
-    return { content, model: target.model, latencyMs: Date.now() - startedAt };
+    return {
+      content,
+      model: target.model,
+      latencyMs: Date.now() - startedAt,
+      fallbackUsed: target.model !== this.config().model,
+    };
   }
 
   /** Load and retain the configured conductor model before the first user turn. */

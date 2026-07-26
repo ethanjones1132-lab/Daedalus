@@ -52,6 +52,21 @@ describe("pipeline stage telemetry", () => {
   test("persists one executor audit row for every invoked mid-loop intervention", async () => {
     const interventions = [
       { result: { kind: "continue" } as const, directiveType: "mid_loop_continue" },
+      {
+        result: {
+          kind: "continue",
+          decisionSource: "resident_error",
+          escalationId: "mid_timeout",
+        } as const,
+        directiveType: "mid_loop_continue",
+        decisionSource: "resident_error",
+        escalationId: "mid_timeout",
+      },
+      {
+        result: { kind: "continue", decisionSource: "cap_exhausted" } as const,
+        directiveType: "mid_loop_continue",
+        decisionSource: "cap_exhausted",
+      },
       { result: { kind: "force_write", note: "Apply the change now." } as const, directiveType: "mid_loop_force_write", note: "Apply the change now." },
       { result: { kind: "redirect", tool: "edit_file", note: "Use edit_file instead." } as const, directiveType: "mid_loop_redirect", note: "Use edit_file instead." },
       { result: { kind: "inject", note: "Keep the target path in scope." } as const, directiveType: "mid_loop_inject", note: "Keep the target path in scope." },
@@ -110,6 +125,8 @@ describe("pipeline stage telemetry", () => {
         expect(row).toMatchObject({ stage: "executor", directive_type: intervention.directiveType });
         expect(row.inject_note).toBe(intervention.note ?? null);
         expect(row.reason).toBe(intervention.reason ?? null);
+        expect(row.decision_source).toBe(intervention.decisionSource ?? null);
+        expect(row.escalation_id).toBe(intervention.escalationId ?? null);
       }
     }
   });

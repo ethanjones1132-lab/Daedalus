@@ -191,8 +191,10 @@ describe("PersistentConductor", () => {
     ]);
 
     expect(result.model).toBe("gemma4:e2b");
+    expect(result.fallbackUsed).toBe(true);
     expect(result.content).toBe('{"directive":"continue"}');
     expect(body?.format?.properties?.directive?.enum).toContain("reroute");
+    expect(body?.format?.properties?.directive?.enum).toContain("force_write");
     expect(body?.options?.num_predict).toBeLessThanOrEqual(160);
     expect(body?.think).toBe(false);
   });
@@ -428,6 +430,7 @@ describe("PersistentConductor", () => {
     ]);
 
     expect(result.model).toBe("gemma4:e2b");
+    expect(result.fallbackUsed).toBe(true);
     expect(chatModels).toEqual(["gemma4:e2b"]);
     expect(generateCalled).toBe(false);
   });
