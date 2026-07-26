@@ -942,17 +942,43 @@ describe("LiveConductor verification early-stop side-channel (Task 4.3)", () => 
       });
     });
 
-    test("escalation is capped per turn - further ambiguous calls fall back to continue", async () => {
+    test("timed-out ambiguous escalation emits one error attribution", async () => {
+      const attributions: SupervisionAttribution[] = [];
+      const conductor = new LiveConductor(
+        async () => ({ content: "{}" }), new ConductorBus(), new AgentPool([]),
+        { supervision_timeout_ms: 10, max_tool_errors_before_reroute: 3, supervise_low_complexity: true },
+        async () => {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          return { content: JSON.stringify({ directive: "continue" }) };
+        },
+        (row) => attributions.push(row),
+      );
+      conductor.setContext("general", "medium", "run-2-timeout");
+      const result = await conductor.checkMidLoop(baseSignal);
+      expect(result).toEqual({ kind: "continue" });
+      expect(attributions).toHaveLength(1);
+      expect(attributions[0]).toMatchObject({
+        agentRunId: "run-2-timeout",
+        wasSuccessful: false,
+        hadError: true,
+      });
+    }, 2000);
+
+    test("escalation is capped per turn without extra attributions", async () => {
       let calls = 0;
+      const attributions: SupervisionAttribution[] = [];
       const supervisorModel = async () => { calls++; return { content: JSON.stringify({ directive: "continue" }) }; };
       const conductor = new LiveConductor(
         async () => ({ content: "{}" }), new ConductorBus(), new AgentPool([]),
         { supervision_timeout_ms: 2000, max_tool_errors_before_reroute: 3, supervise_low_complexity: true },
         supervisorModel,
+        (row) => attributions.push(row),
       );
       conductor.setContext("general", "medium", "run-3");
       for (let i = 0; i < 5; i++) await conductor.checkMidLoop(baseSignal);
-      expect(calls).toBeLessThanOrEqual(3);
+      expect(calls).toBe(3);
+      expect(attributions).toHaveLength(3);
+      expect(attributions.every((row) => row.agentRunId === "run-3" && row.wasSuccessful && !row.hadError)).toBe(true);
     });
   });
 });
