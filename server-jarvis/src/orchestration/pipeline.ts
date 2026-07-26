@@ -92,8 +92,19 @@ import {
   type RunClaudeDelegateInput,
 } from "./claude-delegate";
 import {
+  clearDelegateThrash,
+  getDelegateThrashCount,
+  isDelegateThrashOutcome,
+  recordDelegateThrash,
+  selectDelegateModel,
+} from "./delegate-model-select";
+import {
+  assessCorrectnessFloor,
   buildMidLoopToolEvidence,
+  DEFAULT_QUALITY_PUSH_NOTE,
+  MAX_QUALITY_PUSHES,
   shouldRunMidLoopCheck,
+  shouldRunQualityPhase,
   type LoopIntervention,
   type MidLoopSignal,
 } from "./mid-loop-intervention";
@@ -1483,6 +1494,9 @@ export class PipelineExecutor {
     /** Successful writes covered by the last mid-loop check-runner invocation. */
     let midLoopSuccessfulWritesAtLastCheck = 0;
     let midLoopChecksUsed = 0;
+    /** Slice D: quality pushes after correctness floor. */
+    let qualityPushesUsed = 0;
+    let qualityAccepted = false;
     type MidLoopStop =
       | { kind: "abort"; reason: string }
       | { kind: "handoff"; note: string };
@@ -1497,6 +1511,7 @@ export class PipelineExecutor {
         progressSinceLastCheckpoint?: string;
         deadToolSuppressed?: boolean;
         suppressedToolName?: string;
+        forceQualityGate?: boolean;
       } = {},
     ): MidLoopSignal => {
       const evidence = buildMidLoopToolEvidence(calls, {
@@ -1514,7 +1529,7 @@ export class PipelineExecutor {
         progressSinceLastCheckpoint: extras.progressSinceLastCheckpoint,
         writeLandedSinceLastCheck: extras.writeLandedSinceLastCheck,
       });
-      return {
+      const base: MidLoopSignal = {
         writeIntent: requiresWriteEffect,
         successfulWrites: evidence.successfulWrites ?? 0,
         distinctSuccessfulReads: evidence.distinctSuccessfulReads ?? distinctSuccessfulReadCount(),
@@ -1526,8 +1541,26 @@ export class PipelineExecutor {
         // Re-entered executor after a prior segment carries tool evidence →
         // treat as post-reroute priority for #5 escalation reservation.
         afterReroute: priorToolCalls.length > 0,
+        qualityPushesUsed,
+        qualityPushBudget: MAX_QUALITY_PUSHES,
+        qualityAccepted,
+        forceQualityGate: extras.forceQualityGate === true,
         ...evidence,
       };
+      // Slice D phase label for prompts / resident schema.
+      if (shouldRunQualityPhase(base) || assessCorrectnessFloor(base)) {
+        base.implementationPhase = assessCorrectnessFloor(base) &&
+          (shouldRunQualityPhase(base) || extras.forceQualityGate === true || qualityPushesUsed > 0)
+          ? "quality"
+          : "correctness";
+        if (assessCorrectnessFloor(base) && !qualityAccepted) {
+          // Prefer quality label whenever floor is met and we still owe a quality gate.
+          if (shouldRunQualityPhase({ ...base, implementationPhase: "quality", forceQualityGate: extras.forceQualityGate })) {
+            base.implementationPhase = "quality";
+          }
+        }
+      }
+      return base;
     };
 
     const recordMidLoopDirective = (midLoop: LoopIntervention): void => {
@@ -1543,6 +1576,36 @@ export class PipelineExecutor {
       });
     };
 
+    const applyQualityPhaseBookkeeping = (midLoop: LoopIntervention, signal: MidLoopSignal): void => {
+      const inQuality =
+        signal.implementationPhase === "quality" || shouldRunQualityPhase(signal);
+      if (!inQuality) return;
+      if (midLoop.kind === "inject" || midLoop.kind === "force_write" || midLoop.kind === "redirect") {
+        qualityPushesUsed += 1;
+        this.collector.recordDirective?.({
+          id: `dir_${crypto.randomUUID()}`,
+          agent_run_id: agentRunId,
+          stage: "executor",
+          directive_type: "mid_loop_quality_push",
+          decision_source: midLoop.decisionSource,
+          escalation_id: midLoop.escalationId,
+          reason: `quality_push ${qualityPushesUsed}/${MAX_QUALITY_PUSHES}`,
+          inject_note: "note" in midLoop ? midLoop.note : undefined,
+        });
+      } else if (midLoop.kind === "continue" && midLoop.decisionSource === "resident_model") {
+        qualityAccepted = true;
+        this.collector.recordDirective?.({
+          id: `dir_${crypto.randomUUID()}`,
+          agent_run_id: agentRunId,
+          stage: "executor",
+          directive_type: "mid_loop_quality_accept",
+          decision_source: midLoop.decisionSource,
+          escalation_id: midLoop.escalationId,
+          reason: "resident accepted product quality after correctness floor",
+        });
+      }
+    };
+
     const runMidLoopCheckpoint = async (
       calls: ToolCallRecord[],
       turnCountForSignal: number,
@@ -1553,6 +1616,8 @@ export class PipelineExecutor {
         suppressedToolName?: string;
         /** Pre-completion quality gate: re-check unchecked writes before accepting done. */
         forcePreCompletion?: boolean;
+        /** Slice D: force quality-phase checkpoint after correctness. */
+        forceQualityGate?: boolean;
       } = {},
     ): Promise<LoopIntervention | null> => {
       if (!inTurnDriverEnabled || !this.conductor?.live || !requiresWriteEffect) return null;
@@ -1566,7 +1631,7 @@ export class PipelineExecutor {
       if (
         shouldRunMidLoopCheck({
           writeLanded,
-          forcePreCompletion: extras.forcePreCompletion === true,
+          forcePreCompletion: extras.forcePreCompletion === true || extras.forceQualityGate === true,
           successfulWrites: writes,
           successfulWritesAtLastCheck: midLoopSuccessfulWritesAtLastCheck,
           checksUsed: midLoopChecksUsed,
@@ -1603,14 +1668,15 @@ export class PipelineExecutor {
         }
       }
 
-      const midLoop = await this.conductor.live.checkMidLoop(
-        buildMidLoopSignal(calls, turnCountForSignal, {
-          ...extras,
-          writeLandedSinceLastCheck: writeLanded,
-        }),
-      );
+      const signal = buildMidLoopSignal(calls, turnCountForSignal, {
+        ...extras,
+        writeLandedSinceLastCheck: writeLanded,
+        forceQualityGate: extras.forceQualityGate === true,
+      });
+      const midLoop = await this.conductor.live.checkMidLoop(signal);
       midLoopLastSuccessfulWrites = writes;
       recordMidLoopDirective(midLoop);
+      applyQualityPhaseBookkeeping(midLoop, signal);
       return midLoop;
     };
 
@@ -1669,10 +1735,35 @@ export class PipelineExecutor {
       );
       this.delegateAttemptedRuns.add(agentRunId);
       const delegateStreamCalls: ToolCallRecord[] = [];
+      // Slice B: free-first model selection with thrash → cheap Go promotion.
+      const thrashKey = agentRunId;
+      const modelSelection = selectDelegateModel({
+        configuredModel: this.ctx.config.claude_cli.delegate.model,
+        thrashCount: getDelegateThrashCount(thrashKey),
+        thrashThreshold: this.ctx.config.claude_cli.delegate.free_thrash_threshold,
+      });
+      const delegateConfig = {
+        ...this.ctx.config,
+        claude_cli: {
+          ...this.ctx.config.claude_cli,
+          delegate: {
+            ...this.ctx.config.claude_cli.delegate,
+            model: modelSelection.model,
+          },
+        },
+      };
+      this.collector.recordDirective?.({
+        id: `dir_${crypto.randomUUID()}`,
+        agent_run_id: agentRunId,
+        stage: "executor",
+        directive_type: "delegate_model_select",
+        decision_source: "deterministic_reflex",
+        reason: `${modelSelection.reason} pool=${modelSelection.pool} model=${modelSelection.model} thrash=${modelSelection.thrashCount}`,
+      });
       let delegated: ExecutorStageOutput;
       try {
         delegated = await delegateRuntime.run({
-          config: this.ctx.config,
+          config: delegateConfig,
           prompt,
           sessionId: this.ctx.session_id ?? `delegate_${crypto.randomUUID()}`,
           allowedRoots,
@@ -1811,6 +1902,18 @@ export class PipelineExecutor {
             ? "mid_loop_handoff"
           : delegated.errorCode
           ?? (cancelled ? "delegate_aborted" : hasVerifiedWrite ? undefined : "delegate_no_write");
+      // Slice B thrash accounting: promote free → Go on repeated non-writes.
+      if (
+        isDelegateThrashOutcome({
+          ok: delegated.ok === true,
+          hasVerifiedWrite,
+          errorCode: downgradeCode ?? delegated.errorCode,
+        })
+      ) {
+        recordDelegateThrash(thrashKey);
+      } else if (hasVerifiedWrite) {
+        clearDelegateThrash(thrashKey);
+      }
       this.collector.recordStageRun({
         id: stageId,
         agent_run_id: agentRunId,
@@ -1838,13 +1941,14 @@ export class PipelineExecutor {
         stage_id: stageId,
         agent_id: "claude_delegate",
         provider: "claude_cli",
-        model_id: this.ctx.config.claude_cli.delegate.model.trim()
+        model_id: modelSelection.model
+          || this.ctx.config.claude_cli.delegate.model.trim()
           || this.ctx.config.claude_cli.model?.trim()
           || "claude_cli",
         was_successful: stageSucceeded ? 1 : 0,
         had_error: stageSucceeded ? 0 : 1,
         duration_ms: Date.now() - delegateStart,
-        fallback_used: nativeNoWrite || willRunNativeFallback ? 1 : 0,
+        fallback_used: nativeNoWrite || willRunNativeFallback || modelSelection.pool === "go_capable" ? 1 : 0,
       });
 
       toolCalls.push(...delegated.toolCalls);
@@ -2483,8 +2587,8 @@ export class PipelineExecutor {
             }
           }
 
-          // About to accept completion: one last quality gate when writes exist
-          // but have not been covered by a mid-loop check yet.
+          // About to accept completion: unchecked writes still need a mid-loop
+          // check, then Slice D quality phase after the correctness floor.
           if (
             !executorDone &&
             !emittedToolCalls &&
@@ -2495,7 +2599,7 @@ export class PipelineExecutor {
           ) {
             const preComplete = await runMidLoopCheckpoint(toolCalls, turnCount, {
               forcePreCompletion: true,
-              progressSinceLastCheckpoint: "pre-completion quality gate",
+              progressSinceLastCheckpoint: "pre-completion correctness gate",
             });
             if (preComplete) {
               if (preComplete.kind === "abort") {
@@ -2511,6 +2615,80 @@ export class PipelineExecutor {
                 executorMessages.push({
                   role: "user",
                   content: "note" in preComplete ? preComplete.note : "Continue fixing before completing.",
+                });
+              }
+            }
+          }
+
+          // Slice D: correctness met but quality not accepted → one more push
+          // so free/local executors cannot one-shot "write and stop".
+          if (
+            !executorDone &&
+            !emittedToolCalls &&
+            !workspaceEvidenceNudgeSentThisTurn &&
+            !writeEffectNudgeSentThisTurn &&
+            !midLoopHeldOpen &&
+            !qualityAccepted &&
+            qualityPushesUsed < MAX_QUALITY_PUSHES &&
+            assessCorrectnessFloor({
+              writeIntent: requiresWriteEffect,
+              successfulWrites: successfulWriteCount(),
+              verification: this.lastCheckResult
+                ? {
+                    tier: this.lastCheckResult.tier,
+                    ran: this.lastCheckResult.ran,
+                    passed: this.lastCheckResult.passed,
+                    detail: this.lastCheckResult.detail,
+                    command: this.lastCheckResult.command,
+                  }
+                : undefined,
+            })
+          ) {
+            onStateChange({ stage: "executor", status: "running", detail: "mid_loop_quality_gate" });
+            const qualityGate = await runMidLoopCheckpoint(toolCalls, turnCount, {
+              forceQualityGate: true,
+              progressSinceLastCheckpoint: "slice-d quality-after-correctness gate",
+            });
+            if (qualityGate) {
+              if (qualityGate.kind === "abort") {
+                executorDone = true;
+                narratives.push(`[Conductor] ${qualityGate.reason}`);
+              } else if (
+                qualityGate.kind === "force_write" ||
+                qualityGate.kind === "inject" ||
+                qualityGate.kind === "redirect"
+              ) {
+                midLoopHeldOpen = true;
+                if (qualityGate.kind === "force_write") {
+                  writeEffectNudgeCount++;
+                  writeEffectNudgeSentThisTurn = true;
+                }
+                executorMessages.push({
+                  role: "user",
+                  content: "note" in qualityGate
+                    ? qualityGate.note
+                    : "Raise implementation quality before completing.",
+                });
+              } else if (
+                // Resident fail-open must not skip Slice D: host still issues
+                // one quality push so free/local executors get coached.
+                qualityGate.kind === "continue" &&
+                (qualityGate.decisionSource === "resident_error" ||
+                  qualityGate.decisionSource === "cap_exhausted" ||
+                  qualityGate.decisionSource === "escalation_reserved") &&
+                qualityPushesUsed < MAX_QUALITY_PUSHES
+              ) {
+                qualityPushesUsed += 1;
+                midLoopHeldOpen = true;
+                executorMessages.push({ role: "user", content: DEFAULT_QUALITY_PUSH_NOTE });
+                this.collector.recordDirective?.({
+                  id: `dir_${crypto.randomUUID()}`,
+                  agent_run_id: agentRunId,
+                  stage: "executor",
+                  directive_type: "mid_loop_quality_push",
+                  decision_source: "deterministic_reflex",
+                  reason: `quality_push_host_failopen ${qualityPushesUsed}/${MAX_QUALITY_PUSHES}`,
+                  inject_note: DEFAULT_QUALITY_PUSH_NOTE,
                 });
               }
             }
@@ -4310,6 +4488,11 @@ export class PipelineExecutor {
       const gated = applyEffectGate(
         upstreamDegraded ? "degraded" : "success",
         upstreamDegraded ? "upstream_stage_failed" : undefined,
+        // 2026-07-26 (Rung 1, plan §3.1): both fallback effect-gate calls
+        // now thread `request` + `taskRunWriteIntent` so write-intent is
+        // derived from the request text — not the profile heuristic. Every
+        // other call site in this file already passes both; this one and
+        // the L4002 sibling were the last two outliers.
         segment.effectGate ?? evaluateEffectGate({
           profile: options.executionProfile ?? "full",
           executor: state.executor,
@@ -4354,6 +4537,12 @@ export class PipelineExecutor {
     ({ outcome, errorCode } = applyEffectGate(
       outcome === "partial" ? "degraded" : outcome,
       errorCode,
+      // 2026-07-26 (Rung 1, plan §3.1): sibling of the L3960 fallback above.
+      // Both fallbacks must thread `request` so a non-`full` profile with a
+      // write-intent request (e.g. `workspace_read` + "fix the bug") still
+      // gates the run; the old profile-based heuristic collapsed write
+      // intent to `profile === "full" && executor !== undefined` and let
+      // the run ship as `success` whenever the profile wasn't full.
       segment.effectGate ?? evaluateEffectGate({
         profile: options.executionProfile ?? "full",
         executor: state.executor,

@@ -101,6 +101,8 @@ export interface DescribeHealthOptions {
  * backend, and policy-staging version — all snake_case.
  */
 export interface ConductorHealthSnapshot {
+  /** Slice A: true when the configured resident model is loaded in Ollama. */
+  warm?: boolean;
   enabled: boolean;
   available: boolean;
   fallback_to_api: boolean;
@@ -567,6 +569,7 @@ export class PersistentConductor {
       return {
         enabled: false,
         available: false,
+        warm: false,
         fallback_to_api: conductor.fallback_to_api,
         model: conductor.model,
         fallback_model: conductor.fallback_model,
@@ -576,9 +579,11 @@ export class PersistentConductor {
     }
     try {
       const available = await this.isAvailable();
+      const warm = available ? await this.isWarm(2_500) : false;
       return {
         enabled: true,
         available,
+        warm,
         fallback_to_api: conductor.fallback_to_api,
         model: conductor.model,
         fallback_model: conductor.fallback_model,
@@ -594,6 +599,7 @@ export class PersistentConductor {
       return {
         enabled: true,
         available: false,
+        warm: false,
         fallback_to_api: conductor.fallback_to_api,
         model: conductor.model,
         fallback_model: conductor.fallback_model,
@@ -612,17 +618,24 @@ export class PersistentConductor {
     const primary = await this.resolveTarget();
     let target = await this.resolveWarmInferenceTarget(primary);
     if (!target) {
-      void this.warmUp().catch((error) => {
-        console.warn(
-          `[PersistentConductor] background warm after cold_start_warming failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
+      // Slice A: first-route waits for a bounded warm instead of immediately
+      // aborting to deterministic routing (live canary: ~50s cold load).
+      try {
+        await this.warmUp(90_000);
+        target = (await this.resolveWarmInferenceTarget(primary)) ?? primary;
+      } catch (error) {
+        void this.warmUp().catch((warmError) => {
+          console.warn(
+            `[PersistentConductor] background warm after cold_start_warming failed: ${
+              warmError instanceof Error ? warmError.message : String(warmError)
+            }`,
+          );
+        });
+        throw new PersistentConductorError(
+          error instanceof Error ? error.message : "cold_start_warming",
+          { code: "cold_start_warming", retryable: true },
         );
-      });
-      throw new PersistentConductorError("cold_start_warming", {
-        code: "cold_start_warming",
-        retryable: false,
-      });
+      }
     }
 
     const session = this.getSession(input.sessionId);

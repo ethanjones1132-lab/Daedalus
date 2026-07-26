@@ -71,7 +71,32 @@ export interface MidLoopSignal {
    * (e.g. write-effect or deep-read re-enter). Priority escalation slot.
    */
   afterReroute?: boolean;
+  /**
+   * Slice D — implementation phase. `quality` means correctness floor is met
+   * and the resident must push one-shot product quality (not mere green checks).
+   */
+  implementationPhase?: MidLoopImplementationPhase;
+  /** Quality pushes already issued this executor stage. */
+  qualityPushesUsed?: number;
+  /** Max quality pushes allowed this stage (host-enforced). */
+  qualityPushBudget?: number;
+  /** Host already accepted quality for this stage. */
+  qualityAccepted?: boolean;
+  /** Force a quality-phase checkpoint even if write did not just land. */
+  forceQualityGate?: boolean;
 }
+
+/** Correctness = mutation floor; quality = product polish after that floor. */
+export type MidLoopImplementationPhase = "correctness" | "quality";
+
+/** Bounded quality pushes after correctness so free/local executors get coached. */
+export const MAX_QUALITY_PUSHES = 2;
+
+export const DEFAULT_QUALITY_PUSH_NOTE =
+  "Correctness floor is met (write landed; verification not red). " +
+  "Before finishing, raise one-shot product quality: cover edge cases and requirement gaps, " +
+  "re-read the edited code for clarity/robustness, and apply a focused polish edit if needed. " +
+  "Do not stop at 'tests might pass' — ship a finished-looking change.";
 
 /** Thresholds are deliberately conservative: reflexes fire only on the
  * unambiguous cases. The middle ground (some reads, budget not yet critical)
@@ -211,6 +236,13 @@ export function buildMidLoopToolEvidence(
 
 /** Max bounded check-runner invocations per executor stage (mid-loop path). */
 export const MAX_MID_LOOP_CHECKS = 2;
+/** Max resident mid-loop escalations per run (shared with historical cap). */
+export const MAX_MID_LOOP_ESCALATIONS = 3;
+/** Hold back at least this many slots for post-write / endgame / post-reroute. */
+export const RESERVED_MID_LOOP_ESCALATIONS = 1;
+/** Endgame: last 20% of turns, or stage budget under this floor. */
+export const MID_LOOP_ENDGAME_BUDGET_MS = 45_000;
+export const MID_LOOP_ENDGAME_TURN_RATIO = 0.8;
 
 /**
  * Whether to invoke the check-runner before a mid-loop judgment.
@@ -234,32 +266,62 @@ export function shouldRunMidLoopCheck(input: {
   return input.writeLanded === true || input.forcePreCompletion === true;
 }
 
+/**
+ * Correctness floor (Slice D): write intent has a successful mutation and
+ * verification is not red. Green checks or tier=none both clear the floor;
+ * only an executed failing check blocks it.
+ */
+export function assessCorrectnessFloor(signal: Pick<
+  MidLoopSignal,
+  "writeIntent" | "successfulWrites" | "verification"
+>): boolean {
+  if (!signal.writeIntent) return true;
+  if (signal.successfulWrites <= 0) return false;
+  if (signal.verification?.ran === true && signal.verification.passed === false) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Quality phase: correctness floor met, quality not yet accepted, and budget
+ * remains for at least one more quality push (or a forced quality gate).
+ */
+export function shouldRunQualityPhase(signal: MidLoopSignal): boolean {
+  if (!signal.writeIntent) return false;
+  if (!assessCorrectnessFloor(signal)) return false;
+  if (signal.qualityAccepted === true) return false;
+  const used = signal.qualityPushesUsed ?? 0;
+  const budget = signal.qualityPushBudget ?? MAX_QUALITY_PUSHES;
+  if (used >= budget) return false;
+  return (
+    signal.implementationPhase === "quality" ||
+    signal.forceQualityGate === true ||
+    signal.writeLandedSinceLastCheck === true ||
+    // Pre-completion / endgame with writes but no quality accept yet.
+    (signal.successfulWrites > 0 && (signal.turnCount >= signal.maxTurns || signal.stageRemainingMs <= MID_LOOP_ENDGAME_BUDGET_MS))
+  );
+}
+
 /** Whether the ambiguous middle / post-write quality case warrants resident escalation. */
 export function midLoopWorthAsking(signal: MidLoopSignal): boolean {
   return classifyMidLoopEscalation(signal) !== null;
 }
 
-/** Max resident mid-loop escalations per run (shared with historical cap). */
-export const MAX_MID_LOOP_ESCALATIONS = 3;
-/** Hold back at least this many slots for post-write / endgame / post-reroute. */
-export const RESERVED_MID_LOOP_ESCALATIONS = 1;
-/** Endgame: last 20% of turns, or stage budget under this floor. */
-export const MID_LOOP_ENDGAME_BUDGET_MS = 45_000;
-export const MID_LOOP_ENDGAME_TURN_RATIO = 0.8;
-
 export type MidLoopEscalationClass = "early_exploration" | "priority_quality";
 
 /**
  * Classify why mid-loop wants a resident call. Priority slots are reserved
- * for post-write quality, endgame, and post-reroute checkpoints (#5).
+ * for post-write quality, endgame, post-reroute, and Slice D quality phase.
  */
 export function classifyMidLoopEscalation(signal: MidLoopSignal): MidLoopEscalationClass | null {
   if (!signal.writeIntent) return null;
 
   const verificationFailed =
     signal.verification?.ran === true && signal.verification.passed === false;
+  const qualityPhase = shouldRunQualityPhase(signal);
   const postWriteQuality =
-    signal.writeLandedSinceLastCheck === true || verificationFailed;
+    signal.writeLandedSinceLastCheck === true || verificationFailed || qualityPhase;
   const turnRatio = signal.maxTurns > 0 ? signal.turnCount / signal.maxTurns : 0;
   const endgame =
     turnRatio >= MID_LOOP_ENDGAME_TURN_RATIO ||
@@ -336,11 +398,28 @@ export interface ResidentMidLoopParse {
   directive?: string;
   reason?: string;
   progress_evidence?: string;
+  /** Slice D: evidence that product quality (not mere correctness) is good enough. */
+  quality_evidence?: string;
+}
+
+/** Quality-phase evidence: polish language, not just "I wrote a file". */
+export function hasQualityEvidence(text: string | undefined, signal: MidLoopSignal): boolean {
+  const t = (text ?? "").trim();
+  if (t.length < 16) return false;
+  if (hasConcreteProgressEvidence(t, signal) &&
+    /\b(edge|empty|boundary|robust|polish|clean|simplif|clarity|naming|structure|cover(?:age|s|ed)?|requirement|complete|harden|defensive|one-shot|product|quality|test(?:s|ed)?|handle|graceful|error case)\b/i
+      .test(t)
+  ) {
+    return true;
+  }
+  return /\b(edge case|empty input|requirement gap|product quality|one-shot|polish(?:ed|ing)?|re-?read|hardened|defensive)\b/i
+    .test(t);
 }
 
 /**
  * Map resident JSON to a LoopIntervention. Continue is affirmative (#4):
  * uncited continue becomes force_write (pre-write) or inject (post-write).
+ * Slice D quality phase: continue/quality_accept need quality_evidence.
  */
 export function resolveResidentMidLoopDirective(
   parsed: ResidentMidLoopParse,
@@ -349,6 +428,9 @@ export function resolveResidentMidLoopDirective(
   const directive = (parsed.directive ?? "continue").trim();
   const reason = parsed.reason?.trim();
   const evidenceText = (parsed.progress_evidence ?? parsed.reason ?? "").trim();
+  const qualityText = (parsed.quality_evidence ?? parsed.progress_evidence ?? parsed.reason ?? "").trim();
+  const inQualityPhase =
+    signal.implementationPhase === "quality" || shouldRunQualityPhase(signal);
 
   if (directive === "abort_stage") {
     return {
@@ -360,7 +442,9 @@ export function resolveResidentMidLoopDirective(
   if (directive === "force_write") {
     return {
       kind: "force_write",
-      note: reason || "resident conductor: apply the change now",
+      note: reason || (inQualityPhase
+        ? "resident conductor: apply a quality polish edit now"
+        : "resident conductor: apply the change now"),
       decisionSource: "resident_model",
     };
   }
@@ -377,6 +461,20 @@ export function resolveResidentMidLoopDirective(
       tool: "alternative",
       note: reason,
       decisionSource: "resident_model",
+    };
+  }
+
+  // Slice D: quality_accept or continue in quality phase requires quality evidence.
+  if (inQualityPhase && (directive === "quality_accept" || directive === "continue")) {
+    if (hasQualityEvidence(qualityText, signal)) {
+      return { kind: "continue", decisionSource: "resident_model" };
+    }
+    return {
+      kind: "inject",
+      note: reason || DEFAULT_QUALITY_PUSH_NOTE,
+      decisionSource: directive === "continue" || directive === "quality_accept"
+        ? "schema_control"
+        : "resident_model",
     };
   }
 
@@ -402,6 +500,31 @@ export function resolveResidentMidLoopDirective(
       "before treating the write as complete. Fix quality issues if verification is weak or red.",
     decisionSource: "schema_control",
   };
+}
+
+/**
+ * Deterministic Slice D quality push when correctness is met but quality has
+ * not been accepted and the resident is not asked (or fails open later).
+ * Returns null when quality phase is not active.
+ */
+export function decideQualityPhaseReflex(signal: MidLoopSignal): LoopIntervention | null {
+  if (!shouldRunQualityPhase(signal)) return null;
+  // Prefer resident judgment; this reflex is the zero-inference floor when
+  // the host wants a guaranteed quality push (forceQualityGate) without
+  // waiting for a model that may fail open.
+  if (signal.forceQualityGate !== true && signal.implementationPhase !== "quality") {
+    return null;
+  }
+  // Only fire deterministic inject when we still have quality budget and
+  // the caller marked this as an explicit quality gate (pre-completion).
+  if (signal.forceQualityGate === true) {
+    return {
+      kind: "inject",
+      note: DEFAULT_QUALITY_PUSH_NOTE,
+      decisionSource: "deterministic_reflex",
+    };
+  }
+  return null;
 }
 
 /** Zero-inference reflex decision for one executor turn-loop iteration. */
@@ -436,6 +559,9 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
   }
 
   // Zero-write spiral reflexes only apply before any successful mutation.
+  // Slice D quality is handled by resident escalation + schema_control inject
+  // (see resolveResidentMidLoopDirective / shouldRunQualityPhase), not a
+  // zero-inference shortcut that would skip Qwythos.
   // A successful but incorrect write must NOT short-circuit supervision —
   // the quality path above (or resident escalation) owns that case.
   if (signal.successfulWrites === 0 && signal.distinctSuccessfulReads >= SPIRAL_READ_FLOOR) {
@@ -494,15 +620,28 @@ export function formatMidLoopEscalationContext(signal: MidLoopSignal): string {
   if (signal.afterReroute) {
     lines.push("This checkpoint is immediately after a deterministic reroute — judge the new trajectory carefully.");
   }
+  const phase = signal.implementationPhase
+    ?? (shouldRunQualityPhase(signal) ? "quality" : "correctness");
+  lines.push(`Implementation phase: ${phase}.`);
+  if (phase === "quality") {
+    lines.push(
+      `Quality pushes used: ${signal.qualityPushesUsed ?? 0}/${signal.qualityPushBudget ?? MAX_QUALITY_PUSHES}.`,
+      "CORRECTNESS FLOOR IS MET. Your job is product quality for one-shot free/local executors — " +
+        "edge cases, requirement completeness, clarity, robustness — not mere 'a write happened'.",
+    );
+  }
   lines.push(
     "Respond with ONLY JSON (one of):",
     '{"directive":"continue","progress_evidence":"<concrete file/tool/check progress>","reason":"<optional>"}',
-    '{"directive":"force_write","reason":"<why write now>"}',
-    '{"directive":"inject","reason":"<corrective note for the executor>"}',
+    '{"directive":"quality_accept","quality_evidence":"<why the change is finished-product quality>","reason":"<optional>"}',
+    '{"directive":"force_write","reason":"<why write/polish now>"}',
+    '{"directive":"inject","reason":"<corrective or quality note for the executor>"}',
     '{"directive":"abort_stage","reason":"<why unrecoverable>"}',
     "Rules: continue is AFFIRMATIVE — progress_evidence (or reason) MUST cite concrete progress " +
       "(path read/written, check result, plan item). Bare {\"directive\":\"continue\"} is rejected. " +
-      "A successful write is NOT automatically correct. Prefer force_write over abort_stage when budget remains.",
+      "In quality phase, quality_accept/continue need quality_evidence (edge cases, completeness, polish). " +
+      "A successful write is NOT automatically correct OR high-quality. " +
+      "Prefer force_write/inject polish over abort_stage when budget remains.",
   );
   return lines.join("\n");
 }

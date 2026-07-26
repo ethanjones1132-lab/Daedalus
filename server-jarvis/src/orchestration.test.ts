@@ -1,4 +1,4 @@
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, spyOn } from "bun:test";
 import { BUILTIN_MODES, executorTurnLimit, getToolsForMode } from "./orchestration/modes";
 import { PredictiveRouter } from "./orchestration/router";
 import { PipelineExecutor, describePipelineError, errText } from "./orchestration/pipeline";
@@ -9,6 +9,7 @@ import type { ChatMessage } from "./orchestration/router";
 import { SessionOutcomeCollector, SelfTuningStore } from "./self-tuning/mod";
 import { registerGitMetadataBundle } from "./git-metadata-bundle";
 import { resolveWorkspaceReadScope } from "./orchestration/evidence-sufficiency";
+import * as effectGate from "./orchestration/effect-gate";
 
 // In-memory collector so PipelineExecutor runs in tests can NEVER write to the
 // production self-tuning DB (~/.openclaw/jarvis/self-tuning.db). Passed as the
@@ -1009,6 +1010,74 @@ describe("Orchestration & Routing Tests", () => {
     // The unknown reenter_stage degraded to a `done` event.
     expect(recursionEvents.some((event) => event.status === "done")).toBe(true);
     expect(recursionEvents.some((event) => event.status === "reenter")).toBe(false);
+  });
+
+  test("Rung 1: every effect-gate call site in PipelineExecutor threads request + taskRunWriteIntent", async () => {
+    // Rung 1, plan §3.1: the two `evaluateEffectGate({...})` fallback calls
+    // at pipeline.ts L3960 + L4002 historically omitted `request` and
+    // `assumeWriteIntent`, so write intent in those defensive paths
+    // collapsed to the legacy profile-based heuristic
+    // `profile === "full" && executor !== undefined`. Every other call
+    // site in the file (L3471, L3519, L3749, L3779) already passed both,
+    // so the two fallbacks were the last two outliers. This test pins
+    // the contract: across a representative turn, every call to
+    // `evaluateEffectGate` from inside PipelineExecutor receives a
+    // non-undefined `request` and a defined `assumeWriteIntent`. A
+    // future refactor that drops either arg at any call site is caught.
+    //
+    // Note: the test exercises the normal flow (which hits the L3749
+    // call site). The L3960 and L4002 fallbacks are defensive code for
+    // error/exit paths that are hard to reach in a unit test, but the
+    // fix makes them structurally consistent with the L3749 contract.
+    // The source diff (both fallbacks now pass `request` and
+    // `assumeWriteIntent: options.taskRunWriteIntent`) is the regression
+    // pin for those two call sites; this test guards the family.
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig);
+    const callModel = (_messages: ChatMessage[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") {
+        return Promise.resolve({ content: "executor narrative", tool_calls: [] });
+      }
+      if (options.stageLabel === "synthesizer") return Promise.resolve({ content: "synthesized answer" });
+      return Promise.resolve({ content: "noop" });
+    };
+
+    const callArgs: Array<{ request: unknown; assumeWriteIntent: unknown }> = [];
+    const original = effectGate.evaluateEffectGate;
+    const spy = spyOn(effectGate, "evaluateEffectGate").mockImplementation((input) => {
+      callArgs.push({
+        request: input.request,
+        assumeWriteIntent: input.assumeWriteIntent,
+      });
+      return original(input);
+    });
+
+    try {
+      const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+      const request = "please fix the bug in solution.py";
+      await executor.execute(
+        request,
+        ["executor", "synthesizer"],
+        "run-rung1-gate-contract",
+        () => {},
+        { executionProfile: "workspace_read" },
+      );
+
+      // At least one call (the L3749 post-loop gate) must have fired.
+      expect(callArgs.length).toBeGreaterThan(0);
+      // Every call must have received a defined `request` and a defined
+      // `assumeWriteIntent`. A future regression that drops either arg
+      // at any call site would surface here.
+      for (const args of callArgs) {
+        expect(args.request).toBe(request);
+        // `assumeWriteIntent` is `boolean | undefined`; the call site
+        // always passes the field (even when false) so the gate's
+        // intent check is explicit rather than defaulting.
+        expect("assumeWriteIntent" in args).toBe(true);
+      }
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   test("executeSegment runs only the requested stages and returns typed state", async () => {

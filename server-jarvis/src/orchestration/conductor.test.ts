@@ -1013,8 +1013,9 @@ describe("LiveConductor verification early-stop side-channel (Task 4.3)", () => 
         calls++;
         return {
           content: JSON.stringify({
-            directive: "continue",
-            progress_evidence: "read solution.py and listed the call sites",
+            directive: "quality_accept",
+            quality_evidence: "hardened empty and unsorted edge cases after re-read of solution.py",
+            progress_evidence: "edit_file solution.py and verified edge cases",
           }),
         };
       };
@@ -1033,7 +1034,7 @@ describe("LiveConductor verification early-stop side-channel (Task 4.3)", () => 
       expect(reserved).toMatchObject({ kind: "continue", decisionSource: "escalation_reserved" });
       expect(calls).toBe(2);
 
-      // Post-write priority may spend the reserved third slot.
+      // Post-write / Slice D quality priority may spend the reserved third slot.
       const priority = await conductor.checkMidLoop({
         ...baseSignal,
         successfulWrites: 1,
@@ -1041,7 +1042,7 @@ describe("LiveConductor verification early-stop side-channel (Task 4.3)", () => 
         recentWriteTargets: ["solution.py"],
       });
       expect(calls).toBe(3);
-      expect(priority.decisionSource).toBe("resident_model");
+      expect(priority).toMatchObject({ kind: "continue", decisionSource: "resident_model" });
       expect(attributions).toHaveLength(3);
     });
 

@@ -116,9 +116,17 @@ export interface ClaudeDelegateConfig {
   policy: "delegate_first" | "escalation";
   permission_mode: "acceptEdits" | "bypassPermissions";
   allowed_tools: string[];
-  /** Model used by the stock Claude CLI delegate (OpenCode Go id or Claude model). */
+  /**
+   * Model used by the stock Claude CLI delegate (OpenCode Go / free-capable id).
+   * Use `"auto"` for free-first selection with thrash → cheapest capable Go.
+   */
   model: string;
   timeout_ms: number;
+  /**
+   * After this many consecutive delegate thrash signals (no write / stream
+   * error / rate limit), `auto` selection promotes to the cheap Go pool.
+   */
+  free_thrash_threshold?: number;
 }
 
 export interface ToolConfig {
@@ -515,7 +523,9 @@ export function defaultConfig(): JarvisConfig {
           "Read", "Edit", "Write", "MultiEdit", "Grep", "Glob",
           "WebSearch", "WebFetch", "TodoWrite",
         ],
-        model: "minimax-m3",
+        // auto = free-capable first, thrash → cheapest known-capable Go model.
+        model: "auto",
+        free_thrash_threshold: 2,
         timeout_ms: 420_000,
       },
     },
@@ -596,7 +606,8 @@ export function defaultConfig(): JarvisConfig {
         num_ctx: 16384,
         fallback_to_api: true,
         keep_warm: true,
-        keep_warm_interval_ms: 600_000,
+        // 10m left Qwythos cold under GPU thrash; 3m keep-warm for first-turn readiness.
+        keep_warm_interval_ms: 180_000,
         session_ttl_ms: 30 * 60 * 1000,
         max_turns_in_cache: 12,
         persist_sessions: true,

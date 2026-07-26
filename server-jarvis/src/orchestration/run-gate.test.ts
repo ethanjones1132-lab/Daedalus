@@ -51,6 +51,19 @@ describe("run gate target selection", () => {
     }
   });
 
+  test("recognizes tier-2B bare _t.py as an adjacent test (Slice C)", async () => {
+    const root = tempRoot();
+    try {
+      writeFileSync(join(root, "solution.py"), "def f():\n    return 1\n");
+      writeFileSync(join(root, "_t.py"), "from solution import f\nassert f()==1\nprint('OK')\n");
+      const target = await findRunnableTarget([writeCall("solution.py")], "fix solution.py", "", { root });
+      expect(target?.path).toBe(join(root, "_t.py"));
+      expect(target?.reason).toBe("adjacent_test");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("falls back to a written standalone script with a main guard", async () => {
     const root = tempRoot();
     try {

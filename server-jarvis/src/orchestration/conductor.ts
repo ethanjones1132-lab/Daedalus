@@ -286,6 +286,7 @@ export class LiveConductor {
         directive: string;
         reason?: string;
         progress_evidence?: string;
+        quality_evidence?: string;
       }>(result.content);
       this.emitAttribution(Date.now() - startedAt, true, false, result, escalationId);
       // #4: continue must cite concrete progress; bare continue is inverted.

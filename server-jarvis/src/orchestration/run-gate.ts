@@ -6,7 +6,8 @@ import type { ToolCallRecord } from "./stage-output";
 
 const WRITE_TOOL_NAMES = new Set(["write_file", "edit_file", "multi_edit", "apply_patch"]);
 const PYTHON_PATH = /(?:[A-Za-z]:[\\/])?[A-Za-z0-9_.\\/-]+\.py\b/gi;
-const TEST_FILE = /(?:^test[_-].*|.*[_-]test|_t[^.]+)\.py$/i;
+// Include bare `_t.py` (tier-2B fixture) — `_t[^.]+` alone required chars after `_t`.
+const TEST_FILE = /(?:^test[_-].*|.*[_-]test|^_t(?:[^.]+)?)\.py$/i;
 const MAIN_GUARD = /if\s+__name__\s*==\s*["']__main__["']\s*:/;
 
 export interface RunGateIssue {

@@ -328,12 +328,20 @@ describe("PersistentConductor", () => {
     expect(await conductor.isWarm()).toBe(true);
   });
 
-  test("routeTurn fail-fasts cold local conductor and starts a background warm ping", async () => {
+  test("routeTurn awaits a bounded warm when cold instead of fail-fast aborting", async () => {
+    // Slice A: first route should warm then proceed, not immediately throw
+    // cold_start_warming (live canary spent ~50s cold and lost Qwythos routing).
+    let psCalls = 0;
     const calls: string[] = [];
     (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
-      if (url.endsWith("/api/ps")) return Response.json({ models: [] });
+      if (url.endsWith("/api/ps")) {
+        psCalls += 1;
+        // Cold until warm-up generate lands.
+        if (psCalls === 1) return Response.json({ models: [] });
+        return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      }
       if (url.endsWith("/api/generate")) {
         const body = JSON.parse(String(init?.body ?? "{}"));
         calls.push(`generate:${body.model}:${body.keep_alive}:${body.options?.num_predict}`);
@@ -341,7 +349,16 @@ describe("PersistentConductor", () => {
       }
       if (url.endsWith("/api/chat")) {
         calls.push("chat");
-        return Response.json({ message: { role: "assistant", content: "{}" } });
+        return Response.json({
+          message: {
+            role: "assistant",
+            content: JSON.stringify({
+              pipeline: ["executor", "synthesizer"],
+              topology: "linear",
+              task_type: "general",
+            }),
+          },
+        });
       }
       throw new Error(`Unexpected fetch: ${url}`);
     };
@@ -349,14 +366,14 @@ describe("PersistentConductor", () => {
     const cfg = makeConfig({ persist_sessions: false });
     const conductor = new PersistentConductor(() => cfg);
 
-    await expect(conductor.routeTurn({
-      sessionId: "cold-fast-fail",
+    const result = await conductor.routeTurn({
+      sessionId: "cold-await-warm",
       request: "continue",
       turnNumber: 1,
-    })).rejects.toThrow("cold_start_warming");
-    await nextTick();
-
-    expect(calls).toEqual(["generate:gemma4:e2b:30m:1"]);
+    });
+    expect(calls[0]).toBe("generate:gemma4:e2b:30m:1");
+    expect(calls).toContain("chat");
+    expect(result.model).toBe("gemma4:e2b");
   });
 
   test("routeTurn uses a warm fallback_model when the primary conductor model is evicted", async () => {

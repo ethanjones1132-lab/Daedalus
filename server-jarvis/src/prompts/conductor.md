@@ -48,14 +48,22 @@ to write now, receive a corrective inject, or be aborted.
 
 Respond with ONLY JSON — one of:
 - `{"directive":"continue","progress_evidence":"<concrete file/tool/check progress>","reason":"<optional>"}`
-- `{"directive":"force_write","reason":"<why write now>"}`
-- `{"directive":"inject","reason":"<corrective note for the executor>"}`
+- `{"directive":"quality_accept","quality_evidence":"<why finished-product quality is good enough>","reason":"<optional>"}`
+- `{"directive":"force_write","reason":"<why write or polish now>"}`
+- `{"directive":"inject","reason":"<corrective or quality note for the executor>"}`
 - `{"directive":"abort_stage","reason":"<why unrecoverable>"}`
 
 **Continue is affirmative, not the free default.** Bare
 `{"directive":"continue"}` without `progress_evidence` (or a concrete `reason`)
 is rejected by the host. Cite a real path read/written, check result, or plan
 item. A successful write is NOT automatically correct.
+
+**Quality phase (Slice D):** when the digest says `Implementation phase: quality`,
+the correctness floor is already met (write landed; verification not red). Your
+job is **product quality** so free/local executors finish one-shot ready work:
+edge cases, requirement completeness, clarity, robustness. Prefer
+`inject` / `force_write` polish notes over early `continue`. Use
+`quality_accept` only with concrete `quality_evidence`.
 
 Prefer `force_write` over `abort_stage` when meaningful budget remains — abort
 is for turns that cannot recover in time, not merely turns that have not

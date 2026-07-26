@@ -1,14 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import {
+  assessCorrectnessFloor,
   buildMidLoopToolEvidence,
   classifyMidLoopEscalation,
   collectToolPathTargets,
   decideMidLoopIntervention,
+  DEFAULT_QUALITY_PUSH_NOTE,
   hasConcreteProgressEvidence,
+  hasQualityEvidence,
   maySpendMidLoopEscalation,
   midLoopWorthAsking,
   resolveResidentMidLoopDirective,
   shouldRunMidLoopCheck,
+  shouldRunQualityPhase,
 } from "./mid-loop-intervention";
 
 const base = {
@@ -244,6 +248,8 @@ describe("resolveResidentMidLoopDirective (#4 continue-must-cite)", () => {
       ...base,
       distinctSuccessfulReads: 2,
       recentReadTargets: ["solution.py"],
+      // Not quality phase (quality already accepted).
+      qualityAccepted: true,
     });
     expect(d).toMatchObject({ kind: "continue", decisionSource: "resident_model" });
   });
@@ -252,6 +258,94 @@ describe("resolveResidentMidLoopDirective (#4 continue-must-cite)", () => {
     expect(hasConcreteProgressEvidence("looks fine", base)).toBe(false);
     expect(hasConcreteProgressEvidence("ok", base)).toBe(false);
     expect(hasConcreteProgressEvidence("read src/a.ts and wrote the fix", base)).toBe(true);
+  });
+});
+
+describe("Slice D quality-after-correctness", () => {
+  test("correctness floor needs a write and non-red verification", () => {
+    expect(assessCorrectnessFloor({
+      writeIntent: true, successfulWrites: 0,
+    })).toBe(false);
+    expect(assessCorrectnessFloor({
+      writeIntent: true, successfulWrites: 1,
+      verification: { tier: "none", ran: false, passed: null },
+    })).toBe(true);
+    expect(assessCorrectnessFloor({
+      writeIntent: true, successfulWrites: 1,
+      verification: { tier: "builtin", ran: true, passed: false, detail: "err" },
+    })).toBe(false);
+  });
+
+  test("quality phase arms after write lands with correctness floor", () => {
+    expect(shouldRunQualityPhase({
+      ...base,
+      successfulWrites: 1,
+      writeLandedSinceLastCheck: true,
+    })).toBe(true);
+    expect(shouldRunQualityPhase({
+      ...base,
+      successfulWrites: 1,
+      writeLandedSinceLastCheck: true,
+      qualityAccepted: true,
+    })).toBe(false);
+    expect(shouldRunQualityPhase({
+      ...base,
+      successfulWrites: 1,
+      writeLandedSinceLastCheck: true,
+      qualityPushesUsed: 2,
+      qualityPushBudget: 2,
+    })).toBe(false);
+  });
+
+  test("quality phase is priority escalation", () => {
+    expect(classifyMidLoopEscalation({
+      ...base,
+      successfulWrites: 1,
+      writeLandedSinceLastCheck: true,
+    })).toBe("priority_quality");
+  });
+
+  test("quality_accept without quality_evidence becomes inject push", () => {
+    const d = resolveResidentMidLoopDirective(
+      { directive: "quality_accept" },
+      {
+        ...base,
+        successfulWrites: 1,
+        implementationPhase: "quality",
+        writeLandedSinceLastCheck: true,
+      },
+    );
+    expect(d.kind).toBe("inject");
+    expect((d as { note: string }).note).toContain("Correctness floor");
+    expect(d.decisionSource).toBe("schema_control");
+  });
+
+  test("quality_accept with quality_evidence is accepted", () => {
+    const d = resolveResidentMidLoopDirective(
+      {
+        directive: "quality_accept",
+        quality_evidence: "hardened empty-input edge case and re-read solution.py for polish",
+      },
+      {
+        ...base,
+        successfulWrites: 1,
+        implementationPhase: "quality",
+        recentWriteTargets: ["solution.py"],
+      },
+    );
+    expect(d).toMatchObject({ kind: "continue", decisionSource: "resident_model" });
+  });
+
+  test("hasQualityEvidence distinguishes polish from bare write mentions", () => {
+    expect(hasQualityEvidence("wrote solution.py", {
+      ...base, recentWriteTargets: ["solution.py"],
+    })).toBe(false);
+    expect(hasQualityEvidence("covered empty and unsorted edge cases after re-read", base)).toBe(true);
+  });
+
+  test("default quality push note is actionable for free/local executors", () => {
+    expect(DEFAULT_QUALITY_PUSH_NOTE).toContain("edge cases");
+    expect(DEFAULT_QUALITY_PUSH_NOTE).toContain("one-shot");
   });
 });
 
