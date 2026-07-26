@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { defaultConfig } from "../config";
 import { createToolRuntime, makeExecutionContext } from "../tool-runtime";
-import type { StageRun } from "../self-tuning/store";
+import { SessionOutcomeCollector } from "../self-tuning/collector";
+import { SelfTuningStore, type StageRun } from "../self-tuning/store";
 import { PipelineExecutor, type StageRunRecorder } from "./pipeline";
 import { LiveConductor } from "./conductor";
 import { ConductorBus } from "./conductor-bus";
@@ -48,6 +49,114 @@ function telemetryHarness(toolName: string, handler: () => Promise<string>) {
 }
 
 describe("pipeline stage telemetry", () => {
+  test("persists one executor audit row for every invoked mid-loop intervention", async () => {
+    const interventions = [
+      { result: { kind: "continue" } as const, directiveType: "mid_loop_continue" },
+      { result: { kind: "force_write", note: "Apply the change now." } as const, directiveType: "mid_loop_force_write", note: "Apply the change now." },
+      { result: { kind: "redirect", tool: "edit_file", note: "Use edit_file instead." } as const, directiveType: "mid_loop_redirect", note: "Use edit_file instead." },
+      { result: { kind: "inject", note: "Keep the target path in scope." } as const, directiveType: "mid_loop_inject", note: "Keep the target path in scope." },
+      { result: { kind: "abort", reason: "Stage budget is exhausted." } as const, directiveType: "mid_loop_abort", reason: "Stage budget is exhausted." },
+    ];
+
+    for (const [index, intervention] of interventions.entries()) {
+      const runId = `run-mid-loop-${index}`;
+      const store = new SelfTuningStore(":memory:");
+      const collector = new SessionOutcomeCollector(store);
+      collector.startAgentRun(runId, "session-mid-loop", "Update the target config file", "general", ["executor"]);
+      const config = defaultConfig();
+      config.orchestrator.conductor.in_turn_driver.enabled = true;
+      const ctx = makeExecutionContext("agent", config, { workspace_path: process.cwd() });
+      let midLoopCalls = 0;
+      const executor = new PipelineExecutor(
+        (async () => ({ content: "I will update the config.", tool_calls: [] })) as any,
+        createToolRuntime(),
+        ctx,
+        {
+          bus: new ConductorBus(),
+          collector,
+          live: {
+            checkMidLoop: async () => {
+              midLoopCalls++;
+              return intervention.result;
+            },
+            afterStage: async () => ({ type: "continue" }),
+          },
+        } as any,
+      );
+
+      await executor.executeSegment(
+        "Update the target config file",
+        ["executor"],
+        runId,
+        () => {},
+        {
+          executionProfile: "full",
+          rawMessage: "Update the target config file",
+          taskRunWriteIntent: true,
+          turnBudget: {
+            stageRemainingMs: () => 9_000,
+            extendStageOnProgress: () => 0,
+          } as any,
+        },
+      );
+
+      expect(midLoopCalls).toBeGreaterThan(0);
+      const rows = store.getConductorDirectives(runId)
+        .filter((row) => row.directive_type === intervention.directiveType);
+      expect(rows).toHaveLength(midLoopCalls);
+      for (const row of rows) {
+        expect(row).toMatchObject({ stage: "executor", directive_type: intervention.directiveType });
+        expect(row.inject_note).toBe(intervention.note ?? null);
+        expect(row.reason).toBe(intervention.reason ?? null);
+      }
+    }
+  });
+
+  test("does not persist a mid-loop audit row when the driver is disabled or the executor is not a write turn", async () => {
+    for (const scenario of [
+      { name: "driver disabled", driverEnabled: false, executionProfile: "full" as const, request: "Update the target config file" },
+      { name: "read-only executor", driverEnabled: true, executionProfile: "read_only" as const, request: "Inspect the target config file" },
+    ]) {
+      const runId = `run-mid-loop-skipped-${scenario.name}`;
+      const store = new SelfTuningStore(":memory:");
+      const collector = new SessionOutcomeCollector(store);
+      collector.startAgentRun(runId, "session-mid-loop-skipped", scenario.request, "general", ["executor"]);
+      const config = defaultConfig();
+      config.orchestrator.conductor.in_turn_driver.enabled = scenario.driverEnabled;
+      const ctx = makeExecutionContext("agent", config, { workspace_path: process.cwd() });
+      let midLoopCalls = 0;
+      const executor = new PipelineExecutor(
+        (async () => ({ content: "No tool call needed.", tool_calls: [] })) as any,
+        createToolRuntime(),
+        ctx,
+        {
+          bus: new ConductorBus(),
+          collector,
+          live: {
+            checkMidLoop: async () => {
+              midLoopCalls++;
+              return { kind: "continue" };
+            },
+            afterStage: async () => ({ type: "continue" }),
+          },
+        } as any,
+      );
+
+      await executor.executeSegment(scenario.request, ["executor"], runId, () => {}, {
+        executionProfile: scenario.executionProfile,
+        rawMessage: scenario.request,
+        turnBudget: {
+          stageRemainingMs: () => 9_000,
+          extendStageOnProgress: () => 0,
+        } as any,
+      });
+
+      expect(midLoopCalls).toBe(0);
+      expect(store.getConductorDirectives(runId).filter((row) => row.directive_type.startsWith("mid_loop_")))
+        .toEqual([]);
+    }
+  });
+
   test("high-complexity gate failure retries the executor once with a different model", async () => {
     class GateRetryExecutor extends PipelineExecutor {
       private syntaxGateCalls = 0;

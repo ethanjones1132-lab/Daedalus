@@ -99,6 +99,16 @@ import type { JarvisConfig } from "../config";
  */
 export interface StageRunRecorder {
   recordStageRun(stage: StageRun): void;
+  recordDirective?(row: {
+    id: string;
+    agent_run_id: string;
+    stage: string;
+    directive_type: string;
+    reason?: string;
+    new_remaining_json?: string;
+    inject_note?: string;
+    inject_for_stage?: string;
+  }): void;
   recordModelAttribution?(row: {
     id: string;
     agent_run_id: string;
@@ -2178,6 +2188,14 @@ export class PipelineExecutor {
               stageRemainingMs: options.turnBudget?.stageRemainingMs("executor") ?? Number.POSITIVE_INFINITY,
               deadToolSuppressed: false,
               suppressedToolName: undefined,
+            });
+            this.collector.recordDirective?.({
+              id: `dir_${crypto.randomUUID()}`,
+              agent_run_id: agentRunId,
+              stage: "executor",
+              directive_type: `mid_loop_${midLoop.kind}`,
+              reason: "reason" in midLoop ? midLoop.reason : undefined,
+              inject_note: "note" in midLoop ? midLoop.note : undefined,
             });
             if (midLoop.kind === "abort") {
               executorDone = true;
