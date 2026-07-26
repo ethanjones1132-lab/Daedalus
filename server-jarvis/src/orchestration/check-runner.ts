@@ -1,6 +1,6 @@
 import type { RunGateResult, RunTarget } from "./run-gate";
 import type { ToolCallRecord } from "./stage-output";
-import type { SyntaxIssue } from "./syntax-gate";
+import type { CheckOutcome } from "./build-check";
 
 export type CheckTier = "existing" | "builtin" | "synth" | "none";
 
@@ -25,8 +25,8 @@ export interface RunVerificationInput {
   plan: string;
   workspaceRoot: string;
   timeoutMs: number;
-  /** Injected gates (default to the real module functions in the pipeline caller). */
-  runSyntax: (toolCalls: readonly ToolCallRecord[]) => Promise<SyntaxIssue[]>;
+  /** Detect + run the project's build-system check (tri-state). */
+  runBuild: () => Promise<CheckOutcome>;
   runTests: (toolCalls: readonly ToolCallRecord[], request: string, plan: string) => Promise<RunGateResult>;
 }
 
@@ -36,19 +36,22 @@ export function classifyRunGateTier(reason: RunTarget["reason"]): CheckTier {
 }
 
 /**
- * Merge the outputs of the existing syntax-gate and run-gate into a single
+ * Merge the outputs of the existing run-gate and build-check into a single
  * tiered CheckResult. Priority: a run-gate that actually RAN (passed/failed)
- * wins its tier; otherwise the syntax-gate is the builtin static check; if
- * neither has anything to say the result is `none`.
+ * wins its tier; otherwise the build-check is the builtin static check; if
+ * nothing real ran (build-check returned `not_applicable`) the result is `none`.
+ * `not_applicable` is the vacuous-green guard — it maps to an honest `none`.
  */
 export function mergeToCheckResult(input: {
-  syntaxIssues: readonly SyntaxIssue[];
   run: RunGateResult;
-  hadWrittenCode?: boolean;
+  build: CheckOutcome;
+  hadWrittenCode: boolean;
   durationMs?: number;
 }): CheckResult {
   const durationMs = input.durationMs ?? 0;
-
+  if (!input.hadWrittenCode) {
+    return { tier: "none", ran: false, passed: null, detail: "", command: "", durationMs };
+  }
   if (input.run.status === "passed" || input.run.status === "failed") {
     const tier = input.run.reason
       ? classifyRunGateTier(input.run.reason as RunTarget["reason"])
@@ -64,25 +67,19 @@ export function mergeToCheckResult(input: {
     };
   }
 
-  // No test ran — fall back to the builtin static check.
-  const hadWritten = input.hadWrittenCode ?? true;
-  if (!hadWritten) {
-    return { tier: "none", ran: false, passed: null, detail: "", command: "", durationMs };
+  switch (input.build.kind) {
+    case "clean":
+      return { tier: "builtin", ran: true, passed: true, detail: "", command: input.build.command, durationMs };
+    case "failed":
+      return { tier: "builtin", ran: true, passed: false, detail: input.build.detail, command: input.build.command, durationMs };
+    case "not_applicable":
+      return { tier: "none", ran: false, passed: null, detail: "", command: "", durationMs };
   }
-  const passed = input.syntaxIssues.length === 0;
-  return {
-    tier: "builtin",
-    ran: true,
-    passed,
-    detail: passed ? "" : input.syntaxIssues.map((i) => `[${i.path}] ${i.error}`).join("\n").slice(0, 400),
-    command: "syntax_check",
-    durationMs,
-  };
 }
 
 /**
  * Orchestration entry for verification-gated conductor: detect whether code
- * was written, run injected syntax + test gates in parallel, and merge into
+ * was written, run injected build + test gates in parallel, and merge into
  * a single tiered CheckResult.
  */
 export async function runVerificationCheck(input: RunVerificationInput): Promise<CheckResult> {
@@ -91,9 +88,9 @@ export async function runVerificationCheck(input: RunVerificationInput): Promise
   if (!written) {
     return { tier: "none", ran: false, passed: null, detail: "", command: "", durationMs: Date.now() - startedAt };
   }
-  const [syntaxIssues, run] = await Promise.all([
-    input.runSyntax(input.toolCalls),
+  const [build, run] = await Promise.all([
+    input.runBuild(),
     input.runTests(input.toolCalls, input.request, input.plan),
   ]);
-  return mergeToCheckResult({ syntaxIssues, run, hadWrittenCode: true, durationMs: Date.now() - startedAt });
+  return mergeToCheckResult({ run, build, hadWrittenCode: true, durationMs: Date.now() - startedAt });
 }
