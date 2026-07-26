@@ -5,6 +5,7 @@ import { injectToolGuidelines } from "./tool-guidelines";
 import { checkWrittenFilesSyntax, renderSyntaxIssues, type SyntaxIssue } from "./syntax-gate";
 import { renderRunIssues, runWrittenCodeGate, type RunGateResult } from "./run-gate";
 import { mergeToCheckResult, runVerificationCheck, type CheckResult } from "./check-runner";
+import { runBuildCheck, writtenPathsFrom } from "./build-check";
 import { BUILTIN_MODES, executorTurnLimit, getToolsForMode } from "./modes";
 import { toolResultModelText, type ToolRuntime, type ExecutionContext } from "../tool-runtime";
 import type { CallModelFn, ChatMessage } from "./router";
@@ -719,7 +720,7 @@ export class PipelineExecutor {
     if (!this.ctx.config.orchestrator?.verification?.enabled) return undefined;
     const workspaceRoot =
       this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd();
-    const timeoutMs = this.ctx.config.orchestrator.verification.check_timeout_ms ?? 15000;
+    const timeoutMs = this.ctx.config.orchestrator.verification.check_timeout_ms ?? 90000;
     try {
       return await runVerificationCheck({
         toolCalls,
@@ -727,7 +728,11 @@ export class PipelineExecutor {
         plan: planSummary,
         workspaceRoot,
         timeoutMs,
-        runSyntax: (tc) => this.gateWrittenSyntax([...tc]),
+        runBuild: () => runBuildCheck({
+          root: workspaceRoot,
+          writtenPaths: writtenPathsFrom(toolCalls),
+          timeoutMs,
+        }),
         runTests: (tc, req, pl) => this.gateWrittenRun([...tc], req, pl),
       });
     } catch (e) {
@@ -2725,12 +2730,26 @@ export class PipelineExecutor {
       // Prefer the executor-completion result (avoid re-running heavy tests);
       // otherwise merge the gates already executed above.
       if (this.ctx.config.orchestrator?.verification?.enabled && !this.lastCheckResult) {
+        // Run the language-agnostic build check on the same toolCalls so the
+        // durable `lastCheckResult` reflects the real build outcome (clean / failed /
+        // not_applicable) rather than a vacuous-green `builtin` from the old
+        // syntax-only path. `mergeToCheckResult` is tri-state-aware: only an
+        // actually-executed check yields `builtin`; `not_applicable` maps to
+        // honest `none`.
+        const hadWritten = writtenToolCalls.some(
+          (c) => !c.is_error && WRITE_EFFECT_TOOLS.has(c.name),
+        );
+        const reviewerBuild = hadWritten
+          ? await runBuildCheck({
+              root: this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd(),
+              writtenPaths: writtenPathsFrom(writtenToolCalls),
+              timeoutMs: this.ctx.config.orchestrator.verification.check_timeout_ms ?? 90000,
+            })
+          : { kind: "not_applicable", reason: "no written code" } as const;
         this.lastCheckResult = mergeToCheckResult({
-          syntaxIssues,
           run: runGate,
-          hadWrittenCode: writtenToolCalls.some(
-            (c) => !c.is_error && WRITE_EFFECT_TOOLS.has(c.name),
-          ),
+          build: reviewerBuild,
+          hadWrittenCode: hadWritten,
         });
       }
       const deterministicGateFeedback = [

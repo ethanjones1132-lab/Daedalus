@@ -627,7 +627,7 @@ export function defaultConfig(): JarvisConfig {
       },
       verification: {
         enabled: false,
-        check_timeout_ms: 15000,
+        check_timeout_ms: 90000,
         tier_reward: { existing: 1, builtin: 1, synth: 0.5, none: 0 },
         thrift: { dead_tool_suppression: true, achieved_effect_early_stop: true },
       },
