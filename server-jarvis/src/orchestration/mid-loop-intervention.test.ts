@@ -43,6 +43,18 @@ describe("decideMidLoopIntervention", () => {
     expect(d.kind).toBe("force_write");
   });
 
+  test("failed write attempts with zero success → force_write with path guidance", () => {
+    const d = decideMidLoopIntervention({
+      ...base,
+      distinctSuccessfulReads: 2,
+      failedWriteAttempts: 2,
+      successfulWrites: 0,
+      stageRemainingMs: 200_000,
+    });
+    expect(d.kind).toBe("force_write");
+    expect((d as { note: string }).note).toContain("_t.py");
+  });
+
   test("write-intent, zero writes, budget critical -> abort (not a timeout)", () => {
     const d = decideMidLoopIntervention({
       ...base, distinctSuccessfulReads: 10, stageRemainingMs: 20_000,

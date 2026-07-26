@@ -2,13 +2,12 @@
  * Slice B — free-first executor model selection for the Claude CLI tool surface.
  *
  * Preference order:
- *   1. Free-capable models (any free provider id that the CLI proxy can host)
- *   2. After thrash (no write / stream error / rate limit × N), cheapest known
- *      capable OpenCode Go models (deepseek-v4-flash, minimax-m3, …)
+ *   1. Free-capable models (proxy path) when the local proxy is up
+ *   2. After thrash / no proxy: cheapest capable OpenCode Go models
+ *      - OpenAI-format Go (deepseek-v4-flash) when proxy is up
+ *      - Anthropic-native Go (minimax-m3) when proxy is down but Go key exists
  *
- * Operator pin: any non-empty, non-"auto" `claude_cli.delegate.model` is used
- * until thrash forces Go promotion (pin still loses after threshold so free
- * thrash cannot stick forever on a broken free id).
+ * Operator pin: non-empty non-"auto" model is used until thrash forces promotion.
  */
 
 export const DELEGATE_FREE_FIRST_MODELS = [
@@ -18,10 +17,21 @@ export const DELEGATE_FREE_FIRST_MODELS = [
   "nemotron-3-ultra-free",
 ] as const;
 
-export const DELEGATE_GO_CHEAP_CAPABLE_MODELS = [
+/** OpenAI-format Go models (need proxy for Claude CLI). */
+export const DELEGATE_GO_OPENAI_MODELS = [
   "deepseek-v4-flash",
-  "minimax-m3",
   "mimo-v2.5",
+] as const;
+
+/** Anthropic-native Go models (skip proxy; need opencode_go key). */
+export const DELEGATE_GO_ANTHROPIC_MODELS = [
+  "minimax-m3",
+  "minimax-m2.7",
+] as const;
+
+export const DELEGATE_GO_CHEAP_CAPABLE_MODELS = [
+  ...DELEGATE_GO_OPENAI_MODELS,
+  ...DELEGATE_GO_ANTHROPIC_MODELS,
 ] as const;
 
 export const DEFAULT_FREE_THRASH_THRESHOLD = 2;
@@ -65,7 +75,7 @@ export function isDelegateThrashOutcome(input: {
   errorCode?: string;
 }): boolean {
   if (input.hasVerifiedWrite) return false;
-  if (input.ok && !input.hasVerifiedWrite) return true; // completed without write
+  if (input.ok && !input.hasVerifiedWrite) return true;
   const code = (input.errorCode || "").toLowerCase();
   if (!code) return !input.ok;
   return (
@@ -77,7 +87,8 @@ export function isDelegateThrashOutcome(input: {
     code.includes("exit") ||
     code.includes("unverified") ||
     code.includes("aborted") ||
-    code.includes("integration")
+    code.includes("integration") ||
+    code.includes("unavailable")
   );
 }
 
@@ -85,43 +96,125 @@ export function selectDelegateModel(input: {
   configuredModel: string;
   thrashCount: number;
   thrashThreshold?: number;
+  /** Local claude_cli_proxy on :19878 (required for free + OpenAI-format Go). */
+  proxyAvailable?: boolean;
+  /** OpenCode Go API key present (required for Anthropic-native Go). */
+  hasOpenCodeGoKey?: boolean;
   freeModels?: readonly string[];
-  goModels?: readonly string[];
+  goOpenaiModels?: readonly string[];
+  goAnthropicModels?: readonly string[];
 }): DelegateModelSelection {
   const threshold = input.thrashThreshold ?? DEFAULT_FREE_THRASH_THRESHOLD;
   const free = input.freeModels ?? DELEGATE_FREE_FIRST_MODELS;
-  const go = input.goModels ?? DELEGATE_GO_CHEAP_CAPABLE_MODELS;
+  const goOpenai = input.goOpenaiModels ?? DELEGATE_GO_OPENAI_MODELS;
+  const goAnthropic = input.goAnthropicModels ?? DELEGATE_GO_ANTHROPIC_MODELS;
+  const proxyOk = input.proxyAvailable !== false;
+  const goKey = input.hasOpenCodeGoKey !== false;
   const configured = input.configuredModel.trim();
   const auto = !configured || configured.toLowerCase() === "auto";
+  const thrash = input.thrashCount;
 
-  if (input.thrashCount >= threshold) {
-    const model = go[0] ?? "deepseek-v4-flash";
+  const pickGo = (reason: string): DelegateModelSelection => {
+    // Prefer proxy OpenAI Go when proxy is up; else Anthropic-native Go (no proxy).
+    if (proxyOk && goOpenai.length > 0) {
+      return {
+        model: goOpenai[0],
+        pool: "go_capable",
+        reason,
+        thrashCount: thrash,
+      };
+    }
+    if (goKey && goAnthropic.length > 0) {
+      return {
+        model: goAnthropic[0],
+        pool: "go_capable",
+        reason: `${reason}_anthropic_no_proxy`,
+        thrashCount: thrash,
+      };
+    }
+    if (goOpenai.length > 0) {
+      return { model: goOpenai[0], pool: "go_capable", reason, thrashCount: thrash };
+    }
     return {
-      model,
+      model: goAnthropic[0] ?? "minimax-m3",
       pool: "go_capable",
-      reason: `thrash_promoted_after_${input.thrashCount}`,
-      thrashCount: input.thrashCount,
+      reason,
+      thrashCount: thrash,
     };
+  };
+
+  if (thrash >= threshold) {
+    return pickGo(`thrash_promoted_after_${thrash}`);
+  }
+
+  // No proxy → free/OpenAI Go cannot launch; jump to Anthropic Go if possible.
+  if (!proxyOk) {
+    if (!auto && configured) {
+      // Pinned free/openai model cannot run without proxy → promote.
+      return pickGo("no_proxy_promote_go");
+    }
+    return pickGo("no_proxy_go_first");
   }
 
   if (!auto) {
-    // Operator pin for the free-first window; thrash still promotes to Go above.
-    const pinnedIsGo = go.some((m) => m === configured);
+    const pinnedIsGo =
+      goOpenai.includes(configured as typeof goOpenai[number]) ||
+      goAnthropic.includes(configured as typeof goAnthropic[number]);
     return {
       model: configured,
       pool: pinnedIsGo ? "go_capable" : "free",
       reason: "operator_pin",
-      thrashCount: input.thrashCount,
+      thrashCount: thrash,
     };
   }
 
-  // Free-first rotation: cycle free models by thrash count before Go promotion.
-  const freeIdx = Math.min(input.thrashCount, Math.max(0, free.length - 1));
-  const model = free[freeIdx] ?? free[0] ?? "deepseek-v4-flash-free";
-  return {
-    model,
-    pool: "free",
-    reason: input.thrashCount === 0 ? "free_first" : `free_rotate_${input.thrashCount}`,
-    thrashCount: input.thrashCount,
-  };
+  // Free-first rotation while under thrash threshold and proxy is up.
+  if (free.length > 0) {
+    const freeIdx = Math.min(thrash, Math.max(0, free.length - 1));
+    return {
+      model: free[freeIdx] ?? free[0],
+      pool: "free",
+      reason: thrash === 0 ? "free_first" : `free_rotate_${thrash}`,
+      thrashCount: thrash,
+    };
+  }
+
+  return pickGo("no_free_candidates");
+}
+
+/**
+ * Build ordered candidate models to try until CLI availability succeeds.
+ * Starts at current thrash selection and walks free → Go.
+ */
+export function enumerateDelegateModelCandidates(input: {
+  configuredModel: string;
+  thrashCount: number;
+  thrashThreshold?: number;
+  proxyAvailable?: boolean;
+  hasOpenCodeGoKey?: boolean;
+}): DelegateModelSelection[] {
+  const threshold = input.thrashThreshold ?? DEFAULT_FREE_THRASH_THRESHOLD;
+  const maxThrash = Math.max(input.thrashCount, threshold) + 1;
+  const seen = new Set<string>();
+  const out: DelegateModelSelection[] = [];
+  for (let t = input.thrashCount; t <= maxThrash; t++) {
+    const sel = selectDelegateModel({ ...input, thrashCount: t });
+    if (seen.has(sel.model)) continue;
+    seen.add(sel.model);
+    out.push(sel);
+  }
+  // Always ensure an Anthropic Go fallback is last when key exists (no-proxy launch).
+  if (input.hasOpenCodeGoKey !== false) {
+    for (const model of DELEGATE_GO_ANTHROPIC_MODELS) {
+      if (seen.has(model)) continue;
+      out.push({
+        model,
+        pool: "go_capable",
+        reason: "anthropic_go_fallback",
+        thrashCount: input.thrashCount,
+      });
+      seen.add(model);
+    }
+  }
+  return out;
 }

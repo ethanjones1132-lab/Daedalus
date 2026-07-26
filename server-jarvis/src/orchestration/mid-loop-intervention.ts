@@ -341,6 +341,15 @@ export function classifyMidLoopEscalation(signal: MidLoopSignal): MidLoopEscalat
     }
   }
 
+  // Failed write attempts with zero successes: keep priority pressure so the
+  // resident continues pushing correctness (not a soft continue / early replan).
+  if (
+    signal.successfulWrites === 0 &&
+    (signal.failedWriteAttempts ?? 0) > 0
+  ) {
+    return "priority_quality";
+  }
+
   // Pre-write: some reads, no successful mutation yet — classic spiral ambiguity.
   if (signal.successfulWrites === 0 && signal.distinctSuccessfulReads > 0) {
     return "early_exploration";
@@ -555,6 +564,23 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
         `Verification failed after write (${signal.verification.tier}` +
         `${signal.verification.command ? `: ${signal.verification.command}` : ""}): ${detail}. ` +
         "Fix the implementation before treating the write as complete.",
+    };
+  }
+
+  // Failed mutations with zero success: deterministic correctness push so the
+  // executor cannot spin silent failures until replan (live canary: old_string
+  // not found ×2 → effect_gate_no_write without enough force_write pressure).
+  if (
+    signal.successfulWrites === 0 &&
+    (signal.failedWriteAttempts ?? 0) >= 1 &&
+    signal.stageRemainingMs > ABORT_BUDGET_FLOOR_MS
+  ) {
+    return {
+      kind: "force_write",
+      note:
+        `${signal.failedWriteAttempts} failed write attempt(s) and zero successful mutations. ` +
+        "Re-read the exact target path (use list/glob results — adjacent tests are often `_t.py`), " +
+        "then apply edit_file/write_file with an exact old_string match from the latest read.",
     };
   }
 

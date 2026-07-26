@@ -93,10 +93,11 @@ import {
 } from "./claude-delegate";
 import {
   clearDelegateThrash,
+  enumerateDelegateModelCandidates,
   getDelegateThrashCount,
   isDelegateThrashOutcome,
   recordDelegateThrash,
-  selectDelegateModel,
+  type DelegateModelSelection,
 } from "./delegate-model-select";
 import {
   assessCorrectnessFloor,
@@ -1682,7 +1683,12 @@ export class PipelineExecutor {
 
     const runDelegate = async (nativeNoWrite: boolean): Promise<ExecutorStageOutput | undefined> => {
       const delegateRuntime = this.delegateRuntime;
-      if (!delegateRuntime || this.delegateAttemptedRuns.has(agentRunId)) return undefined;
+      if (!delegateRuntime || this.delegateAttemptedRuns.has(agentRunId)) {
+        if (!delegateRuntime) {
+          console.warn("[Pipeline] delegate skipped: no delegateRuntime wired");
+        }
+        return undefined;
+      }
       const allowedRoots = this.evidenceRoots(options);
       const eligibility = delegateEligibility({
         config: this.ctx.config,
@@ -1693,18 +1699,91 @@ export class PipelineExecutor {
         allowedRoots,
       });
       if (!eligibility.eligible) {
+        console.warn(
+          `[Pipeline] delegate ineligible: ${eligibility.reason} ` +
+          `(profile=${profile} write=${requiresWriteEffect} roots=${allowedRoots.length})`,
+        );
+        this.collector.recordDirective?.({
+          id: `dir_${crypto.randomUUID()}`,
+          agent_run_id: agentRunId,
+          stage: "executor",
+          directive_type: "delegate_skip",
+          decision_source: "deterministic_reflex",
+          reason: eligibility.reason,
+        });
         return undefined;
       }
-      let available = false;
-      try {
-        available = await delegateRuntime.availability.isAvailable(this.ctx.config);
-      } catch {
-        // Availability is an optimization boundary, not a reason to fail the
-        // native executor. A later replan may probe again because no delegate
-        // process was launched.
+
+      // Slice B: resolve a concrete CLI model BEFORE availability checks.
+      // Checking with model="auto" forced the proxy path and silently failed
+      // when free/OpenAI-format models could not launch — then native free
+      // thrash ate the turn with zero writes.
+      const thrashKey = agentRunId;
+      const hasGoKey = Boolean(this.ctx.config.opencode_go.api_key?.trim());
+      const candidates = enumerateDelegateModelCandidates({
+        configuredModel: this.ctx.config.claude_cli.delegate.model,
+        thrashCount: getDelegateThrashCount(thrashKey),
+        thrashThreshold: this.ctx.config.claude_cli.delegate.free_thrash_threshold,
+        hasOpenCodeGoKey: hasGoKey,
+        // Probe both proxy and no-proxy candidates; availability filters.
+        proxyAvailable: true,
+      });
+      let modelSelection: DelegateModelSelection | undefined;
+      let delegateConfig: typeof this.ctx.config | undefined;
+      for (const candidate of candidates) {
+        const cfg = {
+          ...this.ctx.config,
+          claude_cli: {
+            ...this.ctx.config.claude_cli,
+            delegate: {
+              ...this.ctx.config.claude_cli.delegate,
+              model: candidate.model,
+            },
+          },
+        };
+        let available = false;
+        try {
+          available = await delegateRuntime.availability.isAvailable(cfg);
+        } catch (error) {
+          console.warn(
+            `[Pipeline] delegate availability error for model=${candidate.model}: ` +
+            `${error instanceof Error ? error.message : String(error)}`,
+          );
+          continue;
+        }
+        if (!available) {
+          console.warn(
+            `[Pipeline] delegate unavailable for model=${candidate.model} ` +
+            `(${candidate.reason}); trying next candidate`,
+          );
+          this.collector.recordDirective?.({
+            id: `dir_${crypto.randomUUID()}`,
+            agent_run_id: agentRunId,
+            stage: "executor",
+            directive_type: "delegate_model_unavailable",
+            decision_source: "deterministic_reflex",
+            reason: `${candidate.reason} model=${candidate.model}`,
+          });
+          continue;
+        }
+        modelSelection = candidate;
+        delegateConfig = cfg;
+        break;
+      }
+      if (!modelSelection || !delegateConfig) {
+        console.warn(
+          `[Pipeline] delegate skipped: no available CLI model among ${candidates.map((c) => c.model).join(",")}`,
+        );
+        this.collector.recordDirective?.({
+          id: `dir_${crypto.randomUUID()}`,
+          agent_run_id: agentRunId,
+          stage: "executor",
+          directive_type: "delegate_skip",
+          decision_source: "deterministic_reflex",
+          reason: "no_available_cli_model",
+        });
         return undefined;
       }
-      if (!available) return undefined;
 
       const delegateStart = Date.now();
       const stageId = `stage_${crypto.randomUUID()}`;
@@ -1726,6 +1805,7 @@ export class PipelineExecutor {
         `User Request: ${request}`,
         `Plan:\n${planSummary}`,
         "[Runtime write contract] This is a CHANGE request. The stage is complete only after you actually invoke a file-writing tool (your environment's Write/Edit or equivalent) and it succeeds — describing the change in your response text does NOT modify any file. Read what you need first, then CALL the write/edit tool now, then read the file back to verify.",
+        "[Runtime path contract] Prefer exact paths from list/glob results. Do not invent sibling names (e.g. solution_t.py). The adjacent test file is often named _t.py.",
       ].join("\n\n");
       // Mid-loop abort is merged so force_write/abort can stop the CLI stream.
       const combinedAbort = combineAbortSignals(
@@ -1735,23 +1815,6 @@ export class PipelineExecutor {
       );
       this.delegateAttemptedRuns.add(agentRunId);
       const delegateStreamCalls: ToolCallRecord[] = [];
-      // Slice B: free-first model selection with thrash → cheap Go promotion.
-      const thrashKey = agentRunId;
-      const modelSelection = selectDelegateModel({
-        configuredModel: this.ctx.config.claude_cli.delegate.model,
-        thrashCount: getDelegateThrashCount(thrashKey),
-        thrashThreshold: this.ctx.config.claude_cli.delegate.free_thrash_threshold,
-      });
-      const delegateConfig = {
-        ...this.ctx.config,
-        claude_cli: {
-          ...this.ctx.config.claude_cli,
-          delegate: {
-            ...this.ctx.config.claude_cli.delegate,
-            model: modelSelection.model,
-          },
-        },
-      };
       this.collector.recordDirective?.({
         id: `dir_${crypto.randomUUID()}`,
         agent_run_id: agentRunId,
@@ -1760,6 +1823,10 @@ export class PipelineExecutor {
         decision_source: "deterministic_reflex",
         reason: `${modelSelection.reason} pool=${modelSelection.pool} model=${modelSelection.model} thrash=${modelSelection.thrashCount}`,
       });
+      console.log(
+        `[Pipeline] delegate launching model=${modelSelection.model} ` +
+        `pool=${modelSelection.pool} reason=${modelSelection.reason}`,
+      );
       let delegated: ExecutorStageOutput;
       try {
         delegated = await delegateRuntime.run({

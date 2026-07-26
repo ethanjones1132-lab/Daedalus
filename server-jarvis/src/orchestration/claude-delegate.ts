@@ -272,8 +272,14 @@ export function delegateEligibility(
   // Anthropic-native OpenCode Go models under proxy mode resolve to opencode_go
   // at launch. Refuse early when the key is empty so we never mark the path
   // eligible and then fail at spawn with a blank ANTHROPIC_API_KEY.
+  // "auto" is resolved later to a concrete free/Go id — do not treat it as
+  // Anthropic-native (that would falsely require a key and skip free-first).
   const delegateModel = input.config.claude_cli.delegate.model.trim();
-  if (delegateModel && openCodeGoProtocolForModel(delegateModel) === "anthropic") {
+  if (
+    delegateModel &&
+    delegateModel.toLowerCase() !== "auto" &&
+    openCodeGoProtocolForModel(delegateModel) === "anthropic"
+  ) {
     if (!input.config.opencode_go.api_key?.trim()) {
       return { eligible: false, reason: "missing_opencode_go_key" };
     }

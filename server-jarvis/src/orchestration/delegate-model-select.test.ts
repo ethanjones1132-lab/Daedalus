@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   __resetDelegateThrashForTests,
   clearDelegateThrash,
+  enumerateDelegateModelCandidates,
   getDelegateThrashCount,
   isDelegateThrashOutcome,
   recordDelegateThrash,
@@ -9,16 +10,21 @@ import {
 } from "./delegate-model-select";
 
 describe("selectDelegateModel (Slice B free-first)", () => {
-  test("auto starts on free-first pool", () => {
-    const s = selectDelegateModel({ configuredModel: "auto", thrashCount: 0 });
+  test("auto starts on free-first pool when proxy is up", () => {
+    const s = selectDelegateModel({
+      configuredModel: "auto",
+      thrashCount: 0,
+      proxyAvailable: true,
+      hasOpenCodeGoKey: true,
+    });
     expect(s.pool).toBe("free");
     expect(s.reason).toBe("free_first");
     expect(s.model).toContain("free");
   });
 
   test("auto rotates free models with thrash before Go", () => {
-    const s0 = selectDelegateModel({ configuredModel: "auto", thrashCount: 0 });
-    const s1 = selectDelegateModel({ configuredModel: "auto", thrashCount: 1 });
+    const s0 = selectDelegateModel({ configuredModel: "auto", thrashCount: 0, proxyAvailable: true });
+    const s1 = selectDelegateModel({ configuredModel: "auto", thrashCount: 1, proxyAvailable: true });
     expect(s0.pool).toBe("free");
     expect(s1.pool).toBe("free");
     expect(s1.model).not.toBe(s0.model);
@@ -29,25 +35,54 @@ describe("selectDelegateModel (Slice B free-first)", () => {
       configuredModel: "auto",
       thrashCount: 2,
       thrashThreshold: 2,
+      proxyAvailable: true,
+      hasOpenCodeGoKey: true,
     });
     expect(s.pool).toBe("go_capable");
     expect(s.model).toBe("deepseek-v4-flash");
     expect(s.reason).toContain("thrash_promoted");
   });
 
+  test("no proxy promotes to Anthropic-native Go (minimax) instead of free", () => {
+    const s = selectDelegateModel({
+      configuredModel: "auto",
+      thrashCount: 0,
+      proxyAvailable: false,
+      hasOpenCodeGoKey: true,
+    });
+    expect(s.pool).toBe("go_capable");
+    expect(s.model).toBe("minimax-m3");
+    expect(s.reason).toContain("no_proxy");
+  });
+
   test("operator pin is honored until thrash threshold", () => {
     const s = selectDelegateModel({
       configuredModel: "minimax-m3",
       thrashCount: 0,
+      proxyAvailable: true,
     });
     expect(s).toMatchObject({ model: "minimax-m3", reason: "operator_pin", pool: "go_capable" });
     const promoted = selectDelegateModel({
       configuredModel: "minimax-m3",
       thrashCount: 2,
       thrashThreshold: 2,
+      proxyAvailable: true,
     });
     expect(promoted.pool).toBe("go_capable");
     expect(promoted.model).toBe("deepseek-v4-flash");
+  });
+
+  test("enumerate includes free then go then anthropic fallback", () => {
+    const list = enumerateDelegateModelCandidates({
+      configuredModel: "auto",
+      thrashCount: 0,
+      thrashThreshold: 2,
+      proxyAvailable: true,
+      hasOpenCodeGoKey: true,
+    });
+    expect(list.some((s) => s.pool === "free")).toBe(true);
+    expect(list.some((s) => s.model === "deepseek-v4-flash")).toBe(true);
+    expect(list.some((s) => s.model === "minimax-m3")).toBe(true);
   });
 });
 
