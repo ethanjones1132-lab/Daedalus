@@ -605,7 +605,8 @@ export function defaultConfig(): JarvisConfig {
         supervision: {
           // 5s left no headroom above the ~2-4.5s measured local latency;
           // a single GC pause turned supervision into fallback-continue.
-          supervision_timeout_ms: 8000,
+          // Qwythos 9B mid-loop/supervision needs headroom; 8s only ever fail-opens.
+          supervision_timeout_ms: 90000,
           max_tool_errors_before_reroute: 3,
           supervise_low_complexity: false,
         },
