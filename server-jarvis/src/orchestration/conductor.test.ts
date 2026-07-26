@@ -885,27 +885,61 @@ describe("LiveConductor verification early-stop side-channel (Task 4.3)", () => 
 
     test("reflex fast-path never calls the supervisor model", async () => {
       let called = false;
+      const attributions: SupervisionAttribution[] = [];
       const conductor = new LiveConductor(
         async () => ({ content: "{}" }), new ConductorBus(), new AgentPool([]),
         { supervision_timeout_ms: 1000, max_tool_errors_before_reroute: 3, supervise_low_complexity: true },
         async () => { called = true; return { content: "{}" }; },
+        (row) => attributions.push(row),
       );
       conductor.setContext("general", "medium", "run-1");
       const result = await conductor.checkMidLoop({ ...baseSignal, deadToolSuppressed: true, suppressedToolName: "glob" });
       expect(result).toMatchObject({ kind: "redirect", tool: "glob" });
       expect(called).toBe(false);
+      expect(attributions).toEqual([]);
     });
 
-    test("ambiguous middle escalates to the resident supervisor and applies its directive", async () => {
+    test("successful ambiguous escalation emits one successful attribution", async () => {
+      const attributions: SupervisionAttribution[] = [];
       const supervisorModel = async () => ({ content: JSON.stringify({ directive: "abort_stage", stage: "executor", reason: "spiral" }) });
       const conductor = new LiveConductor(
         async () => ({ content: "{}" }), new ConductorBus(), new AgentPool([]),
         { supervision_timeout_ms: 2000, max_tool_errors_before_reroute: 3, supervise_low_complexity: true },
         supervisorModel,
+        (row) => attributions.push(row),
       );
       conductor.setContext("general", "medium", "run-2");
       const result = await conductor.checkMidLoop(baseSignal);
       expect(result.kind).toBe("abort");
+      expect(attributions).toHaveLength(1);
+      expect(attributions[0]).toMatchObject({
+        agentRunId: "run-2",
+        wasSuccessful: true,
+        hadError: false,
+        provider: "conductor",
+        modelId: "supervision",
+      });
+    });
+
+    test("failed ambiguous escalation emits one error attribution", async () => {
+      const attributions: SupervisionAttribution[] = [];
+      const conductor = new LiveConductor(
+        async () => ({ content: "{}" }), new ConductorBus(), new AgentPool([]),
+        { supervision_timeout_ms: 2000, max_tool_errors_before_reroute: 3, supervise_low_complexity: true },
+        async () => { throw new Error("supervisor unavailable"); },
+        (row) => attributions.push(row),
+      );
+      conductor.setContext("general", "medium", "run-2-failure");
+      const result = await conductor.checkMidLoop(baseSignal);
+      expect(result).toEqual({ kind: "continue" });
+      expect(attributions).toHaveLength(1);
+      expect(attributions[0]).toMatchObject({
+        agentRunId: "run-2-failure",
+        wasSuccessful: false,
+        hadError: true,
+        provider: "conductor",
+        modelId: "supervision",
+      });
     });
 
     test("escalation is capped per turn - further ambiguous calls fall back to continue", async () => {

@@ -220,6 +220,7 @@ export class LiveConductor {
     }
     this.midLoopEscalationsUsed += 1;
 
+    const startedAt = Date.now();
     try {
       const userContent = [
         "Mid-loop checkpoint - the executor is still running.",
@@ -249,6 +250,7 @@ export class LiveConductor {
         if (timeoutHandle) clearTimeout(timeoutHandle);
       }
       const parsed = extractJson<{ directive: string; reason?: string }>(result.content);
+      this.emitAttribution(Date.now() - startedAt, true, false);
       if (parsed.directive === "abort_stage") {
         return { kind: "abort", reason: parsed.reason ?? "resident conductor judged the turn unrecoverable" };
       }
@@ -257,6 +259,7 @@ export class LiveConductor {
       }
       return { kind: "continue" };
     } catch {
+      this.emitAttribution(Date.now() - startedAt, false, true);
       return { kind: "continue" }; // fail-open: escalation must never abort a turn
     }
   }
