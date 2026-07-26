@@ -1117,6 +1117,210 @@ describe("executor delegate pipeline integration", () => {
     });
   });
 
+  test("delegate_first mid-loop supervises tool results and persists directives", async () => {
+    const config = delegateTestConfig();
+    config.jarvis_path = process.cwd();
+    config.claude_cli.delegate.policy = "delegate_first";
+    config.orchestrator.conductor.in_turn_driver.enabled = true;
+    const ctx = makeExecutionContext("agent", config, {
+      session_id: "session-delegate-mid-loop",
+      workspace_path: config.jarvis_path,
+    });
+    const store = new SelfTuningStore(":memory:");
+    const collector = new SessionOutcomeCollector(store);
+    collector.startAgentRun(
+      "run-delegate-mid-loop",
+      "session-delegate-mid-loop",
+      "Change result.txt",
+      "general",
+      ["executor"],
+    );
+
+    const midLoopSignals: any[] = [];
+    let nativeCalls = 0;
+    const readThenNoWrite = [
+      {
+        name: "read_file",
+        arguments: { path: "result.txt" },
+        output: "old content",
+        is_error: false,
+        duration_ms: 4,
+      },
+      {
+        name: "read_file",
+        arguments: { path: "other.txt" },
+        output: "other",
+        is_error: false,
+        duration_ms: 3,
+      },
+    ];
+
+    const executor = new PipelineExecutor(
+      async () => {
+        nativeCalls += 1;
+        return { content: "Native took over after conductor handoff.", tool_calls: [] };
+      },
+      createToolRuntime(),
+      ctx,
+      {
+        bus: { registerAbortHandle: () => {}, publishThrottled: () => {}, resolveAbort: () => {} },
+        collector,
+        live: {
+          onToolResult: () => {},
+          checkMidLoop: async (signal: any) => {
+            midLoopSignals.push(signal);
+            // After two reads with zero writes, force a native handoff.
+            if (signal.distinctSuccessfulReads >= 2 && signal.successfulWrites === 0) {
+              return {
+                kind: "force_write",
+                note: "Apply the change now (delegate mid-loop).",
+                decisionSource: "deterministic_reflex",
+              };
+            }
+            return { kind: "continue", decisionSource: "no_signal" };
+          },
+          afterStage: async () => ({ type: "continue" }),
+        },
+      } as any,
+      {
+        availability: { isAvailable: async () => true },
+        run: async (input) => {
+          for (const call of readThenNoWrite) {
+            input.onToolUse?.(call);
+            await input.onToolResult?.(call);
+            if (input.signal?.aborted) {
+              return {
+                ok: false,
+                narrative: "Delegate aborted by mid-loop handoff.",
+                terminalStatus: "cancelled",
+                errorCode: "delegate_aborted",
+                toolCalls: [...readThenNoWrite],
+              };
+            }
+          }
+          return {
+            ok: false,
+            narrative: "Delegate finished without a write.",
+            terminalStatus: "completed",
+            errorCode: "delegate_no_write",
+            toolCalls: [...readThenNoWrite],
+          };
+        },
+      },
+    );
+
+    await executor.executeSegment(
+      "Change result.txt",
+      ["executor"],
+      "run-delegate-mid-loop",
+      () => {},
+      {
+        executionProfile: "full",
+        rawMessage: "Change result.txt",
+        turnRequirement: "full_execution",
+        taskRunWriteIntent: true,
+        maxReviewRepairRounds: 0,
+        turnBudget: {
+          stageRemainingMs: () => 120_000,
+          extendStageOnProgress: () => 0,
+        } as any,
+      },
+    );
+
+    expect(midLoopSignals.length).toBeGreaterThanOrEqual(2);
+    expect(midLoopSignals.some((s) => s.taskObjective?.includes("Change result.txt"))).toBe(true);
+    expect(midLoopSignals.some((s) => (s.recentReadTargets ?? []).includes("result.txt"))).toBe(true);
+
+    const directives = store.getConductorDirectives("run-delegate-mid-loop")
+      .filter((row) => row.directive_type.startsWith("mid_loop_"));
+    expect(directives.length).toBeGreaterThanOrEqual(1);
+    expect(directives.some((row) => row.directive_type === "mid_loop_force_write")).toBe(true);
+
+    // force_write with zero writes must hand off to native (CLI cannot inject).
+    // Native may take multiple turns to finish; only assert the handoff happened.
+    expect(nativeCalls).toBeGreaterThanOrEqual(1);
+  });
+
+  test("delegate_first mid-loop abort returns a clean partial without native fallback", async () => {
+    const config = delegateTestConfig();
+    config.jarvis_path = process.cwd();
+    config.claude_cli.delegate.policy = "delegate_first";
+    config.orchestrator.conductor.in_turn_driver.enabled = true;
+    const ctx = makeExecutionContext("agent", config, {
+      session_id: "session-delegate-mid-abort",
+      workspace_path: config.jarvis_path,
+    });
+    let nativeCalls = 0;
+    const executor = new PipelineExecutor(
+      async () => {
+        nativeCalls += 1;
+        return { content: "native must not run after mid-loop abort", tool_calls: [] };
+      },
+      createToolRuntime(),
+      ctx,
+      {
+        bus: { registerAbortHandle: () => {}, publishThrottled: () => {}, resolveAbort: () => {} },
+        collector: { recordStageRun: () => {}, recordDirective: () => {} },
+        live: {
+          onToolResult: () => {},
+          checkMidLoop: async () => ({
+            kind: "abort",
+            reason: "budget too low to recover",
+            decisionSource: "deterministic_reflex",
+          }),
+          afterStage: async () => ({ type: "continue" }),
+        },
+      } as any,
+      {
+        availability: { isAvailable: async () => true },
+        run: async (input) => {
+          const call = {
+            name: "read_file",
+            arguments: { path: "result.txt" },
+            output: "content",
+            is_error: false,
+            duration_ms: 2,
+          };
+          input.onToolUse?.(call);
+          await input.onToolResult?.(call);
+          return {
+            ok: false,
+            narrative: "aborted",
+            terminalStatus: "cancelled",
+            errorCode: "delegate_aborted",
+            toolCalls: [call],
+          };
+        },
+      },
+    );
+
+    const segment = await executor.executeSegment(
+      "Change result.txt",
+      ["executor"],
+      "run-delegate-mid-abort",
+      () => {},
+      {
+        executionProfile: "full",
+        rawMessage: "Change result.txt",
+        turnRequirement: "full_execution",
+        taskRunWriteIntent: true,
+        maxReviewRepairRounds: 0,
+        turnBudget: {
+          stageRemainingMs: () => 5_000,
+          extendStageOnProgress: () => 0,
+        } as any,
+      },
+    );
+
+    expect(nativeCalls).toBe(0);
+    expect(segment.state.executor).toMatchObject({
+      ok: false,
+      errorCode: "mid_loop_abort",
+      terminalStatus: "partial",
+    });
+    expect(segment.state.executor?.narrative).toContain("budget too low");
+  });
+
   test("unverified escalation is downgraded and never bounces back to native", async () => {
     const config = delegateTestConfig();
     config.jarvis_path = process.cwd();

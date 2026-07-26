@@ -193,7 +193,11 @@ export type ConductorOutputMode = "tool_call" | "json_schema" | "prompt";
 export interface ConductorConfig {
   /** When true, coordinator routing uses the local Ollama conductor model. */
   enabled: boolean;
-  /** Rung 2 in-turn executor driver; canary gate, default off. */
+  /**
+   * Rung 2 in-turn executor driver (mid-loop supervision on native +
+   * delegate_first streams). Default on after live-fire canary; set false to
+   * disable without tearing out wiring.
+   */
   in_turn_driver: {
     enabled: boolean;
   };
@@ -572,7 +576,7 @@ export function defaultConfig(): JarvisConfig {
       conductor: {
         enabled: true,
         in_turn_driver: {
-          enabled: false,
+          enabled: true,
         },
         // 2026-07-18 measured on the live Ollama host: qwen3.5:4b answers a
         // conductor directive in ~1.8s vs gemma4:e2b's ~4.4s (both with

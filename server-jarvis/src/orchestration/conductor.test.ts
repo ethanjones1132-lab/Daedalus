@@ -1006,10 +1006,18 @@ describe("LiveConductor verification early-stop side-channel (Task 4.3)", () => 
       });
     }, 2000);
 
-    test("escalation is capped per turn without extra attributions", async () => {
+    test("early escalations reserve one slot; priority may spend it (#5)", async () => {
       let calls = 0;
       const attributions: SupervisionAttribution[] = [];
-      const supervisorModel = async () => { calls++; return { content: JSON.stringify({ directive: "continue" }) }; };
+      const supervisorModel = async () => {
+        calls++;
+        return {
+          content: JSON.stringify({
+            directive: "continue",
+            progress_evidence: "read solution.py and listed the call sites",
+          }),
+        };
+      };
       const conductor = new LiveConductor(
         async () => ({ content: "{}" }), new ConductorBus(), new AgentPool([]),
         { supervision_timeout_ms: 2000, max_tool_errors_before_reroute: 3, supervise_low_complexity: true },
@@ -1017,17 +1025,36 @@ describe("LiveConductor verification early-stop side-channel (Task 4.3)", () => 
         (row) => attributions.push(row),
       );
       conductor.setContext("general", "medium", "run-3");
-      for (let i = 0; i < 5; i++) await conductor.checkMidLoop(baseSignal);
+
+      // Early exploration: at most 2 of 3 (one reserved).
+      for (let i = 0; i < 4; i++) await conductor.checkMidLoop(baseSignal);
+      expect(calls).toBe(2);
+      const reserved = await conductor.checkMidLoop(baseSignal);
+      expect(reserved).toMatchObject({ kind: "continue", decisionSource: "escalation_reserved" });
+      expect(calls).toBe(2);
+
+      // Post-write priority may spend the reserved third slot.
+      const priority = await conductor.checkMidLoop({
+        ...baseSignal,
+        successfulWrites: 1,
+        writeLandedSinceLastCheck: true,
+        recentWriteTargets: ["solution.py"],
+      });
       expect(calls).toBe(3);
+      expect(priority.decisionSource).toBe("resident_model");
       expect(attributions).toHaveLength(3);
-      expect(attributions.every((row) => row.agentRunId === "run-3" && row.wasSuccessful && !row.hadError)).toBe(true);
     });
 
     test("mid-loop and after-stage supervision share the existing four-call run cap", async () => {
       let calls = 0;
       const supervisorModel = async () => {
         calls++;
-        return { content: JSON.stringify({ directive: "continue" }) };
+        return {
+          content: JSON.stringify({
+            directive: "continue",
+            progress_evidence: "read solution.py for the failing boundary",
+          }),
+        };
       };
       const conductor = new LiveConductor(
         async () => ({ content: "{}" }), new ConductorBus(), new AgentPool([]),
@@ -1036,7 +1063,8 @@ describe("LiveConductor verification early-stop side-channel (Task 4.3)", () => 
       );
       conductor.setContext("general", "high", "run-shared-cap");
 
-      for (let i = 0; i < 3; i++) await conductor.checkMidLoop(baseSignal);
+      // 2 early mid-loop + 2 after-stage = 4 shared supervision calls.
+      for (let i = 0; i < 2; i++) await conductor.checkMidLoop(baseSignal);
       await conductor.afterStage("planner", "failed", "first failure", ["executor"]);
       await conductor.afterStage("planner", "failed", "second failure", ["executor"]);
 
@@ -1044,6 +1072,90 @@ describe("LiveConductor verification early-stop side-channel (Task 4.3)", () => 
       const capped = await conductor.checkMidLoop(baseSignal);
       expect(capped).toMatchObject({ kind: "continue", decisionSource: "cap_exhausted" });
       expect(calls).toBe(4);
+    });
+
+    test("bare continue without progress evidence is inverted by schema control (#4)", async () => {
+      const conductor = new LiveConductor(
+        async () => ({ content: "{}" }), new ConductorBus(), new AgentPool([]),
+        { supervision_timeout_ms: 2000, max_tool_errors_before_reroute: 3, supervise_low_complexity: true },
+        async () => ({ content: JSON.stringify({ directive: "continue" }) }),
+      );
+      conductor.setContext("general", "medium", "run-schema");
+
+      const preWrite = await conductor.checkMidLoop(baseSignal);
+      expect(preWrite).toMatchObject({ kind: "force_write", decisionSource: "schema_control" });
+
+      const postWrite = await conductor.checkMidLoop({
+        ...baseSignal,
+        successfulWrites: 1,
+        writeLandedSinceLastCheck: true,
+      });
+      expect(postWrite).toMatchObject({ kind: "inject", decisionSource: "schema_control" });
+    });
+
+    test("post-write quality checkpoint escalates when a write just landed", async () => {
+      let prompt = "";
+      const conductor = new LiveConductor(
+        async () => ({ content: "{}" }), new ConductorBus(), new AgentPool([]),
+        { supervision_timeout_ms: 2000, max_tool_errors_before_reroute: 3, supervise_low_complexity: true },
+        async (messages) => {
+          prompt = messages.map((m: any) => m.content).join("\n");
+          return { content: JSON.stringify({ directive: "inject", reason: "Re-read the edited boundary." }) };
+        },
+      );
+      conductor.setContext("general", "medium", "run-post-write");
+
+      // Successful writes alone used to short-circuit as no_signal.
+      const idle = await conductor.checkMidLoop({
+        ...baseSignal,
+        successfulWrites: 1,
+        distinctSuccessfulReads: 4,
+        writeLandedSinceLastCheck: false,
+      });
+      expect(idle).toMatchObject({ kind: "continue", decisionSource: "no_signal" });
+
+      const quality = await conductor.checkMidLoop({
+        ...baseSignal,
+        successfulWrites: 1,
+        distinctSuccessfulReads: 4,
+        writeLandedSinceLastCheck: true,
+        taskObjective: "fix off-by-one in solution.py",
+        recentWriteTargets: ["solution.py"],
+        verification: { tier: "none", ran: false, passed: null },
+      });
+      expect(quality).toMatchObject({
+        kind: "inject",
+        decisionSource: "resident_model",
+      });
+      expect(prompt).toContain("successful write landed");
+      expect(prompt).toContain("solution.py");
+      expect(prompt).toMatch(/AFFIRMATIVE|progress_evidence/i);
+    });
+
+    test("failed verification after write is a deterministic inject, not silent continue", async () => {
+      let called = false;
+      const conductor = new LiveConductor(
+        async () => ({ content: "{}" }), new ConductorBus(), new AgentPool([]),
+        { supervision_timeout_ms: 1000, max_tool_errors_before_reroute: 3, supervise_low_complexity: true },
+        async () => { called = true; return { content: "{}" }; },
+      );
+      conductor.setContext("general", "medium", "run-verify-red");
+
+      const result = await conductor.checkMidLoop({
+        ...baseSignal,
+        successfulWrites: 1,
+        distinctSuccessfulReads: 2,
+        verification: {
+          tier: "builtin",
+          ran: true,
+          passed: false,
+          detail: "syntax error near line 12",
+          command: "syntax_check",
+        },
+      });
+      expect(result).toMatchObject({ kind: "inject", decisionSource: "deterministic_reflex" });
+      expect((result as any).note).toContain("Verification failed");
+      expect(called).toBe(false);
     });
   });
 });

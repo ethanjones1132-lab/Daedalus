@@ -24,7 +24,16 @@ import {
 import { parseReviewerVerdict } from "./stage-output";
 import { decideVerificationDirective } from "./verification-decision";
 import { DeadToolTracker } from "./dead-tool-suppression";
-import { decideMidLoopIntervention, type LoopIntervention, type MidLoopSignal } from "./mid-loop-intervention";
+import {
+  classifyMidLoopEscalation,
+  decideMidLoopIntervention,
+  formatMidLoopEscalationContext,
+  maySpendMidLoopEscalation,
+  MAX_MID_LOOP_ESCALATIONS,
+  resolveResidentMidLoopDirective,
+  type LoopIntervention,
+  type MidLoopSignal,
+} from "./mid-loop-intervention";
 
 export interface ConductorStageEvidence {
   toolCalls?: ToolCallRecord[];
@@ -118,7 +127,8 @@ export class LiveConductor {
   private supervisionCallsUsed = 0;
   /** Rung 2: per-run cap on mid-loop resident-model escalations. */
   private midLoopEscalationsUsed = 0;
-  private static readonly MAX_MID_LOOP_ESCALATIONS = 3;
+  /** Early-exploration spends only; priority (post-write/endgame/reroute) uses any remaining. */
+  private midLoopEarlyEscalationsUsed = 0;
   /** Owned-runtime-loop: optional TaskPlan contract for per-item grading. */
   private planContract: TaskRunContract | undefined;
   /** Max repair cycles per item (from cfg or default). */
@@ -164,6 +174,7 @@ export class LiveConductor {
     this.writeEffectRerouteUsed = false;
     this.supervisionCallsUsed = 0;
     this.midLoopEscalationsUsed = 0;
+    this.midLoopEarlyEscalationsUsed = 0;
     this.lastVerificationDroppedReviewer = false;
     this.lastVerificationEarlyStop = false;
     this.deadTools.reset();
@@ -216,31 +227,41 @@ export class LiveConductor {
       return { ...reflex, decisionSource: "deterministic_reflex" };
     }
 
-    // Only escalate when there is SOME signal worth asking about - a clean
-    // turn with no reads/writes yet must not spend an inference for nothing.
-    const worthAsking = signal.writeIntent && signal.successfulWrites === 0 && signal.distinctSuccessfulReads > 0;
-    if (!worthAsking) {
+    // Escalate on pre-write ambiguity OR post-write / endgame / post-reroute.
+    const classification = classifyMidLoopEscalation(signal);
+    if (!classification) {
       return { kind: "continue", decisionSource: "no_signal" };
     }
-    if (
-      this.midLoopEscalationsUsed >= LiveConductor.MAX_MID_LOOP_ESCALATIONS ||
-      this.supervisionCallsUsed >= 4
-    ) {
+    if (this.supervisionCallsUsed >= 4) {
       return { kind: "continue", decisionSource: "cap_exhausted" };
     }
+    // #5: early exploration cannot burn the reserved priority slot.
+    if (
+      !maySpendMidLoopEscalation({
+        classification,
+        used: this.midLoopEscalationsUsed,
+        earlyUsed: this.midLoopEarlyEscalationsUsed,
+        max: MAX_MID_LOOP_ESCALATIONS,
+      })
+    ) {
+      return {
+        kind: "continue",
+        decisionSource:
+          this.midLoopEscalationsUsed >= MAX_MID_LOOP_ESCALATIONS
+            ? "cap_exhausted"
+            : "escalation_reserved",
+      };
+    }
     this.midLoopEscalationsUsed += 1;
+    if (classification === "early_exploration") {
+      this.midLoopEarlyEscalationsUsed += 1;
+    }
     this.supervisionCallsUsed += 1;
     const escalationId = `mid_${crypto.randomUUID()}`;
 
     const startedAt = Date.now();
     try {
-      const userContent = [
-        "Mid-loop checkpoint - the executor is still running.",
-        `Turn ${signal.turnCount}/${signal.maxTurns}, stage budget remaining: ${Math.round(signal.stageRemainingMs / 1000)}s.`,
-        `Write intent: true. Successful writes so far: ${signal.successfulWrites}. Distinct successful reads: ${signal.distinctSuccessfulReads}.`,
-        "Decide: is this productive exploration (continue), should the executor be pressed to write now (force_write), " +
-          "or has it spiraled beyond recovery (abort_stage)?",
-      ].join("\n");
+      const userContent = formatMidLoopEscalationContext(signal);
       const conductorPrompt = loadPrompt("conductor.md");
       let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
       const timeoutPromise = new Promise<never>((_, reject) => {
@@ -254,32 +275,24 @@ export class LiveConductor {
         result = await Promise.race([
           this.supervisorModel(
             [{ role: "system", content: conductorPrompt }, { role: "user", content: userContent }],
-            { temperature: 0.1, max_tokens: 120, stageLabel: "coordinator", suppressActivity: true },
+            { temperature: 0.1, max_tokens: 180, stageLabel: "coordinator", suppressActivity: true },
           ),
           timeoutPromise,
         ]);
       } finally {
         if (timeoutHandle) clearTimeout(timeoutHandle);
       }
-      const parsed = extractJson<{ directive: string; reason?: string }>(result.content);
+      const parsed = extractJson<{
+        directive: string;
+        reason?: string;
+        progress_evidence?: string;
+      }>(result.content);
       this.emitAttribution(Date.now() - startedAt, true, false, result, escalationId);
-      if (parsed.directive === "abort_stage") {
-        return {
-          kind: "abort",
-          reason: parsed.reason ?? "resident conductor judged the turn unrecoverable",
-          decisionSource: "resident_model",
-          escalationId,
-        };
-      }
-      if (parsed.directive === "force_write") {
-        return {
-          kind: "force_write",
-          note: parsed.reason ?? "resident conductor: apply the change now",
-          decisionSource: "resident_model",
-          escalationId,
-        };
-      }
-      return { kind: "continue", decisionSource: "resident_model", escalationId };
+      // #4: continue must cite concrete progress; bare continue is inverted.
+      return {
+        ...resolveResidentMidLoopDirective(parsed, signal),
+        escalationId,
+      };
     } catch {
       this.emitAttribution(Date.now() - startedAt, false, true, undefined, escalationId);
       return {
