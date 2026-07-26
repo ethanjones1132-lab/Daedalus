@@ -5,7 +5,6 @@ import { tmpdir } from "os";
 import {
   PersistentConductor,
   __resetPersistentConductorCachesForTests,
-  ROUTING_TIMEOUT_MS,
 } from "./persistent-conductor";
 import { conductorCacheSnapshot, __resetConductorCacheMetricsForTests } from "./conductor-metrics";
 import type { JarvisConfig } from "../config";
@@ -52,6 +51,46 @@ function nextTick(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+function makeTimerHarness() {
+  let now = 0;
+  let nextId = 1;
+  const pending = new Map<number, { dueAt: number; callback: () => void }>();
+  const scheduledDelays: number[] = [];
+  return {
+    scheduledDelays,
+    setTimeout(callback: () => void, delay = 0): number {
+      const id = nextId++;
+      scheduledDelays.push(delay);
+      pending.set(id, { dueAt: now + delay, callback });
+      return id;
+    },
+    clearTimeout(id: number): void {
+      pending.delete(id);
+    },
+    advanceBy(milliseconds: number): void {
+      const target = now + milliseconds;
+      while (true) {
+        const due = [...pending.entries()]
+          .filter(([, timer]) => timer.dueAt <= target)
+          .sort(([, left], [, right]) => left.dueAt - right.dueAt)[0];
+        if (!due) break;
+        pending.delete(due[0]);
+        now = due[1].dueAt;
+        due[1].callback();
+      }
+      now = target;
+    },
+  };
+}
+
 afterEach(() => {
   globalThis.fetch = originalFetch;
   __resetPersistentConductorCachesForTests();
@@ -60,10 +99,6 @@ afterEach(() => {
 });
 
 describe("PersistentConductor", () => {
-  test("routing call timeout is 20s", () => {
-    expect(ROUTING_TIMEOUT_MS).toBe(20_000);
-  });
-
   test("uses compact JSON schema output for local routing", async () => {
     let body: Record<string, any> | undefined;
     (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
@@ -164,12 +199,6 @@ describe("PersistentConductor", () => {
 
   test("warmUp preloads and retains the conductor model", async () => {
     let generateBody: Record<string, any> | undefined;
-    const timeoutDelays: number[] = [];
-    const originalSetTimeout = globalThis.setTimeout;
-    (globalThis as any).setTimeout = ((handler: TimerHandler, timeout?: number, ...args: any[]) => {
-      if (typeof timeout === "number") timeoutDelays.push(timeout);
-      return originalSetTimeout(handler, timeout, ...args);
-    }) as typeof globalThis.setTimeout;
     (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
@@ -182,18 +211,93 @@ describe("PersistentConductor", () => {
 
     const cfg = makeConfig({ persist_sessions: false });
     const conductor = new PersistentConductor(() => cfg);
-    try {
-      const result = await conductor.warmUp();
 
-      expect(result.model).toBe("gemma4:e2b");
-      expect(generateBody).toMatchObject({ model: "gemma4:e2b", prompt: "", keep_alive: "30m" });
-      expect(timeoutDelays).toContain(90_000);
-      // 2026-07-18: default num_ctx raised 8192→16384 (supervision digests +
-      // session prefixes were crowding the old window).
-      expect(generateBody?.options).toMatchObject({ num_predict: 1, num_ctx: 16_384 });
-    } finally {
-      globalThis.setTimeout = originalSetTimeout;
-    }
+    const result = await conductor.warmUp();
+    expect(result.model).toBe("gemma4:e2b");
+    expect(generateBody).toMatchObject({ model: "gemma4:e2b", prompt: "", keep_alive: "30m" });
+    // 2026-07-18: default num_ctx raised 8192→16384 (supervision digests +
+    // session prefixes were crowding the old window).
+    expect(generateBody?.options).toMatchObject({ num_predict: 1, num_ctx: 16_384 });
+  });
+
+  test("default warmUp stays pending past 30s and accepts a 54.4s cold load", async () => {
+    const timers = makeTimerHarness();
+    const load = deferred<Response>();
+    let generateSignal: AbortSignal | undefined;
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/generate")) {
+        generateSignal = init?.signal;
+        return load.promise;
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg = makeConfig({ persist_sessions: false });
+    const conductor = new PersistentConductor(() => cfg, undefined, undefined, timers);
+    const warmUp = conductor.warmUp();
+    let warmUpSettled = false;
+    void warmUp.then(() => {
+      warmUpSettled = true;
+    });
+    await nextTick();
+    expect(generateSignal).toBeDefined();
+    expect(timers.scheduledDelays).toContain(90_000);
+
+    timers.advanceBy(30_001);
+    await nextTick();
+    expect(warmUpSettled).toBe(false);
+    expect(generateSignal?.aborted).toBe(false);
+
+    timers.advanceBy(24_399);
+    load.resolve(Response.json({ done: true, done_reason: "load" }));
+    const result = await warmUp;
+
+    expect(result.model).toBe("gemma4:e2b");
+    expect(generateSignal?.aborted).toBe(false);
+  });
+
+  test("local routing stays alive past 10s and accepts a response before 20s", async () => {
+    const timers = makeTimerHarness();
+    const route = deferred<Response>();
+    let chatSignal: AbortSignal | undefined;
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/chat")) {
+        chatSignal = init?.signal;
+        return route.promise;
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg = makeConfig({ persist_sessions: false });
+    const conductor = new PersistentConductor(() => cfg, undefined, undefined, timers);
+    const routed = conductor.routeTurn({ sessionId: "fake-time-route", request: "hello", turnNumber: 1 });
+    let routeSettled = false;
+    void routed.then(() => {
+      routeSettled = true;
+    });
+    await nextTick();
+    expect(chatSignal).toBeDefined();
+    expect(timers.scheduledDelays).toContain(20_000);
+
+    timers.advanceBy(10_001);
+    await nextTick();
+    expect(routeSettled).toBe(false);
+    expect(chatSignal?.aborted).toBe(false);
+
+    route.resolve(Response.json({
+      message: {
+        role: "assistant",
+        content: '{"task_type":"general","pipeline":["synthesizer"],"topology":"linear","context":{"needs_workspace_inspection":false,"needs_memory":true,"estimated_complexity":"low"},"coordinator_rationale":"fake-time"}',
+      },
+    }));
+    const result = await routed;
+
+    expect(result.content).toContain('"coordinator_rationale":"fake-time"');
+    expect(chatSignal?.aborted).toBe(false);
   });
 
   test("isWarm returns false only when the configured model is confidently absent from /api/ps", async () => {
@@ -293,7 +397,7 @@ describe("PersistentConductor", () => {
   // the most involved in the file — the routeTurn path does the full Ollama /api/ps
   // warm-fallback resolution chain on top of the model-installed check. Observed
   // 19.0s in one full-suite run; consistent 16ms in isolation. 20s is comfortably
-  // below the 10s ROUTING_TIMEOUT_MS ceiling plus network jitter under load.
+  // below the 20s ROUTING_TIMEOUT_MS ceiling plus network jitter under load.
 
   test("supervise runs on the resident fallback_model instead of reloading the evicted primary", async () => {
     // The reload symptom: with the primary evicted, supervise used to call it

@@ -290,6 +290,11 @@ interface ResolvedConductorTarget {
   model: string;
 }
 
+export interface ConductorTimerApi {
+  setTimeout: typeof globalThis.setTimeout;
+  clearTimeout: typeof globalThis.clearTimeout;
+}
+
 let cachedTarget: ResolvedConductorTarget | null = null;
 let cachedTargetKey = "";
 let cachedTargetAt = 0;
@@ -481,6 +486,7 @@ export class PersistentConductor {
     private getConfig: () => JarvisConfig,
     private sessionsRoot: string = SESSIONS_DIR,
     private readonly outcomeStore: SelfTuningStore = new SelfTuningStore(),
+    private readonly timers: ConductorTimerApi = globalThis,
   ) {}
 
   private config(): ConductorConfig {
@@ -749,7 +755,7 @@ export class PersistentConductor {
     }
     let target = await this.resolveTarget();
     const ctrl = new AbortController();
-    const timeout = setTimeout(() => ctrl.abort(), timeoutMs);
+    const timeout = this.timers.setTimeout(() => ctrl.abort(), timeoutMs);
     const startedAt = Date.now();
     try {
       const res = await fetch(`${target.baseUrl}/api/generate`, {
@@ -782,7 +788,7 @@ export class PersistentConductor {
       if (error instanceof PersistentConductorError) throw error;
       throw new PersistentConductorError(error instanceof Error ? error.message : String(error));
     } finally {
-      clearTimeout(timeout);
+      this.timers.clearTimeout(timeout);
     }
   }
 
@@ -1075,7 +1081,7 @@ export class PersistentConductor {
   ): Promise<OllamaChatMessage> {
     const conductor = this.config();
     const ctrl = new AbortController();
-    const timeout = setTimeout(() => ctrl.abort(), options.timeoutMs);
+    const timeout = this.timers.setTimeout(() => ctrl.abort(), options.timeoutMs);
 
     const body: Record<string, unknown> = {
       model: target.model,
@@ -1100,7 +1106,7 @@ export class PersistentConductor {
         body: JSON.stringify(body),
         signal: ctrl.signal,
       });
-      clearTimeout(timeout);
+      this.timers.clearTimeout(timeout);
 
       if (!res.ok) {
         const errBody = await res.text().catch(() => "");
@@ -1115,7 +1121,7 @@ export class PersistentConductor {
       if (!json.message) throw new PersistentConductorError("Ollama conductor returned no message");
       return json.message;
     } catch (e) {
-      clearTimeout(timeout);
+      this.timers.clearTimeout(timeout);
       if (isAbortOrTimeoutError(e)) throw e;
       if (e instanceof PersistentConductorError) throw e;
       throw new PersistentConductorError(e instanceof Error ? e.message : String(e));
