@@ -26,6 +26,11 @@ export type LoopIntervention = (
   | { kind: "abort"; reason: string }
 ) & MidLoopDecisionMeta;
 
+/** Distributive Omit so Omit<Union, K> preserves per-variant required fields. */
+export type DistributiveOmit<T, K extends keyof T> = T extends T
+  ? Omit<T, K>
+  : never;
+
 /** Bounded verification snapshot carried into mid-loop checkpoints. */
 export interface MidLoopVerificationSnapshot {
   tier: string;
@@ -433,7 +438,7 @@ export function hasQualityEvidence(text: string | undefined, signal: MidLoopSign
 export function resolveResidentMidLoopDirective(
   parsed: ResidentMidLoopParse,
   signal: MidLoopSignal,
-): Omit<LoopIntervention, "escalationId"> {
+): DistributiveOmit<LoopIntervention, "escalationId"> {
   const directive = (parsed.directive ?? "continue").trim();
   const reason = parsed.reason?.trim();
   const evidenceText = (parsed.progress_evidence ?? parsed.reason ?? "").trim();

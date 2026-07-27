@@ -1531,23 +1531,21 @@ export class PipelineExecutor {
         writeLandedSinceLastCheck: extras.writeLandedSinceLastCheck,
       });
       const base: MidLoopSignal = {
-        writeIntent: requiresWriteEffect,
-        successfulWrites: evidence.successfulWrites ?? 0,
-        distinctSuccessfulReads: evidence.distinctSuccessfulReads ?? distinctSuccessfulReadCount(),
-        turnCount: turnCountForSignal,
-        maxTurns,
-        stageRemainingMs: options.turnBudget?.stageRemainingMs("executor") ?? Number.POSITIVE_INFINITY,
-        deadToolSuppressed: extras.deadToolSuppressed === true,
-        suppressedToolName: extras.suppressedToolName,
-        // Re-entered executor after a prior segment carries tool evidence →
-        // treat as post-reroute priority for #5 escalation reservation.
-        afterReroute: priorToolCalls.length > 0,
-        qualityPushesUsed,
-        qualityPushBudget: MAX_QUALITY_PUSHES,
-        qualityAccepted,
-        forceQualityGate: extras.forceQualityGate === true,
-        ...evidence,
-      };
+              writeIntent: requiresWriteEffect,
+              turnCount: turnCountForSignal,
+              maxTurns,
+              stageRemainingMs: options.turnBudget?.stageRemainingMs("executor") ?? Number.POSITIVE_INFINITY,
+              deadToolSuppressed: extras.deadToolSuppressed === true,
+              suppressedToolName: extras.suppressedToolName,
+              // Re-entered executor after a prior segment carries tool evidence →
+              // treat as post-reroute priority for #5 escalation reservation.
+              afterReroute: priorToolCalls.length > 0,
+              qualityPushesUsed,
+              qualityPushBudget: MAX_QUALITY_PUSHES,
+              qualityAccepted,
+              forceQualityGate: extras.forceQualityGate === true,
+              ...evidence,
+            };
       // Slice D phase label for prompts / resident schema.
       if (shouldRunQualityPhase(base) || assessCorrectnessFloor(base)) {
         base.implementationPhase = assessCorrectnessFloor(base) &&
