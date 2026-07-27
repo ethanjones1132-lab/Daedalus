@@ -138,17 +138,19 @@ describe("pipeline stage telemetry", () => {
   test("mid-loop check-runner feeds CheckResult into supervision after a write", async () => {
     // Wall-clock-budget pin: this test does real work (full PipelineExecutor.executeSegment
     // round-trip with an in-memory SelfTuningStore, a live ConductorBus, a registered tool
-    // runtime, and a synchronous mid-loop callback chain). Consistent 4.0s in isolation
-    // (just under the 5s vitest default); the 5s budget is not enough headroom when 2044
-    // other tests share the same process. Same wall-clock-budget-vs-real-work class as
-    // the 2026-07-27 9am pass `config-regression.test.ts` `defaults local conductor
-    // keep-warm on with a three-minute refresh interval` and the 2026-07-21 1pm pass
-    // `persistent-conductor.test.ts` `uses compact JSON schema output for local routing`
-    // (both bumped to 15_000ms under full-suite load). Behavior under test (the mid-loop
-    // check-runner writes a `mid_loop_check` directive row to the store after observing
-    // a successful write, and the live `checkMidLoop` callback receives a `signals` entry
-    // with `successfulWrites > 0 && verification !== undefined`) is orthogonal to wall-clock
-    // precision, so 5s was measuring the wrong thing.
+    // runtime, and a synchronous mid-loop callback chain). Consistent ~5.4s in isolation
+    // (just over the 5s vitest default and the 2026-07-27 1pm pass 15_000ms budget);
+    // the 15s budget is not enough headroom on the 2026-07-27 evening pass run when 2044
+    // other tests share the same process (observed 15031ms = at-budget timeout). Bump to
+    // 30_000ms. Same wall-clock-budget-vs-real-work class as the 2026-07-27 1pm pass bump
+    // on this exact test (5s→15s), the 2026-07-27 9am pass `config-regression.test.ts`
+    // `defaults local conductor keep-warm on with a three-minute refresh interval`, and the
+    // 2026-07-21 1pm pass `persistent-conductor.test.ts` `uses compact JSON schema output
+    // for local routing`. Behavior under test (the mid-loop check-runner writes a
+    // `mid_loop_check` directive row to the store after observing a successful write, and
+    // the live `checkMidLoop` callback receives a `signals` entry with
+    // `successfulWrites > 0 && verification !== undefined`) is orthogonal to wall-clock
+    // precision, so any time-based bound is measuring the wrong thing.
     const runId = "run-mid-loop-check";
     const store = new SelfTuningStore(":memory:");
     const collector = new SessionOutcomeCollector(store);
@@ -215,7 +217,7 @@ describe("pipeline stage telemetry", () => {
     expect(checkRows.length).toBeGreaterThanOrEqual(1);
     // At least one mid-loop judgment saw a verification snapshot after the write.
     expect(signals.some((s) => s.successfulWrites > 0 && s.verification !== undefined)).toBe(true);
-  }, 15_000);
+  }, 30_000);
 
   test("does not persist a mid-loop audit row when the driver is disabled or the executor is not a write turn", async () => {
     for (const scenario of [

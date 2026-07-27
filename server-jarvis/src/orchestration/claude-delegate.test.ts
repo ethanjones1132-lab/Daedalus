@@ -536,7 +536,22 @@ describe("Claude executor delegate", () => {
     expect(output.toolCalls[0].output.length).toBeLessThanOrEqual(6_000);
     expect(output.toolCalls.filter((record) => record.name === "git_metadata")).toHaveLength(1);
     expect(health.snapshot().lastReason).toBe("unverified_write");
-  });
+  }, 15_000); // 2026-07-27 evening cron: 5s vitest default was tight under full-suite load
+  // (observed 5172ms = at-budget timeout on the 2026-07-27 evening pass run with 2044
+  // other tests sharing the worker); consistent ~4.0s in isolation. 15s is 3.8x
+  // isolated / 2.9x observed, comfortably above the 5s default and well below the
+  // 30s stage budget the test exercises. Same wall-clock-budget-vs-real-work class
+  // as the 2026-07-27 1pm pass `pipeline-telemetry.test.ts` `mid-loop check-runner
+  // feeds CheckResult into supervision after a write` bump (5s→15s→30s), the
+  // 2026-07-20 4pm claude-delegate bump (47f3c78), and the 2026-07-21 evening
+  // `claude-delegate.test.ts` `claude-delegate cleanups unconfirmed termination
+  // within bounded retries` bump (300ms→3000ms). The test pumps a 20k-char
+  // tool_result through the synthetic process stream and exercises the snapshot
+  // factory + 6k-char tool-output truncation + git_metadata emit path; behavior
+  // under test (the delegate downgrades an unverified write before effect-gating
+  // with the documented `delegate_write_unverified` error code and the unverified
+  // `lastReason`) is orthogonal to wall-clock precision, so 5s was measuring the
+  // wrong thing.
 
   test("accepts verified writes and truncates delegate tool output with the shared context policy", async () => {
     const config = testConfig();
