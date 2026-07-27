@@ -87,9 +87,11 @@ describe("configuration regression coverage retained during Task 6", () => {
     expect(roundTrip.tools.grant_session_roots).toBe(false);
   });
 
-  test("defaults local conductor keep-warm on with a ten-minute refresh interval", () => {
+  test("defaults local conductor keep-warm on with a three-minute refresh interval", () => {
+    // Post-2026-07-26 conductor hardening: 10m left Qwythos cold under GPU
+    // thrash; 3m keep-warm interval for first-turn readiness.
     const cfg = normalizeConfig({});
     expect(cfg.orchestrator.conductor.keep_warm).toBe(true);
-    expect(cfg.orchestrator.conductor.keep_warm_interval_ms).toBe(600_000);
+    expect(cfg.orchestrator.conductor.keep_warm_interval_ms).toBe(180_000);
   });
 });

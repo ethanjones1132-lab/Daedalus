@@ -323,13 +323,16 @@ describe("Coordinator", () => {
   });
 
   test("cold_start_warming degrades to deterministic route, not remote API (F2)", async () => {
-    // Primary cold after a write-turn eviction: routeTurn throws cold_start_warming.
-    // Must return buildDeterministicRoute — remote API coordinator times out past deadline.
+    // Primary cold after a write-turn eviction: routeTurn's bounded warmUp fails,
+    // so routeTurn throws cold_start_warming. Must return buildDeterministicRoute
+    // — remote API coordinator times out past deadline.
+    // (Post-Slice A: routeTurn no longer fail-fast aborts on cold; it waits 90s for
+    // warmUp. We make warmUp throw to force the cold_start_warming path.)
     (globalThis as any).fetch = async (input: string | URL) => {
       const url = String(input);
       if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
       if (url.endsWith("/api/ps")) return Response.json({ models: [] });
-      if (url.endsWith("/api/generate")) return Response.json({ done: true, done_reason: "load" });
+      if (url.endsWith("/api/generate")) throw new Error("warmup failed");
       throw new Error(`Unexpected fetch: ${url}`);
     };
 

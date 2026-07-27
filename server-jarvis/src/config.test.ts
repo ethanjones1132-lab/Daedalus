@@ -46,6 +46,9 @@ describe("Claude CLI auth mode config", () => {
 
 describe("Claude CLI delegate config", () => {
   test("projects safe delegate defaults into legacy Claude CLI config", () => {
+    // Post-2026-07-26 free-first delegate work: when no model is set, the
+    // delegate defaults to "auto" (free-first, thrash → cheap Go). The
+    // Anthropic-native OpenCode Go primary is the fallback after thrash.
     const delegate = normalizeConfig({ claude_cli: { enabled: true } }).claude_cli.delegate;
 
     expect(delegate).toEqual({
@@ -56,14 +59,19 @@ describe("Claude CLI delegate config", () => {
         "Read", "Edit", "Write", "MultiEdit", "Grep", "Glob",
         "WebSearch", "WebFetch", "TodoWrite",
       ],
-      model: "minimax-m3",
+      model: "auto",
+      free_thrash_threshold: 2,
       timeout_ms: 420_000,
     });
   });
 
-  test("projects the Anthropic-native OpenCode Go primary into an unset delegate", () => {
+  test("projects auto into an unset delegate", () => {
+    // After the free-first change, an explicit empty delegate.model merges
+    // through deepMerge's blank-string guard and stays on the "auto" default;
+    // the migration only kicks in when the merged value is missing entirely
+    // (not when an explicit empty string is overridden by a non-empty default).
     const delegate = normalizeConfig({ claude_cli: { enabled: true, delegate: { model: "" } } }).claude_cli.delegate;
-    expect(delegate.model).toBe("minimax-m3");
+    expect(delegate.model).toBe("auto");
   });
 
   test("round-trips explicit delegate settings", () => {
