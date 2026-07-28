@@ -1484,7 +1484,21 @@ describe("Claude executor delegate", () => {
     } finally {
       process.off("unhandledRejection", onUnhandled);
     }
-  }, 1_000);
+    // 2026-07-28 (cron: evening) flake pin: the 1_000ms budget was
+    // measuring wall-clock precision, not the behavior under test.
+    // Observed 1031ms in a single full-suite run (over budget by 31ms);
+    // in isolation this test runs in ~172ms, so the over-budget is
+    // pure shared-worker contention. The test does real work (a 4ms
+    // process-factory wait + SIGTERM→SIGKILL teardown + 300ms
+    // cleanupTimeoutMs + a 1000ms race-vs-cleanup sentinel), and
+    // the bounded-known-outcome contract is orthogonal to wall-clock
+    // precision. Same wall-clock-budget-vs-real-work class as the
+    // 2026-07-27 4pm commit (d9b04b6) that bumped the "deadline covers
+    // delayed post-snapshot" test from 1500→5000ms for the same
+    // reason. Bumped 1_000→3_000ms to keep headroom under full-suite
+    // load (where the same test class stretches from ~170ms in
+    // isolation to ~1030ms under the 2164-test shared worker).
+  }, 3_000);
 
   test("deadline covers delayed post-snapshot and downgrades unverifiable writes", async () => {
     const config = testConfig();
@@ -1536,19 +1550,22 @@ describe("Claude executor delegate", () => {
     });
     expect(output.toolCalls.at(-1)).toMatchObject({ name: "git_metadata", is_error: true });
     expect(output.toolCalls.at(-1)?.output).toContain("verification unavailable");
-  }, 1_500);
-  // 2026-07-24 (cron: afternoon) flake pin: the 250ms budget was
-  // measuring wall-clock precision, not the behavior under test.
-  // Observed 265ms in a single full-suite run (over budget by 15ms);
-  // this test does real work (process spawn + 150ms designed wait
-  // inside snapshotFactory.capture + write-effect verification with
-  // a 25ms verificationTimeoutMs). Same wall-clock-budget-vs-real-
-  // work class as the 2026-07-20 4pm commit (47f3c78) that bumped
-  // the adjacent "verifies a claimed write" test from 250 to 1000ms
-  // for the same reason. Bumped to 1500ms to keep headroom under
-  // full-suite load (where other 250ms tests in this file cluster
-  // around 109-187ms in isolation but stretch under shared worker
-  // contention).
+  }, 5_000);
+  // 2026-07-28 (cron: evening) flake pin: the 1_500ms budget
+  // previously bumped 2026-07-24 was again over-budget under this
+  // evening's host contention (observed 1516ms in a single full-suite
+  // run, 16ms over). In isolation this test runs in ~125ms; under
+  // the 2164-test shared worker it stretches to ~1516ms. The
+  // 2026-07-24 pin kept the test stable for 4 days; today's full
+  // suite is the first time the 1.5s ceiling has been observed
+  // exceeded again on this host. Same wall-clock-budget-vs-real-work
+  // class as the 2026-07-27 1pm commit (a1e4ae2) that bumped
+  // `pipeline-telemetry > mid-loop check-runner` 5s→15s, then
+  // 2026-07-27 4pm (d9b04b6) bumped it again 15s→30s under the
+  // same observation pattern. Bumped 1_500→5_000ms to keep ~3.3x
+  // headroom over the observed worst case. Behavior under test
+  // (delayed post-snapshot + unverifiable write downgrades) is
+  // orthogonal to wall-clock precision.
 
   test("strikes health on spawn errors and clean no-event exits", async () => {
     const config = testConfig();
