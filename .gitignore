@@ -80,6 +80,7 @@ scripts/diagnose-priorities.py
 scripts/verify-priorities-update.py
 scripts/prepend-priorities-sessions-filter.py
 scripts/verify-priorities-sessions-filter.py
+server-jarvis/scripts/probe-*.ts
 
 # --- Live benchmark output ---
 scripts/benchmark-tier2b/results-tier2b.json
