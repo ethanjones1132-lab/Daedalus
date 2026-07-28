@@ -295,7 +295,12 @@ const CONCRETE_WRITE_TARGET =
 // one is ordering a mutation. Abstract deliverables are excluded by
 // construction because `plan`/`report`/etc. are not in the object list.
 const MUTATION_ARTIFACT_ORDER =
-  /\b(?:make|do|handle|perform|finish|complete|land|ship|apply)\s+(?:the|those|these|your|any|all)?\s*(?:remaining|pending|outstanding|necessary|required|proposed|suggested|above|discussed)?\s*(?:fix(?:es)?|edit(?:s)?|chang(?:e|es)|modification(?:s)?|patch(?:es)?)\b/gi;
+  // Up to TWO article words sit between the verb and the modifier so
+  // natural phrasings like "make all the remaining fixes" or "do all the
+  // fixes" both match (a single optional slot only catches "make the
+  // remaining fixes" / "do the fixes"). The incident-20260726 regression
+  // pin in turn-requirements.test.ts locks this.
+  /\b(?:make|do|handle|perform|finish|complete|land|ship|apply)\s+(?:(?:the|those|these|your|any|all)\s+){0,2}(?:remaining|pending|outstanding|necessary|required|proposed|suggested|above|discussed)?\s*(?:fix(?:es)?|edit(?:s)?|chang(?:e|es)|modification(?:s)?|patch(?:es)?)\b/gi;
 
 /**
  * Decide whether a raw user message actually asks Jarvis to mutate something.

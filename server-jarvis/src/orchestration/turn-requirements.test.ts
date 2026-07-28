@@ -558,3 +558,192 @@ describe("work commencement over mutation nouns (2026-07-18 23:23 incident)", ()
       .not.toBe("full_execution");
   });
 });
+
+// ── 2026-07-26 live incident (session c5f1a360, run_247d1cf1): ──
+// The `MUTATION_ARTIFACT_ORDER` rule (generic verb + mutation-artifact noun)
+// is the new layer that fired for "Retry, implement the fixes this time" and
+// for the read→write escalation that the continuation branch failed to arm.
+// The incident-20260726-write-refusal.test.ts file pins the verbatim session
+// turns; this block broadens the contract pin to the full rule shape so a
+// future "tighten the regex" can't silently lose the new coverage.
+//
+// One regression found while writing this pin: "make all the remaining fixes"
+// and "do all the fixes" did NOT match the original
+//   \b(?:make|...|apply)\s+(?:the|...|all)?\s*(?:remaining|...)?\s*(?:fix|...)\b
+// because the optional groups each match only a SINGLE word. The fix lifts
+// the article group to `(?:(?:the|...|all)\s+){0,2}` so up to TWO article
+// words can sit between the verb and the modifier (e.g. "all the", "the
+// remaining", or simply "the"). All cases below assume that fix.
+describe("MUTATION_ARTIFACT_ORDER — generic verb + mutation artifact (2026-07-26 rule)", () => {
+  test.each([
+    // Singular objects.
+    "make the fix",
+    "do the edit",
+    "handle the change",
+    "perform the modification",
+    "finish the patch",
+    "complete the change",
+    "land the fix",
+    "ship the patch",
+    "apply the fix",
+    // Plural objects.
+    "make the fixes",
+    "do the edits",
+    "handle the changes",
+    "perform the modifications",
+    "finish the patches",
+    "complete the changes",
+    "land the fixes",
+    "ship the patches",
+    "apply the fixes",
+    "apply the changes",
+    // The incident's exact phrase.
+    "implement the fixes",
+    "implement the changes",
+    // With one modifier.
+    "make the remaining fixes",
+    "do the necessary edits",
+    "handle the outstanding changes",
+    "perform the required modifications",
+    "finish the pending changes",
+    "complete the proposed edits",
+    "land the suggested fix",
+    "ship the discussed changes",
+    "apply the above patches",
+    // With two article words (the regression that motivated the fix).
+    "make all the remaining fixes",
+    "do all the fixes",
+    "make all the changes",
+    "do all the edits",
+    "apply all the above patches",
+    "ship all the pending changes",
+    // Different article words.
+    "do those remaining edits",
+    "make those changes",
+    "apply these fixes",
+    "handle your modifications",
+  ])("%p is write intent", (message) => {
+    expect(hasWriteIntent(message)).toBe(true);
+  });
+
+  test.each([
+    // Conversational / interrogative framing — the rule must NOT fire.
+    "what are the changes?",
+    "what were the fixes you made?",
+    "explain the fixes in this file",
+    "review the patches",
+    "summarize the modifications",
+    "show me the patches",
+    // The "MUTATION_ARTIFACT_ORDER" object list is exactly {fix|edit|change|
+    // modification|patch}. Abstract deliverables + other artifact nouns must
+    // remain in their own gates.
+    "make a plan",
+    "make a report",
+    "make a summary",
+    "make the analysis",
+    "make the outline",
+    "make the report",
+    "complete the assessment",
+    "do the recommendation",
+    "perform the overview",
+    "ship the proposal",
+    "apply the strategy",
+    "complete the write-up",
+    "ship the documentation",
+    "land the proposal",
+    // Generic verbs without an artifact object must not gain authority.
+    "do you think this is right?",
+    "do you agree?",
+    "make sure it works",
+    // Compound turns with a leading read/inspection frame still defer to
+    // their own classification.
+    "summarize the changes without editing anything",
+    "read the implementation plan please",
+  ])("%p is NOT write intent", (message) => {
+    expect(hasWriteIntent(message)).toBe(false);
+  });
+
+  test.each([
+    "don't make the fixes",
+    "do not make the fixes",
+    "don't apply the edits",
+    "do not ship the patches",
+    "do not do the changes",
+    "don't make the changes",
+    "never make the fixes",
+    "without making the fixes",
+    "DO NOT make the fixes",
+    "Don't make any changes",
+    "don't apply the fixes yet",
+    "without applying the fixes",
+  ])("negated mutation-artifact order is read-only: %p", (message) => {
+    expect(hasWriteIntent(message)).toBe(false);
+  });
+
+  // The `MUTATION_ARTIFACT_ORDER` rule arms `hasWriteIntent` (the effect-gate
+  // contract) but does NOT raise the requirement on its own — that is a
+  // separate decision owned by MUTATION_VERB, WORK_START_COMMAND, and
+  // findWorkCommencement. The three groups below pin the split:
+  //   (a) `make/handle/land/do the/...` (verbs ONLY in
+  //       MUTATION_ARTIFACT_ORDER) → writeIntent=true, requirement=answer_only.
+  //       The effect gate arms, but the pipeline is not auto-promoted to
+  //       full_execution.
+  //   (b) `apply/implement/edit/...` (verbs in MUTATION_VERB too) →
+  //       writeIntent=true, requirement=full_execution. MUTATION_VERB
+  //       promotes the requirement; MUTATION_ARTIFACT_ORDER (or the
+  //       concrete-target check) arms write intent.
+  //   (c) `do all the fixes` (also fires WORK_START_COMMAND) →
+  //       full_execution via the anchored work-start shortcut. The
+  //       artifact rule still contributes to write intent; the
+  //       WORK_START_COMMAND path drives the requirement.
+  test.each([
+    "make the remaining fixes",
+    "handle the pending changes",
+  ])("(a) artifact-only verb → writeIntent=true, requirement=answer_only: %p", (message) => {
+    expect(hasWriteIntent(message)).toBe(true);
+    expect(classifyTurnRequirements(message).requirement).toBe("answer_only");
+  });
+
+  test.each([
+    "implement the remaining fixes",
+    "apply the remaining patches",
+    "fix the remaining issue",          // singular `issue` IS in CONCRETE_WRITE_TARGET
+    "fix the bug",                       // singular `bug` IS in CONCRETE_WRITE_TARGET
+    "land the necessary patches",        // `land` is in MUTATION_VERB
+  ])("(b) MUTATION_VERB + artifact → full_execution + writeIntent=true: %p", (message) => {
+    expect(classifyTurnRequirements(message).requirement).toBe("full_execution");
+    expect(hasWriteIntent(message)).toBe(true);
+  });
+
+  test("(c) work-start command with artifact noun → full_execution + writeIntent=true", () => {
+    // `do all the fixes` matches WORK_START_COMMAND ("do the" + count noun +
+    // artifact), not MUTATION_VERB. The artifact rule also fires.
+    expect(hasWriteIntent("do all the fixes")).toBe(true);
+    expect(classifyTurnRequirements("do all the fixes").requirement).toBe("full_execution");
+  });
+
+  // KNOWN GAP (documented, not fixed in this pass): the older
+  // CONCRETE_WRITE_TARGET list accepts `issue`/`bug`/`crash`/`doc`/`config`/
+  // `directory`/`file` but not their plurals (`issues`/`bugs`/`crashes`/
+  // `docs`/`configs`/`directories`/`files`). The 2026-07-26 fix widened
+  // `fix(?:es)?` and added the MUTATION_ARTIFACT_ORDER list (which handles
+  // the most common plural phrasings), but did not retro-fit the older
+  // list. The cases below are the residual gap: a user who says
+  // "fix the bugs" / "fix the crashes" / "fix the docs" / "fix the
+  // issues" / "fix the configs" / "fix the directories" / "edit the
+  // necessary files" gets writeIntent=false because neither the older
+  // CONCRETE_WRITE_TARGET nor the new MUTATION_ARTIFACT_ORDER matches
+  // the plural target. Surfaced here so a future pass can decide whether
+  // to widen the older list (`s?` on each noun) or accept the gap.
+  test.each([
+    "fix the bugs",
+    "fix the issues",
+    "fix the crashes",
+    "fix the docs",
+    "fix the configs",
+    "fix the directories",
+    "edit the necessary files",
+  ])("KNOWN GAP: plural non-artifact targets carry no write intent: %p", (message) => {
+    expect(hasWriteIntent(message)).toBe(false);
+  });
+});
