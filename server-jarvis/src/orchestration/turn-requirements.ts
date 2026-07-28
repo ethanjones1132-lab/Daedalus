@@ -279,8 +279,23 @@ const ABSTRACT_DELIVERABLE =
 // Mutation-artifact nouns (changes/edits/patch/diff/...) are concrete write
 // targets: "apply the Phase 1 smoothing changes to X.h" routed READ-ONLY on
 // 2026-07-18 because nothing in this list matched the object.
+// `fix` must accept its plural: on 2026-07-26 "Retry, implement the fixes
+// this time. It is required" carried NO write intent because `\bfix\b` does
+// not match "fixes". That single false disarmed mid-loop supervision, the
+// write nudge, delegate eligibility and the effect gate, and the zero-write
+// turn shipped as `success` (self-tuning.db run_247d1cf1).
 const CONCRETE_WRITE_TARGET =
-  /\b(file|repo(?:sitory)?|path|workspace|code|source|doc(?:ument)?|config(?:uration)?|test|script|directory|folder|module|package|app(?:lication)?|project|table|database|schema|target|phase|task|step|item|milestone|feature|functionality|fix|bug|crash|issue|chang(?:e|es)|edit(?:s)?|modification(?:s)?|patch(?:es)?|diff(?:s)?|update(?:s)?|improvement(?:s)?)\b/i;
+  /\b(file|repo(?:sitory)?|path|workspace|code|source|doc(?:ument)?|config(?:uration)?|test|script|directory|folder|module|package|app(?:lication)?|project|table|database|schema|target|phase|task|step|item|milestone|feature|functionality|fix(?:es)?|bug|crash|issue|chang(?:e|es)|edit(?:s)?|modification(?:s)?|patch(?:es)?|diff(?:s)?|update(?:s)?|improvement(?:s)?)\b/i;
+
+// Generic action verb + mutation-ARTIFACT noun ("make the fixes", "do the
+// edits", "handle the remaining changes"). These verbs are far too ambiguous
+// to sit in MUTATION_VERB — "make sure", "do you think", "make a plan" would
+// all gain write authority. Here the authority comes from the OBJECT: a fix /
+// edit / change / patch is a mutation artifact, so ordering someone to "do"
+// one is ordering a mutation. Abstract deliverables are excluded by
+// construction because `plan`/`report`/etc. are not in the object list.
+const MUTATION_ARTIFACT_ORDER =
+  /\b(?:make|do|handle|perform|finish|complete|land|ship|apply)\s+(?:the|those|these|your|any|all)?\s*(?:remaining|pending|outstanding|necessary|required|proposed|suggested|above|discussed)?\s*(?:fix(?:es)?|edit(?:s)?|chang(?:e|es)|modification(?:s)?|patch(?:es)?)\b/gi;
 
 /**
  * Decide whether a raw user message actually asks Jarvis to mutate something.
@@ -315,6 +330,15 @@ export function hasWriteIntent(message: string): boolean {
       if (!compoundTarget && hasNegatedMutation) continue;
     }
 
+    return true;
+  }
+
+  // An order to carry out a mutation artifact ("make the fixes", "do the
+  // edits") is a write order even though its verb is generic. Negation still
+  // governs: "do not make the fixes" stays read-only.
+  for (const match of intentText.matchAll(MUTATION_ARTIFACT_ORDER)) {
+    if (isNegatedMutation(intentText, match.index ?? 0)) continue;
+    if (NEGATED_MUTATION_NOUN.test(intentText)) break;
     return true;
   }
 

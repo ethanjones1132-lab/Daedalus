@@ -227,12 +227,34 @@ const OBJECTIVE_STOPWORDS = new Set([
   "your", "will", "would", "could", "should", "about", "which", "there",
 ]);
 
+/**
+ * Crude suffix stripper so inflected forms of one verb compare equal.
+ *
+ * 2026-07-26: the objective "Begin implementing phase 1..." and the follow-up
+ * "Retry, implement the fixes this time" shared no EXACT token — "implement"
+ * and "implementing" are distinct strings — so `sharesObjectiveSignal` said
+ * no, the follow-up minted a brand new task run, and every sticky property
+ * (workspace, depth, write intent) was silently dropped mid-implementation.
+ *
+ * The 4-character floor is kept after stripping so short tokens cannot be
+ * eroded into collisions ("uses" -> "use", never "us").
+ */
+function stem(token: string): string {
+  for (const suffix of ["ing", "ed", "es", "s"]) {
+    if (token.endsWith(suffix) && token.length - suffix.length >= 4) {
+      return token.slice(0, token.length - suffix.length);
+    }
+  }
+  return token;
+}
+
 function significantTokens(text: string): Set<string> {
   return new Set(
     text
       .toLowerCase()
       .split(/[^a-z0-9_./\\-]+/i)
-      .filter((tok) => tok.length >= 4 && !OBJECTIVE_STOPWORDS.has(tok)),
+      .filter((tok) => tok.length >= 4 && !OBJECTIVE_STOPWORDS.has(tok))
+      .map(stem),
   );
 }
 
@@ -889,8 +911,34 @@ export function resolveTaskRunTurn(
         status: "active",
         // A write-phrased follow-up escalates a read task's contract; write
         // intent never de-escalates while the same task run is live.
+        //
+        // 2026-07-26: this tested `base.requirement` — the PRIOR turn's
+        // classification — so the escalation the comment describes could never
+        // happen. "Begin implementing phase 1" continued a live *read* run
+        // ("read the implementation plan"), the guard saw `workspace_read`,
+        // and the contract stayed writeIntent:false through the entire
+        // implementation session. The newly classified requirement is the one
+        // that describes THIS turn, so it is the one that must be able to
+        // arm the contract.
+        requirement: classifiedRequirement === "full_execution"
+          ? "full_execution"
+          : base.requirement,
+        // When a continuation ESCALATES a read run into an execution run, the
+        // message that ordered the work becomes the objective. 2026-07-26:
+        // "Begin implementing phase 1" continued the prior read run and kept
+        // its objective verbatim, so for the rest of the session the contract
+        // — and the "[In-progress task] Objective: ..." block injected into
+        // the executor prompt — read "try again, read the rest of the file".
+        // The executor was being handed a READ objective on every write turn,
+        // and the next follow-up then failed `sharesObjectiveSignal` against
+        // that stale text and minted a fresh run, dropping the contract.
+        objective: base.requirement !== "full_execution" &&
+            classifiedRequirement === "full_execution"
+          ? message.trim()
+          : base.objective,
         writeIntent: base.writeIntent === true ||
-          (base.requirement === "full_execution" && hasWriteIntent(message)),
+          ((base.requirement === "full_execution" ||
+            classifiedRequirement === "full_execution") && hasWriteIntent(message)),
         lastOutcome: undefined,
         updatedAt: nowIso(),
       },

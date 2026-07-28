@@ -50,9 +50,29 @@ describe("decideMidLoopIntervention", () => {
       failedWriteAttempts: 2,
       successfulWrites: 0,
       stageRemainingMs: 200_000,
+      recentReadTargets: ["src/PluginProcessor.cpp"],
     });
     expect(d.kind).toBe("force_write");
-    expect((d as { note: string }).note).toContain("_t.py");
+    const note = (d as { note: string }).note;
+    // The guidance now points at the path this run actually touched. It used
+    // to hardcode `_t.py`, a tier-2B benchmark fixture name, which was
+    // injected ~22 times into an unrelated C++ task on 2026-07-26.
+    expect(note).toContain("src/PluginProcessor.cpp");
+    expect(note).toContain("edit_file");
+    expect(note).not.toContain("_t.py");
+  });
+
+  test("a repeatedly-ignored failed-write nudge escalates to whole-file write", () => {
+    const d = decideMidLoopIntervention({
+      ...base,
+      distinctSuccessfulReads: 2,
+      failedWriteAttempts: 3,
+      successfulWrites: 0,
+      stageRemainingMs: 200_000,
+      forceWriteNudgesSent: 2,
+    });
+    expect(d.kind).toBe("force_write");
+    expect((d as { note: string }).note).toContain("write_file");
   });
 
   test("write-intent, zero writes, budget critical -> abort (not a timeout)", () => {

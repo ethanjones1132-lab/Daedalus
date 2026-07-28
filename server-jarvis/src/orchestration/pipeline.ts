@@ -1544,6 +1544,9 @@ export class PipelineExecutor {
               qualityPushBudget: MAX_QUALITY_PUSHES,
               qualityAccepted,
               forceQualityGate: extras.forceQualityGate === true,
+              // Lets the reflex escalate its wording instead of repeating a
+              // note the executor has already ignored (2026-07-26).
+              forceWriteNudgesSent: writeEffectNudgeCount,
               ...evidence,
             };
       // Slice D phase label for prompts / resident schema.

@@ -89,6 +89,13 @@ export interface MidLoopSignal {
   qualityAccepted?: boolean;
   /** Force a quality-phase checkpoint even if write did not just land. */
   forceQualityGate?: boolean;
+  /**
+   * Force-write nudges already pushed into the executor transcript this stage.
+   * Drives escalation: a note the model has already ignored twice must not be
+   * repeated a third time verbatim (2026-07-26: the same sentence was injected
+   * ~22 times in run_13298c8f and the executor kept reading).
+   */
+  forceWriteNudgesSent?: number;
 }
 
 /** Correctness = mutation floor; quality = product polish after that floor. */
@@ -107,7 +114,6 @@ export const DEFAULT_QUALITY_PUSH_NOTE =
  * unambiguous cases. The middle ground (some reads, budget not yet critical)
  * is left for resident-model escalation - see conductor.ts checkMidLoop. */
 const SPIRAL_READ_FLOOR = 5;
-const FORCE_WRITE_BUDGET_FLOOR_MS = 150_000;
 const ABORT_BUDGET_FLOOR_MS = 30_000;
 
 const EVIDENCE_TARGET_CAP = 6;
@@ -582,10 +588,7 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
   ) {
     return {
       kind: "force_write",
-      note:
-        `${signal.failedWriteAttempts} failed write attempt(s) and zero successful mutations. ` +
-        "Re-read the exact target path (use list/glob results — adjacent tests are often `_t.py`), " +
-        "then apply edit_file/write_file with an exact old_string match from the latest read.",
+      note: buildFailedWriteNote(signal),
     };
   }
 
@@ -604,15 +607,69 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
           "ending now with a clean partial instead of running to the timeout.",
       };
     }
-    if (signal.stageRemainingMs <= FORCE_WRITE_BUDGET_FLOOR_MS) {
-      return {
-        kind: "force_write",
-        note: `${signal.distinctSuccessfulReads} reads and zero writes so far - apply the change with a write tool now.`,
-      };
-    }
+    // 2026-07-26: this used to require `stageRemainingMs <=
+    // FORCE_WRITE_BUDGET_FLOOR_MS` (150s), so a spiral with a healthy budget
+    // got `continue` every time. run_f5c966fc read ~10 files and never once
+    // attempted a write; the first force_write arrived at the floor and the
+    // next checkpoint aborted. A read spiral is a spiral at read 5 — how much
+    // budget is left changes only whether recovery is still POSSIBLE (the
+    // abort branch above), never whether the spiral is real.
+    return {
+      kind: "force_write",
+      note: buildReadSpiralNote(signal),
+    };
   }
 
   return { kind: "continue" };
+}
+
+/**
+ * Force-write notes must lead with the WRITE, and must escalate when ignored.
+ *
+ * 2026-07-26 (run_13298c8f): the single note began "Re-read the exact target
+ * path ..." and was injected ~22 times byte-identical. `deepseek-v4-flash-free`
+ * obeyed the leading clause every time and the turn ended with 24 reads and
+ * one failed edit. A nudge that opens with an instruction to read is a nudge
+ * that sustains the read loop it was written to break.
+ */
+function buildReadSpiralNote(signal: MidLoopSignal): string {
+  const reads = signal.distinctSuccessfulReads;
+  const sent = signal.forceWriteNudgesSent ?? 0;
+  if (sent === 0) {
+    return `Call edit_file or write_file now. You have made ${reads} reads and zero writes ` +
+      "on a turn whose whole purpose is to change files. You have enough context to make the " +
+      "first edit — apply it, then continue.";
+  }
+  if (sent === 1) {
+    return `Still zero writes after ${reads} reads. Stop reading and apply the change. ` +
+      "Pick the single most obvious edit you already know how to make, call edit_file with an " +
+      "exact old_string from the read you already did, and only then look at anything else.";
+  }
+  return `This is nudge ${sent + 1}: ${reads} reads, zero writes. Do not call read_file, ` +
+    "list_directory, glob or grep again on this turn. Your next tool call must be edit_file or " +
+    "write_file. If no exact old_string is available, use write_file with the full new contents " +
+    "of the file you have already read.";
+}
+
+/**
+ * Note for the "tried to write, it failed" case. Recovery genuinely needs a
+ * re-read (the old_string did not match), but the write must stay the headline
+ * and the instruction must not name fixture files from unrelated benchmarks.
+ */
+function buildFailedWriteNote(signal: MidLoopSignal): string {
+  const attempts = signal.failedWriteAttempts ?? 1;
+  const target = signal.recentWriteTargets?.at(-1) ?? signal.recentReadTargets?.at(-1);
+  const sent = signal.forceWriteNudgesSent ?? 0;
+  const where = target ? ` The last write target was \`${target}\`.` : "";
+  if (sent >= 2) {
+    return `${attempts} failed write attempt(s) and still zero successful mutations.` + where +
+      " Stop retrying the same old_string. Call write_file with the complete new contents of " +
+      "the file instead — a whole-file write cannot fail on a match.";
+  }
+  return `${attempts} failed write attempt(s) and zero successful mutations — the edit did NOT ` +
+    "land." + where + " Re-read that exact path once to get its current text, then immediately " +
+    "call edit_file with an old_string copied verbatim from what you just read. Do not explore " +
+    "other files first.";
 }
 
 /** Format enriched signal fields for the resident mid-loop escalation prompt. */
