@@ -22,6 +22,16 @@ describe("orchestration performance guardrails", () => {
     expect(addedWriteProgress(before, after)).toBe(true);
   });
 
+  test("uses the workspace-normalized identity for write progress accounting", () => {
+    const keys = successfulWriteKeys([
+      writeCall("write_file", { path: "IMPLEMENTATION_PLAN.md", content: "same" }),
+      writeCall("write_file", { path: "C:\\Projects\\Jarvis\\IMPLEMENTATION_PLAN.md", content: "same" }),
+      writeCall("write_file", { path: "C:/Projects/Jarvis/IMPLEMENTATION_PLAN.md", content: "same" }),
+    ], { workspaceRoot: "C:\\Projects\\Jarvis", platform: "win32" });
+
+    expect(keys.size).toBe(1);
+  });
+
   test("stops after a rewriter makes no new write progress", async () => {
     const calls: string[] = [];
     let reviewerCalls = 0;

@@ -61,7 +61,7 @@ import {
 } from "./context-budget";
 import { prepareToolResultForContext } from "../tool-result-truncation";
 import { findExistingWorkspacePath } from "./workspace-affinity";
-import { join } from "path";
+import { join, posix, win32 } from "path";
 import { canApplyConductorReroute, rejectReroute } from "./reroute-policy";
 import {
   getActivePlanItem,
@@ -312,8 +312,59 @@ export function partitionToolCalls<T extends { name: string }>(calls: T[]): T[][
   return batches;
 }
 
-function duplicateToolCallKey(call: Pick<ToolCall, "name" | "arguments">): string {
-  return `${call.name}:${JSON.stringify(call.arguments)}`;
+const PATH_LIKE_ARGUMENT_KEYS = new Set([
+  "path",
+  "file_path",
+  "filepath",
+  "directory",
+  "directory_path",
+  "cwd",
+  "root",
+  "workspace_path",
+  "workspacepath",
+]);
+
+export interface ToolCallIdentityOptions {
+  /** Active workspace root used to make relative filesystem references comparable. */
+  workspaceRoot?: string;
+  /** Injectable only to keep the Windows identity contract directly testable. */
+  platform?: NodeJS.Platform;
+}
+
+function normalizePathIdentity(pathValue: string, workspaceRoot: string, platform: NodeJS.Platform): string {
+  const pathApi = platform === "win32" ? win32 : posix;
+  const normalizeSeparators = (value: string) => platform === "win32"
+    ? value.replace(/\//g, "\\")
+    : value.replace(/\\/g, "/");
+  const root = normalizeSeparators(workspaceRoot);
+  const candidate = normalizeSeparators(pathValue);
+  const resolved = pathApi.isAbsolute(candidate)
+    ? pathApi.normalize(candidate)
+    : pathApi.resolve(root, candidate);
+  const normalized = pathApi.normalize(resolved);
+  return platform === "win32"
+    ? normalized.replace(/\//g, "\\").toLowerCase()
+    : normalized.replace(/\\/g, "/");
+}
+
+/**
+ * Stable accounting identity for a tool call. This deliberately normalizes
+ * only path-bearing argument values; the Tool runtime receives the original
+ * arguments unchanged, preserving its file-access semantics.
+ */
+export function toolCallIdentityKey(
+  call: Pick<ToolCall, "name" | "arguments">,
+  { workspaceRoot = process.cwd(), platform = process.platform }: ToolCallIdentityOptions = {},
+): string {
+  const identityArguments = Object.fromEntries(
+    Object.entries(call.arguments).map(([key, value]) => [
+      key,
+      typeof value === "string" && PATH_LIKE_ARGUMENT_KEYS.has(key.toLowerCase())
+        ? normalizePathIdentity(value, workspaceRoot, platform)
+        : value,
+    ]),
+  );
+  return `${call.name}:${JSON.stringify(identityArguments)}`;
 }
 
 // 2026-07-18: a repeated identical read now REPLAYS the full cached output
@@ -428,11 +479,14 @@ export function shouldCutToSynthesis(args: {
   return args.remainingMs <= args.reserveMs + SYNTHESIS_RUNWAY_MS;
 }
 
-export function successfulWriteKeys(calls: ToolCallRecord[]): Set<string> {
+export function successfulWriteKeys(
+  calls: ToolCallRecord[],
+  identityOptions: ToolCallIdentityOptions = {},
+): Set<string> {
   return new Set(
     calls
       .filter((call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name))
-      .map((call) => `${call.name}:${JSON.stringify(call.arguments)}`),
+      .map((call) => toolCallIdentityKey(call, identityOptions)),
   );
 }
 
@@ -737,6 +791,10 @@ export class PipelineExecutor {
       workspaceOverride: this.ctx.workspace_path,
       sessionGrants: options.sessionGrants ?? this.ctx.session_grants,
     });
+  }
+
+  private activeWorkspaceRoot(): string {
+    return this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd();
   }
 
   /**
@@ -1139,7 +1197,9 @@ export class PipelineExecutor {
             return { entry, result, duplicateKey: undefined, deflected: false };
           }
           if (readOnlyOutputCache !== undefined && READ_ONLY_TOOLS.has(entry.call.name)) {
-            const duplicateKey = duplicateToolCallKey(entry.call);
+            const duplicateKey = toolCallIdentityKey(entry.call, {
+              workspaceRoot: this.activeWorkspaceRoot(),
+            });
             if (readOnlyOutputCache.has(duplicateKey)) {
               return {
                 entry,
@@ -1357,6 +1417,7 @@ export class PipelineExecutor {
     onStateChange({ stage: "executor", status: "running" });
     const priorToolCalls = options.priorToolCalls ?? [];
     const toolCalls: ToolCallRecord[] = [...priorToolCalls];
+    const identityOptions = { workspaceRoot: this.activeWorkspaceRoot() };
     const duplicateReadOnlyOutputs = new Map<string, string>();
     for (const call of priorToolCalls) {
       if (
@@ -1365,7 +1426,7 @@ export class PipelineExecutor {
         call.output.trim().length > 0 &&
         !isDuplicateToolDeflection(call)
       ) {
-        duplicateReadOnlyOutputs.set(duplicateToolCallKey(call), call.output);
+        duplicateReadOnlyOutputs.set(toolCallIdentityKey(call, identityOptions), call.output);
       }
     }
     const narratives: string[] = [];
@@ -1410,7 +1471,7 @@ export class PipelineExecutor {
       toolCalls,
       request: options.rawMessage ?? request,
       workerInstruction: options.workerInstructions?.executor,
-      workspaceRoot: this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd(),
+      workspaceRoot: identityOptions.workspaceRoot,
       workspaceRoots: this.evidenceRoots(options),
       writeIntent: requiresWriteEffect,
     });
@@ -1480,7 +1541,7 @@ export class PipelineExecutor {
     const distinctSuccessfulReadCount = () => new Set(
       stageCalls()
         .filter((call) => READ_ONLY_TOOLS.has(call.name) && !call.is_error && call.output.trim().length > 0 && !isDuplicateToolDeflection(call))
-        .map((call) => duplicateToolCallKey(call)),
+        .map((call) => toolCallIdentityKey(call, identityOptions)),
     ).size;
     const mostReadTarget = () => mostReadSuccessfulFile(stageCalls()) ?? "the requested workspace file";
     const availableWriteTools = getToolsForMode("executor", this.runtime.listTools(), profile)
@@ -2078,7 +2139,7 @@ export class PipelineExecutor {
             && call.output.trim().length > 0
             && !isDuplicateToolDeflection(call)
           ) {
-            duplicateReadOnlyOutputs.set(duplicateToolCallKey(call), call.output);
+            duplicateReadOnlyOutputs.set(toolCallIdentityKey(call, identityOptions), call.output);
           }
         }
         if (conductorHandoff && midLoopStop?.kind === "handoff") {
@@ -3523,7 +3584,7 @@ export class PipelineExecutor {
         const beforeWrites = successfulWriteKeys([
           ...executorToolCalls,
           ...(rewriterOutput?.toolCalls ?? []),
-        ]);
+        ], { workspaceRoot: this.activeWorkspaceRoot() });
         repairs++;
         onStateChange({ stage: "rewriter", status: "running", output: `\nReviewer flagged issues. Rewriting...\n` });
         rewriterOutput = await this.runRewriterStage(request, reviewerFeedback, executorSummary, agentRunId, onStateChange, options, profile, remainingQueue);
@@ -3531,7 +3592,7 @@ export class PipelineExecutor {
         const afterWrites = successfulWriteKeys([
           ...executorToolCalls,
           ...(rewriterOutput.toolCalls ?? []),
-        ]);
+        ], { workspaceRoot: this.activeWorkspaceRoot() });
         if (!addedWriteProgress(beforeWrites, afterWrites)) {
           // The rewriter's writes are a strict subset of what the executor
           // already produced. Re-firing executor→reviewer after the loop

@@ -5,7 +5,7 @@
 // with the deflection marker so it earns no evidence credit — the actual
 // purpose of the 2026-07-12 repetition guard).
 import { describe, expect, test } from "bun:test";
-import { duplicateToolCallDeflection } from "./pipeline";
+import { duplicateToolCallDeflection, toolCallIdentityKey } from "./pipeline";
 import { isDuplicateToolDeflection } from "./stage-output";
 
 const bigOutput = Array.from({ length: 400 }, (_, i) => `${i + 1} | line ${i + 1}`).join("\n");
@@ -36,5 +36,33 @@ describe("duplicateToolCallDeflection", () => {
     );
     expect(isDuplicateToolDeflection({ output: result.output })).toBe(true);
     expect(result.output).toContain("NEW target");
+  });
+});
+
+describe("toolCallIdentityKey", () => {
+  const windowsIdentity = (arguments_: Record<string, unknown>) => toolCallIdentityKey(
+    { name: "read_file", arguments: arguments_ },
+    { workspaceRoot: "C:\\Projects\\Jarvis", platform: "win32" },
+  );
+
+  test("collapses equivalent relative, absolute, and forward-slash workspace paths", () => {
+    const relative = windowsIdentity({ path: "IMPLEMENTATION_PLAN.md" });
+    const absolute = windowsIdentity({ path: "C:\\Projects\\Jarvis\\IMPLEMENTATION_PLAN.md" });
+    const forwardSlash = windowsIdentity({ path: "c:/projects/jarvis/implementation_plan.md" });
+
+    expect(relative).toBe(absolute);
+    expect(relative).toBe(forwardSlash);
+  });
+
+  test("keeps unrelated targets and non-path arguments distinct", () => {
+    const plan = windowsIdentity({ path: "IMPLEMENTATION_PLAN.md", offset: 0 });
+    const readme = windowsIdentity({ path: "README.md", offset: 0 });
+    const shiftedOffset = windowsIdentity({ path: "IMPLEMENTATION_PLAN.md", offset: 1 });
+    const differentPattern = windowsIdentity({ path: "IMPLEMENTATION_PLAN.md", pattern: "Needle" });
+    const caseChangedPattern = windowsIdentity({ path: "IMPLEMENTATION_PLAN.md", pattern: "needle" });
+
+    expect(plan).not.toBe(readme);
+    expect(plan).not.toBe(shiftedOffset);
+    expect(differentPattern).not.toBe(caseChangedPattern);
   });
 });
