@@ -190,8 +190,14 @@ export function hasWorkspaceSignal(message: string): boolean {
 // synthesizer). Past/-s forms are deliberately EXCLUDED — they read as status
 // questions or nouns ("what are the latest changes?", "is the server
 // running?"), so "running" and "changes" must never grant write authority.
+// `undo` (2026-07-29): added alongside the question-mark clause-boundary fix
+// below — "what did you change? please undo it" surfaced that "undo" was
+// simply absent from this list entirely, unrelated to boundary detection.
+// Reverting a change is itself a mutation, so it belongs here on the same
+// terms as the rest of the list (present/gerund only; see the past/-s-form
+// note above this const).
 const MUTATION_VERB =
-  /\b(writ(?:e|ing)|edit(?:ing)?|creat(?:e|ing)|add(?:ing)?|delet(?:e|ing)|remov(?:e|ing)|fix(?:ing)?|refactor(?:ing)?|implement(?:ing)?|execut(?:e|ing)|build(?:ing)?|deploy(?:ing)?|install(?:ing)?|commit(?:ting)?|patch(?:ing)?|chang(?:e|ing)|modif(?:y|ies|ying)|renam(?:e|ing)|mov(?:e|ing)|generat(?:e|ing)|replac(?:e|ing)|rewrit(?:e|ing)|scaffold(?:ing)?|migrat(?:e|ing)|format(?:ting)?|append(?:ing)?|insert(?:ing)?|overwrit(?:e|ing)|updat(?:e|ing)|push(?:ing)?|appl(?:y|ies|ying)|land|ship(?:ping)?|wir(?:e|ing)|integrat(?:e|ing)|run)\b/gi;
+  /\b(writ(?:e|ing)|edit(?:ing)?|creat(?:e|ing)|add(?:ing)?|delet(?:e|ing)|remov(?:e|ing)|fix(?:ing)?|refactor(?:ing)?|implement(?:ing)?|execut(?:e|ing)|build(?:ing)?|deploy(?:ing)?|install(?:ing)?|commit(?:ting)?|patch(?:ing)?|chang(?:e|ing)|modif(?:y|ies|ying)|renam(?:e|ing)|mov(?:e|ing)|generat(?:e|ing)|replac(?:e|ing)|rewrit(?:e|ing)|scaffold(?:ing)?|migrat(?:e|ing)|format(?:ting)?|append(?:ing)?|insert(?:ing)?|overwrit(?:e|ing)|updat(?:e|ing)|push(?:ing)?|appl(?:y|ies|ying)|land|ship(?:ping)?|wir(?:e|ing)|integrat(?:e|ing)|undo(?:ing)?|run)\b/gi;
 
 const NEGATED_MUTATION_NOUN =
   /\b(?:no\s+(?:(?:file|code)\s+)?|without\s+(?:any\s+)?)(?:modifications?|edits?|changes?)\b|\bwithout\s+(?:writing|editing|creating|adding|deleting|removing|fixing|refactoring|implementing|building|deploying|installing|committing|patching|modifying|renaming|moving|generating|replacing|rewriting|scaffolding|migrating|formatting|appending|inserting|overwriting|updating|pushing|running)\b|\bdo\s+not\s+(?:make|apply)\s+(?:any\s+)?(?:modifications?|edits?|changes?)\b/i;
@@ -412,7 +418,25 @@ const RETROSPECTIVE_QUESTION =
 // (followed by whitespace or end-of-string) — `\.(?!\d)(?=\s|$)` deliberately
 // skips decimal points ("1.6") and file extensions ("PluginProcessor.cpp",
 // where the period is followed directly by a letter, not whitespace).
-const CLAUSE_BOUNDARY = /[,;!\n]|\.(?!\d)(?=\s|$)/;
+//
+// `?` belongs in this set too (2026-07-29, second review pass on 0ed2953):
+// "why is the build failing? please fix it" has the same zero-length
+// aux+subject match ("is the") completing entirely before the `?`, so
+// RETROSPECTIVE_QUESTION's own `?` exclusion never helps — only this
+// boundary scan can catch the trailing order, and it silently couldn't
+// because `?` was missing from the character class.
+//
+// The char-class alternative uses `+` (own adversarial pass, same day): a
+// STACK of these same accepted characters ("failing?! please fix it",
+// "failing!! please fix it") left the leftover punctuation mark sitting at
+// the head of `tail`, which defeated the imperative-verb "must be at the
+// tail's own clause start" check further down (the stray char isn't part of
+// IMPERATIVE_FILLER_PREFIX, so `beforeVerb` never trimmed to empty). This is
+// still the identical, already-accepted separator set — just repeated — so
+// it stays in scope here; genuinely NEW separators (colon, em dash, bare
+// "and", parentheses, unicode ellipsis "…") were adversarially probed too
+// and are NOT covered — see the review note this was fixed alongside.
+const CLAUSE_BOUNDARY = /[,;!?\n]+|\.(?!\d)(?=\s|$)/;
 
 // A tail that continues the SAME question — another wh-clause, optionally
 // joined by a conjunction ("...and what did you change") — is coordination,

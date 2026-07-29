@@ -792,4 +792,26 @@ describe("retrospective questions are not execution orders", () => {
   ])("%p (coordinated question clause) does not classify as full_execution", (message) => {
     expect(classifyTurnRequirements(message).requirement).not.toBe("full_execution");
   });
+
+  test.each([
+    "why is the build failing? please fix it",
+    "why did you break the build? please fix it",
+    "what did you change? please undo it",
+  ])("%p (question-mark clause boundary order) is still an execution order", (message) => {
+    expect(classifyTurnRequirements(message).requirement).toBe("full_execution");
+  });
+
+  test("%p (question-mark coordinated question) does not classify as full_execution", () => {
+    expect(
+      classifyTurnRequirements("what did you change? did you also test it").requirement,
+    ).not.toBe("full_execution");
+  });
+
+  test.each([
+    "why is the build failing?! please fix it",
+    "why is the build failing!? please fix it",
+    "why is the build failing?? please fix it",
+  ])("%p (stacked clause-boundary punctuation) is still an execution order", (message) => {
+    expect(classifyTurnRequirements(message).requirement).toBe("full_execution");
+  });
 });
