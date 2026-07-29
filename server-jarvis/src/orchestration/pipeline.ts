@@ -2691,11 +2691,20 @@ export class PipelineExecutor {
           ) {
             writeEffectNudgeCount++;
             writeEffectNudgeSentThisTurn = true;
+            const writeEffectNudge = emittedToolCalls
+              ? buildWriteEffectNudge(availableWriteTools, mostReadTarget())
+              : WRITE_EFFECT_NUDGE;
             executorMessages.push({
               role: "user",
-              content: emittedToolCalls
-                ? buildWriteEffectNudge(availableWriteTools, mostReadTarget())
-                : WRITE_EFFECT_NUDGE,
+              content: writeEffectNudge,
+            });
+            this.collector.recordDirective?.({
+              id: `dir_${crypto.randomUUID()}`,
+              agent_run_id: agentRunId,
+              stage: "executor",
+              directive_type: "write_effect_nudge",
+              decision_source: "deterministic_reflex",
+              inject_note: writeEffectNudge,
             });
           }
 

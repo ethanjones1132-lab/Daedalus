@@ -1301,7 +1301,11 @@ describe("pipeline stage telemetry", () => {
     expect(progressCounts[0]).toBe(1);
   });
 
-  test("duplicate-read write pressure is injected in-loop and bounded to three directives", async () => {
+  test("duplicate-read write pressure persists its direct nudge telemetry and stays bounded to three", async () => {
+    const runId = "run-write-read-loop";
+    const store = new SelfTuningStore(":memory:");
+    const collector = new SessionOutcomeCollector(store);
+    collector.startAgentRun(runId, "session-write-read-loop", "update src/app.ts", "general", ["executor"]);
     const runtime = createToolRuntime();
     runtime.register(toolDefinition("read_file"), async () => "source body");
     runtime.register(toolDefinition("write_file"), async () => "unused write");
@@ -1320,17 +1324,25 @@ describe("pipeline stage telemetry", () => {
         ],
       };
     };
-    const executor = new PipelineExecutor(callModel as any, runtime, ctx, { recordStageRun: () => {} });
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
 
-    await executor.execute("update src/app.ts", ["executor"], "run-write-read-loop", () => {}, {
+    await executor.execute("update src/app.ts", ["executor"], runId, () => {}, {
       executionProfile: "full",
     });
 
     const directives = finalMessages.filter((message) => message.content?.includes("Expected write target"));
+    const nudgeRows = store.getConductorDirectives(runId)
+      .filter((row) => row.directive_type === "write_effect_nudge");
     expect(executorTurns).toBe(12);
     expect(directives).toHaveLength(3);
     expect(directives.every((message) => message.content?.includes("write_file"))).toBe(true);
     expect(directives.every((message) => message.content?.includes("src/app.ts"))).toBe(true);
+    expect(nudgeRows).toHaveLength(3);
+    expect(nudgeRows.every((row) =>
+      row.stage === "executor" &&
+      row.decision_source === "deterministic_reflex" &&
+      directives.some((message) => message.content === row.inject_note),
+    )).toBe(true);
   });
 
   test("PipelineResult.toolCalls is undefined when the executor stage never ran", async () => {
