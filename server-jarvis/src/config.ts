@@ -601,16 +601,25 @@ export function defaultConfig(): JarvisConfig {
         // the conductor fallback specifically. Still excluded on general
         // grounds — a model failing 85% of the time in any role is a bad
         // default to hand new users even without on-role evidence against it.
-        // A first pass matched fallback_model to the then-primary (qwen3.5:4b),
-        // but that made model === fallback_model — a no-op fallback with
-        // nothing to actually fall back to. Corrected same day: production
-        // (~/.openclaw/jarvis/config.json) already runs a proven, distinct
-        // pair — qwythos9b-conductor:latest as primary, with DIRECT on-role
-        // evidence (0% error across 31 calls, all stage_id='conductor_supervision',
-        // self-tuning.db) and faster than qwen3.5:4b, which is demoted to
-        // fallback. Adopting that live pair as the code default.
-        model: "qwythos9b-conductor:latest",
-        fallback_model: "qwen3.5:4b",
+        // 2026-07-29 (whole-branch review correction): a same-day pass briefly
+        // set `model` to `qwythos9b-conductor:latest` — this developer's own
+        // personal Ollama fine-tune, evaluated only via a one-off local A/B
+        // harness (docs/superpowers/plans/2026-07-26-qwythos-quality-evaluation.md).
+        // No other install of this software would have that model pulled, so
+        // it shipped a non-portable code default (PersistentConductor falls
+        // back gracefully to the remote API coordinator when neither `model`
+        // nor `fallback_model` resolves in Ollama, so this didn't crash — it
+        // just silently lost the local-conductor path on every other install).
+        // Reverted `model` to `qwen3.5:4b`, the original pre-review primary.
+        // `fallback_model` is `qwen3:8b`: a real, commonly-pulled qwen-family
+        // model, distinct from primary (see the structural
+        // `fallback_model !== model` test in config.test.ts) and not the
+        // 85%-error gemma4:e2b. This is a REASONABLE, PORTABLE default pair —
+        // both real qwen-family models any qwen-family install would
+        // recognize — not a claim of direct conductor-role telemetry for
+        // qwen3:8b specifically; we have no on-role error-rate data for it.
+        model: "qwen3.5:4b",
+        fallback_model: "qwen3:8b",
         base_url: "",
         output_mode: "tool_call",
         temperature: 1.0,

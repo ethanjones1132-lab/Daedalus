@@ -273,8 +273,8 @@ describe("Coordinator", () => {
     cfg.orchestrator.conductor.persist_sessions = false;
     // Mocked /api/tags below reports only "gemma4:e2b" installed, to exercise
     // "primary missing, fallback installed". Neither of config.ts's real
-    // 2026-07-29 defaults (qwythos9b-conductor:latest primary / qwen3.5:4b
-    // fallback) is gemma4:e2b, so pin the fallback explicitly as sample data.
+    // 2026-07-29 defaults (qwen3.5:4b primary / qwen3:8b fallback) is
+    // gemma4:e2b, so pin the fallback explicitly as sample data.
     cfg.orchestrator.conductor.fallback_model = "gemma4:e2b";
     const conductor = new PersistentConductor(() => cfg);
     const coordinator = new Coordinator(async () => {
