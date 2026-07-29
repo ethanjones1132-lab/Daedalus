@@ -390,6 +390,14 @@ const STRONG_WORKSPACE =
 const WEAK_WORKSPACE =
   /\b(this|these|those|that|the|my|our|your)\s+(file|files|module|package|app|application|script|source|contents?)\b/i;
 
+// Verifying a named work item is a claim about the CODE, so it needs reads.
+// 2026-07-28: "Verify phase 4 was acutally put into code" classified
+// answer_only, routed synthesizer-only, and burned its whole 45s turn budget
+// producing no output at all. The abstract-concept case ("verify my
+// understanding of TCP") is excluded by requiring a work-item noun.
+const VERIFY_WORK_ITEM =
+  /\b(?:verif(?:y|ies|ying)|validat(?:e|ing)|confirm(?:ing)?|check|audit|review)\b[^.?!]{0,60}?\b(?:phase|task|step|item|milestone|implementation|feature)s?\b/i;
+
 // A question ABOUT work already done is never an order to do more work.
 // 2026-07-29 (session dd3df41c): "what was your reasoning for implementing
 // 1.6 first before 1.1" matched MUTATION_VERB on "implementing", classified
@@ -601,7 +609,13 @@ export function classifyTurnRequirements(message: string): TurnRequirementResult
   // Workspace inspection when: a concrete path is named, OR a strong workspace
   // reference is present (repo/codebase/"this folder" — implies inspection on
   // its own), OR a read verb targets a weak workspace noun ("read the file").
-  if (pathSignal || hasStrongWorkspace || (hasReadVerb && hasWeakWorkspace)) {
+  if (VERIFY_WORK_ITEM.test(intentText)) signals.push("verify_work_item");
+  if (
+    pathSignal ||
+    hasStrongWorkspace ||
+    (hasReadVerb && hasWeakWorkspace) ||
+    VERIFY_WORK_ITEM.test(intentText)
+  ) {
     return { requirement: "workspace_read", signals };
   }
 

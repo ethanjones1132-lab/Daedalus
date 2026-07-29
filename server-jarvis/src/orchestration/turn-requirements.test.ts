@@ -841,3 +841,20 @@ describe("execution is a commencement noun", () => {
     expect(hasWriteIntent("complete the plan")).toBe(false);
   });
 });
+
+describe("verifying a work item reads the workspace", () => {
+  test.each([
+    "Verify phase 4 was acutally put into code",
+    "confirm task 1.3 is implemented",
+    "check that phase 2 landed",
+  ])("%p is workspace_read", (message) => {
+    expect(classifyTurnRequirements(message).requirement).toBe("workspace_read");
+  });
+
+  test.each([
+    "verify my understanding of TCP",
+    "check the weather",
+  ])("%p stays answer_only", (message) => {
+    expect(classifyTurnRequirements(message).requirement).toBe("answer_only");
+  });
+});
