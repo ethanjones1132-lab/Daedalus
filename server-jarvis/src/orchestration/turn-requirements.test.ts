@@ -825,6 +825,22 @@ describe("retrospective questions are not execution orders", () => {
   ])("%p (polite modal / conjunction before imperative) is still an execution order", (message) => {
     expect(classifyTurnRequirements(message).requirement).toBe("full_execution");
   });
+
+  test.each([
+    "why did you pick that library, adding dependencies always has tradeoffs",
+    "why is this failing, building on windows is always painful",
+    "why did the tests fail, writing async tests is tricky",
+    "what was your reasoning, refactoring this class seemed unnecessary to me",
+  ])("%p (gerund-headed clause is a subject, not an order) is not full_execution", (message) => {
+    expect(classifyTurnRequirements(message).requirement).toBe("answer_only");
+  });
+
+  test.each([
+    "why is the build failing, please fix it",
+    "why is the build failing, can you fix it",
+  ])("%p still classifies as full_execution after the gerund-subject fix", (message) => {
+    expect(classifyTurnRequirements(message).requirement).toBe("full_execution");
+  });
 });
 
 describe("execution is a commencement noun", () => {

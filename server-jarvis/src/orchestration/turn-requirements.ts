@@ -501,6 +501,24 @@ function hasTrailingMutationOrderAfterClauseBoundary(text: string): boolean {
     const beforeVerb = tail.slice(0, matchStart).replace(IMPERATIVE_FILLER_PREFIX, "").trim();
     if (beforeVerb.length > 0) continue;
 
+    // English imperatives are never bare -ing forms: "Fix it" is a command,
+    // "Fixing it" is a gerund phrase heading a noun clause ("Fixing it is
+    // hard"). When the verb sits at the very head of the tail clause
+    // (beforeVerb is empty, i.e. nothing but optional politeness filler
+    // precedes it) AND the matched verb text is itself a bare -ing form, this
+    // is "V-ing X is/seems/was Y" — a gerund-as-SUBJECT shape, not an order.
+    // 2026-07-29 (whole-branch review): "why did you pick that library,
+    // adding dependencies always has tradeoffs" matched "adding" here and
+    // misclassified as full_execution — the exact bug class Task A1 targeted,
+    // reproduced through this trailing-order escape hatch instead of the
+    // original MUTATION_VERB hit.
+    // This is deliberately checked only when beforeVerb is empty: a real
+    // gerund-COMPLEMENT order such as "please keep implementing this" already
+    // fails the beforeVerb check above ("keep" is not part of
+    // IMPERATIVE_FILLER_PREFIX, so beforeVerb is "keep", not empty) and never
+    // reaches this branch — so this exclusion cannot regress that shape.
+    if (/ing$/i.test(match[0])) continue;
+
     const afterVerb = tail.slice(matchEnd, matchEnd + 20);
     if (LIST_CONJUNCTION_AFTER.test(afterVerb)) continue;
 
