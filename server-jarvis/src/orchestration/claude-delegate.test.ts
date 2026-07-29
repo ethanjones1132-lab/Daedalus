@@ -1138,7 +1138,7 @@ describe("Claude executor delegate", () => {
     expect(health.snapshot().lastReason).toBe("termination_unconfirmed");
   }, 1_000);
 
-  test("forces KILL and reports uncertainty when TERM fails despite direct child exit", async () => {
+  test("treats a failed TERM tree signal as non-fatal after forced KILL and confirmed direct child exit", async () => {
     const config = testConfig();
     const snapshot: DelegateRootSnapshot = {
       root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
@@ -1172,18 +1172,13 @@ describe("Claude executor delegate", () => {
     });
 
     expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
-    expect(output).toMatchObject({ ok: false, terminalStatus: "failed", errorCode: "delegate_cleanup_unconfirmed" });
+    expect(output).toMatchObject({ ok: false, terminalStatus: "timed_out", errorCode: "delegate_timeout" });
     expect(output.toolCalls).toContainEqual(expect.objectContaining({
       name: "delegate_cleanup",
-      arguments: { status: "signal_error" },
-      is_error: true,
-      error_code: "delegate_cleanup_signal_error",
-    }));
-    expect(output.toolCalls).not.toContainEqual(expect.objectContaining({
-      name: "delegate_cleanup",
       arguments: { status: "terminated" },
+      is_error: false,
     }));
-    expect(health.snapshot().lastReason).toBe("termination_unconfirmed");
+    expect(health.snapshot().lastReason).not.toBe("termination_unconfirmed");
   }, 1_000);
 
   test("bounds teardown after forced KILL when the child exit promise never settles", async () => {

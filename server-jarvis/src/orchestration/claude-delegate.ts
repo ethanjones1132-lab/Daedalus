@@ -940,24 +940,11 @@ async function terminateDelegateProcess(
   }
 
   const killState = kill.state();
-  const termState = term.state();
   if (killState.kind === "error") {
     return { status: "signal_error", detail: `Forced process-tree kill failed: ${String(killState.error)}` };
   }
   if (killState.kind === "pending") {
     return { status: "signal_error", detail: "Forced process-tree kill did not settle before the cleanup deadline." };
-  }
-  if (termState.kind === "error") {
-    return {
-      status: "signal_error",
-      detail: `TERM process-tree signal failed; forced kill was still issued: ${String(termState.error)}`,
-    };
-  }
-  if (termState.kind === "pending") {
-    return {
-      status: "signal_error",
-      detail: "TERM process-tree signal did not settle; forced kill was still issued but cleanup remains uncertain.",
-    };
   }
   remainingMs = Math.max(0, capMs - (Date.now() - startedAt));
   if (exit.state().kind === "pending" && remainingMs > 0) {
@@ -970,7 +957,7 @@ async function terminateDelegateProcess(
   if (exitState.kind === "pending") {
     return { status: "exit_unconfirmed", detail: "Child exit was not observed before the cleanup deadline after forced process-tree kill." };
   }
-  return { status: "terminated", detail: "TERM and forced process-tree kill completed with confirmed direct child exit." };
+  return { status: "terminated", detail: "Forced process-tree kill and direct child exit were confirmed." };
 }
 
 async function cleanupLateLaunch(
