@@ -23,10 +23,10 @@ function makeConfig(overrides: Partial<JarvisConfig["orchestrator"]["conductor"]
     // Test fixtures throughout this file model a distinct primary/fallback
     // pair (mockOllamaChat's /api/tags mock reports only "gemma4:e2b"
     // installed, to exercise the "primary missing, fallback installed" path).
-    // The production default collapsed model === fallback_model on 2026-07-29
-    // (config.ts:596 — gemma4:e2b was retired as a default for 85.1% error),
-    // so this local test default keeps gemma4:e2b as sample fallback data,
-    // independent of whatever config.ts's real default is.
+    // config.ts's real 2026-07-29 default pair is qwythos9b-conductor:latest
+    // (primary) / qwen3.5:4b (fallback) — neither is gemma4:e2b, so this local
+    // test default keeps gemma4:e2b as sample fallback data, independent of
+    // whatever config.ts's real default is.
     fallback_model: "gemma4:e2b",
     ...overrides,
   };
@@ -848,7 +848,11 @@ describe("PersistentConductor", () => {
       throw new Error(`Unexpected fetch: ${url}`);
     };
 
-    const cfg = makeConfig({ persist_sessions: false });
+    // Explicit model override: this test exercises "installed primary crashes,
+    // fallback succeeds" using qwen3.5:4b/gemma4:e2b as sample data, independent
+    // of whatever config.ts's real default primary is (qwythos9b-conductor:latest
+    // as of 2026-07-29, which is not in this test's mocked /api/tags list at all).
+    const cfg = makeConfig({ persist_sessions: false, model: "qwen3.5:4b" });
     const conductor = new PersistentConductor(() => cfg);
     const result = await conductor.routeTurn({
       sessionId: "runtime-fallback-model",

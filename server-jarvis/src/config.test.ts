@@ -138,4 +138,13 @@ describe("conductor fallback default", () => {
     const cfg = defaultConfig();
     expect(cfg.orchestrator.conductor.fallback_model).not.toBe("gemma4:e2b");
   });
+
+  test("the conductor primary and fallback default to distinct models", () => {
+    // 2026-07-29: an earlier pass fixed the 85%-error fallback by matching it
+    // to the (then) primary, which silently collapsed model === fallback_model
+    // — a no-op fallback with nothing left to fall back to. Structural guard so
+    // a future edit can't reintroduce that degeneracy without failing loudly.
+    const cfg = defaultConfig();
+    expect(cfg.orchestrator.conductor.fallback_model).not.toBe(cfg.orchestrator.conductor.model);
+  });
 });

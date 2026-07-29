@@ -592,12 +592,16 @@ export function defaultConfig(): JarvisConfig {
         // conductor directive in ~1.8s vs gemma4:e2b's ~4.4s (both with
         // think:false; both otherwise burn the whole budget in the thinking
         // channel and emit empty content).
-        // 2026-07-29: gemma4:e2b was dropped as the fallback — model_attributions
-        // shows it at 85.1% error across 67 calls (self-tuning.db), so it was
-        // never a usable fallback in practice. qwen3.5:4b is used for both
-        // primary and fallback here, matching what the live production config
-        // already overrides this to.
-        model: "qwen3.5:4b",
+        // 2026-07-29: gemma4:e2b was retired as the fallback — model_attributions
+        // shows it at 85.1% error across 67 calls (self-tuning.db); a fallback
+        // that fails 85% of the time isn't one. A first pass matched fallback_model
+        // to the then-primary (qwen3.5:4b), but that made model === fallback_model —
+        // a no-op fallback with nothing to actually fall back to. Corrected same day:
+        // production (~/.openclaw/jarvis/config.json) already runs a proven, distinct
+        // pair — qwythos9b-conductor:latest as primary (0% error across 31 calls,
+        // and faster than qwen3.5:4b) with qwen3.5:4b demoted to fallback. Adopting
+        // that live pair as the code default: two real findings, two distinct models.
+        model: "qwythos9b-conductor:latest",
         fallback_model: "qwen3.5:4b",
         base_url: "",
         output_mode: "tool_call",
