@@ -271,6 +271,11 @@ describe("Coordinator", () => {
     const cfg: JarvisConfig = defaultConfig();
     cfg.orchestrator.conductor.enabled = true;
     cfg.orchestrator.conductor.persist_sessions = false;
+    // Mocked /api/tags below reports only "gemma4:e2b" installed, to exercise
+    // "primary missing, fallback installed"; keep a distinct fallback here
+    // regardless of config.ts's real default (which collapsed to match the
+    // primary on 2026-07-29 after gemma4:e2b's 85.1% error rate).
+    cfg.orchestrator.conductor.fallback_model = "gemma4:e2b";
     const conductor = new PersistentConductor(() => cfg);
     const coordinator = new Coordinator(async () => {
       apiCalls += 1;
@@ -341,6 +346,8 @@ describe("Coordinator", () => {
     cfg.orchestrator.conductor.enabled = true;
     cfg.orchestrator.conductor.fallback_to_api = true;
     cfg.orchestrator.conductor.persist_sessions = false;
+    // See note above: mocked /api/tags reports only "gemma4:e2b" installed.
+    cfg.orchestrator.conductor.fallback_model = "gemma4:e2b";
     const conductor = new PersistentConductor(() => cfg);
     const coordinator = new Coordinator(async () => {
       apiCalls += 1;
@@ -373,6 +380,8 @@ describe("Coordinator", () => {
     cfg.orchestrator.conductor.enabled = true;
     cfg.orchestrator.conductor.fallback_to_api = true;
     cfg.orchestrator.conductor.persist_sessions = false;
+    // See note above: mocked /api/tags reports only "gemma4:e2b" installed.
+    cfg.orchestrator.conductor.fallback_model = "gemma4:e2b";
     const conductor = new PersistentConductor(() => cfg);
     const coordinator = new Coordinator(async () => {
       apiCalls += 1;

@@ -591,9 +591,14 @@ export function defaultConfig(): JarvisConfig {
         // 2026-07-18 measured on the live Ollama host: qwen3.5:4b answers a
         // conductor directive in ~1.8s vs gemma4:e2b's ~4.4s (both with
         // think:false; both otherwise burn the whole budget in the thinking
-        // channel and emit empty content). Fast primary, gemma as fallback.
+        // channel and emit empty content).
+        // 2026-07-29: gemma4:e2b was dropped as the fallback — model_attributions
+        // shows it at 85.1% error across 67 calls (self-tuning.db), so it was
+        // never a usable fallback in practice. qwen3.5:4b is used for both
+        // primary and fallback here, matching what the live production config
+        // already overrides this to.
         model: "qwen3.5:4b",
-        fallback_model: "gemma4:e2b",
+        fallback_model: "qwen3.5:4b",
         base_url: "",
         output_mode: "tool_call",
         temperature: 1.0,

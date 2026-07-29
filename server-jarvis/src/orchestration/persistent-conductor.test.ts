@@ -20,6 +20,14 @@ function makeConfig(overrides: Partial<JarvisConfig["orchestrator"]["conductor"]
   const cfg = defaultConfig();
   cfg.orchestrator.conductor = {
     ...cfg.orchestrator.conductor,
+    // Test fixtures throughout this file model a distinct primary/fallback
+    // pair (mockOllamaChat's /api/tags mock reports only "gemma4:e2b"
+    // installed, to exercise the "primary missing, fallback installed" path).
+    // The production default collapsed model === fallback_model on 2026-07-29
+    // (config.ts:596 — gemma4:e2b was retired as a default for 85.1% error),
+    // so this local test default keeps gemma4:e2b as sample fallback data,
+    // independent of whatever config.ts's real default is.
+    fallback_model: "gemma4:e2b",
     ...overrides,
   };
   return cfg;

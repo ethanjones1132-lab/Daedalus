@@ -129,3 +129,13 @@ describe("stale jarvis_path warning dedupe (Task 3.5)", () => {
     expect(cfg.jarvis_path).not.toContain("/root/");
   });
 });
+
+describe("conductor fallback default", () => {
+  test("the conductor fallback default is not the 85%-error model", () => {
+    // model_attributions 2026-07-29: gemma4:e2b n=67, 85.1% error. It was
+    // picked at config.ts:596 on latency alone (~1.8s vs ~4.4s) with no
+    // error-rate input. A fallback that fails 85% of the time is not a fallback.
+    const cfg = defaultConfig();
+    expect(cfg.orchestrator.conductor.fallback_model).not.toBe("gemma4:e2b");
+  });
+});
