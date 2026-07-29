@@ -5,6 +5,9 @@ import {
   enumerateDelegateModelCandidates,
   getDelegateThrashCount,
   isDelegateThrashOutcome,
+  isProxyResolvable,
+  DELEGATE_FREE_FIRST_MODELS,
+  DELEGATE_GO_OPENAI_MODELS,
   recordDelegateThrash,
   selectDelegateModel,
 } from "./delegate-model-select";
@@ -105,5 +108,37 @@ describe("delegate thrash accounting", () => {
     expect(isDelegateThrashOutcome({
       ok: false, hasVerifiedWrite: false, errorCode: "delegate_stream_error",
     })).toBe(true);
+  });
+});
+
+describe("delegate only selects models the claude_cli proxy can resolve", () => {
+  const installed = ["qwythos9b-conductor:latest", "qwen3.5:4b", "qwen3:8b"];
+  const goOpenaiModels = ["deepseek-v4-flash", "mimo-v2.5"];
+
+  test("a namespaced id routes to OpenRouter and is resolvable", () => {
+    expect(isProxyResolvable("cohere/north-mini-code:free", installed, goOpenaiModels)).toBe(true);
+    expect(isProxyResolvable("deepseek/deepseek-v4-flash", installed, goOpenaiModels)).toBe(true);
+  });
+
+  test("a bare OpenCode Go OpenAI-format id resolves via rule 1, not Ollama", () => {
+    for (const model of DELEGATE_GO_OPENAI_MODELS) {
+      expect(isProxyResolvable(model, [], goOpenaiModels)).toBe(true);
+    }
+  });
+
+  test("a bare id NOT in the Go OpenAI list is only resolvable when installed in Ollama", () => {
+    expect(isProxyResolvable("qwen3:8b", installed, goOpenaiModels)).toBe(true);
+    expect(isProxyResolvable("deepseek-v4-flash-free", installed, goOpenaiModels)).toBe(false);
+  });
+
+  test("claude-* placeholders fall back to the proxy default model", () => {
+    expect(isProxyResolvable("claude-sonnet-4", installed, goOpenaiModels)).toBe(true);
+  });
+
+  test("every default free-first model is namespaced", () => {
+    for (const model of DELEGATE_FREE_FIRST_MODELS) {
+      expect({ model, namespaced: model.includes("/") })
+        .toEqual({ model, namespaced: true });
+    }
   });
 });

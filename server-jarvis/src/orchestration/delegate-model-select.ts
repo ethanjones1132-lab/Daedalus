@@ -10,17 +10,53 @@
  * Operator pin: non-empty non-"auto" model is used until thrash forces promotion.
  */
 
-export const DELEGATE_FREE_FIRST_MODELS = [
-  "deepseek-v4-flash-free",
-  "north-mini-code-free",
-  "mimo-v2.5-free",
-  "nemotron-3-ultra-free",
-] as const;
-
 /** OpenAI-format Go models (need proxy for Claude CLI). */
 export const DELEGATE_GO_OPENAI_MODELS = [
   "deepseek-v4-flash",
   "mimo-v2.5",
+] as const;
+
+/**
+ * Mirror of the claude_cli proxy's own model routing
+ * (claude_cli_proxy.py::resolve_upstream, verified 2026-07-29):
+ *
+ *   1. Bare id in get_opencode_go_openai_models() + Go key -> opencode_go (direct)
+ *   2. Namespaced "vendor/model[:tag]" + OpenRouter key     -> openrouter
+ *   3. Bare Ollama ids / claude-* placeholders              -> ollama
+ *
+ * Rule 1 matters: DELEGATE_GO_OPENAI_MODELS ("deepseek-v4-flash", "mimo-v2.5")
+ * are bare ids that resolve WITHOUT being installed in Ollama, via a
+ * different mechanism than rule 3. A bare id that matches neither rule 1 nor
+ * an installed Ollama model is unreachable: the proxy sends it to :11434 and
+ * gets `{"error":{"message":"model '<id>' not found"}}`, the delegate exits
+ * nonzero, and the turn opens with a failed git_metadata call. Through
+ * 2026-07-29 every id in DELEGATE_FREE_FIRST_MODELS was a bare OpenCode ZEN
+ * id (a different catalog than OpenCode Go) matching neither rule 1 nor any
+ * installed Ollama model, so the whole free-first pool 404'd on every write run.
+ */
+export function isProxyResolvable(
+  model: string,
+  installedOllamaModels: readonly string[],
+  goOpenaiModels: readonly string[] = DELEGATE_GO_OPENAI_MODELS,
+): boolean {
+  const id = model.trim();
+  if (id.length === 0) return false;
+  if (goOpenaiModels.includes(id)) return true; // rule 1 — OpenCode Go direct
+  if (id.includes("/")) return true;            // rule 2 — OpenRouter
+  if (id.startsWith("claude-")) return true;    // rule 3 — proxy default model
+  return installedOllamaModels.includes(id);    // rule 3 — must be installed
+}
+
+/**
+ * Free-tier delegate models, healthiest first.
+ *
+ * These MUST be namespaced (`vendor/model`) so the proxy routes them to
+ * OpenRouter. Bare OpenCode Zen ids are unreachable — see isProxyResolvable.
+ */
+export const DELEGATE_FREE_FIRST_MODELS = [
+  "cohere/north-mini-code:free",
+  "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+  "google/gemma-4-31b-it:free",
 ] as const;
 
 /** Anthropic-native Go models (skip proxy; need opencode_go key). */
@@ -103,9 +139,13 @@ export function selectDelegateModel(input: {
   freeModels?: readonly string[];
   goOpenaiModels?: readonly string[];
   goAnthropicModels?: readonly string[];
+  /** Ollama tags, for resolving bare model ids. Empty means "none installed". */
+  installedOllamaModels?: readonly string[];
 }): DelegateModelSelection {
   const threshold = input.thrashThreshold ?? DEFAULT_FREE_THRASH_THRESHOLD;
   const free = input.freeModels ?? DELEGATE_FREE_FIRST_MODELS;
+  const installed = input.installedOllamaModels ?? [];
+  const resolvableFree = free.filter((model) => isProxyResolvable(model, installed));
   const goOpenai = input.goOpenaiModels ?? DELEGATE_GO_OPENAI_MODELS;
   const goAnthropic = input.goAnthropicModels ?? DELEGATE_GO_ANTHROPIC_MODELS;
   const proxyOk = input.proxyAvailable !== false;
@@ -169,10 +209,10 @@ export function selectDelegateModel(input: {
   }
 
   // Free-first rotation while under thrash threshold and proxy is up.
-  if (free.length > 0) {
-    const freeIdx = Math.min(thrash, Math.max(0, free.length - 1));
+  if (resolvableFree.length > 0) {
+    const freeIdx = Math.min(thrash, Math.max(0, resolvableFree.length - 1));
     return {
-      model: free[freeIdx] ?? free[0],
+      model: resolvableFree[freeIdx] ?? resolvableFree[0],
       pool: "free",
       reason: thrash === 0 ? "free_first" : `free_rotate_${thrash}`,
       thrashCount: thrash,
