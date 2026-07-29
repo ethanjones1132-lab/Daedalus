@@ -54,6 +54,21 @@ describe("toolCallIdentityKey", () => {
     expect(relative).toBe(forwardSlash);
   });
 
+  test("uses the filesystem scope's WSL drive canonicalization on Linux", () => {
+    const linuxIdentity = (arguments_: Record<string, unknown>) => toolCallIdentityKey(
+      { name: "read_file", arguments: arguments_ },
+      { workspaceRoot: "/mnt/c/Projects/Jarvis", platform: "linux" },
+    );
+    const relative = linuxIdentity({ path: "README.md" });
+    const windowsDrive = linuxIdentity({ path: "C:\\Projects\\Jarvis\\README.md" });
+    const windowsForwardSlash = linuxIdentity({ path: "C:/Projects/Jarvis/README.md" });
+    const wslPath = linuxIdentity({ path: "/mnt/c/Projects/Jarvis/README.md" });
+
+    expect(relative).toBe(windowsDrive);
+    expect(relative).toBe(windowsForwardSlash);
+    expect(relative).toBe(wslPath);
+  });
+
   test("keeps unrelated targets and non-path arguments distinct", () => {
     const plan = windowsIdentity({ path: "IMPLEMENTATION_PLAN.md", offset: 0 });
     const readme = windowsIdentity({ path: "README.md", offset: 0 });

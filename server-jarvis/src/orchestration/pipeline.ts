@@ -81,7 +81,7 @@ import {
   seedTaskPlanFromPlannerProposal,
   type OwnedPlanningAttachment,
 } from "./runtime-loop";
-import { resolveAllowedRoots } from "../fs-scope";
+import { normalizePathInput, resolveAllowedRoots } from "../fs-scope";
 import {
   ClaudeDelegateAvailabilityCache,
   DelegateHealth,
@@ -336,8 +336,12 @@ function normalizePathIdentity(pathValue: string, workspaceRoot: string, platfor
   const normalizeSeparators = (value: string) => platform === "win32"
     ? value.replace(/\//g, "\\")
     : value.replace(/\\/g, "/");
-  const root = normalizeSeparators(workspaceRoot);
-  const candidate = normalizeSeparators(pathValue);
+  // Keep identity semantics aligned with the Tool runtime: under WSL/Linux,
+  // Windows drive input is first translated to /mnt/<drive>/... before the
+  // path is resolved. This is identity-only; original tool arguments remain
+  // untouched for runtime execution.
+  const root = normalizeSeparators(normalizePathInput(workspaceRoot, platform));
+  const candidate = normalizeSeparators(normalizePathInput(pathValue, platform));
   const resolved = pathApi.isAbsolute(candidate)
     ? pathApi.normalize(candidate)
     : pathApi.resolve(root, candidate);
