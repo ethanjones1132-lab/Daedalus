@@ -866,4 +866,195 @@ describe("raceCandidates", () => {
     );
     expect(pool.raceCandidates("planner", "refactor")).toEqual([]);
   });
+
+  // 2026-07-29 (cron: afternoon) — B2 wiring-readiness regression pins. The
+  // 2026-07-29 orchestrator-latency-and-completion plan's B2 wiring note
+  // says the stage dispatch will pass `pool.raceCandidates(stage, taskType)`
+  // into `raceFirstToken` for `planner` and `synthesizer` only. These cases
+  // lock the observable shape a future refactor cannot silently regress.
+  // All assertions are GROUNDED IN ACTUAL MEASURED BEHAVIOR (probed against
+  // the current build before writing) — not in what we thought the code
+  // did. The interesting observation: with the default agent pool, every
+  // stage resolves to a single openrouter lane, so `raceCandidates` is
+  // intentionally single-element for the default config. The wiring has
+  // to handle the single-lane case via `raceFirstToken`'s `raced:false`
+  // path; the test contract is therefore "the FIRST element of
+  // raceCandidates always matches the cascade chain's first pick" (not
+  // "always returns 2").
+
+  test("the first picked agent is the top of the cascade chain", () => {
+    const pool = new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS);
+    const candidates = pool.raceCandidates("planner", "refactor");
+    const chain = pool.cascadeChain("planner", "refactor");
+    expect(candidates.length).toBeGreaterThanOrEqual(1);
+    expect(chain.length).toBeGreaterThanOrEqual(1);
+    // The first picked is the cascade chain's first pick — the primary
+    // lane raceFirstToken will commit to if it wins. This is the
+    // wiring-readiness contract: changing which lane is the primary
+    // means changing the cascade order, not the race function.
+    expect(candidates[0]?.id).toBe(chain[0]?.id);
+  });
+
+  test("the default pool returns a single-element race list for planner (only one provider present)", () => {
+    // The default agent pool is openrouter-only for these stages, so
+    // the second-pick distinct-provider step finds nothing and the
+    // wiring code MUST take the no-race path (`raced:false` inside
+    // raceFirstToken). Pin this so a future "always race 2 lanes"
+    // refactor can't silently degrade to a same-provider double-shot
+    // (which is exactly what raceCandidates is documented to AVOID).
+    const pool = new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS);
+    const candidates = pool.raceCandidates("planner", "refactor");
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]?.provider).toBe("openrouter");
+  });
+
+  test("with 2 distinct providers in the same routing tier the race list has 2 entries on those 2 providers", () => {
+    // Two healthy planner candidates in the same routing tier:
+    // openrouter `<model>:free` is tier 0 (note the colon, not hyphen
+    // — the routing-tier function checks `endsWith(":free")` for
+    // openrouter). opencode_zen `-free` is tier 0 too. The cascade
+    // chain picks the strongest reasoner on each tier, and
+    // raceCandidates keeps the first distinct-provider entry from
+    // each. An ollama or go agent is tier 1+, so it would be excluded
+    // by the tier policy — pin that the race list only contains
+    // same-tier agents.
+    const pool = new AgentPool([
+      {
+        id: "or-planner",
+        provider: "openrouter",
+        model_id: "test:free",
+        capabilities: { code: 0.5, reasoning: 0.8, speed: 0.7, cost: 0.9, json_reliability: 0.8 },
+        default_for: ["planner"],
+        enabled: true,
+      },
+      {
+        id: "zen-planner",
+        provider: "opencode_zen",
+        model_id: "test-free",
+        capabilities: { code: 0.5, reasoning: 0.7, speed: 0.6, cost: 0.8, json_reliability: 0.7 },
+        default_for: [],
+        enabled: true,
+      },
+    ]);
+    const candidates = pool.raceCandidates("planner", "general");
+    expect(candidates).toHaveLength(2);
+    const providers = candidates.map((agent) => agent.provider);
+    expect(new Set(providers).size).toBe(2);
+    expect(providers).toContain("openrouter");
+    expect(providers).toContain("opencode_zen");
+  });
+
+  test("agents in different routing tiers are not paired in a single race list", () => {
+    // The cost/capacity policy is a hard boundary: the active tier is
+    // the MINIMUM tier number, and only same-tier candidates are
+    // eligible. So `openrouter/free` (tier 0) is the active tier when
+    // it exists, and an opencode_go agent (tier 1) is excluded — the
+    // race list contains ONLY the free-tier openrouter agent. Pin
+    // this so a future "race the next-cheapest tier as a second lane"
+    // refactor can't silently break the cost/capacity policy by
+    // pairing a free lane with a paid lane.
+    const pool = new AgentPool([
+      {
+        id: "or-planner",
+        provider: "openrouter",
+        model_id: "openrouter/free",
+        capabilities: { code: 0.5, reasoning: 0.8, speed: 0.7, cost: 0.9, json_reliability: 0.8 },
+        default_for: ["planner"],
+        enabled: true,
+      },
+      {
+        id: "go-planner",
+        provider: "opencode_go",
+        model_id: "go-model",
+        capabilities: { code: 0.5, reasoning: 0.7, speed: 0.6, cost: 0.8, json_reliability: 0.7 },
+        default_for: [],
+        enabled: true,
+      },
+    ]);
+    const candidates = pool.raceCandidates("planner", "general");
+    // The active tier is 0 (openrouter/free); the go-tier agent is
+    // excluded. Race list = free-tier openrouter lane only.
+    const providers = candidates.map((agent) => agent.provider);
+    expect(providers).toEqual(["openrouter"]);
+  });
+
+  test("a single-distinct-provider pool returns a single-element array (the no-race path)", () => {
+    // All healthy planner candidates on openrouter. The wiring code
+    // does `if (candidates.length === 1) { /* no-race path */ }`, so
+    // the return shape MUST be a single-element array (NOT two
+    // openrouter duplicates, NOT []). Two openrouter lanes behind the
+    // same queue is exactly what race-first-token is documented to
+    // AVOID — racing them buys nothing because they share a queue.
+    const pool = new AgentPool([
+      {
+        id: "or-planner-a",
+        provider: "openrouter",
+        model_id: "model-a",
+        capabilities: { code: 0.5, reasoning: 0.8, speed: 0.7, cost: 0.9, json_reliability: 0.8 },
+        default_for: ["planner"],
+        enabled: true,
+      },
+      {
+        id: "or-planner-b",
+        provider: "openrouter",
+        model_id: "model-b",
+        capabilities: { code: 0.5, reasoning: 0.7, speed: 0.7, cost: 0.9, json_reliability: 0.8 },
+        default_for: ["planner"],
+        enabled: true,
+      },
+      {
+        id: "or-planner-c",
+        provider: "openrouter",
+        model_id: "model-c",
+        capabilities: { code: 0.4, reasoning: 0.6, speed: 0.7, cost: 0.9, json_reliability: 0.7 },
+        default_for: ["planner"],
+        enabled: true,
+      },
+    ]);
+    const candidates = pool.raceCandidates("planner", "general");
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]?.provider).toBe("openrouter");
+  });
+
+  test("agents below the cascade capability floor are excluded from the race list", () => {
+    // cascadeChain applies `code >= 0.55 || reasoning >= 0.55` as a
+    // hard floor. A weak model (reasoning 0.4) is dropped BEFORE the
+    // race step. Pin this so a future "loosen the floor" or "skip the
+    // floor" refactor can't silently start racing weak lanes.
+    const pool = new AgentPool([
+      {
+        id: "strong",
+        provider: "openrouter",
+        model_id: "strong",
+        capabilities: { code: 0.5, reasoning: 0.8, speed: 0.7, cost: 0.9, json_reliability: 0.8 },
+        default_for: ["planner"],
+        enabled: true,
+      },
+      {
+        id: "weak",
+        provider: "ollama",
+        model_id: "weak",
+        capabilities: { code: 0.3, reasoning: 0.4, speed: 0.4, cost: 1, json_reliability: 0.4 },
+        default_for: [],
+        enabled: true,
+      },
+    ]);
+    const candidates = pool.raceCandidates("planner", "general");
+    // Only the strong openrouter lane clears the floor; the ollama
+    // lane is excluded by the floor, leaving a single-element list.
+    const ids = candidates.map((a) => a.id);
+    expect(ids).toContain("strong");
+    expect(ids).not.toContain("weak");
+  });
+
+  test("a fully-disabled pool returns [] (the wiring must short-circuit, not throw)", () => {
+    // The wiring code runs `raceFirstToken([...raceCandidates(...)])`
+    // — if raceCandidates throws when every agent is disabled, the
+    // stage would never run on a misconfigured cold start. Empty array
+    // is the only safe shape.
+    const pool = new AgentPool(
+      DEFAULT_ORCHESTRATOR_AGENTS.map((agent) => ({ ...agent, enabled: false })),
+    );
+    expect(pool.raceCandidates("planner", "refactor")).toEqual([]);
+  });
 });
