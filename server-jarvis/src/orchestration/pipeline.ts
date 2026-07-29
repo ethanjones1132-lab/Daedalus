@@ -1595,7 +1595,9 @@ export class PipelineExecutor {
         progressSinceLastCheckpoint: extras.progressSinceLastCheckpoint,
         writeLandedSinceLastCheck: extras.writeLandedSinceLastCheck,
       });
+      const { totalSuccessfulReads, ...midLoopEvidence } = evidence;
       const base: MidLoopSignal = {
+              totalSuccessfulReads,
               writeIntent: requiresWriteEffect,
               turnCount: turnCountForSignal,
               maxTurns,
@@ -1617,7 +1619,7 @@ export class PipelineExecutor {
               planItemsRemaining: options.taskRunContract?.plan?.items.filter(
                 (item) => item.status !== "verified",
               ).length,
-              ...evidence,
+              ...midLoopEvidence,
             };
       // Slice D phase label for prompts / resident schema.
       if (shouldRunQualityPhase(base) || assessCorrectnessFloor(base)) {

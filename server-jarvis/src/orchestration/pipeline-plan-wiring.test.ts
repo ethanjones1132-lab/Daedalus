@@ -29,7 +29,7 @@ describe("TaskPlan ledger stays wired to the mid-loop signal, not the correctnes
   const source = readFileSync(join(import.meta.dir, "pipeline.ts"), "utf8");
   const lines = source.split("\n");
 
-  test("the mid-loop base signal still forwards planItemsTotal/planItemsRemaining", () => {
+  test("the mid-loop base signal still forwards plan and read-loop counters", () => {
     const baseSignalIdx = lines.findIndex((line) =>
       line.includes("const base: MidLoopSignal = {"),
     );
@@ -39,6 +39,7 @@ describe("TaskPlan ledger stays wired to the mid-loop signal, not the correctnes
     const window = lines.slice(baseSignalIdx, baseSignalIdx + 40).join("\n");
     expect(window).toContain("planItemsTotal");
     expect(window).toContain("planItemsRemaining");
+    expect(window).toContain("totalSuccessfulReads");
   });
 
   test("no assessCorrectnessFloor( call site forwards the ledger", () => {

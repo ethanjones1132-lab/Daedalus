@@ -44,6 +44,8 @@ export interface MidLoopSignal {
   writeIntent: boolean;
   successfulWrites: number;
   distinctSuccessfulReads: number;
+  /** Total successful read-tool calls, including re-reads of the same target. */
+  totalSuccessfulReads?: number;
   turnCount: number;
   maxTurns: number;
   /** Remaining wall-clock budget for the executor stage, ms. */
@@ -201,17 +203,20 @@ export function buildMidLoopToolEvidence(
   | "failedWriteAttempts"
   | "successfulWrites"
   | "distinctSuccessfulReads"
+  | "totalSuccessfulReads"
 > {
   const recentReadTargets: string[] = [];
   const recentWriteTargets: string[] = [];
   const recentToolSummaries: string[] = [];
   let successfulWrites = 0;
+  let totalSuccessfulReads = 0;
   let failedWriteAttempts = 0;
   const successfulReadKeys = new Set<string>();
 
   for (const call of toolCalls) {
     const paths = collectToolPathTargets(call.arguments);
     if (!call.is_error && READ_TOOL_NAMES.has(call.name)) {
+      totalSuccessfulReads += 1;
       const key = `${call.name}:${JSON.stringify(call.arguments)}`;
       successfulReadKeys.add(key);
       for (const path of paths) {
@@ -246,6 +251,7 @@ export function buildMidLoopToolEvidence(
     failedWriteAttempts,
     successfulWrites,
     distinctSuccessfulReads: successfulReadKeys.size,
+    totalSuccessfulReads,
   };
 }
 
@@ -638,6 +644,34 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
     };
   }
 
+  // A re-read loop can hide below the distinct-target floor: repeatedly
+  // reading the same two files still burns the turn without moving toward the
+  // required mutation. Keep this after the legacy distinct-read spiral so the
+  // established higher-priority ordering remains intact.
+  const totalSuccessfulReads = signal.totalSuccessfulReads ?? 0;
+  if (
+    signal.successfulWrites === 0 &&
+    totalSuccessfulReads >= 6 &&
+    totalSuccessfulReads >= 2 * signal.distinctSuccessfulReads
+  ) {
+    if (signal.stageRemainingMs <= ABORT_BUDGET_FLOOR_MS) {
+      return {
+        kind: "abort",
+        reason: `write-intent turn with ${totalSuccessfulReads} successful reads across ` +
+          `${signal.distinctSuccessfulReads} distinct targets and zero writes; ` +
+          `remaining budget (${Math.round(signal.stageRemainingMs / 1000)}s) is too low to recover - ` +
+          "ending now with a clean partial instead of running to the timeout.",
+      };
+    }
+    return {
+      kind: "force_write",
+      note: buildReadSpiralNote(
+        signal,
+        `${totalSuccessfulReads} successful reads across ${signal.distinctSuccessfulReads} distinct targets`,
+      ),
+    };
+  }
+
   // A plan remainder we cannot possibly finish should end as a NAMED partial,
   // not run to the stage timeout. Checked BEFORE the remaining-work push
   // below: when the budget is already gone, naming what is left and stopping
@@ -703,20 +737,22 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
  * one failed edit. A nudge that opens with an instruction to read is a nudge
  * that sustains the read loop it was written to break.
  */
-function buildReadSpiralNote(signal: MidLoopSignal): string {
-  const reads = signal.distinctSuccessfulReads;
+function buildReadSpiralNote(
+  signal: MidLoopSignal,
+  readSummary = `${signal.distinctSuccessfulReads} reads`,
+): string {
   const sent = signal.forceWriteNudgesSent ?? 0;
   if (sent === 0) {
-    return `Call edit_file or write_file now. You have made ${reads} reads and zero writes ` +
+    return `Call edit_file or write_file now. You have made ${readSummary} and zero writes ` +
       "on a turn whose whole purpose is to change files. You have enough context to make the " +
       "first edit — apply it, then continue.";
   }
   if (sent === 1) {
-    return `Still zero writes after ${reads} reads. Stop reading and apply the change. ` +
+    return `Still zero writes after ${readSummary}. Stop reading and apply the change. ` +
       "Pick the single most obvious edit you already know how to make, call edit_file with an " +
       "exact old_string from the read you already did, and only then look at anything else.";
   }
-  return `This is nudge ${sent + 1}: ${reads} reads, zero writes. Do not call read_file, ` +
+  return `This is nudge ${sent + 1}: ${readSummary}, zero writes. Do not call read_file, ` +
     "list_directory, glob or grep again on this turn. Your next tool call must be edit_file or " +
     "write_file. If no exact old_string is available, use write_file with the full new contents " +
     "of the file you have already read.";

@@ -44,6 +44,43 @@ describe("decideMidLoopIntervention", () => {
     expect(d.kind).toBe("force_write");
   });
 
+  test("five total successful reads across two files do not trigger the re-read-loop reflex", () => {
+    const d = decideMidLoopIntervention({
+      ...base,
+      distinctSuccessfulReads: 2,
+      totalSuccessfulReads: 5,
+    });
+    expect(d.kind).toBe("continue");
+  });
+
+  test("six total successful reads across three files meet the re-read-loop threshold", () => {
+    const d = decideMidLoopIntervention({
+      ...base,
+      distinctSuccessfulReads: 3,
+      totalSuccessfulReads: 6,
+    });
+    expect(d.kind).toBe("force_write");
+  });
+
+  test("nine total successful reads across two files force a write", () => {
+    const d = decideMidLoopIntervention({
+      ...base,
+      distinctSuccessfulReads: 2,
+      totalSuccessfulReads: 9,
+    });
+    expect(d.kind).toBe("force_write");
+  });
+
+  test("a re-read loop at the abort floor preserves the low-budget abort", () => {
+    const d = decideMidLoopIntervention({
+      ...base,
+      distinctSuccessfulReads: 2,
+      totalSuccessfulReads: 9,
+      stageRemainingMs: 30_000,
+    });
+    expect(d.kind).toBe("abort");
+  });
+
   test("failed write attempts with zero success → force_write with path guidance", () => {
     const d = decideMidLoopIntervention({
       ...base,
@@ -412,6 +449,7 @@ describe("buildMidLoopToolEvidence", () => {
     });
 
     expect(evidence.distinctSuccessfulReads).toBe(1);
+    expect(evidence.totalSuccessfulReads).toBe(1);
     expect(evidence.successfulWrites).toBe(1);
     expect(evidence.failedWriteAttempts).toBe(1);
     expect(evidence.recentReadTargets).toEqual(["src/a.ts"]);
