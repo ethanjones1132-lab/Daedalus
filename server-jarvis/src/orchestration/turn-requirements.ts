@@ -380,6 +380,21 @@ const STRONG_WORKSPACE =
 const WEAK_WORKSPACE =
   /\b(this|these|those|that|the|my|our|your)\s+(file|files|module|package|app|application|script|source|contents?)\b/i;
 
+// A question ABOUT work already done is never an order to do more work.
+// 2026-07-29 (session dd3df41c): "what was your reasoning for implementing
+// 1.6 first before 1.1" matched MUTATION_VERB on "implementing", classified
+// full_execution, and the route normalizer expanded the coordinator's
+// single-stage route into planner+executor+reviewer+synthesizer — 120s of
+// wall clock, zero tool calls, outcome degraded. The trailing "?" is what
+// normally saves these; punctuation must not be load-bearing.
+//
+// Deliberately narrow: an interrogative opener is NOT enough on its own
+// ("what needs fixing? then fix it" is a real order). The message must also
+// refer back to an actor/subject with an auxiliary verb — "did you", "was
+// your", "have you" — which is the shape of asking about the past.
+const RETROSPECTIVE_QUESTION =
+  /^(?:so|and|but|ok|okay|hey|hmm|wait|also|quick\s+q(?:uestion)?)?[,.!\s]*\b(?:what|why|how|when|which|who|whose)\b[^.?!]{0,140}?\b(?:did|do|does|are|were|was|is|have|has|had|would|should|could)\s+(?:you|your|we|our|it|that|this|the)\b/i;
+
 /**
  * Classify the raw current user message into the capability class the turn
  * requires. Precedence (first match wins):
@@ -437,6 +452,17 @@ export function classifyTurnRequirements(message: string): TurnRequirementResult
   // would otherwise steal the hatch into full_execution.
   if (hasDeepReadIntent) {
     return { requirement: "workspace_read", signals };
+  }
+
+  // Retrospective questions are answered, not executed. Checked before the
+  // mutation branch because their verb ("implementing", "change") is exactly
+  // what would otherwise grant execution authority.
+  if (RETROSPECTIVE_QUESTION.test(intentText)) {
+    signals.push("retrospective_question");
+    return {
+      requirement: pathSignal || hasStrongWorkspace ? "workspace_read" : "answer_only",
+      signals,
+    };
   }
 
   // Unnegated mutation intent wins outright — even with a path present,

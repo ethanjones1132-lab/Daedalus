@@ -747,3 +747,25 @@ describe("MUTATION_ARTIFACT_ORDER — generic verb + mutation artifact (2026-07-
     expect(hasWriteIntent(message)).toBe(false);
   });
 });
+
+describe("retrospective questions are not execution orders", () => {
+  test.each([
+    "what was your reasoning for implementing 1.6 first before 1.1",
+    "what did you change",
+    "why did you do 1.6 before 1.1",
+    "how did you implement the smoothing",
+    "which files did you edit",
+    "what have you completed so far",
+  ])("%p does not classify as full_execution", (message) => {
+    expect(classifyTurnRequirements(message).requirement).not.toBe("full_execution");
+  });
+
+  test.each([
+    "Begin full execution of phase 1",
+    "implement the fixes",
+    "fix the bug in PluginProcessor.cpp",
+    "what needs fixing? then fix it",
+  ])("%p is still an execution order", (message) => {
+    expect(classifyTurnRequirements(message).requirement).toBe("full_execution");
+  });
+});
