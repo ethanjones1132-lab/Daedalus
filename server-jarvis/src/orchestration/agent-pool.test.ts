@@ -849,3 +849,21 @@ describe("firstTokenTimeoutFor", () => {
     });
   });
 });
+
+describe("raceCandidates", () => {
+  test("returns at most two healthy lanes on distinct providers", () => {
+    const pool = new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS);
+    const candidates = pool.raceCandidates("planner", "refactor");
+    expect(candidates.length).toBeGreaterThanOrEqual(1);
+    expect(candidates.length).toBeLessThanOrEqual(2);
+    const providers = candidates.map((agent) => agent.provider);
+    expect(new Set(providers).size).toBe(providers.length);
+  });
+
+  test("never races onto a disabled agent", () => {
+    const pool = new AgentPool(
+      DEFAULT_ORCHESTRATOR_AGENTS.map((agent) => ({ ...agent, enabled: false })),
+    );
+    expect(pool.raceCandidates("planner", "refactor")).toEqual([]);
+  });
+});

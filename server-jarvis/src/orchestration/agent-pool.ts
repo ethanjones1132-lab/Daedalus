@@ -468,6 +468,29 @@ export class AgentPool {
     return [cheapFirst, strongSecond].filter((agent): agent is OrchestratorAgent => Boolean(agent));
   }
 
+  /**
+   * Up to two lanes to race for one stage, on DISTINCT providers.
+   *
+   * Distinct providers is the point: two lanes behind the same queue share the
+   * same first-token tail, so racing them buys nothing. Bounded at two so the
+   * free-tier request budget is not multiplied further.
+   */
+  raceCandidates(stage: string, taskType: TaskType | string): OrchestratorAgent[] {
+    const chain = this.cascadeChain(stage, taskType);
+    // No explicit `enabled` filter here: `cascadeChain` builds its candidate
+    // list from `this.enabled()` (verified by reading its implementation), so
+    // a disabled agent can never reach this point.
+    const picked: OrchestratorAgent[] = [];
+    const seenProviders = new Set<string>();
+    for (const agent of chain) {
+      if (seenProviders.has(agent.provider)) continue;
+      seenProviders.add(agent.provider);
+      picked.push(agent);
+      if (picked.length === 2) break;
+    }
+    return picked;
+  }
+
   coverage(): AgentPoolCoverage {
     const enabled = this.enabled();
     const providers: Record<string, number> = {};
