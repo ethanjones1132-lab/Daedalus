@@ -826,3 +826,18 @@ describe("retrospective questions are not execution orders", () => {
     expect(classifyTurnRequirements(message).requirement).toBe("full_execution");
   });
 });
+
+describe("execution is a commencement noun", () => {
+  test.each([
+    "Complete the execution of all partial and incomplete phases",
+    "Begin full execution of phase 1",
+    "finish the remaining execution",
+    "resume execution of the plan",
+  ])("%p is full_execution", (message) => {
+    expect(classifyTurnRequirements(message).requirement).toBe("full_execution");
+  });
+
+  test("commencing an abstract deliverable is still not write intent", () => {
+    expect(hasWriteIntent("complete the plan")).toBe(false);
+  });
+});

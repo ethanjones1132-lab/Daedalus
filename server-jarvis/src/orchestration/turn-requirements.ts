@@ -248,8 +248,12 @@ function isNegatedMutation(text: string, index: number): boolean {
 // tool-less synthesizer; the first fabricated a "## Changes Made" report with
 // invented diffs. A commencement verb targeting a work-item noun IS an order
 // to do the work, which mid-session means mutating files.
+// 2026-07-29: `execution` was missing, and the {0,4} gap could not span
+// "the execution of all partial and incomplete". "Complete the execution of
+// all partial and incomplete phases" — the most explicit order in session
+// 650a4f48 — classified answer_only and got a tool-less synthesizer.
 const WORK_COMMENCEMENT_RE =
-  /\b(begin|start|commence|complete|finish|resume|continue|execute|perform|tackle|carry\s+out|kick\s+off|wrap\s+up|knock\s+out|proceed\s+with|move\s+on\s+to)(?!\s+(?:you|we|they|i)\b)\s+(?:[\w'’-]+\s+){0,4}?((?:phase|task|step|item|part|stage|milestone|plan|implementation|migration|integration|deployment|rollout|remainder|rest|work|fixe?|change|edit|feature|functionality)s?)\b/gi;
+  /\b(begin|start|commence|complete|finish|resume|continue|execute|perform|tackle|carry\s+out|kick\s+off|wrap\s+up|knock\s+out|proceed\s+with|move\s+on\s+to)(?!\s+(?:you|we|they|i)\b)\s+(?:[\w'’-]+\s+){0,5}?((?:phase|task|step|item|part|stage|milestone|plan|implementation|execution|migration|integration|deployment|rollout|remainder|rest|work|fixe?|change|edit|feature|functionality)s?)\b/gi;
 
 // Status questions ("did you complete the phase?") and failure descriptions
 // ("fails to start the sync task") contain the same verb→noun shape but are

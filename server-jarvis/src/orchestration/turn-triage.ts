@@ -33,7 +33,7 @@ const CONTINUATION_PATTERNS: RegExp[] = [
 // that fabricated an implementation report. The `(?!\s+(?:you|we|they|i)\b)`
 // guard keeps aux usage ("do you think…") from reading as a command.
 export const WORK_START_COMMAND =
-  /^(?:now |ok |okay |please |actually |just |alright |and |then )*(begin|start|complete|finish|resume|continue|execute|launch|perform|implement|tackle|kick off|wrap up|carry out|proceed with|do)(?!\s+(?:you|we|they|i)\b)\s+(?:[\w'’-]+\s+){0,4}?(phase|task|step|item|part|stage|plan|milestone|next|implementation|migration|integration|deployment|rollout|remainder|rest|work|fixe?|change|edit|feature|functionality)s?\b/i;
+  /^(?:now |ok |okay |please |actually |just |alright |and |then )*(begin|start|complete|finish|resume|continue|execute|launch|perform|implement|tackle|kick off|wrap up|carry out|proceed with|do)(?!\s+(?:you|we|they|i)\b)\s+(?:[\w'’-]+\s+){0,5}?(phase|task|step|item|part|stage|plan|milestone|next|implementation|execution|migration|integration|deployment|rollout|remainder|rest|work|fixe?|change|edit|feature|functionality)s?\b/i;
 
 export function isContinuationTurn(request: string): boolean {
   const text = (request || "").trim();
