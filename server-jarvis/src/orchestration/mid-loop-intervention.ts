@@ -189,6 +189,7 @@ export function buildMidLoopToolEvidence(
     verification?: MidLoopVerificationSnapshot;
     progressSinceLastCheckpoint?: string;
     writeLandedSinceLastCheck?: boolean;
+    readIdentityKey?: (call: Pick<ToolCallRecord, "name" | "arguments">) => string;
   } = {},
 ): Pick<
   MidLoopSignal,
@@ -217,7 +218,8 @@ export function buildMidLoopToolEvidence(
     const paths = collectToolPathTargets(call.arguments);
     if (!call.is_error && READ_TOOL_NAMES.has(call.name)) {
       totalSuccessfulReads += 1;
-      const key = `${call.name}:${JSON.stringify(call.arguments)}`;
+      const key = opts.readIdentityKey?.(call)
+        ?? `${call.name}:${JSON.stringify(call.arguments)}`;
       successfulReadKeys.add(key);
       for (const path of paths) {
         if (!recentReadTargets.includes(path)) recentReadTargets.push(path);

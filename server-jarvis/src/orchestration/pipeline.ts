@@ -1594,6 +1594,7 @@ export class PipelineExecutor {
           : undefined,
         progressSinceLastCheckpoint: extras.progressSinceLastCheckpoint,
         writeLandedSinceLastCheck: extras.writeLandedSinceLastCheck,
+        readIdentityKey: (call) => toolCallIdentityKey(call, identityOptions),
       });
       const { totalSuccessfulReads, ...midLoopEvidence } = evidence;
       const base: MidLoopSignal = {

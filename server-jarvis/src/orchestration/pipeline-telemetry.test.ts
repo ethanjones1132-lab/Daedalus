@@ -9,6 +9,7 @@ import { ConductorBus } from "./conductor-bus";
 import { AgentPool, DEFAULT_ORCHESTRATOR_AGENTS } from "./agent-pool";
 import { TurnDeadlineExceededError } from "../stream-liveness";
 import { DEEP_READ_MIN_CONTENT_READS } from "./evidence-sufficiency";
+import { decideMidLoopIntervention } from "./mid-loop-intervention";
 
 function toolDefinition(name: string) {
   return {
@@ -133,6 +134,67 @@ describe("pipeline stage telemetry", () => {
 
   test("in_turn_driver defaults to enabled in config", () => {
     expect(defaultConfig().orchestrator.conductor.in_turn_driver.enabled).toBe(true);
+  });
+
+  test("mid-loop signal canonicalizes equivalent carried read paths against the active workspace", async () => {
+    const workspaceRoot = "C:\\Projects\\Jarvis";
+    const priorToolCalls = [
+      "IMPLEMENTATION_PLAN.md",
+      "C:\\Projects\\Jarvis\\IMPLEMENTATION_PLAN.md",
+      "c:/projects/jarvis/implementation_plan.md",
+      "README.md",
+      "README.md",
+      "README.md",
+    ].map((path) => ({
+      name: "read_file",
+      arguments: { path },
+      output: `contents of ${path}`,
+      is_error: false,
+      duration_ms: 1,
+    }));
+    const signals: any[] = [];
+    const config = defaultConfig();
+    config.orchestrator.conductor.in_turn_driver.enabled = true;
+    const executor = new PipelineExecutor(
+      (async () => ({ content: "Still inspecting before the write.", tool_calls: [] })) as any,
+      createToolRuntime(),
+      makeExecutionContext("agent", config, { workspace_path: workspaceRoot }),
+      {
+        bus: new ConductorBus(),
+        collector: { recordStageRun: () => {} },
+        live: {
+          checkMidLoop: async (signal: any) => {
+            signals.push(signal);
+            return decideMidLoopIntervention(signal);
+          },
+          afterStage: async () => ({ type: "continue" }),
+        },
+      } as any,
+    );
+
+    await executor.executeSegment(
+      "Update IMPLEMENTATION_PLAN.md after reviewing README.md",
+      ["executor"],
+      "run-canonical-mid-loop-reads",
+      () => {},
+      {
+        executionProfile: "full",
+        rawMessage: "Update IMPLEMENTATION_PLAN.md after reviewing README.md",
+        taskRunWriteIntent: true,
+        priorToolCalls,
+        turnBudget: {
+          stageRemainingMs: () => 120_000,
+          extendStageOnProgress: () => 0,
+        } as any,
+      },
+    );
+
+    expect(signals.length).toBeGreaterThan(0);
+    expect(signals[0]).toMatchObject({
+      totalSuccessfulReads: 6,
+      distinctSuccessfulReads: 2,
+    });
+    expect(decideMidLoopIntervention(signals[0]).kind).toBe("force_write");
   });
 
   test("mid-loop check-runner feeds CheckResult into supervision after a write", async () => {
