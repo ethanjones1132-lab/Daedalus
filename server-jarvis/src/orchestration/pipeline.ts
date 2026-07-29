@@ -2715,6 +2715,16 @@ export class PipelineExecutor {
                     command: this.lastCheckResult.command,
                   }
                 : undefined,
+              // TaskPlan ledger drives the plan-aware correctness floor (Task C1).
+              // This is the second call site of assessCorrectnessFloor in this
+              // method (Task C2 follow-up) — without these fields the Slice D
+              // quality gate treated a single write as "correctness met" even
+              // with plan items still unverified, pushing the executor toward
+              // polish instead of the remaining plan work.
+              planItemsTotal: options.taskRunContract?.plan?.items.length,
+              planItemsRemaining: options.taskRunContract?.plan?.items.filter(
+                (item) => item.status !== "verified",
+              ).length,
             })
           ) {
             onStateChange({ stage: "executor", status: "running", detail: "mid_loop_quality_gate" });
