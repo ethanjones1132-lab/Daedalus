@@ -96,6 +96,10 @@ export interface MidLoopSignal {
    * ~22 times in run_13298c8f and the executor kept reading).
    */
   forceWriteNudgesSent?: number;
+  /** Total items in the active TaskPlan ledger, when one exists. */
+  planItemsTotal?: number;
+  /** Items not yet `verified` in the active TaskPlan ledger. */
+  planItemsRemaining?: number;
 }
 
 /** Correctness = mutation floor; quality = product polish after that floor. */
@@ -284,11 +288,22 @@ export function shouldRunMidLoopCheck(input: {
  */
 export function assessCorrectnessFloor(signal: Pick<
   MidLoopSignal,
-  "writeIntent" | "successfulWrites" | "verification"
+  "writeIntent" | "successfulWrites" | "verification" | "planItemsTotal" | "planItemsRemaining"
 >): boolean {
   if (!signal.writeIntent) return true;
   if (signal.successfulWrites <= 0) return false;
   if (signal.verification?.ran === true && signal.verification.passed === false) {
+    return false;
+  }
+  // 2026-07-29: the floor was `successfulWrites > 0` alone, so the first edit
+  // of a seven-task phase satisfied it, the quality gate accepted, and the
+  // turn ended 1/7 done (run_7e6b590f). When a TaskPlan ledger exists it is
+  // the authority on "done" — a write is progress, not completion.
+  if (
+    signal.planItemsTotal !== undefined &&
+    signal.planItemsTotal > 0 &&
+    (signal.planItemsRemaining ?? 0) > 0
+  ) {
     return false;
   }
   return true;

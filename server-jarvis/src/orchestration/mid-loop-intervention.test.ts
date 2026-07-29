@@ -14,6 +14,7 @@ import {
   shouldRunMidLoopCheck,
   shouldRunQualityPhase,
 } from "./mid-loop-intervention";
+import type { MidLoopSignal } from "./mid-loop-intervention";
 
 const base = {
   writeIntent: true,
@@ -424,5 +425,51 @@ describe("buildMidLoopToolEvidence", () => {
     expect(collectToolPathTargets({
       edits: [{ path: "one.ts" }, { file_path: "two.ts" }],
     })).toEqual(["one.ts", "two.ts"]);
+  });
+});
+
+describe("correctness floor is plan-aware", () => {
+  const base = {
+    writeIntent: true,
+    successfulWrites: 1,
+    verification: undefined,
+  };
+
+  test("one write does not satisfy a seven-item plan", () => {
+    expect(assessCorrectnessFloor({
+      ...base,
+      planItemsTotal: 7,
+      planItemsRemaining: 6,
+    })).toBe(false);
+  });
+
+  test("floor is met when no plan items remain", () => {
+    expect(assessCorrectnessFloor({
+      ...base,
+      planItemsTotal: 7,
+      planItemsRemaining: 0,
+    })).toBe(true);
+  });
+
+  test("with no ledger the legacy one-write floor still applies", () => {
+    expect(assessCorrectnessFloor(base)).toBe(true);
+  });
+
+  test("zero writes never meets the floor regardless of ledger", () => {
+    expect(assessCorrectnessFloor({
+      ...base,
+      successfulWrites: 0,
+      planItemsTotal: 7,
+      planItemsRemaining: 0,
+    })).toBe(false);
+  });
+
+  test("a red verification still fails the floor", () => {
+    expect(assessCorrectnessFloor({
+      ...base,
+      planItemsTotal: 1,
+      planItemsRemaining: 0,
+      verification: { tier: "builtin", ran: true, passed: false },
+    })).toBe(false);
   });
 });
