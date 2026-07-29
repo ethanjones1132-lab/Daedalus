@@ -592,15 +592,23 @@ export function defaultConfig(): JarvisConfig {
         // conductor directive in ~1.8s vs gemma4:e2b's ~4.4s (both with
         // think:false; both otherwise burn the whole budget in the thinking
         // channel and emit empty content).
-        // 2026-07-29: gemma4:e2b was retired as the fallback — model_attributions
-        // shows it at 85.1% error across 67 calls (self-tuning.db); a fallback
-        // that fails 85% of the time isn't one. A first pass matched fallback_model
-        // to the then-primary (qwen3.5:4b), but that made model === fallback_model —
-        // a no-op fallback with nothing to actually fall back to. Corrected same day:
-        // production (~/.openclaw/jarvis/config.json) already runs a proven, distinct
-        // pair — qwythos9b-conductor:latest as primary (0% error across 31 calls,
-        // and faster than qwen3.5:4b) with qwen3.5:4b demoted to fallback. Adopting
-        // that live pair as the code default: two real findings, two distinct models.
+        // 2026-07-29: gemma4:e2b was retired as the fallback. model_attributions
+        // shows it at 85.1% error across 67 calls (self-tuning.db), but that
+        // figure is from its use as a Claude-CLI DELEGATE model (provider=
+        // claude_cli, stage_id=stage_<uuid> — the Task-B1 delegate path), NOT
+        // from the conductor role: stage_id='conductor_supervision' has zero
+        // rows for gemma4:e2b, so there is no direct evidence of it failing as
+        // the conductor fallback specifically. Still excluded on general
+        // grounds — a model failing 85% of the time in any role is a bad
+        // default to hand new users even without on-role evidence against it.
+        // A first pass matched fallback_model to the then-primary (qwen3.5:4b),
+        // but that made model === fallback_model — a no-op fallback with
+        // nothing to actually fall back to. Corrected same day: production
+        // (~/.openclaw/jarvis/config.json) already runs a proven, distinct
+        // pair — qwythos9b-conductor:latest as primary, with DIRECT on-role
+        // evidence (0% error across 31 calls, all stage_id='conductor_supervision',
+        // self-tuning.db) and faster than qwen3.5:4b, which is demoted to
+        // fallback. Adopting that live pair as the code default.
         model: "qwythos9b-conductor:latest",
         fallback_model: "qwen3.5:4b",
         base_url: "",
