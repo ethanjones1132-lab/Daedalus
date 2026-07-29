@@ -446,8 +446,17 @@ const COORDINATED_QUESTION_TAIL =
 
 // "please"/"then"/"now"/etc. are politeness/sequencing fillers that may sit
 // between the clause boundary and a genuine imperative verb ("...; please fix
-// it") without disqualifying it as an order.
-const IMPERATIVE_FILLER_PREFIX = /^\s*(?:please|then|now|just|go\s+ahead\s+and|ok(?:ay)?)\s+/i;
+// it") without disqualifying it as an order. Broadened (2026-07-29, third
+// review pass on 830995e): ordinary polite-request modals ("can you fix it",
+// "could you fix it") and coordinating conjunctions ("and fix it", "but
+// rewrite the tests", "so rewrite the tests") are at least as common as the
+// "please"-led phrasing already covered, and were an equally real regression
+// vs. pre-Task-A1 baseline. The modal group optionally swallows a following
+// "please" too ("can you please fix it"). Each group is independently
+// optional so the whole prefix still matches zero-length when the verb sits
+// bare at the tail's head ("...; fix it").
+const IMPERATIVE_FILLER_PREFIX =
+  /^\s*(?:(?:and|but|so)\s+)?(?:(?:can|could|would|will)\s+you\s+)?(?:please|then|now|just|go\s+ahead\s+and|ok(?:ay)?)?\s*/i;
 
 // A mutation verb immediately followed by ", or"/", and" is a coordinated
 // list item ("what did you change, add, or remove"), not a standalone

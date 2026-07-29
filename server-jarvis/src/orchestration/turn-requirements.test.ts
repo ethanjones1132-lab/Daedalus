@@ -814,4 +814,15 @@ describe("retrospective questions are not execution orders", () => {
   ])("%p (stacked clause-boundary punctuation) is still an execution order", (message) => {
     expect(classifyTurnRequirements(message).requirement).toBe("full_execution");
   });
+
+  test.each([
+    "why is the build failing, can you fix it",
+    "why is the build failing, could you fix it",
+    "why is the build failing, can you please fix it",
+    "why is the build failing, and fix it",
+    "why is the build failing, but rewrite the tests",
+    "why is the build failing, so rewrite the tests",
+  ])("%p (polite modal / conjunction before imperative) is still an execution order", (message) => {
+    expect(classifyTurnRequirements(message).requirement).toBe("full_execution");
+  });
 });
