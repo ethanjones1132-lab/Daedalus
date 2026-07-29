@@ -776,4 +776,20 @@ describe("retrospective questions are not execution orders", () => {
   ])("%p (comma-joined order) is still an execution order", (message) => {
     expect(classifyTurnRequirements(message).requirement).toBe("full_execution");
   });
+
+  test.each([
+    "why is the build failing. please fix it",
+    "why is the build failing; please fix it",
+    "why is the build failing\nplease fix it",
+  ])("%p (non-comma clause boundary order) is still an execution order", (message) => {
+    expect(classifyTurnRequirements(message).requirement).toBe("full_execution");
+  });
+
+  test.each([
+    "what did you change, add, or remove",
+    "what did you change, add, or remove in the last edit",
+    "why did you fix it that way, and what did you change",
+  ])("%p (coordinated question clause) does not classify as full_execution", (message) => {
+    expect(classifyTurnRequirements(message).requirement).not.toBe("full_execution");
+  });
 });

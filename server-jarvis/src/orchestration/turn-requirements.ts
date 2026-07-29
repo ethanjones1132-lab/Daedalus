@@ -395,23 +395,71 @@ const WEAK_WORKSPACE =
 const RETROSPECTIVE_QUESTION =
   /^(?:so|and|but|ok|okay|hey|hmm|wait|also|quick\s+q(?:uestion)?)?[,.!\s]*\b(?:what|why|how|when|which|who|whose)\b[^.?!,]{0,140}?\b(?:did|do|does|are|were|was|is|have|has|had|would|should|could)\s+(?:you|your|we|our|it|that|this|the)\b/i;
 
-// A retrospective question can be comma-joined to a genuine execution order
-// ("why is the build failing, please fix it" / "what is the plan, implement
-// it now"). Excluding the comma from RETROSPECTIVE_QUESTION's lazy span (above)
-// only stops matches that would otherwise SPAN the comma — but the aux+subject
-// shape ("is the ...") is satisfied with a zero-length span immediately after
-// the wh-word, so the match completes entirely inside the pre-comma clause and
-// never needs to cross the comma at all. The comma exclusion alone is a no-op
-// for this shape. The actual distinguishing signal: an unnegated mutation verb
-// in the clause AFTER the comma is a separate imperative, not part of the
-// question, and must not be swallowed by the retrospective demotion.
-function hasTrailingMutationOrderAfterComma(text: string): boolean {
-  const commaIndex = text.indexOf(",");
-  if (commaIndex === -1) return false;
-  const tail = text.slice(commaIndex + 1);
+// A retrospective question can be joined to a genuine execution order by ANY
+// clause boundary, not only a comma — "why is the build failing, please fix
+// it", "why is the build failing. please fix it", "...; please fix it",
+// "...\nplease fix it" are all the same shape. Excluding the comma from
+// RETROSPECTIVE_QUESTION's lazy span (above) only stops matches that would
+// otherwise SPAN the comma — but the aux+subject shape ("is the ...") is
+// satisfied with a zero-length span immediately after the wh-word, so the
+// match completes entirely inside the pre-boundary clause and never needs to
+// cross the boundary at all. The span exclusion alone is a no-op for this
+// shape, and a bug fixed here on 2026-07-29 (code review of commit 4b9c7f2)
+// checked only `,` and missed `.`/`;`/`!`/newline entirely — a real
+// regression vs. pre-Task-A1 behavior for those separators.
+//
+// A period is treated as a boundary only when it reads as sentence-final
+// (followed by whitespace or end-of-string) — `\.(?!\d)(?=\s|$)` deliberately
+// skips decimal points ("1.6") and file extensions ("PluginProcessor.cpp",
+// where the period is followed directly by a letter, not whitespace).
+const CLAUSE_BOUNDARY = /[,;!\n]|\.(?!\d)(?=\s|$)/;
+
+// A tail that continues the SAME question — another wh-clause, optionally
+// joined by a conjunction ("...and what did you change") — is coordination,
+// not a new order, and must never be treated as a trailing mutation order.
+const COORDINATED_QUESTION_TAIL =
+  /^\s*(?:and|but|so|also|then)?\s*\b(?:what|why|how|when|which|who|whose)\b/i;
+
+// "please"/"then"/"now"/etc. are politeness/sequencing fillers that may sit
+// between the clause boundary and a genuine imperative verb ("...; please fix
+// it") without disqualifying it as an order.
+const IMPERATIVE_FILLER_PREFIX = /^\s*(?:please|then|now|just|go\s+ahead\s+and|ok(?:ay)?)\s+/i;
+
+// A mutation verb immediately followed by ", or"/", and" is a coordinated
+// list item ("what did you change, add, or remove"), not a standalone
+// imperative — the same list shape that fed the mutation verb into
+// hasMutation upstream but is asking about several past actions, not
+// ordering one.
+const LIST_CONJUNCTION_AFTER = /^\s*,\s*(?:or|and)\b/i;
+
+function hasTrailingMutationOrderAfterClauseBoundary(text: string): boolean {
+  const boundaryMatch = CLAUSE_BOUNDARY.exec(text);
+  if (!boundaryMatch) return false;
+  const boundaryIndex = boundaryMatch.index;
+  const tail = text.slice(boundaryIndex + boundaryMatch[0].length);
+
+  // "...and what did you change" / "...why did you also fix it" continue the
+  // same question rather than issuing a new order.
+  if (COORDINATED_QUESTION_TAIL.test(tail)) return false;
+
   for (const match of tail.matchAll(MUTATION_VERB)) {
-    const globalIndex = commaIndex + 1 + (match.index ?? 0);
-    if (!isNegatedMutation(text, globalIndex)) return true;
+    const matchStart = match.index ?? 0;
+    const matchEnd = matchStart + match[0].length;
+    const globalIndex = boundaryIndex + boundaryMatch[0].length + matchStart;
+    if (isNegatedMutation(text, globalIndex)) continue;
+
+    // The verb must read as the tail's OWN imperative — at (or near, past
+    // only politeness/sequencing fillers) the very start of the tail clause —
+    // not a bare item buried in a coordinated list ("...change, add, or
+    // remove"), where the "add"/"remove" verbs have other list content
+    // (a preceding item, or a trailing ", or") around them.
+    const beforeVerb = tail.slice(0, matchStart).replace(IMPERATIVE_FILLER_PREFIX, "").trim();
+    if (beforeVerb.length > 0) continue;
+
+    const afterVerb = tail.slice(matchEnd, matchEnd + 20);
+    if (LIST_CONJUNCTION_AFTER.test(afterVerb)) continue;
+
+    return true;
   }
   return false;
 }
@@ -478,7 +526,12 @@ export function classifyTurnRequirements(message: string): TurnRequirementResult
   // Retrospective questions are answered, not executed. Checked before the
   // mutation branch because their verb ("implementing", "change") is exactly
   // what would otherwise grant execution authority.
-  if (RETROSPECTIVE_QUESTION.test(intentText) && !hasTrailingMutationOrderAfterComma(intentText)) {
+  const isRetrospectiveQuestion = RETROSPECTIVE_QUESTION.test(intentText);
+  const trailingMutationOrder = isRetrospectiveQuestion &&
+    hasTrailingMutationOrderAfterClauseBoundary(intentText);
+  if (isRetrospectiveQuestion && trailingMutationOrder) {
+    signals.push("trailing_mutation_order_after_boundary");
+  } else if (isRetrospectiveQuestion) {
     signals.push("retrospective_question");
     return {
       requirement: pathSignal || hasStrongWorkspace ? "workspace_read" : "answer_only",
