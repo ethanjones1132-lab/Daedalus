@@ -284,29 +284,29 @@ export function shouldRunMidLoopCheck(input: {
 /**
  * Correctness floor (Slice D): write intent has a successful mutation and
  * verification is not red. Green checks or tier=none both clear the floor;
- * only an executed failing check blocks it. When a TaskPlan ledger is present
- * (`planItemsTotal` set) and items remain (`planItemsRemaining` > 0), the
- * floor also requires the ledger to be drained — a single write no longer
- * satisfies a multi-item plan on its own.
+ * only an executed failing check blocks it.
+ *
+ * This asks "is the correctness bar met for the work ATTEMPTED?", not "is the
+ * whole plan done". Its only consumers — {@link shouldRunQualityPhase} and the
+ * Slice D gate in pipeline.ts — read a `true` as permission to unlock the
+ * quality push, so anything that makes this return `false` REMOVES
+ * supervision. The TaskPlan ledger therefore must not live here: outstanding
+ * plan items are handled by a dedicated reflex in
+ * {@link decideMidLoopIntervention} that ADDS pressure instead.
+ *
+ * 2026-07-29 inversion incident: a ledger check was briefly added to this
+ * function. Because it gates the quality push rather than completion, a
+ * partially-drained ledger silently disabled the only supervision still
+ * active after the first write — live run_da68c50b (5 of 6 items outstanding)
+ * issued zero quality pushes where pre-change run_7e6b590f issued two.
  */
 export function assessCorrectnessFloor(signal: Pick<
   MidLoopSignal,
-  "writeIntent" | "successfulWrites" | "verification" | "planItemsTotal" | "planItemsRemaining"
+  "writeIntent" | "successfulWrites" | "verification"
 >): boolean {
   if (!signal.writeIntent) return true;
   if (signal.successfulWrites <= 0) return false;
   if (signal.verification?.ran === true && signal.verification.passed === false) {
-    return false;
-  }
-  // 2026-07-29: the floor was `successfulWrites > 0` alone, so the first edit
-  // of a seven-task phase satisfied it, the quality gate accepted, and the
-  // turn ended 1/7 done (run_7e6b590f). When a TaskPlan ledger exists it is
-  // the authority on "done" — a write is progress, not completion.
-  if (
-    signal.planItemsTotal !== undefined &&
-    signal.planItemsTotal > 0 &&
-    (signal.planItemsRemaining ?? 0) > 0
-  ) {
     return false;
   }
   return true;
@@ -639,9 +639,9 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
   }
 
   // A plan remainder we cannot possibly finish should end as a NAMED partial,
-  // not run to the stage timeout. Pairs with the plan-aware correctness floor
-  // (Task C1, assessCorrectnessFloor): raising the completion bar must not
-  // convert partial success into a timeout.
+  // not run to the stage timeout. Checked BEFORE the remaining-work push
+  // below: when the budget is already gone, naming what is left and stopping
+  // beats asking for more work there is no time to do.
   // (writeIntent is already true here — the top-of-function early return
   // handles !writeIntent — so it is not re-checked below, matching every
   // other branch past that point. The zero-write spiral abort above takes
@@ -658,6 +658,36 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
         `${Math.round(signal.stageRemainingMs / 1000)}s of stage budget left - ` +
         "ending with a clean partial that names the remaining work instead of " +
         "running to the timeout.",
+    };
+  }
+
+  // Writes landed but the TaskPlan ledger still has unverified items, and
+  // there is budget to keep going: push the executor onto the next item.
+  //
+  // This is where the ledger belongs. Once the first write lands, every other
+  // pressure mechanism has already switched itself off by design —
+  // `shouldPressWriteEffect` and the spiral reflexes above all require
+  // `successfulWrites === 0` — so without this branch a multi-item plan has
+  // nothing holding the executor open after item one. That is exactly how
+  // live run_7e6b590f ended 1-of-7 done. Injecting here sets `midLoopHeldOpen`
+  // in the executor loop, which is the mechanism that actually keeps it
+  // working; the quality push is left free to fire on its own terms.
+  if (
+    signal.successfulWrites > 0 &&
+    (signal.planItemsRemaining ?? 0) > 0
+  ) {
+    const remaining = signal.planItemsRemaining ?? 0;
+    const activeItem = signal.activePlanItem
+      ? ` The active item is: ${signal.activePlanItem}.`
+      : "";
+    return {
+      kind: "inject",
+      note:
+        `${remaining} plan item(s) are still unverified — this turn is not done.` +
+        `${activeItem} A landed write is progress on ONE item, not completion ` +
+        "of the plan. Continue with the next unverified item now: make its " +
+        "change with edit_file/write_file, then move to the one after it. " +
+        "Do not summarise or stop while items remain and budget is left.",
     };
   }
 

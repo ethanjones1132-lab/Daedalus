@@ -3,40 +3,61 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 /**
- * Task C2 wired `planItemsTotal`/`planItemsRemaining` into both
- * `assessCorrectnessFloor(` call sites in pipeline.ts (the mid-loop `base`
- * signal, and the Slice D quality-push gate). The unit tests in
- * mid-loop-intervention.test.ts only prove the pure function is correct
- * given a hand-built signal — they say nothing about whether production
- * code actually populates that signal. This is a crude but real tripwire:
- * if either call site's field-forwarding is silently deleted in a future
- * edit, this test fails instead of the regression going unnoticed.
+ * The TaskPlan ledger has exactly one correct home in pipeline.ts, and one
+ * place it must never go back to.
+ *
+ * IT BELONGS in the `buildMidLoopSignal` `base` object: that signal feeds
+ * `decideMidLoopIntervention`, whose remaining-work reflex injects the
+ * "N items still unverified" push that holds the executor open, and whose
+ * budget guard converts an unfinishable remainder into a named partial.
+ *
+ * IT MUST NOT go into the Slice D `assessCorrectnessFloor(` gate. That gate
+ * asks "is correctness met so the quality push can unlock?" — a `false` there
+ * REMOVES supervision. Feeding it the ledger (2026-07-29, Tasks C1/C2)
+ * inverted the intent: a partially-drained ledger disabled the only pressure
+ * still active after the first write. Live run_da68c50b (5 of 6 items
+ * outstanding) issued zero quality pushes where pre-change run_7e6b590f
+ * issued two. Task C3 moved the ledger out of the floor and into its own
+ * reflex.
+ *
+ * The pure-function tests in mid-loop-intervention.test.ts prove the reflex
+ * behaves correctly given a hand-built signal; they say nothing about whether
+ * production code populates that signal, or about where it must not be
+ * populated. This crude source tripwire covers both directions.
  */
-describe("assessCorrectnessFloor call sites stay wired to the TaskPlan ledger", () => {
-  test("every assessCorrectnessFloor( call site in pipeline.ts forwards planItemsTotal/planItemsRemaining", () => {
-    const source = readFileSync(join(import.meta.dir, "pipeline.ts"), "utf8");
-    const lines = source.split("\n");
+describe("TaskPlan ledger stays wired to the mid-loop signal, not the correctness floor", () => {
+  const source = readFileSync(join(import.meta.dir, "pipeline.ts"), "utf8");
+  const lines = source.split("\n");
+
+  test("the mid-loop base signal still forwards planItemsTotal/planItemsRemaining", () => {
+    const baseSignalIdx = lines.findIndex((line) =>
+      line.includes("const base: MidLoopSignal = {"),
+    );
+    expect(baseSignalIdx).toBeGreaterThan(-1);
+
+    // The object literal runs for a few dozen lines after its opening.
+    const window = lines.slice(baseSignalIdx, baseSignalIdx + 40).join("\n");
+    expect(window).toContain("planItemsTotal");
+    expect(window).toContain("planItemsRemaining");
+  });
+
+  test("no assessCorrectnessFloor( call site forwards the ledger", () => {
     const callSiteLines: number[] = [];
     lines.forEach((line, i) => {
       if (line.includes("assessCorrectnessFloor(")) callSiteLines.push(i);
     });
-
-    // Two known call sites: the buildMidLoopSignal `base` object, and the
-    // Slice D quality-push gate. If a future edit adds a third, this still
-    // enforces the invariant on it — the loop below checks every site found.
-    expect(callSiteLines.length).toBeGreaterThanOrEqual(2);
+    expect(callSiteLines.length).toBeGreaterThanOrEqual(1);
 
     for (const lineIdx of callSiteLines) {
-      // Some call sites pass a named signal variable (e.g. `assessCorrectnessFloor(base)`)
-      // whose object literal — and the two ledger fields — is built a few
-      // dozen lines ABOVE the call, not after it. Others pass an inline
-      // object literal, where the fields appear a few lines AFTER the call.
-      // Look both directions so either shape is covered by the same crude check.
-      const windowStart = Math.max(0, lineIdx - 30);
-      const windowEnd = lineIdx + 20;
-      const window = lines.slice(windowStart, windowEnd).join("\n");
-      expect(window).toContain("planItemsTotal");
-      expect(window).toContain("planItemsRemaining");
+      // Only look FORWARD: an inline object literal passed to the floor starts
+      // on the call line. Looking backward would pick up the unrelated `base`
+      // literal above and produce a false failure.
+      const literal = lines.slice(lineIdx, lineIdx + 20).join("\n");
+      // A bare `assessCorrectnessFloor(base)`-style call passes a variable and
+      // has no literal of its own to inspect; the check below is a no-op for
+      // those, and meaningful for the inline-literal sites.
+      expect(literal).not.toContain("planItemsTotal:");
+      expect(literal).not.toContain("planItemsRemaining:");
     }
   });
 });

@@ -2715,16 +2715,13 @@ export class PipelineExecutor {
                     command: this.lastCheckResult.command,
                   }
                 : undefined,
-              // TaskPlan ledger drives the plan-aware correctness floor (Task C1).
-              // This is the second call site of assessCorrectnessFloor in this
-              // method (Task C2 follow-up) — without these fields the Slice D
-              // quality gate treated a single write as "correctness met" even
-              // with plan items still unverified, pushing the executor toward
-              // polish instead of the remaining plan work.
-              planItemsTotal: options.taskRunContract?.plan?.items.length,
-              planItemsRemaining: options.taskRunContract?.plan?.items.filter(
-                (item) => item.status !== "verified",
-              ).length,
+              // The TaskPlan ledger is deliberately NOT passed here. This gate
+              // asks "is correctness met so we can unlock the quality push?",
+              // so feeding it the ledger made outstanding items SUPPRESS the
+              // push rather than demand more work (2026-07-29 inversion; see
+              // assessCorrectnessFloor). Remaining items are handled by the
+              // dedicated inject reflex in decideMidLoopIntervention, which
+              // holds the executor open instead of closing this gate.
             })
           ) {
             onStateChange({ stage: "executor", status: "running", detail: "mid_loop_quality_gate" });

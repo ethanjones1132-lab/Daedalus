@@ -428,49 +428,104 @@ describe("buildMidLoopToolEvidence", () => {
   });
 });
 
-describe("correctness floor is plan-aware", () => {
+describe("correctness floor stays about the work attempted, not the plan", () => {
   const base = {
     writeIntent: true,
     successfulWrites: 1,
     verification: undefined,
   };
 
-  test("one write does not satisfy a seven-item plan", () => {
+  // 2026-07-29 inversion incident: the floor was made ledger-aware, but its
+  // ONLY consumers (shouldRunQualityPhase, and the Slice D gate in
+  // pipeline.ts) read it as "correctness met -> now unlock the quality push".
+  // Returning false for a partially-drained ledger therefore SUPPRESSED
+  // supervision on exactly the turns that needed it most: live run_da68c50b
+  // (5 of 6 items outstanding) issued zero quality pushes, where pre-change
+  // run_7e6b590f had issued two. The ledger belongs in its own reflex that
+  // ADDS pressure — see "outstanding plan items add supervision pressure".
+  test("a partially-drained ledger does not lower the floor", () => {
     expect(assessCorrectnessFloor({
       ...base,
       planItemsTotal: 7,
       planItemsRemaining: 6,
-    })).toBe(false);
-  });
-
-  test("floor is met when no plan items remain", () => {
-    expect(assessCorrectnessFloor({
-      ...base,
-      planItemsTotal: 7,
-      planItemsRemaining: 0,
     })).toBe(true);
   });
 
-  test("with no ledger the legacy one-write floor still applies", () => {
+  test("with no ledger the one-write floor applies", () => {
     expect(assessCorrectnessFloor(base)).toBe(true);
   });
 
-  test("zero writes never meets the floor regardless of ledger", () => {
-    expect(assessCorrectnessFloor({
-      ...base,
-      successfulWrites: 0,
-      planItemsTotal: 7,
-      planItemsRemaining: 0,
-    })).toBe(false);
+  test("zero writes never meets the floor", () => {
+    expect(assessCorrectnessFloor({ ...base, successfulWrites: 0 })).toBe(false);
   });
 
   test("a red verification still fails the floor", () => {
     expect(assessCorrectnessFloor({
       ...base,
-      planItemsTotal: 1,
-      planItemsRemaining: 0,
       verification: { tier: "builtin", ran: true, passed: false },
     })).toBe(false);
+  });
+});
+
+describe("outstanding plan items add supervision pressure", () => {
+  const worked = (over: Partial<MidLoopSignal> = {}): MidLoopSignal => ({
+    writeIntent: true,
+    successfulWrites: 1,
+    distinctSuccessfulReads: 4,
+    turnCount: 7,
+    maxTurns: 14,
+    stageRemainingMs: 300_000,
+    deadToolSuppressed: false,
+    writeLandedSinceLastCheck: true,
+    qualityPushesUsed: 0,
+    qualityPushBudget: 2,
+    ...over,
+  } as MidLoopSignal);
+
+  // The property the 2026-07-29 inversion violated, stated directly: a turn
+  // with work still outstanding must never receive LESS supervision than the
+  // same turn with the ledger fully drained.
+  test("a remaining ledger never yields less supervision than a drained one", () => {
+    const remaining = worked({ planItemsTotal: 6, planItemsRemaining: 5 });
+    const drained = worked({ planItemsTotal: 6, planItemsRemaining: 0 });
+    const supervised = (s: MidLoopSignal) =>
+      decideMidLoopIntervention(s).kind !== "continue" || shouldRunQualityPhase(s);
+    expect(supervised(remaining)).toBe(true);
+    expect(supervised(drained)).toBe(true);
+  });
+
+  test("remaining items inject a directive naming what is left", () => {
+    const decision = decideMidLoopIntervention(
+      worked({ planItemsTotal: 6, planItemsRemaining: 5 }),
+    );
+    expect(decision.kind).toBe("inject");
+    expect((decision as { note: string }).note).toContain("5");
+  });
+
+  test("a drained ledger does not inject remaining-work pressure", () => {
+    const decision = decideMidLoopIntervention(
+      worked({ planItemsTotal: 6, planItemsRemaining: 0 }),
+    );
+    expect(decision.kind).toBe("continue");
+  });
+
+  test("no ledger keeps the legacy behaviour", () => {
+    expect(decideMidLoopIntervention(worked()).kind).toBe("continue");
+  });
+
+  test("the quality phase still unlocks while items remain", () => {
+    // The regression: this returned false, so the Slice D gate never ran.
+    expect(shouldRunQualityPhase(
+      worked({ planItemsTotal: 6, planItemsRemaining: 5 }),
+    )).toBe(true);
+  });
+
+  test("remaining items do not push once the budget is nearly gone", () => {
+    // The C2 budget guard owns that case and aborts with a named partial.
+    const decision = decideMidLoopIntervention(
+      worked({ planItemsTotal: 6, planItemsRemaining: 5, stageRemainingMs: 20_000 }),
+    );
+    expect(decision.kind).toBe("abort");
   });
 });
 
