@@ -768,4 +768,12 @@ describe("retrospective questions are not execution orders", () => {
   ])("%p is still an execution order", (message) => {
     expect(classifyTurnRequirements(message).requirement).toBe("full_execution");
   });
+
+  test.each([
+    "why is the build failing, please fix it",
+    "what is the plan, implement it now",
+    "how is the module structured, refactor it to be cleaner",
+  ])("%p (comma-joined order) is still an execution order", (message) => {
+    expect(classifyTurnRequirements(message).requirement).toBe("full_execution");
+  });
 });

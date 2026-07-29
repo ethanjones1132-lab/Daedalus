@@ -393,7 +393,28 @@ const WEAK_WORKSPACE =
 // refer back to an actor/subject with an auxiliary verb — "did you", "was
 // your", "have you" — which is the shape of asking about the past.
 const RETROSPECTIVE_QUESTION =
-  /^(?:so|and|but|ok|okay|hey|hmm|wait|also|quick\s+q(?:uestion)?)?[,.!\s]*\b(?:what|why|how|when|which|who|whose)\b[^.?!]{0,140}?\b(?:did|do|does|are|were|was|is|have|has|had|would|should|could)\s+(?:you|your|we|our|it|that|this|the)\b/i;
+  /^(?:so|and|but|ok|okay|hey|hmm|wait|also|quick\s+q(?:uestion)?)?[,.!\s]*\b(?:what|why|how|when|which|who|whose)\b[^.?!,]{0,140}?\b(?:did|do|does|are|were|was|is|have|has|had|would|should|could)\s+(?:you|your|we|our|it|that|this|the)\b/i;
+
+// A retrospective question can be comma-joined to a genuine execution order
+// ("why is the build failing, please fix it" / "what is the plan, implement
+// it now"). Excluding the comma from RETROSPECTIVE_QUESTION's lazy span (above)
+// only stops matches that would otherwise SPAN the comma — but the aux+subject
+// shape ("is the ...") is satisfied with a zero-length span immediately after
+// the wh-word, so the match completes entirely inside the pre-comma clause and
+// never needs to cross the comma at all. The comma exclusion alone is a no-op
+// for this shape. The actual distinguishing signal: an unnegated mutation verb
+// in the clause AFTER the comma is a separate imperative, not part of the
+// question, and must not be swallowed by the retrospective demotion.
+function hasTrailingMutationOrderAfterComma(text: string): boolean {
+  const commaIndex = text.indexOf(",");
+  if (commaIndex === -1) return false;
+  const tail = text.slice(commaIndex + 1);
+  for (const match of tail.matchAll(MUTATION_VERB)) {
+    const globalIndex = commaIndex + 1 + (match.index ?? 0);
+    if (!isNegatedMutation(text, globalIndex)) return true;
+  }
+  return false;
+}
 
 /**
  * Classify the raw current user message into the capability class the turn
@@ -457,7 +478,7 @@ export function classifyTurnRequirements(message: string): TurnRequirementResult
   // Retrospective questions are answered, not executed. Checked before the
   // mutation branch because their verb ("implementing", "change") is exactly
   // what would otherwise grant execution authority.
-  if (RETROSPECTIVE_QUESTION.test(intentText)) {
+  if (RETROSPECTIVE_QUESTION.test(intentText) && !hasTrailingMutationOrderAfterComma(intentText)) {
     signals.push("retrospective_question");
     return {
       requirement: pathSignal || hasStrongWorkspace ? "workspace_read" : "answer_only",
