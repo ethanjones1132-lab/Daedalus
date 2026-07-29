@@ -284,7 +284,10 @@ export function shouldRunMidLoopCheck(input: {
 /**
  * Correctness floor (Slice D): write intent has a successful mutation and
  * verification is not red. Green checks or tier=none both clear the floor;
- * only an executed failing check blocks it.
+ * only an executed failing check blocks it. When a TaskPlan ledger is present
+ * (`planItemsTotal` set) and items remain (`planItemsRemaining` > 0), the
+ * floor also requires the ledger to be drained — a single write no longer
+ * satisfies a multi-item plan on its own.
  */
 export function assessCorrectnessFloor(signal: Pick<
   MidLoopSignal,

@@ -14,7 +14,6 @@ import {
   shouldRunMidLoopCheck,
   shouldRunQualityPhase,
 } from "./mid-loop-intervention";
-import type { MidLoopSignal } from "./mid-loop-intervention";
 
 const base = {
   writeIntent: true,
