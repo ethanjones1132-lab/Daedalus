@@ -642,8 +642,12 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
   // not run to the stage timeout. Pairs with the plan-aware correctness floor
   // (Task C1, assessCorrectnessFloor): raising the completion bar must not
   // convert partial success into a timeout.
+  // (writeIntent is already true here — the top-of-function early return
+  // handles !writeIntent — so it is not re-checked below, matching every
+  // other branch past that point. The zero-write spiral abort above takes
+  // priority when both predicates are true simultaneously: both are
+  // early-returns and the spiral branch comes first.)
   if (
-    signal.writeIntent &&
     (signal.planItemsRemaining ?? 0) > 0 &&
     signal.stageRemainingMs <= ABORT_BUDGET_FLOOR_MS
   ) {
