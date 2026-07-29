@@ -188,7 +188,10 @@ export class DelegateHealth {
   strike(reason: DelegateHealthStrikeReason): void {
     this.strikes += 1;
     this.lastReason = reason;
-    this.cooldownUntil = this.now() + DELEGATE_HEALTH_COOLDOWN_MS;
+    const cooldownMinutes = Math.max(0, this.strikes - 2);
+    this.cooldownUntil = cooldownMinutes === 0
+      ? 0
+      : this.now() + cooldownMinutes * DELEGATE_HEALTH_COOLDOWN_MS;
   }
 
   markHealthy(): void {

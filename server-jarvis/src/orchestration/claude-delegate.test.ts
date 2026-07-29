@@ -383,23 +383,59 @@ describe("Claude executor delegate", () => {
     expect(isPermittedDelegateTool("Task", "task", stock, canonical)).toBe(false);
   });
 
-  test("cools down for ten minutes after delegate integrity strikes", () => {
+  test("keeps the first two strikes available and escalates later cooldowns", () => {
     let now = 1_000;
     const health = new DelegateHealth(() => now);
     expect(health.isAvailable()).toBe(true);
     health.strike("unverified_write");
     expect(health.snapshot()).toEqual({
       strikes: 1,
-      cooldownUntil: 601_000,
+      cooldownUntil: 0,
       lastReason: "unverified_write",
     });
-    expect(health.isAvailable()).toBe(false);
-    now = 600_999;
-    expect(health.isAvailable()).toBe(false);
-    now = 601_000;
     expect(health.isAvailable()).toBe(true);
+
+    now = 2_000;
+    health.strike("timeout_without_write");
+    expect(health.snapshot()).toEqual({
+      strikes: 2,
+      cooldownUntil: 0,
+      lastReason: "timeout_without_write",
+    });
+    expect(health.isAvailable()).toBe(true);
+
+    now = 3_000;
+    health.strike("spawn_error");
+    expect(health.snapshot()).toEqual({
+      strikes: 3,
+      cooldownUntil: 603_000,
+      lastReason: "spawn_error",
+    });
+    expect(health.isAvailable()).toBe(false);
+    now = 602_999;
+    expect(health.isAvailable()).toBe(false);
+    now = 603_000;
+    expect(health.isAvailable()).toBe(true);
+
+    now = 4_000;
+    health.strike("no_event_exit");
+    expect(health.snapshot()).toEqual({
+      strikes: 4,
+      cooldownUntil: 1_204_000,
+      lastReason: "no_event_exit",
+    });
+
+    now = 5_000;
+    health.strike("termination_unconfirmed");
+    expect(health.snapshot()).toEqual({
+      strikes: 5,
+      cooldownUntil: 1_805_000,
+      lastReason: "termination_unconfirmed",
+    });
+
     health.markHealthy();
-    expect(health.snapshot().strikes).toBe(0);
+    expect(health.snapshot()).toEqual({ strikes: 0, cooldownUntil: 0 });
+    expect(health.isAvailable()).toBe(true);
   });
 
   test("availability caches for five minutes and requires port 19878 in proxy mode", async () => {
