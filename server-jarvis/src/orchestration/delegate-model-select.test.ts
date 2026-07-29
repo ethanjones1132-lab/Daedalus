@@ -141,4 +141,23 @@ describe("delegate only selects models the claude_cli proxy can resolve", () => 
         .toEqual({ model, namespaced: true });
     }
   });
+
+  test("a custom goOpenaiModels list is honored by free-pool resolvability, not the module default", () => {
+    // "custom-bare-model" is NOT namespaced, NOT installed in Ollama, and NOT
+    // in the module-level DELEGATE_GO_OPENAI_MODELS default -- it only
+    // resolves if selectDelegateModel's OWN resolved `goOpenai` (from
+    // input.goOpenaiModels) is what gets passed into isProxyResolvable for
+    // the free-pool filter, rather than isProxyResolvable falling back to
+    // its own default parameter.
+    const result = selectDelegateModel({
+      configuredModel: "auto",
+      thrashCount: 0,
+      freeModels: ["custom-bare-model"],
+      goOpenaiModels: ["custom-bare-model"], // NOT in DELEGATE_GO_OPENAI_MODELS
+      installedOllamaModels: [],
+    });
+    expect(result.model).toBe("custom-bare-model");
+    expect(result.pool).toBe("free");
+    expect(result.reason).toBe("free_first");
+  });
 });

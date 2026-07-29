@@ -144,10 +144,10 @@ export function selectDelegateModel(input: {
 }): DelegateModelSelection {
   const threshold = input.thrashThreshold ?? DEFAULT_FREE_THRASH_THRESHOLD;
   const free = input.freeModels ?? DELEGATE_FREE_FIRST_MODELS;
-  const installed = input.installedOllamaModels ?? [];
-  const resolvableFree = free.filter((model) => isProxyResolvable(model, installed));
   const goOpenai = input.goOpenaiModels ?? DELEGATE_GO_OPENAI_MODELS;
   const goAnthropic = input.goAnthropicModels ?? DELEGATE_GO_ANTHROPIC_MODELS;
+  const installed = input.installedOllamaModels ?? [];
+  const resolvableFree = free.filter((model) => isProxyResolvable(model, installed, goOpenai));
   const proxyOk = input.proxyAvailable !== false;
   const goKey = input.hasOpenCodeGoKey !== false;
   const configured = input.configuredModel.trim();
