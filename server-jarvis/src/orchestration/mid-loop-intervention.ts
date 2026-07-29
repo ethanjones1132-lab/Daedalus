@@ -695,8 +695,9 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
     };
   }
 
-  // Writes landed but the TaskPlan ledger still has unverified items, and
-  // there is budget to keep going: push the executor onto the next item.
+  // The TaskPlan ledger still has unverified items, and there is budget to
+  // keep going: push the executor onto the next item, even before the first
+  // successful write lands.
   //
   // This is where the ledger belongs. Once the first write lands, every other
   // pressure mechanism has already switched itself off by design —
@@ -707,19 +708,21 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
   // in the executor loop, which is the mechanism that actually keeps it
   // working; the quality push is left free to fire on its own terms.
   if (
-    signal.successfulWrites > 0 &&
     (signal.planItemsRemaining ?? 0) > 0
   ) {
     const remaining = signal.planItemsRemaining ?? 0;
     const activeItem = signal.activePlanItem
       ? ` The active item is: ${signal.activePlanItem}.`
       : "";
+    const progress = signal.successfulWrites > 0
+      ? "A landed write is progress on ONE item, not completion of the plan."
+      : "No successful write has landed yet; start by making the current item's change.";
     return {
       kind: "inject",
       note:
         `${remaining} plan item(s) are still unverified — this turn is not done.` +
-        `${activeItem} A landed write is progress on ONE item, not completion ` +
-        "of the plan. Continue with the next unverified item now: make its " +
+        `${activeItem} ${progress} ` +
+        "Continue with the next unverified item now: make its " +
         "change with edit_file/write_file, then move to the one after it. " +
         "Do not summarise or stop while items remain and budget is left.",
     };

@@ -538,6 +538,17 @@ describe("outstanding plan items add supervision pressure", () => {
     );
     expect(decision.kind).toBe("inject");
     expect((decision as { note: string }).note).toContain("5");
+    expect((decision as { note: string }).note).toContain("A landed write is progress");
+  });
+
+  test("remaining items inject before the first successful write", () => {
+    const decision = decideMidLoopIntervention(
+      worked({ successfulWrites: 0, writeLandedSinceLastCheck: false, planItemsTotal: 6, planItemsRemaining: 5 }),
+    );
+    expect(decision.kind).toBe("inject");
+    const note = (decision as { note: string }).note;
+    expect(note).toContain("No successful write has landed yet");
+    expect(note).not.toContain("A landed write is progress");
   });
 
   test("a drained ledger does not inject remaining-work pressure", () => {
