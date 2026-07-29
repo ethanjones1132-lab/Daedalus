@@ -638,6 +638,25 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
     };
   }
 
+  // A plan remainder we cannot possibly finish should end as a NAMED partial,
+  // not run to the stage timeout. Pairs with the plan-aware correctness floor
+  // (Task C1, assessCorrectnessFloor): raising the completion bar must not
+  // convert partial success into a timeout.
+  if (
+    signal.writeIntent &&
+    (signal.planItemsRemaining ?? 0) > 0 &&
+    signal.stageRemainingMs <= ABORT_BUDGET_FLOOR_MS
+  ) {
+    return {
+      kind: "abort",
+      reason:
+        `${signal.planItemsRemaining} plan item(s) still unverified with only ` +
+        `${Math.round(signal.stageRemainingMs / 1000)}s of stage budget left - ` +
+        "ending with a clean partial that names the remaining work instead of " +
+        "running to the timeout.",
+    };
+  }
+
   return { kind: "continue" };
 }
 

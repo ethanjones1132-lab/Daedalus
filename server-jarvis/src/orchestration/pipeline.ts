@@ -1547,6 +1547,11 @@ export class PipelineExecutor {
               // Lets the reflex escalate its wording instead of repeating a
               // note the executor has already ignored (2026-07-26).
               forceWriteNudgesSent: writeEffectNudgeCount,
+              // TaskPlan ledger drives the plan-aware correctness floor (Task C1).
+              planItemsTotal: options.taskRunContract?.plan?.items.length,
+              planItemsRemaining: options.taskRunContract?.plan?.items.filter(
+                (item) => item.status !== "verified",
+              ).length,
               ...evidence,
             };
       // Slice D phase label for prompts / resident schema.

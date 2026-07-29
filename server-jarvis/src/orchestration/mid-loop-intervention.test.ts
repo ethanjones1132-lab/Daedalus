@@ -13,6 +13,7 @@ import {
   resolveResidentMidLoopDirective,
   shouldRunMidLoopCheck,
   shouldRunQualityPhase,
+  type MidLoopSignal,
 } from "./mid-loop-intervention";
 
 const base = {
@@ -470,5 +471,29 @@ describe("correctness floor is plan-aware", () => {
       planItemsRemaining: 0,
       verification: { tier: "builtin", ran: true, passed: false },
     })).toBe(false);
+  });
+});
+
+describe("plan remainder respects the stage budget", () => {
+  const spiral = {
+    writeIntent: true,
+    successfulWrites: 2,
+    distinctSuccessfulReads: 3,
+    turnCount: 6,
+    maxTurns: 14,
+    deadToolSuppressed: false,
+    planItemsTotal: 7,
+    planItemsRemaining: 5,
+  } as MidLoopSignal;
+
+  test("plenty of budget left keeps pushing for the remaining items", () => {
+    const decision = decideMidLoopIntervention({ ...spiral, stageRemainingMs: 400_000 });
+    expect(decision.kind).not.toBe("abort");
+  });
+
+  test("budget too low for the remainder ends with an honest partial", () => {
+    const decision = decideMidLoopIntervention({ ...spiral, stageRemainingMs: 20_000 });
+    expect(decision.kind).toBe("abort");
+    expect((decision as { reason: string }).reason).toContain("5");
   });
 });
