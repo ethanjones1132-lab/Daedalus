@@ -281,11 +281,12 @@ const FREE_ZEN_MODEL_IDS = new Set([
   "hy3-free",
 ]);
 
-/** User capacity policy: free OpenRouter + free Zen, then Go, then paid tail. */
+/** User capacity policy: free OpenRouter + free Zen + local Ollama, then Go, then paid tail. */
 export function orchestrationRoutingTier(agent: OrchestratorAgent): number {
   if (agent.billing_tier === "free") return 0;
   if (agent.billing_tier === "go") return 1;
   if (
+    agent.provider === "ollama" ||
     (agent.provider === "openrouter" && (agent.model_id === "openrouter/free" || agent.model_id.endsWith(":free"))) ||
     (agent.provider === "opencode_zen" && (FREE_ZEN_MODEL_IDS.has(agent.model_id) || agent.model_id.endsWith("-free")))
   ) {

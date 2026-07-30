@@ -4,6 +4,7 @@ import {
   DEFAULT_ORCHESTRATOR_AGENTS,
   firstTokenTimeoutFor,
   formatPoolDiversity,
+  orchestrationRoutingTier,
   type OrchestratorAgent,
 } from "./agent-pool";
 import { getLearnedPoolState } from "../self-tuning/learned-pool-state";
@@ -1032,7 +1033,13 @@ describe("raceCandidates", () => {
       },
       {
         id: "weak",
-        provider: "ollama",
+        // Same tier as "strong" (both non-free openrouter) is the point:
+        // this pins the floor filter specifically, not the tier filter.
+        // (Pre-2026-07-29 this fixture used provider "ollama" for "weak",
+        // which incidentally relied on ollama being the tier-3 catch-all —
+        // that coupling broke when ollama was promoted to tier 0 alongside
+        // free lanes, since local models have no cost or rate limit either.)
+        provider: "openrouter",
         model_id: "weak",
         capabilities: { code: 0.3, reasoning: 0.4, speed: 0.4, cost: 1, json_reliability: 0.4 },
         default_for: [],
@@ -1040,8 +1047,8 @@ describe("raceCandidates", () => {
       },
     ]);
     const candidates = pool.raceCandidates("planner", "general");
-    // Only the strong openrouter lane clears the floor; the ollama
-    // lane is excluded by the floor, leaving a single-element list.
+    // Only the strong lane clears the floor; the weak lane (same tier)
+    // is excluded by the floor, leaving a single-element list.
     const ids = candidates.map((a) => a.id);
     expect(ids).toContain("strong");
     expect(ids).not.toContain("weak");
@@ -1056,5 +1063,66 @@ describe("raceCandidates", () => {
       DEFAULT_ORCHESTRATOR_AGENTS.map((agent) => ({ ...agent, enabled: false })),
     );
     expect(pool.raceCandidates("planner", "refactor")).toEqual([]);
+  });
+});
+
+describe("orchestrationRoutingTier — local ollama lane", () => {
+  test("an ollama-provider agent is tier 0 (free + no rate limit), not the tier-3 catch-all", () => {
+    // 2026-07-29 live incident: `local-qwythos-reviewer` (provider "ollama")
+    // was added to the live pool with `default_for: ["reviewer"]`, but
+    // orchestrationRoutingTier had no branch for "ollama" — it fell through
+    // to the final `return 3` catch-all, below free (0), opencode_go (1),
+    // and even paid openrouter/zen (2). Since the pool always has several
+    // enabled tier-0 free agents, `activeTier` in `pickFor` was always 0 and
+    // `tierCandidates` excluded the ollama agent entirely — the pin could
+    // never be selected. Confirmed live via `server-jarvis.log`: the
+    // reviewer stage resolved to `zen-deepseek-v4-flash-free` post-restart,
+    // never the local agent. A local model costs nothing and has no
+    // provider queue, so it belongs in tier 0 alongside remote free lanes.
+    const localAgent: OrchestratorAgent = {
+      id: "local-test",
+      provider: "ollama",
+      model_id: "some-local-model:latest",
+      capabilities: { code: 0.7, reasoning: 0.7, speed: 0.9, cost: 1, json_reliability: 0.75 },
+      default_for: [],
+      enabled: true,
+    };
+    expect(orchestrationRoutingTier(localAgent)).toBe(0);
+  });
+
+  test("an ollama default_for pin is actually selected alongside enabled remote free-tier agents", () => {
+    // Direct regression pin for the live incident above: with a mixed pool
+    // of remote free-tier agents (no stage pin) and one local ollama agent
+    // pinned to "reviewer", pickFor must return the local agent — not silently
+    // exclude it because it landed in a lower-priority tier than the remote
+    // free lanes.
+    const pool = new AgentPool([
+      {
+        id: "zen-deepseek-v4-flash-free",
+        provider: "opencode_zen",
+        model_id: "deepseek-v4-flash-free",
+        capabilities: { code: 0.9, reasoning: 0.86, speed: 0.82, cost: 1, json_reliability: 0.9 },
+        default_for: [],
+        enabled: true,
+      },
+      {
+        id: "or-openrouter-free",
+        provider: "openrouter",
+        model_id: "openrouter/free",
+        capabilities: { code: 0.55, reasoning: 0.65, speed: 0.8, cost: 1, json_reliability: 0.72 },
+        default_for: [],
+        enabled: true,
+      },
+      {
+        id: "local-qwythos-reviewer",
+        provider: "ollama",
+        model_id: "qwythos9b-conductor:latest",
+        capabilities: { code: 0.65, reasoning: 0.7, speed: 0.9, cost: 1, json_reliability: 0.75 },
+        default_for: ["reviewer"],
+        enabled: true,
+      },
+    ]);
+    const picked = pool.pickFor("reviewer", "general");
+    expect(picked?.id).toBe("local-qwythos-reviewer");
   });
 });

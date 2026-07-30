@@ -23,7 +23,7 @@ import { Database } from "bun:sqlite";
 import { buildLearningPrompt, buildReviewPrompt, buildCodebaseAuditPrompt, buildFootballAuditPrompt } from "./cron-prompts";
 import { createLifecycleService } from "./agent-lifecycle";
 import { handleAgentRequest } from "./agent-routes";
-import { effectiveOllamaUrl, checkOllamaHealth, checkOllamaModelSupportsTools, resolveWindowsHostIP, selectInstalledOllamaModel } from "./ollama";
+import { effectiveOllamaUrl, checkOllamaHealth, checkOllamaModelSupportsTools, resolveWindowsHostIP, resolveDesiredOllamaModel } from "./ollama";
 import { buildClaudeCliChatArgs, streamClaudeCli, isClaudeCliAvailable, compactTurnHistoryForCli } from "./claude-cli";
 import { ReasoningParser, stripReasoningFromText, type ReasoningEvent } from "./reasoning";
 import {
@@ -856,8 +856,12 @@ interface CachedOllamaTarget {
 const ollamaTargetCache = new Map<string, CachedOllamaTarget>();
 const OLLAMA_TARGET_CACHE_TTL = 10000; // 10 seconds
 
-async function resolveOllamaChatTarget(cfg: JarvisConfig): Promise<{ chatUrl: string; modelName: string; tried: string[]; supportsNativeTools: boolean }> {
-  const cacheKey = cfg.ollama.model;
+async function resolveOllamaChatTarget(
+  cfg: JarvisConfig,
+  desiredModel?: string,
+): Promise<{ chatUrl: string; modelName: string; tried: string[]; supportsNativeTools: boolean }> {
+  const preferredModel = desiredModel ?? cfg.ollama.model;
+  const cacheKey = preferredModel;
   const now = Date.now();
   const cached = ollamaTargetCache.get(cacheKey);
   if (cached && (now - cached.timestamp) < OLLAMA_TARGET_CACHE_TTL) {
@@ -889,7 +893,7 @@ async function resolveOllamaChatTarget(cfg: JarvisConfig): Promise<{ chatUrl: st
         continue;
       }
 
-      const modelName = selectInstalledOllamaModel(cfg, models);
+      const modelName = resolveDesiredOllamaModel(desiredModel, cfg, models);
 
       // /api/tags doesn't report capabilities — query /api/show for the
       // resolved model to find out whether it supports native tool calls.
@@ -902,7 +906,7 @@ async function resolveOllamaChatTarget(cfg: JarvisConfig): Promise<{ chatUrl: st
         supportsNativeTools,
       };
 
-      if (equivalentOllamaModelName(modelName, cfg.ollama.model)) {
+      if (equivalentOllamaModelName(modelName, preferredModel)) {
         const result = { ...target, tried: [...tried] };
         ollamaTargetCache.set(cacheKey, { ...result, timestamp: now });
         return result;
@@ -923,7 +927,7 @@ async function resolveOllamaChatTarget(cfg: JarvisConfig): Promise<{ chatUrl: st
   const fallbackUrl = ollamaBaseUrlCandidates(cfg.ollama)[0] ?? "http://localhost:11434";
   const fallback = {
     chatUrl: `${fallbackUrl}/v1/chat/completions`,
-    modelName: cfg.ollama.model,
+    modelName: preferredModel,
     tried,
     supportsNativeTools: false,
   };
@@ -1772,7 +1776,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let poolModel: string | null = null;
           // Provider of the pool-selected agent. Drives endpoint + key routing
           // for the primary request (the fallback cascade routes per-attempt).
-          let poolProvider: "openrouter" | "opencode_zen" | "opencode_go" | null = null;
+          let poolProvider: "openrouter" | "opencode_zen" | "opencode_go" | "ollama" | null = null;
           let poolResolvedAgent: import("./orchestration/agent-pool").OrchestratorAgent | undefined;
           const stageLabel = callOptions?.stageLabel as string | undefined;
           const cascadeTier = callOptions?.cascadeTier as "cheap" | "strong" | undefined;
@@ -1818,7 +1822,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               } else {
                 agent = pool.pickFor(stageLabel, orchestratorTaskType, poolExcludeModels, modelSelection);
               }
-              if (agent && (agent.provider === "openrouter" || agent.provider === "opencode_zen" || agent.provider === "opencode_go")) {
+              if (agent && (agent.provider === "openrouter" || agent.provider === "opencode_zen" || agent.provider === "opencode_go" || agent.provider === "ollama")) {
                 poolModel = agent.model_id;
                 poolProvider = agent.provider;
                 poolResolvedAgent = agent;
@@ -1832,11 +1836,18 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const resolvedOpenRouterModel = cfg.active_backend === "openrouter"
             ? await resolveOpenRouterModel(cfg)
             : null;
-          const isOllama = activeBackendIsOllama && !poolProvider;
-          const ollamaTarget = isOllama ? await resolveOllamaChatTarget(cfg) : null;
+          // A pool-selected "ollama" agent (e.g. a local reviewer lane) pins
+          // this stage to ITS model_id, independent of the backend-wide
+          // active_backend setting — that's what lets a stage route to a
+          // local model even when the global default backend is openrouter.
+          const isPoolOllama = poolProvider === "ollama";
+          const isOllama = isPoolOllama || (activeBackendIsOllama && !poolProvider);
+          const ollamaTarget = isOllama
+            ? await resolveOllamaChatTarget(cfg, isPoolOllama ? poolModel ?? undefined : undefined)
+            : null;
 
           const modelName = isOllama
-            ? (ollamaTarget?.modelName ?? cfg.ollama.model)
+            ? (ollamaTarget?.modelName ?? (isPoolOllama ? poolModel! : cfg.ollama.model))
             : poolModel ?? resolvedOpenRouterModel ?? cfg.openrouter.model;
           // The effective provider for the PRIMARY request. OpenCode providers
           // speak OpenAI-compatible /chat/completions but live on their own

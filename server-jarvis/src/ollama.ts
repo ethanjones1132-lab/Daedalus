@@ -30,6 +30,22 @@ function installedMatch(installedModels: string[], candidate: string | undefined
   return installedModels.find((name) => equivalentModelName(name, candidate)) ?? null;
 }
 
+/**
+ * A pool-selected agent (provider "ollama") must be able to pin a single
+ * stage to ITS model_id rather than the backend-wide cfg.ollama.model
+ * default. Falls back to the normal cfg-driven selection when no desired
+ * model is given, or when the desired model isn't actually installed.
+ */
+export function resolveDesiredOllamaModel(
+  desiredModel: string | undefined,
+  cfg: JarvisConfig,
+  installedModels: string[],
+): string {
+  const match = installedMatch(installedModels, desiredModel);
+  if (match) return match;
+  return selectInstalledOllamaModel(cfg, installedModels);
+}
+
 export function selectInstalledOllamaModel(cfg: JarvisConfig, installedModels: string[]): string {
   const requested = cfg.ollama.model;
   const profiles = cfg.profiles ?? {};
