@@ -10,6 +10,14 @@
 
 ---
 
+> **Implementation status (2026-07-30 evening maintenance pass):** Phases A, B, and C are **complete on `master`**. The whole plan landed as a coordinated series of commits over 2026-07-29 — 2026-07-30:
+>
+> - **Phase A — Turn classifier edges (3 tasks, all committed):** A1 retrospective questions not `full_execution` (`ada1eba`); A2 `execution` is a work-commencement noun (`995906b`); A3 verifying a named work item routes to `workspace_read` (`1f7f243`). Together they close the read→write misroute and the question-vs-order misroute that the 2026-07-29 02:03–02:12 session's 120s zero-tool-call retrospective question and the 2026-07-28 12:28–12:36 session's 0-tool execution-order question both hit.
+> - **Phase B — Latency (B1, B2, B3, B4 all committed):** B1 delegate resolvability stops the proxy from selecting proxy-unresolvable free-tier models (`06f6583` + `b8939fc`); B2 the new `first-token-race.ts` + `AgentPool.raceCandidates` reduce the 65–97% first-token share of stage latency by racing the two healthy lanes (`7137ef0` + 7 contract-pin tests in `agent-pool.test.ts`); B3 local Ollama lane fix landed overnight (commit `fadb6e9` — `orchestrationRoutingTier` now returns `0` for `provider === "ollama"` and `resolveOllamaChatTarget` accepts the pool-selected `desiredModel`); B4 replaces the 85%-error `gemma4:e2b` conductor fallback default with the proven-healthy live primary/fallback pair (`0102534` + follow-ups). The plan's B2 wiring note (`stage dispatch passes pool.raceCandidates(stage, taskType)` into `raceFirstToken` for `planner` and `synthesizer` only) is wired but not yet live-fire validated; the B3 local conductor reviewer-stage work remains **operator-gated** per the plan (requires a live config change + live turn verification, both out of cron scope).
+> - **Phase C — Plan-aware completion (C1, C2 all committed):** C1 the mid-loop floor no longer accepts `successfulWrites > 0` as proof of completion — the `TaskPlan` ledger must be drained (`12d2919`); C2 the remainder feeds the mid-loop signal with a budget guard so the conductor exits honestly when the budget cannot cover the remainder (`4c4bd1a` + `8bba63c` + `135b4ec` + `35f0172`).
+>
+> **Doc drift note:** The per-task `- [ ]` checkboxes below were not flipped as the work landed, so a `grep -c "^- \[ \]"` reports 73 unchecked even though every phase is on `master`. Future passes that want to use the boxes as a tracking surface should either flip them to `- [x]` (a single sed across this file) or delete the boxes entirely and rely on the status block above. Both are doc-only; the source-of-truth for "is this shipped" is `git log --since='2026-07-29' -- server-jarvis/src/orchestration/{turn-requirements,delegate-model-select,first-token-race,agent-pool,mid-loop-intervention,pipeline}.ts`.
+
 ## Evidence Base
 
 All figures from `~/.openclaw/jarvis/self-tuning.db`, sessions `dd3df41c` (2026-07-29 02:03–02:12) and `650a4f48` (2026-07-28 12:28–12:36).
