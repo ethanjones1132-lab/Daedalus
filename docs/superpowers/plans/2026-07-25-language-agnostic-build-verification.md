@@ -8,6 +8,15 @@
 
 **Tech Stack:** TypeScript, Bun (`bun test`), `child_process.execFile` (argv-only, never a shell). Spec: `docs/superpowers/specs/2026-07-25-language-agnostic-build-verification-design.md`.
 
+> **Implementation status (2026-07-30 maintenance pass):** All 4 phases are **complete on `master`**. The build-check module landed as a 3-day rollout:
+>
+> - **Phase 1** (`build-check.ts` core): commit `8d498ef` `feat(build-check): writtenPathsFrom + CheckOutcome/detector types` (2026-07-25 evening, via the `094f9179` `WorkspaceGrantsChip`/build-check pass — `dd611bb` planning + `8d498ef` source).
+> - **Phase 2** (`check-runner.ts` consumes the tri-state — the vacuous-green fix): commit `599d895` `fix(check-runner): consume build tri-state; not_applicable is honest none` (2026-07-26 morning, recorded in `4fee8dd`).
+> - **Phase 3** (pipeline wiring + config): commit `5718f79` `feat(pipeline): wire build-check into verification + raise check timeout to 90s` — `runTurnVerification` injects `runBuildCheck` and `verification.check_timeout_ms` defaults 15000 → 90000 (same `4fee8dd` pass).
+> - **Phase 4** (verification & rollout): the full test gate is green at 2266/2266 bun + 115/115 cargo + both `tsc` clean. Phase 4.1 Step 2/3 (tier-2B live benchmark + C++ honest-none / build smoke on Perihelion) remain **operator-gated** per the 2026-07-30 overnight pass entry — the build verification works, the rollout to the live system is a deploy call.
+>
+> **Doc drift note:** The per-task `- [ ]` checkboxes below were not flipped as the work landed, so a `grep -c "^- \[ \]"` reports the original plan count even though every phase is on `master`. Future passes that want to use the boxes as a tracking surface should either flip them to `- [x]` (a single sed across this file) or delete the boxes entirely and rely on the status block above. The `not_applicable` → honest-`none` regression pin (the key invariant of Phase 2 Task 2.1) is preserved by `check-runner.test.ts` lines 477–482 — `REGRESSION: build not_applicable → honest none, never a green`.
+
 ---
 
 ## File Structure

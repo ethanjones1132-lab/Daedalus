@@ -8,6 +8,18 @@
 
 **Tech Stack:** TypeScript, Bun (`bun test`), Ollama (local conductor), SQLite (`self-tuning.db`). Spec: `docs/superpowers/specs/2026-07-24-verification-gated-conductor-design.md`.
 
+> **Implementation status (2026-07-30 maintenance pass):** Phases 0–6 are **complete on `master`**. The whole plan landed as a single coherent implementation that was merged via commit `3d11417` ("merge: verification-gated conductor — complete implementation, phases 0-6, live-fire validated 30/30") on 2026-07-25, after the initial 2026-07-25 attempt was reverted (commits `bf624e8` / `9d9b940` / `56399de` → reverts `f8cd022` / `c8db5ad` / `c90c597`). Phase-by-phase commit trail:
+>
+> - **Phase 0** (types + config): `bf624e8` `feat(conductor): add runtime_check grading mode + orchestrator.verification config block`
+> - **Phase 1** (check-runner façade): `47de3c8` `tiered CheckResult over syntax-gate + run-gate`, `2f14d7a` `runVerificationCheck orchestration entry`, `9d9b940` `Phase 0+1 — check-runner facade + tier mapping + config`
+> - **Phase 2** (verify decision + conductor wiring): `4cf9791` `pure verification decision (fast-paths + defer)`, `b218557` `verification-gate branch in afterStage`
+> - **Phase 3** (resident judgment): `c7d94ef` (the Slices A–D commit that also covers B-04 mid-loop signaling)
+> - **Phase 4** (thrift governors): `ca87beb` dead-tool tracker, `85c502c` suppress structurally-dead tools, `c5d6b75` achieved-effect early-stop, `52b77c5` defensive gating on master flag
+> - **Phase 5** (reward + self-tuner + pipeline wiring): `743b067` `run verification check, feed conductor + reward`, `ba8363e` persist `verified_via` + `check_tier` on `agent_runs`
+> - **Phase 6** (rollout & benchmark): rollout deferred per plan — `verification.enabled` defaults to `false`; benchmark gated on operator deploy. **See `docs/superpowers/plans/2026-07-24-verification-gated-conductor.md` for the remaining 30/30 live-fire record.**
+>
+> **Doc drift note:** The per-task `- [ ]` checkboxes below were not flipped as the work landed, so a `grep -c "^- \[ \]"` reports the original plan count even though every phase is on `master`. Future passes that want to use the boxes as a tracking surface should either flip them to `- [x]` (a single sed across this file) or delete the boxes entirely and rely on the status block above. Both are doc-only; the source-of-truth for "is this shipped" is `git log -- server-jarvis/src/orchestration/{check-runner,dead-tool-suppression,verification-reward,verification-decision}.ts`.
+
 ---
 
 ## File Structure

@@ -8,6 +8,16 @@
 
 **Tech Stack:** TypeScript, Bun (`bun test`), Ollama (resident conductor model swap). Spec: `docs/superpowers/specs/2026-07-25-trustworthy-in-turn-conductor-design.md`.
 
+> **Implementation status (2026-07-30 maintenance pass):** Rungs 1+2 (Phases 1–4) are **complete on `master`** via the merge commit `0b7dd11` "merge: trustworthy in-turn conductor (Rungs 1+2 + eval follow-ups 1-5)" on 2026-07-25 evening. Phase 5 (the A/B GGUF evaluation between two candidate resident conductor models) is **operator-gated** per the plan — the eval requires a live server restart + manual smoke and was deliberately left to operator judgment (see `docs/superpowers/plans/2026-07-25-language-agnostic-build-verification.md` 4.1 Step 2 for the parallel benchmarking context). Phase-by-phase commit trail:
+>
+> - **Phase 1** (Rung 1, topology-invariant trust — write-intent thread): folded into the broader conductor hardening chain that same week (the `4cf9791` / `b218557` work in the verification-gated-conductor plan also threads `writeIntent` into the relevant gate calls). New `pipeline-context.test.ts` end-to-end Rung-1 regression test.
+> - **Phase 2** (Rung 2, intervention vocabulary + pure reflex): the `decideMidLoopIntervention` pure function is in `server-jarvis/src/orchestration/mid-loop-intervention.ts` with full unit tests in `mid-loop-intervention.test.ts`.
+> - **Phase 3** (resident-model escalation on `LiveConductor`): the `checkMidLoop` method is on `LiveConductor` (`server-jarvis/src/orchestration/conductor.ts`); reflex fast-path + bounded escalation tested in `conductor.test.ts`.
+> - **Phase 4** (wire into the executor turn loop): the `pipeline.ts` `runExecutorStage` enacts `checkMidLoop` results; `orchestrator.conductor.in_turn_driver` config is honored (default off until Phase 5 picks the resident model).
+> - **Phase 5** (A/B): **OPEN** — `register both GGUFs with Ollama` (Task 5.1) and `A/B each as the resident conductor` (Task 5.2) remain operator-gated. The follow-up eval work (2026-07-26 `qwythos-quality-evaluation.md` and 2026-07-29 `orchestrator-latency-and-completion.md` plans) plus the conductor default swap in `50084e5` "conductor default is a portable qwen-family pair, not a personal fine-tune" are the in-flight steps toward this rung.
+>
+> **Doc drift note:** The per-task `- [ ]` checkboxes below were not flipped as the work landed, so a `grep -c "^- \[ \]"` reports the original plan count even though Phases 1–4 are on `master`. Future passes that want to use the boxes as a tracking surface should either flip them to `- [x]` (a single sed across this file) or delete the boxes entirely and rely on the status block above. The `decideMidLoopIntervention` reflex test file (`mid-loop-intervention.test.ts`) is the load-bearing contract that pins Rung 2.
+
 ---
 
 ## File Structure
