@@ -103,6 +103,26 @@ function renderToolCalls(toolCalls: ToolCallRecord[]): string {
     .join("\n\n");
 }
 
+/**
+ * The "no stage ran" strings the render helpers below emit. They are rendering
+ * placeholders, NOT content: anything that formats one into a model-facing
+ * instruction is telling the model to act on a null. `synth-context.ts` keeps
+ * its own (broader) SKIP_SENTINELS set for the synthesizer path; this one is
+ * scoped to exactly what the renderers here produce, which is what callers
+ * downstream of `renderPlanSummary` et al. actually receive.
+ */
+const STAGE_SUMMARY_PLACEHOLDERS: ReadonlySet<string> = new Set([
+  "No planning stage executed.",
+  "No execution stage executed.",
+  "No review stage executed.",
+  "No rewriting stage executed.",
+]);
+
+/** True when a rendered stage summary is a "stage did not run" placeholder. */
+export function isStageSummaryPlaceholder(summary: string | undefined): boolean {
+  return summary !== undefined && STAGE_SUMMARY_PLACEHOLDERS.has(summary.trim());
+}
+
 export function renderPlanSummary(stage: PlannerStageOutput | undefined): string {
   if (!stage) return "No planning stage executed.";
   return stage.narrative;

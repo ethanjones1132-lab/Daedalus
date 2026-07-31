@@ -1,3 +1,4 @@
+import { isStageSummaryPlaceholder } from "./stage-output";
 import type { ToolCallRecord } from "./stage-output";
 
 export type MidLoopDecisionSource =
@@ -713,7 +714,16 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
     (signal.planItemsRemaining ?? 0) > 0
   ) {
     const remaining = signal.planItemsRemaining ?? 0;
-    const activeItem = signal.activePlanItem
+    // 2026-07-31 (run_2c46d082): `activePlanItem` can be the stage-output
+    // placeholder ("No planning stage executed.") when a turn's conductor
+    // aborts into the deterministic route — no planner runs, but a PREVIOUS
+    // turn's ledger still reports items remaining. Naming that placeholder as
+    // "the active item" hands the model a null to act on; it was injected 56x
+    // byte-identical and 28 of 37 executor turns produced no tool call. Same
+    // failure shape as the 2026-07-26 read-spiral note (see buildReadSpiralNote
+    // below). Supervision is preserved — only the unactionable clause is
+    // dropped, so the branch still injects.
+    const activeItem = signal.activePlanItem && !isStageSummaryPlaceholder(signal.activePlanItem)
       ? ` The active item is: ${signal.activePlanItem}.`
       : "";
     const progress = signal.successfulWrites > 0

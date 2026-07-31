@@ -576,6 +576,66 @@ describe("outstanding plan items add supervision pressure", () => {
     );
     expect(decision.kind).toBe("abort");
   });
+
+  // 2026-07-31 live incident (run_2c46d082, session 50504c06): a "continue"
+  // turn whose local conductor aborted fell to the deterministic answer_only
+  // route, so NO planner stage ran — but the TaskPlan ledger still carried the
+  // PREVIOUS turn's 4 items. `activePlanItem` therefore rendered the
+  // stage-output placeholder "No planning stage executed." (see the
+  // SKIP_SENTINELS set in synth-context.ts, which already treats these strings
+  // as non-meaningful on the synthesizer path). The resulting nudge read:
+  //
+  //   "4 plan item(s) are still unverified ... The active item is:
+  //    No planning stage executed."
+  //
+  // — an instruction naming a null placeholder as the thing to work on. It was
+  // injected 56x byte-identical; 28 of 37 executor turns produced no tool call
+  // at all (~93s of a 282s turn). Same bug class the 2026-07-26 read-spiral
+  // note fix addressed (buildReadSpiralNote), which this branch never got.
+  //
+  // The note must never name a placeholder as the active item. Supervision is
+  // deliberately PRESERVED (still `inject`, not `continue`) — per the
+  // 2026-07-29 C1/C2 polarity inversion, making this branch stricter must not
+  // silently remove supervision.
+  test("a placeholder plan summary is never named as the active item", () => {
+    const decision = decideMidLoopIntervention(
+      worked({
+        planItemsTotal: 4,
+        planItemsRemaining: 4,
+        activePlanItem: "No planning stage executed.",
+      }),
+    );
+    expect(decision.kind).toBe("inject");
+    const note = (decision as { note: string }).note;
+    expect(note).not.toContain("No planning stage executed.");
+    expect(note).not.toContain("The active item is:");
+  });
+
+  test("a real active plan item is still named", () => {
+    const decision = decideMidLoopIntervention(
+      worked({
+        planItemsTotal: 4,
+        planItemsRemaining: 4,
+        activePlanItem: "Task 2: add the ParameterID enum",
+      }),
+    );
+    expect(decision.kind).toBe("inject");
+    const note = (decision as { note: string }).note;
+    expect(note).toContain("The active item is: Task 2: add the ParameterID enum");
+  });
+
+  test("supervision is preserved when the plan summary is a placeholder", () => {
+    // The 2026-07-29 inversion property, restated for this guard: suppressing
+    // the placeholder text must not suppress the supervision itself.
+    const placeholder = worked({
+      planItemsTotal: 4,
+      planItemsRemaining: 4,
+      activePlanItem: "No planning stage executed.",
+    });
+    const supervised = decideMidLoopIntervention(placeholder).kind !== "continue"
+      || shouldRunQualityPhase(placeholder);
+    expect(supervised).toBe(true);
+  });
 });
 
 describe("plan remainder respects the stage budget", () => {
