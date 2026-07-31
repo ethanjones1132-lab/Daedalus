@@ -76,9 +76,10 @@ scripts/render-session-stats-pill.py
 scripts/fix-session-stats-pill-props.py
 scripts/verify-session-stats-feature.py
 scripts/prepend-priorities-session-stats.py
+scripts/prepend-priorities-sessions-filter.py
+scripts/prepend-priorities-2026-07-31-inference-feedback-refresh.py
 scripts/diagnose-priorities.py
 scripts/verify-priorities-update.py
-scripts/prepend-priorities-sessions-filter.py
 scripts/verify-priorities-sessions-filter.py
 server-jarvis/scripts/probe-*.ts
 
