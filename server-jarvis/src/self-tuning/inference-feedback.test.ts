@@ -1,8 +1,12 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { AgentPool, firstTokenTimeoutFor, type OrchestratorAgent } from "../orchestration/agent-pool";
 import { applyInferenceFeedback } from "./inference-feedback";
 import {
   buildInferenceFeedbackCommand,
+  findInferenceMetricsScript,
   refreshInferenceFeedback,
 } from "./inference-feedback-refresh";
 import {
@@ -141,6 +145,145 @@ describe("cron feedback refresh", () => {
     expect(seen).toHaveLength(1);
     expect(result).toEqual({ success: true, output: "Policy written", applied: 2, ignored: 0 });
   });
+
+  test("non-zero exit code captures trimmed stderr as the error", async () => {
+    const result = await refreshInferenceFeedback({
+      scriptPath: "C:/Jarvis/automate_inference_metrics.py",
+      runCommand: async () => ({
+        exitCode: 1,
+        stdout: "   \n",
+        stderr: "Traceback (most recent call last):\n  File ...\n",
+      }),
+      loadPolicy: () => ({ applied: 0, ignored: 0, reason: undefined }),
+      paths: {
+        python: "python",
+        dbPath: "db",
+        reportsPath: "reports",
+        policyPath: "policy",
+      },
+    });
+    // stdout is whitespace-only so trim() yields "" — error comes from stderr.
+    expect(result.success).toBe(false);
+    expect(result.output).toBe("");
+    expect(result.error).toBe("Traceback (most recent call last):\n  File ...");
+  });
+
+  test("non-zero exit code without stderr falls back to the exit-code summary", async () => {
+    const result = await refreshInferenceFeedback({
+      scriptPath: "C:/Jarvis/automate_inference_metrics.py",
+      runCommand: async () => ({ exitCode: 2, stdout: "", stderr: "" }),
+      loadPolicy: () => ({ applied: 0, ignored: 0, reason: undefined }),
+      paths: {
+        python: "python",
+        dbPath: "db",
+        reportsPath: "reports",
+        policyPath: "policy",
+      },
+    });
+    expect(result.success).toBe(false);
+    // The fallback message reflects the actual exit code.
+    expect(result.error).toBe("metrics process exited 2");
+  });
+
+  test("error message is sliced to 2000 chars to bound operator-visible error logs", async () => {
+    const result = await refreshInferenceFeedback({
+      scriptPath: "C:/Jarvis/automate_inference_metrics.py",
+      runCommand: async () => ({
+        exitCode: 1,
+        stdout: "",
+        stderr: "x".repeat(5_000),
+      }),
+      loadPolicy: () => ({ applied: 0, ignored: 0, reason: undefined }),
+      paths: {
+        python: "python",
+        dbPath: "db",
+        reportsPath: "reports",
+        policyPath: "policy",
+      },
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toBeDefined();
+    expect(result.error!.length).toBe(2_000);
+  });
+
+  test("stdout is trimmed before being returned as output on the success path", async () => {
+    const result = await refreshInferenceFeedback({
+      scriptPath: "C:/Jarvis/automate_inference_metrics.py",
+      runCommand: async () => ({
+        exitCode: 0,
+        stdout: "Policy written\n\n",
+        stderr: "",
+      }),
+      loadPolicy: () => ({ applied: 3, ignored: 1, reason: undefined }),
+      paths: {
+        python: "python",
+        dbPath: "db",
+        reportsPath: "reports",
+        policyPath: "policy",
+      },
+    });
+    expect(result).toEqual({ success: true, output: "Policy written", applied: 3, ignored: 1 });
+  });
+
+  test("loadPolicy returning a reason short-circuits with a not-applied error and no applied count", async () => {
+    const result = await refreshInferenceFeedback({
+      scriptPath: "C:/Jarvis/automate_inference_metrics.py",
+      runCommand: async () => ({ exitCode: 0, stdout: "Policy written\n", stderr: "" }),
+      loadPolicy: () => ({ applied: 0, ignored: 0, reason: "missing" }),
+      paths: {
+        python: "python",
+        dbPath: "db",
+        reportsPath: "reports",
+        policyPath: "policy",
+      },
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("generated inference policy was not applied: missing");
+    // The reason short-circuit must NOT surface `applied`/`ignored` — they're
+    // not the success path.
+    expect(result.applied).toBeUndefined();
+    expect(result.ignored).toBeUndefined();
+  });
+
+  test("loadPolicy reason preserves the trimmed stdout in the output field", async () => {
+    const result = await refreshInferenceFeedback({
+      scriptPath: "C:/Jarvis/automate_inference_metrics.py",
+      runCommand: async () => ({
+        exitCode: 0,
+        stdout: "Policy written\n",
+        stderr: "",
+      }),
+      loadPolicy: () => ({ applied: 0, ignored: 0, reason: "expired" }),
+      paths: {
+        python: "python",
+        dbPath: "db",
+        reportsPath: "reports",
+        policyPath: "policy",
+      },
+    });
+    expect(result.success).toBe(false);
+    expect(result.output).toBe("Policy written");
+    expect(result.error).toBe("generated inference policy was not applied: expired");
+  });
+
+  test("a thrown exception from runCommand is caught and surfaced as a failed result", async () => {
+    const result = await refreshInferenceFeedback({
+      scriptPath: "C:/Jarvis/automate_inference_metrics.py",
+      runCommand: async () => {
+        throw new Error("spawn failed");
+      },
+      loadPolicy: () => ({ applied: 0, ignored: 0, reason: undefined }),
+      paths: {
+        python: "python",
+        dbPath: "db",
+        reportsPath: "reports",
+        policyPath: "policy",
+      },
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("spawn failed");
+    expect(result.output).toBe("");
+  });
 });
 
 describe("production policy durability across inference-feedback clear/apply", () => {
@@ -225,5 +368,46 @@ describe("production policy durability across inference-feedback clear/apply", (
     });
     expect(result.reason).toBe("expired");
     expect(getLearnedPoolState().modelRoutingScoreDeltas.get(productionKey)).toBe(0.12);
+  });
+});
+
+describe("findInferenceMetricsScript (env override precedence)", () => {
+  let tempRoot = "";
+  let savedEnv: string | undefined;
+
+  beforeEach(() => {
+    tempRoot = mkdtempSync(join(tmpdir(), "jarvis-inference-metrics-"));
+    // Save and clear the env var so a leaked value from a previous test (or
+    // the user's shell) cannot hijack these assertions.
+    savedEnv = process.env.JARVIS_INFERENCE_METRICS_SCRIPT;
+    delete process.env.JARVIS_INFERENCE_METRICS_SCRIPT;
+  });
+
+  afterEach(() => {
+    if (savedEnv === undefined) {
+      delete process.env.JARVIS_INFERENCE_METRICS_SCRIPT;
+    } else {
+      process.env.JARVIS_INFERENCE_METRICS_SCRIPT = savedEnv;
+    }
+    if (tempRoot) rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  test("JARVIS_INFERENCE_METRICS_SCRIPT takes priority when the configured file exists", () => {
+    const overridePath = join(tempRoot, "my-custom-metrics.py");
+    writeFileSync(overridePath, "# custom metrics", "utf-8");
+    process.env.JARVIS_INFERENCE_METRICS_SCRIPT = overridePath;
+    expect(findInferenceMetricsScript()).toBe(overridePath);
+  });
+
+  test("JARVIS_INFERENCE_METRICS_SCRIPT is silently ignored when the configured path does not exist", () => {
+    process.env.JARVIS_INFERENCE_METRICS_SCRIPT = join(tempRoot, "does-not-exist.py");
+    // The repo-root candidate <repo>/automate_inference_metrics.py is always
+    // present in this workspace, so the function falls through to it. The
+    // contract under test is: a misconfigured env var must not silently pick
+    // an empty / wrong path; the existsSync guard skips it and the walk
+    // continues.
+    const result = findInferenceMetricsScript();
+    expect(result).toBeDefined();
+    expect(result).not.toContain("does-not-exist.py");
   });
 });
