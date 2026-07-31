@@ -147,6 +147,40 @@ describe("live orchestration model catalog", () => {
     expect(goModels).toEqual(["deepseek-v4-flash", "minimax-m3", "glm-5.2"]);
   });
 
+  // 2026-07-31 live incident: local-qwythos-reviewer (provider "ollama") was
+  // added to orchestrator.agents with default_for: ["reviewer"], plus fixes
+  // to orchestrationRoutingTier, the index.ts dispatch path, and
+  // routableOrchestratorAgents — yet reviewer-stage turns still never
+  // resolved to it. Root cause: mergeAgents() only handles the three
+  // CatalogProvider values (openrouter/opencode_zen/opencode_go); any
+  // configured agent whose provider isn't one of those three hits
+  // `if (!(agent.provider in results)) continue;` and is silently dropped
+  // from the merged snapshot BEFORE the pool is ever built — independent of
+  // every other fix. Non-catalog providers (ollama, claude_cli) have no
+  // remote catalog to discover against, so they must pass through
+  // unchanged rather than be treated as "not in the live catalog, drop it".
+  test("preserves a configured ollama agent unchanged (no remote catalog covers it)", async () => {
+    resetLiveModelCatalogCache();
+    const cfg = defaultConfig();
+    cfg.openrouter.api_key = "openrouter-test-key";
+    cfg.opencode_zen.api_key = "zen-test-key";
+    cfg.opencode_go.api_key = "go-test-key";
+    const ollamaAgent = {
+      id: "local-qwythos-reviewer",
+      provider: "ollama" as const,
+      model_id: "qwythos9b-conductor:latest",
+      capabilities: { code: 0.65, reasoning: 0.7, speed: 0.9, cost: 1, json_reliability: 0.75 },
+      default_for: ["reviewer"],
+      enabled: true,
+    };
+    cfg.orchestrator.agents = [ollamaAgent];
+
+    const fetcher: typeof fetch = async () => json([]);
+    const snapshot = await discoverLiveOrchestratorAgents(cfg, { fetcher, forceRefresh: true });
+
+    expect(snapshot.agents).toContainEqual(ollamaAgent);
+  });
+
   test("keeps configured fallbacks when a catalog is temporarily unavailable", async () => {
     resetLiveModelCatalogCache();
     const cfg = defaultConfig();

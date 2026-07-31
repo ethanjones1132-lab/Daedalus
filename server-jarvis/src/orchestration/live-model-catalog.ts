@@ -311,7 +311,13 @@ function mergeAgents(
   const merged = new Map<string, OrchestratorAgent>();
 
   for (const agent of configured) {
-    if (!(agent.provider in results)) continue;
+    if (!(agent.provider in results)) {
+      // Non-catalog providers (ollama, claude_cli) have no remote catalog to
+      // discover against — pass them through unchanged rather than treating
+      // "not in the live catalog" as "drop it".
+      merged.set(`${agent.provider}:${agent.model_id}`, agent);
+      continue;
+    }
     const provider = agent.provider as CatalogProvider;
     const result = results[provider];
     // A successful live catalog is authoritative and removes retired ids. If
