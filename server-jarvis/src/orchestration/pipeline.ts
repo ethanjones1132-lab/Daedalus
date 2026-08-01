@@ -20,7 +20,12 @@ import type { ConductorBus, ConductorDirective } from "./conductor-bus";
 import type { ConductorStageEvidence, LiveConductor } from "./conductor";
 import { buildSynthesizerContext, buildSynthesizerContextFromStageState } from "./synth-context";
 import { detectDeferralStall, DEFERRAL_STALL_NUDGE } from "./synthesizer-deferral";
-import { applyEffectGate, buildWriteEffectNudge, evaluateEffectGate, hasRepeatedWriteFailureWithoutEffect, isTerminalNoWriteEffect, mostReadSuccessfulFile, shouldPressWriteEffect, WRITE_EFFECT_NUDGE, WRITE_EFFECT_TOOLS, type EffectGateReport } from "./effect-gate";
+import { applyEffectGate, buildWriteEffectNudge, claimWriteEffectPressure, evaluateEffectGate, hasRepeatedWriteFailureWithoutEffect, isTerminalNoWriteEffect, mostReadSuccessfulFile, shouldPressWriteEffect, WRITE_EFFECT_NUDGE, WRITE_EFFECT_TOOLS, type EffectGateReport } from "./effect-gate";
+import {
+  decideExecutorProgress,
+  SemanticPressureBudget,
+  SEMANTIC_PRESSURE_SUPPRESSED,
+} from "./executor-progress-policy";
 import { normalizeRemainingStages, type ExecutionProfile } from "./route-normalization";
 import { hasWriteIntent, type TurnRequirement } from "./turn-requirements";
 import type { TurnBudget } from "./turn-budget";
@@ -291,6 +296,12 @@ export interface PipelineExecuteOptions {
   ownedPlanning?: OwnedPlanningAttachment;
   /** Request-wide cancellation (Stop, disconnect, or supersession). */
   turnAbort?: AbortSignal;
+  /**
+   * Run-level semantic pressure claims (Task 6). Created once per agentRunId
+   * and shared across segment/replan so write-effect / plan-remainder notes
+   * cannot re-inject after a reroute.
+   */
+  semanticPressureBudget?: SemanticPressureBudget;
 }
 
 // Derived from the capability taxonomy. READ_CACHE_TOOLS is `cacheable`
@@ -1526,6 +1537,24 @@ export class PipelineExecutor {
     let lastModelKey: string | undefined;
     let turnCount = 0;
     let executorDone = false;
+    /** Typed partial when write-intent turns emit no tools twice (Task 6). */
+    let executorNoToolPartial = false;
+    /** Consecutive write-intent turns with zero tools and zero successful writes. */
+    let consecutiveNoToolTurns = 0;
+    /**
+     * Once the model has emitted any tool call this stage, no-tool bounding
+     * yields to the effect gate / normal completion path (failed tools and
+     * read spirals are not `executor_no_tool`).
+     */
+    let anyModelToolCallThisStage = false;
+    /** In-loop model exclusions from a no-tool strong retry. */
+    let inLoopModelExclusions: string[] = [...(options.modelExclusions ?? [])];
+    /** Prefer strong model after a no-tool retry_strong decision. */
+    let preferStrongNextTurn = options.executorRetryUsed === true;
+    const pressureBudget = options.semanticPressureBudget ?? new SemanticPressureBudget();
+    if (!options.semanticPressureBudget) {
+      options.semanticPressureBudget = pressureBudget;
+    }
     let workspaceEvidenceNudgeCount = 0;
     let evidenceCountAtLastNudge = 0;
     let writeEffectNudgeCount = 0;
@@ -2712,8 +2741,8 @@ export class PipelineExecutor {
             stream: true,
             stageLabel: "executor",
             complexity: options.estimatedComplexity,
-            preferStrongModel: options.executorRetryUsed === true,
-            excludeModels: options.modelExclusions,
+            preferStrongModel: preferStrongNextTurn,
+            excludeModels: inLoopModelExclusions.length > 0 ? inLoopModelExclusions : options.modelExclusions,
             suppressActivity: true,
             stageAbort: this.registerStageAbort("executor"),
             onChunk: (chunk) => {
@@ -2842,28 +2871,98 @@ export class PipelineExecutor {
               workspaceEvidenceNudgeCount === 0 ||
               evidenceNow > evidenceCountAtLastNudge;
             if (mayNudge) {
-              workspaceEvidenceNudgeCount++;
-              evidenceCountAtLastNudge = evidenceNow;
-              workspaceEvidenceNudgeSentThisTurn = true;
-              executorMessages.push({
-                role: "user",
-                content:
-                  `Workspace evidence is required for this turn. ${assessmentAfterTurn.reason}. Call the relevant read-only workspace tools (read_file, list_directory, glob, or grep) and ground your findings in their results before answering.` +
-                  (requiresWriteEffect
-                    ? " This is ALSO a change request: after reading, apply the requested change with write_file/edit_file/multi_edit/apply_patch."
-                    : ""),
-              });
+              const evidenceNote =
+                `Workspace evidence is required for this turn. ${assessmentAfterTurn.reason}. Call the relevant read-only workspace tools (read_file, list_directory, glob, or grep) and ground your findings in their results before answering.` +
+                (requiresWriteEffect
+                  ? " This is ALSO a change request: after reading, apply the requested change with write_file/edit_file/multi_edit/apply_patch."
+                  : "");
+              if (pressureBudget.claim("workspace_evidence")) {
+                workspaceEvidenceNudgeCount++;
+                evidenceCountAtLastNudge = evidenceNow;
+                workspaceEvidenceNudgeSentThisTurn = true;
+                executorMessages.push({
+                  role: "user",
+                  content: evidenceNote,
+                });
+              } else {
+                this.collector.recordDirective?.({
+                  id: `dir_${crypto.randomUUID()}`,
+                  agent_run_id: agentRunId,
+                  stage: "executor",
+                  directive_type: SEMANTIC_PRESSURE_SUPPRESSED,
+                  decision_source: "deterministic_reflex",
+                  reason: "workspace_evidence",
+                });
+              }
             }
           }
+
+          // Task 6: bound consecutive pure-prose write turns (retry_strong once,
+          // then stop_partial). Any real tool call this stage disables the
+          // bound so failed tools / read spirals still reach the effect gate.
+          const stageRemainingMs =
+            options.turnBudget?.stageRemainingMs("executor") ?? Number.POSITIVE_INFINITY;
+          if (emittedToolCalls) {
+            consecutiveNoToolTurns = 0;
+            anyModelToolCallThisStage = true;
+          } else if (requiresWriteEffect && successfulWriteCount() === 0) {
+            consecutiveNoToolTurns += 1;
+          }
+          const progressDecision = anyModelToolCallThisStage
+            ? "continue" as const
+            : decideExecutorProgress({
+                writeIntent: requiresWriteEffect,
+                emittedToolCalls,
+                successfulWrites: successfulWriteCount(),
+                consecutiveNoToolTurns,
+                stageRemainingMs,
+              });
 
           // Write pressure (2026-07-17): the model is about to end a
           // full-profile change turn with zero successful mutations. Press it
           // (bounded) to actually call a write tool instead of accepting the
           // prose ending — but never into a nearly-exhausted stage window.
+          // Shared SemanticPressureBudget: only the first write_effect inject
+          // per agent run actually adds transcript text.
           let writeEffectNudgeSentThisTurn = false;
-          if (
+          const tryInjectWriteEffect = (note: string, source: "deterministic_reflex" | "no_tool_retry"): boolean => {
+            if (claimWriteEffectPressure(pressureBudget)) {
+              writeEffectNudgeCount++;
+              writeEffectNudgeSentThisTurn = true;
+              executorMessages.push({ role: "user", content: note });
+              this.collector.recordDirective?.({
+                id: `dir_${crypto.randomUUID()}`,
+                agent_run_id: agentRunId,
+                stage: "executor",
+                directive_type: "write_effect_nudge",
+                decision_source: source,
+                inject_note: note,
+              });
+              return true;
+            }
+            this.collector.recordDirective?.({
+              id: `dir_${crypto.randomUUID()}`,
+              agent_run_id: agentRunId,
+              stage: "executor",
+              directive_type: SEMANTIC_PRESSURE_SUPPRESSED,
+              decision_source: source,
+              reason: "write_effect",
+            });
+            return false;
+          };
+
+          if (progressDecision === "retry_strong") {
+            preferStrongNextTurn = true;
+            if (lastModelKey && !inLoopModelExclusions.includes(lastModelKey)) {
+              inLoopModelExclusions = [...inLoopModelExclusions, lastModelKey];
+            }
+            tryInjectWriteEffect(WRITE_EFFECT_NUDGE, "no_tool_retry");
+          } else if (
+            progressDecision !== "stop_partial" &&
             !repeatedWriteFailureReached &&
-            (options.turnBudget?.stageRemainingMs("executor") ?? Number.POSITIVE_INFINITY) > 8_000 &&
+            stageRemainingMs > 8_000 &&
+            // Evaluate press without the availability gate so a spent budget
+            // still records semantic_pressure_suppressed via tryInject.
             shouldPressWriteEffect({
               writeIntent: requiresWriteEffect,
               profile,
@@ -2876,47 +2975,73 @@ export class PipelineExecutor {
               maxTurns,
             })
           ) {
-            writeEffectNudgeCount++;
-            writeEffectNudgeSentThisTurn = true;
             const writeEffectNudge = emittedToolCalls
               ? buildWriteEffectNudge(availableWriteTools, mostReadTarget())
               : WRITE_EFFECT_NUDGE;
-            executorMessages.push({
-              role: "user",
-              content: writeEffectNudge,
-            });
-            this.collector.recordDirective?.({
-              id: `dir_${crypto.randomUUID()}`,
-              agent_run_id: agentRunId,
-              stage: "executor",
-              directive_type: "write_effect_nudge",
-              decision_source: "deterministic_reflex",
-              inject_note: writeEffectNudge,
-            });
+            tryInjectWriteEffect(writeEffectNudge, "deterministic_reflex");
           }
 
           // Rung 2: real-time in-turn ownership (default on). Quality-aware:
           // successfulWrites alone no longer end supervision — a write that
           // just landed triggers a post-write checkpoint (+ bounded check-runner).
-          const midLoop = await runMidLoopCheckpoint(toolCalls, turnCount, {
-            progressSinceLastCheckpoint: emittedToolCalls
-              ? `native turn ${turnCount}: ${toolCalls.slice(turnStartIdx).map((c) => c.name).join(", ") || "no tools"}`
-              : `native turn ${turnCount}: no tool calls`,
-          });
+          // Skip mid-loop pressure when we already decided stop_partial.
           let midLoopHeldOpen = false;
+          const midLoop = progressDecision === "stop_partial"
+            ? null
+            : await runMidLoopCheckpoint(toolCalls, turnCount, {
+                progressSinceLastCheckpoint: emittedToolCalls
+                  ? `native turn ${turnCount}: ${toolCalls.slice(turnStartIdx).map((c) => c.name).join(", ") || "no tools"}`
+                  : `native turn ${turnCount}: no tool calls`,
+              });
           if (midLoop) {
             if (midLoop.kind === "abort") {
               executorDone = true;
               narratives.push(`[Conductor] ${midLoop.reason}`);
               onStateChange({ stage: "executor", status: "running", detail: "mid_loop_abort" });
             } else if (midLoop.kind === "force_write" && !writeEffectNudgeSentThisTurn) {
-              writeEffectNudgeCount++;
-              writeEffectNudgeSentThisTurn = true;
-              midLoopHeldOpen = true;
-              executorMessages.push({ role: "user", content: midLoop.note });
+              if (tryInjectWriteEffect(midLoop.note, "deterministic_reflex")) {
+                midLoopHeldOpen = true;
+              }
             } else if (midLoop.kind === "inject") {
-              midLoopHeldOpen = true;
-              executorMessages.push({ role: "user", content: midLoop.note });
+              const isPlanRemainder = midLoop.noteKind === "plan_remainder";
+              const isQuality = (midLoop as { decisionSource?: string }).decisionSource === "schema_control"
+                || (midLoop as { decisionSource?: string }).decisionSource === "deterministic_reflex";
+              if (isPlanRemainder) {
+                if (pressureBudget.claim("plan_remainder")) {
+                  midLoopHeldOpen = true;
+                  executorMessages.push({ role: "user", content: midLoop.note });
+                } else {
+                  this.collector.recordDirective?.({
+                    id: `dir_${crypto.randomUUID()}`,
+                    agent_run_id: agentRunId,
+                    stage: "executor",
+                    directive_type: SEMANTIC_PRESSURE_SUPPRESSED,
+                    decision_source: midLoop.decisionSource,
+                    reason: "plan_remainder",
+                  });
+                }
+              } else if (
+                // Quality injects share quality_after_correctness slot.
+                midLoop.note === DEFAULT_QUALITY_PUSH_NOTE ||
+                (isQuality && successfulWriteCount() > 0)
+              ) {
+                if (pressureBudget.claim("quality_after_correctness")) {
+                  midLoopHeldOpen = true;
+                  executorMessages.push({ role: "user", content: midLoop.note });
+                } else {
+                  this.collector.recordDirective?.({
+                    id: `dir_${crypto.randomUUID()}`,
+                    agent_run_id: agentRunId,
+                    stage: "executor",
+                    directive_type: SEMANTIC_PRESSURE_SUPPRESSED,
+                    decision_source: midLoop.decisionSource,
+                    reason: "quality_after_correctness",
+                  });
+                }
+              } else {
+                midLoopHeldOpen = true;
+                executorMessages.push({ role: "user", content: midLoop.note });
+              }
             } else if (midLoop.kind === "redirect") {
               midLoopHeldOpen = true;
               executorMessages.push({ role: "user", content: midLoop.note });
@@ -3021,23 +3146,48 @@ export class PipelineExecutor {
                   qualityGate.decisionSource === "escalation_reserved") &&
                 qualityPushesUsed < MAX_QUALITY_PUSHES
               ) {
-                qualityPushesUsed += 1;
-                midLoopHeldOpen = true;
-                executorMessages.push({ role: "user", content: DEFAULT_QUALITY_PUSH_NOTE });
-                this.collector.recordDirective?.({
-                  id: `dir_${crypto.randomUUID()}`,
-                  agent_run_id: agentRunId,
-                  stage: "executor",
-                  directive_type: "mid_loop_quality_push",
-                  decision_source: "deterministic_reflex",
-                  reason: `quality_push_host_failopen ${qualityPushesUsed}/${MAX_QUALITY_PUSHES}`,
-                  inject_note: DEFAULT_QUALITY_PUSH_NOTE,
-                });
+                if (pressureBudget.claim("quality_after_correctness")) {
+                  qualityPushesUsed += 1;
+                  midLoopHeldOpen = true;
+                  executorMessages.push({ role: "user", content: DEFAULT_QUALITY_PUSH_NOTE });
+                  this.collector.recordDirective?.({
+                    id: `dir_${crypto.randomUUID()}`,
+                    agent_run_id: agentRunId,
+                    stage: "executor",
+                    directive_type: "mid_loop_quality_push",
+                    decision_source: "deterministic_reflex",
+                    reason: `quality_push_host_failopen ${qualityPushesUsed}/${MAX_QUALITY_PUSHES}`,
+                    inject_note: DEFAULT_QUALITY_PUSH_NOTE,
+                  });
+                } else {
+                  this.collector.recordDirective?.({
+                    id: `dir_${crypto.randomUUID()}`,
+                    agent_run_id: agentRunId,
+                    stage: "executor",
+                    directive_type: SEMANTIC_PRESSURE_SUPPRESSED,
+                    decision_source: "deterministic_reflex",
+                    reason: "quality_after_correctness",
+                  });
+                }
               }
             }
           }
 
-          if (
+          if (progressDecision === "stop_partial") {
+            executorDone = true;
+            executorNoToolPartial = true;
+            narratives.push(
+              "Executor stopped after consecutive write-intent turns with no tool calls; " +
+                "reporting partial rather than spending more model budget on prose.",
+            );
+            onStateChange({
+              stage: "executor",
+              status: "partial",
+              detail: "executor_no_tool",
+            });
+          } else if (progressDecision === "retry_strong") {
+            // Keep the loop open for one strong-model retry (note already injected).
+          } else if (
             !executorDone &&
             !emittedToolCalls &&
             !workspaceEvidenceNudgeSentThisTurn &&
@@ -3052,6 +3202,11 @@ export class PipelineExecutor {
           // workspace-evidence verdict. A successful read is not a model error
           // merely because the deep-read floor still needs another file.
           const turnHadToolError = turnToolErrors.length > 0;
+          // Task 6: no-tool write turns are typed failures for model learning.
+          const isNoToolWriteTurn =
+            requiresWriteEffect &&
+            !emittedToolCalls &&
+            successfulWriteCount() === 0;
           this.collector.recordStageRun({
             id: `stage_${crypto.randomUUID()}`,
             agent_run_id: agentRunId,
@@ -3061,11 +3216,15 @@ export class PipelineExecutor {
             output_tokens: countTokens(response?.content || ""),
             tool_calls_json: JSON.stringify(response?.tool_calls || []),
             duration_ms: Date.now() - turnStartTime,
-            was_successful: turnHadToolError ? 0 : 1,
-            had_error: turnHadToolError ? 1 : 0,
+            was_successful: isNoToolWriteTurn || turnHadToolError ? 0 : 1,
+            had_error: isNoToolWriteTurn || turnHadToolError ? 1 : 0,
             error_message: turnToolErrors[0]
               ? `${turnToolErrors[0].name}: ${(turnToolErrors[0].output || "").slice(0, 200)}`
-              : undefined,
+              : isNoToolWriteTurn
+                ? "executor_no_tool"
+                : undefined,
+            stop_reason: isNoToolWriteTurn ? "no_tool" : undefined,
+            partial_error_code: isNoToolWriteTurn ? "executor_no_tool" : undefined,
           });
         } catch (err: any) {
           this.collector.recordStageRun({
@@ -3208,6 +3367,34 @@ export class PipelineExecutor {
           toolCalls,
           terminalStatus: "failed",
           errorCode: "effect_gate_no_write_effect",
+          modelKey: lastModelKey,
+        };
+      }
+      if (executorNoToolPartial) {
+        const message =
+          "Executor ended partial after consecutive write-intent turns emitted no tool calls.";
+        const partialNarrative = [narrative, message].filter(Boolean).join("\n\n");
+        onStateChange({
+          stage: "executor",
+          status: "partial",
+          output: message,
+          detail: "executor_no_tool",
+        });
+        await this.afterConductorStage(
+          "executor",
+          "failed",
+          partialNarrative,
+          agentRunId,
+          options,
+          remainingQueue,
+          executorEvidence(),
+        );
+        return {
+          ok: false,
+          narrative: partialNarrative,
+          toolCalls,
+          terminalStatus: "partial",
+          errorCode: "executor_no_tool",
           modelKey: lastModelKey,
         };
       }
@@ -4205,6 +4392,11 @@ export class PipelineExecutor {
     options: PipelineExecuteOptions,
     carry: PipelineStageState = {},
   ): Promise<PipelineSegmentResult> {
+    // Once per agentRunId: share across segment/replan so write-effect notes
+    // cannot re-inject after a reroute (Task 6).
+    if (!options.semanticPressureBudget) {
+      options.semanticPressureBudget = new SemanticPressureBudget();
+    }
     const state: PipelineStageState = { ...carry };
     const profile: ExecutionProfile = options.executionProfile ?? "full";
     const intentText = options.rawMessage ?? request;
@@ -4411,6 +4603,12 @@ export class PipelineExecutor {
             contentEffects: this.ctx.write_effects,
           });
           return finish({ state, effectGate, partialStage });
+        }
+        if (state.executor.errorCode === "executor_no_tool") {
+          return finish({
+            state,
+            partialStage: { stage: "executor", errorCode: "executor_no_tool" },
+          });
         }
         // T2.4: hard executor failure (non-workspace_read) → replan pre-synthesizer.
         // workspace_read falls through to the evidence fence for precise codes.
@@ -4909,6 +5107,19 @@ export class PipelineExecutor {
     );
 
     if (segment.synthesizerAnswer === undefined) {
+      // Task 6: typed partials (e.g. executor_no_tool) must surface even when
+      // the pipeline slice omitted the synthesizer stage.
+      if (segment.partialStage) {
+        return {
+          answer: state.plan ? renderPlanSummary(state.plan) : (state.executor?.narrative ?? ""),
+          recursion_depth: 0,
+          outcome: "partial",
+          error_code: segment.partialStage.errorCode,
+          toolCalls: state.executor?.toolCalls,
+          checkResult: this.lastCheckResult,
+          reviewerAccepted: this.lastReviewerAccepted,
+        };
+      }
       const gated = applyEffectGate(
         upstreamDegraded ? "degraded" : "success",
         upstreamDegraded ? "upstream_stage_failed" : undefined,

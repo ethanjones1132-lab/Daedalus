@@ -76,4 +76,53 @@ describe("orchestrator transcript context", () => {
     expect(result.outcome).toBe("success");
     expect(rows.some((row) => row.mode_id === "rewriter")).toBe(false);
   });
+
+  test("no-tool write pressure note appears only once in the executor transcript", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("write_file"), async () => "written");
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    const executorInputs: any[][] = [];
+    let executorTurns = 0;
+    const callModel = async (messages: any[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") {
+        executorInputs.push(messages.map((message) => ({ ...message })));
+        executorTurns++;
+        return {
+          content: "Here is the patch as prose without calling tools.",
+          _provider: "openrouter",
+          _modelUsed: executorTurns === 1 ? "m1" : "m2",
+        };
+      }
+      return { content: "Could not complete the write." };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "edit src/a.ts to export a helper",
+      ["executor", "synthesizer"],
+      "run-no-tool-single-pressure",
+      () => {},
+      {
+        executionProfile: "full",
+        turnBudget: {
+          stageRemainingMs: () => 60_000,
+          extendStageOnProgress: () => 0,
+        } as any,
+      },
+    );
+
+    expect(executorTurns).toBe(2);
+    const pressureNotes = executorInputs.flat().filter(
+      (message) =>
+        message.role === "user" &&
+        typeof message.content === "string" &&
+        message.content.includes("CHANGE request") &&
+        message.content.includes("write tools"),
+    );
+    expect(pressureNotes).toHaveLength(1);
+    expect(result.error_code).toBe("executor_no_tool");
+    expect(rows.filter((row) => row.stop_reason === "no_tool")).toHaveLength(2);
+  });
 });

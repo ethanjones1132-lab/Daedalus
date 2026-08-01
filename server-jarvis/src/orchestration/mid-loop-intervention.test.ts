@@ -118,6 +118,27 @@ describe("decideMidLoopIntervention", () => {
     expect(decideMidLoopIntervention(fresh).kind).toBe("force_write");
   });
 
+  test("force_write skips when run-level write_effect pressure is already spent", () => {
+    const spent = {
+      ...base,
+      distinctSuccessfulReads: 6,
+      stageRemainingMs: 200_000,
+      writeEffectPressureAvailable: false,
+    };
+    expect(decideMidLoopIntervention(spent).kind).toBe("continue");
+  });
+
+  test("plan_remainder skips when run-level plan_remainder pressure is already spent", () => {
+    const spent = {
+      ...base,
+      successfulWrites: 1,
+      planItemsRemaining: 3,
+      planNudgesSent: 0,
+      planRemainderPressureAvailable: false,
+    };
+    expect(decideMidLoopIntervention(spent).kind).toBe("continue");
+  });
+
   test("the failed-write note escalates instead of repeating verbatim", () => {
     const at = (sent: number) =>
       (decideMidLoopIntervention({
