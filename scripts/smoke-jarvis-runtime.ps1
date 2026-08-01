@@ -184,10 +184,13 @@ if ($CompletionIntegritySmoke) {
     try {
         New-Item -ItemType Directory -Path $smokeDir -Force | Out-Null
         $planPath = Join-Path $smokeDir 'GROUP_A_EXECUTION.md'
-        $alphaPath = Join-Path $smokeDir 'alpha.txt'
-        $betaPath = Join-Path $smokeDir 'beta.txt'
-        $gammaPath = Join-Path $smokeDir 'gamma.txt'
-        $deltaPath = Join-Path $smokeDir 'delta.txt'
+        # Use .py artifacts so py_compile can supply an authoritative
+        # check_tier (Task 1 forbids write success with tier=none). Bare
+        # identifiers are valid Python syntax and keep exact-content pins.
+        $alphaPath = Join-Path $smokeDir 'alpha.py'
+        $betaPath = Join-Path $smokeDir 'beta.py'
+        $gammaPath = Join-Path $smokeDir 'gamma.py'
+        $deltaPath = Join-Path $smokeDir 'delta.py'
         $expected = [ordered]@{
             ALPHA_OK = $alphaPath
             BETA_OK = $betaPath
@@ -199,13 +202,13 @@ if ($CompletionIntegritySmoke) {
 # Execution Plan
 ## Group A
 ### A1 — Create alpha artifact
-- [ ] Write file alpha.txt with exactly the text ALPHA_OK
+- [ ] Write file alpha.py with exactly the text ALPHA_OK
 ### A2 — Create beta artifact
-- [ ] Write file beta.txt with exactly the text BETA_OK
+- [ ] Write file beta.py with exactly the text BETA_OK
 ### A3 — Create gamma artifact
-- [ ] Write file gamma.txt with exactly the text GAMMA_OK
+- [ ] Write file gamma.py with exactly the text GAMMA_OK
 ### A4 — Create delta artifact
-- [ ] Write file delta.txt with exactly the text DELTA_OK
+- [ ] Write file delta.py with exactly the text DELTA_OK
 ## Group B
 ### B1 — Later work
 "@ | Set-Content -LiteralPath $planPath -Encoding utf8
@@ -220,7 +223,7 @@ if ($CompletionIntegritySmoke) {
         for ($turn = 1; $turn -le $maxTurns; $turn++) {
             $message = if ($turn -eq 1) {
                 "Execute Group A from GROUP_A_EXECUTION.md in workspace '$smokeDir'. " +
-                "Create each of the four required files (alpha.txt, beta.txt, gamma.txt, delta.txt) " +
+                "Create each of the four required files (alpha.py, beta.py, gamma.py, delta.py) " +
                 "with the exact contents specified in the plan. Do not mark the group complete until all four exist."
             } else {
                 "continue"
