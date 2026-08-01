@@ -54,6 +54,7 @@ import {
 } from "./evidence-sufficiency";
 import { substituteToolCall } from "../tool-heal";
 import {
+  compactCompletedExecutorCycles,
   enforceTranscriptBudget,
   EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS,
   EXECUTOR_TOOL_RESULT_CONTEXT_CHARS,
@@ -2723,6 +2724,20 @@ export class PipelineExecutor {
         let response: any;
 
         try {
+          // Cycle compaction first (whole assistant/tool cycles → evidence
+          // checkpoint), then payload eviction as the final size fence.
+          const cycleCompact = compactCompletedExecutorCycles(
+            executorMessages,
+            toolCalls,
+            transcriptBudgetTokens,
+          );
+          if (cycleCompact.compactedCycles > 0) {
+            onStateChange({
+              stage: "executor",
+              status: "running",
+              detail: `context_compacted:${cycleCompact.compactedCycles}`,
+            });
+          }
           const transcriptBudget = enforceTranscriptBudget(executorMessages, transcriptBudgetTokens);
           if (transcriptBudget.evicted > 0) {
             onStateChange({
@@ -2731,6 +2746,7 @@ export class PipelineExecutor {
               detail: `context_evicted:${transcriptBudget.evicted}`,
             });
           }
+          // Exact input token count after compaction + eviction.
           const inputTokens = transcriptBudget.inputTokens;
           response = await this.callModel(executorMessages, {
             temperature: BUILTIN_MODES.executor.temperature,
