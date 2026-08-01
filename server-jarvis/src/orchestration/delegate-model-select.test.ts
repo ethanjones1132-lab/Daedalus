@@ -8,11 +8,80 @@ import {
   getDelegateThrashCount,
   isDelegateThrashOutcome,
   isProxyResolvable,
+  isToolCallCapableDelegate,
   DELEGATE_FREE_FIRST_MODELS,
   DELEGATE_GO_OPENAI_MODELS,
+  DELEGATE_TOOL_INCAPABLE_MODELS,
   recordDelegateThrash,
   selectDelegateModel,
 } from "./delegate-model-select";
+
+// 2026-08-01, live runs run_d84a937f / run_275068a5: the delegate is the
+// PRIMARY write path, and `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`
+// sat second in DELEGATE_FREE_FIRST_MODELS. Reasoning models emit <think> and
+// leave `content` empty, so there is nothing to parse as a tool call — the
+// same trap already recorded for MiniMax M3. Observed: one executor turn
+// produced 7825 output tokens with ZERO tool calls, the delegate's only edit
+// was a no-op (`old_string` === `new_string`), and both delegate stages
+// recorded ok=0 err=1.
+//
+// Exclusion is by EXPLICIT id, never a substring heuristic on "reasoning":
+// a wrong exclusion silently costs a free lane, and re-enabling a model when
+// it gains tool support must be a one-line edit. Free-first ordering is
+// untouched — capable free models are still tried before any paid tier.
+describe("delegate tool-call capability filter", () => {
+  test("the known reasoning model is excluded", () => {
+    expect(isToolCallCapableDelegate("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free")).toBe(false);
+  });
+
+  test("north-mini-code stays capable and remains the free-first primary", () => {
+    expect(isToolCallCapableDelegate("cohere/north-mini-code:free")).toBe(true);
+    const s = selectDelegateModel({
+      configuredModel: "auto",
+      thrashCount: 0,
+      proxyAvailable: true,
+      hasOpenCodeGoKey: true,
+    });
+    expect(s.pool).toBe("free");
+    expect(s.model).toBe("cohere/north-mini-code:free");
+  });
+
+  test("a model is not excluded merely for having 'reasoning' in its id", () => {
+    // Guards against the substring heuristic this deliberately avoids.
+    expect(isToolCallCapableDelegate("vendor/some-reasoning-capable-coder:free")).toBe(true);
+  });
+
+  test("the exclusion set is injectable so a model can be toggled back", () => {
+    expect(isToolCallCapableDelegate("cohere/north-mini-code:free", ["cohere/north-mini-code:free"]))
+      .toBe(false);
+    expect(isToolCallCapableDelegate("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", []))
+      .toBe(true);
+  });
+
+  test("selection never returns an incapable model from the free pool", () => {
+    // Rotate through every thrash count that still selects from free.
+    for (let thrash = 0; thrash < DELEGATE_FREE_FIRST_MODELS.length; thrash++) {
+      const s = selectDelegateModel({
+        configuredModel: "auto",
+        thrashCount: thrash,
+        proxyAvailable: true,
+        hasOpenCodeGoKey: true,
+      });
+      if (s.pool !== "free") continue;
+      expect(DELEGATE_TOOL_INCAPABLE_MODELS).not.toContain(s.model);
+    }
+  });
+
+  test("free-first is preserved: a capable free model still beats the paid tier", () => {
+    const s = selectDelegateModel({
+      configuredModel: "auto",
+      thrashCount: 0,
+      proxyAvailable: true,
+      hasOpenCodeGoKey: true,
+    });
+    expect(s.pool).toBe("free");
+  });
+});
 
 describe("selectDelegateModel (Slice B free-first)", () => {
   test("auto starts on free-first pool when proxy is up", () => {

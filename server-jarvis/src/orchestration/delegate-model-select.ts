@@ -59,6 +59,36 @@ export const DELEGATE_FREE_FIRST_MODELS = [
   "google/gemma-4-31b-it:free",
 ] as const;
 
+/**
+ * Free-first is the goal, but a lane that cannot emit a tool call is not a
+ * cheap lane — it is a wasted turn plus a fallback.
+ *
+ * The delegate is the primary write path, so tool-call fidelity is the entire
+ * job. Reasoning models emit `<think>` and leave `content` empty, so there is
+ * nothing to parse as a tool call (the trap already recorded for MiniMax M3).
+ * Live 2026-08-01 (run_d84a937f, run_275068a5): with the reasoning model in
+ * this pool, one executor turn produced 7825 output tokens and ZERO tool
+ * calls, the delegate's only edit was a no-op (`old_string` === `new_string`),
+ * and both delegate stages recorded ok=0 err=1.
+ *
+ * Listed by EXPLICIT id rather than matched on a substring like "reasoning":
+ * a wrong exclusion silently costs a free lane, and re-enabling a model once
+ * it supports tools must be deleting one line here — nothing else. Entries
+ * stay in DELEGATE_FREE_FIRST_MODELS above so the pool still documents what
+ * exists and ordering is unchanged for every capable model.
+ */
+export const DELEGATE_TOOL_INCAPABLE_MODELS = [
+  "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+] as const;
+
+/** False only for models known to be unable to emit a usable tool call. */
+export function isToolCallCapableDelegate(
+  model: string,
+  incapable: readonly string[] = DELEGATE_TOOL_INCAPABLE_MODELS,
+): boolean {
+  return !incapable.includes(model.trim());
+}
+
 /** Anthropic-native Go models (skip proxy; need opencode_go key). */
 export const DELEGATE_GO_ANTHROPIC_MODELS = [
   "minimax-m3",
@@ -184,7 +214,11 @@ export function selectDelegateModel(input: {
   const goOpenai = input.goOpenaiModels ?? DELEGATE_GO_OPENAI_MODELS;
   const goAnthropic = input.goAnthropicModels ?? DELEGATE_GO_ANTHROPIC_MODELS;
   const installed = input.installedOllamaModels ?? [];
-  const resolvableFree = free.filter((model) => isProxyResolvable(model, installed, goOpenai));
+  // Two independent reasons a free lane is not actually usable: the proxy
+  // cannot route it, or the model cannot emit a tool call. Both cost a whole
+  // turn plus a fallback, so both are filtered before free-first ordering.
+  const resolvableFree = free.filter((model) =>
+    isProxyResolvable(model, installed, goOpenai) && isToolCallCapableDelegate(model));
   const proxyOk = input.proxyAvailable !== false;
   const goKey = input.hasOpenCodeGoKey !== false;
   const configured = input.configuredModel.trim();
