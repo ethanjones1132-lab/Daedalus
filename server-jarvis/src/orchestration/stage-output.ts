@@ -34,6 +34,15 @@ export interface PlannerStageOutput {
   narrative: string;
 }
 
+/** Bounded, sanitized Claude-delegate process diagnostics for stage_runs. */
+export interface DelegateStageDiagnostics {
+  delegate_request_id?: string;
+  auth_mode?: string;
+  base_url?: string;
+  exit_code?: number | null;
+  stderr_tail?: string;
+}
+
 export interface ExecutorStageOutput {
   ok: boolean;
   narrative: string;
@@ -44,6 +53,11 @@ export interface ExecutorStageOutput {
   errorCode?: string;
   /** Actual provider/model used by the final native candidate, for bounded escalation. */
   modelKey?: string;
+  /**
+   * Persistable Claude-delegate process diagnostics (request id, exit code,
+   * sanitized stderr tail). Never put this on SSE or final_output.
+   */
+  diagnostics?: DelegateStageDiagnostics;
 }
 
 export interface ReviewerStageOutput {

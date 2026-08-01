@@ -37,6 +37,12 @@ export interface ReplayRun {
   taskType?: string;
   /** success | partial | failed | degraded, when the run reached a verdict. */
   outcome?: string | null;
+  /** agent_runs.final_output — used by success_declares_incomplete. */
+  finalOutput?: string | null;
+  /** agent_runs.verified_via. */
+  verifiedVia?: string | null;
+  /** agent_runs.check_tier (builtin/existing/none/…). */
+  checkTier?: string | null;
   stageRuns: StageRun[];
   directives: ConductorDirectiveRow[];
 }
@@ -47,7 +53,10 @@ export type ReplayRule =
   | "stage_deadline_exceeded"
   | "noop_executor_turns"
   | "turn_cap_saturation"
-  | "delegate_never_wrote";
+  | "delegate_never_wrote"
+  | "delegate_failed_before_fallback"
+  | "success_without_runtime_check"
+  | "success_declares_incomplete";
 
 export interface ReplayViolation {
   rule: ReplayRule;
@@ -285,6 +294,82 @@ function checkDelegateNeverWrote(run: ReplayRun): ReplayViolation[] {
   }];
 }
 
+/**
+ * A delegate stage row (identified by `delegate_cleanup` in that row) failed
+ * to produce a successful write in the SAME row. A later native write must not
+ * suppress this — that was the false-green that hid eleven days of dead proxy.
+ */
+function checkDelegateFailedBeforeFallback(run: ReplayRun): ReplayViolation[] {
+  const out: ReplayViolation[] = [];
+  for (const stage of run.stageRuns) {
+    const calls = parseToolCalls(stage.tool_calls_json);
+    if (!calls.some((c) => c.name === DELEGATE_MARKER_TOOL)) continue;
+    const wroteInRow = calls.some(
+      (c) => c.name && WRITE_EFFECT_TOOLS.has(c.name) && c.is_error !== true,
+    );
+    if (wroteInRow) continue;
+    out.push({
+      rule: "delegate_failed_before_fallback",
+      agentRunId: run.agentRunId,
+      severity: "high",
+      count: 1,
+      detail:
+        `delegate stage ${stage.id} (turn ${stage.turn_number}) ran without a successful write in that row` +
+        " — later native fallback writes do not clear this failure",
+    });
+  }
+  return out;
+}
+
+function runHasWriteIntent(run: ReplayRun): boolean {
+  const calls = run.stageRuns.flatMap((s) => parseToolCalls(s.tool_calls_json));
+  return calls.some(
+    (c) => c.name === DELEGATE_MARKER_TOOL || (c.name && WRITE_EFFECT_TOOLS.has(c.name)),
+  );
+}
+
+/**
+ * Successful write-intent runs must carry an authoritative runtime check tier.
+ * `null` / missing / `"none"` means the completion was not runtime-verified.
+ */
+function checkSuccessWithoutRuntimeCheck(run: ReplayRun): ReplayViolation[] {
+  if (run.outcome !== "success") return [];
+  if (!runHasWriteIntent(run)) return [];
+  const tier = run.checkTier ?? null;
+  if (tier && tier !== "none") return [];
+  return [{
+    rule: "success_without_runtime_check",
+    agentRunId: run.agentRunId,
+    severity: "high",
+    count: 1,
+    detail:
+      `successful write-intent run has check_tier=${tier === null || tier === undefined ? "null" : JSON.stringify(tier)}` +
+      " — write tasks require a runtime check tier (e.g. builtin/existing)",
+  }];
+}
+
+/**
+ * Task 1 incomplete-language backstop mirrored for offline replay. Same phrase
+ * family as `INCOMPLETE_PROGRESS_PATTERN` in task-run.ts — a "success" final
+ * output that admits incompleteness is a completion-policy failure.
+ */
+const INCOMPLETE_PROGRESS_PATTERN =
+  /\b(?:incomplete|unfinished|cut short|partial(?:ly)?|could not be (?:confirmed|completed|applied|written|verified)|not (?:yet )?(?:been )?(?:applied|completed|confirmed|written|started)|not yet complete|was not (?:applied|modified|updated|written)|remains? (?:unchanged|unmodified|unapplied|to be)|more (?:files|work|evidence)|still (?:need|needs|needed|remains?|pending)|not enough evidence|could not gather|unable to complete|remaining work)\b/i;
+
+function checkSuccessDeclaresIncomplete(run: ReplayRun): ReplayViolation[] {
+  if (run.outcome !== "success") return [];
+  const answer = (run.finalOutput ?? "").trim();
+  if (!answer || !INCOMPLETE_PROGRESS_PATTERN.test(answer)) return [];
+  return [{
+    rule: "success_declares_incomplete",
+    agentRunId: run.agentRunId,
+    severity: "high",
+    count: 1,
+    detail:
+      `successful final_output declares incomplete progress: "${truncate(answer, 90)}"`,
+  }];
+}
+
 /** Every invariant, evaluated against one stored run. Pure. */
 export function checkReplayInvariants(
   run: ReplayRun,
@@ -297,6 +382,9 @@ export function checkReplayInvariants(
     ...checkNoopExecutorTurns(run, thresholds),
     ...checkTurnCapSaturation(run, thresholds),
     ...checkDelegateNeverWrote(run),
+    ...checkDelegateFailedBeforeFallback(run),
+    ...checkSuccessWithoutRuntimeCheck(run),
+    ...checkSuccessDeclaresIncomplete(run),
   ];
 }
 

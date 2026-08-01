@@ -2251,6 +2251,16 @@ export class PipelineExecutor {
               ? "mid_loop_handoff"
               : delegated.terminalStatus,
         partial_error_code: stageSucceeded ? undefined : downgradeCode,
+        // Persist only the bounded diagnostic envelope — never on SSE/final_output.
+        diagnostic_json: delegated.diagnostics
+          ? JSON.stringify({
+              delegate_request_id: delegated.diagnostics.delegate_request_id,
+              auth_mode: delegated.diagnostics.auth_mode,
+              base_url: delegated.diagnostics.base_url,
+              exit_code: delegated.diagnostics.exit_code,
+              stderr_tail: delegated.diagnostics.stderr_tail,
+            })
+          : undefined,
       });
       this.collector.recordModelAttribution?.({
         id: `attr_${crypto.randomUUID()}`,

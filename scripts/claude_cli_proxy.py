@@ -42,6 +42,29 @@ CLAUDE_TIMEOUT = float(os.environ.get("JARVIS_CLAUDE_TIMEOUT", "180"))
 LOCAL_ONLY = os.environ.get("JARVIS_CLAUDE_PROXY_LOCAL_ONLY", "1").lower() not in ("0", "false", "no", "off")
 LOCAL_HOSTNAMES = {"localhost", "host.docker.internal", "host.containers.internal"}
 
+# Correlate proxy logs with stage_runs.diagnostic_json.delegate_request_id.
+# Read once per process (cached); tests may call reset_delegate_request_id_cache().
+_DELEGATE_REQUEST_ID_CACHE: str | None = None
+
+
+def get_delegate_request_id() -> str:
+    """Return JARVIS_DELEGATE_REQUEST_ID or 'missing' (cached after first read)."""
+    global _DELEGATE_REQUEST_ID_CACHE
+    if _DELEGATE_REQUEST_ID_CACHE is None:
+        raw = os.environ.get("JARVIS_DELEGATE_REQUEST_ID", "").strip()
+        _DELEGATE_REQUEST_ID_CACHE = raw or "missing"
+    return _DELEGATE_REQUEST_ID_CACHE
+
+
+def reset_delegate_request_id_cache() -> None:
+    """Test helper: clear the process-level correlation cache."""
+    global _DELEGATE_REQUEST_ID_CACHE
+    _DELEGATE_REQUEST_ID_CACHE = None
+
+
+def delegate_correlation_field() -> str:
+    return f"delegate_request_id={get_delegate_request_id()}"
+
 # ── Remote hosted routing (OpenRouter + OpenCode Go) ────────────────────────
 OPENROUTER_URL = os.environ.get("JARVIS_OPENROUTER_URL", "https://openrouter.ai/api/v1")
 OPENROUTER_REFERER = os.environ.get("JARVIS_OPENROUTER_REFERER", "http://localhost:19877")
@@ -556,7 +579,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         # Strip query parameters for path matching
         path = self.path.split("?")[0]
-        LOG.info("POST %s (path=%s)", self.path, path)
+        correlation = delegate_correlation_field()
+        LOG.info("POST %s (path=%s) %s", self.path, path, correlation)
         if path != "/v1/messages":
             self._write_json(404, {"error": "not found", "path": self.path})
             return
@@ -566,12 +590,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             req = json.loads(raw.decode("utf-8") or "{}")
         except json.JSONDecodeError as exc:
+            LOG.error("request parse error %s: %s", correlation, exc)
             self._write_json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": str(exc)}})
             return
 
         # Per-request upstream selection (Ollama vs OpenRouter) keyed off model id.
         upstream = resolve_upstream(req.get("model") or DEFAULT_MODEL)
         model = upstream["model"]
+        LOG.info("request start model=%s %s", model, correlation)
 
         # Bilateral Translation: Anthropic -> OpenAI
         openai_messages = map_history_messages(req.get("messages", []))
@@ -650,15 +676,19 @@ class Handler(BaseHTTPRequestHandler):
             method="POST"
         )
 
-        LOG.info("Bilateral proxying %s request to %s [%s] (stream=%s)", model, completions_url, upstream["provider"], stream)
         LOG.info(
-            "Upstream turn shape: %s",
+            "Bilateral proxying %s request to %s [%s] (stream=%s) %s",
+            model, completions_url, upstream["provider"], stream, correlation,
+        )
+        LOG.info(
+            "Upstream turn shape: %s %s",
             [
                 m.get("role") + ("+tool_calls" if m.get("tool_calls") else "")
                 for m in payload.get("messages", [])
             ],
+            correlation,
         )
-        LOG.info("Upstream payload: %s", json.dumps(payload, indent=2)[:2000])
+        LOG.info("Upstream payload: %s %s", json.dumps(payload, indent=2)[:2000], correlation)
 
         if not stream:
             try:
@@ -666,13 +696,14 @@ class Handler(BaseHTTPRequestHandler):
                     resp_data = response.read().decode("utf-8")
                     openai_resp = json.loads(resp_data)
                     anthropic_resp = translate_openai_response_to_anthropic(openai_resp, model)
+                    LOG.info("upstream result status=200 %s", correlation)
                     self._write_json(200, anthropic_resp)
             except urllib.error.HTTPError as exc:
                 err_content = exc.read().decode("utf-8")
-                LOG.error("Upstream API Error: %s", err_content)
+                LOG.error("Upstream API Error %s: %s", correlation, err_content)
                 self._write_json(exc.code, {"error": {"type": "api_error", "message": err_content}})
             except Exception as exc:
-                LOG.exception("Upstream dispatch failed")
+                LOG.exception("Upstream dispatch failed %s", correlation)
                 self._write_json(500, {"error": {"type": "internal_error", "message": str(exc)}})
         else:
             try:
@@ -821,9 +852,10 @@ class Handler(BaseHTTPRequestHandler):
                 }
                 emit("message_delta", message_delta)
                 emit("message_stop", {"type": "message_stop"})
+                LOG.info("upstream result status=200 stream=true %s", correlation)
 
             except Exception as exc:
-                LOG.error("Streaming error: %s", exc)
+                LOG.error("Streaming error %s: %s", correlation, exc)
                 error_event = {
                     "type": "error",
                     "error": {"type": "api_error", "message": str(exc)}
