@@ -12,6 +12,7 @@ import {
   delegateEligibility,
   isPermittedDelegateTool,
   mapClaudeDelegateToolName,
+  nodeDelegateProcessFactory,
   nodeDelegateSnapshotFactory,
   runClaudeDelegate,
   type DelegateRootSnapshot,
@@ -1678,5 +1679,89 @@ describe("Claude executor delegate", () => {
     });
     expect(noEvents.errorCode).toBe("delegate_no_events");
     expect(exitHealth.snapshot().lastReason).toBe("no_event_exit");
+  });
+
+  test("process factory retains only a sanitized 4KiB stderr tail", async () => {
+    // >4 KiB of noise, then a secret header near the end so a naive dump would
+    // retain it — diagnostics must keep the newest 4096 chars and scrub secrets.
+    const padding = "noise-line-abcdefghijklmnopqrstuvwxyz\n".repeat(200); // ~6.8 KiB
+    const secret = "Authorization: Bearer secret-value";
+    const tailMarker = "DELEGATE_STDERR_TAIL_MARKER";
+    const stderrPayload = `${padding}${secret}\n${tailMarker}\n`;
+    const script = [
+      `process.stderr.write(${JSON.stringify(stderrPayload)});`,
+      `process.stdout.write(${JSON.stringify(JSON.stringify({ type: "result", result: "ok" }) + "\n")});`,
+    ].join("\n");
+
+    const child = await nodeDelegateProcessFactory({
+      executable: process.execPath,
+      args: ["-e", script],
+      promptOnStdin: false,
+      cleanup: () => {},
+      cwd: process.cwd(),
+      env: { ...process.env } as Record<string, string>,
+      timeoutMs: 10_000,
+      authMode: "proxy",
+      baseUrl: "http://127.0.0.1:19878",
+      prompt: "unused",
+      signal: new AbortController().signal,
+    });
+
+    const events: unknown[] = [];
+    for await (const event of child.events) events.push(event);
+    const exit = await child.exit;
+    expect(exit.code).toBe(0);
+    expect(events.length).toBeGreaterThan(0);
+
+    const diag = child.diagnostics?.();
+    expect(diag).toBeDefined();
+    expect(diag!.stderrTail.length).toBeLessThanOrEqual(4096);
+    expect(diag!.stderrTail).toContain(tailMarker);
+    expect(diag!.stderrTail).not.toContain("secret-value");
+    expect(diag!.stderrTail).not.toMatch(/Authorization:\s*Bearer\s+secret-value/i);
+    expect(diag!.exitCode).toBe(0);
+  });
+
+  test("runClaudeDelegate attaches request-id and process diagnostics to the result", async () => {
+    const config = testConfig();
+    const snapshot: DelegateRootSnapshot = {
+      root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
+    };
+    let launchedEnv: Record<string, string> | undefined;
+    const output = await runClaudeDelegate({
+      config,
+      prompt: "change it",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 30_000,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      health: new DelegateHealth(),
+      snapshotFactory: { capture: async () => [snapshot] },
+      processFactory: async (launch) => {
+        launchedEnv = launch.env;
+        return {
+          events: (async function* () {
+            yield { type: "result", result: "no tools" };
+          })(),
+          exit: Promise.resolve({ code: 1, signal: null }),
+          kill: () => {},
+          diagnostics: () => ({
+            stderrTail: "proxy refused\nAuthorization: Bearer secret-value",
+            exitCode: 1,
+          }),
+        };
+      },
+    });
+
+    expect(launchedEnv?.JARVIS_DELEGATE_REQUEST_ID).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    );
+    expect(output.diagnostics?.delegate_request_id).toBe(launchedEnv?.JARVIS_DELEGATE_REQUEST_ID);
+    expect(output.diagnostics?.exit_code).toBe(1);
+    expect(output.diagnostics?.stderr_tail).toContain("proxy refused");
+    expect(output.diagnostics?.stderr_tail).not.toContain("secret-value");
+    expect(output.diagnostics?.auth_mode).toBeTruthy();
   });
 });

@@ -36,6 +36,7 @@ export type ConductorDirective =
       itemId: string;
       evidenceRef: string;
       evidenceSummary?: string;
+      grounding: import("./task-plan-evidence").TaskPlanEvidenceGrounding;
       gradingMode: "conductor_direct_diff" | "reviewer_mediated" | "runtime_check";
       reason: string;
     }

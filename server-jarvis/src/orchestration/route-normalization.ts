@@ -195,7 +195,9 @@ export type RouteSource =
   | "parse_fallback"
   | "invariant_override"
   | "trivial_short_circuit"
-  | "deterministic";
+  | "deterministic"
+  /** Explicit continuation of an open TaskPlan item — skips Coordinator/Planner. */
+  | "active_plan_continuation";
 
 export interface NormalizedRoute {
   pipeline: StageName[];

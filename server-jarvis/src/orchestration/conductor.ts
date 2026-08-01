@@ -23,6 +23,7 @@ import {
 } from "./runtime-loop";
 import { parseReviewerVerdict } from "./stage-output";
 import { decideVerificationDirective } from "./verification-decision";
+import { buildTaskPlanGrounding, type TaskPlanEvidenceGrounding } from "./task-plan-evidence";
 import { DeadToolTracker } from "./dead-tool-suppression";
 import {
   classifyMidLoopEscalation,
@@ -368,6 +369,11 @@ export class LiveConductor {
             item,
             runId: this.runId,
             remainingQueue,
+            toolCalls: evidence.toolCalls,
+            writeIntent: evidence.writeIntent === true,
+            workspaceEvidenceRequired: Boolean(
+              evidence.request && isDeepReadRequest(evidence.request),
+            ),
           });
           if (decision.kind === "directive") {
             this.lastVerificationDroppedReviewer = decision.dropReviewer === true;
@@ -488,6 +494,7 @@ export class LiveConductor {
             itemId: item.id,
             evidenceRef: evidence.evidenceRef ?? `${this.runId || "run"}:reviewer:${item.id}`,
             evidenceSummary: output.slice(0, 240),
+            grounding: this.buildStageGrounding(evidence, true),
             gradingMode: "reviewer_mediated",
             reason: "reviewer accepted — mark verified and advance",
           };
@@ -564,6 +571,7 @@ export class LiveConductor {
           itemId: item.id,
           evidenceRef: evidence.evidenceRef ?? `${this.runId || "run"}:executor:${item.id}`,
           evidenceSummary: localGrade.reason,
+          grounding: this.buildStageGrounding(evidence, false),
           gradingMode: "conductor_direct_diff",
           reason: localGrade.reason,
         };
@@ -571,6 +579,21 @@ export class LiveConductor {
     }
 
     return null;
+  }
+
+  private buildStageGrounding(
+    evidence: ConductorStageEvidence,
+    reviewerAccepted: boolean,
+  ): TaskPlanEvidenceGrounding {
+    return buildTaskPlanGrounding({
+      writeIntent: evidence.writeIntent === true,
+      workspaceEvidenceRequired: Boolean(
+        evidence.request && isDeepReadRequest(evidence.request),
+      ),
+      reviewerAccepted,
+      toolCalls: evidence.toolCalls ?? [],
+      checkResult: evidence.checkResult,
+    });
   }
 
   private resolvePlanItem(evidence: ConductorStageEvidence): TaskPlanItem | undefined {

@@ -117,6 +117,15 @@ export interface MidLoopSignal {
    * executor turns produced no tool call.
    */
   planNudgesSent?: number;
+  /**
+   * Run-level semantic pressure availability (Task 6). When false, the
+   * corresponding inject/force_write reflex must not re-emit the same class
+   * of note — the host already spent the slot (or will record
+   * `semantic_pressure_suppressed`). Omit/true = available.
+   */
+  writeEffectPressureAvailable?: boolean;
+  planRemainderPressureAvailable?: boolean;
+  qualityPressureAvailable?: boolean;
 }
 
 /** Correctness = mutation floor; quality = product polish after that floor. */
@@ -595,6 +604,7 @@ export function resolveResidentMidLoopDirective(
  */
 export function decideQualityPhaseReflex(signal: MidLoopSignal): LoopIntervention | null {
   if (!shouldRunQualityPhase(signal)) return null;
+  if (signal.qualityPressureAvailable === false) return null;
   // Prefer resident judgment; this reflex is the zero-inference floor when
   // the host wants a guaranteed quality push (forceQualityGate) without
   // waiting for a model that may fail open.
@@ -647,11 +657,13 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
   // Failed mutations with zero success: deterministic correctness push so the
   // executor cannot spin silent failures until replan (live canary: old_string
   // not found ×2 → effect_gate_no_write without enough force_write pressure).
+  // Skip when the run-level write_effect pressure slot is already spent.
   if (
     signal.successfulWrites === 0 &&
     (signal.failedWriteAttempts ?? 0) >= 1 &&
     signal.stageRemainingMs > ABORT_BUDGET_FLOOR_MS &&
-    (signal.forceWriteNudgesSent ?? 0) < FORCE_WRITE_NUDGE_CAP
+    (signal.forceWriteNudgesSent ?? 0) < FORCE_WRITE_NUDGE_CAP &&
+    signal.writeEffectPressureAvailable !== false
   ) {
     return {
       kind: "force_write",
@@ -682,10 +694,12 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
     // next checkpoint aborted. A read spiral is a spiral at read 5 — how much
     // budget is left changes only whether recovery is still POSSIBLE (the
     // abort branch above), never whether the spiral is real.
-    return {
-      kind: "force_write",
-      note: buildReadSpiralNote(signal),
-    };
+    if (signal.writeEffectPressureAvailable !== false) {
+      return {
+        kind: "force_write",
+        note: buildReadSpiralNote(signal),
+      };
+    }
   }
 
   // A re-read loop can hide below the distinct-target floor: repeatedly
@@ -707,13 +721,15 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
           "ending now with a clean partial instead of running to the timeout.",
       };
     }
-    return {
-      kind: "force_write",
-      note: buildReadSpiralNote(
-        signal,
-        `${totalSuccessfulReads} successful reads across ${signal.distinctSuccessfulReads} distinct targets`,
-      ),
-    };
+    if (signal.writeEffectPressureAvailable !== false) {
+      return {
+        kind: "force_write",
+        note: buildReadSpiralNote(
+          signal,
+          `${totalSuccessfulReads} successful reads across ${signal.distinctSuccessfulReads} distinct targets`,
+        ),
+      };
+    }
   }
 
   // A plan remainder we cannot possibly finish should end as a NAMED partial,
@@ -753,7 +769,8 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
   // working; the quality push is left free to fire on its own terms.
   if (
     (signal.planItemsRemaining ?? 0) > 0 &&
-    (signal.planNudgesSent ?? 0) < PLAN_REMAINDER_NUDGE_CAP
+    (signal.planNudgesSent ?? 0) < PLAN_REMAINDER_NUDGE_CAP &&
+    signal.planRemainderPressureAvailable !== false
   ) {
     const remaining = signal.planItemsRemaining ?? 0;
     // 2026-07-31 (run_2c46d082): `activePlanItem` can be the stage-output

@@ -6,6 +6,7 @@ import { checkWrittenFilesSyntax, renderSyntaxIssues, type SyntaxIssue } from ".
 import { renderRunIssues, runWrittenCodeGate, type RunGateResult } from "./run-gate";
 import { mergeToCheckResult, runVerificationCheck, type CheckResult } from "./check-runner";
 import { runBuildCheck, writtenPathsFrom } from "./build-check";
+import { ensureVerificationWorkspaceCached } from "./verification-workspace";
 import { BUILTIN_MODES, executorTurnLimit, getToolsForMode } from "./modes";
 import { toolResultModelText, type ToolRuntime, type ExecutionContext } from "../tool-runtime";
 import type { CallModelFn, ChatMessage } from "./router";
@@ -20,7 +21,12 @@ import type { ConductorBus, ConductorDirective } from "./conductor-bus";
 import type { ConductorStageEvidence, LiveConductor } from "./conductor";
 import { buildSynthesizerContext, buildSynthesizerContextFromStageState } from "./synth-context";
 import { detectDeferralStall, DEFERRAL_STALL_NUDGE } from "./synthesizer-deferral";
-import { applyEffectGate, buildWriteEffectNudge, evaluateEffectGate, hasRepeatedWriteFailureWithoutEffect, isTerminalNoWriteEffect, mostReadSuccessfulFile, shouldPressWriteEffect, WRITE_EFFECT_NUDGE, WRITE_EFFECT_TOOLS, type EffectGateReport } from "./effect-gate";
+import { applyEffectGate, buildWriteEffectNudge, claimWriteEffectPressure, evaluateEffectGate, hasRepeatedWriteFailureWithoutEffect, isTerminalNoWriteEffect, mostReadSuccessfulFile, shouldPressWriteEffect, WRITE_EFFECT_NUDGE, WRITE_EFFECT_TOOLS, type EffectGateReport } from "./effect-gate";
+import {
+  decideExecutorProgress,
+  SemanticPressureBudget,
+  SEMANTIC_PRESSURE_SUPPRESSED,
+} from "./executor-progress-policy";
 import { normalizeRemainingStages, type ExecutionProfile } from "./route-normalization";
 import { hasWriteIntent, type TurnRequirement } from "./turn-requirements";
 import type { TurnBudget } from "./turn-budget";
@@ -49,6 +55,7 @@ import {
 } from "./evidence-sufficiency";
 import { substituteToolCall } from "../tool-heal";
 import {
+  compactCompletedExecutorCycles,
   enforceTranscriptBudget,
   EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS,
   EXECUTOR_TOOL_RESULT_CONTEXT_CHARS,
@@ -65,6 +72,7 @@ import { join, posix, win32 } from "path";
 import { canApplyConductorReroute, rejectReroute } from "./reroute-policy";
 import {
   activePlanItemText,
+  expandActivePlanItem,
   getActivePlanItem,
   incrementPlanItemRepairCycle,
   markPlanItemBlocked,
@@ -82,6 +90,15 @@ import {
   seedTaskPlanFromPlannerProposal,
   type OwnedPlanningAttachment,
 } from "./runtime-loop";
+import {
+  buildTaskPlanGrounding,
+  evaluateTaskPlanAcceptance,
+} from "./task-plan-evidence";
+import {
+  discoverPlanItems,
+  isPlanDocumentPath,
+  requestedPlanGroupFromMessage,
+} from "./task-plan-discovery";
 import { normalizePathInput, resolveAllowedRoots } from "../fs-scope";
 import {
   ClaudeDelegateAvailabilityCache,
@@ -94,12 +111,15 @@ import {
 } from "./claude-delegate";
 import {
   clearDelegateThrash,
+  DEFAULT_THRASH_TTL_MS,
+  delegateThrashKey,
   enumerateDelegateModelCandidates,
   getDelegateThrashCount,
   isDelegateThrashOutcome,
   recordDelegateThrash,
   type DelegateModelSelection,
 } from "./delegate-model-select";
+import { decideDelegateIntervention } from "./delegate-intervention-policy";
 import {
   assessCorrectnessFloor,
   buildMidLoopToolEvidence,
@@ -278,6 +298,12 @@ export interface PipelineExecuteOptions {
   ownedPlanning?: OwnedPlanningAttachment;
   /** Request-wide cancellation (Stop, disconnect, or supersession). */
   turnAbort?: AbortSignal;
+  /**
+   * Run-level semantic pressure claims (Task 6). Created once per agentRunId
+   * and shared across segment/replan so write-effect / plan-remainder notes
+   * cannot re-inject after a reroute.
+   */
+  semanticPressureBudget?: SemanticPressureBudget;
 }
 
 // Derived from the capability taxonomy. READ_CACHE_TOOLS is `cacheable`
@@ -813,8 +839,23 @@ export class PipelineExecutor {
   ): Promise<CheckResult | undefined> {
     const workspaceRoot =
       this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd();
-    const timeoutMs = this.ctx.config.orchestrator?.verification?.check_timeout_ms ?? 90000;
+    const vcfg = this.ctx.config.orchestrator?.verification;
+    const timeoutMs = vcfg?.check_timeout_ms ?? 90_000;
     try {
+      // CMake prepare is outside the model loop and process-cached per workspace.
+      // A ready dir is fed into build-check; unavailable → honest none (no cold configure).
+      let configuredBuildDirs: string[] | undefined;
+      const prepareCmake = vcfg?.prepare_cmake !== false;
+      if (prepareCmake) {
+        const prepared = await ensureVerificationWorkspaceCached({
+          root: workspaceRoot,
+          prepareTimeoutMs: vcfg?.prepare_timeout_ms ?? 120_000,
+          prepareEnabled: true,
+        });
+        if (prepared.kind === "ready") {
+          configuredBuildDirs = [prepared.buildDir];
+        }
+      }
       return await runVerificationCheck({
         toolCalls,
         request,
@@ -825,6 +866,7 @@ export class PipelineExecutor {
           root: workspaceRoot,
           writtenPaths: writtenPathsFrom(toolCalls),
           timeoutMs,
+          configuredBuildDirs,
         }),
         runTests: (tc, req, pl) => this.gateWrittenRun([...tc], req, pl),
       });
@@ -911,6 +953,11 @@ export class PipelineExecutor {
       /** Reroute apply counter; max 1 per segment. */
       reroutesApplied?: { n: number };
       maxReroutesPerSegment?: number;
+      /**
+       * Clear sticky plan_item_acceptance_unmet partial after grounded recovery
+       * (conductor mark_verified success). Owned by executeSegment.
+       */
+      clearAcceptanceUnmetPartial?: () => void;
     },
     remainingQueue: StageName[],
     evidence?: ConductorStageEvidence,
@@ -1001,6 +1048,7 @@ export class PipelineExecutor {
     // extended directive set. Repair-chain stages are injected deterministically
     // — no further Conductor re-decision between Rewriter and Executor.
     if (directive.type === "mark_verified") {
+      let markVerifiedOk = !options.taskRunContract;
       if (options.taskRunContract) {
         try {
           const next = applySufficientVerdict(options.taskRunContract, {
@@ -1009,44 +1057,57 @@ export class PipelineExecutor {
             evidence: {
               ref: directive.evidenceRef,
               summary: directive.evidenceSummary,
+              grounding: directive.grounding,
             },
           });
           options.taskRunContract = next;
           options.onTaskPlanUpdate?.(next);
           this.conductor?.live.setPlanContext(next);
+          markVerifiedOk = true;
         } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
           console.warn(
-            `[Pipeline] mark_verified failed for ${directive.itemId}: ` +
-            `${e instanceof Error ? e.message : String(e)}`,
+            `[Pipeline] mark_verified failed for ${directive.itemId}: ${msg}`,
           );
+          // Fail closed: ungrounded verification must not early-stop / thrift.
+          markVerifiedOk = false;
+          if (this.conductor?.live) {
+            this.conductor.live.lastVerificationEarlyStop = false;
+            this.conductor.live.lastVerificationDroppedReviewer = false;
+          }
         }
       }
 
       // Task 4.3 thrift + Task 5.3 dropReviewer: green existing/builtin can
       // skip intermediate stages (early-stop → synthesizer) or just drop reviewer.
       // Flags are set by LiveConductor verify branch; thrift gate applied here.
-      if (directive.gradingMode === "reviewer_mediated") {
-        this.lastReviewerAccepted = true;
-      }
-      const live = this.conductor?.live;
-      if (options.workQueue && live) {
-        if (
-          live.lastVerificationEarlyStop === true &&
-          this.ctx.config.orchestrator.verification?.thrift?.achieved_effect_early_stop === true
-        ) {
-          options.workQueue.length = 0;
-          options.workQueue.push("synthesizer");
-          console.log(`[Pipeline] achieved-effect early-stop after ${stage}: synthesizer`);
-        } else if (live.lastVerificationDroppedReviewer === true) {
-          const filtered = options.workQueue.filter(
-            (s) => s !== "reviewer" && s !== ("re-enter:reviewer" as StageName),
-          );
-          options.workQueue.length = 0;
-          options.workQueue.push(...filtered);
-          console.log(`[Pipeline] drop-reviewer thrift after ${stage}: ${filtered.join("->") || "(empty)"}`);
+      // Only thrift after a successful ledger mark-off (or when no ledger exists).
+      if (markVerifiedOk) {
+        // Grounded recovery: drop sticky unmet partial from an earlier ACCEPT.
+        options.clearAcceptanceUnmetPartial?.();
+        if (directive.gradingMode === "reviewer_mediated") {
+          this.lastReviewerAccepted = true;
         }
-        live.lastVerificationEarlyStop = false;
-        live.lastVerificationDroppedReviewer = false;
+        const live = this.conductor?.live;
+        if (options.workQueue && live) {
+          if (
+            live.lastVerificationEarlyStop === true &&
+            this.ctx.config.orchestrator.verification?.thrift?.achieved_effect_early_stop === true
+          ) {
+            options.workQueue.length = 0;
+            options.workQueue.push("synthesizer");
+            console.log(`[Pipeline] achieved-effect early-stop after ${stage}: synthesizer`);
+          } else if (live.lastVerificationDroppedReviewer === true) {
+            const filtered = options.workQueue.filter(
+              (s) => s !== "reviewer" && s !== ("re-enter:reviewer" as StageName),
+            );
+            options.workQueue.length = 0;
+            options.workQueue.push(...filtered);
+            console.log(`[Pipeline] drop-reviewer thrift after ${stage}: ${filtered.join("->") || "(empty)"}`);
+          }
+          live.lastVerificationEarlyStop = false;
+          live.lastVerificationDroppedReviewer = false;
+        }
       }
     }
 
@@ -1151,6 +1212,50 @@ export class PipelineExecutor {
   }
 
   /**
+   * After a successful read of an explicit plan/execution document, expand the
+   * active broad TaskPlan item into durable children (A1–A4, …). No-op when
+   * the path is not plan-like, discovery finds fewer than two children, or the
+   * ledger has no active item.
+   */
+  private maybeExpandTaskPlanFromRead(
+    options: PipelineExecuteOptions,
+    path: string,
+    content: string,
+  ): void {
+    if (!options.taskRunContract || !isPlanDocumentPath(path)) return;
+    const active = getActivePlanItem(options.taskRunContract);
+    if (!active) return;
+
+    const requestedGroup = requestedPlanGroupFromMessage(
+      options.rawMessage ?? options.taskRunContract.objective ?? "",
+    );
+    const discovered = discoverPlanItems({
+      path,
+      content,
+      requestedGroup,
+    });
+    if (discovered.length < 2) return;
+
+    try {
+      const next = expandActivePlanItem(options.taskRunContract, active.id, discovered, {
+        sourcePath: path,
+      });
+      options.taskRunContract = next;
+      options.onTaskPlanUpdate?.(next);
+      this.conductor?.live.setPlanContext(next);
+      console.log(
+        `[Pipeline] expanded active plan item ${active.id} → ${discovered.map((d) => d.externalKey).join(", ")} ` +
+        `from ${path}`,
+      );
+    } catch (e) {
+      console.warn(
+        `[Pipeline] plan expansion skipped for ${path}: ` +
+        `${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+
+  /**
    * Dispatch a turn's tool calls with read-parallelism (Task 3.1): read-only
    * batches run concurrently via Promise.all; writes stay serial barriers in
    * model order. `record` is invoked once per call in the original batch
@@ -1229,6 +1334,18 @@ export class PipelineExecutor {
           result.is_error,
           toolResultModelText(result).slice(0, 500),
         );
+        // Task 3: expand broad active items from explicit workspace plan reads.
+        if (
+          !result.is_error &&
+          entry.call.name === "read_file" &&
+          typeof entry.call.arguments?.path === "string"
+        ) {
+          this.maybeExpandTaskPlanFromRead(
+            options,
+            entry.call.arguments.path,
+            toolResultModelText(result),
+          );
+        }
         await record(entry.raw, entry.call, result);
       }
       if (readOnlyOutputCache && settled.some(({ entry, deflected }) => !deflected && cacheInvalidatingTools.has(entry.call.name))) {
@@ -1438,6 +1555,24 @@ export class PipelineExecutor {
     let lastModelKey: string | undefined;
     let turnCount = 0;
     let executorDone = false;
+    /** Typed partial when write-intent turns emit no tools twice (Task 6). */
+    let executorNoToolPartial = false;
+    /** Consecutive write-intent turns with zero tools and zero successful writes. */
+    let consecutiveNoToolTurns = 0;
+    /**
+     * Once the model has emitted any tool call this stage, no-tool bounding
+     * yields to the effect gate / normal completion path (failed tools and
+     * read spirals are not `executor_no_tool`).
+     */
+    let anyModelToolCallThisStage = false;
+    /** In-loop model exclusions from a no-tool strong retry. */
+    let inLoopModelExclusions: string[] = [...(options.modelExclusions ?? [])];
+    /** Prefer strong model after a no-tool retry_strong decision. */
+    let preferStrongNextTurn = options.executorRetryUsed === true;
+    const pressureBudget = options.semanticPressureBudget ?? new SemanticPressureBudget();
+    if (!options.semanticPressureBudget) {
+      options.semanticPressureBudget = pressureBudget;
+    }
     let workspaceEvidenceNudgeCount = 0;
     let evidenceCountAtLastNudge = 0;
     let writeEffectNudgeCount = 0;
@@ -1819,11 +1954,15 @@ export class PipelineExecutor {
       // Checking with model="auto" forced the proxy path and silently failed
       // when free/OpenAI-format models could not launch — then native free
       // thrash ate the turn with zero writes.
-      const thrashKey = agentRunId;
+      // Thrash is session-scoped (with TTL) so free→Go promotion survives
+      // agent-run boundaries within one conversation.
+      const thrashKey = delegateThrashKey(this.ctx.session_id ?? "");
+      const thrashTtlMs = this.ctx.config.claude_cli.delegate.thrash_ttl_ms
+        ?? DEFAULT_THRASH_TTL_MS;
       const hasGoKey = Boolean(this.ctx.config.opencode_go.api_key?.trim());
       const candidates = enumerateDelegateModelCandidates({
         configuredModel: this.ctx.config.claude_cli.delegate.model,
-        thrashCount: getDelegateThrashCount(thrashKey),
+        thrashCount: getDelegateThrashCount(thrashKey, thrashTtlMs),
         thrashThreshold: this.ctx.config.claude_cli.delegate.free_thrash_threshold,
         hasOpenCodeGoKey: hasGoKey,
         // Probe both proxy and no-proxy candidates; availability filters.
@@ -1971,6 +2110,19 @@ export class PipelineExecutor {
               record.is_error,
               (record.output || "").slice(0, 500),
             );
+            // Same TaskPlan expansion as native dispatchToolCalls — one ledger
+            // for delegate and native execution.
+            if (
+              !record.is_error &&
+              record.name === "read_file" &&
+              typeof record.arguments?.path === "string"
+            ) {
+              this.maybeExpandTaskPlanFromRead(
+                options,
+                record.arguments.path,
+                record.output || "",
+              );
+            }
             const midLoop = await runMidLoopCheckpoint(
               [...priorToolCalls, ...delegateStreamCalls],
               delegateStreamCalls.length,
@@ -1979,41 +2131,84 @@ export class PipelineExecutor {
               },
             );
             if (!midLoop || midLoopStop) return;
-            if (midLoop.kind === "abort") {
+
+            // Claude CLI cannot accept mid-stream user notes. Decide whether to
+            // abort, hand off, defer (keep exploring), or observe (write landed).
+            const streamWrites = delegateStreamCalls.filter(
+              (call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name),
+            ).length;
+            const streamFailedWrites = delegateStreamCalls.filter(
+              (call) => call.is_error === true && WRITE_EFFECT_TOOLS.has(call.name),
+            ).length;
+            const streamReads = delegateStreamCalls.filter(
+              (call) => !call.is_error && (call.name === "read_file" || call.name === "Read"),
+            ).length;
+            const policyDenied = delegateStreamCalls.some(
+              (call) => call.error_code === "policy_denied",
+            );
+            const elapsedMs = Date.now() - delegateStart;
+            const stageRemainingMs = options.turnBudget?.stageRemainingMs("executor")
+              ?? this.ctx.config.claude_cli.delegate.timeout_ms;
+            const explorationLimitMs = this.ctx.config.claude_cli.delegate.exploration_limit_ms
+              ?? 45_000;
+            const nativeFallbackReserveMs = this.ctx.config.claude_cli.delegate.native_fallback_reserve_ms
+              ?? 30_000;
+            const action = decideDelegateIntervention({
+              intervention: midLoop,
+              successfulReads: streamReads,
+              successfulWrites: streamWrites,
+              failedWrites: streamFailedWrites,
+              policyDenied,
+              elapsedMs,
+              stageRemainingMs,
+              explorationLimitMs,
+              nativeFallbackReserveMs,
+            });
+
+            if (action === "abort" && midLoop.kind === "abort") {
               midLoopStop = { kind: "abort", reason: midLoop.reason };
               midLoopAbortController.abort();
               onStateChange({ stage: "executor", status: "running", detail: "mid_loop_abort" });
               return;
             }
+
             if (
-              (midLoop.kind === "force_write" || midLoop.kind === "redirect" || midLoop.kind === "inject")
+              action === "handoff"
+              && (midLoop.kind === "force_write" || midLoop.kind === "redirect" || midLoop.kind === "inject")
               && "note" in midLoop
             ) {
-              const streamWrites = delegateStreamCalls.filter(
-                (call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name),
-              ).length;
-              // Claude CLI cannot accept mid-stream user notes. Handoff to
-              // native with the intervention when no verified write exists yet;
-              // after a write, only record the directive (already done) so a
-              // quality inject does not discard a landed mutation.
-              if (streamWrites === 0 && midLoop.kind !== "inject") {
-                midLoopStop = { kind: "handoff", note: midLoop.note };
-                midLoopAbortController.abort();
-                onStateChange({
-                  stage: "executor",
-                  status: "running",
-                  detail: `mid_loop_handoff:${midLoop.kind}`,
-                });
-              } else if (midLoop.kind === "inject" && streamWrites === 0) {
-                midLoopStop = { kind: "handoff", note: midLoop.note };
-                midLoopAbortController.abort();
-                onStateChange({
-                  stage: "executor",
-                  status: "running",
-                  detail: "mid_loop_handoff:inject",
-                });
-              }
+              midLoopStop = { kind: "handoff", note: midLoop.note };
+              midLoopAbortController.abort();
+              onStateChange({
+                stage: "executor",
+                status: "running",
+                detail: `mid_loop_handoff:${midLoop.kind}`,
+              });
+              return;
             }
+
+            if (
+              action === "defer"
+              && (midLoop.kind === "force_write" || midLoop.kind === "redirect" || midLoop.kind === "inject")
+            ) {
+              // mid_loop_* already persisted; record deferral without aborting CLI.
+              this.collector.recordDirective?.({
+                id: `dir_${crypto.randomUUID()}`,
+                agent_run_id: agentRunId,
+                stage: "executor",
+                directive_type: "delegate_intervention_deferred",
+                decision_source: midLoop.decisionSource ?? "deterministic_reflex",
+                escalation_id: midLoop.escalationId,
+                reason: `reads=${streamReads} elapsed_ms=${elapsedMs} kind=${midLoop.kind}`,
+                inject_note: "note" in midLoop ? midLoop.note : undefined,
+              });
+              onStateChange({
+                stage: "executor",
+                status: "running",
+                detail: `delegate_intervention_deferred:${midLoop.kind}`,
+              });
+            }
+            // action === "observe": verified write already recorded via mid_loop_*; keep process.
           },
         });
       } catch (error) {
@@ -2070,7 +2265,8 @@ export class PipelineExecutor {
             ? "mid_loop_handoff"
           : delegated.errorCode
           ?? (cancelled ? "delegate_aborted" : hasVerifiedWrite ? undefined : "delegate_no_write");
-      // Slice B thrash accounting: promote free → Go on repeated non-writes.
+      // Slice B thrash accounting: promote free → Go on repeated non-writes/handoffs.
+      // Session-scoped with TTL so promotion survives run boundaries but expires.
       if (
         isDelegateThrashOutcome({
           ok: delegated.ok === true,
@@ -2078,7 +2274,7 @@ export class PipelineExecutor {
           errorCode: downgradeCode ?? delegated.errorCode,
         })
       ) {
-        recordDelegateThrash(thrashKey);
+        recordDelegateThrash(thrashKey, thrashTtlMs);
       } else if (hasVerifiedWrite) {
         clearDelegateThrash(thrashKey);
       }
@@ -2102,6 +2298,16 @@ export class PipelineExecutor {
               ? "mid_loop_handoff"
               : delegated.terminalStatus,
         partial_error_code: stageSucceeded ? undefined : downgradeCode,
+        // Persist only the bounded diagnostic envelope — never on SSE/final_output.
+        diagnostic_json: delegated.diagnostics
+          ? JSON.stringify({
+              delegate_request_id: delegated.diagnostics.delegate_request_id,
+              auth_mode: delegated.diagnostics.auth_mode,
+              base_url: delegated.diagnostics.base_url,
+              exit_code: delegated.diagnostics.exit_code,
+              stderr_tail: delegated.diagnostics.stderr_tail,
+            })
+          : undefined,
       });
       this.collector.recordModelAttribution?.({
         id: `attr_${crypto.randomUUID()}`,
@@ -2535,6 +2741,20 @@ export class PipelineExecutor {
         let response: any;
 
         try {
+          // Cycle compaction first (whole assistant/tool cycles → evidence
+          // checkpoint), then payload eviction as the final size fence.
+          const cycleCompact = compactCompletedExecutorCycles(
+            executorMessages,
+            toolCalls,
+            transcriptBudgetTokens,
+          );
+          if (cycleCompact.compactedCycles > 0) {
+            onStateChange({
+              stage: "executor",
+              status: "running",
+              detail: `context_compacted:${cycleCompact.compactedCycles}`,
+            });
+          }
           const transcriptBudget = enforceTranscriptBudget(executorMessages, transcriptBudgetTokens);
           if (transcriptBudget.evicted > 0) {
             onStateChange({
@@ -2543,6 +2763,7 @@ export class PipelineExecutor {
               detail: `context_evicted:${transcriptBudget.evicted}`,
             });
           }
+          // Exact input token count after compaction + eviction.
           const inputTokens = transcriptBudget.inputTokens;
           response = await this.callModel(executorMessages, {
             temperature: BUILTIN_MODES.executor.temperature,
@@ -2553,8 +2774,8 @@ export class PipelineExecutor {
             stream: true,
             stageLabel: "executor",
             complexity: options.estimatedComplexity,
-            preferStrongModel: options.executorRetryUsed === true,
-            excludeModels: options.modelExclusions,
+            preferStrongModel: preferStrongNextTurn,
+            excludeModels: inLoopModelExclusions.length > 0 ? inLoopModelExclusions : options.modelExclusions,
             suppressActivity: true,
             stageAbort: this.registerStageAbort("executor"),
             onChunk: (chunk) => {
@@ -2683,28 +2904,98 @@ export class PipelineExecutor {
               workspaceEvidenceNudgeCount === 0 ||
               evidenceNow > evidenceCountAtLastNudge;
             if (mayNudge) {
-              workspaceEvidenceNudgeCount++;
-              evidenceCountAtLastNudge = evidenceNow;
-              workspaceEvidenceNudgeSentThisTurn = true;
-              executorMessages.push({
-                role: "user",
-                content:
-                  `Workspace evidence is required for this turn. ${assessmentAfterTurn.reason}. Call the relevant read-only workspace tools (read_file, list_directory, glob, or grep) and ground your findings in their results before answering.` +
-                  (requiresWriteEffect
-                    ? " This is ALSO a change request: after reading, apply the requested change with write_file/edit_file/multi_edit/apply_patch."
-                    : ""),
-              });
+              const evidenceNote =
+                `Workspace evidence is required for this turn. ${assessmentAfterTurn.reason}. Call the relevant read-only workspace tools (read_file, list_directory, glob, or grep) and ground your findings in their results before answering.` +
+                (requiresWriteEffect
+                  ? " This is ALSO a change request: after reading, apply the requested change with write_file/edit_file/multi_edit/apply_patch."
+                  : "");
+              if (pressureBudget.claim("workspace_evidence")) {
+                workspaceEvidenceNudgeCount++;
+                evidenceCountAtLastNudge = evidenceNow;
+                workspaceEvidenceNudgeSentThisTurn = true;
+                executorMessages.push({
+                  role: "user",
+                  content: evidenceNote,
+                });
+              } else {
+                this.collector.recordDirective?.({
+                  id: `dir_${crypto.randomUUID()}`,
+                  agent_run_id: agentRunId,
+                  stage: "executor",
+                  directive_type: SEMANTIC_PRESSURE_SUPPRESSED,
+                  decision_source: "deterministic_reflex",
+                  reason: "workspace_evidence",
+                });
+              }
             }
           }
+
+          // Task 6: bound consecutive pure-prose write turns (retry_strong once,
+          // then stop_partial). Any real tool call this stage disables the
+          // bound so failed tools / read spirals still reach the effect gate.
+          const stageRemainingMs =
+            options.turnBudget?.stageRemainingMs("executor") ?? Number.POSITIVE_INFINITY;
+          if (emittedToolCalls) {
+            consecutiveNoToolTurns = 0;
+            anyModelToolCallThisStage = true;
+          } else if (requiresWriteEffect && successfulWriteCount() === 0) {
+            consecutiveNoToolTurns += 1;
+          }
+          const progressDecision = anyModelToolCallThisStage
+            ? "continue" as const
+            : decideExecutorProgress({
+                writeIntent: requiresWriteEffect,
+                emittedToolCalls,
+                successfulWrites: successfulWriteCount(),
+                consecutiveNoToolTurns,
+                stageRemainingMs,
+              });
 
           // Write pressure (2026-07-17): the model is about to end a
           // full-profile change turn with zero successful mutations. Press it
           // (bounded) to actually call a write tool instead of accepting the
           // prose ending — but never into a nearly-exhausted stage window.
+          // Shared SemanticPressureBudget: only the first write_effect inject
+          // per agent run actually adds transcript text.
           let writeEffectNudgeSentThisTurn = false;
-          if (
+          const tryInjectWriteEffect = (note: string, source: "deterministic_reflex" | "no_tool_retry"): boolean => {
+            if (claimWriteEffectPressure(pressureBudget)) {
+              writeEffectNudgeCount++;
+              writeEffectNudgeSentThisTurn = true;
+              executorMessages.push({ role: "user", content: note });
+              this.collector.recordDirective?.({
+                id: `dir_${crypto.randomUUID()}`,
+                agent_run_id: agentRunId,
+                stage: "executor",
+                directive_type: "write_effect_nudge",
+                decision_source: source,
+                inject_note: note,
+              });
+              return true;
+            }
+            this.collector.recordDirective?.({
+              id: `dir_${crypto.randomUUID()}`,
+              agent_run_id: agentRunId,
+              stage: "executor",
+              directive_type: SEMANTIC_PRESSURE_SUPPRESSED,
+              decision_source: source,
+              reason: "write_effect",
+            });
+            return false;
+          };
+
+          if (progressDecision === "retry_strong") {
+            preferStrongNextTurn = true;
+            if (lastModelKey && !inLoopModelExclusions.includes(lastModelKey)) {
+              inLoopModelExclusions = [...inLoopModelExclusions, lastModelKey];
+            }
+            tryInjectWriteEffect(WRITE_EFFECT_NUDGE, "no_tool_retry");
+          } else if (
+            progressDecision !== "stop_partial" &&
             !repeatedWriteFailureReached &&
-            (options.turnBudget?.stageRemainingMs("executor") ?? Number.POSITIVE_INFINITY) > 8_000 &&
+            stageRemainingMs > 8_000 &&
+            // Evaluate press without the availability gate so a spent budget
+            // still records semantic_pressure_suppressed via tryInject.
             shouldPressWriteEffect({
               writeIntent: requiresWriteEffect,
               profile,
@@ -2717,47 +3008,73 @@ export class PipelineExecutor {
               maxTurns,
             })
           ) {
-            writeEffectNudgeCount++;
-            writeEffectNudgeSentThisTurn = true;
             const writeEffectNudge = emittedToolCalls
               ? buildWriteEffectNudge(availableWriteTools, mostReadTarget())
               : WRITE_EFFECT_NUDGE;
-            executorMessages.push({
-              role: "user",
-              content: writeEffectNudge,
-            });
-            this.collector.recordDirective?.({
-              id: `dir_${crypto.randomUUID()}`,
-              agent_run_id: agentRunId,
-              stage: "executor",
-              directive_type: "write_effect_nudge",
-              decision_source: "deterministic_reflex",
-              inject_note: writeEffectNudge,
-            });
+            tryInjectWriteEffect(writeEffectNudge, "deterministic_reflex");
           }
 
           // Rung 2: real-time in-turn ownership (default on). Quality-aware:
           // successfulWrites alone no longer end supervision — a write that
           // just landed triggers a post-write checkpoint (+ bounded check-runner).
-          const midLoop = await runMidLoopCheckpoint(toolCalls, turnCount, {
-            progressSinceLastCheckpoint: emittedToolCalls
-              ? `native turn ${turnCount}: ${toolCalls.slice(turnStartIdx).map((c) => c.name).join(", ") || "no tools"}`
-              : `native turn ${turnCount}: no tool calls`,
-          });
+          // Skip mid-loop pressure when we already decided stop_partial.
           let midLoopHeldOpen = false;
+          const midLoop = progressDecision === "stop_partial"
+            ? null
+            : await runMidLoopCheckpoint(toolCalls, turnCount, {
+                progressSinceLastCheckpoint: emittedToolCalls
+                  ? `native turn ${turnCount}: ${toolCalls.slice(turnStartIdx).map((c) => c.name).join(", ") || "no tools"}`
+                  : `native turn ${turnCount}: no tool calls`,
+              });
           if (midLoop) {
             if (midLoop.kind === "abort") {
               executorDone = true;
               narratives.push(`[Conductor] ${midLoop.reason}`);
               onStateChange({ stage: "executor", status: "running", detail: "mid_loop_abort" });
             } else if (midLoop.kind === "force_write" && !writeEffectNudgeSentThisTurn) {
-              writeEffectNudgeCount++;
-              writeEffectNudgeSentThisTurn = true;
-              midLoopHeldOpen = true;
-              executorMessages.push({ role: "user", content: midLoop.note });
+              if (tryInjectWriteEffect(midLoop.note, "deterministic_reflex")) {
+                midLoopHeldOpen = true;
+              }
             } else if (midLoop.kind === "inject") {
-              midLoopHeldOpen = true;
-              executorMessages.push({ role: "user", content: midLoop.note });
+              const isPlanRemainder = midLoop.noteKind === "plan_remainder";
+              const isQuality = (midLoop as { decisionSource?: string }).decisionSource === "schema_control"
+                || (midLoop as { decisionSource?: string }).decisionSource === "deterministic_reflex";
+              if (isPlanRemainder) {
+                if (pressureBudget.claim("plan_remainder")) {
+                  midLoopHeldOpen = true;
+                  executorMessages.push({ role: "user", content: midLoop.note });
+                } else {
+                  this.collector.recordDirective?.({
+                    id: `dir_${crypto.randomUUID()}`,
+                    agent_run_id: agentRunId,
+                    stage: "executor",
+                    directive_type: SEMANTIC_PRESSURE_SUPPRESSED,
+                    decision_source: midLoop.decisionSource,
+                    reason: "plan_remainder",
+                  });
+                }
+              } else if (
+                // Quality injects share quality_after_correctness slot.
+                midLoop.note === DEFAULT_QUALITY_PUSH_NOTE ||
+                (isQuality && successfulWriteCount() > 0)
+              ) {
+                if (pressureBudget.claim("quality_after_correctness")) {
+                  midLoopHeldOpen = true;
+                  executorMessages.push({ role: "user", content: midLoop.note });
+                } else {
+                  this.collector.recordDirective?.({
+                    id: `dir_${crypto.randomUUID()}`,
+                    agent_run_id: agentRunId,
+                    stage: "executor",
+                    directive_type: SEMANTIC_PRESSURE_SUPPRESSED,
+                    decision_source: midLoop.decisionSource,
+                    reason: "quality_after_correctness",
+                  });
+                }
+              } else {
+                midLoopHeldOpen = true;
+                executorMessages.push({ role: "user", content: midLoop.note });
+              }
             } else if (midLoop.kind === "redirect") {
               midLoopHeldOpen = true;
               executorMessages.push({ role: "user", content: midLoop.note });
@@ -2862,23 +3179,48 @@ export class PipelineExecutor {
                   qualityGate.decisionSource === "escalation_reserved") &&
                 qualityPushesUsed < MAX_QUALITY_PUSHES
               ) {
-                qualityPushesUsed += 1;
-                midLoopHeldOpen = true;
-                executorMessages.push({ role: "user", content: DEFAULT_QUALITY_PUSH_NOTE });
-                this.collector.recordDirective?.({
-                  id: `dir_${crypto.randomUUID()}`,
-                  agent_run_id: agentRunId,
-                  stage: "executor",
-                  directive_type: "mid_loop_quality_push",
-                  decision_source: "deterministic_reflex",
-                  reason: `quality_push_host_failopen ${qualityPushesUsed}/${MAX_QUALITY_PUSHES}`,
-                  inject_note: DEFAULT_QUALITY_PUSH_NOTE,
-                });
+                if (pressureBudget.claim("quality_after_correctness")) {
+                  qualityPushesUsed += 1;
+                  midLoopHeldOpen = true;
+                  executorMessages.push({ role: "user", content: DEFAULT_QUALITY_PUSH_NOTE });
+                  this.collector.recordDirective?.({
+                    id: `dir_${crypto.randomUUID()}`,
+                    agent_run_id: agentRunId,
+                    stage: "executor",
+                    directive_type: "mid_loop_quality_push",
+                    decision_source: "deterministic_reflex",
+                    reason: `quality_push_host_failopen ${qualityPushesUsed}/${MAX_QUALITY_PUSHES}`,
+                    inject_note: DEFAULT_QUALITY_PUSH_NOTE,
+                  });
+                } else {
+                  this.collector.recordDirective?.({
+                    id: `dir_${crypto.randomUUID()}`,
+                    agent_run_id: agentRunId,
+                    stage: "executor",
+                    directive_type: SEMANTIC_PRESSURE_SUPPRESSED,
+                    decision_source: "deterministic_reflex",
+                    reason: "quality_after_correctness",
+                  });
+                }
               }
             }
           }
 
-          if (
+          if (progressDecision === "stop_partial") {
+            executorDone = true;
+            executorNoToolPartial = true;
+            narratives.push(
+              "Executor stopped after consecutive write-intent turns with no tool calls; " +
+                "reporting partial rather than spending more model budget on prose.",
+            );
+            onStateChange({
+              stage: "executor",
+              status: "partial",
+              detail: "executor_no_tool",
+            });
+          } else if (progressDecision === "retry_strong") {
+            // Keep the loop open for one strong-model retry (note already injected).
+          } else if (
             !executorDone &&
             !emittedToolCalls &&
             !workspaceEvidenceNudgeSentThisTurn &&
@@ -2893,6 +3235,11 @@ export class PipelineExecutor {
           // workspace-evidence verdict. A successful read is not a model error
           // merely because the deep-read floor still needs another file.
           const turnHadToolError = turnToolErrors.length > 0;
+          // Task 6: no-tool write turns are typed failures for model learning.
+          const isNoToolWriteTurn =
+            requiresWriteEffect &&
+            !emittedToolCalls &&
+            successfulWriteCount() === 0;
           this.collector.recordStageRun({
             id: `stage_${crypto.randomUUID()}`,
             agent_run_id: agentRunId,
@@ -2902,11 +3249,15 @@ export class PipelineExecutor {
             output_tokens: countTokens(response?.content || ""),
             tool_calls_json: JSON.stringify(response?.tool_calls || []),
             duration_ms: Date.now() - turnStartTime,
-            was_successful: turnHadToolError ? 0 : 1,
-            had_error: turnHadToolError ? 1 : 0,
+            was_successful: isNoToolWriteTurn || turnHadToolError ? 0 : 1,
+            had_error: isNoToolWriteTurn || turnHadToolError ? 1 : 0,
             error_message: turnToolErrors[0]
               ? `${turnToolErrors[0].name}: ${(turnToolErrors[0].output || "").slice(0, 200)}`
-              : undefined,
+              : isNoToolWriteTurn
+                ? "executor_no_tool"
+                : undefined,
+            stop_reason: isNoToolWriteTurn ? "no_tool" : undefined,
+            partial_error_code: isNoToolWriteTurn ? "executor_no_tool" : undefined,
           });
         } catch (err: any) {
           this.collector.recordStageRun({
@@ -3049,6 +3400,38 @@ export class PipelineExecutor {
           toolCalls,
           terminalStatus: "failed",
           errorCode: "effect_gate_no_write_effect",
+          modelKey: lastModelKey,
+        };
+      }
+      if (executorNoToolPartial) {
+        const message =
+          "Executor ended partial after consecutive write-intent turns emitted no tool calls.";
+        const partialNarrative = [narrative, message].filter(Boolean).join("\n\n");
+        onStateChange({
+          stage: "executor",
+          status: "partial",
+          output: message,
+          detail: "executor_no_tool",
+        });
+        await this.afterConductorStage(
+          "executor",
+          "failed",
+          partialNarrative,
+          agentRunId,
+          options,
+          remainingQueue,
+          executorEvidence(),
+        );
+        // ok stays true so the segment is not treated as an upstream hard
+        // failure: the typed partial errorCode + partialStage carry the
+        // no-tool signal, and the effect gate remains free to fail a
+        // zero-write write-intent run as effect_gate_no_write_effect.
+        return {
+          ok: true,
+          narrative: partialNarrative,
+          toolCalls,
+          terminalStatus: "partial",
+          errorCode: "executor_no_tool",
           modelKey: lastModelKey,
         };
       }
@@ -3454,11 +3837,24 @@ export class PipelineExecutor {
         const hadWritten = writtenToolCalls.some(
           (c) => !c.is_error && WRITE_EFFECT_TOOLS.has(c.name),
         );
+        const reviewRoot = this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd();
+        const reviewVcfg = this.ctx.config.orchestrator.verification;
+        let reviewConfiguredDirs: string[] | undefined;
+        const reviewPrepareCmake = reviewVcfg?.prepare_cmake !== false;
+        if (hadWritten && reviewPrepareCmake) {
+          const prepared = await ensureVerificationWorkspaceCached({
+            root: reviewRoot,
+            prepareTimeoutMs: reviewVcfg?.prepare_timeout_ms ?? 120_000,
+            prepareEnabled: true,
+          });
+          if (prepared.kind === "ready") reviewConfiguredDirs = [prepared.buildDir];
+        }
         const reviewerBuild = hadWritten
           ? await runBuildCheck({
-              root: this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd(),
+              root: reviewRoot,
               writtenPaths: writtenPathsFrom(writtenToolCalls),
-              timeoutMs: this.ctx.config.orchestrator.verification.check_timeout_ms ?? 90000,
+              timeoutMs: reviewVcfg.check_timeout_ms ?? 90_000,
+              configuredBuildDirs: reviewConfiguredDirs,
             })
           : { kind: "not_applicable", reason: "no written code" } as const;
         this.lastCheckResult = mergeToCheckResult({
@@ -4046,6 +4442,11 @@ export class PipelineExecutor {
     options: PipelineExecuteOptions,
     carry: PipelineStageState = {},
   ): Promise<PipelineSegmentResult> {
+    // Once per agentRunId: share across segment/replan so write-effect notes
+    // cannot re-inject after a reroute (Task 6).
+    if (!options.semanticPressureBudget) {
+      options.semanticPressureBudget = new SemanticPressureBudget();
+    }
     const state: PipelineStageState = { ...carry };
     const profile: ExecutionProfile = options.executionProfile ?? "full";
     const intentText = options.rawMessage ?? request;
@@ -4069,6 +4470,11 @@ export class PipelineExecutor {
       checkResult: this.lastCheckResult,
       reviewerAccepted: this.lastReviewerAccepted,
     });
+    const clearAcceptanceUnmetPartial = () => {
+      if (partialStage?.errorCode === "plan_item_acceptance_unmet") {
+        partialStage = undefined;
+      }
+    };
     const pendingInjections = new Map<StageName, string[]>();
     const reroutesApplied = { n: 0 };
     // Post-loop executor re-entry is bounded to one per segment: the in-loop
@@ -4085,6 +4491,7 @@ export class PipelineExecutor {
       workQueue,
       reroutesApplied,
       maxReroutesPerSegment: 3,
+      clearAcceptanceUnmetPartial,
     };
 
     // Drain the queue. Synthesizer is a barrier: effect-gate + evidence fence
@@ -4163,6 +4570,12 @@ export class PipelineExecutor {
         state.executor = await this.runExecutorStage(
           request, renderPlanSummary(state.plan), agentRunId, onStateChange, executorOptions, profile, remainingNow(),
         );
+        // Plan expansion (and other in-executor ledger mutations) write to the
+        // shallow-copied executorOptions; mirror them onto segment opts so
+        // reviewer / acceptance paths see the expanded children.
+        if (executorOptions.taskRunContract) {
+          opts.taskRunContract = executorOptions.taskRunContract;
+        }
         // P2.3: a high-complexity CHANGE gets one alternate strong executor
         // only when deterministic verification says candidate one failed.
         // The retry starts from the current workspace, carries no stale model
@@ -4241,11 +4654,19 @@ export class PipelineExecutor {
           });
           return finish({ state, effectGate, partialStage });
         }
+        if (state.executor.errorCode === "executor_no_tool") {
+          // Bound no-tool spend ends the executor stage, but remaining
+          // stages (reviewer/rewriter/synthesizer) still run so repair
+          // paths and honest effect-gating can finish the turn.
+          partialStage = { stage: "executor", errorCode: "executor_no_tool" };
+          continue;
+        }
         // T2.4: hard executor failure (non-workspace_read) → replan pre-synthesizer.
         // workspace_read falls through to the evidence fence for precise codes.
         if (
           state.executor &&
           state.executor.ok === false &&
+          state.executor.errorCode !== "executor_no_tool" &&
           wantsSynthesizer &&
           options.allowMidRunReplan !== false &&
           !requiresWorkspaceEvidence
@@ -4415,7 +4836,8 @@ export class PipelineExecutor {
           };
           return finish({ state, replanRequested, partialStage });
         }
-        // Reviewer accept with active plan item → mark verified (reviewer_mediated).
+        // Reviewer accept with active plan item → mark verified only when
+        // structured grounding satisfies acceptance checks (fail closed).
         if (
           reviewer &&
           !reviewer.hasIssues &&
@@ -4423,20 +4845,88 @@ export class PipelineExecutor {
           opts.taskRunContract &&
           activeItem
         ) {
+          const grounding = buildTaskPlanGrounding({
+            writeIntent: writeIntentForRepair,
+            workspaceEvidenceRequired: requiresWorkspaceEvidence,
+            reviewerAccepted: true,
+            toolCalls: state.executor?.toolCalls ?? [],
+            checkResult: this.lastCheckResult,
+          });
+          const acceptance = evaluateTaskPlanAcceptance(activeItem, grounding);
+          if (!acceptance.accepted) {
+            console.warn(
+              `[Pipeline] reviewer ACCEPT without grounded evidence for ${activeItem.id}: ` +
+              acceptance.unmet.join(","),
+            );
+            partialStage = {
+              stage: "reviewer" as StageName,
+              errorCode: "plan_item_acceptance_unmet",
+            };
+            // Enqueue repair only when remaining repair budget permits.
+            const unmetRepair = decideRepairChain({
+              reviewerHasIssues: true,
+              writeIntent: writeIntentForRepair,
+              profile,
+              repairCycleCount: ledgerCycles,
+              maxRepairCycles,
+              consecutiveFailures: this.conductor?.live.getConsecutiveToolErrors?.() ?? 0,
+            });
+            if (unmetRepair.fire) {
+              const chainRemaining = mergeRepairChainIntoRemaining(
+                remainingNow().length > 0 ? remainingNow() : (wantsSynthesizer ? ["synthesizer"] : []),
+                unmetRepair.stages,
+              );
+              workQueue.length = 0;
+              workQueue.push(...chainRemaining);
+              try {
+                const applied = applyInsufficientVerdict(opts.taskRunContract, {
+                  itemId: activeItem.id,
+                  flaggedIssues: `plan_item_acceptance_unmet:${acceptance.unmet.join(",")}`,
+                  maxRepairCycles,
+                  consecutiveFailures: this.conductor?.live.getConsecutiveToolErrors?.() ?? 0,
+                });
+                opts.taskRunContract = applied.contract;
+                opts.onTaskPlanUpdate?.(applied.contract);
+                this.conductor?.live.setPlanContext(applied.contract);
+              } catch (e) {
+                console.warn(
+                  `[Pipeline] acceptance-unmet repair ledger update failed: ` +
+                  `${e instanceof Error ? e.message : String(e)}`,
+                );
+              }
+              console.log(
+                `[Pipeline] acceptance unmet — repair chain: ${chainRemaining.join("->")}`,
+              );
+              continue;
+            }
+            // No repair budget: surface partial and skip synthesizer success path.
+            return finish({
+              state,
+              partialStage,
+            });
+          }
           this.lastReviewerAccepted = true;
           try {
             const next = applyReviewerAccept(opts.taskRunContract, activeItem.id, {
               ref: `${agentRunId}:reviewer:${activeItem.id}`,
               summary: reviewer.feedback?.slice(0, 240),
+              grounding,
             });
             opts.taskRunContract = next;
             opts.onTaskPlanUpdate?.(next);
             this.conductor?.live.setPlanContext(next);
+            // Grounded recovery: prior unmet ACCEPT must not stick after verify.
+            clearAcceptanceUnmetPartial();
           } catch (e) {
-            console.warn(
-              `[Pipeline] reviewer accept mark-verified failed: ` +
-              `${e instanceof Error ? e.message : String(e)}`,
-            );
+            const msg = e instanceof Error ? e.message : String(e);
+            console.warn(`[Pipeline] reviewer accept mark-verified failed: ${msg}`);
+            if (msg.startsWith("plan_item_acceptance_unmet")) {
+              partialStage = {
+                stage: "reviewer" as StageName,
+                errorCode: "plan_item_acceptance_unmet",
+              };
+              return finish({ state, partialStage });
+            }
           }
         }
         continue;
@@ -4669,6 +5159,19 @@ export class PipelineExecutor {
     );
 
     if (segment.synthesizerAnswer === undefined) {
+      // Task 6: typed partials (e.g. executor_no_tool) must surface even when
+      // the pipeline slice omitted the synthesizer stage.
+      if (segment.partialStage) {
+        return {
+          answer: state.plan ? renderPlanSummary(state.plan) : (state.executor?.narrative ?? ""),
+          recursion_depth: 0,
+          outcome: "partial",
+          error_code: segment.partialStage.errorCode,
+          toolCalls: state.executor?.toolCalls,
+          checkResult: this.lastCheckResult,
+          reviewerAccepted: this.lastReviewerAccepted,
+        };
+      }
       const gated = applyEffectGate(
         upstreamDegraded ? "degraded" : "success",
         upstreamDegraded ? "upstream_stage_failed" : undefined,
@@ -4736,6 +5239,9 @@ export class PipelineExecutor {
         contentEffects: this.ctx.write_effects,
       }),
     ));
+    // Task 6: sticky no-tool partial outranks a soft degraded effect-gate
+    // result so the typed executor_no_tool code remains visible. A hard
+    // failed effect-gate (terminal repeated write failures) stays failed.
     if (segment.partialStage && outcome !== "failed") {
       outcome = "partial";
       errorCode = segment.partialStage.errorCode;

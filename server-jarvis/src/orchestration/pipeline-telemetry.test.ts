@@ -109,8 +109,10 @@ describe("pipeline stage telemetry", () => {
           executionProfile: "full",
           rawMessage: "Update the target config file",
           taskRunWriteIntent: true,
+          // >20s so Task 6 no-tool bound chooses retry_strong (not stop_partial)
+          // and mid-loop still runs on the first prose turn.
           turnBudget: {
-            stageRemainingMs: () => 9_000,
+            stageRemainingMs: () => 60_000,
             extendStageOnProgress: () => 0,
           } as any,
         },
@@ -756,9 +758,11 @@ describe("pipeline stage telemetry", () => {
       },
     );
 
+    // Task 6: workspace_evidence semantic pressure is claimed once per run,
+    // so the third-turn transcript carries only the first nudge (not two).
     const thirdExecutorInput = executorInputs[2].map((message) => message.content ?? "").join("\n");
     const nudgeCount = (thirdExecutorInput.match(/Workspace evidence is required/g) ?? []).length;
-    expect(nudgeCount).toBe(2);
+    expect(nudgeCount).toBe(1);
     expect(executorCalls).toBe(3);
   });
 
@@ -1363,7 +1367,7 @@ describe("pipeline stage telemetry", () => {
     expect(progressCounts[0]).toBe(1);
   });
 
-  test("duplicate-read write pressure persists its direct nudge telemetry and stays bounded to three", async () => {
+  test("duplicate-read write pressure injects once per run and suppresses duplicates", async () => {
     const runId = "run-write-read-loop";
     const store = new SelfTuningStore(":memory:");
     const collector = new SessionOutcomeCollector(store);
@@ -1393,18 +1397,124 @@ describe("pipeline stage telemetry", () => {
     });
 
     const directives = finalMessages.filter((message) => message.content?.includes("Expected write target"));
-    const nudgeRows = store.getConductorDirectives(runId)
-      .filter((row) => row.directive_type === "write_effect_nudge");
+    const allDirectives = store.getConductorDirectives(runId);
+    const nudgeRows = allDirectives.filter((row) => row.directive_type === "write_effect_nudge");
+    const suppressed = allDirectives.filter((row) => row.directive_type === "semantic_pressure_suppressed");
     expect(executorTurns).toBe(12);
-    expect(directives).toHaveLength(3);
-    expect(directives.every((message) => message.content?.includes("write_file"))).toBe(true);
-    expect(directives.every((message) => message.content?.includes("src/app.ts"))).toBe(true);
-    expect(nudgeRows).toHaveLength(3);
-    expect(nudgeRows.every((row) =>
-      row.stage === "executor" &&
-      row.decision_source === "deterministic_reflex" &&
-      directives.some((message) => message.content === row.inject_note),
-    )).toBe(true);
+    // Task 6: run-level SemanticPressureBudget allows one write_effect inject.
+    expect(directives).toHaveLength(1);
+    expect(directives[0]?.content?.includes("write_file")).toBe(true);
+    expect(directives[0]?.content?.includes("src/app.ts")).toBe(true);
+    expect(nudgeRows).toHaveLength(1);
+    expect(nudgeRows[0]?.stage).toBe("executor");
+    expect(nudgeRows[0]?.decision_source).toBe("deterministic_reflex");
+    expect(nudgeRows[0]?.inject_note).toBe(directives[0]?.content);
+    expect(suppressed.length).toBeGreaterThanOrEqual(1);
+    expect(suppressed.every((row) => row.reason === "write_effect")).toBe(true);
+  });
+
+  test("no-tool write prose is bounded to one strong retry then partial executor_no_tool", async () => {
+    const rows: StageRun[] = [];
+    const directives: Array<{ directive_type: string; inject_note?: string; reason?: string }> = [];
+    const collector: StageRunRecorder = {
+      recordStageRun: (row) => rows.push(row),
+      recordDirective: (row) => directives.push(row),
+    };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("write_file"), async () => "written");
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    const exclusions: string[][] = [];
+    const preferStrong: boolean[] = [];
+    let executorCalls = 0;
+    const callModel = async (_messages: unknown[], options: any = {}) => {
+      if (options.stageLabel === "executor") {
+        exclusions.push(options.excludeModels ?? []);
+        preferStrong.push(options.preferStrongModel === true);
+        const model = executorCalls === 0 ? "weak-model" : "strong-model";
+        executorCalls++;
+        return {
+          content: "I would write the file like this: ```ts\nexport const x = 1\n```",
+          _provider: "openrouter",
+          _modelUsed: model,
+        };
+      }
+      if (options.stageLabel === "synthesizer") return { content: "Partial: no write landed." };
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "update workspace/thing.ts with a constant",
+      ["executor", "synthesizer"],
+      "run-no-tool-bound",
+      () => {},
+      {
+        executionProfile: "full",
+        turnBudget: {
+          stageRemainingMs: () => 60_000,
+          extendStageOnProgress: () => 0,
+        } as any,
+      },
+    );
+
+    // Model may return prose many times; only two executor calls allowed.
+    expect(executorCalls).toBe(2);
+    expect(preferStrong[0]).toBe(false);
+    expect(preferStrong[1]).toBe(true);
+    expect(exclusions[1]).toContain("openrouter:weak-model");
+    const writeNudges = directives.filter((d) => d.directive_type === "write_effect_nudge");
+    expect(writeNudges).toHaveLength(1);
+    expect(result.outcome).toBe("partial");
+    expect(result.error_code).toBe("executor_no_tool");
+    const noToolRows = rows.filter(
+      (row) => row.mode_id === "executor" && row.partial_error_code === "executor_no_tool",
+    );
+    expect(noToolRows.length).toBeGreaterThanOrEqual(1);
+    expect(noToolRows.every((row) => row.was_successful === 0 && row.had_error === 1 && row.stop_reason === "no_tool")).toBe(true);
+    expect(noToolRows[0]?.output_tokens).toBeGreaterThan(0);
+  });
+
+  test("successful write does not trigger a needless no-tool strong retry", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("write_file"), async () => "written");
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    ctx.config.tools.require_approval = [];
+    const exclusions: string[][] = [];
+    let executorCalls = 0;
+    const callModel = async (_messages: unknown[], options: any = {}) => {
+      if (options.stageLabel === "executor") {
+        exclusions.push(options.excludeModels ?? []);
+        executorCalls++;
+        if (executorCalls === 1) {
+          return {
+            content: "writing",
+            tool_calls: [toolCallWithArgs("write_file", { path: "workspace/ok.ts", content: "export const ok = 1;" })],
+            _provider: "openrouter",
+            _modelUsed: "model-a",
+          };
+        }
+        return { content: "done", _provider: "openrouter", _modelUsed: "model-a" };
+      }
+      if (options.stageLabel === "synthesizer") return { content: "Wrote the file." };
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "write workspace/ok.ts",
+      ["executor", "synthesizer"],
+      "run-write-no-retry",
+      () => {},
+      { executionProfile: "full" },
+    );
+
+    expect(executorCalls).toBe(2);
+    // Second call is normal prose completion after write — no model exclusion.
+    expect(exclusions[1] ?? []).toEqual([]);
+    expect(result.outcome).toBe("success");
+    expect(rows.some((row) => row.partial_error_code === "executor_no_tool")).toBe(false);
   });
 
   test("PipelineResult.toolCalls is undefined when the executor stage never ran", async () => {

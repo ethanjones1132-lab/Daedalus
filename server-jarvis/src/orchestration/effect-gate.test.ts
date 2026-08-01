@@ -317,6 +317,7 @@ describe("executor write pressure", () => {
   test("keeps prose-only pressure and bounds all injections at three", () => {
     expect(shouldPressWriteEffect({ ...base, toolCallsEmitted: false })).toBe(true);
     expect(shouldPressWriteEffect({ ...base, duplicateReadDeflections: 3, nudgesSent: 3 })).toBe(false);
+    expect(shouldPressWriteEffect({ ...base, toolCallsEmitted: false, writeEffectPressureAvailable: false })).toBe(false);
   });
 
   test("directive names available write tools and the expected target", () => {

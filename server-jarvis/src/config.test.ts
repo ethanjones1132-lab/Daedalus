@@ -61,6 +61,9 @@ describe("Claude CLI delegate config", () => {
       ],
       model: "auto",
       free_thrash_threshold: 2,
+      exploration_limit_ms: 45_000,
+      native_fallback_reserve_ms: 30_000,
+      thrash_ttl_ms: 30 * 60_000,
       timeout_ms: 420_000,
     });
   });

@@ -1,6 +1,10 @@
 import { isContinuationTurn, isWorkOrderFollowup } from "./turn-triage";
 import { hasWriteIntent, type TurnRequirement } from "./turn-requirements";
 import { isDeepReadRequest } from "./evidence-sufficiency";
+import {
+  evaluateTaskPlanAcceptance,
+  type TaskPlanEvidenceGrounding,
+} from "./task-plan-evidence";
 
 export type TaskRunDepth = "standard" | "deep";
 export type TaskRunStatus = "active" | "paused" | "completed" | "failed" | "cancelled";
@@ -37,7 +41,11 @@ export interface TaskPlanEvidencePointer {
   summary?: string;
   /** ISO timestamp when the pointer was recorded. */
   recordedAt?: string;
+  /** Structured grounding that justified verification (writes, checks, reviewer). */
+  grounding?: TaskPlanEvidenceGrounding;
 }
+
+export type { TaskPlanEvidenceGrounding };
 
 export interface TaskPlanAcceptanceCheck {
   id: string;
@@ -186,8 +194,13 @@ export function terminalSubtypeForRunOutcome(
 // workspace. Match the honesty vocabulary broadly: a false "paused" merely
 // keeps continuation stickiness armed (cheap), a false "completed" strands
 // the task (expensive).
+// Also match multi-word incomplete phrases that span "not yet been X" /
+// "not yet complete" / "not yet been started" — synthesizer honesty often
+// uses those forms ("Group A has not yet been completed") which the
+// single-token `not (?:yet )?completed` arm alone does not cover when
+// "been" or "complete" (adj) intervenes.
 const INCOMPLETE_PROGRESS_PATTERN =
-  /\b(?:incomplete|unfinished|cut short|partial(?:ly)?|could not be (?:confirmed|completed|applied|written|verified)|not (?:yet )?(?:applied|completed|confirmed|written)|was not (?:applied|modified|updated|written)|remains? (?:unchanged|unmodified|unapplied|to be)|more (?:files|work|evidence)|still (?:need|needs|needed|remains?|pending)|not enough evidence|could not gather|unable to complete|remaining work)\b/i;
+  /\b(?:incomplete|unfinished|cut short|partial(?:ly)?|could not be (?:confirmed|completed|applied|written|verified)|not (?:yet )?(?:been )?(?:applied|completed|confirmed|written|started)|not yet complete|was not (?:applied|modified|updated|written)|remains? (?:unchanged|unmodified|unapplied|to be)|more (?:files|work|evidence)|still (?:need|needs|needed|remains?|pending)|not enough evidence|could not gather|unable to complete|remaining work)\b/i;
 
 function newTaskRunId(): string {
   return `task_${crypto.randomUUID()}`;
@@ -291,6 +304,7 @@ export function makeEvidencePointer(
   ref: string,
   summary?: string,
   recordedAt: string = nowIso(),
+  grounding?: TaskPlanEvidenceGrounding,
 ): TaskPlanEvidencePointer {
   const trimmed = ref.trim();
   if (!trimmed) {
@@ -298,6 +312,7 @@ export function makeEvidencePointer(
   }
   const pointer: TaskPlanEvidencePointer = { ref: trimmed, recordedAt };
   if (summary?.trim()) pointer.summary = summary.trim();
+  if (grounding) pointer.grounding = grounding;
   return pointer;
 }
 
@@ -490,7 +505,12 @@ export function reconcileTaskRunStatus(input: {
     return "paused";
   }
 
-  // All items verified → overall completed (turn failed already returned above).
+  // Turn-level incomplete/partial prose is a hard backstop even when the
+  // ledger claims every item is verified (e.g. one mutation wrongly verified
+  // a broad parent). Never promote that to completed.
+  if (turn === "paused") return "paused";
+
+  // All items verified and turn accepted → overall completed.
   return "completed";
 }
 
@@ -624,16 +644,34 @@ export function activatePlanItem(contract: TaskRunContract, itemId: string): Tas
 /**
  * Mark an item verified, store grading mode + evidence pointer, optionally
  * advance the queue to the next ready item.
+ *
+ * Fail-closed: requires structured grounding that satisfies the item's
+ * acceptance checks. Throws `plan_item_acceptance_unmet:<reasons>` when red.
  */
 export function markPlanItemVerified(
   contract: TaskRunContract,
   itemId: string,
   input: MarkPlanItemVerifiedInput,
 ): TaskRunContract {
+  const target = getPlanItem(contract, itemId);
+  if (!target) {
+    throw new Error(`markPlanItemVerified: plan item not found: ${itemId}`);
+  }
+  const grounding = input.evidence.grounding ?? {
+    requiredEffect: "none" as const,
+    reviewerAccepted: false,
+    successfulWrites: [],
+    successfulReads: [],
+  };
+  const verdict = evaluateTaskPlanAcceptance(target, grounding);
+  if (!verdict.accepted) {
+    throw new Error(`plan_item_acceptance_unmet:${verdict.unmet.join(",")}`);
+  }
   const evidence = makeEvidencePointer(
     input.evidence.ref,
     input.evidence.summary,
     input.evidence.recordedAt ?? nowIso(),
+    grounding,
   );
   const now = nowIso();
   let next = mapPlanItem(contract, itemId, (item) => ({
@@ -704,13 +742,112 @@ export function setPlanItemEvidence(
   itemId: string,
   evidence: TaskPlanEvidencePointer,
 ): TaskRunContract {
-  const pointer = makeEvidencePointer(evidence.ref, evidence.summary, evidence.recordedAt ?? nowIso());
+  const pointer = makeEvidencePointer(
+    evidence.ref,
+    evidence.summary,
+    evidence.recordedAt ?? nowIso(),
+    evidence.grounding,
+  );
   const now = nowIso();
   return mapPlanItem(contract, itemId, (item) => ({
     ...item,
     evidence: pointer,
     updatedAt: now,
   }));
+}
+
+/**
+ * Child shape accepted by {@link expandActivePlanItem}. Mirrors discovery output
+ * without importing the discovery module (keeps task-run free of parse concerns).
+ */
+export interface ExpandablePlanChild {
+  externalKey: string;
+  title: string;
+  description?: string;
+  acceptanceChecks?: Array<string | TaskPlanAcceptanceCheck>;
+}
+
+/**
+ * Replace one active broad plan item with durable children discovered from an
+ * explicit workspace plan document.
+ *
+ * Pure mutation rules:
+ * 1. Target must be `active`.
+ * 2. At least two discovered children.
+ * 3. Replace only that active item at the same list position.
+ * 4. First child inherits parent deps; later children chain in order.
+ * 5. Redirect downstream deps from the parent ID to the final child ID.
+ * 6. Activate the first child.
+ * 7. Preserve verified/blocked siblings and their evidence.
+ * 8. Store the source path in each child description when provided.
+ */
+export function expandActivePlanItem(
+  contract: TaskRunContract,
+  activeItemId: string,
+  discovered: ExpandablePlanChild[],
+  opts: { sourcePath?: string } = {},
+): TaskRunContract {
+  const plan = requirePlan(contract);
+  const index = plan.items.findIndex((item) => item.id === activeItemId);
+  if (index < 0) {
+    throw new Error(`expandActivePlanItem: plan item not found: ${activeItemId}`);
+  }
+  const parent = plan.items[index];
+  if (parent.status !== "active") {
+    throw new Error(`expandActivePlanItem: target must be active: ${activeItemId}`);
+  }
+  if (discovered.length < 2) {
+    throw new Error("expandActivePlanItem: requires at least two discovered children");
+  }
+
+  const now = nowIso();
+  const sourcePath = opts.sourcePath?.trim();
+  const children: TaskPlanItem[] = discovered.map((child, i) => {
+    const externalKey = child.externalKey.trim().toUpperCase();
+    const id = `pi_${externalKey.toLowerCase()}`;
+    const title = child.title.trim();
+    if (!title) {
+      throw new Error(`expandActivePlanItem: child ${externalKey} has empty title`);
+    }
+    const sourceNote = sourcePath
+      ? `Source: ${sourcePath} (${externalKey})`
+      : undefined;
+    const description = [child.description?.trim(), sourceNote]
+      .filter(Boolean)
+      .join("\n") || undefined;
+    const dependsOn =
+      i === 0
+        ? [...parent.dependsOn]
+        : [`pi_${discovered[i - 1].externalKey.trim().toLowerCase()}`];
+    return {
+      id,
+      title,
+      ...(description ? { description } : {}),
+      dependsOn,
+      acceptanceChecks: normalizeAcceptanceChecks(child.acceptanceChecks),
+      status: (i === 0 ? "active" : "pending") as TaskPlanItemStatus,
+      repairCycleCount: 0,
+      updatedAt: now,
+    };
+  });
+
+  const finalChildId = children[children.length - 1].id;
+  const before = plan.items.slice(0, index);
+  const after = plan.items.slice(index + 1).map((item) => {
+    if (!item.dependsOn.includes(activeItemId)) return item;
+    return {
+      ...item,
+      dependsOn: item.dependsOn.map((dep) => (dep === activeItemId ? finalChildId : dep)),
+      updatedAt: now,
+    };
+  });
+
+  const items = [...before, ...children, ...after];
+  return withUpdatedPlan(
+    contract,
+    { items, activeItemId: children[0].id },
+    now,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -796,6 +933,45 @@ function isPlanItemStatus(value: unknown): value is TaskPlanItemStatus {
   return value === "pending" || value === "active" || value === "verified" || value === "blocked";
 }
 
+function normalizeGroundingOnRead(raw: unknown): TaskPlanEvidenceGrounding | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const g = raw as Record<string, unknown>;
+  const requiredEffect =
+    g.requiredEffect === "write" || g.requiredEffect === "read" || g.requiredEffect === "none"
+      ? g.requiredEffect
+      : undefined;
+  if (!requiredEffect) return undefined;
+  const successfulWrites = Array.isArray(g.successfulWrites)
+    ? g.successfulWrites.filter((v): v is string => typeof v === "string")
+    : [];
+  const successfulReads = Array.isArray(g.successfulReads)
+    ? g.successfulReads.filter((v): v is string => typeof v === "string")
+    : [];
+  const grounding: TaskPlanEvidenceGrounding = {
+    requiredEffect,
+    reviewerAccepted: g.reviewerAccepted === true,
+    successfulWrites,
+    successfulReads,
+  };
+  if (g.check && typeof g.check === "object") {
+    const c = g.check as Record<string, unknown>;
+    const tier =
+      c.tier === "existing" || c.tier === "builtin" || c.tier === "synth" || c.tier === "none"
+        ? c.tier
+        : undefined;
+    if (tier) {
+      grounding.check = {
+        tier,
+        ran: c.ran === true,
+        passed: c.passed === true ? true : c.passed === false ? false : null,
+        command: typeof c.command === "string" ? c.command : "",
+        detail: typeof c.detail === "string" ? c.detail : "",
+      };
+    }
+  }
+  return grounding;
+}
+
 function normalizePlanOnRead(raw: unknown): TaskPlan | undefined {
   if (!raw || typeof raw !== "object") return emptyTaskPlan();
   const p = raw as Record<string, unknown>;
@@ -818,10 +994,12 @@ function normalizePlanOnRead(raw: unknown): TaskPlan | undefined {
     if (item.evidence && typeof item.evidence === "object") {
       const ev = item.evidence as Record<string, unknown>;
       if (typeof ev.ref === "string" && ev.ref.trim()) {
+        const grounding = normalizeGroundingOnRead(ev.grounding);
         evidence = {
           ref: ev.ref.trim(),
           ...(typeof ev.summary === "string" ? { summary: ev.summary } : {}),
           ...(typeof ev.recordedAt === "string" ? { recordedAt: ev.recordedAt } : {}),
+          ...(grounding ? { grounding } : {}),
         };
       }
     }

@@ -1,4 +1,5 @@
 import { countTokens } from "../tokens";
+import type { ToolCallRecord } from "./stage-output";
 import type { TurnRequirement } from "./turn-requirements";
 
 export const HISTORY_BUDGET_TOKENS: Record<TurnRequirement, number> = {
@@ -31,11 +32,32 @@ export const REWRITER_TRANSCRIPT_BUDGET_TOKENS = 8_000;
 export const WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS = 24_000;
 export const WRITE_TURN_TRANSCRIPT_BUDGET_TOKENS = 24_000;
 
+/** Keep the newest N assistant/tool cycles intact; older ones become a checkpoint. */
+const KEEP_NEWEST_ASSISTANT_CYCLES = 2;
+/** Hard cap for the evidence checkpoint carrier message. */
+const EVIDENCE_CHECKPOINT_MAX_CHARS = 2_000;
+
+const CHECKPOINT_READ_TOOLS = new Set([
+  "read_file",
+  "list_directory",
+  "glob",
+  "grep",
+  "workspace_read",
+]);
+const CHECKPOINT_WRITE_TOOLS = new Set([
+  "write_file",
+  "edit_file",
+  "multi_edit",
+  "apply_patch",
+]);
+
 export interface TranscriptMessage {
   role: string;
   content: string;
   name?: string;
   tool_call_id?: string;
+  /** Present on assistant turns that issued tool_calls; kept for provider pairing. */
+  tool_calls?: unknown;
 }
 
 /**
@@ -71,6 +93,153 @@ export function enforceTranscriptBudget(
   }
 
   return { evicted, inputTokens };
+}
+
+function isWritePressureMessage(content: string): boolean {
+  return content.includes("CHANGE request")
+    && (content.includes("write tools") || content.includes("write tool"));
+}
+
+function toolTargetPath(call: ToolCallRecord): string {
+  const args = call.arguments as Record<string, unknown> | undefined;
+  if (typeof args?.path === "string" && args.path.trim()) return args.path.trim();
+  if (typeof args?.file_path === "string" && args.file_path.trim()) return args.file_path.trim();
+  return "";
+}
+
+/**
+ * Build a bounded evidence checkpoint from clean tool records.
+ * Paths are ordered by first appearance; failed tools list paths (or tool name).
+ */
+export function buildEvidenceCheckpoint(toolCalls: readonly ToolCallRecord[]): string {
+  const reads: string[] = [];
+  const writes: string[] = [];
+  const failed: string[] = [];
+  const seenRead = new Set<string>();
+  const seenWrite = new Set<string>();
+  const seenFailed = new Set<string>();
+
+  for (const call of toolCalls) {
+    const path = toolTargetPath(call);
+    if (call.is_error) {
+      const label = path || call.name;
+      if (!seenFailed.has(label)) {
+        seenFailed.add(label);
+        failed.push(label);
+      }
+      continue;
+    }
+    if (CHECKPOINT_READ_TOOLS.has(call.name) && path && !seenRead.has(path)) {
+      seenRead.add(path);
+      reads.push(path);
+    }
+    if (CHECKPOINT_WRITE_TOOLS.has(call.name) && path && !seenWrite.has(path)) {
+      seenWrite.add(path);
+      writes.push(path);
+    }
+  }
+
+  let text = [
+    "[Evidence checkpoint]",
+    `reads: ${reads.length > 0 ? reads.join(", ") : "none"}`,
+    `writes: ${writes.length > 0 ? writes.join(", ") : "none"}`,
+    `failed: ${failed.length > 0 ? failed.join(", ") : "none"}`,
+  ].join("\n");
+
+  if (text.length > EVIDENCE_CHECKPOINT_MAX_CHARS) {
+    text = text.slice(0, EVIDENCE_CHECKPOINT_MAX_CHARS);
+  }
+  return text;
+}
+
+/** Index after the system + original user request prefix. */
+function seedEndIndex(messages: readonly TranscriptMessage[]): number {
+  if (messages.length === 0) return 0;
+  if (messages[0]?.role === "system") {
+    if (messages[1]?.role === "user") return 2;
+    return 1;
+  }
+  if (messages[0]?.role === "user") return 1;
+  return 0;
+}
+
+/**
+ * Compact completed executor assistant/tool cycles into a single evidence
+ * checkpoint while preserving the newest cycles and tool_call pairing.
+ *
+ * - Compacts whole cycles only (never separates a retained tool result from
+ *   its assistant `tool_calls`).
+ * - Keeps the newest two assistant cycles intact.
+ * - Replaces older cycles with one `[Evidence checkpoint]` derived from clean
+ *   tool records (capped at 2,000 chars).
+ * - Drops duplicate write-pressure user messages.
+ * - Runs {@link enforceTranscriptBudget} afterward as the final size fence.
+ */
+export function compactCompletedExecutorCycles(
+  messages: TranscriptMessage[],
+  toolCalls: readonly ToolCallRecord[],
+  budgetTokens: number,
+): { compactedCycles: number; inputTokens: number } {
+  const assistantIndices: number[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i].role === "assistant") assistantIndices.push(i);
+  }
+
+  let compactedCycles = 0;
+
+  if (assistantIndices.length > KEEP_NEWEST_ASSISTANT_CYCLES) {
+    const seedEnd = seedEndIndex(messages);
+    const keepFrom = assistantIndices[assistantIndices.length - KEEP_NEWEST_ASSISTANT_CYCLES];
+    const compactAssistants = assistantIndices.filter((index) => index < keepFrom);
+    compactedCycles = compactAssistants.length;
+
+    // Checkpoint summarizes clean tool records (paths the model already
+    // gathered). Cap is applied inside buildEvidenceCheckpoint.
+    const checkpoint = buildEvidenceCheckpoint(toolCalls);
+
+    const gap = messages.slice(seedEnd, keepFrom);
+    const pressureInGap = gap.filter(
+      (message) => message.role === "user" && isWritePressureMessage(message.content),
+    );
+
+    const next: TranscriptMessage[] = messages.slice(0, seedEnd);
+    next.push({ role: "user", content: checkpoint });
+
+    // At most one write-pressure note between checkpoint and retained cycles.
+    if (pressureInGap.length > 0) {
+      next.push({ ...pressureInGap[pressureInGap.length - 1] });
+    }
+
+    let seenPressure = pressureInGap.length > 0;
+    for (const message of messages.slice(keepFrom)) {
+      if (message.role === "user" && isWritePressureMessage(message.content)) {
+        if (seenPressure) continue;
+        seenPressure = true;
+      }
+      next.push(message);
+    }
+
+    messages.length = 0;
+    messages.push(...next);
+  } else {
+    // Still collapse duplicate pressure notes even when no cycles are removed.
+    let seenPressure = false;
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i];
+      if (message.role === "user" && isWritePressureMessage(message.content)) {
+        if (seenPressure) {
+          messages.splice(i, 1);
+          i--;
+          continue;
+        }
+        seenPressure = true;
+      }
+    }
+  }
+
+  // Final size fence: payload eviction only, preserves tool_call pairing.
+  const fence = enforceTranscriptBudget(messages, budgetTokens);
+  return { compactedCycles, inputTokens: fence.inputTokens };
 }
 
 /** Trim dynamic stage text while preserving both the newest request prefix and

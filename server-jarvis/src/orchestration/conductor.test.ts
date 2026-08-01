@@ -580,6 +580,8 @@ describe("LiveConductor owned-runtime-loop directives (Task 5)", () => {
     if (directive.type === "mark_verified") {
       expect(directive.itemId).toBe("pi_main");
       expect(directive.gradingMode).toBe("conductor_direct_diff");
+      expect(directive.grounding.successfulWrites).toContain("helper.ts");
+      expect(directive.grounding.requiredEffect).toBe("write");
     }
     // Deterministic grade — no supervisory model call.
     expect(supervisorCalls.length).toBe(0);
@@ -642,6 +644,7 @@ describe("LiveConductor owned-runtime-loop directives (Task 5)", () => {
     if (directive.type === "mark_verified") {
       expect(directive.gradingMode).toBe("reviewer_mediated");
       expect(directive.itemId).toBe("pi_ok");
+      expect(directive.grounding.reviewerAccepted).toBe(true);
     }
   });
 

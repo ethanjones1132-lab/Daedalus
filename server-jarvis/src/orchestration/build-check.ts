@@ -40,6 +40,11 @@ export interface DetectInput {
   writtenPaths: string[];
   exists: (p: string) => boolean;
   readText: (p: string) => string | null;
+  /**
+   * Extra already-configured CMake build directories (e.g. Jarvis prepare cache).
+   * Checked after normal workspace candidates; never cold-configured here.
+   */
+  configuredBuildDirs?: string[];
 }
 
 export interface BuildDetector {
@@ -59,11 +64,18 @@ export const PROJECT_DETECTORS: BuildDetector[] = [
   },
   {
     id: "cmake",
-    detect: ({ root, exists }) => {
+    detect: ({ root, exists, configuredBuildDirs }) => {
       if (!exists(join(root, "CMakeLists.txt"))) return null;
       for (const d of CMAKE_BUILD_DIRS) {
         const dir = join(root, d);
         if (exists(join(dir, "CMakeCache.txt"))) return { command: "cmake", args: ["--build", dir], cwd: root };
+      }
+      // Prepared dirs from ensureVerificationWorkspace (outside model loops).
+      for (const dir of configuredBuildDirs ?? []) {
+        if (!dir) continue;
+        if (exists(join(dir, "CMakeCache.txt"))) {
+          return { command: "cmake", args: ["--build", dir], cwd: root };
+        }
       }
       return null; // unconfigured → decline → honest none (no cold configure in-turn)
     },
@@ -109,6 +121,8 @@ export interface RunBuildCheckInput {
   root: string;
   writtenPaths: string[];
   timeoutMs: number;
+  /** Pre-prepared CMake build dirs (from verification-workspace prepare). */
+  configuredBuildDirs?: string[];
   exists?: (p: string) => boolean;
   readText?: (p: string) => string | null;
   exec?: ExecFn;
@@ -152,7 +166,13 @@ export async function runBuildCheck(input: RunBuildCheckInput): Promise<CheckOut
   const exists = input.exists ?? existsSync;
   const readText = input.readText ?? defaultReadText;
   const exec = input.exec ?? defaultExec;
-  const ctx: DetectInput = { root: input.root, writtenPaths: input.writtenPaths, exists, readText };
+  const ctx: DetectInput = {
+    root: input.root,
+    writtenPaths: input.writtenPaths,
+    exists,
+    readText,
+    configuredBuildDirs: input.configuredBuildDirs,
+  };
 
   for (const det of PROJECT_DETECTORS) {
     const cmd = det.detect(ctx);

@@ -257,7 +257,10 @@ describe("conductor replay — delegate wrote nothing invariant", () => {
     expect(found[0]?.severity).toBe("high");
   });
 
-  test("does not flag when a write landed later in the run", () => {
+  test("later native write does not hide a failed delegate row", () => {
+    // A successful write in a later native fallback row must not suppress
+    // delegate_failed_before_fallback. Total-failure delegate_never_wrote is
+    // correctly absent because a write did land somewhere in the turn.
     const run = replayRun({
       stageRuns: [
         delegateTurn(),
@@ -267,8 +270,26 @@ describe("conductor replay — delegate wrote nothing invariant", () => {
         }),
       ],
     });
+    const violations = checkReplayInvariants(run);
+    expect(violations.filter((v) => v.rule === "delegate_never_wrote")).toHaveLength(0);
+    expect(violations.filter((v) => v.rule === "delegate_failed_before_fallback")).toHaveLength(1);
+  });
+
+  test("a verified write inside the same delegate row is green", () => {
+    const run = replayRun({
+      stageRuns: [
+        stage({
+          tool_calls_json: JSON.stringify([
+            { name: "write_file", arguments: { path: "claimed.ts" } },
+            { name: "delegate_cleanup", arguments: { status: "exited" } },
+          ]),
+        }),
+      ],
+    });
     expect(
-      checkReplayInvariants(run).filter((v) => v.rule === "delegate_never_wrote"),
+      checkReplayInvariants(run).filter((v) =>
+        v.rule === "delegate_never_wrote" || v.rule === "delegate_failed_before_fallback",
+      ),
     ).toHaveLength(0);
   });
 
@@ -295,6 +316,52 @@ describe("conductor replay — delegate wrote nothing invariant", () => {
     expect(
       checkReplayInvariants(run).filter((v) => v.rule === "delegate_never_wrote"),
     ).toHaveLength(0);
+  });
+});
+
+describe("conductor replay — success verification invariants", () => {
+  test("flags successful write-intent runs without a runtime check tier", () => {
+    const run = replayRun({
+      outcome: "success",
+      checkTier: null,
+      stageRuns: [
+        stage({
+          tool_calls_json: JSON.stringify([{ name: "write_file", arguments: {} }]),
+        }),
+      ],
+    });
+    const found = checkReplayInvariants(run).filter((v) => v.rule === "success_without_runtime_check");
+    expect(found).toHaveLength(1);
+    expect(found[0]?.severity).toBe("high");
+  });
+
+  test("accepts success with check_tier=builtin", () => {
+    const run = replayRun({
+      outcome: "success",
+      checkTier: "builtin",
+      verifiedVia: "runtime_check",
+      stageRuns: [
+        stage({
+          tool_calls_json: JSON.stringify([{ name: "write_file", arguments: {} }]),
+        }),
+      ],
+    });
+    expect(
+      checkReplayInvariants(run).filter((v) => v.rule === "success_without_runtime_check"),
+    ).toHaveLength(0);
+  });
+
+  test("flags success whose final output declares incomplete progress", () => {
+    const run = replayRun({
+      outcome: "success",
+      checkTier: "builtin",
+      verifiedVia: "runtime_check",
+      finalOutput: "Group A has not yet been completed.",
+      stageRuns: [stage()],
+    });
+    const found = checkReplayInvariants(run).filter((v) => v.rule === "success_declares_incomplete");
+    expect(found).toHaveLength(1);
+    expect(found[0]?.severity).toBe("high");
   });
 });
 

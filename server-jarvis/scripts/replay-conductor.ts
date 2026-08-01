@@ -36,12 +36,21 @@ const db = new Database(dbPath, { readonly: true });
 const agentRuns = (since
   ? db
     .query(
-      "SELECT id, task_type, outcome FROM agent_runs WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?",
+      "SELECT id, task_type, outcome, final_output, verified_via, check_tier FROM agent_runs WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?",
     )
     .all(since, limit)
   : db
-    .query("SELECT id, task_type, outcome FROM agent_runs ORDER BY created_at DESC LIMIT ?")
-    .all(limit)) as Array<{ id: string; task_type?: string; outcome?: string | null }>;
+    .query(
+      "SELECT id, task_type, outcome, final_output, verified_via, check_tier FROM agent_runs ORDER BY created_at DESC LIMIT ?",
+    )
+    .all(limit)) as Array<{
+  id: string;
+  task_type?: string;
+  outcome?: string | null;
+  final_output?: string | null;
+  verified_via?: string | null;
+  check_tier?: string | null;
+}>;
 
 const stageStmt = db.query(
   "SELECT * FROM stage_runs WHERE agent_run_id = ? ORDER BY created_at",
@@ -54,6 +63,9 @@ const runs: ReplayRun[] = agentRuns.map((row) => ({
   agentRunId: row.id,
   taskType: row.task_type,
   outcome: row.outcome,
+  finalOutput: row.final_output,
+  verifiedVia: row.verified_via,
+  checkTier: row.check_tier,
   stageRuns: stageStmt.all(row.id) as StageRun[],
   directives: directiveStmt.all(row.id) as ConductorDirectiveRow[],
 }));

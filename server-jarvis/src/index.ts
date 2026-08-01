@@ -150,8 +150,13 @@ import {
   reconcileRouteWithBudget,
   type ExecutionProfile,
 } from "./orchestration/route-normalization";
+import { activePlanContinuationPipeline } from "./orchestration/active-plan-route";
 import { runPipelineWithReplanning } from "./orchestration/replan-loop";
 import { mapCheckToReward } from "./orchestration/verification-reward";
+import {
+  applyStricterOutcomeFloor,
+  decideCompletion,
+} from "./orchestration/completion-policy";
 import { buildBoundedHistoryBlock, HISTORY_BUDGET_TOKENS } from "./orchestration/context-budget";
 import { SessionReplanCounter } from "./orchestration/replan-telemetry";
 import { conductorLearning, outcomeCollector, selfTuningProposer, SelfTuningStore } from "./self-tuning/mod";
@@ -179,6 +184,7 @@ import { loadInferenceFeedback } from "./self-tuning/inference-feedback";
 import { loadPolicyVersions, getPolicyVersionStore } from "./self-tuning/policy-staging";
 import {
   assessTaskRunAcceptance,
+  getActivePlanItem,
   reconcileTaskRunStatus,
   resolveDeepReadIntent,
   terminalSubtypeForRunOutcome,
@@ -2813,6 +2819,21 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           !["completed", "failed", "cancelled"].includes(activeTaskRun.status),
         );
         const shortCircuit = shouldShortCircuitCoordinator(message, turnReq, continuation);
+        // Active-plan fast path: explicit continuation of an active/paused TaskRun
+        // with an open item skips Coordinator + Planner (plan already expanded).
+        const activePlanItem = getActivePlanItem(activeTaskRun);
+        const activePlanPipeline = !shortCircuit
+          ? activePlanContinuationPipeline({
+              explicitContinuation: continuation,
+              status: activeTaskRun.status,
+              turnCount: activeTaskRun.turnCount,
+              activeItem: activePlanItem
+                ? { acceptanceChecks: activePlanItem.acceptanceChecks }
+                : null,
+            })
+          : null;
+        const useActivePlanContinuation = Array.isArray(activePlanPipeline)
+          && activePlanPipeline.length > 0;
         // T1.7: emit one conductor_health frame when local is enabled but we fall back.
         let conductorHealthEmitted = false;
         const onLocalUnavailable = async (info: { reason: string; sessionId: string }) => {
@@ -2863,6 +2884,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const coordinatorUnfit = modelScorecard.unfitKeys("coordinator").size > 0;
         const skipAdvisoryCoordinator =
           !shortCircuit &&
+          !useActivePlanContinuation &&
           !localConductorAvailable &&
           (coordinatorParseExcluded || coordinatorUnfit) &&
           (coordinatorIsAdvisoryOnly(turnReq.requirement) || coordinatorUnfit);
@@ -2871,6 +2893,26 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         if (shortCircuit) {
           route = buildShortCircuitRoute(
             turnReq.requirement === "conversational" ? "conversational" : "answer_only",
+          );
+        } else if (useActivePlanContinuation && activePlanPipeline) {
+          // Never re-run Planner for an already-expanded plan; reviewer only
+          // when acceptance requires reviewer_pass (see activePlanContinuationPipeline).
+          route = {
+            task_type: turnReq.requirement === "workspace_read" ? "research" as const : "general" as const,
+            pipeline: activePlanPipeline,
+            topology: "linear" as const,
+            context: {
+              needs_workspace_inspection: true,
+              needs_memory: false,
+              estimated_complexity: activeTaskRun.estimatedComplexity ?? "medium",
+            },
+            coordinator_rationale:
+              "Active plan continuation: resume open TaskPlan item without Coordinator/Planner.",
+            conductor_source: "continuation_reuse" as const,
+          };
+          console.log(
+            `[Jarvis Orchestrator] active plan continuation: ${activePlanPipeline.join("->")} ` +
+            `(item=${activePlanItem?.id ?? "?"} status=${activeTaskRun.status} turn=${activeTaskRun.turnCount})`,
           );
         } else if (skipAdvisoryCoordinator) {
           console.warn(
@@ -2887,7 +2929,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             sessionMemoryHints: memoryHints,
           });
         }
-        const coordinatorDurationMs = shortCircuit || skipAdvisoryCoordinator ? 0 : Date.now() - coordinatorStartedAt;
+        const coordinatorDurationMs =
+          shortCircuit || skipAdvisoryCoordinator || useActivePlanContinuation
+            ? 0
+            : Date.now() - coordinatorStartedAt;
 
         // Owned-runtime-loop: short-circuit / deterministic routes skip
         // Coordinator.route, so attach planning ownership here when missing.
@@ -2930,16 +2975,18 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
         const routeSource = shortCircuit
           ? "trivial_short_circuit"
-          : skipAdvisoryCoordinator
-            ? "deterministic"
-            : route.routing_parse_fallback
-              ? "parse_fallback"
-              : "model";
+          : useActivePlanContinuation
+            ? "active_plan_continuation"
+            : skipAdvisoryCoordinator
+              ? "deterministic"
+              : route.routing_parse_fallback
+                ? "parse_fallback"
+                : "model";
         // F5: force-deep-read overrides topology to the research route
         // (executor→synthesizer) so planner/reviewer/supervision tax cannot
         // re-starve. Applied before normalize for telemetry, then re-asserted
         // after normalize because full_execution invariants re-add reviewer.
-        if (forcedDeepRead && !shortCircuit) {
+        if (forcedDeepRead && !shortCircuit && !useActivePlanContinuation) {
           route = applyForcedDeepReadRoute(route);
           console.log(
             `[Jarvis Orchestrator] forced deep read: direct executor route with extended budget ` +
@@ -2949,8 +2996,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // Throughput: continuation turns of an in-progress deep task with
         // prior evidence skip planner+reviewer ceremony (the plan already
         // exists; ceremony cost 30-60s/turn live and starved synthesis).
+        // Active-plan continuation already chose executor[+reviewer]→synthesizer.
         const leanContinuation = !shortCircuit
           && !forcedDeepRead
+          && !useActivePlanContinuation
           && activeTaskRun.depth === "deep"
           && activeTaskRun.turnCount > 1
           && activeTaskRun.evidenceCount > 0;
@@ -2974,7 +3023,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // Simple (low): Conductor-authored items land only when ledger is empty
         // or unusable — never wipe verified/blocked progress on continuation.
         // Complex: brief only — ledger filled after Planner validate in pipeline.
-        if (route.plan_authorship) {
+        // Active-plan continuation must not reseed — plan is already expanded.
+        if (route.plan_authorship && !useActivePlanContinuation) {
           const priorPlanItems = activeTaskRun.plan?.items?.length ?? 0;
           const seeded = sessionMemory.applyOwnedPlanning(sessionId, {
             plan_authorship: route.plan_authorship,
@@ -2999,9 +3049,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             );
           }
         }
-        const forcedPipeline = (forcedDeepRead || leanContinuation) && !shortCircuit
-          ? (["executor", "synthesizer"] as StageName[])
-          : normalized.pipeline;
+        // Re-assert active-plan / deep-read / lean pipelines after normalize
+        // because full_execution invariants re-add reviewer/planner.
+        const forcedPipeline = useActivePlanContinuation && activePlanPipeline && !shortCircuit
+          ? activePlanPipeline
+          : (forcedDeepRead || leanContinuation) && !shortCircuit
+            ? (["executor", "synthesizer"] as StageName[])
+            : normalized.pipeline;
         const reconciled = reconcileRouteWithBudget(
           forcedPipeline,
           turnBudget.turn_ms,
@@ -3422,16 +3476,20 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           turnAcceptanceStatus: taskAcceptance.status,
           forcePaused: repetitionVerdict.repeated,
         });
-        const runOutcome: "success" | "degraded" | "failed" | "partial" =
-          repetitionVerdict.repeated
-            ? "degraded"
-            : taskAcceptance.accepted
-              ? pipelineOutcome
-              : taskAcceptance.status === "paused"
-                ? "partial"
-                : "failed";
-        // Task 5.3: verification-gated reward floor. When no check ran (disabled
-        // or tier none), outcomeFloor is null and runOutcome passes through.
+        // Single fail-closed completion decision: TaskPlan openness, sticky
+        // write intent, repetition, and verification gate must all agree
+        // before a write run can persist as completed/success.
+        const writeIntent = latestTaskRun.writeIntent === true;
+        const decision = decideCompletion({
+          pipelineOutcome,
+          reconciledStatus,
+          writeIntent,
+          repeated: repetitionVerdict.repeated,
+          checkResult: result.checkResult,
+        });
+        // Task 5.3: verification-gated reward floor. Apply only when the floor
+        // is *stricter* than decideCompletion — never promote partial
+        // (write_unverified / open plan / pipeline_partial) to success.
         const reward = result.checkResult
           ? mapCheckToReward(
               result.checkResult,
@@ -3444,10 +3502,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               result.reviewerAccepted === true,
             )
           : null;
-        const verifiedRunOutcome =
-          reward?.outcomeFloor != null ? reward.outcomeFloor : runOutcome;
+        const verifiedRunOutcome = applyStricterOutcomeFloor(
+          decision.runOutcome,
+          reward?.outcomeFloor,
+        );
         sessionMemory.updateTaskRun(sessionId, {
-          status: reconciledStatus,
+          status: decision.taskStatus,
           evidenceCount,
           lastOutcome: verifiedRunOutcome,
           lastTurnId: agentRunId,
@@ -3462,6 +3522,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           errorCode: result.error_code,
           error: result.error,
           answer: trimmedAnswer,
+          completion_reason: decision.reason,
         });
         outcomeCollector.completeAgentRun(
           agentRunId,

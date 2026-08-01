@@ -28,6 +28,7 @@ import {
 import { parseReviewerVerdict } from "./stage-output";
 import type { ToolCallRecord } from "./stage-output";
 import { WRITE_EFFECT_TOOLS } from "./effect-gate";
+import type { TaskPlanEvidenceGrounding } from "./task-plan-evidence";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -256,8 +257,68 @@ export function extractPlanItemsFromPlannerNarrative(
 }
 
 /**
+ * True when a title is a single broad "execute/complete/implement the group/plan/tasks"
+ * item rather than a durable child step.
+ */
+function isBroadWorkspacePlanTitle(title: string): boolean {
+  return (
+    /\b(execute|complete|implement)\b/i.test(title) &&
+    /\b(tasks?|groups?|plans?)\b/i.test(title)
+  );
+}
+
+/**
+ * True when the Conductor brief names an explicit workspace plan document or
+ * an execution-plan style objective that should expand from file evidence.
+ */
+function briefNamesWorkspacePlan(brief?: ConductorPlanBrief): boolean {
+  if (!brief) return false;
+  const haystack = [
+    brief.request,
+    brief.objective,
+    ...brief.constraints,
+    ...brief.relevantMemory,
+  ].join("\n");
+  return (
+    /\b[\w./\\-]*(?:plan|execution|checklist|roadmap|tasks)[\w./\\-]*\.(?:md|txt)\b/i.test(haystack) ||
+    /\bGROUP_[A-Z0-9]+_EXECUTION\b/i.test(haystack) ||
+    /\b(?:workspace|execution|implementation)\s+plan\b/i.test(haystack)
+  );
+}
+
+/** Placeholder item kept active until plan-file discovery expands it. */
+function awaitPlanExpansionItem(brief?: ConductorPlanBrief): CreateTaskPlanItemInput {
+  const request = brief?.request?.trim() || brief?.objective?.trim() || "Expand workspace plan";
+  const title =
+    request.length > 120
+      ? `Expand workspace plan: ${request.slice(0, 100)}...`
+      : `Expand workspace plan: ${request}`;
+  return {
+    id: "pi_plan_expand",
+    title,
+    description:
+      "Await successful read of the named plan/execution document before item-level verification. " +
+      "Do not mark this broad item verified from a single partial mutation.",
+    acceptanceChecks: [
+      {
+        id: "ac_plan_diff",
+        description: "Plan expansion produced verified workspace mutations",
+        kind: "diff_match",
+      },
+      {
+        id: "ac_plan_check",
+        description: "Plan expansion passed an authoritative runtime/build check",
+        kind: "test_pass",
+      },
+    ],
+  };
+}
+
+/**
  * Conductor validates / lightly revises a Planner proposal before ledger persist.
  * Pure: drops empty titles, caps count, ensures sequential deps when multi-item.
+ * Rejects a single broad execute/complete/implement group|plan|tasks item when
+ * the brief names a workspace plan — preserve ledger until plan-file expansion.
  */
 export function conductorValidatePlanItems(
   proposed: CreateTaskPlanItemInput[],
@@ -288,7 +349,32 @@ export function conductorValidatePlanItems(
     });
   }
 
+  // Single broad "execute Group A / implement the plan" items must not become
+  // the only ledger entry when a workspace plan file is named — expansion from
+  // a successful plan-file read is the durable decomposition path.
+  if (
+    cleaned.length === 1 &&
+    isBroadWorkspacePlanTitle(cleaned[0].title) &&
+    briefNamesWorkspacePlan(brief)
+  ) {
+    return {
+      items: [awaitPlanExpansionItem(brief)],
+      revised: true,
+      notes:
+        "rejected single broad workspace-plan item — awaiting plan-file discovery expansion",
+    };
+  }
+
   if (cleaned.length === 0) {
+    // If the brief itself is a broad plan request, seed the await-expansion
+    // placeholder rather than a reviewer_pass item that can false-complete.
+    if (briefNamesWorkspacePlan(brief) && isBroadWorkspacePlanTitle(brief?.request ?? brief?.objective ?? "")) {
+      return {
+        items: [awaitPlanExpansionItem(brief)],
+        revised: true,
+        notes: "empty planner proposal — awaiting plan-file discovery expansion",
+      };
+    }
     return {
       items: extractPlanItemsFromPlannerNarrative(brief?.request ?? "Complete the request", brief),
       revised: true,
@@ -574,6 +660,7 @@ export function applySufficientVerdict(
       input.evidence.ref,
       input.evidence.summary,
       input.evidence.recordedAt,
+      input.evidence.grounding,
     ),
     advance: input.advance,
   });
@@ -751,6 +838,7 @@ export function applyInsufficientVerdict(
 
 /**
  * Reviewer accept → mark verified with reviewer_mediated grading.
+ * Requires structured grounding on the evidence pointer.
  */
 export function applyReviewerAccept(
   contract: TaskRunContract,
@@ -763,6 +851,8 @@ export function applyReviewerAccept(
     gradingMode: "reviewer_mediated",
   });
 }
+
+export type { TaskPlanEvidenceGrounding };
 
 /** Parse reviewer feedback into accept/reject for runtime-loop consumers. */
 export function reviewerFeedbackIsInsufficient(feedback: string): boolean {

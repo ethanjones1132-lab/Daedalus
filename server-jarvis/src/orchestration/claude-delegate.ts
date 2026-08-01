@@ -25,7 +25,7 @@ import { isAbsolute, join, relative, resolve } from "path";
 import { createConnection } from "net";
 import { prepareToolResultForContext } from "../tool-result-truncation";
 import { EXECUTOR_TOOL_RESULT_CONTEXT_CHARS } from "./context-budget";
-import type { ExecutorStageOutput, ToolCallRecord } from "./stage-output";
+import type { DelegateStageDiagnostics, ExecutorStageOutput, ToolCallRecord } from "./stage-output";
 import type { ExecutionProfile } from "./route-normalization";
 
 const DELEGATE_TOOL_NAMES: Record<string, string> = {
@@ -315,6 +315,10 @@ export interface ClaudeDelegateInvocation {
   cwd: string;
   env: Record<string, string>;
   timeoutMs: number;
+  /** Effective CLI launch auth mode (proxy | subscription | opencode_go). */
+  authMode: string;
+  /** ANTHROPIC_BASE_URL when the launch pins one; omitted for subscription. */
+  baseUrl?: string;
 }
 
 /** Claude Code 2.1.88 rejects Jarvis run/session identifiers such as `run_*`. */
@@ -405,6 +409,7 @@ export function buildClaudeDelegateInvocation(
   const configuredTimeout = delegate.timeout_ms > 0 ? delegate.timeout_ms : 420_000;
   const preparedCleanup = prepared.cleanup;
 
+  const env = buildLocalClaudeEnv(input.baseEnv ?? process.env, launchOptions);
   return {
     executable,
     args: prepared.args,
@@ -414,8 +419,10 @@ export function buildClaudeDelegateInvocation(
       mcpConfig.cleanup();
     },
     cwd: input.allowedRoots[0],
-    env: buildLocalClaudeEnv(input.baseEnv ?? process.env, launchOptions),
+    env,
     timeoutMs: Math.max(0, Math.min(input.stageRemainingMs, configuredTimeout, 420_000)),
+    authMode: launchOptions.authMode,
+    baseUrl: env.ANTHROPIC_BASE_URL,
   };
 }
 
@@ -441,6 +448,13 @@ export interface DelegateProcessExit {
   signal: string | null;
 }
 
+export interface DelegateProcessDiagnostics {
+  /** Newest ≤4096 UTF-8 characters of stderr, secrets scrubbed. */
+  stderrTail: string;
+  /** Process exit code when known (null if signal/unknown). */
+  exitCode?: number | null;
+}
+
 export interface DelegateProcess {
   /** Native root PID of the spawned process tree, when available. */
   pid?: number;
@@ -448,6 +462,42 @@ export interface DelegateProcess {
   exit: Promise<DelegateProcessExit>;
   writeStdin?: (text: string) => void;
   kill(signal: "SIGTERM" | "SIGKILL"): void;
+  /** Bounded sanitized stderr/exit diagnostics for stage_runs.diagnostic_json. */
+  diagnostics?: () => DelegateProcessDiagnostics;
+}
+
+/** Keep the newest 4 KiB of stderr and scrub credential-bearing tokens. */
+export const DELEGATE_STDERR_TAIL_CHARS = 4096;
+
+const SECRET_VALUE_PATTERNS: RegExp[] = [
+  // Authorization: Bearer <token> / Authorization: <value>
+  /\bauthorization\s*[:=]\s*bearer\s+\S+/gi,
+  /\bauthorization\s*[:=]\s*\S+/gi,
+  // api-key / x-api-key headers and assignments
+  /\b(?:x-)?api-?key\s*[:=]\s*\S+/gi,
+  // token= / token: values (avoid bare "token" mid-prose without separator)
+  /\btoken\s*[:=]\s*\S+/gi,
+  // Standalone Bearer tokens
+  /\bbearer\s+[A-Za-z0-9._\-+=\/]{8,}/gi,
+];
+
+export function sanitizeDelegateDiagnosticText(raw: string): string {
+  let text = raw;
+  for (const pattern of SECRET_VALUE_PATTERNS) {
+    text = text.replace(pattern, (match) => {
+      const sep = match.includes("=") ? "=" : match.includes(":") ? ":" : " ";
+      const key = match.split(/[:=\s]/)[0] ?? "secret";
+      return `${key}${sep}[REDACTED]`;
+    });
+  }
+  return text;
+}
+
+function boundedStderrTail(raw: string): string {
+  const sliced = raw.length <= DELEGATE_STDERR_TAIL_CHARS
+    ? raw
+    : raw.slice(raw.length - DELEGATE_STDERR_TAIL_CHARS);
+  return sanitizeDelegateDiagnosticText(sliced);
 }
 
 export interface DelegateProcessLaunch extends ClaudeDelegateInvocation {
@@ -492,9 +542,26 @@ export const nodeDelegateProcessFactory: DelegateProcessFactory = async (launch)
     // with a negative PID. Windows uses taskkill /T instead.
     detached: process.platform !== "win32",
   });
+  let resolvedExit: DelegateProcessExit = { code: null, signal: null };
+  // Drain stderr into a rolling buffer; keep enough headroom so the final
+  // 4 KiB tail is complete even when chunks arrive mid-multibyte sequence.
+  let stderrRaw = "";
+  const onStderr = (chunk: Buffer | string) => {
+    stderrRaw += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    // Bound memory: retain slightly more than the publish cap.
+    const keep = DELEGATE_STDERR_TAIL_CHARS * 2;
+    if (stderrRaw.length > keep) stderrRaw = stderrRaw.slice(stderrRaw.length - keep);
+  };
+  child.stderr?.on("data", onStderr);
   const exit = new Promise<DelegateProcessExit>((resolveExit) => {
-    child.once("exit", (code, signal) => resolveExit({ code, signal }));
-    child.once("error", () => resolveExit({ code: null, signal: null }));
+    child.once("exit", (code, signal) => {
+      resolvedExit = { code, signal };
+      resolveExit(resolvedExit);
+    });
+    child.once("error", () => {
+      resolvedExit = { code: null, signal: null };
+      resolveExit(resolvedExit);
+    });
   });
   await new Promise<void>((resolveSpawn, rejectSpawn) => {
     child.once("spawn", resolveSpawn);
@@ -506,15 +573,16 @@ export const nodeDelegateProcessFactory: DelegateProcessFactory = async (launch)
     child.kill("SIGTERM");
     throw new Error("Claude delegate stdio was not available after spawn");
   }
-  // The delegate protocol is stdout-only; drain stderr so a noisy child can
-  // never block on a full pipe while the caller waits for JSON events.
-  child.stderr?.resume();
   return {
     pid: child.pid,
     events: readJsonLines(stdout),
     exit,
     writeStdin: stdin ? (text) => stdin.end(text) : undefined,
     kill: (signal) => { child.kill(signal); },
+    diagnostics: () => ({
+      stderrTail: boundedStderrTail(stderrRaw),
+      exitCode: resolvedExit.code,
+    }),
   };
 };
 
@@ -1091,23 +1159,58 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
 
     if (operation.state()) return terminalOutput(operation.state()!);
     const records: ToolCallRecord[] = [];
-    const launchPromise = input.processFactory({ ...invocation, prompt: input.prompt, signal: operation.signal });
+    // Correlate proxy/stderr logs with this stage_runs.diagnostic_json row.
+    const delegateRequestId = crypto.randomUUID();
+    let processDiagnostics: DelegateProcessDiagnostics | undefined;
+    let delegatedProcess: DelegateProcess | undefined;
+    const stageDiagnostics = (): DelegateStageDiagnostics => {
+      const live = delegatedProcess?.diagnostics?.() ?? processDiagnostics;
+      if (live) processDiagnostics = live;
+      return {
+        delegate_request_id: delegateRequestId,
+        auth_mode: invocation!.authMode,
+        base_url: invocation!.baseUrl,
+        exit_code: processDiagnostics?.exitCode ?? null,
+        stderr_tail: processDiagnostics
+          ? sanitizeDelegateDiagnosticText(processDiagnostics.stderrTail)
+          : undefined,
+      };
+    };
+    const withDiagnostics = (result: ExecutorStageOutput): ExecutorStageOutput => ({
+      ...result,
+      diagnostics: stageDiagnostics(),
+    });
+    const launchPromise = input.processFactory({
+      ...invocation,
+      env: {
+        ...invocation.env,
+        JARVIS_DELEGATE_REQUEST_ID: delegateRequestId,
+      },
+      prompt: input.prompt,
+      signal: operation.signal,
+    });
     const launchResult = await operation.race(launchPromise);
     if (launchResult.kind === "timeout" || launchResult.kind === "aborted") {
       const cleanup = await cleanupLateLaunch(launchPromise, terminationGraceMs, cleanupTimeoutMs, treeKiller);
       records.push(cleanupRecord(cleanup));
-      return terminalOutput(launchResult.kind, records);
+      // Do not await the factory again — cleanupLateLaunch already bounded it.
+      // Request-id-only diagnostics still correlate proxy/stderr when present.
+      return withDiagnostics(terminalOutput(launchResult.kind, records));
     }
     if (launchResult.kind === "error") {
       input.health.strike("spawn_error");
-      return delegateFailure("delegate_spawn_error", `Failed to spawn Claude delegate: ${String(launchResult.error)}`);
+      return withDiagnostics(delegateFailure(
+        "delegate_spawn_error",
+        `Failed to spawn Claude delegate: ${String(launchResult.error)}`,
+      ));
     }
-    const delegatedProcess = launchResult.value;
+    delegatedProcess = launchResult.value;
     if (operation.state()) {
       records.push(cleanupRecord(await terminateDelegateProcess(
         delegatedProcess, terminationGraceMs, cleanupTimeoutMs, treeKiller,
       )));
-      return terminalOutput(operation.state()!, records);
+      processDiagnostics = delegatedProcess.diagnostics?.();
+      return withDiagnostics(terminalOutput(operation.state()!, records));
     }
     if (invocation.promptOnStdin) delegatedProcess.writeStdin?.(input.prompt);
 
@@ -1251,42 +1354,81 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
     }
     records.push(gitMetadataRecord(afterSnapshots, verificationAvailable));
 
+    // Capture process diagnostics after the child has settled (exit observed or
+    // teardown attempted) so exit_code and stderr_tail are as complete as possible.
+    processDiagnostics = delegatedProcess.diagnostics?.() ?? processDiagnostics;
+
     const terminal = operation.state()
       ?? (afterResult.kind === "timeout" || afterResult.kind === "aborted" ? afterResult.kind : undefined);
     if (cleanupUnconfirmed) {
       input.health.strike("termination_unconfirmed");
-      return {
+      return withDiagnostics({
         ok: false,
         narrative: narrative.join(""),
         toolCalls: records,
         terminalStatus: "failed",
         errorCode: "delegate_cleanup_unconfirmed",
-      };
+      });
     }
     if (terminal) {
       if (unverifiedWrite) input.health.strike("unverified_write");
-      return terminalOutput(terminal, records, narrative.join(""));
+      return withDiagnostics(terminalOutput(terminal, records, narrative.join("")));
     }
     if (afterResult.kind === "error") narrative.push(`Ground-truth verification failed: ${String(afterResult.error)}`);
     if (unverifiedWrite) {
       input.health.strike("unverified_write");
-      return { ok: false, narrative: narrative.join(""), toolCalls: records, terminalStatus: "failed", errorCode: "delegate_write_unverified" };
+      return withDiagnostics({
+        ok: false,
+        narrative: narrative.join(""),
+        toolCalls: records,
+        terminalStatus: "failed",
+        errorCode: "delegate_write_unverified",
+      });
     }
     if (policyViolation) {
-      return { ok: false, narrative: narrative.join(""), toolCalls: records, terminalStatus: "failed", errorCode: "delegate_tool_not_permitted" };
+      return withDiagnostics({
+        ok: false,
+        narrative: narrative.join(""),
+        toolCalls: records,
+        terminalStatus: "failed",
+        errorCode: "delegate_tool_not_permitted",
+      });
     }
     if (streamOutcome.kind === "stream_error") {
-      return { ok: false, narrative: `Claude delegate stream failed: ${String(streamOutcome.error)}`, toolCalls: records, terminalStatus: "failed", errorCode: "delegate_stream_error" };
+      return withDiagnostics({
+        ok: false,
+        narrative: `Claude delegate stream failed: ${String(streamOutcome.error)}`,
+        toolCalls: records,
+        terminalStatus: "failed",
+        errorCode: "delegate_stream_error",
+      });
     }
     if (eventCount === 0) {
       input.health.strike("no_event_exit");
-      return { ok: false, narrative: "Claude delegate exited without emitting stream events.", toolCalls: records, terminalStatus: "failed", errorCode: "delegate_no_events" };
+      return withDiagnostics({
+        ok: false,
+        narrative: "Claude delegate exited without emitting stream events.",
+        toolCalls: records,
+        terminalStatus: "failed",
+        errorCode: "delegate_no_events",
+      });
     }
     if (streamOutcome.exit.code !== 0) {
-      return { ok: false, narrative: narrative.join(""), toolCalls: records, terminalStatus: "failed", errorCode: "delegate_exit_nonzero" };
+      return withDiagnostics({
+        ok: false,
+        narrative: narrative.join(""),
+        toolCalls: records,
+        terminalStatus: "failed",
+        errorCode: "delegate_exit_nonzero",
+      });
     }
     input.health.markHealthy();
-    return { ok: true, narrative: narrative.join(""), toolCalls: records, terminalStatus: "completed" };
+    return withDiagnostics({
+      ok: true,
+      narrative: narrative.join(""),
+      toolCalls: records,
+      terminalStatus: "completed",
+    });
   } finally {
     invocation?.cleanup();
     operation.dispose();

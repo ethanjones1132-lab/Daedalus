@@ -3,6 +3,7 @@ import type { ExecutionProfile } from "./route-normalization";
 import type { WriteEffectObservation } from "./content-fingerprint";
 import { hasWriteIntent } from "./turn-requirements";
 import { defaultCapabilityIndex } from "../tool-capabilities-default";
+import type { SemanticPressureBudget } from "./executor-progress-policy";
 
 /**
  * Tools whose success is a real workspace mutation.
@@ -211,7 +212,11 @@ export function isTerminalNoWriteEffect(report: EffectGateReport): boolean {
  * READ-evidence rubric, which actively steers toward read-only tools. When
  * the model is about to end a full-profile write turn with zero successful
  * mutations, the loop sends a bounded write nudge instead of accepting the
- * prose. Bounded at 3 so a refusing/incapable model still exits predictably.
+ * prose.
+ *
+ * Run-level bound: `SemanticPressureBudget.claim("write_effect")` is once per
+ * agent run (shared with mid-loop force_write). The local `nudgesSent < 3`
+ * cap remains a safety net for callers that have not wired the budget.
  */
 export const WRITE_EFFECT_NUDGE =
   "This turn is a CHANGE request. You have write tools available " +
@@ -228,6 +233,16 @@ export function buildWriteEffectNudge(writeTools: string[], expectedTarget: stri
     `Expected write target based on the gathered evidence: ${expectedTarget}.`,
     "Call an available write tool now; prose or an unexecuted diff does not modify the workspace. Read the target back after writing to verify it.",
   ].join(" ");
+}
+
+/**
+ * Spend the run-level `write_effect` pressure slot. Returns true only when the
+ * caller may inject write-pressure text. Without a budget, always allows
+ * (legacy callers keep the local nudge cap only).
+ */
+export function claimWriteEffectPressure(budget?: SemanticPressureBudget): boolean {
+  if (!budget) return true;
+  return budget.claim("write_effect");
 }
 
 /** Select the file with the most genuine successful content reads. */
@@ -266,7 +281,14 @@ export function shouldPressWriteEffect(input: {
   nudgesSent: number;
   turnCount: number;
   maxTurns: number;
+  /**
+   * When false, the run-level write_effect slot is already spent — do not
+   * press again (caller may still record `semantic_pressure_suppressed`).
+   * Omit/true = available.
+   */
+  writeEffectPressureAvailable?: boolean;
 }): boolean {
+  if (input.writeEffectPressureAvailable === false) return false;
   const readLoopEscalation = input.toolCallsEmitted && (
     input.duplicateReadDeflections >= 2
     || (

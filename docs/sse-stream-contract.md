@@ -12,12 +12,51 @@ For every connected Session turn, the server emits exactly one user-visible outc
 
 `message_stop` is a transport terminator, not a user-visible outcome. It is emitted at most once and may arrive before `result` on compatibility paths such as Claude CLI. A `cancelled` outcome replaces a trailing `message_stop` because the client has already aborted the stream.
 
+### Transport completion vs TaskRun completion
+
+Terminal **transport** completion is the single SSE outcome frame for one
+`/chat/stream` request. It is not the same as **TaskRun** completion on the
+persisted ledger:
+
+| Layer | Meaning |
+|---|---|
+| Transport (`result` / `error` / `cancelled`) | This stream request ended; the client may show the answer or error. |
+| TaskRun (`decideCompletion` → `taskStatus` / `runOutcome`) | Whether the multi-turn work item is finished, paused, or failed. |
+
+A clean transport `result` with `subtype: "partial"` means the stream finished
+while the TaskRun remains resumable (open plan items, write unverified, etc.).
+Only `subtype: "success"` (with a verified write when write-intent applies)
+corresponds to a completed TaskRun. See
+`docs/conductor-completion-contract.md`.
+
+### `completion_reason`
+
+When the orchestrator path runs, the structured pipeline outcome record
+includes a machine-readable `completion_reason` from `decideCompletion`:
+
+| Reason | Typical transport subtype | TaskRun effect |
+|---|---|---|
+| `verified_complete` | `success` | TaskRun completed |
+| `non_write_complete` | `success` | TaskRun completed (non-write) |
+| `task_plan_open` | `partial` | TaskRun stays active/paused |
+| `write_unverified` | `partial` | TaskRun paused, resumable |
+| `verification_failed` | `partial` | TaskRun paused |
+| `pipeline_partial` / `pipeline_degraded` | `partial` | TaskRun paused |
+| `pipeline_failed` | `error` (or error-bearing result) | TaskRun failed |
+| `repetition_detected` | `partial` / degraded path | TaskRun paused |
+
+`completion_reason` explains *why* a run paused or completed; clients and
+replay must not treat synthesizer prose as authoritative over it.
+
 The packaged-runtime smoke (`scripts/smoke-jarvis-runtime.ps1`) parses the
-stream and requires exactly one outcome frame. It records `manifest_sha`,
+stream and requires exactly one outcome frame per request. It records `manifest_sha`,
 `health_sha`, the serving listener command line, `session_id`, elapsed time,
 the terminal type, and the terminal result/error text as one compact JSON
 record. A mismatch between the Desktop manifest, `/health`, or the process
 serving port 19877 fails the smoke before a prompt is sent.
+`-CompletionIntegritySmoke` additionally drives multi-turn Group A execution
+and requires intermediate turns to stay non-success until all four artifacts
+exist.
 
 If a connected server path exits without an outcome, `StreamSession.ensureTerminal()` emits `error` with code `stream_ended_without_outcome`, followed by `message_stop` if one has not already been sent. Client disconnects are exempt because the stream can no longer be written.
 

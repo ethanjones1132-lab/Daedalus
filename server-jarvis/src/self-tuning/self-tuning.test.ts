@@ -152,6 +152,29 @@ describe("Self tuning", () => {
     expect(run?.check_tier).toBe("existing");
   });
 
+  test("insertStageRun persists diagnostic_json for delegate failures", () => {
+    const store = new SelfTuningStore(TEST_DB_PATH);
+    const collector = new SessionOutcomeCollector(store);
+    collector.startAgentRun("run-diagnostic", "s", "q", "general", ["executor"]);
+    collector.recordStageRun({
+      id: "stage-diagnostic",
+      agent_run_id: "run-diagnostic",
+      mode_id: "executor",
+      turn_number: 1,
+      was_successful: 0,
+      had_error: 1,
+      diagnostic_json: JSON.stringify({
+        delegate_request_id: "req-123",
+        exit_code: 1,
+        stderr_tail: "proxy refused",
+      }),
+    });
+    expect(JSON.parse(store.getStageRuns("run-diagnostic")[0]!.diagnostic_json!)).toMatchObject({
+      delegate_request_id: "req-123",
+      exit_code: 1,
+    });
+  });
+
   // T0.2: stage_runs stop_reason + partial_error_code round-trip (new columns
   // + idempotent guarded ALTER on pre-existing DBs).
   test("insertStageRun persists stop_reason and partial_error_code", () => {
