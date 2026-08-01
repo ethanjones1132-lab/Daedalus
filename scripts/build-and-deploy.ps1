@@ -236,7 +236,8 @@ if ($RestartServer) {
     # text-protocol executor that rarely emits write calls, and it took eleven
     # days and a replay-harness rule to notice. Every deploy in between shipped
     # a dead write path without a word. Verify it here instead.
-    Write-Step 'Verifying Claude CLI proxy (:19878 — delegate write path)'
+    # ASCII-only in console output: PS 5.1 renders non-ASCII here as mojibake.
+    Write-Step 'Verifying Claude CLI proxy (:19878 - delegate write path)'
     $proxyPort = 19878
     $logsDir = Join-Path $env:USERPROFILE '.openclaw\jarvis\logs'
     if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Force -Path $logsDir | Out-Null }
