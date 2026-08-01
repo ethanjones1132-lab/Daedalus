@@ -6,6 +6,7 @@ import { checkWrittenFilesSyntax, renderSyntaxIssues, type SyntaxIssue } from ".
 import { renderRunIssues, runWrittenCodeGate, type RunGateResult } from "./run-gate";
 import { mergeToCheckResult, runVerificationCheck, type CheckResult } from "./check-runner";
 import { runBuildCheck, writtenPathsFrom } from "./build-check";
+import { ensureVerificationWorkspaceCached } from "./verification-workspace";
 import { BUILTIN_MODES, executorTurnLimit, getToolsForMode } from "./modes";
 import { toolResultModelText, type ToolRuntime, type ExecutionContext } from "../tool-runtime";
 import type { CallModelFn, ChatMessage } from "./router";
@@ -838,8 +839,23 @@ export class PipelineExecutor {
   ): Promise<CheckResult | undefined> {
     const workspaceRoot =
       this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd();
-    const timeoutMs = this.ctx.config.orchestrator?.verification?.check_timeout_ms ?? 90000;
+    const vcfg = this.ctx.config.orchestrator?.verification;
+    const timeoutMs = vcfg?.check_timeout_ms ?? 90_000;
     try {
+      // CMake prepare is outside the model loop and process-cached per workspace.
+      // A ready dir is fed into build-check; unavailable → honest none (no cold configure).
+      let configuredBuildDirs: string[] | undefined;
+      const prepareCmake = vcfg?.prepare_cmake !== false;
+      if (prepareCmake) {
+        const prepared = await ensureVerificationWorkspaceCached({
+          root: workspaceRoot,
+          prepareTimeoutMs: vcfg?.prepare_timeout_ms ?? 120_000,
+          prepareEnabled: true,
+        });
+        if (prepared.kind === "ready") {
+          configuredBuildDirs = [prepared.buildDir];
+        }
+      }
       return await runVerificationCheck({
         toolCalls,
         request,
@@ -850,6 +866,7 @@ export class PipelineExecutor {
           root: workspaceRoot,
           writtenPaths: writtenPathsFrom(toolCalls),
           timeoutMs,
+          configuredBuildDirs,
         }),
         runTests: (tc, req, pl) => this.gateWrittenRun([...tc], req, pl),
       });
@@ -3816,11 +3833,24 @@ export class PipelineExecutor {
         const hadWritten = writtenToolCalls.some(
           (c) => !c.is_error && WRITE_EFFECT_TOOLS.has(c.name),
         );
+        const reviewRoot = this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd();
+        const reviewVcfg = this.ctx.config.orchestrator.verification;
+        let reviewConfiguredDirs: string[] | undefined;
+        const reviewPrepareCmake = reviewVcfg?.prepare_cmake !== false;
+        if (hadWritten && reviewPrepareCmake) {
+          const prepared = await ensureVerificationWorkspaceCached({
+            root: reviewRoot,
+            prepareTimeoutMs: reviewVcfg?.prepare_timeout_ms ?? 120_000,
+            prepareEnabled: true,
+          });
+          if (prepared.kind === "ready") reviewConfiguredDirs = [prepared.buildDir];
+        }
         const reviewerBuild = hadWritten
           ? await runBuildCheck({
-              root: this.ctx.workspace_path || this.ctx.config.jarvis_path || process.cwd(),
+              root: reviewRoot,
               writtenPaths: writtenPathsFrom(writtenToolCalls),
-              timeoutMs: this.ctx.config.orchestrator.verification.check_timeout_ms ?? 90000,
+              timeoutMs: reviewVcfg.check_timeout_ms ?? 90_000,
+              configuredBuildDirs: reviewConfiguredDirs,
             })
           : { kind: "not_applicable", reason: "no written code" } as const;
         this.lastCheckResult = mergeToCheckResult({

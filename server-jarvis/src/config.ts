@@ -364,6 +364,13 @@ export interface DynamicAgentsConfig {
 export interface VerificationConfig {
   /** Master flag — off by default; canary via policy-staging before default-on. */
   enabled: boolean;
+  /**
+   * When true (default), prepare a reusable CMake build dir outside model
+   * loops via verification-workspace before the check runs.
+   */
+  prepare_cmake: boolean;
+  /** Bound for out-of-loop CMake configure (`cmake -S/-B`). */
+  prepare_timeout_ms: number;
   /** Bounded check execution timeout. */
   check_timeout_ms: number;
   /** Reward weight per tier (feeds verification-reward.ts). */
@@ -699,7 +706,9 @@ export function defaultConfig(): JarvisConfig {
       },
       verification: {
         enabled: false,
-        check_timeout_ms: 90000,
+        prepare_cmake: true,
+        prepare_timeout_ms: 120_000,
+        check_timeout_ms: 90_000,
         tier_reward: { existing: 1, builtin: 1, synth: 0.5, none: 0 },
         thrift: { dead_tool_suppression: true, achieved_effect_early_stop: true },
       },

@@ -67,6 +67,34 @@ describe("detector registry", () => {
     expect(d?.cmd.args).toEqual(["--build", `/ws/build`.replace(/\//g, sep)]);
   });
 
+  test("cmake accepts prepared configuredBuildDirs after normal candidates", () => {
+    const sep = require("path").sep as string;
+    const prepared = `/cache/abc`.replace(/\//g, sep);
+    const files = ["/ws/CMakeLists.txt", `${prepared.replace(/\\/g, "/")}/CMakeCache.txt`];
+    const d = detectorFor({
+      ...di({ files }),
+      configuredBuildDirs: [prepared],
+    });
+    expect(d?.id).toBe("cmake");
+    expect(d?.cmd.args).toEqual(["--build", prepared]);
+  });
+
+  test("cmake prefers workspace build over configuredBuildDirs", () => {
+    const sep = require("path").sep as string;
+    const prepared = `/cache/abc`.replace(/\//g, sep);
+    const d = detectorFor({
+      ...di({
+        files: [
+          "/ws/CMakeLists.txt",
+          "/ws/build/CMakeCache.txt",
+          `${prepared.replace(/\\/g, "/")}/CMakeCache.txt`,
+        ],
+      }),
+      configuredBuildDirs: [prepared],
+    });
+    expect(d?.cmd.args).toEqual(["--build", `/ws/build`.replace(/\//g, sep)]);
+  });
+
   test("go detected from go.mod → go build ./...", () => {
     expect(detectorFor(di({ files: ["/ws/go.mod"] }))?.id).toBe("go");
   });
@@ -143,5 +171,20 @@ describe("runBuildCheck", () => {
       exists: files(), exec: fakeExec({}),
     });
     expect(r.kind).toBe("not_applicable");
+  });
+
+  test("cmake with configuredBuildDirs runs cmake --build on prepared dir", async () => {
+    const sep = require("path").sep as string;
+    const prepared = `/cache/sha`.replace(/\//g, sep);
+    const r = await runBuildCheck({
+      root: "/ws",
+      writtenPaths: ["/ws/a.cpp"],
+      timeoutMs: 1000,
+      configuredBuildDirs: [prepared],
+      exists: files("/ws/CMakeLists.txt", `${prepared.replace(/\\/g, "/")}/CMakeCache.txt`),
+      exec: fakeExec({ cmake: { code: 0 } }),
+    });
+    expect(r.kind).toBe("clean");
+    if (r.kind === "clean") expect(r.command).toContain("--build");
   });
 });

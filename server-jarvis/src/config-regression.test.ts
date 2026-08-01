@@ -103,4 +103,33 @@ describe("configuration regression coverage retained during Task 6", () => {
     expect(delegate.timeout_ms).toBe(420_000);
     expect(delegate.free_thrash_threshold).toBe(2);
   });
+
+  test("verification prepare_cmake defaults and honor explicit overrides", () => {
+    const defaults = defaultConfig().orchestrator.verification;
+    expect(defaults.prepare_cmake).toBe(true);
+    expect(defaults.prepare_timeout_ms).toBe(120_000);
+    expect(defaults.check_timeout_ms).toBe(90_000);
+
+    const overridden = normalizeConfig({
+      orchestrator: {
+        verification: {
+          prepare_cmake: false,
+          prepare_timeout_ms: 5_000,
+          check_timeout_ms: 15_000,
+        },
+      },
+    }).orchestrator.verification;
+    expect(overridden.prepare_cmake).toBe(false);
+    expect(overridden.prepare_timeout_ms).toBe(5_000);
+    expect(overridden.check_timeout_ms).toBe(15_000);
+
+    // Round-trip serialization preserves prepare flags without inventing secrets.
+    const roundTrip = normalizeConfig(JSON.parse(JSON.stringify({
+      orchestrator: { verification: overridden },
+    })));
+    expect(roundTrip.orchestrator.verification.prepare_cmake).toBe(false);
+    expect(roundTrip.orchestrator.verification.prepare_timeout_ms).toBe(5_000);
+    const serialized = JSON.stringify(roundTrip);
+    expect(serialized).not.toMatch(/sk-|OPENROUTER_API_KEY|Bearer /i);
+  });
 });
