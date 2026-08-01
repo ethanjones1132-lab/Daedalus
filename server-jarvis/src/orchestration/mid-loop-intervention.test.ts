@@ -624,6 +624,61 @@ describe("outstanding plan items add supervision pressure", () => {
     expect(note).toContain("The active item is: Task 2: add the ParameterID enum");
   });
 
+  // 2026-07-31 follow-up to the same incident: removing the unactionable
+  // clause stops the note being nonsense, but not the REPETITION. The plan
+  // nudge fired 66x on one turn because nothing counted how many times it had
+  // already been ignored. `buildReadSpiralNote` got exactly this discipline on
+  // 2026-07-26 via `forceWriteNudgesSent`; this branch never did.
+  //
+  // Contract: escalate once, then stop. A note the executor has ignored twice
+  // is not going to work the third time, and each repeat costs a full model
+  // round-trip (~2-10s) plus a re-upload of the whole transcript. Stopping lets
+  // the executor loop exit naturally instead of being held open to the turn
+  // cap — 28 of 37 turns on the live run did nothing at all.
+  test("the first plan nudge uses the baseline wording", () => {
+    const decision = decideMidLoopIntervention(
+      worked({ planItemsTotal: 6, planItemsRemaining: 5, planNudgesSent: 0 }),
+    );
+    expect(decision.kind).toBe("inject");
+    expect((decision as { note: string }).note).toContain("still unverified");
+  });
+
+  test("the second plan nudge escalates instead of repeating verbatim", () => {
+    const first = decideMidLoopIntervention(
+      worked({ planItemsTotal: 6, planItemsRemaining: 5, planNudgesSent: 0 }),
+    ) as { note: string };
+    const second = decideMidLoopIntervention(
+      worked({ planItemsTotal: 6, planItemsRemaining: 5, planNudgesSent: 1 }),
+    ) as { kind: string; note: string };
+    expect(second.kind).toBe("inject");
+    expect(second.note).not.toBe(first.note);
+  });
+
+  test("a plan nudge ignored twice stops firing so the loop can exit", () => {
+    const decision = decideMidLoopIntervention(
+      worked({ planItemsTotal: 6, planItemsRemaining: 5, planNudgesSent: 2 }),
+    );
+    expect(decision.kind).toBe("continue");
+  });
+
+  test("supervision survives the repeat-cap via the quality phase", () => {
+    // Same polarity property as above: capping the nudge must not leave the
+    // stage unsupervised.
+    const capped = worked({ planItemsTotal: 6, planItemsRemaining: 5, planNudgesSent: 2 });
+    const supervised = decideMidLoopIntervention(capped).kind !== "continue"
+      || shouldRunQualityPhase(capped);
+    expect(supervised).toBe(true);
+  });
+
+  test("plan-remainder injects are tagged so the host can count them", () => {
+    // The host increments `planNudgesSent` at the apply site in pipeline.ts and
+    // cannot distinguish inject variants without a tag.
+    const decision = decideMidLoopIntervention(
+      worked({ planItemsTotal: 6, planItemsRemaining: 5, planNudgesSent: 0 }),
+    );
+    expect((decision as { noteKind?: string }).noteKind).toBe("plan_remainder");
+  });
+
   test("supervision is preserved when the plan summary is a placeholder", () => {
     // The 2026-07-29 inversion property, restated for this guard: suppressing
     // the placeholder text must not suppress the supervision itself.

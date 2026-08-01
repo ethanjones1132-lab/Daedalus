@@ -369,6 +369,22 @@ export function getPlanItem(contract: TaskRunContract, itemId: string): TaskPlan
   return contract.plan?.items.find((item) => item.id === itemId);
 }
 
+/**
+ * Text for the ledger's active plan item, for model-facing supervision notes.
+ *
+ * 2026-07-31 (run_2c46d082): the mid-loop signal took `planItemsRemaining` from
+ * this ledger but `activePlanItem` from the CURRENT turn's rendered planner
+ * narrative. On a "continue" turn whose conductor aborted into the
+ * deterministic route no planner ran, so the count reported 4 items remaining
+ * while the text reported "No planning stage executed." — one nudge built from
+ * two disagreeing sources, naming a null as the thing to work on. Carrying the
+ * plan across turns is correct; reading its item text from somewhere else was
+ * not. Both now come from here.
+ */
+export function activePlanItemText(contract: TaskRunContract): string | undefined {
+  return getActivePlanItem(contract)?.title;
+}
+
 export function getActivePlanItem(contract: TaskRunContract): TaskPlanItem | undefined {
   const plan = contract.plan;
   if (!plan?.activeItemId) return undefined;

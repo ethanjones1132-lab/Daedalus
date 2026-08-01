@@ -9,6 +9,7 @@ import {
   createTaskPlanItem,
   createTaskRun,
   deriveTaskStatusFromPlan,
+  activePlanItemText,
   getActivePlanItem,
   getPlanItem,
   hasEvidencePointer,
@@ -919,6 +920,32 @@ describe("task-run > TaskPlan constructors", () => {
     expect(getActivePlanItem(run)?.status).toBe("active");
     expect(getPlanItem(run, "i2")?.status).toBe("pending");
     expect(run.remainingWork).toEqual(["Scaffold module", "Wire tests"]);
+  });
+
+  // 2026-07-31 (run_2c46d082): the mid-loop signal sourced `planItemsRemaining`
+  // from the session-scoped TaskPlan ledger but `activePlanItem` from THIS
+  // turn's rendered planner narrative. On a "continue" turn whose conductor
+  // aborted into the deterministic route, no planner ran — so the count said
+  // "4 items remain" while the text said "No planning stage executed.". Two
+  // sources describing one thing, disagreeing. The nudge built from them named
+  // a null as the active item and was injected 66x.
+  //
+  // Carrying a plan across turns is CORRECT (that is what a session TaskPlan is
+  // for); the defect was reading the item text from somewhere else. Both must
+  // come from the ledger.
+  describe("activePlanItemText", () => {
+    test("returns the ledger's active item, independent of any rendered plan text", () => {
+      const run = makePlanRun([
+        { id: "i1", title: "Scaffold module", acceptanceChecks: ["files exist"] },
+        { id: "i2", title: "Wire tests", dependsOn: ["i1"] },
+      ]);
+      expect(activePlanItemText(run)).toBe("Scaffold module");
+    });
+
+    test("returns undefined when the contract carries no plan", () => {
+      const run = makePlanRun([]);
+      expect(activePlanItemText(run)).toBeUndefined();
+    });
   });
 
   test("createTaskPlan builds ordered items without activating", () => {

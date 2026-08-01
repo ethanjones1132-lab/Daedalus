@@ -64,6 +64,7 @@ import { findExistingWorkspacePath } from "./workspace-affinity";
 import { join, posix, win32 } from "path";
 import { canApplyConductorReroute, rejectReroute } from "./reroute-policy";
 import {
+  activePlanItemText,
   getActivePlanItem,
   incrementPlanItemRepairCycle,
   markPlanItemBlocked,
@@ -1440,6 +1441,12 @@ export class PipelineExecutor {
     let workspaceEvidenceNudgeCount = 0;
     let evidenceCountAtLastNudge = 0;
     let writeEffectNudgeCount = 0;
+    // Plan-remainder nudges issued this stage. Counted at decision time (the
+    // single `recordMidLoopDirective` choke point) rather than per apply site:
+    // a few branches produce a decision they then discard, so this can only
+    // over-count, which engages the cap sooner — the safe direction for a
+    // reflex whose failure mode is injecting 66x (2026-07-31, run_2c46d082).
+    let planNudgeCount = 0;
     let repeatedWriteFailureReached = false;
     const intentText = options.rawMessage ?? request;
     const requiresWorkspaceEvidence = turnNeedsWorkspaceEvidence(options.turnRequirement, intentText);
@@ -1582,7 +1589,14 @@ export class PipelineExecutor {
     ): MidLoopSignal => {
       const evidence = buildMidLoopToolEvidence(calls, {
         taskObjective: intentText,
-        activePlanItem: planSummary,
+        // Prefer the TaskPlan ledger's active item — the SAME source as
+        // `planItemsRemaining` below. `planSummary` is this turn's rendered
+        // planner narrative and is a placeholder when no planner ran, which on
+        // a plan-carrying "continue" turn disagreed with the count and produced
+        // a nudge naming a null (2026-07-31, run_2c46d082).
+        activePlanItem: (options.taskRunContract
+          ? activePlanItemText(options.taskRunContract)
+          : undefined) ?? planSummary,
         verification: this.lastCheckResult
           ? {
               tier: this.lastCheckResult.tier,
@@ -1615,6 +1629,8 @@ export class PipelineExecutor {
               // Lets the reflex escalate its wording instead of repeating a
               // note the executor has already ignored (2026-07-26).
               forceWriteNudgesSent: writeEffectNudgeCount,
+              // Same escalate-then-stop discipline for the plan-remainder note.
+              planNudgesSent: planNudgeCount,
               // TaskPlan ledger drives the plan-aware correctness floor (Task C1).
               planItemsTotal: options.taskRunContract?.plan?.items.length,
               planItemsRemaining: options.taskRunContract?.plan?.items.filter(
@@ -1751,6 +1767,9 @@ export class PipelineExecutor {
       const midLoop = await this.conductor.live.checkMidLoop(signal);
       midLoopLastSuccessfulWrites = writes;
       recordMidLoopDirective(midLoop);
+      if (midLoop.kind === "inject" && midLoop.noteKind === "plan_remainder") {
+        planNudgeCount++;
+      }
       applyQualityPhaseBookkeeping(midLoop, signal);
       return midLoop;
     };

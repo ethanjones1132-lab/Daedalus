@@ -17,6 +17,12 @@ export interface MidLoopDecisionMeta {
   decisionSource?: MidLoopDecisionSource;
   /** Shared with the model attribution when a resident escalation was attempted. */
   escalationId?: string;
+  /**
+   * Which reflex produced an `inject`. The host cannot tell inject variants
+   * apart at the apply site, so a per-reflex repeat counter (e.g.
+   * `planNudgesSent`) has nothing to key on without this tag.
+   */
+  noteKind?: "plan_remainder";
 }
 
 export type LoopIntervention = (
@@ -103,6 +109,14 @@ export interface MidLoopSignal {
   planItemsTotal?: number;
   /** Items not yet `verified` in the active TaskPlan ledger. */
   planItemsRemaining?: number;
+  /**
+   * Plan-remainder nudges already pushed into the executor transcript this
+   * stage. Same role `forceWriteNudgesSent` plays for the force-write reflex:
+   * drives escalation, then a hard stop. 2026-07-31 (run_2c46d082) this note
+   * was injected 66x on a single turn because nothing counted it, and 28 of 37
+   * executor turns produced no tool call.
+   */
+  planNudgesSent?: number;
 }
 
 /** Correctness = mutation floor; quality = product polish after that floor. */
@@ -122,6 +136,17 @@ export const DEFAULT_QUALITY_PUSH_NOTE =
  * is left for resident-model escalation - see conductor.ts checkMidLoop. */
 const SPIRAL_READ_FLOOR = 5;
 const ABORT_BUDGET_FLOOR_MS = 30_000;
+
+/**
+ * How many times the plan-remainder note may be injected in one executor
+ * stage before it stops firing. Two: one statement, one escalation. A note the
+ * executor has ignored twice will not work the third time, and every repeat
+ * costs a full model round-trip plus a re-upload of the growing transcript —
+ * live run_2c46d082 injected it 66x and 28 of 37 turns produced no tool call.
+ * Stopping lets the executor loop exit instead of being held open to the turn
+ * cap; the quality phase still supervises the stage (see the polarity test).
+ */
+const PLAN_REMAINDER_NUDGE_CAP = 2;
 
 const EVIDENCE_TARGET_CAP = 6;
 const EVIDENCE_SUMMARY_CAP = 5;
@@ -711,7 +736,8 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
   // in the executor loop, which is the mechanism that actually keeps it
   // working; the quality push is left free to fire on its own terms.
   if (
-    (signal.planItemsRemaining ?? 0) > 0
+    (signal.planItemsRemaining ?? 0) > 0 &&
+    (signal.planNudgesSent ?? 0) < PLAN_REMAINDER_NUDGE_CAP
   ) {
     const remaining = signal.planItemsRemaining ?? 0;
     // 2026-07-31 (run_2c46d082): `activePlanItem` can be the stage-output
@@ -729,15 +755,22 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
     const progress = signal.successfulWrites > 0
       ? "A landed write is progress on ONE item, not completion of the plan."
       : "No successful write has landed yet; start by making the current item's change.";
-    return {
-      kind: "inject",
-      note:
-        `${remaining} plan item(s) are still unverified — this turn is not done.` +
+    // Escalate rather than repeat. The first note states the situation; the
+    // second one names the fact that it was already ignored and narrows the
+    // ask to a single concrete call, mirroring `buildReadSpiralNote`.
+    const note = (signal.planNudgesSent ?? 0) === 0
+      ? `${remaining} plan item(s) are still unverified — this turn is not done.` +
         `${activeItem} ${progress} ` +
         "Continue with the next unverified item now: make its " +
         "change with edit_file/write_file, then move to the one after it. " +
-        "Do not summarise or stop while items remain and budget is left.",
-    };
+        "Do not summarise or stop while items remain and budget is left."
+      : `Second notice: ${remaining} plan item(s) are still unverified and the ` +
+        "previous instruction to continue produced no file change." +
+        `${activeItem} Stop describing the work and make ONE concrete edit now — ` +
+        "your next tool call must be edit_file or write_file. If you cannot " +
+        "identify the next change, say exactly what is blocking you instead of " +
+        "restating the plan.";
+    return { kind: "inject", noteKind: "plan_remainder", note };
   }
 
   return { kind: "continue" };
