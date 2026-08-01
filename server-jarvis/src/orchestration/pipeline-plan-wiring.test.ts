@@ -166,4 +166,139 @@ describe("pipeline reviewer ACCEPT requires grounded evidence", () => {
     expect(item?.status).toBe("active");
     expect(segment.partialStage?.errorCode).toBe("plan_item_acceptance_unmet");
   });
+
+  test("ACCEPT without write then write+ACCEPT recovers: item verified and partialStage cleared", async () => {
+    const runtime = createToolRuntime();
+    runtime.register(
+      {
+        type: "function",
+        function: {
+          name: "read_file",
+          description: "read",
+          parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+        },
+        requires_approval: false,
+        dangerous: false,
+      } as any,
+      async () => "file contents",
+    );
+    runtime.register(
+      {
+        type: "function",
+        function: {
+          name: "write_file",
+          description: "write",
+          parameters: {
+            type: "object",
+            properties: { path: { type: "string" }, content: { type: "string" } },
+            required: ["path", "content"],
+          },
+        },
+        requires_approval: false,
+        dangerous: false,
+      } as any,
+      async () => "File written",
+    );
+    const config = defaultConfig();
+    config.tools.require_approval = [];
+    const ctx = makeExecutionContext("agent", config, { workspace_path: process.cwd() });
+
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") {
+        executorTurns++;
+        // First pass: only a read (triggers plan_item_acceptance_unmet + repair).
+        // Repair re-entry: successful write so grounded ACCEPT can verify.
+        if (executorTurns === 1) {
+          return {
+            content: "I inspected the file.",
+            tool_calls: [
+              {
+                id: "call_read_1",
+                type: "function",
+                function: {
+                  name: "read_file",
+                  arguments: JSON.stringify({ path: "src/main.ts" }),
+                },
+              },
+            ],
+          };
+        }
+        return {
+          content: "I implemented the write path.",
+          tool_calls: [
+            {
+              id: `call_write_${executorTurns}`,
+              type: "function",
+              function: {
+                name: "write_file",
+                arguments: JSON.stringify({
+                  path: "src/main.ts",
+                  content: "export function main() { return 1; }\n",
+                }),
+              },
+            },
+          ],
+        };
+      }
+      if (options.stageLabel === "reviewer") {
+        return { content: "ACCEPT — looks complete" };
+      }
+      if (options.stageLabel === "synthesizer") {
+        return { content: "Implemented the write path in src/main.ts." };
+      }
+      if (options.stageLabel === "rewriter") {
+        return { content: "Apply the write that was missing on the first pass." };
+      }
+      return { content: "ok" };
+    };
+
+    let contract = createTaskRun({
+      taskRunId: "task_accept_recovery",
+      sessionId: "sess_accept_recovery",
+      objective: "implement the write path",
+      requirement: "full_execution",
+      estimatedComplexity: "medium",
+      planItems: [
+        {
+          id: "pi_write",
+          title: "Implement the write path",
+          acceptanceChecks: [
+            { id: "ac_write", description: "reviewer accepts grounded write", kind: "reviewer_pass" },
+          ],
+        },
+      ],
+    });
+    expect(getActivePlanItem(contract)?.id).toBe("pi_write");
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, {
+      recordStageRun: () => {},
+    });
+
+    const segment = await executor.executeSegment(
+      "implement the write path in src/main.ts",
+      ["executor", "reviewer", "synthesizer"],
+      "run_accept_recovery",
+      () => {},
+      {
+        executionProfile: "full",
+        rawMessage: "implement the write path in src/main.ts",
+        taskRunWriteIntent: true,
+        taskRunContract: contract,
+        // Allow one repair cycle so unmet ACCEPT can re-enter executor with a write.
+        maxReviewRepairRounds: 1,
+        allowMidRunReplan: false,
+        onTaskPlanUpdate: (next) => {
+          contract = next;
+        },
+      },
+    );
+
+    const item = getPlanItem(contract, "pi_write");
+    expect(item?.status).toBe("verified");
+    // Sticky unmet must not survive grounded recovery.
+    expect(segment.partialStage?.errorCode).not.toBe("plan_item_acceptance_unmet");
+    expect(segment.partialStage).toBeUndefined();
+    expect(executorTurns).toBeGreaterThanOrEqual(2);
+  });
 });

@@ -915,6 +915,11 @@ export class PipelineExecutor {
       /** Reroute apply counter; max 1 per segment. */
       reroutesApplied?: { n: number };
       maxReroutesPerSegment?: number;
+      /**
+       * Clear sticky plan_item_acceptance_unmet partial after grounded recovery
+       * (conductor mark_verified success). Owned by executeSegment.
+       */
+      clearAcceptanceUnmetPartial?: () => void;
     },
     remainingQueue: StageName[],
     evidence?: ConductorStageEvidence,
@@ -1040,6 +1045,8 @@ export class PipelineExecutor {
       // Flags are set by LiveConductor verify branch; thrift gate applied here.
       // Only thrift after a successful ledger mark-off (or when no ledger exists).
       if (markVerifiedOk) {
+        // Grounded recovery: drop sticky unmet partial from an earlier ACCEPT.
+        options.clearAcceptanceUnmetPartial?.();
         if (directive.gradingMode === "reviewer_mediated") {
           this.lastReviewerAccepted = true;
         }
@@ -4085,6 +4092,11 @@ export class PipelineExecutor {
       checkResult: this.lastCheckResult,
       reviewerAccepted: this.lastReviewerAccepted,
     });
+    const clearAcceptanceUnmetPartial = () => {
+      if (partialStage?.errorCode === "plan_item_acceptance_unmet") {
+        partialStage = undefined;
+      }
+    };
     const pendingInjections = new Map<StageName, string[]>();
     const reroutesApplied = { n: 0 };
     // Post-loop executor re-entry is bounded to one per segment: the in-loop
@@ -4101,6 +4113,7 @@ export class PipelineExecutor {
       workQueue,
       reroutesApplied,
       maxReroutesPerSegment: 3,
+      clearAcceptanceUnmetPartial,
     };
 
     // Drain the queue. Synthesizer is a barrier: effect-gate + evidence fence
@@ -4510,6 +4523,8 @@ export class PipelineExecutor {
             opts.taskRunContract = next;
             opts.onTaskPlanUpdate?.(next);
             this.conductor?.live.setPlanContext(next);
+            // Grounded recovery: prior unmet ACCEPT must not stick after verify.
+            clearAcceptanceUnmetPartial();
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
             console.warn(`[Pipeline] reviewer accept mark-verified failed: ${msg}`);
