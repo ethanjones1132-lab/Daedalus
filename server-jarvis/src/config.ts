@@ -127,6 +127,23 @@ export interface ClaudeDelegateConfig {
    * error / rate limit), `auto` selection promotes to the cheap Go pool.
    */
   free_thrash_threshold?: number;
+  /**
+   * How long the Claude CLI delegate may explore (reads) before a mid-loop
+   * force_write is enacted as native handoff. Within this window write pressure
+   * is deferred so productive exploration can finish.
+   */
+  exploration_limit_ms?: number;
+  /**
+   * Stage budget reserved for a possible native fallback after delegate
+   * handoff. When remaining stage time falls to this floor, mid-loop pressure
+   * hands off immediately instead of deferring.
+   */
+  native_fallback_reserve_ms?: number;
+  /**
+   * TTL for session-scoped free→Go thrash counters. Expired entries reset so
+   * thrash does not permanently pin a session to the Go pool.
+   */
+  thrash_ttl_ms?: number;
 }
 
 export interface ToolConfig {
@@ -526,6 +543,12 @@ export function defaultConfig(): JarvisConfig {
         // auto = free-capable first, thrash → cheapest known-capable Go model.
         model: "auto",
         free_thrash_threshold: 2,
+        // Let the CLI finish productive reads before force_write becomes handoff.
+        exploration_limit_ms: 45_000,
+        // Keep enough stage budget for a native write after mid-loop handoff.
+        native_fallback_reserve_ms: 30_000,
+        // Session thrash counters expire so free-first can recover later.
+        thrash_ttl_ms: 30 * 60_000,
         timeout_ms: 420_000,
       },
     },

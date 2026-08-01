@@ -71,6 +71,8 @@ export const DELEGATE_GO_CHEAP_CAPABLE_MODELS = [
 ] as const;
 
 export const DEFAULT_FREE_THRASH_THRESHOLD = 2;
+/** Default session thrash counter TTL (30 minutes). */
+export const DEFAULT_THRASH_TTL_MS = 30 * 60_000;
 
 export type DelegateModelPool = "free" | "go_capable";
 
@@ -81,20 +83,54 @@ export interface DelegateModelSelection {
   thrashCount: number;
 }
 
-/** Process-local thrash counters keyed by agent run id (or session). */
-const thrashByKey = new Map<string, number>();
+/** Session-scoped thrash state with expiry for free→Go promotion. */
+export interface DelegateThrashState {
+  count: number;
+  updatedAt: number;
+}
+
+/** Process-local thrash counters keyed by session (survives agent-run boundaries). */
+const thrashByKey = new Map<string, DelegateThrashState>();
+
+/** Stable thrash key for a session; blank/missing → unknown-session. */
+export function delegateThrashKey(sessionId: string): string {
+  return sessionId.trim() || "unknown-session";
+}
 
 export function __resetDelegateThrashForTests(): void {
   thrashByKey.clear();
 }
 
-export function getDelegateThrashCount(key: string): number {
-  return thrashByKey.get(key) ?? 0;
+function thrashStateAt(
+  key: string,
+  ttlMs: number,
+  now: number,
+): DelegateThrashState | undefined {
+  const state = thrashByKey.get(key);
+  if (!state) return undefined;
+  if (now - state.updatedAt > ttlMs) {
+    thrashByKey.delete(key);
+    return undefined;
+  }
+  return state;
 }
 
-export function recordDelegateThrash(key: string): number {
-  const next = (thrashByKey.get(key) ?? 0) + 1;
-  thrashByKey.set(key, next);
+export function getDelegateThrashCount(
+  key: string,
+  ttlMs: number = DEFAULT_THRASH_TTL_MS,
+  now: number = Date.now(),
+): number {
+  return thrashStateAt(key, ttlMs, now)?.count ?? 0;
+}
+
+export function recordDelegateThrash(
+  key: string,
+  ttlMs: number = DEFAULT_THRASH_TTL_MS,
+  now: number = Date.now(),
+): number {
+  const prev = thrashStateAt(key, ttlMs, now);
+  const next = (prev?.count ?? 0) + 1;
+  thrashByKey.set(key, { count: next, updatedAt: now });
   return next;
 }
 
@@ -123,6 +159,7 @@ export function isDelegateThrashOutcome(input: {
     code.includes("exit") ||
     code.includes("unverified") ||
     code.includes("aborted") ||
+    code.includes("handoff") ||
     code.includes("integration") ||
     code.includes("unavailable")
   );

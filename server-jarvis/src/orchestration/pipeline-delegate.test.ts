@@ -1117,10 +1117,12 @@ describe("executor delegate pipeline integration", () => {
     });
   });
 
-  test("delegate_first mid-loop supervises tool results and persists directives", async () => {
+  test("delegate_first mid-loop defers force_write during exploration so the write can land", async () => {
     const config = delegateTestConfig();
     config.jarvis_path = process.cwd();
     config.claude_cli.delegate.policy = "delegate_first";
+    config.claude_cli.delegate.exploration_limit_ms = 45_000;
+    config.claude_cli.delegate.native_fallback_reserve_ms = 30_000;
     config.orchestrator.conductor.in_turn_driver.enabled = true;
     const ctx = makeExecutionContext("agent", config, {
       session_id: "session-delegate-mid-loop",
@@ -1138,7 +1140,7 @@ describe("executor delegate pipeline integration", () => {
 
     const midLoopSignals: any[] = [];
     let nativeCalls = 0;
-    const readThenNoWrite = [
+    const reads = [
       {
         name: "read_file",
         arguments: { path: "result.txt" },
@@ -1154,11 +1156,18 @@ describe("executor delegate pipeline integration", () => {
         duration_ms: 3,
       },
     ];
+    const writeCall = {
+      name: "write_file",
+      arguments: { path: "result.txt", content: "new content" },
+      output: "wrote result.txt",
+      is_error: false,
+      duration_ms: 5,
+    };
 
     const executor = new PipelineExecutor(
       async () => {
         nativeCalls += 1;
-        return { content: "Native took over after conductor handoff.", tool_calls: [] };
+        return { content: "Native must not take over during productive exploration.", tool_calls: [] };
       },
       createToolRuntime(),
       ctx,
@@ -1169,7 +1178,8 @@ describe("executor delegate pipeline integration", () => {
           onToolResult: () => {},
           checkMidLoop: async (signal: any) => {
             midLoopSignals.push(signal);
-            // After two reads with zero writes, force a native handoff.
+            // After two reads with zero writes, apply write pressure — but
+            // exploration window is still open so the host must defer, not hand off.
             if (signal.distinctSuccessfulReads >= 2 && signal.successfulWrites === 0) {
               return {
                 kind: "force_write",
@@ -1185,31 +1195,37 @@ describe("executor delegate pipeline integration", () => {
       {
         availability: { isAvailable: async () => true },
         run: async (input) => {
-          for (const call of readThenNoWrite) {
+          const toolCalls: any[] = [];
+          for (const call of reads) {
             input.onToolUse?.(call);
             await input.onToolResult?.(call);
+            toolCalls.push(call);
+            // force_write after the second read must NOT abort during exploration.
             if (input.signal?.aborted) {
               return {
                 ok: false,
-                narrative: "Delegate aborted by mid-loop handoff.",
+                narrative: "Delegate aborted unexpectedly during exploration.",
                 terminalStatus: "cancelled",
                 errorCode: "delegate_aborted",
-                toolCalls: [...readThenNoWrite],
+                toolCalls: [...toolCalls],
               };
             }
           }
+          // Delegate continues after deferred force_write and lands the write.
+          input.onToolUse?.(writeCall);
+          await input.onToolResult?.(writeCall);
+          toolCalls.push(writeCall);
           return {
-            ok: false,
-            narrative: "Delegate finished without a write.",
+            ok: true,
+            narrative: "Delegate applied the change after exploration.",
             terminalStatus: "completed",
-            errorCode: "delegate_no_write",
-            toolCalls: [...readThenNoWrite],
+            toolCalls,
           };
         },
       },
     );
 
-    await executor.executeSegment(
+    const segment = await executor.executeSegment(
       "Change result.txt",
       ["executor"],
       "run-delegate-mid-loop",
@@ -1231,13 +1247,219 @@ describe("executor delegate pipeline integration", () => {
     expect(midLoopSignals.some((s) => s.taskObjective?.includes("Change result.txt"))).toBe(true);
     expect(midLoopSignals.some((s) => (s.recentReadTargets ?? []).includes("result.txt"))).toBe(true);
 
-    const directives = store.getConductorDirectives("run-delegate-mid-loop")
+    const allDirectives = store.getConductorDirectives("run-delegate-mid-loop");
+    const midLoopDirectives = allDirectives
       .filter((row) => row.directive_type.startsWith("mid_loop_"));
-    expect(directives.length).toBeGreaterThanOrEqual(1);
-    expect(directives.some((row) => row.directive_type === "mid_loop_force_write")).toBe(true);
+    expect(midLoopDirectives.length).toBeGreaterThanOrEqual(1);
+    expect(midLoopDirectives.some((row) => row.directive_type === "mid_loop_force_write")).toBe(true);
+    expect(allDirectives.some((row) => row.directive_type === "delegate_intervention_deferred")).toBe(true);
 
-    // force_write with zero writes must hand off to native (CLI cannot inject).
-    // Native may take multiple turns to finish; only assert the handoff happened.
+    // Productive exploration + deferred force_write → verified write, no native fallback.
+    expect(nativeCalls).toBe(0);
+    expect(segment.state.executor?.ok).toBe(true);
+    expect(segment.state.executor?.toolCalls).toContainEqual(expect.objectContaining({
+      name: "write_file",
+      is_error: false,
+    }));
+  });
+
+  test("delegate_first mid-loop hands off after exploration deadline", async () => {
+    const config = delegateTestConfig();
+    config.jarvis_path = process.cwd();
+    config.claude_cli.delegate.policy = "delegate_first";
+    // Negative limit: any elapsed_ms > limit → force_write becomes handoff
+    // (0 is flaky when the fake delegate finishes in the same millisecond).
+    config.claude_cli.delegate.exploration_limit_ms = -1;
+    config.claude_cli.delegate.native_fallback_reserve_ms = 30_000;
+    config.orchestrator.conductor.in_turn_driver.enabled = true;
+    const ctx = makeExecutionContext("agent", config, {
+      session_id: "session-delegate-deadline-handoff",
+      workspace_path: config.jarvis_path,
+    });
+    let nativeCalls = 0;
+    const reads = [
+      {
+        name: "read_file",
+        arguments: { path: "result.txt" },
+        output: "old",
+        is_error: false,
+        duration_ms: 2,
+      },
+      {
+        name: "read_file",
+        arguments: { path: "other.txt" },
+        output: "other",
+        is_error: false,
+        duration_ms: 2,
+      },
+    ];
+
+    const executor = new PipelineExecutor(
+      async () => {
+        nativeCalls += 1;
+        return {
+          content: "Native completed after exploration deadline handoff.",
+          tool_calls: [{
+            id: "n1",
+            type: "function",
+            function: {
+              name: "write_file",
+              arguments: JSON.stringify({ path: "result.txt", content: "native" }),
+            },
+          }],
+        };
+      },
+      createToolRuntime(),
+      ctx,
+      {
+        bus: { registerAbortHandle: () => {}, publishThrottled: () => {}, resolveAbort: () => {} },
+        collector: { recordStageRun: () => {}, recordDirective: () => {}, recordModelAttribution: () => {} },
+        live: {
+          onToolResult: () => {},
+          checkMidLoop: async (signal: any) => {
+            if (signal.distinctSuccessfulReads >= 2 && signal.successfulWrites === 0) {
+              return {
+                kind: "force_write",
+                note: "Exploration expired; write now.",
+                decisionSource: "deterministic_reflex",
+              };
+            }
+            return { kind: "continue", decisionSource: "no_signal" };
+          },
+          afterStage: async () => ({ type: "continue" }),
+        },
+      } as any,
+      {
+        availability: { isAvailable: async () => true },
+        run: async (input) => {
+          for (const call of reads) {
+            input.onToolUse?.(call);
+            await input.onToolResult?.(call);
+            if (input.signal?.aborted) {
+              return {
+                ok: false,
+                narrative: "Delegate aborted by exploration deadline handoff.",
+                terminalStatus: "cancelled",
+                errorCode: "delegate_aborted",
+                toolCalls: [...reads],
+              };
+            }
+          }
+          return {
+            ok: false,
+            narrative: "Delegate finished without a write.",
+            terminalStatus: "completed",
+            errorCode: "delegate_no_write",
+            toolCalls: [...reads],
+          };
+        },
+      },
+    );
+
+    await executor.executeSegment(
+      "Change result.txt",
+      ["executor"],
+      "run-delegate-deadline-handoff",
+      () => {},
+      {
+        executionProfile: "full",
+        rawMessage: "Change result.txt",
+        turnRequirement: "full_execution",
+        taskRunWriteIntent: true,
+        maxReviewRepairRounds: 0,
+        turnBudget: {
+          stageRemainingMs: () => 120_000,
+          extendStageOnProgress: () => 0,
+        } as any,
+      },
+    );
+
+    expect(nativeCalls).toBeGreaterThanOrEqual(1);
+  });
+
+  test("delegate_first mid-loop hands off after policy denial", async () => {
+    const config = delegateTestConfig();
+    config.jarvis_path = process.cwd();
+    config.claude_cli.delegate.policy = "delegate_first";
+    config.claude_cli.delegate.exploration_limit_ms = 45_000;
+    config.orchestrator.conductor.in_turn_driver.enabled = true;
+    const ctx = makeExecutionContext("agent", config, {
+      session_id: "session-delegate-policy-handoff",
+      workspace_path: config.jarvis_path,
+    });
+    let nativeCalls = 0;
+    const deniedWrite = {
+      name: "write_file",
+      arguments: { path: "result.txt", content: "x" },
+      output: "policy denied",
+      is_error: true,
+      error_code: "policy_denied",
+      duration_ms: 3,
+    };
+
+    const executor = new PipelineExecutor(
+      async () => {
+        nativeCalls += 1;
+        return { content: "Native took over after policy denial.", tool_calls: [] };
+      },
+      createToolRuntime(),
+      ctx,
+      {
+        bus: { registerAbortHandle: () => {}, publishThrottled: () => {}, resolveAbort: () => {} },
+        collector: { recordStageRun: () => {}, recordDirective: () => {}, recordModelAttribution: () => {} },
+        live: {
+          onToolResult: () => {},
+          checkMidLoop: async () => ({
+            kind: "force_write",
+            note: "Write was denied; hand off.",
+            decisionSource: "deterministic_reflex",
+          }),
+          afterStage: async () => ({ type: "continue" }),
+        },
+      } as any,
+      {
+        availability: { isAvailable: async () => true },
+        run: async (input) => {
+          input.onToolUse?.(deniedWrite);
+          await input.onToolResult?.(deniedWrite);
+          if (input.signal?.aborted) {
+            return {
+              ok: false,
+              narrative: "Delegate aborted by policy-denial handoff.",
+              terminalStatus: "cancelled",
+              errorCode: "delegate_aborted",
+              toolCalls: [deniedWrite],
+            };
+          }
+          return {
+            ok: false,
+            narrative: "Delegate finished after denial without handoff.",
+            terminalStatus: "completed",
+            errorCode: "delegate_no_write",
+            toolCalls: [deniedWrite],
+          };
+        },
+      },
+    );
+
+    await executor.executeSegment(
+      "Change result.txt",
+      ["executor"],
+      "run-delegate-policy-handoff",
+      () => {},
+      {
+        executionProfile: "full",
+        rawMessage: "Change result.txt",
+        turnRequirement: "full_execution",
+        taskRunWriteIntent: true,
+        maxReviewRepairRounds: 0,
+        turnBudget: {
+          stageRemainingMs: () => 120_000,
+          extendStageOnProgress: () => 0,
+        } as any,
+      },
+    );
+
     expect(nativeCalls).toBeGreaterThanOrEqual(1);
   });
 

@@ -94,4 +94,13 @@ describe("configuration regression coverage retained during Task 6", () => {
     expect(cfg.orchestrator.conductor.keep_warm).toBe(true);
     expect(cfg.orchestrator.conductor.keep_warm_interval_ms).toBe(180_000);
   });
+
+  test("defaults Claude CLI delegate exploration and thrash TTL bounds", () => {
+    const delegate = normalizeConfig({}).claude_cli.delegate;
+    expect(delegate.exploration_limit_ms).toBe(45_000);
+    expect(delegate.native_fallback_reserve_ms).toBe(30_000);
+    expect(delegate.thrash_ttl_ms).toBe(30 * 60_000);
+    expect(delegate.timeout_ms).toBe(420_000);
+    expect(delegate.free_thrash_threshold).toBe(2);
+  });
 });

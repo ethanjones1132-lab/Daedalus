@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import {
   __resetDelegateThrashForTests,
   clearDelegateThrash,
+  DEFAULT_THRASH_TTL_MS,
+  delegateThrashKey,
   enumerateDelegateModelCandidates,
   getDelegateThrashCount,
   isDelegateThrashOutcome,
@@ -99,7 +101,25 @@ describe("delegate thrash accounting", () => {
     expect(getDelegateThrashCount("run-a")).toBe(0);
   });
 
-  test("thrash outcomes match no-write / stream failures", () => {
+  test("session thrash key trims and falls back", () => {
+    expect(delegateThrashKey("  session-abc  ")).toBe("session-abc");
+    expect(delegateThrashKey("")).toBe("unknown-session");
+    expect(delegateThrashKey("   ")).toBe("unknown-session");
+  });
+
+  test("expires thrash after thrash_ttl_ms", () => {
+    __resetDelegateThrashForTests();
+    const t0 = 1_000_000;
+    const ttl = 60_000;
+    expect(recordDelegateThrash("session-ttl", ttl, t0)).toBe(1);
+    expect(getDelegateThrashCount("session-ttl", ttl, t0 + 30_000)).toBe(1);
+    expect(getDelegateThrashCount("session-ttl", ttl, t0 + ttl + 1)).toBe(0);
+    // Re-record after expiry starts a fresh counter.
+    expect(recordDelegateThrash("session-ttl", ttl, t0 + ttl + 2)).toBe(1);
+    expect(DEFAULT_THRASH_TTL_MS).toBe(30 * 60_000);
+  });
+
+  test("thrash outcomes match no-write / stream failures / handoff", () => {
     expect(isDelegateThrashOutcome({ ok: true, hasVerifiedWrite: true })).toBe(false);
     expect(isDelegateThrashOutcome({ ok: true, hasVerifiedWrite: false })).toBe(true);
     expect(isDelegateThrashOutcome({
@@ -107,6 +127,9 @@ describe("delegate thrash accounting", () => {
     })).toBe(true);
     expect(isDelegateThrashOutcome({
       ok: false, hasVerifiedWrite: false, errorCode: "delegate_stream_error",
+    })).toBe(true);
+    expect(isDelegateThrashOutcome({
+      ok: false, hasVerifiedWrite: false, errorCode: "mid_loop_handoff",
     })).toBe(true);
   });
 });

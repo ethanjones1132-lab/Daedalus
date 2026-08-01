@@ -104,12 +104,15 @@ import {
 } from "./claude-delegate";
 import {
   clearDelegateThrash,
+  DEFAULT_THRASH_TTL_MS,
+  delegateThrashKey,
   enumerateDelegateModelCandidates,
   getDelegateThrashCount,
   isDelegateThrashOutcome,
   recordDelegateThrash,
   type DelegateModelSelection,
 } from "./delegate-model-select";
+import { decideDelegateIntervention } from "./delegate-intervention-policy";
 import {
   assessCorrectnessFloor,
   buildMidLoopToolEvidence,
@@ -1904,11 +1907,15 @@ export class PipelineExecutor {
       // Checking with model="auto" forced the proxy path and silently failed
       // when free/OpenAI-format models could not launch — then native free
       // thrash ate the turn with zero writes.
-      const thrashKey = agentRunId;
+      // Thrash is session-scoped (with TTL) so free→Go promotion survives
+      // agent-run boundaries within one conversation.
+      const thrashKey = delegateThrashKey(this.ctx.session_id ?? "");
+      const thrashTtlMs = this.ctx.config.claude_cli.delegate.thrash_ttl_ms
+        ?? DEFAULT_THRASH_TTL_MS;
       const hasGoKey = Boolean(this.ctx.config.opencode_go.api_key?.trim());
       const candidates = enumerateDelegateModelCandidates({
         configuredModel: this.ctx.config.claude_cli.delegate.model,
-        thrashCount: getDelegateThrashCount(thrashKey),
+        thrashCount: getDelegateThrashCount(thrashKey, thrashTtlMs),
         thrashThreshold: this.ctx.config.claude_cli.delegate.free_thrash_threshold,
         hasOpenCodeGoKey: hasGoKey,
         // Probe both proxy and no-proxy candidates; availability filters.
@@ -2077,41 +2084,84 @@ export class PipelineExecutor {
               },
             );
             if (!midLoop || midLoopStop) return;
-            if (midLoop.kind === "abort") {
+
+            // Claude CLI cannot accept mid-stream user notes. Decide whether to
+            // abort, hand off, defer (keep exploring), or observe (write landed).
+            const streamWrites = delegateStreamCalls.filter(
+              (call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name),
+            ).length;
+            const streamFailedWrites = delegateStreamCalls.filter(
+              (call) => call.is_error === true && WRITE_EFFECT_TOOLS.has(call.name),
+            ).length;
+            const streamReads = delegateStreamCalls.filter(
+              (call) => !call.is_error && (call.name === "read_file" || call.name === "Read"),
+            ).length;
+            const policyDenied = delegateStreamCalls.some(
+              (call) => call.error_code === "policy_denied",
+            );
+            const elapsedMs = Date.now() - delegateStart;
+            const stageRemainingMs = options.turnBudget?.stageRemainingMs("executor")
+              ?? this.ctx.config.claude_cli.delegate.timeout_ms;
+            const explorationLimitMs = this.ctx.config.claude_cli.delegate.exploration_limit_ms
+              ?? 45_000;
+            const nativeFallbackReserveMs = this.ctx.config.claude_cli.delegate.native_fallback_reserve_ms
+              ?? 30_000;
+            const action = decideDelegateIntervention({
+              intervention: midLoop,
+              successfulReads: streamReads,
+              successfulWrites: streamWrites,
+              failedWrites: streamFailedWrites,
+              policyDenied,
+              elapsedMs,
+              stageRemainingMs,
+              explorationLimitMs,
+              nativeFallbackReserveMs,
+            });
+
+            if (action === "abort" && midLoop.kind === "abort") {
               midLoopStop = { kind: "abort", reason: midLoop.reason };
               midLoopAbortController.abort();
               onStateChange({ stage: "executor", status: "running", detail: "mid_loop_abort" });
               return;
             }
+
             if (
-              (midLoop.kind === "force_write" || midLoop.kind === "redirect" || midLoop.kind === "inject")
+              action === "handoff"
+              && (midLoop.kind === "force_write" || midLoop.kind === "redirect" || midLoop.kind === "inject")
               && "note" in midLoop
             ) {
-              const streamWrites = delegateStreamCalls.filter(
-                (call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name),
-              ).length;
-              // Claude CLI cannot accept mid-stream user notes. Handoff to
-              // native with the intervention when no verified write exists yet;
-              // after a write, only record the directive (already done) so a
-              // quality inject does not discard a landed mutation.
-              if (streamWrites === 0 && midLoop.kind !== "inject") {
-                midLoopStop = { kind: "handoff", note: midLoop.note };
-                midLoopAbortController.abort();
-                onStateChange({
-                  stage: "executor",
-                  status: "running",
-                  detail: `mid_loop_handoff:${midLoop.kind}`,
-                });
-              } else if (midLoop.kind === "inject" && streamWrites === 0) {
-                midLoopStop = { kind: "handoff", note: midLoop.note };
-                midLoopAbortController.abort();
-                onStateChange({
-                  stage: "executor",
-                  status: "running",
-                  detail: "mid_loop_handoff:inject",
-                });
-              }
+              midLoopStop = { kind: "handoff", note: midLoop.note };
+              midLoopAbortController.abort();
+              onStateChange({
+                stage: "executor",
+                status: "running",
+                detail: `mid_loop_handoff:${midLoop.kind}`,
+              });
+              return;
             }
+
+            if (
+              action === "defer"
+              && (midLoop.kind === "force_write" || midLoop.kind === "redirect" || midLoop.kind === "inject")
+            ) {
+              // mid_loop_* already persisted; record deferral without aborting CLI.
+              this.collector.recordDirective?.({
+                id: `dir_${crypto.randomUUID()}`,
+                agent_run_id: agentRunId,
+                stage: "executor",
+                directive_type: "delegate_intervention_deferred",
+                decision_source: midLoop.decisionSource ?? "deterministic_reflex",
+                escalation_id: midLoop.escalationId,
+                reason: `reads=${streamReads} elapsed_ms=${elapsedMs} kind=${midLoop.kind}`,
+                inject_note: "note" in midLoop ? midLoop.note : undefined,
+              });
+              onStateChange({
+                stage: "executor",
+                status: "running",
+                detail: `delegate_intervention_deferred:${midLoop.kind}`,
+              });
+            }
+            // action === "observe": verified write already recorded via mid_loop_*; keep process.
           },
         });
       } catch (error) {
@@ -2168,7 +2218,8 @@ export class PipelineExecutor {
             ? "mid_loop_handoff"
           : delegated.errorCode
           ?? (cancelled ? "delegate_aborted" : hasVerifiedWrite ? undefined : "delegate_no_write");
-      // Slice B thrash accounting: promote free → Go on repeated non-writes.
+      // Slice B thrash accounting: promote free → Go on repeated non-writes/handoffs.
+      // Session-scoped with TTL so promotion survives run boundaries but expires.
       if (
         isDelegateThrashOutcome({
           ok: delegated.ok === true,
@@ -2176,7 +2227,7 @@ export class PipelineExecutor {
           errorCode: downgradeCode ?? delegated.errorCode,
         })
       ) {
-        recordDelegateThrash(thrashKey);
+        recordDelegateThrash(thrashKey, thrashTtlMs);
       } else if (hasVerifiedWrite) {
         clearDelegateThrash(thrashKey);
       }
