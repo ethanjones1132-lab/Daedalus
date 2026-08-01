@@ -46,7 +46,8 @@ export type ReplayRule =
   | "placeholder_in_note"
   | "stage_deadline_exceeded"
   | "noop_executor_turns"
-  | "turn_cap_saturation";
+  | "turn_cap_saturation"
+  | "delegate_never_wrote";
 
 export interface ReplayViolation {
   rule: ReplayRule;
@@ -97,6 +98,31 @@ const STAGE_PLACEHOLDERS = [
 ];
 
 const STAGE_DEADLINE_MARKER = "Stage deadline exceeded";
+
+/** Tools whose successful call actually mutates a file. */
+const WRITE_EFFECT_TOOLS = new Set(["write_file", "edit_file", "multi_edit", "apply_patch"]);
+
+/**
+ * Emitted only on the delegate path, which `delegateEligibility` gates on
+ * `writeEffectRequired` — so seeing it is proof a write was expected.
+ */
+const DELEGATE_MARKER_TOOL = "delegate_cleanup";
+
+interface ParsedToolCall {
+  name?: string;
+  is_error?: boolean;
+  output?: unknown;
+}
+
+function parseToolCalls(raw: string | undefined): ParsedToolCall[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as ParsedToolCall[]) : [];
+  } catch {
+    return [];
+  }
+}
 
 function truncate(value: string, max = 120): string {
   const flat = value.replace(/\s+/g, " ").trim();
@@ -228,6 +254,37 @@ function checkTurnCapSaturation(run: ReplayRun, t: ReplayThresholds): ReplayViol
   }];
 }
 
+/**
+ * The delegate ran and the turn ended with no file mutated anywhere.
+ *
+ * 2026-08-01: `claude_cli_proxy` stopped on 07-21 and nothing restarted it, so
+ * the delegate — the primary write path — launched the `claude` CLI against a
+ * dead port, got connection refused, and terminated instantly on every run for
+ * eleven days. Writes fell back to a free-tier text-protocol executor that
+ * rarely emits write calls. Every affected run carried the evidence in turn 1
+ * (`delegate_cleanup` + a failed `git_metadata` reporting no diffstat) and
+ * nothing was reading it. A dead write path must never again go unnoticed for
+ * that long.
+ */
+function checkDelegateNeverWrote(run: ReplayRun): ReplayViolation[] {
+  const calls = run.stageRuns.flatMap((s) => parseToolCalls(s.tool_calls_json));
+  if (!calls.some((c) => c.name === DELEGATE_MARKER_TOOL)) return [];
+  const wrote = calls.some((c) => c.name && WRITE_EFFECT_TOOLS.has(c.name) && c.is_error !== true);
+  if (wrote) return [];
+  const attempted = calls.filter((c) => c.name && WRITE_EFFECT_TOOLS.has(c.name)).length;
+  return [{
+    rule: "delegate_never_wrote",
+    agentRunId: run.agentRunId,
+    severity: "high",
+    count: 1,
+    detail:
+      "the delegate ran but no file was mutated anywhere in the turn" +
+      (attempted > 0
+        ? ` (${attempted} write attempt(s), all failed)`
+        : " (no write tool was called at all — check that claude_cli_proxy is listening on 19878)"),
+  }];
+}
+
 /** Every invariant, evaluated against one stored run. Pure. */
 export function checkReplayInvariants(
   run: ReplayRun,
@@ -239,6 +296,7 @@ export function checkReplayInvariants(
     ...checkStageDeadlines(run),
     ...checkNoopExecutorTurns(run, thresholds),
     ...checkTurnCapSaturation(run, thresholds),
+    ...checkDelegateNeverWrote(run),
   ];
 }
 

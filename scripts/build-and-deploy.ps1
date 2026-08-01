@@ -226,6 +226,53 @@ Write-Ok "deploy manifest -> .jarvis-deploy-manifest.json"
 
 # ── Optional: relaunch the server so the next prompt streams immediately ──────
 if ($RestartServer) {
+    # ── Claude CLI proxy (:19878) — the delegate write path ──────────────────
+    # This deploy has always COPIED claude_cli_proxy.py to the Desktop and then
+    # done nothing with it. On 2026-07-21 the proxy stopped and nothing
+    # restarted it; the delegate (policy: delegate_first, the PRIMARY write
+    # path) kept launching the `claude` CLI with
+    # ANTHROPIC_BASE_URL=127.0.0.1:19878, getting connection refused, and
+    # terminating instantly. Writes silently fell back to a free-tier
+    # text-protocol executor that rarely emits write calls, and it took eleven
+    # days and a replay-harness rule to notice. Every deploy in between shipped
+    # a dead write path without a word. Verify it here instead.
+    Write-Step 'Verifying Claude CLI proxy (:19878 — delegate write path)'
+    $proxyPort = 19878
+    $logsDir = Join-Path $env:USERPROFILE '.openclaw\jarvis\logs'
+    if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Force -Path $logsDir | Out-Null }
+    $proxyUp = [bool](Get-NetTCPConnection -State Listen -LocalPort $proxyPort -ErrorAction SilentlyContinue)
+    if ($proxyUp) {
+        Write-Ok "proxy already listening on http://127.0.0.1:$proxyPort"
+    }
+    else {
+        $python = (Get-Command python -ErrorAction SilentlyContinue).Source
+        if (-not $python) {
+            Write-Host "  [WARN] python not found on PATH - cannot start the Claude CLI proxy." -ForegroundColor Red
+            Write-Host "         The delegate write path will be DEAD: file edits will fall back to" -ForegroundColor Red
+            Write-Host "         the native executor, which writes far less reliably." -ForegroundColor Red
+        }
+        else {
+            $deployedProxy = Join-Path $desktop 'resources\claude_cli_proxy.py'
+            $proxyOut = Join-Path $logsDir "claude-proxy-stdout-$ts.log"
+            $proxyErr = Join-Path $logsDir "claude-proxy-stderr-$ts.log"
+            Start-Process -FilePath $python -ArgumentList "`"$deployedProxy`"" -WindowStyle Hidden -RedirectStandardOutput $proxyOut -RedirectStandardError $proxyErr
+            for ($i = 0; $i -lt 15; $i++) {
+                Start-Sleep -Milliseconds 500
+                if (Get-NetTCPConnection -State Listen -LocalPort $proxyPort -ErrorAction SilentlyContinue) { $proxyUp = $true; break }
+            }
+            if ($proxyUp) {
+                Write-Ok "proxy started on http://127.0.0.1:$proxyPort"
+                Write-Ok "logging to $proxyOut"
+            }
+            else {
+                Write-Host "  [WARN] proxy did not bind :$proxyPort within ~7s." -ForegroundColor Red
+                Write-Host "         The delegate write path is DEAD - file edits will fall back to" -ForegroundColor Red
+                Write-Host "         the native executor, which writes far less reliably." -ForegroundColor Red
+                Write-Host "         See $proxyErr" -ForegroundColor Red
+            }
+        }
+    }
+
     Write-Step 'Restarting Jarvis server (bun <Desktop>\index.js on :19877)'
     $deployedJs = Join-Path $desktop 'index.js'
     # Server stdout/stderr previously went nowhere (Start-Process -WindowStyle

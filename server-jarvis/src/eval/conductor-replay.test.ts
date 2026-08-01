@@ -223,6 +223,81 @@ describe("conductor replay — turn cap saturation invariant", () => {
   });
 });
 
+describe("conductor replay — delegate wrote nothing invariant", () => {
+  // 2026-08-01: `claude_cli_proxy` stopped on 07-21 and nothing restarted it.
+  // The delegate — the PRIMARY write path (policy: delegate_first) — launches
+  // the `claude` CLI with ANTHROPIC_BASE_URL=127.0.0.1:19878, got connection
+  // refused, and terminated instantly on every run for eleven days. Writes
+  // silently fell back to a free-tier text-protocol executor that rarely emits
+  // write calls, which is what "struggling very hard with writes" looked like.
+  //
+  // The evidence was in turn 1 of every affected run the whole time. The
+  // harness had no rule for it — this closes that gap. `delegate_cleanup` only
+  // appears on write-intent turns (delegateEligibility requires
+  // writeEffectRequired), so its presence alone establishes that a write was
+  // expected.
+  const delegateTurn = (over: Partial<StageRun> = {}) =>
+    stage({
+      tool_calls_json: JSON.stringify([
+        { name: "delegate_cleanup", arguments: { status: "signal_error" }, is_error: true },
+        {
+          name: "git_metadata",
+          arguments: {},
+          is_error: true,
+          output: "Post-run ground-truth verification unavailable; no diffstat is verified.",
+        },
+      ]),
+      ...over,
+    });
+
+  test("flags a run where the delegate ran and nothing was ever written", () => {
+    const run = replayRun({ stageRuns: [delegateTurn(), stage({ turn_number: 2 })] });
+    const found = checkReplayInvariants(run).filter((v) => v.rule === "delegate_never_wrote");
+    expect(found).toHaveLength(1);
+    expect(found[0]?.severity).toBe("high");
+  });
+
+  test("does not flag when a write landed later in the run", () => {
+    const run = replayRun({
+      stageRuns: [
+        delegateTurn(),
+        stage({
+          turn_number: 2,
+          tool_calls_json: JSON.stringify([{ name: "write_file", arguments: {} }]),
+        }),
+      ],
+    });
+    expect(
+      checkReplayInvariants(run).filter((v) => v.rule === "delegate_never_wrote"),
+    ).toHaveLength(0);
+  });
+
+  test("a failed write attempt does not count as a write", () => {
+    const run = replayRun({
+      stageRuns: [
+        delegateTurn(),
+        stage({
+          turn_number: 2,
+          tool_calls_json: JSON.stringify([
+            { name: "edit_file", arguments: {}, is_error: true, output: "old_string not found" },
+          ]),
+        }),
+      ],
+    });
+    expect(
+      checkReplayInvariants(run).filter((v) => v.rule === "delegate_never_wrote"),
+    ).toHaveLength(1);
+  });
+
+  test("a run where the delegate never launched is not flagged", () => {
+    // Read-only turns never invoke the delegate; absence of writes is normal.
+    const run = replayRun({ stageRuns: [stage(), stage({ turn_number: 2 })] });
+    expect(
+      checkReplayInvariants(run).filter((v) => v.rule === "delegate_never_wrote"),
+    ).toHaveLength(0);
+  });
+});
+
 describe("conductor replay — reporting", () => {
   test("a clean run yields no violations", () => {
     const run = replayRun({
