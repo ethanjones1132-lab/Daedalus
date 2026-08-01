@@ -1559,6 +1559,8 @@ export class PipelineExecutor {
     let executorNoToolPartial = false;
     /** Consecutive write-intent turns with zero tools and zero successful writes. */
     let consecutiveNoToolTurns = 0;
+    /** Executor turns this stage that emitted no tool call (ratio bound). */
+    let noToolTurnsThisStage = 0;
     /**
      * Once the model has emitted any tool call this stage, no-tool bounding
      * yields to the effect gate / normal completion path (failed tools and
@@ -1766,6 +1768,15 @@ export class PipelineExecutor {
               forceWriteNudgesSent: writeEffectNudgeCount,
               // Same escalate-then-stop discipline for the plan-remainder note.
               planNudgesSent: planNudgeCount,
+              // Run-level pressure gates. Declared + consumed by
+              // mid-loop-intervention.ts but never set until now, so the
+              // `!== false` guards always passed. `writeEffectPressureAvailable`
+              // stays unset on purpose: its slot is shared by three distinct
+              // force_write diagnoses, so gating the decision on it lets the
+              // first silence the other two (see FORCE_WRITE_NUDGE_CAP, which
+              // already bounds repeats per-reflex).
+              planRemainderPressureAvailable: !pressureBudget.has("plan_remainder"),
+              qualityPressureAvailable: !pressureBudget.has("quality_after_correctness"),
               // TaskPlan ledger drives the plan-aware correctness floor (Task C1).
               planItemsTotal: options.taskRunContract?.plan?.items.length,
               planItemsRemaining: options.taskRunContract?.plan?.items.filter(
@@ -2941,15 +2952,21 @@ export class PipelineExecutor {
           } else if (requiresWriteEffect && successfulWriteCount() === 0) {
             consecutiveNoToolTurns += 1;
           }
-          const progressDecision = anyModelToolCallThisStage
-            ? "continue" as const
-            : decideExecutorProgress({
-                writeIntent: requiresWriteEffect,
-                emittedToolCalls,
-                successfulWrites: successfulWriteCount(),
-                consecutiveNoToolTurns,
-                stageRemainingMs,
-              });
+          if (!emittedToolCalls) noToolTurnsThisStage += 1;
+          // The policy owns the `anyModelToolCallThisStage` exemption now.
+          // Short-circuiting here meant one tool call disabled the bound for
+          // the rest of the stage, which is how an interleaved tool/prose
+          // stage ran unbounded to 42.9% no-tool turns (2026-08-01 window).
+          const progressDecision = decideExecutorProgress({
+            writeIntent: requiresWriteEffect,
+            emittedToolCalls,
+            successfulWrites: successfulWriteCount(),
+            consecutiveNoToolTurns,
+            stageRemainingMs,
+            anyToolCallThisStage: anyModelToolCallThisStage,
+            noToolTurns: noToolTurnsThisStage,
+            executorTurns: turnCount,
+          });
 
           // Write pressure (2026-07-17): the model is about to end a
           // full-profile change turn with zero successful mutations. Press it

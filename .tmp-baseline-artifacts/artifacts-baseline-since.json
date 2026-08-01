@@ -1,0 +1,73 @@
+﻿{
+  "scanned": 6,
+  "summary": {
+    "totalViolations": 7,
+    "byRule": [
+      {
+        "rule": "repeated_nudge",
+        "severity": "high",
+        "violations": 5,
+        "affectedRuns": 4,
+        "worstDetail": "note injected 5x byte-identical: \"This turn is a CHANGE request. You have write tools available (write_file, edit_file, multΓÇª\""
+      },
+      {
+        "rule": "noop_executor_turns",
+        "severity": "high",
+        "violations": 2,
+        "affectedRuns": 2,
+        "worstDetail": "8/13 executor turns made no tool call (62%), costing 79s of model round-trips"
+      }
+    ]
+  },
+  "violations": [
+    {
+      "rule": "repeated_nudge",
+      "agentRunId": "run_2602dbcb-d949-4d41-9584-522dac59e154",
+      "severity": "high",
+      "count": 3,
+      "detail": "note injected 3x byte-identical: \"Second notice: 1 plan item(s) are still unverified and the previous instruction to continuΓÇª\""
+    },
+    {
+      "rule": "repeated_nudge",
+      "agentRunId": "run_36725b81-79fb-4aa1-9e13-0a9d11181c59",
+      "severity": "high",
+      "count": 5,
+      "detail": "note injected 5x byte-identical: \"This turn is a CHANGE request. You have write tools available (write_file, edit_file, multΓÇª\""
+    },
+    {
+      "rule": "noop_executor_turns",
+      "agentRunId": "run_36725b81-79fb-4aa1-9e13-0a9d11181c59",
+      "severity": "high",
+      "count": 7,
+      "detail": "7/11 executor turns made no tool call (64%), costing 80s of model round-trips"
+    },
+    {
+      "rule": "repeated_nudge",
+      "agentRunId": "run_75c8a820-e356-4c99-9082-cf5b2f38f7bc",
+      "severity": "high",
+      "count": 3,
+      "detail": "note injected 3x byte-identical: \"Second notice: 3 plan item(s) are still unverified and the previous instruction to continuΓÇª\""
+    },
+    {
+      "rule": "repeated_nudge",
+      "agentRunId": "run_75c8a820-e356-4c99-9082-cf5b2f38f7bc",
+      "severity": "high",
+      "count": 4,
+      "detail": "note injected 4x byte-identical: \"This turn is a CHANGE request. You have write tools available (write_file, edit_file, multΓÇª\""
+    },
+    {
+      "rule": "noop_executor_turns",
+      "agentRunId": "run_75c8a820-e356-4c99-9082-cf5b2f38f7bc",
+      "severity": "high",
+      "count": 8,
+      "detail": "8/13 executor turns made no tool call (62%), costing 79s of model round-trips"
+    },
+    {
+      "rule": "repeated_nudge",
+      "agentRunId": "run_c0a67eb0-8f76-45c1-af21-93d3adb33113",
+      "severity": "high",
+      "count": 3,
+      "detail": "note injected 3x byte-identical: \"This turn is a CHANGE request. You have write tools available (write_file, edit_file, multΓÇª\""
+    }
+  ]
+}
