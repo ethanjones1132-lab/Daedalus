@@ -1770,6 +1770,14 @@ export class PipelineExecutor {
       if (midLoop.kind === "inject" && midLoop.noteKind === "plan_remainder") {
         planNudgeCount++;
       }
+      // 2026-08-01: force_write decisions must advance their counter here too.
+      // The apply site increments only behind `!writeEffectNudgeSentThisTurn`,
+      // so on turns where the press path already fired the counter stalled --
+      // and `buildFailedWriteNote`'s `sent >= 2` escalation could never be
+      // reached, leaving the note byte-identical every checkpoint.
+      if (midLoop.kind === "force_write" && midLoop.noteKind === "force_write") {
+        writeEffectNudgeCount++;
+      }
       applyQualityPhaseBookkeeping(midLoop, signal);
       return midLoop;
     };

@@ -5,6 +5,7 @@ import {
   classifyMidLoopEscalation,
   collectToolPathTargets,
   decideMidLoopIntervention,
+  FORCE_WRITE_NUDGE_CAP,
   DEFAULT_QUALITY_PUSH_NOTE,
   hasConcreteProgressEvidence,
   hasQualityEvidence,
@@ -79,6 +80,67 @@ describe("decideMidLoopIntervention", () => {
       stageRemainingMs: 30_000,
     });
     expect(d.kind).toBe("abort");
+  });
+
+  // 2026-08-01, found by the replay harness on the FIRST post-fix runs: after
+  // the plan-remainder nudge was capped, the spin relocated here. The
+  // failed-write note was decided 7x byte-identical across 3 runs and 12/17
+  // executor turns still made no tool call.
+  //
+  // Two halves of one bug, the same shape as the plan-remainder case:
+  //   1. this branch had NO nudge cap — unlike `shouldPressWriteEffect`, which
+  //      stops at `nudgesSent < 3` — so it kept holding the executor loop open.
+  //   2. `buildFailedWriteNote` escalates on `forceWriteNudgesSent`, but that
+  //      counter only advanced at the APPLY site behind a per-turn gate, while
+  //      the decision fires every checkpoint. Its `sent >= 2` branch could
+  //      therefore never be reached, so the note repeated verbatim.
+  test("force_write stops firing once its nudge budget is spent", () => {
+    const spent = {
+      ...base,
+      distinctSuccessfulReads: 2,
+      failedWriteAttempts: 2,
+      successfulWrites: 0,
+      stageRemainingMs: 200_000,
+      forceWriteNudgesSent: FORCE_WRITE_NUDGE_CAP,
+    };
+    expect(decideMidLoopIntervention(spent).kind).not.toBe("force_write");
+  });
+
+  test("force_write still fires while budget remains", () => {
+    const fresh = {
+      ...base,
+      distinctSuccessfulReads: 2,
+      failedWriteAttempts: 2,
+      successfulWrites: 0,
+      stageRemainingMs: 200_000,
+      forceWriteNudgesSent: FORCE_WRITE_NUDGE_CAP - 1,
+    };
+    expect(decideMidLoopIntervention(fresh).kind).toBe("force_write");
+  });
+
+  test("the failed-write note escalates instead of repeating verbatim", () => {
+    const at = (sent: number) =>
+      (decideMidLoopIntervention({
+        ...base,
+        distinctSuccessfulReads: 2,
+        failedWriteAttempts: 2,
+        successfulWrites: 0,
+        stageRemainingMs: 200_000,
+        recentReadTargets: ["src/PluginProcessor.cpp"],
+        forceWriteNudgesSent: sent,
+      }) as { note: string }).note;
+    expect(at(0)).not.toBe(at(2));
+  });
+
+  test("force_write injects are tagged so the host can count them", () => {
+    const d = decideMidLoopIntervention({
+      ...base,
+      distinctSuccessfulReads: 2,
+      failedWriteAttempts: 2,
+      successfulWrites: 0,
+      stageRemainingMs: 200_000,
+    });
+    expect((d as { noteKind?: string }).noteKind).toBe("force_write");
   });
 
   test("failed write attempts with zero success → force_write with path guidance", () => {

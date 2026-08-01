@@ -22,7 +22,7 @@ export interface MidLoopDecisionMeta {
    * apart at the apply site, so a per-reflex repeat counter (e.g.
    * `planNudgesSent`) has nothing to key on without this tag.
    */
-  noteKind?: "plan_remainder";
+  noteKind?: "plan_remainder" | "force_write";
 }
 
 export type LoopIntervention = (
@@ -147,6 +147,20 @@ const ABORT_BUDGET_FLOOR_MS = 30_000;
  * cap; the quality phase still supervises the stage (see the polarity test).
  */
 const PLAN_REMAINDER_NUDGE_CAP = 2;
+
+/**
+ * Same discipline for the force-write reflex. `shouldPressWriteEffect` has
+ * always stopped at `nudgesSent < 3`, but the force_write DECISION branch had
+ * no equivalent bound, so once the press path was spent this one carried on
+ * holding the executor loop open.
+ *
+ * 2026-08-01, replay harness on the first post-fix runs: with the
+ * plan-remainder nudge capped, the spin simply relocated here — the
+ * failed-write note was decided 7x byte-identical across 3 runs and 12/17
+ * executor turns still produced no tool call. Matched to 3 for consistency
+ * with the press path.
+ */
+export const FORCE_WRITE_NUDGE_CAP = 3;
 
 const EVIDENCE_TARGET_CAP = 6;
 const EVIDENCE_SUMMARY_CAP = 5;
@@ -636,10 +650,12 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
   if (
     signal.successfulWrites === 0 &&
     (signal.failedWriteAttempts ?? 0) >= 1 &&
-    signal.stageRemainingMs > ABORT_BUDGET_FLOOR_MS
+    signal.stageRemainingMs > ABORT_BUDGET_FLOOR_MS &&
+    (signal.forceWriteNudgesSent ?? 0) < FORCE_WRITE_NUDGE_CAP
   ) {
     return {
       kind: "force_write",
+      noteKind: "force_write",
       note: buildFailedWriteNote(signal),
     };
   }
