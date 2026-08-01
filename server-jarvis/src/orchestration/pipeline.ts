@@ -82,6 +82,10 @@ import {
   seedTaskPlanFromPlannerProposal,
   type OwnedPlanningAttachment,
 } from "./runtime-loop";
+import {
+  buildTaskPlanGrounding,
+  evaluateTaskPlanAcceptance,
+} from "./task-plan-evidence";
 import { normalizePathInput, resolveAllowedRoots } from "../fs-scope";
 import {
   ClaudeDelegateAvailabilityCache,
@@ -1001,6 +1005,7 @@ export class PipelineExecutor {
     // extended directive set. Repair-chain stages are injected deterministically
     // — no further Conductor re-decision between Rewriter and Executor.
     if (directive.type === "mark_verified") {
+      let markVerifiedOk = !options.taskRunContract;
       if (options.taskRunContract) {
         try {
           const next = applySufficientVerdict(options.taskRunContract, {
@@ -1009,44 +1014,55 @@ export class PipelineExecutor {
             evidence: {
               ref: directive.evidenceRef,
               summary: directive.evidenceSummary,
+              grounding: directive.grounding,
             },
           });
           options.taskRunContract = next;
           options.onTaskPlanUpdate?.(next);
           this.conductor?.live.setPlanContext(next);
+          markVerifiedOk = true;
         } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
           console.warn(
-            `[Pipeline] mark_verified failed for ${directive.itemId}: ` +
-            `${e instanceof Error ? e.message : String(e)}`,
+            `[Pipeline] mark_verified failed for ${directive.itemId}: ${msg}`,
           );
+          // Fail closed: ungrounded verification must not early-stop / thrift.
+          markVerifiedOk = false;
+          if (this.conductor?.live) {
+            this.conductor.live.lastVerificationEarlyStop = false;
+            this.conductor.live.lastVerificationDroppedReviewer = false;
+          }
         }
       }
 
       // Task 4.3 thrift + Task 5.3 dropReviewer: green existing/builtin can
       // skip intermediate stages (early-stop → synthesizer) or just drop reviewer.
       // Flags are set by LiveConductor verify branch; thrift gate applied here.
-      if (directive.gradingMode === "reviewer_mediated") {
-        this.lastReviewerAccepted = true;
-      }
-      const live = this.conductor?.live;
-      if (options.workQueue && live) {
-        if (
-          live.lastVerificationEarlyStop === true &&
-          this.ctx.config.orchestrator.verification?.thrift?.achieved_effect_early_stop === true
-        ) {
-          options.workQueue.length = 0;
-          options.workQueue.push("synthesizer");
-          console.log(`[Pipeline] achieved-effect early-stop after ${stage}: synthesizer`);
-        } else if (live.lastVerificationDroppedReviewer === true) {
-          const filtered = options.workQueue.filter(
-            (s) => s !== "reviewer" && s !== ("re-enter:reviewer" as StageName),
-          );
-          options.workQueue.length = 0;
-          options.workQueue.push(...filtered);
-          console.log(`[Pipeline] drop-reviewer thrift after ${stage}: ${filtered.join("->") || "(empty)"}`);
+      // Only thrift after a successful ledger mark-off (or when no ledger exists).
+      if (markVerifiedOk) {
+        if (directive.gradingMode === "reviewer_mediated") {
+          this.lastReviewerAccepted = true;
         }
-        live.lastVerificationEarlyStop = false;
-        live.lastVerificationDroppedReviewer = false;
+        const live = this.conductor?.live;
+        if (options.workQueue && live) {
+          if (
+            live.lastVerificationEarlyStop === true &&
+            this.ctx.config.orchestrator.verification?.thrift?.achieved_effect_early_stop === true
+          ) {
+            options.workQueue.length = 0;
+            options.workQueue.push("synthesizer");
+            console.log(`[Pipeline] achieved-effect early-stop after ${stage}: synthesizer`);
+          } else if (live.lastVerificationDroppedReviewer === true) {
+            const filtered = options.workQueue.filter(
+              (s) => s !== "reviewer" && s !== ("re-enter:reviewer" as StageName),
+            );
+            options.workQueue.length = 0;
+            options.workQueue.push(...filtered);
+            console.log(`[Pipeline] drop-reviewer thrift after ${stage}: ${filtered.join("->") || "(empty)"}`);
+          }
+          live.lastVerificationEarlyStop = false;
+          live.lastVerificationDroppedReviewer = false;
+        }
       }
     }
 
@@ -4415,7 +4431,8 @@ export class PipelineExecutor {
           };
           return finish({ state, replanRequested, partialStage });
         }
-        // Reviewer accept with active plan item → mark verified (reviewer_mediated).
+        // Reviewer accept with active plan item → mark verified only when
+        // structured grounding satisfies acceptance checks (fail closed).
         if (
           reviewer &&
           !reviewer.hasIssues &&
@@ -4423,20 +4440,86 @@ export class PipelineExecutor {
           opts.taskRunContract &&
           activeItem
         ) {
+          const grounding = buildTaskPlanGrounding({
+            writeIntent: writeIntentForRepair,
+            workspaceEvidenceRequired: requiresWorkspaceEvidence,
+            reviewerAccepted: true,
+            toolCalls: state.executor?.toolCalls ?? [],
+            checkResult: this.lastCheckResult,
+          });
+          const acceptance = evaluateTaskPlanAcceptance(activeItem, grounding);
+          if (!acceptance.accepted) {
+            console.warn(
+              `[Pipeline] reviewer ACCEPT without grounded evidence for ${activeItem.id}: ` +
+              acceptance.unmet.join(","),
+            );
+            partialStage = {
+              stage: "reviewer" as StageName,
+              errorCode: "plan_item_acceptance_unmet",
+            };
+            // Enqueue repair only when remaining repair budget permits.
+            const unmetRepair = decideRepairChain({
+              reviewerHasIssues: true,
+              writeIntent: writeIntentForRepair,
+              profile,
+              repairCycleCount: ledgerCycles,
+              maxRepairCycles,
+              consecutiveFailures: this.conductor?.live.getConsecutiveToolErrors?.() ?? 0,
+            });
+            if (unmetRepair.fire) {
+              const chainRemaining = mergeRepairChainIntoRemaining(
+                remainingNow().length > 0 ? remainingNow() : (wantsSynthesizer ? ["synthesizer"] : []),
+                unmetRepair.stages,
+              );
+              workQueue.length = 0;
+              workQueue.push(...chainRemaining);
+              try {
+                const applied = applyInsufficientVerdict(opts.taskRunContract, {
+                  itemId: activeItem.id,
+                  flaggedIssues: `plan_item_acceptance_unmet:${acceptance.unmet.join(",")}`,
+                  maxRepairCycles,
+                  consecutiveFailures: this.conductor?.live.getConsecutiveToolErrors?.() ?? 0,
+                });
+                opts.taskRunContract = applied.contract;
+                opts.onTaskPlanUpdate?.(applied.contract);
+                this.conductor?.live.setPlanContext(applied.contract);
+              } catch (e) {
+                console.warn(
+                  `[Pipeline] acceptance-unmet repair ledger update failed: ` +
+                  `${e instanceof Error ? e.message : String(e)}`,
+                );
+              }
+              console.log(
+                `[Pipeline] acceptance unmet — repair chain: ${chainRemaining.join("->")}`,
+              );
+              continue;
+            }
+            // No repair budget: surface partial and skip synthesizer success path.
+            return finish({
+              state,
+              partialStage,
+            });
+          }
           this.lastReviewerAccepted = true;
           try {
             const next = applyReviewerAccept(opts.taskRunContract, activeItem.id, {
               ref: `${agentRunId}:reviewer:${activeItem.id}`,
               summary: reviewer.feedback?.slice(0, 240),
+              grounding,
             });
             opts.taskRunContract = next;
             opts.onTaskPlanUpdate?.(next);
             this.conductor?.live.setPlanContext(next);
           } catch (e) {
-            console.warn(
-              `[Pipeline] reviewer accept mark-verified failed: ` +
-              `${e instanceof Error ? e.message : String(e)}`,
-            );
+            const msg = e instanceof Error ? e.message : String(e);
+            console.warn(`[Pipeline] reviewer accept mark-verified failed: ${msg}`);
+            if (msg.startsWith("plan_item_acceptance_unmet")) {
+              partialStage = {
+                stage: "reviewer" as StageName,
+                errorCode: "plan_item_acceptance_unmet",
+              };
+              return finish({ state, partialStage });
+            }
           }
         }
         continue;

@@ -1,6 +1,10 @@
 import { isContinuationTurn, isWorkOrderFollowup } from "./turn-triage";
 import { hasWriteIntent, type TurnRequirement } from "./turn-requirements";
 import { isDeepReadRequest } from "./evidence-sufficiency";
+import {
+  evaluateTaskPlanAcceptance,
+  type TaskPlanEvidenceGrounding,
+} from "./task-plan-evidence";
 
 export type TaskRunDepth = "standard" | "deep";
 export type TaskRunStatus = "active" | "paused" | "completed" | "failed" | "cancelled";
@@ -37,7 +41,11 @@ export interface TaskPlanEvidencePointer {
   summary?: string;
   /** ISO timestamp when the pointer was recorded. */
   recordedAt?: string;
+  /** Structured grounding that justified verification (writes, checks, reviewer). */
+  grounding?: TaskPlanEvidenceGrounding;
 }
+
+export type { TaskPlanEvidenceGrounding };
 
 export interface TaskPlanAcceptanceCheck {
   id: string;
@@ -296,6 +304,7 @@ export function makeEvidencePointer(
   ref: string,
   summary?: string,
   recordedAt: string = nowIso(),
+  grounding?: TaskPlanEvidenceGrounding,
 ): TaskPlanEvidencePointer {
   const trimmed = ref.trim();
   if (!trimmed) {
@@ -303,6 +312,7 @@ export function makeEvidencePointer(
   }
   const pointer: TaskPlanEvidencePointer = { ref: trimmed, recordedAt };
   if (summary?.trim()) pointer.summary = summary.trim();
+  if (grounding) pointer.grounding = grounding;
   return pointer;
 }
 
@@ -629,16 +639,34 @@ export function activatePlanItem(contract: TaskRunContract, itemId: string): Tas
 /**
  * Mark an item verified, store grading mode + evidence pointer, optionally
  * advance the queue to the next ready item.
+ *
+ * Fail-closed: requires structured grounding that satisfies the item's
+ * acceptance checks. Throws `plan_item_acceptance_unmet:<reasons>` when red.
  */
 export function markPlanItemVerified(
   contract: TaskRunContract,
   itemId: string,
   input: MarkPlanItemVerifiedInput,
 ): TaskRunContract {
+  const target = getPlanItem(contract, itemId);
+  if (!target) {
+    throw new Error(`markPlanItemVerified: plan item not found: ${itemId}`);
+  }
+  const grounding = input.evidence.grounding ?? {
+    requiredEffect: "none" as const,
+    reviewerAccepted: false,
+    successfulWrites: [],
+    successfulReads: [],
+  };
+  const verdict = evaluateTaskPlanAcceptance(target, grounding);
+  if (!verdict.accepted) {
+    throw new Error(`plan_item_acceptance_unmet:${verdict.unmet.join(",")}`);
+  }
   const evidence = makeEvidencePointer(
     input.evidence.ref,
     input.evidence.summary,
     input.evidence.recordedAt ?? nowIso(),
+    grounding,
   );
   const now = nowIso();
   let next = mapPlanItem(contract, itemId, (item) => ({
@@ -709,7 +737,12 @@ export function setPlanItemEvidence(
   itemId: string,
   evidence: TaskPlanEvidencePointer,
 ): TaskRunContract {
-  const pointer = makeEvidencePointer(evidence.ref, evidence.summary, evidence.recordedAt ?? nowIso());
+  const pointer = makeEvidencePointer(
+    evidence.ref,
+    evidence.summary,
+    evidence.recordedAt ?? nowIso(),
+    evidence.grounding,
+  );
   const now = nowIso();
   return mapPlanItem(contract, itemId, (item) => ({
     ...item,
@@ -801,6 +834,45 @@ function isPlanItemStatus(value: unknown): value is TaskPlanItemStatus {
   return value === "pending" || value === "active" || value === "verified" || value === "blocked";
 }
 
+function normalizeGroundingOnRead(raw: unknown): TaskPlanEvidenceGrounding | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const g = raw as Record<string, unknown>;
+  const requiredEffect =
+    g.requiredEffect === "write" || g.requiredEffect === "read" || g.requiredEffect === "none"
+      ? g.requiredEffect
+      : undefined;
+  if (!requiredEffect) return undefined;
+  const successfulWrites = Array.isArray(g.successfulWrites)
+    ? g.successfulWrites.filter((v): v is string => typeof v === "string")
+    : [];
+  const successfulReads = Array.isArray(g.successfulReads)
+    ? g.successfulReads.filter((v): v is string => typeof v === "string")
+    : [];
+  const grounding: TaskPlanEvidenceGrounding = {
+    requiredEffect,
+    reviewerAccepted: g.reviewerAccepted === true,
+    successfulWrites,
+    successfulReads,
+  };
+  if (g.check && typeof g.check === "object") {
+    const c = g.check as Record<string, unknown>;
+    const tier =
+      c.tier === "existing" || c.tier === "builtin" || c.tier === "synth" || c.tier === "none"
+        ? c.tier
+        : undefined;
+    if (tier) {
+      grounding.check = {
+        tier,
+        ran: c.ran === true,
+        passed: c.passed === true ? true : c.passed === false ? false : null,
+        command: typeof c.command === "string" ? c.command : "",
+        detail: typeof c.detail === "string" ? c.detail : "",
+      };
+    }
+  }
+  return grounding;
+}
+
 function normalizePlanOnRead(raw: unknown): TaskPlan | undefined {
   if (!raw || typeof raw !== "object") return emptyTaskPlan();
   const p = raw as Record<string, unknown>;
@@ -823,10 +895,12 @@ function normalizePlanOnRead(raw: unknown): TaskPlan | undefined {
     if (item.evidence && typeof item.evidence === "object") {
       const ev = item.evidence as Record<string, unknown>;
       if (typeof ev.ref === "string" && ev.ref.trim()) {
+        const grounding = normalizeGroundingOnRead(ev.grounding);
         evidence = {
           ref: ev.ref.trim(),
           ...(typeof ev.summary === "string" ? { summary: ev.summary } : {}),
           ...(typeof ev.recordedAt === "string" ? { recordedAt: ev.recordedAt } : {}),
+          ...(grounding ? { grounding } : {}),
         };
       }
     }

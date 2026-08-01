@@ -1,6 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { defaultConfig } from "../config";
+import { createToolRuntime, makeExecutionContext } from "../tool-runtime";
+import { PipelineExecutor } from "./pipeline";
+import {
+  createTaskRun,
+  getActivePlanItem,
+  getPlanItem,
+} from "./task-run";
 
 /**
  * The TaskPlan ledger has exactly one correct home in pipeline.ts, and one
@@ -60,5 +68,102 @@ describe("TaskPlan ledger stays wired to the mid-loop signal, not the correctnes
       expect(literal).not.toContain("planItemsTotal:");
       expect(literal).not.toContain("planItemsRemaining:");
     }
+  });
+});
+
+describe("pipeline reviewer ACCEPT requires grounded evidence", () => {
+  test("ACCEPT + only read_file leaves item active and segment partial", async () => {
+    const runtime = createToolRuntime();
+    runtime.register(
+      {
+        type: "function",
+        function: {
+          name: "read_file",
+          description: "read",
+          parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+        },
+        requires_approval: false,
+        dangerous: false,
+      } as any,
+      async () => "file contents",
+    );
+    const config = defaultConfig();
+    config.tools.require_approval = [];
+    const ctx = makeExecutionContext("agent", config, { workspace_path: process.cwd() });
+
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") {
+        executorTurns++;
+        // First turn: only a read (no write). Subsequent turns (repair) still no write.
+        return {
+          content: "I inspected the file.",
+          tool_calls: [
+            {
+              id: `call_read_${executorTurns}`,
+              type: "function",
+              function: {
+                name: "read_file",
+                arguments: JSON.stringify({ path: "src/main.ts" }),
+              },
+            },
+          ],
+        };
+      }
+      if (options.stageLabel === "reviewer") {
+        return { content: "ACCEPT — looks complete" };
+      }
+      if (options.stageLabel === "synthesizer") {
+        return { content: "should not be treated as successful verification" };
+      }
+      if (options.stageLabel === "rewriter") {
+        return { content: "rewrite guidance" };
+      }
+      return { content: "ok" };
+    };
+
+    let contract = createTaskRun({
+      taskRunId: "task_ungrounded_accept",
+      sessionId: "sess_ungrounded_accept",
+      objective: "implement the write path",
+      requirement: "full_execution",
+      estimatedComplexity: "medium",
+      planItems: [
+        {
+          id: "pi_write",
+          title: "Implement the write path",
+          acceptanceChecks: [
+            { id: "ac_write", description: "reviewer accepts grounded write", kind: "reviewer_pass" },
+          ],
+        },
+      ],
+    });
+    expect(getActivePlanItem(contract)?.id).toBe("pi_write");
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, {
+      recordStageRun: () => {},
+    });
+
+    const segment = await executor.executeSegment(
+      "implement the write path in src/main.ts",
+      ["executor", "reviewer", "synthesizer"],
+      "run_ungrounded_accept",
+      () => {},
+      {
+        executionProfile: "full",
+        rawMessage: "implement the write path in src/main.ts",
+        taskRunWriteIntent: true,
+        taskRunContract: contract,
+        maxReviewRepairRounds: 0,
+        allowMidRunReplan: false,
+        onTaskPlanUpdate: (next) => {
+          contract = next;
+        },
+      },
+    );
+
+    const item = getPlanItem(contract, "pi_write");
+    expect(item?.status).toBe("active");
+    expect(segment.partialStage?.errorCode).toBe("plan_item_acceptance_unmet");
   });
 });

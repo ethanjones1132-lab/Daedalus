@@ -1,6 +1,8 @@
 import type { StageName } from "./coordinator";
 import type { ConductorDirective } from "./conductor-bus";
 import type { CheckResult } from "./check-runner";
+import type { ToolCallRecord } from "./stage-output";
+import { buildTaskPlanGrounding } from "./task-plan-evidence";
 
 export type VerificationDecision =
   | { kind: "directive"; directive: ConductorDirective; dropReviewer?: boolean }
@@ -11,6 +13,9 @@ export function decideVerificationDirective(input: {
   item: { id: string };
   runId: string;
   remainingQueue: StageName[];
+  toolCalls?: readonly ToolCallRecord[];
+  writeIntent?: boolean;
+  workspaceEvidenceRequired?: boolean;
 }): VerificationDecision {
   const { check, item, runId, remainingQueue } = input;
 
@@ -30,6 +35,13 @@ export function decideVerificationDirective(input: {
 
   // Fast-path: a trustworthy tier passed → mark verified without a reviewer.
   if (check.ran && check.passed === true && (check.tier === "existing" || check.tier === "builtin")) {
+    const grounding = buildTaskPlanGrounding({
+      writeIntent: input.writeIntent === true,
+      workspaceEvidenceRequired: input.workspaceEvidenceRequired === true,
+      reviewerAccepted: false,
+      toolCalls: input.toolCalls ?? [],
+      checkResult: check,
+    });
     return {
       kind: "directive",
       dropReviewer: remainingQueue.includes("reviewer" as StageName),
@@ -38,6 +50,7 @@ export function decideVerificationDirective(input: {
         itemId: item.id,
         evidenceRef: `${runId || "run"}:runtime_check:${item.id}`,
         evidenceSummary: check.command,
+        grounding,
         gradingMode: "runtime_check",
         reason: `verified by ${check.tier} check (${check.command})`,
       },

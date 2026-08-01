@@ -28,6 +28,7 @@ import {
 import { parseReviewerVerdict } from "./stage-output";
 import type { ToolCallRecord } from "./stage-output";
 import { WRITE_EFFECT_TOOLS } from "./effect-gate";
+import type { TaskPlanEvidenceGrounding } from "./task-plan-evidence";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -574,6 +575,7 @@ export function applySufficientVerdict(
       input.evidence.ref,
       input.evidence.summary,
       input.evidence.recordedAt,
+      input.evidence.grounding,
     ),
     advance: input.advance,
   });
@@ -751,6 +753,7 @@ export function applyInsufficientVerdict(
 
 /**
  * Reviewer accept → mark verified with reviewer_mediated grading.
+ * Requires structured grounding on the evidence pointer.
  */
 export function applyReviewerAccept(
   contract: TaskRunContract,
@@ -763,6 +766,8 @@ export function applyReviewerAccept(
     gradingMode: "reviewer_mediated",
   });
 }
+
+export type { TaskPlanEvidenceGrounding };
 
 /** Parse reviewer feedback into accept/reject for runtime-loop consumers. */
 export function reviewerFeedbackIsInsufficient(feedback: string): boolean {

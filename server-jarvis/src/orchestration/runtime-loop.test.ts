@@ -29,6 +29,7 @@ import {
   getActivePlanItem,
   getPlanItem,
   listVerifiedPlanItems,
+  type TaskPlanEvidenceGrounding,
   type TaskRunContract,
 } from "./task-run";
 
@@ -41,6 +42,28 @@ function baseContract(overrides: Partial<Parameters<typeof createTaskRun>[0]> = 
     estimatedComplexity: "low",
     ...overrides,
   });
+}
+
+function writeGrounding(path = "src/fixture.ts"): TaskPlanEvidenceGrounding {
+  return {
+    requiredEffect: "write",
+    reviewerAccepted: false,
+    successfulWrites: [path],
+    successfulReads: [],
+  };
+}
+
+function reviewerGrounding(path = "src/fixture.ts"): TaskPlanEvidenceGrounding {
+  return {
+    requiredEffect: "write",
+    reviewerAccepted: true,
+    successfulWrites: [path],
+    successfulReads: [],
+  };
+}
+
+function groundedEvidence(ref: string, summary?: string, grounding: TaskPlanEvidenceGrounding = writeGrounding()) {
+  return { ref, ...(summary ? { summary } : {}), grounding };
 }
 
 describe("runtime-loop > plan authorship complexity gate", () => {
@@ -175,10 +198,11 @@ describe("runtime-loop > mark verified on sufficient", () => {
     contract = applySufficientVerdict(contract, {
       itemId: active.id,
       gradingMode: "conductor_direct_diff",
-      evidence: { ref: "run_1:executor", summary: "diff clean" },
+      evidence: groundedEvidence("run_1:executor", "diff clean"),
     });
     expect(getPlanItem(contract, active.id)?.status).toBe("verified");
     expect(getPlanItem(contract, active.id)?.gradingMode).toBe("conductor_direct_diff");
+    expect(getPlanItem(contract, active.id)?.evidence?.grounding?.successfulWrites.length).toBeGreaterThan(0);
     expect(listVerifiedPlanItems(contract)).toHaveLength(1);
     expect(contract.status).toBe("completed");
   });
@@ -194,9 +218,31 @@ describe("runtime-loop > mark verified on sufficient", () => {
     contract = applyReviewerAccept(contract, active.id, {
       ref: "run_1:reviewer",
       summary: "ACCEPT — looks good",
+      grounding: reviewerGrounding(),
     });
     expect(getPlanItem(contract, active.id)?.gradingMode).toBe("reviewer_mediated");
     expect(getPlanItem(contract, active.id)?.status).toBe("verified");
+  });
+
+  test("reviewer accept without write evidence fails for write-intent reviewer_pass", () => {
+    const planning = attachOwnedPlanning("complex-ish single item", "low");
+    planning.plan_items[0].acceptanceChecks = [
+      { id: "ac", description: "reviewer ok", kind: "reviewer_pass" },
+    ];
+    const contract = seedTaskPlanFromPlanning(baseContract(), planning);
+    const active = getActivePlanItem(contract)!;
+    expect(() =>
+      applyReviewerAccept(contract, active.id, {
+        ref: "run_1:reviewer",
+        summary: "ACCEPT — prose only",
+        grounding: {
+          requiredEffect: "write",
+          reviewerAccepted: true,
+          successfulWrites: [],
+          successfulReads: ["PLAN.md"],
+        },
+      }),
+    ).toThrow(/plan_item_acceptance_unmet/);
   });
 
   test("shouldEscalateToReviewer for medium+ and reviewer_pass checks", () => {
@@ -351,7 +397,7 @@ describe("runtime-loop > multi-turn plan reseeding (non-clobber)", () => {
     contract = applySufficientVerdict(contract, {
       itemId: active.id,
       gradingMode: "conductor_direct_diff",
-      evidence: { ref: "run_1:executor", summary: "done" },
+      evidence: groundedEvidence("run_1:executor", "done"),
       advance: false,
     });
     // Simulate status still active for multi-item, but mark verified:
@@ -400,7 +446,7 @@ describe("runtime-loop > multi-turn plan reseeding (non-clobber)", () => {
     contract = applySufficientVerdict(contract, {
       itemId: active.id,
       gradingMode: "conductor_direct_diff",
-      evidence: { ref: "r1", summary: "ok" },
+      evidence: groundedEvidence("r1", "ok"),
       advance: false,
     });
 
@@ -430,10 +476,11 @@ describe("runtime-loop > multi-turn plan reseeding (non-clobber)", () => {
     expect(contract.plan?.items.length).toBe(3);
 
     const firstItemId = first.items[0].id!;
+    // Planner items default to reviewer_pass — ground with reviewer accept + write.
     contract = applySufficientVerdict(contract, {
       itemId: firstItemId,
       gradingMode: "conductor_direct_diff",
-      evidence: { ref: "run_1:executor", summary: "scaffolded" },
+      evidence: groundedEvidence("run_1:executor", "scaffolded", reviewerGrounding()),
       advance: true,
     });
     expect(getPlanItem(contract, firstItemId)?.status).toBe("verified");

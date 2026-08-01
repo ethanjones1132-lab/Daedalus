@@ -30,6 +30,7 @@ import {
   setTaskPlan,
   terminalSubtypeForRunOutcome,
   unblockPlanItem,
+  type TaskPlanEvidenceGrounding,
   type TaskRunContract,
   type TurnRequirement,
 } from "./task-run";
@@ -46,6 +47,37 @@ const BASE_INPUT = {
   requirement: "full_execution" as TurnRequirement,
   estimatedComplexity: "high" as const,
 };
+
+/** Default grounded write evidence for ledger mark-off fixtures. */
+function writeGrounding(path = "src/fixture.ts"): TaskPlanEvidenceGrounding {
+  return {
+    requiredEffect: "write",
+    reviewerAccepted: false,
+    successfulWrites: [path],
+    successfulReads: [],
+  };
+}
+
+function groundedEvidence(ref: string, summary?: string) {
+  return {
+    ref,
+    ...(summary ? { summary } : {}),
+    grounding: writeGrounding(),
+  };
+}
+
+const DIFF_CHECK = { id: "ac_diff", description: "file written", kind: "diff_match" as const };
+
+function withDiffChecks<T extends { id?: string; title: string; dependsOn?: string[]; acceptanceChecks?: unknown[] }>(
+  items: T[],
+): T[] {
+  return items.map((item) => ({
+    ...item,
+    acceptanceChecks: item.acceptanceChecks?.length
+      ? item.acceptanceChecks
+      : [{ ...DIFF_CHECK, id: `ac_${item.id ?? "x"}` }],
+  }));
+}
 
 function makeTaskRun(overrides: Partial<Parameters<typeof createTaskRun>[0]> = {}): TaskRunContract {
   return createTaskRun({ ...BASE_INPUT, ...overrides });
@@ -681,15 +713,15 @@ describe("task-run > reconcileTaskRunStatus", () => {
   test("multi-item partial progress: turn completed → overall stays active", () => {
     let run = createTaskRun({
       ...BASE_INPUT,
-      planItems: [
+      planItems: withDiffChecks([
         { id: "i1", title: "Step one" },
         { id: "i2", title: "Step two" },
         { id: "i3", title: "Step three" },
-      ],
+      ]),
     });
     run = markPlanItemVerified(run, "i1", {
       gradingMode: "conductor_direct_diff",
-      evidence: { ref: "ev_1" },
+      evidence: groundedEvidence("ev_1"),
     });
     // Item 1 verified, 2 active, 3 pending — synthesizer may still claim done.
     expect(deriveTaskStatusFromPlan(run.plan!)).toBe("active");
@@ -704,13 +736,13 @@ describe("task-run > reconcileTaskRunStatus", () => {
   test("all items verified: turn completed → completed", () => {
     let run = createTaskRun({
       ...BASE_INPUT,
-      planItems: [
+      planItems: withDiffChecks([
         { id: "i1", title: "Only step" },
-      ],
+      ]),
     });
     run = markPlanItemVerified(run, "i1", {
       gradingMode: "conductor_direct_diff",
-      evidence: { ref: "ev" },
+      evidence: groundedEvidence("ev"),
     });
     expect(deriveTaskStatusFromPlan(run.plan!)).toBe("completed");
     expect(
@@ -724,11 +756,11 @@ describe("task-run > reconcileTaskRunStatus", () => {
   test("all items verified: turn paused still yields completed (ledger authority)", () => {
     let run = createTaskRun({
       ...BASE_INPUT,
-      planItems: [{ id: "i1", title: "Done" }],
+      planItems: withDiffChecks([{ id: "i1", title: "Done" }]),
     });
     run = markPlanItemVerified(run, "i1", {
       gradingMode: "reviewer_mediated",
-      evidence: { ref: "ev" },
+      evidence: groundedEvidence("ev"),
     });
     expect(
       reconcileTaskRunStatus({
@@ -759,11 +791,11 @@ describe("task-run > reconcileTaskRunStatus", () => {
   test("forcePaused (repetition): always paused", () => {
     let run = createTaskRun({
       ...BASE_INPUT,
-      planItems: [{ id: "i1", title: "A" }],
+      planItems: withDiffChecks([{ id: "i1", title: "A" }]),
     });
     run = markPlanItemVerified(run, "i1", {
       gradingMode: "conductor_direct_diff",
-      evidence: { ref: "ev" },
+      evidence: groundedEvidence("ev"),
     });
     expect(
       reconcileTaskRunStatus({
@@ -806,11 +838,11 @@ describe("task-run > reconcileTaskRunStatus", () => {
 
     let done = createTaskRun({
       ...BASE_INPUT,
-      planItems: [{ id: "a", title: "A" }],
+      planItems: withDiffChecks([{ id: "a", title: "A" }]),
     });
     done = markPlanItemVerified(done, "a", {
       gradingMode: "conductor_direct_diff",
-      evidence: { ref: "ev" },
+      evidence: groundedEvidence("ev"),
     });
     expect(
       reconcileTaskRunStatus({
@@ -880,7 +912,7 @@ describe("task-run > reconcileTaskRunStatus", () => {
 function makePlanRun(planItems: Parameters<typeof createTaskRun>[0]["planItems"]): TaskRunContract {
   return createTaskRun({
     ...BASE_INPUT,
-    planItems,
+    planItems: planItems ? withDiffChecks(planItems) : planItems,
   });
 }
 
@@ -979,13 +1011,14 @@ describe("task-run > TaskPlan status transitions", () => {
     ]);
     run = markPlanItemVerified(run, "i1", {
       gradingMode: "conductor_direct_diff",
-      evidence: makeEvidencePointer("ev_1", "diff matched"),
+      evidence: makeEvidencePointer("ev_1", "diff matched", undefined, writeGrounding()),
     });
     const verified = getPlanItem(run, "i1")!;
     expect(verified.status).toBe("verified");
     expect(verified.gradingMode).toBe("conductor_direct_diff");
     expect(verified.evidence?.ref).toBe("ev_1");
     expect(verified.evidence?.summary).toBe("diff matched");
+    expect(verified.evidence?.grounding?.successfulWrites).toEqual(["src/fixture.ts"]);
     expect(verified.verifiedAt).toBeTruthy();
     expect(verified.blockedReason).toBeUndefined();
     // Queue advances to next dep-satisfied item.
@@ -996,6 +1029,16 @@ describe("task-run > TaskPlan status transitions", () => {
     expect(countItemizedEvidence(run.plan!)).toBe(1);
   });
 
+  test("markPlanItemVerified rejects ungrounded acceptance", () => {
+    const run = makePlanRun([{ id: "i1", title: "Step one" }]);
+    expect(() =>
+      markPlanItemVerified(run, "i1", {
+        gradingMode: "conductor_direct_diff",
+        evidence: { ref: "ev_bare" },
+      }),
+    ).toThrow(/plan_item_acceptance_unmet/);
+  });
+
   test("markPlanItemVerified with advance=false leaves queue on the verified item", () => {
     let run = makePlanRun([
       { id: "i1", title: "A" },
@@ -1003,7 +1046,7 @@ describe("task-run > TaskPlan status transitions", () => {
     ]);
     run = markPlanItemVerified(run, "i1", {
       gradingMode: "reviewer_mediated",
-      evidence: { ref: "ev_r1" },
+      evidence: groundedEvidence("ev_r1"),
       advance: false,
     });
     expect(getPlanItem(run, "i1")?.status).toBe("verified");
@@ -1051,19 +1094,19 @@ describe("task-run > TaskPlan status transitions", () => {
 
     run = markPlanItemVerified(run, "a", {
       gradingMode: "conductor_direct_diff",
-      evidence: { ref: "ev_a" },
+      evidence: groundedEvidence("ev_a"),
     });
     expect(run.plan?.activeItemId).toBe("b");
 
     run = markPlanItemVerified(run, "b", {
       gradingMode: "reviewer_mediated",
-      evidence: { ref: "ev_b" },
+      evidence: groundedEvidence("ev_b"),
     });
     expect(run.plan?.activeItemId).toBe("c");
 
     run = markPlanItemVerified(run, "c", {
       gradingMode: "conductor_direct_diff",
-      evidence: { ref: "ev_c" },
+      evidence: groundedEvidence("ev_c"),
     });
     expect(run.plan?.activeItemId).toBeNull();
     expect(run.status).toBe("completed");
@@ -1101,7 +1144,7 @@ describe("task-run > TaskPlan status transitions", () => {
     ]);
     run = markPlanItemVerified(run, "a", {
       gradingMode: "conductor_direct_diff",
-      evidence: { ref: "ev" },
+      evidence: groundedEvidence("ev"),
       advance: false,
     });
     expect(() => activatePlanItem(run, "a")).toThrow(/verified/);
@@ -1179,7 +1222,7 @@ describe("task-run > TaskPlan status transitions", () => {
     let run = makePlanRun([{ id: "a", title: "A" }]);
     run = markPlanItemVerified(run, "a", {
       gradingMode: "conductor_direct_diff",
-      evidence: { ref: "ev" },
+      evidence: groundedEvidence("ev"),
     });
     expect(deriveTaskStatusFromPlan(run.plan!)).toBe("completed");
     expect(remainingWorkFromPlan(run.plan!)).toEqual([]);
@@ -1196,7 +1239,7 @@ describe("task-run > TaskPlan status transitions", () => {
     const run = makePlanRun([{ id: "a", title: "A" }]);
     expect(() => markPlanItemVerified(run, "missing", {
       gradingMode: "conductor_direct_diff",
-      evidence: { ref: "ev" },
+      evidence: groundedEvidence("ev"),
     })).toThrow(/not found/);
     expect(() => markPlanItemBlocked(run, "missing", "x")).toThrow(/not found/);
   });

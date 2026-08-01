@@ -95,7 +95,16 @@ describe("session-memory", () => {
     contract = applySufficientVerdict(contract, {
       itemId: active.id,
       gradingMode: "conductor_direct_diff",
-      evidence: { ref: "run:exec", summary: "written" },
+      evidence: {
+        ref: "run:exec",
+        summary: "written",
+        grounding: {
+          requiredEffect: "write",
+          reviewerAccepted: false,
+          successfulWrites: ["src/cache.ts"],
+          successfulReads: [],
+        },
+      },
       advance: false,
     });
     memory.setTaskRunContract("sess-plan-preserve", contract);
