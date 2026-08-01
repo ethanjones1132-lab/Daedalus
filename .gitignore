@@ -78,9 +78,11 @@ scripts/verify-session-stats-feature.py
 scripts/prepend-priorities-session-stats.py
 scripts/prepend-priorities-sessions-filter.py
 scripts/prepend-priorities-2026-07-31-inference-feedback-refresh.py
+scripts/prepend-priorities-2026-08-01-9am-eval-budget-push.py
 scripts/diagnose-priorities.py
 scripts/verify-priorities-update.py
 scripts/verify-priorities-sessions-filter.py
+scripts/verify-priorities-prepend-2026-08-01-9am.py
 server-jarvis/scripts/probe-*.ts
 
 # --- Live benchmark output ---
