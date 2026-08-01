@@ -57,6 +57,16 @@ export class ModelScorecard {
     }
   }
 
+  /**
+   * Observations recorded for this stage/model. Drives the new-release trial
+   * policy: below `TRIAL_SAMPLE_TARGET` there is not yet enough data to grade
+   * a model fairly, which is the same floor `errorRate` uses before it will
+   * return a verdict at all.
+   */
+  sampleCount(stage: string, providerModelKey: string): number {
+    return this.slot(stage, providerModelKey).length;
+  }
+
   errorRate(stage: string, providerModelKey: string): number | undefined {
     const list = this.slot(stage, providerModelKey);
     if (list.length < MIN_SAMPLES) return undefined;

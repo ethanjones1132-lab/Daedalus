@@ -1,4 +1,5 @@
 import type { Complexity, StageName, TaskType } from "./coordinator";
+import { selectTrialCandidate } from "./model-trial-policy";
 import {
   applyLearnedCapabilities,
   empiricalFirstTokenTimeoutFor,
@@ -299,6 +300,19 @@ export function orchestrationRoutingTier(agent: OrchestratorAgent): number {
 
 export class AgentPool {
   private agents = new Map<string, OrchestratorAgent>();
+  /**
+   * Stage/model observation counts for the new-release trial policy. Optional
+   * and injected so the pool stays free of telemetry dependencies — when it is
+   * absent (tests, health probes, the /agents/pool view) selection behaves
+   * exactly as before and no model is trialled.
+   */
+  private sampleCountFor?: (agent: OrchestratorAgent, stage: string) => number;
+
+  /** Supply observation counts so unproven free lanes can be trialled. */
+  withTrialSampleCounts(fn: (agent: OrchestratorAgent, stage: string) => number): this {
+    this.sampleCountFor = fn;
+    return this;
+  }
 
   constructor(agents: OrchestratorAgent[]) {
     for (const agent of agents) this.add(agent);
@@ -357,6 +371,18 @@ export class AgentPool {
     // become eligible.
     const activeTier = Math.min(...candidates.map(orchestrationRoutingTier));
     const tierCandidates = candidates.filter((agent) => orchestrationRoutingTier(agent) === activeTier);
+    // New-release trial (model-trial-policy.ts). A model discovered from a
+    // live catalog is scored from a name-matching regex, which puts any
+    // unfamiliar family below the pool median and keeps it there — it can
+    // never earn the data that would correct the guess. Try it aggressively
+    // until it has enough observations to grade, then let it compete on
+    // merit. Runs AFTER the exclusion + tier filters, so an unfit model
+    // (>=50% errors over >=6 samples) has already been removed and no trial
+    // can leave the active cost tier.
+    const trialPick = this.sampleCountFor
+      ? selectTrialCandidate(tierCandidates, stage, (agent) => this.sampleCountFor!(agent, stage))
+      : undefined;
+    if (trialPick) return trialPick;
     const highComplexityBrain = selection.complexity === "high"
       && (stage === "planner" || stage === "executor");
     const stageDefault = highComplexityBrain

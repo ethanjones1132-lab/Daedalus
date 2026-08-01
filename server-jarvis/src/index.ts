@@ -1806,7 +1806,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             : new Set<string>(excludeModels ?? []);
           if (stageLabel && cfg.orchestrator?.enabled) {
             try {
-              const pool = new AgentPool(routableOrchestratorAgents(cfg));
+              // Trial counts come from the in-process scorecard, which is
+              // seeded from model_attributions — so a model that already has
+              // production history is graded immediately rather than
+              // re-trialled on every restart.
+              const pool = new AgentPool(routableOrchestratorAgents(cfg))
+                .withTrialSampleCounts((agent, trialStage) =>
+                  modelScorecard.sampleCount(trialStage, `${agent.provider}:${agent.model_id}`));
               let agent: import("./orchestration/agent-pool").OrchestratorAgent | undefined;
               // Honor the empty-completion cascade-advance exclude set: a model
               // that just returned an empty 200 (or hit a 2-strike rate limit)
