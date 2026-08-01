@@ -25,15 +25,23 @@ function arg(flag: string): string | undefined {
 
 const dbPath = arg("--db") ?? join(homedir(), ".openclaw", "jarvis", "self-tuning.db");
 const limit = Number(arg("--limit") ?? 500);
+// ISO timestamp. The point of a regression gate is comparing before/after a
+// fix, so scope the scan to runs recorded since one shipped:
+//   --since 2026-07-31T18:00:00Z
+const since = arg("--since");
 const asJson = process.argv.includes("--json");
 
 const db = new Database(dbPath, { readonly: true });
 
-const agentRuns = db
-  .query(
-    "SELECT id, task_type, outcome FROM agent_runs ORDER BY created_at DESC LIMIT ?",
-  )
-  .all(limit) as Array<{ id: string; task_type?: string; outcome?: string | null }>;
+const agentRuns = (since
+  ? db
+    .query(
+      "SELECT id, task_type, outcome FROM agent_runs WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?",
+    )
+    .all(since, limit)
+  : db
+    .query("SELECT id, task_type, outcome FROM agent_runs ORDER BY created_at DESC LIMIT ?")
+    .all(limit)) as Array<{ id: string; task_type?: string; outcome?: string | null }>;
 
 const stageStmt = db.query(
   "SELECT * FROM stage_runs WHERE agent_run_id = ? ORDER BY created_at",
