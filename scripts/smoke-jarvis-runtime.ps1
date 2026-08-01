@@ -213,7 +213,9 @@ if ($CompletionIntegritySmoke) {
 ### B1 — Later work
 "@ | Set-Content -LiteralPath $planPath -Encoding utf8
 
-        $maxTurns = 4
+        # Four child items + plan-file expansion often need more than four
+        # model turns when intermediate work correctly stays partial.
+        $maxTurns = 6
         $turnRecords = [System.Collections.Generic.List[object]]::new()
         $allEvents = [System.Collections.Generic.List[object]]::new()
         $started = Get-Date
