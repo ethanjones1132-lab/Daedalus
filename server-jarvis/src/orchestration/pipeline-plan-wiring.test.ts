@@ -8,7 +8,24 @@ import {
   createTaskRun,
   getActivePlanItem,
   getPlanItem,
+  markPlanItemVerified,
 } from "./task-run";
+import { evaluateTaskPlanAcceptance, buildTaskPlanGrounding } from "./task-plan-evidence";
+
+const GROUP_A_PLAN_MARKDOWN = `
+# Execution Plan
+## Group A
+### A1 — Add the bypass invariant
+- [ ] Implement the invariant
+### A2 — Replace volatility depth
+- [ ] Update the calculation
+### A3 — Add regression coverage
+- [ ] Run the focused suite
+### A4 — Verify the full group
+- [ ] Build and smoke
+## Group B
+### B1 — Later work
+`;
 
 /**
  * The TaskPlan ledger has exactly one correct home in pipeline.ts, and one
@@ -300,5 +317,190 @@ describe("pipeline reviewer ACCEPT requires grounded evidence", () => {
     expect(segment.partialStage?.errorCode).not.toBe("plan_item_acceptance_unmet");
     expect(segment.partialStage).toBeUndefined();
     expect(executorTurns).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe("pipeline expands explicit workspace plans on read_file", () => {
+  test("reading GROUP_A_EXECUTION.md expands broad active item; one A2 write cannot verify parent", async () => {
+    const runtime = createToolRuntime();
+    runtime.register(
+      {
+        type: "function",
+        function: {
+          name: "read_file",
+          description: "read",
+          parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+        },
+        requires_approval: false,
+        dangerous: false,
+      } as any,
+      async (args: { path?: string }) => {
+        if (String(args.path ?? "").includes("GROUP_A_EXECUTION")) {
+          return GROUP_A_PLAN_MARKDOWN;
+        }
+        return "file contents";
+      },
+    );
+    runtime.register(
+      {
+        type: "function",
+        function: {
+          name: "write_file",
+          description: "write",
+          parameters: {
+            type: "object",
+            properties: { path: { type: "string" }, content: { type: "string" } },
+            required: ["path", "content"],
+          },
+        },
+        requires_approval: false,
+        dangerous: false,
+      } as any,
+      async () => "File written",
+    );
+    const config = defaultConfig();
+    config.tools.require_approval = [];
+    const ctx = makeExecutionContext("agent", config, { workspace_path: process.cwd() });
+
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor") {
+        executorTurns++;
+        if (executorTurns === 1) {
+          return {
+            content: "Reading the Group A plan.",
+            tool_calls: [
+              {
+                id: "call_read_plan",
+                type: "function",
+                function: {
+                  name: "read_file",
+                  arguments: JSON.stringify({ path: "GROUP_A_EXECUTION.md" }),
+                },
+              },
+            ],
+          };
+        }
+        // Only A2 mutation — must not verify the whole Group A parent.
+        return {
+          content: "Implemented A2 volatility depth only.",
+          tool_calls: [
+            {
+              id: "call_write_a2",
+              type: "function",
+              function: {
+                name: "write_file",
+                arguments: JSON.stringify({
+                  path: "src/volatility_depth.ts",
+                  content: "export const depth = 2;\n",
+                }),
+              },
+            },
+          ],
+        };
+      }
+      if (options.stageLabel === "reviewer") {
+        return { content: "ACCEPT — A2 looks fine" };
+      }
+      if (options.stageLabel === "synthesizer") {
+        return { content: "Group A partially done (only A2 written)." };
+      }
+      return { content: "ok" };
+    };
+
+    let contract = createTaskRun({
+      taskRunId: "task_group_a_expand",
+      sessionId: "sess_group_a_expand",
+      objective: "Execute Group A from GROUP_A_EXECUTION.md",
+      requirement: "full_execution",
+      estimatedComplexity: "medium",
+      planItems: [
+        {
+          id: "pi_group_a",
+          title: "Execute Group A tasks",
+          acceptanceChecks: [
+            { id: "ac_group", description: "Group A complete", kind: "reviewer_pass" },
+          ],
+        },
+      ],
+    });
+    expect(getActivePlanItem(contract)?.id).toBe("pi_group_a");
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, {
+      recordStageRun: () => {},
+    });
+
+    await executor.executeSegment(
+      "Execute Group A from GROUP_A_EXECUTION.md",
+      ["executor", "reviewer", "synthesizer"],
+      "run_group_a_expand",
+      () => {},
+      {
+        executionProfile: "full",
+        rawMessage: "Execute Group A from GROUP_A_EXECUTION.md",
+        taskRunWriteIntent: true,
+        taskRunContract: contract,
+        maxReviewRepairRounds: 0,
+        allowMidRunReplan: false,
+        onTaskPlanUpdate: (next) => {
+          contract = next;
+        },
+      },
+    );
+
+    // After reading the plan, the broad parent is replaced by A1–A4.
+    expect(contract.plan?.items.map((item) => [item.id, item.status])).toEqual([
+      ["pi_a1", "active"],
+      ["pi_a2", "pending"],
+      ["pi_a3", "pending"],
+      ["pi_a4", "pending"],
+    ]);
+    expect(contract.status).toBe("active");
+    expect(getPlanItem(contract, "pi_group_a")).toBeUndefined();
+
+    // One A2-style mutation cannot verify A1 (still active) or the vanished parent.
+    const a1 = getPlanItem(contract, "pi_a1")!;
+    const a2WriteGrounding = buildTaskPlanGrounding({
+      writeIntent: true,
+      reviewerAccepted: true,
+      toolCalls: [
+        {
+          name: "write_file",
+          arguments: { path: "src/volatility_depth.ts" },
+          output: "File written",
+          is_error: false,
+          duration_ms: 1,
+        },
+      ],
+    });
+    expect(evaluateTaskPlanAcceptance(a1, a2WriteGrounding).accepted).toBe(false);
+
+    // Even forcing A2 verification still leaves the ledger open.
+    try {
+      contract = markPlanItemVerified(contract, "pi_a2", {
+        gradingMode: "conductor_direct_diff",
+        evidence: {
+          ref: "ev_a2_only",
+          grounding: {
+            requiredEffect: "write",
+            reviewerAccepted: false,
+            successfulWrites: ["src/volatility_depth.ts"],
+            successfulReads: [],
+            check: {
+              tier: "builtin",
+              ran: true,
+              passed: true,
+              command: "test",
+              detail: "ok",
+            },
+          },
+        },
+        advance: false,
+      });
+    } catch {
+      // A2 is pending (depends on A1); verification may reject — still open either way.
+    }
+    expect(contract.status).toBe("active");
+    expect(contract.plan?.items.some((item) => item.status !== "verified")).toBe(true);
   });
 });

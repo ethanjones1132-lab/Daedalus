@@ -147,6 +147,43 @@ describe("runtime-loop > plan authorship complexity gate", () => {
     expect(result.items[1].dependsOn).toEqual([result.items[0].id!]);
   });
 
+  test("conductorValidatePlanItems rejects a single broad plan item when brief names a workspace plan", () => {
+    const brief = buildConductorPlanBrief(
+      "Execute Group A from GROUP_A_EXECUTION.md",
+      "medium",
+    );
+    const result = conductorValidatePlanItems(
+      [{ title: "Execute Group A tasks from the plan" }],
+      brief,
+    );
+    expect(result.revised).toBe(true);
+    expect(result.notes).toMatch(/rejected single broad|awaiting plan-file/i);
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0].id).toBe("pi_plan_expand");
+    // Fail-closed checks: one A2-style mutation cannot verify this placeholder.
+    const kinds = (result.items[0].acceptanceChecks ?? []).map((c) =>
+      typeof c === "string" ? undefined : c.kind,
+    );
+    expect(kinds).toContain("diff_match");
+    expect(kinds).toContain("test_pass");
+  });
+
+  test("conductorValidatePlanItems still accepts multi-item proposals with a named plan", () => {
+    const brief = buildConductorPlanBrief(
+      "Execute Group A from GROUP_A_EXECUTION.md",
+      "medium",
+    );
+    const result = conductorValidatePlanItems(
+      [
+        { title: "A1 — Add the bypass invariant" },
+        { title: "A2 — Replace volatility depth" },
+      ],
+      brief,
+    );
+    expect(result.items).toHaveLength(2);
+    expect(result.items[0].title).toContain("A1");
+  });
+
   test("extractPlanItemsFromPlannerNarrative falls back to brief objective", () => {
     const items = extractPlanItemsFromPlannerNarrative(
       "We should carefully consider the design.",

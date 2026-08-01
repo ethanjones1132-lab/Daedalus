@@ -10,6 +10,7 @@ import {
   createTaskRun,
   deriveTaskStatusFromPlan,
   activePlanItemText,
+  expandActivePlanItem,
   getActivePlanItem,
   getPlanItem,
   hasEvidencePointer,
@@ -1242,6 +1243,101 @@ describe("task-run > TaskPlan status transitions", () => {
       evidence: groundedEvidence("ev"),
     })).toThrow(/not found/);
     expect(() => markPlanItemBlocked(run, "missing", "x")).toThrow(/not found/);
+  });
+
+  test("expandActivePlanItem replaces broad active item with A1–A4 and preserves verified predecessors", () => {
+    let run = makePlanRun([
+      { id: "pi_inspect", title: "Inspect workspace layout" },
+      { id: "pi_group_a", title: "Execute Group A", dependsOn: ["pi_inspect"] },
+      { id: "pi_group_b", title: "Execute Group B later", dependsOn: ["pi_group_a"] },
+    ]);
+    run = markPlanItemVerified(run, "pi_inspect", {
+      gradingMode: "conductor_direct_diff",
+      evidence: groundedEvidence("ev_inspect", "layout noted"),
+    });
+    expect(getActivePlanItem(run)?.id).toBe("pi_group_a");
+    expect(getPlanItem(run, "pi_inspect")?.status).toBe("verified");
+    expect(getPlanItem(run, "pi_inspect")?.evidence?.ref).toBe("ev_inspect");
+
+    const discovered = [
+      {
+        externalKey: "A1",
+        title: "Add the bypass invariant",
+        acceptanceChecks: [
+          { id: "ac_a1_diff", description: "A1 produced a verified workspace mutation", kind: "diff_match" as const },
+          { id: "ac_a1_check", description: "A1 passed an authoritative runtime/build check", kind: "test_pass" as const },
+        ],
+      },
+      {
+        externalKey: "A2",
+        title: "Replace volatility depth",
+        acceptanceChecks: [
+          { id: "ac_a2_diff", description: "A2 produced a verified workspace mutation", kind: "diff_match" as const },
+          { id: "ac_a2_check", description: "A2 passed an authoritative runtime/build check", kind: "test_pass" as const },
+        ],
+      },
+      {
+        externalKey: "A3",
+        title: "Add regression coverage",
+        acceptanceChecks: [
+          { id: "ac_a3_diff", description: "A3 produced a verified workspace mutation", kind: "diff_match" as const },
+          { id: "ac_a3_check", description: "A3 passed an authoritative runtime/build check", kind: "test_pass" as const },
+        ],
+      },
+      {
+        externalKey: "A4",
+        title: "Verify the full group",
+        acceptanceChecks: [
+          { id: "ac_a4_diff", description: "A4 produced a verified workspace mutation", kind: "diff_match" as const },
+          { id: "ac_a4_check", description: "A4 passed an authoritative runtime/build check", kind: "test_pass" as const },
+        ],
+      },
+    ];
+
+    run = expandActivePlanItem(run, "pi_group_a", discovered, {
+      sourcePath: "GROUP_A_EXECUTION.md",
+    });
+
+    expect(getPlanItem(run, "pi_inspect")?.status).toBe("verified");
+    expect(getPlanItem(run, "pi_inspect")?.evidence?.ref).toBe("ev_inspect");
+    expect(getPlanItem(run, "pi_group_a")).toBeUndefined();
+
+    const items = run.plan!.items;
+    expect(items.map((item) => [item.id, item.status])).toEqual([
+      ["pi_inspect", "verified"],
+      ["pi_a1", "active"],
+      ["pi_a2", "pending"],
+      ["pi_a3", "pending"],
+      ["pi_a4", "pending"],
+      ["pi_group_b", "pending"],
+    ]);
+    expect(run.plan?.activeItemId).toBe("pi_a1");
+    expect(getPlanItem(run, "pi_a1")?.dependsOn).toEqual(["pi_inspect"]);
+    expect(getPlanItem(run, "pi_a2")?.dependsOn).toEqual(["pi_a1"]);
+    expect(getPlanItem(run, "pi_a3")?.dependsOn).toEqual(["pi_a2"]);
+    expect(getPlanItem(run, "pi_a4")?.dependsOn).toEqual(["pi_a3"]);
+    // Downstream deps redirect from parent id to final child id.
+    expect(getPlanItem(run, "pi_group_b")?.dependsOn).toEqual(["pi_a4"]);
+    expect(getPlanItem(run, "pi_a1")?.description).toContain("GROUP_A_EXECUTION.md");
+    expect(run.status).toBe("active");
+  });
+
+  test("expandActivePlanItem requires active target and at least two children", () => {
+    const run = makePlanRun([
+      { id: "pi_broad", title: "Execute Group A" },
+      { id: "pi_later", title: "Later" },
+    ]);
+    expect(() =>
+      expandActivePlanItem(run, "pi_later", [
+        { externalKey: "A1", title: "One", acceptanceChecks: [] },
+        { externalKey: "A2", title: "Two", acceptanceChecks: [] },
+      ]),
+    ).toThrow(/active/);
+    expect(() =>
+      expandActivePlanItem(run, "pi_broad", [
+        { externalKey: "A1", title: "Only one", acceptanceChecks: [] },
+      ]),
+    ).toThrow(/at least two/);
   });
 });
 

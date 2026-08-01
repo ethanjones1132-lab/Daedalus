@@ -751,6 +751,100 @@ export function setPlanItemEvidence(
   }));
 }
 
+/**
+ * Child shape accepted by {@link expandActivePlanItem}. Mirrors discovery output
+ * without importing the discovery module (keeps task-run free of parse concerns).
+ */
+export interface ExpandablePlanChild {
+  externalKey: string;
+  title: string;
+  description?: string;
+  acceptanceChecks?: Array<string | TaskPlanAcceptanceCheck>;
+}
+
+/**
+ * Replace one active broad plan item with durable children discovered from an
+ * explicit workspace plan document.
+ *
+ * Pure mutation rules:
+ * 1. Target must be `active`.
+ * 2. At least two discovered children.
+ * 3. Replace only that active item at the same list position.
+ * 4. First child inherits parent deps; later children chain in order.
+ * 5. Redirect downstream deps from the parent ID to the final child ID.
+ * 6. Activate the first child.
+ * 7. Preserve verified/blocked siblings and their evidence.
+ * 8. Store the source path in each child description when provided.
+ */
+export function expandActivePlanItem(
+  contract: TaskRunContract,
+  activeItemId: string,
+  discovered: ExpandablePlanChild[],
+  opts: { sourcePath?: string } = {},
+): TaskRunContract {
+  const plan = requirePlan(contract);
+  const index = plan.items.findIndex((item) => item.id === activeItemId);
+  if (index < 0) {
+    throw new Error(`expandActivePlanItem: plan item not found: ${activeItemId}`);
+  }
+  const parent = plan.items[index];
+  if (parent.status !== "active") {
+    throw new Error(`expandActivePlanItem: target must be active: ${activeItemId}`);
+  }
+  if (discovered.length < 2) {
+    throw new Error("expandActivePlanItem: requires at least two discovered children");
+  }
+
+  const now = nowIso();
+  const sourcePath = opts.sourcePath?.trim();
+  const children: TaskPlanItem[] = discovered.map((child, i) => {
+    const externalKey = child.externalKey.trim().toUpperCase();
+    const id = `pi_${externalKey.toLowerCase()}`;
+    const title = child.title.trim();
+    if (!title) {
+      throw new Error(`expandActivePlanItem: child ${externalKey} has empty title`);
+    }
+    const sourceNote = sourcePath
+      ? `Source: ${sourcePath} (${externalKey})`
+      : undefined;
+    const description = [child.description?.trim(), sourceNote]
+      .filter(Boolean)
+      .join("\n") || undefined;
+    const dependsOn =
+      i === 0
+        ? [...parent.dependsOn]
+        : [`pi_${discovered[i - 1].externalKey.trim().toLowerCase()}`];
+    return {
+      id,
+      title,
+      ...(description ? { description } : {}),
+      dependsOn,
+      acceptanceChecks: normalizeAcceptanceChecks(child.acceptanceChecks),
+      status: (i === 0 ? "active" : "pending") as TaskPlanItemStatus,
+      repairCycleCount: 0,
+      updatedAt: now,
+    };
+  });
+
+  const finalChildId = children[children.length - 1].id;
+  const before = plan.items.slice(0, index);
+  const after = plan.items.slice(index + 1).map((item) => {
+    if (!item.dependsOn.includes(activeItemId)) return item;
+    return {
+      ...item,
+      dependsOn: item.dependsOn.map((dep) => (dep === activeItemId ? finalChildId : dep)),
+      updatedAt: now,
+    };
+  });
+
+  const items = [...before, ...children, ...after];
+  return withUpdatedPlan(
+    contract,
+    { items, activeItemId: children[0].id },
+    now,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Legacy read path
 // ---------------------------------------------------------------------------

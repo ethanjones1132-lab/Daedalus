@@ -65,6 +65,7 @@ import { join, posix, win32 } from "path";
 import { canApplyConductorReroute, rejectReroute } from "./reroute-policy";
 import {
   activePlanItemText,
+  expandActivePlanItem,
   getActivePlanItem,
   incrementPlanItemRepairCycle,
   markPlanItemBlocked,
@@ -86,6 +87,11 @@ import {
   buildTaskPlanGrounding,
   evaluateTaskPlanAcceptance,
 } from "./task-plan-evidence";
+import {
+  discoverPlanItems,
+  isPlanDocumentPath,
+  requestedPlanGroupFromMessage,
+} from "./task-plan-discovery";
 import { normalizePathInput, resolveAllowedRoots } from "../fs-scope";
 import {
   ClaudeDelegateAvailabilityCache,
@@ -1174,6 +1180,50 @@ export class PipelineExecutor {
   }
 
   /**
+   * After a successful read of an explicit plan/execution document, expand the
+   * active broad TaskPlan item into durable children (A1–A4, …). No-op when
+   * the path is not plan-like, discovery finds fewer than two children, or the
+   * ledger has no active item.
+   */
+  private maybeExpandTaskPlanFromRead(
+    options: PipelineExecuteOptions,
+    path: string,
+    content: string,
+  ): void {
+    if (!options.taskRunContract || !isPlanDocumentPath(path)) return;
+    const active = getActivePlanItem(options.taskRunContract);
+    if (!active) return;
+
+    const requestedGroup = requestedPlanGroupFromMessage(
+      options.rawMessage ?? options.taskRunContract.objective ?? "",
+    );
+    const discovered = discoverPlanItems({
+      path,
+      content,
+      requestedGroup,
+    });
+    if (discovered.length < 2) return;
+
+    try {
+      const next = expandActivePlanItem(options.taskRunContract, active.id, discovered, {
+        sourcePath: path,
+      });
+      options.taskRunContract = next;
+      options.onTaskPlanUpdate?.(next);
+      this.conductor?.live.setPlanContext(next);
+      console.log(
+        `[Pipeline] expanded active plan item ${active.id} → ${discovered.map((d) => d.externalKey).join(", ")} ` +
+        `from ${path}`,
+      );
+    } catch (e) {
+      console.warn(
+        `[Pipeline] plan expansion skipped for ${path}: ` +
+        `${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+
+  /**
    * Dispatch a turn's tool calls with read-parallelism (Task 3.1): read-only
    * batches run concurrently via Promise.all; writes stay serial barriers in
    * model order. `record` is invoked once per call in the original batch
@@ -1252,6 +1302,18 @@ export class PipelineExecutor {
           result.is_error,
           toolResultModelText(result).slice(0, 500),
         );
+        // Task 3: expand broad active items from explicit workspace plan reads.
+        if (
+          !result.is_error &&
+          entry.call.name === "read_file" &&
+          typeof entry.call.arguments?.path === "string"
+        ) {
+          this.maybeExpandTaskPlanFromRead(
+            options,
+            entry.call.arguments.path,
+            toolResultModelText(result),
+          );
+        }
         await record(entry.raw, entry.call, result);
       }
       if (readOnlyOutputCache && settled.some(({ entry, deflected }) => !deflected && cacheInvalidatingTools.has(entry.call.name))) {
@@ -1994,6 +2056,19 @@ export class PipelineExecutor {
               record.is_error,
               (record.output || "").slice(0, 500),
             );
+            // Same TaskPlan expansion as native dispatchToolCalls — one ledger
+            // for delegate and native execution.
+            if (
+              !record.is_error &&
+              record.name === "read_file" &&
+              typeof record.arguments?.path === "string"
+            ) {
+              this.maybeExpandTaskPlanFromRead(
+                options,
+                record.arguments.path,
+                record.output || "",
+              );
+            }
             const midLoop = await runMidLoopCheckpoint(
               [...priorToolCalls, ...delegateStreamCalls],
               delegateStreamCalls.length,
@@ -4192,6 +4267,12 @@ export class PipelineExecutor {
         state.executor = await this.runExecutorStage(
           request, renderPlanSummary(state.plan), agentRunId, onStateChange, executorOptions, profile, remainingNow(),
         );
+        // Plan expansion (and other in-executor ledger mutations) write to the
+        // shallow-copied executorOptions; mirror them onto segment opts so
+        // reviewer / acceptance paths see the expanded children.
+        if (executorOptions.taskRunContract) {
+          opts.taskRunContract = executorOptions.taskRunContract;
+        }
         // P2.3: a high-complexity CHANGE gets one alternate strong executor
         // only when deterministic verification says candidate one failed.
         // The retry starts from the current workspace, carries no stale model
