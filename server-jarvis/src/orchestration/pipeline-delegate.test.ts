@@ -1118,6 +1118,16 @@ describe("executor delegate pipeline integration", () => {
   });
 
   test("delegate_first mid-loop defers force_write during exploration so the write can land", async () => {
+    // Wall-clock budget: this test exercises the full delegate mid-loop deferral
+    // path (45s exploration limit, two read_file calls, mid-loop force_write
+    // directive, deferred-but-still-applied write) and consistently runs >5s
+    // under full-suite load (observed 5016ms on a clean rerun while the 2467
+    // sibling tests share the worker). The behavior under test is orthogonal
+    // to wall-clock precision, so the 5s default budget is measuring the wrong
+    // thing. 15_000ms follows the established pin pattern (claude-delegate
+    // 2026-07-20 4pm, mcp-tools 2026-07-20 overnight, pipeline-telemetry
+    // 2026-07-27 1pm/4pm, persistent-conductor 2026-07-21 4pm, session-authority
+    // 2026-07-19 1pm, SkillsView 2026-07-21 4pm).
     const config = delegateTestConfig();
     config.jarvis_path = process.cwd();
     config.claude_cli.delegate.policy = "delegate_first";
@@ -1261,7 +1271,7 @@ describe("executor delegate pipeline integration", () => {
       name: "write_file",
       is_error: false,
     }));
-  });
+  }, 15_000);
 
   test("delegate_first mid-loop hands off after exploration deadline", async () => {
     const config = delegateTestConfig();
