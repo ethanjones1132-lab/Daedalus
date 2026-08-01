@@ -754,7 +754,7 @@ describe("task-run > reconcileTaskRunStatus", () => {
     ).toBe("completed");
   });
 
-  test("all items verified: turn paused still yields completed (ledger authority)", () => {
+  test("all items verified: turn paused keeps paused (incomplete-prose backstop)", () => {
     let run = createTaskRun({
       ...BASE_INPUT,
       planItems: withDiffChecks([{ id: "i1", title: "Done" }]),
@@ -763,12 +763,14 @@ describe("task-run > reconcileTaskRunStatus", () => {
       gradingMode: "reviewer_mediated",
       evidence: groundedEvidence("ev"),
     });
+    // Incomplete synthesizer prose must not become success just because the
+    // ledger claims every item is verified (broad-item / false-verify cases).
     expect(
       reconcileTaskRunStatus({
         contract: run,
         turnAcceptanceStatus: "paused",
       }),
-    ).toBe("completed");
+    ).toBe("paused");
   });
 
   test("blocked item: plan paused beats turn completed", () => {

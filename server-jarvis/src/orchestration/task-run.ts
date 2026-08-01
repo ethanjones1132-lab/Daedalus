@@ -505,7 +505,12 @@ export function reconcileTaskRunStatus(input: {
     return "paused";
   }
 
-  // All items verified → overall completed (turn failed already returned above).
+  // Turn-level incomplete/partial prose is a hard backstop even when the
+  // ledger claims every item is verified (e.g. one mutation wrongly verified
+  // a broad parent). Never promote that to completed.
+  if (turn === "paused") return "paused";
+
+  // All items verified and turn accepted → overall completed.
   return "completed";
 }
 
