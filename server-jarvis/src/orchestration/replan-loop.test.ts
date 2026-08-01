@@ -508,10 +508,10 @@ describe("runPipelineWithReplanning", () => {
 
     expect(coordinatorCalls).toBe(1);
     // "migrate the users table" carries write intent, and this fixture model
-    // only ever answers prose — so the executor stage presses its bounded
-    // write-effect nudge three times before accepting the prose ending:
-    // 4 executor model calls for the single executor stage entry.
-    expect(stageLabels).toEqual(["executor", "executor", "executor", "executor", "rewriter", "reviewer", "synthesizer"]);
+    // only ever answers prose. Task 6 bounds pure-prose write turns to one
+    // strong-model retry (2 executor model calls) then continues into the
+    // auto-rewriter / replan remainder.
+    expect(stageLabels).toEqual(["executor", "executor", "rewriter", "reviewer", "synthesizer"]);
     expect(stateEvents).toContain("conductor_replan:running");
     expect(stateEvents).toContain("conductor_replan:done");
     // Deliberate effect-gate inversion: this full-execution fixture never
@@ -552,20 +552,17 @@ describe("runPipelineWithReplanning", () => {
     expect(coordinatorCalls).toBe(1); // exactly one replan invocation, then budget exhausted
     // The executor STAGE legitimately runs twice here: once in the pre-budget
     // segment, and again in the final segment, because the coordinator's LAST
-    // decision (returned just before the budget ran out) still explicitly
-    // lists "executor" — and an explicit request in the model's own decision
-    // always wins over "already completed", even across the budget-exhaustion
-    // boundary. Each stage entry additionally makes 4 model calls (initial +
-    // 3 bounded write-effect nudges) because this write-intent
-    // fixture only ever answers prose.
+    // decision still lists "executor". Each stage entry is bounded to 2 pure-
+    // prose model calls (Task 6: one strong retry, then stop).
     expect(stageLabels).toEqual([
-      "executor", "executor", "executor", "executor",
+      "executor", "executor",
       "rewriter",
-      "executor", "executor", "executor", "executor",
+      "executor", "executor",
       "reviewer", "synthesizer",
     ]);
-    expect(result.outcome).toBe("failed");
-    expect(result.error_code).toBe("effect_gate_no_write_effect");
+    // Final segment re-runs executor prose → Task 6 typed no-tool partial.
+    expect(result.outcome).toBe("partial");
+    expect(result.error_code).toBe("executor_no_tool");
   });
 
   test("deliberately re-requested executor runs again even though carry already has its output", async () => {
@@ -607,17 +604,18 @@ describe("runPipelineWithReplanning", () => {
     });
 
     expect(coordinatorCalls).toBe(1);
-    // Two executor STAGE entries (original + deliberate re-run), each pressed
-    // by the bounded write-effect nudge into 4 model calls.
+    // Two executor STAGE entries (original + deliberate re-run), each bounded
+    // to 2 pure-prose model calls under Task 6.
     expect(stageLabels).toEqual([
-      "executor", "executor", "executor", "executor",
+      "executor", "executor",
       "rewriter",
-      "executor", "executor", "executor", "executor",
+      "executor", "executor",
       "reviewer", "synthesizer",
     ]);
-    expect(stageLabels.filter((s) => s === "executor")).toHaveLength(8);
-    expect(result.outcome).toBe("failed");
-    expect(result.error_code).toBe("effect_gate_no_write_effect");
+    expect(stageLabels.filter((s) => s === "executor")).toHaveLength(4);
+    // Deliberate executor re-run ends pure-prose → Task 6 typed no-tool partial.
+    expect(result.outcome).toBe("partial");
+    expect(result.error_code).toBe("executor_no_tool");
   });
 
   test("evidence-insufficient replan forces executor even when revised route is synthesizer-only", async () => {
@@ -821,8 +819,10 @@ describe("runPipelineWithReplanning", () => {
 
     expect(stageLabels).toContain("synthesizer");
     expect(result.answer).toBe("output for synthesizer");
-    expect(result.outcome).toBe("failed");
-    expect(result.error_code).toBe("effect_gate_no_write_effect");
+    // Same-segment pure-prose executor is typed executor_no_tool (Task 6)
+    // rather than the older effect_gate_no_write_effect terminal.
+    expect(result.outcome).toBe("partial");
+    expect(result.error_code).toBe("executor_no_tool");
   });
 });
 
@@ -912,9 +912,9 @@ describe("runPipelineWithReplanning — B-04 session cap + telemetry", () => {
     });
 
     expect(counter.used("b04-s2")).toBe(2);
-    expect(result.outcome).toBe("failed");
-    // A real missing-effect failure outranks the softer session-cap tag.
-    expect(result.error_code).toBe("effect_gate_no_write_effect");
+    // Write-intent pure-prose fixtures now terminate as Task 6 no-tool partial.
+    expect(result.outcome).toBe("partial");
+    expect(result.error_code).toBe("executor_no_tool");
   });
 
   test("B-04: per-turn cap is preserved when session cap is generous (binding constraint = per_turn)", async () => {
@@ -946,8 +946,8 @@ describe("runPipelineWithReplanning — B-04 session cap + telemetry", () => {
     });
 
     expect(counter.used("b04-s3")).toBe(1);
-    expect(result.outcome).toBe("failed");
-    expect(result.error_code).toBe("effect_gate_no_write_effect");
+    expect(result.outcome).toBe("partial");
+    expect(result.error_code).toBe("executor_no_tool");
   });
 
   test("B-04: clearSession resets the counter so a fresh session can replan again", async () => {

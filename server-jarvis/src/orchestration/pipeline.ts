@@ -3422,8 +3422,12 @@ export class PipelineExecutor {
           remainingQueue,
           executorEvidence(),
         );
+        // ok stays true so the segment is not treated as an upstream hard
+        // failure: the typed partial errorCode + partialStage carry the
+        // no-tool signal, and the effect gate remains free to fail a
+        // zero-write write-intent run as effect_gate_no_write_effect.
         return {
-          ok: false,
+          ok: true,
           narrative: partialNarrative,
           toolCalls,
           terminalStatus: "partial",
@@ -4651,16 +4655,18 @@ export class PipelineExecutor {
           return finish({ state, effectGate, partialStage });
         }
         if (state.executor.errorCode === "executor_no_tool") {
-          return finish({
-            state,
-            partialStage: { stage: "executor", errorCode: "executor_no_tool" },
-          });
+          // Bound no-tool spend ends the executor stage, but remaining
+          // stages (reviewer/rewriter/synthesizer) still run so repair
+          // paths and honest effect-gating can finish the turn.
+          partialStage = { stage: "executor", errorCode: "executor_no_tool" };
+          continue;
         }
         // T2.4: hard executor failure (non-workspace_read) → replan pre-synthesizer.
         // workspace_read falls through to the evidence fence for precise codes.
         if (
           state.executor &&
           state.executor.ok === false &&
+          state.executor.errorCode !== "executor_no_tool" &&
           wantsSynthesizer &&
           options.allowMidRunReplan !== false &&
           !requiresWorkspaceEvidence
@@ -5233,6 +5239,9 @@ export class PipelineExecutor {
         contentEffects: this.ctx.write_effects,
       }),
     ));
+    // Task 6: sticky no-tool partial outranks a soft degraded effect-gate
+    // result so the typed executor_no_tool code remains visible. A hard
+    // failed effect-gate (terminal repeated write failures) stays failed.
     if (segment.partialStage && outcome !== "failed") {
       outcome = "partial";
       errorCode = segment.partialStage.errorCode;
