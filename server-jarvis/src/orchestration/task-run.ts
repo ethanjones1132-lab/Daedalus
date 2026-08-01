@@ -186,8 +186,13 @@ export function terminalSubtypeForRunOutcome(
 // workspace. Match the honesty vocabulary broadly: a false "paused" merely
 // keeps continuation stickiness armed (cheap), a false "completed" strands
 // the task (expensive).
+// Also match multi-word incomplete phrases that span "not yet been X" /
+// "not yet complete" / "not yet been started" — synthesizer honesty often
+// uses those forms ("Group A has not yet been completed") which the
+// single-token `not (?:yet )?completed` arm alone does not cover when
+// "been" or "complete" (adj) intervenes.
 const INCOMPLETE_PROGRESS_PATTERN =
-  /\b(?:incomplete|unfinished|cut short|partial(?:ly)?|could not be (?:confirmed|completed|applied|written|verified)|not (?:yet )?(?:applied|completed|confirmed|written)|was not (?:applied|modified|updated|written)|remains? (?:unchanged|unmodified|unapplied|to be)|more (?:files|work|evidence)|still (?:need|needs|needed|remains?|pending)|not enough evidence|could not gather|unable to complete|remaining work)\b/i;
+  /\b(?:incomplete|unfinished|cut short|partial(?:ly)?|could not be (?:confirmed|completed|applied|written|verified)|not (?:yet )?(?:been )?(?:applied|completed|confirmed|written|started)|not yet complete|was not (?:applied|modified|updated|written)|remains? (?:unchanged|unmodified|unapplied|to be)|more (?:files|work|evidence)|still (?:need|needs|needed|remains?|pending)|not enough evidence|could not gather|unable to complete|remaining work)\b/i;
 
 function newTaskRunId(): string {
   return `task_${crypto.randomUUID()}`;

@@ -152,6 +152,10 @@ import {
 } from "./orchestration/route-normalization";
 import { runPipelineWithReplanning } from "./orchestration/replan-loop";
 import { mapCheckToReward } from "./orchestration/verification-reward";
+import {
+  applyStricterOutcomeFloor,
+  decideCompletion,
+} from "./orchestration/completion-policy";
 import { buildBoundedHistoryBlock, HISTORY_BUDGET_TOKENS } from "./orchestration/context-budget";
 import { SessionReplanCounter } from "./orchestration/replan-telemetry";
 import { conductorLearning, outcomeCollector, selfTuningProposer, SelfTuningStore } from "./self-tuning/mod";
@@ -3422,16 +3426,20 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           turnAcceptanceStatus: taskAcceptance.status,
           forcePaused: repetitionVerdict.repeated,
         });
-        const runOutcome: "success" | "degraded" | "failed" | "partial" =
-          repetitionVerdict.repeated
-            ? "degraded"
-            : taskAcceptance.accepted
-              ? pipelineOutcome
-              : taskAcceptance.status === "paused"
-                ? "partial"
-                : "failed";
-        // Task 5.3: verification-gated reward floor. When no check ran (disabled
-        // or tier none), outcomeFloor is null and runOutcome passes through.
+        // Single fail-closed completion decision: TaskPlan openness, sticky
+        // write intent, repetition, and verification gate must all agree
+        // before a write run can persist as completed/success.
+        const writeIntent = latestTaskRun.writeIntent === true;
+        const decision = decideCompletion({
+          pipelineOutcome,
+          reconciledStatus,
+          writeIntent,
+          repeated: repetitionVerdict.repeated,
+          checkResult: result.checkResult,
+        });
+        // Task 5.3: verification-gated reward floor. Apply only when the floor
+        // is *stricter* than decideCompletion — never promote partial
+        // (write_unverified / open plan / pipeline_partial) to success.
         const reward = result.checkResult
           ? mapCheckToReward(
               result.checkResult,
@@ -3444,10 +3452,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               result.reviewerAccepted === true,
             )
           : null;
-        const verifiedRunOutcome =
-          reward?.outcomeFloor != null ? reward.outcomeFloor : runOutcome;
+        const verifiedRunOutcome = applyStricterOutcomeFloor(
+          decision.runOutcome,
+          reward?.outcomeFloor,
+        );
         sessionMemory.updateTaskRun(sessionId, {
-          status: reconciledStatus,
+          status: decision.taskStatus,
           evidenceCount,
           lastOutcome: verifiedRunOutcome,
           lastTurnId: agentRunId,
@@ -3462,6 +3472,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           errorCode: result.error_code,
           error: result.error,
           answer: trimmedAnswer,
+          completion_reason: decision.reason,
         });
         outcomeCollector.completeAgentRun(
           agentRunId,

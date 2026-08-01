@@ -483,6 +483,22 @@ describe("task-run > assessTaskRunAcceptance", () => {
     expect(r.reason).toBe("answer_declares_incomplete_progress");
   });
 
+  for (const answer of [
+    "Group A has not yet been completed.",
+    "The implementation is not yet complete.",
+    "A1, A3, and A4 have not yet been started.",
+  ]) {
+    test(`incomplete answer pauses: ${answer}`, () => {
+      expect(assessTaskRunAcceptance({
+        requirement: "full_execution",
+        depth: "standard",
+        pipelineOutcome: "success",
+        answer,
+        evidenceCount: 3,
+      }).status).toBe("paused");
+    });
+  }
+
   test("INCOMPLETE_PROGRESS_PATTERN: each phrase in the regex fires the pause", () => {
     // Pin every phrase in the regex literal so a future edit that drops one
     // (e.g. 'unable to complete' is silently lost) is caught here.

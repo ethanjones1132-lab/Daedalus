@@ -475,11 +475,14 @@ export class SessionMemory {
     errorCode?: string;
     error?: string;
     answer?: string;
+    /** Machine-readable decideCompletion reason for replay / diagnostics. */
+    completion_reason?: string;
   }): void {
     if (!this.config().enabled) return;
     const session = this.getSession(sessionId);
     const summary = [
       `outcome=${args.outcome}`,
+      args.completion_reason ? `completion_reason=${args.completion_reason}` : "",
       args.errorCode ? `code=${args.errorCode}` : "",
       args.error ? `error=${truncateSnippet(args.error, 300)}` : "",
     ].filter(Boolean).join("; ");
