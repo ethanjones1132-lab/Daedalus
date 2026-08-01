@@ -300,6 +300,52 @@ describe("turn budgets", () => {
     expect(budget.canStart("reviewer", 100_000)).toBe(true);
   });
 
+  // 2026-07-31, from the conductor replay harness over 500 stored runs: 46
+  // stage runs died on their own deadline between 07-16 and 07-31, producing
+  // nothing at all — reviewer 22, planner 15, executor 7, rewriter 2. Roughly
+  // half got a SQUEEZED window: `canStart` only required
+  // `stageRemainingMs > 0`, so a reviewer could be admitted with two seconds
+  // left, burn them, and return nothing. Measured p50 duration of SUCCESSFUL
+  // stages (self-tuning.db): reviewer 9.7s (n=458), planner 9.0s p75
+  // (n=1249), executor 3.1s (n=3112), rewriter 5.6s (n=163). Admitting a
+  // stage below that is a losing bet paid in full before it fails.
+  describe("minimum viable stage window", () => {
+    test("a reviewer with only seconds left is not admitted", () => {
+      const budget = createTurnBudget("full_execution", "high", 0);
+      // Consume all but 3s of the reviewer window.
+      budget.beginStage("reviewer", 0);
+      budget.endStage("reviewer", 57_000);
+      expect(budget.stageRemainingMs("reviewer", 57_000)).toBe(3_000);
+      expect(budget.canStart("reviewer", 57_000)).toBe(false);
+    });
+
+    test("a reviewer with a full window is admitted", () => {
+      const budget = createTurnBudget("full_execution", "high", 0);
+      expect(budget.canStart("reviewer", 0)).toBe(true);
+    });
+
+    test("a stage with no configured budget is unaffected", () => {
+      const budget = createTurnBudget("full_execution", "high", 0);
+      // synthesizer has no stage_ms entry — it is bounded by the turn only.
+      expect(budget.canStart("synthesizer", 0)).toBe(true);
+    });
+
+    test("the turn-level finalization reserve still takes precedence", () => {
+      const budget = createTurnBudget("full_execution", "high", 0);
+      // Well past any turn deadline: the reserve check must reject before the
+      // per-stage window is even consulted.
+      expect(budget.canStart("reviewer", 1_000_000)).toBe(false);
+    });
+
+    test("the floor never exceeds a stage's own configured budget", () => {
+      // A stage whose entire budget is smaller than the generic floor must
+      // still be startable at full budget, or it could never run at all.
+      const budget = createTurnBudget("answer_only", "medium", 0);
+      expect(budget.stageRemainingMs("planner", 0)).toBe(15_000);
+      expect(budget.canStart("planner", 0)).toBe(true);
+    });
+  });
+
   test("stageStreamDeadlineAt is now+remaining and bounded by turn deadline", () => {
     const budget = createTurnBudget("conversational", "medium", 0);
     budget.beginStage("coordinator", 0);

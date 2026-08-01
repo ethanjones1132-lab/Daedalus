@@ -53,6 +53,42 @@ export interface TurnBudget {
 /** T1.3: never hard-chop a streaming synthesizer at the turn deadline. */
 export const FINAL_STREAM_GRACE_MS = 30_000;
 
+/**
+ * Smallest window in which a stage can plausibly finish. Below this it is a
+ * losing bet: the stage consumes whatever remains and returns nothing, which
+ * is strictly worse than not starting it — `canStart` returning false raises
+ * `StageBudgetExhaustedError`, which callers already handle by moving on.
+ *
+ * 2026-07-31, conductor replay over 500 stored runs: 46 stage runs died on
+ * their own deadline between 07-16 and 07-31 (reviewer 22, planner 15,
+ * executor 7, rewriter 2), producing nothing. About half had a SQUEEZED
+ * window — `canStart` previously required only `stageRemainingMs > 0`.
+ *
+ * Floors are set below the measured p50 duration of SUCCESSFUL runs of each
+ * stage (self-tuning.db), so a stage is only refused when the odds are
+ * genuinely against it, never merely because it would be slower than typical:
+ *   reviewer  p50  9.7s  (n=458)   -> 8s
+ *   planner   p75  9.0s  (n=1249)  -> 6s
+ *   executor  p50  3.1s  (n=3112)  -> 5s
+ *   rewriter  p50  5.6s  (n=163)   -> 5s
+ *   coordinator p50 3.2s (n=498)   -> 5s (default)
+ */
+export const MIN_VIABLE_STAGE_MS: Readonly<Record<string, number>> = {
+  reviewer: 8_000,
+  planner: 6_000,
+};
+
+const DEFAULT_MIN_VIABLE_STAGE_MS = 5_000;
+
+/**
+ * The floor never exceeds the stage's own configured budget — otherwise a
+ * stage whose whole allowance is smaller than the floor could never run.
+ */
+function minViableStageMs(stage: string, configuredStageMs: number): number {
+  const floor = MIN_VIABLE_STAGE_MS[stage] ?? DEFAULT_MIN_VIABLE_STAGE_MS;
+  return Math.min(floor, configuredStageMs);
+}
+
 const PROGRESS_EXTENSION_MS = 20_000;      // per evidence-producing stage turn
 const STAGE_EXTENSION_CEILING_MS = 90_000; // a stage may never exceed this (unforced)
 const ABSOLUTE_TURN_CAP_MS = 180_000;      // default high-complexity full_execution cap
@@ -234,7 +270,13 @@ export function createTurnBudget(
     },
     canStart(stage, now = Date.now()) {
       if (this.remainingMs(now) <= this.finalization_reserve_ms) return false;
-      return this.stage_ms[stage] === undefined || this.stageRemainingMs(stage, now) > 0;
+      const stageBudget = this.stage_ms[stage];
+      if (stageBudget === undefined) return true;
+      // A stage admitted with a sliver of window left burns the sliver and
+      // returns nothing — strictly worse than skipping it, because the caller
+      // handles StageBudgetExhaustedError by moving on. The old `> 0` test
+      // admitted a reviewer with two seconds left. See MIN_VIABLE_STAGE_MS.
+      return this.stageRemainingMs(stage, now) >= minViableStageMs(stage, stageBudget);
     },
     beginStage(stage, now = Date.now()) {
       // Only for budgeted stages; synthesizer has no stage_ms entry.
