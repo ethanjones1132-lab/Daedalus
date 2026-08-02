@@ -1767,6 +1767,45 @@ describe("Claude executor delegate", () => {
     expect(resultErrorExit0.narrative).not.toMatch(/exited without emitting stream events/i);
   });
 
+  test("CLI failure narrative scrubs credential-bearing detail", async () => {
+    const config = testConfig();
+    const snapshot: DelegateRootSnapshot = {
+      root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
+    };
+    const secretKey = "sk-abcdefghijklmnopqrstuvwx";
+    const secretEnv = "sk-ant-secret-value-here";
+    const result = await runClaudeDelegate({
+      config,
+      prompt: "change it",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 30_000,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      snapshotFactory: { capture: async () => [snapshot] },
+      health: new DelegateHealth(),
+      processFactory: async () => ({
+        events: (async function* () {
+          yield {
+            type: "result",
+            subtype: "error_during_execution",
+            is_error: true,
+            result: `auth failed with key ${secretKey} and ANTHROPIC_API_KEY=${secretEnv}`,
+          };
+        })(),
+        exit: Promise.resolve({ code: 1, signal: null }),
+        kill: () => {},
+      }),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.errorCode).toBe("delegate_cli_error");
+    expect(result.narrative).toMatch(/error_during_execution|auth failed/i);
+    expect(result.narrative).not.toContain(secretKey);
+    expect(result.narrative).not.toContain(secretEnv);
+    expect(result.narrative).toContain("[REDACTED]");
+  });
+
   test("sanitizeDelegateDiagnosticText scrubs API keys, env forms, and JSON fields", () => {
     // OpenAI / Anthropic style bare keys (sk-… / sk-ant-…)
     const openai = "error: invalid key sk-abcdefghijklmnopqrstuvwx near end";

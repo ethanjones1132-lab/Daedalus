@@ -1480,9 +1480,10 @@ describe("pipeline stage telemetry", () => {
     const runtime = createToolRuntime();
     runtime.register(toolDefinition("write_file"), async () => "written");
     const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    const leakedKey = "sk-abcdefghijklmnopqrstuvwx";
     const prose =
       "I would write the file like this: ```ts\nexport const x = 1\n``` " +
-      "but the completion hit the length cap mid-thought.";
+      `but the completion hit the length cap mid-thought with key ${leakedKey}.`;
     let executorCalls = 0;
     const callModel = async (_messages: unknown[], options: any = {}) => {
       if (options.stageLabel === "executor") {
@@ -1528,6 +1529,8 @@ describe("pipeline stage telemetry", () => {
       expect(row.diagnostic_json).toBeTruthy();
       const diag = JSON.parse(row.diagnostic_json!);
       expect(diag.content_prefix).toContain("export const x = 1");
+      expect(diag.content_prefix).not.toContain(leakedKey);
+      expect(diag.content_prefix).toContain("[REDACTED]");
       expect(diag.content_prefix.length).toBeLessThanOrEqual(2048);
       expect(diag.finish_reason).toBe("length");
       expect(diag.stop_reason).toBe("length");

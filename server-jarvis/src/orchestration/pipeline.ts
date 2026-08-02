@@ -107,6 +107,7 @@ import {
   nodeDelegateProcessFactory,
   nodeDelegateSnapshotFactory,
   runClaudeDelegate,
+  sanitizeDelegateDiagnosticText,
   type RunClaudeDelegateInput,
 } from "./claude-delegate";
 import {
@@ -3272,7 +3273,8 @@ export class PipelineExecutor {
                   _toolParseFailed?: true;
                 } | null | undefined;
                 return {
-                  content_prefix: String(resp?.content ?? "").slice(0, 2048),
+                  // Model prose may echo credential-bearing tokens; scrub before diagnostic_json.
+                  content_prefix: sanitizeDelegateDiagnosticText(String(resp?.content ?? "").slice(0, 2048)),
                   finish_reason: typeof resp?._finishReason === "string" ? resp._finishReason : null,
                   stop_reason: typeof resp?._stopReason === "string" ? resp._stopReason : null,
                   truncated: resp?._truncated === true,

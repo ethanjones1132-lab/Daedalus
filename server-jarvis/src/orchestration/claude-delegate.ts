@@ -1481,9 +1481,10 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
         : (text
           ? `${text}\nClaude delegate failed: ${cliFailureDetail}`
           : `Claude delegate failed: ${cliFailureDetail}`);
+      // CLI error detail/prose can echo credential-bearing tokens; scrub before stage narrative.
       return withDiagnostics({
         ok: false,
-        narrative: failureNarrative,
+        narrative: sanitizeDelegateDiagnosticText(failureNarrative),
         toolCalls: records,
         terminalStatus: "failed",
         errorCode: "delegate_cli_error",
