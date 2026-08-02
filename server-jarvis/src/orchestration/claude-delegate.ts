@@ -478,18 +478,29 @@ const SECRET_VALUE_PATTERNS: RegExp[] = [
   // Authorization: Bearer <token> / Authorization: <value>
   /\bauthorization\s*[:=]\s*bearer\s+\S+/gi,
   /\bauthorization\s*[:=]\s*\S+/gi,
-  // api-key / x-api-key headers and assignments
+  // api-key / x-api-key headers and assignments (header-style; not ENV_API_KEY)
   /\b(?:x-)?api-?key\s*[:=]\s*\S+/gi,
+  // ENV-style *_API_KEY=value (underscore names current \b api-key patterns miss)
+  /\b[A-Za-z_][A-Za-z0-9_]*API_KEY\s*=\s*\S+/gi,
   // token= / token: values (avoid bare "token" mid-prose without separator)
   /\btoken\s*[:=]\s*\S+/gi,
   // Standalone Bearer tokens
   /\bbearer\s+[A-Za-z0-9._\-+=\/]{8,}/gi,
+  // OpenAI / Anthropic style keys: sk-… / sk-ant-… (mirror training/shadow-router)
+  /\bsk-[A-Za-z0-9_-]{12,}/g,
+  // JSON-ish "api_key":"…" / "token":"…" / "x-api-key":"…"
+  /"(?:api[_-]?key|token|x-api-key)"\s*:\s*"[^"]*"/gi,
 ];
 
 export function sanitizeDelegateDiagnosticText(raw: string): string {
   let text = raw;
   for (const pattern of SECRET_VALUE_PATTERNS) {
     text = text.replace(pattern, (match) => {
+      // Bare OpenAI/Anthropic-style keys — replace the whole token.
+      if (/^sk-/i.test(match)) return "[REDACTED]";
+      // JSON object fields: preserve key, scrub value.
+      const jsonField = match.match(/^"([^"]+)"\s*:/);
+      if (jsonField) return `"${jsonField[1]}":"[REDACTED]"`;
       const sep = match.includes("=") ? "=" : match.includes(":") ? ":" : " ";
       const key = match.split(/[:=\s]/)[0] ?? "secret";
       return `${key}${sep}[REDACTED]`;
@@ -568,8 +579,10 @@ export const nodeDelegateProcessFactory: DelegateProcessFactory = async (launch)
   // Passive stdout accumulator (raw lines including non-JSON chatter).
   let stdoutRaw = "";
   const onStdoutLine = (rawLine: string) => {
-    stdoutRaw += `${rawLine}\n`;
     const keep = DELEGATE_STDERR_TAIL_CHARS * 2;
+    // Memory guard: a single oversized line never exceeds the keep buffer alone.
+    const line = rawLine.length > keep ? rawLine.slice(rawLine.length - keep) : rawLine;
+    stdoutRaw += `${line}\n`;
     if (stdoutRaw.length > keep) stdoutRaw = stdoutRaw.slice(stdoutRaw.length - keep);
   };
   const exit = new Promise<DelegateProcessExit>((resolveExit) => {

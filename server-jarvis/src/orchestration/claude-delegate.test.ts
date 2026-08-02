@@ -15,6 +15,7 @@ import {
   nodeDelegateProcessFactory,
   nodeDelegateSnapshotFactory,
   runClaudeDelegate,
+  sanitizeDelegateDiagnosticText,
   type DelegateRootSnapshot,
 } from "./claude-delegate";
 import {
@@ -1764,6 +1765,45 @@ describe("Claude executor delegate", () => {
     expect(resultErrorExit0.errorCode).toBe("delegate_cli_error");
     expect(resultErrorExit0.narrative).toMatch(/error_during_execution|execution failed mid-turn/i);
     expect(resultErrorExit0.narrative).not.toMatch(/exited without emitting stream events/i);
+  });
+
+  test("sanitizeDelegateDiagnosticText scrubs API keys, env forms, and JSON fields", () => {
+    // OpenAI / Anthropic style bare keys (sk-… / sk-ant-…)
+    const openai = "error: invalid key sk-abcdefghijklmnopqrstuvwx near end";
+    const openaiScrubbed = sanitizeDelegateDiagnosticText(openai);
+    expect(openaiScrubbed).not.toContain("sk-abcdefghijklmnopqrstuvwx");
+    expect(openaiScrubbed).toContain("[REDACTED]");
+
+    const anthropic = "auth failed sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUV";
+    const anthropicScrubbed = sanitizeDelegateDiagnosticText(anthropic);
+    expect(anthropicScrubbed).not.toContain("sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUV");
+    expect(anthropicScrubbed).toContain("[REDACTED]");
+
+    // ENV-style *_API_KEY=… (underscore names that header-style patterns miss)
+    const envLine =
+      "ANTHROPIC_API_KEY=sk-ant-secret-value-here OPENROUTER_API_KEY=or-secret-value";
+    const envScrubbed = sanitizeDelegateDiagnosticText(envLine);
+    expect(envScrubbed).not.toContain("sk-ant-secret-value-here");
+    expect(envScrubbed).not.toContain("or-secret-value");
+    expect(envScrubbed).toMatch(/ANTHROPIC_API_KEY=\[REDACTED\]/i);
+    expect(envScrubbed).toMatch(/OPENROUTER_API_KEY=\[REDACTED\]/i);
+
+    // JSON-ish stream-json / config shapes
+    const jsonish =
+      '{"type":"error","api_key":"sk-live-supersecret1234","token":"tok_secret_value","x-api-key":"hdr-secret"}';
+    const jsonScrubbed = sanitizeDelegateDiagnosticText(jsonish);
+    expect(jsonScrubbed).not.toContain("sk-live-supersecret1234");
+    expect(jsonScrubbed).not.toContain("tok_secret_value");
+    expect(jsonScrubbed).not.toContain("hdr-secret");
+    expect(jsonScrubbed).toContain('"api_key":"[REDACTED]"');
+    expect(jsonScrubbed).toContain('"token":"[REDACTED]"');
+    expect(jsonScrubbed).toContain('"x-api-key":"[REDACTED]"');
+    // Non-secret structure preserved
+    expect(jsonScrubbed).toContain('"type":"error"');
+
+    // Existing Authorization header path still works
+    const auth = "Authorization: Bearer secret-value";
+    expect(sanitizeDelegateDiagnosticText(auth)).not.toContain("secret-value");
   });
 
   test("process factory retains only a sanitized 4KiB stderr tail", async () => {
