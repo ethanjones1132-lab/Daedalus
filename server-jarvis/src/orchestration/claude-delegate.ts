@@ -223,6 +223,28 @@ export function mapClaudeDelegateToolName(name: string): string {
 }
 
 /**
+ * Canonicalize Claude CLI tool_input keys to native executor shapes so
+ * deflection identity (`toolCallIdentityKey`) and evidence accounting match.
+ * CLI Read emits `file_path`; native `read_file` uses `path`.
+ */
+export function canonicalizeDelegateToolArguments(
+  input: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(input)) {
+    const lower = key.toLowerCase();
+    let canonKey = key;
+    if (lower === "file_path" || lower === "filepath") canonKey = "path";
+    else if (lower === "directory_path") canonKey = "directory";
+    // Prefer first-seen when both aliases present.
+    if (canonKey in out) continue;
+    out[canonKey] = value;
+  }
+  return out;
+}
+
+/**
  * Whether a stock-Claude or MCP tool event is permitted for the delegate.
  * Stock tools use the root-confinable floor; Jarvis MCP tools are allowed when
  * they are not shell/Task-spawning escapes.
@@ -473,6 +495,29 @@ export interface DelegateProcess {
 
 /** Keep the newest 4 KiB of stderr and scrub credential-bearing tokens. */
 export const DELEGATE_STDERR_TAIL_CHARS = 4096;
+
+/**
+ * Header Claude CLI forwards via ANTHROPIC_CUSTOM_HEADERS so the long-lived
+ * Python proxy can correlate logs with stage_runs.diagnostic_json.
+ */
+export const DELEGATE_REQUEST_ID_HEADER = "X-Jarvis-Delegate-Request-Id";
+
+/**
+ * Stamp env with both the process-local request id (tests / diagnostics) and
+ * the Claude CLI custom header the proxy reads per HTTP request.
+ */
+export function withDelegateRequestCorrelation(
+  env: Record<string, string>,
+  requestId: string,
+): Record<string, string> {
+  const headerLine = `${DELEGATE_REQUEST_ID_HEADER}: ${requestId}`;
+  const existing = env.ANTHROPIC_CUSTOM_HEADERS?.trim();
+  return {
+    ...env,
+    JARVIS_DELEGATE_REQUEST_ID: requestId,
+    ANTHROPIC_CUSTOM_HEADERS: existing ? `${existing}\n${headerLine}` : headerLine,
+  };
+}
 
 const SECRET_VALUE_PATTERNS: RegExp[] = [
   // Authorization: Bearer <token> / Authorization: <value>
@@ -1193,6 +1238,9 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
     if (operation.state()) return terminalOutput(operation.state()!);
     const records: ToolCallRecord[] = [];
     // Correlate proxy/stderr logs with this stage_runs.diagnostic_json row.
+    // The proxy is long-lived, so process-env alone is always "missing" there.
+    // Claude CLI forwards ANTHROPIC_CUSTOM_HEADERS on every /v1/messages call;
+    // the proxy reads X-Jarvis-Delegate-Request-Id from that request.
     const delegateRequestId = crypto.randomUUID();
     let processDiagnostics: DelegateProcessDiagnostics | undefined;
     let delegatedProcess: DelegateProcess | undefined;
@@ -1218,10 +1266,7 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
     });
     const launchPromise = input.processFactory({
       ...invocation,
-      env: {
-        ...invocation.env,
-        JARVIS_DELEGATE_REQUEST_ID: delegateRequestId,
-      },
+      env: withDelegateRequestCorrelation(invocation.env, delegateRequestId),
       prompt: input.prompt,
       signal: operation.signal,
     });
@@ -1310,7 +1355,9 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
               );
               const record: ToolCallRecord = {
                 name: canonicalName,
-                arguments: event.tool_input ?? {},
+                arguments: canonicalizeDelegateToolArguments(
+                  (event.tool_input ?? {}) as Record<string, unknown>,
+                ),
                 output: permitted ? "" : "delegate_tool_not_permitted: tool is outside the root-confinable delegate set.",
                 is_error: !permitted,
                 ...(!permitted ? { error_code: "policy_denied" as const } : {}),

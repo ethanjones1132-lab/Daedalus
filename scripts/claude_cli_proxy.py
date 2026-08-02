@@ -18,11 +18,14 @@ proxy entirely and talk point-to-point from the Bun server (see claude-cli.ts).
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
 import ipaddress
+import re
 import signal
+import socket
 import time
 import urllib.request
 import urllib.error
@@ -30,7 +33,7 @@ import urllib.parse
 import sys
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Callable, Mapping
 
 LOG = logging.getLogger("jarvis.claude_cli_proxy")
 
@@ -43,27 +46,157 @@ LOCAL_ONLY = os.environ.get("JARVIS_CLAUDE_PROXY_LOCAL_ONLY", "1").lower() not i
 LOCAL_HOSTNAMES = {"localhost", "host.docker.internal", "host.containers.internal"}
 
 # Correlate proxy logs with stage_runs.diagnostic_json.delegate_request_id.
-# Read once per process (cached); tests may call reset_delegate_request_id_cache().
-_DELEGATE_REQUEST_ID_CACHE: str | None = None
+#
+# The proxy is a long-lived server. Process-env JARVIS_DELEGATE_REQUEST_ID is
+# only a test/fallback path — production correlation is per HTTP request via
+# X-Jarvis-Delegate-Request-Id (Claude CLI forwards ANTHROPIC_CUSTOM_HEADERS).
+DELEGATE_REQUEST_ID_HEADER = "X-Jarvis-Delegate-Request-Id"
+_DELEGATE_REQUEST_ID_SAFE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
-def get_delegate_request_id() -> str:
-    """Return JARVIS_DELEGATE_REQUEST_ID or 'missing' (cached after first read)."""
-    global _DELEGATE_REQUEST_ID_CACHE
-    if _DELEGATE_REQUEST_ID_CACHE is None:
-        raw = os.environ.get("JARVIS_DELEGATE_REQUEST_ID", "").strip()
-        _DELEGATE_REQUEST_ID_CACHE = raw or "missing"
-    return _DELEGATE_REQUEST_ID_CACHE
+def sanitize_delegate_request_id(raw: str | None) -> str:
+    """Return a log-safe request id, or empty string if unusable."""
+    if not raw:
+        return ""
+    value = raw.strip()
+    if not value or len(value) > 128:
+        return ""
+    lower = value.lower()
+    # Never treat auth material as a correlation id.
+    if lower.startswith("bearer ") or "authorization" in lower:
+        return ""
+    if not _DELEGATE_REQUEST_ID_SAFE.fullmatch(value):
+        return ""
+    return value
+
+
+def get_delegate_request_id(headers: Mapping[str, str] | None = None) -> str:
+    """Resolve delegate_request_id for the current request.
+
+    Priority:
+      1. Per-request header X-Jarvis-Delegate-Request-Id (production path)
+      2. JARVIS_DELEGATE_REQUEST_ID env (tests / same-process launches)
+      3. "missing"
+    """
+    if headers is not None:
+        # BaseHTTPRequestHandler headers are case-insensitive; Mapping.get may not be.
+        header_val = ""
+        try:
+            header_val = headers.get(DELEGATE_REQUEST_ID_HEADER) or headers.get(
+                DELEGATE_REQUEST_ID_HEADER.lower()
+            ) or ""
+        except Exception:
+            # Some mappings only support exact keys — scan case-insensitively.
+            want = DELEGATE_REQUEST_ID_HEADER.lower()
+            for key, value in headers.items():
+                if str(key).lower() == want:
+                    header_val = value
+                    break
+        sanitized = sanitize_delegate_request_id(
+            header_val if isinstance(header_val, str) else str(header_val or "")
+        )
+        if sanitized:
+            return sanitized
+
+    env_val = sanitize_delegate_request_id(os.environ.get("JARVIS_DELEGATE_REQUEST_ID", ""))
+    return env_val or "missing"
 
 
 def reset_delegate_request_id_cache() -> None:
-    """Test helper: clear the process-level correlation cache."""
-    global _DELEGATE_REQUEST_ID_CACHE
-    _DELEGATE_REQUEST_ID_CACHE = None
+    """Back-compat no-op (process-level cache removed; correlation is per-request)."""
+    return None
 
 
-def delegate_correlation_field() -> str:
-    return f"delegate_request_id={get_delegate_request_id()}"
+def delegate_correlation_field(
+    headers: Mapping[str, str] | None = None,
+    *,
+    request_id: str | None = None,
+) -> str:
+    rid = request_id if request_id is not None else get_delegate_request_id(headers)
+    return f"delegate_request_id={rid}"
+
+
+# ── Transport-level retry (not model cascade) ────────────────────────────────
+# Free-tier upstreams drop connections after accepting (200) mid-stream. The
+# Conductor owns model-selection retry; nobody owned transport retry, so a
+# TCP reset discarded productive delegate work (run_8e930248). Retry only
+# transport failures, only before any content has been emitted to the client.
+TRANSPORT_RETRY_ATTEMPTS = int(os.environ.get("JARVIS_PROXY_TRANSPORT_RETRIES", "3"))
+TRANSPORT_RETRY_BACKOFF_S = float(os.environ.get("JARVIS_PROXY_TRANSPORT_BACKOFF", "0.25"))
+
+
+def is_transport_error(exc: BaseException) -> bool:
+    """True for connection drops / incomplete reads / timeouts — not HTTP 4xx."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, TimeoutError)):
+        return True
+    if isinstance(exc, socket.timeout):
+        return True
+    if isinstance(exc, http.client.IncompleteRead):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, TimeoutError, socket.timeout)):
+            return True
+        # DNS / refused / reset often wrap as URLError(OSError)
+        if isinstance(reason, OSError):
+            return True
+        return True  # generic URLError is transport-ish; HTTPError is separate
+    # WinError 10054 often surfaces as OSError / ConnectionResetError subclass
+    if isinstance(exc, OSError):
+        winerr = getattr(exc, "winerror", None)
+        if winerr in (10054, 10053, 10060):  # reset, aborted, timeout
+            return True
+        err = getattr(exc, "errno", None)
+        if err in (104, 54, 110, 10054):  # ECONNRESET variants
+            return True
+    return False
+
+
+def open_upstream_with_retry(
+    req_obj: urllib.request.Request,
+    *,
+    timeout: float = CLAUDE_TIMEOUT,
+    attempts: int = TRANSPORT_RETRY_ATTEMPTS,
+    backoff_s: float = TRANSPORT_RETRY_BACKOFF_S,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    urlopen_fn: Callable[..., Any] = urllib.request.urlopen,
+    log: logging.Logger | None = None,
+    correlation: str | None = None,
+) -> Any:
+    """Open upstream with bounded transport retries. Never retries HTTPError 4xx/5xx.
+
+    Caller must not have written to the client yet — a failure here is still
+    invisible and safe to retry. Once the returned response is live, the
+    streaming loop applies its own content-emitted guard.
+    """
+    logger = log or LOG
+    corr = correlation if correlation is not None else delegate_correlation_field()
+    last_exc: BaseException | None = None
+    tries = max(1, attempts)
+    for attempt in range(1, tries + 1):
+        try:
+            return urlopen_fn(req_obj, timeout=timeout)
+        except urllib.error.HTTPError:
+            # Genuine upstream rejection (auth, bad model, context length) — fail fast.
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if not is_transport_error(exc) or attempt >= tries:
+                raise
+            logger.warning(
+                "upstream transport retry attempt=%s/%s reason=%s: %s %s",
+                attempt,
+                tries,
+                type(exc).__name__,
+                exc,
+                corr,
+            )
+            sleep_fn(backoff_s * attempt)
+    assert last_exc is not None
+    raise last_exc
+
 
 # ── Remote hosted routing (OpenRouter + OpenCode Go) ────────────────────────
 OPENROUTER_URL = os.environ.get("JARVIS_OPENROUTER_URL", "https://openrouter.ai/api/v1")
@@ -539,7 +672,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, anthropic-version")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization, x-api-key, anthropic-version, "
+            "x-jarvis-delegate-request-id",
+        )
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.end_headers()
 
@@ -579,7 +716,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         # Strip query parameters for path matching
         path = self.path.split("?")[0]
-        correlation = delegate_correlation_field()
+        # Per-request header from Claude CLI ANTHROPIC_CUSTOM_HEADERS — not process env.
+        correlation = delegate_correlation_field(self.headers)
         LOG.info("POST %s (path=%s) %s", self.path, path, correlation)
         if path != "/v1/messages":
             self._write_json(404, {"error": "not found", "path": self.path})
@@ -692,7 +830,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if not stream:
             try:
-                with urllib.request.urlopen(req_obj, timeout=CLAUDE_TIMEOUT) as response:
+                with open_upstream_with_retry(
+                    req_obj, timeout=CLAUDE_TIMEOUT, correlation=correlation,
+                ) as response:
                     resp_data = response.read().decode("utf-8")
                     openai_resp = json.loads(resp_data)
                     anthropic_resp = translate_openai_response_to_anthropic(openai_resp, model)
@@ -706,166 +846,227 @@ class Handler(BaseHTTPRequestHandler):
                 LOG.exception("Upstream dispatch failed %s", correlation)
                 self._write_json(500, {"error": {"type": "internal_error", "message": str(exc)}})
         else:
+            # Open upstream BEFORE headers / message_start so transport failures
+            # are invisible to the client and safely retryable. Once content
+            # has been emitted, never retry (would duplicate output).
+            content_emitted = False
+            headers_sent = False
             try:
-                # Setup streaming headers
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                # The SSE body has neither Content-Length nor chunked framing, so
-                # it is delimited only by connection close. Advertising
-                # keep-alive here makes strict clients (Node/undici, which the
-                # Claude CLI uses) wait forever for a delimiter that never
-                # arrives; curl is lenient and masks this.
-                self.send_header("Connection", "close")
-                self.close_connection = True
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-
                 msg_id = f"msg_{uuid.uuid4().hex[:24]}"
                 # Anthropic requires content block indices to start at 0 and be
                 # contiguous, so blocks are numbered in emission order rather
                 # than reserving index 0 for text that may never arrive.
                 next_block_index = 0
                 text_block_index = None
-                active_tool_calls = {}
+                active_tool_calls: dict = {}
 
                 def emit(event_type: str, payload: dict) -> None:
                     self.wfile.write(f"event: {event_type}\n".encode("utf-8"))
                     self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode("utf-8"))
                     self.wfile.flush()
 
-                # Send initial message_start
-                message_start = {
-                    "type": "message_start",
-                    "message": {
-                        "id": msg_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "model": model,
-                        "content": [],
-                        "stop_reason": None,
-                        "stop_sequence": None,
-                        "usage": {"input_tokens": 0, "output_tokens": 0}
-                    }
-                }
-                emit("message_start", message_start)
+                stream_attempts = max(1, TRANSPORT_RETRY_ATTEMPTS)
+                last_stream_exc: BaseException | None = None
+                for stream_attempt in range(1, stream_attempts + 1):
+                    try:
+                        # Fresh open each attempt (retry only pre-content).
+                        response = open_upstream_with_retry(
+                            req_obj,
+                            timeout=CLAUDE_TIMEOUT,
+                            attempts=1,  # outer loop owns multi-attempt for stream
+                            correlation=correlation,
+                        )
+                        try:
+                            if not headers_sent:
+                                # Setup streaming headers only after upstream is alive.
+                                self.send_response(200)
+                                self.send_header("Content-Type", "text/event-stream")
+                                self.send_header("Cache-Control", "no-cache")
+                                # The SSE body has neither Content-Length nor chunked framing, so
+                                # it is delimited only by connection close. Advertising
+                                # keep-alive here makes strict clients (Node/undici, which the
+                                # Claude CLI uses) wait forever for a delimiter that never
+                                # arrives; curl is lenient and masks this.
+                                self.send_header("Connection", "close")
+                                self.close_connection = True
+                                self.send_header("Access-Control-Allow-Origin", "*")
+                                self.end_headers()
+                                headers_sent = True
 
-                with urllib.request.urlopen(req_obj, timeout=CLAUDE_TIMEOUT) as response:
-                    for line_bytes in response:
-                        line = line_bytes.decode("utf-8").strip()
-                        if not line:
-                            continue
-                        if line.startswith("data:"):
-                            data_str = line[5:].strip()
-                            if data_str == "[DONE]":
-                                break
-                            try:
-                                chunk = json.loads(data_str)
-                            except Exception:
-                                continue
+                                message_start = {
+                                    "type": "message_start",
+                                    "message": {
+                                        "id": msg_id,
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "model": model,
+                                        "content": [],
+                                        "stop_reason": None,
+                                        "stop_sequence": None,
+                                        "usage": {"input_tokens": 0, "output_tokens": 0}
+                                    }
+                                }
+                                emit("message_start", message_start)
 
-                            choices = chunk.get("choices", [])
-                            if not choices:
-                                continue
-                            choice = choices[0]
-                            delta = choice.get("delta", {})
+                            for line_bytes in response:
+                                line = line_bytes.decode("utf-8").strip()
+                                if not line:
+                                    continue
+                                if line.startswith("data:"):
+                                    data_str = line[5:].strip()
+                                    if data_str == "[DONE]":
+                                        break
+                                    try:
+                                        chunk = json.loads(data_str)
+                                    except Exception:
+                                        continue
 
-                            # Text chunks mapping
-                            content = delta.get("content")
-                            if content:
-                                if text_block_index is None:
-                                    text_block_index = next_block_index
-                                    next_block_index += 1
-                                    emit("content_block_start", {
-                                        "type": "content_block_start",
-                                        "index": text_block_index,
-                                        "content_block": {"type": "text", "text": ""}
-                                    })
+                                    choices = chunk.get("choices", [])
+                                    if not choices:
+                                        continue
+                                    choice = choices[0]
+                                    delta = choice.get("delta", {})
 
-                                emit("content_block_delta", {
-                                    "type": "content_block_delta",
-                                    "index": text_block_index,
-                                    "delta": {"type": "text_delta", "text": content}
-                                })
+                                    # Text chunks mapping
+                                    content = delta.get("content")
+                                    if content:
+                                        content_emitted = True
+                                        if text_block_index is None:
+                                            text_block_index = next_block_index
+                                            next_block_index += 1
+                                            emit("content_block_start", {
+                                                "type": "content_block_start",
+                                                "index": text_block_index,
+                                                "content_block": {"type": "text", "text": ""}
+                                            })
 
-                            # Tool chunks mapping
-                            tool_calls = delta.get("tool_calls")
-                            if tool_calls:
-                                for tc in tool_calls:
-                                    idx = tc.get("index", 0)
-                                    if idx not in active_tool_calls:
-                                        tc_id = tc.get("id") or f"toolu_{uuid.uuid4().hex[:12]}"
-                                        tc_name = tc.get("function", {}).get("name") or ""
-                                        block_index = next_block_index
-                                        next_block_index += 1
-                                        active_tool_calls[idx] = {
-                                            "id": tc_id,
-                                            "name": tc_name,
-                                            "arguments": "",
-                                            "block_index": block_index
-                                        }
-                                        emit("content_block_start", {
-                                            "type": "content_block_start",
-                                            "index": block_index,
-                                            "content_block": {
-                                                "type": "tool_use",
-                                                "id": tc_id,
-                                                "name": tc_name,
-                                                "input": {}
-                                            }
-                                        })
-
-                                    active_tc = active_tool_calls[idx]
-                                    tc_args_delta = tc.get("function", {}).get("arguments") or ""
-                                    if tc_args_delta:
-                                        active_tc["arguments"] += tc_args_delta
                                         emit("content_block_delta", {
                                             "type": "content_block_delta",
-                                            "index": active_tc["block_index"],
-                                            "delta": {
-                                                "type": "input_json_delta",
-                                                "partial_json": tc_args_delta
-                                            }
+                                            "index": text_block_index,
+                                            "delta": {"type": "text_delta", "text": content}
                                         })
 
-                # Clean up stream blocks
-                if text_block_index is not None:
-                    emit("content_block_stop", {
-                        "type": "content_block_stop",
-                        "index": text_block_index
-                    })
+                                    # Tool chunks mapping
+                                    tool_calls = delta.get("tool_calls")
+                                    if tool_calls:
+                                        for tc in tool_calls:
+                                            idx = tc.get("index", 0)
+                                            if idx not in active_tool_calls:
+                                                content_emitted = True
+                                                tc_id = tc.get("id") or f"toolu_{uuid.uuid4().hex[:12]}"
+                                                tc_name = tc.get("function", {}).get("name") or ""
+                                                block_index = next_block_index
+                                                next_block_index += 1
+                                                active_tool_calls[idx] = {
+                                                    "id": tc_id,
+                                                    "name": tc_name,
+                                                    "arguments": "",
+                                                    "block_index": block_index
+                                                }
+                                                emit("content_block_start", {
+                                                    "type": "content_block_start",
+                                                    "index": block_index,
+                                                    "content_block": {
+                                                        "type": "tool_use",
+                                                        "id": tc_id,
+                                                        "name": tc_name,
+                                                        "input": {}
+                                                    }
+                                                })
 
-                for active_tc in active_tool_calls.values():
-                    emit("content_block_stop", {
-                        "type": "content_block_stop",
-                        "index": active_tc["block_index"]
-                    })
+                                            active_tc = active_tool_calls[idx]
+                                            tc_args_delta = tc.get("function", {}).get("arguments") or ""
+                                            if tc_args_delta:
+                                                content_emitted = True
+                                                active_tc["arguments"] += tc_args_delta
+                                                emit("content_block_delta", {
+                                                    "type": "content_block_delta",
+                                                    "index": active_tc["block_index"],
+                                                    "delta": {
+                                                        "type": "input_json_delta",
+                                                        "partial_json": tc_args_delta
+                                                    }
+                                                })
+                        finally:
+                            try:
+                                response.close()
+                            except Exception:
+                                pass
 
-                stop_reason = "tool_use" if active_tool_calls else "end_turn"
-                message_delta = {
-                    "type": "message_delta",
-                    "delta": {
-                        "stop_reason": stop_reason,
-                        "stop_sequence": None
-                    },
-                    "usage": {"output_tokens": 0}
-                }
-                emit("message_delta", message_delta)
-                emit("message_stop", {"type": "message_stop"})
-                LOG.info("upstream result status=200 stream=true %s", correlation)
+                        # Clean up stream blocks
+                        if text_block_index is not None:
+                            emit("content_block_stop", {
+                                "type": "content_block_stop",
+                                "index": text_block_index
+                            })
+
+                        for active_tc in active_tool_calls.values():
+                            emit("content_block_stop", {
+                                "type": "content_block_stop",
+                                "index": active_tc["block_index"]
+                            })
+
+                        stop_reason = "tool_use" if active_tool_calls else "end_turn"
+                        message_delta = {
+                            "type": "message_delta",
+                            "delta": {
+                                "stop_reason": stop_reason,
+                                "stop_sequence": None
+                            },
+                            "usage": {"output_tokens": 0}
+                        }
+                        emit("message_delta", message_delta)
+                        emit("message_stop", {"type": "message_stop"})
+                        LOG.info("upstream result status=200 stream=true %s", correlation)
+                        last_stream_exc = None
+                        break
+
+                    except urllib.error.HTTPError as exc:
+                        # HTTP rejections are never transport-retried.
+                        last_stream_exc = exc
+                        break
+                    except Exception as exc:
+                        last_stream_exc = exc
+                        if content_emitted or not is_transport_error(exc) or stream_attempt >= stream_attempts:
+                            break
+                        LOG.warning(
+                            "stream transport retry attempt=%s/%s reason=%s: %s %s",
+                            stream_attempt,
+                            stream_attempts,
+                            type(exc).__name__,
+                            exc,
+                            correlation,
+                        )
+                        time.sleep(TRANSPORT_RETRY_BACKOFF_S * stream_attempt)
+                        continue
+
+                if last_stream_exc is not None:
+                    raise last_stream_exc
 
             except Exception as exc:
                 LOG.error("Streaming error %s: %s", correlation, exc)
-                error_event = {
-                    "type": "error",
-                    "error": {"type": "api_error", "message": str(exc)}
-                }
-                try:
-                    self.wfile.write(b"event: error\n")
-                    self.wfile.write(f"data: {json.dumps(error_event)}\n\n".encode("utf-8"))
-                    self.wfile.flush()
-                except Exception:
-                    pass
+                if headers_sent:
+                    error_event = {
+                        "type": "error",
+                        "error": {"type": "api_error", "message": str(exc)}
+                    }
+                    try:
+                        self.wfile.write(b"event: error\n")
+                        self.wfile.write(f"data: {json.dumps(error_event)}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                    except Exception:
+                        pass
+                else:
+                    # Headers not sent — client still expects a normal JSON error.
+                    code = exc.code if isinstance(exc, urllib.error.HTTPError) else 500
+                    try:
+                        if isinstance(exc, urllib.error.HTTPError):
+                            err_content = exc.read().decode("utf-8")
+                            self._write_json(code, {"error": {"type": "api_error", "message": err_content}})
+                        else:
+                            self._write_json(500, {"error": {"type": "internal_error", "message": str(exc)}})
+                    except Exception:
+                        pass
 
 
 def main() -> None:

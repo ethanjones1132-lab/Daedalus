@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { defaultConfig } from "../config";
 import { createToolRuntime, makeExecutionContext } from "../tool-runtime";
 import type { ExecutorStageOutput } from "./stage-output";
-import { PipelineExecutor } from "./pipeline";
+import { MAX_DELEGATE_LAUNCHES_PER_RUN, PipelineExecutor } from "./pipeline";
 import { runPipelineWithReplanning } from "./replan-loop";
 import { Coordinator, type CoordinatorResult } from "./coordinator";
 import { SessionOutcomeCollector, SelfTuningStore } from "../self-tuning/mod";
@@ -1627,5 +1627,143 @@ describe("executor delegate pipeline integration", () => {
       had_error: 1,
       fallback_used: 1,
     }));
+  });
+
+  // 2026-08-02: the delegate is the committed executor architecture for
+  // write-intent turns. Measured over the fresh post-deploy window it does 7
+  // tool calls per launch against the native loop's 1.4, and the budget is
+  // ~100% model round-trip: 138s of turns carrying 91ms of actual file I/O
+  // (a 1522x ratio). Round-trip COUNT is the only lever that moves that, and
+  // the delegate is ~5x better on it.
+  //
+  // Previously `delegateAttemptedRuns` was a boolean Set — one launch per
+  // agent run forever — so every re-entered segment fell back to the native
+  // one-call-per-turn loop. That is what produced 17 reads / 0 writes in
+  // run_8e930248.
+  //
+  // The original "one delegate process per logical agent run" invariant was
+  // adopted for idempotency. It is safe to relax now for two reasons that did
+  // not hold then: the delegate prompt carries a path-level evidence
+  // checkpoint (`buildEvidenceCheckpoint`), so a re-entry does not rediscover;
+  // and a re-applied edit is naturally idempotent (`edit_file` fails on a
+  // stale old_string, `write_file` is last-write-wins). The cap below keeps a
+  // failing delegate from spawning unbounded subprocesses, and DelegateHealth
+  // cooldown remains the second guard.
+  test("the delegate serves re-entered segments up to a bounded launch cap", async () => {
+    const config = delegateTestConfig();
+    config.jarvis_path = process.cwd();
+    config.claude_cli.enabled = true;
+    config.claude_cli.delegate.enabled = true;
+    config.claude_cli.delegate.policy = "delegate_first";
+    const ctx = makeExecutionContext("agent", config, {
+      session_id: "session-delegate-reentry",
+      workspace_path: config.jarvis_path,
+    });
+    const collector = { recordStageRun: () => {}, recordModelAttribution: () => {} };
+    let delegateCalls = 0;
+    const delegateRuntime = {
+      availability: { isAvailable: async () => true },
+      run: async () => {
+        delegateCalls += 1;
+        return verifiedDelegateOutput();
+      },
+    };
+    const executor = new (PipelineExecutor as any)(
+      async () => ({ content: "native fallback" }),
+      createToolRuntime(),
+      ctx,
+      collector,
+      delegateRuntime,
+    ) as PipelineExecutor;
+
+    const runOnce = () =>
+      executor.executeSegment("Change result.txt", ["executor"], "run-delegate-reentry", () => {}, {
+        executionProfile: "full",
+        rawMessage: "Change result.txt",
+        turnRequirement: "full_execution",
+        maxReviewRepairRounds: 0,
+      });
+
+    // Same agentRunId across segments — this is exactly the re-entry the old
+    // boolean gate blocked after the first launch.
+    await runOnce();
+    await runOnce();
+    expect(delegateCalls).toBe(2);
+  });
+
+  test("the launch cap stops the delegate from spawning unbounded subprocesses", async () => {
+    const config = delegateTestConfig();
+    config.jarvis_path = process.cwd();
+    config.claude_cli.enabled = true;
+    config.claude_cli.delegate.enabled = true;
+    config.claude_cli.delegate.policy = "delegate_first";
+    const ctx = makeExecutionContext("agent", config, {
+      session_id: "session-delegate-cap",
+      workspace_path: config.jarvis_path,
+    });
+    const collector = { recordStageRun: () => {}, recordModelAttribution: () => {} };
+    let delegateCalls = 0;
+    const delegateRuntime = {
+      availability: { isAvailable: async () => true },
+      run: async () => {
+        delegateCalls += 1;
+        return verifiedDelegateOutput();
+      },
+    };
+    const executor = new (PipelineExecutor as any)(
+      async () => ({ content: "native fallback" }),
+      createToolRuntime(),
+      ctx,
+      collector,
+      delegateRuntime,
+    ) as PipelineExecutor;
+
+    for (let i = 0; i < MAX_DELEGATE_LAUNCHES_PER_RUN + 3; i++) {
+      await executor.executeSegment("Change result.txt", ["executor"], "run-delegate-cap", () => {}, {
+        executionProfile: "full",
+        rawMessage: "Change result.txt",
+        turnRequirement: "full_execution",
+        maxReviewRepairRounds: 0,
+      });
+    }
+    expect(delegateCalls).toBe(MAX_DELEGATE_LAUNCHES_PER_RUN);
+  });
+
+  test("separate agent runs each get their own launch budget", async () => {
+    const config = delegateTestConfig();
+    config.jarvis_path = process.cwd();
+    config.claude_cli.enabled = true;
+    config.claude_cli.delegate.enabled = true;
+    config.claude_cli.delegate.policy = "delegate_first";
+    const ctx = makeExecutionContext("agent", config, {
+      session_id: "session-delegate-budgets",
+      workspace_path: config.jarvis_path,
+    });
+    const collector = { recordStageRun: () => {}, recordModelAttribution: () => {} };
+    let delegateCalls = 0;
+    const delegateRuntime = {
+      availability: { isAvailable: async () => true },
+      run: async () => {
+        delegateCalls += 1;
+        return verifiedDelegateOutput();
+      },
+    };
+    const executor = new (PipelineExecutor as any)(
+      async () => ({ content: "native fallback" }),
+      createToolRuntime(),
+      ctx,
+      collector,
+      delegateRuntime,
+    ) as PipelineExecutor;
+
+    for (const runId of ["run-budget-a", "run-budget-b"]) {
+      await executor.executeSegment("Change result.txt", ["executor"], runId, () => {}, {
+        executionProfile: "full",
+        rawMessage: "Change result.txt",
+        turnRequirement: "full_execution",
+        maxReviewRepairRounds: 0,
+      });
+    }
+    expect(delegateCalls).toBe(2);
   });
 });

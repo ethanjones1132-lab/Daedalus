@@ -6,8 +6,10 @@ import { defaultConfig, type JarvisConfig } from "../config";
 import { readFileSync } from "fs";
 import {
   buildClaudeDelegateInvocation,
+  canonicalizeDelegateToolArguments,
   ClaudeDelegateAvailabilityCache,
   createPlatformDelegateProcessTreeKiller,
+  DELEGATE_REQUEST_ID_HEADER,
   DelegateHealth,
   delegateEligibility,
   isPermittedDelegateTool,
@@ -16,8 +18,10 @@ import {
   nodeDelegateSnapshotFactory,
   runClaudeDelegate,
   sanitizeDelegateDiagnosticText,
+  withDelegateRequestCorrelation,
   type DelegateRootSnapshot,
 } from "./claude-delegate";
+import { toolCallIdentityKey } from "./pipeline";
 import {
   DELEGATE_MCP_SERVER_NAME,
   DELEGATE_MCP_SESSION_GRANTS_ENV,
@@ -30,6 +34,34 @@ function testConfig(): JarvisConfig {
   config.opencode_go.api_key = "go-test-key";
   return config;
 }
+
+describe("canonicalizeDelegateToolArguments", () => {
+  test("maps Claude CLI file_path to native path for deflection identity", () => {
+    const canon = canonicalizeDelegateToolArguments({ file_path: "src/pipeline.ts", offset: 1 });
+    expect(canon).toEqual({ path: "src/pipeline.ts", offset: 1 });
+    // run_8e930248: delegate-seeded cache key must match native re-query.
+    const delegateKey = toolCallIdentityKey({ name: "read_file", arguments: canon });
+    const nativeKey = toolCallIdentityKey({
+      name: "read_file",
+      arguments: { path: "src/pipeline.ts" },
+    });
+    expect(delegateKey).toBe(nativeKey);
+  });
+});
+
+describe("withDelegateRequestCorrelation", () => {
+  test("sets env id and Claude CLI custom header for the long-lived proxy", () => {
+    const env = withDelegateRequestCorrelation(
+      { PATH: "/usr/bin", ANTHROPIC_CUSTOM_HEADERS: "X-Existing: keep" },
+      "req-uuid-1234",
+    );
+    expect(env.JARVIS_DELEGATE_REQUEST_ID).toBe("req-uuid-1234");
+    expect(env.ANTHROPIC_CUSTOM_HEADERS).toContain("X-Existing: keep");
+    expect(env.ANTHROPIC_CUSTOM_HEADERS).toContain(
+      `${DELEGATE_REQUEST_ID_HEADER}: req-uuid-1234`,
+    );
+  });
+});
 
 describe("Claude executor delegate", () => {
   test("filesystem snapshots use content hashes instead of mtime/size identity", async () => {
@@ -1968,6 +2000,10 @@ describe("Claude executor delegate", () => {
       /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
     );
     expect(output.diagnostics?.delegate_request_id).toBe(launchedEnv?.JARVIS_DELEGATE_REQUEST_ID);
+    // Long-lived proxy reads this header per request (not process env).
+    expect(launchedEnv?.ANTHROPIC_CUSTOM_HEADERS).toContain(
+      `${DELEGATE_REQUEST_ID_HEADER}: ${launchedEnv?.JARVIS_DELEGATE_REQUEST_ID}`,
+    );
     expect(output.diagnostics?.exit_code).toBe(1);
     expect(output.diagnostics?.stderr_tail).toContain("proxy refused");
     expect(output.diagnostics?.stderr_tail).not.toContain("secret-value");

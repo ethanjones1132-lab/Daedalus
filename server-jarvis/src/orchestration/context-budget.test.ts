@@ -234,4 +234,91 @@ describe("compactCompletedExecutorCycles", () => {
     expect(messages[assistantIdx + 1]?.role).toBe("tool");
     expect(messages[assistantIdx + 1]?.tool_call_id).toBe("new");
   });
+
+  // pipeline.ts write contract uses write_file list / "file-writing tool", not
+  // the phrase "write tools" — was silently dropped by compaction.
+  test("preserves [Runtime write contract] as write-pressure across compaction", () => {
+    const writeContract =
+      "[Runtime write contract] This is a CHANGE request. The stage is complete only after at least one successful write_file / edit_file / multi_edit / apply_patch call. Read what you need first, then APPLY the change with a tool call and read the file back to verify — code or diffs written as prose do not modify any file.";
+    const messages: TranscriptMessage[] = [
+      { role: "system", content: "sys" },
+      { role: "user", content: "edit src/a.cpp" },
+      { role: "user", content: writeContract },
+      {
+        role: "assistant",
+        content: "old",
+        tool_calls: [{ id: "c1", type: "function", function: { name: "read_file", arguments: "{\"path\":\"src/a.cpp\"}" } }],
+      },
+      { role: "tool", name: "read_file", tool_call_id: "c1", content: "a".repeat(400) },
+      {
+        role: "assistant",
+        content: "mid",
+        tool_calls: [{ id: "c2", type: "function", function: { name: "read_file", arguments: "{\"path\":\"src/b.cpp\"}" } }],
+      },
+      { role: "tool", name: "read_file", tool_call_id: "c2", content: "b".repeat(400) },
+      {
+        role: "assistant",
+        content: "new",
+        tool_calls: [{ id: "c3", type: "function", function: { name: "read_file", arguments: "{\"path\":\"src/c.cpp\"}" } }],
+      },
+      { role: "tool", name: "read_file", tool_call_id: "c3", content: "c".repeat(400) },
+    ];
+    const toolCalls = [
+      tool("read_file", "src/a.cpp"),
+      tool("read_file", "src/b.cpp"),
+      tool("read_file", "src/c.cpp"),
+    ];
+
+    compactCompletedExecutorCycles(messages, toolCalls, 4_000);
+
+    const contracts = messages.filter(
+      (m) => m.role === "user" && m.content.includes("[Runtime write contract]"),
+    );
+    expect(contracts.length).toBe(1);
+    expect(contracts[0].content).toContain("write_file");
+  });
+
+  // Carried evidence sits after the seed (index 2) and was discarded once
+  // compaction rewrote the gap to checkpoint-only.
+  test("preserves [Runtime carried evidence] across compaction", () => {
+    const carried =
+      "[Runtime carried evidence] These results came from an earlier executor segment. " +
+      "Reuse them; do not rediscover the same targets.\n- read_file {\"path\":\"src/a.ts\"}\nfile a";
+    const messages: TranscriptMessage[] = [
+      { role: "system", content: "sys" },
+      { role: "user", content: "continue the edit" },
+      { role: "user", content: carried },
+      {
+        role: "assistant",
+        content: "old",
+        tool_calls: [{ id: "c1", type: "function", function: { name: "read_file", arguments: "{\"path\":\"src/b.ts\"}" } }],
+      },
+      { role: "tool", name: "read_file", tool_call_id: "c1", content: "b".repeat(400) },
+      {
+        role: "assistant",
+        content: "mid",
+        tool_calls: [{ id: "c2", type: "function", function: { name: "read_file", arguments: "{\"path\":\"src/c.ts\"}" } }],
+      },
+      { role: "tool", name: "read_file", tool_call_id: "c2", content: "c".repeat(400) },
+      {
+        role: "assistant",
+        content: "new",
+        tool_calls: [{ id: "c3", type: "function", function: { name: "read_file", arguments: "{\"path\":\"src/d.ts\"}" } }],
+      },
+      { role: "tool", name: "read_file", tool_call_id: "c3", content: "d".repeat(400) },
+    ];
+    const toolCalls = [
+      tool("read_file", "src/b.ts"),
+      tool("read_file", "src/c.ts"),
+      tool("read_file", "src/d.ts"),
+    ];
+
+    compactCompletedExecutorCycles(messages, toolCalls, 4_000);
+
+    const survivors = messages.filter(
+      (m) => m.role === "user" && m.content.includes("[Runtime carried evidence]"),
+    );
+    expect(survivors.length).toBe(1);
+    expect(survivors[0].content).toContain("src/a.ts");
+  });
 });

@@ -55,6 +55,7 @@ import {
 } from "./evidence-sufficiency";
 import { substituteToolCall } from "../tool-heal";
 import {
+  buildEvidenceCheckpoint,
   compactCompletedExecutorCycles,
   enforceTranscriptBudget,
   EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS,
@@ -352,6 +353,27 @@ const PATH_LIKE_ARGUMENT_KEYS = new Set([
   "workspacepath",
 ]);
 
+/** Pagination / window args that do not change the read *target* for deflection. */
+const IDENTITY_IGNORED_ARGUMENT_KEYS = new Set([
+  "offset",
+  "limit",
+  "start_line",
+  "end_line",
+  "max_lines",
+]);
+
+/**
+ * Canonicalize CLI vs native argument key aliases so identity (and cache seed)
+ * treat Claude CLI `file_path` the same as native `path` (run_8e930248).
+ */
+function canonicalIdentityArgKey(key: string): string {
+  const lower = key.toLowerCase();
+  if (lower === "file_path" || lower === "filepath") return "path";
+  if (lower === "directory_path") return "directory";
+  if (lower === "workspacepath") return "workspace_path";
+  return lower;
+}
+
 export interface ToolCallIdentityOptions {
   /** Active workspace root used to make relative filesystem references comparable. */
   workspaceRoot?: string;
@@ -380,23 +402,29 @@ function normalizePathIdentity(pathValue: string, workspaceRoot: string, platfor
 }
 
 /**
- * Stable accounting identity for a tool call. This deliberately normalizes
- * only path-bearing argument values; the Tool runtime receives the original
- * arguments unchanged, preserving its file-access semantics.
+ * Stable accounting identity for a tool call. Normalizes path-bearing argument
+ * *keys* (file_path → path) and values; drops pagination args so a re-read of
+ * the same target (delegate CLI shape vs native, or offset/limit window) hits
+ * the deflection cache. The Tool runtime still receives original arguments.
  */
 export function toolCallIdentityKey(
   call: Pick<ToolCall, "name" | "arguments">,
   { workspaceRoot = process.cwd(), platform = process.platform }: ToolCallIdentityOptions = {},
 ): string {
-  const identityArguments = Object.fromEntries(
-    Object.entries(call.arguments).map(([key, value]) => [
-      key,
-      typeof value === "string" && PATH_LIKE_ARGUMENT_KEYS.has(key.toLowerCase())
-        ? normalizePathIdentity(value, workspaceRoot, platform)
-        : value,
-    ]),
-  );
-  return `${call.name}:${JSON.stringify(identityArguments)}`;
+  const identityArguments: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(call.arguments ?? {})) {
+    const canonKey = canonicalIdentityArgKey(key);
+    if (IDENTITY_IGNORED_ARGUMENT_KEYS.has(canonKey)) continue;
+    const identityValue = typeof value === "string" && PATH_LIKE_ARGUMENT_KEYS.has(key.toLowerCase())
+      ? normalizePathIdentity(value, workspaceRoot, platform)
+      : value;
+    // Prefer first-seen when both path and file_path appear (should be rare).
+    if (canonKey in identityArguments) continue;
+    identityArguments[canonKey] = identityValue;
+  }
+  const orderedKeys = Object.keys(identityArguments).sort();
+  const ordered = Object.fromEntries(orderedKeys.map((k) => [k, identityArguments[k]]));
+  return `${call.name}:${JSON.stringify(ordered)}`;
 }
 
 // 2026-07-18: a repeated identical read now REPLAYS the full cached output
@@ -493,6 +521,17 @@ export function composeEvidenceFallbackAnswer(state: PipelineStageState): string
  * ~60s+ (run 6b4ab013) produced a full answer.
  */
 export const SYNTHESIS_RUNWAY_MS = 30_000;
+
+/**
+ * Delegate launches allowed per logical agent run.
+ *
+ * Sized to cover the observed segment count (a run re-enters the executor 2–4
+ * times via reroute/replan) so the committed delegate path serves re-entries
+ * instead of dropping to the native loop, while still bounding subprocess
+ * spawning if the delegate is failing. `DelegateHealth`'s strike cooldown is
+ * the independent second guard.
+ */
+export const MAX_DELEGATE_LAUNCHES_PER_RUN = 4;
 
 /**
  * True when the segment loop should stop starting non-synthesizer stages and
@@ -792,8 +831,34 @@ function stageSystemPrompt(
 export class PipelineExecutor {
   private collector: StageRunRecorder;
   private conductor?: ConductorWiring;
-  /** One delegate process maximum per logical agent run, including replans. */
-  private delegateAttemptedRuns = new Set<string>();
+  /**
+   * Delegate launches used by each logical agent run, including replans.
+   *
+   * The delegate is the committed executor architecture for write-intent
+   * turns: measured over the 2026-08-02 post-deploy window it runs 7 tool
+   * calls per launch against the native loop's 1.4, and executor cost is
+   * ~entirely model round-trip (138s of turns carrying 91ms of file I/O — a
+   * 1522x ratio). Round-trip COUNT is the only lever that moves that.
+   *
+   * This was a boolean Set — one launch per run forever — so every re-entered
+   * segment dropped to the native one-call-per-turn loop. That is what
+   * produced 17 reads and 0 writes in run_8e930248.
+   *
+   * Relaxing the original "one delegate process per run" idempotency
+   * invariant is safe now for two reasons that did not hold when it was
+   * written: the delegate prompt carries a `buildEvidenceCheckpoint` so a
+   * re-entry does not rediscover, and a re-applied edit is naturally
+   * idempotent (`edit_file` fails on a stale old_string; `write_file` is
+   * last-write-wins). The cap below bounds subprocess spawning; the
+   * `DelegateHealth` cooldown remains the second guard.
+   */
+  private delegateLaunchesByRun = new Map<string, number>();
+  /**
+   * Runs whose delegate attempt ended with no verified write. Re-entry is
+   * earned: a delegate that already failed and needed a native rescue does not
+   * get another subprocess on the same task.
+   */
+  private delegateNoWriteRuns = new Set<string>();
   /** Last verification check for this execute() turn (feeds conductor + reward). */
   private lastCheckResult: CheckResult | undefined;
   /** Reviewer accepted this turn (synth-tier reward upgrade). */
@@ -1931,9 +1996,25 @@ export class PipelineExecutor {
 
     const runDelegate = async (nativeNoWrite: boolean): Promise<ExecutorStageOutput | undefined> => {
       const delegateRuntime = this.delegateRuntime;
-      if (!delegateRuntime || this.delegateAttemptedRuns.has(agentRunId)) {
+      const launchesUsed = this.delegateLaunchesByRun.get(agentRunId) ?? 0;
+      // Re-entry is earned, not free. A delegate that already failed to
+      // produce a verified write and had to be rescued by native will very
+      // likely fail the same way on the same task, so it does not get another
+      // 76s subprocess — that is the invariant the replan test encodes. A
+      // delegate that IS writing keeps the stage, up to the launch cap.
+      if (!delegateRuntime || launchesUsed >= MAX_DELEGATE_LAUNCHES_PER_RUN
+        || this.delegateNoWriteRuns.has(agentRunId)) {
         if (!delegateRuntime) {
           console.warn("[Pipeline] delegate skipped: no delegateRuntime wired");
+        } else if (this.delegateNoWriteRuns.has(agentRunId)) {
+          console.warn(
+            `[Pipeline] delegate skipped: prior attempt produced no verified write for run=${agentRunId}`,
+          );
+        } else {
+          console.warn(
+            `[Pipeline] delegate skipped: launch cap reached ` +
+            `(${launchesUsed}/${MAX_DELEGATE_LAUNCHES_PER_RUN}) for run=${agentRunId}`,
+          );
         }
         return undefined;
       }
@@ -2052,10 +2133,24 @@ export class PipelineExecutor {
       // stopping without writing — consistent with a model told it had no
       // write capability (2026-07-21 delegate-reliability investigation).
       const delegateSystemPrompt = stageSystemPrompt("executor", options, "host_provided");
+      // Segment re-entry used to rediscover from scratch (run_8e930248). Carry a
+      // path-level evidence checkpoint — same builder as native cycle compaction
+      // so argument-shape differences (file_path vs path) do not matter.
+      const priorEvidence = priorToolCalls.length > 0
+        ? buildEvidenceCheckpoint(
+          priorToolCalls.filter((call) => !isDuplicateToolDeflection(call)),
+        )
+        : "";
       const prompt = [
         delegateSystemPrompt,
         `User Request: ${request}`,
         `Plan:\n${planSummary}`,
+        ...(priorEvidence.trim()
+          ? [
+            `[Runtime carried evidence] These results came from an earlier executor segment. ` +
+            `Reuse them; do not rediscover the same targets.\n${priorEvidence}`,
+          ]
+          : []),
         "[Runtime write contract] This is a CHANGE request. The stage is complete only after you actually invoke a file-writing tool (your environment's Write/Edit or equivalent) and it succeeds — describing the change in your response text does NOT modify any file. Read what you need first, then CALL the write/edit tool now, then read the file back to verify.",
         "[Runtime path contract] Prefer exact paths from list/glob results. Do not invent sibling names (e.g. solution_t.py). The adjacent test file is often named _t.py.",
       ].join("\n\n");
@@ -2065,7 +2160,10 @@ export class PipelineExecutor {
         options.turnAbort,
         midLoopAbortController.signal,
       );
-      this.delegateAttemptedRuns.add(agentRunId);
+      this.delegateLaunchesByRun.set(
+        agentRunId,
+        (this.delegateLaunchesByRun.get(agentRunId) ?? 0) + 1,
+      );
       const delegateStreamCalls: ToolCallRecord[] = [];
       this.collector.recordDirective?.({
         id: `dir_${crypto.randomUUID()}`,
@@ -2259,6 +2357,9 @@ export class PipelineExecutor {
       const hasVerifiedWrite = delegated.toolCalls.some(
         (call) => WRITE_EFFECT_TOOLS.has(call.name) && !call.is_error,
       );
+      // Gate future re-entry for this run on whether the delegate actually
+      // produced something (see delegateNoWriteRuns).
+      if (!hasVerifiedWrite) this.delegateNoWriteRuns.add(agentRunId);
       // Filesystem evidence is ground truth. If a delegate mutates the
       // workspace and only then times out/cancels, falling back to native can
       // duplicate a non-idempotent write. A verified write therefore closes

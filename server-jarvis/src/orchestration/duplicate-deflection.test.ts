@@ -70,14 +70,37 @@ describe("toolCallIdentityKey", () => {
   });
 
   test("keeps unrelated targets and non-path arguments distinct", () => {
-    const plan = windowsIdentity({ path: "IMPLEMENTATION_PLAN.md", offset: 0 });
-    const readme = windowsIdentity({ path: "README.md", offset: 0 });
-    const shiftedOffset = windowsIdentity({ path: "IMPLEMENTATION_PLAN.md", offset: 1 });
+    const plan = windowsIdentity({ path: "IMPLEMENTATION_PLAN.md" });
+    const readme = windowsIdentity({ path: "README.md" });
     const differentPattern = windowsIdentity({ path: "IMPLEMENTATION_PLAN.md", pattern: "Needle" });
     const caseChangedPattern = windowsIdentity({ path: "IMPLEMENTATION_PLAN.md", pattern: "needle" });
 
     expect(plan).not.toBe(readme);
-    expect(plan).not.toBe(shiftedOffset);
     expect(differentPattern).not.toBe(caseChangedPattern);
+  });
+
+  // run_8e930248: delegate seeds cache with Claude CLI Read shape (file_path);
+  // native re-entry queries with path. Full-arg JSON identity never hit.
+  test("collapses Claude CLI file_path and native path for the same read target", () => {
+    const fromDelegate = windowsIdentity({ file_path: "src/orchestration/pipeline.ts" });
+    const fromNative = windowsIdentity({ path: "src/orchestration/pipeline.ts" });
+    expect(fromDelegate).toBe(fromNative);
+  });
+
+  // Same incident: offset/limit pagination must not defeat path-level deflection.
+  test("collapses read_file path with and without offset/limit pagination", () => {
+    const whole = windowsIdentity({ path: "src/a.ts" });
+    const windowed = windowsIdentity({ path: "src/a.ts", offset: 0, limit: 100 });
+    const shifted = windowsIdentity({ path: "src/a.ts", offset: 50, limit: 100 });
+    expect(whole).toBe(windowed);
+    expect(whole).toBe(shifted);
+  });
+
+  test("collapses absolute path via file_path with relative path", () => {
+    const relative = windowsIdentity({ path: "IMPLEMENTATION_PLAN.md" });
+    const absoluteFilePath = windowsIdentity({
+      file_path: "C:\\Projects\\Jarvis\\IMPLEMENTATION_PLAN.md",
+    });
+    expect(relative).toBe(absoluteFilePath);
   });
 });

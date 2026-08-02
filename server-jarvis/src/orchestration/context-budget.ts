@@ -95,9 +95,29 @@ export function enforceTranscriptBudget(
   return { evicted, inputTokens };
 }
 
+/**
+ * Mid-loop write-pressure nudges (WRITE_EFFECT_NUDGE / buildWriteEffectNudge).
+ * These are deduped to at most one across compaction — distinct from the
+ * seeded `[Runtime write contract]`, which is a permanent stage carrier.
+ */
 function isWritePressureMessage(content: string): boolean {
+  if (content.includes("[Runtime write contract]")) return false;
   return content.includes("CHANGE request")
-    && (content.includes("write tools") || content.includes("write tool"));
+    && (
+      content.includes("write tools")
+      || content.includes("write tool")
+      || content.includes("Available write tools")
+      || content.includes("Expected write target")
+    );
+}
+
+/** Seeded write-intent contract; must survive cycle compaction as its own slot. */
+function isWriteContractMessage(content: string): boolean {
+  return content.includes("[Runtime write contract]");
+}
+
+function isCarriedEvidenceMessage(content: string): boolean {
+  return content.includes("[Runtime carried evidence]");
 }
 
 function toolTargetPath(call: ToolCallRecord): string {
@@ -201,20 +221,44 @@ export function compactCompletedExecutorCycles(
     const pressureInGap = gap.filter(
       (message) => message.role === "user" && isWritePressureMessage(message.content),
     );
+    // Carried evidence + write contract sit after the seed; keep the latest of
+    // each so re-entry and write-intent do not lose permanent stage carriers.
+    const carriedInGap = gap.filter(
+      (message) => message.role === "user" && isCarriedEvidenceMessage(message.content),
+    );
+    const contractInGap = gap.filter(
+      (message) => message.role === "user" && isWriteContractMessage(message.content),
+    );
 
     const next: TranscriptMessage[] = messages.slice(0, seedEnd);
+    if (carriedInGap.length > 0) {
+      next.push({ ...carriedInGap[carriedInGap.length - 1] });
+    }
+    if (contractInGap.length > 0) {
+      next.push({ ...contractInGap[contractInGap.length - 1] });
+    }
     next.push({ role: "user", content: checkpoint });
 
-    // At most one write-pressure note between checkpoint and retained cycles.
+    // At most one mid-loop write-pressure note between checkpoint and retained cycles.
     if (pressureInGap.length > 0) {
       next.push({ ...pressureInGap[pressureInGap.length - 1] });
     }
 
     let seenPressure = pressureInGap.length > 0;
+    let seenCarried = carriedInGap.length > 0;
+    let seenContract = contractInGap.length > 0;
     for (const message of messages.slice(keepFrom)) {
       if (message.role === "user" && isWritePressureMessage(message.content)) {
         if (seenPressure) continue;
         seenPressure = true;
+      }
+      if (message.role === "user" && isCarriedEvidenceMessage(message.content)) {
+        if (seenCarried) continue;
+        seenCarried = true;
+      }
+      if (message.role === "user" && isWriteContractMessage(message.content)) {
+        if (seenContract) continue;
+        seenContract = true;
       }
       next.push(message);
     }
@@ -222,10 +266,20 @@ export function compactCompletedExecutorCycles(
     messages.length = 0;
     messages.push(...next);
   } else {
-    // Still collapse duplicate pressure notes even when no cycles are removed.
+    // Collapse duplicate mid-loop pressure notes (not the write contract carrier).
     let seenPressure = false;
+    let seenContract = false;
     for (let i = 0; i < messages.length; i++) {
       const message = messages[i];
+      if (message.role === "user" && isWriteContractMessage(message.content)) {
+        if (seenContract) {
+          messages.splice(i, 1);
+          i--;
+          continue;
+        }
+        seenContract = true;
+        continue;
+      }
       if (message.role === "user" && isWritePressureMessage(message.content)) {
         if (seenPressure) {
           messages.splice(i, 1);
