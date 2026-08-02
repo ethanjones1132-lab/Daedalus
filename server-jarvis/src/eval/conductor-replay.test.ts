@@ -155,7 +155,16 @@ describe("conductor replay — stage deadline invariant", () => {
 describe("conductor replay — no-op executor turn invariant", () => {
   // 28 of 37 executor turns produced no tool call, each still costing a full
   // model round-trip plus a re-upload of the growing transcript.
+  //
+  // The executor's *normal* exit is a no-tool turn (tools ran earlier; model
+  // writes a closing summary). That accepted terminal empty must not count as
+  // waste — otherwise short stages floor the metric at 25–50%. Real waste is
+  // mid-stage empties and terminal empties typed as failures (stop_reason /
+  // partial_error_code / was_successful=0).
+
   test("flags a run whose executor turns mostly did nothing", () => {
+    // Eight mid-segment empties + two productive turns. Last turn has tools,
+    // so every empty is mid-stage waste.
     const run = replayRun({
       stageRuns: [
         ...Array.from({ length: 8 }, (_, i) =>
@@ -168,6 +177,87 @@ describe("conductor replay — no-op executor turn invariant", () => {
     const found = checkReplayInvariants(run).filter((v) => v.rule === "noop_executor_turns");
     expect(found).toHaveLength(1);
     expect(found[0]?.count).toBe(8);
+  });
+
+  test("accepted terminal no-tool turn does not count toward noop_executor_turns", () => {
+    // Two mid-stage empties + one natural closing empty. Without excluding the
+    // terminal summary: 3/5 = 60% flags. With exclusion: 2/5 = 40% stays green.
+    const run = replayRun({
+      stageRuns: [
+        stage({ turn_number: 1 }),
+        stage({ turn_number: 2 }),
+        stage({ turn_number: 3, tool_calls_json: "[]" }),
+        stage({ turn_number: 4, tool_calls_json: "[]" }),
+        stage({
+          turn_number: 5,
+          tool_calls_json: "[]",
+          was_successful: 1,
+          // Natural close — no typed no_tool failure.
+          stop_reason: "stop",
+          partial_error_code: null,
+        }),
+      ],
+    });
+    expect(checkReplayInvariants(run).filter((v) => v.rule === "noop_executor_turns")).toHaveLength(0);
+  });
+
+  test("mid-stage no-tool turns still count as waste", () => {
+    // Segment never ends on empty: empties sit before a final tool turn.
+    const run = replayRun({
+      stageRuns: [
+        ...Array.from({ length: 6 }, (_, i) =>
+          stage({ turn_number: i + 1, tool_calls_json: "[]" }),
+        ),
+        stage({ turn_number: 7 }),
+        stage({ turn_number: 8 }),
+      ],
+    });
+    const found = checkReplayInvariants(run).filter((v) => v.rule === "noop_executor_turns");
+    expect(found).toHaveLength(1);
+    expect(found[0]?.count).toBe(6);
+  });
+
+  test("terminal no-tool failure (stop_reason no_tool) still counts as waste", () => {
+    // Mid-stage empties + a typed terminal no_tool failure — all waste.
+    const run = replayRun({
+      stageRuns: [
+        stage({ turn_number: 1 }),
+        stage({ turn_number: 2, tool_calls_json: "[]" }),
+        stage({ turn_number: 3, tool_calls_json: "[]" }),
+        stage({ turn_number: 4, tool_calls_json: "[]" }),
+        stage({
+          turn_number: 5,
+          tool_calls_json: "[]",
+          was_successful: 0,
+          stop_reason: "no_tool",
+          partial_error_code: "executor_no_tool",
+        }),
+      ],
+    });
+    const found = checkReplayInvariants(run).filter((v) => v.rule === "noop_executor_turns");
+    expect(found).toHaveLength(1);
+    expect(found[0]?.count).toBe(4);
+  });
+
+  test("terminal empty with was_successful=0 counts even without stop_reason", () => {
+    const run = replayRun({
+      stageRuns: [
+        stage({ turn_number: 1 }),
+        stage({ turn_number: 2, tool_calls_json: "[]" }),
+        stage({ turn_number: 3, tool_calls_json: "[]" }),
+        stage({ turn_number: 4, tool_calls_json: "[]" }),
+        stage({
+          turn_number: 5,
+          tool_calls_json: "[]",
+          was_successful: 0,
+          stop_reason: null,
+          partial_error_code: null,
+        }),
+      ],
+    });
+    const found = checkReplayInvariants(run).filter((v) => v.rule === "noop_executor_turns");
+    expect(found).toHaveLength(1);
+    expect(found[0]?.count).toBe(4);
   });
 
   test("does not flag a productive executor stage", () => {

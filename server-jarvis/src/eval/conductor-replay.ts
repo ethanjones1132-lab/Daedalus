@@ -231,10 +231,47 @@ function checkStageDeadlines(run: ReplayRun): ReplayViolation[] {
   return out;
 }
 
+/**
+ * Zero-tool executor turns that are *not* an accepted terminal stage-end.
+ *
+ * The executor loop's normal exit is a no-tool turn — tools ran, model writes
+ * a closing summary, stage ends. Counting that terminal empty as waste floors
+ * the metric at 25–50% on healthy 2–4 turn stages. Real waste is mid-segment
+ * empties and terminal empties typed as failures.
+ *
+ * Segments use the same turn_number restart rule as `executorSegmentLengths`.
+ */
+function isNoopWasteTurn(stage: StageRun, isLastInSegment: boolean): boolean {
+  if (parseToolCallCount(stage.tool_calls_json) !== 0) return false;
+  if (!isLastInSegment) return true;
+  // Terminal empty: waste only when it looks like a typed no-tool failure.
+  if (stage.stop_reason === "no_tool") return true;
+  if (stage.partial_error_code === "executor_no_tool") return true;
+  if (stage.was_successful === 0) return true;
+  return false;
+}
+
+/** Index → whether that executor row is the last turn of its segment. */
+function executorSegmentTerminalFlags(executorRuns: StageRun[]): boolean[] {
+  const flags = new Array<boolean>(executorRuns.length).fill(false);
+  if (executorRuns.length === 0) return flags;
+  let previousTurn = 0;
+  for (let i = 0; i < executorRuns.length; i++) {
+    const turn = executorRuns[i]!.turn_number ?? 0;
+    if (turn <= previousTurn && i > 0) {
+      flags[i - 1] = true;
+    }
+    previousTurn = turn;
+  }
+  flags[executorRuns.length - 1] = true;
+  return flags;
+}
+
 function checkNoopExecutorTurns(run: ReplayRun, t: ReplayThresholds): ReplayViolation[] {
   const executorRuns = run.stageRuns.filter((s) => s.mode_id === "executor");
   if (executorRuns.length < t.minExecutorTurnsForRatio) return [];
-  const noop = executorRuns.filter((s) => parseToolCallCount(s.tool_calls_json) === 0);
+  const terminalFlags = executorSegmentTerminalFlags(executorRuns);
+  const noop = executorRuns.filter((s, i) => isNoopWasteTurn(s, terminalFlags[i]!));
   const ratio = noop.length / executorRuns.length;
   if (ratio <= t.maxNoopExecutorRatio) return [];
   const wastedMs = noop.reduce((sum, s) => sum + (s.duration_ms ?? 0), 0);
