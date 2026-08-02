@@ -1474,6 +1474,69 @@ describe("pipeline stage telemetry", () => {
     expect(noToolRows[0]?.output_tokens).toBeGreaterThan(0);
   });
 
+  test("no-tool write turn persists finish/parse diagnostics in diagnostic_json", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    runtime.register(toolDefinition("write_file"), async () => "written");
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    const prose =
+      "I would write the file like this: ```ts\nexport const x = 1\n``` " +
+      "but the completion hit the length cap mid-thought.";
+    let executorCalls = 0;
+    const callModel = async (_messages: unknown[], options: any = {}) => {
+      if (options.stageLabel === "executor") {
+        executorCalls++;
+        return {
+          content: prose,
+          tool_calls: [],
+          _finishReason: "length",
+          _stopReason: "length",
+          _truncated: true,
+          _toolParseAttempted: true,
+          _toolParseFailed: true,
+          _provider: "openrouter",
+          _modelUsed: executorCalls === 1 ? "weak-model" : "strong-model",
+        };
+      }
+      if (options.stageLabel === "synthesizer") return { content: "Partial: no write landed." };
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "update workspace/thing.ts with a constant",
+      ["executor", "synthesizer"],
+      "run-no-tool-diagnostic-json",
+      () => {},
+      {
+        executionProfile: "full",
+        turnBudget: {
+          stageRemainingMs: () => 60_000,
+          extendStageOnProgress: () => 0,
+        } as any,
+      },
+    );
+
+    expect(result.error_code).toBe("executor_no_tool");
+    const noToolRows = rows.filter(
+      (row) => row.mode_id === "executor" && row.stop_reason === "no_tool",
+    );
+    expect(noToolRows.length).toBeGreaterThanOrEqual(1);
+    for (const row of noToolRows) {
+      expect(row.partial_error_code).toBe("executor_no_tool");
+      expect(row.diagnostic_json).toBeTruthy();
+      const diag = JSON.parse(row.diagnostic_json!);
+      expect(diag.content_prefix).toContain("export const x = 1");
+      expect(diag.content_prefix.length).toBeLessThanOrEqual(2048);
+      expect(diag.finish_reason).toBe("length");
+      expect(diag.stop_reason).toBe("length");
+      expect(diag.truncated).toBe(true);
+      expect(diag.tool_parse_attempted).toBe(true);
+      expect(diag.tool_parse_failed).toBe(true);
+    }
+  });
+
   test("successful write does not trigger a needless no-tool strong retry", async () => {
     const rows: StageRun[] = [];
     const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };

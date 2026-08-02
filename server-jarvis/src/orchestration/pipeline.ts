@@ -3258,6 +3258,29 @@ export class PipelineExecutor {
             requiresWriteEffect &&
             !emittedToolCalls &&
             successfulWriteCount() === 0;
+          // Task 2b: stage stop_reason stays "no_tool" for consumers; real
+          // finish/parse metadata lives in diagnostic_json so length-truncated
+          // vs finished-prose vs text-tool parse-fail are distinguishable.
+          const noToolDiagnostics = isNoToolWriteTurn
+            ? (() => {
+                const resp = response as {
+                  content?: string;
+                  _finishReason?: string | null;
+                  _stopReason?: string | null;
+                  _truncated?: boolean;
+                  _toolParseAttempted?: true;
+                  _toolParseFailed?: true;
+                } | null | undefined;
+                return {
+                  content_prefix: String(resp?.content ?? "").slice(0, 2048),
+                  finish_reason: typeof resp?._finishReason === "string" ? resp._finishReason : null,
+                  stop_reason: typeof resp?._stopReason === "string" ? resp._stopReason : null,
+                  truncated: resp?._truncated === true,
+                  tool_parse_attempted: resp?._toolParseAttempted === true,
+                  tool_parse_failed: resp?._toolParseFailed === true,
+                };
+              })()
+            : undefined;
           this.collector.recordStageRun({
             id: `stage_${crypto.randomUUID()}`,
             agent_run_id: agentRunId,
@@ -3276,6 +3299,7 @@ export class PipelineExecutor {
                 : undefined,
             stop_reason: isNoToolWriteTurn ? "no_tool" : undefined,
             partial_error_code: isNoToolWriteTurn ? "executor_no_tool" : undefined,
+            diagnostic_json: noToolDiagnostics ? JSON.stringify(noToolDiagnostics) : undefined,
           });
         } catch (err: any) {
           this.collector.recordStageRun({
