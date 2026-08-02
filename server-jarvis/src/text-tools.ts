@@ -248,6 +248,29 @@ ${toolList}
 - tools_enum: List all available Jarvis tools. Args: { }`;
 }
 
+/**
+ * Diagnostic flags for text-tool protocol turns.
+ * Distinguishes "parse ran and found no calls" (prose / failed extract)
+ * from native-tool turns that never attempted text parsing.
+ * Pipeline diagnostic_json (item 2b) will read these on no-tool turns.
+ */
+export type TextToolParseSignals = {
+  _toolParseAttempted?: true;
+  _toolParseFailed?: true;
+};
+
+/** Pure mapping: text-tool parse attempt/failure → response signal flags. */
+export function textToolParseSignals(
+  useTextTools: boolean,
+  extractedCallCount: number,
+): TextToolParseSignals {
+  if (!useTextTools) return {};
+  if (extractedCallCount > 0) {
+    return { _toolParseAttempted: true };
+  }
+  return { _toolParseAttempted: true, _toolParseFailed: true };
+}
+
 export function extractTextToolCalls(text: string, tools: ToolDefinition[]): {
   cleanedText: string;
   calls: ParsedTextToolCall[];

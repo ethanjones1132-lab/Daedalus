@@ -3,6 +3,7 @@ import {
   extractTextToolCalls,
   createStageStreamSanitizer,
   hasExplicitWebSearchIntent,
+  textToolParseSignals,
   textToolResultsPrompt,
   TextToolCallStreamSanitizer,
   VisibleAnswerStreamSanitizer,
@@ -416,6 +417,25 @@ Here is the actual answer.`;
     expect(apiTools.length).toBeGreaterThan(0);
     expect(apiTools.some(tool => "requires_approval" in tool)).toBe(false);
     expect(apiTools.some(tool => "dangerous" in tool)).toBe(false);
+  });
+});
+
+describe("textToolParseSignals", () => {
+  test("omits flags when not using text tools", () => {
+    expect(textToolParseSignals(false, 0)).toEqual({});
+    expect(textToolParseSignals(false, 3)).toEqual({});
+  });
+
+  test("marks attempt without failure when calls were extracted", () => {
+    expect(textToolParseSignals(true, 1)).toEqual({ _toolParseAttempted: true });
+    expect(textToolParseSignals(true, 5)).toEqual({ _toolParseAttempted: true });
+  });
+
+  test("marks attempt and failure when zero calls extracted", () => {
+    expect(textToolParseSignals(true, 0)).toEqual({
+      _toolParseAttempted: true,
+      _toolParseFailed: true,
+    });
   });
 });
 

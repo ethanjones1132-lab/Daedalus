@@ -67,6 +67,7 @@ import {
   hasExplicitWebSearchIntent,
   hasLocalWorkspaceToolIntent,
   isNativeToolProtocolUnsupportedError,
+  textToolParseSignals,
   textToolResultsPrompt,
   webSearchQueryFromPrompt,
 } from "./text-tools";
@@ -2457,15 +2458,24 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             console.warn(`[Jarvis] malformed streamed tool_call (${w.kind}) ${normalizeCtx}: ${w.message}`);
           }
           let parsedToolCalls = normalized.calls;
+          // Text-tool stages always attempt parse; zero calls may mean prose
+          // rather than a successful native empty tool list. Flags are read by
+          // the orchestrator pipeline (diagnostic_json) on no-tool turns.
+          let toolParseFlags = textToolParseSignals(false, 0);
 
           if (useTextTools) {
             const extracted = extractTextToolCalls(fullTurnText, callOptions.tools);
+            toolParseFlags = textToolParseSignals(true, extracted.calls.length);
             if (extracted.calls.length > 0) {
               parsedToolCalls = extracted.calls.map((c) => ({
                 id: c.id || `call_${crypto.randomUUID().slice(0, 8)}`,
                 name: c.name,
                 arguments: c.arguments,
               }));
+            } else {
+              console.warn(
+                `[Jarvis] text-tool parse produced zero calls ${normalizeCtx}: model may have written prose instead of tool protocol`,
+              );
             }
           }
 
@@ -2616,6 +2626,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             _fallbackRetries: attemptFallbackRetries,
             _fallbackDepth: attemptFallbackDepth,
             _fallbackReason: attemptFallbackReason,
+            // Present only on text-tool turns; pipeline may persist on no-tool turns.
+            ...toolParseFlags,
           };
           } finally {
             clearTimeout(firstTokenTimer);
