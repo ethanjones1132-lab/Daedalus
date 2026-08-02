@@ -167,11 +167,14 @@ describe("Self tuning", () => {
         delegate_request_id: "req-123",
         exit_code: 1,
         stderr_tail: "proxy refused",
+        stdout_tail: "stream-json chatter",
       }),
     });
     expect(JSON.parse(store.getStageRuns("run-diagnostic")[0]!.diagnostic_json!)).toMatchObject({
       delegate_request_id: "req-123",
       exit_code: 1,
+      stderr_tail: "proxy refused",
+      stdout_tail: "stream-json chatter",
     });
   });
 

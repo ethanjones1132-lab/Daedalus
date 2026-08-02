@@ -1807,6 +1807,50 @@ describe("Claude executor delegate", () => {
     expect(diag!.exitCode).toBe(0);
   });
 
+  test("process factory retains only a sanitized 4KiB stdout tail", async () => {
+    // Non-JSON chatter (>4 KiB) with a secret near the end, then a valid
+    // stream-json event — stdout_tail must keep the newest 4096 chars, scrub
+    // secrets, and must not break protocol parsing of well-formed lines.
+    const padding = "noise-line-abcdefghijklmnopqrstuvwxyz\n".repeat(200); // ~6.8 KiB
+    const secret = "Authorization: Bearer secret-value";
+    const tailMarker = "DELEGATE_STDOUT_TAIL_MARKER";
+    const chatter = `${padding}${secret}\n${tailMarker}\n`;
+    const resultLine = `${JSON.stringify({ type: "result", result: "ok" })}\n`;
+    const script = [
+      `process.stdout.write(${JSON.stringify(chatter)});`,
+      `process.stdout.write(${JSON.stringify(resultLine)});`,
+    ].join("\n");
+
+    const child = await nodeDelegateProcessFactory({
+      executable: process.execPath,
+      args: ["-e", script],
+      promptOnStdin: false,
+      cleanup: () => {},
+      cwd: process.cwd(),
+      env: { ...process.env } as Record<string, string>,
+      timeoutMs: 10_000,
+      authMode: "proxy",
+      baseUrl: "http://127.0.0.1:19878",
+      prompt: "unused",
+      signal: new AbortController().signal,
+    });
+
+    const events: unknown[] = [];
+    for await (const event of child.events) events.push(event);
+    const exit = await child.exit;
+    expect(exit.code).toBe(0);
+    // Protocol regression guard: well-formed JSON lines still parse.
+    expect(events).toEqual([{ type: "result", result: "ok" }]);
+
+    const diag = child.diagnostics?.();
+    expect(diag).toBeDefined();
+    expect(diag!.stdoutTail.length).toBeLessThanOrEqual(4096);
+    expect(diag!.stdoutTail).toContain(tailMarker);
+    expect(diag!.stdoutTail).not.toContain("secret-value");
+    expect(diag!.stdoutTail).not.toMatch(/Authorization:\s*Bearer\s+secret-value/i);
+    expect(diag!.exitCode).toBe(0);
+  });
+
   test("runClaudeDelegate attaches request-id and process diagnostics to the result", async () => {
     const config = testConfig();
     const snapshot: DelegateRootSnapshot = {
@@ -1834,6 +1878,7 @@ describe("Claude executor delegate", () => {
           kill: () => {},
           diagnostics: () => ({
             stderrTail: "proxy refused\nAuthorization: Bearer secret-value",
+            stdoutTail: "stream chatter\nAuthorization: Bearer secret-value\n{\"type\":\"error\"}",
             exitCode: 1,
           }),
         };
@@ -1847,6 +1892,8 @@ describe("Claude executor delegate", () => {
     expect(output.diagnostics?.exit_code).toBe(1);
     expect(output.diagnostics?.stderr_tail).toContain("proxy refused");
     expect(output.diagnostics?.stderr_tail).not.toContain("secret-value");
+    expect(output.diagnostics?.stdout_tail).toContain("stream chatter");
+    expect(output.diagnostics?.stdout_tail).not.toContain("secret-value");
     expect(output.diagnostics?.auth_mode).toBeTruthy();
   });
 });

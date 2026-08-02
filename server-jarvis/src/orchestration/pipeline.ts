@@ -2317,6 +2317,7 @@ export class PipelineExecutor {
               base_url: delegated.diagnostics.base_url,
               exit_code: delegated.diagnostics.exit_code,
               stderr_tail: delegated.diagnostics.stderr_tail,
+              stdout_tail: delegated.diagnostics.stdout_tail,
             })
           : undefined,
       });

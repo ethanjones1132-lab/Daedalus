@@ -41,6 +41,8 @@ export interface DelegateStageDiagnostics {
   base_url?: string;
   exit_code?: number | null;
   stderr_tail?: string;
+  /** Newest ≤4096 chars of raw stdout (incl. non-JSON), secrets scrubbed. */
+  stdout_tail?: string;
 }
 
 export interface ExecutorStageOutput {

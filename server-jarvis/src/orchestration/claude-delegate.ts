@@ -451,6 +451,11 @@ export interface DelegateProcessExit {
 export interface DelegateProcessDiagnostics {
   /** Newest ≤4096 UTF-8 characters of stderr, secrets scrubbed. */
   stderrTail: string;
+  /**
+   * Newest ≤4096 UTF-8 characters of raw stdout (including non-JSON chatter),
+   * secrets scrubbed. Backstop when stream-json parse yields nothing useful.
+   */
+  stdoutTail: string;
   /** Process exit code when known (null if signal/unknown). */
   exitCode?: number | null;
 }
@@ -493,10 +498,9 @@ export function sanitizeDelegateDiagnosticText(raw: string): string {
   return text;
 }
 
-function boundedStderrTail(raw: string): string {
-  const sliced = raw.length <= DELEGATE_STDERR_TAIL_CHARS
-    ? raw
-    : raw.slice(raw.length - DELEGATE_STDERR_TAIL_CHARS);
+/** Keep the newest `cap` characters and scrub credential-bearing tokens. */
+function boundedDiagnosticTail(raw: string, cap: number = DELEGATE_STDERR_TAIL_CHARS): string {
+  const sliced = raw.length <= cap ? raw : raw.slice(raw.length - cap);
   return sanitizeDelegateDiagnosticText(sliced);
 }
 
@@ -512,10 +516,18 @@ export interface DelegateProcessTreeKiller {
   signalTree(process: DelegateProcess, signal: "SIGTERM" | "SIGKILL"): Promise<void>;
 }
 
-async function* readJsonLines(stream: NodeJS.ReadableStream): AsyncGenerator<unknown> {
+/**
+ * Parse stream-json lines. Optional `onRawLine` is a passive accumulator for
+ * diagnostics — it must not influence which values are yielded.
+ */
+async function* readJsonLines(
+  stream: NodeJS.ReadableStream,
+  onRawLine?: (rawLine: string) => void,
+): AsyncGenerator<unknown> {
   const lines = createInterface({ input: stream, crlfDelay: Infinity });
   try {
     for await (const line of lines) {
+      onRawLine?.(line);
       const trimmed = line.trim();
       if (!trimmed) continue;
       try {
@@ -553,6 +565,13 @@ export const nodeDelegateProcessFactory: DelegateProcessFactory = async (launch)
     if (stderrRaw.length > keep) stderrRaw = stderrRaw.slice(stderrRaw.length - keep);
   };
   child.stderr?.on("data", onStderr);
+  // Passive stdout accumulator (raw lines including non-JSON chatter).
+  let stdoutRaw = "";
+  const onStdoutLine = (rawLine: string) => {
+    stdoutRaw += `${rawLine}\n`;
+    const keep = DELEGATE_STDERR_TAIL_CHARS * 2;
+    if (stdoutRaw.length > keep) stdoutRaw = stdoutRaw.slice(stdoutRaw.length - keep);
+  };
   const exit = new Promise<DelegateProcessExit>((resolveExit) => {
     child.once("exit", (code, signal) => {
       resolvedExit = { code, signal };
@@ -575,12 +594,13 @@ export const nodeDelegateProcessFactory: DelegateProcessFactory = async (launch)
   }
   return {
     pid: child.pid,
-    events: readJsonLines(stdout),
+    events: readJsonLines(stdout, onStdoutLine),
     exit,
     writeStdin: stdin ? (text) => stdin.end(text) : undefined,
     kill: (signal) => { child.kill(signal); },
     diagnostics: () => ({
-      stderrTail: boundedStderrTail(stderrRaw),
+      stderrTail: boundedDiagnosticTail(stderrRaw),
+      stdoutTail: boundedDiagnosticTail(stdoutRaw),
       exitCode: resolvedExit.code,
     }),
   };
@@ -1173,6 +1193,9 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
         exit_code: processDiagnostics?.exitCode ?? null,
         stderr_tail: processDiagnostics
           ? sanitizeDelegateDiagnosticText(processDiagnostics.stderrTail)
+          : undefined,
+        stdout_tail: processDiagnostics
+          ? sanitizeDelegateDiagnosticText(processDiagnostics.stdoutTail)
           : undefined,
       };
     };
