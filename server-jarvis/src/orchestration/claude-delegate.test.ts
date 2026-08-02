@@ -1741,6 +1741,29 @@ describe("Claude executor delegate", () => {
     expect(typeError.errorCode).toBe("delegate_cli_error");
     expect(typeError.narrative).toMatch(/authentication_failed|api_error/i);
     expect(typeError.narrative).not.toMatch(/exited without emitting stream events/i);
+
+    // result + is_error with process exit 0 must still fail as delegate_cli_error
+    // (not complete successfully / not generic no-events).
+    const resultErrorExit0 = await runClaudeDelegate({
+      ...base,
+      health: new DelegateHealth(),
+      processFactory: async () => ({
+        events: (async function* () {
+          yield {
+            type: "result",
+            subtype: "error_during_execution",
+            is_error: true,
+            result: "execution failed mid-turn",
+          };
+        })(),
+        exit: Promise.resolve({ code: 0, signal: null }),
+        kill: () => {},
+      }),
+    });
+    expect(resultErrorExit0.ok).toBe(false);
+    expect(resultErrorExit0.errorCode).toBe("delegate_cli_error");
+    expect(resultErrorExit0.narrative).toMatch(/error_during_execution|execution failed mid-turn/i);
+    expect(resultErrorExit0.narrative).not.toMatch(/exited without emitting stream events/i);
   });
 
   test("process factory retains only a sanitized 4KiB stderr tail", async () => {

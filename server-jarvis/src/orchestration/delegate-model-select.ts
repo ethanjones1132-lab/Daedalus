@@ -187,6 +187,9 @@ export function isDelegateThrashOutcome(input: {
     code.includes("rate") ||
     code.includes("spawn") ||
     code.includes("exit") ||
+    // Named CLI stream failures (result is_error / type:error) — previously
+    // often classified as delegate_exit_nonzero; must still promote free→Go.
+    code.includes("cli") ||
     code.includes("unverified") ||
     code.includes("aborted") ||
     code.includes("handoff") ||

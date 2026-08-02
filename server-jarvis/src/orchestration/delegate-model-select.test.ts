@@ -200,6 +200,15 @@ describe("delegate thrash accounting", () => {
     expect(isDelegateThrashOutcome({
       ok: false, hasVerifiedWrite: false, errorCode: "mid_loop_handoff",
     })).toBe(true);
+    // Named CLI stream failures used to surface as delegate_exit_nonzero
+    // (matched via "exit"). Preferring delegate_cli_error must stay thrash-
+    // eligible so free→Go promotion still advances on repeated CLI failures.
+    expect(isDelegateThrashOutcome({
+      ok: false, hasVerifiedWrite: false, errorCode: "delegate_cli_error",
+    })).toBe(true);
+    expect(isDelegateThrashOutcome({
+      ok: false, hasVerifiedWrite: false, errorCode: "delegate_exit_nonzero",
+    })).toBe(true);
   });
 });
 
