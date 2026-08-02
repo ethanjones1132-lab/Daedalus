@@ -1681,6 +1681,68 @@ describe("Claude executor delegate", () => {
     expect(exitHealth.snapshot().lastReason).toBe("no_event_exit");
   });
 
+  test("prefers decoded CLI error/result-error signals over generic delegate_no_events", async () => {
+    const config = testConfig();
+    const snapshot: DelegateRootSnapshot = {
+      root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
+    };
+    const base = {
+      config,
+      prompt: "change it",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 30_000,
+      profile: "full" as const,
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      snapshotFactory: { capture: async () => [snapshot] },
+    };
+
+    const resultError = await runClaudeDelegate({
+      ...base,
+      health: new DelegateHealth(),
+      processFactory: async () => ({
+        events: (async function* () {
+          yield {
+            type: "result",
+            subtype: "error_during_execution",
+            is_error: true,
+            result: "API rejected the request",
+          };
+        })(),
+        exit: Promise.resolve({ code: 1, signal: null }),
+        kill: () => {},
+      }),
+    });
+    expect(resultError.ok).toBe(false);
+    expect(resultError.errorCode).not.toBe("delegate_no_events");
+    expect(resultError.errorCode).toBe("delegate_cli_error");
+    expect(resultError.narrative).toMatch(/error_during_execution|API rejected the request/i);
+    expect(resultError.narrative).not.toMatch(/exited without emitting stream events/i);
+
+    const typeError = await runClaudeDelegate({
+      ...base,
+      health: new DelegateHealth(),
+      processFactory: async () => ({
+        events: (async function* () {
+          yield {
+            type: "error",
+            subtype: "api_error",
+            error: "authentication_failed",
+          };
+        })(),
+        // Exit 0 must still fail when the CLI stream named an error.
+        exit: Promise.resolve({ code: 0, signal: null }),
+        kill: () => {},
+      }),
+    });
+    expect(typeError.ok).toBe(false);
+    expect(typeError.errorCode).not.toBe("delegate_no_events");
+    expect(typeError.errorCode).toBe("delegate_cli_error");
+    expect(typeError.narrative).toMatch(/authentication_failed|api_error/i);
+    expect(typeError.narrative).not.toMatch(/exited without emitting stream events/i);
+  });
+
   test("process factory retains only a sanitized 4KiB stderr tail", async () => {
     // >4 KiB of noise, then a secret header near the end so a naive dump would
     // retain it — diagnostics must keep the newest 4096 chars and scrub secrets.

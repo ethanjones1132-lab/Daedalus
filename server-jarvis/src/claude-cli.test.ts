@@ -326,6 +326,47 @@ describe("Claude CLI stream-json decoder", () => {
     }]);
   });
 
+  test("preserves result is_error and subtype failure signals", () => {
+    expect(decodeClaudeCliMessage({
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      session_id: "err-session",
+      result: "API rejected the request",
+      usage: { input_tokens: 1, output_tokens: 0 },
+      total_cost_usd: 0,
+      num_turns: 0,
+    })).toEqual([{
+      type: "result",
+      content: "API rejected the request",
+      session_id: "err-session",
+      usage: { input_tokens: 1, output_tokens: 0 },
+      cost_usd: 0,
+      num_turns: 0,
+      subtype: "error_during_execution",
+      is_error: true,
+    }]);
+  });
+
+  test("decodes type error stream-json records instead of dropping them", () => {
+    expect(decodeClaudeCliMessage({
+      type: "error",
+      session_id: "err-session",
+      error: "authentication_failed",
+      subtype: "api_error",
+    })).toEqual([{
+      type: "error",
+      error: "authentication_failed",
+      content: "authentication_failed",
+      subtype: "api_error",
+      is_error: true,
+      session_id: "err-session",
+    }]);
+
+    // Unknown non-stream types still drop (unchanged).
+    expect(decodeClaudeCliMessage({ type: "unknown_future_type" })).toEqual([]);
+  });
+
   test("does not duplicate completed assistant text after ordered partial deltas", () => {
     const state = { partialTextSeen: false };
     const fixture = [

@@ -452,6 +452,8 @@ export interface ClaudeStreamEvent {
   tool_input?: Record<string, unknown>;
   tool_output?: string;
   is_error?: boolean;
+  /** Stock stream-json subtype (e.g. result subtype `error_during_execution`). */
+  subtype?: string;
   session_id?: string;
   tools?: string[];
   model?: string;
@@ -592,6 +594,35 @@ export function decodeClaudeCliMessage(
       usage: msg.usage,
       cost_usd: typeof msg.total_cost_usd === "number" ? msg.total_cost_usd : undefined,
       num_turns: typeof msg.num_turns === "number" ? msg.num_turns : undefined,
+      // Preserve CLI failure signals — stream-json reports errors as result
+      // records with subtype/is_error rather than only via process exit code.
+      subtype: typeof msg.subtype === "string" ? msg.subtype : undefined,
+      is_error: typeof msg.is_error === "boolean" ? msg.is_error : undefined,
+    }];
+  }
+
+  if (msg.type === "error") {
+    const errorText = (() => {
+      if (typeof msg.error === "string") return msg.error;
+      if (msg.error && typeof msg.error === "object") {
+        const obj = msg.error as { message?: unknown; type?: unknown };
+        if (typeof obj.message === "string") return obj.message;
+        try {
+          return JSON.stringify(msg.error);
+        } catch {
+          return String(msg.error);
+        }
+      }
+      if (typeof msg.content === "string") return msg.content;
+      return undefined;
+    })();
+    return [{
+      type: "error",
+      error: errorText,
+      content: errorText,
+      subtype: typeof msg.subtype === "string" ? msg.subtype : undefined,
+      is_error: true,
+      session_id,
     }];
   }
 

@@ -1220,6 +1220,8 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
     const eventIterator = delegatedProcess.events[Symbol.asyncIterator]();
     let eventCount = 0;
     let policyViolation = false;
+    /** Decoded CLI failure signal (result is_error / type error) for named failure reasons. */
+    let cliFailureDetail: string | undefined;
     const execution = (async (): Promise<
       | { kind: "completed"; exit: DelegateProcessExit }
       | { kind: "stream_error"; error: unknown }
@@ -1236,9 +1238,30 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
               narrative.push(event.delta.text);
               input.onTextDelta?.(event.delta.text);
             }
-            else if (event.type === "result" && event.content) {
-              narrative.push(event.content);
-              input.onTextDelta?.(event.content);
+            else if (event.type === "result") {
+              if (event.content) {
+                narrative.push(event.content);
+                input.onTextDelta?.(event.content);
+              }
+              if (event.is_error === true) {
+                const parts = [event.subtype, event.content ?? event.error]
+                  .filter((part): part is string => typeof part === "string" && part.length > 0);
+                cliFailureDetail = parts.length > 0
+                  ? parts.join(": ")
+                  : "result reported is_error";
+              }
+            }
+            else if (event.type === "error") {
+              const parts = [event.subtype, event.error ?? event.content]
+                .filter((part): part is string => typeof part === "string" && part.length > 0);
+              cliFailureDetail = parts.length > 0
+                ? parts.join(": ")
+                : "CLI emitted an error event";
+              const text = event.error ?? event.content;
+              if (text) {
+                narrative.push(text);
+                input.onTextDelta?.(text);
+              }
             }
             else if (event.type === "tool_use") {
               const stockToolName = event.tool_name ?? "unknown";
@@ -1403,7 +1426,7 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
         errorCode: "delegate_stream_error",
       });
     }
-    if (eventCount === 0) {
+    if (eventCount === 0 && !cliFailureDetail) {
       input.health.strike("no_event_exit");
       return withDiagnostics({
         ok: false,
@@ -1411,6 +1434,23 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
         toolCalls: records,
         terminalStatus: "failed",
         errorCode: "delegate_no_events",
+      });
+    }
+    // Prefer a named CLI failure cause over generic no-events / bare exit codes
+    // when stream-json already reported why the turn failed.
+    if (cliFailureDetail) {
+      const text = narrative.join("");
+      const failureNarrative = text.includes(cliFailureDetail)
+        ? (text || `Claude delegate failed: ${cliFailureDetail}`)
+        : (text
+          ? `${text}\nClaude delegate failed: ${cliFailureDetail}`
+          : `Claude delegate failed: ${cliFailureDetail}`);
+      return withDiagnostics({
+        ok: false,
+        narrative: failureNarrative,
+        toolCalls: records,
+        terminalStatus: "failed",
+        errorCode: "delegate_cli_error",
       });
     }
     if (streamOutcome.exit.code !== 0) {
