@@ -547,6 +547,84 @@ describe("buildMidLoopToolEvidence", () => {
       edits: [{ path: "one.ts" }, { file_path: "two.ts" }],
     })).toEqual(["one.ts", "two.ts"]);
   });
+
+  // W5 mid-loop integrity: status/log (and off-target) writes must not count
+  // as successfulWrites — otherwise force_write pressure stops while the
+  // terminal effect gate still reports no_write_effect.
+  test("status doc write does not count as successfulWrites", () => {
+    const evidence = buildMidLoopToolEvidence([
+      {
+        name: "write_file",
+        arguments: { path: "IMPLEMENTATION_STATUS_CURRENT.md" },
+        output: "wrote",
+        is_error: false,
+        duration_ms: 5,
+      },
+      {
+        name: "write_file",
+        arguments: { path: "docs/EXECUTION_LOG.md" },
+        output: "wrote",
+        is_error: false,
+        duration_ms: 5,
+      },
+    ]);
+    expect(evidence.successfulWrites).toBe(0);
+    expect(evidence.recentWriteTargets).toEqual([]);
+  });
+
+  test("off-target write is ignored when targetPaths are set; target write counts", () => {
+    const evidence = buildMidLoopToolEvidence([
+      {
+        name: "write_file",
+        arguments: { path: "scratch/notes.md" },
+        output: "wrote",
+        is_error: false,
+        duration_ms: 5,
+      },
+      {
+        name: "edit_file",
+        arguments: { path: "src/app.ts" },
+        output: "edited",
+        is_error: false,
+        duration_ms: 5,
+      },
+    ], { targetPaths: ["src/app.ts"] });
+    expect(evidence.successfulWrites).toBe(1);
+    expect(evidence.recentWriteTargets).toEqual(["src/app.ts"]);
+  });
+
+  test("status doc listed as a target still does not credit mid-loop success", () => {
+    const evidence = buildMidLoopToolEvidence([
+      {
+        name: "write_file",
+        arguments: { path: "IMPLEMENTATION_STATUS_CURRENT.md" },
+        output: "wrote",
+        is_error: false,
+        duration_ms: 5,
+      },
+    ], { targetPaths: ["IMPLEMENTATION_STATUS_CURRENT.md", "src/app.ts"] });
+    expect(evidence.successfulWrites).toBe(0);
+    expect(evidence.recentWriteTargets).toEqual([]);
+  });
+});
+
+describe("pickNamedWriteTarget / failed-write notes (W5)", () => {
+  test("failed-write note never names a status/log path", () => {
+    const d = decideMidLoopIntervention({
+      ...base,
+      distinctSuccessfulReads: 2,
+      failedWriteAttempts: 2,
+      successfulWrites: 0,
+      stageRemainingMs: 200_000,
+      recentWriteTargets: ["IMPLEMENTATION_STATUS_CURRENT.md"],
+      recentReadTargets: ["src/real.ts"],
+    });
+    expect(d.kind).toBe("force_write");
+    const note = (d as { note: string }).note;
+    expect(note).not.toMatch(/IMPLEMENTATION_STATUS/i);
+    expect(note).not.toMatch(/_STATUS|_LOG/i);
+    expect(note).toContain("src/real.ts");
+  });
 });
 
 describe("correctness floor stays about the work attempted, not the plan", () => {

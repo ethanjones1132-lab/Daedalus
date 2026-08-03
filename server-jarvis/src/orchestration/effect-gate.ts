@@ -399,6 +399,30 @@ export const WRITE_EFFECT_NUDGE =
   "not modify any file and do not count. After writing, read the file back " +
   "to verify, then finish.";
 
+/** Safe fallback when no non-status write target is known. */
+export const GENERIC_WRITE_TARGET_LABEL = "the requested workspace file";
+
+/**
+ * Resolve a path safe to name in a write-pressure nudge. Status/log basenames
+ * are never returned — they would steer the model into the gaming path.
+ */
+export function resolveNamedWriteTarget(
+  expectedTarget?: string,
+  taskTargets?: readonly string[],
+): string {
+  const preferred = (taskTargets ?? []).find((path) => path && !isStatusOrLogDocPath(path));
+  if (preferred) return preferred;
+  const evidence = expectedTarget?.trim();
+  if (
+    evidence
+    && evidence !== GENERIC_WRITE_TARGET_LABEL
+    && !isStatusOrLogDocPath(evidence)
+  ) {
+    return evidence;
+  }
+  return GENERIC_WRITE_TARGET_LABEL;
+}
+
 /**
  * Build a write-pressure note. Prefer a concrete task target when known
  * (W5.2); fall back to the evidence-derived path. Never names status/log docs.
@@ -410,11 +434,7 @@ export function buildWriteEffectNudge(
 ): string {
   const available = writeTools.length > 0 ? writeTools.join(", ") : "no write tools exposed";
   const preferred = (taskTargets ?? []).find((path) => path && !isStatusOrLogDocPath(path));
-  const evidenceOk = expectedTarget && !isStatusOrLogDocPath(expectedTarget)
-    && expectedTarget !== "the requested workspace file";
-  const target = preferred
-    ?? (evidenceOk ? expectedTarget : undefined)
-    ?? expectedTarget;
+  const target = resolveNamedWriteTarget(expectedTarget, taskTargets);
   const targetClause = preferred
     ? `Required write target from the task/plan: ${preferred}. Apply the requested edit there — status or log docs do not count.`
     : `Expected write target based on the gathered evidence: ${target}.`;
@@ -436,7 +456,10 @@ export function claimWriteEffectPressure(budget?: SemanticPressureBudget): boole
   return budget.claim("write_effect");
 }
 
-/** Select the file with the most genuine successful content reads. */
+/**
+ * Select the file with the most genuine successful content reads.
+ * Status/log docs are ignored so they cannot become the named write target.
+ */
 export function mostReadSuccessfulFile(calls: ToolCallRecord[]): string | undefined {
   const counts = new Map<string, number>();
   for (const call of calls) {
@@ -449,7 +472,9 @@ export function mostReadSuccessfulFile(calls: ToolCallRecord[]): string | undefi
       continue;
     }
     const path = typeof call.arguments.path === "string" ? call.arguments.path.trim() : "";
-    if (path) counts.set(path, (counts.get(path) ?? 0) + 1);
+    if (path && !isStatusOrLogDocPath(path)) {
+      counts.set(path, (counts.get(path) ?? 0) + 1);
+    }
   }
   let target: string | undefined;
   let max = 0;

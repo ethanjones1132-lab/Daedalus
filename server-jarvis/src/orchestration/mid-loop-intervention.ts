@@ -1,5 +1,6 @@
 import { isStageSummaryPlaceholder } from "./stage-output";
 import type { ToolCallRecord } from "./stage-output";
+import { countsTowardWriteEffect, isStatusOrLogDocPath } from "./effect-gate";
 
 export type MidLoopDecisionSource =
   | "deterministic_reflex"
@@ -229,6 +230,10 @@ export function truncateMidLoopText(text: string | undefined, maxChars: number):
 /**
  * Build the bounded semantic evidence fields for a mid-loop checkpoint from
  * the stage tool transcript so far.
+ *
+ * W5: successfulWrites / recentWriteTargets only credit paths that would
+ * satisfy the write-effect gate (no status/log docs; when targetPaths is set,
+ * only task targets). Status-doc gaming must not silence force_write pressure.
  */
 export function buildMidLoopToolEvidence(
   toolCalls: readonly ToolCallRecord[],
@@ -239,6 +244,8 @@ export function buildMidLoopToolEvidence(
     progressSinceLastCheckpoint?: string;
     writeLandedSinceLastCheck?: boolean;
     readIdentityKey?: (call: Pick<ToolCallRecord, "name" | "arguments">) => string;
+    /** Task target set shared with evaluateEffectGate (optional). */
+    targetPaths?: readonly string[];
   } = {},
 ): Pick<
   MidLoopSignal,
@@ -262,6 +269,7 @@ export function buildMidLoopToolEvidence(
   let totalSuccessfulReads = 0;
   let failedWriteAttempts = 0;
   const successfulReadKeys = new Set<string>();
+  const targetPaths = opts.targetPaths;
 
   for (const call of toolCalls) {
     const paths = collectToolPathTargets(call.arguments);
@@ -278,9 +286,14 @@ export function buildMidLoopToolEvidence(
       if (call.is_error) {
         failedWriteAttempts += 1;
       } else {
-        successfulWrites += 1;
-        for (const path of paths) {
-          if (!recentWriteTargets.includes(path)) recentWriteTargets.push(path);
+        const creditPaths = paths.filter((path) => countsTowardWriteEffect(path, targetPaths));
+        const unpathedOk = paths.length === 0
+          && countsTowardWriteEffect(undefined, targetPaths);
+        if (creditPaths.length > 0 || unpathedOk) {
+          successfulWrites += 1;
+          for (const path of creditPaths) {
+            if (!recentWriteTargets.includes(path)) recentWriteTargets.push(path);
+          }
         }
       }
     }
@@ -840,13 +853,35 @@ function buildReadSpiralNote(
 }
 
 /**
+ * Pick a path safe to name in a write-pressure note. Status/log docs never
+ * appear — naming them steers the model into the gaming path W5 forbids.
+ */
+export function pickNamedWriteTarget(
+  ...candidates: Array<string | undefined | null>
+): string | undefined {
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const trimmed = candidate.trim();
+    if (!trimmed || isStatusOrLogDocPath(trimmed)) continue;
+    if (trimmed === "the requested workspace file") return trimmed;
+    return trimmed;
+  }
+  return undefined;
+}
+
+/**
  * Note for the "tried to write, it failed" case. Recovery genuinely needs a
  * re-read (the old_string did not match), but the write must stay the headline
  * and the instruction must not name fixture files from unrelated benchmarks.
+ * Never names status/log docs as the recovery target (W5).
  */
 function buildFailedWriteNote(signal: MidLoopSignal): string {
   const attempts = signal.failedWriteAttempts ?? 1;
-  const target = signal.recentWriteTargets?.at(-1) ?? signal.recentReadTargets?.at(-1);
+  // Newest first among gate-credit write targets, then reads — never status/log.
+  const target = pickNamedWriteTarget(
+    ...(signal.recentWriteTargets ?? []).slice().reverse(),
+    ...(signal.recentReadTargets ?? []).slice().reverse(),
+  );
   const sent = signal.forceWriteNudgesSent ?? 0;
   const where = target ? ` The last write target was \`${target}\`.` : "";
   if (sent >= 2) {

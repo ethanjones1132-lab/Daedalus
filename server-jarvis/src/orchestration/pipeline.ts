@@ -28,10 +28,12 @@ import {
   claimWriteEffectPressure,
   countsTowardWriteEffect,
   evaluateEffectGate,
+  GENERIC_WRITE_TARGET_LABEL,
   hasRepeatedWriteFailureWithoutEffect,
-  isStatusOrLogDocPath,
+  IDENTICAL_WRITE_PRESSURE_NOTE_CAP,
   isTerminalNoWriteEffect,
   mostReadSuccessfulFile,
+  resolveNamedWriteTarget,
   resolveTaskTargetPaths,
   shouldPressWriteEffect,
   toolCallWritePath,
@@ -1924,12 +1926,11 @@ export class PipelineExecutor {
         .filter((call) => READ_ONLY_TOOLS.has(call.name) && !call.is_error && call.output.trim().length > 0 && !isDuplicateToolDeflection(call))
         .map((call) => toolCallIdentityKey(call, identityOptions)),
     ).size;
-    const mostReadTarget = () => {
-      const evidence = mostReadSuccessfulFile(stageCalls());
-      if (evidence && !isStatusOrLogDocPath(evidence)) return evidence;
-      const preferred = effectGateTargetPaths?.[0];
-      return preferred ?? evidence ?? "the requested workspace file";
-    };
+    const mostReadTarget = () =>
+      resolveNamedWriteTarget(
+        mostReadSuccessfulFile(stageCalls()) ?? GENERIC_WRITE_TARGET_LABEL,
+        effectGateTargetPaths,
+      );
     const availableWriteTools = getToolsForMode("executor", this.runtime.listTools(), profile)
       .map((tool) => tool.function.name)
       .filter((name) => WRITE_EFFECT_TOOLS.has(name));
@@ -1986,6 +1987,9 @@ export class PipelineExecutor {
         progressSinceLastCheckpoint: extras.progressSinceLastCheckpoint,
         writeLandedSinceLastCheck: extras.writeLandedSinceLastCheck,
         readIdentityKey: (call) => toolCallIdentityKey(call, identityOptions),
+        // W5: same target set as evaluateEffectGate — status/off-target writes
+        // must not inflate mid-loop successfulWrites and silence force_write.
+        targetPaths: effectGateTargetPaths,
       });
       const { totalSuccessfulReads, ...midLoopEvidence } = evidence;
       const base: MidLoopSignal = {
@@ -2098,7 +2102,13 @@ export class PipelineExecutor {
       } = {},
     ): Promise<LoopIntervention | null> => {
       if (!inTurnDriverEnabled || !this.conductor?.live || !requiresWriteEffect) return null;
-      const writes = calls.filter((call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name)).length;
+      // W5: only gate-credit writes count as "landed" for mid-loop pressure.
+      const writes = calls.filter(
+        (call) =>
+          !call.is_error
+          && WRITE_EFFECT_TOOLS.has(call.name)
+          && countsTowardWriteEffect(toolCallWritePath(call), effectGateTargetPaths),
+      ).length;
       const writeLanded = extras.writeLandedSinceLastCheck
         ?? writes > midLoopLastSuccessfulWrites;
 
@@ -3299,7 +3309,7 @@ export class PipelineExecutor {
             // burn identical-note slots.
             const identicalKey = note.trim();
             const identicalUsed = identicalWritePressureNotes.get(identicalKey) ?? 0;
-            if (identicalKey && identicalUsed >= 2) {
+            if (identicalKey && identicalUsed >= IDENTICAL_WRITE_PRESSURE_NOTE_CAP) {
               this.collector.recordDirective?.({
                 id: `dir_${crypto.randomUUID()}`,
                 agent_run_id: agentRunId,

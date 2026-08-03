@@ -341,6 +341,27 @@ describe("effect gate — target-scoped write credit (W5)", () => {
     expect(note).toContain("write_file");
   });
 
+  test("buildWriteEffectNudge never names a status/log path as the target", () => {
+    const note = buildWriteEffectNudge(
+      ["write_file", "edit_file"],
+      "IMPLEMENTATION_STATUS_CURRENT.md",
+      ["docs/EXECUTION_LOG.md"],
+    );
+    expect(note).not.toMatch(/IMPLEMENTATION_STATUS/i);
+    expect(note).not.toMatch(/EXECUTION_LOG/i);
+    expect(note).toContain("the requested workspace file");
+  });
+
+  test("buildWriteEffectNudge prefers real task target over status evidence path", () => {
+    const note = buildWriteEffectNudge(
+      ["edit_file"],
+      "IMPLEMENTATION_STATUS_CURRENT.md",
+      ["src/app.ts", "IMPLEMENTATION_STATUS_CURRENT.md"],
+    );
+    expect(note).toContain("src/app.ts");
+    expect(note).not.toMatch(/IMPLEMENTATION_STATUS/i);
+  });
+
   test("identical write-pressure notes are capped (max 2) then suppressed", () => {
     const tracker = new Map<string, number>();
     const note = "Call edit_file now.";
