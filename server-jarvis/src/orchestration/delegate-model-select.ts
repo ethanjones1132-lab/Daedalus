@@ -4,10 +4,12 @@
  * Preference order (W1.1 / W1.2 / W1.3):
  *   1. Operator pin (non-empty non-"auto") until thrash threshold
  *   2. Highest write-evidence among eligible candidates:
- *      - Free models (proxy path) only while not benched (earned, not default)
+ *      - Free models (proxy path) only when earned: verifiedWrites > 0 and not benched
  *      - OpenAI-format Go when proxy is up
  *      - Anthropic-native Go when Go key is present — even when proxy is up
- *   3. Thrash advances through the evidence-ranked list (not free-first / cheapest)
+ *   3. Free only ranks above Go when its write rate strictly exceeds the best
+ *      eligible Go model; thrash after minimax prefers other Go before free
+ *   4. Thrash advances through that list (not free-first / cheapest)
  *
  * Scoreboard is process-cached and persisted in self-tuning.db so a restart
  * does not re-learn free-pool failure from zero.
@@ -200,8 +202,21 @@ function persistScoreboardEntry(entry: DelegateWriteScoreboardEntry): void {
 }
 
 /**
- * Load scoreboard from self-tuning.db; seed historical evidence when empty.
- * Idempotent per process (unless reset for tests).
+ * Merge historical seeds for models missing from the in-memory board.
+ * Never overwrites live counters. Safe to call repeatedly.
+ */
+function mergeHistoricalSeeds(): void {
+  for (const seed of DELEGATE_WRITE_SCOREBOARD_SEEDS) {
+    if (writeScoreboard.has(seed.model)) continue;
+    const entry = entryFromSeed(seed);
+    writeScoreboard.set(entry.model, entry);
+    persistScoreboardEntry(entry);
+  }
+}
+
+/**
+ * Load scoreboard from self-tuning.db; merge historical seeds for any missing
+ * models (never overwrites live counters). Idempotent per process unless reset.
  */
 export function ensureDelegateWriteScoreboardHydrated(): void {
   if (scoreboardHydrated) return;
@@ -219,36 +234,25 @@ export function ensureDelegateWriteScoreboardHydrated(): void {
     console.error("[delegate-model-select] load scoreboard failed:", e);
   }
 
-  if (rows.length > 0) {
-    for (const row of rows) {
-      writeScoreboard.set(row.model, {
-        model: row.model,
-        attempts: row.attempts,
-        verifiedWrites: row.verified_writes,
-        benched: row.benched === 1,
-      });
-    }
-    return;
+  for (const row of rows) {
+    writeScoreboard.set(row.model, {
+      model: row.model,
+      attempts: row.attempts,
+      verifiedWrites: row.verified_writes,
+      benched: row.benched === 1,
+    });
   }
 
-  if (scoreboardSeedSuppressed) return;
-
-  for (const seed of DELEGATE_WRITE_SCOREBOARD_SEEDS) {
-    const entry = entryFromSeed(seed);
-    writeScoreboard.set(entry.model, entry);
-    persistScoreboardEntry(entry);
+  // Always merge missing seeds when not suppressed (empty or partial table).
+  if (!scoreboardSeedSuppressed) {
+    mergeHistoricalSeeds();
   }
 }
 
-/** Apply historical seeds into the in-memory + persisted scoreboard (merge). */
+/** Apply historical seeds into the in-memory + persisted scoreboard (merge only). */
 export function seedDelegateWriteScoreboardFromHistory(): void {
   ensureDelegateWriteScoreboardHydrated();
-  for (const seed of DELEGATE_WRITE_SCOREBOARD_SEEDS) {
-    if (writeScoreboard.has(seed.model)) continue;
-    const entry = entryFromSeed(seed);
-    writeScoreboard.set(entry.model, entry);
-    persistScoreboardEntry(entry);
-  }
+  mergeHistoricalSeeds();
 }
 
 /**
@@ -303,6 +307,29 @@ export function getBenchedDelegateModels(): string[] {
   return [...writeScoreboard.values()]
     .filter((entry) => entry.benched)
     .map((entry) => entry.model);
+}
+
+/**
+ * Whether a delegate outcome should count as model write-capability evidence.
+ *
+ * Always record verified writes. Skip abort/cancel/integration/handoff paths
+ * that often fire before the model does real work — three cancels must not
+ * bench a capable model. Model failure signals (no_write, stream, timeout,
+ * exit, cli, rate, …) still count.
+ */
+export function shouldRecordDelegateWriteOutcome(input: {
+  hasVerifiedWrite: boolean;
+  errorCode?: string;
+}): boolean {
+  if (input.hasVerifiedWrite) return true;
+  const code = (input.errorCode || "").toLowerCase();
+  if (!code) return true;
+  // External cancel / pre-model integration failure / conductor intervention.
+  if (code.includes("abort")) return false; // delegate_aborted, mid_loop_abort
+  if (code.includes("cancel")) return false;
+  if (code.includes("integration")) return false;
+  if (code.includes("handoff")) return false;
+  return true;
 }
 
 export function recordDelegateWriteOutcome(
@@ -362,6 +389,33 @@ export function compareDelegateWriteEvidence(a: string, b: string): number {
 export function rankModelsByWriteEvidence(models: readonly string[]): string[] {
   ensureDelegateWriteScoreboardHydrated();
   return [...models].sort(compareDelegateWriteEvidence);
+}
+
+/**
+ * Auto-mode candidate order: free only sits above Go when its write rate
+ * strictly exceeds the best eligible Go model. Otherwise Go (evidence-ranked)
+ * comes first, then earned free (evidence-ranked). Thrash after minimax
+ * therefore prefers other Go models before free.
+ */
+export function rankDelegateAutoCandidates(
+  freeModels: readonly string[],
+  goModels: readonly string[],
+): string[] {
+  ensureDelegateWriteScoreboardHydrated();
+  const goRanked = rankModelsByWriteEvidence(goModels);
+  const freeRanked = rankModelsByWriteEvidence(freeModels);
+  if (goRanked.length === 0) return freeRanked;
+  if (freeRanked.length === 0) return goRanked;
+
+  const bestGoRate = writeEvidenceScore(writeScoreboard.get(goRanked[0]!)).rate;
+  const freeAboveBestGo: string[] = [];
+  const freeRest: string[] = [];
+  for (const model of freeRanked) {
+    const rate = writeEvidenceScore(writeScoreboard.get(model)).rate;
+    if (rate > bestGoRate) freeAboveBestGo.push(model);
+    else freeRest.push(model);
+  }
+  return [...freeAboveBestGo, ...goRanked, ...freeRest];
 }
 
 /** Stable thrash key for a session; blank/missing → unknown-session. */
@@ -456,15 +510,16 @@ function poolForModel(
 }
 
 /**
- * Free lane is earned: eligible while not benched (3 zero-write attempts).
- * Unproven / low-rate free models remain candidates but lose ranking to
- * seeded high-evidence writers (minimax-m3).
+ * Free lane is earned (W1.3): not benched AND at least one verified write.
+ * Unseen free models are not auto-selected until they prove a write
+ * (operator pin can still force them). Seeded free with verifiedWrites > 0
+ * remains eligible but ranks below higher-evidence Go unless it beats best Go.
  */
 export function isEarnedFreeDelegateModel(model: string): boolean {
   ensureDelegateWriteScoreboardHydrated();
   const entry = writeScoreboard.get(model.trim());
-  if (entry?.benched) return false;
-  return true;
+  if (!entry || entry.benched) return false;
+  return entry.verifiedWrites > 0;
 }
 
 export function selectDelegateModel(input: {
@@ -519,20 +574,19 @@ export function selectDelegateModel(input: {
     : [];
   const capableFree = proxyOk ? resolvableFree : [];
 
-  const pickFromRanked = (
-    candidates: readonly string[],
+  const pickFromOrdered = (
+    ordered: readonly string[],
     reason: string,
     index = 0,
   ): DelegateModelSelection => {
     const deduped: string[] = [];
     const seen = new Set<string>();
-    for (const model of candidates) {
+    for (const model of ordered) {
       if (seen.has(model)) continue;
       seen.add(model);
       deduped.push(model);
     }
-    const ranked = rankModelsByWriteEvidence(deduped);
-    if (ranked.length === 0) {
+    if (deduped.length === 0) {
       return {
         model: "minimax-m3",
         pool: "go_capable",
@@ -540,8 +594,8 @@ export function selectDelegateModel(input: {
         thrashCount: thrash,
       };
     }
-    const idx = Math.min(Math.max(0, index), ranked.length - 1);
-    const model = ranked[idx]!;
+    const idx = Math.min(Math.max(0, index), deduped.length - 1);
+    const model = deduped[idx]!;
     return {
       model,
       pool: poolForModel(model, free, goOpenai, goAnthropic),
@@ -556,13 +610,16 @@ export function selectDelegateModel(input: {
    * whenever the Go key is present (W1.2).
    */
   const pickGo = (reason: string, index = 0): DelegateModelSelection => {
-    const candidates = [...capableGoOpenai, ...capableGoAnthropic];
+    const candidates = rankModelsByWriteEvidence([
+      ...capableGoOpenai,
+      ...capableGoAnthropic,
+    ]);
     // When proxy is down, capableGoOpenai is empty; anthropic-only path.
     const annotatedReason =
       !proxyOk && capableGoAnthropic.length > 0 && capableGoOpenai.length === 0
         ? `${reason}_anthropic_no_proxy`
         : reason;
-    return pickFromRanked(candidates, annotatedReason, index);
+    return pickFromOrdered(candidates, annotatedReason, index);
   };
 
   if (thrash >= threshold) {
@@ -591,13 +648,15 @@ export function selectDelegateModel(input: {
     };
   }
 
-  // Auto under thrash threshold: evidence-ranked among free + Go OpenAI + Anthropic Go.
-  const allEligible = [...capableFree, ...capableGoOpenai, ...capableGoAnthropic];
-  if (allEligible.length === 0) {
+  // Auto under thrash threshold: Go first by evidence; earned free only above
+  // Go when free rate strictly exceeds best Go (rankDelegateAutoCandidates).
+  const goEligible = [...capableGoOpenai, ...capableGoAnthropic];
+  if (capableFree.length === 0 && goEligible.length === 0) {
     return pickGo("no_free_candidates");
   }
-  return pickFromRanked(
-    allEligible,
+  const ordered = rankDelegateAutoCandidates(capableFree, goEligible);
+  return pickFromOrdered(
+    ordered,
     thrash === 0 ? "write_evidence" : `write_evidence_rotate_${thrash}`,
     thrash,
   );

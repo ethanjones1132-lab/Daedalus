@@ -123,6 +123,7 @@ import {
   isDelegateThrashOutcome,
   recordDelegateThrash,
   recordDelegateWriteOutcome,
+  shouldRecordDelegateWriteOutcome,
   type DelegateModelSelection,
 } from "./delegate-model-select";
 import { decideDelegateIntervention } from "./delegate-intervention-policy";
@@ -2389,7 +2390,6 @@ export class PipelineExecutor {
       const hasVerifiedWrite = delegated.toolCalls.some(
         (call) => WRITE_EFFECT_TOOLS.has(call.name) && !call.is_error,
       );
-      recordDelegateWriteOutcome(modelSelection.model, hasVerifiedWrite);
       // Gate future re-entry for this run on whether the delegate actually
       // produced something (see delegateNoWriteRuns).
       if (!hasVerifiedWrite) this.delegateNoWriteRuns.add(agentRunId);
@@ -2411,6 +2411,16 @@ export class PipelineExecutor {
             ? "mid_loop_handoff"
           : delegated.errorCode
           ?? (cancelled ? "delegate_aborted" : hasVerifiedWrite ? undefined : "delegate_no_write");
+      // Write scoreboard is model-capability evidence only. Abort/cancel/
+      // integration/handoff before real model work must not bench a model.
+      if (
+        shouldRecordDelegateWriteOutcome({
+          hasVerifiedWrite,
+          errorCode: downgradeCode ?? delegated.errorCode,
+        })
+      ) {
+        recordDelegateWriteOutcome(modelSelection.model, hasVerifiedWrite);
+      }
       // Slice B thrash accounting: promote free → Go on repeated non-writes/handoffs.
       // Session-scoped with TTL so promotion survives run boundaries but expires.
       if (

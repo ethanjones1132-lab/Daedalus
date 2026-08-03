@@ -22,8 +22,11 @@ import {
   getBenchedDelegateModels,
   getDelegateWriteScoreboard,
   recordDelegateWriteOutcome,
+  isEarnedFreeDelegateModel,
+  rankDelegateAutoCandidates,
   rankModelsByWriteEvidence,
   selectDelegateModel,
+  shouldRecordDelegateWriteOutcome,
   writeEvidenceScore,
 } from "./delegate-model-select";
 
@@ -172,6 +175,24 @@ describe("selectDelegateModel (W1.1 scoreboard ranking)", () => {
     });
     expect(s0.model).toBe("minimax-m3");
     expect(s1.model).not.toBe(s0.model);
+    // Thrash after minimax must prefer other Go before free (even seeded free).
+    expect(s1.pool).toBe("go_capable");
+    expect(s1.model.includes(":free")).toBe(false);
+  });
+
+  test("thrash=1 after minimax prefers Go over free with lower rate", () => {
+    // Seeds: free rates ~0.06–0.125, unseeded Go rate 0. Pure rate ranking
+    // would pick free; auto candidates must keep Go ahead of free.
+    const s1 = selectDelegateModel({
+      configuredModel: "auto",
+      thrashCount: 1,
+      proxyAvailable: true,
+      hasOpenCodeGoKey: true,
+    });
+    expect(s1.pool).toBe("go_capable");
+    const goIds: string[] = [...DELEGATE_GO_ANTHROPIC_MODELS, ...DELEGATE_GO_OPENAI_MODELS];
+    expect(goIds).toContain(s1.model);
+    expect(s1.model).not.toBe("minimax-m3");
   });
 
   test("thrash at threshold promotes among Go capable by write evidence (not cheapest first)", () => {
@@ -293,6 +314,56 @@ describe("selectDelegateModel (W1.3 earned free lane)", () => {
     __resetDelegateWriteScoreboardForTests();
   });
 
+  test("free without verifiedWrites is not auto-selected", () => {
+    // Attempts without writes do not earn free; Go still selected.
+    recordDelegateWriteOutcome("vendor/unproven:free", false);
+    recordDelegateWriteOutcome("vendor/unproven:free", false);
+    for (let i = 0; i < 3; i++) recordDelegateWriteOutcome("minimax-m3", true);
+
+    expect(isEarnedFreeDelegateModel("vendor/unproven:free")).toBe(false);
+
+    const s = selectDelegateModel({
+      configuredModel: "auto",
+      thrashCount: 0,
+      proxyAvailable: true,
+      hasOpenCodeGoKey: true,
+      freeModels: ["vendor/unproven:free"],
+      goAnthropicModels: ["minimax-m3"],
+      goOpenaiModels: [],
+    });
+    expect(s.model).toBe("minimax-m3");
+    expect(s.pool).toBe("go_capable");
+  });
+
+  test("unseen free model is not auto-selected until it has a verified write", () => {
+    expect(isEarnedFreeDelegateModel("vendor/never-tried:free")).toBe(false);
+    const s = selectDelegateModel({
+      configuredModel: "auto",
+      thrashCount: 0,
+      proxyAvailable: true,
+      hasOpenCodeGoKey: false,
+      freeModels: ["vendor/never-tried:free"],
+      goOpenaiModels: [],
+      goAnthropicModels: [],
+    });
+    // No eligible free or go → fallback minimax (not the unproven free).
+    expect(s.model).not.toBe("vendor/never-tried:free");
+  });
+
+  test("operator pin can still force an unearned free model", () => {
+    const s = selectDelegateModel({
+      configuredModel: "vendor/never-tried:free",
+      thrashCount: 0,
+      proxyAvailable: true,
+      freeModels: ["vendor/never-tried:free"],
+    });
+    expect(s).toMatchObject({
+      model: "vendor/never-tried:free",
+      reason: "operator_pin",
+      pool: "free",
+    });
+  });
+
   test("benched free model is not selected even as thrash rotates", () => {
     recordDelegateWriteOutcome("vendor/failing:free", false);
     recordDelegateWriteOutcome("vendor/failing:free", false);
@@ -319,6 +390,22 @@ describe("selectDelegateModel (W1.3 earned free lane)", () => {
       recordDelegateWriteOutcome("cohere/north-mini-code:free", false);
     }
     expect(getDelegateWriteScoreboard("cohere/north-mini-code:free")?.benched).toBe(true);
+    expect(isEarnedFreeDelegateModel("cohere/north-mini-code:free")).toBe(false);
+  });
+
+  test("rankDelegateAutoCandidates keeps Go ahead of free unless free beats best Go rate", () => {
+    for (let i = 0; i < 10; i++) recordDelegateWriteOutcome("minimax-m3", true);
+    // Free has some evidence but lower rate than minimax.
+    recordDelegateWriteOutcome("vendor/ok:free", true);
+    recordDelegateWriteOutcome("vendor/ok:free", false);
+    recordDelegateWriteOutcome("vendor/ok:free", false);
+
+    const ranked = rankDelegateAutoCandidates(
+      ["vendor/ok:free"],
+      ["minimax-m3", "deepseek-v4-flash"],
+    );
+    expect(ranked[0]).toBe("minimax-m3");
+    expect(ranked.indexOf("deepseek-v4-flash")).toBeLessThan(ranked.indexOf("vendor/ok:free"));
   });
 });
 
@@ -479,6 +566,60 @@ describe("delegate verified-write scoreboard", () => {
     expect(ranked[0]).toBe("a");
     expect(ranked[1]).toBe("b");
     expect(ranked[2]).toBe("c");
+  });
+
+  test("shouldRecordDelegateWriteOutcome skips abort/integration/handoff", () => {
+    expect(shouldRecordDelegateWriteOutcome({ hasVerifiedWrite: true, errorCode: "delegate_aborted" }))
+      .toBe(true);
+    expect(shouldRecordDelegateWriteOutcome({ hasVerifiedWrite: false, errorCode: "delegate_aborted" }))
+      .toBe(false);
+    expect(shouldRecordDelegateWriteOutcome({ hasVerifiedWrite: false, errorCode: "delegate_integration_error" }))
+      .toBe(false);
+    expect(shouldRecordDelegateWriteOutcome({ hasVerifiedWrite: false, errorCode: "mid_loop_handoff" }))
+      .toBe(false);
+    expect(shouldRecordDelegateWriteOutcome({ hasVerifiedWrite: false, errorCode: "mid_loop_abort" }))
+      .toBe(false);
+    expect(shouldRecordDelegateWriteOutcome({ hasVerifiedWrite: false, errorCode: "delegate_no_write" }))
+      .toBe(true);
+    expect(shouldRecordDelegateWriteOutcome({ hasVerifiedWrite: false, errorCode: "delegate_stream_error" }))
+      .toBe(true);
+    expect(shouldRecordDelegateWriteOutcome({ hasVerifiedWrite: false })).toBe(true);
+  });
+
+  test("abort outcomes do not bench a model via three failed scoreboard records", () => {
+    // Simulate pipeline gating: aborts never call recordDelegateWriteOutcome.
+    for (let i = 0; i < 3; i++) {
+      expect(shouldRecordDelegateWriteOutcome({
+        hasVerifiedWrite: false,
+        errorCode: "delegate_aborted",
+      })).toBe(false);
+    }
+    expect(getDelegateWriteScoreboard("minimax-m3")).toBeUndefined();
+    expect(getBenchedDelegateModels()).not.toContain("minimax-m3");
+  });
+
+  test("hydrate merges missing historical seeds without overwriting live counters", () => {
+    const store = new SelfTuningStore(":memory:");
+    store.upsertDelegateWriteScoreboard({
+      model: "minimax-m3",
+      attempts: 5,
+      verifiedWrites: 4,
+      benched: false,
+    });
+    __setDelegateWriteScoreboardStoreForTests(store);
+    // Hydrate loads live minimax counters and fills free seeds that were missing.
+    expect(getDelegateWriteScoreboard("minimax-m3")).toMatchObject({
+      attempts: 5,
+      verifiedWrites: 4,
+    });
+    expect(getDelegateWriteScoreboard("cohere/north-mini-code:free")).toMatchObject({
+      attempts: 17,
+      verifiedWrites: 1,
+    });
+    expect(getDelegateWriteScoreboard("google/gemma-4-31b-it:free")).toMatchObject({
+      attempts: 16,
+      verifiedWrites: 2,
+    });
   });
 });
 
