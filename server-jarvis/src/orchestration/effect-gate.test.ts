@@ -1,5 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { applyEffectGate, buildWriteEffectNudge, evaluateEffectGate, isTerminalNoWriteEffect, mostReadSuccessfulFile, shouldPressWriteEffect } from "./effect-gate";
+import {
+  applyEffectGate,
+  buildWriteEffectNudge,
+  claimIdenticalWritePressureNote,
+  evaluateEffectGate,
+  isStatusOrLogDocPath,
+  isTerminalNoWriteEffect,
+  mostReadSuccessfulFile,
+  resolveTaskTargetPaths,
+  shouldPressWriteEffect,
+} from "./effect-gate";
 import type { ExecutorStageOutput, ToolCallRecord } from "./stage-output";
 import type { WriteEffectObservation } from "./content-fingerprint";
 
@@ -213,6 +223,132 @@ describe("effect gate", () => {
 
     expect(report.contentDeltas).toBe(1);
     expect(report.verdict).toBe("clean");
+  });
+});
+
+// ── W5: progress that cannot be faked — target-scoped write-effect gate ──
+describe("effect gate — target-scoped write credit (W5)", () => {
+  function callWith(name: string, is_error: boolean, path?: string, output = "ok"): ToolCallRecord {
+    return { name, arguments: path ? { path } : {}, output, is_error, duration_ms: 1 };
+  }
+
+  function delta(path: string, changed = true): WriteEffectObservation {
+    return {
+      toolName: "write_file",
+      path,
+      before: { path, exists: true, bytes: 4, sha256: changed ? "before" : "same" },
+      after: { path, exists: true, bytes: changed ? 8 : 4, sha256: changed ? "after" : "same" },
+      changed,
+    };
+  }
+
+  test("status doc write alone does NOT clear no_write_effect when writeIntent=true", () => {
+    const report = evaluateEffectGate({
+      profile: "full",
+      executor: executor([callWith("write_file", false, "IMPLEMENTATION_STATUS_CURRENT.md")]),
+      request: "implement the feature in src/app.ts",
+      contentEffects: [delta("IMPLEMENTATION_STATUS_CURRENT.md")],
+    });
+    expect(report.writeIntent).toBe(true);
+    expect(report.successfulWrites).toBe(0);
+    expect(report.contentDeltas).toBe(0);
+    expect(report.verdict).toBe("no_write_effect");
+  });
+
+  test("execution log write alone does NOT satisfy the write-effect gate", () => {
+    const report = evaluateEffectGate({
+      profile: "full",
+      executor: executor([callWith("write_file", false, "docs/EXECUTION_LOG.md")]),
+      request: "fix the bug in solution.py",
+      contentEffects: [delta("docs/EXECUTION_LOG.md")],
+    });
+    expect(report.verdict).toBe("no_write_effect");
+    expect(report.contentDeltas).toBe(0);
+  });
+
+  test("target file write DOES clear no_write_effect when targetPaths provided", () => {
+    const report = evaluateEffectGate({
+      profile: "full",
+      executor: executor([callWith("edit_file", false, "src/app.ts")]),
+      request: "update src/app.ts",
+      targetPaths: ["src/app.ts"],
+      contentEffects: [delta("src/app.ts")],
+    });
+    expect(report.verdict).toBe("clean");
+    expect(report.contentDeltas).toBe(1);
+    expect(report.successfulWrites).toBe(1);
+  });
+
+  test("non-target write does not clear the gate when targetPaths are set", () => {
+    const report = evaluateEffectGate({
+      profile: "full",
+      executor: executor([callWith("write_file", false, "scratch/notes.md")]),
+      request: "update src/app.ts",
+      targetPaths: ["src/app.ts"],
+      contentEffects: [delta("scratch/notes.md")],
+    });
+    expect(report.verdict).toBe("no_write_effect");
+    expect(report.contentDeltas).toBe(0);
+    expect(report.successfulWrites).toBe(0);
+  });
+
+  test("non-status write without targets still works (backward compatible)", () => {
+    const report = evaluateEffectGate({
+      profile: "full",
+      executor: executor([callWith("write_file", false, "workspace/proof.txt")]),
+      request: "write workspace/proof.txt",
+      contentEffects: [delta("workspace/proof.txt")],
+    });
+    expect(report.verdict).toBe("clean");
+    expect(report.contentDeltas).toBe(1);
+  });
+
+  test("status doc still excluded even when listed in targetPaths", () => {
+    const report = evaluateEffectGate({
+      profile: "full",
+      executor: executor([callWith("write_file", false, "IMPLEMENTATION_STATUS_CURRENT.md")]),
+      request: "implement the change in src/app.ts",
+      targetPaths: ["IMPLEMENTATION_STATUS_CURRENT.md", "src/app.ts"],
+      contentEffects: [delta("IMPLEMENTATION_STATUS_CURRENT.md")],
+    });
+    expect(report.writeIntent).toBe(true);
+    expect(report.verdict).toBe("no_write_effect");
+    expect(report.contentDeltas).toBe(0);
+  });
+
+  test("isStatusOrLogDocPath matches *_STATUS* / *_LOG* basenames case-insensitively", () => {
+    expect(isStatusOrLogDocPath("IMPLEMENTATION_STATUS_CURRENT.md")).toBe(true);
+    expect(isStatusOrLogDocPath("docs/execution_log.md")).toBe(true);
+    expect(isStatusOrLogDocPath("Foo_Status_Bar.MD")).toBe(true);
+    expect(isStatusOrLogDocPath("run_LOG_summary.md")).toBe(true);
+    expect(isStatusOrLogDocPath("src/app.ts")).toBe(false);
+    expect(isStatusOrLogDocPath("README.md")).toBe(false);
+  });
+
+  test("resolveTaskTargetPaths pulls plan/request path mentions and drops status docs", () => {
+    const targets = resolveTaskTargetPaths({
+      request: "edit src/app.ts and update IMPLEMENTATION_STATUS_CURRENT.md",
+      planTexts: ["Item A1: fix server-jarvis/src/orchestration/effect-gate.ts"],
+    });
+    expect(targets).toContain("src/app.ts");
+    expect(targets).toContain("server-jarvis/src/orchestration/effect-gate.ts");
+    expect(targets?.some((p) => /status/i.test(p))).toBe(false);
+  });
+
+  test("buildWriteEffectNudge prefers an explicit task target when provided", () => {
+    const note = buildWriteEffectNudge(["write_file", "edit_file"], "src/app.ts");
+    expect(note).toContain("src/app.ts");
+    expect(note).toContain("write_file");
+  });
+
+  test("identical write-pressure notes are capped (max 2) then suppressed", () => {
+    const tracker = new Map<string, number>();
+    const note = "Call edit_file now.";
+    expect(claimIdenticalWritePressureNote(tracker, note, 2)).toBe(true);
+    expect(claimIdenticalWritePressureNote(tracker, note, 2)).toBe(true);
+    expect(claimIdenticalWritePressureNote(tracker, note, 2)).toBe(false);
+    // A different note still gets a slot.
+    expect(claimIdenticalWritePressureNote(tracker, "Different strategy: use write_file.", 2)).toBe(true);
   });
 });
 

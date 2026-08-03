@@ -16,6 +16,24 @@ import type { SemanticPressureBudget } from "./executor-progress-policy";
 export const WRITE_EFFECT_TOOLS: ReadonlySet<string> = defaultCapabilityIndex().writeEffect;
 export const MAX_FAILED_WRITE_ATTEMPTS_WITHOUT_EFFECT = 2;
 
+/** Max times the same write-pressure note text may be injected in one run. */
+export const IDENTICAL_WRITE_PRESSURE_NOTE_CAP = 2;
+
+/**
+ * Status / log documents that models invent to game the write-effect gate
+ * (IMPLEMENTATION_STATUS_CURRENT.md, EXECUTION_LOG.md, …). Basename match:
+ * `*_STATUS*.md` / `*_LOG*.md` (case-insensitive). Never satisfies the gate.
+ */
+const STATUS_OR_LOG_DOC_BASENAME_RE = /_status.*\.md$|_log.*\.md$/i;
+
+/**
+ * Path-ish tokens for plan/request target discovery. Conservative: requires a
+ * slash-separated path with an extension, or a bare filename with a common
+ * source/doc extension.
+ */
+const PATH_MENTION_RE =
+  /(?:^|[\s`"'(=\[])((?:\.?\.?\/)?[\w.-]+(?:\/[\w.-]+)+\.[\w.+-]+|[\w.-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|rs|go|md|json|toml|yml|yaml|cpp|cc|cxx|h|hpp|java|kt|css|html|vue|svelte|sql|sh|ps1))(?=[\s`"'',\):;\]]|$)/gi;
+
 export interface EffectGateReport {
   clean: boolean;
   verdict: "clean" | "tool_failures" | "no_write_effect";
@@ -29,10 +47,134 @@ export interface EffectGateReport {
    */
   consequentialFailures: number;
   writeIntent: boolean;
+  /**
+   * Successful write tools that count toward the write-effect gate (excludes
+   * status/log docs; when `targetPaths` is set, only task-target paths).
+   */
   successfulWrites: number;
-  /** Number of successful write calls whose post-write bytes differ from pre-write bytes. */
+  /**
+   * Content deltas that count toward the write-effect gate (same filtering as
+   * successfulWrites).
+   */
   contentDeltas: number;
   synthesizerNotice: string;
+}
+
+/** True when the path basename is a status/log progress document. */
+export function isStatusOrLogDocPath(path: string): boolean {
+  const base = normBasename(path);
+  if (!base) return false;
+  return STATUS_OR_LOG_DOC_BASENAME_RE.test(base);
+}
+
+/** Normalize path separators and trim trailing slashes for comparison. */
+export function normalizePathForGate(path: string): string {
+  return path.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+/** Loose path match: exact, suffix, or basename equality (case-insensitive). */
+export function pathMatchesTarget(path: string, target: string): boolean {
+  const a = normalizePathForGate(path).toLowerCase();
+  const b = normalizePathForGate(target).toLowerCase();
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (a.endsWith("/" + b) || b.endsWith("/" + a)) return true;
+  const ba = a.split("/").pop() ?? "";
+  const bb = b.split("/").pop() ?? "";
+  return ba.length > 0 && ba === bb;
+}
+
+export function pathInTargetSet(path: string, targets: readonly string[]): boolean {
+  return targets.some((target) => pathMatchesTarget(path, target));
+}
+
+/**
+ * Whether a mutated path earns write-effect gate credit.
+ * - Status/log docs never count.
+ * - When `targetPaths` is non-empty, only those paths (or plan-named targets)
+ *   count.
+ * - When no targets are available, any non-status path counts (backward compat).
+ */
+export function countsTowardWriteEffect(
+  path: string | undefined,
+  targetPaths?: readonly string[],
+): boolean {
+  if (path && isStatusOrLogDocPath(path)) return false;
+  if (!targetPaths || targetPaths.length === 0) {
+    // Unpathed successful writes still count when no target set is known
+    // (legacy unit fixtures and delegate markers without path args).
+    return true;
+  }
+  if (!path) return false;
+  return pathInTargetSet(path, targetPaths);
+}
+
+/** Extract path-like mentions from free text (request / plan item prose). */
+export function extractPathMentions(text: string): string[] {
+  if (!text.trim()) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  PATH_MENTION_RE.lastIndex = 0;
+  for (const match of text.matchAll(PATH_MENTION_RE)) {
+    const raw = match[1]?.trim();
+    if (!raw) continue;
+    const key = normalizePathForGate(raw).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(raw);
+  }
+  return out;
+}
+
+/**
+ * Build the task target set from explicit paths plus plan/request mentions.
+ * Returns `undefined` when nothing usable was found (gate stays path-agnostic
+ * except for always-on status/log exclusion).
+ */
+export function resolveTaskTargetPaths(input: {
+  explicit?: readonly string[];
+  request?: string;
+  planTexts?: readonly string[];
+}): string[] | undefined {
+  const collected: string[] = [];
+  const seen = new Set<string>();
+  const push = (path: string) => {
+    const trimmed = path.trim();
+    if (!trimmed || isStatusOrLogDocPath(trimmed)) return;
+    const key = normalizePathForGate(trimmed).toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    collected.push(trimmed);
+  };
+  for (const path of input.explicit ?? []) push(path);
+  for (const text of [input.request, ...(input.planTexts ?? [])]) {
+    if (!text) continue;
+    for (const path of extractPathMentions(text)) push(path);
+  }
+  return collected.length > 0 ? collected : undefined;
+}
+
+export function toolCallWritePath(call: ToolCallRecord): string | undefined {
+  const raw = call.arguments?.path ?? call.arguments?.file_path;
+  return typeof raw === "string" && raw.trim() ? raw.trim() : undefined;
+}
+
+/**
+ * Claim one injection of a specific write-pressure note. Returns false when
+ * the identical text has already been injected `cap` times (default 2) so the
+ * host must escalate wording or stop rather than replaying the same sentence.
+ */
+export function claimIdenticalWritePressureNote(
+  tracker: Map<string, number>,
+  note: string,
+  cap: number = IDENTICAL_WRITE_PRESSURE_NOTE_CAP,
+): boolean {
+  const key = note.trim();
+  if (!key) return false;
+  const used = tracker.get(key) ?? 0;
+  if (used >= cap) return false;
+  tracker.set(key, used + 1);
+  return true;
 }
 
 export function evaluateEffectGate(input: {
@@ -50,6 +192,12 @@ export function evaluateEffectGate(input: {
   assumeWriteIntent?: boolean;
   /** Pre/post hashes captured by filesystem handlers during this pipeline run. */
   contentEffects?: readonly WriteEffectObservation[];
+  /**
+   * W5: task target paths (plan/request-discovered or explicit). When present,
+   * only writes to these paths satisfy the write-effect gate. Status/log docs
+   * are always excluded regardless.
+   */
+  targetPaths?: readonly string[];
 }): EffectGateReport {
   const calls: ToolCallRecord[] = [
     ...(input.executor?.toolCalls ?? []),
@@ -71,17 +219,32 @@ export function evaluateEffectGate(input: {
       ? hasWriteIntent(input.request)
       : (input.profile === "full" && input.executor !== undefined)
   );
+  const targetPaths = input.targetPaths && input.targetPaths.length > 0
+    ? input.targetPaths
+    : undefined;
+  // W5: gate credit only for non-status writes that land on task targets when
+  // a target set is known. Status/log docs never count.
   const successfulWrites = calls.filter(
-    (call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name),
+    (call) =>
+      !call.is_error
+      && WRITE_EFFECT_TOOLS.has(call.name)
+      && countsTowardWriteEffect(toolCallWritePath(call), targetPaths),
   ).length;
   // The delegate reports canonical write tool names but mutates outside the
   // native ToolRuntime, so it has no handler-side observation. Preserve the
   // call-level success in that case. Native write calls always append an
   // observation, including a zero-delta observation for an unchanged patch.
+  // Raw (pre-filter) success drives whether content effects are authoritative:
+  // a status-doc-only write still produces observations that must be filtered.
+  const rawWriteSuccessCount = calls.filter(
+    (call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name),
+  ).length;
   const canUseContentEffects = input.contentEffects !== undefined
-    && (input.contentEffects.length > 0 || successfulWrites === 0);
+    && (input.contentEffects.length > 0 || rawWriteSuccessCount === 0);
   const contentDeltas = canUseContentEffects
-    ? input.contentEffects!.filter((effect) => effect.changed).length
+    ? input.contentEffects!.filter(
+      (effect) => effect.changed && countsTowardWriteEffect(effect.path, targetPaths),
+    ).length
     : successfulWrites;
   // A single failed tool call used to flip an otherwise-successful run to
   // `degraded`. On the 2026-07-24 tier-2B run that mislabeled every correct
@@ -95,9 +258,13 @@ export function evaluateEffectGate(input: {
     (call) => call.is_error && !isForgivableFailure(call, calls, contentDeltas, writeIntent),
   );
   let verdict: EffectGateReport["verdict"] = "clean";
-  if (hasRepeatedWriteFailureWithoutEffect(calls, writeIntent)) verdict = "no_write_effect";
-  else if (consequentialFailed.length > 0) verdict = "tool_failures";
-  else if (writeIntent && contentDeltas === 0) verdict = "no_write_effect";
+  if (hasRepeatedWriteFailureWithoutEffect(calls, writeIntent, targetPaths)) {
+    verdict = "no_write_effect";
+  } else if (consequentialFailed.length > 0) {
+    verdict = "tool_failures";
+  } else if (writeIntent && contentDeltas === 0) {
+    verdict = "no_write_effect";
+  }
   const clean = verdict === "clean";
   const consequentialForNotice = consequentialFailed.map(
     (call) => ({ name: call.name, detail: (call.output || "").slice(0, 160) }),
@@ -187,14 +354,21 @@ export function applyEffectGate(
   return { outcome: "degraded", errorCode: `effect_gate_${report.verdict}` };
 }
 
-/** Two failed mutation attempts with no success exhaust bounded recovery. */
+/**
+ * Two failed mutation attempts with no *gate-credit* success exhaust bounded
+ * recovery. Status-doc / off-target successes do not cancel the terminal path.
+ */
 export function hasRepeatedWriteFailureWithoutEffect(
   calls: ToolCallRecord[],
   writeIntent: boolean,
+  targetPaths?: readonly string[],
 ): boolean {
   if (!writeIntent) return false;
   const writes = calls.filter((call) => WRITE_EFFECT_TOOLS.has(call.name));
-  return !writes.some((call) => !call.is_error)
+  const gateSuccess = writes.some(
+    (call) => !call.is_error && countsTowardWriteEffect(toolCallWritePath(call), targetPaths),
+  );
+  return !gateSuccess
     && writes.filter((call) => call.is_error).length >= MAX_FAILED_WRITE_ATTEMPTS_WITHOUT_EFFECT;
 }
 
@@ -225,12 +399,29 @@ export const WRITE_EFFECT_NUDGE =
   "not modify any file and do not count. After writing, read the file back " +
   "to verify, then finish.";
 
-export function buildWriteEffectNudge(writeTools: string[], expectedTarget: string): string {
+/**
+ * Build a write-pressure note. Prefer a concrete task target when known
+ * (W5.2); fall back to the evidence-derived path. Never names status/log docs.
+ */
+export function buildWriteEffectNudge(
+  writeTools: string[],
+  expectedTarget: string,
+  taskTargets?: readonly string[],
+): string {
   const available = writeTools.length > 0 ? writeTools.join(", ") : "no write tools exposed";
+  const preferred = (taskTargets ?? []).find((path) => path && !isStatusOrLogDocPath(path));
+  const evidenceOk = expectedTarget && !isStatusOrLogDocPath(expectedTarget)
+    && expectedTarget !== "the requested workspace file";
+  const target = preferred
+    ?? (evidenceOk ? expectedTarget : undefined)
+    ?? expectedTarget;
+  const targetClause = preferred
+    ? `Required write target from the task/plan: ${preferred}. Apply the requested edit there — status or log docs do not count.`
+    : `Expected write target based on the gathered evidence: ${target}.`;
   return [
     "This turn is a CHANGE request and the executor is still in a read loop.",
     `Available write tools: ${available}.`,
-    `Expected write target based on the gathered evidence: ${expectedTarget}.`,
+    targetClause,
     "Call an available write tool now; prose or an unexecuted diff does not modify the workspace. Read the target back after writing to verify it.",
   ].join(" ");
 }

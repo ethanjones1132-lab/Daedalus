@@ -21,7 +21,24 @@ import type { ConductorBus, ConductorDirective } from "./conductor-bus";
 import type { ConductorStageEvidence, LiveConductor } from "./conductor";
 import { buildSynthesizerContext, buildSynthesizerContextFromStageState } from "./synth-context";
 import { detectDeferralStall, DEFERRAL_STALL_NUDGE } from "./synthesizer-deferral";
-import { applyEffectGate, buildWriteEffectNudge, claimWriteEffectPressure, evaluateEffectGate, hasRepeatedWriteFailureWithoutEffect, isTerminalNoWriteEffect, mostReadSuccessfulFile, shouldPressWriteEffect, WRITE_EFFECT_NUDGE, WRITE_EFFECT_TOOLS, type EffectGateReport } from "./effect-gate";
+import {
+  applyEffectGate,
+  buildWriteEffectNudge,
+  claimIdenticalWritePressureNote,
+  claimWriteEffectPressure,
+  countsTowardWriteEffect,
+  evaluateEffectGate,
+  hasRepeatedWriteFailureWithoutEffect,
+  isStatusOrLogDocPath,
+  isTerminalNoWriteEffect,
+  mostReadSuccessfulFile,
+  resolveTaskTargetPaths,
+  shouldPressWriteEffect,
+  toolCallWritePath,
+  WRITE_EFFECT_NUDGE,
+  WRITE_EFFECT_TOOLS,
+  type EffectGateReport,
+} from "./effect-gate";
 import {
   decideExecutorProgress,
   SemanticPressureBudget,
@@ -345,6 +362,29 @@ export function partitionToolCalls<T extends { name: string }>(calls: T[]): T[][
   }
   if (current.length) batches.push(current);
   return batches;
+}
+
+/**
+ * Free-text sources that may name write targets for the W5 effect gate:
+ * active/plan item titles, descriptions, acceptance checks, and the rendered
+ * plan summary. Status/log paths are stripped later by resolveTaskTargetPaths.
+ */
+export function collectPlanTargetTexts(
+  contract?: TaskRunContract | null,
+  planSummary?: string,
+): string[] {
+  const texts: string[] = [];
+  if (planSummary?.trim()) texts.push(planSummary);
+  const plan = contract?.plan;
+  if (!plan) return texts;
+  for (const item of plan.items) {
+    if (item.title) texts.push(item.title);
+    if (item.description) texts.push(item.description);
+    for (const check of item.acceptanceChecks ?? []) {
+      if (check.description) texts.push(check.description);
+    }
+  }
+  return texts;
 }
 
 const PATH_LIKE_ARGUMENT_KEYS = new Set([
@@ -1744,6 +1784,13 @@ export class PipelineExecutor {
     let repeatedWriteFailureReached = false;
     const intentText = options.rawMessage ?? request;
     const requiresWorkspaceEvidence = turnNeedsWorkspaceEvidence(options.turnRequirement, intentText);
+    // W5: task targets from the plan ledger + request path mentions. Status/log
+    // docs never count; when targets are known only those paths clear write
+    // pressure / the effect gate.
+    const effectGateTargetPaths = resolveTaskTargetPaths({
+      request: intentText,
+      planTexts: collectPlanTargetTexts(options.taskRunContract, planSummary),
+    });
     // 2026-07-17 incident: on live write turns the executor read files and
     // then narrated the change as prose — nothing in the loop demanded an
     // actual mutation (the only nudge was the READ-evidence rubric). Write
@@ -1786,8 +1833,15 @@ export class PipelineExecutor {
         });
       }
     }
+    // W5: mid-loop / progress counts only gate-credit writes (status/log docs
+    // and off-target mutations do not clear write pressure).
     const successfulWriteCount = () =>
-      toolCalls.filter((call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name)).length;
+      toolCalls.filter(
+        (call) =>
+          !call.is_error
+          && WRITE_EFFECT_TOOLS.has(call.name)
+          && countsTowardWriteEffect(toolCallWritePath(call), effectGateTargetPaths),
+      ).length;
     const deepReadRequest = resolveDeepReadIntent(intentText, options.taskRunDepth);
     const executorPrompt = stageSystemPrompt(
       "executor",
@@ -1870,10 +1924,17 @@ export class PipelineExecutor {
         .filter((call) => READ_ONLY_TOOLS.has(call.name) && !call.is_error && call.output.trim().length > 0 && !isDuplicateToolDeflection(call))
         .map((call) => toolCallIdentityKey(call, identityOptions)),
     ).size;
-    const mostReadTarget = () => mostReadSuccessfulFile(stageCalls()) ?? "the requested workspace file";
+    const mostReadTarget = () => {
+      const evidence = mostReadSuccessfulFile(stageCalls());
+      if (evidence && !isStatusOrLogDocPath(evidence)) return evidence;
+      const preferred = effectGateTargetPaths?.[0];
+      return preferred ?? evidence ?? "the requested workspace file";
+    };
     const availableWriteTools = getToolsForMode("executor", this.runtime.listTools(), profile)
       .map((tool) => tool.function.name)
       .filter((name) => WRITE_EFFECT_TOOLS.has(name));
+    /** W5.3: identical write-pressure note text may inject at most twice. */
+    const identicalWritePressureNotes = new Map<string, number>();
 
     // Rung 2 mid-loop state: shared by the native turn loop and delegate_first
     // stream supervision so both paths produce auditable conductor_directives.
@@ -3139,6 +3200,7 @@ export class PipelineExecutor {
           repeatedWriteFailureReached = hasRepeatedWriteFailureWithoutEffect(
             toolCalls,
             requiresWriteEffect,
+            effectGateTargetPaths,
           );
           if (repeatedWriteFailureReached) {
             executorDone = true;
@@ -3232,7 +3294,24 @@ export class PipelineExecutor {
           // per agent run actually adds transcript text.
           let writeEffectNudgeSentThisTurn = false;
           const tryInjectWriteEffect = (note: string, source: "deterministic_reflex" | "no_tool_retry"): boolean => {
+            // W5.3: do not re-inject byte-identical write-pressure text past the cap.
+            // Peek before claiming run-level pressure so a spent budget does not
+            // burn identical-note slots.
+            const identicalKey = note.trim();
+            const identicalUsed = identicalWritePressureNotes.get(identicalKey) ?? 0;
+            if (identicalKey && identicalUsed >= 2) {
+              this.collector.recordDirective?.({
+                id: `dir_${crypto.randomUUID()}`,
+                agent_run_id: agentRunId,
+                stage: "executor",
+                directive_type: SEMANTIC_PRESSURE_SUPPRESSED,
+                decision_source: source,
+                reason: "write_effect_identical_cap",
+              });
+              return false;
+            }
             if (claimWriteEffectPressure(pressureBudget)) {
+              claimIdenticalWritePressureNote(identicalWritePressureNotes, note);
               writeEffectNudgeCount++;
               writeEffectNudgeSentThisTurn = true;
               executorMessages.push({ role: "user", content: note });
@@ -3282,8 +3361,10 @@ export class PipelineExecutor {
             })
           ) {
             const writeEffectNudge = emittedToolCalls
-              ? buildWriteEffectNudge(availableWriteTools, mostReadTarget())
-              : WRITE_EFFECT_NUDGE;
+              ? buildWriteEffectNudge(availableWriteTools, mostReadTarget(), effectGateTargetPaths)
+              : effectGateTargetPaths?.[0]
+                ? buildWriteEffectNudge(availableWriteTools, effectGateTargetPaths[0], effectGateTargetPaths)
+                : WRITE_EFFECT_NUDGE;
             tryInjectWriteEffect(writeEffectNudge, "deterministic_reflex");
           }
 
@@ -4761,6 +4842,11 @@ export class PipelineExecutor {
     const profile: ExecutionProfile = options.executionProfile ?? "full";
     const intentText = options.rawMessage ?? request;
     const requiresWorkspaceEvidence = turnNeedsWorkspaceEvidence(options.turnRequirement, intentText);
+    // W5: scope write-effect gate credit to plan/request targets when known.
+    const effectGateTargetPaths = resolveTaskTargetPaths({
+      request: intentText,
+      planTexts: collectPlanTargetTexts(options.taskRunContract, state.plan ? renderPlanSummary(state.plan) : undefined),
+    });
     // T2.1: ordered work queue (behavior-preserving vs if-ladder; enables T2.2 reroute).
     const workQueue: StageName[] = stages.filter(
       (s): s is StageName =>
@@ -4912,6 +4998,7 @@ export class PipelineExecutor {
             request: intentText,
             assumeWriteIntent: options.taskRunWriteIntent,
             contentEffects: this.ctx.write_effects,
+            targetPaths: effectGateTargetPaths,
           });
           const gateFailure = candidateSyntax.length > 0
             || candidateRun.issues.length > 0
@@ -4961,6 +5048,7 @@ export class PipelineExecutor {
             request: intentText,
             assumeWriteIntent: options.taskRunWriteIntent,
             contentEffects: this.ctx.write_effects,
+            targetPaths: effectGateTargetPaths,
           });
           return finish({ state, effectGate, partialStage });
         }
@@ -5268,6 +5356,7 @@ export class PipelineExecutor {
       request: intentText,
       assumeWriteIntent: options.taskRunWriteIntent,
       contentEffects: this.ctx.write_effects,
+      targetPaths: effectGateTargetPaths,
     });
     if (
       effectGate.verdict === "no_write_effect" &&
@@ -5298,6 +5387,7 @@ export class PipelineExecutor {
         request: intentText,
         assumeWriteIntent: options.taskRunWriteIntent,
         contentEffects: this.ctx.write_effects,
+        targetPaths: effectGateTargetPaths,
       });
       if (state.rewriter.terminalStatus === "timed_out") {
         partialStage = { stage: "rewriter", errorCode: state.rewriter.errorCode ?? "stage_timeout" };
@@ -5497,6 +5587,10 @@ export class PipelineExecutor {
           request,
           assumeWriteIntent: options.taskRunWriteIntent,
           contentEffects: this.ctx.write_effects,
+          targetPaths: resolveTaskTargetPaths({
+            request: options.rawMessage ?? request,
+            planTexts: collectPlanTargetTexts(options.taskRunContract, state.plan ? renderPlanSummary(state.plan) : undefined),
+          }),
         }),
       );
       // No synthesizer in this pipeline: fall back to the last completed phase.
@@ -5551,6 +5645,10 @@ export class PipelineExecutor {
         request,
         assumeWriteIntent: options.taskRunWriteIntent,
         contentEffects: this.ctx.write_effects,
+        targetPaths: resolveTaskTargetPaths({
+          request: options.rawMessage ?? request,
+          planTexts: collectPlanTargetTexts(options.taskRunContract, state.plan ? renderPlanSummary(state.plan) : undefined),
+        }),
       }),
     ));
     // Task 6: sticky no-tool partial outranks a soft degraded effect-gate

@@ -1619,7 +1619,10 @@ describe("pipeline stage telemetry", () => {
       executionProfile: "full",
     });
 
-    const directives = finalMessages.filter((message) => message.content?.includes("Expected write target"));
+    const directives = finalMessages.filter((message) =>
+      message.content?.includes("Expected write target")
+      || message.content?.includes("Required write target"),
+    );
     const allDirectives = store.getConductorDirectives(runId);
     const nudgeRows = allDirectives.filter((row) => row.directive_type === "write_effect_nudge");
     const suppressed = allDirectives.filter((row) => row.directive_type === "semantic_pressure_suppressed");
