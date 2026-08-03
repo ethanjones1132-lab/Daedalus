@@ -67,7 +67,7 @@ import {
   hasExplicitWebSearchIntent,
   hasLocalWorkspaceToolIntent,
   isNativeToolProtocolUnsupportedError,
-  textToolParseSignals,
+  resolveToolCallsFromTurn,
   textToolResultsPrompt,
   webSearchQueryFromPrompt,
 } from "./text-tools";
@@ -2509,26 +2509,22 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           for (const w of normalized.warnings) {
             console.warn(`[Jarvis] malformed streamed tool_call (${w.kind}) ${normalizeCtx}: ${w.message}`);
           }
-          let parsedToolCalls = normalized.calls;
-          // Text-tool stages always attempt parse; zero calls may mean prose
-          // rather than a successful native empty tool list. Flags are read by
-          // the orchestrator pipeline (diagnostic_json) on no-tool turns.
-          let toolParseFlags = textToolParseSignals(false, 0);
-
-          if (useTextTools) {
-            const extracted = extractTextToolCalls(fullTurnText, callOptions.tools);
-            toolParseFlags = textToolParseSignals(true, extracted.calls.length);
-            if (extracted.calls.length > 0) {
-              parsedToolCalls = extracted.calls.map((c) => ({
-                id: c.id || `call_${crypto.randomUUID().slice(0, 8)}`,
-                name: c.name,
-                arguments: c.arguments,
-              }));
-            } else {
-              console.warn(
-                `[Jarvis] text-tool parse produced zero calls ${normalizeCtx}: model may have written prose instead of tool protocol`,
-              );
-            }
+          // W3.1: native tool_calls first; if zero native calls + non-empty
+          // content + tools offered, always run the tolerant text parser even
+          // when useTextTools is false (DSML/bare dialects otherwise become
+          // executor_no_tool). Helper keeps this testable outside the loop.
+          const resolvedTools = resolveToolCallsFromTurn({
+            nativeCalls: normalized.calls,
+            fullText: fullTurnText,
+            tools: callOptions?.tools,
+            useTextTools: Boolean(useTextTools),
+          });
+          let parsedToolCalls = resolvedTools.calls;
+          let toolParseFlags = resolvedTools.toolParseFlags;
+          if (resolvedTools.textParseAttempted && parsedToolCalls.length === 0) {
+            console.warn(
+              `[Jarvis] text-tool parse produced zero calls ${normalizeCtx}: model may have written prose instead of tool protocol`,
+            );
           }
 
           const reasoningStripped = cfg.reasoning.enabled ? stripReasoningFromText(fullTurnText) : fullTurnText;
@@ -2539,20 +2535,18 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // echoing the executor's tool-heavy activity summary verbatim,
           // 2026-07-01 live incident: synthesizer answer was literally just
           // `<tool_call>{"name":"list_directory",...}</tool_call>`). Stages
-          // that DO use the text-tool protocol already run
-          // extractTextToolCalls above to parse+execute genuine calls; a
-          // stage with no tools never does, so any such tag it emits would
-          // otherwise leak straight into the user-visible answer verbatim.
-          // extractTextToolCalls with an empty tools list can never
-          // match/execute anything (normalizeToolName requires the name to
-          // be in the offered tools), it only performs the cleanup — so this
-          // is safe even when nothing was actually a real tool call.
-          // Text-tool stages first remove genuine call blocks (real tools
-          // list), then EVERY stage gets the empty-list cosmetic pass. The
-          // previous `useTextTools ? reasoningStripped : …` ternary returned
-          // the raw text for text-tool stages, so bare hallucinated tool JSON
-          // in executor visible activity was never stripped.
-          const toolAwareCleaned = useTextTools
+          // that DO use the text-tool protocol (or the native-empty text
+          // fallback) already run extractTextToolCalls to parse+execute
+          // genuine calls; a stage with no tools never does, so any such tag
+          // it emits would otherwise leak straight into the user-visible
+          // answer verbatim. extractTextToolCalls with an empty tools list
+          // can never match/execute anything (normalizeToolName requires the
+          // name to be in the offered tools), it only performs the cleanup —
+          // so this is safe even when nothing was actually a real tool call.
+          // Text-tool / fallback stages first remove genuine call blocks
+          // (real tools list), then EVERY stage gets the empty-list cosmetic
+          // pass.
+          const toolAwareCleaned = resolvedTools.textParseAttempted && callOptions?.tools?.length
             ? extractTextToolCalls(reasoningStripped, callOptions.tools).cleanedText
             : reasoningStripped;
           const cleanContent = extractTextToolCalls(toolAwareCleaned, []).cleanedText;

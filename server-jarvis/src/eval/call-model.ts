@@ -8,7 +8,7 @@
 
 import { type JarvisConfig } from "../config";
 import { chatCompletionWithFallback, isOpenRouterModelSupportsTools } from "../openrouter";
-import { buildTextToolInstructions, extractTextToolCalls } from "../text-tools";
+import { buildTextToolInstructions, extractTextToolCalls, resolveToolCallsFromTurn } from "../text-tools";
 import { AgentPool } from "../orchestration/agent-pool";
 import type { CallModelFn, ChatMessage } from "../orchestration/coordinator";
 import type { ToolDefinition } from "../tool-types";
@@ -71,14 +71,44 @@ export function makeCallModel(cfg: JarvisConfig, stage: string): CallModelFn {
     const choice = json.choices?.[0]?.message ?? {};
     const content: string = choice.content ?? "";
 
-    if (useTextTools) {
-      const extracted = extractTextToolCalls(content, tools);
-      const tool_calls = extracted.calls.length > 0
-        ? extracted.calls.map((c) => ({ id: c.id, name: c.name, arguments: c.arguments }))
-        : undefined;
-      return { content: extracted.cleanedText, tool_calls };
-    }
+    // Normalize native OpenAI-style tool_calls into the shared ResolvedToolCall shape.
+    const nativeCalls = Array.isArray(choice.tool_calls)
+      ? choice.tool_calls
+        .map((tc: { id?: string; function?: { name?: string; arguments?: string | Record<string, unknown> }; name?: string; arguments?: Record<string, unknown> }) => {
+          const name = tc.function?.name ?? tc.name;
+          if (!name) return null;
+          let args: Record<string, unknown> = {};
+          const rawArgs = tc.function?.arguments ?? tc.arguments;
+          if (typeof rawArgs === "string") {
+            try { args = JSON.parse(rawArgs || "{}"); } catch { args = {}; }
+          } else if (rawArgs && typeof rawArgs === "object") {
+            args = rawArgs as Record<string, unknown>;
+          }
+          return {
+            id: tc.id || `call_${crypto.randomUUID().slice(0, 8)}`,
+            name,
+            arguments: args,
+          };
+        })
+        .filter((c: { id: string; name: string; arguments: Record<string, unknown> } | null): c is { id: string; name: string; arguments: Record<string, unknown> } => c !== null)
+      : [];
 
-    return { content, tool_calls: choice.tool_calls };
+    // W3.1: same native-first + text-fallback policy as index.ts (including when
+    // useTextTools is false and the model emitted DSML/bare markup in content).
+    const resolved = resolveToolCallsFromTurn({
+      nativeCalls,
+      fullText: content,
+      tools,
+      useTextTools,
+    });
+
+    const cleaned = resolved.textParseAttempted && tools.length > 0
+      ? extractTextToolCalls(content, tools).cleanedText
+      : content;
+
+    return {
+      content: cleaned,
+      tool_calls: resolved.calls.length > 0 ? resolved.calls : undefined,
+    };
   };
 }

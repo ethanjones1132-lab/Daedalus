@@ -271,12 +271,96 @@ export function textToolParseSignals(
   return { _toolParseAttempted: true, _toolParseFailed: true };
 }
 
+/** Dispatchable tool call shape shared by native stream slots and text parse. */
+export type ResolvedToolCall = {
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+};
+
+export type ResolveToolCallsFromTurnInput = {
+  nativeCalls: ResolvedToolCall[];
+  fullText: string;
+  tools?: ToolDefinition[] | null;
+  useTextTools: boolean;
+};
+
+export type ResolveToolCallsFromTurnResult = {
+  calls: ResolvedToolCall[];
+  toolParseFlags: TextToolParseSignals;
+  /** True when extractTextToolCalls ran (primary text mode or native-empty fallback). */
+  textParseAttempted: boolean;
+};
+
+/**
+ * Native tool_calls first; when a turn yields zero native calls, tools were
+ * offered, and content is non-empty, always run the tolerant text parser —
+ * even when useTextTools is false (native path). Prevents DSML/bare dialects
+ * from being discarded as executor_no_tool.
+ */
+export function resolveToolCallsFromTurn(
+  input: ResolveToolCallsFromTurnInput,
+): ResolveToolCallsFromTurnResult {
+  const tools = input.tools ?? [];
+  const toolsOffered = tools.length > 0;
+  const fullText = input.fullText ?? "";
+  const mapExtracted = (extracted: ParsedTextToolCall[]): ResolvedToolCall[] =>
+    extracted.map((c) => ({
+      id: c.id || `call_${crypto.randomUUID().slice(0, 8)}`,
+      name: c.name,
+      arguments: c.arguments,
+    }));
+
+  if (input.useTextTools && toolsOffered) {
+    const extracted = extractTextToolCalls(fullText, tools);
+    return {
+      calls: mapExtracted(extracted.calls),
+      toolParseFlags: textToolParseSignals(true, extracted.calls.length),
+      textParseAttempted: true,
+    };
+  }
+
+  if (input.nativeCalls.length > 0) {
+    return {
+      calls: input.nativeCalls,
+      toolParseFlags: textToolParseSignals(false, 0),
+      textParseAttempted: false,
+    };
+  }
+
+  // Fallback: native empty + non-empty content + tools offered → always try text parse
+  if (toolsOffered && fullText.trim().length > 0) {
+    const extracted = extractTextToolCalls(fullText, tools);
+    return {
+      calls: mapExtracted(extracted.calls),
+      toolParseFlags: textToolParseSignals(true, extracted.calls.length),
+      textParseAttempted: true,
+    };
+  }
+
+  return {
+    calls: input.nativeCalls,
+    toolParseFlags: textToolParseSignals(false, 0),
+    textParseAttempted: false,
+  };
+}
+
+/** Fullwidth vertical line U+FF5C used as the DSML delimiter in live model output. */
+const DSML_FULLWIDTH_PIPE = "\uFF5C";
+
+/** Normalize DSML delimiters so fullwidth and ASCII pipes share one matcher. */
+export function normalizeDsmlDelimiters(text: string): string {
+  return text.replaceAll(DSML_FULLWIDTH_PIPE, "|");
+}
+
 export function extractTextToolCalls(text: string, tools: ToolDefinition[]): {
   cleanedText: string;
   calls: ParsedTextToolCall[];
 } {
   const availableNames = new Set(tools.map((tool) => tool.function.name));
-  const boundedInternalCleaned = stripBoundedInternalToolResults(text);
+  // Fullwidth ｜ (U+FF5C) is a single UTF-16 unit, same as ASCII | — indices stay aligned.
+  const normalizedText = normalizeDsmlDelimiters(text);
+  const boundedInternalCleaned = stripBoundedInternalToolResults(normalizedText);
   const candidates = collectCandidates(boundedInternalCleaned);
   const calls: ParsedTextToolCall[] = [];
   const seen = new Set<string>();
@@ -317,7 +401,8 @@ export function extractTextToolCalls(text: string, tools: ToolDefinition[]): {
   }
   const strippedInternal = boundedInternalCleaned !== text || legacyToolResultSpans.length > 0;
   const strippedCosmetic = availableNames.size === 0 && uniqueSpans.length > 0;
-  if (calls.length > 0 || strippedInternal || strippedCosmetic || /<\/?tool_call>/i.test(cleanedText)) {
+  const hasDsmlMarkup = /<\/?\|DSML\|/i.test(cleanedText);
+  if (calls.length > 0 || strippedInternal || strippedCosmetic || /<\/?tool_call>/i.test(cleanedText) || hasDsmlMarkup) {
     cleanedText = cleanedText
       .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "")
       // An UNCLOSED <tool_call> suppresses everything after it, mirroring
@@ -330,6 +415,10 @@ export function extractTextToolCalls(text: string, tools: ToolDefinition[]): {
       // 1d4727cf / run_81091960).
       .replace(/<tool_call>[\s\S]*$/i, "")
       .replace(/<\/?tool_call>/gi, "")
+      // Residual DSML wrappers after successful call extraction / cosmetic pass.
+      .replace(/<\|DSML\|tool_calls>[\s\S]*?<\/\|DSML\|tool_calls>/gi, "")
+      .replace(/<\|DSML\|invoke\b[\s\S]*?<\/\|DSML\|invoke>/gi, "")
+      .replace(/<\/?\|DSML\|[^>]*>/gi, "")
       .replace(/\n{3,}/g, "\n\n")
       .trim();
     // Tag removal can turn a mixed line (e.g. `</tool_call>{json}`) into a
@@ -564,7 +653,149 @@ function collectCandidates(text: string): Candidate[] {
     addCandidate(object.raw, object.start, object.end);
   }
 
+  // DSML / bare XML dialects (DeepSeek-style and degraded variants). Text is
+  // already fullwidth-pipe-normalized by extractTextToolCalls.
+  candidates.push(...collectDsmlCandidates(text));
+
   return dedupeCandidates(candidates);
+}
+
+/** Known tool names (aliases + canonical) for bare-XML open tags. */
+function knownToolNameSet(): Set<string> {
+  const names = new Set<string>();
+  for (const [alias, target] of Object.entries(TOOL_ALIASES)) {
+    names.add(alias.toLowerCase());
+    names.add(target.toLowerCase());
+  }
+  return names;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Parse parameter bodies from DSML full form, degraded form, or bare XML.
+ * Expects fullwidth pipes already normalized to ASCII |.
+ */
+function parseTaggedParameters(body: string): Record<string, unknown> {
+  const args: Record<string, unknown> = {};
+
+  for (const match of body.matchAll(
+    /<\|DSML\|parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/\|DSML\|parameter>/gi,
+  )) {
+    args[match[1]] = match[2];
+  }
+
+  for (const match of body.matchAll(
+    /<\|DSML\|:([a-zA-Z_][\w]*)>([\s\S]*?)(?:<\/\|DSML\|:\1>|(?=<\|DSML\|:)|(?=<\/\|DSML\|)|$)/gi,
+  )) {
+    const key = match[1];
+    // Skip if this identifier is itself a tool name (degraded tool open tag nested).
+    const keyLower = key.toLowerCase();
+    if (knownToolNameSet().has(keyLower) || knownToolNameSet().has(TOOL_ALIASES[keyLower] ?? "")) {
+      continue;
+    }
+    if (args[key] === undefined) args[key] = match[2];
+  }
+
+  for (const match of body.matchAll(/<([a-zA-Z_][\w]*)>([\s\S]*?)<\/\1>/gi)) {
+    const key = match[1];
+    const keyLower = key.toLowerCase();
+    // Do not treat nested tool opens as parameters.
+    if (knownToolNameSet().has(keyLower)) continue;
+    if (args[key] === undefined) args[key] = match[2];
+  }
+
+  return args;
+}
+
+/**
+ * Collect DSML full/degraded and bare XML tool-call candidates.
+ * Input must already have U+FF5C normalized to ASCII |.
+ */
+function collectDsmlCandidates(text: string): Candidate[] {
+  const candidates: Candidate[] = [];
+  const occupied: TextSpan[] = [];
+  const overlaps = (start: number, end: number) =>
+    occupied.some((span) => start < span.end && end > span.start);
+  const add = (start: number, end: number, value: { name: string; arguments: Record<string, unknown> }) => {
+    if (end <= start || overlaps(start, end)) return;
+    occupied.push({ start, end });
+    candidates.push({ raw: text.slice(start, end), start, end, value });
+  };
+
+  // 1) Full DSML invoke blocks
+  for (const match of text.matchAll(
+    /<\|DSML\|invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/\|DSML\|invoke>/gi,
+  )) {
+    const start = match.index ?? 0;
+    const end = start + match[0].length;
+    add(start, end, {
+      name: match[1],
+      arguments: parseTaggedParameters(match[2]),
+    });
+  }
+
+  // 2) Degraded: <|DSML|:tool_name> then <|DSML|:arg>… params until next tool or end
+  const known = knownToolNameSet();
+  const degradedOpen = /<\|DSML\|:([a-zA-Z_][\w]*)>/gi;
+  const opens: Array<{ name: string; nameStart: number; bodyStart: number }> = [];
+  for (const match of text.matchAll(degradedOpen)) {
+    const name = match[1];
+    const nameLower = name.toLowerCase();
+    const isTool = known.has(nameLower) || known.has(TOOL_ALIASES[nameLower] ?? "");
+    if (!isTool) continue;
+    const nameStart = match.index ?? 0;
+    opens.push({ name, nameStart, bodyStart: nameStart + match[0].length });
+  }
+  for (let i = 0; i < opens.length; i++) {
+    const current = opens[i];
+    const nextStart = i + 1 < opens.length ? opens[i + 1].nameStart : text.length;
+    // Extend through trailing param close tags that sit before the next tool.
+    let end = nextStart;
+    const body = text.slice(current.bodyStart, nextStart);
+    // Prefer to end after the last parameter region inside body.
+    const lastParamClose = Math.max(
+      body.lastIndexOf("</|DSML|:"),
+      body.lastIndexOf("</|DSML|"),
+    );
+    if (lastParamClose >= 0) {
+      const closeEnd = body.indexOf(">", lastParamClose);
+      if (closeEnd >= 0) end = current.bodyStart + closeEnd + 1;
+    }
+    const argsBody = text.slice(current.bodyStart, end);
+    add(current.nameStart, end, {
+      name: current.name,
+      arguments: parseTaggedParameters(argsBody),
+    });
+  }
+
+  // 3) Bare XML: <read_file><path>…</path></read_file> (known tools only)
+  //    Also mixed close: <read_file><path>…</path></|DSML|tool>
+  const toolNames = [...new Set([...Object.keys(TOOL_ALIASES), ...Object.values(TOOL_ALIASES)])]
+    .filter((n) => /^[a-zA-Z_][\w]*$/.test(n))
+    .sort((a, b) => b.length - a.length);
+  if (toolNames.length > 0) {
+    const alt = toolNames.map(escapeRegExp).join("|");
+    const bareRe = new RegExp(
+      `<(${alt})>([\\s\\S]*?)(?:</\\1>|</\\|DSML\\|[^>]*>|(?=<\\|DSML\\|)|(?=<(?:${alt})>)|$)`,
+      "gi",
+    );
+    for (const match of text.matchAll(bareRe)) {
+      const start = match.index ?? 0;
+      const end = start + match[0].length;
+      // Require at least one parameter-looking child to avoid prose false positives.
+      const body = match[2] ?? "";
+      if (!/<[a-zA-Z_][\w]*>/.test(body) && !/<\|DSML\|:/.test(body)) continue;
+      add(start, end, {
+        name: match[1],
+        arguments: parseTaggedParameters(body),
+      });
+    }
+  }
+
+  return candidates;
 }
 
 function stripBoundedInternalToolResults(text: string): string {
