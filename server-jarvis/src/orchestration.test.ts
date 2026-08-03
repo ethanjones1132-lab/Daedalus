@@ -1553,7 +1553,21 @@ describe("PipelineExecutor Phase 2: live conductor observability + abort", () =>
 
     for (const topology of ["linear", "recursive"] as const) {
       const noSynthExecutor = new PipelineExecutor(async () => ({ content: "unused" }), runtime, ctx, { collector: testCollector });
-      (noSynthExecutor as any).executeSegment = async () => ({ state: {} });
+      (noSynthExecutor as any).executeSegment = async () => ({
+        state: {
+          executor: {
+            ok: true,
+            narrative: "Read evidence gathered but no mutation landed.",
+            toolCalls: [{
+              name: "read_file",
+              arguments: { path: "src/PluginProcessor.h" },
+              output: "class PluginProcessor {};",
+              is_error: false,
+              duration_ms: 1,
+            }],
+          },
+        },
+      });
       const noSynthResult = await noSynthExecutor.execute(
         request,
         ["executor"],
@@ -1563,6 +1577,8 @@ describe("PipelineExecutor Phase 2: live conductor observability + abort", () =>
       );
       expect(noSynthResult.outcome).toBe("failed");
       expect(noSynthResult.error_code).toBe("effect_gate_no_write_effect");
+      expect(noSynthResult.answer).toContain("PluginProcessor.h");
+      expect(noSynthResult.answer).toContain("Runtime-composed digest");
 
       const withSynthExecutor = new PipelineExecutor(
         async (_messages: any[], options: any = {}) => options.stageLabel === "recursion_critique"

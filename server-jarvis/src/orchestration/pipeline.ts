@@ -5368,8 +5368,12 @@ export class PipelineExecutor {
         }),
       );
       // No synthesizer in this pipeline: fall back to the last completed phase.
+      const noWriteEvidence = gated.errorCode === "effect_gate_no_write_effect"
+        ? composeEvidenceFallbackAnswer(state)
+        : "";
       return {
-        answer: state.plan ? renderPlanSummary(state.plan) : "No planning stage executed.",
+        answer: noWriteEvidence
+          || (state.plan ? renderPlanSummary(state.plan) : "No planning stage executed."),
         recursion_depth: 0,
         outcome: gated.outcome,
         error_code: gated.errorCode,
