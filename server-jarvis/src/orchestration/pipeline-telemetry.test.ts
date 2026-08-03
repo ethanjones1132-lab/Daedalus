@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
 import { defaultConfig } from "../config";
 import { createToolRuntime, makeExecutionContext } from "../tool-runtime";
+import { registerFilesystemBundle } from "../filesystem-bundle";
 import { SessionOutcomeCollector } from "../self-tuning/collector";
 import { SelfTuningStore, type StageRun } from "../self-tuning/store";
 import { PipelineExecutor, type StageRunRecorder } from "./pipeline";
@@ -197,6 +201,65 @@ describe("pipeline stage telemetry", () => {
       distinctSuccessfulReads: 2,
     });
     expect(decideMidLoopIntervention(signals[0]).kind).toBe("force_write");
+  });
+
+  test("a seeded delegate read opens the native edit ledger", async () => {
+    const workspace = mkdtempSync(join(tmpdir(), "jarvis-pipeline-ledger-"));
+    try {
+      writeFileSync(join(workspace, "target.txt"), "before\n");
+      const config = defaultConfig();
+      config.jarvis_path = workspace;
+      config.tools.enabled = true;
+      config.tools.sandbox_mode = "workspace";
+      config.claude_cli.delegate.enabled = false;
+      const runtime = createToolRuntime();
+      registerFilesystemBundle(runtime);
+      const ctx = makeExecutionContext("chat", config, {
+        workspace_path: workspace,
+        requestApproval: async () => true,
+      });
+      const priorToolCalls = [{
+        name: "read_file",
+        // Claude Code's Read payload uses file_path; the native edit uses path.
+        arguments: { file_path: "target.txt" },
+        output: "    1 | before",
+        is_error: false,
+        duration_ms: 1,
+      }];
+      const executor = new PipelineExecutor(
+        async (_messages, options) => options.stageLabel === "executor"
+          ? {
+              content: "apply the requested edit",
+              tool_calls: [toolCallWithArgs("edit_file", {
+                path: "target.txt",
+                old_string: "before",
+                new_string: "after",
+              })],
+            }
+          : { content: "done" },
+        runtime,
+        ctx,
+        { recordStageRun: () => {} },
+      );
+
+      const result = await executor.executeSegment(
+        "Update target.txt",
+        ["executor"],
+        "run-seeded-read-write",
+        () => {},
+        {
+          executionProfile: "full",
+          rawMessage: "Update target.txt",
+          taskRunWriteIntent: true,
+          priorToolCalls,
+        },
+      );
+
+      expect(readFileSync(join(workspace, "target.txt"), "utf8")).toBe("after\n");
+      expect(result.state.executor?.toolCalls.find((call) => call.name === "edit_file")?.is_error).toBe(false);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
   });
 
   test("mid-loop check-runner feeds CheckResult into supervision after a write", async () => {

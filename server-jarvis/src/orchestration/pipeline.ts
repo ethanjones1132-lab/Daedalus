@@ -69,6 +69,8 @@ import {
 } from "./context-budget";
 import { prepareToolResultForContext } from "../tool-result-truncation";
 import { findExistingWorkspacePath } from "./workspace-affinity";
+import { safePath } from "../fs-scope";
+import { markFileRead } from "../fs-read-cache";
 import { join, posix, win32 } from "path";
 import { canApplyConductorReroute, rejectReroute } from "./reroute-policy";
 import {
@@ -1377,6 +1379,9 @@ export class PipelineExecutor {
               workspaceRoot: this.activeWorkspaceRoot(),
             });
             if (readOnlyOutputCache.has(duplicateKey)) {
+              if ((readOnlyOutputCache.get(duplicateKey) ?? "").trim().length > 0) {
+                this.markReadLedgerForCall(entry.call);
+              }
               return {
                 entry,
                 result: duplicateToolCallDeflection(entry.call, readOnlyOutputCache.get(duplicateKey)),
@@ -1467,6 +1472,28 @@ export class PipelineExecutor {
       });
     }
     return result;
+  }
+
+  /**
+   * Seed the filesystem read-before-edit ledger when evidence came from a
+   * cached or external read rather than handleReadFile itself. Delegate reads
+   * run in another process, and duplicate deflections intentionally skip the
+   * native handler, so both paths otherwise leave edits falsely blocked.
+   */
+  private markReadLedgerForCall(call: Pick<ToolCall, "name" | "arguments">): void {
+    if (call.name !== "read_file") return;
+    const rawPath = call.arguments?.path ?? call.arguments?.file_path;
+    if (typeof rawPath !== "string" || rawPath.trim().length === 0) return;
+    try {
+      const resolved = safePath(rawPath, this.ctx.config, {
+        workspaceOverride: this.ctx.workspace_path,
+        sessionGrants: this.ctx.session_grants,
+      });
+      markFileRead(resolved);
+    } catch {
+      // Scope validation remains authoritative at execution time. A cached
+      // read that cannot resolve under the current scope must not broaden it.
+    }
   }
 
   private async runPlannerStage(
@@ -1614,6 +1641,7 @@ export class PipelineExecutor {
         call.output.trim().length > 0 &&
         !isDuplicateToolDeflection(call)
       ) {
+        this.markReadLedgerForCall(call);
         duplicateReadOnlyOutputs.set(toolCallIdentityKey(call, identityOptions), call.output);
       }
     }
@@ -2493,6 +2521,7 @@ export class PipelineExecutor {
             && call.output.trim().length > 0
             && !isDuplicateToolDeflection(call)
           ) {
+            this.markReadLedgerForCall(call);
             duplicateReadOnlyOutputs.set(toolCallIdentityKey(call, identityOptions), call.output);
           }
         }
