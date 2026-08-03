@@ -2631,7 +2631,14 @@ export class PipelineExecutor {
         was_successful: stageSucceeded ? 1 : 0,
         had_error: stageSucceeded ? 0 : 1,
         duration_ms: Date.now() - delegateStart,
-        fallback_used: nativeNoWrite || willRunNativeFallback || modelSelection.pool === "go_capable" ? 1 : 0,
+        // W1: go_capable (minimax-m3) is the primary write-evidence lane, not a
+        // free→Go fallback. Mark fallback only for thrash promotion or native
+        // handoff after a failed/empty delegate attempt.
+        fallback_used: nativeNoWrite || willRunNativeFallback
+          || modelSelection.thrashCount > 0
+          || /thrash|promot/i.test(modelSelection.reason)
+          ? 1
+          : 0,
       });
 
       toolCalls.push(...delegated.toolCalls);

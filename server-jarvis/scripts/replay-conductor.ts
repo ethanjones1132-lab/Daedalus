@@ -16,7 +16,11 @@ import {
   type ReplayRun,
   type ReplayViolation,
 } from "../src/eval/conductor-replay";
-import type { ConductorDirectiveRow, StageRun } from "../src/self-tuning/store";
+import type {
+  ConductorDirectiveRow,
+  ModelAttribution,
+  StageRun,
+} from "../src/self-tuning/store";
 
 function arg(flag: string): string | undefined {
   const i = process.argv.indexOf(flag);
@@ -58,6 +62,12 @@ const stageStmt = db.query(
 const directiveStmt = db.query(
   "SELECT * FROM conductor_directives WHERE agent_run_id = ? ORDER BY created_at",
 );
+// W1.4 / W2.1: claude_cli attributions drive delegate_benched_model_selected
+// and other attribution-primary dials. Without this load the invariant is dead
+// on live Layer-1 scans.
+const attributionStmt = db.query(
+  "SELECT * FROM model_attributions WHERE agent_run_id = ? ORDER BY created_at",
+);
 
 const runs: ReplayRun[] = agentRuns.map((row) => ({
   agentRunId: row.id,
@@ -68,6 +78,7 @@ const runs: ReplayRun[] = agentRuns.map((row) => ({
   checkTier: row.check_tier,
   stageRuns: stageStmt.all(row.id) as StageRun[],
   directives: directiveStmt.all(row.id) as ConductorDirectiveRow[],
+  modelAttributions: attributionStmt.all(row.id) as ModelAttribution[],
 }));
 
 const violations: ReplayViolation[] = runs.flatMap((run) =>
