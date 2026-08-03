@@ -155,8 +155,38 @@ export function requestTimeoutMessage(timeoutMs: number): string {
 }
 
 /**
- * Give a final queued repair stage the unused turn window, while preserving
- * the finalization reserve for synthesis and terminal bookkeeping.
+ * W6: when the turn still has headroom, allow a stage more than its flat
+ * configured ceiling so it is not killed while the turn has >2× the stage
+ * budget remaining. Cap at `configured * k` so one stage cannot eat the
+ * whole turn; always leave `finalization_reserve_ms` for synthesis.
+ *
+ * Never shrinks an existing ceiling (progress extensions / F7 last-stage
+ * grants win). Pass `baseConfiguredMs` when the live `stage_ms` may already
+ * have been scaled so re-entry does not compound the multiplier.
+ */
+export const STAGE_PROPORTIONAL_K = 2;
+
+export function scaleStageBudgetProportional(
+  budget: TurnBudget,
+  stage: string,
+  now = Date.now(),
+  baseConfiguredMs?: number,
+): number | undefined {
+  const current = budget.stage_ms[stage];
+  if (current === undefined) return undefined;
+  const configured = baseConfiguredMs ?? current;
+  if (configured <= 0) return current;
+  const available = Math.max(0, budget.remainingMs(now) - budget.finalization_reserve_ms);
+  const scaled = Math.min(configured * STAGE_PROPORTIONAL_K, available);
+  if (scaled > current) budget.stage_ms[stage] = scaled;
+  return budget.stage_ms[stage];
+}
+
+/**
+ * F7: give a final queued repair stage the unused turn window, while
+ * preserving the finalization reserve for synthesis and terminal bookkeeping.
+ * Unlike proportional scaling this may grant the full available window
+ * (beyond configured × k) because no later model stage remains.
  */
 export function scaleLastQueuedStageBudget(
   budget: TurnBudget,
@@ -251,6 +281,9 @@ export function createTurnBudget(
     // conversational/answer_only have no executor budget — grant one too.
     stage_ms.executor = EXTENDED_DEEP_EXECUTOR_MS;
   }
+  // Snapshot of configured ceilings before proportional/F7/progress mutation.
+  // W6 re-entry must multiply the *base* config, not an already-scaled value.
+  const baseStageMs: Readonly<Record<string, number>> = { ...stage_ms };
   // F2: cumulative usage per stage + current inflight start (usage-based,
   // not wall-clock since first entry).
   const stageUsedAccumMs = new Map<string, number>();
@@ -301,6 +334,9 @@ export function createTurnBudget(
       if (this.stage_ms[stage] === undefined) return;
       // Already inflight (retry without endStage) — share the window (T1.1).
       if (!stageInflightStart.has(stage)) {
+        // W6: scale stage ceiling with remaining turn headroom before opening
+        // the usage window. Uses base configured ms so retries do not compound k.
+        scaleStageBudgetProportional(this, stage, now, baseStageMs[stage]);
         stageInflightStart.set(stage, now);
       }
     },

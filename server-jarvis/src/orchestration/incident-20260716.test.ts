@@ -68,29 +68,38 @@ describe("incident 2026-07-16 run_5283dd64 — F2 stage-window starvation (Phase
     // Live bug: wall-clock from first begin (T0+14) to T0+88 = 74s killed the
     // 60s stage window even though only ~50s of planner inference ran.
     // Usage-based accounting: end after 50s of work; idle until T0+88 is free.
+    // W6 may scale the planner ceiling above the flat 60s on beginStage; residual
+    // is still ceiling − used, not wall-clock since first entry.
     const budget = createTurnBudget("full_execution", "high", T0);
     budget.beginStage("planner", T0 + 14_000);
+    const ceiling = budget.stage_ms.planner!;
     budget.endStage("planner", T0 + 14_000 + 50_000);
 
     const atReplan = T0 + 88_000;
     expect(budget.stageUsedMs("planner", atReplan)).toBe(50_000);
-    expect(budget.stageRemainingMs("planner", atReplan)).toBe(10_000);
+    expect(budget.stageRemainingMs("planner", atReplan)).toBe(ceiling - 50_000);
     expect(budget.canStart("planner", atReplan)).toBe(true);
     // Turn itself still has budget (the mislabeled "Total turn deadline" path).
     expect(budget.remainingMs(atReplan)).toBeGreaterThan(90_000);
   });
 
-  test("F2: stageRemainingMs(reviewer) meters usage (60_000 − usedMs), not wall-clock", () => {
+  test("F2: stageRemainingMs(reviewer) meters usage (ceiling − usedMs), not wall-clock", () => {
     // Live: reviewer first entry ~58s; re-entry at ~109s died after ~8.86s
     // because remaining was 60_000 − ~51_000 wall-clock. Usage accounting:
     // first segment used 8_862ms then ended; idle gap free.
+    // W6 scales the ceiling on begin; residual is still ceiling − used.
     const budget = createTurnBudget("full_execution", "high", T0);
     const usedMs = 8_862;
     budget.beginStage("reviewer", T0 + 58_000);
+    const ceiling = budget.stage_ms.reviewer!;
     budget.endStage("reviewer", T0 + 58_000 + usedMs);
 
     const atReentry = T0 + 109_000;
-    expect(budget.stageRemainingMs("reviewer", atReentry)).toBe(60_000 - usedMs);
+    // Remaining is min(ceiling − used, turn remaining) — never wall-clock from first entry.
+    expect(budget.stageRemainingMs("reviewer", atReentry)).toBe(
+      Math.min(ceiling - usedMs, budget.remainingMs(atReentry)),
+    );
+    expect(budget.stageUsedMs("reviewer", atReentry)).toBe(usedMs);
   });
 });
 

@@ -10,6 +10,8 @@ import {
   FORCED_DEEP_READ_TURN_MS,
   requestTimeoutMessage,
   scaleLastQueuedStageBudget,
+  scaleStageBudgetProportional,
+  STAGE_PROPORTIONAL_K,
 } from "./turn-budget";
 import { AgentPool, firstTokenTimeoutFor } from "./agent-pool";
 import { resolveTurnRequirement } from "./turn-requirements";
@@ -288,28 +290,33 @@ describe("turn budgets", () => {
   });
 
   // T1.1: retries within one inflight window share stage budget (cannot
-  // re-arm a full 15s coordinator budget — 37s serial parse-fail chain).
+  // re-arm a full stage budget — 37s serial parse-fail chain).
   test("beginStage elapsed accounting shrinks stageRemainingMs across retries", () => {
     const budget = createTurnBudget("workspace_read", "medium", 0);
     budget.beginStage("coordinator", 1_000);
-    // 10s into the stage → 5s of the 15s budget remain.
-    expect(budget.stageRemainingMs("coordinator", 11_000)).toBe(5_000);
+    // W6 may scale the ceiling (base 15s × k, capped by remaining−reserve);
+    // usage still accumulates from first begin and retries must not re-arm.
+    const ceiling = budget.stage_ms.coordinator!;
+    expect(ceiling).toBeGreaterThanOrEqual(15_000);
+    expect(budget.stageRemainingMs("coordinator", 11_000)).toBe(ceiling - 10_000);
     // Second "attempt" at t=11s must NOT reset the budget (still inflight).
     budget.beginStage("coordinator", 11_000);
-    expect(budget.stageRemainingMs("coordinator", 14_000)).toBe(2_000);
-    expect(budget.stageRemainingMs("coordinator", 16_000)).toBe(0);
+    expect(budget.stageRemainingMs("coordinator", 14_000)).toBe(ceiling - 13_000);
+    expect(budget.stageRemainingMs("coordinator", 1_000 + ceiling)).toBe(0);
   });
 
   // F2: usage-based accounting — idle between ended attempts is free.
-  test("two 20s planner attempts separated by 60s idle leave 20s remaining", () => {
+  test("two 20s planner attempts separated by 60s idle leave residual remaining", () => {
     const budget = createTurnBudget("full_execution", "high", 0);
     budget.beginStage("planner", 0);
+    const ceiling = budget.stage_ms.planner!;
     budget.endStage("planner", 20_000);
     // 60s idle gap (replan / supervision) does not consume planner budget.
     budget.beginStage("planner", 80_000);
     budget.endStage("planner", 100_000);
     expect(budget.stageUsedMs("planner", 100_000)).toBe(40_000);
-    expect(budget.stageRemainingMs("planner", 100_000)).toBe(20_000);
+    // W6 scales the first begin; residual is ceiling − used, not base − used.
+    expect(budget.stageRemainingMs("planner", 100_000)).toBe(ceiling - 40_000);
   });
 
   test("a stage never begun has full budget at any wall-clock time", () => {
@@ -330,11 +337,12 @@ describe("turn budgets", () => {
   describe("minimum viable stage window", () => {
     test("a reviewer with only seconds left is not admitted", () => {
       const budget = createTurnBudget("full_execution", "high", 0);
-      // Consume all but 3s of the reviewer window.
+      // Consume all but 3s of the (possibly W6-scaled) reviewer window.
       budget.beginStage("reviewer", 0);
-      budget.endStage("reviewer", 57_000);
-      expect(budget.stageRemainingMs("reviewer", 57_000)).toBe(3_000);
-      expect(budget.canStart("reviewer", 57_000)).toBe(false);
+      const ceiling = budget.stage_ms.reviewer!;
+      budget.endStage("reviewer", ceiling - 3_000);
+      expect(budget.stageRemainingMs("reviewer", ceiling - 3_000)).toBe(3_000);
+      expect(budget.canStart("reviewer", ceiling - 3_000)).toBe(false);
     });
 
     test("a reviewer with a full window is admitted", () => {
@@ -380,5 +388,115 @@ describe("turn budgets", () => {
   test("finalStreamDeadlineAt extends past deadlineAt by FINAL_STREAM_GRACE_MS", () => {
     const budget = createTurnBudget("workspace_read", "medium", 0);
     expect(budget.finalStreamDeadlineAt()).toBe(budget.deadlineAt + FINAL_STREAM_GRACE_MS);
+  });
+
+  // W6 — proportional stage budgets: stage ceiling scales with remaining turn
+  // headroom (min(configured × k, remaining − finalization_reserve)) so a
+  // stage is not killed while the turn still has >2× its flat budget left.
+  describe("proportional stage budgets (W6)", () => {
+    test("stage with 60s configured while turn has ample remaining scales up past 60s", () => {
+      // full_execution medium: turn 150s, reserve 30s, executor 60s.
+      // At t=0 remaining=150s → available=120s → min(60×2, 120)=120.
+      const budget = createTurnBudget("full_execution", "medium", 0);
+      expect(budget.stage_ms.executor).toBe(60_000);
+      expect(budget.remainingMs(0)).toBe(150_000);
+
+      budget.beginStage("executor", 0);
+
+      expect(STAGE_PROPORTIONAL_K).toBe(2);
+      expect(budget.stage_ms.executor).toBe(120_000);
+      expect(budget.stageRemainingMs("executor", 0)).toBe(120_000);
+      // Pure helper agrees when called on a fresh budget.
+      const fresh = createTurnBudget("full_execution", "medium", 0);
+      scaleStageBudgetProportional(fresh, "executor", 0);
+      expect(fresh.stage_ms.executor).toBe(120_000);
+    });
+
+    test("stage does not steal past finalization_reserve", () => {
+      // high full_execution: turn 180s. At t=60s remaining=120s, reserve=30s
+      // → available=90s. Configured planner 60s × 2 = 120, capped at 90.
+      const budget = createTurnBudget("full_execution", "high", 0);
+      budget.beginStage("planner", 60_000);
+
+      expect(budget.remainingMs(60_000)).toBe(120_000);
+      expect(budget.stage_ms.planner).toBe(90_000);
+      // Any upward scale is capped at remaining − reserve.
+      expect(budget.stage_ms.planner!).toBeLessThanOrEqual(
+        budget.remainingMs(60_000) - budget.finalization_reserve_ms,
+      );
+
+      // When available is below the flat configured ceiling the helper never
+      // shrinks stage_ms, but effective remaining is still turn-clamped and
+      // canStart refuses once only the finalization reserve is left.
+      const tight = createTurnBudget("full_execution", "high", 0);
+      scaleStageBudgetProportional(tight, "reviewer", 100_000);
+      const available = tight.remainingMs(100_000) - tight.finalization_reserve_ms;
+      expect(available).toBe(50_000);
+      expect(tight.stage_ms.reviewer).toBe(60_000); // never shrink
+      // Live remaining cannot exceed turn remaining (and canStart hits reserve).
+      expect(tight.stageRemainingMs("reviewer", 100_000)).toBeLessThanOrEqual(
+        tight.remainingMs(100_000),
+      );
+      expect(tight.canStart("reviewer", tight.deadlineAt - tight.finalization_reserve_ms)).toBe(false);
+    });
+
+    test("last-stage F7 still grants full available beyond proportional k", () => {
+      const budget = createTurnBudget("full_execution", "medium", 0);
+      // At t=30s: remaining=120s, available=90s. Proportional alone would cap
+      // rewriter at min(60×2, 90)=90 — same number here — but F7 is allowed
+      // to grant the full available window even when that exceeds base×k
+      // after earlier spend has left more free than k would imply.
+      // Force a higher available relative to base×k by starting late with
+      // a stage that still has headroom only via F7 after partial turn use
+      // where available > base but available < base×k is the normal case;
+      // assert F7 still expands when another non-synth stage is NOT queued,
+      // and refuses when one is.
+      scaleLastQueuedStageBudget(budget, "rewriter", ["synthesizer"], 30_000);
+      expect(budget.stage_ms.rewriter).toBe(90_000);
+
+      const blocked = createTurnBudget("full_execution", "medium", 0);
+      scaleLastQueuedStageBudget(blocked, "rewriter", ["reviewer", "synthesizer"], 30_000);
+      expect(blocked.stage_ms.rewriter).toBe(60_000);
+
+      // F7 after proportional: last stage may keep a grant ≥ proportional.
+      const both = createTurnBudget("full_execution", "medium", 0);
+      scaleStageBudgetProportional(both, "rewriter", 30_000);
+      const afterProp = both.stage_ms.rewriter!;
+      scaleLastQueuedStageBudget(both, "rewriter", ["synthesizer"], 30_000);
+      expect(both.stage_ms.rewriter!).toBeGreaterThanOrEqual(afterProp);
+      expect(both.stage_ms.rewriter!).toBe(
+        Math.max(0, both.remainingMs(30_000) - both.finalization_reserve_ms),
+      );
+    });
+
+    test("stages still die at the scaled deadline, not infinite", () => {
+      const budget = createTurnBudget("full_execution", "medium", 0);
+      budget.beginStage("executor", 0);
+      const ceiling = budget.stage_ms.executor!;
+      expect(ceiling).toBe(120_000);
+      expect(ceiling).toBeLessThan(budget.turn_ms);
+
+      // At the scaled boundary, remaining is 0 and the stream deadline is now.
+      expect(budget.stageRemainingMs("executor", ceiling)).toBe(0);
+      expect(budget.stageStreamDeadlineAt("executor", ceiling)).toBe(ceiling);
+      // Past the scaled window the stage is exhausted even though the turn
+      // still has finalization reserve left.
+      expect(budget.remainingMs(ceiling)).toBeGreaterThan(0);
+      expect(budget.canStart("executor", ceiling)).toBe(false);
+
+      // Re-entry does not compound k past base×k / available.
+      budget.endStage("executor", ceiling);
+      budget.beginStage("executor", ceiling);
+      expect(budget.stage_ms.executor!).toBe(ceiling);
+    });
+
+    test("proportional scale never shrinks a progress-extended ceiling", () => {
+      const budget = createTurnBudget("workspace_read", "medium", 0);
+      budget.extendStageOnProgress("executor", 1); // 60 → 80
+      expect(budget.stage_ms.executor).toBe(80_000);
+      // available at t=0: 75−25=50 < 80, so proportional must not shrink.
+      scaleStageBudgetProportional(budget, "executor", 0, 60_000);
+      expect(budget.stage_ms.executor).toBe(80_000);
+    });
   });
 });
