@@ -83,6 +83,10 @@ import { searchWeb } from "./web-bundle";
 import { getSessionState, clearSessionState } from "./interactive-bundle";
 import { StreamSession, VisibleTextPipe, isTerminalPipelineErrorCode } from "./stream-emitter";
 import {
+  markNativeToolProtocolUnsupported,
+  supportsNativeToolsForProvider,
+} from "./native-tool-support";
+import {
   createStreamLivenessTracker,
   createDisconnectAwareWrite,
   ResettableWatchdog,
@@ -1882,7 +1886,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const modelSupportsNativeTools = isOllama
             ? (ollamaTarget?.supportsNativeTools ?? false)
             : isOpenCodeProvider
-              ? false // OpenCode agents use the text tool protocol
+              ? supportsNativeToolsForProvider(effectiveProvider, modelName)
               : (openRouterEffective?.supports_tools ?? isOpenRouterModelSupportsTools(modelName));
           // Use text tool protocol if native tools are disabled/unsupported and tools are requested
           const useTextTools = !modelSupportsNativeTools && callOptions?.tools && callOptions.tools.length > 0;
@@ -2084,9 +2088,57 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
           if (!fetchRes.ok) {
             const errText = await fetchRes.text();
-            clearTimeout(timeout);
-            cleanupRequestAbort();
-            throw new Error(`API ${fetchRes.status}: ${errText.slice(0, 300)}`);
+            if (
+              isNativeToolProtocolUnsupportedError(fetchRes.status, errText)
+              && requestBody.tools
+              && actualProviderUsed === "opencode_zen"
+            ) {
+              markNativeToolProtocolUnsupported(actualProviderUsed, actualModelUsed);
+              console.warn(`[Jarvis Orchestrator] Model ${actualModelUsed} does not support native tools. Retrying without tools...`);
+              delete requestBody.tools;
+              const instructions = buildTextToolInstructions(runtime.listTools());
+              const systemMessage = requestBody.messages.find((item: any) => item.role === "system");
+              if (systemMessage) {
+                systemMessage.content = [systemMessage.content, instructions].filter(Boolean).join("\n\n");
+              } else {
+                requestBody.messages.unshift({ role: "system", content: instructions });
+              }
+              clearTimeout(timeout);
+              cleanupRequestAbort();
+              const retryTarget = resolveProviderTarget(cfg, actualProviderUsed);
+              const retryBudgetMs = computeBoundedRequestTimeoutMs(
+                callOptions?.stageLabel ?? "orchestrator_request",
+                turnBudget,
+                requestTimeout,
+                reserveMs,
+              );
+              const retryCtrl = new AbortController();
+              const retryTimeout = setTimeout(() => retryCtrl.abort(), retryBudgetMs);
+              const cleanupRetryAbort = registerAbortHandler(streamAbort.signal, () => retryCtrl.abort());
+              try {
+                fetchRes = await fetch(providerChatUrl(retryTarget, actualModelUsed), {
+                  method: "POST",
+                  headers: providerHeaders(cfg, retryTarget, actualModelUsed),
+                  body: JSON.stringify(requestBody),
+                  signal: retryCtrl.signal,
+                });
+                if (!fetchRes.ok) {
+                  const retryErrText = await fetchRes.text();
+                  throw new Error(`API ${fetchRes.status}: ${retryErrText.slice(0, 300)}`);
+                }
+              } catch (retryErr: any) {
+                if (retryErr.name === "AbortError" && streamAbort.signal.aborted) await emitCancelled();
+                if (retryErr.name === "AbortError") throw new Error(requestTimeoutMessage(retryBudgetMs));
+                throw retryErr;
+              } finally {
+                clearTimeout(retryTimeout);
+                cleanupRetryAbort();
+              }
+            } else {
+              clearTimeout(timeout);
+              cleanupRequestAbort();
+              throw new Error(`API ${fetchRes.status}: ${errText.slice(0, 300)}`);
+            }
           }
           clearTimeout(timeout);
 
@@ -4116,6 +4168,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           
           if (isNativeToolProtocolUnsupportedError(fetchRes.status, errText) && requestBody.tools) {
             cleanupRequestAbort();
+            markNativeToolProtocolUnsupported(
+              isOllama ? "ollama" : "openrouter",
+              actualModelUsed,
+            );
             console.warn(`[Jarvis] Model ${actualModelUsed} does not support native tools. Retrying without tools...`);
             delete requestBody.tools;
             useTextToolProtocol = true;
