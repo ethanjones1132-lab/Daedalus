@@ -15,7 +15,7 @@
 // The CLI (`scripts/benchmark-conductor-completion.ts`) loads SQLite and
 // prints these metrics; unit tests feed hand-built fixtures.
 
-import type { ConductorDirectiveRow, StageRun } from "../self-tuning/store";
+import type { ConductorDirectiveRow, ModelAttribution, StageRun } from "../self-tuning/store";
 
 /** One stored turn, assembled from the tables keyed by agent_run_id. */
 export interface ConductorPerformanceFixture {
@@ -31,6 +31,12 @@ export interface ConductorPerformanceFixture {
   checkTier?: string | null;
   stageRuns: StageRun[];
   directives: ConductorDirectiveRow[];
+  /**
+   * model_attributions for this run. Primary signal for delegate detection:
+   * provider === "claude_cli" (pipeline records this for the Claude delegate path).
+   * Optional so older hand fixtures / partial loaders still work via cleanup fallback.
+   */
+  modelAttributions?: ModelAttribution[];
 }
 
 export interface ConductorPerformanceThresholds {
@@ -90,8 +96,16 @@ const WRITE_EFFECT_TOOLS = new Set(["write_file", "edit_file", "multi_edit", "ap
 /**
  * Emitted only on the delegate path, which `delegateEligibility` gates on
  * `writeEffectRequired` — so seeing it is proof a write was expected.
+ * Kept as a secondary/fallback signal; primary is model_attributions.provider.
  */
 const DELEGATE_MARKER_TOOL = "delegate_cleanup";
+
+/**
+ * Pipeline records this provider on model_attributions for Claude-CLI
+ * delegate stages (see pipeline.ts). Present on good-era (07-25) minimax runs
+ * that rarely emitted delegate_cleanup.
+ */
+const DELEGATE_PROVIDER = "claude_cli";
 
 /**
  * Task 1 incomplete-language backstop — same family as conductor-replay and
@@ -135,6 +149,21 @@ function isWritePressureNote(note: string | undefined | null): boolean {
   );
 }
 
+function stageHasSuccessfulWrite(stage: StageRun): boolean {
+  const calls = parseToolCalls(stage.tool_calls_json);
+  return calls.some(
+    (c) => c.name && WRITE_EFFECT_TOOLS.has(c.name) && c.is_error !== true,
+  );
+}
+
+function stageHasDelegateCleanup(stage: StageRun): boolean {
+  return parseToolCalls(stage.tool_calls_json).some((c) => c.name === DELEGATE_MARKER_TOOL);
+}
+
+function claudeCliAttributions(fixture: ConductorPerformanceFixture): ModelAttribution[] {
+  return (fixture.modelAttributions ?? []).filter((a) => a.provider === DELEGATE_PROVIDER);
+}
+
 function runHasWriteIntent(fixture: ConductorPerformanceFixture): boolean {
   const calls = fixture.stageRuns.flatMap((s) => parseToolCalls(s.tool_calls_json));
   return calls.some(
@@ -142,24 +171,45 @@ function runHasWriteIntent(fixture: ConductorPerformanceFixture): boolean {
   );
 }
 
+/**
+ * Primary: any model_attributions row with provider === "claude_cli".
+ * Fallback: legacy `delegate_cleanup` tool marker (sparse in good-era data).
+ */
 function isDelegateRun(fixture: ConductorPerformanceFixture): boolean {
-  const calls = fixture.stageRuns.flatMap((s) => parseToolCalls(s.tool_calls_json));
-  return calls.some((c) => c.name === DELEGATE_MARKER_TOOL);
+  if (claudeCliAttributions(fixture).length > 0) return true;
+  return fixture.stageRuns.some(stageHasDelegateCleanup);
 }
 
 /**
  * A delegate fixture is "verified" when a successful write-effect tool appears
- * in the same stage row as `delegate_cleanup` (the primary write path, not a
- * later native fallback).
+ * on the delegate path:
+ *   1. Attribution-primary: write on a stage whose mode_id matches a
+ *      claude_cli attribution's stage_id (preferred linkage).
+ *   2. Attribution same-run fallback: any successful write in the run when a
+ *      claude_cli attribution exists but stage linkage is messy.
+ *   3. Cleanup fallback: successful write in the same stage row as
+ *      `delegate_cleanup` (legacy marker; also counts when no attributions).
  */
 function isDelegateVerifiedWrite(fixture: ConductorPerformanceFixture): boolean {
+  const attrs = claudeCliAttributions(fixture);
+  if (attrs.length > 0) {
+    const attributedStageIds = new Set(attrs.map((a) => a.stage_id));
+    // Prefer stage-linked: mode_id matches attribution stage_id (e.g. "executor").
+    if (
+      fixture.stageRuns.some(
+        (s) => attributedStageIds.has(s.mode_id) && stageHasSuccessfulWrite(s),
+      )
+    ) {
+      return true;
+    }
+    // Same-run fallback when stage_id/mode_id do not align.
+    if (fixture.stageRuns.some(stageHasSuccessfulWrite)) return true;
+  }
+
+  // Legacy cleanup marker: write in the same stage row as the marker.
   for (const stage of fixture.stageRuns) {
-    const calls = parseToolCalls(stage.tool_calls_json);
-    if (!calls.some((c) => c.name === DELEGATE_MARKER_TOOL)) continue;
-    const wroteInRow = calls.some(
-      (c) => c.name && WRITE_EFFECT_TOOLS.has(c.name) && c.is_error !== true,
-    );
-    if (wroteInRow) return true;
+    if (!stageHasDelegateCleanup(stage)) continue;
+    if (stageHasSuccessfulWrite(stage)) return true;
   }
   return false;
 }

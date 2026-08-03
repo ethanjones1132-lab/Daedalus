@@ -14,7 +14,7 @@ import {
   summarizeConductorPerformance,
   type ConductorPerformanceFixture,
 } from "../src/eval/conductor-performance";
-import type { ConductorDirectiveRow, StageRun } from "../src/self-tuning/store";
+import type { ConductorDirectiveRow, ModelAttribution, StageRun } from "../src/self-tuning/store";
 
 function arg(flag: string): string | undefined {
   const i = process.argv.indexOf(flag);
@@ -53,6 +53,10 @@ const stageStmt = db.query(
 const directiveStmt = db.query(
   "SELECT * FROM conductor_directives WHERE agent_run_id = ? ORDER BY created_at",
 );
+// W2.1: claude_cli attributions are the primary delegate-run signal.
+const attributionStmt = db.query(
+  "SELECT * FROM model_attributions WHERE agent_run_id = ? ORDER BY created_at",
+);
 
 const fixtures: ConductorPerformanceFixture[] = agentRuns.map((row) => ({
   agentRunId: row.id,
@@ -63,6 +67,7 @@ const fixtures: ConductorPerformanceFixture[] = agentRuns.map((row) => ({
   checkTier: row.check_tier,
   stageRuns: stageStmt.all(row.id) as StageRun[],
   directives: directiveStmt.all(row.id) as ConductorDirectiveRow[],
+  modelAttributions: attributionStmt.all(row.id) as ModelAttribution[],
 }));
 
 const summary = summarizeConductorPerformance(fixtures, RELEASE_THRESHOLDS);

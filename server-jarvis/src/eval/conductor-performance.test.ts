@@ -6,7 +6,7 @@ import {
   type ConductorPerformanceFixture,
   type ConductorPerformanceThresholds,
 } from "./conductor-performance";
-import type { ConductorDirectiveRow, StageRun } from "../self-tuning/store";
+import type { ConductorDirectiveRow, ModelAttribution, StageRun } from "../self-tuning/store";
 
 // ---------------------------------------------------------------------------
 // Fixtures shaped like self-tuning.db rows used by the pure metrics module.
@@ -35,12 +35,31 @@ function directive(over: Partial<ConductorDirectiveRow> = {}): ConductorDirectiv
   };
 }
 
+/** Minimal model_attributions row — pipeline records provider "claude_cli" for delegates. */
+function claudeCliAttribution(
+  agentRunId: string,
+  over: Partial<ModelAttribution> = {},
+): ModelAttribution {
+  return {
+    id: `attr_${Math.random().toString(36).slice(2)}`,
+    agent_run_id: agentRunId,
+    stage_id: "executor",
+    agent_id: "claude_delegate",
+    provider: "claude_cli",
+    model_id: "sonnet",
+    was_successful: 1,
+    had_error: 0,
+    fallback_used: 0,
+    ...over,
+  };
+}
+
 const WRITE_PRESSURE_NOTE =
   "This turn is a CHANGE request. You have write tools available " +
   "(write_file, edit_file, multi_edit, apply_patch). Apply the requested " +
   "change by CALLING one of them now.";
 
-/** Healthy delegate-verified write run: cleanup + write in the same row. */
+/** Healthy delegate-verified write: claude_cli attribution + cleanup + write (legacy + modern signals). */
 function delegateVerifiedWrite(
   agentRunId: string,
   over: Partial<ConductorPerformanceFixture> = {},
@@ -61,6 +80,7 @@ function delegateVerifiedWrite(
       }),
     ],
     directives: [],
+    modelAttributions: [claudeCliAttribution(agentRunId)],
     ...over,
   };
 }
@@ -86,6 +106,9 @@ function delegateFailedWrite(agentRunId: string): ConductorPerformanceFixture {
       }),
     ],
     directives: [],
+    modelAttributions: [
+      claudeCliAttribution(agentRunId, { was_successful: 0, had_error: 1 }),
+    ],
   };
 }
 
@@ -103,6 +126,36 @@ function nativeVerifiedWrite(agentRunId: string): ConductorPerformanceFixture {
       }),
     ],
     directives: [],
+    // Native executor — no claude_cli attribution.
+    modelAttributions: [],
+  };
+}
+
+/**
+ * Good-era (07-25) style: claude_cli attribution + successful write tools,
+ * but no delegate_cleanup marker (that marker only appeared in 4/112 minimax runs).
+ */
+function attributionOnlyDelegateVerifiedWrite(
+  agentRunId: string,
+): ConductorPerformanceFixture {
+  return {
+    agentRunId,
+    outcome: "success",
+    checkTier: "builtin",
+    verifiedVia: "runtime_check",
+    finalOutput: "Delegated write applied (no cleanup tool in transcript).",
+    stageRuns: [
+      stage({
+        agent_run_id: agentRunId,
+        mode_id: "executor",
+        tool_calls_json: JSON.stringify([
+          { name: "write_file", arguments: { path: "out.txt" } },
+          { name: "edit_file", arguments: { path: "out.txt" } },
+        ]),
+      }),
+    ],
+    directives: [],
+    modelAttributions: [claudeCliAttribution(agentRunId)],
   };
 }
 
@@ -261,5 +314,74 @@ describe("summarizeConductorPerformance", () => {
       maxDuplicateWritePressureRuns: 0,
     };
     expect(RELEASE_THRESHOLDS).toEqual(expected);
+  });
+
+  // W2.1 — identify delegate runs by claude_cli attribution, not only cleanup marker.
+  test("claude_cli attribution + write tools (no cleanup) counts as delegate verified write", () => {
+    const fixtures = [attributionOnlyDelegateVerifiedWrite("run_attr_only")];
+    const summary = summarizeConductorPerformance(fixtures);
+    expect(summary.delegateRuns).toBe(1);
+    expect(summary.delegateVerifiedWrites).toBe(1);
+    expect(summary.delegateVerifiedWriteRate).toBe(1);
+  });
+
+  test("native writes without claude_cli attribution do not count as delegate", () => {
+    const fixtures = [nativeVerifiedWrite("run_native_only")];
+    const summary = summarizeConductorPerformance(fixtures);
+    expect(summary.delegateRuns).toBe(0);
+    expect(summary.delegateVerifiedWrites).toBe(0);
+    expect(summary.delegateVerifiedWriteRate).toBe(0);
+    expect(summary.delegateGate).toBe("not_applicable");
+  });
+
+  test("delegate_cleanup remains a valid fallback signal without attributions", () => {
+    // Historical fixture shape: cleanup marker only, no modelAttributions field.
+    const fixtures: ConductorPerformanceFixture[] = [
+      {
+        agentRunId: "run_cleanup_only",
+        outcome: "success",
+        checkTier: "builtin",
+        verifiedVia: "runtime_check",
+        finalOutput: "Cleanup-marked delegate write.",
+        stageRuns: [
+          stage({
+            agent_run_id: "run_cleanup_only",
+            tool_calls_json: JSON.stringify([
+              { name: "write_file", arguments: { path: "out.txt" } },
+              { name: "delegate_cleanup", arguments: { status: "exited" } },
+            ]),
+          }),
+        ],
+        directives: [],
+        // omit modelAttributions entirely
+      },
+    ];
+    const summary = summarizeConductorPerformance(fixtures);
+    expect(summary.delegateRuns).toBe(1);
+    expect(summary.delegateVerifiedWrites).toBe(1);
+  });
+
+  test("claude_cli attribution without successful write is a failed delegate run", () => {
+    const fixtures: ConductorPerformanceFixture[] = [
+      {
+        agentRunId: "run_attr_no_write",
+        outcome: "partial",
+        checkTier: "none",
+        stageRuns: [
+          stage({
+            agent_run_id: "run_attr_no_write",
+            tool_calls_json: JSON.stringify([{ name: "read_file", arguments: {} }]),
+          }),
+        ],
+        directives: [],
+        modelAttributions: [
+          claudeCliAttribution("run_attr_no_write", { was_successful: 0, had_error: 1 }),
+        ],
+      },
+    ];
+    const summary = summarizeConductorPerformance(fixtures);
+    expect(summary.delegateRuns).toBe(1);
+    expect(summary.delegateVerifiedWrites).toBe(0);
+    expect(summary.delegateVerifiedWriteRate).toBe(0);
   });
 });
