@@ -7,7 +7,14 @@ import { createToolRuntime, makeExecutionContext } from "../tool-runtime";
 import { registerFilesystemBundle } from "../filesystem-bundle";
 import { SessionOutcomeCollector } from "../self-tuning/collector";
 import { SelfTuningStore, type StageRun } from "../self-tuning/store";
-import { PipelineExecutor, type StageRunRecorder } from "./pipeline";
+import {
+  isTruncatedReadResult,
+  PipelineExecutor,
+  type StageRunRecorder,
+} from "./pipeline";
+import { hasFileBeenRead } from "../fs-read-cache";
+import { WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS } from "./context-budget";
+import { resolve } from "path";
 import { LiveConductor } from "./conductor";
 import { ConductorBus } from "./conductor-bus";
 import { AgentPool, DEFAULT_ORCHESTRATOR_AGENTS } from "./agent-pool";
@@ -257,6 +264,106 @@ describe("pipeline stage telemetry", () => {
 
       expect(readFileSync(join(workspace, "target.txt"), "utf8")).toBe("after\n");
       expect(result.state.executor?.toolCalls.find((call) => call.name === "edit_file")?.is_error).toBe(false);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  test("C1: seeded raw priorToolCalls above context cap do not unlock ledger or deflect as complete", async () => {
+    // Raw priorToolCalls carry full tool output without the prepareToolResultForContext
+    // marker. Re-seed must recompute truncation against the write-turn cap so a live
+    // stage that unmarked after context truncation cannot re-open edit_file.
+    const oversize = "x".repeat(WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS + 1_000);
+    expect(isTruncatedReadResult("read_file", oversize)).toBe(false); // no marker alone
+    expect(
+      isTruncatedReadResult("read_file", oversize, WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS),
+    ).toBe(true);
+    expect(
+      isTruncatedReadResult("read_file", "    1 | short", WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS),
+    ).toBe(false);
+
+    const workspace = mkdtempSync(join(tmpdir(), "jarvis-pipeline-c1-seed-"));
+    try {
+      writeFileSync(join(workspace, "target.txt"), "before\n");
+      const resolved = resolve(workspace, "target.txt");
+      const config = defaultConfig();
+      config.jarvis_path = workspace;
+      config.tools.enabled = true;
+      config.tools.sandbox_mode = "workspace";
+      config.claude_cli.delegate.enabled = false;
+      const runtime = createToolRuntime();
+      registerFilesystemBundle(runtime);
+      const ctx = makeExecutionContext("chat", config, {
+        workspace_path: workspace,
+        requestApproval: async () => true,
+      });
+      const priorToolCalls = [{
+        name: "read_file",
+        arguments: { path: "target.txt" },
+        // Raw whole-file-looking payload larger than the write-turn context cap.
+        output: oversize,
+        is_error: false,
+        duration_ms: 1,
+      }];
+      let executorTurns = 0;
+      const executor = new PipelineExecutor(
+        async (_messages, options) => {
+          if (options.stageLabel !== "executor") return { content: "done" };
+          const turn = executorTurns++;
+          if (turn === 0) {
+            // Edit must fail: oversized seed must not markFileRead.
+            return {
+              content: "try edit",
+              tool_calls: [toolCallWithArgs("edit_file", {
+                path: "target.txt",
+                old_string: "before",
+                new_string: "after",
+              })],
+            };
+          }
+          if (turn === 1) {
+            // Same identity as the seeded prior — must re-execute, not deflect.
+            return {
+              content: "re-read",
+              tool_calls: [toolCallWithArgs("read_file", { path: "target.txt" })],
+            };
+          }
+          return { content: "done" };
+        },
+        runtime,
+        ctx,
+        { recordStageRun: () => {} },
+      );
+
+      const result = await executor.executeSegment(
+        "Update target.txt",
+        ["executor"],
+        "run-c1-oversized-seed",
+        () => {},
+        {
+          executionProfile: "full",
+          rawMessage: "Update target.txt",
+          taskRunWriteIntent: true,
+          priorToolCalls,
+        },
+      );
+
+      // After live whole-file re-read of the small on-disk file, ledger may unlock.
+      // The critical check is the first edit (pre re-read) was blocked.
+      const toolCalls = result.state.executor?.toolCalls ?? [];
+      const edit = toolCalls.find((c) => c.name === "edit_file");
+      expect(edit?.is_error).toBe(true);
+      expect(`${edit?.output ?? ""}`).toMatch(/has not been read yet/i);
+
+      // Seed is carried in toolCalls; live re-read must not be a deflection of it.
+      const nonPriorReads = toolCalls.filter(
+        (c) => c.name === "read_file" && c.output !== oversize,
+      );
+      expect(nonPriorReads.length).toBeGreaterThanOrEqual(1);
+      expect(nonPriorReads.every((r) => !r.output.includes("[duplicate call deflected]"))).toBe(true);
+      expect(nonPriorReads.some((r) => r.output.includes("before"))).toBe(true);
+      // After the live complete read of the small on-disk file, ledger unlocks.
+      expect(hasFileBeenRead(resolved)).toBe(true);
     } finally {
       rmSync(workspace, { recursive: true, force: true });
     }

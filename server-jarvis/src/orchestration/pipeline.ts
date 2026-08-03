@@ -453,8 +453,17 @@ export interface ReadOnlyCacheEntry {
 /**
  * Detect incomplete/truncated tool results that must not unlock edit_file or
  * be served from the deflection cache as "complete".
+ *
+ * @param contextLimitChars When set, also treats outputs that *would* be
+ *   context-truncated at this cap as incomplete. Needed for priorToolCalls /
+ *   delegate-evidence seeds where `call.output` is raw (no truncation marker)
+ *   even though the live stage unmarked the path after prepareToolResultForContext.
  */
-export function isTruncatedReadResult(toolName: string, output: string): boolean {
+export function isTruncatedReadResult(
+  toolName: string,
+  output: string,
+  contextLimitChars?: number,
+): boolean {
   if (!output) return false;
   // filesystem-bundle line-window continuation / partial-page notes
   if (toolName === "read_file") {
@@ -462,6 +471,15 @@ export function isTruncatedReadResult(toolName: string, output: string): boolean
   }
   // prepareToolResultForContext marker (context-budget truncation)
   if (/\n\n\[\.\.\.truncated - \d+ chars removed/.test(output)) return true;
+  // C1: recompute against the stage cap when markers are absent (raw seed).
+  if (
+    typeof contextLimitChars === "number"
+    && Number.isFinite(contextLimitChars)
+    && contextLimitChars >= 0
+    && prepareToolResultForContext(output, contextLimitChars).metadata.truncated
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -1690,22 +1708,6 @@ export class PipelineExecutor {
     const toolCalls: ToolCallRecord[] = [...priorToolCalls];
     const identityOptions = { workspaceRoot: this.activeWorkspaceRoot() };
     const duplicateReadOnlyOutputs = new Map<string, ReadOnlyCacheEntry>();
-    for (const call of priorToolCalls) {
-      if (
-        READ_ONLY_TOOLS.has(call.name) &&
-        !call.is_error &&
-        call.output.trim().length > 0 &&
-        !isDuplicateToolDeflection(call)
-      ) {
-        const truncated = isTruncatedReadResult(call.name, call.output);
-        // W4.1: only complete prior reads unlock edit_file.
-        if (!truncated) this.markReadLedgerForCall(call, call.output);
-        duplicateReadOnlyOutputs.set(toolCallIdentityKey(call, identityOptions), {
-          output: call.output,
-          truncated,
-        });
-      }
-    }
     const narratives: string[] = [];
     let lastModelKey: string | undefined;
     let turnCount = 0;
@@ -1762,6 +1764,28 @@ export class PipelineExecutor {
     const toolResultNote = requiresWriteEffect
       ? "Call read_file again with offset/limit to view the elided lines BEFORE composing any edit."
       : PIPELINE_TOOL_RESULT_NOTE;
+    // Seed deflection / F1 ledger after the stage cap is known (C1: raw
+    // priorToolCalls lack truncation markers; recompute against toolResultContextChars).
+    for (const call of priorToolCalls) {
+      if (
+        READ_ONLY_TOOLS.has(call.name) &&
+        !call.is_error &&
+        call.output.trim().length > 0 &&
+        !isDuplicateToolDeflection(call)
+      ) {
+        const truncated = isTruncatedReadResult(
+          call.name,
+          call.output,
+          toolResultContextChars,
+        );
+        // W4.1: only complete prior reads unlock edit_file.
+        if (!truncated) this.markReadLedgerForCall(call, call.output);
+        duplicateReadOnlyOutputs.set(toolCallIdentityKey(call, identityOptions), {
+          output: call.output,
+          truncated,
+        });
+      }
+    }
     const successfulWriteCount = () =>
       toolCalls.filter((call) => !call.is_error && WRITE_EFFECT_TOOLS.has(call.name)).length;
     const deepReadRequest = resolveDeepReadIntent(intentText, options.taskRunDepth);
@@ -2593,7 +2617,12 @@ export class PipelineExecutor {
             && call.output.trim().length > 0
             && !isDuplicateToolDeflection(call)
           ) {
-            const truncated = isTruncatedReadResult(call.name, call.output);
+            // C1: recompute context truncation against this stage's cap.
+            const truncated = isTruncatedReadResult(
+              call.name,
+              call.output,
+              toolResultContextChars,
+            );
             if (!truncated) this.markReadLedgerForCall(call, call.output);
             duplicateReadOnlyOutputs.set(toolCallIdentityKey(call, identityOptions), {
               output: call.output,
@@ -3028,6 +3057,9 @@ export class PipelineExecutor {
               );
               // W4.1: a context-truncated read must not unlock edit_file or be
               // treated as a complete deflection hit on re-read.
+              // I1 soft note: files larger than the stage cap cannot unlock via
+              // whole-file mark+unmark; the model must page with offset/limit
+              // until a non-truncated window is prepared for context.
               if (
                 call.name === "read_file"
                 && !toolResult.is_error
