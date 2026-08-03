@@ -101,6 +101,7 @@ export const DELEGATE_GO_CHEAP_CAPABLE_MODELS = [
 ] as const;
 
 export const DEFAULT_FREE_THRASH_THRESHOLD = 2;
+export const DELEGATE_WRITE_SCOREBOARD_BENCH_ATTEMPTS = 3;
 /** Default session thrash counter TTL (30 minutes). */
 export const DEFAULT_THRASH_TTL_MS = 30 * 60_000;
 
@@ -121,6 +122,48 @@ export interface DelegateThrashState {
 
 /** Process-local thrash counters keyed by session (survives agent-run boundaries). */
 const thrashByKey = new Map<string, DelegateThrashState>();
+
+export interface DelegateWriteScoreboardEntry {
+  model: string;
+  attempts: number;
+  verifiedWrites: number;
+  benched: boolean;
+}
+
+/** Process-local per-model write evidence; a restart starts a fresh scoreboard. */
+const writeScoreboard = new Map<string, DelegateWriteScoreboardEntry>();
+
+export function __resetDelegateWriteScoreboardForTests(): void {
+  writeScoreboard.clear();
+}
+
+export function getDelegateWriteScoreboard(model: string): DelegateWriteScoreboardEntry | undefined {
+  return writeScoreboard.get(model.trim());
+}
+
+export function getBenchedDelegateModels(): string[] {
+  return [...writeScoreboard.values()]
+    .filter((entry) => entry.benched)
+    .map((entry) => entry.model);
+}
+
+export function recordDelegateWriteOutcome(
+  model: string,
+  verifiedWrite: boolean,
+): DelegateWriteScoreboardEntry {
+  const normalized = model.trim() || "unknown-delegate-model";
+  const previous = writeScoreboard.get(normalized);
+  const attempts = (previous?.attempts ?? 0) + 1;
+  const verifiedWrites = (previous?.verifiedWrites ?? 0) + (verifiedWrite ? 1 : 0);
+  const entry: DelegateWriteScoreboardEntry = {
+    model: normalized,
+    attempts,
+    verifiedWrites,
+    benched: attempts >= DELEGATE_WRITE_SCOREBOARD_BENCH_ATTEMPTS && verifiedWrites === 0,
+  };
+  writeScoreboard.set(normalized, entry);
+  return entry;
+}
 
 /** Stable thrash key for a session; blank/missing → unknown-session. */
 export function delegateThrashKey(sessionId: string): string {
@@ -211,46 +254,52 @@ export function selectDelegateModel(input: {
   goAnthropicModels?: readonly string[];
   /** Ollama tags, for resolving bare model ids. Empty means "none installed". */
   installedOllamaModels?: readonly string[];
+  /** Models with repeated launches and zero verified writes. */
+  benchedModels?: readonly string[];
 }): DelegateModelSelection {
   const threshold = input.thrashThreshold ?? DEFAULT_FREE_THRASH_THRESHOLD;
   const free = input.freeModels ?? DELEGATE_FREE_FIRST_MODELS;
   const goOpenai = input.goOpenaiModels ?? DELEGATE_GO_OPENAI_MODELS;
   const goAnthropic = input.goAnthropicModels ?? DELEGATE_GO_ANTHROPIC_MODELS;
   const installed = input.installedOllamaModels ?? [];
+  const benched = new Set((input.benchedModels ?? []).map((model) => model.trim()).filter(Boolean));
   // Two independent reasons a free lane is not actually usable: the proxy
   // cannot route it, or the model cannot emit a tool call. Both cost a whole
   // turn plus a fallback, so both are filtered before free-first ordering.
   const resolvableFree = free.filter((model) =>
-    isProxyResolvable(model, installed, goOpenai) && isToolCallCapableDelegate(model));
+    !benched.has(model) && isProxyResolvable(model, installed, goOpenai) && isToolCallCapableDelegate(model));
   const proxyOk = input.proxyAvailable !== false;
   const goKey = input.hasOpenCodeGoKey !== false;
   const configured = input.configuredModel.trim();
-  const auto = !configured || configured.toLowerCase() === "auto";
+  const configuredBenched = Boolean(configured && benched.has(configured));
+  const auto = !configured || configured.toLowerCase() === "auto" || configuredBenched;
   const thrash = input.thrashCount;
 
   const pickGo = (reason: string): DelegateModelSelection => {
     // Prefer proxy OpenAI Go when proxy is up; else Anthropic-native Go (no proxy).
-    if (proxyOk && goOpenai.length > 0) {
+    const capableGoOpenai = goOpenai.filter((model) => !benched.has(model));
+    const capableGoAnthropic = goAnthropic.filter((model) => !benched.has(model));
+    if (proxyOk && capableGoOpenai.length > 0) {
       return {
-        model: goOpenai[0],
+        model: capableGoOpenai[0],
         pool: "go_capable",
         reason,
         thrashCount: thrash,
       };
     }
-    if (goKey && goAnthropic.length > 0) {
+    if (goKey && capableGoAnthropic.length > 0) {
       return {
-        model: goAnthropic[0],
+        model: capableGoAnthropic[0],
         pool: "go_capable",
         reason: `${reason}_anthropic_no_proxy`,
         thrashCount: thrash,
       };
     }
-    if (goOpenai.length > 0) {
-      return { model: goOpenai[0], pool: "go_capable", reason, thrashCount: thrash };
+    if (capableGoOpenai.length > 0) {
+      return { model: capableGoOpenai[0], pool: "go_capable", reason, thrashCount: thrash };
     }
     return {
-      model: goAnthropic[0] ?? "minimax-m3",
+      model: capableGoAnthropic[0] ?? capableGoOpenai[0] ?? "minimax-m3",
       pool: "go_capable",
       reason,
       thrashCount: thrash,
@@ -277,7 +326,7 @@ export function selectDelegateModel(input: {
     return {
       model: configured,
       pool: pinnedIsGo ? "go_capable" : "free",
-      reason: "operator_pin",
+      reason: configuredBenched ? "operator_pin_benched_promote" : "operator_pin",
       thrashCount: thrash,
     };
   }
@@ -306,6 +355,7 @@ export function enumerateDelegateModelCandidates(input: {
   thrashThreshold?: number;
   proxyAvailable?: boolean;
   hasOpenCodeGoKey?: boolean;
+  benchedModels?: readonly string[];
 }): DelegateModelSelection[] {
   const threshold = input.thrashThreshold ?? DEFAULT_FREE_THRASH_THRESHOLD;
   const maxThrash = Math.max(input.thrashCount, threshold) + 1;
@@ -320,6 +370,7 @@ export function enumerateDelegateModelCandidates(input: {
   // Always ensure an Anthropic Go fallback is last when key exists (no-proxy launch).
   if (input.hasOpenCodeGoKey !== false) {
     for (const model of DELEGATE_GO_ANTHROPIC_MODELS) {
+      if (input.benchedModels?.includes(model)) continue;
       if (seen.has(model)) continue;
       out.push({
         model,

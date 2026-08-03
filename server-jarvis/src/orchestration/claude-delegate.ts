@@ -92,6 +92,8 @@ export type DelegateHealthStrikeReason =
 
 export const DELEGATE_HEALTH_COOLDOWN_MS = 10 * 60 * 1_000;
 export const DELEGATE_AVAILABILITY_CACHE_MS = 5 * 60 * 1_000;
+/** Stop provider retry storms before the CLI spends several minutes backing off. */
+export const DELEGATE_API_RETRY_ABORT_THRESHOLD = 3;
 
 export interface ClaudeDelegateAvailabilityChecks {
   now?: () => number;
@@ -596,6 +598,16 @@ async function* readJsonLines(
   } finally {
     lines.close();
   }
+}
+
+function isApiRetryFrame(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  const nested = record.event && typeof record.event === "object"
+    ? record.event as Record<string, unknown>
+    : undefined;
+  return [record.type, record.subtype, nested?.type, nested?.subtype]
+    .some((part) => part === "api_retry");
 }
 
 /** Native process boundary used by Task 6; tests inject a deterministic factory. */
@@ -1300,6 +1312,7 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
     const decodeState: ClaudeStreamDecodeState = { partialTextSeen: false };
     const eventIterator = delegatedProcess.events[Symbol.asyncIterator]();
     let eventCount = 0;
+    let consecutiveApiRetries = 0;
     let policyViolation = false;
     /** Decoded CLI failure signal (result is_error / type error) for named failure reasons. */
     let cliFailureDetail: string | undefined;
@@ -1312,6 +1325,21 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
           const next = await eventIterator.next();
           if (next.done) break;
           const rawEvent = next.value;
+          if (isApiRetryFrame(rawEvent)) {
+            consecutiveApiRetries += 1;
+            if (consecutiveApiRetries >= DELEGATE_API_RETRY_ABORT_THRESHOLD) {
+              cliFailureDetail = `api_retry storm: aborted after ${DELEGATE_API_RETRY_ABORT_THRESHOLD} consecutive retries`;
+              records.push(cleanupRecord(await terminateDelegateProcess(
+                delegatedProcess,
+                terminationGraceMs,
+                cleanupTimeoutMs,
+                treeKiller,
+              )));
+              break;
+            }
+          } else {
+            consecutiveApiRetries = 0;
+          }
           const events = decodeClaudeCliMessage(rawEvent, decodeState);
           eventCount += events.length;
           for (const event of events) {
@@ -1391,6 +1419,7 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
               }
             }
           }
+          if (cliFailureDetail?.startsWith("api_retry storm:")) break;
         }
         return { kind: "completed", exit: await delegatedProcess.exit };
       } catch (error) {
@@ -1534,7 +1563,9 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
         narrative: sanitizeDelegateDiagnosticText(failureNarrative),
         toolCalls: records,
         terminalStatus: "failed",
-        errorCode: "delegate_cli_error",
+        errorCode: cliFailureDetail.startsWith("api_retry storm:")
+          ? "delegate_api_retry_storm"
+          : "delegate_cli_error",
       });
     }
     if (streamOutcome.exit.code !== 0) {

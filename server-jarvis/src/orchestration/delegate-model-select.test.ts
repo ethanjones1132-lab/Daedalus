@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   __resetDelegateThrashForTests,
+  __resetDelegateWriteScoreboardForTests,
   clearDelegateThrash,
   DEFAULT_THRASH_TTL_MS,
   delegateThrashKey,
@@ -13,6 +14,9 @@ import {
   DELEGATE_GO_OPENAI_MODELS,
   DELEGATE_TOOL_INCAPABLE_MODELS,
   recordDelegateThrash,
+  getBenchedDelegateModels,
+  getDelegateWriteScoreboard,
+  recordDelegateWriteOutcome,
   selectDelegateModel,
 } from "./delegate-model-select";
 
@@ -209,6 +213,50 @@ describe("delegate thrash accounting", () => {
     expect(isDelegateThrashOutcome({
       ok: false, hasVerifiedWrite: false, errorCode: "delegate_exit_nonzero",
     })).toBe(true);
+  });
+});
+
+describe("delegate verified-write scoreboard", () => {
+  test("benches a model after three attempts with zero verified writes", () => {
+    __resetDelegateWriteScoreboardForTests();
+    expect(recordDelegateWriteOutcome("vendor/failing:free", false)).toMatchObject({
+      attempts: 1,
+      verifiedWrites: 0,
+      benched: false,
+    });
+    recordDelegateWriteOutcome("vendor/failing:free", false);
+    const final = recordDelegateWriteOutcome("vendor/failing:free", false);
+
+    expect(final).toMatchObject({ attempts: 3, verifiedWrites: 0, benched: true });
+    expect(getBenchedDelegateModels()).toEqual(["vendor/failing:free"]);
+    expect(getDelegateWriteScoreboard("vendor/failing:free")).toEqual(final);
+  });
+
+  test("a verified write prevents benching even after three attempts", () => {
+    __resetDelegateWriteScoreboardForTests();
+    recordDelegateWriteOutcome("vendor/working:free", false);
+    recordDelegateWriteOutcome("vendor/working:free", false);
+    const result = recordDelegateWriteOutcome("vendor/working:free", true);
+
+    expect(result).toMatchObject({ attempts: 3, verifiedWrites: 1, benched: false });
+    expect(getBenchedDelegateModels()).not.toContain("vendor/working:free");
+  });
+
+  test("selection skips a benched free model", () => {
+    __resetDelegateWriteScoreboardForTests();
+    recordDelegateWriteOutcome("vendor/failing:free", false);
+    recordDelegateWriteOutcome("vendor/failing:free", false);
+    recordDelegateWriteOutcome("vendor/failing:free", false);
+
+    const selection = selectDelegateModel({
+      configuredModel: "auto",
+      thrashCount: 0,
+      proxyAvailable: true,
+      freeModels: ["vendor/failing:free", "vendor/healthy:free"],
+      benchedModels: getBenchedDelegateModels(),
+    });
+
+    expect(selection.model).toBe("vendor/healthy:free");
   });
 });
 

@@ -118,9 +118,11 @@ import {
   DEFAULT_THRASH_TTL_MS,
   delegateThrashKey,
   enumerateDelegateModelCandidates,
+  getBenchedDelegateModels,
   getDelegateThrashCount,
   isDelegateThrashOutcome,
   recordDelegateThrash,
+  recordDelegateWriteOutcome,
   type DelegateModelSelection,
 } from "./delegate-model-select";
 import { decideDelegateIntervention } from "./delegate-intervention-policy";
@@ -2088,6 +2090,7 @@ export class PipelineExecutor {
         hasOpenCodeGoKey: hasGoKey,
         // Probe both proxy and no-proxy candidates; availability filters.
         proxyAvailable: true,
+        benchedModels: getBenchedDelegateModels(),
       });
       let modelSelection: DelegateModelSelection | undefined;
       let delegateConfig: typeof this.ctx.config | undefined;
@@ -2385,6 +2388,7 @@ export class PipelineExecutor {
       const hasVerifiedWrite = delegated.toolCalls.some(
         (call) => WRITE_EFFECT_TOOLS.has(call.name) && !call.is_error,
       );
+      recordDelegateWriteOutcome(modelSelection.model, hasVerifiedWrite);
       // Gate future re-entry for this run on whether the delegate actually
       // produced something (see delegateNoWriteRuns).
       if (!hasVerifiedWrite) this.delegateNoWriteRuns.add(agentRunId);

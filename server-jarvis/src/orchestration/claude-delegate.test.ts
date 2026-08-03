@@ -9,6 +9,7 @@ import {
   canonicalizeDelegateToolArguments,
   ClaudeDelegateAvailabilityCache,
   createPlatformDelegateProcessTreeKiller,
+  DELEGATE_API_RETRY_ABORT_THRESHOLD,
   DELEGATE_REQUEST_ID_HEADER,
   DelegateHealth,
   delegateEligibility,
@@ -64,6 +65,55 @@ describe("withDelegateRequestCorrelation", () => {
 });
 
 describe("Claude executor delegate", () => {
+  test("aborts a repeated api_retry stream instead of waiting for provider backoff", async () => {
+    const config = testConfig();
+    let kills = 0;
+    let signalTreeCalls = 0;
+    let finish!: (exit: { code: number | null; signal: string | null }) => void;
+    const exit = new Promise<{ code: number | null; signal: string | null }>((resolve) => { finish = resolve; });
+    const output = await runClaudeDelegate({
+      config,
+      prompt: "write the target",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 30_000,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      health: new DelegateHealth(),
+      terminationGraceMs: 1,
+      cleanupTimeoutMs: 30,
+      snapshotFactory: { capture: async () => [{
+        root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
+      }] },
+      treeKiller: {
+        signalTree: async (_process, signal) => {
+          signalTreeCalls += 1;
+          if (signal === "SIGKILL") finish({ code: null, signal });
+        },
+      },
+      processFactory: async () => ({
+        events: (async function* () {
+          for (let i = 0; i < DELEGATE_API_RETRY_ABORT_THRESHOLD; i += 1) {
+            yield { type: "api_retry", retry_count: i + 1 };
+          }
+          await new Promise(() => {});
+        })(),
+        exit,
+        kill: () => { kills += 1; },
+      }),
+    });
+
+    expect(output).toMatchObject({
+      ok: false,
+      errorCode: "delegate_api_retry_storm",
+      terminalStatus: "failed",
+    });
+    expect(output.narrative).toContain("api_retry");
+    expect(kills).toBe(0);
+    expect(signalTreeCalls).toBeGreaterThanOrEqual(2);
+  }, 500);
+
   test("filesystem snapshots use content hashes instead of mtime/size identity", async () => {
     const root = await mkdtemp(join(tmpdir(), "jarvis-delegate-"));
     const target = join(root, "same-size.txt");
