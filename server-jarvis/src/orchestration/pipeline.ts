@@ -70,7 +70,7 @@ import {
 import { prepareToolResultForContext } from "../tool-result-truncation";
 import { findExistingWorkspacePath } from "./workspace-affinity";
 import { safePath } from "../fs-scope";
-import { markFileRead } from "../fs-read-cache";
+import { markFileRead, unmarkFileRead } from "../fs-read-cache";
 import { join, posix, win32 } from "path";
 import { canApplyConductorReroute, rejectReroute } from "./reroute-policy";
 import {
@@ -441,6 +441,30 @@ export function toolCallIdentityKey(
 // still excludes the replay from evidence accounting (so repeat-loops earn
 // no progress credit — the 2026-07-12 repetition guard's actual purpose),
 // and the per-result context cap bounds what reaches the transcript.
+//
+// W4.1 (2026-08): truncated/incomplete reads are NOT served as complete —
+// re-reads re-execute so the model can page or widen the window.
+export interface ReadOnlyCacheEntry {
+  output: string;
+  /** True when the result is a partial window or context-truncated payload. */
+  truncated: boolean;
+}
+
+/**
+ * Detect incomplete/truncated tool results that must not unlock edit_file or
+ * be served from the deflection cache as "complete".
+ */
+export function isTruncatedReadResult(toolName: string, output: string): boolean {
+  if (!output) return false;
+  // filesystem-bundle line-window continuation / partial-page notes
+  if (toolName === "read_file") {
+    if (/\[showing lines \d+-\d+ of \d+ total/.test(output)) return true;
+  }
+  // prepareToolResultForContext marker (context-budget truncation)
+  if (/\n\n\[\.\.\.truncated - \d+ chars removed/.test(output)) return true;
+  return false;
+}
+
 export function duplicateToolCallDeflection(call: ToolCall, firstOutput: string | undefined): ToolResult {
   const previous = firstOutput && firstOutput.trim().length > 0
     ? ` Serving the cached result of that identical call below — do not repeat it again; use offset/limit or a new target for anything more.\n${firstOutput}`
@@ -1339,7 +1363,7 @@ export class PipelineExecutor {
     rawToolCalls: any[],
     options: PipelineExecuteOptions,
     record: (raw: any, call: ToolCall, result: ToolResult) => Promise<void> | void,
-    duplicateReadOnlyOutputs?: Map<string, string>,
+    duplicateReadOnlyOutputs?: Map<string, ReadOnlyCacheEntry>,
   ): Promise<void> {
     const parsed = rawToolCalls.map((raw) => {
       const call = parseStreamedToolCall(raw);
@@ -1382,20 +1406,27 @@ export class PipelineExecutor {
             const duplicateKey = toolCallIdentityKey(entry.call, {
               workspaceRoot: this.activeWorkspaceRoot(),
             });
-            if (readOnlyOutputCache.has(duplicateKey)) {
-              if ((readOnlyOutputCache.get(duplicateKey) ?? "").trim().length > 0) {
-                this.markReadLedgerForCall(entry.call);
+            const cached = readOnlyOutputCache.get(duplicateKey);
+            // W4.1: never serve a truncated/incomplete read as complete —
+            // re-execute so the model can page or request a wider window.
+            if (cached && !cached.truncated) {
+              if (cached.output.trim().length > 0) {
+                this.markReadLedgerForCall(entry.call, cached.output);
               }
               return {
                 entry,
-                result: duplicateToolCallDeflection(entry.call, readOnlyOutputCache.get(duplicateKey)),
+                result: duplicateToolCallDeflection(entry.call, cached.output),
                 duplicateKey,
                 deflected: true,
               };
             }
-            readOnlyOutputCache.set(duplicateKey, "");
+            readOnlyOutputCache.set(duplicateKey, { output: "", truncated: false });
             const result = await this.runToolCall(entry.raw, options);
-            readOnlyOutputCache.set(duplicateKey, toolResultModelText(result));
+            const text = toolResultModelText(result);
+            const truncated = result.is_error
+              ? false
+              : isTruncatedReadResult(entry.call.name, text);
+            readOnlyOutputCache.set(duplicateKey, { output: text, truncated });
             return { entry, result, duplicateKey, deflected: false };
           }
           const result = await this.runToolCall(entry.raw, options);
@@ -1483,9 +1514,14 @@ export class PipelineExecutor {
    * cached or external read rather than handleReadFile itself. Delegate reads
    * run in another process, and duplicate deflections intentionally skip the
    * native handler, so both paths otherwise leave edits falsely blocked.
+   * W4.1: only complete (non-truncated) reads unlock the ledger.
    */
-  private markReadLedgerForCall(call: Pick<ToolCall, "name" | "arguments">): void {
+  private markReadLedgerForCall(
+    call: Pick<ToolCall, "name" | "arguments">,
+    output?: string,
+  ): void {
     if (call.name !== "read_file") return;
+    if (output !== undefined && isTruncatedReadResult(call.name, output)) return;
     const rawPath = call.arguments?.path ?? call.arguments?.file_path;
     if (typeof rawPath !== "string" || rawPath.trim().length === 0) return;
     try {
@@ -1497,6 +1533,22 @@ export class PipelineExecutor {
     } catch {
       // Scope validation remains authoritative at execution time. A cached
       // read that cannot resolve under the current scope must not broaden it.
+    }
+  }
+
+  /** Drop a path from the read ledger after a context-truncated model payload. */
+  private unmarkReadLedgerForCall(call: Pick<ToolCall, "name" | "arguments">): void {
+    if (call.name !== "read_file") return;
+    const rawPath = call.arguments?.path ?? call.arguments?.file_path;
+    if (typeof rawPath !== "string" || rawPath.trim().length === 0) return;
+    try {
+      const resolved = safePath(rawPath, this.ctx.config, {
+        workspaceOverride: this.ctx.workspace_path,
+        sessionGrants: this.ctx.session_grants,
+      });
+      unmarkFileRead(resolved);
+    } catch {
+      // Same scope fail-open as mark — never broaden grants on resolve failure.
     }
   }
 
@@ -1637,7 +1689,7 @@ export class PipelineExecutor {
     const priorToolCalls = options.priorToolCalls ?? [];
     const toolCalls: ToolCallRecord[] = [...priorToolCalls];
     const identityOptions = { workspaceRoot: this.activeWorkspaceRoot() };
-    const duplicateReadOnlyOutputs = new Map<string, string>();
+    const duplicateReadOnlyOutputs = new Map<string, ReadOnlyCacheEntry>();
     for (const call of priorToolCalls) {
       if (
         READ_ONLY_TOOLS.has(call.name) &&
@@ -1645,8 +1697,13 @@ export class PipelineExecutor {
         call.output.trim().length > 0 &&
         !isDuplicateToolDeflection(call)
       ) {
-        this.markReadLedgerForCall(call);
-        duplicateReadOnlyOutputs.set(toolCallIdentityKey(call, identityOptions), call.output);
+        const truncated = isTruncatedReadResult(call.name, call.output);
+        // W4.1: only complete prior reads unlock edit_file.
+        if (!truncated) this.markReadLedgerForCall(call, call.output);
+        duplicateReadOnlyOutputs.set(toolCallIdentityKey(call, identityOptions), {
+          output: call.output,
+          truncated,
+        });
       }
     }
     const narratives: string[] = [];
@@ -2536,8 +2593,12 @@ export class PipelineExecutor {
             && call.output.trim().length > 0
             && !isDuplicateToolDeflection(call)
           ) {
-            this.markReadLedgerForCall(call);
-            duplicateReadOnlyOutputs.set(toolCallIdentityKey(call, identityOptions), call.output);
+            const truncated = isTruncatedReadResult(call.name, call.output);
+            if (!truncated) this.markReadLedgerForCall(call, call.output);
+            duplicateReadOnlyOutputs.set(toolCallIdentityKey(call, identityOptions), {
+              output: call.output,
+              truncated,
+            });
           }
         }
         if (conductorHandoff && midLoopStop?.kind === "handoff") {
@@ -2951,23 +3012,39 @@ export class PipelineExecutor {
           const emittedToolCalls = Boolean(response.tool_calls && response.tool_calls.length > 0);
           if (emittedToolCalls) {
             await this.dispatchToolCalls("executor", response.tool_calls, options, async (tc, call, toolResult) => {
+              const rawOutput = toolResultModelText(toolResult);
               toolCalls.push({
                 name: call.name,
                 arguments: call.arguments,
-                output: toolResultModelText(toolResult),
+                output: rawOutput,
                 is_error: toolResult.is_error,
                 error_code: toolResult.error_code,
                 duration_ms: toolResult.duration_ms ?? 0,
               });
+              const prepared = prepareToolResultForContext(
+                rawOutput,
+                toolResultContextChars,
+                toolResultNote,
+              );
+              // W4.1: a context-truncated read must not unlock edit_file or be
+              // treated as a complete deflection hit on re-read.
+              if (
+                call.name === "read_file"
+                && !toolResult.is_error
+                && prepared.metadata.truncated
+              ) {
+                this.unmarkReadLedgerForCall(call);
+                const key = toolCallIdentityKey(call, identityOptions);
+                const prior = duplicateReadOnlyOutputs.get(key);
+                if (prior) {
+                  duplicateReadOnlyOutputs.set(key, { output: prior.output, truncated: true });
+                }
+              }
               executorMessages.push({
                 role: "tool",
                 tool_call_id: tc.id,
                 name: tc.name,
-                content: prepareToolResultForContext(
-                  toolResultModelText(toolResult),
-                  toolResultContextChars,
-                  toolResultNote,
-                ).context,
+                content: prepared.context,
               });
               onStateChange({
                 stage: "executor",
@@ -3807,23 +3884,32 @@ export class PipelineExecutor {
 
           if (rewriteResp.tool_calls && rewriteResp.tool_calls.length > 0) {
             await this.dispatchToolCalls("rewriter", rewriteResp.tool_calls, options, (tc, call, toolResult) => {
+              const rawOutput = toolResultModelText(toolResult);
               toolCalls.push({
                 name: call.name,
                 arguments: call.arguments,
-                output: toolResultModelText(toolResult),
+                output: rawOutput,
                 is_error: toolResult.is_error,
                 error_code: toolResult.error_code,
                 duration_ms: toolResult.duration_ms ?? 0,
               });
+              const prepared = prepareToolResultForContext(
+                rawOutput,
+                rewriterResultContextChars,
+                rewriterResultNote,
+              );
+              if (
+                call.name === "read_file"
+                && !toolResult.is_error
+                && prepared.metadata.truncated
+              ) {
+                this.unmarkReadLedgerForCall(call);
+              }
               rewriterMessages.push({
                 role: "tool",
                 tool_call_id: tc.id,
                 name: tc.name,
-                content: prepareToolResultForContext(
-                  toolResultModelText(toolResult),
-                  rewriterResultContextChars,
-                  rewriterResultNote,
-                ).context,
+                content: prepared.context,
               });
               onStateChange({
                 stage: "rewriter",

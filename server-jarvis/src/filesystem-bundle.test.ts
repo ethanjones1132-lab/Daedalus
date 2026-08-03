@@ -7,7 +7,8 @@ import { createToolRuntime, makeExecutionContext } from "./tool-runtime";
 import type { ToolRuntime, ExecutionContext } from "./tool-runtime";
 import { registerFilesystemBundle, registerSearchBundle } from "./filesystem-bundle";
 import { defaultConfig } from "./config";
-import { markFileRead } from "./fs-read-cache";
+import { hasFileBeenRead, markFileRead } from "./fs-read-cache";
+import { resolve } from "path";
 
 // These tests run against a real workspace and use WORKSPACE-RELATIVE paths so
 // that fs-scope's Windows->WSL translation is a passthrough — making them valid
@@ -395,6 +396,32 @@ describe("FilesystemBundle > read_file continuation note (2026-07-18)", () => {
       makeCtx(ws),
     );
     expect(result.output).not.toContain("showing lines");
+  });
+
+  test("W4.1: partial window read does not markFileRead; complete read does", async () => {
+    const ws = makeTempWorkspace();
+    writeFileSync(join(ws, "big.txt"), Array.from({ length: 10 }, (_, i) => `line ${i + 1}`).join("\n"));
+    const resolved = resolve(ws, "big.txt");
+    const rt = makeRuntime();
+    const ctx = makeCtx(ws);
+
+    const partial = await rt.execute(call("read_file", { path: "big.txt", limit: 4 }), ctx);
+    expect(partial.is_error).toBe(false);
+    expect(partial.output).toContain("showing lines");
+    expect(hasFileBeenRead(resolved)).toBe(false);
+
+    // Edit must remain blocked after a truncated page.
+    const blocked = await rt.execute(
+      call("edit_file", { path: "big.txt", old_string: "line 1", new_string: "LINE 1" }),
+      ctx,
+    );
+    expect(blocked.is_error).toBe(true);
+    expect(blocked.error).toContain("has not been read yet");
+
+    const full = await rt.execute(call("read_file", { path: "big.txt" }), ctx);
+    expect(full.is_error).toBe(false);
+    expect(full.output).not.toContain("showing lines");
+    expect(hasFileBeenRead(resolved)).toBe(true);
   });
 });
 

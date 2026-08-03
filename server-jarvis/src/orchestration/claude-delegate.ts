@@ -24,7 +24,7 @@ import { createInterface } from "readline";
 import { isAbsolute, join, relative, resolve } from "path";
 import { createConnection } from "net";
 import { prepareToolResultForContext } from "../tool-result-truncation";
-import { EXECUTOR_TOOL_RESULT_CONTEXT_CHARS } from "./context-budget";
+import { delegateToolResultContextChars } from "./context-budget";
 import type { DelegateStageDiagnostics, ExecutorStageOutput, ToolCallRecord } from "./stage-output";
 import type { ExecutionProfile } from "./route-normalization";
 
@@ -70,17 +70,43 @@ const DELEGATE_MCP_BLOCKED_TOOLS = new Set([
   "task_create",
 ]);
 
+// Bash is root-confinable at the stock CLI layer: process cwd is the P0 root
+// (allowedRoots[0]). Patterned entries like Bash(powershell:*) stay stored in
+// config but never reach --tools (exact-name floor only). Task remains blocked.
 const ROOT_CONFINABLE_CLAUDE_TOOLS = [
-  "Read", "Edit", "Write", "MultiEdit", "Grep", "Glob",
+  "Read", "Edit", "Write", "MultiEdit", "Grep", "Glob", "Bash",
   "WebSearch", "WebFetch", "TodoWrite",
 ] as const;
 const ROOT_CONFINABLE_CLAUDE_TOOL_SET = new Set<string>(ROOT_CONFINABLE_CLAUDE_TOOLS);
 
-/** Unsafe/indirect configured entries remain stored but never reach stock CLI authority. */
+/** Patterned/unsafe configured entries remain stored but never reach stock CLI authority. */
 function rootConfinableDelegateTools(configured: string[]): string[] {
   return configured.filter((name, index) =>
     ROOT_CONFINABLE_CLAUDE_TOOL_SET.has(name) && configured.indexOf(name) === index,
   );
+}
+
+/**
+ * Stock Claude CLI Read on a directory surfaces raw EISDIR. Normalize to the
+ * same actionable guidance native filesystem-bundle returns for read_file.
+ */
+export function normalizeDelegateReadFileOutput(
+  canonicalName: string,
+  output: string,
+  args: Record<string, unknown>,
+): string {
+  if (canonicalName !== "read_file" || !output) return output;
+  const lower = output.toLowerCase();
+  // Already native-style guidance — leave alone.
+  if (lower.includes("list_directory") && lower.includes("is a directory")) return output;
+  const isDirError =
+    lower.includes("eisdir")
+    || (lower.includes("is a directory") && (lower.includes("illegal") || lower.includes("operation")));
+  if (!isDirError) return output;
+  const pathHint = typeof args.path === "string" && args.path.trim().length > 0
+    ? args.path
+    : "that path";
+  return `Error: "${pathHint}" is a directory, not a file. Use list_directory to see its contents, then read_file on a specific file inside it.\n(Original: ${output})`;
 }
 
 export type DelegateHealthStrikeReason =
@@ -402,9 +428,10 @@ export function buildClaudeDelegateInvocation(
   args.push("--strict-mcp-config", "--mcp-config", mcpConfig.path);
   const rootConfinableTools = rootConfinableDelegateTools(delegate.allowed_tools);
   // --allowedTools only controls auto-approval. --tools is the actual
-  // availability boundary that prevents Bash/Task from escaping P0 roots.
-  // MCP tools are separate from the built-in --tools set; keep the stock
-  // allowlist as the floor and let --mcp-config supply richer Jarvis tools.
+  // availability boundary (root-confinable stock tools only — Task and
+  // patterned Bash(...) entries stay stripped). MCP tools are separate from
+  // the built-in --tools set; keep the stock allowlist as the floor and let
+  // --mcp-config supply richer Jarvis tools.
   args.push("--tools", rootConfinableTools.join(","));
   if (rootConfinableTools.length > 0) {
     // Claude 2.1.88 parses --allowedTools as variadic. Terminate its values so
@@ -917,7 +944,7 @@ function gitMetadataRecord(snapshots: DelegateRootSnapshot[], verified = true): 
   return {
     name: "git_metadata",
     arguments: { roots: snapshots.map((snapshot) => snapshot.root) },
-    output: prepareToolResultForContext(output, EXECUTOR_TOOL_RESULT_CONTEXT_CHARS).context,
+    output: prepareToolResultForContext(output, delegateToolResultContextChars()).context,
     is_error: !verified,
     duration_ms: 0,
   };
@@ -1399,13 +1426,26 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
               const match = event.tool_use_id ? pending.get(event.tool_use_id) : undefined;
               if (match) {
                 const resultOutput = event.tool_output ?? "";
+                const normalizedOutput = match.record.error_code === "policy_denied"
+                  ? `${match.record.output}\n\nRejected delegate output: ${resultOutput}`
+                  : normalizeDelegateReadFileOutput(
+                    match.record.name,
+                    resultOutput,
+                    match.record.arguments,
+                  );
+                // Directory-read normalization produces a guided error even when
+                // the CLI marked the event non-error or left is_error unset.
+                const directoryGuided =
+                  match.record.name === "read_file"
+                  && normalizedOutput !== resultOutput
+                  && normalizedOutput.includes("list_directory");
                 match.record.output = prepareToolResultForContext(
-                  match.record.error_code === "policy_denied"
-                    ? `${match.record.output}\n\nRejected delegate output: ${resultOutput}`
-                    : resultOutput,
-                  EXECUTOR_TOOL_RESULT_CONTEXT_CHARS,
+                  normalizedOutput,
+                  delegateToolResultContextChars(),
                 ).context;
-                if (match.record.error_code !== "policy_denied") match.record.is_error = event.is_error === true;
+                if (match.record.error_code !== "policy_denied") {
+                  match.record.is_error = event.is_error === true || directoryGuided;
+                }
                 match.record.duration_ms = Math.max(0, now() - match.startedAt);
                 pending.delete(event.tool_use_id!);
                 // Mid-loop supervision observes completed tool outcomes. Await
@@ -1483,7 +1523,7 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
         const unverifiedOutput = record.output
           ? `${record.output}\n\ndelegate_write_unverified: no matching filesystem change was observed.`
           : "delegate_write_unverified: no matching filesystem change was observed.";
-        record.output = prepareToolResultForContext(unverifiedOutput, EXECUTOR_TOOL_RESULT_CONTEXT_CHARS).context;
+        record.output = prepareToolResultForContext(unverifiedOutput, delegateToolResultContextChars()).context;
         unverifiedWrite = true;
       }
     }

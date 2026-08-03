@@ -207,17 +207,24 @@ async function handleReadFile(args: Record<string, unknown>, ctx: ExecutionConte
 
   try {
     const content = await fs.readFile(path, "utf-8");
-    markFileRead(path);
     const lines = content.split("\n");
     const start = Math.max(0, offset - 1);
     const end = Math.min(lines.length, start + limit);
+    // F1 / W4.1: only a complete whole-file read unlocks edit_file. A partial
+    // offset/limit page must not be treated as "file fully seen".
+    const coversWholeFile = start === 0 && end >= lines.length;
+    if (coversWholeFile) {
+      markFileRead(path);
+    }
 
     const numbered = lines.slice(start, end).map((line, i) => `${(start + i + 1).toString().padStart(6)} | ${line}`);
     // A cut-off read must SAY so, with the exact call that continues it —
     // silence here previously read as "that was the whole file".
     const continuation = end < lines.length
       ? `\n[showing lines ${start + 1}-${end} of ${lines.length} total — call read_file with offset=${end + 1} to continue]`
-      : "";
+      : (start > 0
+        ? `\n[showing lines ${start + 1}-${end} of ${lines.length} total — earlier lines were not included in this call]`
+        : "");
     return numbered.join("\n") + continuation;
   } catch {
     throw new Error(`File not found: ${path}. Use glob with pattern to find the correct path before retrying.`);

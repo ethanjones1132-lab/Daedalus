@@ -32,6 +32,15 @@ export const REWRITER_TRANSCRIPT_BUDGET_TOKENS = 8_000;
 export const WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS = 24_000;
 export const WRITE_TURN_TRANSCRIPT_BUDGET_TOKENS = 24_000;
 
+/**
+ * Per-result context cap for the Claude CLI delegate.
+ * The delegate only runs on write-intent turns, so it always uses the
+ * write-turn visibility budget (not the 6 KB read-turn executor cap).
+ */
+export function delegateToolResultContextChars(): number {
+  return WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS;
+}
+
 /** Keep the newest N assistant/tool cycles intact; older ones become a checkpoint. */
 const KEEP_NEWEST_ASSISTANT_CYCLES = 2;
 /** Hard cap for the evidence checkpoint carrier message. */

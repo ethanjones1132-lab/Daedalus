@@ -544,7 +544,7 @@ export function defaultConfig(): JarvisConfig {
         policy: "delegate_first",
         permission_mode: "acceptEdits",
         allowed_tools: [
-          "Read", "Edit", "Write", "MultiEdit", "Grep", "Glob",
+          "Read", "Edit", "Write", "MultiEdit", "Grep", "Glob", "Bash",
           "WebSearch", "WebFetch", "TodoWrite",
         ],
         // auto = free-capable first, thrash → cheapest known-capable Go model.

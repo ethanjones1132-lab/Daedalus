@@ -17,12 +17,14 @@ import {
   mapClaudeDelegateToolName,
   nodeDelegateProcessFactory,
   nodeDelegateSnapshotFactory,
+  normalizeDelegateReadFileOutput,
   runClaudeDelegate,
   sanitizeDelegateDiagnosticText,
   withDelegateRequestCorrelation,
   type DelegateRootSnapshot,
 } from "./claude-delegate";
 import { toolCallIdentityKey } from "./pipeline";
+import { delegateToolResultContextChars, WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS } from "./context-budget";
 import {
   DELEGATE_MCP_SERVER_NAME,
   DELEGATE_MCP_SESSION_GRANTS_ENV,
@@ -35,6 +37,38 @@ function testConfig(): JarvisConfig {
   config.opencode_go.api_key = "go-test-key";
   return config;
 }
+
+describe("delegateToolResultContextChars (W1.5)", () => {
+  test("uses the write-turn 24k cap, not the 6k read-turn executor cap", () => {
+    expect(delegateToolResultContextChars()).toBe(WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS);
+    expect(delegateToolResultContextChars()).toBe(24_000);
+    expect(delegateToolResultContextChars()).toBeGreaterThan(6_000);
+  });
+});
+
+describe("normalizeDelegateReadFileOutput (W1.5 EISDIR)", () => {
+  test("rewrites raw EISDIR into list_directory guidance", () => {
+    const out = normalizeDelegateReadFileOutput(
+      "read_file",
+      "EISDIR: illegal operation on a directory, read",
+      { path: "src" },
+    );
+    expect(out).toContain("is a directory");
+    expect(out).toContain("list_directory");
+    expect(out).toContain("src");
+  });
+
+  test("leaves already-guided directory errors unchanged", () => {
+    const guided = 'Error: "src" is a directory, not a file. Use list_directory to see its contents.';
+    expect(normalizeDelegateReadFileOutput("read_file", guided, { path: "src" })).toBe(guided);
+  });
+
+  test("does not rewrite non-read tools or ordinary read errors", () => {
+    expect(normalizeDelegateReadFileOutput("bash", "EISDIR: x", { path: "src" })).toBe("EISDIR: x");
+    expect(normalizeDelegateReadFileOutput("read_file", "ENOENT: no such file", { path: "x" }))
+      .toBe("ENOENT: no such file");
+  });
+});
 
 describe("canonicalizeDelegateToolArguments", () => {
   test("maps Claude CLI file_path to native path for deflection identity", () => {
@@ -376,7 +410,7 @@ describe("Claude executor delegate", () => {
     expect(invocation.args[index + 1]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
   });
 
-  test("default invocation exposes only root-confinable direct tools and strips configured shell auto-allows", () => {
+  test("default invocation exposes root-confinable direct tools including Bash and strips patterned shell auto-allows", () => {
     const config = testConfig();
     config.claude_cli.delegate.allowed_tools.push("Bash(powershell:*)");
     const invocation = buildClaudeDelegateInvocation({
@@ -391,17 +425,18 @@ describe("Claude executor delegate", () => {
     try {
       const serialized = invocation.args.join(" ");
 
-      expect(serialized).toContain("--tools Read,Edit,Write,MultiEdit,Grep,Glob,WebSearch,WebFetch,TodoWrite");
+      // Exact "Bash" is root-confinable (cwd = P0 root); patterned Bash(...) is stripped.
+      expect(serialized).toContain("--tools Read,Edit,Write,MultiEdit,Grep,Glob,Bash,WebSearch,WebFetch,TodoWrite");
       // --allowedTools is root-confinable floor + jarvis MCP server, then `--`.
       const allowedIdx = invocation.args.indexOf("--allowedTools");
       expect(invocation.args[allowedIdx + 1]).toBe(
-        "Read,Edit,Write,MultiEdit,Grep,Glob,WebSearch,WebFetch,TodoWrite",
+        "Read,Edit,Write,MultiEdit,Grep,Glob,Bash,WebSearch,WebFetch,TodoWrite",
       );
       expect(invocation.args[allowedIdx + 2]).toBe("mcp__jarvis");
       expect(invocation.args[allowedIdx + 3]).toBe("--");
       expect(serialized).not.toContain("Bash(");
-      expect(serialized).not.toMatch(/(?:^|[\s,])Bash(?:[\s,]|$)/);
       expect(serialized).not.toMatch(/(?:^|[\s,])Task(?:[\s,]|$)/);
+      expect(config.claude_cli.delegate.allowed_tools).toContain("Bash");
       expect(config.claude_cli.delegate.allowed_tools).toContain("Bash(powershell:*)");
     } finally {
       invocation.cleanup();
@@ -442,9 +477,9 @@ describe("Claude executor delegate", () => {
         "C:\\primary",
         "D:\\extra",
       ]);
-      // Root confinement floor: no Bash/Task in stock tool availability.
+      // Root confinement floor: Bash is allowed (workspace cwd); Task stays out.
       const toolsArg = invocation.args[invocation.args.indexOf("--tools") + 1] ?? "";
-      expect(toolsArg).not.toContain("Bash");
+      expect(toolsArg.split(",")).toContain("Bash");
       expect(toolsArg).not.toContain("Task");
     } finally {
       invocation.cleanup();
@@ -465,6 +500,11 @@ describe("Claude executor delegate", () => {
     expect(isPermittedDelegateTool("mcp__jarvis__agent", "agent", stock, canonical)).toBe(false);
     expect(isPermittedDelegateTool("Bash", "bash", stock, canonical)).toBe(false);
     expect(isPermittedDelegateTool("Task", "task", stock, canonical)).toBe(false);
+
+    // Exact Bash in the stock floor is permitted (W1.5).
+    const withBash = new Set(["Read", "Write", "Bash"]);
+    const withBashCanon = new Set(["read_file", "write_file", "bash"]);
+    expect(isPermittedDelegateTool("Bash", "bash", withBash, withBashCanon)).toBe(true);
   });
 
   test("keeps the first two strikes available and escalates later cooldowns", () => {
@@ -637,7 +677,7 @@ describe("Claude executor delegate", () => {
           };
           yield {
             type: "user",
-            message: { content: [{ type: "tool_result", tool_use_id: "write-1", content: "x".repeat(20_000) }] },
+            message: { content: [{ type: "tool_result", tool_use_id: "write-1", content: "x".repeat(40_000) }] },
           };
           yield { type: "result", result: "done" };
         })(),
@@ -653,7 +693,9 @@ describe("Claude executor delegate", () => {
       is_error: true,
       error_code: "delegate_write_unverified",
     });
-    expect(output.toolCalls[0].output.length).toBeLessThanOrEqual(6_000);
+    // W1.5: write-turn 24k cap (delegate always write-intent).
+    expect(output.toolCalls[0].output.length).toBeLessThanOrEqual(24_000);
+    expect(output.toolCalls[0].output).toContain("truncated");
     expect(output.toolCalls.filter((record) => record.name === "git_metadata")).toHaveLength(1);
     expect(health.snapshot().lastReason).toBe("unverified_write");
   }, 15_000); // 2026-07-27 evening cron: 5s vitest default was tight under full-suite load
@@ -715,7 +757,7 @@ describe("Claude executor delegate", () => {
           yield { type: "user", message: { content: [{
             type: "tool_result",
             tool_use_id: "write-1",
-            content: "x".repeat(20_000),
+            content: "x".repeat(40_000),
           }] } };
           yield { type: "result" };
         })(),
@@ -727,16 +769,20 @@ describe("Claude executor delegate", () => {
     expect(output.ok).toBe(true);
     expect(output.narrative).toBe("Applied the change.");
     expect(output.toolCalls[0].is_error).toBe(false);
-    expect(output.toolCalls[0].output.length).toBeLessThanOrEqual(6_000);
+    // W1.5: delegate uses write-turn 24k cap, not the 6k read-turn executor cap.
+    expect(output.toolCalls[0].output.length).toBeLessThanOrEqual(24_000);
+    expect(output.toolCalls[0].output.length).toBeGreaterThan(6_000);
     expect(output.toolCalls[0].output).toContain("truncated");
     expect(output.toolCalls.at(-1)?.output).toContain("claimed.ts | 2 ++");
     expect(streamedText).toEqual(["Applied the change."]);
     expect(streamedTools).toEqual(["write_file"]);
   });
 
-  test("rejects an out-of-root Bash write as unverifiable policy evidence", async () => {
+  test("rejects patterned Bash(...) alone as stock Bash authority (exact Bash required)", async () => {
+    // Patterned entries remain stored for config round-trip but never enter the
+    // root-confinable floor. Without exact "Bash", stock Bash is policy-denied.
     const config = testConfig();
-    config.claude_cli.delegate.allowed_tools.push("Bash(python:*)");
+    config.claude_cli.delegate.allowed_tools = ["Read", "Bash(python:*)"];
     const snapshot: DelegateRootSnapshot = {
       root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
     };

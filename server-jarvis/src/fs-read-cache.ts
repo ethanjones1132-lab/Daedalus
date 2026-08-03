@@ -15,3 +15,8 @@ export function markFileRead(resolvedPath: string): void {
 export function hasFileBeenRead(resolvedPath: string): boolean {
   return readFiles.has(resolvedPath);
 }
+
+/** Drop a path from the ledger (e.g. when a "complete" disk read is context-truncated for the model). */
+export function unmarkFileRead(resolvedPath: string): void {
+  readFiles.delete(resolvedPath);
+}

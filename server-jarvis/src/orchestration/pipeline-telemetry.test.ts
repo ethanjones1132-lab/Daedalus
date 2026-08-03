@@ -1240,6 +1240,59 @@ describe("pipeline stage telemetry", () => {
     expect(readCalls.map((c) => (c.arguments as { path: string }).path)).toEqual(["a.ts", "b.ts", "c.ts"]);
   });
 
+  test("W4.1: truncated read_file is not deflected as complete — re-read re-executes", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    let readRuns = 0;
+    runtime.register(toolDefinition("read_file"), async () => {
+      readRuns++;
+      return "     1 | line 1\n     2 | line 2\n     3 | line 3\n     4 | line 4\n[showing lines 1-4 of 10 total — call read_file with offset=5 to continue]";
+    });
+    const cfg = defaultConfig();
+    cfg.tools = { ...cfg.tools, require_approval: [], sandbox_mode: "permissive" };
+    const ctx = makeExecutionContext("agent", cfg, { workspace_path: process.cwd() });
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel !== "executor") {
+        if (options.stageLabel === "synthesizer") return { content: "Read big.txt." };
+        return { content: "unexpected" };
+      }
+      const turn = executorTurns++;
+      // Sequential turns so the deflection cache is populated between attempts.
+      if (turn === 0) {
+        return {
+          content: "page 1",
+          tool_calls: [toolCallWithArgs("read_file", { path: "big.txt", limit: 4 })],
+        };
+      }
+      if (turn === 1) {
+        // Same identity as turn 0 — must re-execute because the cached page was truncated.
+        return {
+          content: "page 1 again",
+          tool_calls: [toolCallWithArgs("read_file", { path: "big.txt", limit: 4 })],
+        };
+      }
+      return { content: "done reading partial pages" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "read big.txt carefully",
+      ["executor", "synthesizer"],
+      "run-truncated-read-no-deflection",
+      () => {},
+      { executionProfile: "read_only" },
+    );
+
+    expect(readRuns).toBe(2);
+    const reads = (result.toolCalls ?? []).filter((c) => c.name === "read_file");
+    expect(reads).toHaveLength(2);
+    expect(reads[0]?.output).toContain("showing lines");
+    expect(reads[1]?.output).toContain("showing lines");
+    expect(reads[1]?.output).not.toContain("[duplicate call deflected]");
+  });
+
   test("duplicate read-only tool calls in one executor stage execute once and return a deflection result", async () => {
     const rows: StageRun[] = [];
     const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
