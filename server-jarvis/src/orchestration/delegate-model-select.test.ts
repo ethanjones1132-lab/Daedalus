@@ -1,9 +1,13 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, beforeEach } from "bun:test";
+import { SelfTuningStore } from "../self-tuning/store";
 import {
   __resetDelegateThrashForTests,
   __resetDelegateWriteScoreboardForTests,
+  __reseedDelegateWriteScoreboardForTests,
+  __setDelegateWriteScoreboardStoreForTests,
   clearDelegateThrash,
   DEFAULT_THRASH_TTL_MS,
+  DELEGATE_WRITE_SCOREBOARD_SEEDS,
   delegateThrashKey,
   enumerateDelegateModelCandidates,
   getDelegateThrashCount,
@@ -11,13 +15,16 @@ import {
   isProxyResolvable,
   isToolCallCapableDelegate,
   DELEGATE_FREE_FIRST_MODELS,
+  DELEGATE_GO_ANTHROPIC_MODELS,
   DELEGATE_GO_OPENAI_MODELS,
   DELEGATE_TOOL_INCAPABLE_MODELS,
   recordDelegateThrash,
   getBenchedDelegateModels,
   getDelegateWriteScoreboard,
   recordDelegateWriteOutcome,
+  rankModelsByWriteEvidence,
   selectDelegateModel,
+  writeEvidenceScore,
 } from "./delegate-model-select";
 
 // 2026-08-01, live runs run_d84a937f / run_275068a5: the delegate is the
@@ -31,14 +38,18 @@ import {
 //
 // Exclusion is by EXPLICIT id, never a substring heuristic on "reasoning":
 // a wrong exclusion silently costs a free lane, and re-enabling a model when
-// it gains tool support must be a one-line edit. Free-first ordering is
-// untouched — capable free models are still tried before any paid tier.
+// it gains tool support must be a one-line edit.
 describe("delegate tool-call capability filter", () => {
+  beforeEach(() => {
+    __setDelegateWriteScoreboardStoreForTests(new SelfTuningStore(":memory:"));
+    __reseedDelegateWriteScoreboardForTests();
+  });
+
   test("the known reasoning model is excluded", () => {
     expect(isToolCallCapableDelegate("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free")).toBe(false);
   });
 
-  test("north-mini-code stays capable and remains the free-first primary", () => {
+  test("north-mini-code stays tool-capable but does not beat seeded minimax-m3", () => {
     expect(isToolCallCapableDelegate("cohere/north-mini-code:free")).toBe(true);
     const s = selectDelegateModel({
       configuredModel: "auto",
@@ -46,8 +57,8 @@ describe("delegate tool-call capability filter", () => {
       proxyAvailable: true,
       hasOpenCodeGoKey: true,
     });
-    expect(s.pool).toBe("free");
-    expect(s.model).toBe("cohere/north-mini-code:free");
+    expect(s.model).toBe("minimax-m3");
+    expect(s.pool).toBe("go_capable");
   });
 
   test("a model is not excluded merely for having 'reasoning' in its id", () => {
@@ -63,8 +74,7 @@ describe("delegate tool-call capability filter", () => {
   });
 
   test("selection never returns an incapable model from the free pool", () => {
-    // Rotate through every thrash count that still selects from free.
-    for (let thrash = 0; thrash < DELEGATE_FREE_FIRST_MODELS.length; thrash++) {
+    for (let thrash = 0; thrash < DELEGATE_FREE_FIRST_MODELS.length + 2; thrash++) {
       const s = selectDelegateModel({
         configuredModel: "auto",
         thrashCount: thrash,
@@ -76,39 +86,95 @@ describe("delegate tool-call capability filter", () => {
     }
   });
 
-  test("free-first is preserved: a capable free model still beats the paid tier", () => {
+  test("seeded write evidence beats free pool on first auto selection", () => {
     const s = selectDelegateModel({
       configuredModel: "auto",
       thrashCount: 0,
       proxyAvailable: true,
       hasOpenCodeGoKey: true,
     });
-    expect(s.pool).toBe("free");
+    expect(s.pool).toBe("go_capable");
+    expect(s.model).toBe("minimax-m3");
+    expect(s.reason).toBe("write_evidence");
   });
 });
 
-describe("selectDelegateModel (Slice B free-first)", () => {
-  test("auto starts on free-first pool when proxy is up", () => {
+describe("selectDelegateModel (W1.1 scoreboard ranking)", () => {
+  beforeEach(() => {
+    __setDelegateWriteScoreboardStoreForTests(new SelfTuningStore(":memory:"));
+    __reseedDelegateWriteScoreboardForTests();
+  });
+
+  test("auto + thrash=0 + proxy up + go key → minimax-m3 (highest write evidence)", () => {
     const s = selectDelegateModel({
       configuredModel: "auto",
       thrashCount: 0,
       proxyAvailable: true,
       hasOpenCodeGoKey: true,
     });
-    expect(s.pool).toBe("free");
-    expect(s.reason).toBe("free_first");
-    expect(s.model).toContain("free");
+    expect(s.model).toBe("minimax-m3");
+    expect(s.pool).toBe("go_capable");
+    expect(s.reason).toBe("write_evidence");
   });
 
-  test("auto rotates free models with thrash before Go", () => {
-    const s0 = selectDelegateModel({ configuredModel: "auto", thrashCount: 0, proxyAvailable: true });
-    const s1 = selectDelegateModel({ configuredModel: "auto", thrashCount: 1, proxyAvailable: true });
-    expect(s0.pool).toBe("free");
-    expect(s1.pool).toBe("free");
+  test("selector returns highest write-evidence available model (minimax-m3 vs free-pool fixture)", () => {
+    __resetDelegateWriteScoreboardForTests();
+    // Fixture: free looks cheap but has poor write evidence; minimax is proven.
+    recordDelegateWriteOutcome("minimax-m3", true);
+    for (let i = 0; i < 10; i++) {
+      // pad minimax to high rate with confidence
+      recordDelegateWriteOutcome("minimax-m3", true);
+    }
+    // free pool: many attempts, few writes
+    for (let i = 0; i < 10; i++) {
+      recordDelegateWriteOutcome("cohere/north-mini-code:free", i === 0);
+    }
+
+    const s = selectDelegateModel({
+      configuredModel: "auto",
+      thrashCount: 0,
+      proxyAvailable: true,
+      hasOpenCodeGoKey: true,
+      freeModels: ["cohere/north-mini-code:free"],
+      goAnthropicModels: ["minimax-m3"],
+      goOpenaiModels: ["deepseek-v4-flash"],
+    });
+    expect(s.model).toBe("minimax-m3");
+    expect(writeEvidenceScore(getDelegateWriteScoreboard("minimax-m3")).rate)
+      .toBeGreaterThan(writeEvidenceScore(getDelegateWriteScoreboard("cohere/north-mini-code:free")).rate);
+  });
+
+  test("historical seeds document minimax ~96% and free pool ~9%", () => {
+    const minimax = DELEGATE_WRITE_SCOREBOARD_SEEDS.find((s) => s.model === "minimax-m3")!;
+    expect(minimax.attempts).toBe(123);
+    expect(minimax.verifiedWrites).toBe(118);
+    expect(minimax.verifiedWrites / minimax.attempts).toBeCloseTo(0.96, 2);
+
+    const freeSeeds = DELEGATE_WRITE_SCOREBOARD_SEEDS.filter((s) => s.model.includes(":free"));
+    const freeAttempts = freeSeeds.reduce((n, s) => n + s.attempts, 0);
+    const freeVerified = freeSeeds.reduce((n, s) => n + s.verifiedWrites, 0);
+    expect(freeAttempts).toBe(33);
+    expect(freeVerified / freeAttempts).toBeCloseTo(0.09, 2);
+  });
+
+  test("thrash rotates through evidence-ranked candidates", () => {
+    const s0 = selectDelegateModel({
+      configuredModel: "auto",
+      thrashCount: 0,
+      proxyAvailable: true,
+      hasOpenCodeGoKey: true,
+    });
+    const s1 = selectDelegateModel({
+      configuredModel: "auto",
+      thrashCount: 1,
+      proxyAvailable: true,
+      hasOpenCodeGoKey: true,
+    });
+    expect(s0.model).toBe("minimax-m3");
     expect(s1.model).not.toBe(s0.model);
   });
 
-  test("thrash at threshold promotes to cheapest Go capable", () => {
+  test("thrash at threshold promotes among Go capable by write evidence (not cheapest first)", () => {
     const s = selectDelegateModel({
       configuredModel: "auto",
       thrashCount: 2,
@@ -117,7 +183,8 @@ describe("selectDelegateModel (Slice B free-first)", () => {
       hasOpenCodeGoKey: true,
     });
     expect(s.pool).toBe("go_capable");
-    expect(s.model).toBe("deepseek-v4-flash");
+    // With seeds, minimax-m3 remains the highest-evidence Go model.
+    expect(s.model).toBe("minimax-m3");
     expect(s.reason).toContain("thrash_promoted");
   });
 
@@ -145,12 +212,15 @@ describe("selectDelegateModel (Slice B free-first)", () => {
       thrashCount: 2,
       thrashThreshold: 2,
       proxyAvailable: true,
+      hasOpenCodeGoKey: true,
     });
     expect(promoted.pool).toBe("go_capable");
-    expect(promoted.model).toBe("deepseek-v4-flash");
+    // Evidence-ranked Go promotion (not deepseek-first).
+    expect(promoted.model).toBe("minimax-m3");
+    expect(promoted.reason).toContain("thrash_promoted");
   });
 
-  test("enumerate includes free then go then anthropic fallback", () => {
+  test("enumerate includes free, go openai, and anthropic candidates", () => {
     const list = enumerateDelegateModelCandidates({
       configuredModel: "auto",
       thrashCount: 0,
@@ -158,9 +228,97 @@ describe("selectDelegateModel (Slice B free-first)", () => {
       proxyAvailable: true,
       hasOpenCodeGoKey: true,
     });
-    expect(list.some((s) => s.pool === "free")).toBe(true);
+    expect(list[0]?.model).toBe("minimax-m3");
     expect(list.some((s) => s.model === "deepseek-v4-flash")).toBe(true);
     expect(list.some((s) => s.model === "minimax-m3")).toBe(true);
+    // Free models still appear later in the evidence-ranked walk when not benched.
+    expect(list.some((s) => s.pool === "free" || s.model.includes(":free"))).toBe(true);
+  });
+});
+
+describe("selectDelegateModel (W1.2 Anthropic Go while proxy up)", () => {
+  beforeEach(() => {
+    __setDelegateWriteScoreboardStoreForTests(new SelfTuningStore(":memory:"));
+    __reseedDelegateWriteScoreboardForTests();
+  });
+
+  test("proxy-up does not exclude Anthropic-native Go models from consideration", () => {
+    const s = selectDelegateModel({
+      configuredModel: "auto",
+      thrashCount: 0,
+      proxyAvailable: true,
+      hasOpenCodeGoKey: true,
+    });
+    // minimax-m3 is Anthropic-native Go and must win with seeds even when proxy is up
+    expect(DELEGATE_GO_ANTHROPIC_MODELS).toContain(s.model as typeof DELEGATE_GO_ANTHROPIC_MODELS[number]);
+    expect(s.model).toBe("minimax-m3");
+  });
+
+  test("with empty free pool and proxy up, anthropic Go still ranks against openai Go", () => {
+    __resetDelegateWriteScoreboardForTests();
+    // Only deepseek has weak evidence; minimax has strong evidence.
+    for (let i = 0; i < 5; i++) recordDelegateWriteOutcome("minimax-m3", true);
+    for (let i = 0; i < 5; i++) recordDelegateWriteOutcome("deepseek-v4-flash", false);
+
+    const s = selectDelegateModel({
+      configuredModel: "auto",
+      thrashCount: 0,
+      proxyAvailable: true,
+      hasOpenCodeGoKey: true,
+      freeModels: [],
+      goOpenaiModels: ["deepseek-v4-flash"],
+      goAnthropicModels: ["minimax-m3"],
+    });
+    expect(s.model).toBe("minimax-m3");
+    expect(s.pool).toBe("go_capable");
+  });
+
+  test("enumerate with proxy up still lists anthropic Go models", () => {
+    const list = enumerateDelegateModelCandidates({
+      configuredModel: "auto",
+      thrashCount: 0,
+      thrashThreshold: 2,
+      proxyAvailable: true,
+      hasOpenCodeGoKey: true,
+    });
+    for (const model of DELEGATE_GO_ANTHROPIC_MODELS) {
+      expect(list.some((s) => s.model === model)).toBe(true);
+    }
+  });
+});
+
+describe("selectDelegateModel (W1.3 earned free lane)", () => {
+  beforeEach(() => {
+    __setDelegateWriteScoreboardStoreForTests(new SelfTuningStore(":memory:"));
+    __resetDelegateWriteScoreboardForTests();
+  });
+
+  test("benched free model is not selected even as thrash rotates", () => {
+    recordDelegateWriteOutcome("vendor/failing:free", false);
+    recordDelegateWriteOutcome("vendor/failing:free", false);
+    recordDelegateWriteOutcome("vendor/failing:free", false);
+    // Give healthy free weak evidence; minimax strong.
+    recordDelegateWriteOutcome("vendor/healthy:free", true);
+    for (let i = 0; i < 5; i++) recordDelegateWriteOutcome("minimax-m3", true);
+
+    const selection = selectDelegateModel({
+      configuredModel: "auto",
+      thrashCount: 0,
+      proxyAvailable: true,
+      hasOpenCodeGoKey: true,
+      freeModels: ["vendor/failing:free", "vendor/healthy:free"],
+      benchedModels: getBenchedDelegateModels(),
+    });
+
+    expect(selection.model).not.toBe("vendor/failing:free");
+    expect(getBenchedDelegateModels()).toContain("vendor/failing:free");
+  });
+
+  test("free model with no verified writes after bench attempts stays benched", () => {
+    for (let i = 0; i < 3; i++) {
+      recordDelegateWriteOutcome("cohere/north-mini-code:free", false);
+    }
+    expect(getDelegateWriteScoreboard("cohere/north-mini-code:free")?.benched).toBe(true);
   });
 });
 
@@ -217,8 +375,12 @@ describe("delegate thrash accounting", () => {
 });
 
 describe("delegate verified-write scoreboard", () => {
-  test("benches a model after three attempts with zero verified writes", () => {
+  beforeEach(() => {
+    __setDelegateWriteScoreboardStoreForTests(new SelfTuningStore(":memory:"));
     __resetDelegateWriteScoreboardForTests();
+  });
+
+  test("benches a model after three attempts with zero verified writes", () => {
     expect(recordDelegateWriteOutcome("vendor/failing:free", false)).toMatchObject({
       attempts: 1,
       verifiedWrites: 0,
@@ -233,7 +395,6 @@ describe("delegate verified-write scoreboard", () => {
   });
 
   test("a verified write prevents benching even after three attempts", () => {
-    __resetDelegateWriteScoreboardForTests();
     recordDelegateWriteOutcome("vendor/working:free", false);
     recordDelegateWriteOutcome("vendor/working:free", false);
     const result = recordDelegateWriteOutcome("vendor/working:free", true);
@@ -243,26 +404,92 @@ describe("delegate verified-write scoreboard", () => {
   });
 
   test("selection skips a benched free model", () => {
-    __resetDelegateWriteScoreboardForTests();
     recordDelegateWriteOutcome("vendor/failing:free", false);
     recordDelegateWriteOutcome("vendor/failing:free", false);
     recordDelegateWriteOutcome("vendor/failing:free", false);
+    // Give healthy free the only free-side evidence so thrash=0 can still
+    // prefer it when Go models have zero evidence — but with empty board
+    // after reset, rank prefers Anthropic Go via tier break. Seed healthy
+    // free higher than unproven go? Actually with 0 evidence everywhere
+    // except failing benched, tier order: anthropic > openai > free.
+    // Force free-only selection via no go key and no go models if needed.
+    recordDelegateWriteOutcome("vendor/healthy:free", true);
+    recordDelegateWriteOutcome("vendor/healthy:free", true);
 
     const selection = selectDelegateModel({
       configuredModel: "auto",
       thrashCount: 0,
       proxyAvailable: true,
+      hasOpenCodeGoKey: false,
       freeModels: ["vendor/failing:free", "vendor/healthy:free"],
+      goOpenaiModels: [],
+      goAnthropicModels: [],
       benchedModels: getBenchedDelegateModels(),
     });
 
     expect(selection.model).toBe("vendor/healthy:free");
+  });
+
+  test("scoreboard persists across hydrate via SelfTuningStore", () => {
+    const store = new SelfTuningStore(":memory:");
+    __setDelegateWriteScoreboardStoreForTests(store);
+    __resetDelegateWriteScoreboardForTests();
+
+    recordDelegateWriteOutcome("minimax-m3", true);
+    recordDelegateWriteOutcome("minimax-m3", true);
+    expect(getDelegateWriteScoreboard("minimax-m3")?.attempts).toBe(2);
+
+    // Simulate process restart: new in-memory module cache, same store rows.
+    __setDelegateWriteScoreboardStoreForTests(store);
+    // Force re-hydrate from store (not suppressed empty)
+    const row = store.getDelegateWriteScoreboardRow("minimax-m3");
+    expect(row?.attempts).toBe(2);
+    expect(row?.verified_writes).toBe(2);
+
+    // Re-bind and load
+    __setDelegateWriteScoreboardStoreForTests(store);
+    // After set, hydrated=false; get should load from store
+    expect(getDelegateWriteScoreboard("minimax-m3")).toMatchObject({
+      model: "minimax-m3",
+      attempts: 2,
+      verifiedWrites: 2,
+      benched: false,
+    });
+  });
+
+  test("empty store is seeded from history on first hydrate", () => {
+    const store = new SelfTuningStore(":memory:");
+    __setDelegateWriteScoreboardStoreForTests(store);
+    // hydrated=false, seed not suppressed → seeds applied
+    expect(getDelegateWriteScoreboard("minimax-m3")).toMatchObject({
+      model: "minimax-m3",
+      attempts: 123,
+      verifiedWrites: 118,
+      benched: false,
+    });
+    expect(store.getDelegateWriteScoreboardRow("minimax-m3")?.attempts).toBe(123);
+  });
+
+  test("rankModelsByWriteEvidence orders by rate then attempts", () => {
+    recordDelegateWriteOutcome("a", true); // 1/1
+    recordDelegateWriteOutcome("b", true);
+    recordDelegateWriteOutcome("b", false); // 1/2
+    recordDelegateWriteOutcome("c", false); // 0/1
+    const ranked = rankModelsByWriteEvidence(["c", "b", "a"]);
+    expect(ranked[0]).toBe("a");
+    expect(ranked[1]).toBe("b");
+    expect(ranked[2]).toBe("c");
   });
 });
 
 describe("delegate only selects models the claude_cli proxy can resolve", () => {
   const installed = ["qwythos9b-conductor:latest", "qwen3.5:4b", "qwen3:8b"];
   const goOpenaiModels = ["deepseek-v4-flash", "mimo-v2.5"];
+
+  beforeEach(() => {
+    __setDelegateWriteScoreboardStoreForTests(new SelfTuningStore(":memory:"));
+    __resetDelegateWriteScoreboardForTests();
+  });
 
   test("a namespaced id routes to OpenRouter and is resolvable", () => {
     expect(isProxyResolvable("cohere/north-mini-code:free", installed, goOpenaiModels)).toBe(true);
@@ -298,15 +525,20 @@ describe("delegate only selects models the claude_cli proxy can resolve", () => 
     // input.goOpenaiModels) is what gets passed into isProxyResolvable for
     // the free-pool filter, rather than isProxyResolvable falling back to
     // its own default parameter.
+    //
+    // With scoreboard ranking, give the free bare model evidence so it wins
+    // over unproven Go anthropic fallback when go lists are empty of evidence.
+    recordDelegateWriteOutcome("custom-bare-model", true);
     const result = selectDelegateModel({
       configuredModel: "auto",
       thrashCount: 0,
       freeModels: ["custom-bare-model"],
       goOpenaiModels: ["custom-bare-model"], // NOT in DELEGATE_GO_OPENAI_MODELS
+      goAnthropicModels: [],
+      hasOpenCodeGoKey: false,
       installedOllamaModels: [],
     });
     expect(result.model).toBe("custom-bare-model");
     expect(result.pool).toBe("free");
-    expect(result.reason).toBe("free_first");
   });
 });

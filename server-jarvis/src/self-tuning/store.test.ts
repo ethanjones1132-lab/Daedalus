@@ -40,6 +40,47 @@ describe("SelfTuningStore recent stage attributions", () => {
   });
 });
 
+describe("SelfTuningStore delegate write scoreboard", () => {
+  test("upserts, reads, and clears delegate write scoreboard rows", () => {
+    const store = new SelfTuningStore(":memory:");
+    expect(store.getAllDelegateWriteScoreboard()).toEqual([]);
+
+    store.upsertDelegateWriteScoreboard({
+      model: "minimax-m3",
+      attempts: 123,
+      verifiedWrites: 118,
+      benched: false,
+    });
+    store.upsertDelegateWriteScoreboard({
+      model: "cohere/north-mini-code:free",
+      attempts: 3,
+      verifiedWrites: 0,
+      benched: true,
+    });
+
+    const all = store.getAllDelegateWriteScoreboard();
+    expect(all).toHaveLength(2);
+    expect(store.getDelegateWriteScoreboardRow("minimax-m3")).toMatchObject({
+      model: "minimax-m3",
+      attempts: 123,
+      verified_writes: 118,
+      benched: 0,
+    });
+    expect(store.getDelegateWriteScoreboardRow("cohere/north-mini-code:free")?.benched).toBe(1);
+
+    store.upsertDelegateWriteScoreboard({
+      model: "minimax-m3",
+      attempts: 124,
+      verifiedWrites: 119,
+      benched: false,
+    });
+    expect(store.getDelegateWriteScoreboardRow("minimax-m3")?.attempts).toBe(124);
+
+    store.clearDelegateWriteScoreboard();
+    expect(store.getAllDelegateWriteScoreboard()).toEqual([]);
+  });
+});
+
 describe("SelfTuningStore conductor outcome summaries", () => {
   test("aggregates recent task and pipeline outcomes in SQLite", () => {
     const store = new SelfTuningStore(":memory:");

@@ -197,6 +197,18 @@ export interface InstructionVariantRow {
 }
 
 /**
+ * Per-model verified-write evidence for the Claude CLI delegate selector.
+ * Survives process restart so free-pool failure is not re-learned every boot.
+ */
+export interface DelegateWriteScoreboardRow {
+  model: string;
+  attempts: number;
+  verified_writes: number;
+  benched: number;
+  updated_at?: string;
+}
+
+/**
  * B-04: per-replan telemetry row. One row is written every time the
  * `conductor_replan` loop re-invokes the conductor mid-pipeline. Survives
  * restart so a "did the conductor start thrashing?" question can be answered
@@ -436,6 +448,13 @@ const SELF_TUNING_SCHEMA = `
   );
   CREATE INDEX IF NOT EXISTS idx_replan_events_session_id ON replan_events(session_id);
   CREATE INDEX IF NOT EXISTS idx_replan_events_agent_run_id ON replan_events(agent_run_id);
+  CREATE TABLE IF NOT EXISTS delegate_write_scoreboard (
+    model TEXT PRIMARY KEY,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    verified_writes INTEGER NOT NULL DEFAULT 0,
+    benched INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  );
 `;
 
 const schemaEnsuredPaths = new Set<string>();
@@ -1162,6 +1181,80 @@ export class SelfTuningStore {
     } catch (e) {
       console.error("[SelfTuningStore] getReplanEventsForSession failed:", e);
       return [];
+    } finally {
+      db.close();
+    }
+  }
+
+  // W1.1: persistent delegate verified-write scoreboard (self-tuning.db).
+  getAllDelegateWriteScoreboard(): DelegateWriteScoreboardRow[] {
+    const db = this.getDb();
+    if (!db) return [];
+    try {
+      return db.query(
+        "SELECT model, attempts, verified_writes, benched, updated_at FROM delegate_write_scoreboard ORDER BY model ASC",
+      ).all() as DelegateWriteScoreboardRow[];
+    } catch (e) {
+      console.error("[SelfTuningStore] getAllDelegateWriteScoreboard failed:", e);
+      return [];
+    } finally {
+      db.close();
+    }
+  }
+
+  getDelegateWriteScoreboardRow(model: string): DelegateWriteScoreboardRow | null {
+    const db = this.getDb();
+    if (!db) return null;
+    try {
+      const row = db.query(
+        "SELECT model, attempts, verified_writes, benched, updated_at FROM delegate_write_scoreboard WHERE model = ?",
+      ).get(model.trim()) as DelegateWriteScoreboardRow | null;
+      return row ?? null;
+    } catch (e) {
+      console.error("[SelfTuningStore] getDelegateWriteScoreboardRow failed:", e);
+      return null;
+    } finally {
+      db.close();
+    }
+  }
+
+  upsertDelegateWriteScoreboard(entry: {
+    model: string;
+    attempts: number;
+    verifiedWrites: number;
+    benched: boolean;
+  }): void {
+    const db = this.getDb();
+    if (!db) return;
+    try {
+      db.prepare(
+        `INSERT INTO delegate_write_scoreboard (model, attempts, verified_writes, benched, updated_at)
+         VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+         ON CONFLICT(model) DO UPDATE SET
+           attempts = excluded.attempts,
+           verified_writes = excluded.verified_writes,
+           benched = excluded.benched,
+           updated_at = excluded.updated_at`,
+      ).run(
+        entry.model.trim(),
+        entry.attempts,
+        entry.verifiedWrites,
+        entry.benched ? 1 : 0,
+      );
+    } catch (e) {
+      console.error("[SelfTuningStore] upsertDelegateWriteScoreboard failed:", e);
+    } finally {
+      db.close();
+    }
+  }
+
+  clearDelegateWriteScoreboard(): void {
+    const db = this.getDb();
+    if (!db) return;
+    try {
+      db.exec("DELETE FROM delegate_write_scoreboard");
+    } catch (e) {
+      console.error("[SelfTuningStore] clearDelegateWriteScoreboard failed:", e);
     } finally {
       db.close();
     }
