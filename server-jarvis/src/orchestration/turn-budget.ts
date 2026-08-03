@@ -154,6 +154,24 @@ export function requestTimeoutMessage(timeoutMs: number): string {
   return `Request timed out after ${timeoutMs / 1000}s. The model may be loading or overloaded.`;
 }
 
+/**
+ * Give a final queued repair stage the unused turn window, while preserving
+ * the finalization reserve for synthesis and terminal bookkeeping.
+ */
+export function scaleLastQueuedStageBudget(
+  budget: TurnBudget,
+  stage: string,
+  remainingQueue: readonly string[],
+  now = Date.now(),
+): number | undefined {
+  const current = budget.stage_ms[stage];
+  if (current === undefined) return undefined;
+  if (remainingQueue.some((queued) => queued !== "synthesizer")) return current;
+  const available = Math.max(0, budget.remainingMs(now) - budget.finalization_reserve_ms);
+  if (available > current) budget.stage_ms[stage] = available;
+  return budget.stage_ms[stage];
+}
+
 const BUDGETS: Record<TurnRequirement, Omit<TurnBudget, "requirement" | "complexity" | "startedAt" | "deadlineAt" | "remainingMs" | "stageRemainingMs" | "stageUsedMs" | "canStart" | "extendStageOnProgress" | "beginStage" | "endStage" | "stageStreamDeadlineAt" | "finalStreamDeadlineAt">> = {
   conversational: { turn_ms: 30_000, finalization_reserve_ms: 15_000, max_stage_attempts: 2, stage_ms: { coordinator: 15_000 } },
   answer_only: { turn_ms: 45_000, finalization_reserve_ms: 20_000, max_stage_attempts: 2, stage_ms: { coordinator: 15_000, planner: 15_000 } },

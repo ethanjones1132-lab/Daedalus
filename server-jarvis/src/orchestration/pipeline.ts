@@ -136,6 +136,7 @@ import {
   type LoopIntervention,
   type MidLoopSignal,
 } from "./mid-loop-intervention";
+import { scaleLastQueuedStageBudget } from "./turn-budget";
 import type { JarvisConfig } from "../config";
 
 /**
@@ -3733,6 +3734,9 @@ export class PipelineExecutor {
     try {
       while (!rewriterDone && rewriterTurn < maxRewriterTurns) {
         rewriterTurn++;
+        if (rewriterTurn === 1 && options.turnBudget) {
+          scaleLastQueuedStageBudget(options.turnBudget, "rewriter", remainingQueue);
+        }
         const rewStartTime = Date.now();
         const turnStartIdx = toolCalls.length;
         let rewriteResp: any;

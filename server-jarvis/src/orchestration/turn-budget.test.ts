@@ -9,6 +9,7 @@ import {
   FORCED_DEEP_READ_EXECUTOR_MS,
   FORCED_DEEP_READ_TURN_MS,
   requestTimeoutMessage,
+  scaleLastQueuedStageBudget,
 } from "./turn-budget";
 import { AgentPool, firstTokenTimeoutFor } from "./agent-pool";
 import { resolveTurnRequirement } from "./turn-requirements";
@@ -143,6 +144,23 @@ describe("turn budgets", () => {
     expect(budget.stage_ms.executor).toBe(80_000); // 60k + 1*20k = 80k
     budget.extendStageOnProgress("executor", 3);
     expect(budget.stage_ms.executor).toBe(90_000); // 80k + 3*20k = 140k, clamped to 90k ceiling
+  });
+
+  test("last queued rewriter scales into unused turn budget while preserving synthesis reserve", () => {
+    const budget = createTurnBudget("full_execution", "medium", 0);
+
+    scaleLastQueuedStageBudget(budget, "rewriter", ["synthesizer"], 30_000);
+
+    expect(budget.stage_ms.rewriter).toBe(90_000);
+    expect(budget.stageRemainingMs("rewriter", 30_000)).toBe(90_000);
+  });
+
+  test("rewriter stays capped when another model stage remains queued", () => {
+    const budget = createTurnBudget("full_execution", "medium", 0);
+
+    scaleLastQueuedStageBudget(budget, "rewriter", ["reviewer", "synthesizer"], 30_000);
+
+    expect(budget.stage_ms.rewriter).toBe(60_000);
   });
 
   test("extension also relaxes the turn deadline but never past the absolute cap", () => {
