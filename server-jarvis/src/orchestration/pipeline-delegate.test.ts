@@ -1112,6 +1112,7 @@ describe("executor delegate pipeline integration", () => {
     expect(attributions[0]).toMatchObject({
       provider: "claude_cli",
       model_id: "sonnet",
+      stage_id: "executor",
       was_successful: 1,
       had_error: 0,
     });

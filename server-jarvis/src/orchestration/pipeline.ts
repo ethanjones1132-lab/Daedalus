@@ -2454,7 +2454,7 @@ export class PipelineExecutor {
       this.collector.recordModelAttribution?.({
         id: `attr_${crypto.randomUUID()}`,
         agent_run_id: agentRunId,
-        stage_id: stageId,
+        stage_id: "executor",
         agent_id: "claude_delegate",
         provider: "claude_cli",
         model_id: modelSelection.model
