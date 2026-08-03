@@ -40,7 +40,9 @@ export function locateEditMatch(content: string, oldStr: string): EditMatch {
   while (needleLines.length && needleLines[needleLines.length - 1].trim() === "") needleLines.pop();
   if (needleLines.length === 0) return { kind: "not_found" };
 
-  const needle = needleLines.map((line) => line.trim());
+  const needle = needleLines.map((line) =>
+    line.replace(/^\s*\d+\s*(?:\||\t)\s?/, "").trim(),
+  );
   const windows: number[] = [];
   for (let i = 0; i + needle.length <= contentLines.length; i++) {
     let matches = true;

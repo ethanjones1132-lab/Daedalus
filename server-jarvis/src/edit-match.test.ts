@@ -54,6 +54,16 @@ describe("locateEditMatch", () => {
       .toBe("if x:\n    raise ValueError('x')\n");
   });
 
+  test("tolerates Claude Code line-number gutters in the needle", () => {
+    const content = "# Perihelion VST3\nvoid prepareToPlay() {\n  reset();\n}\n";
+    const oldStr = "1\t# Perihelion VST3\n2\tvoid prepareToPlay() {";
+    const match = locateEditMatch(content, oldStr);
+
+    expect(match).toMatchObject({ kind: "match", tolerant: true });
+    expect(roundTrip(content, oldStr, "# Perihelion VST3\nvoid prepareToPlay() {"))
+      .toBe(content);
+  });
+
   test("tolerant match stays unique — two trimmed-equal lines are ambiguous", () => {
     const content = "if a:\n        return x\nif b:\n    return x\n";
     // both "return x" lines differ in indent, so exact fails; trimmed they tie
