@@ -182,6 +182,92 @@ describe("DSML / bare text-tool dialects (W3.2)", () => {
     expect(parsed.calls).toHaveLength(1);
     expect(parsed.cleanedText).toBe("I'll read the plan.");
   });
+
+  test("unclosed bare block caps at last closed param and keeps trailing prose", () => {
+    // No </read_file> — candidate must not extend to EOF and erase prose.
+    const text =
+      `<read_file><path>docs/plan.md</path>\n` +
+      `Here is the summary after the tool markup.`;
+    const parsed = extractTextToolCalls(text, tools);
+    expect(parsed.calls).toHaveLength(1);
+    expect(parsed.calls[0].name).toBe("read_file");
+    expect(parsed.calls[0].arguments).toEqual({ path: "docs/plan.md" });
+    expect(parsed.cleanedText).toContain("Here is the summary after the tool markup.");
+    expect(parsed.cleanedText).not.toContain("<read_file>");
+    expect(parsed.cleanedText).not.toContain("<path>");
+  });
+
+  test("unclosed degraded DSML caps at last closed param and keeps trailing prose", () => {
+    const text =
+      `<${FW}DSML${FW}:read_file>` +
+      `<${FW}DSML${FW}:path>notes.md</${FW}DSML${FW}:path>\n` +
+      `Trailing prose must survive cleanup.`;
+    const parsed = extractTextToolCalls(text, tools);
+    expect(parsed.calls).toHaveLength(1);
+    expect(parsed.calls[0].arguments).toEqual({ path: "notes.md" });
+    expect(parsed.cleanedText).toContain("Trailing prose must survive cleanup.");
+  });
+
+  test("bare/degraded with zero closed params is rejected (no EOF span)", () => {
+    const bareOpenOnly = `<read_file><path>docs/plan.md\nProse after unclosed param.`;
+    const bareParsed = extractTextToolCalls(bareOpenOnly, tools);
+    expect(bareParsed.calls).toHaveLength(0);
+    expect(bareParsed.cleanedText).toContain("Prose after unclosed param.");
+
+    const degradedOpenOnly =
+      `<${FW}DSML${FW}:read_file><${FW}DSML${FW}:path>docs/plan.md\nMore prose.`;
+    const degradedParsed = extractTextToolCalls(degradedOpenOnly, tools);
+    expect(degradedParsed.calls).toHaveLength(0);
+    expect(degradedParsed.cleanedText).toContain("More prose.");
+  });
+
+  test("non-aliased offered tool is recognized in bare and degraded DSML", () => {
+    // apply_patch is not in TOOL_ALIASES; recognition must union availableNames.
+    const applyPatchTool: ToolDefinition = {
+      type: "function",
+      function: {
+        name: "apply_patch",
+        description: "Apply a patch",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Path" },
+            patch: { type: "string", description: "Patch body" },
+          },
+          required: ["path", "patch"],
+        },
+      },
+      requires_approval: false,
+      dangerous: false,
+    };
+    const offered = [...tools, applyPatchTool];
+
+    const bare =
+      `<apply_patch><path>src/a.ts</path><patch>--- a\n+++ b</patch></apply_patch>`;
+    const bareParsed = extractTextToolCalls(bare, offered);
+    expect(bareParsed.calls).toHaveLength(1);
+    expect(bareParsed.calls[0].name).toBe("apply_patch");
+    expect(bareParsed.calls[0].arguments).toEqual({
+      path: "src/a.ts",
+      patch: "--- a\n+++ b",
+    });
+
+    const degraded =
+      `<${FW}DSML${FW}:apply_patch>` +
+      `<${FW}DSML${FW}:path>src/b.ts</${FW}DSML${FW}:path>` +
+      `<${FW}DSML${FW}:patch>diff</${FW}DSML${FW}:patch>`;
+    const degradedParsed = extractTextToolCalls(degraded, offered);
+    expect(degradedParsed.calls).toHaveLength(1);
+    expect(degradedParsed.calls[0].name).toBe("apply_patch");
+    expect(degradedParsed.calls[0].arguments).toEqual({
+      path: "src/b.ts",
+      patch: "diff",
+    });
+
+    // Without offering apply_patch, bare markup must not produce a call.
+    const notOffered = extractTextToolCalls(bare, tools);
+    expect(notOffered.calls).toHaveLength(0);
+  });
 });
 
 describe("resolveToolCallsFromTurn (W3.1)", () => {

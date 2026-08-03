@@ -361,7 +361,7 @@ export function extractTextToolCalls(text: string, tools: ToolDefinition[]): {
   // Fullwidth ｜ (U+FF5C) is a single UTF-16 unit, same as ASCII | — indices stay aligned.
   const normalizedText = normalizeDsmlDelimiters(text);
   const boundedInternalCleaned = stripBoundedInternalToolResults(normalizedText);
-  const candidates = collectCandidates(boundedInternalCleaned);
+  const candidates = collectCandidates(boundedInternalCleaned, availableNames);
   const calls: ParsedTextToolCall[] = [];
   const seen = new Set<string>();
 
@@ -633,7 +633,7 @@ export function textToolResultsPrompt(results: ToolResult[]): string {
   ].join("\n\n");
 }
 
-function collectCandidates(text: string): Candidate[] {
+function collectCandidates(text: string, availableNames: Set<string> = new Set()): Candidate[] {
   const candidates: Candidate[] = [];
   const addCandidate = (raw: string, start: number, end: number) => {
     const value = parseJsonLike(raw);
@@ -655,17 +655,25 @@ function collectCandidates(text: string): Candidate[] {
 
   // DSML / bare XML dialects (DeepSeek-style and degraded variants). Text is
   // already fullwidth-pipe-normalized by extractTextToolCalls.
-  candidates.push(...collectDsmlCandidates(text));
+  candidates.push(...collectDsmlCandidates(text, availableNames));
 
   return dedupeCandidates(candidates);
 }
 
-/** Known tool names (aliases + canonical) for bare-XML open tags. */
-function knownToolNameSet(): Set<string> {
+/**
+ * Known tool names for bare/degraded open tags: TOOL_ALIASES union offered tools.
+ * Offered names matter for tools like apply_patch / git_metadata that are not aliased.
+ */
+function knownToolNameSet(availableNames?: Set<string>): Set<string> {
   const names = new Set<string>();
   for (const [alias, target] of Object.entries(TOOL_ALIASES)) {
     names.add(alias.toLowerCase());
     names.add(target.toLowerCase());
+  }
+  if (availableNames) {
+    for (const name of availableNames) {
+      if (name) names.add(name.toLowerCase());
+    }
   }
   return names;
 }
@@ -675,11 +683,43 @@ function escapeRegExp(value: string): string {
 }
 
 /**
+ * Offset (relative to `body`) just past the last properly closed parameter tag.
+ * Returns -1 when no closed params exist — callers must reject such candidates
+ * so unclosed bare/degraded blocks cannot extend to EOF and erase trailing prose.
+ */
+function lastClosedParamEnd(body: string): number {
+  let lastEnd = -1;
+
+  for (const match of body.matchAll(/<\/\|DSML\|parameter>/gi)) {
+    lastEnd = Math.max(lastEnd, (match.index ?? 0) + match[0].length);
+  }
+  for (const match of body.matchAll(/<\/\|DSML\|:[a-zA-Z_][\w]*>/g)) {
+    lastEnd = Math.max(lastEnd, (match.index ?? 0) + match[0].length);
+  }
+  for (const match of body.matchAll(/<\/([a-zA-Z_][\w]*)>/g)) {
+    // Skip tool-level closes; those are handled separately by callers.
+    // Parameter closes look the same syntactically — callers pass only the
+    // interior body (before a tool close) or accept any close as a bound.
+    lastEnd = Math.max(lastEnd, (match.index ?? 0) + match[0].length);
+  }
+
+  return lastEnd;
+}
+
+/**
  * Parse parameter bodies from DSML full form, degraded form, or bare XML.
+ * Only properly closed parameters are accepted (no `$`/EOF swallowing of prose).
  * Expects fullwidth pipes already normalized to ASCII |.
  */
-function parseTaggedParameters(body: string): Record<string, unknown> {
+function parseTaggedParameters(
+  body: string,
+  knownTools: Set<string> = knownToolNameSet(),
+): Record<string, unknown> {
   const args: Record<string, unknown> = {};
+  const isToolName = (key: string) => {
+    const keyLower = key.toLowerCase();
+    return knownTools.has(keyLower) || knownTools.has(TOOL_ALIASES[keyLower] ?? "");
+  };
 
   for (const match of body.matchAll(
     /<\|DSML\|parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/\|DSML\|parameter>/gi,
@@ -688,22 +728,16 @@ function parseTaggedParameters(body: string): Record<string, unknown> {
   }
 
   for (const match of body.matchAll(
-    /<\|DSML\|:([a-zA-Z_][\w]*)>([\s\S]*?)(?:<\/\|DSML\|:\1>|(?=<\|DSML\|:)|(?=<\/\|DSML\|)|$)/gi,
+    /<\|DSML\|:([a-zA-Z_][\w]*)>([\s\S]*?)<\/\|DSML\|:\1>/gi,
   )) {
     const key = match[1];
-    // Skip if this identifier is itself a tool name (degraded tool open tag nested).
-    const keyLower = key.toLowerCase();
-    if (knownToolNameSet().has(keyLower) || knownToolNameSet().has(TOOL_ALIASES[keyLower] ?? "")) {
-      continue;
-    }
+    if (isToolName(key)) continue;
     if (args[key] === undefined) args[key] = match[2];
   }
 
   for (const match of body.matchAll(/<([a-zA-Z_][\w]*)>([\s\S]*?)<\/\1>/gi)) {
     const key = match[1];
-    const keyLower = key.toLowerCase();
-    // Do not treat nested tool opens as parameters.
-    if (knownToolNameSet().has(keyLower)) continue;
+    if (isToolName(key)) continue;
     if (args[key] === undefined) args[key] = match[2];
   }
 
@@ -713,10 +747,13 @@ function parseTaggedParameters(body: string): Record<string, unknown> {
 /**
  * Collect DSML full/degraded and bare XML tool-call candidates.
  * Input must already have U+FF5C normalized to ASCII |.
+ * `availableNames` is unioned with TOOL_ALIASES so non-aliased offered tools
+ * (apply_patch, git_metadata, …) are recognized in bare/degraded form.
  */
-function collectDsmlCandidates(text: string): Candidate[] {
+function collectDsmlCandidates(text: string, availableNames: Set<string> = new Set()): Candidate[] {
   const candidates: Candidate[] = [];
   const occupied: TextSpan[] = [];
+  const known = knownToolNameSet(availableNames);
   const overlaps = (start: number, end: number) =>
     occupied.some((span) => start < span.end && end > span.start);
   const add = (start: number, end: number, value: { name: string; arguments: Record<string, unknown> }) => {
@@ -725,7 +762,7 @@ function collectDsmlCandidates(text: string): Candidate[] {
     candidates.push({ raw: text.slice(start, end), start, end, value });
   };
 
-  // 1) Full DSML invoke blocks
+  // 1) Full DSML invoke blocks (require matching close — already bounded)
   for (const match of text.matchAll(
     /<\|DSML\|invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/\|DSML\|invoke>/gi,
   )) {
@@ -733,64 +770,93 @@ function collectDsmlCandidates(text: string): Candidate[] {
     const end = start + match[0].length;
     add(start, end, {
       name: match[1],
-      arguments: parseTaggedParameters(match[2]),
+      arguments: parseTaggedParameters(match[2], known),
     });
   }
 
-  // 2) Degraded: <|DSML|:tool_name> then <|DSML|:arg>… params until next tool or end
-  const known = knownToolNameSet();
+  // 2) Degraded: <|DSML|:tool_name> then closed <|DSML|:arg>… params
+  // Cap at last closed param — never extend to EOF / trailing prose.
   const degradedOpen = /<\|DSML\|:([a-zA-Z_][\w]*)>/gi;
-  const opens: Array<{ name: string; nameStart: number; bodyStart: number }> = [];
+  const degradedOpens: Array<{ name: string; nameStart: number; bodyStart: number }> = [];
   for (const match of text.matchAll(degradedOpen)) {
     const name = match[1];
     const nameLower = name.toLowerCase();
-    const isTool = known.has(nameLower) || known.has(TOOL_ALIASES[nameLower] ?? "");
-    if (!isTool) continue;
+    if (!known.has(nameLower) && !known.has(TOOL_ALIASES[nameLower] ?? "")) continue;
     const nameStart = match.index ?? 0;
-    opens.push({ name, nameStart, bodyStart: nameStart + match[0].length });
+    degradedOpens.push({ name, nameStart, bodyStart: nameStart + match[0].length });
   }
-  for (let i = 0; i < opens.length; i++) {
-    const current = opens[i];
-    const nextStart = i + 1 < opens.length ? opens[i + 1].nameStart : text.length;
-    // Extend through trailing param close tags that sit before the next tool.
-    let end = nextStart;
+  for (let i = 0; i < degradedOpens.length; i++) {
+    const current = degradedOpens[i];
+    const nextStart = i + 1 < degradedOpens.length ? degradedOpens[i + 1].nameStart : text.length;
     const body = text.slice(current.bodyStart, nextStart);
-    // Prefer to end after the last parameter region inside body.
-    const lastParamClose = Math.max(
-      body.lastIndexOf("</|DSML|:"),
-      body.lastIndexOf("</|DSML|"),
-    );
-    if (lastParamClose >= 0) {
-      const closeEnd = body.indexOf(">", lastParamClose);
-      if (closeEnd >= 0) end = current.bodyStart + closeEnd + 1;
-    }
+    const closedEnd = lastClosedParamEnd(body);
+    // Reject candidates with zero closed params (unclosed would otherwise span to EOF).
+    if (closedEnd < 0) continue;
+    let end = current.bodyStart + closedEnd;
+    // Optional trailing mixed DSML close immediately after last param.
+    const after = text.slice(end, nextStart);
+    const trailingClose = after.match(/^\s*<\/\|DSML\|[^>]*>/);
+    if (trailingClose) end += trailingClose[0].length;
     const argsBody = text.slice(current.bodyStart, end);
     add(current.nameStart, end, {
       name: current.name,
-      arguments: parseTaggedParameters(argsBody),
+      arguments: parseTaggedParameters(argsBody, known),
     });
   }
 
-  // 3) Bare XML: <read_file><path>…</path></read_file> (known tools only)
+  // 3) Bare XML: <read_file><path>…</path></read_file> (aliases ∪ offered tools)
   //    Also mixed close: <read_file><path>…</path></|DSML|tool>
-  const toolNames = [...new Set([...Object.keys(TOOL_ALIASES), ...Object.values(TOOL_ALIASES)])]
+  // Cap at last closed param / tool close — never `$`/EOF.
+  const toolNames = [
+    ...new Set([
+      ...Object.keys(TOOL_ALIASES),
+      ...Object.values(TOOL_ALIASES),
+      ...availableNames,
+    ]),
+  ]
     .filter((n) => /^[a-zA-Z_][\w]*$/.test(n))
     .sort((a, b) => b.length - a.length);
+
   if (toolNames.length > 0) {
     const alt = toolNames.map(escapeRegExp).join("|");
-    const bareRe = new RegExp(
-      `<(${alt})>([\\s\\S]*?)(?:</\\1>|</\\|DSML\\|[^>]*>|(?=<\\|DSML\\|)|(?=<(?:${alt})>)|$)`,
-      "gi",
-    );
-    for (const match of text.matchAll(bareRe)) {
-      const start = match.index ?? 0;
-      const end = start + match[0].length;
-      // Require at least one parameter-looking child to avoid prose false positives.
-      const body = match[2] ?? "";
-      if (!/<[a-zA-Z_][\w]*>/.test(body) && !/<\|DSML\|:/.test(body)) continue;
-      add(start, end, {
+    const bareOpenRe = new RegExp(`<(${alt})>`, "gi");
+    const bareOpens: Array<{ name: string; nameStart: number; bodyStart: number }> = [];
+    for (const match of text.matchAll(bareOpenRe)) {
+      const nameStart = match.index ?? 0;
+      bareOpens.push({
         name: match[1],
-        arguments: parseTaggedParameters(body),
+        nameStart,
+        bodyStart: nameStart + match[0].length,
+      });
+    }
+    for (let i = 0; i < bareOpens.length; i++) {
+      const current = bareOpens[i];
+      if (overlaps(current.nameStart, current.bodyStart)) continue;
+      const nextStart = i + 1 < bareOpens.length ? bareOpens[i + 1].nameStart : text.length;
+      const body = text.slice(current.bodyStart, nextStart);
+      // Require at least one closed parameter child.
+      const closedEnd = lastClosedParamEnd(body);
+      if (closedEnd < 0) continue;
+      // Prefer a matching tool close after params when present.
+      const toolCloseRe = new RegExp(`</${escapeRegExp(current.name)}>`, "i");
+      const toolCloseMatch = body.match(toolCloseRe);
+      let end: number;
+      if (toolCloseMatch && toolCloseMatch.index !== undefined) {
+        end = current.bodyStart + toolCloseMatch.index + toolCloseMatch[0].length;
+      } else {
+        end = current.bodyStart + closedEnd;
+        const after = text.slice(end, nextStart);
+        const mixedClose = after.match(/^\s*<\/\|DSML\|[^>]*>/);
+        if (mixedClose) end += mixedClose[0].length;
+      }
+      const argsBody = text.slice(current.bodyStart, end);
+      // Still require a param-looking child (not just a tool self-close).
+      if (!/<[a-zA-Z_][\w]*>/.test(argsBody) && !/<\|DSML\|:/.test(argsBody) && !/<\|DSML\|parameter\b/i.test(argsBody)) {
+        continue;
+      }
+      add(current.nameStart, end, {
+        name: current.name,
+        arguments: parseTaggedParameters(argsBody, known),
       });
     }
   }
