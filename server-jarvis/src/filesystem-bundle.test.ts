@@ -483,6 +483,18 @@ describe("FilesystemBundle > grep + glob + list_directory", () => {
     expect(result.output).not.toContain("beta.txt");
   });
 
+  test("globstar matches files at the search root as well as nested files", async () => {
+    const ws = makeTempWorkspace();
+    mkdirSync(join(ws, "src"));
+    writeFileSync(join(ws, "root.ts"), "");
+    writeFileSync(join(ws, "src", "nested.ts"), "");
+
+    const result = await makeRuntime().execute(call("glob", { pattern: "**/*.ts", path: ws }), makeCtx(ws));
+
+    expect(result.output).toContain("root.ts");
+    expect(result.output).toContain(join("src", "nested.ts"));
+  });
+
   test("list_directory lists entries with the count header", async () => {
     const ws = makeTempWorkspace();
     writeFileSync(join(ws, "a.txt"), "");

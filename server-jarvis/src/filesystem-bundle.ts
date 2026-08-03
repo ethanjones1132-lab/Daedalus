@@ -437,9 +437,11 @@ function shouldMatch(filepath: string, pattern: string): boolean {
   // Simple glob matching
   const regexPattern = pattern
     .replace(/\./g, "\\.")
+    .replace(/\*\*\//g, "___GLOBSTAR_DIR___")
     .replace(/\*\*/g, "___GLOBSTAR___")
     .replace(/\*/g, "[^/]*")
     .replace(/\?/g, ".")
+    .replace(/___GLOBSTAR_DIR___/g, "(?:.*/)?")
     .replace(/___GLOBSTAR___/g, ".*");
   return new RegExp(`^${regexPattern}$`).test(filepath);
 }
