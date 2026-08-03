@@ -12,6 +12,11 @@
 //   - zero false-complete runs (success that declares incomplete progress)
 //   - zero duplicate write-pressure runs (write-effect note injected >1×)
 //
+// Delegate identity (W2.1): primary signal is model_attributions.provider
+// === "claude_cli"; legacy delegate_cleanup is a fallback. Verified writes
+// must land on the *delegate stage row* — a later native-fallback executor
+// write does not count (no same-run write fallback).
+//
 // The CLI (`scripts/benchmark-conductor-completion.ts`) loads SQLite and
 // prints these metrics; unit tests feed hand-built fixtures.
 
@@ -160,8 +165,40 @@ function stageHasDelegateCleanup(stage: StageRun): boolean {
   return parseToolCalls(stage.tool_calls_json).some((c) => c.name === DELEGATE_MARKER_TOOL);
 }
 
+/** Pipeline persists { delegate_request_id, ... } on Claude-delegate stage rows. */
+function stageHasDelegateDiagnostic(stage: StageRun): boolean {
+  const raw = stage.diagnostic_json;
+  if (!raw) return false;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== "object") return false;
+    return typeof parsed.delegate_request_id === "string"
+      || Object.keys(parsed).some((k) => k.startsWith("delegate_"));
+  } catch {
+    return raw.includes("delegate_request_id");
+  }
+}
+
 function claudeCliAttributions(fixture: ConductorPerformanceFixture): ModelAttribution[] {
   return (fixture.modelAttributions ?? []).filter((a) => a.provider === DELEGATE_PROVIDER);
+}
+
+/**
+ * Earliest executor stage by turn_number (then created_at). Used as the
+ * attribution-only delegate-stage proxy when cleanup/diagnostic markers are
+ * absent (good-era minimax rows).
+ */
+function firstExecutorStage(stages: readonly StageRun[]): StageRun | undefined {
+  const executors = stages.filter((s) => s.mode_id === "executor");
+  if (executors.length === 0) return undefined;
+  return [...executors].sort((a, b) => {
+    if (a.turn_number !== b.turn_number) return a.turn_number - b.turn_number;
+    const ac = a.created_at ?? "";
+    const bc = b.created_at ?? "";
+    if (ac < bc) return -1;
+    if (ac > bc) return 1;
+    return 0;
+  })[0];
 }
 
 function runHasWriteIntent(fixture: ConductorPerformanceFixture): boolean {
@@ -181,36 +218,41 @@ function isDelegateRun(fixture: ConductorPerformanceFixture): boolean {
 }
 
 /**
- * A delegate fixture is "verified" when a successful write-effect tool appears
- * on the delegate path:
- *   1. Attribution-primary: write on a stage whose mode_id matches a
- *      claude_cli attribution's stage_id (preferred linkage).
- *   2. Attribution same-run fallback: any successful write in the run when a
- *      claude_cli attribution exists but stage linkage is messy.
- *   3. Cleanup fallback: successful write in the same stage row as
- *      `delegate_cleanup` (legacy marker; also counts when no attributions).
+ * A delegate fixture is "verified" only when a successful write-effect tool
+ * lands on the *delegate stage row* — never a later native-fallback write.
+ *
+ * Identification of that row (in order):
+ *   1. Any stage with `delegate_cleanup` → write must be in that same row.
+ *   2. Else, attributed stages (`mode_id` ∈ claude_cli attribution stage_ids)
+ *      with diagnostic_json marking the Claude delegate → write in that row.
+ *   3. Else (attribution-only / good-era): the first executor stage
+ *      (min turn_number) among stages whose mode_id is attributed — write
+ *      must be there. Later executor stages are treated as native fallback.
+ *
+ * There is intentionally no "any write in the run" fallback.
  */
 function isDelegateVerifiedWrite(fixture: ConductorPerformanceFixture): boolean {
-  const attrs = claudeCliAttributions(fixture);
-  if (attrs.length > 0) {
-    const attributedStageIds = new Set(attrs.map((a) => a.stage_id));
-    // Prefer stage-linked: mode_id matches attribution stage_id (e.g. "executor").
-    if (
-      fixture.stageRuns.some(
-        (s) => attributedStageIds.has(s.mode_id) && stageHasSuccessfulWrite(s),
-      )
-    ) {
-      return true;
-    }
-    // Same-run fallback when stage_id/mode_id do not align.
-    if (fixture.stageRuns.some(stageHasSuccessfulWrite)) return true;
+  // (1) Cleanup marker: same-row write only.
+  for (const stage of fixture.stageRuns) {
+    if (stageHasDelegateCleanup(stage) && stageHasSuccessfulWrite(stage)) return true;
   }
 
-  // Legacy cleanup marker: write in the same stage row as the marker.
-  for (const stage of fixture.stageRuns) {
-    if (!stageHasDelegateCleanup(stage)) continue;
-    if (stageHasSuccessfulWrite(stage)) return true;
+  const attrs = claudeCliAttributions(fixture);
+  if (attrs.length === 0) return false;
+
+  const attributedStageIds = new Set(attrs.map((a) => a.stage_id));
+  const attributedStages = fixture.stageRuns.filter((s) => attributedStageIds.has(s.mode_id));
+
+  // (2) Diagnostic-marked delegate stage rows.
+  for (const stage of attributedStages) {
+    if (stageHasDelegateDiagnostic(stage) && stageHasSuccessfulWrite(stage)) return true;
   }
+
+  // (3) Attribution-only: only the first executor stage can be the delegate.
+  // Later executor stages are assumed native fallback and must not credit.
+  const first = firstExecutorStage(attributedStages);
+  if (first && stageHasSuccessfulWrite(first)) return true;
+
   return false;
 }
 

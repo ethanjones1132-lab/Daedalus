@@ -27,10 +27,14 @@ the release gates in `server-jarvis/src/eval/conductor-performance.ts`.
 
 4. **Delegate success requires delegate-row write evidence and ground-truth metadata.**
    A successful delegate write is proven by a successful write-effect tool
-   (`write_file` / `edit_file` / `multi_edit` / `apply_patch`) in the **same**
-   stage row as `delegate_cleanup`, plus successful ground-truth metadata
-   (e.g. `git_metadata`) when the path requires it. A later native fallback
-   write does not clear a failed delegate row
+   (`write_file` / `edit_file` / `multi_edit` / `apply_patch`) on the **delegate
+   stage row**, plus successful ground-truth metadata (e.g. `git_metadata`)
+   when the path requires it. Runtime rows may mark that stage via
+   `delegate_cleanup` and/or `diagnostic_json.delegate_request_id`. The
+   release-gate metric (`conductor-performance`) identifies delegate fixtures
+   primarily by `model_attributions.provider = "claude_cli"` and only counts
+   writes on that delegate stage (first attributed executor when markers are
+   absent) — a later native-fallback write does not credit the delegate
    (`delegate_failed_before_fallback` in replay).
 
 5. **Partial keeps the TaskRun resumable.**

@@ -384,4 +384,97 @@ describe("summarizeConductorPerformance", () => {
     expect(summary.delegateVerifiedWrites).toBe(0);
     expect(summary.delegateVerifiedWriteRate).toBe(0);
   });
+
+  test("native fallback write after failed delegate stage does not count as verified", () => {
+    // Delegate launched (claude_cli attr) but wrote nothing; later native
+    // executor stage wrote. Must not credit the native write to the delegate.
+    const fixtures: ConductorPerformanceFixture[] = [
+      {
+        agentRunId: "run_native_fallback_after_delegate",
+        outcome: "success",
+        checkTier: "builtin",
+        verifiedVia: "runtime_check",
+        finalOutput: "Native fallback applied the write.",
+        stageRuns: [
+          stage({
+            id: "stage_delegate_first",
+            agent_run_id: "run_native_fallback_after_delegate",
+            mode_id: "executor",
+            turn_number: 1,
+            was_successful: 0,
+            had_error: 1,
+            tool_calls_json: JSON.stringify([{ name: "read_file", arguments: {} }]),
+            diagnostic_json: JSON.stringify({
+              delegate_request_id: "req_delegate_1",
+              exit_code: 1,
+            }),
+          }),
+          stage({
+            id: "stage_native_second",
+            agent_run_id: "run_native_fallback_after_delegate",
+            mode_id: "executor",
+            turn_number: 2,
+            was_successful: 1,
+            had_error: 0,
+            tool_calls_json: JSON.stringify([
+              { name: "write_file", arguments: { path: "native-fallback.txt" } },
+            ]),
+          }),
+        ],
+        directives: [],
+        modelAttributions: [
+          claudeCliAttribution("run_native_fallback_after_delegate", {
+            was_successful: 0,
+            had_error: 1,
+            fallback_used: 1,
+          }),
+        ],
+      },
+    ];
+    const summary = summarizeConductorPerformance(fixtures);
+    expect(summary.delegateRuns).toBe(1);
+    expect(summary.delegateVerifiedWrites).toBe(0);
+    expect(summary.delegateVerifiedWriteRate).toBe(0);
+  });
+
+  test("diagnostic-marked delegate stage with write counts even if not first executor", () => {
+    // Unusual ordering: a non-first executor row carries the delegate diagnostic
+    // and the write — still the delegate stage, not native fallback.
+    const fixtures: ConductorPerformanceFixture[] = [
+      {
+        agentRunId: "run_diagnostic_delegate_write",
+        outcome: "success",
+        checkTier: "builtin",
+        verifiedVia: "runtime_check",
+        finalOutput: "Delegate wrote on diagnostic-marked row.",
+        stageRuns: [
+          stage({
+            id: "stage_early_read",
+            agent_run_id: "run_diagnostic_delegate_write",
+            mode_id: "executor",
+            turn_number: 1,
+            tool_calls_json: JSON.stringify([{ name: "read_file", arguments: {} }]),
+          }),
+          stage({
+            id: "stage_delegate_write",
+            agent_run_id: "run_diagnostic_delegate_write",
+            mode_id: "executor",
+            turn_number: 2,
+            tool_calls_json: JSON.stringify([
+              { name: "write_file", arguments: { path: "delegated.txt" } },
+            ]),
+            diagnostic_json: JSON.stringify({
+              delegate_request_id: "req_delegate_2",
+              exit_code: 0,
+            }),
+          }),
+        ],
+        directives: [],
+        modelAttributions: [claudeCliAttribution("run_diagnostic_delegate_write")],
+      },
+    ];
+    const summary = summarizeConductorPerformance(fixtures);
+    expect(summary.delegateRuns).toBe(1);
+    expect(summary.delegateVerifiedWrites).toBe(1);
+  });
 });
