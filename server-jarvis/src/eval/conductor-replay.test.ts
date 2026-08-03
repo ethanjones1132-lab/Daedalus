@@ -455,6 +455,95 @@ describe("conductor replay — success verification invariants", () => {
   });
 });
 
+describe("conductor replay — delegate benched model selected (W1.4)", () => {
+  // Selector pins (W1.4.1) live in delegate-model-select.test.ts. This invariant
+  // is the offline half: a stored claude_cli attribution to a benched or
+  // tool-incapable model must fail replay even without a live scoreboard.
+
+  function claudeAttr(modelId: string): import("../self-tuning/store").ModelAttribution {
+    return {
+      id: `attr_${Math.random().toString(36).slice(2)}`,
+      agent_run_id: "run_x",
+      stage_id: "executor",
+      agent_id: "claude_delegate",
+      provider: "claude_cli",
+      model_id: modelId,
+      was_successful: 0,
+      had_error: 1,
+      fallback_used: 0,
+    };
+  }
+
+  test("flags claude_cli attribution to a fixture-benched model", () => {
+    const run = replayRun({
+      stageRuns: [
+        stage({
+          tool_calls_json: JSON.stringify([
+            { name: "delegate_cleanup", arguments: { status: "exited" } },
+          ]),
+        }),
+      ],
+      modelAttributions: [claudeAttr("cohere/north-mini-code:free")],
+      benchedModels: ["cohere/north-mini-code:free"],
+    });
+    const found = checkReplayInvariants(run).filter(
+      (v) => v.rule === "delegate_benched_model_selected",
+    );
+    expect(found).toHaveLength(1);
+    expect(found[0]?.severity).toBe("high");
+    expect(found[0]?.detail).toContain("cohere/north-mini-code:free");
+  });
+
+  test("flags claude_cli attribution to a known tool-incapable free model", () => {
+    const run = replayRun({
+      modelAttributions: [
+        claudeAttr("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"),
+      ],
+      // No benchedModels list — static DELEGATE_TOOL_INCAPABLE_MODELS alone.
+    });
+    const found = checkReplayInvariants(run).filter(
+      (v) => v.rule === "delegate_benched_model_selected",
+    );
+    expect(found).toHaveLength(1);
+    expect(found[0]?.detail).toContain("tool-incapable");
+  });
+
+  test("does not flag a healthy minimax-m3 attribution", () => {
+    const run = replayRun({
+      modelAttributions: [claudeAttr("minimax-m3")],
+      benchedModels: ["cohere/north-mini-code:free", "vendor/failing:free"],
+    });
+    expect(
+      checkReplayInvariants(run).filter((v) => v.rule === "delegate_benched_model_selected"),
+    ).toHaveLength(0);
+  });
+
+  test("ignores non-claude_cli attributions even when model is benched", () => {
+    const run = replayRun({
+      modelAttributions: [
+        {
+          ...claudeAttr("vendor/failing:free"),
+          provider: "openrouter",
+        },
+      ],
+      benchedModels: ["vendor/failing:free"],
+    });
+    expect(
+      checkReplayInvariants(run).filter((v) => v.rule === "delegate_benched_model_selected"),
+    ).toHaveLength(0);
+  });
+
+  test("does not flag when attributions are absent", () => {
+    const run = replayRun({
+      benchedModels: ["minimax-m3"],
+      stageRuns: [stage()],
+    });
+    expect(
+      checkReplayInvariants(run).filter((v) => v.rule === "delegate_benched_model_selected"),
+    ).toHaveLength(0);
+  });
+});
+
 describe("conductor replay — reporting", () => {
   test("a clean run yields no violations", () => {
     const run = replayRun({

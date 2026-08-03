@@ -2518,6 +2518,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             fullText: fullTurnText,
             tools: callOptions?.tools,
             useTextTools: Boolean(useTextTools),
+            // W3.3: per-model tool-format observation for later prompt selection.
+            modelId: poolModel ?? null,
           });
           let parsedToolCalls = resolvedTools.calls;
           let toolParseFlags = resolvedTools.toolParseFlags;

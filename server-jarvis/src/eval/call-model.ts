@@ -95,11 +95,15 @@ export function makeCallModel(cfg: JarvisConfig, stage: string): CallModelFn {
 
     // W3.1: same native-first + text-fallback policy as index.ts (including when
     // useTextTools is false and the model emitted DSML/bare markup in content).
+    // W3.3: pass stage model id when the pool can resolve one.
+    const pool = new AgentPool(cfg.orchestrator?.agents ?? []);
+    const stageAgent = pool.pickFor(stage, "general");
     const resolved = resolveToolCallsFromTurn({
       nativeCalls,
       fullText: content,
       tools,
       useTextTools,
+      modelId: stageAgent?.model_id ?? null,
     });
 
     const cleaned = resolved.textParseAttempted && tools.length > 0

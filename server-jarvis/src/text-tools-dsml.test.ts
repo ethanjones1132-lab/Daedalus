@@ -3,6 +3,11 @@
 
 import { describe, expect, test } from "bun:test";
 import { extractTextToolCalls, resolveToolCallsFromTurn } from "./text-tools";
+import {
+  __clearModelToolFormatsForTests,
+  __resetModelToolFormatsForTests,
+  getModelToolFormat,
+} from "./model-tool-format";
 import type { ToolDefinition } from "./tool-types";
 
 const FW = "\uFF5C"; // fullwidth vertical line ｜
@@ -374,5 +379,35 @@ describe("resolveToolCallsFromTurn (W3.1)", () => {
       _toolParseFailed: true,
     });
     expect(resolved.textParseAttempted).toBe(true);
+  });
+
+  // W3.3 — resolveToolCallsFromTurn updates per-model format when modelId is set
+  test("records dsml format when modelId is provided and DSML parse succeeds", () => {
+    __clearModelToolFormatsForTests();
+    const resolved = resolveToolCallsFromTurn({
+      nativeCalls: [],
+      fullText: dsmlText,
+      tools,
+      useTextTools: false,
+      modelId: "vendor/dsml-live",
+    });
+    expect(resolved.calls).toHaveLength(1);
+    expect(resolved.observedToolFormat).toBe("dsml");
+    expect(getModelToolFormat("vendor/dsml-live")).toBe("dsml");
+    __resetModelToolFormatsForTests();
+  });
+
+  test("records native format when native calls are present", () => {
+    __clearModelToolFormatsForTests();
+    const resolved = resolveToolCallsFromTurn({
+      nativeCalls: [nativeRead],
+      fullText: "",
+      tools,
+      useTextTools: false,
+      modelId: "vendor/native-live",
+    });
+    expect(resolved.observedToolFormat).toBe("native");
+    expect(getModelToolFormat("vendor/native-live")).toBe("native");
+    __resetModelToolFormatsForTests();
   });
 });

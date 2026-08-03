@@ -21,6 +21,7 @@
 // prints these metrics; unit tests feed hand-built fixtures.
 
 import type { ConductorDirectiveRow, ModelAttribution, StageRun } from "../self-tuning/store";
+import { isStatusOrLogDocPath, pathInTargetSet } from "../orchestration/effect-gate";
 
 /** One stored turn, assembled from the tables keyed by agent_run_id. */
 export interface ConductorPerformanceFixture {
@@ -42,6 +43,12 @@ export interface ConductorPerformanceFixture {
    * Optional so older hand fixtures / partial loaders still work via cleanup fallback.
    */
   modelAttributions?: ModelAttribution[];
+  /**
+   * Optional task-target paths (W2.2). When set, `taskTargetWrites` only
+   * counts successful writes whose path matches a target. When omitted,
+   * any successful write on a non-status/log path counts.
+   */
+  taskTargets?: readonly string[];
 }
 
 export interface ConductorPerformanceThresholds {
@@ -85,6 +92,16 @@ export interface ConductorPerformanceSummary {
    * fixtures (not null — keeps toMatchObject stable).
    */
   delegateVerifiedWriteRate: number;
+  /**
+   * W2.2 — average successful write-tool calls per run (total / runs).
+   * 0 when there are no runs.
+   */
+  writesLandedPerRun: number;
+  /**
+   * W2.2 — total successful write-tool calls on non-status paths (or on
+   * fixture taskTargets when provided). Absolute count across the window.
+   */
+  taskTargetWrites: number;
   unverifiedSuccesses: number;
   falseCompleteRuns: number;
   duplicateWritePressureRuns: number;
@@ -123,6 +140,7 @@ interface ParsedToolCall {
   name?: string;
   is_error?: boolean;
   output?: unknown;
+  arguments?: Record<string, unknown>;
 }
 
 function parseToolCalls(raw: string | undefined): ParsedToolCall[] {
@@ -277,6 +295,47 @@ function hasDuplicateWritePressure(fixture: ConductorPerformanceFixture): boolea
   return count > 1;
 }
 
+function writeToolPath(call: ParsedToolCall): string | undefined {
+  const args = call.arguments;
+  if (!args || typeof args !== "object") return undefined;
+  const raw = args.path ?? args.file_path;
+  return typeof raw === "string" && raw.trim() ? raw.trim() : undefined;
+}
+
+/**
+ * Count successful write-effect tool calls on a fixture.
+ * - `writesLanded`: every successful write tool (any path, including status docs).
+ * - `taskTargetWrites`: successful writes on non-status paths; when
+ *   `fixture.taskTargets` is non-empty, only paths matching those targets.
+ */
+function countWriteMetrics(fixture: ConductorPerformanceFixture): {
+  writesLanded: number;
+  taskTargetWrites: number;
+} {
+  let writesLanded = 0;
+  let taskTargetWrites = 0;
+  const targets = fixture.taskTargets ?? [];
+  const hasTargets = targets.length > 0;
+
+  for (const stage of fixture.stageRuns) {
+    for (const call of parseToolCalls(stage.tool_calls_json)) {
+      if (!call.name || !WRITE_EFFECT_TOOLS.has(call.name) || call.is_error === true) {
+        continue;
+      }
+      writesLanded += 1;
+      const path = writeToolPath(call);
+      if (path && isStatusOrLogDocPath(path)) continue;
+      if (hasTargets) {
+        if (path && pathInTargetSet(path, targets)) taskTargetWrites += 1;
+      } else {
+        // No target set: any non-status path (or unpathed write) counts.
+        taskTargetWrites += 1;
+      }
+    }
+  }
+  return { writesLanded, taskTargetWrites };
+}
+
 export function summarizeConductorPerformance(
   fixtures: readonly ConductorPerformanceFixture[],
   thresholds: ConductorPerformanceThresholds = RELEASE_THRESHOLDS,
@@ -285,6 +344,8 @@ export function summarizeConductorPerformance(
   let executorNoToolTurns = 0;
   let delegateRuns = 0;
   let delegateVerifiedWrites = 0;
+  let totalWritesLanded = 0;
+  let taskTargetWrites = 0;
   let unverifiedSuccesses = 0;
   let falseCompleteRuns = 0;
   let duplicateWritePressureRuns = 0;
@@ -301,14 +362,20 @@ export function summarizeConductorPerformance(
       if (isDelegateVerifiedWrite(fixture)) delegateVerifiedWrites += 1;
     }
 
+    const writes = countWriteMetrics(fixture);
+    totalWritesLanded += writes.writesLanded;
+    taskTargetWrites += writes.taskTargetWrites;
+
     if (isUnverifiedSuccess(fixture)) unverifiedSuccesses += 1;
     if (isFalseComplete(fixture)) falseCompleteRuns += 1;
     if (hasDuplicateWritePressure(fixture)) duplicateWritePressureRuns += 1;
   }
 
+  const runs = fixtures.length;
   const executorNoToolRatio = executorTurns === 0 ? 0 : executorNoToolTurns / executorTurns;
   const delegateVerifiedWriteRate =
     delegateRuns === 0 ? 0 : delegateVerifiedWrites / delegateRuns;
+  const writesLandedPerRun = runs === 0 ? 0 : totalWritesLanded / runs;
 
   let delegateGate: DelegateGate;
   if (delegateRuns === 0) {
@@ -339,13 +406,15 @@ export function summarizeConductorPerformance(
   }
 
   return {
-    runs: fixtures.length,
+    runs,
     executorTurns,
     executorNoToolTurns,
     executorNoToolRatio,
     delegateRuns,
     delegateVerifiedWrites,
     delegateVerifiedWriteRate,
+    writesLandedPerRun,
+    taskTargetWrites,
     unverifiedSuccesses,
     falseCompleteRuns,
     duplicateWritePressureRuns,

@@ -120,6 +120,7 @@ describe("selectDelegateModel (W1.1 scoreboard ranking)", () => {
     expect(s.reason).toBe("write_evidence");
   });
 
+  // W1.4.1 permanent pin — do not weaken or delete; pairs with W1.2 proxy-up pin.
   test("selector returns highest write-evidence available model (minimax-m3 vs free-pool fixture)", () => {
     __resetDelegateWriteScoreboardForTests();
     // Fixture: free looks cheap but has poor write evidence; minimax is proven.
@@ -263,6 +264,7 @@ describe("selectDelegateModel (W1.2 Anthropic Go while proxy up)", () => {
     __reseedDelegateWriteScoreboardForTests();
   });
 
+  // W1.4.1 permanent pin — proxy availability must never drop the Anthropic Go lane.
   test("proxy-up does not exclude Anthropic-native Go models from consideration", () => {
     const s = selectDelegateModel({
       configuredModel: "auto",

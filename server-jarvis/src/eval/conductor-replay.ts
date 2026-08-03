@@ -29,7 +29,8 @@
 // What this can do is assert properties that must hold on any healthy run,
 // and catch a regression the moment it appears in the trace record.
 
-import type { ConductorDirectiveRow, StageRun } from "../self-tuning/store";
+import type { ConductorDirectiveRow, ModelAttribution, StageRun } from "../self-tuning/store";
+import { DELEGATE_TOOL_INCAPABLE_MODELS } from "../orchestration/delegate-model-select";
 
 /** A single stored turn, assembled from the tables keyed by agent_run_id. */
 export interface ReplayRun {
@@ -45,6 +46,17 @@ export interface ReplayRun {
   checkTier?: string | null;
   stageRuns: StageRun[];
   directives: ConductorDirectiveRow[];
+  /**
+   * model_attributions for this run (optional). Used by
+   * `delegate_benched_model_selected` when provider === "claude_cli".
+   */
+  modelAttributions?: ModelAttribution[];
+  /**
+   * Fixture-supplied benched model ids (W1.4). Pure check — no live scoreboard
+   * required. When a claude_cli-attributed model appears here, the invariant
+   * fails so a benched free/Go pick cannot regress silently in replay.
+   */
+  benchedModels?: readonly string[];
 }
 
 export type ReplayRule =
@@ -56,7 +68,8 @@ export type ReplayRule =
   | "delegate_never_wrote"
   | "delegate_failed_before_fallback"
   | "success_without_runtime_check"
-  | "success_declares_incomplete";
+  | "success_declares_incomplete"
+  | "delegate_benched_model_selected";
 
 export interface ReplayViolation {
   rule: ReplayRule;
@@ -407,6 +420,46 @@ function checkSuccessDeclaresIncomplete(run: ReplayRun): ReplayViolation[] {
   }];
 }
 
+/**
+ * W1.4 — the delegate ran on a model that was benched (or known tool-incapable).
+ *
+ * Pure fixture check: fails when a `claude_cli` attribution points at a model
+ * in `run.benchedModels` or in `DELEGATE_TOOL_INCAPABLE_MODELS`. Live scoreboard
+ * is not required — pin the benched set on the fixture (or rely on the static
+ * incapable list) so regressions trip offline.
+ */
+function checkDelegateBenchedModelSelected(run: ReplayRun): ReplayViolation[] {
+  const attrs = (run.modelAttributions ?? []).filter((a) => a.provider === "claude_cli");
+  if (attrs.length === 0) return [];
+
+  const benched = new Set((run.benchedModels ?? []).map((m) => m.trim()).filter(Boolean));
+  const incapable = new Set(DELEGATE_TOOL_INCAPABLE_MODELS.map((m) => m.trim()));
+  const out: ReplayViolation[] = [];
+  const seen = new Set<string>();
+
+  for (const attr of attrs) {
+    const model = (attr.model_id ?? "").trim();
+    if (!model || seen.has(model)) continue;
+    const isBenched = benched.has(model);
+    const isIncapable = incapable.has(model);
+    if (!isBenched && !isIncapable) continue;
+    seen.add(model);
+    const reason = isIncapable
+      ? "known tool-incapable (DELEGATE_TOOL_INCAPABLE_MODELS)"
+      : "listed in fixture benchedModels";
+    out.push({
+      rule: "delegate_benched_model_selected",
+      agentRunId: run.agentRunId,
+      severity: "high",
+      count: 1,
+      detail:
+        `delegate attributed to benched/incapable model "${model}" (${reason})` +
+        " — selector must not land writes on a model below the write-evidence bench threshold",
+    });
+  }
+  return out;
+}
+
 /** Every invariant, evaluated against one stored run. Pure. */
 export function checkReplayInvariants(
   run: ReplayRun,
@@ -422,6 +475,7 @@ export function checkReplayInvariants(
     ...checkDelegateFailedBeforeFallback(run),
     ...checkSuccessWithoutRuntimeCheck(run),
     ...checkSuccessDeclaresIncomplete(run),
+    ...checkDelegateBenchedModelSelected(run),
   ];
 }
 

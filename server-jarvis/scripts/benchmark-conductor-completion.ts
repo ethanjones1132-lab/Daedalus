@@ -128,6 +128,14 @@ console.log(
   `  duplicate write-pressure:     ${summary.duplicateWritePressureRuns}` +
     `  [max ${RELEASE_THRESHOLDS.maxDuplicateWritePressureRuns}]`,
 );
+console.log(
+  `  writes landed per run:        ${summary.writesLandedPerRun.toFixed(2)}` +
+    `  (avg successful write tools)`,
+);
+console.log(
+  `  task-target writes:           ${summary.taskTargetWrites}` +
+    `  (non-status paths; targets when known)`,
+);
 console.log();
 if (summary.meetsReleaseGate) {
   console.log("  RELEASE GATE: PASS\n");

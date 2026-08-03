@@ -1,5 +1,6 @@
 import type { ToolCall, ToolDefinition, ToolResult } from "./tool-types";
 import type { JarvisConfig } from "./config";
+import { observeModelToolFormatFromTurn } from "./model-tool-format";
 
 interface ParsedTextToolCall {
   id: string;
@@ -283,6 +284,12 @@ export type ResolveToolCallsFromTurnInput = {
   fullText: string;
   tools?: ToolDefinition[] | null;
   useTextTools: boolean;
+  /**
+   * Optional model id for W3.3 per-model tool-format observation.
+   * When present and the turn produces tool calls, updates the process-local
+   * capability record (`model-tool-format.ts`).
+   */
+  modelId?: string | null;
 };
 
 export type ResolveToolCallsFromTurnResult = {
@@ -290,6 +297,8 @@ export type ResolveToolCallsFromTurnResult = {
   toolParseFlags: TextToolParseSignals;
   /** True when extractTextToolCalls ran (primary text mode or native-empty fallback). */
   textParseAttempted: boolean;
+  /** Observed format for this turn when modelId was provided (W3.3). */
+  observedToolFormat?: "native" | "text_xml" | "dsml" | "unknown";
 };
 
 /**
@@ -311,38 +320,49 @@ export function resolveToolCallsFromTurn(
       arguments: c.arguments,
     }));
 
+  let result: ResolveToolCallsFromTurnResult;
+
   if (input.useTextTools && toolsOffered) {
     const extracted = extractTextToolCalls(fullText, tools);
-    return {
+    result = {
       calls: mapExtracted(extracted.calls),
       toolParseFlags: textToolParseSignals(true, extracted.calls.length),
       textParseAttempted: true,
     };
-  }
-
-  if (input.nativeCalls.length > 0) {
-    return {
+  } else if (input.nativeCalls.length > 0) {
+    result = {
+      calls: input.nativeCalls,
+      toolParseFlags: textToolParseSignals(false, 0),
+      textParseAttempted: false,
+    };
+  } else if (toolsOffered && fullText.trim().length > 0) {
+    // Fallback: native empty + non-empty content + tools offered → always try text parse
+    const extracted = extractTextToolCalls(fullText, tools);
+    result = {
+      calls: mapExtracted(extracted.calls),
+      toolParseFlags: textToolParseSignals(true, extracted.calls.length),
+      textParseAttempted: true,
+    };
+  } else {
+    result = {
       calls: input.nativeCalls,
       toolParseFlags: textToolParseSignals(false, 0),
       textParseAttempted: false,
     };
   }
 
-  // Fallback: native empty + non-empty content + tools offered → always try text parse
-  if (toolsOffered && fullText.trim().length > 0) {
-    const extracted = extractTextToolCalls(fullText, tools);
-    return {
-      calls: mapExtracted(extracted.calls),
-      toolParseFlags: textToolParseSignals(true, extracted.calls.length),
-      textParseAttempted: true,
-    };
+  // W3.3: record per-model tool format when the caller supplies a model id.
+  if (input.modelId?.trim()) {
+    const observed = observeModelToolFormatFromTurn({
+      model: input.modelId,
+      nativeCallCount: input.nativeCalls.length,
+      fullText,
+      textParseFoundCalls: result.textParseAttempted && result.calls.length > 0,
+    });
+    result = { ...result, observedToolFormat: observed };
   }
 
-  return {
-    calls: input.nativeCalls,
-    toolParseFlags: textToolParseSignals(false, 0),
-    textParseAttempted: false,
-  };
+  return result;
 }
 
 /** Fullwidth vertical line U+FF5C used as the DSML delimiter in live model output. */

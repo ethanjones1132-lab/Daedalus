@@ -385,6 +385,94 @@ describe("summarizeConductorPerformance", () => {
     expect(summary.delegateVerifiedWriteRate).toBe(0);
   });
 
+  // W2.2 — first-class write volume metrics
+  test("writesLandedPerRun averages successful write tools across runs", () => {
+    // 2 runs: first has 2 successful writes, second has 0 → avg 1.0
+    const fixtures: ConductorPerformanceFixture[] = [
+      {
+        agentRunId: "run_two_writes",
+        outcome: "success",
+        checkTier: "builtin",
+        stageRuns: [
+          stage({
+            agent_run_id: "run_two_writes",
+            tool_calls_json: JSON.stringify([
+              { name: "write_file", arguments: { path: "a.ts" } },
+              { name: "edit_file", arguments: { path: "b.ts" } },
+              { name: "read_file", arguments: { path: "a.ts" } },
+            ]),
+          }),
+        ],
+        directives: [],
+      },
+      {
+        agentRunId: "run_no_writes",
+        outcome: "partial",
+        stageRuns: [
+          stage({
+            agent_run_id: "run_no_writes",
+            tool_calls_json: JSON.stringify([{ name: "read_file", arguments: {} }]),
+          }),
+        ],
+        directives: [],
+      },
+    ];
+    const summary = summarizeConductorPerformance(fixtures);
+    expect(summary.writesLandedPerRun).toBe(1);
+    expect(summary.taskTargetWrites).toBe(2);
+  });
+
+  test("taskTargetWrites excludes status/log docs and honors fixture targets", () => {
+    const fixtures: ConductorPerformanceFixture[] = [
+      {
+        agentRunId: "run_mixed_paths",
+        outcome: "success",
+        checkTier: "builtin",
+        taskTargets: ["src/app.ts"],
+        stageRuns: [
+          stage({
+            agent_run_id: "run_mixed_paths",
+            tool_calls_json: JSON.stringify([
+              { name: "write_file", arguments: { path: "src/app.ts" } },
+              { name: "write_file", arguments: { path: "IMPLEMENTATION_STATUS_CURRENT.md" } },
+              { name: "edit_file", arguments: { path: "docs/other.ts" } },
+              { name: "write_file", arguments: { path: "src/app.ts" }, is_error: true },
+            ]),
+          }),
+        ],
+        directives: [],
+      },
+    ];
+    const summary = summarizeConductorPerformance(fixtures);
+    // All successful write tools (including status + off-target): 3
+    expect(summary.writesLandedPerRun).toBe(3);
+    // Only non-status + on-target: src/app.ts once
+    expect(summary.taskTargetWrites).toBe(1);
+  });
+
+  test("taskTargetWrites without targets counts all non-status successful writes", () => {
+    const fixtures: ConductorPerformanceFixture[] = [
+      {
+        agentRunId: "run_no_targets",
+        outcome: "success",
+        checkTier: "builtin",
+        stageRuns: [
+          stage({
+            agent_run_id: "run_no_targets",
+            tool_calls_json: JSON.stringify([
+              { name: "write_file", arguments: { path: "src/app.ts" } },
+              { name: "write_file", arguments: { path: "EXECUTION_LOG.md" } },
+            ]),
+          }),
+        ],
+        directives: [],
+      },
+    ];
+    const summary = summarizeConductorPerformance(fixtures);
+    expect(summary.writesLandedPerRun).toBe(2);
+    expect(summary.taskTargetWrites).toBe(1);
+  });
+
   test("native fallback write after failed delegate stage does not count as verified", () => {
     // Delegate launched (claude_cli attr) but wrote nothing; later native
     // executor stage wrote. Must not credit the native write to the delegate.
