@@ -123,9 +123,18 @@ try {
         --define "process.env.JARVIS_GIT_DIRTY=\`"$($buildGitDirty.ToString().ToLowerInvariant())\`"" `
         --define "process.env.JARVIS_SOURCE_TREE_SHA256=\`"$sourceTreeSha256\`""
     if ($LASTEXITCODE -ne 0) { Die 'server bundle build failed' }
+    # Standalone MCP stdio server for the Claude delegate. Deployed next to
+    # index.js so Claude's --mcp-config can launch it after Desktop deploy
+    # (live 2026-08-04: mcp_servers jarvis status=failed because the entry
+    # path only existed under server-jarvis/src in the repo).
+    & $bun build ./src/mcp-stdio-server.ts --outdir ./dist --target bun --outfile ./dist/mcp-stdio-server.js
+    if ($LASTEXITCODE -ne 0) { Die 'mcp-stdio-server bundle build failed' }
 } finally { Pop-Location }
 if (-not (Test-Path $distJs)) { Die "server bundle not produced at $distJs" }
+$distMcp = Join-Path $serverDir 'dist\mcp-stdio-server.js'
+if (-not (Test-Path $distMcp)) { Die "mcp-stdio-server bundle not produced at $distMcp" }
 Write-Ok "server bundle -> $distJs"
+Write-Ok "mcp-stdio-server -> $distMcp"
 
 # ── Stage 2: UI ──────────────────────────────────────────────────────────────
 Write-Step 'Stage 2/4 - Building UI (bun run build)'
@@ -192,6 +201,8 @@ function Deploy-File($src, $dstName) {
 Deploy-File $exeOut 'Jarvis.exe'
 Deploy-File $exeOut 'home-base.exe'
 Deploy-File $distJs 'index.js'
+$distMcpJs = Join-Path $serverDir 'dist\mcp-stdio-server.js'
+Deploy-File $distMcpJs 'mcp-stdio-server.js'
 Deploy-File $metricsScript 'automate_inference_metrics.py'
 Deploy-File $proxyScript 'resources\claude_cli_proxy.py'
 Deploy-File $proxyModelsJson 'resources\opencode_go_openai_models.json'

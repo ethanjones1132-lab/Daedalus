@@ -11,7 +11,8 @@
 // or Task-spawning, which remain the root-confinement boundary.
 
 import { createInterface } from "readline";
-import { join } from "path";
+import { existsSync } from "fs";
+import { dirname, join } from "path";
 import { defaultConfig, type JarvisConfig } from "./config";
 import { registerFilesystemBundle } from "./filesystem-bundle";
 import { registerGitMetadataBundle } from "./git-metadata-bundle";
@@ -225,8 +226,37 @@ export function createDelegateMcpAdapter(
   });
 }
 
-/** Resolve the default stdio entrypoint next to this module. */
+/**
+ * Resolve the stdio MCP entrypoint for the Claude delegate.
+ *
+ * Deployed Desktop runs use `bun <Desktop>/index.js` — `import.meta.dir` is
+ * then the Desktop, not `server-jarvis/src`, so a hard-coded
+ * `join(import.meta.dir, "mcp-stdio-server.ts")` always misses and Claude
+ * reports `mcp_servers: [{ name: "jarvis", status: "failed" }]`. Stock Grep
+ * then falls back to Claude Code's broken Bun-embedded rg path
+ * (`B:\~BUN\root\vendor\ripgrep\...` ENOENT) — live 2026-08-04.
+ *
+ * Prefer a bundled `mcp-stdio-server.js` next to the running entry, then the
+ * TypeScript source next to this module (dev).
+ */
 export function defaultDelegateMcpServerScriptPath(): string {
+  const candidates: string[] = [];
+  // Next to this module (dev: server-jarvis/src; bundle: next to chunk).
+  candidates.push(join(import.meta.dir, "mcp-stdio-server.js"));
+  candidates.push(join(import.meta.dir, "mcp-stdio-server.ts"));
+  // Next to the running entry (deployed Desktop\index.js → Desktop\mcp-stdio-server.js).
+  const entry = typeof process.argv[1] === "string" ? process.argv[1] : "";
+  if (entry) {
+    candidates.push(join(dirname(entry), "mcp-stdio-server.js"));
+    candidates.push(join(dirname(entry), "mcp-stdio-server.ts"));
+  }
+  // CWD fallback (operator launches from Desktop).
+  candidates.push(join(process.cwd(), "mcp-stdio-server.js"));
+  candidates.push(join(process.cwd(), "mcp-stdio-server.ts"));
+  for (const path of candidates) {
+    if (existsSync(path)) return path;
+  }
+  // Last resort: source path relative to this file (dev only; may 404 in bundle).
   return join(import.meta.dir, "mcp-stdio-server.ts");
 }
 

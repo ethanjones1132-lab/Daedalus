@@ -351,6 +351,9 @@ describe("Claude executor delegate", () => {
       expect(invocation.args).toContain("--strict-mcp-config");
       expect(mcpConfigIdx).toBeGreaterThan(-1);
       const mcpConfigPath = invocation.args[mcpConfigIdx + 1];
+      // Floor tools always re-union even when config listed only Read + patterned Bash
+      // (2026-08-04: stale allowlists without Bash broke verification greps).
+      const floor = "Read,Edit,Write,MultiEdit,Grep,Glob,Bash,WebSearch,WebFetch,TodoWrite";
       expect(invocation.args).toEqual([
         "--print",
         "--output-format", "stream-json",
@@ -363,13 +366,15 @@ describe("Claude executor delegate", () => {
         "--add-dir", "D:\\extra",
         "--strict-mcp-config",
         "--mcp-config", mcpConfigPath,
-        "--tools", "Read",
-        "--allowedTools", "Read",
+        "--tools", floor,
+        "--allowedTools", floor,
         "mcp__jarvis",
         "--",
         "make the change",
       ]);
       expect(invocation.args).not.toContain("--bare");
+      // Patterned Bash(...) still never appears on --tools.
+      expect(invocation.args.join(" ")).not.toContain("Bash(");
     } finally {
       invocation.cleanup();
     }
@@ -778,56 +783,42 @@ describe("Claude executor delegate", () => {
     expect(streamedTools).toEqual(["write_file"]);
   });
 
-  test("rejects patterned Bash(...) alone as stock Bash authority (exact Bash required)", async () => {
+  test("patterned Bash(...) never reaches --tools but floor still supplies exact Bash", async () => {
     // Patterned entries remain stored for config round-trip but never enter the
-    // root-confinable floor. Without exact "Bash", stock Bash is policy-denied.
+    // root-confinable --tools list. Exact "Bash" is always re-unioned from the
+    // floor (2026-08-04: stale configs without Bash blocked verification).
     const config = testConfig();
     config.claude_cli.delegate.allowed_tools = ["Read", "Bash(python:*)"];
-    const snapshot: DelegateRootSnapshot = {
-      root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
-    };
-    const output = await runClaudeDelegate({
+    const invocation = buildClaudeDelegateInvocation({
       config,
-      prompt: "write outside",
+      prompt: "verify",
       sessionId: "123e4567-e89b-42d3-a456-426614174000",
       allowedRoots: ["C:\\repo"],
-      stageRemainingMs: 30_000,
-      profile: "full",
-      writeEffectRequired: true,
-      nativeNoWrite: false,
-      health: new DelegateHealth(),
-      snapshotFactory: { capture: async () => [snapshot] },
-      processFactory: async () => ({
-        events: (async function* () {
-          yield { type: "assistant", message: { content: [{
-            type: "tool_use",
-            id: "bash-1",
-            name: "Bash",
-            input: { command: "python -c write C:\\outside\\escape.txt" },
-          }] } };
-          yield { type: "user", message: { content: [{
-            type: "tool_result", tool_use_id: "bash-1", content: "wrote outside",
-          }] } };
-          yield { type: "result", result: "done" };
-        })(),
-        exit: Promise.resolve({ code: 0, signal: null }),
-        kill: () => {},
-      }),
+      stageRemainingMs: 12_000,
+      executable: "claude",
+      baseEnv: {},
     });
-
-    expect(output).toMatchObject({ ok: false, errorCode: "delegate_tool_not_permitted" });
-    expect(output.toolCalls[0]).toMatchObject({ name: "bash", is_error: true, error_code: "policy_denied" });
+    try {
+      const toolsArg = invocation.args[invocation.args.indexOf("--tools") + 1] ?? "";
+      expect(toolsArg.split(",")).toContain("Bash");
+      expect(toolsArg).not.toContain("Bash(");
+      expect(config.claude_cli.delegate.allowed_tools).toContain("Bash(python:*)");
+    } finally {
+      invocation.cleanup();
+    }
   });
 
-  test("rejects a safe stock tool event that was not enabled in delegate config", async () => {
+  test("rejects Task even when the floor tools are present", async () => {
+    // Floor re-unions Write/Bash/etc.; Task remains permanently out of the
+    // root-confinable set (shell/Task-spawning escape).
     const config = testConfig();
-    config.claude_cli.delegate.allowed_tools = ["Read"];
+    config.claude_cli.delegate.allowed_tools = ["Read", "Task"];
     const snapshot: DelegateRootSnapshot = {
       root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
     };
     const output = await runClaudeDelegate({
       config,
-      prompt: "read only",
+      prompt: "spawn a task",
       sessionId: "123e4567-e89b-42d3-a456-426614174000",
       allowedRoots: ["C:\\repo"],
       stageRemainingMs: 30_000,
@@ -839,10 +830,10 @@ describe("Claude executor delegate", () => {
       processFactory: async () => ({
         events: (async function* () {
           yield { type: "assistant", message: { content: [{
-            type: "tool_use", id: "write-1", name: "Write", input: { file_path: "forged.ts" },
+            type: "tool_use", id: "task-1", name: "Task", input: { prompt: "escape" },
           }] } };
           yield { type: "user", message: { content: [{
-            type: "tool_result", tool_use_id: "write-1", content: "claimed write",
+            type: "tool_result", tool_use_id: "task-1", content: "spawned",
           }] } };
           yield { type: "result", result: "done" };
         })(),
@@ -852,7 +843,7 @@ describe("Claude executor delegate", () => {
     });
 
     expect(output).toMatchObject({ ok: false, errorCode: "delegate_tool_not_permitted" });
-    expect(output.toolCalls[0]).toMatchObject({ name: "write_file", is_error: true, error_code: "policy_denied" });
+    expect(output.toolCalls[0]).toMatchObject({ is_error: true, error_code: "policy_denied" });
   });
 
   test("permits canonical write_file when Write is in allowed_tools (F1 vocabulary mismatch)", async () => {
@@ -915,7 +906,9 @@ describe("Claude executor delegate", () => {
     expect(health.snapshot().lastReason).toBeUndefined();
   });
 
-  test("still denies Bash when only Read is allowed (canonical permit is not a free pass)", async () => {
+  test("stale allowlist with only Read still permits floor Bash (2026-08-04)", async () => {
+    // deepMerge used to leave production configs without Bash; the floor
+    // re-unions exact Bash so verification greps can run.
     const config = testConfig();
     config.claude_cli.delegate.allowed_tools = ["Read"];
     const snapshot: DelegateRootSnapshot = {
@@ -923,7 +916,7 @@ describe("Claude executor delegate", () => {
     };
     const output = await runClaudeDelegate({
       config,
-      prompt: "no shell",
+      prompt: "verify with shell",
       sessionId: "123e4567-e89b-42d3-a456-426614174000",
       allowedRoots: ["C:\\repo"],
       stageRemainingMs: 30_000,
@@ -948,8 +941,8 @@ describe("Claude executor delegate", () => {
       }),
     });
 
-    expect(output).toMatchObject({ ok: false, errorCode: "delegate_tool_not_permitted" });
-    expect(output.toolCalls[0]).toMatchObject({ name: "bash", is_error: true, error_code: "policy_denied" });
+    expect(output.toolCalls[0]).toMatchObject({ name: "bash", is_error: false });
+    expect(output.toolCalls[0].error_code).toBeUndefined();
   });
 
   test("terminates then kills a timed-out child and cools down when it produced zero writes", async () => {

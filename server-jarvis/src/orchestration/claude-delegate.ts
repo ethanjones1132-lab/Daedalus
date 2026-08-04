@@ -73,16 +73,25 @@ const DELEGATE_MCP_BLOCKED_TOOLS = new Set([
 // Bash is root-confinable at the stock CLI layer: process cwd is the P0 root
 // (allowedRoots[0]). Patterned entries like Bash(powershell:*) stay stored in
 // config but never reach --tools (exact-name floor only). Task remains blocked.
+// Keep in sync with config.DELEGATE_STOCK_FLOOR_TOOLS — both are the floor.
 const ROOT_CONFINABLE_CLAUDE_TOOLS = [
   "Read", "Edit", "Write", "MultiEdit", "Grep", "Glob", "Bash",
   "WebSearch", "WebFetch", "TodoWrite",
 ] as const;
 const ROOT_CONFINABLE_CLAUDE_TOOL_SET = new Set<string>(ROOT_CONFINABLE_CLAUDE_TOOLS);
 
-/** Patterned/unsafe configured entries remain stored but never reach stock CLI authority. */
+/**
+ * Patterned/unsafe configured entries remain stored but never reach stock CLI
+ * authority. Always include the floor set so a stale allowlist without Bash
+ * still launches with verification tools available.
+ */
 function rootConfinableDelegateTools(configured: string[]): string[] {
-  return configured.filter((name, index) =>
-    ROOT_CONFINABLE_CLAUDE_TOOL_SET.has(name) && configured.indexOf(name) === index,
+  const union = [...configured];
+  for (const floor of ROOT_CONFINABLE_CLAUDE_TOOLS) {
+    if (!union.includes(floor)) union.push(floor);
+  }
+  return union.filter((name, index) =>
+    ROOT_CONFINABLE_CLAUDE_TOOL_SET.has(name) && union.indexOf(name) === index,
   );
 }
 

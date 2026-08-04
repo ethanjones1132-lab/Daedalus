@@ -824,6 +824,34 @@ export function isInvalidWorkspacePath(
 // when a DIFFERENT stale path appears (i.e., new information).
 const warnedStaleWorkspacePaths = new Set<string>();
 
+/**
+ * Stock Claude tools that must remain available on the delegate even when a
+ * persisted config still has a pre-W1.5 allowlist (live 2026-08-04:
+ * `~/.openclaw/jarvis/config.json` overwrote defaults and dropped Bash, so
+ * verification greps via shell were policy-denied as
+ * `delegate_tool_not_permitted` / "No such tool available: Bash").
+ *
+ * deepMerge replaces arrays wholesale — it does not union. Floor tools are
+ * therefore re-applied after merge.
+ */
+export const DELEGATE_STOCK_FLOOR_TOOLS = [
+  "Read", "Edit", "Write", "MultiEdit", "Grep", "Glob", "Bash",
+  "WebSearch", "WebFetch", "TodoWrite",
+] as const;
+
+/** Ensure every floor tool is present; preserve extras (patterned Bash(...), etc.). */
+export function ensureDelegateFloorTools(configured: readonly string[] | undefined): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const name of [...(configured ?? []), ...DELEGATE_STOCK_FLOOR_TOOLS]) {
+    const trimmed = typeof name === "string" ? name.trim() : "";
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out;
+}
+
 export function normalizeConfig(raw: any, options: NormalizeConfigOptions = {}): JarvisConfig {
   const merged = deepMerge(defaultConfig(), raw);
   // Stock Claude delegation must not silently fall back to a blank/implicit
@@ -831,6 +859,13 @@ export function normalizeConfig(raw: any, options: NormalizeConfigOptions = {}):
   // configs to the Anthropic-native OpenCode Go primary (point-to-point).
   if (!merged.claude_cli.delegate.model || !merged.claude_cli.delegate.model.trim()) {
     merged.claude_cli.delegate.model = "minimax-m3";
+  }
+  // Re-union floor tools after deepMerge so a stale on-disk allowlist cannot
+  // drop Bash / Grep / Write after a code default upgrade (2026-08-04 live).
+  if (merged.claude_cli?.delegate) {
+    merged.claude_cli.delegate.allowed_tools = ensureDelegateFloorTools(
+      merged.claude_cli.delegate.allowed_tools,
+    );
   }
   const configuredRepairRounds = Number(merged.orchestrator.max_review_repair_rounds);
   merged.orchestrator.max_review_repair_rounds = Number.isFinite(configuredRepairRounds)

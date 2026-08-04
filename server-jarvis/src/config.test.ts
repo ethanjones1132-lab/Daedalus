@@ -95,6 +95,24 @@ describe("Claude CLI delegate config", () => {
       config.claude_cli.delegate,
     );
   });
+
+  test("stale on-disk allowlist without Bash is re-unioned with the floor (2026-08-04 live)", () => {
+    // Production config had dropped Bash after deepMerge replaced the default
+    // array wholesale — verification greps via shell were then policy-denied.
+    const delegate = normalizeConfig({
+      claude_cli: {
+        delegate: {
+          allowed_tools: [
+            "Read", "Edit", "Write", "MultiEdit", "Grep", "Glob",
+            "WebSearch", "WebFetch", "TodoWrite",
+          ],
+        },
+      },
+    }).claude_cli.delegate;
+    expect(delegate.allowed_tools).toContain("Bash");
+    expect(delegate.allowed_tools).toContain("Read");
+    expect(delegate.allowed_tools).toContain("Write");
+  });
 });
 
 describe("skill distillation config", () => {
