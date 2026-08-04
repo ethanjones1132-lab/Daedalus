@@ -14,6 +14,10 @@ import {
   summarizeConductorPerformance,
   type ConductorPerformanceFixture,
 } from "../src/eval/conductor-performance";
+import {
+  summarizeFrontierMetrics,
+  type FrontierMetricsRun,
+} from "../src/eval/frontier-metrics";
 import type { ConductorDirectiveRow, ModelAttribution, StageRun } from "../src/self-tuning/store";
 
 function arg(flag: string): string | undefined {
@@ -31,12 +35,12 @@ const db = new Database(dbPath, { readonly: true });
 const agentRuns = (since
   ? db
     .query(
-      "SELECT id, task_type, outcome, final_output, verified_via, check_tier FROM agent_runs WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?",
+      "SELECT id, task_type, outcome, final_output, verified_via, check_tier, duration_ms, created_at FROM agent_runs WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?",
     )
     .all(since, limit)
   : db
     .query(
-      "SELECT id, task_type, outcome, final_output, verified_via, check_tier FROM agent_runs ORDER BY created_at DESC LIMIT ?",
+      "SELECT id, task_type, outcome, final_output, verified_via, check_tier, duration_ms, created_at FROM agent_runs ORDER BY created_at DESC LIMIT ?",
     )
     .all(limit)) as Array<{
   id: string;
@@ -45,6 +49,8 @@ const agentRuns = (since
   final_output?: string | null;
   verified_via?: string | null;
   check_tier?: string | null;
+  duration_ms?: number | null;
+  created_at?: string | null;
 }>;
 
 const stageStmt = db.query(
@@ -72,6 +78,25 @@ const fixtures: ConductorPerformanceFixture[] = agentRuns.map((row) => ({
 
 const summary = summarizeConductorPerformance(fixtures, RELEASE_THRESHOLDS);
 
+// Part IV frontier harness metrics (wall-clock / round-trips / TTFT proxy / cache).
+const frontierRuns: FrontierMetricsRun[] = agentRuns.map((row, index) => ({
+  duration_ms: row.duration_ms,
+  created_at: row.created_at,
+  stageRuns: fixtures[index]!.stageRuns.map((s) => ({
+    mode_id: s.mode_id,
+    duration_ms: s.duration_ms,
+    created_at: s.created_at,
+  })),
+}));
+const frontier = summarizeFrontierMetrics(frontierRuns);
+
+function fmtMs(value: number | null): string {
+  if (value === null) return "n/a";
+  if (value >= 60_000) return `${(value / 60_000).toFixed(2)} min`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(2)} s`;
+  return `${value.toFixed(0)} ms`;
+}
+
 // Exit non-zero when any hard threshold fails. The delegate-rate axis only
 // contributes a failure when delegateGate === "fail" (sample ≥5 and rate low);
 // insufficient_sample is reported but does not force exit by itself.
@@ -88,6 +113,7 @@ if (asJson) {
         limit,
         thresholds: RELEASE_THRESHOLDS,
         summary,
+        frontier,
         delegate_gate: summary.delegateGate,
         gate_failures: summary.gateFailures,
         meets_release_gate: summary.meetsReleaseGate,
@@ -140,6 +166,29 @@ console.log(
 console.log(
   `  task-target writes:           ${summary.taskTargetWrites}` +
     `  (non-status paths; targets when known)`,
+);
+console.log();
+console.log("  ── Frontier harness metrics ──");
+console.log(
+  `  avg_run_wall_clock:           ${fmtMs(frontier.avg_run_wall_clock)}` +
+    (frontier.avg_run_wall_clock !== null
+      ? ` (${frontier.avg_run_wall_clock.toFixed(0)} ms)`
+      : ""),
+);
+console.log(
+  `  round_trips_per_run:          ${
+    frontier.round_trips_per_run === null
+      ? "n/a"
+      : frontier.round_trips_per_run.toFixed(2)
+  }`,
+);
+console.log(
+  `  time_to_first_visible_token:  ${fmtMs(frontier.time_to_first_visible_token)}` +
+    `  (proxy: run→synthesizer start; null if uncomputable)`,
+);
+console.log(
+  `  cache_hit_rate:               ${(frontier.cache_hit_rate * 100).toFixed(1)}%` +
+    `  (0 until M2)`,
 );
 console.log();
 if (summary.meetsReleaseGate) {

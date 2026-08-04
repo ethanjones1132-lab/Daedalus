@@ -1792,9 +1792,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const modelComplexity = callOptions?.complexity
             ?? activeTaskRun.estimatedComplexity
             ?? "medium";
+          // M5: remaining stage budget for latency-aware refuse. Prefer the
+          // stage window; fall back to turn remaining when the stage has no
+          // configured budget (e.g. synthesizer).
+          const remainingStageMsForPick = stageLabel
+            ? turnBudget.stageRemainingMs(stageLabel, Date.now())
+            : undefined;
           const modelSelection = {
             complexity: modelComplexity as "low" | "medium" | "high",
             preferStrong: callOptions?.preferStrongModel === true,
+            remainingStageMs: remainingStageMsForPick,
           };
           // F2: one exclusion union for both pool selection and the fallback
           // cascade. A cooldown that reaches only the pool is not a cooldown.
@@ -1813,9 +1820,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               // seeded from model_attributions — so a model that already has
               // production history is graded immediately rather than
               // re-trialled on every restart.
+              // M5: same scorecard supplies reliability/latency stats for
+              // budget-aware refuse + success/latency ranking within tier.
               const pool = new AgentPool(routableOrchestratorAgents(cfg))
                 .withTrialSampleCounts((agent, trialStage) =>
-                  modelScorecard.sampleCount(trialStage, `${agent.provider}:${agent.model_id}`));
+                  modelScorecard.sampleCount(trialStage, `${agent.provider}:${agent.model_id}`))
+                .withReliabilityStats((agent, relStage) =>
+                  modelScorecard.reliabilityEntry(relStage, `${agent.provider}:${agent.model_id}`));
               let agent: import("./orchestration/agent-pool").OrchestratorAgent | undefined;
               // Honor the empty-completion cascade-advance exclude set: a model
               // that just returned an empty 200 (or hit a 2-strike rate limit)

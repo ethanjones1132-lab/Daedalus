@@ -1,4 +1,5 @@
 import type { ModelAttribution } from "../self-tuning/store";
+import type { ReliabilityLatencyEntry } from "./reliability-latency-rank";
 
 export interface ScorecardAttempt {
   ok: boolean;
@@ -8,6 +9,9 @@ export interface ScorecardAttempt {
 const WINDOW_SIZE = 20;
 const MIN_SAMPLES = 6;
 const UNFIT_ERROR_RATE = 0.5;
+
+/** Exported so ranking / trial policy can share the same floor. */
+export const SCORECARD_MIN_SAMPLES = MIN_SAMPLES;
 
 /** In-process rolling stage/model telemetry used to add selection pressure. */
 export class ModelScorecard {
@@ -73,6 +77,17 @@ export class ModelScorecard {
     return list.filter((attempt) => !attempt.ok).length / list.length;
   }
 
+  /**
+   * Observed success fraction for this stage/model. Defined for any non-empty
+   * window (unlike errorRate, which waits for MIN_SAMPLES). Used by M5
+   * reliability/latency ranking so thin samples still participate softly.
+   */
+  successRate(stage: string, providerModelKey: string): number | undefined {
+    const list = this.slot(stage, providerModelKey);
+    if (list.length === 0) return undefined;
+    return list.filter((attempt) => attempt.ok).length / list.length;
+  }
+
   unfitKeys(stage: string): Set<string> {
     const result = new Set<string>();
     const prefix = `${stage}|`;
@@ -92,5 +107,25 @@ export class ModelScorecard {
       .sort((a, b) => a - b);
     if (latencies.length === 0) return undefined;
     return latencies[Math.floor((latencies.length - 1) / 2)];
+  }
+
+  /**
+   * M5 input row for one stage/model. Undefined when the scorecard has never
+   * observed this key for the stage.
+   */
+  reliabilityEntry(
+    stage: string,
+    providerModelKey: string,
+  ): ReliabilityLatencyEntry | undefined {
+    const samples = this.sampleCount(stage, providerModelKey);
+    if (samples === 0) return undefined;
+    const successRate = this.successRate(stage, providerModelKey);
+    if (successRate === undefined) return undefined;
+    return {
+      key: providerModelKey,
+      sampleCount: samples,
+      successRate,
+      p50FirstTokenMs: this.p50FirstToken(stage, providerModelKey),
+    };
   }
 }

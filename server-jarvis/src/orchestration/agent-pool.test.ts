@@ -1126,3 +1126,91 @@ describe("orchestrationRoutingTier — local ollama lane", () => {
     expect(picked?.id).toBe("local-qwythos-reviewer");
   });
 });
+
+describe("pickFor M5 reliability/latency ranking", () => {
+  const freeAgents: OrchestratorAgent[] = [
+    {
+      id: "slow-reliable",
+      provider: "openrouter",
+      model_id: "vendor/slow-reliable:free",
+      capabilities: { code: 0.95, reasoning: 0.9, speed: 0.4, cost: 1, json_reliability: 0.9 },
+      default_for: [],
+      enabled: true,
+      billing_tier: "free",
+    },
+    {
+      id: "fast-ok",
+      provider: "openrouter",
+      model_id: "vendor/fast-ok:free",
+      capabilities: { code: 0.7, reasoning: 0.7, speed: 0.9, cost: 1, json_reliability: 0.75 },
+      default_for: [],
+      enabled: true,
+      billing_tier: "free",
+    },
+  ];
+
+  test("refuses a graded model whose p50 first_token exceeds remainingStageMs", () => {
+    const pool = new AgentPool(freeAgents).withReliabilityStats((agent) => {
+      if (agent.id === "slow-reliable") {
+        return {
+          key: `${agent.provider}:${agent.model_id}`,
+          sampleCount: 8,
+          successRate: 1,
+          p50FirstTokenMs: 25_000,
+        };
+      }
+      return {
+        key: `${agent.provider}:${agent.model_id}`,
+        sampleCount: 8,
+        successRate: 0.85,
+        p50FirstTokenMs: 1_500,
+      };
+    });
+
+    const picked = pool.pickFor("executor", "refactor", undefined, {
+      remainingStageMs: 5_000,
+    });
+    expect(picked?.id).toBe("fast-ok");
+  });
+
+  test("ranks measured peers by successRate / latency when no stage pin", () => {
+    const pool = new AgentPool(freeAgents).withReliabilityStats((agent) => {
+      if (agent.id === "slow-reliable") {
+        return {
+          key: `${agent.provider}:${agent.model_id}`,
+          sampleCount: 10,
+          successRate: 1,
+          p50FirstTokenMs: 12_000,
+        };
+      }
+      return {
+        key: `${agent.provider}:${agent.model_id}`,
+        sampleCount: 10,
+        successRate: 0.9,
+        p50FirstTokenMs: 800,
+      };
+    });
+
+    // Budget generous enough that neither is refused — ranking should prefer fast.
+    const picked = pool.pickFor("executor", "refactor", undefined, {
+      remainingStageMs: 60_000,
+    });
+    expect(picked?.id).toBe("fast-ok");
+  });
+
+  test("does not empty the tier when every graded model exceeds budget", () => {
+    const pool = new AgentPool(freeAgents).withReliabilityStats((agent) => ({
+      key: `${agent.provider}:${agent.model_id}`,
+      sampleCount: 8,
+      successRate: 0.9,
+      p50FirstTokenMs: 50_000,
+    }));
+
+    const picked = pool.pickFor("executor", "refactor", undefined, {
+      remainingStageMs: 1_000,
+    });
+    // Fail-open: keep original tier rather than leave the stage uncovered.
+    expect(picked).toBeDefined();
+  });
+});
+

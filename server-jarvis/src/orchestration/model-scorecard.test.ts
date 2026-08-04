@@ -57,6 +57,22 @@ describe("ModelScorecard", () => {
     expect(scorecard.p50FirstToken("synthesizer", KEY)).toBe(2000);
   });
 
+  test("successRate and reliabilityEntry expose M5 ranking inputs", () => {
+    const scorecard = new ModelScorecard();
+    scorecard.record("executor", KEY, { ok: true, firstTokenMs: 1_000 });
+    scorecard.record("executor", KEY, { ok: true, firstTokenMs: 3_000 });
+    scorecard.record("executor", KEY, { ok: false, firstTokenMs: 2_000 });
+
+    expect(scorecard.successRate("executor", KEY)).toBeCloseTo(2 / 3);
+    expect(scorecard.reliabilityEntry("executor", KEY)).toEqual({
+      key: KEY,
+      sampleCount: 3,
+      successRate: 2 / 3,
+      p50FirstTokenMs: 2_000,
+    });
+    expect(scorecard.reliabilityEntry("reviewer", KEY)).toBeUndefined();
+  });
+
   test("revises a recorded outcome without adding a second sample", () => {
     const scorecard = new ModelScorecard();
     for (let i = 0; i < 5; i++) scorecard.record("coordinator", KEY, { ok: true });

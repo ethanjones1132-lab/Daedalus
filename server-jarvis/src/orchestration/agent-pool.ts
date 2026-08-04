@@ -7,6 +7,10 @@ import {
   modelRoutingScoreDelta,
   stageRoutingScoreDelta,
 } from "../self-tuning/learned-pool-state";
+import {
+  rankModelsByReliabilityLatency,
+  type ReliabilityLatencyEntry,
+} from "./reliability-latency-rank";
 
 export interface AgentCapabilities {
   code: number;
@@ -55,6 +59,12 @@ export interface AgentSelectionOptions {
   complexity?: Complexity;
   /** A bounded retry should ask for the strongest eligible alternative. */
   preferStrong?: boolean;
+  /**
+   * M5: remaining stage budget in ms. When set (and reliability stats are
+   * injected via withReliabilityStats), models whose measured p50 first_token
+   * exceeds this budget are refused before ranking.
+   */
+  remainingStageMs?: number;
 }
 
 export interface AgentPoolCoverage {
@@ -307,10 +317,30 @@ export class AgentPool {
    * exactly as before and no model is trialled.
    */
   private sampleCountFor?: (agent: OrchestratorAgent, stage: string) => number;
+  /**
+   * M5: optional reliability/latency stats from ModelScorecard (seeded from
+   * model_attributions). When absent, pickFor ranking is unchanged.
+   */
+  private reliabilityStatsFor?: (
+    agent: OrchestratorAgent,
+    stage: string,
+  ) => ReliabilityLatencyEntry | undefined;
 
   /** Supply observation counts so unproven free lanes can be trialled. */
   withTrialSampleCounts(fn: (agent: OrchestratorAgent, stage: string) => number): this {
     this.sampleCountFor = fn;
+    return this;
+  }
+
+  /**
+   * Supply measured success/latency stats so pickFor can refuse models whose
+   * p50 first_token exceeds remaining stage budget and rank survivors by
+   * successRate / latency within the active cost tier.
+   */
+  withReliabilityStats(
+    fn: (agent: OrchestratorAgent, stage: string) => ReliabilityLatencyEntry | undefined,
+  ): this {
+    this.reliabilityStatsFor = fn;
     return this;
   }
 
@@ -370,7 +400,11 @@ export class AgentPool {
     // model. Only after the entire active tier is excluded does the next tier
     // become eligible.
     const activeTier = Math.min(...candidates.map(orchestrationRoutingTier));
-    const tierCandidates = candidates.filter((agent) => orchestrationRoutingTier(agent) === activeTier);
+    let tierCandidates = candidates.filter((agent) => orchestrationRoutingTier(agent) === activeTier);
+    // M5: refuse models whose measured p50 first_token exceeds remaining stage
+    // budget. Never leave the stage uncovered — if every candidate is refused,
+    // keep the original tier set (a late answer beats no answer).
+    tierCandidates = this.applyReliabilityLatencyFilter(tierCandidates, stage, selection);
     // New-release trial (model-trial-policy.ts). A model discovered from a
     // live catalog is scored from a name-matching regex, which puts any
     // unfamiliar family below the pool median and keeps it there — it can
@@ -404,6 +438,54 @@ export class AgentPool {
       }
     }
     return tierCandidates.sort((a, b) => this.compareWithinTier(a, b, stage, taskType, selection))[0];
+  }
+
+  /**
+   * M5 hard filter: drop agents whose scorecard p50 first_token exceeds the
+   * remaining stage budget (sample >= N). Soft no-op when stats or budget are
+   * absent. Never returns an empty list when `agents` was non-empty.
+   */
+  private applyReliabilityLatencyFilter(
+    agents: OrchestratorAgent[],
+    stage: string,
+    selection: AgentSelectionOptions,
+  ): OrchestratorAgent[] {
+    if (!this.reliabilityStatsFor) return agents;
+    if (
+      typeof selection.remainingStageMs !== "number"
+      || !Number.isFinite(selection.remainingStageMs)
+    ) {
+      return agents;
+    }
+    const entries: ReliabilityLatencyEntry[] = [];
+    for (const agent of agents) {
+      const entry = this.reliabilityStatsFor(agent, stage);
+      if (entry) entries.push(entry);
+    }
+    if (entries.length === 0) return agents;
+    const ranked = rankModelsByReliabilityLatency(entries, selection.remainingStageMs);
+    const allowed = new Set(ranked.map((e) => e.key));
+    // Agents with no stats are kept (unknown is not refused).
+    const filtered = agents.filter((agent) => {
+      const key = `${agent.provider}:${agent.model_id}`;
+      const hasStats = entries.some((e) => e.key === key);
+      return !hasStats || allowed.has(key);
+    });
+    if (filtered.length === 0) {
+      console.warn(
+        `[agent-pool] M5 latency filter would empty stage=${stage} tier ` +
+        `(remainingStageMs=${selection.remainingStageMs}); keeping unfiltered tier`,
+      );
+      return agents;
+    }
+    if (filtered.length < agents.length) {
+      const dropped = agents.length - filtered.length;
+      console.warn(
+        `[agent-pool] M5 latency filter refused ${dropped} model(s) for stage=${stage} ` +
+        `(p50 first_token > remainingStageMs=${selection.remainingStageMs})`,
+      );
+    }
+    return filtered;
   }
 
   /**
@@ -589,9 +671,44 @@ export class AgentPool {
     taskType: TaskType | string,
     selection: AgentSelectionOptions = {},
   ): number {
+    // Preserve Go plan cost ordering as a hard policy within the go tier.
     const goCostDelta = this.goCostDelta(a, b);
     if (goCostDelta !== 0) return goCostDelta;
+    // M5: among free/paid peers with measured stats, prefer success/latency
+    // over raw capability/price scores so a fast reliable free model beats a
+    // slow flaky one even when hand-tuned caps favor the slow one.
+    const relDelta = this.reliabilityLatencyCompare(a, b, stage);
+    if (relDelta !== 0) return relDelta;
     return this.scoreWithFeedback(b, stage, taskType, selection) - this.scoreWithFeedback(a, stage, taskType, selection);
+  }
+
+  /**
+   * Compare two agents by successRate / p50 first_token. Returns 0 when either
+   * side lacks stats so existing scoring remains the tie-breaker.
+   * Negative means `a` should sort before `b` (Array.sort ascending: lower first).
+   * We return scoreB - scoreA so higher reliability score ranks first.
+   */
+  private reliabilityLatencyCompare(
+    a: OrchestratorAgent,
+    b: OrchestratorAgent,
+    stage: string,
+  ): number {
+    if (!this.reliabilityStatsFor) return 0;
+    const entryA = this.reliabilityStatsFor(a, stage);
+    const entryB = this.reliabilityStatsFor(b, stage);
+    if (!entryA || !entryB) return 0;
+    // Both need at least one latency sample for the ratio to mean "prefer fast".
+    if (
+      typeof entryA.p50FirstTokenMs !== "number"
+      || typeof entryB.p50FirstTokenMs !== "number"
+    ) {
+      return 0;
+    }
+    const ranked = rankModelsByReliabilityLatency([entryA, entryB], undefined);
+    if (ranked.length < 2) return 0;
+    if (ranked[0]!.key === entryA.key && ranked[0]!.key !== entryB.key) return -1;
+    if (ranked[0]!.key === entryB.key && ranked[0]!.key !== entryA.key) return 1;
+    return 0;
   }
 
   private overallScore(agent: OrchestratorAgent): number {
