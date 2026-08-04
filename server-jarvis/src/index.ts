@@ -139,7 +139,6 @@ import type { ConductorDirective } from "./orchestration/conductor-bus";
 import { LiveConductor } from "./orchestration/conductor";
 import type { StageName } from "./orchestration/coordinator";
 import {
-  coordinatorIsAdvisoryOnly,
   hasWriteIntent,
   resolveTurnRequirement,
   shouldRememberRequirement,
@@ -149,10 +148,9 @@ import {
 import {
   applyContinuationLeanRoute,
   applyForcedDeepReadRoute,
-  buildDeterministicRoute,
-  buildShortCircuitRoute,
   normalizeRoute,
   reconcileRouteWithBudget,
+  resolveCoordinatorRouteDecision,
   type ExecutionProfile,
 } from "./orchestration/route-normalization";
 import { activePlanContinuationPipeline } from "./orchestration/active-plan-route";
@@ -2928,39 +2926,21 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           sessionMemory.toSharedContextHints(sessionId, activeWorkspacePath),
           { relevant_memories: [workspaceRootHint] },
         );
-        // F7: skip the API coordinator when local routing is unavailable and
-        // every remaining coordinator path is struck or scorecard-unfit.
-        const localConductorCfgEnabled = Boolean(cfg.orchestrator?.conductor?.enabled);
-        let localConductorAvailable = false;
-        // 2026-07-18: availability is a HEALTH question, not a fallback-policy
-        // question. The old `!shouldFallbackToApi()` gate meant that with the
-        // standard `fallback_to_api: true` config this probe never ran,
-        // `localConductorAvailable` was permanently false, and every turn with
-        // coordinator health strikes skipped straight to deterministic routes —
-        // while a warm, healthy local conductor sat unused ("local conductor
-        // unavailable" logged seconds after a successful keep-warm ping).
-        if (localConductorCfgEnabled) {
-          try {
-            localConductorAvailable = await persistentConductor.isAvailable();
-          } catch {
-            localConductorAvailable = false;
-          }
-        }
-        const coordinatorParseExcluded = stageHealth.excludedModelKeys("coordinator").size > 0;
-        const coordinatorUnfit = modelScorecard.unfitKeys("coordinator").size > 0;
-        const skipAdvisoryCoordinator =
-          !shortCircuit &&
-          !useActivePlanContinuation &&
-          !localConductorAvailable &&
-          (coordinatorParseExcluded || coordinatorUnfit) &&
-          (coordinatorIsAdvisoryOnly(turnReq.requirement) || coordinatorUnfit);
+        // M3: resolve whether Coordinator.route (local-first / API) is required.
+        // Advisory-only requirements (workspace_read) always take the
+        // deterministic route — normalizeRoute rebuilds from the requirement.
+        const routeDecision = resolveCoordinatorRouteDecision({
+          shortCircuit,
+          shortCircuitKind:
+            turnReq.requirement === "conversational" ? "conversational" : "answer_only",
+          useActivePlanContinuation,
+          requirement: turnReq.requirement,
+        });
         const coordinatorStartedAt = Date.now();
         let route;
-        if (shortCircuit) {
-          route = buildShortCircuitRoute(
-            turnReq.requirement === "conversational" ? "conversational" : "answer_only",
-          );
-        } else if (useActivePlanContinuation && activePlanPipeline) {
+        if (routeDecision.kind === "short_circuit") {
+          route = routeDecision.route;
+        } else if (routeDecision.kind === "continuation" && activePlanPipeline) {
           // Never re-run Planner for an already-expanded plan; reviewer only
           // when acceptance requires reviewer_pass (see activePlanContinuationPipeline).
           route = {
@@ -2980,12 +2960,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             `[Jarvis Orchestrator] active plan continuation: ${activePlanPipeline.join("->")} ` +
             `(item=${activePlanItem?.id ?? "?"} status=${activeTaskRun.status} turn=${activeTaskRun.turnCount})`,
           );
-        } else if (skipAdvisoryCoordinator) {
-          console.warn(
-            `[Jarvis Orchestrator] skipping API coordinator for ${turnReq.requirement} ` +
-            `(local conductor unavailable + coordinator candidate health excluded)`,
+        } else if (routeDecision.kind === "deterministic_advisory") {
+          console.log(
+            `[Jarvis Orchestrator] M3 advisory skip: deterministic ${turnReq.requirement} route ` +
+            `(coordinator model not called)`,
           );
-          route = buildDeterministicRoute(turnReq.requirement);
+          route = routeDecision.route;
         } else {
           route = await coordinator.route(contextMessage, {
             sessionId,
@@ -2995,10 +2975,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             sessionMemoryHints: memoryHints,
           });
         }
-        const coordinatorDurationMs =
-          shortCircuit || skipAdvisoryCoordinator || useActivePlanContinuation
-            ? 0
-            : Date.now() - coordinatorStartedAt;
+        const skippedCoordinatorModel = routeDecision.kind !== "model";
+        const coordinatorDurationMs = skippedCoordinatorModel
+          ? 0
+          : Date.now() - coordinatorStartedAt;
 
         // Owned-runtime-loop: short-circuit / deterministic routes skip
         // Coordinator.route, so attach planning ownership here when missing.
@@ -3039,11 +3019,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           );
         }
 
-        const routeSource = shortCircuit
+        const routeSource = routeDecision.kind === "short_circuit"
           ? "trivial_short_circuit"
-          : useActivePlanContinuation
+          : routeDecision.kind === "continuation"
             ? "active_plan_continuation"
-            : skipAdvisoryCoordinator
+            : routeDecision.kind === "deterministic_advisory"
               ? "deterministic"
               : route.routing_parse_fallback
                 ? "parse_fallback"

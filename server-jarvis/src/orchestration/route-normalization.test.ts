@@ -7,9 +7,11 @@ import {
   normalizeRemainingStages,
   normalizeRoute,
   reconcileRouteWithBudget,
+  resolveCoordinatorRouteDecision,
 } from "./route-normalization";
 import type { CoordinatorResult } from "./coordinator";
 import { FORCE_DEEP_READ_PATTERN } from "./repetition-guard";
+import { coordinatorIsAdvisoryOnly } from "./turn-requirements";
 
 function decision(pipeline: CoordinatorResult["pipeline"], topology: CoordinatorResult["topology"] = "linear"): CoordinatorResult {
   return {
@@ -52,9 +54,73 @@ describe("buildDeterministicRoute (T1.2)", () => {
     const r = buildDeterministicRoute("workspace_read");
     expect(r.pipeline).toEqual(["executor", "synthesizer"]);
     expect(r.conductor_source).toBe("deterministic");
+    expect(r.coordinator_rationale).toMatch(/M3 advisory skip/i);
     const n = normalizeRoute(r, "workspace_read", "deterministic");
     expect(n.pipeline).toEqual(["executor", "synthesizer"]);
     expect(n.profile).toBe("read_only");
+  });
+});
+
+describe("resolveCoordinatorRouteDecision (M3 advisory skip)", () => {
+  test("workspace_read is advisory-only so the model call is never required", () => {
+    expect(coordinatorIsAdvisoryOnly("workspace_read")).toBe(true);
+    expect(coordinatorIsAdvisoryOnly("full_execution")).toBe(false);
+    expect(coordinatorIsAdvisoryOnly("answer_only")).toBe(false);
+  });
+
+  test("advisory workspace_read always returns deterministic_advisory (even if local would be available)", () => {
+    // Decision tree does not take local conductor health — advisory skip is absolute.
+    const decision = resolveCoordinatorRouteDecision({
+      shortCircuit: false,
+      useActivePlanContinuation: false,
+      requirement: "workspace_read",
+    });
+    expect(decision.kind).toBe("deterministic_advisory");
+    if (decision.kind !== "deterministic_advisory") throw new Error("expected deterministic_advisory");
+    expect(decision.route.pipeline).toEqual(["executor", "synthesizer"]);
+    expect(decision.route.conductor_source).toBe("deterministic");
+    expect(decision.route.coordinator_rationale).toMatch(/M3 advisory skip/i);
+  });
+
+  test("shortCircuit wins over advisory requirement", () => {
+    const decision = resolveCoordinatorRouteDecision({
+      shortCircuit: true,
+      shortCircuitKind: "conversational",
+      useActivePlanContinuation: false,
+      requirement: "conversational",
+    });
+    expect(decision.kind).toBe("short_circuit");
+    if (decision.kind !== "short_circuit") throw new Error("expected short_circuit");
+    expect(decision.route.pipeline).toEqual(["synthesizer"]);
+    expect(decision.route.conductor_source).toBe("trivial");
+  });
+
+  test("active plan continuation wins over advisory workspace_read", () => {
+    const decision = resolveCoordinatorRouteDecision({
+      shortCircuit: false,
+      useActivePlanContinuation: true,
+      requirement: "workspace_read",
+    });
+    expect(decision.kind).toBe("continuation");
+  });
+
+  test("full_execution is not advisory and requires the model path", () => {
+    const decision = resolveCoordinatorRouteDecision({
+      shortCircuit: false,
+      useActivePlanContinuation: false,
+      requirement: "full_execution",
+    });
+    expect(decision.kind).toBe("model");
+  });
+
+  test("answer_only without shortCircuit requires the model path", () => {
+    // Complex answer_only does not short-circuit; coordinator still runs.
+    const decision = resolveCoordinatorRouteDecision({
+      shortCircuit: false,
+      useActivePlanContinuation: false,
+      requirement: "answer_only",
+    });
+    expect(decision.kind).toBe("model");
   });
 });
 

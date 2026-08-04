@@ -22,7 +22,7 @@
 // model wrongly marked as an edit is capped to read-only tools.
 
 import type { CoordinatorResult, StageName, Topology } from "./coordinator";
-import type { TurnRequirement } from "./turn-requirements";
+import { coordinatorIsAdvisoryOnly, type TurnRequirement } from "./turn-requirements";
 
 /**
  * Canonical Coordinator-shaped decision for a turn whose deterministic
@@ -48,9 +48,9 @@ export function buildShortCircuitRoute(
 }
 
 /**
- * T1.2: sibling of buildShortCircuitRoute for requirements where the API
- * coordinator is advisory-only (workspace_read) and we skip a known-bad or
- * unavailable coordinator path. normalizeRoute will still enforce invariants.
+ * Sibling of buildShortCircuitRoute for requirements where the coordinator
+ * model is not required (M3 advisory skip for workspace_read, health/unavailable
+ * fallbacks for other classes). normalizeRoute still enforces invariants.
  */
 export function buildDeterministicRoute(
   requirement: TurnRequirement,
@@ -79,7 +79,8 @@ export function buildDeterministicRoute(
         needs_memory: false,
         estimated_complexity: "medium",
       },
-      coordinator_rationale: "Deterministic workspace_read route: local conductor unavailable + advisory coordinator skipped.",
+      coordinator_rationale:
+        "Deterministic workspace_read route: M3 advisory skip — coordinator model not required.",
       conductor_source: "deterministic",
     };
   }
@@ -95,6 +96,46 @@ export function buildDeterministicRoute(
     coordinator_rationale: "Deterministic full_execution route: coordinator skipped.",
     conductor_source: "deterministic",
   };
+}
+
+/**
+ * M3: pure decision tree for whether the orchestrator must call coordinator.route()
+ * (local-first PersistentConductor / API) or can skip with a deterministic route.
+ *
+ * Priority:
+ *   1. shortCircuit → synthesizer-only trivial route
+ *   2. active plan continuation → reuse expanded plan pipeline (caller builds route)
+ *   3. advisory-only requirement (workspace_read) → buildDeterministicRoute (never model)
+ *   4. otherwise → model (local-first via Coordinator.route)
+ */
+export type CoordinatorRouteDecision =
+  | { kind: "short_circuit"; route: CoordinatorResult }
+  | { kind: "continuation" }
+  | { kind: "deterministic_advisory"; route: CoordinatorResult }
+  | { kind: "model" };
+
+export function resolveCoordinatorRouteDecision(input: {
+  shortCircuit: boolean;
+  shortCircuitKind?: "conversational" | "answer_only";
+  useActivePlanContinuation: boolean;
+  requirement: TurnRequirement;
+}): CoordinatorRouteDecision {
+  if (input.shortCircuit) {
+    const kind =
+      input.shortCircuitKind ??
+      (input.requirement === "conversational" ? "conversational" : "answer_only");
+    return { kind: "short_circuit", route: buildShortCircuitRoute(kind) };
+  }
+  if (input.useActivePlanContinuation) {
+    return { kind: "continuation" };
+  }
+  if (coordinatorIsAdvisoryOnly(input.requirement)) {
+    return {
+      kind: "deterministic_advisory",
+      route: buildDeterministicRoute(input.requirement),
+    };
+  }
+  return { kind: "model" };
 }
 
 /**

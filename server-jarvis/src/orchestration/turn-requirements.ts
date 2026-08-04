@@ -59,11 +59,11 @@ export function shouldShortCircuitCoordinator(
 }
 
 /**
- * T1.2: true when the API coordinator is purely advisory for this requirement —
+ * True when the coordinator model call is never required for this requirement.
  * normalizeRoute rebuilds pipeline/topology/profile from the requirement
- * regardless; only task_type/worker_instructions survive from the model.
- * When true and local conductor is unavailable and the coordinator has recent
- * parse-failure strikes, skip the API coordinator entirely.
+ * regardless; only task_type/worker_instructions would survive from the model.
+ * When true, callers must use buildDeterministicRoute and must not call
+ * coordinator.route() (M3 advisory skip).
  */
 export function coordinatorIsAdvisoryOnly(requirement: TurnRequirement): boolean {
   return requirement === "workspace_read";
