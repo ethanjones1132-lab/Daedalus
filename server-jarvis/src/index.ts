@@ -152,7 +152,6 @@ import {
   hasWriteIntent,
   resolveTurnRequirement,
   shouldRememberRequirement,
-  shouldShortCircuitCoordinator,
   type TurnRequirement,
 } from "./orchestration/turn-requirements";
 import {
@@ -160,10 +159,9 @@ import {
   applyForcedDeepReadRoute,
   normalizeRoute,
   reconcileRouteWithBudget,
-  resolveCoordinatorRouteDecision,
   type ExecutionProfile,
 } from "./orchestration/route-normalization";
-import { activePlanContinuationPipeline } from "./orchestration/active-plan-route";
+import { resolveCoordinatorRouteEntry } from "./orchestration/coordinator-route-entry";
 import { runPipelineWithReplanning } from "./orchestration/replan-loop";
 import { mapCheckToReward } from "./orchestration/verification-reward";
 import {
@@ -203,7 +201,6 @@ import {
   terminalSubtypeForRunOutcome,
   type TaskRunContract,
 } from "./orchestration/task-run";
-import { attachOwnedPlanning } from "./orchestration/runtime-loop";
 import {
   INFERENCE_FEEDBACK_CRON_JOB_ID,
   refreshInferenceFeedback,
@@ -2938,27 +2935,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // NOT `contextMessage` (which prepends history and would let a prior
         // file-read contaminate a follow-up greeting). This is the authoritative
         // signal; the coordinator model's route is advisory.
-        const { continuation, result: turnReq } = resolveTurnRequirement(
-          message,
-          activeTaskRun.requirement ?? continuationRequirements.get(sessionId),
-          !["completed", "failed", "cancelled"].includes(activeTaskRun.status),
-        );
-        const shortCircuit = shouldShortCircuitCoordinator(message, turnReq, continuation);
-        // Active-plan fast path: explicit continuation of an active/paused TaskRun
-        // with an open item skips Coordinator + Planner (plan already expanded).
+        // M8: shortCircuit / continuation / advisory / model + attachOwnedPlanning
+        // live in coordinator-route-entry (seam extract).
         const activePlanItem = getActivePlanItem(activeTaskRun);
-        const activePlanPipeline = !shortCircuit
-          ? activePlanContinuationPipeline({
-              explicitContinuation: continuation,
-              status: activeTaskRun.status,
-              turnCount: activeTaskRun.turnCount,
-              activeItem: activePlanItem
-                ? { acceptanceChecks: activePlanItem.acceptanceChecks }
-                : null,
-            })
-          : null;
-        const useActivePlanContinuation = Array.isArray(activePlanPipeline)
-          && activePlanPipeline.length > 0;
         // T1.7: emit one conductor_health frame when local is enabled but we fall back.
         let conductorHealthEmitted = false;
         const onLocalUnavailable = async (info: { reason: string; sessionId: string }) => {
@@ -2987,75 +2966,36 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           sessionMemory.toSharedContextHints(sessionId, activeWorkspacePath),
           { relevant_memories: [workspaceRootHint] },
         );
-        // M3: resolve whether Coordinator.route (local-first / API) is required.
-        // Advisory-only requirements (workspace_read) always take the
-        // deterministic route — normalizeRoute rebuilds from the requirement.
-        const routeDecision = resolveCoordinatorRouteDecision({
+        const {
+          turnReq,
           shortCircuit,
-          shortCircuitKind:
-            turnReq.requirement === "conversational" ? "conversational" : "answer_only",
+          activePlanPipeline,
           useActivePlanContinuation,
-          requirement: turnReq.requirement,
+          route: entryRoute,
+          coordinatorDurationMs,
+          routeSource,
+        } = await resolveCoordinatorRouteEntry({
+          message,
+          priorRequirement:
+            activeTaskRun.requirement ?? continuationRequirements.get(sessionId),
+          taskRunLive: !["completed", "failed", "cancelled"].includes(activeTaskRun.status),
+          taskRunStatus: activeTaskRun.status,
+          taskRunTurnCount: activeTaskRun.turnCount,
+          activePlanItem: activePlanItem
+            ? { acceptanceChecks: activePlanItem.acceptanceChecks }
+            : null,
+          activePlanItemId: activePlanItem?.id,
+          estimatedComplexity: activeTaskRun.estimatedComplexity,
+          routeViaModel: () =>
+            coordinator.route(contextMessage, {
+              sessionId,
+              rawMessage: message,
+              history: turnHistory,
+              lastOutcome: sessionMemory.getLastOutcome(sessionId),
+              sessionMemoryHints: memoryHints,
+            }),
         });
-        const coordinatorStartedAt = Date.now();
-        let route;
-        if (routeDecision.kind === "short_circuit") {
-          route = routeDecision.route;
-        } else if (routeDecision.kind === "continuation" && activePlanPipeline) {
-          // Never re-run Planner for an already-expanded plan; reviewer only
-          // when acceptance requires reviewer_pass (see activePlanContinuationPipeline).
-          route = {
-            task_type: turnReq.requirement === "workspace_read" ? "research" as const : "general" as const,
-            pipeline: activePlanPipeline,
-            topology: "linear" as const,
-            context: {
-              needs_workspace_inspection: true,
-              needs_memory: false,
-              estimated_complexity: activeTaskRun.estimatedComplexity ?? "medium",
-            },
-            coordinator_rationale:
-              "Active plan continuation: resume open TaskPlan item without Coordinator/Planner.",
-            conductor_source: "continuation_reuse" as const,
-          };
-          console.log(
-            `[Jarvis Orchestrator] active plan continuation: ${activePlanPipeline.join("->")} ` +
-            `(item=${activePlanItem?.id ?? "?"} status=${activeTaskRun.status} turn=${activeTaskRun.turnCount})`,
-          );
-        } else if (routeDecision.kind === "deterministic_advisory") {
-          console.log(
-            `[Jarvis Orchestrator] M3 advisory skip: deterministic ${turnReq.requirement} route ` +
-            `(coordinator model not called)`,
-          );
-          route = routeDecision.route;
-        } else {
-          route = await coordinator.route(contextMessage, {
-            sessionId,
-            rawMessage: message,
-            history: turnHistory,
-            lastOutcome: sessionMemory.getLastOutcome(sessionId),
-            sessionMemoryHints: memoryHints,
-          });
-        }
-        const skippedCoordinatorModel = routeDecision.kind !== "model";
-        const coordinatorDurationMs = skippedCoordinatorModel
-          ? 0
-          : Date.now() - coordinatorStartedAt;
-
-        // Owned-runtime-loop: short-circuit / deterministic routes skip
-        // Coordinator.route, so attach planning ownership here when missing.
-        if (!route.plan_authorship) {
-          const planning = attachOwnedPlanning(
-            message,
-            route.context?.estimated_complexity ?? "low",
-            { taskType: route.task_type },
-          );
-          route = {
-            ...route,
-            plan_authorship: planning.plan_authorship,
-            plan_items: planning.plan_items,
-            plan_brief: planning.plan_brief,
-          };
-        }
+        let route = entryRoute;
 
         // T1.6: record parse_failure strike so next turn's pickFor / exclude
         // set demotes the pinned coordinator default after one strike.
@@ -3080,15 +3020,6 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           );
         }
 
-        const routeSource = routeDecision.kind === "short_circuit"
-          ? "trivial_short_circuit"
-          : routeDecision.kind === "continuation"
-            ? "active_plan_continuation"
-            : routeDecision.kind === "deterministic_advisory"
-              ? "deterministic"
-              : route.routing_parse_fallback
-                ? "parse_fallback"
-                : "model";
         // F5: force-deep-read overrides topology to the research route
         // (executor→synthesizer) so planner/reviewer/supervision tax cannot
         // re-starve. Applied before normalize for telemetry, then re-asserted
