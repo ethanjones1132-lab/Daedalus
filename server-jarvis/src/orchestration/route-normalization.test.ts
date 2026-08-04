@@ -8,6 +8,8 @@ import {
   normalizeRoute,
   reconcileRouteWithBudget,
   resolveCoordinatorRouteDecision,
+  shouldRunPlannerConcurrentWithExecutor,
+  shouldScheduleRewriter,
 } from "./route-normalization";
 import type { CoordinatorResult } from "./coordinator";
 import { FORCE_DEEP_READ_PATTERN } from "./repetition-guard";
@@ -234,9 +236,12 @@ describe("normalizeRoute", () => {
     expect(r.topology).toBe("linear");
   });
 
-  test("full_execution: keeps planner and rewriter when the model included them", () => {
+  test("full_execution: keeps planner when the model included it, strips rewriter (M3 gate)", () => {
+    // M3: rewriter is repair-only — model-opted rewriter on the initial route
+    // was ~91:1 waste. Repair paths re-inject it when shouldScheduleRewriter.
     const r = normalizeRoute(decision(["planner", "executor", "reviewer", "rewriter", "synthesizer"]), "full_execution", "model");
-    expect(r.pipeline).toEqual(["planner", "executor", "reviewer", "rewriter", "synthesizer"]);
+    expect(r.pipeline).toEqual(["planner", "executor", "reviewer", "synthesizer"]);
+    expect(r.original_pipeline).toContain("rewriter");
     expect(r.profile).toBe("full");
   });
 
@@ -377,5 +382,57 @@ describe("applyContinuationLeanRoute", () => {
     expect(lean.pipeline).toEqual(["executor", "synthesizer"]);
     expect(lean.task_type).toBe("research");
     expect(lean.coordinator_rationale).toContain("Continuation of in-progress deep task");
+  });
+});
+
+describe("shouldRunPlannerConcurrentWithExecutor (M3)", () => {
+  const fullPipe = ["planner", "executor", "reviewer", "synthesizer"] as const;
+
+  test("true for full_execution planner→executor with no plan items", () => {
+    expect(shouldRunPlannerConcurrentWithExecutor(fullPipe, "full_execution", false)).toBe(true);
+  });
+
+  test("false when active plan already has items (continuation)", () => {
+    expect(shouldRunPlannerConcurrentWithExecutor(fullPipe, "full_execution", true)).toBe(false);
+  });
+
+  test("false for non-full_execution requirements", () => {
+    expect(shouldRunPlannerConcurrentWithExecutor(fullPipe, "workspace_read", false)).toBe(false);
+    expect(shouldRunPlannerConcurrentWithExecutor(["executor", "synthesizer"], "workspace_read", false)).toBe(false);
+    expect(shouldRunPlannerConcurrentWithExecutor(["synthesizer"], "conversational", false)).toBe(false);
+  });
+
+  test("false when pipeline lacks planner or executor", () => {
+    expect(shouldRunPlannerConcurrentWithExecutor(["executor", "reviewer", "synthesizer"], "full_execution", false)).toBe(false);
+    expect(shouldRunPlannerConcurrentWithExecutor(["planner", "reviewer", "synthesizer"], "full_execution", false)).toBe(false);
+  });
+
+  test("false when executor is scheduled before planner", () => {
+    expect(
+      shouldRunPlannerConcurrentWithExecutor(
+        ["executor", "planner", "reviewer", "synthesizer"],
+        "full_execution",
+        false,
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("shouldScheduleRewriter (M3 gate)", () => {
+  test("false by default — no evidence", () => {
+    expect(shouldScheduleRewriter({})).toBe(false);
+    expect(shouldScheduleRewriter({ reviewerHasIssues: false })).toBe(false);
+  });
+
+  test("true when reviewer requested changes", () => {
+    expect(shouldScheduleRewriter({ reviewerHasIssues: true })).toBe(true);
+  });
+
+  test("true for effect-gate no_write_effect repair", () => {
+    expect(shouldScheduleRewriter({ effectGateNoWriteEffect: true })).toBe(true);
+  });
+
+  test("true for explicit replan/repair chain", () => {
+    expect(shouldScheduleRewriter({ explicitReplan: true })).toBe(true);
   });
 });

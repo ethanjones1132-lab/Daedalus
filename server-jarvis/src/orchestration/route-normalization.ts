@@ -329,6 +329,48 @@ const PROFILE_FOR: Record<TurnRequirement, ExecutionProfile> = {
   full_execution: "full",
 };
 
+/**
+ * M3: run planner ‖ executor concurrently on full_execution routes when the
+ * executor's first tool work does not depend on a finished plan (plan is for
+ * structure/verification). Skip when an active plan continuation already has
+ * items — sequential is fine and avoids double-planning over a live ledger.
+ *
+ * Pure helper; executeSegment decides whether to apply it.
+ */
+export function shouldRunPlannerConcurrentWithExecutor(
+  pipeline: readonly string[],
+  requirement: TurnRequirement | undefined,
+  hasPlanItems: boolean,
+): boolean {
+  if (requirement !== "full_execution") return false;
+  if (hasPlanItems) return false;
+  const plannerIdx = pipeline.indexOf("planner");
+  const executorIdx = pipeline.indexOf("executor");
+  if (plannerIdx < 0 || executorIdx < 0) return false;
+  // Executor must follow planner in the scheduled order.
+  return plannerIdx < executorIdx;
+}
+
+/**
+ * M3: rewriter is a conditional repair stage, not a default full_execution
+ * stage. History shows high waste when it runs on every write turn with no
+ * evidence it will change the answer. Only schedule/run when:
+ *   - reviewer requested changes / rejected, OR
+ *   - effect gate no_write_effect needs repair, OR
+ *   - explicit replan/repair chain asks for rewriter
+ */
+export function shouldScheduleRewriter(input: {
+  reviewerHasIssues?: boolean;
+  effectGateNoWriteEffect?: boolean;
+  explicitReplan?: boolean;
+}): boolean {
+  return Boolean(
+    input.reviewerHasIssues ||
+      input.effectGateNoWriteEffect ||
+      input.explicitReplan,
+  );
+}
+
 /** Strip `re-enter:` prefixes and nulls down to a concrete stage list. */
 function toStageList(pipeline: CoordinatorResult["pipeline"]): StageName[] {
   const out: StageName[] = [];
@@ -370,6 +412,12 @@ export function normalizeRoute(
   for (const stage of required) {
     if (stage !== "synthesizer") include.add(stage);
   }
+
+  // M3 rewriter gate: never put rewriter on the initial executable route.
+  // Repair paths (reviewer reject, effect-gate no_write_effect, explicit
+  // replan/repair chain) inject it later when shouldScheduleRewriter is true.
+  // Keeping model-opted rewriter on every full_execution turn was ~91:1 waste.
+  include.delete("rewriter");
 
   const pipeline = CANONICAL_ORDER.filter((s) => s !== "synthesizer" && include.has(s));
   pipeline.push("synthesizer"); // exactly one, always last
