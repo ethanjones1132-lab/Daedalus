@@ -74,6 +74,14 @@ export interface TuningProposal {
   rationale?: string;
   applied: number;
   created_at?: string;
+  /** ISO timestamp set when applied=1; split point for post-apply measurement. */
+  applied_at?: string | null;
+  /** Success rate of completed task_type runs at apply time (0..1). */
+  baseline_success_rate?: number | null;
+  /** Count of completed task_type runs at apply time (informational / legacy slice). */
+  pre_apply_run_count?: number | null;
+  /** JSON array of completed run ids at apply time; post-apply = runs not in this set. */
+  pre_apply_run_ids?: string | null;
 }
 
 export interface TuningOutcome {
@@ -83,6 +91,24 @@ export interface TuningOutcome {
   token_delta?: number;
   success_rate_delta?: number;
   measured_at?: string;
+  /** Post-apply success rate (0..1). */
+  measured?: number | null;
+  /** Baseline success rate captured at apply (0..1). */
+  baseline?: number | null;
+  /** 1 if measured > baseline, else 0. */
+  improved?: number | null;
+  /** Number of post-apply completed runs in the measurement window. */
+  sample_n?: number | null;
+  notes?: string | null;
+}
+
+/** Input for the self-tuning outcome loop (M7). */
+export interface TuningOutcomeMeasurement {
+  measured: number;
+  baseline: number;
+  improved: boolean;
+  sample_n: number;
+  notes?: string;
 }
 
 /** Auditable directive emitted by the optional live conductor. */
@@ -334,6 +360,10 @@ const SELF_TUNING_SCHEMA = `
     proposed_value TEXT,
     rationale TEXT,
     applied INTEGER NOT NULL DEFAULT 0,
+    applied_at TEXT,
+    baseline_success_rate REAL,
+    pre_apply_run_count INTEGER,
+    pre_apply_run_ids TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   );
   CREATE INDEX IF NOT EXISTS idx_tuning_proposals_agent_run_id ON tuning_proposals(agent_run_id);
@@ -343,6 +373,11 @@ const SELF_TUNING_SCHEMA = `
     user_rating_delta REAL,
     token_delta REAL,
     success_rate_delta REAL,
+    measured REAL,
+    baseline REAL,
+    improved INTEGER,
+    sample_n INTEGER,
+    notes TEXT,
     measured_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   );
   CREATE INDEX IF NOT EXISTS idx_tuning_outcomes_proposal_id ON tuning_outcomes(proposal_id);
@@ -466,6 +501,34 @@ export function selfTuningDbPath(): string {
   return p;
 }
 
+/**
+ * Simple success-rate dial over completed agent runs.
+ * Prefer the truthful `outcome` column; fall back to user_rating for legacy rows.
+ */
+export function successRateOfRuns(runs: AgentRun[]): { rate: number; sample_n: number } {
+  const completed = runs.filter((r) => r.completed === 1);
+  const sample_n = completed.length;
+  if (sample_n === 0) return { rate: 0, sample_n: 0 };
+  let successes = 0;
+  for (const r of completed) {
+    if (r.outcome === "success") {
+      successes += 1;
+      continue;
+    }
+    if (
+      r.outcome === "failed" ||
+      r.outcome === "degraded" ||
+      r.outcome === "partial" ||
+      r.outcome === "cancelled"
+    ) {
+      continue;
+    }
+    // Legacy rows without outcome: rating >= 3 counts as success; unrated completed = success.
+    if (r.user_rating == null || r.user_rating >= 3) successes += 1;
+  }
+  return { rate: successes / sample_n, sample_n };
+}
+
 export class SelfTuningStore {
   private cachedDb: Database | null = null;
 
@@ -556,6 +619,34 @@ export class SelfTuningStore {
         // querying "how long did routing take" always meant grepping logs.
         try {
           db.exec(`ALTER TABLE conductor_runs ADD COLUMN latency_ms INTEGER`);
+        } catch { /* column already exists */ }
+        // M7: self-tuning outcome loop — baseline snapshot on apply + rich outcomes.
+        try {
+          db.exec(`ALTER TABLE tuning_proposals ADD COLUMN applied_at TEXT`);
+        } catch { /* column already exists */ }
+        try {
+          db.exec(`ALTER TABLE tuning_proposals ADD COLUMN baseline_success_rate REAL`);
+        } catch { /* column already exists */ }
+        try {
+          db.exec(`ALTER TABLE tuning_proposals ADD COLUMN pre_apply_run_count INTEGER`);
+        } catch { /* column already exists */ }
+        try {
+          db.exec(`ALTER TABLE tuning_proposals ADD COLUMN pre_apply_run_ids TEXT`);
+        } catch { /* column already exists */ }
+        try {
+          db.exec(`ALTER TABLE tuning_outcomes ADD COLUMN measured REAL`);
+        } catch { /* column already exists */ }
+        try {
+          db.exec(`ALTER TABLE tuning_outcomes ADD COLUMN baseline REAL`);
+        } catch { /* column already exists */ }
+        try {
+          db.exec(`ALTER TABLE tuning_outcomes ADD COLUMN improved INTEGER`);
+        } catch { /* column already exists */ }
+        try {
+          db.exec(`ALTER TABLE tuning_outcomes ADD COLUMN sample_n INTEGER`);
+        } catch { /* column already exists */ }
+        try {
+          db.exec(`ALTER TABLE tuning_outcomes ADD COLUMN notes TEXT`);
         } catch { /* column already exists */ }
         schemaEnsuredPaths.add(dbPath);
       }
@@ -669,17 +760,124 @@ export class SelfTuningStore {
     if (!db) return;
     try {
       db.prepare(
-        `INSERT INTO tuning_outcomes (id, proposal_id, user_rating_delta, token_delta, success_rate_delta)
-         VALUES (?, ?, ?, ?, ?)`
+        `INSERT INTO tuning_outcomes (id, proposal_id, user_rating_delta, token_delta, success_rate_delta, measured, baseline, improved, sample_n, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         outcome.id,
         outcome.proposal_id,
         outcome.user_rating_delta ?? null,
         outcome.token_delta ?? null,
-        outcome.success_rate_delta ?? null
+        outcome.success_rate_delta ?? null,
+        outcome.measured ?? null,
+        outcome.baseline ?? null,
+        outcome.improved ?? null,
+        outcome.sample_n ?? null,
+        outcome.notes ?? null,
       );
     } catch (e) {
       console.error("[SelfTuningStore] insertTuningOutcome failed:", e);
+    } finally {
+      db.close();
+    }
+  }
+
+  /**
+   * M7: record a measured outcome for an applied proposal.
+   * Idempotent per proposal — a second call returns the existing row without writing.
+   */
+  recordTuningOutcome(
+    proposalId: string,
+    measurement: TuningOutcomeMeasurement,
+  ): TuningOutcome | null {
+    const existing = this.getTuningOutcomes(proposalId);
+    if (existing.length > 0) return existing[0] ?? null;
+
+    const delta = measurement.measured - measurement.baseline;
+    const outcome: TuningOutcome = {
+      id: `tout_${crypto.randomUUID()}`,
+      proposal_id: proposalId,
+      success_rate_delta: delta,
+      measured: measurement.measured,
+      baseline: measurement.baseline,
+      improved: measurement.improved ? 1 : 0,
+      sample_n: measurement.sample_n,
+      notes: measurement.notes ?? null,
+    };
+    this.insertTuningOutcome(outcome);
+    return this.getTuningOutcomes(proposalId)[0] ?? outcome;
+  }
+
+  getTuningOutcomes(proposalId?: string): TuningOutcome[] {
+    const db = this.getDb();
+    if (!db) return [];
+    try {
+      if (proposalId) {
+        return db
+          .query("SELECT * FROM tuning_outcomes WHERE proposal_id = ? ORDER BY measured_at DESC")
+          .all(proposalId) as TuningOutcome[];
+      }
+      return db.query("SELECT * FROM tuning_outcomes ORDER BY measured_at DESC").all() as TuningOutcome[];
+    } catch (e) {
+      console.error("[SelfTuningStore] getTuningOutcomes failed:", e);
+      return [];
+    } finally {
+      db.close();
+    }
+  }
+
+  getTuningProposal(id: string): TuningProposal | null {
+    const db = this.getDb();
+    if (!db) return null;
+    try {
+      const row = db.query("SELECT * FROM tuning_proposals WHERE id = ?").get(id) as TuningProposal | null;
+      return row ?? null;
+    } catch (e) {
+      console.error("[SelfTuningStore] getTuningProposal failed:", e);
+      return null;
+    } finally {
+      db.close();
+    }
+  }
+
+  /**
+   * Applied proposals that do not yet have a tuning_outcomes row.
+   * These are waiting for enough post-apply runs of the same task_type.
+   */
+  getProposalsPendingMeasurement(): TuningProposal[] {
+    const db = this.getDb();
+    if (!db) return [];
+    try {
+      return db
+        .query(
+          `SELECT p.* FROM tuning_proposals p
+           WHERE p.applied = 1
+             AND NOT EXISTS (SELECT 1 FROM tuning_outcomes o WHERE o.proposal_id = p.id)
+           ORDER BY COALESCE(p.applied_at, p.created_at) ASC`,
+        )
+        .all() as TuningProposal[];
+    } catch (e) {
+      console.error("[SelfTuningStore] getProposalsPendingMeasurement failed:", e);
+      return [];
+    } finally {
+      db.close();
+    }
+  }
+
+  /** Completed agent runs for a task_type, oldest-first (stable post-apply slice). */
+  getCompletedAgentRunsForTaskType(taskType: string): AgentRun[] {
+    const db = this.getDb();
+    if (!db) return [];
+    try {
+      return db
+        .query(
+          `SELECT * FROM agent_runs
+           WHERE task_type = ? AND completed = 1
+           ORDER BY created_at ASC, id ASC`,
+        )
+        .all(taskType) as AgentRun[];
+    } catch (e) {
+      console.error("[SelfTuningStore] getCompletedAgentRunsForTaskType failed:", e);
+      return [];
     } finally {
       db.close();
     }
@@ -762,11 +960,45 @@ export class SelfTuningStore {
     }
   }
 
+  /**
+   * Mark a proposal applied and open a pending measurement window (M7).
+   * Captures baseline success rate + pre-apply run count for the proposal's task_type
+   * so later evaluation can compare post-apply runs without recomputing history.
+   */
   applyTuningProposal(id: string): void {
+    const prop = this.getTuningProposal(id);
+    if (!prop) {
+      // Still attempt the legacy applied=1 write so callers that race a missing
+      // row don't throw; no-op when the id truly does not exist.
+      const db = this.getDb();
+      if (!db) return;
+      try {
+        db.prepare("UPDATE tuning_proposals SET applied = 1 WHERE id = ?").run(id);
+      } catch (e) {
+        console.error("[SelfTuningStore] applyTuningProposal failed:", e);
+      } finally {
+        db.close();
+      }
+      return;
+    }
+
+    const priorRuns = this.getCompletedAgentRunsForTaskType(prop.task_type);
+    const baseline = successRateOfRuns(priorRuns);
+    const appliedAt = new Date().toISOString();
+    const priorIds = JSON.stringify(priorRuns.map((r) => r.id));
+
     const db = this.getDb();
     if (!db) return;
     try {
-      db.prepare("UPDATE tuning_proposals SET applied = 1 WHERE id = ?").run(id);
+      db.prepare(
+        `UPDATE tuning_proposals
+         SET applied = 1,
+             applied_at = ?,
+             baseline_success_rate = ?,
+             pre_apply_run_count = ?,
+             pre_apply_run_ids = ?
+         WHERE id = ?`,
+      ).run(appliedAt, baseline.rate, baseline.sample_n, priorIds, id);
     } catch (e) {
       console.error("[SelfTuningStore] applyTuningProposal failed:", e);
     } finally {

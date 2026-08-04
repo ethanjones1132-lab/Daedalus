@@ -5,6 +5,7 @@ import {
   type ModelAttribution,
   type StageRun,
 } from "./store";
+import { evaluatePendingTuningOutcomes } from "./outcome-loop";
 
 export class SessionOutcomeCollector {
   private store: SelfTuningStore;
@@ -73,6 +74,14 @@ export class SessionOutcomeCollector {
       verified_via: verifiedVia ?? null,
       check_tier: checkTier ?? null,
     });
+
+    // M7: close the self-tuning loop — once enough post-apply runs exist for
+    // an applied proposal's task_type, write tuning_outcomes (measured vs baseline).
+    try {
+      evaluatePendingTuningOutcomes(this.store);
+    } catch (e) {
+      console.error("[SessionOutcomeCollector] evaluatePendingTuningOutcomes failed:", e);
+    }
   }
 
   submitUserRating(runId: string, rating: number): void {

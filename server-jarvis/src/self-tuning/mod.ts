@@ -5,3 +5,4 @@ export * from "./proposer";
 export * from "./learned-pool-state";
 export * from "./policy-staging";
 export * from "./conductor-learning";
+export * from "./outcome-loop";
