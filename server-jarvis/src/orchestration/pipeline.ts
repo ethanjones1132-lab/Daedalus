@@ -46,7 +46,12 @@ import {
   SemanticPressureBudget,
   SEMANTIC_PRESSURE_SUPPRESSED,
 } from "./executor-progress-policy";
-import { normalizeRemainingStages, type ExecutionProfile } from "./route-normalization";
+import {
+  normalizeRemainingStages,
+  shouldRunPlannerConcurrentWithExecutor,
+  shouldScheduleRewriter,
+  type ExecutionProfile,
+} from "./route-normalization";
 import { hasWriteIntent, type TurnRequirement } from "./turn-requirements";
 import type { TurnBudget } from "./turn-budget";
 import type { PipelineStageState, PlannerStageOutput, ExecutorStageOutput, ReviewerStageOutput, RewriterStageOutput, ToolCallRecord } from "./stage-output";
@@ -4834,6 +4839,88 @@ export class PipelineExecutor {
   }
 
   /**
+   * Shared post-executor terminal checks used by sequential and M3 concurrent
+   * planner ‖ executor paths. Mutates nothing beyond reading `state.executor`.
+   */
+  private applyPostExecutorSegmentChecks(args: {
+    state: PipelineStageState;
+    profile: ExecutionProfile;
+    intentText: string;
+    options: PipelineExecuteOptions;
+    effectGateTargetPaths: string[] | undefined;
+    wantsSynthesizer: boolean;
+    requiresWorkspaceEvidence: boolean;
+    partialStage: PipelineSegmentResult["partialStage"];
+    onStateChange: (state: PipelineProgressState) => void;
+    request: string;
+    agentRunId: string;
+    remainingQueue: StageName[];
+  }): {
+    finished?: Omit<PipelineSegmentResult, "checkResult" | "reviewerAccepted">;
+    partialStage: PipelineSegmentResult["partialStage"];
+  } {
+    const {
+      state,
+      profile,
+      intentText,
+      options,
+      effectGateTargetPaths,
+      wantsSynthesizer,
+      requiresWorkspaceEvidence,
+    } = args;
+    let { partialStage } = args;
+    if (!state.executor) return { partialStage };
+
+    if (state.executor.terminalStatus === "cancelled") {
+      return { finished: { state, partialStage }, partialStage };
+    }
+    if (state.executor.errorCode === "delegate_cleanup_unconfirmed") {
+      return { finished: { state, partialStage }, partialStage };
+    }
+    if (state.executor.errorCode === "effect_gate_no_write_effect") {
+      const effectGate = evaluateEffectGate({
+        profile,
+        executor: state.executor,
+        rewriter: state.rewriter,
+        request: intentText,
+        assumeWriteIntent: options.taskRunWriteIntent,
+        contentEffects: this.ctx.write_effects,
+        targetPaths: effectGateTargetPaths,
+      });
+      return { finished: { state, effectGate, partialStage }, partialStage };
+    }
+    if (state.executor.errorCode === "executor_no_tool") {
+      // Bound no-tool spend ends the executor stage, but remaining
+      // stages (reviewer/rewriter/synthesizer) still run so repair
+      // paths and honest effect-gating can finish the turn.
+      partialStage = { stage: "executor", errorCode: "executor_no_tool" };
+      return { partialStage };
+    }
+    // T2.4: hard executor failure (non-workspace_read) → replan pre-synthesizer.
+    // workspace_read falls through to the evidence fence for precise codes.
+    if (
+      state.executor.ok === false &&
+      state.executor.errorCode !== "executor_no_tool" &&
+      wantsSynthesizer &&
+      options.allowMidRunReplan !== false &&
+      !requiresWorkspaceEvidence
+    ) {
+      return {
+        finished: {
+          state,
+          replanRequested: {
+            trigger: "executor_hard_failure",
+            detail: state.executor.narrative?.slice(0, 400) || "executor failed",
+          },
+          partialStage,
+        },
+        partialStage,
+      };
+    }
+    return { partialStage };
+  }
+
+  /**
    * Run a bounded slice of {planner, executor, reviewer, rewriter, synthesizer}
    * against a `carry`-forward state. Used directly by `execute()`'s linear
    * branch (with the full pipeline as `stages`) and by the B-02 replan loop
@@ -4941,6 +5028,98 @@ export class PipelineExecutor {
         break;
       }
       if (stage === "planner") {
+        // M3: concurrent planner ‖ executor on full_execution write turns when
+        // the plan is advisory structure (no live plan items yet). Executor
+        // starts from the user request without waiting for planner completion.
+        const concurrentCandidates = ["planner", ...remainingNow()];
+        const hasPlanItems = (opts.taskRunContract?.plan?.items?.length ?? 0) > 0;
+        const runConcurrent =
+          !state.executor &&
+          remainingNow()[0] === "executor" &&
+          shouldRunPlannerConcurrentWithExecutor(
+            concurrentCandidates,
+            options.turnRequirement,
+            hasPlanItems,
+          );
+
+        if (runConcurrent) {
+          workQueue.shift(); // consume the paired executor stage
+          console.log("[Pipeline] M3 concurrent planner ‖ executor");
+          onStateChange({
+            stage: "planner",
+            status: "running",
+            detail: "concurrent_with_executor",
+          });
+          const provisionalPlanSummary =
+            "Planner is running concurrently. Proceed from the user request; the plan will structure later verification.";
+          const executorOptions = {
+            ...opts,
+            priorToolCalls: state.executor?.toolCalls ?? opts.priorToolCalls,
+          };
+          const plannerPromise = this.runPlannerStage(
+            request, agentRunId, onStateChange, opts, remainingNow(),
+          );
+          const executorPromise = this.runExecutorStage(
+            request,
+            provisionalPlanSummary,
+            agentRunId,
+            onStateChange,
+            executorOptions,
+            profile,
+            remainingNow(),
+          );
+          const [plan, executor] = await Promise.all([plannerPromise, executorPromise]);
+          state.plan = plan;
+          if (
+            state.plan?.ok &&
+            opts.ownedPlanning?.plan_authorship === "planner_mediated" &&
+            opts.taskRunContract
+          ) {
+            try {
+              const force =
+                opts.taskRunContract.reconstruction === "reconstruction_required";
+              const seeded = seedTaskPlanFromPlannerProposal(
+                opts.taskRunContract,
+                state.plan.narrative,
+                opts.ownedPlanning.plan_brief,
+                { force },
+              );
+              opts.taskRunContract = seeded.contract;
+              opts.onTaskPlanUpdate?.(seeded.contract);
+              this.conductor?.live.setPlanContext(seeded.contract);
+              console.log(
+                `[Pipeline] planner_mediated TaskPlan seeded (${seeded.items.length} items): ${seeded.notes}`,
+              );
+            } catch (e) {
+              console.warn(
+                `[Pipeline] planner_mediated TaskPlan seed failed: ` +
+                `${e instanceof Error ? e.message : String(e)}`,
+              );
+            }
+          }
+          if (executorOptions.taskRunContract) {
+            opts.taskRunContract = executorOptions.taskRunContract;
+          }
+          state.executor = executor;
+          const post = this.applyPostExecutorSegmentChecks({
+            state,
+            profile,
+            intentText,
+            options: opts,
+            effectGateTargetPaths,
+            wantsSynthesizer,
+            requiresWorkspaceEvidence,
+            partialStage,
+            onStateChange,
+            request,
+            agentRunId,
+            remainingQueue: remainingNow(),
+          });
+          if (post.finished) return finish(post.finished);
+          partialStage = post.partialStage;
+          continue;
+        }
+
         state.plan = await this.runPlannerStage(request, agentRunId, onStateChange, opts, remainingNow());
         // Owned-runtime-loop: complex path — Conductor validates Planner
         // decomposition and persists TaskPlan ledger before dispatch.
@@ -5051,47 +5230,22 @@ export class PipelineExecutor {
             };
           }
         }
-        if (state.executor.terminalStatus === "cancelled") {
-          return finish({ state, partialStage });
-        }
-        if (state.executor.errorCode === "delegate_cleanup_unconfirmed") {
-          return finish({ state, partialStage });
-        }
-        if (state.executor.errorCode === "effect_gate_no_write_effect") {
-          const effectGate = evaluateEffectGate({
-            profile,
-            executor: state.executor,
-            rewriter: state.rewriter,
-            request: intentText,
-            assumeWriteIntent: options.taskRunWriteIntent,
-            contentEffects: this.ctx.write_effects,
-            targetPaths: effectGateTargetPaths,
-          });
-          return finish({ state, effectGate, partialStage });
-        }
-        if (state.executor.errorCode === "executor_no_tool") {
-          // Bound no-tool spend ends the executor stage, but remaining
-          // stages (reviewer/rewriter/synthesizer) still run so repair
-          // paths and honest effect-gating can finish the turn.
-          partialStage = { stage: "executor", errorCode: "executor_no_tool" };
-          continue;
-        }
-        // T2.4: hard executor failure (non-workspace_read) → replan pre-synthesizer.
-        // workspace_read falls through to the evidence fence for precise codes.
-        if (
-          state.executor &&
-          state.executor.ok === false &&
-          state.executor.errorCode !== "executor_no_tool" &&
-          wantsSynthesizer &&
-          options.allowMidRunReplan !== false &&
-          !requiresWorkspaceEvidence
-        ) {
-          replanRequested = {
-            trigger: "executor_hard_failure",
-            detail: state.executor.narrative?.slice(0, 400) || "executor failed",
-          };
-          return finish({ state, replanRequested, partialStage });
-        }
+        const post = this.applyPostExecutorSegmentChecks({
+          state,
+          profile,
+          intentText,
+          options: opts,
+          effectGateTargetPaths,
+          wantsSynthesizer,
+          requiresWorkspaceEvidence,
+          partialStage,
+          onStateChange,
+          request,
+          agentRunId,
+          remainingQueue: remainingNow(),
+        });
+        if (post.finished) return finish(post.finished);
+        partialStage = post.partialStage;
         continue;
       }
       if (stage === "reviewer") {
@@ -5347,10 +5501,28 @@ export class PipelineExecutor {
         continue;
       }
       if (stage === "rewriter") {
+        // M3 gate: only run a queue-scheduled rewriter when there is evidence
+        // it will change the answer (reviewer reject, or explicit replan that
+        // left no accept-path reviewer). Successful-path model-scheduled
+        // rewriter was ~91:1 waste — normalizeRoute also strips it from the
+        // initial pipeline; this is defense-in-depth for repair/replan queues.
         if (!state.rewriter && state.executor) {
+          const allowRewriter = shouldScheduleRewriter({
+            reviewerHasIssues: state.reviewer?.hasIssues === true,
+            // Repair chain / re-enter:rewriter with no prior accept is explicit.
+            explicitReplan: state.reviewer === undefined,
+          });
+          if (!allowRewriter) {
+            console.log(
+              "[Pipeline] M3 rewriter gate: skipped queue rewriter (no reviewer reject / explicit replan)",
+            );
+            continue;
+          }
           state.rewriter = await this.runRewriterStage(
             request,
-            "Standalone rewriter pass from queue.",
+            state.reviewer?.hasIssues
+              ? (state.reviewer.feedback || "Reviewer flagged issues. Rewriting...")
+              : "Standalone rewriter pass from explicit replan queue.",
             renderExecutorSummary(state.executor),
             agentRunId,
             onStateChange,
@@ -5381,7 +5553,8 @@ export class PipelineExecutor {
       (options.maxReviewRepairRounds ?? 1) > 0 &&
       turnWriteIntent &&
       state.executor &&
-      !state.rewriter
+      !state.rewriter &&
+      shouldScheduleRewriter({ effectGateNoWriteEffect: true })
     ) {
       onStateChange({ stage: "rewriter", status: "running", output: "\nNo write effect detected. Repairing before synthesis...\n" });
       state.rewriter = await this.runRewriterStage(

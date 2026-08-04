@@ -1143,6 +1143,88 @@ describe("Orchestration & Routing Tests", () => {
     expect(stages2).toEqual(["planner", "synthesizer"]);
   });
 
+  test("M3: full_execution runs planner ‖ executor concurrently when no plan items", async () => {
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig());
+    const events: Array<{ stage: string; t: number }> = [];
+    const t0 = Date.now();
+    const callModel = async (_messages: ChatMessage[], options: { stageLabel?: string } = {}) => {
+      const stage = options.stageLabel ?? "unknown";
+      events.push({ stage: `${stage}:start`, t: Date.now() - t0 });
+      if (stage === "planner") {
+        await new Promise((r) => setTimeout(r, 80));
+        events.push({ stage: "planner:end", t: Date.now() - t0 });
+        return { content: "PLAN: do the thing" };
+      }
+      if (stage === "executor") {
+        await new Promise((r) => setTimeout(r, 15));
+        events.push({ stage: "executor:end", t: Date.now() - t0 });
+        return { content: "executor narrative", tool_calls: [] };
+      }
+      if (stage === "reviewer") return { content: "ACCEPT — looks complete." };
+      return { content: "noop" };
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+    const segment = await executor.executeSegment(
+      "do the thing",
+      ["planner", "executor", "reviewer"],
+      "run-m3-concurrent",
+      () => {},
+      {
+        turnRequirement: "full_execution",
+        executionProfile: "full",
+        rawMessage: "do the thing",
+        maxReviewRepairRounds: 0,
+      },
+    );
+    expect(segment.state.plan?.ok).toBe(true);
+    expect(segment.state.executor?.ok).toBe(true);
+    const plannerEnd = events.find((e) => e.stage === "planner:end")?.t;
+    const executorStart = events.find((e) => e.stage === "executor:start")?.t;
+    expect(plannerEnd).toBeDefined();
+    expect(executorStart).toBeDefined();
+    // Executor must begin before the slow planner finishes (true overlap).
+    expect(executorStart!).toBeLessThan(plannerEnd!);
+  });
+
+  test("M3: queue rewriter is skipped after reviewer ACCEPT (no repair evidence)", async () => {
+    const runtime = createToolRuntime();
+    const ctx = makeExecutionContext("agent", defaultConfig());
+    const stages: string[] = [];
+    const callModel = async (_messages: ChatMessage[], options: { stageLabel?: string } = {}) => {
+      stages.push(options.stageLabel ?? "unknown");
+      if (options.stageLabel === "executor") {
+        return { content: "executor narrative", tool_calls: [] };
+      }
+      if (options.stageLabel === "reviewer") {
+        return { content: "ACCEPT — complete and correct." };
+      }
+      if (options.stageLabel === "rewriter") {
+        return { content: "should not run" };
+      }
+      if (options.stageLabel === "synthesizer") {
+        return { content: "final answer" };
+      }
+      return { content: "noop" };
+    };
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+    const segment = await executor.executeSegment(
+      "do the thing",
+      ["executor", "reviewer", "rewriter", "synthesizer"],
+      "run-m3-rewriter-gate",
+      () => {},
+      {
+        turnRequirement: "full_execution",
+        executionProfile: "full",
+        rawMessage: "do the thing",
+        maxReviewRepairRounds: 0,
+      },
+    );
+    expect(stages).not.toContain("rewriter");
+    expect(segment.state.rewriter).toBeUndefined();
+    expect(segment.synthesizerAnswer).toBe("final answer");
+  });
+
   test("executeSegment threads carry-forward state into the next segment", async () => {
     // The B-02 replan loop hands the conductor a summarized carry state from
     // segment N, and segment N+1 should be able to read those typed values
