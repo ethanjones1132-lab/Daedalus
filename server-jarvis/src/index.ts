@@ -119,7 +119,13 @@ import { SessionRepetitionStore, assessRepetition, shouldShortCircuitRepeat } fr
 import { Coordinator } from "./orchestration/coordinator";
 import { PersistentConductor } from "./orchestration/persistent-conductor";
 import { SessionMemory, mergeSharedContextHints } from "./orchestration/session-memory";
-import { AgentPool, firstTokenTimeoutFor, formatPoolDiversity, orchestrationRoutingTier } from "./orchestration/agent-pool";
+import {
+  AgentPool,
+  firstTokenTimeoutFor,
+  formatPoolDiversity,
+  orchestrationRoutingTier,
+  preferLocalForStage,
+} from "./orchestration/agent-pool";
 import {
   discoverLiveOrchestratorAgents,
   latestLiveModelCatalogSnapshot,
@@ -1798,10 +1804,42 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const remainingStageMsForPick = stageLabel
             ? turnBudget.stageRemainingMs(stageLabel, Date.now())
             : undefined;
+          // M1b: availability-gated local-first for planner/reviewer. Health is
+          // cached (10s) so this is not a per-stage cold probe. Conductor
+          // primary+fallback are preferred when present; pickFor falls back to
+          // the portable qwen pair when localModels is omitted.
+          let ollamaAvailableForPick = false;
+          let localModelsForPick: string[] | undefined;
+          if (stageLabel && preferLocalForStage(stageLabel)) {
+            try {
+              const health = await checkOllamaHealth(cfg.ollama);
+              ollamaAvailableForPick = health.running;
+              if (ollamaAvailableForPick) {
+                const preferred = [
+                  cfg.orchestrator?.conductor?.model,
+                  cfg.orchestrator?.conductor?.fallback_model,
+                ].filter((m): m is string => typeof m === "string" && m.trim().length > 0);
+                if (preferred.length > 0 && health.models.length > 0) {
+                  const installed = preferred.filter((m) =>
+                    health.models.some((name) =>
+                      name === m || name.startsWith((m.split(":")[0] ?? m) + ":") || name === (m.split(":")[0] ?? m),
+                    ),
+                  );
+                  localModelsForPick = installed.length > 0 ? installed : preferred;
+                } else if (preferred.length > 0) {
+                  localModelsForPick = preferred;
+                }
+              }
+            } catch {
+              ollamaAvailableForPick = false;
+            }
+          }
           const modelSelection = {
             complexity: modelComplexity as "low" | "medium" | "high",
             preferStrong: callOptions?.preferStrongModel === true,
             remainingStageMs: remainingStageMsForPick,
+            ollamaAvailable: ollamaAvailableForPick,
+            localModels: localModelsForPick,
           };
           // F2: one exclusion union for both pool selection and the fallback
           // cascade. A cooldown that reaches only the pool is not a cooldown.

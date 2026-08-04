@@ -65,6 +65,19 @@ export interface AgentSelectionOptions {
    * exceeds this budget are refused before ranking.
    */
   remainingStageMs?: number;
+  /**
+   * M1b: when true and `preferLocalForStage(stage)`, inject conductor-class
+   * local Ollama models and prefer them over remote free/Go pins. Remote
+   * remains available via exclude-driven fallback (same idea as conductor
+   * `fallback_to_api`). Callers gate this on Ollama health.
+   */
+  ollamaAvailable?: boolean;
+  /**
+   * Optional local model ids for M1b injection. Defaults to
+   * {@link DEFAULT_LOCAL_STAGE_MODELS} (qwen3.5:4b / qwen3:8b). Production
+   * wiring usually passes the conductor primary + fallback pair.
+   */
+  localModels?: readonly string[];
 }
 
 export interface AgentPoolCoverage {
@@ -292,6 +305,45 @@ const FREE_ZEN_MODEL_IDS = new Set([
   "hy3-free",
 ]);
 
+/**
+ * M1b: stages that prefer a healthy local Ollama lane before remote free/Go.
+ * Planner and reviewer are reasoning-light enough for the resident qwen-class
+ * models; executor/synthesizer stay remote-first (tool-heavy / user-visible).
+ */
+export function preferLocalForStage(stage: string): boolean {
+  return stage === "planner" || stage === "reviewer";
+}
+
+/**
+ * Portable local models used when M1b injects candidates and the caller did
+ * not supply `selection.localModels`. Mirrors the conductor default pair in
+ * config.ts (`qwen3.5:4b` primary, `qwen3:8b` fallback).
+ */
+export const DEFAULT_LOCAL_STAGE_MODELS: readonly string[] = ["qwen3.5:4b", "qwen3:8b"];
+
+/**
+ * Build a synthetic pool agent for a local Ollama model. Not stage-pinned
+ * (`default_for: []`); selection is driven by {@link preferLocalForStage}
+ * rather than competing with remote `default_for` pins.
+ */
+export function localStageAgent(modelId: string): OrchestratorAgent {
+  const safe = modelId.replace(/[^a-zA-Z0-9._:-]+/g, "-");
+  return {
+    id: `local-stage-${safe}`,
+    provider: "ollama",
+    model_id: modelId,
+    capabilities: {
+      code: 0.72,
+      reasoning: 0.8,
+      speed: 0.88,
+      cost: 1,
+      json_reliability: 0.82,
+    },
+    default_for: [],
+    enabled: true,
+  };
+}
+
 /** User capacity policy: free OpenRouter + free Zen + local Ollama, then Go, then paid tail. */
 export function orchestrationRoutingTier(agent: OrchestratorAgent): number {
   if (agent.billing_tier === "free") return 0;
@@ -393,7 +445,16 @@ export class AgentPool {
         !exclude.has(`${agent.provider}:${agent.model_id}`) &&
         !exclude.has(`${agent.provider}:*`)
       );
-    const candidates = this.enabled().filter(filterExclude).map(applyLearnedCapabilities);
+    let candidates = this.enabled().filter(filterExclude).map(applyLearnedCapabilities);
+    // M1b: when Ollama is healthy and this stage prefers local, inject the
+    // conductor-class local models (or caller-supplied list) so they can win
+    // even if the live pool has no ollama entries. Exclusions still apply so
+    // a failed local hop advances to the next local, then remote.
+    if (preferLocalForStage(stage) && selection.ollamaAvailable) {
+      candidates = this.injectLocalStageCandidates(candidates, exclude, selection);
+      const localPick = this.pickPreferredLocal(candidates, stage, selection);
+      if (localPick) return localPick;
+    }
     if (candidates.length === 0) return undefined;
     // Cost/capacity policy is a hard boundary, not another weighted hint. A
     // perfect Go stage pin must not leapfrog any healthy free OpenRouter/Zen
@@ -438,6 +499,59 @@ export class AgentPool {
       }
     }
     return tierCandidates.sort((a, b) => this.compareWithinTier(a, b, stage, taskType, selection))[0];
+  }
+
+  /**
+   * M1b helper: append synthetic local agents for models not already present
+   * in the candidate set (and not excluded).
+   */
+  private injectLocalStageCandidates(
+    candidates: OrchestratorAgent[],
+    exclude: ReadonlySet<string> | undefined,
+    selection: AgentSelectionOptions,
+  ): OrchestratorAgent[] {
+    const models = selection.localModels?.length
+      ? selection.localModels
+      : DEFAULT_LOCAL_STAGE_MODELS;
+    const keys = new Set(candidates.map((agent) => `${agent.provider}:${agent.model_id}`));
+    const injected: OrchestratorAgent[] = [];
+    for (const modelId of models) {
+      const key = `ollama:${modelId}`;
+      if (keys.has(key)) continue;
+      if (exclude?.has(key) || exclude?.has("ollama:*")) continue;
+      injected.push(applyLearnedCapabilities(localStageAgent(modelId)));
+      keys.add(key);
+    }
+    return injected.length > 0 ? [...candidates, ...injected] : candidates;
+  }
+
+  /**
+   * M1b helper: pick the preferred local Ollama agent for a stage.
+   * Order: stage-pinned ollama agent (operator config), then preferred model
+   * list order, then any remaining ollama agent. Returns undefined when no
+   * local candidate remains (caller falls through to remote ranking).
+   */
+  private pickPreferredLocal(
+    candidates: OrchestratorAgent[],
+    stage: string,
+    selection: AgentSelectionOptions,
+  ): OrchestratorAgent | undefined {
+    const locals = candidates.filter((agent) => agent.provider === "ollama");
+    if (locals.length === 0) return undefined;
+    const stagePinned = locals.find((agent) => agent.default_for.includes(stage));
+    if (stagePinned) return stagePinned;
+    const models = selection.localModels?.length
+      ? selection.localModels
+      : DEFAULT_LOCAL_STAGE_MODELS;
+    locals.sort((a, b) => {
+      const ia = models.indexOf(a.model_id);
+      const ib = models.indexOf(b.model_id);
+      const ra = ia === -1 ? 1000 : ia;
+      const rb = ib === -1 ? 1000 : ib;
+      if (ra !== rb) return ra - rb;
+      return a.id.localeCompare(b.id);
+    });
+    return locals[0];
   }
 
   /**

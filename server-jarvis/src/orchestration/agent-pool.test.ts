@@ -1,10 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
   AgentPool,
+  DEFAULT_LOCAL_STAGE_MODELS,
   DEFAULT_ORCHESTRATOR_AGENTS,
   firstTokenTimeoutFor,
   formatPoolDiversity,
+  localStageAgent,
   orchestrationRoutingTier,
+  preferLocalForStage,
   type OrchestratorAgent,
 } from "./agent-pool";
 import { getLearnedPoolState } from "../self-tuning/learned-pool-state";
@@ -1124,6 +1127,171 @@ describe("orchestrationRoutingTier — local ollama lane", () => {
     ]);
     const picked = pool.pickFor("reviewer", "general");
     expect(picked?.id).toBe("local-qwythos-reviewer");
+  });
+});
+
+describe("M1b preferLocalForStage + local-first pick", () => {
+  test("preferLocalForStage is true for planner and reviewer only", () => {
+    expect(preferLocalForStage("planner")).toBe(true);
+    expect(preferLocalForStage("reviewer")).toBe(true);
+    expect(preferLocalForStage("executor")).toBe(false);
+    expect(preferLocalForStage("synthesizer")).toBe(false);
+    expect(preferLocalForStage("coordinator")).toBe(false);
+    expect(preferLocalForStage("rewriter")).toBe(false);
+  });
+
+  test("localStageAgent builds an enabled ollama provider agent", () => {
+    const agent = localStageAgent("qwen3.5:4b");
+    expect(agent.provider).toBe("ollama");
+    expect(agent.model_id).toBe("qwen3.5:4b");
+    expect(agent.enabled).toBe(true);
+    expect(agent.default_for).toEqual([]);
+  });
+
+  test("pool pick with ollamaAvailable puts local model first for planner", () => {
+    // Remote free pin would otherwise win the planner stage; M1b injects the
+    // portable local pair and prefers ollama when the health gate is open.
+    const pool = new AgentPool([
+      {
+        id: "remote-planner",
+        provider: "openrouter",
+        model_id: "nvidia/nemotron-3-ultra-550b-a55b:free",
+        capabilities: { code: 0.78, reasoning: 0.96, speed: 0.42, cost: 1, json_reliability: 0.88 },
+        default_for: ["planner"],
+        enabled: true,
+      },
+      {
+        id: "remote-free",
+        provider: "openrouter",
+        model_id: "openrouter/free",
+        capabilities: { code: 0.55, reasoning: 0.65, speed: 0.8, cost: 1, json_reliability: 0.72 },
+        default_for: [],
+        enabled: true,
+      },
+    ]);
+    const withoutLocal = pool.pickFor("planner", "general");
+    expect(withoutLocal?.provider).not.toBe("ollama");
+
+    const withLocal = pool.pickFor("planner", "general", undefined, {
+      ollamaAvailable: true,
+    });
+    expect(withLocal?.provider).toBe("ollama");
+    expect(withLocal?.model_id).toBe(DEFAULT_LOCAL_STAGE_MODELS[0]);
+  });
+
+  test("pool pick with ollamaAvailable puts local model first for reviewer", () => {
+    const pool = new AgentPool([
+      {
+        id: "remote-reviewer",
+        provider: "openrouter",
+        model_id: "nvidia/nemotron-3-ultra-550b-a55b:free",
+        capabilities: { code: 0.78, reasoning: 0.96, speed: 0.42, cost: 1, json_reliability: 0.88 },
+        default_for: ["reviewer"],
+        enabled: true,
+      },
+    ]);
+    const withLocal = pool.pickFor("reviewer", "code_review", undefined, {
+      ollamaAvailable: true,
+      localModels: ["qwen3:8b", "qwen3.5:4b"],
+    });
+    expect(withLocal?.provider).toBe("ollama");
+    expect(withLocal?.model_id).toBe("qwen3:8b");
+  });
+
+  test("executor and synthesizer ignore ollamaAvailable (no local-first)", () => {
+    const pool = new AgentPool([
+      {
+        id: "remote-executor",
+        provider: "openrouter",
+        model_id: "openrouter/free",
+        capabilities: { code: 0.9, reasoning: 0.7, speed: 0.8, cost: 1, json_reliability: 0.8 },
+        default_for: ["executor", "synthesizer"],
+        enabled: true,
+      },
+    ]);
+    expect(pool.pickFor("executor", "refactor", undefined, { ollamaAvailable: true })?.provider)
+      .toBe("openrouter");
+    expect(pool.pickFor("synthesizer", "general", undefined, { ollamaAvailable: true })?.provider)
+      .toBe("openrouter");
+  });
+
+  test("operator-pinned ollama default_for wins over injected portable locals", () => {
+    const pool = new AgentPool([
+      {
+        id: "local-qwythos-reviewer",
+        provider: "ollama",
+        model_id: "qwythos9b-conductor:latest",
+        capabilities: { code: 0.65, reasoning: 0.7, speed: 0.9, cost: 1, json_reliability: 0.75 },
+        default_for: ["reviewer"],
+        enabled: true,
+      },
+      {
+        id: "remote-free",
+        provider: "openrouter",
+        model_id: "openrouter/free",
+        capabilities: { code: 0.55, reasoning: 0.65, speed: 0.8, cost: 1, json_reliability: 0.72 },
+        default_for: [],
+        enabled: true,
+      },
+    ]);
+    const picked = pool.pickFor("reviewer", "general", undefined, {
+      ollamaAvailable: true,
+      localModels: ["qwen3.5:4b"],
+    });
+    expect(picked?.id).toBe("local-qwythos-reviewer");
+  });
+
+  test("excluded local advances to next local then remote", () => {
+    const pool = new AgentPool([
+      {
+        id: "remote-planner",
+        provider: "openrouter",
+        model_id: "openrouter/free",
+        capabilities: { code: 0.55, reasoning: 0.65, speed: 0.8, cost: 1, json_reliability: 0.72 },
+        default_for: ["planner"],
+        enabled: true,
+      },
+    ]);
+    const first = pool.pickFor("planner", "plan", undefined, {
+      ollamaAvailable: true,
+      localModels: ["qwen3.5:4b", "qwen3:8b"],
+    });
+    expect(first?.model_id).toBe("qwen3.5:4b");
+
+    const second = pool.pickFor(
+      "planner",
+      "plan",
+      new Set([`ollama:${first!.model_id}`]),
+      { ollamaAvailable: true, localModels: ["qwen3.5:4b", "qwen3:8b"] },
+    );
+    expect(second?.provider).toBe("ollama");
+    expect(second?.model_id).toBe("qwen3:8b");
+
+    const remote = pool.pickFor(
+      "planner",
+      "plan",
+      new Set(["ollama:qwen3.5:4b", "ollama:qwen3:8b"]),
+      { ollamaAvailable: true, localModels: ["qwen3.5:4b", "qwen3:8b"] },
+    );
+    expect(remote?.provider).toBe("openrouter");
+    expect(remote?.model_id).toBe("openrouter/free");
+  });
+
+  test("ollamaAvailable false leaves remote stage pin in place", () => {
+    const pool = new AgentPool([
+      {
+        id: "remote-planner",
+        provider: "openrouter",
+        model_id: "openrouter/free",
+        capabilities: { code: 0.55, reasoning: 0.65, speed: 0.8, cost: 1, json_reliability: 0.72 },
+        default_for: ["planner"],
+        enabled: true,
+      },
+    ]);
+    const picked = pool.pickFor("planner", "general", undefined, {
+      ollamaAvailable: false,
+    });
+    expect(picked?.id).toBe("remote-planner");
   });
 });
 
