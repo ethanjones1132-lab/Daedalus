@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useLayoutEffect } from 'react';
+import { useState, useEffect, useRef, useCallback, useLayoutEffect, memo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
@@ -25,8 +25,10 @@ import {
   SendGate,
   SendInFlightGuard,
   appendAgentProgress,
+  buildActivityFeed,
   dedupeMessages,
   finalizeStreamingMessages,
+  formatActivityFeedSummary,
   formatAgentProgressSummary,
   formatFallbackProgress,
   formatInferenceRoute,
@@ -36,6 +38,7 @@ import {
   recoverComposerAfterFailure,
   sanitizeAssistantDisplay,
   shouldSubmitComposerKey,
+  type ActivityItem,
   type ToolCallState,
 } from './chat-state';
 import { errorDisplayForCode } from './error-display';
@@ -499,20 +502,68 @@ export function ChatPanel({
     return sid === current;
   }, []);
 
-  const appendAssistantText = useCallback((text: string) => {
-    if (!text) return;
-    setError(null);
-    setPipelineStage('');
-    setMessages(prev => {
-      const last = prev[prev.length - 1];
-      if (last && last.role === 'assistant' && last.isStreaming) {
-        return [...prev.slice(0, -1), { ...last, content: last.content + text }];
-      }
-      return [...prev, { role: 'assistant', content: text, isStreaming: true }];
-    });
+  // M6 — coalesce token deltas into one setMessages per animation frame so
+  // high-frequency SSE token events don't thrash React with N re-renders
+  // per second. Buffer into a ref; rAF (or immediate sync flush on finalize
+  // / error / cancel / session switch) applies the concatenated chunk.
+  const pendingTokenRef = useRef('');
+  const tokenRafRef = useRef<number | null>(null);
+
+  const cancelTokenRaf = useCallback(() => {
+    if (tokenRafRef.current !== null) {
+      cancelAnimationFrame(tokenRafRef.current);
+      tokenRafRef.current = null;
+    }
   }, []);
 
+  /** Drain the token buffer; cancel any scheduled rAF. Returns the text. */
+  const takePendingTokens = useCallback(() => {
+    cancelTokenRaf();
+    const text = pendingTokenRef.current;
+    pendingTokenRef.current = '';
+    return text;
+  }, [cancelTokenRaf]);
+
+  /** Append a text chunk onto the streaming assistant bubble (pure). */
+  const applyTokenChunk = useCallback((prev: JarvisMessage[], text: string): JarvisMessage[] => {
+    if (!text) return prev;
+    const last = prev[prev.length - 1];
+    if (last && last.role === 'assistant' && last.isStreaming) {
+      return [...prev.slice(0, -1), { ...last, content: last.content + text }];
+    }
+    return [...prev, { role: 'assistant', content: text, isStreaming: true }];
+  }, []);
+
+  /** Apply any buffered tokens into messages state (rAF path). */
+  const flushPendingTokens = useCallback(() => {
+    tokenRafRef.current = null;
+    const text = pendingTokenRef.current;
+    if (!text) return;
+    pendingTokenRef.current = '';
+    setError(null);
+    setPipelineStage('');
+    setMessages(prev => applyTokenChunk(prev, text));
+  }, [applyTokenChunk]);
+
+  /** Drop buffered tokens + cancel rAF (session wipe / new chat). */
+  const discardPendingTokens = useCallback(() => {
+    cancelTokenRaf();
+    pendingTokenRef.current = '';
+  }, [cancelTokenRaf]);
+
+  const appendAssistantText = useCallback((text: string) => {
+    if (!text) return;
+    pendingTokenRef.current += text;
+    if (tokenRafRef.current !== null) return;
+    tokenRafRef.current = requestAnimationFrame(() => {
+      flushPendingTokens();
+    });
+  }, [flushPendingTokens]);
+
   const finalizeAssistantMessage = useCallback((sid?: string) => {
+    // Drain rAF buffer inside the same setMessages as finalize so React
+    // batching cannot drop the last ~16ms of streamed text.
+    const pending = takePendingTokens();
     setIsStreaming(false);
     setPipelineStage('');
     setRecursionDepth(null);
@@ -520,8 +571,9 @@ export function ChatPanel({
     setUserPinnedToBottom(true);
     const effectiveSid = sid || activeSessionRef.current || sessionIdRef.current;
     setMessages(prev => {
-      const last = prev[prev.length - 1];
-      const finalizedMessages = finalizeStreamingMessages(prev);
+      const withTokens = applyTokenChunk(prev, pending);
+      const last = withTokens[withTokens.length - 1];
+      const finalizedMessages = finalizeStreamingMessages(withTokens);
       const finalized = finalizedMessages[finalizedMessages.length - 1];
       if (last?.role === 'assistant' && last.isStreaming) {
         if (effectiveSid && finalized?.role === 'assistant' && finalized.content.trim()) {
@@ -533,10 +585,10 @@ export function ChatPanel({
         }
         return finalizedMessages;
       }
-      return prev;
+      return withTokens;
     });
     onSessionCreatedRef.current();
-  }, []);
+  }, [applyTokenChunk, takePendingTokens]);
 
   // Reduced-motion respect — we use it to disable token fade-in / shimmer.
   const prefersReducedMotion = useRef(false);
@@ -604,6 +656,7 @@ export function ChatPanel({
       streamAbortRef.current = null;
       sendGateRef.current.invalidate();
       stopRequestedRef.current = false;
+      discardPendingTokens();
       setMessages([]);
       setIsStreaming(false);
       setPipelineStage('');
@@ -625,6 +678,7 @@ export function ChatPanel({
       lastAccumulatedRunIdRef.current = undefined;
     }
     if (!activeSession) {
+      discardPendingTokens();
       setMessages([]);
       setSessionId('');
       setToolCalls([]);
@@ -666,7 +720,10 @@ export function ChatPanel({
         if (!cancelled) setLoadingHistory(false);
       });
     return () => { cancelled = true; };
-  }, [activeSession, scrollToBottom]);
+  }, [activeSession, scrollToBottom, discardPendingTokens]);
+
+  // Cancel any pending token rAF on unmount so we never setState after teardown.
+  useEffect(() => () => { discardPendingTokens(); }, [discardPendingTokens]);
 
   // Register jarvis:// listeners once on mount. Async listen() + deps that
   // change during streaming causes a re-subscribe storm (jarvis-tauri-listen-race).
@@ -701,6 +758,7 @@ export function ChatPanel({
     // frames) — reported as a gap below rather than changing Rust.
     track(listen<{ error: string; session_id: string; code?: string }>('jarvis://error', (event) => {
       if (!matchesStreamSession(event.payload.session_id)) return;
+      const pending = takePendingTokens();
       setIsStreaming(false);
       setPipelineStage('');
       setRecursionDepth(null);
@@ -708,14 +766,15 @@ export function ChatPanel({
       setError(event.payload.error);
       setUserPinnedToBottom(true);
       setMessages(prev => {
-        const last = prev[prev.length - 1];
+        const withTokens = applyTokenChunk(prev, pending);
+        const last = withTokens[withTokens.length - 1];
         if (last && last.isStreaming) {
           // If nothing streamed before the error (e.g. a turn-fatal auth
           // failure), turn the bubble into a designed error bubble showing
           // the message text (instead of silently dropping it, which left
           // the user with only their own message + the easy-to-miss banner).
           const partial = last.content.trim();
-          return [...prev.slice(0, -1), {
+          return [...withTokens.slice(0, -1), {
             ...last,
             content: partial ? last.content : event.payload.error,
             isStreaming: false,
@@ -723,7 +782,7 @@ export function ChatPanel({
             errorCode: event.payload.code,
           }];
         }
-        return prev;
+        return withTokens;
       });
     }));
 
@@ -736,18 +795,20 @@ export function ChatPanel({
     // further UI changes.
     track(listen<{ session_id: string }>('jarvis://cancelled', (event) => {
       if (!matchesStreamSession(event.payload.session_id)) return;
+      const pending = takePendingTokens();
       setIsStreaming(false);
       setPipelineStage('');
       setRecursionDepth(null);
       setError(null);
       setMessages(prev => {
-        const last = prev[prev.length - 1];
+        const withTokens = applyTokenChunk(prev, pending);
+        const last = withTokens[withTokens.length - 1];
         if (last?.role === 'assistant' && last.isStreaming) {
           const content = sanitizeAssistantDisplay(last.content);
-          if (!content) return prev.slice(0, -1);
-          return [...prev.slice(0, -1), { ...last, content, isStreaming: false, isCancelled: true }];
+          if (!content) return withTokens.slice(0, -1);
+          return [...withTokens.slice(0, -1), { ...last, content, isStreaming: false, isCancelled: true }];
         }
-        return prev;
+        return withTokens;
       });
     }));
 
@@ -846,7 +907,7 @@ export function ChatPanel({
       disposed = true;
       unsubs.forEach((f) => f());
     };
-  }, [appendAssistantText, finalizeAssistantMessage, matchesStreamSession]);
+  }, [appendAssistantText, applyTokenChunk, finalizeAssistantMessage, matchesStreamSession, takePendingTokens]);
 
   // True autosize composer (Phase 2.4). The previous rows=⟨line-count⟩ approach
   // overflowed for single-line wrapped text.
@@ -1194,17 +1255,19 @@ export function ChatPanel({
         // server build omits the field.
         runAcc.outcome = 'cancelled';
         runAcc.cancelledReason = typeof frame.reason === 'string' ? frame.reason : 'user_stop';
+        const pending = takePendingTokens();
         setIsStreaming(false);
         stopRequestedRef.current = false;
         setError(null);
         setMessages(prev => {
-          const last = prev[prev.length - 1];
+          const withTokens = applyTokenChunk(prev, pending);
+          const last = withTokens[withTokens.length - 1];
           if (last?.role === 'assistant' && last.isStreaming) {
             const content = sanitizeAssistantDisplay(last.content);
-            if (!content) return prev.slice(0, -1);
-            return [...prev.slice(0, -1), { ...last, content, isStreaming: false, isCancelled: true }];
+            if (!content) return withTokens.slice(0, -1);
+            return [...withTokens.slice(0, -1), { ...last, content, isStreaming: false, isCancelled: true }];
           }
-          return finalizeStreamingMessages(prev);
+          return finalizeStreamingMessages(withTokens);
         });
         return;
       }
@@ -1277,7 +1340,7 @@ export function ChatPanel({
 
     if (sendGateRef.current.isCurrent(sendGeneration)) finalizeAssistantMessage(sid);
     if (streamAbortRef.current === controller) streamAbortRef.current = null;
-  }, [appendAssistantText, finalizeAssistantMessage]);
+  }, [appendAssistantText, applyTokenChunk, finalizeAssistantMessage, takePendingTokens]);
 
   const handleSend = useCallback(async () => {
     // 2026-07-13 live incident (session 7254c3ae): the `isStreaming` React
@@ -1306,6 +1369,7 @@ export function ChatPanel({
     const history = messages
       .filter((msg) => !msg.isStreaming && msg.content.trim())
       .map((msg) => ({ role: msg.role, content: msg.content }));
+    discardPendingTokens();
     setError(null);
     setIsStreaming(true);
     turnStartedAtRef.current = Date.now();
@@ -1354,11 +1418,12 @@ export function ChatPanel({
     } catch (e) {
       if (!sendGateRef.current.isCurrent(sendGeneration)) return;
       streamAbortRef.current = null;
+      const pending = takePendingTokens();
       setIsStreaming(false);
       if (stopRequestedRef.current) {
         stopRequestedRef.current = false;
         setError(null);
-        setMessages(prev => finalizeStreamingMessages(prev));
+        setMessages(prev => finalizeStreamingMessages(applyTokenChunk(prev, pending)));
         return;
       }
       // Task 7 Part C (incident 1d4727cf): finalize the streaming bubble into
@@ -1370,10 +1435,11 @@ export function ChatPanel({
       setError(errorMessage);
       setInput(current => recoverComposerAfterFailure(current, userMsg));
       setMessages(prev => {
-        const last = prev[prev.length - 1];
+        const withTokens = applyTokenChunk(prev, pending);
+        const last = withTokens[withTokens.length - 1];
         if (last?.role === 'assistant' && last.isStreaming) {
           const partial = last.content.trim();
-          return [...prev.slice(0, -1), {
+          return [...withTokens.slice(0, -1), {
             ...last,
             content: partial ? last.content : errorMessage,
             isStreaming: false,
@@ -1381,7 +1447,7 @@ export function ChatPanel({
             errorCode,
           }];
         }
-        return prev;
+        return withTokens;
       });
     } finally {
       sendGateRef.current.release(sendGeneration);
@@ -1392,7 +1458,7 @@ export function ChatPanel({
       // now" check that needs a single finish() on every exit.
       sendInFlightRef.current.finish();
     }
-  }, [input, isStreaming, messages, activeSession, sessionId, onSessionCreated, setActiveSession, streamFromJarvisApi]);
+  }, [input, isStreaming, messages, activeSession, sessionId, onSessionCreated, setActiveSession, streamFromJarvisApi, discardPendingTokens, takePendingTokens, applyTokenChunk]);
 
   // Phase 1.3 — real Stop. POST /chat/cancel on the Bun server; SseRelay now
   // treats the resulting `cancelled` frame as terminal, so isStreaming flips.
@@ -1474,6 +1540,7 @@ export function ChatPanel({
     streamAbortRef.current = null;
     sendGateRef.current.invalidate();
     stopRequestedRef.current = false;
+    discardPendingTokens();
     setIsStreaming(false);
     setMessages([]);
     setSessionId('');
@@ -1686,14 +1753,20 @@ export function ChatPanel({
 
         <WorkspaceGrantsChip sessionId={sessionId} isStreaming={isStreaming} />
 
-        {/* Inline tool-call cards (Phase 3.1). */}
-        {toolCalls.length > 0 && (
-          <div className="space-y-1.5">
-            {toolCalls.map((call, i) => (
-              <ToolCallCard key={`tc-${i}`} call={call} />
-            ))}
-          </div>
-        )}
+        {/* M4 — unified activity feed (agentSteps + toolCalls + pipelineStage). */}
+        {(() => {
+          const activityFeed = buildActivityFeed(agentSteps, toolCalls, pipelineStage || undefined);
+          if (activityFeed.length === 0) return null;
+          return (
+            <ActivityFeed
+              items={activityFeed}
+              isStreaming={isStreaming}
+              turnElapsedMs={turnElapsedMs}
+              recursionDepth={recursionDepth}
+              prefersReducedMotion={prefersReducedMotion.current}
+            />
+          );
+        })()}
 
         {runMetrics && (
           <div
@@ -1727,39 +1800,16 @@ export function ChatPanel({
           </div>
         )}
 
-        {/* Reasoning + Agents combined disclosure — accordion with per-stage rows */}
-        {(reasoningText || agentSteps.length > 0) && (
+        {/* Reasoning disclosure only — agent progress lives in Activity feed. */}
+        {reasoningText && (
           <ReasoningAgentsAccordion
             reasoningText={reasoningText}
-            agentSteps={agentSteps}
+            agentSteps={[]}
             showAgents={showAgents}
             setShowAgents={setShowAgents}
             showReasoning={showReasoning}
             setShowReasoning={setShowReasoning}
           />
-        )}
-
-        {/* Pipeline stage breadcrumb (orchestrator mode) */}
-        {pipelineStage && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            className="flex items-center gap-2 px-3 py-2 bg-royal/5 border border-royal/15 rounded-lg text-[10px] font-mono text-royal-light"
-            aria-label={`Orchestrator stage: ${pipelineStage}`}
-          >
-            <motion.span
-              animate={{ opacity: prefersReducedMotion.current ? 1 : [0.4, 1, 0.4] }}
-              transition={{ duration: 1.2, repeat: prefersReducedMotion.current ? 0 : Infinity }}
-              aria-hidden="true"
-            >
-              <Sparkles size={11} />
-            </motion.span>
-            <span className="uppercase tracking-wider">{pipelineStage}</span>
-            {recursionDepth !== null && (
-              <span className="text-bone-faint">↩ depth {recursionDepth}</span>
-            )}
-            {recursionDepth === null && <span className="text-bone-faint">{formatRunDuration(turnElapsedMs)}</span>}
-          </motion.div>
         )}
 
         {error && (
@@ -1907,6 +1957,48 @@ export function ChatPanel({
 }
 
 // ═══════════════════════════════════════════════════════════════
+// ── Streaming message body leaf (M6) ──
+// Memoized so token flushes re-render only the body, not the full
+// bubble chrome / tree above. rAF coalesce already batches updates;
+// this keeps the residual work small.
+// ═══════════════════════════════════════════════════════════════
+
+const StreamingMessageBody = memo(function StreamingMessageBody({
+  content,
+  isStreaming,
+  isCancelled,
+  isToolEcho,
+  streamStatus,
+  prefersReducedMotion,
+}: {
+  content: string;
+  isStreaming: boolean;
+  isCancelled: boolean;
+  isToolEcho: boolean;
+  streamStatus?: string;
+  prefersReducedMotion: boolean;
+}) {
+  if (isCancelled) return <>(stopped)</>;
+  if (streamStatus) {
+    return <span className="text-bone-faint font-mono text-xs">{streamStatus}</span>;
+  }
+  if (isToolEcho) return <ToolCallEchoCard content={content} />;
+  return (
+    <>
+      <MarkdownView content={content} />
+      {isStreaming && (
+        <motion.span
+          className="inline-block w-1.5 h-3.5 bg-cyan-neon/70 ml-0.5 align-middle rounded-sm"
+          animate={prefersReducedMotion ? undefined : { opacity: [0, 1, 0] }}
+          transition={{ duration: 0.8, repeat: prefersReducedMotion ? 0 : Infinity }}
+          aria-hidden="true"
+        />
+      )}
+    </>
+  );
+});
+
+// ═══════════════════════════════════════════════════════════════
 // ── Chat Message Bubble (Phase 2.2 + 2.7 + 4) ──
 // ═══════════════════════════════════════════════════════════════
 
@@ -2038,21 +2130,16 @@ function ChatMessage({
       )}>
         {isUser || isTool
           ? displayContent
-          : isCancelledBubble
-            ? '(stopped)'
-            : streamStatus
-              ? <span className="text-bone-faint font-mono text-xs">{streamStatus}</span>
-              : isToolEcho
-                ? <ToolCallEchoCard content={displayContent} />
-                : <MarkdownView content={displayContent} />}
-        {message.isStreaming && (
-          <motion.span
-            className="inline-block w-1.5 h-3.5 bg-cyan-neon/70 ml-0.5 align-middle rounded-sm"
-            animate={prefersReducedMotion ? undefined : { opacity: [0, 1, 0] }}
-            transition={{ duration: 0.8, repeat: prefersReducedMotion ? 0 : Infinity }}
-            aria-hidden="true"
-          />
-        )}
+          : (
+            <StreamingMessageBody
+              content={displayContent}
+              isStreaming={!!message.isStreaming}
+              isCancelled={!!isCancelledBubble}
+              isToolEcho={isToolEcho}
+              streamStatus={streamStatus}
+              prefersReducedMotion={prefersReducedMotion}
+            />
+          )}
         {isErrorBubble && errorDisplay && (
           <div className="mt-2 text-xs italic text-bone-dim">
             {errorDisplay.hint ?? `code: ${message.errorCode ?? 'unknown'}`}
@@ -2168,6 +2255,118 @@ function ToolCallCard({ call }: {
                 <pre className={cn('text-[10px] font-mono whitespace-pre-wrap break-words bg-void/40 rounded p-2 max-h-48 overflow-y-auto', call.is_error ? 'text-error' : 'text-bone-dim')}>{call.result}</pre>
               </div>
             )}
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ── Activity feed (M4) — stages + tools + plan rows ──
+// ═══════════════════════════════════════════════════════════════
+
+function ActivityFeed({
+  items,
+  isStreaming,
+  turnElapsedMs,
+  recursionDepth,
+  prefersReducedMotion,
+}: {
+  items: ActivityItem[];
+  isStreaming: boolean;
+  turnElapsedMs: number;
+  recursionDepth: number | null;
+  prefersReducedMotion: boolean;
+}) {
+  // Default expanded while streaming, collapsed when the turn finishes.
+  // Users can still toggle mid-turn; the next isStreaming flip re-syncs.
+  const [open, setOpen] = useState(isStreaming);
+  useEffect(() => {
+    setOpen(isStreaming);
+  }, [isStreaming]);
+
+  const summary = formatActivityFeedSummary(items);
+
+  return (
+    <div
+      className="border border-iron/20 rounded-lg overflow-hidden mr-8"
+      aria-label="Turn activity"
+    >
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="w-full flex items-center gap-2 px-3 py-1.5 text-[10px] font-mono text-bone-faint hover:text-bone-dim transition-colors bg-obsidian/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
+      >
+        <span aria-hidden="true">{open ? <ChevronDown size={10} /> : <ChevronRight size={10} />}</span>
+        <span className="text-royal-light uppercase tracking-wider">Activity</span>
+        {isStreaming && (
+          <motion.span
+            className="text-cyan-neon flex items-center gap-1"
+            animate={prefersReducedMotion ? undefined : { opacity: [0.4, 1, 0.4] }}
+            transition={{ duration: 1.2, repeat: prefersReducedMotion ? 0 : Infinity }}
+            aria-hidden="true"
+          >
+            <LoaderCircle size={9} className={prefersReducedMotion ? '' : 'animate-spin'} />
+          </motion.span>
+        )}
+        <span className="ml-auto opacity-50 flex items-center gap-2">
+          <span>{summary}</span>
+          {isStreaming && recursionDepth === null && (
+            <span className="text-bone-faint">{formatRunDuration(turnElapsedMs)}</span>
+          )}
+          {recursionDepth !== null && (
+            <span className="text-bone-faint">↩ depth {recursionDepth}</span>
+          )}
+        </span>
+      </button>
+      <AnimatePresence initial={false}>
+        {open && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.18 }}
+            className="px-3 py-2 space-y-2 max-h-72 overflow-y-auto bg-obsidian/20"
+          >
+            {items.map((item) => {
+              if (item.kind === 'tool') {
+                return <ToolCallCard key={item.id} call={item.call} />;
+              }
+              if (item.kind === 'stage') {
+                return (
+                  <div
+                    key={item.id}
+                    className="flex items-center gap-2 px-2 py-1.5 rounded-md bg-royal/5 border border-royal/15 text-[10px] font-mono text-royal-light"
+                    aria-label={`Orchestrator stage: ${item.stage}`}
+                  >
+                    <motion.span
+                      animate={prefersReducedMotion ? undefined : { opacity: [0.4, 1, 0.4] }}
+                      transition={{ duration: 1.2, repeat: prefersReducedMotion ? 0 : Infinity }}
+                      aria-hidden="true"
+                    >
+                      <Sparkles size={11} />
+                    </motion.span>
+                    <span className="uppercase tracking-wider">{item.stage}</span>
+                    {isStreaming && (
+                      <span className="text-bone-faint ml-auto">running</span>
+                    )}
+                  </div>
+                );
+              }
+              // plan
+              return (
+                <div key={item.id} className="px-1">
+                  <div className="text-[9px] font-mono text-royal-light uppercase tracking-widest mb-0.5 flex items-center gap-1">
+                    <Sparkles size={9} /> {item.stage}
+                  </div>
+                  <div className="text-[11px] font-mono text-bone-faint whitespace-pre-wrap leading-relaxed">
+                    {item.text}
+                  </div>
+                </div>
+              );
+            })}
           </motion.div>
         )}
       </AnimatePresence>

@@ -3,8 +3,10 @@ import {
   SendGate,
   SendInFlightGuard,
   appendAgentProgress,
+  buildActivityFeed,
   dedupeMessages,
   finalizeStreamingMessages,
+  formatActivityFeedSummary,
   formatAgentProgressSummary,
   formatFallbackProgress,
   formatInferenceRoute,
@@ -330,5 +332,78 @@ describe('orchestration status formatting', () => {
   it('formats sub-minute and multi-minute run durations compactly', () => {
     expect(formatRunDuration(5_528)).toBe('5.5s');
     expect(formatRunDuration(74_215)).toBe('1m 14.2s');
+  });
+});
+
+describe('buildActivityFeed', () => {
+  const tools: ToolCallState[] = [
+    { call_id: 'c1', name: 'read_file', arguments: { path: 'a.ts' }, result: 'ok' },
+    { call_id: 'c2', name: 'list_directory', arguments: { path: '.' } },
+  ];
+
+  it('returns an empty feed when nothing is happening', () => {
+    expect(buildActivityFeed([], [])).toEqual([]);
+    expect(buildActivityFeed([], [], '')).toEqual([]);
+    expect(buildActivityFeed([], [], '   ')).toEqual([]);
+  });
+
+  it('maps agent steps to plan rows and toolCalls to tool rows in order', () => {
+    const feed = buildActivityFeed(
+      [
+        { stage: 'executor', text: 'started' },
+        { stage: 'executor', text: 'used read_file' },
+      ],
+      tools,
+    );
+
+    expect(feed.map((item) => item.kind)).toEqual(['plan', 'plan', 'tool', 'tool']);
+    expect(feed[0]).toMatchObject({ kind: 'plan', stage: 'executor', text: 'started' });
+    expect(feed[2]).toMatchObject({ kind: 'tool', id: 'tool-c1' });
+    expect(feed[3]).toMatchObject({ kind: 'tool', id: 'tool-c2' });
+    if (feed[2].kind === 'tool') expect(feed[2].call.name).toBe('read_file');
+  });
+
+  it('appends a live stage row when pipelineStage is set and not already current', () => {
+    const feed = buildActivityFeed(
+      [{ stage: 'planner', text: 'started' }],
+      [],
+      'executor',
+    );
+    expect(feed).toHaveLength(2);
+    expect(feed[1]).toMatchObject({ kind: 'stage', stage: 'executor' });
+  });
+
+  it('does not duplicate pipelineStage when the latest plan is already that stage', () => {
+    const feed = buildActivityFeed(
+      [{ stage: 'executor', text: 'started' }],
+      [],
+      'executor',
+    );
+    expect(feed).toHaveLength(1);
+    expect(feed[0].kind).toBe('plan');
+  });
+
+  it('emits a live stage-only feed when tools and plans are empty', () => {
+    const feed = buildActivityFeed([], [], 'synthesizer');
+    expect(feed).toEqual([{ kind: 'stage', id: 'stage-live-synthesizer', stage: 'synthesizer' }]);
+  });
+
+  it('skips blank plan text and still keeps tools', () => {
+    const feed = buildActivityFeed(
+      [{ stage: 'executor', text: '   ' }],
+      [{ name: 'read_file', arguments: {} }],
+    );
+    expect(feed).toHaveLength(1);
+    expect(feed[0].kind).toBe('tool');
+  });
+
+  it('summarizes plan/tool/stage counts for the collapsible header', () => {
+    const feed = buildActivityFeed(
+      [{ stage: 'executor', text: 'started' }],
+      tools,
+      'synthesizer',
+    );
+    expect(formatActivityFeedSummary(feed)).toBe('1 event · 2 tools · synthesizer');
+    expect(formatActivityFeedSummary([])).toBe('idle');
   });
 });

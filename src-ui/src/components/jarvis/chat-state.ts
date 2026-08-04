@@ -271,6 +271,91 @@ export function formatAgentProgressSummary(
     + `${steps.length} event${steps.length === 1 ? '' : 's'}`;
 }
 
+// ── Unified activity feed (M4) ──
+//
+// Collapses agentSteps + toolCalls + live pipelineStage into one list the
+// chat panel can render as a collapsible "Activity" section above the
+// answer. Pure / order-preserving: steps then tools, with an optional live
+// stage row when the orchestrator is mid-stage.
+
+export type ActivityItem =
+  | { kind: 'stage'; id: string; stage: string }
+  | { kind: 'tool'; id: string; call: ToolCallState }
+  | { kind: 'plan'; id: string; stage: string; text: string };
+
+/**
+ * Build a chronological activity feed from existing turn telemetry.
+ *
+ * - `agentSteps` → `plan` rows (deterministic stage/tool progress text)
+ * - `toolCalls` → `tool` rows (reuse ToolCallCard in the UI)
+ * - `pipelineStage` → trailing live `stage` row when non-empty and not
+ *   already the most recent plan/stage label
+ */
+export function buildActivityFeed(
+  agentSteps: Array<{ stage: string; text: string }>,
+  toolCalls: ToolCallState[],
+  pipelineStage?: string,
+): ActivityItem[] {
+  const items: ActivityItem[] = [];
+
+  for (let i = 0; i < agentSteps.length; i += 1) {
+    const step = agentSteps[i];
+    const stage = step.stage.trim() || 'agent';
+    const text = step.text.replace(/\s+/g, ' ').trim();
+    if (!text) continue;
+    items.push({
+      kind: 'plan',
+      id: `plan-${i}-${stage}`,
+      stage,
+      text,
+    });
+  }
+
+  for (let i = 0; i < toolCalls.length; i += 1) {
+    const call = toolCalls[i];
+    items.push({
+      kind: 'tool',
+      id: call.call_id ? `tool-${call.call_id}` : `tool-${i}-${call.name}`,
+      call,
+    });
+  }
+
+  const live = pipelineStage?.trim();
+  if (live) {
+    const liveLower = live.toLowerCase();
+    const lastLabel = [...items].reverse().find(
+      (item) => item.kind === 'plan' || item.kind === 'stage',
+    );
+    const alreadyCurrent =
+      lastLabel
+      && (lastLabel.kind === 'plan' || lastLabel.kind === 'stage')
+      && lastLabel.stage.trim().toLowerCase() === liveLower;
+    if (!alreadyCurrent) {
+      items.push({ kind: 'stage', id: `stage-live-${liveLower}`, stage: live });
+    }
+  }
+
+  return items;
+}
+
+export function formatActivityFeedSummary(items: ActivityItem[]): string {
+  const planCount = items.filter((item) => item.kind === 'plan').length;
+  const toolCount = items.filter((item) => item.kind === 'tool').length;
+  const liveStage = [...items].reverse().find((item) => item.kind === 'stage');
+  const parts: string[] = [];
+  if (planCount > 0) {
+    parts.push(`${planCount} event${planCount === 1 ? '' : 's'}`);
+  }
+  if (toolCount > 0) {
+    parts.push(`${toolCount} tool${toolCount === 1 ? '' : 's'}`);
+  }
+  if (liveStage && liveStage.kind === 'stage') {
+    parts.push(liveStage.stage);
+  }
+  if (parts.length === 0) return 'idle';
+  return parts.join(' · ');
+}
+
 export function formatRunDuration(durationMs: number): string {
   const safeMs = Math.max(0, Number.isFinite(durationMs) ? durationMs : 0);
   const totalSeconds = safeMs / 1000;
