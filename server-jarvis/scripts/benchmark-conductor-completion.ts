@@ -109,12 +109,17 @@ console.log(
     `  [max ${(RELEASE_THRESHOLDS.maxExecutorNoToolRatio * 100).toFixed(0)}%]`,
 );
 console.log(
-  `  delegate verified writes:     ${summary.delegateVerifiedWrites}/${summary.delegateRuns}` +
-    ` (${(summary.delegateVerifiedWriteRate * 100).toFixed(1)}%)` +
+  `  delegate write-land rate:     ${summary.delegateRuns > 0 ? (summary.delegateWriteLandRate * 100).toFixed(1) : "0.0"}%` +
+    ` (${summary.delegateRuns} delegate runs)` +
     `  gate=${summary.delegateGate}` +
     (summary.delegateGate === "insufficient_sample"
       ? " (need ≥5 delegate fixtures)"
       : `  [min ${(RELEASE_THRESHOLDS.minDelegateVerifiedWriteRate * 100).toFixed(0)}%]`),
+);
+console.log(
+  `  delegate verified (diagnostic): ${summary.delegateVerifiedWrites}/${summary.delegateRuns}` +
+    ` (${(summary.delegateVerifiedWriteRate * 100).toFixed(1)}%)` +
+    `  — not a hard gate (Stage 0a.2)`,
 );
 console.log(
   `  unverified successes:         ${summary.unverifiedSuccesses}` +
@@ -130,7 +135,7 @@ console.log(
 );
 console.log(
   `  writes landed per run:        ${summary.writesLandedPerRun.toFixed(2)}` +
-    `  (avg successful write tools)`,
+    `  [min ${RELEASE_THRESHOLDS.minWritesLandedPerRun}]`,
 );
 console.log(
   `  task-target writes:           ${summary.taskTargetWrites}` +
