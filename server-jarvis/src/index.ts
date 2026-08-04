@@ -2966,6 +2966,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           sessionMemory.toSharedContextHints(sessionId, activeWorkspacePath),
           { relevant_memories: [workspaceRootHint] },
         );
+        // M8: route-entry owns the decision tree; wall-clock still starts here so
+        // run duration includes model-backed coordinator time.
+        const coordinatorStartedAt = Date.now();
         const {
           turnReq,
           shortCircuit,
