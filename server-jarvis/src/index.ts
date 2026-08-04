@@ -110,7 +110,11 @@ import {
   createStreamFinishTracker,
   serverCancelFromReadStop,
 } from "./stream-finish";
-import { applyAgentSystemPrompt } from "./orchestration/agent-system-prompt";
+import { AGENT_SYSTEM_PROMPT_HEADER } from "./orchestration/agent-system-prompt";
+import {
+  assembleCacheStableMessages,
+  logCachedTokensProbe,
+} from "./orchestration/prompt-cache-stable";
 import { defineAgent } from "./orchestration/define-agent";
 import { prepareToolResultForContext } from "./tool-result-truncation";
 import { detectDegenerateTail } from "./stream-degeneration";
@@ -1938,29 +1942,23 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // Use text tool protocol if native tools are disabled/unsupported and tools are requested
           const useTextTools = !modelSupportsNativeTools && callOptions?.tools && callOptions.tools.length > 0;
 
-          let effectiveMessages = [
-            { role: "system", content: runtimeFactsSystemMessage(cfg) },
-            ...messages,
-          ];
-          // T3.2: optional per-agent system_prompt (inert until an agent defines it).
-          if (poolResolvedAgent?.system_prompt) {
-            effectiveMessages = applyAgentSystemPrompt(
-              effectiveMessages,
-              poolResolvedAgent.system_prompt,
-            ) as typeof effectiveMessages;
-          }
-          if (useTextTools) {
-            const textInstructions = buildTextToolInstructions(callOptions.tools);
-            const sysIdx = effectiveMessages.findIndex((m) => m.role === "system");
-            if (sysIdx >= 0) {
-              effectiveMessages[sysIdx] = {
-                role: "system",
-                content: `${effectiveMessages[sysIdx].content}\n\n${textInstructions}`,
-              };
-            } else {
-              effectiveMessages.unshift({ role: "system", content: textInstructions });
-            }
-          }
+          // M2 cache-stable assembly:
+          //   [runtime facts] → [text tool instructions] → [stage system] → [history] → [turn]
+          // First three blocks stay as stable as possible across mid-stage turns;
+          // normalizeMessagesForLLM merges leading system messages into one prefix.
+          const textInstructions = useTextTools
+            ? buildTextToolInstructions(callOptions.tools)
+            : "";
+          // T3.2: optional per-agent system_prompt rides on the stage system block.
+          const agentSystemPromptBlock = poolResolvedAgent?.system_prompt
+            ? `${AGENT_SYSTEM_PROMPT_HEADER}\n${String(poolResolvedAgent.system_prompt).trim().slice(0, 4000)}`
+            : undefined;
+          const effectiveMessages = assembleCacheStableMessages({
+            runtimeFacts: runtimeFactsSystemMessage(cfg),
+            textToolInstructions: textInstructions,
+            stageMessages: messages,
+            agentSystemPromptBlock,
+          });
 
           const normalizedMessages = normalizeMessagesForLLM(effectiveMessages);
           const requestBody: Record<string, any> = {
@@ -2212,6 +2210,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let activeToolCalls: any[] = [];
           let firstTokenProgress: FirstTokenProgress | undefined;
           let firstTokenLatencyMs: number | undefined;
+          // M2: optional provider cache measurement (non-blocking probe).
+          let attemptCachedTokens: number | undefined;
           // Defense-in-depth: in case the request bypassed the
           // First-token watchdog (orchestrator). If the response body is open
           // but no `choice.delta.content` chunk has arrived before the per-model
@@ -2434,6 +2434,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               if (payload === "[DONE]") continue;
               try {
                 const parsed = JSON.parse(payload);
+                // M2 probe: log provider-reported cached_tokens when present.
+                if (parsed.usage) {
+                  const probed = logCachedTokensProbe({
+                    usage: parsed.usage,
+                    stage: stageName,
+                    model: actualModelUsed,
+                    provider: actualProviderUsed,
+                  });
+                  if (probed !== undefined) attemptCachedTokens = probed;
+                }
                 const choice = parsed.choices?.[0];
                 if (!choice) continue;
                 // T0.1: record provider finish_reason (often null on deltas).
@@ -2721,6 +2731,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             _fallbackRetries: attemptFallbackRetries,
             _fallbackDepth: attemptFallbackDepth,
             _fallbackReason: attemptFallbackReason,
+            // M2: optional cache hit tokens when the provider reported them.
+            ...(attemptCachedTokens !== undefined ? { _cachedTokens: attemptCachedTokens } : {}),
             // Present only on text-tool turns; pipeline may persist on no-tool turns.
             ...toolParseFlags,
           };
@@ -4037,16 +4049,19 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         if (activeHistory.length < previousLength) {
           console.warn(`[Jarvis] Optimizing context: truncated history from ${previousLength} to ${activeHistory.length} messages (context window: ${num_ctx})`);
         }
-        // Cache-friendly prompt assembly:
-        //   [0] static prefix (identity + sandbox + tools) — NEVER changes between turns
-        //   [1..N] compaction summaries / memory context from history (infrequent changes)
-        //   [N+1..] conversation history (changes every turn)
-        //   [last] current user prompt (changes every turn)
+        // M2 cache-stable prompt assembly (stable prefix order):
+        //   [runtime facts] → [tool text instructions] → [stage/identity system + sandbox]
+        //     → [history] → [turn]
         // Only the tail changes between turns → prompt cache stays warm for the prefix.
         {
           const effectiveTextTools = !forceFinalAnswerOnly ? cachedTextToolInstructions : "";
           const sandboxBlock = buildSandboxPermissions(cfg, activeWorkspacePath);
-          const staticPrefix = [cfg.system_prompt, sandboxBlock, effectiveTextTools].filter(Boolean).join("\n\n");
+          const stageSystem = [cfg.system_prompt, sandboxBlock].filter(Boolean).join("\n\n");
+          const staticPrefix = [
+            runtimeFactsSystemMessage(cfg),
+            effectiveTextTools,
+            stageSystem,
+          ].filter(Boolean).join("\n\n");
           messages.push({ role: "system", content: staticPrefix });
           // Preserve compaction summaries and memory system messages from history unchanged
           for (const msg of activeHistory) {
@@ -4427,6 +4442,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 }
 
                 if (json.usage && !isOllama) {
+                  // M2 probe: optional provider cache signal (non-blocking).
+                  const cachedTokens = logCachedTokensProbe({
+                    usage: json.usage,
+                    stage: "agent_loop",
+                    model: actualModelUsed,
+                    provider: lastProviderUsed,
+                  });
                   sessionCostInfo = {
                     prompt_tokens: json.usage.prompt_tokens || 0,
                     completion_tokens: json.usage.completion_tokens || 0,
@@ -4434,6 +4456,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                     total_cost_usd: json.or_cost ?? 0,
                     generation_id: json.or_id ?? json.id ?? "",
                     model: json.model ?? actualModelUsed,
+                    ...(cachedTokens !== undefined ? { cached_tokens: cachedTokens } : {}),
                   };
                 }
               } catch { /* skip bad JSON */ }

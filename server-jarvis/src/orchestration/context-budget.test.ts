@@ -4,6 +4,8 @@ import {
   buildBoundedHistoryBlock,
   compactCompletedExecutorCycles,
   enforceTranscriptBudget,
+  stableTranscriptHeadEnd,
+  stableTranscriptHeadPrefix,
   truncateToTokenBudget,
   type TranscriptMessage,
 } from "./context-budget";
@@ -276,6 +278,59 @@ describe("compactCompletedExecutorCycles", () => {
     );
     expect(contracts.length).toBe(1);
     expect(contracts[0].content).toContain("write_file");
+  });
+
+  // M2: compaction must only rewrite the TAIL. The stable head prefix
+  // (system + original user request) must remain byte-identical so provider
+  // prompt-cache prefixes stay valid across mid-loop turns.
+  test("preserves a byte-identical stable head prefix after compact", () => {
+    const messages: TranscriptMessage[] = [
+      { role: "system", content: "You are the executor.\nStable stage prompt v1." },
+      { role: "user", content: "Implement the filter change in src/a.cpp" },
+      {
+        role: "assistant",
+        content: "old-cycle",
+        tool_calls: [{ id: "c1", type: "function", function: { name: "read_file", arguments: "{\"path\":\"src/a.cpp\"}" } }],
+      },
+      { role: "tool", name: "read_file", tool_call_id: "c1", content: "a".repeat(800) },
+      {
+        role: "assistant",
+        content: "mid-cycle",
+        tool_calls: [{ id: "c2", type: "function", function: { name: "read_file", arguments: "{\"path\":\"src/b.cpp\"}" } }],
+      },
+      { role: "tool", name: "read_file", tool_call_id: "c2", content: "b".repeat(800) },
+      {
+        role: "assistant",
+        content: "new-cycle",
+        tool_calls: [{ id: "c3", type: "function", function: { name: "read_file", arguments: "{\"path\":\"src/c.cpp\"}" } }],
+      },
+      { role: "tool", name: "read_file", tool_call_id: "c3", content: "c".repeat(800) },
+    ];
+    const toolCalls = [
+      tool("read_file", "src/a.cpp"),
+      tool("read_file", "src/b.cpp"),
+      tool("read_file", "src/c.cpp"),
+    ];
+
+    const headEnd = stableTranscriptHeadEnd(messages);
+    expect(headEnd).toBe(2);
+    const headPrefixBefore = stableTranscriptHeadPrefix(messages);
+    // Prefix length N for the byte-identity check (full head serialization).
+    const prefixLenN = headPrefixBefore.length;
+    expect(prefixLenN).toBeGreaterThan(20);
+
+    const result = compactCompletedExecutorCycles(messages, toolCalls, 2_000);
+
+    expect(result.compactedCycles).toBeGreaterThanOrEqual(1);
+    const headPrefixAfter = stableTranscriptHeadPrefix(messages);
+    expect(headPrefixAfter).toBe(headPrefixBefore);
+    expect(headPrefixAfter.slice(0, prefixLenN)).toBe(headPrefixBefore.slice(0, prefixLenN));
+    // Head message objects themselves are the original contents.
+    expect(messages[0].content).toBe("You are the executor.\nStable stage prompt v1.");
+    expect(messages[1].content).toBe("Implement the filter change in src/a.cpp");
+    // Tail was rewritten (checkpoint present; early assistant prose gone).
+    expect(messages.some((m) => m.content.includes("[Evidence checkpoint]"))).toBe(true);
+    expect(messages.some((m) => m.role === "assistant" && m.content === "old-cycle")).toBe(false);
   });
 
   // Carried evidence sits after the seed (index 2) and was discarded once

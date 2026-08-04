@@ -188,7 +188,7 @@ console.log(
 );
 console.log(
   `  cache_hit_rate:               ${(frontier.cache_hit_rate * 100).toFixed(1)}%` +
-    `  (0 until M2)`,
+    `  (0 until durable per-run cache signals; M2 probes/logs cached_tokens)`,
 );
 console.log();
 if (summary.meetsReleaseGate) {

@@ -12,7 +12,9 @@
 //   time_to_first_visible_token — best-effort: run.created_at → first
 //                                 synthesizer stage created_at offset; null
 //                                 when not computable (no stream TTFT in DB)
-//   cache_hit_rate             — 0 until M2 lands; field always present
+//   cache_hit_rate             — 0 until durable per-run cache signals are
+//                                 aggregated (M2 logs/probes cached_tokens;
+//                                 field always present)
 
 /** Minimal run shape for frontier aggregation (matches self-tuning rows). */
 export interface FrontierMetricsRun {
@@ -43,8 +45,9 @@ export interface FrontierMetricsSummary {
    */
   time_to_first_visible_token: number | null;
   /**
-   * Conductor prefix cache hit rate. Hard-coded 0 until M2 cache wiring
-   * lands a durable per-run signal. Field is always present for CLI shape.
+   * Conductor / prompt-prefix cache hit rate. Hard-coded 0 until durable
+   * per-run cache signals (M2 currently probes/logs cached_tokens on the
+   * response path) are aggregated into fixtures. Field always present.
    */
   cache_hit_rate: number;
 }
@@ -133,7 +136,7 @@ export function summarizeFrontierMetrics(
     avg_run_wall_clock: wallCount > 0 ? wallSum / wallCount : null,
     round_trips_per_run: stageCount / n,
     time_to_first_visible_token: ttftCount > 0 ? ttftSum / ttftCount : null,
-    // M2 cache durability not yet landed — keep the field, zero the rate.
+    // Durable per-run cache aggregation not yet wired — keep the field, zero the rate.
     cache_hit_rate: 0,
   };
 }

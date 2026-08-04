@@ -70,9 +70,31 @@ export interface TranscriptMessage {
 }
 
 /**
+ * Index after the stable transcript head (system + original user request).
+ * Compaction and payload eviction must never rewrite messages before this
+ * index — that prefix is the cache-stable head for M2 prompt caching.
+ */
+export function stableTranscriptHeadEnd(messages: readonly TranscriptMessage[]): number {
+  return seedEndIndex(messages);
+}
+
+/**
+ * Byte-stable serialization of the transcript head used for cache-prefix
+ * identity checks. Compaction must leave this string unchanged.
+ */
+export function stableTranscriptHeadPrefix(messages: readonly TranscriptMessage[]): string {
+  const end = stableTranscriptHeadEnd(messages);
+  return JSON.stringify(messages.slice(0, end));
+}
+
+/**
  * Evict only old runtime payloads from a loop transcript. Messages stay in
  * place so provider tool-call pairing remains valid, and the newest assistant
  * turn plus its immediately-following results remain intact.
+ *
+ * M2: never mutates the stable head (system + original user request). Only
+ * tool / preflight payloads strictly after the head and before the last
+ * assistant turn are eligible for eviction.
  */
 export function enforceTranscriptBudget(
   messages: TranscriptMessage[],
@@ -85,8 +107,10 @@ export function enforceTranscriptBudget(
   const lastAssistantIndex = messages.findLastIndex((message) => message.role === "assistant");
   if (lastAssistantIndex < 0) return { evicted: 0, inputTokens };
 
+  // Never rewrite the cache-stable head (system + original user request).
+  const headEnd = stableTranscriptHeadEnd(messages);
   let evicted = 0;
-  for (let index = 2; index < lastAssistantIndex && inputTokens > budgetTokens; index++) {
+  for (let index = headEnd; index < lastAssistantIndex && inputTokens > budgetTokens; index++) {
     const message = messages[index];
     const isPreflightCarrier = message.role === "user"
       && /^\[Runtime (?:preflight:|substitution\])/i.test(message.content);
@@ -196,19 +220,37 @@ function seedEndIndex(messages: readonly TranscriptMessage[]): number {
  * Compact completed executor assistant/tool cycles into a single evidence
  * checkpoint while preserving the newest cycles and tool_call pairing.
  *
+ * M2 cache-stable contract (tail-only rewrite):
+ * - The stable head (system + original user request, see
+ *   {@link stableTranscriptHeadPrefix}) is byte-identical before and after.
+ * - Only the TAIL after that head is rewritten: older completed cycles become
+ *   one evidence checkpoint; newest cycles stay intact.
+ * - Never rewrites or reorders the stable head — that would invalidate a
+ *   provider prompt-cache prefix across mid-loop turns.
+ *
+ * Other rules:
  * - Compacts whole cycles only (never separates a retained tool result from
  *   its assistant `tool_calls`).
  * - Keeps the newest two assistant cycles intact.
  * - Replaces older cycles with one `[Evidence checkpoint]` derived from clean
  *   tool records (capped at 2,000 chars).
  * - Drops duplicate write-pressure user messages.
- * - Runs {@link enforceTranscriptBudget} afterward as the final size fence.
+ * - Runs {@link enforceTranscriptBudget} afterward as the final size fence
+ *   (also head-preserving).
  */
 export function compactCompletedExecutorCycles(
   messages: TranscriptMessage[],
   toolCalls: readonly ToolCallRecord[],
   budgetTokens: number,
 ): { compactedCycles: number; inputTokens: number } {
+  // Snapshot the cache-stable head before any rewrite. Content is copied so
+  // later mutations of shared object references cannot touch the head.
+  const seedEnd = seedEndIndex(messages);
+  const frozenHead: TranscriptMessage[] = messages.slice(0, seedEnd).map((message) => ({
+    ...message,
+    content: message.content,
+  }));
+
   const assistantIndices: number[] = [];
   for (let i = 0; i < messages.length; i++) {
     if (messages[i].role === "assistant") assistantIndices.push(i);
@@ -217,7 +259,6 @@ export function compactCompletedExecutorCycles(
   let compactedCycles = 0;
 
   if (assistantIndices.length > KEEP_NEWEST_ASSISTANT_CYCLES) {
-    const seedEnd = seedEndIndex(messages);
     const keepFrom = assistantIndices[assistantIndices.length - KEEP_NEWEST_ASSISTANT_CYCLES];
     const compactAssistants = assistantIndices.filter((index) => index < keepFrom);
     compactedCycles = compactAssistants.length;
@@ -239,7 +280,8 @@ export function compactCompletedExecutorCycles(
       (message) => message.role === "user" && isWriteContractMessage(message.content),
     );
 
-    const next: TranscriptMessage[] = messages.slice(0, seedEnd);
+    // Re-seed from the frozen head only — never from a mutated live slice.
+    const next: TranscriptMessage[] = frozenHead.map((message) => ({ ...message }));
     if (carriedInGap.length > 0) {
       next.push({ ...carriedInGap[carriedInGap.length - 1] });
     }
@@ -276,9 +318,11 @@ export function compactCompletedExecutorCycles(
     messages.push(...next);
   } else {
     // Collapse duplicate mid-loop pressure notes (not the write contract carrier).
+    // Only scan the tail after the stable head so head message objects/content
+    // cannot be spliced away.
     let seenPressure = false;
     let seenContract = false;
-    for (let i = 0; i < messages.length; i++) {
+    for (let i = seedEnd; i < messages.length; i++) {
       const message = messages[i];
       if (message.role === "user" && isWriteContractMessage(message.content)) {
         if (seenContract) {
@@ -300,8 +344,16 @@ export function compactCompletedExecutorCycles(
     }
   }
 
-  // Final size fence: payload eviction only, preserves tool_call pairing.
+  // Final size fence: payload eviction only, preserves tool_call pairing and
+  // the stable head (starts at headEnd, never mutates frozen head slots).
   const fence = enforceTranscriptBudget(messages, budgetTokens);
+
+  // Pin the cache-stable head to the pre-compaction snapshot so any shared
+  // object mutation or future fence change cannot rewrite prefix bytes.
+  for (let i = 0; i < frozenHead.length && i < messages.length; i++) {
+    messages[i] = { ...frozenHead[i] };
+  }
+
   return { compactedCycles, inputTokens: fence.inputTokens };
 }
 

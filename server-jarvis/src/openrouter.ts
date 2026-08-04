@@ -82,6 +82,8 @@ export interface OpenRouterCostInfo {
   total_cost_usd: number;
   generation_id: string;
   model: string;
+  /** Provider-reported prompt-cache hit tokens when present (M2 measurement). */
+  cached_tokens?: number;
 }
 
 export interface OpenRouterError {
@@ -1354,7 +1356,10 @@ export function openRouterHeaders(cfg: JarvisConfig): Record<string, string> {
 
 export function logOpenRouterCost(cost: OpenRouterCostInfo | null): void {
   if (!cost) return;
+  const cachePart = typeof cost.cached_tokens === "number"
+    ? ` cached_tokens=${cost.cached_tokens}`
+    : "";
   console.log(
-    `[OpenRouter Cost] ${cost.total_tokens} tokens ($${cost.total_cost_usd.toFixed(6)}) via ${cost.model} [${cost.generation_id}]`
+    `[OpenRouter Cost] ${cost.total_tokens} tokens ($${cost.total_cost_usd.toFixed(6)}) via ${cost.model} [${cost.generation_id}]${cachePart}`
   );
 }

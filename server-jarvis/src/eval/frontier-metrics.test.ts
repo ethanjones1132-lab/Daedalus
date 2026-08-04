@@ -120,7 +120,7 @@ describe("summarizeFrontierMetrics", () => {
     expect(summary.time_to_first_visible_token).toBe(15_000);
   });
 
-  test("cache_hit_rate is always 0 until M2 lands", () => {
+  test("cache_hit_rate stays 0 until durable per-run cache signals exist", () => {
     const summary = summarizeFrontierMetrics([run(), run()]);
     expect(summary.cache_hit_rate).toBe(0);
   });
