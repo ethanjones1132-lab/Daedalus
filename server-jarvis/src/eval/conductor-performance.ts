@@ -53,7 +53,20 @@ export interface ConductorPerformanceFixture {
 
 export interface ConductorPerformanceThresholds {
   maxExecutorNoToolRatio: number;
+  /**
+   * Stage 0a.2: minimum fraction of *delegate* runs that landed ≥1 successful
+   * write tool call. Replaces the old "verified write" gate, which depended on
+   * a default-off verification tier and read ~0.6% even in the 96% minimax era.
+   *
+   * Field name kept for API stability; the metric is write-land rate, not
+   * verification-tier verified.
+   */
   minDelegateVerifiedWriteRate: number;
+  /**
+   * Minimum average successful write-tool calls per run across the window
+   * (writesLandedPerRun). Soft when sample is thin; hard when runs ≥ MIN_DELEGATE_SAMPLE.
+   */
+  minWritesLandedPerRun: number;
   maxUnverifiedSuccesses: number;
   maxFalseCompleteRuns: number;
   maxDuplicateWritePressureRuns: number;
@@ -61,7 +74,11 @@ export interface ConductorPerformanceThresholds {
 
 export const RELEASE_THRESHOLDS: ConductorPerformanceThresholds = {
   maxExecutorNoToolRatio: 0.1,
+  // 0.8 write-land rate among delegate runs — real dynamic range (minimax era
+  // lands ~1.3 writes/run; free-pool failure session ~0.3).
   minDelegateVerifiedWriteRate: 0.8,
+  // Absolute volume dial: good era was well above 1.0; failing session ~0.33.
+  minWritesLandedPerRun: 0.5,
   maxUnverifiedSuccesses: 0,
   maxFalseCompleteRuns: 0,
   maxDuplicateWritePressureRuns: 0,
@@ -75,6 +92,7 @@ export type DelegateGate = "pass" | "fail" | "insufficient_sample" | "not_applic
 export type GateFailureCode =
   | "executor_no_tool_ratio"
   | "delegate_verified_write_rate"
+  | "writes_landed_per_run"
   | "unverified_successes"
   | "false_complete_runs"
   | "duplicate_write_pressure_runs";
@@ -86,15 +104,25 @@ export interface ConductorPerformanceSummary {
   /** 0 when there are no executor turns. */
   executorNoToolRatio: number;
   delegateRuns: number;
+  /**
+   * Diagnostic: row-level "verified" writes (strict stage-row matching).
+   * May stay near zero when verification tier is off — not used for the hard gate.
+   */
   delegateVerifiedWrites: number;
   /**
-   * Verified delegate writes / delegate runs. 0 when there are no delegate
-   * fixtures (not null — keeps toMatchObject stable).
+   * Diagnostic: strict verified writes / delegate runs (row-level matching).
+   * Kept for comparison; hard gate uses `delegateWriteLandRate` (Stage 0a.2).
    */
   delegateVerifiedWriteRate: number;
   /**
+   * Stage 0a.2 gate metric: fraction of delegate runs that landed ≥1 successful
+   * write tool call (any path that counts as a write land). Real dynamic range
+   * across minimax-good vs free-pool-bad eras.
+   */
+  delegateWriteLandRate: number;
+  /**
    * W2.2 — average successful write-tool calls per run (total / runs).
-   * 0 when there are no runs.
+   * 0 when there are no runs. Also a hard gate when sample is sufficient.
    */
   writesLandedPerRun: number;
   /**
@@ -108,7 +136,7 @@ export interface ConductorPerformanceSummary {
   /** Whether every hard release threshold passes (delegate soft below sample). */
   meetsReleaseGate: boolean;
   gateFailures: GateFailureCode[];
-  /** Delegate-rate gate status; insufficient_sample when N < MIN_DELEGATE_SAMPLE. */
+  /** Delegate write-land gate status; insufficient_sample when N < MIN_DELEGATE_SAMPLE. */
   delegateGate: DelegateGate;
 }
 
@@ -344,6 +372,8 @@ export function summarizeConductorPerformance(
   let executorNoToolTurns = 0;
   let delegateRuns = 0;
   let delegateVerifiedWrites = 0;
+  /** Delegate runs that landed ≥1 successful write (Stage 0a.2 gate numerator). */
+  let delegateRunsWithWrite = 0;
   let totalWritesLanded = 0;
   let taskTargetWrites = 0;
   let unverifiedSuccesses = 0;
@@ -357,14 +387,18 @@ export function summarizeConductorPerformance(
       if (parseToolCallCount(s.tool_calls_json) === 0) executorNoToolTurns += 1;
     }
 
-    if (isDelegateRun(fixture)) {
-      delegateRuns += 1;
-      if (isDelegateVerifiedWrite(fixture)) delegateVerifiedWrites += 1;
-    }
-
     const writes = countWriteMetrics(fixture);
     totalWritesLanded += writes.writesLanded;
     taskTargetWrites += writes.taskTargetWrites;
+
+    if (isDelegateRun(fixture)) {
+      delegateRuns += 1;
+      // Diagnostic only — strict row-level verification (may stay near zero when
+      // verification tier is off or stage rows lack cleanup markers).
+      if (isDelegateVerifiedWrite(fixture)) delegateVerifiedWrites += 1;
+      // Stage 0a.2 gate: any successful write on a delegate-attributed run.
+      if (writes.writesLanded > 0) delegateRunsWithWrite += 1;
+    }
 
     if (isUnverifiedSuccess(fixture)) unverifiedSuccesses += 1;
     if (isFalseComplete(fixture)) falseCompleteRuns += 1;
@@ -373,8 +407,12 @@ export function summarizeConductorPerformance(
 
   const runs = fixtures.length;
   const executorNoToolRatio = executorTurns === 0 ? 0 : executorNoToolTurns / executorTurns;
+  // Diagnostic: strict row-level verification (often near zero with verification off).
   const delegateVerifiedWriteRate =
     delegateRuns === 0 ? 0 : delegateVerifiedWrites / delegateRuns;
+  // Stage 0a.2 gate: write-land among delegate runs (has real dynamic range).
+  const delegateWriteLandRate =
+    delegateRuns === 0 ? 0 : delegateRunsWithWrite / delegateRuns;
   const writesLandedPerRun = runs === 0 ? 0 : totalWritesLanded / runs;
 
   let delegateGate: DelegateGate;
@@ -382,7 +420,7 @@ export function summarizeConductorPerformance(
     delegateGate = "not_applicable";
   } else if (delegateRuns < MIN_DELEGATE_SAMPLE) {
     delegateGate = "insufficient_sample";
-  } else if (delegateVerifiedWriteRate >= thresholds.minDelegateVerifiedWriteRate) {
+  } else if (delegateWriteLandRate >= thresholds.minDelegateVerifiedWriteRate) {
     delegateGate = "pass";
   } else {
     delegateGate = "fail";
@@ -394,6 +432,14 @@ export function summarizeConductorPerformance(
   }
   if (delegateGate === "fail") {
     gateFailures.push("delegate_verified_write_rate");
+  }
+  // Absolute volume dial — only hard-fail when the window is large enough that
+  // a near-zero rate is meaningful (reuse MIN_DELEGATE_SAMPLE as the floor).
+  if (
+    runs >= MIN_DELEGATE_SAMPLE
+    && writesLandedPerRun < thresholds.minWritesLandedPerRun
+  ) {
+    gateFailures.push("writes_landed_per_run");
   }
   if (unverifiedSuccesses > thresholds.maxUnverifiedSuccesses) {
     gateFailures.push("unverified_successes");
@@ -413,6 +459,7 @@ export function summarizeConductorPerformance(
     delegateRuns,
     delegateVerifiedWrites,
     delegateVerifiedWriteRate,
+    delegateWriteLandRate,
     writesLandedPerRun,
     taskTargetWrites,
     unverifiedSuccesses,

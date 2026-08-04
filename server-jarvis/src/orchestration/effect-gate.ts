@@ -90,23 +90,28 @@ export function pathInTargetSet(path: string, targets: readonly string[]): boole
 
 /**
  * Whether a mutated path earns write-effect gate credit.
- * - Status/log docs never count.
- * - When `targetPaths` is non-empty, only those paths (or plan-named targets)
- *   count.
- * - When no targets are available, any non-status path counts (backward compat).
+ *
+ * Order matters (Stage 0a.1 / frontier plan):
+ * 1. When `targetPaths` is non-empty, an explicit or plan-named target always
+ *    counts — including `*_STATUS*.md` / `*_LOG*.md` when that *is* the task.
+ * 2. Otherwise the denylist applies: status/log basenames invented as a
+ *    cheap gate-satisfy do not count.
+ * 3. When no targets are known, any non-status path (and unpathed legacy
+ *    writes) still count for backward compatibility.
  */
 export function countsTowardWriteEffect(
   path: string | undefined,
   targetPaths?: readonly string[],
 ): boolean {
-  if (path && isStatusOrLogDocPath(path)) return false;
-  if (!targetPaths || targetPaths.length === 0) {
-    // Unpathed successful writes still count when no target set is known
-    // (legacy unit fixtures and delegate markers without path args).
-    return true;
+  if (targetPaths && targetPaths.length > 0) {
+    if (!path) return false;
+    // Explicit / plan-named targets win over the status/log denylist.
+    return pathInTargetSet(path, targetPaths);
   }
-  if (!path) return false;
-  return pathInTargetSet(path, targetPaths);
+  if (path && isStatusOrLogDocPath(path)) return false;
+  // Unpathed successful writes still count when no target set is known
+  // (legacy unit fixtures and delegate markers without path args).
+  return true;
 }
 
 /** Extract path-like mentions from free text (request / plan item prose). */
@@ -129,7 +134,12 @@ export function extractPathMentions(text: string): string[] {
 /**
  * Build the task target set from explicit paths plus plan/request mentions.
  * Returns `undefined` when nothing usable was found (gate stays path-agnostic
- * except for always-on status/log exclusion).
+ * except for invent-status-doc exclusion via `countsTowardWriteEffect`).
+ *
+ * Status/log basenames are kept when named — a task whose goal is
+ * "update EXECUTION_LOG.md" must be able to put that path in the target set
+ * (Stage 0a.1). Invented status docs with no request/plan mention still fail
+ * the gate because they never enter this set.
  */
 export function resolveTaskTargetPaths(input: {
   explicit?: readonly string[];
@@ -140,7 +150,7 @@ export function resolveTaskTargetPaths(input: {
   const seen = new Set<string>();
   const push = (path: string) => {
     const trimmed = path.trim();
-    if (!trimmed || isStatusOrLogDocPath(trimmed)) return;
+    if (!trimmed) return;
     const key = normalizePathForGate(trimmed).toLowerCase();
     if (seen.has(key)) return;
     seen.add(key);
@@ -410,8 +420,11 @@ export function resolveNamedWriteTarget(
   expectedTarget?: string,
   taskTargets?: readonly string[],
 ): string {
-  const preferred = (taskTargets ?? []).find((path) => path && !isStatusOrLogDocPath(path));
-  if (preferred) return preferred;
+  // Prefer non-status task targets; if the task *is* a status/log doc, name it.
+  const nonStatus = (taskTargets ?? []).find((path) => path && !isStatusOrLogDocPath(path));
+  if (nonStatus) return nonStatus;
+  const anyTarget = (taskTargets ?? []).find((path) => Boolean(path?.trim()));
+  if (anyTarget) return anyTarget;
   const evidence = expectedTarget?.trim();
   if (
     evidence
@@ -420,12 +433,16 @@ export function resolveNamedWriteTarget(
   ) {
     return evidence;
   }
+  // Explicit status evidence only when no other target exists (rare).
+  if (evidence && evidence !== GENERIC_WRITE_TARGET_LABEL) return evidence;
   return GENERIC_WRITE_TARGET_LABEL;
 }
 
 /**
  * Build a write-pressure note. Prefer a concrete task target when known
- * (W5.2); fall back to the evidence-derived path. Never names status/log docs.
+ * (W5.2); fall back to the evidence-derived path. Invented status/log docs
+ * are not preferred when a real code target exists; when the task *is* a
+ * status/log path, that path is named so the gate can be satisfied.
  */
 export function buildWriteEffectNudge(
   writeTools: string[],
@@ -433,10 +450,14 @@ export function buildWriteEffectNudge(
   taskTargets?: readonly string[],
 ): string {
   const available = writeTools.length > 0 ? writeTools.join(", ") : "no write tools exposed";
-  const preferred = (taskTargets ?? []).find((path) => path && !isStatusOrLogDocPath(path));
+  const preferred = (taskTargets ?? []).find((path) => path && !isStatusOrLogDocPath(path))
+    ?? (taskTargets ?? []).find((path) => Boolean(path?.trim()));
   const target = resolveNamedWriteTarget(expectedTarget, taskTargets);
+  const preferredIsStatus = preferred ? isStatusOrLogDocPath(preferred) : false;
   const targetClause = preferred
-    ? `Required write target from the task/plan: ${preferred}. Apply the requested edit there — status or log docs do not count.`
+    ? preferredIsStatus
+      ? `Required write target from the task/plan: ${preferred}. Apply the requested edit there.`
+      : `Required write target from the task/plan: ${preferred}. Apply the requested edit there — invented status or log docs do not count unless they are the named target.`
     : `Expected write target based on the gathered evidence: ${target}.`;
   return [
     "This turn is a CHANGE request and the executor is still in a read loop.",

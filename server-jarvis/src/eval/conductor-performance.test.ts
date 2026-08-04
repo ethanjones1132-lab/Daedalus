@@ -234,14 +234,15 @@ describe("summarizeConductorPerformance", () => {
     expect(summary.gateFailures).toContain("executor_no_tool_ratio");
   });
 
-  test("meetsReleaseGate is false at 79% delegate verified writes", () => {
-    // 79 verified + 21 failed = 100 delegate fixtures → 0.79
+  test("meetsReleaseGate is false at 79% delegate write-land rate (Stage 0a.2)", () => {
+    // 79 with a landed write + 21 with zero writes = 100 delegate fixtures → 0.79
+    // Gate uses write-land rate, not strict row-level verified.
     const fixtures: ConductorPerformanceFixture[] = [
       ...Array.from({ length: 79 }, (_, i) => delegateVerifiedWrite(`run_v_${i}`)),
       ...Array.from({ length: 21 }, (_, i) => delegateFailedWrite(`run_f_${i}`)),
     ];
     const summary = summarizeConductorPerformance(fixtures);
-    expect(summary.delegateVerifiedWriteRate).toBeCloseTo(0.79, 5);
+    expect(summary.delegateWriteLandRate).toBeCloseTo(0.79, 5);
     expect(meetsReleaseGate(summary)).toBe(false);
     expect(summary.gateFailures).toContain("delegate_verified_write_rate");
   });
@@ -305,15 +306,31 @@ describe("summarizeConductorPerformance", () => {
     expect(summary.meetsReleaseGate).toBe(true);
   });
 
-  test("RELEASE_THRESHOLDS match the plan contract", () => {
+  test("RELEASE_THRESHOLDS match the plan contract (Stage 0a.2 write-land dials)", () => {
     const expected: ConductorPerformanceThresholds = {
       maxExecutorNoToolRatio: 0.1,
       minDelegateVerifiedWriteRate: 0.8,
+      minWritesLandedPerRun: 0.5,
       maxUnverifiedSuccesses: 0,
       maxFalseCompleteRuns: 0,
       maxDuplicateWritePressureRuns: 0,
     };
     expect(RELEASE_THRESHOLDS).toEqual(expected);
+  });
+
+  test("Stage 0a.2: low writesLandedPerRun fails the release gate", () => {
+    // 5 native no-write partials → 0 writes/run, sample ≥ MIN_DELEGATE_SAMPLE
+    const fixtures: ConductorPerformanceFixture[] = Array.from({ length: 5 }, (_, i) => ({
+      agentRunId: `run_empty_${i}`,
+      outcome: "partial",
+      checkTier: "none",
+      stageRuns: [stage({ agent_run_id: `run_empty_${i}`, tool_calls_json: "[]" })],
+      directives: [],
+    }));
+    const summary = summarizeConductorPerformance(fixtures);
+    expect(summary.writesLandedPerRun).toBe(0);
+    expect(summary.gateFailures).toContain("writes_landed_per_run");
+    expect(meetsReleaseGate(summary)).toBe(false);
   });
 
   // W2.1 — identify delegate runs by claude_cli attribution, not only cleanup marker.

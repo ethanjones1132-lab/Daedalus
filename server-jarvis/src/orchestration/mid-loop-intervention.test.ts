@@ -593,7 +593,7 @@ describe("buildMidLoopToolEvidence", () => {
     expect(evidence.recentWriteTargets).toEqual(["src/app.ts"]);
   });
 
-  test("status doc listed as a target still does not credit mid-loop success", () => {
+  test("Stage 0a.1: status doc listed as a target credits mid-loop when written", () => {
     const evidence = buildMidLoopToolEvidence([
       {
         name: "write_file",
@@ -603,6 +603,20 @@ describe("buildMidLoopToolEvidence", () => {
         duration_ms: 5,
       },
     ], { targetPaths: ["IMPLEMENTATION_STATUS_CURRENT.md", "src/app.ts"] });
+    expect(evidence.successfulWrites).toBe(1);
+    expect(evidence.recentWriteTargets).toEqual(["IMPLEMENTATION_STATUS_CURRENT.md"]);
+  });
+
+  test("status doc does not credit mid-loop when only a code path is the target", () => {
+    const evidence = buildMidLoopToolEvidence([
+      {
+        name: "write_file",
+        arguments: { path: "IMPLEMENTATION_STATUS_CURRENT.md" },
+        output: "wrote",
+        is_error: false,
+        duration_ms: 5,
+      },
+    ], { targetPaths: ["src/app.ts"] });
     expect(evidence.successfulWrites).toBe(0);
     expect(evidence.recentWriteTargets).toEqual([]);
   });

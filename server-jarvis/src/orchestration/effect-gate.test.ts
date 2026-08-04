@@ -303,12 +303,38 @@ describe("effect gate — target-scoped write credit (W5)", () => {
     expect(report.contentDeltas).toBe(1);
   });
 
-  test("status doc still excluded even when listed in targetPaths", () => {
+  test("Stage 0a.1: explicit EXECUTION_LOG.md request satisfies the gate when that path is the target", () => {
+    const report = evaluateEffectGate({
+      profile: "full",
+      executor: executor([callWith("write_file", false, "EXECUTION_LOG.md")]),
+      request: "update EXECUTION_LOG.md with today's progress",
+      targetPaths: ["EXECUTION_LOG.md"],
+      contentEffects: [delta("EXECUTION_LOG.md")],
+    });
+    expect(report.writeIntent).toBe(true);
+    expect(report.verdict).toBe("clean");
+    expect(report.contentDeltas).toBe(1);
+    expect(report.successfulWrites).toBe(1);
+  });
+
+  test("Stage 0a.1: status doc listed in targetPaths counts when it is the named target", () => {
+    const report = evaluateEffectGate({
+      profile: "full",
+      executor: executor([callWith("write_file", false, "IMPLEMENTATION_STATUS_CURRENT.md")]),
+      request: "update IMPLEMENTATION_STATUS_CURRENT.md",
+      targetPaths: ["IMPLEMENTATION_STATUS_CURRENT.md"],
+      contentEffects: [delta("IMPLEMENTATION_STATUS_CURRENT.md")],
+    });
+    expect(report.verdict).toBe("clean");
+    expect(report.contentDeltas).toBe(1);
+  });
+
+  test("status doc still excluded when it is NOT the target (target is code)", () => {
     const report = evaluateEffectGate({
       profile: "full",
       executor: executor([callWith("write_file", false, "IMPLEMENTATION_STATUS_CURRENT.md")]),
       request: "implement the change in src/app.ts",
-      targetPaths: ["IMPLEMENTATION_STATUS_CURRENT.md", "src/app.ts"],
+      targetPaths: ["src/app.ts"],
       contentEffects: [delta("IMPLEMENTATION_STATUS_CURRENT.md")],
     });
     expect(report.writeIntent).toBe(true);
@@ -325,14 +351,14 @@ describe("effect gate — target-scoped write credit (W5)", () => {
     expect(isStatusOrLogDocPath("README.md")).toBe(false);
   });
 
-  test("resolveTaskTargetPaths pulls plan/request path mentions and drops status docs", () => {
+  test("resolveTaskTargetPaths keeps status/log paths when named in the request", () => {
     const targets = resolveTaskTargetPaths({
       request: "edit src/app.ts and update IMPLEMENTATION_STATUS_CURRENT.md",
       planTexts: ["Item A1: fix server-jarvis/src/orchestration/effect-gate.ts"],
     });
     expect(targets).toContain("src/app.ts");
     expect(targets).toContain("server-jarvis/src/orchestration/effect-gate.ts");
-    expect(targets?.some((p) => /status/i.test(p))).toBe(false);
+    expect(targets?.some((p) => /status/i.test(p))).toBe(true);
   });
 
   test("buildWriteEffectNudge prefers an explicit task target when provided", () => {
@@ -341,18 +367,16 @@ describe("effect gate — target-scoped write credit (W5)", () => {
     expect(note).toContain("write_file");
   });
 
-  test("buildWriteEffectNudge never names a status/log path as the target", () => {
+  test("buildWriteEffectNudge names a status/log path when that is the only task target", () => {
     const note = buildWriteEffectNudge(
       ["write_file", "edit_file"],
       "IMPLEMENTATION_STATUS_CURRENT.md",
       ["docs/EXECUTION_LOG.md"],
     );
-    expect(note).not.toMatch(/IMPLEMENTATION_STATUS/i);
-    expect(note).not.toMatch(/EXECUTION_LOG/i);
-    expect(note).toContain("the requested workspace file");
+    expect(note).toMatch(/EXECUTION_LOG/i);
   });
 
-  test("buildWriteEffectNudge prefers real task target over status evidence path", () => {
+  test("buildWriteEffectNudge prefers real code target over status evidence path", () => {
     const note = buildWriteEffectNudge(
       ["edit_file"],
       "IMPLEMENTATION_STATUS_CURRENT.md",
