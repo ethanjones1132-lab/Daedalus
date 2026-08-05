@@ -832,6 +832,9 @@ describe("pipeline stage telemetry", () => {
   });
 
   test("pipeline applies one deterministic executor re-entry before the evidence replan", async () => {
+    // 2026-08-04 B3: full_execution now arms the write contract even without
+    // write-intent phrasing, so this evidence-replan fixture must use
+    // workspace_read (audit/inspect) rather than full_execution.
     const collector: StageRunRecorder = { recordStageRun: () => {} };
     const runtime = createToolRuntime();
     const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
@@ -873,8 +876,8 @@ describe("pipeline stage telemetry", () => {
       "run-pipeline-evidence-reroute",
       () => {},
       {
-        executionProfile: "full",
-        turnRequirement: "full_execution",
+        executionProfile: "read_only",
+        turnRequirement: "workspace_read",
         rawMessage: "comprehensively audit this repo",
         allowMidRunReplan: true,
         onDirective: (directive, stage) => {
