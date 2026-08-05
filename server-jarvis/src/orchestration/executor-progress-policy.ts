@@ -23,6 +23,16 @@ export interface ExecutorProgressInput {
   noToolTurns?: number;
   /** Total executor turns this stage. */
   executorTurns?: number;
+  /**
+   * This turn's classified requirement. When `full_execution`, a stage that
+   * emits no tool call at all is a failure regardless of `writeIntent`.
+   *
+   * 2026-08-04 (run_94cdcfdf): the task-run contract's write intent was lost
+   * on a continuation, so `writeIntent` was false while the requirement was
+   * correctly `full_execution`. The executor emitted zero tools and the turn
+   * still ran planner, reviewer, and synthesizer into the 150s turn deadline.
+   */
+  requirement?: string;
 }
 
 /** Minimum stage budget remaining required for a strong-model no-tool retry. */
@@ -56,6 +66,23 @@ export const NO_TOOL_RATIO_MIN_TURNS = 6;
  * - Any real tool call resets the streak (caller sets consecutiveNoToolTurns=0).
  */
 export function decideExecutorProgress(input: ExecutorProgressInput): ExecutorProgressDecision {
+  // Requirement-keyed floor for full_execution when the write contract was
+  // lost (writeIntent false). Independent of the contract so continuations
+  // that drop write intent still abort a zero-tool executor instead of
+  // burning planner/reviewer/synthesizer (run_94cdcfdf). Threshold is 2 so
+  // the first no-tool turn still gets workspace-evidence / mid-loop repair;
+  // the second hard-stops. When writeIntent is still true, the existing
+  // retry_strong → stop_partial path below owns the bound.
+  if (
+    input.requirement === "full_execution"
+    && !input.writeIntent
+    && !input.emittedToolCalls
+    && input.successfulWrites === 0
+    && !input.anyToolCallThisStage
+    && (input.consecutiveNoToolTurns ?? 0) >= 2
+  ) {
+    return "stop_partial";
+  }
   if (!input.writeIntent) return "continue";
   if (input.emittedToolCalls || input.successfulWrites > 0) return "continue";
   // Interleaved-prose bound. Evaluated BEFORE the `anyToolCallThisStage`

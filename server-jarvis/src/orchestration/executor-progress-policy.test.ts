@@ -132,3 +132,56 @@ test("semantic pressure is claimed once per logical run", () => {
   expect(budget.claim("write_effect")).toBe(false);
   expect(budget.claim("quality_after_correctness")).toBe(true);
 });
+
+describe("full_execution zero-tool early abort", () => {
+  const base = {
+    writeIntent: false,
+    emittedToolCalls: false,
+    successfulWrites: 0,
+    consecutiveNoToolTurns: 2,
+    stageRemainingMs: 60_000,
+    anyToolCallThisStage: false,
+    noToolTurns: 2,
+    executorTurns: 2,
+  };
+
+  test("stops partial when a full_execution turn produced no tools, even without writeIntent", () => {
+    expect(
+      decideExecutorProgress({ ...base, requirement: "full_execution" }),
+    ).toBe("stop_partial");
+  });
+
+  test("first no-tool full_execution turn still continues so evidence repair can fire", () => {
+    expect(
+      decideExecutorProgress({
+        ...base,
+        requirement: "full_execution",
+        consecutiveNoToolTurns: 1,
+        noToolTurns: 1,
+        executorTurns: 1,
+      }),
+    ).toBe("continue");
+  });
+
+  test("does not fire once a tool call has landed", () => {
+    expect(
+      decideExecutorProgress({
+        ...base,
+        requirement: "full_execution",
+        emittedToolCalls: true,
+      }),
+    ).toBe("continue");
+  });
+
+  test("does not fire for non-full_execution requirements", () => {
+    expect(
+      decideExecutorProgress({ ...base, requirement: "workspace_read" }),
+    ).toBe("continue");
+  });
+
+  test("existing writeIntent behaviour is unchanged when requirement is absent", () => {
+    expect(
+      decideExecutorProgress({ ...base, writeIntent: true, consecutiveNoToolTurns: 1 }),
+    ).toBe("retry_strong");
+  });
+});

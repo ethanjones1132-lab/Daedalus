@@ -3343,7 +3343,13 @@ export class PipelineExecutor {
           if (emittedToolCalls) {
             consecutiveNoToolTurns = 0;
             anyModelToolCallThisStage = true;
-          } else if (requiresWriteEffect && successfulWriteCount() === 0) {
+          } else if (
+            // 2026-08-04: also count when requirement is full_execution even if
+            // the write-intent contract was lost on a continuation — otherwise
+            // the requirement-keyed floor never sees consecutiveNoToolTurns>=1.
+            (requiresWriteEffect || options.turnRequirement === "full_execution")
+            && successfulWriteCount() === 0
+          ) {
             consecutiveNoToolTurns += 1;
           }
           if (!emittedToolCalls) noToolTurnsThisStage += 1;
@@ -3360,6 +3366,7 @@ export class PipelineExecutor {
             anyToolCallThisStage: anyModelToolCallThisStage,
             noToolTurns: noToolTurnsThisStage,
             executorTurns: turnCount,
+            requirement: options.turnRequirement,
           });
 
           // Write pressure (2026-07-17): the model is about to end a
@@ -3638,16 +3645,40 @@ export class PipelineExecutor {
 
           if (progressDecision === "stop_partial") {
             executorDone = true;
-            executorNoToolPartial = true;
-            narratives.push(
-              "Executor stopped after consecutive write-intent turns with no tool calls; " +
-                "reporting partial rather than spending more model budget on prose.",
-            );
-            onStateChange({
-              stage: "executor",
-              status: "partial",
-              detail: "executor_no_tool",
-            });
+            // Write-intent no-tool bound: typed executor_no_tool partial.
+            // full_execution without writeIntent (lost contract, run_94cdcfdf)
+            // also stops the loop, but must NOT take the executor_no_tool early
+            // return — that path afterStage(outcome=failed) skips the deep-read
+            // evidence re-entry (needs outcome=completed) that research/audit
+            // turns rely on. Fall through to the evidence fence instead.
+            if (requiresWriteEffect) {
+              executorNoToolPartial = true;
+              narratives.push(
+                "Executor stopped after consecutive write-intent turns with no tool calls; " +
+                  "reporting partial rather than spending more model budget on prose.",
+              );
+              onStateChange({
+                stage: "executor",
+                status: "partial",
+                detail: "executor_no_tool",
+              });
+            } else if (options.turnRequirement === "full_execution") {
+              narratives.push(
+                "[Runtime] Execution stopped: this turn required file changes but the " +
+                  "executor produced no tool calls. No files were modified.",
+              );
+            } else {
+              executorNoToolPartial = true;
+              narratives.push(
+                "Executor stopped after consecutive write-intent turns with no tool calls; " +
+                  "reporting partial rather than spending more model budget on prose.",
+              );
+              onStateChange({
+                stage: "executor",
+                status: "partial",
+                detail: "executor_no_tool",
+              });
+            }
           } else if (progressDecision === "retry_strong") {
             // Keep the loop open for one strong-model retry (note already injected).
           } else if (
