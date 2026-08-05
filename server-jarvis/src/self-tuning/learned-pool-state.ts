@@ -1,5 +1,11 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
+import {
+  applyThetaPatchGlobally,
+  BASELINE_THETA,
+  runWithTheta,
+  type ThetaPatch,
+} from "../orchestration/orchestration-policy";
 
 /** In-memory learned adjustments applied across orchestrator turns. */
 export interface LearnedPoolState {
@@ -33,6 +39,11 @@ export interface PolicySnapshot {
   fallbackBoosts: Record<string, number>;
   modelFirstTokenTimeouts: Record<string, number>;
   recovery: Record<string, number | string | boolean>;
+  /**
+   * Phase C: partial θ overlay. When present, merged onto baseline and applied
+   * as the active orchestration policy (global on promote; ALS on canary).
+   */
+  theta?: Record<string, number>;
 }
 
 const globalState: LearnedPoolState = {
@@ -82,6 +93,7 @@ export function snapshotStagedPolicyFields(state: LearnedPoolState = globalState
     fallbackBoosts: Object.fromEntries(state.fallbackBoosts),
     modelFirstTokenTimeouts: Object.fromEntries(state.modelFirstTokenTimeouts),
     recovery: Object.fromEntries(state.recoveryPolicy),
+    // θ is applied via orchestration-policy ALS/global — not mirrored in maps.
   };
 }
 
@@ -155,16 +167,24 @@ export function applyPolicySnapshotToPool(
     prev?.modelFirstTokenTimeouts,
   );
   mergeRecoveryMap(state.recoveryPolicy, snapshot.recovery, prev?.recovery);
+  // Phase C: promote/rollback of θ patch onto the process-global active policy.
+  if (snapshot.theta && Object.keys(snapshot.theta).length > 0) {
+    applyThetaPatchGlobally(snapshot.theta as ThetaPatch, BASELINE_THETA);
+  }
 }
 
 /**
  * Run `fn` with a request-scoped policy overlay. Overlay keys win for score
  * and timeout reads; global maps are not mutated. Nested calls restore the
- * prior overlay on exit.
+ * prior overlay on exit. When `snapshot.theta` is set, θ is ALS-scoped too.
  */
 export function runWithPolicyOverlay<T>(snapshot: PolicySnapshot | null | undefined, fn: () => T): T {
   if (!snapshot) return fn();
-  return policyOverlayAls.run(snapshot, fn);
+  const body = () => policyOverlayAls.run(snapshot, fn);
+  if (snapshot.theta && Object.keys(snapshot.theta).length > 0) {
+    return runWithTheta(snapshot.theta as ThetaPatch, body);
+  }
+  return body();
 }
 
 function overlayNumber(

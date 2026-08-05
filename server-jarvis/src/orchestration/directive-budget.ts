@@ -10,7 +10,11 @@
  * 24 is roughly 2x the observed healthy per-run rate: generous for a real
  * multi-stage repair, decisively short of a spin.
  */
-export const MAX_DIRECTIVES_PER_TURN = 24;
+
+import { BASELINE_THETA, policy } from "./orchestration-policy";
+
+/** Baseline θ. Decision sites use `policy().max_directives_per_turn`. */
+export const MAX_DIRECTIVES_PER_TURN = BASELINE_THETA.max_directives_per_turn;
 
 /** Directives that end or record a turn — never budget-refused. */
 const TERMINAL_DIRECTIVES = new Set([
@@ -26,14 +30,14 @@ export class DirectiveBudget {
 
   claim(directiveType: string): boolean {
     if (TERMINAL_DIRECTIVES.has(directiveType)) return true;
-    if (this.spent >= MAX_DIRECTIVES_PER_TURN) return false;
+    if (this.spent >= policy().max_directives_per_turn) return false;
     this.spent++;
     this.counts.set(directiveType, (this.counts.get(directiveType) ?? 0) + 1);
     return true;
   }
 
   exhausted(): boolean {
-    return this.spent >= MAX_DIRECTIVES_PER_TURN;
+    return this.spent >= policy().max_directives_per_turn;
   }
 
   tally(): Record<string, number> {

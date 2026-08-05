@@ -1,6 +1,7 @@
 import { isStageSummaryPlaceholder } from "./stage-output";
 import type { ToolCallRecord } from "./stage-output";
 import { countsTowardWriteEffect, isStatusOrLogDocPath } from "./effect-gate";
+import { BASELINE_THETA, policy } from "./orchestration-policy";
 
 export type MidLoopDecisionSource =
   | "deterministic_reflex"
@@ -133,7 +134,7 @@ export interface MidLoopSignal {
 export type MidLoopImplementationPhase = "correctness" | "quality";
 
 /** Bounded quality pushes after correctness so free/local executors get coached. */
-export const MAX_QUALITY_PUSHES = 2;
+export const MAX_QUALITY_PUSHES = BASELINE_THETA.max_quality_pushes;
 
 export const DEFAULT_QUALITY_PUSH_NOTE =
   "Correctness floor is met (write landed; verification not red). " +
@@ -171,7 +172,8 @@ const PLAN_REMAINDER_NUDGE_CAP = 2;
  * third time, and each repeat costs a model round-trip plus transcript
  * re-upload.
  */
-export const FORCE_WRITE_NUDGE_CAP = 2;
+/** Baseline (Phase C θ). Decision sites use `policy().force_write_nudge_cap`. */
+export const FORCE_WRITE_NUDGE_CAP = BASELINE_THETA.force_write_nudge_cap;
 
 const EVIDENCE_TARGET_CAP = 6;
 const EVIDENCE_SUMMARY_CAP = 5;
@@ -321,14 +323,14 @@ export function buildMidLoopToolEvidence(
 }
 
 /** Max bounded check-runner invocations per executor stage (mid-loop path). */
-export const MAX_MID_LOOP_CHECKS = 2;
+export const MAX_MID_LOOP_CHECKS = BASELINE_THETA.max_mid_loop_checks;
 /** Max resident mid-loop escalations per run (shared with historical cap). */
-export const MAX_MID_LOOP_ESCALATIONS = 3;
+export const MAX_MID_LOOP_ESCALATIONS = BASELINE_THETA.max_mid_loop_escalations;
 /** Hold back at least this many slots for post-write / endgame / post-reroute. */
-export const RESERVED_MID_LOOP_ESCALATIONS = 1;
+export const RESERVED_MID_LOOP_ESCALATIONS = BASELINE_THETA.reserved_mid_loop_escalations;
 /** Endgame: last 20% of turns, or stage budget under this floor. */
-export const MID_LOOP_ENDGAME_BUDGET_MS = 45_000;
-export const MID_LOOP_ENDGAME_TURN_RATIO = 0.8;
+export const MID_LOOP_ENDGAME_BUDGET_MS = BASELINE_THETA.mid_loop_endgame_budget_ms;
+export const MID_LOOP_ENDGAME_TURN_RATIO = BASELINE_THETA.mid_loop_endgame_turn_ratio;
 
 /**
  * Whether to invoke the check-runner before a mid-loop judgment.
@@ -550,7 +552,7 @@ export function resolveResidentMidLoopDirective(
   }
   if (directive === "force_write") {
     const sent = signal.forceWriteNudgesSent ?? 0;
-    if (sent >= FORCE_WRITE_NUDGE_CAP) {
+    if (sent >= policy().force_write_nudge_cap) {
       return { kind: "continue", decisionSource: "cap_exhausted" };
     }
     return {
@@ -599,7 +601,7 @@ export function resolveResidentMidLoopDirective(
 
   if (signal.successfulWrites === 0) {
     const sent = signal.forceWriteNudgesSent ?? 0;
-    if (sent >= FORCE_WRITE_NUDGE_CAP) {
+    if (sent >= policy().force_write_nudge_cap) {
       return { kind: "continue", decisionSource: "cap_exhausted" };
     }
     return {
@@ -686,7 +688,7 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
     signal.successfulWrites === 0 &&
     (signal.failedWriteAttempts ?? 0) >= 1 &&
     signal.stageRemainingMs > ABORT_BUDGET_FLOOR_MS &&
-    (signal.forceWriteNudgesSent ?? 0) < FORCE_WRITE_NUDGE_CAP &&
+    (signal.forceWriteNudgesSent ?? 0) < policy().force_write_nudge_cap &&
     signal.writeEffectPressureAvailable !== false
   ) {
     return {
@@ -722,7 +724,7 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
     const spiralSent = signal.forceWriteNudgesSent ?? 0;
     if (
       signal.writeEffectPressureAvailable !== false
-      && spiralSent < FORCE_WRITE_NUDGE_CAP
+      && spiralSent < policy().force_write_nudge_cap
     ) {
       return {
         kind: "force_write",
@@ -754,7 +756,7 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
     const reReadSent = signal.forceWriteNudgesSent ?? 0;
     if (
       signal.writeEffectPressureAvailable !== false
-      && reReadSent < FORCE_WRITE_NUDGE_CAP
+      && reReadSent < policy().force_write_nudge_cap
     ) {
       return {
         kind: "force_write",

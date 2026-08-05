@@ -8,15 +8,17 @@
  * a stage_run_id (Task 1).
  */
 
+import { BASELINE_THETA, policy } from "./orchestration-policy";
+
 /** Executor turns a model needs before its no-tool rate is actionable. */
-export const MIN_NO_TOOL_SAMPLE = 12;
+export const MIN_NO_TOOL_SAMPLE = BASELINE_THETA.min_no_tool_sample;
 
 /**
  * No-tool rate above which a model stops being a preferred executor pick.
  * Set above the 44% fleet average so this demotes the tail, not the field —
  * demoting everything would empty the pool.
  */
-export const NO_TOOL_DEMOTION_THRESHOLD = 0.6;
+export const NO_TOOL_DEMOTION_THRESHOLD = BASELINE_THETA.no_tool_demotion_threshold;
 
 export interface NoToolStats {
   noToolTurns: number;
@@ -24,8 +26,8 @@ export interface NoToolStats {
 }
 
 export function shouldDemoteForNoTool(stats: NoToolStats): boolean {
-  if (stats.executorTurns < MIN_NO_TOOL_SAMPLE) return false;
-  return stats.noToolTurns / stats.executorTurns > NO_TOOL_DEMOTION_THRESHOLD;
+  if (stats.executorTurns < policy().min_no_tool_sample) return false;
+  return stats.noToolTurns / stats.executorTurns > policy().no_tool_demotion_threshold;
 }
 
 const noToolStats = new Map<string, NoToolStats>();
@@ -52,7 +54,7 @@ export function noToolStatsFor(provider: string, modelId: string): NoToolStats {
 }
 
 /** Calls before an error rate is actionable. */
-export const MIN_ERROR_RATE_SAMPLE = 10;
+export const MIN_ERROR_RATE_SAMPLE = BASELINE_THETA.min_error_rate_sample;
 
 /**
  * Error rate above which a model is benched outright. Deliberately high: this
@@ -60,7 +62,7 @@ export const MIN_ERROR_RATE_SAMPLE = 10;
  * 91%, claude_cli:gemma4:e2b at 85%), not merely unreliable
  * (nemotron-3-ultra-free at 20% stays in the pool).
  */
-export const ERROR_RATE_BENCH_THRESHOLD = 0.7;
+export const ERROR_RATE_BENCH_THRESHOLD = BASELINE_THETA.error_rate_bench_threshold;
 
 export interface ErrorRateStats {
   errors: number;
@@ -68,8 +70,8 @@ export interface ErrorRateStats {
 }
 
 export function shouldBenchForErrorRate(stats: ErrorRateStats): boolean {
-  if (stats.calls < MIN_ERROR_RATE_SAMPLE) return false;
-  return stats.errors / stats.calls > ERROR_RATE_BENCH_THRESHOLD;
+  if (stats.calls < policy().min_error_rate_sample) return false;
+  return stats.errors / stats.calls > policy().error_rate_bench_threshold;
 }
 
 /**

@@ -102,6 +102,7 @@ import {
   type SymbolGroundingSummary,
 } from "./symbol-grounding";
 import { preflightWriteTool, WRITE_EFFECT_TOOL_NAMES } from "../write-preflight";
+import { BASELINE_THETA, policy } from "./orchestration-policy";
 import { safePath } from "../fs-scope";
 import { hasFileBeenRead, markFileRead, unmarkFileRead } from "../fs-read-cache";
 import { promises as fsPromises } from "fs";
@@ -628,7 +629,7 @@ export function composeEvidenceFallbackAnswer(state: PipelineStageState): string
  * starting with 28-40s died three turns in a row; the one turn where it got
  * ~60s+ (run 6b4ab013) produced a full answer.
  */
-export const SYNTHESIS_RUNWAY_MS = 30_000;
+export const SYNTHESIS_RUNWAY_MS = BASELINE_THETA.synthesis_runway_ms;
 
 /**
  * Delegate launches allowed per logical agent run.
@@ -639,7 +640,7 @@ export const SYNTHESIS_RUNWAY_MS = 30_000;
  * spawning if the delegate is failing. `DelegateHealth`'s strike cooldown is
  * the independent second guard.
  */
-export const MAX_DELEGATE_LAUNCHES_PER_RUN = 4;
+export const MAX_DELEGATE_LAUNCHES_PER_RUN = BASELINE_THETA.max_delegate_launches_per_run;
 
 /**
  * Error codes that describe the RUNTIME failing before or around the model,
@@ -677,7 +678,7 @@ export function shouldCutToSynthesis(args: {
 }): boolean {
   if (!args.wantsSynthesizer || !args.hasEvidence) return false;
   if (args.remainingMs === undefined || args.reserveMs === undefined) return false;
-  return args.remainingMs <= args.reserveMs + SYNTHESIS_RUNWAY_MS;
+  return args.remainingMs <= args.reserveMs + policy().synthesis_runway_ms;
 }
 
 export function successfulWriteKeys(
@@ -2386,7 +2387,8 @@ export class PipelineExecutor {
       // likely fail the same way on the same task, so it does not get another
       // 76s subprocess — that is the invariant the replan test encodes. A
       // delegate that IS writing keeps the stage, up to the launch cap.
-      if (!delegateRuntime || launchesUsed >= MAX_DELEGATE_LAUNCHES_PER_RUN
+      const maxDelegateLaunches = policy().max_delegate_launches_per_run;
+      if (!delegateRuntime || launchesUsed >= maxDelegateLaunches
         || this.delegateNoWriteRuns.has(agentRunId)) {
         if (!delegateRuntime) {
           console.warn("[Pipeline] delegate skipped: no delegateRuntime wired");
@@ -2397,7 +2399,7 @@ export class PipelineExecutor {
         } else {
           console.warn(
             `[Pipeline] delegate skipped: launch cap reached ` +
-            `(${launchesUsed}/${MAX_DELEGATE_LAUNCHES_PER_RUN}) for run=${agentRunId}`,
+            `(${launchesUsed}/${maxDelegateLaunches}) for run=${agentRunId}`,
           );
         }
         return undefined;

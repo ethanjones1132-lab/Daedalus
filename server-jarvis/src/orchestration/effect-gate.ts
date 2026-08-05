@@ -4,6 +4,7 @@ import type { WriteEffectObservation } from "./content-fingerprint";
 import { hasWriteIntent } from "./turn-requirements";
 import { defaultCapabilityIndex } from "../tool-capabilities-default";
 import type { SemanticPressureBudget } from "./executor-progress-policy";
+import { BASELINE_THETA, policy } from "./orchestration-policy";
 
 /**
  * Tools whose success is a real workspace mutation.
@@ -14,10 +15,11 @@ import type { SemanticPressureBudget } from "./executor-progress-policy";
  * the derived set still covers every name this list used to carry.
  */
 export const WRITE_EFFECT_TOOLS: ReadonlySet<string> = defaultCapabilityIndex().writeEffect;
-export const MAX_FAILED_WRITE_ATTEMPTS_WITHOUT_EFFECT = 2;
+
+export const MAX_FAILED_WRITE_ATTEMPTS_WITHOUT_EFFECT = BASELINE_THETA.max_failed_write_attempts_without_effect;
 
 /** Max times the same write-pressure note text may be injected in one run. */
-export const IDENTICAL_WRITE_PRESSURE_NOTE_CAP = 2;
+export const IDENTICAL_WRITE_PRESSURE_NOTE_CAP = BASELINE_THETA.identical_write_pressure_note_cap;
 
 /**
  * Status / log documents that models invent to game the write-effect gate
@@ -177,7 +179,7 @@ export function toolCallWritePath(call: ToolCallRecord): string | undefined {
 export function claimIdenticalWritePressureNote(
   tracker: Map<string, number>,
   note: string,
-  cap: number = IDENTICAL_WRITE_PRESSURE_NOTE_CAP,
+  cap: number = policy().identical_write_pressure_note_cap,
 ): boolean {
   const key = note.trim();
   if (!key) return false;
@@ -379,14 +381,14 @@ export function hasRepeatedWriteFailureWithoutEffect(
     (call) => !call.is_error && countsTowardWriteEffect(toolCallWritePath(call), targetPaths),
   );
   return !gateSuccess
-    && writes.filter((call) => call.is_error).length >= MAX_FAILED_WRITE_ATTEMPTS_WITHOUT_EFFECT;
+    && writes.filter((call) => call.is_error).length >= policy().max_failed_write_attempts_without_effect;
 }
 
 export function isTerminalNoWriteEffect(report: EffectGateReport): boolean {
   return report.verdict === "no_write_effect"
     && report.successfulWrites === 0
     && report.failedCalls.filter((call) => WRITE_EFFECT_TOOLS.has(call.name)).length
-      >= MAX_FAILED_WRITE_ATTEMPTS_WITHOUT_EFFECT;
+      >= policy().max_failed_write_attempts_without_effect;
 }
 
 /**

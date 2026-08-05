@@ -30,6 +30,7 @@ import {
   isStatusOrLogDocPath,
   pathInTargetSet,
 } from "./effect-gate";
+import { BASELINE_THETA, policy } from "./orchestration-policy";
 
 export interface RunRewardWeights {
   writes: number;
@@ -38,13 +39,13 @@ export interface RunRewardWeights {
 }
 
 export const DEFAULT_RUN_REWARD_WEIGHTS: RunRewardWeights = {
-  writes: 1,
-  check: 1,
-  plan: 1,
+  writes: BASELINE_THETA.reward_weight_writes,
+  check: BASELINE_THETA.reward_weight_check,
+  plan: BASELINE_THETA.reward_weight_plan,
 };
 
 /** B3: subtracted when outcome claims success without a passing independent check. */
-export const OVERCLAIM_PENALTY = 0.5;
+export const OVERCLAIM_PENALTY = BASELINE_THETA.overclaim_penalty;
 
 /** Check tiers that count as an independent oracle (not runtime-authored). */
 export const INDEPENDENT_CHECK_TIERS: ReadonlySet<CheckTier> = new Set([
@@ -291,10 +292,11 @@ export function computeRunReward(input: RunRewardInput): RunRewardBreakdown {
   const antiGaming = input.antiGaming !== false;
   const calibration = input.calibration !== false;
 
+  const pθ = policy();
   const baseWeights: RunRewardWeights = {
-    writes: input.weights?.writes ?? DEFAULT_RUN_REWARD_WEIGHTS.writes,
-    check: input.weights?.check ?? DEFAULT_RUN_REWARD_WEIGHTS.check,
-    plan: input.weights?.plan ?? DEFAULT_RUN_REWARD_WEIGHTS.plan,
+    writes: input.weights?.writes ?? pθ.reward_weight_writes,
+    check: input.weights?.check ?? pθ.reward_weight_check,
+    plan: input.weights?.plan ?? pθ.reward_weight_plan,
   };
 
   const w = computeWriteTerm(input.writes);
@@ -340,12 +342,13 @@ export function computeRunReward(input: RunRewardInput): RunRewardBreakdown {
     calibration
     && declared === "success"
     && !c.independentPass;
-  const overclaimPenalty = overclaim ? OVERCLAIM_PENALTY : 0;
+  const penalty = pθ.overclaim_penalty;
+  const overclaimPenalty = overclaim ? penalty : 0;
   let score = baseScore;
   if (overclaim) {
     // Harder than honest partial: base may be >0 (writes), but success claim
     // without check is driven below an equivalent honest partial.
-    score = clamp(baseScore - OVERCLAIM_PENALTY, -1, 1);
+    score = clamp(baseScore - penalty, -1, 1);
   }
 
   const notes = [
@@ -355,7 +358,7 @@ export function computeRunReward(input: RunRewardInput): RunRewardBreakdown {
     ...(hardZero && hardZeroReason ? [hardZeroReason] : []),
     ...(overclaim
       ? [
-        `B3 overclaim: declared success without independent passing check (−${OVERCLAIM_PENALTY})`,
+        `B3 overclaim: declared success without independent passing check (−${penalty})`,
       ]
       : []),
     sum === 0 && !hardZero

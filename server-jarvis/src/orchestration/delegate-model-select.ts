@@ -21,6 +21,7 @@ import {
   shouldBenchForErrorRate,
   errorStatsForModel,
 } from "./model-health";
+import { BASELINE_THETA, policy } from "./orchestration-policy";
 
 /** OpenAI-format Go models (need proxy for Claude CLI). */
 export const DELEGATE_GO_OPENAI_MODELS = [
@@ -115,10 +116,10 @@ export const DELEGATE_GO_CHEAP_CAPABLE_MODELS = [
   ...DELEGATE_GO_ANTHROPIC_MODELS,
 ] as const;
 
-export const DEFAULT_FREE_THRASH_THRESHOLD = 2;
-export const DELEGATE_WRITE_SCOREBOARD_BENCH_ATTEMPTS = 3;
+export const DEFAULT_FREE_THRASH_THRESHOLD = BASELINE_THETA.default_free_thrash_threshold;
+export const DELEGATE_WRITE_SCOREBOARD_BENCH_ATTEMPTS = BASELINE_THETA.delegate_write_scoreboard_bench_attempts;
 /** Default session thrash counter TTL (30 minutes). */
-export const DEFAULT_THRASH_TTL_MS = 30 * 60_000;
+export const DEFAULT_THRASH_TTL_MS = BASELINE_THETA.thrash_ttl_ms;
 
 /**
  * Historical write-evidence seeds so scoreboard ranking picks a proven writer
@@ -578,7 +579,7 @@ export function selectDelegateModel(input: {
 }): DelegateModelSelection {
   ensureDelegateWriteScoreboardHydrated();
 
-  const threshold = input.thrashThreshold ?? DEFAULT_FREE_THRASH_THRESHOLD;
+  const threshold = input.thrashThreshold ?? policy().default_free_thrash_threshold;
   const free = input.freeModels ?? DELEGATE_FREE_FIRST_MODELS;
   const goOpenai = input.goOpenaiModels ?? DELEGATE_GO_OPENAI_MODELS;
   const goAnthropic = input.goAnthropicModels ?? DELEGATE_GO_ANTHROPIC_MODELS;
@@ -718,7 +719,7 @@ export function enumerateDelegateModelCandidates(input: {
   goAnthropicModels?: readonly string[];
 }): DelegateModelSelection[] {
   ensureDelegateWriteScoreboardHydrated();
-  const threshold = input.thrashThreshold ?? DEFAULT_FREE_THRASH_THRESHOLD;
+  const threshold = input.thrashThreshold ?? policy().default_free_thrash_threshold;
   const free = input.freeModels ?? DELEGATE_FREE_FIRST_MODELS;
   const goOpenai = input.goOpenaiModels ?? DELEGATE_GO_OPENAI_MODELS;
   const goAnthropic = input.goAnthropicModels ?? DELEGATE_GO_ANTHROPIC_MODELS;

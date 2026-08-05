@@ -20,6 +20,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { SESSIONS_DIR } from "../config";
+import { BASELINE_THETA, policy } from "../orchestration/orchestration-policy";
 import {
   applyPolicySnapshotToPool,
   getLearnedPoolState,
@@ -30,17 +31,17 @@ import {
 /** Re-export so consumers can import staged-policy types from one module. */
 export type { PolicySnapshot } from "./learned-pool-state";
 
-// ── Thresholds (from plan) ──────────────────────────────────────────────────
+// ── Thresholds (from plan / Phase C θ baseline) ─────────────────────────────
 
 export const POLICY_STAGING_THRESHOLDS = {
   /** Eligible outcomes required before a candidate may enter shadow replay. */
-  minEligibleOutcomesBeforeShadow: 20,
+  minEligibleOutcomesBeforeShadow: BASELINE_THETA.policy_min_eligible_outcomes_before_shadow,
   /** Fraction of live traffic that receives the canary policy. */
-  canaryTrafficFraction: 0.1,
+  canaryTrafficFraction: BASELINE_THETA.policy_canary_traffic_fraction,
   /** Minimum canary runs before promotion may be evaluated. */
-  minCanaryRunsBeforePromotion: 20,
+  minCanaryRunsBeforePromotion: BASELINE_THETA.policy_min_canary_runs_before_promotion,
   /** Absolute floor on canary success rate for promotion. */
-  minCanarySuccessRate: 0.6,
+  minCanarySuccessRate: BASELINE_THETA.policy_min_canary_success_rate,
   /**
    * Canary must not underperform production by more than this margin
    * (success-rate points) at promotion time.
@@ -76,6 +77,8 @@ export interface PolicyPatch {
   fallbackBoosts?: Record<string, number>;
   modelFirstTokenTimeouts?: Record<string, number>;
   recovery?: Record<string, number | string | boolean>;
+  /** Phase C: partial θ dimensions to stage through canary/LKG. */
+  theta?: Record<string, number>;
 }
 
 export interface PolicyVersion {
@@ -178,6 +181,7 @@ function emptySnapshot(): PolicySnapshot {
     fallbackBoosts: {},
     modelFirstTokenTimeouts: {},
     recovery: {},
+    theta: {},
   };
 }
 
@@ -205,6 +209,10 @@ export function mergePatchIntoSnapshot(
     recovery: {
       ...base.recovery,
       ...(patch.recovery ?? {}),
+    },
+    theta: {
+      ...(base.theta ?? {}),
+      ...(patch.theta ?? {}),
     },
   };
 }
@@ -472,7 +480,7 @@ export function runShadowReplay(
  */
 export function shouldApplyCanary(rng: () => number = Math.random): boolean {
   if (!store.canary || store.canary.stage !== "canary") return false;
-  return rng() < POLICY_STAGING_THRESHOLDS.canaryTrafficFraction;
+  return rng() < policy().policy_canary_traffic_fraction;
 }
 
 /**

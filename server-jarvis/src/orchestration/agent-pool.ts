@@ -12,6 +12,7 @@ import {
   type ReliabilityLatencyEntry,
 } from "./reliability-latency-rank";
 import { noToolStatsFor, shouldDemoteForNoTool } from "./model-health";
+import { BASELINE_THETA, policy } from "./orchestration-policy";
 
 export interface AgentCapabilities {
   code: number;
@@ -331,7 +332,7 @@ export const DEFAULT_LOCAL_STAGE_MODELS: readonly string[] = ["qwen3.5:4b", "qwe
  * local lane that cannot plausibly complete AND leave room for the remote
  * cascade is worse than going remote immediately.
  */
-export const LOCAL_STAGE_MIN_WINDOW_MS = 75_000;
+export const LOCAL_STAGE_MIN_WINDOW_MS = BASELINE_THETA.local_stage_min_window_ms;
 
 /**
  * Build a synthetic pool agent for a local Ollama model. Not stage-pinned
@@ -469,7 +470,7 @@ export class AgentPool {
       const windowAllowsLocal =
         typeof window !== "number"
         || !Number.isFinite(window)
-        || window >= LOCAL_STAGE_MIN_WINDOW_MS;
+        || window >= policy().local_stage_min_window_ms;
       if (windowAllowsLocal) {
         candidates = this.injectLocalStageCandidates(candidates, exclude, selection);
         const localPick = this.pickPreferredLocal(candidates, stage, selection);

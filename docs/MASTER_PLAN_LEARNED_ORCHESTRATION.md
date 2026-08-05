@@ -87,6 +87,28 @@ Every threshold shipped this week was a human reading the evidence store and pic
 
 **Exit criterion:** every hand-tuned constant reachable through θ; the current values reproduce today's behaviour exactly as a baseline.
 
+### Phase C status (2026-08-05) — **complete (C1–C3)**
+
+**C1 — θ defined.** `server-jarvis/src/orchestration/orchestration-policy.ts`:
+- `OrchestrationTheta` + `THETA_KEYS` (~50 dimensions): write pressure, directives, stage budgets, model health, delegate, grounding, context, reward, policy-staging traffic.
+- `BASELINE_THETA` pins today's shipped values (exit criterion: baseline ≡ prior constants).
+- Dense vector: `thetaToVector` / `vectorToTheta` for CMA-ES.
+
+**C2 — Policy object.**
+- `policy()` / `runWithTheta` / `setGlobalTheta` / `applyThetaPatchGlobally` (ALS + global).
+- Decision sites read `policy().…` for: force-write nudge cap, directive budget, no-tool demotion, error-rate bench, local stage window, thrash threshold, failed-write attempts, delegate launch cap, synthesis runway, grounding caps, reward weights/overclaim, canary traffic fraction.
+- Exported module constants remain baseline aliases for tests/docs.
+- `PolicySnapshot.theta` + `PolicyPatch.theta` merge through `policy-staging`; promote applies θ globally; canary overlay uses `runWithTheta` inside `runWithPolicyOverlay`.
+
+**C3 — Reproducible rollouts.**
+- `RolloutSpec` = `{ theta, seed, fixtureId }`
+- `rolloutFingerprint` (SHA-256, deterministic)
+- `mulberry32` PRNG + `withRollout` binds θ + seed for offline identity checks
+
+**Exit criterion met:** every listed hand-tuned knob is a θ dimension; baseline tests pin key values; replay fingerprint is deterministic.
+
+**Still open:** Phase D CMA-ES over θ against Phase B reward.
+
 ---
 
 ## Phase D — Rollout harness and CMA-ES

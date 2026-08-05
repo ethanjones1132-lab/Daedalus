@@ -10,11 +10,12 @@
  */
 
 import { prepareToolResultForContext } from "../tool-result-truncation";
+import { BASELINE_THETA, policy } from "./orchestration-policy";
 
-export const MAX_GROUNDING_SYMBOLS = 8;
-export const MAX_GROUNDING_GREPS = 16;
-export const GROUNDING_GREP_HEAD_LIMIT = 3;
-export const GROUNDING_BLOCK_CONTEXT_CHARS = 4_000;
+export const MAX_GROUNDING_SYMBOLS = BASELINE_THETA.max_grounding_symbols;
+export const MAX_GROUNDING_GREPS = BASELINE_THETA.max_grounding_greps;
+export const GROUNDING_GREP_HEAD_LIMIT = BASELINE_THETA.grounding_grep_head_limit;
+export const GROUNDING_BLOCK_CONTEXT_CHARS = BASELINE_THETA.grounding_block_context_chars;
 export const DEP_DIR_CANDIDATES = [
   "node_modules",
   "vendor",
@@ -136,7 +137,7 @@ export function extractGroundingIdentifiers(text: string): string[] {
     push(match[1]!);
   }
 
-  return candidates.slice(0, MAX_GROUNDING_SYMBOLS);
+  return candidates.slice(0, policy().max_grounding_symbols);
 }
 
 function harvestFromFragment(fragment: string, push: (s: string) => void): void {
@@ -239,7 +240,7 @@ export function formatGroundingBlock(results: SymbolGroundingResult[]): string {
   for (const result of results) {
     if (result.found && result.hits.length > 0) {
       lines.push(`${result.symbol}:`);
-      for (const hit of result.hits.slice(0, GROUNDING_GREP_HEAD_LIMIT)) {
+      for (const hit of result.hits.slice(0, policy().grounding_grep_head_limit)) {
         const declaration = hit.text.trim().slice(0, 200);
         lines.push(`  ${hit.path}:${hit.line}: ${declaration}`);
       }
@@ -253,7 +254,7 @@ export function formatGroundingBlock(results: SymbolGroundingResult[]): string {
   }
 
   const raw = lines.join("\n").trimEnd();
-  return prepareToolResultForContext(raw, GROUNDING_BLOCK_CONTEXT_CHARS).context;
+  return prepareToolResultForContext(raw, policy().grounding_block_context_chars).context;
 }
 
 /**
@@ -270,9 +271,9 @@ export async function collectSymbolGrounding(options: {
   maxGreps?: number;
   headLimit?: number;
 }): Promise<{ results: SymbolGroundingResult[]; grepsUsed: number; summary: SymbolGroundingSummary }> {
-  const maxSymbols = options.maxSymbols ?? MAX_GROUNDING_SYMBOLS;
-  const maxGreps = options.maxGreps ?? MAX_GROUNDING_GREPS;
-  const headLimit = options.headLimit ?? GROUNDING_GREP_HEAD_LIMIT;
+  const maxSymbols = options.maxSymbols ?? policy().max_grounding_symbols;
+  const maxGreps = options.maxGreps ?? policy().max_grounding_greps;
+  const headLimit = options.headLimit ?? policy().grounding_grep_head_limit;
   const symbols = options.symbols.slice(0, maxSymbols);
   const rootEntries = new Set(
     (options.rootEntries ?? []).map((e) => e.replace(/[\\/]+$/, "")),
