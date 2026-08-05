@@ -11,6 +11,7 @@ import {
   rankModelsByReliabilityLatency,
   type ReliabilityLatencyEntry,
 } from "./reliability-latency-rank";
+import { noToolStatsFor, shouldDemoteForNoTool } from "./model-health";
 
 export interface AgentCapabilities {
   code: number;
@@ -473,6 +474,19 @@ export class AgentPool {
         candidates = this.injectLocalStageCandidates(candidates, exclude, selection);
         const localPick = this.pickPreferredLocal(candidates, stage, selection);
         if (localPick) return localPick;
+      }
+    }
+    // W3.4: demote executor models with a measured high no-tool rate from the
+    // preferred set. Leave them in cascade (enabled list / fallbackChain) —
+    // never empty the pool. Stats come from process-local recordExecutorTurn.
+    if (stage === "executor" && candidates.length > 1) {
+      const demoted = new Set(
+        candidates
+          .filter((a) => shouldDemoteForNoTool(noToolStatsFor(a.provider, a.model_id)))
+          .map((a) => `${a.provider}:${a.model_id}`),
+      );
+      if (demoted.size > 0 && demoted.size < candidates.length) {
+        candidates = candidates.filter((a) => !demoted.has(`${a.provider}:${a.model_id}`));
       }
     }
     if (candidates.length === 0) return undefined;

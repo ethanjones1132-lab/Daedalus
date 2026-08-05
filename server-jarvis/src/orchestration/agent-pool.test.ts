@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, test } from "bun:test";
 import {
   AgentPool,
   DEFAULT_LOCAL_STAGE_MODELS,
@@ -12,6 +12,11 @@ import {
   type OrchestratorAgent,
 } from "./agent-pool";
 import { getLearnedPoolState } from "../self-tuning/learned-pool-state";
+import {
+  __resetModelHealthForTests,
+  MIN_NO_TOOL_SAMPLE,
+  recordExecutorTurn,
+} from "./model-health";
 
 const agents: OrchestratorAgent[] = [
   {
@@ -1411,6 +1416,65 @@ describe("pickFor M5 reliability/latency ranking", () => {
     });
     // Fail-open: keep original tier rather than leave the stage uncovered.
     expect(picked).toBeDefined();
+  });
+});
+
+describe("pickFor no-tool demotion (W3.4)", () => {
+  beforeEach(() => {
+    __resetModelHealthForTests();
+  });
+
+  const pair: OrchestratorAgent[] = [
+    {
+      id: "no-tool-heavy",
+      provider: "openrouter",
+      model_id: "vendor/no-tool:free",
+      capabilities: { code: 0.99, reasoning: 0.9, speed: 0.9, cost: 1, json_reliability: 0.9 },
+      default_for: ["executor"],
+      enabled: true,
+      billing_tier: "free",
+    },
+    {
+      id: "tool-healthy",
+      provider: "openrouter",
+      model_id: "vendor/tools:free",
+      capabilities: { code: 0.7, reasoning: 0.7, speed: 0.7, cost: 1, json_reliability: 0.7 },
+      default_for: [],
+      enabled: true,
+      billing_tier: "free",
+    },
+  ];
+
+  test("demotes a high no-tool model from preferred executor picks", () => {
+    for (let i = 0; i < MIN_NO_TOOL_SAMPLE + 4; i++) {
+      // >60% no-tool over sample floor.
+      recordExecutorTurn("openrouter", "vendor/no-tool:free", i % 5 === 0);
+    }
+    const pool = new AgentPool(pair);
+    // Without demotion the default_for pin would win; demotion must fall through.
+    expect(pool.pickFor("executor", "refactor")?.id).toBe("tool-healthy");
+  });
+
+  test("never empties the pool when every candidate is demoted", () => {
+    for (const agent of pair) {
+      for (let i = 0; i < MIN_NO_TOOL_SAMPLE + 2; i++) {
+        recordExecutorTurn(agent.provider, agent.model_id, false);
+      }
+    }
+    const pool = new AgentPool(pair);
+    expect(pool.pickFor("executor", "refactor")).toBeDefined();
+  });
+
+  test("does not demote on non-executor stages", () => {
+    for (let i = 0; i < MIN_NO_TOOL_SAMPLE + 4; i++) {
+      recordExecutorTurn("openrouter", "vendor/no-tool:free", false);
+    }
+    const plannerPair: OrchestratorAgent[] = [
+      { ...pair[0]!, default_for: ["planner"] },
+      { ...pair[1]!, default_for: [] },
+    ];
+    const pool = new AgentPool(plannerPair);
+    expect(pool.pickFor("planner", "general")?.id).toBe("no-tool-heavy");
   });
 });
 
