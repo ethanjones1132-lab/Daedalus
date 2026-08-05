@@ -21,6 +21,12 @@ import { safePath } from "./fs-scope";
 import { markFileRead, hasFileBeenRead } from "./fs-read-cache";
 import { applyUnifiedPatch, buildUnifiedDiff } from "./diff";
 import { fingerprintBytes, fingerprintFile, recordWriteEffect } from "./orchestration/content-fingerprint";
+import {
+  applyRepairedEdit,
+  repairEditPair,
+  repairMultiEditPairs,
+  stripLineNumberGutter,
+} from "./edit-contract";
 
 // ── Tool Definitions (copied byte-for-byte from legacy getAllTools) ──────────────
 
@@ -236,31 +242,9 @@ async function handleReadFile(args: Record<string, unknown>, ctx: ExecutionConte
  * old_strings must match the RAW file. Weak models routinely paste the
  * numbered text verbatim; instead of failing them into a read→edit death
  * spiral, strip the number gutter when (and only when) the literal string
- * does not match. Exported for tests.
+ * does not match. Re-exported from edit-contract (Phase A2) for tests.
  */
-export function stripLineNumberGutter(text: string): string {
-  return text
-    .split("\n")
-    .map((line) => line.replace(/^\s*\d+ \| /, ""))
-    .join("\n");
-}
-
-/** Resolve the old/new pair against raw content, tolerating a pasted number gutter. */
-function resolveEditStrings(
-  content: string,
-  oldStr: string,
-  newStr: string,
-): { oldStr: string; newStr: string } | null {
-  if (content.includes(oldStr)) return { oldStr, newStr };
-  const strippedOld = stripLineNumberGutter(oldStr);
-  if (strippedOld !== oldStr && content.includes(strippedOld)) {
-    // The model pasted the gutter into old_string; assume the replacement
-    // carries the same gutter and strip both so we never write line numbers
-    // into the file.
-    return { oldStr: strippedOld, newStr: stripLineNumberGutter(newStr) };
-  }
-  return null;
-}
+export { stripLineNumberGutter };
 
 async function handleWriteFile(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const cfg = ctx.config;
@@ -307,25 +291,31 @@ async function handleEditFile(args: Record<string, unknown>, ctx: ExecutionConte
     throw new Error(`File not found: ${path}`);
   }
 
-  const resolved = resolveEditStrings(content, oldStr, newStr);
-  if (!resolved) {
+  // Phase A2: exact-text contract — exact, gutter, or whitespace-tolerant unique
+  // match; rewrite against the live span so free-tier whitespace drift still lands.
+  const repair = repairEditPair(content, oldStr, newStr);
+  if (!repair.ok) {
+    if (repair.reason === "ambiguous") {
+      throw new Error(`Error: old_string appears multiple times in ${args.path}. Make it more specific.`);
+    }
+    if (repair.reason === "noop") {
+      throw new Error(`edit is a no-op — old_string equals new_string: ${args.path}`);
+    }
     throw new Error(`Error: old_string not found in "${args.path}". The file content may have changed. Call read_file on "${args.path}" to see current content, then use the exact text for old_string WITHOUT the line-number gutter ("   42 | ").`);
   }
 
-  const occurrences = content.split(resolved.oldStr).length - 1;
-  if (occurrences > 1) {
-    throw new Error(`Error: old_string appears ${occurrences} times in ${args.path}. Make it more specific.`);
-  }
-
-  const updated = content.replace(resolved.oldStr, resolved.newStr);
-  if (resolved.oldStr === resolved.newStr) {
-    throw new Error(`edit is a no-op — old_string equals new_string: ${args.path}`);
-  }
+  const updated = applyRepairedEdit(content, repair);
   const before = await fingerprintFile(path);
   await fs.writeFile(path, updated, "utf-8");
   const after = await fingerprintFile(path);
   recordWriteEffect(ctx, { toolName: "edit_file", path, before, after });
-  return `Edited ${args.path}: replaced ${resolved.oldStr.length} chars with ${resolved.newStr.length} chars`;
+  const how =
+    repair.matchKind === "tolerant"
+      ? " (whitespace-tolerant match)"
+      : repair.matchKind === "gutter"
+        ? " (gutter-stripped match)"
+        : "";
+  return `Edited ${args.path}: replaced ${repair.old_string.length} chars with ${repair.new_string.length} chars${how}`;
 }
 
 async function handleMultiEdit(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
@@ -348,24 +338,33 @@ async function handleMultiEdit(args: Record<string, unknown>, ctx: ExecutionCont
     throw new Error(`File not found: ${path}`);
   }
 
-  const results: string[] = [];
   const before = await fingerprintFile(path);
-
-  for (const edit of edits) {
-    const resolved = resolveEditStrings(content, edit.old_string, edit.new_string);
-    if (!resolved) {
-      results.push(`SKIP: "${edit.old_string.slice(0, 40)}..." not found`);
-      continue;
+  // Phase A2: rolling tolerant/gutter repair for each edit.
+  const { content: next, items, applied } = repairMultiEditPairs(content, edits);
+  const results = items.map((item) => {
+    if (item.skipped === "not_found" || item.skipped === "empty_old") {
+      return `SKIP: "${item.old_string.slice(0, 40)}..." not found`;
     }
-    content = content.replace(resolved.oldStr, resolved.newStr);
-    results.push(`OK: replaced "${resolved.oldStr.slice(0, 40)}..."`);
-  }
+    if (item.skipped === "ambiguous") {
+      return `SKIP: "${item.old_string.slice(0, 40)}..." appears multiple times`;
+    }
+    if (item.skipped === "noop") {
+      return `SKIP: "${item.old_string.slice(0, 40)}..." no-op`;
+    }
+    const tag =
+      item.matchKind === "tolerant"
+        ? " (tolerant)"
+        : item.matchKind === "gutter"
+          ? " (gutter)"
+          : "";
+    return `OK: replaced "${item.old_string.slice(0, 40)}..."${tag}`;
+  });
 
-  if (!results.some((result) => result.startsWith("OK:"))) {
+  if (applied === 0) {
     throw new Error(`multi_edit has no applicable edits — every requested edit was skipped: ${args.path}`);
   }
 
-  await fs.writeFile(path, content, "utf-8");
+  await fs.writeFile(path, next, "utf-8");
   const after = await fingerprintFile(path);
   recordWriteEffect(ctx, { toolName: "multi_edit", path, before, after });
   return `Multi-edit on ${args.path}:\n${results.join("\n")}`;

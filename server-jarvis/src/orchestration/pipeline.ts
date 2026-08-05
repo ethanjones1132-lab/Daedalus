@@ -95,8 +95,16 @@ import {
 } from "./context-budget";
 import { prepareToolResultForContext } from "../tool-result-truncation";
 import { findExistingWorkspacePath } from "./workspace-affinity";
+import {
+  collectSymbolGrounding,
+  extractGroundingIdentifiers,
+  formatGroundingBlock,
+  type SymbolGroundingSummary,
+} from "./symbol-grounding";
+import { preflightWriteTool, WRITE_EFFECT_TOOL_NAMES } from "../write-preflight";
 import { safePath } from "../fs-scope";
-import { markFileRead, unmarkFileRead } from "../fs-read-cache";
+import { hasFileBeenRead, markFileRead, unmarkFileRead } from "../fs-read-cache";
+import { promises as fsPromises } from "fs";
 import { join, posix, win32 } from "path";
 import { canApplyConductorReroute, rejectReroute } from "./reroute-policy";
 import {
@@ -976,6 +984,12 @@ export class PipelineExecutor {
    */
   private delegateLaunchesByRun = new Map<string, number>();
   /**
+   * Phase A1→A3: symbols grepped and confirmed missing during the current
+   * write-turn grounding pass. Write preflight refuses to land content that
+   * reintroduces these. Cleared at the start of each executor stage.
+   */
+  private groundingMissingSymbols = new Set<string>();
+  /**
    * Runs whose delegate attempt ended with no verified write. Re-entry is
    * earned: a delegate that already failed and needed a native rescue does not
    * get another subprocess on the same task.
@@ -1588,6 +1602,18 @@ export class PipelineExecutor {
       }
     }
 
+    // Phase A2/A3: pre-dispatch write preflight — repair old_string in-process
+    // or block fabricated / out-of-scope / missing-string writes before they land.
+    if (WRITE_EFFECT_TOOL_NAMES.has(call.name)) {
+      const preflighted = await this.preflightWriteEffectCall(call);
+      if (preflighted.blocked) {
+        return preflighted.result;
+      }
+      if (preflighted.call) {
+        Object.assign(call, preflighted.call);
+      }
+    }
+
     const result = await this.runtime.execute(call, this.ctx);
     if (memory && sessionId) {
       memory.recordToolResult({
@@ -1599,6 +1625,81 @@ export class PipelineExecutor {
       });
     }
     return result;
+  }
+
+  /**
+   * Phase A2/A3: load live file content (when possible), run pure preflight,
+   * and either rewrite args (repaired edit) or return a blocked ToolResult.
+   */
+  private async preflightWriteEffectCall(
+    call: ToolCall,
+  ): Promise<
+    | { blocked: true; result: ToolResult }
+    | { blocked: false; call?: ToolCall }
+  > {
+    const rawPath = call.arguments?.path ?? call.arguments?.file_path;
+    let pathInScope = typeof rawPath === "string" && rawPath.trim().length > 0;
+    let resolvedPath: string | undefined;
+    let fileContent: string | null | undefined;
+    let hasBeenRead: boolean | undefined;
+
+    if (typeof rawPath === "string" && rawPath.trim()) {
+      try {
+        resolvedPath = safePath(rawPath, this.ctx.config, {
+          workspaceOverride: this.ctx.workspace_path,
+          sessionGrants: this.ctx.session_grants,
+          forWrite: true,
+        });
+        pathInScope = true;
+        hasBeenRead = hasFileBeenRead(resolvedPath);
+        try {
+          fileContent = await fsPromises.readFile(resolvedPath, "utf-8");
+        } catch {
+          fileContent = null;
+        }
+      } catch {
+        pathInScope = false;
+      }
+    } else {
+      pathInScope = false;
+    }
+
+    const verdict = preflightWriteTool(call.name, call.arguments, {
+      pathInScope,
+      fileContent,
+      hasBeenRead,
+      missingSymbols: this.groundingMissingSymbols,
+    });
+
+    if (!verdict.allow) {
+      return {
+        blocked: true,
+        result: {
+          call_id: call.id,
+          name: call.name,
+          output: verdict.reason,
+          is_error: true,
+          error: verdict.reason,
+          error_code: verdict.code === "path_out_of_scope" ? "policy_denied" : "handler_error",
+          duration_ms: 0,
+        },
+      };
+    }
+
+    if (verdict.repair && Object.keys(verdict.repair.arguments).length > 0) {
+      const repaired: ToolCall = {
+        ...call,
+        arguments: verdict.repair.arguments,
+      };
+      if (verdict.repair.notes.length > 0) {
+        console.log(
+          `[Pipeline] write preflight repair ${call.name}: ${verdict.repair.notes.join("; ")}`,
+        );
+      }
+      return { blocked: false, call: repaired };
+    }
+
+    return { blocked: false };
   }
 
   /**
@@ -1855,6 +1956,11 @@ export class PipelineExecutor {
     // reflex whose failure mode is injecting 66x (2026-07-31, run_2c46d082).
     let planNudgeCount = 0;
     let repeatedWriteFailureReached = false;
+    /** Phase A1: filled before delegate_first / native loop; closed over by runDelegate. */
+    let groundingBlock = "";
+    let groundingSummary: SymbolGroundingSummary | undefined;
+    // Fresh A3 missing-symbol set each executor stage (filled by grounding).
+    this.groundingMissingSymbols = new Set();
     const intentText = options.rawMessage ?? request;
     const requiresWorkspaceEvidence = turnNeedsWorkspaceEvidence(options.turnRequirement, intentText);
     // W5: task targets from the plan ledger + request path mentions. Status/log
@@ -2430,6 +2536,11 @@ export class PipelineExecutor {
             `Reuse them; do not rediscover the same targets.\n${priorEvidence}`,
           ]
           : []),
+        // Phase A1: delegate_first returns before the native preflight loop, so
+        // the symbol table must be inlined here when present (write turns only).
+        ...(groundingBlock.trim()
+          ? [`[Runtime grounding: symbol table]\n${groundingBlock}`]
+          : []),
         "[Runtime write contract] This is a CHANGE request. The stage is complete only after you actually invoke a file-writing tool (your environment's Write/Edit or equivalent) and it succeeds — describing the change in your response text does NOT modify any file. Read what you need first, then CALL the write/edit tool now, then read the file back to verify.",
         "[Runtime path contract] Prefer exact paths from list/glob results. Do not invent sibling names (e.g. solution_t.py). The adjacent test file is often named _t.py.",
       ].join("\n\n");
@@ -2865,6 +2976,78 @@ export class PipelineExecutor {
       return acceptedOutput;
     };
 
+    // Phase A1 — symbol grounding for write turns. Runs before delegate_first
+    // (which returns before the deep-read preflight) so both the native
+    // executorMessages seed and the delegate prompt see the same table.
+    // Grep failures are tolerated; never block the write turn.
+    if (
+      requiresWriteEffect
+      && this.runtime.listTools().some((tool) => tool.function.name === "grep")
+    ) {
+      const groundingRoot =
+        findExistingWorkspacePath(request)
+        || this.ctx.workspace_path
+        || this.ctx.config.jarvis_path
+        || process.cwd();
+      const symbols = extractGroundingIdentifiers(`${intentText}\n${planSummary}`);
+      if (symbols.length > 0) {
+        try {
+          const { results, summary } = await collectSymbolGrounding({
+            symbols,
+            searchRoot: groundingRoot,
+            grep: async ({ pattern, path, headLimit }) => {
+              const call: ToolCall = {
+                id: `call_${crypto.randomUUID()}`,
+                name: "grep",
+                arguments: {
+                  pattern,
+                  path,
+                  output_mode: "content",
+                  head_limit: headLimit,
+                },
+              };
+              const result = await this.runToolCall(call, options);
+              const output = toolResultModelText(result);
+              toolCalls.push({
+                name: call.name,
+                arguments: call.arguments,
+                output,
+                is_error: result.is_error,
+                error_code: result.error_code,
+                duration_ms: result.duration_ms ?? 0,
+              });
+              onStateChange({
+                stage: "executor",
+                status: "running",
+                output: "\n[Tool Executed: grep]\n",
+                detail: "tool:grep",
+              });
+              return { output, is_error: result.is_error === true };
+            },
+          });
+          groundingSummary = summary;
+          groundingBlock = formatGroundingBlock(results);
+          // A3: write preflight blocks reintroduction of symbols proven absent.
+          for (const r of results) {
+            if (!r.found) this.groundingMissingSymbols.add(r.symbol);
+          }
+          executorMessages.push({
+            role: "user",
+            content: `[Runtime grounding: symbol table]\n${groundingBlock}`,
+          });
+          onStateChange({
+            stage: "executor",
+            status: "running",
+            detail: `symbol_grounding:${summary.symbols_found}/${summary.symbols_searched}`,
+          });
+        } catch (err) {
+          console.warn(
+            `[Pipeline] symbol grounding failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+    }
+
     if (
       this.delegateRuntime
       && this.ctx.config.claude_cli?.delegate?.policy === "delegate_first"
@@ -3298,7 +3481,34 @@ export class PipelineExecutor {
               // failed call stays recorded above so evidence accounting
               // and telemetry still see the model's actual behavior.
               if (toolResult.is_error) {
-                const sub = substituteToolCall(call.name, call.arguments, toolResultModelText(toolResult));
+                // Phase A2: when edit_file misses old_string, pass live content so
+                // substituteToolCall can repair args in-process (no model turn).
+                let subFileContent: string | null | undefined;
+                if (
+                  (call.name === "edit_file" || call.name === "multi_edit")
+                  && typeof (call.arguments?.path ?? call.arguments?.file_path) === "string"
+                ) {
+                  try {
+                    const p = safePath(
+                      String(call.arguments.path ?? call.arguments.file_path),
+                      this.ctx.config,
+                      {
+                        workspaceOverride: this.ctx.workspace_path,
+                        sessionGrants: this.ctx.session_grants,
+                        forWrite: true,
+                      },
+                    );
+                    subFileContent = await fsPromises.readFile(p, "utf-8");
+                  } catch {
+                    subFileContent = null;
+                  }
+                }
+                const sub = substituteToolCall(
+                  call.name,
+                  call.arguments,
+                  toolResultModelText(toolResult),
+                  { fileContent: subFileContent },
+                );
                 if (sub) {
                   const subCall: ToolCall = {
                     id: `call_${crypto.randomUUID()}`,
@@ -3793,9 +4003,25 @@ export class PipelineExecutor {
                   truncated: resp?._truncated === true,
                   tool_parse_attempted: resp?._toolParseAttempted === true,
                   tool_parse_failed: resp?._toolParseFailed === true,
+                  // Phase A1: compact grounding summary for later stage_runs classification.
+                  ...(groundingSummary
+                    ? {
+                      grounding_symbols_searched: groundingSummary.symbols_searched,
+                      grounding_symbols_found: groundingSummary.symbols_found,
+                      grounding_symbols_missing: groundingSummary.symbols_missing,
+                      grounding_greps_used: groundingSummary.greps_used,
+                    }
+                    : {}),
                 };
               })()
-            : undefined;
+            : groundingSummary && executorTurn === 1
+              ? {
+                grounding_symbols_searched: groundingSummary.symbols_searched,
+                grounding_symbols_found: groundingSummary.symbols_found,
+                grounding_symbols_missing: groundingSummary.symbols_missing,
+                grounding_greps_used: groundingSummary.greps_used,
+              }
+              : undefined;
           this.collector.recordStageRun({
             id: `stage_${crypto.randomUUID()}`,
             agent_run_id: agentRunId,

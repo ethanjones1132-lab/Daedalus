@@ -258,6 +258,47 @@ except RuntimeError as exc:
 print('OK')
 """,
     },
+    # Category E (Phase A1 symbol grounding): workspace seeds a small library whose
+    # correct API differs from a plausible-but-wrong name in the task prose.
+    # Oracle = _t.py tests + no fabricated symbol in the landed solution.
+    {
+        "name": "clamp_with_lib", "category": "E", "entry": "solution.py",
+        "files": {
+            "lib/mathutil.py": """def clampValue(x, lo, hi):
+    \"\"\"Inclusive clamp used by the project DSP path.\"\"\"
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+""",
+            "solution.py": """# TODO: clamp samples to [0.0, 1.0] using the project math library.
+def clamp_sample(x):
+    return x
+""",
+            "solution_t.py": """from solution import clamp_sample
+assert clamp_sample(-1.0) == 0.0
+assert clamp_sample(0.5) == 0.5
+assert clamp_sample(2.0) == 1.0
+print('OK')
+""",
+        },
+        "spec": (
+            "Implement clamp_sample so it clamps to [0.0, 1.0]. "
+            "A prior draft tried `juce::isnan` and `fastClamp` — those are NOT available. "
+            "Use the real helper from lib/mathutil.py (`clampValue`) only."
+        ),
+        "test": """from solution import clamp_sample
+import inspect
+import solution as sol_mod
+src = inspect.getsource(sol_mod)
+assert 'juce::isnan' not in src and 'fastClamp' not in src, 'fabricated symbol in landed solution'
+assert clamp_sample(-1.0) == 0.0
+assert clamp_sample(0.5) == 0.5
+assert clamp_sample(2.0) == 1.0
+print('OK')
+""",
+    },
 ]
 
 K = 3

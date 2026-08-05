@@ -83,4 +83,33 @@ describe("substituteToolCall", () => {
   test("missing path argument returns null", () => {
     expect(substituteToolCall("read_file", {}, "is a directory")).toBeNull();
   });
+
+  // Phase A2 — in-process edit repair after old_string miss
+  test("edit_file old_string miss with recoverable whitespace repairs args", () => {
+    const content = "def f():\n    return now > expires\n";
+    const sub = substituteToolCall(
+      "edit_file",
+      {
+        path: "t.py",
+        old_string: "    return now > expires   ",
+        new_string: "    return now < expires",
+      },
+      `Error: old_string not found in "t.py".`,
+      { fileContent: content },
+    );
+    expect(sub?.name).toBe("edit_file");
+    expect(sub?.arguments.old_string).toBe("    return now > expires");
+    expect(String(sub?.note)).toContain("repaired");
+  });
+
+  test("edit_file miss without recoverable content returns null", () => {
+    expect(
+      substituteToolCall(
+        "edit_file",
+        { path: "t.py", old_string: "gamma", new_string: "delta" },
+        "old_string not found",
+        { fileContent: "alpha beta" },
+      ),
+    ).toBeNull();
+  });
 });

@@ -7,6 +7,8 @@
 // The `Hint:` prefix is also recognized by the UI (ToolCallCard) and rendered
 // as an actionable suggestion.
 
+import { repairEditPair, repairMultiEditPairs } from "./edit-contract";
+
 export type ToolErrorCategory =
   | "not_found"
   | "not_read"
@@ -67,17 +69,30 @@ export interface ToolSubstitution {
   note: string;
 }
 
+export interface SubstituteToolCallOptions {
+  /**
+   * Live file content for Phase A2 edit repair after an old_string miss.
+   * When provided, a failed edit_file/multi_edit can be re-dispatched with
+   * repaired exact strings — still no model round-trip.
+   */
+  fileContent?: string | null;
+}
+
 /**
  * When a failed tool call has an unambiguous correct alternative, return it so
  * the runtime can execute the substitute immediately instead of spending a
  * full model round-trip (~50s on the free-tier pool) acting on a text hint.
- * Currently covers the known executor failure mode of calling read_file on a
- * directory; returns null for everything else (the hint path still applies).
+ *
+ * Covers:
+ * - read_file on a directory → list_directory
+ * - Phase A2: edit_file / multi_edit old_string miss with recoverable content
+ *   (whitespace / gutter) → same tool with repaired args
  */
 export function substituteToolCall(
   name: string,
   args: Record<string, unknown>,
   errorOutput: string,
+  options: SubstituteToolCallOptions = {},
 ): ToolSubstitution | null {
   if (name === "read_file" && classifyToolError(errorOutput) === "is_directory" && typeof args.path === "string") {
     return {
@@ -86,6 +101,56 @@ export function substituteToolCall(
       note: "read_file targeted a directory; auto-substituted list_directory",
     };
   }
+
+  // Phase A2 — in-process edit repair after a failed edit (no model call).
+  const err = (errorOutput || "").toLowerCase();
+  const isOldStringMiss =
+    err.includes("old_string not found")
+    || err.includes("no applicable edits")
+    || (err.includes("old_string") && err.includes("not found"));
+  if (
+    isOldStringMiss
+    && (name === "edit_file" || name === "multi_edit")
+    && typeof options.fileContent === "string"
+  ) {
+    if (name === "edit_file") {
+      const repair = repairEditPair(
+        options.fileContent,
+        String(args.old_string ?? ""),
+        String(args.new_string ?? ""),
+      );
+      if (repair.ok && repair.repaired) {
+        return {
+          name: "edit_file",
+          arguments: {
+            ...args,
+            old_string: repair.old_string,
+            new_string: repair.new_string,
+          },
+          note: `edit_file old_string repaired in-process (${repair.matchKind})`,
+        };
+      }
+    }
+    if (name === "multi_edit" && Array.isArray(args.edits)) {
+      const { items, applied } = repairMultiEditPairs(
+        options.fileContent,
+        args.edits as Array<{ old_string: string; new_string: string }>,
+      );
+      if (applied > 0 && items.some((i) => i.repaired)) {
+        return {
+          name: "multi_edit",
+          arguments: {
+            ...args,
+            edits: items
+              .filter((i) => !i.skipped)
+              .map((i) => ({ old_string: i.old_string, new_string: i.new_string })),
+          },
+          note: "multi_edit old_string(s) repaired in-process",
+        };
+      }
+    }
+  }
+
   return null;
 }
 

@@ -458,10 +458,14 @@ describe("runPipelineWithReplanning", () => {
       error_code: "effect_gate_no_write_effect",
     });
     expect(writeAttempts).toBe(2);
-    expect(result.toolCalls?.map((call) => call.output)).toEqual([
-      expect.stringContaining("EPERM"),
-      expect.stringContaining("EPERM"),
-    ]);
+    // A3 write preflight may deny out-of-scope paths before the handler runs
+    // (path-out-of-scope); older path still surfaces EPERM from the tool.
+    // Either way both attempts fail and the no-write fence still trips.
+    const outputs = result.toolCalls?.map((call) => call.output) ?? [];
+    expect(outputs).toHaveLength(2);
+    for (const out of outputs) {
+      expect(out).toMatch(/EPERM|outside the allowed workspace scope/i);
+    }
     expect(coordinatorCalls).toBe(0);
     expect(stageLabels).not.toContain("reviewer");
     expect(stageLabels).not.toContain("rewriter");

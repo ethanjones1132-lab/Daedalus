@@ -245,7 +245,7 @@ describe("FilesystemBundle > edit_file (read-before-edit guard)", () => {
       ctx,
     );
     expect(ambiguous.is_error).toBe(true);
-    expect(ambiguous.error).toContain("appears 2 times");
+    expect(ambiguous.error?.toLowerCase()).toMatch(/appears (2 times|multiple times)/);
   });
 
   test("multi_edit on a missing file returns is_error", async () => {
@@ -329,6 +329,25 @@ describe("FilesystemBundle > edit_file (read-before-edit guard)", () => {
     expect(result.is_error).toBe(false);
     // The gutter must be stripped from BOTH sides — never written into the file.
     expect(readFileSync(join(ws, "g.txt"), "utf-8")).toBe("function a() {\n  return 2;\n}\n");
+  });
+
+  // Phase A2: whitespace-tolerant exact-text contract (tier-2B failure mode)
+  test("edit_file lands when old_string has trailing whitespace the file lacks", async () => {
+    const ws = makeTempWorkspace();
+    writeFileSync(join(ws, "t.py"), "def f():\n    return now > expires\n");
+    const rt = makeRuntime();
+    const ctx = makeCtx(ws);
+    await rt.execute(call("read_file", { path: "t.py" }), ctx);
+    const result = await rt.execute(
+      call("edit_file", {
+        path: "t.py",
+        old_string: "    return now > expires   ",
+        new_string: "    return now < expires",
+      }),
+      ctx,
+    );
+    expect(result.is_error).toBe(false);
+    expect(readFileSync(join(ws, "t.py"), "utf-8")).toBe("def f():\n    return now < expires\n");
   });
 
   test("multi_edit tolerates the gutter the same way", async () => {
