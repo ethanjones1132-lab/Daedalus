@@ -1,5 +1,146 @@
-import { describe, expect, test } from "bun:test";
+﻿import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { SelfTuningStore } from "./store";
+
+/**
+ * 2026-08-05 live incident: the deployed runtime logged
+ *   `SelfTuningStore: open failed: SQLiteError: no such column: stage_run_id`
+ * and recorded ZERO telemetry for an entire session â€” no agent_runs, no
+ * stage_runs, no reward. Every downstream measurement (Phase A exit criterion,
+ * Phase B reward, replay harness, benchmark) reads this store, so the whole
+ * evidence layer was dark in the shipped build.
+ *
+ * Cause: `CREATE INDEX ... ON model_attributions(stage_run_id)` sat in the base
+ * schema block, which runs BEFORE the guarded ALTER that adds the column. On a
+ * fresh database `CREATE TABLE` includes the column so the index succeeds; on a
+ * PRE-EXISTING database `CREATE TABLE IF NOT EXISTS` is a no-op, the column is
+ * absent, and the unguarded index throws â€” taking the entire schema exec down.
+ *
+ * The existing suite could never catch this: every other test opens `:memory:`
+ * or a fresh file. These tests open a database created with an OLDER schema,
+ * which is the only shape that reproduces it.
+ */
+describe("schema migrations apply to a pre-existing database", () => {
+  function withLegacyDb(fn: (path: string) => void): void {
+    const dir = mkdtempSync(join(tmpdir(), "jarvis-legacy-db-"));
+    const path = join(dir, "self-tuning.db");
+    try {
+      // Minimal pre-Task-1 shape: model_attributions WITHOUT stage_run_id.
+      const seed = new Database(path, { create: true });
+      seed.exec(`
+        CREATE TABLE agent_runs (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          user_request TEXT NOT NULL,
+          task_type TEXT NOT NULL,
+          pipeline TEXT NOT NULL,
+          completed INTEGER NOT NULL DEFAULT 0,
+          final_output TEXT,
+          user_rating INTEGER,
+          duration_ms INTEGER,
+          tool_calls_count INTEGER,
+          token_count INTEGER,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE TABLE model_attributions (
+          id TEXT PRIMARY KEY,
+          agent_run_id TEXT NOT NULL,
+          stage_id TEXT NOT NULL,
+          agent_id TEXT,
+          provider TEXT NOT NULL,
+          model_id TEXT NOT NULL,
+          was_successful INTEGER NOT NULL DEFAULT 0,
+          had_error INTEGER NOT NULL DEFAULT 0,
+          duration_ms INTEGER,
+          first_token_ms INTEGER,
+          fallback_used INTEGER NOT NULL DEFAULT 0,
+          escalation_id TEXT,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+      `);
+      seed.close();
+      fn(path);
+    } finally {
+      // Windows keeps the file handle while the store's connection is open;
+      // teardown must never mask the assertion under test.
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch { /* temp dir reaped by the OS */ }
+    }
+  }
+
+  test("opens a legacy database without throwing", () => {
+    withLegacyDb((path) => {
+      const store = new SelfTuningStore(path);
+      expect(() =>
+        store.insertAgentRun({
+          id: "run_legacy",
+          session_id: "sess_legacy",
+          user_request: "req",
+          task_type: "refactor",
+          pipeline: JSON.stringify(["executor"]),
+        completed: 0,
+        }),
+      ).not.toThrow();
+    });
+  });
+
+  test("adds stage_run_id to a pre-existing model_attributions table", () => {
+    withLegacyDb((path) => {
+      const store = new SelfTuningStore(path);
+      store.insertAgentRun({
+        id: "run_legacy",
+        session_id: "sess_legacy",
+        user_request: "req",
+        task_type: "refactor",
+        pipeline: JSON.stringify(["executor"]),
+        completed: 0,
+      });
+      store.insertModelAttribution({
+        id: "attr_legacy",
+        agent_run_id: "run_legacy",
+        stage_id: "executor",
+        stage_run_id: "stage_legacy",
+        provider: "openrouter",
+        model_id: "m",
+        was_successful: 1,
+        had_error: 0,
+        fallback_used: 0,
+      });
+
+      const probe = new Database(path, { readonly: true });
+      const cols = probe.query(`PRAGMA table_info(model_attributions)`).all() as Array<{ name: string }>;
+      expect(cols.map((c) => c.name)).toContain("stage_run_id");
+      const row = probe
+        .query(`SELECT stage_run_id FROM model_attributions WHERE id='attr_legacy'`)
+        .get() as { stage_run_id: string } | null;
+      expect(row?.stage_run_id).toBe("stage_legacy");
+      probe.close();
+    });
+  });
+
+  test("writes telemetry that downstream measurement can actually read", () => {
+    withLegacyDb((path) => {
+      const store = new SelfTuningStore(path);
+      store.insertAgentRun({
+        id: "run_legacy",
+        session_id: "sess_legacy",
+        user_request: "req",
+        task_type: "refactor",
+        pipeline: JSON.stringify(["executor"]),
+        completed: 0,
+      });
+
+      const probe = new Database(path, { readonly: true });
+      const n = probe.query(`SELECT COUNT(*) c FROM agent_runs`).get() as { c: number };
+      expect(n.c).toBe(1);
+      probe.close();
+    });
+  });
+});
 
 describe("model_attributions carry a stage_run_id", () => {
   test("attribution links to exactly one stage row", () => {
@@ -167,3 +308,4 @@ describe("SelfTuningStore conductor outcome summaries", () => {
     expect(summaries.some((summary) => summary.task_type === "refactor")).toBe(true);
   });
 });
+

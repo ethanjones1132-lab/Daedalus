@@ -469,7 +469,13 @@ const SELF_TUNING_SCHEMA = `
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   );
   CREATE INDEX IF NOT EXISTS idx_model_attributions_agent_run_id ON model_attributions(agent_run_id);
-  CREATE INDEX IF NOT EXISTS idx_model_attributions_stage_run_id ON model_attributions(stage_run_id);
+  -- NOTE: no index on stage_run_id here. This block runs before the guarded
+  -- ALTERs below, and on a PRE-EXISTING database the CREATE TABLE above is a
+  -- no-op, so the column does not exist yet and an index on it throws --
+  -- aborting the whole schema exec and taking the entire store offline.
+  -- That is exactly what happened live on 2026-08-05: the deployed build
+  -- recorded zero telemetry for a full session. The index is created in the
+  -- migration section below, after the ALTER that adds the column.
   CREATE TABLE IF NOT EXISTS trajectory_snapshots (
     id TEXT PRIMARY KEY,
     agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
