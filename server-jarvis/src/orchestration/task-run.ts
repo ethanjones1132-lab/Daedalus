@@ -126,6 +126,14 @@ export interface TaskRunContract {
    * Optional because pre-existing persisted sessions lack the field.
    */
   writeIntent?: boolean;
+  /**
+   * 2026-08-04: absolute paths most recently targeted by a successful write
+   * tool call in this task run, newest first. Carried across continuation
+   * turns so a follow-up ("continue please") can re-read what it was editing
+   * instead of restarting discovery blind. Bounded by
+   * {@link MAX_TRACKED_WRITE_TARGETS}.
+   */
+  lastWriteTargets?: string[];
   lastOutcome?: string;
   lastTurnId?: string;
   createdAt: string;
@@ -423,6 +431,52 @@ export function remainingWorkFromPlan(plan: TaskPlan): string[] {
   return plan.items
     .filter((item) => item.status !== "verified")
     .map((item) => item.title);
+}
+
+/** How many recent write targets a contract carries across turns. */
+export const MAX_TRACKED_WRITE_TARGETS = 5;
+
+/**
+ * Non-verified plan items as re-seedable inputs, order preserved.
+ *
+ * 2026-08-04 (run_085afdac): a "continue please" follow-up reached
+ * `ensureOwnedPlanningOnRoute` with no `plan_authorship`, which authored a
+ * fresh single item titled "continue please" over a real multi-item plan.
+ * Continuation turns carry the surviving ledger through here instead.
+ */
+export function unfinishedPlanItemInputs(
+  contract: TaskRunContract,
+): CreateTaskPlanItemInput[] {
+  return (contract.plan?.items ?? [])
+    .filter((item) => item.status !== "verified")
+    .map((item) => ({
+      id: item.id,
+      title: item.title,
+      ...(item.description ? { description: item.description } : {}),
+      dependsOn: [...item.dependsOn],
+      acceptanceChecks: item.acceptanceChecks.map((check) => ({ ...check })),
+    }));
+}
+
+/**
+ * Record write targets on the contract, newest first, deduped and bounded.
+ * Returns a new contract — never mutates the input.
+ */
+export function recordWriteTargets(
+  contract: TaskRunContract,
+  paths: readonly string[],
+): TaskRunContract {
+  const fresh = paths.map((p) => p.trim()).filter(Boolean);
+  if (fresh.length === 0) return contract;
+  const merged: string[] = [];
+  for (const path of [...fresh, ...(contract.lastWriteTargets ?? [])]) {
+    if (!merged.includes(path)) merged.push(path);
+  }
+  return {
+    ...contract,
+    lastWriteTargets: merged.slice(0, MAX_TRACKED_WRITE_TARGETS),
+    updatedAt: nowIso(),
+  };
 }
 
 /** Count of items that carry an evidence pointer. */
@@ -894,6 +948,10 @@ export function normalizeTaskRunOnRead(raw: unknown): TaskRunContract | undefine
       ? r.remainingWork.filter((w): w is string => typeof w === "string")
       : [],
     writeIntent: typeof r.writeIntent === "boolean" ? r.writeIntent : undefined,
+    lastWriteTargets: Array.isArray(r.lastWriteTargets)
+      ? r.lastWriteTargets.filter((p): p is string => typeof p === "string" && p.trim().length > 0)
+        .slice(0, MAX_TRACKED_WRITE_TARGETS)
+      : undefined,
     lastOutcome: typeof r.lastOutcome === "string" ? r.lastOutcome : undefined,
     lastTurnId: typeof r.lastTurnId === "string" ? r.lastTurnId : undefined,
     createdAt: typeof r.createdAt === "string" ? r.createdAt : nowIso(),

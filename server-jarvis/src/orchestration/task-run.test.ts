@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+﻿import { describe, expect, test } from "bun:test";
 import {
   activatePlanItem,
   advancePlanQueue,
@@ -25,6 +25,9 @@ import {
   normalizeTaskRunOnRead,
   reconcileTaskRunStatus,
   remainingWorkFromPlan,
+  MAX_TRACKED_WRITE_TARGETS,
+  recordWriteTargets,
+  unfinishedPlanItemInputs,
   resolveDeepReadIntent,
   resolveTaskRunTurn,
   setPlanItemEvidence,
@@ -191,7 +194,7 @@ describe("task-run > createTaskRun", () => {
   });
 
   test("writeIntent=false for workspace_read even with write verb in objective", () => {
-    // requirement is workspace_read, not full_execution — write intent only escalates
+    // requirement is workspace_read, not full_execution â€” write intent only escalates
     // when the request profile is full_execution (the only profile that allows mutation).
     const run = createTaskRun({
       taskRunId: "task_x",
@@ -251,7 +254,7 @@ describe("task-run > createTaskRun", () => {
 // ---------------------------------------------------------------------------
 
 describe("task-run > resolveTaskRunTurn", () => {
-  test("no previous → creates fresh task run with isContinuation=false", () => {
+  test("no previous â†’ creates fresh task run with isContinuation=false", () => {
     const result = resolveTaskRunTurn(undefined, "Refactor the gateway", "full_execution");
     expect(result.isContinuation).toBe(false);
     expect(result.contract.taskRunId).toMatch(/^task_/);
@@ -260,7 +263,7 @@ describe("task-run > resolveTaskRunTurn", () => {
     expect(result.contract.objective).toBe("Refactor the gateway");
   });
 
-  test("terminal previous (completed) → new task run, NOT continuation", () => {
+  test("terminal previous (completed) â†’ new task run, NOT continuation", () => {
     const prev = makeTaskRun({ taskRunId: "task_old" });
     const terminal: TaskRunContract = { ...prev, status: "completed" };
     const result = resolveTaskRunTurn(terminal, "continue with the next step", "full_execution");
@@ -268,21 +271,21 @@ describe("task-run > resolveTaskRunTurn", () => {
     expect(result.contract.taskRunId).not.toBe("task_old");
   });
 
-  test("terminal previous (failed) → new task run, NOT continuation", () => {
+  test("terminal previous (failed) â†’ new task run, NOT continuation", () => {
     const prev = makeTaskRun();
     const terminal: TaskRunContract = { ...prev, status: "failed" };
     const result = resolveTaskRunTurn(terminal, "continue", "full_execution");
     expect(result.isContinuation).toBe(false);
   });
 
-  test("terminal previous (cancelled) → new task run, NOT continuation", () => {
+  test("terminal previous (cancelled) â†’ new task run, NOT continuation", () => {
     const prev = makeTaskRun();
     const terminal: TaskRunContract = { ...prev, status: "cancelled" };
     const result = resolveTaskRunTurn(terminal, "continue", "full_execution");
     expect(result.isContinuation).toBe(false);
   });
 
-  test("active previous + explicit continuation phrase → continuation, turnCount increments, same ID", () => {
+  test("active previous + explicit continuation phrase â†’ continuation, turnCount increments, same ID", () => {
     const prev = makeTaskRun({ taskRunId: "task_xyz" });
     const result = resolveTaskRunTurn(prev, "continue with phase 2", "full_execution");
     expect(result.isContinuation).toBe(true);
@@ -291,7 +294,7 @@ describe("task-run > resolveTaskRunTurn", () => {
     expect(result.contract.status).toBe("active");
   });
 
-  test("active previous + work-order followup (full_execution) → continuation (2026-07-18 polarity flip)", () => {
+  test("active previous + work-order followup (full_execution) â†’ continuation (2026-07-18 polarity flip)", () => {
     // Live incident: "re-execute" / "go" / "Please apply the edits" were missed by
     // finite pattern lists and silently downgraded to a new tool-less task run.
     // Under an ACTIVE full_execution task, ANY short non-question message IS a work order.
@@ -304,14 +307,14 @@ describe("task-run > resolveTaskRunTurn", () => {
     }
   });
 
-  test("active previous + work-order followup (workspace_read) → NOT continuation", () => {
+  test("active previous + work-order followup (workspace_read) â†’ NOT continuation", () => {
     // The polarity flip only applies to full_execution. workspace_read stays strict.
     const prev = makeTaskRun({ taskRunId: "task_xyz", requirement: "workspace_read" });
     const result = resolveTaskRunTurn(prev, "re-execute", "workspace_read");
     expect(result.isContinuation).toBe(false);
   });
 
-  test("active previous + long work-order message (>160 chars) → NOT continuation", () => {
+  test("active previous + long work-order message (>160 chars) â†’ NOT continuation", () => {
     // isWorkOrderFollowup bails on messages longer than 160 chars.
     const prev = makeTaskRun({ requirement: "full_execution" });
     const long = "x".repeat(200);
@@ -319,13 +322,13 @@ describe("task-run > resolveTaskRunTurn", () => {
     expect(result.isContinuation).toBe(false);
   });
 
-  test("active previous + question → NOT continuation", () => {
+  test("active previous + question â†’ NOT continuation", () => {
     const prev = makeTaskRun({ requirement: "full_execution" });
     const result = resolveTaskRunTurn(prev, "What should I do next?", "full_execution");
     expect(result.isContinuation).toBe(false);
   });
 
-  test("continuation clears lastOutcome (paused → active should not carry stale outcome)", () => {
+  test("continuation clears lastOutcome (paused â†’ active should not carry stale outcome)", () => {
     const prev: TaskRunContract = {
       ...makeTaskRun(),
       status: "paused",
@@ -434,7 +437,7 @@ describe("task-run > resolveTaskRunTurn", () => {
 // ---------------------------------------------------------------------------
 
 describe("task-run > assessTaskRunAcceptance", () => {
-  test("failed + no evidence → failed with 'pipeline_failed_or_empty'", () => {
+  test("failed + no evidence â†’ failed with 'pipeline_failed_or_empty'", () => {
     const r = assessTaskRunAcceptance({
       requirement: "full_execution",
       depth: "standard",
@@ -449,9 +452,9 @@ describe("task-run > assessTaskRunAcceptance", () => {
     });
   });
 
-  test("failed + evidence>0 → paused with 'pipeline_failed_with_evidence' (F9)", () => {
+  test("failed + evidence>0 â†’ paused with 'pipeline_failed_with_evidence' (F9)", () => {
     // F9: a failed turn that still gathered evidence must PAUSE so the user's
-    // 'continue…' inherits the real objective/workspace/depth, not a fresh task
+    // 'continueâ€¦' inherits the real objective/workspace/depth, not a fresh task
     // whose objective is the literal word "continue".
     const r = assessTaskRunAcceptance({
       requirement: "full_execution",
@@ -464,7 +467,7 @@ describe("task-run > assessTaskRunAcceptance", () => {
     expect(r.reason).toBe("pipeline_failed_with_evidence");
   });
 
-  test("empty answer → failed when no evidence, paused when evidence present", () => {
+  test("empty answer â†’ failed when no evidence, paused when evidence present", () => {
     const noEv = assessTaskRunAcceptance({
       requirement: "full_execution",
       depth: "standard",
@@ -486,7 +489,7 @@ describe("task-run > assessTaskRunAcceptance", () => {
     expect(withEv.reason).toBe("pipeline_failed_with_evidence");
   });
 
-  test("partial outcome → paused with 'pipeline_partial'", () => {
+  test("partial outcome â†’ paused with 'pipeline_partial'", () => {
     const r = assessTaskRunAcceptance({
       requirement: "full_execution",
       depth: "standard",
@@ -501,9 +504,9 @@ describe("task-run > assessTaskRunAcceptance", () => {
     });
   });
 
-  test("INCOMPLETE_PROGRESS_PATTERN: 'partially applied' → paused (live 2026-07-18 incident)", () => {
+  test("INCOMPLETE_PROGRESS_PATTERN: 'partially applied' â†’ paused (live 2026-07-18 incident)", () => {
     // Live incident: the synthesizer wrote "partially applied" and this pattern
-    // only knew "partially complete" — the half-done task was accepted as
+    // only knew "partially complete" â€” the half-done task was accepted as
     // completed and the user's "re-execute" minted a new objective-less task.
     const r = assessTaskRunAcceptance({
       requirement: "full_execution",
@@ -596,7 +599,7 @@ describe("task-run > assessTaskRunAcceptance", () => {
     }
   });
 
-  test("deep + evidenceCount<3 → paused with 'deep_task_evidence_floor_not_met'", () => {
+  test("deep + evidenceCount<3 â†’ paused with 'deep_task_evidence_floor_not_met'", () => {
     const r = assessTaskRunAcceptance({
       requirement: "full_execution",
       depth: "deep",
@@ -608,7 +611,7 @@ describe("task-run > assessTaskRunAcceptance", () => {
     expect(r.reason).toBe("deep_task_evidence_floor_not_met");
   });
 
-  test("deep + evidenceCount=3 (boundary) → completed", () => {
+  test("deep + evidenceCount=3 (boundary) â†’ completed", () => {
     const r = assessTaskRunAcceptance({
       requirement: "full_execution",
       depth: "deep",
@@ -620,7 +623,7 @@ describe("task-run > assessTaskRunAcceptance", () => {
     expect(r.reason).toBe("objective_completion_contract_met");
   });
 
-  test("workspace_read + evidenceCount=0 → paused with 'workspace_task_has_no_evidence'", () => {
+  test("workspace_read + evidenceCount=0 â†’ paused with 'workspace_task_has_no_evidence'", () => {
     const r = assessTaskRunAcceptance({
       requirement: "workspace_read",
       depth: "standard",
@@ -632,7 +635,7 @@ describe("task-run > assessTaskRunAcceptance", () => {
     expect(r.reason).toBe("workspace_task_has_no_evidence");
   });
 
-  test("workspace_read + evidenceCount=1 (boundary) → completed", () => {
+  test("workspace_read + evidenceCount=1 (boundary) â†’ completed", () => {
     const r = assessTaskRunAcceptance({
       requirement: "workspace_read",
       depth: "standard",
@@ -643,8 +646,8 @@ describe("task-run > assessTaskRunAcceptance", () => {
     expect(r.status).toBe("completed");
   });
 
-  test("full_execution + evidenceCount=0 → paused with 'workspace_task_has_no_evidence'", () => {
-    // The workspace task evidence floor also covers full_execution — a full
+  test("full_execution + evidenceCount=0 â†’ paused with 'workspace_task_has_no_evidence'", () => {
+    // The workspace task evidence floor also covers full_execution â€” a full
     // task with zero evidence is just a hallucination.
     const r = assessTaskRunAcceptance({
       requirement: "full_execution",
@@ -657,7 +660,7 @@ describe("task-run > assessTaskRunAcceptance", () => {
     expect(r.reason).toBe("workspace_task_has_no_evidence");
   });
 
-  test("conversational + no evidence + clean answer → completed (no floor)", () => {
+  test("conversational + no evidence + clean answer â†’ completed (no floor)", () => {
     const r = assessTaskRunAcceptance({
       requirement: "conversational",
       depth: "standard",
@@ -668,7 +671,7 @@ describe("task-run > assessTaskRunAcceptance", () => {
     expect(r.status).toBe("completed");
   });
 
-  test("answer_only + no evidence + clean answer → completed (no floor)", () => {
+  test("answer_only + no evidence + clean answer â†’ completed (no floor)", () => {
     const r = assessTaskRunAcceptance({
       requirement: "answer_only",
       depth: "standard",
@@ -679,7 +682,7 @@ describe("task-run > assessTaskRunAcceptance", () => {
     expect(r.status).toBe("completed");
   });
 
-  test("happy path: full_execution + deep + 3 evidence + clean answer → completed", () => {
+  test("happy path: full_execution + deep + 3 evidence + clean answer â†’ completed", () => {
     const r = assessTaskRunAcceptance({
       requirement: "full_execution",
       depth: "deep",
@@ -707,11 +710,11 @@ describe("task-run > assessTaskRunAcceptance", () => {
 });
 
 // ---------------------------------------------------------------------------
-// reconcileTaskRunStatus — ledger vs turn acceptance
+// reconcileTaskRunStatus â€” ledger vs turn acceptance
 // ---------------------------------------------------------------------------
 
 describe("task-run > reconcileTaskRunStatus", () => {
-  test("multi-item partial progress: turn completed → overall stays active", () => {
+  test("multi-item partial progress: turn completed â†’ overall stays active", () => {
     let run = createTaskRun({
       ...BASE_INPUT,
       planItems: withDiffChecks([
@@ -724,7 +727,7 @@ describe("task-run > reconcileTaskRunStatus", () => {
       gradingMode: "conductor_direct_diff",
       evidence: groundedEvidence("ev_1"),
     });
-    // Item 1 verified, 2 active, 3 pending — synthesizer may still claim done.
+    // Item 1 verified, 2 active, 3 pending â€” synthesizer may still claim done.
     expect(deriveTaskStatusFromPlan(run.plan!)).toBe("active");
     expect(
       reconcileTaskRunStatus({
@@ -734,7 +737,7 @@ describe("task-run > reconcileTaskRunStatus", () => {
     ).toBe("active");
   });
 
-  test("all items verified: turn completed → completed", () => {
+  test("all items verified: turn completed â†’ completed", () => {
     let run = createTaskRun({
       ...BASE_INPUT,
       planItems: withDiffChecks([
@@ -891,7 +894,7 @@ describe("task-run > reconcileTaskRunStatus", () => {
     ).toBe("completed");
   });
 
-  test("turn paused + plan active → paused (conservative open)", () => {
+  test("turn paused + plan active â†’ paused (conservative open)", () => {
     const run = createTaskRun({
       ...BASE_INPUT,
       planItems: [
@@ -976,7 +979,7 @@ describe("task-run > TaskPlan constructors", () => {
   // 2026-07-31 (run_2c46d082): the mid-loop signal sourced `planItemsRemaining`
   // from the session-scoped TaskPlan ledger but `activePlanItem` from THIS
   // turn's rendered planner narrative. On a "continue" turn whose conductor
-  // aborted into the deterministic route, no planner ran — so the count said
+  // aborted into the deterministic route, no planner ran â€” so the count said
   // "4 items remain" while the text said "No planning stage executed.". Two
   // sources describing one thing, disagreeing. The nudge built from them named
   // a null as the active item and was injected 66x.
@@ -1155,7 +1158,7 @@ describe("task-run > TaskPlan status transitions", () => {
     expect(() => activatePlanItem(run, "b")).toThrow(/blocked/);
   });
 
-  test("incrementPlanItemRepairCycle counts Reviewer→Rewriter→Executor passes", () => {
+  test("incrementPlanItemRepairCycle counts Reviewerâ†’Rewriterâ†’Executor passes", () => {
     let run = makePlanRun([{ id: "a", title: "A" }]);
     run = incrementPlanItemRepairCycle(run, "a");
     run = incrementPlanItemRepairCycle(run, "a", 2);
@@ -1218,7 +1221,7 @@ describe("task-run > TaskPlan status transitions", () => {
     expect(() => advancePlanQueue(legacy)).toThrow(/reconstruction_required|schemaVersion 2/);
   });
 
-  test("deriveTaskStatusFromPlan: empty→active, all verified→completed, blocked→paused", () => {
+  test("deriveTaskStatusFromPlan: emptyâ†’active, all verifiedâ†’completed, blockedâ†’paused", () => {
     expect(deriveTaskStatusFromPlan(createTaskPlan([]))).toBe("active");
     const pending = createTaskPlan([{ id: "a", title: "A" }]);
     expect(deriveTaskStatusFromPlan(pending)).toBe("active");
@@ -1247,7 +1250,7 @@ describe("task-run > TaskPlan status transitions", () => {
     expect(() => markPlanItemBlocked(run, "missing", "x")).toThrow(/not found/);
   });
 
-  test("expandActivePlanItem replaces broad active item with A1–A4 and preserves verified predecessors", () => {
+  test("expandActivePlanItem replaces broad active item with A1â€“A4 and preserves verified predecessors", () => {
     let run = makePlanRun([
       { id: "pi_inspect", title: "Inspect workspace layout" },
       { id: "pi_group_a", title: "Execute Group A", dependsOn: ["pi_inspect"] },
@@ -1343,7 +1346,7 @@ describe("task-run > TaskPlan status transitions", () => {
   });
 });
 
-describe("task-run > normalizeTaskRunOnRead (legacy → reconstruction_required)", () => {
+describe("task-run > normalizeTaskRunOnRead (legacy â†’ reconstruction_required)", () => {
   test("missing schemaVersion is treated as legacy v1", () => {
     const legacy = {
       taskRunId: "task_legacy",
@@ -1470,5 +1473,77 @@ describe("task-run > resolveTaskRunTurn preserves v2 plan on continuation", () =
     expect(result.contract.plan?.items).toHaveLength(2);
     expect(result.contract.plan?.activeItemId).toBe("a");
     expect(result.contract.turnCount).toBe(prev.turnCount + 1);
+  });
+});
+
+describe("continuation carry helpers", () => {
+  test("unfinishedPlanItemInputs returns non-verified items preserving ids", () => {
+    const contract = createTaskRun({
+      taskRunId: "tr_1",
+      sessionId: "s1",
+      objective: "execute the Perihelion plan",
+      requirement: "full_execution",
+      planItems: [
+        { id: "pi_a1", title: "A1 gain staging" },
+        { id: "pi_a2", title: "A2 parameter smoothing" },
+        { id: "pi_a3", title: "A3 editor layout" },
+      ],
+    });
+    contract.plan!.items[0]!.status = "verified";
+    contract.plan!.items[1]!.status = "active";
+
+    const carried = unfinishedPlanItemInputs(contract);
+
+    expect(carried.map((i) => i.id)).toEqual(["pi_a2", "pi_a3"]);
+    expect(carried[0]!.title).toBe("A2 parameter smoothing");
+  });
+
+  test("unfinishedPlanItemInputs returns empty when every item is verified", () => {
+    const contract = createTaskRun({
+      taskRunId: "tr_2",
+      sessionId: "s2",
+      objective: "done work",
+      requirement: "full_execution",
+      planItems: [{ id: "pi_a", title: "A" }],
+    });
+    contract.plan!.items[0]!.status = "verified";
+
+    expect(unfinishedPlanItemInputs(contract)).toEqual([]);
+  });
+
+  test("recordWriteTargets keeps the most recent targets, newest first, deduped", () => {
+    const contract = createTaskRun({
+      taskRunId: "tr_3",
+      sessionId: "s3",
+      objective: "edit files",
+      requirement: "full_execution",
+    });
+
+    const once = recordWriteTargets(contract, ["C:\\p\\PluginProcessor.cpp"]);
+    const twice = recordWriteTargets(once, [
+      "C:\\p\\PluginEditor.h",
+      "C:\\p\\PluginProcessor.cpp",
+    ]);
+
+    expect(twice.lastWriteTargets).toEqual([
+      "C:\\p\\PluginEditor.h",
+      "C:\\p\\PluginProcessor.cpp",
+    ]);
+  });
+
+  test("recordWriteTargets caps the list at MAX_TRACKED_WRITE_TARGETS", () => {
+    let contract = createTaskRun({
+      taskRunId: "tr_4",
+      sessionId: "s4",
+      objective: "edit many",
+      requirement: "full_execution",
+    });
+    for (let i = 0; i < MAX_TRACKED_WRITE_TARGETS + 3; i++) {
+      contract = recordWriteTargets(contract, [`C:\\p\\file${i}.cpp`]);
+    }
+    expect(contract.lastWriteTargets!.length).toBe(MAX_TRACKED_WRITE_TARGETS);
+    expect(contract.lastWriteTargets![0]).toBe(
+      `C:\\p\\file${MAX_TRACKED_WRITE_TARGETS + 2}.cpp`,
+    );
   });
 });
