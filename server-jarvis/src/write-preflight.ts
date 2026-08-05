@@ -28,6 +28,7 @@ export type WritePreflightCode =
   | "old_string_ambiguous"
   | "edit_noop"
   | "multi_edit_empty"
+  | "multi_edit_partial"
   | "fabricated_symbol"
   | "patch_empty";
 
@@ -218,6 +219,21 @@ export function preflightWriteTool(
       };
     }
     const { items, applied } = repairMultiEditPairs(ctx.fileContent, edits);
+
+    // Atomic dispatch: mixed success/failure never silently drops edits.
+    if (applied > 0 && applied < edits.length) {
+      const skipped = items
+        .map((item, index) => (item.skipped ? `edit ${index + 1}: ${item.skipped}` : null))
+        .filter((item): item is string => item !== null);
+      return {
+        allow: false,
+        code: "multi_edit_partial",
+        reason:
+          `multi_edit is atomic; ${applied}/${edits.length} edits apply on ${path}. `
+          + `No edits were dispatched. Fix and retry: ${skipped.join(", ")}`,
+      };
+    }
+
     if (applied === 0) {
       const reasons = new Set(items.map((i) => i.skipped).filter(Boolean));
       if (reasons.has("ambiguous")) {
@@ -233,17 +249,23 @@ export function preflightWriteTool(
         reason: `multi_edit has no applicable edits — every requested edit was skipped: ${path}`,
       };
     }
+
+    // applied === edits.length — full list must be free of skips.
+    if (items.some((item) => item.skipped)) {
+      return {
+        allow: false,
+        code: "multi_edit_partial",
+        reason: `multi_edit repair invariant failed on ${path}; no edits were dispatched.`,
+      };
+    }
+
     const notes: string[] = [];
-    const repairedEdits = items
-      .filter((i) => !i.skipped)
-      .map((i) => {
-        if (i.repaired && i.matchKind) {
-          notes.push(`repaired old_string (${i.matchKind})`);
-        }
-        return { old_string: i.old_string, new_string: i.new_string };
-      });
-    // Keep original order of successful repairs only — handler still applies
-    // against live content; we rewrite args so exact match succeeds.
+    const repairedEdits = items.map((item) => {
+      if (item.repaired && item.matchKind) {
+        notes.push(`repaired old_string (${item.matchKind})`);
+      }
+      return { old_string: item.old_string, new_string: item.new_string };
+    });
     return {
       allow: true,
       code: "ok",

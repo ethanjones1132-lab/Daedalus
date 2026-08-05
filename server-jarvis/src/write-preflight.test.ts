@@ -141,4 +141,51 @@ describe("preflightWriteTool", () => {
     expect(result.code).toBe("fabricated_symbol");
     expect(result.fabricated).toEqual(["ImaginaryFrameworkBase"]);
   });
+
+  test("denies a partial multi_edit instead of dropping failed operations", () => {
+    const result = preflightWriteTool(
+      "multi_edit",
+      {
+        path: "a.ts",
+        edits: [
+          { old_string: "alpha", new_string: "ALPHA" },
+          { old_string: "missing", new_string: "SHOULD_NOT_DISAPPEAR" },
+        ],
+      },
+      {
+        pathInScope: true,
+        hasBeenRead: true,
+        fileContent: "alpha\nbeta\n",
+      },
+    );
+
+    expect(result.allow).toBe(false);
+    expect(result.code).toBe("multi_edit_partial");
+    expect(result.reason).toContain("edit 2: not_found");
+    expect(result.repair).toBeUndefined();
+  });
+
+  test("an entirely applicable multi_edit preserves count and order", () => {
+    const result = preflightWriteTool(
+      "multi_edit",
+      {
+        path: "a.ts",
+        edits: [
+          { old_string: "alpha", new_string: "ALPHA" },
+          { old_string: "beta", new_string: "BETA" },
+        ],
+      },
+      {
+        pathInScope: true,
+        hasBeenRead: true,
+        fileContent: "alpha\nbeta\n",
+      },
+    );
+
+    expect(result.allow).toBe(true);
+    expect(result.repair?.arguments.edits).toEqual([
+      { old_string: "alpha", new_string: "ALPHA" },
+      { old_string: "beta", new_string: "BETA" },
+    ]);
+  });
 });

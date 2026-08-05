@@ -50,7 +50,7 @@ Two reasons this comes first. It is free — local greps and reads, no API quota
 
 **A2 — Exact-text edit contract.** The runtime supplies current file content; it does not ask the model to recall it. Before dispatching `edit_file`, verify `old_string` actually occurs in the file. If not, repair locally and retry **in-process** — no new API call.
 
-**A3 — Local pre-flight verification.** Check the model's proposed output against ground truth (symbol exists? string present? path in scope?) before the write lands. This is search on the verification axis, costing zero quota.
+**A3 — Local pre-flight verification.** Check the model's proposed output against ground truth (symbol exists? string present? path in scope?) before the write lands. This is search on the verification axis, costing zero quota. `multi_edit` is **atomic**: all requested edits must apply (after A2 repair) or none dispatch — partial applicability returns `multi_edit_partial` without rewriting the edit list.
 
 **Exit criterion:** fabricated-API and no-match write failures approach zero on a fixture suite. Executor no-tool rate falls from the measured 44%.
 
