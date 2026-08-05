@@ -262,6 +262,90 @@ describe("summarizeConductorPerformance", () => {
     expect(summary.gateFailures).toContain("unverified_successes");
   });
 
+  // Task 4 — unchecked-write coverage: success + wrote code + no runtime check
+  // is a hard release-gate failure (maxUncheckedWriteRatio default 0).
+  describe("unchecked-write coverage gate", () => {
+    test("successes that wrote code without a check fail the gate", () => {
+      const fixtures: ConductorPerformanceFixture[] = [
+        {
+          agentRunId: "run_unchecked_write",
+          outcome: "success",
+          checkTier: "none",
+          finalOutput: "Wrote without a runtime check.",
+          stageRuns: [
+            stage({
+              agent_run_id: "run_unchecked_write",
+              tool_calls_json: JSON.stringify([
+                { name: "write_file", arguments: { path: "out.txt" } },
+              ]),
+            }),
+          ],
+          directives: [],
+        },
+        nativeVerifiedWrite("run_checked_write"),
+      ];
+      const summary = summarizeConductorPerformance(fixtures, {
+        ...RELEASE_THRESHOLDS,
+        maxUncheckedWriteRatio: 0,
+      });
+      expect(summary.uncheckedWriteRuns).toBe(1);
+      expect(summary.gateFailures).toContain("unchecked_write_ratio");
+    });
+
+    test("read-only successes are not counted as unchecked", () => {
+      const fixtures: ConductorPerformanceFixture[] = [
+        {
+          agentRunId: "run_readonly_success",
+          outcome: "success",
+          checkTier: "none",
+          finalOutput: "Read-only answer; no files changed.",
+          stageRuns: [
+            stage({
+              agent_run_id: "run_readonly_success",
+              tool_calls_json: JSON.stringify([
+                { name: "read_file", arguments: { path: "src/a.ts" } },
+              ]),
+            }),
+          ],
+          directives: [],
+        },
+      ];
+      const summary = summarizeConductorPerformance(fixtures, {
+        ...RELEASE_THRESHOLDS,
+        maxUncheckedWriteRatio: 0,
+      });
+      expect(summary.uncheckedWriteRuns).toBe(0);
+      expect(summary.gateFailures).not.toContain("unchecked_write_ratio");
+    });
+
+    test("check_tier=existing is not an unchecked write", () => {
+      const fixtures: ConductorPerformanceFixture[] = [
+        {
+          agentRunId: "run_existing_tier",
+          outcome: "success",
+          checkTier: "existing",
+          verifiedVia: "runtime_check",
+          finalOutput: "Verified via existing project check.",
+          stageRuns: [
+            stage({
+              agent_run_id: "run_existing_tier",
+              tool_calls_json: JSON.stringify([
+                { name: "write_file", arguments: { path: "out.txt" } },
+              ]),
+            }),
+          ],
+          directives: [],
+        },
+      ];
+      const summary = summarizeConductorPerformance(fixtures, {
+        ...RELEASE_THRESHOLDS,
+        maxUncheckedWriteRatio: 0,
+      });
+      expect(summary.uncheckedWriteRuns).toBe(0);
+      expect(summary.gateFailures).not.toContain("unchecked_write_ratio");
+    });
+  });
+
   test("meetsReleaseGate is false with one false-complete run", () => {
     const fixtures = tenHealthyWriteFixtures();
     fixtures[0] = {
@@ -314,6 +398,7 @@ describe("summarizeConductorPerformance", () => {
       maxUnverifiedSuccesses: 0,
       maxFalseCompleteRuns: 0,
       maxDuplicateWritePressureRuns: 0,
+      maxUncheckedWriteRatio: 0,
     };
     expect(RELEASE_THRESHOLDS).toEqual(expected);
   });

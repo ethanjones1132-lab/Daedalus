@@ -9,6 +9,7 @@
 //   - executor no-tool ratio ≤ 10%
 //   - delegate verified-write rate ≥ 80% (once ≥5 delegate fixtures exist)
 //   - zero unverified successes (success + write intent + check_tier none)
+//   - zero unchecked-write ratio (success + wrote code + check_tier not builtin/existing)
 //   - zero false-complete runs (success that declares incomplete progress)
 //   - zero duplicate write-pressure runs (write-effect note injected >1×)
 //
@@ -70,6 +71,12 @@ export interface ConductorPerformanceThresholds {
   maxUnverifiedSuccesses: number;
   maxFalseCompleteRuns: number;
   maxDuplicateWritePressureRuns: number;
+  /**
+   * Max fraction of successful write runs whose check_tier is not a real
+   * runtime check (`builtin` / `existing`). Default 0: any success that wrote
+   * code without a check fails the release gate (Theme 2 Task 4).
+   */
+  maxUncheckedWriteRatio: number;
 }
 
 export const RELEASE_THRESHOLDS: ConductorPerformanceThresholds = {
@@ -82,6 +89,8 @@ export const RELEASE_THRESHOLDS: ConductorPerformanceThresholds = {
   maxUnverifiedSuccesses: 0,
   maxFalseCompleteRuns: 0,
   maxDuplicateWritePressureRuns: 0,
+  // Zero tolerance: a success that wrote code must have been runtime-checked.
+  maxUncheckedWriteRatio: 0,
 };
 
 /** Minimum delegate fixtures before the verified-write rate is a hard gate. */
@@ -94,6 +103,7 @@ export type GateFailureCode =
   | "delegate_verified_write_rate"
   | "writes_landed_per_run"
   | "unverified_successes"
+  | "unchecked_write_ratio"
   | "false_complete_runs"
   | "duplicate_write_pressure_runs";
 
@@ -131,6 +141,17 @@ export interface ConductorPerformanceSummary {
    */
   taskTargetWrites: number;
   unverifiedSuccesses: number;
+  /**
+   * Successes that wrote code and were never runtime-checked
+   * (check_tier not `builtin` and not `existing`). Hard-gated via
+   * maxUncheckedWriteRatio (default 0).
+   */
+  uncheckedWriteRuns: number;
+  /**
+   * Successes that landed ≥1 write-effect tool call. Denominator for the
+   * unchecked-write ratio (0 when none — ratio treated as 0).
+   */
+  successfulWriteRuns: number;
   falseCompleteRuns: number;
   duplicateWritePressureRuns: number;
   /** Whether every hard release threshold passes (delegate soft below sample). */
@@ -309,6 +330,23 @@ function isUnverifiedSuccess(fixture: ConductorPerformanceFixture): boolean {
   return !tier || tier === "none";
 }
 
+/** True when any stage landed a successful write-effect tool call. */
+function runWroteCode(fixture: ConductorPerformanceFixture): boolean {
+  return fixture.stageRuns.some(stageHasSuccessfulWrite);
+}
+
+/**
+ * Success + wrote code + check_tier is not a real runtime check.
+ * `builtin` and `existing` count as checked; everything else (none, null,
+ * missing, unknown) is an unchecked write.
+ */
+function isUncheckedWrite(fixture: ConductorPerformanceFixture): boolean {
+  if (fixture.outcome !== "success") return false;
+  if (!runWroteCode(fixture)) return false;
+  const tier = fixture.checkTier ?? null;
+  return tier !== "builtin" && tier !== "existing";
+}
+
 function isFalseComplete(fixture: ConductorPerformanceFixture): boolean {
   if (fixture.outcome !== "success") return false;
   const answer = (fixture.finalOutput ?? "").trim();
@@ -377,6 +415,8 @@ export function summarizeConductorPerformance(
   let totalWritesLanded = 0;
   let taskTargetWrites = 0;
   let unverifiedSuccesses = 0;
+  let uncheckedWriteRuns = 0;
+  let successfulWriteRuns = 0;
   let falseCompleteRuns = 0;
   let duplicateWritePressureRuns = 0;
 
@@ -401,6 +441,10 @@ export function summarizeConductorPerformance(
     }
 
     if (isUnverifiedSuccess(fixture)) unverifiedSuccesses += 1;
+    if (fixture.outcome === "success" && runWroteCode(fixture)) {
+      successfulWriteRuns += 1;
+      if (isUncheckedWrite(fixture)) uncheckedWriteRuns += 1;
+    }
     if (isFalseComplete(fixture)) falseCompleteRuns += 1;
     if (hasDuplicateWritePressure(fixture)) duplicateWritePressureRuns += 1;
   }
@@ -444,6 +488,12 @@ export function summarizeConductorPerformance(
   if (unverifiedSuccesses > thresholds.maxUnverifiedSuccesses) {
     gateFailures.push("unverified_successes");
   }
+  // Coverage gate: fraction of successful write runs that skipped a runtime check.
+  // Denominator is max(1, successfulWriteRuns) so a zero-write window does not fail.
+  const uncheckedWriteRatio = uncheckedWriteRuns / Math.max(1, successfulWriteRuns);
+  if (uncheckedWriteRatio > thresholds.maxUncheckedWriteRatio) {
+    gateFailures.push("unchecked_write_ratio");
+  }
   if (falseCompleteRuns > thresholds.maxFalseCompleteRuns) {
     gateFailures.push("false_complete_runs");
   }
@@ -463,6 +513,8 @@ export function summarizeConductorPerformance(
     writesLandedPerRun,
     taskTargetWrites,
     unverifiedSuccesses,
+    uncheckedWriteRuns,
+    successfulWriteRuns,
     falseCompleteRuns,
     duplicateWritePressureRuns,
     meetsReleaseGate: gateFailures.length === 0,

@@ -152,6 +152,13 @@ console.log(
     `  [max ${RELEASE_THRESHOLDS.maxUnverifiedSuccesses}]`,
 );
 console.log(
+  `  unchecked writes:             ${summary.uncheckedWriteRuns}` +
+    `  [max 0]` +
+    (summary.successfulWriteRuns > 0
+      ? `  (${summary.uncheckedWriteRuns}/${summary.successfulWriteRuns} successful write runs)`
+      : ""),
+);
+console.log(
   `  false-complete runs:          ${summary.falseCompleteRuns}` +
     `  [max ${RELEASE_THRESHOLDS.maxFalseCompleteRuns}]`,
 );
