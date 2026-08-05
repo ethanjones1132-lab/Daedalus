@@ -159,18 +159,19 @@ const ABORT_BUDGET_FLOOR_MS = 30_000;
 const PLAN_REMAINDER_NUDGE_CAP = 2;
 
 /**
- * Same discipline for the force-write reflex. `shouldPressWriteEffect` has
- * always stopped at `nudgesSent < 3`, but the force_write DECISION branch had
- * no equivalent bound, so once the press path was spent this one carried on
- * holding the executor loop open.
+ * Same discipline for the force-write reflex.
  *
- * 2026-08-01, replay harness on the first post-fix runs: with the
- * plan-remainder nudge capped, the spin simply relocated here — the
- * failed-write note was decided 7x byte-identical across 3 runs and 12/17
- * executor turns still produced no tool call. Matched to 3 for consistency
- * with the press path.
+ * 2026-08-01: introduced at 3, matched to the press path.
+ * 2026-08-04 (run_cc660a4d): the cap never engaged — ~30 near-identical
+ * force-write notes were decided in one stage because `writeEffectNudgeCount`
+ * only advances for decisions tagged `noteKind === "force_write"`, and the
+ * deterministic-reflex branches left that tag unset. Every force-write branch
+ * now sets the tag, and the cap drops to 2: one statement, one escalation,
+ * matching PLAN_REMAINDER_NUDGE_CAP. A note ignored twice will not work a
+ * third time, and each repeat costs a model round-trip plus transcript
+ * re-upload.
  */
-export const FORCE_WRITE_NUDGE_CAP = 3;
+export const FORCE_WRITE_NUDGE_CAP = 2;
 
 const EVIDENCE_TARGET_CAP = 6;
 const EVIDENCE_SUMMARY_CAP = 5;
@@ -548,8 +549,13 @@ export function resolveResidentMidLoopDirective(
     };
   }
   if (directive === "force_write") {
+    const sent = signal.forceWriteNudgesSent ?? 0;
+    if (sent >= FORCE_WRITE_NUDGE_CAP) {
+      return { kind: "continue", decisionSource: "cap_exhausted" };
+    }
     return {
       kind: "force_write",
+      noteKind: "force_write",
       note: reason || (inQualityPhase
         ? "resident conductor: apply a quality polish edit now"
         : "resident conductor: apply the change now"),
@@ -592,8 +598,13 @@ export function resolveResidentMidLoopDirective(
   }
 
   if (signal.successfulWrites === 0) {
+    const sent = signal.forceWriteNudgesSent ?? 0;
+    if (sent >= FORCE_WRITE_NUDGE_CAP) {
+      return { kind: "continue", decisionSource: "cap_exhausted" };
+    }
     return {
       kind: "force_write",
+      noteKind: "force_write",
       note:
         reason ||
         "continue lacked concrete progress evidence — apply the change with a write tool now.",
@@ -682,6 +693,7 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
       kind: "force_write",
       noteKind: "force_write",
       note: buildFailedWriteNote(signal),
+      decisionSource: "deterministic_reflex",
     };
   }
 
@@ -707,9 +719,14 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
     // next checkpoint aborted. A read spiral is a spiral at read 5 — how much
     // budget is left changes only whether recovery is still POSSIBLE (the
     // abort branch above), never whether the spiral is real.
-    if (signal.writeEffectPressureAvailable !== false) {
+    const spiralSent = signal.forceWriteNudgesSent ?? 0;
+    if (
+      signal.writeEffectPressureAvailable !== false
+      && spiralSent < FORCE_WRITE_NUDGE_CAP
+    ) {
       return {
         kind: "force_write",
+        noteKind: "force_write",
         note: buildReadSpiralNote(signal),
       };
     }
@@ -734,9 +751,14 @@ export function decideMidLoopIntervention(signal: MidLoopSignal): LoopInterventi
           "ending now with a clean partial instead of running to the timeout.",
       };
     }
-    if (signal.writeEffectPressureAvailable !== false) {
+    const reReadSent = signal.forceWriteNudgesSent ?? 0;
+    if (
+      signal.writeEffectPressureAvailable !== false
+      && reReadSent < FORCE_WRITE_NUDGE_CAP
+    ) {
       return {
         kind: "force_write",
+        noteKind: "force_write",
         note: buildReadSpiralNote(
           signal,
           `${totalSuccessfulReads} successful reads across ${signal.distinctSuccessfulReads} distinct targets`,
@@ -884,7 +906,10 @@ function buildFailedWriteNote(signal: MidLoopSignal): string {
   );
   const sent = signal.forceWriteNudgesSent ?? 0;
   const where = target ? ` The last write target was \`${target}\`.` : "";
-  if (sent >= 2) {
+  // Cap is 2 (one statement, one escalation). Second allowed nudge (sent === 1)
+  // must escalate — previously this required sent >= 2 which was unreachable
+  // once FORCE_WRITE_NUDGE_CAP dropped to 2 (2026-08-04).
+  if (sent >= 1) {
     return `${attempts} failed write attempt(s) and still zero successful mutations.` + where +
       " Stop retrying the same old_string. Call write_file with the complete new contents of " +
       "the file instead — a whole-file write cannot fail on a match.";

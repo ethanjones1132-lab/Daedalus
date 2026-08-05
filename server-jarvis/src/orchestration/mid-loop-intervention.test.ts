@@ -140,6 +140,7 @@ describe("decideMidLoopIntervention", () => {
   });
 
   test("the failed-write note escalates instead of repeating verbatim", () => {
+    // 2026-08-04: cap is 2 (sent 0 then 1). Compare statement vs escalation.
     const at = (sent: number) =>
       (decideMidLoopIntervention({
         ...base,
@@ -150,7 +151,7 @@ describe("decideMidLoopIntervention", () => {
         recentReadTargets: ["src/PluginProcessor.cpp"],
         forceWriteNudgesSent: sent,
       }) as { note: string }).note;
-    expect(at(0)).not.toBe(at(2));
+    expect(at(0)).not.toBe(at(1));
   });
 
   test("force_write injects are tagged so the host can count them", () => {
@@ -184,13 +185,14 @@ describe("decideMidLoopIntervention", () => {
   });
 
   test("a repeatedly-ignored failed-write nudge escalates to whole-file write", () => {
+    // 2026-08-04: second allowed nudge (sent=1) is the escalation under cap=2.
     const d = decideMidLoopIntervention({
       ...base,
       distinctSuccessfulReads: 2,
       failedWriteAttempts: 3,
       successfulWrites: 0,
       stageRemainingMs: 200_000,
-      forceWriteNudgesSent: 2,
+      forceWriteNudgesSent: 1,
     });
     expect(d.kind).toBe("force_write");
     expect((d as { note: string }).note).toContain("write_file");
@@ -889,5 +891,41 @@ describe("plan remainder respects the stage budget", () => {
     const decision = decideMidLoopIntervention({ ...spiral, stageRemainingMs: 20_000 });
     expect(decision.kind).toBe("abort");
     expect((decision as { reason: string }).reason).toContain("5");
+  });
+});
+
+describe("force-write nudge cap engages on every force_write decision", () => {
+  // 2026-08-04 (run_cc660a4d): ~30 near-identical force-write notes because
+  // only decisions tagged noteKind === "force_write" advanced the host counter,
+  // and the spiral branches left that tag unset. Cap is 2: one statement, one
+  // escalation.
+  const writeSignal = (forceWriteNudgesSent: number): MidLoopSignal => ({
+    writeIntent: true,
+    successfulWrites: 0,
+    distinctSuccessfulReads: 8,
+    turnCount: 3,
+    maxTurns: 12,
+    stageRemainingMs: 200_000,
+    deadToolSuppressed: false,
+    forceWriteNudgesSent,
+    planItemsTotal: 1,
+    planItemsRemaining: 1,
+  });
+
+  test("every force_write decision is tagged noteKind so the host can count it", () => {
+    const decision = decideMidLoopIntervention(writeSignal(0));
+    if (decision.kind !== "force_write") {
+      throw new Error(`expected force_write, got ${decision.kind}`);
+    }
+    expect(decision.noteKind).toBe("force_write");
+  });
+
+  test("stops deciding force_write once the cap is reached", () => {
+    const decision = decideMidLoopIntervention(writeSignal(FORCE_WRITE_NUDGE_CAP));
+    expect(decision.kind).not.toBe("force_write");
+  });
+
+  test("cap is 2 — one statement, one escalation", () => {
+    expect(FORCE_WRITE_NUDGE_CAP).toBe(2);
   });
 });
