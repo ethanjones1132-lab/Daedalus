@@ -61,6 +61,12 @@ export interface StageRun {
    * (request id, exit code, sanitized stderr tail). Not user-visible.
    */
   diagnostic_json?: string | null;
+  /**
+   * Underlying exception / detail text for a typed stage failure
+   * (e.g. the EMFILE message behind `delegate_snapshot_error`).
+   * Distinct from `error_message` (which holds the stable code).
+   */
+  failure_detail?: string | null;
   created_at?: string;
 }
 
@@ -354,6 +360,7 @@ const SELF_TUNING_SCHEMA = `
     stop_reason TEXT,
     partial_error_code TEXT,
     diagnostic_json TEXT,
+    failure_detail TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   );
   CREATE INDEX IF NOT EXISTS idx_stage_runs_agent_run_id ON stage_runs(agent_run_id);
@@ -629,6 +636,10 @@ export class SelfTuningStore {
         try {
           db.exec(`ALTER TABLE stage_runs ADD COLUMN diagnostic_json TEXT`);
         } catch { /* column already exists */ }
+        // Theme 1 / Task 2: exception text behind a typed stage error code.
+        try {
+          db.exec(`ALTER TABLE stage_runs ADD COLUMN failure_detail TEXT`);
+        } catch { /* column already exists */ }
         // P5.1: conductor routing latency was only ever a console.log line —
         // querying "how long did routing take" always meant grepping logs.
         try {
@@ -720,8 +731,8 @@ export class SelfTuningStore {
     if (!db) return;
     try {
       db.prepare(
-        `INSERT INTO stage_runs (id, agent_run_id, mode_id, turn_number, input_tokens, output_tokens, tool_calls_json, duration_ms, was_successful, had_error, error_message, stop_reason, partial_error_code, diagnostic_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO stage_runs (id, agent_run_id, mode_id, turn_number, input_tokens, output_tokens, tool_calls_json, duration_ms, was_successful, had_error, error_message, stop_reason, partial_error_code, diagnostic_json, failure_detail)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         stage.id,
         stage.agent_run_id,
@@ -737,6 +748,7 @@ export class SelfTuningStore {
         stage.stop_reason ?? null,
         stage.partial_error_code ?? null,
         stage.diagnostic_json ?? null,
+        stage.failure_detail ?? null,
       );
     } catch (e) {
       console.error("[SelfTuningStore] insertStageRun failed:", e);

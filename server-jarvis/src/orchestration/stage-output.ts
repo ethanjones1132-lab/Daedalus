@@ -53,6 +53,11 @@ export interface ExecutorStageOutput {
   terminalStatus?: "completed" | "failed" | "timed_out" | "cancelled" | "partial";
   /** Stable reason used by replanning and telemetry. */
   errorCode?: string;
+  /**
+   * Underlying exception text for a typed failure (e.g. snapshot EMFILE).
+   * Bounded; never put this on SSE or final_output — stage_runs.failure_detail only.
+   */
+  failureDetail?: string;
   /** Actual provider/model used by the final native candidate, for bounded escalation. */
   modelKey?: string;
   /**

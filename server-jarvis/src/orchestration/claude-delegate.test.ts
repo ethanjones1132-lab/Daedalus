@@ -150,6 +150,33 @@ describe("withDelegateRequestCorrelation", () => {
   });
 });
 
+describe("snapshot failure preserves the underlying exception", () => {
+  test("delegate_snapshot_error carries the thrown message", async () => {
+    const config = testConfig();
+    const result = await runClaudeDelegate({
+      config,
+      prompt: "write the target",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 30_000,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      health: new DelegateHealth(),
+      snapshotFactory: {
+        capture: async () => {
+          throw new Error("EMFILE: too many open files");
+        },
+      },
+      processFactory: async () => {
+        throw new Error("should not spawn after snapshot failure");
+      },
+    });
+    expect(result.errorCode).toBe("delegate_snapshot_error");
+    expect(result.failureDetail).toContain("EMFILE");
+  });
+});
+
 describe("Claude executor delegate", () => {
   test("aborts a repeated api_retry stream instead of waiting for provider backoff", async () => {
     const config = testConfig();

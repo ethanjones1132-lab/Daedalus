@@ -2666,6 +2666,8 @@ export class PipelineExecutor {
               stdout_tail: delegated.diagnostics.stdout_tail,
             })
           : undefined,
+        // Exception text behind typed codes like delegate_snapshot_error.
+        failure_detail: delegated.failureDetail,
       });
       this.collector.recordModelAttribution?.({
         id: `attr_${crypto.randomUUID()}`,

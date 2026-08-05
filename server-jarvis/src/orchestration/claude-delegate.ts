@@ -1064,13 +1064,14 @@ class DelegateOperationGuard {
   }
 }
 
-function delegateFailure(errorCode: string, narrative: string): ExecutorStageOutput {
+function delegateFailure(errorCode: string, narrative: string, detail?: string): ExecutorStageOutput {
   return {
     ok: false,
     narrative,
     toolCalls: [],
     terminalStatus: "failed",
     errorCode,
+    failureDetail: detail?.slice(0, 600),
   };
 }
 
@@ -1305,7 +1306,14 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
     const beforeResult = await operation.race(input.snapshotFactory.capture(input.allowedRoots));
     if (beforeResult.kind === "timeout" || beforeResult.kind === "aborted") return terminalOutput(beforeResult.kind);
     if (beforeResult.kind === "error") {
-      return delegateFailure("delegate_snapshot_error", `Delegate ground-truth snapshot failed: ${String(beforeResult.error)}`);
+      const detail = beforeResult.error instanceof Error
+        ? `${beforeResult.error.name}: ${beforeResult.error.message}`
+        : String(beforeResult.error);
+      return delegateFailure(
+        "delegate_snapshot_error",
+        `Delegate ground-truth snapshot failed: ${detail}`,
+        detail,
+      );
     }
     const beforeSnapshots = beforeResult.value;
 
