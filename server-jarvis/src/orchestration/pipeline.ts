@@ -46,6 +46,7 @@ import {
   SemanticPressureBudget,
   SEMANTIC_PRESSURE_SUPPRESSED,
 } from "./executor-progress-policy";
+import { selectHandoffSeedPaths } from "./delegate-handoff-seed";
 import {
   normalizeRemainingStages,
   shouldRunPlannerConcurrentWithExecutor,
@@ -1617,6 +1618,41 @@ export class PipelineExecutor {
     }
   }
 
+  /**
+   * Read one file as a runtime-issued tool call for handoff seeding. Returns
+   * undefined when the read fails or the path is outside evidence roots — a
+   * failed seed must never block the fallback attempt.
+   *
+   * Uses the same `runToolCall` path as the native executor so scope
+   * enforcement and the read ledger both apply.
+   */
+  private async readFileForSeed(
+    path: string,
+    options: PipelineExecuteOptions,
+  ): Promise<ToolCallRecord | undefined> {
+    try {
+      const call: ToolCall = {
+        id: `seed_${crypto.randomUUID()}`,
+        name: "read_file",
+        arguments: { path },
+      };
+      const result = await this.runToolCall(call, options);
+      const output = toolResultModelText(result);
+      if (result.is_error || !output?.trim()) return undefined;
+      const record: ToolCallRecord = {
+        name: "read_file",
+        arguments: { path },
+        output,
+        is_error: false,
+        duration_ms: result.duration_ms ?? 0,
+      };
+      this.markReadLedgerForCall(call, output);
+      return record;
+    } catch {
+      return undefined;
+    }
+  }
+
   private async runPlannerStage(
     request: string,
     agentRunId: string,
@@ -2718,6 +2754,24 @@ export class PipelineExecutor {
             role: "user",
             content: `[Conductor mid-loop] ${midLoopStop.note}`,
           });
+          // Seed current on-disk text for the targets the delegate was editing.
+          // Without this the native fallback starts blind and (2026-08-04,
+          // run_085afdac) emits nothing at all.
+          const seedPaths = selectHandoffSeedPaths({
+            delegateCalls: delegated.toolCalls,
+            carriedWriteTargets: options.taskRunContract?.lastWriteTargets ?? [],
+          });
+          for (const path of seedPaths) {
+            const seeded = await this.readFileForSeed(path, options);
+            if (!seeded) continue;
+            toolCalls.push(seeded);
+            executorMessages.push({
+              role: "user",
+              content:
+                `[Runtime handoff seed] Current contents of ${path} — ` +
+                `match this text exactly when composing edit_file.\n${seeded.output}`,
+            });
+          }
         }
         executorMessages.push({
           role: "user",
