@@ -204,11 +204,12 @@ describe("mid-loop: the read spiral is broken before the budget runs out", () =>
   });
 
   test("repeat spirals escalate instead of repeating the same sentence", () => {
+    // 2026-08-04: FORCE_WRITE_NUDGE_CAP is 2 — second allowed nudge is sent=1.
     const first = decideMidLoopIntervention(
       signal({ distinctSuccessfulReads: 5, forceWriteNudgesSent: 0 }),
     );
     const later = decideMidLoopIntervention(
-      signal({ distinctSuccessfulReads: 12, forceWriteNudgesSent: 2 }),
+      signal({ distinctSuccessfulReads: 12, forceWriteNudgesSent: 1 }),
     );
     const firstNote = "note" in first ? first.note : "";
     const laterNote = "note" in later ? later.note : "";
