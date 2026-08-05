@@ -65,6 +65,10 @@ export class SessionOutcomeCollector {
     checkTier?: string,
     /** Why a check declined (tier none). Optional; defaults to null. */
     checkDeclinedReason?: string,
+    /** Phase B scalar reward [-1, 1]. Optional. */
+    rewardScore?: number | null,
+    /** Phase B reward breakdown JSON for offline replay. Optional. */
+    rewardJson?: string | null,
   ): void {
     this.store.updateAgentRun(runId, {
       completed: 1,
@@ -76,6 +80,8 @@ export class SessionOutcomeCollector {
       verified_via: verifiedVia ?? null,
       check_tier: checkTier ?? null,
       check_declined_reason: checkDeclinedReason ?? null,
+      reward_score: rewardScore ?? null,
+      reward_json: rewardJson ?? null,
     });
 
     // M7: close the self-tuning loop — once enough post-apply runs exist for

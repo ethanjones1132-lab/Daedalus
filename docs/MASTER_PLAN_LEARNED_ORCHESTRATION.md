@@ -177,20 +177,20 @@ A and B can run in parallel. C depends on nothing but touches many files, so it 
 
 ---
 
-## Phase B1 status (2026-08-05)
+## Phase B status (2026-08-05) — **complete (B1–B3)**
 
-**Shipped**
+**B1 — Scalar reward.** `computeRunReward` / `computeRunRewardFromStored` in `server-jarvis/src/orchestration/run-reward.ts`. Terms: writes, independent check, plan verification. Score base in `[0,1]`; after B3 in `[-1,1]`.
 
-- Pure module `server-jarvis/src/orchestration/run-reward.ts`: `computeRunReward` returns a single scalar in `[0, 1]` from ground truth only:
-  - **writes** — credited paths from filesystem content deltas (`write_effects` preferred; tool-call success as weaker fallback). Optional `targetPaths` so non-target files (e.g. `NOTES.md`) do not score.
-  - **check** — `CheckResult` only (`tier` / `ran` / `passed`). **No reviewer term.** `tier: none` or `!ran` → check term 0 (B2 foundation: declining checks cannot be profitable).
-  - **plan** — `itemsVerified / itemsTotal` from objective acceptance counts; N/A when no plan items.
-  - N/A terms drop weight; remaining weights re-normalize. Deterministic / offline-replayable.
-- Unit tests: `run-reward.test.ts`.
+**B2 — Anti-gaming.**
+- Target-only / status-log denylist via same `countsTowardWriteEffect` rules as the effect gate.
+- `synth` checks never credit (runtime-authored oracle).
+- Write-required + declined/missing check (`none` / `!ran` / null) → **hard zero** entire score (not partial).
+- Written argument: `docs/PHASE_B_RUN_REWARD_ANTI_GAMING.md`.
 
-**Not yet (B2/B3 / wiring)**
+**B3 — Calibration.** Declared `success` without independent passing check → `−OVERCLAIM_PENALTY` (0.5), strictly worse than honest partial with the same base terms.
 
-- **B2** full anti-gaming policy doc + hard zero when check declines on write turns (partially prepared: check term already 0 for `none`).
-- **B3** overclaim penalty (declared success + failed check).
-- Live path: record `computeRunReward` on `completeAgentRun` / conductor learning (optional next step).
-- Phase C θ for reward weights.
+**Live wiring.** Orchestrator completion path builds a stored snapshot, computes reward, persists `agent_runs.reward_score` + `reward_json` (snapshot + breakdown) via `completeAgentRun`. Offline replay: `computeRunRewardFromStored(snapshot)`.
+
+**Exit criterion met:** offline-computable, deterministic replay, anti-farming argument documented.
+
+**Still open (not Phase B):** live θ weights (Phase C); CMA-ES (Phase D); hermetic fixture oracles the agent cannot edit.

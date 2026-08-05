@@ -168,6 +168,13 @@ import { resolveCoordinatorRouteEntry } from "./orchestration/coordinator-route-
 import { runPipelineWithReplanning } from "./orchestration/replan-loop";
 import { mapCheckToReward } from "./orchestration/verification-reward";
 import {
+  buildStoredRunRewardSnapshot,
+  computeRunRewardFromStored,
+  planEvidenceFromItems,
+  serializeRunRewardBreakdown,
+} from "./orchestration/run-reward";
+import { resolveTaskTargetPaths } from "./orchestration/effect-gate";
+import {
   applyStricterOutcomeFloor,
   decideCompletion,
 } from "./orchestration/completion-policy";
@@ -3597,6 +3604,40 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // learning stay on the historical 3-way vocabulary.
         const rewardOutcome: "success" | "degraded" | "failed" =
           verifiedRunOutcome === "partial" ? "degraded" : verifiedRunOutcome;
+        // Phase B: scalar ground-truth reward (B1–B3). Offline-replayable from
+        // the stored snapshot embedded in reward_json. No model-judged terms.
+        const writeRequiredForReward =
+          writeIntent
+          || wroteCode
+          || turnReq.requirement === "full_execution";
+        const rewardTargetPaths = resolveTaskTargetPaths({
+          request: message,
+          planTexts: [
+            latestTaskRun.objective ?? "",
+            ...(latestTaskRun.plan?.items ?? []).map(
+              (item) => `${item.title ?? ""} ${item.description ?? ""}`,
+            ),
+          ],
+        });
+        const runRewardSnapshot = buildStoredRunRewardSnapshot({
+          writeRequired: writeRequiredForReward,
+          toolCalls: result.toolCalls ?? [],
+          targetPaths: rewardTargetPaths,
+          check: result.checkResult
+            ? {
+              tier: result.checkResult.tier,
+              ran: result.checkResult.ran,
+              passed: result.checkResult.passed,
+            }
+            : null,
+          plan: planEvidenceFromItems(latestTaskRun.plan?.items),
+          declaredOutcome: verifiedRunOutcome,
+        });
+        const runReward = computeRunRewardFromStored(runRewardSnapshot);
+        const runRewardJson = JSON.stringify({
+          snapshot: runRewardSnapshot,
+          breakdown: JSON.parse(serializeRunRewardBreakdown(runReward)),
+        });
         const finalOutputForLog = trimmedAnswer || result.error || `(no output: ${result.error_code ?? "empty_completion"})`;
         sessionMemory.recordPipelineOutcome(sessionId, {
           outcome: rewardOutcome,
@@ -3617,6 +3658,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           reward?.verifiedVia,
           reward?.checkTier,
           result.checkResult?.declinedReason,
+          runReward.score,
+          runRewardJson,
         );
         if (conductorRunId) {
           conductorLearning.completeRun({

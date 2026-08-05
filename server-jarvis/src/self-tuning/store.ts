@@ -35,6 +35,13 @@ export interface AgentRun {
    * or the build detector's not_applicable reason.
    */
   check_declined_reason?: string | null;
+  /**
+   * Phase B scalar run reward in [-1, 1] (ground-truth only; see run-reward.ts).
+   * Offline-replayable from reward_json + stage tool evidence.
+   */
+  reward_score?: number | null;
+  /** JSON RunRewardBreakdown (+ optional snapshot) for offline replay. */
+  reward_json?: string | null;
   created_at?: string;
 }
 
@@ -349,6 +356,8 @@ const SELF_TUNING_SCHEMA = `
     verified_via TEXT,
     check_tier TEXT,
     check_declined_reason TEXT,
+    reward_score REAL,
+    reward_json TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   );
   CREATE TABLE IF NOT EXISTS stage_runs (
@@ -616,6 +625,13 @@ export class SelfTuningStore {
         // Theme 1 / Task 3: why verification declined (tier none).
         try {
           db.exec(`ALTER TABLE agent_runs ADD COLUMN check_declined_reason TEXT`);
+        } catch { /* column already exists */ }
+        // Phase B: scalar ground-truth run reward (B1–B3).
+        try {
+          db.exec(`ALTER TABLE agent_runs ADD COLUMN reward_score REAL`);
+        } catch { /* column already exists */ }
+        try {
+          db.exec(`ALTER TABLE agent_runs ADD COLUMN reward_json TEXT`);
         } catch { /* column already exists */ }
         try {
           db.exec(`ALTER TABLE model_attributions ADD COLUMN first_token_ms INTEGER`);

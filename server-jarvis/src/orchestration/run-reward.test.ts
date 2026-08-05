@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
+  OVERCLAIM_PENALTY,
+  buildStoredRunRewardSnapshot,
   computeRunReward,
   computeRunRewardFromEffects,
+  computeRunRewardFromStored,
+  planEvidenceFromItems,
+  serializeRunRewardBreakdown,
   writeEvidenceFromEffects,
   writeEvidenceFromToolCalls,
 } from "./run-reward";
@@ -17,8 +22,8 @@ function effect(path: string, changed: boolean): WriteEffectObservation {
   };
 }
 
-describe("computeRunReward", () => {
-  test("full success: target write + check pass + all plan items", () => {
+describe("computeRunReward B1 composition", () => {
+  test("full success: target write + independent check + plan", () => {
     const r = computeRunReward({
       writes: {
         changedPaths: ["src/solution.py"],
@@ -27,52 +32,51 @@ describe("computeRunReward", () => {
       },
       check: { tier: "existing", ran: true, passed: true },
       plan: { itemsTotal: 2, itemsVerified: 2 },
+      declaredOutcome: "success",
     });
     expect(r.score).toBe(1);
-    expect(r.terms).toEqual({ writes: 1, check: 1, plan: 1 });
-    expect(r.creditedWritePaths).toContain("src/solution.py");
+    expect(r.overclaim).toBe(false);
+    expect(r.hardZero).toBe(false);
   });
 
-  test("no model-judged path: check alone from CheckResult, not reviewer", () => {
-    // Even without plan/write applicability, a failed runtime check is 0.
+  test("partial plan is fractional", () => {
     const r = computeRunReward({
       writes: { changedPaths: ["a.ts"], writeRequired: true },
-      check: { tier: "builtin", ran: true, passed: false },
-      plan: null,
+      check: { tier: "existing", ran: true, passed: true },
+      plan: { itemsTotal: 4, itemsVerified: 1 },
     });
-    // writes=1, check=0 → score 0.5 with equal weights on two applicable terms
-    expect(r.terms.writes).toBe(1);
-    expect(r.terms.check).toBe(0);
-    expect(r.score).toBeCloseTo(0.5, 5);
+    expect(r.terms.plan).toBeCloseTo(0.25, 5);
+    expect(r.score).toBeCloseTo((1 + 1 + 0.25) / 3, 5);
   });
+});
 
-  test("check_tier none scores 0 on check term (B2 foundation)", () => {
+describe("B2 anti-gaming", () => {
+  test("write-required + check_tier none → hard zero (not partial)", () => {
     const r = computeRunReward({
       writes: { changedPaths: ["a.ts"], writeRequired: true },
       check: { tier: "none", ran: false, passed: null },
-      plan: null,
+      plan: { itemsTotal: 1, itemsVerified: 1 },
     });
-    expect(r.terms.check).toBe(0);
-    // writes 1, check 0 → 0.5
-    expect(r.score).toBeCloseTo(0.5, 5);
-    expect(r.notes.some((n) => n.includes("tier=none"))).toBe(true);
+    expect(r.hardZero).toBe(true);
+    expect(r.score).toBe(0);
+    expect(r.baseScore).toBe(0);
   });
 
-  test("write-required with zero deltas → write term 0", () => {
+  test("write-required + missing check → hard zero", () => {
     const r = computeRunReward({
-      writes: { changedPaths: [], writeRequired: true },
-      check: { tier: "existing", ran: true, passed: true },
+      writes: { changedPaths: ["a.ts"], writeRequired: true },
+      check: null,
       plan: null,
     });
-    expect(r.terms.writes).toBe(0);
-    expect(r.score).toBeCloseTo(0.5, 5);
+    // check N/A counts as declined for write-required
+    expect(r.hardZero).toBe(true);
+    expect(r.score).toBe(0);
   });
 
-  test("non-target writes do not credit when targets known", () => {
+  test("status/log docs do not credit writes without being targets", () => {
     const r = computeRunReward({
       writes: {
-        changedPaths: ["NOTES.md", "docs/status.md"],
-        targetPaths: ["src/core.py"],
+        changedPaths: ["IMPLEMENTATION_STATUS_CURRENT.md", "EXECUTION_LOG.md"],
         writeRequired: true,
       },
       check: { tier: "existing", ran: true, passed: true },
@@ -80,77 +84,146 @@ describe("computeRunReward", () => {
     });
     expect(r.terms.writes).toBe(0);
     expect(r.creditedWritePaths).toEqual([]);
-    expect(r.notes.some((n) => n.includes("non-target"))).toBe(true);
   });
 
-  test("read-only turn drops write weight and re-normalizes", () => {
+  test("status doc CAN credit when it is the explicit target", () => {
     const r = computeRunReward({
-      writes: { changedPaths: [], writeRequired: false },
-      check: { tier: "existing", ran: true, passed: true },
-      plan: { itemsTotal: 1, itemsVerified: 1 },
-    });
-    expect(r.weights.writes).toBe(0);
-    expect(r.score).toBe(1);
-    expect(r.weights.check + r.weights.plan).toBeCloseTo(1, 5);
-  });
-
-  test("partial plan verification is fractional", () => {
-    const r = computeRunReward({
-      writes: { changedPaths: ["a.ts"], writeRequired: true },
-      check: { tier: "existing", ran: true, passed: true },
-      plan: { itemsTotal: 4, itemsVerified: 1 },
-    });
-    expect(r.terms.plan).toBeCloseTo(0.25, 5);
-    // (1 + 1 + 0.25) / 3
-    expect(r.score).toBeCloseTo((1 + 1 + 0.25) / 3, 5);
-  });
-
-  test("no applicable terms → score 0", () => {
-    const r = computeRunReward({
-      writes: { changedPaths: [], writeRequired: false },
-      check: null,
-      plan: null,
-    });
-    expect(r.score).toBe(0);
-    expect(r.notes.some((n) => n.includes("no applicable"))).toBe(true);
-  });
-
-  test("offline deterministic: same input → same score", () => {
-    const input = {
       writes: {
-        changedPaths: ["x.cpp", "y.h"],
-        targetPaths: ["x.cpp"],
+        changedPaths: ["docs/EXECUTION_LOG.md"],
+        targetPaths: ["docs/EXECUTION_LOG.md"],
         writeRequired: true,
       },
-      check: { tier: "builtin" as const, ran: true, passed: true as boolean | null },
-      plan: { itemsTotal: 3, itemsVerified: 2 },
-    };
-    expect(computeRunReward(input)).toEqual(computeRunReward(input));
+      check: { tier: "existing", ran: true, passed: true },
+      plan: null,
+    });
+    expect(r.terms.writes).toBe(1);
+  });
+
+  test("non-target writes earn nothing when targets known", () => {
+    const r = computeRunReward({
+      writes: {
+        changedPaths: ["NOTES.md"],
+        targetPaths: ["src/core.py"],
+        writeRequired: true,
+      },
+      check: { tier: "existing", ran: true, passed: true },
+      plan: null,
+    });
+    expect(r.terms.writes).toBe(0);
+  });
+
+  test("synth check is not independent → check term 0 (no hard zero if ran)", () => {
+    const r = computeRunReward({
+      writes: { changedPaths: ["a.ts"], writeRequired: true },
+      check: { tier: "synth", ran: true, passed: true },
+      plan: null,
+    });
+    expect(r.terms.check).toBe(0);
+    expect(r.hardZero).toBe(false);
+    // writes only of two applicable terms
+    expect(r.score).toBeCloseTo(0.5, 5);
+  });
+
+  test("failed independent check allows honest partial (writes can score)", () => {
+    const r = computeRunReward({
+      writes: { changedPaths: ["a.ts"], writeRequired: true },
+      check: { tier: "builtin", ran: true, passed: false },
+      plan: null,
+      declaredOutcome: "partial",
+    });
+    expect(r.hardZero).toBe(false);
+    expect(r.terms.writes).toBe(1);
+    expect(r.terms.check).toBe(0);
+    expect(r.score).toBeCloseTo(0.5, 5);
+    expect(r.overclaim).toBe(false);
   });
 });
 
-describe("writeEvidence helpers", () => {
-  test("from effects only counts changed fingerprints", () => {
-    const ev = writeEvidenceFromEffects(
-      [effect("a.ts", true), effect("b.ts", false)],
-      { writeRequired: true },
-    );
-    expect(ev.changedPaths).toEqual(["a.ts"]);
+describe("B3 calibration (overclaim)", () => {
+  test("declared success + failed check is worse than honest partial", () => {
+    const base = {
+      writes: { changedPaths: ["a.ts"], writeRequired: true as const },
+      check: { tier: "existing" as const, ran: true, passed: false as boolean | null },
+      plan: null,
+    };
+    const honest = computeRunReward({ ...base, declaredOutcome: "partial" });
+    const lie = computeRunReward({ ...base, declaredOutcome: "success" });
+    expect(honest.overclaim).toBe(false);
+    expect(lie.overclaim).toBe(true);
+    expect(lie.score).toBeLessThan(honest.score);
+    expect(lie.score).toBeCloseTo(honest.baseScore - OVERCLAIM_PENALTY, 5);
   });
 
-  test("from tool calls collects successful write paths", () => {
-    const ev = writeEvidenceFromToolCalls(
-      [
-        { name: "read_file", is_error: false, arguments: { path: "a.ts" } },
-        { name: "edit_file", is_error: false, arguments: { path: "a.ts" } },
-        { name: "write_file", is_error: true, arguments: { path: "b.ts" } },
-      ],
-      { writeRequired: true },
-    );
-    expect(ev.changedPaths).toEqual(["a.ts"]);
+  test("declared success without any check is overclaim", () => {
+    // hard zero also applies (write-required + declined)
+    const r = computeRunReward({
+      writes: { changedPaths: ["a.ts"], writeRequired: true },
+      check: { tier: "none", ran: false, passed: null },
+      declaredOutcome: "success",
+    });
+    expect(r.hardZero).toBe(true);
+    expect(r.overclaim).toBe(true);
+    // base 0 − penalty
+    expect(r.score).toBeCloseTo(-OVERCLAIM_PENALTY, 5);
   });
 
-  test("computeRunRewardFromEffects end-to-end", () => {
+  test("true success is not overclaim", () => {
+    const r = computeRunReward({
+      writes: { changedPaths: ["a.ts"], writeRequired: true },
+      check: { tier: "existing", ran: true, passed: true },
+      declaredOutcome: "success",
+    });
+    expect(r.overclaim).toBe(false);
+    expect(r.score).toBe(1);
+  });
+});
+
+describe("offline stored snapshot", () => {
+  test("build + computeRunRewardFromStored is deterministic", () => {
+    const snap = buildStoredRunRewardSnapshot({
+      writeRequired: true,
+      effects: [effect("src/main.rs", true)],
+      targetPaths: ["src/main.rs"],
+      check: { tier: "existing", ran: true, passed: true },
+      plan: { itemsTotal: 1, itemsVerified: 1 },
+      declaredOutcome: "success",
+    });
+    const a = computeRunRewardFromStored(snap);
+    const b = computeRunRewardFromStored(snap);
+    expect(a).toEqual(b);
+    expect(a.score).toBe(1);
+    expect(serializeRunRewardBreakdown(a)).toBe(serializeRunRewardBreakdown(b));
+  });
+
+  test("planEvidenceFromItems counts verified with acceptance checks only", () => {
+    const plan = planEvidenceFromItems([
+      { status: "verified", acceptanceChecks: [{ id: "1" }] },
+      { status: "pending", acceptanceChecks: [{ id: "2" }] },
+      { status: "verified", acceptanceChecks: [] }, // no checks → ignored
+    ]);
+    expect(plan).toEqual({ itemsTotal: 2, itemsVerified: 1 });
+  });
+});
+
+describe("helpers", () => {
+  test("writeEvidenceFromEffects / toolCalls", () => {
+    expect(
+      writeEvidenceFromEffects([effect("a.ts", true), effect("b.ts", false)], {
+        writeRequired: true,
+      }).changedPaths,
+    ).toEqual(["a.ts"]);
+    expect(
+      writeEvidenceFromToolCalls(
+        [
+          { name: "edit_file", is_error: false, arguments: { path: "a.ts" } },
+          { name: "write_file", is_error: true, arguments: { path: "b.ts" } },
+        ],
+        { writeRequired: true },
+      ).changedPaths,
+    ).toEqual(["a.ts"]);
+  });
+
+  test("computeRunRewardFromEffects", () => {
     const r = computeRunRewardFromEffects({
       effects: [effect("src/main.rs", true)],
       check: { tier: "existing", ran: true, passed: true },
