@@ -17,7 +17,7 @@ import {
 import { openCodeGoProtocolForModel } from "./live-model-catalog";
 import { createHash } from "crypto";
 import { execFile, spawn } from "child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { mkdtempSync, rmSync, writeFileSync, type Dirent } from "fs";
 import { readFile, readdir } from "fs/promises";
 import { tmpdir } from "os";
 import { createInterface } from "readline";
@@ -770,6 +770,10 @@ async function fileIdentity(path: string): Promise<string> {
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") return "missing";
+    // A snapshot walk over user-controlled filesystem must never be fatal: a
+    // locked or denied file is not a source mutation, and throwing here kills
+    // the delegate before it launches (see filesystemFiles).
+    if (code === "EPERM" || code === "EACCES" || code === "EBUSY") return `unreadable:${code}`;
     throw error;
   }
 }
@@ -812,19 +816,35 @@ export function shouldSnapshotRelPath(relPath: string): boolean {
   return true;
 }
 
-async function filesystemFiles(root: string): Promise<Record<string, string>> {
+export async function filesystemFiles(
+  root: string,
+  readdirImpl: (directory: string) => Promise<Dirent[]> = (directory) =>
+    readdir(directory, { withFileTypes: true }),
+): Promise<Record<string, string>> {
   const files: Record<string, string> = {};
-  const walk = async (directory: string): Promise<void> => {
-    const entries = await readdir(directory, { withFileTypes: true });
+  const walk = async (directory: string, isRoot: boolean): Promise<void> => {
+    let entries: Dirent[];
+    try {
+      entries = await readdirImpl(directory);
+    } catch (error) {
+      // A walk over user-controlled filesystem must never be fatal: 2026-08-05
+      // live, one unreadable directory (EPERM scandir on
+      // C:\$Recycle.Bin\S-1-5-18) aborted the whole snapshot and killed the
+      // delegate before the model launched. Skip the subtree instead. The root
+      // itself still throws — an unreadable allowed root is a configuration
+      // error, not a subtree to tolerate.
+      if (isRoot) throw error;
+      return;
+    }
     for (const entry of entries) {
       const path = join(directory, entry.name);
       if (entry.isDirectory()) {
         if (SNAPSHOT_EXCLUDED_DIRS.has(entry.name)) continue;
-        await walk(path);
+        await walk(path, false);
       } else files[pathKey(path)] = await fileIdentity(path);
     }
   };
-  await walk(root);
+  await walk(root, true);
   return files;
 }
 

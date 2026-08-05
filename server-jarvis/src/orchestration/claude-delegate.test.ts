@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "fs/promises";
+import { mkdtemp, mkdir, readdir, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { defaultConfig, type JarvisConfig } from "../config";
@@ -13,6 +13,7 @@ import {
   DELEGATE_REQUEST_ID_HEADER,
   DelegateHealth,
   delegateEligibility,
+  filesystemFiles,
   isPermittedDelegateTool,
   mapClaudeDelegateToolName,
   nodeDelegateProcessFactory,
@@ -87,6 +88,45 @@ describe("snapshot excludes build output", () => {
   test("handles backslash-separated paths (Windows git output)", () => {
     expect(shouldSnapshotRelPath("build\\Perihelion.vcxproj")).toBe(false);
     expect(shouldSnapshotRelPath("Source\\DSPEngine.h")).toBe(true);
+  });
+});
+
+/**
+ * 2026-08-05 live: the resolved roots widened to a drive root, the filesystem
+ * walk hit `C:\$Recycle.Bin\S-1-5-18`, and one EPERM scandir threw
+ * delegate_snapshot_error — killing the delegate before the capable model
+ * launched and benching it for the rest of the run. A walk over
+ * user-controlled filesystem must never be fatal: skip the unreadable subtree.
+ */
+describe("snapshot survives unreadable directories", () => {
+  const eperm = (target: string) =>
+    Object.assign(new Error(`EPERM: operation not permitted, scandir '${target}'`), { code: "EPERM" });
+
+  test("skips an EPERM subdirectory and still snapshots the rest", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jarvis-delegate-"));
+    try {
+      await writeFile(join(root, "ok.txt"), "ok");
+      await mkdir(join(root, "locked"));
+      const files = await filesystemFiles(root, async (directory) => {
+        if (directory.endsWith("locked")) throw eperm(directory);
+        return readdir(directory, { withFileTypes: true });
+      });
+      expect(Object.keys(files)).toHaveLength(1);
+      expect(Object.keys(files)[0]).toContain("ok.txt");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("an unreadable root still throws (configuration error, not a subtree)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jarvis-delegate-"));
+    try {
+      await expect(filesystemFiles(root, async (directory) => {
+        throw eperm(directory);
+      })).rejects.toThrow("EPERM");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 
