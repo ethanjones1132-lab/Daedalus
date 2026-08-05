@@ -280,3 +280,58 @@ describe("resolveCoordinatorRouteEntry (async orchestration parity)", () => {
     expect(result.route.plan_authorship).toBe("planner_mediated");
   });
 });
+
+describe("ensureOwnedPlanningOnRoute continuation carry", () => {
+  const bareRoute = (): CoordinatorResult => ({
+    task_type: "general",
+    pipeline: ["synthesizer"],
+    topology: "linear",
+    context: {
+      needs_workspace_inspection: false,
+      needs_memory: true,
+      estimated_complexity: "low",
+    },
+    coordinator_rationale: "Local conductor cold/abort; deterministic answer_only route.",
+    conductor_source: "deterministic",
+  });
+
+  test("inherits unfinished items instead of authoring from the follow-up text", () => {
+    const route = ensureOwnedPlanningOnRoute(bareRoute(), "continue please", {
+      items: [
+        { id: "pi_a2", title: "A2 parameter smoothing", dependsOn: [] },
+        { id: "pi_a3", title: "A3 editor layout", dependsOn: [] },
+      ],
+      lastWriteTargets: ["C:\\p\\PluginProcessor.cpp"],
+    });
+
+    expect(route.plan_authorship).toBe("conductor_direct");
+    expect(route.plan_items?.map((i) => i.id)).toEqual(["pi_a2", "pi_a3"]);
+    expect(route.plan_items?.some((i) => i.title === "continue please")).toBe(false);
+    expect(route.continuation_write_targets).toEqual(["C:\\p\\PluginProcessor.cpp"]);
+  });
+
+  test("falls back to authoring when the carry has no unfinished items", () => {
+    const route = ensureOwnedPlanningOnRoute(bareRoute(), "continue please", {
+      items: [],
+      lastWriteTargets: [],
+    });
+
+    expect(route.plan_items?.length).toBe(1);
+    expect(route.plan_items?.[0]!.title).toBe("continue please");
+  });
+
+  test("carry is ignored when the route already declares plan authorship", () => {
+    const authored: CoordinatorResult = {
+      ...bareRoute(),
+      plan_authorship: "planner_mediated",
+      plan_items: [],
+    };
+    const route = ensureOwnedPlanningOnRoute(authored, "continue please", {
+      items: [{ id: "pi_a2", title: "A2", dependsOn: [] }],
+      lastWriteTargets: [],
+    });
+
+    expect(route.plan_authorship).toBe("planner_mediated");
+    expect(route.plan_items).toEqual([]);
+  });
+});

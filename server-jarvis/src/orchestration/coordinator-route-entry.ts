@@ -21,12 +21,27 @@ import {
   type RouteSource,
 } from "./route-normalization";
 import { attachOwnedPlanning } from "./runtime-loop";
+import type { CreateTaskPlanItemInput } from "./task-run";
 import {
   resolveTurnRequirement,
   shouldShortCircuitCoordinator,
   type TurnRequirement,
   type TurnRequirementResult,
 } from "./turn-requirements";
+
+/**
+ * Surviving plan state handed to route entry on a continuation turn.
+ *
+ * 2026-08-04 (run_085afdac): without this, a "continue please" follow-up on
+ * the deterministic-fallback path authored a fresh single plan item from the
+ * follow-up text and discarded the real multi-item ledger.
+ */
+export interface ContinuationPlanCarry {
+  /** Non-verified items from the live TaskRun ledger, order preserved. */
+  items: CreateTaskPlanItemInput[];
+  /** Absolute paths most recently written in this task run, newest first. */
+  lastWriteTargets: string[];
+}
 
 /** Inputs that fully determine the pure decision tree for one turn. */
 export interface CoordinatorRouteEntryClassifyInput {
@@ -124,8 +139,22 @@ export function buildActivePlanContinuationRoute(input: {
 export function ensureOwnedPlanningOnRoute(
   route: CoordinatorResult,
   message: string,
+  carry?: ContinuationPlanCarry,
 ): CoordinatorResult {
   if (route.plan_authorship) return route;
+  // Continuation turns re-seed the surviving ledger. Authoring from the
+  // follow-up text here is what produced `plan_items: [{title:"continue
+  // please"}]` live (2026-08-04, run_085afdac).
+  if (carry && carry.items.length > 0) {
+    return {
+      ...route,
+      plan_authorship: "conductor_direct",
+      plan_items: carry.items,
+      ...(carry.lastWriteTargets.length > 0
+        ? { continuation_write_targets: carry.lastWriteTargets }
+        : {}),
+    };
+  }
   const planning = attachOwnedPlanning(
     message,
     route.context?.estimated_complexity ?? "low",
@@ -164,6 +193,8 @@ export interface ResolveCoordinatorRouteEntryInput extends CoordinatorRouteEntry
   routeViaModel: () => Promise<CoordinatorResult>;
   /** Optional item id for continuation log line. */
   activePlanItemId?: string;
+  /** Surviving plan state when this turn continues a live task run. */
+  continuationCarry?: ContinuationPlanCarry;
 }
 
 export interface CoordinatorRouteEntryResult extends CoordinatorRouteEntryDecision {
@@ -217,7 +248,7 @@ export async function resolveCoordinatorRouteEntry(
 
   // Owned-runtime-loop: short-circuit / deterministic routes skip
   // Coordinator.route, so attach planning ownership here when missing.
-  route = ensureOwnedPlanningOnRoute(route, input.message);
+  route = ensureOwnedPlanningOnRoute(route, input.message, input.continuationCarry);
 
   const routeSource = deriveCoordinatorRouteSource(routeDecision, route);
 

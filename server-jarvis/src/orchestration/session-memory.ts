@@ -251,7 +251,7 @@ export class SessionMemory {
 
   updateTaskRun(
     sessionId: string,
-    patch: Partial<Pick<TaskRunContract, "status" | "evidenceCount" | "remainingWork" | "lastOutcome" | "lastTurnId" | "estimatedComplexity" | "plan" | "reconstruction" | "schemaVersion">>,
+    patch: Partial<Pick<TaskRunContract, "status" | "evidenceCount" | "remainingWork" | "lastOutcome" | "lastTurnId" | "estimatedComplexity" | "plan" | "reconstruction" | "schemaVersion" | "lastWriteTargets" | "writeIntent">>,
   ): TaskRunContract | undefined {
     const session = this.getSession(sessionId);
     if (!session.taskRun) return undefined;

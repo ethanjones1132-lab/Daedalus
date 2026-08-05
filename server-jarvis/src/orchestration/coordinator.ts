@@ -110,6 +110,8 @@ export interface CoordinatorResult {
   plan_items?: CreateTaskPlanItemInput[];
   /** Brief handed to Planner on the complex path (request + relevant memory). */
   plan_brief?: ConductorPlanBrief;
+  /** Write targets carried from the prior turn of a continuing task run. */
+  continuation_write_targets?: string[];
 }
 
 export interface CoordinatorRouteOptions {

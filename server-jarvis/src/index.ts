@@ -60,6 +60,9 @@ import { actualInferenceRouteTelemetry } from "./orchestration/inference-route-t
 const approvalRegistry = createApprovalRegistry();
 const discordReceiptStore = new SqliteDeliveryReceiptStore();
 import type { ToolCall } from "./tool-types";
+
+/** Write-effect tools, for carrying this turn's mutation targets forward. */
+const TURN_WRITE_TOOLS = new Set(["write_file", "edit_file", "multi_edit", "apply_patch"]);
 import {
   buildTextToolInstructions,
   createStageStreamSanitizer,
@@ -198,9 +201,12 @@ import {
   getActivePlanItem,
   reconcileTaskRunStatus,
   resolveDeepReadIntent,
+  recordWriteTargets,
   terminalSubtypeForRunOutcome,
+  unfinishedPlanItemInputs,
   type TaskRunContract,
 } from "./orchestration/task-run";
+import { collectToolPathTargets } from "./orchestration/mid-loop-intervention";
 import {
   INFERENCE_FEEDBACK_CRON_JOB_ID,
   refreshInferenceFeedback,
@@ -2984,6 +2990,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           taskRunLive: !["completed", "failed", "cancelled"].includes(activeTaskRun.status),
           taskRunStatus: activeTaskRun.status,
           taskRunTurnCount: activeTaskRun.turnCount,
+          continuationCarry: {
+            items: unfinishedPlanItemInputs(activeTaskRun),
+            lastWriteTargets: activeTaskRun.lastWriteTargets ?? [],
+          },
           activePlanItem: activePlanItem
             ? { acceptanceChecks: activePlanItem.acceptanceChecks }
             : null,
@@ -3500,6 +3510,19 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           : turnReq.requirement === "full_execution"
             ? new Set(successfulToolCalls.map((call) => `${call.name}:${JSON.stringify(call.arguments)}`)).size
             : 0;
+        // 2026-08-04: carry what this turn actually mutated into the contract so
+        // the next continuation turn can re-read it instead of rediscovering.
+        const turnWriteTargets = successfulToolCalls
+          .filter((call) => TURN_WRITE_TOOLS.has(call.name))
+          .flatMap((call) => collectToolPathTargets(call.arguments));
+        if (turnWriteTargets.length > 0) {
+          sessionMemory.updateTaskRun(sessionId, {
+            lastWriteTargets: recordWriteTargets(
+              sessionMemory.getTaskRun(sessionId) ?? activeTaskRun,
+              turnWriteTargets,
+            ).lastWriteTargets,
+          });
+        }
         const taskAcceptance = assessTaskRunAcceptance({
           requirement: turnReq.requirement,
           depth: activeTaskRun.depth,
