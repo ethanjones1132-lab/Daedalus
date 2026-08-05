@@ -1767,4 +1767,46 @@ describe("executor delegate pipeline integration", () => {
     }
     expect(delegateCalls).toBe(2);
   });
+
+  test("B3: full_execution requirement arms write contract even without write-intent message", async () => {
+    // 2026-08-04 (run_94cdcfdf): "continue please" had turnRequirement full_execution
+    // but hasWriteIntent was false and contract writeIntent false → write_not_required.
+    const config = delegateTestConfig();
+    config.jarvis_path = process.cwd();
+    config.claude_cli.delegate.policy = "delegate_first";
+    const ctx = makeExecutionContext("agent", config, {
+      session_id: "session-b3-full-execution-arms",
+      workspace_path: config.jarvis_path,
+    });
+    let delegateCalls = 0;
+    const executor = new (PipelineExecutor as any)(
+      async () => ({ content: "native should not be primary" }),
+      createToolRuntime(),
+      ctx,
+      { recordStageRun: () => {} },
+      {
+        availability: { isAvailable: async () => true },
+        run: async () => {
+          delegateCalls += 1;
+          return verifiedDelegateOutput();
+        },
+      },
+    ) as PipelineExecutor;
+
+    await executor.executeSegment(
+      "continue please",
+      ["executor"],
+      "run-b3-full-execution-arms",
+      () => {},
+      {
+        executionProfile: "full",
+        rawMessage: "continue please",
+        turnRequirement: "full_execution",
+        taskRunWriteIntent: false,
+        maxReviewRepairRounds: 0,
+      },
+    );
+
+    expect(delegateCalls).toBe(1);
+  });
 });

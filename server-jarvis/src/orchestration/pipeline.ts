@@ -1841,8 +1841,14 @@ export class PipelineExecutor {
     // task run's sticky write intent counts too, so "re-execute"/"continue"
     // follow-ups of an implementation task keep the contract even though the
     // follow-up text names no mutation.
+    // 2026-08-04 B3 (run_94cdcfdf): budget already treated full_execution as a
+    // write turn, but delegate eligibility used only message/contract writeIntent
+    // and skipped with write_not_required. Arm the write contract from the
+    // classified requirement as a third signal so the two authorities agree.
     const requiresWriteEffect = profile === "full" &&
-      (hasWriteIntent(intentText) || options.taskRunWriteIntent === true);
+      (hasWriteIntent(intentText)
+        || options.taskRunWriteIntent === true
+        || options.turnRequirement === "full_execution");
     // Write turns get file-scale visibility (see context-budget.ts): a model
     // cannot compose a correct edit for code it never saw.
     const toolResultContextChars = requiresWriteEffect
