@@ -97,7 +97,7 @@ import { prepareToolResultForContext } from "../tool-result-truncation";
 import { findExistingWorkspacePath } from "./workspace-affinity";
 import {
   collectSymbolGrounding,
-  extractGroundingIdentifiers,
+  extractGroundingRequirements,
   formatGroundingBlock,
   type SymbolGroundingSummary,
 } from "./symbol-grounding";
@@ -990,6 +990,8 @@ export class PipelineExecutor {
    * reintroduces these. Cleared at the start of each executor stage.
    */
   private groundingMissingSymbols = new Set<string>();
+  /** Task-explicit may_create symbols (exact names) exempt from fabricated-symbol block. */
+  private groundingAllowedNewSymbols = new Set<string>();
   /**
    * Runs whose delegate attempt ended with no verified write. Re-entry is
    * earned: a delegate that already failed and needed a native rescue does not
@@ -1670,6 +1672,7 @@ export class PipelineExecutor {
       fileContent,
       hasBeenRead,
       missingSymbols: this.groundingMissingSymbols,
+      allowedNewSymbols: this.groundingAllowedNewSymbols,
     });
 
     if (!verdict.allow) {
@@ -1960,8 +1963,9 @@ export class PipelineExecutor {
     /** Phase A1: filled before delegate_first / native loop; closed over by runDelegate. */
     let groundingBlock = "";
     let groundingSummary: SymbolGroundingSummary | undefined;
-    // Fresh A3 missing-symbol set each executor stage (filled by grounding).
+    // Fresh A3 missing/allow sets each executor stage (filled by grounding).
     this.groundingMissingSymbols = new Set();
+    this.groundingAllowedNewSymbols = new Set();
     const intentText = options.rawMessage ?? request;
     const requiresWorkspaceEvidence = turnNeedsWorkspaceEvidence(options.turnRequirement, intentText);
     // W5: task targets from the plan ledger + request path mentions. Status/log
@@ -2991,7 +2995,13 @@ export class PipelineExecutor {
         || this.ctx.workspace_path
         || this.ctx.config.jarvis_path
         || process.cwd();
-      const symbols = extractGroundingIdentifiers(`${intentText}\n${planSummary}`);
+      const requirements = extractGroundingRequirements(`${intentText}\n${planSummary}`);
+      const symbols = requirements.map((requirement) => requirement.symbol);
+      this.groundingAllowedNewSymbols = new Set(
+        requirements
+          .filter((requirement) => requirement.expectation === "may_create")
+          .map((requirement) => requirement.symbol),
+      );
       if (symbols.length > 0) {
         try {
           const { results, summary } = await collectSymbolGrounding({

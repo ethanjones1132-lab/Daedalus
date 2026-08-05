@@ -95,12 +95,26 @@ export type GroundingGrepFn = (args: {
   headLimit: number;
 }) => Promise<{ output: string; is_error: boolean }>;
 
+export type GroundingExpectation = "must_exist" | "may_create";
+
+export interface GroundingIdentifierRequirement {
+  symbol: string;
+  expectation: GroundingExpectation;
+}
+
+/**
+ * Narrow introduction verbs that authorize creating a missing symbol.
+ * Do not treat "use"/"call"/"connect" as permission to invent.
+ */
+const INTRODUCED_SYMBOL_PATTERN =
+  /\b(?:create|add|introduce|define|declare)\s+(?:a\s+|an\s+|the\s+|new\s+)?(?:(?:class|interface|type|function|component|module|enum|struct|constant|helper|hook|service)\s+)?`?([A-Za-z_][\w]*(?:::[A-Za-z_][\w]*)*)`?/gi;
+
 /**
  * Local identifier extraction — no model call.
  * Pulls candidates from task + plan prose: backticked spans, qualified names
  * (`a::b`, `a.b.c`), CamelCase tokens, and `name(` call shapes.
  */
-export function extractGroundingIdentifiers(text: string): string[] {
+function extractGroundingIdentifiersRaw(text: string): string[] {
   if (!text || !text.trim()) return [];
 
   const candidates: string[] = [];
@@ -148,6 +162,28 @@ export function extractGroundingIdentifiers(text: string): string[] {
   }
 
   return candidates.slice(0, policy().max_grounding_symbols);
+}
+
+/**
+ * Classify extracted identifiers as must_exist (default) or may_create when
+ * the task explicitly asks to introduce that symbol.
+ */
+export function extractGroundingRequirements(text: string): GroundingIdentifierRequirement[] {
+  const identifiers = extractGroundingIdentifiersRaw(text);
+  const introduced = new Set<string>();
+  for (const match of text.matchAll(INTRODUCED_SYMBOL_PATTERN)) {
+    const symbol = match[1];
+    if (symbol && identifiers.includes(symbol)) introduced.add(symbol);
+  }
+  return identifiers.map((symbol) => ({
+    symbol,
+    expectation: introduced.has(symbol) ? "may_create" : "must_exist",
+  }));
+}
+
+/** Names only — projection of {@link extractGroundingRequirements}. */
+export function extractGroundingIdentifiers(text: string): string[] {
+  return extractGroundingRequirements(text).map((requirement) => requirement.symbol);
 }
 
 function harvestFromFragment(fragment: string, push: (s: string) => void): void {

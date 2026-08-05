@@ -104,4 +104,41 @@ describe("preflightWriteTool", () => {
     expect(r.allow).toBe(true);
     expect(r.code).toBe("not_a_write");
   });
+
+  test("allows a missing symbol the task explicitly requests to create", () => {
+    const result = preflightWriteTool(
+      "write_file",
+      {
+        path: "src/BrandNewWidget.ts",
+        content: "export class BrandNewWidget {}\n",
+      },
+      {
+        pathInScope: true,
+        missingSymbols: ["BrandNewWidget"],
+        allowedNewSymbols: ["BrandNewWidget"],
+      },
+    );
+
+    expect(result.allow).toBe(true);
+    expect(result.code).toBe("ok");
+  });
+
+  test("does not exempt an unrequested fabricated dependency", () => {
+    const result = preflightWriteTool(
+      "write_file",
+      {
+        path: "src/BrandNewWidget.ts",
+        content: "export class BrandNewWidget extends ImaginaryFrameworkBase {}\n",
+      },
+      {
+        pathInScope: true,
+        missingSymbols: ["BrandNewWidget", "ImaginaryFrameworkBase"],
+        allowedNewSymbols: ["BrandNewWidget"],
+      },
+    );
+
+    expect(result.allow).toBe(false);
+    expect(result.code).toBe("fabricated_symbol");
+    expect(result.fabricated).toEqual(["ImaginaryFrameworkBase"]);
+  });
 });

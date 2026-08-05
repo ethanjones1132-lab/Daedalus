@@ -7,6 +7,7 @@ import {
   GROUNDING_BLOCK_CONTEXT_CHARS,
   collectSymbolGrounding,
   extractGroundingIdentifiers,
+  extractGroundingRequirements,
   formatGroundingBlock,
   parseGrepContentHits,
   buildGroundingGrepPattern,
@@ -50,6 +51,28 @@ describe("extractGroundingIdentifiers", () => {
   test("qualified dotted names with three segments", () => {
     const ids = extractGroundingIdentifiers("Use std.math.isnan carefully.");
     expect(ids.some((id) => id.includes("std.math.isnan") || id === "std.math.isnan")).toBe(true);
+  });
+
+  test("classifies an explicitly requested declaration as may_create", () => {
+    const requirements = extractGroundingRequirements(
+      "Create `BrandNewWidget` and connect it to ExistingRenderApi.",
+    );
+    const bySymbol = Object.fromEntries(
+      requirements.map((requirement) => [requirement.symbol, requirement.expectation]),
+    );
+
+    expect(bySymbol.BrandNewWidget).toBe("may_create");
+    expect(bySymbol.ExistingRenderApi).toBe("must_exist");
+  });
+
+  test("ordinary API references remain must_exist", () => {
+    const requirements = extractGroundingRequirements(
+      "Use `StateVariableTPTFilterType::notch` in processBlock.",
+    );
+    expect(requirements).toContainEqual({
+      symbol: "StateVariableTPTFilterType::notch",
+      expectation: "must_exist",
+    });
   });
 });
 

@@ -59,6 +59,11 @@ export interface WritePreflightContext {
    * Proposed write content must not introduce them.
    */
   missingSymbols?: Iterable<string>;
+  /**
+   * Symbols the task explicitly asked to create (may_create). Exact-name only.
+   * These are exempt from the fabricated-symbol block even if missing.
+   */
+  allowedNewSymbols?: Iterable<string>;
   /** When true, skip fabricated-symbol block (e.g. docs-only tasks). Default false. */
   allowFabricatedSymbols?: boolean;
 }
@@ -87,12 +92,15 @@ function proposedText(name: string, args: Record<string, unknown>): string {
 export function findFabricatedSymbolsInText(
   text: string,
   missingSymbols: Iterable<string>,
+  allowedNewSymbols: Iterable<string> = [],
 ): string[] {
   if (!text) return [];
+  const allowed = new Set(allowedNewSymbols);
   const found: string[] = [];
   const seen = new Set<string>();
   for (const symbol of missingSymbols) {
     if (!symbol || seen.has(symbol)) continue;
+    if (allowed.has(symbol)) continue; // exact-name may_create exemption
     // Prefer boundary-aware check for simple identifiers; for qualified names
     // (juce::isnan) a plain includes is enough and matches C++ call sites.
     const present = symbol.includes("::") || symbol.includes(".")
@@ -137,7 +145,11 @@ export function preflightWriteTool(
   // Fabricated-symbol gate on proposed payload (A1 ↔ A3).
   if (!ctx.allowFabricatedSymbols && ctx.missingSymbols) {
     const text = proposedText(name, args);
-    const fabricated = findFabricatedSymbolsInText(text, ctx.missingSymbols);
+    const fabricated = findFabricatedSymbolsInText(
+      text,
+      ctx.missingSymbols,
+      ctx.allowedNewSymbols,
+    );
     if (fabricated.length > 0) {
       return {
         allow: false,
