@@ -32,6 +32,80 @@ const failedCheck = {
   durationMs: 12,
 };
 
+/**
+ * 2026-08-05: `decideCompletion` gated verification on `writeIntent` alone —
+ * the sticky task-run flag. When a continuation minted a fresh contract that
+ * flag went false, so a turn that wrote 21 files and never compiled fell
+ * through to `non_write_complete` → success with check_tier="none". That is
+ * the `success_without_runtime_check` class (93 violations in replay).
+ *
+ * Verification is now required on EVIDENCE (a write landed) or on the turn's
+ * own requirement, not only on a classification that can be lost.
+ */
+describe("verification requirement is evidence-keyed, not flag-keyed", () => {
+  const base = {
+    pipelineOutcome: "success" as const,
+    reconciledStatus: "completed" as const,
+    repeated: false,
+  };
+
+  test("writes landed with writeIntent false still demand verification", () => {
+    const d = decideCompletion({
+      ...base,
+      writeIntent: false,
+      wroteCode: true,
+      checkResult: none,
+    });
+    expect(d.runOutcome).toBe("partial");
+    expect(d.reason).toBe("write_unverified");
+  });
+
+  test("full_execution requirement demands verification even with no flag", () => {
+    const d = decideCompletion({
+      ...base,
+      writeIntent: false,
+      requirement: "full_execution",
+      checkResult: none,
+    });
+    expect(d.runOutcome).toBe("partial");
+    expect(d.reason).toBe("write_unverified");
+  });
+
+  test("writes landed plus a FAILING check is verification_failed", () => {
+    const d = decideCompletion({
+      ...base,
+      writeIntent: false,
+      wroteCode: true,
+      checkResult: failedCheck,
+    });
+    expect(d.runOutcome).toBe("partial");
+    expect(d.reason).toBe("verification_failed");
+  });
+
+  test("writes landed plus an authoritative green is success", () => {
+    const d = decideCompletion({
+      ...base,
+      writeIntent: false,
+      wroteCode: true,
+      checkResult: green,
+    });
+    expect(d.runOutcome).toBe("success");
+    expect(d.reason).toBe("verified_complete");
+  });
+
+  test("a genuine read-only turn is still non_write_complete", () => {
+    const d = decideCompletion({
+      ...base,
+      writeIntent: false,
+      wroteCode: false,
+      requirement: "workspace_read",
+      checkResult: none,
+    });
+    expect(d.runOutcome).toBe("success");
+    expect(d.reason).toBe("non_write_complete");
+  });
+});
+
 describe("applyStricterOutcomeFloor", () => {
   test("partial + floor success → still partial", () => {
     expect(applyStricterOutcomeFloor("partial", "success")).toBe("partial");

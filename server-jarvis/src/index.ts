@@ -3554,10 +3554,17 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // write intent, repetition, and verification gate must all agree
         // before a write run can persist as completed/success.
         const writeIntent = latestTaskRun.writeIntent === true;
+        // 2026-08-05: `writeIntent` alone let a lost contract wave a write turn
+        // through as success with check_tier="none" (Perihelion run_0c34370a —
+        // 21 writes, never compiled). Landed writes and the turn's own
+        // requirement are ground truth the contract cannot erase.
+        const wroteCode = successfulToolCalls.some((call) => TURN_WRITE_TOOLS.has(call.name));
         const decision = decideCompletion({
           pipelineOutcome,
           reconciledStatus,
           writeIntent,
+          wroteCode,
+          requirement: turnReq.requirement,
           repeated: repetitionVerdict.repeated,
           checkResult: result.checkResult,
         });

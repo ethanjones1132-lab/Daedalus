@@ -56,6 +56,68 @@ export interface BuildDetector {
 
 const CMAKE_BUILD_DIRS = ["build", "out", "cmake-build-debug", "cmake-build-release"];
 
+/**
+ * Visual Studio ships CMake but does not put it on PATH. Without these, a
+ * Windows C++ project ENOENTs the cmake detector and the whole build gate
+ * degrades to `not_applicable` → check_tier "none" (2026-08-05, Perihelion:
+ * a fully configured build/ still could not be checked).
+ */
+const VS_CMAKE_CANDIDATES = [
+  "C:\\Program Files\\Microsoft Visual Studio\\18\\Community",
+  "C:\\Program Files\\Microsoft Visual Studio\\18\\Professional",
+  "C:\\Program Files\\Microsoft Visual Studio\\18\\Enterprise",
+  "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community",
+  "C:\\Program Files\\Microsoft Visual Studio\\2022\\Professional",
+  "C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise",
+  "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\Community",
+  "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools",
+].map((base) =>
+  `${base}\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe`,
+);
+
+export interface ResolveExecutableEnv {
+  platform?: string;
+  /** Whether the bare command resolves on PATH. */
+  onPath?: (cmd: string) => boolean;
+  exists?: (p: string) => boolean;
+}
+
+function defaultOnPath(cmd: string): boolean {
+  const pathVar = process.env.PATH ?? "";
+  const exts = (process.env.PATHEXT ?? ".EXE;.CMD;.BAT").split(";").filter(Boolean);
+  for (const dir of pathVar.split(process.platform === "win32" ? ";" : ":")) {
+    if (!dir) continue;
+    if (existsSync(join(dir, cmd))) return true;
+    if (process.platform === "win32") {
+      for (const ext of exts) {
+        if (existsSync(join(dir, cmd + ext.toLowerCase()))) return true;
+        if (existsSync(join(dir, cmd + ext))) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Resolve a build command to something executable. Only rewrites `cmake` on
+ * win32, and only when it is absent from PATH; otherwise returns the bare
+ * command so an genuinely-missing toolchain still ENOENTs honestly.
+ */
+export function resolveBuildExecutable(
+  command: string,
+  env: ResolveExecutableEnv = {},
+): string {
+  const platform = env.platform ?? process.platform;
+  if (command !== "cmake" || platform !== "win32") return command;
+  const onPath = env.onPath ?? defaultOnPath;
+  if (onPath(command)) return command;
+  const exists = env.exists ?? existsSync;
+  for (const candidate of VS_CMAKE_CANDIDATES) {
+    if (exists(candidate)) return candidate;
+  }
+  return command;
+}
+
 export const PROJECT_DETECTORS: BuildDetector[] = [
   {
     id: "cargo",
@@ -148,8 +210,36 @@ const defaultExec: ExecFn = (cmd, args, cwd, timeoutMs) =>
       });
   });
 
-function tailDetail(r: ExecResult): string {
-  return (r.stderr || r.stdout || "").trim().split("\n").slice(-8).join("\n").slice(0, 400);
+/** Max characters of build failure detail carried forward to the model. */
+const FAILURE_DETAIL_CHARS = 2000;
+/** Max distinct error lines kept — enough to fix a batch, bounded for prompts. */
+const FAILURE_DETAIL_LINES = 25;
+
+const ERROR_LINE = /(^|\s)(error)\b|:\s*error[\s:]|\berror [A-Z]+\d+/i;
+
+/**
+ * Failure detail for a non-zero build.
+ *
+ * 2026-08-05: this took the last 8 lines of `stderr || stdout`. MSVC writes
+ * errors to stdout and warnings to stderr, so the `||` picked stderr and the
+ * detail became a trailing C4530 warning while the real
+ * "'isnan': is not a member of 'juce'" errors were dropped. Both streams are
+ * now searched, error lines win over position, and duplicates collapse.
+ */
+export function extractFailureDetail(r: ExecResult): string {
+  const combined = `${r.stdout ?? ""}\n${r.stderr ?? ""}`
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const errors: string[] = [];
+  for (const line of combined) {
+    if (!ERROR_LINE.test(line)) continue;
+    if (errors.includes(line)) continue;
+    errors.push(line);
+    if (errors.length >= FAILURE_DETAIL_LINES) break;
+  }
+  const chosen = errors.length > 0 ? errors : combined.slice(-8);
+  return chosen.join("\n").slice(0, FAILURE_DETAIL_CHARS);
 }
 
 function normalizeSep(p: string): string {
@@ -177,12 +267,14 @@ export async function runBuildCheck(input: RunBuildCheckInput): Promise<CheckOut
   for (const det of PROJECT_DETECTORS) {
     const cmd = det.detect(ctx);
     if (!cmd) continue;
-    const r = await exec(cmd.command, cmd.args, cmd.cwd, input.timeoutMs);
+    // Resolve before exec so a VS-bundled cmake is found even off PATH.
+    const executable = resolveBuildExecutable(cmd.command);
+    const r = await exec(executable, cmd.args, cmd.cwd, input.timeoutMs);
     if (r.enoent) continue;                                   // toolchain unavailable → try next
     const commandStr = `${cmd.command} ${cmd.args.join(" ")}`.trim();
     if (r.timedOut) return { kind: "not_applicable", reason: `${det.id} check timed out` };
     if (r.code === 0) return { kind: "clean", command: commandStr };
-    const detail = tailDetail(r);
+    const detail = extractFailureDetail(r);
     if (detail) return { kind: "failed", command: commandStr, detail };
     // nonzero with no diagnostic → cannot determine; try next detector
   }

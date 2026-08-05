@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { writtenPathsFrom, runBuildCheck, detectorFor, type ExecResult, type DetectInput } from "./build-check";
+import { writtenPathsFrom, runBuildCheck, detectorFor, resolveBuildExecutable, extractFailureDetail, type ExecResult, type DetectInput } from "./build-check";
 import type { ToolCallRecord } from "./stage-output";
 
 function call(name: string, path?: string, is_error = false): ToolCallRecord {
@@ -127,6 +127,103 @@ function files(...paths: string[]) {
   const s = new Set(paths.map((p) => p.replace(/\\/g, "/")));
   return (p: string) => s.has(p.replace(/\\/g, "/"));
 }
+
+/**
+ * 2026-08-05: the CMake detector emitted the bare command "cmake". On Windows
+ * with only a Visual Studio-bundled CMake, that ENOENTs and the whole C++ gate
+ * silently degrades to `not_applicable` → check_tier "none". The Perihelion
+ * build proved this: a configured build/ existed and the gate still could not
+ * run. Resolution falls back to known VS install locations.
+ */
+/**
+ * 2026-08-05: `tailDetail` took the last 8 lines of `stderr || stdout`. MSVC
+ * writes errors to stdout and warnings to stderr, so a real Perihelion build
+ * failure surfaced as a trailing C4530 *warning* and the actual
+ * "'isnan': is not a member of 'juce'" errors never reached the model. A
+ * failure detail that omits the failure is worse than none.
+ */
+describe("extractFailureDetail", () => {
+  test("prefers error lines over trailing warnings", () => {
+    const detail = extractFailureDetail({
+      code: 1,
+      enoent: false,
+      timedOut: false,
+      stdout: "PluginProcessor.cpp(486,24): error C2039: 'isnan': is not a member of 'juce'",
+      stderr: "ppltasks.h(1580,21): warning C4530: C++ exception handler used",
+    });
+    expect(detail).toContain("error C2039");
+    expect(detail).toContain("isnan");
+    expect(detail).not.toContain("C4530");
+  });
+
+  test("reads errors from stdout even when stderr is non-empty", () => {
+    const detail = extractFailureDetail({
+      code: 1,
+      enoent: false,
+      timedOut: false,
+      stdout: "foo.cpp(1,1): error C1234: broken",
+      stderr: "some unrelated chatter",
+    });
+    expect(detail).toContain("error C1234");
+  });
+
+  test("falls back to the tail when no line looks like an error", () => {
+    const detail = extractFailureDetail({
+      code: 1,
+      enoent: false,
+      timedOut: false,
+      stdout: "line one\nline two\nline three",
+      stderr: "",
+    });
+    expect(detail).toContain("line three");
+  });
+
+  test("is bounded", () => {
+    const many = Array.from({ length: 200 }, (_, i) => `f.cpp(${i},1): error C9999: boom ${i}`).join("\n");
+    const detail = extractFailureDetail({
+      code: 1, enoent: false, timedOut: false, stdout: many, stderr: "",
+    });
+    expect(detail.length).toBeLessThanOrEqual(2000);
+  });
+});
+
+describe("resolveBuildExecutable", () => {
+  test("returns the bare command when it is on PATH", () => {
+    expect(
+      resolveBuildExecutable("cmake", { platform: "win32", onPath: () => true, exists: () => false }),
+    ).toBe("cmake");
+  });
+
+  test("falls back to a Visual Studio-bundled cmake when PATH lacks it", () => {
+    const vsCmake =
+      "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe";
+    expect(
+      resolveBuildExecutable("cmake", {
+        platform: "win32",
+        onPath: () => false,
+        exists: (p) => p === vsCmake,
+      }),
+    ).toBe(vsCmake);
+  });
+
+  test("returns the bare command when no fallback exists (caller still ENOENTs honestly)", () => {
+    expect(
+      resolveBuildExecutable("cmake", { platform: "win32", onPath: () => false, exists: () => false }),
+    ).toBe("cmake");
+  });
+
+  test("never rewrites non-cmake commands", () => {
+    expect(
+      resolveBuildExecutable("cargo", { platform: "win32", onPath: () => false, exists: () => true }),
+    ).toBe("cargo");
+  });
+
+  test("is a no-op off win32", () => {
+    expect(
+      resolveBuildExecutable("cmake", { platform: "linux", onPath: () => false, exists: () => true }),
+    ).toBe("cmake");
+  });
+});
 
 describe("runBuildCheck", () => {
   test("clean build → clean outcome", async () => {

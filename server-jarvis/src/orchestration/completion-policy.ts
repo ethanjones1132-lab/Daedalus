@@ -9,6 +9,34 @@ export interface CompletionDecisionInput {
   writeIntent: boolean;
   repeated: boolean;
   checkResult?: CheckResult;
+  /**
+   * True when at least one write-effect tool call landed successfully this turn.
+   *
+   * 2026-08-05: verification used to hinge on `writeIntent` alone. That flag
+   * lives on the task-run contract, and a continuation that mints a fresh
+   * contract sets it false — so a turn that wrote 21 files to a JUCE plugin and
+   * never compiled fell through to `non_write_complete` and persisted as
+   * success with `check_tier="none"`. Landed writes are ground truth; a
+   * classification is not.
+   */
+  wroteCode?: boolean;
+  /**
+   * The turn's classified requirement. `full_execution` demands verification
+   * on its own, so a write turn whose contract flag was lost still fails
+   * closed rather than reporting success unverified.
+   */
+  requirement?: string;
+}
+
+/**
+ * Whether this turn must produce an authoritative check before it may persist
+ * as success. Any one of: the sticky contract flag, a landed write, or a
+ * full_execution requirement.
+ */
+export function requiresVerification(input: CompletionDecisionInput): boolean {
+  return input.writeIntent
+    || input.wroteCode === true
+    || input.requirement === "full_execution";
 }
 
 export interface CompletionDecision {
@@ -67,13 +95,14 @@ export function decideCompletion(input: CompletionDecisionInput): CompletionDeci
   if (input.reconciledStatus !== "completed") {
     return { taskStatus: input.reconciledStatus, runOutcome: "partial", reason: "task_plan_open" };
   }
-  if (input.writeIntent && input.checkResult?.passed === false) {
+  const mustVerify = requiresVerification(input);
+  if (mustVerify && input.checkResult?.passed === false) {
     return { taskStatus: "paused", runOutcome: "partial", reason: "verification_failed" };
   }
-  if (input.writeIntent && !isAuthoritativelyGreen(input.checkResult)) {
+  if (mustVerify && !isAuthoritativelyGreen(input.checkResult)) {
     return { taskStatus: "paused", runOutcome: "partial", reason: "write_unverified" };
   }
-  if (input.writeIntent) {
+  if (mustVerify) {
     return { taskStatus: "completed", runOutcome: "success", reason: "verified_complete" };
   }
   // pipelineOutcome is "success" here — failed/partial/degraded already returned.
