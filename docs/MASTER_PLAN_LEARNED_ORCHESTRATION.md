@@ -170,7 +170,27 @@ A and B can run in parallel. C depends on nothing but touches many files, so it 
 - Targeted suites (edit-contract, write-preflight, tool-heal, filesystem-bundle, edit-match, symbol-grounding) + full `src/orchestration/` suite — pass. `tsc --noEmit` clean.
 - Live `--live` measurement against the architecture arm is **pending** (not run in this session).
 
-### Still open
+### Still open (Phase A)
 
-- Phase C θ wiring for grounding / preflight constants.
 - Live fixture measurement of fabricated-API / no-match write rates after A1–A3.
+- Phase C θ wiring for grounding / preflight constants.
+
+---
+
+## Phase B1 status (2026-08-05)
+
+**Shipped**
+
+- Pure module `server-jarvis/src/orchestration/run-reward.ts`: `computeRunReward` returns a single scalar in `[0, 1]` from ground truth only:
+  - **writes** — credited paths from filesystem content deltas (`write_effects` preferred; tool-call success as weaker fallback). Optional `targetPaths` so non-target files (e.g. `NOTES.md`) do not score.
+  - **check** — `CheckResult` only (`tier` / `ran` / `passed`). **No reviewer term.** `tier: none` or `!ran` → check term 0 (B2 foundation: declining checks cannot be profitable).
+  - **plan** — `itemsVerified / itemsTotal` from objective acceptance counts; N/A when no plan items.
+  - N/A terms drop weight; remaining weights re-normalize. Deterministic / offline-replayable.
+- Unit tests: `run-reward.test.ts`.
+
+**Not yet (B2/B3 / wiring)**
+
+- **B2** full anti-gaming policy doc + hard zero when check declines on write turns (partially prepared: check term already 0 for `none`).
+- **B3** overclaim penalty (declared success + failed check).
+- Live path: record `computeRunReward` on `completeAgentRun` / conductor learning (optional next step).
+- Phase C θ for reward weights.
