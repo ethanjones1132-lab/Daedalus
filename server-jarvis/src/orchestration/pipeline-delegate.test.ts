@@ -2,7 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { defaultConfig } from "../config";
 import { createToolRuntime, makeExecutionContext } from "../tool-runtime";
 import type { ExecutorStageOutput } from "./stage-output";
-import { MAX_DELEGATE_LAUNCHES_PER_RUN, PipelineExecutor } from "./pipeline";
+import {
+  MAX_DELEGATE_LAUNCHES_PER_RUN,
+  PipelineExecutor,
+  shouldBenchDelegateForRun,
+} from "./pipeline";
 import { runPipelineWithReplanning } from "./replan-loop";
 import { Coordinator, type CoordinatorResult } from "./coordinator";
 import { SessionOutcomeCollector, SelfTuningStore } from "../self-tuning/mod";
@@ -1810,3 +1814,19 @@ describe("executor delegate pipeline integration", () => {
     expect(delegateCalls).toBe(1);
   });
 });
+
+describe("delegate benching distinguishes infrastructure from capability", () => {
+  test("a pre-launch snapshot failure does not bench the delegate for the run", () => {
+    expect(shouldBenchDelegateForRun("delegate_snapshot_error")).toBe(false);
+    expect(shouldBenchDelegateForRun("delegate_integration_error")).toBe(false);
+    expect(shouldBenchDelegateForRun("delegate_aborted")).toBe(false);
+    expect(shouldBenchDelegateForRun("delegate_no_events")).toBe(false);
+  });
+
+  test("a model that ran and produced no write is still benched", () => {
+    expect(shouldBenchDelegateForRun("delegate_no_write")).toBe(true);
+    expect(shouldBenchDelegateForRun("mid_loop_handoff")).toBe(true);
+    expect(shouldBenchDelegateForRun(undefined)).toBe(true);
+  });
+});
+

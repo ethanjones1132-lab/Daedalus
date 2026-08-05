@@ -632,6 +632,28 @@ export const SYNTHESIS_RUNWAY_MS = 30_000;
 export const MAX_DELEGATE_LAUNCHES_PER_RUN = 4;
 
 /**
+ * Error codes that describe the RUNTIME failing before or around the model,
+ * not the model failing to write. Benching on these punishes a capable model
+ * for a crash it never saw (2026-08-05: delegate_snapshot_error benched
+ * minimax-m3 for four subsequent attempts in run_6e924106).
+ */
+const DELEGATE_INFRASTRUCTURE_FAILURES = new Set([
+  "delegate_snapshot_error",
+  "delegate_integration_error",
+  "delegate_aborted",
+  "delegate_no_events",
+]);
+
+/**
+ * Whether a non-write delegate outcome should bench re-entry for the rest of
+ * the run (`delegateNoWriteRuns`). Infrastructure failures leave the model
+ * eligible; capability failures (no write, mid_loop_handoff, …) still bench.
+ */
+export function shouldBenchDelegateForRun(errorCode: string | undefined): boolean {
+  return !(errorCode && DELEGATE_INFRASTRUCTURE_FAILURES.has(errorCode));
+}
+
+/**
  * True when the segment loop should stop starting non-synthesizer stages and
  * jump to synthesis: a synthesizer is queued, there is evidence worth
  * synthesizing, and the remaining turn budget is inside the danger zone
@@ -2591,9 +2613,6 @@ export class PipelineExecutor {
       const hasVerifiedWrite = delegated.toolCalls.some(
         (call) => WRITE_EFFECT_TOOLS.has(call.name) && !call.is_error,
       );
-      // Gate future re-entry for this run on whether the delegate actually
-      // produced something (see delegateNoWriteRuns).
-      if (!hasVerifiedWrite) this.delegateNoWriteRuns.add(agentRunId);
       // Filesystem evidence is ground truth. If a delegate mutates the
       // workspace and only then times out/cancels, falling back to native can
       // duplicate a non-idempotent write. A verified write therefore closes
@@ -2612,6 +2631,12 @@ export class PipelineExecutor {
             ? "mid_loop_handoff"
           : delegated.errorCode
           ?? (cancelled ? "delegate_aborted" : hasVerifiedWrite ? undefined : "delegate_no_write");
+      // Gate future re-entry for this run on whether the delegate actually
+      // produced something (see delegateNoWriteRuns). Infrastructure failures
+      // (snapshot/integration/abort/no_events) do not bench a capable model.
+      if (!hasVerifiedWrite && shouldBenchDelegateForRun(downgradeCode ?? delegated.errorCode)) {
+        this.delegateNoWriteRuns.add(agentRunId);
+      }
       // Write scoreboard is model-capability evidence only. Abort/cancel/
       // integration/handoff before real model work must not bench a model.
       if (
