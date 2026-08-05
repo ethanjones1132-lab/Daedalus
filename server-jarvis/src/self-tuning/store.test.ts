@@ -1,6 +1,49 @@
 import { describe, expect, test } from "bun:test";
 import { SelfTuningStore } from "./store";
 
+describe("model_attributions carry a stage_run_id", () => {
+  test("attribution links to exactly one stage row", () => {
+    const store = new SelfTuningStore(":memory:");
+    store.insertAgentRun({
+      id: "run_1",
+      session_id: "sess_1",
+      user_request: "req",
+      task_type: "refactor",
+      pipeline: JSON.stringify(["executor"]),
+      completed: 0,
+    });
+    const stageId = "stage_abc";
+    store.insertStageRun({
+      id: stageId,
+      agent_run_id: "run_1",
+      mode_id: "executor",
+      turn_number: 1,
+      input_tokens: 10,
+      output_tokens: 10,
+      tool_calls_json: "[]",
+      duration_ms: 100,
+      was_successful: 1,
+      had_error: 0,
+    });
+    store.insertModelAttribution({
+      id: "attr_1",
+      agent_run_id: "run_1",
+      stage_id: "executor",
+      stage_run_id: stageId,
+      agent_id: "a",
+      provider: "openrouter",
+      model_id: "m",
+      was_successful: 1,
+      had_error: 0,
+      duration_ms: 100,
+      fallback_used: 0,
+    });
+    const rows = store.getModelAttributions("run_1");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.stage_run_id).toBe(stageId);
+  });
+});
+
 describe("SelfTuningStore recent stage attributions", () => {
   test("returns newest-first rows for a stage since a cutoff and respects the limit", () => {
     const store = new SelfTuningStore(":memory:");

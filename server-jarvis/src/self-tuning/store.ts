@@ -176,6 +176,12 @@ export interface ModelAttribution {
   id: string;
   agent_run_id: string;
   stage_id: string;
+  /**
+   * Optional FK-style link to the specific `stage_runs.id` row this attribution
+   * describes. `stage_id` is a stage *name* ("executor"); without this column
+   * joins fan out across every turn of that stage in the run.
+   */
+  stage_run_id?: string | null;
   agent_id?: string;
   provider: string;
   model_id: string;
@@ -428,6 +434,7 @@ const SELF_TUNING_SCHEMA = `
     id TEXT PRIMARY KEY,
     agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
     stage_id TEXT NOT NULL,
+    stage_run_id TEXT,
     agent_id TEXT,
     provider TEXT NOT NULL,
     model_id TEXT NOT NULL,
@@ -440,6 +447,7 @@ const SELF_TUNING_SCHEMA = `
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   );
   CREATE INDEX IF NOT EXISTS idx_model_attributions_agent_run_id ON model_attributions(agent_run_id);
+  CREATE INDEX IF NOT EXISTS idx_model_attributions_stage_run_id ON model_attributions(stage_run_id);
   CREATE TABLE IF NOT EXISTS trajectory_snapshots (
     id TEXT PRIMARY KEY,
     agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
@@ -598,6 +606,12 @@ export class SelfTuningStore {
         try {
           db.exec(`ALTER TABLE model_attributions ADD COLUMN escalation_id TEXT`);
         } catch { /* column already exists */ }
+        // Theme 1 / Task 1: join attributions to the exact stage_runs row.
+        try {
+          db.exec(`ALTER TABLE model_attributions ADD COLUMN stage_run_id TEXT`);
+        } catch { /* column already exists */ }
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_model_attributions_stage_run_id
+                 ON model_attributions(stage_run_id)`);
         try {
           db.exec(`ALTER TABLE conductor_directives ADD COLUMN decision_source TEXT`);
         } catch { /* column already exists */ }
@@ -1120,12 +1134,13 @@ export class SelfTuningStore {
     if (!db) return;
     try {
       db.prepare(
-        `INSERT INTO model_attributions (id, agent_run_id, stage_id, agent_id, provider, model_id, was_successful, had_error, duration_ms, first_token_ms, fallback_used, escalation_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO model_attributions (id, agent_run_id, stage_id, stage_run_id, agent_id, provider, model_id, was_successful, had_error, duration_ms, first_token_ms, fallback_used, escalation_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         row.id,
         row.agent_run_id,
         row.stage_id,
+        row.stage_run_id ?? null,
         row.agent_id ?? null,
         row.provider,
         row.model_id,

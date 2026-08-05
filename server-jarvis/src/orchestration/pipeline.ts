@@ -188,6 +188,8 @@ export interface StageRunRecorder {
     id: string;
     agent_run_id: string;
     stage_id: string;
+    /** Links to the paired stage_runs.id when one exists. */
+    stage_run_id?: string | null;
     agent_id?: string;
     provider: string;
     model_id: string;
@@ -2669,6 +2671,7 @@ export class PipelineExecutor {
         id: `attr_${crypto.randomUUID()}`,
         agent_run_id: agentRunId,
         stage_id: "executor",
+        stage_run_id: stageId,
         agent_id: "claude_delegate",
         provider: "claude_cli",
         model_id: modelSelection.model
