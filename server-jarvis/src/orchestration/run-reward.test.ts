@@ -10,6 +10,7 @@ import {
   writeEvidenceFromEffects,
   writeEvidenceFromToolCalls,
 } from "./run-reward";
+import { runWithTheta } from "./orchestration-policy";
 import type { WriteEffectObservation } from "./content-fingerprint";
 
 function effect(path: string, changed: boolean): WriteEffectObservation {
@@ -23,6 +24,25 @@ function effect(path: string, changed: boolean): WriteEffectObservation {
 }
 
 describe("computeRunReward B1 composition", () => {
+  test("the orchestration policy cannot change its own reward objective", () => {
+    const input = {
+      writes: { changedPaths: ["src/a.ts"], writeRequired: true },
+      check: { tier: "existing" as const, ran: true, passed: false },
+      plan: { itemsTotal: 1, itemsVerified: 0 },
+      declaredOutcome: "success" as const,
+    };
+
+    const baseline = computeRunReward(input);
+    const underCandidate = runWithTheta(
+      { force_write_nudge_cap: 99, policy_canary_traffic_fraction: 1 },
+      () => computeRunReward(input),
+    );
+
+    expect(underCandidate).toEqual(baseline);
+    expect(underCandidate.weights).toEqual({ writes: 1 / 3, check: 1 / 3, plan: 1 / 3 });
+    expect(underCandidate.overclaimPenalty).toBe(OVERCLAIM_PENALTY);
+  });
+
   test("full success: target write + independent check + plan", () => {
     const r = computeRunReward({
       writes: {

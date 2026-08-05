@@ -90,13 +90,14 @@ Every threshold shipped this week was a human reading the evidence store and pic
 ### Phase C status (2026-08-05) — **complete (C1–C3)**
 
 **C1 — θ defined.** `server-jarvis/src/orchestration/orchestration-policy.ts`:
-- `OrchestrationTheta` + `THETA_KEYS` (~50 dimensions): write pressure, directives, stage budgets, model health, delegate, grounding, context, reward, policy-staging traffic.
+- `OrchestrationTheta` + `THETA_KEYS` (~46 dimensions): write pressure, directives, stage budgets, model health, delegate, grounding, context, policy-staging traffic.
+- **Phase B reward is not in θ** — weights and overclaim penalty are evaluator-owned (`RUN_REWARD_POLICY`); Phase D treats them as immutable fitness.
 - `BASELINE_THETA` pins today's shipped values (exit criterion: baseline ≡ prior constants).
 - Dense vector: `thetaToVector` / `vectorToTheta` for CMA-ES.
 
 **C2 — Policy object.**
 - `policy()` / `runWithTheta` / `setGlobalTheta` / `applyThetaPatchGlobally` (ALS + global).
-- Decision sites read `policy().…` for: force-write nudge cap, directive budget, no-tool demotion, error-rate bench, local stage window, thrash threshold, failed-write attempts, delegate launch cap, synthesis runway, grounding caps, reward weights/overclaim, canary traffic fraction.
+- Decision sites read `policy().…` for: force-write nudge cap, directive budget, no-tool demotion, error-rate bench, local stage window, thrash threshold, failed-write attempts, delegate launch cap, synthesis runway, grounding caps, canary traffic fraction.
 - Exported module constants remain baseline aliases for tests/docs.
 - `PolicySnapshot.theta` + `PolicyPatch.theta` merge through `policy-staging`; promote applies θ globally; canary overlay uses `runWithTheta` inside `runWithPolicyOverlay`.
 

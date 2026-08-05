@@ -6,6 +6,13 @@
 
 ---
 
+## Evaluator ownership
+
+The scalar objective is evaluator-owned configuration, not agent policy. Its
+three weights and overclaim penalty are fixed by `RUN_REWARD_POLICY`, excluded
+from `OrchestrationTheta`, and not accepted from stored run snapshots. A policy
+candidate can change behavior, but cannot change how that behavior is scored.
+
 ## What is optimized
 
 ```

@@ -75,11 +75,8 @@ export interface OrchestrationTheta {
   executor_transcript_budget_tokens: number;
   write_turn_transcript_budget_tokens: number;
 
-  // ── Reward (Phase B) ────────────────────────────────────────────────────
-  reward_weight_writes: number;
-  reward_weight_check: number;
-  reward_weight_plan: number;
-  overclaim_penalty: number;
+  // Reward weights / overclaim penalty are evaluator-owned (Phase B) and
+  // deliberately excluded from θ so Phase D cannot optimize its own fitness.
 
   // ── Misc ────────────────────────────────────────────────────────────────
   repetition_similarity_threshold: number;
@@ -135,10 +132,6 @@ export const THETA_KEYS: readonly (keyof OrchestrationTheta)[] = [
   "write_turn_tool_result_context_chars",
   "executor_transcript_budget_tokens",
   "write_turn_transcript_budget_tokens",
-  "reward_weight_writes",
-  "reward_weight_check",
-  "reward_weight_plan",
-  "overclaim_penalty",
   "repetition_similarity_threshold",
   "policy_canary_traffic_fraction",
   "policy_min_canary_success_rate",
@@ -199,11 +192,6 @@ export const BASELINE_THETA: OrchestrationTheta = {
   write_turn_tool_result_context_chars: 24_000,
   executor_transcript_budget_tokens: 12_000,
   write_turn_transcript_budget_tokens: 24_000,
-
-  reward_weight_writes: 1,
-  reward_weight_check: 1,
-  reward_weight_plan: 1,
-  overclaim_penalty: 0.5,
 
   repetition_similarity_threshold: 0.25,
 

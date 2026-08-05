@@ -30,22 +30,32 @@ import {
   isStatusOrLogDocPath,
   pathInTargetSet,
 } from "./effect-gate";
-import { BASELINE_THETA, policy } from "./orchestration-policy";
-
 export interface RunRewardWeights {
   writes: number;
   check: number;
   plan: number;
 }
 
+/**
+ * Evaluator-owned reward configuration. Immutable fitness for Phase D —
+ * deliberately NOT part of OrchestrationTheta (a policy must not score itself).
+ */
+export interface RunRewardPolicy {
+  weights: Readonly<RunRewardWeights>;
+  overclaimPenalty: number;
+}
+
+export const RUN_REWARD_POLICY: Readonly<RunRewardPolicy> = Object.freeze({
+  weights: Object.freeze({ writes: 1, check: 1, plan: 1 }),
+  overclaimPenalty: 0.5,
+});
+
 export const DEFAULT_RUN_REWARD_WEIGHTS: RunRewardWeights = {
-  writes: BASELINE_THETA.reward_weight_writes,
-  check: BASELINE_THETA.reward_weight_check,
-  plan: BASELINE_THETA.reward_weight_plan,
+  ...RUN_REWARD_POLICY.weights,
 };
 
 /** B3: subtracted when outcome claims success without a passing independent check. */
-export const OVERCLAIM_PENALTY = BASELINE_THETA.overclaim_penalty;
+export const OVERCLAIM_PENALTY = RUN_REWARD_POLICY.overclaimPenalty;
 
 /** Check tiers that count as an independent oracle (not runtime-authored). */
 export const INDEPENDENT_CHECK_TIERS: ReadonlySet<CheckTier> = new Set([
@@ -80,7 +90,6 @@ export interface RunRewardInput {
    * Used only for B3 overclaim detection — never as a positive reward term.
    */
   declaredOutcome?: DeclaredRunOutcome | null;
-  weights?: Partial<RunRewardWeights>;
   /** When false, skip B2 hard-zero on declined check (tests / ablations). Default true. */
   antiGaming?: boolean;
   /** When false, skip B3 overclaim penalty. Default true. */
@@ -115,7 +124,7 @@ export interface StoredRunRewardSnapshot {
   check: Pick<CheckResult, "tier" | "ran" | "passed"> | null;
   plan?: RunRewardPlanEvidence | null;
   declaredOutcome?: DeclaredRunOutcome | null;
-  weights?: Partial<RunRewardWeights>;
+  // Legacy snapshots may include a `weights` property; parsers ignore it.
 }
 
 const WRITE_TOOL_NAMES = new Set(["write_file", "edit_file", "multi_edit", "apply_patch"]);
@@ -292,12 +301,8 @@ export function computeRunReward(input: RunRewardInput): RunRewardBreakdown {
   const antiGaming = input.antiGaming !== false;
   const calibration = input.calibration !== false;
 
-  const pθ = policy();
-  const baseWeights: RunRewardWeights = {
-    writes: input.weights?.writes ?? pθ.reward_weight_writes,
-    check: input.weights?.check ?? pθ.reward_weight_check,
-    plan: input.weights?.plan ?? pθ.reward_weight_plan,
-  };
+  // Fixed evaluator objective — never read OrchestrationTheta / policy().
+  const baseWeights: RunRewardWeights = { ...RUN_REWARD_POLICY.weights };
 
   const w = computeWriteTerm(input.writes);
   const c = computeCheckTerm(input.check);
@@ -342,7 +347,7 @@ export function computeRunReward(input: RunRewardInput): RunRewardBreakdown {
     calibration
     && declared === "success"
     && !c.independentPass;
-  const penalty = pθ.overclaim_penalty;
+  const penalty = RUN_REWARD_POLICY.overclaimPenalty;
   const overclaimPenalty = overclaim ? penalty : 0;
   let score = baseScore;
   if (overclaim) {
@@ -396,7 +401,6 @@ export function computeRunRewardFromStored(
     check: snapshot.check,
     plan: snapshot.plan,
     declaredOutcome: snapshot.declaredOutcome,
-    weights: snapshot.weights,
   });
 }
 
@@ -407,7 +411,6 @@ export function computeRunRewardFromEffects(input: {
   targetPaths?: string[];
   writeRequired: boolean;
   declaredOutcome?: DeclaredRunOutcome | null;
-  weights?: Partial<RunRewardWeights>;
 }): RunRewardBreakdown {
   return computeRunReward({
     writes: writeEvidenceFromEffects(input.effects, {
@@ -417,7 +420,6 @@ export function computeRunRewardFromEffects(input: {
     check: input.check,
     plan: input.plan,
     declaredOutcome: input.declaredOutcome,
-    weights: input.weights,
   });
 }
 
@@ -436,7 +438,6 @@ export function buildStoredRunRewardSnapshot(input: {
   check: RunRewardInput["check"];
   plan?: RunRewardPlanEvidence | null;
   declaredOutcome?: DeclaredRunOutcome | null;
-  weights?: Partial<RunRewardWeights>;
 }): StoredRunRewardSnapshot {
   const writes =
     input.effects && input.effects.length > 0
@@ -455,7 +456,6 @@ export function buildStoredRunRewardSnapshot(input: {
     check: input.check,
     plan: input.plan ?? null,
     declaredOutcome: input.declaredOutcome ?? null,
-    weights: input.weights,
   };
 }
 

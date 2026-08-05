@@ -48,8 +48,27 @@ describe("OrchestrationTheta (Phase C)", () => {
     expect(BASELINE_THETA.max_delegate_launches_per_run).toBe(4);
     expect(BASELINE_THETA.default_free_thrash_threshold).toBe(2);
     expect(BASELINE_THETA.max_grounding_symbols).toBe(8);
-    expect(BASELINE_THETA.overclaim_penalty).toBe(0.5);
     expect(BASELINE_THETA.deep_read_min_content_reads).toBe(3);
+  });
+
+  test("reward-objective keys are not optimizable theta dimensions", () => {
+    expect(THETA_KEYS).not.toContain("reward_weight_writes" as never);
+    expect(THETA_KEYS).not.toContain("reward_weight_check" as never);
+    expect(THETA_KEYS).not.toContain("reward_weight_plan" as never);
+    expect(THETA_KEYS).not.toContain("overclaim_penalty" as never);
+  });
+
+  test("legacy serialized reward keys do not enter theta", () => {
+    const parsed = parseTheta(JSON.stringify({
+      force_write_nudge_cap: 4,
+      reward_weight_writes: 100,
+      reward_weight_check: 0,
+      reward_weight_plan: 0,
+      overclaim_penalty: 0,
+    }));
+    expect(parsed.force_write_nudge_cap).toBe(4);
+    expect(Object.prototype.hasOwnProperty.call(parsed, "reward_weight_writes")).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(parsed, "overclaim_penalty")).toBe(false);
   });
 
   test("policy() defaults to baseline", () => {
