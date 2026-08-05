@@ -929,3 +929,36 @@ describe("force-write nudge cap engages on every force_write decision", () => {
     expect(FORCE_WRITE_NUDGE_CAP).toBe(2);
   });
 });
+
+describe("read-spiral force_write is capped and tagged (A1)", () => {
+  const spiral = (forceWriteNudgesSent: number) => ({
+    writeIntent: true,
+    successfulWrites: 0,
+    failedWriteAttempts: 0,
+    distinctSuccessfulReads: 9,
+    toolCallsEmitted: true,
+    turnCount: 3,
+    maxTurns: 12,
+    stageRemainingMs: 90_000,
+    forceWriteNudgesSent,
+  });
+
+  test("read-spiral force_write carries noteKind so the host counter advances", () => {
+    const d = decideMidLoopIntervention(spiral(0) as any);
+    expect(d.kind).toBe("force_write");
+    expect(d.noteKind).toBe("force_write");
+  });
+
+  test("read-spiral stops firing at the cap", () => {
+    expect(decideMidLoopIntervention(spiral(FORCE_WRITE_NUDGE_CAP) as any).kind)
+      .not.toBe("force_write");
+  });
+
+  test("the escalated wording is reachable once the counter advances", () => {
+    const first = decideMidLoopIntervention(spiral(0) as any);
+    const second = decideMidLoopIntervention(spiral(1) as any);
+    expect("note" in first && "note" in second).toBe(true);
+    expect((first as { note: string }).note)
+      .not.toBe((second as { note: string }).note);
+  });
+});
