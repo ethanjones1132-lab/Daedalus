@@ -171,8 +171,9 @@ A and B can run in parallel. C depends on nothing but touches many files, so it 
 
 ### A1 — Symbol grounding — **shipped**
 
-- Pure module `server-jarvis/src/orchestration/symbol-grounding.ts`: local identifier extraction (backticks, `a::b` / `a.b.c`, CamelCase, `name(`), stoplist + 8-cap, content-mode grep orchestration with dep-dir miss pass, and `[Runtime grounding: symbol table]` formatting (found hits as `path:line`; missing symbols get an explicit NOT FOUND anti-fabrication line; block budget ~4000 chars).
-- Pipeline hook in `runExecutorStage`: on write turns (`requiresWriteEffect`), runs before `delegate_first` so both native `executorMessages` and the Claude delegate prompt receive the same table. Greps go through `runToolCall` (sandbox + `toolCalls` evidence). Compact summary lands in executor `diagnostic_json` (`grounding_symbols_*`). Missing symbols feed A3 via `groundingMissingSymbols`.
+- Pure module `server-jarvis/src/orchestration/symbol-grounding.ts`: local identifier extraction (backticks, `a::b` / `a.b.c`, CamelCase, `name(`), stoplist + 8-cap, content-mode grep orchestration with dep-dir miss pass, and `[Runtime grounding: symbol table]` formatting.
+- **Tri-state evidence:** `found` | `missing` | `indeterminate`. `NOT FOUND` requires a successful exhaustive search. Tool errors, exceptions, and budget exhaustion are `SEARCH INDETERMINATE` and **cannot** populate the fabricated-symbol deny-set.
+- Pipeline hook in `runExecutorStage`: on write turns (`requiresWriteEffect`), runs before `delegate_first` so both native `executorMessages` and the Claude delegate prompt receive the same table. Greps go through `runToolCall` (sandbox + `toolCalls` evidence). Only `status === "missing"` feeds A3 via `groundingMissingSymbols`.
 - Unit tests: `symbol-grounding.test.ts`. Tier-2B category **E** bait fixture: `clamp_with_lib` in `scripts/benchmark-tier2b/tasks.py`.
 
 ### A2 — Exact-text edit contract — **shipped**

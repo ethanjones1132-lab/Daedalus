@@ -58,7 +58,7 @@ describe("formatGroundingBlock", () => {
     const results: SymbolGroundingResult[] = [
       {
         symbol: "clampValue",
-        found: true,
+        status: "found",
         hits: [
           { path: "lib/math.ts", line: 12, text: "export function clampValue(x: number, lo: number, hi: number)" },
         ],
@@ -72,18 +72,27 @@ describe("formatGroundingBlock", () => {
 
   test("missing symbols render NOT FOUND anti-fabrication line", () => {
     const results: SymbolGroundingResult[] = [
-      { symbol: "juce::isnan", found: false, hits: [] },
+      { symbol: "juce::isnan", status: "missing", hits: [] },
     ];
     const block = formatGroundingBlock(results);
     expect(block).toContain("juce::isnan: NOT FOUND in project source");
     expect(block).toContain("do not reference juce::isnan");
   });
 
+  test("indeterminate symbols render SEARCH INDETERMINATE", () => {
+    const results: SymbolGroundingResult[] = [
+      { symbol: "RealExistingApi", status: "indeterminate", hits: [], errors: ["permission denied"] },
+    ];
+    const block = formatGroundingBlock(results);
+    expect(block).toContain("SEARCH INDETERMINATE");
+    expect(block).not.toContain("NOT FOUND");
+  });
+
   test("budget cap truncates oversized blocks", () => {
     const longLine = "x".repeat(800);
     const results: SymbolGroundingResult[] = Array.from({ length: 8 }, (_, i) => ({
       symbol: `VeryLongSymbolName${i}Type`,
-      found: true,
+      status: "found" as const,
       hits: [
         { path: `src/mod${i}.ts`, line: 1, text: longLine },
         { path: `src/mod${i}.ts`, line: 2, text: longLine },
@@ -191,16 +200,59 @@ describe("collectSymbolGrounding orchestration", () => {
     });
 
     const bySymbol = Object.fromEntries(results.map((r) => [r.symbol, r]));
-    expect(bySymbol["clampValue"]?.found).toBe(true);
+    expect(bySymbol["clampValue"]?.status).toBe("found");
     expect(bySymbol["clampValue"]?.hits.length).toBeGreaterThan(0);
-    expect(bySymbol["juce::isnan"]?.found).toBe(false);
-    expect(bySymbol["realFastClamp"]?.found).toBe(true);
+    expect(bySymbol["juce::isnan"]?.status).toBe("missing");
+    expect(bySymbol["realFastClamp"]?.status).toBe("found");
     expect(summary.symbols_searched).toBe(3);
     expect(summary.symbols_found).toBe(2);
+    expect(summary.symbols_missing).toBe(1);
+    expect(summary.symbols_indeterminate).toBe(0);
 
     const block = formatGroundingBlock(results);
     expect(block).toContain("clampValue:");
     expect(block).toContain("juce::isnan: NOT FOUND");
     expect(block).toContain("realFastClamp:");
+  });
+
+  test("grep errors produce indeterminate evidence, not a confirmed miss", async () => {
+    const { results, summary } = await collectSymbolGrounding({
+      symbols: ["RealExistingApi"],
+      searchRoot: "C:/workspace",
+      rootEntries: [],
+      grep: async () => ({ output: "permission denied", is_error: true }),
+    });
+
+    expect(results[0]?.status).toBe("indeterminate");
+    expect(results[0]?.errors).toContain("permission denied");
+    expect(summary.symbols_missing).toBe(0);
+    expect(summary.symbols_indeterminate).toBe(1);
+    expect(formatGroundingBlock(results)).toContain("SEARCH INDETERMINATE");
+  });
+
+  test("a successful exhaustive no-match is a confirmed miss", async () => {
+    const { results, summary } = await collectSymbolGrounding({
+      symbols: ["AbsentApi"],
+      searchRoot: "C:/workspace",
+      rootEntries: [],
+      grep: async () => ({ output: "No matches found", is_error: false }),
+    });
+
+    expect(results[0]?.status).toBe("missing");
+    expect(summary.symbols_missing).toBe(1);
+    expect(summary.symbols_indeterminate).toBe(0);
+  });
+
+  test("search-budget exhaustion is indeterminate", async () => {
+    const { results } = await collectSymbolGrounding({
+      symbols: ["FirstApi", "SecondApi"],
+      searchRoot: "C:/workspace",
+      rootEntries: [],
+      maxGreps: 1,
+      grep: async () => ({ output: "No matches found", is_error: false }),
+    });
+
+    expect(results[0]?.status).toBe("missing");
+    expect(results[1]?.status).toBe("indeterminate");
   });
 });

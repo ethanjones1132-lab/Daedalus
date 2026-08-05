@@ -66,18 +66,28 @@ export interface SymbolGroundingHit {
   text: string;
 }
 
+/** Tri-state evidence: only `missing` may populate the fabricated-symbol deny-set. */
+export type SymbolGroundingStatus = "found" | "missing" | "indeterminate";
+
 export interface SymbolGroundingResult {
   symbol: string;
-  found: boolean;
+  status: SymbolGroundingStatus;
   hits: SymbolGroundingHit[];
+  errors?: string[];
 }
 
 export interface SymbolGroundingSummary {
   symbols_searched: number;
   symbols_found: number;
   symbols_missing: number;
+  symbols_indeterminate: number;
   greps_used: number;
 }
+
+type GroundingSearchAttempt =
+  | { status: "ok"; hits: SymbolGroundingHit[] }
+  | { status: "error"; reason: string }
+  | { status: "budget_exhausted" };
 
 export type GroundingGrepFn = (args: {
   pattern: string;
@@ -224,8 +234,9 @@ export function parseGrepContentHits(output: string, fallbackPath = ""): SymbolG
 }
 
 /**
- * Render the injected grounding block. Missing symbols get an explicit
- * anti-fabrication statement — that is the point of A1.
+ * Render the injected grounding block.
+ * Confirmed misses get NOT FOUND; search failures are SEARCH INDETERMINATE
+ * (never proof of absence).
  */
 export function formatGroundingBlock(results: SymbolGroundingResult[]): string {
   if (results.length === 0) {
@@ -238,12 +249,17 @@ export function formatGroundingBlock(results: SymbolGroundingResult[]): string {
   ];
 
   for (const result of results) {
-    if (result.found && result.hits.length > 0) {
+    if (result.status === "found" && result.hits.length > 0) {
       lines.push(`${result.symbol}:`);
       for (const hit of result.hits.slice(0, policy().grounding_grep_head_limit)) {
         const declaration = hit.text.trim().slice(0, 200);
         lines.push(`  ${hit.path}:${hit.line}: ${declaration}`);
       }
+    } else if (result.status === "indeterminate") {
+      lines.push(
+        `${result.symbol}: SEARCH INDETERMINATE — runtime grep failed; do not treat this as proof of absence. ` +
+          `Read or search the relevant source before relying on it.`,
+      );
     } else {
       lines.push(
         `${result.symbol}: NOT FOUND in project source — do not reference ${result.symbol}; ` +
@@ -260,6 +276,7 @@ export function formatGroundingBlock(results: SymbolGroundingResult[]): string {
 /**
  * Orchestrate greps: primary pass at root, miss pass into dep dirs.
  * Injectable `grep` keeps this unit-testable without the pipeline.
+ * Errors and budget exhaustion yield `indeterminate`, never a confirmed miss.
  */
 export async function collectSymbolGrounding(options: {
   symbols: string[];
@@ -275,6 +292,9 @@ export async function collectSymbolGrounding(options: {
   const maxGreps = options.maxGreps ?? policy().max_grounding_greps;
   const headLimit = options.headLimit ?? policy().grounding_grep_head_limit;
   const symbols = options.symbols.slice(0, maxSymbols);
+  // When `rootEntries` is supplied (even empty), only listed dep dirs are searched.
+  // When omitted, try all DEP_DIR_CANDIDATES (errors on present dirs → indeterminate).
+  const rootEntriesSupplied = options.rootEntries !== undefined;
   const rootEntries = new Set(
     (options.rootEntries ?? []).map((e) => e.replace(/[\\/]+$/, "")),
   );
@@ -282,8 +302,8 @@ export async function collectSymbolGrounding(options: {
   let grepsUsed = 0;
   const results: SymbolGroundingResult[] = [];
 
-  const runGrep = async (symbol: string, path: string): Promise<SymbolGroundingHit[]> => {
-    if (grepsUsed >= maxGreps) return [];
+  const runGrep = async (symbol: string, path: string): Promise<GroundingSearchAttempt> => {
+    if (grepsUsed >= maxGreps) return { status: "budget_exhausted" };
     grepsUsed += 1;
     try {
       const res = await options.grep({
@@ -291,59 +311,145 @@ export async function collectSymbolGrounding(options: {
         path,
         headLimit,
       });
-      if (res.is_error) return [];
-      return parseGrepContentHits(res.output, path).slice(0, headLimit);
-    } catch {
-      return [];
+      if (res.is_error) {
+        return {
+          status: "error",
+          reason: res.output.trim() || `grep failed at ${path}`,
+        };
+      }
+      return {
+        status: "ok",
+        hits: parseGrepContentHits(res.output, path).slice(0, headLimit),
+      };
+    } catch (error) {
+      return {
+        status: "error",
+        reason: error instanceof Error ? error.message : String(error),
+      };
     }
   };
 
-  const missing: string[] = [];
+  type PendingMiss = { symbol: string; errors: string[] };
+  const pendingMiss: PendingMiss[] = [];
 
   for (const symbol of symbols) {
-    const hits = await runGrep(symbol, options.searchRoot);
-    if (hits.length > 0) {
-      results.push({ symbol, found: true, hits });
-    } else {
-      missing.push(symbol);
-      results.push({ symbol, found: false, hits: [] });
+    const attempt = await runGrep(symbol, options.searchRoot);
+    if (attempt.status === "ok" && attempt.hits.length > 0) {
+      results.push({ symbol, status: "found", hits: attempt.hits });
+      continue;
     }
+    if (attempt.status === "budget_exhausted") {
+      results.push({
+        symbol,
+        status: "indeterminate",
+        hits: [],
+        errors: ["search budget exhausted"],
+      });
+      continue;
+    }
+    if (attempt.status === "error") {
+      results.push({
+        symbol,
+        status: "indeterminate",
+        hits: [],
+        errors: [attempt.reason],
+      });
+      continue;
+    }
+    // Successful exhaustive zero hits at root — candidate for miss pass.
+    pendingMiss.push({ symbol, errors: [] });
+    results.push({ symbol, status: "missing", hits: [] });
   }
 
   // Miss pass: search dep dirs that exist at root (handleGrep skips node_modules
   // on recursive walk, so JS deps need an explicit path).
-  if (missing.length > 0) {
+  if (pendingMiss.length > 0) {
     const depDirs = DEP_DIR_CANDIDATES.filter((d) => {
-      if (rootEntries.size === 0) return true; // try; failures tolerated
+      if (!rootEntriesSupplied) return true;
       return rootEntries.has(d);
     });
 
-    for (const symbol of missing) {
-      if (grepsUsed >= maxGreps) break;
+    // No dep dirs scheduled → successful root no-matches stay confirmed missing.
+    if (depDirs.length === 0) {
+      // leave pending results as status "missing"
+    } else for (const entry of pendingMiss) {
+      if (grepsUsed >= maxGreps) {
+        // Remaining scheduled miss-pass greps cannot run → indeterminate.
+        const idx = results.findIndex((r) => r.symbol === entry.symbol && r.status === "missing");
+        if (idx >= 0) {
+          results[idx] = {
+            symbol: entry.symbol,
+            status: "indeterminate",
+            hits: [],
+            errors: ["search budget exhausted before miss-pass completed"],
+          };
+        }
+        for (const later of pendingMiss) {
+          if (later.symbol === entry.symbol) continue;
+          const i = results.findIndex((r) => r.symbol === later.symbol && r.status === "missing");
+          if (i >= 0) {
+            results[i] = {
+              symbol: later.symbol,
+              status: "indeterminate",
+              hits: [],
+              errors: ["search budget exhausted before miss-pass completed"],
+            };
+          }
+        }
+        break;
+      }
+
       let foundHits: SymbolGroundingHit[] = [];
+      let sawError = false;
+      const errors: string[] = [];
       for (const dep of depDirs) {
-        if (grepsUsed >= maxGreps) break;
+        if (grepsUsed >= maxGreps) {
+          // Budget mid miss-pass without a hit → indeterminate (not confirmed miss).
+          sawError = true;
+          errors.push("search budget exhausted during miss-pass");
+          break;
+        }
         const depPath = joinPath(options.searchRoot, dep);
-        const hits = await runGrep(symbol, depPath);
-        if (hits.length > 0) {
-          foundHits = hits;
+        const attempt = await runGrep(entry.symbol, depPath);
+        if (attempt.status === "ok" && attempt.hits.length > 0) {
+          foundHits = attempt.hits;
+          break;
+        }
+        if (attempt.status === "error") {
+          sawError = true;
+          errors.push(attempt.reason);
+        }
+        if (attempt.status === "budget_exhausted") {
+          sawError = true;
+          errors.push("search budget exhausted");
           break;
         }
       }
+
+      const idx = results.findIndex((r) => r.symbol === entry.symbol);
+      if (idx < 0) continue;
       if (foundHits.length > 0) {
-        const idx = results.findIndex((r) => r.symbol === symbol && !r.found);
-        if (idx >= 0) {
-          results[idx] = { symbol, found: true, hits: foundHits };
-        }
+        results[idx] = { symbol: entry.symbol, status: "found", hits: foundHits };
+      } else if (sawError) {
+        results[idx] = {
+          symbol: entry.symbol,
+          status: "indeterminate",
+          hits: [],
+          errors,
+        };
       }
+      // else: all scheduled dep greps completed ok with zero hits → keep missing
     }
   }
 
-  const symbolsFound = results.filter((r) => r.found).length;
+  const symbolsFound = results.filter((r) => r.status === "found").length;
+  const symbolsMissing = results.filter((r) => r.status === "missing").length;
+  const symbolsIndeterminate = results.filter((r) => r.status === "indeterminate").length;
   const summary: SymbolGroundingSummary = {
     symbols_searched: symbols.length,
     symbols_found: symbolsFound,
-    symbols_missing: symbols.length - symbolsFound,
+    symbols_missing: symbolsMissing,
+    symbols_indeterminate: symbolsIndeterminate,
     greps_used: grepsUsed,
   };
 

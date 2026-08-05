@@ -3031,7 +3031,8 @@ export class PipelineExecutor {
           groundingBlock = formatGroundingBlock(results);
           // A3: write preflight blocks reintroduction of symbols proven absent.
           for (const r of results) {
-            if (!r.found) this.groundingMissingSymbols.add(r.symbol);
+            // Only confirmed misses authorize the fabricated-symbol deny-set.
+            if (r.status === "missing") this.groundingMissingSymbols.add(r.symbol);
           }
           executorMessages.push({
             role: "user",
@@ -3040,7 +3041,9 @@ export class PipelineExecutor {
           onStateChange({
             stage: "executor",
             status: "running",
-            detail: `symbol_grounding:${summary.symbols_found}/${summary.symbols_searched}`,
+            detail:
+              `symbol_grounding:${summary.symbols_found}/${summary.symbols_searched}`
+              + `:indeterminate=${summary.symbols_indeterminate}`,
           });
         } catch (err) {
           console.warn(
