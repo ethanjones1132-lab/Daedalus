@@ -46,6 +46,7 @@ import {
   SemanticPressureBudget,
   SEMANTIC_PRESSURE_SUPPRESSED,
 } from "./executor-progress-policy";
+import { DirectiveBudget } from "./directive-budget";
 import { selectHandoffSeedPaths } from "./delegate-handoff-seed";
 import {
   normalizeRemainingStages,
@@ -151,6 +152,7 @@ import {
   shouldRecordDelegateWriteOutcome,
   type DelegateModelSelection,
 } from "./delegate-model-select";
+import { recordExecutorTurn } from "./model-health";
 import { decideDelegateIntervention } from "./delegate-intervention-policy";
 import {
   assessCorrectnessFloor,
@@ -1839,6 +1841,10 @@ export class PipelineExecutor {
     if (!options.semanticPressureBudget) {
       options.semanticPressureBudget = pressureBudget;
     }
+    // Per-turn total supervision cap — bounds the sum of mid-loop directives
+    // so a spin cannot relocate across uncapped reflexes (Task 8).
+    const directiveBudget = new DirectiveBudget();
+    let directiveBudgetExhaustionRecorded = false;
     let workspaceEvidenceNudgeCount = 0;
     let evidenceCountAtLastNudge = 0;
     let writeEffectNudgeCount = 0;
@@ -2115,17 +2121,35 @@ export class PipelineExecutor {
       return base;
     };
 
-    const recordMidLoopDirective = (midLoop: LoopIntervention): void => {
+    const recordMidLoopDirective = (midLoop: LoopIntervention): LoopIntervention => {
+      const directiveType = `mid_loop_${midLoop.kind}`;
+      if (!directiveBudget.claim(directiveType)) {
+        // Record exhaustion once — stop the spin without logging every
+        // suppressed follow-on directive.
+        if (!directiveBudgetExhaustionRecorded) {
+          directiveBudgetExhaustionRecorded = true;
+          this.collector.recordDirective?.({
+            id: `dir_${crypto.randomUUID()}`,
+            agent_run_id: agentRunId,
+            stage: "executor",
+            directive_type: "directive_budget_exhausted",
+            decision_source: "deterministic_reflex",
+            reason: JSON.stringify(directiveBudget.tally()).slice(0, 300),
+          });
+        }
+        return { kind: "continue" };
+      }
       this.collector.recordDirective?.({
         id: `dir_${crypto.randomUUID()}`,
         agent_run_id: agentRunId,
         stage: "executor",
-        directive_type: `mid_loop_${midLoop.kind}`,
+        directive_type: directiveType,
         decision_source: midLoop.decisionSource,
         escalation_id: midLoop.escalationId,
         reason: "reason" in midLoop ? midLoop.reason : undefined,
         inject_note: "note" in midLoop ? midLoop.note : undefined,
       });
+      return midLoop;
     };
 
     const applyQualityPhaseBookkeeping = (midLoop: LoopIntervention, signal: MidLoopSignal): void => {
@@ -2231,9 +2255,8 @@ export class PipelineExecutor {
         writeLandedSinceLastCheck: writeLanded,
         forceQualityGate: extras.forceQualityGate === true,
       });
-      const midLoop = await this.conductor.live.checkMidLoop(signal);
+      const midLoop = recordMidLoopDirective(await this.conductor.live.checkMidLoop(signal));
       midLoopLastSuccessfulWrites = writes;
-      recordMidLoopDirective(midLoop);
       if (midLoop.kind === "inject" && midLoop.noteKind === "plan_remainder") {
         planNudgeCount++;
       }
@@ -2694,6 +2717,17 @@ export class PipelineExecutor {
         // Exception text behind typed codes like delegate_snapshot_error.
         failure_detail: delegated.failureDetail,
       });
+      {
+        const delegateModelId = modelSelection.model
+          || this.ctx.config.claude_cli.delegate.model.trim()
+          || this.ctx.config.claude_cli.model?.trim()
+          || "claude_cli";
+        recordExecutorTurn(
+          "claude_cli",
+          delegateModelId,
+          delegated.toolCalls.length > 0,
+        );
+      }
       this.collector.recordModelAttribution?.({
         id: `attr_${crypto.randomUUID()}`,
         agent_run_id: agentRunId,
@@ -3781,6 +3815,13 @@ export class PipelineExecutor {
             partial_error_code: isNoToolWriteTurn ? "executor_no_tool" : undefined,
             diagnostic_json: noToolDiagnostics ? JSON.stringify(noToolDiagnostics) : undefined,
           });
+          if (response?._provider && response?._modelUsed) {
+            recordExecutorTurn(
+              String(response._provider),
+              String(response._modelUsed),
+              emittedToolCalls,
+            );
+          }
         } catch (err: any) {
           this.collector.recordStageRun({
             id: `stage_${crypto.randomUUID()}`,
