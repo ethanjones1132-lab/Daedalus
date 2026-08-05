@@ -16,6 +16,11 @@
  */
 
 import { SelfTuningStore } from "../self-tuning/store";
+import {
+  modelsBenchedForErrorRate,
+  shouldBenchForErrorRate,
+  errorStatsForModel,
+} from "./model-health";
 
 /** OpenAI-format Go models (need proxy for Claude CLI). */
 export const DELEGATE_GO_OPENAI_MODELS = [
@@ -302,11 +307,44 @@ export function getDelegateWriteScoreboard(model: string): DelegateWriteScoreboa
   return writeScoreboard.get(model.trim());
 }
 
-export function getBenchedDelegateModels(): string[] {
+/** Why a model is excluded from delegate auto-selection. */
+export type DelegateBenchReason = "write_evidence" | "error_rate";
+
+export interface BenchedDelegateModelEntry {
+  model: string;
+  reason: DelegateBenchReason;
+}
+
+/**
+ * Write-evidence benches unioned with process-local error-rate benches.
+ * Reasons stay distinct so the replay harness can tell them apart.
+ */
+export function getBenchedDelegateModelEntries(): BenchedDelegateModelEntry[] {
   ensureDelegateWriteScoreboardHydrated();
-  return [...writeScoreboard.values()]
-    .filter((entry) => entry.benched)
-    .map((entry) => entry.model);
+  const entries: BenchedDelegateModelEntry[] = [];
+  for (const entry of writeScoreboard.values()) {
+    if (entry.benched) {
+      entries.push({ model: entry.model, reason: "write_evidence" });
+    }
+  }
+  for (const model of modelsBenchedForErrorRate()) {
+    entries.push({ model, reason: "error_rate" });
+  }
+  // Also check scoreboard-known models against bare error stats in case the
+  // error map only holds the model id without a dual provider key.
+  for (const entry of writeScoreboard.values()) {
+    if (entry.benched) continue;
+    if (shouldBenchForErrorRate(errorStatsForModel(entry.model))) {
+      if (!entries.some((e) => e.model === entry.model && e.reason === "error_rate")) {
+        entries.push({ model: entry.model, reason: "error_rate" });
+      }
+    }
+  }
+  return entries;
+}
+
+export function getBenchedDelegateModels(): string[] {
+  return [...new Set(getBenchedDelegateModelEntries().map((e) => e.model))];
 }
 
 /**

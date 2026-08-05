@@ -51,7 +51,90 @@ export function noToolStatsFor(provider: string, modelId: string): NoToolStats {
   return noToolStats.get(modelKey(provider, modelId)) ?? { noToolTurns: 0, executorTurns: 0 };
 }
 
+/** Calls before an error rate is actionable. */
+export const MIN_ERROR_RATE_SAMPLE = 10;
+
+/**
+ * Error rate above which a model is benched outright. Deliberately high: this
+ * targets models that are broken (claude_cli:cohere/north-mini-code:free at
+ * 91%, claude_cli:gemma4:e2b at 85%), not merely unreliable
+ * (nemotron-3-ultra-free at 20% stays in the pool).
+ */
+export const ERROR_RATE_BENCH_THRESHOLD = 0.7;
+
+export interface ErrorRateStats {
+  errors: number;
+  calls: number;
+}
+
+export function shouldBenchForErrorRate(stats: ErrorRateStats): boolean {
+  if (stats.calls < MIN_ERROR_RATE_SAMPLE) return false;
+  return stats.errors / stats.calls > ERROR_RATE_BENCH_THRESHOLD;
+}
+
+/**
+ * Process-local error aggregates.
+ * - `errorRateByProviderModel` is keyed `provider:modelId` for pool diagnostics.
+ * - `errorRateByModel` is keyed by bare model id for delegate selection (model
+ *   ids themselves often contain colons, e.g. `cohere/north-mini-code:free`).
+ */
+const errorRateByProviderModel = new Map<string, ErrorRateStats>();
+const errorRateByModel = new Map<string, ErrorRateStats>();
+
+function bumpErrorStats(
+  map: Map<string, ErrorRateStats>,
+  key: string,
+  hadError: boolean,
+): void {
+  const e = map.get(key) ?? { errors: 0, calls: 0 };
+  e.calls++;
+  if (hadError) e.errors++;
+  map.set(key, e);
+}
+
+/** Record one model call outcome for error-rate benching. */
+export function recordModelCall(
+  provider: string,
+  modelId: string,
+  hadError: boolean,
+): void {
+  const normalized = modelId.trim();
+  if (!normalized) return;
+  bumpErrorStats(errorRateByProviderModel, modelKey(provider, normalized), hadError);
+  // Bare model id so delegate selection (which keys on model only) can consume
+  // the same process-local evidence.
+  bumpErrorStats(errorRateByModel, normalized, hadError);
+}
+
+/**
+ * Look up error stats. Prefer `provider:modelId` when both are known; bare
+ * `modelId` is accepted for delegate scoreboard union.
+ */
+export function errorStatsFor(provider: string, modelId: string): ErrorRateStats {
+  const keyed = errorRateByProviderModel.get(modelKey(provider, modelId));
+  if (keyed) return keyed;
+  return errorRateByModel.get(modelId.trim()) ?? { errors: 0, calls: 0 };
+}
+
+export function errorStatsForModel(modelId: string): ErrorRateStats {
+  return errorRateByModel.get(modelId.trim()) ?? { errors: 0, calls: 0 };
+}
+
+/**
+ * Model ids currently over the error-rate bench threshold (bare ids so they
+ * match `getBenchedDelegateModels` / free-pool keys).
+ */
+export function modelsBenchedForErrorRate(): string[] {
+  const out: string[] = [];
+  for (const [model, stats] of errorRateByModel) {
+    if (shouldBenchForErrorRate(stats)) out.push(model);
+  }
+  return out;
+}
+
 /** Test helper: clear process-local health aggregates. */
 export function __resetModelHealthForTests(): void {
   noToolStats.clear();
+  errorRateByProviderModel.clear();
+  errorRateByModel.clear();
 }

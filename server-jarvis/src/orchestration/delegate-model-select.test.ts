@@ -20,6 +20,7 @@ import {
   DELEGATE_TOOL_INCAPABLE_MODELS,
   recordDelegateThrash,
   getBenchedDelegateModels,
+  getBenchedDelegateModelEntries,
   getDelegateWriteScoreboard,
   recordDelegateWriteOutcome,
   isEarnedFreeDelegateModel,
@@ -29,6 +30,10 @@ import {
   shouldRecordDelegateWriteOutcome,
   writeEvidenceScore,
 } from "./delegate-model-select";
+import {
+  __resetModelHealthForTests,
+  recordModelCall,
+} from "./model-health";
 
 // 2026-08-01, live runs run_d84a937f / run_275068a5: the delegate is the
 // PRIMARY write path, and `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`
@@ -467,6 +472,7 @@ describe("delegate verified-write scoreboard", () => {
   beforeEach(() => {
     __setDelegateWriteScoreboardStoreForTests(new SelfTuningStore(":memory:"));
     __resetDelegateWriteScoreboardForTests();
+    __resetModelHealthForTests();
   });
 
   test("benches a model after three attempts with zero verified writes", () => {
@@ -481,6 +487,33 @@ describe("delegate verified-write scoreboard", () => {
     expect(final).toMatchObject({ attempts: 3, verifiedWrites: 0, benched: true });
     expect(getBenchedDelegateModels()).toEqual(["vendor/failing:free"]);
     expect(getDelegateWriteScoreboard("vendor/failing:free")).toEqual(final);
+  });
+
+  test("unions error-rate benches with write-evidence benches and keeps reasons distinct", () => {
+    // Write-evidence bench.
+    for (let i = 0; i < 3; i++) recordDelegateWriteOutcome("vendor/no-write:free", false);
+    // Error-rate bench: 10/10 errors (above 0.7 threshold, sample floor 10).
+    for (let i = 0; i < 10; i++) {
+      recordModelCall("claude_cli", "vendor/error-heavy:free", true);
+    }
+    // Healthy: neither write-benched nor error-benched.
+    recordDelegateWriteOutcome("vendor/healthy:free", true);
+    for (let i = 0; i < 10; i++) {
+      recordModelCall("claude_cli", "vendor/healthy:free", false);
+    }
+
+    const models = getBenchedDelegateModels();
+    expect(models).toContain("vendor/no-write:free");
+    expect(models).toContain("vendor/error-heavy:free");
+    expect(models).not.toContain("vendor/healthy:free");
+
+    const entries = getBenchedDelegateModelEntries();
+    expect(entries).toContainEqual({ model: "vendor/no-write:free", reason: "write_evidence" });
+    expect(entries).toContainEqual({ model: "vendor/error-heavy:free", reason: "error_rate" });
+    // A model that is only write-benched must not also appear as error_rate.
+    expect(
+      entries.filter((e) => e.model === "vendor/no-write:free").map((e) => e.reason),
+    ).toEqual(["write_evidence"]);
   });
 
   test("a verified write prevents benching even after three attempts", () => {

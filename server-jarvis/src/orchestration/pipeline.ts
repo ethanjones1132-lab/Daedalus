@@ -152,7 +152,7 @@ import {
   shouldRecordDelegateWriteOutcome,
   type DelegateModelSelection,
 } from "./delegate-model-select";
-import { recordExecutorTurn } from "./model-health";
+import { recordExecutorTurn, recordModelCall } from "./model-health";
 import { decideDelegateIntervention } from "./delegate-intervention-policy";
 import {
   assessCorrectnessFloor,
@@ -2727,6 +2727,7 @@ export class PipelineExecutor {
           delegateModelId,
           delegated.toolCalls.length > 0,
         );
+        recordModelCall("claude_cli", delegateModelId, !stageSucceeded);
       }
       this.collector.recordModelAttribution?.({
         id: `attr_${crypto.randomUUID()}`,
@@ -3820,6 +3821,11 @@ export class PipelineExecutor {
               String(response._provider),
               String(response._modelUsed),
               emittedToolCalls,
+            );
+            recordModelCall(
+              String(response._provider),
+              String(response._modelUsed),
+              isNoToolWriteTurn || turnHadToolError,
             );
           }
         } catch (err: any) {
