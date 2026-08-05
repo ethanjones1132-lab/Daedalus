@@ -774,14 +774,54 @@ async function fileIdentity(path: string): Promise<string> {
   }
 }
 
+/**
+ * Directories whose contents are build output, not source. Hashing them is
+ * pure cost and can be fatal: 2026-08-05 live, a configured CMake build put
+ * 336 files / 255 MB under `build/` in a repo with no .gitignore, so
+ * `git ls-files -co` handed every artifact to the snapshot and the SHA-256
+ * walk threw `delegate_snapshot_error` before the delegate could launch.
+ *
+ * This matters structurally, not just for one workspace: the build gate's
+ * CMake detector only fires when `build/CMakeCache.txt` exists, so the gate
+ * requires the very directory that broke the snapshot.
+ */
+const SNAPSHOT_EXCLUDED_DIRS = new Set([
+  ".git",
+  ".vs",
+  "build",
+  "cmake-build-debug",
+  "cmake-build-release",
+  "dist",
+  "JUCE_BUILD",
+  "node_modules",
+  "out",
+  "target",
+]);
+
+/**
+ * Whether a workspace-relative path belongs in the delegate's ground-truth
+ * snapshot. Matches whole path segments only — `builder/` and `outbound.cpp`
+ * are source, not output.
+ */
+export function shouldSnapshotRelPath(relPath: string): boolean {
+  const segments = relPath.split(/[\\/]+/).filter(Boolean);
+  // The basename is a file; only directory segments gate inclusion.
+  for (const segment of segments.slice(0, -1)) {
+    if (SNAPSHOT_EXCLUDED_DIRS.has(segment)) return false;
+  }
+  return true;
+}
+
 async function filesystemFiles(root: string): Promise<Record<string, string>> {
   const files: Record<string, string> = {};
   const walk = async (directory: string): Promise<void> => {
     const entries = await readdir(directory, { withFileTypes: true });
     for (const entry of entries) {
       const path = join(directory, entry.name);
-      if (entry.isDirectory()) await walk(path);
-      else files[pathKey(path)] = await fileIdentity(path);
+      if (entry.isDirectory()) {
+        if (SNAPSHOT_EXCLUDED_DIRS.has(entry.name)) continue;
+        await walk(path);
+      } else files[pathKey(path)] = await fileIdentity(path);
     }
   };
   await walk(root);
@@ -792,6 +832,8 @@ async function gitFiles(root: string, top: string): Promise<Record<string, strin
   const output = await execFileText("git", ["-C", root, "ls-files", "-co", "--exclude-standard", "-z", "--", "."]);
   const files: Record<string, string> = {};
   for (const listed of output.split("\0").filter(Boolean)) {
+    // Build output is never a source mutation; skip before hashing it.
+    if (!shouldSnapshotRelPath(listed)) continue;
     // git -C <subdir> returns paths relative to that working directory for
     // this invocation. Fall back to the repository top only if necessary.
     const fromRoot = resolve(root, listed);

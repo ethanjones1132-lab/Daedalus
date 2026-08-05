@@ -20,6 +20,7 @@ import {
   normalizeDelegateReadFileOutput,
   runClaudeDelegate,
   sanitizeDelegateDiagnosticText,
+  shouldSnapshotRelPath,
   withDelegateRequestCorrelation,
   type DelegateRootSnapshot,
 } from "./claude-delegate";
@@ -37,6 +38,57 @@ function testConfig(): JarvisConfig {
   config.opencode_go.api_key = "go-test-key";
   return config;
 }
+
+/**
+ * 2026-08-05 live: configuring a CMake build in the Perihelion workspace put
+ * 336 untracked artifact files (255 MB) under build/. The repo has no
+ * .gitignore, so `git ls-files -co --exclude-standard` returned all of them and
+ * the delegate snapshot SHA-256'd every one before the process could launch —
+ * throwing delegate_snapshot_error, killing the delegate, and producing a
+ * zero-tool turn.
+ *
+ * This is structurally coupled to the build gate: the CMake detector only fires
+ * when build/CMakeCache.txt exists, so the gate's precondition is exactly what
+ * broke the snapshot. Build output is never a source mutation — exclude it.
+ */
+describe("snapshot excludes build output", () => {
+  test("excludes common build/artifact directories", () => {
+    for (const p of [
+      "build/Perihelion.vcxproj",
+      "out/x64/thing.obj",
+      "dist/bundle.js",
+      "target/debug/app.exe",
+      "node_modules/pkg/index.js",
+      "cmake-build-debug/CMakeCache.txt",
+      "JUCE_BUILD/juceaide.exe",
+      ".vs/slnx.sqlite",
+    ]) {
+      expect(shouldSnapshotRelPath(p)).toBe(false);
+    }
+  });
+
+  test("keeps source files, including nested ones", () => {
+    for (const p of [
+      "PluginProcessor.cpp",
+      "Source/DSPEngine.h",
+      "tests/Test_Perihelion.cpp",
+      "CMakeLists.txt",
+      "docs/rebuild-notes.md",
+    ]) {
+      expect(shouldSnapshotRelPath(p)).toBe(true);
+    }
+  });
+
+  test("does not exclude a source file merely because a segment is a prefix", () => {
+    expect(shouldSnapshotRelPath("builder/Builder.cpp")).toBe(true);
+    expect(shouldSnapshotRelPath("Source/outbound.cpp")).toBe(true);
+  });
+
+  test("handles backslash-separated paths (Windows git output)", () => {
+    expect(shouldSnapshotRelPath("build\\Perihelion.vcxproj")).toBe(false);
+    expect(shouldSnapshotRelPath("Source\\DSPEngine.h")).toBe(true);
+  });
+});
 
 describe("delegateToolResultContextChars (W1.5)", () => {
   test("uses the write-turn 24k cap, not the 6k read-turn executor cap", () => {
