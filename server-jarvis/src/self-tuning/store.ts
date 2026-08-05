@@ -30,6 +30,11 @@ export interface AgentRun {
   verified_via?: string | null;
   /** Verification depth tier (e.g. existing, deep). */
   check_tier?: string | null;
+  /**
+   * Why a verification check declined (tier none) — e.g. no_code_written
+   * or the build detector's not_applicable reason.
+   */
+  check_declined_reason?: string | null;
   created_at?: string;
 }
 
@@ -343,6 +348,7 @@ const SELF_TUNING_SCHEMA = `
     outcome TEXT,
     verified_via TEXT,
     check_tier TEXT,
+    check_declined_reason TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
   );
   CREATE TABLE IF NOT EXISTS stage_runs (
@@ -606,6 +612,10 @@ export class SelfTuningStore {
         } catch { /* column already exists */ }
         try {
           db.exec(`ALTER TABLE agent_runs ADD COLUMN check_tier TEXT`);
+        } catch { /* column already exists */ }
+        // Theme 1 / Task 3: why verification declined (tier none).
+        try {
+          db.exec(`ALTER TABLE agent_runs ADD COLUMN check_declined_reason TEXT`);
         } catch { /* column already exists */ }
         try {
           db.exec(`ALTER TABLE model_attributions ADD COLUMN first_token_ms INTEGER`);

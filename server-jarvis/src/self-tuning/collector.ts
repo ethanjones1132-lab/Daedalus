@@ -63,6 +63,8 @@ export class SessionOutcomeCollector {
     verifiedVia?: string,
     /** Verification depth tier (e.g. existing). Optional; defaults to null. */
     checkTier?: string,
+    /** Why a check declined (tier none). Optional; defaults to null. */
+    checkDeclinedReason?: string,
   ): void {
     this.store.updateAgentRun(runId, {
       completed: 1,
@@ -73,6 +75,7 @@ export class SessionOutcomeCollector {
       outcome,
       verified_via: verifiedVia ?? null,
       check_tier: checkTier ?? null,
+      check_declined_reason: checkDeclinedReason ?? null,
     });
 
     // M7: close the self-tuning loop — once enough post-apply runs exist for

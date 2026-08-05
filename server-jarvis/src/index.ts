@@ -3616,6 +3616,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // leave null when verification is off / no checkResult.
           reward?.verifiedVia,
           reward?.checkTier,
+          result.checkResult?.declinedReason,
         );
         if (conductorRunId) {
           conductorLearning.completeRun({

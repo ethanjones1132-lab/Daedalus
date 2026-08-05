@@ -56,6 +56,26 @@ describe("mergeToCheckResult (build tri-state)", () => {
   });
 });
 
+describe("CheckResult explains a none tier", () => {
+  test("no code written is distinguished from a declined detector", () => {
+    const noCode = mergeToCheckResult({
+      run: { status: "skipped", issues: [], reason: undefined, target: undefined } as any,
+      build: { kind: "not_applicable", reason: "no build system matched" },
+      hadWrittenCode: false,
+    });
+    expect(noCode.tier).toBe("none");
+    expect(noCode.declinedReason).toBe("no_code_written");
+
+    const declined = mergeToCheckResult({
+      run: { status: "skipped", issues: [], reason: undefined, target: undefined } as any,
+      build: { kind: "not_applicable", reason: "no build system matched" },
+      hadWrittenCode: true,
+    });
+    expect(declined.tier).toBe("none");
+    expect(declined.declinedReason).toBe("no build system matched");
+  });
+});
+
 describe("runVerificationCheck (build)", () => {
   const write: ToolCallRecord = { name: "write_file", arguments: { path: "a.cpp" }, output: "ok", is_error: false, duration_ms: 1 };
 

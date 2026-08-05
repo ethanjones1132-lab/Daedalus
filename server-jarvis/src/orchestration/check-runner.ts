@@ -11,6 +11,11 @@ export interface CheckResult {
   detail: string;           // failing assertion / compiler error, truncated
   command: string;          // what was executed / checked, for telemetry
   durationMs: number;
+  /**
+   * Why tier is `none` when a check was declined or skipped.
+   * Distinguishes "no code written" from "no build system matched" etc.
+   */
+  declinedReason?: string;
 }
 
 const WRITE_TOOL_NAMES = new Set(["write_file", "edit_file", "multi_edit", "apply_patch"]);
@@ -50,7 +55,15 @@ export function mergeToCheckResult(input: {
 }): CheckResult {
   const durationMs = input.durationMs ?? 0;
   if (!input.hadWrittenCode) {
-    return { tier: "none", ran: false, passed: null, detail: "", command: "", durationMs };
+    return {
+      tier: "none",
+      ran: false,
+      passed: null,
+      detail: "",
+      command: "",
+      durationMs,
+      declinedReason: "no_code_written",
+    };
   }
   if (input.run.status === "passed" || input.run.status === "failed") {
     const tier = input.run.reason
@@ -73,7 +86,15 @@ export function mergeToCheckResult(input: {
     case "failed":
       return { tier: "builtin", ran: true, passed: false, detail: input.build.detail, command: input.build.command, durationMs };
     case "not_applicable":
-      return { tier: "none", ran: false, passed: null, detail: "", command: "", durationMs };
+      return {
+        tier: "none",
+        ran: false,
+        passed: null,
+        detail: "",
+        command: "",
+        durationMs,
+        declinedReason: input.build.reason,
+      };
   }
 }
 
@@ -86,7 +107,15 @@ export async function runVerificationCheck(input: RunVerificationInput): Promise
   const startedAt = Date.now();
   const written = hadWrittenCode(input.toolCalls);
   if (!written) {
-    return { tier: "none", ran: false, passed: null, detail: "", command: "", durationMs: Date.now() - startedAt };
+    return {
+      tier: "none",
+      ran: false,
+      passed: null,
+      detail: "",
+      command: "",
+      durationMs: Date.now() - startedAt,
+      declinedReason: "no_code_written",
+    };
   }
   const [build, run] = await Promise.all([
     input.runBuild(),
