@@ -5,6 +5,7 @@ import {
   DEFAULT_ORCHESTRATOR_AGENTS,
   firstTokenTimeoutFor,
   formatPoolDiversity,
+  LOCAL_STAGE_MIN_WINDOW_MS,
   localStageAgent,
   orchestrationRoutingTier,
   preferLocalForStage,
@@ -1292,6 +1293,37 @@ describe("M1b preferLocalForStage + local-first pick", () => {
       ollamaAvailable: false,
     });
     expect(picked?.id).toBe("remote-planner");
+  });
+});
+
+describe("local stage picks respect the remaining stage window", () => {
+  test("refuses a local pick when the window cannot fit a local attempt", () => {
+    const pool = new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS);
+    const pick = pool.pickFor("reviewer", "refactor", undefined, {
+      ollamaAvailable: true,
+      localModels: ["qwen3.5:4b"],
+      remainingStageMs: LOCAL_STAGE_MIN_WINDOW_MS - 1,
+    });
+    expect(pick?.provider).not.toBe("ollama");
+  });
+
+  test("allows a local pick when the window is wide enough", () => {
+    const pool = new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS);
+    const pick = pool.pickFor("reviewer", "refactor", undefined, {
+      ollamaAvailable: true,
+      localModels: ["qwen3.5:4b"],
+      remainingStageMs: LOCAL_STAGE_MIN_WINDOW_MS + 1,
+    });
+    expect(pick?.provider).toBe("ollama");
+  });
+
+  test("an unspecified window still allows local (no regression for callers without budgets)", () => {
+    const pool = new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS);
+    const pick = pool.pickFor("reviewer", "refactor", undefined, {
+      ollamaAvailable: true,
+      localModels: ["qwen3.5:4b"],
+    });
+    expect(pick?.provider).toBe("ollama");
   });
 });
 

@@ -322,6 +322,17 @@ export function preferLocalForStage(stage: string): boolean {
 export const DEFAULT_LOCAL_STAGE_MODELS: readonly string[] = ["qwen3.5:4b", "qwen3:8b"];
 
 /**
+ * Minimum remaining stage window for a local Ollama pick to be worth taking.
+ *
+ * 2026-08-04 (run_cc660a4d): reviewer routed to qwen3.5:4b, the call errored
+ * at 33s, and the stage still burned to its 120s deadline with nothing to show.
+ * Planner showed the same shape (56.3s model timeout inside a 158s stage). A
+ * local lane that cannot plausibly complete AND leave room for the remote
+ * cascade is worse than going remote immediately.
+ */
+export const LOCAL_STAGE_MIN_WINDOW_MS = 75_000;
+
+/**
  * Build a synthetic pool agent for a local Ollama model. Not stage-pinned
  * (`default_for: []`); selection is driven by {@link preferLocalForStage}
  * rather than competing with remote `default_for` pins.
@@ -451,9 +462,18 @@ export class AgentPool {
     // even if the live pool has no ollama entries. Exclusions still apply so
     // a failed local hop advances to the next local, then remote.
     if (preferLocalForStage(stage) && selection.ollamaAvailable) {
-      candidates = this.injectLocalStageCandidates(candidates, exclude, selection);
-      const localPick = this.pickPreferredLocal(candidates, stage, selection);
-      if (localPick) return localPick;
+      // Fail fast rather than spend the stage window on a local lane that
+      // cannot finish and still leave room for the remote cascade.
+      const window = selection.remainingStageMs;
+      const windowAllowsLocal =
+        typeof window !== "number"
+        || !Number.isFinite(window)
+        || window >= LOCAL_STAGE_MIN_WINDOW_MS;
+      if (windowAllowsLocal) {
+        candidates = this.injectLocalStageCandidates(candidates, exclude, selection);
+        const localPick = this.pickPreferredLocal(candidates, stage, selection);
+        if (localPick) return localPick;
+      }
     }
     if (candidates.length === 0) return undefined;
     // Cost/capacity policy is a hard boundary, not another weighted hint. A
