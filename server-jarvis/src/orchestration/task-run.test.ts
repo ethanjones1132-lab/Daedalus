@@ -1547,3 +1547,22 @@ describe("continuation carry helpers", () => {
     );
   });
 });
+
+describe("evidence scoring is requirement-independent for terminal decisions (B2)", () => {
+  test("a failed turn with real successful tool calls pauses rather than fails", () => {
+    const contract = createTaskRun({
+      taskRunId: "tr_b2",
+      sessionId: "s",
+      objective: "execute the Perihelion plan",
+      requirement: "full_execution",
+    });
+    const result = assessTaskRunAcceptance({
+      requirement: "answer_only",
+      depth: contract.depth,
+      pipelineOutcome: "failed",
+      answer: "",
+      evidenceCount: 30,
+    });
+    expect(result.status).toBe("paused");
+  });
+});
