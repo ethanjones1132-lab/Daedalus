@@ -3184,6 +3184,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           conductorSource: route.conductor_source ?? "api",
           conductorModel: route.conductor_model,
           latencyMs: coordinatorDurationMs,
+          // 2026-08-04 B1: persist classified requirement so answer_only
+          // fallbacks that still do real work are diagnosable without inference.
+          requirement: turnReq.requirement,
         });
         if (!shortCircuit) {
           const coordinatorSucceeded = !route.routing_parse_fallback;
@@ -3503,13 +3506,20 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           activeTaskRun.depth === "deep" ? `${message}\ncomprehensive deep-read continuation` : message,
           activeWorkspacePath,
         );
+        // 2026-08-04 (run_085afdac / addendum B2): this scored 0 for any
+        // requirement outside workspace_read / full_execution. The deterministic
+        // answer_only fallback therefore recorded a turn with 30 successful tool
+        // calls as zero-evidence, F9's pause did not apply, the contract went
+        // terminal, and the next "continue please" minted a fresh run with
+        // writeIntent false. Evidence is what the turn DID, not how it was classified.
+        const distinctSuccessful = new Set(
+          successfulToolCalls.map((call) => `${call.name}:${JSON.stringify(call.arguments)}`),
+        ).size;
         const evidenceCount = turnReq.requirement === "workspace_read"
           ? (activeTaskRun.depth === "deep"
             ? evidenceAssessment.contentReads
             : evidenceAssessment.contentReads + evidenceAssessment.listings)
-          : turnReq.requirement === "full_execution"
-            ? new Set(successfulToolCalls.map((call) => `${call.name}:${JSON.stringify(call.arguments)}`)).size
-            : 0;
+          : distinctSuccessful;
         // 2026-08-04: carry what this turn actually mutated into the contract so
         // the next continuation turn can re-read it instead of rediscovering.
         const turnWriteTargets = successfulToolCalls

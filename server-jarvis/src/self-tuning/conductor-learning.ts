@@ -39,6 +39,12 @@ export interface RoutingRecordInput {
   conductorModel?: string;
   /** Wall-clock time the routing decision itself took (any path). */
   latencyMs?: number;
+  /**
+   * 2026-08-04: classified turn requirement (full_execution / workspace_read / …).
+   * Persisted on routing_json so post-hoc diagnosis does not re-infer it from
+   * coordinator_rationale (addendum B1 / run_085afdac chain).
+   */
+  requirement?: string;
 }
 
 export interface RunCompletionInput {
@@ -91,11 +97,18 @@ export class ConductorLearningLoop {
   recordRouting(input: RoutingRecordInput): string {
     if (!this.config.enabled) return "";
     const id = `cond_${crypto.randomUUID()}`;
+    // Spread route then attach requirement so historical consumers that parse
+    // routing_json as a CoordinatorResult still see known fields; requirement
+    // is an additive telemetry key (2026-08-04 B1).
+    const routingPayload = {
+      ...input.route,
+      ...(input.requirement ? { requirement: input.requirement } : {}),
+    };
     this.store.insertConductorRun({
       id,
       agent_run_id: input.agentRunId,
       session_id: input.sessionId,
-      routing_json: JSON.stringify(input.route),
+      routing_json: JSON.stringify(routingPayload),
       conductor_source: input.conductorSource,
       conductor_model: input.conductorModel,
       task_type: input.route.task_type,

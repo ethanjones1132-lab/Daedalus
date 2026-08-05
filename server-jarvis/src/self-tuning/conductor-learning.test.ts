@@ -124,6 +124,45 @@ describe("Conductor learning (Phase 4)", () => {
     expect(store.getAgentPerformance("debug").some((r) => r.agent_id === sampleAgent.id)).toBe(true);
   });
 
+  test("B1: recordRouting persists turn requirement on routing_json", () => {
+    const store = new SelfTuningStore(TEST_DB);
+    const loop = new ConductorLearningLoop(store);
+    store.insertAgentRun({
+      id: "run_b1_req",
+      session_id: "sess_b1",
+      user_request: "continue please",
+      task_type: "general",
+      pipeline: JSON.stringify(["synthesizer"]),
+      completed: 0,
+    });
+    loop.recordRouting({
+      agentRunId: "run_b1_req",
+      sessionId: "sess_b1",
+      route: {
+        task_type: "general",
+        pipeline: ["synthesizer"],
+        topology: "linear",
+        context: {
+          needs_workspace_inspection: false,
+          needs_memory: true,
+          estimated_complexity: "low",
+        },
+        coordinator_rationale: "Local conductor cold; deterministic answer_only route.",
+        conductor_source: "deterministic",
+      },
+      normalizedPipeline: ["synthesizer"],
+      routeSource: "deterministic",
+      conductorSource: "deterministic",
+      latencyMs: 0,
+      requirement: "answer_only",
+    });
+    const row = store.getConductorRuns("run_b1_req")[0];
+    expect(row).toBeDefined();
+    const parsed = JSON.parse(row!.routing_json) as { requirement?: string; task_type?: string };
+    expect(parsed.requirement).toBe("answer_only");
+    expect(parsed.task_type).toBe("general");
+  });
+
   test("optimizeAndApply boosts high-performing agents and records proposals", async () => {
     const store = new SelfTuningStore(TEST_DB);
     const loop = new ConductorLearningLoop(store, {
