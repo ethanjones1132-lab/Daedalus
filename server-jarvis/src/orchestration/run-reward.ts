@@ -120,6 +120,8 @@ export interface RunRewardBreakdown {
 export interface StoredRunRewardSnapshot {
   writeRequired: boolean;
   changedPaths: string[];
+  /** Ground truth authority used to build changedPaths. */
+  writeEvidenceSource: "fingerprints" | "legacy_tool_calls";
   targetPaths?: string[];
   check: Pick<CheckResult, "tier" | "ran" | "passed"> | null;
   plan?: RunRewardPlanEvidence | null;
@@ -439,19 +441,23 @@ export function buildStoredRunRewardSnapshot(input: {
   plan?: RunRewardPlanEvidence | null;
   declaredOutcome?: DeclaredRunOutcome | null;
 }): StoredRunRewardSnapshot {
-  const writes =
-    input.effects && input.effects.length > 0
-      ? writeEvidenceFromEffects(input.effects, {
+  // An explicitly observed empty ledger means that filesystem fingerprints
+  // found no delta. Only historical snapshots that omitted ledger data may
+  // replay the weaker tool-call evidence.
+  const hasFingerprintLedger = input.effects !== undefined && input.effects !== null;
+  const writes = hasFingerprintLedger
+    ? writeEvidenceFromEffects(input.effects ?? [], {
         targetPaths: input.targetPaths,
         writeRequired: input.writeRequired,
       })
-      : writeEvidenceFromToolCalls(input.toolCalls ?? [], {
+    : writeEvidenceFromToolCalls(input.toolCalls ?? [], {
         targetPaths: input.targetPaths,
         writeRequired: input.writeRequired,
       });
   return {
     writeRequired: input.writeRequired,
     changedPaths: writes.changedPaths,
+    writeEvidenceSource: hasFingerprintLedger ? "fingerprints" : "legacy_tool_calls",
     targetPaths: input.targetPaths,
     check: input.check,
     plan: input.plan ?? null,

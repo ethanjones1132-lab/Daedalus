@@ -168,11 +168,11 @@ import { resolveCoordinatorRouteEntry } from "./orchestration/coordinator-route-
 import { runPipelineWithReplanning } from "./orchestration/replan-loop";
 import { mapCheckToReward } from "./orchestration/verification-reward";
 import {
-  buildStoredRunRewardSnapshot,
   computeRunRewardFromStored,
   planEvidenceFromItems,
   serializeRunRewardBreakdown,
 } from "./orchestration/run-reward";
+import { buildLiveRunRewardSnapshot } from "./orchestration/live-reward-evidence";
 import { resolveTaskTargetPaths } from "./orchestration/effect-gate";
 import {
   applyStricterOutcomeFloor,
@@ -3619,9 +3619,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             ),
           ],
         });
-        const runRewardSnapshot = buildStoredRunRewardSnapshot({
+        const runRewardSnapshot = buildLiveRunRewardSnapshot({
           writeRequired: writeRequiredForReward,
-          toolCalls: result.toolCalls ?? [],
+          effects: result.writeEffects ?? [],
           targetPaths: rewardTargetPaths,
           check: result.checkResult
             ? {

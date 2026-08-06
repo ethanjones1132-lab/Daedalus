@@ -12,6 +12,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 import type { ToolErrorCode } from "../tool-types";
+import type { WriteEffectObservation } from "./content-fingerprint";
 
 export const DUPLICATE_TOOL_DEFLECTION_MARKER = "[duplicate call deflected]";
 
@@ -49,6 +50,8 @@ export interface ExecutorStageOutput {
   ok: boolean;
   narrative: string;
   toolCalls: ToolCallRecord[];
+  /** Content fingerprints observed for delegate or native writes in this stage. */
+  writeEffects?: WriteEffectObservation[];
   /** Why execution stopped when `ok` is false. */
   terminalStatus?: "completed" | "failed" | "timed_out" | "cancelled" | "partial";
   /** Stable reason used by replanning and telemetry. */

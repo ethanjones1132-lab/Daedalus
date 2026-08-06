@@ -199,6 +199,34 @@ describe("B3 calibration (overclaim)", () => {
 });
 
 describe("offline stored snapshot", () => {
+  test("explicit empty fingerprint ledger never falls back to successful tool calls", () => {
+    const snapshot = buildStoredRunRewardSnapshot({
+      writeRequired: true,
+      effects: [],
+      toolCalls: [{
+        name: "write_file", is_error: false,
+        arguments: { path: "src/a.ts" },
+      }],
+      check: { tier: "existing", ran: true, passed: true },
+    });
+    expect(snapshot.writeEvidenceSource).toBe("fingerprints");
+    expect(snapshot.changedPaths).toEqual([]);
+    expect(computeRunRewardFromStored(snapshot).terms.writes).toBe(0);
+  });
+
+  test("legacy snapshot fallback is explicitly labeled", () => {
+    const snapshot = buildStoredRunRewardSnapshot({
+      writeRequired: true,
+      toolCalls: [{
+        name: "write_file", is_error: false,
+        arguments: { path: "src/a.ts" },
+      }],
+      check: { tier: "existing", ran: true, passed: true },
+    });
+    expect(snapshot.writeEvidenceSource).toBe("legacy_tool_calls");
+    expect(snapshot.changedPaths).toEqual(["src/a.ts"]);
+  });
+
   test("build + computeRunRewardFromStored is deterministic", () => {
     const snap = buildStoredRunRewardSnapshot({
       writeRequired: true,

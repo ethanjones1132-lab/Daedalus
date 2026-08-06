@@ -117,6 +117,53 @@ describe("executor delegate pipeline integration", () => {
     });
   });
 
+  test("a delegate-changed path reaches PipelineResult.writeEffects exactly once", async () => {
+    const config = delegateTestConfig();
+    config.jarvis_path = process.cwd();
+    config.claude_cli.enabled = true;
+    config.claude_cli.delegate.enabled = true;
+    config.claude_cli.delegate.policy = "delegate_first";
+    const ctx = makeExecutionContext("agent", config, {
+      session_id: "session-delegate-write-effects",
+      workspace_path: config.jarvis_path,
+    });
+    const path = "result.txt";
+    const executor = new PipelineExecutor(
+      async () => ({ content: "native should not run" }),
+      createToolRuntime(),
+      ctx,
+      { recordStageRun: () => {} },
+      {
+        availability: { isAvailable: async () => true },
+        run: async () => ({
+          ...verifiedDelegateOutput(),
+          writeEffects: [{
+            toolName: "write_file",
+            path,
+            before: { path, exists: false, bytes: 0, sha256: null },
+            after: { path, exists: true, bytes: 2, sha256: "b".repeat(64) },
+            changed: true,
+          }],
+        }),
+      },
+    );
+
+    const result = await executor.execute(
+      "Change result.txt",
+      ["executor"],
+      "run-delegate-write-effects",
+      () => {},
+      {
+        executionProfile: "full",
+        rawMessage: "Change result.txt",
+        turnRequirement: "full_execution",
+        maxReviewRepairRounds: 0,
+      },
+    );
+
+    expect(result.writeEffects?.filter((effect) => effect.path === path)).toHaveLength(1);
+  });
+
   test("verified delegate writes are authoritative even when the delegate reports a later timeout", async () => {
     const config = delegateTestConfig();
     config.jarvis_path = process.cwd();

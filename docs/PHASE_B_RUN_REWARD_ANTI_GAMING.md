@@ -21,7 +21,7 @@ score ∈ [-1, 1] = baseScore(writes, check, plan) − overclaimPenalty
 
 | Term | Ground truth | Not used |
 |------|----------------|----------|
-| **writes** | Paths with real content delta (tool success + path; preferred: write-effect fingerprints) that pass the same target/status filter as the effect gate | Model prose claiming a write; status/log docs; non-target paths |
+| **writes** | Paths with real content delta from write-effect fingerprints that pass the same target/status filter as the effect gate | Model prose claiming a write; status/log docs; non-target paths |
 | **check** | Independent runtime `CheckResult` (`existing` / `builtin`, ran, passed) | Reviewer accept/reject; synthesizer narrative; `synth` tier |
 | **plan** | Count of plan items with acceptance checks in status `verified` | Reviewer-mediated grading as a free float (items only count when ledger says verified) |
 
@@ -77,6 +77,11 @@ computeRunRewardFromStored(JSON.parse(reward_json).snapshot)
 ```
 
 No model calls, no filesystem re-read required when the snapshot already holds `changedPaths` and check/plan fields.
+
+New live rows always set `writeEvidenceSource: "fingerprints"`, including an
+explicit empty ledger when no content delta was observed. `legacy_tool_calls`
+exists only to replay historical snapshots created before write-effect plumbing;
+it is not available at the live persistence boundary.
 
 ---
 

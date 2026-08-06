@@ -25,6 +25,7 @@ import { isAbsolute, join, relative, resolve } from "path";
 import { createConnection } from "net";
 import { prepareToolResultForContext } from "../tool-result-truncation";
 import { delegateToolResultContextChars } from "./context-budget";
+import type { ContentFingerprint, WriteEffectObservation } from "./content-fingerprint";
 import type { DelegateStageDiagnostics, ExecutorStageOutput, ToolCallRecord } from "./stage-output";
 import type { ExecutionProfile } from "./route-normalization";
 import { BASELINE_THETA, policy } from "./orchestration-policy";
@@ -1011,6 +1012,91 @@ function writeVerified(
     : snapshotChanged(roots, before, after);
 }
 
+function fingerprintFromDelegateIdentity(
+  path: string,
+  identity: string | undefined,
+): ContentFingerprint {
+  if (!identity || identity === "missing") {
+    return { path, exists: false, bytes: 0, sha256: null };
+  }
+  const match = /^sha256:([a-f0-9]{64})$/i.exec(identity);
+  return {
+    path,
+    exists: true,
+    bytes: 0,
+    sha256: match?.[1]?.toLowerCase() ?? createHash("sha256").update(identity).digest("hex"),
+  };
+}
+
+function delegateSnapshotFileIdentities(
+  snapshots: readonly DelegateRootSnapshot[],
+): Map<string, string | undefined> {
+  const identities = new Map<string, string | undefined>();
+  for (const snapshot of snapshots) {
+    for (const [path, identity] of Object.entries(snapshot.files)) {
+      identities.set(pathKey(path), identity);
+    }
+  }
+  return identities;
+}
+
+function successfulDelegateWriteToolByPath(
+  records: readonly ToolCallRecord[],
+  roots: readonly string[],
+): Map<string, string> {
+  const tools = new Map<string, string>();
+  for (const record of records) {
+    if (record.is_error || !DELEGATE_WRITE_TOOLS.has(record.name)) continue;
+    for (const claimedPath of collectClaimedPaths(record.arguments)) {
+      for (const root of roots) {
+        const normalized = pathKey(isAbsolute(claimedPath)
+          ? claimedPath
+          : resolve(root, claimedPath));
+        if (!tools.has(normalized)) tools.set(normalized, record.name);
+      }
+    }
+  }
+  return tools;
+}
+
+/**
+ * Converts delegate before/after snapshots into the same content-fingerprint
+ * write ledger used by native filesystem tools. A changed root fingerprint on
+ * its own is deliberately insufficient: Phase B write credit needs a concrete
+ * changed path.
+ */
+export function delegateSnapshotWriteEffects(
+  before: readonly DelegateRootSnapshot[],
+  after: readonly DelegateRootSnapshot[],
+  records: readonly ToolCallRecord[],
+): WriteEffectObservation[] {
+  const beforeFiles = delegateSnapshotFileIdentities(before);
+  const afterFiles = delegateSnapshotFileIdentities(after);
+  const changedPaths = new Set([...beforeFiles.keys(), ...afterFiles.keys()]);
+  const roots = [...before, ...after].map((snapshot) => snapshot.root);
+  const toolsByPath = successfulDelegateWriteToolByPath(records, roots);
+  const effects: WriteEffectObservation[] = [];
+
+  for (const path of changedPaths) {
+    const beforeIdentity = beforeFiles.get(path);
+    const afterIdentity = afterFiles.get(path);
+    const beforeFingerprint = fingerprintFromDelegateIdentity(path, beforeIdentity);
+    const afterFingerprint = fingerprintFromDelegateIdentity(path, afterIdentity);
+    const changed = beforeFingerprint.exists !== afterFingerprint.exists
+      || beforeFingerprint.sha256 !== afterFingerprint.sha256;
+    if (!changed) continue;
+    effects.push({
+      toolName: toolsByPath.get(path) ?? "delegate",
+      path,
+      before: beforeFingerprint,
+      after: afterFingerprint,
+      changed,
+    });
+  }
+
+  return effects;
+}
+
 function gitMetadataRecord(snapshots: DelegateRootSnapshot[], verified = true): ToolCallRecord {
   const gitSnapshots = snapshots.filter((snapshot) => snapshot.kind === "git");
   const output = !verified
@@ -1624,6 +1710,13 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
       }
     }
     records.push(gitMetadataRecord(afterSnapshots, verificationAvailable));
+    const writeEffects = verificationAvailable
+      ? delegateSnapshotWriteEffects(beforeSnapshots, afterSnapshots, records)
+      : [];
+    const withWriteEffects = (result: ExecutorStageOutput): ExecutorStageOutput => ({
+      ...result,
+      writeEffects,
+    });
 
     // Capture process diagnostics after the child has settled (exit observed or
     // teardown attempted) so exit_code and stderr_tail are as complete as possible.
@@ -1633,56 +1726,56 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
       ?? (afterResult.kind === "timeout" || afterResult.kind === "aborted" ? afterResult.kind : undefined);
     if (cleanupUnconfirmed) {
       strikeHealth("termination_unconfirmed");
-      return withDiagnostics({
+      return withDiagnostics(withWriteEffects({
         ok: false,
         narrative: narrative.join(""),
         toolCalls: records,
         terminalStatus: "failed",
         errorCode: "delegate_cleanup_unconfirmed",
-      });
+      }));
     }
     if (terminal) {
       if (unverifiedWrite) strikeHealth("unverified_write");
-      return withDiagnostics(terminalOutput(terminal, records, narrative.join("")));
+      return withDiagnostics(withWriteEffects(terminalOutput(terminal, records, narrative.join(""))));
     }
     if (afterResult.kind === "error") narrative.push(`Ground-truth verification failed: ${String(afterResult.error)}`);
     if (unverifiedWrite) {
       strikeHealth("unverified_write");
-      return withDiagnostics({
+      return withDiagnostics(withWriteEffects({
         ok: false,
         narrative: narrative.join(""),
         toolCalls: records,
         terminalStatus: "failed",
         errorCode: "delegate_write_unverified",
-      });
+      }));
     }
     if (policyViolation) {
-      return withDiagnostics({
+      return withDiagnostics(withWriteEffects({
         ok: false,
         narrative: narrative.join(""),
         toolCalls: records,
         terminalStatus: "failed",
         errorCode: "delegate_tool_not_permitted",
-      });
+      }));
     }
     if (streamOutcome.kind === "stream_error") {
-      return withDiagnostics({
+      return withDiagnostics(withWriteEffects({
         ok: false,
         narrative: `Claude delegate stream failed: ${String(streamOutcome.error)}`,
         toolCalls: records,
         terminalStatus: "failed",
         errorCode: "delegate_stream_error",
-      });
+      }));
     }
     if (eventCount === 0 && !cliFailureDetail) {
       strikeHealth("no_event_exit");
-      return withDiagnostics({
+      return withDiagnostics(withWriteEffects({
         ok: false,
         narrative: "Claude delegate exited without emitting stream events.",
         toolCalls: records,
         terminalStatus: "failed",
         errorCode: "delegate_no_events",
-      });
+      }));
     }
     // Prefer a named CLI failure cause over generic no-events / bare exit codes
     // when stream-json already reported why the turn failed.
@@ -1694,7 +1787,7 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
           ? `${text}\nClaude delegate failed: ${cliFailureDetail}`
           : `Claude delegate failed: ${cliFailureDetail}`);
       // CLI error detail/prose can echo credential-bearing tokens; scrub before stage narrative.
-      return withDiagnostics({
+      return withDiagnostics(withWriteEffects({
         ok: false,
         narrative: sanitizeDelegateDiagnosticText(failureNarrative),
         toolCalls: records,
@@ -1702,24 +1795,24 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
         errorCode: cliFailureDetail.startsWith("api_retry storm:")
           ? "delegate_api_retry_storm"
           : "delegate_cli_error",
-      });
+      }));
     }
     if (streamOutcome.exit.code !== 0) {
-      return withDiagnostics({
+      return withDiagnostics(withWriteEffects({
         ok: false,
         narrative: narrative.join(""),
         toolCalls: records,
         terminalStatus: "failed",
         errorCode: "delegate_exit_nonzero",
-      });
+      }));
     }
     input.health.markHealthy();
-    return withDiagnostics({
+    return withDiagnostics(withWriteEffects({
       ok: true,
       narrative: narrative.join(""),
       toolCalls: records,
       terminalStatus: "completed",
-    });
+    }));
   } finally {
     invocation?.cleanup();
     operation.dispose();

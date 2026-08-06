@@ -2773,6 +2773,16 @@ export class PipelineExecutor {
       const hasVerifiedWrite = delegated.toolCalls.some(
         (call) => WRITE_EFFECT_TOOLS.has(call.name) && !call.is_error,
       );
+      // Delegate writes bypass native filesystem handlers. Carry its
+      // independently observed snapshot deltas into the shared logical-turn
+      // ledger before any accepted return or native handoff.
+      for (const effect of delegated.writeEffects ?? []) {
+        this.ctx.write_effects?.push({
+          ...effect,
+          before: { ...effect.before },
+          after: { ...effect.after },
+        });
+      }
       // Filesystem evidence is ground truth. If a delegate mutates the
       // workspace and only then times out/cancels, falling back to native can
       // duplicate a non-idempotent write. A verified write therefore closes

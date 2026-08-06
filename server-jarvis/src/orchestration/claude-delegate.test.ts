@@ -13,6 +13,7 @@ import {
   DELEGATE_REQUEST_ID_HEADER,
   DelegateHealth,
   delegateEligibility,
+  delegateSnapshotWriteEffects,
   filesystemFiles,
   isPermittedDelegateTool,
   mapClaudeDelegateToolName,
@@ -40,6 +41,37 @@ function testConfig(): JarvisConfig {
   config.opencode_go.api_key = "go-test-key";
   return config;
 }
+
+test("delegate snapshot diff produces cryptographic write effects", () => {
+  const path = "c:\\repo\\claimed.ts";
+  const before = [{
+    root: "C:\\repo", kind: "git" as const, status: "", diffStat: "",
+    fingerprint: "before", files: { [path]: `sha256:${"a".repeat(64)}` },
+  }];
+  const after = [{
+    root: "C:\\repo", kind: "git" as const, status: " M claimed.ts", diffStat: "",
+    fingerprint: "after", files: { [path]: `sha256:${"b".repeat(64)}` },
+  }];
+  const effects = delegateSnapshotWriteEffects(before, after, [{
+    name: "edit_file", arguments: { path }, output: "ok", is_error: false, duration_ms: 1,
+  }]);
+  expect(effects).toEqual([expect.objectContaining({
+    toolName: "edit_file", path, changed: true,
+    before: expect.objectContaining({ sha256: "a".repeat(64), exists: true }),
+    after: expect.objectContaining({ sha256: "b".repeat(64), exists: true }),
+  })]);
+});
+
+test("unverified tool narration does not create a delegate write effect", () => {
+  const root = [{
+    root: "C:\\repo", kind: "git" as const, status: "", diffStat: "",
+    fingerprint: "same", files: {},
+  }];
+  expect(delegateSnapshotWriteEffects(root, root, [{
+    name: "write_file", arguments: { path: "C:\\repo\\claimed.ts" },
+    output: "success", is_error: false, duration_ms: 1,
+  }])).toEqual([]);
+});
 
 test("delegate cooldown reads request-scoped theta", () => {
   let now = 1_000;
