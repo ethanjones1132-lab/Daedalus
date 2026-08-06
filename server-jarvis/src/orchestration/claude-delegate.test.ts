@@ -55,6 +55,29 @@ test("delegate cooldown reads request-scoped theta", () => {
   expect(health.isAvailable()).toBe(true);
 });
 
+test("delegate availability cache is isolated by request-scoped TTL", async () => {
+  let now = 10_000;
+  let cliChecks = 0;
+  const availability = new ClaudeDelegateAvailabilityCache({
+    now: () => now,
+    checkCli: async () => {
+      cliChecks += 1;
+      return true;
+    },
+    checkProxyPort: async () => true,
+  });
+  const config = testConfig();
+
+  await runWithTheta({ delegate_availability_cache_ms: 100 }, () => availability.isAvailable(config));
+  now += 50;
+  await runWithTheta({ delegate_availability_cache_ms: 1_000 }, () => availability.isAvailable(config));
+  expect(cliChecks).toBe(2);
+
+  now += 50;
+  await runWithTheta({ delegate_availability_cache_ms: 1_000 }, () => availability.isAvailable(config));
+  expect(cliChecks).toBe(2);
+});
+
 /**
  * 2026-08-05 live: configuring a CMake build in the Perihelion workspace put
  * 336 untracked artifact files (255 MB) under build/. The repo has no

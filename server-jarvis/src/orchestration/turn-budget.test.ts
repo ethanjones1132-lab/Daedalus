@@ -15,8 +15,27 @@ import {
 } from "./turn-budget";
 import { AgentPool, firstTokenTimeoutFor } from "./agent-pool";
 import { resolveTurnRequirement } from "./turn-requirements";
+import { runWithTheta } from "./orchestration-policy";
 
 describe("turn budgets", () => {
+  test("request-scoped absolute cap clamps initial and later stage extensions", () => {
+    const budget = runWithTheta({
+      absolute_turn_cap_ms: 80_000,
+      progress_extension_ms: 20_000,
+      stage_extension_ceiling_ms: 90_000,
+    }, () => createTurnBudget("full_execution", "high", 0));
+
+    expect(budget.turn_ms).toBe(80_000);
+    expect(budget.deadlineAt).toBe(80_000);
+
+    // The budget may outlive the request ALS; its extension must retain the
+    // cap captured when the request admitted it.
+    budget.extendStageOnProgress("executor", 1);
+    expect(budget.stage_ms.executor).toBe(80_000);
+    expect(budget.turn_ms).toBe(80_000);
+    expect(budget.deadlineAt).toBe(80_000);
+  });
+
   test("request timeouts follow stage remaining time with a 60s floor", () => {
     const budget = {
       turn_ms: 150_000,

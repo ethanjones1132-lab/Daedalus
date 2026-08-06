@@ -268,11 +268,18 @@ export function createTurnBudget(
   opts: CreateTurnBudgetOptions = {},
 ): TurnBudget {
   const base = BUDGETS[requirement];
+  // TurnBudget is used after stage awaits; retain the request policy admitted
+  // here instead of consulting a later request's ALS context during extension.
+  const absoluteTurnCapMs = policy().absolute_turn_cap_ms;
+  const progressExtensionMs = policy().progress_extension_ms;
+  const stageExtensionCeilingPolicyMs = policy().stage_extension_ceiling_ms;
   // Deep-task contract: the explicit force hatch and turns classified deep
   // (deep-read intent / deep task-run continuation) share the same
   // long-haul window.
   const extendedDeep = Boolean(opts.forcedDeepRead || opts.deepTask);
-  const absolute_cap_ms = extendedDeep ? EXTENDED_DEEP_TURN_MS : policy().absolute_turn_cap_ms;
+  const absolute_cap_ms = extendedDeep
+    ? EXTENDED_DEEP_TURN_MS
+    : Math.max(0, Math.floor(absoluteTurnCapMs));
   let turn_ms = requirement === "full_execution" && complexity === "high"
     ? Math.min(180_000, base.turn_ms + 30_000)
     : base.turn_ms;
@@ -281,6 +288,10 @@ export function createTurnBudget(
     turn_ms = EXTENDED_DEEP_TURN_MS;
     // conversational/answer_only have no executor budget — grant one too.
     stage_ms.executor = EXTENDED_DEEP_EXECUTOR_MS;
+  } else {
+    // The policy cap applies when the turn is admitted, not only after it
+    // earns progress. Otherwise a low-cap candidate still starts at baseline.
+    turn_ms = Math.min(turn_ms, absolute_cap_ms);
   }
   // Snapshot of configured ceilings before proportional/F7/progress mutation.
   // W6 re-entry must multiply the *base* config, not an already-scaled value.
@@ -292,8 +303,8 @@ export function createTurnBudget(
   // Extended stages may start above the default 90s progress ceiling; never
   // shrink them via extendStageOnProgress, and allow growth up to absolute_cap.
   const stageExtensionCeilingMs = extendedDeep
-    ? Math.max(policy().stage_extension_ceiling_ms, EXTENDED_DEEP_EXECUTOR_MS)
-    : policy().stage_extension_ceiling_ms;
+    ? Math.max(stageExtensionCeilingPolicyMs, EXTENDED_DEEP_EXECUTOR_MS)
+    : stageExtensionCeilingPolicyMs;
 
   const budget: TurnBudget = {
     requirement,
@@ -367,7 +378,7 @@ export function createTurnBudget(
       if (newEvidenceCount <= 0) return;
       const current = this.stage_ms[stage];
       if (current === undefined) return;
-      const extension = Math.min(newEvidenceCount, 3) * policy().progress_extension_ms;
+      const extension = Math.min(newEvidenceCount, 3) * progressExtensionMs;
       const next = Math.min(stageExtensionCeilingMs, current + extension);
       const granted = next - current;
       if (granted <= 0) return;

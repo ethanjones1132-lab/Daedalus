@@ -176,6 +176,10 @@ export class ClaudeDelegateAvailabilityCache {
   }
 
   async isAvailable(config: JarvisConfig): Promise<boolean> {
+    // The cache is process-global while theta is request-scoped. Keep entries
+    // from policy overlays separate so a candidate never inherits baseline
+    // freshness (or vice versa).
+    const cacheTtlMs = Math.max(0, Math.floor(policy().delegate_availability_cache_ms));
     const delegateModel = config.claude_cli.delegate.model.trim();
     const launch = resolveClaudeCliLaunchOptions({
       authMode: config.claude_cli.auth_mode,
@@ -185,7 +189,7 @@ export class ClaudeDelegateAvailabilityCache {
     });
     const hasOpenCodeGoKey = Boolean(config.opencode_go.api_key?.trim());
     // Include effective auth + key presence so adding/removing a Go key invalidates cache.
-    const key = `${config.claude_cli.auth_mode}:${launch.authMode}:${config.claude_cli.path}:${delegateModel}:goKey=${hasOpenCodeGoKey ? "1" : "0"}`;
+    const key = `${config.claude_cli.auth_mode}:${launch.authMode}:${config.claude_cli.path}:${delegateModel}:goKey=${hasOpenCodeGoKey ? "1" : "0"}:ttl=${cacheTtlMs}`;
     const cached = this.cache.get(key);
     if (cached && this.now() < cached.expiresAt) return cached.available;
 
@@ -193,7 +197,7 @@ export class ClaudeDelegateAvailabilityCache {
     if (launch.authMode === "opencode_go" && !hasOpenCodeGoKey) {
       this.cache.set(key, {
         available: false,
-        expiresAt: this.now() + policy().delegate_availability_cache_ms,
+        expiresAt: this.now() + cacheTtlMs,
       });
       return false;
     }
@@ -206,7 +210,7 @@ export class ClaudeDelegateAvailabilityCache {
     const available = cliAvailable && proxyAvailable;
     this.cache.set(key, {
       available,
-      expiresAt: this.now() + policy().delegate_availability_cache_ms,
+      expiresAt: this.now() + cacheTtlMs,
     });
     return available;
   }
@@ -217,23 +221,26 @@ export class DelegateHealth {
   private cooldownUntil = 0;
   private lastReason: DelegateHealthStrikeReason | undefined;
 
-  private readonly cooldownMs: number;
-
-  constructor(private readonly now: () => number = Date.now) {
-    this.cooldownMs = policy().delegate_health_cooldown_ms;
-  }
+  constructor(private readonly now: () => number = Date.now) {}
 
   isAvailable(): boolean {
     return this.now() >= this.cooldownUntil;
   }
 
-  strike(reason: DelegateHealthStrikeReason): void {
+  /**
+   * `runClaudeDelegate` snapshots the request policy once at its entry and
+   * passes it here. The default keeps direct callers request-scoped too.
+   */
+  strike(
+    reason: DelegateHealthStrikeReason,
+    cooldownMs = policy().delegate_health_cooldown_ms,
+  ): void {
     this.strikes += 1;
     this.lastReason = reason;
     const cooldownMinutes = Math.max(0, this.strikes - 2);
     this.cooldownUntil = cooldownMinutes === 0
       ? 0
-      : this.now() + cooldownMinutes * this.cooldownMs;
+      : this.now() + cooldownMinutes * Math.max(0, Math.floor(cooldownMs));
   }
 
   markHealthy(): void {
@@ -1259,6 +1266,11 @@ async function cleanupLateLaunch(
  * filesystem boundaries. Production integration remains owned by Task 6.
  */
 export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<ExecutorStageOutput> {
+  // A delegate run can outlive the request's immediate call stack. Snapshot
+  // its cooldown policy before any await instead of letting the process-global
+  // health tracker read a later request's ALS context when it records a strike.
+  const healthCooldownMs = Math.max(0, Math.floor(policy().delegate_health_cooldown_ms));
+  const strikeHealth = (reason: DelegateHealthStrikeReason) => input.health.strike(reason, healthCooldownMs);
   const eligibility = delegateEligibility({
     config: input.config,
     profile: input.profile,
@@ -1311,10 +1323,10 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
     narrative = "",
   ): ExecutorStageOutput => {
     if (kind === "timeout" && !toolCalls.some((record) => DELEGATE_WRITE_TOOLS.has(record.name) && !record.is_error)) {
-      input.health.strike("timeout_without_write");
+      strikeHealth("timeout_without_write");
     }
     if (toolCalls.some((record) => record.name === "delegate_cleanup" && record.is_error)) {
-      input.health.strike("termination_unconfirmed");
+      strikeHealth("termination_unconfirmed");
     }
     return {
       ok: false,
@@ -1354,7 +1366,7 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
         baseEnv: input.baseEnv,
       });
     } catch (error) {
-      input.health.strike("spawn_error");
+      strikeHealth("spawn_error");
       return delegateFailure("delegate_spawn_error", `Failed to prepare Claude delegate: ${String(error)}`);
     }
 
@@ -1402,7 +1414,7 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
       return withDiagnostics(terminalOutput(launchResult.kind, records));
     }
     if (launchResult.kind === "error") {
-      input.health.strike("spawn_error");
+      strikeHealth("spawn_error");
       return withDiagnostics(delegateFailure(
         "delegate_spawn_error",
         `Failed to spawn Claude delegate: ${String(launchResult.error)}`,
@@ -1620,7 +1632,7 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
     const terminal = operation.state()
       ?? (afterResult.kind === "timeout" || afterResult.kind === "aborted" ? afterResult.kind : undefined);
     if (cleanupUnconfirmed) {
-      input.health.strike("termination_unconfirmed");
+      strikeHealth("termination_unconfirmed");
       return withDiagnostics({
         ok: false,
         narrative: narrative.join(""),
@@ -1630,12 +1642,12 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
       });
     }
     if (terminal) {
-      if (unverifiedWrite) input.health.strike("unverified_write");
+      if (unverifiedWrite) strikeHealth("unverified_write");
       return withDiagnostics(terminalOutput(terminal, records, narrative.join("")));
     }
     if (afterResult.kind === "error") narrative.push(`Ground-truth verification failed: ${String(afterResult.error)}`);
     if (unverifiedWrite) {
-      input.health.strike("unverified_write");
+      strikeHealth("unverified_write");
       return withDiagnostics({
         ok: false,
         narrative: narrative.join(""),
@@ -1663,7 +1675,7 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
       });
     }
     if (eventCount === 0 && !cliFailureDetail) {
-      input.health.strike("no_event_exit");
+      strikeHealth("no_event_exit");
       return withDiagnostics({
         ok: false,
         narrative: "Claude delegate exited without emitting stream events.",
