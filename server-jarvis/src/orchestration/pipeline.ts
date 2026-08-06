@@ -1,4 +1,5 @@
 import { loadPrompt } from "./prompt-loader";
+import type { WriteEffectObservation } from "./content-fingerprint";
 import { defaultCapabilityIndex } from "../tool-capabilities-default";
 import { deriveEvidenceTaskKind } from "./turn-requirements";
 import { injectToolGuidelines } from "./tool-guidelines";
@@ -813,6 +814,8 @@ export interface PipelineResult {
    * topology that has no ToolCallRecord[] to report).
    */
   toolCalls?: ToolCallRecord[];
+  /** Native filesystem write fingerprints observed during this logical turn. */
+  writeEffects?: WriteEffectObservation[];
   /** Verification-gated check result for this turn (when verification enabled). */
   checkResult?: CheckResult;
   /** True when the reviewer stage accepted (feeds synth-tier reward floor). */
@@ -830,6 +833,8 @@ export interface PipelineResult {
  */
 export interface PipelineSegmentResult {
   state: PipelineStageState;
+  /** Native filesystem write fingerprints observed through this segment. */
+  writeEffects?: WriteEffectObservation[];
   synthesizerAnswer?: string;
   synthesizerFatalError?: string;
   /** Precise code for a pre-synthesis runtime fence such as missing evidence. */
@@ -1017,6 +1022,18 @@ export class PipelineExecutor {
       this.collector = collectorOrConductor.collector ?? outcomeCollector;
       this.conductor = collectorOrConductor;
     }
+  }
+
+  resetWriteEffectLedger(): void {
+    this.ctx.write_effects = [];
+  }
+
+  snapshotWriteEffects(): WriteEffectObservation[] {
+    return (this.ctx.write_effects ?? []).map((effect) => ({
+      ...effect,
+      before: { ...effect.before },
+      after: { ...effect.after },
+    }));
   }
 
   private evidenceRoots(options: PipelineExecuteOptions): string[] {
@@ -5373,6 +5390,7 @@ export class PipelineExecutor {
       segment: Omit<PipelineSegmentResult, "checkResult" | "reviewerAccepted">,
     ): PipelineSegmentResult => ({
       ...segment,
+      writeEffects: this.snapshotWriteEffects(),
       checkResult: this.lastCheckResult,
       reviewerAccepted: this.lastReviewerAccepted,
     });
@@ -6091,7 +6109,7 @@ export class PipelineExecutor {
     // Content observations belong to this logical turn. Replans and repair
     // segments intentionally share the same array so the final gate can see
     // every native write attempt made before synthesis.
-    this.ctx.write_effects = [];
+    this.resetWriteEffectLedger();
     // Reset verification side-channels so prior turns cannot leak into reward.
     this.lastCheckResult = undefined;
     this.lastReviewerAccepted = false;
@@ -6142,6 +6160,7 @@ export class PipelineExecutor {
           outcome: "failed",
           error_code: failure.code,
           toolCalls: state.executor?.toolCalls,
+          writeEffects: this.snapshotWriteEffects(),
           checkResult: this.lastCheckResult,
           reviewerAccepted: this.lastReviewerAccepted,
         };
@@ -6164,6 +6183,7 @@ export class PipelineExecutor {
           outcome: "partial",
           error_code: segment.partialStage.errorCode,
           toolCalls: state.executor?.toolCalls,
+          writeEffects: this.snapshotWriteEffects(),
           checkResult: this.lastCheckResult,
           reviewerAccepted: this.lastReviewerAccepted,
         };
@@ -6200,6 +6220,7 @@ export class PipelineExecutor {
         outcome: gated.outcome,
         error_code: gated.errorCode,
         toolCalls: state.executor?.toolCalls,
+        writeEffects: this.snapshotWriteEffects(),
         checkResult: this.lastCheckResult,
         reviewerAccepted: this.lastReviewerAccepted,
       };
@@ -6262,6 +6283,7 @@ export class PipelineExecutor {
       outcome,
       error_code: errorCode,
       toolCalls: state.executor?.toolCalls,
+      writeEffects: this.snapshotWriteEffects(),
       checkResult: this.lastCheckResult,
       reviewerAccepted: this.lastReviewerAccepted,
     };
@@ -6328,7 +6350,7 @@ export class PipelineExecutor {
     const rewriterSummary = "No rewriting stage executed.";
 
     if (!pipeline.includes("synthesizer")) {
-      return { answer: plan };
+      return { answer: plan, writeEffects: this.snapshotWriteEffects() };
     }
 
     onStateChange({ stage: "synthesizer", status: "running" });
@@ -6369,7 +6391,7 @@ export class PipelineExecutor {
         had_error: 0,
       });
 
-      return { answer: finalAnswer, recursion_depth: 0, outcome: finalAnswer.trim() ? "success" : "failed", error_code: finalAnswer.trim() ? undefined : "empty_completion" };
+      return { answer: finalAnswer, recursion_depth: 0, outcome: finalAnswer.trim() ? "success" : "failed", error_code: finalAnswer.trim() ? undefined : "empty_completion", writeEffects: this.snapshotWriteEffects() };
     } catch (e: any) {
       onStateChange({ stage: "synthesizer", status: "failed", output: errText(e) });
       const fatalError = describePipelineError(errText(e));
@@ -6390,7 +6412,7 @@ export class PipelineExecutor {
       // raw failure text as the answer bubble. `error` (fatalError) carries
       // it through PipelineResult.error, which index.ts turns into an SSE
       // error frame.
-      return { answer: "", error: fatalError, recursion_depth: 0, outcome: "failed", error_code: "stage_error" };
+      return { answer: "", error: fatalError, recursion_depth: 0, outcome: "failed", error_code: "stage_error", writeEffects: this.snapshotWriteEffects() };
     }
   }
 
@@ -6541,7 +6563,7 @@ export class PipelineExecutor {
         had_error: 0,
       });
 
-      return { answer: finalAnswer, recursion_depth: 0, outcome: finalAnswer.trim() ? "success" : "failed", error_code: finalAnswer.trim() ? undefined : "empty_completion" };
+      return { answer: finalAnswer, recursion_depth: 0, outcome: finalAnswer.trim() ? "success" : "failed", error_code: finalAnswer.trim() ? undefined : "empty_completion", writeEffects: this.snapshotWriteEffects() };
     } catch (e: any) {
       onStateChange({ stage: "synthesizer", status: "failed", output: errText(e) });
       const fatalError = describePipelineError(errText(e));
@@ -6562,7 +6584,7 @@ export class PipelineExecutor {
       // raw failure text as the answer bubble. `error` (fatalError) carries
       // it through PipelineResult.error, which index.ts turns into an SSE
       // error frame.
-      return { answer: "", error: fatalError, recursion_depth: 0, outcome: "failed", error_code: "stage_error" };
+      return { answer: "", error: fatalError, recursion_depth: 0, outcome: "failed", error_code: "stage_error", writeEffects: this.snapshotWriteEffects() };
     }
   }
 

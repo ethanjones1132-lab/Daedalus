@@ -269,6 +269,75 @@ describe("pipeline stage telemetry", () => {
     }
   });
 
+  test("PipelineResult surfaces native write fingerprints", async () => {
+    const workspace = mkdtempSync(join(tmpdir(), "jarvis-write-effects-"));
+    try {
+      writeFileSync(join(workspace, "target.txt"), "before\n");
+      const config = defaultConfig();
+      config.jarvis_path = workspace;
+      config.tools.enabled = true;
+      config.tools.sandbox_mode = "workspace";
+      config.claude_cli.delegate.enabled = false;
+      const runtime = createToolRuntime();
+      registerFilesystemBundle(runtime);
+      const ctx = makeExecutionContext("chat", config, {
+        workspace_path: workspace,
+        requestApproval: async () => true,
+      });
+      const priorToolCalls = [{
+        name: "read_file",
+        arguments: { path: "target.txt" },
+        output: "    1 | before",
+        is_error: false,
+        duration_ms: 1,
+      }];
+      let executorTurns = 0;
+      const executor = new PipelineExecutor(
+        async (_messages, options) => {
+          if (options.stageLabel === "executor" && executorTurns++ === 0) {
+            return {
+              content: "apply edit",
+              tool_calls: [toolCallWithArgs("edit_file", {
+                path: "target.txt",
+                old_string: "before",
+                new_string: "after",
+              })],
+            };
+          }
+          if (options.stageLabel === "executor") return { content: "done" };
+          if (options.stageLabel === "synthesizer") return { content: "Updated target.txt." };
+          return { content: "unexpected" };
+        },
+        runtime,
+        ctx,
+        { recordStageRun: () => {} },
+      );
+      const result = await executor.execute(
+        "Update target.txt",
+        ["executor", "synthesizer"],
+        "run-native-write-effects",
+        () => {},
+        {
+          executionProfile: "full",
+          rawMessage: "Update target.txt",
+          taskRunWriteIntent: true,
+          priorToolCalls,
+        },
+      );
+      expect(readFileSync(join(workspace, "target.txt"), "utf8")).toBe("after\n");
+      expect(result.writeEffects).toHaveLength(1);
+      expect(result.writeEffects?.[0]).toMatchObject({
+        toolName: "edit_file",
+        path: expect.stringContaining("target.txt"),
+        changed: true,
+      });
+      expect(result.writeEffects?.[0]?.before.sha256)
+        .not.toBe(result.writeEffects?.[0]?.after.sha256);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
   test("C1: seeded raw priorToolCalls above context cap do not unlock ledger or deflect as complete", async () => {
     // Raw priorToolCalls carry full tool output without the prepareToolResultForContext
     // marker. Re-seed must recompute truncation against the write-turn cap so a live

@@ -91,6 +91,9 @@ export interface ReplanLoopArgs {
  * (graceful degradation — never an aborted turn).
  */
 export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<PipelineResult> {
+  // One native write-effect ledger spans the entire logical turn, including
+  // all replan and repair segments. Individual segments only snapshot it.
+  args.executor.resetWriteEffectLedger?.();
   let decision = args.initialDecision;
   let carry: PipelineStageState = {};
   let replans = 0;
@@ -310,7 +313,13 @@ function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean)
   // Task 5.3: thread verification fields from the segment so index.ts reward
   // mapping (`result.checkResult` → mapCheckToReward → verified_via/check_tier)
   // works on the production replan-loop path (not only PipelineExecutor.execute).
-  const checkFields = {
+  const evidenceFields = {
+    toolCalls: segment.state.executor?.toolCalls,
+    writeEffects: (segment.writeEffects ?? []).map((effect) => ({
+      ...effect,
+      before: { ...effect.before },
+      after: { ...effect.after },
+    })),
     checkResult: segment.checkResult,
     reviewerAccepted: segment.reviewerAccepted,
   };
@@ -321,8 +330,7 @@ function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean)
       cancelled: true,
       outcome: "failed",
       error_code: segment.state.executor.errorCode ?? "delegate_aborted",
-      toolCalls: segment.state.executor.toolCalls,
-      ...checkFields,
+      ...evidenceFields,
     };
   }
   if (segment.state.executor?.errorCode === "delegate_cleanup_unconfirmed") {
@@ -331,8 +339,7 @@ function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean)
       error: segment.state.executor.narrative || "Claude delegate cleanup could not be confirmed.",
       outcome: "failed",
       error_code: "delegate_cleanup_unconfirmed",
-      toolCalls: segment.state.executor.toolCalls,
-      ...checkFields,
+      ...evidenceFields,
     };
   }
   const upstreamDegraded = Boolean(
@@ -357,9 +364,8 @@ function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean)
       recursion_depth: 0,
       outcome: partialErrorCode ? "partial" : gated.outcome,
       error_code: partialErrorCode ?? gated.errorCode,
-      toolCalls: segment.state.executor?.toolCalls,
       replanRequested: segment.replanRequested,
-      ...checkFields,
+      ...evidenceFields,
     };
   }
 
@@ -409,8 +415,7 @@ function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean)
     recursion_depth: 0,
     outcome,
     error_code: errorCode,
-    toolCalls: segment.state.executor?.toolCalls,
     replanRequested: segment.replanRequested,
-    ...checkFields,
+    ...evidenceFields,
   };
 }

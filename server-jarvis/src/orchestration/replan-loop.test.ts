@@ -12,6 +12,7 @@ import type { CoordinatorResult } from "./coordinator";
 import { ConductorBus } from "./conductor-bus";
 import { LiveConductor } from "./conductor";
 import { AgentPool, DEFAULT_ORCHESTRATOR_AGENTS } from "./agent-pool";
+import type { WriteEffectObservation } from "./content-fingerprint";
 
 // In-memory collector so this test can never touch the production self-tuning DB.
 const testCollector: StageRunRecorder = { recordStageRun: () => {} };
@@ -26,6 +27,16 @@ function baseDecision(overrides: Partial<CoordinatorResult> = {}): CoordinatorRe
     context: { needs_workspace_inspection: true, needs_memory: false, estimated_complexity: "medium" },
     coordinator_rationale: "fixture",
     ...overrides,
+  };
+}
+
+function changedEffect(path: string): WriteEffectObservation {
+  return {
+    toolName: "edit_file",
+    path,
+    before: { path, exists: true, bytes: 1, sha256: "a".repeat(64) },
+    after: { path, exists: true, bytes: 1, sha256: "b".repeat(64) },
+    changed: true,
   };
 }
 
@@ -723,6 +734,70 @@ describe("runPipelineWithReplanning", () => {
     expect(result.checkResult).toEqual(checkResult);
     expect(result.reviewerAccepted).toBe(true);
     expect(result.answer).toBe("Change applied and verified.");
+  });
+
+  test("finalizeSegment preserves write effects", async () => {
+    const effect = changedEffect("src/a.ts");
+    const executor = {
+      resetWriteEffectLedger: () => {},
+      executeSegment: async () => ({
+        state: {
+          executor: { ok: true, narrative: "wrote file", toolCalls: [] },
+        },
+        synthesizerAnswer: "Change applied.",
+        synthesizerEmptyCompletion: false,
+        writeEffects: [effect],
+      }),
+    } as unknown as PipelineExecutor;
+    const coordinator = new Coordinator((async () => ({ content: "unused" })) as any);
+    const result = await runPipelineWithReplanning({
+      contextMessage: "fix the bug",
+      initialDecision: baseDecision({ pipeline: ["executor", "synthesizer"] }),
+      turnRequirement: "full_execution",
+      coordinator,
+      routeOptions: { sessionId: "write-effects-finalize" },
+      executor,
+      agentRunId: "run-write-effects-finalize",
+      onStateChange: () => {},
+      baseOptions: {},
+      maxReplans: 0,
+    });
+    expect(result.writeEffects).toEqual([effect]);
+    expect(result.writeEffects?.[0]).not.toBe(effect);
+  });
+
+  test("cancelled result still carries landed write evidence", async () => {
+    const effect = changedEffect("src/a.ts");
+    const executor = {
+      resetWriteEffectLedger: () => {},
+      executeSegment: async () => ({
+        state: {
+          executor: {
+            ok: false,
+            narrative: "cancelled after write",
+            toolCalls: [],
+            terminalStatus: "cancelled" as const,
+            errorCode: "delegate_aborted",
+          },
+        },
+        writeEffects: [effect],
+      }),
+    } as unknown as PipelineExecutor;
+    const coordinator = new Coordinator((async () => ({ content: "unused" })) as any);
+    const result = await runPipelineWithReplanning({
+      contextMessage: "fix then stop",
+      initialDecision: baseDecision({ pipeline: ["executor", "synthesizer"] }),
+      turnRequirement: "full_execution",
+      coordinator,
+      routeOptions: { sessionId: "write-effects-cancelled" },
+      executor,
+      agentRunId: "run-write-effects-cancelled",
+      onStateChange: () => {},
+      baseOptions: {},
+      maxReplans: 0,
+    });
+    expect(result.cancelled).toBe(true);
+    expect(result.writeEffects).toEqual([effect]);
   });
 
   test("read_only profile cannot escalate to full even if the replanned decision implies more authority", async () => {
