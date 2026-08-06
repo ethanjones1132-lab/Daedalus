@@ -28,6 +28,7 @@ import {
 } from "./policy-staging";
 import { runWithPolicyOverlay } from "./learned-pool-state";
 import { hashInstruction, type InstructionVariantSelection } from "../orchestration/worker-prompt";
+import { rolloutRandom } from "../orchestration/orchestration-policy";
 
 export interface RoutingRecordInput {
   agentRunId: string;
@@ -179,7 +180,7 @@ export class ConductorLearningLoop {
       const conductorStats = stats.find((s) => s.variant_id === conductorKey && s.stage_id === stage);
       const baselineStats = stats.find((s) => s.variant_id === baselineKey && s.stage_id === stage);
 
-      const explore = Math.random() < epsilon;
+      const explore = rolloutRandom() < epsilon;
       let pick: "conductor" | "baseline" = "conductor";
 
       if (!explore && conductorStats && baselineStats && conductorStats.sample_count >= 3 && baselineStats.sample_count >= 3) {

@@ -5,6 +5,7 @@ import { resetLearnedPoolStateForTests } from "./learned-pool-state";
 import { getPolicyVersionStore, resetPolicyStagingForTests } from "./policy-staging";
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
 import { hashInstruction } from "../orchestration/worker-prompt";
+import { BASELINE_THETA, withRollout } from "../orchestration/orchestration-policy";
 
 const TEST_DB = ":memory:";
 
@@ -329,6 +330,36 @@ describe("Conductor learning (Phase 4)", () => {
     );
     expect(selection.variants.executor).toBe("baseline");
     expect(selection.instructions?.executor).toBeUndefined();
+  });
+
+  test("instruction-bandit exploration follows the rollout PRNG", () => {
+    const store = new SelfTuningStore(TEST_DB);
+    const loop = new ConductorLearningLoop(store, {
+      enabled: true,
+      min_samples_for_heuristics: 5,
+      capability_adjustment_step: 0.03,
+      trajectory_export: false,
+      instruction_ab_epsilon: 0.5,
+      max_trajectory_snapshots: 100,
+    });
+    const instructionText = "Always run tests before committing.";
+    const conductorKey = `conductor:${hashInstruction(instructionText)}`;
+    for (let i = 0; i < 6; i++) {
+      store.upsertInstructionVariantStats("baseline", "executor", "coding", true);
+      store.upsertInstructionVariantStats(conductorKey, "executor", "coding", false);
+    }
+
+    const exploring = withRollout(
+      { theta: BASELINE_THETA, seed: 7, fixtureId: "instruction-bandit" },
+      () => loop.selectInstructionVariants({ executor: instructionText }, "coding"),
+    );
+    const exploiting = withRollout(
+      { theta: BASELINE_THETA, seed: 1, fixtureId: "instruction-bandit" },
+      () => loop.selectInstructionVariants({ executor: instructionText }, "coding"),
+    );
+
+    expect(exploring.result.variants.executor).toBe(conductorKey);
+    expect(exploiting.result.variants.executor).toBe("baseline");
   });
 
   test("proposeStagedPolicy layers on top of immediate capability path without replacing it", async () => {

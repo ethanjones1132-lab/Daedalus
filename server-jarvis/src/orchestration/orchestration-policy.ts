@@ -478,6 +478,30 @@ export interface RolloutSpec {
 }
 
 /**
+ * Request-scoped services used by model-free policy rollout fixtures.
+ * Production callers retain the platform defaults outside a rollout.
+ */
+export interface RolloutRuntime {
+  random: () => number;
+  now: () => number;
+  id: (prefix: string) => string;
+}
+
+const rolloutRuntimeAls = new AsyncLocalStorage<RolloutRuntime>();
+
+export function rolloutRandom(): number {
+  return rolloutRuntimeAls.getStore()?.random() ?? Math.random();
+}
+
+export function rolloutNow(): number {
+  return rolloutRuntimeAls.getStore()?.now() ?? Date.now();
+}
+
+export function rolloutId(prefix: string): string {
+  return rolloutRuntimeAls.getStore()?.id(prefix) ?? `${prefix}_${crypto.randomUUID()}`;
+}
+
+/**
  * Stable fingerprint of (θ, seed, fixture). Same inputs → same string forever.
  * Phase D uses this to detect non-deterministic trajectories.
  */
@@ -511,13 +535,31 @@ export function mulberry32(seed: number): () => number {
 export function withRollout<T>(
   spec: RolloutSpec,
   fn: (rng: () => number) => T,
-): { fingerprint: string; result: T; theta: OrchestrationTheta } {
+): { fingerprint: string; result: T; theta: OrchestrationTheta };
+export function withRollout<T>(
+  spec: RolloutSpec,
+  fn: (rng: () => number) => Promise<T>,
+): { fingerprint: string; result: Promise<T>; theta: OrchestrationTheta };
+export function withRollout<T>(
+  spec: RolloutSpec,
+  fn: (rng: () => number) => T | Promise<T>,
+): { fingerprint: string; result: T | Promise<T>; theta: OrchestrationTheta } {
   const theta = isFullTheta(spec.theta)
     ? freezeTheta(spec.theta)
     : mergeTheta(BASELINE_THETA, spec.theta);
   const fingerprint = rolloutFingerprint({ ...spec, theta });
-  const rng = mulberry32(spec.seed);
-  const result = runWithTheta(theta, () => fn(rng));
+  const seed = spec.seed | 0;
+  const rng = mulberry32(seed);
+  let now = 1_700_000_000_000 + seed * 1_000;
+  let idCounter = 0;
+  const runtime: RolloutRuntime = {
+    random: rng,
+    now: () => now++,
+    id: (prefix) => `${prefix}_${seed}_${idCounter++}`,
+  };
+  // Install the deterministic services around the θ scope so both ALS
+  // contexts persist through any async work returned by the rollout body.
+  const result = rolloutRuntimeAls.run(runtime, () => runWithTheta(theta, () => fn(rng)));
   return { fingerprint, result, theta };
 }
 

@@ -29,8 +29,10 @@ import {
 } from "./policy-staging";
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
 import {
+  BASELINE_THETA,
   policy,
   resetGlobalThetaToBaseline,
+  withRollout,
 } from "../orchestration/orchestration-policy";
 
 const routingPatch: PolicyPatch = {
@@ -161,6 +163,21 @@ describe("propose → eligible → shadow → canary → promote", () => {
     expect(prodSnap.modelRoutingScoreDeltas["opencode_go:deepseek-v4-flash"]).toBeUndefined();
     // Live pool still production (empty) during canary.
     expect(getLearnedPoolState().modelRoutingScoreDeltas.size).toBe(0);
+  });
+
+  test("default canary draw follows the rollout PRNG", () => {
+    advanceToCanary();
+    const canary = withRollout(
+      { theta: BASELINE_THETA, seed: 7, fixtureId: "canary-draw" },
+      () => shouldApplyCanary(),
+    );
+    const production = withRollout(
+      { theta: BASELINE_THETA, seed: 1, fixtureId: "canary-draw" },
+      () => shouldApplyCanary(),
+    );
+
+    expect(canary.result).toBe(true);
+    expect(production.result).toBe(false);
   });
 
   test("promote applies snapshot to pool and seeds last-known-good", () => {

@@ -104,9 +104,9 @@ Every threshold shipped this week was a human reading the evidence store and pic
 **C3 — Reproducible rollouts.**
 - `RolloutSpec` = `{ theta, seed, fixtureId }`
 - `rolloutFingerprint` (SHA-256, deterministic)
-- `mulberry32` PRNG + `withRollout` binds θ + seed for offline identity checks
+- `mulberry32` + `withRollout` bind θ, seed, runtime PRNG/time/IDs, and fixture identity for offline trajectory checks
 
-**Implementation complete:** every inventory-approved optimizable runtime decision is a θ dimension; baseline tests pin key values; replay fingerprint is deterministic. **Live fixture exit proof remains pending.**
+**Implementation complete:** every inventory-approved optimizable runtime decision is a θ dimension; baseline tests pin key values. C3 proves deterministic, model-free policy trajectories over recorded fixture inputs. It controls θ, PRNG, fixture identity, rollout time, and event IDs. It does not claim live model/provider responses are deterministic; Phase D records those outputs as stochastic rollout evidence.
 
 **Still open:** Phase D CMA-ES over θ against Phase B reward.
 

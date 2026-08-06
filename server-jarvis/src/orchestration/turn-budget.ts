@@ -1,5 +1,5 @@
 import type { TurnRequirement } from "./turn-requirements";
-import { BASELINE_THETA, policy } from "./orchestration-policy";
+import { BASELINE_THETA, policy, rolloutNow } from "./orchestration-policy";
 
 export interface TurnBudget {
   requirement: TurnRequirement;
@@ -170,7 +170,7 @@ export const STAGE_PROPORTIONAL_K = 2;
 export function scaleStageBudgetProportional(
   budget: TurnBudget,
   stage: string,
-  now = Date.now(),
+  now = rolloutNow(),
   baseConfiguredMs?: number,
 ): number | undefined {
   const current = budget.stage_ms[stage];
@@ -193,7 +193,7 @@ export function scaleLastQueuedStageBudget(
   budget: TurnBudget,
   stage: string,
   remainingQueue: readonly string[],
-  now = Date.now(),
+  now = rolloutNow(),
 ): number | undefined {
   const current = budget.stage_ms[stage];
   if (current === undefined) return undefined;
@@ -264,7 +264,7 @@ const BUDGETS: Record<TurnRequirement, Omit<TurnBudget, "requirement" | "complex
 export function createTurnBudget(
   requirement: TurnRequirement,
   complexity: "low" | "medium" | "high" = "medium",
-  startedAt = Date.now(),
+  startedAt = rolloutNow(),
   opts: CreateTurnBudgetOptions = {},
 ): TurnBudget {
   const base = BUDGETS[requirement];
@@ -315,23 +315,23 @@ export function createTurnBudget(
     max_stage_attempts: base.max_stage_attempts,
     stage_ms,
     deadlineAt: startedAt + turn_ms,
-    remainingMs(now = Date.now()) {
+    remainingMs(now = rolloutNow()) {
       return Math.max(0, this.deadlineAt - now);
     },
-    stageUsedMs(stage, now = Date.now()) {
+    stageUsedMs(stage, now = rolloutNow()) {
       const accumulated = stageUsedAccumMs.get(stage) ?? 0;
       const inflightStart = stageInflightStart.get(stage);
       const inflight = inflightStart !== undefined ? Math.max(0, now - inflightStart) : 0;
       return accumulated + inflight;
     },
-    stageRemainingMs(stage, now = Date.now()) {
+    stageRemainingMs(stage, now = rolloutNow()) {
       const stageBudget = this.stage_ms[stage];
       if (stageBudget === undefined) return this.remainingMs(now);
       const used = this.stageUsedMs(stage, now);
       const stageLeft = Math.max(0, stageBudget - used);
       return Math.max(0, Math.min(stageLeft, this.remainingMs(now)));
     },
-    canStart(stage, now = Date.now()) {
+    canStart(stage, now = rolloutNow()) {
       if (this.remainingMs(now) <= this.finalization_reserve_ms) return false;
       const stageBudget = this.stage_ms[stage];
       if (stageBudget === undefined) return true;
@@ -341,7 +341,7 @@ export function createTurnBudget(
       // admitted a reviewer with two seconds left. See MIN_VIABLE_STAGE_MS.
       return this.stageRemainingMs(stage, now) >= minViableStageMs(stage, stageBudget);
     },
-    beginStage(stage, now = Date.now()) {
+    beginStage(stage, now = rolloutNow()) {
       // Only for budgeted stages; synthesizer has no stage_ms entry.
       if (this.stage_ms[stage] === undefined) return;
       // Already inflight (retry without endStage) — share the window (T1.1).
@@ -352,14 +352,14 @@ export function createTurnBudget(
         stageInflightStart.set(stage, now);
       }
     },
-    endStage(stage, now = Date.now()) {
+    endStage(stage, now = rolloutNow()) {
       const start = stageInflightStart.get(stage);
       if (start === undefined) return;
       stageInflightStart.delete(stage);
       const slice = Math.max(0, now - start);
       stageUsedAccumMs.set(stage, (stageUsedAccumMs.get(stage) ?? 0) + slice);
     },
-    stageStreamDeadlineAt(stage, now = Date.now()) {
+    stageStreamDeadlineAt(stage, now = rolloutNow()) {
       const stageBudget = this.stage_ms[stage];
       if (stageBudget === undefined) return undefined;
       // Usage-based: remaining budget from *now*, not first-begin wall clock.

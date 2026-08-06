@@ -25,6 +25,7 @@ import {
   ThetaValidationError,
   mergeTheta,
   migrateLegacyThetaPatch,
+  rolloutRandom,
 } from "../orchestration/orchestration-policy";
 import {
   applyPolicySnapshotToPool,
@@ -531,7 +532,7 @@ export function runShadowReplay(
  * Whether this live run should receive the canary policy (10% default).
  * Only true while a canary is active.
  */
-export function shouldApplyCanary(rng: () => number = Math.random): boolean {
+export function shouldApplyCanary(rng: () => number = rolloutRandom): boolean {
   if (!store.canary || store.canary.stage !== "canary") return false;
   return rng() < POLICY_STAGING_GOVERNANCE.canaryTrafficFraction;
 }

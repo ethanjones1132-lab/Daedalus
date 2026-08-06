@@ -10,6 +10,9 @@ import {
   parseTheta,
   policy,
   resetGlobalThetaToBaseline,
+  rolloutId,
+  rolloutNow,
+  rolloutRandom,
   rolloutFingerprint,
   runWithTheta,
   serializeTheta,
@@ -192,5 +195,20 @@ describe("C3 reproducible rollouts", () => {
     );
     expect(again.fingerprint).toBe(fingerprint);
     expect(again.result).toEqual(result);
+  });
+
+  test("withRollout controls random, time, and ids", () => {
+    const spec = { theta: BASELINE_THETA, seed: 42, fixtureId: "runtime" };
+    const first = withRollout(spec, () => ({
+      draws: [rolloutRandom(), rolloutRandom()],
+      times: [rolloutNow(), rolloutNow()],
+      ids: [rolloutId("evt"), rolloutId("evt")],
+    }));
+    const second = withRollout(spec, () => ({
+      draws: [rolloutRandom(), rolloutRandom()],
+      times: [rolloutNow(), rolloutNow()],
+      ids: [rolloutId("evt"), rolloutId("evt")],
+    }));
+    expect(second.result).toEqual(first.result);
   });
 });
