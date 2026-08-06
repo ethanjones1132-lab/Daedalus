@@ -779,7 +779,7 @@ export const platformDelegateProcessTreeKiller = createPlatformDelegateProcessTr
 async function fileIdentity(path: string): Promise<string> {
   try {
     const content = await readFile(path);
-    return `sha256:${createHash("sha256").update(content).digest("hex")}`;
+    return `sha256:${createHash("sha256").update(content).digest("hex")};bytes=${content.byteLength}`;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") return "missing";
@@ -1012,19 +1012,40 @@ function writeVerified(
     : snapshotChanged(roots, before, after);
 }
 
+interface DelegateIdentityFingerprint {
+  fingerprint: ContentFingerprint;
+  /** Only exact content hashes or an observed absence are reward-grade evidence. */
+  verified: boolean;
+}
+
 function fingerprintFromDelegateIdentity(
   path: string,
   identity: string | undefined,
-): ContentFingerprint {
+): DelegateIdentityFingerprint {
   if (!identity || identity === "missing") {
-    return { path, exists: false, bytes: 0, sha256: null };
+    return {
+      fingerprint: { path, exists: false, bytes: 0, sha256: null },
+      verified: true,
+    };
   }
-  const match = /^sha256:([a-f0-9]{64})$/i.exec(identity);
+  const match = /^sha256:([a-f0-9]{64})(?:;bytes=(\d+))?$/i.exec(identity);
+  if (match) {
+    return {
+      fingerprint: {
+        path,
+        exists: true,
+        bytes: match[2] === undefined ? null : Number(match[2]),
+        sha256: match[1]!.toLowerCase(),
+      },
+      verified: true,
+    };
+  }
+  // `unreadable:<errno>` and legacy mtime/size identities establish neither
+  // content nor a safe delta. Keep their unknown byte count explicit and do
+  // not allow them to mint Phase B write credit.
   return {
-    path,
-    exists: true,
-    bytes: 0,
-    sha256: match?.[1]?.toLowerCase() ?? createHash("sha256").update(identity).digest("hex"),
+    fingerprint: { path, exists: true, bytes: null, sha256: null },
+    verified: false,
   };
 }
 
@@ -1082,14 +1103,15 @@ export function delegateSnapshotWriteEffects(
     const afterIdentity = afterFiles.get(path);
     const beforeFingerprint = fingerprintFromDelegateIdentity(path, beforeIdentity);
     const afterFingerprint = fingerprintFromDelegateIdentity(path, afterIdentity);
-    const changed = beforeFingerprint.exists !== afterFingerprint.exists
-      || beforeFingerprint.sha256 !== afterFingerprint.sha256;
+    if (!beforeFingerprint.verified || !afterFingerprint.verified) continue;
+    const changed = beforeFingerprint.fingerprint.exists !== afterFingerprint.fingerprint.exists
+      || beforeFingerprint.fingerprint.sha256 !== afterFingerprint.fingerprint.sha256;
     if (!changed) continue;
     effects.push({
       toolName: toolsByPath.get(path) ?? "delegate",
       path,
-      before: beforeFingerprint,
-      after: afterFingerprint,
+      before: beforeFingerprint.fingerprint,
+      after: afterFingerprint.fingerprint,
       changed,
     });
   }

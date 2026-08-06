@@ -34,9 +34,10 @@ score ∈ [-1, 1] = baseScore(writes, check, plan) − overclaimPenalty
 ### Writes
 
 1. **Content delta, not claim.** Credit requires a successful write tool (or fingerprint delta). Narrating a patch does not score.
-2. **Task targets when known.** If the request/plan names paths, only those paths credit. Writing `NOTES.md` or inventing adjacent files earns zero write term.
-3. **Status/log denylist.** Without targets, basenames matching `*_STATUS*.md` / `*_LOG*.md` never credit (same rule as the write-effect gate). A task that *names* `EXECUTION_LOG.md` can still target it explicitly.
-4. **Write-required flag.** Read-only turns drop the write weight (re-normalize); inventing fake write-required labels is a policy input from requirement/writeIntent/wroteCode, not from the model.
+2. **Unknown is not a delta.** Unreadable or legacy non-content snapshot identities do not produce a write effect; a missing byte length is represented as `null`, never as a synthetic zero-byte file.
+3. **Task targets when known.** If the request/plan names paths, only those paths credit. Writing `NOTES.md` or inventing adjacent files earns zero write term.
+4. **Status/log denylist.** Without targets, basenames matching `*_STATUS*.md` / `*_LOG*.md` never credit (same rule as the write-effect gate). A task that *names* `EXECUTION_LOG.md` can still target it explicitly.
+5. **Write-required flag.** Read-only turns drop the write weight (re-normalize); inventing fake write-required labels is a policy input from requirement/writeIntent/wroteCode, not from the model.
 
 **Residual risk:** a successful write tool that writes garbage to a target path still earns the write term. That is intentional — the **check** term must fail independent compile/test. Writes alone cannot max the score when a check is required.
 

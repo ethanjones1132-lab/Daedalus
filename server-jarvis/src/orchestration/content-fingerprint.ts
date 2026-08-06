@@ -4,7 +4,8 @@ import { promises as fs } from "fs";
 export interface ContentFingerprint {
   path: string;
   exists: boolean;
-  bytes: number;
+  /** Null means the snapshot could not establish a trustworthy byte length. */
+  bytes: number | null;
   sha256: string | null;
 }
 

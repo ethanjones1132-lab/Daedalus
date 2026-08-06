@@ -57,8 +57,8 @@ test("delegate snapshot diff produces cryptographic write effects", () => {
   }]);
   expect(effects).toEqual([expect.objectContaining({
     toolName: "edit_file", path, changed: true,
-    before: expect.objectContaining({ sha256: "a".repeat(64), exists: true }),
-    after: expect.objectContaining({ sha256: "b".repeat(64), exists: true }),
+    before: expect.objectContaining({ sha256: "a".repeat(64), exists: true, bytes: null }),
+    after: expect.objectContaining({ sha256: "b".repeat(64), exists: true, bytes: null }),
   })]);
 });
 
@@ -71,6 +71,39 @@ test("unverified tool narration does not create a delegate write effect", () => 
     name: "write_file", arguments: { path: "C:\\repo\\claimed.ts" },
     output: "success", is_error: false, duration_ms: 1,
   }])).toEqual([]);
+});
+
+test("unreadable or unknown delegate identities cannot mint write effects", () => {
+  const path = "c:\\repo\\claimed.ts";
+  const base = {
+    root: "C:\\repo", kind: "git" as const, status: "", diffStat: "", fingerprint: "same",
+  };
+  const record = [{
+    name: "edit_file", arguments: { path }, output: "ok", is_error: false, duration_ms: 1,
+  }];
+  for (const identity of ["unreadable:EPERM", "100:10"]) {
+    expect(delegateSnapshotWriteEffects(
+      [{ ...base, files: { [path]: `sha256:${"a".repeat(64)};bytes=3` } }],
+      [{ ...base, files: { [path]: identity } }],
+      record,
+    )).toEqual([]);
+  }
+});
+
+test("delegate snapshot effects preserve known byte counts", () => {
+  const path = "c:\\repo\\claimed.ts";
+  const base = {
+    root: "C:\\repo", kind: "git" as const, status: "", diffStat: "", fingerprint: "same",
+  };
+  const effects = delegateSnapshotWriteEffects(
+    [{ ...base, files: { [path]: `sha256:${"a".repeat(64)};bytes=3` } }],
+    [{ ...base, files: { [path]: `sha256:${"b".repeat(64)};bytes=5` } }],
+    [{ name: "edit_file", arguments: { path }, output: "ok", is_error: false, duration_ms: 1 }],
+  );
+  expect(effects[0]).toMatchObject({
+    before: { bytes: 3 },
+    after: { bytes: 5 },
+  });
 });
 
 test("delegate cooldown reads request-scoped theta", () => {
@@ -347,8 +380,8 @@ describe("Claude executor delegate", () => {
       const after = await nodeDelegateSnapshotFactory.capture([root]);
       const beforeIdentity = Object.values(before[0]!.files)[0];
       const afterIdentity = Object.values(after[0]!.files)[0];
-      expect(beforeIdentity).toMatch(/^sha256:[0-9a-f]{64}$/);
-      expect(afterIdentity).toMatch(/^sha256:[0-9a-f]{64}$/);
+      expect(beforeIdentity).toMatch(/^sha256:[0-9a-f]{64};bytes=4$/);
+      expect(afterIdentity).toMatch(/^sha256:[0-9a-f]{64};bytes=4$/);
       expect(afterIdentity).not.toBe(beforeIdentity);
     } finally {
       await rm(root, { recursive: true, force: true });
