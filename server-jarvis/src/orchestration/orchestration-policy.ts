@@ -77,15 +77,12 @@ export interface OrchestrationTheta {
 
   // Reward weights / overclaim penalty are evaluator-owned (Phase B) and
   // deliberately excluded from θ so Phase D cannot optimize its own fitness.
+  // Policy-staging admission thresholds (canary traffic fraction, promotion
+  // floors) are the same class — see POLICY_STAGING_GOVERNANCE — and must not
+  // reappear here for CMA-ES to tune.
 
   // ── Misc ────────────────────────────────────────────────────────────────
   repetition_similarity_threshold: number;
-
-  // ── Policy staging traffic (meta-θ) ─────────────────────────────────────
-  policy_canary_traffic_fraction: number;
-  policy_min_canary_success_rate: number;
-  policy_min_eligible_outcomes_before_shadow: number;
-  policy_min_canary_runs_before_promotion: number;
 }
 
 /** Ordered keys — stable serialization / CMA-ES vector layout. */
@@ -133,10 +130,6 @@ export const THETA_KEYS: readonly (keyof OrchestrationTheta)[] = [
   "executor_transcript_budget_tokens",
   "write_turn_transcript_budget_tokens",
   "repetition_similarity_threshold",
-  "policy_canary_traffic_fraction",
-  "policy_min_canary_success_rate",
-  "policy_min_eligible_outcomes_before_shadow",
-  "policy_min_canary_runs_before_promotion",
 ] as const;
 
 /**
@@ -194,11 +187,6 @@ export const BASELINE_THETA: OrchestrationTheta = {
   write_turn_transcript_budget_tokens: 24_000,
 
   repetition_similarity_threshold: 0.25,
-
-  policy_canary_traffic_fraction: 0.1,
-  policy_min_canary_success_rate: 0.6,
-  policy_min_eligible_outcomes_before_shadow: 20,
-  policy_min_canary_runs_before_promotion: 20,
 };
 
 export type ThetaPatch = Partial<OrchestrationTheta>;

@@ -20,7 +20,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { SESSIONS_DIR } from "../config";
-import { BASELINE_THETA, policy } from "../orchestration/orchestration-policy";
 import {
   applyPolicySnapshotToPool,
   getLearnedPoolState,
@@ -31,17 +30,29 @@ import {
 /** Re-export so consumers can import staged-policy types from one module. */
 export type { PolicySnapshot } from "./learned-pool-state";
 
-// ── Thresholds (from plan / Phase C θ baseline) ─────────────────────────────
+// ── Governance (immutable — deliberately outside optimizable θ) ─────────────
+// Same values previously on BASELINE_THETA.policy_* but excluded from
+// OrchestrationTheta so Phase D CMA-ES cannot tune its own promotion
+// admission criteria (reward-isolation class, sibling of 0c1face).
+
+export const POLICY_STAGING_GOVERNANCE = Object.freeze({
+  canaryTrafficFraction: 0.1,
+  minCanarySuccessRate: 0.6,
+  minEligibleOutcomesBeforeShadow: 20,
+  minCanaryRunsBeforePromotion: 20,
+});
+
+// ── Thresholds (governance + operational rollback knobs) ────────────────────
 
 export const POLICY_STAGING_THRESHOLDS = {
   /** Eligible outcomes required before a candidate may enter shadow replay. */
-  minEligibleOutcomesBeforeShadow: BASELINE_THETA.policy_min_eligible_outcomes_before_shadow,
+  minEligibleOutcomesBeforeShadow: POLICY_STAGING_GOVERNANCE.minEligibleOutcomesBeforeShadow,
   /** Fraction of live traffic that receives the canary policy. */
-  canaryTrafficFraction: BASELINE_THETA.policy_canary_traffic_fraction,
+  canaryTrafficFraction: POLICY_STAGING_GOVERNANCE.canaryTrafficFraction,
   /** Minimum canary runs before promotion may be evaluated. */
-  minCanaryRunsBeforePromotion: BASELINE_THETA.policy_min_canary_runs_before_promotion,
+  minCanaryRunsBeforePromotion: POLICY_STAGING_GOVERNANCE.minCanaryRunsBeforePromotion,
   /** Absolute floor on canary success rate for promotion. */
-  minCanarySuccessRate: BASELINE_THETA.policy_min_canary_success_rate,
+  minCanarySuccessRate: POLICY_STAGING_GOVERNANCE.minCanarySuccessRate,
   /**
    * Canary must not underperform production by more than this margin
    * (success-rate points) at promotion time.
@@ -480,7 +491,9 @@ export function runShadowReplay(
  */
 export function shouldApplyCanary(rng: () => number = Math.random): boolean {
   if (!store.canary || store.canary.stage !== "canary") return false;
-  return rng() < policy().policy_canary_traffic_fraction;
+  // Governance constant — never policy()/θ, so a candidate cannot widen its
+  // own canary traffic fraction into production.
+  return rng() < POLICY_STAGING_GOVERNANCE.canaryTrafficFraction;
 }
 
 /**

@@ -58,6 +58,15 @@ describe("OrchestrationTheta (Phase C)", () => {
     expect(THETA_KEYS).not.toContain("overclaim_penalty" as never);
   });
 
+  test("policy-staging governance keys are not optimizable theta dimensions", () => {
+    // Phase D must not be able to tune its own promotion admission criteria.
+    expect(THETA_KEYS).not.toContain("policy_canary_traffic_fraction" as never);
+    expect(THETA_KEYS).not.toContain("policy_min_canary_success_rate" as never);
+    expect(THETA_KEYS).not.toContain("policy_min_eligible_outcomes_before_shadow" as never);
+    expect(THETA_KEYS).not.toContain("policy_min_canary_runs_before_promotion" as never);
+    expect(Object.prototype.hasOwnProperty.call(BASELINE_THETA, "policy_canary_traffic_fraction")).toBe(false);
+  });
+
   test("legacy serialized reward keys do not enter theta", () => {
     const parsed = parseTheta(JSON.stringify({
       force_write_nudge_cap: 4,
