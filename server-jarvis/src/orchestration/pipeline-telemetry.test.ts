@@ -338,6 +338,84 @@ describe("pipeline stage telemetry", () => {
     }
   });
 
+  test("recursive repair retains native write fingerprints from the original pass", async () => {
+    const workspace = mkdtempSync(join(tmpdir(), "jarvis-recursive-write-effects-"));
+    try {
+      writeFileSync(join(workspace, "first.txt"), "first before\n");
+      writeFileSync(join(workspace, "second.txt"), "second before\n");
+      const config = defaultConfig();
+      config.jarvis_path = workspace;
+      config.tools.enabled = true;
+      config.tools.sandbox_mode = "workspace";
+      config.claude_cli.delegate.enabled = false;
+      const runtime = createToolRuntime();
+      registerFilesystemBundle(runtime);
+      const ctx = makeExecutionContext("chat", config, {
+        workspace_path: workspace,
+        requestApproval: async () => true,
+      });
+      let executorTurns = 0;
+      const executor = new PipelineExecutor(
+        async (_messages, options) => {
+          if (options.stageLabel === "executor") {
+            const turn = executorTurns++;
+            if (turn === 0) return { content: "read first", tool_calls: [toolCallWithArgs("read_file", { path: "first.txt" })] };
+            if (turn === 1) return {
+              content: "write first",
+              tool_calls: [toolCallWithArgs("edit_file", {
+                path: "first.txt",
+                old_string: "first before",
+                new_string: "first after",
+              })],
+            };
+            if (turn === 2) return { content: "first write complete" };
+            if (turn === 3) return { content: "read second", tool_calls: [toolCallWithArgs("read_file", { path: "second.txt" })] };
+            if (turn === 4) return {
+              content: "write second",
+              tool_calls: [toolCallWithArgs("edit_file", {
+                path: "second.txt",
+                old_string: "second before",
+                new_string: "second after",
+              })],
+            };
+            return { content: "second write complete" };
+          }
+          if (options.stageLabel === "recursion_critique") {
+            return { content: JSON.stringify({ needs_more_work: true, reenter_stage: "executor", critique: "Also update second.txt." }) };
+          }
+          if (options.stageLabel === "synthesizer") return { content: "Both updates are complete." };
+          return { content: "unexpected" };
+        },
+        runtime,
+        ctx,
+        { recordStageRun: () => {} },
+      );
+
+      const result = await executor.execute(
+        "Update first.txt and second.txt",
+        ["executor", "synthesizer"],
+        "run-recursive-write-effects",
+        () => {},
+        {
+          executionProfile: "full",
+          rawMessage: "Update first.txt and second.txt",
+          taskRunWriteIntent: true,
+          topology: "recursive",
+          maxRecursionDepth: 1,
+        },
+      );
+
+      expect(readFileSync(join(workspace, "first.txt"), "utf8")).toBe("first after\n");
+      expect(readFileSync(join(workspace, "second.txt"), "utf8")).toBe("second after\n");
+      expect(result.writeEffects?.map((effect) => effect.path)).toEqual([
+        join(workspace, "first.txt"),
+        join(workspace, "second.txt"),
+      ]);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
   test("C1: seeded raw priorToolCalls above context cap do not unlock ledger or deflect as complete", async () => {
     // Raw priorToolCalls carry full tool output without the prepareToolResultForContext
     // marker. Re-seed must recompute truncation against the write-turn cap so a live

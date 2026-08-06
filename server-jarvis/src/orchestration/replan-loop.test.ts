@@ -1,9 +1,13 @@
 // server-jarvis/src/orchestration/replan-loop.test.ts
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { runPipelineWithReplanning } from "./replan-loop";
 import { PipelineExecutor } from "./pipeline";
 import { Coordinator } from "./coordinator";
 import { createToolRuntime, makeExecutionContext } from "../tool-runtime";
+import { registerFilesystemBundle } from "../filesystem-bundle";
 import { defaultConfig } from "../config";
 import { SessionReplanCounter } from "./replan-telemetry";
 import { SelfTuningStore } from "../self-tuning/store";
@@ -37,6 +41,14 @@ function changedEffect(path: string): WriteEffectObservation {
     before: { path, exists: true, bytes: 1, sha256: "a".repeat(64) },
     after: { path, exists: true, bytes: 1, sha256: "b".repeat(64) },
     changed: true,
+  };
+}
+
+function toolCallWithArgs(id: string, name: string, arguments_: Record<string, string>) {
+  return {
+    id,
+    type: "function" as const,
+    function: { name, arguments: JSON.stringify(arguments_) },
   };
 }
 
@@ -798,6 +810,79 @@ describe("runPipelineWithReplanning", () => {
     });
     expect(result.cancelled).toBe(true);
     expect(result.writeEffects).toEqual([effect]);
+  });
+
+  test("replan segments share one write-effect ledger and final result retains both writes", async () => {
+    const workspace = mkdtempSync(join(tmpdir(), "jarvis-replan-write-effects-"));
+    try {
+      writeFileSync(join(workspace, "first.txt"), "first before\n");
+      writeFileSync(join(workspace, "second.txt"), "second before\n");
+      const config = defaultConfig();
+      config.jarvis_path = workspace;
+      config.tools.enabled = true;
+      config.tools.sandbox_mode = "workspace";
+      config.claude_cli.delegate.enabled = false;
+      const runtime = createToolRuntime();
+      registerFilesystemBundle(runtime);
+      const localCtx = makeExecutionContext("chat", config, {
+        workspace_path: workspace,
+        requestApproval: async () => true,
+      });
+      let executorTurns = 0;
+      const executor = new PipelineExecutor(
+        async (_messages, options) => {
+          if (options.stageLabel === "executor") {
+            const turn = executorTurns++;
+            if (turn === 0) return { content: "read first", tool_calls: [toolCallWithArgs("read-first", "read_file", { path: "first.txt" })] };
+            if (turn === 1) return { content: "write first", tool_calls: [toolCallWithArgs("write-first", "edit_file", { path: "first.txt", old_string: "first before", new_string: "first after" })] };
+            if (turn === 2) return { content: "first write complete" };
+            if (turn === 3) return { content: "read second", tool_calls: [toolCallWithArgs("read-second", "read_file", { path: "second.txt" })] };
+            if (turn === 4) return { content: "write second", tool_calls: [toolCallWithArgs("write-second", "edit_file", { path: "second.txt", old_string: "second before", new_string: "second after" })] };
+            return { content: "second write complete" };
+          }
+          if (options.stageLabel === "synthesizer") return { content: "Both updates are complete." };
+          return { content: "unexpected" };
+        },
+        runtime,
+        localCtx,
+        testCollector,
+      );
+      let resets = 0;
+      const reset = executor.resetWriteEffectLedger.bind(executor);
+      executor.resetWriteEffectLedger = () => {
+        resets += 1;
+        reset();
+      };
+      const coordinator = new Coordinator((async () => ({ content: "unused" })) as any);
+      coordinator.route = (async () => baseDecision({ pipeline: ["executor", "synthesizer"] })) as typeof coordinator.route;
+
+      const result = await runPipelineWithReplanning({
+        contextMessage: "Update first.txt and second.txt",
+        initialDecision: baseDecision({ pipeline: ["executor", "conductor_replan", "synthesizer"] }),
+        turnRequirement: "full_execution",
+        coordinator,
+        routeOptions: { sessionId: "replan-write-effects" },
+        executor,
+        agentRunId: "run-replan-write-effects",
+        onStateChange: () => {},
+        baseOptions: {
+          executionProfile: "full",
+          rawMessage: "Update first.txt and second.txt",
+          taskRunWriteIntent: true,
+        },
+        maxReplans: 1,
+      });
+
+      expect(resets).toBe(1);
+      expect(readFileSync(join(workspace, "first.txt"), "utf8")).toBe("first after\n");
+      expect(readFileSync(join(workspace, "second.txt"), "utf8")).toBe("second after\n");
+      expect(result.writeEffects?.map((effect) => effect.path)).toEqual([
+        join(workspace, "first.txt"),
+        join(workspace, "second.txt"),
+      ]);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
   });
 
   test("read_only profile cannot escalate to full even if the replanned decision implies more authority", async () => {

@@ -261,6 +261,12 @@ export interface PipelineExecuteOptions {
   topology?: PipelineTopology;
   maxRecursionDepth?: number;
   /**
+   * Own the native write-effect ledger for this invocation. The outer
+   * logical-turn entry resets it; recursive repair re-entry explicitly
+   * inherits it so evidence from the original pass is retained.
+   */
+  resetWriteEffectLedger?: boolean;
+  /**
    * B-03: starting recursion depth when this `execute()` is itself a
    * recursive re-entry from `applyRecursiveCritique`. The inner pipeline
    * reads `result.recursion_depth ?? 0` to check against the depth cap, so
@@ -6109,7 +6115,9 @@ export class PipelineExecutor {
     // Content observations belong to this logical turn. Replans and repair
     // segments intentionally share the same array so the final gate can see
     // every native write attempt made before synthesis.
-    this.resetWriteEffectLedger();
+    if (options.resetWriteEffectLedger ?? true) {
+      this.resetWriteEffectLedger();
+    }
     // Reset verification side-channels so prior turns cannot leak into reward.
     this.lastCheckResult = undefined;
     this.lastReviewerAccepted = false;
@@ -6820,6 +6828,7 @@ export class PipelineExecutor {
       // pipeline calls.
       {
         topology: "linear",
+        resetWriteEffectLedger: false,
         executionProfile: options.executionProfile,
         workerInstructions: options.workerInstructions,
         sharedContext: options.sharedContext,
