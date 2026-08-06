@@ -22,7 +22,7 @@ describe("turn budgets", () => {
     const budget = runWithTheta({
       absolute_turn_cap_ms: 80_000,
       progress_extension_ms: 20_000,
-      stage_extension_ceiling_ms: 90_000,
+      stage_extension_ceiling_ms: 80_000,
     }, () => createTurnBudget("full_execution", "high", 0));
 
     expect(budget.turn_ms).toBe(80_000);

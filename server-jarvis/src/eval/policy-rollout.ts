@@ -1,5 +1,6 @@
 import { createHash } from "crypto";
 import {
+  BASELINE_THETA,
   type OrchestrationTheta,
   type RolloutSpec,
   rolloutId,
@@ -10,7 +11,11 @@ import { decideDelegateIntervention } from "../orchestration/delegate-interventi
 import { decideExecutorProgress } from "../orchestration/executor-progress-policy";
 import { canApplyConductorReroute } from "../orchestration/reroute-policy";
 import { POLICY_STAGING_GOVERNANCE } from "../self-tuning/policy-staging";
-import type { PolicyRolloutFixture, PolicyRolloutStep } from "./policy-rollout-fixtures";
+import {
+  POLICY_ROLLOUT_FIXTURES,
+  type PolicyRolloutFixture,
+  type PolicyRolloutStep,
+} from "./policy-rollout-fixtures";
 
 export interface PolicyRolloutEvent {
   index: number;
@@ -72,4 +77,28 @@ export function runPolicyRollout(
     theta: execution.theta,
     events,
   };
+}
+
+if (import.meta.main) {
+  const args = process.argv.slice(2);
+  const valueAfter = (flag: string): string | undefined => {
+    const index = args.indexOf(flag);
+    return index >= 0 ? args[index + 1] : undefined;
+  };
+  const fixtureId = valueAfter("--fixture") ?? "completion_integrity_mixed";
+  const seed = Number(valueAfter("--seed") ?? "17");
+  if (!Number.isInteger(seed)) throw new Error(`invalid integer seed: ${seed}`);
+  const fixture = POLICY_ROLLOUT_FIXTURES.find((item) => item.id === fixtureId);
+  if (!fixture) throw new Error(`unknown policy rollout fixture: ${fixtureId}`);
+  const result = runPolicyRollout(
+    { theta: BASELINE_THETA, seed, fixtureId },
+    fixture,
+  );
+  if (args.includes("--json")) {
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+  } else {
+    process.stdout.write(
+      `fixture=${fixtureId} seed=${seed} trajectory=${result.trajectoryDigest}\n`,
+    );
+  }
 }

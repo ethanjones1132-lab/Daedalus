@@ -133,13 +133,13 @@ test("delegate availability cache is isolated by request-scoped TTL", async () =
   });
   const config = testConfig();
 
-  await runWithTheta({ delegate_availability_cache_ms: 100 }, () => availability.isAvailable(config));
-  now += 50;
   await runWithTheta({ delegate_availability_cache_ms: 1_000 }, () => availability.isAvailable(config));
+  now += 1_000;
+  await runWithTheta({ delegate_availability_cache_ms: 2_000 }, () => availability.isAvailable(config));
   expect(cliChecks).toBe(2);
 
   now += 50;
-  await runWithTheta({ delegate_availability_cache_ms: 1_000 }, () => availability.isAvailable(config));
+  await runWithTheta({ delegate_availability_cache_ms: 2_000 }, () => availability.isAvailable(config));
   expect(cliChecks).toBe(2);
 });
 
