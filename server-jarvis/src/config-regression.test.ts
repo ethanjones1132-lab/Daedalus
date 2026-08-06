@@ -108,7 +108,7 @@ describe("configuration regression coverage retained during Task 6", () => {
     const defaults = defaultConfig().orchestrator.verification;
     expect(defaults.prepare_cmake).toBe(true);
     expect(defaults.prepare_timeout_ms).toBe(120_000);
-    expect(defaults.check_timeout_ms).toBe(90_000);
+    expect(defaults.check_timeout_ms).toBe(600_000);
 
     const overridden = normalizeConfig({
       orchestrator: {

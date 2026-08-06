@@ -708,7 +708,11 @@ export function defaultConfig(): JarvisConfig {
         enabled: false,
         prepare_cmake: true,
         prepare_timeout_ms: 120_000,
-        check_timeout_ms: 90_000,
+        // Cold multi-file C++/JUCE builds routinely exceed 90s; a short timeout
+        // maps to check tier "none" and Phase B hard-zeros write-required reward
+        // (2026-08-05 Perihelion: genuine compile success scored reward_score 0).
+        // Overridable per deploy via orchestrator.verification.check_timeout_ms.
+        check_timeout_ms: 600_000,
         tier_reward: { existing: 1, builtin: 1, synth: 0.5, none: 0 },
         thrift: { dead_tool_suppression: true, achieved_effect_early_stop: true },
       },
