@@ -1,0 +1,517 @@
+{
+  "generated_at": "2026-08-06T14:01:58Z",
+  "k": 3,
+  "live": true,
+  "arms": {
+    "baseline": [
+      {
+        "name": "merge_intervals",
+        "category": "A",
+        "passes": 1,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 34.562,
+            "detail": "ImportError: cannot import name 'merge_intervals' from 'solution' (C:\\Users\\ethan\\AppData\\Local\\Temp\\tier2b-base-merge_intervals-yxqhlh2a\\solution.py)",
+            "pass": false
+          },
+          {
+            "secs": 6.511,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 35.668,
+            "detail": "ImportError: cannot import name 'merge_intervals' from 'solution' (C:\\Users\\ethan\\AppData\\Local\\Temp\\tier2b-base-merge_intervals-q3xtnbqr\\solution.py)",
+            "pass": false
+          }
+        ]
+      },
+      {
+        "name": "lru_cache",
+        "category": "A",
+        "passes": 3,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 73.19,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 7.232,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 13.17,
+            "detail": "ok",
+            "pass": true
+          }
+        ]
+      },
+      {
+        "name": "topological_sort",
+        "category": "A",
+        "passes": 2,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 9.264,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 34.884,
+            "detail": "ImportError: cannot import name 'topological_sort' from 'solution' (C:\\Users\\ethan\\AppData\\Local\\Temp\\tier2b-base-topological_sort-juawc0h6\\solution.py)",
+            "pass": false
+          },
+          {
+            "secs": 13.245,
+            "detail": "ok",
+            "pass": true
+          }
+        ]
+      },
+      {
+        "name": "parse_csv_line",
+        "category": "A",
+        "passes": 1,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 37.368,
+            "detail": "ImportError: cannot import name 'parse_csv_line' from 'solution' (C:\\Users\\ethan\\AppData\\Local\\Temp\\tier2b-base-parse_csv_line-7c0tr7p2\\solution.py)",
+            "pass": false
+          },
+          {
+            "secs": 41.027,
+            "detail": "ImportError: cannot import name 'parse_csv_line' from 'solution' (C:\\Users\\ethan\\AppData\\Local\\Temp\\tier2b-base-parse_csv_line-mekrjmr7\\solution.py)",
+            "pass": false
+          },
+          {
+            "secs": 55.695,
+            "detail": "ok",
+            "pass": true
+          }
+        ]
+      },
+      {
+        "name": "pkg_discount",
+        "category": "B",
+        "passes": 0,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 34.421,
+            "detail": "ImportError: cannot import name 'total_price' from 'calc' (C:\\Users\\ethan\\AppData\\Local\\Temp\\tier2b-base-pkg_discount-if6i9axr\\calc.py)",
+            "pass": false
+          },
+          {
+            "secs": 37.076,
+            "detail": "ImportError: cannot import name 'total_price' from 'calc' (C:\\Users\\ethan\\AppData\\Local\\Temp\\tier2b-base-pkg_discount-339ycf5g\\calc.py)",
+            "pass": false
+          },
+          {
+            "secs": 37.585,
+            "detail": "ImportError: cannot import name 'total_price' from 'calc' (C:\\Users\\ethan\\AppData\\Local\\Temp\\tier2b-base-pkg_discount-88wbt8yy\\calc.py)",
+            "pass": false
+          }
+        ]
+      },
+      {
+        "name": "pkg_auth",
+        "category": "B",
+        "passes": 0,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 31.14,
+            "detail": "ImportError: cannot import name 'authorize' from 'session' (C:\\Users\\ethan\\AppData\\Local\\Temp\\tier2b-base-pkg_auth-tuwb1f84\\session.py)",
+            "pass": false
+          },
+          {
+            "secs": 35.244,
+            "detail": "ImportError: cannot import name 'authorize' from 'session' (C:\\Users\\ethan\\AppData\\Local\\Temp\\tier2b-base-pkg_auth-n9zu5c4r\\session.py)",
+            "pass": false
+          },
+          {
+            "secs": 38.293,
+            "detail": "ImportError: cannot import name 'authorize' from 'session' (C:\\Users\\ethan\\AppData\\Local\\Temp\\tier2b-base-pkg_auth-q06m5h2j\\session.py)",
+            "pass": false
+          }
+        ]
+      },
+      {
+        "name": "safe_divide_batch",
+        "category": "C",
+        "passes": 3,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 15.094,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 7.308,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 2.626,
+            "detail": "ok",
+            "pass": true
+          }
+        ]
+      },
+      {
+        "name": "retry_with_backoff",
+        "category": "C",
+        "passes": 3,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 15.067,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 19.19,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 5.609,
+            "detail": "ok",
+            "pass": true
+          }
+        ]
+      },
+      {
+        "name": "load_or_create_json",
+        "category": "D",
+        "passes": 3,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 37.139,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 2.601,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 8.5,
+            "detail": "ok",
+            "pass": true
+          }
+        ]
+      },
+      {
+        "name": "run_checked",
+        "category": "D",
+        "passes": 3,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 2.585,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 8.08,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 6.642,
+            "detail": "ok",
+            "pass": true
+          }
+        ]
+      },
+      {
+        "name": "clamp_with_lib",
+        "category": "E",
+        "passes": 3,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 8.514,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 5.891,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 5.265,
+            "detail": "ok",
+            "pass": true
+          }
+        ]
+      }
+    ],
+    "architecture": [
+      {
+        "name": "merge_intervals",
+        "category": "A",
+        "passes": 3,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 65.8,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 55.4,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 55.2,
+            "detail": "ok",
+            "pass": true
+          }
+        ]
+      },
+      {
+        "name": "lru_cache",
+        "category": "A",
+        "passes": 3,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 123.0,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 65.1,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 57.1,
+            "detail": "ok",
+            "pass": true
+          }
+        ]
+      },
+      {
+        "name": "topological_sort",
+        "category": "A",
+        "passes": 3,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 72.5,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 66.5,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 205.9,
+            "detail": "ok",
+            "pass": true
+          }
+        ]
+      },
+      {
+        "name": "parse_csv_line",
+        "category": "A",
+        "passes": 3,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 81.1,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 65.7,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 52.8,
+            "detail": "ok",
+            "pass": true
+          }
+        ]
+      },
+      {
+        "name": "pkg_discount",
+        "category": "B",
+        "passes": 3,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 88.5,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 75.8,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 90.7,
+            "detail": "ok",
+            "pass": true
+          }
+        ]
+      },
+      {
+        "name": "pkg_auth",
+        "category": "B",
+        "passes": 3,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 71.2,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 61.8,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 136.9,
+            "detail": "ok",
+            "pass": true
+          }
+        ]
+      },
+      {
+        "name": "safe_divide_batch",
+        "category": "C",
+        "passes": 3,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 90.2,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 72.3,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 52.3,
+            "detail": "ok",
+            "pass": true
+          }
+        ]
+      },
+      {
+        "name": "retry_with_backoff",
+        "category": "C",
+        "passes": 3,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 91.5,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 90.1,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 68.0,
+            "detail": "ok",
+            "pass": true
+          }
+        ]
+      },
+      {
+        "name": "load_or_create_json",
+        "category": "D",
+        "passes": 3,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 64.5,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 56.4,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 73.8,
+            "detail": "ok",
+            "pass": true
+          }
+        ]
+      },
+      {
+        "name": "run_checked",
+        "category": "D",
+        "passes": 3,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 69.5,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 51.7,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 69.8,
+            "detail": "ok",
+            "pass": true
+          }
+        ]
+      },
+      {
+        "name": "clamp_with_lib",
+        "category": "E",
+        "passes": 3,
+        "k": 3,
+        "samples": [
+          {
+            "secs": 59.7,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 55.1,
+            "detail": "ok",
+            "pass": true
+          },
+          {
+            "secs": 64.3,
+            "detail": "ok",
+            "pass": true
+          }
+        ]
+      }
+    ]
+  }
+}

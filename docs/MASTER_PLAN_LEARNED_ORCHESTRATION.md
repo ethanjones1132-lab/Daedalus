@@ -193,11 +193,30 @@ A and B can run in parallel. C depends on nothing but touches many files, so it 
 ### Measured
 
 - Targeted suites (edit-contract, write-preflight, tool-heal, filesystem-bundle, edit-match, symbol-grounding) + full `src/orchestration/` suite — pass. `tsc --noEmit` clean.
-- Live `--live` measurement against the architecture arm is **pending** (not run in this session).
+- Live `--live` measurement against the architecture arm is **pending** as of 2026-08-06: port `:19877` is held by a Windows ghost socket (dead PID still LISTENING after Bun restart thrash). After reboot, run both arms and replace this note:
+  ```powershell
+  scripts\run-tier2b-benchmark.ps1 -Arm baseline -Live
+  scripts\run-tier2b-benchmark.ps1 -Arm architecture -Live
+  ```
+  Results land in `scripts/benchmark-tier2b/results-tier2b.json`.
+
+### Phase-D prerequisites landed (2026-08-06)
+
+Before CMA-ES, five measurement/safety gaps from the 2026-08-05 review were closed (plan `enchanted-prancing-pearl`):
+
+| Item | Fix |
+|------|-----|
+| mid_loop_continue hot loop | One shared `DirectiveBudget` per segment (not per `runExecutorStage` call site) |
+| build-gate timeout | `check_timeout_ms` default **600_000** (was 90s — cold C++ builds hard-zeroed reward) |
+| θ governance leak | `policy_*` promotion thresholds removed from `OrchestrationTheta`; immutable `POLICY_STAGING_GOVERNANCE` |
+| attribution wiring | `stageRunId` generated before model call, joined on `model_attributions.stage_run_id` |
+| reward evidence | `writeEffects` plumbed to `buildStoredRunRewardSnapshot` so no-op edits don't earn write credit |
+
+Full suite: **2862 pass / 0 fail**, `tsc --noEmit` clean. Phase D (D1–D4) may begin after Item 3 live measurement numbers are recorded.
 
 ### Still open (Phase A)
 
-- Live fixture measurement of fabricated-API / no-match write rates after A1–A3.
+- Live fixture measurement of fabricated-API / no-match write rates after A1–A3 (blocked on ghost `:19877` until reboot).
 - Phase C θ wiring for grounding / preflight constants.
 
 ---
