@@ -7,6 +7,7 @@
  * Semantic pressure notes (write effect, plan remainder, etc.) are claimed
  * once per logical agent run so reroutes cannot re-inject the same text.
  */
+import { BASELINE_THETA, policy } from "./orchestration-policy";
 
 export type ExecutorProgressDecision = "continue" | "retry_strong" | "stop_partial";
 
@@ -36,7 +37,7 @@ export interface ExecutorProgressInput {
 }
 
 /** Minimum stage budget remaining required for a strong-model no-tool retry. */
-export const NO_TOOL_RETRY_BUDGET_FLOOR_MS = 20_000;
+export const NO_TOOL_RETRY_BUDGET_FLOOR_MS = BASELINE_THETA.no_tool_retry_budget_floor_ms;
 
 /**
  * Ratio bound for INTERLEAVED prose turns.
@@ -53,8 +54,8 @@ export const NO_TOOL_RETRY_BUDGET_FLOOR_MS = 20_000;
  * that short-circuit was protecting. Only a mostly-prose, zero-write stage
  * trips this.
  */
-export const NO_TOOL_RATIO_CEILING = 0.5;
-export const NO_TOOL_RATIO_MIN_TURNS = 6;
+export const NO_TOOL_RATIO_CEILING = BASELINE_THETA.no_tool_ratio_ceiling;
+export const NO_TOOL_RATIO_MIN_TURNS = BASELINE_THETA.no_tool_ratio_min_turns;
 
 /**
  * Decide whether the executor loop should keep going, retry once on a
@@ -91,8 +92,8 @@ export function decideExecutorProgress(input: ExecutorProgressInput): ExecutorPr
   const executorTurns = input.executorTurns ?? 0;
   const noToolTurns = input.noToolTurns ?? 0;
   if (
-    executorTurns >= NO_TOOL_RATIO_MIN_TURNS
-    && noToolTurns / executorTurns >= NO_TOOL_RATIO_CEILING
+    executorTurns >= policy().no_tool_ratio_min_turns
+    && noToolTurns / executorTurns >= policy().no_tool_ratio_ceiling
   ) {
     return "stop_partial";
   }
@@ -102,7 +103,7 @@ export function decideExecutorProgress(input: ExecutorProgressInput): ExecutorPr
   if (input.consecutiveNoToolTurns <= 0) return "continue";
   if (
     input.consecutiveNoToolTurns === 1
-    && input.stageRemainingMs > NO_TOOL_RETRY_BUDGET_FLOOR_MS
+    && input.stageRemainingMs > policy().no_tool_retry_budget_floor_ms
   ) {
     return "retry_strong";
   }

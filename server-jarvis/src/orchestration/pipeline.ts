@@ -70,7 +70,6 @@ import {
 import {
   alreadyReadSourceKeys,
   assessWorkspaceEvidence,
-  DEEP_READ_MIN_CONTENT_READS,
   evidenceFailure,
   extractSourceReadCandidates,
   isDeepReadRequest,
@@ -84,11 +83,11 @@ import {
   buildEvidenceCheckpoint,
   compactCompletedExecutorCycles,
   enforceTranscriptBudget,
-  EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS,
-  EXECUTOR_TOOL_RESULT_CONTEXT_CHARS,
-  EXECUTOR_TRANSCRIPT_BUDGET_TOKENS,
-  WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS,
-  WRITE_TURN_TRANSCRIPT_BUDGET_TOKENS,
+  executorPreflightResultContextChars,
+  executorToolResultContextChars,
+  executorTranscriptBudgetTokens,
+  writeTurnToolResultContextChars,
+  writeTurnTranscriptBudgetTokens,
   REWRITER_TOOL_RESULT_CONTEXT_CHARS,
   REWRITER_TRANSCRIPT_BUDGET_TOKENS,
   truncateToTokenBudget,
@@ -150,7 +149,6 @@ import {
 } from "./claude-delegate";
 import {
   clearDelegateThrash,
-  DEFAULT_THRASH_TTL_MS,
   delegateThrashKey,
   enumerateDelegateModelCandidates,
   getBenchedDelegateModels,
@@ -167,7 +165,6 @@ import {
   assessCorrectnessFloor,
   buildMidLoopToolEvidence,
   DEFAULT_QUALITY_PUSH_NOTE,
-  MAX_QUALITY_PUSHES,
   shouldRunMidLoopCheck,
   shouldRunQualityPhase,
   type LoopIntervention,
@@ -1993,11 +1990,11 @@ export class PipelineExecutor {
     // Write turns get file-scale visibility (see context-budget.ts): a model
     // cannot compose a correct edit for code it never saw.
     const toolResultContextChars = requiresWriteEffect
-      ? WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS
-      : EXECUTOR_TOOL_RESULT_CONTEXT_CHARS;
+      ? writeTurnToolResultContextChars()
+      : executorToolResultContextChars();
     const transcriptBudgetTokens = requiresWriteEffect
-      ? WRITE_TURN_TRANSCRIPT_BUDGET_TOKENS
-      : EXECUTOR_TRANSCRIPT_BUDGET_TOKENS;
+      ? writeTurnTranscriptBudgetTokens()
+      : executorTranscriptBudgetTokens();
     const toolResultNote = requiresWriteEffect
       ? "Call read_file again with offset/limit to view the elided lines BEFORE composing any edit."
       : PIPELINE_TOOL_RESULT_NOTE;
@@ -2086,7 +2083,7 @@ export class PipelineExecutor {
       executorMessages.push({
         role: "user",
         content:
-          `[Runtime depth target] Deep-read workspace evidence is required: read at least ${DEEP_READ_MIN_CONTENT_READS} distinct source files before ending the stage; listings/manifests do not count; never repeat a call.`,
+          `[Runtime depth target] Deep-read workspace evidence is required: read at least ${policy().deep_read_min_content_reads} distinct source files before ending the stage; listings/manifests do not count; never repeat a call.`,
       });
     }
     if (requiresWriteEffect) {
@@ -2192,7 +2189,7 @@ export class PipelineExecutor {
               // treat as post-reroute priority for #5 escalation reservation.
               afterReroute: priorToolCalls.length > 0,
               qualityPushesUsed,
-              qualityPushBudget: MAX_QUALITY_PUSHES,
+              qualityPushBudget: policy().max_quality_pushes,
               qualityAccepted,
               forceQualityGate: extras.forceQualityGate === true,
               // Lets the reflex escalate its wording instead of repeating a
@@ -2276,7 +2273,7 @@ export class PipelineExecutor {
           directive_type: "mid_loop_quality_push",
           decision_source: midLoop.decisionSource,
           escalation_id: midLoop.escalationId,
-          reason: `quality_push ${qualityPushesUsed}/${MAX_QUALITY_PUSHES}`,
+          reason: `quality_push ${qualityPushesUsed}/${policy().max_quality_pushes}`,
           inject_note: "note" in midLoop ? midLoop.note : undefined,
         });
       } else if (midLoop.kind === "continue" && midLoop.decisionSource === "resident_model") {
@@ -2441,7 +2438,7 @@ export class PipelineExecutor {
       // agent-run boundaries within one conversation.
       const thrashKey = delegateThrashKey(this.ctx.session_id ?? "");
       const thrashTtlMs = this.ctx.config.claude_cli.delegate.thrash_ttl_ms
-        ?? DEFAULT_THRASH_TTL_MS;
+        ?? policy().thrash_ttl_ms;
       const hasGoKey = Boolean(this.ctx.config.opencode_go.api_key?.trim());
       const candidates = enumerateDelegateModelCandidates({
         configuredModel: this.ctx.config.claude_cli.delegate.model,
@@ -3201,7 +3198,7 @@ export class PipelineExecutor {
       });
       executorMessages.push({
         role: "user",
-        content: `[Runtime preflight: git_metadata]\n${prepareToolResultForContext(preflightOutput, EXECUTOR_TOOL_RESULT_CONTEXT_CHARS, PIPELINE_TOOL_RESULT_NOTE).context}\nUse this exact metadata in your answer; do not claim the tool is unavailable.`,
+        content: `[Runtime preflight: git_metadata]\n${prepareToolResultForContext(preflightOutput, executorToolResultContextChars(), PIPELINE_TOOL_RESULT_NOTE).context}\nUse this exact metadata in your answer; do not claim the tool is unavailable.`,
       });
       onStateChange({
         stage: "executor",
@@ -3249,7 +3246,7 @@ export class PipelineExecutor {
       });
       executorMessages.push({
         role: "user",
-        content: `[Runtime preflight: list_directory]\n${prepareToolResultForContext(listOutput, EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS, PIPELINE_TOOL_RESULT_NOTE).context}`,
+        content: `[Runtime preflight: list_directory]\n${prepareToolResultForContext(listOutput, executorPreflightResultContextChars(), PIPELINE_TOOL_RESULT_NOTE).context}`,
       });
       onStateChange({
         stage: "executor",
@@ -3285,7 +3282,7 @@ export class PipelineExecutor {
           });
           executorMessages.push({
             role: "user",
-            content: `[Runtime preflight: read_file ${anchor}]\n${prepareToolResultForContext(readOutput, EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS, PIPELINE_TOOL_RESULT_NOTE).context}`,
+            content: `[Runtime preflight: read_file ${anchor}]\n${prepareToolResultForContext(readOutput, executorPreflightResultContextChars(), PIPELINE_TOOL_RESULT_NOTE).context}`,
           });
           onStateChange({
             stage: "executor",
@@ -3329,7 +3326,7 @@ export class PipelineExecutor {
             });
             executorMessages.push({
               role: "user",
-              content: `[Runtime preflight: list_directory ${nestedDir}]\n${prepareToolResultForContext(nestedListOutput, EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS, PIPELINE_TOOL_RESULT_NOTE).context}`,
+              content: `[Runtime preflight: list_directory ${nestedDir}]\n${prepareToolResultForContext(nestedListOutput, executorPreflightResultContextChars(), PIPELINE_TOOL_RESULT_NOTE).context}`,
             });
             onStateChange({
               stage: "executor",
@@ -3365,7 +3362,7 @@ export class PipelineExecutor {
                 });
                 executorMessages.push({
                   role: "user",
-                  content: `[Runtime preflight: read_file ${firstSource}]\n${prepareToolResultForContext(sourceOutput, EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS, PIPELINE_TOOL_RESULT_NOTE).context}`,
+                  content: `[Runtime preflight: read_file ${firstSource}]\n${prepareToolResultForContext(sourceOutput, executorPreflightResultContextChars(), PIPELINE_TOOL_RESULT_NOTE).context}`,
                 });
                 onStateChange({
                   stage: "executor",
@@ -3856,7 +3853,7 @@ export class PipelineExecutor {
             !writeEffectNudgeSentThisTurn &&
             !midLoopHeldOpen &&
             !qualityAccepted &&
-            qualityPushesUsed < MAX_QUALITY_PUSHES &&
+            qualityPushesUsed < policy().max_quality_pushes &&
             assessCorrectnessFloor({
               writeIntent: requiresWriteEffect,
               successfulWrites: successfulWriteCount(),
@@ -3910,7 +3907,7 @@ export class PipelineExecutor {
                 (qualityGate.decisionSource === "resident_error" ||
                   qualityGate.decisionSource === "cap_exhausted" ||
                   qualityGate.decisionSource === "escalation_reserved") &&
-                qualityPushesUsed < MAX_QUALITY_PUSHES
+                qualityPushesUsed < policy().max_quality_pushes
               ) {
                 if (pressureBudget.claim("quality_after_correctness")) {
                   qualityPushesUsed += 1;
@@ -3922,7 +3919,7 @@ export class PipelineExecutor {
                     stage: "executor",
                     directive_type: "mid_loop_quality_push",
                     decision_source: "deterministic_reflex",
-                    reason: `quality_push_host_failopen ${qualityPushesUsed}/${MAX_QUALITY_PUSHES}`,
+                    reason: `quality_push_host_failopen ${qualityPushesUsed}/${policy().max_quality_pushes}`,
                     inject_note: DEFAULT_QUALITY_PUSH_NOTE,
                   });
                 } else {
@@ -4125,7 +4122,7 @@ export class PipelineExecutor {
           );
           const toRead = Math.min(
             4,
-            Math.max(0, DEEP_READ_MIN_CONTENT_READS - floorAssessment.contentReads + 1),
+            Math.max(0, policy().deep_read_min_content_reads - floorAssessment.contentReads + 1),
           );
           let completed = 0;
           for (const candidate of candidates) {
@@ -4153,7 +4150,7 @@ export class PipelineExecutor {
             });
             executorMessages.push({
               role: "user",
-              content: `[Runtime floor-completion: read_file ${candidate}]\n${prepareToolResultForContext(readOutput, EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS, PIPELINE_TOOL_RESULT_NOTE).context}`,
+              content: `[Runtime floor-completion: read_file ${candidate}]\n${prepareToolResultForContext(readOutput, executorPreflightResultContextChars(), PIPELINE_TOOL_RESULT_NOTE).context}`,
             });
             onStateChange({
               stage: "executor",
@@ -4353,10 +4350,10 @@ export class PipelineExecutor {
     const rewriterWriteTurn = profile === "full" &&
       (hasWriteIntent(options.rawMessage ?? request) || options.taskRunWriteIntent === true);
     const rewriterResultContextChars = rewriterWriteTurn
-      ? WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS
+      ? writeTurnToolResultContextChars()
       : REWRITER_TOOL_RESULT_CONTEXT_CHARS;
     const rewriterTranscriptBudget = rewriterWriteTurn
-      ? WRITE_TURN_TRANSCRIPT_BUDGET_TOKENS
+      ? writeTurnTranscriptBudgetTokens()
       : REWRITER_TRANSCRIPT_BUDGET_TOKENS;
     const rewriterResultNote = rewriterWriteTurn
       ? "Call read_file again with offset/limit to view the elided lines BEFORE composing any edit."
@@ -4602,10 +4599,10 @@ export class PipelineExecutor {
     const boundedRequest = truncateToTokenBudget(request, 1_000);
     const boundedPlanSummary = truncateToTokenBudget(planSummary, 1_000);
     const boundedExecutorSummary = truncateToTokenBudget(executorSummary, 3_000);
-    const configuredRepairRounds = Number(options.maxReviewRepairRounds ?? 1);
+    const configuredRepairRounds = Number(options.maxReviewRepairRounds ?? policy().max_review_repair_rounds_cap);
     const maxRepairRounds = Number.isFinite(configuredRepairRounds)
-      ? Math.min(2, Math.max(0, Math.floor(configuredRepairRounds)))
-      : 1;
+      ? Math.min(policy().max_review_repair_rounds_cap, Math.max(0, Math.floor(configuredRepairRounds)))
+      : policy().max_review_repair_rounds_cap;
     let reviewCount = 0;
     let repairs = 0;
     let hasPendingIssues = true;
@@ -5399,7 +5396,7 @@ export class PipelineExecutor {
       pendingInjections,
       workQueue,
       reroutesApplied,
-      maxReroutesPerSegment: 3,
+      maxReroutesPerSegment: policy().default_max_reroutes_per_segment,
       clearAcceptanceUnmetPartial,
     };
 

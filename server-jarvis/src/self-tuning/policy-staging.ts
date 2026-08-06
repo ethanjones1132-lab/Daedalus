@@ -20,7 +20,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { SESSIONS_DIR } from "../config";
-import { BASELINE_THETA, policy } from "../orchestration/orchestration-policy";
 import {
   applyPolicySnapshotToPool,
   getLearnedPoolState,
@@ -33,15 +32,15 @@ export type { PolicySnapshot } from "./learned-pool-state";
 
 // ── Thresholds (from plan / Phase C θ baseline) ─────────────────────────────
 
-export const POLICY_STAGING_THRESHOLDS = {
+export const POLICY_STAGING_GOVERNANCE = Object.freeze({
   /** Eligible outcomes required before a candidate may enter shadow replay. */
-  minEligibleOutcomesBeforeShadow: BASELINE_THETA.policy_min_eligible_outcomes_before_shadow,
+  minEligibleOutcomesBeforeShadow: 20,
   /** Fraction of live traffic that receives the canary policy. */
-  canaryTrafficFraction: BASELINE_THETA.policy_canary_traffic_fraction,
+  canaryTrafficFraction: 0.1,
   /** Minimum canary runs before promotion may be evaluated. */
-  minCanaryRunsBeforePromotion: BASELINE_THETA.policy_min_canary_runs_before_promotion,
+  minCanaryRunsBeforePromotion: 20,
   /** Absolute floor on canary success rate for promotion. */
-  minCanarySuccessRate: BASELINE_THETA.policy_min_canary_success_rate,
+  minCanarySuccessRate: 0.6,
   /**
    * Canary must not underperform production by more than this margin
    * (success-rate points) at promotion time.
@@ -56,7 +55,7 @@ export const POLICY_STAGING_THRESHOLDS = {
    * after minSamplesForRollback, auto-rollback.
    */
   maxCanaryRegressionVsProduction: 0.15,
-} as const;
+});
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -298,7 +297,7 @@ export function proposePolicy(
  * Record an eligible production outcome while a candidate is held back, or
  * accumulate live shadow progress once the candidate has entered `shadow`.
  *
- * Candidate stage: after {@link POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow}
+ * Candidate stage: after {@link POLICY_STAGING_GOVERNANCE.minEligibleOutcomesBeforeShadow}
  * outcomes the candidate automatically enters `shadow`.
  *
  * Shadow stage: further live outcomes feed shadow counters so candidates can
@@ -338,7 +337,7 @@ export function recordEligibleOutcome(
   candidate.updatedAt = nowIso();
 
   if (
-    candidate.eligibleOutcomes >= POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow
+    candidate.eligibleOutcomes >= POLICY_STAGING_GOVERNANCE.minEligibleOutcomesBeforeShadow
   ) {
     recordTransition(candidate, "shadow", "eligible_threshold_met");
     candidate.shadow = { replayed: 0, successCount: 0, failureCount: 0 };
@@ -352,7 +351,7 @@ export function recordEligibleOutcome(
 
   return {
     action: "eligible_recorded",
-    reason: `eligible_${candidate.eligibleOutcomes}_of_${POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow}`,
+    reason: `eligible_${candidate.eligibleOutcomes}_of_${POLICY_STAGING_GOVERNANCE.minEligibleOutcomesBeforeShadow}`,
     version: candidate,
     store,
   };
@@ -374,10 +373,10 @@ function recordShadowLiveOutcome(
   else candidate.shadow.failureCount += 1;
   candidate.updatedAt = nowIso();
 
-  if (candidate.shadow.replayed < POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow) {
+  if (candidate.shadow.replayed < POLICY_STAGING_GOVERNANCE.minEligibleOutcomesBeforeShadow) {
     return {
       action: "eligible_recorded",
-      reason: `shadow_live_${candidate.shadow.replayed}_of_${POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow}`,
+      reason: `shadow_live_${candidate.shadow.replayed}_of_${POLICY_STAGING_GOVERNANCE.minEligibleOutcomesBeforeShadow}`,
       version: candidate,
       store,
     };
@@ -397,7 +396,7 @@ function finalizeShadowReplay(candidate: PolicyVersion): TransitionResult {
   }
 
   // Require a full shadow pass of at least minEligibleOutcomesBeforeShadow replays.
-  if (candidate.shadow.replayed < POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow) {
+  if (candidate.shadow.replayed < POLICY_STAGING_GOVERNANCE.minEligibleOutcomesBeforeShadow) {
     return {
       action: "none",
       reason: `shadow_partial_${candidate.shadow.replayed}`,
@@ -408,7 +407,7 @@ function finalizeShadowReplay(candidate: PolicyVersion): TransitionResult {
 
   const shadowRate = successRate(candidate.shadow.successCount, candidate.shadow.failureCount);
   // Reject shadow if absolute rate is catastrophic.
-  if (shadowRate < POLICY_STAGING_THRESHOLDS.minCanarySuccessRate) {
+  if (shadowRate < POLICY_STAGING_GOVERNANCE.minCanarySuccessRate) {
     recordTransition(candidate, "rejected", `shadow_rate_${shadowRate.toFixed(3)}`);
     store.candidate = null;
     return {
@@ -480,7 +479,7 @@ export function runShadowReplay(
  */
 export function shouldApplyCanary(rng: () => number = Math.random): boolean {
   if (!store.canary || store.canary.stage !== "canary") return false;
-  return rng() < policy().policy_canary_traffic_fraction;
+  return rng() < POLICY_STAGING_GOVERNANCE.canaryTrafficFraction;
 }
 
 /**
@@ -500,17 +499,17 @@ function maybeAutoRollback(version: PolicyVersion): TransitionResult | null {
   const stats = version.canaryStats;
   if (!stats) return null;
   const samples = stats.runs;
-  if (samples < POLICY_STAGING_THRESHOLDS.minSamplesForRollback) return null;
+  if (samples < POLICY_STAGING_GOVERNANCE.minSamplesForRollback) return null;
 
   const failRate = stats.failureCount / Math.max(1, stats.runs);
-  if (failRate >= POLICY_STAGING_THRESHOLDS.maxCanaryFailureRate) {
+  if (failRate >= POLICY_STAGING_GOVERNANCE.maxCanaryFailureRate) {
     return rollbackPolicy(`canary_failure_rate_${failRate.toFixed(3)}`);
   }
 
-  if (stats.productionRuns >= POLICY_STAGING_THRESHOLDS.minSamplesForRollback) {
+  if (stats.productionRuns >= POLICY_STAGING_GOVERNANCE.minSamplesForRollback) {
     const canaryRate = successRate(stats.successCount, stats.failureCount);
     const prodRate = successRate(stats.productionSuccessCount, stats.productionFailureCount);
-    if (canaryRate < prodRate - POLICY_STAGING_THRESHOLDS.maxCanaryRegressionVsProduction) {
+    if (canaryRate < prodRate - POLICY_STAGING_GOVERNANCE.maxCanaryRegressionVsProduction) {
       return rollbackPolicy(
         `canary_regression_${canaryRate.toFixed(3)}_vs_${prodRate.toFixed(3)}`,
       );
@@ -522,16 +521,16 @@ function maybeAutoRollback(version: PolicyVersion): TransitionResult | null {
 function evaluatePromotionUnlocked(version: PolicyVersion): TransitionResult | null {
   const stats = version.canaryStats;
   if (!stats) return null;
-  if (stats.runs < POLICY_STAGING_THRESHOLDS.minCanaryRunsBeforePromotion) return null;
+  if (stats.runs < POLICY_STAGING_GOVERNANCE.minCanaryRunsBeforePromotion) return null;
 
   const canaryRate = successRate(stats.successCount, stats.failureCount);
-  if (canaryRate < POLICY_STAGING_THRESHOLDS.minCanarySuccessRate) {
+  if (canaryRate < POLICY_STAGING_GOVERNANCE.minCanarySuccessRate) {
     return rollbackPolicy(`promotion_floor_failed_${canaryRate.toFixed(3)}`);
   }
 
   if (stats.productionRuns > 0) {
     const prodRate = successRate(stats.productionSuccessCount, stats.productionFailureCount);
-    if (canaryRate + POLICY_STAGING_THRESHOLDS.maxCanaryUnderperformance < prodRate) {
+    if (canaryRate + POLICY_STAGING_GOVERNANCE.maxCanaryUnderperformance < prodRate) {
       return rollbackPolicy(
         `promotion_underperform_${canaryRate.toFixed(3)}_vs_${prodRate.toFixed(3)}`,
       );
@@ -599,7 +598,7 @@ export function evaluatePromotion(): TransitionResult {
     };
   }
   const stats = version.canaryStats;
-  if (!stats || stats.runs < POLICY_STAGING_THRESHOLDS.minCanaryRunsBeforePromotion) {
+  if (!stats || stats.runs < POLICY_STAGING_GOVERNANCE.minCanaryRunsBeforePromotion) {
     return {
       action: "none",
       reason: `insufficient_canary_runs_${stats?.runs ?? 0}`,

@@ -16,7 +16,9 @@ const REDIRECT: Record<string, string> = {
   powershell: "powershell is unavailable this turn — use the dedicated file tools instead.",
 };
 
-const SUPPRESS_THRESHOLD = 2;
+import { BASELINE_THETA, policy } from "./orchestration-policy";
+
+const SUPPRESS_THRESHOLD = BASELINE_THETA.dead_tool_suppress_threshold;
 
 function isStructural(output: string): boolean {
   const o = (output || "").toLowerCase();
@@ -25,6 +27,8 @@ function isStructural(output: string): boolean {
 
 export class DeadToolTracker {
   private structuralFailures = new Map<string, number>();
+  /** Snapshot the request policy so this tracker cannot inherit a later turn's ALS. */
+  private readonly suppressThreshold = policy().dead_tool_suppress_threshold;
 
   record(tool: string, isError: boolean, output: string): void {
     if (!isError) {
@@ -36,7 +40,7 @@ export class DeadToolTracker {
   }
 
   isSuppressed(tool: string): boolean {
-    return (this.structuralFailures.get(tool) ?? 0) >= SUPPRESS_THRESHOLD;
+    return (this.structuralFailures.get(tool) ?? 0) >= this.suppressThreshold;
   }
 
   redirectNote(tool: string): string {

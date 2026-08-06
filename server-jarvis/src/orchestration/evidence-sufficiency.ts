@@ -29,6 +29,7 @@ import { posix, win32 } from "path";
 import { normalizePathInput } from "../fs-scope";
 import { isDuplicateToolDeflection, type ToolCallRecord } from "./stage-output";
 import { hasWorkspaceSignal, hasWriteIntent, type TurnRequirement } from "./turn-requirements";
+import { BASELINE_THETA, policy } from "./orchestration-policy";
 
 const DEEP_READ_MARKERS =
   /\b(comprehensiv\w*|thorough\w*|entire|whole|all files|full|in[- ]depth|deep\s+reads?|architecture|architectural|audit|diagnos\w*|repo|repository|codebase)\b/i;
@@ -358,7 +359,7 @@ function distinctDeepReadTargetKeys(
  * can pin the floor at 3, and the wire-up in `pipeline.ts` (the post-loop
  * fence and the nudge message) can reference the same value.
  */
-export const DEEP_READ_MIN_CONTENT_READS = 3;
+export const DEEP_READ_MIN_CONTENT_READS = BASELINE_THETA.deep_read_min_content_reads;
 
 export interface EvidenceAssessment {
   sufficient: boolean;
@@ -511,7 +512,7 @@ export function assessWorkspaceEvidence(
     // Deep-read floor: only genuine file-content reads count, deduped by
     // (tool, arguments) so reading the same file 3 times can't fake it.
     const distinctContentReads = distinctDeepReadTargetKeys(calls, workspaceRoot, pathSemantics).size;
-    const sufficient = distinctContentReads >= DEEP_READ_MIN_CONTENT_READS;
+    const sufficient = distinctContentReads >= policy().deep_read_min_content_reads;
     return {
       sufficient,
       contentReads: distinctContentReads,
@@ -519,7 +520,7 @@ export function assessWorkspaceEvidence(
       deepRead,
       reason: sufficient
         ? `deep read satisfied: ${distinctContentReads} distinct content reads`
-        : `deep-read request needs >=${DEEP_READ_MIN_CONTENT_READS} distinct content reads (read_file/grep on different targets); got ${distinctContentReads} and ${listings} list_directory/glob calls`,
+        : `deep-read request needs >=${policy().deep_read_min_content_reads} distinct content reads (read_file/grep on different targets); got ${distinctContentReads} and ${listings} list_directory/glob calls`,
     };
   }
   // Shallow floor: any single real read (file content, repo metadata, or a

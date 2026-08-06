@@ -42,6 +42,10 @@ export interface OrchestrationTheta {
   no_tool_retry_budget_floor_ms: number;
   no_tool_ratio_ceiling: number;
   no_tool_ratio_min_turns: number;
+  default_min_viable_stage_ms: number;
+  progress_extension_ms: number;
+  stage_extension_ceiling_ms: number;
+  absolute_turn_cap_ms: number;
 
   // ── Model health / demotion ─────────────────────────────────────────────
   min_no_tool_sample: number;
@@ -50,6 +54,8 @@ export interface OrchestrationTheta {
   error_rate_bench_threshold: number;
   trial_sample_target: number;
   reliability_latency_min_samples: number;
+  model_scorecard_window_size: number;
+  model_scorecard_unfit_error_rate: number;
 
   // ── Delegate ────────────────────────────────────────────────────────────
   max_delegate_launches_per_run: number;
@@ -82,10 +88,9 @@ export interface OrchestrationTheta {
   repetition_similarity_threshold: number;
 
   // ── Policy staging traffic (meta-θ) ─────────────────────────────────────
-  policy_canary_traffic_fraction: number;
-  policy_min_canary_success_rate: number;
-  policy_min_eligible_outcomes_before_shadow: number;
-  policy_min_canary_runs_before_promotion: number;
+  default_max_repair_cycles: number;
+  max_review_repair_rounds_cap: number;
+  dead_tool_suppress_threshold: number;
 }
 
 /** Ordered keys — stable serialization / CMA-ES vector layout. */
@@ -108,12 +113,18 @@ export const THETA_KEYS: readonly (keyof OrchestrationTheta)[] = [
   "no_tool_retry_budget_floor_ms",
   "no_tool_ratio_ceiling",
   "no_tool_ratio_min_turns",
+  "default_min_viable_stage_ms",
+  "progress_extension_ms",
+  "stage_extension_ceiling_ms",
+  "absolute_turn_cap_ms",
   "min_no_tool_sample",
   "no_tool_demotion_threshold",
   "min_error_rate_sample",
   "error_rate_bench_threshold",
   "trial_sample_target",
   "reliability_latency_min_samples",
+  "model_scorecard_window_size",
+  "model_scorecard_unfit_error_rate",
   "max_delegate_launches_per_run",
   "default_free_thrash_threshold",
   "delegate_write_scoreboard_bench_attempts",
@@ -133,10 +144,9 @@ export const THETA_KEYS: readonly (keyof OrchestrationTheta)[] = [
   "executor_transcript_budget_tokens",
   "write_turn_transcript_budget_tokens",
   "repetition_similarity_threshold",
-  "policy_canary_traffic_fraction",
-  "policy_min_canary_success_rate",
-  "policy_min_eligible_outcomes_before_shadow",
-  "policy_min_canary_runs_before_promotion",
+  "default_max_repair_cycles",
+  "max_review_repair_rounds_cap",
+  "dead_tool_suppress_threshold",
 ] as const;
 
 /**
@@ -164,6 +174,10 @@ export const BASELINE_THETA: OrchestrationTheta = {
   no_tool_retry_budget_floor_ms: 20_000,
   no_tool_ratio_ceiling: 0.5,
   no_tool_ratio_min_turns: 6,
+  default_min_viable_stage_ms: 5_000,
+  progress_extension_ms: 20_000,
+  stage_extension_ceiling_ms: 90_000,
+  absolute_turn_cap_ms: 180_000,
 
   min_no_tool_sample: 12,
   no_tool_demotion_threshold: 0.6,
@@ -171,6 +185,8 @@ export const BASELINE_THETA: OrchestrationTheta = {
   error_rate_bench_threshold: 0.7,
   trial_sample_target: 6,
   reliability_latency_min_samples: 6,
+  model_scorecard_window_size: 20,
+  model_scorecard_unfit_error_rate: 0.5,
 
   max_delegate_launches_per_run: 4,
   default_free_thrash_threshold: 2,
@@ -195,10 +211,9 @@ export const BASELINE_THETA: OrchestrationTheta = {
 
   repetition_similarity_threshold: 0.25,
 
-  policy_canary_traffic_fraction: 0.1,
-  policy_min_canary_success_rate: 0.6,
-  policy_min_eligible_outcomes_before_shadow: 20,
-  policy_min_canary_runs_before_promotion: 20,
+  default_max_repair_cycles: 2,
+  max_review_repair_rounds_cap: 2,
+  dead_tool_suppress_threshold: 2,
 };
 
 export type ThetaPatch = Partial<OrchestrationTheta>;

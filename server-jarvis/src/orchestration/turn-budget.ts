@@ -1,4 +1,5 @@
 import type { TurnRequirement } from "./turn-requirements";
+import { BASELINE_THETA, policy } from "./orchestration-policy";
 
 export interface TurnBudget {
   requirement: TurnRequirement;
@@ -78,20 +79,20 @@ export const MIN_VIABLE_STAGE_MS: Readonly<Record<string, number>> = {
   planner: 6_000,
 };
 
-const DEFAULT_MIN_VIABLE_STAGE_MS = 5_000;
+const DEFAULT_MIN_VIABLE_STAGE_MS = BASELINE_THETA.default_min_viable_stage_ms;
 
 /**
  * The floor never exceeds the stage's own configured budget — otherwise a
  * stage whose whole allowance is smaller than the floor could never run.
  */
 function minViableStageMs(stage: string, configuredStageMs: number): number {
-  const floor = MIN_VIABLE_STAGE_MS[stage] ?? DEFAULT_MIN_VIABLE_STAGE_MS;
+  const floor = MIN_VIABLE_STAGE_MS[stage] ?? policy().default_min_viable_stage_ms;
   return Math.min(floor, configuredStageMs);
 }
 
-const PROGRESS_EXTENSION_MS = 20_000;      // per evidence-producing stage turn
-const STAGE_EXTENSION_CEILING_MS = 90_000; // a stage may never exceed this (unforced)
-const ABSOLUTE_TURN_CAP_MS = 180_000;      // default high-complexity full_execution cap
+const PROGRESS_EXTENSION_MS = BASELINE_THETA.progress_extension_ms;
+const STAGE_EXTENSION_CEILING_MS = BASELINE_THETA.stage_extension_ceiling_ms;
+const ABSOLUTE_TURN_CAP_MS = BASELINE_THETA.absolute_turn_cap_ms;
 /**
  * Deep-task contract (2026-07-16 evening): any turn classified deep — a
  * deep-read request, a continuation of a deep task, or the explicit "force
@@ -132,7 +133,7 @@ export function computeRequestTimeoutMs(
 ): number {
   const stageRemaining = budget.stageRemainingMs(stageLabel);
   const usefulWindow = Math.max(60_000, Math.min(base, stageRemaining));
-  return budget.turn_ms > ABSOLUTE_TURN_CAP_MS
+  return budget.turn_ms > policy().absolute_turn_cap_ms
     ? Math.min(180_000, usefulWindow)
     : usefulWindow;
 }
@@ -271,7 +272,7 @@ export function createTurnBudget(
   // (deep-read intent / deep task-run continuation) share the same
   // long-haul window.
   const extendedDeep = Boolean(opts.forcedDeepRead || opts.deepTask);
-  const absolute_cap_ms = extendedDeep ? EXTENDED_DEEP_TURN_MS : ABSOLUTE_TURN_CAP_MS;
+  const absolute_cap_ms = extendedDeep ? EXTENDED_DEEP_TURN_MS : policy().absolute_turn_cap_ms;
   let turn_ms = requirement === "full_execution" && complexity === "high"
     ? Math.min(180_000, base.turn_ms + 30_000)
     : base.turn_ms;
@@ -291,8 +292,8 @@ export function createTurnBudget(
   // Extended stages may start above the default 90s progress ceiling; never
   // shrink them via extendStageOnProgress, and allow growth up to absolute_cap.
   const stageExtensionCeilingMs = extendedDeep
-    ? Math.max(STAGE_EXTENSION_CEILING_MS, EXTENDED_DEEP_EXECUTOR_MS)
-    : STAGE_EXTENSION_CEILING_MS;
+    ? Math.max(policy().stage_extension_ceiling_ms, EXTENDED_DEEP_EXECUTOR_MS)
+    : policy().stage_extension_ceiling_ms;
 
   const budget: TurnBudget = {
     requirement,
@@ -366,7 +367,7 @@ export function createTurnBudget(
       if (newEvidenceCount <= 0) return;
       const current = this.stage_ms[stage];
       if (current === undefined) return;
-      const extension = Math.min(newEvidenceCount, 3) * PROGRESS_EXTENSION_MS;
+      const extension = Math.min(newEvidenceCount, 3) * policy().progress_extension_ms;
       const next = Math.min(stageExtensionCeilingMs, current + extension);
       const granted = next - current;
       if (granted <= 0) return;

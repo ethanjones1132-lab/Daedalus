@@ -25,6 +25,7 @@ import { parseReviewerVerdict } from "./stage-output";
 import { decideVerificationDirective } from "./verification-decision";
 import { buildTaskPlanGrounding, type TaskPlanEvidenceGrounding } from "./task-plan-evidence";
 import { DeadToolTracker } from "./dead-tool-suppression";
+import { policy } from "./orchestration-policy";
 import {
   classifyMidLoopEscalation,
   decideMidLoopIntervention,
@@ -133,7 +134,7 @@ export class LiveConductor {
   /** Owned-runtime-loop: optional TaskPlan contract for per-item grading. */
   private planContract: TaskRunContract | undefined;
   /** Max repair cycles per item (from cfg or default). */
-  private maxRepairCycles = DEFAULT_MAX_REPAIR_CYCLES;
+  private maxRepairCycles = policy().default_max_repair_cycles;
   /** Side-channel: last verification decision asked pipeline to drop reviewer. */
   lastVerificationDroppedReviewer = false;
   /**
@@ -242,13 +243,13 @@ export class LiveConductor {
         classification,
         used: this.midLoopEscalationsUsed,
         earlyUsed: this.midLoopEarlyEscalationsUsed,
-        max: MAX_MID_LOOP_ESCALATIONS,
+        max: policy().max_mid_loop_escalations,
       })
     ) {
       return {
         kind: "continue",
         decisionSource:
-          this.midLoopEscalationsUsed >= MAX_MID_LOOP_ESCALATIONS
+          this.midLoopEscalationsUsed >= policy().max_mid_loop_escalations
             ? "cap_exhausted"
             : "escalation_reserved",
       };

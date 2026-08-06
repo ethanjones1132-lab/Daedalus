@@ -1,12 +1,14 @@
 /** Maximum number of conductor queue rewrites allowed in one execution segment. */
-export const DEFAULT_MAX_REROUTES_PER_SEGMENT = 3;
+import { BASELINE_THETA, policy } from "./orchestration-policy";
+
+export const DEFAULT_MAX_REROUTES_PER_SEGMENT = BASELINE_THETA.default_max_reroutes_per_segment;
 
 /** Stages that can produce tool calls and legitimately re-enter on evidence gaps. */
 export const EVIDENCE_CAPABLE_STAGES = new Set<string>(["executor", "rewriter"]);
 
 export function canApplyConductorReroute(
   applied: number,
-  max = DEFAULT_MAX_REROUTES_PER_SEGMENT,
+  max = policy().default_max_reroutes_per_segment,
 ): boolean {
   return Number.isFinite(applied) && applied >= 0 && applied < Math.max(1, Math.floor(max));
 }

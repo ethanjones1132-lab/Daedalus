@@ -10,9 +10,10 @@
 
 import type { ToolCallRecord } from "./stage-output";
 import { collectToolPathTargets } from "./mid-loop-intervention";
+import { BASELINE_THETA, policy } from "./orchestration-policy";
 
 /** Upper bound on seeded reads — the handoff must not become its own spiral. */
-export const MAX_HANDOFF_SEED_PATHS = 3;
+export const MAX_HANDOFF_SEED_PATHS = BASELINE_THETA.max_handoff_seed_paths;
 
 const WRITE_TOOLS = new Set(["write_file", "edit_file", "multi_edit", "apply_patch"]);
 const READ_TOOLS = new Set(["read_file", "Read"]);
@@ -52,5 +53,5 @@ export function selectHandoffSeedPaths(input: HandoffSeedInput): string[] {
     if (!path || alreadyRead.has(path) || ordered.includes(path)) continue;
     ordered.push(path);
   }
-  return ordered.slice(0, MAX_HANDOFF_SEED_PATHS);
+  return ordered.slice(0, policy().max_handoff_seed_paths);
 }

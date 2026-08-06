@@ -85,12 +85,12 @@ Every threshold shipped this week was a human reading the evidence store and pic
 
 **C3 — Reproducible rollouts.** θ snapshot + fixture + seed must replay to the same trajectory, or the optimizer is fitting noise.
 
-**Exit criterion:** every hand-tuned constant reachable through θ; the current values reproduce today's behaviour exactly as a baseline.
+**Exit criterion:** every inventory-approved optimizable runtime decision reachable through θ; the current values reproduce today's behaviour exactly as a baseline.
 
-### Phase C status (2026-08-05) — **complete (C1–C3)**
+### Phase C status (2026-08-05) — **implementation complete; live fixture exit proof pending**
 
 **C1 — θ defined.** `server-jarvis/src/orchestration/orchestration-policy.ts`:
-- `OrchestrationTheta` + `THETA_KEYS` (~46 dimensions): write pressure, directives, stage budgets, model health, delegate, grounding, context, policy-staging traffic.
+- `OrchestrationTheta` + `THETA_KEYS`: inventory-approved write pressure, directives, stage budgets, model health, delegate, grounding, context, and repair decisions.
 - **Phase B reward is not in θ** — weights and overclaim penalty are evaluator-owned (`RUN_REWARD_POLICY`); Phase D treats them as immutable fitness.
 - `BASELINE_THETA` pins today's shipped values (exit criterion: baseline ≡ prior constants).
 - Dense vector: `thetaToVector` / `vectorToTheta` for CMA-ES.
@@ -106,7 +106,7 @@ Every threshold shipped this week was a human reading the evidence store and pic
 - `rolloutFingerprint` (SHA-256, deterministic)
 - `mulberry32` PRNG + `withRollout` binds θ + seed for offline identity checks
 
-**Exit criterion met:** every listed hand-tuned knob is a θ dimension; baseline tests pin key values; replay fingerprint is deterministic.
+**Implementation complete:** every inventory-approved optimizable runtime decision is a θ dimension; baseline tests pin key values; replay fingerprint is deterministic. **Live fixture exit proof remains pending.**
 
 **Still open:** Phase D CMA-ES over θ against Phase B reward.
 

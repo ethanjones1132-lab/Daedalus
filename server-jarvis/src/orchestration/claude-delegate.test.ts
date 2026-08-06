@@ -25,6 +25,7 @@ import {
   withDelegateRequestCorrelation,
   type DelegateRootSnapshot,
 } from "./claude-delegate";
+import { runWithTheta } from "./orchestration-policy";
 import { toolCallIdentityKey } from "./pipeline";
 import { delegateToolResultContextChars, WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS } from "./context-budget";
 import {
@@ -39,6 +40,20 @@ function testConfig(): JarvisConfig {
   config.opencode_go.api_key = "go-test-key";
   return config;
 }
+
+test("delegate cooldown reads request-scoped theta", () => {
+  let now = 1_000;
+  const health = new DelegateHealth(() => now);
+  runWithTheta({ delegate_health_cooldown_ms: 2_000 }, () => {
+    health.strike("spawn_error");
+    health.strike("spawn_error");
+    health.strike("spawn_error");
+  });
+  now = 2_999;
+  expect(health.isAvailable()).toBe(false);
+  now = 3_000;
+  expect(health.isAvailable()).toBe(true);
+});
 
 /**
  * 2026-08-05 live: configuring a CMake build in the Perihelion workspace put

@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync,
 import { join } from "path";
 import { estimateTokens, recordConductorCache } from "./conductor-metrics";
 import { loadPrompt } from "./prompt-loader";
+import { BASELINE_THETA, policy } from "./orchestration-policy";
 import type { ChatMessage, SharedContextHints } from "./coordinator";
 import type { ConductorConfig, JarvisConfig } from "../config";
 import { SESSIONS_DIR } from "../config";
@@ -307,7 +308,7 @@ const RUNTIME_HEALTH_FAILURE_TTL_MS = 30_000;
 const runtimeFailedTargets = new Map<string, number>();
 
 /** F7: warm routing must fail fast before API fallback takes over. */
-export const ROUTING_TIMEOUT_MS = 20_000;
+export const ROUTING_TIMEOUT_MS = BASELINE_THETA.routing_timeout_ms;
 
 export function __resetPersistentConductorCachesForTests(): void {
   cachedTarget = null;
@@ -1154,7 +1155,7 @@ export class PersistentConductor {
     const message = await this.callOllamaMessage(target, messages, {
       format: COORDINATOR_ROUTE_JSON_SCHEMA,
       numPredict: 320,
-      timeoutMs: ROUTING_TIMEOUT_MS,
+      timeoutMs: policy().routing_timeout_ms,
     });
     return extractConductorRoutingJson(message);
   }

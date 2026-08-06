@@ -34,7 +34,7 @@ describe("computeRunReward B1 composition", () => {
 
     const baseline = computeRunReward(input);
     const underCandidate = runWithTheta(
-      { force_write_nudge_cap: 99, policy_canary_traffic_fraction: 1 },
+      { force_write_nudge_cap: 99 },
       () => computeRunReward(input),
     );
 

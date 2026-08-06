@@ -194,7 +194,7 @@ function entryFromSeed(seed: {
     attempts: seed.attempts,
     verifiedWrites: seed.verifiedWrites,
     benched:
-      seed.attempts >= DELEGATE_WRITE_SCOREBOARD_BENCH_ATTEMPTS &&
+      seed.attempts >= policy().delegate_write_scoreboard_bench_attempts &&
       seed.verifiedWrites === 0,
   };
 }
@@ -384,7 +384,7 @@ export function recordDelegateWriteOutcome(
     model: normalized,
     attempts,
     verifiedWrites,
-    benched: attempts >= DELEGATE_WRITE_SCOREBOARD_BENCH_ATTEMPTS && verifiedWrites === 0,
+    benched: attempts >= policy().delegate_write_scoreboard_bench_attempts && verifiedWrites === 0,
   };
   writeScoreboard.set(normalized, entry);
   persistScoreboardEntry(entry);
@@ -482,7 +482,7 @@ function thrashStateAt(
 
 export function getDelegateThrashCount(
   key: string,
-  ttlMs: number = DEFAULT_THRASH_TTL_MS,
+  ttlMs: number = policy().thrash_ttl_ms,
   now: number = Date.now(),
 ): number {
   return thrashStateAt(key, ttlMs, now)?.count ?? 0;
@@ -490,7 +490,7 @@ export function getDelegateThrashCount(
 
 export function recordDelegateThrash(
   key: string,
-  ttlMs: number = DEFAULT_THRASH_TTL_MS,
+  ttlMs: number = policy().thrash_ttl_ms,
   now: number = Date.now(),
 ): number {
   const prev = thrashStateAt(key, ttlMs, now);

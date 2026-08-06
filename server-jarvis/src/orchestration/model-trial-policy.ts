@@ -30,6 +30,7 @@
  */
 
 import type { OrchestratorAgent } from "./agent-pool";
+import { BASELINE_THETA, policy } from "./orchestration-policy";
 
 /**
  * Observations required before a model is judged on merit.
@@ -39,7 +40,7 @@ import type { OrchestratorAgent } from "./agent-pool";
  * it keeps one definition of "enough data" — a trial ends exactly when the
  * scorecard is willing to grade.
  */
-export const TRIAL_SAMPLE_TARGET = 6;
+export const TRIAL_SAMPLE_TARGET = BASELINE_THETA.trial_sample_target;
 
 /**
  * Stages where a wrong pick is contained.
@@ -76,7 +77,7 @@ export function selectTrialCandidate(
   const inTrial = candidates
     .filter((agent) => agent.enabled && isFreeLane(agent))
     .map((agent) => ({ agent, samples: sampleCountFor(agent) }))
-    .filter((entry) => entry.samples < TRIAL_SAMPLE_TARGET);
+    .filter((entry) => entry.samples < policy().trial_sample_target);
   if (inTrial.length === 0) return undefined;
   // Fewest samples first, so several new arrivals all graduate promptly
   // instead of one monopolising the trial slot.

@@ -16,6 +16,7 @@
  */
 
 import type { LoopIntervention } from "./mid-loop-intervention";
+import { BASELINE_THETA, policy } from "./orchestration-policy";
 
 export type DelegateInterventionAction = "observe" | "defer" | "handoff" | "abort";
 
@@ -32,7 +33,7 @@ export interface DelegateInterventionInput {
 }
 
 /** How many failed write attempts count as "repeated" for handoff. */
-export const REPEATED_FAILED_WRITES_THRESHOLD = 2;
+export const REPEATED_FAILED_WRITES_THRESHOLD = BASELINE_THETA.repeated_failed_writes_threshold;
 
 /**
  * Decide how the host should enact a mid-loop intervention against a live
@@ -52,7 +53,7 @@ export function decideDelegateIntervention(
   }
 
   // 3. Policy denial or repeated failed writes → hand off to native.
-  if (input.policyDenied || input.failedWrites >= REPEATED_FAILED_WRITES_THRESHOLD) {
+  if (input.policyDenied || input.failedWrites >= policy().repeated_failed_writes_threshold) {
     return "handoff";
   }
 

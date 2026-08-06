@@ -346,7 +346,7 @@ export function shouldRunMidLoopCheck(input: {
   checksUsed: number;
   maxChecks?: number;
 }): boolean {
-  const maxChecks = input.maxChecks ?? MAX_MID_LOOP_CHECKS;
+  const maxChecks = input.maxChecks ?? policy().max_mid_loop_checks;
   if (input.checksUsed >= maxChecks) return false;
   if (input.successfulWrites <= 0) return false;
   // New mutations since the last mid-loop check.
@@ -394,14 +394,14 @@ export function shouldRunQualityPhase(signal: MidLoopSignal): boolean {
   if (!assessCorrectnessFloor(signal)) return false;
   if (signal.qualityAccepted === true) return false;
   const used = signal.qualityPushesUsed ?? 0;
-  const budget = signal.qualityPushBudget ?? MAX_QUALITY_PUSHES;
+  const budget = signal.qualityPushBudget ?? policy().max_quality_pushes;
   if (used >= budget) return false;
   return (
     signal.implementationPhase === "quality" ||
     signal.forceQualityGate === true ||
     signal.writeLandedSinceLastCheck === true ||
     // Pre-completion / endgame with writes but no quality accept yet.
-    (signal.successfulWrites > 0 && (signal.turnCount >= signal.maxTurns || signal.stageRemainingMs <= MID_LOOP_ENDGAME_BUDGET_MS))
+    (signal.successfulWrites > 0 && (signal.turnCount >= signal.maxTurns || signal.stageRemainingMs <= policy().mid_loop_endgame_budget_ms))
   );
 }
 
@@ -426,8 +426,8 @@ export function classifyMidLoopEscalation(signal: MidLoopSignal): MidLoopEscalat
     signal.writeLandedSinceLastCheck === true || verificationFailed || qualityPhase;
   const turnRatio = signal.maxTurns > 0 ? signal.turnCount / signal.maxTurns : 0;
   const endgame =
-    turnRatio >= MID_LOOP_ENDGAME_TURN_RATIO ||
-    signal.stageRemainingMs <= MID_LOOP_ENDGAME_BUDGET_MS;
+    turnRatio >= policy().mid_loop_endgame_turn_ratio ||
+    signal.stageRemainingMs <= policy().mid_loop_endgame_budget_ms;
   const afterReroute = signal.afterReroute === true;
 
   if (postWriteQuality || endgame || afterReroute) {
@@ -472,8 +472,8 @@ export function maySpendMidLoopEscalation(input: {
   max?: number;
   reserved?: number;
 }): boolean {
-  const max = input.max ?? MAX_MID_LOOP_ESCALATIONS;
-  const reserved = input.reserved ?? RESERVED_MID_LOOP_ESCALATIONS;
+  const max = input.max ?? policy().max_mid_loop_escalations;
+  const reserved = input.reserved ?? policy().reserved_mid_loop_escalations;
   if (input.used >= max) return false;
   if (input.classification === "priority_quality") return true;
   return input.earlyUsed < Math.max(0, max - reserved);
@@ -963,7 +963,7 @@ export function formatMidLoopEscalationContext(signal: MidLoopSignal): string {
   lines.push(`Implementation phase: ${phase}.`);
   if (phase === "quality") {
     lines.push(
-      `Quality pushes used: ${signal.qualityPushesUsed ?? 0}/${signal.qualityPushBudget ?? MAX_QUALITY_PUSHES}.`,
+      `Quality pushes used: ${signal.qualityPushesUsed ?? 0}/${signal.qualityPushBudget ?? policy().max_quality_pushes}.`,
       "CORRECTNESS FLOOR IS MET. Your job is product quality for one-shot free/local executors — " +
         "edge cases, requirement completeness, clarity, robustness — not mere 'a write happened'.",
     );

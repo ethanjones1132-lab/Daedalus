@@ -1,6 +1,7 @@
 import { countTokens } from "../tokens";
 import type { ToolCallRecord } from "./stage-output";
 import type { TurnRequirement } from "./turn-requirements";
+import { BASELINE_THETA, policy } from "./orchestration-policy";
 
 export const HISTORY_BUDGET_TOKENS: Record<TurnRequirement, number> = {
   conversational: 0,
@@ -9,15 +10,15 @@ export const HISTORY_BUDGET_TOKENS: Record<TurnRequirement, number> = {
   full_execution: 2_400,
 };
 
-export const EXECUTOR_TOOL_RESULT_CONTEXT_CHARS = 6_000;
-export const EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS = 3_000;
+export const EXECUTOR_TOOL_RESULT_CONTEXT_CHARS = BASELINE_THETA.executor_tool_result_context_chars;
+export const EXECUTOR_PREFLIGHT_RESULT_CONTEXT_CHARS = BASELINE_THETA.executor_preflight_result_context_chars;
 export const REWRITER_TOOL_RESULT_CONTEXT_CHARS = 4_000;
 // Network results (web_fetch/web_search) carry the evidence for research turns,
 // where the readable article is the whole point. The 5,000-char strip that
 // web_fetch used truncated mid-article on any real page; this budget admits a
 // full extracted article while staying well under the write-turn cap.
 export const NETWORK_TOOL_RESULT_CONTEXT_CHARS = 12_000;
-export const EXECUTOR_TRANSCRIPT_BUDGET_TOKENS = 12_000;
+export const EXECUTOR_TRANSCRIPT_BUDGET_TOKENS = BASELINE_THETA.executor_transcript_budget_tokens;
 export const REWRITER_TRANSCRIPT_BUDGET_TOKENS = 8_000;
 
 // ── Write-turn visibility (2026-07-18) ───────────────────────────────────────
@@ -29,8 +30,14 @@ export const REWRITER_TRANSCRIPT_BUDGET_TOKENS = 8_000;
 // admits real source files whole, and a transcript budget sized to hold two
 // such files plus the working conversation. Read-only turns keep the tight
 // caps — summarization does not need byte-exact visibility.
-export const WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS = 24_000;
-export const WRITE_TURN_TRANSCRIPT_BUDGET_TOKENS = 24_000;
+export const WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS = BASELINE_THETA.write_turn_tool_result_context_chars;
+export const WRITE_TURN_TRANSCRIPT_BUDGET_TOKENS = BASELINE_THETA.write_turn_transcript_budget_tokens;
+
+export function executorToolResultContextChars(): number { return policy().executor_tool_result_context_chars; }
+export function executorPreflightResultContextChars(): number { return policy().executor_preflight_result_context_chars; }
+export function writeTurnToolResultContextChars(): number { return policy().write_turn_tool_result_context_chars; }
+export function executorTranscriptBudgetTokens(): number { return policy().executor_transcript_budget_tokens; }
+export function writeTurnTranscriptBudgetTokens(): number { return policy().write_turn_transcript_budget_tokens; }
 
 /**
  * Per-result context cap for the Claude CLI delegate.
@@ -38,7 +45,7 @@ export const WRITE_TURN_TRANSCRIPT_BUDGET_TOKENS = 24_000;
  * write-turn visibility budget (not the 6 KB read-turn executor cap).
  */
 export function delegateToolResultContextChars(): number {
-  return WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS;
+  return policy().write_turn_tool_result_context_chars;
 }
 
 /** Keep the newest N assistant/tool cycles intact; older ones become a checkpoint. */

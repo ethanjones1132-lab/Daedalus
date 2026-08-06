@@ -3,6 +3,7 @@ import {
   NO_TOOL_RATIO_CEILING,
   NO_TOOL_RATIO_MIN_TURNS,
 } from "./executor-progress-policy";
+import { runWithTheta } from "./orchestration-policy";
 
 // 2026-08-01, measured on the 8-run post-deploy window after the completion
 // integrity merge: executor no-tool turns were 42.9% against a <=10% target.
@@ -65,6 +66,16 @@ describe("interleaved no-tool turns (ratio bound)", () => {
 import { decideExecutorProgress, SemanticPressureBudget } from "./executor-progress-policy";
 
 describe("decideExecutorProgress", () => {
+  test("no-tool ratio reads request-scoped theta", () => {
+    const input = {
+      writeIntent: true, emittedToolCalls: false, successfulWrites: 0,
+      consecutiveNoToolTurns: 1, stageRemainingMs: 60_000,
+      anyToolCallThisStage: true, executorTurns: 10, noToolTurns: 4,
+    };
+    expect(runWithTheta({ no_tool_ratio_ceiling: 0.3 }, () => decideExecutorProgress(input))).toBe("stop_partial");
+    expect(runWithTheta({ no_tool_ratio_ceiling: 0.5 }, () => decideExecutorProgress(input))).toBe("continue");
+  });
+
   test("first no-tool write turn retries once with a different strong model", () => {
     expect(decideExecutorProgress({
       writeIntent: true,

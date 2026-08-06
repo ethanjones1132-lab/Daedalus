@@ -100,7 +100,9 @@ export interface ApplyInsufficientInput {
 }
 
 /** Default max Reviewer→Rewriter→Executor cycles per plan item. */
-export const DEFAULT_MAX_REPAIR_CYCLES = 2;
+import { BASELINE_THETA, policy } from "./orchestration-policy";
+
+export const DEFAULT_MAX_REPAIR_CYCLES = BASELINE_THETA.default_max_repair_cycles;
 
 /**
  * Reuses LiveConductor's consecutive-failure spirit (tool-error threshold in
@@ -740,7 +742,7 @@ export function decideRepairChain(args: {
   /** When false, read-intent turns skip automatic repair (existing write gate). */
   allowOnReadIntent?: boolean;
 }): RepairChainDecision {
-  const maxCycles = args.maxRepairCycles ?? DEFAULT_MAX_REPAIR_CYCLES;
+  const maxCycles = args.maxRepairCycles ?? policy().default_max_repair_cycles;
   const maxFails = args.maxConsecutiveFailures ?? DEFAULT_MAX_CONSECUTIVE_FAILURES;
   const consecutive = args.consecutiveFailures ?? 0;
   const stages = buildAutomaticRepairChainStages();

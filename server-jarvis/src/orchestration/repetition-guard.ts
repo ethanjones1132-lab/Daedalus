@@ -11,7 +11,9 @@
 // Never raise above 0.30 without re-measuring against the incident snapshot
 // (.hermes/incident-20260712/jarvis-incident.db). The `newEvidence` gate is
 // the primary false-positive guard, not this threshold.
-export const REPETITION_SIMILARITY_THRESHOLD = 0.25;
+import { BASELINE_THETA, policy } from "./orchestration-policy";
+
+export const REPETITION_SIMILARITY_THRESHOLD = BASELINE_THETA.repetition_similarity_threshold;
 
 export interface TurnSignature {
   trigrams: Set<string>;
@@ -78,7 +80,7 @@ export function assessRepetition(
       ? 0
       : jaccard(previous.trigrams, answerTrigrams);
   return {
-    repeated: similarity >= REPETITION_SIMILARITY_THRESHOLD && !newEvidence,
+    repeated: similarity >= policy().repetition_similarity_threshold && !newEvidence,
     similarity,
     newEvidence,
   };
@@ -122,7 +124,7 @@ export function shouldShortCircuitRepeat(
   if (FORCE_BYPASS.test(request)) return false;
   // Naming a concrete file/path the previous request lacked is new signal.
   if (CONCRETE_PATH.test(request) && !CONCRETE_PATH.test(previous.request)) return false;
-  return jaccard(trigramsOf(previous.request), trigramsOf(request)) >= REPETITION_SIMILARITY_THRESHOLD;
+  return jaccard(trigramsOf(previous.request), trigramsOf(request)) >= policy().repetition_similarity_threshold;
 }
 
 /** Bounded per-session store of the last turn's signature (LRU by insertion). */

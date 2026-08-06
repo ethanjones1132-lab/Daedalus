@@ -16,6 +16,7 @@ import {
   shouldRunQualityPhase,
   type MidLoopSignal,
 } from "./mid-loop-intervention";
+import { runWithTheta } from "./orchestration-policy";
 
 const base = {
   writeIntent: true,
@@ -417,6 +418,22 @@ describe("resolveResidentMidLoopDirective (#4 continue-must-cite)", () => {
 });
 
 describe("Slice D quality-after-correctness", () => {
+  test("quality push budget reads request-scoped theta", () => {
+    const signal: MidLoopSignal = {
+      writeIntent: true,
+      successfulWrites: 1,
+      distinctSuccessfulReads: 1,
+      turnCount: 1,
+      maxTurns: 5,
+      stageRemainingMs: 100_000,
+      deadToolSuppressed: false,
+      implementationPhase: "quality",
+      qualityPushesUsed: 1,
+    };
+    expect(runWithTheta({ max_quality_pushes: 1 }, () => shouldRunQualityPhase(signal))).toBe(false);
+    expect(runWithTheta({ max_quality_pushes: 2 }, () => shouldRunQualityPhase(signal))).toBe(true);
+  });
+
   test("correctness floor needs a write and non-red verification", () => {
     expect(assessCorrectnessFloor({
       writeIntent: true, successfulWrites: 0,

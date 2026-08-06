@@ -1,14 +1,15 @@
 import type { ModelAttribution } from "../self-tuning/store";
 import type { ReliabilityLatencyEntry } from "./reliability-latency-rank";
+import { BASELINE_THETA, policy } from "./orchestration-policy";
 
 export interface ScorecardAttempt {
   ok: boolean;
   firstTokenMs?: number;
 }
 
-const WINDOW_SIZE = 20;
+const WINDOW_SIZE = BASELINE_THETA.model_scorecard_window_size;
 const MIN_SAMPLES = 6;
-const UNFIT_ERROR_RATE = 0.5;
+const UNFIT_ERROR_RATE = BASELINE_THETA.model_scorecard_unfit_error_rate;
 
 /** Exported so ranking / trial policy can share the same floor. */
 export const SCORECARD_MIN_SAMPLES = MIN_SAMPLES;
@@ -31,7 +32,8 @@ export class ModelScorecard {
     const list = this.slot(stage, providerModelKey);
     const trackedAttempt = { ...attempt };
     list.push(trackedAttempt);
-    if (list.length > WINDOW_SIZE) list.splice(0, list.length - WINDOW_SIZE);
+    const windowSize = Math.max(1, Math.floor(policy().model_scorecard_window_size));
+    if (list.length > windowSize) list.splice(0, list.length - windowSize);
     return trackedAttempt;
   }
 
@@ -73,7 +75,7 @@ export class ModelScorecard {
 
   errorRate(stage: string, providerModelKey: string): number | undefined {
     const list = this.slot(stage, providerModelKey);
-    if (list.length < MIN_SAMPLES) return undefined;
+    if (list.length < SCORECARD_MIN_SAMPLES) return undefined;
     return list.filter((attempt) => !attempt.ok).length / list.length;
   }
 
@@ -95,7 +97,7 @@ export class ModelScorecard {
       if (!key.startsWith(prefix)) continue;
       const providerModelKey = key.slice(prefix.length);
       const rate = this.errorRate(stage, providerModelKey);
-      if (rate !== undefined && rate >= UNFIT_ERROR_RATE) result.add(providerModelKey);
+      if (rate !== undefined && rate >= policy().model_scorecard_unfit_error_rate) result.add(providerModelKey);
     }
     return result;
   }

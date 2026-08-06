@@ -11,7 +11,7 @@ import {
   snapshotStagedPolicyFields,
 } from "./learned-pool-state";
 import {
-  POLICY_STAGING_THRESHOLDS,
+  POLICY_STAGING_GOVERNANCE,
   activeSnapshotForArm,
   evaluatePromotion,
   getPolicyVersionStore,
@@ -43,7 +43,7 @@ const budgetPatch: PolicyPatch = {
 function advanceToShadow(): void {
   const proposed = proposePolicy(routingPatch, "boost reliable model");
   expect(proposed.action).toBe("proposed");
-  for (let i = 0; i < POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow - 1; i++) {
+  for (let i = 0; i < POLICY_STAGING_GOVERNANCE.minEligibleOutcomesBeforeShadow - 1; i++) {
     const r = recordEligibleOutcome(i % 5 === 0 ? "failed" : "success");
     expect(r.action).toBe("eligible_recorded");
   }
@@ -54,7 +54,7 @@ function advanceToShadow(): void {
 
 function advanceToCanary(successRate = 0.9): void {
   advanceToShadow();
-  const n = POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow;
+  const n = POLICY_STAGING_GOVERNANCE.minEligibleOutcomesBeforeShadow;
   const outcomes = Array.from({ length: n }, (_, i) => ({
     success: i / n < successRate,
   }));
@@ -66,9 +66,9 @@ function advanceToCanary(successRate = 0.9): void {
 
 describe("policy staging thresholds", () => {
   test("plan thresholds are pinned", () => {
-    expect(POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow).toBe(20);
-    expect(POLICY_STAGING_THRESHOLDS.canaryTrafficFraction).toBe(0.1);
-    expect(POLICY_STAGING_THRESHOLDS.minCanaryRunsBeforePromotion).toBe(20);
+    expect(POLICY_STAGING_GOVERNANCE.minEligibleOutcomesBeforeShadow).toBe(20);
+    expect(POLICY_STAGING_GOVERNANCE.canaryTrafficFraction).toBe(0.1);
+    expect(POLICY_STAGING_GOVERNANCE.minCanaryRunsBeforePromotion).toBe(20);
   });
 });
 
@@ -128,7 +128,7 @@ describe("propose → eligible → shadow → canary → promote", () => {
     for (let k = 0; k < n; k++) {
       if (shouldApplyCanary(rng)) hits += 1;
     }
-    expect(hits).toBe(Math.floor(n * POLICY_STAGING_THRESHOLDS.canaryTrafficFraction));
+    expect(hits).toBe(Math.floor(n * POLICY_STAGING_GOVERNANCE.canaryTrafficFraction));
 
     const canarySnap = activeSnapshotForArm("canary");
     expect(canarySnap.modelRoutingScoreDeltas["opencode_go:deepseek-v4-flash"]).toBe(0.12);
@@ -141,10 +141,10 @@ describe("propose → eligible → shadow → canary → promote", () => {
   test("promote applies snapshot to pool and seeds last-known-good", () => {
     advanceToCanary(1.0);
     // 20 canary successes + concurrent production successes.
-    for (let i = 0; i < POLICY_STAGING_THRESHOLDS.minCanaryRunsBeforePromotion; i++) {
+    for (let i = 0; i < POLICY_STAGING_GOVERNANCE.minCanaryRunsBeforePromotion; i++) {
       const r = recordCanaryOutcome("canary", true);
       recordCanaryOutcome("production", true);
-      if (i < POLICY_STAGING_THRESHOLDS.minCanaryRunsBeforePromotion - 1) {
+      if (i < POLICY_STAGING_GOVERNANCE.minCanaryRunsBeforePromotion - 1) {
         expect(r.action).toBe("canary_outcome_recorded");
       }
     }
@@ -184,7 +184,7 @@ describe("rollback triggers", () => {
     // Seed a production baseline so LKG has something meaningful after first promote path.
     // Here we roll back mid-canary: failure rate 1.0 after 10 samples.
     let last = recordCanaryOutcome("canary", false);
-    for (let i = 1; i < POLICY_STAGING_THRESHOLDS.minSamplesForRollback; i++) {
+    for (let i = 1; i < POLICY_STAGING_GOVERNANCE.minSamplesForRollback; i++) {
       last = recordCanaryOutcome("canary", false);
     }
     expect(last.action).toBe("rolled_back");
@@ -198,7 +198,7 @@ describe("rollback triggers", () => {
     // Keep canary failure rate < 0.5 so the catastrophic gate does not fire first,
     // but leave canary success well below the concurrent production arm (>0.15 gap).
     // canary: 6/10 success (0.6); production: 10/10 success (1.0) → regression 0.4.
-    for (let i = 0; i < POLICY_STAGING_THRESHOLDS.minSamplesForRollback; i++) {
+    for (let i = 0; i < POLICY_STAGING_GOVERNANCE.minSamplesForRollback; i++) {
       recordCanaryOutcome("production", true);
     }
     let last = recordCanaryOutcome("canary", true);
@@ -211,7 +211,7 @@ describe("rollback triggers", () => {
   test("explicit rollback restores last-known-good snapshot to pool", () => {
     // Establish production via a clean promote.
     advanceToCanary(1.0);
-    for (let i = 0; i < POLICY_STAGING_THRESHOLDS.minCanaryRunsBeforePromotion; i++) {
+    for (let i = 0; i < POLICY_STAGING_GOVERNANCE.minCanaryRunsBeforePromotion; i++) {
       recordCanaryOutcome("canary", true);
       recordCanaryOutcome("production", true);
     }
@@ -249,7 +249,7 @@ describe("restart survival", () => {
   test("persist + load restores production/candidate/canary/LKG and pool maps", () => {
     // Promote once so production + LKG exist.
     advanceToCanary(1.0);
-    for (let i = 0; i < POLICY_STAGING_THRESHOLDS.minCanaryRunsBeforePromotion; i++) {
+    for (let i = 0; i < POLICY_STAGING_GOVERNANCE.minCanaryRunsBeforePromotion; i++) {
       recordCanaryOutcome("canary", true);
       recordCanaryOutcome("production", true);
     }
@@ -379,7 +379,7 @@ describe("merge apply + live shadow progress + canary overlay", () => {
     getLearnedPoolState().modelRoutingScoreDeltas.set("openrouter:ops-feedback", -0.05);
 
     advanceToCanary(1.0);
-    for (let i = 0; i < POLICY_STAGING_THRESHOLDS.minCanaryRunsBeforePromotion; i++) {
+    for (let i = 0; i < POLICY_STAGING_GOVERNANCE.minCanaryRunsBeforePromotion; i++) {
       recordCanaryOutcome("canary", true);
       recordCanaryOutcome("production", true);
     }
@@ -396,7 +396,7 @@ describe("merge apply + live shadow progress + canary overlay", () => {
     getLearnedPoolState().modelRoutingScoreDeltas.set("openrouter:ops-feedback", 0.03);
 
     advanceToCanary(1.0);
-    for (let i = 0; i < POLICY_STAGING_THRESHOLDS.minCanaryRunsBeforePromotion; i++) {
+    for (let i = 0; i < POLICY_STAGING_GOVERNANCE.minCanaryRunsBeforePromotion; i++) {
       recordCanaryOutcome("canary", true);
       recordCanaryOutcome("production", true);
     }
@@ -420,7 +420,7 @@ describe("merge apply + live shadow progress + canary overlay", () => {
     advanceToShadow();
     expect(getPolicyVersionStore().candidate?.stage).toBe("shadow");
 
-    for (let i = 0; i < POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow - 1; i++) {
+    for (let i = 0; i < POLICY_STAGING_GOVERNANCE.minEligibleOutcomesBeforeShadow - 1; i++) {
       const r = recordEligibleOutcome("success");
       expect(r.action).toBe("eligible_recorded");
       expect(r.reason).toContain("shadow_live_");
@@ -436,7 +436,7 @@ describe("merge apply + live shadow progress + canary overlay", () => {
   test("live shadow rejects catastrophic success rate without offline job", () => {
     advanceToShadow();
     let last = recordEligibleOutcome("failed");
-    for (let i = 1; i < POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow; i++) {
+    for (let i = 1; i < POLICY_STAGING_GOVERNANCE.minEligibleOutcomesBeforeShadow; i++) {
       last = recordEligibleOutcome("failed");
     }
     expect(last.action).toBe("rejected");

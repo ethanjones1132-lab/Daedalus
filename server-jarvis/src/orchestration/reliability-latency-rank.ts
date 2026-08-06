@@ -14,8 +14,10 @@
  * and still participate in ranking with whatever successRate / p50 we have.
  */
 
+import { BASELINE_THETA, policy } from "./orchestration-policy";
+
 /** Aligns with ModelScorecard's grading floor and TRIAL_SAMPLE_TARGET. */
-export const RELIABILITY_LATENCY_MIN_SAMPLES = 6;
+export const RELIABILITY_LATENCY_MIN_SAMPLES = BASELINE_THETA.reliability_latency_min_samples;
 
 export interface ReliabilityLatencyEntry {
   /** `provider:model_id` (or any stable pool key). */
@@ -64,7 +66,7 @@ export function rankModelsByReliabilityLatency(
 
   const survivors = entries.filter((entry) => {
     if (budget === undefined) return true;
-    if (entry.sampleCount < RELIABILITY_LATENCY_MIN_SAMPLES) return true;
+    if (entry.sampleCount < policy().reliability_latency_min_samples) return true;
     if (
       typeof entry.p50FirstTokenMs !== "number"
       || !Number.isFinite(entry.p50FirstTokenMs)
@@ -98,7 +100,7 @@ export function refusedForStageBudget(
   const refused = new Set<string>();
   if (budget === undefined) return refused;
   for (const entry of entries) {
-    if (entry.sampleCount < RELIABILITY_LATENCY_MIN_SAMPLES) continue;
+    if (entry.sampleCount < policy().reliability_latency_min_samples) continue;
     if (
       typeof entry.p50FirstTokenMs !== "number"
       || !Number.isFinite(entry.p50FirstTokenMs)

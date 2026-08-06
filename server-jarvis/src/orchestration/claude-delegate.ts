@@ -27,6 +27,7 @@ import { prepareToolResultForContext } from "../tool-result-truncation";
 import { delegateToolResultContextChars } from "./context-budget";
 import type { DelegateStageDiagnostics, ExecutorStageOutput, ToolCallRecord } from "./stage-output";
 import type { ExecutionProfile } from "./route-normalization";
+import { BASELINE_THETA, policy } from "./orchestration-policy";
 
 const DELEGATE_TOOL_NAMES: Record<string, string> = {
   edit: "edit_file",
@@ -125,10 +126,10 @@ export type DelegateHealthStrikeReason =
   | "unverified_write"
   | "termination_unconfirmed";
 
-export const DELEGATE_HEALTH_COOLDOWN_MS = 10 * 60 * 1_000;
-export const DELEGATE_AVAILABILITY_CACHE_MS = 5 * 60 * 1_000;
+export const DELEGATE_HEALTH_COOLDOWN_MS = BASELINE_THETA.delegate_health_cooldown_ms;
+export const DELEGATE_AVAILABILITY_CACHE_MS = BASELINE_THETA.delegate_availability_cache_ms;
 /** Stop provider retry storms before the CLI spends several minutes backing off. */
-export const DELEGATE_API_RETRY_ABORT_THRESHOLD = 3;
+export const DELEGATE_API_RETRY_ABORT_THRESHOLD = BASELINE_THETA.delegate_api_retry_abort_threshold;
 
 export interface ClaudeDelegateAvailabilityChecks {
   now?: () => number;
@@ -192,7 +193,7 @@ export class ClaudeDelegateAvailabilityCache {
     if (launch.authMode === "opencode_go" && !hasOpenCodeGoKey) {
       this.cache.set(key, {
         available: false,
-        expiresAt: this.now() + DELEGATE_AVAILABILITY_CACHE_MS,
+        expiresAt: this.now() + policy().delegate_availability_cache_ms,
       });
       return false;
     }
@@ -205,7 +206,7 @@ export class ClaudeDelegateAvailabilityCache {
     const available = cliAvailable && proxyAvailable;
     this.cache.set(key, {
       available,
-      expiresAt: this.now() + DELEGATE_AVAILABILITY_CACHE_MS,
+      expiresAt: this.now() + policy().delegate_availability_cache_ms,
     });
     return available;
   }
@@ -216,7 +217,11 @@ export class DelegateHealth {
   private cooldownUntil = 0;
   private lastReason: DelegateHealthStrikeReason | undefined;
 
-  constructor(private readonly now: () => number = Date.now) {}
+  private readonly cooldownMs: number;
+
+  constructor(private readonly now: () => number = Date.now) {
+    this.cooldownMs = policy().delegate_health_cooldown_ms;
+  }
 
   isAvailable(): boolean {
     return this.now() >= this.cooldownUntil;
@@ -228,7 +233,7 @@ export class DelegateHealth {
     const cooldownMinutes = Math.max(0, this.strikes - 2);
     this.cooldownUntil = cooldownMinutes === 0
       ? 0
-      : this.now() + cooldownMinutes * DELEGATE_HEALTH_COOLDOWN_MS;
+      : this.now() + cooldownMinutes * this.cooldownMs;
   }
 
   markHealthy(): void {
@@ -1433,8 +1438,8 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
           const rawEvent = next.value;
           if (isApiRetryFrame(rawEvent)) {
             consecutiveApiRetries += 1;
-            if (consecutiveApiRetries >= DELEGATE_API_RETRY_ABORT_THRESHOLD) {
-              cliFailureDetail = `api_retry storm: aborted after ${DELEGATE_API_RETRY_ABORT_THRESHOLD} consecutive retries`;
+            if (consecutiveApiRetries >= policy().delegate_api_retry_abort_threshold) {
+              cliFailureDetail = `api_retry storm: aborted after ${policy().delegate_api_retry_abort_threshold} consecutive retries`;
               records.push(cleanupRecord(await terminateDelegateProcess(
                 delegatedProcess,
                 terminationGraceMs,
