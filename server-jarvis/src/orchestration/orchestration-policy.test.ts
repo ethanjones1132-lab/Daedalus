@@ -211,4 +211,42 @@ describe("C3 reproducible rollouts", () => {
     }));
     expect(second.result).toEqual(first.result);
   });
+
+  test("rollout seed must be a signed 32-bit integer", () => {
+    const spec = { theta: BASELINE_THETA, fixtureId: "invalid-seed" };
+    for (const seed of [1.5, Number.NaN, 2 ** 31, -(2 ** 31) - 1]) {
+      expect(() => rolloutFingerprint({ ...spec, seed })).toThrow(/seed/);
+      expect(() => withRollout({ ...spec, seed }, () => "never")).toThrow(/seed/);
+    }
+  });
+
+  test("withRollout preserves theta and runtime services through async continuations", async () => {
+    const spec = {
+      theta: { force_write_nudge_cap: 5 },
+      seed: 42,
+      fixtureId: "async-runtime",
+    };
+    const run = () => withRollout(spec, async () => {
+      await Promise.resolve();
+      const afterAwait = {
+        theta: policy().force_write_nudge_cap,
+        random: rolloutRandom(),
+        now: rolloutNow(),
+        id: rolloutId("await"),
+      };
+      const afterCallback = await new Promise((resolve) => setTimeout(() => resolve({
+        theta: policy().force_write_nudge_cap,
+        random: rolloutRandom(),
+        now: rolloutNow(),
+        id: rolloutId("callback"),
+      }), 0));
+      return { afterAwait, afterCallback };
+    });
+
+    const first = await run().result;
+    const second = await run().result;
+    expect(second).toEqual(first);
+    expect(first.afterAwait.theta).toBe(5);
+    expect(first.afterCallback.theta).toBe(5);
+  });
 });

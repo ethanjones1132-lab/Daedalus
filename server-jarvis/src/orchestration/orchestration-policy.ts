@@ -477,6 +477,23 @@ export interface RolloutSpec {
   fixtureId: string;
 }
 
+const MIN_ROLLOUT_SEED = -0x8000_0000;
+const MAX_ROLLOUT_SEED = 0x7fff_ffff;
+
+/** Keep every rollout service on the same signed 32-bit seed representation. */
+function normalizeRolloutSeed(seed: number): number {
+  if (
+    !Number.isSafeInteger(seed)
+    || seed < MIN_ROLLOUT_SEED
+    || seed > MAX_ROLLOUT_SEED
+  ) {
+    throw new RangeError(
+      `rollout seed must be a signed 32-bit integer; received ${String(seed)}`,
+    );
+  }
+  return seed;
+}
+
 /**
  * Request-scoped services used by model-free policy rollout fixtures.
  * Production callers retain the platform defaults outside a rollout.
@@ -506,12 +523,13 @@ export function rolloutId(prefix: string): string {
  * Phase D uses this to detect non-deterministic trajectories.
  */
 export function rolloutFingerprint(spec: RolloutSpec): string {
+  const seed = normalizeRolloutSeed(spec.seed);
   const theta = isFullTheta(spec.theta)
     ? spec.theta
     : mergeTheta(BASELINE_THETA, spec.theta);
   const payload = JSON.stringify({
     theta: JSON.parse(serializeTheta(theta)),
-    seed: spec.seed | 0,
+    seed,
     fixtureId: String(spec.fixtureId),
   });
   return createHash("sha256").update(payload).digest("hex");
@@ -544,11 +562,11 @@ export function withRollout<T>(
   spec: RolloutSpec,
   fn: (rng: () => number) => T | Promise<T>,
 ): { fingerprint: string; result: T | Promise<T>; theta: OrchestrationTheta } {
+  const seed = normalizeRolloutSeed(spec.seed);
   const theta = isFullTheta(spec.theta)
     ? freezeTheta(spec.theta)
     : mergeTheta(BASELINE_THETA, spec.theta);
-  const fingerprint = rolloutFingerprint({ ...spec, theta });
-  const seed = spec.seed | 0;
+  const fingerprint = rolloutFingerprint({ ...spec, theta, seed });
   const rng = mulberry32(seed);
   let now = 1_700_000_000_000 + seed * 1_000;
   let idCounter = 0;
