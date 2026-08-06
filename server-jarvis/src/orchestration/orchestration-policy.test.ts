@@ -1,6 +1,7 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import {
   BASELINE_THETA,
+  ThetaValidationError,
   THETA_DIM,
   THETA_KEYS,
   applyThetaPatchGlobally,
@@ -65,17 +66,14 @@ describe("OrchestrationTheta (Phase C)", () => {
     expect(THETA_KEYS).not.toContain("policy_min_canary_runs_before_promotion" as never);
   });
 
-  test("legacy serialized reward keys do not enter theta", () => {
-    const parsed = parseTheta(JSON.stringify({
+  test("manual serialized theta rejects removed reward keys", () => {
+    expect(() => parseTheta(JSON.stringify({
       force_write_nudge_cap: 4,
       reward_weight_writes: 100,
       reward_weight_check: 0,
       reward_weight_plan: 0,
       overclaim_penalty: 0,
-    }));
-    expect(parsed.force_write_nudge_cap).toBe(4);
-    expect(Object.prototype.hasOwnProperty.call(parsed, "reward_weight_writes")).toBe(false);
-    expect(Object.prototype.hasOwnProperty.call(parsed, "overclaim_penalty")).toBe(false);
+    }))).toThrow(ThetaValidationError);
   });
 
   test("policy() defaults to baseline", () => {
@@ -83,8 +81,8 @@ describe("OrchestrationTheta (Phase C)", () => {
   });
 
   test("runWithTheta overlays without mutating global", () => {
-    runWithTheta({ force_write_nudge_cap: 9 }, () => {
-      expect(policy().force_write_nudge_cap).toBe(9);
+    runWithTheta({ force_write_nudge_cap: 8 }, () => {
+      expect(policy().force_write_nudge_cap).toBe(8);
       expect(policy().max_directives_per_turn).toBe(24);
     });
     expect(policy().force_write_nudge_cap).toBe(2);
@@ -111,13 +109,35 @@ describe("OrchestrationTheta (Phase C)", () => {
     expect(thetaFingerprint(BASELINE_THETA)).toBe(thetaFingerprint(parseTheta(s)));
   });
 
-  test("mergeTheta ignores non-finite patch values", () => {
-    const m = mergeTheta(BASELINE_THETA, {
-      force_write_nudge_cap: Number.NaN,
-      max_directives_per_turn: 10,
-    } as any);
-    expect(m.force_write_nudge_cap).toBe(2);
-    expect(m.max_directives_per_turn).toBe(10);
+  test("manual theta patches reject unsafe domains", () => {
+    expect(() => mergeTheta(BASELINE_THETA, { routing_timeout_ms: -1 }))
+      .toThrow(ThetaValidationError);
+    expect(() => mergeTheta(BASELINE_THETA, { no_tool_ratio_ceiling: 1.1 }))
+      .toThrow(ThetaValidationError);
+    expect(() => mergeTheta(BASELINE_THETA, { max_directives_per_turn: 1.5 }))
+      .toThrow(ThetaValidationError);
+  });
+
+  test("cross-field invariants reject contradictory theta", () => {
+    expect(() => mergeTheta(BASELINE_THETA, {
+      max_mid_loop_escalations: 1,
+      reserved_mid_loop_escalations: 2,
+    })).toThrow(/reserved_mid_loop_escalations/);
+    expect(() => mergeTheta(BASELINE_THETA, {
+      absolute_turn_cap_ms: 60_000,
+      stage_extension_ceiling_ms: 90_000,
+    })).toThrow(/stage_extension_ceiling_ms/);
+  });
+
+  test("optimizer vectors are deterministically projected", () => {
+    const vector = thetaToVector(BASELINE_THETA);
+    vector[THETA_KEYS.indexOf("routing_timeout_ms")] = -1;
+    vector[THETA_KEYS.indexOf("no_tool_ratio_ceiling")] = 2;
+    vector[THETA_KEYS.indexOf("max_directives_per_turn")] = 3.8;
+    const projected = vectorToTheta(vector);
+    expect(projected.routing_timeout_ms).toBe(1_000);
+    expect(projected.no_tool_ratio_ceiling).toBe(1);
+    expect(projected.max_directives_per_turn).toBe(4);
   });
 });
 

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
@@ -88,6 +88,16 @@ describe("propose → eligible → shadow → canary → promote", () => {
     const second = proposePolicy(budgetPatch, "second");
     expect(second.action).toBe("rejected");
     expect(second.reason).toBe("in_flight_exists");
+  });
+
+  test("policy staging rejects an invalid theta patch", () => {
+    const result = proposePolicy(
+      { domain: "budget", theta: { routing_timeout_ms: -1 } },
+      "invalid timeout",
+    );
+    expect(result.action).toBe("rejected");
+    expect(result.reason).toContain("invalid_theta:routing_timeout_ms");
+    expect(getPolicyVersionStore().candidate).toBeNull();
   });
 
   test("holds candidate until 20 eligible outcomes then enters shadow", () => {
@@ -293,6 +303,30 @@ describe("restart survival", () => {
   test("load is a no-op when no file exists", () => {
     loadPolicyVersions(root);
     expect(getPolicyVersionStore().production).toBeNull();
+    expect(getPolicyVersionStore().candidate).toBeNull();
+  });
+
+  test("load migrates legacy theta keys but quarantines invalid persisted theta", () => {
+    expect(proposePolicy(
+      { domain: "budget", theta: { routing_timeout_ms: 25_000 } },
+      "persisted theta",
+    ).action).toBe("proposed");
+    persistPolicyVersions(root);
+
+    const path = policyVersionsPath(root);
+    const legacy = JSON.parse(readFileSync(path, "utf-8"));
+    legacy.candidate.snapshot.theta.reward_weight_writes = 1;
+    writeFileSync(path, JSON.stringify(legacy), "utf-8");
+    resetPolicyStagingForTests();
+    loadPolicyVersions(root);
+    expect(getPolicyVersionStore().candidate?.snapshot.theta?.routing_timeout_ms).toBe(25_000);
+    expect(getPolicyVersionStore().candidate?.snapshot.theta).not.toHaveProperty("reward_weight_writes");
+
+    const invalid = JSON.parse(readFileSync(path, "utf-8"));
+    invalid.candidate.snapshot.theta.routing_timeout_ms = -1;
+    writeFileSync(path, JSON.stringify(invalid), "utf-8");
+    resetPolicyStagingForTests();
+    loadPolicyVersions(root);
     expect(getPolicyVersionStore().candidate).toBeNull();
   });
 

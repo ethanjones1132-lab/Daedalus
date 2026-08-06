@@ -13,6 +13,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "crypto";
+import { THETA_SPEC } from "./orchestration-policy-schema";
 
 /**
  * Numeric policy vector. All dimensions are numbers for sep-CMA-ES comfort.
@@ -94,7 +95,7 @@ export interface OrchestrationTheta {
 }
 
 /** Ordered keys — stable serialization / CMA-ES vector layout. */
-export const THETA_KEYS: readonly (keyof OrchestrationTheta)[] = [
+export const LEGACY_THETA_KEYS: readonly (keyof OrchestrationTheta)[] = [
   "force_write_nudge_cap",
   "max_quality_pushes",
   "max_mid_loop_checks",
@@ -153,7 +154,7 @@ export const THETA_KEYS: readonly (keyof OrchestrationTheta)[] = [
  * Baseline θ — exact values of the hand-tuned constants as of Phase C land.
  * Changing a baseline value IS a behaviour change; tests pin key dimensions.
  */
-export const BASELINE_THETA: OrchestrationTheta = {
+export const LEGACY_BASELINE_THETA: OrchestrationTheta = {
   force_write_nudge_cap: 2,
   max_quality_pushes: 2,
   max_mid_loop_checks: 2,
@@ -216,7 +217,145 @@ export const BASELINE_THETA: OrchestrationTheta = {
   dead_tool_suppress_threshold: 2,
 };
 
+/** Ordered keys and baseline are derived from the single schema source. */
+export const THETA_KEYS = Object.keys(THETA_SPEC) as Array<keyof OrchestrationTheta>;
+export const BASELINE_THETA: OrchestrationTheta = Object.fromEntries(
+  Object.entries(THETA_SPEC).map(([key, spec]) => [key, spec.baseline]),
+) as unknown as OrchestrationTheta;
+
 export type ThetaPatch = Partial<OrchestrationTheta>;
+
+export interface ThetaValidationIssue {
+  key: string;
+  value: unknown;
+  reason: "unknown" | "non_finite" | "below_min" | "above_max" | "not_integer" | "cross_field";
+  message: string;
+}
+
+export class ThetaValidationError extends Error {
+  constructor(public readonly issues: readonly ThetaValidationIssue[]) {
+    super(issues.map((issue) => issue.message).join("; "));
+    this.name = "ThetaValidationError";
+  }
+}
+
+function issue(
+  key: string,
+  value: unknown,
+  reason: ThetaValidationIssue["reason"],
+  message: string,
+): ThetaValidationIssue {
+  return { key, value, reason, message };
+}
+
+/** Strict validation for all manual, staged, and persisted θ inputs. */
+export function validateThetaPatch(patch: Record<string, unknown>): ThetaValidationIssue[] {
+  const issues: ThetaValidationIssue[] = [];
+  for (const [key, value] of Object.entries(patch)) {
+    const spec = THETA_SPEC[key as keyof OrchestrationTheta];
+    if (!spec) {
+      issues.push(issue(key, value, "unknown", `${key} is not a θ dimension`));
+      continue;
+    }
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      issues.push(issue(key, value, "non_finite", `${key} must be finite`));
+      continue;
+    }
+    if (value < spec.min) {
+      issues.push(issue(key, value, "below_min", `${key} must be at least ${spec.min}`));
+    } else if (value > spec.max) {
+      issues.push(issue(key, value, "above_max", `${key} must be at most ${spec.max}`));
+    } else if (spec.kind === "integer" && !Number.isInteger(value)) {
+      issues.push(issue(key, value, "not_integer", `${key} must be an integer`));
+    }
+  }
+
+  const maxEscalations = patch.max_mid_loop_escalations;
+  const reservedEscalations = patch.reserved_mid_loop_escalations;
+  if (
+    typeof maxEscalations === "number" &&
+    typeof reservedEscalations === "number" &&
+    reservedEscalations > maxEscalations
+  ) {
+    issues.push(issue(
+      "reserved_mid_loop_escalations",
+      reservedEscalations,
+      "cross_field",
+      "reserved_mid_loop_escalations must not exceed max_mid_loop_escalations",
+    ));
+  }
+
+  const absoluteTurnCap = patch.absolute_turn_cap_ms;
+  const stageExtensionCap = patch.stage_extension_ceiling_ms;
+  if (
+    typeof absoluteTurnCap === "number" &&
+    typeof stageExtensionCap === "number" &&
+    stageExtensionCap > absoluteTurnCap
+  ) {
+    issues.push(issue(
+      "stage_extension_ceiling_ms",
+      stageExtensionCap,
+      "cross_field",
+      "stage_extension_ceiling_ms must not exceed absolute_turn_cap_ms",
+    ));
+  }
+  return issues;
+}
+
+export function assertValidTheta(theta: OrchestrationTheta): OrchestrationTheta {
+  const raw = theta as unknown as Record<string, unknown>;
+  const issues = validateThetaPatch(raw);
+  for (const key of THETA_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(raw, key)) {
+      issues.push(issue(key, undefined, "non_finite", `${key} must be finite`));
+    }
+  }
+  if (issues.length > 0) throw new ThetaValidationError(issues);
+  return theta;
+}
+
+/** Optimizer-only path: sanitize candidate values instead of rejecting the generation. */
+export function projectThetaPatch(
+  base: OrchestrationTheta,
+  patch: Record<string, unknown>,
+): OrchestrationTheta {
+  const projected = { ...assertValidTheta(base) };
+  for (const key of THETA_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(patch, key)) continue;
+    const value = patch[key];
+    if (typeof value !== "number" || !Number.isFinite(value)) continue;
+    const spec = THETA_SPEC[key];
+    const clamped = Math.min(spec.max, Math.max(spec.min, value));
+    projected[key] = spec.kind === "integer" ? Math.round(clamped) : clamped;
+  }
+  projected.reserved_mid_loop_escalations = Math.min(
+    projected.reserved_mid_loop_escalations,
+    projected.max_mid_loop_escalations,
+  );
+  projected.stage_extension_ceiling_ms = Math.min(
+    projected.stage_extension_ceiling_ms,
+    projected.absolute_turn_cap_ms,
+  );
+  return assertValidTheta(projected);
+}
+
+export const LEGACY_REMOVED_THETA_KEYS = new Set([
+  "reward_weight_writes",
+  "reward_weight_check",
+  "reward_weight_plan",
+  "overclaim_penalty",
+  "policy_canary_traffic_fraction",
+  "policy_min_canary_success_rate",
+  "policy_min_eligible_outcomes_before_shadow",
+  "policy_min_canary_runs_before_promotion",
+]);
+
+/** Strip only historic evaluator/governance keys during persisted-snapshot migration. */
+export function migrateLegacyThetaPatch(raw: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(raw).filter(([key]) => !LEGACY_REMOVED_THETA_KEYS.has(key)),
+  );
+}
 
 const thetaAls = new AsyncLocalStorage<OrchestrationTheta>();
 
@@ -236,7 +375,7 @@ export function getGlobalTheta(): OrchestrationTheta {
 }
 
 export function setGlobalTheta(theta: OrchestrationTheta): void {
-  globalTheta = freezeTheta(theta);
+  globalTheta = freezeTheta(assertValidTheta(theta));
 }
 
 export function resetGlobalThetaToBaseline(): void {
@@ -247,17 +386,17 @@ export function mergeTheta(
   base: OrchestrationTheta,
   patch: ThetaPatch | null | undefined,
 ): OrchestrationTheta {
-  if (!patch) return { ...base };
-  const next = { ...base };
+  const next = { ...assertValidTheta(base) };
+  if (!patch) return next;
+  const raw = patch as Record<string, unknown>;
+  const patchIssues = validateThetaPatch(raw);
+  if (patchIssues.length > 0) throw new ThetaValidationError(patchIssues);
   for (const key of THETA_KEYS) {
-    if (Object.prototype.hasOwnProperty.call(patch, key)) {
-      const v = patch[key];
-      if (typeof v === "number" && Number.isFinite(v)) {
-        next[key] = v;
-      }
+    if (Object.prototype.hasOwnProperty.call(raw, key)) {
+      next[key] = raw[key] as number;
     }
   }
-  return next;
+  return assertValidTheta(next);
 }
 
 function freezeTheta(theta: OrchestrationTheta): OrchestrationTheta {
@@ -270,7 +409,7 @@ function freezeTheta(theta: OrchestrationTheta): OrchestrationTheta {
  */
 export function runWithTheta<T>(patchOrFull: ThetaPatch | OrchestrationTheta, fn: () => T): T {
   const full = isFullTheta(patchOrFull)
-    ? freezeTheta(patchOrFull)
+    ? freezeTheta(assertValidTheta(patchOrFull))
     : mergeTheta(policy(), patchOrFull);
   return thetaAls.run(full, fn);
 }
@@ -290,19 +429,17 @@ export function applyThetaPatchGlobally(
 
 /** Dense vector in THETA_KEYS order (CMA-ES input). */
 export function thetaToVector(theta: OrchestrationTheta = policy()): number[] {
-  return THETA_KEYS.map((k) => theta[k]);
+  const valid = assertValidTheta(theta);
+  return THETA_KEYS.map((k) => valid[k]);
 }
 
 /** Inverse of thetaToVector. */
 export function vectorToTheta(vector: number[], base: OrchestrationTheta = BASELINE_THETA): OrchestrationTheta {
-  const next = { ...base };
+  const patch: Record<string, unknown> = {};
   for (let i = 0; i < THETA_KEYS.length && i < vector.length; i++) {
-    const v = vector[i];
-    if (typeof v === "number" && Number.isFinite(v)) {
-      next[THETA_KEYS[i]] = v;
-    }
+    patch[THETA_KEYS[i]] = vector[i];
   }
-  return next;
+  return projectThetaPatch(base, patch);
 }
 
 export function thetaEquals(a: OrchestrationTheta, b: OrchestrationTheta, eps = 1e-9): boolean {
@@ -314,14 +451,15 @@ export function thetaEquals(a: OrchestrationTheta, b: OrchestrationTheta, eps = 
 
 /** Canonical JSON (sorted keys) for hashing / persistence. */
 export function serializeTheta(theta: OrchestrationTheta = policy()): string {
+  const valid = assertValidTheta(theta);
   const obj: Record<string, number> = {};
-  for (const key of THETA_KEYS) obj[key] = theta[key];
+  for (const key of THETA_KEYS) obj[key] = valid[key];
   return JSON.stringify(obj);
 }
 
 export function parseTheta(json: string, base: OrchestrationTheta = BASELINE_THETA): OrchestrationTheta {
-  const raw = JSON.parse(json) as ThetaPatch;
-  return mergeTheta(base, raw);
+  const raw = JSON.parse(json) as Record<string, unknown>;
+  return mergeTheta(base, raw as ThetaPatch);
 }
 
 export function thetaFingerprint(theta: OrchestrationTheta = policy()): string {

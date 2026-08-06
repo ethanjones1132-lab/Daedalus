@@ -21,6 +21,12 @@ import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileS
 import { dirname, join } from "path";
 import { SESSIONS_DIR } from "../config";
 import {
+  BASELINE_THETA,
+  ThetaValidationError,
+  mergeTheta,
+  migrateLegacyThetaPatch,
+} from "../orchestration/orchestration-policy";
+import {
   applyPolicySnapshotToPool,
   getLearnedPoolState,
   snapshotStagedPolicyFields,
@@ -238,8 +244,23 @@ function patchIsEmpty(patch: PolicyPatch): boolean {
     Object.keys(patch.stageModelRoutingScoreDeltas ?? {}).length === 0 &&
     Object.keys(patch.fallbackBoosts ?? {}).length === 0 &&
     Object.keys(patch.modelFirstTokenTimeouts ?? {}).length === 0 &&
-    Object.keys(patch.recovery ?? {}).length === 0
+    Object.keys(patch.recovery ?? {}).length === 0 &&
+    Object.keys(patch.theta ?? {}).length === 0
   );
+}
+
+function thetaValidationReason(error: ThetaValidationError): string {
+  return `invalid_theta:${error.issues[0]?.key ?? "unknown"}`;
+}
+
+function validateSnapshotTheta(snapshot: PolicySnapshot, migrateLegacy = false): PolicySnapshot {
+  if (!snapshot.theta || Object.keys(snapshot.theta).length === 0) return snapshot;
+  const raw = migrateLegacy
+    ? migrateLegacyThetaPatch(snapshot.theta as Record<string, unknown>)
+    : snapshot.theta as Record<string, unknown>;
+  // Full validation merges historic partial snapshots over today's baseline.
+  mergeTheta(BASELINE_THETA, raw as Record<string, number>);
+  return { ...snapshot, theta: raw as Record<string, number> };
 }
 
 // ── Propose ─────────────────────────────────────────────────────────────────
@@ -271,13 +292,23 @@ export function proposePolicy(
     store.production?.snapshot ??
     snapshotStagedPolicyFields(getLearnedPoolState());
   const createdAt = options.now ?? nowIso();
+  const snapshot = mergePatchIntoSnapshot(baseline, patch);
+  try {
+    validateSnapshotTheta(snapshot);
+  } catch (error) {
+    if (error instanceof ThetaValidationError) {
+      return { action: "rejected", reason: thetaValidationReason(error), version: null, store };
+    }
+    throw error;
+  }
+
   const versionNum = store.nextVersion++;
   const version: PolicyVersion = {
     id: `pol_${versionNum}_${crypto.randomUUID().slice(0, 8)}`,
     version: versionNum,
     stage: "candidate",
     domain: patch.domain,
-    snapshot: mergePatchIntoSnapshot(baseline, patch),
+    snapshot,
     patch,
     rationale,
     createdAt,
@@ -768,6 +799,20 @@ export function reapplyProductionPolicySnapshot(): boolean {
   return true;
 }
 
+function loadPersistedVersion(raw: unknown): PolicyVersion | null {
+  if (!raw || typeof raw !== "object") return null;
+  const version = raw as PolicyVersion;
+  try {
+    return { ...version, snapshot: validateSnapshotTheta(version.snapshot, true) };
+  } catch (error) {
+    if (error instanceof ThetaValidationError) {
+      console.warn(`[PolicyStaging] Quarantined persisted ${thetaValidationReason(error)}`);
+      return null;
+    }
+    throw error;
+  }
+}
+
 /** Load persisted policy versions. No-op when the file is missing. */
 export function loadPolicyVersions(root: string = SESSIONS_DIR): void {
   const path = policyVersionsPath(root);
@@ -778,14 +823,15 @@ export function loadPolicyVersions(root: string = SESSIONS_DIR): void {
       console.warn(`[PolicyStaging] Unknown schema_version=${String(raw.schemaVersion)}; ignoring`);
       return;
     }
-    store = {
+    const next: PolicyVersionStore = {
       schemaVersion: 1,
       nextVersion: Math.max(1, Number(raw.nextVersion) || 1),
-      production: (raw.production as PolicyVersion | null) ?? null,
-      candidate: (raw.candidate as PolicyVersion | null) ?? null,
-      canary: (raw.canary as PolicyVersion | null) ?? null,
-      lastKnownGood: (raw.lastKnownGood as PolicyVersion | null) ?? null,
+      production: loadPersistedVersion(raw.production),
+      candidate: loadPersistedVersion(raw.candidate),
+      canary: loadPersistedVersion(raw.canary),
+      lastKnownGood: loadPersistedVersion(raw.lastKnownGood),
     };
+    store = next;
     // Re-apply production snapshot so routing/budget maps match disk after restart.
     reapplyProductionPolicySnapshot();
   } catch (e) {

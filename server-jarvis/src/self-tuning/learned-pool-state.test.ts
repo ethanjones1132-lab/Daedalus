@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
 import {
+  applyPolicySnapshotToPool,
   applyLearnedCapabilities,
   clearInferenceFeedbackState,
   empiricalFirstTokenTimeoutFor,
@@ -12,6 +13,7 @@ import {
   stageModelFeedbackKey,
   stageRoutingScoreDelta,
 } from "./learned-pool-state";
+import { ThetaValidationError } from "../orchestration/orchestration-policy";
 
 const baseAgent: OrchestratorAgent = {
   id: "test-agent",
@@ -102,6 +104,27 @@ describe("learned-pool-state score deltas", () => {
       state.stageModelRoutingScoreDeltas.delete("opencode_go:deepseek-v4-flash:planner");
       state.stageModelRoutingScoreDeltas.delete("opencode_go:deepseek-v4-flash:synthesizer");
     }
+  });
+});
+
+describe("staged theta activation", () => {
+  beforeEach(() => resetLearnedPoolStateForTests());
+
+  test("rejects invalid theta before mutating learned pool maps", () => {
+    const state = getLearnedPoolState();
+    state.modelRoutingScoreDeltas.set("existing:model", 0.1);
+
+    expect(() => applyPolicySnapshotToPool({
+      modelRoutingScoreDeltas: { "new:model": 0.2 },
+      stageModelRoutingScoreDeltas: {},
+      fallbackBoosts: {},
+      modelFirstTokenTimeouts: {},
+      recovery: {},
+      theta: { routing_timeout_ms: -1 },
+    })).toThrow(ThetaValidationError);
+
+    expect(state.modelRoutingScoreDeltas.get("existing:model")).toBe(0.1);
+    expect(state.modelRoutingScoreDeltas.get("new:model")).toBeUndefined();
   });
 });
 

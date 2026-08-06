@@ -3,6 +3,7 @@ import type { OrchestratorAgent } from "../orchestration/agent-pool";
 import {
   applyThetaPatchGlobally,
   BASELINE_THETA,
+  mergeTheta,
   runWithTheta,
   type ThetaPatch,
 } from "../orchestration/orchestration-policy";
@@ -150,6 +151,11 @@ export function applyPolicySnapshotToPool(
   options: { previous?: PolicySnapshot } = {},
 ): void {
   const prev = options.previous;
+  // Validate θ before any learned-pool map can change. Staging/load callers
+  // quarantine the resulting ThetaValidationError and preserve production/LKG.
+  const validatedTheta = snapshot.theta && Object.keys(snapshot.theta).length > 0
+    ? mergeTheta(BASELINE_THETA, snapshot.theta as ThetaPatch)
+    : null;
   mergeNumberMap(
     state.modelRoutingScoreDeltas,
     snapshot.modelRoutingScoreDeltas,
@@ -168,8 +174,8 @@ export function applyPolicySnapshotToPool(
   );
   mergeRecoveryMap(state.recoveryPolicy, snapshot.recovery, prev?.recovery);
   // Phase C: promote/rollback of θ patch onto the process-global active policy.
-  if (snapshot.theta && Object.keys(snapshot.theta).length > 0) {
-    applyThetaPatchGlobally(snapshot.theta as ThetaPatch, BASELINE_THETA);
+  if (validatedTheta) {
+    applyThetaPatchGlobally(validatedTheta, BASELINE_THETA);
   }
 }
 
@@ -182,7 +188,8 @@ export function runWithPolicyOverlay<T>(snapshot: PolicySnapshot | null | undefi
   if (!snapshot) return fn();
   const body = () => policyOverlayAls.run(snapshot, fn);
   if (snapshot.theta && Object.keys(snapshot.theta).length > 0) {
-    return runWithTheta(snapshot.theta as ThetaPatch, body);
+    const validatedTheta = mergeTheta(BASELINE_THETA, snapshot.theta as ThetaPatch);
+    return runWithTheta(validatedTheta, body);
   }
   return body();
 }
