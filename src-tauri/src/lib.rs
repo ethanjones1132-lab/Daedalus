@@ -382,21 +382,32 @@ fn pids_listening_on_port(port: u16) -> Vec<u32> {
     parse_listening_pids(&String::from_utf8_lossy(&output.stdout), port)
 }
 
-/// Reap any process currently bound to the proxy port before spawning a fresh
-/// one. Closes the stale-code hazard: an orphaned `claude_cli_proxy.py` from a
-/// previous app instance/deploy can survive indefinitely once nothing tracks
-/// it (observed live: 3 simultaneous listeners on :19878 from prior sessions).
-/// `is_port_listening` alone cannot distinguish "healthy current proxy" from
-/// "stale proxy squatting the port" — both answer the TCP probe the same way,
-/// so the supervisor's own `is_port_listening` health check would never flag
-/// an orphan as a problem. This runs unconditionally right before every spawn
-/// attempt (manual restart, supervisor auto-restart, and app startup all funnel
-/// through `spawn_claude_cli_proxy`), so the newest deployed script always wins
-/// the port. Best-effort: a kill failure is logged, never fatal to the spawn.
-fn reap_stale_proxy_listeners() {
-    for pid in pids_listening_on_port(CLAUDE_PROXY_PORT) {
+/// The port the Bun server binds. Shared with `supervisor.rs` so both sides
+/// agree on what "the Bun port" means when reaping orphans before spawn.
+pub(crate) const BUN_SERVER_PORT: u16 = 19877;
+
+/// Reap any process currently bound to `port` before spawning a fresh one.
+/// Closes the stale-code hazard: an orphaned child from a previous app
+/// instance/deploy can survive indefinitely once nothing tracks it (observed
+/// live for both :19878 proxy and :19877 Bun — EADDRINUSE thrash + ghost
+/// LISTEN PIDs that no longer resolve in tasklist).
+///
+/// `is_port_listening` alone cannot distinguish "healthy current service" from
+/// "stale process squatting the port" — both answer the TCP probe the same way,
+/// so the supervisor's own TCP health check would never flag an orphan as a
+/// problem. Callers run this unconditionally right before every spawn attempt
+/// so the newest process always wins the port. Best-effort: a kill failure is
+/// logged, never fatal to the spawn. After any kill, sleeps briefly so the OS
+/// can release the socket before the next bind (without this, spawn races the
+/// TIME_WAIT/CLOSE_WAIT cleanup and still gets EADDRINUSE).
+fn reap_stale_port_listeners(port: u16, label: &str) {
+    let pids = pids_listening_on_port(port);
+    if pids.is_empty() {
+        return;
+    }
+    for pid in pids {
         println!(
-            "[Jarvis] reaping process PID {pid} already listening on :{CLAUDE_PROXY_PORT} before spawning claude_cli_proxy"
+            "[Jarvis] reaping process PID {pid} already listening on :{port} before spawning {label}"
         );
         match std::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/F"])
@@ -410,6 +421,63 @@ fn reap_stale_proxy_listeners() {
             Err(e) => eprintln!("[Jarvis] taskkill PID {pid} failed to spawn: {e}"),
         }
     }
+    // Give Windows a beat to release the socket after forced kill.
+    std::thread::sleep(std::time::Duration::from_millis(350));
+}
+
+/// Reap orphans on the Claude CLI proxy port before spawn.
+fn reap_stale_proxy_listeners() {
+    reap_stale_port_listeners(CLAUDE_PROXY_PORT, "claude_cli_proxy");
+}
+
+/// Reap orphans on the Bun server port before spawn. Without this,
+/// `ensure_jarvis_server_started` / force-restart only kill the *tracked*
+/// child handle; if that handle was lost (app restart, external bun, prior
+/// EADDRINUSE crash) the port stays held and every new spawn dies immediately
+/// with `Failed to start server. Is port 19877 in use?` — leaving the runtime
+/// dark until a manual taskkill.
+fn reap_stale_bun_listeners() {
+    reap_stale_port_listeners(BUN_SERVER_PORT, "Bun server");
+}
+
+/// True when `tasklist` cannot find a process for `pid` (Windows). Used to
+/// detect "ghost sockets": netstat still shows LISTENING with a PID that no
+/// longer exists, so taskkill is a no-op and every bind gets EADDRINUSE /
+/// access-denied until reboot. Pure wrapper so the diagnostic string is testable.
+fn process_exists_windows(pid: u32) -> bool {
+    if !cfg!(target_os = "windows") {
+        return true;
+    }
+    let Ok(output) = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+    else {
+        return true; // unknown — don't claim ghost
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // tasklist prints "INFO: No tasks are running which match..." when missing,
+    // or a row containing the PID when present.
+    stdout.contains(&pid.to_string()) && !stdout.to_ascii_lowercase().contains("no tasks")
+}
+
+/// PIDs that netstat reports as LISTENING on `port` but that are not live
+/// processes. Non-empty → Windows ghost socket; only a reboot (or a winsock
+/// reset) frees the port.
+fn ghost_pids_holding_port(port: u16) -> Vec<u32> {
+    pids_listening_on_port(port)
+        .into_iter()
+        .filter(|pid| *pid > 0 && !process_exists_windows(*pid))
+        .collect()
+}
+
+fn bun_port_ghost_diagnostic(port: u16, ghosts: &[u32]) -> String {
+    format!(
+        "Port {port} is held by dead PID(s) {ghosts:?} (Windows ghost socket). \
+         taskkill cannot free a process that no longer exists, so every Bun spawn \
+         fails with EADDRINUSE / 'access permissions'. Reboot the machine (or \
+         `netsh winsock reset` + reboot) to release the port. Root cause is usually \
+         a mid-turn kill of a hung Bun process that left CLOSE_WAIT/LISTEN state behind."
+    )
 }
 
 #[cfg(test)]
@@ -458,6 +526,15 @@ Active Connections
     #[test]
     fn a_port_with_nothing_listening_yields_no_pids() {
         assert_eq!(parse_listening_pids(NETSTAT_FIXTURE, 60000), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn ghost_diagnostic_names_the_port_and_dead_pids() {
+        let msg = super::bun_port_ghost_diagnostic(19877, &[25352]);
+        assert!(msg.contains("19877"), "{msg}");
+        assert!(msg.contains("25352"), "{msg}");
+        assert!(msg.to_ascii_lowercase().contains("reboot"), "{msg}");
+        assert!(msg.contains("ghost"), "{msg}");
     }
 }
 
@@ -890,6 +967,11 @@ fn spawn_jarvis_server(entry: &str) -> Option<std::process::Child> {
     let looks_like_local_bun =
         is_windows && bun.to_lowercase().ends_with(".exe") && !bun.contains("wsl");
 
+    // Always free :19877 before bind. Tracked-child kill in ensure/force_restart
+    // only covers the handle we own; orphans from prior sessions / EADDRINUSE
+    // crashes need a port-level reap (same pattern as claude_cli_proxy).
+    reap_stale_bun_listeners();
+
     let spawn_result = if is_windows && !looks_like_local_bun {
         // Original WSL path for dev / full WSL setups.
         let cmd = format!("exec {} {}", bun, entry);
@@ -981,6 +1063,12 @@ pub async fn force_restart_jarvis_server() -> Result<(), String> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
+    let ghosts = ghost_pids_holding_port(BUN_SERVER_PORT);
+    if !ghosts.is_empty() {
+        let diagnostic = bun_port_ghost_diagnostic(BUN_SERVER_PORT, &ghosts);
+        log::error!(target: "jarvis::startup", "{diagnostic}");
+        return Err(diagnostic);
+    }
     Err("Bun server did not become healthy within 20s of restart".to_string())
 }
 
@@ -1018,7 +1106,27 @@ pub async fn ensure_jarvis_server_started() -> Result<(), String> {
         return Ok(());
     }
 
-    // Not reachable — spawn the server once.
+    // Second chance: TCP is up but the first HTTP probe failed. A single
+    // overloaded event-loop tick can miss a 2s budget; killing a live server
+    // mid-turn is far worse than waiting one more second. If the port is
+    // closed, fall through to spawn immediately.
+    if is_port_listening(BUN_SERVER_PORT) {
+        log::info!(
+            target: "jarvis::startup",
+            "Bun port :{BUN_SERVER_PORT} is open but /health missed the first probe; retrying once"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        if probe_jarvis_healthy().await {
+            LAST_HEALTHY_MS.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
+            return Ok(());
+        }
+        log::warn!(
+            target: "jarvis::startup",
+            "Bun port open but /health still failing — reaping and respawning"
+        );
+    }
+
+    // Not reachable — spawn the server once (spawn reaps any port squatters).
     log::info!(target: "jarvis::startup", "Bun health probe failed; locating server entry");
     if SERVER_PROCESS.get().is_none() {
         SERVER_PROCESS.set(std::sync::Mutex::new(None)).ok();
@@ -1049,6 +1157,14 @@ pub async fn ensure_jarvis_server_started() -> Result<(), String> {
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    // Surface the ghost-socket case explicitly — a generic timeout leaves the
+    // operator hunting EADDRINUSE in err logs with no recovery path.
+    let ghosts = ghost_pids_holding_port(BUN_SERVER_PORT);
+    if !ghosts.is_empty() {
+        let diagnostic = bun_port_ghost_diagnostic(BUN_SERVER_PORT, &ghosts);
+        log::error!(target: "jarvis::startup", "{diagnostic}");
+        return Err(diagnostic);
     }
     Err("Bun server did not become healthy within timeout".to_string())
 }

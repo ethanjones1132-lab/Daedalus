@@ -81,9 +81,30 @@ let cachedHostIP: string | null = null;
 let cachedHostIPTimestamp = 0;
 const HOST_IP_CACHE_TTL = 30_000;
 
-export function resolveWindowsHostIP(): string {
+/** Test seam: clear the 30s host-IP cache between cases. */
+export function __resetWindowsHostIPCacheForTests(): void {
+  cachedHostIP = null;
+  cachedHostIPTimestamp = 0;
+}
+
+/**
+ * Resolve the Windows host IP as seen from WSL2, so Ollama on the Windows side
+ * is reachable. On native Windows (`process.platform === "win32"`) this returns
+ * `127.0.0.1` immediately — rewriting localhost → 172.17.0.1 is a WSL-only
+ * concern and hangs fetch probes when the Bun server runs as bun.exe.
+ */
+export function resolveWindowsHostIP(platform: NodeJS.Platform = process.platform): string {
   const now = Date.now();
   if (cachedHostIP && (now - cachedHostIPTimestamp) < HOST_IP_CACHE_TTL) {
+    return cachedHostIP;
+  }
+
+  // Native Windows Bun: Ollama is local. Never fall through to the WSL path
+  // (which ends at the hard-coded docker-bridge fallback 172.17.0.1 and was
+  // spamming "Could not resolve Windows host IP" every 30s while probes hung).
+  if (platform === "win32") {
+    cachedHostIP = "127.0.0.1";
+    cachedHostIPTimestamp = now;
     return cachedHostIP;
   }
 

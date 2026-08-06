@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   __resetOllamaHealthCacheForTests,
+  __resetWindowsHostIPCacheForTests,
   checkOllamaHealth,
   checkOllamaModelSupportsTools,
+  effectiveOllamaUrl,
   listOllamaModels,
   resolveDesiredOllamaModel,
+  resolveWindowsHostIP,
   selectInstalledOllamaModel,
 } from "./ollama";
 import type { OllamaConfig } from "./config";
@@ -49,6 +52,35 @@ function mockOllamaTags(emptyStoresForAll = false) {
 afterEach(() => {
   globalThis.fetch = originalFetch;
   __resetOllamaHealthCacheForTests();
+  __resetWindowsHostIPCacheForTests();
+});
+
+describe("resolveWindowsHostIP platform branches", () => {
+  // 2026-08-06 live incident: native bun.exe on Windows ran the WSL host-IP
+  // path, always fell through to 172.17.0.1, and every 30s cache miss logged
+  // "Could not resolve Windows host IP" while fetch probes to the docker
+  // bridge hung. /health and keep-warm both paid that cost.
+  test("on win32 returns loopback without WSL fallback", () => {
+    __resetWindowsHostIPCacheForTests();
+    expect(resolveWindowsHostIP("win32")).toBe("127.0.0.1");
+    // Cache sticks for subsequent calls.
+    expect(resolveWindowsHostIP("win32")).toBe("127.0.0.1");
+  });
+
+  test("effectiveOllamaUrl on win32 keeps traffic on loopback", () => {
+    __resetWindowsHostIPCacheForTests();
+    // Force the win32 branch via resolveWindowsHostIP("win32") first so the
+    // cache is primed; effectiveOllamaUrl calls the default-platform path.
+    // When this suite itself runs on win32 the default path is also correct.
+    if (process.platform === "win32") {
+      const url = effectiveOllamaUrl(makeConfig("http://localhost:11434"));
+      expect(url).toContain("127.0.0.1");
+      expect(url).not.toContain("172.17.0.1");
+    } else {
+      // On Linux CI, just pin the pure win32 helper contract above.
+      expect(resolveWindowsHostIP("win32")).toBe("127.0.0.1");
+    }
+  });
 });
 
 describe("Ollama integration", () => {
