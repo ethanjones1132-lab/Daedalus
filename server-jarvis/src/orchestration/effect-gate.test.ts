@@ -361,6 +361,32 @@ describe("effect gate — target-scoped write credit (W5)", () => {
     expect(targets?.some((p) => /status/i.test(p))).toBe(true);
   });
 
+  // Regression: tier2b pkg_discount/pkg_auth live benchmark (2026-08-06) —
+  // the planner named only calc.py before the executor had opened the
+  // package; the real bug lived in the hidden dependency rules.py. The
+  // executor correctly read both, fixed rules.py, and the independent check
+  // passed — but the write term still scored zero because rules.py was never
+  // a "target". A file the turn actually read is real investigation
+  // evidence, not a gaming vector (the check term still gates full credit).
+  test("resolveTaskTargetPaths widens an existing target set with files the turn read", () => {
+    const targets = resolveTaskTargetPaths({
+      planTexts: ["Fix calc.py to handle the boundary case"],
+      readPaths: ["calc.py", "rules.py", "_t.py"],
+    });
+    expect(targets).toContain("calc.py");
+    expect(targets).toContain("rules.py");
+  });
+
+  test("resolveTaskTargetPaths does not let read-only evidence create a target set on its own", () => {
+    // No explicit/request/plan target named at all: stays path-agnostic
+    // (undefined) rather than letting incidental reads narrow an otherwise
+    // fully-open turn down to only what happened to be looked at.
+    const targets = resolveTaskTargetPaths({
+      readPaths: ["some/file/that/was/read.py"],
+    });
+    expect(targets).toBeUndefined();
+  });
+
   test("buildWriteEffectNudge prefers an explicit task target when provided", () => {
     const note = buildWriteEffectNudge(["write_file", "edit_file"], "src/app.ts");
     expect(note).toContain("src/app.ts");

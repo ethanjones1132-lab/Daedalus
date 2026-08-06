@@ -147,6 +147,20 @@ export function resolveTaskTargetPaths(input: {
   explicit?: readonly string[];
   request?: string;
   planTexts?: readonly string[];
+  /**
+   * Paths the turn actually read successfully (see `collectReadToolPaths`).
+   * Only widens an ALREADY-established target set — never the sole source of
+   * one. Regression (tier2b pkg_discount/pkg_auth, 2026-08-06): the planner
+   * named only the entry file before the executor opened the package; the
+   * real bug lived in a hidden dependency the executor read and correctly
+   * fixed, but the write term scored zero because that file was never a
+   * named "target". Letting readPaths alone form a restrictive set would
+   * regress the opposite way — narrowing an otherwise fully-open turn (no
+   * target named at all) down to only what happened to be looked at, which
+   * would zero out legitimate brand-new-file writes that were never read
+   * because they didn't exist yet.
+   */
+  readPaths?: readonly string[];
 }): string[] | undefined {
   const collected: string[] = [];
   const seen = new Set<string>();
@@ -163,12 +177,38 @@ export function resolveTaskTargetPaths(input: {
     if (!text) continue;
     for (const path of extractPathMentions(text)) push(path);
   }
+  if (collected.length > 0) {
+    for (const path of input.readPaths ?? []) push(path);
+  }
   return collected.length > 0 ? collected : undefined;
 }
 
 export function toolCallWritePath(call: ToolCallRecord): string | undefined {
   const raw = call.arguments?.path ?? call.arguments?.file_path;
   return typeof raw === "string" && raw.trim() ? raw.trim() : undefined;
+}
+
+/** Tools whose successful call is evidence the turn inspected a specific path. */
+const READ_TOOL_NAMES = new Set(["read_file", "list_directory", "glob", "grep", "git_metadata"]);
+
+/**
+ * Paths the turn read successfully — feeds `resolveTaskTargetPaths`'s
+ * `readPaths` so a fix landing in a file the plan never named in advance
+ * (but the executor demonstrably opened) can still earn write credit.
+ */
+export function collectReadToolPaths(toolCalls: readonly ToolCallRecord[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const call of toolCalls) {
+    if (call.is_error || !READ_TOOL_NAMES.has(call.name)) continue;
+    const path = toolCallWritePath(call);
+    if (!path) continue;
+    const key = normalizePathForGate(path).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(path);
+  }
+  return out;
 }
 
 /**

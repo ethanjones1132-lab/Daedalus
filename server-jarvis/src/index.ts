@@ -173,7 +173,7 @@ import {
   planEvidenceFromItems,
   serializeRunRewardBreakdown,
 } from "./orchestration/run-reward";
-import { resolveTaskTargetPaths } from "./orchestration/effect-gate";
+import { collectReadToolPaths, resolveTaskTargetPaths } from "./orchestration/effect-gate";
 import {
   applyStricterOutcomeFloor,
   decideCompletion,
@@ -3622,6 +3622,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               (item) => `${item.title ?? ""} ${item.description ?? ""}`,
             ),
           ],
+          // 2026-08-06: widen with files the executor demonstrably read this
+          // run — see resolveTaskTargetPaths's readPaths doc. Fixes tier2b
+          // pkg_discount/pkg_auth scoring zero for a correct hidden-dependency
+          // fix the plan never named in advance.
+          readPaths: collectReadToolPaths(result.toolCalls ?? []),
         });
         const runRewardSnapshot = buildStoredRunRewardSnapshot({
           writeRequired: writeRequiredForReward,
