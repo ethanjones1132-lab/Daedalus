@@ -4,6 +4,8 @@ import type { CallModelFn } from "../../orchestration/coordinator";
 import { TRAINING_TASKS } from "./fixture-tasks";
 import { runOneRollout } from "./rollout-runner";
 
+const hiddenFileTask = TRAINING_TASKS.find((t) => t.name === "pkg_discount")!;
+
 /**
  * These use a scripted CallModelFn rather than a live model: the point is to
  * prove the rollout PLUMBING (θ scoping, workspace seeding, write-effect
@@ -85,6 +87,47 @@ describe("runOneRollout", () => {
     expect(
       outcome.breakdown.creditedWritePaths.some((p) => p.includes(task.entry)),
       `expected ${task.entry} in credited paths, got ${JSON.stringify(outcome.breakdown.creditedWritePaths)}`,
+    ).toBe(true);
+    expect(outcome.breakdown.terms.writes).toBeGreaterThan(0);
+  });
+
+  // Regression: rollout-runner previously hardcoded targetPaths to only
+  // [task.entry], so a category-B rollout that correctly fixes the seeded
+  // bug in hiddenFile (the realistic outcome for these fixtures — the entry
+  // file is a thin wrapper, the bug lives in the dependency) scored zero on
+  // the writes term. That would train CMA-ES to avoid touching hidden files
+  // even when that is the only correct fix location.
+  test("a rollout that lands a real write in hiddenFile credits it too", async () => {
+    expect(hiddenFileTask.hiddenFile).toBeTruthy();
+    const hiddenFile = hiddenFileTask.hiddenFile!;
+    const fixesHiddenFile: CallModelFn = async (_messages, options) => {
+      if (options?.stageLabel === "executor") {
+        return {
+          content: "the bug is in the dependency, fixing it there",
+          tool_calls: [
+            {
+              id: "call_1",
+              type: "function",
+              function: {
+                name: "write_file",
+                arguments: JSON.stringify({
+                  path: hiddenFile,
+                  content: `# fixed\n${hiddenFileTask.files[hiddenFile]}\n# end\n`,
+                }),
+              },
+            } as never,
+          ],
+        };
+      }
+      return { content: "done" };
+    };
+    const outcome = await runOneRollout(
+      { theta: BASELINE_THETA, task: hiddenFileTask, seed: 4 },
+      fixesHiddenFile,
+    );
+    expect(
+      outcome.breakdown.creditedWritePaths.some((p) => p.includes(hiddenFile)),
+      `expected ${hiddenFile} in credited paths, got ${JSON.stringify(outcome.breakdown.creditedWritePaths)}`,
     ).toBe(true);
     expect(outcome.breakdown.terms.writes).toBeGreaterThan(0);
   });

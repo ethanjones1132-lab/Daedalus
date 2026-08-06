@@ -135,10 +135,17 @@ export async function runOneRollout(
       ),
     );
 
+    // Category B fixtures seed the bug in hiddenFile behind a thin entry
+    // wrapper (the realistic, often-correct fix lands there, not in entry) —
+    // targetPaths must include it or a genuine fix scores zero on writes and
+    // CMA-ES learns to avoid touching hidden files.
+    const targetPaths = spec.task.hiddenFile
+      ? [spec.task.entry, spec.task.hiddenFile]
+      : [spec.task.entry];
     const breakdown = computeRunRewardFromEffects({
       effects: result.writeEffects ?? [],
       check: result.checkResult ?? null,
-      targetPaths: [spec.task.entry],
+      targetPaths,
       // Every fixture is a code-fix task, so a rollout that lands no verified
       // content change must score zero rather than coast on a clean check.
       writeRequired: true,
