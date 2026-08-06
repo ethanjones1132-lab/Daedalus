@@ -42,6 +42,12 @@ export interface CampaignOptions {
   popSize?: number;
   rng?: () => number;
   onGeneration?: (info: GenerationReport) => void;
+  /**
+   * Optional training subset for early budget-controlled runs (`--tasks N`).
+   * Defaults to the full TRAINING_TASKS export. Held-out scoring always uses
+   * HELD_OUT_TASKS regardless of this override.
+   */
+  trainingTasks?: readonly FixtureTask[];
 }
 
 export interface GenerationReport {
@@ -82,10 +88,11 @@ async function evaluateFitness(
   theta: OrchestrationTheta,
   callModel: CallModelFn,
   concurrency: number,
+  trainingTasks: readonly FixtureTask[],
 ): Promise<number> {
   const [outcomes] = await runRolloutBatch(
     [{ theta, seed: 0 }],
-    TRAINING_TASKS,
+    trainingTasks,
     callModel,
     { concurrency },
   );
@@ -109,7 +116,8 @@ export async function scoreHeldOut(
 
 /** Run the optimizer loop and score the result against held-out fixtures. */
 export async function runCmaEsCampaign(opts: CampaignOptions): Promise<CampaignResult> {
-  if (TRAINING_TASKS.length === 0) {
+  const trainingTasks = opts.trainingTasks ?? TRAINING_TASKS;
+  if (trainingTasks.length === 0) {
     throw new Error("no training fixtures — refusing to run a campaign with nothing to score");
   }
   if (HELD_OUT_TASKS.length === 0) {
@@ -139,7 +147,7 @@ export async function runCmaEsCampaign(opts: CampaignOptions): Promise<CampaignR
     const fitness: number[] = [];
     for (const vector of samples) {
       const theta = vectorToTheta(vector, BASELINE_THETA);
-      fitness.push(await evaluateFitness(theta, opts.callModel, concurrency));
+      fitness.push(await evaluateFitness(theta, opts.callModel, concurrency, trainingTasks));
     }
     cma.tell(samples, fitness);
 

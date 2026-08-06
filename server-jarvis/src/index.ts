@@ -1986,6 +1986,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
             if (cfg.top_p !== undefined) requestBody.top_p = cfg.top_p;
             const activeProfile = cfg.profiles?.[cfg.active_profile];
+            // NOTE: on Ollama `/v1`, the entire `options` block is silently
+            // discarded (measured 0.32.6). Left in place for non-/v1 clients /
+            // future Ollama builds; do not rely on num_ctx here for correctness.
             requestBody.options = {
               temperature: requestBody.temperature ?? 0.7,
               top_p: cfg.top_p ?? 0.95,
@@ -1994,6 +1997,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               num_thread: activeProfile?.num_threads ?? cfg.ollama.options?.num_thread ?? 8,
               num_batch: activeProfile?.batch_size ?? cfg.ollama.options?.num_batch ?? 256,
             };
+            // Thinking models burn the completion budget in the reasoning
+            // channel under /v1 (think:false is ignored). reasoning_effort is
+            // the only switch that works there. Orchestrator stages only —
+            // agent-loop path is deliberately not touched.
+            if (cfg.orchestrator?.local_disable_thinking !== false) {
+              requestBody.reasoning_effort = "none";
+            }
           } else if (isOpenCodeProvider) {
             // OpenCode (Zen/Go): OpenAI-compatible but not in the OpenRouter
             // catalog. Apply a lean config from callOptions/cfg directly.
@@ -5055,6 +5065,30 @@ async function checkStatus(configOverride?: Partial<JarvisConfig> | null) {
     configWarnings.push("Ollama is not running. Start Ollama on Windows (ollama serve).");
   } else if (cfg.active_backend === "ollama" && !ollamaHealth.modelAvailable) {
     configWarnings.push(`Model "${cfg.ollama.model}" not found in Ollama. Run: ollama pull ${cfg.ollama.model}`);
+  }
+  // /v1 discards per-request options.num_ctx; production local stages need the
+  // daemon default (OLLAMA_CONTEXT_LENGTH) raised. Warn when a loaded model
+  // reports context_length under the 16k floor via /api/ps.
+  if (ollamaHealth.running) {
+    try {
+      const { readOllamaLoadedContextLength, LOCAL_CONTEXT_LENGTH_FLOOR } = await import(
+        "./self-tuning/rollout/ollama-local-transport"
+      );
+      for (const baseUrl of ollamaBaseUrlCandidates(cfg.ollama)) {
+        const ctxLen = await readOllamaLoadedContextLength(baseUrl);
+        if (ctxLen !== null && ctxLen < LOCAL_CONTEXT_LENGTH_FLOOR) {
+          configWarnings.push(
+            `Ollama loaded context_length=${ctxLen} is below ${LOCAL_CONTEXT_LENGTH_FLOOR}. ` +
+              `Set OLLAMA_CONTEXT_LENGTH=${LOCAL_CONTEXT_LENGTH_FLOOR} on the Ollama service and restart ` +
+              `( /v1 ignores per-request options.num_ctx ).`,
+          );
+          break;
+        }
+        if (ctxLen !== null) break;
+      }
+    } catch {
+      /* non-fatal: status path must not throw */
+    }
   }
   if (cfg.active_backend === "openrouter" && !hasApiKey) {
     configWarnings.push("OpenRouter API key not configured. Add your key in the Config tab.");

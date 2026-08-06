@@ -12,6 +12,9 @@
     "eval": "bun run src/eval/harness.ts",
     "eval:nightly": "bun run src/eval/nightly-semantic-eval.ts",
     "audit:pool": "bun run src/orchestration/model-pool-eligibility-audit.ts",
+    "campaign:preflight": "bun run src/self-tuning/cma-es/campaign-cli.ts --preflight",
+    "campaign:smoke": "bun run src/self-tuning/cma-es/campaign-cli.ts --smoke",
+    "campaign": "bun run src/self-tuning/cma-es/campaign-cli.ts",
     "test:gate": "bun test src/eval/harness.test.ts && bun run src/eval/harness.ts"
   },
   "dependencies": {

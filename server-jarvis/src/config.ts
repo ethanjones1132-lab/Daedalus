@@ -400,6 +400,17 @@ export interface OrchestratorConfig {
    * runPipelineWithReplanning so mid-run replan triggers can fire.
    */
   mid_run_replan?: boolean;
+  /**
+   * When true (default), orchestrator stage calls to Ollama set
+   * `reasoning_effort: "none"` on the `/v1` chat body so thinking models do
+   * not burn the entire completion budget in the reasoning channel and return
+   * empty `content`. Measured on Ollama 0.32.6 + qwen3.5:4b: 200/200
+   * completion tokens as reasoning, `content: ""`. `/v1` ignores `think:false`
+   * and the entire `options` block; only `reasoning_effort` works there.
+   * Scoped to orchestrator stages only — the main agent-loop path is untouched
+   * so user-facing reasoning display is unchanged.
+   */
+  local_disable_thinking: boolean;
   /** T3.3: conductor-facing dynamic agent registration (default OFF). */
   dynamic_agents?: DynamicAgentsConfig;
   conductor: ConductorConfig;
@@ -609,6 +620,9 @@ export function defaultConfig(): JarvisConfig {
       max_review_repair_rounds: 1,
       high_complexity_executor_retry: true,
       mid_run_replan: true,
+      // See OrchestratorConfig.local_disable_thinking — measured empty-content
+      // on thinking Ollama models via /v1; only reasoning_effort works there.
+      local_disable_thinking: true,
       dynamic_agents: {
         enabled: false,
         max_dynamic_agents: 4,
