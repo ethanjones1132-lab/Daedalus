@@ -9,6 +9,7 @@ import {
   localStageAgent,
   orchestrationRoutingTier,
   preferLocalForStage,
+  runRolloutLocalOnly,
   type OrchestratorAgent,
 } from "./agent-pool";
 import { getLearnedPoolState } from "../self-tuning/learned-pool-state";
@@ -1475,6 +1476,84 @@ describe("pickFor no-tool demotion (W3.4)", () => {
     ];
     const pool = new AgentPool(plannerPair);
     expect(pool.pickFor("planner", "general")?.id).toBe("no-tool-heavy");
+  });
+});
+
+/**
+ * Phase D rollouts must cost nothing. `preferLocalForStage` alone cannot
+ * guarantee that: free-tier remote agents share `orchestrationRoutingTier() === 0`
+ * with Ollama, so "prefer local" still leaves them eligible in the general
+ * ranking path. The ALS flag therefore has to both widen the preference AND
+ * hard-filter the tier candidates.
+ */
+describe("rollout local-only routing", () => {
+  const mixed: OrchestratorAgent[] = [
+    {
+      id: "free-remote",
+      provider: "openrouter",
+      model_id: "some-model:free",
+      capabilities: { code: 0.9, reasoning: 0.9, speed: 0.9, cost: 1, json_reliability: 0.9 },
+      default_for: ["executor", "synthesizer"],
+      enabled: true,
+    },
+    {
+      id: "free-zen",
+      provider: "opencode_zen",
+      model_id: "deepseek-v4-flash-free",
+      capabilities: { code: 0.9, reasoning: 0.9, speed: 0.9, cost: 1, json_reliability: 0.9 },
+      default_for: [],
+      enabled: true,
+    },
+    {
+      id: "local-qwen",
+      provider: "ollama",
+      model_id: "qwen3.5:4b",
+      capabilities: { code: 0.5, reasoning: 0.5, speed: 0.6, cost: 1, json_reliability: 0.6 },
+      default_for: [],
+      enabled: true,
+    },
+  ];
+
+  test("every stage resolves to ollama inside runRolloutLocalOnly", () => {
+    const pool = new AgentPool(mixed);
+    runRolloutLocalOnly(() => {
+      for (const stage of ["executor", "synthesizer", "planner", "reviewer", "coordinator"]) {
+        const pick = pool.pickFor(stage, "refactor", undefined, {
+          ollamaAvailable: true,
+          localModels: ["qwen3.5:4b"],
+        });
+        expect(pick?.provider, `stage=${stage} escaped to a non-local provider`).toBe("ollama");
+      }
+    });
+  });
+
+  test("free-tier remote still wins outside a rollout (no behavior change)", () => {
+    const pool = new AgentPool(mixed);
+    // executor/synthesizer are deliberately NOT in preferLocalForStage's set,
+    // so outside a rollout the remote default_for pin must still win.
+    expect(pool.pickFor("executor", "refactor")?.id).toBe("free-remote");
+    expect(pool.pickFor("synthesizer", "refactor")?.id).toBe("free-remote");
+  });
+
+  test("preferLocalForStage is unchanged outside a rollout", () => {
+    expect(preferLocalForStage("planner")).toBe(true);
+    expect(preferLocalForStage("reviewer")).toBe(true);
+    expect(preferLocalForStage("executor")).toBe(false);
+    expect(preferLocalForStage("synthesizer")).toBe(false);
+  });
+
+  test("preferLocalForStage widens to every stage inside a rollout", () => {
+    runRolloutLocalOnly(() => {
+      expect(preferLocalForStage("executor")).toBe(true);
+      expect(preferLocalForStage("synthesizer")).toBe(true);
+    });
+  });
+
+  test("the flag does not leak out of its async scope", async () => {
+    await runRolloutLocalOnly(async () => {
+      expect(preferLocalForStage("executor")).toBe(true);
+    });
+    expect(preferLocalForStage("executor")).toBe(false);
   });
 });
 

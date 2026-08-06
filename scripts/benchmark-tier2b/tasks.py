@@ -299,6 +299,105 @@ assert clamp_sample(2.0) == 1.0
 print('OK')
 """,
     },
+    {
+        "name": "find_rotation_point", "category": "A", "entry": "solution.py",
+        "files": {"solution.py": """def find_rotation_point(arr):
+    \"\"\"Index of the smallest element in a rotated sorted array.\"\"\"
+    if not arr:
+        return -1
+    lo, hi = 0, len(arr) - 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if arr[mid] > arr[lo]:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+"""},
+        "spec": (
+            "find_rotation_point returns the index of the smallest element in a "
+            "rotated sorted array. Bug report: a non-rotated array like [1,2,3,4,5] "
+            "returns 3 instead of 0, and [2,1] returns 0 instead of 1. Empty input "
+            "must still return -1."
+        ),
+        "test": """from solution import find_rotation_point
+assert find_rotation_point([4,5,6,7,0,1,2]) == 4
+assert find_rotation_point([1,2,3,4,5]) == 0
+assert find_rotation_point([2,1]) == 1
+assert find_rotation_point([5,1,2,3,4]) == 1
+assert find_rotation_point([]) == -1
+print('OK')
+""",
+    },
+    {
+        "name": "nested_lookup", "category": "C", "entry": "solution.py",
+        "files": {"solution.py": """def nested_lookup(data, path, default=None):
+    \"\"\"Walk a dotted path through nested dicts, returning default if absent.\"\"\"
+    current = data
+    for part in path.split('.'):
+        if not current.get(part):
+            return default
+        current = current[part]
+    return current
+"""},
+        "spec": (
+            "nested_lookup(data, path, default) walks a dotted path through nested "
+            "dicts. Two defects: a value that is present but falsy (0, '', False) is "
+            "wrongly reported as missing, and a non-dict value partway down the path "
+            "raises AttributeError instead of returning the default."
+        ),
+        "test": """from solution import nested_lookup
+assert nested_lookup({'a': {'b': {'c': 1}}}, 'a.b.c') == 1
+assert nested_lookup({'a': {'b': 0}}, 'a.b') == 0
+assert nested_lookup({'a': {'b': ''}}, 'a.b', 'x') == ''
+assert nested_lookup({'a': 1}, 'a.b', 'x') == 'x'
+assert nested_lookup({}, 'a', 'd') == 'd'
+print('OK')
+""",
+    },
+    {
+        "name": "slugify_with_lib", "category": "E", "entry": "solution.py",
+        "files": {
+            "lib/textutil.py": """def normalize_token(text):
+    \"\"\"Lowercase, strip, and collapse internal whitespace to single spaces.\"\"\"
+    return " ".join(text.lower().split())
+""",
+            "solution.py": """# TODO: build slugify(text) using the project text library.
+def slugify(text):
+    return text
+""",
+            "solution_t.py": """from solution import slugify
+assert slugify('  Hello   World  ') == 'hello-world'
+print('OK')
+""",
+        },
+        "spec": (
+            "Implement slugify(text) so it lowercases, collapses whitespace, and joins "
+            "words with single hyphens. A prior draft tried `strutil.toKebab` and "
+            "`fastSlug` - those are NOT available. Use the real helper from "
+            "lib/textutil.py (`normalize_token`) only."
+        ),
+        "test": """from solution import slugify
+import inspect
+import solution as sol_mod
+src = inspect.getsource(sol_mod)
+assert 'strutil.toKebab' not in src and 'fastSlug' not in src, 'fabricated symbol in landed solution'
+assert slugify('  Hello   World  ') == 'hello-world'
+assert slugify('Already-Fine') == 'already-fine'
+assert slugify('Multi   Space Here') == 'multi-space-here'
+print('OK')
+""",
+    },
 ]
+
+# Structural held-out enforcement: held_out.py is the single source of truth for
+# which tasks are reserved for final scoring. Assert on import so a typo or a
+# renamed/removed task fails loud here rather than silently shrinking the
+# held-out set (which would let the optimizer train on data meant to be unseen).
+from held_out import HELD_OUT_NAMES  # noqa: E402
+
+_TASK_NAMES = {t["name"] for t in TASKS}
+_MISSING = HELD_OUT_NAMES - _TASK_NAMES
+assert not _MISSING, f"held_out.py names not present in TASKS: {sorted(_MISSING)}"
 
 K = 3

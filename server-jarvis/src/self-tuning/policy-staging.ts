@@ -250,7 +250,8 @@ function patchIsEmpty(patch: PolicyPatch): boolean {
     Object.keys(patch.stageModelRoutingScoreDeltas ?? {}).length === 0 &&
     Object.keys(patch.fallbackBoosts ?? {}).length === 0 &&
     Object.keys(patch.modelFirstTokenTimeouts ?? {}).length === 0 &&
-    Object.keys(patch.recovery ?? {}).length === 0
+    Object.keys(patch.recovery ?? {}).length === 0 &&
+    Object.keys(patch.theta ?? {}).length === 0
   );
 }
 

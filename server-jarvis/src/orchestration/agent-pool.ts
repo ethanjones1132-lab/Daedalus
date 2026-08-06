@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "async_hooks";
 import type { Complexity, StageName, TaskType } from "./coordinator";
 import { selectTrialCandidate } from "./model-trial-policy";
 import {
@@ -308,11 +309,39 @@ const FREE_ZEN_MODEL_IDS = new Set([
 ]);
 
 /**
+ * Phase D: rollout-scoped "local models only" flag.
+ *
+ * A CMA-ES campaign runs many thousands of fixture rollouts, and the whole
+ * premise is that they cost nothing — Ollama has no quota. Without this, a
+ * rollout would silently spend free-tier (and eventually paid) remote calls.
+ *
+ * ALS rather than a threaded parameter: `pickFor`/`preferLocalForStage` are
+ * called from many sites, so threading a flag through every signature is a far
+ * larger diff than reusing the exact ambient-async-context mechanism
+ * `runWithTheta` already established in orchestration-policy.ts for the same
+ * shape of problem (a rollout-scoped override that must not touch production).
+ */
+const rolloutLocalOnlyAls = new AsyncLocalStorage<boolean>();
+
+/** Run `fn` with every stage forced onto local Ollama models. */
+export function runRolloutLocalOnly<T>(fn: () => T): T {
+  return rolloutLocalOnlyAls.run(true, fn);
+}
+
+function isRolloutLocalOnly(): boolean {
+  return rolloutLocalOnlyAls.getStore() === true;
+}
+
+/**
  * M1b: stages that prefer a healthy local Ollama lane before remote free/Go.
  * Planner and reviewer are reasoning-light enough for the resident qwen-class
  * models; executor/synthesizer stay remote-first (tool-heavy / user-visible).
+ *
+ * Inside a Phase-D rollout every stage prefers local — see `pickFor`, which
+ * also hard-filters, because preference alone is not exclusion.
  */
 export function preferLocalForStage(stage: string): boolean {
+  if (isRolloutLocalOnly()) return true;
   return stage === "planner" || stage === "reviewer";
 }
 
@@ -495,6 +524,19 @@ export class AgentPool {
     // perfect Go stage pin must not leapfrog any healthy free OpenRouter/Zen
     // model. Only after the entire active tier is excluded does the next tier
     // become eligible.
+    // Phase D: inside a rollout, local is the ONLY acceptable lane. This filter
+    // (not preferLocalForStage above) is the actual enforcement — free-tier
+    // remote agents share orchestrationRoutingTier() === 0 with Ollama, so
+    // preference alone leaves them eligible here. Applied before tier selection
+    // so the active tier is computed from local candidates only.
+    if (isRolloutLocalOnly()) {
+      const localOnly = candidates.filter((agent) => agent.provider === "ollama");
+      // Never empty the pool: if no local agent survived (Ollama unavailable,
+      // all excluded), fall through to normal selection rather than returning
+      // undefined and silently skipping the stage. The rollout will be slower
+      // and non-free, which the caller can detect, instead of vanishing.
+      if (localOnly.length > 0) candidates = localOnly;
+    }
     const activeTier = Math.min(...candidates.map(orchestrationRoutingTier));
     let tierCandidates = candidates.filter((agent) => orchestrationRoutingTier(agent) === activeTier);
     // M5: refuse models whose measured p50 first_token exceeds remaining stage

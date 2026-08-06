@@ -90,6 +90,15 @@ describe("propose → eligible → shadow → canary → promote", () => {
     expect(second.reason).toBe("in_flight_exists");
   });
 
+  test("accepts a theta-only patch (Phase D promotion path)", () => {
+    const proposed = proposePolicy(
+      { domain: "budget", theta: { routing_timeout_ms: 25_000 } },
+      "Phase D sep-CMA-ES candidate",
+    );
+    expect(proposed.action).toBe("proposed");
+    expect(proposed.version?.snapshot.theta).toEqual({ routing_timeout_ms: 25_000 });
+  });
+
   test("holds candidate until 20 eligible outcomes then enters shadow", () => {
     advanceToShadow();
     const store = getPolicyVersionStore();
