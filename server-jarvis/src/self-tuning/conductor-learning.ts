@@ -28,7 +28,11 @@ import {
 } from "./policy-staging";
 import { runWithPolicyOverlay } from "./learned-pool-state";
 import { hashInstruction, type InstructionVariantSelection } from "../orchestration/worker-prompt";
-import { rolloutRandom } from "../orchestration/orchestration-policy";
+import {
+  rolloutRandom,
+  runWithPolicyArmContext,
+  type PolicyArm,
+} from "../orchestration/orchestration-policy";
 
 export interface RoutingRecordInput {
   agentRunId: string;
@@ -420,10 +424,27 @@ export class ConductorLearningLoop {
    * Run a turn under the canary (or production) policy arm. Canary uses a
    * request-scoped overlay so global maps stay on production until promote.
    */
-  runTurnWithPolicyArm<T>(arm: "canary" | "production", fn: () => T): T {
-    if (arm !== "canary") return fn();
-    const snap = this.canaryPolicySnapshot();
-    return runWithPolicyOverlay(snap, fn);
+  runTurnWithPolicyArm<T>(arm: PolicyArm, fn: () => T): T {
+    const versions = getPolicyVersionStore();
+    const scopeId = arm === "canary"
+      ? `canary:${versions.canary?.id ?? "inactive"}`
+      : "production";
+    return runWithPolicyArmContext({ arm, scopeId }, () => {
+      if (arm !== "canary") return fn();
+      return runWithPolicyOverlay(this.canaryPolicySnapshot(), fn);
+    });
+  }
+
+  /** Select and install one policy arm before any logical-turn objects are built. */
+  runSelectedPolicyTurn<T>(fn: (arm: PolicyArm) => T, rng?: () => number): {
+    arm: PolicyArm;
+    result: T;
+  } {
+    const arm: PolicyArm = this.shouldRouteToCanaryPolicy(rng) ? "canary" : "production";
+    return {
+      arm,
+      result: this.runTurnWithPolicyArm(arm, () => fn(arm)),
+    };
   }
 
   /** Record a canary-phase outcome; may auto-promote or auto-rollback. */

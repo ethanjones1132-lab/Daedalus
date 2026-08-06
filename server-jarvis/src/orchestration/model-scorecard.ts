@@ -1,39 +1,59 @@
 import type { ModelAttribution } from "../self-tuning/store";
 import type { ReliabilityLatencyEntry } from "./reliability-latency-rank";
-import { BASELINE_THETA, policy } from "./orchestration-policy";
+import { activePolicyArmContext, policy } from "./orchestration-policy";
 
 export interface ScorecardAttempt {
   ok: boolean;
   firstTokenMs?: number;
 }
 
-const WINDOW_SIZE = BASELINE_THETA.model_scorecard_window_size;
 const MIN_SAMPLES = 6;
-const UNFIT_ERROR_RATE = BASELINE_THETA.model_scorecard_unfit_error_rate;
 
 /** Exported so ranking / trial policy can share the same floor. */
 export const SCORECARD_MIN_SAMPLES = MIN_SAMPLES;
 
 /** In-process rolling stage/model telemetry used to add selection pressure. */
 export class ModelScorecard {
-  private readonly attempts = new Map<string, ScorecardAttempt[]>();
+  private readonly attemptsByScope = new Map<string, Map<string, ScorecardAttempt[]>>();
 
-  private slot(stage: string, providerModelKey: string): ScorecardAttempt[] {
+  private scope(scopeId = activePolicyArmContext().scopeId): Map<string, ScorecardAttempt[]> {
+    let attempts = this.attemptsByScope.get(scopeId);
+    if (!attempts) {
+      attempts = new Map();
+      this.attemptsByScope.set(scopeId, attempts);
+    }
+    return attempts;
+  }
+
+  private slot(
+    stage: string,
+    providerModelKey: string,
+    scopeId = activePolicyArmContext().scopeId,
+  ): ScorecardAttempt[] {
     const key = `${stage}|${providerModelKey}`;
-    let list = this.attempts.get(key);
+    const attempts = this.scope(scopeId);
+    let list = attempts.get(key);
     if (!list) {
       list = [];
-      this.attempts.set(key, list);
+      attempts.set(key, list);
     }
     return list;
+  }
+
+  private visibleAttempts(stage: string, providerModelKey: string): ScorecardAttempt[] {
+    const context = activePolicyArmContext();
+    const production = this.slot(stage, providerModelKey, "production");
+    const raw = context.arm === "canary"
+      ? [...production, ...this.slot(stage, providerModelKey, context.scopeId)]
+      : production;
+    const windowSize = Math.max(1, Math.floor(policy().model_scorecard_window_size));
+    return raw.slice(-windowSize);
   }
 
   record(stage: string, providerModelKey: string, attempt: ScorecardAttempt): ScorecardAttempt {
     const list = this.slot(stage, providerModelKey);
     const trackedAttempt = { ...attempt };
     list.push(trackedAttempt);
-    const windowSize = Math.max(1, Math.floor(policy().model_scorecard_window_size));
-    if (list.length > windowSize) list.splice(0, list.length - windowSize);
     return trackedAttempt;
   }
 
@@ -70,11 +90,11 @@ export class ModelScorecard {
    * return a verdict at all.
    */
   sampleCount(stage: string, providerModelKey: string): number {
-    return this.slot(stage, providerModelKey).length;
+    return this.visibleAttempts(stage, providerModelKey).length;
   }
 
   errorRate(stage: string, providerModelKey: string): number | undefined {
-    const list = this.slot(stage, providerModelKey);
+    const list = this.visibleAttempts(stage, providerModelKey);
     if (list.length < SCORECARD_MIN_SAMPLES) return undefined;
     return list.filter((attempt) => !attempt.ok).length / list.length;
   }
@@ -85,7 +105,7 @@ export class ModelScorecard {
    * reliability/latency ranking so thin samples still participate softly.
    */
   successRate(stage: string, providerModelKey: string): number | undefined {
-    const list = this.slot(stage, providerModelKey);
+    const list = this.visibleAttempts(stage, providerModelKey);
     if (list.length === 0) return undefined;
     return list.filter((attempt) => attempt.ok).length / list.length;
   }
@@ -93,7 +113,12 @@ export class ModelScorecard {
   unfitKeys(stage: string): Set<string> {
     const result = new Set<string>();
     const prefix = `${stage}|`;
-    for (const key of this.attempts.keys()) {
+    const context = activePolicyArmContext();
+    const keys = new Set(this.scope("production").keys());
+    if (context.arm === "canary") {
+      for (const key of this.scope(context.scopeId).keys()) keys.add(key);
+    }
+    for (const key of keys) {
       if (!key.startsWith(prefix)) continue;
       const providerModelKey = key.slice(prefix.length);
       const rate = this.errorRate(stage, providerModelKey);
@@ -103,7 +128,7 @@ export class ModelScorecard {
   }
 
   p50FirstToken(stage: string, providerModelKey: string): number | undefined {
-    const latencies = this.slot(stage, providerModelKey)
+    const latencies = this.visibleAttempts(stage, providerModelKey)
       .map((attempt) => attempt.firstTokenMs)
       .filter((ms): ms is number => typeof ms === "number")
       .sort((a, b) => a - b);

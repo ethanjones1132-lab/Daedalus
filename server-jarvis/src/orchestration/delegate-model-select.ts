@@ -21,7 +21,12 @@ import {
   shouldBenchForErrorRate,
   errorStatsForModel,
 } from "./model-health";
-import { BASELINE_THETA, policy } from "./orchestration-policy";
+import {
+  activePolicyArmContext,
+  BASELINE_THETA,
+  getGlobalTheta,
+  policy,
+} from "./orchestration-policy";
 
 /** OpenAI-format Go models (need proxy for Claude CLI). */
 export const DELEGATE_GO_OPENAI_MODELS = [
@@ -172,6 +177,8 @@ export interface DelegateWriteScoreboardEntry {
 
 /** Process-local cache of write evidence; hydrated from self-tuning.db. */
 const writeScoreboard = new Map<string, DelegateWriteScoreboardEntry>();
+/** Candidate-local derived boards. Canary observations never persist into production. */
+const canaryWriteScoreboards = new Map<string, Map<string, DelegateWriteScoreboardEntry>>();
 let scoreboardHydrated = false;
 /** When true, empty scoreboard stays empty (tests) and seeds are not re-applied. */
 let scoreboardSeedSuppressed = false;
@@ -194,7 +201,7 @@ function entryFromSeed(seed: {
     attempts: seed.attempts,
     verifiedWrites: seed.verifiedWrites,
     benched:
-      seed.attempts >= policy().delegate_write_scoreboard_bench_attempts &&
+      seed.attempts >= getGlobalTheta().delegate_write_scoreboard_bench_attempts &&
       seed.verifiedWrites === 0,
   };
 }
@@ -205,6 +212,31 @@ function persistScoreboardEntry(entry: DelegateWriteScoreboardEntry): void {
   } catch (e) {
     console.error("[delegate-model-select] persist scoreboard failed:", e);
   }
+}
+
+function entryWithActiveBench(entry: DelegateWriteScoreboardEntry): DelegateWriteScoreboardEntry {
+  return {
+    ...entry,
+    benched:
+      entry.attempts >= policy().delegate_write_scoreboard_bench_attempts &&
+      entry.verifiedWrites === 0,
+  };
+}
+
+function activeWriteScoreboard(): Map<string, DelegateWriteScoreboardEntry> {
+  const context = activePolicyArmContext();
+  if (context.arm === "production") return writeScoreboard;
+  let board = canaryWriteScoreboards.get(context.scopeId);
+  if (!board) {
+    board = new Map(
+      [...writeScoreboard.entries()].map(([model, entry]) => [
+        model,
+        entryWithActiveBench(entry),
+      ]),
+    );
+    canaryWriteScoreboards.set(context.scopeId, board);
+  }
+  return board;
 }
 
 /**
@@ -267,6 +299,7 @@ export function seedDelegateWriteScoreboardFromHistory(): void {
  */
 export function __resetDelegateWriteScoreboardForTests(): void {
   writeScoreboard.clear();
+  canaryWriteScoreboards.clear();
   scoreboardHydrated = true;
   scoreboardSeedSuppressed = true;
   try {
@@ -281,6 +314,7 @@ export function __resetDelegateWriteScoreboardForTests(): void {
  */
 export function __reseedDelegateWriteScoreboardForTests(): void {
   writeScoreboard.clear();
+  canaryWriteScoreboards.clear();
   scoreboardHydrated = true;
   scoreboardSeedSuppressed = false;
   try {
@@ -299,13 +333,14 @@ export function __reseedDelegateWriteScoreboardForTests(): void {
 export function __setDelegateWriteScoreboardStoreForTests(store: SelfTuningStore | null): void {
   scoreboardStore = store;
   writeScoreboard.clear();
+  canaryWriteScoreboards.clear();
   scoreboardHydrated = false;
   scoreboardSeedSuppressed = false;
 }
 
 export function getDelegateWriteScoreboard(model: string): DelegateWriteScoreboardEntry | undefined {
   ensureDelegateWriteScoreboardHydrated();
-  return writeScoreboard.get(model.trim());
+  return activeWriteScoreboard().get(model.trim());
 }
 
 /** Why a model is excluded from delegate auto-selection. */
@@ -322,8 +357,9 @@ export interface BenchedDelegateModelEntry {
  */
 export function getBenchedDelegateModelEntries(): BenchedDelegateModelEntry[] {
   ensureDelegateWriteScoreboardHydrated();
+  const scoreboard = activeWriteScoreboard();
   const entries: BenchedDelegateModelEntry[] = [];
-  for (const entry of writeScoreboard.values()) {
+  for (const entry of scoreboard.values()) {
     if (entry.benched) {
       entries.push({ model: entry.model, reason: "write_evidence" });
     }
@@ -333,7 +369,7 @@ export function getBenchedDelegateModelEntries(): BenchedDelegateModelEntry[] {
   }
   // Also check scoreboard-known models against bare error stats in case the
   // error map only holds the model id without a dual provider key.
-  for (const entry of writeScoreboard.values()) {
+  for (const entry of scoreboard.values()) {
     if (entry.benched) continue;
     if (shouldBenchForErrorRate(errorStatsForModel(entry.model))) {
       if (!entries.some((e) => e.model === entry.model && e.reason === "error_rate")) {
@@ -377,7 +413,8 @@ export function recordDelegateWriteOutcome(
 ): DelegateWriteScoreboardEntry {
   ensureDelegateWriteScoreboardHydrated();
   const normalized = model.trim() || "unknown-delegate-model";
-  const previous = writeScoreboard.get(normalized);
+  const scoreboard = activeWriteScoreboard();
+  const previous = scoreboard.get(normalized);
   const attempts = (previous?.attempts ?? 0) + 1;
   const verifiedWrites = (previous?.verifiedWrites ?? 0) + (verifiedWrite ? 1 : 0);
   const entry: DelegateWriteScoreboardEntry = {
@@ -386,8 +423,8 @@ export function recordDelegateWriteOutcome(
     verifiedWrites,
     benched: attempts >= policy().delegate_write_scoreboard_bench_attempts && verifiedWrites === 0,
   };
-  writeScoreboard.set(normalized, entry);
-  persistScoreboardEntry(entry);
+  scoreboard.set(normalized, entry);
+  if (activePolicyArmContext().arm === "production") persistScoreboardEntry(entry);
   return entry;
 }
 
@@ -409,8 +446,9 @@ export function writeEvidenceScore(entry: DelegateWriteScoreboardEntry | undefin
 /** Compare two models by write evidence (descending). Negative → a ranks above b. */
 export function compareDelegateWriteEvidence(a: string, b: string): number {
   ensureDelegateWriteScoreboardHydrated();
-  const sa = writeEvidenceScore(writeScoreboard.get(a.trim()));
-  const sb = writeEvidenceScore(writeScoreboard.get(b.trim()));
+  const scoreboard = activeWriteScoreboard();
+  const sa = writeEvidenceScore(scoreboard.get(a.trim()));
+  const sb = writeEvidenceScore(scoreboard.get(b.trim()));
   if (sb.rate !== sa.rate) return sb.rate - sa.rate;
   if (sb.attempts !== sa.attempts) return sb.attempts - sa.attempts;
   // Stable fallback: prefer Anthropic Go, then OpenAI Go, then free (lexical).
@@ -446,11 +484,12 @@ export function rankDelegateAutoCandidates(
   if (goRanked.length === 0) return freeRanked;
   if (freeRanked.length === 0) return goRanked;
 
-  const bestGoRate = writeEvidenceScore(writeScoreboard.get(goRanked[0]!)).rate;
+  const scoreboard = activeWriteScoreboard();
+  const bestGoRate = writeEvidenceScore(scoreboard.get(goRanked[0]!)).rate;
   const freeAboveBestGo: string[] = [];
   const freeRest: string[] = [];
   for (const model of freeRanked) {
-    const rate = writeEvidenceScore(writeScoreboard.get(model)).rate;
+    const rate = writeEvidenceScore(scoreboard.get(model)).rate;
     if (rate > bestGoRate) freeAboveBestGo.push(model);
     else freeRest.push(model);
   }
@@ -556,7 +595,7 @@ function poolForModel(
  */
 export function isEarnedFreeDelegateModel(model: string): boolean {
   ensureDelegateWriteScoreboardHydrated();
-  const entry = writeScoreboard.get(model.trim());
+  const entry = activeWriteScoreboard().get(model.trim());
   if (!entry || entry.benched) return false;
   return entry.verifiedWrites > 0;
 }

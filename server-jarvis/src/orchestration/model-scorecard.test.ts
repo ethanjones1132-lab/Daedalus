@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { ModelScorecard } from "./model-scorecard";
+import { runWithPolicyArmContext, runWithTheta } from "./orchestration-policy";
 import type { ModelAttribution } from "../self-tuning/store";
 
 const KEY = "opencode_go:deepseek-v4-flash";
@@ -24,6 +25,28 @@ function seededRow(
 }
 
 describe("ModelScorecard", () => {
+  test("canary windows do not delete or reclassify production observations", () => {
+    const scorecard = new ModelScorecard();
+    for (let i = 0; i < 6; i++) {
+      scorecard.record("executor", KEY, { ok: false, firstTokenMs: 100 + i });
+    }
+    expect(scorecard.sampleCount("executor", KEY)).toBe(6);
+    expect(scorecard.unfitKeys("executor")).toEqual(new Set([KEY]));
+
+    runWithPolicyArmContext({ arm: "canary", scopeId: "candidate-a" }, () =>
+      runWithTheta({
+        model_scorecard_window_size: 1,
+        model_scorecard_unfit_error_rate: 1,
+      }, () => {
+        scorecard.record("executor", KEY, { ok: true, firstTokenMs: 10 });
+        expect(scorecard.sampleCount("executor", KEY)).toBe(1);
+        expect(scorecard.unfitKeys("executor")).toEqual(new Set());
+      }));
+
+    expect(scorecard.sampleCount("executor", KEY)).toBe(6);
+    expect(scorecard.unfitKeys("executor")).toEqual(new Set([KEY]));
+  });
+
   test("below the minimum sample size nothing is unfit", () => {
     const scorecard = new ModelScorecard();
     for (let i = 0; i < 5; i++) scorecard.record("coordinator", KEY, { ok: false });

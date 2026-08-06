@@ -94,130 +94,7 @@ export interface OrchestrationTheta {
   dead_tool_suppress_threshold: number;
 }
 
-/** Ordered keys — stable serialization / CMA-ES vector layout. */
-export const LEGACY_THETA_KEYS: readonly (keyof OrchestrationTheta)[] = [
-  "force_write_nudge_cap",
-  "max_quality_pushes",
-  "max_mid_loop_checks",
-  "max_mid_loop_escalations",
-  "reserved_mid_loop_escalations",
-  "mid_loop_endgame_budget_ms",
-  "mid_loop_endgame_turn_ratio",
-  "max_failed_write_attempts_without_effect",
-  "identical_write_pressure_note_cap",
-  "repeated_failed_writes_threshold",
-  "max_directives_per_turn",
-  "default_max_reroutes_per_segment",
-  "local_stage_min_window_ms",
-  "synthesis_runway_ms",
-  "routing_timeout_ms",
-  "no_tool_retry_budget_floor_ms",
-  "no_tool_ratio_ceiling",
-  "no_tool_ratio_min_turns",
-  "default_min_viable_stage_ms",
-  "progress_extension_ms",
-  "stage_extension_ceiling_ms",
-  "absolute_turn_cap_ms",
-  "min_no_tool_sample",
-  "no_tool_demotion_threshold",
-  "min_error_rate_sample",
-  "error_rate_bench_threshold",
-  "trial_sample_target",
-  "reliability_latency_min_samples",
-  "model_scorecard_window_size",
-  "model_scorecard_unfit_error_rate",
-  "max_delegate_launches_per_run",
-  "default_free_thrash_threshold",
-  "delegate_write_scoreboard_bench_attempts",
-  "thrash_ttl_ms",
-  "delegate_health_cooldown_ms",
-  "delegate_availability_cache_ms",
-  "delegate_api_retry_abort_threshold",
-  "max_handoff_seed_paths",
-  "deep_read_min_content_reads",
-  "max_grounding_symbols",
-  "max_grounding_greps",
-  "grounding_grep_head_limit",
-  "grounding_block_context_chars",
-  "executor_tool_result_context_chars",
-  "executor_preflight_result_context_chars",
-  "write_turn_tool_result_context_chars",
-  "executor_transcript_budget_tokens",
-  "write_turn_transcript_budget_tokens",
-  "repetition_similarity_threshold",
-  "default_max_repair_cycles",
-  "max_review_repair_rounds_cap",
-  "dead_tool_suppress_threshold",
-] as const;
-
-/**
- * Baseline θ — exact values of the hand-tuned constants as of Phase C land.
- * Changing a baseline value IS a behaviour change; tests pin key dimensions.
- */
-export const LEGACY_BASELINE_THETA: OrchestrationTheta = {
-  force_write_nudge_cap: 2,
-  max_quality_pushes: 2,
-  max_mid_loop_checks: 2,
-  max_mid_loop_escalations: 3,
-  reserved_mid_loop_escalations: 1,
-  mid_loop_endgame_budget_ms: 45_000,
-  mid_loop_endgame_turn_ratio: 0.8,
-  max_failed_write_attempts_without_effect: 2,
-  identical_write_pressure_note_cap: 2,
-  repeated_failed_writes_threshold: 2,
-
-  max_directives_per_turn: 24,
-  default_max_reroutes_per_segment: 3,
-
-  local_stage_min_window_ms: 75_000,
-  synthesis_runway_ms: 30_000,
-  routing_timeout_ms: 20_000,
-  no_tool_retry_budget_floor_ms: 20_000,
-  no_tool_ratio_ceiling: 0.5,
-  no_tool_ratio_min_turns: 6,
-  default_min_viable_stage_ms: 5_000,
-  progress_extension_ms: 20_000,
-  stage_extension_ceiling_ms: 90_000,
-  absolute_turn_cap_ms: 180_000,
-
-  min_no_tool_sample: 12,
-  no_tool_demotion_threshold: 0.6,
-  min_error_rate_sample: 10,
-  error_rate_bench_threshold: 0.7,
-  trial_sample_target: 6,
-  reliability_latency_min_samples: 6,
-  model_scorecard_window_size: 20,
-  model_scorecard_unfit_error_rate: 0.5,
-
-  max_delegate_launches_per_run: 4,
-  default_free_thrash_threshold: 2,
-  delegate_write_scoreboard_bench_attempts: 3,
-  thrash_ttl_ms: 30 * 60_000,
-  delegate_health_cooldown_ms: 10 * 60_000,
-  delegate_availability_cache_ms: 5 * 60_000,
-  delegate_api_retry_abort_threshold: 3,
-  max_handoff_seed_paths: 3,
-
-  deep_read_min_content_reads: 3,
-  max_grounding_symbols: 8,
-  max_grounding_greps: 16,
-  grounding_grep_head_limit: 3,
-  grounding_block_context_chars: 4_000,
-
-  executor_tool_result_context_chars: 6_000,
-  executor_preflight_result_context_chars: 3_000,
-  write_turn_tool_result_context_chars: 24_000,
-  executor_transcript_budget_tokens: 12_000,
-  write_turn_transcript_budget_tokens: 24_000,
-
-  repetition_similarity_threshold: 0.25,
-
-  default_max_repair_cycles: 2,
-  max_review_repair_rounds_cap: 2,
-  dead_tool_suppress_threshold: 2,
-};
-
-/** Ordered keys and baseline are derived from the single schema source. */
+/** Stable vector layout and baseline are derived from the single schema source. */
 export const THETA_KEYS = Object.keys(THETA_SPEC) as Array<keyof OrchestrationTheta>;
 export const BASELINE_THETA: OrchestrationTheta = Object.fromEntries(
   Object.entries(THETA_SPEC).map(([key, spec]) => [key, spec.baseline]),
@@ -358,6 +235,33 @@ export function migrateLegacyThetaPatch(raw: Record<string, unknown>): Record<st
 }
 
 const thetaAls = new AsyncLocalStorage<OrchestrationTheta>();
+
+export type PolicyArm = "production" | "canary";
+
+export interface PolicyArmContext {
+  arm: PolicyArm;
+  /** Stable policy-version identity; keeps consecutive canaries isolated. */
+  scopeId: string;
+}
+
+const DEFAULT_POLICY_ARM_CONTEXT: Readonly<PolicyArmContext> = Object.freeze({
+  arm: "production",
+  scopeId: "production",
+});
+const policyArmAls = new AsyncLocalStorage<Readonly<PolicyArmContext>>();
+
+/** Logical-turn arm identity used by mutable telemetry and derived routing state. */
+export function activePolicyArmContext(): Readonly<PolicyArmContext> {
+  return policyArmAls.getStore() ?? DEFAULT_POLICY_ARM_CONTEXT;
+}
+
+export function runWithPolicyArmContext<T>(context: PolicyArmContext, fn: () => T): T {
+  const normalized = Object.freeze({
+    arm: context.arm,
+    scopeId: context.scopeId.trim() || `${context.arm}:unknown`,
+  });
+  return policyArmAls.run(normalized, fn);
+}
 
 /** Process-global override (production promote / test install). */
 let globalTheta: OrchestrationTheta = { ...BASELINE_THETA };

@@ -30,6 +30,7 @@ import {
   shouldRecordDelegateWriteOutcome,
   writeEvidenceScore,
 } from "./delegate-model-select";
+import { runWithPolicyArmContext, runWithTheta } from "./orchestration-policy";
 import {
   __resetModelHealthForTests,
   recordModelCall,
@@ -487,6 +488,37 @@ describe("delegate verified-write scoreboard", () => {
     expect(final).toMatchObject({ attempts: 3, verifiedWrites: 0, benched: true });
     expect(getBenchedDelegateModels()).toEqual(["vendor/failing:free"]);
     expect(getDelegateWriteScoreboard("vendor/failing:free")).toEqual(final);
+  });
+
+  test("canary scoreboard and bench thresholds do not mutate production state", () => {
+    const store = new SelfTuningStore(":memory:");
+    __setDelegateWriteScoreboardStoreForTests(store);
+    __resetDelegateWriteScoreboardForTests();
+    recordDelegateWriteOutcome("vendor/candidate:free", false);
+    recordDelegateWriteOutcome("vendor/candidate:free", false);
+    expect(getDelegateWriteScoreboard("vendor/candidate:free")).toMatchObject({
+      attempts: 2,
+      verifiedWrites: 0,
+      benched: false,
+    });
+
+    runWithPolicyArmContext({ arm: "canary", scopeId: "candidate-a" }, () =>
+      runWithTheta({ delegate_write_scoreboard_bench_attempts: 2 }, () => {
+        expect(getDelegateWriteScoreboard("vendor/candidate:free")?.benched).toBe(true);
+        const candidate = recordDelegateWriteOutcome("vendor/candidate:free", false);
+        expect(candidate).toMatchObject({ attempts: 3, verifiedWrites: 0, benched: true });
+      }));
+
+    expect(getDelegateWriteScoreboard("vendor/candidate:free")).toMatchObject({
+      attempts: 2,
+      verifiedWrites: 0,
+      benched: false,
+    });
+    expect(store.getDelegateWriteScoreboardRow("vendor/candidate:free")).toMatchObject({
+      attempts: 2,
+      verified_writes: 0,
+      benched: 0,
+    });
   });
 
   test("unions error-rate benches with write-evidence benches and keeps reasons distinct", () => {
