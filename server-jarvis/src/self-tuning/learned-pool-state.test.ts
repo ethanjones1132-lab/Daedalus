@@ -10,10 +10,16 @@ import {
   modelFeedbackKey,
   modelRoutingScoreDelta,
   resetLearnedPoolStateForTests,
+  runWithPolicyOverlay,
   stageModelFeedbackKey,
   stageRoutingScoreDelta,
 } from "./learned-pool-state";
-import { ThetaValidationError } from "../orchestration/orchestration-policy";
+import {
+  applyThetaPatchGlobally,
+  policy,
+  resetGlobalThetaToBaseline,
+  ThetaValidationError,
+} from "../orchestration/orchestration-policy";
 
 const baseAgent: OrchestratorAgent = {
   id: "test-agent",
@@ -108,7 +114,10 @@ describe("learned-pool-state score deltas", () => {
 });
 
 describe("staged theta activation", () => {
-  beforeEach(() => resetLearnedPoolStateForTests());
+  beforeEach(() => {
+    resetLearnedPoolStateForTests();
+    resetGlobalThetaToBaseline();
+  });
 
   test("rejects invalid theta before mutating learned pool maps", () => {
     const state = getLearnedPoolState();
@@ -124,6 +133,37 @@ describe("staged theta activation", () => {
     })).toThrow(ThetaValidationError);
 
     expect(state.modelRoutingScoreDeltas.get("existing:model")).toBe(0.1);
+    expect(state.modelRoutingScoreDeltas.get("new:model")).toBeUndefined();
+  });
+
+  test("partial canary theta overlays the active policy without resetting it", () => {
+    applyThetaPatchGlobally({ max_directives_per_turn: 42 });
+    const snapshot = {
+      modelRoutingScoreDeltas: {},
+      stageModelRoutingScoreDeltas: {},
+      fallbackBoosts: {},
+      modelFirstTokenTimeouts: {},
+      recovery: {},
+      theta: { routing_timeout_ms: 30_000 },
+    };
+
+    runWithPolicyOverlay(snapshot, () => {
+      expect(policy().routing_timeout_ms).toBe(30_000);
+      expect(policy().max_directives_per_turn).toBe(42);
+    });
+    expect(policy().max_directives_per_turn).toBe(42);
+  });
+
+  test("rejects malformed theta containers before mutating learned pool maps", () => {
+    const state = getLearnedPoolState();
+    expect(() => applyPolicySnapshotToPool({
+      modelRoutingScoreDeltas: { "new:model": 0.2 },
+      stageModelRoutingScoreDeltas: {},
+      fallbackBoosts: {},
+      modelFirstTokenTimeouts: {},
+      recovery: {},
+      theta: [] as unknown as Record<string, number>,
+    })).toThrow(ThetaValidationError);
     expect(state.modelRoutingScoreDeltas.get("new:model")).toBeUndefined();
   });
 });

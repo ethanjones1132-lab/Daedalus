@@ -4,7 +4,10 @@ import {
   applyThetaPatchGlobally,
   BASELINE_THETA,
   mergeTheta,
+  policy,
   runWithTheta,
+  setGlobalTheta,
+  ThetaValidationError,
   type ThetaPatch,
 } from "../orchestration/orchestration-policy";
 
@@ -44,7 +47,7 @@ export interface PolicySnapshot {
    * Phase C: partial θ overlay. When present, merged onto baseline and applied
    * as the active orchestration policy (global on promote; ALS on canary).
    */
-  theta?: Record<string, number>;
+  theta?: unknown;
 }
 
 const globalState: LearnedPoolState = {
@@ -134,6 +137,19 @@ function mergeRecoveryMap(
   }
 }
 
+function thetaRecord(theta: unknown): Record<string, unknown> | undefined {
+  if (theta === undefined) return undefined;
+  if (!theta || typeof theta !== "object" || Array.isArray(theta)) {
+    throw new ThetaValidationError([{
+      key: "theta",
+      value: theta,
+      reason: "unknown",
+      message: "theta must be a non-array object",
+    }]);
+  }
+  return theta as Record<string, unknown>;
+}
+
 /**
  * Merge staged-policy fields from a snapshot into the live pool.
  *
@@ -153,8 +169,9 @@ export function applyPolicySnapshotToPool(
   const prev = options.previous;
   // Validate θ before any learned-pool map can change. Staging/load callers
   // quarantine the resulting ThetaValidationError and preserve production/LKG.
-  const validatedTheta = snapshot.theta && Object.keys(snapshot.theta).length > 0
-    ? mergeTheta(BASELINE_THETA, snapshot.theta as ThetaPatch)
+  const theta = thetaRecord(snapshot.theta);
+  const validatedTheta = theta && Object.keys(theta).length > 0
+    ? mergeTheta(BASELINE_THETA, theta as ThetaPatch)
     : null;
   mergeNumberMap(
     state.modelRoutingScoreDeltas,
@@ -176,6 +193,8 @@ export function applyPolicySnapshotToPool(
   // Phase C: promote/rollback of θ patch onto the process-global active policy.
   if (validatedTheta) {
     applyThetaPatchGlobally(validatedTheta, BASELINE_THETA);
+  } else {
+    setGlobalTheta(BASELINE_THETA);
   }
 }
 
@@ -187,8 +206,9 @@ export function applyPolicySnapshotToPool(
 export function runWithPolicyOverlay<T>(snapshot: PolicySnapshot | null | undefined, fn: () => T): T {
   if (!snapshot) return fn();
   const body = () => policyOverlayAls.run(snapshot, fn);
-  if (snapshot.theta && Object.keys(snapshot.theta).length > 0) {
-    const validatedTheta = mergeTheta(BASELINE_THETA, snapshot.theta as ThetaPatch);
+  const theta = thetaRecord(snapshot.theta);
+  if (theta && Object.keys(theta).length > 0) {
+    const validatedTheta = mergeTheta(policy(), theta as ThetaPatch);
     return runWithTheta(validatedTheta, body);
   }
   return body();

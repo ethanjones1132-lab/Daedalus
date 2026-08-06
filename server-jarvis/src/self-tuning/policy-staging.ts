@@ -83,7 +83,7 @@ export interface PolicyPatch {
   modelFirstTokenTimeouts?: Record<string, number>;
   recovery?: Record<string, number | string | boolean>;
   /** Phase C: partial θ dimensions to stage through canary/LKG. */
-  theta?: Record<string, number>;
+  theta?: unknown;
 }
 
 export interface PolicyVersion {
@@ -215,10 +215,7 @@ export function mergePatchIntoSnapshot(
       ...base.recovery,
       ...(patch.recovery ?? {}),
     },
-    theta: {
-      ...(base.theta ?? {}),
-      ...(patch.theta ?? {}),
-    },
+    theta: mergeThetaSnapshot(base.theta, patch.theta),
   };
 }
 
@@ -239,13 +236,19 @@ function successRate(success: number, failure: number): number {
 }
 
 function patchIsEmpty(patch: PolicyPatch): boolean {
+  const thetaIsEmpty = patch.theta === undefined || (
+    typeof patch.theta === "object" &&
+    patch.theta !== null &&
+    !Array.isArray(patch.theta) &&
+    Object.keys(patch.theta).length === 0
+  );
   return (
     Object.keys(patch.modelRoutingScoreDeltas ?? {}).length === 0 &&
     Object.keys(patch.stageModelRoutingScoreDeltas ?? {}).length === 0 &&
     Object.keys(patch.fallbackBoosts ?? {}).length === 0 &&
     Object.keys(patch.modelFirstTokenTimeouts ?? {}).length === 0 &&
     Object.keys(patch.recovery ?? {}).length === 0 &&
-    Object.keys(patch.theta ?? {}).length === 0
+    thetaIsEmpty
   );
 }
 
@@ -253,14 +256,35 @@ function thetaValidationReason(error: ThetaValidationError): string {
   return `invalid_theta:${error.issues[0]?.key ?? "unknown"}`;
 }
 
+function thetaRecord(theta: unknown): Record<string, unknown> | undefined {
+  if (theta === undefined) return undefined;
+  if (!theta || typeof theta !== "object" || Array.isArray(theta)) {
+    throw new ThetaValidationError([{
+      key: "theta",
+      value: theta,
+      reason: "unknown",
+      message: "theta must be a non-array object",
+    }]);
+  }
+  return theta as Record<string, unknown>;
+}
+
+function mergeThetaSnapshot(baseTheta: unknown, patchTheta: unknown): Record<string, unknown> | undefined {
+  const base = thetaRecord(baseTheta);
+  const patch = thetaRecord(patchTheta);
+  if (!patch) return base;
+  return { ...(base ?? {}), ...patch };
+}
+
 function validateSnapshotTheta(snapshot: PolicySnapshot, migrateLegacy = false): PolicySnapshot {
-  if (!snapshot.theta || Object.keys(snapshot.theta).length === 0) return snapshot;
+  const theta = thetaRecord(snapshot.theta);
+  if (!theta || Object.keys(theta).length === 0) return snapshot;
   const raw = migrateLegacy
-    ? migrateLegacyThetaPatch(snapshot.theta as Record<string, unknown>)
-    : snapshot.theta as Record<string, unknown>;
+    ? migrateLegacyThetaPatch(theta)
+    : theta;
   // Full validation merges historic partial snapshots over today's baseline.
   mergeTheta(BASELINE_THETA, raw as Record<string, number>);
-  return { ...snapshot, theta: raw as Record<string, number> };
+  return { ...snapshot, theta: raw };
 }
 
 // ── Propose ─────────────────────────────────────────────────────────────────
@@ -292,34 +316,33 @@ export function proposePolicy(
     store.production?.snapshot ??
     snapshotStagedPolicyFields(getLearnedPoolState());
   const createdAt = options.now ?? nowIso();
-  const snapshot = mergePatchIntoSnapshot(baseline, patch);
   try {
+    const snapshot = mergePatchIntoSnapshot(baseline, patch);
     validateSnapshotTheta(snapshot);
+    const versionNum = store.nextVersion++;
+    const version: PolicyVersion = {
+      id: `pol_${versionNum}_${crypto.randomUUID().slice(0, 8)}`,
+      version: versionNum,
+      stage: "candidate",
+      domain: patch.domain,
+      snapshot,
+      patch,
+      rationale,
+      createdAt,
+      updatedAt: createdAt,
+      eligibleOutcomes: 0,
+      eligibleSuccessCount: 0,
+      eligibleFailureCount: 0,
+      history: [{ at: createdAt, from: "candidate", to: "candidate", reason: "proposed" }],
+    };
+    store.candidate = version;
+    return { action: "proposed", reason: "held_as_candidate", version, store };
   } catch (error) {
     if (error instanceof ThetaValidationError) {
       return { action: "rejected", reason: thetaValidationReason(error), version: null, store };
     }
     throw error;
   }
-
-  const versionNum = store.nextVersion++;
-  const version: PolicyVersion = {
-    id: `pol_${versionNum}_${crypto.randomUUID().slice(0, 8)}`,
-    version: versionNum,
-    stage: "candidate",
-    domain: patch.domain,
-    snapshot,
-    patch,
-    rationale,
-    createdAt,
-    updatedAt: createdAt,
-    eligibleOutcomes: 0,
-    eligibleSuccessCount: 0,
-    eligibleFailureCount: 0,
-    history: [{ at: createdAt, from: "candidate", to: "candidate", reason: "proposed" }],
-  };
-  store.candidate = version;
-  return { action: "proposed", reason: "held_as_candidate", version, store };
 }
 
 // ── Eligible outcomes → shadow ──────────────────────────────────────────────

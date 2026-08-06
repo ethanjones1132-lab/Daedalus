@@ -28,6 +28,10 @@ import {
   type PolicyPatch,
 } from "./policy-staging";
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
+import {
+  policy,
+  resetGlobalThetaToBaseline,
+} from "../orchestration/orchestration-policy";
 
 const routingPatch: PolicyPatch = {
   domain: "routing",
@@ -98,6 +102,17 @@ describe("propose → eligible → shadow → canary → promote", () => {
     expect(result.action).toBe("rejected");
     expect(result.reason).toContain("invalid_theta:routing_timeout_ms");
     expect(getPolicyVersionStore().candidate).toBeNull();
+  });
+
+  test("policy staging rejects malformed theta containers", () => {
+    for (const theta of [null, [], "not-an-object"]) {
+      const result = proposePolicy(
+        { domain: "budget", theta: theta as unknown as Record<string, number> },
+        "malformed theta",
+      );
+      expect(result.action).toBe("rejected");
+      expect(result.reason).toBe("invalid_theta:theta");
+    }
   });
 
   test("holds candidate until 20 eligible outcomes then enters shadow", () => {
@@ -330,6 +345,22 @@ describe("restart survival", () => {
     expect(getPolicyVersionStore().candidate).toBeNull();
   });
 
+  test("load quarantines malformed persisted theta containers", () => {
+    expect(proposePolicy(
+      { domain: "budget", theta: { routing_timeout_ms: 25_000 } },
+      "persisted theta",
+    ).action).toBe("proposed");
+    persistPolicyVersions(root);
+    const path = policyVersionsPath(root);
+    const malformed = JSON.parse(readFileSync(path, "utf-8"));
+    malformed.candidate.snapshot.theta = [];
+    writeFileSync(path, JSON.stringify(malformed), "utf-8");
+
+    resetPolicyStagingForTests();
+    loadPolicyVersions(root);
+    expect(getPolicyVersionStore().candidate).toBeNull();
+  });
+
   test("canary in-flight survives restart with rollback still available", () => {
     advanceToCanary(1.0);
     for (let i = 0; i < 7; i++) {
@@ -387,6 +418,7 @@ describe("merge apply + live shadow progress + canary overlay", () => {
   beforeEach(() => {
     resetPolicyStagingForTests();
     resetLearnedPoolStateForTests();
+    resetGlobalThetaToBaseline();
   });
 
   test("applyPolicySnapshotToPool merges keys and preserves concurrent learning", () => {
@@ -448,6 +480,28 @@ describe("merge apply + live shadow progress + canary overlay", () => {
     expect(
       getLearnedPoolState().modelRoutingScoreDeltas.get("openrouter:ops-feedback"),
     ).toBe(0.03);
+  });
+
+  test("rollback from promoted theta to a no-theta LKG restores baseline theta", () => {
+    expect(proposePolicy(
+      { domain: "budget", theta: { routing_timeout_ms: 30_000 } },
+      "raise routing timeout",
+    ).action).toBe("proposed");
+    for (let i = 0; i < POLICY_STAGING_GOVERNANCE.minEligibleOutcomesBeforeShadow; i++) {
+      recordEligibleOutcome("success");
+    }
+    runShadowReplay(Array.from(
+      { length: POLICY_STAGING_GOVERNANCE.minEligibleOutcomesBeforeShadow },
+      () => ({ success: true }),
+    ));
+    for (let i = 0; i < POLICY_STAGING_GOVERNANCE.minCanaryRunsBeforePromotion; i++) {
+      recordCanaryOutcome("canary", true);
+      recordCanaryOutcome("production", true);
+    }
+    expect(policy().routing_timeout_ms).toBe(30_000);
+
+    expect(rollbackPolicy("restore_legacy_lkg").action).toBe("rolled_back");
+    expect(policy().routing_timeout_ms).toBe(20_000);
   });
 
   test("live shadow outcomes auto-complete shadow without offline replay job", () => {
