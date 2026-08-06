@@ -49,7 +49,9 @@ def run_test(directory, source):
 
 def seed(directory, task):
     for name, content in task["files"].items():
-        (directory / name).write_text(content, encoding="utf-8")
+        path = directory / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
     # Pre-seed the test file (will be overwritten by run_test before scoring for integrity)
     (directory / "_t.py").write_text(task["test"], encoding="utf-8")
 
