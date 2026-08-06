@@ -47,6 +47,7 @@ import {
   SEMANTIC_PRESSURE_SUPPRESSED,
 } from "./executor-progress-policy";
 import { DirectiveBudget } from "./directive-budget";
+import type { WriteEffectObservation } from "./content-fingerprint";
 import { selectHandoffSeedPaths } from "./delegate-handoff-seed";
 import {
   normalizeRemainingStages,
@@ -350,6 +351,12 @@ export interface PipelineExecuteOptions {
    * cannot re-inject after a reroute.
    */
   semanticPressureBudget?: SemanticPressureBudget;
+  /**
+   * Run-level total supervision directive budget (Task 8 / mid_loop_continue).
+   * Seeded once in executeSegment so concurrent planner‖executor, normal
+   * dispatch, and high-complexity retry share one ceiling — not 3×.
+   */
+  directiveBudget?: DirectiveBudget;
 }
 
 // Derived from the capability taxonomy. READ_CACHE_TOOLS is `cacheable`
@@ -822,6 +829,12 @@ export interface PipelineResult {
   reviewerAccepted?: boolean;
   /** T2.5: recursive critique asked for conductor replan. */
   replanRequested?: PipelineSegmentResult["replanRequested"];
+  /**
+   * Content-fingerprint observations for the whole logical turn (shared across
+   * replan segments). When present and non-empty, live reward uses real
+   * before/after diffs instead of the tool-call-success fallback.
+   */
+  writeEffects?: WriteEffectObservation[];
 }
 
 /**
@@ -856,6 +869,8 @@ export interface PipelineSegmentResult {
   checkResult?: CheckResult;
   /** True when the reviewer stage accepted (feeds synth-tier reward floor). */
   reviewerAccepted?: boolean;
+  /** Full-turn write-effect observations (not reset per segment). */
+  writeEffects?: WriteEffectObservation[];
 }
 
 /**
@@ -1809,11 +1824,14 @@ export class PipelineExecutor {
         { role: "system", content: plannerPrompt },
         { role: "user", content: plannerUserContent },
       ] as ChatMessage[];
+      // One stage_run id for this planner attempt — shared with model attributions.
+      const stageRunId = `stage_${crypto.randomUUID()}`;
       const plannerOptions = {
         temperature: BUILTIN_MODES.planner.temperature,
         max_tokens: BUILTIN_MODES.planner.max_tokens,
         stream: true,
         stageLabel: "planner",
+        stageRunId,
         complexity: options.estimatedComplexity,
         advanceOnEmpty: true,
         suppressActivity: true,
@@ -1839,7 +1857,7 @@ export class PipelineExecutor {
         // re-enter:planner directive would create a third planner attempt and
         // consume reroute accounting instead of degrading to executor-without-plan.
         this.collector.recordStageRun({
-          id: `stage_${crypto.randomUUID()}`,
+          id: stageRunId,
           agent_run_id: agentRunId,
           mode_id: "planner",
           turn_number: 1,
@@ -1865,7 +1883,7 @@ export class PipelineExecutor {
       );
 
       this.collector.recordStageRun({
-        id: `stage_${crypto.randomUUID()}`,
+        id: stageRunId,
         agent_run_id: agentRunId,
         mode_id: "planner",
         turn_number: 1,
@@ -1948,7 +1966,14 @@ export class PipelineExecutor {
     }
     // Per-turn total supervision cap — bounds the sum of mid-loop directives
     // so a spin cannot relocate across uncapped reflexes (Task 8).
-    const directiveBudget = new DirectiveBudget();
+    // Must share one budget across every runExecutorStage call in the segment
+    // (concurrent planner‖executor, normal dispatch, high-complexity retry);
+    // a fresh instance per call multiplies the ceiling by call-site count
+    // (live 2026-08-05: 73 directives ≈ 3 × 24).
+    const directiveBudget = options.directiveBudget ?? new DirectiveBudget();
+    if (!options.directiveBudget) {
+      options.directiveBudget = directiveBudget;
+    }
     let directiveBudgetExhaustionRecorded = false;
     let workspaceEvidenceNudgeCount = 0;
     let evidenceCountAtLastNudge = 0;
@@ -3419,6 +3444,8 @@ export class PipelineExecutor {
           }
           // Exact input token count after compaction + eviction.
           const inputTokens = transcriptBudget.inputTokens;
+          // Per executor model-turn: one stage_run id shared with attribution.
+          const stageRunId = `stage_${crypto.randomUUID()}`;
           response = await this.callModel(executorMessages, {
             temperature: BUILTIN_MODES.executor.temperature,
             // Write turns may emit a whole-file write_file payload; the 4096
@@ -3427,6 +3454,7 @@ export class PipelineExecutor {
             tools: getToolsForMode("executor", this.runtime.listTools(), profile),
             stream: true,
             stageLabel: "executor",
+            stageRunId,
             complexity: options.estimatedComplexity,
             preferStrongModel: preferStrongNextTurn,
             excludeModels: inLoopModelExclusions.length > 0 ? inLoopModelExclusions : options.modelExclusions,
@@ -4038,7 +4066,7 @@ export class PipelineExecutor {
               }
               : undefined;
           this.collector.recordStageRun({
-            id: `stage_${crypto.randomUUID()}`,
+            id: stageRunId,
             agent_run_id: agentRunId,
             mode_id: "executor",
             turn_number: executorTurn,
@@ -4382,12 +4410,14 @@ export class PipelineExecutor {
             });
           }
           const inputTokens = transcriptBudget.inputTokens;
+          const stageRunId = `stage_${crypto.randomUUID()}`;
           rewriteResp = await this.callModel(rewriterMessages, {
             temperature: BUILTIN_MODES.rewriter.temperature,
             max_tokens: rewriterWriteTurn ? 8192 : BUILTIN_MODES.rewriter.max_tokens,
             tools: getToolsForMode("rewriter", this.runtime.listTools(), profile),
             stream: true,
             stageLabel: "rewriter",
+            stageRunId,
             complexity: options.estimatedComplexity,
             advanceOnEmpty: true,
             stageAbort: this.registerStageAbort("rewriter"),
@@ -4403,7 +4433,7 @@ export class PipelineExecutor {
             onStateChange({ stage: "rewriter", status: "failed", output: errorMessage });
             await this.afterConductorStage("rewriter", "failed", errorMessage, agentRunId, options, []);
             this.collector.recordStageRun({
-              id: `stage_${crypto.randomUUID()}`,
+              id: stageRunId,
               agent_run_id: agentRunId,
               mode_id: "rewriter",
               turn_number: rewriterTurn,
@@ -4467,7 +4497,7 @@ export class PipelineExecutor {
 
           const turnToolErrors = toolCalls.slice(turnStartIdx).filter((call) => call.is_error);
           this.collector.recordStageRun({
-            id: `stage_${crypto.randomUUID()}`,
+            id: stageRunId,
             agent_run_id: agentRunId,
             mode_id: "rewriter",
             turn_number: rewriterTurn,
@@ -4698,11 +4728,13 @@ export class PipelineExecutor {
             content: `User Request: ${boundedRequest}\n\nOriginal Plan:\n${boundedPlanSummary}\n\nExecutor Activity:\n${boundedExecutorSummary}\n\nRewriter Activity:\n${truncateToTokenBudget(rewriterSummaryForPrompt, 1_000)}\n\nDeterministic verification evidence:\n${deterministicGateFeedback || "Syntax and run gates produced no deterministic failures."}`
           }
         ] as ChatMessage[];
+        const stageRunId = `stage_${crypto.randomUUID()}`;
         const reviewerOptions = {
           temperature: BUILTIN_MODES.reviewer.temperature,
           max_tokens: BUILTIN_MODES.reviewer.max_tokens,
           stream: true,
           stageLabel: "reviewer" as const,
+          stageRunId,
           complexity: options.estimatedComplexity,
           advanceOnEmpty: true,
           suppressActivity: true,
@@ -4728,7 +4760,7 @@ export class PipelineExecutor {
           onStateChange({ stage: "reviewer", status: "failed", output: errorMessage });
           await this.afterConductorStage("reviewer", "failed", errorMessage, agentRunId, options, []);
           this.collector.recordStageRun({
-            id: `stage_${crypto.randomUUID()}`,
+            id: stageRunId,
             agent_run_id: agentRunId,
             mode_id: "reviewer",
             turn_number: reviewCount,
@@ -4750,7 +4782,7 @@ export class PipelineExecutor {
         onStateChange({ stage: "reviewer", status: "completed", output: reviewerFeedback });
 
         this.collector.recordStageRun({
-          id: `stage_${crypto.randomUUID()}`,
+          id: stageRunId,
           agent_run_id: agentRunId,
           mode_id: "reviewer",
           turn_number: reviewCount,
@@ -4926,6 +4958,7 @@ export class PipelineExecutor {
     const contextText = buildSynthesizerContextFromStageState(request, state, executionVerification);
     let streamedAnswer = "";
     try {
+      const stageRunId = `stage_${crypto.randomUUID()}`;
       const resp = await this.callModel([
         { role: "system", content: synthesizerPrompt },
         { role: "user", content: contextText }
@@ -4934,6 +4967,7 @@ export class PipelineExecutor {
         max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
         stream: true,
         stageLabel: "synthesizer",
+        stageRunId,
         complexity: options.estimatedComplexity,
         cascadeTier: options.preferFastSynthesizer ? "cheap" : undefined,
         surfaceAsAnswer: true,
@@ -4964,7 +4998,7 @@ export class PipelineExecutor {
       if (!finalAnswer.trim()) {
         onStateChange({ stage: "synthesizer", status: "failed", output: "(empty completion)" });
         this.collector.recordStageRun({
-          id: `stage_${crypto.randomUUID()}`,
+          id: stageRunId,
           agent_run_id: agentRunId,
           mode_id: "synthesizer",
           turn_number: 1,
@@ -4999,9 +5033,9 @@ export class PipelineExecutor {
         const graceLeftMs = options.turnBudget
           ? Math.max(0, options.turnBudget.finalStreamDeadlineAt() - Date.now())
           : 30_000;
-        // Always record the first (capped) attempt.
+        // Always record the first (capped) attempt — same id as the model call.
         this.collector.recordStageRun({
-          id: `stage_${crypto.randomUUID()}`,
+          id: stageRunId,
           agent_run_id: agentRunId,
           mode_id: "synthesizer",
           turn_number: 1,
@@ -5023,6 +5057,7 @@ export class PipelineExecutor {
         try {
           const continuationStartTime = Date.now();
           const continuationNudge = "Continue exactly where you stopped. Do not repeat prior text.";
+          const contStageRunId = `stage_${crypto.randomUUID()}`;
           const contResp = await this.callModel([
             { role: "system", content: synthesizerPrompt },
             { role: "user", content: contextText },
@@ -5033,6 +5068,7 @@ export class PipelineExecutor {
             max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
             stream: true,
             stageLabel: "synthesizer",
+            stageRunId: contStageRunId,
             complexity: options.estimatedComplexity,
             cascadeTier: options.preferFastSynthesizer ? "cheap" : undefined,
             surfaceAsAnswer: true,
@@ -5054,7 +5090,7 @@ export class PipelineExecutor {
           const contStop = typeof contResp._stopReason === "string" ? contResp._stopReason : null;
           const contLength = contTruncated && (contStop === "length" || contResp._finishReason === "length");
           this.collector.recordStageRun({
-            id: `stage_${crypto.randomUUID()}`,
+            id: contStageRunId,
             agent_run_id: agentRunId,
             mode_id: "synthesizer",
             turn_number: 2,
@@ -5098,7 +5134,7 @@ export class PipelineExecutor {
         onStateChange({ stage: "synthesizer", status: "completed", output: finalAnswer });
         await this.afterConductorStage("synthesizer", "completed", finalAnswer, agentRunId, options, remainingQueue);
         this.collector.recordStageRun({
-          id: `stage_${crypto.randomUUID()}`,
+          id: stageRunId,
           agent_run_id: agentRunId,
           mode_id: "synthesizer",
           turn_number: 1,
@@ -5117,6 +5153,7 @@ export class PipelineExecutor {
       // T1.5: deferral-stall detection + one corrective retry.
       let answerToShip = finalAnswer;
       let deferralRetried = false;
+      let terminalStageRunId = stageRunId;
       if (detectDeferralStall(finalAnswer)) {
         const remainingMs = typeof (options as { turnBudgetRemainingMs?: () => number }).turnBudgetRemainingMs === "function"
           ? (options as { turnBudgetRemainingMs: () => number }).turnBudgetRemainingMs()
@@ -5125,6 +5162,8 @@ export class PipelineExecutor {
           deferralRetried = true;
           console.warn(`[Pipeline] synthesizer deferral stall detected — one corrective retry`);
           try {
+            const deferralStageRunId = `stage_${crypto.randomUUID()}`;
+            terminalStageRunId = deferralStageRunId;
             const retryResp = await this.callModel([
               { role: "system", content: `${synthesizerPrompt}\n\n${DEFERRAL_STALL_NUDGE}` },
               { role: "user", content: contextText },
@@ -5135,6 +5174,7 @@ export class PipelineExecutor {
               max_tokens: BUILTIN_MODES.synthesizer.max_tokens,
               stream: true,
               stageLabel: "synthesizer",
+              stageRunId: deferralStageRunId,
               complexity: options.estimatedComplexity,
               cascadeTier: options.preferFastSynthesizer ? "cheap" : undefined,
               surfaceAsAnswer: true,
@@ -5150,7 +5190,7 @@ export class PipelineExecutor {
               answerToShip = retryAnswer;
             } else if (detectDeferralStall(retryAnswer) || !retryAnswer.trim()) {
               this.collector.recordStageRun({
-                id: `stage_${crypto.randomUUID()}`,
+                id: deferralStageRunId,
                 agent_run_id: agentRunId,
                 mode_id: "synthesizer",
                 turn_number: 2,
@@ -5172,7 +5212,7 @@ export class PipelineExecutor {
       onStateChange({ stage: "synthesizer", status: "completed", output: answerToShip });
       await this.afterConductorStage("synthesizer", "completed", answerToShip, agentRunId, options, remainingQueue);
       this.collector.recordStageRun({
-        id: `stage_${crypto.randomUUID()}`,
+        id: terminalStageRunId,
         agent_run_id: agentRunId,
         mode_id: "synthesizer",
         turn_number: deferralRetried ? 2 : 1,
@@ -5351,6 +5391,11 @@ export class PipelineExecutor {
     if (!options.semanticPressureBudget) {
       options.semanticPressureBudget = new SemanticPressureBudget();
     }
+    // Same one-time seed for the total directive ceiling — must run before
+    // any runExecutorStage call site (including those that spread-copy opts).
+    if (!options.directiveBudget) {
+      options.directiveBudget = new DirectiveBudget();
+    }
     const state: PipelineStageState = { ...carry };
     const profile: ExecutionProfile = options.executionProfile ?? "full";
     const intentText = options.rawMessage ?? request;
@@ -5373,11 +5418,13 @@ export class PipelineExecutor {
     // Attach verification side-channels on every exit so replan-loop's
     // finalizeSegment can thread them into PipelineResult (reward/provenance).
     const finish = (
-      segment: Omit<PipelineSegmentResult, "checkResult" | "reviewerAccepted">,
+      segment: Omit<PipelineSegmentResult, "checkResult" | "reviewerAccepted" | "writeEffects">,
     ): PipelineSegmentResult => ({
       ...segment,
       checkResult: this.lastCheckResult,
       reviewerAccepted: this.lastReviewerAccepted,
+      // Full-turn accumulation — executeSegment never resets write_effects.
+      writeEffects: this.ctx.write_effects,
     });
     const clearAcceptanceUnmetPartial = () => {
       if (partialStage?.errorCode === "plan_item_acceptance_unmet") {
@@ -6147,6 +6194,7 @@ export class PipelineExecutor {
           toolCalls: state.executor?.toolCalls,
           checkResult: this.lastCheckResult,
           reviewerAccepted: this.lastReviewerAccepted,
+          writeEffects: this.ctx.write_effects,
         };
       }
     }
@@ -6169,6 +6217,7 @@ export class PipelineExecutor {
           toolCalls: state.executor?.toolCalls,
           checkResult: this.lastCheckResult,
           reviewerAccepted: this.lastReviewerAccepted,
+          writeEffects: this.ctx.write_effects,
         };
       }
       const gated = applyEffectGate(
@@ -6205,6 +6254,7 @@ export class PipelineExecutor {
         toolCalls: state.executor?.toolCalls,
         checkResult: this.lastCheckResult,
         reviewerAccepted: this.lastReviewerAccepted,
+        writeEffects: this.ctx.write_effects,
       };
     }
 
@@ -6267,6 +6317,7 @@ export class PipelineExecutor {
       toolCalls: state.executor?.toolCalls,
       checkResult: this.lastCheckResult,
       reviewerAccepted: this.lastReviewerAccepted,
+      writeEffects: this.ctx.write_effects,
     };
     if (!segment.synthesizerFatalError && !segment.synthesizerEmptyCompletion && pipeline.includes("synthesizer")) {
       return this.applyRecursiveCritique(request, result, agentRunId, onStateChange, options);

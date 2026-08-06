@@ -187,6 +187,43 @@ describe("Conductor learning (Phase 4)", () => {
     expect(adjusted[0].capabilities.code).toBeGreaterThan(sampleAgent.capabilities.code);
   });
 
+  test("recordStageModel joins attributions to stage_runs via stageRunId", () => {
+    const store = new SelfTuningStore(TEST_DB);
+    const loop = new ConductorLearningLoop(store);
+    store.insertAgentRun({
+      id: "run_join",
+      session_id: "sess_join",
+      user_request: "review",
+      task_type: "code_review",
+      pipeline: JSON.stringify(["reviewer"]),
+      completed: 0,
+    });
+    const stageRunId = "stage_join_reviewer_1";
+    store.insertStageRun({
+      id: stageRunId,
+      agent_run_id: "run_join",
+      mode_id: "reviewer",
+      turn_number: 1,
+      tool_calls_json: "[]",
+      was_successful: 1,
+      had_error: 0,
+    });
+    loop.recordStageModel({
+      agentRunId: "run_join",
+      stageId: "reviewer",
+      stageRunId,
+      provider: "opencode_zen",
+      modelId: "mimo-v2.5-free",
+      durationMs: 1_200,
+      wasSuccessful: true,
+    });
+    const attrs = store.getModelAttributions("run_join");
+    expect(attrs).toHaveLength(1);
+    expect(attrs[0]!.stage_run_id).toBe(stageRunId);
+    const stages = store.getStageRuns("run_join");
+    expect(stages.some((s) => s.id === attrs[0]!.stage_run_id)).toBe(true);
+  });
+
   test("F10: recordStageModel persists first_token_ms and never rewards empty success", () => {
     const store = new SelfTuningStore(TEST_DB);
     const loop = new ConductorLearningLoop(store);

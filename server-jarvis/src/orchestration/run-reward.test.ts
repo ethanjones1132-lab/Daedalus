@@ -34,7 +34,7 @@ describe("computeRunReward B1 composition", () => {
 
     const baseline = computeRunReward(input);
     const underCandidate = runWithTheta(
-      { force_write_nudge_cap: 99, policy_canary_traffic_fraction: 1 },
+      { force_write_nudge_cap: 99 },
       () => computeRunReward(input),
     );
 
@@ -226,6 +226,31 @@ describe("offline stored snapshot", () => {
 });
 
 describe("helpers", () => {
+  test("no-op content effect does not earn write credit even if tool call succeeded", () => {
+    // CMA-ES exploit surface: a tool call that returns ok but changed:false
+    // must not fill changedPaths (writeEvidenceFromEffects filters on changed).
+    const snap = buildStoredRunRewardSnapshot({
+      writeRequired: true,
+      effects: [effect("src/noop.ts", false)],
+      toolCalls: [
+        { name: "edit_file", is_error: false, arguments: { path: "src/noop.ts" } },
+      ],
+      check: { tier: "none", ran: false, passed: false },
+      declaredOutcome: "success",
+    });
+    expect(snap.changedPaths).toEqual([]);
+    // Same tool call without effects would have credited the write.
+    const toolOnly = buildStoredRunRewardSnapshot({
+      writeRequired: true,
+      toolCalls: [
+        { name: "edit_file", is_error: false, arguments: { path: "src/noop.ts" } },
+      ],
+      check: { tier: "none", ran: false, passed: false },
+      declaredOutcome: "success",
+    });
+    expect(toolOnly.changedPaths).toEqual(["src/noop.ts"]);
+  });
+
   test("writeEvidenceFromEffects / toolCalls", () => {
     expect(
       writeEvidenceFromEffects([effect("a.ts", true), effect("b.ts", false)], {

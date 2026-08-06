@@ -125,6 +125,8 @@ export class ConductorLearningLoop {
   recordStageModel(args: {
     agentRunId: string;
     stageId: string;
+    /** Joins this attribution to the exact stage_runs row for the same turn. */
+    stageRunId?: string;
     agentId?: string;
     provider: string;
     modelId: string;
@@ -142,6 +144,7 @@ export class ConductorLearningLoop {
       id: `attr_${crypto.randomUUID()}`,
       agent_run_id: args.agentRunId,
       stage_id: args.stageId,
+      stage_run_id: args.stageRunId ?? null,
       agent_id: args.agentId,
       provider: args.provider,
       model_id: args.modelId,

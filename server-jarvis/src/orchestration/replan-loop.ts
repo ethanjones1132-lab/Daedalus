@@ -313,6 +313,7 @@ function finalizeSegment(segment: PipelineSegmentResult, sessionCapHit: boolean)
   const checkFields = {
     checkResult: segment.checkResult,
     reviewerAccepted: segment.reviewerAccepted,
+    writeEffects: segment.writeEffects,
   };
 
   if (segment.state.executor?.terminalStatus === "cancelled") {

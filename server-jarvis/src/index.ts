@@ -2705,6 +2705,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             conductorLearning.recordStageModel({
               agentRunId: orchestratorAgentRunId,
               stageId: stageLabel,
+              stageRunId: typeof callOptions?.stageRunId === "string" ? callOptions.stageRunId : undefined,
               agentId: poolResolvedAgent?.id,
               provider: actualProviderUsed,
               modelId: actualModelUsed,
@@ -3197,8 +3198,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         });
         if (!shortCircuit) {
           const coordinatorSucceeded = !route.routing_parse_fallback;
+          // Generate stage-run id before attribution so both rows join.
+          const coordinatorStageRunId = `stage_${crypto.randomUUID()}`;
           outcomeCollector.recordStageRun({
-            id: `stage_${crypto.randomUUID()}`,
+            id: coordinatorStageRunId,
             agent_run_id: agentRunId,
             mode_id: "coordinator",
             turn_number: 1,
@@ -3213,6 +3216,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             conductorLearning.recordStageModel({
               agentRunId,
               stageId: "coordinator",
+              stageRunId: coordinatorStageRunId,
               provider: orchLastProvider,
               modelId: orchLastModel,
               durationMs: coordinatorDurationMs,
@@ -3621,6 +3625,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         });
         const runRewardSnapshot = buildStoredRunRewardSnapshot({
           writeRequired: writeRequiredForReward,
+          // Prefer real content-fingerprint diffs when the pipeline threaded
+          // write_effects; fall back to tool-call success only when empty.
+          effects: result.writeEffects ?? [],
           toolCalls: result.toolCalls ?? [],
           targetPaths: rewardTargetPaths,
           check: result.checkResult
@@ -5105,27 +5112,18 @@ export async function baseFetch(req: Request): Promise<Response> {
       return Response.json({ ok: true, name: "Jarvis", version: JARVIS_VERSION });
     }
     if (path === "/health") {
+      // LIVENESS ONLY. The Rust supervisor / ensure_jarvis_server_started probe
+      // has a 2s budget. Prior code awaited resolveOllamaChatTarget (up to 4×3s)
+      // and describeHealth (isAvailable + isWarm 2.5s) on every probe. Under load
+      // those awaits exceeded the budget → probe failed → ensure killed and
+      // respawned the Bun process mid-turn → competing spawns logged EADDRINUSE
+      // and left :19877 in a ghost LISTEN state (live 2026-08-05/06 session logs).
+      // Deep diagnostics live on /health/inference and /health/conductor-*.
       const hcfg = loadConfig();
-      let model = hcfg.active_backend === "openrouter" ? hcfg.openrouter.model : hcfg.ollama.model;
-      let configured_model: string | undefined;
-      if (hcfg.active_backend === "ollama") {
-        configured_model = hcfg.ollama.model;
-        try {
-          model = (await resolveOllamaChatTarget(hcfg)).modelName;
-        } catch {
-          model = hcfg.ollama.model;
-        }
-      }
-      let conductor_health: Awaited<ReturnType<typeof persistentConductor.describeHealth>> | undefined;
-      try {
-        // Task 8: wire TaskPlan ledger (most recent active session task),
-        // Claude-CLI delegate backend, and policy staging into conductor health.
-        const activeTask = sessionMemory.getMostRecentActiveTaskRun();
-        conductor_health = await persistentConductor.describeHealth({
-          taskRun: activeTask?.taskRun,
-          sessionId: activeTask?.sessionId,
-        });
-      } catch { /* leave undefined */ }
+      const model =
+        hcfg.active_backend === "openrouter" ? hcfg.openrouter.model : hcfg.ollama.model;
+      const configured_model =
+        hcfg.active_backend === "ollama" ? hcfg.ollama.model : undefined;
       return Response.json({
         ok: true,
         uptime: process.uptime(),
@@ -5133,13 +5131,13 @@ export async function baseFetch(req: Request): Promise<Response> {
         backend: hcfg.active_backend,
         model,
         configured_model,
-        model_resolved: configured_model ? equivalentOllamaModelName(model, configured_model) : true,
+        // Configured model is reported as-is; live Ollama resolution is not a
+        // liveness concern and must not block this endpoint.
+        model_resolved: true,
         git_sha: JARVIS_GIT_SHA,
         built_at: JARVIS_BUILT_AT,
         git_dirty: JARVIS_GIT_DIRTY,
         source_tree_sha256: JARVIS_SOURCE_TREE_SHA256,
-        // T1.7: local PersistentConductor health (enabled/available/model).
-        conductor: conductor_health,
       });
     }
     if (path === "/health/inference") {

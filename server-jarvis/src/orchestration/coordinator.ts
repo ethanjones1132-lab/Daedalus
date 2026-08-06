@@ -52,6 +52,12 @@ export type CallModelFn = (
     suppressActivity?: boolean;
     /** Optional stage-local cancellation. It must not abort the whole turn. */
     stageAbort?: AbortSignal;
+    /**
+     * Pre-generated stage_runs.id for this model call. Generated before the
+     * call so recordStageModel can join attributions to the exact stage row
+     * (recordStageRun happens after the call and cannot invent the id first).
+     */
+    stageRunId?: string;
   }
 ) => Promise<{
   content: string;
