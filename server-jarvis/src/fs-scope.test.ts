@@ -127,6 +127,55 @@ describe("fs-scope", () => {
     expect(safePath(`${basename(root)}/missing.md`, config(root))).toBe(resolve(root, basename(root), "missing.md"));
   });
 
+  // Regression: 2026-08-07 overnight local-model eval — 5+ different models
+  // (qwen3.5:4b, qwen3.5-9b-heretic, ornith-1.0-9b, bartowski's stock
+  // Llama-3.1-8B, qwythos9b-conductor) repeatedly hallucinated a literal
+  // "workspace" path segment that doesn't exist in the fixture — most often
+  // as an absolute /workspace/... path, sometimes doubled
+  // (/workspace/workspace/...). The existing basename-dedup above only
+  // strips a segment matching the root's OWN (random) directory name; it
+  // never fires for this because fixture temp dirs aren't named "workspace".
+  // Several otherwise-correct fixes were lost entirely to this: the model
+  // landed the right diagnosis, then burned its whole remaining turn budget
+  // re-verifying via a path that only ever resolves to a dead end.
+  test("safePath strips a hallucinated 'workspace' segment on a relative path", () => {
+    const root = tempRoot("hallucinated-relative");
+    writeFileSync(join(root, "rules.py"), "ok");
+    expect(safePath("workspace/rules.py", config(root))).toBe(resolve(root, "rules.py"));
+  });
+
+  test("safePath strips a hallucinated leading '/workspace/' segment on an absolute path", () => {
+    const root = tempRoot("hallucinated-absolute");
+    writeFileSync(join(root, "rules.py"), "ok");
+    expect(safePath("/workspace/rules.py", config(root))).toBe(resolve(root, "rules.py"));
+  });
+
+  test("safePath strips a doubled 'workspace/workspace/' prefix", () => {
+    const root = tempRoot("hallucinated-doubled");
+    writeFileSync(join(root, "config_store.py"), "ok");
+    expect(safePath("/workspace/workspace/config_store.py", config(root)))
+      .toBe(resolve(root, "config_store.py"));
+  });
+
+  test("safePath matches the 'workspace' placeholder case-insensitively", () => {
+    const root = tempRoot("hallucinated-case");
+    writeFileSync(join(root, "calc.py"), "ok");
+    expect(safePath("Workspace/calc.py", config(root))).toBe(resolve(root, "calc.py"));
+  });
+
+  test("safePath still resolves a genuine workspace/ subdirectory honestly, not via stripping", () => {
+    const root = tempRoot("real-workspace-dir");
+    mkdirSync(join(root, "workspace"));
+    writeFileSync(join(root, "workspace", "real.py"), "ok");
+    expect(safePath("workspace/real.py", config(root))).toBe(resolve(root, "workspace", "real.py"));
+  });
+
+  test("safePath still throws when stripping the placeholder does not lead to a real file", () => {
+    const root = tempRoot("hallucinated-still-missing");
+    expect(() => safePath("/workspace/does-not-exist.py", config(root)))
+      .toThrow(/outside the workspace/);
+  });
+
   test("root basename comparison is case-sensitive on POSIX and case-insensitive on Windows", () => {
     expect(pathSegmentsEqual("Project", "project", "linux")).toBe(false);
     expect(pathSegmentsEqual("Project", "project", "darwin")).toBe(false);

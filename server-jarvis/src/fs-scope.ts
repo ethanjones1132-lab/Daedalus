@@ -122,6 +122,51 @@ function isContained(root: string, candidate: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel) && !/^[a-zA-Z]:/.test(rel));
 }
 
+/**
+ * Leading path segments models hallucinate as if the sandbox root were
+ * literally named this. Evidence: 2026-08-07 overnight local-model eval —
+ * 5+ different local models repeatedly emitted a "workspace/" (or absolute
+ * "/workspace/...") prefix that matches nothing in the actual fixture,
+ * sometimes doubled ("/workspace/workspace/..."). Several otherwise-correct
+ * fixes were lost entirely to this: the model landed the right diagnosis,
+ * then burned its whole remaining turn budget re-verifying via a path that
+ * only ever resolves to a dead end, never reaching the reviewer stage.
+ *
+ * Matching is case-insensitive regardless of platform — this is a
+ * conceptual placeholder word a model typed, not a real filesystem entry,
+ * so OS case semantics don't apply to it. Only ever consulted as a fallback
+ * after the literal path has already failed to resolve (see call sites), so
+ * a real directory actually named "workspace" is never shadowed: direct
+ * resolution finds it first, exactly as the existing basename-dedup above
+ * already does for a root's own name.
+ */
+const HALLUCINATED_ROOT_SEGMENTS = new Set(["workspace"]);
+
+/** Strip zero or more leading hallucinated placeholder segments. */
+function stripHallucinatedRootSegments(segments: readonly string[]): string[] {
+  let start = 0;
+  while (start < segments.length - 1 && HALLUCINATED_ROOT_SEGMENTS.has(segments[start].toLowerCase())) {
+    start++;
+  }
+  return segments.slice(start);
+}
+
+/** Try each root with hallucinated placeholder segments stripped; null if none resolve. */
+function resolveHallucinatedRootPath(
+  segments: readonly string[],
+  roots: readonly string[],
+  forWrite: boolean,
+): string | null {
+  const stripped = stripHallucinatedRootSegments(segments);
+  if (stripped.length === 0 || stripped.length === segments.length) return null;
+  for (const root of roots) {
+    const candidate = resolve(root, ...stripped);
+    if (!isContained(root, candidate)) continue;
+    if (forWrite ? existingDirectory(dirname(candidate)) : existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
 function outsideError(inputPath: string, cfg: JarvisConfig, roots: string[]): Error {
   return new Error(
     `Path "${inputPath}" is outside the workspace. Sandbox mode: ${cfg.tools.sandbox_mode}. ` +
@@ -162,6 +207,12 @@ export function safePath(
   if (inputIsAbsolute) {
     const candidate = resolve(normalizedInput);
     if (roots.some((root) => isContained(root, candidate))) return candidate;
+    const hallucinated = resolveHallucinatedRootPath(
+      normalizedInput.split(/[\\/]+/).filter(Boolean),
+      roots,
+      options.forWrite === true,
+    );
+    if (hallucinated) return hallucinated;
     if (allowOutside) {
       console.log(`[Sandbox] Permissive mode: allowing access to "${candidate}" (outside allowed roots: ${roots.join(", ") || "none"})`);
       return candidate;
@@ -179,6 +230,15 @@ export function safePath(
     const candidate = resolve(root, normalizedInput);
     if (!isContained(root, candidate)) continue;
     if (options.forWrite ? existingDirectory(dirname(candidate)) : existsSync(candidate)) return candidate;
+  }
+
+  {
+    const hallucinated = resolveHallucinatedRootPath(
+      normalizedInput.split(/[\\/]+/).filter(Boolean),
+      roots,
+      options.forWrite === true,
+    );
+    if (hallucinated) return hallucinated;
   }
 
   if (roots.length > 0) {
