@@ -118,7 +118,21 @@ output and self-tuning DB trace directly:
   324.9s of its 596.2s total), and in the worst cases the task runs out of
   turn budget before a fallback provider lands a credited write.
 
-**Not fixed in this session** — root-caused, not resolved. The next concrete
-step is to trace what root `claude-delegate.ts`'s snapshot resolves to for a
-live (non-fixture) session and confirm it isn't reaching outside the intended
-workspace.
+**Fixed same session, [`baec687`](../../server-jarvis/src/orchestration/claude-delegate.ts).**
+`fileIdentity()` already tolerated `EPERM`/`EACCES`/`EBUSY` from the two prior
+2026-08-05 snapshot incidents; `EISDIR` was the missing case. Traced the root
+further: the resolved snapshot root for a live session is not this repo but
+the server's default workspace (`~/.openclaw/agents/coderclaw/workspace/home-base`,
+via `effectiveWorkspaceRoot`/`resolveAllowedRoots`) — not a git repo itself,
+so the walk takes the plain filesystem path (`filesystemFiles`), not
+`gitFiles`. A reproduction script mirroring the exact walk logic against
+that real directory found zero EISDIR against its current, settled state and
+no symlinks/junctions anywhere in the tree — the directory names
+(`jarvis-livefire-perihelion`, `jarvis-livefire-write`) indicate active,
+ongoing agent usage, pointing to a TOCTOU race against another live session
+concurrently mutating the same shared default workspace while this
+delegate's snapshot walk was enumerating it, not a static per-path problem
+an exclude-list could fix. Reproduced the real production stack trace with
+a real on-disk directory (not mocked) before fixing; fix mirrors the
+existing EPERM/EACCES/EBUSY pattern exactly — a directory masquerading as a
+file entry is not a source mutation, same reasoning as a locked file.
