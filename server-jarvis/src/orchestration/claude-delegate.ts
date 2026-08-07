@@ -773,7 +773,17 @@ async function fileIdentity(path: string): Promise<string> {
     // A snapshot walk over user-controlled filesystem must never be fatal: a
     // locked or denied file is not a source mutation, and throwing here kills
     // the delegate before it launches (see filesystemFiles).
-    if (code === "EPERM" || code === "EACCES" || code === "EBUSY") return `unreadable:${code}`;
+    //
+    // EISDIR (2026-08-06 live, tier2b: 6/39 architecture-arm tasks, 12
+    // occurrences): a listed entry's reported type does not match what read()
+    // finds — a directory masquerading as a file entry is not a source
+    // mutation either. Most likely a TOCTOU race between readdir() and this
+    // read() against a concurrently-mutated shared workspace, not a static
+    // property of any one path, so excluding a name/dir up front (like the
+    // build-output list) cannot fix it — only tolerating the read failure can.
+    if (code === "EPERM" || code === "EACCES" || code === "EBUSY" || code === "EISDIR") {
+      return `unreadable:${code}`;
+    }
     throw error;
   }
 }

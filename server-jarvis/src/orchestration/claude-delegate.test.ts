@@ -130,6 +130,42 @@ describe("snapshot survives unreadable directories", () => {
   });
 });
 
+/**
+ * 2026-08-06 live (tier2b benchmark, 6/39 architecture-arm tasks): the
+ * default shared workspace snapshot threw `EISDIR: illegal operation on a
+ * directory, read` from fileIdentity's readFile, killing the delegate before
+ * launch — same failure class as EPERM/EBUSY above (a real dirent whose
+ * reported type does not match what read() finds moments later, most likely
+ * a TOCTOU race against another live session concurrently mutating the same
+ * default workspace — no reproduction against the directory's later,
+ * settled state, and no symlinks/junctions found there). A directory
+ * masquerading as a file entry is not a source mutation either; it must not
+ * be fatal.
+ */
+describe("snapshot survives a directory misreported as a file entry", () => {
+  test("EISDIR from readFile on a misclassified entry does not kill the snapshot", async () => {
+    const root = await mkdtemp(join(tmpdir(), "jarvis-delegate-"));
+    try {
+      await writeFile(join(root, "ok.txt"), "ok");
+      await mkdir(join(root, "weird")); // a real directory on disk
+      const files = await filesystemFiles(root, async (directory) => {
+        const real = await readdir(directory, { withFileTypes: true });
+        // Simulate the dirent/read mismatch: readdir reports "weird" as a
+        // file (as a stale TOCTOU snapshot or reparse-point quirk would),
+        // so the walk takes the file branch and calls the real readFile.
+        return real.map((entry) =>
+          entry.name === "weird" ? ({ name: "weird", isDirectory: () => false } as never) : entry,
+        );
+      });
+      expect(Object.keys(files)).toHaveLength(2);
+      expect(files[Object.keys(files).find((k) => k.includes("ok.txt"))!]).toStartWith("sha256:");
+      expect(files[Object.keys(files).find((k) => k.includes("weird"))!]).toBe("unreadable:EISDIR");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("delegateToolResultContextChars (W1.5)", () => {
   test("uses the write-turn 24k cap, not the 6k read-turn executor cap", () => {
     expect(delegateToolResultContextChars()).toBe(WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS);
