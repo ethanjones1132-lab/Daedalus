@@ -1,5 +1,7 @@
 import { describe, expect, test, beforeEach } from "bun:test";
 import { defaultConfig } from "../../config";
+import { AGENT_SYSTEM_PROMPT_HEADER } from "../../orchestration/agent-system-prompt";
+import { directiveForModel } from "../../orchestration/local-model-directives";
 import { __resetLocalTargetCacheForTests } from "./ollama-local-transport";
 import { makeLocalCallModel, resolveLocalStageModels } from "./local-call-model";
 
@@ -362,5 +364,86 @@ describe("makeLocalCallModel", () => {
         { stageLabel: "executor", stageAbort: ctrl.signal },
       ),
     ).rejects.toThrow();
+  });
+
+  test("outgoing system message includes directive for a known corrective model", async () => {
+    const cfg = defaultConfig();
+    cfg.ollama.base_url = `${BASE}/v1`;
+    const expected = directiveForModel("ornith-1.0-9b");
+    expect(expected).toBeDefined();
+
+    let capturedSystem: string | undefined;
+    const callModel = makeLocalCallModel(cfg, {
+      localModelsOverride: ["ornith-1.0-9b"],
+      deps: {
+        fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input);
+          if (url.endsWith("/api/tags")) {
+            return jsonResponse({ models: [{ name: "ornith-1.0-9b:latest" }] });
+          }
+          if (url.endsWith("/api/show")) {
+            return jsonResponse({ capabilities: ["tools", "completion"] });
+          }
+          if (url.endsWith("/api/chat")) {
+            const body = JSON.parse(String(init?.body ?? "{}")) as {
+              messages?: Array<{ role: string; content: string }>;
+              model?: string;
+            };
+            const sys = body.messages?.find((m) => m.role === "system");
+            capturedSystem = sys?.content;
+            return jsonResponse({
+              message: { role: "assistant", content: "ok", tool_calls: [] },
+              model: body.model,
+              prompt_eval_count: 10,
+              eval_count: 5,
+            });
+          }
+          throw new Error(`unexpected url ${url}`);
+        }) as typeof fetch,
+      },
+    });
+
+    await callModel(
+      [{ role: "system", content: "Base system." }, { role: "user", content: "fix" }],
+      { stageLabel: "executor" },
+    );
+
+    expect(capturedSystem).toBeDefined();
+    expect(capturedSystem).toContain("Base system.");
+    expect(capturedSystem).toContain(AGENT_SYSTEM_PROMPT_HEADER);
+    expect(capturedSystem).toContain(expected!);
+  });
+
+  test("outgoing system message is byte-identical for an unknown model (no directive splice)", async () => {
+    const cfg = defaultConfig();
+    cfg.ollama.base_url = `${BASE}/v1`;
+    const baseSystem = "Base system only.";
+
+    let capturedSystem: string | undefined;
+    const callModel = makeLocalCallModel(cfg, {
+      localModelsOverride: ["qwen3.5:4b"],
+      deps: {
+        fetch: makeFetch({
+          chat: (body) => {
+            const messages = body.messages as Array<{ role: string; content: string }>;
+            capturedSystem = messages.find((m) => m.role === "system")?.content;
+            return {
+              message: { role: "assistant", content: "ok" },
+              model: "qwen3.5:4b",
+              prompt_eval_count: 10,
+            };
+          },
+        }) as typeof fetch,
+      },
+    });
+
+    await callModel(
+      [{ role: "system", content: baseSystem }, { role: "user", content: "fix" }],
+      { stageLabel: "executor" },
+    );
+
+    // No directive for qwen3.5:4b → system content unchanged (no header splice).
+    expect(capturedSystem).toBe(baseSystem);
+    expect(capturedSystem).not.toContain(AGENT_SYSTEM_PROMPT_HEADER);
   });
 });

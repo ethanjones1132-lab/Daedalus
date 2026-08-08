@@ -14,6 +14,7 @@ import {
 } from "./reliability-latency-rank";
 import { noToolStatsFor, shouldDemoteForNoTool } from "./model-health";
 import { BASELINE_THETA, policy } from "./orchestration-policy";
+import { directiveForModel } from "./local-model-directives";
 
 export interface AgentCapabilities {
   code: number;
@@ -370,6 +371,7 @@ export const LOCAL_STAGE_MIN_WINDOW_MS = BASELINE_THETA.local_stage_min_window_m
  */
 export function localStageAgent(modelId: string): OrchestratorAgent {
   const safe = modelId.replace(/[^a-zA-Z0-9._:-]+/g, "-");
+  const system_prompt = directiveForModel(modelId);
   return {
     id: `local-stage-${safe}`,
     provider: "ollama",
@@ -383,6 +385,8 @@ export function localStageAgent(modelId: string): OrchestratorAgent {
     },
     default_for: [],
     enabled: true,
+    // undefined when unknown → field stays inert (live path already reads it)
+    ...(system_prompt !== undefined ? { system_prompt } : {}),
   };
 }
 

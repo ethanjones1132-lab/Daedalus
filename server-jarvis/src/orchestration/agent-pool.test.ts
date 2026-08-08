@@ -1155,6 +1155,18 @@ describe("M1b preferLocalForStage + local-first pick", () => {
     expect(agent.default_for).toEqual([]);
   });
 
+  test("localStageAgent carries system_prompt for known corrective models", () => {
+    const agent = localStageAgent("ornith-1.0-9b:latest");
+    expect(agent.system_prompt).toBeDefined();
+    expect(agent.system_prompt!).toContain("old_string");
+    expect(agent.system_prompt!.length).toBeLessThanOrEqual(600);
+  });
+
+  test("localStageAgent omits system_prompt for unknown local models", () => {
+    const agent = localStageAgent("qwen3.5:4b");
+    expect(agent.system_prompt).toBeUndefined();
+  });
+
   test("pool pick with ollamaAvailable puts local model first for planner", () => {
     // Remote free pin would otherwise win the planner stage; M1b injects the
     // portable local pair and prefers ollama when the health gate is open.

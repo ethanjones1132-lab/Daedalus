@@ -30,6 +30,8 @@ import {
   resolveLocalTarget,
   type OllamaTransportDeps,
 } from "./ollama-local-transport";
+import { applyAgentSystemPrompt } from "../../orchestration/agent-system-prompt";
+import { directiveForModel } from "../../orchestration/local-model-directives";
 
 export interface LocalCallModelStats {
   calls: number;
@@ -201,9 +203,16 @@ export function makeLocalCallModel(
     // Production semantics: native-vs-text from /api/show capability.
     const supportsNative = target.supportsNativeTools;
     const useTextTools = tools.length > 0 && !supportsNative;
+    // Per-model corrective directive (same splice the live path builds via
+    // OrchestratorAgent.system_prompt). Reuses applyAgentSystemPrompt so
+    // rollouts exercise the same prompt shape as production.
+    const withDirective = applyAgentSystemPrompt(
+      messages as Array<{ role?: string; content?: string; [k: string]: unknown }>,
+      directiveForModel(target.model),
+    ) as ChatMessage[];
     const effectiveMessages = useTextTools
-      ? withTextToolInstructions(messages, tools)
-      : messages;
+      ? withTextToolInstructions(withDirective, tools)
+      : withDirective;
 
     const result = await callOllamaChat(
       target,

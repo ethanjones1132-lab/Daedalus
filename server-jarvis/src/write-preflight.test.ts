@@ -37,6 +37,27 @@ describe("preflightWriteTool", () => {
     expect(r.code).toBe("not_read");
   });
 
+  test("rejects no-op edit_file where old_string equals new_string", () => {
+    const r = preflightWriteTool(
+      "edit_file",
+      { path: "a.ts", old_string: "hello", new_string: "hello" },
+      { pathInScope: true, hasBeenRead: true, fileContent: "hello\n" },
+    );
+    expect(r.allow).toBe(false);
+    expect(r.code).toBe("edit_noop");
+    expect(r.reason).toContain("no-op");
+  });
+
+  test("allows a real edit_file that changes content", () => {
+    const r = preflightWriteTool(
+      "edit_file",
+      { path: "a.ts", old_string: "hello", new_string: "world" },
+      { pathInScope: true, hasBeenRead: true, fileContent: "hello\n" },
+    );
+    expect(r.allow).toBe(true);
+    expect(r.code).toBe("ok");
+  });
+
   test("repairs whitespace-drifted old_string in-process", () => {
     const content = "def f():\n    return now > expires\n";
     const r = preflightWriteTool(
