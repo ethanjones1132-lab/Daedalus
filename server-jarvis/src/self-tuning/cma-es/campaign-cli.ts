@@ -15,7 +15,7 @@ if (process.env.NODE_ENV !== "test") {
   process.env.NODE_ENV = "test";
 }
 
-import { loadConfig } from "../../config";
+import { loadConfig, type JarvisConfig } from "../../config";
 import { AgentPool, DEFAULT_LOCAL_STAGE_MODELS } from "../../orchestration/agent-pool";
 import { BASELINE_THETA } from "../../orchestration/orchestration-policy";
 import { routableOrchestratorAgents } from "../../provider-availability";
@@ -42,6 +42,7 @@ function parseArgs(argv: string[]): {
   generations?: number;
   concurrency: number;
   tasks?: number;
+  model?: string;
 } {
   const out = {
     preflight: false,
@@ -49,6 +50,7 @@ function parseArgs(argv: string[]): {
     generations: undefined as number | undefined,
     concurrency: DEFAULT_ROLLOUT_CONCURRENCY,
     tasks: undefined as number | undefined,
+    model: undefined as string | undefined,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
@@ -60,12 +62,27 @@ function parseArgs(argv: string[]): {
       out.concurrency = Math.max(1, Number(argv[++i]) || 1);
     } else if (a === "--tasks" || a === "-t") {
       out.tasks = Math.max(1, Number(argv[++i]) || 1);
+    } else if (a === "--model" || a === "-m") {
+      out.model = argv[++i];
     } else if (a === "--help" || a === "-h") {
       printHelp();
       process.exit(0);
     }
   }
   return out;
+}
+
+/**
+ * Pin every rollout stage to one local model.
+ *
+ * Without this the pool resolves through `resolveLocalStageModels` (conductor
+ * primary/fallback ∩ installed), which is the production routing choice — not
+ * necessarily the model whose policy you want to optimize. A campaign's whole
+ * output is θ tuned against ONE worker's behaviour, so the worker has to be an
+ * explicit input, not an ambient config default.
+ */
+function callModelFor(cfg: JarvisConfig, model?: string) {
+  return makeLocalCallModel(cfg, model ? { localModelsOverride: [model] } : {});
 }
 
 function printHelp(): void {
@@ -82,6 +99,7 @@ Options:
   --generations N Run sep-CMA-ES for N generations (real campaign)
   --concurrency C Parallel rollouts (default ${DEFAULT_ROLLOUT_CONCURRENCY})
   --tasks N       Subset first N training fixtures (early-run budget control)
+  --model ID      Pin every rollout stage to one local model (e.g. qwen3.5-9b-heretic)
 `);
 }
 
@@ -181,7 +199,7 @@ async function runPreflight(): Promise<number> {
   return 0;
 }
 
-async function runSmoke(): Promise<number> {
+async function runSmoke(model?: string): Promise<number> {
   const cfg = loadConfig();
   if (TRAINING_TASKS.length === 0) {
     console.error("FAIL: no training fixtures");
@@ -190,8 +208,9 @@ async function runSmoke(): Promise<number> {
   const task = TRAINING_TASKS[0]!;
   console.log(`=== Phase-D campaign smoke ===`);
   console.log(`task=${task.name} category=${task.category} entry=${task.entry}`);
+  console.log(`model=${model ?? "(pool default)"}`);
 
-  const callModel = makeLocalCallModel(cfg);
+  const callModel = callModelFor(cfg, model);
   const started = Date.now();
   const outcome = await runOneRollout(
     { theta: BASELINE_THETA, task, seed: 0 },
@@ -234,15 +253,20 @@ async function runSmoke(): Promise<number> {
   return exit;
 }
 
-async function runCampaign(generations: number, concurrency: number, taskLimit?: number): Promise<number> {
+async function runCampaign(
+  generations: number,
+  concurrency: number,
+  taskLimit?: number,
+  model?: string,
+): Promise<number> {
   const cfg = loadConfig();
-  const callModel = makeLocalCallModel(cfg);
+  const callModel = callModelFor(cfg, model);
   const trainingTasks =
     taskLimit !== undefined ? TRAINING_TASKS.slice(0, taskLimit) : TRAINING_TASKS;
 
   console.log(
     `=== Phase-D campaign generations=${generations} concurrency=${concurrency} ` +
-      `trainingTasks=${trainingTasks.length} ===`,
+      `trainingTasks=${trainingTasks.length} model=${model ?? "(pool default)"} ===`,
   );
   const campaignStarted = Date.now();
   const result = await runCmaEsCampaign({
@@ -299,7 +323,7 @@ async function main(): Promise<void> {
     if (code !== 0) process.exit(code);
   }
   if (args.smoke) {
-    code = await runSmoke();
+    code = await runSmoke(args.model);
     if (code !== 0) process.exit(code);
   }
   if (args.generations !== undefined) {
@@ -307,7 +331,7 @@ async function main(): Promise<void> {
       console.error("--generations must be a positive integer");
       process.exit(1);
     }
-    code = await runCampaign(args.generations, args.concurrency, args.tasks);
+    code = await runCampaign(args.generations, args.concurrency, args.tasks, args.model);
   }
   process.exit(code);
 }
