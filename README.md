@@ -2,161 +2,119 @@
 
 # Daedalus · Jarvis
 
-**A standalone desktop platform for local-first AI agents.**  
-Native Rust shell · Bun HTTP server · React UI · SQLite persistence · Multi-stage orchestrator
+**A local-first desktop platform for AI agents, and a testbed for making agent completion verifiable.**
 
-[![License](https://img.shields.io/badge/license-MIT-green)](src-tauri/LICENSE)
-[![Version](https://img.shields.io/badge/version-3.0.0-blue)](package.json)
-[![Tests](https://img.shields.io/badge/tests-1964%20bun%20|%20115%20cargo-success)](scripts/verify.sh)
-[![Platform](https://img.shields.io/badge/platform-Windows%20|%20Linux%20|%20macOS-lightgrey)]()
+Rust/Tauri shell · Bun orchestration server · React UI · SQLite · MIT
 
 </div>
 
 ---
 
-## What is this?
+## What this is
 
-**Jarvis** is a standalone desktop app that runs AI agents entirely on your computer — everything stays local. It's built from the ground up to be its own self-contained AI runtime: it doesn't depend on Hermes, OpenClaw, or any external platform. It owns the full stack — native window, web server, database, tool execution, and agent lifecycle — and can optionally talk to cloud services if you choose.
+**Jarvis** is a desktop application that runs AI agents on your own machine. It owns its full stack — native window, HTTP server, database, tool runtime, and agent lifecycle — and depends on no external agent platform. It can call out to cloud models if you configure it to, or run entirely against local models through Ollama.
 
-> **Daedalus** is this GitHub repository. **Jarvis** is the app. Same project, two names. The project recovered from a 2026-06 WSL disk wipe and has since been rebuilt into a production-capable platform.
+**Daedalus** is the GitHub repository. **Jarvis** is the application. Same project; the names come from different layers of the stack, and the [Repo origins](#repo-origins) section explains why.
 
----
+The part worth a reviewer's attention is not the chat app. It's the machinery underneath it:
 
-## Who is this for?
+> **The runtime captures the exit code. The model never decides whether it passed.**
 
-- **Power users** who want a capable local AI assistant that respects their privacy
-- **Developers** who want to build custom agents or integrate the tool runtime into their own workflows
-- **Anyone tired of half-baked cloud AI apps** that can't access your files, run code, or work offline
+That one constraint is the spine of this codebase. An agent that grades its own work will eventually learn to narrate success, and any reward signal built on that narration is training on a lie. Everything below is downstream of refusing that.
 
 ---
 
-## What can it do?
+## Three systems worth reading
 
-| What you see | How it works |
-|:---|---|
-| **AI chat with real reasoning** | Every message goes through an **orchestrator pipeline** — a coordinator decides whether to answer directly or plan multi-step work, a planner breaks the request into stages, executors run each stage with tool access, a reviewer checks quality, and a synthesizer compiles the final response. If the plan goes sideways mid-stream, the **conductor** can pause, re-evaluate, and re-plan — just like a human stepping back to rethink. |
-| **Read, write, and search your files** | The tool runtime gives the AI controlled access to your filesystem. It can find files, read them, edit them, and search their contents — all bounded by a permission policy (`strict`, `permissive`, or `off`). |
-| **Run code and shell commands** | Jarvis can execute terminal commands, run scripts, and pipe results back into the conversation. Output is streamed in real time so you see progress as it happens. |
-| **Browse the web** | Web search and page extraction via the tool runtime — the AI can fetch live information from the internet when you ask. |
-| **Recurring tasks (cron)** | Schedule agent runs on a timer — daily health checks, automated reports, periodic maintenance. Cron jobs run in a sandbox with no interactive feedback, and their results get delivered back to you. |
-| **Self-improving over time** | The **self-tuning system** tracks how each AI model performs on every type of task — response speed, quality, how often it stalls — and automatically adjusts timeouts, routing preferences, and fallback ordering. The **organism loop** goes further: it captures "trajectories" (snapshots of how a task was solved), has a judge evaluate them, and promotes the good ones into reusable skills. |
-| **Won't repeat itself** | A **repetition guard** detects when the AI starts producing the same content turn after turn (using Jaccard trigram similarity + degenerate-stream detection) and redirects it to try something genuinely new. |
-| **Thorough analysis** | The **evidence sufficiency system** ensures the AI actually reads enough material before answering — it sets minimum read requirements based on how deep the question goes, and won't skip past them. |
-| **Verifies its own work before finishing** | When a task changes code, Jarvis runs an actual check before calling the job done — the project's own tests if they exist, a syntax/type check otherwise. A failing check triggers an automatic repair pass instead of a false "done." The check's exit code decides the outcome, not the model's own claim, so the system can't talk itself into believing broken work succeeded. |
-| **Your choice of AI models** | Supports local models via Ollama, cloud models via OpenRouter/OpenCode, or Claude CLI — with automatic fallback if the primary is slow or unavailable. OpenCode Zen and Go are available as backup providers. |
-| **Connect external tools (MCP)** | Implements the Model Context Protocol (MCP) — a standard for plugging in external tools and data sources — so you can wire up custom capabilities without changing the core. |
-| **Agent lifecycle management** | Portable agent directories (a `soul.md` file with capabilities, constraints, and personality). Jarvis discovers, validates, and activates agents from a local store. |
+### 1. Runtime-owned verification
+
+When a turn changes code, the runtime executes a real check and reads its exit code. The model's claim of success is not an input.
+
+The check-runner is tiered by trust — the project's own tests first, then a language-appropriate build/syntax check, then a model-authored check — and returns a **tri-state** `CheckOutcome`: `clean`, `failed`, or `not_applicable`.
+
+The third state is the whole point. An earlier version returned `{ran: true, passed: true}` for a project with no Python files in it, so a repository the checker couldn't actually inspect produced a green pass. The detector registry (cargo / cmake / go / node / make, with a Python syntax fallback) now returns `not_applicable` when it finds no build system, and that is recorded honestly as `none` rather than promoted to a vacuous green.
+
+The invariant the system enforces: *a write-intent run is `success` only when its TaskPlan is drained **and** an authoritative check ran and passed. `check_tier=none` must produce `partial` and keep the run resumable.*
+
+### 2. Offline trace replay as an evaluation harness
+
+Every orchestrated turn is written to `self-tuning.db`. For a long time that database was effectively write-only — the tuner read narrow slices and nothing else touched it.
+
+Two defects diagnosed by hand in July took instrumented builds, log reading, and roughly 400k tokens per attempt. Both were already sitting in the database. A query would have surfaced either in milliseconds.
+
+`server-jarvis/src/eval/conductor-replay.ts` (282 lines, 17 tests) replays stored traces against five invariants — `repeated_nudge`, `placeholder_in_note`, `stage_deadline_exceeded`, `noop_executor_turns`, `turn_cap_saturation`:
+
+```bash
+bun scripts/replay-conductor.ts [--limit N] [--since TS] [--db PATH] [--json]
+```
+
+First run over **500 stored runs found 117 violations across 68 runs (14%)** — and independently ranked the run that had been diagnosed by hand as the worst in the corpus, hitting all five rules.
+
+Scope, stated honestly: this is invariant and regression checking over recorded traces. It is not a counterfactual simulator.
+
+### 3. Phase D — policy optimization over the orchestrator
+
+The orchestrator's behavior is parameterized as a policy vector **θ** (Phase C, `a5212fd`), and Phase D tunes it as a black box:
+
+| Piece | Commit | What it is |
+|---|---|---|
+| sep-CMA-ES core + fixture **held-out split** + rollout-local-only routing | `3ee568c` | Separable CMA-ES over θ, with fixtures partitioned so tuning cannot fit the evaluation set |
+| In-process rollout runner + bounded-concurrency pool | `bb34d6a` | Rollouts execute in-process against local models rather than shelling out per trial |
+| CMA-ES campaign driver + policy-staging proposal | `ec3a193` | Drives a campaign end to end and stages the resulting policy for review |
+| Fixture suite expansion 11 → 39 | `0143a51` | Widens the task set the policy is scored against |
+| Offline write-effect reward corrections | `689f64d`, `dc73e3d` | Credits hidden-file writes, and read-then-fixed files outside the named target set |
+
+Rollouts run against local models through a dedicated Ollama transport (`self-tuning/rollout/ollama-local-transport.ts`), so a tuning campaign costs compute rather than API spend.
+
+This is why runtime-owned verification matters beyond hygiene: the reward the optimizer maximizes is grounded in an executed check result. Ungameable by construction is not a slogan here — it is the precondition that makes the search meaningful.
 
 ---
 
-## Architecture — the full picture
-
-Jarvis has three main layers:
+## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │  React UI (src-ui/) — Vite + TypeScript                              │
-│  Chat panel · Health dashboard · Agent manager · Settings             │
-│  Chat: fetch → http://127.0.0.1:19877/chat/stream (SSE streaming)     │
-│  Other views: Tauri IPC → Rust commands → SQLite                      │
+│  Chat · health dashboard · agent manager · cron · settings           │
+│  Chat: SSE fetch → 127.0.0.1:19877/chat/stream                       │
+│  Everything else: Tauri IPC → Rust commands → SQLite                 │
 └────────────────────────────┬─────────────────────────────────────────┘
-                             │
 ┌────────────────────────────▼─────────────────────────────────────────┐
-│  Tauri / Rust (src-tauri/)                                             │
-│  SQLite sessions, agents, cron, skills, channel management            │
-│  Process supervisor (monitors Bun, Ollama, proxy)                     │
-│  Spawns Bun server from bundled resources; background thread boot     │
+│  Tauri / Rust (src-tauri/) — crate `home-base`                       │
+│  SQLite: sessions, agents, cron, skills, channels                    │
+│  Process supervisor (Bun, Ollama, proxy) · background-thread boot    │
 └────────────────────────────┬─────────────────────────────────────────┘
-                             │
 ┌────────────────────────────▼─────────────────────────────────────────┐
-│  Bun server (server-jarvis/) — HTTP :19877                             │
-│  Tool runtime · Orchestrator pipeline · SSE streaming                 │
-│  Self-tuning DB · Conductor replan · Repetition guard                  │
-│  MCP bridge · Eval harness · Prompts from disk                        │
+│  Bun server (server-jarvis/) — HTTP :19877                           │
+│  Orchestrator pipeline · tool runtime · SSE · MCP bridge             │
+│  Verification gate · replay eval · self-tuning · Phase-D campaigns   │
 └────────────────────────────┬─────────────────────────────────────────┘
-                             │
         ┌────────────────────┼────────────────────┐
         ▼                    ▼                    ▼
-   Ollama (local)      OpenRouter / OpenCode    Claude CLI
+   Ollama (local)     OpenRouter / OpenCode    Claude CLI
 ```
 
-### Layer by layer
+### The orchestration pipeline
 
-| Layer | What it does | What's inside |
-|-------|-------------|---------------|
-| **React UI** | Everything you see and click. The chat panel (`ChatPanel` component), a health dashboard showing model status and server health, an agent manager, cron overview, settings page, and a companion sprite. | Vite, TypeScript, custom components. Chat is SSE-fetch from the Bun server. All non-chat data goes through Tauri IPC to Rust commands. |
-| **Rust / Tauri** | The native shell. Manages the desktop window, file system sandbox, SQLite databases, and process supervision (keeps the Bun server and Ollama alive). Bootstraps everything on a background thread so the window appears instantly. | Tauri 2, SQLite via rusqlite, Tokio async runtime. Modules for sessions, agents, cron jobs, skills, channels, and the supervisor. |
-| **Bun server** | The AI engine room. Handles all inference requests, tool execution, streaming, orchestration, self-tuning, and MCP connectivity. Prompts (the instructions that shape how the orchestrator plans and executes) are loaded from disk, not baked into code. | Bun with TypeScript. HTTP API on port 19877. Endpoints: `/health`, `/chat/stream`, tool dispatch, cron trigger, eval harness. |
+A turn is assessed by a **coordinator**, which selects a topology: a direct answer, a tool-assisted turn, or a multi-stage plan run by a **planner**, an **executor** pool, a **reviewer**, and a **synthesizer**. Topologies are `linear`, `speculative_parallel`, `speculative_cascade`, and `recursive` — and `linear` is the only one permitted for file edits or destructive actions.
 
-### How a chat message flows
+The **conductor** supervises mid-flight. When a stage returns something unexpected, it can pause, inject what has been learned, and re-plan, bounded by per-turn and per-session caps.
 
-1. You type a message in the **ChatPanel** UI component
-2. It calls `jarvis_send_message` → a Tauri IPC command → the Bun server's `/chat/stream` endpoint
-3. The **orchestrator** kicks in — the coordinator assesses your request and decides the strategy:
-   - **Direct answer** — one model call, no tools, done
-   - **Tool-assisted** — reads files, runs code, then answers
-   - **Multi-stage plan** — a coordinator + planner break it into stages, executors run each, a reviewer checks quality, the synthesizer compiles the result
-4. Throughout the pipeline, the **conductor** tracks progress. If a stage produces unexpected results, it can pause, inject what it's learned so far, and re-plan with revised instructions
-5. Results stream back as SSE events — text, tool results, stage transitions, and errors are all real-time
-6. Every message is saved to **SQLite** via the Rust layer (`append_message` IPC command)
-7. The **self-tuning system** logs model performance (first-token latency, stage duration, routing path) and periodically proposes adjustments
+Supporting systems, all live:
 
-### Behind the scenes systems
-
-| System | What it does | How it works |
-|--------|-------------|--------------|
-| **Orchestrator** | Routes every request through the right pipeline | Configurable per `orchestrator.enabled`. Has a coordinator, planner, executor pool, reviewer, and synthesizer. Supports multi-model pipelines with fallback across OpenRouter, OpenCode Zen/Go, Ollama, and Claude CLI. |
-| **Conductor** | Mid-pipeline re-planning | A persistent KV database that tracks the execution state. When a stage fails or returns unexpected results, the conductor can pause and re-invoke with a summary of what's happened so far. Per-turn and per-session caps prevent infinite re-plans. |
-| **Verification gate** | Proves work before scoring it | A tiered check-runner — existing project tests, then a syntax/type check, then a model-authored check, in that order of trust — runs after any code change. The *runtime* executes the check and reads the exit code; the model never gets to claim success on its own word. A pass on a trusted tier marks the work done immediately, a failure triggers automatic repair, and only the ambiguous middle case goes to the reviewer stage for judgment. Two cost-neutral thrift governors (dead-tool suppression, achieved-effect early-stop) fund the extra step out of the waste it removes. This is also what makes the self-tuning reward signal below trustworthy — it now trains on a verified outcome instead of the model's own narration. |
-| **Self-tuning** | Automatic performance optimization | An inference feedback loop that scores each model on speed, stall rate, and completion quality. Periodically updates routing preferences, per-model first-token timeouts, and capability adjustments — all from live telemetry, no manual tuning. |
-| **Repetition guard** | Prevents repetitive loops | Computes Jaccard trigram similarity between consecutive turns. If similarity exceeds a threshold or the model is detected in a degenerate stream (no-progress loop), it intervenes with a fresh directive. |
-| **Evidence sufficiency** | Ensures thorough research | Sets minimum deep-read requirements (3+ content reads) for analysis-style questions, and enforces them. Pre-flight listing commands (like `ls` or `search_files`) don't count — the model must actually read the content. |
-| **Organism loop** | Skill distillation from experience | Captures "trajectory snapshots" of how the AI solved a task. A judge evaluates the quality. Good trajectories are distilled into skills (reusable prompt fragments) that get injected into future orchestrator plans. The system can auto-promote or require manual approval. |
-| **Fail-fast memorization** | Short-circuits repeated failures | A no-progress memo cache that recognizes when the AI is attempting nearly-identical retries and short-circuits them in under a second instead of burning tokens. |
-| **Parallel dispatch** | Faster multi-tool work | Read-only tool batches (multiple file reads, multiple web searches) are dispatched concurrently instead of serially — tool results arrive in parallel. |
+| System | What it does |
+|---|---|
+| **Repetition guard** | Trigram Jaccard similarity across consecutive turns, threshold `0.25` — calibrated between an observed incident range of 0.315–0.414 and a genuinely-different answer at 0.092 |
+| **Evidence sufficiency** | Depth-scaled minimum deep-reads before answering. Listing commands don't count; an earlier version let `git_metadata` calls pose as content reads |
+| **Stage budgets** | `MIN_VIABLE_STAGE_MS` per stage, set below the measured p50 of successful runs (reviewer p50 9.7s n=458; planner p75 9.0s n=1249; executor p50 3.1s n=3112). A stage that cannot plausibly finish in its window is refused rather than started and killed |
+| **Fail-fast memo** | Sub-second short-circuit for near-identical retries |
+| **Parallel dispatch** | Read-only tool batches dispatched concurrently |
+| **Organism loop** | Trajectory snapshots → judge evaluation → skill promotion. `auto_promote` defaults to `false`; `min_judge_score` 0.75 |
+| **Trajectory export** | `trajectory_snapshots` → GRPO-ready JSONL with a normalized composite reward in [0,1] |
 
 ---
 
-## Orchestration reliability safeguards
-
-The live-session orchestration path now protects the stages that matter most to a usable answer:
-
-- **Verification-gated completion** (2026-07-25): change turns are gated on an actually-executed check rather than the model's own narration, closing a gap where a wrong or unapplied fix could be scored `success` while genuinely correct work got mislabeled `degraded`. On a live 30-sample Tier-2B benchmark this took the score from 27/30 — with the self-tuner training on an inverted reward signal — to **30/30**, with every run's completion now backed by a real check result and median tool-calls-per-turn down from the high-20s/40s range to single digits.
-- Empty planner, reviewer, and rewriter completions are recorded as failures and advance through the fallback cascade. Executor tool-call turns remain valid even when they have no visible prose.
-- Stage-health cooldowns and rolling per-stage model scorecards reach both the agent pool and fallback cascade, so unhealthy candidates are not immediately selected again.
-- Hidden reasoning deltas count as transport liveness without leaking into visible output. Trivial short-circuit turns use the fast synthesizer tier, while routed pipelines shed advisory stages when the remaining turn budget is tight.
-- Local conductor routing fails fast after 10 seconds and can fall back to a deterministic route when coordinator candidates are unavailable or unfit.
-- Post-loop executor↔reviewer repair re-entry is capped at one attempt per segment and terminates cleanly at the reviewer repair-round cap (`repair_cap_exhausted`) instead of re-firing indefinitely. This closes an unbounded-loop path on contract-less turns (e.g. single-shot benchmark/API calls with no TaskPlan ledger), where the repair-cycle counter never advanced and the old cap check was a no-op — verified against a full 30-sample Tier-2B live benchmark run with no stalls.
-
-The one-off `scripts/retro-correct-empty-stages.ts` utility can repair historical empty-stage labels in `self-tuning.db`. Preview its target rows first, stop the server before applying the update, and treat it as an operator migration rather than a startup task.
-
-## Platform milestones
-
-Every major system shipped in the last two months:
-
-| Area | What shipped | When |
-|------|-------------|------|
-| **Phase 1–3 core** | Tool runtime, eval harness, MCP protocol support | Complete |
-| **Orchestrator v2** | Coordinator, agent pool, route normalization, conductor replan, persistent conductor KV | Live |
-| **Verification-gated conductor** | Runtime-executed check-runner (tests → syntax/type check → model-authored check) gates task completion and grounds the self-tuner's reward in a real outcome instead of model narration; cost-neutral thrift governors fund the extra step | Live — 30/30 on a live Tier-2B benchmark |
-| **Organism loop** | Judge-gated skill promotion, trajectory-backed distillation, conductor injection | Live |
-| **Self-tuning** | Inference feedback loop, stage-specific routing deltas, per-model first-token overrides | Live |
-| **Repetition guard** | Cross-turn Jaccard similarity + degenerate-stream detection | Live |
-| **Evidence sufficiency** | Depth-scaled deep-read minimums (3+ content reads), pre-flight listing/anchor | Live |
-| **Parallel dispatch** | Read-only tool batches dispatched concurrently | Live |
-| **Fail-fast memo** | <1s short-circuit for near-identical retries | Live |
-| **5-front performance** | Runtime latency, classifier short-circuit, inference feedback, boot reliability, evidence grounding | Complete |
-| **Track A (orchestrator health)** | Visible answer sanitizer, structured pipeline state, inference observability | Complete |
-| **Track B (conductor)** | Conductor replan, structured stage output, per-session replan + telemetry | Complete |
-| **Track C (distillation)** | Trajectory snapshot distillation, organism loop | Complete |
-| **Track D (eval)** | GRPO-ready JSONL export, composite reward model | Complete |
-| **OpenCode fallback** | Provider credentials, pool availability filtering, per-provider timeouts | Complete |
-
-Latest (2026-07-25): verification-gated conductor shipped and live-fire validated — a runtime-executed check now gates task completion and grounds the self-tuner's reward signal, turning a 27/30 Tier-2B benchmark run into **30/30** with tool-calls-per-turn cut roughly 4–5x. See [`PRIORITIES.md`](PRIORITIES.md) for the full changelog with commit SHAs and test counts.
-
----
-
-## Quick start (for developers)
+## Quick start
 
 ```bash
 git clone https://github.com/ethanjones1132-lab/Daedalus.git
@@ -165,136 +123,79 @@ cd Daedalus
 cd server-jarvis && bun install && cd ..
 cd src-ui && bun install && cd ..
 
-# Terminal 1 — Bun server (hot-reload)
-cd server-jarvis && bun run dev
-
-# Terminal 2 — UI dev server
-cd src-ui && bun run dev
-
-# Terminal 3 — Tauri app (debug)
-cd src-tauri && cargo tauri dev
+cd server-jarvis && bun run dev     # terminal 1 — API on :19877
+cd src-ui        && bun run dev     # terminal 2 — UI
+cd src-tauri     && cargo tauri dev # terminal 3 — desktop shell
 ```
 
-Default API: **http://127.0.0.1:19877** (`/health`, `/chat/stream`).
+| Prerequisite | For | Minimum |
+|---|---|---|
+| [Rust](https://rustup.rs/) | native shell | 1.85+ |
+| [Bun](https://bun.sh/) | server + UI build | 1.2+ |
+| [Ollama](https://ollama.com/) *(optional)* | local models, Phase-D rollouts | — |
+| OpenRouter / OpenCode key *(optional)* | cloud models | — |
 
-### Prerequisites
+### Build
 
-| Tool | Required for | Minimum version |
-|------|-------------|-----------------|
-| [Rust](https://rustup.rs/) | Building the native shell | 1.85+ |
-| [Bun](https://bun.sh/) | Running the server and building the UI | 1.2+ |
-| (Optional) [Ollama](https://ollama.com/) | Running AI models locally | — |
-| (Optional) API keys | OpenRouter / OpenCode for cloud models | — |
-
----
-
-## Build & release
-
-### Windows — full-stack deploy script
-
-Run this from a PowerShell terminal at the repo root:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\build-and-deploy.ps1
+```bash
+# Windows full-stack deploy
 powershell -ExecutionPolicy Bypass -File scripts\build-and-deploy.ps1 -RestartServer
-```
 
-What it does, in order:
+# Installer
+cd src-tauri && cargo tauri build   # → target/release/bundle/nsis/Jarvis_*_x64-setup.exe
 
-1. **`bun build`** the Bun server → `server-jarvis/dist/index.js` (a single bundled file)
-2. **`src-ui` production build** → `src-ui/dist` (embedded by Tauri)
-3. **`cargo build --release`** → `src-tauri/target/release/home-base.exe`
-4. **Copies** the exe, `index.js`, and `prompts/` folder to your Desktop
-5. **Writes** `.jarvis-deploy-manifest.json` — a deployment record with git SHA, file hashes, and timestamps
-
-Use `-SkipDeploy` to build without copying. Add `-RestartServer` to kill and restart any running instance after deploy.
-
-### Standalone installer
-
-```bash
-cd src-tauri && cargo tauri build
-# → NSIS installer: target/release/bundle/nsis/Jarvis_*_x64-setup.exe
-```
-
-The `tauri.conf.json` bundles `server-jarvis/dist/index.js` and the full `prompts/` directory as resources.
-
-### Linux / WSL
-
-```bash
+# Linux / WSL
 bash build-wsl.sh
 ```
 
 ---
 
-## Configuration
+## Verification
 
-### Config file
+```bash
+bash scripts/verify.sh              # rust lint + both tsc jobs
+bash scripts/verify.sh --test       # + cargo test + bun test
+bash scripts/verify.sh --build      # + server dist + UI dist
+```
 
-Auto-created on first run at:
+**Last full recorded run — 2026-08-01: 2,469/2,469 Bun tests and 115/115 Cargo tests green, both `tsc` jobs clean.**
 
-- **Windows:** `%USERPROFILE%\.openclaw\jarvis\config.json`
-- **Linux/macOS:** `~/.openclaw/jarvis/config.json`
+The tree has grown since that run: **185 test files under `server-jarvis/src`**, 215 across the repo including the UI. Reproduce with `bash scripts/verify.sh --test` rather than trusting this paragraph — the number in a README is a claim, and the command is the evidence.
 
-| Setting | What it does |
-|---------|-------------|
-| `active_backend` | Which inference backend to use: `ollama` (local), `openrouter` (cloud), or `claude_cli` |
-| `openrouter.model` | Which cloud model to call |
-| `openrouter.api_key` | API key for OpenRouter |
-| `orchestrator.enabled` | Master switch for the multi-stage orchestrator pipeline |
-| `orchestrator.max_conductor_replans` | Max re-plans per turn (default 2) |
-| `orchestrator.max_conductor_replans_per_session` | Max re-plans across the whole session (default 6) |
-| `orchestrator.skill_distillation.auto_promote` | Auto-promote distilled skill candidates without manual review (default: false — judge-gated) |
-| `jarvis_path` | Filesystem sandbox root — restricts what folders the AI can read/write |
-| `tools.sandbox_mode` | Tool permission policy: `strict` (approve dangerous tools), `permissive` (relaxed), `off` (no sandbox) |
-| `tools.enabled` | Master switch for tool execution |
-
-### Runtime environment variables
-
-| Variable | Default | What it does |
-|----------|---------|-------------|
-| `JARVIS_FIRST_TOKEN_TIMEOUT_MS` | varies by model | How long to wait for the first token before declaring a stall and falling back |
-| `JARVIS_VISIBLE_PROGRESS_TIMEOUT_MS` | 180000 (3 min) | For hidden-reasoning models — if no visible output in this time, watchdog fires |
-| `JARVIS_TOTAL_TURN_TIMEOUT_MS` | 480000 (8 min) | Absolute deadline for a single turn |
-
-### SQLite databases
-
-| Database | Path | What it stores |
-|----------|------|---------------|
-| **App data** | `%LOCALAPPDATA%\com.jarvis.desktop\jarvis.db` | Conversations, agents, cron jobs, skills, channel configs |
-| **Self-tuning** | `~/.openclaw/jarvis/self-tuning.db` | Agent run records, stage-level timing, model attributions, tuning proposals, trajectory snapshots |
+Suite growth is itself the artifact of how this repo is maintained: **240 Bun tests on 2026-06-24 → 2,469 on 2026-08-01**, added by a cron-driven maintenance loop that ships small, test-first, commit-attributed changes on a daily cadence. `PRIORITIES.md` records each pass with its commit SHAs and the test delta it produced.
 
 ---
 
-## Verification
+## State of the documentation
 
-The current automated baseline is **1,964 Bun tests across 142 files**, **115 Cargo tests**, and clean server/UI TypeScript checks.
+Stated plainly, because a reviewer will find this anyway:
 
-The fastest way to check everything is healthy:
+- **`PRIORITIES.md` is the real changelog and it stops at 2026-08-01.** `master` runs to 2026-08-07. The Phase-D work described above is in git history and in the source tree, but not in that file.
+- **Plan checkboxes in `docs/superpowers/plans/` are not a reliable completion signal, in either direction.** One shipped six-phase plan still reports 0/34 boxes checked; another would report 73 unchecked despite having landed. Read `git log`, not the boxes.
+- **`CONTEXT.md` is the vocabulary for the Tauri/native surface** — sessions, agents, `soul.md`, tool runtime, permission policy, activation boundary. It predates the orchestration layer and does not define conductor/executor/reviewer. Its **Flagged ambiguities** section — 21 entries of the form *"X could have meant Y; resolved: Z"* — is the part worth reading.
+- **Several items are operator-gated and off by default,** including the verification-gated conductor's Phase-6 rollout flag and the A/B GGUF evaluation. Off by default means not proven at scale, and it is labeled that way on purpose.
 
-```bash
-bash scripts/verify.sh              # Quick: Rust lint + UI typecheck + server typecheck
-bash scripts/verify.sh --test       # Same + cargo test + bun test
-bash scripts/verify.sh --build      # Same + build server dist + UI dist
-```
+---
 
-Individual checks:
+## Configuration
 
-```bash
-# Rust — lint only
-cargo check --manifest-path src-tauri/Cargo.toml
+Config is auto-created at `%USERPROFILE%\.openclaw\jarvis\config.json` (Windows) or `~/.openclaw/jarvis/config.json`.
 
-# Server — typecheck + unit tests
-cd server-jarvis && bunx tsc --noEmit && bun test
+| Key | Meaning |
+|---|---|
+| `active_backend` | `ollama` · `openrouter` · `claude_cli` |
+| `orchestrator.enabled` | Master switch for the multi-stage pipeline |
+| `orchestrator.max_conductor_replans` | Per-turn replan cap (default 2) |
+| `orchestrator.max_conductor_replans_per_session` | Per-session cap (default 6) |
+| `orchestrator.skill_distillation.auto_promote` | Default `false` — promotion is judge-gated |
+| `verification.check_timeout_ms` | Default 90000; 15s was fine for `py_compile`, not for `cargo check` on a cold tree |
+| `jarvis_path` | Filesystem sandbox root |
+| `tools.sandbox_mode` | `strict` · `permissive` · `off` |
 
-# UI — typecheck
-cd src-ui && bunx tsc -b
-```
-
-Full gate (server):
-
-```bash
-cd server-jarvis && bun run test:gate
-```
+| Database | Path | Holds |
+|---|---|---|
+| App | `%LOCALAPPDATA%\com.jarvis.desktop\jarvis.db` | Conversations, agents, cron, skills, channels |
+| Self-tuning | `~/.openclaw/jarvis/self-tuning.db` | Run records, stage timing, model attribution, trajectories, tuning proposals |
 
 ---
 
@@ -302,58 +203,39 @@ cd server-jarvis && bun run test:gate
 
 ```
 Daedalus/
-├── src-tauri/               # Rust/Tauri — native shell, SQLite, supervisor
-│   ├── src/                 #   commands/, sessions, agents, cron, skills, channels
-│   └── Cargo.toml           #   Rust crate: home-base v0.1.0
-├── server-jarvis/           # Bun — AI engine, orchestrator, tool runtime
-│   ├── src/                 #   prompts/, tool bundles, MCP, self-tuning
-│   └── package.json         #   Bun package: server-jarvis v3.0.0
-├── src-ui/                  # React — chat, dashboard, agent manager
-│   ├── src/                 #   components/, ChatPanel, health views
-│   └── package.json         #   Vite + TypeScript
-├── scripts/                 # verify.sh, build-and-deploy.ps1, claude_cli_proxy.py
-├── docs/                    # Architecture decisions, plans, incident reports
-├── workspace/               # Action registry + automated workflow tooling
-├── agents/                  # Example agent directories (soul.md profiles)
-├── CONTEXT.md               # Required reading — canonical project vocabulary
-├── AGENTS.md                # Working rules for autonomous coding agents
-├── PRIORITIES.md            # Full changelog and improvement backlog
-├── HANDOFF.md               # Deep component-level architecture reference
-└── RECOVERY_STATUS.md       # 2026-06 WSL recovery provenance
+├── src-tauri/        Rust/Tauri — native shell, SQLite, supervisor (crate: home-base)
+├── server-jarvis/    Bun — orchestrator, tool runtime, verification, eval, self-tuning
+│   └── src/
+│       ├── orchestration/   coordinator, pipeline, conductor, run-gate, check-runner
+│       ├── eval/            conductor-replay — offline trace invariants
+│       └── self-tuning/     cma-es/ (sep-CMA-ES, campaigns) · rollout/ (runner, pool, Ollama)
+├── src-ui/           React + Vite — chat, dashboard, agent manager
+├── scripts/          verify.sh, build-and-deploy.ps1, benchmark-tier2b/, replay-conductor.ts
+├── docs/             ADRs, plans, incident reports
+├── CONTEXT.md        Vocabulary for the native surface + flagged ambiguities
+├── AGENTS.md         Working rules for autonomous coding agents in this repo
+├── PRIORITIES.md     Changelog with commit SHAs and test deltas (through 2026-08-01)
+├── HANDOFF.md        Component-level architecture reference
+└── RECOVERY_STATUS.md  2026-06 WSL recovery provenance
 ```
-
-### Documentation map
-
-| Document | Read this if... |
-|----------|----------------|
-| `CONTEXT.md` | You're new to the project — defines all the phase boundaries and canonical terms |
-| `AGENTS.md` | You're an autonomous coding agent about to make changes |
-| `PRIORITIES.md` | You want the full shipped changelog with test counts and commit SHAs |
-| `HANDOFF.md` | You're diving into component-level implementation details |
-| `RECOVERY_STATUS.md` | You want to understand the recovery provenance |
-| `docs/MASTER_PLAN.md` | You want the long-range platform roadmap |
 
 ---
 
 ## Repo origins
 
-This codebase started as `home-base-recovered` after a **2026-06 WSL disk wipe** destroyed the original tree. It was recovered from backup, rebuilt, and extended far beyond where the original was. The GitHub remote is now `Daedalus`.
+This tree began as `home-base-recovered` after a **2026-06 WSL disk wipe** destroyed the original. It was reconstructed — partly from backups, partly from agent transcripts — and rebuilt well past where it had been. The first two commits, both dated 2026-06-18, are that recovery.
 
-The Rust crate is `home-base` (v0.1.0), the Bun server is `server-jarvis` (v3.0.0), and the app surface is branded **Jarvis** (`com.jarvis.desktop`). These different names come from different layers of the stack — they all point to the same desktop agent platform.
-
-**Current test health:** 1,964 Bun tests across 142 files · 115 Cargo tests · both `tsc` jobs clean.
+The Rust crate is `home-base`, the Bun package is `server-jarvis` v3.0.0, the app bundle is `com.jarvis.desktop`, and the remote is `Daedalus`. Four names, one system. `RECOVERY_STATUS.md` has the provenance.
 
 ---
 
 ## License
 
-MIT — see the Rust crate [`Cargo.toml`](src-tauri/Cargo.toml).
+MIT — see [LICENSE](LICENSE). Copyright © 2026 Ethan Jones.
 
 ---
 
 <div align="center">
-
-**Daedalus / Jarvis** — Built with Rust, Bun, and TypeScript
 
 [GitHub](https://github.com/ethanjones1132-lab/Daedalus) · [Issues](https://github.com/ethanjones1132-lab/Daedalus/issues)
 
