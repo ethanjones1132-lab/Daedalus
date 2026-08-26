@@ -87,14 +87,16 @@ export default function SystemStatusBar() {
     return () => clearInterval(interval);
   }, [fetchHealth]);
 
-  // Derive overall status
-  const bunUp = health?.bun_server.running ?? false;
-  const ollamaUp = health?.ollama.running ?? false;
-  const bridgeUp = health?.bridge.running ?? false;
+  // Derive overall status. Each section is optional at runtime even though the
+  // interface declares it: get_system_health is served by the native surface,
+  // and a partial answer used to throw here and unmount the whole JarvisView.
+  const bunUp = health?.bun_server?.running ?? false;
+  const ollamaUp = health?.ollama?.running ?? false;
+  const bridgeUp = health?.bridge?.running ?? false;
 
   const coreHealthy = bunUp && bridgeUp; // Bun + bridge are essential
-  const memoryPct = health?.memory.used_percent ?? 0;
-  const diskPct = health?.disk.use_percent ? parseFloat(health.disk.use_percent.replace('%', '')) : 0;
+  const memoryPct = health?.memory?.used_percent ?? 0;
+  const diskPct = health?.disk?.use_percent ? parseFloat(health.disk.use_percent.replace('%', '')) : 0;
 
   // Inference health: any backend with >10% error rate in recent window
   const hasInferenceErrors = inferenceMetrics && inferenceMetrics.window_size > 0 &&
