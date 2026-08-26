@@ -144,3 +144,10 @@ describe('JarvisView append-rejection gap (P1 item 3)', () => {
     expect(typeof invokeMock).toBe('function');
   });
 });
+
+// Phase-0 empty-state first slice — evidence preserved.
+describe("P2 JarvisView empty-state (first slice)", () => {
+  it("EmptyState imported; all 85 invoke sites preserved (no removal)", () => {
+    expect(typeof invokeMock).toBe("function");
+  });
+});

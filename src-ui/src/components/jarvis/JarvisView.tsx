@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useLayoutEffect, memo } from 
 import { motion, AnimatePresence } from 'framer-motion';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
-import { cn } from '../ui';
+import { cn, EmptyState } from '../ui';
 import type { CompanionState } from './types';
 import {
   JarvisSession, JarvisMessage, JarvisConfig, JarvisStatus, SessionRunRecord,
@@ -1698,6 +1698,8 @@ export function ChatPanel({
             </div>
           </div>
         )}
+
+        {messages.length === 0 && <EmptyState message="No messages yet" />}
 
         {messages.map((msg, i) => (
           <ChatMessage
