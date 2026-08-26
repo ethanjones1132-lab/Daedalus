@@ -330,8 +330,8 @@ export default function SystemHealthView() {
                   {inferenceMetrics.backends.map((b) => (
                     <div key={b.backend} className="text-xs flex items-center gap-3 flex-wrap">
                       <span className="font-mono text-bone font-medium w-28 shrink-0">{b.backend}</span>
-                      <Pill variant={b.error_rate > 0.1 ? 'error' : b.error_rate > 0 ? 'warn' : 'success'}>
-                        {b.errors}/{b.requests} err
+                      <Pill variant={(b?.error_rate ?? 0) > 0.1 ? 'error' : (b?.error_rate ?? 0) > 0 ? 'warn' : 'success'}>
+                        {(b?.errors ?? 0)}/{(b?.requests ?? 1)} err
                       </Pill>
                       <span className="font-mono text-bone/50 text-[10px]">p50 {b.p50_ms}ms</span>
                       <span className="font-mono text-bone/50 text-[10px]">p95 {b.p95_ms}ms</span>

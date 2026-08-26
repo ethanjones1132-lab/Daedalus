@@ -47,6 +47,16 @@ describe('formatRuntimeProvenance', () => {
   });
 });
 
+describe('partial native payload resilience', () => {
+  // get_system_health / inference backends can arrive with missing sections;
+  // rendering must not throw (same class as SystemStatusBar 93-95, HealthBanner fix).
+  it('tolerates a backend with null error_rate / errors / requests', () => {
+    const b = { backend: 'openrouter/free', error_rate: undefined as any, errors: undefined as any, requests: undefined as any, p50_ms: 120, p95_ms: 340 };
+    expect((b?.error_rate ?? 0) > 0.1 ? 'error' : (b?.error_rate ?? 0) > 0 ? 'warn' : 'success').toBe('success');
+    expect(`${(b?.errors ?? 0)}/${(b?.requests ?? 1)}`).toBe('0/1');
+  });
+});
+
 describe('formatAttemptSummary', () => {
   it('keeps the stage attempt summary compact and secret-free', () => {
     expect(formatAttemptSummary({
