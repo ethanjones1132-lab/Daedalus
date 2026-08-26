@@ -30,8 +30,11 @@ export function usePolling(
     }
   }, []);
 
-  // Start/stop based on visibility
+  // Start/stop based on visibility; also restart on dependency change
+  // so a new callback reference (e.g., new fetchStatus) does not keep
+  // calling a stale savedCallback.current (stale-read loop, line 20).
   useEffect(() => {
+    stopPolling(); // restart on any dependency change (clear old interval first)
     const handleVisibility = () => {
       if (document.hidden) {
         stopPolling();
