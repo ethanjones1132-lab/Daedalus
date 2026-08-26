@@ -58,6 +58,9 @@ export function ModelProfilesView() {
   const [pendingDelete, setPendingDelete] = useState<ModelProfile | null>(null);
   const { success, error: toastError } = useToast();
 
+  const [discovering, setDiscovering] = useState(false);
+  const [discovered, setDiscovered] = useState<string[]>([]);
+
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -99,6 +102,19 @@ export function ModelProfilesView() {
       toastError(String(e), 'Delete failed');
     }
   }, [pendingDelete, load, success, toastError]);
+
+  const discover = useCallback(async () => {
+    setDiscovering(true);
+    setDiscovered([]);
+    try {
+      const models = await invoke<{ id: string; name: string; provider: string }[]>('jarvis_discover_models');
+      setDiscovered(models.map((m) => `${m.provider}/${m.name}`));
+    } catch (e) {
+      setDiscovered([]);
+    } finally {
+      setDiscovering(false);
+    }
+  }, []);
 
   const create = useCallback(async () => {
     if (!form.name.trim() || !form.model.trim()) {
@@ -165,6 +181,14 @@ export function ModelProfilesView() {
               )}
             >
               {showNew ? '✕ Cancel' : '+ New profile'}
+            </button>
+            <button
+              type="button"
+              onClick={discover}
+              disabled={discovering}
+              className="px-3 py-1.5 text-xs rounded-lg border border-cyan-400/30 text-cyan-200 hover:bg-cyan-400/10 disabled:opacity-50 transition-colors font-mono"
+            >
+              {discovering ? 'Discovering…' : 'Discover models'}
             </button>
           </div>
         }
@@ -240,6 +264,14 @@ export function ModelProfilesView() {
           <EmptyState message="No model profiles yet. Create one above to get started." />
         ) : (
           <>
+            {discovered.length > 0 && (
+              <div className="mb-2">
+                <div className="text-[10px] font-mono font-bold text-cyan-200/70 uppercase tracking-wider mb-1">Discovered</div>
+                <div className="flex flex-wrap gap-2">{discovered.map((d) => (
+                  <span key={d} className="px-2 py-0.5 text-[11px] font-mono rounded border border-cyan-400/20 text-cyan-100 bg-cyan-400/10">{d}</span>
+                ))}</div>
+              </div>
+            )}
             {activeProfile && (
               <div className="text-[10px] font-mono text-bone/40 px-1 mb-1">
                 Active: <span className="text-emerald-300">{activeProfile.name}</span>
