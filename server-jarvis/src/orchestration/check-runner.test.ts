@@ -201,3 +201,14 @@ describe("honesty-gate regression (check-runner:35-43)", () => {
   });
 });
 });
+
+describe("honesty-gate fix (check-runner:41-44, iter-035 redo)", () => {
+  const red = { ran: true, passed: false, tier: "none" } as const;
+  const green = { ran: true, passed: true, tier: "full" } as const;
+  test("false-check demotes success to degraded (regression guard)", () => {
+    expect(applyCheckHonestyGate("success", undefined, red)).toEqual({ outcome: "degraded", errorCode: CHECK_HONESTY_GATE_CODE });
+  });
+  test("true-check keeps success (no over-demote — the previously broken case)", () => {
+    expect(applyCheckHonestyGate("success", undefined, green)).toEqual({ outcome: "success" });
+  });
+});

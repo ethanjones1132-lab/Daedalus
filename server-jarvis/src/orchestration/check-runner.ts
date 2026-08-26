@@ -38,8 +38,10 @@ export function applyCheckHonestyGate(
   check: Pick<CheckResult, "ran" | "passed"> | null | undefined,
 ): { outcome: "success" | "degraded" | "failed"; errorCode?: string } {
   if (outcome !== "success") return { outcome, errorCode };
-  if (!check?.ran || check.passed !== false) return { outcome, errorCode };
-  return { outcome: "degraded", errorCode: CHECK_HONESTY_GATE_CODE };
+  if (!check?.ran) return { outcome, errorCode };
+  if (check.passed === true) return { outcome, errorCode };
+  if (check.passed === false) return { outcome: "degraded", errorCode: CHECK_HONESTY_GATE_CODE };
+  return { outcome, errorCode };
 }
 
 const WRITE_TOOL_NAMES = new Set(["write_file", "edit_file", "multi_edit", "apply_patch"]);
