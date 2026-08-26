@@ -111,6 +111,14 @@ export function isEmptyStageOutput(content: string | null | undefined): boolean 
   return !content || content.trim().length === 0;
 }
 
+// Before reporting a stage as completed, verify it produced real content.
+// The self-tuning collector must not treat an empty output as success.
+export function assertStageResultNotEmpty(content: string | null | undefined): void {
+  if (isEmptyStageOutput(content)) {
+    throw new Error("stage-output: empty result reported as success");
+  }
+}
+
 const TOOL_OUTPUT_TRUNCATE_AT = 1000;
 
 function renderToolCalls(toolCalls: ToolCallRecord[]): string {
