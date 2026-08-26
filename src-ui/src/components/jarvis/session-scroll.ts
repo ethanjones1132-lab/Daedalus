@@ -20,4 +20,8 @@ export const sessionScroll = {
   clear(sessionId: string) {
     store.delete(sessionId);
   },
+  rename(oldId: string, newId: string) {
+    const s = store.get(oldId);
+    if (s) { store.set(newId, s); store.delete(oldId); }
+  },
 };
