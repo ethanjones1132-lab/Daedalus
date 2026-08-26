@@ -61,6 +61,13 @@ describe("mergeToCheckResult (build tri-state)", () => {
     expect(mergeToCheckResult({ run: skipped, build: { kind: "clean", command: "x" }, hadWrittenCode: false }))
       .toMatchObject({ tier: "none", ran: false });
   });
+
+  test("no-written path forces none tier with declinedReason", () => {
+    const result = mergeToCheckResult({ run: skipped, build: { kind: "clean", command: "x" }, hadWrittenCode: false });
+    expect(result.tier).toBe("none");
+    expect(result.ran).toBe(false);
+    expect(result.declinedReason).toBe("no_code_written");
+  });
 });
 
 describe("CheckResult explains a none tier", () => {
