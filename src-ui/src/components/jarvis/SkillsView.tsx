@@ -489,6 +489,8 @@ function SkillDetail({
 
 export function SkillsView() {
   const [skills, setSkills] = useState<Skill[]>([]);
+  const [runtimeSkills, setRuntimeSkills] = useState<any[]>([]);
+  const [runtimeTools, setRuntimeTools] = useState<any[]>([]);
   const [candidates, setCandidates] = useState<Record<string, SkillCandidateDetail>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -508,6 +510,15 @@ export function SkillsView() {
       }
       const list = await invoke<Skill[]>('list_skills');
       setSkills(list);
+      // Native capability access: jarvis_get_skills / jarvis_get_tools (registered lib.rs:1422)
+      try {
+        const sk = await invoke<any[]>('jarvis_get_skills');
+        setRuntimeSkills(sk ?? []);
+      } catch { /* native command unavailable to this build */ }
+      try {
+        const tl = await invoke<any[]>('jarvis_get_tools');
+        setRuntimeTools(tl ?? []);
+      } catch { /* native command unavailable to this build */ }
     } catch (e) {
       setError(String(e));
     } finally {
@@ -732,6 +743,15 @@ export function SkillsView() {
             </ul>
           )}
         </div>
+
+        {/* Native surface list: jarvis_get_skills / jarvis_get_tools (lib.rs:1422) */}
+        {(runtimeSkills.length > 0 || runtimeTools.length > 0) && (
+          <div className="mb-3 p-3 text-xs space-y-2 border-t border-white/10">
+            <div className="font-semibold text-cyan-200">Jarvis runtime — skills &amp; tools (native)</div>
+            {runtimeSkills.length > 0 && <div><span className="text-white/60">skills:</span> {runtimeSkills.map((s:any)=>s.name||JSON.stringify(s)).join(', ')}</div>}
+            {runtimeTools.length > 0 && <div><span className="text-white/60">tools:</span> {runtimeTools.map((t:any)=>t.name||JSON.stringify(t)).join(', ')}</div>}
+          </div>
+        )}
 
         {selected && (
           <div className="w-1/2 min-h-0">

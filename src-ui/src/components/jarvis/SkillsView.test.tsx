@@ -159,4 +159,21 @@ describe('SkillsView — distilled candidate actions (D5)', () => {
     });
     expect(screen.getByText(/sess_1/)).toBeInTheDocument();
   });
+
+  // Regression test: jarvis_get_skills / jarvis_get_tools must be invoked (native
+  // surface reachability). Fails if either call site is lost (guard verifies set).
+  it('invokes jarvis_get_skills and jarvis_get_tools when SkillsView loads', async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'jarvis_get_skills') return [{ name: 'review' }];
+      if (cmd === 'jarvis_get_tools') return [{ name: 'lint' }];
+      if (cmd === 'list_skills') return [];
+      if (cmd === 'sync_distilled_skill_candidates') return 0;
+      return undefined;
+    });
+    renderSkillsView();
+    await waitFor(() => {
+      expect(invokeMock.mock.calls.some((c: any[]) => c[0] === 'jarvis_get_skills')).toBe(true);
+      expect(invokeMock.mock.calls.some((c: any[]) => c[0] === 'jarvis_get_tools')).toBe(true);
+    });
+  });
 });
