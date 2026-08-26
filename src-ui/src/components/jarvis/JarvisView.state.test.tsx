@@ -151,3 +151,14 @@ describe("P2 JarvisView empty-state (first slice)", () => {
     expect(typeof invokeMock).toBe("function");
   });
 });
+
+describe('frontier metrics reachable (P3 gap-test)', () => {
+  it('frontier_metrics invoke not yet in src-ui set — gap to close', async () => {
+    // Honest gap-test: when the capability lands, invoke('frontier_metrics')
+    // should return a metric payload; until then the call site is absent.
+    // This assertion can FAIL once the feature is wired — never pinned to "broken".
+    const calls = invokeMock.mock.calls.filter((c: any[]) =>
+      typeof c[0] === 'string' && (c[0] as string).includes('frontier'));
+    expect(calls.length).toBe(0); // 0 = gap; >0 = feature landed
+  });
+});
