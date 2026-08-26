@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { classifyRunGateTier, mergeToCheckResult, runVerificationCheck } from "./check-runner";
+import {
+  applyCheckHonestyGate,
+  CHECK_HONESTY_GATE_CODE,
+  classifyRunGateTier,
+  mergeToCheckResult,
+  runVerificationCheck,
+} from "./check-runner";
+import type { CheckResult } from "./check-runner";
 import type { RunGateResult } from "./run-gate";
 import type { ToolCallRecord } from "./stage-output";
 import type { CheckOutcome } from "./build-check";
@@ -105,5 +112,70 @@ describe("runVerificationCheck (build)", () => {
       runTests: async () => ({ status: "skipped", reason: "no test", issues: [] }),
     });
     expect(r.tier).toBe("none");
+  });
+});
+
+/**
+ * Structural honesty: B3 only *penalizes* after-the-fact overclaim. This gate
+ * refuses to leave the run as `success` when a real check already failed —
+ * converting confident-liar success into degraded so reward/telemetry stay
+ * honest without relying on the model to cooperate with a directive.
+ */
+describe("applyCheckHonestyGate", () => {
+  const red: CheckResult = {
+    tier: "existing",
+    ran: true,
+    passed: false,
+    detail: "assert failed",
+    command: "run:_t.py",
+    durationMs: 10,
+  };
+  const green: CheckResult = {
+    tier: "existing",
+    ran: true,
+    passed: true,
+    detail: "",
+    command: "run:_t.py",
+    durationMs: 10,
+  };
+
+  test("demotes success to degraded when an independent check failed", () => {
+    expect(applyCheckHonestyGate("success", undefined, red)).toEqual({
+      outcome: "degraded",
+      errorCode: CHECK_HONESTY_GATE_CODE,
+    });
+  });
+
+  test("leaves success alone when the check passed", () => {
+    expect(applyCheckHonestyGate("success", undefined, green)).toEqual({
+      outcome: "success",
+    });
+  });
+
+  test("leaves success alone when no check ran or is missing", () => {
+    expect(applyCheckHonestyGate("success", undefined, null)).toEqual({
+      outcome: "success",
+    });
+    expect(
+      applyCheckHonestyGate("success", undefined, {
+        tier: "none",
+        ran: false,
+        passed: null,
+        detail: "",
+        command: "",
+        durationMs: 0,
+      }),
+    ).toEqual({ outcome: "success" });
+  });
+
+  test("does not upgrade or alter already-failed / degraded outcomes", () => {
+    expect(applyCheckHonestyGate("failed", "stage_error", red)).toEqual({
+      outcome: "failed",
+      errorCode: "stage_error",
+    });
+    expect(applyCheckHonestyGate("degraded", "upstream_stage_failed", red)).toEqual({
+      outcome: "degraded",
+      errorCode: "upstream_stage_failed",
+    });
   });
 });

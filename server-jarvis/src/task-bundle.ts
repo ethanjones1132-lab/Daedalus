@@ -39,6 +39,13 @@ const RUN_BG_DEF = def("run_background_command",
     powershell: { type: "boolean", description: "Run via PowerShell instead of bash" },
     cwd: { type: "string", description: "Working directory" },
     description: { type: "string", description: "Short label for the task" },
+    timeout_ms: {
+      type: "number",
+      description:
+        "Max run time in milliseconds before the process is killed " +
+        "(default 300000 / 5 min, max 1800000 / 30 min). " +
+        "Required for non-terminating commands — without a bound, a hung child can stall the whole session.",
+    },
   }, ["command"], true, { class: "shell", evidence: "execution" });
 
 const AGENT_DEF = def("agent",

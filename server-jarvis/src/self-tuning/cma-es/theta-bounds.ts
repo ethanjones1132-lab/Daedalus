@@ -102,6 +102,16 @@ export function projectToBounds(vector: number[]): number[] {
   return out;
 }
 
+/**
+ * Per-dimension box width (max - min), in THETA_KEYS order. Feeds the
+ * optimizer's initial per-dimension diagonal scale so a single raw-unit
+ * stepSize produces a comparable *proportional* step on every dimension,
+ * not just the width-1 ratio01 dims it happens to be tuned for.
+ */
+export function thetaBoundWidths(): number[] {
+  return THETA_KEYS.map((key) => THETA_BOUNDS[key].max - THETA_BOUNDS[key].min);
+}
+
 /** True when every dimension of a THETA_KEYS-order vector is already valid. */
 export function vectorInBounds(vector: number[]): boolean {
   if (vector.length !== THETA_KEYS.length) return false;

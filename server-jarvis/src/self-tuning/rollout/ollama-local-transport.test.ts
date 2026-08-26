@@ -135,6 +135,27 @@ describe("callOllamaChat", () => {
     expect(result.prompt_eval_count).toBe(100);
   });
 
+  test("when seed is set, request options block contains that seed", async () => {
+    let captured: Record<string, unknown> | null = null;
+    const fetchFn = async (_input: RequestInfo | URL, init?: RequestInit) => {
+      captured = JSON.parse(String(init?.body ?? "{}"));
+      return jsonResponse({
+        message: { role: "assistant", content: "ok", tool_calls: [] },
+      });
+    };
+
+    await callOllamaChat(
+      makeTarget(),
+      [{ role: "user", content: "hi" }],
+      { seed: 42, temperature: 0.2 },
+      { fetch: fetchFn as typeof fetch },
+    );
+
+    expect(captured).not.toBeNull();
+    const options = captured!.options as Record<string, number>;
+    expect(options.seed).toBe(42);
+  });
+
   test("tools absent when text-protocol (useNativeTools false)", async () => {
     let captured: Record<string, unknown> | null = null;
     const fetchFn = async (_input: RequestInfo | URL, init?: RequestInit) => {

@@ -22,7 +22,9 @@ export const LOCAL_MODEL_DIRECTIVES: Readonly<Record<string, string>> = {
     "Before editing a symbol, confirm by reading which file textually contains " +
     "its definition (grep/read the definition site). An import line names a " +
     "module; that is not proof the definition lives in the imported path. " +
-    "Do not attribute a symbol to a file from imports alone.",
+    "Do not attribute a symbol to a file from imports alone. " +
+    "After editing, run the adjacent test and read its real output. Do not " +
+    "report success from reasoning or confidence alone.",
 
   "qwythos9b-conductor":
     "Before editing a symbol, confirm by reading which file textually contains " +

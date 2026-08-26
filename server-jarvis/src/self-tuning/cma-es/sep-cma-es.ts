@@ -23,6 +23,15 @@ export interface SepCmaEsOptions {
   bounds: (v: number[]) => number[];
   popSize?: number; // default 4 + floor(3 * ln(dim)) — 15 for dim=43
   rng?: () => number; // uniform [0,1); inject for deterministic tests
+  /**
+   * Initial per-dimension diagonal scale (sqrt of diagonal covariance).
+   * Defaults to all-1s, which assumes every dimension shares initialSigma's
+   * natural scale. For a parameterization spanning many orders of magnitude,
+   * pass each dimension's box width via `thetaBoundWidths()` so a single
+   * initialSigma is a comparable fraction of every range (see run-cma-es
+   * DEFAULT_INITIAL_SIGMA — campaigns pass initialD for this reason).
+   */
+  initialD?: number[];
 }
 
 export class SepCmaEs {
@@ -54,6 +63,9 @@ export class SepCmaEs {
       throw new Error(`initialMean length ${opts.initialMean.length} != dim ${opts.dim}`);
     }
     if (!(opts.initialSigma > 0)) throw new Error("initialSigma must be > 0");
+    if (opts.initialD !== undefined && opts.initialD.length !== opts.dim) {
+      throw new Error(`initialD length ${opts.initialD.length} != dim ${opts.dim}`);
+    }
     this.n = opts.dim;
     this.lambda = opts.popSize ?? 4 + Math.floor(3 * Math.log(opts.dim));
     this.mu = Math.floor(this.lambda / 2);
@@ -77,7 +89,7 @@ export class SepCmaEs {
     this.rand = opts.rng ?? Math.random;
     this.m = [...opts.initialMean];
     this.stepSize = opts.initialSigma;
-    this.d = new Array(n).fill(1);
+    this.d = opts.initialD ? [...opts.initialD] : new Array(n).fill(1);
     this.pC = new Array(n).fill(0);
     this.pSigma = new Array(n).fill(0);
   }

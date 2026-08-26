@@ -52,6 +52,36 @@ describe("runRolloutBatch", () => {
   test("handles an empty candidate list without hanging", async () => {
     expect(await runRolloutBatch([], tasks, inertModel)).toEqual([]);
   });
+
+  test("derives distinct deterministic per-task seeds from candidate.seed", async () => {
+    const seedsByTask: Record<string, number | undefined> = {};
+    const spy: CallModelFn = async (_messages, options) => {
+      // First model call of each rollout is enough to capture the injected seed.
+      // We key by a stable id derived from... we don't have task name on options,
+      // so collect all seeds seen and assert the expected multiset.
+      const s = options?.seed;
+      if (s !== undefined) {
+        seedsByTask[String(s)] = (seedsByTask[String(s)] ?? 0) + 1;
+      }
+      return { content: "no tools." };
+    };
+
+    const base = 5;
+    await runRolloutBatch(
+      [{ theta: BASELINE_THETA, seed: base }],
+      tasks,
+      spy,
+      { concurrency: 1 },
+    );
+
+    // taskIndex 0 → 5*1000+0 = 5000; taskIndex 1 → 5001
+    const expected = tasks.map((_, t) => base * 1000 + t);
+    for (const e of expected) {
+      expect(seedsByTask[String(e)], `expected seed ${e}`).toBeGreaterThan(0);
+    }
+    // No bare candidate.seed (without per-task derivation).
+    expect(seedsByTask[String(base)]).toBeUndefined();
+  });
 });
 
 describe("meanReward", () => {

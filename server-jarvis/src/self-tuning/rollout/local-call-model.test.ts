@@ -94,6 +94,65 @@ describe("makeLocalCallModel", () => {
     expect(callModel.stats.calls).toBe(1);
   });
 
+  /**
+   * Silent-quitter diagnostics: empty `content` with native tool_calls is a
+   * normal agentic turn, not a template failure. Counting those as emptyContent
+   * conflated "model is broken" with "model is calling tools" — especially on
+   * Gemma imports where native tool use is common.
+   */
+  test("empty content with native tool_calls is not counted as emptyContentTurns", async () => {
+    const cfg = defaultConfig();
+    cfg.ollama.base_url = `${BASE}/v1`;
+    const callModel = makeLocalCallModel(cfg, {
+      localModelsOverride: ["qwen3.5:4b"],
+      deps: {
+        fetch: makeFetch({
+          chat: () => ({
+            message: {
+              role: "assistant",
+              content: "",
+              tool_calls: [
+                {
+                  id: "c1",
+                  type: "function",
+                  function: {
+                    name: "read_file",
+                    arguments: JSON.stringify({ path: "a.py" }),
+                  },
+                },
+              ],
+            },
+            model: "qwen3.5:4b",
+            prompt_eval_count: 50,
+          }),
+        }) as typeof fetch,
+      },
+    });
+
+    const result = await callModel(
+      [{ role: "user", content: "hi" }],
+      {
+        stageLabel: "executor",
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "read_file",
+              description: "read",
+              parameters: { type: "object", properties: { path: { type: "string" } } },
+            },
+          },
+        ] as never,
+      },
+    );
+
+    expect(result.content).toBe("");
+    expect(result.tool_calls?.length).toBeGreaterThan(0);
+    expect(callModel.stats.emptyContentTurns).toBe(0);
+    expect(callModel.stats.thinkingOnlyTurns).toBe(0);
+    expect(callModel.stats.toolOnlyTurns).toBe(1);
+  });
+
   test("non-ollama pool pick pins local model and increments nonLocalPickFallbacks", async () => {
     const cfg = defaultConfig();
     cfg.ollama.base_url = `${BASE}/v1`;
@@ -277,6 +336,35 @@ describe("makeLocalCallModel", () => {
     expect(result.tool_calls?.[0]?.name).toBe("edit_file");
   });
 
+  test("seed passed in CallModelFn options reaches the Ollama options block", async () => {
+    const cfg = defaultConfig();
+    cfg.ollama.base_url = `${BASE}/v1`;
+    let capturedSeed: number | undefined;
+    const callModel = makeLocalCallModel(cfg, {
+      localModelsOverride: ["qwen3.5:4b"],
+      deps: {
+        fetch: makeFetch({
+          chat: (body) => {
+            const options = body.options as Record<string, number> | undefined;
+            capturedSeed = options?.seed;
+            return {
+              message: { role: "assistant", content: "ok" },
+              model: "qwen3.5:4b",
+              prompt_eval_count: 10,
+            };
+          },
+        }) as typeof fetch,
+      },
+    });
+
+    await callModel([{ role: "user", content: "hi" }], {
+      stageLabel: "executor",
+      seed: 99,
+    });
+
+    expect(capturedSeed).toBe(99);
+  });
+
   test("text-protocol when model lacks tools capability", async () => {
     const cfg = defaultConfig();
     cfg.ollama.base_url = `${BASE}/v1`;
@@ -412,6 +500,64 @@ describe("makeLocalCallModel", () => {
     expect(capturedSystem).toContain("Base system.");
     expect(capturedSystem).toContain(AGENT_SYSTEM_PROMPT_HEADER);
     expect(capturedSystem).toContain(expected!);
+    expect(callModel.stats.directivesApplied).toBe(1);
+  });
+
+  /**
+   * Item 3: Qwythos overclaimed in the sweep despite a "run the test / no
+   * confidence alone" directive. Prove the splice actually lands for that
+   * model id (including :latest) so remaining overclaims are model noncompliance,
+   * not a wiring miss.
+   */
+  test("qwythos9b-conductor directive lands in the outgoing Ollama system message", async () => {
+    const cfg = defaultConfig();
+    cfg.ollama.base_url = `${BASE}/v1`;
+    const expected = directiveForModel("qwythos9b-conductor:latest");
+    expect(expected).toBeDefined();
+    expect(expected!).toContain("read its real output");
+
+    let capturedSystem: string | undefined;
+    let capturedModel: string | undefined;
+    const callModel = makeLocalCallModel(cfg, {
+      localModelsOverride: ["qwythos9b-conductor:latest"],
+      deps: {
+        fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input);
+          if (url.endsWith("/api/tags")) {
+            return jsonResponse({ models: [{ name: "qwythos9b-conductor:latest" }] });
+          }
+          if (url.endsWith("/api/show")) {
+            return jsonResponse({ capabilities: ["tools", "completion"] });
+          }
+          if (url.endsWith("/api/chat")) {
+            const body = JSON.parse(String(init?.body ?? "{}")) as {
+              messages?: Array<{ role: string; content: string }>;
+              model?: string;
+            };
+            capturedModel = body.model;
+            capturedSystem = body.messages?.find((m) => m.role === "system")?.content;
+            return jsonResponse({
+              message: { role: "assistant", content: "ok", tool_calls: [] },
+              model: body.model,
+              prompt_eval_count: 10,
+              eval_count: 5,
+            });
+          }
+          throw new Error(`unexpected url ${url}`);
+        }) as typeof fetch,
+      },
+    });
+
+    await callModel(
+      [{ role: "system", content: "Base." }, { role: "user", content: "fix" }],
+      { stageLabel: "executor" },
+    );
+
+    expect(capturedModel).toMatch(/qwythos9b-conductor/i);
+    expect(capturedSystem).toContain(AGENT_SYSTEM_PROMPT_HEADER);
+    expect(capturedSystem).toContain(expected!);
+    expect(capturedSystem).toContain("not report success from reasoning or confidence alone");
+    expect(callModel.stats.directivesApplied).toBe(1);
   });
 
   test("outgoing system message is byte-identical for an unknown model (no directive splice)", async () => {
@@ -445,5 +591,6 @@ describe("makeLocalCallModel", () => {
     // No directive for qwen3.5:4b → system content unchanged (no header splice).
     expect(capturedSystem).toBe(baseSystem);
     expect(capturedSystem).not.toContain(AGENT_SYSTEM_PROMPT_HEADER);
+    expect(callModel.stats.directivesApplied).toBe(0);
   });
 });

@@ -4,7 +4,12 @@ import { deriveEvidenceTaskKind } from "./turn-requirements";
 import { injectToolGuidelines } from "./tool-guidelines";
 import { checkWrittenFilesSyntax, renderSyntaxIssues, type SyntaxIssue } from "./syntax-gate";
 import { renderRunIssues, runWrittenCodeGate, type RunGateResult } from "./run-gate";
-import { mergeToCheckResult, runVerificationCheck, type CheckResult } from "./check-runner";
+import {
+  applyCheckHonestyGate,
+  mergeToCheckResult,
+  runVerificationCheck,
+  type CheckResult,
+} from "./check-runner";
 import { runBuildCheck, writtenPathsFrom } from "./build-check";
 import { ensureVerificationWorkspaceCached } from "./verification-workspace";
 import { BUILTIN_MODES, executorTurnLimit, getToolsForMode } from "./modes";
@@ -6220,7 +6225,7 @@ export class PipelineExecutor {
           writeEffects: this.ctx.write_effects,
         };
       }
-      const gated = applyEffectGate(
+      let gated = applyEffectGate(
         upstreamDegraded ? "degraded" : "success",
         upstreamDegraded ? "upstream_stage_failed" : undefined,
         // 2026-07-26 (Rung 1, plan §3.1): both fallback effect-gate calls
@@ -6241,6 +6246,8 @@ export class PipelineExecutor {
           }),
         }),
       );
+      // Structural honesty: a failed independent check cannot remain success.
+      gated = applyCheckHonestyGate(gated.outcome, gated.errorCode, this.lastCheckResult);
       // No synthesizer in this pipeline: fall back to the last completed phase.
       const noWriteEvidence = gated.errorCode === "effect_gate_no_write_effect"
         ? composeEvidenceFallbackAnswer(state)
@@ -6300,6 +6307,12 @@ export class PipelineExecutor {
         }),
       }),
     ));
+    // Structural honesty: refuse success when the independent check already failed.
+    // Applied before sticky-partial so a hard failed effect-gate stays failed,
+    // and after effect-gate so write-effect failures remain primary.
+    if (outcome === "success") {
+      ({ outcome, errorCode } = applyCheckHonestyGate(outcome, errorCode, this.lastCheckResult));
+    }
     // Task 6: sticky no-tool partial outranks a soft degraded effect-gate
     // result so the typed executor_no_tool code remains visible. A hard
     // failed effect-gate (terminal repeated write failures) stays failed.

@@ -154,7 +154,10 @@ def authorize(token, now):
     return now > token['expires_at']
 """,
         },
-        "spec": "Valid tokens must be unrevoked and not expired; expired or revoked tokens must raise PermissionError.",
+        "spec": "Valid tokens must be unrevoked and not expired; expired or revoked tokens must raise "
+        "PermissionError. Bug report: a token with expires_at=1000 is rejected as invalid at now=500 "
+        "(should be valid — not yet expired) but accepted as valid at now=1500 (should be rejected — "
+        "already expired). The comparison in tokens.py has the expiry check backwards.",
         "test": """from session import authorize
 assert authorize({'expires_at': 1000, 'revoked': False}, 500) is True
 for token, now in [({'expires_at': 1000, 'revoked': False}, 1500), ({'expires_at': 2000, 'revoked': True}, 500)]:

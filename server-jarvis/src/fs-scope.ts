@@ -142,8 +142,14 @@ function isContained(root: string, candidate: string): boolean {
  */
 const HALLUCINATED_ROOT_SEGMENTS = new Set(["workspace"]);
 
-/** Strip zero or more leading hallucinated placeholder segments. */
-function stripHallucinatedRootSegments(segments: readonly string[]): string[] {
+/**
+ * Strip zero or more leading hallucinated placeholder segments.
+ *
+ * Exported so every consumer of a model-supplied path repairs it the same way.
+ * A second copy of this rule elsewhere would drift from `HALLUCINATED_ROOT_SEGMENTS`
+ * and reintroduce the writer/verifier disagreement it exists to prevent.
+ */
+export function stripHallucinatedRootSegments(segments: readonly string[]): string[] {
   let start = 0;
   while (start < segments.length - 1 && HALLUCINATED_ROOT_SEGMENTS.has(segments[start].toLowerCase())) {
     start++;

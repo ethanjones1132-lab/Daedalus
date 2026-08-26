@@ -1,8 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { BASELINE_THETA } from "../../orchestration/orchestration-policy";
 import type { CallModelFn } from "../../orchestration/coordinator";
 import { TRAINING_TASKS } from "./fixture-tasks";
-import { runOneRollout } from "./rollout-runner";
+import {
+  buildFixtureRolloutRequest,
+  runGradedFixtureCheck,
+  runOneRollout,
+} from "./rollout-runner";
 
 const hiddenFileTask = TRAINING_TASKS.find((t) => t.name === "pkg_discount")!;
 
@@ -14,6 +21,39 @@ const hiddenFileTask = TRAINING_TASKS.find((t) => t.name === "pkg_discount")!;
  */
 
 const task = TRAINING_TASKS.find((t) => t.name === "merge_intervals")!;
+
+/**
+ * Phase-D fixtures are test-driven: the graded oracle lives at `_t.py`.
+ * Naming it in the request closes the dominant failure mode (models that
+ * never discover or run the test). This is a deliberate semantic shift from
+ * blind-fix to "fix and verify against the seeded oracle."
+ */
+describe("buildFixtureRolloutRequest", () => {
+  test("names the graded test and requires running it before success", () => {
+    const request = buildFixtureRolloutRequest(task);
+    expect(request).toContain(task.spec);
+    expect(request).toContain(task.entry);
+    expect(request).toContain("_t.py");
+    expect(request.toLowerCase()).toContain("run");
+    expect(request.toLowerCase()).toMatch(/do not (edit|delete)/);
+  });
+
+  test("runOneRollout surfaces that request text to the model", async () => {
+    const seenUser: string[] = [];
+    const spy: CallModelFn = async (messages) => {
+      for (const m of messages) {
+        if (m.role === "user" && typeof m.content === "string") {
+          seenUser.push(m.content);
+        }
+      }
+      return { content: "I have considered it." };
+    };
+    await runOneRollout({ theta: BASELINE_THETA, task, seed: 9 }, spy);
+    const joined = seenUser.join("\n");
+    expect(joined).toContain("_t.py");
+    expect(joined).toContain(task.entry);
+  });
+});
 
 /** Model that edits the entry file with a correct fix. */
 const fixingModel: CallModelFn = async (_messages, options) => {
@@ -54,6 +94,19 @@ const fixingModel: CallModelFn = async (_messages, options) => {
 const inertModel: CallModelFn = async () => ({ content: "I have considered it." });
 
 describe("runOneRollout", () => {
+  test("injects RolloutSpec.seed into every model call", async () => {
+    const seedsSeen: Array<number | undefined> = [];
+    const spyModel: CallModelFn = async (_messages, options) => {
+      seedsSeen.push(options?.seed);
+      return { content: "I have considered it." };
+    };
+
+    await runOneRollout({ theta: BASELINE_THETA, task, seed: 7 }, spyModel);
+
+    expect(seedsSeen.length).toBeGreaterThan(0);
+    expect(seedsSeen.every((s) => s === 7)).toBe(true);
+  });
+
   test("refuses to run without the NODE_ENV=test DB guard", async () => {
     const original = process.env.NODE_ENV;
     process.env.NODE_ENV = "production";
@@ -148,5 +201,165 @@ describe("runOneRollout", () => {
     expect(outcome.reward).toBeLessThanOrEqual(0);
     expect(outcome.breakdown.creditedWritePaths).toEqual([]);
     expect(outcome.task).toBe(task.name);
+  });
+
+  // Anti-gaming wiring: without re-seeding authenticTest, a model that
+  // neuters `_t.py` to `assert True` after a wrong edit would farm check=1
+  // and a near-full reward. Production always re-seeds from fixture.test.
+  test("a model that neuters _t.py cannot farm a passing check for a wrong fix", async () => {
+    const tamperingModel: CallModelFn = async (_messages, options) => {
+      if (options?.stageLabel === "executor") {
+        return {
+          content: "fixed and verified",
+          tool_calls: [
+            {
+              id: "call_1",
+              type: "function",
+              function: {
+                name: "write_file",
+                arguments: JSON.stringify({
+                  path: task.entry,
+                  // Intentionally broken — would fail the real oracle.
+                  content: "def merge_intervals(intervals):\n    return intervals\n",
+                }),
+              },
+            } as never,
+            {
+              id: "call_2",
+              type: "function",
+              function: {
+                name: "write_file",
+                arguments: JSON.stringify({
+                  path: "_t.py",
+                  content: "assert True\n",
+                }),
+              },
+            } as never,
+          ],
+        };
+      }
+      return { content: "success" };
+    };
+    const outcome = await runOneRollout(
+      { theta: BASELINE_THETA, task, seed: 5 },
+      tamperingModel,
+    );
+    expect(outcome.breakdown.terms.check).toBe(0);
+    // Full success requires a real independent check pass; oracle sabotage
+    // must not unlock the top of the score range.
+    expect(outcome.reward).toBeLessThan(1);
+  });
+});
+
+/**
+ * The graded `_t.py` is the fixture suite's ground-truth oracle. Scoring must
+ * consult it directly rather than depending on whether the pipeline happened
+ * to run a verification pass — a correct fix scored a B2 hard zero whenever
+ * the run terminated through a route that skips the executor-completion check.
+ */
+describe("runGradedFixtureCheck", () => {
+  function workspaceWith(testSource: string): string {
+    const root = mkdtempSync(join(tmpdir(), "graded-check-test-"));
+    writeFileSync(join(root, "_t.py"), testSource, "utf8");
+    return root;
+  }
+
+  test("reports an independent pass when the graded test succeeds", async () => {
+    const root = workspaceWith("assert 1 + 1 == 2\n");
+    try {
+      const check = await runGradedFixtureCheck(root);
+      expect(check?.tier).toBe("existing");
+      expect(check?.ran).toBe(true);
+      expect(check?.passed).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("reports a failure with detail when the graded test fails", async () => {
+    const root = workspaceWith("assert False, 'boom'\n");
+    try {
+      const check = await runGradedFixtureCheck(root);
+      expect(check?.ran).toBe(true);
+      expect(check?.passed).toBe(false);
+      expect(check?.detail).toContain("boom");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("stays bounded when the graded test never terminates", async () => {
+    // A fixture suite exists to make models fix buggy code, so non-terminating
+    // submissions are expected output, not an edge case. One unbounded child
+    // stalled a whole campaign for 65 minutes.
+    const root = workspaceWith("while True:\n    pass\n");
+    try {
+      const startedAt = Date.now();
+      const check = await runGradedFixtureCheck(root, { timeoutMs: 2_000 });
+      expect(Date.now() - startedAt).toBeLessThan(20_000);
+      expect(check?.passed).not.toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("returns null when the workspace carries no graded test", async () => {
+    const root = mkdtempSync(join(tmpdir(), "graded-check-test-"));
+    try {
+      expect(await runGradedFixtureCheck(root)).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * Phase-D anti-gaming: CMA-ES optimizes the graded-check scalar. A model that
+   * neuters or deletes `_t.py` would otherwise farm reward for a wrong (or
+   * empty) fix. Re-seed from the fixture definition before every check.
+   */
+  test("rejects a neutered graded test when authenticTest is supplied", async () => {
+    const authentic = "assert False, 'real oracle still fails'\n";
+    const root = workspaceWith(authentic);
+    try {
+      // Model tampering: replace the oracle with a always-pass stub.
+      writeFileSync(join(root, "_t.py"), "assert True\n", "utf8");
+      const check = await runGradedFixtureCheck(root, { authenticTest: authentic });
+      expect(check?.ran).toBe(true);
+      expect(check?.passed).toBe(false);
+      expect(check?.detail).toContain("real oracle still fails");
+      // Disk must also carry the restored oracle, not the neutered stub.
+      expect(readFileSync(join(root, "_t.py"), "utf8")).toBe(authentic);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("restores a deleted graded test when authenticTest is supplied", async () => {
+    const authentic = "assert 2 + 2 == 4\n";
+    const root = workspaceWith(authentic);
+    try {
+      unlinkSync(join(root, "_t.py"));
+      expect(existsSync(join(root, "_t.py"))).toBe(false);
+      const check = await runGradedFixtureCheck(root, { authenticTest: authentic });
+      expect(check).not.toBeNull();
+      expect(check?.ran).toBe(true);
+      expect(check?.passed).toBe(true);
+      expect(readFileSync(join(root, "_t.py"), "utf8")).toBe(authentic);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("without authenticTest, a neutered on-disk test is trusted (legacy unit path)", async () => {
+    // Call sites that build their own workspace (these tests) may omit the
+    // fixture source. Production rollouts always pass authenticTest.
+    const root = workspaceWith("assert False\n");
+    try {
+      writeFileSync(join(root, "_t.py"), "assert True\n", "utf8");
+      const check = await runGradedFixtureCheck(root);
+      expect(check?.passed).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

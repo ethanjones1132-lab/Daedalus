@@ -67,6 +67,12 @@ export interface CallOllamaChatOptions {
   top_p?: number;
   num_ctx?: number;
   num_predict?: number;
+  /**
+   * Ollama sampler seed (`options.seed`). Same (model, prompt, seed) should
+   * yield the same sample path when the daemon honors it — used for CRN
+   * fitness evaluation and paired held-out verdicts.
+   */
+  seed?: number;
   /** Keep the model resident across thousands of rollouts. Default "30m". */
   keep_alive?: string;
   tools?: ToolDefinition[];
@@ -266,6 +272,7 @@ export async function callOllamaChat(
       top_p: opts.top_p ?? 0.95,
       num_ctx: opts.num_ctx ?? DEFAULT_NUM_CTX,
       num_predict: opts.num_predict ?? 1024,
+      ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
     },
   };
 

@@ -18,6 +18,30 @@ export interface CheckResult {
   declinedReason?: string;
 }
 
+/** Terminal outcome code when success is refused because a check already failed. */
+export const CHECK_HONESTY_GATE_CODE = "check_honesty_gate_failed";
+
+/**
+ * Structural honesty gate (Phase-D hardening #4).
+ *
+ * B3 only subtracts an overclaim penalty *after* a run declares success without
+ * a passing check. Models still get to claim success; the score just hurts.
+ * This gate is stronger: when a real check already ran and failed, the run
+ * cannot remain `success` — it is demoted to `degraded` with a typed code.
+ *
+ * Does not invent failures when no check ran (that is B2 / write-required
+ * territory). Does not upgrade failed/degraded outcomes.
+ */
+export function applyCheckHonestyGate(
+  outcome: "success" | "degraded" | "failed",
+  errorCode: string | undefined,
+  check: Pick<CheckResult, "ran" | "passed"> | null | undefined,
+): { outcome: "success" | "degraded" | "failed"; errorCode?: string } {
+  if (outcome !== "success") return { outcome, errorCode };
+  if (!check?.ran || check.passed !== false) return { outcome, errorCode };
+  return { outcome: "degraded", errorCode: CHECK_HONESTY_GATE_CODE };
+}
+
 const WRITE_TOOL_NAMES = new Set(["write_file", "edit_file", "multi_edit", "apply_patch"]);
 
 function hadWrittenCode(toolCalls: readonly ToolCallRecord[]): boolean {

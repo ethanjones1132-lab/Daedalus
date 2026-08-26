@@ -19,11 +19,41 @@ interface TaskRecord {
   completed_at?: string;
   output: string;
   error?: string;
+  /** Per-task wall-clock bound in ms (background commands). */
+  timeout_ms?: number;
 }
 
 interface RunningTask {
   proc?: ChildProcessWithoutNullStreams;
   abort?: AbortController;
+  killTimer?: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * Default wall-clock bound for `run_background_command`.
+ * The old monitor only reaped bash children after 2 hours and only polled
+ * every 60s — a non-terminating `python -c "while True"` stalled a Phase-D
+ * campaign for 65 minutes. Five minutes is long enough for real background
+ * work and short enough that a hung child cannot freeze a campaign.
+ */
+export const DEFAULT_BG_COMMAND_TIMEOUT_MS = 300_000;
+
+/** Hard ceiling — models cannot request more than 30 minutes. */
+export const MAX_BG_COMMAND_TIMEOUT_MS = 1_800_000;
+
+/** Floor so a typo of 0/negative never disables the kill timer. */
+export const MIN_BG_COMMAND_TIMEOUT_MS = 1_000;
+
+/**
+ * Resolve `timeout_ms` for a background command: default 5 min, clamp to
+ * [1s, 30 min]. Exported for unit tests.
+ */
+export function resolveBackgroundCommandTimeoutMs(raw: unknown): number {
+  const n =
+    typeof raw === "number" && Number.isFinite(raw)
+      ? Math.floor(raw)
+      : DEFAULT_BG_COMMAND_TIMEOUT_MS;
+  return Math.min(Math.max(MIN_BG_COMMAND_TIMEOUT_MS, n), MAX_BG_COMMAND_TIMEOUT_MS);
 }
 
 const TASKS_FILE = join(CONFIG_DIR, "agent-tasks.json");
@@ -111,6 +141,7 @@ export async function toolRunBackgroundCommand(args: Record<string, unknown>, cf
   const isPowerShell = booleanArg(args.powershell ?? args.ps, false);
   const cwd = stringArg(args.cwd) || cfg.jarvis_path || cfg.jarvis_path;
   const description = stringArg(args.description) || `Background: ${command.slice(0, 80)}`;
+  const timeoutMs = resolveBackgroundCommandTimeoutMs(args.timeout_ms);
   const taskId = `bg_${crypto.randomUUID().slice(0, 8)}`;
 
   const now = new Date().toISOString();
@@ -124,6 +155,7 @@ export async function toolRunBackgroundCommand(args: Record<string, unknown>, cf
     created_at: now,
     updated_at: now,
     output: "",
+    timeout_ms: timeoutMs,
   };
 
   await upsertTask(task);
@@ -157,11 +189,10 @@ export async function toolRunBackgroundCommand(args: Record<string, unknown>, cf
     return `Error: Failed to spawn process: ${e.message}`;
   }
 
-  runningTasks.set(taskId, { proc });
-
   // Buffers to throttle disk writes
   let outputBuffer = "";
   let writeTimeout: Timer | null = null;
+  let timedOut = false;
 
   const flushOutput = async () => {
     if (!outputBuffer) return;
@@ -184,30 +215,72 @@ export async function toolRunBackgroundCommand(args: Record<string, unknown>, cf
     }
   };
 
+  const clearKillTimer = () => {
+    const rt = runningTasks.get(taskId);
+    if (rt?.killTimer) {
+      clearTimeout(rt.killTimer);
+      rt.killTimer = undefined;
+    }
+  };
+
+  // Per-process kill timer — does not depend on the 60s task monitor poll.
+  // This is the load-bearing fix for non-terminating fixture-suite children.
+  const killTimer = setTimeout(() => {
+    timedOut = true;
+    const rt = runningTasks.get(taskId);
+    if (!rt?.proc) return;
+    console.warn(
+      `[Jarvis] Background command ${taskId} hit timeout_ms=${timeoutMs}; terminating.`,
+    );
+    try {
+      rt.proc.kill("SIGTERM");
+    } catch {
+      // Process may already be exiting.
+    }
+    // Windows often needs a hard kill if SIGTERM is ignored.
+    setTimeout(() => {
+      try {
+        if (!rt.proc?.killed) rt.proc?.kill("SIGKILL");
+      } catch {
+        // ignore
+      }
+    }, 2_000).unref?.();
+  }, timeoutMs);
+  killTimer.unref?.();
+
+  runningTasks.set(taskId, { proc, killTimer });
+
   proc.stdout?.on("data", (d) => { queueOutput(d.toString()); });
   proc.stderr?.on("data", (d) => { queueOutput(d.toString()); });
 
   proc.on("close", async (code) => {
+    clearKillTimer();
     if (writeTimeout) {
       clearTimeout(writeTimeout);
       writeTimeout = null;
     }
     await flushOutput();
-    
+
     const currentTask = await getTask(taskId);
     if (currentTask && currentTask.status === "running") {
-      currentTask.status = code === 0 ? "completed" : "failed";
+      if (timedOut) {
+        currentTask.status = "failed";
+        currentTask.error = `Background command timed out after ${timeoutMs}ms.`;
+      } else {
+        currentTask.status = code === 0 ? "completed" : "failed";
+        if (code !== 0) {
+          currentTask.error = `Process exited with code ${code}`;
+        }
+      }
       currentTask.completed_at = new Date().toISOString();
       currentTask.updated_at = currentTask.completed_at;
-      if (code !== 0) {
-        currentTask.error = `Process exited with code ${code}`;
-      }
       await upsertTask(currentTask);
     }
     runningTasks.delete(taskId);
   });
 
   proc.on("error", async (err) => {
+    clearKillTimer();
     if (writeTimeout) {
       clearTimeout(writeTimeout);
       writeTimeout = null;
@@ -225,7 +298,11 @@ export async function toolRunBackgroundCommand(args: Record<string, unknown>, cf
     runningTasks.delete(taskId);
   });
 
-  return `Background command started. Task ID: ${taskId}. You can check progress using task_get or task_output tools.`;
+  return (
+    `Background command started. Task ID: ${taskId}. ` +
+    `Timeout: ${timeoutMs}ms. ` +
+    `You can check progress using task_get or task_output tools.`
+  );
 }
 
 export function startTaskMonitor(): void {
@@ -244,20 +321,24 @@ export function startTaskMonitor(): void {
         const elapsedMs = now.getTime() - createdTime.getTime();
 
         // Timeout limits:
-        // Background commands: 2 hours (7200000 ms)
+        // Background commands: per-task timeout_ms (default 5 min) — the spawn
+        // path also arms an immediate kill timer; this monitor is a backstop.
         // Background agent tasks: 15 minutes (900000 ms)
         const isAgent = task.agent_type !== "bash" && task.agent_type !== "powershell";
-        const limitMs = isAgent ? 900000 : 7200000;
+        const limitMs = isAgent
+          ? 900_000
+          : (task.timeout_ms ?? DEFAULT_BG_COMMAND_TIMEOUT_MS);
 
         if (elapsedMs > limitMs) {
           console.warn(`[Jarvis Task Monitor] Task ${id} timed out. Terminating.`);
           stoppingTasks.add(id);
+          if (rt.killTimer) clearTimeout(rt.killTimer);
           if (rt.proc) rt.proc.kill("SIGTERM");
           if (rt.abort) rt.abort.abort();
           runningTasks.delete(id);
 
           task.status = "failed";
-          task.error = `Task timed out after ${limitMs / 60000} minutes.`;
+          task.error = `Task timed out after ${Math.round(limitMs / 1000)}s.`;
           task.completed_at = now.toISOString();
           task.updated_at = task.completed_at;
           changed = true;

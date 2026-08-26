@@ -37,6 +37,13 @@ describe("directiveForModel", () => {
     expect(directiveForModel("qwen3.5:4b")).toBeUndefined();
   });
 
+  test("Heretic carries the verify-before-claim line", () => {
+    const d = directiveForModel("qwen3.5-9b-heretic:latest");
+    expect(d).toBeDefined();
+    expect(d!).toContain("read its real output");
+    expect(d!).toContain("not report success from reasoning or confidence alone");
+  });
+
   test("every seeded directive is non-empty and within soft budget", () => {
     for (const [id, text] of Object.entries(LOCAL_MODEL_DIRECTIVES)) {
       expect(id).toBe(id.toLowerCase());

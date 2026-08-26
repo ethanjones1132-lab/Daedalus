@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { findRunnableTarget, runWrittenCodeGate } from "./run-gate";
@@ -59,6 +59,69 @@ describe("run gate target selection", () => {
       const target = await findRunnableTarget([writeCall("solution.py")], "fix solution.py", "", { root });
       expect(target?.path).toBe(join(root, "_t.py"));
       expect(target?.reason).toBe("adjacent_test");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("finds the adjacent test when the model prefixed the write with a hallucinated 'workspace/'", async () => {
+    // fs-scope.safePath already repairs this prefix so the WRITE lands on the
+    // real file. The gate saw the raw path, looked in a directory that never
+    // existed, and silently skipped verification — so a correct fix scored a
+    // B2 hard zero. Writer and verifier must agree on where the file is.
+    const root = tempRoot();
+    try {
+      writeFileSync(join(root, "stock.py"), "def f():\n    return 1\n");
+      writeFileSync(join(root, "_t.py"), "from stock import f\nassert f()==1\n");
+      const target = await findRunnableTarget(
+        [writeCall("workspace/stock.py")],
+        "fix stock.py",
+        "",
+        { root },
+      );
+      expect(target?.path).toBe(join(root, "_t.py"));
+      expect(target?.reason).toBe("adjacent_test");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("accepts the file_path argument alias like every other write-path consumer", async () => {
+    const root = tempRoot();
+    try {
+      writeFileSync(join(root, "solution.py"), "def f():\n    return 1\n");
+      writeFileSync(join(root, "_t.py"), "from solution import f\nassert f()==1\n");
+      const call: ToolCallRecord = {
+        name: "edit_file",
+        arguments: { file_path: "solution.py", old_string: "1", new_string: "2" },
+        output: "Edited",
+        is_error: false,
+        duration_ms: 1,
+      };
+      const target = await findRunnableTarget([call], "fix solution.py", "", { root });
+      expect(target?.path).toBe(join(root, "_t.py"));
+      expect(target?.reason).toBe("adjacent_test");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("still prefers a real directory literally named workspace over the repair", async () => {
+    const root = tempRoot();
+    try {
+      mkdirSync(join(root, "workspace"), { recursive: true });
+      writeFileSync(join(root, "workspace", "stock.py"), "def f():\n    return 1\n");
+      writeFileSync(join(root, "workspace", "_t.py"), "from stock import f\n");
+      // A decoy at the root must NOT win: the literal path resolves first.
+      writeFileSync(join(root, "stock.py"), "def f():\n    return 2\n");
+      writeFileSync(join(root, "test_decoy.py"), "assert False\n");
+      const target = await findRunnableTarget(
+        [writeCall("workspace/stock.py")],
+        "fix stock.py",
+        "",
+        { root },
+      );
+      expect(target?.path).toBe(join(root, "workspace", "_t.py"));
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -66,10 +66,15 @@ export async function runRolloutBatch(
       const job = jobs[index]!;
       const candidate = candidates[job.candidateIndex]!;
       const task = tasks[job.taskIndex]!;
+      // Per-task seed: candidate.seed is the CRN generation (or held-out) base;
+      // taskIndex differentiates tasks so the same base does not collapse every
+      // fixture onto one sampler path. Formula is load-bearing for
+      // reproducibility — do not change without regenerating seed documentation.
+      const taskSeed = candidate.seed * 1000 + job.taskIndex;
       // runOneRollout never rejects — it scores failures instead — so one bad
       // candidate cannot abort a whole generation's evaluation.
       results[job.candidateIndex]![job.taskIndex] = await runOneRollout(
-        { theta: candidate.theta, task, seed: candidate.seed },
+        { theta: candidate.theta, task, seed: taskSeed },
         callModel,
       );
       options.onProgress?.(++completed, jobs.length);

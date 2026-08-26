@@ -3,6 +3,7 @@ import { existsSync } from "fs";
 import { promises as fs } from "fs";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "path";
 import type { ToolCallRecord } from "./stage-output";
+import { stripHallucinatedRootSegments } from "../fs-scope";
 
 const WRITE_TOOL_NAMES = new Set(["write_file", "edit_file", "multi_edit", "apply_patch"]);
 const PYTHON_PATH = /(?:[A-Za-z]:[\\/])?[A-Za-z0-9_.\\/-]+\.py\b/gi;
@@ -39,7 +40,12 @@ function writtenPythonPaths(toolCalls: readonly ToolCallRecord[] | undefined): s
   const seen = new Set<string>();
   for (const call of toolCalls ?? []) {
     if (call.is_error || !WRITE_TOOL_NAMES.has(call.name)) continue;
-    const path = typeof call.arguments?.path === "string" ? call.arguments.path.trim() : "";
+    // `file_path` is the same argument under a different name — every other
+    // write-path consumer accepts both (see effect-gate.toolCallWritePath).
+    // Reading only `path` here made the gate blind to writes the reward
+    // function had already credited.
+    const raw = call.arguments?.path ?? call.arguments?.file_path;
+    const path = typeof raw === "string" ? raw.trim() : "";
     if (path && extname(path).toLowerCase() === ".py") seen.add(path);
   }
   return [...seen];
@@ -47,6 +53,38 @@ function writtenPythonPaths(toolCalls: readonly ToolCallRecord[] | undefined): s
 
 function absoluteTarget(path: string, root: string): string {
   return isAbsolute(path) ? resolve(path) : resolve(root, path);
+}
+
+/**
+ * Resolve a model-supplied write path to where the file actually landed.
+ *
+ * Models sometimes prefix a path with a conceptual `workspace/` segment that
+ * is not a real directory. `fs-scope.safePath` repairs that so the WRITE
+ * succeeds — but this gate read the raw path, looked for an adjacent test in
+ * a directory that never existed, and returned no target. The run then scored
+ * a B2 hard zero (`tier: "none"`) even though the fix was correct and already
+ * credited by the write-effect accounting. Writer and verifier have to agree
+ * on where the file is.
+ *
+ * Repair is a fallback only, after the literal path fails to resolve, so a
+ * directory genuinely named `workspace` is never shadowed — mirroring the
+ * ordering `fs-scope` itself uses.
+ */
+function resolveWrittenTarget(
+  raw: string,
+  root: string,
+  exists: (path: string) => boolean,
+): string {
+  const literal = absoluteTarget(raw, root);
+  if (exists(literal) || exists(dirname(literal))) return literal;
+
+  const segments = raw.split(/[\\/]+/).filter(Boolean);
+  const stripped = stripHallucinatedRootSegments(segments);
+  if (stripped.length > 0 && stripped.length !== segments.length) {
+    const repaired = resolve(root, ...stripped);
+    if (exists(repaired) || exists(dirname(repaired))) return repaired;
+  }
+  return literal;
 }
 
 function isWithinRoot(root: string, candidate: string): boolean {
@@ -79,7 +117,7 @@ export async function findRunnableTarget(
   const listDirectory = options.listDirectory ?? defaultListDirectory;
   const readFile = options.readFile ?? ((path: string) => fs.readFile(path, "utf8"));
   const written = writtenPythonPaths(toolCalls)
-    .map((path) => absoluteTarget(path, options.root))
+    .map((path) => resolveWrittenTarget(path, options.root, exists))
     .filter((path) => isWithinRoot(options.root, path));
 
   // Priority A: a test path named explicitly in the request or plan.
@@ -154,6 +192,35 @@ function runPythonCommand(
   });
 }
 
+/**
+ * Run one EXPLICIT Python target, bounded, with no discovery step.
+ *
+ * Split out from `runWrittenCodeGate` so a caller that already knows its
+ * target (e.g. a fixture harness holding the graded test) can execute it
+ * without routing through tool-call inference — discovery is exactly the part
+ * that can silently decline, and a scorer must not depend on it.
+ */
+export async function runPythonTarget(
+  target: string,
+  root: string,
+  timeoutMs = 10_000,
+): Promise<RunGateResult> {
+  let result = await runPythonCommand("python", target, root, timeoutMs);
+  if (result.unavailable) {
+    result = await runPythonCommand("py", target, root, timeoutMs);
+  }
+  if (result.unavailable) {
+    return { status: "skipped", target, reason: "Python interpreter unavailable", issues: [] };
+  }
+  if (result.exitCode === 0) {
+    return { status: "passed", target, issues: [] };
+  }
+  if (result.detail) {
+    return { status: "failed", target, issues: [{ path: target, error: result.detail }] };
+  }
+  return { status: "skipped", target, reason: "Python run outcome was ambiguous", issues: [] };
+}
+
 /** Run one selected target with a bounded direct-argv Python invocation. */
 export async function runWrittenCodeGate(
   toolCalls: readonly ToolCallRecord[] | undefined,
@@ -170,36 +237,11 @@ export async function runWrittenCodeGate(
   if (!target) {
     return { status: "skipped", reason: "no runnable Python target was identified", issues: [] };
   }
-
-  const timeoutMs = options.timeoutMs ?? 10_000;
-  let result = await runPythonCommand("python", target.path, options.root, timeoutMs);
-  if (result.unavailable) {
-    result = await runPythonCommand("py", target.path, options.root, timeoutMs);
-  }
-  if (result.unavailable) {
-    return {
-      status: "skipped",
-      target: target.path,
-      reason: "Python interpreter unavailable",
-      issues: [],
-    };
-  }
-  if (result.exitCode === 0) {
-    return { status: "passed", target: target.path, issues: [] };
-  }
-  if (result.detail) {
-    return {
-      status: "failed",
-      target: target.path,
-      issues: [{ path: target.path, error: result.detail }],
-    };
-  }
-  return {
-    status: "skipped",
-    target: target.path,
-    reason: "Python run outcome was ambiguous",
-    issues: [],
-  };
+  // Deliberately does NOT attach `target.reason` to a passed/failed result:
+  // mergeToCheckResult reads `reason` to pick the tier, so surfacing it here
+  // would silently reclassify standalone_script runs from `existing` to
+  // `synth` and change reward credit. Preserving the established behaviour.
+  return runPythonTarget(target.path, options.root, options.timeoutMs ?? 10_000);
 }
 
 export function renderRunIssues(result: Pick<RunGateResult, "issues">): string {

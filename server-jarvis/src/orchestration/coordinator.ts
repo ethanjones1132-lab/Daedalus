@@ -35,6 +35,8 @@ export type CallModelFn = (
   messages: Array<ChatMessage>,
   options?: {
     temperature?: number;
+    /** Ollama sampler seed for deterministic / CRN rollouts. */
+    seed?: number;
     max_tokens?: number;
     stream?: boolean;
     onChunk?: (chunk: string) => void;

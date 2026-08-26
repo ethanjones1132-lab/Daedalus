@@ -36,8 +36,19 @@ import { directiveForModel } from "../../orchestration/local-model-directives";
 export interface LocalCallModelStats {
   calls: number;
   byModel: Record<string, number>;
+  /**
+   * Turns with empty content AND no tool_calls. True silent/broken generation
+   * (template failure, thinking-only with no action). Does NOT include native
+   * tool-only turns — those are normal agentic behavior and used to inflate
+   * this counter, which confounded "silent quitter" diagnostics across models.
+   */
   emptyContentTurns: number;
+  /** Subset of emptyContentTurns that also carried a non-empty thinking channel. */
   thinkingOnlyTurns: number;
+  /** Empty content but at least one native/text tool_call — productive agentic turn. */
+  toolOnlyTurns: number;
+  /** Outgoing system message received a per-model corrective directive splice. */
+  directivesApplied: number;
   nonLocalPickFallbacks: number;
   /**
    * prompt_eval_count compared against requested num_ctx. Nonzero means
@@ -145,6 +156,8 @@ export function makeLocalCallModel(
     byModel: {},
     emptyContentTurns: 0,
     thinkingOnlyTurns: 0,
+    toolOnlyTurns: 0,
+    directivesApplied: 0,
     nonLocalPickFallbacks: 0,
     truncationSuspected: 0,
   };
@@ -206,9 +219,11 @@ export function makeLocalCallModel(
     // Per-model corrective directive (same splice the live path builds via
     // OrchestratorAgent.system_prompt). Reuses applyAgentSystemPrompt so
     // rollouts exercise the same prompt shape as production.
+    const directive = directiveForModel(target.model);
+    if (directive) stats.directivesApplied += 1;
     const withDirective = applyAgentSystemPrompt(
       messages as Array<{ role?: string; content?: string; [k: string]: unknown }>,
-      directiveForModel(target.model),
+      directive,
     ) as ChatMessage[];
     const effectiveMessages = useTextTools
       ? withTextToolInstructions(withDirective, tools)
@@ -222,6 +237,7 @@ export function makeLocalCallModel(
         top_p: cfg.top_p ?? 0.95,
         num_ctx: numCtx,
         num_predict: options?.max_tokens ?? cfg.max_tokens ?? 1024,
+        seed: options?.seed,
         tools,
         useNativeTools: !useTextTools && tools.length > 0,
         timeoutMs: opts.timeoutMs,
@@ -233,10 +249,19 @@ export function makeLocalCallModel(
     stats.calls += 1;
     stats.byModel[result.model] = (stats.byModel[result.model] ?? 0) + 1;
 
+    // Split the "empty content" diagnostic into true silence vs tool-only
+    // turns. The multi-model sweep's emptyContentTurns rates were not
+    // comparable across models that prefer native tool_calls (often empty
+    // content) vs models that narrate before tools.
+    const hasToolCalls = result.tool_calls.length > 0;
     if (!result.content.trim()) {
-      stats.emptyContentTurns += 1;
-      if (result.thinking.trim()) {
-        stats.thinkingOnlyTurns += 1;
+      if (hasToolCalls) {
+        stats.toolOnlyTurns += 1;
+      } else {
+        stats.emptyContentTurns += 1;
+        if (result.thinking.trim()) {
+          stats.thinkingOnlyTurns += 1;
+        }
       }
     }
 
