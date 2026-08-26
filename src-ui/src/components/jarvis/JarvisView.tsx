@@ -582,7 +582,7 @@ export function ChatPanel({
             ...sessionInvokeArgs(effectiveSid),
             role: 'assistant',
             content: finalized.content,
-          }).catch((e) => console.error('Failed to persist assistant message:', e));
+          }).catch((e: any) => { console.error('Failed to persist assistant message:', e); setError('Append failed: ' + (e?.message || String(e))); });
         }
         return finalizedMessages;
       }
@@ -964,7 +964,7 @@ export function ChatPanel({
       // JarvisMessage.id and the `key` it feeds into.
       if (typeof dbId !== 'string' || !dbId) return;
       setMessages(prev => prev.map((m) => (m.id === clientMessageId ? { ...m, id: dbId } : m)));
-    }).catch((e) => console.error('Failed to persist user message:', e));
+    }).catch((e: any) => { console.error('Failed to persist user message:', e); setError('Append failed: ' + (e?.message || String(e))); });
 
     const response = await fetch(`${JARVIS_API_URL}/chat/stream`, {
       method: 'POST',
