@@ -178,4 +178,19 @@ describe("applyCheckHonestyGate", () => {
       errorCode: "upstream_stage_failed",
     });
   });
+
+// Regression guard (iter-035): applyCheckHonestyGate (check-runner.ts:35-43) must
+// demote success -> degraded when check.passed === false.
+describe("honesty-gate regression (check-runner:35-43)", () => {
+  const red = { ran: true, passed: false, tier: "none" } as const;
+  test("false-check demotes to degraded with CHECK_HONESTY_GATE_CODE", () => {
+    const r = applyCheckHonestyGate("success", undefined, red);
+    expect(r.outcome).toBe("degraded");
+    expect(r.errorCode).toBe(CHECK_HONESTY_GATE_CODE);
+  });
+  test("true-check keeps success (no over-demote)", () => {
+    const g = { ran: true, passed: true, tier: "full" } as const;
+    expect(applyCheckHonestyGate("success", undefined, g).outcome).toBe("success");
+  });
+});
 });
