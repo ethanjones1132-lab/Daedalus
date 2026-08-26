@@ -19,28 +19,28 @@ export const STARTUP_GRACE_MS = 20_000;
 // ── Health derivation using the new JarvisStatus shape ─────────
 
 function backendOk(s: JarvisStatus): boolean {
-  const backend = s.active_backend.toLowerCase();
-  if (backend === 'ollama') return s.ollama_running && s.model_available;
-  if (backend === 'openrouter') return s.openrouter_key_set;
-  if (backend === 'claude_cli') return s.claude_proxy_running;
+  const backend = (s.active_backend ?? '').toLowerCase();
+  if (backend === 'ollama') return !!(s.ollama_running) && !!(s.model_available);
+  if (backend === 'openrouter') return !!(s.openrouter_key_set);
+  if (backend === 'claude_cli') return !!(s.claude_proxy_running);
   return false;
 }
 
 function overallLevel(s: JarvisStatus, fetchError: string | null, mountedForMs: number): Level {
   if (fetchError) return 'down';
   if (!backendOk(s)) return 'down';
-  if (!s.bun_server_running) return mountedForMs < STARTUP_GRACE_MS ? 'starting' : 'warn';
+  if (! (s.bun_server_running ?? false)) return mountedForMs < STARTUP_GRACE_MS ? 'starting' : 'warn';
   return 'ok';
 }
 
 function summaryFor(s: JarvisStatus, level: Level, fetchError: string | null): string {
   if (fetchError) return fetchError;
   if (level === 'down') {
-    if (!backendOk(s)) return `Backend "${s.active_backend}" is unreachable`;
+    if (!backendOk(s)) return `Backend "${s.active_backend ?? ''}" is unreachable`;
     return 'Status check failed';
   }
   if (level === 'starting') return 'Starting Bun server — tools and skills are warming up';
-  if (!s.bun_server_running) return 'Bun server is not running — tools and skills unavailable';
+  if (! (s.bun_server_running ?? false)) return 'Bun server is not running — tools and skills unavailable';
   return 'Inference is responding slowly';
 }
 
@@ -102,12 +102,12 @@ export default function HealthBanner() {
 
   const style = LEVEL_STYLES[level];
   const subsystems: Array<{ name: string; up: boolean; detail?: string }> = [
-    { name: 'Bun server', up: status.bun_server_running, detail: status.bun_server_url },
-    { name: 'Ollama', up: status.ollama_running, detail: status.model_available ? status.model : 'model not loaded' },
-    { name: 'Model', up: status.model_available, detail: status.model || '—' },
-    { name: 'OR key', up: status.openrouter_key_set },
-    { name: 'Claude proxy', up: status.claude_proxy_running, detail: ':19878' },
-    { name: 'Bridge', up: status.bridge_active, detail: `:${status.bridge_port}` },
+    { name: 'Bun server', up: !!(status.bun_server_running), detail: status.bun_server_url ?? undefined },
+    { name: 'Ollama', up: !!(status.ollama_running), detail: (status.model_available ? status.model : 'model not loaded') ?? 'model not loaded' },
+    { name: 'Model', up: !!(status.model_available), detail: status.model ?? '—' },
+    { name: 'OR key', up: !!(status.openrouter_key_set) },
+    { name: 'Claude proxy', up: !!(status.claude_proxy_running), detail: ':19878' },
+    { name: 'Bridge', up: !!(status.bridge_active), detail: status.bridge_port !== undefined ? `:${status.bridge_port}` : undefined },
   ];
 
   return (

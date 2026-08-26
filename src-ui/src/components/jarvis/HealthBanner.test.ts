@@ -41,3 +41,14 @@ describe('HealthBanner startup presentation', () => {
     expect(deriveHealthPresentation(healthyOpenRouter, null, 0).level).toBe('ok');
   });
 });
+
+describe('HealthBanner partial native payload', () => {
+  it('tolerates a missing bun_server_running section (partial jarvis_check_status)', () => {
+    // Partial answer from native surface: active_backend present, rest undefined
+    const partial = { active_backend: 'ollama' } as JarvisStatus;
+    const res = deriveHealthPresentation(partial, null, 0);
+    expect(res.level).toBe('down');
+    // Partial payload: backend identified, no crash; guard delivers degraded summary
+    expect(res.summary).toContain('ollama');
+  });
+});
