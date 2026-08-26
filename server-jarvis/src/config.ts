@@ -353,6 +353,8 @@ export interface ConductorLearningConfig {
   instruction_ab_epsilon: number;
   /** Max trajectories retained (oldest pruned). */
   max_trajectory_snapshots: number;
+  /** Enforced bound on self-tuning loop iterations (regression guard P2). */
+  maxLearningIterations: number;
 }
 
 export interface DynamicAgentsConfig {
@@ -708,6 +710,7 @@ export function defaultConfig(): JarvisConfig {
         trajectory_export: true,
         instruction_ab_epsilon: 0.15,
         max_trajectory_snapshots: 500,
+        maxLearningIterations: 100,
       },
       skill_distillation: {
         enabled: true,

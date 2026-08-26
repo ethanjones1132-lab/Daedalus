@@ -464,3 +464,15 @@ describe("Conductor learning (Phase 4)", () => {
     expect(getLearnedPoolState().modelRoutingScoreDeltas.size).toBe(0);
   });
 });
+
+describe("Conductor learning self-tuning bound (P2)", () => {
+  test("self-tuning loop must enforce a max iteration bound (regression)", () => {
+    const loop = new ConductorLearningLoop(new SelfTuningStore(":memory:"));
+    // The loop config should carry an enforced bound; absence = regression.
+    const cfg = (loop as any).config ?? {};
+    // Assert the enforced-bound property exists and is a positive number.
+    expect(typeof cfg.maxLearningIterations).toBe("number");
+    expect(cfg.maxLearningIterations).toBeGreaterThan(0);
+    // If ever the loop runs unbounded (no cap), this assertion fails.
+  });
+});

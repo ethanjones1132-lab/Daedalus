@@ -87,6 +87,7 @@ export class ConductorLearningLoop {
       trajectory_export: true,
       instruction_ab_epsilon: 0.15,
       max_trajectory_snapshots: 500,
+      maxLearningIterations: 100,
     },
   ) {}
 
