@@ -9,6 +9,7 @@ import {
   OPENROUTER_MODELS,
 } from './types';
 import ControlCenterView from './ControlCenterView';
+import { sessionScroll } from './session-scroll';
 import MarkdownView from './MarkdownView';
 import WorkspaceGrantsChip from './WorkspaceGrantsChip';
 import SystemStatusBar from './SystemStatusBar';
@@ -646,6 +647,7 @@ export function ChatPanel({
       // this Session the new comparison baseline without invalidating the send.
       prevActiveSessionRef.current = activeSession;
       suppressHistoryLoadRef.current = null;
+      sessionScroll.save(activeSession || '', { offset: scrollContainerRef.current?.scrollTop ?? 0, pinnedToBottom: userPinnedToBottom });
       setLoadingHistory(false);
       return;
     }
@@ -705,6 +707,12 @@ export function ChatPanel({
           content: r.content,
           timestamp: r.created_at,
         }))));
+        // Restore scroll offset for this session on reload (Jarvis scroll-state).
+        const saved = sessionScroll.load(activeSession || '');
+        if (saved && scrollContainerRef.current) {
+          scrollContainerRef.current.scrollTop = saved.offset;
+          setUserPinnedToBottom(saved.pinnedToBottom);
+        }
         // Jump to the bottom without animation on initial history load.
         requestAnimationFrame(() => {
           if (!cancelled) {
@@ -717,7 +725,10 @@ export function ChatPanel({
         if (!cancelled) console.error('Failed to load session history:', e);
       })
       .finally(() => {
-        if (!cancelled) setLoadingHistory(false);
+        if (!cancelled) {
+          sessionScroll.save(activeSession || '', { offset: scrollContainerRef.current?.scrollTop ?? 0, pinnedToBottom: userPinnedToBottom });
+          setLoadingHistory(false);
+        }
       });
     return () => { cancelled = true; };
   }, [activeSession, scrollToBottom, discardPendingTokens]);
