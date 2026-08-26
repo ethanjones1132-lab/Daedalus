@@ -173,3 +173,13 @@ describe('session-filter (SessionsPanel search input)', () => {
     expect(formatFilterResultCount(0, 8)).toBe('(0 of 8)');
   });
 });
+
+describe('filterSessions — partial Session payload (messages/fields undefined from SQLite)', () => {
+  test('survives a session with null name/title and undefined model/backend', () => {
+    const partial = [{ id: 'p1', name: null, title: undefined, model: '', backend: undefined } as any];
+    expect(filterSessions(partial, 'p')).toHaveLength(1);  // fails if normalize throws on undefined backend/model
+  });
+  test('survives empty array with undefined-query (no crash)', () => {
+    expect(filterSessions([], '')).toEqual([]);
+  });
+});

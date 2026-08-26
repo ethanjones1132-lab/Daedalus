@@ -91,3 +91,12 @@ describe('formatSessionStatsLine', () => {
     expect(formatSessionStatsLine({ tokens: Number.NaN, turnCount: 3 })).toBe('0 tok · 3 turns');
   });
 });
+
+describe('formatSessionStatsLine — partial payload (undefined / non-finite tokens from SQLite)', () => {
+  it('formats NaN tokens as 0 tok (not thrown)', () => {
+    expect(formatSessionStatsLine({ tokens: NaN, turnCount: 0 })).toBe('0 tok');
+  });
+  it('formats undefined-turn as hidden pill (empty turnPart) not crashed', () => {
+    expect(formatSessionStatsLine({ tokens: 123, turnCount: (undefined as any) })).toBe('123 tok');
+  });
+});
