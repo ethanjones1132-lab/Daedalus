@@ -1,3 +1,4 @@
+import React, { useCallback, useState } from 'react';
 import { cn } from '../ui';
 
 interface MarkdownRendererProps {
@@ -10,6 +11,20 @@ interface MarkdownRendererProps {
  * Handles basic formatting: bold, italic, code, code blocks, lists, and links.
  */
 export default function MarkdownRenderer({ content, className }: MarkdownRendererProps) {
+  const [copied, setCopied] = useState(false);
+  const handleCopy = useCallback(async () => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(content ?? '');
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      } else {
+        throw new Error('clipboard unavailable');
+      }
+    } catch {
+      setCopied(false);
+    }
+  }, [content]);
   if (!content) return null;
 
   // Split content by code blocks first
@@ -50,6 +65,16 @@ export default function MarkdownRenderer({ content, className }: MarkdownRendere
 
   return (
     <div className={cn('markdown-content', className)}>
+      <div className="flex items-center justify-between mb-2">
+        <button
+          type="button"
+          onClick={handleCopy}
+          aria-label={copied ? 'Copied' : 'Copy to clipboard'}
+          className="text-xs px-2 py-0.5 rounded bg-ink/60 text-bone/90 hover:bg-ink/80 transition-colors"
+        >
+          {copied ? 'Copied' : 'Copy'}
+        </button>
+      </div>
       {segments.map((segment, idx) =>
         segment.type === 'code' ? (
           <pre
