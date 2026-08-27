@@ -212,3 +212,16 @@ describe("honesty-gate fix (check-runner:41-44, iter-035 redo)", () => {
     expect(applyCheckHonestyGate("success", undefined, green)).toEqual({ outcome: "success" });
   });
 });
+
+describe("check-runner empty written-code guard (regression; can fail)", () => {
+  test("hadWrittenCode:false -> tier:none, ran:false, declinedReason:no_code_written; fails if line 83 removed", () => {
+    const r = mergeToCheckResult({
+      run: { status: "skipped", reason: "none", issues: [] },
+      build: { kind: "clean", command: "bare" },
+      hadWrittenCode: false,
+    });
+    expect(r.tier).toBe("none");
+    expect(r.ran).toBe(false);
+    expect(r.declinedReason).toBe("no_code_written");
+  });
+});
