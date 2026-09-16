@@ -569,23 +569,16 @@ function AppInner() {
     } catch { return 'jarvis'; }
   });
   const [companion, setCompanion] = useState<CompanionState | null>(null);
-  const [lastRefresh, setLastRefresh] = useState<Date>(new Date());
   const [paletteOpen, setPaletteOpen] = useState(false);
   const allNavItems = useMemo(
     () => NAV_SECTIONS.flatMap((s) => s.items),
     [],
   );
-  // Feature 2: Luxury companion awareness for self-improvement crons (premium "alive" feel)
-  const [cronAwareness, setCronAwareness] = useState<string | null>('Syncing improvement routines…');
+  const [cronAwareness, setCronAwareness] = useState<string | null>('Loading cron awareness…');
 
   useEffect(() => {
     try { localStorage.setItem('jarvis-current-view', currentView); } catch {}
   }, [currentView]);
-
-  useEffect(() => {
-    const intervalId = setInterval(() => setLastRefresh(new Date()), 10000);
-    return () => clearInterval(intervalId);
-  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -612,7 +605,7 @@ function AppInner() {
         missedCount: missed.length,
       }));
     } catch {
-      setCronAwareness('Companion synced to your workspace.');
+      setCronAwareness('Cron awareness unavailable. Waiting for the next refresh.');
     }
   }, []);
 
@@ -768,10 +761,6 @@ function AppInner() {
             <Label tone="muted">command surface</Label>
           </div>
           <div className="ml-auto flex items-center gap-5">
-            <div className="flex items-center gap-1.5">
-              <span className="w-1.5 h-1.5 rounded-full bg-cyan-neon animate-pulse" style={{ boxShadow: '0 0 8px rgba(34, 211, 238, 0.7)' }} />
-              <span className="text-[10px] font-mono uppercase tracking-widest text-cyan-glow">synced {formatAge(Date.now() - lastRefresh.getTime())}</span>
-            </div>
             <button
               type="button"
               onClick={toggleTheme}
