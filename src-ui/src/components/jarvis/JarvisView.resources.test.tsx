@@ -57,6 +57,78 @@ function mockResource(command: string, response: () => Promise<unknown>) {
 }
 const callsFor = (command: string) => invokeMock.mock.calls.filter(([name]) => name === command);
 
+describe('Config save state', () => {
+  async function openConfig(save: () => Promise<unknown>) {
+    invokeMock.mockImplementation((name: string) => {
+      if (name === 'jarvis_get_config') return Promise.resolve(config);
+      if (name === 'jarvis_check_status') return Promise.resolve(status);
+      if (name === 'jarvis_save_config') return save();
+      return Promise.resolve([]);
+    });
+    render(<JarvisView initialSubView="config" />);
+    await screen.findByRole('heading', { name: 'Configuration' });
+    return screen.getByPlaceholderText('e.g., qwen2.5-coder:7b');
+  }
+
+  it('guards pending submissions and confirms only the resolved, unchanged draft', async () => {
+    const save = deferred<unknown>();
+    const model = await openConfig(() => save.promise);
+    fireEvent.change(model, { target: { value: 'edited-model' } });
+    const button = screen.getByRole('button', { name: 'Save Config' });
+    fireEvent.click(button);
+    fireEvent.click(button);
+    expect(callsFor('jarvis_save_config')).toEqual([
+      ['jarvis_save_config', { config: { ...config, ollama: { ...config.ollama, model: 'edited-model' } } }],
+    ]);
+    expect(button).toBeDisabled();
+    expect(model).toBeDisabled();
+    expect(screen.getByRole('status')).toHaveTextContent('Saving config');
+    expect(screen.queryByText('✓ Saved')).not.toBeInTheDocument();
+    await act(async () => save.resolve(null));
+    expect(screen.getByRole('status')).toHaveTextContent('Config saved');
+    expect(screen.getByRole('button', { name: '✓ Saved' })).toBeEnabled();
+    expect(model).toBeEnabled();
+    expect(model).toHaveValue('edited-model');
+    fireEvent.change(model, { target: { value: 'newer-model' } });
+    expect(screen.queryByText('✓ Saved')).not.toBeInTheDocument();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('preserves rejected edits, redacts native errors, and retries the draft', async () => {
+    const first = deferred<unknown>();
+    const retry = deferred<unknown>();
+    const save = vi.fn().mockReturnValueOnce(first.promise).mockReturnValueOnce(retry.promise);
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const model = await openConfig(save);
+      fireEvent.change(model, { target: { value: 'retained-model' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Save Config' }));
+      await act(async () => first.reject(new Error('private-native-detail')));
+      expect(screen.getByRole('alert')).toHaveTextContent('Could not save config');
+      expect(screen.getByRole('alert')).toHaveTextContent('Retry');
+      expect(screen.queryByText(/private-native-detail/)).not.toBeInTheDocument();
+      expect(errorLog).not.toHaveBeenCalled();
+      expect(model).toHaveValue('retained-model');
+      expect(model).toBeEnabled();
+      expect(screen.queryByText('✓ Saved')).not.toBeInTheDocument();
+      const button = screen.getByRole('button', { name: 'Retry save config' });
+      fireEvent.click(button);
+      fireEvent.click(button);
+      expect(save).toHaveBeenCalledTimes(2);
+      expect(callsFor('jarvis_save_config')[1]).toEqual(callsFor('jarvis_save_config')[0]);
+      await act(async () => retry.resolve(null));
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(screen.getByRole('status')).toHaveTextContent('Config saved');
+      // Direct-setter controls must invalidate saved feedback too.
+      fireEvent.click(screen.getByRole('button', { name: /Subscription/ }));
+      expect(screen.queryByText('✓ Saved')).not.toBeInTheDocument();
+      expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    } finally {
+      errorLog.mockRestore();
+    }
+  });
+});
+
 describe('Config and Status native resource states', () => {
   it.each(resources)('$view distinguishes pending, failure and successful retry without leaking error detail', async ({ view, command, data, heading }) => {
     const initial = deferred<unknown>();

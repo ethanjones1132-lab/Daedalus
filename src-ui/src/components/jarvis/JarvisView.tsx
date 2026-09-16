@@ -2805,7 +2805,11 @@ function ConfigPanel({ config, setConfig, loading, loadError, onRetry }: {
   onRetry: () => void;
 }) {
   const [localConfig, setLocalConfig] = useState<JarvisConfig | null>(config);
-  const [saved, setSaved] = useState(false);
+  const [savedConfig, setSavedConfig] = useState<JarvisConfig | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState(false);
+  const savePending = useRef(false);
+  const saved = savedConfig !== null && savedConfig === localConfig;
   const [showApiKeys, setShowApiKeys] = useState(false);
 
   useEffect(() => {
@@ -2813,14 +2817,22 @@ function ConfigPanel({ config, setConfig, loading, loadError, onRetry }: {
   }, [config]);
 
   const handleSave = async () => {
-    if (!localConfig) return;
+    if (!localConfig || savePending.current) return;
+    const submittedConfig = localConfig;
+    savePending.current = true;
+    setSaving(true);
+    setSaveError(false);
+    setSavedConfig(null);
     try {
-      await invoke('jarvis_save_config', { config: localConfig });
-      setConfig(localConfig);
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
-    } catch (e) {
-      console.error('Failed to save config:', e);
+      await invoke('jarvis_save_config', { config: submittedConfig });
+      setConfig(submittedConfig);
+      setSavedConfig(submittedConfig);
+    } catch {
+      // Native errors may contain configuration values; never display or log them.
+      setSaveError(true);
+    } finally {
+      savePending.current = false;
+      setSaving(false);
     }
   };
 
@@ -2856,19 +2868,37 @@ function ConfigPanel({ config, setConfig, loading, loadError, onRetry }: {
         <h2 className="text-lg font-bold text-bone tracking-tight">Configuration</h2>
         <button
           onClick={handleSave}
+          disabled={saving}
           className={cn(
-            'px-4 py-1.5 text-xs font-mono rounded-lg border transition-all',
+            'px-4 py-1.5 text-xs font-mono rounded-lg border transition-all disabled:opacity-50',
             'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50',
             saved
               ? 'bg-cyan-neon/20 text-cyan-glow border-cyan-neon/40'
               : 'bg-royal/20 text-royal-light border-royal/40 hover:bg-royal/30'
           )}
         >
-          {saved ? '✓ Saved' : 'Save Config'}
+          {saving ? 'Saving...' : saved ? '✓ Saved' : 'Save Config'}
         </button>
       </div>
 
-      <div className="space-y-4">
+      {saving && <p role="status" className="mb-4 text-bone-dim text-xs font-mono">Saving config...</p>}
+      {saved && <p role="status" className="mb-4 text-cyan-glow text-xs font-mono">Config saved.</p>}
+      {saveError && (
+        <div role="alert" className="mb-4 p-3 bg-error/10 border border-error/30 rounded-xl text-error text-xs font-mono">
+          <p>Could not save config. Your edits are preserved. Retry to save configuration.</p>
+          <button
+            onClick={handleSave}
+            disabled={saving}
+            aria-label="Retry save config"
+            className="mt-2 px-3 py-1.5 border border-error/30 rounded-lg disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-error/50"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
+      {/* Freeze the submitted draft until native persistence resolves. */}
+      <fieldset disabled={saving} aria-label="Configuration settings" className="space-y-4 min-w-0 border-0 p-0 m-0">
         {/* Backend Selection */}
         <GlassCard hoverable={false}>
           <h3 className="text-sm font-semibold text-bone mb-3">Backend</h3>
@@ -3262,7 +3292,7 @@ function ConfigPanel({ config, setConfig, loading, loadError, onRetry }: {
             </div>
           )}
         </GlassCard>
-      </div>
+      </fieldset>
     </div>
   );
 }
