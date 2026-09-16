@@ -999,7 +999,6 @@ export function ChatPanel({
     streamAbortRef.current?.abort();
     const controller = new AbortController();
     streamAbortRef.current = controller;
-    setPipelineStage('stream relay');
 
     // `append_message` returns the DB row id (sessions.rs `insert_message_row`).
     // Swap the client-generated id for the persisted one so a later
@@ -1687,6 +1686,17 @@ export function ChatPanel({
           + New Chat
         </button>
       </div>
+
+      {turnProgress && (
+        <div
+          role="status"
+          aria-label="Session turn progress"
+          aria-atomic="true"
+          className="shrink-0 mb-3 rounded-lg border border-cyan-neon/20 bg-cyan-neon/5 px-3 py-2 text-xs font-mono text-bone-muted"
+        >
+          {turnProgress.text}
+        </div>
+      )}
 
       {/* Messages area — ARIA live-region so screen readers announce tokens. */}
       <div

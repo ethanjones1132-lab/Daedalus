@@ -72,6 +72,32 @@ describe('ChatPanel state machine', () => {
     await waitFor(() => expect(screen.queryByRole('status', { name: 'Session turn progress' })).not.toBeInTheDocument());
   });
 
+  it.each(['stop', 'session switch', 'new Session'])('removes turn progress on %s', async (action) => {
+    vi.stubGlobal('fetch', vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(_input).endsWith('/chat/cancel')) return Promise.resolve(new Response('{}'));
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          reject(new DOMException('Cancelled', 'AbortError'));
+        }, { once: true });
+      });
+    }));
+    const view = render(<ChatPanel {...props} />);
+    const composer = await screen.findByLabelText('Chat input');
+    expect(screen.queryByRole('status', { name: 'Session turn progress' })).not.toBeInTheDocument();
+    fireEvent.change(composer, { target: { value: 'inspect the workspace' } });
+    fireEvent.keyDown(composer, { key: 'Enter' });
+    const progress = await screen.findByRole('status', { name: 'Session turn progress' });
+    expect(progress).toHaveTextContent('Waiting for Session turn progress.');
+    expect(screen.getByRole('log')).not.toContainElement(progress);
+
+    if (action === 'stop') fireEvent.click(screen.getByLabelText('Stop streaming'));
+    else if (action === 'session switch') view.rerender(<ChatPanel {...props} activeSession="session-2" />);
+    else fireEvent.click(screen.getByRole('button', { name: '+ New Chat' }));
+
+    await waitFor(() => expect(screen.queryByRole('status', { name: 'Session turn progress' })).not.toBeInTheDocument());
+    expect(screen.queryByLabelText('Stop streaming')).not.toBeInTheDocument();
+  });
+
   it('allows only one fetch for rapid duplicate Enter submissions', async () => {
     let resolveFetch!: (response: Response) => void;
     const fetchMock = vi.fn(() => new Promise<Response>((resolve) => { resolveFetch = resolve; }));
