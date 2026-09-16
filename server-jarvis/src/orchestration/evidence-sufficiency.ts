@@ -181,6 +181,29 @@ function distinctTargetKeys(calls: ToolCallRecord[], tools: Set<string>): Set<st
   return keys;
 }
 
+/** Count fetched URLs, not retries or extraction prompts, as research sources. */
+function distinctFetchSourceCount(calls: ToolCallRecord[]): number {
+  const sources = new Set<string>();
+  for (const call of calls) {
+    if (call.name !== "web_fetch") continue;
+    const rawUrl = call.arguments?.url;
+    if (typeof rawUrl !== "string" || !rawUrl.trim()) continue;
+    const trimmed = rawUrl.trim();
+    try {
+      // Match the Web bundle's default HTTPS scheme and URL normalization.
+      const url = new URL(/^[a-z][a-z\d+\-.]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
+      if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+      // Fragments are not sent to the server. Keep path case and query values:
+      // different pages on the same host may legitimately supply evidence.
+      url.hash = "";
+      sources.add(url.toString());
+    } catch {
+      // Unidentifiable sources cannot substantiate a multiple-source claim.
+    }
+  }
+  return sources.size;
+}
+
 function normalizePath(rawPath: string): { path: string; absolute: boolean } {
   let slashPath = rawPath.replace(/\\/g, "/");
   const extendedPrefix = slashPath.match(/^\/\/\?\//);
@@ -423,7 +446,7 @@ export function assessWorkspaceEvidence(
   // The fence itself is unchanged: these floors still require SUCCESSFUL
   // result records, so a turn that called nothing (or whose calls all errored)
   // remains insufficient.
-  const fetches = calls.filter((c) => c.name === "web_fetch").length;
+  const fetches = distinctFetchSourceCount(calls);
   const searches = calls.filter((c) => c.name === "web_search").length;
   const executions = calls.filter((c) => SHELL_TOOLS.has(c.name)).length;
 
@@ -438,8 +461,8 @@ export function assessWorkspaceEvidence(
       listings,
       deepRead: false,
       reason: researchSatisfied
-        ? `research evidence satisfied: ${fetches} web_fetch, ${searches} web_search`
-        : `research request needs >=${RESEARCH_MIN_FETCHES} successful web_fetch plus a web_search (or >=${RESEARCH_MIN_FETCHES_WITHOUT_SEARCH} fetches); got ${fetches} fetch / ${searches} search`,
+        ? `research evidence satisfied: ${fetches} distinct source(s) fetched, ${searches} web_search`
+        : `research request needs successful fetches of >=${RESEARCH_MIN_FETCHES} distinct sources plus a web_search (or >=${RESEARCH_MIN_FETCHES_WITHOUT_SEARCH} distinct sources); got ${fetches} distinct fetch source(s) / ${searches} search`,
     };
   }
 
@@ -463,7 +486,7 @@ export function assessWorkspaceEvidence(
       contentReads: fetches + executions,
       listings,
       deepRead: false,
-      reason: `mixed evidence satisfied: ${fetches} web_fetch, ${searches} web_search, ${executions} execution(s)`,
+      reason: `mixed evidence satisfied: ${fetches} distinct fetched source(s), ${searches} web_search, ${executions} execution(s)`,
     };
   }
 

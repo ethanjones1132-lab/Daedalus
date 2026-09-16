@@ -27,6 +27,103 @@ describe("research evidence floor", () => {
     expect(result.sufficient).toBe(false);
   });
 
+  test("re-fetching one URL with different prompts is still a single source", () => {
+    const result = assessWorkspaceEvidence(
+      [
+        call("web_fetch", "page content", false, { url: "https://a.example", prompt: "summarize" }),
+        call("web_fetch", "page content", false, { url: "https://a.example", prompt: "extract dates" }),
+        call("web_search", "results", false, { query: "x" }),
+      ],
+      "research X",
+      undefined,
+      {},
+      "research",
+    );
+    expect(result.sufficient).toBe(false);
+  });
+
+  test("re-fetching one URL is a single source even with no search", () => {
+    const result = assessWorkspaceEvidence(
+      [
+        call("web_fetch", "one", false, { url: "https://a.example" }),
+        call("web_fetch", "one", false, { url: "https://a.example" }),
+        call("web_fetch", "one", false, { url: "https://a.example" }),
+      ],
+      "research X",
+      undefined,
+      {},
+      "research",
+    );
+    expect(result.sufficient).toBe(false);
+  });
+
+  test("distinct URLs keep their independent credit", () => {
+    const result = assessWorkspaceEvidence(
+      [
+        call("web_fetch", "one", false, { url: "https://a.example" }),
+        call("web_fetch", "two", false, { url: "https://b.example" }),
+        call("web_search", "r", false, { query: "x" }),
+      ],
+      "research X",
+      undefined,
+      {},
+      "research",
+    );
+    expect(result.sufficient).toBe(true);
+  });
+
+  test("mixed turn also cannot pass on repeated fetches of one URL", () => {
+    const result = assessWorkspaceEvidence(
+      [
+        call("web_fetch", "one", false, { url: "https://a.example" }),
+        call("web_fetch", "two", false, { url: "https://a.example", prompt: "different" }),
+        call("web_search", "results", false, { query: "x" }),
+      ],
+      "research X and check the repo",
+      undefined,
+      {},
+      "mixed",
+    );
+    expect(result.sufficient).toBe(false);
+  });
+
+  test("URL aliases and fragments do not create additional sources", () => {
+    const calls = ["a.example", "https://A.EXAMPLE:443/", "https://a.example/#section"]
+      .map((url) => call("web_fetch", "content", false, { url }));
+    const result = assessWorkspaceEvidence(calls, "research X", undefined, {}, "research");
+    expect(result.sufficient).toBe(false);
+    expect(result.contentReads).toBe(1);
+  });
+
+  test("distinct paths and query values on one host retain credit", () => {
+    const calls = ["https://a.example/One", "https://a.example/one", "https://a.example/one?v=2"]
+      .map((url) => call("web_fetch", "content", false, { url }));
+    const result = assessWorkspaceEvidence(calls, "research X", undefined, {}, "research");
+    expect(result.sufficient).toBe(true);
+    expect(result.contentReads).toBe(3);
+  });
+
+  test("missing, malformed, and unsupported URLs earn no source credit", () => {
+    const calls = [undefined, 42, "", "https://", "ftp://a.example"]
+      .map((url) => call("web_fetch", "content", false, { url }));
+    const result = assessWorkspaceEvidence(calls, "research X", undefined, {}, "research");
+    expect(result.sufficient).toBe(false);
+    expect(result.contentReads).toBe(0);
+  });
+
+  test("empty and deflected fetches cannot supplement a successful source", () => {
+    const calls = [
+      call("web_fetch", "one", false, { url: "https://a.example" }),
+      call("web_fetch", "  ", false, { url: "https://b.example" }),
+      call("web_fetch", "[duplicate call deflected]", false, { url: "https://c.example" }),
+      call("web_fetch", "failed", true, { url: "https://d.example" }),
+      call("web_search", "results", false, { query: "x" }),
+    ];
+    const result = assessWorkspaceEvidence(calls, "research X", undefined, {}, "research");
+    expect(result.sufficient).toBe(false);
+    expect(result.contentReads).toBe(1);
+  });
+
   test("failed fetches earn no credit", () => {
     const calls = [
       call("web_fetch", "boom", true, { url: "https://a.example" }),
