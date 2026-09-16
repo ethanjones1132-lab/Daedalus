@@ -503,6 +503,8 @@ export function ChatPanel({
 
   // Loading-state for Session history fetch (Phase 2.3).
   const [loadingHistory, setLoadingHistory] = useState(false);
+  const [historyError, setHistoryError] = useState(false);
+  const [historyRetry, setHistoryRetry] = useState(0);
 
   // Scroll-aware autoscroll (Phase 2.5). When the user scrolls up we pause
   // automatic anchoring so the chat isn't yanked away mid-read. A floating
@@ -690,6 +692,7 @@ export function ChatPanel({
   const suppressHistoryLoadRef = useRef<string | null>(null);
   useEffect(() => {
     const prev = prevActiveSessionRef.current;
+    setHistoryError(false);
     if (suppressHistoryLoadRef.current && suppressHistoryLoadRef.current === activeSession) {
       // Freshly created by handleSend: preserve its optimistic turn and make
       // this Session the new comparison baseline without invalidating the send.
@@ -729,6 +732,7 @@ export function ChatPanel({
       lastAccumulatedRunIdRef.current = undefined;
     }
     if (!activeSession) {
+      setLoadingHistory(false);
       discardPendingTokens();
       setMessages([]);
       setSessionId('');
@@ -770,8 +774,8 @@ export function ChatPanel({
           }
         });
       })
-      .catch((e) => {
-        if (!cancelled) console.error('Failed to load session history:', e);
+      .catch(() => {
+        if (!cancelled) setHistoryError(true);
       })
       .finally(() => {
         if (!cancelled) {
@@ -780,7 +784,7 @@ export function ChatPanel({
         }
       });
     return () => { cancelled = true; };
-  }, [activeSession, scrollToBottom, discardPendingTokens]);
+  }, [activeSession, historyRetry, scrollToBottom, discardPendingTokens]);
 
   // Cancel any pending token rAF on unmount so we never setState after teardown.
   useEffect(() => () => { discardPendingTokens(); }, [discardPendingTokens]);
@@ -1695,7 +1699,8 @@ export function ChatPanel({
         className="flex-1 overflow-y-auto mb-4 space-y-3 pr-1 min-h-0 scroll-smooth"
       >
         {loadingHistory && (
-          <div className="space-y-2">
+          <div role="status" className="space-y-2">
+            <span className="sr-only">Loading session history…</span>
             {[0, 1, 2].map(i => (
               <div
                 key={i}
@@ -1714,7 +1719,20 @@ export function ChatPanel({
           </div>
         )}
 
-        {messages.length === 0 && !loadingHistory && (
+        {historyError && (
+          <div role="alert" className="rounded-xl border border-iron/30 p-3 text-sm text-bone-dim">
+            <p>Could not load session history.</p>
+            <button
+              type="button"
+              onClick={() => setHistoryRetry(value => value + 1)}
+              className="mt-2 px-3 py-1 text-xs font-mono border border-iron/30 rounded-lg hover:text-bone-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
+            >
+              Retry
+            </button>
+          </div>
+        )}
+
+        {messages.length === 0 && !loadingHistory && !historyError && (
           <div className="h-full flex items-center justify-center">
             <div className="text-center max-w-md">
               <motion.div
@@ -1764,7 +1782,7 @@ export function ChatPanel({
           </div>
         )}
 
-        {messages.length === 0 && <EmptyState message="No messages yet" />}
+        {messages.length === 0 && !loadingHistory && !historyError && <EmptyState message="No messages yet" />}
 
         {messages.map((msg, i) => (
           <ChatMessage

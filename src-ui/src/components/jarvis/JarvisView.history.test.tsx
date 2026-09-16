@@ -118,6 +118,20 @@ describe('Session history resource states', () => {
     expect(screen.getByText(splash)).toBeInTheDocument();
   });
 
+  it('hides loaded history immediately when another Session is pending', async () => {
+    const beta = deferred<unknown[]>();
+    mockHistory(id => id === 'Alpha' ? Promise.resolve([row('Alpha history')]) : beta.promise);
+    render(<JarvisView />);
+    await select('Alpha');
+    expect(await transcript().findByText('Alpha history')).toBeInTheDocument();
+    await select('Beta');
+    expect(screen.queryByText('Alpha history')).not.toBeInTheDocument();
+    expect(transcript().getByRole('status')).toHaveTextContent('Loading session history');
+    expect(screen.queryByText('No messages yet')).not.toBeInTheDocument();
+    await act(async () => beta.resolve([row('Beta history')]));
+    expect(transcript().getByText('Beta history')).toBeInTheDocument();
+  });
+
   it('clears old messages and errors when switching Sessions', async () => {
     mockHistory(async id => id === 'Alpha' ? [row('Alpha history')] : Promise.reject(new Error('unavailable')));
     render(<JarvisView />);
