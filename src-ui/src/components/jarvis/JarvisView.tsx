@@ -95,6 +95,12 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
   const [activeSession, setActiveSession] = useState<string | null>(null);
   const [config, setConfig] = useState<JarvisConfig | null>(null);
   const [status, setStatus] = useState<JarvisStatus | null>(null);
+  const [configLoading, setConfigLoading] = useState(true);
+  const [configError, setConfigError] = useState(false);
+  const configPending = useRef(false);
+  const [statusLoading, setStatusLoading] = useState(true);
+  const [statusError, setStatusError] = useState(false);
+  const statusPending = useRef(false);
 
   const loadSessions = useCallback(async () => {
     const request = ++sessionsRequest.current;
@@ -122,17 +128,38 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
   }, []);
 
   const loadConfig = useCallback(async () => {
+    if (configPending.current) return;
+    configPending.current = true;
+    setConfigLoading(true);
     try {
       const result = await invoke<JarvisConfig>('jarvis_get_config');
+      if (!result) throw new Error('Missing config');
       setConfig(result);
-    } catch (e) { console.error('Failed to load config:', e); }
+      setConfigError(false);
+    } catch {
+      // Native errors may contain configuration values; never display or log them.
+      setConfigError(true);
+    } finally {
+      configPending.current = false;
+      setConfigLoading(false);
+    }
   }, []);
 
   const loadStatus = useCallback(async () => {
+    if (statusPending.current) return;
+    statusPending.current = true;
+    setStatusLoading(true);
     try {
       const result = await invoke<JarvisStatus>('jarvis_check_status');
+      if (!result) throw new Error('Missing status');
       setStatus(result);
-    } catch (e) { console.error('Failed to load status:', e); }
+      setStatusError(false);
+    } catch {
+      setStatusError(true);
+    } finally {
+      statusPending.current = false;
+      setStatusLoading(false);
+    }
   }, []);
 
   useEffect(() => {
@@ -287,12 +314,12 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
           )}
           {subView === 'config' && (
             <motion.div key="config" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="h-full">
-              <ConfigPanel config={config} setConfig={setConfig} />
+              <ConfigPanel config={config} setConfig={setConfig} loading={configLoading} loadError={configError} onRetry={loadConfig} />
             </motion.div>
           )}
           {subView === 'status' && (
             <motion.div key="status" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="h-full">
-              <StatusPanel status={status} onRefresh={loadStatus} />
+              <StatusPanel status={status} loading={statusLoading} loadError={statusError} onRefresh={loadStatus} />
             </motion.div>
           )}
           {subView === 'control' && (
@@ -2770,7 +2797,13 @@ function SessionsPanel({
 // ── Config Panel ──
 // ═══════════════════════════════════════════════════════════════
 
-function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setConfig: (c: JarvisConfig | null) => void }) {
+function ConfigPanel({ config, setConfig, loading, loadError, onRetry }: {
+  config: JarvisConfig | null;
+  setConfig: (c: JarvisConfig | null) => void;
+  loading: boolean;
+  loadError: boolean;
+  onRetry: () => void;
+}) {
   const [localConfig, setLocalConfig] = useState<JarvisConfig | null>(config);
   const [saved, setSaved] = useState(false);
   const [showApiKeys, setShowApiKeys] = useState(false);
@@ -2798,8 +2831,21 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
 
   if (!localConfig) {
     return (
-      <div className="flex items-center justify-center h-48">
-        <p className="text-bone-dim text-sm font-mono">Loading config...</p>
+      <div className="flex flex-col items-center justify-center gap-3 h-48">
+        {loading && <p role="status" className="text-bone-dim text-sm font-mono">Loading config...</p>}
+        {loadError && (
+          <div role="alert" className="text-error text-xs font-mono text-center">
+            <p>Could not load config. Retry to load configuration.</p>
+            <button
+              onClick={onRetry}
+              disabled={loading}
+              aria-label="Retry config"
+              className="mt-2 px-3 py-1.5 border border-error/30 rounded-lg disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-error/50"
+            >
+              Retry
+            </button>
+          </div>
+        )}
       </div>
     );
   }
@@ -3225,11 +3271,39 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
 // ── Status Panel ──
 // ═══════════════════════════════════════════════════════════════
 
-function StatusPanel({ status, onRefresh }: { status: JarvisStatus | null; onRefresh: () => void }) {
+function StatusPanel({ status, loading, loadError, onRefresh }: {
+  status: JarvisStatus | null;
+  loading: boolean;
+  loadError: boolean;
+  onRefresh: () => void;
+}) {
+  const loadFeedback = (
+    <div className="space-y-3">
+      {loading && (
+        <p role="status" className="text-bone-dim text-sm font-mono">
+          {status ? 'Refreshing status...' : 'Loading status...'}
+        </p>
+      )}
+      {loadError && (
+        <div role="alert" className="p-3 bg-error/10 border border-error/30 rounded-xl text-error text-xs font-mono">
+          <p>{status ? 'Could not refresh status. Showing previously loaded status; it may be stale.' : 'Could not load status.'}</p>
+          <button
+            onClick={onRefresh}
+            disabled={loading}
+            aria-label="Retry status"
+            className="mt-2 px-3 py-1.5 border border-error/30 rounded-lg disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-error/50"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+    </div>
+  );
+
   if (!status) {
     return (
       <div className="flex items-center justify-center h-48">
-        <p className="text-bone-dim text-sm font-mono">Loading status...</p>
+        {loadFeedback}
       </div>
     );
   }
@@ -3290,11 +3364,14 @@ function StatusPanel({ status, onRefresh }: { status: JarvisStatus | null; onRef
         <button
           onClick={onRefresh}
           aria-label="Refresh status"
-          className="px-3 py-1 text-xs font-mono text-bone-dim border border-iron/30 rounded-lg hover:border-iron/50 hover:text-bone-muted transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
+          disabled={loading}
+          className="px-3 py-1 text-xs font-mono text-bone-dim border border-iron/30 rounded-lg hover:border-iron/50 hover:text-bone-muted transition-colors disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
         >
           ↻ Refresh
         </button>
       </div>
+
+      {(loading || loadError) && <div className="mb-4">{loadFeedback}</div>}
 
       <div className="space-y-2">
         {serviceItems.map(item => (
