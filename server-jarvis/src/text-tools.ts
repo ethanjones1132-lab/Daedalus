@@ -243,6 +243,7 @@ Rules:
 - After a tool result is provided, answer normally.
 - Do not explain the tool call inside the JSON block.
 - Common aliases are accepted: read/write/edit, bash/shell/powershell, find/list_files, search, browse/open_url, websearch, mcp_call_tool, agent, task_create.
+- If the request only needs arithmetic, unit/date math, or something you already know, answer directly — do not call a tool. Tools are only for external data, side effects (files, commands, network), or information you cannot derive yourself. If a tool is still required after doing that arithmetic or lookup yourself (e.g. using a computed value as a tool argument), call it.
 
 Available tools:
 ${toolList}
