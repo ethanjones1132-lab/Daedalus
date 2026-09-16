@@ -1,7 +1,7 @@
 // ── DevicesView — paired devices (get_devices/add_device/remove_device) ──
 
 import { invoke } from '@tauri-apps/api/core';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   cn,
   ConfirmModal,
@@ -38,6 +38,9 @@ export default function DevicesView() {
   const [name, setName] = useState('');
   const [type, setType] = useState(DEVICE_TYPES[0]);
   const [pendingDelete, setPendingDelete] = useState<Device | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState(false);
+  const createPending = useRef(false);
   const { success, error: toastError } = useToast();
 
   const fetchDevices = useCallback(async () => {
@@ -57,16 +60,22 @@ export default function DevicesView() {
   }, [fetchDevices]);
 
   const add = useCallback(async () => {
-    if (!name.trim()) return;
+    if (createPending.current || !name.trim()) return;
+    createPending.current = true;
+    setCreating(true);
+    setCreateError(false);
     try {
       await invoke<Device>('add_device', { name: name.trim(), deviceType: type });
       success(`Added device ${name}`);
       setName('');
       await fetchDevices();
-    } catch (e) {
-      toastError(String(e), 'Add failed');
+    } catch {
+      setCreateError(true);
+    } finally {
+      createPending.current = false;
+      setCreating(false);
     }
-  }, [name, type, fetchDevices, success, toastError]);
+  }, [name, type, fetchDevices, success]);
 
   const remove = useCallback((d: Device) => { setPendingDelete(d); }, []);
 
@@ -98,15 +107,23 @@ export default function DevicesView() {
       />
       <SectionHeader title="Devices" subtitle="Paired devices and their status" count={devices.length} />
 
+      {createError && (
+        <div role="alert" className="text-sm text-red-200">
+          Could not add the device. Your draft was kept.{' '}
+          <button type="button" onClick={add} disabled={creating || !name.trim()} className="underline disabled:opacity-40">Retry</button>
+        </div>
+      )}
+
       <div className="flex gap-2">
         <input
           className={cn(inputCls, 'flex-1')}
           placeholder="Device name"
+          disabled={creating}
           value={name}
           onChange={(e) => setName(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && add()}
         />
-        <select className={inputCls} value={type} onChange={(e) => setType(e.target.value)}>
+        <select disabled={creating} className={inputCls} value={type} onChange={(e) => setType(e.target.value)}>
           {DEVICE_TYPES.map((t) => (
             <option key={t} value={t}>
               {t}
@@ -116,10 +133,10 @@ export default function DevicesView() {
         <button
           type="button"
           onClick={add}
-          disabled={!name.trim()}
+          disabled={creating || !name.trim()}
           className="px-4 py-2 text-sm rounded-lg bg-accent text-bone hover:bg-accent/80 disabled:opacity-40 transition-colors"
         >
-          Add
+          {creating ? 'Adding…' : 'Add'}
         </button>
       </div>
 

@@ -1,7 +1,7 @@
 // ── HooksView — event hooks (get_hooks/register_hook/unregister_hook) ──
 
 import { invoke } from '@tauri-apps/api/core';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   cn,
   ConfirmModal,
@@ -43,6 +43,9 @@ export default function HooksView() {
   const [event, setEvent] = useState(HOOK_EVENTS[0]);
   const [script, setScript] = useState('');
   const [pendingDelete, setPendingDelete] = useState<Hook | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState(false);
+  const createPending = useRef(false);
   const { success, error: toastError } = useToast();
 
   const fetchHooks = useCallback(async () => {
@@ -62,7 +65,10 @@ export default function HooksView() {
   }, [fetchHooks]);
 
   const register = useCallback(async () => {
-    if (!name.trim()) return;
+    if (createPending.current || !name.trim()) return;
+    createPending.current = true;
+    setCreating(true);
+    setCreateError(false);
     try {
       await invoke<Hook>('register_hook', {
         name: name.trim(),
@@ -73,10 +79,13 @@ export default function HooksView() {
       setName('');
       setScript('');
       await fetchHooks();
-    } catch (e) {
-      toastError(String(e), 'Register failed');
+    } catch {
+      setCreateError(true);
+    } finally {
+      createPending.current = false;
+      setCreating(false);
     }
-  }, [name, event, script, fetchHooks, success, toastError]);
+  }, [name, event, script, fetchHooks, success]);
 
   const unregister = useCallback((h: Hook) => { setPendingDelete(h); }, []);
 
@@ -109,14 +118,21 @@ export default function HooksView() {
       <SectionHeader title="Hooks" subtitle="Event-driven automation hooks" count={hooks.length} />
 
       <GlassCard className="p-3 space-y-2">
+        {createError && (
+          <div role="alert" className="text-sm text-red-200">
+            Could not register the hook. Your draft was kept.{' '}
+            <button type="button" onClick={register} disabled={creating || !name.trim()} className="underline disabled:opacity-40">Retry</button>
+          </div>
+        )}
         <div className="flex gap-2">
           <input
             className={cn(inputCls, 'flex-1')}
             placeholder="Hook name"
+            disabled={creating}
             value={name}
             onChange={(e) => setName(e.target.value)}
           />
-          <select className={inputCls} value={event} onChange={(e) => setEvent(e.target.value)}>
+          <select disabled={creating} className={inputCls} value={event} onChange={(e) => setEvent(e.target.value)}>
             {HOOK_EVENTS.map((ev) => (
               <option key={ev} value={ev}>
                 {ev}
@@ -128,6 +144,7 @@ export default function HooksView() {
           <input
             className={cn(inputCls, 'flex-1 font-mono text-xs')}
             placeholder="Script / command (optional)"
+            disabled={creating}
             value={script}
             onChange={(e) => setScript(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && register()}
@@ -135,10 +152,10 @@ export default function HooksView() {
           <button
             type="button"
             onClick={register}
-            disabled={!name.trim()}
+            disabled={creating || !name.trim()}
             className="px-4 py-2 text-sm rounded-lg bg-accent text-bone hover:bg-accent/80 disabled:opacity-40 transition-colors"
           >
-            Register
+            {creating ? 'Registering…' : 'Register'}
           </button>
         </div>
       </GlassCard>

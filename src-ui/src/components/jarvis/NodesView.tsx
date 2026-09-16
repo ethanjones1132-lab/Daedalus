@@ -1,7 +1,7 @@
 // ── NodesView — compute nodes (get_nodes/add_node/remove_node) ──
 
 import { invoke } from '@tauri-apps/api/core';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   cn,
   ConfirmModal,
@@ -32,6 +32,9 @@ export default function NodesView() {
   const [name, setName] = useState('');
   const [address, setAddress] = useState('');
   const [pendingDelete, setPendingDelete] = useState<Node | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState(false);
+  const createPending = useRef(false);
   const { success, error: toastError } = useToast();
 
   const fetchNodes = useCallback(async () => {
@@ -51,17 +54,23 @@ export default function NodesView() {
   }, [fetchNodes]);
 
   const add = useCallback(async () => {
-    if (!name.trim() || !address.trim()) return;
+    if (createPending.current || !name.trim() || !address.trim()) return;
+    createPending.current = true;
+    setCreating(true);
+    setCreateError(false);
     try {
       await invoke<Node>('add_node', { name: name.trim(), address: address.trim() });
       success(`Added node ${name}`);
       setName('');
       setAddress('');
       await fetchNodes();
-    } catch (e) {
-      toastError(String(e), 'Add failed');
+    } catch {
+      setCreateError(true);
+    } finally {
+      createPending.current = false;
+      setCreating(false);
     }
-  }, [name, address, fetchNodes, success, toastError]);
+  }, [name, address, fetchNodes, success]);
 
   const remove = useCallback((n: Node) => { setPendingDelete(n); }, []);
 
@@ -100,16 +109,25 @@ export default function NodesView() {
       />
       <SectionHeader title="Nodes" subtitle="Distributed compute nodes" count={nodes.length} />
 
+      {createError && (
+        <div role="alert" className="text-sm text-red-200">
+          Could not add the node. Your draft was kept.{' '}
+          <button type="button" onClick={add} disabled={creating || !name.trim() || !address.trim()} className="underline disabled:opacity-40">Retry</button>
+        </div>
+      )}
+
       <div className="flex gap-2">
         <input
           className={cn(inputCls, 'flex-1')}
           placeholder="Node name"
+          disabled={creating}
           value={name}
           onChange={(e) => setName(e.target.value)}
         />
         <input
           className={cn(inputCls, 'flex-1')}
           placeholder="Address (host:port)"
+          disabled={creating}
           value={address}
           onChange={(e) => setAddress(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && add()}
@@ -117,10 +135,10 @@ export default function NodesView() {
         <button
           type="button"
           onClick={add}
-          disabled={!name.trim() || !address.trim()}
+          disabled={creating || !name.trim() || !address.trim()}
           className="px-4 py-2 text-sm rounded-lg bg-accent text-bone hover:bg-accent/80 disabled:opacity-40 transition-colors"
         >
-          Add
+          {creating ? 'Adding…' : 'Add'}
         </button>
       </div>
 
