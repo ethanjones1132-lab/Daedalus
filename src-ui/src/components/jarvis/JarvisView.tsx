@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useLayoutEffect, memo } from 
 import { motion, AnimatePresence } from 'framer-motion';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
-import { cn, EmptyState } from '../ui';
+import { cn, EmptyState, LoadingState, ErrorState } from '../ui';
 import type { CompanionState } from './types';
 import {
   JarvisSession, JarvisMessage, JarvisConfig, JarvisStatus, SessionRunRecord,
@@ -87,17 +87,24 @@ class JarvisStreamError extends Error {
 export default function JarvisView({ initialSubView = 'chat', onCompanionChange }: JarvisViewProps) {
   const [subView, setSubView] = useState<JarvisSubView>(initialSubView);
   const [sessions, setSessions] = useState<JarvisSession[]>([]);
+  const [sessionsLoading, setSessionsLoading] = useState(true);
+  const [sessionsError, setSessionsError] = useState<string | null>(null);
+  const sessionsRequest = useRef(0);
   const [sessionRuns, setSessionRuns] = useState<Record<string, SessionRunRecord>>({});
   const [activeSession, setActiveSession] = useState<string | null>(null);
   const [config, setConfig] = useState<JarvisConfig | null>(null);
   const [status, setStatus] = useState<JarvisStatus | null>(null);
 
   const loadSessions = useCallback(async () => {
+    const request = ++sessionsRequest.current;
+    setSessionsLoading(true);
+    setSessionsError(null);
     try {
       const [result, runs] = await Promise.all([
         invoke<JarvisSession[]>('jarvis_list_sessions'),
         invoke<SessionRunRecord[]>('get_all_session_runs').catch(() => [] as SessionRunRecord[]),
       ]);
+      if (request !== sessionsRequest.current) return;
       setSessions(result);
       const runMap: Record<string, SessionRunRecord> = {};
       for (const run of runs) {
@@ -106,7 +113,11 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
         }
       }
       setSessionRuns(runMap);
-    } catch (e) { console.error('Failed to load sessions:', e); }
+    } catch (e) {
+      if (request === sessionsRequest.current) setSessionsError(String(e));
+    } finally {
+      if (request === sessionsRequest.current) setSessionsLoading(false);
+    }
   }, []);
 
   const loadConfig = useCallback(async () => {
@@ -262,6 +273,8 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
             <motion.div key="sessions" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="h-full">
               <SessionsPanel
                 sessions={sessions}
+                loading={sessionsLoading}
+                error={sessionsError}
                 sessionRuns={sessionRuns}
                 activeSession={activeSession}
                 onSelect={(id) => { setActiveSession(id); setSubView('chat'); }}
@@ -2575,9 +2588,11 @@ function ApprovalModal({ call_id, name, args, error, onApprove, onReject }: {
 // ═══════════════════════════════════════════════════════════════
 
 function SessionsPanel({
-  sessions, sessionRuns, activeSession, onSelect, onNew, onDelete, onRefresh,
+  sessions, loading, error, sessionRuns, activeSession, onSelect, onNew, onDelete, onRefresh,
 }: {
   sessions: JarvisSession[];
+  loading: boolean;
+  error: string | null;
   sessionRuns: Record<string, SessionRunRecord>;
   activeSession: string | null;
   onSelect: (id: string) => void;
@@ -2611,6 +2626,7 @@ function SessionsPanel({
           <button
             onClick={onRefresh}
             aria-label="Refresh sessions"
+            disabled={loading}
             className="px-3 py-1 text-xs font-mono text-bone-dim border border-iron/30 rounded-lg hover:border-iron/50 hover:text-bone-muted transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
           >
             ↻ Refresh
@@ -2656,7 +2672,20 @@ function SessionsPanel({
       )}
 
       <div className="flex-1 overflow-y-auto space-y-2">
-        {sessions.length === 0 ? (
+        {loading && (
+          <div role="status">
+            <LoadingState message={sessions.length > 0 ? 'Refreshing sessions…' : 'Loading sessions…'} />
+          </div>
+        )}
+        {error && (
+          <div role="alert">
+            <ErrorState
+              error={`Could not load sessions. ${sessions.length > 0 ? 'Showing previously loaded sessions; they may be out of date. ' : ''}${error}`}
+              onRetry={onRefresh}
+            />
+          </div>
+        )}
+        {sessions.length === 0 && (loading || error) ? null : sessions.length === 0 ? (
           <div className="flex items-center justify-center h-48">
             <div className="text-center">
               <p className="text-bone-dim text-sm font-mono">No sessions yet</p>
