@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import McpPanel from './McpPanel';
+import { ToastProvider } from '../ui';
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
@@ -31,6 +32,52 @@ async function renderLoaded() {
 }
 
 describe('MCP persistence drafts and serialization', () => {
+  it('freezes every mutation control and reports success only after resolution', async () => {
+    const pending = deferred<void>();
+    saved.mockReturnValueOnce(pending.promise);
+    render(<ToastProvider><McpPanel /></ToastProvider>);
+    await screen.findByPlaceholderText('npx');
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    for (const input of screen.getAllByRole('textbox')) expect(input).toBeDisabled();
+    const enabled = screen.getByRole('button', { name: 'Enabled' });
+    const remove = screen.getByRole('button', { name: 'Remove' });
+    expect(enabled).toBeDisabled();
+    expect(remove).toBeDisabled();
+    fireEvent.click(enabled);
+    fireEvent.click(remove);
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.queryByText('MCP servers saved')).not.toBeInTheDocument();
+    expect(saved).toHaveBeenCalledTimes(1);
+
+    await act(async () => { pending.resolve(undefined); });
+    expect(screen.getByText('MCP servers saved')).toBeInTheDocument();
+    expect(enabled).toBeEnabled();
+    expect(remove).toBeEnabled();
+  });
+
+  it('retries the edited retained draft without losing untouched entry fields', async () => {
+    const first = deferred<void>();
+    const retry = deferred<void>();
+    const entry = { ...existing, cwd: '/synthetic/workspace', type: 'stdio', env: { DEMO: 'fixture' } };
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'list_mcp_servers') return Promise.resolve({ existing: entry });
+      if (command === 'save_mcp_servers') return saved();
+      throw new Error(`Unexpected command: ${command}`);
+    });
+    saved.mockReturnValueOnce(first.promise).mockReturnValueOnce(retry.promise);
+    await renderLoaded();
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await act(async () => { first.reject(new Error('synthetic rejection')); });
+    fireEvent.change(screen.getByPlaceholderText('npx'), { target: { value: 'bun' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(invokeMock.mock.calls.filter(([c]) => c === 'save_mcp_servers')[1]).toEqual([
+      'save_mcp_servers', { servers: { existing: { ...entry, command: 'bun' } } },
+    ]);
+    await act(async () => { retry.resolve(undefined); });
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
   it('serializes saves and freezes the draft until persistence resolves', async () => {
     const first = deferred<void>();
     const second = deferred<void>();

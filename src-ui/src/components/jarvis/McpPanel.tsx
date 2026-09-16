@@ -8,7 +8,7 @@
 // commands (list_mcp_servers / save_mcp_servers, src-tauri/src/commands/mcp.rs)
 // that read/write the same file+shape the orchestrator already reads.
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
   cn,
@@ -26,8 +26,10 @@ export default function McpPanel() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState(false);
   const [newName, setNewName] = useState('');
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
+  const savePendingRef = useRef(false);
   const { success, error: toastError } = useToast();
 
   const load = useCallback(async () => {
@@ -46,19 +48,26 @@ export default function McpPanel() {
   useEffect(() => { load(); }, [load]);
 
   const persist = async (next: McpServerMap) => {
+    if (savePendingRef.current) return;
+    savePendingRef.current = true;
     setSaving(true);
+    // Add and removal are retained drafts, not evidence of successful persistence.
+    // All editing is frozen until this exact snapshot settles.
+    setServers(next);
     try {
       await invoke('save_mcp_servers', { servers: next });
-      setServers(next);
+      setSaveError(false);
       success('MCP servers saved');
-    } catch (e) {
-      toastError(String(e), 'Failed to save .mcp.json');
+    } catch {
+      setSaveError(true); // Native errors may embed configuration values.
     } finally {
+      savePendingRef.current = false;
       setSaving(false);
     }
   };
 
   const addServer = () => {
+    if (savePendingRef.current) return;
     const name = newName.trim();
     if (!name || !servers) return;
     if (servers[name]) {
@@ -66,11 +75,11 @@ export default function McpPanel() {
       return;
     }
     void persist({ ...servers, [name]: emptyMcpServerEntry() });
-    setNewName('');
+    setNewName(''); // The name now lives in the retained server draft.
   };
 
   const removeServer = (name: string) => {
-    if (!servers) return;
+    if (!servers || savePendingRef.current) return;
     const next = { ...servers };
     delete next[name];
     void persist(next);
@@ -78,7 +87,7 @@ export default function McpPanel() {
   };
 
   const updateServer = (name: string, patch: Partial<McpServerEntry>) => {
-    if (!servers) return;
+    if (!servers || savePendingRef.current) return;
     setServers({ ...servers, [name]: { ...servers[name], ...patch } });
   };
 
@@ -95,6 +104,16 @@ export default function McpPanel() {
 
   return (
     <div className="space-y-3">
+      {saving && <div role="status" className="text-xs text-bone/60">Saving MCP draft… Changes are not yet saved.</div>}
+      {saveError && (
+        <div role="alert" className="text-xs text-red-200">
+          Could not save .mcp.json. Your draft is kept; changes are not yet saved.
+          <button type="button" onClick={saveAll} disabled={saving} className="ml-2 underline disabled:opacity-40">
+            Retry
+          </button>
+        </div>
+      )}
+      <fieldset disabled={saving} className="space-y-3 border-0 p-0 m-0 min-w-0">
       <GlassCard className="p-4">
         <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40 mb-2">
           Add MCP server
@@ -103,7 +122,7 @@ export default function McpPanel() {
           <input
             type="text"
             value={newName}
-            onChange={(e) => setNewName(e.target.value)}
+            onChange={(e) => { if (!savePendingRef.current) setNewName(e.target.value); }}
             onKeyDown={(e) => { if (e.key === 'Enter') addServer(); }}
             placeholder="server name (e.g. filesystem)"
             className="flex-1 px-3 py-2 text-xs font-mono bg-white/5 border border-white/10 rounded-lg text-bone placeholder:text-bone/30 focus:outline-none focus:border-white/20 transition-colors"
@@ -144,7 +163,7 @@ export default function McpPanel() {
                     </button>
                     <button
                       type="button"
-                      onClick={() => setPendingDelete(name)}
+                      onClick={() => { if (!savePendingRef.current) setPendingDelete(name); }}
                       className="px-2 py-0.5 text-[10px] font-mono rounded-md border border-red-500/30 text-red-200 hover:bg-red-500/10 transition-colors"
                     >
                       Remove
@@ -203,6 +222,7 @@ export default function McpPanel() {
         </ul>
       )}
 
+      </fieldset>
       <ConfirmModal
         open={pendingDelete !== null}
         message={`Remove MCP server "${pendingDelete}"?`}
