@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   PageTransition,
@@ -486,6 +486,7 @@ function ChatFeedsView() {
 }
 
 function SessionsView() {
+  const disclosureId = useId();
   const [sessions, setSessions] = useState<BackendSession[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -520,15 +521,24 @@ function SessionsView() {
               <TiltCard
                 intensity="subtle"
                 accent={isExpanded ? 'cyan' : 'royal'}
-                onClick={() => toggle(session.id)}
                 className="!p-3.5"
               >
-                <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  aria-label={`Session details: ${session.title || session.agent_id}`}
+                  aria-expanded={isExpanded}
+                  aria-controls={`${disclosureId}-${session.id}`}
+                  onClick={() => toggle(session.id)}
+                  className="w-full flex items-center gap-3 text-left rounded-lg cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-neon focus-visible:outline-offset-4"
+                >
                   <StatusDot ok={!session.archived} warn={session.archived} />
-                  <div className="flex-1 min-w-0"><div className="flex items-center gap-2 mb-0.5"><span className="text-sm font-semibold text-bone truncate">{session.title || session.agent_id}</span><Pill variant="info">{session.backend}</Pill>{session.archived && <Pill variant="warning">archived</Pill>}</div><div className="text-xs font-mono text-bone-faint truncate">{session.id}</div></div>
-                  <div className="text-right shrink-0"><div className="text-xs font-mono text-bone-muted">{session.model}</div><div className="text-xs font-mono text-bone-dim">{formatIsoAge(session.updated_at)}</div></div>
-                </div>
+                  <span className="flex-1 min-w-0"><span className="flex items-center gap-2 mb-0.5"><span className="text-sm font-semibold text-bone truncate">{session.title || session.agent_id}</span><Pill variant="info">{session.backend}</Pill>{session.archived && <Pill variant="warning">archived</Pill>}</span><span className="block text-xs font-mono text-bone-faint truncate">{session.id}</span></span>
+                  <span className="text-right shrink-0"><span className="block text-xs font-mono text-bone-muted">{session.model}</span><span className="block text-xs font-mono text-bone-dim">{formatIsoAge(session.updated_at)}</span></span>
+                  <span aria-hidden="true" className="text-bone-dim">{isExpanded ? '▾' : '▸'}</span>
+                </button>
+                <div id={`${disclosureId}-${session.id}`} hidden={!isExpanded}>
                 <AnimatePresence>{isExpanded && (<motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} transition={{ duration: 0.2 }} className="overflow-hidden"><div className="px-3 pb-3 border-t border-white/[0.06] mt-3 pt-3"><div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs font-mono"><div><span className="text-bone-dim block mb-0.5">Session ID</span><span className="text-bone-muted break-all">{session.id}</span></div><div><span className="text-bone-dim block mb-0.5">Agent</span><span className="text-bone-muted">{session.agent_id}</span></div><div><span className="text-bone-dim block mb-0.5">Messages</span><span className="text-bone-muted">{session.message_count}</span></div><div><span className="text-bone-dim block mb-0.5">Tokens</span><span className="text-bone-muted">{formatTokens(session.total_tokens)} / {formatTokens(session.context_tokens)}</span></div><div><span className="text-bone-dim block mb-0.5">Created</span><span className="text-bone-muted">{formatIsoAge(session.created_at)}</span></div><div><span className="text-bone-dim block mb-0.5">Updated</span><span className="text-bone-muted">{formatIsoAge(session.updated_at)}</span></div>{percentUsed !== null && (<div className="col-span-2 md:col-span-4"><div className="flex items-center justify-between mb-1"><span className="text-bone-dim">Context Usage</span><span className={percentColor(percentUsed)}>{percentUsed.toFixed(1)}%</span></div><ProgressBar percent={percentUsed} /></div>)}</div></div></motion.div>)}</AnimatePresence>
+                </div>
               </TiltCard>
             </motion.div>
           );
