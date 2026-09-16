@@ -6,7 +6,7 @@
 // fuzzy-searches them and navigates on select. Opens on Cmd/Ctrl+K (wired in
 // App), closes on Esc/backdrop; Arrow keys move selection, Enter chooses.
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { NavItem, ViewId } from '../../types';
 
 /// Subsequence fuzzy match over label and id. Pure + exported for testing.
@@ -37,26 +37,45 @@ export default function CommandPalette({ open, items, onClose, onNavigate }: Pro
   const [query, setQuery] = useState('');
   const [sel, setSel] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  const activeOptionRef = useRef<HTMLLIElement>(null);
+  const listId = useId();
   const results = useMemo(() => filterNavItems(items, query), [items, query]);
+  const selectedIndex = Math.min(sel, Math.max(results.length - 1, 0));
+  const selectedId = results[selectedIndex]?.id;
 
   useEffect(() => {
-    if (open) {
-      setQuery('');
-      setSel(0);
-      // Focus after paint so the input is ready for typing.
-      const t = setTimeout(() => inputRef.current?.focus(), 0);
-      return () => clearTimeout(t);
-    }
+    if (!open) return;
+    const opener = document.activeElement;
+    setQuery('');
+    setSel(0);
+    // The combobox is the only tab stop; options use active-descendant focus.
+    const containFocus = (e: FocusEvent) => {
+      if (e.target !== inputRef.current) inputRef.current?.focus();
+    };
+    document.addEventListener('focusin', containFocus);
+    inputRef.current?.focus();
+    return () => {
+      document.removeEventListener('focusin', containFocus);
+      if (opener instanceof HTMLElement && opener.isConnected) opener.focus();
+      // Navigation can remove or disable the invoking control.
+      if (document.activeElement !== opener || !opener?.isConnected) {
+        const tabIndex = document.body.getAttribute('tabindex');
+        document.body.setAttribute('tabindex', '-1');
+        document.body.focus();
+        if (tabIndex === null) document.body.removeAttribute('tabindex');
+        else document.body.setAttribute('tabindex', tabIndex);
+      }
+    };
   }, [open]);
 
   useEffect(() => {
-    setSel(0);
-  }, [query]);
+    if (open) activeOptionRef.current?.scrollIntoView?.({ block: 'nearest' });
+  }, [open, selectedId]);
 
   if (!open) return null;
 
   const choose = (id?: ViewId) => {
-    const target = id ?? results[sel]?.id;
+    const target = id ?? selectedId;
     if (target) {
       onNavigate(target);
       onClose();
@@ -66,13 +85,17 @@ export default function CommandPalette({ open, items, onClose, onNavigate }: Pro
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Escape') {
       e.preventDefault();
+      e.stopPropagation();
       onClose();
+    } else if (e.key === 'Tab') {
+      e.preventDefault();
+      inputRef.current?.focus();
     } else if (e.key === 'ArrowDown') {
       e.preventDefault();
-      setSel((s) => (results.length ? Math.min(s + 1, results.length - 1) : 0));
+      setSel(results.length ? Math.min(selectedIndex + 1, results.length - 1) : 0);
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
-      setSel((s) => Math.max(s - 1, 0));
+      setSel(Math.max(selectedIndex - 1, 0));
     } else if (e.key === 'Enter') {
       e.preventDefault();
       choose();
@@ -96,24 +119,31 @@ export default function CommandPalette({ open, items, onClose, onNavigate }: Pro
         <input
           ref={inputRef}
           value={query}
-          onChange={(e) => setQuery(e.target.value)}
+          onChange={(e) => { setQuery(e.target.value); setSel(0); }}
           placeholder="Jump to view…"
           aria-label="Search views"
+          role="combobox"
+          aria-expanded={open}
+          aria-autocomplete="list"
+          aria-controls={listId}
+          aria-activedescendant={selectedId ? `${listId}-${selectedId}` : undefined}
           className="w-full bg-transparent px-4 py-3 text-sm text-bone placeholder:text-bone/30 outline-none border-b border-white/5"
         />
-        <ul className="max-h-72 overflow-y-auto py-1" role="listbox" aria-label="Views">
+        <ul id={listId} className="max-h-72 overflow-y-auto py-1" role="listbox" aria-label="Views">
           {results.length === 0 ? (
             <li className="px-4 py-3 text-xs text-bone/40">No matching views</li>
           ) : (
             results.map((it, i) => (
               <li
                 key={it.id}
+                id={`${listId}-${it.id}`}
+                ref={i === selectedIndex ? activeOptionRef : undefined}
                 role="option"
-                aria-selected={i === sel}
+                aria-selected={i === selectedIndex}
                 onMouseEnter={() => setSel(i)}
                 onClick={() => choose(it.id)}
                 className={`flex items-center gap-3 px-4 py-2 cursor-pointer text-sm ${
-                  i === sel ? 'bg-white/10 text-bone' : 'text-bone/70'
+                  i === selectedIndex ? 'bg-white/10 text-bone' : 'text-bone/70'
                 }`}
               >
                 <span className="w-5 h-5 grid place-items-center rounded bg-white/5 text-[10px] font-mono">
