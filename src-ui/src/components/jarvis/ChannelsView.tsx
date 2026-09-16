@@ -13,7 +13,8 @@
 // the flag out of config.
 
 import { invoke } from '@tauri-apps/api/core';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { initialReceiptState, parseReceipts, reduceReceiptState } from './channel-receipt-state';
 import {
   cn,
   ConfirmModal,
@@ -39,16 +40,6 @@ interface Channel {
   connected: boolean;
   created_at: string;
   updated_at: string;
-}
-
-interface DeliveryReceipt {
-  message_id: string;
-  channel: string;
-  status: 'queued' | 'delivered' | 'failed';
-  retry_count: number;
-  error_code?: string;
-  correlation_id: string;
-  finished_at: string;
 }
 
 const CHANNEL_TYPES = [
@@ -168,8 +159,24 @@ export function ChannelsView() {
   const [error, setError] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<Channel | null>(null);
-  const [receipts, setReceipts] = useState<DeliveryReceipt[]>([]);
+  const [receiptState, dispatchReceipts] = useReducer(reduceReceiptState, initialReceiptState);
+  const receiptPending = useRef(false);
   const { success, error: toastError } = useToast();
+
+  const fetchReceipts = useCallback(async () => {
+    if (receiptPending.current) return;
+    receiptPending.current = true;
+    dispatchReceipts({ type: 'pending' });
+    try {
+      const response = await globalThis.fetch(`${BUN_URL}/channels/discord/receipts`);
+      if (!response.ok) throw new Error('Delivery telemetry unavailable');
+      dispatchReceipts({ type: 'success', receipts: parseReceipts(await response.json()) });
+    } catch {
+      dispatchReceipts({ type: 'failure' });
+    } finally {
+      receiptPending.current = false;
+    }
+  }, []);
 
   const fetchChannels = useCallback(async (opts?: { silent?: boolean }) => {
     if (!opts?.silent) setLoading(true);
@@ -177,13 +184,6 @@ export function ChannelsView() {
     try {
       const list = await invoke<Channel[]>('list_channels');
       setChannels(list);
-      const receiptResponse = globalThis.fetch
-        ? await globalThis.fetch(`${BUN_URL}/channels/discord/receipts`).catch(() => null)
-        : null;
-      if (receiptResponse?.ok) {
-        const body = await receiptResponse.json() as { receipts?: DeliveryReceipt[] };
-        setReceipts(body.receipts ?? []);
-      }
     } catch (e) {
       setError(String(e));
     } finally {
@@ -194,6 +194,10 @@ export function ChannelsView() {
   useEffect(() => {
     fetchChannels();
   }, [fetchChannels]);
+
+  useEffect(() => {
+    fetchReceipts();
+  }, [fetchReceipts]);
 
   const create = useCallback(
     async (name: string, type: string, url: string) => {
@@ -273,6 +277,32 @@ export function ChannelsView() {
 
       {adding && <AddChannelForm onCreate={create} onCancel={() => setAdding(false)} />}
 
+      <div className="text-xs text-bone/60 space-y-1">
+        <div className="flex items-center justify-between gap-2">
+          <span>Discord delivery telemetry</span>
+          <button
+            type="button"
+            onClick={fetchReceipts}
+            disabled={receiptState.phase === 'loading'}
+            className="px-3 py-1 rounded-md bg-white/5 hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {receiptState.phase === 'failed' ? 'Retry delivery telemetry' : 'Refresh delivery telemetry'}
+          </button>
+        </div>
+        {receiptState.phase === 'loading' && (
+          <p role="status">Loading delivery telemetry…{receiptState.receipts !== null && ' Previously loaded telemetry may be stale.'}</p>
+        )}
+        {receiptState.phase === 'failed' && (
+          <p role="alert">
+            {receiptState.receipts !== null
+              ? 'Delivery telemetry is stale. Showing previously loaded receipts.'
+              : 'Delivery telemetry is unavailable.'}
+            {' This does not affect native channel loading.'}
+          </p>
+        )}
+        {receiptState.phase === 'ready' && receiptState.receipts?.length === 0 && <p>No delivery receipts yet.</p>}
+      </div>
+
       <div className="flex-1 overflow-y-auto min-h-0">
         {loading ? (
           <LoadingState message="Loading channels…" />
@@ -284,7 +314,7 @@ export function ChannelsView() {
           <ul className="space-y-2">
             {channels.map((c) => {
               const connected = isConnected(c);
-              const latestReceipt = c.type === 'discord' ? receipts[0] : undefined;
+              const latestReceipt = c.type === 'discord' ? receiptState.receipts?.[0] : undefined;
               return (
                 <li key={c.id}>
                   <GlassCard className="p-3">
@@ -317,7 +347,7 @@ export function ChannelsView() {
                     </div>
                     <div className="flex items-center gap-2 mt-1.5 text-[10px] font-mono text-bone/30">
                       <span>last used {formatTimestamp(c.last_used)}</span>
-                      {latestReceipt && <span className={latestReceipt.status === 'delivered' ? 'text-emerald-300/70' : 'text-amber-300/70'}>delivery {latestReceipt.status} · retries {latestReceipt.retry_count}</span>}
+                      {latestReceipt && <span className={latestReceipt.status === 'delivered' ? 'text-emerald-300/70' : 'text-amber-300/70'}>delivery {latestReceipt.status} · retries {latestReceipt.retry_count}{receiptState.phase !== 'ready' && ' (stale)'}</span>}
                       <span className="ml-auto">added {formatTimestamp(c.created_at)}</span>
                     </div>
                   </GlassCard>
