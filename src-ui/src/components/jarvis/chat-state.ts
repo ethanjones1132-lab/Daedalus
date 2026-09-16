@@ -1,4 +1,5 @@
 import type { JarvisMessage } from './types';
+import { isTerminalStageStatus } from './sse-protocol';
 import type { ToolResultTruncationMetadata } from './sse-protocol';
 
 /** Synchronous send lock with generations so stale completions cannot unlock a replacement. */
@@ -362,6 +363,81 @@ export function formatRunDuration(durationMs: number): string {
   if (totalSeconds < 60) return `${totalSeconds.toFixed(1)}s`;
   const minutes = Math.floor(totalSeconds / 60);
   return `${minutes}m ${(totalSeconds - minutes * 60).toFixed(1)}s`;
+}
+
+// ── In-flight Session turn progress (no silent spinner) ──
+//
+// While a Session turn is running, the operator sees an "Activity" feed that
+// is collapsible and a status line that only renders before the first token.
+// Two honesty gaps fell out of that:
+//   1. After a terminal stage update (completed/failed/timed_out/cancelled/
+//      partial) cleared `pipelineStage`, the old status fell back to the most
+//      recent agentStep and said "Jarvis is working in <stage>..." — describing
+//      a stage that had just reported failed/completed as still running.
+//   2. "Jarvis is preparing the response..." invented planning activity before
+//      any telemetry arrived.
+// `buildTurnProgress` is the single pure view-model for the in-flight status
+// row. It only asserts what a runtime frame actually observed: a stage the
+// runtime currently reports as running, a verbatim terminal/elapsed status, a
+// verbatim raw activity observation, or the plain fact that response text is
+// being received. When the turn is no longer in flight it renders nothing —
+// completion states belong to the message transcript, not a progress row.
+
+export interface TurnProgressInput {
+  isStreaming: boolean;
+  /** Stage the runtime currently reports as running ('' when none). */
+  pipelineStage: string;
+  /** Chronological stage/activity log; the tail is the latest observation. */
+  agentSteps: Array<{ stage: string; text: string }>;
+  /** True once any response text frame has been received this turn. */
+  hasResponseText?: boolean;
+  /** Tool awaiting the operator's approval decision, if one is pending. */
+  approvalName?: string;
+}
+
+export interface TurnProgress {
+  /** Machine-readable phase so the row can be styled without re-parsing text. */
+  kind: 'waiting' | 'approval' | 'running_stage' | 'stage_update' | 'activity' | 'response_text';
+  text: string;
+}
+
+export function buildTurnProgress(input: TurnProgressInput): TurnProgress | null {
+  if (!input.isStreaming) return null;
+
+  if (input.approvalName) {
+    return { kind: 'approval', text: `Waiting for approval to run ${input.approvalName}.` };
+  }
+
+  const stage = input.pipelineStage.trim();
+  if (stage) {
+    return { kind: 'running_stage', text: `Running stage: ${stage}.` };
+  }
+
+  const latest = input.agentSteps[input.agentSteps.length - 1];
+  if (latest && latest.text.trim()) {
+    // Deterministic runtime outcomes: a bare terminal status, or the same
+    // status with the runtime-reported elapsed time ("failed in 1.2s").
+    if (isTerminalStageStatus(latest.text)
+      || /^(?:completed|done|failed|timed_out|cancelled|partial) in \d+(?:\.\d+)?s$/.test(latest.text)) {
+      return {
+        kind: 'stage_update',
+        text: `Last stage update: ${latest.stage} — ${latest.text.replaceAll('_', ' ')}. Waiting for the next update.`,
+      };
+    }
+    if (input.hasResponseText) {
+      return { kind: 'response_text', text: 'Receiving response text.' };
+    }
+    return {
+      kind: 'activity',
+      text: `Last activity: ${latest.stage}. Waiting for the next update.`,
+    };
+  }
+
+  if (input.hasResponseText) {
+    return { kind: 'response_text', text: 'Receiving response text.' };
+  }
+
+  return { kind: 'waiting', text: 'Waiting for Session turn progress.' };
 }
 
 const INFERENCE_PROVIDER_LABELS: Record<string, string> = {

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import JarvisView, { ChatPanel } from './JarvisView';
 
@@ -39,6 +39,39 @@ beforeEach(() => {
 });
 
 describe('ChatPanel state machine', () => {
+  it('keeps observed stage progress visible before tokens and with Activity collapsed', async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(stream, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    })));
+    render(<ChatPanel {...props} />);
+    const composer = await screen.findByLabelText('Chat input');
+    fireEvent.change(composer, { target: { value: 'inspect the workspace' } });
+    fireEvent.keyDown(composer, { key: 'Enter' });
+
+    const progress = await screen.findByRole('status', { name: 'Session turn progress' });
+    expect(progress).toHaveTextContent('Waiting for Session turn progress.');
+    const emit = async (frame: object) => {
+      await act(async () => {
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(frame)}\n\n`));
+      });
+    };
+    await emit({ type: 'orchestrator_stage', stage: 'executor', status: 'running' });
+    expect(progress).toHaveTextContent('Running stage: executor.');
+    fireEvent.click(screen.getByRole('button', { name: /Activity/ }));
+    await emit({ type: 'orchestrator_stage', stage: 'executor', status: 'failed', elapsed_ms: 1200 });
+    expect(progress).toHaveTextContent('Last stage update: executor — failed in 1.2s. Waiting for the next update.');
+    expect(progress).not.toHaveTextContent('Running');
+    await emit({ type: 'orchestrator_stage', stage: 'synthesizer', status: 'running' });
+    expect(progress).toHaveTextContent('Running stage: synthesizer.');
+    await emit({ type: 'stream_event', delta: { text: 'Partial answer' } });
+    await waitFor(() => expect(progress).toHaveTextContent('Receiving response text.'));
+    await emit({ type: 'result', result: 'Final answer' });
+    await act(async () => { controller.close(); });
+    await waitFor(() => expect(screen.queryByRole('status', { name: 'Session turn progress' })).not.toBeInTheDocument());
+  });
+
   it('allows only one fetch for rapid duplicate Enter submissions', async () => {
     let resolveFetch!: (response: Response) => void;
     const fetchMock = vi.fn(() => new Promise<Response>((resolve) => { resolveFetch = resolve; }));

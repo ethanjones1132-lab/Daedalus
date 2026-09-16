@@ -27,6 +27,7 @@ import {
   SendInFlightGuard,
   appendAgentProgress,
   buildActivityFeed,
+  buildTurnProgress,
   dedupeMessages,
   finalizeStreamingMessages,
   formatActivityFeedSummary,
@@ -498,6 +499,11 @@ export function ChatPanel({
   // closes the race on the client side; see SendInFlightGuard.
   const sendInFlightRef = useRef(new SendInFlightGuard());
   const stopRequestedRef = useRef(false);
+  // Whether any response text frame has landed this Session turn. Ref-backed
+  // so the pure `buildTurnProgress` view-model can distinguish "receiving
+  // response text" from unverified stage work without a dedicated state
+  // waterfall; reset at send, finalize, error, cancel, and session switch.
+  const turnHadResponseTextRef = useRef(false);
   useEffect(() => { activeSessionRef.current = activeSession; }, [activeSession]);
   useEffect(() => {
     if (!isStreaming || turnStartedAtRef.current === null) return;
@@ -556,6 +562,7 @@ export function ChatPanel({
     pendingTokenRef.current = '';
     setError(null);
     setPipelineStage('');
+    turnHadResponseTextRef.current = true;
     setMessages(prev => applyTokenChunk(prev, text));
   }, [applyTokenChunk]);
 
@@ -583,6 +590,7 @@ export function ChatPanel({
     setRecursionDepth(null);
     setPendingApproval(null);
     setUserPinnedToBottom(true);
+    turnHadResponseTextRef.current = false;
     const effectiveSid = sid || activeSessionRef.current || sessionIdRef.current;
     setMessages(prev => {
       const withTokens = applyTokenChunk(prev, pending);
@@ -685,6 +693,7 @@ export function ChatPanel({
       setPendingApproval(null);
       setApprovalError(null);
       setError(null);
+      turnHadResponseTextRef.current = false;
       // Reset the per-session rollup so the Session Stats pill starts
       // empty for the new session. The accumulation-ref is cleared in
       // lockstep so a re-sent metrics frame from a previous stream
@@ -1399,6 +1408,7 @@ export function ChatPanel({
     turnStartedAtRef.current = Date.now();
     setTurnElapsedMs(0);
     setPipelineStage('');
+    turnHadResponseTextRef.current = false;
     setRecursionDepth(null);
     setReasoningText('');
     setShowReasoning(false);
@@ -1588,14 +1598,18 @@ export function ChatPanel({
   };
 
   const lastAssistant = messages[messages.length - 1];
-  const streamStatusText = (() => {
-    if (!isStreaming) return undefined;
-    if (pendingApproval) return `Jarvis is waiting for approval to run ${pendingApproval.name}.`;
-    if (pipelineStage) return `Jarvis is running ${pipelineStage}...`;
-    const latestAgentStep = agentSteps[agentSteps.length - 1];
-    if (latestAgentStep?.stage) return `Jarvis is working in ${latestAgentStep.stage}...`;
-    return 'Jarvis is preparing the response...';
-  })();
+  // In-flight Session turn progress (M4 sibling): pure view-model output from
+  // observed runtime telemetry only. Rendered as a plain status row, so stage
+  // progress stays readable before the first token and after the collapsible
+  // Activity feed is collapsed — never a bare unexplained spinner.
+  const turnProgress = buildTurnProgress({
+    isStreaming,
+    pipelineStage,
+    agentSteps,
+    hasResponseText: turnHadResponseTextRef.current,
+    approvalName: pendingApproval?.name,
+  });
+  const streamStatusText = turnProgress?.text;
   const showSkeleton =
     isStreaming &&
     !loadingHistory &&
