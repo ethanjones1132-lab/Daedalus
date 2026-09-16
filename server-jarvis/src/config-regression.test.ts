@@ -12,6 +12,8 @@ import {
   resolveAgentsRoot,
   runtimeConfigEvidence,
   runtimeConfigReloadResponse,
+  redactedConfigResponse,
+  resolveProviderTestConfig,
   validateAgentsRootPath,
   invalidateConfigCache,
 } from "./config";
@@ -96,6 +98,49 @@ describe("configuration regression coverage retained during Task 6", () => {
     expect(Object.keys(response).sort()).toEqual(["ok", "runtime"]);
     expect(response.ok).toBe(true);
     expect(JSON.stringify(response)).not.toContain("route-secret");
+  });
+
+  test("legacy config response is metadata-only and never contains provider keys", () => {
+    const cfg = defaultConfig();
+    cfg.openrouter.api_key = "openrouter-route-secret";
+    cfg.opencode_zen.api_key = "zen-route-secret";
+    cfg.opencode_go.api_key = "go-route-secret";
+    const response = redactedConfigResponse(cfg);
+    expect(Object.keys(response).sort()).toEqual(["ok", "runtime", "validation"]);
+    expect(JSON.stringify(response)).not.toContain("route-secret");
+    expect(response).not.toHaveProperty("config");
+    expect(response).not.toHaveProperty("openrouter");
+  });
+
+  test("provider test config uses the live key when a redacted override is blank", () => {
+    const live = defaultConfig();
+    live.opencode_zen.api_key = "stored-zen-key";
+    const merged = resolveProviderTestConfig({ opencode_zen: { api_key: "" } }, live);
+    expect(merged.opencode_zen.api_key).toBe("stored-zen-key");
+    expect(JSON.stringify(merged)).toContain("stored-zen-key");
+    const replacement = resolveProviderTestConfig({ opencode_zen: { api_key: "replacement-zen-key" } }, live);
+    expect(replacement.opencode_zen.api_key).toBe("replacement-zen-key");
+  });
+
+  test("shared OpenCode env keys do not populate independent provider slots", () => {
+    const names = ["OPENCODE_API_KEY", "OPENCODE_KEY", "OPENCODE_ZEN_API_KEY", "OPENCODE_ZEN_KEY", "OPENCODE_GO_API_KEY", "OPENCODE_GO_KEY"] as const;
+    const prior = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    try {
+      process.env.OPENCODE_API_KEY = "shared-only-key";
+      delete process.env.OPENCODE_KEY;
+      delete process.env.OPENCODE_ZEN_API_KEY;
+      delete process.env.OPENCODE_ZEN_KEY;
+      delete process.env.OPENCODE_GO_API_KEY;
+      delete process.env.OPENCODE_GO_KEY;
+      const cfg = normalizeConfig({ opencode_zen: { api_key: "" }, opencode_go: { api_key: "" } });
+      expect(cfg.opencode_zen.api_key).not.toBe("shared-only-key");
+      expect(cfg.opencode_go.api_key).not.toBe("shared-only-key");
+    } finally {
+      for (const name of names) {
+        if (prior[name] === undefined) delete process.env[name];
+        else process.env[name] = prior[name];
+      }
+    }
   });
 
   test("credentialFingerprint is stable, truncated, and blank-safe", () => {

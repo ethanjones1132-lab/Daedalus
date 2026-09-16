@@ -1,5 +1,6 @@
 use crate::db::AppDb;
 use crate::jarvis::types::JarvisConfig;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tauri::State;
 
@@ -71,12 +72,8 @@ const KNOWN_SETTING_KEYS: &[&str] = &[
 const SENSITIVE_PROVIDER_SETTING_KEYS: &[&str] = &["openrouter", "opencode_zen", "opencode_go"];
 
 fn credential_fingerprint(api_key: &str) -> String {
-    let mut hash = 14_695_981_039_346_656_037u64;
-    for byte in api_key.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(1_099_511_628_211);
-    }
-    format!("{hash:016x}")
+    let digest = Sha256::digest(api_key.as_bytes());
+    format!("{:x}", digest)[..12].to_string()
 }
 
 fn redact_provider_value(value: &mut serde_json::Value) {
@@ -590,6 +587,11 @@ mod tests {
         assert!(value.get("api_key").is_none());
         assert_eq!(value["api_key_configured"], serde_json::json!(true));
         assert!(value["api_key_fingerprint"].as_str().is_some());
+    }
+
+    #[test]
+    fn credential_fingerprint_matches_bun_sha256_contract() {
+        assert_eq!(credential_fingerprint("same-key"), "b7f06468dced");
     }
 
     #[test]

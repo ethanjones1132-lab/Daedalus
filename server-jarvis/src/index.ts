@@ -12,7 +12,7 @@ import { readdirSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 
 import { join } from "path";
 import { homedir } from "os";
 import { spawn, execSync } from "child_process";
-import { loadConfig, saveConfig, saveConfigWithValidation, normalizeConfig, InvalidConfigError, CONFIG_DIR, COMPANION_FILE, surfaceTemperature, reloadConfigFromDisk, runtimeConfigReloadResponse } from "./config";
+import { loadConfig, saveConfig, saveConfigWithValidation, normalizeConfig, InvalidConfigError, CONFIG_DIR, COMPANION_FILE, surfaceTemperature, reloadConfigFromDisk, runtimeConfigReloadResponse, redactedConfigResponse, resolveProviderTestConfig } from "./config";
 import type { JarvisConfig, OllamaConfig, SurfaceType } from "./config";
 import { Database } from "bun:sqlite";
 import { buildLearningPrompt, buildReviewPrompt, buildCodebaseAuditPrompt, buildFootballAuditPrompt } from "./cron-prompts";
@@ -3812,7 +3812,10 @@ export async function baseFetch(req: Request): Promise<Response> {
       const cfg = reloadConfigFromDisk();
       return Response.json(runtimeConfigReloadResponse(cfg));
     }
-    if (path === "/config" && req.method === "GET") return Response.json(loadConfig());
+    if (path === "/config" && req.method === "GET") {
+      const cfg = loadConfig();
+      return Response.json(redactedConfigResponse(cfg));
+    }
     if (path === "/config" && req.method === "POST") {
       const body = await req.json().catch(() => ({}));
       // P1-N: validate before write. A partial config that omits the
@@ -3822,7 +3825,7 @@ export async function baseFetch(req: Request): Promise<Response> {
       // chat on the next turn.
       try {
         const { config, validation } = saveConfigWithValidation(body);
-        return Response.json({ ok: true, config, validation });
+        return Response.json(redactedConfigResponse(config, validation));
       } catch (err) {
         if (err instanceof InvalidConfigError) {
           console.warn(`[Jarvis] Rejected invalid config save: ${err.validation.errors.join("; ")}`);
@@ -3889,7 +3892,7 @@ export async function baseFetch(req: Request): Promise<Response> {
         );
       }
       return Response.json(
-        await checkHttpProviderHealth(resolveConfig(body.config), provider as HttpProviderId),
+        await checkHttpProviderHealth(resolveProviderTestConfig(body.config), provider as HttpProviderId),
       );
     }
     if (path === "/test" && (req.method === "GET" || req.method === "POST")) {

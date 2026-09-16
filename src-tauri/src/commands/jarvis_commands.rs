@@ -445,7 +445,12 @@ pub async fn jarvis_save_config(
     const RUNTIME_SYNC_WARNING: &str =
         "Configuration was saved, but the Bun runtime did not confirm the reload.";
     let runtime_result: Result<serde_json::Value, String> = async {
-        crate::ensure_jarvis_server_started().await?;
+        tokio::time::timeout(
+            Duration::from_secs(25),
+            crate::ensure_jarvis_server_started(),
+        )
+        .await
+        .map_err(|_| "Timed out while starting the Bun server for config reload".to_string())??;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(3))
             .build()
@@ -481,7 +486,7 @@ pub async fn jarvis_save_config(
             Ok(ConfigSaveResult {
                 persisted: true,
                 runtime_synced,
-                runtime: Some(runtime_payload),
+                runtime: runtime_synced.then_some(runtime_payload),
                 warning: (!runtime_synced).then(|| RUNTIME_SYNC_WARNING.to_string()),
             })
         }

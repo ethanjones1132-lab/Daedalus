@@ -611,9 +611,8 @@ export function isInvalidWorkspacePath(
 export function normalizeConfig(raw: any, options: NormalizeConfigOptions = {}): JarvisConfig {
   const merged = deepMerge(defaultConfig(), raw);
   const openRouterKey = process.env.OPENROUTER_API_KEY || process.env.OPENROUTER_KEY;
-  const openCodeKey = process.env.OPENCODE_API_KEY || process.env.OPENCODE_KEY;
-  const openCodeZenKey = process.env.OPENCODE_ZEN_API_KEY || process.env.OPENCODE_ZEN_KEY || openCodeKey;
-  const openCodeGoKey = process.env.OPENCODE_GO_API_KEY || process.env.OPENCODE_GO_KEY || openCodeKey;
+  const openCodeZenKey = process.env.OPENCODE_ZEN_API_KEY || process.env.OPENCODE_ZEN_KEY;
+  const openCodeGoKey = process.env.OPENCODE_GO_API_KEY || process.env.OPENCODE_GO_KEY;
   if ((!merged.openrouter.api_key || merged.openrouter.api_key.length < 10) && openRouterKey) {
     merged.openrouter.api_key = openRouterKey;
   }
@@ -732,6 +731,22 @@ export function runtimeConfigEvidence(cfg: JarvisConfig = loadConfig()): Runtime
 /** Build the secret-safe payload returned by POST /config/reload. */
 export function runtimeConfigReloadResponse(cfg: JarvisConfig = loadConfig()): RuntimeConfigReloadResponse {
   return { ok: true, runtime: runtimeConfigEvidence(cfg) };
+}
+
+/** Build the safe response shared by the legacy config routes. */
+export function redactedConfigResponse(
+  cfg: JarvisConfig,
+  validation: ConfigValidation = validateConfig(cfg),
+): { ok: true; runtime: RuntimeConfigEvidence; validation: ConfigValidation } {
+  return { ok: true, runtime: runtimeConfigEvidence(cfg), validation };
+}
+
+/** Merge a provider-test override onto the live config without exposing secrets. */
+export function resolveProviderTestConfig(
+  configOverride?: Partial<JarvisConfig> | null,
+  liveConfig: JarvisConfig = loadConfig(),
+): JarvisConfig {
+  return configOverride ? normalizeConfig(deepMerge(liveConfig, configOverride)) : liveConfig;
 }
 
 /** Invalidate the short-lived config cache and load the current disk state. */

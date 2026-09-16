@@ -2184,6 +2184,11 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
   const [providerTests, setProviderTests] = useState<Partial<Record<CredentialProvider, ProviderTestResult>>>({});
   const [testingProviders, setTestingProviders] = useState<Partial<Record<CredentialProvider, boolean>>>({});
   const configRevision = useRef(0);
+  const providerTestGenerations = useRef<Record<CredentialProvider, number>>({
+    openrouter: 0,
+    opencode_zen: 0,
+    opencode_go: 0,
+  });
 
   useEffect(() => {
     setLocalConfig(config);
@@ -2191,19 +2196,24 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
 
   const handleSave = async () => {
     if (!localConfig) return;
+    const saveRevision = configRevision.current;
+    const configToSave = localConfig;
     setSaving(true);
     setSaveWarning(null);
     try {
-      const result = await invoke<ConfigSaveResult>('jarvis_save_config', { config: localConfig });
+      const result = await invoke<ConfigSaveResult>('jarvis_save_config', { config: configToSave });
+      if (saveRevision !== configRevision.current) return;
       if (result.persisted) {
-        setConfig(localConfig);
+        setConfig(configToSave);
         setSaved(true);
         setRuntimeConfirmed(result.runtime_synced);
         setSaveWarning(result.warning);
       }
     } catch (e) {
       console.error('Failed to save config:', e);
-      setSaveWarning('Configuration could not be saved.');
+      if (saveRevision === configRevision.current) {
+        setSaveWarning('Configuration could not be saved.');
+      }
     } finally {
       setSaving(false);
     }
@@ -2227,24 +2237,28 @@ function ConfigPanel({ config, setConfig }: { config: JarvisConfig | null; setCo
   const testProvider = async (provider: CredentialProvider) => {
     if (!localConfig) return;
     const revision = configRevision.current;
+    const generation = providerTestGenerations.current[provider] + 1;
+    providerTestGenerations.current[provider] = generation;
     setTestingProviders((previous) => ({ ...previous, [provider]: true }));
     try {
       const result = await invoke<ProviderTestResult>('jarvis_test_provider', {
         provider,
         config: localConfig,
       });
-      if (revision === configRevision.current) {
+      if (revision === configRevision.current && providerTestGenerations.current[provider] === generation) {
         setProviderTests((previous) => ({ ...previous, [provider]: result }));
       }
     } catch {
-      if (revision === configRevision.current) {
+      if (revision === configRevision.current && providerTestGenerations.current[provider] === generation) {
         setProviderTests((previous) => ({
           ...previous,
           [provider]: { ok: false, latency_ms: 0, error: 'Connection test failed.' },
         }));
       }
     } finally {
-      setTestingProviders((previous) => ({ ...previous, [provider]: false }));
+      if (providerTestGenerations.current[provider] === generation) {
+        setTestingProviders((previous) => ({ ...previous, [provider]: false }));
+      }
     }
   };
 
