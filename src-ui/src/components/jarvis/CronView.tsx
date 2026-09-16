@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { aggregateInsights, selectInsightJobs } from './cron-insights';
 import {
   PageTransition,
   AnimatedList,
@@ -845,6 +846,9 @@ export default function CronView() {
   const [insightsOpen, setInsightsOpen] = useState(false);
   const [insightRuns, setInsightRuns] = useState<CronRun[]>([]);
   const [insightsLoading, setInsightsLoading] = useState(false);
+  const insightsPending = useRef(false);
+  const [insightsCoverage, setInsightsCoverage] = useState({ failedJobIds: [] as string[], selectedCount: 0 });
+  const [insightsStale, setInsightsStale] = useState(false);
   const [hasAutoOpenedInsights, setHasAutoOpenedInsights] = useState(false);
 
   const fetchInFlight = useCallback(async () => {
@@ -926,23 +930,32 @@ export default function CronView() {
 
   // Feature 1: Luxury Insights loader + simple viz (uses existing invokes, client-side agg, capped)
   const loadInsights = useCallback(async () => {
-    if (insightsLoading) return;
-
+    if (insightsPending.current) return;
+    insightsPending.current = true;
     setInsightsLoading(true);
     try {
-      const samples: CronRun[] = [];
-      const topJobs = [...jobs].sort((a, b) => b.run_count - a.run_count).slice(0, 4); // perf safety
+      const results: { jobId: string; runs: CronRun[] | null }[] = [];
+      const topJobs = selectInsightJobs(jobs);
       for (const j of topJobs) {
         try {
           const rs: CronRun[] = await invoke('get_cron_runs', { cronId: j.id });
-          samples.push(...rs.slice(0, 5));
-        } catch {}
+          results.push({ jobId: j.id, runs: rs });
+        } catch {
+          results.push({ jobId: j.id, runs: null });
+        }
       }
-      setInsightRuns(samples);
+      const sample = aggregateInsights(results);
+      const allFailed = sample.selectedCount > 0 && sample.failedJobIds.length === sample.selectedCount;
+      setInsightsCoverage({ failedJobIds: sample.failedJobIds, selectedCount: sample.selectedCount });
+      // Retain the previous snapshot only when no history request succeeded.
+      // Partial responses replace it rather than mixing fresh and stale runs.
+      if (!allFailed) setInsightRuns(sample.runs);
+      setInsightsStale(allFailed);
     } finally {
+      insightsPending.current = false;
       setInsightsLoading(false);
     }
-  }, [insightsLoading, jobs]);
+  }, [jobs]);
 
   const toggleInsights = async () => {
     if (insightsOpen) {
@@ -1029,14 +1042,28 @@ export default function CronView() {
                     Live execution quality, run history, and balance recommendations for your automation loop.
                   </p>
                 </div>
-                <Pill variant="info">{insightsLoading ? 'syncing…' : `${insightRuns.length} samples`}</Pill>
+                <Pill variant="info">{insightsLoading ? 'syncing…' : insightsStale
+                  ? insightRuns.length > 0 ? `${insightRuns.length} stale samples` : 'unavailable'
+                  : `${insightRuns.length} samples${insightsCoverage.failedJobIds.length > 0 ? ' (partial)' : ''}`}</Pill>
               </div>
 
+              {insightsCoverage.failedJobIds.length > 0 && (
+                <div role="alert" className="mb-3 text-xs font-mono text-error">
+                  {insightsStale ? 'Could not load insights.' : 'Partial insights.'}
+                  {' '}Run history unavailable for {insightsCoverage.failedJobIds.length} of {insightsCoverage.selectedCount} selected jobs.
+                  {' '}{insightsStale && insightRuns.length > 0
+                    ? 'Showing previously loaded samples; they may be stale.'
+                    : !insightsStale ? 'Statistics cover only the available subset.' : ''}
+                  <button onClick={loadInsights} disabled={insightsLoading} className="ml-2 underline disabled:opacity-50">
+                    Retry
+                  </button>
+                </div>
+              )}
               {insightsLoading ? (
-                <p className="text-xs font-mono text-bone-dim">
+                <p role="status" className="text-xs font-mono text-bone-dim">
                   Loading premium cron insights from recent run history…
                 </p>
-              ) : (
+              ) : insightsStale && insightRuns.length === 0 ? null : (
                 (() => {
                   const total = insightRuns.length;
                   const successful = insightRuns.filter((r) => r.status === 'success').length;
@@ -1082,7 +1109,9 @@ export default function CronView() {
                         <div className="text-[10px] text-bone-faint uppercase tracking-wider mb-2">Recent Run History</div>
                         {total === 0 ? (
                           <p className="text-xs text-bone-dim">
-                            No historical runs found yet — let a cron execute and this panel will start charting the loop.
+                            {insightsCoverage.failedJobIds.length > 0
+                              ? 'No runs in the available subset; other selected histories could not be loaded.'
+                              : 'No historical runs found yet — let a cron execute and this panel will start charting the loop.'}
                           </p>
                         ) : (
                           <div className="flex gap-1 h-16 items-end">
@@ -1105,10 +1134,10 @@ export default function CronView() {
                         )}
                       </div>
 
-                      <div className="rounded-lg border border-royal/20 bg-royal/8 p-3 text-[11px] leading-relaxed text-bone-dim">
+                      {insightsCoverage.failedJobIds.length === 0 && <div className="rounded-lg border border-royal/20 bg-royal/8 p-3 text-[11px] leading-relaxed text-bone-dim">
                         <span className="text-royal-light font-semibold tracking-wide uppercase text-[10px]">Recommendation</span>
                         <p className="mt-1">{recommendation}</p>
-                      </div>
+                      </div>}
                     </div>
                   );
                 })()
