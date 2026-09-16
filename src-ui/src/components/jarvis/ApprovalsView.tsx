@@ -2,7 +2,8 @@
 //    (get_approvals/approve_request/reject_request) ──
 
 import { invoke } from '@tauri-apps/api/core';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { reconcileApprovalRows } from './approval-state';
 import {
   GlassCard,
   Pill,
@@ -34,37 +35,57 @@ export default function ApprovalsView() {
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const { success, error: toastError } = useToast();
+  const { success } = useToast();
+  const [decisions, setDecisions] = useState<Map<string, { approve: boolean; pending: boolean; failed: boolean }>>(new Map());
+  const pendingIds = useRef(new Set<string>());
+  const settledIds = useRef(new Set<string>());
+  const retainedRows = useRef(new Map<string, Approval>());
+  const latestFetch = useRef(0);
 
   const fetchApprovals = useCallback(async () => {
+    const request = ++latestFetch.current;
     setLoading(true);
     setError(null);
     try {
-      setApprovals(await invoke<Approval[]>('get_approvals'));
-    } catch (e) {
-      setError(String(e));
+      const incoming = await invoke<Approval[]>('get_approvals');
+      if (request !== latestFetch.current) return;
+      setApprovals(reconcileApprovalRows(incoming, [...retainedRows.current.values()], settledIds.current));
+    } catch {
+      if (request === latestFetch.current) setError('Could not load approvals. Retained requests may be stale.');
     } finally {
-      setLoading(false);
+      if (request === latestFetch.current) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
     fetchApprovals();
+    return () => { latestFetch.current += 1; };
   }, [fetchApprovals]);
 
   const decide = useCallback(
     async (a: Approval, approve: boolean) => {
-      // Optimistic removal — the backend filters to pending only.
-      setApprovals((prev) => prev.filter((x) => x.id !== a.id));
+      if (pendingIds.current.has(a.id) || settledIds.current.has(a.id)) return;
+      pendingIds.current.add(a.id);
+      retainedRows.current.set(a.id, a);
+      setDecisions((prev) => new Map(prev).set(a.id, { approve, pending: true, failed: prev.get(a.id)?.failed ?? false }));
       try {
         await invoke<boolean>(approve ? 'approve_request' : 'reject_request', { id: a.id });
+        settledIds.current.add(a.id);
+        retainedRows.current.delete(a.id);
+        setApprovals((prev) => prev.filter((x) => x.id !== a.id));
+        setDecisions((prev) => {
+          const next = new Map(prev);
+          next.delete(a.id);
+          return next;
+        });
         success(`${approve ? 'Approved' : 'Rejected'} request`);
-      } catch (e) {
-        toastError(String(e), 'Decision failed');
-        await fetchApprovals();
+      } catch {
+        setDecisions((prev) => new Map(prev).set(a.id, { approve, pending: false, failed: true }));
+      } finally {
+        pendingIds.current.delete(a.id);
       }
     },
-    [fetchApprovals, success, toastError],
+    [success],
   );
 
   return (
@@ -85,13 +106,12 @@ export default function ApprovalsView() {
       />
 
       <div className="flex-1 overflow-y-auto min-h-0">
-        {loading ? (
-          <LoadingState message="Loading approvals…" />
-        ) : error ? (
-          <ErrorState error={error} onRetry={fetchApprovals} />
-        ) : approvals.length === 0 ? (
+        {loading && <div role="status"><LoadingState message="Loading approvals…" /></div>}
+        {error && <div role="alert"><ErrorState error={error} onRetry={fetchApprovals} /></div>}
+        {!loading && !error && approvals.length === 0 && (
           <EmptyState message="Nothing waiting for approval. You're all caught up." />
-        ) : (
+        )}
+        {approvals.length > 0 && (
           <ul className="space-y-2">
             {approvals.map((a) => (
               <li key={a.id}>
@@ -104,6 +124,24 @@ export default function ApprovalsView() {
                     </span>
                   </div>
                   <p className="text-sm text-bone/80">{a.description}</p>
+                  {decisions.get(a.id)?.pending && (
+                    <p role="status" className="mt-2 text-xs text-bone/60">
+                      {decisions.get(a.id)?.approve ? 'Approving' : 'Rejecting'}… Waiting for confirmation.
+                    </p>
+                  )}
+                  {decisions.get(a.id)?.failed && (
+                    <div role="alert" className="mt-2 text-xs text-red-200">
+                      Could not save this decision. The request was kept; retry or choose another decision.
+                      <button
+                        type="button"
+                        onClick={() => decide(a, decisions.get(a.id)!.approve)}
+                        disabled={decisions.get(a.id)?.pending}
+                        className="ml-2 underline"
+                      >
+                        Retry
+                      </button>
+                    </div>
+                  )}
                   {a.tool_args && (
                     <pre className="mt-1.5 text-[10px] font-mono text-bone/50 bg-black/20 rounded-md px-2 py-1 overflow-x-auto">
                       {a.tool_args}
@@ -115,6 +153,7 @@ export default function ApprovalsView() {
                       <button
                         type="button"
                         onClick={() => decide(a, true)}
+                        disabled={decisions.get(a.id)?.pending}
                         className="px-3 py-1 rounded-md border border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10 transition-colors"
                       >
                         Approve
@@ -122,6 +161,7 @@ export default function ApprovalsView() {
                       <button
                         type="button"
                         onClick={() => decide(a, false)}
+                        disabled={decisions.get(a.id)?.pending}
                         className="px-3 py-1 rounded-md border border-red-500/30 text-red-200 hover:bg-red-500/10 transition-colors"
                       >
                         Reject
