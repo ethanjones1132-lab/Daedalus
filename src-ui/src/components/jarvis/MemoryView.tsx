@@ -2,9 +2,9 @@
 // ── MemoryView — Browse, recall, and inspect the memory system ──
 // ═══════════════════════════════════════════════════════════════
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { cn, GlassCard, LoadingState, ErrorState, EmptyState, SectionHeader, useToast } from '../ui';
+import { cn, GlassCard, LoadingState, ErrorState, EmptyState, SectionHeader } from '../ui';
 
 interface MemoryEntry {
   id: string;
@@ -60,44 +60,45 @@ export default function MemoryView() {
   const [tier, setTier] = useState<Tier | 'all'>('all');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const { error: toastError } = useToast();
+  const [submittedQuery, setSubmittedQuery] = useState('');
+  const requestId = useRef(0);
 
-  const fetch = useCallback(async () => {
+  // List and recall share one boundary: neither may overwrite a newer request.
+  const load = useCallback(async (requestedQuery: string) => {
+    const id = ++requestId.current;
+    const recallQuery = requestedQuery.trim() ? requestedQuery : '';
+    setSubmittedQuery(recallQuery);
     setLoading(true);
     setError(null);
+    setMemories([]);
     try {
-      const [list, stats] = await Promise.all([
-        invoke<MemoryEntry[]>('list_recent_memories'),
-        invoke<Record<Tier, number>>('jarvis_get_tier_stats').catch(() => null),
-      ]);
-      setMemories(list);
-      setTierStats(stats);
-    } catch (e) {
-      setError(String(e));
+      if (recallQuery) {
+        const results = await invoke<MemoryEntry[]>('memory_recall_preview', { query: recallQuery });
+        if (id !== requestId.current) return;
+        setMemories(results);
+      } else {
+        const [list, stats] = await Promise.all([
+          invoke<MemoryEntry[]>('list_recent_memories'),
+          invoke<Record<Tier, number>>('jarvis_get_tier_stats').catch(() => null),
+        ]);
+        if (id !== requestId.current) return;
+        setMemories(list);
+        setTierStats(stats);
+      }
+    } catch {
+      if (id !== requestId.current) return;
+      setError(recallQuery ? `Memory recall failed for "${recallQuery}".` : 'Could not load memories.');
     } finally {
-      setLoading(false);
+      if (id === requestId.current) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    fetch();
-  }, [fetch]);
+    void load('');
+    return () => { requestId.current += 1; };
+  }, [load]);
 
-  const search = useCallback(async () => {
-    if (!query.trim()) {
-      fetch();
-      return;
-    }
-    setLoading(true);
-    try {
-      const results = await invoke<MemoryEntry[]>('memory_recall_preview', { query });
-      setMemories(results);
-    } catch (e) {
-      toastError(String(e), 'Memory search failed');
-    } finally {
-      setLoading(false);
-    }
-  }, [query, fetch, toastError]);
+  const search = () => { void load(query); };
 
   const filtered = tier === 'all'
     ? memories
@@ -144,6 +145,7 @@ export default function MemoryView() {
       <div className="flex gap-2">
         <input
           type="text"
+          aria-label="Recall query"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && search()}
@@ -151,6 +153,7 @@ export default function MemoryView() {
           className="flex-1 px-3 py-2 text-sm rounded-lg bg-white/5 border border-white/10 text-bone placeholder:text-bone/30 focus:outline-none focus:border-accent/50"
         />
         <select
+          aria-label="Memory tier"
           value={tier}
           onChange={(e) => setTier(e.target.value as Tier | 'all')}
           className="px-2 py-2 text-sm rounded-lg bg-white/5 border border-white/10 text-bone"
@@ -170,10 +173,19 @@ export default function MemoryView() {
       </div>
 
       <div className="flex-1 overflow-y-auto min-h-0">
+        {!loading && !error && (
+          <p className="text-xs text-bone/50 mb-2">
+            {submittedQuery ? `Results for "${submittedQuery}"` : 'Recent memories'}
+          </p>
+        )}
         {loading ? (
-          <LoadingState message="Loading memories…" />
+          <div role="status">
+            <LoadingState message={submittedQuery ? `Recalling memories for "${submittedQuery}"…` : 'Loading memories…'} />
+          </div>
         ) : error ? (
-          <ErrorState error={error} onRetry={fetch} />
+          <div role="alert">
+            <ErrorState error={error} onRetry={() => { void load(submittedQuery); }} />
+          </div>
         ) : filtered.length === 0 ? (
           <EmptyState message="No memories match the current query." />
         ) : (
