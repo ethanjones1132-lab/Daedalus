@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { useEffect, useState, useCallback, useMemo } from 'react';
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   PageTransition,
@@ -541,21 +541,27 @@ function EditJobModal({ job, onClose, onSave }: { job: CronJob; onClose: () => v
 // ── Runs History ─────────────────────────────────────────────────────────────
 
 function RunsHistory({ job }: { job: CronJob }) {
-  const { error: toastError } = useToast();
   const [runs, setRuns] = useState<CronRun[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
+  const pending = useRef(false);
   const [expanded, setExpanded] = useState(false);
 
   const fetchRuns = useCallback(async () => {
+    if (pending.current) return;
+    pending.current = true;
+    setLoading(true);
     try {
       const r = await invoke<CronRun[]>('get_cron_runs', { cronId: job.id });
       setRuns(r);
-    } catch (e) {
-      toastError(`Failed to fetch runs for "${job.name}": ${e}`, 'Runs Fetch Error');
+      setLoadError(false);
+    } catch {
+      setLoadError(true);
     } finally {
+      pending.current = false;
       setLoading(false);
     }
-  }, [job.id, job.name, toastError]);
+  }, [job.id]);
 
   useEffect(() => {
     if (expanded) fetchRuns();
@@ -567,6 +573,7 @@ function RunsHistory({ job }: { job: CronJob }) {
     <div>
       <button
         onClick={() => setExpanded(!expanded)}
+        aria-expanded={expanded}
         className="text-[10px] font-mono text-bone-faint hover:text-bone-dim transition-colors flex items-center gap-1"
       >
         <span className={cn('transition-transform duration-200', expanded && 'rotate-90')}>▶</span>
@@ -583,11 +590,27 @@ function RunsHistory({ job }: { job: CronJob }) {
             className="overflow-hidden"
           >
             <div className="mt-2 pl-3 border-l border-iron/20 space-y-1.5">
-              {loading ? (
-                <div className="text-[10px] font-mono text-bone-faint">Loading runs…</div>
-              ) : runs.length === 0 ? (
+              {loadError && (
+                <div role="alert" className="text-[10px] font-mono text-error">
+                  {runs.length > 0
+                    ? 'Could not refresh run history. Showing previously loaded runs; they may be stale.'
+                    : 'Could not load run history.'}
+                  <button
+                    onClick={fetchRuns}
+                    disabled={loading}
+                    className="ml-2 underline disabled:opacity-50"
+                  >
+                    Retry
+                  </button>
+                </div>
+              )}
+              {loading && (
+                <div role="status" className="text-[10px] font-mono text-bone-faint">Loading runs…</div>
+              )}
+              {!loading && !loadError && runs.length === 0 && (
                 <div className="text-[10px] font-mono text-bone-faint">No runs yet</div>
-              ) : (
+              )}
+              {(!loading || loadError) && (
                 runs.map((run) => (
                   <div key={run.id} className="flex items-start gap-2 py-1.5 border-b border-iron/10 last:border-0">
                     <StatusDot ok={run.status === 'success'} warn={run.status === 'timeout'} size="sm" />
