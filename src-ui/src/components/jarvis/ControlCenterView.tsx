@@ -11,6 +11,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { initialRegistryState, reduceRegistryState } from './action-registry-state';
+import { profileOperationLocked, reduceProfileOperation, type ProfileOperationPhase } from './profile-operation-state';
 import { invoke } from '@tauri-apps/api/core';
 import {
   cn,
@@ -147,22 +148,28 @@ function useControlResource<S>(command: string) {
     try {
       const snapshot = await invoke<S>(command);
       if (snapshot == null) throw new Error('Missing observation');
+      if (request.current !== requestId) return false;
       setState((prev) => reduceRegistryState(prev, { type: 'success', requestId, snapshot }));
+      return true;
     } catch {
+      if (request.current !== requestId) return false;
       setState((prev) => reduceRegistryState(prev, { type: 'failure', requestId }));
+      return false;
     } finally {
       if (request.current === requestId) pending.current = false;
     }
   }, [command]);
-  const updateSnapshot = useCallback((update: (snapshot: S) => S) => {
-    setState((prev) => prev.snapshot === null ? prev : { ...prev, snapshot: update(prev.snapshot) });
+  const invalidate = useCallback(() => {
+    const requestId = ++request.current;
+    pending.current = false;
+    setState((prev) => ({ ...prev, requestId, loading: false }));
   }, []);
-  return { ...state, load, updateSnapshot };
+  return { ...state, load, invalidate };
 }
 
 function ObservationFeedback({ label, resource }: {
   label: string;
-  resource: { loading: boolean; error: boolean; snapshot: unknown; load: () => Promise<void> };
+  resource: { loading: boolean; error: boolean; snapshot: unknown; load: () => Promise<unknown> };
 }) {
   return (
     <div className="space-y-2 text-xs text-bone/60">
@@ -192,7 +199,7 @@ export default function ControlCenterView() {
   const profileResource = useControlResource<ModelProfile[]>('list_model_profiles');
   const healthResource = useControlResource<HealthData>('get_system_health');
   const doctorResource = useControlResource<DoctorReport>('get_doctor_report');
-  const { load: loadProfiles, updateSnapshot: setProfiles } = profileResource;
+  const { load: loadProfiles, invalidate: invalidateProfiles } = profileResource;
   const { load: loadHealth } = healthResource;
   const { load: loadDoctor } = doctorResource;
   const profiles = profileResource.snapshot ?? [];
@@ -200,46 +207,75 @@ export default function ControlCenterView() {
   const doctor = doctorResource.snapshot;
   const loading = profileResource.loading || healthResource.loading || doctorResource.loading;
   const [pendingDelete, setPendingDelete] = useState<ModelProfile | null>(null);
+  const operationPhase = useRef<ProfileOperationPhase>('idle');
+  const [phase, setPhase] = useState<ProfileOperationPhase>('idle');
+  const [operation, setOperation] = useState<{ kind: 'activate' | 'delete'; profile: ModelProfile } | null>(null);
+  const [reconciliationError, setReconciliationError] = useState(false);
+  const transition = useCallback((event: Parameters<typeof reduceProfileOperation>[1]) => {
+    operationPhase.current = reduceProfileOperation(operationPhase.current, event);
+    setPhase(operationPhase.current);
+  }, []);
+  const mutationLocked = profileOperationLocked(phase);
   const [restarting, setRestarting] = useState<SubsystemKey | null>(null);
   const { success, error: toastError } = useToast();
 
+  const refreshProfiles = useCallback(async (supersede = false) => {
+    if (profileOperationLocked(operationPhase.current)) return;
+    return loadProfiles(supersede);
+  }, [loadProfiles]);
+
   const fetchAll = useCallback(async () => {
-    await Promise.all([loadProfiles(true), loadHealth(true), loadDoctor(true)]);
-  }, [loadProfiles, loadHealth, loadDoctor]);
+    await Promise.all([refreshProfiles(true), loadHealth(true), loadDoctor(true)]);
+  }, [refreshProfiles, loadHealth, loadDoctor]);
 
   useEffect(() => {
     fetchAll();
   }, [fetchAll]);
 
-  const activate = useCallback(
-    async (profile: ModelProfile) => {
-      setProfiles((prev) => prev.map((p) => ({ ...p, is_active: p.id === profile.id })));
-      try {
+  const reconcileProfiles = useCallback(async () => {
+    const observed = await loadProfiles(true);
+    setReconciliationError(!observed);
+    transition(observed ? 'observed' : 'read-failed');
+  }, [loadProfiles, transition]);
+
+  const retryReconciliation = useCallback(async () => {
+    if (operationPhase.current !== 'reconciliation-failed') return;
+    transition('retry-read');
+    await reconcileProfiles();
+  }, [transition, reconcileProfiles]);
+
+  const mutateProfile = useCallback(async (kind: 'activate' | 'delete', profile: ModelProfile) => {
+    if (profileOperationLocked(operationPhase.current)) return;
+    transition('submit');
+    setOperation({ kind, profile });
+    setPendingDelete(null);
+    setReconciliationError(false);
+    // Fence reads issued before the write, not merely before its readback.
+    invalidateProfiles();
+    try {
+      if (kind === 'activate') {
         const effective = await invoke<{ provider: string; model: string; source: string; applied_at: string; restart_required: boolean }>('set_active_profile', { id: profile.id });
         success(`Activated ${profile.name} · ${effective.provider}/${effective.model}`);
-        await fetchAll();
-      } catch (e) {
-        toastError(String(e), 'Activation failed');
-        await fetchAll();
+      } else {
+        const deleted = await invoke<boolean>('delete_profile', { id: profile.id });
+        if (deleted !== true) throw new Error('Deletion not confirmed');
+        success(`Deleted ${profile.name}`);
       }
-    },
-    [fetchAll, setProfiles, success, toastError],
-  );
-
-  const remove = useCallback((profile: ModelProfile) => { setPendingDelete(profile); }, []);
-
-  const confirmDelete = useCallback(async () => {
-    if (!pendingDelete) return;
-    const profile = pendingDelete;
-    setPendingDelete(null);
-    try {
-      await invoke<boolean>('delete_profile', { id: profile.id });
-      success(`Deleted ${profile.name}`);
-      await fetchAll();
-    } catch (e) {
-      toastError(String(e), 'Delete failed');
+    } catch {
+      transition('write-failed');
+      return;
     }
-  }, [pendingDelete, fetchAll, success, toastError]);
+    transition('written');
+    await reconcileProfiles();
+  }, [transition, invalidateProfiles, success, reconcileProfiles]);
+
+  const activate = useCallback((profile: ModelProfile) => mutateProfile('activate', profile), [mutateProfile]);
+  const remove = useCallback((profile: ModelProfile) => {
+    if (!profileOperationLocked(operationPhase.current)) setPendingDelete(profile);
+  }, []);
+  const confirmDelete = useCallback(async () => {
+    if (pendingDelete) await mutateProfile('delete', pendingDelete);
+  }, [pendingDelete, mutateProfile]);
 
   // Per-row restart handler. The backend commands return a specific error
   // string (see lib.rs force_restart_jarvis_server / recovery_stubs
@@ -308,7 +344,33 @@ export default function ControlCenterView() {
 
       <div className="flex-1 overflow-y-auto min-h-0">
         {(tab === 'overview' || tab === 'profiles') && (
-          <ObservationFeedback label="Profiles" resource={profileResource} />
+          <div className="space-y-2 text-xs text-bone/60">
+            {!mutationLocked && <ObservationFeedback label="Profiles" resource={{ ...profileResource, load: refreshProfiles }} />}
+            {(phase === 'writing' || phase === 'reconciling') && (
+              <div role="status" aria-label="Profile operation">
+                {phase === 'writing' ? `${operation?.kind === 'activate' ? 'Activating' : 'Deleting'} ${operation?.profile.name}…` : 'Reconciling profiles…'}
+                {' Showing previously observed profiles; they may be stale.'}
+              </div>
+            )}
+            {phase === 'write-failed' && operation && (
+              <div role="alert" aria-label="Profile operation">
+                Could not {operation.kind} {operation.profile.name}. Showing last confirmed profiles.
+                <button type="button" className="ml-2 px-2 py-1 rounded border border-white/10"
+                  onClick={() => operation.kind === 'activate' ? activate(operation.profile) : remove(operation.profile)}>
+                  Retry {operation.kind === 'activate' ? 'activation' : 'deletion'}
+                </button>
+              </div>
+            )}
+            {reconciliationError && (
+              <div role="alert" aria-label="Profile operation">
+                Profile write succeeded, but reconciliation failed. Showing previously observed profiles; they may be stale.
+                <button type="button" disabled={phase === 'reconciling'} onClick={retryReconciliation}
+                  className="ml-2 px-2 py-1 rounded border border-white/10 disabled:opacity-50">
+                  Retry profile reconciliation
+                </button>
+              </div>
+            )}
+          </div>
         )}
         {(tab === 'overview' || tab === 'diagnostics') && (
           <div className="space-y-2 mb-3">
@@ -386,6 +448,7 @@ export default function ControlCenterView() {
                           <button
                             type="button"
                             onClick={() => activate(p)}
+                            disabled={mutationLocked}
                             className="px-2 py-0.5 rounded-md border border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10 transition-colors"
                           >
                             Activate
@@ -394,6 +457,7 @@ export default function ControlCenterView() {
                         <button
                           type="button"
                           onClick={() => remove(p)}
+                          disabled={mutationLocked}
                           className="px-2 py-0.5 rounded-md border border-red-500/30 text-red-200 hover:bg-red-500/10 transition-colors"
                         >
                           Delete
