@@ -14,6 +14,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { initialBindingState, reduceBindingState } from './agent-binding-state';
+import { initialDiscoveryState, reduceDiscoveryState, type LifecycleAgent } from './agent-discovery-state';
 import {
   cn,
   ConfirmModal,
@@ -47,12 +48,6 @@ interface Channel {
   name: string;
   type: string;
   enabled: boolean;
-}
-
-interface LifecycleAgent {
-  id: string;
-  slug: string;
-  status: string;
 }
 
 interface AgentDraft {
@@ -262,8 +257,8 @@ export function AgentsView() {
   const [channelsLoading, setChannelsLoading] = useState(true);
   const [channelsError, setChannelsError] = useState(false);
   const channelsPending = useRef(false);
-  const [lifecycleAgents, setLifecycleAgents] = useState<LifecycleAgent[]>([]);
-  const [lifecycleError, setLifecycleError] = useState<string | null>(null);
+  const [discovery, dispatchDiscovery] = useReducer(reduceDiscoveryState, initialDiscoveryState);
+  const discoveryPending = useRef(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -272,15 +267,18 @@ export function AgentsView() {
   const { success, error: toastError } = useToast();
 
   const fetchLifecycle = useCallback(async () => {
-    setLifecycleError(null);
+    if (discoveryPending.current) return;
+    discoveryPending.current = true;
+    dispatchDiscovery({ type: 'pending' });
     try {
       const res = await fetch('http://127.0.0.1:19877/agents');
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = (await res.json()) as LifecycleAgent[];
-      setLifecycleAgents(data);
-    } catch (e) {
-      setLifecycleError(String(e));
-      setLifecycleAgents([]);
+      dispatchDiscovery({ type: 'success', agents: data });
+    } catch {
+      dispatchDiscovery({ type: 'failure' });
+    } finally {
+      discoveryPending.current = false;
     }
   }, []);
 
@@ -301,6 +299,7 @@ export function AgentsView() {
 
   const fetchAll = useCallback(async () => {
     void fetchChannels();
+    void fetchLifecycle();
     setLoading(true);
     setError(null);
     try {
@@ -310,7 +309,6 @@ export function AgentsView() {
     } finally {
       setLoading(false);
     }
-    await fetchLifecycle();
   }, [fetchChannels, fetchLifecycle]);
 
   useEffect(() => {
@@ -427,18 +425,28 @@ export function AgentsView() {
           <button
             type="button"
             onClick={() => void fetchLifecycle()}
-            className="text-[11px] px-2 py-0.5 rounded-md border border-white/10 text-bone/60 hover:text-bone transition-colors"
+            disabled={discovery.loading}
+            className="text-[11px] px-2 py-0.5 rounded-md border border-white/10 text-bone/60 hover:text-bone transition-colors disabled:opacity-40"
           >
-            Refresh
+            {discovery.error ? 'Retry discovery' : 'Refresh discovery'}
           </button>
         </div>
-        {lifecycleError ? (
-          <p className="text-xs text-red-300">{lifecycleError}</p>
-        ) : lifecycleAgents.length === 0 ? (
+        {discovery.loading && (
+          <p role="status" aria-label="Agent discovery" className="text-xs text-bone/60">
+            {discovery.agents === null ? 'Loading agent discovery…' : 'Refreshing agent discovery… Showing previous results.'}
+          </p>
+        )}
+        {discovery.error && (
+          <p role="alert" className="text-xs text-red-300">
+            Agent discovery is unavailable. {discovery.agents !== null && 'Showing previously discovered agents; they may be stale.'}
+          </p>
+        )}
+        {!discovery.loading && !discovery.error && discovery.agents?.length === 0 && (
           <p className="text-xs text-bone/40">No agents discovered in agents root.</p>
-        ) : (
+        )}
+        {discovery.agents !== null && discovery.agents.length > 0 && (
           <ul className="space-y-1">
-            {lifecycleAgents.map((a) => (
+            {discovery.agents.map((a) => (
               <li key={a.id} className="flex items-center justify-between text-xs">
                 <span className="text-bone truncate">{a.slug}</span>
                 <Pill variant={a.status === 'valid' ? 'success' : a.status === 'invalid' ? 'error' : 'default'}>
