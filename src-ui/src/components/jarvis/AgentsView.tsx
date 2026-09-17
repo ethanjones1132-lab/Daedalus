@@ -12,7 +12,8 @@
 // plus list_channels() for the binding picker.
 
 import { invoke } from '@tauri-apps/api/core';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
+import { initialBindingState, reduceBindingState } from './agent-binding-state';
 import {
   cn,
   ConfirmModal,
@@ -149,68 +150,106 @@ function AgentEditor({
 function ChannelBindings({
   agent,
   channels,
-  onChanged,
+  channelsReady,
 }: {
   agent: Agent;
   channels: Channel[];
-  onChanged: () => void;
+  channelsReady: boolean;
 }) {
-  const { error: toastError } = useToast();
-  const [bound, setBound] = useState<Set<string>>(new Set());
+  const [state, dispatch] = useReducer(reduceBindingState, initialBindingState);
+  // One Agent snapshot is returned by the native read, so serialize its writes
+  // and reads together. Other Agents' pickers remain independent.
+  const pending = useRef(false);
 
-  const refreshBindings = useCallback(async () => {
+  const readBindings = useCallback(async () => {
     try {
       const ids = await invoke<string[]>('list_agent_channel_bindings', { agentId: agent.id });
-      setBound(new Set(ids));
+      dispatch({ type: 'success', ids });
     } catch {
-      setBound(new Set());
+      dispatch({ type: 'failure', error: 'read' });
     }
   }, [agent.id]);
+
+  const refreshBindings = useCallback(async () => {
+    if (pending.current) return;
+    pending.current = true;
+    dispatch({ type: 'pending', phase: 'loading' });
+    try {
+      await readBindings();
+    } finally {
+      pending.current = false;
+    }
+  }, [readBindings]);
 
   useEffect(() => {
     void refreshBindings();
   }, [refreshBindings]);
 
-  const toggle = useCallback(
-    async (channel: Channel) => {
-      const isBound = bound.has(channel.id);
-      try {
-        await invoke(isBound ? 'unbind_agent_channel' : 'bind_agent_channel', {
-          agentId: agent.id,
-          channelId: channel.id,
-        });
-        await refreshBindings();
-        onChanged();
-      } catch (e) {
-        toastError(String(e), 'Channel binding failed');
-      }
-    },
-    [agent.id, bound, onChanged, refreshBindings, toastError],
-  );
+  const toggle = async (channel: Channel) => {
+    if (pending.current || !channelsReady || state.phase !== 'ready' || state.bound === null) return;
+    pending.current = true;
+    dispatch({ type: 'pending', phase: 'updating' });
+    try {
+      await invoke(state.bound.includes(channel.id) ? 'unbind_agent_channel' : 'bind_agent_channel', {
+        agentId: agent.id,
+        channelId: channel.id,
+      });
+      // This read catches its own error: a failed reconciliation is not a
+      // failed write, and Retry must never blindly repeat a settled mutation.
+      await readBindings();
+    } catch {
+      dispatch({ type: 'failure', error: 'write' });
+    } finally {
+      pending.current = false;
+    }
+  };
 
-  if (channels.length === 0) return null;
-
+  const busy = state.phase === 'loading' || state.phase === 'updating';
   return (
-    <div className="flex flex-wrap gap-1.5 mt-2">
-      {channels.map((c) => {
-        const isBound = bound.has(c.id);
-        return (
-          <button
-            key={c.id}
-            type="button"
-            onClick={() => toggle(c)}
-            className={cn(
-              'text-[11px] px-2 py-0.5 rounded-full border transition-colors',
-              isBound
-                ? 'border-accent/40 bg-accent/10 text-accent'
-                : 'border-white/10 text-bone/40 hover:text-bone/70',
-            )}
-          >
-            {isBound ? '● ' : '○ '}
-            {c.name}
-          </button>
-        );
-      })}
+    <div className="space-y-1.5 mt-2 text-[11px] text-bone/60">
+      {busy && (
+        <p role="status" aria-label={`Channel bindings for ${agent.name}`}>
+          {state.phase === 'updating' ? 'Updating channel bindings…' : 'Loading channel bindings…'}
+        </p>
+      )}
+      {state.error && (
+        <p role="alert">
+          {state.error === 'write' ? 'Could not change channel binding. Reload bindings before trying again. ' : 'Channel bindings are unavailable. '}
+          {state.bound !== null && 'Showing previously loaded bindings; they may be stale.'}
+        </p>
+      )}
+      <button
+        type="button"
+        disabled={busy}
+        onClick={() => void refreshBindings()}
+        aria-label={`${state.error ? 'Retry' : 'Refresh'} bindings for ${agent.name}`}
+        className="px-2 py-0.5 rounded-md border border-white/10 disabled:opacity-40"
+      >
+        {state.error ? 'Retry bindings' : 'Refresh bindings'}
+      </button>
+      <div className="flex flex-wrap gap-1.5">
+        {channels.map((c) => {
+          const isBound = state.bound?.includes(c.id);
+          return (
+            <button
+              key={c.id}
+              type="button"
+              disabled={!channelsReady || state.phase !== 'ready'}
+              aria-pressed={isBound}
+              onClick={() => void toggle(c)}
+              className={cn(
+                'text-[11px] px-2 py-0.5 rounded-full border transition-colors disabled:opacity-40 disabled:cursor-not-allowed',
+                isBound
+                  ? 'border-accent/40 bg-accent/10 text-accent'
+                  : 'border-white/10 text-bone/40 hover:text-bone/70',
+              )}
+            >
+              {isBound === undefined ? '? ' : isBound ? '● ' : '○ '}
+              {c.name}
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -219,7 +258,10 @@ function ChannelBindings({
 
 export function AgentsView() {
   const [agents, setAgents] = useState<Agent[]>([]);
-  const [channels, setChannels] = useState<Channel[]>([]);
+  const [channels, setChannels] = useState<Channel[] | null>(null);
+  const [channelsLoading, setChannelsLoading] = useState(true);
+  const [channelsError, setChannelsError] = useState(false);
+  const channelsPending = useRef(false);
   const [lifecycleAgents, setLifecycleAgents] = useState<LifecycleAgent[]>([]);
   const [lifecycleError, setLifecycleError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -242,23 +284,34 @@ export function AgentsView() {
     }
   }, []);
 
+  const fetchChannels = useCallback(async () => {
+    if (channelsPending.current) return;
+    channelsPending.current = true;
+    setChannelsLoading(true);
+    try {
+      setChannels(await invoke<Channel[]>('list_channels'));
+      setChannelsError(false);
+    } catch {
+      setChannelsError(true);
+    } finally {
+      channelsPending.current = false;
+      setChannelsLoading(false);
+    }
+  }, []);
+
   const fetchAll = useCallback(async () => {
+    void fetchChannels();
     setLoading(true);
     setError(null);
     try {
-      const [agentList, channelList] = await Promise.all([
-        invoke<Agent[]>('list_agents'),
-        invoke<Channel[]>('list_channels').catch(() => [] as Channel[]),
-      ]);
-      setAgents(agentList);
-      setChannels(channelList);
+      setAgents(await invoke<Agent[]>('list_agents'));
     } catch (e) {
       setError(String(e));
     } finally {
       setLoading(false);
     }
     await fetchLifecycle();
-  }, [fetchLifecycle]);
+  }, [fetchChannels, fetchLifecycle]);
 
   useEffect(() => {
     fetchAll();
@@ -397,6 +450,24 @@ export function AgentsView() {
         )}
       </GlassCard>
 
+      <div className="text-xs text-bone/60 space-y-1">
+        {channelsLoading && <p role="status" aria-label="Agent channels">Loading channels…</p>}
+        {channelsError && (
+          <p role="alert">
+            Channels are unavailable. {channels !== null && 'Showing previously loaded channels; they may be stale.'}
+          </p>
+        )}
+        {!channelsLoading && !channelsError && channels?.length === 0 && <p>No channels available.</p>}
+        <button
+          type="button"
+          disabled={channelsLoading}
+          onClick={() => void fetchChannels()}
+          className="px-2 py-0.5 rounded-md border border-white/10 disabled:opacity-40"
+        >
+          {channelsError ? 'Retry channels' : 'Refresh channels'}
+        </button>
+      </div>
+
       <div className="flex-1 overflow-y-auto min-h-0">
         {loading ? (
           <LoadingState message="Loading agents…" />
@@ -465,7 +536,7 @@ export function AgentsView() {
                     {a.description && (
                       <p className="text-xs text-bone/60 line-clamp-2">{a.description}</p>
                     )}
-                    <ChannelBindings agent={a} channels={channels} onChanged={fetchAll} />
+                    <ChannelBindings agent={a} channels={channels ?? []} channelsReady={!channelsLoading && !channelsError && channels !== null} />
                   </GlassCard>
                 </li>
               ),
