@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
+import { initialRegistryState, reduceRegistryState } from './action-registry-state';
 import { motion } from 'framer-motion';
 import {
   PageTransition,
@@ -77,30 +78,37 @@ const riskVariant = (risk: string) => {
   }
 };
 
+interface RegistrySnapshot {
+  summary: ActionRegistrySummary;
+  active: RegistryAction[];
+  blocked: RegistryAction[];
+}
+
 export default function ActionRegistryView() {
-  const [summary, setSummary] = useState<ActionRegistrySummary | null>(null);
-  const [active, setActive] = useState<RegistryAction[]>([]);
-  const [blocked, setBlocked] = useState<RegistryAction[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [state, dispatch] = useReducer(reduceRegistryState<RegistrySnapshot>, initialRegistryState<RegistrySnapshot>());
+  const requestId = useRef(0);
+  const { snapshot, loading, error } = state;
+  const summary = snapshot?.summary;
+  const active = snapshot?.active ?? [];
+  const blocked = snapshot?.blocked ?? [];
   const [syncing, setSyncing] = useState(false);
   const { success, error: toastError } = useToast();
 
   const fetchData = useCallback(async () => {
+    const id = ++requestId.current;
+    dispatch({ type: 'pending', requestId: id });
     try {
       const [summaryData, activeData, blockedData] = await Promise.all([
         invoke<ActionRegistrySummary>('get_action_registry_summary'),
         invoke<ActionRegistryBucket>('get_action_registry_bucket', { bucket: 'active' }),
         invoke<ActionRegistryBucket>('get_action_registry_bucket', { bucket: 'blocked' }),
       ]);
-      setSummary(summaryData);
-      setActive(activeData?.actions ?? []);
-      setBlocked(blockedData?.actions ?? []);
-      setError(null);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setLoading(false);
+      dispatch({
+        type: 'success', requestId: id,
+        snapshot: { summary: summaryData, active: activeData.actions, blocked: blockedData.actions },
+      });
+    } catch {
+      dispatch({ type: 'failure', requestId: id });
     }
   }, []);
 
@@ -143,8 +151,32 @@ export default function ActionRegistryView() {
     }
   };
 
-  if (loading) return <LoadingState />;
-  if (error) return <ErrorState error={error} />;
+  const resourceFeedback = (
+    <>
+      {loading && (
+        <div role="status" aria-label="Action registry loading">
+          <LoadingState message={snapshot ? 'Refreshing action registry…' : 'Loading action registry…'} />
+        </div>
+      )}
+      {error && (
+        <div role="alert">
+          <ErrorState error={snapshot
+            ? 'Could not refresh action registry. Showing previously loaded action registry; it may be stale.'
+            : 'Could not load action registry.'} />
+        </div>
+      )}
+      <button
+        type="button"
+        onClick={() => void fetchData()}
+        disabled={loading}
+        className="mb-4 px-3 py-1 text-xs rounded-md bg-white/5 hover:bg-white/10 transition-colors disabled:opacity-50"
+      >
+        {error ? 'Retry' : 'Refresh'}
+      </button>
+    </>
+  );
+
+  if (!snapshot) return <PageTransition>{resourceFeedback}</PageTransition>;
 
   return (
     <PageTransition>
@@ -163,6 +195,8 @@ export default function ActionRegistryView() {
           {syncing ? 'Syncing…' : 'Sync Adapters'}
         </button>
       </div>
+
+      {resourceFeedback}
 
       {summary && (
         <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3 mb-6">
