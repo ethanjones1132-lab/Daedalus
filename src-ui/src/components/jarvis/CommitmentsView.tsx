@@ -2,7 +2,7 @@
 //    (get_commitments/add_commitment/complete_commitment/delete_commitment) ──
 
 import { invoke } from '@tauri-apps/api/core';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   cn,
   GlassCard,
@@ -40,6 +40,9 @@ export default function CommitmentsView() {
   const [error, setError] = useState<string | null>(null);
   const [text, setText] = useState('');
   const [due, setDue] = useState('');
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState(false);
+  const createPending = useRef(false);
   const [filter, setFilter] = useState<Filter>('open');
   const { success, error: toastError } = useToast();
 
@@ -60,20 +63,26 @@ export default function CommitmentsView() {
   }, [fetchCommitments]);
 
   const add = useCallback(async () => {
-    if (!text.trim()) return;
+    if (createPending.current || !text.trim()) return;
+    createPending.current = true;
+    setCreating(true);
     try {
       await invoke<Commitment>('add_commitment', {
         text: text.trim(),
         due: due ? new Date(due).toISOString() : null,
       });
       success('Commitment added');
+      setCreateError(false);
       setText('');
       setDue('');
       await fetchCommitments();
-    } catch (e) {
-      toastError(String(e), 'Add failed');
+    } catch {
+      setCreateError(true);
+    } finally {
+      createPending.current = false;
+      setCreating(false);
     }
-  }, [text, due, fetchCommitments, success, toastError]);
+  }, [text, due, fetchCommitments, success]);
 
   const complete = useCallback(
     async (c: Commitment) => {
@@ -129,27 +138,37 @@ export default function CommitmentsView() {
         }
       />
 
+      {createError && (
+        <div role="alert" className="text-sm text-red-200">
+          Could not add the commitment. Your draft was kept.{' '}
+          <button type="button" onClick={add} disabled={creating || !text.trim()} className="underline disabled:opacity-40">Retry</button>
+        </div>
+      )}
+
       <div className="flex gap-2">
         <input
           className={cn(inputCls, 'flex-1')}
           placeholder="What needs to be done?"
+          disabled={creating}
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => { if (!createPending.current) setText(e.target.value); }}
           onKeyDown={(e) => e.key === 'Enter' && add()}
         />
         <input
           type="date"
+          aria-label="Due date"
+          disabled={creating}
           className={inputCls}
           value={due}
-          onChange={(e) => setDue(e.target.value)}
+          onChange={(e) => { if (!createPending.current) setDue(e.target.value); }}
         />
         <button
           type="button"
           onClick={add}
-          disabled={!text.trim()}
+          disabled={creating || !text.trim()}
           className="px-4 py-2 text-sm rounded-lg bg-accent text-bone hover:bg-accent/80 disabled:opacity-40 transition-colors"
         >
-          Add
+          {creating ? 'Adding…' : 'Add'}
         </button>
       </div>
 
