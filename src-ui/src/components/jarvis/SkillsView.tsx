@@ -23,6 +23,7 @@ import {
   useToast,
 } from '../ui';
 import MarkdownRenderer from './MarkdownRenderer';
+import { initialRegistryState, reduceRegistryState, type RegistrySnapshotState } from './action-registry-state';
 import { applySkillListRead, confirmSkillToggle, type SkillToggleProtection } from './skill-toggle-state';
 
 // ── Types ──────────────────────────────────────────────────────
@@ -175,6 +176,8 @@ async function postSkillCandidateAction(
 function SkillDetail({
   skill,
   candidateDetail,
+  candidateCurrent,
+  canUseCandidate,
   onClose,
   onToggle,
   togglePending,
@@ -183,6 +186,8 @@ function SkillDetail({
 }: {
   skill: Skill;
   candidateDetail: SkillCandidateDetail | null;
+  candidateCurrent: boolean;
+  canUseCandidate: () => boolean;
   onClose: () => void;
   onToggle: (skill: Skill) => void;
   togglePending: boolean;
@@ -210,7 +215,7 @@ function SkillDetail({
 
   const runAction = useCallback(
     async (action: 'promote' | 'reject' | 'demote' | 'eval') => {
-      if (!candidateDetail) return;
+      if (!candidateDetail || !canUseCandidate()) return;
       setActionBusy(true);
       try {
         const { ok, data } = await postSkillCandidateAction(candidateDetail.id, action);
@@ -224,7 +229,7 @@ function SkillDetail({
         setActionBusy(false);
       }
     },
-    [candidateDetail, skill.name, onChanged, success, toastError],
+    [candidateDetail, canUseCandidate, skill.name, onChanged, success, toastError],
   );
 
   const loadRevisions = useCallback(async () => {
@@ -288,7 +293,7 @@ function SkillDetail({
             {candidateDetail && (
               <button
                 type="button"
-                disabled={actionBusy}
+                disabled={actionBusy || !candidateCurrent}
                 onClick={() => runAction('eval')}
                 className="px-3 py-1.5 text-xs rounded-lg border border-white/10 text-bone/70 hover:bg-white/5 transition-colors disabled:opacity-50"
               >
@@ -300,7 +305,7 @@ function SkillDetail({
                 <button
                   type="button"
                   disabled={
-                    actionBusy ||
+                    actionBusy || !candidateCurrent ||
                     candidateDetail.eval_score === undefined ||
                     candidateDetail.eval_score < 0.75
                   }
@@ -316,7 +321,7 @@ function SkillDetail({
                 </button>
                 <button
                   type="button"
-                  disabled={actionBusy}
+                  disabled={actionBusy || !candidateCurrent}
                   onClick={() => runAction('reject')}
                   className="px-3 py-1.5 text-xs rounded-lg border border-red-500/30 text-red-200 hover:bg-red-500/10 transition-colors disabled:opacity-50"
                 >
@@ -327,7 +332,7 @@ function SkillDetail({
             {candidateDetail?.status === 'promoted' && (
               <button
                 type="button"
-                disabled={actionBusy}
+                disabled={actionBusy || !candidateCurrent}
                 onClick={() => runAction('demote')}
                 className="px-3 py-1.5 text-xs rounded-lg border border-amber-500/30 text-amber-200 hover:bg-amber-500/10 transition-colors disabled:opacity-50"
               >
@@ -397,6 +402,7 @@ function SkillDetail({
 
       {candidateDetail && (
         <GlassCard className="p-3 mb-3 text-xs space-y-1.5">
+          {!candidateCurrent && <p className="text-amber-200">Previous lifecycle observation; it may be stale. Actions are unavailable.</p>}
           <div className="flex items-center gap-2 flex-wrap">
             <span className="text-bone/50">Confidence</span>
             <Pill variant="default">{candidateDetail.confidence.toFixed(2)}</Pill>
@@ -498,6 +504,74 @@ function SkillDetail({
   );
 }
 
+// Optional observations never own the native list's loading lifetime. Refreshes
+// supersede older reads; Retry is guarded and only repeats this resource's read.
+function useSkillObservation<S>(read: () => Promise<S>) {
+  const [state, setState] = useState(initialRegistryState<S>);
+  const requestId = useRef(0);
+  const pending = useRef(false);
+  const current = useRef(false);
+  const refresh = useCallback(async (retry = false) => {
+    if (retry && pending.current) return;
+    const id = ++requestId.current;
+    pending.current = true;
+    current.current = false;
+    setState((prev) => reduceRegistryState(prev, { type: 'pending', requestId: id }));
+    try {
+      const snapshot = await read();
+      if (id === requestId.current) current.current = true;
+      setState((prev) => reduceRegistryState(prev, { type: 'success', requestId: id, snapshot }));
+    } catch {
+      setState((prev) => reduceRegistryState(prev, { type: 'failure', requestId: id }));
+    } finally {
+      if (id === requestId.current) pending.current = false;
+    }
+  }, [read]);
+  return { state, refresh, current };
+}
+
+async function readRuntimeSkills() {
+  const result = await invoke<any[]>('jarvis_get_skills');
+  if (!Array.isArray(result)) throw new Error('Invalid skills observation');
+  return result;
+}
+
+async function readRuntimeTools() {
+  const result = await invoke<any[]>('jarvis_get_tools');
+  if (!Array.isArray(result)) throw new Error('Invalid tools observation');
+  return result;
+}
+
+async function readCandidates() {
+  const res = await fetch(`${BUN_URL}/skills/candidates`);
+  if (!res.ok) throw new Error('Candidate observation unavailable');
+  const body = await res.json();
+  if (!Array.isArray(body?.candidates)) throw new Error('Invalid candidate observation');
+  const byId: Record<string, SkillCandidateDetail> = {};
+  for (const candidate of body.candidates) byId[candidate.id] = candidate;
+  return byId;
+}
+
+function ObservationFeedback<S>({ label, state, onRetry }: {
+  label: string;
+  state: RegistrySnapshotState<S>;
+  onRetry: () => void;
+}) {
+  return (
+    <>
+      {state.loading && <div role="status">Loading {label}…</div>}
+      {state.error && (
+        <div role="alert" className="text-amber-200">
+          Could not load {label}.{' '}
+          {state.snapshot !== null && 'Showing previous observations; they may be stale. '}
+          <button type="button" disabled={state.loading} onClick={onRetry} className="underline disabled:opacity-40">Retry</button>
+        </div>
+      )}
+      {state.loading && !state.error && state.snapshot !== null && <p>Showing previous observations; they may be stale.</p>}
+    </>
+  );
+}
+
 // ── Main view ──────────────────────────────────────────────────
 
 export function SkillsView() {
@@ -507,9 +581,12 @@ export function SkillsView() {
   const [toggleError, setToggleError] = useState<Record<string, boolean>>({});
   const protections = useRef<Record<string, SkillToggleProtection<boolean>>>({});
   const listReadId = useRef(0);
-  const [runtimeSkills, setRuntimeSkills] = useState<any[]>([]);
-  const [runtimeTools, setRuntimeTools] = useState<any[]>([]);
-  const [candidates, setCandidates] = useState<Record<string, SkillCandidateDetail>>({});
+  const { state: runtimeSkills, refresh: refreshRuntimeSkills } = useSkillObservation(readRuntimeSkills);
+  const { state: runtimeTools, refresh: refreshRuntimeTools } = useSkillObservation(readRuntimeTools);
+  const { state: candidateState, refresh: refreshCandidates, current: candidatesCurrent } = useSkillObservation(readCandidates);
+  const candidates = candidateState.snapshot;
+  const candidateCurrent = candidates !== null && !candidateState.loading && !candidateState.error;
+  const canUseCandidate = useCallback(() => candidatesCurrent.current, [candidatesCurrent]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
@@ -530,6 +607,9 @@ export function SkillsView() {
 
   const fetchSkills = useCallback(async () => {
     const readId = ++listReadId.current;
+    void refreshRuntimeSkills();
+    void refreshRuntimeTools();
+    void refreshCandidates();
     setLoading(true);
     setError(null);
     try {
@@ -543,37 +623,13 @@ export function SkillsView() {
       const reconciled = applySkillListRead(list, protections.current, readId);
       protections.current = reconciled.protections;
       setSkills(reconciled.skills);
-      // Native capability access: jarvis_get_skills / jarvis_get_tools (registered lib.rs:1422)
-      try {
-        const sk = await invoke<any[]>('jarvis_get_skills');
-        setRuntimeSkills(sk ?? []);
-      } catch { /* native command unavailable to this build */ }
-      try {
-        const tl = await invoke<any[]>('jarvis_get_tools');
-        setRuntimeTools(tl ?? []);
-      } catch { /* native command unavailable to this build */ }
+
     } catch (e) {
       if (readId === listReadId.current) setError(String(e));
     } finally {
       if (readId === listReadId.current) setLoading(false);
     }
-    // Distilled skills are owned by Bun (D1) — fetch full lifecycle detail
-    // (confidence, eval score, rejection info, promoted_at) directly from
-    // there rather than relying on the native metadata projection. Best
-    // effort: if the Bun server is down, distilled rows just show without
-    // the extra detail.
-    try {
-      const res = await fetch(`${BUN_URL}/skills/candidates`);
-      if (res.ok) {
-        const body = (await res.json()) as { candidates: SkillCandidateDetail[] };
-        const byId: Record<string, SkillCandidateDetail> = {};
-        for (const c of body.candidates ?? []) byId[c.id] = c;
-        setCandidates(byId);
-      }
-    } catch {
-      /* Bun server unreachable — distilled rows render without candidate detail */
-    }
-  }, []);
+  }, [refreshRuntimeSkills, refreshRuntimeTools, refreshCandidates]);
 
   useEffect(() => {
     fetchSkills();
@@ -626,13 +682,14 @@ export function SkillsView() {
   const selectedCandidate = useMemo(() => {
     if (!selected) return null;
     const cid = candidateIdOf(selected);
-    return cid ? candidates[cid] ?? null : null;
+    return cid ? candidates?.[cid] ?? null : null;
   }, [selected, candidates]);
 
   const enabledCount = skills.filter((s) => s.enabled).length;
 
   const runRowAction = useCallback(
     async (skill: Skill, candidateId: string, action: 'promote' | 'reject') => {
+      if (!canUseCandidate() || !candidates?.[candidateId]) return;
       const { ok, data } = await postSkillCandidateAction(candidateId, action);
       if (!ok) {
         toastError(data?.detail || data?.error || `${action} failed`, `${action} failed`);
@@ -641,7 +698,7 @@ export function SkillsView() {
       success(`${skill.name}: ${action} -> ${data?.status ?? 'ok'}`);
       await fetchSkills();
     },
-    [fetchSkills, success, toastError],
+    [fetchSkills, success, toastError, canUseCandidate, candidates],
   );
 
   return (
@@ -678,6 +735,36 @@ export function SkillsView() {
         </select>
       </div>
 
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs max-h-40 overflow-y-auto shrink-0">
+        <section aria-label="Runtime skills" className="p-3 rounded-lg border border-white/10">
+          <h3 className="font-semibold text-cyan-200">Runtime skills</h3>
+          <ObservationFeedback label="runtime skills" state={runtimeSkills} onRetry={() => { void refreshRuntimeSkills(true); }} />
+          {runtimeSkills.snapshot !== null && (
+            runtimeSkills.snapshot.length > 0
+              ? <p>{runtimeSkills.snapshot.map((skill: any) => skill.name || JSON.stringify(skill)).join(', ')}</p>
+              : !runtimeSkills.loading && !runtimeSkills.error && <p>No runtime skills observed.</p>
+          )}
+        </section>
+        <section aria-label="Runtime tools" className="p-3 rounded-lg border border-white/10">
+          <h3 className="font-semibold text-cyan-200">Runtime tools</h3>
+          <ObservationFeedback label="runtime tools" state={runtimeTools} onRetry={() => { void refreshRuntimeTools(true); }} />
+          {runtimeTools.snapshot !== null && (
+            runtimeTools.snapshot.length > 0
+              ? <p>{runtimeTools.snapshot.map((tool: any) => tool.name || JSON.stringify(tool)).join(', ')}</p>
+              : !runtimeTools.loading && !runtimeTools.error && <p>No runtime tools observed.</p>
+          )}
+        </section>
+        <section aria-label="Skill candidates" className="p-3 rounded-lg border border-white/10">
+          <h3 className="font-semibold text-cyan-200">Skill candidates</h3>
+          <ObservationFeedback label="skill candidates" state={candidateState} onRetry={() => { void refreshCandidates(true); }} />
+          {candidates !== null && (
+            Object.keys(candidates).length > 0
+              ? <p>{Object.keys(candidates).length} candidate observations</p>
+              : candidateCurrent && <p>No skill candidates observed.</p>
+          )}
+        </section>
+      </div>
+
       <div className="flex-1 flex gap-4 min-h-0">
         <div className={cn('overflow-y-auto min-h-0', selected ? 'w-1/2' : 'flex-1')}>
           {loading ? (
@@ -692,10 +779,10 @@ export function SkillsView() {
                 const category = categoryOf(s);
                 const distilled = isDistilledSkill(s);
                 const candidateId = candidateIdOf(s);
-                const candidate = candidateId ? candidates[candidateId] : null;
+                const candidate = candidateId ? candidates?.[candidateId] : null;
                 const candidateStatus = candidate?.status;
                 const candidateEvalScore = candidate?.eval_score;
-                const canPromote = candidateEvalScore !== undefined && candidateEvalScore >= 0.75;
+                const canPromote = candidateCurrent && candidateEvalScore !== undefined && candidateEvalScore >= 0.75;
                 return (
                   <li key={s.id}>
                     <GlassCard
@@ -732,14 +819,14 @@ export function SkillsView() {
                             {category}
                           </span>
                         )}
-                        {distilledStatus(s) && (
+                        {distilled && (
                           <span className="text-[10px] rounded-full bg-amber-500/10 border border-amber-500/30 px-1.5 py-0.5 text-amber-200/80">
-                            {distilledStatus(s)}
+                            {candidateStatus ? `${candidateStatus}${candidateCurrent ? '' : ' (previous observation; may be stale)'}` : 'Lifecycle observation unavailable.'}
                           </span>
                         )}
                         {distilled && candidateId ? (
                           <div className="ml-auto flex gap-1">
-                            {(candidateStatus ?? 'candidate') === 'candidate' && (
+                            {candidateStatus === 'candidate' && (
                               <>
                                 <button
                                   type="button"
@@ -759,6 +846,7 @@ export function SkillsView() {
                                 </button>
                                 <button
                                   type="button"
+                                  disabled={!candidateCurrent}
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     runRowAction(s, candidateId, 'reject');
@@ -811,14 +899,6 @@ export function SkillsView() {
           )}
         </div>
 
-        {/* Native surface list: jarvis_get_skills / jarvis_get_tools (lib.rs:1422) */}
-        {(runtimeSkills.length > 0 || runtimeTools.length > 0) && (
-          <div className="mb-3 p-3 text-xs space-y-2 border-t border-white/10">
-            <div className="font-semibold text-cyan-200">Jarvis runtime — skills &amp; tools (native)</div>
-            {runtimeSkills.length > 0 && <div><span className="text-white/60">skills:</span> {runtimeSkills.map((s:any)=>s.name||JSON.stringify(s)).join(', ')}</div>}
-            {runtimeTools.length > 0 && <div><span className="text-white/60">tools:</span> {runtimeTools.map((t:any)=>t.name||JSON.stringify(t)).join(', ')}</div>}
-          </div>
-        )}
 
         {selected && (
           <div
@@ -832,6 +912,8 @@ export function SkillsView() {
                 key={selected.id}
                 skill={selected}
                 candidateDetail={selectedCandidate}
+                candidateCurrent={candidateCurrent}
+                canUseCandidate={canUseCandidate}
                 onClose={closeInspection}
                 onToggle={toggle}
                 togglePending={togglePending[selected.id] === true}
