@@ -10,7 +10,7 @@
 //   skill_restore_revision(revisionId) -> bool
 
 import { invoke } from '@tauri-apps/api/core';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import {
   cn,
   GlassCard,
@@ -497,7 +497,18 @@ export function SkillsView() {
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<Filter>('all');
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const detailId = useId();
+  const inspectionButtons = useRef(new Map<string, HTMLButtonElement>());
+  const searchInput = useRef<HTMLInputElement>(null);
   const { success, error: toastError } = useToast();
+
+  const closeInspection = () => {
+    const opener = selectedId ? inspectionButtons.current.get(selectedId) : null;
+    setSelectedId(null);
+    // Filtering or a refreshed list may have removed the selected row.
+    if (opener?.isConnected) opener.focus();
+    else searchInput.current?.focus();
+  };
 
   const fetchSkills = useCallback(async () => {
     setLoading(true);
@@ -618,6 +629,7 @@ export function SkillsView() {
 
       <div className="flex gap-2">
         <input
+          ref={searchInput}
           type="text"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
@@ -666,7 +678,25 @@ export function SkillsView() {
                     >
                       <div className="flex items-center gap-2 mb-1">
                         <StatusDot ok={s.enabled} warn={!s.enabled} />
-                        <h3 className="text-sm font-medium text-bone truncate">{s.name}</h3>
+                        <h3 className="text-sm font-medium text-bone truncate">
+                          <button
+                            type="button"
+                            ref={(node) => {
+                              if (node) inspectionButtons.current.set(s.id, node);
+                              else inspectionButtons.current.delete(s.id);
+                            }}
+                            aria-label={`Inspect skill: ${s.name}`}
+                            aria-pressed={selectedId === s.id}
+                            aria-controls={`${detailId}-${s.id}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedId(s.id);
+                            }}
+                            className="max-w-full truncate text-left rounded cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-neon focus-visible:outline-offset-2"
+                          >
+                            {s.name}
+                          </button>
+                        </h3>
                         {category && (
                           <span className="text-[10px] rounded-full bg-white/5 border border-white/10 px-1.5 py-0.5 text-bone/50">
                             {category}
@@ -754,13 +784,18 @@ export function SkillsView() {
         )}
 
         {selected && (
-          <div className="w-1/2 min-h-0">
+          <div
+            id={`${detailId}-${selected.id}`}
+            role="region"
+            aria-label={`Skill details: ${selected.name}`}
+            className="w-1/2 min-h-0"
+          >
             <GlassCard className="p-4 h-full">
               <SkillDetail
                 key={selected.id}
                 skill={selected}
                 candidateDetail={selectedCandidate}
-                onClose={() => setSelectedId(null)}
+                onClose={closeInspection}
                 onToggle={toggle}
                 onChanged={fetchSkills}
               />
