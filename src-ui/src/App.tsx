@@ -732,9 +732,9 @@ function AppInner() {
       case 'chat-feeds': return <ChatFeedsView />;
       case 'overview': return <OverviewView />;
       case 'sessions': return <SessionsView />;
+      case 'config': return <ErrorBoundary><JarvisView initialSubView="config" onCompanionChange={setCompanion} /></ErrorBoundary>;
+      case 'health': return <ErrorBoundary><JarvisView initialSubView="status" onCompanionChange={setCompanion} /></ErrorBoundary>;
       case 'models':
-      case 'config':
-      case 'health':
       case 'jarvis-config':
       case 'jarvis-status':
       case 'control': return <ErrorBoundary><JarvisView initialSubView="control" onCompanionChange={setCompanion} /></ErrorBoundary>;
