@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useCallback, useEffect, useId, useMemo, useReducer, useRef, useState } from 'react';
 import { initialSessionListState, reduceSessionListState } from './session-list-state';
+import { initialRegistryState, reduceRegistryState } from './components/jarvis/action-registry-state';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   PageTransition,
@@ -287,31 +288,44 @@ function Sidebar({ currentView, onNavigate }: { currentView: ViewId; onNavigate:
 }
 
 function OverviewView() {
-  const [data, setData] = useState<OverviewData | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [{ snapshot: data, error, loading }, dispatch] = useReducer(reduceRegistryState<OverviewData>, initialRegistryState<OverviewData>());
+  const requestId = useRef(0);
 
   const fetchData = useCallback(async () => {
+    const id = ++requestId.current;
+    dispatch({ type: 'pending', requestId: id });
     try {
+      // Publish a complete request group, not a transactional native snapshot.
       const [health, agents, sessions] = await Promise.all([
         invoke<HealthData>('get_system_health'),
         invoke<AgentSummary[]>('list_agents'),
         invoke<BackendSession[]>('list_sessions'),
       ]);
-      setData({ health, agents, sessions });
-      setError(null);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setLoading(false);
+      dispatch({ type: 'success', requestId: id, snapshot: { health, agents, sessions } });
+    } catch {
+      dispatch({ type: 'failure', requestId: id });
     }
   }, []);
 
   usePolling(fetchData, 15000, [fetchData]);
 
-  if (loading) return <LoadingState />;
-  if (error) return <ErrorState error={error} />;
-  if (!data) return <EmptyState message="No data" />;
+  const feedback = <>
+    <div className="flex items-center gap-3 mb-4">
+      <button type="button" onClick={fetchData} disabled={loading} className="btn-ghost text-xs disabled:opacity-50">Refresh overview</button>
+      {loading && <div role="status" aria-label="Overview snapshot" className="text-sm text-bone-dim">
+        {data === null ? 'Loading overview…' : 'Refreshing overview…'}
+      </div>}
+    </div>
+    {error && <div role="alert" className="mb-4 text-sm text-bone-dim">
+      <p>{data === null ? 'Could not load overview.' : 'Could not refresh overview. Showing previously loaded overview; it may be stale.'}</p>
+      <button type="button" onClick={fetchData} disabled={loading} className="btn-ghost text-xs mt-2 disabled:opacity-50">Retry</button>
+    </div>}
+  </>;
+
+  if (!data) return <PageTransition>
+    <SectionHeader title="Overview" subtitle="system telemetry" />
+    {feedback}
+  </PageTransition>;
 
   const { health, agents, sessions } = data;
   const enabledAgents = agents.filter((agent) => agent.enabled);
@@ -323,6 +337,7 @@ function OverviewView() {
   return (
     <PageTransition>
       <SectionHeader title="Overview" subtitle="system telemetry" />
+      {feedback}
       <AnimatedGrid className="grid-cols-2 md:grid-cols-4 gap-3 mb-6">
         <TiltCard intensity="subtle" accent="cyan" className="!p-5">
           <MetricBlock value={agents.length} label="Agents" icon="⬢" tone="cyan" />
