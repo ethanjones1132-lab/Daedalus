@@ -42,6 +42,20 @@ describe('HealthBanner startup presentation', () => {
   });
 });
 
+describe('HealthBanner unavailable observations', () => {
+  it('does not infer backend failure from a failed observation, even during startup', () => {
+    for (const openrouter_key_set of [true, false]) {
+      expect(deriveHealthPresentation(
+        { ...healthyOpenRouter, openrouter_key_set },
+        'Status check failed',
+        0,
+      )).toMatchObject({
+        level: 'unavailable', label: 'Unavailable', summary: 'Health observation is unavailable.',
+      });
+    }
+  });
+});
+
 describe('HealthBanner partial native payload', () => {
   it('tolerates a missing bun_server_running section (partial jarvis_check_status)', () => {
     // Partial answer from native surface: active_backend present, rest undefined

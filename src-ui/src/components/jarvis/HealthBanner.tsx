@@ -6,14 +6,15 @@
 // is healthy; shows amber (degraded) or red (down) the moment something
 // needs attention.
 
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useReducer, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { AnimatePresence, motion } from 'framer-motion';
 import { cn } from '../ui';
 import { usePolling } from '../../hooks/usePolling';
 import type { JarvisStatus } from './types';
+import { initialRegistryState, reduceRegistryState } from './action-registry-state';
 
-type Level = 'ok' | 'starting' | 'warn' | 'down';
+type Level = 'ok' | 'starting' | 'warn' | 'down' | 'unavailable';
 export const STARTUP_GRACE_MS = 20_000;
 
 // ── Health derivation using the new JarvisStatus shape ─────────
@@ -27,14 +28,14 @@ function backendOk(s: JarvisStatus): boolean {
 }
 
 function overallLevel(s: JarvisStatus, fetchError: string | null, mountedForMs: number): Level {
-  if (fetchError) return 'down';
+  if (fetchError) return 'unavailable';
   if (!backendOk(s)) return 'down';
   if (! (s.bun_server_running ?? false)) return mountedForMs < STARTUP_GRACE_MS ? 'starting' : 'warn';
   return 'ok';
 }
 
 function summaryFor(s: JarvisStatus, level: Level, fetchError: string | null): string {
-  if (fetchError) return fetchError;
+  if (fetchError) return 'Health observation is unavailable.';
   if (level === 'down') {
     if (!backendOk(s)) return `Backend "${s.active_backend ?? ''}" is unreachable`;
     return 'Status check failed';
@@ -45,6 +46,11 @@ function summaryFor(s: JarvisStatus, level: Level, fetchError: string | null): s
 }
 
 const LEVEL_STYLES: Record<Exclude<Level, 'ok'>, { bar: string; dot: string; label: string }> = {
+  unavailable: {
+    bar: 'bg-amber-500/10 border-amber-500/30 text-amber-100',
+    dot: 'bg-amber-400',
+    label: 'Unavailable',
+  },
   starting: {
     bar: 'bg-cyan-500/10 border-cyan-500/30 text-cyan-100',
     dot: 'bg-cyan-400 shadow-[0_0_6px_rgba(34,211,238,0.6)]',
@@ -79,41 +85,63 @@ export function deriveHealthPresentation(
 
 export default function HealthBanner() {
   const mountedAtRef = useRef(Date.now());
-  const [status, setStatus] = useState<JarvisStatus | null>(null);
-  const [fetchError, setFetchError] = useState<string | null>(null);
+  const [observation, dispatch] = useReducer(reduceRegistryState<JarvisStatus>, initialRegistryState<JarvisStatus>());
+  const requestIdRef = useRef(0);
+  const { snapshot: status, loading, error } = observation;
   const [expanded, setExpanded] = useState(false);
 
   const fetchStatus = useCallback(async () => {
+    const requestId = ++requestIdRef.current;
+    dispatch({ type: 'pending', requestId });
     try {
       const result = await invoke<JarvisStatus>('jarvis_check_status');
-      setStatus(result);
-      setFetchError(null);
-    } catch (e) {
-      setFetchError('Status check failed');
+      dispatch({ type: 'success', requestId, snapshot: result });
+    } catch {
+      dispatch({ type: 'failure', requestId });
     }
   }, []);
 
   usePolling(fetchStatus, 15000, [fetchStatus]);
 
-  if (!status) return null;
-  const presentation = deriveHealthPresentation(status, fetchError, Date.now() - mountedAtRef.current);
+  const presentation = status
+    ? deriveHealthPresentation(status, error ? 'unavailable' : null, Date.now() - mountedAtRef.current)
+    : { level: 'unavailable' as const, label: 'Unavailable', summary: 'Health observation is unavailable.' };
   const level = presentation.level;
   if (level === 'ok') return null;
 
   const style = LEVEL_STYLES[level];
-  const subsystems: Array<{ name: string; up: boolean; detail?: string }> = [
+  const subsystems: Array<{ name: string; up: boolean; detail?: string }> = status ? [
     { name: 'Bun server', up: !!(status.bun_server_running), detail: status.bun_server_url ?? undefined },
     { name: 'Ollama', up: !!(status.ollama_running), detail: (status.model_available ? status.model : 'model not loaded') ?? 'model not loaded' },
     { name: 'Model', up: !!(status.model_available), detail: status.model ?? '—' },
     { name: 'OR key', up: !!(status.openrouter_key_set) },
     { name: 'Claude proxy', up: !!(status.claude_proxy_running), detail: ':19878' },
     { name: 'Bridge', up: !!(status.bridge_active), detail: status.bridge_port !== undefined ? `:${status.bridge_port}` : undefined },
-  ];
+  ] : [];
 
   return (
     <div className={cn('border-b px-6 py-1.5 text-xs', style.bar)}>
+      {loading && (
+        <div role="status" aria-label="Health observation">
+          {status ? 'Refreshing health observation…' : 'Checking health…'}
+        </div>
+      )}
+      {error && (
+        <div role="alert" className="flex items-center gap-2">
+          <span>
+            Health observation is unavailable.
+            {status && ' Showing previously observed health details; they may be stale.'}
+          </span>
+          <button type="button" disabled={loading} onClick={fetchStatus}
+            className="rounded border px-2 py-0.5 disabled:opacity-50">
+            Retry
+          </button>
+        </div>
+      )}
+      {status && <>
       <button
         type="button"
+        aria-expanded={expanded}
         onClick={() => setExpanded(e => !e)}
         className="flex items-center gap-2 w-full text-left"
       >
@@ -146,6 +174,7 @@ export default function HealthBanner() {
           </motion.div>
         )}
       </AnimatePresence>
+      </>}
     </div>
   );
 }
