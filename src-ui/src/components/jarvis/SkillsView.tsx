@@ -23,6 +23,7 @@ import {
   useToast,
 } from '../ui';
 import MarkdownRenderer from './MarkdownRenderer';
+import { applySkillListRead, confirmSkillToggle, type SkillToggleProtection } from './skill-toggle-state';
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -176,12 +177,16 @@ function SkillDetail({
   candidateDetail,
   onClose,
   onToggle,
+  togglePending,
+  toggleError,
   onChanged,
 }: {
   skill: Skill;
   candidateDetail: SkillCandidateDetail | null;
   onClose: () => void;
   onToggle: (skill: Skill) => void;
+  togglePending: boolean;
+  toggleError: boolean;
   onChanged: () => void;
 }) {
   const [tab, setTab] = useState<'body' | 'revisions'>('body');
@@ -334,6 +339,7 @@ function SkillDetail({
           <button
             type="button"
             onClick={() => onToggle(skill)}
+            disabled={togglePending}
             className={cn(
               'px-3 py-1.5 text-xs rounded-lg border transition-colors',
               skill.enabled
@@ -341,7 +347,7 @@ function SkillDetail({
                 : 'border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10',
             )}
           >
-            {skill.enabled ? 'Disable' : 'Enable'}
+            {togglePending ? (skill.enabled ? 'Disabling…' : 'Enabling…') : skill.enabled ? 'Disable' : 'Enable'}
           </button>
         )}
         <div
@@ -381,6 +387,13 @@ function SkillDetail({
           </button>
         </div>
       </div>
+
+      {!distilled && toggleError && (
+        <div role="alert" className="mb-3 text-xs text-red-200">
+          Could not update skill enablement. Showing last confirmed state: {skill.enabled ? 'enabled' : 'disabled'}.{' '}
+          <button type="button" disabled={togglePending} onClick={() => onToggle(skill)} className="underline disabled:opacity-40">Retry</button>
+        </div>
+      )}
 
       {candidateDetail && (
         <GlassCard className="p-3 mb-3 text-xs space-y-1.5">
@@ -489,6 +502,11 @@ function SkillDetail({
 
 export function SkillsView() {
   const [skills, setSkills] = useState<Skill[]>([]);
+  const pendingToggles = useRef(new Set<string>());
+  const [togglePending, setTogglePending] = useState<Record<string, boolean>>({});
+  const [toggleError, setToggleError] = useState<Record<string, boolean>>({});
+  const protections = useRef<Record<string, SkillToggleProtection<boolean>>>({});
+  const listReadId = useRef(0);
   const [runtimeSkills, setRuntimeSkills] = useState<any[]>([]);
   const [runtimeTools, setRuntimeTools] = useState<any[]>([]);
   const [candidates, setCandidates] = useState<Record<string, SkillCandidateDetail>>({});
@@ -511,6 +529,7 @@ export function SkillsView() {
   };
 
   const fetchSkills = useCallback(async () => {
+    const readId = ++listReadId.current;
     setLoading(true);
     setError(null);
     try {
@@ -520,7 +539,10 @@ export function SkillsView() {
         /* Bun may not have written candidates yet */
       }
       const list = await invoke<Skill[]>('list_skills');
-      setSkills(list);
+      if (readId !== listReadId.current) return;
+      const reconciled = applySkillListRead(list, protections.current, readId);
+      protections.current = reconciled.protections;
+      setSkills(reconciled.skills);
       // Native capability access: jarvis_get_skills / jarvis_get_tools (registered lib.rs:1422)
       try {
         const sk = await invoke<any[]>('jarvis_get_skills');
@@ -531,9 +553,9 @@ export function SkillsView() {
         setRuntimeTools(tl ?? []);
       } catch { /* native command unavailable to this build */ }
     } catch (e) {
-      setError(String(e));
+      if (readId === listReadId.current) setError(String(e));
     } finally {
-      setLoading(false);
+      if (readId === listReadId.current) setLoading(false);
     }
     // Distilled skills are owned by Bun (D1) — fetch full lifecycle detail
     // (confidence, eval score, rejection info, promoted_at) directly from
@@ -559,19 +581,27 @@ export function SkillsView() {
 
   const toggle = useCallback(
     async (skill: Skill) => {
+      if (isDistilledSkill(skill) || pendingToggles.current.has(skill.id)) return;
+      pendingToggles.current.add(skill.id);
+      setTogglePending((prev) => ({ ...prev, [skill.id]: true }));
       const next = !skill.enabled;
-      // Optimistic update so the toggle feels instant.
-      setSkills((prev) => prev.map((s) => (s.id === skill.id ? { ...s, enabled: next } : s)));
+      // Concurrent reads must not publish an in-flight write as confirmed.
+      protections.current[skill.id] = { target: skill.enabled, barrierReadId: Infinity };
       try {
-        await invoke(next ? 'enable_skill' : 'disable_skill', { name: skill.name });
+        await invoke<void>(next ? 'enable_skill' : 'disable_skill', { name: skill.name });
+        protections.current[skill.id] = { target: next, barrierReadId: listReadId.current };
+        setSkills((prev) => confirmSkillToggle(prev, skill.id, next));
+        setToggleError((prev) => ({ ...prev, [skill.id]: false }));
         success(`${next ? 'Enabled' : 'Disabled'} ${skill.name}`);
-      } catch (e) {
-        // Roll back on failure.
-        setSkills((prev) => prev.map((s) => (s.id === skill.id ? { ...s, enabled: !next } : s)));
-        toastError(String(e), 'Toggle failed');
+      } catch {
+        protections.current[skill.id] = { target: skill.enabled, barrierReadId: listReadId.current };
+        setToggleError((prev) => ({ ...prev, [skill.id]: true }));
+      } finally {
+        pendingToggles.current.delete(skill.id);
+        setTogglePending((prev) => ({ ...prev, [skill.id]: false }));
       }
     },
-    [success, toastError],
+    [success],
   );
 
   const filtered = useMemo(() => {
@@ -747,6 +777,7 @@ export function SkillsView() {
                               e.stopPropagation();
                               toggle(s);
                             }}
+                            disabled={distilled || togglePending[s.id] === true}
                             className={cn(
                               'ml-auto text-[11px] px-2 py-0.5 rounded-md border transition-colors',
                               s.enabled
@@ -754,11 +785,17 @@ export function SkillsView() {
                                 : 'border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10',
                             )}
                           >
-                            {s.enabled ? 'Disable' : 'Enable'}
+                            {togglePending[s.id] ? (s.enabled ? 'Disabling…' : 'Enabling…') : s.enabled ? 'Disable' : 'Enable'}
                           </button>
                         )}
                       </div>
                       <p className="text-xs text-bone/60 line-clamp-2">{s.description}</p>
+                      {!distilled && toggleError[s.id] && (
+                        <div role="alert" className="mt-1 text-xs text-red-200">
+                          Could not update skill enablement. Showing last confirmed state: {s.enabled ? 'enabled' : 'disabled'}.{' '}
+                          <button type="button" disabled={togglePending[s.id] === true} onClick={(e) => { e.stopPropagation(); toggle(s); }} className="underline disabled:opacity-40">Retry</button>
+                        </div>
+                      )}
                       <div className="flex items-center gap-2 mt-1.5 text-[10px] font-mono text-bone/30">
                         <span>v{s.version}</span>
                         {s.improvement_score > 0 && (
@@ -797,6 +834,8 @@ export function SkillsView() {
                 candidateDetail={selectedCandidate}
                 onClose={closeInspection}
                 onToggle={toggle}
+                togglePending={togglePending[selected.id] === true}
+                toggleError={toggleError[selected.id] === true}
                 onChanged={fetchSkills}
               />
             </GlassCard>
