@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useReducer, useRef, useState } from 'react';
+import { initialSessionListState, reduceSessionListState } from './session-list-state';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   PageTransition,
@@ -487,33 +488,44 @@ function ChatFeedsView() {
 
 function SessionsView() {
   const disclosureId = useId();
-  const [sessions, setSessions] = useState<BackendSession[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [{ sessions, error, loading }, dispatch] = useReducer(reduceSessionListState, initialSessionListState);
+  const pending = useRef(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   const fetchData = useCallback(async () => {
+    if (pending.current) return;
+    pending.current = true;
+    dispatch({ type: 'pending' });
     try {
-      setSessions(await invoke<BackendSession[]>('list_sessions'));
-      setError(null);
-    } catch (e) {
-      setError(String(e));
+      dispatch({ type: 'success', sessions: await invoke<BackendSession[]>('list_sessions') });
+    } catch {
+      dispatch({ type: 'failure' });
     } finally {
-      setLoading(false);
+      pending.current = false;
     }
   }, []);
 
   usePolling(fetchData, 15000, [fetchData]);
   const toggle = (id: string) => setExpanded((prev) => { const next = new Set(prev); if (next.has(id)) next.delete(id); else next.add(id); return next; });
 
-  if (loading) return <LoadingState />;
-  if (error) return <ErrorState error={error} />;
-
   return (
     <PageTransition>
-      <SectionHeader title="Sessions" count={sessions.length} subtitle="conversation threads" />
+      <SectionHeader title="Sessions" count={sessions?.length} subtitle="conversation threads" />
+      <div className="flex items-center gap-3 mb-4">
+        <button type="button" onClick={fetchData} disabled={loading} className="btn-ghost text-xs disabled:opacity-50">
+          Refresh sessions
+        </button>
+        {loading && <div role="status" aria-label="Session list" className="text-sm text-bone-dim">
+          {sessions === null ? 'Loading sessions…' : 'Refreshing sessions…'}
+        </div>}
+      </div>
+      {error && <div role="alert" className="mb-4 text-sm text-bone-dim">
+        <p>{sessions === null ? 'Could not load sessions.' : 'Could not refresh sessions. Showing previously loaded sessions; they may be stale.'}</p>
+        <button type="button" onClick={fetchData} disabled={loading} className="btn-ghost text-xs mt-2 disabled:opacity-50">Retry</button>
+      </div>}
+      {!loading && !error && sessions?.length === 0 && <EmptyState message="No sessions yet." />}
       <AnimatedList>
-        {sessions.map((session) => {
+        {(sessions ?? []).map((session) => {
           const isExpanded = expanded.has(session.id);
           const percentUsed = session.context_tokens > 0 ? Math.min(100, (session.total_tokens / session.context_tokens) * 100) : null;
           return (
