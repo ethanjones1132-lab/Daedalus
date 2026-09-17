@@ -1,16 +1,15 @@
 // ── GatewayView — gateway server status (get_gateway_status) ──
 
 import { invoke } from '@tauri-apps/api/core';
-import { useCallback, useState } from 'react';
+import { useCallback, useReducer, useRef } from 'react';
 import {
   GlassCard,
   Pill,
   SectionHeader,
   StatusDot,
-  LoadingState,
-  ErrorState,
 } from '../ui';
 import { usePolling } from '../../hooks/usePolling';
+import { initialRegistryState, reduceRegistryState } from './action-registry-state';
 
 interface GatewayStatus {
   running: boolean;
@@ -32,18 +31,19 @@ function formatUptime(seconds: number): string {
 }
 
 export default function GatewayView() {
-  const [status, setStatus] = useState<GatewayStatus | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loaded, setLoaded] = useState(false);
+  const [{ snapshot: status, loading, error }, dispatch] = useReducer(
+    reduceRegistryState<GatewayStatus>, initialRegistryState<GatewayStatus>(),
+  );
+  const requestId = useRef(0);
 
   const fetchStatus = useCallback(async () => {
+    const id = ++requestId.current;
+    dispatch({ type: 'pending', requestId: id });
     try {
-      setStatus(await invoke<GatewayStatus>('get_gateway_status'));
-      setError(null);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setLoaded(true);
+      const snapshot = await invoke<GatewayStatus>('get_gateway_status');
+      dispatch({ type: 'success', requestId: id, snapshot });
+    } catch {
+      dispatch({ type: 'failure', requestId: id });
     }
   }, []);
 
@@ -67,18 +67,22 @@ export default function GatewayView() {
           <button
             type="button"
             onClick={fetchStatus}
-            className="px-3 py-1.5 text-xs rounded-lg border border-white/10 text-bone/60 hover:text-bone transition-colors"
+            disabled={loading}
+            className="px-3 py-1.5 text-xs rounded-lg border border-white/10 text-bone/60 hover:text-bone transition-colors disabled:opacity-50"
           >
             Refresh
           </button>
         }
       />
 
-      {!loaded ? (
-        <LoadingState message="Checking gateway…" />
-      ) : error ? (
-        <ErrorState error={error} onRetry={fetchStatus} />
-      ) : status ? (
+      {loading && <div role="status" aria-label="Gateway observation" className="text-sm text-bone-dim">
+        {status === null ? 'Checking gateway…' : 'Refreshing gateway status…'}
+      </div>}
+      {error && <div role="alert" className="text-sm text-bone-dim">
+        <p>{status === null ? 'Could not load gateway status.' : 'Could not refresh gateway status. Showing previously observed gateway status; it may be stale.'}</p>
+        <button type="button" onClick={fetchStatus} disabled={loading} className="btn-ghost text-xs mt-2 disabled:opacity-50">Retry</button>
+      </div>}
+      {status ? (
         <div className="space-y-3">
           <GlassCard className="p-4">
             <div className="flex items-center gap-2">
