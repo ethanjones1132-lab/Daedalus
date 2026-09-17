@@ -2,6 +2,7 @@
 //    (get_commitments/add_commitment/complete_commitment/delete_commitment) ──
 
 import { invoke } from '@tauri-apps/api/core';
+import { commitmentLocked, reconcileCommitments, type CommitmentOperation } from './commitment-state';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   cn,
@@ -10,7 +11,6 @@ import {
   SectionHeader,
   StatusDot,
   LoadingState,
-  ErrorState,
   EmptyState,
   useToast,
 } from '../ui';
@@ -44,19 +44,53 @@ export default function CommitmentsView() {
   const [createError, setCreateError] = useState(false);
   const createPending = useRef(false);
   const [filter, setFilter] = useState<Filter>('open');
-  const { success, error: toastError } = useToast();
+  const { success } = useToast();
+  const [operations, setOperations] = useState<Record<string, CommitmentOperation<Commitment>>>({});
+  const operationsRef = useRef(operations);
+  const requestId = useRef(0);
+  const reading = useRef(false);
+  const [loaded, setLoaded] = useState(false);
+  const publishOperations = useCallback((next: Record<string, CommitmentOperation<Commitment>>) => {
+    operationsRef.current = next;
+    setOperations(next);
+  }, []);
 
   const fetchCommitments = useCallback(async () => {
+    const request = ++requestId.current;
+    reading.current = true;
     setLoading(true);
-    setError(null);
     try {
-      setCommitments(await invoke<Commitment[]>('get_commitments'));
-    } catch (e) {
-      setError(String(e));
+      const snapshot = await invoke<Commitment[]>('get_commitments');
+      if (request !== requestId.current) return;
+      const result = reconcileCommitments(snapshot, operationsRef.current, request);
+      publishOperations(result.operations);
+      setCommitments(result.rows);
+      setLoaded(true);
+      setError(null);
+    } catch {
+      if (request !== requestId.current) return;
+      const next = { ...operationsRef.current };
+      let rowFailure = false;
+      for (const [id, operation] of Object.entries(next)) {
+        if (operation.phase === 'reconciling' || operation.phase === 'read-failed') {
+          next[id] = { ...operation, phase: 'read-failed' };
+          rowFailure = true;
+        }
+      }
+      publishOperations(next);
+      if (!rowFailure) setError('Could not refresh commitments. Retry reloads the list only.');
     } finally {
-      setLoading(false);
+      if (request === requestId.current) {
+        reading.current = false;
+        setLoading(false);
+      }
     }
-  }, []);
+  }, [publishOperations]);
+
+  const retryRead = useCallback(() => {
+    if (reading.current) return;
+    void fetchCommitments();
+  }, [fetchCommitments]);
 
   useEffect(() => {
     fetchCommitments();
@@ -84,31 +118,21 @@ export default function CommitmentsView() {
     }
   }, [text, due, fetchCommitments, success]);
 
-  const complete = useCallback(
-    async (c: Commitment) => {
-      try {
-        await invoke<boolean>('complete_commitment', { id: c.id });
-        success('Marked complete');
-        await fetchCommitments();
-      } catch (e) {
-        toastError(String(e), 'Update failed');
-      }
-    },
-    [fetchCommitments, success, toastError],
-  );
-
-  const remove = useCallback(
-    async (c: Commitment) => {
-      try {
-        await invoke<boolean>('delete_commitment', { id: c.id });
-        success('Deleted');
-        await fetchCommitments();
-      } catch (e) {
-        toastError(String(e), 'Delete failed');
-      }
-    },
-    [fetchCommitments, success, toastError],
-  );
+  const mutate = useCallback(async (c: Commitment, action: 'complete' | 'delete') => {
+    if (commitmentLocked(operationsRef.current[c.id]) || (action === 'complete' && c.status === 'completed')) return;
+    const operation: CommitmentOperation<Commitment> = { row: c, action, phase: 'writing', after: requestId.current };
+    publishOperations({ ...operationsRef.current, [c.id]: operation });
+    try {
+      const saved = await invoke<boolean>(action === 'complete' ? 'complete_commitment' : 'delete_commitment', { id: c.id });
+      if (saved !== true) throw new Error('Write not confirmed');
+    } catch {
+      publishOperations({ ...operationsRef.current, [c.id]: { ...operation, phase: 'write-failed', after: requestId.current } });
+      return;
+    }
+    publishOperations({ ...operationsRef.current, [c.id]: { ...operation, phase: 'reconciling', after: requestId.current } });
+    success(action === 'complete' ? 'Marked complete' : 'Deleted');
+    await fetchCommitments();
+  }, [fetchCommitments, publishOperations, success]);
 
   const filtered = useMemo(() => {
     if (filter === 'all') return commitments;
@@ -173,16 +197,23 @@ export default function CommitmentsView() {
       </div>
 
       <div className="flex-1 overflow-y-auto min-h-0">
-        {loading ? (
+        {error && (
+          <div role="alert" className="text-sm text-red-200">
+            {error} {loaded && 'Previously loaded rows may be stale.'}{' '}
+            <button type="button" disabled={loading} onClick={retryRead} className="underline disabled:opacity-40">Retry</button>
+          </div>
+        )}
+        {loading && loaded && <div role="status">Refreshing commitments…</div>}
+        {!loaded && loading ? (
           <LoadingState message="Loading commitments…" />
-        ) : error ? (
-          <ErrorState error={error} onRetry={fetchCommitments} />
-        ) : filtered.length === 0 ? (
+        ) : !loaded ? null : filtered.length === 0 ? (
           <EmptyState message="Nothing here." />
         ) : (
           <ul className="space-y-2">
             {filtered.map((c) => {
               const done = c.status === 'completed';
+              const operation = operations[c.id];
+              const locked = commitmentLocked(operation);
               return (
                 <li key={c.id}>
                   <GlassCard className="p-3">
@@ -201,7 +232,8 @@ export default function CommitmentsView() {
                         {!done && (
                           <button
                             type="button"
-                            onClick={() => complete(c)}
+                            onClick={() => mutate(c, 'complete')}
+                            disabled={locked}
                             className="px-2 py-0.5 rounded-md border border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10 transition-colors"
                           >
                             Complete
@@ -209,7 +241,8 @@ export default function CommitmentsView() {
                         )}
                         <button
                           type="button"
-                          onClick={() => remove(c)}
+                          onClick={() => mutate(c, 'delete')}
+                          disabled={locked}
                           className="px-2 py-0.5 rounded-md border border-red-500/30 text-red-200 hover:bg-red-500/10 transition-colors"
                         >
                           Delete
@@ -217,6 +250,22 @@ export default function CommitmentsView() {
                       </div>
                     </div>
                     <div className="mt-1 text-[10px] font-mono text-bone/30">{formatDue(c.due)}</div>
+                    {operation?.phase === 'writing' && (
+                      <div role="status">{operation.action === 'complete' ? 'Completing…' : 'Deleting…'}</div>
+                    )}
+                    {operation?.phase === 'reconciling' && <div role="status">Change saved. Reconciling commitments…</div>}
+                    {operation?.phase === 'write-failed' && (
+                      <div role="alert" className="text-sm text-red-200">
+                        Could not {operation.action === 'complete' ? 'complete' : 'delete'} the commitment. Confirmed state was kept.{' '}
+                        <button type="button" onClick={() => mutate(c, operation.action)} className="underline">Retry</button>
+                      </div>
+                    )}
+                    {operation?.phase === 'read-failed' && (
+                      <div role="alert" className="text-sm text-red-200">
+                        Change saved, but readback is unavailable or does not confirm it. Previous row shown; actions are locked. Retry reloads the list only.{' '}
+                        <button type="button" disabled={loading} onClick={retryRead} className="underline disabled:opacity-40">Retry</button>
+                      </div>
+                    )}
                   </GlassCard>
                 </li>
               );

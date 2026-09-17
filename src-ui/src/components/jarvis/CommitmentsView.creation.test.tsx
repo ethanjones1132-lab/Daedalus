@@ -143,7 +143,8 @@ describe('CommitmentsView creation guard', () => {
     expect(screen.getByText('Commitment added')).toBeInTheDocument();
     expect(screen.queryByText(/Could not add the commitment/)).not.toBeInTheDocument();
     expect(screen.queryByText('Add failed')).not.toBeInTheDocument();
-    expect(screen.getByText('Error: List refresh unavailable')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('Could not refresh commitments. Retry reloads the list only.');
+    expect(screen.queryByText('Error: List refresh unavailable')).not.toBeInTheDocument();
 
     // The empty draft after a resolved create is preserved for a later attempt.
     fireEvent.change(screen.getByPlaceholderText('What needs to be done?'), { target: { value: 'next draft' } });
