@@ -91,3 +91,7 @@ scripts/benchmark-tier2b/results-tier2b.json
 # Scratch probes — not part of the tree.
 server-jarvis/scratchpad-*.ts
 .claude/settings.local.json
+
+# local sprint secrets
+.sprint/.env*
+.env.typesafe
