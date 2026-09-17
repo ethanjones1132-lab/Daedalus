@@ -81,30 +81,30 @@ function formatTimestamp(ts: string | null): string {
 function AddChannelForm({
   onCreate,
   onCancel,
+  saving,
+  createError,
 }: {
   onCreate: (name: string, type: string, url: string) => Promise<void>;
   onCancel: () => void;
+  saving: boolean;
+  createError: boolean;
 }) {
   const [name, setName] = useState('');
   const [type, setType] = useState(CHANNEL_TYPES[0].value);
   const [url, setUrl] = useState('');
-  const [saving, setSaving] = useState(false);
+
 
   const inputCls =
     'w-full px-3 py-2 text-sm rounded-lg bg-white/5 border border-white/10 text-bone placeholder:text-bone/30 focus:outline-none focus:border-accent/50';
 
-  const submit = async () => {
-    if (!name.trim()) return;
-    setSaving(true);
-    try {
-      await onCreate(name.trim(), type, url.trim());
-    } finally {
-      setSaving(false);
-    }
+  const submit = () => {
+    if (saving || !name.trim()) return;
+    void onCreate(name.trim(), type, url.trim());
   };
 
   return (
     <GlassCard className="p-4 space-y-3">
+      <fieldset disabled={saving} className="space-y-3 border-0 p-0 m-0 min-w-0">
       <div className="grid grid-cols-2 gap-3">
         <input
           className={inputCls}
@@ -147,6 +147,14 @@ function AddChannelForm({
           {saving ? 'Adding…' : 'Add channel'}
         </button>
       </div>
+      </fieldset>
+      {saving && <p role="status" className="text-xs text-bone/60">Adding channel…</p>}
+      {createError && (
+        <div role="alert" className="text-xs text-red-200">
+          Could not add channel. Your draft has been kept.{' '}
+          <button type="button" onClick={submit} disabled={saving || !name.trim()} className="underline disabled:opacity-40">Retry</button>
+        </div>
+      )}
     </GlassCard>
   );
 }
@@ -158,6 +166,9 @@ export function ChannelsView() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [createError, setCreateError] = useState(false);
+  const createPending = useRef(false);
   const [pendingDelete, setPendingDelete] = useState<Channel | null>(null);
   const [receiptState, dispatchReceipts] = useReducer(reduceReceiptState, initialReceiptState);
   const receiptPending = useRef(false);
@@ -178,14 +189,14 @@ export function ChannelsView() {
     }
   }, []);
 
-  const fetchChannels = useCallback(async (opts?: { silent?: boolean }) => {
+  const fetchChannels = useCallback(async (opts?: { silent?: boolean; failureMessage?: string }) => {
     if (!opts?.silent) setLoading(true);
     setError(null);
     try {
       const list = await invoke<Channel[]>('list_channels');
       setChannels(list);
     } catch (e) {
-      setError(String(e));
+      setError(opts?.failureMessage ?? String(e));
     } finally {
       if (!opts?.silent) setLoading(false);
     }
@@ -201,18 +212,34 @@ export function ChannelsView() {
 
   const create = useCallback(
     async (name: string, type: string, url: string) => {
+      if (createPending.current || !name.trim()) return;
+      createPending.current = true;
+      setSaving(true);
+      setCreateError(false);
       const config: Record<string, unknown> = url ? { url } : {};
       try {
         await invoke<Channel>('add_channel', { name, channelType: type, config });
         success(`Added channel ${name}`);
         setAdding(false);
-        await fetchChannels({ silent: true });
-      } catch (e) {
-        toastError(String(e), 'Add failed');
+        await fetchChannels({
+          silent: true,
+          failureMessage: 'Channel was added, but the channel list could not be refreshed. Retry reloads the list only.',
+        });
+      } catch {
+        setCreateError(true);
+      } finally {
+        createPending.current = false;
+        setSaving(false);
       }
     },
-    [fetchChannels, success, toastError],
+    [fetchChannels, success],
   );
+
+  const changeAdding = (open: boolean) => {
+    if (createPending.current) return;
+    setCreateError(false);
+    setAdding(open);
+  };
 
   const toggleConnection = useCallback(
     async (channel: Channel) => {
@@ -266,8 +293,9 @@ export function ChannelsView() {
             </Pill>
             <button
               type="button"
-              onClick={() => setAdding((a) => !a)}
-              className="px-3 py-1.5 text-xs rounded-lg bg-accent text-bone hover:bg-accent/80 transition-colors"
+              onClick={() => changeAdding(!adding)}
+              disabled={saving}
+              className="px-3 py-1.5 text-xs rounded-lg bg-accent text-bone hover:bg-accent/80 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {adding ? 'Close' : '+ New channel'}
             </button>
@@ -275,7 +303,7 @@ export function ChannelsView() {
         }
       />
 
-      {adding && <AddChannelForm onCreate={create} onCancel={() => setAdding(false)} />}
+      {adding && <AddChannelForm onCreate={create} onCancel={() => changeAdding(false)} saving={saving} createError={createError} />}
 
       <div className="text-xs text-bone/60 space-y-1">
         <div className="flex items-center justify-between gap-2">
