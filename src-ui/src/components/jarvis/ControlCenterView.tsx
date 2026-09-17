@@ -9,7 +9,8 @@
 //   • Diagnostics — get_system_health (HealthData) + get_doctor_report
 //   • Overview    — active profile + a consolidated health glance
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { initialRegistryState, reduceRegistryState } from './action-registry-state';
 import { invoke } from '@tauri-apps/api/core';
 import {
   cn,
@@ -18,8 +19,6 @@ import {
   Pill,
   SectionHeader,
   StatusDot,
-  LoadingState,
-  ErrorState,
   EmptyState,
   useToast,
 } from '../ui';
@@ -134,37 +133,79 @@ function Bar({ percent, danger }: { percent: number; danger?: boolean }) {
   );
 }
 
+// Each native resource owns its observation lifetime. Post-operation reads may
+// supersede pending reads; only the newest completion can publish a snapshot.
+function useControlResource<S>(command: string) {
+  const [state, setState] = useState(initialRegistryState<S>);
+  const request = useRef(0);
+  const pending = useRef(false);
+  const load = useCallback(async (supersede = false) => {
+    if (pending.current && !supersede) return;
+    pending.current = true;
+    const requestId = ++request.current;
+    setState((prev) => reduceRegistryState(prev, { type: 'pending', requestId }));
+    try {
+      const snapshot = await invoke<S>(command);
+      if (snapshot == null) throw new Error('Missing observation');
+      setState((prev) => reduceRegistryState(prev, { type: 'success', requestId, snapshot }));
+    } catch {
+      setState((prev) => reduceRegistryState(prev, { type: 'failure', requestId }));
+    } finally {
+      if (request.current === requestId) pending.current = false;
+    }
+  }, [command]);
+  const updateSnapshot = useCallback((update: (snapshot: S) => S) => {
+    setState((prev) => prev.snapshot === null ? prev : { ...prev, snapshot: update(prev.snapshot) });
+  }, []);
+  return { ...state, load, updateSnapshot };
+}
+
+function ObservationFeedback({ label, resource }: {
+  label: string;
+  resource: { loading: boolean; error: boolean; snapshot: unknown; load: () => Promise<void> };
+}) {
+  return (
+    <div className="space-y-2 text-xs text-bone/60">
+      {resource.loading && (
+        <div role="status" aria-label={`${label} observation`}>
+          {resource.snapshot === null ? 'Loading' : 'Refreshing'} {label}…
+        </div>
+      )}
+      {resource.error && (
+        <div role="alert" aria-label={`${label} observation`}>
+          Could not load {label}.
+          {resource.snapshot !== null && ' Showing previously observed data; it may be stale.'}
+          <button type="button" disabled={resource.loading} onClick={() => resource.load()}
+            className="ml-2 px-2 py-1 rounded border border-white/10 disabled:opacity-50">
+            Retry {label}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Main view ──────────────────────────────────────────────────
 
 export default function ControlCenterView() {
   const [tab, setTab] = useState<Tab>('overview');
-  const [profiles, setProfiles] = useState<ModelProfile[]>([]);
-  const [health, setHealth] = useState<HealthData | null>(null);
-  const [doctor, setDoctor] = useState<DoctorReport | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const profileResource = useControlResource<ModelProfile[]>('list_model_profiles');
+  const healthResource = useControlResource<HealthData>('get_system_health');
+  const doctorResource = useControlResource<DoctorReport>('get_doctor_report');
+  const { load: loadProfiles, updateSnapshot: setProfiles } = profileResource;
+  const { load: loadHealth } = healthResource;
+  const { load: loadDoctor } = doctorResource;
+  const profiles = profileResource.snapshot ?? [];
+  const health = healthResource.snapshot;
+  const doctor = doctorResource.snapshot;
+  const loading = profileResource.loading || healthResource.loading || doctorResource.loading;
   const [pendingDelete, setPendingDelete] = useState<ModelProfile | null>(null);
   const [restarting, setRestarting] = useState<SubsystemKey | null>(null);
   const { success, error: toastError } = useToast();
 
   const fetchAll = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const [profileList, healthData, doctorReport] = await Promise.all([
-        invoke<ModelProfile[]>('list_model_profiles'),
-        invoke<HealthData>('get_system_health').catch(() => null),
-        invoke<DoctorReport>('get_doctor_report').catch(() => null),
-      ]);
-      setProfiles(profileList);
-      setHealth(healthData);
-      setDoctor(doctorReport);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+    await Promise.all([loadProfiles(true), loadHealth(true), loadDoctor(true)]);
+  }, [loadProfiles, loadHealth, loadDoctor]);
 
   useEffect(() => {
     fetchAll();
@@ -182,7 +223,7 @@ export default function ControlCenterView() {
         await fetchAll();
       }
     },
-    [fetchAll, success, toastError],
+    [fetchAll, setProfiles, success, toastError],
   );
 
   const remove = useCallback((profile: ModelProfile) => { setPendingDelete(profile); }, []);
@@ -240,7 +281,8 @@ export default function ControlCenterView() {
         action={
           <button
             type="button"
-            onClick={fetchAll}
+            onClick={() => { if (!loading) void fetchAll(); }}
+            disabled={loading}
             className="px-3 py-1.5 text-xs rounded-lg border border-white/10 text-bone/60 hover:text-bone transition-colors"
           >
             Refresh
@@ -265,11 +307,16 @@ export default function ControlCenterView() {
       </div>
 
       <div className="flex-1 overflow-y-auto min-h-0">
-        {loading ? (
-          <LoadingState message="Loading control center…" />
-        ) : error ? (
-          <ErrorState error={error} onRetry={fetchAll} />
-        ) : tab === 'overview' ? (
+        {(tab === 'overview' || tab === 'profiles') && (
+          <ObservationFeedback label="Profiles" resource={profileResource} />
+        )}
+        {(tab === 'overview' || tab === 'diagnostics') && (
+          <div className="space-y-2 mb-3">
+            <ObservationFeedback label="System health" resource={healthResource} />
+            <ObservationFeedback label="Doctor report" resource={doctorResource} />
+          </div>
+        )}
+        {tab === 'overview' ? (
           <div className="space-y-3">
             <GlassCard className="p-4">
               <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40 mb-2">
@@ -285,14 +332,14 @@ export default function ControlCenterView() {
                     temp {activeProfile.temperature} · {activeProfile.max_tokens} tok
                   </span>
                 </div>
-              ) : (
+              ) : profileResource.snapshot !== null ? (
                 <span className="text-sm text-bone/50">No active profile.</span>
-              )}
+              ) : <span className="text-sm text-bone/50">Active profile not yet observed.</span>}
             </GlassCard>
 
             <div className="grid grid-cols-3 gap-3">
               <GlassCard className="p-3">
-                <div className="text-2xl font-semibold text-bone">{profiles.length}</div>
+                <div className="text-2xl font-semibold text-bone">{profileResource.snapshot === null ? '—' : profiles.length}</div>
                 <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40">
                   profiles
                 </div>
@@ -321,7 +368,7 @@ export default function ControlCenterView() {
             </div>
           </div>
         ) : tab === 'profiles' ? (
-          profiles.length === 0 ? (
+          profileResource.snapshot === null ? null : profiles.length === 0 ? (
             <EmptyState message="No model profiles configured." />
           ) : (
             <ul className="space-y-2">
@@ -438,9 +485,7 @@ export default function ControlCenterView() {
                   </div>
                 </div>
               </GlassCard>
-            ) : (
-              <EmptyState message="System health unavailable." />
-            )}
+            ) : null}
 
             {doctor && (
               <GlassCard className="p-4">
