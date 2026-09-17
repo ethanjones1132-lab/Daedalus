@@ -15,6 +15,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { initialReceiptState, parseReceipts, reduceReceiptState } from './channel-receipt-state';
+import { channelLocked, isConnected, reconcileChannels, type Channel, type ChannelOperation } from './channel-state';
 import {
   cn,
   ConfirmModal,
@@ -23,24 +24,9 @@ import {
   SectionHeader,
   StatusDot,
   LoadingState,
-  ErrorState,
   EmptyState,
   useToast,
 } from '../ui';
-
-// ── Types ──────────────────────────────────────────────────────
-
-interface Channel {
-  id: string;
-  name: string;
-  type: string;
-  enabled: boolean;
-  config: Record<string, unknown> | null;
-  last_used: string | null;
-  connected: boolean;
-  created_at: string;
-  updated_at: string;
-}
 
 const CHANNEL_TYPES = [
   { value: 'webhook', label: 'Webhook' },
@@ -55,12 +41,6 @@ const CHANNEL_TYPES = [
 const BUN_URL = 'http://127.0.0.1:19877';
 
 // ── Helpers ────────────────────────────────────────────────────
-
-function isConnected(channel: Channel): boolean {
-  if (channel.connected) return true;
-  const c = channel.config;
-  return !!(c && typeof c === 'object' && (c as Record<string, unknown>).connected === true);
-}
 
 function formatTimestamp(ts: string | null): string {
   if (!ts) return '—';
@@ -172,7 +152,16 @@ export function ChannelsView() {
   const [pendingDelete, setPendingDelete] = useState<Channel | null>(null);
   const [receiptState, dispatchReceipts] = useReducer(reduceReceiptState, initialReceiptState);
   const receiptPending = useRef(false);
-  const { success, error: toastError } = useToast();
+  const { success } = useToast();
+  const [operations, setOperations] = useState<Record<string, ChannelOperation<Channel>>>({});
+  const operationsRef = useRef(operations);
+  const requestId = useRef(0);
+  const reading = useRef(false);
+  const [loaded, setLoaded] = useState(false);
+  const publishOperations = useCallback((next: Record<string, ChannelOperation<Channel>>) => {
+    operationsRef.current = next;
+    setOperations(next);
+  }, []);
 
   const fetchReceipts = useCallback(async () => {
     if (receiptPending.current) return;
@@ -190,17 +179,43 @@ export function ChannelsView() {
   }, []);
 
   const fetchChannels = useCallback(async (opts?: { silent?: boolean; failureMessage?: string }) => {
-    if (!opts?.silent) setLoading(true);
-    setError(null);
+    const request = ++requestId.current;
+    reading.current = true;
+    setLoading(true);
     try {
       const list = await invoke<Channel[]>('list_channels');
-      setChannels(list);
-    } catch (e) {
-      setError(opts?.failureMessage ?? String(e));
+      if (request !== requestId.current) return;
+      const result = reconcileChannels(list, operationsRef.current, request);
+      publishOperations(result.operations);
+      setChannels(result.rows);
+      setLoaded(true);
+      setError(null);
+    } catch {
+      if (request !== requestId.current) return;
+      const next = { ...operationsRef.current };
+      let rowFailure = false;
+      for (const [id, operation] of Object.entries(next)) {
+        if (operation.phase === 'reconciling' || operation.phase === 'read-failed') {
+          next[id] = { ...operation, phase: 'read-failed' };
+          rowFailure = true;
+        }
+      }
+      publishOperations(next);
+      if (opts?.failureMessage || !rowFailure) {
+        setError(opts?.failureMessage ?? 'Could not refresh channels. Retry reloads the list only.');
+      }
     } finally {
-      if (!opts?.silent) setLoading(false);
+      if (request === requestId.current) {
+        reading.current = false;
+        setLoading(false);
+      }
     }
-  }, []);
+  }, [publishOperations]);
+
+  const retryRead = useCallback(() => {
+    if (reading.current) return;
+    void fetchChannels({ silent: true });
+  }, [fetchChannels]);
 
   useEffect(() => {
     fetchChannels();
@@ -241,34 +256,36 @@ export function ChannelsView() {
     setAdding(open);
   };
 
-  const toggleConnection = useCallback(
-    async (channel: Channel) => {
-      const connected = isConnected(channel);
-      try {
-        await invoke<boolean>(connected ? 'logout_channel' : 'login_channel', { id: channel.id });
-        success(`${connected ? 'Disconnected' : 'Connected'} ${channel.name}`);
-        await fetchChannels({ silent: true });
-      } catch (e) {
-        toastError(String(e), 'Connection toggle failed');
-      }
-    },
-    [fetchChannels, success, toastError],
-  );
-
-  const remove = useCallback((channel: Channel) => { setPendingDelete(channel); }, []);
-
-  const confirmDelete = useCallback(async () => {
-    if (!pendingDelete) return;
-    const channel = pendingDelete;
-    setPendingDelete(null);
+  const mutate = useCallback(async (channel: Channel, action: ChannelOperation<Channel>['action']) => {
+    if (channelLocked(operationsRef.current[channel.id])) return;
+    const operation: ChannelOperation<Channel> = { row: channel, action, phase: 'writing', after: requestId.current };
+    publishOperations({ ...operationsRef.current, [channel.id]: operation });
     try {
-      await invoke<boolean>('remove_channel', { id: channel.id });
-      success(`Removed ${channel.name}`);
-      await fetchChannels({ silent: true });
-    } catch (e) {
-      toastError(String(e), 'Remove failed');
+      const saved = await invoke<boolean>(action === 'remove' ? 'remove_channel' : action === 'connect' ? 'login_channel' : 'logout_channel', { id: channel.id });
+      if (saved !== true) throw new Error('Write not confirmed');
+    } catch {
+      publishOperations({ ...operationsRef.current, [channel.id]: { ...operation, phase: 'write-failed', after: requestId.current } });
+      if (action === 'remove') setPendingDelete(current => current?.id === channel.id ? null : current);
+      return;
     }
-  }, [pendingDelete, fetchChannels, success, toastError]);
+    publishOperations({ ...operationsRef.current, [channel.id]: { ...operation, phase: 'reconciling', after: requestId.current } });
+    if (action === 'remove') setPendingDelete(current => current?.id === channel.id ? null : current);
+    await fetchChannels({ silent: true });
+  }, [fetchChannels, publishOperations]);
+
+  const toggleConnection = (channel: Channel) => void mutate(channel, isConnected(channel) ? 'disconnect' : 'connect');
+  const remove = (channel: Channel) => {
+    if (!channelLocked(operationsRef.current[channel.id])) setPendingDelete(channel);
+  };
+  const confirmDelete = () => {
+    if (!pendingDelete) return;
+    // Resolve the current confirmed row, not an obsolete dialog snapshot.
+    const channel = channels.find(c => c.id === pendingDelete.id);
+    if (channel) void mutate(channel, 'remove');
+    else setPendingDelete(null);
+  };
+  const deleteOperation = pendingDelete ? operations[pendingDelete.id] : undefined;
+  const deleting = deleteOperation?.action === 'remove' && deleteOperation.phase === 'writing';
 
   const connectedCount = useMemo(() => channels.filter(isConnected).length, [channels]);
 
@@ -277,10 +294,11 @@ export function ChannelsView() {
       <ConfirmModal
         open={pendingDelete !== null}
         message={`Remove channel "${pendingDelete?.name}"?`}
-        confirmLabel="Remove"
+        confirmLabel={deleting ? 'Removing…' : 'Remove'}
+        detail={deleting ? 'Saving removal. Repeated confirmation will not submit another write.' : channelLocked(deleteOperation) ? 'Another change is pending. Removal is unavailable until reconciliation.' : undefined}
         danger
         onConfirm={confirmDelete}
-        onCancel={() => setPendingDelete(null)}
+        onCancel={() => { if (!deleting) setPendingDelete(null); }}
       />
       <SectionHeader
         title="Channels"
@@ -332,16 +350,23 @@ export function ChannelsView() {
       </div>
 
       <div className="flex-1 overflow-y-auto min-h-0">
-        {loading ? (
+        {error && (
+          <div role="alert" className="text-sm text-red-200">
+            <span>{error}</span> {loaded && 'Previously loaded channels may be stale.'}{' '}
+            <button type="button" onClick={retryRead} disabled={loading} className="underline disabled:opacity-40">Retry</button>
+          </div>
+        )}
+        {loaded && loading && <div role="status">Refreshing channels…</div>}
+        {!loaded && loading ? (
           <LoadingState message="Loading channels…" />
-        ) : error ? (
-          <ErrorState error={error} onRetry={fetchChannels} />
-        ) : channels.length === 0 ? (
-          <EmptyState message="No channels yet. Add one to get started." />
+        ) : !loaded ? null : channels.length === 0 ? (
+          !error && !loading && <EmptyState message="No channels yet. Add one to get started." />
         ) : (
           <ul className="space-y-2">
             {channels.map((c) => {
               const connected = isConnected(c);
+              const operation = operations[c.id];
+              const locked = channelLocked(operation);
               const latestReceipt = c.type === 'discord' ? receiptState.receipts?.[0] : undefined;
               return (
                 <li key={c.id}>
@@ -355,8 +380,9 @@ export function ChannelsView() {
                         <button
                           type="button"
                           onClick={() => toggleConnection(c)}
+                          disabled={locked}
                           className={cn(
-                            'px-2 py-0.5 rounded-md border transition-colors',
+                            'px-2 py-0.5 rounded-md border transition-colors disabled:opacity-40 disabled:cursor-not-allowed',
                             connected
                               ? 'border-amber-500/30 text-amber-200 hover:bg-amber-500/10'
                               : 'border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10',
@@ -367,12 +393,27 @@ export function ChannelsView() {
                         <button
                           type="button"
                           onClick={() => remove(c)}
-                          className="px-2 py-0.5 rounded-md border border-red-500/30 text-red-200 hover:bg-red-500/10 transition-colors"
+                          disabled={locked}
+                          className="px-2 py-0.5 rounded-md border border-red-500/30 text-red-200 hover:bg-red-500/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                         >
                           Remove
                         </button>
                       </div>
                     </div>
+                    {operation?.phase === 'writing' && <div role="status">Saving channel change…</div>}
+                    {operation?.phase === 'reconciling' && <div role="status">Change saved. Reconciling channels…</div>}
+                    {operation?.phase === 'write-failed' && (
+                      <div role="alert" className="text-xs text-red-200">
+                        Could not {operation.action} channel. Confirmed state was kept.{' '}
+                        <button type="button" className="underline" onClick={() => operation.action === 'remove' ? remove(c) : void mutate(c, operation.action)}>Retry</button>
+                      </div>
+                    )}
+                    {operation?.phase === 'read-failed' && (
+                      <div role="alert" className="text-xs text-red-200">
+                        Change was saved, but the channel list could not be reconciled. Showing previous state. Retry reloads the list only.{' '}
+                        <button type="button" className="underline disabled:opacity-40" disabled={loading} onClick={retryRead}>Retry</button>
+                      </div>
+                    )}
                     <div className="flex items-center gap-2 mt-1.5 text-[10px] font-mono text-bone/30">
                       <span>last used {formatTimestamp(c.last_used)}</span>
                       {latestReceipt && <span className={latestReceipt.status === 'delivered' ? 'text-emerald-300/70' : 'text-amber-300/70'}>delivery {latestReceipt.status} · retries {latestReceipt.retry_count}{receiptState.phase !== 'ready' && ' (stale)'}</span>}

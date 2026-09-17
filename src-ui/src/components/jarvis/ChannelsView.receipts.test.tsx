@@ -106,7 +106,8 @@ describe('Channel receipt telemetry', () => {
     expect(screen.getByText('Loading channels…')).toBeInTheDocument();
     expect(screen.queryByText('No channels yet. Add one to get started.')).not.toBeInTheDocument();
     await act(async () => { list.reject(new Error('native list failed')); });
-    expect(screen.getByText('Error: native list failed')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('Could not refresh channels. Retry reloads the list only.');
+    expect(screen.queryByText(/native list failed/)).not.toBeInTheDocument();
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry' })); });
     usableRow();
     expect(fetchMock).toHaveBeenCalledTimes(1);
