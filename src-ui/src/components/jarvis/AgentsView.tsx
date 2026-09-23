@@ -16,6 +16,15 @@ import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { initialBindingState, reduceBindingState } from './agent-binding-state';
 import { initialDiscoveryState, reduceDiscoveryState, type LifecycleAgent } from './agent-discovery-state';
 import {
+  agentOperationLocked,
+  reconcileAgents,
+  type Agent,
+  type AgentExpectation,
+  type AgentOperation,
+  type AgentOperationAction,
+  type AgentOperationPhase,
+} from './agent-operation-state';
+import {
   cn,
   ConfirmModal,
   GlassCard,
@@ -23,25 +32,11 @@ import {
   SectionHeader,
   StatusDot,
   LoadingState,
-  ErrorState,
   EmptyState,
   useToast,
 } from '../ui';
 
 // ── Types ──────────────────────────────────────────────────────
-
-interface Agent {
-  id: string;
-  name: string;
-  description: string;
-  model: string;
-  backend: string;
-  system_prompt: string;
-  enabled: boolean;
-  config: string | null;
-  created_at: string;
-  updated_at: string;
-}
 
 interface Channel {
   id: string;
@@ -59,6 +54,26 @@ interface AgentDraft {
 
 const EMPTY_DRAFT: AgentDraft = { name: '', model: '', description: '', system_prompt: '' };
 
+function expectedFromDraft(draft: AgentDraft, enabled: boolean): AgentExpectation {
+  return {
+    name: draft.name.trim(),
+    description: draft.description.trim(),
+    model: draft.model.trim(),
+    system_prompt: draft.system_prompt.trim(),
+    enabled,
+  };
+}
+
+function expectedFromAgent(agent: Agent): AgentExpectation {
+  return {
+    name: agent.name,
+    description: agent.description,
+    model: agent.model,
+    system_prompt: agent.system_prompt,
+    enabled: agent.enabled,
+  };
+}
+
 // ── Helpers ────────────────────────────────────────────────────
 
 // ── Editor (create + edit) ─────────────────────────────────────
@@ -67,19 +82,29 @@ function AgentEditor({
   initial,
   onSave,
   onCancel,
+  locked = false,
+  phase = null,
+  failureMessage = 'Agent change failed. Your draft was kept.',
+  onRetryRead,
 }: {
   initial: AgentDraft;
   onSave: (draft: AgentDraft) => Promise<void>;
   onCancel: () => void;
+  locked?: boolean;
+  phase?: AgentOperationPhase | null;
+  failureMessage?: string;
+  onRetryRead?: () => void;
 }) {
   const [draft, setDraft] = useState<AgentDraft>(initial);
   const [saving, setSaving] = useState(false);
+  const busy = locked || saving;
 
-  const field = (key: keyof AgentDraft, value: string) =>
-    setDraft((d) => ({ ...d, [key]: value }));
+  const field = (key: keyof AgentDraft, value: string) => {
+    if (!busy) setDraft((d) => ({ ...d, [key]: value }));
+  };
 
   const submit = async () => {
-    if (!draft.name.trim() || !draft.model.trim()) return;
+    if (busy || !draft.name.trim() || !draft.model.trim()) return;
     setSaving(true);
     try {
       await onSave(draft);
@@ -90,52 +115,70 @@ function AgentEditor({
 
   const inputCls =
     'w-full px-3 py-2 text-sm rounded-lg bg-white/5 border border-white/10 text-bone placeholder:text-bone/30 focus:outline-none focus:border-accent/50';
+  const invalid = !draft.name.trim() || !draft.model.trim();
 
   return (
     <GlassCard className="p-4 space-y-3">
-      <div className="grid grid-cols-2 gap-3">
+      <fieldset disabled={busy} className="space-y-3 border-0 p-0 m-0 min-w-0">
+        <div className="grid grid-cols-2 gap-3">
+          <input
+            className={inputCls}
+            placeholder="Name *"
+            value={draft.name}
+            onChange={(e) => field('name', e.target.value)}
+          />
+          <input
+            className={inputCls}
+            placeholder="Model * (e.g. qwen2.5-coder:7b)"
+            value={draft.model}
+            onChange={(e) => field('model', e.target.value)}
+          />
+        </div>
         <input
           className={inputCls}
-          placeholder="Name *"
-          value={draft.name}
-          onChange={(e) => field('name', e.target.value)}
+          placeholder="Description"
+          value={draft.description}
+          onChange={(e) => field('description', e.target.value)}
         />
-        <input
-          className={inputCls}
-          placeholder="Model * (e.g. qwen2.5-coder:7b)"
-          value={draft.model}
-          onChange={(e) => field('model', e.target.value)}
+        <textarea
+          className={cn(inputCls, 'resize-none h-24')}
+          placeholder="System prompt"
+          value={draft.system_prompt}
+          onChange={(e) => field('system_prompt', e.target.value)}
         />
-      </div>
-      <input
-        className={inputCls}
-        placeholder="Description"
-        value={draft.description}
-        onChange={(e) => field('description', e.target.value)}
-      />
-      <textarea
-        className={cn(inputCls, 'resize-none h-24')}
-        placeholder="System prompt"
-        value={draft.system_prompt}
-        onChange={(e) => field('system_prompt', e.target.value)}
-      />
-      <div className="flex justify-end gap-2">
-        <button
-          type="button"
-          onClick={onCancel}
-          className="px-3 py-1.5 text-xs rounded-lg border border-white/10 text-bone/60 hover:text-bone transition-colors"
-        >
-          Cancel
-        </button>
-        <button
-          type="button"
-          onClick={submit}
-          disabled={saving || !draft.name.trim() || !draft.model.trim()}
-          className="px-3 py-1.5 text-xs rounded-lg bg-accent text-bone hover:bg-accent/80 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-        >
-          {saving ? 'Saving…' : 'Save'}
-        </button>
-      </div>
+        <div className="flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={busy}
+            className="px-3 py-1.5 text-xs rounded-lg border border-white/10 text-bone/60 hover:text-bone transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={submit}
+            disabled={busy || invalid}
+            className="px-3 py-1.5 text-xs rounded-lg bg-accent text-bone hover:bg-accent/80 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          >
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </fieldset>
+      {phase === 'writing' && <p role="status">Saving agent…</p>}
+      {phase === 'reconciling' && <p role="status">Change saved. Reconciling agents…</p>}
+      {phase === 'write-failed' && (
+        <div role="alert" className="text-xs text-red-200">
+          {failureMessage}{' '}
+          <button type="button" className="underline" onClick={submit} disabled={saving || invalid}>Retry</button>
+        </div>
+      )}
+      {phase === 'read-failed' && (
+        <div role="alert" className="text-xs text-red-200">
+          Change saved, but the agent list could not be reconciled. Showing previous state. Retry reloads the list only.{' '}
+          <button type="button" className="underline disabled:opacity-40" disabled={saving} onClick={onRetryRead}>Retry</button>
+        </div>
+      )}
     </GlassCard>
   );
 }
@@ -146,10 +189,12 @@ function ChannelBindings({
   agent,
   channels,
   channelsReady,
+  locked = false,
 }: {
   agent: Agent;
   channels: Channel[];
   channelsReady: boolean;
+  locked?: boolean;
 }) {
   const [state, dispatch] = useReducer(reduceBindingState, initialBindingState);
   // One Agent snapshot is returned by the native read, so serialize its writes
@@ -166,7 +211,7 @@ function ChannelBindings({
   }, [agent.id]);
 
   const refreshBindings = useCallback(async () => {
-    if (pending.current) return;
+    if (locked || pending.current) return;
     pending.current = true;
     dispatch({ type: 'pending', phase: 'loading' });
     try {
@@ -181,7 +226,7 @@ function ChannelBindings({
   }, [refreshBindings]);
 
   const toggle = async (channel: Channel) => {
-    if (pending.current || !channelsReady || state.phase !== 'ready' || state.bound === null) return;
+    if (locked || pending.current || !channelsReady || state.phase !== 'ready' || state.bound === null) return;
     pending.current = true;
     dispatch({ type: 'pending', phase: 'updating' });
     try {
@@ -199,7 +244,7 @@ function ChannelBindings({
     }
   };
 
-  const busy = state.phase === 'loading' || state.phase === 'updating';
+  const busy = locked || state.phase === 'loading' || state.phase === 'updating';
   return (
     <div className="space-y-1.5 mt-2 text-[11px] text-bone/60">
       {busy && (
@@ -229,7 +274,7 @@ function ChannelBindings({
             <button
               key={c.id}
               type="button"
-              disabled={!channelsReady || state.phase !== 'ready'}
+              disabled={locked || !channelsReady || state.phase !== 'ready'}
               aria-pressed={isBound}
               onClick={() => void toggle(c)}
               className={cn(
@@ -253,6 +298,7 @@ function ChannelBindings({
 
 export function AgentsView() {
   const [agents, setAgents] = useState<Agent[]>([]);
+  const agentsRef = useRef<Agent[]>([]);
   const [channels, setChannels] = useState<Channel[] | null>(null);
   const [channelsLoading, setChannelsLoading] = useState(true);
   const [channelsError, setChannelsError] = useState(false);
@@ -260,11 +306,48 @@ export function AgentsView() {
   const [discovery, dispatchDiscovery] = useReducer(reduceDiscoveryState, initialDiscoveryState);
   const discoveryPending = useRef(false);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [listError, setListError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [createPhase, setCreatePhase] = useState<AgentOperationPhase | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [pendingDelete, setPendingDelete] = useState<Agent | null>(null);
-  const { success, error: toastError } = useToast();
+  const editingIdRef = useRef<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<string | null>(null);
+  const [operations, setOperations] = useState<Record<string, AgentOperation>>({});
+  const operationsRef = useRef<Record<string, AgentOperation>>({});
+  const requestId = useRef(0);
+  const reading = useRef(false);
+  const createPending = useRef(false);
+  const createOperationId = useRef<string | null>(null);
+  const createName = useRef('');
+  const toast = useToast();
+  const successRef = useRef(toast.success);
+  successRef.current = toast.success;
+
+  const publishOperations = useCallback((next: Record<string, AgentOperation>) => {
+    operationsRef.current = next;
+    setOperations(next);
+  }, []);
+
+  const publishCreatePhase = useCallback((phase: AgentOperationPhase | null) => {
+    createPending.current = phase !== null && phase !== 'write-failed';
+    setCreatePhase(phase);
+  }, []);
+
+  const setEditing = useCallback((id: string | null) => {
+    editingIdRef.current = id;
+    setEditingId(id);
+  }, []);
+
+  const completeCreate = useCallback((id: string) => {
+    if (createOperationId.current !== id) return;
+    const name = createName.current;
+    createOperationId.current = null;
+    createName.current = '';
+    publishCreatePhase(null);
+    setCreating(false);
+    successRef.current(`Created agent ${name}`);
+  }, [publishCreatePhase]);
 
   const fetchLifecycle = useCallback(async () => {
     if (discoveryPending.current) return;
@@ -297,105 +380,248 @@ export function AgentsView() {
     }
   }, []);
 
-  const fetchAll = useCallback(async () => {
-    void fetchChannels();
-    void fetchLifecycle();
+  const fetchAgents = useCallback(async () => {
+    const request = ++requestId.current;
+    reading.current = true;
     setLoading(true);
-    setError(null);
     try {
-      setAgents(await invoke<Agent[]>('list_agents'));
-    } catch (e) {
-      setError(String(e));
+      const snapshot = await invoke<Agent[]>('list_agents');
+      if (request !== requestId.current) return;
+      const result = reconcileAgents(snapshot, operationsRef.current, request);
+      const previous = operationsRef.current;
+      publishOperations(result.operations);
+      agentsRef.current = result.rows;
+      setAgents(result.rows);
+      setLoaded(true);
+      setListError(null);
+      for (const id of result.confirmed) {
+        const operation = previous[id];
+        if (!operation) continue;
+        if (operation.action === 'edit') successRef.current('Agent updated');
+        if (operation.action === 'enable') successRef.current('Agent enabled');
+        if (operation.action === 'disable') successRef.current('Agent disabled');
+        if (operation.action === 'delete' && operation.row) successRef.current(`Deleted ${operation.row.name}`);
+        if (operation.action === 'edit' && editingIdRef.current === id) setEditing(null);
+      }
+      const createId = createOperationId.current;
+      if (createId && result.confirmed.includes(createId)) completeCreate(createId);
+    } catch {
+      if (request !== requestId.current) return;
+      const next = { ...operationsRef.current };
+      let rowFailure = false;
+      for (const [id, operation] of Object.entries(next)) {
+        if (operation.phase === 'reconciling' || operation.phase === 'read-failed') {
+          next[id] = { ...operation, phase: 'read-failed' };
+          rowFailure = true;
+        }
+      }
+      publishOperations(next);
+      const createId = createOperationId.current;
+      if (createId && next[createId]?.phase === 'read-failed') publishCreatePhase('read-failed');
+      if (!rowFailure) setListError('Agents are unavailable. Retry reloads the list only.');
     } finally {
-      setLoading(false);
+      if (request === requestId.current) {
+        reading.current = false;
+        setLoading(false);
+      }
     }
-  }, [fetchChannels, fetchLifecycle]);
+  }, [completeCreate, publishCreatePhase, publishOperations, setEditing]);
+
+  const retryRead = useCallback(() => {
+    if (reading.current) return;
+    const next = { ...operationsRef.current };
+    for (const [id, operation] of Object.entries(next)) {
+      if (operation.phase === 'read-failed') next[id] = { ...operation, phase: 'reconciling', after: requestId.current };
+    }
+    publishOperations(next);
+    const createId = createOperationId.current;
+    if (createId && next[createId]?.phase === 'reconciling') publishCreatePhase('reconciling');
+    void fetchAgents();
+  }, [fetchAgents, publishCreatePhase, publishOperations]);
 
   useEffect(() => {
-    fetchAll();
-  }, [fetchAll]);
+    void fetchChannels();
+    void fetchLifecycle();
+    void fetchAgents();
+  }, [fetchAgents, fetchChannels, fetchLifecycle]);
 
-  const create = useCallback(
-    async (draft: AgentDraft) => {
-      try {
-        await invoke<Agent>('add_agent', {
-          name: draft.name.trim(),
-          model: draft.model.trim(),
-          description: draft.description.trim() || null,
-          systemPrompt: draft.system_prompt.trim() || null,
-        });
-        success(`Created agent ${draft.name}`);
-        setCreating(false);
-        await fetchAll();
-      } catch (e) {
-        toastError(String(e), 'Create failed');
-      }
-    },
-    [fetchAll, success, toastError],
-  );
+  const invalidateAgentReads = useCallback(() => {
+    requestId.current += 1;
+    reading.current = false;
+  }, []);
 
-  const saveEdit = useCallback(
-    async (id: string, draft: AgentDraft) => {
-      try {
-        await invoke('set_agent_identity', {
-          id,
-          name: draft.name.trim(),
-          description: draft.description.trim(),
-          systemPrompt: draft.system_prompt.trim(),
-          model: draft.model.trim(),
-        });
-        success('Agent updated');
-        setEditingId(null);
-        await fetchAll();
-      } catch (e) {
-        toastError(String(e), 'Update failed');
-      }
-    },
-    [fetchAll, success, toastError],
-  );
+  const startOperation = useCallback((
+    agent: Agent,
+    action: Exclude<AgentOperationAction, 'create'>,
+    draft?: AgentDraft,
+  ): AgentOperation | null => {
+    const existing = operationsRef.current[agent.id];
+    if (existing && (existing.phase !== 'write-failed' || existing.action !== action)) return null;
+    invalidateAgentReads();
+    const expected = action === 'edit' && draft
+      ? expectedFromDraft(draft, agent.enabled)
+      : action === 'enable' || action === 'disable'
+        ? { ...expectedFromAgent(agent), enabled: action === 'enable' }
+        : expectedFromAgent(agent);
+    const operation: AgentOperation = {
+      id: agent.id,
+      row: agent,
+      action,
+      phase: 'writing',
+      after: requestId.current,
+      expected,
+    };
+    publishOperations({ ...operationsRef.current, [agent.id]: operation });
+    return operation;
+  }, [invalidateAgentReads, publishOperations]);
 
-  const toggleEnabled = useCallback(
-    async (agent: Agent) => {
-      const next = !agent.enabled;
-      setAgents((prev) => prev.map((a) => (a.id === agent.id ? { ...a, enabled: next } : a)));
-      try {
-        await invoke('set_agent_enabled', { id: agent.id, enabled: next });
-      } catch (e) {
-        setAgents((prev) => prev.map((a) => (a.id === agent.id ? { ...a, enabled: !next } : a)));
-        toastError(String(e), 'Toggle failed');
-      }
-    },
-    [toastError],
-  );
-
-  const remove = useCallback(
-    async (agent: Agent) => { setPendingDelete(agent); },
-    [],
-  );
-
-  const confirmDelete = useCallback(async () => {
-    if (!pendingDelete) return;
-    const agent = pendingDelete;
-    setPendingDelete(null);
+  const mutate = useCallback(async (
+    agent: Agent,
+    action: Exclude<AgentOperationAction, 'create'>,
+    draft?: AgentDraft,
+  ) => {
+    const operation = startOperation(agent, action, draft);
+    if (!operation) return;
     try {
-      await invoke('delete_agent', { id: agent.id });
-      success(`Deleted ${agent.name}`);
-      await fetchAll();
-    } catch (e) {
-      toastError(String(e), 'Delete failed');
+      if (action === 'edit') {
+        await invoke('set_agent_identity', {
+          id: agent.id,
+          name: operation.expected.name,
+          description: operation.expected.description,
+          systemPrompt: operation.expected.system_prompt,
+          model: operation.expected.model,
+        });
+      } else if (action === 'enable' || action === 'disable') {
+        await invoke('set_agent_enabled', { id: agent.id, enabled: operation.expected.enabled });
+      } else {
+        await invoke('delete_agent', { id: agent.id });
+      }
+      const reconciling = { ...operation, phase: 'reconciling' as const, after: requestId.current };
+      publishOperations({ ...operationsRef.current, [agent.id]: reconciling });
+      if (action === 'delete') setPendingDelete((current) => current === agent.id ? null : current);
+      await fetchAgents();
+    } catch {
+      const failed = { ...operation, phase: 'write-failed' as const, after: requestId.current };
+      publishOperations({ ...operationsRef.current, [agent.id]: failed });
+      if (action === 'delete') setPendingDelete((current) => current === agent.id ? null : current);
+      setLoading(false);
     }
-  }, [pendingDelete, fetchAll, success, toastError]);
+  }, [fetchAgents, publishOperations, startOperation]);
+
+  const create = useCallback(async (draft: AgentDraft) => {
+    if (createPending.current) return;
+    const expected = expectedFromDraft(draft, true);
+    invalidateAgentReads();
+    publishCreatePhase('writing');
+    createName.current = expected.name;
+    try {
+      const created = await invoke<Agent>('add_agent', {
+        name: expected.name,
+        model: expected.model,
+        description: expected.description || null,
+        systemPrompt: expected.system_prompt || null,
+      });
+      if (!created?.id) throw new Error('Create did not return an Agent');
+      const operation: AgentOperation = {
+        id: created.id,
+        row: null,
+        action: 'create',
+        phase: 'reconciling',
+        after: requestId.current,
+        expected,
+      };
+      createOperationId.current = created.id;
+      publishOperations({ ...operationsRef.current, [created.id]: operation });
+      publishCreatePhase('reconciling');
+      await fetchAgents();
+    } catch {
+      publishCreatePhase('write-failed');
+      setLoading(false);
+    }
+  }, [fetchAgents, invalidateAgentReads, publishCreatePhase, publishOperations]);
+
+  const saveEdit = useCallback(async (id: string, draft: AgentDraft) => {
+    const agent = agentsRef.current.find((candidate) => candidate.id === id);
+    if (!agent) return;
+    await mutate(agent, 'edit', draft);
+  }, [mutate]);
+
+  const toggleEnabled = useCallback((agent: Agent) => {
+    void mutate(agent, agent.enabled ? 'disable' : 'enable');
+  }, [mutate]);
+
+  const retryMutation = useCallback((agent: Agent, action: Exclude<AgentOperationAction, 'create'>) => {
+    if (action === 'delete') {
+      setPendingDelete(agent.id);
+      return;
+    }
+    void mutate(agent, action);
+  }, [mutate]);
+
+  const remove = useCallback((agent: Agent) => {
+    const operation = operationsRef.current[agent.id];
+    if (operation && operation.action !== 'delete') return;
+    setPendingDelete(agent.id);
+  }, []);
+
+  const confirmDelete = useCallback(() => {
+    if (!pendingDelete) return;
+    const agent = agentsRef.current.find((candidate) => candidate.id === pendingDelete);
+    if (!agent) {
+      setPendingDelete(null);
+      return;
+    }
+    void mutate(agent, 'delete');
+  }, [mutate, pendingDelete]);
+
+  const toggleCreating = useCallback(() => {
+    if (createPending.current) return;
+    if (creating) {
+      setCreating(false);
+      publishCreatePhase(null);
+      return;
+    }
+    setCreating(true);
+    publishCreatePhase(null);
+    setEditing(null);
+  }, [creating, publishCreatePhase, setEditing]);
+
+  const cancelCreate = useCallback(() => {
+    if (createPending.current) return;
+    setCreating(false);
+    publishCreatePhase(null);
+  }, [publishCreatePhase]);
+
+  const beginEdit = useCallback((id: string) => {
+    if (creating || createPending.current || operationsRef.current[id]) return;
+    setEditing(id);
+  }, [createPending, creating, setEditing]);
+
+  const cancelEdit = useCallback(() => {
+    const operation = editingIdRef.current ? operationsRef.current[editingIdRef.current] : undefined;
+    if (operation && operation.phase !== 'write-failed') return;
+    if (operation) {
+      const next = { ...operationsRef.current };
+      delete next[editingIdRef.current as string];
+      publishOperations(next);
+    }
+    setEditing(null);
+  }, [publishOperations, setEditing]);
+
+  const deleteAgent = pendingDelete ? agentsRef.current.find((candidate) => candidate.id === pendingDelete) : undefined;
+  const deleteOperation = pendingDelete ? operations[pendingDelete] : undefined;
+  const deleting = deleteOperation?.action === 'delete' && deleteOperation.phase === 'writing';
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-hidden">
       <ConfirmModal
-        open={pendingDelete !== null}
-        message={`Delete agent "${pendingDelete?.name}"?`}
-        detail="This cannot be undone."
-        confirmLabel="Delete"
+        open={pendingDelete !== null && deleteAgent !== undefined}
+        message={`Delete agent "${deleteAgent?.name ?? ''}"?`}
+        detail={deleting ? 'Saving deletion. Repeated confirmation will not submit another write.' : deleteOperation && agentOperationLocked(deleteOperation) ? 'Another change is pending. Removal is unavailable until reconciliation.' : 'This cannot be undone.'}
+        confirmLabel={deleting ? 'Deleting…' : 'Delete'}
         danger
         onConfirm={confirmDelete}
-        onCancel={() => setPendingDelete(null)}
+        onCancel={() => { if (!deleting) setPendingDelete(null); }}
       />
       <SectionHeader
         title="Agents"
@@ -404,11 +630,9 @@ export function AgentsView() {
         action={
           <button
             type="button"
-            onClick={() => {
-              setCreating((c) => !c);
-              setEditingId(null);
-            }}
-            className="px-3 py-1.5 text-xs rounded-lg bg-accent text-bone hover:bg-accent/80 transition-colors"
+            onClick={toggleCreating}
+            disabled={createPending.current}
+            className="px-3 py-1.5 text-xs rounded-lg bg-accent text-bone hover:bg-accent/80 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
           >
             {creating ? 'Close' : '+ New agent'}
           </button>
@@ -416,7 +640,15 @@ export function AgentsView() {
       />
 
       {creating && (
-        <AgentEditor initial={EMPTY_DRAFT} onSave={create} onCancel={() => setCreating(false)} />
+        <AgentEditor
+          initial={EMPTY_DRAFT}
+          onSave={create}
+          onCancel={cancelCreate}
+          locked={createPending.current}
+          phase={createPhase}
+          failureMessage="Could not create the agent. Your draft was kept."
+          onRetryRead={retryRead}
+        />
       )}
 
       <GlassCard className="p-3">
@@ -477,29 +709,43 @@ export function AgentsView() {
       </div>
 
       <div className="flex-1 overflow-y-auto min-h-0">
-        {loading ? (
+        {listError && (
+          <div role="alert" className="text-sm text-red-200">
+            {listError} {loaded && 'Previously loaded agents may be stale.'}{' '}
+            <button type="button" onClick={retryRead} disabled={loading} className="underline disabled:opacity-40">Retry</button>
+          </div>
+        )}
+        {loaded && loading && <p role="status" className="text-xs text-bone/60">Refreshing agents…</p>}
+        {!loaded && !listError ? (
           <LoadingState message="Loading agents…" />
-        ) : error ? (
-          <ErrorState error={error} onRetry={fetchAll} />
-        ) : agents.length === 0 ? (
+        ) : loaded && agents.length === 0 && !listError ? (
           <EmptyState message="No agents yet. Create one to get started." />
-        ) : (
+        ) : loaded ? (
           <ul className="space-y-2">
-            {agents.map((a) =>
-              editingId === a.id ? (
-                <li key={a.id}>
-                  <AgentEditor
-                    initial={{
-                      name: a.name,
-                      model: a.model,
-                      description: a.description,
-                      system_prompt: a.system_prompt,
-                    }}
-                    onSave={(draft) => saveEdit(a.id, draft)}
-                    onCancel={() => setEditingId(null)}
-                  />
-                </li>
-              ) : (
+            {agents.map((a) => {
+              const operation = operations[a.id];
+              const rowLocked = operation !== undefined;
+              if (editingId === a.id) {
+                return (
+                  <li key={a.id}>
+                    <AgentEditor
+                      initial={{
+                        name: a.name,
+                        model: a.model,
+                        description: a.description,
+                        system_prompt: a.system_prompt,
+                      }}
+                      onSave={(draft) => saveEdit(a.id, draft)}
+                      onCancel={cancelEdit}
+                      locked={agentOperationLocked(operation)}
+                      phase={operation?.phase ?? null}
+                      failureMessage="Could not update the agent. Your draft was kept."
+                      onRetryRead={retryRead}
+                    />
+                  </li>
+                );
+              }
+              return (
                 <li key={a.id}>
                   <GlassCard className="p-3">
                     <div className="flex items-center gap-2 mb-1">
@@ -513,8 +759,9 @@ export function AgentsView() {
                         <button
                           type="button"
                           onClick={() => toggleEnabled(a)}
+                          disabled={rowLocked}
                           className={cn(
-                            'px-2 py-0.5 rounded-md border transition-colors',
+                            'px-2 py-0.5 rounded-md border transition-colors disabled:opacity-40 disabled:cursor-not-allowed',
                             a.enabled
                               ? 'border-amber-500/30 text-amber-200 hover:bg-amber-500/10'
                               : 'border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10',
@@ -524,18 +771,17 @@ export function AgentsView() {
                         </button>
                         <button
                           type="button"
-                          onClick={() => {
-                            setEditingId(a.id);
-                            setCreating(false);
-                          }}
-                          className="px-2 py-0.5 rounded-md border border-white/10 text-bone/60 hover:text-bone transition-colors"
+                          onClick={() => beginEdit(a.id)}
+                          disabled={rowLocked}
+                          className="px-2 py-0.5 rounded-md border border-white/10 text-bone/60 hover:text-bone transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                         >
                           Edit
                         </button>
                         <button
                           type="button"
                           onClick={() => remove(a)}
-                          className="px-2 py-0.5 rounded-md border border-red-500/30 text-red-200 hover:bg-red-500/10 transition-colors"
+                          disabled={rowLocked}
+                          className="px-2 py-0.5 rounded-md border border-red-500/30 text-red-200 hover:bg-red-500/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                         >
                           Delete
                         </button>
@@ -544,13 +790,36 @@ export function AgentsView() {
                     {a.description && (
                       <p className="text-xs text-bone/60 line-clamp-2">{a.description}</p>
                     )}
-                    <ChannelBindings agent={a} channels={channels ?? []} channelsReady={!channelsLoading && !channelsError && channels !== null} />
+                    {operation && operation.action !== 'edit' && operation.phase === 'writing' && (
+                      <p role="status" className="text-xs text-bone/60">Saving agent change…</p>
+                    )}
+                    {operation && operation.action !== 'edit' && operation.phase === 'reconciling' && (
+                      <p role="status" className="text-xs text-bone/60">Change saved. Reconciling agents…</p>
+                    )}
+                    {operation && operation.action !== 'edit' && operation.phase === 'write-failed' && (
+                      <div role="alert" className="text-xs text-red-200">
+                        Agent change failed. Confirmed state was kept.{' '}
+                        <button type="button" className="underline" onClick={() => retryMutation(a, operation.action as Exclude<AgentOperationAction, 'create'>)}>Retry</button>
+                      </div>
+                    )}
+                    {operation && operation.action !== 'edit' && operation.phase === 'read-failed' && (
+                      <div role="alert" className="text-xs text-red-200">
+                        Change saved, but the agent list could not be reconciled. Showing previous state. Retry reloads the list only.{' '}
+                        <button type="button" className="underline disabled:opacity-40" disabled={loading} onClick={retryRead}>Retry</button>
+                      </div>
+                    )}
+                    <ChannelBindings
+                      agent={a}
+                      channels={channels ?? []}
+                      channelsReady={!channelsLoading && !channelsError && channels !== null}
+                      locked={rowLocked}
+                    />
                   </GlassCard>
                 </li>
-              ),
-            )}
+              );
+            })}
           </ul>
-        )}
+        ) : null}
       </div>
     </div>
   );

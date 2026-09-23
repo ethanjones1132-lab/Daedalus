@@ -114,8 +114,8 @@ describe('Agent lifecycle discovery', () => {
     const first = deferred<Response>();
     fetchMock.mockReturnValue(first.promise);
     render(<AgentsView />);
-    await screen.findByText(/native list unavailable/);
-    // Native Retry calls fetchAll too; it must share the discovery guard.
+    await screen.findByRole('alert');
+    expect(screen.getByRole('alert')).toHaveTextContent('Agents are unavailable.');
     readAgents = () => Promise.resolve([agent]);
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
     await screen.findByText('Atlas');
