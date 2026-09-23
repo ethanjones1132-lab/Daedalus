@@ -62,6 +62,16 @@ interface JarvisViewProps {
   onCompanionChange?: (companion: CompanionState | null) => void;
 }
 
+type ToolApprovalRequest = {
+  call_id: string;
+  name: string;
+  arguments: unknown;
+  session_id: string;
+};
+
+const sameToolApproval = (left: ToolApprovalRequest | null, right: ToolApprovalRequest | null) =>
+  left?.call_id === right?.call_id && left?.session_id === right?.session_id;
+
 const sessionInvokeArgs = (sessionId: string) => ({
   sessionId,
   session_id: sessionId,
@@ -456,13 +466,16 @@ export function ChatPanel({
   const [showAgents, setShowAgents] = useState(true);
 
   // Phase 1.1 — pending tool approval surfaced from `jarvis://approval_request`.
-  const [pendingApproval, setPendingApproval] = useState<{
-    call_id: string;
-    name: string;
-    arguments: unknown;
-    session_id: string;
-  } | null>(null);
+  const [pendingApproval, setPendingApproval] = useState<ToolApprovalRequest | null>(null);
   const [approvalError, setApprovalError] = useState<string | null>(null);
+  const [approvalPending, setApprovalPending] = useState(false);
+  const [approvalRetryDecision, setApprovalRetryDecision] = useState<boolean | null>(null);
+  const pendingApprovalRef = useRef<ToolApprovalRequest | null>(null);
+  const approvalInFlightRef = useRef<{
+    callId: string;
+    sessionId: string;
+    approved: boolean;
+  } | null>(null);
 
   // Phase 3.1 — inline tool-call cards built from `tool_use` / `tool_result`.
   const [toolCalls, setToolCalls] = useState<ToolCallState[]>([]);
@@ -537,6 +550,13 @@ export function ChatPanel({
   // response text" from unverified stage work without a dedicated state
   // waterfall; reset at send, finalize, error, cancel, and session switch.
   const turnHadResponseTextRef = useRef(false);
+  const clearPendingApproval = useCallback(() => {
+    pendingApprovalRef.current = null;
+    setPendingApproval(null);
+    setApprovalError(null);
+    setApprovalRetryDecision(null);
+  }, []);
+
   useEffect(() => { activeSessionRef.current = activeSession; }, [activeSession]);
   useEffect(() => {
     if (!isStreaming || turnStartedAtRef.current === null) return;
@@ -621,7 +641,7 @@ export function ChatPanel({
     setIsStreaming(false);
     setPipelineStage('');
     setRecursionDepth(null);
-    setPendingApproval(null);
+    clearPendingApproval();
     setUserPinnedToBottom(true);
     turnHadResponseTextRef.current = false;
     const effectiveSid = sid || activeSessionRef.current || sessionIdRef.current;
@@ -643,7 +663,7 @@ export function ChatPanel({
       return withTokens;
     });
     onSessionCreatedRef.current();
-  }, [applyTokenChunk, takePendingTokens]);
+  }, [applyTokenChunk, clearPendingApproval, takePendingTokens]);
 
   // Reduced-motion respect — we use it to disable token fade-in / shimmer.
   const prefersReducedMotion = useRef(false);
@@ -724,7 +744,7 @@ export function ChatPanel({
       setShowAgents(true);
       setToolCalls([]);
       setTurnCost(null);
-      setPendingApproval(null);
+      clearPendingApproval();
       setApprovalError(null);
       setError(null);
       turnHadResponseTextRef.current = false;
@@ -788,7 +808,7 @@ export function ChatPanel({
         }
       });
     return () => { cancelled = true; };
-  }, [activeSession, historyRetry, scrollToBottom, discardPendingTokens]);
+  }, [activeSession, clearPendingApproval, historyRetry, scrollToBottom, discardPendingTokens]);
 
   // Cancel any pending token rAF on unmount so we never setState after teardown.
   useEffect(() => () => { discardPendingTokens(); }, [discardPendingTokens]);
@@ -830,7 +850,7 @@ export function ChatPanel({
       setIsStreaming(false);
       setPipelineStage('');
       setRecursionDepth(null);
-      setPendingApproval(null);
+      clearPendingApproval();
       setError(event.payload.error);
       setUserPinnedToBottom(true);
       setMessages(prev => {
@@ -931,13 +951,17 @@ export function ChatPanel({
     }>('jarvis://approval_request', (event) => {
       const p = event.payload;
       if (!matchesStreamSession(p.session_id)) return;
-      setApprovalError(null);
-      setPendingApproval({
+      const nextApproval: ToolApprovalRequest = {
         call_id: p.call_id,
         name: p.name,
         arguments: p.arguments,
         session_id: p.session_id,
-      });
+      };
+      pendingApprovalRef.current = nextApproval;
+      setPendingApproval(nextApproval);
+      setApprovalError(null);
+      setApprovalRetryDecision(null);
+      setApprovalPending(approvalInFlightRef.current !== null);
     }));
 
     track(listen<{ call_id?: string; name: string; arguments: unknown; session_id?: string }>('jarvis://tool_call', (event) => {
@@ -975,7 +999,7 @@ export function ChatPanel({
       disposed = true;
       unsubs.forEach((f) => f());
     };
-  }, [appendAssistantText, applyTokenChunk, finalizeAssistantMessage, matchesStreamSession, takePendingTokens]);
+  }, [appendAssistantText, applyTokenChunk, clearPendingApproval, finalizeAssistantMessage, matchesStreamSession, takePendingTokens]);
 
   // True autosize composer (Phase 2.4). The previous rows=⟨line-count⟩ approach
   // overflowed for single-line wrapped text.
@@ -988,7 +1012,9 @@ export function ChatPanel({
 
   // Autofocus + focus-after-send + focus-after-session-switch.
   useEffect(() => {
-    const t = setTimeout(() => inputRef.current?.focus(), 50);
+    const t = setTimeout(() => {
+      if (!pendingApprovalRef.current) inputRef.current?.focus();
+    }, 50);
     return () => clearTimeout(t);
   }, [activeSession]);
 
@@ -1558,20 +1584,35 @@ export function ChatPanel({
   // Phase 1.1 — approve / deny the pending tool call and forward the decision
   // to the Bun server. Surface any POST error so the user can retry.
   const handleApproval = useCallback(async (approved: boolean) => {
-    if (!pendingApproval) return;
+    const request = pendingApprovalRef.current;
+    if (!request || approvalInFlightRef.current) return;
+    const inFlight = {
+      callId: request.call_id,
+      sessionId: request.session_id,
+      approved,
+    };
+    approvalInFlightRef.current = inFlight;
+    setApprovalPending(true);
     try {
       await invoke('jarvis_tool_decision', {
-        ...sessionInvokeArgs(pendingApproval.session_id),
-        toolCallId: pendingApproval.call_id,
-        tool_call_id: pendingApproval.call_id,
+        ...sessionInvokeArgs(request.session_id),
+        toolCallId: request.call_id,
+        tool_call_id: request.call_id,
         decision: approved ? 'approve' : 'deny',
       });
-      setPendingApproval(null);
-      setApprovalError(null);
-    } catch (e) {
-      setApprovalError(String(e));
+      if (sameToolApproval(pendingApprovalRef.current, request)) clearPendingApproval();
+    } catch {
+      if (sameToolApproval(pendingApprovalRef.current, request)) {
+        setApprovalError('Tool approval decision failed. Retry the same decision.');
+        setApprovalRetryDecision(approved);
+      }
+    } finally {
+      if (approvalInFlightRef.current === inFlight) {
+        approvalInFlightRef.current = null;
+        setApprovalPending(false);
+      }
     }
-  }, [pendingApproval]);
+  }, [clearPendingApproval]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     // Enter sends; Shift+Enter / Ctrl+Enter / Cmd+Enter → newline.
@@ -1621,7 +1662,7 @@ export function ChatPanel({
     setAgentSteps([]);
     setToolCalls([]);
     setTurnCost(null);
-    setPendingApproval(null);
+    clearPendingApproval();
     setUserPinnedToBottom(true);
     setTimeout(() => inputRef.current?.focus(), 50);
   };
@@ -2042,12 +2083,15 @@ export function ChatPanel({
       <AnimatePresence>
         {pendingApproval && (
           <ApprovalModal
+            key={`${pendingApproval.session_id}:${pendingApproval.call_id}`}
             call_id={pendingApproval.call_id}
             name={pendingApproval.name}
             args={pendingApproval.arguments}
             error={approvalError}
-            onApprove={() => handleApproval(true)}
-            onReject={() => handleApproval(false)}
+            pending={approvalPending}
+            onRetry={approvalRetryDecision === null ? undefined : () => { void handleApproval(approvalRetryDecision); }}
+            onApprove={() => { void handleApproval(true); }}
+            onReject={() => { void handleApproval(false); }}
           />
         )}
       </AnimatePresence>
@@ -2560,14 +2604,24 @@ function ReasoningAgentsAccordion({
 // ├── src-ui/src/components/jarvis/ToolApprovalModal.tsx ─────
 // ═══════════════════════════════════════════════════════════════
 
-function ApprovalModal({ call_id, name, args, error, onApprove, onReject }: {
+function ApprovalModal({ call_id, name, args, error, pending, onRetry, onApprove, onReject }: {
   call_id: string;
   name: string;
   args: unknown;
   error: string | null;
+  pending: boolean;
+  onRetry?: () => void;
   onApprove: () => void;
   onReject: () => void;
 }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const rejectRef = useRef<HTMLButtonElement>(null);
+  const approveRef = useRef<HTMLButtonElement>(null);
+  const onApproveRef = useRef(onApprove);
+  const onRejectRef = useRef(onReject);
+  onApproveRef.current = onApprove;
+  onRejectRef.current = onReject;
+
   const argText = (() => {
     try {
       if (!args) return '';
@@ -2576,32 +2630,78 @@ function ApprovalModal({ call_id, name, args, error, onApprove, onReject }: {
     } catch { return String(args); }
   })();
 
-  // Esc to reject. Use a captured keydown listener at modal mount.
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        onReject();
-      } else if (e.key === 'Enter') {
-        e.preventDefault();
-        onApprove();
+    const opener = document.activeElement;
+    const enabledControls = () => Array.from(
+      dialogRef.current?.querySelectorAll<HTMLElement>('button:not([disabled])') || [],
+    );
+    const focusFirstControl = () => {
+      const target = enabledControls()[0] || dialogRef.current;
+      target?.focus();
+    };
+    const containFocus = (event: FocusEvent) => {
+      if (event.target instanceof Node && !dialogRef.current?.contains(event.target)) focusFirstControl();
+    };
+    document.addEventListener('focusin', containFocus);
+    rejectRef.current?.focus();
+    return () => {
+      document.removeEventListener('focusin', containFocus);
+      if (opener instanceof HTMLElement && opener.isConnected && !opener.hasAttribute('disabled')) {
+        opener.focus();
+      }
+      if (!(opener instanceof HTMLElement) || !opener.isConnected || document.activeElement !== opener) {
+        const tabIndex = document.body.getAttribute('tabindex');
+        document.body.setAttribute('tabindex', '-1');
+        document.body.focus();
+        if (tabIndex === null) document.body.removeAttribute('tabindex');
+        else document.body.setAttribute('tabindex', tabIndex);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        onRejectRef.current();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const controls = Array.from(
+        dialogRef.current?.querySelectorAll<HTMLElement>('button:not([disabled])') || [],
+      );
+      const first = controls[0];
+      const last = controls[controls.length - 1];
+      if (!first || !last) {
+        event.preventDefault();
+        dialogRef.current?.focus();
+      } else if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [onApprove, onReject]);
+  }, []);
 
   return (
     <motion.div
+      ref={dialogRef}
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
       transition={{ duration: 0.15 }}
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
-      onClick={onReject}
+      onClick={() => onRejectRef.current()}
       role="dialog"
       aria-modal="true"
       aria-label="Tool approval required"
+      aria-busy={pending}
+      tabIndex={-1}
     >
       <motion.div
         initial={{ scale: 0.96, opacity: 0 }}
@@ -2624,26 +2724,49 @@ function ApprovalModal({ call_id, name, args, error, onApprove, onReject }: {
         >
           {argText || '(no arguments)'}
         </pre>
+        {pending && (
+          <p
+            className="text-cyan-glow text-xs font-mono mb-2"
+            role="status"
+            aria-label="Tool approval decision pending"
+          >
+            Submitting tool approval decision.
+          </p>
+        )}
         {error && (
           <p className="text-error text-xs font-mono mb-2 break-words" role="alert">
             {error}
           </p>
         )}
-        <div className="flex gap-3 justify-end mt-4">
+        <div className="flex flex-wrap gap-3 justify-end mt-4">
           <button
+            ref={rejectRef}
             type="button"
-            autoFocus
             aria-label="Reject tool call"
-            className="px-4 py-2 text-xs font-mono rounded-lg border border-error/40 text-error hover:bg-error/10 transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-error/50"
-            onClick={onReject}
+            className="px-4 py-2 text-xs font-mono rounded-lg border border-error/40 text-error hover:bg-error/10 transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-error/50 disabled:cursor-not-allowed disabled:opacity-50"
+            onClick={() => onRejectRef.current()}
+            disabled={pending}
           >
             Reject  (Esc)
           </button>
+          {onRetry && (
+            <button
+              type="button"
+              aria-label="Retry tool decision"
+              className="px-4 py-2 text-xs font-mono rounded-lg border border-royal/40 text-royal-light hover:bg-royal/10 transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-royal/50 disabled:cursor-not-allowed disabled:opacity-50"
+              onClick={onRetry}
+              disabled={pending}
+            >
+              Retry decision
+            </button>
+          )}
           <button
+            ref={approveRef}
             type="button"
             aria-label="Approve tool call"
-            className="px-4 py-2 text-xs font-mono rounded-lg border border-cyan-neon/40 text-cyan-glow hover:bg-cyan-neon/10 transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
-            onClick={onApprove}
+            className="px-4 py-2 text-xs font-mono rounded-lg border border-cyan-neon/40 text-cyan-glow hover:bg-cyan-neon/10 transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50 disabled:cursor-not-allowed disabled:opacity-50"
+            onClick={() => onApproveRef.current()}
+            disabled={pending}
           >
             Approve  (Enter)
           </button>
