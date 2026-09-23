@@ -44,6 +44,13 @@ interface CronJob {
   updated_at: string;
 }
 
+interface CronJobDraft {
+  name: string;
+  schedule: string;
+  prompt: string;
+  agentId: string;
+}
+
 interface CronRun {
   id: string;
   cron_id: string;
@@ -233,8 +240,17 @@ function PromptPreview({ prompt }: { prompt: string; jobType?: CronJobType }) {
 
 // ── Add Job Form ─────────────────────────────────────────────────────────────
 
-function AddJobForm({ onAdd, onCancel }: { onAdd: (job: CronJob) => void; onCancel: () => void }) {
-  const { success, error: toastError } = useToast();
+function AddJobForm({
+  onCreate,
+  onCancel,
+  creating,
+  createError,
+}: {
+  onCreate: (draft: CronJobDraft) => Promise<void>;
+  onCancel: () => void;
+  creating: boolean;
+  createError: boolean;
+}) {
   const [jobType, setJobType] = useState<CronJobType>('learning');
   const [name, setName] = useState('');
   const [preset, setPreset] = useState('');
@@ -242,13 +258,13 @@ function AddJobForm({ onAdd, onCancel }: { onAdd: (job: CronJob) => void; onCanc
   const [isCustomSchedule, setIsCustomSchedule] = useState(false);
   const [prompt, setPrompt] = useState('');
   const [agentId, setAgentId] = useState('jarvis');
-  const [saving, setSaving] = useState(false);
   const [showPreview, setShowPreview] = useState(true);
 
   const typeConfig = useMemo(() => JOB_TYPES.find(t => t.id === jobType)!, [jobType]);
 
   // Update defaults when job type changes
   const handleTypeChange = (newType: CronJobType) => {
+    if (creating) return;
     setJobType(newType);
     const config = JOB_TYPES.find(t => t.id === newType)!;
     setPrompt(config.defaultPrompt);
@@ -271,23 +287,14 @@ function AddJobForm({ onAdd, onCancel }: { onAdd: (job: CronJob) => void; onCanc
 
   const expr = isCustomSchedule ? customExpr : preset;
 
-  const handleSubmit = async () => {
-    if (!name.trim() || !expr.trim() || !prompt.trim()) return;
-    setSaving(true);
-    try {
-      const job = await invoke<CronJob>('add_cron_job', {
-        name: name.trim(),
-        schedule: expr.trim(),
-        prompt: prompt.trim(),
-        agentId: agentId.trim() || 'jarvis',
-      });
-      success(`Cron job "${name}" created successfully.`, 'Cron Job Added');
-      onAdd(job);
-    } catch (e) {
-      toastError(`Failed to add cron job: ${e}`, 'Cron Job Error');
-    } finally {
-      setSaving(false);
-    }
+  const handleSubmit = () => {
+    if (creating || !name.trim() || !expr.trim() || !prompt.trim()) return;
+    void onCreate({
+      name: name.trim(),
+      schedule: expr.trim(),
+      prompt: prompt.trim(),
+      agentId: agentId.trim() || 'jarvis',
+    });
   };
 
   const schedulePresets = typeConfig.schedulePresets;
@@ -297,6 +304,27 @@ function AddJobForm({ onAdd, onCancel }: { onAdd: (job: CronJob) => void; onCanc
     <GlassCard>
       <h3 className="text-sm font-semibold text-bone mb-4">Add Cron Job</h3>
 
+      {creating && (
+        <p role="status" className="mb-4 text-xs font-mono text-bone-dim">
+          Adding cron job. The submitted draft is locked until the request completes.
+        </p>
+      )}
+
+      {createError && (
+        <div role="alert" className="mb-4 text-xs font-mono text-error">
+          Could not add cron job. Your draft has been kept.
+          <button
+            type="button"
+            onClick={handleSubmit}
+            disabled={creating || !name.trim() || !expr.trim() || !prompt.trim()}
+            className="ml-2 underline disabled:opacity-50"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
+      <fieldset disabled={creating} className="m-0 min-w-0 border-0 p-0">
       {/* Job Type Selector */}
       <div className="mb-4">
         <label className="block text-xs font-mono text-bone-dim mb-1.5">Job Type</label>
@@ -329,7 +357,7 @@ function AddJobForm({ onAdd, onCancel }: { onAdd: (job: CronJob) => void; onCanc
           <input
             type="text"
             value={name}
-            onChange={(e) => setName(e.target.value)}
+            onChange={(e) => { if (!creating) setName(e.target.value); }}
             placeholder={typeConfig.label}
             className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors"
           />
@@ -339,7 +367,7 @@ function AddJobForm({ onAdd, onCancel }: { onAdd: (job: CronJob) => void; onCanc
           <input
             type="text"
             value={agentId}
-            onChange={(e) => setAgentId(e.target.value)}
+            onChange={(e) => { if (!creating) setAgentId(e.target.value); }}
             placeholder="jarvis"
             className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors"
           />
@@ -354,6 +382,7 @@ function AddJobForm({ onAdd, onCancel }: { onAdd: (job: CronJob) => void; onCanc
             <button
               key={p.label}
               onClick={() => {
+                if (creating) return;
                 if (p.label === 'Custom') {
                   setIsCustomSchedule(true);
                   setPreset('');
@@ -379,7 +408,7 @@ function AddJobForm({ onAdd, onCancel }: { onAdd: (job: CronJob) => void; onCanc
             animate={{ opacity: 1, height: 'auto' }}
             type="text"
             value={customExpr}
-            onChange={(e) => setCustomExpr(e.target.value)}
+            onChange={(e) => { if (!creating) setCustomExpr(e.target.value); }}
             placeholder="*/5 * * * *"
             className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors"
           />
@@ -391,7 +420,7 @@ function AddJobForm({ onAdd, onCancel }: { onAdd: (job: CronJob) => void; onCanc
         <div className="flex items-center justify-between mb-1.5">
           <label className="block text-xs font-mono text-bone-dim">Prompt</label>
           <button
-            onClick={() => setShowPreview(!showPreview)}
+            onClick={() => { if (!creating) setShowPreview(!showPreview); }}
             className="text-[9px] font-mono text-bone-faint hover:text-bone-dim transition-colors"
           >
             {showPreview ? 'Hide Preview' : 'Show Preview'}
@@ -399,7 +428,7 @@ function AddJobForm({ onAdd, onCancel }: { onAdd: (job: CronJob) => void; onCanc
         </div>
         <textarea
           value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
+          onChange={(e) => { if (!creating) setPrompt(e.target.value); }}
           rows={6}
           placeholder="What should this cron job do?"
           className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors resize-none"
@@ -424,7 +453,7 @@ function AddJobForm({ onAdd, onCancel }: { onAdd: (job: CronJob) => void; onCanc
       {/* Actions */}
       <div className="flex items-center justify-end gap-2">
         <motion.button
-          onClick={onCancel}
+          onClick={() => { if (!creating) onCancel(); }}
           className="px-4 py-2 text-xs font-mono text-bone-dim border border-iron/40 rounded-lg hover:border-iron/60 transition-colors"
           whileHover={{ scale: 1.02 }}
           whileTap={{ scale: 0.98 }}
@@ -433,19 +462,20 @@ function AddJobForm({ onAdd, onCancel }: { onAdd: (job: CronJob) => void; onCanc
         </motion.button>
         <motion.button
           onClick={handleSubmit}
-          disabled={saving || !name.trim() || !expr.trim() || !prompt.trim()}
+          disabled={creating || !name.trim() || !expr.trim() || !prompt.trim()}
           className={cn(
             'px-4 py-2 text-xs font-mono text-void bg-gradient-to-r from-royal to-cyan-neon rounded-lg transition-opacity',
-            (saving || !name.trim() || !expr.trim() || !prompt.trim())
+            (creating || !name.trim() || !expr.trim() || !prompt.trim())
               ? 'opacity-50 cursor-not-allowed'
               : 'hover:opacity-90'
           )}
           whileHover={{ scale: 1.02 }}
           whileTap={{ scale: 0.98 }}
         >
-          {saving ? 'Adding…' : 'Add Job'}
+          {creating ? 'Adding…' : 'Add Job'}
         </motion.button>
       </div>
+      </fieldset>
     </GlassCard>
   );
 }
@@ -841,6 +871,9 @@ export default function CronView() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [showAddForm, setShowAddForm] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState(false);
+  const createPending = useRef(false);
 
   // Feature 1: Premium Insights state (luxury viz + smart recs using existing data)
   const [insightsOpen, setInsightsOpen] = useState(false);
@@ -890,8 +923,38 @@ export default function CronView() {
     };
   }, [fetchJobs, fetchInFlight, fetchPendingMissed]);
 
-  const handleAdd = (newJob: CronJob) => {
-    setJobs((prev) => [newJob, ...prev]);
+  const handleCreate = async (draft: CronJobDraft) => {
+    if (createPending.current) return;
+    createPending.current = true;
+    setCreating(true);
+    try {
+      const job = await invoke<CronJob>('add_cron_job', {
+        name: draft.name,
+        schedule: draft.schedule,
+        prompt: draft.prompt,
+        agentId: draft.agentId,
+      });
+      setJobs((prev) => [job, ...prev]);
+      setCreateError(false);
+      setShowAddForm(false);
+      success(`Cron job "${job.name}" created successfully.`, 'Cron Job Added');
+    } catch {
+      setCreateError(true);
+    } finally {
+      createPending.current = false;
+      setCreating(false);
+    }
+  };
+
+  const handleToggleAddForm = () => {
+    if (createPending.current) return;
+    setCreateError(false);
+    setShowAddForm((current) => !current);
+  };
+
+  const handleCancelAdd = () => {
+    if (createPending.current) return;
+    setCreateError(false);
     setShowAddForm(false);
   };
 
@@ -1007,7 +1070,8 @@ export default function CronView() {
               </motion.button>
             )}
             <motion.button
-              onClick={() => setShowAddForm(!showAddForm)}
+              onClick={handleToggleAddForm}
+              disabled={creating}
               className={cn(
                 'px-3 py-1.5 text-xs font-mono rounded-lg border transition-all duration-150',
                 showAddForm
@@ -1156,7 +1220,12 @@ export default function CronView() {
             transition={{ duration: 0.2 }}
             className="mb-4 overflow-hidden"
           >
-            <AddJobForm onAdd={handleAdd} onCancel={() => setShowAddForm(false)} />
+            <AddJobForm
+              onCreate={handleCreate}
+              onCancel={handleCancelAdd}
+              creating={creating}
+              createError={createError}
+            />
           </motion.div>
         )}
       </AnimatePresence>
