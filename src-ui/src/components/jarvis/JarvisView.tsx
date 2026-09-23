@@ -247,6 +247,8 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
             type="button"
             onClick={() => { setActiveSession(null); setSubView('chat'); }}
             aria-label="New chat"
+            aria-pressed={activeSession === null}
+            aria-current={activeSession === null ? 'true' : undefined}
             className={cn(
               'shrink-0 px-2 py-0.5 rounded-md text-[10px] font-mono border transition-colors',
               'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50',
@@ -265,6 +267,8 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
                 key={s.id}
                 type="button"
                 onClick={() => { setActiveSession(s.id); setSubView('chat'); }}
+                aria-pressed={selected}
+                aria-current={selected ? 'true' : undefined}
                 className={cn(
                   'shrink-0 px-2 py-0.5 rounded-md text-[10px] font-mono border transition-colors max-w-[160px] truncate',
                   'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50',
@@ -2776,36 +2780,46 @@ function SessionsPanel({
               onClick={() => onSelect(session.id)}
             >
               <div className="flex items-center gap-3">
-                <StatusDot ok={activeSession === session.id} size="sm" />
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 mb-0.5">
-                    <span className="text-sm font-semibold text-bone truncate">{session.name || session.title || 'Untitled'}</span>
-                    <Pill>{session.model}</Pill>
-                  </div>
-                  <div className="text-[11px] font-mono text-bone-faint">
-                    {session.message_count} msgs · {new Date(session.created_at).toLocaleDateString()}
-                    {sessionRuns[session.id] && (
-                      <span className="ml-2">
-                        ·{' '}
-                        <span
-                          className={cn(
-                            sessionRuns[session.id]!.outcome === 'success' && 'text-emerald-400',
-                            sessionRuns[session.id]!.outcome === 'partial' && 'text-amber-400',
-                            sessionRuns[session.id]!.outcome === 'failed' && 'text-error',
-                            sessionRuns[session.id]!.outcome === 'timed_out' && 'text-amber-400',
-                            sessionRuns[session.id]!.outcome === 'cancelled' && 'text-bone-dim',
-                          )}
-                        >
-                          {sessionRuns[session.id]!.outcome}
-                        </span>
-                        {sessionRuns[session.id]!.selected_model && (
-                          <span className="ml-1 text-bone-faint">({sessionRuns[session.id]!.selected_model})</span>
-                        )}
-                      </span>
-                    )}
-                  </div>
-                </div>
                 <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); onSelect(session.id); }}
+                  aria-label={`Select session ${session.name || session.title || session.id}`}
+                  aria-pressed={activeSession === session.id}
+                  aria-current={activeSession === session.id ? 'true' : undefined}
+                  className="flex min-w-0 flex-1 items-center gap-3 rounded-lg text-left cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
+                >
+                  <StatusDot ok={activeSession === session.id} size="sm" />
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-0.5">
+                      <span className="text-sm font-semibold text-bone truncate">{session.name || session.title || 'Untitled'}</span>
+                      <Pill>{session.model}</Pill>
+                    </div>
+                    <div className="text-[11px] font-mono text-bone-faint">
+                      {session.message_count} msgs · {new Date(session.created_at).toLocaleDateString()}
+                      {sessionRuns[session.id] && (
+                        <span className="ml-2">
+                          ·{' '}
+                          <span
+                            className={cn(
+                              sessionRuns[session.id]!.outcome === 'success' && 'text-emerald-400',
+                              sessionRuns[session.id]!.outcome === 'partial' && 'text-amber-400',
+                              sessionRuns[session.id]!.outcome === 'failed' && 'text-error',
+                              sessionRuns[session.id]!.outcome === 'timed_out' && 'text-amber-400',
+                              sessionRuns[session.id]!.outcome === 'cancelled' && 'text-bone-dim',
+                            )}
+                          >
+                            {sessionRuns[session.id]!.outcome}
+                          </span>
+                          {sessionRuns[session.id]!.selected_model && (
+                            <span className="ml-1 text-bone-faint">({sessionRuns[session.id]!.selected_model})</span>
+                          )}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                </button>
+                <button
+                  type="button"
                   onClick={(e) => handleDelete(session.id, e)}
                   aria-label={`Delete session ${session.name || session.title || session.id}`}
                   className="text-bone-faint hover:text-error text-xs font-mono transition-colors shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-error/50 rounded px-1"
