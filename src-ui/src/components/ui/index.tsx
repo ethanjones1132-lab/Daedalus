@@ -1,5 +1,5 @@
 import { motion, AnimatePresence, type Variants } from 'framer-motion';
-import { Component as ReactComponent, ReactNode, useEffect, useState, useCallback, useMemo, createContext, useContext } from 'react';
+import { Component as ReactComponent, ReactNode, useEffect, useState, useCallback, useMemo, useRef, createContext, useContext } from 'react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
@@ -478,22 +478,42 @@ export function useToast(): ToastContextValue {
   return ctx;
 }
 
+function isPersistentToast(toast: Pick<Toast, 'variant' | 'action'>) {
+  return toast.variant === 'warn' || toast.variant === 'error' || Boolean(toast.action);
+}
+
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const dismissedIds = useRef(new Set<number>());
+  const timers = useRef(new Map<number, ReturnType<typeof setTimeout>>());
 
   const dismiss = useCallback((id: number) => {
+    if (dismissedIds.current.has(id)) return;
+    dismissedIds.current.add(id);
+    const timer = timers.current.get(id);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timers.current.delete(id);
+    }
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
 
-  // Single stable notifier. Its identity (and the memoized `value` below) must NOT
-  // change across renders: App.tsx lists `warn`/`error` in effect deps, so unstable
-  // identities re-run that effect every render and re-fire toasts in a feedback loop.
+  useEffect(() => {
+    return () => {
+      timers.current.forEach((timer) => clearTimeout(timer));
+      timers.current.clear();
+    };
+  }, []);
+
   const notify = useCallback(
     (variant: ToastVariant, message: string, title?: string, _options?: unknown, action?: ToastAction) => {
       const id = Date.now() + Math.random();
-      setToasts((prev) => [...prev, { id, message, title, variant, action }]);
-      // Auto-dismiss after 4s.
-      setTimeout(() => dismiss(id), 4000);
+      const toast = { id, message, title, variant, action };
+      setToasts((prev) => [...prev, toast]);
+      if (!isPersistentToast(toast)) {
+        const timer = setTimeout(() => dismiss(id), 4000);
+        timers.current.set(id, timer);
+      }
     },
     [dismiss],
   );
@@ -508,41 +528,73 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     [notify],
   );
 
+  const renderToasts = (items: Toast[]) => (
+    <AnimatePresence>
+      {items.map((t) => {
+        const assertive = t.variant === 'warn' || t.variant === 'error';
+        return (
+          <motion.div
+            key={t.id}
+            role={assertive ? 'alert' : 'status'}
+            aria-live={assertive ? 'assertive' : 'polite'}
+            aria-atomic="true"
+            initial={{ opacity: 0, y: 16 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 8, transition: { duration: 0 } }}
+            className={cn(
+              'pointer-events-auto rounded-xl border px-3 py-2 text-sm shadow-lg backdrop-blur',
+              t.variant === 'success' && 'bg-emerald-500/10 border-emerald-500/30 text-emerald-100',
+              t.variant === 'error' && 'bg-red-500/10 border-red-500/30 text-red-100',
+              t.variant === 'warn' && 'bg-amber-500/10 border-amber-500/30 text-amber-100',
+              t.variant === 'info' && 'bg-cyan-500/10 border-cyan-500/30 text-cyan-100',
+            )}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                {t.title && <div className="text-xs font-semibold opacity-80 mb-0.5">{t.title}</div>}
+                <div>{t.message}</div>
+              </div>
+              <button
+                type="button"
+                aria-label="Dismiss notification"
+                onClick={() => dismiss(t.id)}
+                className="shrink-0 text-xs leading-none opacity-70 hover:opacity-100"
+              >
+                <span aria-hidden="true">×</span>
+              </button>
+            </div>
+            {t.action && (
+              <button
+                type="button"
+                onClick={() => {
+                  if (dismissedIds.current.has(t.id)) return;
+                  try {
+                    t.action?.onClick();
+                  } finally {
+                    dismiss(t.id);
+                  }
+                }}
+                className="mt-2 text-xs font-medium underline underline-offset-2 hover:opacity-80 transition-opacity"
+              >
+                {t.action.label}
+              </button>
+            )}
+          </motion.div>
+        );
+      })}
+    </AnimatePresence>
+  );
+
   return (
     <ToastContext.Provider value={value}>
       {children}
       <div className="pointer-events-none fixed bottom-4 right-4 z-50 flex flex-col gap-2 max-w-sm">
-        <AnimatePresence>
-          {toasts.map((t) => (
-            <motion.div
-              key={t.id}
-              initial={{ opacity: 0, y: 16 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 8 }}
-              className={cn(
-                'pointer-events-auto rounded-xl border px-3 py-2 text-sm shadow-lg backdrop-blur',
-                t.variant === 'success' && 'bg-emerald-500/10 border-emerald-500/30 text-emerald-100',
-                t.variant === 'error' && 'bg-red-500/10 border-red-500/30 text-red-100',
-                t.variant === 'warn' && 'bg-amber-500/10 border-amber-500/30 text-amber-100',
-                t.variant === 'info' && 'bg-cyan-500/10 border-cyan-500/30 text-cyan-100',
-              )}
-            >
-              {t.title && <div className="text-xs font-semibold opacity-80 mb-0.5">{t.title}</div>}
-              <div>{t.message}</div>
-              {t.action && (
-                <button
-                  onClick={() => {
-                    t.action?.onClick();
-                    dismiss(t.id);
-                  }}
-                  className="mt-2 text-xs font-medium underline underline-offset-2 hover:opacity-80 transition-opacity"
-                >
-                  {t.action.label}
-                </button>
-              )}
-            </motion.div>
-          ))}
-        </AnimatePresence>
+        <div aria-live="polite" aria-atomic="false" className="flex flex-col gap-2">
+          {renderToasts(toasts.filter((t) => t.variant === 'info' || t.variant === 'success'))}
+        </div>
+        <div aria-live="assertive" aria-atomic="false" className="flex flex-col gap-2">
+          {renderToasts(toasts.filter((t) => t.variant === 'warn' || t.variant === 'error'))}
+        </div>
       </div>
     </ToastContext.Provider>
   );
