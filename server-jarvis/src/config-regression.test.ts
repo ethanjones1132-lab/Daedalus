@@ -51,13 +51,16 @@ describe("configuration regression coverage retained during Task 6", () => {
   });
 
   test("blank provider fields cannot erase usable defaults", () => {
+    // normalizeConfig treats api_key length < 10 as blank and may fill from
+    // OPENROUTER_API_KEY / OPENCODE_* env. Use a ≥10-char placeholder so this
+    // contract pins blank URL/model healing without ambient-secret interference.
     const cfg = normalizeConfig({
       active_backend: "openrouter",
-      openrouter: { api_key: "test-key", base_url: "", model: "" },
+      openrouter: { api_key: "test-key-ok", base_url: "", model: "" },
     });
     expect(cfg.openrouter.base_url).toBe(defaultConfig().openrouter.base_url);
     expect(cfg.openrouter.model).toBe(defaultConfig().openrouter.model);
-    expect(cfg.openrouter.api_key).toBe("test-key");
+    expect(cfg.openrouter.api_key).toBe("test-key-ok");
   });
 
   test("normalizes approval and orchestrator safety defaults", () => {
@@ -124,8 +127,13 @@ describe("configuration regression coverage retained during Task 6", () => {
     expect(overridden.check_timeout_ms).toBe(15_000);
 
     // Round-trip serialization preserves prepare flags without inventing secrets.
+    // Pin ≥10-char non-secret placeholders so ambient OPENROUTER/OPENCODE env
+    // keys (length gate in normalizeConfig) cannot leak into the snapshot.
     const roundTrip = normalizeConfig(JSON.parse(JSON.stringify({
       orchestrator: { verification: overridden },
+      openrouter: { api_key: "test-placeholder-key" },
+      opencode_zen: { api_key: "test-placeholder-key" },
+      opencode_go: { api_key: "test-placeholder-key" },
     })));
     expect(roundTrip.orchestrator.verification.prepare_cmake).toBe(false);
     expect(roundTrip.orchestrator.verification.prepare_timeout_ms).toBe(5_000);
