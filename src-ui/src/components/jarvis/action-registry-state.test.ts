@@ -33,4 +33,14 @@ describe('action registry snapshot state', () => {
     expect(reduceRegistryState(loaded, { type: 'success', requestId: 1, snapshot: 'old' })).toBe(loaded);
     expect(reduceRegistryState(loaded, { type: 'failure', requestId: 1 })).toBe(loaded);
   });
+
+  it('invalidates an in-flight read without erasing a confirmed snapshot', () => {
+    const snapshot = { summary: 1, active: ['one'], blocked: [] };
+    const loaded = reduceRegistryState(
+      reduceRegistryState(initialRegistryState<typeof snapshot>(), { type: 'pending', requestId: 1 }),
+      { type: 'success', requestId: 1, snapshot },
+    );
+    const invalidated = reduceRegistryState(loaded, { type: 'invalidate', requestId: 2 });
+    expect(invalidated).toEqual({ snapshot, loading: false, error: false, requestId: 2 });
+  });
 });

@@ -1,6 +1,14 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { initialRegistryState, reduceRegistryState } from './action-registry-state';
+import {
+  registryMutationConfirmed,
+  registryMutationLocked,
+  startRegistryMutation,
+  transitionRegistryMutation,
+  type RegistryMutation,
+  type RegistryMutationKind,
+} from './action-registry-mutation-state';
 import { motion } from 'framer-motion';
 import {
   PageTransition,
@@ -84,17 +92,54 @@ interface RegistrySnapshot {
   blocked: RegistryAction[];
 }
 
+type RegistryReadResult =
+  | { status: 'success'; requestId: number; snapshot: RegistrySnapshot }
+  | { status: 'failure' | 'stale' };
+
+function mutationStatusText(mutation: RegistryMutation): string {
+  if (mutation.phase === 'reconciling') return 'Action registry write saved. Reconciling the confirmed snapshot…';
+  if (mutation.kind === 'sync') return 'Syncing action registry…';
+  if (mutation.kind === 'approve') return 'Approving action…';
+  if (mutation.kind === 'waive') return 'Waiving action…';
+  return 'Dispatching action…';
+}
+
+function mutationFailureText(mutation: RegistryMutation): string {
+  if (mutation.kind === 'sync') return 'Could not sync the action registry. Previous snapshot was kept.';
+  if (mutation.kind === 'dispatch') return 'Could not dispatch the action. Previous snapshot was kept.';
+  return `Could not ${mutation.kind === 'approve' ? 'approve' : 'waive'} the action. Previous snapshot was kept.`;
+}
+
+function mutationReadFailureText(mutation: RegistryMutation): string {
+  if (mutation.kind === 'sync') return 'Action registry sync was saved, but the confirmed snapshot could not be reconciled. Showing the previous snapshot; it may be stale.';
+  return 'The action registry write was saved, but the confirmed snapshot could not be reconciled. Showing the previous snapshot; it may be stale.';
+}
+
+function mutationSuccessText(mutation: RegistryMutation): string {
+  if (mutation.kind === 'sync') return 'Action registry synced from live adapters.';
+  if (mutation.kind === 'approve') return 'Action approved successfully.';
+  if (mutation.kind === 'waive') return 'Action waived successfully.';
+  return 'Action dispatched and verified.';
+}
+
 export default function ActionRegistryView() {
   const [state, dispatch] = useReducer(reduceRegistryState<RegistrySnapshot>, initialRegistryState<RegistrySnapshot>());
   const requestId = useRef(0);
+  const mutationRef = useRef<RegistryMutation | null>(null);
+  const [mutation, setMutation] = useState<RegistryMutation | null>(null);
   const { snapshot, loading, error } = state;
   const summary = snapshot?.summary;
   const active = snapshot?.active ?? [];
   const blocked = snapshot?.blocked ?? [];
-  const [syncing, setSyncing] = useState(false);
-  const { success, error: toastError } = useToast();
+  const mutationLocked = registryMutationLocked(mutation);
+  const { success } = useToast();
+  const publishMutation = useCallback((next: RegistryMutation | null) => {
+    mutationRef.current = next;
+    setMutation(next);
+  }, []);
 
-  const fetchData = useCallback(async () => {
+  const readSnapshot = useCallback(async (options?: { duringMutation?: boolean; suppressError?: boolean }): Promise<RegistryReadResult> => {
+    if (!options?.duringMutation && registryMutationLocked(mutationRef.current)) return { status: 'stale' };
     const id = ++requestId.current;
     dispatch({ type: 'pending', requestId: id });
     try {
@@ -103,14 +148,25 @@ export default function ActionRegistryView() {
         invoke<ActionRegistryBucket>('get_action_registry_bucket', { bucket: 'active' }),
         invoke<ActionRegistryBucket>('get_action_registry_bucket', { bucket: 'blocked' }),
       ]);
-      dispatch({
-        type: 'success', requestId: id,
+      if (id !== requestId.current) return { status: 'stale' };
+      return {
+        status: 'success',
+        requestId: id,
         snapshot: { summary: summaryData, active: activeData.actions, blocked: blockedData.actions },
-      });
+      };
     } catch {
-      dispatch({ type: 'failure', requestId: id });
+      if (id !== requestId.current) return { status: 'stale' };
+      dispatch({ type: options?.suppressError ? 'invalidate' : 'failure', requestId: id });
+      return { status: 'failure' };
     }
   }, []);
+
+  const fetchData = useCallback(async () => {
+    const result = await readSnapshot();
+    if (result.status !== 'success') return false;
+    dispatch({ type: 'success', requestId: result.requestId, snapshot: result.snapshot });
+    return true;
+  }, [readSnapshot]);
 
   useEffect(() => {
     void fetchData();
@@ -118,38 +174,90 @@ export default function ActionRegistryView() {
     return () => clearInterval(interval);
   }, [fetchData]);
 
-  const handleSync = async () => {
-    setSyncing(true);
-    try {
-      await invoke('sync_action_registry');
-      success('Action registry synced from live adapters.', 'Registry Synced');
-      await fetchData();
-    } catch (e) {
-      toastError(`Sync failed: ${e}`, 'Registry Sync Error');
-    } finally {
-      setSyncing(false);
+  const reconcileMutation = useCallback(async (operation: RegistryMutation) => {
+    const result = await readSnapshot({ duringMutation: true, suppressError: true });
+    if (result.status !== 'success') {
+      const next = transitionRegistryMutation(operation, 'read-failed');
+      if (next) publishMutation(next);
+      return;
     }
-  };
+    if (!registryMutationConfirmed(operation, result.snapshot)) {
+      dispatch({ type: 'invalidate', requestId: result.requestId });
+      publishMutation(transitionRegistryMutation(operation, 'read-failed'));
+      return;
+    }
+    dispatch({ type: 'success', requestId: result.requestId, snapshot: result.snapshot });
+    publishMutation(null);
+    success(mutationSuccessText(operation), operation.kind === 'sync' ? 'Registry Synced' : 'Action Updated');
+  }, [publishMutation, readSnapshot, success]);
 
-  const handleUpdateApproval = async (id: string, status: 'approved' | 'waived') => {
+  const handleMutation = useCallback(async (kind: RegistryMutationKind, id?: string) => {
+    if (registryMutationLocked(mutationRef.current)) return;
+    if (kind !== 'sync' && id === undefined) return;
+    if (kind === 'dispatch' && !active.some(action => action.id === id)) return;
+    const operation = startRegistryMutation(kind, id);
+    publishMutation(operation);
+    const invalidationId = ++requestId.current;
+    dispatch({ type: 'invalidate', requestId: invalidationId });
     try {
-      await invoke('update_action_approval', { actionId: id, status });
-      success(`Action ${status === 'approved' ? 'approved' : 'waived'} successfully.`, 'Action Updated');
-      await fetchData();
-    } catch (e) {
-      toastError(`Failed to update action: ${e}`, 'Update Error');
+      if (kind === 'sync') {
+        const result = await invoke<unknown>('sync_action_registry');
+        if (result === false || result == null) throw new Error('Sync was not confirmed');
+      } else if (kind === 'approve' || kind === 'waive') {
+        const result = await invoke<boolean>('update_action_approval', {
+          actionId: id,
+          status: kind === 'approve' ? 'approved' : 'waived',
+        });
+        if (result !== true) throw new Error('Approval was not confirmed');
+      } else {
+        const result = await invoke<unknown>('dispatch_action', { actionId: id });
+        if (result === false || result == null) throw new Error('Dispatch was not confirmed');
+      }
+    } catch {
+      publishMutation(transitionRegistryMutation(operation, 'write-failed'));
+      return;
     }
-  };
+    const reconciling = transitionRegistryMutation(operation, 'write-succeeded');
+    if (reconciling) {
+      publishMutation(reconciling);
+      await reconcileMutation(reconciling);
+    }
+  }, [active, publishMutation, reconcileMutation]);
 
-  const handleDispatch = async (id: string) => {
-    try {
-      await invoke('dispatch_action', { actionId: id });
-      success('Action dispatched and verified.', 'Action Dispatched');
-      await fetchData();
-    } catch (e) {
-      toastError(`Failed to dispatch action: ${e}`, 'Dispatch Error');
+  const retryMutation = useCallback(() => {
+    const operation = mutationRef.current;
+    if (!operation) return;
+    if (operation.phase === 'write-failed') {
+      void handleMutation(operation.kind, operation.id);
+      return;
     }
-  };
+    if (operation.phase === 'read-failed') {
+      const retrying = transitionRegistryMutation(operation, 'retry-read');
+      if (retrying) {
+        publishMutation(retrying);
+        void reconcileMutation(retrying);
+      }
+    }
+  }, [handleMutation, publishMutation, reconcileMutation]);
+
+
+  const mutationFeedback = mutation ? (
+    mutation.phase === 'write-failed' ? (
+      <div role="alert" aria-label="Action registry mutation" className="text-sm text-red-200">
+        {mutationFailureText(mutation)}{' '}
+        <button type="button" className="underline" onClick={retryMutation}>Retry</button>
+      </div>
+    ) : mutation.phase === 'read-failed' ? (
+      <div role="alert" aria-label="Action registry mutation" className="text-sm text-red-200">
+        {mutationReadFailureText(mutation)}{' '}
+        <button type="button" className="underline" onClick={retryMutation}>Retry</button>
+      </div>
+    ) : (
+      <div role="status" aria-label="Action registry mutation" className="text-sm text-bone/60">
+        {mutationStatusText(mutation)}
+      </div>
+    )
+  ) : null;
 
   const resourceFeedback = (
     <>
@@ -168,7 +276,7 @@ export default function ActionRegistryView() {
       <button
         type="button"
         onClick={() => void fetchData()}
-        disabled={loading}
+        disabled={loading || mutationLocked}
         className="mb-4 px-3 py-1 text-xs rounded-md bg-white/5 hover:bg-white/10 transition-colors disabled:opacity-50"
       >
         {error ? 'Retry' : 'Refresh'}
@@ -188,14 +296,15 @@ export default function ActionRegistryView() {
         />
         <button
           type="button"
-          onClick={() => void handleSync()}
-          disabled={syncing}
+          onClick={() => void handleMutation('sync')}
+          disabled={mutationLocked}
           className="px-4 py-2 text-xs font-mono uppercase tracking-wider rounded-lg border border-royal/40 text-royal-light hover:bg-royal/10 transition-colors disabled:opacity-50"
         >
-          {syncing ? 'Syncing…' : 'Sync Adapters'}
+          {mutation?.kind === 'sync' && mutation.phase === 'writing' ? 'Syncing…' : 'Sync Adapters'}
         </button>
       </div>
 
+      {mutationFeedback}
       {resourceFeedback}
 
       {summary && (
@@ -222,9 +331,11 @@ export default function ActionRegistryView() {
                 <ActionCard
                   key={action.id}
                   action={action}
-                  onApprove={(id) => void handleUpdateApproval(id, 'approved')}
-                  onWaive={(id) => void handleUpdateApproval(id, 'waived')}
-                  onDispatch={(id) => void handleDispatch(id)}
+                  bucket="active"
+                  disabled={mutationLocked}
+                  onApprove={(id) => void handleMutation('approve', id)}
+                  onWaive={(id) => void handleMutation('waive', id)}
+                  onDispatch={(id) => void handleMutation('dispatch', id)}
                 />
               ))}
             </AnimatedList>
@@ -243,9 +354,11 @@ export default function ActionRegistryView() {
                 <ActionCard
                   key={action.id}
                   action={action}
-                  onApprove={(id) => void handleUpdateApproval(id, 'approved')}
-                  onWaive={(id) => void handleUpdateApproval(id, 'waived')}
-                  onDispatch={(id) => void handleDispatch(id)}
+                  bucket="blocked"
+                  disabled={mutationLocked}
+                  onApprove={(id) => void handleMutation('approve', id)}
+                  onWaive={(id) => void handleMutation('waive', id)}
+                  onDispatch={(id) => void handleMutation('dispatch', id)}
                 />
               ))}
             </AnimatedList>
@@ -258,16 +371,20 @@ export default function ActionRegistryView() {
 
 function ActionCard({
   action,
+  bucket,
+  disabled,
   onApprove,
   onWaive,
   onDispatch,
 }: {
   action: RegistryAction;
+  bucket: 'active' | 'blocked';
+  disabled: boolean;
   onApprove: (id: string) => void;
   onWaive: (id: string) => void;
   onDispatch: (id: string) => void;
 }) {
-  const canDispatch = action.status !== 'done' &&
+  const canDispatch = bucket === 'active' && action.status !== 'done' &&
     (!action.approval_required || action.approval_status === 'approved' || action.approval_status === 'waived');
 
   return (
@@ -311,15 +428,19 @@ function ActionCard({
               <div className="flex items-center gap-2 mt-3">
                 <button
                   type="button"
+                  aria-label={`Approve ${action.title}`}
+                  disabled={disabled}
                   onClick={() => onApprove(action.id)}
-                  className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider rounded border border-success/30 bg-success/5 text-success-light hover:bg-success/15 transition-all duration-150 cursor-pointer"
+                  className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider rounded border border-success/30 bg-success/5 text-success-light hover:bg-success/15 transition-all duration-150 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   ✓ Approve
                 </button>
                 <button
                   type="button"
+                  aria-label={`Waive ${action.title}`}
+                  disabled={disabled}
                   onClick={() => onWaive(action.id)}
-                  className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider rounded border border-iron/30 bg-iron/5 text-bone-dim hover:bg-iron/15 transition-all duration-150 cursor-pointer"
+                  className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider rounded border border-iron/30 bg-iron/5 text-bone-dim hover:bg-iron/15 transition-all duration-150 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   Waive
                 </button>
@@ -329,8 +450,10 @@ function ActionCard({
               <div className="flex items-center gap-2 mt-3">
                 <button
                   type="button"
+                  aria-label={`Dispatch ${action.title}`}
+                  disabled={disabled}
                   onClick={() => onDispatch(action.id)}
-                  className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider rounded border border-cyan-neon/30 bg-cyan-neon/5 text-cyan-glow hover:bg-cyan-neon/15 transition-all duration-150 cursor-pointer"
+                  className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider rounded border border-cyan-neon/30 bg-cyan-neon/5 text-cyan-glow hover:bg-cyan-neon/15 transition-all duration-150 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   ▶ Dispatch
                 </button>

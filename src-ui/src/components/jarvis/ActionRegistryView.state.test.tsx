@@ -41,7 +41,7 @@ beforeEach(() => {
     }
     if (command === 'get_action_registry_bucket' && args?.bucket === 'active') return current.active.promise;
     if (command === 'get_action_registry_bucket' && args?.bucket === 'blocked') return current.blocked.promise;
-    if (command === 'sync_action_registry') return Promise.resolve();
+    if (command === 'sync_action_registry') return Promise.resolve({});
     throw new Error(`Unexpected command: ${command}`);
   });
 });
