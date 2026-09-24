@@ -5,6 +5,7 @@ import { resetLearnedPoolStateForTests } from "./learned-pool-state";
 import { getPolicyVersionStore, resetPolicyStagingForTests } from "./policy-staging";
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
 import { hashInstruction } from "../orchestration/worker-prompt";
+import { defaultConfig } from "../config";
 
 const TEST_DB = ":memory:";
 
@@ -122,6 +123,45 @@ describe("Conductor learning (Phase 4)", () => {
     expect(synth.stop_reason).toBe("provider_cut");
     expect(synth.partial_error_code).toBe("stream_cut");
     expect(store.getAgentPerformance("debug").some((r) => r.agent_id === sampleAgent.id)).toBe(true);
+  });
+
+  test("legacy invalid retention cannot erase prior snapshots on completion", () => {
+    const store = new SelfTuningStore(TEST_DB);
+    const learning = defaultConfig().orchestrator.conductor_learning;
+    const loop = new ConductorLearningLoop(store, {
+      ...learning,
+      max_trajectory_snapshots: -1,
+    });
+    store.insertAgentRun({
+      id: "run_retention_completion",
+      session_id: "session_retention_completion",
+      user_request: "retain prior trajectory",
+      task_type: "general",
+      pipeline: JSON.stringify(["synthesizer"]),
+      completed: 1,
+    });
+
+    loop.completeRun({
+      conductorRunId: "missing_conductor_run",
+      agentRunId: "run_retention_completion",
+      sessionId: "session_retention_completion",
+      taskType: "general",
+      route: {
+        task_type: "general",
+        pipeline: ["synthesizer"],
+        topology: "linear",
+        context: { needs_workspace_inspection: false, needs_memory: false, estimated_complexity: "low" },
+        coordinator_rationale: "retain the trajectory",
+      },
+      runOutcome: "success",
+      instructionVariants: { variants: {} },
+      stageRuns: [],
+      modelAttributions: [],
+      durationMs: 1,
+      userRequest: "retain prior trajectory",
+    });
+
+    expect(store.getTrajectorySnapshots(10)).toHaveLength(1);
   });
 
   test("B1: recordRouting persists turn requirement on routing_json", () => {

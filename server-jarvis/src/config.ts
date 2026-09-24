@@ -5,11 +5,17 @@
 // Loaded by both the Bun HTTP server and the Rust backend.
 
 import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync } from "fs";
-import { join, resolve } from "path";
+import { dirname, join, resolve } from "path";
 import { homedir } from "os";
 import { execSync } from "child_process";
 import { DEFAULT_ORCHESTRATOR_AGENTS, type OrchestratorAgent } from "./orchestration/agent-pool";
 import { validateOrchestratorAgents } from "./orchestration/agent-validation";
+import {
+  DEFAULT_MAX_TRAJECTORY_SNAPSHOTS,
+  invalidTrajectoryRetentionMessage,
+  isValidTrajectoryRetention,
+  normalizeTrajectoryRetention,
+} from "./self-tuning/trajectory-retention";
 
 // ── Types ──
 
@@ -709,7 +715,7 @@ export function defaultConfig(): JarvisConfig {
         capability_adjustment_step: 0.03,
         trajectory_export: true,
         instruction_ab_epsilon: 0.15,
-        max_trajectory_snapshots: 500,
+        max_trajectory_snapshots: DEFAULT_MAX_TRAJECTORY_SNAPSHOTS,
         maxLearningIterations: 100,
       },
       skill_distillation: {
@@ -820,6 +826,7 @@ Workspace: \`/home/ethan/.openclaw/agents/coderclaw/workspace/home-base\`.
 export interface NormalizeConfigOptions {
   platform?: NodeJS.Platform;
   exists?: (path: string) => boolean;
+  healInvalidTrajectorySnapshots?: boolean;
 }
 
 /** True when a configured jarvis_path is unusable on this platform. */
@@ -875,6 +882,13 @@ export function ensureDelegateFloorTools(configured: readonly string[] | undefin
 
 export function normalizeConfig(raw: any, options: NormalizeConfigOptions = {}): JarvisConfig {
   const merged = deepMerge(defaultConfig(), raw);
+  const configuredTrajectoryRetention = merged.orchestrator?.conductor_learning?.max_trajectory_snapshots;
+  if (!isValidTrajectoryRetention(configuredTrajectoryRetention)) {
+    if (options.healInvalidTrajectorySnapshots !== false) {
+      console.warn(invalidTrajectoryRetentionMessage(configuredTrajectoryRetention, "Config"));
+      merged.orchestrator.conductor_learning.max_trajectory_snapshots = normalizeTrajectoryRetention(configuredTrajectoryRetention);
+    }
+  }
   // Stock Claude delegation must not silently fall back to a blank/implicit
   // model. Preserve an explicitly configured model, but migrate old blank
   // configs to the Anthropic-native OpenCode Go primary (point-to-point).
@@ -992,6 +1006,8 @@ export interface SaveConfigOptions {
    * intermediate partial state.
    */
   validate?: boolean;
+  currentConfig?: JarvisConfig;
+  configFile?: string;
 }
 
 export interface SaveConfigResult {
@@ -1004,8 +1020,10 @@ export function saveConfig(
   options: SaveConfigOptions = {},
 ): JarvisConfig {
   const validate = options.validate !== false;
-  const current = loadConfig();
-  const merged = normalizeConfig(deepMerge(current, partial));
+  const current = options.currentConfig ?? loadConfig();
+  const merged = normalizeConfig(deepMerge(current, partial), {
+    healInvalidTrajectorySnapshots: options.validate === false,
+  });
   const validation = validateConfig(merged);
   for (const warning of validation.warnings) {
     console.warn(`[Config] saveConfig warning: ${warning}`);
@@ -1013,8 +1031,9 @@ export function saveConfig(
   if (validate && !validation.valid) {
     throw new InvalidConfigError(validation);
   }
-  mkdirSync(CONFIG_DIR, { recursive: true });
-  writeFileSync(CONFIG_FILE, JSON.stringify(merged, null, 2), "utf-8");
+  const targetFile = options.configFile ?? CONFIG_FILE;
+  mkdirSync(dirname(targetFile), { recursive: true });
+  writeFileSync(targetFile, JSON.stringify(merged, null, 2), "utf-8");
   configCache = merged;
   configCacheTime = Date.now();
   return merged;
@@ -1098,6 +1117,9 @@ export function validateConfig(cfg: JarvisConfig): ConfigValidation {
   }
   if (cfg.max_tokens < 1 || cfg.max_tokens > 131072) {
     warnings.push("max_tokens outside typical range (1-131072)");
+  }
+  if (!isValidTrajectoryRetention(cfg.orchestrator?.conductor_learning?.max_trajectory_snapshots)) {
+    errors.push("orchestrator.conductor_learning.max_trajectory_snapshots must be a finite positive integer");
   }
 
   // T3.1: WARN-level orchestrator agent pool validation (existing configs keep booting).

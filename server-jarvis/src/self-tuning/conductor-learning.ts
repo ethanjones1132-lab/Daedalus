@@ -27,6 +27,7 @@ import {
   type TransitionResult,
 } from "./policy-staging";
 import { runWithPolicyOverlay } from "./learned-pool-state";
+import { DEFAULT_MAX_TRAJECTORY_SNAPSHOTS } from "./trajectory-retention";
 import { hashInstruction, type InstructionVariantSelection } from "../orchestration/worker-prompt";
 
 export interface RoutingRecordInput {
@@ -86,7 +87,7 @@ export class ConductorLearningLoop {
       capability_adjustment_step: 0.03,
       trajectory_export: true,
       instruction_ab_epsilon: 0.15,
-      max_trajectory_snapshots: 500,
+      max_trajectory_snapshots: DEFAULT_MAX_TRAJECTORY_SNAPSHOTS,
       maxLearningIterations: 100,
     },
   ) {}

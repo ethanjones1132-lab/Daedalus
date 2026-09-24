@@ -3,6 +3,11 @@ import { existsSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
 import { homedir } from "os";
 import { execSync } from "child_process";
+import {
+  invalidTrajectoryRetentionMessage,
+  isValidTrajectoryRetention,
+  normalizeTrajectoryRetention,
+} from "./trajectory-retention";
 
 export interface AgentRun {
   id: string;
@@ -1218,12 +1223,17 @@ export class SelfTuningStore {
   }
 
   pruneTrajectorySnapshots(maxRows: number): void {
+    let effectiveMaxRows = maxRows;
+    if (!isValidTrajectoryRetention(effectiveMaxRows)) {
+      console.warn(invalidTrajectoryRetentionMessage(effectiveMaxRows, "SelfTuningStore"));
+      effectiveMaxRows = normalizeTrajectoryRetention(effectiveMaxRows);
+    }
     const db = this.getDb();
     if (!db) return;
     try {
       const count = (db.query("SELECT COUNT(*) as c FROM trajectory_snapshots").get() as { c: number }).c;
-      if (count <= maxRows) return;
-      const excess = count - maxRows;
+      if (count <= effectiveMaxRows) return;
+      const excess = count - effectiveMaxRows;
       db.prepare(
         `DELETE FROM trajectory_snapshots WHERE id IN (
           SELECT id FROM trajectory_snapshots ORDER BY created_at ASC LIMIT ?

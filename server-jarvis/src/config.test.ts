@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { defaultConfig, normalizeConfig, normalizeSettingMutation } from "./config";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+import { InvalidConfigError, defaultConfig, normalizeConfig, normalizeSettingMutation, saveConfig, validateConfig } from "./config";
 
 describe("normalizeSettingMutation", () => {
   test("rejects an unknown key", () => {
@@ -28,6 +31,67 @@ describe("review repair budget", () => {
     expect(normalizeConfig({ orchestrator: { max_review_repair_rounds: 99 } }).orchestrator.max_review_repair_rounds).toBe(2);
     expect(normalizeConfig({ orchestrator: { max_review_repair_rounds: -3 } }).orchestrator.max_review_repair_rounds).toBe(0);
     expect(normalizeConfig({ orchestrator: { max_review_repair_rounds: "not-a-number" } }).orchestrator.max_review_repair_rounds).toBe(1);
+  });
+});
+
+describe("trajectory snapshot retention config", () => {
+  test.each([-1, 0, 1.5, Number.NaN, Number.POSITIVE_INFINITY])("rejects invalid limit %p", (limit) => {
+    const cfg = normalizeConfig(
+      { orchestrator: { conductor_learning: { max_trajectory_snapshots: limit } } },
+      { healInvalidTrajectorySnapshots: false },
+    );
+    const validation = validateConfig(cfg);
+    expect(validation.valid).toBe(false);
+    expect(validation.errors.some((error) => error.includes("max_trajectory_snapshots"))).toBe(true);
+  });
+
+  test("heals legacy invalid values to the documented default", () => {
+    const originalWarn = console.warn;
+    const warnings: string[] = [];
+    console.warn = (...args: unknown[]) => { warnings.push(String(args[0])); };
+    try {
+      const cfg = normalizeConfig({
+        orchestrator: { conductor_learning: { max_trajectory_snapshots: -1 } },
+      });
+      expect(cfg.orchestrator.conductor_learning.max_trajectory_snapshots).toBe(500);
+      expect(warnings.some((warning) => warning.includes("max_trajectory_snapshots"))).toBe(true);
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  test("accepts finite positive integer limits", () => {
+    for (const limit of [1, 500, 10_000]) {
+      const cfg = normalizeConfig(
+        { orchestrator: { conductor_learning: { max_trajectory_snapshots: limit } } },
+        { healInvalidTrajectorySnapshots: false },
+      );
+      expect(validateConfig(cfg).valid).toBe(true);
+    }
+  });
+
+  test("rejects an invalid save without replacing the existing config", () => {
+    const dir = mkdtempSync(join(tmpdir(), "jarvis-config-retention-"));
+    const file = join(dir, "config.json");
+    const before = JSON.stringify(defaultConfig(), null, 2);
+    writeFileSync(file, before);
+    let thrown: unknown;
+    let after: string | null = null;
+    try {
+      saveConfig(
+        {
+          orchestrator: { conductor_learning: { max_trajectory_snapshots: -1 } },
+        } as any,
+        { currentConfig: defaultConfig(), configFile: file },
+      );
+    } catch (error) {
+      thrown = error;
+    } finally {
+      after = readFileSync(file, "utf8");
+      rmSync(dir, { recursive: true, force: true });
+    }
+    expect(thrown).toBeInstanceOf(InvalidConfigError);
+    expect(after).toBe(before);
   });
 });
 

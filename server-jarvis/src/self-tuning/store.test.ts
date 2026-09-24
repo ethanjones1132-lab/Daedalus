@@ -265,6 +265,78 @@ describe("SelfTuningStore delegate write scoreboard", () => {
   });
 });
 
+describe("SelfTuningStore trajectory retention", () => {
+  function withStore(fn: (store: SelfTuningStore, path: string) => void): void {
+    const dir = mkdtempSync(join(tmpdir(), "jarvis-trajectory-retention-"));
+    const path = join(dir, "self-tuning.db");
+    try {
+      fn(new SelfTuningStore(path), path);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  function seedTrajectories(store: SelfTuningStore, count: number): void {
+    store.insertAgentRun({
+      id: "run-trajectory-retention",
+      session_id: "session-trajectory-retention",
+      user_request: "retain trajectories",
+      task_type: "general",
+      pipeline: "[]",
+      completed: 1,
+    });
+    for (let index = 0; index < count; index++) {
+      store.insertTrajectorySnapshot({
+        id: `trajectory-${index}`,
+        agent_run_id: "run-trajectory-retention",
+        session_id: "session-trajectory-retention",
+        snapshot_json: JSON.stringify({ index }),
+      });
+    }
+  }
+
+  function setCreatedAt(path: string, id: string, createdAt: string): void {
+    const db = new Database(path);
+    db.query("UPDATE trajectory_snapshots SET created_at = ? WHERE id = ?").run(createdAt, id);
+    db.close();
+  }
+
+  test.each([-1, Number.NaN, Number.POSITIVE_INFINITY])("keeps existing rows for invalid limit %p", (limit) => {
+    withStore((store) => {
+      seedTrajectories(store, 3);
+      store.pruneTrajectorySnapshots(limit);
+      expect(store.getTrajectorySnapshots(10)).toHaveLength(3);
+    });
+  });
+
+  test("retains a single row at a one-row boundary", () => {
+    withStore((store) => {
+      seedTrajectories(store, 1);
+      store.pruneTrajectorySnapshots(1);
+      expect(store.getTrajectorySnapshots(10)).toHaveLength(1);
+    });
+  });
+
+  test("retains every row at an exact cap", () => {
+    withStore((store) => {
+      seedTrajectories(store, 3);
+      store.pruneTrajectorySnapshots(3);
+      expect(store.getTrajectorySnapshots(10)).toHaveLength(3);
+    });
+  });
+
+  test("prunes oldest rows beyond the cap", () => {
+    withStore((store, path) => {
+      seedTrajectories(store, 3);
+      setCreatedAt(path, "trajectory-0", "2026-01-01T00:00:00.000Z");
+      setCreatedAt(path, "trajectory-1", "2026-01-02T00:00:00.000Z");
+      setCreatedAt(path, "trajectory-2", "2026-01-03T00:00:00.000Z");
+      store.pruneTrajectorySnapshots(1);
+      expect(store.getTrajectorySnapshots(10).map((row) => row.id)).toEqual(["trajectory-2"]);
+    });
+  });
+});
+
 describe("SelfTuningStore conductor outcome summaries", () => {
   test("aggregates recent task and pipeline outcomes in SQLite", () => {
     const store = new SelfTuningStore(":memory:");
