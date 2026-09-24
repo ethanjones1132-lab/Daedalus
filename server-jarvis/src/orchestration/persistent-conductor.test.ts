@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, rmSync } from "fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import {
@@ -50,6 +50,22 @@ function mockOllamaChat(responses: string[]) {
         message: { role: "assistant", content },
         done: true,
       });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+}
+
+function mockOllamaChatCapture(
+  chatBodies: Array<{ messages: Array<{ role: string; content: string }> }>,
+  content = '{"task_type":"general","pipeline":["synthesizer"],"topology":"linear","context":{"needs_workspace_inspection":false,"needs_memory":true,"estimated_complexity":"low"},"coordinator_rationale":"captured"}',
+) {
+  (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+    if (url.endsWith("/api/ps")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+    if (url.endsWith("/api/chat")) {
+      chatBodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return Response.json({ message: { role: "assistant", content } });
     }
     throw new Error(`Unexpected fetch: ${url}`);
   };
@@ -1056,6 +1072,159 @@ describe("PersistentConductor", () => {
     expect(chatBodies[0].messages.length).toBe(2);
     expect(chatBodies[1].messages.length).toBe(4);
     expect(chatBodies[2].messages.length).toBe(6);
+  });
+
+  test("rebuilds the conductor system prefix when the active prompt changes", async () => {
+    const promptDir = mkdtempSync(join(tmpdir(), "jarvis-conductor-prompts-"));
+    const previousPromptsDir = process.env.JARVIS_PROMPTS_DIR;
+    const chatBodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    mockOllamaChatCapture(chatBodies);
+
+    try {
+      process.env.JARVIS_PROMPTS_DIR = promptDir;
+      const promptPath = join(promptDir, "coordinator.md");
+      writeFileSync(promptPath, "COORDINATOR_PROMPT_A");
+      const cfg = makeConfig({ persist_sessions: false, kv_persist: false });
+      const conductor = new PersistentConductor(() => cfg);
+
+      const first = await conductor.routeTurn({ sessionId: "prompt-change", request: "first", turnNumber: 1 });
+      const firstHash = conductor.getSessionState("prompt-change")?.systemPromptHash;
+      expect(first.cacheHit).toBe(false);
+      expect(firstHash).toBeDefined();
+
+      writeFileSync(promptPath, "COORDINATOR_PROMPT_B");
+      const rebuilt = await conductor.routeTurn({
+        sessionId: "prompt-change",
+        request: "second",
+        turnNumber: 2,
+        lastOutcome: "success",
+      });
+      const warm = await conductor.routeTurn({
+        sessionId: "prompt-change",
+        request: "third",
+        turnNumber: 3,
+        lastOutcome: "success",
+      });
+
+      expect(rebuilt.cacheHit).toBe(false);
+      expect(rebuilt.kvGeneration).toBe(2);
+      expect(rebuilt.prefixTokensRecomputed).toBeGreaterThan(0);
+      expect(warm.cacheHit).toBe(true);
+      expect(warm.kvGeneration).toBe(3);
+      expect(warm.prefixTokensRecomputed).toBe(0);
+      expect(chatBodies.map((body) => body.messages.filter((message) => message.role === "system").map((message) => message.content))).toEqual([
+        ["COORDINATOR_PROMPT_A"],
+        ["COORDINATOR_PROMPT_B"],
+        ["COORDINATOR_PROMPT_B"],
+      ]);
+      expect(conductor.getSessionState("prompt-change")?.systemPromptHash).not.toBe(firstHash);
+    } finally {
+      if (previousPromptsDir === undefined) delete process.env.JARVIS_PROMPTS_DIR;
+      else process.env.JARVIS_PROMPTS_DIR = previousPromptsDir;
+      rmSync(promptDir, { recursive: true, force: true });
+    }
+  });
+
+  test("rebuilds a changed prompt after reloading persisted Conductor state", async () => {
+    const promptDir = mkdtempSync(join(tmpdir(), "jarvis-conductor-prompts-"));
+    const sessionsRoot = mkdtempSync(join(tmpdir(), "jarvis-conductor-sessions-"));
+    const previousPromptsDir = process.env.JARVIS_PROMPTS_DIR;
+    const chatBodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    mockOllamaChatCapture(chatBodies);
+
+    try {
+      process.env.JARVIS_PROMPTS_DIR = promptDir;
+      const promptPath = join(promptDir, "coordinator.md");
+      writeFileSync(promptPath, "COORDINATOR_PROMPT_A");
+      const cfg = makeConfig({ persist_sessions: true, kv_persist: true });
+      const conductorA = new PersistentConductor(() => cfg, sessionsRoot);
+      await conductorA.routeTurn({ sessionId: "restart-change", request: "first", turnNumber: 1 });
+
+      writeFileSync(promptPath, "COORDINATOR_PROMPT_B");
+      const conductorB = new PersistentConductor(() => cfg, sessionsRoot);
+      expect(conductorB.getSessionState("restart-change")).toBeUndefined();
+      const rebuilt = await conductorB.routeTurn({
+        sessionId: "restart-change",
+        request: "second",
+        turnNumber: 2,
+        lastOutcome: "success",
+      });
+      const warm = await conductorB.routeTurn({
+        sessionId: "restart-change",
+        request: "third",
+        turnNumber: 3,
+        lastOutcome: "success",
+      });
+
+      expect(rebuilt.cacheHit).toBe(false);
+      expect(rebuilt.kvGeneration).toBe(2);
+      expect(warm.cacheHit).toBe(true);
+      expect(warm.kvGeneration).toBe(3);
+      expect(chatBodies.map((body) => body.messages.filter((message) => message.role === "system").map((message) => message.content))).toEqual([
+        ["COORDINATOR_PROMPT_A"],
+        ["COORDINATOR_PROMPT_B"],
+        ["COORDINATOR_PROMPT_B"],
+      ]);
+    } finally {
+      if (previousPromptsDir === undefined) delete process.env.JARVIS_PROMPTS_DIR;
+      else process.env.JARVIS_PROMPTS_DIR = previousPromptsDir;
+      rmSync(promptDir, { recursive: true, force: true });
+      rmSync(sessionsRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("rebuilds a legacy persisted prefix when its prompt hash is missing", async () => {
+    const promptDir = mkdtempSync(join(tmpdir(), "jarvis-conductor-prompts-"));
+    const sessionsRoot = mkdtempSync(join(tmpdir(), "jarvis-conductor-sessions-"));
+    const previousPromptsDir = process.env.JARVIS_PROMPTS_DIR;
+    const chatBodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    mockOllamaChatCapture(chatBodies);
+
+    try {
+      process.env.JARVIS_PROMPTS_DIR = promptDir;
+      const promptPath = join(promptDir, "coordinator.md");
+      writeFileSync(promptPath, "COORDINATOR_PROMPT_A");
+      const cfg = makeConfig({ persist_sessions: true, kv_persist: true });
+      const conductorA = new PersistentConductor(() => cfg, sessionsRoot);
+      await conductorA.routeTurn({ sessionId: "legacy-change", request: "first", turnNumber: 1 });
+
+      const persistedPath = join(sessionsRoot, "conductor", "legacy-change.json");
+      const persisted = JSON.parse(readFileSync(persistedPath, "utf-8")) as Record<string, unknown>;
+      delete persisted.systemPromptHash;
+      writeFileSync(persistedPath, JSON.stringify(persisted, null, 2), "utf-8");
+
+      writeFileSync(promptPath, "COORDINATOR_PROMPT_B");
+      const conductorB = new PersistentConductor(() => cfg, sessionsRoot);
+      const rebuilt = await conductorB.routeTurn({
+        sessionId: "legacy-change",
+        request: "second",
+        turnNumber: 2,
+        lastOutcome: "success",
+      });
+      const warm = await conductorB.routeTurn({
+        sessionId: "legacy-change",
+        request: "third",
+        turnNumber: 3,
+        lastOutcome: "success",
+      });
+
+      expect(rebuilt.cacheHit).toBe(false);
+      expect(rebuilt.kvGeneration).toBe(2);
+      expect(rebuilt.prefixTokensRecomputed).toBeGreaterThan(0);
+      expect(warm.cacheHit).toBe(true);
+      expect(warm.kvGeneration).toBe(3);
+      expect(chatBodies.map((body) => body.messages.filter((message) => message.role === "system").map((message) => message.content))).toEqual([
+        ["COORDINATOR_PROMPT_A"],
+        ["COORDINATOR_PROMPT_B"],
+        ["COORDINATOR_PROMPT_B"],
+      ]);
+      expect(conductorB.getSessionState("legacy-change")?.systemPromptHash).toBeDefined();
+    } finally {
+      if (previousPromptsDir === undefined) delete process.env.JARVIS_PROMPTS_DIR;
+      else process.env.JARVIS_PROMPTS_DIR = previousPromptsDir;
+      rmSync(promptDir, { recursive: true, force: true });
+      rmSync(sessionsRoot, { recursive: true, force: true });
+    }
   });
 
   describe("D4: KV-safe conductor skill hint (organism loop v1)", () => {

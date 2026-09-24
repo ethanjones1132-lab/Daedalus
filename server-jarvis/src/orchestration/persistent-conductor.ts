@@ -651,7 +651,7 @@ export class PersistentConductor {
     const systemHash = hashText(systemPrompt);
 
     const hadSystem = session.messages.some((m) => m.role === "system");
-    const rebuiltPrefix = !hadSystem || session.apiFallbackUsed;
+    const rebuiltPrefix = !hadSystem || session.apiFallbackUsed || session.systemPromptHash !== systemHash;
     if (rebuiltPrefix) {
       const existingSystemIdx = session.messages.findIndex((m) => m.role === "system");
       if (existingSystemIdx >= 0) {
