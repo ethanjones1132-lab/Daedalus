@@ -44,6 +44,12 @@ import {
   type ToolCallState,
 } from './chat-state';
 import { errorDisplayForCode } from './error-display';
+import {
+  classifyStreamTermination,
+  STREAM_INCOMPLETE_CODE,
+  STREAM_INCOMPLETE_MESSAGE,
+  type StreamTerminalFrame,
+} from './stream-lifecycle';
 import { formatSessionStatsLine, shouldShowSessionStats } from './session-stats';
 import { filterSessions, formatFilterResultCount } from './session-filter';
 import {
@@ -1168,6 +1174,7 @@ export function ChatPanel({
       cancelledReason?: string;
       partialOutput?: string;
     } = { tokenCount: 0, toolCount: 0 };
+    let terminalFrame: StreamTerminalFrame = null;
     const TIMEOUT_CODES = new Set([
       'stage_timeout', 'first_token_timeout', 'stream_idle_timeout',
       'visible_progress_timeout', 'turn_deadline_exceeded',
@@ -1359,6 +1366,7 @@ export function ChatPanel({
       }
       if (isPassiveSseFrame(frame.type)) return;
       if (frame.type === 'result') {
+        terminalFrame = 'result';
         // Mirror runner.rs map_terminal_outcome: is_error wins, then
         // stage_timeout, then the subtype's own vocabulary.
         const subtype = typeof frame.subtype === 'string' ? frame.subtype : 'success';
@@ -1383,6 +1391,7 @@ export function ChatPanel({
         return;
       }
       if (frame.type === 'error') {
+        terminalFrame = 'error';
         // P0-B (2026-07-02): the `code` field discriminates the failure
         // mode. `first_token_timeout` means the model hung and was
         // terminated by the server-side watchdog; surface a clearer
@@ -1402,6 +1411,7 @@ export function ChatPanel({
         throw new JarvisStreamError(String(frame.error || 'Jarvis stream failed.'), code);
       }
       if (frame.type === 'cancelled') {
+        terminalFrame = 'cancelled';
         // P0-B (2026-07-02): `cancelled` is now reserved for genuine user
         // / `/chat/cancel` aborts (the server-side fix prevents a hung
         // model from emitting this). Previously the UI had no handler for
@@ -1481,6 +1491,17 @@ export function ChatPanel({
             }
           }
         }
+      }
+      const termination = classifyStreamTermination({
+        terminalFrame,
+        inactivityTimedOut,
+        aborted: controller.signal.aborted,
+        stopRequested: stopRequestedRef.current,
+      });
+      if (termination === 'unterminated') {
+        runAcc.outcome = 'failed';
+        runAcc.partialOutput = streamedRawText || undefined;
+        throw new JarvisStreamError(STREAM_INCOMPLETE_MESSAGE, STREAM_INCOMPLETE_CODE);
       }
     } catch (error) {
       if (inactivityTimedOut) {

@@ -53,6 +53,11 @@ const DISPLAY_BY_CODE: Record<string, ErrorDisplay> = {
     pillVariant: 'warn',
     hint: 'The model kept producing hidden reasoning but never surfaced an answer. Try again — the router can pick a different model.',
   },
+  stream_incomplete: {
+    label: 'incomplete',
+    pillVariant: 'warn',
+    hint: 'The stream ended before a terminal result. Retry the turn.',
+  },
 };
 
 const FALLBACK: ErrorDisplay = {

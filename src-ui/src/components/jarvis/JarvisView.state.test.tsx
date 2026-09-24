@@ -1,6 +1,9 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import JarvisView, { ChatPanel } from './JarvisView';
+import {
+  STREAM_INCOMPLETE_MESSAGE,
+} from './stream-lifecycle';
 
 const { invokeMock, listenMock } = vi.hoisted(() => ({
   invokeMock: vi.fn(),
@@ -168,6 +171,72 @@ describe('ChatPanel state machine', () => {
     const metrics = await screen.findByLabelText('Orchestration run metrics');
     expect(metrics).toHaveTextContent('OpenCode Zen · deepseek-v4-flash-free');
     expect(metrics).toHaveTextContent('TTFT 3.2s');
+  });
+
+  it('keeps an unterminated partial response visibly incomplete and recoverable', async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(stream, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    })));
+    render(<ChatPanel {...props} />);
+    const composer = await screen.findByLabelText('Chat input') as HTMLTextAreaElement;
+
+    fireEvent.change(composer, { target: { value: 'inspect the workspace' } });
+    fireEvent.keyDown(composer, { key: 'Enter' });
+    await screen.findByRole('status', { name: 'Session turn progress' });
+    await act(async () => {
+      controller.enqueue(new TextEncoder().encode('data: {"type":"stream_event","delta":{"text":"Partial answer"}}\n\n'));
+    });
+    await waitFor(() => expect(screen.getByText('Partial answer')).toBeInTheDocument());
+    await act(async () => { controller.close(); });
+
+    await waitFor(() => expect(screen.getAllByText(STREAM_INCOMPLETE_MESSAGE).length).toBeGreaterThan(0));
+    expect(screen.getByText('incomplete')).toBeInTheDocument();
+    expect(composer).toHaveValue('inspect the workspace');
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('record_terminal_run', expect.objectContaining({
+      outcome: 'failed',
+      partialOutput: 'Partial answer',
+    })));
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(0);
+  });
+
+  it('distinguishes an empty unterminated stream from an authoritative empty result', async () => {
+    let incompleteController!: ReadableStreamDefaultController<Uint8Array>;
+    const incompleteStream = new ReadableStream<Uint8Array>({ start(value) { incompleteController = value; } });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(incompleteStream, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    })));
+    const first = render(<ChatPanel {...props} />);
+    const firstComposer = await screen.findByLabelText('Chat input') as HTMLTextAreaElement;
+    fireEvent.change(firstComposer, { target: { value: 'empty incomplete turn' } });
+    fireEvent.keyDown(firstComposer, { key: 'Enter' });
+    await screen.findByRole('status', { name: 'Session turn progress' });
+    await act(async () => { incompleteController.close(); });
+
+    await waitFor(() => expect(screen.getAllByText(STREAM_INCOMPLETE_MESSAGE).length).toBeGreaterThan(0));
+    expect(firstComposer).toHaveValue('empty incomplete turn');
+    first.unmount();
+
+    let successController!: ReadableStreamDefaultController<Uint8Array>;
+    const successStream = new ReadableStream<Uint8Array>({ start(value) { successController = value; } });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(successStream, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    })));
+    render(<ChatPanel {...props} />);
+    const secondComposer = await screen.findByLabelText('Chat input') as HTMLTextAreaElement;
+    fireEvent.change(secondComposer, { target: { value: 'empty successful turn' } });
+    fireEvent.keyDown(secondComposer, { key: 'Enter' });
+    await screen.findByRole('status', { name: 'Session turn progress' });
+    await act(async () => {
+      successController.enqueue(new TextEncoder().encode('data: {"type":"result","result":""}\n\n'));
+      successController.close();
+    });
+
+    await waitFor(() => expect(screen.queryByRole('status', { name: 'Session turn progress' })).not.toBeInTheDocument());
+    expect(screen.queryByText(STREAM_INCOMPLETE_MESSAGE)).not.toBeInTheDocument();
+    expect(screen.queryByText('incomplete')).not.toBeInTheDocument();
+    expect(secondComposer).toHaveValue('');
   });
 });
 
