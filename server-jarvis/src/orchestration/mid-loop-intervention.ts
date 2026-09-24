@@ -249,6 +249,7 @@ export function buildMidLoopToolEvidence(
     readIdentityKey?: (call: Pick<ToolCallRecord, "name" | "arguments">) => string;
     /** Task target set shared with evaluateEffectGate (optional). */
     targetPaths?: readonly string[];
+    workspaceRoot?: string;
   } = {},
 ): Pick<
   MidLoopSignal,
@@ -289,9 +290,17 @@ export function buildMidLoopToolEvidence(
       if (call.is_error) {
         failedWriteAttempts += 1;
       } else {
-        const creditPaths = paths.filter((path) => countsTowardWriteEffect(path, targetPaths));
+        const creditPaths = paths.filter((path) => countsTowardWriteEffect(
+          path,
+          targetPaths,
+          { workspaceRoot: opts.workspaceRoot },
+        ));
         const unpathedOk = paths.length === 0
-          && countsTowardWriteEffect(undefined, targetPaths);
+          && countsTowardWriteEffect(
+            undefined,
+            targetPaths,
+            { workspaceRoot: opts.workspaceRoot },
+          );
         if (creditPaths.length > 0 || unpathedOk) {
           successfulWrites += 1;
           for (const path of creditPaths) {

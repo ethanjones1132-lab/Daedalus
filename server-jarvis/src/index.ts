@@ -3250,6 +3250,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           sharedContext: mergedSharedContext,
           sessionMemory: sessionMemory,
           sessionGrants: activeTaskRun.sessionGrants,
+          workspaceRoot: activeWorkspacePath,
           // F6 latency: a low-complexity turn's synthesis does not need the
           // strongest (slowest) synthesizer — route it to the cheap/fast tier
           // like trivial short-circuits and workspace reads already do. Medium/
@@ -3517,6 +3518,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           effects: result.writeEffects ?? [],
           toolCalls: result.toolCalls ?? [],
           targetPaths: rewardTargetPaths,
+          workspaceRoot: activeWorkspacePath,
           check: result.checkResult
             ? {
               tier: result.checkResult.tier,

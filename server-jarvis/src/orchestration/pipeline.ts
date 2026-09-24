@@ -26,6 +26,7 @@ import type { ConductorBus, ConductorDirective } from "./conductor-bus";
 import type { ConductorStageEvidence, LiveConductor } from "./conductor";
 import { buildSynthesizerContext, buildSynthesizerContextFromStageState } from "./synth-context";
 import { detectDeferralStall, DEFERRAL_STALL_NUDGE } from "./synthesizer-deferral";
+import { resolveWorkspacePathIdentity } from "./path-identity";
 import {
   applyEffectGate,
   buildWriteEffectNudge,
@@ -112,7 +113,7 @@ import { BASELINE_THETA, policy } from "./orchestration-policy";
 import { safePath } from "../fs-scope";
 import { hasFileBeenRead, markFileRead, unmarkFileRead } from "../fs-read-cache";
 import { promises as fsPromises } from "fs";
-import { join, posix, win32 } from "path";
+import { join } from "path";
 import { canApplyConductorReroute, rejectReroute } from "./reroute-policy";
 import {
   activePlanItemText,
@@ -143,7 +144,7 @@ import {
   isPlanDocumentPath,
   requestedPlanGroupFromMessage,
 } from "./task-plan-discovery";
-import { normalizePathInput, resolveAllowedRoots } from "../fs-scope";
+import { resolveAllowedRoots } from "../fs-scope";
 import {
   ClaudeDelegateAvailabilityCache,
   DelegateHealth,
@@ -293,6 +294,7 @@ export interface PipelineExecuteOptions {
   sessionMemory?: SessionMemory;
   /** Absolute filesystem roots granted by raw user messages for this Session. */
   sessionGrants?: string[];
+  workspaceRoot?: string;
   /** Promoted distilled skills block for planner/executor injection. */
   distilledSkillsBlock?: string;
   /**
@@ -460,26 +462,6 @@ export interface ToolCallIdentityOptions {
   platform?: NodeJS.Platform;
 }
 
-function normalizePathIdentity(pathValue: string, workspaceRoot: string, platform: NodeJS.Platform): string {
-  const pathApi = platform === "win32" ? win32 : posix;
-  const normalizeSeparators = (value: string) => platform === "win32"
-    ? value.replace(/\//g, "\\")
-    : value.replace(/\\/g, "/");
-  // Keep identity semantics aligned with the Tool runtime: under WSL/Linux,
-  // Windows drive input is first translated to /mnt/<drive>/... before the
-  // path is resolved. This is identity-only; original tool arguments remain
-  // untouched for runtime execution.
-  const root = normalizeSeparators(normalizePathInput(workspaceRoot, platform));
-  const candidate = normalizeSeparators(normalizePathInput(pathValue, platform));
-  const resolved = pathApi.isAbsolute(candidate)
-    ? pathApi.normalize(candidate)
-    : pathApi.resolve(root, candidate);
-  const normalized = pathApi.normalize(resolved);
-  return platform === "win32"
-    ? normalized.replace(/\//g, "\\").toLowerCase()
-    : normalized.replace(/\\/g, "/");
-}
-
 /**
  * Stable accounting identity for a tool call. Normalizes path-bearing argument
  * *keys* (file_path → path) and values; drops pagination args so a re-read of
@@ -495,7 +477,7 @@ export function toolCallIdentityKey(
     const canonKey = canonicalIdentityArgKey(key);
     if (IDENTITY_IGNORED_ARGUMENT_KEYS.has(canonKey)) continue;
     const identityValue = typeof value === "string" && PATH_LIKE_ARGUMENT_KEYS.has(key.toLowerCase())
-      ? normalizePathIdentity(value, workspaceRoot, platform)
+      ? resolveWorkspacePathIdentity(value, { workspaceRoot, platform }) ?? value
       : value;
     // Prefer first-seen when both path and file_path appear (should be rare).
     if (canonKey in identityArguments) continue;
@@ -2060,7 +2042,11 @@ export class PipelineExecutor {
         (call) =>
           !call.is_error
           && WRITE_EFFECT_TOOLS.has(call.name)
-          && countsTowardWriteEffect(toolCallWritePath(call), effectGateTargetPaths),
+          && countsTowardWriteEffect(
+            toolCallWritePath(call),
+            effectGateTargetPaths,
+            { workspaceRoot: options.workspaceRoot || this.activeWorkspaceRoot() },
+          ),
       ).length;
     const deepReadRequest = resolveDeepReadIntent(intentText, options.taskRunDepth);
     const executorPrompt = stageSystemPrompt(
@@ -2208,6 +2194,7 @@ export class PipelineExecutor {
         // W5: same target set as evaluateEffectGate — status/off-target writes
         // must not inflate mid-loop successfulWrites and silence force_write.
         targetPaths: effectGateTargetPaths,
+        workspaceRoot: options.workspaceRoot || this.activeWorkspaceRoot(),
       });
       const { totalSuccessfulReads, ...midLoopEvidence } = evidence;
       const base: MidLoopSignal = {
@@ -2343,7 +2330,11 @@ export class PipelineExecutor {
         (call) =>
           !call.is_error
           && WRITE_EFFECT_TOOLS.has(call.name)
-          && countsTowardWriteEffect(toolCallWritePath(call), effectGateTargetPaths),
+          && countsTowardWriteEffect(
+            toolCallWritePath(call),
+            effectGateTargetPaths,
+            { workspaceRoot: options.workspaceRoot || this.activeWorkspaceRoot() },
+          ),
       ).length;
       const writeLanded = extras.writeLandedSinceLastCheck
         ?? writes > midLoopLastSuccessfulWrites;
@@ -3606,6 +3597,7 @@ export class PipelineExecutor {
             toolCalls,
             requiresWriteEffect,
             effectGateTargetPaths,
+            { workspaceRoot: options.workspaceRoot || this.activeWorkspaceRoot() },
           );
           if (repeatedWriteFailureReached) {
             executorDone = true;
@@ -5340,6 +5332,7 @@ export class PipelineExecutor {
         assumeWriteIntent: options.taskRunWriteIntent,
         contentEffects: this.ctx.write_effects,
         targetPaths: effectGateTargetPaths,
+        workspaceRoot: args.options.workspaceRoot || this.activeWorkspaceRoot(),
       });
       return { finished: { state, effectGate, partialStage }, partialStage };
     }
@@ -5404,6 +5397,7 @@ export class PipelineExecutor {
     const state: PipelineStageState = { ...carry };
     const profile: ExecutionProfile = options.executionProfile ?? "full";
     const intentText = options.rawMessage ?? request;
+    const workspaceRoot = options.workspaceRoot || this.activeWorkspaceRoot();
     const requiresWorkspaceEvidence = turnNeedsWorkspaceEvidence(options.turnRequirement, intentText);
     // W5: scope write-effect gate credit to plan/request targets when known.
     const effectGateTargetPaths = resolveTaskTargetPaths({
@@ -5656,6 +5650,7 @@ export class PipelineExecutor {
             assumeWriteIntent: options.taskRunWriteIntent,
             contentEffects: this.ctx.write_effects,
             targetPaths: effectGateTargetPaths,
+            workspaceRoot,
           });
           const gateFailure = candidateSyntax.length > 0
             || candidateRun.issues.length > 0
@@ -6007,6 +6002,7 @@ export class PipelineExecutor {
       assumeWriteIntent: options.taskRunWriteIntent,
       contentEffects: this.ctx.write_effects,
       targetPaths: effectGateTargetPaths,
+      workspaceRoot,
     });
     if (
       effectGate.verdict === "no_write_effect" &&
@@ -6039,6 +6035,7 @@ export class PipelineExecutor {
         assumeWriteIntent: options.taskRunWriteIntent,
         contentEffects: this.ctx.write_effects,
         targetPaths: effectGateTargetPaths,
+        workspaceRoot,
       });
       if (state.rewriter.terminalStatus === "timed_out") {
         partialStage = { stage: "rewriter", errorCode: state.rewriter.errorCode ?? "stage_timeout" };
@@ -6244,6 +6241,7 @@ export class PipelineExecutor {
             request: options.rawMessage ?? request,
             planTexts: collectPlanTargetTexts(options.taskRunContract, state.plan ? renderPlanSummary(state.plan) : undefined),
           }),
+          workspaceRoot: options.workspaceRoot || this.activeWorkspaceRoot(),
         }),
       );
       // Structural honesty: a failed independent check cannot remain success.
@@ -6305,6 +6303,7 @@ export class PipelineExecutor {
           request: options.rawMessage ?? request,
           planTexts: collectPlanTargetTexts(options.taskRunContract, state.plan ? renderPlanSummary(state.plan) : undefined),
         }),
+        workspaceRoot: options.workspaceRoot || this.activeWorkspaceRoot(),
       }),
     ));
     // Structural honesty: refuse success when the independent check already failed.

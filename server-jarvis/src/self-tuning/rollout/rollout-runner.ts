@@ -250,6 +250,7 @@ export async function runOneRollout(
             rawMessage: request,
             taskRunWriteIntent: true,
             turnRequirement: "full_execution",
+            workspaceRoot: workspace,
           },
         ),
       ),
@@ -279,6 +280,7 @@ export async function runOneRollout(
       effects: result.writeEffects ?? [],
       check: gradedCheck ?? result.checkResult ?? null,
       targetPaths,
+      workspaceRoot: workspace,
       // Every fixture is a code-fix task, so a rollout that lands no verified
       // content change must score zero rather than coast on a clean check.
       writeRequired: true,

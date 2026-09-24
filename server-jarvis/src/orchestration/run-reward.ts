@@ -70,7 +70,12 @@ export type DeclaredRunOutcome =
   | "partial"
   | "cancelled";
 
-export interface RunRewardWriteEvidence {
+export interface RunRewardPathOptions {
+  workspaceRoot?: string;
+  pathPlatform?: NodeJS.Platform;
+}
+
+export interface RunRewardWriteEvidence extends RunRewardPathOptions {
   changedPaths: string[];
   targetPaths?: string[];
   writeRequired: boolean;
@@ -117,7 +122,7 @@ export interface RunRewardBreakdown {
  * Minimal offline snapshot — everything needed to recompute reward from a
  * stored run without re-executing tools or calling a model.
  */
-export interface StoredRunRewardSnapshot {
+export interface StoredRunRewardSnapshot extends RunRewardPathOptions {
   writeRequired: boolean;
   changedPaths: string[];
   targetPaths?: string[];
@@ -145,13 +150,15 @@ function clamp01(n: number): number {
  */
 export function writeEvidenceFromEffects(
   effects: readonly WriteEffectObservation[],
-  opts: { targetPaths?: string[]; writeRequired: boolean },
+  opts: { targetPaths?: string[]; writeRequired: boolean; workspaceRoot?: string; pathPlatform?: NodeJS.Platform },
 ): RunRewardWriteEvidence {
   const changedPaths = effects.filter((e) => e.changed).map((e) => e.path);
   return {
     changedPaths,
     targetPaths: opts.targetPaths,
     writeRequired: opts.writeRequired,
+    workspaceRoot: opts.workspaceRoot,
+    pathPlatform: opts.pathPlatform,
   };
 }
 
@@ -164,7 +171,7 @@ export function writeEvidenceFromToolCalls(
     is_error?: boolean;
     arguments?: Record<string, unknown>;
   }>,
-  opts: { targetPaths?: string[]; writeRequired: boolean },
+  opts: { targetPaths?: string[]; writeRequired: boolean; workspaceRoot?: string; pathPlatform?: NodeJS.Platform },
 ): RunRewardWriteEvidence {
   const changedPaths: string[] = [];
   for (const call of toolCalls) {
@@ -177,6 +184,8 @@ export function writeEvidenceFromToolCalls(
     changedPaths,
     targetPaths: opts.targetPaths,
     writeRequired: opts.writeRequired,
+    workspaceRoot: opts.workspaceRoot,
+    pathPlatform: opts.pathPlatform,
   };
 }
 
@@ -211,7 +220,10 @@ function computeWriteTerm(writes: RunRewardWriteEvidence): {
 
   // B2: same filter as effect-gate — targets win; else status/log denylist.
   const credited = writes.changedPaths.filter((path) =>
-    countsTowardWriteEffect(path, targetOpt),
+    countsTowardWriteEffect(path, targetOpt, {
+      workspaceRoot: writes.workspaceRoot,
+      platform: writes.pathPlatform,
+    }),
   );
 
   if (credited.length === 0 && writes.changedPaths.length > 0) {
@@ -397,6 +409,8 @@ export function computeRunRewardFromStored(
       changedPaths: snapshot.changedPaths,
       targetPaths: snapshot.targetPaths,
       writeRequired: snapshot.writeRequired,
+      workspaceRoot: snapshot.workspaceRoot,
+      pathPlatform: snapshot.pathPlatform,
     },
     check: snapshot.check,
     plan: snapshot.plan,
@@ -411,11 +425,15 @@ export function computeRunRewardFromEffects(input: {
   targetPaths?: string[];
   writeRequired: boolean;
   declaredOutcome?: DeclaredRunOutcome | null;
+  workspaceRoot?: string;
+  pathPlatform?: NodeJS.Platform;
 }): RunRewardBreakdown {
   return computeRunReward({
     writes: writeEvidenceFromEffects(input.effects, {
       targetPaths: input.targetPaths,
       writeRequired: input.writeRequired,
+      workspaceRoot: input.workspaceRoot,
+      pathPlatform: input.pathPlatform,
     }),
     check: input.check,
     plan: input.plan,
@@ -438,21 +456,29 @@ export function buildStoredRunRewardSnapshot(input: {
   check: RunRewardInput["check"];
   plan?: RunRewardPlanEvidence | null;
   declaredOutcome?: DeclaredRunOutcome | null;
+  workspaceRoot?: string;
+  pathPlatform?: NodeJS.Platform;
 }): StoredRunRewardSnapshot {
   const writes =
     input.effects && input.effects.length > 0
       ? writeEvidenceFromEffects(input.effects, {
         targetPaths: input.targetPaths,
         writeRequired: input.writeRequired,
+        workspaceRoot: input.workspaceRoot,
+        pathPlatform: input.pathPlatform,
       })
       : writeEvidenceFromToolCalls(input.toolCalls ?? [], {
         targetPaths: input.targetPaths,
         writeRequired: input.writeRequired,
+        workspaceRoot: input.workspaceRoot,
+        pathPlatform: input.pathPlatform,
       });
   return {
     writeRequired: input.writeRequired,
     changedPaths: writes.changedPaths,
     targetPaths: input.targetPaths,
+    workspaceRoot: input.workspaceRoot,
+    pathPlatform: input.pathPlatform,
     check: input.check,
     plan: input.plan ?? null,
     declaredOutcome: input.declaredOutcome ?? null,

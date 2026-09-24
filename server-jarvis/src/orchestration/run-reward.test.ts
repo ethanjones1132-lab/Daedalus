@@ -132,6 +132,36 @@ describe("B2 anti-gaming", () => {
     expect(r.terms.writes).toBe(0);
   });
 
+  test("target-scoped reward rejects a same-basename write from another directory", () => {
+    const r = computeRunReward({
+      writes: {
+        changedPaths: ["other/src/app.ts"],
+        targetPaths: ["src/app.ts"],
+        workspaceRoot: "/workspace/project",
+        writeRequired: true,
+      },
+      check: { tier: "existing", ran: true, passed: true },
+      plan: null,
+    });
+    expect(r.terms.writes).toBe(0);
+    expect(r.creditedWritePaths).toEqual([]);
+  });
+
+  test("target-scoped reward accepts an equivalent absolute observation", () => {
+    const r = computeRunReward({
+      writes: {
+        changedPaths: ["/workspace/project/src/app.ts"],
+        targetPaths: ["src/app.ts"],
+        workspaceRoot: "/workspace/project",
+        writeRequired: true,
+      },
+      check: { tier: "existing", ran: true, passed: true },
+      plan: null,
+    });
+    expect(r.terms.writes).toBe(1);
+    expect(r.creditedWritePaths).toEqual(["/workspace/project/src/app.ts"]);
+  });
+
   test("synth check is not independent → check term 0 (no hard zero if ran)", () => {
     const r = computeRunReward({
       writes: { changedPaths: ["a.ts"], writeRequired: true },

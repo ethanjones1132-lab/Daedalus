@@ -5,6 +5,10 @@ import { hasWriteIntent } from "./turn-requirements";
 import { defaultCapabilityIndex } from "../tool-capabilities-default";
 import type { SemanticPressureBudget } from "./executor-progress-policy";
 import { BASELINE_THETA, policy } from "./orchestration-policy";
+import {
+  pathsHaveSameIdentity,
+  type PathIdentityOptions,
+} from "./path-identity";
 
 /**
  * Tools whose success is a real workspace mutation.
@@ -74,8 +78,14 @@ export function normalizePathForGate(path: string): string {
   return path.trim().replace(/\\/g, "/").replace(/\/+$/, "");
 }
 
-/** Loose path match: exact, suffix, or basename equality (case-insensitive). */
-export function pathMatchesTarget(path: string, target: string): boolean {
+export function pathMatchesTarget(
+  path: string,
+  target: string,
+  options: PathIdentityOptions = {},
+): boolean {
+  if (options.workspaceRoot !== undefined) {
+    return pathsHaveSameIdentity(path, target, options);
+  }
   const a = normalizePathForGate(path).toLowerCase();
   const b = normalizePathForGate(target).toLowerCase();
   if (!a || !b) return false;
@@ -86,8 +96,12 @@ export function pathMatchesTarget(path: string, target: string): boolean {
   return ba.length > 0 && ba === bb;
 }
 
-export function pathInTargetSet(path: string, targets: readonly string[]): boolean {
-  return targets.some((target) => pathMatchesTarget(path, target));
+export function pathInTargetSet(
+  path: string,
+  targets: readonly string[],
+  options: PathIdentityOptions = {},
+): boolean {
+  return targets.some((target) => pathMatchesTarget(path, target, options));
 }
 
 /**
@@ -104,11 +118,12 @@ export function pathInTargetSet(path: string, targets: readonly string[]): boole
 export function countsTowardWriteEffect(
   path: string | undefined,
   targetPaths?: readonly string[],
+  options: PathIdentityOptions = {},
 ): boolean {
   if (targetPaths && targetPaths.length > 0) {
     if (!path) return false;
     // Explicit / plan-named targets win over the status/log denylist.
-    return pathInTargetSet(path, targetPaths);
+    return pathInTargetSet(path, targetPaths, options);
   }
   if (path && isStatusOrLogDocPath(path)) return false;
   // Unpathed successful writes still count when no target set is known
@@ -250,7 +265,13 @@ export function evaluateEffectGate(input: {
    * are always excluded regardless.
    */
   targetPaths?: readonly string[];
+  workspaceRoot?: string;
+  pathPlatform?: NodeJS.Platform;
 }): EffectGateReport {
+  const pathOptions: PathIdentityOptions = {
+    workspaceRoot: input.workspaceRoot,
+    platform: input.pathPlatform,
+  };
   const calls: ToolCallRecord[] = [
     ...(input.executor?.toolCalls ?? []),
     ...(input.rewriter?.toolCalls ?? []),
@@ -280,7 +301,7 @@ export function evaluateEffectGate(input: {
     (call) =>
       !call.is_error
       && WRITE_EFFECT_TOOLS.has(call.name)
-      && countsTowardWriteEffect(toolCallWritePath(call), targetPaths),
+      && countsTowardWriteEffect(toolCallWritePath(call), targetPaths, pathOptions),
   ).length;
   // The delegate reports canonical write tool names but mutates outside the
   // native ToolRuntime, so it has no handler-side observation. Preserve the
@@ -295,7 +316,7 @@ export function evaluateEffectGate(input: {
     && (input.contentEffects.length > 0 || rawWriteSuccessCount === 0);
   const contentDeltas = canUseContentEffects
     ? input.contentEffects!.filter(
-      (effect) => effect.changed && countsTowardWriteEffect(effect.path, targetPaths),
+      (effect) => effect.changed && countsTowardWriteEffect(effect.path, targetPaths, pathOptions),
     ).length
     : successfulWrites;
   // A single failed tool call used to flip an otherwise-successful run to
@@ -307,10 +328,17 @@ export function evaluateEffectGate(input: {
   // drive the verdict now. no_write_effect / repeated-write-failure protections
   // are evaluated separately and are unchanged.
   const consequentialFailed = calls.filter(
-    (call) => call.is_error && !isForgivableFailure(call, calls, contentDeltas, writeIntent),
+    (call) => call.is_error && !isForgivableFailure(
+      call,
+      calls,
+      contentDeltas,
+      writeIntent,
+      targetPaths,
+      pathOptions,
+    ),
   );
   let verdict: EffectGateReport["verdict"] = "clean";
-  if (hasRepeatedWriteFailureWithoutEffect(calls, writeIntent, targetPaths)) {
+  if (hasRepeatedWriteFailureWithoutEffect(calls, writeIntent, targetPaths, pathOptions)) {
     verdict = "no_write_effect";
   } else if (consequentialFailed.length > 0) {
     verdict = "tool_failures";
@@ -356,15 +384,25 @@ function isForgivableFailure(
   calls: ToolCallRecord[],
   contentDeltas: number,
   writeIntent: boolean,
+  targetPaths: readonly string[] | undefined,
+  pathOptions: PathIdentityOptions,
 ): boolean {
   if (WRITE_EFFECT_TOOLS.has(failed.name)) {
-    const target = normBasename(failed.arguments?.path);
-    if (!target) return false;
+    const failedPath = toolCallWritePath(failed);
+    if (!failedPath) return false;
+    if (targetPaths && targetPaths.length > 0
+      && !pathInTargetSet(failedPath, targetPaths, pathOptions)) {
+      return false;
+    }
     return calls.some(
       (candidate) => candidate !== failed
         && !candidate.is_error
         && WRITE_EFFECT_TOOLS.has(candidate.name)
-        && normBasename(candidate.arguments?.path) === target,
+        && pathMatchesTarget(
+          failedPath,
+          toolCallWritePath(candidate) ?? "",
+          pathOptions,
+        ),
     );
   }
   return writeIntent && contentDeltas > 0;
@@ -414,11 +452,12 @@ export function hasRepeatedWriteFailureWithoutEffect(
   calls: ToolCallRecord[],
   writeIntent: boolean,
   targetPaths?: readonly string[],
+  pathOptions: PathIdentityOptions = {},
 ): boolean {
   if (!writeIntent) return false;
   const writes = calls.filter((call) => WRITE_EFFECT_TOOLS.has(call.name));
   const gateSuccess = writes.some(
-    (call) => !call.is_error && countsTowardWriteEffect(toolCallWritePath(call), targetPaths),
+    (call) => !call.is_error && countsTowardWriteEffect(toolCallWritePath(call), targetPaths, pathOptions),
   );
   return !gateSuccess
     && writes.filter((call) => call.is_error).length >= policy().max_failed_write_attempts_without_effect;

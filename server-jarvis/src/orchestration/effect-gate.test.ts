@@ -7,6 +7,7 @@ import {
   isStatusOrLogDocPath,
   isTerminalNoWriteEffect,
   mostReadSuccessfulFile,
+  pathMatchesTarget,
   resolveTaskTargetPaths,
   shouldPressWriteEffect,
 } from "./effect-gate";
@@ -486,6 +487,59 @@ describe("effect gate — recovered/benign failure forgiveness", () => {
       executor: executor([callWith("read_file", true, undefined, "File does not exist")]),
       request: "explain the auth flow",
     });
+    expect(report.verdict).toBe("tool_failures");
+    expect(report.consequentialFailures).toBe(1);
+  });
+});
+
+describe("effect gate — workspace path identity", () => {
+  const workspaceRoot = "/workspace/project";
+
+  test("qualified paths with the same basename in different directories do not match", () => {
+    expect(pathMatchesTarget("other/src/app.ts", "src/app.ts", { workspaceRoot })).toBe(false);
+  });
+
+  test("relative and absolute observations resolve to the same workspace target", () => {
+    expect(pathMatchesTarget("/workspace/project/src/app.ts", "src/app.ts", { workspaceRoot })).toBe(true);
+    expect(pathMatchesTarget("./src/app.ts", "src/app.ts", { workspaceRoot })).toBe(true);
+  });
+
+  test("Windows separators resolve relative and absolute observations to one identity", () => {
+    expect(pathMatchesTarget(
+      "C:\\repo\\src\\app.ts",
+      "src/app.ts",
+      { workspaceRoot: "C:\\repo", platform: "win32" },
+    )).toBe(true);
+    expect(pathMatchesTarget(
+      "C:\\repo\\other\\src\\app.ts",
+      "src/app.ts",
+      { workspaceRoot: "C:\\repo", platform: "win32" },
+    )).toBe(false);
+  });
+
+  test("a genuinely bare target only matches its workspace-root identity", () => {
+    expect(pathMatchesTarget("app.ts", "app.ts", { workspaceRoot })).toBe(true);
+    expect(pathMatchesTarget("src/app.ts", "app.ts", { workspaceRoot })).toBe(false);
+  });
+});
+
+describe("effect gate — failed target recovery", () => {
+  test("a failed real target is not forgiven by a same-basename write in another directory", () => {
+    const writeCall = (name: string, isError: boolean, path: string, output: string): ToolCallRecord => ({
+      ...call(name, isError, output),
+      arguments: { path },
+    });
+    const report = evaluateEffectGate({
+      profile: "full",
+      executor: executor([
+        writeCall("edit_file", true, "src/app.ts", "permission denied"),
+        writeCall("write_file", false, "other/src/app.ts", "File created"),
+      ]),
+      request: "update src/app.ts",
+      targetPaths: ["src/app.ts"],
+      workspaceRoot: "/workspace/project",
+    });
+
     expect(report.verdict).toBe("tool_failures");
     expect(report.consequentialFailures).toBe(1);
   });
