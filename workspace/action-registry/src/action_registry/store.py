@@ -104,6 +104,7 @@ class RegistryStore:
             raise ValueError("; ".join(errors))
 
         with registry_lock(self.root):
+            self._assert_action_id_compatible(action)
             target_bucket = bucket_for_status(action["status"])
             for bucket in BUCKETS:
                 payload = self.load_bucket(bucket)
@@ -130,6 +131,7 @@ class RegistryStore:
         prepared_actions = self._prepare_actions_for_ingest(actions)
         stamp = seen_at or datetime.now().isoformat(timespec="seconds")
         with registry_lock(self.root):
+            self._assert_batch_action_ids_compatible(prepared_actions)
             for action in prepared_actions:
                 if action.get("status") in DEDUPABLE_STATUSES:
                     similar = self._find_similar_action(action)
@@ -241,11 +243,34 @@ class RegistryStore:
         self.upsert(action, audit_event=audit_event)
         return action
 
+    def _assert_batch_action_ids_compatible(self, actions: list[dict[str, Any]]) -> None:
+        identities: dict[str, tuple[str, str]] = {}
+        for action in actions:
+            action_id = action["id"]
+            identity = (action.get("project", ""), infer_track_key(action))
+            previous = identities.get(action_id)
+            if previous is not None and previous != identity:
+                raise ValueError(f"action id {action_id!r} appears with multiple tracks")
+            identities[action_id] = identity
+            self._assert_action_id_compatible(action)
+
+    def _assert_action_id_compatible(self, action: dict[str, Any]) -> None:
+        incoming_identity = (action.get("project", ""), infer_track_key(action))
+        for bucket in BUCKETS:
+            payload = self.load_bucket(bucket)
+            for existing in payload.get("actions", []):
+                if not isinstance(existing, dict) or existing.get("id") != action["id"]:
+                    continue
+                existing_identity = (existing.get("project", ""), infer_track_key(existing))
+                if existing_identity != incoming_identity:
+                    raise ValueError(f"action id {action['id']!r} already belongs to a different track")
+
     def _upsert_unlocked(self, action: dict[str, Any]) -> str:
         action = normalize_action(deepcopy(action))
         errors = validate_action(action)
         if errors:
             raise ValueError("; ".join(errors))
+        self._assert_action_id_compatible(action)
         target_bucket = bucket_for_status(action["status"])
         for bucket in BUCKETS:
             payload = self.load_bucket(bucket)
@@ -265,6 +290,8 @@ class RegistryStore:
                     return {"bucket": bucket, "action": deepcopy(action)}
         for bucket in DEDUPE_BUCKETS:
             for action in self.load_bucket(bucket).get("actions", []):
+                if not self._is_legacy_identity(action) or not self._is_legacy_identity(candidate):
+                    continue
                 if not self._is_same_legacy_scope(action, candidate):
                     continue
                 title = action.get("title")
@@ -384,6 +411,14 @@ class RegistryStore:
         if errors:
             raise ValueError("; ".join(errors))
         return prepared
+
+    @staticmethod
+    def _is_legacy_identity(action: dict[str, Any]) -> bool:
+        project = action.get("project", "")
+        source_area = action.get("source_area", "")
+        inferred = f"{project}:{source_area}"
+        explicit = action.get("track_key")
+        return not (isinstance(explicit, str) and explicit.strip()) or explicit.strip() == inferred
 
     @staticmethod
     def _is_same_legacy_scope(existing: dict[str, Any], candidate: dict[str, Any]) -> bool:

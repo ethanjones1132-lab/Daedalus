@@ -83,6 +83,8 @@ class JonesinSrcProductsAdapter(BaseAdapter):
                     "project": "jonesinsrc",
                     "source_system": "product-adapter",
                     "source_area": product["slug"],
+                    "track_key": f"jonesinsrc:{product['slug']}",
+                    "action_kind": "track",
                     "priority": product["priority"],
                     "risk_level": product["risk_level"],
                     "category": "product_registry",

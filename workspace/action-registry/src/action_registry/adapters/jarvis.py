@@ -70,7 +70,9 @@ class JarvisAdapter(BaseAdapter):
             if release_binary.stat().st_mtime < newest_source.stat().st_mtime:
                 actions.append(
                     self._build(
-                        action_id("home-base-stale-binary", date_tag),
+                        action_id("home-base-stale-binary-signal", date_tag),
+                        track_key="home-base:stale-binary",
+                        action_kind="signal",
                         title="Rebuild stale Jarvis binary before release",
                         description=(
                             "The Windows release binary is older than the newest Jarvis source or packaged "
@@ -98,7 +100,9 @@ class JarvisAdapter(BaseAdapter):
         if not inference_csv.exists():
             actions.append(
                 self._build(
-                    action_id("home-base-eval-harness", date_tag),
+                    action_id("home-base-eval-harness-signal", date_tag),
+                    track_key="home-base:eval-harness",
+                    action_kind="signal",
                     title="Stand up eval harness baseline",
                     description=(
                         "No inference metrics file found. Capture a baseline eval run so "
@@ -123,6 +127,8 @@ class JarvisAdapter(BaseAdapter):
             actions.append(
                 self._build(
                     action_id("home-base-platform-track", date_tag),
+                    track_key="home-base:jarvis",
+                    action_kind="track",
                     title="Jarvis platform follow-through",
                     description=(
                         "AGENTS.md lists active platform priorities: build provenance, eval harness, "
@@ -148,6 +154,8 @@ class JarvisAdapter(BaseAdapter):
     def _build(
         item_id: str,
         *,
+        track_key: str,
+        action_kind: str,
         title: str,
         description: str,
         priority: str,
@@ -164,6 +172,8 @@ class JarvisAdapter(BaseAdapter):
             "project": "home-base",
             "source_system": "jarvis-adapter",
             "source_area": "jarvis",
+            "track_key": track_key,
+            "action_kind": action_kind,
             "priority": priority,
             "risk_level": risk_level,
             "category": category,
