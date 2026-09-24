@@ -198,4 +198,49 @@ describe('MCP persistence drafts and serialization', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.queryByText('existing')).not.toBeInTheDocument();
   });
+
+  it('preserves exact argument boundaries through loading, editing, and saving', async () => {
+    const save = deferred<void>();
+    const entry = { ...existing, args: ['--root', 'C:\\Program Files\\repo'] };
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'list_mcp_servers') return Promise.resolve({ existing: entry });
+      if (command === 'save_mcp_servers') return saved();
+      throw new Error(`Unexpected command: ${command}`);
+    });
+    saved.mockReturnValueOnce(save.promise);
+    await renderLoaded();
+
+    const args = screen.getByLabelText('Args (JSON array)');
+    expect(args).toHaveValue('["--root","C:\\\\Program Files\\\\repo"]');
+    fireEvent.change(args, {
+      target: { value: '["--root","D:\\\\Jarvis Data\\\\repo","--label=\\\"quoted value\\\""]' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    expect(invokeMock.mock.calls.filter(([command]) => command === 'save_mcp_servers')[0]).toEqual([
+      'save_mcp_servers',
+      {
+        servers: {
+          existing: { ...entry, args: ['--root', 'D:\\Jarvis Data\\repo', '--label="quoted value"'] },
+        },
+      },
+    ]);
+    await act(async () => { save.resolve(undefined); });
+  });
+
+  it('retains invalid argument JSON and blocks persistence until it is corrected', async () => {
+    await renderLoaded();
+
+    const args = screen.getByLabelText('Args (JSON array)');
+    fireEvent.change(args, { target: { value: '["--root",' } });
+
+    expect(args).toHaveValue('["--root",');
+    expect(screen.getByRole('alert')).toHaveTextContent('Enter args as a JSON array of strings.');
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
+    expect(saved).not.toHaveBeenCalled();
+
+    fireEvent.change(args, { target: { value: '["--root","C:\\\\Program Files\\\\repo"]' } });
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
+  });
 });
