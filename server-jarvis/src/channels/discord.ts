@@ -117,8 +117,7 @@ function isTransientStatus(status: number): boolean {
   return status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
-function errorCode(error: unknown): string {
-  if (error instanceof Error && error.message) return error.message.slice(0, 120);
+function errorCode(): string {
   return "discord_delivery_failed";
 }
 
@@ -163,8 +162,8 @@ export function createDiscordAdapter(options: DiscordAdapterOptions) {
           }
           failure = `discord_http_${response.status}`;
           if (!isTransientStatus(response.status)) break;
-        } catch (error) {
-          failure = errorCode(error);
+        } catch {
+          failure = errorCode();
         }
         if (attempt < maxAttempts) {
           retryCount++;
@@ -184,5 +183,47 @@ export function createDiscordAdapter(options: DiscordAdapterOptions) {
       await options.receiptStore?.persist(receipt);
       return receipt;
     },
+  };
+}
+
+export interface DiscordSendHandlerOptions {
+  token: string | (() => string | undefined);
+  fetchImpl?: typeof fetch;
+  receiptStore?: DiscordReceiptStore;
+  correlationId?: () => string;
+}
+
+function responseError(error: string, status: number): Response {
+  return Response.json({ ok: false, error }, { status });
+}
+
+export function createDiscordSendHandler(options: DiscordSendHandlerOptions): (request: Request) => Promise<Response> {
+  const tokenProvider = (): string | undefined => typeof options.token === "function" ? options.token() : options.token;
+  return async (request: Request) => {
+    const token = tokenProvider()?.trim() ?? "";
+    if (!token) return responseError("discord_secret_unavailable", 503);
+
+    const body = await request.json().catch(() => ({}));
+    const channelId = typeof body?.channel_id === "string" ? body.channel_id.trim() : "";
+    if (!channelId) return responseError("discord_channel_required", 400);
+    const text = typeof body?.text === "string" ? body.text : "";
+    if (!text.trim()) return responseError("discord_message_required", 400);
+    const correlationId = typeof body?.correlation_id === "string" && body.correlation_id.trim()
+      ? body.correlation_id.trim()
+      : options.correlationId?.() ?? crypto.randomUUID();
+
+    try {
+      const adapter = createDiscordAdapter({
+        token,
+        channelId,
+        fetchImpl: options.fetchImpl,
+        receiptStore: options.receiptStore,
+      });
+      const receipt = await adapter.send({ text, correlation_id: correlationId });
+      const ok = receipt.status === "delivered";
+      return Response.json({ ok, receipt }, { status: ok ? 200 : 502 });
+    } catch {
+      return responseError("discord_delivery_failed", 502);
+    }
   };
 }

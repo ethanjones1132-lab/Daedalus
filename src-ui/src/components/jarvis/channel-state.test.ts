@@ -1,9 +1,20 @@
 import { describe, expect, it } from 'vitest';
-import { channelLocked, isConnected, reconcileChannels, type ChannelOperation } from './channel-state';
+import { canVerifyChannel, channelId, channelLocked, isConfiguredChannel, isConnected, reconcileChannels, type ChannelOperation } from './channel-state';
 const row = { id: 'a', connected: false, config: { connected: false } };
 const connected = { ...row, config: { connected: true } };
 const operation = (patch: Partial<ChannelOperation<typeof row>> = {}): ChannelOperation<typeof row> => ({
   row, action: 'connect', phase: 'reconciling', after: 2, ...patch,
+});
+describe('channel provisioning contract', () => {
+  it('accepts only a configured Discord destination as verifiable', () => {
+    const discord = { id: 'd', type: 'discord', connected: false, config: { channel_id: '123' } };
+    expect(channelId(discord)).toBe('123');
+    expect(isConfiguredChannel(discord)).toBe(true);
+    expect(canVerifyChannel(discord)).toBe(true);
+    expect(channelId({ ...discord, config: { channel_id: '  ' } })).toBe('');
+    expect(canVerifyChannel({ ...discord, type: 'webhook' })).toBe(false);
+    expect(canVerifyChannel({ ...discord, config: null })).toBe(false);
+  });
 });
 describe('channel reconciliation', () => {
   it('preserves connection flag interpretation without inferring delivery', () => {
@@ -16,6 +27,7 @@ describe('channel reconciliation', () => {
     expect(channelLocked(undefined)).toBe(false);
     for (const phase of ['writing', 'reconciling', 'read-failed'] as const) expect(channelLocked(operation({ phase }))).toBe(true);
     expect(channelLocked(operation({ phase: 'write-failed' }))).toBe(false);
+    expect(channelLocked(operation({ phase: 'verification-failed' }))).toBe(false);
   });
   it('retains pending rows even when a snapshot omits or changes them', () => {
     for (const snapshot of [[], [connected]]) {
@@ -46,5 +58,9 @@ describe('channel reconciliation', () => {
   it('allows a fresh read after a rejected write without crediting it as a successful write', () => {
     const op = operation({ phase: 'write-failed' });
     expect(reconcileChannels([connected], { a: op }, 3)).toEqual({ rows: [connected], operations: {} });
+  });
+  it('clears a rejected verification on a later read without treating it as connected', () => {
+    const op = operation({ phase: 'verification-failed' });
+    expect(reconcileChannels([row], { a: op }, 3)).toEqual({ rows: [row], operations: {} });
   });
 });

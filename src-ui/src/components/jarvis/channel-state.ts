@@ -11,6 +11,21 @@ export interface Channel {
 }
 
 type Connection = Pick<Channel, 'connected' | 'config'>;
+type Provisioned = Pick<Channel, 'type' | 'config'>;
+
+export function channelId(channel: Provisioned): string {
+  const value = channel.config?.channel_id;
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+export function isConfiguredChannel(channel: Provisioned): boolean {
+  return channel.type === 'discord' && channelId(channel).length > 0;
+}
+
+export function canVerifyChannel(channel: Provisioned): boolean {
+  return isConfiguredChannel(channel);
+}
+
 export function isConnected(channel: Connection): boolean {
   return channel.connected || channel.config?.connected === true;
 }
@@ -18,13 +33,12 @@ export function isConnected(channel: Connection): boolean {
 export interface ChannelOperation<T> {
   row: T;
   action: 'connect' | 'disconnect' | 'remove';
-  phase: 'writing' | 'write-failed' | 'reconciling' | 'read-failed';
-  // A read started before settlement cannot confirm this write.
+  phase: 'writing' | 'write-failed' | 'verification-failed' | 'reconciling' | 'read-failed';
   after: number;
 }
 
 export function channelLocked<T>(operation: ChannelOperation<T> | undefined): boolean {
-  return !!operation && operation.phase !== 'write-failed';
+  return !!operation && operation.phase !== 'write-failed' && operation.phase !== 'verification-failed';
 }
 
 export function reconcileChannels<T extends Connection & { id: string }>(
@@ -36,6 +50,7 @@ export function reconcileChannels<T extends Connection & { id: string }>(
     const observed = snapshot.find(row => row.id === id);
     if (operation.phase !== 'writing' && request > operation.after) {
       if (operation.phase === 'write-failed'
+        || operation.phase === 'verification-failed'
         || (operation.action === 'remove' ? !observed
           : observed && isConnected(observed) === (operation.action === 'connect'))) {
         delete next[id];
@@ -43,7 +58,6 @@ export function reconcileChannels<T extends Connection & { id: string }>(
       }
       next[id] = { ...operation, phase: 'read-failed' };
     }
-    // Keep the last confirmed row, disabled, until readback matches the write.
     const index = rows.findIndex(row => row.id === id);
     if (index < 0) rows.push(operation.row);
     else rows[index] = operation.row;

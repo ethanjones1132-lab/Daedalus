@@ -14,10 +14,9 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
-import { initialReceiptState, parseReceipts, reduceReceiptState, type DeliveryReceipt } from './channel-receipt-state';
-import { channelLocked, isConnected, reconcileChannels, type Channel, type ChannelOperation } from './channel-state';
+import { initialReceiptState, parseDiscordSendResponse, parseReceipts, reduceReceiptState, type DeliveryReceipt } from './channel-receipt-state';
+import { canVerifyChannel, channelId, channelLocked, isConfiguredChannel, isConnected, reconcileChannels, type Channel, type ChannelOperation } from './channel-state';
 import {
-  cn,
   ConfirmModal,
   GlassCard,
   Pill,
@@ -28,17 +27,9 @@ import {
   useToast,
 } from '../ui';
 
-const CHANNEL_TYPES = [
-  { value: 'webhook', label: 'Webhook' },
-  { value: 'discord', label: 'Discord' },
-  { value: 'slack', label: 'Slack' },
-  { value: 'telegram', label: 'Telegram' },
-  { value: 'signal', label: 'Signal' },
-  { value: 'email', label: 'Email' },
-  { value: 'http', label: 'HTTP Endpoint' },
-  { value: 'websocket', label: 'WebSocket' },
-];
+const CHANNEL_TYPES = [{ value: 'discord', label: 'Discord' }];
 const BUN_URL = 'http://127.0.0.1:19877';
+const VERIFICATION_TEXT = 'Jarvis Discord connection check';
 
 // ── Helpers ────────────────────────────────────────────────────
 
@@ -105,75 +96,68 @@ function AddChannelForm({
   saving,
   createError,
 }: {
-  onCreate: (name: string, type: string, url: string) => Promise<void>;
+  onCreate: (name: string, destination: string) => Promise<void>;
   onCancel: () => void;
   saving: boolean;
   createError: boolean;
 }) {
   const [name, setName] = useState('');
-  const [type, setType] = useState(CHANNEL_TYPES[0].value);
-  const [url, setUrl] = useState('');
-
-
+  const [destination, setDestination] = useState('');
   const inputCls =
     'w-full px-3 py-2 text-sm rounded-lg bg-white/5 border border-white/10 text-bone placeholder:text-bone/30 focus:outline-none focus:border-accent/50';
 
   const submit = () => {
-    if (saving || !name.trim()) return;
-    void onCreate(name.trim(), type, url.trim());
+    if (saving || !name.trim() || !destination.trim()) return;
+    void onCreate(name.trim(), destination.trim());
   };
 
   return (
     <GlassCard className="p-4 space-y-3">
       <fieldset disabled={saving} className="space-y-3 border-0 p-0 m-0 min-w-0">
-      <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-2 gap-3">
+          <input
+            className={inputCls}
+            placeholder="Channel name *"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+          <select className={inputCls} defaultValue={CHANNEL_TYPES[0].value} aria-label="Adapter">
+            {CHANNEL_TYPES.map((t) => (
+              <option key={t.value} value={t.value}>
+                {t.label}
+              </option>
+            ))}
+          </select>
+        </div>
         <input
           className={inputCls}
-          placeholder="Channel name *"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
+          placeholder="Discord channel ID *"
+          value={destination}
+          onChange={(e) => setDestination(e.target.value)}
         />
-        <select
-          className={inputCls}
-          value={type}
-          onChange={(e) => setType(e.target.value)}
-        >
-          {CHANNEL_TYPES.map((t) => (
-            <option key={t.value} value={t.value}>
-              {t.label}
-            </option>
-          ))}
-        </select>
-      </div>
-      <input
-        className={inputCls}
-        placeholder="Endpoint URL / token (optional)"
-        value={url}
-        onChange={(e) => setUrl(e.target.value)}
-      />
-      <div className="flex justify-end gap-2">
-        <button
-          type="button"
-          onClick={onCancel}
-          className="px-3 py-1.5 text-xs rounded-lg border border-white/10 text-bone/60 hover:text-bone transition-colors"
-        >
-          Cancel
-        </button>
-        <button
-          type="button"
-          onClick={submit}
-          disabled={saving || !name.trim()}
-          className="px-3 py-1.5 text-xs rounded-lg bg-accent text-bone hover:bg-accent/80 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-        >
-          {saving ? 'Adding…' : 'Add channel'}
-        </button>
-      </div>
+        <div className="flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="px-3 py-1.5 text-xs rounded-lg border border-white/10 text-bone/60 hover:text-bone transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={submit}
+            disabled={saving || !name.trim() || !destination.trim()}
+            className="px-3 py-1.5 text-xs rounded-lg bg-accent text-bone hover:bg-accent/80 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          >
+            {saving ? 'Adding…' : 'Add channel'}
+          </button>
+        </div>
       </fieldset>
       {saving && <p role="status" className="text-xs text-bone/60">Adding channel…</p>}
       {createError && (
         <div role="alert" className="text-xs text-red-200">
           Could not add channel. Your draft has been kept.{' '}
-          <button type="button" onClick={submit} disabled={saving || !name.trim()} className="underline disabled:opacity-40">Retry</button>
+          <button type="button" onClick={submit} disabled={saving || !name.trim() || !destination.trim()} className="underline disabled:opacity-40">Retry</button>
         </div>
       )}
     </GlassCard>
@@ -192,6 +176,7 @@ export function ChannelsView() {
   const createPending = useRef(false);
   const [pendingDelete, setPendingDelete] = useState<Channel | null>(null);
   const [receiptState, dispatchReceipts] = useReducer(reduceReceiptState, initialReceiptState);
+  const [verifiedChannels, setVerifiedChannels] = useState<Set<string>>(() => new Set());
   const receiptPending = useRef(false);
   const { success } = useToast();
   const [operations, setOperations] = useState<Record<string, ChannelOperation<Channel>>>({});
@@ -267,14 +252,17 @@ export function ChannelsView() {
   }, [fetchReceipts]);
 
   const create = useCallback(
-    async (name: string, type: string, url: string) => {
-      if (createPending.current || !name.trim()) return;
+    async (name: string, destination: string) => {
+      if (createPending.current || !name.trim() || !destination.trim()) return;
       createPending.current = true;
       setSaving(true);
       setCreateError(false);
-      const config: Record<string, unknown> = url ? { url } : {};
       try {
-        await invoke<Channel>('add_channel', { name, channelType: type, config });
+        await invoke<Channel>('add_channel', {
+          name,
+          channelType: 'discord',
+          config: { channel_id: destination.trim() },
+        });
         success(`Added channel ${name}`);
         setAdding(false);
         await fetchChannels({
@@ -297,10 +285,37 @@ export function ChannelsView() {
     setAdding(open);
   };
 
+  const verifyDelivery = useCallback(async (channel: Channel): Promise<boolean> => {
+    if (!canVerifyChannel(channel)) return false;
+    try {
+      const response = await globalThis.fetch(`${BUN_URL}/channels/discord/send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ channel_id: channelId(channel), text: VERIFICATION_TEXT }),
+      });
+      const result = parseDiscordSendResponse(await response.json().catch(() => null));
+      return response.ok && result.ok && result.receipt?.status === 'delivered';
+    } catch {
+      return false;
+    }
+  }, []);
+
   const mutate = useCallback(async (channel: Channel, action: ChannelOperation<Channel>['action']) => {
     if (channelLocked(operationsRef.current[channel.id])) return;
     const operation: ChannelOperation<Channel> = { row: channel, action, phase: 'writing', after: requestId.current };
     publishOperations({ ...operationsRef.current, [channel.id]: operation });
+    if (action === 'connect') {
+      setVerifiedChannels((current) => {
+        const next = new Set(current);
+        next.delete(channel.id);
+        return next;
+      });
+      if (!await verifyDelivery(channel)) {
+        publishOperations({ ...operationsRef.current, [channel.id]: { ...operation, phase: 'verification-failed', after: requestId.current } });
+        return;
+      }
+      setVerifiedChannels((current) => new Set(current).add(channel.id));
+    }
     try {
       const saved = await invoke<boolean>(action === 'remove' ? 'remove_channel' : action === 'connect' ? 'login_channel' : 'logout_channel', { id: channel.id });
       if (saved !== true) throw new Error('Write not confirmed');
@@ -309,12 +324,22 @@ export function ChannelsView() {
       if (action === 'remove') setPendingDelete(current => current?.id === channel.id ? null : current);
       return;
     }
+    if (action === 'disconnect' || action === 'remove') {
+      setVerifiedChannels((current) => {
+        const next = new Set(current);
+        next.delete(channel.id);
+        return next;
+      });
+    }
     publishOperations({ ...operationsRef.current, [channel.id]: { ...operation, phase: 'reconciling', after: requestId.current } });
     if (action === 'remove') setPendingDelete(current => current?.id === channel.id ? null : current);
     await fetchChannels({ silent: true });
-  }, [fetchChannels, publishOperations]);
+  }, [fetchChannels, publishOperations, verifyDelivery]);
 
-  const toggleConnection = (channel: Channel) => void mutate(channel, isConnected(channel) ? 'disconnect' : 'connect');
+  const toggleConnection = (channel: Channel) => {
+    if (isConnected(channel)) void mutate(channel, 'disconnect');
+    else if (canVerifyChannel(channel)) void mutate(channel, 'connect');
+  };
   const remove = (channel: Channel) => {
     if (!channelLocked(operationsRef.current[channel.id])) setPendingDelete(channel);
   };
@@ -329,6 +354,7 @@ export function ChannelsView() {
   const deleting = deleteOperation?.action === 'remove' && deleteOperation.phase === 'writing';
 
   const connectedCount = useMemo(() => channels.filter(isConnected).length, [channels]);
+  const verifiedCount = useMemo(() => channels.filter(channel => verifiedChannels.has(channel.id)).length, [channels, verifiedChannels]);
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-hidden">
@@ -349,6 +375,9 @@ export function ChannelsView() {
           <div className="flex items-center gap-2">
             <Pill variant={connectedCount > 0 ? 'success' : 'default'}>
               {connectedCount} connected
+            </Pill>
+            <Pill variant={verifiedCount > 0 ? 'success' : 'default'}>
+              {verifiedCount} delivery verified
             </Pill>
             <button
               type="button"
@@ -409,31 +438,45 @@ export function ChannelsView() {
         ) : (
           <ul className="space-y-2">
             {channels.map((c) => {
-               const connected = isConnected(c);
-               const operation = operations[c.id];
-               const locked = channelLocked(operation);
-               return (
+              const connected = isConnected(c);
+              const configured = isConfiguredChannel(c);
+              const supported = c.type === 'discord';
+              const verified = verifiedChannels.has(c.id);
+              const operation = operations[c.id];
+              const locked = channelLocked(operation);
+              return (
                 <li key={c.id}>
                   <GlassCard className="p-3">
                     <div className="flex items-center gap-2">
                       <StatusDot ok={connected} warn={!connected} pulse={connected} />
                       <h3 className="text-sm font-medium text-bone truncate">{c.name}</h3>
                       <Pill variant="default">{c.type}</Pill>
+                      {configured && <Pill>configured</Pill>}
                       {connected && <Pill variant="success">connected</Pill>}
+                      {verified && <Pill variant="success">delivery verified</Pill>}
+                      {!supported && <Pill>unsupported adapter</Pill>}
+                      {supported && !configured && <Pill>needs channel ID</Pill>}
                       <div className="ml-auto flex items-center gap-1 text-[11px]">
-                        <button
-                          type="button"
-                          onClick={() => toggleConnection(c)}
-                          disabled={locked}
-                          className={cn(
-                            'px-2 py-0.5 rounded-md border transition-colors disabled:opacity-40 disabled:cursor-not-allowed',
-                            connected
-                              ? 'border-amber-500/30 text-amber-200 hover:bg-amber-500/10'
-                              : 'border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10',
-                          )}
-                        >
-                          {connected ? 'Disconnect' : 'Connect'}
-                        </button>
+                        {connected && (
+                          <button
+                            type="button"
+                            onClick={() => toggleConnection(c)}
+                            disabled={locked}
+                            className="px-2 py-0.5 rounded-md border border-amber-500/30 text-amber-200 hover:bg-amber-500/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                          >
+                            Disconnect
+                          </button>
+                        )}
+                        {!connected && canVerifyChannel(c) && (
+                          <button
+                            type="button"
+                            onClick={() => toggleConnection(c)}
+                            disabled={locked}
+                            className="px-2 py-0.5 rounded-md border border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                          >
+                            {operation?.phase === 'writing' ? 'Verifying…' : 'Verify & connect'}
+                          </button>
+                        )}
                         <button
                           type="button"
                           onClick={() => remove(c)}
@@ -444,8 +487,16 @@ export function ChannelsView() {
                         </button>
                       </div>
                     </div>
-                    {operation?.phase === 'writing' && <div role="status">Saving channel change…</div>}
+                    {operation?.phase === 'writing' && (
+                      <div role="status">{operation.action === 'connect' ? 'Verifying delivery…' : 'Saving channel change…'}</div>
+                    )}
                     {operation?.phase === 'reconciling' && <div role="status">Change saved. Reconciling channels…</div>}
+                    {operation?.phase === 'verification-failed' && (
+                      <div role="alert" className="text-xs text-red-200">
+                        Delivery could not be verified. The channel was not connected.{' '}
+                        <button type="button" className="underline" onClick={() => void mutate(c, operation.action)}>Retry</button>
+                      </div>
+                    )}
                     {operation?.phase === 'write-failed' && (
                       <div role="alert" className="text-xs text-red-200">
                         Could not {operation.action} channel. Confirmed state was kept.{' '}
@@ -458,10 +509,10 @@ export function ChannelsView() {
                         <button type="button" className="underline disabled:opacity-40" disabled={loading} onClick={retryRead}>Retry</button>
                       </div>
                     )}
-                     <div className="flex items-center gap-2 mt-1.5 text-[10px] font-mono text-bone/30">
-                       <span>last used {formatTimestamp(c.last_used)}</span>
-                       <span className="ml-auto">added {formatTimestamp(c.created_at)}</span>
-                     </div>
+                    <div className="flex items-center gap-2 mt-1.5 text-[10px] font-mono text-bone/30">
+                      <span>last used {formatTimestamp(c.last_used)}</span>
+                      <span className="ml-auto">added {formatTimestamp(c.created_at)}</span>
+                    </div>
                   </GlassCard>
                 </li>
               );

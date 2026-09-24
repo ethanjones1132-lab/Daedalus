@@ -12,7 +12,7 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 const channel = {
-  id: 'ch_2', name: 'Newsroom', type: 'discord', enabled: true, config: null,
+  id: 'ch_2', name: 'Newsroom', type: 'discord', enabled: true, config: { channel_id: '123' },
   last_used: null, connected: false, created_at: '2026-09-16T00:00:00Z', updated_at: '2026-09-16T00:00:00Z',
 };
 const secondChannel = { ...channel, id: 'ch_3', name: 'Operations' };
@@ -31,7 +31,7 @@ afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 function usableRow() {
   expect(screen.getByText('Newsroom')).toBeInTheDocument();
-  expect(screen.getByRole('button', { name: 'Connect' })).toBeEnabled();
+  expect(screen.getByRole('button', { name: 'Verify & connect' })).toBeEnabled();
   expect(screen.getByRole('button', { name: 'Remove' })).toBeEnabled();
 }
 

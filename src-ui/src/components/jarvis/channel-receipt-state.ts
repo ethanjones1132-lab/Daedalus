@@ -8,6 +8,12 @@ export interface DeliveryReceipt {
   finished_at: string;
 }
 
+export interface DiscordSendResponse {
+  ok: boolean;
+  receipt?: DeliveryReceipt;
+  error?: string;
+}
+
 interface ReceiptState {
   phase: 'loading' | 'ready' | 'failed';
   receipts: DeliveryReceipt[] | null;
@@ -27,20 +33,40 @@ export function reduceReceiptState(state: ReceiptState, action: ReceiptAction): 
   }
 }
 
-// A malformed response is unavailable telemetry, never a successful empty list.
+function parseDeliveryReceipt(value: unknown): DeliveryReceipt {
+  if (!value || typeof value !== 'object'
+    || typeof (value as Record<string, unknown>).message_id !== 'string'
+    || typeof (value as Record<string, unknown>).channel !== 'string'
+    || !['queued', 'delivered', 'failed'].includes(String((value as Record<string, unknown>).status))
+    || !Number.isInteger((value as Record<string, unknown>).retry_count)
+    || Number((value as Record<string, unknown>).retry_count) < 0
+    || typeof (value as Record<string, unknown>).correlation_id !== 'string'
+    || typeof (value as Record<string, unknown>).finished_at !== 'string'
+    || ((value as Record<string, unknown>).error_code !== undefined
+      && typeof (value as Record<string, unknown>).error_code !== 'string')) {
+    throw new Error('Invalid delivery receipt');
+  }
+  return value as DeliveryReceipt;
+}
+
+export function parseDiscordSendResponse(body: unknown): DiscordSendResponse {
+  if (!body || typeof body !== 'object' || typeof (body as Record<string, unknown>).ok !== 'boolean') {
+    throw new Error('Invalid delivery response');
+  }
+  const source = body as Record<string, unknown>;
+  const result: DiscordSendResponse = { ok: source.ok as boolean };
+  if (source.receipt !== undefined) result.receipt = parseDeliveryReceipt(source.receipt);
+  if (source.error !== undefined) {
+    if (typeof source.error !== 'string') throw new Error('Invalid delivery response');
+    result.error = source.error;
+  }
+  if (result.ok && !result.receipt) throw new Error('Invalid delivery response');
+  return result;
+}
+
 export function parseReceipts(body: unknown): DeliveryReceipt[] {
-  if (!body || typeof body !== 'object' || !('receipts' in body) || !Array.isArray(body.receipts)) {
+  if (!body || typeof body !== 'object' || !('receipts' in body) || !Array.isArray((body as { receipts?: unknown }).receipts)) {
     throw new Error('Invalid delivery telemetry');
   }
-  for (const receipt of body.receipts) {
-    if (!receipt || typeof receipt !== 'object'
-      || typeof receipt.message_id !== 'string' || typeof receipt.channel !== 'string'
-      || !['queued', 'delivered', 'failed'].includes(receipt.status)
-      || !Number.isInteger(receipt.retry_count) || receipt.retry_count < 0
-      || typeof receipt.correlation_id !== 'string' || typeof receipt.finished_at !== 'string'
-      || (receipt.error_code !== undefined && typeof receipt.error_code !== 'string')) {
-      throw new Error('Invalid delivery telemetry');
-    }
-  }
-  return body.receipts;
+  return (body as { receipts: unknown[] }).receipts.map(parseDeliveryReceipt);
 }

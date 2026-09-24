@@ -51,7 +51,7 @@ import {
   type FirstTokenProgress,
 } from "./inference-metrics";
 import { createApprovalRegistry } from "./approval-registry";
-import { createDiscordAdapter, SqliteDeliveryReceiptStore } from "./channels/discord";
+import { createDiscordSendHandler, SqliteDeliveryReceiptStore } from "./channels/discord";
 import { summarizeTurnMetrics } from "./orchestration/turn-metrics";
 import { actualInferenceRouteTelemetry } from "./orchestration/inference-route-telemetry";
 
@@ -60,6 +60,10 @@ import { actualInferenceRouteTelemetry } from "./orchestration/inference-route-t
 // The UI resolves them via POST /tool/decision.
 const approvalRegistry = createApprovalRegistry();
 const discordReceiptStore = new SqliteDeliveryReceiptStore();
+const discordSendHandler = createDiscordSendHandler({
+  token: () => process.env.JARVIS_DISCORD_BOT_TOKEN,
+  receiptStore: discordReceiptStore,
+});
 import type { ToolCall } from "./tool-types";
 
 /** Write-effect tools, for carrying this turn's mutation targets forward. */
@@ -5261,24 +5265,7 @@ export async function baseFetch(req: Request): Promise<Response> {
       return Response.json({ receipts: discordReceiptStore.list() });
     }
     if (path === "/channels/discord/send" && req.method === "POST") {
-      const token = process.env.JARVIS_DISCORD_BOT_TOKEN?.trim();
-      if (!token) {
-        return Response.json({ ok: false, error: "discord_secret_unavailable" }, { status: 503 });
-      }
-      const body = await req.json().catch(() => ({}));
-      const channelId = typeof body?.channel_id === "string" ? body.channel_id.trim() : "";
-      const text = typeof body?.text === "string" ? body.text : "";
-      const correlationId = typeof body?.correlation_id === "string" && body.correlation_id.trim()
-        ? body.correlation_id.trim()
-        : crypto.randomUUID();
-      try {
-        const adapter = createDiscordAdapter({ token, channelId, receiptStore: discordReceiptStore });
-        const receipt = await adapter.send({ text, correlation_id: correlationId });
-        return Response.json({ ok: receipt.status === "delivered", receipt }, { status: receipt.status === "delivered" ? 200 : 502 });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        return Response.json({ ok: false, error: message }, { status: 400 });
-      }
+      return discordSendHandler(req);
     }
     if (path === "/skills/candidates" && req.method === "GET") {
       const status = new URL(req.url).searchParams.get("status") as "candidate" | "promoted" | "rejected" | null;
