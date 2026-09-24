@@ -27,6 +27,7 @@ const firstMemory = {
   status: 'active',
   supersedes_id: 'memory-old',
   metadata: JSON.stringify({ tier: 'hot', private_note: 'do not render' }),
+  tier: 'hot',
 };
 
 const secondMemory = {

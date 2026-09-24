@@ -13,11 +13,35 @@ function deferred<T>() {
 }
 
 const entry = (title: string) => ({
-  id: title, title, content: `${title} content`, tags: '[]', category: 'note',
-  updated_at: '2026-09-16T00:00:00Z', confidence: 0.9,
+  id: title,
+  title,
+  content: `${title} content`,
+  tags: '[]',
+  category: 'note',
+  created_at: '2026-09-15T00:00:00Z',
+  updated_at: '2026-09-16T00:00:00Z',
+  relevance_score: 0.5,
+  agent_id: 'agent-1',
+  source: 'operator',
+  source_session_id: 'session-1',
+  source_message_ids: '[]',
+  confidence: 0.9,
+  last_used_at: null,
+  usage_count: 0,
+  expires_at: null,
+  review_after: null,
+  status: 'active',
+  supersedes_id: null,
+  metadata: null,
+  tier: 'hot',
+  drive_file_id: null,
+  summary: '',
+  archived_at: null,
+  updated_at_ms: 1,
 });
 const list = vi.fn();
 const recall = vi.fn();
+const recallEntry = (title: string) => ({ memory: entry(title), score: 0.9, matched_terms: [] });
 function search(query: string, enter = false) {
   const input = screen.getByPlaceholderText('Recall by query…');
   fireEvent.change(input, { target: { value: query } });
@@ -56,7 +80,7 @@ describe('Memory recall request honesty', () => {
     expect(recall.mock.calls).toEqual([['alpha'], ['alpha']]);
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
-    await act(async () => retry.resolve([entry('Recovered recall')]));
+    await act(async () => retry.resolve([recallEntry('Recovered recall')]));
     expect(screen.getByText('Recovered recall')).toBeInTheDocument();
     expect(screen.getByText('Results for "alpha"')).toBeInTheDocument();
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
@@ -69,7 +93,7 @@ describe('Memory recall request honesty', () => {
     recall.mockReturnValueOnce(request.promise);
     render(<MemoryView />);
     search('alpha');
-    await act(async () => request.resolve([entry('Recall hit')]));
+    await act(async () => request.resolve([recallEntry('Recall hit')]));
     await act(async () => {
       if (completion === 'resolve') initial.resolve([entry('Old list')]);
       else initial.reject(new Error('old list failure'));
@@ -88,13 +112,13 @@ describe('Memory recall request honesty', () => {
     search('alpha');
     search('beta', true);
     await act(async () => {
-      if (completion === 'resolve') first.resolve([entry('Alpha result')]);
+      if (completion === 'resolve') first.resolve([recallEntry('Alpha result')]);
       else first.reject(new Error('old recall failure'));
     });
     expect(screen.getByRole('status')).toHaveTextContent('Recalling memories');
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.queryByText('Alpha result')).not.toBeInTheDocument();
-    await act(async () => second.resolve([entry('Beta result')]));
+    await act(async () => second.resolve([recallEntry('Beta result')]));
     expect(screen.getByText('Beta result')).toBeInTheDocument();
     expect(screen.getByText('Results for "beta"')).toBeInTheDocument();
   });
@@ -107,7 +131,7 @@ describe('Memory recall request honesty', () => {
     search('alpha');
     search('   ');
     await screen.findByText('Recent memory');
-    await act(async () => request.resolve([entry('Old recall')]));
+    await act(async () => request.resolve([recallEntry('Old recall')]));
     expect(screen.getByText('Recent memory')).toBeInTheDocument();
     expect(screen.queryByText('Old recall')).not.toBeInTheDocument();
     expect(list).toHaveBeenCalledTimes(2);
@@ -115,7 +139,7 @@ describe('Memory recall request honesty', () => {
 
   it('recovers from initial list failure through a successful recall', async () => {
     list.mockRejectedValueOnce(new Error('sqlite unavailable'));
-    recall.mockResolvedValueOnce([entry('Recall hit')]);
+    recall.mockResolvedValueOnce([recallEntry('Recall hit')]);
     render(<MemoryView />);
     expect(await screen.findByRole('alert')).toHaveTextContent('Could not load memories');
     search('alpha');

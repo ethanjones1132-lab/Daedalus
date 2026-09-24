@@ -5,31 +5,13 @@
 import { useState, useEffect, useCallback, useId, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { cn, GlassCard, LoadingState, ErrorState, EmptyState, SectionHeader } from '../ui';
-
-interface MemoryEntry {
-  id: string;
-  title: string;
-  content: string;
-  tags: string;
-  category: string;
-  created_at: string;
-  updated_at: string;
-  relevance_score: number;
-  agent_id: string;
-  source: string;
-  source_session_id?: string | null;
-  source_message_ids: string;
-  confidence: number;
-  last_used_at?: string | null;
-  usage_count: number;
-  expires_at?: string | null;
-  review_after?: string | null;
-  status: 'active' | 'tombstoned' | string;
-  supersedes_id?: string | null;
-  metadata?: string | null;
-}
-
-type Tier = 'hot' | 'warm' | 'cold';
+import {
+  decodeMemoryRecallResults,
+  filterMemoriesByTier,
+  getMemoryTier,
+  type MemoryEntry,
+  type Tier,
+} from './memory-recall-state';
 
 // Defensive formatters — the memory backend has drifted shape during recovery, so the
 // render must never throw on a missing/oddly-typed field (that blanks the whole page).
@@ -58,18 +40,6 @@ function displayValue(value: string | number | null | undefined): string {
     return 'Not supplied';
   }
   return String(value);
-}
-
-function memoryTier(entry: MemoryEntry): Tier | null {
-  if (typeof entry.metadata !== 'string' || !entry.metadata) return null;
-  try {
-    const metadata = JSON.parse(entry.metadata) as { tier?: unknown } | null;
-    return metadata?.tier === 'hot' || metadata?.tier === 'warm' || metadata?.tier === 'cold'
-      ? metadata.tier
-      : null;
-  } catch {
-    return null;
-  }
 }
 
 function fmtConfidence(c: number | undefined | null): string {
@@ -106,9 +76,9 @@ export default function MemoryView() {
     setMemories([]);
     try {
       if (recallQuery) {
-        const results = await invoke<MemoryEntry[]>('memory_recall_preview', { query: recallQuery });
+        const results = await invoke<unknown>('memory_recall_preview', { query: recallQuery });
         if (id !== requestId.current) return;
-        setMemories(results);
+        setMemories(decodeMemoryRecallResults(results));
       } else {
         const [list, stats] = await Promise.all([
           invoke<MemoryEntry[]>('list_recent_memories'),
@@ -133,18 +103,7 @@ export default function MemoryView() {
 
   const search = () => { void load(query); };
 
-  const filtered = tier === 'all'
-    ? memories
-    : memories.filter((m) => {
-        // The recovered engine puts `tier` in metadata; fall back to "hot".
-        if (m.metadata) {
-          try {
-            const md = JSON.parse(m.metadata);
-            if (md.tier) return md.tier === tier;
-          } catch { /* ignore */ }
-        }
-        return tier === 'hot';
-      });
+  const filtered = filterMemoriesByTier(memories, tier);
 
   const selected = selectedId ? filtered.find((memory) => memory.id === selectedId) ?? null : null;
 
@@ -327,9 +286,13 @@ export default function MemoryView() {
                     {displayValue(selected.content)}
                   </p>
                   <h4 className="mt-4 text-xs font-medium text-bone/70">Provenance</h4>
-                  <dl aria-label="Memory provenance" className="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-2 text-xs">
-                    <div>
-                      <dt className="text-bone/40">Source</dt>
+                   <dl aria-label="Memory provenance" className="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-2 text-xs">
+                     <div>
+                       <dt className="text-bone/40">ID</dt>
+                       <dd className="text-bone/75 break-words">{displayValue(selected.id)}</dd>
+                     </div>
+                     <div>
+                       <dt className="text-bone/40">Source</dt>
                       <dd className="text-bone/75 break-words">{displayValue(selected.source)}</dd>
                     </div>
                     <div>
@@ -354,7 +317,7 @@ export default function MemoryView() {
                     </div>
                     <div>
                       <dt className="text-bone/40">Tier</dt>
-                      <dd className="text-bone/75 break-words">{memoryTier(selected) ?? 'Not supplied'}</dd>
+                      <dd className="text-bone/75 break-words">{getMemoryTier(selected) ?? 'Not supplied'}</dd>
                     </div>
                     <div>
                       <dt className="text-bone/40">Tags</dt>
