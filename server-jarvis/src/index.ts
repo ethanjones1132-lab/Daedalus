@@ -186,7 +186,7 @@ import {
 } from "./orchestration/completion-policy";
 import { buildBoundedHistoryBlock, HISTORY_BUDGET_TOKENS } from "./orchestration/context-budget";
 import { SessionReplanCounter } from "./orchestration/replan-telemetry";
-import { conductorLearning, outcomeCollector, selfTuningProposer, SelfTuningStore } from "./self-tuning/mod";
+import { conductorLearning, outcomeCollector, RunFinalizer, selfTuningProposer, SelfTuningStore } from "./self-tuning/mod";
 import { conductorCacheSnapshot, conductorDirectiveSnapshot, recordConductorDirective } from "./orchestration/conductor-metrics";
 import {
   computeCandidatePerformance,
@@ -1400,6 +1400,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     let lastFallbackRetries = 0;
     let lastFallbackModel: string | undefined;
     let orchestratorAgentRunId: string | undefined;
+  let orchestratorRunFinalizer: RunFinalizer | undefined;
     // Track the actual provider the fallback cascade engaged for THIS turn so
     // the per-turn `recordInference` call can attribute the request to the
     // real backend. The cascade can hop from openrouter → opencode_zen →
@@ -3071,11 +3072,29 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           console.warn(`[Jarvis Orchestrator] route override: ${normalized.override_reason}`);
         }
 
-        // Initialize tuned configurations and start run in collector
         const agentRunId = `run_${crypto.randomUUID()}`;
         orchestratorAgentRunId = agentRunId;
         selfTuningProposer.initializeTunedConfigs();
-        outcomeCollector.startAgentRun(agentRunId, sessionId, message, route.task_type, executablePipeline);
+        const runFinalizer = new RunFinalizer({
+          agentRunId,
+          sessionId,
+          userRequest: message,
+          taskType: route.task_type,
+          pipeline: executablePipeline as string[],
+          route,
+          normalizedPipeline: executablePipeline as string[],
+          routeSource: normalized.route_source,
+          conductorSource: route.conductor_source ?? "api",
+          conductorModel: route.conductor_model,
+          latencyMs: coordinatorDurationMs,
+          requirement: turnReq.requirement,
+          store: outcomeCollector.store,
+          collector: outcomeCollector,
+          learning: conductorLearning,
+        });
+        orchestratorRunFinalizer = runFinalizer;
+        runFinalizer.start();
+        const conductorRunId = runFinalizer.runConductorId;
         if (workspaceReadScope) {
           await writer.write(encoder.encode(`data: ${JSON.stringify({
             type: "scope_notice",
@@ -3100,10 +3119,6 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             run_id: agentRunId,
           })}\n\n`));
         }
-        // P5.1: routing source/model/latency previously required cross-referencing
-        // console.log lines with the conductor_runs table by hand to diagnose
-        // (the exact friction hit while diagnosing F1/F2). Emit it as a normal
-        // frame on every turn, not only the rare parse-fallback case.
         await writer.write(encoder.encode(`data: ${JSON.stringify({
           type: "conductor_info",
           source: route.conductor_source ?? "api",
@@ -3112,19 +3127,6 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           session_id: sessionId,
           run_id: agentRunId,
         })}\n\n`));
-        const conductorRunId = conductorLearning.recordRouting({
-          agentRunId,
-          sessionId,
-          route,
-          normalizedPipeline: executablePipeline,
-          routeSource: normalized.route_source,
-          conductorSource: route.conductor_source ?? "api",
-          conductorModel: route.conductor_model,
-          latencyMs: coordinatorDurationMs,
-          // 2026-08-04 B1: persist classified requirement so answer_only
-          // fallbacks that still do real work are diagnosable without inference.
-          requirement: turnReq.requirement,
-        });
         if (!shortCircuit) {
           const coordinatorSucceeded = !route.routing_parse_fallback;
           // Generate stage-run id before attribution so both rows join.
@@ -3159,6 +3161,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           route.worker_instructions,
           route.task_type,
         );
+        runFinalizer.setInstructionVariants(instructionSelection);
         const resolvedSkills = resolveSkillsForTurn(activeTaskRun.objective, route.task_type);
         // Staged policy canary arm: ~10% of turns while a canary is active use
         // request-scoped overlay for routing/budget reads (global maps stay production).
@@ -3589,36 +3592,22 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           answer: trimmedAnswer,
           completion_reason: decision.reason,
         });
-        outcomeCollector.completeAgentRun(
-          agentRunId,
-          finalOutputForLog,
-          duration,
-          turnMetrics.tool_calls,
-          turnMetrics.tokens_total,
-          verifiedRunOutcome,
-          // Only set provenance columns when a verification check actually ran;
-          // leave null when verification is off / no checkResult.
-          reward?.verifiedVia,
-          reward?.checkTier,
-          result.checkResult?.declinedReason,
-          runReward.score,
-          runRewardJson,
-        );
-        if (conductorRunId) {
-          conductorLearning.completeRun({
-            conductorRunId,
-            agentRunId,
-            sessionId,
-            taskType: route.task_type,
-            route,
-            runOutcome: rewardOutcome,
-            workerInstructions: route.worker_instructions,
-            instructionVariants: instructionSelection,
-            stageRuns,
-            modelAttributions,
-            durationMs: duration,
-            userRequest: message,
-          });
+        const terminalStatus = runFinalizer.finalize({
+          finalOutput: finalOutputForLog,
+          durationMs: duration,
+          toolCallsCount: turnMetrics.tool_calls,
+          tokenCount: turnMetrics.tokens_total,
+          outcome: verifiedRunOutcome,
+          verifiedVia: reward?.verifiedVia,
+          checkTier: reward?.checkTier,
+          checkDeclinedReason: result.checkResult?.declinedReason,
+          rewardScore: runReward.score,
+          rewardJson: runRewardJson,
+          stageRuns,
+          modelAttributions,
+          instructionVariants: instructionSelection,
+        });
+        if (conductorRunId && terminalStatus === "claimed") {
           // Staged policy lifecycle on the live request path:
           // - canary arm → noteCanaryPolicyOutcome (may auto-promote/rollback)
           // - candidate/shadow → noteEligiblePolicyOutcome (eligible → shadow →
@@ -3664,7 +3653,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }
         }
         const distillCfg = cfg.orchestrator.skill_distillation;
-        if (distillCfg?.enabled && verifiedRunOutcome === "success" && taskAcceptance.accepted && !repetitionVerdict.repeated) {
+        if (terminalStatus === "claimed" && distillCfg?.enabled && verifiedRunOutcome === "success" && taskAcceptance.accepted && !repetitionVerdict.repeated) {
           const stageRunsForDistill = stageRuns;
           const candidate = distillSkillCandidate({
             agentRunId,
@@ -3707,7 +3696,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
           }
         }
-        await selfTuningProposer.proposeAndApply(agentRunId, route.task_type);
+        if (terminalStatus === "claimed") {
+          await selfTuningProposer.proposeAndApply(agentRunId, route.task_type);
+        }
 
         // Write final done messages
         await writer.write(encoder.encode(`data: ${JSON.stringify({
@@ -4746,15 +4737,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
     } catch (error: any) {
       if (error?.name === "StreamCancelledError") {
-        if (orchestratorAgentRunId) {
-          outcomeCollector.completeAgentRun(
-            orchestratorAgentRunId,
-            "Stream cancelled before the orchestration run reached a terminal answer.",
-            Date.now() - _turnStart,
-            0,
-            sessionCostInfo?.total_tokens ?? 0,
-            "cancelled",
-          );
+        if (orchestratorRunFinalizer) {
+          try {
+            orchestratorRunFinalizer.finalize({
+              finalOutput: "Stream cancelled before the orchestration run reached a terminal answer.",
+              durationMs: Date.now() - _turnStart,
+              outcome: "cancelled",
+            });
+          } catch (finalizationError) {
+            console.warn("[Jarvis Orchestrator] cancellation telemetry failed:", finalizationError);
+          }
         }
         return;
       }
@@ -4806,15 +4798,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             `Try again — the router will pick a different model. (${error?.model ?? "unknown model"}, stage=${error?.stage ?? "unknown"})`
         : errMsg;
       console.error(`[Jarvis] Stream error session=${sessionId} code=${errorCode ?? "<generic>"}:`, userFacingMsg);
-      if (orchestratorAgentRunId) {
-        outcomeCollector.completeAgentRun(
-          orchestratorAgentRunId,
-          userFacingMsg,
-          Date.now() - _turnStart,
-          0,
-          sessionCostInfo?.total_tokens ?? 0,
-          "failed",
-        );
+      if (orchestratorRunFinalizer) {
+        try {
+          orchestratorRunFinalizer.finalize({
+            finalOutput: userFacingMsg,
+            durationMs: Date.now() - _turnStart,
+            outcome: "failed",
+          });
+        } catch (finalizationError) {
+          console.warn("[Jarvis Orchestrator] failure telemetry failed:", finalizationError);
+        }
       }
       const _cfg3 = resolveConfig(options.config);
       recordInference({
@@ -4842,6 +4835,17 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         await session.error(userFacingMsg, errorCode);
       } catch {}
     } finally {
+      if (orchestratorRunFinalizer && !orchestratorRunFinalizer.isFinalized()) {
+        try {
+          orchestratorRunFinalizer.finalize({
+            finalOutput: "The orchestration run ended before a terminal result was recorded.",
+            durationMs: Date.now() - _turnStart,
+            outcome: "failed",
+          });
+        } catch (finalizationError) {
+          console.warn("[Jarvis Orchestrator] finalization fallback failed:", finalizationError);
+        }
+      }
       stopHeartbeat();
       admissionLease?.release();
       cleanupExternalAbort();

@@ -228,6 +228,54 @@ export interface TrajectorySnapshot {
   created_at?: string;
 }
 
+export type ConductorRunOutcome = "success" | "degraded" | "failed";
+
+export type RunFinalizationStatus =
+  | "claimed"
+  | "already_terminal"
+  | "not_started"
+  | "missing"
+  | "missing_conductor"
+  | "unavailable";
+
+export interface TerminalRunInput {
+  finalOutput: string;
+  durationMs: number;
+  toolCallsCount: number;
+  tokenCount: number;
+  outcome: "success" | "degraded" | "failed" | "partial" | "cancelled";
+  verifiedVia?: string | null;
+  checkTier?: string | null;
+  checkDeclinedReason?: string | null;
+  rewardScore?: number | null;
+  rewardJson?: string | null;
+}
+
+export interface InstructionVariantEffect {
+  variantId: string;
+  stageId: string;
+  taskType: string;
+  success: boolean;
+}
+
+export interface AgentPerformanceEffect {
+  agentId: string;
+  stageId: string;
+  taskType: string;
+  success: boolean;
+  durationMs: number;
+}
+
+export interface RunCompletionBundle {
+  conductorRunId: string | null;
+  conductorOutcome: ConductorRunOutcome;
+  instructionVariants: InstructionVariantEffect[];
+  workerInstructionOutcomes: WorkerInstructionOutcome[];
+  agentPerformance: AgentPerformanceEffect[];
+  trajectorySnapshot?: TrajectorySnapshot;
+  maxTrajectorySnapshots?: number;
+}
+
 /** Phase 4: rolling agent performance aggregates. */
 export interface AgentPerformanceRow {
   agent_id: string;
@@ -535,6 +583,13 @@ const SELF_TUNING_SCHEMA = `
 
 const schemaEnsuredPaths = new Set<string>();
 
+class RunFinalizationAbort extends Error {
+  constructor(readonly status: "already_terminal") {
+    super(status);
+    this.name = "RunFinalizationAbort";
+  }
+}
+
 /** Dedicated, WSL-native self-tuning DB path (parent dir created lazily). */
 export function selfTuningDbPath(): string {
   const p = join(homedir(), ".openclaw", "jarvis", "self-tuning.db");
@@ -719,9 +774,9 @@ export class SelfTuningStore {
     }
   }
 
-  insertAgentRun(run: AgentRun): void {
+  insertAgentRun(run: AgentRun): boolean {
     const db = this.getDb();
-    if (!db) return;
+    if (!db) return false;
     try {
       db.prepare(
         `INSERT INTO agent_runs (id, session_id, user_request, task_type, pipeline, completed, final_output, user_rating, duration_ms, tool_calls_count, token_count)
@@ -739,8 +794,10 @@ export class SelfTuningStore {
         run.tool_calls_count ?? null,
         run.token_count ?? null
       );
+      return true;
     } catch (e) {
       console.error("[SelfTuningStore] insertAgentRun failed:", e);
+      return false;
     } finally {
       db.close();
     }
@@ -758,6 +815,218 @@ export class SelfTuningStore {
       db.prepare(`UPDATE agent_runs SET ${setClause} WHERE id = ?`).run(...params);
     } catch (e) {
       console.error("[SelfTuningStore] updateAgentRun failed:", e);
+    } finally {
+      db.close();
+    }
+  }
+
+  completeAgentRunOnce(runId: string, updates: Partial<AgentRun>): boolean {
+    const db = this.getDb();
+    if (!db) return false;
+    try {
+      const keys = Object.keys(updates);
+      if (keys.length === 0) return false;
+      const setClause = keys.map((k) => `${k} = ?`).join(", ");
+      const params = keys.map((k) => (updates as any)[k]);
+      params.push(runId);
+      const result = db
+        .prepare(`UPDATE agent_runs SET ${setClause} WHERE id = ? AND completed = 0`)
+        .run(...params);
+      return result.changes > 0;
+    } catch (e) {
+      console.error("[SelfTuningStore] completeAgentRunOnce failed:", e);
+      return false;
+    } finally {
+      db.close();
+    }
+  }
+
+  private applyRunCompletionEffects(db: Database, completion: RunCompletionBundle): void {
+    for (const effect of completion.instructionVariants) {
+      db.prepare(
+        `INSERT INTO instruction_variant_stats (variant_id, stage_id, task_type, success_count, failure_count, sample_count)
+         VALUES (?, ?, ?, ?, ?, 1)
+         ON CONFLICT(variant_id, stage_id, task_type) DO UPDATE SET
+           success_count = success_count + excluded.success_count,
+           failure_count = failure_count + excluded.failure_count,
+           sample_count = sample_count + 1,
+           last_updated = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
+      ).run(
+        effect.variantId,
+        effect.stageId,
+        effect.taskType,
+        effect.success ? 1 : 0,
+        effect.success ? 0 : 1,
+      );
+    }
+
+    for (const row of completion.workerInstructionOutcomes) {
+      db.prepare(
+        `INSERT INTO worker_instruction_outcomes (id, agent_run_id, stage_id, instruction_hash, instruction_variant, instruction_text, was_successful, had_error)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        row.id,
+        row.agent_run_id,
+        row.stage_id,
+        row.instruction_hash,
+        row.instruction_variant,
+        row.instruction_text ?? null,
+        row.was_successful,
+        row.had_error,
+      );
+    }
+
+    for (const effect of completion.agentPerformance) {
+      db.prepare(
+        `INSERT INTO agent_performance (agent_id, stage_id, task_type, success_count, failure_count, total_duration_ms, sample_count)
+         VALUES (?, ?, ?, ?, ?, ?, 1)
+         ON CONFLICT(agent_id, stage_id, task_type) DO UPDATE SET
+           success_count = success_count + excluded.success_count,
+           failure_count = failure_count + excluded.failure_count,
+           total_duration_ms = total_duration_ms + excluded.total_duration_ms,
+           sample_count = sample_count + 1,
+           last_updated = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
+      ).run(
+        effect.agentId,
+        effect.stageId,
+        effect.taskType,
+        effect.success ? 1 : 0,
+        effect.success ? 0 : 1,
+        effect.durationMs,
+      );
+    }
+
+    if (!completion.trajectorySnapshot) return;
+    const snapshot = completion.trajectorySnapshot;
+    db.prepare(
+      `INSERT INTO trajectory_snapshots (id, agent_run_id, session_id, snapshot_json)
+       VALUES (?, ?, ?, ?)`,
+    ).run(snapshot.id, snapshot.agent_run_id, snapshot.session_id, snapshot.snapshot_json);
+
+    const requestedMax = completion.maxTrajectorySnapshots ?? 500;
+    const effectiveMax = isValidTrajectoryRetention(requestedMax)
+      ? requestedMax
+      : normalizeTrajectoryRetention(requestedMax);
+    if (!isValidTrajectoryRetention(requestedMax)) {
+      console.warn(invalidTrajectoryRetentionMessage(requestedMax, "SelfTuningStore"));
+    }
+    const count = (db.query("SELECT COUNT(*) as c FROM trajectory_snapshots").get() as { c: number }).c;
+    if (count > effectiveMax) {
+      db.prepare(
+        `DELETE FROM trajectory_snapshots WHERE id IN (
+          SELECT id FROM trajectory_snapshots ORDER BY created_at ASC LIMIT ?
+        )`,
+      ).run(count - effectiveMax);
+    }
+  }
+
+  completeConductorRunBundle(
+    id: string,
+    completion: RunCompletionBundle,
+    options: { allowMissingConductor?: boolean } = {},
+  ): RunFinalizationStatus {
+    const db = this.getDb();
+    if (!db) return "unavailable";
+    try {
+      const transaction = db.transaction(() => {
+        const conductor = db
+          .query("SELECT run_outcome FROM conductor_runs WHERE id = ?")
+          .get(id) as { run_outcome: string | null } | null;
+        if (!conductor) {
+          if (!options.allowMissingConductor) return "missing" as const;
+          if (
+            completion.trajectorySnapshot &&
+            db
+              .query("SELECT id FROM trajectory_snapshots WHERE agent_run_id = ? LIMIT 1")
+              .get(completion.trajectorySnapshot.agent_run_id)
+          ) {
+            return "already_terminal" as const;
+          }
+          this.applyRunCompletionEffects(db, completion);
+          return "claimed" as const;
+        }
+        if (conductor.run_outcome != null) return "already_terminal" as const;
+        const result = db
+          .prepare("UPDATE conductor_runs SET run_outcome = ? WHERE id = ? AND run_outcome IS NULL")
+          .run(completion.conductorOutcome, id);
+        if (result.changes !== 1) return "already_terminal" as const;
+        this.applyRunCompletionEffects(db, completion);
+        return "claimed" as const;
+      });
+      return transaction();
+    } catch (e) {
+      console.error("[SelfTuningStore] completeConductorRunBundle failed:", e);
+      return "unavailable";
+    } finally {
+      db.close();
+    }
+  }
+
+  finalizeRun(
+    runId: string,
+    input: TerminalRunInput,
+    completion: RunCompletionBundle,
+  ): RunFinalizationStatus {
+    const db = this.getDb();
+    if (!db) return "unavailable";
+    try {
+      const transaction = db.transaction(() => {
+        const parent = db
+          .query("SELECT completed FROM agent_runs WHERE id = ?")
+          .get(runId) as { completed: number } | null;
+        if (!parent) return "missing" as const;
+        if (parent.completed !== 0) return "already_terminal" as const;
+        if (completion.conductorRunId) {
+          const conductor = db
+            .query("SELECT run_outcome FROM conductor_runs WHERE id = ?")
+            .get(completion.conductorRunId) as { run_outcome: string | null } | null;
+          if (!conductor) return "missing_conductor" as const;
+          if (conductor.run_outcome != null) return "already_terminal" as const;
+        }
+
+        const parentResult = db.prepare(
+          `UPDATE agent_runs
+           SET completed = 1,
+               final_output = ?,
+               duration_ms = ?,
+               tool_calls_count = ?,
+               token_count = ?,
+               outcome = ?,
+               verified_via = ?,
+               check_tier = ?,
+               check_declined_reason = ?,
+               reward_score = ?,
+               reward_json = ?
+           WHERE id = ? AND completed = 0`,
+        ).run(
+          input.finalOutput,
+          input.durationMs,
+          input.toolCallsCount,
+          input.tokenCount,
+          input.outcome,
+          input.verifiedVia ?? null,
+          input.checkTier ?? null,
+          input.checkDeclinedReason ?? null,
+          input.rewardScore ?? null,
+          input.rewardJson ?? null,
+          runId,
+        );
+        if (parentResult.changes !== 1) return "already_terminal" as const;
+
+        if (completion.conductorRunId) {
+          const conductorResult = db.prepare(
+            "UPDATE conductor_runs SET run_outcome = ? WHERE id = ? AND run_outcome IS NULL",
+          ).run(completion.conductorOutcome, completion.conductorRunId);
+          if (conductorResult.changes !== 1) throw new RunFinalizationAbort("already_terminal");
+          this.applyRunCompletionEffects(db, completion);
+        }
+        return "claimed" as const;
+      });
+      return transaction();
+    } catch (e) {
+      if (e instanceof RunFinalizationAbort) return e.status;
+      console.error("[SelfTuningStore] finalizeRun failed:", e);
+      return "unavailable";
     } finally {
       db.close();
     }
@@ -1081,9 +1350,9 @@ export class SelfTuningStore {
     }
   }
 
-  insertConductorRun(run: ConductorRun): void {
+  insertConductorRun(run: ConductorRun): boolean {
     const db = this.getDb();
-    if (!db) return;
+    if (!db) return false;
     try {
       db.prepare(
         `INSERT INTO conductor_runs (id, agent_run_id, session_id, routing_json, conductor_source, conductor_model, task_type, topology, pipeline_json, normalized_pipeline_json, route_source, run_outcome, latency_ms)
@@ -1103,8 +1372,10 @@ export class SelfTuningStore {
         run.run_outcome ?? null,
         run.latency_ms ?? null,
       );
+      return true;
     } catch (e) {
       console.error("[SelfTuningStore] insertConductorRun failed:", e);
+      return false;
     } finally {
       db.close();
     }

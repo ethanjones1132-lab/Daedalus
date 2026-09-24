@@ -3,9 +3,13 @@ import type { CoordinatorResult, StageName, TaskType, WorkerInstructions } from 
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
 import {
   SelfTuningStore,
+  type AgentPerformanceEffect,
+  type InstructionVariantEffect,
   type ModelAttribution,
+  type RunCompletionBundle,
   type StageRun,
   type TuningProposal,
+  type WorkerInstructionOutcome,
 } from "./store";
 import {
   applyLearnedCapabilities,
@@ -63,6 +67,10 @@ export interface RunCompletionInput {
   userRequest: string;
 }
 
+export interface CompletionPreparationOptions {
+  suppressLearning?: boolean;
+}
+
 export interface HeuristicOptimizationResult {
   proposals: TuningProposal[];
   agentsAdjusted: number;
@@ -96,6 +104,104 @@ export class ConductorLearningLoop {
     this.config = config;
   }
 
+  isEnabled(): boolean {
+    return this.config.enabled;
+  }
+
+  hasPendingAttributions(agentRunId: string): boolean {
+    return this.pendingAttributions.has(agentRunId);
+  }
+
+  releasePendingAttributions(agentRunId: string): void {
+    this.pendingAttributions.delete(agentRunId);
+  }
+
+  prepareCompletion(
+    input: RunCompletionInput,
+    options: CompletionPreparationOptions = {},
+  ): RunCompletionBundle {
+    const conductorRunId = input.conductorRunId || null;
+    const instructionVariants: InstructionVariantEffect[] = [];
+    const workerInstructionOutcomes: WorkerInstructionOutcome[] = [];
+    const agentPerformance: AgentPerformanceEffect[] = [];
+    const canLearn = this.config.enabled && conductorRunId !== null && !options.suppressLearning;
+
+    if (canLearn) {
+      const stageByMode = new Map(input.stageRuns.map((stage) => [stage.mode_id, stage]));
+      for (const [stage, variant] of Object.entries(input.instructionVariants.variants)) {
+        const stageRun = stageByMode.get(stage);
+        if (!stageRun) continue;
+        if (
+          stageRun.partial_error_code === "stage_window_exhausted" ||
+          stageRun.partial_error_code === "turn_deadline"
+        ) {
+          continue;
+        }
+        const custom = input.workerInstructions?.[stage as StageName]?.trim();
+        const success = stageRun.was_successful === 1 && stageRun.had_error === 0;
+        instructionVariants.push({
+          variantId: variant,
+          stageId: stage,
+          taskType: input.taskType,
+          success,
+        });
+        workerInstructionOutcomes.push({
+          id: `wi_${crypto.randomUUID()}`,
+          agent_run_id: input.agentRunId,
+          stage_id: stage,
+          instruction_hash: custom ? hashInstruction(custom) : "baseline",
+          instruction_variant: variant,
+          instruction_text: custom?.slice(0, 2000),
+          was_successful: stageRun.was_successful,
+          had_error: stageRun.had_error,
+        });
+      }
+
+      for (const attribution of input.modelAttributions) {
+        if (!attribution.agent_id) continue;
+        agentPerformance.push({
+          agentId: attribution.agent_id,
+          stageId: attribution.stage_id,
+          taskType: input.taskType,
+          success: attribution.was_successful === 1 && attribution.had_error === 0,
+          durationMs: attribution.duration_ms ?? 0,
+        });
+      }
+    }
+
+    const trajectorySnapshot = this.config.enabled && conductorRunId !== null && this.config.trajectory_export
+      ? {
+          id: `traj_${crypto.randomUUID()}`,
+          agent_run_id: input.agentRunId,
+          session_id: input.sessionId,
+          snapshot_json: JSON.stringify({
+            version: 1,
+            agent_run_id: input.agentRunId,
+            session_id: input.sessionId,
+            task_type: input.taskType,
+            run_outcome: input.runOutcome,
+            duration_ms: input.durationMs,
+            routing: input.route,
+            worker_instructions: input.workerInstructions,
+            instruction_variants: input.instructionVariants.variants,
+            stage_runs: input.stageRuns,
+            model_attributions: input.modelAttributions,
+            user_request: input.userRequest.slice(0, 4000),
+          }),
+        }
+      : undefined;
+
+    return {
+      conductorRunId,
+      conductorOutcome: input.runOutcome,
+      instructionVariants,
+      workerInstructionOutcomes,
+      agentPerformance,
+      trajectorySnapshot,
+      maxTrajectorySnapshots: this.config.max_trajectory_snapshots,
+    };
+  }
+
   recordRouting(input: RoutingRecordInput): string {
     if (!this.config.enabled) return "";
     const id = `cond_${crypto.randomUUID()}`;
@@ -106,7 +212,7 @@ export class ConductorLearningLoop {
       ...input.route,
       ...(input.requirement ? { requirement: input.requirement } : {}),
     };
-    this.store.insertConductorRun({
+    const inserted = this.store.insertConductorRun({
       id,
       agent_run_id: input.agentRunId,
       session_id: input.sessionId,
@@ -120,6 +226,7 @@ export class ConductorLearningLoop {
       route_source: input.routeSource,
       latency_ms: input.latencyMs,
     });
+    if (!inserted) return "";
     this.pendingAttributions.set(input.agentRunId, []);
     return id;
   }
@@ -207,74 +314,14 @@ export class ConductorLearningLoop {
     return { instructions: Object.keys(adjusted).length > 0 ? adjusted : undefined, variants };
   }
 
-  completeRun(input: RunCompletionInput): void {
-    if (!this.config.enabled) return;
-
-    this.store.updateConductorRun(input.conductorRunId, { run_outcome: input.runOutcome });
-
-    const stageByMode = new Map(input.stageRuns.map((s) => [s.mode_id, s]));
-    for (const [stage, variant] of Object.entries(input.instructionVariants.variants)) {
-      const stageRun = stageByMode.get(stage);
-      if (!stageRun) continue;
-      // F2/F3: runtime starvation must not train instruction variants.
-      if (
-        stageRun.partial_error_code === "stage_window_exhausted" ||
-        stageRun.partial_error_code === "turn_deadline"
-      ) {
-        continue;
-      }
-      const custom = input.workerInstructions?.[stage as StageName]?.trim();
-      const ok = stageRun.was_successful === 1 && stageRun.had_error === 0;
-      this.store.upsertInstructionVariantStats(variant, stage, input.taskType, ok);
-      this.store.insertWorkerInstructionOutcome({
-        id: `wi_${crypto.randomUUID()}`,
-        agent_run_id: input.agentRunId,
-        stage_id: stage,
-        instruction_hash: custom ? hashInstruction(custom) : "baseline",
-        instruction_variant: variant,
-        instruction_text: custom?.slice(0, 2000),
-        was_successful: stageRun.was_successful,
-        had_error: stageRun.had_error,
-      });
-    }
-
-    for (const attr of input.modelAttributions) {
-      if (!attr.agent_id) continue;
-      const ok = attr.was_successful === 1 && attr.had_error === 0;
-      this.store.upsertAgentPerformance(
-        attr.agent_id,
-        attr.stage_id,
-        input.taskType,
-        ok,
-        attr.duration_ms ?? 0,
-      );
-    }
-
-    if (this.config.trajectory_export) {
-      const snapshot = {
-        version: 1,
-        agent_run_id: input.agentRunId,
-        session_id: input.sessionId,
-        task_type: input.taskType,
-        run_outcome: input.runOutcome,
-        duration_ms: input.durationMs,
-        routing: input.route,
-        worker_instructions: input.workerInstructions,
-        instruction_variants: input.instructionVariants.variants,
-        stage_runs: input.stageRuns,
-        model_attributions: input.modelAttributions,
-        user_request: input.userRequest.slice(0, 4000),
-      };
-      this.store.insertTrajectorySnapshot({
-        id: `traj_${crypto.randomUUID()}`,
-        agent_run_id: input.agentRunId,
-        session_id: input.sessionId,
-        snapshot_json: JSON.stringify(snapshot),
-      });
-      this.store.pruneTrajectorySnapshots(this.config.max_trajectory_snapshots);
-    }
-
-    this.pendingAttributions.delete(input.agentRunId);
+  completeRun(input: RunCompletionInput): boolean {
+    if (!this.config.enabled) return false;
+    const completion = this.prepareCompletion(input);
+    const status = this.store.completeConductorRunBundle(input.conductorRunId, completion, {
+      allowMissingConductor: true,
+    });
+    this.releasePendingAttributions(input.agentRunId);
+    return status === "claimed";
   }
 
   async optimizeAndApply(agentRunId: string, taskType: TaskType, agents: OrchestratorAgent[]): Promise<HeuristicOptimizationResult> {

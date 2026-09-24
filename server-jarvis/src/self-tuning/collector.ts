@@ -8,13 +8,13 @@ import {
 import { evaluatePendingTuningOutcomes } from "./outcome-loop";
 
 export class SessionOutcomeCollector {
-  private store: SelfTuningStore;
+  readonly store: SelfTuningStore;
 
   constructor(store?: SelfTuningStore) {
     this.store = store || new SelfTuningStore();
   }
 
-  startAgentRun(runId: string, sessionId: string, request: string, taskType: string, pipeline: string[]): void {
+  startAgentRun(runId: string, sessionId: string, request: string, taskType: string, pipeline: string[]): boolean {
     const run: AgentRun = {
       id: runId,
       session_id: sessionId,
@@ -23,7 +23,7 @@ export class SessionOutcomeCollector {
       pipeline: JSON.stringify(pipeline),
       completed: 0,
     };
-    this.store.insertAgentRun(run);
+    return this.store.insertAgentRun(run);
   }
 
   recordStageRun(stage: StageRun): void {
@@ -69,8 +69,8 @@ export class SessionOutcomeCollector {
     rewardScore?: number | null,
     /** Phase B reward breakdown JSON for offline replay. Optional. */
     rewardJson?: string | null,
-  ): void {
-    this.store.updateAgentRun(runId, {
+  ): boolean {
+    const claimed = this.store.completeAgentRunOnce(runId, {
       completed: 1,
       final_output: finalOutput,
       duration_ms: durationMs,
@@ -83,6 +83,7 @@ export class SessionOutcomeCollector {
       reward_score: rewardScore ?? null,
       reward_json: rewardJson ?? null,
     });
+    if (!claimed) return false;
 
     // M7: close the self-tuning loop — once enough post-apply runs exist for
     // an applied proposal's task_type, write tuning_outcomes (measured vs baseline).
@@ -91,6 +92,7 @@ export class SessionOutcomeCollector {
     } catch (e) {
       console.error("[SessionOutcomeCollector] evaluatePendingTuningOutcomes failed:", e);
     }
+    return true;
   }
 
   submitUserRating(runId: string, rating: number): void {
