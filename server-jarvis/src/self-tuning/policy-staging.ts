@@ -26,6 +26,7 @@ import {
   snapshotStagedPolicyFields,
   type PolicySnapshot,
 } from "./learned-pool-state";
+import { getGlobalTheta, setGlobalTheta, THETA_KEYS } from "../orchestration/orchestration-policy";
 
 /** Re-export so consumers can import staged-policy types from one module. */
 export type { PolicySnapshot } from "./learned-pool-state";
@@ -735,6 +736,291 @@ export function rollbackPolicy(reason: string): TransitionResult {
 
 // ── Persistence ─────────────────────────────────────────────────────────────
 
+const POLICY_DOMAINS = new Set<PolicyDomain>(["routing", "budget", "recovery"]);
+const POLICY_STAGES = new Set<PolicyStage>([
+  "candidate",
+  "shadow",
+  "canary",
+  "production",
+  "rolled_back",
+  "rejected",
+]);
+const THETA_KEY_NAMES = new Set<string>(THETA_KEYS);
+
+class PolicyVersionValidationError extends Error {
+  constructor(readonly reason: string) {
+    super(reason);
+  }
+}
+
+function rejectPolicyState(reason: string): never {
+  throw new PolicyVersionValidationError(reason);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isCounter(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isPolicyDomain(value: unknown): value is PolicyDomain {
+  return typeof value === "string" && POLICY_DOMAINS.has(value as PolicyDomain);
+}
+
+function isPolicyStage(value: unknown): value is PolicyStage {
+  return typeof value === "string" && POLICY_STAGES.has(value as PolicyStage);
+}
+
+function validateNumberMap(
+  value: unknown,
+  missingReason: string,
+  invalidReason: string,
+): void {
+  if (!isRecord(value)) rejectPolicyState(missingReason);
+  for (const [key, entry] of Object.entries(value)) {
+    if (key.length === 0 || !isFiniteNumber(entry)) rejectPolicyState(invalidReason);
+  }
+}
+
+function validateRecoveryMap(value: unknown, missingReason: string, invalidReason: string): void {
+  if (!isRecord(value)) rejectPolicyState(missingReason);
+  for (const [key, entry] of Object.entries(value)) {
+    if (key.length === 0) rejectPolicyState(invalidReason);
+    if (typeof entry === "string" || typeof entry === "boolean") continue;
+    if (!isFiniteNumber(entry)) rejectPolicyState(invalidReason);
+  }
+}
+
+function validateTheta(value: unknown): void {
+  if (!isRecord(value)) rejectPolicyState("invalid_theta");
+  for (const [key, entry] of Object.entries(value)) {
+    if (!THETA_KEY_NAMES.has(key) || !isFiniteNumber(entry)) rejectPolicyState("invalid_theta");
+  }
+}
+
+function validateSnapshot(value: unknown): PolicySnapshot {
+  if (!isRecord(value)) rejectPolicyState("missing_snapshot");
+  validateNumberMap(
+    value.modelRoutingScoreDeltas,
+    "missing_map",
+    "nonnumeric_map",
+  );
+  validateNumberMap(
+    value.stageModelRoutingScoreDeltas,
+    "missing_map",
+    "nonnumeric_map",
+  );
+  validateNumberMap(value.fallbackBoosts, "missing_map", "nonnumeric_map");
+  validateNumberMap(value.modelFirstTokenTimeouts, "missing_map", "nonnumeric_map");
+  validateRecoveryMap(value.recovery, "missing_map", "invalid_recovery");
+  if (value.theta !== undefined) validateTheta(value.theta);
+  return value as unknown as PolicySnapshot;
+}
+
+function validatePatch(value: unknown, versionDomain: PolicyDomain): PolicyPatch {
+  if (!isRecord(value) || !isPolicyDomain(value.domain) || value.domain !== versionDomain) {
+    rejectPolicyState("invalid_patch");
+  }
+  const patch = value as Record<string, unknown>;
+  if (patch.modelRoutingScoreDeltas !== undefined) {
+    validateNumberMap(patch.modelRoutingScoreDeltas, "invalid_patch", "nonnumeric_map");
+  }
+  if (patch.stageModelRoutingScoreDeltas !== undefined) {
+    validateNumberMap(patch.stageModelRoutingScoreDeltas, "invalid_patch", "nonnumeric_map");
+  }
+  if (patch.fallbackBoosts !== undefined) {
+    validateNumberMap(patch.fallbackBoosts, "invalid_patch", "nonnumeric_map");
+  }
+  if (patch.modelFirstTokenTimeouts !== undefined) {
+    validateNumberMap(patch.modelFirstTokenTimeouts, "invalid_patch", "nonnumeric_map");
+  }
+  if (patch.recovery !== undefined) {
+    validateRecoveryMap(patch.recovery, "invalid_patch", "invalid_recovery");
+  }
+  if (patch.theta !== undefined) validateTheta(patch.theta);
+  return value as unknown as PolicyPatch;
+}
+
+function validateCounterSet(
+  value: Record<string, unknown>,
+  fields: readonly string[],
+  totalField: string,
+  mismatchReason: string,
+): void {
+  let total = 0;
+  for (const field of fields) {
+    const counter = value[field];
+    if (!isCounter(counter)) rejectPolicyState("invalid_counter");
+    total += counter;
+  }
+  const totalValue = value[totalField];
+  if (!isCounter(totalValue)) rejectPolicyState("invalid_counter");
+  if (totalValue !== total) rejectPolicyState(mismatchReason);
+}
+
+function validateShadow(value: unknown): void {
+  if (!isRecord(value)) rejectPolicyState("invalid_shadow");
+  validateCounterSet(value, ["successCount", "failureCount"], "replayed", "counter_mismatch");
+  if (value.completedAt !== undefined && typeof value.completedAt !== "string") {
+    rejectPolicyState("invalid_shadow");
+  }
+}
+
+function validateCanaryStats(value: unknown): void {
+  if (!isRecord(value)) rejectPolicyState("invalid_canary_stats");
+  validateCounterSet(
+    value,
+    ["successCount", "failureCount"],
+    "runs",
+    "counter_mismatch",
+  );
+  validateCounterSet(
+    value,
+    ["productionSuccessCount", "productionFailureCount"],
+    "productionRuns",
+    "counter_mismatch",
+  );
+}
+
+function validateHistory(value: unknown): void {
+  if (!Array.isArray(value)) rejectPolicyState("invalid_history");
+  for (const entry of value) {
+    if (!isRecord(entry)) rejectPolicyState("invalid_history");
+    if (typeof entry.at !== "string" || typeof entry.reason !== "string") {
+      rejectPolicyState("invalid_history");
+    }
+    if (!isPolicyStage(entry.from) || !isPolicyStage(entry.to)) rejectPolicyState("invalid_history");
+  }
+}
+
+function validateVersion(value: unknown, slot: keyof PolicyVersionStore): PolicyVersion | null {
+  if (value === null) return null;
+  if (!isRecord(value)) rejectPolicyState("invalid_version");
+  if (typeof value.id !== "string" || value.id.length === 0) rejectPolicyState("invalid_version");
+  if (!isCounter(value.version)) rejectPolicyState("invalid_version");
+  if (!isPolicyStage(value.stage)) rejectPolicyState("invalid_stage");
+  if (!isPolicyDomain(value.domain)) rejectPolicyState("invalid_domain");
+  if (typeof value.rationale !== "string") rejectPolicyState("invalid_version");
+  if (typeof value.createdAt !== "string" || typeof value.updatedAt !== "string") {
+    rejectPolicyState("invalid_version");
+  }
+  validateSnapshot(value.snapshot);
+  validatePatch(value.patch, value.domain);
+  validateCounterSet(
+    value,
+    ["eligibleSuccessCount", "eligibleFailureCount"],
+    "eligibleOutcomes",
+    "counter_mismatch",
+  );
+  validateHistory(value.history);
+  if (value.shadow !== undefined) validateShadow(value.shadow);
+  if (value.canaryStats !== undefined) validateCanaryStats(value.canaryStats);
+
+  if (value.stage === "shadow" && value.shadow === undefined) {
+    rejectPolicyState("missing_shadow");
+  }
+  if (value.stage === "canary" && value.canaryStats === undefined) {
+    rejectPolicyState("missing_canary_stats");
+  }
+  if (slot === "production" && value.stage !== "production") rejectPolicyState("invalid_stage");
+  if (slot === "lastKnownGood" && value.stage !== "production") rejectPolicyState("invalid_stage");
+  if (slot === "canary" && value.stage !== "canary") rejectPolicyState("invalid_stage");
+  if (slot === "candidate" && !["candidate", "shadow", "canary"].includes(value.stage)) {
+    rejectPolicyState("invalid_stage");
+  }
+  return value as unknown as PolicyVersion;
+}
+
+function validateStorePointerConsistency(store: {
+  production: PolicyVersion | null;
+  candidate: PolicyVersion | null;
+  canary: PolicyVersion | null;
+  lastKnownGood: PolicyVersion | null;
+}): void {
+  const { production, candidate, canary, lastKnownGood } = store;
+  if (canary && !candidate) rejectPolicyState("pointer_mismatch");
+  if (candidate?.stage === "canary" && !canary) rejectPolicyState("pointer_mismatch");
+  if (canary && candidate && JSON.stringify(candidate) !== JSON.stringify(canary)) {
+    rejectPolicyState("pointer_mismatch");
+  }
+  if (lastKnownGood && !production) rejectPolicyState("pointer_mismatch");
+
+  const ids = new Map<string, string>();
+  const versions = new Set<number>();
+  for (const [slot, version] of [
+    ["production", production],
+    ["candidate", candidate],
+    ["canary", canary],
+    ["lastKnownGood", lastKnownGood],
+  ] as const) {
+    if (!version) continue;
+    if (slot !== "canary" && ids.has(version.id)) rejectPolicyState("pointer_mismatch");
+    ids.set(version.id, slot);
+    if (slot !== "canary" && versions.has(version.version)) {
+      rejectPolicyState("pointer_mismatch");
+    }
+    versions.add(version.version);
+  }
+  if (lastKnownGood && production && lastKnownGood.id === production.id) {
+    rejectPolicyState("pointer_mismatch");
+  }
+  if (production && candidate && candidate.id === production.id) {
+    rejectPolicyState("pointer_mismatch");
+  }
+  if (production && canary && canary.id === production.id) {
+    rejectPolicyState("pointer_mismatch");
+  }
+}
+
+function parsePolicyVersionStore(raw: unknown): PolicyVersionStore {
+  if (!isRecord(raw)) rejectPolicyState("invalid_root");
+  if (raw.schemaVersion !== 1) rejectPolicyState("unknown_schema");
+  if (!isCounter(raw.nextVersion) || raw.nextVersion < 1) rejectPolicyState("invalid_next_version");
+  for (const field of ["production", "candidate", "canary", "lastKnownGood"] as const) {
+    if (!Object.prototype.hasOwnProperty.call(raw, field)) rejectPolicyState("missing_slot");
+  }
+
+  const production = validateVersion(raw.production, "production");
+  const candidate = validateVersion(raw.candidate, "candidate");
+  const canary = validateVersion(raw.canary, "canary");
+  const lastKnownGood = validateVersion(raw.lastKnownGood, "lastKnownGood");
+  const parsed: PolicyVersionStore = {
+    schemaVersion: 1,
+    nextVersion: raw.nextVersion,
+    production,
+    candidate,
+    canary,
+    lastKnownGood,
+  };
+  validateStorePointerConsistency(parsed);
+  let maxVersion = 0;
+  for (const version of [production, candidate, canary, lastKnownGood]) {
+    if (version) maxVersion = Math.max(maxVersion, version.version);
+  }
+  if (parsed.nextVersion <= maxVersion) rejectPolicyState("invalid_next_version");
+  return parsed;
+}
+
+function restoreStagedPolicyMaps(snapshot: PolicySnapshot): void {
+  const state = getLearnedPoolState();
+  state.modelRoutingScoreDeltas.clear();
+  state.stageModelRoutingScoreDeltas.clear();
+  state.fallbackBoosts.clear();
+  state.modelFirstTokenTimeouts.clear();
+  state.recoveryPolicy.clear();
+  applyPolicySnapshotToPool(snapshot, state);
+}
+
+function warnInvalidPolicyVersions(reason: string): void {
+  console.warn(`[PolicyStaging] Ignoring invalid policy versions: ${reason}`);
+}
+
 export function policyVersionsPath(root: string = SESSIONS_DIR): string {
   return join(root, "self-tuning", "policy-versions.json");
 }
@@ -787,25 +1073,34 @@ export function reapplyProductionPolicySnapshot(): boolean {
 export function loadPolicyVersions(root: string = SESSIONS_DIR): void {
   const path = policyVersionsPath(root);
   if (!existsSync(path)) return;
+
+  let raw: unknown;
   try {
-    const raw = JSON.parse(readFileSync(path, "utf-8")) as Partial<PolicyVersionStore>;
-    if (raw.schemaVersion !== 1) {
-      console.warn(`[PolicyStaging] Unknown schema_version=${String(raw.schemaVersion)}; ignoring`);
-      return;
-    }
-    store = {
-      schemaVersion: 1,
-      nextVersion: Math.max(1, Number(raw.nextVersion) || 1),
-      production: (raw.production as PolicyVersion | null) ?? null,
-      candidate: (raw.candidate as PolicyVersion | null) ?? null,
-      canary: (raw.canary as PolicyVersion | null) ?? null,
-      lastKnownGood: (raw.lastKnownGood as PolicyVersion | null) ?? null,
-    };
-    // Re-apply production snapshot so routing/budget maps match disk after restart.
+    raw = JSON.parse(readFileSync(path, "utf-8"));
+  } catch {
+    warnInvalidPolicyVersions("invalid_json");
+    return;
+  }
+
+  let validated: PolicyVersionStore;
+  try {
+    validated = parsePolicyVersionStore(raw);
+  } catch (error) {
+    const reason = error instanceof PolicyVersionValidationError ? error.reason : "invalid_state";
+    warnInvalidPolicyVersions(reason === "unknown_schema" ? reason : `invalid_state (${reason})`);
+    return;
+  }
+
+  const previousStore = store;
+  const previousPool = snapshotStagedPolicyFields(getLearnedPoolState());
+  const previousTheta = getGlobalTheta();
+  try {
+    store = validated;
     reapplyProductionPolicySnapshot();
-  } catch (e) {
-    console.warn(
-      `[PolicyStaging] Failed to load: ${e instanceof Error ? e.message : String(e)}`,
-    );
+  } catch {
+    store = previousStore;
+    restoreStagedPolicyMaps(previousPool);
+    setGlobalTheta(previousTheta);
+    warnInvalidPolicyVersions("apply_failed");
   }
 }

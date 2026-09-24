@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
@@ -28,6 +28,7 @@ import {
   type PolicyPatch,
 } from "./policy-staging";
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
+import { policy, resetGlobalThetaToBaseline } from "../orchestration/orchestration-policy";
 
 const routingPatch: PolicyPatch = {
   domain: "routing",
@@ -62,6 +63,39 @@ function advanceToCanary(successRate = 0.9): void {
   expect(r.action).toBe("entered_canary");
   expect(r.version?.stage).toBe("canary");
   expect(getPolicyVersionStore().canary?.id).toBe(r.version?.id);
+}
+
+function captureWarnings(action: () => void): string[] {
+  const warnings: string[] = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map(String).join(" "));
+  };
+  try {
+    action();
+  } finally {
+    console.warn = original;
+  }
+  return warnings;
+}
+
+function promoteValidPolicy(): void {
+  advanceToCanary(1.0);
+  for (let i = 0; i < POLICY_STAGING_THRESHOLDS.minCanaryRunsBeforePromotion; i++) {
+    recordCanaryOutcome("canary", true);
+    recordCanaryOutcome("production", true);
+  }
+}
+
+function snapshotPool(): Record<string, Array<[string, unknown]>> {
+  const state = getLearnedPoolState();
+  return {
+    modelRoutingScoreDeltas: [...state.modelRoutingScoreDeltas.entries()],
+    stageModelRoutingScoreDeltas: [...state.stageModelRoutingScoreDeltas.entries()],
+    fallbackBoosts: [...state.fallbackBoosts.entries()],
+    modelFirstTokenTimeouts: [...state.modelFirstTokenTimeouts.entries()],
+    recoveryPolicy: [...state.recoveryPolicy.entries()],
+  };
 }
 
 describe("policy staging thresholds", () => {
@@ -252,6 +286,7 @@ describe("restart survival", () => {
   afterEach(() => {
     resetPolicyStagingForTests();
     resetLearnedPoolStateForTests();
+    resetGlobalThetaToBaseline();
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -297,6 +332,162 @@ describe("restart survival", () => {
     expect(
       getLearnedPoolState().modelRoutingScoreDeltas.get("opencode_go:deepseek-v4-flash"),
     ).toBe(0.12);
+  });
+
+  test("valid persisted theta is re-applied after restart", () => {
+    const proposed = proposePolicy(
+      { domain: "budget", theta: { routing_timeout_ms: 25_000 } },
+      "valid theta restart",
+    );
+    expect(proposed.action).toBe("proposed");
+    for (let i = 0; i < POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow; i++) {
+      recordEligibleOutcome("success");
+    }
+    expect(runShadowReplay(Array.from({ length: 20 }, () => ({ success: true }))).action).toBe(
+      "entered_canary",
+    );
+    for (let i = 0; i < POLICY_STAGING_THRESHOLDS.minCanaryRunsBeforePromotion; i++) {
+      recordCanaryOutcome("canary", true);
+      recordCanaryOutcome("production", true);
+    }
+    persistPolicyVersions(root);
+
+    resetPolicyStagingForTests();
+    resetLearnedPoolStateForTests();
+    loadPolicyVersions(root);
+
+    expect(policy().routing_timeout_ms).toBe(25_000);
+  });
+
+  test("unknown schema is ignored atomically with a stable warning", () => {
+    promoteValidPolicy();
+    const beforeStore = JSON.parse(JSON.stringify(getPolicyVersionStore()));
+    const beforePool = snapshotPool();
+    persistPolicyVersions(root);
+    const raw = JSON.parse(readFileSync(policyVersionsPath(root), "utf-8"));
+    raw.schemaVersion = 2;
+    writeFileSync(policyVersionsPath(root), JSON.stringify(raw), "utf-8");
+
+    const warnings = captureWarnings(() => loadPolicyVersions(root));
+
+    expect(warnings).toContain("[PolicyStaging] Ignoring invalid policy versions: unknown_schema");
+    expect(getPolicyVersionStore()).toEqual(beforeStore);
+    expect(snapshotPool()).toEqual(beforePool);
+  });
+
+  test("malformed snapshots are ignored atomically", () => {
+    promoteValidPolicy();
+    const beforeStore = JSON.parse(JSON.stringify(getPolicyVersionStore()));
+    const beforePool = snapshotPool();
+    persistPolicyVersions(root);
+    const validRaw = JSON.parse(readFileSync(policyVersionsPath(root), "utf-8"));
+    const mutations: Array<[string, (raw: any) => void]> = [
+      ["missing_snapshot", (raw) => delete raw.production.snapshot],
+      ["missing_map", (raw) => delete raw.production.snapshot.modelRoutingScoreDeltas],
+      ["nonnumeric_map", (raw) => { raw.production.snapshot.modelRoutingScoreDeltas = { bad: "1" }; }],
+      ["invalid_theta", (raw) => { raw.production.snapshot.theta = { unknown_dimension: 1 }; }],
+      ["invalid_recovery", (raw) => { raw.production.snapshot.recovery = { bad: null }; }],
+    ];
+
+    for (const [label, mutate] of mutations) {
+      const raw = JSON.parse(JSON.stringify(validRaw));
+      mutate(raw);
+      writeFileSync(policyVersionsPath(root), JSON.stringify(raw), "utf-8");
+      const warnings = captureWarnings(() => loadPolicyVersions(root));
+      expect(warnings).toContain(`[PolicyStaging] Ignoring invalid policy versions: invalid_state (${label})`);
+      expect(getPolicyVersionStore()).toEqual(beforeStore);
+      expect(snapshotPool()).toEqual(beforePool);
+    }
+  });
+
+  test("invalid stages, counters, and pointers are ignored atomically", () => {
+    promoteValidPolicy();
+    const beforeStore = JSON.parse(JSON.stringify(getPolicyVersionStore()));
+    const beforePool = snapshotPool();
+    persistPolicyVersions(root);
+    const validRaw = JSON.parse(readFileSync(policyVersionsPath(root), "utf-8"));
+    const mutations: Array<[string, (raw: any) => void]> = [
+      ["invalid_stage", (raw) => { raw.production.stage = "candidate"; }],
+      ["negative_counter", (raw) => { raw.production.eligibleOutcomes = -1; }],
+      ["counter_mismatch", (raw) => { raw.production.eligibleSuccessCount += 1; }],
+      ["invalid_next_version", (raw) => { raw.nextVersion = 0; }],
+      ["invalid_lkg_stage", (raw) => { raw.lastKnownGood.stage = "candidate"; }],
+      ["duplicate_production_lkg_id", (raw) => { raw.lastKnownGood.id = raw.production.id; }],
+    ];
+
+    for (const [label, mutate] of mutations) {
+      const raw = JSON.parse(JSON.stringify(validRaw));
+      mutate(raw);
+      writeFileSync(policyVersionsPath(root), JSON.stringify(raw), "utf-8");
+      const warnings = captureWarnings(() => loadPolicyVersions(root));
+      const reason = label === "negative_counter"
+        ? "invalid_counter"
+        : label === "invalid_lkg_stage"
+          ? "invalid_stage"
+          : label === "duplicate_production_lkg_id"
+            ? "pointer_mismatch"
+            : label;
+      expect(warnings).toContain(`[PolicyStaging] Ignoring invalid policy versions: invalid_state (${reason})`);
+      expect(getPolicyVersionStore()).toEqual(beforeStore);
+      expect(snapshotPool()).toEqual(beforePool);
+    }
+  });
+
+  test("candidate and canary pointers must describe the same version", () => {
+    advanceToCanary(1.0);
+    const beforeStore = JSON.parse(JSON.stringify(getPolicyVersionStore()));
+    const beforePool = snapshotPool();
+    persistPolicyVersions(root);
+    const raw = JSON.parse(readFileSync(policyVersionsPath(root), "utf-8"));
+    raw.candidate.id = "different-version";
+    writeFileSync(policyVersionsPath(root), JSON.stringify(raw), "utf-8");
+
+    const warnings = captureWarnings(() => loadPolicyVersions(root));
+
+    expect(warnings).toContain("[PolicyStaging] Ignoring invalid policy versions: invalid_state (pointer_mismatch)");
+    expect(getPolicyVersionStore()).toEqual(beforeStore);
+    expect(snapshotPool()).toEqual(beforePool);
+  });
+
+  test("malformed JSON is ignored atomically", () => {
+    promoteValidPolicy();
+    const beforeStore = JSON.parse(JSON.stringify(getPolicyVersionStore()));
+    const beforePool = snapshotPool();
+    persistPolicyVersions(root);
+    writeFileSync(policyVersionsPath(root), "{", "utf-8");
+
+    const warnings = captureWarnings(() => loadPolicyVersions(root));
+
+    expect(warnings).toContain("[PolicyStaging] Ignoring invalid policy versions: invalid_json");
+    expect(getPolicyVersionStore()).toEqual(beforeStore);
+    expect(snapshotPool()).toEqual(beforePool);
+  });
+
+  test("a valid empty schema-v1 store loads without creating versions", () => {
+    persistPolicyVersions(root);
+    writeFileSync(
+      policyVersionsPath(root),
+      JSON.stringify({
+        schemaVersion: 1,
+        nextVersion: 1,
+        production: null,
+        candidate: null,
+        canary: null,
+        lastKnownGood: null,
+      }),
+      "utf-8",
+    );
+
+    loadPolicyVersions(root);
+
+    expect(getPolicyVersionStore()).toEqual({
+      schemaVersion: 1,
+      nextVersion: 1,
+      production: null,
+      candidate: null,
+      canary: null,
+      lastKnownGood: null,
+    });
   });
 
   test("load is a no-op when no file exists", () => {
