@@ -150,6 +150,7 @@ import { ModelScorecard, type ScorecardAttempt } from "./orchestration/model-sco
 import { computeBoundedRequestTimeoutMs, createTurnBudget, requestTimeoutMessage } from "./orchestration/turn-budget";
 import { assessWorkspaceEvidence, isDeepReadRequest, resolveWorkspaceReadScope } from "./orchestration/evidence-sufficiency";
 import { FORCE_DEEP_READ_PATTERN } from "./orchestration/repetition-guard";
+import { acquireAdmissionForStream } from "./orchestration/admission-boundary";
 import { OrchestrationAdmissionController, type AdmissionLease } from "./orchestration/admission-controller";
 import type { PipelineProgressState, PipelineRecursionEvent } from "./orchestration/pipeline";
 import { ConductorBus } from "./orchestration/conductor-bus";
@@ -1411,6 +1412,28 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     let lastActualModelUsed: string | undefined;
     try {
       const systemPrompt = options.systemPromptOverride ?? cfg.system_prompt;
+      const acquiredLease = await acquireAdmissionForStream({
+        acquire: () => orchestrationAdmission.acquire({
+          workClass: surface === "cron" ? "background" : "interactive",
+          signal: streamAbort.signal,
+          deadlineAt: turnBudget.deadlineAt,
+        }),
+        onDeadline: async () => {
+          if (sessionMemory.getTaskRun(sessionId) === activeTaskRun) {
+            sessionMemory.updateTaskRun(sessionId, {
+              status: "paused",
+              lastOutcome: "admission_deadline",
+            });
+          }
+          await session.error(
+            "The turn deadline expired while waiting for orchestration capacity.",
+            "turn_deadline_exceeded",
+          );
+        },
+        onCancelled: emitCancelled,
+      });
+      if (!acquiredLease) return;
+      admissionLease = acquiredLease;
       const isOllama = cfg.active_backend === "ollama";
       const ollamaTarget = isOllama ? await resolveOllamaChatTarget(cfg) : null;
       const resolvedOpenRouterModel = cfg.active_backend === "openrouter"
@@ -1424,11 +1447,6 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
       console.log(`[Jarvis] Stream start session=${sessionId} backend=${cfg.active_backend} model=${modelLabel}`);
       await session.init(modelLabel);
-      admissionLease = await orchestrationAdmission.acquire({
-        workClass: surface === "cron" ? "background" : "interactive",
-        signal: streamAbort.signal,
-        deadlineAt: turnBudget.deadlineAt,
-      });
       await streamWrite(`data: ${JSON.stringify({
         type: "orchestrator_queue",
         queue_wait_ms: admissionLease.queue_wait_ms,
