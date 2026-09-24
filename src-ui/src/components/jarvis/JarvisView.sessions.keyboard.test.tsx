@@ -126,6 +126,9 @@ describe('Jarvis Session selection', () => {
 
     deleteBeta.focus();
     await user.keyboard('{Enter}');
+    expect(invokeMock).not.toHaveBeenCalledWith('jarvis_delete_session', { sessionId: 'session-2' });
+    const dialog = screen.getByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: 'Delete' }));
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('jarvis_delete_session', { sessionId: 'session-2' }));
 
     expect(selectionButton('Alpha')).toHaveAttribute('aria-pressed', 'true');

@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useLayoutEffect, memo } from 
 import { motion, AnimatePresence } from 'framer-motion';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
-import { cn, EmptyState, LoadingState, ErrorState } from '../ui';
+import { cn, ConfirmModal, EmptyState, LoadingState, ErrorState } from '../ui';
 import type { CompanionState } from './types';
 import {
   JarvisSession, JarvisMessage, JarvisConfig, JarvisStatus, SessionRunRecord,
@@ -46,6 +46,11 @@ import {
 import { errorDisplayForCode } from './error-display';
 import { formatSessionStatsLine, shouldShowSessionStats } from './session-stats';
 import { filterSessions, formatFilterResultCount } from './session-filter';
+import {
+  reconcileSessionDeletions,
+  sessionDeleteLocked,
+  type SessionDeleteOperation,
+} from './session-delete-state';
 import {
   Send, Square, Bot, User, Wrench, Check, Copy, ChevronDown,
   ChevronRight, Sparkles, LoaderCircle, Plus, ArrowDown,
@@ -102,6 +107,9 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
   const [sessionsError, setSessionsError] = useState<string | null>(null);
   const sessionsRequest = useRef(0);
   const [sessionRuns, setSessionRuns] = useState<Record<string, SessionRunRecord>>({});
+  const [sessionDeleteOperations, setSessionDeleteOperations] = useState<Record<string, SessionDeleteOperation<JarvisSession>>>({});
+  const sessionDeleteOperationsRef = useRef<Record<string, SessionDeleteOperation<JarvisSession>>>({});
+  const sessionDeleteReadPending = useRef(false);
   const [activeSession, setActiveSession] = useState<string | null>(null);
   const [config, setConfig] = useState<JarvisConfig | null>(null);
   const [status, setStatus] = useState<JarvisStatus | null>(null);
@@ -112,8 +120,16 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
   const [statusError, setStatusError] = useState(false);
   const statusPending = useRef(false);
 
-  const loadSessions = useCallback(async () => {
+  const publishSessionDeleteOperations = useCallback((next: Record<string, SessionDeleteOperation<JarvisSession>>) => {
+    sessionDeleteOperationsRef.current = next;
+    setSessionDeleteOperations(next);
+  }, []);
+
+  const loadSessions = useCallback(async (options?: { deletionRead?: boolean }) => {
+    if (options?.deletionRead && sessionDeleteReadPending.current) return;
     const request = ++sessionsRequest.current;
+    if (options?.deletionRead) sessionDeleteReadPending.current = true;
+    else sessionDeleteReadPending.current = false;
     setSessionsLoading(true);
     setSessionsError(null);
     try {
@@ -122,20 +138,77 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
         invoke<SessionRunRecord[]>('get_all_session_runs').catch(() => [] as SessionRunRecord[]),
       ]);
       if (request !== sessionsRequest.current) return;
-      setSessions(result);
+      const reconciled = reconcileSessionDeletions(result, sessionDeleteOperationsRef.current, request);
+      publishSessionDeleteOperations(reconciled.operations);
+      setSessions(reconciled.rows);
+      const visibleIds = new Set(reconciled.rows.map(row => row.id));
       const runMap: Record<string, SessionRunRecord> = {};
       for (const run of runs) {
-        if (!runMap[run.session_id]) {
+        if (visibleIds.has(run.session_id) && !runMap[run.session_id]) {
           runMap[run.session_id] = run;
         }
       }
       setSessionRuns(runMap);
+      const confirmed = new Set(reconciled.confirmed);
+      if (confirmed.size > 0) {
+        setActiveSession(current => current && confirmed.has(current) ? null : current);
+      }
     } catch (e) {
-      if (request === sessionsRequest.current) setSessionsError(String(e));
+      if (request !== sessionsRequest.current) return;
+      const next = { ...sessionDeleteOperationsRef.current };
+      let removalFailure = false;
+      for (const [id, operation] of Object.entries(next)) {
+        if (operation.phase === 'reconciling' || operation.phase === 'read-failed') {
+          next[id] = { ...operation, phase: 'read-failed' };
+          removalFailure = true;
+        }
+      }
+      if (removalFailure) publishSessionDeleteOperations(next);
+      else setSessionsError(String(e));
     } finally {
-      if (request === sessionsRequest.current) setSessionsLoading(false);
+      if (request === sessionsRequest.current) {
+        if (options?.deletionRead) sessionDeleteReadPending.current = false;
+        setSessionsLoading(false);
+      }
     }
-  }, []);
+  }, [publishSessionDeleteOperations]);
+
+  const deleteSession = useCallback((session: JarvisSession) => {
+    if (sessionDeleteLocked(sessionDeleteOperationsRef.current[session.id])) return;
+    const operation: SessionDeleteOperation<JarvisSession> = {
+      row: session,
+      phase: 'writing',
+      after: sessionsRequest.current,
+    };
+    publishSessionDeleteOperations({ ...sessionDeleteOperationsRef.current, [session.id]: operation });
+    void (async () => {
+      try {
+        await invoke<void>('jarvis_delete_session', { sessionId: session.id });
+        if (sessionDeleteOperationsRef.current[session.id] !== operation) return;
+        publishSessionDeleteOperations({
+          ...sessionDeleteOperationsRef.current,
+          [session.id]: { ...operation, phase: 'reconciling', after: sessionsRequest.current },
+        });
+        await loadSessions({ deletionRead: true });
+      } catch {
+        if (sessionDeleteOperationsRef.current[session.id] !== operation) return;
+        publishSessionDeleteOperations({
+          ...sessionDeleteOperationsRef.current,
+          [session.id]: { ...operation, phase: 'write-failed', after: sessionsRequest.current },
+        });
+      }
+    })();
+  }, [loadSessions, publishSessionDeleteOperations]);
+
+  const retrySessionDeleteRead = useCallback((id: string) => {
+    const current = sessionDeleteOperationsRef.current[id];
+    if (!current || current.phase !== 'read-failed' || sessionDeleteReadPending.current) return;
+    publishSessionDeleteOperations({
+      ...sessionDeleteOperationsRef.current,
+      [id]: { ...current, phase: 'reconciling', after: sessionsRequest.current },
+    });
+    void loadSessions({ deletionRead: true });
+  }, [loadSessions, publishSessionDeleteOperations]);
 
   const loadConfig = useCallback(async () => {
     if (configPending.current) return;
@@ -319,10 +392,12 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
                 error={sessionsError}
                 sessionRuns={sessionRuns}
                 activeSession={activeSession}
+                deleteOperations={sessionDeleteOperations}
                 onSelect={(id) => { setActiveSession(id); setSubView('chat'); }}
                 onNew={() => { setActiveSession(null); setSubView('chat'); }}
-                onDelete={loadSessions}
-                onRefresh={loadSessions}
+                onDelete={deleteSession}
+                onRetryDeleteRead={retrySessionDeleteRead}
+                onRefresh={() => { void loadSessions(); }}
               />
             </motion.div>
           )}
@@ -2785,36 +2860,54 @@ function ApprovalModal({ call_id, name, args, error, pending, onRetry, onApprove
 // ═══════════════════════════════════════════════════════════════
 
 function SessionsPanel({
-  sessions, loading, error, sessionRuns, activeSession, onSelect, onNew, onDelete, onRefresh,
+  sessions, loading, error, sessionRuns, activeSession, deleteOperations, onSelect, onNew, onDelete, onRetryDeleteRead, onRefresh,
 }: {
   sessions: JarvisSession[];
   loading: boolean;
   error: string | null;
   sessionRuns: Record<string, SessionRunRecord>;
   activeSession: string | null;
+  deleteOperations: Record<string, SessionDeleteOperation<JarvisSession>>;
   onSelect: (id: string) => void;
   onNew: () => void;
-  onDelete: () => void;
+  onDelete: (session: JarvisSession) => void;
+  onRetryDeleteRead: (id: string) => void;
   onRefresh: () => void;
 }) {
   // Free-text filter — case-insensitive subsequence match against name /
   // title / id / model / backend. See `session-filter.ts` for the contract.
   const [filterQuery, setFilterQuery] = useState('');
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const filteredSessions = filterSessions(sessions, filterQuery);
   const isFiltering = filterQuery.trim().length > 0;
+  const pendingDelete = sessions.find(session => session.id === pendingDeleteId);
 
-  const handleDelete = async (id: string, e: React.MouseEvent) => {
+  useEffect(() => {
+    if (pendingDeleteId && !pendingDelete) setPendingDeleteId(null);
+  }, [pendingDelete, pendingDeleteId]);
+
+  const openDelete = (session: JarvisSession, e: React.MouseEvent) => {
     e.stopPropagation();
-    try {
-      await invoke('jarvis_delete_session', { sessionId: id });
-      onDelete();
-    } catch (err) {
-      console.error('Failed to delete session:', err);
-    }
+    if (sessionDeleteLocked(deleteOperations[session.id])) return;
+    setPendingDeleteId(session.id);
+  };
+
+  const confirmDelete = () => {
+    if (!pendingDelete) return;
+    setPendingDeleteId(null);
+    onDelete(pendingDelete);
   };
 
   return (
     <div className="h-full flex flex-col">
+      <ConfirmModal
+        open={pendingDelete !== undefined}
+        message={`Delete session "${pendingDelete?.name || pendingDelete?.title || pendingDelete?.id}"?`}
+        confirmLabel="Delete"
+        danger
+        onConfirm={confirmDelete}
+        onCancel={() => setPendingDeleteId(null)}
+      />
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-lg font-bold text-bone tracking-tight">
           Sessions <span className="text-bone-font text-sm font-mono">{formatFilterResultCount(filteredSessions.length, sessions.length)}</span>
@@ -2897,7 +2990,10 @@ function SessionsPanel({
             </div>
           </div>
         ) : (
-          filteredSessions.map(session => (
+          filteredSessions.map(session => {
+            const operation = deleteOperations[session.id];
+            const deleteLocked = sessionDeleteLocked(operation);
+            return (
             <GlassCard
               key={session.id}
               className={cn(activeSession === session.id && 'border-royal/40 bg-royal/10')}
@@ -2944,15 +3040,31 @@ function SessionsPanel({
                 </button>
                 <button
                   type="button"
-                  onClick={(e) => handleDelete(session.id, e)}
+                  onClick={(e) => openDelete(session, e)}
+                  disabled={deleteLocked}
                   aria-label={`Delete session ${session.name || session.title || session.id}`}
-                  className="text-bone-faint hover:text-error text-xs font-mono transition-colors shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-error/50 rounded px-1"
+                  className="text-bone-faint hover:text-error text-xs font-mono transition-colors shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-error/50 rounded px-1 disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   ✕
                 </button>
               </div>
+              {operation?.phase === 'writing' && <div role="status" className="mt-1.5 text-xs text-bone/60">Deleting session…</div>}
+              {operation?.phase === 'reconciling' && <div role="status" className="mt-1.5 text-xs text-bone/60">Deletion saved. Confirming session removal…</div>}
+              {operation?.phase === 'write-failed' && (
+                <div role="alert" className="mt-1.5 text-xs text-red-200">
+                  Could not delete the Session. The previous row was kept.{' '}
+                  <button type="button" onClick={(e) => { e.stopPropagation(); setPendingDeleteId(session.id); }} className="underline">Retry</button>
+                </div>
+              )}
+              {operation?.phase === 'read-failed' && (
+                <div role="alert" className="mt-1.5 text-xs text-red-200">
+                  Deletion was saved, but the Session list could not confirm removal. Showing the previous row; it may be stale. Retry reloads the list only.{' '}
+                  <button type="button" onClick={(e) => { e.stopPropagation(); onRetryDeleteRead(session.id); }} disabled={loading} className="underline disabled:opacity-40">Retry</button>
+                </div>
+              )}
             </GlassCard>
-          ))
+            );
+          })
         )}
       </div>
     </div>
