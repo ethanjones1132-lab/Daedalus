@@ -26,6 +26,6 @@ describe('SystemStatusBar resilience', () => {
     render(<SystemStatusBar />);
 
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('get_system_health'));
-    expect(await screen.findByText('BUN')).toBeInTheDocument();
+    expect(await screen.findByText('BUN ?')).toBeInTheDocument();
   });
 });
