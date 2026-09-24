@@ -4,6 +4,13 @@ import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { aggregateInsights, selectInsightJobs } from './cron-insights';
 import {
+  reconcileCronOperations,
+  startCronOperation,
+  transitionCronOperation,
+  type CronOperation,
+  type CronOperationKind,
+} from './cron-operation-state';
+import {
   PageTransition,
   AnimatedList,
   GlassCard,
@@ -11,7 +18,6 @@ import {
   Pill,
   SectionHeader,
   LoadingState,
-  ErrorState,
   EmptyState,
   cn,
   useToast,
@@ -49,6 +55,31 @@ interface CronJobDraft {
   schedule: string;
   prompt: string;
   agentId: string;
+}
+
+type CronOperationMap = Record<string, CronOperation<CronJob>>;
+
+type MissedOperationKind = 'trigger' | 'dismiss' | 'dismiss-all';
+type MissedOperationPhase = 'writing' | 'write-failed' | 'reconciling' | 'read-failed';
+
+interface MissedOperation {
+  kind: MissedOperationKind;
+  ids: string[];
+  phase: MissedOperationPhase;
+  after: number;
+  failedIds?: string[];
+}
+
+interface CronSnapshot {
+  jobs: CronJob[];
+  inFlightIds: string[];
+  pendingMissed: CronJob[];
+  requestId: number;
+}
+
+interface CronReadResult {
+  status: 'success' | 'failure' | 'stale';
+  snapshot?: CronSnapshot;
 }
 
 interface CronRun {
@@ -701,60 +732,81 @@ function detectJobType(job: CronJob): CronJobType {
   return 'custom';
 }
 
-function CronJobCard({ job, onRefresh, isInFlight }: { job: CronJob; onRefresh: () => void; isInFlight: boolean }) {
-  const { success, error: toastError } = useToast();
-  const [toggling, setToggling] = useState(false);
-  const [running, setRunning] = useState(false);
-  const [deleting, setDeleting] = useState(false);
-  const [editing, setEditing] = useState(false);
+function cronOperationVerb(operation: CronOperation<CronJob>): string {
+  if (operation.kind === 'delete') return 'delete';
+  if (operation.kind === 'run') return 'run';
+  return operation.targetEnabled ? 'enable' : 'disable';
+}
 
+function cronOperationStatusText(operation: CronOperation<CronJob>): string {
+  if (operation.phase === 'reconciling') return `Cron job ${cronOperationVerb(operation)} was saved. Confirming the updated job list…`;
+  if (operation.phase === 'read-failed') return 'Confirming the updated cron job list…';
+  const action = operation.kind === 'delete'
+    ? 'Deleting'
+    : operation.kind === 'run'
+      ? 'Running'
+      : operation.targetEnabled ? 'Enabling' : 'Disabling';
+  return `${action} cron job…`;
+}
+
+function cronOperationFailureText(operation: CronOperation<CronJob>): string {
+  return `Could not ${cronOperationVerb(operation)} cron job. The previous job state was kept.`;
+}
+
+function cronOperationReadFailureText(operation: CronOperation<CronJob>): string {
+  return `The cron job ${cronOperationVerb(operation)} was saved, but the confirmed job list could not be reconciled. Showing the previous job; it may be stale.`;
+}
+
+function cronOperationSuccessText(operation: CronOperation<CronJob>): string {
+  if (operation.kind === 'delete') return `Cron job "${operation.row.name}" deleted.`;
+  if (operation.kind === 'run') return `Run requested for cron job "${operation.row.name}".`;
+  return `Cron job "${operation.row.name}" ${operation.targetEnabled ? 'enabled' : 'disabled'}.`;
+}
+
+function missedOperationStatusText(operation: MissedOperation): string {
+  if (operation.phase === 'reconciling') return 'Missed cron action was saved. Confirming the pending list…';
+  if (operation.phase === 'read-failed') return 'Confirming the pending missed cron list…';
+  return operation.kind === 'dismiss-all'
+    ? 'Dismissing all missed cron jobs…'
+    : `${operation.kind === 'trigger' ? 'Triggering' : 'Dismissing'} missed cron job…`;
+}
+
+function missedOperationFailureText(operation: MissedOperation): string {
+  if (operation.kind === 'dismiss-all') {
+    return operation.failedIds && operation.failedIds.length < operation.ids.length
+      ? 'Some missed cron jobs could not be dismissed. The remaining dismissals can be retried.'
+      : 'Could not dismiss all missed cron jobs. The pending list was kept.';
+  }
+  return `Could not ${operation.kind === 'trigger' ? 'trigger' : 'dismiss'} the missed cron job. The pending action was kept.`;
+}
+
+function missedOperationReadFailureText(): string {
+  return `The missed cron action was saved, but the pending list could not be reconciled. Showing the previous pending list; it may be stale.`;
+}
+
+function CronJobCard({
+  job,
+  onRefresh,
+  isInFlight,
+  operation,
+  onToggle,
+  onRun,
+  onDelete,
+  onRetry,
+}: {
+  job: CronJob;
+  onRefresh: () => void;
+  isInFlight: boolean;
+  operation?: CronOperation<CronJob>;
+  onToggle: (job: CronJob) => void;
+  onRun: (job: CronJob) => void;
+  onDelete: (job: CronJob) => void;
+  onRetry: (job: CronJob) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const operationBlocked = operation !== undefined;
   const jobType = detectJobType(job);
   const typeConfig = JOB_TYPES.find(t => t.id === jobType);
-
-  const handleToggle = async () => {
-    setToggling(true);
-    try {
-      if (job.enabled) {
-        await invoke('disable_cron_job', { id: job.id });
-        success(`Cron job "${job.name}" disabled.`, 'Cron Job Disabled');
-      } else {
-        await invoke('enable_cron_job', { id: job.id });
-        success(`Cron job "${job.name}" enabled.`, 'Cron Job Enabled');
-      }
-      onRefresh();
-    } catch (e) {
-      toastError(`Failed to toggle: ${e}`, 'Toggle Error');
-    } finally {
-      setToggling(false);
-    }
-  };
-
-  const handleRun = async () => {
-    setRunning(true);
-    try {
-      await invoke('run_cron_job', { id: job.id });
-      success(`Cron job "${job.name}" triggered successfully.`, 'Cron Job Started');
-      onRefresh();
-    } catch (e) {
-      toastError(`Failed to run: ${e}`, 'Run Error');
-    } finally {
-      setRunning(false);
-    }
-  };
-
-  const handleDelete = async () => {
-    if (!confirm(`Delete cron job "${job.name}"?`)) return;
-    setDeleting(true);
-    try {
-      await invoke('delete_cron_job', { id: job.id });
-      success(`Cron job "${job.name}" deleted.`, 'Cron Job Deleted');
-      onRefresh();
-    } catch (e) {
-      toastError(`Failed to delete: ${e}`, 'Delete Error');
-    } finally {
-      setDeleting(false);
-    }
-  };
 
   return (
     <>
@@ -804,14 +856,48 @@ function CronJobCard({ job, onRefresh, isInFlight }: { job: CronJob; onRefresh: 
             {/* Runs history */}
             <RunsHistory job={job} />
 
-            {/* Actions */}
+            {operation && (
+              operation.phase === 'write-failed' ? (
+                <div role="alert" aria-label="Cron job operation" className="mt-3 text-[10px] font-mono text-error">
+                  {cronOperationFailureText(operation)}{' '}
+                  <button
+                    type="button"
+                    aria-label={`Retry ${job.name}`}
+                    onClick={() => onRetry(job)}
+                    className="underline"
+                  >
+                    Retry
+                  </button>
+                </div>
+              ) : operation.phase === 'read-failed' ? (
+                <div role="alert" aria-label="Cron job operation" className="mt-3 text-[10px] font-mono text-error">
+                  {cronOperationReadFailureText(operation)}{' '}
+                  <button
+                    type="button"
+                    aria-label={`Retry ${job.name}`}
+                    onClick={() => onRetry(job)}
+                    className="underline"
+                  >
+                    Retry
+                  </button>
+                </div>
+              ) : (
+                <div role="status" aria-label="Cron job operation" className="mt-3 text-[10px] font-mono text-bone-dim">
+                  {cronOperationStatusText(operation)}
+                </div>
+              )
+            )}
             <div className="flex items-center gap-2 mt-3 pt-3 border-t border-iron/20">
               <motion.button
-                onClick={handleToggle} disabled={toggling}
+                type="button"
+                aria-label={`${job.enabled ? 'Disable' : 'Enable'} ${job.name}`}
+                aria-pressed={job.enabled}
+                onClick={() => onToggle(job)}
+                disabled={operationBlocked}
                 className={cn(
                   'relative w-10 h-5 rounded-full transition-colors duration-200 border',
                   job.enabled ? 'bg-cyan-neon/20 border-cyan-neon/40' : 'bg-iron/20 border-iron/40',
-                  toggling && 'opacity-50'
+                  operationBlocked && 'opacity-50'
                 )}
                 whileTap={{ scale: 0.95 }}
               >
@@ -823,30 +909,39 @@ function CronJobCard({ job, onRefresh, isInFlight }: { job: CronJob; onRefresh: 
               </motion.button>
 
               <motion.button
-                onClick={handleRun} disabled={running || isInFlight || !job.enabled}
+                type="button"
+                aria-label={`Run ${job.name}`}
+                onClick={() => onRun(job)}
+                disabled={operationBlocked || isInFlight || !job.enabled}
                 className={cn(
                   'px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider rounded-md border transition-colors',
-                  job.enabled && !isInFlight && !running
+                  job.enabled && !isInFlight && !operationBlocked
                     ? 'bg-cyan-neon/10 text-cyan-glow border-cyan-neon/30 hover:bg-cyan-neon/20'
                     : 'bg-iron/10 text-bone-faint border-iron/20 cursor-not-allowed'
                 )}
-                whileHover={job.enabled && !isInFlight && !running ? { scale: 1.05 } : undefined}
-                whileTap={job.enabled && !isInFlight && !running ? { scale: 0.95 } : undefined}
+                whileHover={job.enabled && !isInFlight && !operationBlocked ? { scale: 1.05 } : undefined}
+                whileTap={job.enabled && !isInFlight && !operationBlocked ? { scale: 0.95 } : undefined}
               >
-                {running || isInFlight ? 'Running…' : 'Run Now'}
+                {operation?.kind === 'run' && operation.phase === 'writing' ? 'Running…' : isInFlight ? 'Running…' : 'Run Now'}
               </motion.button>
 
               <motion.button
+                type="button"
+                aria-label={`Edit ${job.name}`}
                 onClick={() => setEditing(true)}
-                className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider bg-royal/10 text-royal-light border border-royal/30 rounded-md hover:bg-royal/20 transition-colors"
+                disabled={operationBlocked}
+                className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider bg-royal/10 text-royal-light border border-royal/30 rounded-md hover:bg-royal/20 transition-colors disabled:opacity-50"
                 whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}
               >Edit</motion.button>
 
               <motion.button
-                onClick={handleDelete} disabled={deleting}
+                type="button"
+                aria-label={`Delete ${job.name}`}
+                onClick={() => onDelete(job)}
+                disabled={operationBlocked}
                 className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider bg-error/10 text-error border border-error/30 rounded-md hover:bg-error/20 transition-colors disabled:opacity-50"
                 whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}
-              >{deleting ? '…' : 'Delete'}</motion.button>
+              >{operation?.kind === 'delete' && operation.phase === 'writing' ? 'Deleting…' : 'Delete'}</motion.button>
             </div>
           </div>
         </div>
@@ -864,16 +959,61 @@ function CronJobCard({ job, onRefresh, isInFlight }: { job: CronJob; onRefresh: 
 // ── Main CronView ────────────────────────────────────────────────────────────
 
 export default function CronView() {
-  const { success, error: toastError } = useToast();
+  const { success } = useToast();
   const [jobs, setJobs] = useState<CronJob[]>([]);
+  const jobsRef = useRef<CronJob[]>([]);
   const [inFlightIds, setInFlightIds] = useState<Set<string>>(new Set());
   const [pendingMissed, setPendingMissed] = useState<CronJob[]>([]);
+  const pendingMissedRef = useRef<CronJob[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [showAddForm, setShowAddForm] = useState(false);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState(false);
   const createPending = useRef(false);
+  const [operations, setOperations] = useState<CronOperationMap>({});
+  const operationsRef = useRef<CronOperationMap>({});
+  const [missedOperation, setMissedOperation] = useState<MissedOperation | null>(null);
+  const missedOperationRef = useRef<MissedOperation | null>(null);
+  const jobsRequestId = useRef(0);
+  const inFlightRequestId = useRef(0);
+  const missedRequestId = useRef(0);
+  const snapshotVersion = useRef(0);
+  const readbackTail = useRef<Promise<unknown>>(Promise.resolve());
+
+  const publishOperations = useCallback((next: CronOperationMap) => {
+    operationsRef.current = next;
+    setOperations(next);
+  }, []);
+
+  const publishMissedOperation = useCallback((next: MissedOperation | null) => {
+    missedOperationRef.current = next;
+    setMissedOperation(next);
+  }, []);
+
+  const updateJobs = useCallback((next: CronJob[]) => {
+    jobsRef.current = next;
+    setJobs(next);
+  }, []);
+
+  const updatePendingMissed = useCallback((next: CronJob[]) => {
+    pendingMissedRef.current = next;
+    setPendingMissed(next);
+  }, []);
+
+  const hasMutation = useCallback(() => (
+    Object.keys(operationsRef.current).length > 0 || missedOperationRef.current !== null
+  ), []);
+
+  const invalidateResourceReads = useCallback(() => {
+    jobsRequestId.current += 1;
+    inFlightRequestId.current += 1;
+    missedRequestId.current += 1;
+    snapshotVersion.current += 1;
+    setRefreshing(false);
+    return snapshotVersion.current;
+  }, []);
 
   // Feature 1: Premium Insights state (luxury viz + smart recs using existing data)
   const [insightsOpen, setInsightsOpen] = useState(false);
@@ -885,43 +1025,186 @@ export default function CronView() {
   const [hasAutoOpenedInsights, setHasAutoOpenedInsights] = useState(false);
 
   const fetchInFlight = useCallback(async () => {
+    if (hasMutation()) return;
+    const requestId = ++inFlightRequestId.current;
     try {
       const ids = await invoke<string[]>('get_in_flight_cron_jobs');
+      if (requestId !== inFlightRequestId.current) return;
       setInFlightIds(new Set(ids));
-    } catch (e) { /* Squelch background polling errors */ }
-  }, []);
+    } catch {
+      return;
+    }
+  }, [hasMutation]);
 
   const fetchJobs = useCallback(async () => {
+    if (hasMutation()) return false;
+    const requestId = ++jobsRequestId.current;
+    setRefreshing(true);
     try {
-      const r = await invoke<CronJob[]>('list_cron_jobs');
-      setJobs(r);
+      const nextJobs = await invoke<CronJob[]>('list_cron_jobs');
+      if (requestId !== jobsRequestId.current) return false;
+      updateJobs(nextJobs);
       setError(null);
-    } catch (e) { setError(String(e)); }
-    finally { setLoading(false); }
-  }, []);
+      return true;
+    } catch {
+      if (requestId === jobsRequestId.current) {
+        setError(jobsRef.current.length > 0
+          ? 'Could not refresh cron jobs. Showing the previous list; it may be stale.'
+          : 'Could not load cron jobs.');
+      }
+      return false;
+    } finally {
+      if (requestId === jobsRequestId.current) {
+        setRefreshing(false);
+        setLoading(false);
+      }
+    }
+  }, [hasMutation, updateJobs]);
 
   const fetchPendingMissed = useCallback(async () => {
+    if (hasMutation()) return;
+    const requestId = ++missedRequestId.current;
     try {
-      const missed = await invoke<CronJob[]>('list_pending_missed_jobs');
-      setPendingMissed(missed);
-    } catch (e) { /* Squelch background errors */ }
-  }, []);
+      const nextMissed = await invoke<CronJob[]>('list_pending_missed_jobs');
+      if (requestId !== missedRequestId.current) return;
+      updatePendingMissed(nextMissed);
+    } catch {
+      return;
+    }
+  }, [hasMutation, updatePendingMissed]);
 
   useEffect(() => {
-    fetchJobs();
-    fetchInFlight();
-    fetchPendingMissed();
-    const interval = setInterval(fetchInFlight, 3000);
+    void fetchJobs();
+    void fetchInFlight();
+    void fetchPendingMissed();
+    const interval = setInterval(() => void fetchInFlight(), 3000);
 
-    const missedListen = listen<CronJob[]>('cron://missed-jobs', (e) => {
-      setPendingMissed(e.payload);
+    const missedListen = listen<CronJob[]>('cron://missed-jobs', (event) => {
+      if (hasMutation()) return;
+      updatePendingMissed(event.payload);
     });
 
     return () => {
       clearInterval(interval);
-      missedListen.then(unlisten => unlisten());
+      void Promise.resolve(missedListen).then(unlisten => unlisten());
     };
-  }, [fetchJobs, fetchInFlight, fetchPendingMissed]);
+  }, [fetchInFlight, fetchJobs, fetchPendingMissed, hasMutation, updatePendingMissed]);
+
+  const readOperationSnapshot = useCallback((): Promise<CronReadResult> => {
+    const run = async (): Promise<CronReadResult> => {
+      const requestId = ++snapshotVersion.current;
+      try {
+        const [nextJobs, nextInFlight, nextMissed] = await Promise.all([
+          invoke<CronJob[]>('list_cron_jobs'),
+          invoke<string[]>('get_in_flight_cron_jobs'),
+          invoke<CronJob[]>('list_pending_missed_jobs'),
+        ]);
+        return {
+          status: 'success',
+          snapshot: { jobs: nextJobs, inFlightIds: nextInFlight, pendingMissed: nextMissed, requestId },
+        };
+      } catch {
+        return { status: 'failure' };
+      }
+    };
+
+    const result = readbackTail.current.then(run, run);
+    readbackTail.current = result.then(() => undefined, () => undefined);
+    return result;
+  }, []);
+
+  const applyOperationSnapshot = useCallback((result: CronReadResult) => {
+    if (result.status !== 'success' || !result.snapshot) return;
+    const { snapshot } = result;
+    const reconciliation = reconcileCronOperations(snapshot.jobs, operationsRef.current, snapshot.requestId);
+    publishOperations(reconciliation.operations);
+    updateJobs(reconciliation.rows);
+    setInFlightIds(new Set(snapshot.inFlightIds));
+    updatePendingMissed(snapshot.pendingMissed);
+    jobsRequestId.current = Math.max(jobsRequestId.current, snapshot.requestId);
+    inFlightRequestId.current = Math.max(inFlightRequestId.current, snapshot.requestId);
+    missedRequestId.current = Math.max(missedRequestId.current, snapshot.requestId);
+    setLoading(false);
+    setRefreshing(false);
+    setError(null);
+    for (const confirmed of reconciliation.confirmed) {
+      success(cronOperationSuccessText(confirmed.operation), 'Cron Job Updated');
+    }
+  }, [publishOperations, success, updateJobs, updatePendingMissed]);
+
+  const reconcileOperation = useCallback(async (operation: CronOperation<CronJob>) => {
+    const result = await readOperationSnapshot();
+    if (result.status === 'stale') return;
+    if (result.status === 'failure') {
+      const failed = transitionCronOperation(operation, 'read-failed');
+      if (failed && operationsRef.current[operation.id]) {
+        publishOperations({ ...operationsRef.current, [operation.id]: failed });
+      }
+      return;
+    }
+    applyOperationSnapshot(result);
+  }, [applyOperationSnapshot, publishOperations, readOperationSnapshot]);
+
+  const handleOperation = useCallback(async (kind: CronOperationKind, job: CronJob) => {
+    if (operationsRef.current[job.id] || missedOperationRef.current) return;
+    const after = invalidateResourceReads();
+    const targetEnabled = kind === 'toggle' ? !job.enabled : undefined;
+    const operation = startCronOperation(kind, job.id, job, after, targetEnabled);
+    publishOperations({ ...operationsRef.current, [job.id]: operation });
+
+    try {
+      let result: unknown;
+      if (kind === 'toggle') {
+        result = await invoke<boolean>(job.enabled ? 'disable_cron_job' : 'enable_cron_job', { id: job.id });
+      } else if (kind === 'run') {
+        result = await invoke<boolean>('run_cron_job', { id: job.id });
+      } else {
+        result = await invoke<boolean>('delete_cron_job', { id: job.id });
+      }
+      if (result !== true) throw new Error('Cron operation was not confirmed');
+    } catch {
+      const failed = transitionCronOperation(operation, 'write-failed');
+      if (failed) publishOperations({ ...operationsRef.current, [job.id]: failed });
+      return;
+    }
+
+    const reconciling = transitionCronOperation(operation, 'write-succeeded');
+    if (!reconciling) return;
+    publishOperations({ ...operationsRef.current, [job.id]: reconciling });
+    await reconcileOperation(reconciling);
+  }, [invalidateResourceReads, publishOperations, reconcileOperation]);
+
+  const handleToggle = useCallback((job: CronJob) => {
+    void handleOperation('toggle', job);
+  }, [handleOperation]);
+
+  const handleRun = useCallback((job: CronJob) => {
+    void handleOperation('run', job);
+  }, [handleOperation]);
+
+  const handleDelete = useCallback((job: CronJob) => {
+    if (operationsRef.current[job.id] || missedOperationRef.current) return;
+    if (!confirm(`Delete cron job "${job.name}"?`)) return;
+    void handleOperation('delete', job);
+  }, [handleOperation]);
+
+  const handleRetry = useCallback((job: CronJob) => {
+    const operation = operationsRef.current[job.id];
+    if (!operation) return;
+    if (operation.phase === 'write-failed') {
+      const next = { ...operationsRef.current };
+      delete next[job.id];
+      publishOperations(next);
+      void handleOperation(operation.kind, job);
+      return;
+    }
+    if (operation.phase === 'read-failed') {
+      const retrying = transitionCronOperation(operation, 'retry-read');
+      if (!retrying) return;
+      publishOperations({ ...operationsRef.current, [job.id]: retrying });
+      void reconcileOperation(retrying);
+    }
+  }, [handleOperation, publishOperations, reconcileOperation]);
 
   const handleCreate = async (draft: CronJobDraft) => {
     if (createPending.current) return;
@@ -934,7 +1217,7 @@ export default function CronView() {
         prompt: draft.prompt,
         agentId: draft.agentId,
       });
-      setJobs((prev) => [job, ...prev]);
+      updateJobs([job, ...jobsRef.current]);
       setCreateError(false);
       setShowAddForm(false);
       success(`Cron job "${job.name}" created successfully.`, 'Cron Job Added');
@@ -958,38 +1241,115 @@ export default function CronView() {
     setShowAddForm(false);
   };
 
-  const handleTriggerMissed = async (id: string, name: string) => {
-    try {
-      await invoke('trigger_missed_cron_job', { id });
-      success(`Missed job "${name}" is executing now.`, 'Missed Job Started');
-      setPendingMissed(prev => prev.filter(j => j.id !== id));
-      fetchJobs();
-    } catch (e) {
-      toastError(`Failed to trigger: ${e}`, 'Trigger Error');
-    }
-  };
+  const updateFromSnapshot = useCallback((snapshot: CronSnapshot) => {
+    const reconciliation = reconcileCronOperations(snapshot.jobs, operationsRef.current, snapshot.requestId);
+    publishOperations(reconciliation.operations);
+    updateJobs(reconciliation.rows);
+    setInFlightIds(new Set(snapshot.inFlightIds));
+    updatePendingMissed(snapshot.pendingMissed);
+    jobsRequestId.current = Math.max(jobsRequestId.current, snapshot.requestId);
+    inFlightRequestId.current = Math.max(inFlightRequestId.current, snapshot.requestId);
+    missedRequestId.current = Math.max(missedRequestId.current, snapshot.requestId);
+    setLoading(false);
+    setRefreshing(false);
+    setError(null);
+  }, [publishOperations, updateJobs, updatePendingMissed]);
 
-  const handleDismissMissed = async (id: string, name: string) => {
-    try {
-      await invoke('dismiss_missed_cron_job', { id });
-      success(`Missed job "${name}" dismissed and rescheduled.`, 'Missed Job Dismissed');
-      setPendingMissed(prev => prev.filter(j => j.id !== id));
-      fetchJobs();
-    } catch (e) {
-      toastError(`Failed to dismiss: ${e}`, 'Dismiss Error');
+  const reconcileMissedOperation = useCallback(async (operation: MissedOperation) => {
+    const result = await readOperationSnapshot();
+    if (result.status === 'stale') return;
+    if (result.status === 'failure' || !result.snapshot) {
+      if (missedOperationRef.current?.after === operation.after) {
+        publishMissedOperation({ ...operation, phase: 'read-failed' });
+      }
+      return;
     }
-  };
 
-  const handleDismissAllMissed = async () => {
-    try {
-      await Promise.all(pendingMissed.map(j => invoke('dismiss_missed_cron_job', { id: j.id })));
-      success('All missed jobs dismissed.', 'Missed Jobs Dismissed');
-      setPendingMissed([]);
-      fetchJobs();
-    } catch (e) {
-      toastError(`Failed to dismiss all: ${e}`, 'Dismiss All Error');
+    const previousNames = new Map(pendingMissedRef.current.map(job => [job.id, job.name]));
+    updateFromSnapshot(result.snapshot);
+    const current = missedOperationRef.current;
+    if (!current || current.after !== operation.after) return;
+    const pendingIds = new Set(result.snapshot.pendingMissed.map(job => job.id));
+    if (current.failedIds && current.failedIds.some(id => pendingIds.has(id))) {
+      publishMissedOperation({ ...current, phase: 'write-failed' });
+      return;
     }
-  };
+    if (current.phase === 'write-failed') {
+      publishMissedOperation(null);
+      return;
+    }
+    if (current.ids.every(id => !pendingIds.has(id))) {
+      const name = previousNames.get(current.ids[0]);
+      publishMissedOperation(null);
+      if (current.kind === 'dismiss-all') {
+        success('All missed jobs dismissed.', 'Missed Jobs Dismissed');
+      } else if (current.kind === 'trigger') {
+        success(`Missed job "${name ?? current.ids[0]}" is executing now.`, 'Missed Job Started');
+      } else {
+        success(`Missed job "${name ?? current.ids[0]}" dismissed and rescheduled.`, 'Missed Job Dismissed');
+      }
+    } else {
+      publishMissedOperation({ ...current, phase: 'read-failed' });
+    }
+  }, [publishMissedOperation, readOperationSnapshot, success, updateFromSnapshot]);
+
+  const executeMissedMutation = useCallback(async (
+    kind: MissedOperationKind,
+    ids: string[],
+    originalIds: string[] = ids,
+  ) => {
+    if (missedOperationRef.current || Object.keys(operationsRef.current).length > 0 || ids.length === 0) return;
+    const after = invalidateResourceReads();
+    const operation: MissedOperation = { kind, ids: originalIds, phase: 'writing', after };
+    publishMissedOperation(operation);
+    const results = await Promise.all(ids.map(async id => {
+      try {
+        const command = kind === 'trigger' ? 'trigger_missed_cron_job' : 'dismiss_missed_cron_job';
+        return { id, ok: await invoke<boolean>(command, { id }) === true };
+      } catch {
+        return { id, ok: false };
+      }
+    }));
+    const failedIds = results.filter(result => !result.ok).map(result => result.id);
+    if (failedIds.length > 0) {
+      const failed = { ...operation, phase: 'write-failed' as const, failedIds };
+      publishMissedOperation(failed);
+      if (kind === 'dismiss-all') await reconcileMissedOperation(failed);
+      return;
+    }
+    const reconciling = { ...operation, phase: 'reconciling' as const };
+    publishMissedOperation(reconciling);
+    await reconcileMissedOperation(reconciling);
+  }, [invalidateResourceReads, publishMissedOperation, reconcileMissedOperation]);
+
+  const handleTriggerMissed = useCallback((id: string) => {
+    void executeMissedMutation('trigger', [id]);
+  }, [executeMissedMutation]);
+
+  const handleDismissMissed = useCallback((id: string) => {
+    void executeMissedMutation('dismiss', [id]);
+  }, [executeMissedMutation]);
+
+  const handleDismissAllMissed = useCallback(() => {
+    void executeMissedMutation('dismiss-all', pendingMissedRef.current.map(job => job.id));
+  }, [executeMissedMutation]);
+
+  const handleRetryMissed = useCallback(() => {
+    const operation = missedOperationRef.current;
+    if (!operation) return;
+    if (operation.phase === 'write-failed') {
+      const ids = operation.failedIds && operation.failedIds.length > 0 ? operation.failedIds : operation.ids;
+      publishMissedOperation(null);
+      void executeMissedMutation(operation.kind, ids, operation.ids);
+      return;
+    }
+    if (operation.phase === 'read-failed') {
+      const retrying = { ...operation, phase: 'reconciling' as const };
+      publishMissedOperation(retrying);
+      void reconcileMissedOperation(retrying);
+    }
+  }, [executeMissedMutation, publishMissedOperation, reconcileMissedOperation]);
+
 
   // Feature 1: Luxury Insights loader + simple viz (uses existing invokes, client-side agg, capped)
   const loadInsights = useCallback(async () => {
@@ -1044,7 +1404,6 @@ export default function CronView() {
   const reviewCount = jobs.filter(j => detectJobType(j) === 'review').length;
 
   if (loading) return <LoadingState />;
-  if (error) return <ErrorState error={error} />;
 
   return (
     <PageTransition>
@@ -1054,6 +1413,17 @@ export default function CronView() {
         subtitle={jobs.length > 0 ? `${enabledCount} enabled · ${learningCount} learning · ${reviewCount} review` : undefined}
         action={
           <div className="flex items-center gap-2">
+            <motion.button
+              type="button"
+              aria-label="Refresh jobs"
+              onClick={() => void fetchJobs()}
+              disabled={refreshing || hasMutation()}
+              className="px-3 py-1.5 text-xs font-mono rounded-lg border border-iron/30 bg-iron/10 text-bone-dim hover:bg-iron/15 transition-all duration-150 disabled:opacity-50"
+              whileHover={{ scale: 1.03 }}
+              whileTap={{ scale: 0.97 }}
+            >
+              {refreshing ? 'Refreshing…' : 'Refresh'}
+            </motion.button>
             {jobs.length > 0 && (
               <motion.button
                 onClick={toggleInsights}
@@ -1086,6 +1456,20 @@ export default function CronView() {
           </div>
         }
       />
+
+      {refreshing && (
+        <div role="status" aria-label="Cron jobs loading" className="mb-3 text-xs font-mono text-bone-dim">
+          Refreshing cron jobs…
+        </div>
+      )}
+      {error && (
+        <div role="alert" aria-label="Cron jobs loading" className="mb-3 text-xs font-mono text-error">
+          {error}{' '}
+          <button type="button" onClick={() => void fetchJobs()} disabled={refreshing || hasMutation()} className="underline disabled:opacity-50">
+            Retry
+          </button>
+        </div>
+      )}
 
       <AnimatePresence>
         {insightsOpen && (
@@ -1239,6 +1623,32 @@ export default function CronView() {
             className="mb-6"
           >
             <GlassCard className="border-warning/30 bg-warning/5 p-4">
+              {missedOperation && (
+                missedOperation.phase === 'write-failed' ? (
+                  <div role="alert" aria-label="Missed cron operation" className="mb-3 text-[10px] font-mono text-error">
+                    {missedOperationFailureText(missedOperation)}{' '}
+                    <button
+                      type="button"
+                      aria-label={missedOperation.kind === 'dismiss-all' ? 'Retry remaining missed dismissals' : 'Retry missed action'}
+                      onClick={handleRetryMissed}
+                      className="underline"
+                    >
+                      Retry
+                    </button>
+                  </div>
+                ) : missedOperation.phase === 'read-failed' ? (
+                  <div role="alert" aria-label="Missed cron operation" className="mb-3 text-[10px] font-mono text-error">
+                    {missedOperationReadFailureText()}{' '}
+                    <button type="button" aria-label="Retry missed list" onClick={handleRetryMissed} className="underline">
+                      Retry
+                    </button>
+                  </div>
+                ) : (
+                  <div role="status" aria-label="Missed cron operation" className="mb-3 text-[10px] font-mono text-bone-dim">
+                    {missedOperationStatusText(missedOperation)}
+                  </div>
+                )
+              )}
               <div className="flex items-center justify-between mb-3 border-b border-warning/20 pb-2 flex-wrap gap-2">
                 <div className="flex items-center gap-2">
                   <span className="text-sm">⏳</span>
@@ -1247,8 +1657,10 @@ export default function CronView() {
                   </h4>
                 </div>
                 <button
+                  type="button"
                   onClick={handleDismissAllMissed}
-                  className="px-2.5 py-1 text-[10px] font-mono text-warning hover:text-warning/80 border border-warning/30 hover:border-warning/50 rounded-md hover:bg-warning/10 transition-colors"
+                  disabled={missedOperation !== null}
+                  className="px-2.5 py-1 text-[10px] font-mono text-warning hover:text-warning/80 border border-warning/30 hover:border-warning/50 rounded-md hover:bg-warning/10 transition-colors disabled:opacity-50"
                 >
                   Dismiss All
                 </button>
@@ -1267,14 +1679,20 @@ export default function CronView() {
                     </div>
                     <div className="flex items-center gap-2">
                       <button
-                        onClick={() => handleDismissMissed(m.id, m.name)}
-                        className="px-2.5 py-1 text-[10px] font-mono border border-iron/40 rounded-md text-bone-dim hover:text-bone hover:border-iron/60 transition-colors"
+                        type="button"
+                        aria-label={`Dismiss ${m.name}`}
+                        onClick={() => handleDismissMissed(m.id)}
+                        disabled={missedOperation !== null}
+                        className="px-2.5 py-1 text-[10px] font-mono border border-iron/40 rounded-md text-bone-dim hover:text-bone hover:border-iron/60 transition-colors disabled:opacity-50"
                       >
                         Dismiss
                       </button>
                       <button
-                        onClick={() => handleTriggerMissed(m.id, m.name)}
-                        className="px-2.5 py-1 text-[10px] font-mono bg-cyan-neon/15 border border-cyan-neon/30 rounded-md text-cyan-glow hover:bg-cyan-neon/25 transition-colors font-semibold"
+                        type="button"
+                        aria-label={`Trigger ${m.name}`}
+                        onClick={() => handleTriggerMissed(m.id)}
+                        disabled={missedOperation !== null}
+                        className="px-2.5 py-1 text-[10px] font-mono bg-cyan-neon/15 border border-cyan-neon/30 rounded-md text-cyan-glow hover:bg-cyan-neon/25 transition-colors font-semibold disabled:opacity-50"
                       >
                         Trigger Now
                       </button>
@@ -1292,7 +1710,17 @@ export default function CronView() {
       ) : (
         <AnimatedList>
           {jobs.map((job) => (
-            <CronJobCard key={job.id} job={job} onRefresh={fetchJobs} isInFlight={inFlightIds.has(job.id)} />
+            <CronJobCard
+              key={job.id}
+              job={job}
+              onRefresh={fetchJobs}
+              isInFlight={inFlightIds.has(job.id)}
+              operation={operations[job.id]}
+              onToggle={handleToggle}
+              onRun={handleRun}
+              onDelete={handleDelete}
+              onRetry={handleRetry}
+            />
           ))}
         </AnimatedList>
       )}
