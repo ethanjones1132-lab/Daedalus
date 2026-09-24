@@ -108,11 +108,11 @@ describe("createLifecycleService — single valid agent", () => {
     expect(entry.source_size_bytes).toBeGreaterThan(0);
   });
 
-  test("activate() returns true for the slug of a valid entry (no store)", () => {
+  test("activate() returns false for a valid entry when no durable store is configured", () => {
     fixture = makeFixtureRoot("activate-ok");
     fixture.writeSoul("reviewer", validSoul("reviewer"));
     const service = createLifecycleService(fixture.root);
-    expect(service.activate("reviewer")).toBe(true);
+    expect(service.activate("reviewer")).toBe(false);
   });
 
   test("activate() returns false for a slug that is not present (no store)", () => {
@@ -363,12 +363,100 @@ describe("createLifecycleService — activate() with a ProjectionStore", () => {
     expect(service.activate("alpha")).toBe(false);
   });
 
-  test("store is consulted even for slugs not present in scan()", () => {
+  test("does not consult the store for a slug missing from the current scan", () => {
     fixture = makeFixtureRoot("store-missing-slug");
     fixture.writeSoul("alpha", validSoul("alpha"));
-    const store: ProjectionStore = { activate: (slug) => slug === "ghost" };
+    const calls: string[] = [];
+    const store: ProjectionStore = {
+      activate: (slug) => {
+        calls.push(slug);
+        return true;
+      },
+    };
     const service = createLifecycleService(fixture.root, store);
-    // 'ghost' is not on disk, but the store is the authority when present.
-    expect(service.activate("ghost")).toBe(true);
+    expect(service.activate("ghost")).toBe(false);
+    expect(calls).toEqual([]);
+  });
+});
+
+describe("createLifecycleService — activation boundary", () => {
+  test("validates the current source before persisting an activation", () => {
+    fixture = makeFixtureRoot("activation-boundary-valid");
+    fixture.writeSoul("alpha", validSoul("alpha"));
+    const calls: Array<{ slug: string; hash?: string }> = [];
+    const store = {
+      activate(slug: string, entry?: { source_hash?: string }) {
+        calls.push({ slug, hash: entry?.source_hash });
+        return { active: true, source_hash: entry?.source_hash };
+      },
+      deactivate: () => true,
+    };
+    const service = createLifecycleService(fixture.root, store as unknown as ProjectionStore);
+    const currentHash = service.scan().results[0].source_hash!;
+    const result = (service as unknown as {
+      activateDetailed: (slug: string, hash: string) => { ok: boolean; entry?: { source_hash?: string } };
+    }).activateDetailed("alpha", currentHash);
+
+    expect(result.ok).toBe(true);
+    expect(calls).toEqual([{ slug: "alpha", hash: expect.any(String) }]);
+  });
+
+  test("rejects invalid and collision candidates without writing", () => {
+    fixture = makeFixtureRoot("activation-boundary-invalid");
+    fixture.writeSoul("bad", "not a soul file");
+    fixture.writeSoul("a", validSoul("duplicate"));
+    fixture.writeSoul("b", validSoul("duplicate"));
+    let writes = 0;
+    const store = {
+      activate() {
+        writes += 1;
+        return true;
+      },
+      deactivate: () => true,
+    };
+    const service = createLifecycleService(fixture.root, store as unknown as ProjectionStore);
+    const detailed = service as unknown as {
+      activateDetailed: (slug: string, hash?: string) => { ok: boolean; code?: string };
+    };
+
+    expect(detailed.activateDetailed("bad", "b".repeat(64))).toMatchObject({ ok: false, code: "agent_invalid" });
+    expect(detailed.activateDetailed("duplicate", "c".repeat(64))).toMatchObject({ ok: false, code: "agent_collision" });
+    expect(writes).toBe(0);
+  });
+
+  test("rejects a source hash that changed after discovery", () => {
+    fixture = makeFixtureRoot("activation-boundary-stale");
+    fixture.writeSoul("alpha", validSoul("alpha"));
+    const store = { activate: () => true, deactivate: () => true };
+    const service = createLifecycleService(fixture.root, store as unknown as ProjectionStore);
+    const detailed = service as unknown as {
+      activateDetailed: (slug: string, hash: string) => { ok: boolean; code?: string };
+    };
+
+    expect(detailed.activateDetailed("alpha", "b".repeat(64))).toMatchObject({ ok: false, code: "source_changed" });
+  });
+
+  test("deactivation is idempotent and does not require a valid source", () => {
+    fixture = makeFixtureRoot("activation-boundary-deactivate");
+    const calls: string[] = [];
+    const store = {
+      activate: () => true,
+      deactivate(slug: string) {
+        calls.push(slug);
+        return { active: false };
+      },
+    };
+    const service = createLifecycleService(fixture.root, store as unknown as ProjectionStore);
+
+    expect(service.deactivate("missing")).toBe(true);
+    expect(service.deactivate("missing")).toBe(true);
+    expect(calls).toEqual(["missing", "missing"]);
+  });
+
+  test("does not activate a valid Agent when no durable store is configured", () => {
+    fixture = makeFixtureRoot("activation-boundary-no-store");
+    fixture.writeSoul("alpha", validSoul("alpha"));
+    const service = createLifecycleService(fixture.root);
+    expect(service.activate("alpha")).toBe(false);
   });
 });

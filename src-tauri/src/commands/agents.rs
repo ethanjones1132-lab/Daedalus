@@ -31,6 +31,45 @@ pub struct Agent {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentProjection {
+    pub slug: String,
+    pub source_path: String,
+    pub source_hash: String,
+    pub projection_version: i64,
+    pub status: String,
+    pub validation_errors: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub tools: Option<Vec<String>>,
+    pub version_tag: Option<String>,
+    pub activated_at: Option<String>,
+    pub active: bool,
+    pub active_source_hash: String,
+    pub source_size_bytes: Option<i64>,
+    pub last_validated_at: Option<String>,
+    pub deactivated_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentProjectionInput {
+    pub slug: String,
+    pub source_path: String,
+    pub source_hash: String,
+    pub projection_version: Option<i64>,
+    pub status: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub tools: Option<Vec<String>>,
+    pub version_tag: Option<String>,
+    pub source_size_bytes: Option<i64>,
+    pub validation_errors: Option<String>,
+}
+
+const PROJECTION_COLS: &str = "slug, source_path, source_hash, projection_version, status, validation_errors, name, description, tools_json, version_tag, activated_at, active, active_source_hash, source_size_bytes, last_validated_at, deactivated_at, created_at, updated_at";
+
 const COLS: &str =
     "id, name, description, model, backend, system_prompt, enabled, config, created_at, updated_at";
 
@@ -46,6 +85,33 @@ fn row_to_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
         config: row.get(7)?,
         created_at: row.get(8)?,
         updated_at: row.get(9)?,
+    })
+}
+
+fn row_to_agent_projection(row: &rusqlite::Row) -> rusqlite::Result<AgentProjection> {
+    let tools_json: Option<String> = row.get(8)?;
+    let tools = tools_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok());
+    Ok(AgentProjection {
+        slug: row.get(0)?,
+        source_path: row.get(1)?,
+        source_hash: row.get(2)?,
+        projection_version: row.get(3)?,
+        status: row.get(4)?,
+        validation_errors: row.get(5)?,
+        name: row.get(6)?,
+        description: row.get(7)?,
+        tools,
+        version_tag: row.get(9)?,
+        activated_at: row.get(10)?,
+        active: row.get::<_, i64>(11)? != 0,
+        active_source_hash: row.get(12)?,
+        source_size_bytes: row.get(13)?,
+        last_validated_at: row.get(14)?,
+        deactivated_at: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
     })
 }
 
@@ -67,6 +133,133 @@ pub(crate) fn fetch_agent(conn: &Connection, id: &str) -> Result<Option<Agent>, 
     conn.query_row(&sql, [&id], row_to_agent)
         .optional()
         .map_err(|e| e.to_string())
+}
+
+pub(crate) fn fetch_agent_projection(
+    conn: &Connection,
+    slug: &str,
+) -> Result<Option<AgentProjection>, String> {
+    let sql = format!("SELECT {PROJECTION_COLS} FROM agent_projections WHERE slug = ?");
+    conn.query_row(&sql, [slug], row_to_agent_projection)
+        .optional()
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) fn fetch_agent_projections(conn: &Connection) -> Result<Vec<AgentProjection>, String> {
+    let sql = format!("SELECT {PROJECTION_COLS} FROM agent_projections ORDER BY slug");
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let projections = stmt
+        .query_map([], row_to_agent_projection)
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(projections)
+}
+
+fn valid_projection_hash(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub(crate) fn activate_projection_row(
+    conn: &Connection,
+    projection: AgentProjectionInput,
+) -> Result<AgentProjection, String> {
+    let slug = projection.slug.trim().to_string();
+    if slug.is_empty() || projection.status != "valid" {
+        return Err("a valid Agent projection is required".to_string());
+    }
+    if projection.source_path.trim().is_empty() || !valid_projection_hash(&projection.source_hash) {
+        return Err("a source path and SHA-256 source hash are required".to_string());
+    }
+
+    let previous = fetch_agent_projection(conn, &slug)?;
+    let same_active_projection = previous
+        .as_ref()
+        .map(|row| row.active && row.source_hash == projection.source_hash)
+        .unwrap_or(false);
+    let projection_version = if same_active_projection {
+        previous
+            .as_ref()
+            .map(|row| row.projection_version)
+            .unwrap_or(1)
+    } else {
+        previous
+            .as_ref()
+            .map(|row| row.projection_version + 1)
+            .unwrap_or(1)
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let activated_at = previous
+        .as_ref()
+        .and_then(|row| row.activated_at.clone())
+        .unwrap_or_else(|| now.clone());
+    let tools_json = projection
+        .tools
+        .as_ref()
+        .map(|tools| serde_json::to_string(tools).map_err(|e| e.to_string()))
+        .transpose()?;
+
+    conn.execute(
+        "INSERT INTO agent_projections
+         (slug, source_path, source_hash, projection_version, status, validation_errors,
+          name, description, tools_json, version_tag, activated_at, active,
+          active_source_hash, source_size_bytes, last_validated_at, deactivated_at, updated_at)
+         VALUES (?, ?, ?, ?, 'valid', ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, NULL, ?)
+         ON CONFLICT(slug) DO UPDATE SET
+           source_path = excluded.source_path,
+           source_hash = excluded.source_hash,
+           projection_version = excluded.projection_version,
+           status = excluded.status,
+           validation_errors = excluded.validation_errors,
+           name = excluded.name,
+           description = excluded.description,
+           tools_json = excluded.tools_json,
+           version_tag = excluded.version_tag,
+           activated_at = excluded.activated_at,
+           active = 1,
+           active_source_hash = excluded.active_source_hash,
+           source_size_bytes = excluded.source_size_bytes,
+           last_validated_at = excluded.last_validated_at,
+           deactivated_at = NULL,
+           updated_at = excluded.updated_at",
+        params![
+            slug,
+            projection.source_path,
+            projection.source_hash,
+            projection_version,
+            projection.validation_errors,
+            projection.name,
+            projection.description,
+            tools_json,
+            projection.version_tag,
+            activated_at,
+            projection.source_hash,
+            projection.source_size_bytes,
+            now,
+            now,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    fetch_agent_projection(conn, &slug)?
+        .ok_or_else(|| "activated projection disappeared during readback".to_string())
+}
+
+pub(crate) fn deactivate_projection_row(
+    conn: &Connection,
+    slug: &str,
+) -> Result<Option<AgentProjection>, String> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE agent_projections
+         SET active = 0,
+             deactivated_at = COALESCE(deactivated_at, ?),
+             updated_at = ?
+         WHERE slug = ?",
+        params![now, now, slug],
+    )
+    .map_err(|e| e.to_string())?;
+    fetch_agent_projection(conn, slug)
 }
 
 pub(crate) fn insert_agent(
@@ -258,6 +451,30 @@ pub fn set_agent_enabled(db: State<AppDb>, id: String, enabled: bool) -> Result<
     set_agent_enabled_row(&conn, &id, enabled)
 }
 
+#[tauri::command]
+pub fn list_agent_projections(db: State<AppDb>) -> Result<Vec<AgentProjection>, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    fetch_agent_projections(&conn)
+}
+
+#[tauri::command]
+pub fn activate_agent_projection(
+    db: State<AppDb>,
+    projection: AgentProjectionInput,
+) -> Result<AgentProjection, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    activate_projection_row(&conn, projection)
+}
+
+#[tauri::command]
+pub fn deactivate_agent_projection(
+    db: State<AppDb>,
+    slug: String,
+) -> Result<Option<AgentProjection>, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    deactivate_projection_row(&conn, &slug)
+}
+
 /// Bind an agent to a channel.
 #[tauri::command]
 pub fn bind_agent_channel(
@@ -388,5 +605,81 @@ mod tests {
 
         unbind_channel_row(&conn, &a.id, "chan-1").unwrap();
         assert_eq!(channel_bindings(&conn, &a.id).unwrap(), vec!["chan-2"]);
+    }
+
+    fn projection(slug: &str, source_hash: &str, version: Option<i64>) -> AgentProjectionInput {
+        AgentProjectionInput {
+            slug: slug.into(),
+            source_path: format!("/agents/{slug}/soul.md"),
+            source_hash: source_hash.into(),
+            projection_version: version,
+            status: "valid".into(),
+            name: Some("Coder".into()),
+            description: Some("Canonical".into()),
+            tools: Some(vec!["search".into()]),
+            version_tag: Some("1".into()),
+            source_size_bytes: Some(128),
+            validation_errors: None,
+        }
+    }
+
+    #[test]
+    fn activation_rejects_invalid_or_unverifiable_projection_input() {
+        let conn = test_db();
+        let mut invalid = projection("coder", &"a".repeat(64), None);
+        invalid.status = "invalid".into();
+        assert!(activate_projection_row(&conn, invalid).is_err());
+
+        let invalid_hash = projection("coder", "not-a-sha", None);
+        assert!(activate_projection_row(&conn, invalid_hash).is_err());
+        assert!(fetch_agent_projections(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn activation_is_idempotent_for_the_same_source_and_increments_for_a_new_source() {
+        let conn = test_db();
+        let first = activate_projection_row(&conn, projection("coder", &"a".repeat(64), None)).unwrap();
+        assert!(first.active);
+        assert_eq!(first.projection_version, 1);
+
+        let same = activate_projection_row(&conn, projection("coder", &"a".repeat(64), None)).unwrap();
+        assert_eq!(same.projection_version, 1);
+
+        let changed = activate_projection_row(&conn, projection("coder", &"b".repeat(64), None)).unwrap();
+        assert_eq!(changed.projection_version, 2);
+        assert_eq!(changed.source_hash, "b".repeat(64));
+        assert!(changed.active);
+    }
+
+    #[test]
+    fn deactivation_preserves_provenance_and_is_idempotent() {
+        let conn = test_db();
+        let active = activate_projection_row(&conn, projection("coder", &"a".repeat(64), None)).unwrap();
+        let inactive = deactivate_projection_row(&conn, "coder").unwrap().expect("projection");
+        assert!(!inactive.active);
+        assert!(inactive.activated_at.is_some());
+        assert!(inactive.deactivated_at.is_some());
+        assert_eq!(inactive.source_hash, active.source_hash);
+        assert_eq!(deactivate_projection_row(&conn, "coder").unwrap().expect("projection").active, false);
+    }
+
+    #[test]
+    fn activation_state_survives_database_reopen() {
+        let dir = std::env::temp_dir().join(format!("jarvis-agent-projection-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = AppDb::new(&dir).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            activate_projection_row(&conn, projection("coder", &"a".repeat(64), None)).unwrap();
+        }
+        drop(db);
+        let reopened = AppDb::new(&dir).unwrap();
+        let conn = reopened.conn.lock().unwrap();
+        let rows = fetch_agent_projections(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].active);
+        drop(conn);
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

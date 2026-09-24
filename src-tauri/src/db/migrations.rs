@@ -220,9 +220,14 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
             source_path         TEXT NOT NULL DEFAULT '',
             source_hash         TEXT NOT NULL DEFAULT '',
             projection_version  INTEGER NOT NULL DEFAULT 1,
-            status              TEXT NOT NULL DEFAULT 'pending'
-                                CHECK(status IN ('valid', 'invalid', 'pending')),
-            validation_errors   TEXT CHECK(validation_errors IS NULL OR json_valid(validation_errors)),
+             status              TEXT NOT NULL DEFAULT 'pending'
+                                 CHECK(status IN ('valid', 'invalid', 'pending')),
+             active              INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0, 1)),
+             active_source_hash  TEXT NOT NULL DEFAULT '',
+             source_size_bytes   INTEGER,
+             last_validated_at   TEXT,
+             deactivated_at      TEXT,
+             validation_errors   TEXT CHECK(validation_errors IS NULL OR json_valid(validation_errors)),
             name                TEXT NOT NULL DEFAULT '',
             description         TEXT,
             tools_json          TEXT CHECK(tools_json IS NULL OR json_valid(tools_json)),
@@ -231,8 +236,9 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
             created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
             updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
-        CREATE INDEX IF NOT EXISTS idx_agent_projections_status ON agent_projections(status);
-        CREATE INDEX IF NOT EXISTS idx_agent_projections_hash   ON agent_projections(source_hash);
+         CREATE INDEX IF NOT EXISTS idx_agent_projections_status ON agent_projections(status);
+         CREATE INDEX IF NOT EXISTS idx_agent_projections_active ON agent_projections(active, status);
+         CREATE INDEX IF NOT EXISTS idx_agent_projections_hash   ON agent_projections(source_hash);
         "#,
     )?;
 
@@ -493,6 +499,41 @@ fn apply_schema_patches(conn: &Connection) -> Result<(), rusqlite::Error> {
         "memory",
         "status",
         "status TEXT NOT NULL DEFAULT 'active'",
+    )?;
+
+    add_column_if_missing(
+        conn,
+        "agent_projections",
+        "active",
+        "active INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "agent_projections",
+        "active_source_hash",
+        "active_source_hash TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(
+        conn,
+        "agent_projections",
+        "source_size_bytes",
+        "source_size_bytes INTEGER",
+    )?;
+    add_column_if_missing(
+        conn,
+        "agent_projections",
+        "last_validated_at",
+        "last_validated_at TEXT",
+    )?;
+    add_column_if_missing(
+        conn,
+        "agent_projections",
+        "deactivated_at",
+        "deactivated_at TEXT",
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_projections_active ON agent_projections(active, status)",
+        [],
     )?;
 
     // v3.1 — Self-learning: nudge counters + review tracking

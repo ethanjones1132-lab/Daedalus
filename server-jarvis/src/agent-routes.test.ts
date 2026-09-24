@@ -1,7 +1,7 @@
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { createLifecycleService } from "./agent-lifecycle";
+import { createLifecycleService, type ProjectionStore } from "./agent-lifecycle";
 import {
   handleActivateAgent,
   handleAgentRequest,
@@ -41,10 +41,13 @@ describe("agent routes", () => {
       activate(slug) {
         return slug === "coder";
       },
+      deactivate() {
+        return true;
+      },
     });
 
-    expect(handleListAgents(lifecycle)).toEqual([
-      { id: "coder", slug: "coder", status: "valid" },
+    expect(handleListAgents(lifecycle)).toMatchObject([
+      { id: "coder", slug: "coder", status: "valid", active: false },
     ]);
     expect(handleGetAgent(lifecycle, "coder")).toMatchObject({
       id: "coder",
@@ -57,39 +60,107 @@ describe("agent routes", () => {
       id: "missing",
       found: false,
     });
-    expect(handleActivateAgent(lifecycle, "coder")).toEqual({
+    expect(handleActivateAgent(lifecycle, "coder")).toMatchObject({
       success: true,
+      code: "activated",
       message: "Agent coder activated",
     });
     expect(handleScanAgents(lifecycle)).toEqual({ scanned: 1, valid: 1, invalid: 0 });
-    expect(handleDeactivateAgent(lifecycle, "coder")).toEqual({
+    expect(handleDeactivateAgent(lifecycle, "coder")).toMatchObject({
       success: true,
+      code: "deactivated",
       message: "Agent coder deactivated",
     });
   });
 
-  test("handleAgentRequest routes GET /agents through the mounted handler", () => {
+  test("handleAgentRequest routes GET /agents through the mounted handler", async () => {
     fixture = makeAgentRoot("http");
     writeSoul(fixture.root, "coder", `slug: coder\nname: Coder\n`);
     const lifecycle = createLifecycleService(fixture.root);
 
-    const response = handleAgentRequest(
+    const response = await handleAgentRequest(
       new Request("http://local/agents", { method: "GET" }),
       lifecycle
     );
     expect(response).not.toBeNull();
     expect(response!.status).toBe(200);
-    expect(response!.json()).resolves.toEqual([
-      { id: "coder", slug: "coder", status: "valid" },
+    expect(await response!.json()).toMatchObject([
+      { id: "coder", slug: "coder", status: "valid", active: false },
     ]);
   });
 
-  test("handleAgentRequest returns null for non-agent paths", () => {
+  test("handleAgentRequest returns null for non-agent paths", async () => {
     fixture = makeAgentRoot("fallback");
     const lifecycle = createLifecycleService(fixture.root);
-    const response = handleAgentRequest(
+    const response = await handleAgentRequest(
       new Request("http://local/skills", { method: "GET" }),
       lifecycle
+    );
+    expect(response).toBeNull();
+  });
+
+  test("activation requires the displayed source hash and returns the persisted projection", async () => {
+    fixture = makeAgentRoot("activation-route");
+    writeSoul(fixture.root, "coder", `slug: coder\nname: Coder\n`);
+    const lifecycle = createLifecycleService(fixture.root, {
+      activate: (slug, entry) => ({ active: true, slug, source_hash: entry?.source_hash }),
+      deactivate: () => ({ active: false }),
+    } as unknown as ProjectionStore);
+    const currentHash = lifecycle.scan().results[0].source_hash!;
+
+    const stale = await handleAgentRequest(
+      new Request("http://local/agents/coder/activate", {
+        method: "POST",
+        body: JSON.stringify({ expected_source_hash: "b".repeat(64) }),
+        headers: { "content-type": "application/json" },
+      }),
+      lifecycle,
+    );
+    expect(stale?.status).toBe(409);
+    expect(await stale?.json()).toMatchObject({ success: false, code: "source_changed" });
+
+    const response = await handleAgentRequest(
+      new Request("http://local/agents/coder/activate", {
+        method: "POST",
+        body: JSON.stringify({ expected_source_hash: currentHash }),
+        headers: { "content-type": "application/json" },
+      }),
+      lifecycle,
+    );
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({ success: true, projection: { active: true } });
+  });
+
+  test("deactivation is routed through the lifecycle store and remains idempotent", async () => {
+    fixture = makeAgentRoot("deactivation-route");
+    const calls: string[] = [];
+    const lifecycle = createLifecycleService(fixture.root, {
+      activate: () => true,
+      deactivate: (slug: string) => {
+        calls.push(slug);
+        return { active: false };
+      },
+    } as unknown as ProjectionStore);
+
+    const first = await handleAgentRequest(
+      new Request("http://local/agents/missing/deactivate", { method: "POST" }),
+      lifecycle,
+    );
+    const second = await handleAgentRequest(
+      new Request("http://local/agents/missing/deactivate", { method: "POST" }),
+      lifecycle,
+    );
+    expect(first?.status).toBe(200);
+    expect(second?.status).toBe(200);
+    expect(calls).toEqual(["missing", "missing"]);
+  });
+
+  test("does not interpret the pool namespace as an Agent id", async () => {
+    fixture = makeAgentRoot("pool-route");
+    const lifecycle = createLifecycleService(fixture.root);
+    const response = await handleAgentRequest(
+      new Request("http://local/agents/pool", { method: "GET" }),
+      lifecycle,
     );
     expect(response).toBeNull();
   });

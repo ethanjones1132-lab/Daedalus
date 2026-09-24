@@ -2,6 +2,16 @@ export interface LifecycleAgent {
   id: string;
   slug: string;
   status: string;
+  source_path?: string;
+  name?: string;
+  description?: string;
+  version?: string;
+  source_hash?: string;
+  source_size_bytes?: number;
+  active?: boolean;
+  projection_version?: number;
+  activated_at?: string | null;
+  deactivated_at?: string | null;
 }
 
 interface DiscoveryState {

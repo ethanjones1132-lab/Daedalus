@@ -5,6 +5,7 @@
 
 use crate::db::AppDb;
 use chrono::Utc;
+use rusqlite::OptionalExtension;
 use cron::Schedule;
 use reqwest::Client;
 use serde_json::json;
@@ -116,9 +117,9 @@ struct ProjectionSnapshot {
     slug: String,
     source_path: String,
     source_hash: String,
+    active_source_hash: String,
     projection_version: i64,
-    /// ISO-8601 timestamp when this snapshot was captured.
-    bound_at: String,
+    activated_at: String,
 }
 
 /// Query the agent projection for `agent_id` from the native SQLite store.
@@ -126,23 +127,62 @@ struct ProjectionSnapshot {
 fn query_projection_snapshot(
     conn: &rusqlite::Connection,
     agent_id: &str,
-) -> Option<ProjectionSnapshot> {
-    conn.query_row(
-        "SELECT slug, source_path, source_hash, projection_version
-         FROM agent_projections
-         WHERE slug = ? AND status = 'valid'",
-        [agent_id],
-        |row| {
-            Ok(ProjectionSnapshot {
-                slug: row.get(0)?,
-                source_path: row.get(1)?,
-                source_hash: row.get(2)?,
-                projection_version: row.get(3)?,
-                bound_at: Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
-            })
-        },
-    )
-    .ok()
+) -> Result<Option<ProjectionSnapshot>, String> {
+    let row = conn
+        .query_row(
+            "SELECT slug, source_path, source_hash, active_source_hash, projection_version,
+                    status, active, activated_at
+             FROM agent_projections
+             WHERE slug = ?",
+            [agent_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some((
+        slug,
+        source_path,
+        source_hash,
+        active_source_hash,
+        projection_version,
+        status,
+        active,
+        activated_at,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    if status != "valid" {
+        return Err("projection_invalid".to_string());
+    }
+    if active == 0 {
+        return Err("projection_inactive".to_string());
+    }
+    let Some(activated_at) = activated_at else {
+        return Err("projection_stale".to_string());
+    };
+    if source_hash.is_empty() || active_source_hash != source_hash {
+        return Err("projection_stale".to_string());
+    }
+    Ok(Some(ProjectionSnapshot {
+        slug,
+        source_path,
+        source_hash,
+        active_source_hash,
+        projection_version,
+        activated_at,
+    }))
 }
 
 /// Result of dispatching a cron job to the Bun server.
@@ -178,10 +218,10 @@ pub async fn dispatch_cron_job(
             )
             .map_err(|e| format!("Cron job '{}' not found: {}", job_id, e))?;
 
-        // Attempt to load a valid projection snapshot for the agent
-        let snapshot = agent_id
-            .as_deref()
-            .and_then(|aid| query_projection_snapshot(&conn, aid));
+        let snapshot = match agent_id.as_deref() {
+            Some(aid) => query_projection_snapshot(&conn, aid)?,
+            None => None,
+        };
 
         (prompt, agent_id, snapshot)
     };

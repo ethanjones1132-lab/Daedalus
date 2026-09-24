@@ -25,7 +25,7 @@ beforeEach(() => {
   readAgents = () => Promise.resolve([agent]);
   invokeMock.mockReset().mockImplementation((command: string) => {
     if (command === 'list_agents') return readAgents();
-    if (command === 'list_channels' || command === 'list_agent_channel_bindings') return Promise.resolve([]);
+    if (command === 'list_channels' || command === 'list_agent_channel_bindings' || command === 'list_agent_projections') return Promise.resolve([]);
     throw new Error(`Unexpected command: ${command}`);
   });
   fetchMock.mockReset();

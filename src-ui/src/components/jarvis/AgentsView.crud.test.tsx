@@ -78,7 +78,7 @@ describe('Agent CRUD coordination', () => {
         listCalls += 1;
         return listCalls === 1 ? Promise.resolve([alpha, beta]) : readback.promise;
       }
-      if (command === 'list_channels' || command === 'list_agent_channel_bindings') return Promise.resolve([]);
+      if (command === 'list_channels' || command === 'list_agent_channel_bindings' || command === 'list_agent_projections') return Promise.resolve([]);
       if (command === 'add_agent') return write.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
@@ -117,7 +117,7 @@ describe('Agent CRUD coordination', () => {
         listCalls += 1;
         return listCalls === 1 ? Promise.resolve([alpha, beta]) : Promise.resolve([alpha, beta, created]);
       }
-      if (command === 'list_channels' || command === 'list_agent_channel_bindings') return Promise.resolve([]);
+      if (command === 'list_channels' || command === 'list_agent_channel_bindings' || command === 'list_agent_projections') return Promise.resolve([]);
       if (command === 'add_agent') {
         writesAttempt += 1;
         return writesAttempt === 1 ? first.promise : second.promise;
@@ -154,7 +154,7 @@ describe('Agent CRUD coordination', () => {
         listCalls += 1;
         return Promise.resolve(listCalls === 1 ? [alpha, beta] : [updatedAlpha, beta]);
       }
-      if (command === 'list_channels' || command === 'list_agent_channel_bindings') return Promise.resolve([]);
+      if (command === 'list_channels' || command === 'list_agent_channel_bindings' || command === 'list_agent_projections') return Promise.resolve([]);
       if (command === 'set_agent_identity') {
         editWrites += 1;
         return editWrites === 1 ? first.promise : second.promise;
@@ -196,7 +196,7 @@ describe('Agent CRUD coordination', () => {
         listCalls += 1;
         return listCalls === 1 ? Promise.resolve([alpha, beta]) : readback.promise;
       }
-      if (command === 'list_channels' || command === 'list_agent_channel_bindings') return Promise.resolve([]);
+      if (command === 'list_channels' || command === 'list_agent_channel_bindings' || command === 'list_agent_projections') return Promise.resolve([]);
       if (command === 'set_agent_enabled') return write.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
@@ -223,7 +223,7 @@ describe('Agent CRUD coordination', () => {
         listCalls += 1;
         return listCalls === 1 ? Promise.resolve([alpha, beta]) : readback.promise;
       }
-      if (command === 'list_channels' || command === 'list_agent_channel_bindings') return Promise.resolve([]);
+      if (command === 'list_channels' || command === 'list_agent_channel_bindings' || command === 'list_agent_projections') return Promise.resolve([]);
       if (command === 'delete_agent') return write.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
@@ -258,7 +258,7 @@ describe('Agent CRUD coordination', () => {
         listCalls += 1;
         return listCalls === 1 ? oldRead.promise : newRead.promise;
       }
-      if (command === 'list_channels' || command === 'list_agent_channel_bindings') return Promise.resolve([]);
+      if (command === 'list_channels' || command === 'list_agent_channel_bindings' || command === 'list_agent_projections') return Promise.resolve([]);
       if (command === 'add_agent') return Promise.resolve(created);
       throw new Error(`Unexpected command: ${command}`);
     });
@@ -289,7 +289,7 @@ describe('Agent CRUD coordination', () => {
         if (listCalls === 2) return Promise.reject(new Error('private readback detail'));
         return retryRead.promise;
       }
-      if (command === 'list_channels' || command === 'list_agent_channel_bindings') return Promise.resolve([]);
+      if (command === 'list_channels' || command === 'list_agent_channel_bindings' || command === 'list_agent_projections') return Promise.resolve([]);
       if (command === 'set_agent_enabled') return write.promise;
       throw new Error(`Unexpected command: ${command}`);
     });

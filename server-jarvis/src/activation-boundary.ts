@@ -3,13 +3,18 @@
 // ═══════════════════════════════════════════════════════════════
 // Minimal file-backed projection snapshot support for cron runs.
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "fs";
 import { join } from "path";
 import { CONFIG_DIR } from "./config";
 
 export interface ProjectionSnapshot {
   slug: string;
-  active?: boolean;
+  active: boolean;
+  source_path?: string;
+  source_hash?: string;
+  projection_version?: number;
+  activated_at?: string | null;
+  deactivated_at?: string | null;
   updated_at?: string;
   [key: string]: unknown;
 }
@@ -64,11 +69,91 @@ export function restoreBoundary(slug = "default", baseDir: string = CONFIG_DIR):
 export function saveBoundary(snapshot: ProjectionSnapshot, baseDir: string = CONFIG_DIR): ActivationBoundary {
   mkdirSync(snapshotsDir(baseDir), { recursive: true });
   const normalized: ProjectionSnapshot = { ...snapshot, slug: snapshot.slug || "default", updated_at: new Date().toISOString() };
-  writeFileSync(snapshotPath(normalized.slug, baseDir), JSON.stringify(normalized, null, 2));
+  const path = snapshotPath(normalized.slug, baseDir);
+  const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(temporary, JSON.stringify(normalized, null, 2));
+  renameSync(temporary, path);
   try {
     writeFileSync(projectionDbPath(baseDir), JSON.stringify({ active: normalized.slug, updated_at: normalized.updated_at }, null, 2));
   } catch {
     // The JSON snapshot is the source of truth; the marker file is best-effort.
   }
   return { slug: normalized.slug, snapshot: normalized };
+}
+
+function assertSafeSlug(slug: string): void {
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) {
+    throw new Error("invalid agent slug");
+  }
+}
+
+function readProjection(slug: string, baseDir: string): ProjectionSnapshot | null {
+  assertSafeSlug(slug);
+  const path = snapshotPath(slug, baseDir);
+  if (!existsSync(path)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf-8")) as ProjectionSnapshot;
+    if (!parsed || typeof parsed !== "object" || parsed.slug !== slug) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export function createBoundaryProjectionStore(baseDir: string = CONFIG_DIR) {
+  return {
+    get(slug: string): ProjectionSnapshot | null {
+      return readProjection(slug, baseDir);
+    },
+    activate(
+      slug: string,
+      entry: {
+        source_path?: string;
+        source_hash?: string;
+        projection_version?: number;
+        activated_at?: string | null;
+        deactivated_at?: string | null;
+      } = {},
+    ): ProjectionSnapshot {
+      assertSafeSlug(slug);
+      const previous = readProjection(slug, baseDir);
+      const sourceHash = entry.source_hash ?? previous?.source_hash;
+      if (typeof sourceHash !== "string" || !/^[a-f0-9]{64}$/i.test(sourceHash)) {
+        throw new Error("activation requires a source hash");
+      }
+      const now = new Date().toISOString();
+      const sameActiveProjection = previous?.active === true && previous.source_hash === sourceHash;
+      const next: ProjectionSnapshot = {
+        ...previous,
+        ...entry,
+        slug,
+        source_hash: sourceHash,
+        active: true,
+        projection_version: sameActiveProjection
+          ? previous?.projection_version ?? 1
+          : (previous?.projection_version ?? 0) + 1,
+        activated_at: previous?.activated_at ?? now,
+        deactivated_at: null,
+        updated_at: now,
+      };
+      saveBoundary(next, baseDir);
+      return next;
+    },
+    deactivate(slug: string): ProjectionSnapshot {
+      assertSafeSlug(slug);
+      const previous = readProjection(slug, baseDir);
+      const now = new Date().toISOString();
+      const next: ProjectionSnapshot = {
+        ...previous,
+        slug,
+        active: false,
+        projection_version: previous?.projection_version ?? 1,
+        activated_at: previous?.activated_at ?? null,
+        deactivated_at: now,
+        updated_at: now,
+      };
+      saveBoundary(next, baseDir);
+      return next;
+    },
+  };
 }

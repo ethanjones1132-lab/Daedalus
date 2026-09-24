@@ -16,6 +16,12 @@ import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { initialBindingState, reduceBindingState } from './agent-binding-state';
 import { initialDiscoveryState, reduceDiscoveryState, type LifecycleAgent } from './agent-discovery-state';
 import {
+  canActivateLifecycle,
+  canDeactivateLifecycle,
+  effectiveLifecycleState,
+  type AgentProjection,
+} from './agent-lifecycle-state';
+import {
   agentOperationLocked,
   reconcileAgents,
   type Agent,
@@ -53,6 +59,21 @@ interface AgentDraft {
 }
 
 const EMPTY_DRAFT: AgentDraft = { name: '', model: '', description: '', system_prompt: '' };
+
+type LifecycleOperationPhase = 'writing' | 'reconciling' | 'write-failed' | 'read-failed';
+
+interface LifecycleOperation {
+  slug: string;
+  action: 'activate' | 'deactivate';
+  phase: LifecycleOperationPhase;
+  expectedSourceHash?: string;
+}
+
+interface LifecycleMutationResponse {
+  success: boolean;
+  code?: string;
+  projection?: AgentProjection;
+}
 
 function expectedFromDraft(draft: AgentDraft, enabled: boolean): AgentExpectation {
   return {
@@ -305,6 +326,12 @@ export function AgentsView() {
   const channelsPending = useRef(false);
   const [discovery, dispatchDiscovery] = useReducer(reduceDiscoveryState, initialDiscoveryState);
   const discoveryPending = useRef(false);
+  const [projections, setProjections] = useState<AgentProjection[] | null>(null);
+  const [projectionsLoading, setProjectionsLoading] = useState(true);
+  const [projectionsError, setProjectionsError] = useState(false);
+  const projectionsPending = useRef(false);
+  const [lifecycleOperations, setLifecycleOperations] = useState<Record<string, LifecycleOperation>>({});
+  const lifecycleOperationsRef = useRef<Record<string, LifecycleOperation>>({});
   const [loading, setLoading] = useState(true);
   const [loaded, setLoaded] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
@@ -329,6 +356,11 @@ export function AgentsView() {
     setOperations(next);
   }, []);
 
+  const publishLifecycleOperations = useCallback((next: Record<string, LifecycleOperation>) => {
+    lifecycleOperationsRef.current = next;
+    setLifecycleOperations(next);
+  }, []);
+
   const publishCreatePhase = useCallback((phase: AgentOperationPhase | null) => {
     createPending.current = phase !== null && phase !== 'write-failed';
     setCreatePhase(phase);
@@ -349,8 +381,8 @@ export function AgentsView() {
     successRef.current(`Created agent ${name}`);
   }, [publishCreatePhase]);
 
-  const fetchLifecycle = useCallback(async () => {
-    if (discoveryPending.current) return;
+  const fetchLifecycle = useCallback(async (): Promise<LifecycleAgent[] | null> => {
+    if (discoveryPending.current) return null;
     discoveryPending.current = true;
     dispatchDiscovery({ type: 'pending' });
     try {
@@ -358,10 +390,30 @@ export function AgentsView() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = (await res.json()) as LifecycleAgent[];
       dispatchDiscovery({ type: 'success', agents: data });
+      return data;
     } catch {
       dispatchDiscovery({ type: 'failure' });
+      return null;
     } finally {
       discoveryPending.current = false;
+    }
+  }, []);
+
+  const fetchProjections = useCallback(async (): Promise<AgentProjection[] | null> => {
+    if (projectionsPending.current) return null;
+    projectionsPending.current = true;
+    setProjectionsLoading(true);
+    try {
+      const data = await invoke<AgentProjection[]>('list_agent_projections');
+      setProjections(data);
+      setProjectionsError(false);
+      return data;
+    } catch {
+      setProjectionsError(true);
+      return null;
+    } finally {
+      projectionsPending.current = false;
+      setProjectionsLoading(false);
     }
   }, []);
 
@@ -443,7 +495,8 @@ export function AgentsView() {
     void fetchChannels();
     void fetchLifecycle();
     void fetchAgents();
-  }, [fetchAgents, fetchChannels, fetchLifecycle]);
+    void fetchProjections();
+  }, [fetchAgents, fetchChannels, fetchLifecycle, fetchProjections]);
 
   const invalidateAgentReads = useCallback(() => {
     requestId.current += 1;
@@ -558,6 +611,121 @@ export function AgentsView() {
     void mutate(agent, action);
   }, [mutate]);
 
+  const reconcileLifecycle = useCallback(async (
+    slug: string,
+    action: 'activate' | 'deactivate',
+    expectedSourceHash?: string,
+  ) => {
+    const [currentDiscovery, currentProjections] = await Promise.all([
+      fetchLifecycle(),
+      fetchProjections(),
+    ]);
+    const discovered = currentDiscovery?.find((agent) => agent.slug === slug);
+    const projection = currentProjections?.find((candidate) => candidate.slug === slug);
+    const confirmed = action === 'activate'
+      ? Boolean(
+        discovered
+        && discovered.status === 'valid'
+        && discovered.source_hash === expectedSourceHash
+        && projection?.active === true
+        && projection.source_hash === expectedSourceHash,
+      )
+      : Boolean(projection && projection.active === false);
+    if (!confirmed) {
+      const next = { ...lifecycleOperationsRef.current };
+      const operation = next[slug];
+      if (operation) next[slug] = { ...operation, phase: 'read-failed' };
+      publishLifecycleOperations(next);
+      return false;
+    }
+    const next = { ...lifecycleOperationsRef.current };
+    delete next[slug];
+    publishLifecycleOperations(next);
+    successRef.current(action === 'activate' ? `Activated ${slug}` : `Deactivated ${slug}`);
+    return true;
+  }, [fetchLifecycle, fetchProjections, publishLifecycleOperations]);
+
+  const activateLifecycle = useCallback(async (agent: LifecycleAgent) => {
+    const existing = lifecycleOperationsRef.current[agent.slug];
+    if (existing && existing.phase !== 'write-failed') return;
+    if (!canActivateLifecycle(agent, projections?.find((projection) => projection.slug === agent.slug))) return;
+    const expectedSourceHash = agent.source_hash;
+    if (!expectedSourceHash) return;
+    publishLifecycleOperations({
+      ...lifecycleOperationsRef.current,
+      [agent.slug]: { slug: agent.slug, action: 'activate', phase: 'writing', expectedSourceHash },
+    });
+    let nativeConfirmed = false;
+    try {
+      const response = await fetch(`http://127.0.0.1:19877/agents/${encodeURIComponent(agent.slug)}/activate`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ expected_source_hash: expectedSourceHash }),
+      });
+      const payload = await response.json() as LifecycleMutationResponse;
+      if (!response.ok || !payload.success || !payload.projection) throw new Error('activation rejected');
+      const next = { ...lifecycleOperationsRef.current };
+      next[agent.slug] = { slug: agent.slug, action: 'activate', phase: 'reconciling', expectedSourceHash };
+      publishLifecycleOperations(next);
+      const nativeProjection = await invoke<AgentProjection>('activate_agent_projection', { projection: payload.projection });
+      if (!nativeProjection?.active || nativeProjection.source_hash !== expectedSourceHash) throw new Error('native readback rejected');
+      nativeConfirmed = true;
+      await reconcileLifecycle(agent.slug, 'activate', expectedSourceHash);
+    } catch {
+      const next = { ...lifecycleOperationsRef.current };
+      next[agent.slug] = {
+        slug: agent.slug,
+        action: 'activate',
+        phase: nativeConfirmed ? 'read-failed' : 'write-failed',
+        expectedSourceHash,
+      };
+      publishLifecycleOperations(next);
+    }
+  }, [fetchLifecycle, projections, publishLifecycleOperations, reconcileLifecycle]);
+
+  const deactivateLifecycle = useCallback(async (agent: LifecycleAgent) => {
+    const projection = projections?.find((candidate) => candidate.slug === agent.slug);
+    const existing = lifecycleOperationsRef.current[agent.slug];
+    if (existing && existing.phase !== 'write-failed') return;
+    if (!canDeactivateLifecycle(agent, projection)) return;
+    publishLifecycleOperations({
+      ...lifecycleOperationsRef.current,
+      [agent.slug]: { slug: agent.slug, action: 'deactivate', phase: 'writing' },
+    });
+    let nativeConfirmed = false;
+    try {
+      const nativeProjection = await invoke<AgentProjection | null>('deactivate_agent_projection', { slug: agent.slug });
+      if (!nativeProjection || nativeProjection.active) throw new Error('native deactivation rejected');
+      nativeConfirmed = true;
+      const next = { ...lifecycleOperationsRef.current };
+      next[agent.slug] = { slug: agent.slug, action: 'deactivate', phase: 'reconciling' };
+      publishLifecycleOperations(next);
+      const response = await fetch(`http://127.0.0.1:19877/agents/${encodeURIComponent(agent.slug)}/deactivate`, { method: 'POST' });
+      const payload = await response.json() as LifecycleMutationResponse;
+      if (!response.ok || !payload.success) throw new Error('boundary deactivation rejected');
+      await reconcileLifecycle(agent.slug, 'deactivate');
+    } catch {
+      const next = { ...lifecycleOperationsRef.current };
+      next[agent.slug] = {
+        slug: agent.slug,
+        action: 'deactivate',
+        phase: nativeConfirmed ? 'read-failed' : 'write-failed',
+      };
+      publishLifecycleOperations(next);
+    }
+  }, [fetchLifecycle, projections, publishLifecycleOperations, reconcileLifecycle]);
+
+  const retryLifecycle = useCallback((agent: LifecycleAgent) => {
+    const operation = lifecycleOperationsRef.current[agent.slug];
+    if (!operation) return;
+    if (operation.phase === 'read-failed') {
+      void reconcileLifecycle(agent.slug, operation.action, operation.expectedSourceHash);
+      return;
+    }
+    if (operation.action === 'activate') void activateLifecycle(agent);
+    else void deactivateLifecycle(agent);
+  }, [activateLifecycle, deactivateLifecycle, reconcileLifecycle]);
+
   const remove = useCallback((agent: Agent) => {
     const operation = operationsRef.current[agent.id];
     if (operation && operation.action !== 'delete') return;
@@ -652,40 +820,107 @@ export function AgentsView() {
       )}
 
       <GlassCard className="p-3">
-        <div className="flex items-center justify-between mb-2">
-          <h3 className="text-xs font-medium text-bone/80">Lifecycle agents (disk scan)</h3>
-          <button
-            type="button"
-            onClick={() => void fetchLifecycle()}
-            disabled={discovery.loading}
-            className="text-[11px] px-2 py-0.5 rounded-md border border-white/10 text-bone/60 hover:text-bone transition-colors disabled:opacity-40"
-          >
-            {discovery.error ? 'Retry discovery' : 'Refresh discovery'}
-          </button>
+        <div className="flex items-center justify-between mb-2 gap-2">
+          <h3 className="text-xs font-medium text-bone/80">Canonical Agent lifecycle</h3>
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => void fetchLifecycle()}
+              disabled={discovery.loading}
+              className="text-[11px] px-2 py-0.5 rounded-md border border-white/10 text-bone/60 hover:text-bone transition-colors disabled:opacity-40"
+            >
+              {discovery.error ? 'Retry discovery' : 'Refresh discovery'}
+            </button>
+            <button
+              type="button"
+              onClick={() => void fetchProjections()}
+              disabled={projectionsLoading}
+              className="text-[11px] px-2 py-0.5 rounded-md border border-white/10 text-bone/60 hover:text-bone transition-colors disabled:opacity-40"
+            >
+              {projectionsError ? 'Retry projections' : 'Refresh projections'}
+            </button>
+          </div>
         </div>
         {discovery.loading && (
           <p role="status" aria-label="Agent discovery" className="text-xs text-bone/60">
             {discovery.agents === null ? 'Loading agent discovery…' : 'Refreshing agent discovery… Showing previous results.'}
           </p>
         )}
+        {projectionsLoading && projections === null && (
+          <p role="status" aria-label="Agent projections" className="text-xs text-bone/60">Loading Agent projections…</p>
+        )}
         {discovery.error && (
-          <p role="alert" className="text-xs text-red-300">
+          <p role="alert" aria-label="Agent discovery" className="text-xs text-red-300">
             Agent discovery is unavailable. {discovery.agents !== null && 'Showing previously discovered agents; they may be stale.'}
+          </p>
+        )}
+        {projectionsError && (
+          <p role="alert" aria-label="Agent projections" className="text-xs text-red-300">
+            Agent projections are unavailable. {projections !== null && 'Showing previously observed projections; they may be stale.'}
           </p>
         )}
         {!discovery.loading && !discovery.error && discovery.agents?.length === 0 && (
           <p className="text-xs text-bone/40">No agents discovered in agents root.</p>
         )}
         {discovery.agents !== null && discovery.agents.length > 0 && (
-          <ul className="space-y-1">
-            {discovery.agents.map((a) => (
-              <li key={a.id} className="flex items-center justify-between text-xs">
-                <span className="text-bone truncate">{a.slug}</span>
-                <Pill variant={a.status === 'valid' ? 'success' : a.status === 'invalid' ? 'error' : 'default'}>
-                  {a.status}
-                </Pill>
-              </li>
-            ))}
+          <ul className="space-y-2">
+            {discovery.agents.map((a) => {
+              const projection = projections?.find((candidate) => candidate.slug === a.slug);
+              const state = effectiveLifecycleState(a, projection);
+              const operation = lifecycleOperations[a.slug];
+              const operationLocked = operation !== undefined && operation.phase !== 'write-failed';
+              const canActivate = canActivateLifecycle(a, projection) && !projectionsError && !operationLocked;
+              const canDeactivate = canDeactivateLifecycle(a, projection) && !projectionsError && !operationLocked;
+              return (
+                <li key={a.slug} className="space-y-1">
+                  <div className="flex items-center gap-2 text-xs">
+                    <span className="text-bone truncate">{a.name ?? a.slug}</span>
+                    <Pill variant={a.status === 'valid' ? 'success' : a.status === 'invalid' ? 'error' : 'default'}>
+                      {a.status}
+                    </Pill>
+                    {projection && <Pill variant={projection.active ? 'success' : 'default'}>{projection.active ? 'active' : 'inactive'}</Pill>}
+                    {state === 'stale' && <span className="text-amber-200">Source changed; previous projection is stale.</span>}
+                    {state === 'unavailable' && <span className="text-bone/50">Activation unavailable until source provenance is observed.</span>}
+                    <div className="ml-auto flex items-center gap-1">
+                      {state !== 'active' && (
+                        <button
+                          type="button"
+                          aria-label={`Activate agent ${a.slug}`}
+                          onClick={() => void activateLifecycle(a)}
+                          disabled={!canActivate}
+                          className="px-2 py-0.5 rounded-md border border-emerald-500/30 text-emerald-200 disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          Activate
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        aria-label={`Deactivate agent ${a.slug}`}
+                        onClick={() => void deactivateLifecycle(a)}
+                        disabled={!canDeactivate}
+                        className="px-2 py-0.5 rounded-md border border-amber-500/30 text-amber-200 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        Deactivate
+                      </button>
+                    </div>
+                  </div>
+                  {operation?.phase === 'writing' && <p role="status" className="text-[11px] text-bone/60">{operation.action === 'activate' ? 'Activating Agent…' : 'Deactivating Agent…'}</p>}
+                  {operation?.phase === 'reconciling' && <p role="status" className="text-[11px] text-bone/60">Change saved. Confirming Agent projection…</p>}
+                  {operation?.phase === 'write-failed' && (
+                    <div role="alert" className="text-[11px] text-red-200">
+                      Agent {operation.action} failed. Confirmed lifecycle state was kept.{' '}
+                      <button type="button" className="underline" onClick={() => retryLifecycle(a)}>Retry</button>
+                    </div>
+                  )}
+                  {operation?.phase === 'read-failed' && (
+                    <div role="alert" className="text-[11px] text-red-200">
+                      Agent change was saved, but confirmation readback failed. Retry reloads both lifecycle sources only.{' '}
+                      <button type="button" aria-label={`Retry reconciliation for ${a.slug}`} className="underline" onClick={() => retryLifecycle(a)}>Retry</button>
+                    </div>
+                  )}
+                </li>
+              );
+            })}
           </ul>
         )}
       </GlassCard>

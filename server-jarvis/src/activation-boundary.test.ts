@@ -18,6 +18,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "os";
 import { join } from "path";
 import {
+  createBoundaryProjectionStore,
   defaultSnapshot,
   restoreBoundary,
   saveBoundary,
@@ -228,5 +229,29 @@ describe("saveBoundary + restoreBoundary round-trip", () => {
     // B has no file → falls through to default-snapshot, which is a freshly
     // stamped timestamp, NOT the one written by A.
     expect(fromB.snapshot.updated_at).not.toBe(fromA.snapshot.updated_at);
+  });
+});
+
+describe("boundary projection store", () => {
+  test("persists activation provenance and deactivation without deleting it", () => {
+    const dir = tempBaseDir();
+    const store = createBoundaryProjectionStore(dir);
+    const activated = store.activate("coder", {
+      source_path: "/agents/coder/soul.md",
+      source_hash: "a".repeat(64),
+    });
+    expect(activated).toMatchObject({ active: true, source_hash: "a".repeat(64) });
+    expect(store.get("coder")).toMatchObject({ active: true, source_hash: "a".repeat(64) });
+
+    const deactivated = store.deactivate("coder");
+    expect(deactivated).toMatchObject({ active: false, source_hash: "a".repeat(64) });
+    expect(store.get("coder")).toMatchObject({ active: false, source_path: "/agents/coder/soul.md" });
+  });
+
+  test("rejects unsafe slugs instead of normalizing them into a different identity", () => {
+    const dir = tempBaseDir();
+    const store = createBoundaryProjectionStore(dir);
+    expect(() => store.get("../escape")).toThrow();
+    expect(() => store.activate("", { source_hash: "a".repeat(64) })).toThrow();
   });
 });

@@ -28,6 +28,7 @@ beforeEach(() => {
     if (command === 'list_agents') return Promise.resolve([agent]);
     if (command === 'list_channels') return readChannels();
     if (command === 'list_agent_channel_bindings') return readBindings();
+    if (command === 'list_agent_projections') return Promise.resolve([]);
     if (command === 'bind_agent_channel' || command === 'unbind_agent_channel') return mutate();
     throw new Error(`Unexpected command: ${command}`);
   });

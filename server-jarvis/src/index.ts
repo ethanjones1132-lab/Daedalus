@@ -21,7 +21,8 @@ import { loadConfig, saveConfig, saveConfigWithValidation, normalizeConfig, Inva
 import type { JarvisConfig, OllamaConfig, SurfaceType } from "./config";
 import { Database } from "bun:sqlite";
 import { buildLearningPrompt, buildReviewPrompt, buildCodebaseAuditPrompt, buildFootballAuditPrompt } from "./cron-prompts";
-import { createLifecycleService } from "./agent-lifecycle";
+import { createLifecycleService, validateLifecycleSnapshot, type LifecycleSnapshot } from "./agent-lifecycle";
+import { createBoundaryProjectionStore } from "./activation-boundary";
 import { handleAgentRequest } from "./agent-routes";
 import { effectiveOllamaUrl, checkOllamaHealth, checkOllamaModelSupportsTools, resolveWindowsHostIP, resolveDesiredOllamaModel } from "./ollama";
 import { buildClaudeCliChatArgs, streamClaudeCli, isClaudeCliAvailable, compactTurnHistoryForCli } from "./claude-cli";
@@ -692,7 +693,10 @@ function agentsRootPath(): string {
 const cliSessionMap = new Map<string, string>(); // appSessionId → Claude CLI session ID for --resume
 
 /** Process-wide agent lifecycle service. Scans the configured agents root on demand. */
-const agentLifecycle = createLifecycleService(agentsRootPath());
+const agentLifecycle = createLifecycleService(
+  agentsRootPath(),
+  createBoundaryProjectionStore(CONFIG_DIR),
+);
 
 function resolveConfig(configOverride?: Partial<JarvisConfig> | null): JarvisConfig {
   return configOverride ? normalizeConfig(configOverride) : loadConfig();
@@ -1315,8 +1319,47 @@ async function runCronInference(body: Record<string, unknown>): Promise<{
     };
   }
   const sessionId = String(body.session_id ?? `cron_${crypto.randomUUID()}`);
+  const projectionValue = body.projection_snapshot;
+  let canonicalInstructions: string | undefined;
+  if (projectionValue !== undefined && projectionValue !== null) {
+    if (typeof projectionValue !== "object" || typeof (projectionValue as { slug?: unknown }).slug !== "string") {
+      return {
+        success: false,
+        output: "",
+        error: "invalid projection snapshot",
+        execution_evidence: {
+          run_id,
+          status: "failed",
+          started_at,
+          finished_at: new Date().toISOString(),
+          acceptance_result: "invalid projection snapshot",
+          error_code: "projection_invalid",
+        },
+      };
+    }
+    const validation = validateLifecycleSnapshot(agentLifecycle, projectionValue as LifecycleSnapshot);
+    if (!validation.ok) {
+      return {
+        success: false,
+        output: "",
+        error: validation.message,
+        execution_evidence: {
+          run_id,
+          status: "failed",
+          started_at,
+          finished_at: new Date().toISOString(),
+          acceptance_result: validation.message,
+          error_code: validation.code,
+        },
+      };
+    }
+    canonicalInstructions = validation.entry.instructions;
+  }
   try {
-    const resp = await streamJarvis(prompt, sessionId, { surface: "cron" });
+    const resp = await streamJarvis(prompt, sessionId, {
+      surface: "cron",
+      systemPromptOverride: canonicalInstructions,
+    });
     const { output, error } = await drainStreamJarvisResponse(resp);
     const finished_at = new Date().toISOString();
     if (error) {
@@ -5342,7 +5385,7 @@ export async function baseFetch(req: Request): Promise<Response> {
       );
       return Response.json(perf);
     }
-    const agentResponse = handleAgentRequest(req, agentLifecycle);
+    const agentResponse = await handleAgentRequest(req, agentLifecycle);
     if (agentResponse) {
       return agentResponse;
     }
