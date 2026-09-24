@@ -25,6 +25,14 @@ import {
 import MarkdownRenderer from './MarkdownRenderer';
 import { initialRegistryState, reduceRegistryState, type RegistrySnapshotState } from './action-registry-state';
 import { applySkillListRead, confirmSkillToggle, type SkillToggleProtection } from './skill-toggle-state';
+import {
+  skillCandidateMutationConfirmed,
+  skillCandidateMutationLocked,
+  startSkillCandidateMutation,
+  transitionSkillCandidateMutation,
+  type SkillCandidateAction,
+  type SkillCandidateMutation,
+} from './skill-candidate-operation-state';
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -68,6 +76,7 @@ interface SkillCandidateDetail {
   source_session_id?: string;
   confidence: number;
   status: 'candidate' | 'promoted' | 'rejected';
+  lifecycle_version?: number;
   eval_score?: number;
   eval_missed?: string[];
   rejection_reason?: string;
@@ -153,21 +162,32 @@ function isDistilledSkill(skill: Skill): boolean {
   return sourceOf(skill) === 'trajectory_distillation';
 }
 
+interface SkillCandidateActionResponse {
+  ok: boolean;
+  status: number;
+  data: Record<string, unknown>;
+}
+
 async function postSkillCandidateAction(
   candidateId: string,
-  action: 'promote' | 'reject' | 'demote' | 'eval',
-  body?: unknown,
-): Promise<{ ok: boolean; data: any }> {
+  action: SkillCandidateAction,
+  expectedVersion: number,
+  reason?: string,
+): Promise<SkillCandidateActionResponse> {
   try {
     const res = await fetch(`${BUN_URL}/skills/candidates/${encodeURIComponent(candidateId)}/${action}`, {
       method: 'POST',
-      headers: body ? { 'Content-Type': 'application/json' } : undefined,
-      body: body ? JSON.stringify(body) : undefined,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ expected_version: expectedVersion, ...(reason === undefined ? {} : { reason }) }),
     });
     const data = await res.json().catch(() => ({}));
-    return { ok: res.ok, data };
-  } catch (e) {
-    return { ok: false, data: { error: String(e) } };
+    return {
+      ok: res.ok,
+      status: res.status,
+      data: data && typeof data === 'object' ? data as Record<string, unknown> : {},
+    };
+  } catch {
+    return { ok: false, status: 0, data: {} };
   }
 }
 
@@ -177,7 +197,9 @@ function SkillDetail({
   skill,
   candidateDetail,
   candidateCurrent,
-  canUseCandidate,
+  candidateMutation,
+  onCandidateAction,
+  onRetryCandidate,
   onClose,
   onToggle,
   togglePending,
@@ -187,7 +209,9 @@ function SkillDetail({
   skill: Skill;
   candidateDetail: SkillCandidateDetail | null;
   candidateCurrent: boolean;
-  canUseCandidate: () => boolean;
+  candidateMutation: SkillCandidateMutation | null;
+  onCandidateAction: (action: SkillCandidateAction) => void;
+  onRetryCandidate: () => void;
   onClose: () => void;
   onToggle: (skill: Skill) => void;
   togglePending: boolean;
@@ -199,9 +223,9 @@ function SkillDetail({
   const [loadingRevs, setLoadingRevs] = useState(false);
   const [revError, setRevError] = useState<string | null>(null);
   const [performance, setPerformance] = useState<CandidatePerformance | null>(null);
-  const [actionBusy, setActionBusy] = useState(false);
   const { success, error: toastError } = useToast();
   const distilled = isDistilledSkill(skill);
+  const candidateActionLocked = skillCandidateMutationLocked(candidateMutation);
 
   useEffect(() => {
     setPerformance(null);
@@ -212,25 +236,6 @@ function SkillDetail({
         .catch(() => setPerformance(null));
     }
   }, [candidateDetail?.id, candidateDetail?.status]);
-
-  const runAction = useCallback(
-    async (action: 'promote' | 'reject' | 'demote' | 'eval') => {
-      if (!candidateDetail || !canUseCandidate()) return;
-      setActionBusy(true);
-      try {
-        const { ok, data } = await postSkillCandidateAction(candidateDetail.id, action);
-        if (!ok) {
-          toastError(data?.detail || data?.error || `${action} failed`, `${action} failed`);
-          return;
-        }
-        success(`${skill.name}: ${action} -> ${data?.status ?? 'ok'}`);
-        onChanged();
-      } finally {
-        setActionBusy(false);
-      }
-    },
-    [candidateDetail, canUseCandidate, skill.name, onChanged, success, toastError],
-  );
 
   const loadRevisions = useCallback(async () => {
     setLoadingRevs(true);
@@ -293,8 +298,8 @@ function SkillDetail({
             {candidateDetail && (
               <button
                 type="button"
-                disabled={actionBusy || !candidateCurrent}
-                onClick={() => runAction('eval')}
+                disabled={candidateActionLocked || !candidateCurrent}
+                onClick={() => onCandidateAction('eval')}
                 className="px-3 py-1.5 text-xs rounded-lg border border-white/10 text-bone/70 hover:bg-white/5 transition-colors disabled:opacity-50"
               >
                 Run eval
@@ -305,11 +310,11 @@ function SkillDetail({
                 <button
                   type="button"
                   disabled={
-                    actionBusy || !candidateCurrent ||
+                    candidateActionLocked || !candidateCurrent ||
                     candidateDetail.eval_score === undefined ||
                     candidateDetail.eval_score < 0.75
                   }
-                  onClick={() => runAction('promote')}
+                  onClick={() => onCandidateAction('promote')}
                   title={
                     candidateDetail.eval_score === undefined || candidateDetail.eval_score < 0.75
                       ? 'Run eval first — promotion requires a passing judge decision (≥0.75)'
@@ -321,8 +326,8 @@ function SkillDetail({
                 </button>
                 <button
                   type="button"
-                  disabled={actionBusy || !candidateCurrent}
-                  onClick={() => runAction('reject')}
+                  disabled={candidateActionLocked || !candidateCurrent}
+                  onClick={() => onCandidateAction('reject')}
                   className="px-3 py-1.5 text-xs rounded-lg border border-red-500/30 text-red-200 hover:bg-red-500/10 transition-colors disabled:opacity-50"
                 >
                   Reject
@@ -332,8 +337,8 @@ function SkillDetail({
             {candidateDetail?.status === 'promoted' && (
               <button
                 type="button"
-                disabled={actionBusy || !candidateCurrent}
-                onClick={() => runAction('demote')}
+                disabled={candidateActionLocked || !candidateCurrent}
+                onClick={() => onCandidateAction('demote')}
                 className="px-3 py-1.5 text-xs rounded-lg border border-amber-500/30 text-amber-200 hover:bg-amber-500/10 transition-colors disabled:opacity-50"
               >
                 Demote
@@ -392,6 +397,19 @@ function SkillDetail({
           </button>
         </div>
       </div>
+
+      {candidateMutation?.phase === 'write-failed' && (
+        <div role="status" aria-label="Candidate lifecycle status" className="mb-3 text-xs text-red-200">
+          Could not update candidate lifecycle. Showing the last confirmed state.{' '}
+          <button type="button" onClick={onRetryCandidate} className="underline">Retry</button>
+        </div>
+      )}
+      {candidateMutation?.phase === 'read-failed' && (
+        <div role="status" aria-label="Candidate lifecycle status" className="mb-3 text-xs text-amber-200">
+          The lifecycle write completed, but its status could not be confirmed. Showing the last confirmed state.{' '}
+                           <button type="button" onClick={onRetryCandidate} className="underline">Retry</button>
+        </div>
+      )}
 
       {!distilled && toggleError && (
         <div role="alert" className="mb-3 text-xs text-red-200">
@@ -511,8 +529,8 @@ function useSkillObservation<S>(read: () => Promise<S>) {
   const requestId = useRef(0);
   const pending = useRef(false);
   const current = useRef(false);
-  const refresh = useCallback(async (retry = false) => {
-    if (retry && pending.current) return;
+  const refresh = useCallback(async (retry = false): Promise<S | null> => {
+    if (retry && pending.current) return null;
     const id = ++requestId.current;
     pending.current = true;
     current.current = false;
@@ -521,8 +539,10 @@ function useSkillObservation<S>(read: () => Promise<S>) {
       const snapshot = await read();
       if (id === requestId.current) current.current = true;
       setState((prev) => reduceRegistryState(prev, { type: 'success', requestId: id, snapshot }));
+      return snapshot;
     } catch {
       setState((prev) => reduceRegistryState(prev, { type: 'failure', requestId: id }));
+      return null;
     } finally {
       if (id === requestId.current) pending.current = false;
     }
@@ -548,7 +568,17 @@ async function readCandidates() {
   const body = await res.json();
   if (!Array.isArray(body?.candidates)) throw new Error('Invalid candidate observation');
   const byId: Record<string, SkillCandidateDetail> = {};
-  for (const candidate of body.candidates) byId[candidate.id] = candidate;
+  for (const value of body.candidates) {
+    if (!value || typeof value !== 'object' || typeof (value as { id?: unknown }).id !== 'string') {
+      throw new Error('Invalid candidate observation');
+    }
+    const candidate = value as SkillCandidateDetail;
+    const version = candidate.lifecycle_version;
+    byId[candidate.id] = {
+      ...candidate,
+      lifecycle_version: Number.isSafeInteger(version) && (version as number) >= 0 ? version as number : 0,
+    };
+  }
   return byId;
 }
 
@@ -580,6 +610,9 @@ export function SkillsView() {
   const [togglePending, setTogglePending] = useState<Record<string, boolean>>({});
   const [toggleError, setToggleError] = useState<Record<string, boolean>>({});
   const protections = useRef<Record<string, SkillToggleProtection<boolean>>>({});
+  const candidateMutationRef = useRef<Record<string, SkillCandidateMutation | undefined>>({});
+  const [candidateMutations, setCandidateMutations] = useState<Record<string, SkillCandidateMutation | undefined>>({});
+  const nextCandidateMutationToken = useRef(0);
   const listReadId = useRef(0);
   const { state: runtimeSkills, refresh: refreshRuntimeSkills } = useSkillObservation(readRuntimeSkills);
   const { state: runtimeTools, refresh: refreshRuntimeTools } = useSkillObservation(readRuntimeTools);
@@ -595,7 +628,17 @@ export function SkillsView() {
   const detailId = useId();
   const inspectionButtons = useRef(new Map<string, HTMLButtonElement>());
   const searchInput = useRef<HTMLInputElement>(null);
-  const { success, error: toastError } = useToast();
+  const { success } = useToast();
+
+  const publishCandidateMutation = useCallback((candidateId: string, mutation: SkillCandidateMutation | null) => {
+    candidateMutationRef.current[candidateId] = mutation ?? undefined;
+    setCandidateMutations((previous) => {
+      const next = { ...previous };
+      if (mutation) next[candidateId] = mutation;
+      else delete next[candidateId];
+      return next;
+    });
+  }, []);
 
   const closeInspection = () => {
     const opener = selectedId ? inspectionButtons.current.get(selectedId) : null;
@@ -605,11 +648,11 @@ export function SkillsView() {
     else searchInput.current?.focus();
   };
 
-  const fetchSkills = useCallback(async () => {
+  const fetchSkills = useCallback(async (includeCandidates = true) => {
     const readId = ++listReadId.current;
     void refreshRuntimeSkills();
     void refreshRuntimeTools();
-    void refreshCandidates();
+    if (includeCandidates) void refreshCandidates();
     setLoading(true);
     setError(null);
     try {
@@ -679,26 +722,98 @@ export function SkillsView() {
     () => skills.find((s) => s.id === selectedId) ?? null,
     [skills, selectedId],
   );
-  const selectedCandidate = useMemo(() => {
-    if (!selected) return null;
-    const cid = candidateIdOf(selected);
-    return cid ? candidates?.[cid] ?? null : null;
-  }, [selected, candidates]);
+   const selectedCandidate = useMemo(() => {
+     if (!selected) return null;
+     const cid = candidateIdOf(selected);
+     return cid ? candidates?.[cid] ?? null : null;
+   }, [selected, candidates]);
+   const selectedCandidateId = selected ? candidateIdOf(selected) : null;
+   const selectedCandidateMutation = selectedCandidateId ? candidateMutations[selectedCandidateId] ?? null : null;
 
-  const enabledCount = skills.filter((s) => s.enabled).length;
+   const enabledCount = skills.filter((s) => s.enabled).length;
 
-  const runRowAction = useCallback(
-    async (skill: Skill, candidateId: string, action: 'promote' | 'reject') => {
-      if (!canUseCandidate() || !candidates?.[candidateId]) return;
-      const { ok, data } = await postSkillCandidateAction(candidateId, action);
-      if (!ok) {
-        toastError(data?.detail || data?.error || `${action} failed`, `${action} failed`);
+  const runCandidateAction = useCallback(
+    async (skill: Skill, candidateId: string, action: SkillCandidateAction) => {
+      if (!canUseCandidate()) return;
+      const observed = candidates?.[candidateId];
+      if (!observed) return;
+      const existing = candidateMutationRef.current[candidateId];
+      if (skillCandidateMutationLocked(existing)) return;
+      const token = ++nextCandidateMutationToken.current;
+      const mutation = startSkillCandidateMutation(
+        candidateId,
+        action,
+        observed.lifecycle_version ?? 0,
+        token,
+        observed.status,
+      );
+      publishCandidateMutation(candidateId, mutation);
+      const isCurrent = () => candidateMutationRef.current[candidateId]?.token === token;
+      const response = await postSkillCandidateAction(candidateId, action, mutation.expectedVersion);
+      if (!isCurrent()) return;
+      if (!response.ok) {
+        if (response.status === 400) {
+          publishCandidateMutation(candidateId, transitionSkillCandidateMutation(mutation, 'write-failed'));
+          return;
+        }
+        const reconciling = transitionSkillCandidateMutation(mutation, 'conflict');
+        if (!reconciling) return;
+        publishCandidateMutation(candidateId, reconciling);
+        const snapshot = await refreshCandidates();
+        if (!isCurrent()) return;
+        const authoritative = snapshot?.[candidateId];
+        if (snapshot && authoritative && skillCandidateMutationConfirmed(reconciling, authoritative)) {
+          publishCandidateMutation(candidateId, null);
+          success(`${authoritative.status === 'promoted' ? 'Promoted' : authoritative.status === 'rejected' ? 'Rejected' : action === 'eval' ? 'Evaluated' : 'Updated'} ${skill.name}`);
+        } else {
+          publishCandidateMutation(candidateId, transitionSkillCandidateMutation(reconciling, 'read-failed'));
+        }
         return;
       }
-      success(`${skill.name}: ${action} -> ${data?.status ?? 'ok'}`);
-      await fetchSkills();
+      const reconciling = transitionSkillCandidateMutation(mutation, 'write-succeeded');
+      if (!reconciling) return;
+      publishCandidateMutation(candidateId, reconciling);
+      const snapshot = await refreshCandidates();
+      if (!isCurrent()) return;
+      const authoritative = snapshot?.[candidateId];
+      if (!snapshot || !authoritative || !skillCandidateMutationConfirmed(reconciling, authoritative)) {
+        publishCandidateMutation(candidateId, transitionSkillCandidateMutation(reconciling, 'read-failed'));
+        return;
+      }
+      publishCandidateMutation(candidateId, null);
+      const outcome = authoritative.status === 'promoted' ? 'Promoted' : authoritative.status === 'rejected' ? 'Rejected' : 'Evaluated';
+      success(`${outcome} ${skill.name}`);
+      void fetchSkills(false);
     },
-    [fetchSkills, success, toastError, canUseCandidate, candidates],
+    [candidates, canUseCandidate, fetchSkills, publishCandidateMutation, refreshCandidates, success],
+  );
+
+  const retryCandidateMutation = useCallback(
+    async (skill: Skill, candidateId: string) => {
+      const mutation = candidateMutationRef.current[candidateId];
+      if (!mutation) return;
+      if (mutation.phase === 'write-failed') {
+        await runCandidateAction(skill, candidateId, mutation.action);
+        return;
+      }
+      if (mutation.phase !== 'read-failed') return;
+      const reconciling = transitionSkillCandidateMutation(mutation, 'retry-read');
+      if (!reconciling) return;
+      publishCandidateMutation(candidateId, reconciling);
+      const token = reconciling.token;
+      const snapshot = await refreshCandidates();
+      if (candidateMutationRef.current[candidateId]?.token !== token) return;
+      const authoritative = snapshot?.[candidateId];
+      if (!snapshot || !authoritative || !skillCandidateMutationConfirmed(reconciling, authoritative)) {
+        publishCandidateMutation(candidateId, transitionSkillCandidateMutation(reconciling, 'read-failed'));
+        return;
+      }
+      publishCandidateMutation(candidateId, null);
+      const outcome = authoritative.status === 'promoted' ? 'Promoted' : authoritative.status === 'rejected' ? 'Rejected' : 'Evaluated';
+      success(`${outcome} ${skill.name}`);
+      void fetchSkills(false);
+    },
+    [fetchSkills, publishCandidateMutation, refreshCandidates, runCandidateAction, success],
   );
 
   return (
@@ -780,9 +895,11 @@ export function SkillsView() {
                 const distilled = isDistilledSkill(s);
                 const candidateId = candidateIdOf(s);
                 const candidate = candidateId ? candidates?.[candidateId] : null;
-                const candidateStatus = candidate?.status;
-                const candidateEvalScore = candidate?.eval_score;
-                const canPromote = candidateCurrent && candidateEvalScore !== undefined && candidateEvalScore >= 0.75;
+                 const candidateStatus = candidate?.status;
+                 const candidateEvalScore = candidate?.eval_score;
+                 const candidateMutation = candidateId ? candidateMutations[candidateId] ?? null : null;
+                 const candidateActionLocked = skillCandidateMutationLocked(candidateMutation);
+                 const canPromote = candidateCurrent && !candidateActionLocked && candidateEvalScore !== undefined && candidateEvalScore >= 0.75;
                 return (
                   <li key={s.id}>
                     <GlassCard
@@ -833,7 +950,7 @@ export function SkillsView() {
                                   disabled={!canPromote}
                                   onClick={(e) => {
                                     e.stopPropagation();
-                                    runRowAction(s, candidateId, 'promote');
+                                     runCandidateAction(s, candidateId, 'promote');
                                   }}
                                   title={
                                     canPromote
@@ -846,10 +963,10 @@ export function SkillsView() {
                                 </button>
                                 <button
                                   type="button"
-                                  disabled={!candidateCurrent}
+                                   disabled={!candidateCurrent || candidateActionLocked}
                                   onClick={(e) => {
                                     e.stopPropagation();
-                                    runRowAction(s, candidateId, 'reject');
+                                     runCandidateAction(s, candidateId, 'reject');
                                   }}
                                   className="text-[11px] px-2 py-0.5 rounded-md border border-red-500/30 text-red-200 hover:bg-red-500/10 transition-colors"
                                 >
@@ -877,7 +994,19 @@ export function SkillsView() {
                           </button>
                         )}
                       </div>
-                      <p className="text-xs text-bone/60 line-clamp-2">{s.description}</p>
+                       <p className="text-xs text-bone/60 line-clamp-2">{s.description}</p>
+                       {candidateMutation?.phase === 'write-failed' && (
+                         <div role="alert" aria-label={`Candidate lifecycle: ${s.name}`} className="mt-1 text-xs text-red-200">
+                           Could not update candidate lifecycle. Showing the last confirmed state.{' '}
+                           <button type="button" onClick={(e) => { e.stopPropagation(); void retryCandidateMutation(s, candidateId!); }} className="underline">Retry</button>
+                         </div>
+                       )}
+                       {candidateMutation?.phase === 'read-failed' && (
+                         <div role="alert" aria-label={`Candidate lifecycle: ${s.name}`} className="mt-1 text-xs text-amber-200">
+                           The lifecycle write completed, but its status could not be confirmed. Showing the last confirmed state.{' '}
+                           <button type="button" onClick={(e) => { e.stopPropagation(); void retryCandidateMutation(s, candidateId!); }} className="underline">Retry</button>
+                         </div>
+                       )}
                       {!distilled && toggleError[s.id] && (
                         <div role="alert" className="mt-1 text-xs text-red-200">
                           Could not update skill enablement. Showing last confirmed state: {s.enabled ? 'enabled' : 'disabled'}.{' '}
@@ -911,10 +1040,16 @@ export function SkillsView() {
               <SkillDetail
                 key={selected.id}
                 skill={selected}
-                candidateDetail={selectedCandidate}
-                candidateCurrent={candidateCurrent}
-                canUseCandidate={canUseCandidate}
-                onClose={closeInspection}
+                 candidateDetail={selectedCandidate}
+                 candidateCurrent={candidateCurrent}
+                 candidateMutation={selectedCandidateMutation}
+                 onCandidateAction={(action) => {
+                   if (selectedCandidate) void runCandidateAction(selected, selectedCandidate.id, action);
+                 }}
+                 onRetryCandidate={() => {
+                   if (selectedCandidateId) void retryCandidateMutation(selected, selectedCandidateId);
+                 }}
+                 onClose={closeInspection}
                 onToggle={toggle}
                 togglePending={togglePending[selected.id] === true}
                 toggleError={toggleError[selected.id] === true}

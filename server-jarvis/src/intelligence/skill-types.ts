@@ -29,6 +29,7 @@ export interface SkillCandidate {
   source_session_id?: string;
   confidence: number;
   status: SkillCandidateStatus;
+  lifecycle_version?: number;
   eval_score?: number;
   /** Rubric items missed on the most recent judge run. Only meaningful after a `POST .../eval` or `.../promote` call. */
   eval_missed?: string[];

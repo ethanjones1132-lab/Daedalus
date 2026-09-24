@@ -1,6 +1,6 @@
 import type { SkillDistillationConfig } from "../config";
 import type { SkillCandidate, SkillRejectionReason } from "./skill-types";
-import { listSkillCandidates, loadSkillCandidate, updateSkillCandidateStatus } from "./skill-store";
+import { listSkillCandidates, loadSkillCandidate, skillCandidateLifecycleVersion, transitionSkillCandidate, updateSkillCandidateStatus } from "./skill-store";
 import { judgeAnswer, type JudgeVerdict } from "../eval/judge";
 import type { CallModelFn } from "../orchestration/coordinator";
 import { SelfTuningStore, type TrajectorySnapshot } from "../self-tuning/store";
@@ -152,7 +152,15 @@ export function runSkillPromotionPass(
     result.total_evaluated += 1;
     const verdict = evaluateSkillPromotion(candidate, config);
     if (verdict.promote) {
-      const updated = updateSkillCandidateStatus(candidate.id, "promoted", verdict.score);
+      const updated = updateSkillCandidateStatus(
+        candidate.id,
+        "promoted",
+        verdict.score,
+        undefined,
+        undefined,
+        undefined,
+        skillCandidateLifecycleVersion(candidate),
+      );
       if (updated) result.promoted.push(updated);
       continue;
     }
@@ -168,6 +176,8 @@ export function runSkillPromotionPass(
         verdict.score,
         verdict.reason,
         verdict.detail,
+        undefined,
+        skillCandidateLifecycleVersion(candidate),
       );
       if (updated) result.rejected.push(updated);
     }
@@ -227,8 +237,17 @@ export async function promoteCandidates(
 
   const decisions: SkillPromotionDecision[] = [];
   for (const { candidate, priorJson } of pending) {
-    const result = await promoteSkillCandidate(candidate.id, callModel, config, fetchSnapshot);
+    const result = await promoteSkillCandidate(
+      candidate.id,
+      callModel,
+      config,
+      fetchSnapshot,
+      skillCandidateLifecycleVersion(candidate),
+    );
     if (!result.ok) {
+      if (result.error === "stale_version") {
+        throw new Error(`stale_version: candidate ${candidate.id} changed during promotion`);
+      }
       // Re-evaluate after a fresh judge call failed or returned an invalid
       // protocol: this is not a grounded rejection. Surface it as a reject
       // decision but do not leave the candidate promoted.
@@ -370,7 +389,7 @@ export async function runGroundingJudge(
 
 export interface PromoteSkillCandidateResult {
   ok: boolean;
-  error?: "candidate_not_found" | "wrong_status" | "judge_unavailable" | "judge_invalid";
+  error?: "candidate_not_found" | "wrong_status" | "stale_version" | "judge_unavailable" | "judge_invalid";
   detail?: string;
   candidate?: SkillCandidate;
   verdict?: JudgeVerdict;
@@ -389,38 +408,65 @@ export async function promoteSkillCandidate(
   callModel: CallModelFn,
   config: SkillDistillationConfig,
   fetchSnapshot: SnapshotFetcher = defaultSnapshotFetcher,
+  expectedVersion?: number,
 ): Promise<PromoteSkillCandidateResult> {
   const candidate = loadSkillCandidate(id);
   if (!candidate) {
     return { ok: false, error: "candidate_not_found" };
   }
+  const observedVersion = skillCandidateLifecycleVersion(candidate);
+  if (expectedVersion !== undefined && expectedVersion !== observedVersion) {
+    return { ok: false, error: "stale_version", detail: `current version is ${observedVersion}` };
+  }
   if (candidate.status !== "candidate") {
     return { ok: false, error: "wrong_status", detail: `status is ${candidate.status}` };
   }
 
+  const commit = (
+    status: "promoted" | "rejected",
+    evalScore: number | undefined,
+    rejectionReason: SkillRejectionReason | undefined,
+    rejectionDetail: string | undefined,
+    evalMissed: string[] | undefined,
+  ): PromoteSkillCandidateResult => {
+    const transitioned = transitionSkillCandidate(id, observedVersion, "candidate", (current) => {
+      const updated: SkillCandidate = {
+        ...current,
+        status,
+        eval_score: evalScore ?? current.eval_score,
+      };
+      if (status === "rejected") {
+        updated.rejection_reason = rejectionReason;
+        updated.rejection_detail = rejectionDetail;
+      } else {
+        updated.rejection_reason = undefined;
+        updated.rejection_detail = undefined;
+      }
+      if (evalMissed !== undefined) updated.eval_missed = evalMissed;
+      if (status === "promoted") updated.promoted_at = new Date().toISOString();
+      else updated.promoted_at = undefined;
+      return updated;
+    });
+    if (!transitioned.ok) {
+      return {
+        ok: false,
+        error: transitioned.error === "stale_version" ? "stale_version" : "wrong_status",
+        detail: transitioned.error === "stale_version" ? "candidate changed during lifecycle action" : `status is ${transitioned.current?.status ?? "unknown"}`,
+        candidate: transitioned.current,
+      };
+    }
+    return { ok: true, candidate: transitioned.candidate };
+  };
+
   const heuristic = evaluateSkillPromotion(candidate, config);
   if (!heuristic.promote) {
-    const updated = updateSkillCandidateStatus(
-      id,
-      "rejected",
-      heuristic.score,
-      heuristic.reason,
-      heuristic.detail,
-    );
-    return { ok: true, candidate: updated ?? undefined };
+    return commit("rejected", heuristic.score, heuristic.reason, heuristic.detail, undefined);
   }
 
   const grounding = await runGroundingJudge(candidate, callModel, fetchSnapshot);
   if (!grounding.ok) {
     if (grounding.error === "no_grounding_source") {
-      const updated = updateSkillCandidateStatus(
-        id,
-        "rejected",
-        heuristic.score,
-        "eval_failed",
-        "no grounding source available",
-      );
-      return { ok: true, candidate: updated ?? undefined };
+      return commit("rejected", heuristic.score, "eval_failed", "no grounding source available", undefined);
     }
     if (grounding.error === "judge_invalid") {
       return { ok: false, error: "judge_invalid", detail: grounding.detail };
@@ -431,18 +477,18 @@ export async function promoteSkillCandidate(
   const verdict = grounding.verdict;
   const minJudgeScore = config.min_judge_score ?? 0.75;
   if (verdict.score >= minJudgeScore) {
-    const updated = updateSkillCandidateStatus(id, "promoted", verdict.score, undefined, undefined, verdict.missed);
-    return { ok: true, candidate: updated ?? undefined, verdict };
+    return { ...commit("promoted", verdict.score, undefined, undefined, verdict.missed), verdict };
   }
-  const updated = updateSkillCandidateStatus(
-    id,
-    "rejected",
-    verdict.score,
-    "eval_failed",
-    `missed: ${verdict.missed.join("; ")}`,
-    verdict.missed,
-  );
-  return { ok: true, candidate: updated ?? undefined, verdict };
+  return {
+    ...commit(
+      "rejected",
+      verdict.score,
+      "eval_failed",
+      `missed: ${verdict.missed.join("; ")}`,
+      verdict.missed,
+    ),
+    verdict,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════

@@ -3,6 +3,16 @@ import { join, dirname } from "path";
 import { homedir } from "os";
 import type { SkillCandidate, SkillCandidateStatus, SkillRejectionReason } from "./skill-types";
 
+export function skillCandidateLifecycleVersion(candidate: Pick<SkillCandidate, "lifecycle_version"> | null | undefined): number {
+  const version = candidate?.lifecycle_version;
+  return Number.isSafeInteger(version) && (version as number) >= 0 ? version as number : 0;
+}
+
+function normalizeSkillCandidate(value: unknown): SkillCandidate {
+  const candidate = value as SkillCandidate;
+  return { ...candidate, lifecycle_version: skillCandidateLifecycleVersion(candidate) };
+}
+
 function skillCandidatesDirOverride(): string | undefined {
   return (globalThis as { __skillCandidatesDirOverride?: string }).__skillCandidatesDirOverride;
 }
@@ -18,16 +28,17 @@ export function skillCandidatePath(id: string): string {
 }
 
 export function saveSkillCandidate(candidate: SkillCandidate): void {
-  const path = skillCandidatePath(candidate.id);
+  const normalized = normalizeSkillCandidate(candidate);
+  const path = skillCandidatePath(normalized.id);
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(candidate, null, 2), "utf-8");
+  writeFileSync(path, JSON.stringify(normalized, null, 2), "utf-8");
 }
 
 export function loadSkillCandidate(id: string): SkillCandidate | null {
   const path = skillCandidatePath(id);
   if (!existsSync(path)) return null;
   try {
-    return JSON.parse(readFileSync(path, "utf-8")) as SkillCandidate;
+    return normalizeSkillCandidate(JSON.parse(readFileSync(path, "utf-8")));
   } catch {
     return null;
   }
@@ -40,7 +51,7 @@ export function listSkillCandidates(status?: SkillCandidateStatus): SkillCandida
   for (const file of readdirSync(dir)) {
     if (!file.endsWith(".json")) continue;
     try {
-      const row = JSON.parse(readFileSync(join(dir, file), "utf-8")) as SkillCandidate;
+      const row = normalizeSkillCandidate(JSON.parse(readFileSync(join(dir, file), "utf-8")));
       if (!status || row.status === status) out.push(row);
     } catch {
       // Skip corrupt files.
@@ -52,6 +63,37 @@ export function listSkillCandidates(status?: SkillCandidateStatus): SkillCandida
   });
 }
 
+export type SkillCandidateTransitionError = "candidate_not_found" | "stale_version" | "wrong_status";
+export type SkillCandidateTransitionResult =
+  | { ok: true; candidate: SkillCandidate }
+  | { ok: false; error: SkillCandidateTransitionError; current?: SkillCandidate };
+
+export function transitionSkillCandidate(
+  id: string,
+  expectedVersion: number,
+  requiredStatus: SkillCandidateStatus,
+  update: (current: SkillCandidate) => Partial<SkillCandidate>,
+): SkillCandidateTransitionResult {
+  const existing = loadSkillCandidate(id);
+  if (!existing) return { ok: false, error: "candidate_not_found" };
+  const currentVersion = skillCandidateLifecycleVersion(existing);
+  if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0 || currentVersion !== expectedVersion) {
+    return { ok: false, error: "stale_version", current: existing };
+  }
+  if (existing.status !== requiredStatus) {
+    return { ok: false, error: "wrong_status", current: existing };
+  }
+  const updated = normalizeSkillCandidate({
+    ...existing,
+    ...update(existing),
+    id: existing.id,
+    lifecycle_version: currentVersion + 1,
+    updated_at: new Date().toISOString(),
+  });
+  saveSkillCandidate(updated);
+  return { ok: true, candidate: updated };
+}
+
 export function updateSkillCandidateStatus(
   id: string,
   status: SkillCandidateStatus,
@@ -59,56 +101,54 @@ export function updateSkillCandidateStatus(
   rejectionReason?: SkillRejectionReason,
   rejectionDetail?: string,
   evalMissed?: string[],
+  expectedVersion?: number,
 ): SkillCandidate | null {
   const existing = loadSkillCandidate(id);
   if (!existing) return null;
-  const updated: SkillCandidate = {
-    ...existing,
-    status,
-    eval_score: evalScore ?? existing.eval_score,
-    updated_at: new Date().toISOString(),
-  };
-  // Only attach rejection metadata on rejection transitions — preserve
-  // a stale reason on a status change to "candidate" or "promoted"
-  // (the operator can re-arm by saving a fresh candidate).
-  if (status === "rejected") {
-    updated.rejection_reason = rejectionReason;
-    updated.rejection_detail = rejectionDetail;
-  } else {
-    delete updated.rejection_reason;
-    delete updated.rejection_detail;
-  }
-  if (evalMissed !== undefined) updated.eval_missed = evalMissed;
-  // promoted_at is set on promotion and cleared on any transition away from
-  // "promoted" (demote back to "candidate", or a reject) — it should never
-  // survive a status it no longer describes.
-  if (status === "promoted") {
-    updated.promoted_at = new Date().toISOString();
-  } else {
-    delete updated.promoted_at;
-  }
-  saveSkillCandidate(updated);
-  return updated;
+  const result = transitionSkillCandidate(
+    id,
+    expectedVersion ?? skillCandidateLifecycleVersion(existing),
+    existing.status,
+    (current) => {
+      const updated: SkillCandidate = {
+        ...current,
+        status,
+        eval_score: evalScore ?? current.eval_score,
+      };
+      if (status === "rejected") {
+        updated.rejection_reason = rejectionReason;
+        updated.rejection_detail = rejectionDetail;
+      } else {
+        updated.rejection_reason = undefined;
+        updated.rejection_detail = undefined;
+      }
+      if (evalMissed !== undefined) updated.eval_missed = evalMissed;
+      if (status === "promoted") {
+        updated.promoted_at = new Date().toISOString();
+      } else {
+        updated.promoted_at = undefined;
+      }
+      return updated;
+    },
+  );
+  return result.ok ? result.candidate : null;
 }
 
-/** Persists a judge run's score/missed items without transitioning status —
- *  backs the `POST /skills/candidates/:id/eval` endpoint, which lets an
- *  operator preview a grounding score before committing to promote/reject. */
 export function updateSkillCandidateEval(
   id: string,
   evalScore: number,
   evalMissed: string[],
+  expectedVersion?: number,
 ): SkillCandidate | null {
   const existing = loadSkillCandidate(id);
   if (!existing) return null;
-  const updated: SkillCandidate = {
-    ...existing,
-    eval_score: evalScore,
-    eval_missed: evalMissed,
-    updated_at: new Date().toISOString(),
-  };
-  saveSkillCandidate(updated);
-  return updated;
+  const result = transitionSkillCandidate(
+    id,
+    expectedVersion ?? skillCandidateLifecycleVersion(existing),
+    existing.status,
+    (current) => ({ ...current, eval_score: evalScore, eval_missed: evalMissed }),
+  );
+  return result.ok ? result.candidate : null;
 }
 
 export function pruneSkillCandidates(maxRows: number): number {

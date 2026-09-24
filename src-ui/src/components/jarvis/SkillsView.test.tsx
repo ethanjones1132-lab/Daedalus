@@ -58,9 +58,9 @@ const candidateDetail = {
   // once the independent judge/eval gate has passed.
   eval_score: 0.82,
   eval_missed: false,
-  rejection_reason: undefined,
-  rejection_detail: undefined,
-  promoted_at: undefined,
+  rejection_reason: undefined as string | undefined,
+  rejection_detail: undefined as string | undefined,
+  promoted_at: undefined as string | undefined,
   created_at: '2026-06-02T00:00:00.000Z',
   updated_at: '2026-06-02T00:00:00.000Z',
 };
@@ -70,18 +70,21 @@ function mockFetchJson(body: unknown, ok = true) {
 }
 
 function setupFetchMock(overrides?: { onPromote?: () => void }) {
+  let candidateSnapshot = { ...candidateDetail, lifecycle_version: 0 };
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     const method = init?.method ?? 'GET';
     if (url === `${BUN_URL}/skills/candidates` && method === 'GET') {
-      return mockFetchJson({ candidates: [candidateDetail] });
+      return mockFetchJson({ candidates: [candidateSnapshot] });
     }
     if (url === `${BUN_URL}/skills/candidates/${candidateDetail.id}/promote` && method === 'POST') {
       overrides?.onPromote?.();
-      return mockFetchJson({ id: candidateDetail.id, status: 'promoted', promoted_at: '2026-06-03T00:00:00.000Z' });
+      candidateSnapshot = { ...candidateSnapshot, status: 'promoted', lifecycle_version: 1, promoted_at: '2026-06-03T00:00:00.000Z' };
+      return mockFetchJson(candidateSnapshot);
     }
     if (url === `${BUN_URL}/skills/candidates/${candidateDetail.id}/reject` && method === 'POST') {
-      return mockFetchJson({ id: candidateDetail.id, status: 'rejected', rejection_reason: 'manual' });
+      candidateSnapshot = { ...candidateSnapshot, status: 'rejected', lifecycle_version: 1, rejection_reason: 'manual' };
+      return mockFetchJson(candidateSnapshot);
     }
     return mockFetchJson({}, false);
   });
