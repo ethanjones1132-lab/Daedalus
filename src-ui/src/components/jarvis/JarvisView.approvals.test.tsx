@@ -78,6 +78,40 @@ async function renderPanel() {
   return view;
 }
 
+function directSseStream() {
+  let controller!: ReadableStreamDefaultController<Uint8Array>;
+  const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
+  const fetchMock = vi.fn(async () => new Response(stream, {
+    status: 200,
+    headers: { 'Content-Type': 'text/event-stream' },
+  }));
+  vi.stubGlobal('fetch', fetchMock);
+  return {
+    fetchMock,
+    async emit(frame: object) {
+      await act(async () => {
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(frame)}\n\n`));
+      });
+    },
+    async emitRaw(value: string) {
+      await act(async () => {
+        controller.enqueue(new TextEncoder().encode(value));
+      });
+    },
+    async close() {
+      await act(async () => { controller.close(); });
+    },
+  };
+}
+
+async function startDirectTurn(fetchMock: ReturnType<typeof vi.fn>, message = 'request approval') {
+  const composer = await screen.findByLabelText('Chat input') as HTMLTextAreaElement;
+  fireEvent.change(composer, { target: { value: message } });
+  fireEvent.keyDown(composer, { key: 'Enter' });
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+  await screen.findByRole('status', { name: 'Session turn progress' });
+}
+
 async function emitApproval(payload: Partial<ApprovalPayload> = {}, expectDialog = true) {
   const listener = listeners.get('jarvis://approval_request');
   expect(listener).toBeDefined();
@@ -106,9 +140,110 @@ beforeEach(() => {
   Element.prototype.scrollIntoView = vi.fn();
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
 describe('ChatPanel tool approval decisions', () => {
+  it.each([
+    ['Approve', 'approve'],
+    ['Reject', 'deny'],
+  ] as const)('handles a direct approval frame and sends the exact Native %s decision before finalizing', async (control, decision) => {
+    const stream = directSseStream();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await renderPanel();
+    await startDirectTurn(stream.fetchMock);
+
+    const encoded = `data: ${JSON.stringify({ ...request, type: 'tool_approval_request', policy_source: 'tool_requires_approval' })}\n\n`;
+    const split = Math.floor(encoded.length / 2);
+    await stream.emitRaw(encoded.slice(0, split));
+    await stream.emitRaw(encoded.slice(split));
+
+    await screen.findByRole('dialog', { name: 'Tool approval required' });
+    expect(screen.getByText('filesystem.write')).toBeInTheDocument();
+    expect(JSON.parse(screen.getByLabelText('Tool arguments').textContent || '')).toEqual(request.arguments);
+    expect(screen.getByText(request.call_id.slice(0, 12))).toBeInTheDocument();
+    expect(screen.getByRole('status', { name: 'Session turn progress' })).toHaveTextContent('Waiting for approval to run filesystem.write.');
+
+    fireEvent.click(screen.getByRole('button', { name: `${control} tool call` }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Tool approval required' })).not.toBeInTheDocument());
+    expect(decisionCalls()).toEqual([[
+      'jarvis_tool_decision',
+      {
+        sessionId: 'session-1',
+        session_id: 'session-1',
+        toolCallId: request.call_id,
+        tool_call_id: request.call_id,
+        decision,
+      },
+    ]]);
+
+    await stream.emit({ type: 'result', result: 'done' });
+    await stream.close();
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+    expect(warnSpy.mock.calls.some(([message]) => String(message).includes('unknown SSE frame type: tool_approval_request'))).toBe(false);
+  });
+
+  it('filters and deduplicates direct approval frames across the same Session', async () => {
+    const stream = directSseStream();
+    const decision = deferred<void>();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_session_history') return Promise.resolve([]);
+      if (command === 'jarvis_tool_decision') return decision.promise;
+      if (command === 'jarvis_get_session_grants') return Promise.resolve({ session_id: 'session-1', grants: [] });
+      return Promise.resolve(true);
+    });
+    await renderPanel();
+    await startDirectTurn(stream.fetchMock);
+
+    await stream.emit({ ...request, type: 'tool_approval_request', session_id: 'session-2' });
+    await stream.emit({ ...request, type: 'tool_approval_request', call_id: '' });
+    await stream.emit({ ...request, type: 'tool_approval_request', name: '' });
+    expect(screen.queryByRole('dialog', { name: 'Tool approval required' })).not.toBeInTheDocument();
+
+    await stream.emit({ ...request, type: 'tool_approval_request' });
+    await stream.emit({ ...request, type: 'tool_approval_request' });
+    await screen.findByRole('dialog', { name: 'Tool approval required' });
+    fireEvent.click(screen.getByRole('button', { name: 'Approve tool call' }));
+    expect(decisionCalls()).toHaveLength(1);
+    await act(async () => decision.resolve());
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Tool approval required' })).not.toBeInTheDocument());
+
+    await stream.emit({ ...request, type: 'tool_approval_request' });
+    expect(screen.queryByRole('dialog', { name: 'Tool approval required' })).not.toBeInTheDocument();
+    await stream.emit({ type: 'result', result: 'done' });
+    await stream.close();
+  });
+
+  it.each([
+    ['cancelled', { type: 'cancelled', reason: 'user_stop' }],
+    ['error', { type: 'error', error: 'provider failed', code: 'provider_failure' }],
+  ] as const)('clears a direct approval when the stream ends with %s', async (_name, terminalFrame) => {
+    const stream = directSseStream();
+    await renderPanel();
+    await startDirectTurn(stream.fetchMock);
+    await stream.emit({ ...request, type: 'tool_approval_request' });
+    await screen.findByRole('dialog', { name: 'Tool approval required' });
+
+    await stream.emit(terminalFrame);
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Tool approval required' })).not.toBeInTheDocument());
+    await stream.close();
+  });
+
+  it('clears a direct approval when Stop is requested', async () => {
+    const stream = directSseStream();
+    await renderPanel();
+    await startDirectTurn(stream.fetchMock);
+    await stream.emit({ ...request, type: 'tool_approval_request' });
+    await screen.findByRole('dialog', { name: 'Tool approval required' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stop streaming' }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Tool approval required' })).not.toBeInTheDocument());
+    await stream.close();
+  });
+
   it('filters approval events and renders the complete active request with deliberate initial focus', async () => {
     await renderPanel();
     await emitApproval({ session_id: 'session-2' }, false);

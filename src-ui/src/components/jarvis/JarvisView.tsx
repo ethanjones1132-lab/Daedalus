@@ -559,6 +559,7 @@ export function ChatPanel({
     sessionId: string;
     approved: boolean;
   } | null>(null);
+  const seenApprovalKeysRef = useRef<Set<string>>(new Set());
 
   // Phase 3.1 — inline tool-call cards built from `tool_use` / `tool_result`.
   const [toolCalls, setToolCalls] = useState<ToolCallState[]>([]);
@@ -638,6 +639,19 @@ export function ChatPanel({
     setPendingApproval(null);
     setApprovalError(null);
     setApprovalRetryDecision(null);
+  }, []);
+
+  const presentApprovalRequest = useCallback((request: ToolApprovalRequest | null | undefined) => {
+    if (!request || !request.session_id || !request.call_id || !request.name) return false;
+    const key = JSON.stringify([request.session_id, request.call_id]);
+    if (seenApprovalKeysRef.current.has(key)) return false;
+    seenApprovalKeysRef.current.add(key);
+    pendingApprovalRef.current = request;
+    setPendingApproval(request);
+    setApprovalError(null);
+    setApprovalRetryDecision(null);
+    setApprovalPending(approvalInFlightRef.current !== null);
+    return true;
   }, []);
 
   useEffect(() => { activeSessionRef.current = activeSession; }, [activeSession]);
@@ -811,6 +825,7 @@ export function ChatPanel({
     }
     prevActiveSessionRef.current = activeSession;
     if (prev !== activeSession) {
+      seenApprovalKeysRef.current.clear();
       if (prev) invoke('cancel_chat_stream', sessionInvokeArgs(prev)).catch(() => {});
       streamAbortRef.current?.abort('Session switched');
       streamAbortRef.current = null;
@@ -1034,17 +1049,12 @@ export function ChatPanel({
     }>('jarvis://approval_request', (event) => {
       const p = event.payload;
       if (!matchesStreamSession(p.session_id)) return;
-      const nextApproval: ToolApprovalRequest = {
+      presentApprovalRequest({
         call_id: p.call_id,
         name: p.name,
         arguments: p.arguments,
         session_id: p.session_id,
-      };
-      pendingApprovalRef.current = nextApproval;
-      setPendingApproval(nextApproval);
-      setApprovalError(null);
-      setApprovalRetryDecision(null);
-      setApprovalPending(approvalInFlightRef.current !== null);
+      });
     }));
 
     track(listen<{ call_id?: string; name: string; arguments: unknown; session_id?: string }>('jarvis://tool_call', (event) => {
@@ -1082,7 +1092,7 @@ export function ChatPanel({
       disposed = true;
       unsubs.forEach((f) => f());
     };
-  }, [appendAssistantText, applyTokenChunk, clearPendingApproval, finalizeAssistantMessage, matchesStreamSession, takePendingTokens]);
+  }, [appendAssistantText, applyTokenChunk, clearPendingApproval, finalizeAssistantMessage, matchesStreamSession, presentApprovalRequest, takePendingTokens]);
 
   // True autosize composer (Phase 2.4). The previous rows=⟨line-count⟩ approach
   // overflowed for single-line wrapped text.
@@ -1263,6 +1273,24 @@ export function ChatPanel({
         setShowReasoning(true);
         return;
       }
+      if (frame.type === 'tool_approval_request') {
+        const frameSessionId = frame.session_id;
+        const callId = frame.call_id;
+        const name = frame.name;
+        if (typeof frameSessionId !== 'string'
+          || frameSessionId !== sid
+          || typeof callId !== 'string'
+          || !callId.trim()
+          || typeof name !== 'string'
+          || !name.trim()) return;
+        presentApprovalRequest({
+          call_id: callId,
+          name,
+          arguments: frame.arguments,
+          session_id: frameSessionId,
+        });
+        return;
+      }
       if (frame.type === 'tool_use') {
         runAcc.toolCount += 1;
         setToolCalls(prev => [...prev, {
@@ -1435,6 +1463,7 @@ export function ChatPanel({
         // server build omits the field.
         runAcc.outcome = 'cancelled';
         runAcc.cancelledReason = typeof frame.reason === 'string' ? frame.reason : 'user_stop';
+        clearPendingApproval();
         const pending = takePendingTokens();
         setIsStreaming(false);
         stopRequestedRef.current = false;
@@ -1531,7 +1560,7 @@ export function ChatPanel({
 
     if (sendGateRef.current.isCurrent(sendGeneration)) finalizeAssistantMessage(sid);
     if (streamAbortRef.current === controller) streamAbortRef.current = null;
-  }, [appendAssistantText, applyTokenChunk, finalizeAssistantMessage, takePendingTokens]);
+  }, [appendAssistantText, applyTokenChunk, clearPendingApproval, finalizeAssistantMessage, presentApprovalRequest, takePendingTokens]);
 
   const handleSend = useCallback(async () => {
     // 2026-07-13 live incident (session 7254c3ae): the `isStreaming` React
@@ -1610,6 +1639,7 @@ export function ChatPanel({
     } catch (e) {
       if (!sendGateRef.current.isCurrent(sendGeneration)) return;
       streamAbortRef.current = null;
+      clearPendingApproval();
       const pending = takePendingTokens();
       setIsStreaming(false);
       if (stopRequestedRef.current) {
@@ -1661,6 +1691,7 @@ export function ChatPanel({
       return;
     }
     stopRequestedRef.current = true;
+    clearPendingApproval();
     streamAbortRef.current?.abort();
     streamAbortRef.current = null;
     setReasoningText('');
@@ -1677,7 +1708,7 @@ export function ChatPanel({
       console.error('Failed to cancel stream:', e);
       setIsStreaming(false);
     }
-  }, [activeSession, sessionId]);
+  }, [activeSession, clearPendingApproval, sessionId]);
 
   // Phase 1.1 — approve / deny the pending tool call and forward the decision
   // to the Bun server. Surface any POST error so the user can retry.
