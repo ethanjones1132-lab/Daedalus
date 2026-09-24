@@ -39,6 +39,7 @@ const status: JarvisStatus = {
 beforeEach(() => {
   localStorage.clear();
   vi.stubGlobal('scrollTo', vi.fn());
+  Element.prototype.scrollTo = vi.fn();
   Object.defineProperty(Element.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() });
   vi.mocked(invoke).mockReset();
   vi.mocked(invoke).mockImplementation(async (command) => {
@@ -53,6 +54,7 @@ afterEach(() => {
   cleanup();
   localStorage.clear();
   Reflect.deleteProperty(Element.prototype, 'scrollIntoView');
+  Reflect.deleteProperty(Element.prototype, 'scrollTo');
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -117,5 +119,21 @@ describe('App Config and Health destinations', () => {
     fireEvent.keyDown(input, { key: 'Enter' });
     await expectDestination(destination);
     expect(screen.queryByRole('dialog', { name: 'Command palette' })).not.toBeInTheDocument();
+  });
+
+  it('routes Hermes to an explicit unavailable state when its status probe fails', async () => {
+    localStorage.setItem('jarvis-current-view', 'hermes');
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === 'hermes_status') throw new Error('private executable path');
+      if (command === 'jarvis_get_config') return config;
+      if (command === 'jarvis_check_status') return status;
+      if (['jarvis_list_sessions', 'get_all_session_runs', 'list_sessions', 'list_model_profiles',
+        'list_cron_jobs', 'list_pending_missed_jobs', 'get_action_registry_alerts'].includes(command)) return [];
+      return null;
+    });
+    await act(async () => { render(<App />); });
+    expect(await screen.findByRole('heading', { name: 'Hermes Bridge', level: 1 })).toBeInTheDocument();
+    expect(await screen.findByRole('alert', { name: 'Hermes Bridge availability' })).toHaveTextContent('Hermes Bridge is unavailable.');
+    expect(screen.queryByText(/private executable path/)).not.toBeInTheDocument();
   });
 });

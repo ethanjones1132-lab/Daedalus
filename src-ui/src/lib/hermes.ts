@@ -1,10 +1,17 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  HERMES_START_FAILED_REASON,
+  HERMES_STOP_FAILED_REASON,
+  HERMES_TURN_FAILED,
+  HERMES_UNAVAILABLE_REASON,
+  isHermesTurnEventForSession,
+  normalizeHermesState,
+  type HermesLifecycleState,
+} from './hermes-state';
 
-// ── Types ──────────────────────────────────────────────────────
-
-export type HermesState = 'cold' | 'starting' | 'ready' | 'draining' | 'crashed';
+export type HermesState = HermesLifecycleState;
 
 export interface HermesStatus {
   state: HermesState;
@@ -22,28 +29,17 @@ export interface HermesMessage {
   role: 'user' | 'assistant' | 'system';
   content: string;
   createdAt: number;
-  /** true while a token stream is still arriving for this message */
   streaming?: boolean;
-  /** optional error attached to a failed message */
   error?: string;
+  cancelled?: boolean;
 }
 
 export interface HermesInvokeArgs {
   method: string;
   params?: Record<string, unknown>;
-  /** Long-running methods can opt out of the default per-request timeout. */
   timeout_ms?: number;
 }
 
-// ── Long-running method manifest ─────────────────────────────
-//
-// Hard-coded rather than fetched from a manifest at runtime. The CI
-// invariant `src-tauri/tests/hermes_protocol_manifest.rs` keeps this
-// list in sync with the YAML side.
-//
-// When the user fires one of these methods we don't try to cancel
-// the previous one — we let it run to completion and the caller
-// surfaces a "still running" hint instead.
 const LONG_METHODS = new Set([
   'session.resume', 'session.compress', 'session.steer',
   'prompt.submit', 'prompt.background',
@@ -55,8 +51,6 @@ const LONG_METHODS = new Set([
 export function isLongRunning(method: string): boolean {
   return LONG_METHODS.has(method);
 }
-
-// ── Low-level command surface ────────────────────────────────
 
 export async function hermesStatus(): Promise<HermesStatus> {
   return invoke<HermesStatus>('hermes_status');
@@ -82,15 +76,6 @@ export async function hermesInvoke<T = unknown>(args: HermesInvokeArgs): Promise
   return invoke<T>('hermes_invoke', { args });
 }
 
-// ── Event stream ─────────────────────────────────────────────
-
-/**
- * Subscribe to the typed Hermes event stream. The Tauri backend emits
- * events under the channel name `hermes-event`. We unwrap the envelope
- * here so the rest of the app sees a clean `HermesEvent`.
- *
- * Returns an unlisten function — call it from a useEffect cleanup.
- */
 export async function subscribeHermesEvents(
   handler: (ev: HermesEvent) => void,
 ): Promise<UnlistenFn> {
@@ -108,233 +93,296 @@ export async function subscribeHermesEvents(
   });
 }
 
-// ── React hook ───────────────────────────────────────────────
-
 export interface UseHermesChat {
   messages: HermesMessage[];
   isStreaming: boolean;
   isReady: boolean;
+  isStarting: boolean;
+  isStopping: boolean;
+  interruptError: string | null;
   state: HermesState;
   reason: string | null;
   submit: (text: string) => Promise<void>;
   interrupt: () => Promise<void>;
+  retry: () => Promise<void>;
   clear: () => void;
 }
 
-/**
- * React hook that wires the Hermes bridge into a chat-style
- * conversation. The `submit` function fires a `prompt.submit` JSON-RPC
- * call; token deltas arrive on the event stream and are appended to
- * the assistant message as they come in.
- *
- * If the bridge is `cold` when `submit` is called we attempt a
- * transparent `hermes_spawn` and retry once.
- */
+type TurnOutcome = 'complete' | 'error' | 'stopped';
+
 export function useHermesChat(sessionId: string): UseHermesChat {
   const [messages, setMessages] = useState<HermesMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [isStarting, setIsStarting] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
+  const [interruptError, setInterruptError] = useState<string | null>(null);
   const [state, setState] = useState<HermesState>('cold');
   const [reason, setReason] = useState<string | null>(null);
-  const assistantIdRef = useRef<string | null>(null);
+  const stateRef = useRef<HermesState>('cold');
+  const mountedRef = useRef(false);
   const sessionIdRef = useRef(sessionId);
-  useEffect(() => {
-    sessionIdRef.current = sessionId;
-  }, [sessionId]);
+  const previousSessionRef = useRef(sessionId);
+  const assistantIdRef = useRef<string | null>(null);
+  const turnSessionIdRef = useRef<string | null>(null);
+  const isStreamingRef = useRef(false);
+  const sendPendingRef = useRef(false);
+  const startPendingRef = useRef(false);
+  const retryPendingRef = useRef(false);
+  const stopPendingRef = useRef(false);
+  const subscriptionRef = useRef<UnlistenFn | null>(null);
+  const subscriptionPromiseRef = useRef<Promise<boolean> | null>(null);
+  const lifecycleEventVersionRef = useRef(0);
+  const messageIdRef = useRef(0);
+  sessionIdRef.current = sessionId;
 
-  // Initial status + subscribe to events
-  useEffect(() => {
-    let unlisten: UnlistenFn | null = null;
-    let cancelled = false;
+  const setLifecycle = useCallback((next: HermesState, nextReason: string | null = null) => {
+    stateRef.current = next;
+    setState(next);
+    setReason(nextReason);
+  }, []);
 
-    (async () => {
-      try {
-        const status = await hermesStatus();
-        if (cancelled) return;
-        setState(status.state);
-        setReason(status.reason ?? null);
-      } catch (e) {
-        // Status probe is best-effort. The chat will surface a clear
-        // error on first submit if the bridge is genuinely down.
-        if (cancelled) return;
-        setReason(String(e));
-      }
+  const markUnavailable = useCallback((nextReason = HERMES_UNAVAILABLE_REASON) => {
+    setLifecycle('unavailable', nextReason);
+  }, [setLifecycle]);
 
-      try {
-        unlisten = await subscribeHermesEvents((ev) => {
-          if (ev.session_id && ev.session_id !== sessionIdRef.current) return;
-          handleHermesEvent(ev);
-        });
-      } catch (e) {
-        if (!cancelled) setReason(String(e));
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-      if (unlisten) {
-        try { unlisten(); } catch { /* swallow */ }
-      }
-    };
+  const settleActiveTurn = useCallback((outcome: TurnOutcome) => {
+    const id = assistantIdRef.current;
+    isStreamingRef.current = false;
+    setIsStreaming(false);
+    assistantIdRef.current = null;
+    turnSessionIdRef.current = null;
+    if (!id) return;
+    setMessages((prev) => prev.map((message) => {
+      if (message.id !== id) return message;
+      const next = { ...message, streaming: false };
+      if (outcome === 'error') next.error = HERMES_TURN_FAILED;
+      if (outcome === 'stopped') next.cancelled = true;
+      return next;
+    }));
   }, []);
 
   const handleHermesEvent = useCallback((ev: HermesEvent) => {
-    // State transitions from the bridge itself
     if (ev.type === 'gateway.ready') {
-      setState('ready');
-      setReason(null);
+      lifecycleEventVersionRef.current += 1;
+      setLifecycle('ready');
       return;
     }
     if (ev.type === 'gateway.crashed') {
-      setState('crashed');
-      setReason(String((ev.params as { reason?: string })?.reason ?? 'unknown'));
+      lifecycleEventVersionRef.current += 1;
+      markUnavailable();
+      settleActiveTurn('error');
       return;
     }
     if (ev.type === 'gateway.draining') {
-      setState('draining');
+      lifecycleEventVersionRef.current += 1;
+      setLifecycle('draining');
       return;
     }
 
-    // Token / content deltas for the active assistant message
+    if (!isHermesTurnEventForSession(ev.session_id, sessionIdRef.current, turnSessionIdRef.current)) {
+      return;
+    }
+
     if (ev.type === 'stream.token' || ev.type === 'message.delta') {
-      const text = (ev.params as { text?: string; delta?: string })?.text
-        ?? (ev.params as { text?: string; delta?: string })?.delta
-        ?? '';
-      if (!text) return;
-      setMessages((prev) => {
-        const id = assistantIdRef.current;
-        if (!id) return prev;
-        return prev.map((m) =>
-          m.id === id ? { ...m, content: m.content + text } : m,
-        );
-      });
+      const params = ev.params as { text?: string; delta?: string };
+      const text = params.text ?? params.delta ?? '';
+      const id = assistantIdRef.current;
+      if (!text || !id) return;
+      setMessages((prev) => prev.map((message) => (
+        message.id === id ? { ...message, content: message.content + text } : message
+      )));
       return;
     }
 
     if (ev.type === 'stream.done' || ev.type === 'message.complete') {
-      setIsStreaming(false);
-      const id = assistantIdRef.current;
-      assistantIdRef.current = null;
-      if (id) {
-        setMessages((prev) =>
-          prev.map((m) => (m.id === id ? { ...m, streaming: false } : m)),
-        );
-      }
+      settleActiveTurn('complete');
       return;
     }
 
     if (ev.type === 'stream.error' || ev.type === 'message.error') {
-      const err = (ev.params as { error?: string; message?: string })?.error
-        ?? (ev.params as { error?: string; message?: string })?.message
-        ?? 'unknown error';
-      setMessages((prev) => {
-        const id = assistantIdRef.current;
-        if (!id) {
-          return [
-            ...prev,
-            {
-              id: `${Date.now()}-err`,
-              role: 'system',
-              content: `Error: ${err}`,
-              createdAt: Date.now(),
-              error: err,
-            },
-          ];
-        }
-        return prev.map((m) =>
-          m.id === id ? { ...m, error: err, streaming: false } : m,
-        );
-      });
-      setIsStreaming(false);
-      assistantIdRef.current = null;
-      return;
+      settleActiveTurn('error');
     }
-  }, []);
+  }, [markUnavailable, setLifecycle, settleActiveTurn]);
+
+  const ensureSubscription = useCallback(async () => {
+    if (subscriptionRef.current) return true;
+    if (subscriptionPromiseRef.current) return subscriptionPromiseRef.current;
+    const pending = (async () => {
+      try {
+        const unlisten = await subscribeHermesEvents(handleHermesEvent);
+        if (!mountedRef.current) {
+          unlisten();
+          return false;
+        }
+        subscriptionRef.current = unlisten;
+        return true;
+      } catch {
+        markUnavailable();
+        return false;
+      }
+    })();
+    subscriptionPromiseRef.current = pending;
+    try {
+      return await pending;
+    } finally {
+      if (subscriptionPromiseRef.current === pending) subscriptionPromiseRef.current = null;
+    }
+  }, [handleHermesEvent, markUnavailable]);
+
+  const startBridge = useCallback(async () => {
+    if (startPendingRef.current || isStreamingRef.current) return;
+    startPendingRef.current = true;
+    setIsStarting(true);
+    setInterruptError(null);
+    setLifecycle('starting');
+    const eventVersion = lifecycleEventVersionRef.current;
+    try {
+      const next = await hermesSpawn();
+      if (!mountedRef.current) return;
+      if (eventVersion !== lifecycleEventVersionRef.current && stateRef.current === 'ready') return;
+      const normalized = normalizeHermesState(next.state);
+      if (normalized === 'ready') setLifecycle('ready');
+      else if (normalized === 'starting') setLifecycle('starting');
+      else markUnavailable(HERMES_START_FAILED_REASON);
+    } catch {
+      if (mountedRef.current) markUnavailable(HERMES_START_FAILED_REASON);
+    } finally {
+      startPendingRef.current = false;
+      if (mountedRef.current) setIsStarting(false);
+    }
+  }, [markUnavailable, setLifecycle]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    let disposed = false;
+    const run = async () => {
+      const subscribed = await ensureSubscription();
+      if (disposed || !subscribed) return;
+      const eventVersion = lifecycleEventVersionRef.current;
+      try {
+        const next = await hermesStatus();
+        if (disposed || eventVersion !== lifecycleEventVersionRef.current) return;
+        const normalized = normalizeHermesState(next.state);
+        if (normalized === 'unavailable') markUnavailable();
+        else setLifecycle(normalized);
+        if (normalized === 'cold') await startBridge();
+      } catch {
+        if (!disposed) markUnavailable();
+      }
+    };
+    void run();
+    return () => {
+      disposed = true;
+      mountedRef.current = false;
+      const unlisten = subscriptionRef.current;
+      subscriptionRef.current = null;
+      if (unlisten) {
+        try { unlisten(); } catch {}
+      }
+    };
+  }, [ensureSubscription, markUnavailable, setLifecycle, startBridge]);
+
+  useEffect(() => {
+    const previous = previousSessionRef.current;
+    previousSessionRef.current = sessionId;
+    if (previous !== sessionId) {
+      settleActiveTurn('stopped');
+    }
+  }, [sessionId, settleActiveTurn]);
+
+  const retry = useCallback(async () => {
+    if (retryPendingRef.current || isStreamingRef.current) return;
+    retryPendingRef.current = true;
+    setIsStarting(true);
+    try {
+      const subscribed = await ensureSubscription();
+      if (subscribed) await startBridge();
+    } finally {
+      retryPendingRef.current = false;
+      if (mountedRef.current && !startPendingRef.current) setIsStarting(false);
+    }
+  }, [ensureSubscription, startBridge]);
 
   const submit = useCallback(async (text: string) => {
     const trimmed = text.trim();
-    if (!trimmed) return;
-    if (isStreaming) return; // The user must wait or interrupt.
-
-    // Make sure the bridge is up. If it's cold, try to spawn it once.
-    if (state === 'cold') {
-      try {
-        await hermesSpawn();
-        setState('starting');
-      } catch (e) {
-        setState('crashed');
-        setReason(String(e));
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `${Date.now()}-err`,
-            role: 'system',
-            content: `Bridge spawn failed: ${e}`,
-            createdAt: Date.now(),
-            error: String(e),
-          },
-        ]);
-        return;
-      }
-    }
-
-    const userMsg: HermesMessage = {
-      id: `u-${Date.now()}`,
+    const activeSession = sessionIdRef.current;
+    if (!trimmed || !activeSession || sendPendingRef.current || isStreamingRef.current || stateRef.current !== 'ready') return;
+    sendPendingRef.current = true;
+    isStreamingRef.current = true;
+    setIsStreaming(true);
+    setInterruptError(null);
+    const now = Date.now();
+    const suffix = messageIdRef.current++;
+    const userMessage: HermesMessage = {
+      id: `u-${now}-${suffix}`,
       role: 'user',
       content: trimmed,
-      createdAt: Date.now(),
+      createdAt: now,
     };
-    const assistantId = `a-${Date.now()}`;
+    const assistantId = `a-${now}-${suffix}`;
     assistantIdRef.current = assistantId;
-    const assistantMsg: HermesMessage = {
+    turnSessionIdRef.current = activeSession;
+    const assistantMessage: HermesMessage = {
       id: assistantId,
       role: 'assistant',
       content: '',
-      createdAt: Date.now(),
+      createdAt: now,
       streaming: true,
     };
-    setMessages((prev) => [...prev, userMsg, assistantMsg]);
-    setIsStreaming(true);
-
+    setMessages((prev) => [...prev, userMessage, assistantMessage]);
     try {
       await hermesInvoke({
         method: 'prompt.submit',
-        params: { text: trimmed, session_id: sessionIdRef.current },
+        params: { text: trimmed, session_id: activeSession },
         timeout_ms: 300_000,
       });
-    } catch (e) {
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === assistantId ? { ...m, error: String(e), streaming: false } : m,
-        ),
-      );
-      setIsStreaming(false);
-      assistantIdRef.current = null;
+    } catch {
+      if (mountedRef.current) settleActiveTurn('error');
+    } finally {
+      sendPendingRef.current = false;
     }
-  }, [isStreaming, state]);
+  }, [settleActiveTurn]);
 
   const interrupt = useCallback(async () => {
-    if (!isStreaming) return;
+    if (!isStreamingRef.current || stopPendingRef.current) return;
+    stopPendingRef.current = true;
+    setIsStopping(true);
+    setInterruptError(null);
+    const assistantId = assistantIdRef.current;
     try {
-      await hermesInterrupt();
-    } catch (e) {
-      setReason(String(e));
+      const next = await hermesInterrupt();
+      if (!mountedRef.current) return;
+      if (assistantId && assistantIdRef.current === assistantId) settleActiveTurn('stopped');
+      const normalized = normalizeHermesState(next.state);
+      if (normalized === 'ready') setLifecycle('ready');
+      else markUnavailable();
+    } catch {
+      if (mountedRef.current) setInterruptError(HERMES_STOP_FAILED_REASON);
+    } finally {
+      stopPendingRef.current = false;
+      if (mountedRef.current) setIsStopping(false);
     }
-  }, [isStreaming]);
+  }, [markUnavailable, setLifecycle, settleActiveTurn]);
 
   const clear = useCallback(() => {
-    if (isStreaming) return;
+    if (isStreamingRef.current) return;
     setMessages([]);
     assistantIdRef.current = null;
-  }, [isStreaming]);
+    turnSessionIdRef.current = null;
+  }, []);
 
   return {
     messages,
     isStreaming,
     isReady: state === 'ready',
+    isStarting,
+    isStopping,
+    interruptError,
     state,
     reason,
     submit,
     interrupt,
+    retry,
     clear,
   };
 }
