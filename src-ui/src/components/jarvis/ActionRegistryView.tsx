@@ -1,6 +1,12 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
-import { initialRegistryState, reduceRegistryState } from './action-registry-state';
+import {
+  initialRegistryState,
+  parseActionRegistryAlerts,
+  reduceRegistryState,
+  type ActionRegistryAlert,
+  type RegistrySnapshotState,
+} from './action-registry-state';
 import {
   isRegistryDispatchUnavailable,
   isVerifiedRegistryDispatchEvidence,
@@ -59,6 +65,89 @@ interface RegistryAction {
 interface ActionRegistryBucket {
   bucket: string;
   actions: RegistryAction[];
+}
+
+function alertSeverityVariant(severity: string): 'error' | 'warning' | 'success' | 'default' {
+  if (severity === 'high' || severity === 'critical') return 'error';
+  if (severity === 'medium') return 'warning';
+  if (severity === 'low') return 'success';
+  return 'default';
+}
+
+function alertValue(value: string | number | null | undefined): string {
+  return value === undefined || value === null || value === '' ? 'Not supplied' : String(value);
+}
+
+function ActionAlertLedger({
+  state,
+  onRefresh,
+}: {
+  state: RegistrySnapshotState<ActionRegistryAlert[]>;
+  onRefresh: () => void;
+}) {
+  const { snapshot, loading, error } = state;
+  const stale = snapshot !== null && (loading || error);
+
+  return (
+    <section
+      role="region"
+      aria-label="Action registry alerts"
+      className="rounded-xl border border-white/10 bg-white/[0.02] p-4 space-y-3"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="text-sm font-semibold text-bone">Alert ledger</h3>
+          <p className="text-[10px] text-bone/50">Persisted Action Registry alerts; this ledger is independent of action bucket loading.</p>
+        </div>
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={loading}
+          className="shrink-0 px-3 py-1 text-xs rounded-md bg-white/5 hover:bg-white/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {error ? 'Retry alerts' : 'Refresh alerts'}
+        </button>
+      </div>
+
+      {loading && (
+        <div role="status" aria-label="Action registry alerts loading" className="text-xs text-bone/60">
+          {snapshot ? 'Refreshing Action Registry alerts…' : 'Loading Action Registry alerts…'}
+        </div>
+      )}
+      {error && (
+        <div role="alert" aria-label="Action registry alerts error" className="text-xs text-red-200">
+          {snapshot
+            ? 'Could not refresh Action Registry alerts. Showing previously loaded alerts; they may be stale.'
+            : 'Could not load Action Registry alerts.'}
+        </div>
+      )}
+      {stale && <div className="text-[10px] text-amber-200/70">stale</div>}
+      {snapshot !== null && snapshot.length > 0 ? (
+        <ul aria-label="Action Registry alert entries" className="space-y-2">
+          {snapshot.map((alert, index) => (
+            <li key={`${alert.id}-${index}`} className="rounded-lg border border-white/5 bg-black/10 p-3 text-[11px] text-bone/60 space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <span>severity: <Pill variant={alertSeverityVariant(alert.severity)}>{alert.severity}</Pill></span>
+                <span>kind: <Pill>{alert.kind}</Pill></span>
+              </div>
+              <div>
+                <h4 className="text-sm font-semibold text-bone">{alert.title}</h4>
+                <p className="mt-1 text-xs leading-relaxed">{alert.message}</p>
+              </div>
+              <div className="flex flex-wrap gap-x-4 gap-y-1 font-mono text-[10px]">
+                <span>alert_id: {alertValue(alert.id)}</span>
+                <span>action_id: {alertValue(alert.action_id)}</span>
+                <span>count: {alertValue(alert.count)}</span>
+                <span>created_at: {alertValue(alert.created_at)}</span>
+              </div>
+            </li>
+          ))}
+        </ul>
+      ) : snapshot?.length === 0 && !loading && !error ? (
+        <p className="text-xs text-bone/50">No Action Registry alerts.</p>
+      ) : null}
+    </section>
+  );
 }
 
 const priorityVariant = (priority: string) => {
@@ -122,7 +211,12 @@ function mutationSuccessText(mutation: RegistryMutation): string {
 
 export default function ActionRegistryView() {
   const [state, dispatch] = useReducer(reduceRegistryState<RegistrySnapshot>, initialRegistryState<RegistrySnapshot>());
+  const [alertState, dispatchAlerts] = useReducer(
+    reduceRegistryState<ActionRegistryAlert[]>,
+    initialRegistryState<ActionRegistryAlert[]>(),
+  );
   const requestId = useRef(0);
+  const alertRequestId = useRef(0);
   const mutationRef = useRef<RegistryMutation | null>(null);
   const [mutation, setMutation] = useState<RegistryMutation | null>(null);
   const { snapshot, loading, error } = state;
@@ -166,11 +260,26 @@ export default function ActionRegistryView() {
     return true;
   }, [readSnapshot]);
 
+  const fetchAlerts = useCallback(async () => {
+    const id = ++alertRequestId.current;
+    dispatchAlerts({ type: 'pending', requestId: id });
+    try {
+      const response = await invoke<unknown>('get_action_registry_alerts');
+      dispatchAlerts({ type: 'success', requestId: id, snapshot: parseActionRegistryAlerts(response) });
+    } catch {
+      dispatchAlerts({ type: 'failure', requestId: id });
+    }
+  }, []);
+
   useEffect(() => {
     void fetchData();
-    const interval = setInterval(() => void fetchData(), 30000);
+    void fetchAlerts();
+    const interval = setInterval(() => {
+      void fetchData();
+      void fetchAlerts();
+    }, 30000);
     return () => clearInterval(interval);
-  }, [fetchData]);
+  }, [fetchAlerts, fetchData]);
 
   const reconcileMutation = useCallback(async (operation: RegistryMutation, dispatchEvidence?: RegistryDispatchEvidence) => {
     const result = await readSnapshot({ duringMutation: true, suppressError: true });
@@ -305,15 +414,13 @@ export default function ActionRegistryView() {
     </>
   );
 
-  if (!snapshot) return <PageTransition>{resourceFeedback}</PageTransition>;
-
   return (
     <PageTransition>
       <div className="flex items-start justify-between gap-4 mb-6">
         <SectionHeader
           title="Action Registry"
           subtitle="cross-project work queue"
-          count={summary?.active ?? 0}
+          count={summary?.active}
         />
         <button
           type="button"
@@ -327,6 +434,9 @@ export default function ActionRegistryView() {
 
       {mutationFeedback}
       {resourceFeedback}
+      <div className="mb-6">
+        <ActionAlertLedger state={alertState} onRefresh={() => void fetchAlerts()} />
+      </div>
 
       {summary && (
         <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3 mb-6">
@@ -339,53 +449,55 @@ export default function ActionRegistryView() {
         </div>
       )}
 
-      <div className="grid gap-6 xl:grid-cols-2">
-        <section>
-          <h3 className="text-sm font-semibold text-bone mb-3">Active</h3>
-          {active.length === 0 ? (
-            <GlassCard className="text-center py-10">
-              <p className="text-bone-dim text-sm font-mono">No active actions</p>
-            </GlassCard>
-          ) : (
-            <AnimatedList>
-              {active.map((action) => (
-                <ActionCard
-                  key={action.id}
-                  action={action}
-                  bucket="active"
-                  disabled={mutationLocked}
-                  onApprove={(id) => void handleMutation('approve', id)}
-                  onWaive={(id) => void handleMutation('waive', id)}
-                  onDispatch={(id) => void handleMutation('dispatch', id)}
-                />
-              ))}
-            </AnimatedList>
-          )}
-        </section>
+      {snapshot && (
+        <div className="grid gap-6 xl:grid-cols-2">
+          <section>
+            <h3 className="text-sm font-semibold text-bone mb-3">Active</h3>
+            {active.length === 0 ? (
+              <GlassCard className="text-center py-10">
+                <p className="text-bone-dim text-sm font-mono">No active actions</p>
+              </GlassCard>
+            ) : (
+              <AnimatedList>
+                {active.map((action) => (
+                  <ActionCard
+                    key={action.id}
+                    action={action}
+                    bucket="active"
+                    disabled={mutationLocked}
+                    onApprove={(id) => void handleMutation('approve', id)}
+                    onWaive={(id) => void handleMutation('waive', id)}
+                    onDispatch={(id) => void handleMutation('dispatch', id)}
+                  />
+                ))}
+              </AnimatedList>
+            )}
+          </section>
 
-        <section>
-          <h3 className="text-sm font-semibold text-bone mb-3">Blocked</h3>
-          {blocked.length === 0 ? (
-            <GlassCard className="text-center py-10">
-              <p className="text-bone-dim text-sm font-mono">No blocked actions</p>
-            </GlassCard>
-          ) : (
-            <AnimatedList>
-              {blocked.map((action) => (
-                <ActionCard
-                  key={action.id}
-                  action={action}
-                  bucket="blocked"
-                  disabled={mutationLocked}
-                  onApprove={(id) => void handleMutation('approve', id)}
-                  onWaive={(id) => void handleMutation('waive', id)}
-                  onDispatch={(id) => void handleMutation('dispatch', id)}
-                />
-              ))}
-            </AnimatedList>
-          )}
-        </section>
-      </div>
+          <section>
+            <h3 className="text-sm font-semibold text-bone mb-3">Blocked</h3>
+            {blocked.length === 0 ? (
+              <GlassCard className="text-center py-10">
+                <p className="text-bone-dim text-sm font-mono">No blocked actions</p>
+              </GlassCard>
+            ) : (
+              <AnimatedList>
+                {blocked.map((action) => (
+                  <ActionCard
+                    key={action.id}
+                    action={action}
+                    bucket="blocked"
+                    disabled={mutationLocked}
+                    onApprove={(id) => void handleMutation('approve', id)}
+                    onWaive={(id) => void handleMutation('waive', id)}
+                    onDispatch={(id) => void handleMutation('dispatch', id)}
+                  />
+                ))}
+              </AnimatedList>
+            )}
+          </section>
+        </div>
+      )}
     </PageTransition>
   );
 }

@@ -131,6 +131,7 @@ describe('ToastProvider accessibility', () => {
         return { active: 0, blocked: 0, done: 0, pending_approvals: 0, escalated: 0, alerts: 0 };
       }
       if (command === 'get_action_registry_bucket') return { bucket: 'active', actions: [] };
+      if (command === 'get_action_registry_alerts') return [];
       if (command === 'sync_action_registry') return {};
       throw new Error(`Unexpected command: ${command}`);
     });

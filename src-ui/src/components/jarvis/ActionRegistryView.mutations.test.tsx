@@ -105,6 +105,7 @@ beforeEach(() => {
     }
     if (command === 'get_action_registry_bucket' && args?.bucket === 'active') return latestRead.active.promise;
     if (command === 'get_action_registry_bucket' && args?.bucket === 'blocked') return latestRead.blocked.promise;
+    if (command === 'get_action_registry_alerts') return Promise.resolve([]);
     if (command === 'sync_action_registry') return nextWrite?.promise ?? Promise.resolve({ synced: true });
     if (command === 'update_action_approval' || command === 'dispatch_action') return nextWrite?.promise ?? Promise.resolve(command === 'dispatch_action' ? unavailableDispatch : true);
     throw new Error(`Unexpected command: ${command}`);

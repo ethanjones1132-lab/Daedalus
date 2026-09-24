@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import ActionRegistryView from './ActionRegistryView';
 import { ToastProvider } from '../ui';
@@ -21,6 +21,29 @@ function action(title: string) {
     approval_required: false, updated_at: '2026-09-16',
   };
 }
+type Alert = {
+  id: string;
+  kind: string;
+  severity: string;
+  title: string;
+  message: string;
+  action_id: string | null;
+  count: number | null;
+  created_at: string;
+};
+function alert(overrides: Partial<Alert> = {}): Alert {
+  return {
+    id: 'escalated-action-1',
+    kind: 'escalation',
+    severity: 'high',
+    title: 'Escalated action',
+    message: 'P0 action escalated',
+    action_id: 'action-1',
+    count: null,
+    created_at: '2026-09-24T01:00:00',
+    ...overrides,
+  };
+}
 function request() {
   return {
     summary: deferred<typeof summary>(),
@@ -30,9 +53,11 @@ function request() {
 }
 let requests: ReturnType<typeof request>[];
 let current: ReturnType<typeof request>;
+let alertRequests: ReturnType<typeof deferred<Alert[]>>[];
 beforeEach(() => {
   vi.useFakeTimers();
   requests = [];
+  alertRequests = [];
   invokeMock.mockReset().mockImplementation((command: string, args?: { bucket: string }) => {
     if (command === 'get_action_registry_summary') {
       current = request();
@@ -41,6 +66,11 @@ beforeEach(() => {
     }
     if (command === 'get_action_registry_bucket' && args?.bucket === 'active') return current.active.promise;
     if (command === 'get_action_registry_bucket' && args?.bucket === 'blocked') return current.blocked.promise;
+    if (command === 'get_action_registry_alerts') {
+      const next = deferred<Alert[]>();
+      alertRequests.push(next);
+      return next.promise;
+    }
     if (command === 'sync_action_registry') return Promise.resolve({});
     throw new Error(`Unexpected command: ${command}`);
   });
@@ -59,6 +89,12 @@ async function resolveRequest(index: number, label: string, empty = false) {
 async function failRequest(index: number) {
   await act(async () => { requests[index].blocked.reject(new Error('private native failure detail')); });
 }
+async function resolveAlerts(index: number, alerts: Alert[] = []) {
+  await act(async () => { alertRequests[index].resolve(alerts); });
+}
+async function failAlerts(index: number) {
+  await act(async () => { alertRequests[index].reject(new Error('private native alert detail')); });
+}
 async function poll() {
   await act(async () => { vi.advanceTimersByTime(30000); });
 }
@@ -72,6 +108,7 @@ describe('ActionRegistryView snapshot recovery', () => {
       ['get_action_registry_summary'],
       ['get_action_registry_bucket', { bucket: 'active' }],
       ['get_action_registry_bucket', { bucket: 'blocked' }],
+      ['get_action_registry_alerts'],
     ]);
     await act(async () => {
       requests[0].summary.resolve(summary);
@@ -80,12 +117,16 @@ describe('ActionRegistryView snapshot recovery', () => {
     expect(screen.queryByText('partial active')).not.toBeInTheDocument();
     expect(screen.getByRole('status', { name: 'Action registry loading' })).toBeInTheDocument();
     await act(async () => { requests[0].blocked.resolve({ bucket: 'blocked', actions: [] }); });
+    await resolveAlerts(0);
     expect(screen.getByText('partial active')).toBeInTheDocument();
     expect(screen.getByText('No blocked actions')).toBeInTheDocument();
+    expect(screen.getByText('No Action Registry alerts.')).toBeInTheDocument();
     await poll();
     await resolveRequest(1, '', true);
+    await resolveAlerts(1);
     expect(screen.getByText('No active actions')).toBeInTheDocument();
     expect(screen.getByText('No blocked actions')).toBeInTheDocument();
+    expect(screen.getByText('No Action Registry alerts.')).toBeInTheDocument();
   });
 
   it('offers immediate read-only Retry after rejection and retains the error until successful recovery', async () => {
@@ -157,5 +198,107 @@ describe('ActionRegistryView snapshot recovery', () => {
     expect(screen.getByRole('status', { name: 'Action registry loading' })).toBeInTheDocument();
     await resolveRequest(2, 'latest');
     expect(screen.getByText('latest active')).toBeInTheDocument();
+  });
+});
+
+describe('ActionRegistryView alert ledger', () => {
+  it('renders every supplied alert field even when the action snapshot fails independently', async () => {
+    mount();
+    const escalation = alert();
+    const approvalSummary = alert({
+      id: 'approval-summary-2026-09-24T01:00:00',
+      kind: 'approval_summary',
+      severity: 'medium',
+      title: 'Actions awaiting approval',
+      message: '3 actions require approval before execution.',
+      action_id: null,
+      count: 3,
+      created_at: '2026-09-24T01:00:01',
+    });
+    await resolveAlerts(0, [escalation, approvalSummary]);
+    await failRequest(0);
+
+    expect(screen.getByRole('alert')).toHaveTextContent('Could not load action registry.');
+    const region = screen.getByRole('region', { name: 'Action registry alerts' });
+    const rows = within(region).getAllByRole('listitem');
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toHaveTextContent('severity: high');
+    expect(rows[0]).toHaveTextContent('kind: escalation');
+    expect(within(rows[0]).getByText('Escalated action')).toBeInTheDocument();
+    expect(within(rows[0]).getByText('P0 action escalated')).toBeInTheDocument();
+    expect(rows[0]).toHaveTextContent('count: Not supplied');
+    expect(rows[0]).toHaveTextContent('created_at: 2026-09-24T01:00:00');
+    expect(rows[0]).toHaveTextContent('action_id: action-1');
+    expect(rows[1]).toHaveTextContent('severity: medium');
+    expect(rows[1]).toHaveTextContent('kind: approval_summary');
+    expect(within(rows[1]).getByText('Actions awaiting approval')).toBeInTheDocument();
+    expect(within(rows[1]).getByText('3 actions require approval before execution.')).toBeInTheDocument();
+    expect(rows[1]).toHaveTextContent('count: 3');
+    expect(rows[1]).toHaveTextContent('created_at: 2026-09-24T01:00:01');
+    expect(rows[1]).toHaveTextContent('action_id: Not supplied');
+  });
+
+  it('keeps action rows usable through alert failure and retries only the alert read', async () => {
+    mount();
+    await resolveRequest(0, 'known');
+    await failAlerts(0);
+
+    expect(screen.getByText('known active')).toBeInTheDocument();
+    const region = screen.getByRole('region', { name: 'Action registry alerts' });
+    expect(within(region).getByRole('alert')).toHaveTextContent('Could not load Action Registry alerts.');
+    expect(within(region).queryByText('No Action Registry alerts.')).not.toBeInTheDocument();
+    expect(screen.queryByText(/private native alert detail/)).not.toBeInTheDocument();
+
+    const retry = within(region).getByRole('button', { name: 'Retry alerts' });
+    fireEvent.click(retry);
+    expect(within(region).getByRole('button', { name: 'Retry alerts' })).toBeDisabled();
+    fireEvent.click(within(region).getByRole('button', { name: 'Retry alerts' }));
+    expect(alertRequests).toHaveLength(2);
+    expect(invokeMock.mock.calls.filter(([command]) => command.startsWith('sync_action_registry'))).toHaveLength(0);
+    expect(invokeMock.mock.calls.filter(([command]) => ['update_action_approval', 'dispatch_action'].includes(command))).toHaveLength(0);
+    expect(within(region).getByRole('status')).toHaveTextContent('Loading Action Registry alerts');
+
+    await resolveAlerts(1);
+    expect(within(region).getByText('No Action Registry alerts.')).toBeInTheDocument();
+    expect(within(region).queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('retains loaded alerts as stale through refresh failure and clears them only after successful empty retry', async () => {
+    mount();
+    await resolveRequest(0, 'known');
+    await resolveAlerts(0, [alert()]);
+    const region = screen.getByRole('region', { name: 'Action registry alerts' });
+    expect(within(region).getByText('Escalated action')).toBeInTheDocument();
+
+    fireEvent.click(within(region).getByRole('button', { name: 'Refresh alerts' }));
+    expect(within(region).getByText('stale')).toBeInTheDocument();
+    expect(within(region).getByText('Escalated action')).toBeInTheDocument();
+    await failAlerts(1);
+    expect(within(region).getByRole('alert')).toHaveTextContent('Showing previously loaded alerts; they may be stale.');
+    expect(within(region).getByText('Escalated action')).toBeInTheDocument();
+    expect(within(region).getByText('stale')).toBeInTheDocument();
+
+    fireEvent.click(within(region).getByRole('button', { name: 'Retry alerts' }));
+    await resolveAlerts(2);
+    expect(within(region).queryByRole('listitem')).not.toBeInTheDocument();
+    expect(within(region).queryByRole('alert')).not.toBeInTheDocument();
+    expect(within(region).getByText('No Action Registry alerts.')).toBeInTheDocument();
+  });
+
+  it('publishes only the newest result when a manual alert read overlaps the 30-second poll', async () => {
+    mount();
+    await resolveRequest(0, 'known');
+    await resolveAlerts(0, [alert({ id: 'initial', title: 'Initial alert' })]);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh alerts' }));
+    await poll();
+    expect(alertRequests).toHaveLength(3);
+    await resolveAlerts(2, [alert({ id: 'latest', title: 'Latest alert' })]);
+    await resolveAlerts(1, [alert({ id: 'obsolete', title: 'Obsolete alert' })]);
+
+    const region = screen.getByRole('region', { name: 'Action registry alerts' });
+    expect(within(region).getByText('Latest alert')).toBeInTheDocument();
+    expect(within(region).queryByText('Obsolete alert')).not.toBeInTheDocument();
+    expect(within(region).queryByText('Initial alert')).not.toBeInTheDocument();
   });
 });
