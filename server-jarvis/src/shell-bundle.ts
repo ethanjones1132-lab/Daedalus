@@ -7,7 +7,7 @@ import { spawn } from "child_process";
 import { existsSync, statSync } from "fs";
 import type { ToolRuntime, ExecutionContext } from "./tool-runtime";
 import type { ToolDefinition } from "./tool-types";
-import { safePath } from "./fs-scope";
+import { resolveSafePath } from "./fs-scope";
 
 /** Hard ceiling when config carries no `tools.shell_timeout_max_ms`. */
 const DEFAULT_SHELL_TIMEOUT_MAX_MS = 120_000;
@@ -95,17 +95,21 @@ async function handleShell(
   const requestedCwd = typeof args.cwd === "string" && args.cwd.trim().length > 0
     ? args.cwd
     : (ctx.workspace_path || cfg.jarvis_path || process.cwd());
-  const cwd = safePath(requestedCwd, cfg, {
+  const resolution = resolveSafePath(requestedCwd, cfg, {
     workspaceOverride: ctx.workspace_path,
     sessionGrants: ctx.session_grants,
   });
+  const cwd = resolution.canonicalPath;
+  resolution.revalidate();
   if (!statSync(cwd).isDirectory()) {
     throw new Error(`Shell cwd is not a directory: ${requestedCwd}`);
   }
+  resolution.revalidate();
 
   const { program, prefixArgs } = spawnShell(cfg);
 
   return new Promise((resolve) => {
+    resolution.revalidate();
     const proc = spawn(program, [...prefixArgs, command], {
       cwd,
       timeout,

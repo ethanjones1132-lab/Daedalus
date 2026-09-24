@@ -1,6 +1,6 @@
 import { describe, test, expect } from "bun:test";
 import { tmpdir } from "os";
-import { mkdtempSync, rmSync } from "fs";
+import { mkdtempSync, rmSync, symlinkSync } from "fs";
 import { basename, join } from "path";
 import { createToolRuntime, makeExecutionContext } from "./tool-runtime";
 import { registerShellBundle } from "./shell-bundle";
@@ -83,6 +83,28 @@ describe("ShellBundle", () => {
       const ctx = makeExecutionContext("chat", cfg, { requestApproval: async () => true });
       const result = await makeRuntime().execute(
         { id: "cwd-outside", name: "bash", arguments: { command: "pwd", cwd: outside } },
+        ctx,
+      );
+      expect(result.is_error).toBe(true);
+      expect(result.output).toContain("outside the workspace");
+    } finally {
+      rmSync(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+      rmSync(outside, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  }, { timeout: 15_000 });
+
+  test("rejects cwd reached through an outside directory link", async () => {
+    const workspace = mkdtempSync(join(tmpdir(), "jarvis-shell-workspace-"));
+    const outside = mkdtempSync(join(tmpdir(), "jarvis-shell-outside-"));
+    symlinkSync(outside, join(workspace, "escape"), process.platform === "win32" ? "junction" : "dir");
+    try {
+      const cfg = defaultConfig();
+      cfg.jarvis_path = workspace;
+      cfg.tools.enabled = true;
+      cfg.tools.sandbox_mode = "strict";
+      const ctx = makeExecutionContext("chat", cfg, { requestApproval: async () => true });
+      const result = await makeRuntime().execute(
+        { id: "cwd-link", name: "bash", arguments: { command: "pwd", cwd: join(workspace, "escape") } },
         ctx,
       );
       expect(result.is_error).toBe(true);

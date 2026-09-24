@@ -1,8 +1,8 @@
 import { afterEach, describe, test, expect } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "fs";
 import { homedir, tmpdir } from "os";
 import { basename, join, resolve } from "path";
-import { expandHomePath, normalizePathInput, pathSegmentsEqual, resolveAllowedRoots, toWslPath, safePath } from "./fs-scope";
+import { expandHomePath, normalizePathInput, pathSegmentsEqual, resolveAllowedRoots, toWslPath, resolveSafePath, safePath } from "./fs-scope";
 import type { JarvisConfig } from "./config";
 
 const tempRoots: string[] = [];
@@ -11,6 +11,10 @@ function tempRoot(label: string): string {
   const root = mkdtempSync(join(tmpdir(), `jarvis-${label}-`));
   tempRoots.push(root);
   return root;
+}
+
+function linkDirectory(target: string, link: string): void {
+  symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
 }
 
 function config(root: string, mode: "strict" | "permissive" | "off" = "strict"): JarvisConfig {
@@ -64,6 +68,84 @@ describe("fs-scope", () => {
       workspaceOverride,
       sessionGrants: [granted, persistent, granted],
     })).toEqual([resolve(workspaceOverride), resolve(configured), resolve(granted), resolve(persistent)]);
+  });
+
+  test("safePath rejects an existing file reached through an outside directory link", () => {
+    const workspace = tempRoot("linked-read-workspace");
+    const outside = tempRoot("linked-read-outside");
+    writeFileSync(join(outside, "secret.txt"), "outside secret");
+    linkDirectory(outside, join(workspace, "escape"));
+
+    expect(() => safePath("escape/secret.txt", config(workspace))).toThrow(/outside the workspace/);
+  });
+
+  test("safePath rejects a new file reached through an outside directory link", () => {
+    const workspace = tempRoot("linked-write-workspace");
+    const outside = tempRoot("linked-write-outside");
+    linkDirectory(outside, join(workspace, "escape"));
+
+    expect(() => safePath("escape/new.txt", config(workspace), { forWrite: true }))
+      .toThrow(/outside the workspace/);
+    expect(existsSync(join(outside, "new.txt"))).toBe(false);
+  });
+
+  test("safePath allows a directory link whose target remains inside the workspace", () => {
+    const workspace = tempRoot("linked-inside-workspace");
+    const target = join(workspace, "real");
+    mkdirSync(target);
+    writeFileSync(join(target, "file.txt"), "inside");
+    linkDirectory(target, join(workspace, "link"));
+
+    expect(safePath("link/file.txt", config(workspace))).toBe(join(workspace, "link", "file.txt"));
+  });
+
+  test("safePath allows an outside link target only when that root is explicitly granted", () => {
+    const workspace = tempRoot("granted-link-workspace");
+    const outside = tempRoot("granted-link-outside");
+    writeFileSync(join(outside, "file.txt"), "granted");
+    linkDirectory(outside, join(workspace, "link"));
+
+    expect(safePath("link/file.txt", config(workspace), { sessionGrants: [outside] }))
+      .toBe(join(workspace, "link", "file.txt"));
+    expect(safePath("link/new.txt", config(workspace), { sessionGrants: [outside], forWrite: true }))
+      .toBe(join(workspace, "link", "new.txt"));
+  });
+
+  test("safePath revalidation rejects a link retarget during an operation", () => {
+    const workspace = tempRoot("retarget-workspace");
+    const inside = join(workspace, "inside");
+    mkdirSync(inside);
+    const outside = tempRoot("retarget-outside");
+    writeFileSync(join(inside, "file.txt"), "inside");
+    linkDirectory(inside, join(workspace, "link"));
+
+    const resolution = resolveSafePath("link/file.txt", config(workspace));
+    unlinkSync(join(workspace, "link"));
+    linkDirectory(outside, join(workspace, "link"));
+
+    expect(() => resolution.revalidate()).toThrow(/outside the workspace|changed/);
+  });
+
+  test("safePath permits permissive reads through an outside link but confines writes", () => {
+    const workspace = tempRoot("permissive-link-workspace");
+    const outside = tempRoot("permissive-link-outside");
+    writeFileSync(join(outside, "file.txt"), "permissive");
+    linkDirectory(outside, join(workspace, "link"));
+    const cfg = config(workspace, "permissive");
+
+    expect(safePath("link/file.txt", cfg)).toBe(join(workspace, "link", "file.txt"));
+    expect(() => safePath("link/new.txt", cfg, { forWrite: true })).toThrow(/outside the workspace/);
+  });
+
+  test("safePath accepts a configured root that is itself a directory link", () => {
+    const workspace = tempRoot("root-link-target");
+    const configured = join(workspace, "configured-link");
+    writeFileSync(join(workspace, "file.txt"), "ok");
+    linkDirectory(workspace, configured);
+    const cfg = config(configured);
+
+    expect(safePath("file.txt", cfg)).toBe(join(configured, "file.txt"));
+    expect(resolveSafePath("file.txt", cfg).canonicalPath).toBe(join(realpathSync(workspace), "file.txt"));
   });
 
   test("safePath rejects an escape outside the workspace", () => {

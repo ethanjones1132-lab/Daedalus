@@ -1,6 +1,6 @@
 // Filesystem path scoping shared by every canonical filesystem tool.
 
-import { existsSync, statSync } from "fs";
+import { existsSync, lstatSync, realpathSync, statSync } from "fs";
 import { homedir } from "os";
 import { basename, dirname, isAbsolute, posix, relative, resolve, win32 } from "path";
 import type { JarvisConfig } from "./config";
@@ -9,6 +9,21 @@ export interface SafePathOptions {
   workspaceOverride?: string;
   sessionGrants?: string[];
   forWrite?: boolean;
+}
+
+export interface SafePathResolution {
+  path: string;
+  canonicalPath: string;
+  revalidate(): void;
+}
+
+interface AllowedRoot {
+  path: string;
+  canonicalPath: string;
+}
+
+interface CandidatePath {
+  path: string;
 }
 
 export function effectiveWorkspaceRoot(cfg: JarvisConfig): string {
@@ -85,11 +100,47 @@ function existingDirectory(path: string): boolean {
   }
 }
 
-/** Ordered, normalized filesystem authority for one invocation. */
-export function resolveAllowedRoots(
+function canonicalExistingPath(path: string): string | null {
+  try {
+    if (!statSync(path).isDirectory()) return null;
+    return realpathSync(path);
+  } catch {
+    return null;
+  }
+}
+
+function canonicalCandidatePath(path: string): string | null {
+  const absolute = resolve(path);
+  try {
+    lstatSync(absolute);
+  } catch {
+    const suffix: string[] = [];
+    let ancestor = absolute;
+    while (true) {
+      const parent = dirname(ancestor);
+      if (parent === ancestor) return null;
+      suffix.push(basename(ancestor));
+      ancestor = parent;
+      try {
+        const canonicalAncestor = realpathSync(ancestor);
+        return resolve(canonicalAncestor, ...suffix.reverse());
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  try {
+    return realpathSync(absolute);
+  } catch {
+    return null;
+  }
+}
+
+function resolveAllowedRootEntries(
   cfg: JarvisConfig,
   options: Pick<SafePathOptions, "workspaceOverride" | "sessionGrants"> = {},
-): string[] {
+): AllowedRoot[] {
   const candidates = [
     options.workspaceOverride,
     effectiveWorkspaceRoot(cfg),
@@ -97,16 +148,25 @@ export function resolveAllowedRoots(
     ...(cfg.tools?.allowed_roots ?? []),
   ];
   const seen = new Set<string>();
-  const roots: string[] = [];
+  const roots: AllowedRoot[] = [];
   for (const candidate of candidates) {
     if (!candidate?.trim()) continue;
     const normalized = resolve(normalizePathInput(candidate));
-    const key = rootKey(normalized);
-    if (seen.has(key) || !existingDirectory(normalized)) continue;
+    const canonicalPath = canonicalExistingPath(normalized);
+    if (!canonicalPath) continue;
+    const key = rootKey(canonicalPath);
+    if (seen.has(key)) continue;
     seen.add(key);
-    roots.push(normalized);
+    roots.push({ path: normalized, canonicalPath });
   }
   return roots;
+}
+
+export function resolveAllowedRoots(
+  cfg: JarvisConfig,
+  options: Pick<SafePathOptions, "workspaceOverride" | "sessionGrants"> = {},
+): string[] {
+  return resolveAllowedRootEntries(cfg, options).map((root) => root.path);
 }
 
 function absoluteLike(path: string): boolean {
@@ -160,14 +220,14 @@ export function stripHallucinatedRootSegments(segments: readonly string[]): stri
 /** Try each root with hallucinated placeholder segments stripped; null if none resolve. */
 function resolveHallucinatedRootPath(
   segments: readonly string[],
-  roots: readonly string[],
+  roots: readonly AllowedRoot[],
   forWrite: boolean,
 ): string | null {
   const stripped = stripHallucinatedRootSegments(segments);
   if (stripped.length === 0 || stripped.length === segments.length) return null;
   for (const root of roots) {
-    const candidate = resolve(root, ...stripped);
-    if (!isContained(root, candidate)) continue;
+    const candidate = resolve(root.path, ...stripped);
+    if (!isContained(root.path, candidate)) continue;
     if (forWrite ? existingDirectory(dirname(candidate)) : existsSync(candidate)) return candidate;
   }
   return null;
@@ -194,69 +254,118 @@ function optionsFrom(third?: string | SafePathOptions): SafePathOptions {
  *   (`forWrite: true`) remain confined to roots∪grants (F4 / 2026-07-21).
  *   Effectively a permissive-reads / confined-writes policy.
  */
+function addCandidate(candidates: CandidatePath[], seen: Set<string>, path: string): void {
+  const absolute = resolve(path);
+  const key = rootKey(absolute);
+  if (seen.has(key)) return;
+  seen.add(key);
+  candidates.push({ path: absolute });
+}
+
+function collectCandidatePaths(
+  inputPath: string,
+  cfg: JarvisConfig,
+  options: SafePathOptions,
+  roots: readonly AllowedRoot[],
+): CandidatePath[] {
+  const normalizedInput = normalizePathInput(inputPath);
+  const candidates: CandidatePath[] = [];
+  const seen = new Set<string>();
+  const segments = normalizedInput.split(/[\\/]+/).filter(Boolean);
+
+  if (absoluteLike(normalizedInput)) {
+    addCandidate(candidates, seen, resolve(normalizedInput));
+    const hallucinated = resolveHallucinatedRootPath(segments, roots, options.forWrite === true);
+    if (hallucinated) addCandidate(candidates, seen, hallucinated);
+    return candidates;
+  }
+
+  for (const root of roots) {
+    if (segments.length > 1 && pathSegmentsEqual(basename(root.path), segments[0])) {
+      const deduplicated = resolve(root.path, ...segments.slice(1));
+      if (isContained(root.path, deduplicated) && existsSync(deduplicated)) {
+        addCandidate(candidates, seen, deduplicated);
+      }
+    }
+
+    const candidate = resolve(root.path, normalizedInput);
+    if (!isContained(root.path, candidate)) continue;
+    if (options.forWrite ? existingDirectory(dirname(candidate)) : existsSync(candidate)) {
+      addCandidate(candidates, seen, candidate);
+    }
+  }
+
+  const hallucinated = resolveHallucinatedRootPath(segments, roots, options.forWrite === true);
+  if (hallucinated) addCandidate(candidates, seen, hallucinated);
+
+  if (roots.length > 0) {
+    const fallback = resolve(roots[0].path, normalizedInput);
+    addCandidate(candidates, seen, fallback);
+  } else {
+    const permissiveBase = resolve(normalizePathInput(effectiveWorkspaceRoot(cfg)));
+    addCandidate(candidates, seen, resolve(permissiveBase, normalizedInput));
+  }
+
+  return candidates;
+}
+
+function makeResolution(
+  inputPath: string,
+  cfg: JarvisConfig,
+  workspaceOrOptions: string | SafePathOptions | undefined,
+  path: string,
+  canonicalPath: string,
+): SafePathResolution {
+  return {
+    path,
+    canonicalPath,
+    revalidate(): void {
+      if (cfg.tools.sandbox_mode === "off") return;
+      const current = resolveSafePath(inputPath, cfg, workspaceOrOptions);
+      if (current.path !== path || current.canonicalPath !== canonicalPath) {
+        throw new Error(`Path "${inputPath}" changed while it was being processed.`);
+      }
+    },
+  };
+}
+
+export function resolveSafePath(
+  inputPath: string,
+  cfg: JarvisConfig,
+  workspaceOrOptions?: string | SafePathOptions,
+): SafePathResolution {
+  const options = optionsFrom(workspaceOrOptions);
+  const normalizedInput = normalizePathInput(inputPath);
+
+  if (cfg.tools.sandbox_mode === "off") {
+    const path = resolve(normalizedInput);
+    return makeResolution(inputPath, cfg, workspaceOrOptions, path, path);
+  }
+
+  const roots = resolveAllowedRootEntries(cfg, options);
+  const allowOutside = cfg.tools.sandbox_mode === "permissive" && !options.forWrite;
+  const candidates = collectCandidatePaths(inputPath, cfg, options, roots);
+  const rootPaths = roots.map((root) => root.path);
+
+  for (const candidate of candidates) {
+    const canonicalPath = canonicalCandidatePath(candidate.path);
+    if (!canonicalPath) continue;
+    if (roots.some((root) => isContained(root.canonicalPath, canonicalPath))) {
+      return makeResolution(inputPath, cfg, workspaceOrOptions, candidate.path, canonicalPath);
+    }
+    if (allowOutside) {
+      console.log(`[Sandbox] Permissive mode: allowing access to "${candidate.path}" (outside allowed roots: ${rootPaths.join(", ") || "none"})`);
+      return makeResolution(inputPath, cfg, workspaceOrOptions, candidate.path, canonicalPath);
+    }
+  }
+
+  throw outsideError(inputPath, cfg, rootPaths);
+}
+
 export function safePath(
   inputPath: string,
   cfg: JarvisConfig,
   workspaceOrOptions?: string | SafePathOptions,
 ): string {
-  const options = optionsFrom(workspaceOrOptions);
-  const normalizedInput = normalizePathInput(inputPath);
-
-  if (cfg.tools.sandbox_mode === "off") return resolve(normalizedInput);
-
-  const roots = resolveAllowedRoots(cfg, options);
-  // Writes under permissive use the same containment as strict (F4).
-  const allowOutside =
-    cfg.tools.sandbox_mode === "permissive" && !options.forWrite;
-
-  const inputIsAbsolute = absoluteLike(normalizedInput);
-  if (inputIsAbsolute) {
-    const candidate = resolve(normalizedInput);
-    if (roots.some((root) => isContained(root, candidate))) return candidate;
-    const hallucinated = resolveHallucinatedRootPath(
-      normalizedInput.split(/[\\/]+/).filter(Boolean),
-      roots,
-      options.forWrite === true,
-    );
-    if (hallucinated) return hallucinated;
-    if (allowOutside) {
-      console.log(`[Sandbox] Permissive mode: allowing access to "${candidate}" (outside allowed roots: ${roots.join(", ") || "none"})`);
-      return candidate;
-    }
-    throw outsideError(inputPath, cfg, roots);
-  }
-
-  for (const root of roots) {
-    const segments = normalizedInput.split(/[\\/]+/).filter(Boolean);
-    if (segments.length > 1 && pathSegmentsEqual(basename(root), segments[0])) {
-      const deduplicated = resolve(root, ...segments.slice(1));
-      if (isContained(root, deduplicated) && existsSync(deduplicated)) return deduplicated;
-    }
-
-    const candidate = resolve(root, normalizedInput);
-    if (!isContained(root, candidate)) continue;
-    if (options.forWrite ? existingDirectory(dirname(candidate)) : existsSync(candidate)) return candidate;
-  }
-
-  {
-    const hallucinated = resolveHallucinatedRootPath(
-      normalizedInput.split(/[\\/]+/).filter(Boolean),
-      roots,
-      options.forWrite === true,
-    );
-    if (hallucinated) return hallucinated;
-  }
-
-  if (roots.length > 0) {
-    const fallback = resolve(roots[0], normalizedInput);
-    if (isContained(roots[0], fallback)) return fallback;
-  }
-
-  const permissiveBase = roots[0] ?? resolve(normalizePathInput(effectiveWorkspaceRoot(cfg)));
-  const permissiveCandidate = resolve(permissiveBase, normalizedInput);
-  if (allowOutside) {
-    console.log(`[Sandbox] Permissive mode: allowing access to "${permissiveCandidate}" (outside allowed roots: ${roots.join(", ") || "none"})`);
-    return permissiveCandidate;
-  }
-  throw outsideError(inputPath, cfg, roots);
+  return resolveSafePath(inputPath, cfg, workspaceOrOptions).path;
 }

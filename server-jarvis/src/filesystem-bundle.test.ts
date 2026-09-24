@@ -1,5 +1,5 @@
 import { describe, test, expect, afterEach } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from "fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { createTwoFilesPatch } from "diff";
@@ -20,6 +20,10 @@ function makeTempWorkspace(): string {
   const dir = mkdtempSync(join(tmpdir(), "jarvis-fs-test-"));
   cleanups.push(dir);
   return dir;
+}
+
+function linkDirectory(target: string, link: string): void {
+  symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
 }
 
 afterEach(() => {
@@ -141,6 +145,36 @@ describe("FilesystemBundle > read_file", () => {
     expect(result.output).not.toContain("File not found");
   });
 
+  test("read_file rejects an outside directory link without exposing its content", async () => {
+    const workspace = makeTempWorkspace();
+    const outside = makeTempWorkspace();
+    writeFileSync(join(outside, "secret.txt"), "outside secret");
+    linkDirectory(outside, join(workspace, "escape"));
+
+    const result = await makeRuntime().execute(
+      call("read_file", { path: "escape/secret.txt" }),
+      makeCtx(workspace),
+    );
+
+    expect(result.is_error).toBe(true);
+    expect(result.error).toContain("outside the workspace");
+    expect(result.output ?? "").not.toContain("outside secret");
+  });
+
+  test("read_file accepts an explicitly granted outside directory link", async () => {
+    const workspace = makeTempWorkspace();
+    const outside = makeTempWorkspace();
+    writeFileSync(join(outside, "granted.txt"), "granted content");
+    linkDirectory(outside, join(workspace, "escape"));
+    const ctx = makeCtx(workspace);
+    ctx.session_grants = [outside];
+
+    const result = await makeRuntime().execute(call("read_file", { path: "escape/granted.txt" }), ctx);
+
+    expect(result.is_error).toBe(false);
+    expect(result.output).toContain("granted content");
+  });
+
   test("read_file resolves relative paths through execution-context session grants", async () => {
     const workspace = makeTempWorkspace();
     const granted = makeTempWorkspace();
@@ -195,6 +229,38 @@ describe("FilesystemBundle > write_file", () => {
     expect(result.is_error).toBe(false);
     expect(readFileSync(join(granted, "generated", "new.txt"), "utf-8")).toBe("granted write\n");
     expect(existsSync(join(workspace, "generated", "new.txt"))).toBe(false);
+  });
+
+  test("write_file rejects an outside directory link without changing the target", async () => {
+    const workspace = makeTempWorkspace();
+    const outside = makeTempWorkspace();
+    const target = join(outside, "existing.txt");
+    writeFileSync(target, "before");
+    linkDirectory(outside, join(workspace, "escape"));
+
+    const result = await makeRuntime().execute(
+      call("write_file", { path: "escape/existing.txt", content: "after" }),
+      makeCtx(workspace),
+    );
+
+    expect(result.is_error).toBe(true);
+    expect(result.error).toContain("outside the workspace");
+    expect(readFileSync(target, "utf-8")).toBe("before");
+  });
+
+  test("write_file rejects a new target reached through an outside directory link", async () => {
+    const workspace = makeTempWorkspace();
+    const outside = makeTempWorkspace();
+    linkDirectory(outside, join(workspace, "escape"));
+
+    const result = await makeRuntime().execute(
+      call("write_file", { path: "escape/new.txt", content: "after" }),
+      makeCtx(workspace),
+    );
+
+    expect(result.is_error).toBe(true);
+    expect(result.error).toContain("outside the workspace");
+    expect(existsSync(join(outside, "new.txt"))).toBe(false);
   });
 
   test("write_file returns is_error and preserves the file when content is identical", async () => {
@@ -271,6 +337,31 @@ describe("FilesystemBundle > edit_file (read-before-edit guard)", () => {
     );
     expect(result.is_error).toBe(false);
     expect(readFileSync(join(ws, "f.txt"), "utf-8")).toBe("hi world");
+  });
+
+  test("edit_file does not follow a link retargeted after a successful read", async () => {
+    const workspace = makeTempWorkspace();
+    const inside = makeTempWorkspace();
+    const outside = makeTempWorkspace();
+    writeFileSync(join(inside, "file.txt"), "inside");
+    writeFileSync(join(outside, "file.txt"), "outside");
+    const link = join(workspace, "link");
+    linkDirectory(inside, link);
+    const rt = makeRuntime();
+    const ctx = makeCtx(workspace);
+    await rt.execute(call("read_file", { path: "link/file.txt" }), ctx);
+
+    unlinkSync(link);
+    linkDirectory(outside, link);
+    const result = await rt.execute(
+      call("edit_file", { path: "link/file.txt", old_string: "inside", new_string: "changed" }),
+      ctx,
+    );
+
+    expect(result.is_error).toBe(true);
+    expect(result.error).toContain("outside the workspace");
+    expect(readFileSync(join(outside, "file.txt"), "utf-8")).toBe("outside");
+    expect(readFileSync(join(inside, "file.txt"), "utf-8")).toBe("inside");
   });
 
   test("edit_file returns is_error for a no-op replacement", async () => {
@@ -549,6 +640,54 @@ describe("FilesystemBundle > grep + glob + list_directory", () => {
     expect(result.is_error).toBe(false);
     expect(result.output).toContain("a.txt");
     expect(result.output).toContain("sub");
+  });
+
+  test("grep and glob skip an outside directory link", async () => {
+    const workspace = makeTempWorkspace();
+    const outside = makeTempWorkspace();
+    writeFileSync(join(outside, "secret.txt"), "SECRET outside");
+    writeFileSync(join(workspace, "inside.txt"), "inside");
+    linkDirectory(outside, join(workspace, "escape"));
+    const rt = makeRuntime();
+    const ctx = makeCtx(workspace);
+
+    const grep = await rt.execute(call("grep", { pattern: "SECRET", path: "." }), ctx);
+    const glob = await rt.execute(call("glob", { pattern: "**/*.txt", path: "." }), ctx);
+
+    expect(grep.is_error).toBe(false);
+    expect(grep.output).not.toContain("secret.txt");
+    expect(glob.is_error).toBe(false);
+    expect(glob.output).not.toContain("escape");
+    expect(glob.output).toContain("inside.txt");
+  });
+
+  test("grep and glob can inspect an explicitly granted outside directory link", async () => {
+    const workspace = makeTempWorkspace();
+    const outside = makeTempWorkspace();
+    writeFileSync(join(outside, "secret.txt"), "SECRET outside");
+    linkDirectory(outside, join(workspace, "escape"));
+    const ctx = makeCtx(workspace);
+    ctx.session_grants = [outside];
+    const rt = makeRuntime();
+
+    const grep = await rt.execute(call("grep", { pattern: "SECRET", path: "." }), ctx);
+    const glob = await rt.execute(call("glob", { pattern: "**/*.txt", path: "." }), ctx);
+
+    expect(grep.output).toContain("escape/secret.txt");
+    expect(glob.output).toContain("escape/secret.txt");
+  });
+
+  test("list_directory does not inspect an outside directory link target", async () => {
+    const workspace = makeTempWorkspace();
+    const outside = makeTempWorkspace();
+    writeFileSync(join(outside, "secret.txt"), "outside secret");
+    linkDirectory(outside, join(workspace, "escape"));
+
+    const result = await makeRuntime().execute(call("list_directory", { path: "." }), makeCtx(workspace));
+
+    expect(result.is_error).toBe(false);
+    expect(result.output).toContain("escape");
+    expect(result.output).not.toContain("outside secret");
   });
 
   test("missing search roots return typed errors for glob, grep, and list_directory", async () => {
