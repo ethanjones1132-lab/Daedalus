@@ -1,9 +1,10 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync } from "fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { distillSkillCandidate, distillFromTrajectorySnapshot } from "./skill-distiller";
-import { listSkillCandidates, saveSkillCandidate, loadSkillCandidate, updateSkillCandidateEval } from "./skill-store";
+import { redistillSnapshots } from "./redistill";
+import { listSkillCandidates, loadSkillCandidate, pruneSkillCandidates, saveSkillCandidate, skillCandidatePath, updateSkillCandidateEval } from "./skill-store";
 import { resolveSkillsForTurn, resolveSkillsForConductor } from "./skill-resolver";
 import {
   evaluateSkillPromotion,
@@ -354,6 +355,167 @@ describe("skill distillation (Track C)", () => {
     workerInstructions: { executor: "Read src/auth.ts before editing." },
     stageRuns: [baseStageRun],
   };
+
+  test("dry-run redistillation does not create or read through the candidate store", () => {
+    const missingDir = join(tempRoot, "dry-run");
+    (globalThis as any).__skillCandidatesDirOverride = missingDir;
+    const snapshot: TrajectorySnapshot = {
+      id: "traj_dry_run",
+      agent_run_id: "run_dry_run",
+      session_id: "sess_dry_run",
+      snapshot_json: JSON.stringify({
+        version: 1,
+        agent_run_id: "run_dry_run",
+        session_id: "sess_dry_run",
+        task_type: "debug",
+        run_outcome: "success",
+        duration_ms: 100,
+        routing: {},
+        instruction_variants: {},
+        stage_runs: [baseStageRun],
+        model_attributions: [],
+        user_request: "fix the failing import",
+      }),
+    };
+    const candidate = distillFromTrajectorySnapshot({
+      snapshot,
+      config: {
+        enabled: true,
+        min_confidence: 0.5,
+        promotion_eval_delta: 0.02,
+        max_candidates: 50,
+      },
+    }, { persist: false });
+    expect(candidate).not.toBeNull();
+    expect(existsSync(missingDir)).toBe(false);
+    expect(readdirSync(tempRoot)).toHaveLength(0);
+  });
+
+  test("redistill dry-run uses the non-persisting path", () => {
+    const missingDir = join(tempRoot, "redistill-dry-run");
+    (globalThis as any).__skillCandidatesDirOverride = missingDir;
+    const snapshot: TrajectorySnapshot = {
+      id: "traj_redistill_dry_run",
+      agent_run_id: "run_redistill_dry_run",
+      session_id: "sess_redistill_dry_run",
+      snapshot_json: JSON.stringify({
+        version: 1,
+        agent_run_id: "run_redistill_dry_run",
+        session_id: "sess_redistill_dry_run",
+        task_type: "debug",
+        run_outcome: "success",
+        duration_ms: 100,
+        routing: {},
+        instruction_variants: {},
+        stage_runs: [baseStageRun],
+        model_attributions: [],
+        user_request: "fix the failing import",
+      }),
+    };
+    const results = redistillSnapshots([snapshot], {
+      enabled: true,
+      min_confidence: 0.5,
+      promotion_eval_delta: 0.02,
+      max_candidates: 50,
+    }, true);
+    expect(results[0].candidate).not.toBeNull();
+    expect(existsSync(missingDir)).toBe(false);
+  });
+
+  test("rebuilding a promoted source preserves it and creates a separate candidate", () => {
+    const config = {
+      enabled: true,
+      min_confidence: 0.5,
+      promotion_eval_delta: 0.02,
+      max_candidates: 50,
+    };
+    const input = { ...baseDistillInput, agentRunId: "run_rebuild_1", runOutcome: "success" as const };
+    const original = distillSkillCandidate(input, config);
+    expect(original).not.toBeNull();
+    const promoted = {
+      ...original!,
+      status: "promoted" as const,
+      promoted_at: "2026-09-23T00:00:00.000Z",
+      eval_score: 1,
+    };
+    saveSkillCandidate(promoted);
+    const originalPath = skillCandidatePath(original!.id);
+    const originalBytes = readFileSync(originalPath, "utf-8");
+
+    const rebuilt = distillSkillCandidate(input, config);
+    expect(rebuilt).not.toBeNull();
+    expect(rebuilt!.id).not.toBe(original!.id);
+    expect(rebuilt!.name).not.toBe(original!.name);
+    expect(rebuilt!.status).toBe("candidate");
+    expect(rebuilt!.source_run_ids).toEqual([input.agentRunId]);
+    expect(readFileSync(originalPath, "utf-8")).toBe(originalBytes);
+    expect(loadSkillCandidate(original!.id)?.status).toBe("promoted");
+
+    const resolved = resolveSkillsForTurn("fix the failing import", "debug");
+    expect(resolved.matched.some((skill) => skill.id === original!.id)).toBe(true);
+    expect(resolved.matched.some((skill) => skill.id === rebuilt!.id)).toBe(false);
+  });
+
+  test("pruning removes only the oldest unreviewed candidates", () => {
+    const rows: SkillCandidate[] = [
+      {
+        id: "prune_old_candidate",
+        name: "prune-old-candidate",
+        description: "old candidate",
+        trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: ["mutation_verb"] },
+        body: "x".repeat(600),
+        source_run_ids: ["run_old_candidate"],
+        confidence: 0.9,
+        status: "candidate",
+        created_at: "2026-09-20T00:00:00.000Z",
+        updated_at: "2026-09-20T00:00:00.000Z",
+      },
+      {
+        id: "prune_new_candidate",
+        name: "prune-new-candidate",
+        description: "new candidate",
+        trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: ["mutation_verb"] },
+        body: "x".repeat(600),
+        source_run_ids: ["run_new_candidate"],
+        confidence: 0.9,
+        status: "candidate",
+        created_at: "2026-09-22T00:00:00.000Z",
+        updated_at: "2026-09-22T00:00:00.000Z",
+      },
+      {
+        id: "prune_promoted",
+        name: "prune-promoted",
+        description: "promoted",
+        trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: ["mutation_verb"] },
+        body: "x".repeat(600),
+        source_run_ids: ["run_promoted"],
+        confidence: 0.9,
+        status: "promoted",
+        created_at: "2026-09-21T00:00:00.000Z",
+        updated_at: "2026-09-21T00:00:00.000Z",
+      },
+      {
+        id: "prune_rejected",
+        name: "prune-rejected",
+        description: "rejected",
+        trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: ["mutation_verb"] },
+        body: "x".repeat(600),
+        source_run_ids: ["run_rejected"],
+        confidence: 0.9,
+        status: "rejected",
+        created_at: "2026-09-21T00:00:00.000Z",
+        updated_at: "2026-09-21T00:00:00.000Z",
+      },
+    ];
+    for (const row of rows) saveSkillCandidate(row);
+
+    expect(pruneSkillCandidates(1)).toBe(1);
+    const remaining = new Set(listSkillCandidates().map((row) => row.id));
+    expect(remaining.has("prune_old_candidate")).toBe(false);
+    expect(remaining.has("prune_new_candidate")).toBe(true);
+    expect(remaining.has("prune_promoted")).toBe(true);
+    expect(remaining.has("prune_rejected")).toBe(true);
+  });
 
   test("distill_on=[success] (default) blocks degraded and failed outcomes", () => {
     // Default config (no distill_on) → ["success"] implicit

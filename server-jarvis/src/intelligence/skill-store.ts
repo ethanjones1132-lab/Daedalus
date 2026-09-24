@@ -9,9 +9,7 @@ function skillCandidatesDirOverride(): string | undefined {
 
 export function skillCandidatesDir(): string {
   const override = skillCandidatesDirOverride();
-  const p = override ?? join(homedir(), ".openclaw", "jarvis", "skills", "candidates");
-  mkdirSync(p, { recursive: true });
-  return p;
+  return override ?? join(homedir(), ".openclaw", "jarvis", "skills", "candidates");
 }
 
 export function skillCandidatePath(id: string): string {
@@ -48,7 +46,10 @@ export function listSkillCandidates(status?: SkillCandidateStatus): SkillCandida
       // Skip corrupt files.
     }
   }
-  return out.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  return out.sort((a, b) => {
+    const byUpdated = b.updated_at.localeCompare(a.updated_at);
+    return byUpdated || a.id.localeCompare(b.id);
+  });
 }
 
 export function updateSkillCandidateStatus(
@@ -111,9 +112,11 @@ export function updateSkillCandidateEval(
 }
 
 export function pruneSkillCandidates(maxRows: number): number {
-  const all = listSkillCandidates();
-  if (all.length <= maxRows) return 0;
-  const excess = all.slice(maxRows);
+  if (!Number.isFinite(maxRows) || maxRows < 0) return 0;
+  const limit = Math.floor(maxRows);
+  const candidates = listSkillCandidates("candidate");
+  if (candidates.length <= limit) return 0;
+  const excess = candidates.slice(limit);
   for (const row of excess) {
     try {
       unlinkSync(skillCandidatePath(row.id));

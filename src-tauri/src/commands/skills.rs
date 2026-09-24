@@ -619,18 +619,47 @@ struct DistilledSkillCandidateFile {
 /// Import distilled skill candidates written by the Bun orchestrator into SQLite.
 #[tauri::command]
 pub fn sync_distilled_skill_candidates(db: State<AppDb>) -> Result<usize, String> {
-    use std::fs;
     use std::path::PathBuf;
 
     let dir = PathBuf::from(crate::get_home_dir()).join(".openclaw/jarvis/skills/candidates");
+    sync_distilled_skill_candidates_from_dir(db.inner(), &dir)
+}
+
+fn distilled_candidate_id(metadata: Option<&str>) -> Option<String> {
+    let raw = metadata?;
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if value.get("source")?.as_str()? != "trajectory_distillation" {
+        return None;
+    }
+    value
+        .get("candidate_id")?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
+fn is_distilled_metadata(metadata: Option<&str>) -> bool {
+    let Some(raw) = metadata else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    value.get("source").and_then(|v| v.as_str()) == Some("trajectory_distillation")
+}
+
+fn sync_distilled_skill_candidates_from_dir(db: &AppDb, dir: &std::path::Path) -> Result<usize, String> {
+    use std::collections::{HashMap, HashSet};
+    use std::fs;
+    use std::path::PathBuf;
+
     if !dir.exists() {
         return Ok(0);
     }
 
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let mut synced = 0usize;
-
-    for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
+    let mut files: Vec<(PathBuf, DistilledSkillCandidateFile)> = Vec::new();
+    let mut seen_ids = HashSet::new();
+    let mut seen_names = HashSet::new();
+    for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
@@ -639,6 +668,58 @@ pub fn sync_distilled_skill_candidates(db: State<AppDb>) -> Result<usize, String
         let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
         let file: DistilledSkillCandidateFile = serde_json::from_str(&raw)
             .map_err(|e| format!("Invalid candidate {}: {}", path.display(), e))?;
+        if !seen_ids.insert(file.id.clone()) {
+            return Err(format!("Duplicate candidate id: {}", file.id));
+        }
+        if !seen_names.insert(file.name.clone()) {
+            return Err(format!("Duplicate candidate name: {}", file.name));
+        }
+        files.push((path, file));
+    }
+
+    let current_ids: HashSet<String> = files.iter().map(|(_, file)| file.id.clone()).collect();
+    let mut conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let existing_rows: Vec<(String, String, Option<String>)> = {
+        let mut stmt = tx
+            .prepare("SELECT id, name, metadata FROM skills")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+    };
+    let mut by_candidate: HashMap<String, String> = HashMap::new();
+    let mut by_name: HashMap<String, (String, Option<String>)> = HashMap::new();
+    for (id, name, metadata) in &existing_rows {
+        if let Some(candidate_id) = distilled_candidate_id(metadata.as_deref()) {
+            by_candidate.insert(candidate_id, id.clone());
+        }
+        by_name.insert(name.clone(), (id.clone(), metadata.clone()));
+    }
+
+    let mut retained_ids = HashSet::new();
+    let mut synced = 0usize;
+    for (_, file) in &files {
+        let existing_id = by_candidate.get(&file.id).cloned();
+        let existing_name = by_name.get(&file.name).cloned();
+        if let Some((name_id, name_metadata)) = &existing_name {
+            let same_candidate = existing_id.as_deref() == Some(name_id.as_str());
+            if !same_candidate && !is_distilled_metadata(name_metadata.as_deref()) {
+                return Err(format!("Candidate name conflicts with existing skill: {}", file.name));
+            }
+        }
+        if let (Some(candidate_id), Some((name_id, _))) = (&existing_id, &existing_name) {
+            if candidate_id != name_id {
+                return Err(format!("Candidate name conflicts with another distilled skill: {}", file.name));
+            }
+        }
 
         let enabled = if file.status == "promoted" { 1 } else { 0 };
         let metadata = serde_json::json!({
@@ -649,29 +730,22 @@ pub fn sync_distilled_skill_candidates(db: State<AppDb>) -> Result<usize, String
             "candidate_id": file.id,
         })
         .to_string();
-
-        let exists: i64 = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM skills WHERE name = ?)",
-                [&file.name],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        if exists != 0 {
-            conn.execute(
-                "UPDATE skills SET description = ?, body = ?, enabled = ?, metadata = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE name = ?",
-                params![file.description, file.body, enabled, metadata, file.name],
+        let target_id = existing_id.or_else(|| existing_name.as_ref().map(|(id, _)| id.clone()));
+        if let Some(target_id) = target_id {
+            tx.execute(
+                "UPDATE skills SET name = ?, description = ?, body = ?, enabled = ?, metadata = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?",
+                params![file.name, file.description, file.body, enabled, metadata, target_id],
             )
             .map_err(|e| e.to_string())?;
+            retained_ids.insert(target_id);
         } else {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO skills (id, name, description, path, enabled, metadata, body, version, created_at, updated_at)
                  VALUES (?, ?, ?, '', ?, ?, ?, 1, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
                 params![file.id, file.name, file.description, enabled, metadata, file.body],
             )
             .map_err(|e| e.to_string())?;
-            conn.execute(
+            tx.execute(
                 "INSERT INTO skill_revisions (id, skill_id, version, body_before, body_after, change_reason, source_session_id, created_at)
                  VALUES (?, ?, 1, '', ?, 'trajectory_distillation', ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
                 params![
@@ -682,9 +756,135 @@ pub fn sync_distilled_skill_candidates(db: State<AppDb>) -> Result<usize, String
                 ],
             )
             .map_err(|e| e.to_string())?;
+            retained_ids.insert(file.id.clone());
         }
         synced += 1;
     }
 
+    let stale_ids: Vec<String> = existing_rows
+        .iter()
+        .filter_map(|(id, _, metadata)| {
+            let candidate_id = distilled_candidate_id(metadata.as_deref())?;
+            if current_ids.contains(&candidate_id) || retained_ids.contains(id) {
+                None
+            } else {
+                Some(id.clone())
+            }
+        })
+        .collect();
+    for id in stale_ids {
+        tx.execute("DELETE FROM skills WHERE id = ?", [&id])
+            .map_err(|e| e.to_string())?;
+    }
+
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(synced)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::run_migrations;
+    use rusqlite::Connection;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    fn mem_db() -> AppDb {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        run_migrations(&conn).expect("run migrations");
+        AppDb {
+            conn: Mutex::new(conn),
+            db_path: PathBuf::from(":memory:"),
+        }
+    }
+
+    fn temp_dir() -> PathBuf {
+        let path = std::env::temp_dir().join(format!("jarvis-skills-sync-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    fn insert_skill(db: &AppDb, id: &str, name: &str, source: &str, candidate_id: Option<&str>) {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let metadata = serde_json::json!({
+            "source": source,
+            "candidate_id": candidate_id,
+        });
+        conn.execute(
+            "INSERT INTO skills (id, name, description, path, enabled, metadata, body, version, created_at, updated_at)
+             VALUES (?, ?, ?, '', 1, ?, ?, 1, '', '')",
+            params![id, name, source, metadata.to_string(), "body"],
+        )
+        .expect("insert skill");
+    }
+
+    fn skill_exists(db: &AppDb, id: &str) -> bool {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM skills WHERE id = ?)",
+            [id],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("query skill")
+            != 0
+    }
+
+    fn candidate_json(id: &str, name: &str, status: &str) -> String {
+        serde_json::json!({
+            "id": id,
+            "name": name,
+            "description": "candidate",
+            "body": "body",
+            "status": status,
+            "source_session_id": "session",
+            "confidence": 0.9,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn sync_removes_only_stale_distilled_rows() {
+        let db = mem_db();
+        insert_skill(&db, "stale", "stale-skill", "trajectory_distillation", Some("stale"));
+        insert_skill(&db, "bundled", "bundled-skill", "bundled", None);
+        let dir = temp_dir();
+        fs::write(
+            dir.join("current.json"),
+            candidate_json("current", "current-skill", "promoted"),
+        )
+        .expect("write current candidate");
+
+        assert_eq!(sync_distilled_skill_candidates_from_dir(&db, &dir).unwrap(), 1);
+        assert!(skill_exists(&db, "current"));
+        assert!(!skill_exists(&db, "stale"));
+        assert!(skill_exists(&db, "bundled"));
+        fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn missing_directory_preserves_existing_distilled_rows() {
+        let db = mem_db();
+        insert_skill(&db, "stale", "stale-skill", "trajectory_distillation", Some("stale"));
+        let dir = temp_dir();
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+
+        assert_eq!(sync_distilled_skill_candidates_from_dir(&db, &dir).unwrap(), 0);
+        assert!(skill_exists(&db, "stale"));
+    }
+
+    #[test]
+    fn malformed_directory_does_not_partially_reconcile_rows() {
+        let db = mem_db();
+        insert_skill(&db, "stale", "stale-skill", "trajectory_distillation", Some("stale"));
+        let dir = temp_dir();
+        fs::write(dir.join("valid.json"), candidate_json("valid", "valid-skill", "candidate"))
+            .expect("write valid candidate");
+        fs::write(dir.join("broken.json"), "{").expect("write broken candidate");
+
+        assert!(sync_distilled_skill_candidates_from_dir(&db, &dir).is_err());
+        assert!(skill_exists(&db, "stale"));
+        assert!(!skill_exists(&db, "valid"));
+        fs::remove_dir_all(dir).expect("remove temp dir");
+    }
 }

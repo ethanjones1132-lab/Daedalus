@@ -11,6 +11,7 @@
  */
 
 import { distillFromTrajectorySnapshot } from "./skill-distiller";
+import type { SkillCandidate } from "./skill-types";
 import type { SkillDistillationConfig } from "../config";
 import { loadConfig } from "../config";
 import { SelfTuningStore, type TrajectorySnapshot } from "../self-tuning/store";
@@ -61,6 +62,30 @@ Options:
   --dry-run              Show what would be distilled without writing
   --help, -h             Show this help
 `);
+}
+
+export interface RedistillSnapshotResult {
+  candidate: SkillCandidate | null;
+  error?: unknown;
+}
+
+export function redistillSnapshots(
+  snapshots: TrajectorySnapshot[],
+  config: SkillDistillationConfig,
+  dryRun: boolean,
+): RedistillSnapshotResult[] {
+  return snapshots.map((snapshot) => {
+    try {
+      return {
+        candidate: distillFromTrajectorySnapshot(
+          { snapshot, config },
+          { persist: !dryRun },
+        ),
+      };
+    } catch (error) {
+      return { candidate: null, error };
+    }
+  });
 }
 
 async function main(): Promise<void> {
@@ -115,37 +140,39 @@ async function main(): Promise<void> {
   let skipped = 0;
   let errors = 0;
 
-  for (const snapshot of filtered) {
-    try {
-      const candidate = distillFromTrajectorySnapshot({ snapshot, config: distillCfg });
-      if (candidate) {
-        distilled++;
-        if (args.dryRun) {
-          console.log(`  [DRY-RUN] Would create candidate: ${candidate.name} (confidence: ${candidate.confidence.toFixed(2)})`);
-        } else {
-          console.log(`  ✓ Created candidate: ${candidate.name} (confidence: ${candidate.confidence.toFixed(2)})`);
-        }
-      } else {
-        skipped++;
-        if (args.dryRun) {
-          console.log(`  [DRY-RUN] Skipped: no candidate produced (outcome filter or confidence threshold)`);
-        }
-      }
-    } catch (e) {
+  const results = redistillSnapshots(filtered, distillCfg, args.dryRun ?? false);
+  for (const [index, result] of results.entries()) {
+    const snapshot = filtered[index];
+    if (result.error !== undefined) {
       errors++;
-      console.error(`  ✗ Error processing snapshot ${snapshot.id}:`, e);
+      console.error(`  ✗ Error processing snapshot ${snapshot.id}:`, result.error);
+      continue;
+    }
+    if (result.candidate) {
+      distilled++;
+      if (args.dryRun) {
+        console.log(`  [DRY-RUN] Would create candidate: ${result.candidate.name} (confidence: ${result.candidate.confidence.toFixed(2)})`);
+      } else {
+        console.log(`  ✓ Created candidate: ${result.candidate.name} (confidence: ${result.candidate.confidence.toFixed(2)})`);
+      }
+    } else {
+      skipped++;
+      if (args.dryRun) {
+        console.log(`  [DRY-RUN] Skipped: no candidate produced (outcome filter or confidence threshold)`);
+      }
     }
   }
 
   console.log(`\nDone. Distilled: ${distilled}, Skipped: ${skipped}, Errors: ${errors}`);
   
   if (!args.dryRun && distilled > 0) {
-    console.log("\nRun promotion pass to evaluate candidates:");
-    console.log("  bun run src/intelligence/promote.ts");
+    console.log("\nRun the Skills promotion pass to evaluate candidates.");
   }
 }
 
-main().catch((e) => {
-  console.error("Fatal error:", e);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((e) => {
+    console.error("Fatal error:", e);
+    process.exit(1);
+  });
+}

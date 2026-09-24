@@ -1,9 +1,10 @@
+import { createHash } from "node:crypto";
 import type { TaskType, WorkerInstructions } from "../orchestration/coordinator";
 import type { StageRun } from "../self-tuning/store";
 import type { TurnRequirement } from "../orchestration/turn-requirements";
 import { classifyTurnRequirements } from "../orchestration/turn-requirements";
 import type { SkillCandidate, SkillTrigger } from "./skill-types";
-import { saveSkillCandidate, pruneSkillCandidates } from "./skill-store";
+import { loadSkillCandidate, saveSkillCandidate, pruneSkillCandidates } from "./skill-store";
 import type { SkillDistillationConfig } from "../config";
 import type { TrajectorySnapshot } from "../self-tuning/store";
 
@@ -89,13 +90,13 @@ function computeConfidence(input: DistillationInput): number {
   return Math.min(1, score);
 }
 
-export function distillSkillCandidate(
+export function buildSkillCandidate(
   input: DistillationInput,
   config: SkillDistillationConfig,
 ): SkillCandidate | null {
   if (!config.enabled) return null;
   if (input.taskRunAccepted === false) return null;
-  
+
   const distillOn = config.distill_on ?? ["success"];
   if (!distillOn.includes(input.runOutcome)) return null;
 
@@ -113,7 +114,7 @@ export function distillSkillCandidate(
 
   const now = new Date().toISOString();
   const id = `skill_${slugify(input.taskType)}_${input.agentRunId.slice(-8)}`;
-  const candidate: SkillCandidate = {
+  return {
     id,
     name: `distilled-${input.taskType}-${input.agentRunId.slice(-6)}`,
     description: `Distilled orchestration pattern for ${input.taskType} (${turnReq.requirement})`,
@@ -126,16 +127,63 @@ export function distillSkillCandidate(
     created_at: now,
     updated_at: now,
   };
+}
 
-  saveSkillCandidate(candidate);
+function candidateDigest(candidate: SkillCandidate): string {
+  return createHash("sha256")
+    .update(JSON.stringify({
+      body: candidate.body,
+      trigger: candidate.trigger,
+      source_run_ids: candidate.source_run_ids,
+      source_session_id: candidate.source_session_id ?? null,
+    }))
+    .digest("hex")
+    .slice(0, 12);
+}
+
+function resolveSkillCandidate(candidate: SkillCandidate): SkillCandidate {
+  const existing = loadSkillCandidate(candidate.id);
+  if (!existing || existing.status === "candidate") return candidate;
+
+  const digest = candidateDigest(candidate);
+  const rebuilt: SkillCandidate = {
+    ...candidate,
+    id: `${candidate.id}_r${digest}`,
+    name: `${candidate.name}-r${digest.slice(0, 8)}`,
+  };
+  return loadSkillCandidate(rebuilt.id) ?? rebuilt;
+}
+
+function persistSkillCandidate(candidate: SkillCandidate): SkillCandidate {
+  const resolved = resolveSkillCandidate(candidate);
+  if (resolved.id === candidate.id) {
+    saveSkillCandidate(candidate);
+    return candidate;
+  }
+  if (!loadSkillCandidate(resolved.id)) saveSkillCandidate(resolved);
+  return loadSkillCandidate(resolved.id) ?? resolved;
+}
+
+export function distillSkillCandidate(
+  input: DistillationInput,
+  config: SkillDistillationConfig,
+): SkillCandidate | null {
+  const candidate = buildSkillCandidate(input, config);
+  if (!candidate) return null;
+  const persisted = persistSkillCandidate(candidate);
   pruneSkillCandidates(config.max_candidates);
-  return candidate;
+  return persisted;
 }
 
 /** Distill a skill candidate from a stored trajectory snapshot (C-01 hardening).
  *  Used for audit/replay: e.g., CLI `bun run src/intelligence/redistill.ts --agent-run-id=...` */
+export interface TrajectoryDistillationOptions {
+  persist?: boolean;
+}
+
 export function distillFromTrajectorySnapshot(
   input: TrajectoryDistillationInput,
+  options: TrajectoryDistillationOptions = {},
 ): SkillCandidate | null {
   const { snapshot, config } = input;
   if (!config.enabled) return null;
@@ -168,7 +216,7 @@ export function distillFromTrajectorySnapshot(
   const distillOn = config.distill_on ?? ["success"];
   if (!distillOn.includes(traj.run_outcome)) return null;
 
-  const candidate = distillSkillCandidate(
+  const candidate = buildSkillCandidate(
     {
       agentRunId: traj.agent_run_id,
       sessionId: traj.session_id,
@@ -180,6 +228,9 @@ export function distillFromTrajectorySnapshot(
     },
     config,
   );
-
-  return candidate;
+  if (!candidate) return null;
+  if (options.persist === false) return resolveSkillCandidate(candidate);
+  const persisted = persistSkillCandidate(candidate);
+  pruneSkillCandidates(config.max_candidates);
+  return persisted;
 }
