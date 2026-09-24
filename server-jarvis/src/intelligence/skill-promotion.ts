@@ -1,6 +1,7 @@
 import type { SkillDistillationConfig } from "../config";
 import type { SkillCandidate, SkillRejectionReason } from "./skill-types";
-import { listSkillCandidates, loadSkillCandidate, skillCandidateLifecycleVersion, transitionSkillCandidate, updateSkillCandidateStatus } from "./skill-store";
+import { isValidSkillCandidate } from "./skill-candidate-validation";
+import { listSkillCandidates, readSkillCandidate, skillCandidateLifecycleVersion, transitionSkillCandidate, updateSkillCandidateStatus } from "./skill-store";
 import { judgeAnswer, type JudgeVerdict } from "../eval/judge";
 import type { CallModelFn } from "../orchestration/coordinator";
 import { SelfTuningStore, type TrajectorySnapshot } from "../self-tuning/store";
@@ -35,6 +36,7 @@ function bodyGuidanceSection(body: string): string {
 
 /** Deterministic eval proxy until live replay harness covers distilled skills. */
 export function scoreSkillCandidate(candidate: SkillCandidate): number {
+  if (!isValidSkillCandidate(candidate)) return 0;
   let score = candidate.confidence;
   if (candidate.body.includes("## Conductor worker guidance")) score += 0.05;
   if (candidate.trigger.signals.length >= 2) score += 0.03;
@@ -69,6 +71,15 @@ export function evaluateSkillPromotion(
   candidate: SkillCandidate,
   config: SkillDistillationConfig,
 ): SkillPromotionVerdict {
+  if (!isValidSkillCandidate(candidate)) {
+    return {
+      promote: false,
+      score: 0,
+      baseline: 0.5,
+      reason: "manual",
+      detail: "invalid candidate record",
+    };
+  }
   if (candidate.status !== "candidate") {
     return {
       promote: false,
@@ -217,10 +228,11 @@ export async function promoteCandidates(
   // bulk call.
   const pending: { candidate: SkillCandidate; priorJson: string }[] = [];
   for (const id of ids) {
-    const candidate = loadSkillCandidate(id);
-    if (!candidate) {
-      throw new Error(`judge_required: candidate ${id} not found`);
+    const read = readSkillCandidate(id);
+    if (!read.ok) {
+      throw new Error(`judge_required: candidate ${id} ${read.error}`);
     }
+    const candidate = read.candidate;
     if (candidate.status !== "candidate") {
       throw new Error(
         `judge_required: candidate ${id} status is ${candidate.status}, expected candidate`,
@@ -363,6 +375,9 @@ export async function runGroundingJudge(
   callModel: CallModelFn,
   fetchSnapshot: SnapshotFetcher = defaultSnapshotFetcher,
 ): Promise<GroundingJudgeResult> {
+  if (!isValidSkillCandidate(candidate)) {
+    return { ok: false, error: "judge_invalid", detail: "invalid candidate record" };
+  }
   const sourceRunId = candidate.source_run_ids[0];
   const snapshot = sourceRunId ? fetchSnapshot(sourceRunId) : null;
   if (!snapshot) {
@@ -389,7 +404,7 @@ export async function runGroundingJudge(
 
 export interface PromoteSkillCandidateResult {
   ok: boolean;
-  error?: "candidate_not_found" | "wrong_status" | "stale_version" | "judge_unavailable" | "judge_invalid";
+  error?: "candidate_not_found" | "invalid_candidate_record" | "wrong_status" | "stale_version" | "judge_unavailable" | "judge_invalid";
   detail?: string;
   candidate?: SkillCandidate;
   verdict?: JudgeVerdict;
@@ -410,10 +425,11 @@ export async function promoteSkillCandidate(
   fetchSnapshot: SnapshotFetcher = defaultSnapshotFetcher,
   expectedVersion?: number,
 ): Promise<PromoteSkillCandidateResult> {
-  const candidate = loadSkillCandidate(id);
-  if (!candidate) {
-    return { ok: false, error: "candidate_not_found" };
+  const read = readSkillCandidate(id);
+  if (!read.ok) {
+    return { ok: false, error: read.error };
   }
+  const candidate = read.candidate;
   const observedVersion = skillCandidateLifecycleVersion(candidate);
   if (expectedVersion !== undefined && expectedVersion !== observedVersion) {
     return { ok: false, error: "stale_version", detail: `current version is ${observedVersion}` };

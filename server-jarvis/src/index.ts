@@ -193,7 +193,7 @@ import {
   distillSkillCandidate,
   evaluateSkillPromotion,
   listSkillCandidates,
-  loadSkillCandidate,
+  readSkillCandidate,
   promoteCandidates,
   promoteSkillCandidate,
   resolveSkillsForTurn,
@@ -5182,8 +5182,14 @@ export async function baseFetch(req: Request): Promise<Response> {
     const candidatePerformanceMatch = path.match(/^\/skills\/candidates\/([^/]+)\/performance$/);
     if (candidatePerformanceMatch && req.method === "GET") {
       const id = decodeURIComponent(candidatePerformanceMatch[1]);
-      const candidate = loadSkillCandidate(id);
-      if (!candidate) return Response.json({ error: "candidate_not_found" }, { status: 404 });
+      const read = readSkillCandidate(id);
+      if (!read.ok) {
+        if (read.error === "invalid_candidate_record") {
+          return Response.json({ error: read.error, reason: read.error }, { status: 422 });
+        }
+        return Response.json({ error: read.error }, { status: 404 });
+      }
+      const candidate = read.candidate;
       if (candidate.status !== "promoted") {
         return Response.json({ error: "wrong_status", detail: `status is ${candidate.status}` }, { status: 409 });
       }

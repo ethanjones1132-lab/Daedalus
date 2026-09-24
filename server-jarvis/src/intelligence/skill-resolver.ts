@@ -4,6 +4,7 @@ import { classifyTurnRequirements } from "../orchestration/turn-requirements";
 import { countTokens } from "../tokens";
 import { truncateToTokenBudget } from "../orchestration/context-budget";
 import type { SkillCandidate } from "./skill-types";
+import { isValidSkillCandidate } from "./skill-candidate-validation";
 import { listSkillCandidates } from "./skill-store";
 
 export const MAX_PROMOTED_SKILLS_PER_TURN = 3;
@@ -95,7 +96,7 @@ export function resolveSkillsForTurn(
     : stageOrOptions ?? {};
   const maxSkills = normalizeLimit(options.maxSkills, MAX_PROMOTED_SKILLS_PER_TURN);
   const maxTokens = normalizeLimit(options.maxTokens, PROMOTED_SKILL_BLOCK_BUDGET_TOKENS);
-  const candidates = listSkillCandidates("promoted");
+  const candidates = listSkillCandidates("promoted").filter((candidate) => isValidSkillCandidate(candidate) && candidate.source_run_ids.length > 0);
   const allMatches = candidates.filter((candidate) => triggerMatches(candidate, taskType, message));
   if (allMatches.length === 0) return emptyResolution();
 
@@ -171,9 +172,15 @@ const CONDUCTOR_HINT_MAX_CHARS = 400;
 
 function triggerMatchesConductor(candidate: SkillCandidate, requirement: string, signals: string[]): boolean {
   const trigger = candidate.trigger;
+  if (
+    !trigger
+    || !Array.isArray(trigger.requirements)
+    || !Array.isArray(trigger.signals)
+    || !Array.isArray(trigger.task_types)
+  ) return false;
   if (trigger.requirements.length > 0 && !trigger.requirements.includes(requirement as any)) return false;
   if (trigger.signals.length === 0) return true;
-  return trigger.signals.some((sig) => signals.includes(sig));
+  return trigger.signals.some((sig) => typeof sig === "string" && signals.includes(sig));
 }
 
 /**
@@ -184,7 +191,7 @@ function triggerMatchesConductor(candidate: SkillCandidate, requirement: string,
  */
 export function resolveSkillsForConductor(message: string): string {
   const { requirement, signals } = classifyTurnRequirements(message);
-  const candidates = listSkillCandidates("promoted");
+  const candidates = listSkillCandidates("promoted").filter((candidate) => isValidSkillCandidate(candidate) && candidate.source_run_ids.length > 0);
   const matched = candidates.filter((c) => triggerMatchesConductor(c, requirement, signals));
   if (matched.length === 0) return "";
 

@@ -5,7 +5,7 @@ import {
   type SnapshotFetcher,
 } from "./intelligence/skill-promotion";
 import {
-  loadSkillCandidate,
+  readSkillCandidate,
   skillCandidateLifecycleVersion,
   transitionSkillCandidate,
   type SkillCandidateTransitionResult,
@@ -27,19 +27,26 @@ function responseBody(body: unknown): Record<string, unknown> {
 
 function transitionErrorResponse(result: Extract<SkillCandidateTransitionResult, { ok: false }>): Response {
   const current = result.current;
-  const status = result.error === "candidate_not_found" ? 404 : 409;
+  const status = result.error === "candidate_not_found"
+    ? 404
+    : result.error === "invalid_candidate_record" ? 422 : 409;
   return Response.json({
     error: result.error,
+    ...(result.error === "invalid_candidate_record" ? { reason: "invalid_candidate_record" } : {}),
     current_status: current?.status,
     current_version: current ? skillCandidateLifecycleVersion(current) : undefined,
   }, { status });
 }
 
 function promotionErrorResponse(result: Awaited<ReturnType<typeof promoteSkillCandidate>>): Response {
-  const status = result.error === "candidate_not_found" ? 404 : result.error === "wrong_status" || result.error === "stale_version" ? 409 : 503;
+  const status = result.error === "candidate_not_found"
+    ? 404
+    : result.error === "invalid_candidate_record"
+      ? 422
+      : result.error === "wrong_status" || result.error === "stale_version" ? 409 : 503;
   return Response.json({
     error: result.error,
-    detail: result.detail,
+    ...(result.error === "invalid_candidate_record" ? { reason: "invalid_candidate_record" } : { detail: result.detail }),
     current_status: result.candidate?.status,
     current_version: result.candidate ? skillCandidateLifecycleVersion(result.candidate) : undefined,
   }, { status });
@@ -60,8 +67,14 @@ export async function handleSkillCandidateRequest(
     return Response.json({ error: "invalid_candidate_id" }, { status: 400 });
   }
   const action = match[2] as CandidateAction;
-  const candidate = loadSkillCandidate(id);
-  if (!candidate) return Response.json({ error: "candidate_not_found" }, { status: 404 });
+  const read = readSkillCandidate(id);
+  if (!read.ok) {
+    if (read.error === "invalid_candidate_record") {
+      return Response.json({ error: read.error, reason: read.error }, { status: 422 });
+    }
+    return Response.json({ error: read.error }, { status: 404 });
+  }
+  const candidate = read.candidate;
 
   const body = responseBody(await req.json().catch(() => ({})));
   const suppliedVersion = body.expected_version;

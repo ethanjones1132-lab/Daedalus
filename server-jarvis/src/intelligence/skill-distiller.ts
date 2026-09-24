@@ -4,7 +4,7 @@ import type { StageRun } from "../self-tuning/store";
 import type { TurnRequirement } from "../orchestration/turn-requirements";
 import { classifyTurnRequirements } from "../orchestration/turn-requirements";
 import type { SkillCandidate, SkillTrigger } from "./skill-types";
-import { loadSkillCandidate, saveSkillCandidate, pruneSkillCandidates } from "./skill-store";
+import { readSkillCandidate, saveSkillCandidate, pruneSkillCandidates } from "./skill-store";
 import type { SkillDistillationConfig } from "../config";
 import type { TrajectorySnapshot } from "../self-tuning/store";
 
@@ -141,17 +141,40 @@ function candidateDigest(candidate: SkillCandidate): string {
     .slice(0, 12);
 }
 
-function resolveSkillCandidate(candidate: SkillCandidate): SkillCandidate {
-  const existing = loadSkillCandidate(candidate.id);
-  if (!existing || existing.status === "candidate") return candidate;
-
-  const digest = candidateDigest(candidate);
-  const rebuilt: SkillCandidate = {
+function rebuiltSkillCandidate(candidate: SkillCandidate, id: string, suffix: string): SkillCandidate {
+  return {
     ...candidate,
-    id: `${candidate.id}_r${digest}`,
-    name: `${candidate.name}-r${digest.slice(0, 8)}`,
+    id,
+    name: `${candidate.name}-r${suffix}`,
   };
-  return loadSkillCandidate(rebuilt.id) ?? rebuilt;
+}
+
+function resolveRebuiltSkillCandidate(candidate: SkillCandidate): SkillCandidate {
+  const digest = candidateDigest(candidate);
+  const baseId = `${candidate.id}_r${digest}`;
+  let id = baseId;
+  let suffix = digest.slice(0, 8);
+  let index = 0;
+  while (true) {
+    const existing = readSkillCandidate(id);
+    if (!existing.ok) {
+      if (existing.error === "candidate_not_found") return rebuiltSkillCandidate(candidate, id, suffix);
+      index += 1;
+      suffix = `${digest.slice(0, 8)}_${index}`;
+      id = `${baseId}_${index}`;
+      continue;
+    }
+    return existing.candidate;
+  }
+}
+
+function resolveSkillCandidate(candidate: SkillCandidate): SkillCandidate {
+  const existing = readSkillCandidate(candidate.id);
+  if (!existing.ok) {
+    return existing.error === "candidate_not_found" ? candidate : resolveRebuiltSkillCandidate(candidate);
+  }
+  if (existing.candidate.status === "candidate") return candidate;
+  return resolveRebuiltSkillCandidate(candidate);
 }
 
 function persistSkillCandidate(candidate: SkillCandidate): SkillCandidate {
@@ -160,8 +183,12 @@ function persistSkillCandidate(candidate: SkillCandidate): SkillCandidate {
     saveSkillCandidate(candidate);
     return candidate;
   }
-  if (!loadSkillCandidate(resolved.id)) saveSkillCandidate(resolved);
-  return loadSkillCandidate(resolved.id) ?? resolved;
+  const existing = readSkillCandidate(resolved.id);
+  if (!existing.ok) {
+    saveSkillCandidate(resolved);
+    return resolved;
+  }
+  return existing.candidate;
 }
 
 export function distillSkillCandidate(
