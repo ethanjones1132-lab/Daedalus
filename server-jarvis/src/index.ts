@@ -282,6 +282,10 @@ const TOTAL_TURN_TIMEOUT_MS = Math.min(
   3_600_000,
   Math.max(60_000, Number(process.env.JARVIS_TOTAL_TURN_TIMEOUT_MS ?? 480_000) || 480_000),
 );
+const CRON_EXECUTION_DEADLINE_MS = Math.min(
+  3_600_000,
+  Math.max(1_000, Number(process.env.JARVIS_CRON_DEADLINE_MS ?? 240_000) || 240_000),
+);
 // First-token watchdog. See chatCompletionWithFallback for the upstream
 // implementation. This constant governs the orchestrator-level defense
 // in depth that aborts the read loop if the response body is open but
@@ -399,15 +403,21 @@ async function applyOutputMaxTokens(
  * bundles. Every surface (chat, cron, agent, mcp) now executes through this
  * same ToolRuntime contract; the chat surface composes the full bundle set.
  */
-function buildChatRuntime(cfg: JarvisConfig, workspacePath = cfg.jarvis_path): {
+function buildChatRuntime(
+  cfg: JarvisConfig,
+  workspacePath = cfg.jarvis_path,
+  signal?: AbortSignal,
+  surface: "chat" | "cron" = "chat",
+): {
   runtime: ToolRuntime;
   ctx: ExecutionContext;
 } {
   const runtime = createToolRuntime();
   registerStandardBundles(runtime);
 
-  const ctx = makeExecutionContext("chat", cfg, {
+  const ctx = makeExecutionContext(surface, cfg, {
     workspace_path: workspacePath,
+    signal,
   });
 
   return { runtime, ctx };
@@ -480,6 +490,8 @@ interface StreamJarvisOptions {
   history?: ChatHistoryMessage[];
   systemPromptOverride?: string;
   surface?: SurfaceType;
+  signal?: AbortSignal;
+  onComplete?: () => void;
 }
 
 // OpenClaw interfaces removed — Jarvis is now self-contained
@@ -1311,6 +1323,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
   const { readable, writable } = new TransformStream();
   const rawWriter = writable.getWriter();
   const encoder = new TextEncoder();
+  let completionNotified = false;
+  const notifyCompletion = (): void => {
+    if (completionNotified) return;
+    completionNotified = true;
+    try { options.onComplete?.(); } catch {}
+  };
   totalRequests++;
   let _turnStart = Date.now();
 
@@ -1320,6 +1338,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     // stay stage-local and must never abort this controller.
     const streamLease = activeStreams.begin(sessionId);
     const streamAbort = streamLease.controller;
+    const cleanupExternalAbort = options.signal
+      ? registerAbortHandler(options.signal, () => {
+        if (!streamAbort.signal.aborted) streamAbort.abort(options.signal?.reason ?? "Cron execution cancelled");
+      })
+      : () => {};
     let admissionLease: AdmissionLease | undefined;
     let clientDisconnected = false;
     const writeBytes = createDisconnectAwareWrite(
@@ -1525,7 +1548,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       }
 
       // ── Build canonical tool runtime for this request ───────────
-      const { runtime, ctx } = buildChatRuntime(cfg, activeWorkspacePath);
+      const { runtime, ctx } = buildChatRuntime(
+        cfg,
+        activeWorkspacePath,
+        streamAbort.signal,
+        surface === "cron" ? "cron" : "chat",
+      );
       // Patch the execution context with the active session ID so
       // interactive tools (ask_user_question) can scope state per-session.
       ctx.session_id = sessionId;
@@ -4797,11 +4825,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     } finally {
       stopHeartbeat();
       admissionLease?.release();
+      cleanupExternalAbort();
       streamLease.release();
       try {
         await session.ensureTerminal();
       } catch {}
       try { await writer.close(); } catch {}
+      notifyCompletion();
     }
   })();
 
@@ -5258,10 +5288,21 @@ export async function baseFetch(req: Request): Promise<Response> {
     if (path === "/cron/run" && req.method === "POST") {
       const body = await req.json().catch(() => ({}));
       return handleCronRunRequest(body as Record<string, unknown>, {
-        stream: streamJarvis,
+        stream: async (prompt, sessionId, options) => {
+          let resolveCompletion!: () => void;
+          const completion = new Promise<void>((resolve) => { resolveCompletion = resolve; });
+          const response = await streamJarvis(prompt, sessionId, {
+            ...options,
+            onComplete: resolveCompletion,
+          });
+          return { response, completion };
+        },
         validateProjection: (snapshot) => validateLifecycleSnapshot(agentLifecycle, snapshot as LifecycleSnapshot),
         refreshInferenceFeedback,
         feedbackJobId: INFERENCE_FEEDBACK_CRON_JOB_ID,
+      }, {
+        signal: req.signal,
+        deadlineMs: CRON_EXECUTION_DEADLINE_MS,
       });
     }
     if (path === "/chat/stream" && req.method === "POST") {

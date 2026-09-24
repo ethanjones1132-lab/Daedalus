@@ -187,7 +187,50 @@ describe("Cron stream draining", () => {
       output: "partial",
     });
   });
+
+  test("cancels the response reader and settles an aborted Cron stream", async () => {
+    const controller = new AbortController();
+    let cancelled = false;
+    const response = delayedResponse(100, () => { cancelled = true; });
+    const resultPromise = drainCronStreamJarvisResponse(response, undefined, { signal: controller.signal });
+
+    controller.abort("request aborted");
+
+    const outcome = await resultPromise;
+    expect(cancelled).toBe(true);
+    expect(outcome).toMatchObject({
+      success: false,
+      status: "cancelled",
+      error_code: "cancelled",
+      output: "partial",
+    });
+  });
 });
+
+function delayedResponse(
+  delayMs: number,
+  onCancel: () => void = () => {},
+  onLateResult: () => void = () => {},
+): Response {
+  let cancelled = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode(frame("stream_event", { delta: { text: "partial" } })));
+      timer = setTimeout(() => {
+        if (cancelled) return;
+        onLateResult();
+        controller.enqueue(encoder.encode(frame("result", { subtype: "success", is_error: false, result: "late success" })));
+        controller.close();
+      }, delayMs);
+    },
+    cancel() {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      onCancel();
+    },
+  }));
+}
 
 describe("Cron inference route", () => {
   test("returns successful evidence for an authoritative result", async () => {
@@ -327,5 +370,108 @@ describe("Cron inference route", () => {
       execution_evidence: { error_code: "projection_invalid" },
     });
     expect(streamCalls).toBe(0);
+  });
+
+  test("passes request cancellation to the exact stream and suppresses late results", async () => {
+    const request = new AbortController();
+    let streamSignal: AbortSignal | undefined;
+    let startedResolve!: () => void;
+    const started = new Promise<void>((resolve) => { startedResolve = resolve; });
+    let cancelled = false;
+    let lateResult = false;
+    const response = delayedResponse(100, () => { cancelled = true; }, () => { lateResult = true; });
+    const resultPromise = runCronInference(
+      { prompt: "do work" },
+      makeDependencies(new Response(null), {
+        stream: async (_prompt, _sessionId, options) => {
+          streamSignal = options.signal;
+          startedResolve();
+          return response;
+        },
+      }),
+      { signal: request.signal },
+    );
+
+    await started;
+    request.abort("request aborted");
+    const result = await resultPromise;
+    await Bun.sleep(120);
+
+    expect(streamSignal?.aborted).toBe(true);
+    expect(cancelled).toBe(true);
+    expect(lateResult).toBe(false);
+    expect(result).toMatchObject({
+      success: false,
+      output: "partial",
+      execution_evidence: {
+        status: "cancelled",
+        error_code: "cancelled",
+      },
+    });
+  });
+
+  test("waits for the active stream producer to finish after cancellation", async () => {
+    const request = new AbortController();
+    let startedResolve!: () => void;
+    const started = new Promise<void>((resolve) => { startedResolve = resolve; });
+    let releaseCompletion!: () => void;
+    let producerCompleted = false;
+    const response = delayedResponse(100);
+    const completion = new Promise<void>((resolve) => {
+      releaseCompletion = () => {
+        producerCompleted = true;
+        resolve();
+      };
+    });
+    const resultPromise = runCronInference(
+      { prompt: "do work" },
+      makeDependencies(new Response(null), {
+        stream: async () => {
+          startedResolve();
+          return { response, completion };
+        },
+      }),
+      { signal: request.signal },
+    );
+
+    await started;
+    request.abort("request aborted");
+    let settled = false;
+    void resultPromise.then(() => { settled = true; });
+    await Bun.sleep(20);
+    expect(settled).toBe(false);
+    releaseCompletion();
+
+    const result = await resultPromise;
+    expect(producerCompleted).toBe(true);
+    expect(result.execution_evidence?.status).toBe("cancelled");
+  });
+
+  test("returns a stable timeout outcome when the production deadline expires", async () => {
+    let streamSignal: AbortSignal | undefined;
+    let lateResult = false;
+    const response = delayedResponse(100, () => {}, () => { lateResult = true; });
+    const result = await runCronInference(
+      { prompt: "do work" },
+      makeDependencies(new Response(null), {
+        stream: async (_prompt, _sessionId, options) => {
+          streamSignal = options.signal;
+          return response;
+        },
+      }),
+      { deadlineMs: 15 },
+    );
+    await Bun.sleep(120);
+
+    expect(streamSignal?.aborted).toBe(true);
+    expect(lateResult).toBe(false);
+    expect(result).toMatchObject({
+      success: false,
+      output: "partial",
+      execution_evidence: {
+        status: "timeout",
+        error_code: "cron_deadline_exceeded",
+      },
+    });
   });
 });

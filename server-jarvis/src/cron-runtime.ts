@@ -32,7 +32,12 @@ export interface CronRunRequest {
   config?: Partial<JarvisConfig>;
 }
 
-export interface RetryOptions {
+export interface CronRunOptions {
+  signal?: AbortSignal;
+  deadlineMs?: number;
+}
+
+export interface RetryOptions extends CronRunOptions {
   /** Maximum execution attempts for this cron run. Defaults to 3. */
   maxAttempts?: number;
   /** Milliseconds to wait between attempts. Defaults to 1000. */
@@ -51,6 +56,7 @@ export interface CronRunResult {
   boundary: ActivationBoundary;
   results: ToolResult[];
   error?: string;
+  status?: "cancelled" | "timeout";
   queue_wait_ms?: number;
 }
 
@@ -91,28 +97,93 @@ const CRON_TOOL_TIMEOUT_MS = Math.max(
   60_000,
   Number(process.env.JARVIS_CRON_TOOL_TIMEOUT_MS ?? 900_000) || 900_000,
 );
+const CRON_TIMEOUT_REASON = "cron_timeout";
+const CRON_CANCEL_REASON = "cron_cancelled";
 const cronAdmission = new OrchestrationAdmissionController({ interactive: 2, background: 1 });
 
-/**
- * Execute a single tool call with a timeout.
- * If the tool hangs beyond CRON_TOOL_TIMEOUT_MS, we return an error result
- * rather than leaving the cron job idle until the Hermes watchdog kills it.
- */
+function statusForSignal(signal: AbortSignal | undefined): "cancelled" | "timeout" | undefined {
+  if (!signal?.aborted) return undefined;
+  return signal.reason === CRON_TIMEOUT_REASON ? "timeout" : "cancelled";
+}
+
 async function executeWithTimeout(
   runtime: ToolRuntime,
   call: ToolCall,
   ctx: ExecutionContext,
-): Promise<ToolResult> {
-  const result = await Promise.race([
-    runtime.execute(call, ctx),
-    new Promise<ToolResult>((_, reject) =>
-      setTimeout(
-        () => reject(new Error(`Cron tool execution timed out after ${CRON_TOOL_TIMEOUT_MS}ms`)),
-        CRON_TOOL_TIMEOUT_MS,
-      ),
-    ),
+  signal: AbortSignal | undefined,
+  deadlineAt: number | undefined,
+  controller: AbortController | undefined,
+): Promise<{ result: ToolResult; status?: "cancelled" | "timeout" }> {
+  const initialStatus = statusForSignal(signal);
+  if (initialStatus) {
+    return {
+      result: {
+        call_id: call.id,
+        name: call.name,
+        output: "",
+        is_error: true,
+        error: initialStatus === "timeout" ? "Cron execution deadline exceeded" : "Cron execution cancelled",
+        error_code: "handler_error",
+        duration_ms: 0,
+      },
+      status: initialStatus,
+    };
+  }
+
+  const execution = runtime.execute(call, ctx);
+  let stopTimer: ReturnType<typeof setTimeout> | undefined;
+  let stopResolve: ((status: "cancelled" | "timeout") => void) | undefined;
+  const stopPromise = new Promise<"cancelled" | "timeout">((resolve) => {
+    stopResolve = resolve;
+  });
+  const onAbort = (): void => stopResolve?.(statusForSignal(signal) ?? "cancelled");
+  if (signal) {
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  }
+  const effectiveDeadline = Math.min(
+    Date.now() + CRON_TOOL_TIMEOUT_MS,
+    deadlineAt ?? Number.POSITIVE_INFINITY,
+  );
+  stopTimer = setTimeout(() => {
+    controller?.abort(CRON_TIMEOUT_REASON);
+    stopResolve?.("timeout");
+  }, Math.max(0, effectiveDeadline - Date.now()));
+
+  const outcome = await Promise.race([
+    execution.then((result) => ({ kind: "result" as const, result })),
+    stopPromise.then((status) => ({ kind: "stop" as const, status })),
   ]);
-  return result;
+  if (signal) signal.removeEventListener("abort", onAbort);
+  if (stopTimer) clearTimeout(stopTimer);
+
+  const stoppedResult = (stoppedStatus: "cancelled" | "timeout"): {
+    result: ToolResult;
+    status: "cancelled" | "timeout";
+  } => ({
+    result: {
+      call_id: call.id,
+      name: call.name,
+      output: "",
+      is_error: true,
+      error: stoppedStatus === "timeout"
+        ? `Cron tool execution timed out after ${CRON_TOOL_TIMEOUT_MS}ms`
+        : "Cron execution cancelled",
+      error_code: "handler_error",
+      duration_ms: 0,
+    },
+    status: stoppedStatus,
+  });
+  if (outcome.kind === "result") {
+    const resultStatus = statusForSignal(signal);
+    if (!resultStatus) return { result: outcome.result };
+    controller?.abort(resultStatus === "timeout" ? CRON_TIMEOUT_REASON : CRON_CANCEL_REASON);
+    await execution.catch(() => undefined);
+    return stoppedResult(resultStatus);
+  }
+  controller?.abort(outcome.status === "timeout" ? CRON_TIMEOUT_REASON : CRON_CANCEL_REASON);
+  await execution.catch(() => undefined);
+  return stoppedResult(outcome.status);
 }
 
 function evidenceDir(cfg: JarvisConfig): string {
@@ -137,6 +208,7 @@ function persistEvidence(evidence: ExecutionEvidence, cfg: JarvisConfig): void {
 function classifyStatus(result: CronRunResult): ExecutionEvidence["status"] {
   if (result.ok) return "success";
   if (result.error === "background_deferred") return "background_deferred";
+  if (result.status) return result.status;
   const timedOut = result.results.some(
     (r) =>
       r.is_error &&
@@ -162,8 +234,8 @@ function buildEvidence(result: CronRunResult, run_id: string): ExecutionEvidence
       .join("\n")
       .slice(0, 500);
   } else {
-    evidence.error_code = failed?.error_code || status;
-    evidence.acceptance_result = failed?.error || result.error || status;
+    evidence.error_code = result.status || failed?.error_code || status;
+    evidence.acceptance_result = result.error || failed?.error || status;
   }
 
   return evidence;
@@ -173,22 +245,72 @@ export async function runCronRequest(
   req: CronRunRequest,
   cfg: JarvisConfig,
   runtime?: ToolRuntime,
+  options: CronRunOptions = {},
 ): Promise<CronRunResult> {
   const boundary = restoreBoundary(req.slug);
   const rt: ToolRuntime = runtime ?? createToolRuntime();
   if (!runtime) registerStandardBundles(rt);
+  const deadlineAt = options.deadlineMs !== undefined && Number.isFinite(options.deadlineMs)
+    ? Date.now() + Math.max(0, options.deadlineMs)
+    : undefined;
+  const controller = new AbortController();
+  let requestedStatus: "cancelled" | "timeout" | undefined;
+  const abort = (status: "cancelled" | "timeout"): void => {
+    requestedStatus ??= status;
+    if (!controller.signal.aborted) {
+      controller.abort(status === "timeout" ? CRON_TIMEOUT_REASON : CRON_CANCEL_REASON);
+    }
+  };
+  const onExternalAbort = (): void => abort("cancelled");
+  if (options.signal) {
+    if (options.signal.aborted) onExternalAbort();
+    else options.signal.addEventListener("abort", onExternalAbort, { once: true });
+  }
+  const deadlineTimer = deadlineAt !== undefined
+    ? setTimeout(() => abort("timeout"), Math.max(0, deadlineAt - Date.now()))
+    : undefined;
+  const signal = controller.signal;
+  const cleanup = (): void => {
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+    options.signal?.removeEventListener("abort", onExternalAbort);
+  };
+  const stopped = (): "cancelled" | "timeout" | undefined => {
+    return requestedStatus
+      ?? statusForSignal(signal)
+      ?? (deadlineAt !== undefined && Date.now() >= deadlineAt ? "timeout" : undefined);
+  };
+  const stopResult = (status: "cancelled" | "timeout"): CronRunResult => ({
+    ok: false,
+    slug: req.slug,
+    boundary,
+    results: [],
+    status,
+    error: status === "timeout" ? "Cron execution deadline exceeded" : "Cron execution cancelled",
+  });
+
+  const initialStop = stopped();
+  if (initialStop) {
+    cleanup();
+    return stopResult(initialStop);
+  }
+
   const ctx = makeExecutionContext("cron", cfg, {
     interactive: false,
     workspace_path: cfg.jarvis_path,
+    signal,
   });
 
   let lease: AdmissionLease;
   try {
     lease = await cronAdmission.acquire({
       workClass: "background",
-      deadlineAt: Date.now() + CRON_TOOL_TIMEOUT_MS,
+      signal,
+      deadlineAt: deadlineAt ?? Date.now() + CRON_TOOL_TIMEOUT_MS,
     });
   } catch {
+    const status = stopped() ?? "failed";
+    cleanup();
+    if (status === "cancelled" || status === "timeout") return stopResult(status);
     return {
       ok: false,
       slug: req.slug,
@@ -199,11 +321,18 @@ export async function runCronRequest(
   }
 
   const results: ToolResult[] = [];
+  let status: "cancelled" | "timeout" | undefined;
   try {
     for (const call of req.tools) {
+      status = stopped();
+      if (status) break;
       try {
-        const result = await executeWithTimeout(rt, call, ctx);
-        results.push(result);
+        const execution = await executeWithTimeout(rt, call, ctx, signal, deadlineAt, controller);
+        results.push(execution.result);
+        if (execution.status) {
+          status = execution.status;
+          break;
+        }
       } catch (e: any) {
         results.push({
           call_id: call.id,
@@ -219,24 +348,50 @@ export async function runCronRequest(
   } finally {
     lease.release();
   }
+  cleanup();
 
   return {
-    ok: results.every((result) => !result.is_error),
+    ok: !status && results.every((result) => !result.is_error),
     slug: req.slug,
     boundary,
     results,
+    status,
+    error: status === "timeout"
+      ? "Cron execution deadline exceeded"
+      : status === "cancelled"
+        ? "Cron execution cancelled"
+        : undefined,
     queue_wait_ms: lease.queue_wait_ms,
   };
 }
 
-/**
- * Run a cron request with bounded retries, producing durable `ExecutionEvidence`
- * for every attempt. Failed evidence is persisted to disk before the next attempt
- * so operators can reconstruct the retry trail even if the process restarts.
- *
- * The runner stops as soon as an attempt succeeds or the maximum number of
- * attempts is exhausted.
- */
+function waitForRetryDelay(
+  delayMs: number,
+  signal: AbortSignal | undefined,
+  deadlineAt: number | undefined,
+): Promise<boolean> {
+  if (signal?.aborted || (deadlineAt !== undefined && Date.now() >= deadlineAt)) {
+    return Promise.resolve(false);
+  }
+  if (delayMs <= 0) return Promise.resolve(true);
+
+  return new Promise((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (value: boolean): void => {
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(value);
+    };
+    const onAbort = (): void => finish(false);
+    const remaining = deadlineAt === undefined ? delayMs : Math.min(delayMs, deadlineAt - Date.now());
+    timer = setTimeout(() => finish(deadlineAt === undefined || Date.now() < deadlineAt), Math.max(0, remaining));
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
+  });
+}
+
 export async function runCronWithRetries(
   req: CronRunRequest,
   cfg: JarvisConfig,
@@ -246,13 +401,22 @@ export async function runCronWithRetries(
   const retryDelayMs = Math.max(0, opts.retryDelayMs ?? 1000);
   const runtime = opts.runtime ?? createToolRuntime();
   if (!opts.runtime) registerStandardBundles(runtime);
+  const signal = opts.signal;
+  const deadlineAt = opts.deadlineMs !== undefined && Number.isFinite(opts.deadlineMs)
+    ? Date.now() + Math.max(0, opts.deadlineMs)
+    : undefined;
 
   const evidenceList: ExecutionEvidence[] = [];
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (signal?.aborted || (deadlineAt !== undefined && Date.now() >= deadlineAt)) break;
     const run_id = randomUUID();
     const startedAt = new Date().toISOString();
-    const result = await runCronRequest(req, cfg, runtime);
+    const remaining = deadlineAt === undefined ? undefined : Math.max(0, deadlineAt - Date.now());
+    const result = await runCronRequest(req, cfg, runtime, {
+      signal,
+      deadlineMs: remaining,
+    });
     const evidence: ExecutionEvidence = {
       ...buildEvidence(result, run_id),
       started_at: startedAt,
@@ -262,10 +426,9 @@ export async function runCronWithRetries(
     persistEvidence(evidence, cfg);
     evidenceList.push(evidence);
 
-    if (result.ok || attempt === maxAttempts) break;
-    if (retryDelayMs > 0) {
-      await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
-    }
+    if (result.ok || result.status || attempt === maxAttempts || signal?.aborted) break;
+    if (deadlineAt !== undefined && Date.now() >= deadlineAt) break;
+    if (retryDelayMs > 0 && !(await waitForRetryDelay(retryDelayMs, signal, deadlineAt))) break;
   }
 
   return evidenceList;

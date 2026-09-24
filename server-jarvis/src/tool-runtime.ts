@@ -64,6 +64,7 @@ export interface ExecutionContext {
   workspace_path?: string;
   /** Absolute roots explicitly granted by raw user messages for this Session. */
   session_grants?: string[];
+  signal?: AbortSignal;
   /** Pre/post content hashes recorded by filesystem write handlers for effect gating. */
   write_effects?: WriteEffectObservation[];
   /**
@@ -361,11 +362,32 @@ export function createToolRuntime(): ToolRuntime {
         };
       }
     }
-    // "allow": proceed directly
+    if (ctx.signal?.aborted) {
+      return {
+        call_id: call.id,
+        name: call.name,
+        output: "Tool execution cancelled",
+        is_error: true,
+        error: "Tool execution cancelled",
+        error_code: "handler_error",
+        duration_ms: Date.now() - start,
+      };
+    }
 
     // Execute handler — catch all throws
     try {
       const output = await entry.handler(callArguments, ctx);
+      if (ctx.signal?.aborted) {
+        return {
+          call_id: call.id,
+          name: call.name,
+          output: "Tool execution cancelled",
+          is_error: true,
+          error: "Tool execution cancelled",
+          error_code: "handler_error",
+          duration_ms: Date.now() - start,
+        };
+      }
       return {
         call_id: call.id,
         name: call.name,

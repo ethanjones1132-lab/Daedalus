@@ -226,4 +226,100 @@ describe("runCronWithRetries contract", () => {
 
     rmSync(tmp, { recursive: true, force: true });
   });
+
+  it("passes cancellation to the tool execution context and stops the request", async () => {
+    const controller = new AbortController();
+    let startedResolve!: () => void;
+    const started = new Promise<void>((resolve) => { startedResolve = resolve; });
+    let observedSignal: AbortSignal | undefined;
+    const runtime = createToolRuntime();
+    runtime.register(makeTool("cancellable"), async (_args, ctx) => {
+      observedSignal = ctx.signal;
+      startedResolve();
+      await new Promise<void>((resolve) => {
+        const fallback = setTimeout(resolve, 100);
+        ctx.signal?.addEventListener("abort", () => {
+          clearTimeout(fallback);
+          resolve();
+        }, { once: true });
+      });
+      return "late result";
+    });
+
+    const pending = runCronRequest(
+      { slug: "cancel-test", prompt: "wait", tools: [{ id: "call-1", name: "cancellable", arguments: {} }] },
+      defaultConfig(),
+      runtime,
+      { signal: controller.signal },
+    );
+    await started;
+    controller.abort("request aborted");
+
+    const result = await pending;
+    expect(observedSignal?.aborted).toBe(true);
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe("cancelled");
+  });
+
+  it("reports a timeout and aborts the active tool before retrying", async () => {
+    let startedResolve!: () => void;
+    const started = new Promise<void>((resolve) => { startedResolve = resolve; });
+    let observedSignal: AbortSignal | undefined;
+    let calls = 0;
+    const runtime = createToolRuntime();
+    runtime.register(makeTool("deadline_tool"), async (_args, ctx) => {
+      calls += 1;
+      observedSignal = ctx.signal;
+      startedResolve();
+      await new Promise<void>((resolve) => {
+        const fallback = setTimeout(resolve, 100);
+        ctx.signal?.addEventListener("abort", () => {
+          clearTimeout(fallback);
+          resolve();
+        }, { once: true });
+      });
+      return "late result";
+    });
+
+    const evidence = await runCronWithRetries(
+      { slug: "deadline-test", prompt: "wait", tools: [{ id: "call-1", name: "deadline_tool", arguments: {} }] },
+      defaultConfig(),
+      { maxAttempts: 2, retryDelayMs: 0, runtime, deadlineMs: 15 },
+    );
+
+    expect(calls).toBe(1);
+    expect(observedSignal?.aborted).toBe(true);
+    expect(evidence).toHaveLength(1);
+    expect(evidence[0]?.status).toBe("timeout");
+  });
+
+  it("does not start another attempt after cancellation", async () => {
+    const controller = new AbortController();
+    let startedResolve!: () => void;
+    const started = new Promise<void>((resolve) => { startedResolve = resolve; });
+    let calls = 0;
+    const runtime = createToolRuntime();
+    runtime.register(makeTool("cancel_retry"), async () => {
+      calls += 1;
+      if (calls === 1) {
+        startedResolve();
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        throw new Error("first attempt failed");
+      }
+      return "late retry";
+    });
+
+    const evidencePromise = runCronWithRetries(
+      { slug: "cancel-retry-test", prompt: "fail once", tools: [{ id: "call-1", name: "cancel_retry", arguments: {} }] },
+      defaultConfig(),
+      { maxAttempts: 3, retryDelayMs: 0, runtime, signal: controller.signal },
+    );
+    await started;
+    controller.abort("request aborted");
+
+    const evidence = await evidencePromise;
+    expect(calls).toBe(1);
+    expect(evidence).toHaveLength(1);
+    expect(evidence[0]?.status).toBe("cancelled");
+  });
 });

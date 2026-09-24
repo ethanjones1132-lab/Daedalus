@@ -1,4 +1,6 @@
 export const MAX_CRON_OUTPUT_LENGTH = 500;
+export const CRON_CANCELLED_CODE = "cancelled";
+export const CRON_DEADLINE_CODE = "cron_deadline_exceeded";
 
 export type CronExecutionStatus = "success" | "failed" | "cancelled" | "timeout";
 
@@ -34,6 +36,22 @@ export interface CronTerminalAccumulator {
 export interface CronStreamOptions {
   surface: "cron";
   systemPromptOverride?: string;
+  signal?: AbortSignal;
+  onComplete?: () => void;
+}
+
+export interface CronStreamResult {
+  response: Response;
+  completion?: Promise<void>;
+}
+
+export interface CronExecutionOptions {
+  signal?: AbortSignal;
+  deadlineMs?: number;
+}
+
+export interface CronStreamDrainOptions {
+  signal?: AbortSignal;
 }
 
 export interface CronProjectionValidation {
@@ -51,12 +69,120 @@ export interface CronFeedbackResult {
 }
 
 export interface CronInferenceDependencies {
-  stream: (prompt: string, sessionId: string, options: CronStreamOptions) => Promise<Response>;
+  stream: (
+    prompt: string,
+    sessionId: string,
+    options: CronStreamOptions,
+  ) => Promise<Response | CronStreamResult>;
   validateProjection: (snapshot: unknown) => CronProjectionValidation;
   refreshInferenceFeedback: () => Promise<CronFeedbackResult>;
   feedbackJobId: string;
   now?: () => string;
   uuid?: () => string;
+}
+
+class CronStreamAbortError extends Error {
+  constructor(
+    readonly status: "cancelled" | "timeout",
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "CronStreamAbortError";
+  }
+}
+
+interface CronStopDetails {
+  status: "cancelled" | "timeout";
+  code: string;
+  message: string;
+}
+
+function stopDetails(signal: AbortSignal): CronStopDetails {
+  const reason = signal.reason;
+  if (reason instanceof CronStreamAbortError) {
+    return { status: reason.status, code: reason.code, message: reason.message };
+  }
+  return {
+    status: "cancelled",
+    code: CRON_CANCELLED_CODE,
+    message: "Cron execution cancelled",
+  };
+}
+
+function createStopError(status: "cancelled" | "timeout"): CronStreamAbortError {
+  return status === "timeout"
+    ? new CronStreamAbortError(status, CRON_DEADLINE_CODE, "Cron execution deadline exceeded")
+    : new CronStreamAbortError(status, CRON_CANCELLED_CODE, "Cron execution cancelled");
+}
+
+function createExecutionController(options: CronExecutionOptions): {
+  signal: AbortSignal;
+  dispose: () => void;
+} {
+  const controller = new AbortController();
+  const stop = (status: "cancelled" | "timeout"): void => {
+    if (!controller.signal.aborted) controller.abort(createStopError(status));
+  };
+  const onExternalAbort = (): void => stop("cancelled");
+  if (options.signal) {
+    if (options.signal.aborted) onExternalAbort();
+    else options.signal.addEventListener("abort", onExternalAbort, { once: true });
+  }
+  const deadlineMs = options.deadlineMs;
+  const deadline = deadlineMs !== undefined && Number.isFinite(deadlineMs) && deadlineMs > 0
+    ? setTimeout(() => stop("timeout"), deadlineMs)
+    : undefined;
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      if (deadline !== undefined) clearTimeout(deadline);
+      options.signal?.removeEventListener("abort", onExternalAbort);
+    },
+  };
+}
+
+function awaitWithSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new Error(stopDetails(signal).message));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(new Error(stopDetails(signal).message));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+function isCronStreamResult(value: Response | CronStreamResult): value is CronStreamResult {
+  return typeof value === "object" && value !== null && "response" in value;
+}
+
+function stoppedOutcome(signal: AbortSignal, output = ""): CronTerminalOutcome {
+  const details = stopDetails(signal);
+  return {
+    success: false,
+    output,
+    error: details.message,
+    status: details.status,
+    error_code: details.code,
+  };
+}
+
+function observeStop(accumulator: CronTerminalAccumulator, signal: AbortSignal): CronTerminalOutcome {
+  const details = stopDetails(signal);
+  if (details.status === "timeout") {
+    accumulator.observe({ type: "error", error: details.message, code: details.code });
+  } else {
+    accumulator.observe({ type: "cancelled" });
+  }
+  return accumulator.settle();
 }
 
 function recordValue(value: unknown): Record<string, unknown> | null {
@@ -193,9 +319,11 @@ export function createCronTerminalAccumulator(): CronTerminalAccumulator {
 export async function drainCronStreamJarvisResponse(
   response: Response,
   accumulator: CronTerminalAccumulator = createCronTerminalAccumulator(),
+  options: CronStreamDrainOptions = {},
 ): Promise<CronTerminalOutcome> {
   const reader = response.body?.getReader();
   if (!reader) {
+    if (options.signal?.aborted) return observeStop(accumulator, options.signal);
     return {
       success: false,
       output: "",
@@ -207,6 +335,26 @@ export async function drainCronStreamJarvisResponse(
 
   const decoder = new TextDecoder();
   let buffer = "";
+  let cancelPromise: Promise<void> | undefined;
+  const cancelReader = (): Promise<void> => {
+    cancelPromise ??= Promise.resolve()
+      .then(() => reader.cancel(options.signal?.reason))
+      .then(() => undefined);
+    return cancelPromise;
+  };
+  let rejectAbort: ((reason?: unknown) => void) | undefined;
+  const abortPromise = options.signal
+    ? new Promise<never>((_, reject) => { rejectAbort = reject; })
+    : undefined;
+  if (abortPromise) void abortPromise.catch(() => {});
+  const onAbort = (): void => {
+    void cancelReader().catch(() => {});
+    rejectAbort?.(new Error(stopDetails(options.signal as AbortSignal).message));
+  };
+  if (options.signal) {
+    if (options.signal.aborted) onAbort();
+    else options.signal.addEventListener("abort", onAbort, { once: true });
+  }
 
   const consumeLine = (line: string): void => {
     const trimmed = line.trim();
@@ -233,15 +381,24 @@ export async function drainCronStreamJarvisResponse(
 
   try {
     while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+      const read = reader.read();
+      const result = abortPromise ? await Promise.race([read, abortPromise]) : await read;
+      if (result.done) break;
+      buffer += decoder.decode(result.value, { stream: true });
       consumeBufferedLines(false);
     }
     buffer += decoder.decode();
     consumeBufferedLines(true);
+    if (options.signal?.aborted) return observeStop(accumulator, options.signal);
     return accumulator.settle();
+  } catch (error) {
+    if (options.signal?.aborted) {
+      await cancelReader().catch(() => {});
+      return observeStop(accumulator, options.signal);
+    }
+    throw error;
   } finally {
+    options.signal?.removeEventListener("abort", onAbort);
     reader.releaseLock();
   }
 }
@@ -279,97 +436,118 @@ function responseFromOutcome(
 export async function runCronInference(
   body: Record<string, unknown>,
   dependencies: CronInferenceDependencies,
+  executionOptions: CronExecutionOptions = {},
 ): Promise<CronRunResponse> {
   const now = dependencies.now ?? (() => new Date().toISOString());
   const uuid = dependencies.uuid ?? (() => crypto.randomUUID());
   const runId = uuid();
   const startedAt = now();
-
-  if (String(body.job_id ?? "") === dependencies.feedbackJobId) {
-    const refreshed = await dependencies.refreshInferenceFeedback();
-    const finishedAt = now();
-    const status: CronExecutionStatus = refreshed.success ? "success" : "failed";
-    return {
-      success: refreshed.success,
-      output: refreshed.output || (refreshed.success
-        ? `Applied ${refreshed.applied ?? 0} inference feedback adjustment(s).`
-        : ""),
-      error: refreshed.error,
-      execution_evidence: {
-        run_id: runId,
-        status,
-        started_at: startedAt,
-        finished_at: finishedAt,
-        acceptance_result: refreshed.output || status,
-        error_code: refreshed.error ? "refresh_failed" : undefined,
-      },
-    };
-  }
-
-  const prompt = String(body.prompt ?? "");
-  if (!prompt.trim()) {
-    return {
-      success: false,
-      output: "",
-      error: "prompt required",
-      execution_evidence: {
-        run_id: runId,
-        status: "failed",
-        started_at: startedAt,
-        finished_at: now(),
-        acceptance_result: "prompt required",
-        error_code: "missing_prompt",
-      },
-    };
-  }
-
-  const sessionId = String(body.session_id ?? `cron_${uuid()}`);
-  const projectionValue = body.projection_snapshot;
-  let canonicalInstructions: string | undefined;
-  if (projectionValue !== undefined && projectionValue !== null) {
-    if (typeof projectionValue !== "object" || typeof (projectionValue as { slug?: unknown }).slug !== "string") {
-      return {
-        success: false,
-        output: "",
-        error: "invalid projection snapshot",
-        execution_evidence: {
-          run_id: runId,
-          status: "failed",
-          started_at: startedAt,
-          finished_at: now(),
-          acceptance_result: "invalid projection snapshot",
-          error_code: "projection_invalid",
-        },
-      };
-    }
-    const validation = dependencies.validateProjection(projectionValue);
-    if (!validation.ok) {
-      const message = validation.message ?? "invalid projection snapshot";
-      return {
-        success: false,
-        output: "",
-        error: message,
-        execution_evidence: {
-          run_id: runId,
-          status: "failed",
-          started_at: startedAt,
-          finished_at: now(),
-          acceptance_result: message,
-          error_code: validation.code ?? "projection_invalid",
-        },
-      };
-    }
-    canonicalInstructions = validation.entry?.instructions;
-  }
+  const execution = createExecutionController(executionOptions);
 
   try {
-    const response = await dependencies.stream(prompt, sessionId, {
-      surface: "cron",
-      systemPromptOverride: canonicalInstructions,
+    if (execution.signal.aborted) {
+      return responseFromOutcome(stoppedOutcome(execution.signal), runId, startedAt, now());
+    }
+
+    if (String(body.job_id ?? "") === dependencies.feedbackJobId) {
+      const refreshed = await awaitWithSignal(
+        dependencies.refreshInferenceFeedback(),
+        execution.signal,
+      );
+      const finishedAt = now();
+      const status: CronExecutionStatus = refreshed.success ? "success" : "failed";
+      return {
+        success: refreshed.success,
+        output: refreshed.output || (refreshed.success
+          ? `Applied ${refreshed.applied ?? 0} inference feedback adjustment(s).`
+          : ""),
+        error: refreshed.error,
+        execution_evidence: {
+          run_id: runId,
+          status,
+          started_at: startedAt,
+          finished_at: finishedAt,
+          acceptance_result: refreshed.output || status,
+          error_code: refreshed.error ? "refresh_failed" : undefined,
+        },
+      };
+    }
+
+    const prompt = String(body.prompt ?? "");
+    if (!prompt.trim()) {
+      return {
+        success: false,
+        output: "",
+        error: "prompt required",
+        execution_evidence: {
+          run_id: runId,
+          status: "failed",
+          started_at: startedAt,
+          finished_at: now(),
+          acceptance_result: "prompt required",
+          error_code: "missing_prompt",
+        },
+      };
+    }
+
+    const sessionId = String(body.session_id ?? `cron_${uuid()}`);
+    const projectionValue = body.projection_snapshot;
+    let canonicalInstructions: string | undefined;
+    if (projectionValue !== undefined && projectionValue !== null) {
+      if (typeof projectionValue !== "object" || typeof (projectionValue as { slug?: unknown }).slug !== "string") {
+        return {
+          success: false,
+          output: "",
+          error: "invalid projection snapshot",
+          execution_evidence: {
+            run_id: runId,
+            status: "failed",
+            started_at: startedAt,
+            finished_at: now(),
+            acceptance_result: "invalid projection snapshot",
+            error_code: "projection_invalid",
+          },
+        };
+      }
+      const validation = dependencies.validateProjection(projectionValue);
+      if (!validation.ok) {
+        const message = validation.message ?? "invalid projection snapshot";
+        return {
+          success: false,
+          output: "",
+          error: message,
+          execution_evidence: {
+            run_id: runId,
+            status: "failed",
+            started_at: startedAt,
+            finished_at: now(),
+            acceptance_result: message,
+            error_code: validation.code ?? "projection_invalid",
+          },
+        };
+      }
+      canonicalInstructions = validation.entry?.instructions;
+    }
+
+    const streamValue = await awaitWithSignal(
+      dependencies.stream(prompt, sessionId, {
+        surface: "cron",
+        systemPromptOverride: canonicalInstructions,
+        signal: execution.signal,
+      }),
+      execution.signal,
+    );
+    const response = isCronStreamResult(streamValue) ? streamValue.response : streamValue;
+    const completion = isCronStreamResult(streamValue) ? streamValue.completion : undefined;
+    const outcome = await drainCronStreamJarvisResponse(response, undefined, {
+      signal: execution.signal,
     });
-    const outcome = await drainCronStreamJarvisResponse(response);
+    if (completion) await completion;
     return responseFromOutcome(outcome, runId, startedAt, now());
   } catch (error) {
+    if (execution.signal.aborted) {
+      return responseFromOutcome(stoppedOutcome(execution.signal), runId, startedAt, now());
+    }
     const message = error instanceof Error ? error.message : String(error);
     const safeMessage = message || "Cron inference failed";
     return responseFromOutcome({
@@ -379,12 +557,15 @@ export async function runCronInference(
       status: "failed",
       error_code: "exception",
     }, runId, startedAt, now());
+  } finally {
+    execution.dispose();
   }
 }
 
 export async function handleCronRunRequest(
   body: Record<string, unknown>,
   dependencies: CronInferenceDependencies,
+  executionOptions: CronExecutionOptions = {},
 ): Promise<Response> {
-  return Response.json(await runCronInference(body, dependencies));
+  return Response.json(await runCronInference(body, dependencies, executionOptions));
 }
