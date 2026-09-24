@@ -453,6 +453,7 @@ export function ChatPanel({
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
   const [sessionId, setSessionId] = useState<string>('');
+  const selectedSessionId = activeSession ?? '';
   const [error, setError] = useState<string | null>(null);
   // Orchestrator pipeline progress: e.g. "planner", "executor", "reviewer"
   const [pipelineStage, setPipelineStage] = useState<string>('');
@@ -1754,7 +1755,7 @@ export function ChatPanel({
         className="flex-1 overflow-y-auto mb-4 space-y-3 pr-1 min-h-0 scroll-smooth"
       >
         {loadingHistory && (
-          <div role="status" className="space-y-2">
+          <div role="status" aria-label="Session history loading" className="space-y-2">
             <span className="sr-only">Loading session history…</span>
             {[0, 1, 2].map(i => (
               <div
@@ -1775,7 +1776,7 @@ export function ChatPanel({
         )}
 
         {historyError && (
-          <div role="alert" className="rounded-xl border border-iron/30 p-3 text-sm text-bone-dim">
+          <div role="alert" aria-label="Session history error" className="rounded-xl border border-iron/30 p-3 text-sm text-bone-dim">
             <p>Could not load session history.</p>
             <button
               type="button"
@@ -1891,7 +1892,7 @@ export function ChatPanel({
           </div>
         )}
 
-        <WorkspaceGrantsChip sessionId={sessionId} isStreaming={isStreaming} />
+        <WorkspaceGrantsChip sessionId={selectedSessionId} isStreaming={isStreaming} />
 
         {/* M4 — unified activity feed (agentSteps + toolCalls + pipelineStage). */}
         {(() => {

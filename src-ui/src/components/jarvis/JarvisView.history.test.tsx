@@ -24,6 +24,7 @@ function mockHistory(load: (id: string) => Promise<unknown>) {
     if (command === 'jarvis_list_sessions') return Promise.resolve(sessions);
     if (command === 'get_session_history') return load(args!.sessionId);
     if (command === 'get_all_session_runs') return Promise.resolve([]);
+    if (command === 'jarvis_get_session_grants') return Promise.resolve({ session_id: args?.sessionId, grants: [] });
     return Promise.resolve(null);
   });
 }
@@ -54,18 +55,18 @@ describe('Session history resource states', () => {
     mockHistory(load);
     render(<JarvisView />);
     await select('Alpha');
-    expect(transcript().getByRole('status')).toHaveTextContent('Loading session history');
+    expect(transcript().getByRole('status', { name: /Session history loading/ })).toHaveTextContent('Loading session history');
     expect(screen.queryByText(splash)).not.toBeInTheDocument();
     await act(async () => first.reject(new Error('sqlite unavailable')));
-    expect(transcript().getByRole('alert')).toHaveTextContent('Could not load session history');
+    expect(transcript().getByRole('alert', { name: /Session history error/ })).toHaveTextContent('Could not load session history');
     expect(screen.queryByText(splash)).not.toBeInTheDocument();
     fireEvent.click(transcript().getByRole('button', { name: 'Retry' }));
-    expect(transcript().queryByRole('alert')).not.toBeInTheDocument();
-    expect(transcript().getByRole('status')).toHaveTextContent('Loading session history');
+    expect(transcript().queryByRole('alert', { name: /Session history error/ })).not.toBeInTheDocument();
+    expect(transcript().getByRole('status', { name: /Session history loading/ })).toHaveTextContent('Loading session history');
     expect(transcript().queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
     await act(async () => retry.resolve([row('Restored message'), row('Restored message')]));
     expect(transcript().getAllByText('Restored message')).toHaveLength(1);
-    expect(transcript().queryByRole('status')).not.toBeInTheDocument();
+    expect(transcript().queryByRole('status', { name: /Session history loading/ })).not.toBeInTheDocument();
     expect(load.mock.calls).toEqual([['Alpha'], ['Alpha']]);
     expect(invokeMock).toHaveBeenCalledWith('get_session_history', { sessionId: 'Alpha', session_id: 'Alpha' });
   });
@@ -78,8 +79,8 @@ describe('Session history resource states', () => {
     expect(screen.queryByText(splash)).not.toBeInTheDocument();
     await act(async () => request.resolve([]));
     expect(screen.getByText(splash)).toBeInTheDocument();
-    expect(transcript().queryByRole('alert')).not.toBeInTheDocument();
-    expect(transcript().queryByRole('status')).not.toBeInTheDocument();
+    expect(transcript().queryByRole('alert', { name: /Session history error/ })).not.toBeInTheDocument();
+    expect(transcript().queryByRole('status', { name: /Session history loading/ })).not.toBeInTheDocument();
   });
 
   it.each(['resolve', 'reject'] as const)('ignores a late %s from a previous Session while the selected Session is pending', async (completion) => {
@@ -93,9 +94,9 @@ describe('Session history resource states', () => {
       if (completion === 'resolve') alpha.resolve([row('Wrong Session message')]);
       else alpha.reject(new Error('old failure'));
     });
-    expect(transcript().getByRole('status')).toHaveTextContent('Loading session history');
+    expect(transcript().getByRole('status', { name: /Session history loading/ })).toHaveTextContent('Loading session history');
     expect(screen.queryByText('Wrong Session message')).not.toBeInTheDocument();
-    expect(transcript().queryByRole('alert')).not.toBeInTheDocument();
+    expect(transcript().queryByRole('alert', { name: /Session history error/ })).not.toBeInTheDocument();
     await act(async () => beta.resolve([row('Selected Session message')]));
     expect(transcript().getByText('Selected Session message')).toBeInTheDocument();
     expect(invokeMock).toHaveBeenCalledWith('cancel_chat_stream', { sessionId: 'Alpha', session_id: 'Alpha' });
@@ -108,13 +109,13 @@ describe('Session history resource states', () => {
     await select('Alpha');
     await select('New chat');
     expect(screen.getByText(splash)).toBeInTheDocument();
-    expect(transcript().queryByRole('status')).not.toBeInTheDocument();
+    expect(transcript().queryByRole('status', { name: /Session history loading/ })).not.toBeInTheDocument();
     await act(async () => {
       if (completion === 'resolve') request.resolve([row('Wrong Session message')]);
       else request.reject(new Error('old failure'));
     });
     expect(screen.queryByText('Wrong Session message')).not.toBeInTheDocument();
-    expect(transcript().queryByRole('alert')).not.toBeInTheDocument();
+    expect(transcript().queryByRole('alert', { name: /Session history error/ })).not.toBeInTheDocument();
     expect(screen.getByText(splash)).toBeInTheDocument();
   });
 
@@ -126,7 +127,7 @@ describe('Session history resource states', () => {
     expect(await transcript().findByText('Alpha history')).toBeInTheDocument();
     await select('Beta');
     expect(screen.queryByText('Alpha history')).not.toBeInTheDocument();
-    expect(transcript().getByRole('status')).toHaveTextContent('Loading session history');
+    expect(transcript().getByRole('status', { name: /Session history loading/ })).toHaveTextContent('Loading session history');
     expect(screen.queryByText('No messages yet')).not.toBeInTheDocument();
     await act(async () => beta.resolve([row('Beta history')]));
     expect(transcript().getByText('Beta history')).toBeInTheDocument();
@@ -138,10 +139,10 @@ describe('Session history resource states', () => {
     await select('Alpha');
     expect(await transcript().findByText('Alpha history')).toBeInTheDocument();
     await select('Beta');
-    expect(await transcript().findByRole('alert')).toHaveTextContent('Could not load session history');
+    expect(await transcript().findByRole('alert', { name: /Session history error/ })).toHaveTextContent('Could not load session history');
     expect(screen.queryByText('Alpha history')).not.toBeInTheDocument();
     await select('New chat');
-    expect(transcript().queryByRole('alert')).not.toBeInTheDocument();
+    expect(transcript().queryByRole('alert', { name: /Session history error/ })).not.toBeInTheDocument();
     expect(screen.getByText(splash)).toBeInTheDocument();
   });
 });

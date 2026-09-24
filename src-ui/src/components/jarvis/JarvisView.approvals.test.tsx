@@ -91,6 +91,7 @@ beforeEach(() => {
   invokeMock.mockReset();
   invokeMock.mockImplementation(async (command: string) => {
     if (command === 'get_session_history') return [];
+    if (command === 'jarvis_get_session_grants') return { session_id: 'session-1', grants: [] };
     return true;
   });
   listeners.clear();
@@ -149,6 +150,7 @@ describe('ChatPanel tool approval decisions', () => {
     invokeMock.mockImplementation((command: string) => {
       if (command === 'get_session_history') return Promise.resolve([]);
       if (command === 'jarvis_tool_decision') return pending.promise;
+      if (command === 'jarvis_get_session_grants') return Promise.resolve({ session_id: 'session-1', grants: [] });
       return Promise.resolve(true);
     });
     const user = userEvent.setup();
@@ -176,6 +178,7 @@ describe('ChatPanel tool approval decisions', () => {
     invokeMock.mockImplementation((command: string) => {
       if (command === 'get_session_history') return Promise.resolve([]);
       if (command === 'jarvis_tool_decision') return pending.promise;
+      if (command === 'jarvis_get_session_grants') return Promise.resolve({ session_id: 'session-1', grants: [] });
       return Promise.resolve(true);
     });
     await renderPanel();
@@ -229,6 +232,7 @@ describe('ChatPanel tool approval decisions', () => {
     invokeMock.mockImplementation((command: string) => {
       if (command === 'get_session_history') return Promise.resolve([]);
       if (command === 'jarvis_tool_decision') return pending.promise;
+      if (command === 'jarvis_get_session_grants') return Promise.resolve({ session_id: 'session-1', grants: [] });
       return Promise.resolve(true);
     });
     await renderPanel();
@@ -276,6 +280,7 @@ describe('ChatPanel tool approval decisions', () => {
         decisionAttempt += 1;
         return decisionAttempt === 1 ? first.promise : retry.promise;
       }
+      if (command === 'jarvis_get_session_grants') return Promise.resolve({ session_id: 'session-1', grants: [] });
       return Promise.resolve(true);
     });
     await renderPanel();
