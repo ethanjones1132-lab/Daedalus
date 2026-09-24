@@ -1,51 +1,161 @@
 import type { TaskType } from "../orchestration/coordinator";
 import type { StageName } from "../orchestration/coordinator";
 import { classifyTurnRequirements } from "../orchestration/turn-requirements";
+import { countTokens } from "../tokens";
+import { truncateToTokenBudget } from "../orchestration/context-budget";
 import type { SkillCandidate } from "./skill-types";
 import { listSkillCandidates } from "./skill-store";
+
+export const MAX_PROMOTED_SKILLS_PER_TURN = 3;
+export const PROMOTED_SKILL_BLOCK_BUDGET_TOKENS = 1_200;
+export const MAX_SKILL_OMISSION_SAMPLES = 5;
+
+export type SkillOmissionReason = "max_skills" | "token_budget";
+
+export interface SkillOmissionSample {
+  id: string;
+  name: string;
+  reason: SkillOmissionReason;
+  renderedTokens: number;
+}
 
 export interface ResolvedSkills {
   matched: SkillCandidate[];
   promptBlock: string;
+  promptTokens: number;
+  totalMatched: number;
+  omitted: {
+    count: number;
+    byReason: Record<SkillOmissionReason, number>;
+    samples: SkillOmissionSample[];
+  };
+}
+
+export interface ResolveSkillsOptions {
+  stage?: StageName;
+  maxSkills?: number;
+  maxTokens?: number;
 }
 
 function triggerMatches(candidate: SkillCandidate, taskType: TaskType, message: string): boolean {
   const { requirement, signals } = classifyTurnRequirements(message);
   const trigger = candidate.trigger;
-  if (!trigger.task_types.includes(taskType)) return false;
+  if (
+    !trigger
+    || !Array.isArray(trigger.task_types)
+    || !Array.isArray(trigger.requirements)
+    || !Array.isArray(trigger.signals)
+    || !trigger.task_types.includes(taskType)
+  ) return false;
   if (trigger.requirements.length > 0 && !trigger.requirements.includes(requirement)) return false;
   if (trigger.signals.length === 0) return true;
   return trigger.signals.some((sig) => signals.includes(sig));
 }
 
+function normalizeLimit(value: number | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.floor(value));
+}
+
+function renderSkill(candidate: SkillCandidate): string {
+  const name = typeof candidate.name === "string" && candidate.name.trim()
+    ? candidate.name
+    : candidate.id;
+  const body = typeof candidate.body === "string" ? candidate.body : "";
+  return `### ${name}\n${body}`;
+}
+
+function renderPrompt(header: string, selected: SkillCandidate[]): string {
+  if (selected.length === 0) return "";
+  return `${header}\n\n${selected.map(renderSkill).join("\n\n")}`;
+}
+
+function emptyResolution(): ResolvedSkills {
+  return {
+    matched: [],
+    promptBlock: "",
+    promptTokens: 0,
+    totalMatched: 0,
+    omitted: {
+      count: 0,
+      byReason: { max_skills: 0, token_budget: 0 },
+      samples: [],
+    },
+  };
+}
+
 export function resolveSkillsForTurn(
   message: string,
   taskType: TaskType,
-  stage?: StageName,
+  stageOrOptions?: StageName | ResolveSkillsOptions,
 ): ResolvedSkills {
+  const options = typeof stageOrOptions === "string"
+    ? { stage: stageOrOptions }
+    : stageOrOptions ?? {};
+  const maxSkills = normalizeLimit(options.maxSkills, MAX_PROMOTED_SKILLS_PER_TURN);
+  const maxTokens = normalizeLimit(options.maxTokens, PROMOTED_SKILL_BLOCK_BUDGET_TOKENS);
   const candidates = listSkillCandidates("promoted");
-  const matched = candidates.filter((c) => triggerMatches(c, taskType, message));
+  const allMatches = candidates.filter((candidate) => triggerMatches(candidate, taskType, message));
+  if (allMatches.length === 0) return emptyResolution();
 
-  if (matched.length === 0) {
-    return { matched: [], promptBlock: "" };
+  const header = options.stage
+    ? `Promoted distilled skills for ${options.stage}:`
+    : "Promoted distilled skills for this turn:";
+  const selected: SkillCandidate[] = [];
+  const omitted: ResolvedSkills["omitted"] = {
+    count: 0,
+    byReason: { max_skills: 0, token_budget: 0 },
+    samples: [],
+  };
+
+  for (const candidate of allMatches) {
+    if (selected.length >= maxSkills) {
+      omitted.count++;
+      omitted.byReason.max_skills++;
+      if (omitted.samples.length < MAX_SKILL_OMISSION_SAMPLES) {
+        omitted.samples.push({
+          id: candidate.id,
+          name: candidate.name,
+          reason: "max_skills",
+          renderedTokens: countTokens(renderSkill(candidate)),
+        });
+      }
+      continue;
+    }
+
+    const prospective = renderPrompt(header, [...selected, candidate]);
+    if (countTokens(prospective) > maxTokens) {
+      omitted.count++;
+      omitted.byReason.token_budget++;
+      if (omitted.samples.length < MAX_SKILL_OMISSION_SAMPLES) {
+        omitted.samples.push({
+          id: candidate.id,
+          name: candidate.name,
+          reason: "token_budget",
+          renderedTokens: countTokens(renderSkill(candidate)),
+        });
+      }
+      continue;
+    }
+
+    selected.push(candidate);
   }
 
-  const header = stage
-    ? `Promoted distilled skills for ${stage}:`
-    : "Promoted distilled skills for this turn:";
-  const body = matched
-    .map((s) => `### ${s.name}\n${s.body.slice(0, 2000)}`)
-    .join("\n\n");
-
+  const promptBlock = renderPrompt(header, selected);
   return {
-    matched,
-    promptBlock: `${header}\n\n${body}`,
+    matched: selected,
+    promptBlock,
+    promptTokens: countTokens(promptBlock),
+    totalMatched: allMatches.length,
+    omitted,
   };
 }
 
 export function appendSkillsToPrompt(basePrompt: string, skillsBlock: string): string {
   if (!skillsBlock.trim()) return basePrompt;
-  return [basePrompt, skillsBlock].filter(Boolean).join("\n\n");
+  const bounded = truncateToTokenBudget(skillsBlock.trim(), PROMOTED_SKILL_BLOCK_BUDGET_TOKENS);
+  return [basePrompt, bounded].filter(Boolean).join("\n\n");
 }
 
 // ═══════════════════════════════════════════════════════════════

@@ -1,4 +1,5 @@
 import type { SharedContextHints, StageName, WorkerInstructions } from "./coordinator";
+import { PROMOTED_SKILL_BLOCK_BUDGET_TOKENS } from "../intelligence/skill-resolver";
 import { truncateToTokenBudget } from "./context-budget";
 
 export interface InstructionVariantSelection {
@@ -76,7 +77,12 @@ export function resolveStagePrompt(
 ): string {
   const custom = workerInstructions?.[stage]?.trim();
   const sharedBlock = formatSharedContext(sharedContext);
-  const skills = distilledSkillsBlock?.trim();
+  const skills = (stage === "planner" || stage === "executor")
+    ? truncateToTokenBudget(
+      distilledSkillsBlock?.trim() ?? "",
+      PROMOTED_SKILL_BLOCK_BUDGET_TOKENS,
+    )
+    : "";
   const notes = (injectedNotes ?? [])
     .map((n) => n.trim().slice(0, 600))
     .filter(Boolean)

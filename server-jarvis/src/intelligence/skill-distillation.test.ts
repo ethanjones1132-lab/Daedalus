@@ -17,6 +17,7 @@ import {
 } from "./skill-promotion";
 import type { SkillCandidate } from "./skill-types";
 import type { TrajectorySnapshot } from "../self-tuning/store";
+import { countTokens } from "../tokens";
 import type { CallModelFn } from "../orchestration/coordinator";
 
 describe("skill distillation (Track C)", () => {
@@ -134,6 +135,152 @@ describe("skill distillation (Track C)", () => {
     const resolved = resolveSkillsForTurn("refactor the login handler and fix tests", "debug");
     expect(resolved.matched.length).toBeGreaterThan(0);
     expect(resolved.promptBlock).toContain("distilled-debug-test");
+  });
+
+  test("bounds many matches with deterministic omission diagnostics", () => {
+    const rows: SkillCandidate[] = [
+      ["skill-newest", "newest", "2026-09-24T04:00:00.000Z", "newest guidance"],
+      ["skill-middle", "middle", "2026-09-24T03:00:00.000Z", "middle guidance"],
+      ["skill-older", "older", "2026-09-24T02:00:00.000Z", "older guidance"],
+      ["skill-oldest", "oldest", "2026-09-24T01:00:00.000Z", "oldest guidance"],
+    ].map(([id, name, updatedAt, body]) => ({
+      id,
+      name,
+      description: `${name} description`,
+      trigger: { task_types: ["debug"] as const, requirements: ["full_execution"] as const, signals: ["mutation_verb"] },
+      body,
+      source_run_ids: [`run-${id}`],
+      confidence: 0.9,
+      status: "promoted" as const,
+      created_at: updatedAt,
+      updated_at: updatedAt,
+    }));
+    for (const row of rows.slice().reverse()) saveSkillCandidate(row);
+
+    const resolved = resolveSkillsForTurn(
+      "fix the failing import in src/auth.ts",
+      "debug",
+      { maxSkills: 2, maxTokens: 200 },
+    );
+
+    expect(resolved.matched.map((skill) => skill.id)).toEqual(["skill-newest", "skill-middle"]);
+    expect(resolved.totalMatched).toBe(4);
+    expect(resolved.omitted.byReason.max_skills).toBe(2);
+    expect(countTokens(resolved.promptBlock)).toBeLessThanOrEqual(200);
+  });
+
+  test("bounds omission samples while retaining the total omission count", () => {
+    for (let index = 0; index < 8; index++) {
+      const timestamp = `2026-09-24T00:00:${String(index).padStart(2, "0")}.000Z`;
+      saveSkillCandidate({
+        id: `skill-diagnostic-${index}`,
+        name: `diagnostic-${index}`,
+        description: "diagnostic",
+        trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: ["mutation_verb"] },
+        body: "diagnostic guidance",
+        source_run_ids: [`run-diagnostic-${index}`],
+        confidence: 0.9,
+        status: "promoted",
+        created_at: timestamp,
+        updated_at: timestamp,
+      });
+    }
+
+    const resolved = resolveSkillsForTurn(
+      "fix the failing import in src/auth.ts",
+      "debug",
+      { maxSkills: 1, maxTokens: 1_000 },
+    );
+
+    expect(resolved.totalMatched).toBe(8);
+    expect(resolved.omitted.count).toBe(7);
+    expect(resolved.omitted.samples).toHaveLength(5);
+    expect(resolved.omitted.samples.every((sample) => sample.reason === "max_skills")).toBe(true);
+  });
+
+  test("keeps a selected skill whole instead of slicing its body", () => {
+    const sentinel = "SKILL_BODY_END_SENTINEL";
+    const row: SkillCandidate = {
+      id: "skill-whole-body",
+      name: "whole-body",
+      description: "whole body",
+      trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: ["mutation_verb"] },
+      body: `SKILL_BODY_START\n${"x".repeat(2_100)}\n${sentinel}`,
+      source_run_ids: ["run-whole"],
+      source_session_id: "session-whole",
+      confidence: 0.9,
+      status: "promoted",
+      created_at: "2026-09-24T00:00:00.000Z",
+      updated_at: "2026-09-24T00:00:00.000Z",
+    };
+    saveSkillCandidate(row);
+
+    const resolved = resolveSkillsForTurn(
+      "fix the failing import in src/auth.ts",
+      "debug",
+      { maxTokens: 1_000 },
+    );
+
+    expect(resolved.matched.map((skill) => skill.id)).toEqual([row.id]);
+    expect(resolved.matched[0].source_run_ids).toEqual(["run-whole"]);
+    expect(resolved.matched[0].source_session_id).toBe("session-whole");
+    expect(resolved.promptBlock).toContain(sentinel);
+  });
+
+  test("skips an oversized skill without blocking a smaller later match", () => {
+    const rows: SkillCandidate[] = [
+      {
+        id: "skill-too-large",
+        name: "too-large",
+        description: "too large",
+        trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: ["mutation_verb"] },
+        body: "x".repeat(5_000),
+        source_run_ids: ["run-too-large"],
+        confidence: 0.9,
+        status: "promoted",
+        created_at: "2026-09-24T01:00:00.000Z",
+        updated_at: "2026-09-24T01:00:00.000Z",
+      },
+      {
+        id: "skill-small",
+        name: "small",
+        description: "small",
+        trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: ["mutation_verb"] },
+        body: "small guidance",
+        source_run_ids: ["run-small"],
+        confidence: 0.9,
+        status: "promoted",
+        created_at: "2026-09-24T00:00:00.000Z",
+        updated_at: "2026-09-24T00:00:00.000Z",
+      },
+    ];
+    for (const row of rows) saveSkillCandidate(row);
+
+    const resolved = resolveSkillsForTurn(
+      "fix the failing import in src/auth.ts",
+      "debug",
+      { maxTokens: 120 },
+    );
+
+    expect(resolved.matched.map((skill) => skill.id)).toEqual(["skill-small"]);
+    expect(resolved.omitted.byReason.token_budget).toBe(1);
+    expect(countTokens(resolved.promptBlock)).toBeLessThanOrEqual(120);
+  });
+
+  test("preserves a byte-stable empty result when no skill matches", () => {
+    const resolved = resolveSkillsForTurn(
+      "answer a general question",
+      "debug",
+      { maxSkills: 2, maxTokens: 100 },
+    );
+
+    expect(resolved).toMatchObject({
+      matched: [],
+      promptBlock: "",
+      promptTokens: 0,
+      totalMatched: 0,
+    });
+    expect(resolved.omitted.count).toBe(0);
   });
 
   test("promotion pass promotes high-confidence candidates", () => {

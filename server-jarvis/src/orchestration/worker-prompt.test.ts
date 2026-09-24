@@ -1,9 +1,35 @@
 import { describe, expect, test } from "bun:test";
+import { countTokens } from "../tokens";
+import { PROMOTED_SKILL_BLOCK_BUDGET_TOKENS } from "../intelligence/skill-resolver";
 import { hashInstruction, resolveStagePrompt } from "./worker-prompt";
 
 describe("resolveStagePrompt", () => {
   test("returns static prompt when no worker instructions exist", () => {
     expect(resolveStagePrompt("planner", "BASE PROMPT")).toBe("BASE PROMPT");
+  });
+
+  test("bounds oversized skill augmentation without truncating the baseline", () => {
+    const baseline = `BASELINE_SENTINEL\n${"baseline ".repeat(1_000)}`;
+    const skills = `SKILL_START\n${"skill ".repeat(5_000)}\nSKILL_END`;
+    const merged = resolveStagePrompt("executor", baseline, undefined, undefined, skills);
+    const marker = "Stage baseline contract (always applies):";
+    const prefix = merged.slice(0, merged.indexOf(marker));
+
+    expect(countTokens(prefix)).toBeLessThanOrEqual(PROMOTED_SKILL_BLOCK_BUDGET_TOKENS);
+    expect(merged).toContain("BASELINE_SENTINEL");
+    expect(merged.endsWith(baseline)).toBe(true);
+  });
+
+  test("does not inject skills into stages without the skill contract", () => {
+    const merged = resolveStagePrompt(
+      "reviewer",
+      "BASE PROMPT",
+      undefined,
+      undefined,
+      "SKILL_SHOULD_NOT_APPEAR",
+    );
+
+    expect(merged).toBe("BASE PROMPT");
   });
 
   test("prepends conductor instructions and appends baseline contract", () => {
