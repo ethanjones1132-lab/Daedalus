@@ -7,12 +7,25 @@
 
 import type { CallModelFn } from "../orchestration/coordinator";
 
-export interface JudgeVerdict {
-  score: number; // covered.length / rubric.length, in [0, 1]
-  covered: string[];
-  missed: string[];
-  rationale: string;
-}
+export type JudgeVerdictError = "invalid_verdict" | "unparseable";
+
+export type JudgeVerdict =
+  | {
+      valid: true;
+      score: number;
+      covered: string[];
+      missed: string[];
+      rationale: string;
+      error?: undefined;
+    }
+  | {
+      valid: false;
+      error: JudgeVerdictError;
+      score: 0;
+      covered: [];
+      missed: string[];
+      rationale: string;
+    };
 
 function buildJudgePrompt(request: string, answer: string, rubric: string[]): string {
   return [
@@ -47,6 +60,41 @@ function extractJudgeJson(text: string): { covered: string[]; missed: string[] }
   return null;
 }
 
+function invalidVerdict(
+  rubric: string[],
+  error: JudgeVerdictError,
+  detail: string,
+): JudgeVerdict {
+  return {
+    valid: false,
+    error,
+    score: 0,
+    covered: [],
+    missed: [...rubric],
+    rationale: `Judge output invalid: ${detail}`,
+  };
+}
+
+function findPartitionConflict(
+  rubric: string[],
+  covered: unknown[],
+  missed: unknown[],
+): string | null {
+  const rubricSet = new Set(rubric);
+  if (rubricSet.size !== rubric.length) return "rubric contains duplicate items";
+
+  const seen = new Map<string, "covered" | "missed">();
+  for (const [partition, values] of [["covered", covered], ["missed", missed]] as const) {
+    for (const value of values) {
+      if (typeof value !== "string" || !rubricSet.has(value)) continue;
+      const previous = seen.get(value);
+      if (previous) return `rubric item "${value}" appears in ${previous} and ${partition}`;
+      seen.set(value, partition);
+    }
+  }
+  return null;
+}
+
 export async function judgeAnswer(
   callModel: CallModelFn,
   request: string,
@@ -54,7 +102,7 @@ export async function judgeAnswer(
   rubric: string[],
 ): Promise<JudgeVerdict> {
   if (rubric.length === 0) {
-    return { score: 1, covered: [], missed: [], rationale: "Empty rubric — vacuous pass." };
+    return { valid: true, score: 1, covered: [], missed: [], rationale: "Empty rubric — vacuous pass." };
   }
 
   const resp = await callModel([
@@ -64,17 +112,24 @@ export async function judgeAnswer(
 
   const parsed = extractJudgeJson(resp.content);
   if (!parsed || !Array.isArray(parsed.covered) || !Array.isArray(parsed.missed)) {
-    return { score: 0, covered: [], missed: rubric, rationale: `Judge output unparseable: ${resp.content.slice(0, 200)}` };
+    return invalidVerdict(
+      rubric,
+      "unparseable",
+      `unparseable: ${resp.content.slice(0, 200)}`,
+    );
   }
 
-  // Exact-string matching against the rubric: a known, accepted limitation.
-  // If the judge paraphrases a covered item's text instead of echoing it
-  // verbatim, that item is silently NOT credited (it drops into `missed`
-  // below) — this is why the prompt now explicitly asks for verbatim echoing.
-  const covered = parsed.covered.filter((item) => rubric.includes(item));
+  const conflict = findPartitionConflict(rubric, parsed.covered, parsed.missed);
+  if (conflict) return invalidVerdict(rubric, "invalid_verdict", conflict);
+
+  const rubricSet = new Set(rubric);
+  const covered = parsed.covered.filter(
+    (item: unknown): item is string => typeof item === "string" && rubricSet.has(item),
+  );
   const missed = rubric.filter((item) => !covered.includes(item));
   return {
-    score: covered.length / rubric.length,
+    valid: true,
+    score: Math.min(1, covered.length / rubric.length),
     covered,
     missed,
     rationale: `${covered.length}/${rubric.length} rubric items covered.`,

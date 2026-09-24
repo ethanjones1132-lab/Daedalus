@@ -5278,7 +5278,7 @@ export async function baseFetch(req: Request): Promise<Response> {
         if (grounding.error === "no_grounding_source") {
           return Response.json({ error: "judge_unavailable", detail: "no grounding source available" }, { status: 503 });
         }
-        return Response.json({ error: "judge_unavailable", detail: grounding.detail }, { status: 503 });
+        return Response.json({ error: grounding.error, detail: grounding.detail }, { status: 503 });
       }
       const updated = updateSkillCandidateEval(id, grounding.verdict.score, grounding.verdict.missed);
       return Response.json({ id, status: updated?.status ?? candidate.status, verdict: grounding.verdict });

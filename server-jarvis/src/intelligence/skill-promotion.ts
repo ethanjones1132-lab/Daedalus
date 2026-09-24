@@ -229,15 +229,15 @@ export async function promoteCandidates(
   for (const { candidate, priorJson } of pending) {
     const result = await promoteSkillCandidate(candidate.id, callModel, config, fetchSnapshot);
     if (!result.ok) {
-      // Re-evaluate after a fresh judge call failed: this is an infra issue,
-      // not a grounded rejection. Surface it as a reject decision but do not
-      // leave the candidate promoted.
-      if (result.error === "judge_unavailable") {
+      // Re-evaluate after a fresh judge call failed or returned an invalid
+      // protocol: this is not a grounded rejection. Surface it as a reject
+      // decision but do not leave the candidate promoted.
+      if (result.error === "judge_unavailable" || result.error === "judge_invalid") {
         decisions.push({
           candidate_id: candidate.id,
-          judge_score: candidate.eval_score ?? 0,
+          judge_score: result.error === "judge_invalid" ? 0 : candidate.eval_score ?? 0,
           decision: "reject",
-          rationale: result.detail ?? "judge unavailable",
+          rationale: result.detail ?? (result.error === "judge_invalid" ? "judge verdict invalid" : "judge unavailable"),
         });
         continue;
       }
@@ -331,7 +331,7 @@ export function buildGroundingRubric(
 
 export type GroundingJudgeResult =
   | { ok: true; verdict: JudgeVerdict }
-  | { ok: false; error: "no_grounding_source" | "judge_unavailable"; detail?: string };
+  | { ok: false; error: "no_grounding_source" | "judge_unavailable" | "judge_invalid"; detail?: string };
 
 /**
  * Runs the semantic grounding check for a candidate: fetch its source
@@ -355,6 +355,9 @@ export async function runGroundingJudge(
 
   try {
     const verdict = await judgeAnswer(callModel, request, candidate.body, rubric);
+    if (!verdict.valid) {
+      return { ok: false, error: "judge_invalid", detail: verdict.rationale };
+    }
     return { ok: true, verdict };
   } catch (e) {
     return {
@@ -367,7 +370,7 @@ export async function runGroundingJudge(
 
 export interface PromoteSkillCandidateResult {
   ok: boolean;
-  error?: "candidate_not_found" | "wrong_status" | "judge_unavailable";
+  error?: "candidate_not_found" | "wrong_status" | "judge_unavailable" | "judge_invalid";
   detail?: string;
   candidate?: SkillCandidate;
   verdict?: JudgeVerdict;
@@ -418,6 +421,9 @@ export async function promoteSkillCandidate(
         "no grounding source available",
       );
       return { ok: true, candidate: updated ?? undefined };
+    }
+    if (grounding.error === "judge_invalid") {
+      return { ok: false, error: "judge_invalid", detail: grounding.detail };
     }
     return { ok: false, error: "judge_unavailable", detail: grounding.detail };
   }

@@ -46,13 +46,26 @@ describe("judgeAnswer", () => {
     expect(verdict.score).toBe(1);
   });
 
-  test("resolves an item listed in both covered and missed in favor of covered", async () => {
+  test("rejects an item listed in both covered and missed", async () => {
     const callModel = async () => ({
       content: JSON.stringify({ covered: ["mentions the fix"], missed: ["mentions the fix"] }),
     });
     const verdict = await judgeAnswer(callModel as any, "fix the bug", "I fixed it.", ["mentions the fix"]);
-    expect(verdict.covered).toEqual(["mentions the fix"]);
-    expect(verdict.missed).toEqual([]);
+    expect(verdict.valid).toBe(false);
+    expect(verdict.error).toBe("invalid_verdict");
+    expect(verdict.score).toBe(0);
+    expect(verdict.covered).toEqual([]);
+    expect(verdict.missed).toEqual(["mentions the fix"]);
+  });
+
+  test("rejects a rubric item repeated within one partition", async () => {
+    const callModel = async () => ({
+      content: JSON.stringify({ covered: ["mentions the fix", "mentions the fix"], missed: [] }),
+    });
+    const verdict = await judgeAnswer(callModel as any, "fix the bug", "I fixed it.", ["mentions the fix"]);
+    expect(verdict.valid).toBe(false);
+    expect(verdict.error).toBe("invalid_verdict");
+    expect(verdict.score).toBe(0);
   });
 
   test("drops a hallucinated covered item that isn't in the rubric, without inflating the score", async () => {
@@ -60,6 +73,7 @@ describe("judgeAnswer", () => {
       content: JSON.stringify({ covered: ["mentions the fix", "a made-up item"], missed: [] }),
     });
     const verdict = await judgeAnswer(callModel as any, "fix the bug", "I fixed it.", ["mentions the fix"]);
+    expect(verdict.valid).toBe(true);
     expect(verdict.score).toBe(1);
     expect(verdict.covered).toEqual(["mentions the fix"]);
   });

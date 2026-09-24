@@ -832,6 +832,31 @@ describe("skill distillation (Track C)", () => {
       expect(result.candidate?.eval_missed?.length).toBeGreaterThan(0);
     });
 
+    test("contradictory judge verdict leaves the candidate untouched and reports evaluator invalidity", async () => {
+      const c = groundableCandidate("rc_judge_contradictory");
+      saveSkillCandidate(c);
+      const fetcher = snapshotFetcherFor(`run_for_${c.id}`, { worker_instructions: { executor: "Read first." } });
+      const contradictoryCallModel: CallModelFn = async (messages, options) => {
+        const response = await passingCallModel()(messages, options);
+        const parsed = JSON.parse(response.content) as { covered: string[]; missed: string[] };
+        return {
+          content: JSON.stringify({
+            covered: [...parsed.covered, ...parsed.covered],
+            missed: parsed.missed,
+          }),
+        };
+      };
+
+      const result = await promoteSkillCandidate(c.id, contradictoryCallModel, promotionCfg, fetcher);
+      expect(result.ok).toBe(false);
+      expect(result.error).toBe("judge_invalid");
+      expect(result.detail).toContain("invalid");
+      const reloaded = loadSkillCandidate(c.id);
+      expect(reloaded?.status).toBe("candidate");
+      expect(reloaded?.eval_score).toBeUndefined();
+      expect(reloaded?.rejection_reason).toBeUndefined();
+    });
+
     test("judge call failure leaves the candidate as 'candidate' (not rejected, not promoted)", async () => {
       const c = groundableCandidate("rc_judge_unavailable");
       saveSkillCandidate(c);
@@ -1002,6 +1027,20 @@ describe("skill distillation (Track C)", () => {
       const result = await runGroundingJudge(c, passingCallModel(), fetcher);
       expect(result.ok).toBe(true);
       expect(result.ok && result.verdict.score).toBe(1);
+    });
+
+    test("invalid judge partition -> judge_invalid", async () => {
+      const c = candidate("rg-invalid");
+      const fetcher = (runId: string) => (runId === "run_for_rg-invalid" ? { worker_instructions: {} } : null);
+      const result = await runGroundingJudge(c, async (messages) => {
+        const userMsg = messages.find((m) => m.role === "user")?.content ?? "";
+        const items = [...(userMsg.split("Rubric items")[1] ?? "").matchAll(/^- (.+)$/gm)].map((m) => m[1]);
+        return {
+          content: JSON.stringify({ covered: [...items, ...items], missed: [] }),
+        };
+      }, fetcher);
+      expect(result.ok).toBe(false);
+      expect(!result.ok && result.error).toBe("judge_invalid");
     });
 
     test("judge call throwing -> judge_unavailable", async () => {
