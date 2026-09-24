@@ -484,6 +484,59 @@ describe("D-01 exportCorpus — quality filtering", () => {
       }),
     ]);
   });
+
+  test("prefers repaired canonical stage evidence and recalculates the error component", () => {
+    store.insertAgentRun(makeAgentRun());
+    store.insertTrajectorySnapshot(makeSnapshot());
+    store.insertStageRun({
+      id: "st_1",
+      agent_run_id: "run_test_1",
+      mode_id: "executor",
+      turn_number: 1,
+      input_tokens: 500,
+      output_tokens: 200,
+      tool_calls_json: "[]",
+      duration_ms: 100,
+      was_successful: 1,
+      had_error: 0,
+    });
+    store.insertStageRun({
+      id: "st_2",
+      agent_run_id: "run_test_1",
+      mode_id: "synthesizer",
+      turn_number: 2,
+      input_tokens: 800,
+      output_tokens: 400,
+      tool_calls_json: "[]",
+      duration_ms: 100,
+      was_successful: 0,
+      had_error: 1,
+    });
+
+    const { rows } = exportCorpus(store, 100);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].stage_runs).toHaveLength(2);
+    expect(rows[0].stage_runs.find((stage) => (stage as { id: string }).id === "st_2")).toMatchObject({
+      id: "st_2",
+      mode_id: "synthesizer",
+      was_successful: 0,
+      had_error: 1,
+    });
+    expect(rows[0].reward_components.errors).toBe(0.5);
+  });
+
+  test("falls back to frozen stage evidence when canonical stage rows are absent", () => {
+    const snap = makeSnapshot();
+    store.insertAgentRun(makeAgentRun());
+    store.insertTrajectorySnapshot(snap);
+
+    const { rows } = exportCorpus(store, 100);
+    const snapshotStages = JSON.parse(snap.snapshot_json).stage_runs as unknown[];
+
+    expect(rows[0].stage_runs).toEqual(snapshotStages);
+    expect(rows[0].reward_components.errors).toBe(1);
+  });
 });
 
 describe("D-01 exportCorpus — JSONL serialization shape", () => {

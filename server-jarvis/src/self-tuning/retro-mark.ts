@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { extractTextToolCalls } from "../text-tools";
+import { isRuntimeStarvationErrorCode } from "../orchestration/turn-budget";
 
 /**
  * Retro-repair for the 2026-07-03 reward-signal leak (session 1d4727cf,
@@ -34,6 +35,8 @@ export interface RetroMarkOptions {
 export interface RetroMarkSummary {
   runsMarked: number;
   attributionsFlipped: number;
+  stageRunsFlipped: number;
+  ambiguousStageLinks: number;
   performanceRowsAdjusted: number;
   details: string[];
 }
@@ -49,9 +52,18 @@ interface ModelAttributionRow {
   id: string;
   agent_run_id: string;
   stage_id: string;
+  stage_run_id?: string | null;
   agent_id: string | null;
   was_successful: number;
   had_error: number;
+}
+
+interface StageRunRow {
+  id: string;
+  agent_run_id: string;
+  mode_id: string;
+  was_successful: number;
+  partial_error_code?: string | null;
 }
 
 /**
@@ -107,6 +119,8 @@ export function retroMarkPoisonedRuns(db: Database, options: RetroMarkOptions): 
   const summary: RetroMarkSummary = {
     runsMarked: 0,
     attributionsFlipped: 0,
+    stageRunsFlipped: 0,
+    ambiguousStageLinks: 0,
     performanceRowsAdjusted: 0,
     details: [],
   };
@@ -130,6 +144,41 @@ export function retroMarkPoisonedRuns(db: Database, options: RetroMarkOptions): 
 
       for (const attr of attributions) {
         if (attr.stage_id !== ANSWER_STAGE_ID) continue;
+
+        if (attr.stage_run_id) {
+          const stage = db
+            .query(
+              `SELECT id, agent_run_id, mode_id, was_successful, partial_error_code
+               FROM stage_runs WHERE id = ?`,
+            )
+            .get(attr.stage_run_id) as StageRunRow | undefined;
+          if (!stage || stage.agent_run_id !== run.id || stage.mode_id !== ANSWER_STAGE_ID) {
+            summary.ambiguousStageLinks++;
+            summary.details.push(
+              `ambiguous stage link for attribution ${attr.id} (run ${run.id}); stage evidence left unchanged`,
+            );
+          } else if (isRuntimeStarvationErrorCode(stage.partial_error_code)) {
+            summary.details.push(
+              `stage ${stage.id} (run ${run.id}) has a runtime starvation code; stage evidence left unchanged`,
+            );
+          } else if (stage.was_successful === 1) {
+            db.prepare(
+              `UPDATE stage_runs
+               SET was_successful = 0, had_error = 1
+               WHERE id = ? AND agent_run_id = ? AND mode_id = ?`,
+            ).run(stage.id, run.id, ANSWER_STAGE_ID);
+            summary.stageRunsFlipped++;
+            summary.details.push(
+              `stage ${stage.id} (run ${run.id}, stage ${stage.mode_id}): was_successful 1 -> 0, had_error 0 -> 1`,
+            );
+          }
+        } else {
+          summary.ambiguousStageLinks++;
+          summary.details.push(
+            `ambiguous stage link for attribution ${attr.id} (run ${run.id}); stage evidence left unchanged`,
+          );
+        }
+
         if (attr.was_successful !== 1) continue;
 
         db.prepare(

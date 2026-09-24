@@ -56,7 +56,7 @@
  * still have signal for preference learning.
  */
 
-import { SelfTuningStore, type TrajectorySnapshot, type AgentRun } from "../self-tuning/store";
+import { SelfTuningStore, type TrajectorySnapshot, type AgentRun, type StageRun } from "../self-tuning/store";
 
 /** Weights for each component of the composite reward. Sum does not need to
  *  be 1 — the final reward is normalized by the sum of supplied weights so
@@ -248,6 +248,7 @@ export function buildExportRow(
   snapshot: TrajectorySnapshot,
   agentRun: AgentRun | undefined,
   options: ExportOptions,
+  canonicalStageRuns?: readonly StageRun[],
 ): ExportedRow | null {
   const traj = parseSnapshot(snapshot);
   if (!traj) return null;
@@ -276,7 +277,12 @@ export function buildExportRow(
   const evalResults = options.evalResults;
   const replanCounts = options.replanCounts;
 
-  const stageRuns = Array.isArray(traj.stage_runs) ? traj.stage_runs : [];
+  const stageRuns =
+    canonicalStageRuns && canonicalStageRuns.length > 0
+      ? [...canonicalStageRuns]
+      : Array.isArray(traj.stage_runs)
+        ? traj.stage_runs
+        : [];
   const modelAttributions = Array.isArray(traj.model_attributions) ? traj.model_attributions : [];
   const { inputTokens, outputTokens } = stageTokenTotals(stageRuns);
 
@@ -338,7 +344,8 @@ export function exportCorpus(
       droppedMalformed++;
       continue;
     }
-    const row = buildExportRow(snap, runsById.get(traj.agent_run_id), options);
+    const canonicalStageRuns = store.getStageRuns(traj.agent_run_id);
+    const row = buildExportRow(snap, runsById.get(traj.agent_run_id), options, canonicalStageRuns);
     if (!row) {
       droppedMalformed++;
       continue;

@@ -54,11 +54,42 @@ function insertAttribution(
   stageId: string,
   agentId: string,
   wasSuccessful: number,
+  stageRunId: string | null = null,
 ): void {
   db.prepare(
-    `INSERT INTO model_attributions (id, agent_run_id, stage_id, agent_id, provider, model_id, was_successful, had_error, duration_ms, fallback_used)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(id, runId, stageId, agentId, "openrouter", "test-model", wasSuccessful, wasSuccessful ? 0 : 1, 100, 0);
+    `INSERT INTO model_attributions (id, agent_run_id, stage_id, agent_id, provider, model_id, stage_run_id, was_successful, had_error, duration_ms, fallback_used)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(id, runId, stageId, agentId, "openrouter", "test-model", stageRunId, wasSuccessful, wasSuccessful ? 0 : 1, 100, 0);
+}
+
+function insertStageRun(
+  db: Database,
+  id: string,
+  runId: string,
+  modeId: string,
+  wasSuccessful: number,
+  partialErrorCode: string | null = null,
+): void {
+  db.prepare(
+    `INSERT INTO stage_runs (id, agent_run_id, mode_id, turn_number, input_tokens, output_tokens, tool_calls_json, duration_ms, was_successful, had_error, error_message, stop_reason, partial_error_code, diagnostic_json, failure_detail)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    id,
+    runId,
+    modeId,
+    1,
+    11,
+    22,
+    '[{"name":"read_file"}]',
+    333,
+    wasSuccessful,
+    wasSuccessful ? 0 : 1,
+    "synthetic stage",
+    "stop",
+    partialErrorCode,
+    '{"diagnostic":"preserve"}',
+    "preserve-detail",
+  );
 }
 
 function insertPerformance(
@@ -84,6 +115,7 @@ function snapshot(db: Database) {
     performance: db
       .query("SELECT agent_id, stage_id, task_type, success_count, failure_count FROM agent_performance ORDER BY agent_id, stage_id, task_type")
       .all(),
+    stages: db.query("SELECT * FROM stage_runs ORDER BY id").all(),
   };
 }
 
@@ -109,7 +141,7 @@ describe("retro-mark poisoned runs", () => {
     );
     // Already failed — should not be re-flagged as newly poisoned by findPoisonedRuns
     // (outcome is neither NULL nor 'success').
-    insertRun(db, "run_already_failed", '{"name":"read_file"}', "failed");
+    insertRun(db, "run_already_failed", '{"name":"read_file","arguments":{"path":"foo.ts"}}', "failed");
 
     const poisoned = findPoisonedRuns(db).map((r) => r.id).sort();
     expect(poisoned).toEqual(["run_synthesis_failed", "run_tool_json_leak"].sort());
@@ -282,5 +314,105 @@ describe("retro-mark poisoned runs", () => {
       .get("agent_a", "synthesizer") as { success_count: number; failure_count: number };
     expect(row.success_count).toBe(0); // clamped, was already 0
     expect(row.failure_count).toBe(6);
+  });
+
+  test("apply repairs an exact linked synthesizer stage without touching executor evidence", () => {
+    const db = makeDb();
+    insertRun(db, "run_linked", '{"name":"read_file","arguments":{"path":"foo.ts"}}', "success");
+    insertStageRun(db, "stage_synth", "run_linked", "synthesizer", 1);
+    insertStageRun(db, "stage_executor", "run_linked", "executor", 1);
+    insertAttribution(db, "attr_synth_linked", "run_linked", "synthesizer", "agent_a", 1, "stage_synth");
+    insertAttribution(db, "attr_executor_linked", "run_linked", "executor", "agent_b", 1, "stage_executor");
+    const beforeStages = db.query("SELECT * FROM stage_runs ORDER BY id").all();
+
+    const summary = retroMarkPoisonedRuns(db, { apply: true });
+
+    expect(summary.runsMarked).toBe(1);
+    expect(summary.stageRunsFlipped).toBe(1);
+    expect(summary.ambiguousStageLinks).toBe(0);
+    expect(summary.details.some((detail) => detail.includes("stage_synth"))).toBe(true);
+    const afterStages = db.query("SELECT * FROM stage_runs ORDER BY id").all() as Array<Record<string, unknown>>;
+    const previousExecutor = beforeStages.find((stage) => (stage as Record<string, unknown>).id === "stage_executor");
+    expect(afterStages.find((stage) => stage.id === "stage_executor")).toEqual(previousExecutor);
+    expect(afterStages.find((stage) => stage.id === "stage_synth")).toMatchObject({
+      id: "stage_synth",
+      agent_run_id: "run_linked",
+      mode_id: "synthesizer",
+      was_successful: 0,
+      had_error: 1,
+      tool_calls_json: '[{"name":"read_file"}]',
+      diagnostic_json: '{"diagnostic":"preserve"}',
+      failure_detail: "preserve-detail",
+    });
+  });
+
+  test("dry run reports stage repair and rolls every table back", () => {
+    const db = makeDb();
+    insertRun(db, "run_dry_stage", '{"name":"read_file","arguments":{"path":"foo.ts"}}', "success");
+    insertStageRun(db, "stage_dry_synth", "run_dry_stage", "synthesizer", 1);
+    insertAttribution(db, "attr_dry_synth", "run_dry_stage", "synthesizer", "agent_a", 1, "stage_dry_synth");
+    insertPerformance(db, "agent_a", "synthesizer", "general", 4, 1);
+    const before = snapshot(db);
+
+    const summary = retroMarkPoisonedRuns(db, { apply: false });
+
+    expect(summary.stageRunsFlipped).toBe(1);
+    expect(summary.details.some((detail) => detail.includes("stage_dry_synth"))).toBe(true);
+    expect(snapshot(db)).toEqual(before);
+  });
+
+  test("legacy, mismatched, and missing stage links are reported and left unchanged", () => {
+    const db = makeDb();
+    insertRun(db, "run_ambiguous", '{"name":"read_file","arguments":{"path":"foo.ts"}}', "success");
+    insertStageRun(db, "stage_legacy_synth", "run_ambiguous", "synthesizer", 1);
+    insertStageRun(db, "stage_ambiguous_executor", "run_ambiguous", "executor", 1);
+    insertAttribution(db, "attr_legacy_link", "run_ambiguous", "synthesizer", "agent_a", 1, null);
+    insertAttribution(db, "attr_wrong_link", "run_ambiguous", "synthesizer", "agent_b", 1, "stage_ambiguous_executor");
+    insertAttribution(db, "attr_missing_link", "run_ambiguous", "synthesizer", "agent_c", 1, "stage_missing");
+    const beforeStages = db.query("SELECT * FROM stage_runs ORDER BY id").all();
+
+    const summary = retroMarkPoisonedRuns(db, { apply: true });
+
+    expect(summary.stageRunsFlipped).toBe(0);
+    expect(summary.ambiguousStageLinks).toBe(3);
+    expect(summary.details.filter((detail) => detail.startsWith("ambiguous stage link"))).toHaveLength(3);
+    expect(db.query("SELECT * FROM stage_runs ORDER BY id").all()).toEqual(beforeStages);
+  });
+
+  test("already-failed poisoned stage evidence is idempotent", () => {
+    const db = makeDb();
+    insertRun(db, "run_already_failed_stage", '{"name":"read_file","arguments":{"path":"foo.ts"}}', "failed");
+    insertStageRun(db, "stage_already_failed", "run_already_failed_stage", "synthesizer", 0);
+    insertAttribution(db, "attr_already_failed", "run_already_failed_stage", "synthesizer", "agent_a", 0, "stage_already_failed");
+    insertPerformance(db, "agent_a", "synthesizer", "general", 3, 2);
+    const before = snapshot(db);
+
+    const summary = retroMarkPoisonedRuns(db, { apply: true });
+
+    expect(summary.runsMarked).toBe(0);
+    expect(summary.stageRunsFlipped).toBe(0);
+    expect(summary.attributionsFlipped).toBe(0);
+    expect(summary.details).toEqual([]);
+    expect(snapshot(db)).toEqual(before);
+  });
+
+  test("apply rolls back earlier repairs when linked stage persistence fails", () => {
+    const db = makeDb();
+    insertRun(db, "run_rollback", '{"name":"read_file","arguments":{"path":"foo.ts"}}', "success");
+    insertStageRun(db, "stage_rollback", "run_rollback", "synthesizer", 1);
+    insertAttribution(db, "attr_rollback", "run_rollback", "synthesizer", "agent_a", 1, "stage_rollback");
+    insertPerformance(db, "agent_a", "synthesizer", "general", 2, 0);
+    const before = snapshot(db);
+    db.exec(`
+      CREATE TRIGGER block_stage_repair
+      BEFORE UPDATE OF was_successful ON stage_runs
+      WHEN NEW.id = 'stage_rollback'
+      BEGIN
+        SELECT RAISE(ABORT, 'stage repair blocked');
+      END;
+    `);
+
+    expect(() => retroMarkPoisonedRuns(db, { apply: true })).toThrow();
+    expect(snapshot(db)).toEqual(before);
   });
 });
