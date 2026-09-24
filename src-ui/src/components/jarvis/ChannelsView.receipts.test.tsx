@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import ChannelsView from './ChannelsView';
 
@@ -15,6 +15,7 @@ const channel = {
   id: 'ch_2', name: 'Newsroom', type: 'discord', enabled: true, config: null,
   last_used: null, connected: false, created_at: '2026-09-16T00:00:00Z', updated_at: '2026-09-16T00:00:00Z',
 };
+const secondChannel = { ...channel, id: 'ch_3', name: 'Operations' };
 const receipt = {
   message_id: 'm1', channel: 'discord', status: 'delivered', retry_count: 0,
   correlation_id: 'c1', finished_at: '2026-09-16T00:00:00Z',
@@ -43,9 +44,14 @@ describe('Channel receipt telemetry', () => {
     usableRow();
     expect(screen.getByRole('status')).toHaveTextContent('Loading delivery telemetry');
     expect(screen.getByRole('button', { name: 'Refresh delivery telemetry' })).toBeDisabled();
-    expect(screen.queryByText(/delivery delivered/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Discord adapter delivery receipts' })).not.toBeInTheDocument();
     await act(async () => { request.resolve(response()); });
-    expect(screen.getByText('delivery delivered · retries 0')).toBeInTheDocument();
+    const ledger = screen.getByRole('region', { name: 'Discord adapter delivery receipts' });
+    expect(within(ledger).getByText('status: delivered')).toBeInTheDocument();
+    expect(within(ledger).getByText('retry_count: 0')).toBeInTheDocument();
+    expect(within(ledger).getByText('message_id: m1')).toBeInTheDocument();
+    expect(within(ledger).getByText('correlation_id: c1')).toBeInTheDocument();
+    expect(within(ledger).getByText('finished_at: 2026-09-16T00:00:00Z')).toBeInTheDocument();
     expect(fetchMock.mock.calls[0][0]).toBe('http://127.0.0.1:19877/channels/discord/receipts');
   });
 
@@ -73,28 +79,87 @@ describe('Channel receipt telemetry', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(invokeMock.mock.calls).toEqual([['list_channels']]);
     await act(async () => { retry.resolve(response()); });
-    expect(screen.getByText('delivery delivered · retries 0')).toBeInTheDocument();
+    expect(within(screen.getByRole('region', { name: 'Discord adapter delivery receipts' })).getByText('status: delivered')).toBeInTheDocument();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
-  it('labels retained delivery status stale during refresh and failure, clearing it on successful empty retry', async () => {
+  it('labels retained receipts stale during refresh and failure, clearing them on successful empty retry', async () => {
     fetchMock.mockResolvedValueOnce(response());
     render(<ChannelsView />);
-    await screen.findByText('delivery delivered · retries 0');
+    const ledger = await screen.findByRole('region', { name: 'Discord adapter delivery receipts' });
+    expect(within(ledger).getByText('status: delivered')).toBeInTheDocument();
     const refresh = deferred<Response>();
     fetchMock.mockReturnValueOnce(refresh.promise);
     fireEvent.click(screen.getByRole('button', { name: 'Refresh delivery telemetry' }));
-    expect(screen.getByText('delivery delivered · retries 0 (stale)')).toBeInTheDocument();
+    expect(within(ledger).getByText('status: delivered (stale)')).toBeInTheDocument();
     usableRow();
     await act(async () => { refresh.reject(new Error('private detail')); });
     expect(screen.getByRole('alert')).toHaveTextContent('Delivery telemetry is stale');
-    expect(screen.getByText('delivery delivered · retries 0 (stale)')).toBeInTheDocument();
+    expect(within(ledger).getByText('status: delivered (stale)')).toBeInTheDocument();
     fetchMock.mockResolvedValueOnce(response([]));
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry delivery telemetry' })); });
-    expect(screen.queryByText(/delivery delivered/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Discord adapter delivery receipts' })).not.toBeInTheDocument();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.getByText('No delivery receipts yet.')).toBeInTheDocument();
     expect(invokeMock.mock.calls).toEqual([['list_channels']]);
+  });
+
+  it('keeps adapter-wide receipts detached from every Discord row', async () => {
+    invokeMock.mockResolvedValueOnce([channel, secondChannel]);
+    fetchMock.mockResolvedValueOnce(response());
+    render(<ChannelsView />);
+    const ledger = await screen.findByRole('region', { name: 'Discord adapter delivery receipts' });
+    const rows = [screen.getByText('Newsroom').closest('li')!, screen.getByText('Operations').closest('li')!];
+    expect(within(ledger).getAllByRole('listitem')).toHaveLength(1);
+    expect(screen.getAllByText('status: delivered')).toHaveLength(1);
+    for (const row of rows) {
+      expect(within(row).queryByText(/status:|message_id:|correlation_id:|delivery/)).not.toBeInTheDocument();
+    }
+  });
+
+  it('renders multiple newest-first receipts with status, retries, identity, finish time, and stored error code', async () => {
+    const failed = {
+      ...receipt,
+      message_id: '',
+      correlation_id: 'c2',
+      status: 'failed' as const,
+      retry_count: 2,
+      error_code: 'discord_http_500',
+      finished_at: '2026-09-16T00:00:02Z',
+    };
+    const delivered = { ...receipt, correlation_id: 'c1' };
+    fetchMock.mockResolvedValueOnce(response([failed, delivered]));
+    render(<ChannelsView />);
+    const ledger = await screen.findByRole('region', { name: 'Discord adapter delivery receipts' });
+    const entries = within(ledger).getAllByRole('listitem');
+    expect(entries).toHaveLength(2);
+    expect(entries[0]).toHaveTextContent('status: failed');
+    expect(entries[0]).toHaveTextContent('retry_count: 2');
+    expect(entries[0]).toHaveTextContent('message_id: Not supplied');
+    expect(entries[0]).toHaveTextContent('correlation_id: c2');
+    expect(entries[0]).toHaveTextContent('finished_at: 2026-09-16T00:00:02Z');
+    expect(entries[0]).toHaveTextContent('error_code: discord_http_500');
+    expect(entries[1]).toHaveTextContent('status: delivered');
+    expect(entries[1]).toHaveTextContent('message_id: m1');
+    expect(entries[1]).toHaveTextContent('correlation_id: c1');
+  });
+
+  it('uses fixed missing-value fallbacks without exposing response details', async () => {
+    fetchMock.mockResolvedValueOnce(response([{
+      ...receipt,
+      message_id: '',
+      correlation_id: '',
+      finished_at: '',
+      status: 'failed',
+      error_code: undefined,
+    }]));
+    render(<ChannelsView />);
+    const ledger = await screen.findByRole('region', { name: 'Discord adapter delivery receipts' });
+    expect(within(ledger).getByText('message_id: Not supplied')).toBeInTheDocument();
+    expect(within(ledger).getByText('correlation_id: Not supplied')).toBeInTheDocument();
+    expect(within(ledger).getByText('finished_at: Not supplied')).toBeInTheDocument();
+    expect(within(ledger).getByText('error_code: Not supplied')).toBeInTheDocument();
+    expect(screen.queryByText(/private detail|response body|authorization|bearer/i)).not.toBeInTheDocument();
   });
 
   it('keeps native loading and retry separate even when telemetry succeeds first', async () => {

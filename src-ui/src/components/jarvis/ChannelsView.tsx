@@ -14,7 +14,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
-import { initialReceiptState, parseReceipts, reduceReceiptState } from './channel-receipt-state';
+import { initialReceiptState, parseReceipts, reduceReceiptState, type DeliveryReceipt } from './channel-receipt-state';
 import { channelLocked, isConnected, reconcileChannels, type Channel, type ChannelOperation } from './channel-state';
 import {
   cn,
@@ -54,6 +54,47 @@ function formatTimestamp(ts: string | null): string {
   const h = Math.floor(m / 60);
   if (h < 24) return `${h}h ago`;
   return `${Math.floor(h / 24)}d ago`;
+}
+
+function receiptValue(value: string | undefined): string {
+  return value ? value : 'Not supplied';
+}
+
+function ReceiptLedger({ receipts, stale }: { receipts: DeliveryReceipt[]; stale: boolean }) {
+  return (
+    <section
+      role="region"
+      aria-label="Discord adapter delivery receipts"
+      className="rounded-xl border border-white/10 bg-white/[0.02] p-3 space-y-2"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="text-xs font-semibold text-bone">Discord adapter delivery receipts</h3>
+          <p className="text-[10px] text-bone/50">Adapter-wide history; receipts are not mapped to configured channel rows.</p>
+        </div>
+        {stale && <span className="text-[10px] text-amber-200/70">stale</span>}
+      </div>
+      <ul className="space-y-2">
+        {receipts.map((receipt, index) => (
+          <li key={`${receipt.correlation_id}-${index}`} className="rounded-lg border border-white/5 bg-black/10 p-2 text-[10px] text-bone/60 space-y-1">
+            <div className="flex items-center gap-2">
+              <Pill variant={receipt.status === 'delivered' ? 'success' : receipt.status === 'failed' ? 'error' : 'default'}>{receipt.status}</Pill>
+              <span>status: {receipt.status}{stale && ' (stale)'}</span>
+            </div>
+            <div className="flex flex-wrap gap-x-3 gap-y-1">
+              <span>retry_count: {receipt.retry_count}</span>
+              <span>finished_at: {receiptValue(receipt.finished_at)}</span>
+            </div>
+            <div className="flex flex-wrap gap-x-3 gap-y-1">
+              <span>message_id: {receiptValue(receipt.message_id)}</span>
+              <span>correlation_id: {receiptValue(receipt.correlation_id)}</span>
+            </div>
+            <div>error_code: {receiptValue(receipt.error_code)}</div>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
 }
 
 // ── Add form ───────────────────────────────────────────────────
@@ -349,6 +390,10 @@ export function ChannelsView() {
         {receiptState.phase === 'ready' && receiptState.receipts?.length === 0 && <p>No delivery receipts yet.</p>}
       </div>
 
+      {receiptState.receipts !== null && receiptState.receipts.length > 0 && (
+        <ReceiptLedger receipts={receiptState.receipts} stale={receiptState.phase !== 'ready'} />
+      )}
+
       <div className="flex-1 overflow-y-auto min-h-0">
         {error && (
           <div role="alert" className="text-sm text-red-200">
@@ -364,11 +409,10 @@ export function ChannelsView() {
         ) : (
           <ul className="space-y-2">
             {channels.map((c) => {
-              const connected = isConnected(c);
-              const operation = operations[c.id];
-              const locked = channelLocked(operation);
-              const latestReceipt = c.type === 'discord' ? receiptState.receipts?.[0] : undefined;
-              return (
+               const connected = isConnected(c);
+               const operation = operations[c.id];
+               const locked = channelLocked(operation);
+               return (
                 <li key={c.id}>
                   <GlassCard className="p-3">
                     <div className="flex items-center gap-2">
@@ -414,11 +458,10 @@ export function ChannelsView() {
                         <button type="button" className="underline disabled:opacity-40" disabled={loading} onClick={retryRead}>Retry</button>
                       </div>
                     )}
-                    <div className="flex items-center gap-2 mt-1.5 text-[10px] font-mono text-bone/30">
-                      <span>last used {formatTimestamp(c.last_used)}</span>
-                      {latestReceipt && <span className={latestReceipt.status === 'delivered' ? 'text-emerald-300/70' : 'text-amber-300/70'}>delivery {latestReceipt.status} · retries {latestReceipt.retry_count}{receiptState.phase !== 'ready' && ' (stale)'}</span>}
-                      <span className="ml-auto">added {formatTimestamp(c.created_at)}</span>
-                    </div>
+                     <div className="flex items-center gap-2 mt-1.5 text-[10px] font-mono text-bone/30">
+                       <span>last used {formatTimestamp(c.last_used)}</span>
+                       <span className="ml-auto">added {formatTimestamp(c.created_at)}</span>
+                     </div>
                   </GlassCard>
                 </li>
               );
