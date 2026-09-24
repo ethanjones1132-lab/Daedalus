@@ -1,4 +1,4 @@
-import { memo, useState, useCallback, useMemo } from 'react';
+import { isValidElement, memo, useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
@@ -25,15 +25,39 @@ interface MarkdownViewProps {
  * closing fence arrives (the original reflow bug).
  */
 function preprocessStreamingMarkdown(src: string): string {
-  // Count triple-backtick fences (ignoring ones that are clearly inside text
-  // by virtue of leading non-fence chars). Each opener without a matching
-  // closer gets a synthetic closer appended so react-markdown sees a
-  // well-formed fenced block.
-  const matches = src.match(/```/g);
-  if (matches && matches.length % 2 === 1) {
-    return src + '\n```';
+  const lines = src.split(/\r?\n/);
+  let openFence: { marker: '`' | '~'; length: number } | null = null;
+
+  for (const line of lines) {
+    const fence = /^( {0,3})(`{3,}|~{3,})(.*)$/.exec(line);
+    if (!fence) continue;
+
+    const marker = fence[2][0] as '`' | '~';
+    const length = fence[2].length;
+    const trailing = fence[3].trim();
+
+    if (!openFence) {
+      openFence = { marker, length };
+      continue;
+    }
+
+    if (marker === openFence.marker && length >= openFence.length && !trailing) {
+      openFence = null;
+    }
   }
-  return src;
+
+  if (!openFence) return src;
+  return `${src}\n${openFence.marker.repeat(openFence.length)}`;
+}
+
+function textFromNode(node: React.ReactNode): string {
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  if (Array.isArray(node)) return node.map(textFromNode).join('');
+  if (isValidElement(node)) {
+    const props = node.props as { children?: React.ReactNode };
+    return textFromNode(props.children);
+  }
+  return '';
 }
 
 const markdownComponents = {
@@ -41,8 +65,9 @@ const markdownComponents = {
   // code (no language, single line) gets a lighter treatment.
   code(props: React.ComponentPropsWithoutRef<'code'> & { className?: string }) {
     const { className, children, ...rest } = props;
-    const match = /language-(\w+)/.exec(className || '');
-    const isBlock = !!match || String(children).includes('\n');
+    const match = /language-([^\s]+)/.exec(className || '');
+    const text = textFromNode(children);
+    const isBlock = !!match || text.includes('\n');
 
     if (!isBlock) {
       return (
@@ -59,7 +84,7 @@ const markdownComponents = {
     }
 
     const lang = match?.[1] ?? 'text';
-    const raw = String(children).replace(/\n$/, '');
+    const raw = text.replace(/\n$/, '');
     return <CodeBlock lang={lang} raw={raw}>{children}</CodeBlock>;
   },
   pre(props: React.ComponentPropsWithoutRef<'pre'>) {
@@ -103,16 +128,46 @@ interface CodeBlockProps {
 
 function CodeBlock({ lang, raw, children }: CodeBlockProps) {
   const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState(false);
+  const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copyRequest = useRef(0);
+
+  const clearCopyTimer = useCallback(() => {
+    if (copyTimer.current === null) return;
+    clearTimeout(copyTimer.current);
+    copyTimer.current = null;
+  }, []);
+
+  useEffect(() => {
+    copyRequest.current += 1;
+    clearCopyTimer();
+    setCopied(false);
+    setCopyError(false);
+    return () => {
+      copyRequest.current += 1;
+      clearCopyTimer();
+    };
+  }, [clearCopyTimer, raw]);
 
   const handleCopy = useCallback(async () => {
+    const request = ++copyRequest.current;
+    clearCopyTimer();
+    setCopyError(false);
+    setCopied(false);
     try {
       await navigator.clipboard.writeText(raw);
+      if (request !== copyRequest.current) return;
       setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      copyTimer.current = setTimeout(() => {
+        copyTimer.current = null;
+        setCopied(false);
+      }, 1500);
     } catch {
-      /* clipboard unavailable — silent */
+      if (request !== copyRequest.current) return;
+      setCopied(false);
+      setCopyError(true);
     }
-  }, [raw]);
+  }, [clearCopyTimer, raw]);
 
   return (
     <div className="group relative my-2 rounded-lg border border-iron/40 bg-void/60 overflow-hidden">
@@ -121,12 +176,13 @@ function CodeBlock({ lang, raw, children }: CodeBlockProps) {
         <button
           type="button"
           onClick={handleCopy}
-          aria-label={`Copy ${lang} code`}
+          aria-label={`${copied ? 'Copied' : 'Copy'} ${lang} code`}
           className="text-bone-faint hover:text-cyan-glow transition-colors p-0.5 rounded"
         >
           {copied ? <Check size={12} /> : <Copy size={12} />}
         </button>
       </div>
+      {copyError && <p role="alert" className="px-2.5 py-1 text-[10px] text-red-300">Could not copy code to clipboard.</p>}
       <pre className="px-3 py-2.5 overflow-x-auto text-[11px] leading-relaxed font-mono">
         <code className={lang ? `hljs language-${lang}` : 'hljs'}>{children}</code>
       </pre>
