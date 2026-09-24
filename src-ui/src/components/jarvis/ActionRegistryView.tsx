@@ -2,10 +2,13 @@ import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { initialRegistryState, reduceRegistryState } from './action-registry-state';
 import {
+  isRegistryDispatchUnavailable,
+  isVerifiedRegistryDispatchEvidence,
   registryMutationConfirmed,
   registryMutationLocked,
   startRegistryMutation,
   transitionRegistryMutation,
+  type RegistryDispatchEvidence,
   type RegistryMutation,
   type RegistryMutationKind,
 } from './action-registry-mutation-state';
@@ -32,15 +35,6 @@ interface ActionRegistrySummary {
   alerts: number;
 }
 
-interface ExecutionEvidence {
-  run_id: string;
-  status: string;
-  acceptance_result?: string;
-  error_code?: string;
-  started_at?: string;
-  finished_at?: string;
-}
-
 interface RegistryAction {
   id: string;
   project: string;
@@ -59,7 +53,6 @@ interface RegistryAction {
   next_due?: string;
   escalated?: boolean;
   escalation_note?: string;
-  execution_evidence?: ExecutionEvidence;
   updated_at: string;
 }
 
@@ -96,7 +89,11 @@ type RegistryReadResult =
   | { status: 'success'; requestId: number; snapshot: RegistrySnapshot }
   | { status: 'failure' | 'stale' };
 
+const DISPATCH_UNAVAILABLE_MESSAGE =
+  'Action dispatch is unavailable because no authoritative verification path is configured. Registry data was not changed.';
+
 function mutationStatusText(mutation: RegistryMutation): string {
+  if (mutation.unavailable && mutation.phase === 'reconciling') return 'Refreshing action registry after unavailable dispatch…';
   if (mutation.phase === 'reconciling') return 'Action registry write saved. Reconciling the confirmed snapshot…';
   if (mutation.kind === 'sync') return 'Syncing action registry…';
   if (mutation.kind === 'approve') return 'Approving action…';
@@ -111,6 +108,7 @@ function mutationFailureText(mutation: RegistryMutation): string {
 }
 
 function mutationReadFailureText(mutation: RegistryMutation): string {
+  if (mutation.unavailable) return 'Action dispatch is unavailable. The action registry could not be refreshed; showing the previous snapshot; it may be stale.';
   if (mutation.kind === 'sync') return 'Action registry sync was saved, but the confirmed snapshot could not be reconciled. Showing the previous snapshot; it may be stale.';
   return 'The action registry write was saved, but the confirmed snapshot could not be reconciled. Showing the previous snapshot; it may be stale.';
 }
@@ -119,7 +117,7 @@ function mutationSuccessText(mutation: RegistryMutation): string {
   if (mutation.kind === 'sync') return 'Action registry synced from live adapters.';
   if (mutation.kind === 'approve') return 'Action approved successfully.';
   if (mutation.kind === 'waive') return 'Action waived successfully.';
-  return 'Action dispatched and verified.';
+  return 'Action registry update confirmed.';
 }
 
 export default function ActionRegistryView() {
@@ -174,31 +172,35 @@ export default function ActionRegistryView() {
     return () => clearInterval(interval);
   }, [fetchData]);
 
-  const reconcileMutation = useCallback(async (operation: RegistryMutation) => {
+  const reconcileMutation = useCallback(async (operation: RegistryMutation, dispatchEvidence?: RegistryDispatchEvidence) => {
     const result = await readSnapshot({ duringMutation: true, suppressError: true });
     if (result.status !== 'success') {
       const next = transitionRegistryMutation(operation, 'read-failed');
       if (next) publishMutation(next);
       return;
     }
-    if (!registryMutationConfirmed(operation, result.snapshot)) {
+    if (!operation.unavailable && !registryMutationConfirmed(operation, result.snapshot, dispatchEvidence)) {
       dispatch({ type: 'invalidate', requestId: result.requestId });
       publishMutation(transitionRegistryMutation(operation, 'read-failed'));
       return;
     }
     dispatch({ type: 'success', requestId: result.requestId, snapshot: result.snapshot });
     publishMutation(null);
-    success(mutationSuccessText(operation), operation.kind === 'sync' ? 'Registry Synced' : 'Action Updated');
+    if (!operation.unavailable) {
+      success(mutationSuccessText(operation), operation.kind === 'sync' ? 'Registry Synced' : 'Action Updated');
+    }
   }, [publishMutation, readSnapshot, success]);
 
   const handleMutation = useCallback(async (kind: RegistryMutationKind, id?: string) => {
     if (registryMutationLocked(mutationRef.current)) return;
     if (kind !== 'sync' && id === undefined) return;
-    if (kind === 'dispatch' && !active.some(action => action.id === id)) return;
+    if (kind === 'dispatch' && !active.some(action =>
+      action.id === id && (action.status === 'open' || action.status === 'in_progress'))) return;
     const operation = startRegistryMutation(kind, id);
     publishMutation(operation);
     const invalidationId = ++requestId.current;
     dispatch({ type: 'invalidate', requestId: invalidationId });
+    let dispatchEvidence: RegistryDispatchEvidence | undefined;
     try {
       if (kind === 'sync') {
         const result = await invoke<unknown>('sync_action_registry');
@@ -212,6 +214,12 @@ export default function ActionRegistryView() {
       } else {
         const result = await invoke<unknown>('dispatch_action', { actionId: id });
         if (result === false || result == null) throw new Error('Dispatch was not confirmed');
+        if (isRegistryDispatchUnavailable(result) || !isVerifiedRegistryDispatchEvidence(result)) {
+          const unavailable = transitionRegistryMutation(operation, 'dispatch-unavailable');
+          if (unavailable) publishMutation(unavailable);
+          return;
+        }
+        dispatchEvidence = result;
       }
     } catch {
       publishMutation(transitionRegistryMutation(operation, 'write-failed'));
@@ -220,13 +228,21 @@ export default function ActionRegistryView() {
     const reconciling = transitionRegistryMutation(operation, 'write-succeeded');
     if (reconciling) {
       publishMutation(reconciling);
-      await reconcileMutation(reconciling);
+      await reconcileMutation(reconciling, dispatchEvidence);
     }
   }, [active, publishMutation, reconcileMutation]);
 
   const retryMutation = useCallback(() => {
     const operation = mutationRef.current;
     if (!operation) return;
+    if (operation.phase === 'unavailable') {
+      const retrying = transitionRegistryMutation(operation, 'retry-read');
+      if (retrying) {
+        publishMutation(retrying);
+        void reconcileMutation(retrying);
+      }
+      return;
+    }
     if (operation.phase === 'write-failed') {
       void handleMutation(operation.kind, operation.id);
       return;
@@ -242,7 +258,12 @@ export default function ActionRegistryView() {
 
 
   const mutationFeedback = mutation ? (
-    mutation.phase === 'write-failed' ? (
+    mutation.phase === 'unavailable' ? (
+      <div role="alert" aria-label="Action registry mutation" className="text-sm text-amber-200">
+        {DISPATCH_UNAVAILABLE_MESSAGE}{' '}
+        <button type="button" className="underline" onClick={retryMutation}>Retry</button>
+      </div>
+    ) : mutation.phase === 'write-failed' ? (
       <div role="alert" aria-label="Action registry mutation" className="text-sm text-red-200">
         {mutationFailureText(mutation)}{' '}
         <button type="button" className="underline" onClick={retryMutation}>Retry</button>
@@ -384,7 +405,8 @@ function ActionCard({
   onWaive: (id: string) => void;
   onDispatch: (id: string) => void;
 }) {
-  const canDispatch = bucket === 'active' && action.status !== 'done' &&
+  const canDispatch = bucket === 'active' &&
+    (action.status === 'open' || action.status === 'in_progress') &&
     (!action.approval_required || action.approval_status === 'approved' || action.approval_status === 'waived');
 
   return (
@@ -403,11 +425,6 @@ function ActionCard({
                 </Pill>
               )}
               {action.escalated && <Pill variant="error">escalated</Pill>}
-              {action.execution_evidence && (
-                <Pill variant={action.execution_evidence.status === 'verified' ? 'success' : 'warning'}>
-                  {action.execution_evidence.status}
-                </Pill>
-              )}
             </div>
             <h4 className="text-sm font-semibold text-bone mb-1">{action.title}</h4>
             <p className="text-xs text-bone-muted leading-relaxed">{action.description}</p>
@@ -416,11 +433,6 @@ function ActionCard({
               {action.next_due && <span>due {action.next_due}</span>}
               <span>updated {action.updated_at}</span>
             </div>
-            {action.execution_evidence?.acceptance_result && (
-              <p className="text-[10px] font-mono text-bone-dim mt-2 line-clamp-2">
-                {action.execution_evidence.acceptance_result}
-              </p>
-            )}
             {action.escalation_note && (
               <p className="text-[11px] text-amber-200/80 mt-2 font-mono">{action.escalation_note}</p>
             )}

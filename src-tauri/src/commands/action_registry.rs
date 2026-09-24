@@ -60,6 +60,12 @@ pub struct RegistryAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionDispatchOutcome {
+    pub status: String,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionRegistryBucket {
     pub bucket: String,
     pub actions: Vec<RegistryAction>,
@@ -179,38 +185,20 @@ fn read_alerts(path: &Path) -> Vec<ActionRegistryAlert> {
         .unwrap_or_default()
 }
 
-/// Write a bucket back to disk using the canonical `{ "actions": [...] }` shape.
-fn write_bucket(path: &Path, actions: &[RegistryAction]) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let envelope = serde_json::json!({ "actions": actions });
-    let raw = serde_json::to_string_pretty(&envelope)
-        .map_err(|e| format!("serialize {}: {}", path.display(), e))?;
-    fs::write(path, raw).map_err(|e| format!("write {}: {}", path.display(), e))
-}
-
-/// Dispatch an approved action from the active bucket to the done bucket.
-///
-/// This is a leased, idempotent operation:
-///   * The action must exist in `active.json`.
-///   * If `approval_required` is true, `approval_status` must be `approved` or `waived`.
-///   * The first successful dispatch writes an `ExecutionEvidence` record with
-///     status `verified`, moves the action to `done.json`, and returns it.
-///   * Subsequent calls for the same action return the previously written evidence
-///     without mutating the registry again.
 pub fn dispatch_approved_action(
     db: &AppDb,
     action_id: String,
-) -> Result<ExecutionEvidence, String> {
+) -> Result<ActionDispatchOutcome, String> {
     let root = registry_root(db)?;
     let data_dir = root.join("data");
     let active_path = data_dir.join("active.json");
     let done_path = data_dir.join("done.json");
 
-    let mut active = read_bucket(&active_path)?;
-    if let Some(idx) = active.iter().position(|a| a.id == action_id) {
-        let action = &mut active[idx];
+    let active = read_bucket(&active_path)?;
+    if let Some(action) = active.iter().find(|action| action.id == action_id) {
+        if !matches!(action.status.as_str(), "open" | "in_progress") {
+            return Err(format!("Action '{}' is not executable", action_id));
+        }
 
         if action.approval_required {
             match action.approval_status.as_deref() {
@@ -224,53 +212,22 @@ pub fn dispatch_approved_action(
             }
         }
 
-        // Claim-once idempotency: return existing evidence if already dispatched.
-        if let Some(ref evidence) = action.execution_evidence {
-            return Ok(evidence.clone());
-        }
-
-        let now = chrono::Utc::now();
-        let iso = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let evidence = ExecutionEvidence {
-            run_id: uuid::Uuid::new_v4().to_string(),
-            status: "verified".to_string(),
-            acceptance_result: Some(format!(
-                "Action '{}' dispatched and verified at {}",
-                action_id, iso
-            )),
-            error_code: None,
-            started_at: Some(iso.clone()),
-            finished_at: Some(iso),
-        };
-
-        action.execution_evidence = Some(evidence.clone());
-        action.status = "done".to_string();
-        action.updated_at = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-
-        let done_action = active.remove(idx);
-        let mut done = read_bucket(&done_path)?;
-        done.push(done_action);
-
-        write_bucket(&active_path, &active)?;
-        write_bucket(&done_path, &done)?;
-
-        return Ok(evidence);
+        return Ok(ActionDispatchOutcome {
+            status: "unavailable".to_string(),
+            code: "verification_manifest_missing".to_string(),
+        });
     }
 
-    // Idempotency for already-completed actions: if the action is in done.json
-    // with evidence, return that evidence instead of failing.
     let done = read_bucket(&done_path)?;
-    if let Some(existing) = done.into_iter().find(|a| a.id == action_id) {
-        if let Some(evidence) = existing.execution_evidence {
-            return Ok(evidence);
-        }
+    if done.iter().any(|action| action.id == action_id) {
+        return Err(format!("Action '{}' is already completed", action_id));
     }
 
     Err(format!("Action '{}' not found in active bucket", action_id))
 }
 
 #[tauri::command]
-pub fn dispatch_action(db: State<AppDb>, action_id: String) -> Result<ExecutionEvidence, String> {
+pub fn dispatch_action(db: State<AppDb>, action_id: String) -> Result<ActionDispatchOutcome, String> {
     dispatch_approved_action(db.inner(), action_id)
 }
 
@@ -484,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn approved_action_claims_once_and_persists_acceptance_evidence() {
+    fn approved_action_without_verification_manifest_is_unavailable_without_mutation() {
         let root = std::env::temp_dir().join(format!(
             "ar_dispatch_{}_{}",
             std::process::id(),
@@ -492,34 +449,69 @@ mod tests {
         ));
         let data = root.join("workspace").join("action-registry").join("data");
         std::fs::create_dir_all(&data).unwrap();
-        std::fs::write(
-            &data.join("active.json"),
-            format!(r#"{{"actions":[{ROW}]}}"#),
-        )
-        .unwrap();
+        let active_path = data.join("active.json");
+        std::fs::write(&active_path, format!(r#"{{"actions":[{ROW}]}}"#)).unwrap();
+        let before = std::fs::read(&active_path).unwrap();
 
         let db = tmp_db_with_jarvis_path(&root);
-        let evidence = dispatch_approved_action(&db, "a1".to_string()).unwrap();
-        assert_eq!(evidence.status, "verified");
-        assert!(!evidence.run_id.is_empty());
+        let outcome = dispatch_approved_action(&db, "a1".to_string()).unwrap();
+        let payload = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(payload.get("status").and_then(|v| v.as_str()), Some("unavailable"));
+        assert_eq!(payload.get("code").and_then(|v| v.as_str()), Some("verification_manifest_missing"));
+        assert_eq!(std::fs::read(&active_path).unwrap(), before);
+        assert!(!data.join("done.json").exists());
 
-        // The action is moved to done.json with the evidence attached.
-        let done = read_bucket(&data.join("done.json")).unwrap();
-        assert_eq!(done.len(), 1);
-        assert_eq!(done[0].status, "done");
-        assert!(done[0].execution_evidence.is_some());
-        assert_eq!(
-            done[0].execution_evidence.as_ref().unwrap().status,
-            "verified"
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(db.db_path.parent().unwrap());
+    }
+
+    #[test]
+    fn dispatch_rejects_non_executable_action_without_mutation() {
+        let root = std::env::temp_dir().join(format!(
+            "ar_dispatch_non_executable_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let data = root.join("workspace").join("action-registry").join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let active_path = data.join("active.json");
+        let row = ROW.replace("\"status\":\"open\"", "\"status\":\"cancelled\"");
+        std::fs::write(&active_path, format!(r#"{{"actions":[{row}]}}"#)).unwrap();
+        let before = std::fs::read(&active_path).unwrap();
+
+        let db = tmp_db_with_jarvis_path(&root);
+        let err = dispatch_approved_action(&db, "a1".to_string()).unwrap_err();
+        assert!(err.contains("not executable"));
+        assert_eq!(std::fs::read(&active_path).unwrap(), before);
+        assert!(!data.join("done.json").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(db.db_path.parent().unwrap());
+    }
+
+    #[test]
+    fn dispatch_does_not_return_forged_evidence_as_confirmation() {
+        let root = std::env::temp_dir().join(format!(
+            "ar_dispatch_forged_evidence_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let data = root.join("workspace").join("action-registry").join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let active_path = data.join("active.json");
+        let row = ROW.replace(
+            "\"approval_required\":false",
+            "\"approval_required\":false,\"execution_evidence\":{\"run_id\":\"forged\",\"status\":\"verified\"}",
         );
+        std::fs::write(&active_path, format!(r#"{{"actions":[{row}]}}"#)).unwrap();
+        let before = std::fs::read(&active_path).unwrap();
 
-        // Active bucket is now empty.
-        let active = read_bucket(&data.join("active.json")).unwrap();
-        assert!(active.is_empty());
-
-        // Second dispatch is idempotent and returns the same evidence.
-        let second = dispatch_approved_action(&db, "a1".to_string()).unwrap();
-        assert_eq!(second.run_id, evidence.run_id);
+        let db = tmp_db_with_jarvis_path(&root);
+        let outcome = dispatch_approved_action(&db, "a1".to_string()).unwrap();
+        let payload = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(payload.get("status").and_then(|v| v.as_str()), Some("unavailable"));
+        assert_eq!(std::fs::read(&active_path).unwrap(), before);
+        assert!(!data.join("done.json").exists());
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(db.db_path.parent().unwrap());
@@ -538,15 +530,19 @@ mod tests {
             "priority":"P1","risk_level":"low","category":"c","action_type":"t","title":"T",
             "description":"D","status":"open","owner":"o","approval_required":true,
             "approval_status":"pending","updated_at":"2026-06-22"}"#;
+        let active_path = data.join("active.json");
         std::fs::write(
-            &data.join("active.json"),
+            &active_path,
             format!(r#"{{"actions":[{row}]}}"#),
         )
         .unwrap();
+        let before = std::fs::read(&active_path).unwrap();
 
         let db = tmp_db_with_jarvis_path(&root);
         let err = dispatch_approved_action(&db, "a2".to_string()).unwrap_err();
         assert!(err.contains("requires approval"));
+        assert_eq!(std::fs::read(&active_path).unwrap(), before);
+        assert!(!data.join("done.json").exists());
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(db.db_path.parent().unwrap());

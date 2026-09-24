@@ -73,6 +73,7 @@ const action = (id: string, title: string, approvalRequired = false): Action => 
 const alpha = action('alpha', 'Alpha');
 const beta = action('beta', 'Beta', true);
 const blocked = action('blocked', 'Blocked');
+const unavailableDispatch = { status: 'unavailable', code: 'verification_manifest_missing' } as const;
 
 let reads: ReadRequest[] = [];
 let latestRead: ReadRequest;
@@ -105,7 +106,7 @@ beforeEach(() => {
     if (command === 'get_action_registry_bucket' && args?.bucket === 'active') return latestRead.active.promise;
     if (command === 'get_action_registry_bucket' && args?.bucket === 'blocked') return latestRead.blocked.promise;
     if (command === 'sync_action_registry') return nextWrite?.promise ?? Promise.resolve({ synced: true });
-    if (command === 'update_action_approval' || command === 'dispatch_action') return nextWrite?.promise ?? Promise.resolve(command === 'dispatch_action' ? { status: 'verified' } : true);
+    if (command === 'update_action_approval' || command === 'dispatch_action') return nextWrite?.promise ?? Promise.resolve(command === 'dispatch_action' ? unavailableDispatch : true);
     throw new Error(`Unexpected command: ${command}`);
   });
 });
@@ -182,25 +183,52 @@ describe('ActionRegistryView mutation coordination', () => {
 
     expect(screen.getByText(button === 'Approve Beta' ? 'Beta' : 'Alpha')).toBeInTheDocument();
     expect(screen.getByRole('alert', { name: 'Action registry mutation' })).toHaveTextContent('Previous snapshot was kept.');
+    expect(screen.queryByText('Action dispatched and verified.')).not.toBeInTheDocument();
     expect(screen.queryByText('private native mutation detail')).not.toBeInTheDocument();
     const retry = screen.getByRole('button', { name: 'Retry' });
     const next = queueWrite();
     fireEvent.click(retry);
     fireEvent.click(retry);
     expect(mutationCalls()).toHaveLength(2);
-    await act(async () => next.resolve(command === 'dispatch_action' ? { status: 'verified' } : true));
+    await act(async () => next.resolve(command === 'dispatch_action' ? unavailableDispatch : true));
   });
 
-  it('confirms dispatch only after the active row disappears from the post-write snapshot', async () => {
+  it('keeps an approved action active when dispatch is unavailable and offers read-only recovery', async () => {
     await mount();
     const write = queueWrite();
     fireEvent.click(screen.getByRole('button', { name: 'Dispatch Alpha' }));
-    await act(async () => write.resolve({ status: 'verified' }));
+    await act(async () => write.resolve(unavailableDispatch));
+
+    expect(screen.getByRole('alert', { name: 'Action registry mutation' })).toHaveTextContent(
+      'Action dispatch is unavailable because no authoritative verification path is configured. Registry data was not changed.',
+    );
+    expect(screen.getByText('Alpha')).toBeInTheDocument();
     expect(screen.queryByText('Action dispatched and verified.')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Dispatch Alpha' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
+
+    const retry = screen.getByRole('button', { name: 'Retry' });
+    fireEvent.click(retry);
+    fireEvent.click(retry);
     expect(reads).toHaveLength(2);
-    await resolveRead(1, [beta], [blocked]);
-    expect(screen.getByText('Action dispatched and verified.')).toBeInTheDocument();
-    expect(screen.queryByText('Alpha')).not.toBeInTheDocument();
+    expect(mutationCalls()).toHaveLength(1);
+    expect(invokeMock).toHaveBeenCalledWith('dispatch_action', { actionId: 'alpha' });
+    await resolveRead(1, [alpha, beta], [blocked]);
+    expect(screen.queryByRole('alert', { name: 'Action registry mutation' })).not.toBeInTheDocument();
+    expect(screen.queryByText('Action dispatched and verified.')).not.toBeInTheDocument();
+  });
+
+  it('does not treat an evidence-free dispatch response as verification', async () => {
+    await mount();
+    const write = queueWrite();
+    fireEvent.click(screen.getByRole('button', { name: 'Dispatch Alpha' }));
+    await act(async () => write.resolve({}));
+
+    expect(screen.getByRole('alert', { name: 'Action registry mutation' })).toHaveTextContent(
+      'Action dispatch is unavailable because no authoritative verification path is configured. Registry data was not changed.',
+    );
+    expect(screen.getByText('Alpha')).toBeInTheDocument();
+    expect(screen.queryByText('Action dispatched and verified.')).not.toBeInTheDocument();
   });
 
   it('does not announce a confirmed write until readback and retries a failed read without rewriting', async () => {
