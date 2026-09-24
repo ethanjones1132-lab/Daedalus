@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .briefing import brief_markdown, build_brief, select_next
+from .briefing import brief_markdown, build_brief, select_next_with_reason
 from .dedupe import run_dedupe
 from .metrics import compute_metrics
 from .models import validate_action
@@ -123,14 +123,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "next":
-        action = select_next(store)
+        action, selection = select_next_with_reason(store)
         if action is None:
-            print(json.dumps({"ok": True, "next": None}, indent=2))
+            print(json.dumps({"ok": True, "next": None, "selection": selection}, indent=2))
             return 0
         if args.format == "markdown":
-            print(f"# Next Action\n\n**{action['title']}** (`{action['id']}`)\n")
+            print(
+                f"# Next Action\n\n**{action['title']}** (`{action['id']}`)\n"
+                f"\nSelection: {selection['reason']}\n"
+            )
         else:
-            print(json.dumps({"ok": True, "next": action}, indent=2))
+            print(json.dumps({"ok": True, "next": action, "selection": selection}, indent=2))
         return 0
 
     if args.command == "dedupe":
