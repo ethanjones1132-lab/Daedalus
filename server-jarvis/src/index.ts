@@ -219,10 +219,8 @@ import {
   type TaskRunContract,
 } from "./orchestration/task-run";
 import { collectToolPathTargets } from "./orchestration/mid-loop-intervention";
-import {
-  INFERENCE_FEEDBACK_CRON_JOB_ID,
-  refreshInferenceFeedback,
-} from "./self-tuning/inference-feedback-refresh";
+import { INFERENCE_FEEDBACK_CRON_JOB_ID, refreshInferenceFeedback } from "./self-tuning/inference-feedback-refresh";
+import { handleCronRunRequest } from "./cron-inference";
 
 // ── Structured Logging Override ──────────────────────────────────────────────
 const originalLog = console.log;
@@ -1237,179 +1235,6 @@ class DegenerateStreamError extends Error {
   }
 }
 
-/** Collect aggregate answer from a streamJarvis Response (cron scheduler contract). */
-async function drainStreamJarvisResponse(resp: Response): Promise<{ output: string; error?: string }> {
-  const reader = resp.body?.getReader();
-  if (!reader) return { output: "", error: "No response body" };
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let streamed = "";
-  let aggregate = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("data: ")) continue;
-      const payload = trimmed.slice(6);
-      if (payload === "[DONE]") continue;
-      try {
-        const evt = JSON.parse(payload);
-        if (evt.type === "stream_event" && evt.delta?.text) streamed += evt.delta.text;
-        if (evt.type === "result" && typeof evt.result === "string") aggregate = evt.result;
-        if (evt.type === "error" && evt.error) return { output: streamed, error: String(evt.error) };
-        if (evt.type === "cancelled") return { output: streamed, error: "cancelled" };
-      } catch {
-        // skip malformed frames
-      }
-    }
-  }
-  return { output: aggregate || streamed };
-}
-
-/** Non-streaming cron dispatch — matches cron_scheduler.rs JSON contract. */
-async function runCronInference(body: Record<string, unknown>): Promise<{
-  success: boolean;
-  output: string;
-  error?: string;
-  execution_evidence?: {
-    run_id: string;
-    status: "success" | "failed" | "cancelled" | "timeout";
-    started_at: string;
-    finished_at: string;
-    acceptance_result?: string;
-    error_code?: string;
-  };
-}> {
-  const run_id = crypto.randomUUID();
-  const started_at = new Date().toISOString();
-  if (String(body.job_id ?? "") === INFERENCE_FEEDBACK_CRON_JOB_ID) {
-    const refreshed = await refreshInferenceFeedback();
-    const finished_at = new Date().toISOString();
-    const status: "success" | "failed" = refreshed.success ? "success" : "failed";
-    return {
-      success: refreshed.success,
-      output: refreshed.output || (refreshed.success
-        ? `Applied ${refreshed.applied ?? 0} inference feedback adjustment(s).`
-        : ""),
-      error: refreshed.error,
-      execution_evidence: {
-        run_id,
-        status,
-        started_at,
-        finished_at,
-        acceptance_result: refreshed.output || status,
-        error_code: refreshed.error ? "refresh_failed" : undefined,
-      },
-    };
-  }
-  const prompt = String(body.prompt ?? "");
-  if (!prompt.trim()) {
-    return {
-      success: false,
-      output: "",
-      error: "prompt required",
-      execution_evidence: {
-        run_id,
-        status: "failed",
-        started_at,
-        finished_at: new Date().toISOString(),
-        acceptance_result: "prompt required",
-        error_code: "missing_prompt",
-      },
-    };
-  }
-  const sessionId = String(body.session_id ?? `cron_${crypto.randomUUID()}`);
-  const projectionValue = body.projection_snapshot;
-  let canonicalInstructions: string | undefined;
-  if (projectionValue !== undefined && projectionValue !== null) {
-    if (typeof projectionValue !== "object" || typeof (projectionValue as { slug?: unknown }).slug !== "string") {
-      return {
-        success: false,
-        output: "",
-        error: "invalid projection snapshot",
-        execution_evidence: {
-          run_id,
-          status: "failed",
-          started_at,
-          finished_at: new Date().toISOString(),
-          acceptance_result: "invalid projection snapshot",
-          error_code: "projection_invalid",
-        },
-      };
-    }
-    const validation = validateLifecycleSnapshot(agentLifecycle, projectionValue as LifecycleSnapshot);
-    if (!validation.ok) {
-      return {
-        success: false,
-        output: "",
-        error: validation.message,
-        execution_evidence: {
-          run_id,
-          status: "failed",
-          started_at,
-          finished_at: new Date().toISOString(),
-          acceptance_result: validation.message,
-          error_code: validation.code,
-        },
-      };
-    }
-    canonicalInstructions = validation.entry.instructions;
-  }
-  try {
-    const resp = await streamJarvis(prompt, sessionId, {
-      surface: "cron",
-      systemPromptOverride: canonicalInstructions,
-    });
-    const { output, error } = await drainStreamJarvisResponse(resp);
-    const finished_at = new Date().toISOString();
-    if (error) {
-      return {
-        success: false,
-        output,
-        error,
-        execution_evidence: {
-          run_id,
-          status: "failed",
-          started_at,
-          finished_at,
-          acceptance_result: error,
-          error_code: "inference_failed",
-        },
-      };
-    }
-    return {
-      success: true,
-      output,
-      execution_evidence: {
-        run_id,
-        status: "success",
-        started_at,
-        finished_at,
-        acceptance_result: output.slice(0, 500),
-      },
-    };
-  } catch (e: any) {
-    const finished_at = new Date().toISOString();
-    const message = e?.message ?? String(e);
-    return {
-      success: false,
-      output: "",
-      error: message,
-      execution_evidence: {
-        run_id,
-        status: "failed",
-        started_at,
-        finished_at,
-        acceptance_result: message,
-        error_code: "exception",
-      },
-    };
-  }
-}
 
 async function streamJarvis(message: string, sessionId: string, options: StreamJarvisOptions = {}): Promise<Response> {
   const turnStartedAt = Date.now();
@@ -5430,8 +5255,12 @@ export async function baseFetch(req: Request): Promise<Response> {
     }
     if (path === "/cron/run" && req.method === "POST") {
       const body = await req.json().catch(() => ({}));
-      const result = await runCronInference(body as Record<string, unknown>);
-      return Response.json(result);
+      return handleCronRunRequest(body as Record<string, unknown>, {
+        stream: streamJarvis,
+        validateProjection: (snapshot) => validateLifecycleSnapshot(agentLifecycle, snapshot as LifecycleSnapshot),
+        refreshInferenceFeedback,
+        feedbackJobId: INFERENCE_FEEDBACK_CRON_JOB_ID,
+      });
     }
     if (path === "/chat/stream" && req.method === "POST") {
       const body = await req.json();
