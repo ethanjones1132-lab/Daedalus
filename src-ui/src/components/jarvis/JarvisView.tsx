@@ -8,7 +8,7 @@ import {
   JarvisSession, JarvisMessage, JarvisConfig, JarvisStatus, SessionRunRecord,
   OPENROUTER_MODELS,
 } from './types';
-import ControlCenterView from './ControlCenterView';
+import ControlCenterView, { type ControlCenterTab } from './ControlCenterView';
 import { sessionScroll } from './session-scroll';
 import MarkdownView from './MarkdownView';
 import WorkspaceGrantsChip from './WorkspaceGrantsChip';
@@ -70,6 +70,7 @@ type JarvisSubView = 'chat' | 'sessions' | 'config' | 'status' | 'control';
 
 interface JarvisViewProps {
   initialSubView?: JarvisSubView;
+  initialControlTab?: ControlCenterTab;
   onCompanionChange?: (companion: CompanionState | null) => void;
 }
 
@@ -106,7 +107,7 @@ class JarvisStreamError extends Error {
   }
 }
 
-export default function JarvisView({ initialSubView = 'chat', onCompanionChange }: JarvisViewProps) {
+export default function JarvisView({ initialSubView = 'chat', initialControlTab, onCompanionChange }: JarvisViewProps) {
   const [subView, setSubView] = useState<JarvisSubView>(initialSubView);
   const [sessions, setSessions] = useState<JarvisSession[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(true);
@@ -419,7 +420,7 @@ export default function JarvisView({ initialSubView = 'chat', onCompanionChange 
           )}
           {subView === 'control' && (
             <motion.div key="control" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="h-full">
-              <ControlCenterView />
+              <ControlCenterView initialTab={initialControlTab} />
             </motion.div>
           )}
         </AnimatePresence>

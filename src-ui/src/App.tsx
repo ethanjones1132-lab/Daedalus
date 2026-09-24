@@ -734,7 +734,7 @@ function AppInner() {
       case 'sessions': return <SessionsView />;
       case 'config': return <ErrorBoundary><JarvisView initialSubView="config" onCompanionChange={setCompanion} /></ErrorBoundary>;
       case 'health': return <ErrorBoundary><JarvisView initialSubView="status" onCompanionChange={setCompanion} /></ErrorBoundary>;
-      case 'models':
+      case 'models': return <ErrorBoundary><JarvisView initialSubView="control" initialControlTab="profiles" onCompanionChange={setCompanion} /></ErrorBoundary>;
       case 'jarvis-config':
       case 'jarvis-status':
       case 'control': return <ErrorBoundary><JarvisView initialSubView="control" onCompanionChange={setCompanion} /></ErrorBoundary>;

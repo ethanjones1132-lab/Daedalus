@@ -60,6 +60,7 @@ afterEach(() => {
 const destinations = [
   { id: 'config', label: 'Config', heading: 'Configuration' },
   { id: 'health', label: 'Health', heading: 'Status' },
+  { id: 'models', label: 'Models', heading: 'Model Profiles' },
 ];
 async function expectDestination(destination: typeof destinations[number]) {
   expect(await screen.findByRole('heading', { name: destination.heading, level: 2 })).toBeInTheDocument();
@@ -69,9 +70,12 @@ async function expectDestination(destination: typeof destinations[number]) {
   if (destination.id === 'config') {
     expect(screen.getByRole('button', { name: 'Save Config' })).toBeEnabled();
     expect(screen.getByPlaceholderText('e.g., qwen2.5-coder:7b')).toHaveValue('navigation-test-model');
-  } else {
+  } else if (destination.id === 'health') {
     expect(screen.getByText('navigation-test-model', { selector: 'p' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Refresh status' })).toBeEnabled();
+  } else {
+    expect(screen.getByRole('button', { name: 'New profile' })).toBeEnabled();
+    expect(screen.queryByRole('button', { name: 'New profile' })).toBeInTheDocument();
   }
 }
 
@@ -92,7 +96,12 @@ describe('App Config and Health destinations', () => {
     }
     for (const label of ['Models', 'Control']) {
       fireEvent.click(within(screen.getByRole('navigation')).getByRole('button', { name: new RegExp(label) }));
-      expect(await screen.findByRole('heading', { name: 'Control Center' })).toBeInTheDocument();
+      if (label === 'Models') {
+        expect(await screen.findByRole('heading', { name: 'Model Profiles' })).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: 'New profile' })).toBeEnabled();
+      } else {
+        expect(await screen.findByRole('heading', { name: 'Control Center' })).toBeInTheDocument();
+      }
       expect(screen.getByRole('heading', { name: label, level: 1 })).toBeInTheDocument();
       expect(screen.queryByRole('heading', { name: 'Configuration' })).not.toBeInTheDocument();
       expect(screen.queryByRole('heading', { name: 'Status', level: 2 })).not.toBeInTheDocument();

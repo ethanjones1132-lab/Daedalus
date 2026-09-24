@@ -24,6 +24,12 @@ import {
   useToast,
 } from '../ui';
 import McpPanel from './McpPanel';
+import {
+  DEFAULT_MODEL_PROFILE_DRAFT,
+  validateCreateProfileDraft,
+  type CreateProfileArgs,
+  type ModelProfileDraft,
+} from './model-profile-creation-state';
 
 // ── Types (mirror the Rust command return shapes) ──────────────
 
@@ -96,9 +102,9 @@ interface DoctorReport {
   timestamp: string;
 }
 
-type Tab = 'overview' | 'profiles' | 'diagnostics' | 'mcp';
+export type ControlCenterTab = 'overview' | 'profiles' | 'diagnostics' | 'mcp';
 
-const TABS: Array<{ id: Tab; label: string }> = [
+const TABS: Array<{ id: ControlCenterTab; label: string }> = [
   { id: 'overview', label: 'Overview' },
   { id: 'profiles', label: 'Profiles' },
   { id: 'diagnostics', label: 'Diagnostics' },
@@ -141,20 +147,20 @@ function useControlResource<S>(command: string) {
   const request = useRef(0);
   const pending = useRef(false);
   const load = useCallback(async (supersede = false) => {
-    if (pending.current && !supersede) return;
+    if (pending.current && !supersede) return null;
     pending.current = true;
     const requestId = ++request.current;
     setState((prev) => reduceRegistryState(prev, { type: 'pending', requestId }));
     try {
       const snapshot = await invoke<S>(command);
       if (snapshot == null) throw new Error('Missing observation');
-      if (request.current !== requestId) return false;
+      if (request.current !== requestId) return null;
       setState((prev) => reduceRegistryState(prev, { type: 'success', requestId, snapshot }));
-      return true;
+      return snapshot;
     } catch {
-      if (request.current !== requestId) return false;
+      if (request.current !== requestId) return null;
       setState((prev) => reduceRegistryState(prev, { type: 'failure', requestId }));
-      return false;
+      return null;
     } finally {
       if (request.current === requestId) pending.current = false;
     }
@@ -194,8 +200,12 @@ function ObservationFeedback({ label, resource }: {
 
 // ── Main view ──────────────────────────────────────────────────
 
-export default function ControlCenterView() {
-  const [tab, setTab] = useState<Tab>('overview');
+interface ControlCenterViewProps {
+  initialTab?: ControlCenterTab;
+}
+
+export default function ControlCenterView({ initialTab = 'overview' }: ControlCenterViewProps) {
+  const [tab, setTab] = useState<ControlCenterTab>(initialTab);
   const profileResource = useControlResource<ModelProfile[]>('list_model_profiles');
   const healthResource = useControlResource<HealthData>('get_system_health');
   const doctorResource = useControlResource<DoctorReport>('get_doctor_report');
@@ -207,6 +217,14 @@ export default function ControlCenterView() {
   const doctor = doctorResource.snapshot;
   const loading = profileResource.loading || healthResource.loading || doctorResource.loading;
   const [pendingDelete, setPendingDelete] = useState<ModelProfile | null>(null);
+  const [profileDraft, setProfileDraft] = useState<ModelProfileDraft>({ ...DEFAULT_MODEL_PROFILE_DRAFT });
+  const [showProfileForm, setShowProfileForm] = useState(false);
+  const [creatingProfile, setCreatingProfile] = useState(false);
+  const [profileCreateStage, setProfileCreateStage] = useState<'write' | 'readback' | null>(null);
+  const [profileCreationError, setProfileCreationError] = useState<'validation' | 'write' | 'reconciliation' | null>(null);
+  const [profileCreationMessage, setProfileCreationMessage] = useState<string | null>(null);
+  const profileCreatePending = useRef(false);
+  const createdProfileId = useRef<string | null>(null);
   const operationPhase = useRef<ProfileOperationPhase>('idle');
   const [phase, setPhase] = useState<ProfileOperationPhase>('idle');
   const [operation, setOperation] = useState<{ kind: 'activate' | 'delete'; profile: ModelProfile } | null>(null);
@@ -215,12 +233,12 @@ export default function ControlCenterView() {
     operationPhase.current = reduceProfileOperation(operationPhase.current, event);
     setPhase(operationPhase.current);
   }, []);
-  const mutationLocked = profileOperationLocked(phase);
+  const mutationLocked = profileOperationLocked(phase) || creatingProfile || profileCreationError === 'reconciliation';
   const [restarting, setRestarting] = useState<SubsystemKey | null>(null);
   const { success, error: toastError } = useToast();
 
   const refreshProfiles = useCallback(async (supersede = false) => {
-    if (profileOperationLocked(operationPhase.current)) return;
+    if (profileOperationLocked(operationPhase.current) || profileCreatePending.current) return null;
     return loadProfiles(supersede);
   }, [loadProfiles]);
 
@@ -244,8 +262,97 @@ export default function ControlCenterView() {
     await reconcileProfiles();
   }, [transition, reconcileProfiles]);
 
+  const createProfile = useCallback(async () => {
+    if (profileCreatePending.current || profileOperationLocked(operationPhase.current)) return;
+    const validation = validateCreateProfileDraft(profileDraft);
+    if (!validation.valid) {
+      setProfileCreationError('validation');
+      setProfileCreationMessage(validation.message);
+      return;
+    }
+    const args: CreateProfileArgs = validation.args;
+    profileCreatePending.current = true;
+    setCreatingProfile(true);
+    setProfileCreateStage('write');
+    if (profileCreationError === 'validation') {
+      setProfileCreationError(null);
+      setProfileCreationMessage(null);
+    }
+    setPendingDelete(null);
+    createdProfileId.current = null;
+    invalidateProfiles();
+    let stage: 'write' | 'reconciliation' = 'write';
+    try {
+      const created = await invoke<ModelProfile>('create_profile', args);
+      stage = 'reconciliation';
+      setProfileCreateStage('readback');
+      if (!created || typeof created.id !== 'string' || created.id.length === 0) {
+        throw new Error('Missing created profile identity');
+      }
+      createdProfileId.current = created.id;
+      const observed = await loadProfiles(true);
+      if (!observed?.some((profile) => profile.id === created.id)) {
+        setProfileCreationError('reconciliation');
+        setProfileCreationMessage('Profile created, but the profile list did not confirm it. Retry reloads the list only.');
+        setProfileCreateStage(null);
+        setShowProfileForm(false);
+        return;
+      }
+      createdProfileId.current = null;
+      setProfileDraft({ ...DEFAULT_MODEL_PROFILE_DRAFT });
+      setShowProfileForm(false);
+      setProfileCreationError(null);
+      setProfileCreationMessage(null);
+      setProfileCreateStage(null);
+      success(`Created "${args.name}"`);
+    } catch {
+      setProfileCreateStage(null);
+      if (stage === 'write') {
+        setProfileCreationError('write');
+        setProfileCreationMessage('Could not create profile. Your draft has been kept.');
+        setShowProfileForm(true);
+      } else {
+        setProfileCreationError('reconciliation');
+        setProfileCreationMessage('Profile created, but the profile list did not confirm it. Retry reloads the list only.');
+        setShowProfileForm(false);
+      }
+    } finally {
+      profileCreatePending.current = false;
+      setCreatingProfile(false);
+    }
+  }, [profileDraft, profileCreationError, invalidateProfiles, loadProfiles, success]);
+
+  const retryProfileReadback = useCallback(async () => {
+    if (profileCreationError !== 'reconciliation' || profileCreatePending.current) return;
+    const id = createdProfileId.current;
+    if (!id) return;
+    profileCreatePending.current = true;
+    setCreatingProfile(true);
+    setProfileCreateStage('readback');
+    try {
+      const observed = await loadProfiles(true);
+      if (!observed?.some((profile) => profile.id === id)) {
+        setProfileCreationError('reconciliation');
+        setProfileCreationMessage('Profile created, but the profile list did not confirm it. Retry reloads the list only.');
+        return;
+      }
+      createdProfileId.current = null;
+      setProfileDraft({ ...DEFAULT_MODEL_PROFILE_DRAFT });
+      setProfileCreationError(null);
+      setProfileCreationMessage(null);
+      setProfileCreateStage(null);
+      success(`Created "${profileDraft.name.trim()}"`);
+    } catch {
+      setProfileCreationError('reconciliation');
+      setProfileCreationMessage('Profile created, but the profile list did not confirm it. Retry reloads the list only.');
+    } finally {
+      profileCreatePending.current = false;
+      setCreatingProfile(false);
+    }
+  }, [loadProfiles, profileCreationError, profileDraft.name, success]);
+
   const mutateProfile = useCallback(async (kind: 'activate' | 'delete', profile: ModelProfile) => {
-    if (profileOperationLocked(operationPhase.current)) return;
+    if (profileOperationLocked(operationPhase.current) || profileCreatePending.current) return;
     transition('submit');
     setOperation({ kind, profile });
     setPendingDelete(null);
@@ -271,7 +378,7 @@ export default function ControlCenterView() {
 
   const activate = useCallback((profile: ModelProfile) => mutateProfile('activate', profile), [mutateProfile]);
   const remove = useCallback((profile: ModelProfile) => {
-    if (!profileOperationLocked(operationPhase.current)) setPendingDelete(profile);
+    if (!profileOperationLocked(operationPhase.current) && !profileCreatePending.current) setPendingDelete(profile);
   }, []);
   const confirmDelete = useCallback(async () => {
     if (pendingDelete) await mutateProfile('delete', pendingDelete);
@@ -312,13 +419,13 @@ export default function ControlCenterView() {
         onCancel={() => setPendingDelete(null)}
       />
       <SectionHeader
-        title="Control Center"
+        title={tab === 'profiles' ? 'Model Profiles' : 'Control Center'}
         subtitle="Profiles, diagnostics, and system operations"
         action={
           <button
             type="button"
-            onClick={() => { if (!loading) void fetchAll(); }}
-            disabled={loading}
+            onClick={() => { if (!loading && !creatingProfile) void fetchAll(); }}
+            disabled={loading || creatingProfile}
             className="px-3 py-1.5 text-xs rounded-lg border border-white/10 text-bone/60 hover:text-bone transition-colors"
           >
             Refresh
@@ -344,9 +451,33 @@ export default function ControlCenterView() {
 
       <div className="flex-1 overflow-y-auto min-h-0">
         {(tab === 'overview' || tab === 'profiles') && (
-          <div className="space-y-2 text-xs text-bone/60">
-            {!mutationLocked && <ObservationFeedback label="Profiles" resource={{ ...profileResource, load: refreshProfiles }} />}
-            {(phase === 'writing' || phase === 'reconciling') && (
+           <div className="space-y-2 text-xs text-bone/60">
+             {!mutationLocked && <ObservationFeedback label="Profiles" resource={{ ...profileResource, load: refreshProfiles }} />}
+             {creatingProfile && (
+               <div role="status" aria-label="Profile creation">
+                 {profileCreateStage === 'readback' ? 'Refreshing profile list…' : 'Creating profile…'}
+               </div>
+             )}
+             {profileCreationError === 'validation' && (
+               <div role="alert" aria-label="Profile creation">{profileCreationMessage}</div>
+             )}
+             {profileCreationError === 'write' && (
+               <div role="alert" aria-label="Profile creation">
+                 {profileCreationMessage}
+                 <button type="button" className="ml-2 px-2 py-1 rounded border border-white/10" onClick={createProfile} disabled={creatingProfile}>
+                   Retry profile creation
+                 </button>
+               </div>
+             )}
+             {profileCreationError === 'reconciliation' && (
+               <div role="alert" aria-label="Profile reconciliation">
+                 {profileCreationMessage}
+                 <button type="button" className="ml-2 px-2 py-1 rounded border border-white/10" onClick={retryProfileReadback} disabled={creatingProfile}>
+                   Retry profile list
+                 </button>
+               </div>
+             )}
+             {(phase === 'writing' || phase === 'reconciling') && (
               <div role="status" aria-label="Profile operation">
                 {phase === 'writing' ? `${operation?.kind === 'activate' ? 'Activating' : 'Deleting'} ${operation?.profile.name}…` : 'Reconciling profiles…'}
                 {' Showing previously observed profiles; they may be stale.'}
@@ -430,48 +561,202 @@ export default function ControlCenterView() {
             </div>
           </div>
         ) : tab === 'profiles' ? (
-          profileResource.snapshot === null ? null : profiles.length === 0 ? (
-            <EmptyState message="No model profiles configured." />
-          ) : (
-            <ul className="space-y-2">
-              {profiles.map((p) => (
-                <li key={p.id}>
-                  <GlassCard className={cn('p-3', p.is_active && 'border-accent/40 bg-white/[0.06]')}>
-                    <div className="flex items-center gap-2">
-                      <StatusDot ok={p.is_active} warn={!p.is_active} />
-                      <span className="text-sm font-medium text-bone truncate">{p.name}</span>
-                      <Pill variant="info">{p.provider}</Pill>
-                      <Pill variant="default">{p.model}</Pill>
-                      {p.is_active && <Pill variant="success">active</Pill>}
-                      <div className="ml-auto flex items-center gap-1 text-[11px]">
-                        {!p.is_active && (
-                          <button
-                            type="button"
-                            onClick={() => activate(p)}
-                            disabled={mutationLocked}
-                            className="px-2 py-0.5 rounded-md border border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10 transition-colors"
-                          >
-                            Activate
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => remove(p)}
-                          disabled={mutationLocked}
-                          className="px-2 py-0.5 rounded-md border border-red-500/30 text-red-200 hover:bg-red-500/10 transition-colors"
-                        >
-                          Delete
-                        </button>
+          <div className="space-y-3">
+            <div className="flex justify-end">
+              <button
+                type="button"
+                aria-expanded={showProfileForm}
+                onClick={() => {
+                  if (mutationLocked) return;
+                  setProfileCreationError(null);
+                  setProfileCreationMessage(null);
+                  setShowProfileForm(true);
+                }}
+                disabled={mutationLocked}
+                className="px-3 py-1.5 text-xs rounded-lg border border-white/10 text-bone/60 hover:text-bone transition-colors disabled:opacity-50"
+              >
+                New profile
+              </button>
+            </div>
+            {showProfileForm && (
+              <GlassCard className="p-4">
+                <form
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    void createProfile();
+                  }}
+                >
+                  <fieldset disabled={creatingProfile} className="border-0 p-0 m-0 min-w-0 space-y-3">
+                    <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40">New profile</div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label htmlFor="profile-name" className="block text-[10px] font-mono text-bone/50 mb-1">Name</label>
+                        <input
+                          id="profile-name"
+                          type="text"
+                          value={profileDraft.name}
+                          onChange={(event) => {
+                            if (profileCreatePending.current) return;
+                            setProfileDraft((current) => ({ ...current, name: event.target.value }));
+                          }}
+                          className="w-full px-2 py-1.5 text-xs font-mono bg-white/5 border border-white/10 rounded text-bone focus:outline-none focus:border-white/20 transition-colors"
+                        />
+                      </div>
+                      <div>
+                        <label htmlFor="profile-backend" className="block text-[10px] font-mono text-bone/50 mb-1">Backend</label>
+                        <input
+                          id="profile-backend"
+                          type="text"
+                          value={profileDraft.backend}
+                          onChange={(event) => {
+                            if (profileCreatePending.current) return;
+                            setProfileDraft((current) => ({ ...current, backend: event.target.value }));
+                          }}
+                          className="w-full px-2 py-1.5 text-xs font-mono bg-white/5 border border-white/10 rounded text-bone focus:outline-none focus:border-white/20 transition-colors"
+                        />
+                      </div>
+                      <div>
+                        <label htmlFor="profile-model" className="block text-[10px] font-mono text-bone/50 mb-1">Model</label>
+                        <input
+                          id="profile-model"
+                          type="text"
+                          value={profileDraft.model}
+                          onChange={(event) => {
+                            if (profileCreatePending.current) return;
+                            setProfileDraft((current) => ({ ...current, model: event.target.value }));
+                          }}
+                          className="w-full px-2 py-1.5 text-xs font-mono bg-white/5 border border-white/10 rounded text-bone focus:outline-none focus:border-white/20 transition-colors"
+                        />
+                      </div>
+                      <div>
+                        <label htmlFor="profile-max-tokens" className="block text-[10px] font-mono text-bone/50 mb-1">Max tokens</label>
+                        <input
+                          id="profile-max-tokens"
+                          type="number"
+                          min="1"
+                          step="1"
+                          value={profileDraft.maxTokens}
+                          onChange={(event) => {
+                            if (profileCreatePending.current) return;
+                            setProfileDraft((current) => ({ ...current, maxTokens: event.target.value === '' ? Number.NaN : Number(event.target.value) }));
+                          }}
+                          className="w-full px-2 py-1.5 text-xs font-mono bg-white/5 border border-white/10 rounded text-bone focus:outline-none focus:border-white/20 transition-colors"
+                        />
+                      </div>
+                      <div>
+                        <label htmlFor="profile-temperature" className="block text-[10px] font-mono text-bone/50 mb-1">Temperature</label>
+                        <input
+                          id="profile-temperature"
+                          type="number"
+                          min="0"
+                          max="2"
+                          step="0.1"
+                          value={profileDraft.temperature}
+                          onChange={(event) => {
+                            if (profileCreatePending.current) return;
+                            setProfileDraft((current) => ({ ...current, temperature: event.target.value === '' ? Number.NaN : Number(event.target.value) }));
+                          }}
+                          className="w-full px-2 py-1.5 text-xs font-mono bg-white/5 border border-white/10 rounded text-bone focus:outline-none focus:border-white/20 transition-colors"
+                        />
+                      </div>
+                      <div>
+                        <label htmlFor="profile-top-p" className="block text-[10px] font-mono text-bone/50 mb-1">Top P</label>
+                        <input
+                          id="profile-top-p"
+                          type="number"
+                          min="0"
+                          max="1"
+                          step="0.1"
+                          value={profileDraft.topP}
+                          onChange={(event) => {
+                            if (profileCreatePending.current) return;
+                            setProfileDraft((current) => ({ ...current, topP: event.target.value === '' ? Number.NaN : Number(event.target.value) }));
+                          }}
+                          className="w-full px-2 py-1.5 text-xs font-mono bg-white/5 border border-white/10 rounded text-bone focus:outline-none focus:border-white/20 transition-colors"
+                        />
+                      </div>
+                      <div>
+                        <label htmlFor="profile-engine" className="block text-[10px] font-mono text-bone/50 mb-1">Engine</label>
+                        <input
+                          id="profile-engine"
+                          type="text"
+                          value={profileDraft.engine}
+                          onChange={(event) => {
+                            if (profileCreatePending.current) return;
+                            setProfileDraft((current) => ({ ...current, engine: event.target.value }));
+                          }}
+                          className="w-full px-2 py-1.5 text-xs font-mono bg-white/5 border border-white/10 rounded text-bone focus:outline-none focus:border-white/20 transition-colors"
+                        />
                       </div>
                     </div>
-                    <div className="mt-1.5 text-[10px] font-mono text-bone/40">
-                      engine {p.engine} · temp {p.temperature} · top_p {p.top_p} · {p.max_tokens} tok
+                    <div className="flex justify-end gap-2 pt-1">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (profileCreatePending.current) return;
+                          setShowProfileForm(false);
+                          setProfileCreationError(null);
+                          setProfileCreationMessage(null);
+                        }}
+                        className="px-3 py-1.5 text-xs font-mono rounded-lg border border-white/10 text-bone/60 hover:text-bone transition-colors"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="submit"
+                        onClick={() => { void createProfile(); }}
+                        className="px-4 py-1.5 text-xs font-mono rounded-lg border border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/10 disabled:opacity-50 transition-colors"
+                      >
+                        {creatingProfile ? 'Creating…' : 'Create profile'}
+                      </button>
                     </div>
-                  </GlassCard>
-                </li>
-              ))}
-            </ul>
-          )
+                  </fieldset>
+                </form>
+              </GlassCard>
+            )}
+            {profileResource.snapshot === null ? null : profiles.length === 0 ? (
+              <EmptyState message="No model profiles configured." />
+            ) : (
+              <ul className="space-y-2">
+                {profiles.map((p) => (
+                  <li key={p.id}>
+                    <GlassCard className={cn('p-3', p.is_active && 'border-accent/40 bg-white/[0.06]')}>
+                      <div className="flex items-center gap-2">
+                        <StatusDot ok={p.is_active} warn={!p.is_active} />
+                        <span className="text-sm font-medium text-bone truncate">{p.name}</span>
+                        <Pill variant="info">{p.provider}</Pill>
+                        <Pill variant="default">{p.model}</Pill>
+                        {p.is_active && <Pill variant="success">active</Pill>}
+                        <div className="ml-auto flex items-center gap-1 text-[11px]">
+                          {!p.is_active && (
+                            <button
+                              type="button"
+                              onClick={() => activate(p)}
+                              disabled={mutationLocked}
+                              className="px-2 py-0.5 rounded-md border border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10 transition-colors"
+                            >
+                              Activate
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => remove(p)}
+                            disabled={mutationLocked}
+                            className="px-2 py-0.5 rounded-md border border-red-500/30 text-red-200 hover:bg-red-500/10 transition-colors"
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </div>
+                      <div className="mt-1.5 text-[10px] font-mono text-bone/40">
+                        engine {p.engine} · temp {p.temperature} · top_p {p.top_p} · {p.max_tokens} tok
+                      </div>
+                    </GlassCard>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
         ) : tab === 'diagnostics' ? (
           // ── Diagnostics ──
           <div className="space-y-3">
