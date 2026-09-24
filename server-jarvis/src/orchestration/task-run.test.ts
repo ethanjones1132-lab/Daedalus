@@ -1459,6 +1459,103 @@ describe("task-run > normalizeTaskRunOnRead (legacy â†’ reconstruction_requ
     expect(again.plan?.items[0].title).toBe("A");
     expect(again.plan?.activeItemId).toBe("a");
   });
+
+  test("schemaVersion 2 round-trips every grading mode and rejects unknown values", () => {
+    for (const gradingMode of ["conductor_direct_diff", "reviewer_mediated", "runtime_check"] as const) {
+      const normalized = normalizeTaskRunOnRead(JSON.parse(JSON.stringify({
+        schemaVersion: 2,
+        reconstruction: "none",
+        taskRunId: `task_${gradingMode}`,
+        sessionId: "session_modes",
+        objective: "verify durable grading",
+        requirement: "full_execution",
+        depth: "standard",
+        estimatedComplexity: "medium",
+        turnCount: 1,
+        status: "completed",
+        evidenceCount: 1,
+        remainingWork: [],
+        plan: {
+          activeItemId: null,
+          items: [{
+            id: "item",
+            title: "Verified item",
+            dependsOn: [],
+            acceptanceChecks: [],
+            status: "verified",
+            gradingMode,
+            repairCycleCount: 0,
+            evidence: {
+              ref: `run:${gradingMode}`,
+              summary: "authoritative check passed",
+              recordedAt: "2026-07-20T00:00:00.000Z",
+              grounding: {
+                requiredEffect: "write",
+                reviewerAccepted: false,
+                successfulWrites: ["src/runtime.ts"],
+                successfulReads: [],
+                check: {
+                  tier: "builtin",
+                  ran: true,
+                  passed: true,
+                  command: "bun test",
+                  detail: "passed",
+                },
+              },
+            },
+            verifiedAt: "2026-07-20T00:01:00.000Z",
+            updatedAt: "2026-07-20T00:02:00.000Z",
+          }],
+        },
+        createdAt: "2026-07-20T00:00:00.000Z",
+        updatedAt: "2026-07-20T00:02:00.000Z",
+      })))!;
+
+      expect(normalized.plan?.items[0]).toMatchObject({
+        gradingMode,
+        evidence: {
+          ref: `run:${gradingMode}`,
+          recordedAt: "2026-07-20T00:00:00.000Z",
+          grounding: {
+            successfulWrites: ["src/runtime.ts"],
+            check: { tier: "builtin", ran: true, passed: true },
+          },
+        },
+        verifiedAt: "2026-07-20T00:01:00.000Z",
+        updatedAt: "2026-07-20T00:02:00.000Z",
+      });
+    }
+
+    const unknown = normalizeTaskRunOnRead({
+      schemaVersion: 2,
+      reconstruction: "none",
+      taskRunId: "task_unknown",
+      sessionId: "session_modes",
+      objective: "reject unknown grading",
+      requirement: "full_execution",
+      depth: "standard",
+      estimatedComplexity: "medium",
+      turnCount: 1,
+      status: "completed",
+      evidenceCount: 0,
+      remainingWork: [],
+      plan: {
+        activeItemId: null,
+        items: [{
+          id: "item",
+          title: "Unknown grading",
+          dependsOn: [],
+          acceptanceChecks: [],
+          status: "verified",
+          gradingMode: "synthesized",
+          repairCycleCount: 0,
+        }],
+      },
+      createdAt: "2026-07-20T00:00:00.000Z",
+      updatedAt: "2026-07-20T00:00:00.000Z",
+    })!;
+    expect(unknown.plan?.items[0]?.gradingMode).toBeUndefined();
+  });
 });
 
 describe("task-run > resolveTaskRunTurn preserves v2 plan on continuation", () => {

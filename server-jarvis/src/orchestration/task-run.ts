@@ -991,6 +991,12 @@ function isPlanItemStatus(value: unknown): value is TaskPlanItemStatus {
   return value === "pending" || value === "active" || value === "verified" || value === "blocked";
 }
 
+function isTaskPlanGradingMode(value: unknown): value is TaskPlanGradingMode {
+  return value === "conductor_direct_diff"
+    || value === "reviewer_mediated"
+    || value === "runtime_check";
+}
+
 function normalizeGroundingOnRead(raw: unknown): TaskPlanEvidenceGrounding | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   const g = raw as Record<string, unknown>;
@@ -1061,10 +1067,9 @@ function normalizePlanOnRead(raw: unknown): TaskPlan | undefined {
         };
       }
     }
-    const gradingMode =
-      item.gradingMode === "conductor_direct_diff" || item.gradingMode === "reviewer_mediated"
-        ? item.gradingMode
-        : undefined;
+    const gradingMode = isTaskPlanGradingMode(item.gradingMode)
+      ? item.gradingMode
+      : undefined;
     items.push({
       id: item.id,
       title: item.title,

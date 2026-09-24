@@ -10,7 +10,7 @@ import {
 } from "./session-memory";
 import type { SessionMemoryConfig } from "../config";
 import { attachOwnedPlanning, applySufficientVerdict, seedTaskPlanFromPlanning } from "./runtime-loop";
-import { getActivePlanItem, getPlanItem } from "./task-run";
+import { getActivePlanItem, getPlanItem, markPlanItemVerified } from "./task-run";
 
 function makeConfig(overrides: Partial<SessionMemoryConfig> = {}): SessionMemoryConfig {
   return {
@@ -430,6 +430,61 @@ describe("session-memory", () => {
       // Fresh v2 contracts round-trip without reconstruction.
       expect(reader.getTaskRun("disk-sess")?.schemaVersion).toBe(2);
       expect(reader.getTaskRun("disk-sess")?.reconstruction).toBe("none");
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("reloads runtime-check grading provenance, grounding, and timestamps", () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), "jarvis-memory-runtime-check-"));
+    try {
+      const cfg = makeConfig({ persist: true });
+      const writer = new SessionMemory(() => cfg, tempRoot);
+      const initial = writer.beginTaskRun("runtime-check-sess", {
+        message: "run the authoritative verification",
+        requirement: "full_execution",
+        estimatedComplexity: "low",
+      });
+      const planned = writer.replaceTaskPlan("runtime-check-sess", [{
+        id: "pi_runtime",
+        title: "Verify the runtime check",
+        acceptanceChecks: [{ id: "ac_runtime", description: "check passes", kind: "test_pass" }],
+      }])!;
+      const verified = markPlanItemVerified(planned, "pi_runtime", {
+        gradingMode: "runtime_check",
+        evidence: {
+          ref: "run:runtime-check",
+          summary: "builtin check passed",
+          recordedAt: "2026-07-20T00:00:00.000Z",
+          grounding: {
+            requiredEffect: "write",
+            reviewerAccepted: false,
+            successfulWrites: ["src/runtime.ts"],
+            successfulReads: [],
+            check: {
+              tier: "builtin",
+              ran: true,
+              passed: true,
+              command: "bun test",
+              detail: "passed",
+            },
+          },
+        },
+      });
+      writer.setTaskRunContract("runtime-check-sess", verified);
+
+      const reader = new SessionMemory(() => cfg, tempRoot);
+      const loaded = reader.getTaskRun("runtime-check-sess")!;
+      const expected = getPlanItem(verified, "pi_runtime")!;
+      const actual = getPlanItem(loaded, "pi_runtime")!;
+
+      expect(initial.taskRunId).toBe(loaded.taskRunId);
+      expect(actual.gradingMode).toBe("runtime_check");
+      expect(actual.evidence).toEqual(expected.evidence);
+      expect(actual.evidence?.recordedAt).toBe("2026-07-20T00:00:00.000Z");
+      expect(actual.evidence?.grounding).toEqual(expected.evidence?.grounding);
+      expect(actual.verifiedAt).toBe(expected.verifiedAt);
+      expect(actual.updatedAt).toBe(expected.updatedAt);
     } finally {
       rmSync(tempRoot, { recursive: true, force: true });
     }
