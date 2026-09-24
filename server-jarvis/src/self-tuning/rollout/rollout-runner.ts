@@ -1,9 +1,6 @@
 import { existsSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { registerFilesystemBundle } from "../../filesystem-bundle";
-import { registerMetaBundle } from "../../meta-bundle";
-import { registerShellBundle } from "../../shell-bundle";
-import { registerTaskBundle } from "../../task-bundle";
 import { createToolRuntime, makeExecutionContext } from "../../tool-runtime";
 import { defaultConfig } from "../../config";
 import { runRolloutLocalOnly } from "../../orchestration/agent-pool";
@@ -184,16 +181,13 @@ function assertRolloutDbSafety(): void {
 }
 
 /** Tool surface a rollout is allowed. */
-function buildRolloutRuntime() {
+export function buildRolloutRuntime() {
   const runtime = createToolRuntime();
-  // Narrower than registerStandardBundles ON PURPOSE: no web bundle, no MCP
-  // client, no interactive bundle. A fixture rollout must not make outbound
+  // Narrower than registerStandardBundles ON PURPOSE: no shell, task, meta,
+  // web, MCP, or interactive bundles. A fixture rollout must not make outbound
   // network calls or open side channels — it is a hermetic code-edit task, and
   // anything reaching the network would make scores irreproducible.
   registerFilesystemBundle(runtime);
-  registerShellBundle(runtime);
-  registerTaskBundle(runtime);
-  registerMetaBundle(runtime);
   return runtime;
 }
 

@@ -3,10 +3,14 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSyn
 import { tmpdir } from "os";
 import { join } from "path";
 import { BASELINE_THETA } from "../../orchestration/orchestration-policy";
+import { getToolsForMode } from "../../orchestration/modes";
+import { defaultConfig } from "../../config";
+import { makeExecutionContext } from "../../tool-runtime";
 import type { CallModelFn } from "../../orchestration/coordinator";
 import { TRAINING_TASKS } from "./fixture-tasks";
 import {
   buildFixtureRolloutRequest,
+  buildRolloutRuntime,
   runGradedFixtureCheck,
   runOneRollout,
 } from "./rollout-runner";
@@ -52,6 +56,91 @@ describe("buildFixtureRolloutRequest", () => {
     const joined = seenUser.join("\n");
     expect(joined).toContain("_t.py");
     expect(joined).toContain(task.entry);
+  });
+});
+
+describe("rollout tool boundary", () => {
+  test("registers only filesystem capabilities and rejects escape tools", async () => {
+    const runtime = buildRolloutRuntime();
+    const tools = runtime.listTools();
+    const names = tools.map((tool) => tool.function.name);
+    const filesystemTools = [
+      "read_file",
+      "write_file",
+      "edit_file",
+      "multi_edit",
+      "apply_patch",
+      "glob",
+      "grep",
+      "list_directory",
+    ];
+
+    expect(new Set(names)).toEqual(new Set(filesystemTools));
+    expect(
+      tools.every((tool) =>
+        tool.capability !== undefined &&
+        ["read", "list", "write"].includes(tool.capability.class),
+      ),
+    ).toBe(true);
+
+    const context = makeExecutionContext("chat", defaultConfig(), {
+      workspace_path: process.cwd(),
+    });
+    const forbiddenTools = [
+      "bash",
+      "powershell",
+      "agent",
+      "run_background_command",
+      "task_create",
+      "task_list",
+      "task_get",
+      "task_output",
+      "task_stop",
+      "todo_write",
+      "todo_list",
+      "tools_enum",
+      "web_search",
+      "web_fetch",
+      "mcp_list_tools",
+      "mcp_call_tool",
+      "mcp_read_resource",
+      "git_metadata",
+      "ask_user_question",
+    ];
+
+    for (const name of forbiddenTools) {
+      const result = await runtime.execute(
+        { id: `forbidden-${name}`, name, arguments: {} },
+        context,
+      );
+      expect(result.is_error).toBe(true);
+      expect(result.error_code).toBe("unknown_tool");
+    }
+  });
+
+  test("exposes only filesystem tools to the executor and read tools to the reviewer", () => {
+    const tools = buildRolloutRuntime().listTools();
+    const namesFor = (mode: string) =>
+      new Set(getToolsForMode(mode, tools).map((tool) => tool.function.name));
+
+    expect(namesFor("planner")).toEqual(new Set());
+    expect(namesFor("executor")).toEqual(new Set([
+      "read_file",
+      "write_file",
+      "edit_file",
+      "multi_edit",
+      "apply_patch",
+      "glob",
+      "grep",
+      "list_directory",
+    ]));
+    expect(namesFor("reviewer")).toEqual(new Set([
+      "read_file",
+      "glob",
+      "grep",
+      "list_directory",
+    ]));
+    expect(namesFor("synthesizer")).toEqual(new Set());
   });
 });
 
