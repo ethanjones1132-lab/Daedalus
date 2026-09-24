@@ -10,11 +10,20 @@ import { SessionOutcomeCollector, SelfTuningStore } from "./self-tuning/mod";
 import { registerGitMetadataBundle } from "./git-metadata-bundle";
 import { resolveWorkspaceReadScope } from "./orchestration/evidence-sufficiency";
 import * as effectGate from "./orchestration/effect-gate";
+import { createTaskRun } from "./orchestration/task-run";
 
 // In-memory collector so PipelineExecutor runs in tests can NEVER write to the
 // production self-tuning DB (~/.openclaw/jarvis/self-tuning.db). Passed as the
 // 4th constructor arg to every executor below.
 const testCollector = new SessionOutcomeCollector(new SelfTuningStore(":memory:"));
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
 
 describe("Orchestration & Routing Tests", () => {
   test("PredictiveRouter falls back safely when prompt files are absent", async () => {
@@ -1185,6 +1194,260 @@ describe("Orchestration & Routing Tests", () => {
     expect(executorStart).toBeDefined();
     // Executor must begin before the slow planner finishes (true overlap).
     expect(executorStart!).toBeLessThan(plannerEnd!);
+  });
+
+  test("M3 keeps the planner-seeded TaskPlan authoritative after overlap", async () => {
+    const runtime = createToolRuntime();
+    runtime.register(
+      {
+        type: "function",
+        function: {
+          name: "write_file",
+          description: "write",
+          parameters: {
+            type: "object",
+            properties: { path: { type: "string" }, content: { type: "string" } },
+            required: ["path", "content"],
+          },
+        },
+        requires_approval: false,
+        dangerous: false,
+      } as any,
+      async () => "File written",
+    );
+    const config = defaultConfig();
+    config.tools.require_approval = [];
+    const ctx = makeExecutionContext("agent", config, { workspace_path: process.cwd() });
+    const { ConductorBus } = await import("./orchestration/conductor-bus");
+    const { LiveConductor } = await import("./orchestration/conductor");
+    const { AgentPool, DEFAULT_ORCHESTRATOR_AGENTS } = await import("./orchestration/agent-pool");
+    const bus = new ConductorBus();
+    const liveConductor = new LiveConductor(
+      async () => ({ content: '{"directive":"continue"}' }),
+      bus,
+      new AgentPool(DEFAULT_ORCHESTRATOR_AGENTS),
+      { supervision_timeout_ms: 1000, max_tool_errors_before_reroute: 10, supervise_low_complexity: true },
+    );
+    const runId = "run-m3-taskplan-authority";
+    liveConductor.setContext("general", "high", runId);
+
+    const plannerGate = deferred<{ content: string; tool_calls?: any[] }>();
+    const executorGate = deferred<{ content: string; tool_calls?: any[] }>();
+    const plannerStarted = deferred<void>();
+    const executorStarted = deferred<void>();
+    const reviewerPlanItemIds: Array<string | null> = [];
+    let executorCalls = 0;
+    let persisted = createTaskRun({
+      taskRunId: "task_m3_taskplan_authority",
+      sessionId: "session_m3_taskplan_authority",
+      objective: "implement the first fix and add a regression test",
+      requirement: "full_execution",
+      estimatedComplexity: "high",
+    });
+    const updates: typeof persisted[] = [];
+
+    const callModel = async (messages: ChatMessage[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "planner") {
+        plannerStarted.resolve(undefined);
+        return plannerGate.promise;
+      }
+      if (options.stageLabel === "executor") {
+        if (executorCalls++ === 0) {
+          executorStarted.resolve(undefined);
+          return executorGate.promise;
+        }
+        return { content: "Executor completed the requested change", tool_calls: [] };
+      }
+      if (options.stageLabel === "reviewer") {
+        reviewerPlanItemIds.push(liveConductor.getPlanContext()?.plan?.activeItemId ?? null);
+        return { content: "ACCEPT — grounded completion" };
+      }
+      return { content: messages.map((message) => message.content).join("\n") };
+    };
+
+    const pipeline = new PipelineExecutor(callModel as any, runtime, ctx, {
+      bus,
+      live: liveConductor,
+      collector: testCollector,
+    });
+    const runPromise = pipeline.executeSegment(
+      "implement the first fix and add a regression test",
+      ["planner", "executor", "reviewer"],
+      runId,
+      () => {},
+      {
+        turnRequirement: "full_execution",
+        executionProfile: "full",
+        rawMessage: "implement the first fix and add a regression test",
+        estimatedComplexity: "high",
+        taskRunWriteIntent: true,
+        maxReviewRepairRounds: 0,
+        taskRunContract: persisted,
+        ownedPlanning: {
+          plan_authorship: "planner_mediated",
+          plan_items: [],
+          plan_brief: {
+            request: "implement the first fix and add a regression test",
+            objective: "implement the first fix and add a regression test",
+            estimatedComplexity: "high",
+            relevantMemory: [],
+            failurePatterns: [],
+            constraints: [],
+          },
+        },
+        onTaskPlanUpdate: (next) => {
+          persisted = next;
+          updates.push(next);
+        },
+      },
+    );
+
+    await Promise.all([plannerStarted.promise, executorStarted.promise]);
+    plannerGate.resolve({
+      content: "1. Implement the first fix in src/app.ts\n2. Add a regression test in src/app.test.ts",
+    });
+    executorGate.resolve({
+      content: "Implemented the first fix",
+      tool_calls: [
+        {
+          id: "write_m3_authority",
+          type: "function",
+          function: {
+            name: "write_file",
+            arguments: JSON.stringify({ path: "src/app.ts", content: "export const fixed = true;\n" }),
+          },
+        },
+      ],
+    });
+
+    let segment: Awaited<ReturnType<typeof pipeline.executeSegment>>;
+    try {
+      segment = await runPromise;
+    } finally {
+      bus.clear();
+    }
+
+    expect(reviewerPlanItemIds).toEqual(["pi_1"]);
+    expect(persisted.plan?.items.map((item) => [item.id, item.status])).toEqual([
+      ["pi_1", "verified"],
+      ["pi_2", "active"],
+    ]);
+    expect(updates[updates.length - 1]).toEqual(persisted);
+    expect(liveConductor.getPlanContext()).toEqual(persisted);
+    expect(segment.state.reviewer?.ok).toBe(true);
+  });
+
+  test("M3 does not let an out-of-order executor copy overwrite a newer plan", async () => {
+    const runtime = createToolRuntime();
+    runtime.register(
+      {
+        type: "function",
+        function: {
+          name: "write_file",
+          description: "write",
+          parameters: {
+            type: "object",
+            properties: { path: { type: "string" }, content: { type: "string" } },
+            required: ["path", "content"],
+          },
+        },
+        requires_approval: false,
+        dangerous: false,
+      } as any,
+      async () => "File written",
+    );
+    const config = defaultConfig();
+    config.tools.require_approval = [];
+    const ctx = makeExecutionContext("agent", config, { workspace_path: process.cwd() });
+    const plannerGate = deferred<{ content: string; tool_calls?: any[] }>();
+    const executorGate = deferred<{ content: string; tool_calls?: any[] }>();
+    const plannerStarted = deferred<void>();
+    const executorStarted = deferred<void>();
+    let executorCalls = 0;
+    let persisted = createTaskRun({
+      taskRunId: "task_m3_out_of_order",
+      sessionId: "session_m3_out_of_order",
+      objective: "implement the first fix and add a regression test",
+      requirement: "full_execution",
+      estimatedComplexity: "high",
+    });
+    const updates: typeof persisted[] = [];
+
+    const callModel = async (_messages: ChatMessage[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "planner") {
+        plannerStarted.resolve(undefined);
+        return plannerGate.promise;
+      }
+      if (options.stageLabel === "executor") {
+        if (executorCalls++ === 0) {
+          executorStarted.resolve(undefined);
+          return executorGate.promise;
+        }
+        return { content: "Executor completed the requested change", tool_calls: [] };
+      }
+      if (options.stageLabel === "reviewer") return { content: "ACCEPT — grounded completion" };
+      return { content: "ok" };
+    };
+
+    const pipeline = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
+    const runPromise = pipeline.executeSegment(
+      "implement the first fix and add a regression test",
+      ["planner", "executor", "reviewer"],
+      "run-m3-out-of-order",
+      () => {},
+      {
+        turnRequirement: "full_execution",
+        executionProfile: "full",
+        rawMessage: "implement the first fix and add a regression test",
+        estimatedComplexity: "high",
+        taskRunWriteIntent: true,
+        maxReviewRepairRounds: 0,
+        taskRunContract: persisted,
+        ownedPlanning: {
+          plan_authorship: "planner_mediated",
+          plan_items: [],
+          plan_brief: {
+            request: "implement the first fix and add a regression test",
+            objective: "implement the first fix and add a regression test",
+            estimatedComplexity: "high",
+            relevantMemory: [],
+            failurePatterns: [],
+            constraints: [],
+          },
+        },
+        onTaskPlanUpdate: (next) => {
+          persisted = next;
+          updates.push(next);
+        },
+      },
+    );
+
+    await Promise.all([plannerStarted.promise, executorStarted.promise]);
+    executorGate.resolve({
+      content: "Implemented the first fix",
+      tool_calls: [
+        {
+          id: "write_m3_out_of_order",
+          type: "function",
+          function: {
+            name: "write_file",
+            arguments: JSON.stringify({ path: "src/app.ts", content: "export const fixed = true;\n" }),
+          },
+        },
+      ],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    plannerGate.resolve({
+      content: "1. Implement the first fix in src/app.ts\n2. Add a regression test in src/app.test.ts",
+    });
+
+    await runPromise;
+
+    expect(persisted.plan?.items.map((item) => [item.id, item.status])).toEqual([
+      ["pi_1", "verified"],
+      ["pi_2", "active"],
+    ]);
+    expect(updates[updates.length - 1]).toEqual(persisted);
   });
 
   test("M3: queue rewriter is skipped after reviewer ACCEPT (no repair evidence)", async () => {

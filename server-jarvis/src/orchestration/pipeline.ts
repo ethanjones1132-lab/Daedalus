@@ -5525,6 +5525,9 @@ export class PipelineExecutor {
           );
           const [plan, executor] = await Promise.all([plannerPromise, executorPromise]);
           state.plan = plan;
+          if (executorOptions.taskRunContract) {
+            opts.taskRunContract = executorOptions.taskRunContract;
+          }
           if (
             state.plan?.ok &&
             opts.ownedPlanning?.plan_authorship === "planner_mediated" &&
@@ -5551,9 +5554,6 @@ export class PipelineExecutor {
                 `${e instanceof Error ? e.message : String(e)}`,
               );
             }
-          }
-          if (executorOptions.taskRunContract) {
-            opts.taskRunContract = executorOptions.taskRunContract;
           }
           state.executor = executor;
           const post = this.applyPostExecutorSegmentChecks({
