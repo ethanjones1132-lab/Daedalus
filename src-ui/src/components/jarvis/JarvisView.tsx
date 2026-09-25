@@ -45,10 +45,16 @@ import {
 } from './chat-state';
 import { errorDisplayForCode } from './error-display';
 import {
+  acceptFirstTerminal,
+  boundedPartialOutput,
   classifyStreamTermination,
+  decodeResultFrame,
   STREAM_INCOMPLETE_CODE,
   STREAM_INCOMPLETE_MESSAGE,
+  STREAM_TIMEOUT_CODES,
+  type DecodedStreamTerminal,
   type StreamTerminalFrame,
+  type StreamTerminalOutcome,
 } from './stream-lifecycle';
 import { formatSessionStatsLine, shouldShowSessionStats } from './session-stats';
 import { filterSessions, formatFilterResultCount } from './session-filter';
@@ -731,7 +737,7 @@ export function ChatPanel({
     });
   }, [flushPendingTokens]);
 
-  const finalizeAssistantMessage = useCallback((sid?: string) => {
+  const finalizeAssistantMessage = useCallback((sid?: string, terminal?: DecodedStreamTerminal) => {
     // Drain rAF buffer inside the same setMessages as finalize so React
     // batching cannot drop the last ~16ms of streamed text.
     const pending = takePendingTokens();
@@ -745,10 +751,16 @@ export function ChatPanel({
     setMessages(prev => {
       const withTokens = applyTokenChunk(prev, pending);
       const last = withTokens[withTokens.length - 1];
-      const finalizedMessages = finalizeStreamingMessages(withTokens);
+      const messageOutcome: StreamTerminalOutcome | undefined = terminal
+        && terminal.outcome !== 'success'
+        && terminal.outcome !== 'cancelled'
+        ? terminal.outcome
+        : undefined;
+      const finalizedMessages = finalizeStreamingMessages(withTokens, messageOutcome, terminal?.code);
       const finalized = finalizedMessages[finalizedMessages.length - 1];
       if (last?.role === 'assistant' && last.isStreaming) {
-        if (effectiveSid && finalized?.role === 'assistant' && finalized.content.trim()) {
+        const shouldPersist = !terminal || terminal.outcome === 'success';
+        if (shouldPersist && effectiveSid && finalized?.role === 'assistant' && finalized.content.trim()) {
           invoke('append_message', {
             ...sessionInvokeArgs(effectiveSid),
             role: 'assistant',
@@ -1186,10 +1198,7 @@ export function ChatPanel({
       partialOutput?: string;
     } = { tokenCount: 0, toolCount: 0 };
     let terminalFrame: StreamTerminalFrame = null;
-    const TIMEOUT_CODES = new Set([
-      'stage_timeout', 'first_token_timeout', 'stream_idle_timeout',
-      'visible_progress_timeout', 'turn_deadline_exceeded',
-    ]);
+    let terminal: DecodedStreamTerminal | null = null;
     const persistTerminalRun = () => {
       if (!runAcc.outcome) return;
       // A force-stop can land before the pipeline ever emitted agent_run_id
@@ -1208,10 +1217,22 @@ export function ChatPanel({
         partialOutput: runAcc.partialOutput ?? null,
       }).catch((e) => console.warn('[Jarvis] failed to persist terminal run:', e));
     };
+    const acceptTerminal = (next: DecodedStreamTerminal): boolean => {
+      const accepted = acceptFirstTerminal(terminal, next);
+      if (!accepted || accepted === terminal) return false;
+      terminal = accepted;
+      terminalFrame = accepted.frame;
+      runAcc.outcome = accepted.outcome;
+      if (accepted.outcome === 'partial' || accepted.outcome === 'timed_out') {
+        runAcc.partialOutput = boundedPartialOutput(accepted.text || streamedRawText);
+      }
+      return true;
+    };
     const reportUnknownFrame = createUnknownFrameReporter();
     const inactivityWatchdog = new InactivityWatchdog(
       STREAM_INACTIVITY_TIMEOUT_MS,
       () => {
+        if (terminal) return;
         inactivityTimedOut = true;
         controller.abort('Jarvis stream inactivity timeout');
         reader.cancel('Jarvis stream inactivity timeout').catch(() => {});
@@ -1395,44 +1416,25 @@ export function ChatPanel({
       }
       if (isPassiveSseFrame(frame.type)) return;
       if (frame.type === 'result') {
-        terminalFrame = 'result';
-        // Mirror runner.rs map_terminal_outcome: is_error wins, then
-        // stage_timeout, then the subtype's own vocabulary.
-        const subtype = typeof frame.subtype === 'string' ? frame.subtype : 'success';
-        const code = typeof frame.code === 'string' ? frame.code : undefined;
-        runAcc.outcome = frame.is_error
-          ? 'failed'
-          : code === 'stage_timeout'
-            ? 'timed_out'
-            : subtype === 'partial'
-              ? 'partial'
-              : subtype === 'error'
-                ? 'failed'
-                : 'success';
-        if (subtype === 'partial' || code === 'stage_timeout') {
-          runAcc.partialOutput = String(frame.result ?? '') || undefined;
+        const decision = decodeResultFrame(frame);
+        if (!acceptTerminal(decision)) return;
+        if (decision.hardError) {
+          const message = decision.text || String(frame.error || 'Jarvis returned a non-success result.');
+          throw new JarvisStreamError(message, decision.code);
         }
-        if (frame.is_error) throw new Error(String(frame.result || frame.error || 'Jarvis stream failed.'));
-        if (!streamedVisibleText) {
-          const text = String(frame.result || '');
-          if (text) appendAssistantText(text);
-        }
+        if (!streamedVisibleText && decision.text) appendAssistantText(decision.text);
         return;
       }
       if (frame.type === 'error') {
-        terminalFrame = 'error';
-        // P0-B (2026-07-02): the `code` field discriminates the failure
-        // mode. `first_token_timeout` means the model hung and was
-        // terminated by the server-side watchdog; surface a clearer
-        // message than the raw `frame.error` (which the server now
-        // formats to a per-model "did not produce any output within the
-        // per-model first-token window" string). Other codes fall
-        // through to the raw `frame.error` text.
         const code = typeof frame.code === 'string' ? frame.code : undefined;
-        // Task 4.1 (mirrors runner.rs map_error_outcome): timeout codes are
-        // recorded as timed_out so timeout telemetry isn't flattened into a
-        // generic failure.
-        runAcc.outcome = code && TIMEOUT_CODES.has(code) ? 'timed_out' : 'failed';
+        const decision: DecodedStreamTerminal = {
+          frame: 'error',
+          outcome: code && STREAM_TIMEOUT_CODES.has(code) ? 'timed_out' : 'failed',
+          code,
+          text: '',
+          hardError: true,
+        };
+        if (!acceptTerminal(decision)) return;
         if (code) {
           // eslint-disable-next-line no-console
           console.warn(`[Jarvis] stream error code=${code}: ${frame.error}`);
@@ -1440,7 +1442,14 @@ export function ChatPanel({
         throw new JarvisStreamError(String(frame.error || 'Jarvis stream failed.'), code);
       }
       if (frame.type === 'cancelled') {
-        terminalFrame = 'cancelled';
+        const decision: DecodedStreamTerminal = {
+          frame: 'cancelled',
+          outcome: 'cancelled',
+          code: 'cancelled',
+          text: '',
+          hardError: false,
+        };
+        if (!acceptTerminal(decision)) return;
         // P0-B (2026-07-02): `cancelled` is now reserved for genuine user
         // / `/chat/cancel` aborts (the server-side fix prevents a hung
         // model from emitting this). Previously the UI had no handler for
@@ -1461,7 +1470,6 @@ export function ChatPanel({
         // The server now classifies the real reason (index.ts's
         // classifyAbortReason); fall back to 'user_stop' only if an older
         // server build omits the field.
-        runAcc.outcome = 'cancelled';
         runAcc.cancelledReason = typeof frame.reason === 'string' ? frame.reason : 'user_stop';
         clearPendingApproval();
         const pending = takePendingTokens();
@@ -1524,13 +1532,14 @@ export function ChatPanel({
       }
       const termination = classifyStreamTermination({
         terminalFrame,
+        terminalOutcome: runAcc.outcome ?? null,
         inactivityTimedOut,
         aborted: controller.signal.aborted,
         stopRequested: stopRequestedRef.current,
       });
       if (termination === 'unterminated') {
         runAcc.outcome = 'failed';
-        runAcc.partialOutput = streamedRawText || undefined;
+        runAcc.partialOutput = boundedPartialOutput(streamedRawText);
         throw new JarvisStreamError(STREAM_INCOMPLETE_MESSAGE, STREAM_INCOMPLETE_CODE);
       }
     } catch (error) {
@@ -1558,7 +1567,7 @@ export function ChatPanel({
       throw new Error(`Jarvis stream was inactive for ${STREAM_INACTIVITY_TIMEOUT_MS / 1000} seconds.`);
     }
 
-    if (sendGateRef.current.isCurrent(sendGeneration)) finalizeAssistantMessage(sid);
+    if (sendGateRef.current.isCurrent(sendGeneration)) finalizeAssistantMessage(sid, terminal ?? undefined);
     if (streamAbortRef.current === controller) streamAbortRef.current = null;
   }, [appendAssistantText, applyTokenChunk, clearPendingApproval, finalizeAssistantMessage, presentApprovalRequest, takePendingTokens]);
 
@@ -2305,14 +2314,12 @@ function ChatMessage({
     }
   }, [displayContent]);
 
-  if (!isUser && !isTool && !displayContent && !streamStatus) return null;
-
-  // Task 7 Part C: a finalized assistant bubble that ended in a server/stream
-  // error or a user-cancelled turn gets a distinct visual treatment instead
-  // of silently looking like a normal reply (or, previously, leaving the
-  // streaming spinner running forever).
-  const isErrorBubble = !isUser && !isTool && message.isError;
+  const isErrorBubble = !isUser && !isTool && (message.isError || message.terminalOutcome === 'failed');
+  const isPartialBubble = !isUser && !isTool && message.terminalOutcome === 'partial';
+  const isTimedOutBubble = !isUser && !isTool && message.terminalOutcome === 'timed_out';
+  const isNonSuccessBubble = isPartialBubble || isTimedOutBubble;
   const isCancelledBubble = !isUser && !isTool && message.isCancelled;
+  if (!isUser && !isTool && !displayContent && !streamStatus && !isNonSuccessBubble && !isErrorBubble) return null;
   // P0a follow-up (2026-07-05): per-code error UX. The server emits a small
   // set of structured `error` codes; render each one with its own label,
   // pill tone, and actionable hint (see ./error-display.ts). A `turn_deadline_exceeded`
@@ -2332,11 +2339,13 @@ function ChatMessage({
           ? 'glass-strong bg-royal/10 border-royal/25 ml-12'
           : isErrorBubble
             ? 'glass-mythos bg-error/10 border-error/30 mr-8'
-            : isCancelledBubble
-              ? 'glass-mythos bg-iron/10 border-iron/30 mr-8'
-              : isTool
-                ? 'glass-mythos bg-obsidian/40 border-iron/30 mr-8'
-                : 'glass-strong bg-cyan-neon/5 border-cyan-neon/20 mr-8'
+            : isNonSuccessBubble
+              ? 'glass-mythos bg-amber-400/10 border-amber-400/30 mr-8'
+              : isCancelledBubble
+                ? 'glass-mythos bg-iron/10 border-iron/30 mr-8'
+                : isTool
+                  ? 'glass-mythos bg-obsidian/40 border-iron/30 mr-8'
+                  : 'glass-strong bg-cyan-neon/5 border-cyan-neon/20 mr-8'
       )}
     >
       <div className="flex items-center gap-2 mb-1.5">
@@ -2346,11 +2355,14 @@ function ChatMessage({
             ? 'text-royal-light'
             : isErrorBubble
               ? 'text-amber-400'
-              : isCancelledBubble
-                ? 'text-bone-faint'
-                : isTool
-                  ? 'text-bone-dim'
-                  : 'text-cyan-neon'
+              : isNonSuccessBubble
+                ? 'text-amber-400'
+                : isCancelledBubble
+                  ? 'text-bone-faint'
+                  : isTool
+                    ? 'text-bone-dim'
+                    : 'text-cyan-neon'
+
         )}>
           {isUser
             ? <><User size={11} /> YOU</>
@@ -2360,6 +2372,18 @@ function ChatMessage({
         </span>
         {isErrorBubble && errorDisplay && (
           <Pill variant={errorDisplay.pillVariant}>{errorDisplay.label}</Pill>
+        )}
+        {isPartialBubble && (
+          <span aria-label="Partial result" className="flex items-center gap-1">
+            <Pill variant="warning">partial</Pill>
+            {message.errorCode && <span className="text-[10px] font-mono text-amber-200/80">{message.errorCode}</span>}
+          </span>
+        )}
+        {isTimedOutBubble && (
+          <span aria-label="Timed out result" className="flex items-center gap-1">
+            <Pill variant="warning">timed out</Pill>
+            {message.errorCode && <span className="text-[10px] font-mono text-amber-200/80">{message.errorCode}</span>}
+          </span>
         )}
         {isCancelledBubble && <Pill>stopped</Pill>}
         {message.isStreaming && (
@@ -2394,11 +2418,14 @@ function ChatMessage({
           ? 'text-bone'
           : isErrorBubble
             ? 'text-bone-muted'
-            : isCancelledBubble
-              ? 'text-bone-faint italic'
-              : isTool
-                ? 'text-bone-dim'
-                : 'text-bone-muted'
+            : isNonSuccessBubble
+              ? 'text-bone-muted'
+              : isCancelledBubble
+                ? 'text-bone-faint italic'
+                : isTool
+                  ? 'text-bone-dim'
+                  : 'text-bone-muted'
+
       )}>
         {isUser || isTool
           ? displayContent

@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import JarvisView, { ChatPanel } from './JarvisView';
 import {
+  PARTIAL_OUTPUT_LIMIT,
   STREAM_INCOMPLETE_MESSAGE,
 } from './stream-lifecycle';
 
@@ -197,6 +198,121 @@ describe('ChatPanel state machine', () => {
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('record_terminal_run', expect.objectContaining({
       outcome: 'failed',
       partialOutput: 'Partial answer',
+    })));
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(0);
+  });
+
+  it('keeps an aggregate-only partial result visible and never appends it as success', async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(stream, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    })));
+    render(<ChatPanel {...props} />);
+    const composer = await screen.findByLabelText('Chat input');
+    fireEvent.change(composer, { target: { value: 'inspect the workspace' } });
+    fireEvent.keyDown(composer, { key: 'Enter' });
+    await screen.findByRole('status', { name: 'Session turn progress' });
+    await act(async () => {
+      controller.enqueue(new TextEncoder().encode([
+        'data: {"type":"agent_run_id","agent_run_id":"run-partial"}',
+        'data: {"type":"result","subtype":"partial","is_error":false,"code":"retry_short_circuited","result":"Useful partial answer"}',
+        'data: {"type":"result","subtype":"success","is_error":false,"result":"Late success"}',
+        '',
+      ].join('\n\n')));
+      controller.close();
+    });
+
+    await waitFor(() => expect(screen.getByLabelText('Partial result')).toHaveTextContent('partial'));
+    expect(screen.getByLabelText('Partial result')).toHaveTextContent('retry_short_circuited');
+    expect(screen.getAllByText('Useful partial answer')).toHaveLength(1);
+    expect(screen.queryByText('Late success')).not.toBeInTheDocument();
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('record_terminal_run', expect.objectContaining({
+      runId: 'run-partial',
+      outcome: 'partial',
+      partialOutput: 'Useful partial answer',
+    })));
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'record_terminal_run')).toHaveLength(1);
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(0);
+  });
+
+  it('falls back to streamed text and bounds partial telemetry for a streamed partial result', async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(stream, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    })));
+    render(<ChatPanel {...props} />);
+    const composer = await screen.findByLabelText('Chat input');
+    fireEvent.change(composer, { target: { value: 'inspect the workspace' } });
+    fireEvent.keyDown(composer, { key: 'Enter' });
+    await screen.findByRole('status', { name: 'Session turn progress' });
+    const longText = 'streamed partial '.repeat(300);
+    await act(async () => {
+      controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: 'stream_event', delta: { text: longText } })}\n\n`));
+      controller.enqueue(new TextEncoder().encode('data: {"type":"result","subtype":"partial","code":"inference_partial","result":""}\n\n'));
+      controller.close();
+    });
+
+    await waitFor(() => expect(screen.getByLabelText('Partial result')).toBeInTheDocument());
+    expect(screen.getByRole('log')).toHaveTextContent('streamed partial');
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('record_terminal_run', expect.objectContaining({
+      outcome: 'partial',
+      partialOutput: expect.any(String),
+    })));
+    const terminalCall = invokeMock.mock.calls.find(call => call[0] === 'record_terminal_run');
+    expect(terminalCall?.[1]?.partialOutput).toHaveLength(PARTIAL_OUTPUT_LIMIT);
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(0);
+  });
+
+  it.each([
+    ['error subtype', { type: 'result', subtype: 'error', code: 'provider_failed', result: 'The provider failed.' }],
+    ['unknown subtype', { type: 'result', subtype: 'mystery', result: 'Unexpected result.' }],
+    ['is_error result', { type: 'result', subtype: 'partial', is_error: true, code: 'provider_failed', result: 'The provider failed.' }],
+  ])('keeps a hard %s result non-success', async (_label, resultFrame) => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(stream, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    })));
+    render(<ChatPanel {...props} />);
+    const composer = await screen.findByLabelText('Chat input');
+    fireEvent.change(composer, { target: { value: 'inspect the workspace' } });
+    fireEvent.keyDown(composer, { key: 'Enter' });
+    await screen.findByRole('status', { name: 'Session turn progress' });
+    await act(async () => {
+      controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(resultFrame)}\n\n`));
+      controller.close();
+    });
+
+    await waitFor(() => expect(screen.getAllByRole('alert').some(node => node.textContent?.includes(String(resultFrame.result)))).toBe(true));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('record_terminal_run', expect.objectContaining({
+      outcome: 'failed',
+    })));
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(0);
+  });
+
+  it('renders a stage-timeout result as timed out instead of success', async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(stream, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    })));
+    render(<ChatPanel {...props} />);
+    const composer = await screen.findByLabelText('Chat input');
+    fireEvent.change(composer, { target: { value: 'inspect the workspace' } });
+    fireEvent.keyDown(composer, { key: 'Enter' });
+    await screen.findByRole('status', { name: 'Session turn progress' });
+    await act(async () => {
+      controller.enqueue(new TextEncoder().encode('data: {"type":"result","subtype":"success","code":"stage_timeout","result":"A stage timed out."}\n\n'));
+      controller.close();
+    });
+
+    await waitFor(() => expect(screen.getByLabelText('Timed out result')).toHaveTextContent('timed out'));
+    expect(screen.getByLabelText('Timed out result')).toHaveTextContent('stage_timeout');
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('record_terminal_run', expect.objectContaining({
+      outcome: 'timed_out',
+      partialOutput: 'A stage timed out.',
     })));
     expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(0);
   });

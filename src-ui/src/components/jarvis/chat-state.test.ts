@@ -58,6 +58,18 @@ it('drops an empty or think-only streaming assistant when finalizing', () => {
   ])).toEqual([{ role: 'assistant', content: 'Visible', isStreaming: false }]);
 });
 
+it('retains empty non-success terminal bubbles with their machine code', () => {
+  expect(finalizeStreamingMessages([
+    { role: 'assistant', content: '<think>private</think>', isStreaming: true },
+  ], 'partial', 'inference_partial')).toEqual([{
+    role: 'assistant',
+    content: '',
+    isStreaming: false,
+    terminalOutcome: 'partial',
+    errorCode: 'inference_partial',
+  }]);
+});
+
 it('does not submit Enter while an IME composition is active', () => {
   expect(shouldSubmitComposerKey({ key: 'Enter', isComposing: true })).toBe(false);
   expect(shouldSubmitComposerKey({ key: 'Enter', isComposing: false })).toBe(true);

@@ -133,6 +133,8 @@ export interface SessionRunRecord {
 }
 
 
+export type JarvisTerminalOutcome = 'partial' | 'failed' | 'timed_out';
+
 export interface JarvisMessage {
   // Message identity (Task 7 / 2026-07-03 incident 1d4727cf): optimistic sends
   // generate a client-side crypto.randomUUID(); history reload overwrites it
@@ -151,6 +153,7 @@ export interface JarvisMessage {
   errorCode?: string;
   /** Set on a finalized assistant bubble that ended because the user/stream was cancelled. */
   isCancelled?: boolean;
+  terminalOutcome?: JarvisTerminalOutcome;
 }
 
 export interface ReasoningStep {

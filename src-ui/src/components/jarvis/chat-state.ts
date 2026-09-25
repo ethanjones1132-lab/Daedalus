@@ -1,4 +1,4 @@
-import type { JarvisMessage } from './types';
+import type { JarvisMessage, JarvisTerminalOutcome } from './types';
 import { isTerminalStageStatus } from './sse-protocol';
 import type { ToolResultTruncationMetadata } from './sse-protocol';
 
@@ -102,12 +102,19 @@ export function sanitizeAssistantDisplay(content: string): string {
   return visible.replace(/<\/?think>/gi, '').trim();
 }
 
-export function finalizeStreamingMessages(messages: JarvisMessage[]): JarvisMessage[] {
+export function finalizeStreamingMessages(
+  messages: JarvisMessage[],
+  terminalOutcome?: JarvisTerminalOutcome,
+  errorCode?: string,
+): JarvisMessage[] {
   const last = messages[messages.length - 1];
   if (!last || last.role !== 'assistant' || !last.isStreaming) return messages;
   const content = sanitizeAssistantDisplay(last.content);
-  if (!content) return messages.slice(0, -1);
-  return [...messages.slice(0, -1), { ...last, content, isStreaming: false }];
+  if (!content && !terminalOutcome) return messages.slice(0, -1);
+  const terminalMetadata = terminalOutcome
+    ? { terminalOutcome, ...(errorCode ? { errorCode } : {}) }
+    : {};
+  return [...messages.slice(0, -1), { ...last, content, isStreaming: false, ...terminalMetadata }];
 }
 
 // ── Message identity + dedupe (Task 7 / 2026-07-03 incident 1d4727cf) ──
