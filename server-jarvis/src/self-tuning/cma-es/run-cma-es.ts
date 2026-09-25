@@ -7,7 +7,13 @@ import {
   type OrchestrationTheta,
 } from "../../orchestration/orchestration-policy";
 import type { CallModelFn } from "../../orchestration/coordinator";
-import { proposePolicy, type TransitionResult } from "../policy-staging";
+import {
+  loadPolicyVersions,
+  proposeAndPersistPolicy,
+  proposePolicy,
+  type PolicyPatch,
+  type TransitionResult,
+} from "../policy-staging";
 import {
   HELD_OUT_TASKS,
   TRAINING_TASKS,
@@ -381,23 +387,32 @@ export function thetaDiff(winner: OrchestrationTheta): Record<string, number> {
   return diff;
 }
 
-/**
- * D4 — hand a winning candidate to policy-staging.
- *
- * Deliberately does NOT promote anything itself. `proposePolicy` starts the
- * candidate → shadow → canary → production lifecycle, which is driven by
- * outcomes from REAL traffic and gated by immutable governance thresholds.
- * A fixture campaign is evidence a candidate is worth vetting, not evidence it
- * is safe to ship — those are different claims and only live traffic settles
- * the second one.
- */
-export function proposeCampaignWinner(result: CampaignResult): TransitionResult | null {
-  if (!result.improved) {
-    // Not shipping a losing candidate is the correct outcome, not a failure:
-    // it says the signal is not there (or the fixture suite is too small/samey)
-    // — which is information worth having, and not license to promote anyway.
-    return null;
-  }
+export type CampaignHandoffStatus =
+  | "not_proposed"
+  | "proposed"
+  | "rejected"
+  | "load_failed"
+  | "persistence_failed";
+
+export interface CampaignHandoffOptions {
+  root?: string;
+  loadPolicyVersions?: (root?: string) => boolean;
+  persistPolicyVersions?: (root?: string) => boolean;
+}
+
+export interface CampaignHandoffResult {
+  status: CampaignHandoffStatus;
+  transition: TransitionResult | null;
+  persisted: boolean;
+  exitCode: 0 | 1;
+  reason: string;
+}
+
+function campaignWinnerProposal(result: CampaignResult): {
+  patch: PolicyPatch;
+  rationale: string;
+} | null {
+  if (!result.improved) return null;
   const diff = thetaDiff(result.winner);
   if (Object.keys(diff).length === 0) return null;
 
@@ -409,12 +424,86 @@ export function proposeCampaignWinner(result: CampaignResult): TransitionResult 
     : `held-out mean reward ${result.winnerHeldOut.toFixed(4)} vs baseline ` +
       `${result.baselineHeldOut.toFixed(4)}`;
 
-  return proposePolicy(
-    { domain: "budget", theta: diff },
-    `Phase D sep-CMA-ES over ${result.generations} generation(s): ${evidence} ` +
+  return {
+    patch: { domain: "budget", theta: diff },
+    rationale:
+      `Phase D sep-CMA-ES over ${result.generations} generation(s): ${evidence} ` +
       `across ${HELD_OUT_TASKS.length} held-out fixture(s); ${Object.keys(diff).length} ` +
       `of ${THETA_KEYS.length} dimensions changed`,
-  );
+  };
+}
+
+/**
+ * D4 — hand a winning candidate to policy-staging.
+ *
+ * Deliberately does NOT promote anything itself. `proposePolicy` starts the
+ * candidate → shadow → canary → production lifecycle, which is driven by
+ * outcomes from REAL traffic and gated by immutable governance thresholds.
+ * A fixture campaign is evidence a candidate is worth vetting, not evidence it
+ * is safe to ship — those are different claims and only live traffic settles
+ * the second one.
+ */
+export function proposeCampaignWinner(result: CampaignResult): TransitionResult | null {
+  const proposal = campaignWinnerProposal(result);
+  if (!proposal) return null;
+  return proposePolicy(proposal.patch, proposal.rationale);
+}
+
+export function persistCampaignWinner(
+  result: CampaignResult,
+  options: CampaignHandoffOptions = {},
+): CampaignHandoffResult {
+  const proposal = campaignWinnerProposal(result);
+  if (!proposal) {
+    return {
+      status: "not_proposed",
+      transition: null,
+      persisted: false,
+      exitCode: 0,
+      reason: "campaign_not_improved_or_unchanged",
+    };
+  }
+
+  const load = options.loadPolicyVersions ?? loadPolicyVersions;
+  if (!load(options.root)) {
+    return {
+      status: "load_failed",
+      transition: null,
+      persisted: false,
+      exitCode: 1,
+      reason: "policy_load_failed",
+    };
+  }
+
+  const committed = proposeAndPersistPolicy(proposal.patch, proposal.rationale, {
+    root: options.root,
+    persist: options.persistPolicyVersions,
+  });
+  if (committed.transition.action === "rejected") {
+    return {
+      status: "rejected",
+      transition: committed.transition,
+      persisted: false,
+      exitCode: 0,
+      reason: committed.transition.reason,
+    };
+  }
+  if (!committed.persisted) {
+    return {
+      status: "persistence_failed",
+      transition: committed.transition,
+      persisted: false,
+      exitCode: 1,
+      reason: "policy_persistence_failed",
+    };
+  }
+  return {
+    status: "proposed",
+    transition: committed.transition,
+    persisted: true,
+    exitCode: 0,
+    reason: committed.transition.reason,
+  };
 }
 
 /** Fixture counts, for a driver script to log before spending a campaign. */

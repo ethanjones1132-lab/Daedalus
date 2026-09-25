@@ -176,6 +176,18 @@ export interface TransitionResult {
   store: PolicyVersionStore;
 }
 
+export interface PolicyProposalPersistenceOptions {
+  root?: string;
+  baseline?: PolicySnapshot;
+  now?: string;
+  persist?: (root?: string) => boolean;
+}
+
+export interface PolicyProposalCommit {
+  transition: TransitionResult;
+  persisted: boolean;
+}
+
 // ── In-memory store ─────────────────────────────────────────────────────────
 
 function emptyStore(): PolicyVersionStore {
@@ -327,6 +339,34 @@ export function proposePolicy(
   };
   store.candidate = version;
   return { action: "proposed", reason: "held_as_candidate", version, store };
+}
+
+export function proposeAndPersistPolicy(
+  patch: PolicyPatch,
+  rationale: string,
+  options: PolicyProposalPersistenceOptions = {},
+): PolicyProposalCommit {
+  const previous = JSON.parse(JSON.stringify(store)) as PolicyVersionStore;
+  const transition = proposePolicy(patch, rationale, {
+    baseline: options.baseline,
+    now: options.now,
+  });
+  if (transition.action !== "proposed") return { transition, persisted: false };
+
+  let persisted = false;
+  try {
+    persisted = (options.persist ?? persistPolicyVersions)(options.root) === true;
+  } catch {
+    persisted = false;
+  }
+  if (!persisted) {
+    store = previous;
+    return {
+      transition: { ...transition, version: null, store },
+      persisted: false,
+    };
+  }
+  return { transition, persisted: true };
 }
 
 // ── Eligible outcomes → shadow ──────────────────────────────────────────────
@@ -1187,29 +1227,68 @@ export function policyVersionsPath(root: string = SESSIONS_DIR): string {
 
 function atomicWriteJson(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(tmp, JSON.stringify(value, null, 2), "utf-8");
+  const suffix = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}`;
+  const tmp = `${path}.${suffix}.tmp`;
+  const backup = `${path}.${suffix}.bak`;
+  let backupCreated = false;
+  let preserveBackup = false;
   try {
-    renameSync(tmp, path);
-  } catch {
-    // Windows: rename over existing can fail; fall back to overwrite.
-    writeFileSync(path, JSON.stringify(value, null, 2), "utf-8");
+    writeFileSync(tmp, JSON.stringify(value, null, 2), "utf-8");
+    try {
+      renameSync(tmp, path);
+    } catch {
+      let movedExisting = false;
+      if (existsSync(path)) {
+        renameSync(path, backup);
+        movedExisting = true;
+        backupCreated = true;
+      }
+      try {
+        renameSync(tmp, path);
+      } catch (error) {
+        if (movedExisting && !existsSync(path) && existsSync(backup)) {
+          try {
+            renameSync(backup, path);
+          } catch {
+            preserveBackup = true;
+          }
+        }
+        throw error;
+      }
+      if (movedExisting) {
+        try {
+          unlinkSync(backup);
+        } catch {
+          preserveBackup = true;
+        }
+      }
+    }
+  } finally {
     try {
       unlinkSync(tmp);
     } catch {
-      /* ignore */
+      preserveBackup = true;
+    }
+    if (backupCreated && !preserveBackup) {
+      try {
+        unlinkSync(backup);
+      } catch {
+        preserveBackup = true;
+      }
     }
   }
 }
 
 /** Persist production / candidate / canary / last-known-good so restarts keep rollback. */
-export function persistPolicyVersions(root: string = SESSIONS_DIR): void {
+export function persistPolicyVersions(root: string = SESSIONS_DIR): boolean {
   try {
     atomicWriteJson(policyVersionsPath(root), store);
+    return true;
   } catch (e) {
     console.warn(
       `[PolicyStaging] Failed to persist: ${e instanceof Error ? e.message : String(e)}`,
     );
+    return false;
   }
 }
 
@@ -1230,16 +1309,16 @@ export function reapplyProductionPolicySnapshot(): boolean {
 }
 
 /** Load persisted policy versions. No-op when the file is missing. */
-export function loadPolicyVersions(root: string = SESSIONS_DIR): void {
+export function loadPolicyVersions(root: string = SESSIONS_DIR): boolean {
   const path = policyVersionsPath(root);
-  if (!existsSync(path)) return;
+  if (!existsSync(path)) return true;
 
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(path, "utf-8"));
   } catch {
     warnInvalidPolicyVersions("invalid_json");
-    return;
+    return false;
   }
 
   let validated: PolicyVersionStore;
@@ -1248,7 +1327,7 @@ export function loadPolicyVersions(root: string = SESSIONS_DIR): void {
   } catch (error) {
     const reason = error instanceof PolicyVersionValidationError ? error.reason : "invalid_state";
     warnInvalidPolicyVersions(reason === "unknown_schema" ? reason : `invalid_state (${reason})`);
-    return;
+    return false;
   }
 
   const previousStore = store;
@@ -1262,5 +1341,7 @@ export function loadPolicyVersions(root: string = SESSIONS_DIR): void {
     restoreStagedPolicyMaps(previousPool);
     setGlobalTheta(previousTheta);
     warnInvalidPolicyVersions("apply_failed");
+    return false;
   }
+  return true;
 }

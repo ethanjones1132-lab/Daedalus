@@ -15,7 +15,7 @@ if (process.env.NODE_ENV !== "test") {
   process.env.NODE_ENV = "test";
 }
 
-import { loadConfig, type JarvisConfig } from "../../config";
+import { loadConfig, SESSIONS_DIR, type JarvisConfig } from "../../config";
 import { AgentPool, DEFAULT_LOCAL_STAGE_MODELS } from "../../orchestration/agent-pool";
 import { BASELINE_THETA, mulberry32 } from "../../orchestration/orchestration-policy";
 import { routableOrchestratorAgents } from "../../provider-availability";
@@ -33,7 +33,7 @@ import {
   campaignFixtureSummary,
   heldOutSeedsFromCampaignSeed,
   pairedTTestImproved,
-  proposeCampaignWinner,
+  persistCampaignWinner,
   runCmaEsCampaign,
   selectTrainingTasks,
   thetaDiff,
@@ -500,14 +500,22 @@ async function runCampaign(
   console.log("\n--- stats ---");
   console.log(JSON.stringify(callModel.stats, null, 2));
 
-  const transition = proposeCampaignWinner(result);
-  if (transition) {
+  const handoff = persistCampaignWinner(result, { root: SESSIONS_DIR });
+  if (handoff.status === "load_failed") {
+    console.error("Policy handoff failed: the existing policy state could not be loaded.");
+    return handoff.exitCode;
+  }
+  if (handoff.status === "persistence_failed") {
+    console.error("Policy handoff failed: the candidate was not persisted.");
+    return handoff.exitCode;
+  }
+  if (handoff.transition) {
     console.log("\n--- policy-staging proposal ---");
-    console.log(JSON.stringify(transition, null, 2));
+    console.log(JSON.stringify(handoff.transition, null, 2));
   } else {
     console.log("\nNo policy proposal (winner did not beat baseline held-out, or θ unchanged).");
   }
-  return 0;
+  return handoff.exitCode;
 }
 
 async function main(): Promise<void> {

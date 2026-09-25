@@ -1,16 +1,28 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   BASELINE_THETA,
   THETA_KEYS,
+  resetGlobalThetaToBaseline,
   type OrchestrationTheta,
 } from "../../orchestration/orchestration-policy";
 import type { CallModelFn } from "../../orchestration/coordinator";
-import { getPolicyVersionStore, resetPolicyStagingForTests } from "../policy-staging";
+import { resetLearnedPoolStateForTests } from "../learned-pool-state";
+import {
+  getPolicyVersionStore,
+  loadPolicyVersions,
+  policyVersionsPath,
+  recordEligibleOutcome,
+  resetPolicyStagingForTests,
+} from "../policy-staging";
 import { HELD_OUT_TASKS, TRAINING_TASKS } from "../rollout/fixture-tasks";
 import {
   campaignFixtureSummary,
   compareHeldOut,
   pairedTTestImproved,
+  persistCampaignWinner,
   proposeCampaignWinner,
   runCmaEsCampaign,
   selectTrainingTasks,
@@ -274,6 +286,144 @@ describe("proposeCampaignWinner", () => {
     expect(rationale).toContain("0.8123");
     expect(rationale).toContain("0.4011");
     expect(rationale).toContain("5 generation");
+  });
+});
+
+describe("persistCampaignWinner", () => {
+  let root: string;
+
+  beforeEach(() => {
+    resetPolicyStagingForTests();
+    resetLearnedPoolStateForTests();
+    resetGlobalThetaToBaseline();
+    root = mkdtempSync(join(tmpdir(), "jarvis-campaign-policy-"));
+  });
+
+  afterEach(() => {
+    resetPolicyStagingForTests();
+    resetLearnedPoolStateForTests();
+    resetGlobalThetaToBaseline();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const improved = (key = THETA_KEYS[0]!, value = BASELINE_THETA[key] + 2): CampaignResult => ({
+    winner: { ...BASELINE_THETA, [key]: value },
+    winnerHeldOut: 0.8123,
+    baselineHeldOut: 0.4011,
+    improved: true,
+    generations: 3,
+    history: [],
+  });
+
+  test("persists an improved winner and reloads it before qualification", () => {
+    const result = improved();
+    const handoff = persistCampaignWinner(result, { root });
+
+    expect(handoff.status).toBe("proposed");
+    expect(handoff.persisted).toBe(true);
+    expect(handoff.exitCode).toBe(0);
+
+    const onDisk = JSON.parse(readFileSync(policyVersionsPath(root), "utf8"));
+    expect(onDisk.schemaVersion).toBe(1);
+    expect(onDisk.candidate.stage).toBe("candidate");
+    expect(onDisk.candidate.patch.theta).toEqual(thetaDiff(result.winner));
+    expect(onDisk.candidate.rationale).toContain("0.8123");
+
+    resetPolicyStagingForTests();
+    resetLearnedPoolStateForTests();
+    resetGlobalThetaToBaseline();
+    expect(loadPolicyVersions(root)).toBe(true);
+
+    const candidate = getPolicyVersionStore().candidate;
+    expect(candidate?.patch.theta).toEqual(thetaDiff(result.winner));
+    expect(candidate?.eligibleOutcomes).toBe(0);
+    const qualified = recordEligibleOutcome("success", {
+      evidenceId: "campaign-restart-evidence",
+      policyId: candidate!.id,
+      policyVersion: candidate!.version,
+      patch: candidate!.patch,
+      source: "candidate_execution",
+      arm: "candidate",
+      runId: "campaign-restart-run",
+      sessionId: "campaign-restart-session",
+      taskType: "campaign-restart",
+      outcome: "success",
+    });
+    expect(qualified.action).toBe("eligible_recorded");
+  });
+
+  test("does not replace an existing candidate", () => {
+    const first = persistCampaignWinner(improved(), { root });
+    expect(first.status).toBe("proposed");
+    const before = readFileSync(policyVersionsPath(root));
+    const firstCandidate = getPolicyVersionStore().candidate;
+    const second = persistCampaignWinner(
+      improved(THETA_KEYS[1]!, BASELINE_THETA[THETA_KEYS[1]!] + 3),
+      { root },
+    );
+
+    expect(second.status).toBe("rejected");
+    expect(second.exitCode).toBe(0);
+    expect(readFileSync(policyVersionsPath(root)).toString()).toBe(before.toString());
+    expect(getPolicyVersionStore().candidate?.id).toBe(firstCandidate?.id);
+  });
+
+  test("does not rewrite a prior policy for a no-op campaign", () => {
+    persistCampaignWinner(improved(), { root });
+    const before = readFileSync(policyVersionsPath(root)).toString();
+    const noImprovement = persistCampaignWinner(
+      { ...improved(), improved: false },
+      { root },
+    );
+    const unchanged = persistCampaignWinner(improved(), { root });
+
+    expect(noImprovement.status).toBe("not_proposed");
+    expect(unchanged.status).toBe("rejected");
+    expect(readFileSync(policyVersionsPath(root)).toString()).toBe(before);
+  });
+
+  test("fails closed and rolls back when persistence fails", () => {
+    const handoff = persistCampaignWinner(improved(), {
+      root,
+      persistPolicyVersions: () => false,
+    });
+
+    expect(handoff.status).toBe("persistence_failed");
+    expect(handoff.persisted).toBe(false);
+    expect(handoff.exitCode).toBe(1);
+    expect(getPolicyVersionStore().candidate).toBeNull();
+    expect(existsSync(policyVersionsPath(root))).toBe(false);
+  });
+
+  test("leaves a prior policy readable when a replacement cannot persist", () => {
+    persistCampaignWinner(improved(), { root });
+    const before = readFileSync(policyVersionsPath(root)).toString();
+    resetPolicyStagingForTests();
+
+    const handoff = persistCampaignWinner(
+      improved(THETA_KEYS[1]!, BASELINE_THETA[THETA_KEYS[1]!] + 3),
+      {
+        root,
+        loadPolicyVersions: () => true,
+        persistPolicyVersions: () => false,
+      },
+    );
+
+    expect(handoff.status).toBe("persistence_failed");
+    expect(readFileSync(policyVersionsPath(root), "utf8")).toBe(before);
+    expect(getPolicyVersionStore().candidate).toBeNull();
+  });
+
+  test("does not overwrite an unreadable policy file", () => {
+    mkdirSync(join(root, "self-tuning"), { recursive: true });
+    const path = policyVersionsPath(root);
+    writeFileSync(path, "{not-json", "utf8");
+    const handoff = persistCampaignWinner(improved(), { root });
+
+    expect(handoff.status).toBe("load_failed");
+    expect(handoff.exitCode).toBe(1);
+    expect(readFileSync(path, "utf8")).toBe("{not-json");
+    expect(getPolicyVersionStore().candidate).toBeNull();
   });
 });
 
