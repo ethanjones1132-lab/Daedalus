@@ -43,6 +43,87 @@ export const RUN_OUTCOME_UNAVAILABLE_TEXT = 'run outcome unavailable';
 /** Per-row marker for a Session the read confirmed has no recorded run. */
 export const RUN_NOT_RECORDED_TEXT = 'no run recorded';
 
+/**
+ * Per-row marker for a Session whose most recent turn never got a confirmed
+ * run record. The durable read may honestly report no run for it; that alone
+ * must not let a turn the operator watched finish read as a clean run.
+ */
+export const RUN_ROW_UNCONFIRMED_TEXT = "last turn's run outcome not confirmed";
+
+// ── Run-record read-back (Task 4.1 durable outcome confirmation) ─────
+//
+// `record_terminal_run` used to be fire-and-forget: its only failure handling
+// was a `console.warn`, and nothing ever read the row back. A rejected write
+// (invalid outcome, locked DB, a command missing from the shipped binary)
+// therefore left the Session reading as one that never ran, while the
+// operator had just watched a terminal frame render. These helpers decide one
+// run record from the write's own outcome plus a `get_session_runs`
+// read-back, and never infer a record that Native did not report.
+
+/** Pending text for the durable write itself. */
+export const RUN_RECORD_WRITING_TEXT = 'Recording the run outcome for this turn…';
+
+/** Pending text for the read-back that decides whether the write landed. */
+export const RUN_RECORD_CONFIRMING_TEXT =
+  'Reading the recorded run back from the Session store…';
+
+/** Confirmed success: Native's read-back reports this run with this outcome. */
+export const RUN_RECORD_CONFIRMED_MESSAGE = (runId: string, outcome: string) =>
+  `Recorded run ${runId} as ${outcome}.`;
+
+/** The read-back disagrees with the local outcome: the stored one is shown. */
+export const RUN_RECORD_DISAGREED_MESSAGE = (
+  runId: string,
+  localOutcome: string,
+  storedOutcome: string,
+) => `Native recorded run ${runId} as ${storedOutcome}, not ${localOutcome}. The stored outcome is shown.`;
+
+/** The write resolved but the read-back does not report the run. */
+export const RUN_RECORD_UNRECORDED_MESSAGE = (runId: string) =>
+  `Native does not report run ${runId} for this Session, so the recorded run outcome is not confirmed.`;
+
+/** The write resolved but the read-back could not be decoded or failed. */
+export const RUN_RECORD_READ_FAILED_MESSAGE = (runId: string) =>
+  `Run ${runId} was written but could not be read back, so the recorded run outcome is not confirmed.`;
+
+/** Native rejected the write outright. */
+export const RUN_RECORD_WRITE_FAILED_MESSAGE = (runId: string) =>
+  `Native rejected the record for run ${runId}, so this Session has no confirmed run outcome.`;
+
+export type SessionRunWrite = { ok: true } | { ok: false };
+
+/** What the UI believes it recorded, and for which Session. */
+export interface RunRecordIntent {
+  sessionId: string;
+  runId: string;
+  outcome: SessionRunOutcome;
+}
+
+export type RunRecordVerdict =
+  | { phase: 'confirmed'; run: SessionRunRecord }
+  | { phase: 'disagreed'; run: SessionRunRecord }
+  | { phase: 'unrecorded' }
+  | { phase: 'unreadable' }
+  | { phase: 'write_failed' };
+
+export type RunRecordPhase = 'writing' | 'confirming' | RunRecordVerdict['phase'];
+
+export interface RunRecordState {
+  intent: RunRecordIntent;
+  phase: RunRecordPhase;
+  run?: SessionRunRecord;
+}
+
+export interface RunRecordView {
+  phase: RunRecordPhase;
+  text: string;
+  /** True only when Native's read-back reports this run with this outcome. */
+  confirmed: boolean;
+  /** True when a deliberate re-record/re-read can still resolve the record. */
+  retryable: boolean;
+  runId: string;
+}
+
 export type SessionRunRead =
   | { ok: true; value: unknown }
   | { ok: false };
@@ -50,13 +131,19 @@ export type SessionRunRead =
 export type SessionRunTelemetry =
   | { state: 'pending' }
   | { state: 'unavailable' }
-  | { state: 'available'; runs: Record<string, SessionRunRecord> };
+  | { state: 'available'; runs: Record<string, SessionRunHistoryEntry> };
 
 export type SessionOutcomeView =
   | { kind: 'pending' }
   | { kind: 'unavailable' }
   | { kind: 'not_recorded' }
-  | { kind: 'recorded'; run: SessionRunRecord };
+  | { kind: 'recorded'; run: SessionRunRecord; olderCount: number };
+
+/** The newest recorded run of one Session plus how many older ones exist. */
+export interface SessionRunHistoryEntry {
+  run: SessionRunRecord;
+  olderCount: number;
+}
 
 function isRunRecord(value: unknown): value is SessionRunRecord {
   if (typeof value !== 'object' || value === null) return false;
@@ -88,19 +175,20 @@ export function decodeSessionRuns(value: unknown): SessionRunRecord[] | null {
 /**
  * Index decoded runs by Session. Native lists newest-first
  * (`ORDER BY finished_at DESC`), so the first entry for a Session wins and
- * later rows are its older runs. Runs for Sessions that are not visible are
- * dropped, and the input array is never mutated.
+ * every later row is one of its older runs. Runs for Sessions that are not
+ * visible are dropped, and the input array is never mutated.
  */
 export function indexSessionRuns(
   runs: SessionRunRecord[],
   visibleSessionIds: Iterable<string>,
-): Record<string, SessionRunRecord> {
+): Record<string, SessionRunHistoryEntry> {
   const visible = new Set(visibleSessionIds);
-  const indexed: Record<string, SessionRunRecord> = {};
+  const indexed: Record<string, SessionRunHistoryEntry> = {};
   for (const run of runs) {
-    if (visible.has(run.session_id) && !indexed[run.session_id]) {
-      indexed[run.session_id] = run;
-    }
+    if (!visible.has(run.session_id)) continue;
+    const current = indexed[run.session_id];
+    if (current) current.olderCount += 1;
+    else indexed[run.session_id] = { run, olderCount: 0 };
   }
   return indexed;
 }
@@ -123,8 +211,76 @@ export function sessionOutcomeView(
 ): SessionOutcomeView {
   if (telemetry.state === 'pending') return { kind: 'pending' };
   if (telemetry.state === 'unavailable') return { kind: 'unavailable' };
-  const run = telemetry.runs[sessionId];
-  return run ? { kind: 'recorded', run } : { kind: 'not_recorded' };
+  const entry = telemetry.runs[sessionId];
+  return entry
+    ? { kind: 'recorded', run: entry.run, olderCount: entry.olderCount }
+    : { kind: 'not_recorded' };
+}
+
+/**
+ * Decide one run record from the durable write and a `get_session_runs`
+ * read-back. The webview's own terminal frame is never evidence: only a row
+ * Native reports for this `run_id` can confirm a record, and only a stored
+ * outcome inside the recorded vocabulary can read as success. A disagreeing
+ * read-back is reported verbatim and is never rewritten.
+ */
+export function decideRunRecord(
+  intent: RunRecordIntent,
+  write: SessionRunWrite,
+  read: SessionRunRead,
+): RunRecordVerdict {
+  if (!write.ok) return { phase: 'write_failed' };
+  if (!read.ok) return { phase: 'unreadable' };
+  const runs = decodeSessionRuns(read.value);
+  if (runs === null) return { phase: 'unreadable' };
+  const stored = runs.find(entry => entry.run_id === intent.runId);
+  if (!stored) return { phase: 'unrecorded' };
+  const agrees = stored.session_id === intent.sessionId
+    && stored.outcome === intent.outcome
+    && (RUN_OUTCOMES as readonly string[]).includes(stored.outcome);
+  return agrees ? { phase: 'confirmed', run: stored } : { phase: 'disagreed', run: stored };
+}
+
+/** Project a run record onto the one fixed sentence the surface shows. */
+export function runRecordView(state: RunRecordState | null): RunRecordView | null {
+  if (!state) return null;
+  const { intent, phase, run } = state;
+  const base = { phase, runId: intent.runId };
+  if (phase === 'writing') {
+    return { ...base, text: RUN_RECORD_WRITING_TEXT, confirmed: false, retryable: false };
+  }
+  if (phase === 'confirming') {
+    return { ...base, text: RUN_RECORD_CONFIRMING_TEXT, confirmed: false, retryable: false };
+  }
+  if (phase === 'confirmed') {
+    return {
+      ...base,
+      text: RUN_RECORD_CONFIRMED_MESSAGE(intent.runId, run?.outcome ?? intent.outcome),
+      confirmed: true,
+      retryable: false,
+    };
+  }
+  if (phase === 'disagreed') {
+    return {
+      ...base,
+      text: RUN_RECORD_DISAGREED_MESSAGE(
+        intent.runId,
+        intent.outcome,
+        run?.outcome ?? 'an unrecognised outcome',
+      ),
+      confirmed: false,
+      // A disagreement is the stored row winning. Re-recording would overwrite
+      // it, so this state is deliberately not retryable.
+      retryable: false,
+    };
+  }
+  if (phase === 'unrecorded') {
+    return { ...base, text: RUN_RECORD_UNRECORDED_MESSAGE(intent.runId), confirmed: false, retryable: true };
+  }
+  if (phase === 'unreadable') {
+    return { ...base, text: RUN_RECORD_READ_FAILED_MESSAGE(intent.runId), confirmed: false, retryable: true };
+  }
+  return { ...base, text: RUN_RECORD_WRITE_FAILED_MESSAGE(intent.runId), confirmed: false, retryable: true };
 }
 
 /**

@@ -29,6 +29,10 @@ beforeEach(() => {
     if (command === 'get_session_history') return [];
     if (command === 'jarvis_list_sessions' || command === 'get_all_session_runs') return [];
     if (command === 'jarvis_get_config' || command === 'jarvis_check_status' || command === 'jarvis_get_companion') return null;
+    // A valid envelope, so the grants chip renders nothing. The catch-all
+    // `true` below is not a decodable grants response, which made this file's
+    // alerts depend on which read happened to settle first.
+    if (command === 'jarvis_get_session_grants') return { session_id: 'session-1', grants: [] };
     return true;
   });
   Object.defineProperty(window, 'matchMedia', {

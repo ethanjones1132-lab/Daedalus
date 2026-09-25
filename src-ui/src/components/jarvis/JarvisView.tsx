@@ -20,6 +20,7 @@ import {
   type SessionDraftStore,
 } from './session-draft-state';
 import MarkdownView from './MarkdownView';
+import SessionRunsView from './SessionRunsView';
 import WorkspaceGrantsChip from './WorkspaceGrantsChip';
 import SystemStatusBar from './SystemStatusBar';
 import {
@@ -78,11 +79,18 @@ import {
   RUN_NOT_RECORDED_TEXT,
   RUN_OUTCOME_PENDING_TEXT,
   RUN_OUTCOME_UNAVAILABLE_TEXT,
+  RUN_ROW_UNCONFIRMED_TEXT,
   RUN_TELEMETRY_UNAVAILABLE_MESSAGE,
+  decideRunRecord,
   decideSessionRunTelemetry,
+  runRecordView,
   sessionOutcomeView,
   singleFlightSessionRunRead,
+  type RunRecordIntent,
+  type RunRecordState,
+  type SessionRunRead,
   type SessionRunTelemetry,
+  type SessionRunWrite,
 } from './session-run-telemetry';
 import {
   reconcileSessionDeletions,
@@ -121,6 +129,46 @@ const sessionInvokeArgs = (sessionId: string) => ({
   session_id: sessionId,
 });
 
+// ── Durable run record (Task 4.1) ────────────────────────────────────
+// `record_terminal_run` is Native's only writer for `session_runs` and
+// `get_session_runs` its per-Session read. A turn's terminal frame used to be
+// reported fire-and-forget, so a write Native rejected left the Session
+// reading as one that never ran. These two helpers keep the write and the
+// read-back on the existing command surface and report nothing but success or
+// failure: native error text never leaves this boundary.
+
+/** One terminal run, addressed by the Session it belongs to. */
+export interface RunRecordPayload extends RunRecordIntent {
+  selectedModel: string | null;
+  tokenCount: number;
+  toolCount: number;
+  cancelledReason: string | null;
+  partialOutput: string | null;
+}
+
+const recordTerminalRun = (payload: RunRecordPayload): Promise<SessionRunWrite> =>
+  invoke('record_terminal_run', {
+    ...sessionInvokeArgs(payload.sessionId),
+    runId: payload.runId,
+    outcome: payload.outcome,
+    selectedModel: payload.selectedModel,
+    tokenCount: payload.tokenCount,
+    toolCount: payload.toolCount,
+    cancelledReason: payload.cancelledReason,
+    partialOutput: payload.partialOutput,
+  }).then(
+    () => ({ ok: true }) as SessionRunWrite,
+    () => ({ ok: false }) as SessionRunWrite,
+  );
+
+const readSessionRunsFor = async (sessionId: string): Promise<SessionRunRead> => {
+  try {
+    return { ok: true, value: await invoke<unknown>('get_session_runs', sessionInvokeArgs(sessionId)) };
+  } catch {
+    return { ok: false };
+  }
+};
+
 const JARVIS_API_URL = 'http://127.0.0.1:19877';
 const STREAM_INACTIVITY_TIMEOUT_MS = 90_000;
 
@@ -151,6 +199,10 @@ export default function JarvisView({ initialSubView = 'chat', initialControlTab,
   // empty list, so a Session whose outcome could not be read is never shown as
   // a Session that never ran. See `session-run-telemetry.ts`.
   const [runTelemetry, setRunTelemetry] = useState<SessionRunTelemetry>({ state: 'pending' });
+  // The run record of the turn that just ended, confirmed against Native's
+  // read-back. Owned here so the Session list can keep saying "this turn's run
+  // is not recorded" after the operator leaves Chat.
+  const [runRecord, setRunRecord] = useState<RunRecordState | null>(null);
   const sessionRunReader = useRef<ReturnType<typeof singleFlightSessionRunRead> | null>(null);
   const readSessionRuns = sessionRunReader.current
     ?? (sessionRunReader.current = singleFlightSessionRunRead(() => invoke<unknown>('get_all_session_runs')));
@@ -428,6 +480,7 @@ export default function JarvisView({ initialSubView = 'chat', initialControlTab,
                 backendLabel={config?.active_backend === 'openrouter' ? 'OpenRouter' : (config?.active_backend === 'claude_cli' ? 'Claude CLI' : 'Ollama')}
                 modelLabel={config ? (config.active_backend === 'ollama' ? config.ollama.model : (config.active_backend === 'claude_cli' ? (config.claude_cli.model ?? '') : config.openrouter.model)) : ''}
                 onSessionCreated={loadSessions}
+                onRunRecordSettled={setRunRecord}
               />
             </motion.div>
           )}
@@ -438,6 +491,7 @@ export default function JarvisView({ initialSubView = 'chat', initialControlTab,
                 loading={sessionsLoading}
                 error={sessionsError}
                 runTelemetry={runTelemetry}
+                runRecord={runRecord}
                 activeSession={activeSession}
                 deleteOperations={sessionDeleteOperations}
                 onSelect={(id) => { setActiveSession(id); setSubView('chat'); }}
@@ -562,7 +616,7 @@ const CURATED_SUGGESTIONS: string[] = [
 ];
 
 export function ChatPanel({
-  activeSession, setActiveSession, config, backendLabel, modelLabel, onSessionCreated,
+  activeSession, setActiveSession, config, backendLabel, modelLabel, onSessionCreated, onRunRecordSettled,
 }: {
   activeSession: string | null;
   setActiveSession: (id: string | null) => void;
@@ -570,6 +624,7 @@ export function ChatPanel({
   backendLabel: string;
   modelLabel: string;
   onSessionCreated: () => void;
+  onRunRecordSettled?: (state: RunRecordState | null) => void;
 }) {
   const [messages, setMessages] = useState<JarvisMessage[]>([]);
   const [draftStore, setDraftStore] = useState<SessionDraftStore>(() => createSessionDraftStore());
@@ -730,6 +785,71 @@ export function ChatPanel({
   }, [isStreaming]);
   useLayoutEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
   useEffect(() => { onSessionCreatedRef.current = onSessionCreated; }, [onSessionCreated]);
+  useEffect(() => { onRunRecordSettledRef.current = onRunRecordSettled; }, [onRunRecordSettled]);
+
+  // ── Durable run record ────────────────────────────────────────────
+  // A terminal frame is the UI's observation, not a durable record. The
+  // record only exists once Native's read-back reports this `run_id` for this
+  // Session, so every state below is derived from the write plus that
+  // read-back (`decideRunRecord`) and is published to the owner so the
+  // Session list can mark an unconfirmed run.
+  const [runRecord, setRunRecord] = useState<RunRecordState | null>(null);
+  const runRecordRef = useRef<RunRecordState | null>(null);
+  const runRecordPayload = useRef<RunRecordPayload | null>(null);
+  const runRecordToken = useRef(0);
+  const onRunRecordSettledRef = useRef(onRunRecordSettled);
+
+  const publishRunRecord = useCallback((next: RunRecordState | null) => {
+    runRecordRef.current = next;
+    if (mountedRef.current) setRunRecord(next);
+    onRunRecordSettledRef.current?.(next);
+  }, []);
+
+  const confirmRunRecord = useCallback(async (payload: RunRecordPayload, options?: { readOnly?: boolean }) => {
+    const token = ++runRecordToken.current;
+    runRecordPayload.current = payload;
+    const intent: RunRecordIntent = {
+      sessionId: payload.sessionId,
+      runId: payload.runId,
+      outcome: payload.outcome,
+    };
+    publishRunRecord({ intent, phase: 'writing' });
+    // A read-only retry is for a write Native already accepted: it re-reads
+    // instead of writing again, so settling an unreadable record can never
+    // overwrite the stored row.
+    const write = options?.readOnly
+      ? ({ ok: true } as SessionRunWrite)
+      : await recordTerminalRun(payload);
+    if (token !== runRecordToken.current || !mountedRef.current) return;
+    if (write.ok) publishRunRecord({ intent, phase: 'confirming' });
+    // A rejected write is never confirmed by a read: it is reported as-is.
+    const read = write.ok
+      ? await readSessionRunsFor(payload.sessionId)
+      : ({ ok: false } as SessionRunRead);
+    if (token !== runRecordToken.current || !mountedRef.current) return;
+    const verdict = decideRunRecord(intent, write, read);
+    publishRunRecord({ intent, ...verdict });
+    if (verdict.phase === 'confirmed') {
+      // The terminal frame landed before this write, so the list reload that
+      // `finalizeAssistantMessage` triggered can have read the table too
+      // early. Re-read it so the row shows the run Native actually stored.
+      onSessionCreatedRef.current();
+    }
+  }, [publishRunRecord]);
+
+  const retryRunRecord = useCallback(() => {
+    const payload = runRecordPayload.current;
+    if (!payload) return;
+    const readOnly = runRecordView(runRecordRef.current)?.phase === 'unreadable';
+    void confirmRunRecord(payload, { readOnly });
+  }, [confirmRunRecord]);
+
+  // A new turn invalidates the previous turn's confirmation, and with it any
+  // read-back still in flight for that turn.
+  const clearRunRecord = useCallback(() => {
+    runRecordToken.current += 1;
+    publishRunRecord(null);
+  }, [publishRunRecord]);
 
   const matchesStreamSession = useCallback((sid: string | undefined) => {
     if (!mountedRef.current) return false;
@@ -1208,7 +1328,7 @@ export function ChatPanel({
       disposed = true;
       unsubs.forEach((f) => f());
     };
-  }, [appendAssistantText, applyTokenChunk, clearPendingApproval, dispatchActivity, finalizeAssistantMessage, matchesStreamSession, presentApprovalRequest, takePendingTokens]);
+  }, [appendAssistantText, applyTokenChunk, clearPendingApproval, confirmRunRecord, dispatchActivity, finalizeAssistantMessage, matchesStreamSession, presentApprovalRequest, takePendingTokens]);
 
   // True autosize composer (Phase 2.4). The previous rows=⟨line-count⟩ approach
   // overflowed for single-line wrapped text.
@@ -1316,10 +1436,10 @@ export function ChatPanel({
       // A force-stop can land before the pipeline ever emitted agent_run_id
       // (the incident's exact case) — synthesize an id so the cancellation
       // is still durably recorded. run_id is the idempotency key, so a
-      // client-generated id is safe.
+      // client-generated id is safe, and a retry re-uses the same one.
       const runId = runAcc.runId ?? `run_client_${crypto.randomUUID()}`;
-      invoke('record_terminal_run', {
-        ...sessionInvokeArgs(sid),
+      void confirmRunRecord({
+        sessionId: sid,
         runId,
         outcome: runAcc.outcome,
         selectedModel: runAcc.selectedModel ?? null,
@@ -1327,7 +1447,7 @@ export function ChatPanel({
         toolCount: runAcc.toolCount,
         cancelledReason: runAcc.cancelledReason ?? null,
         partialOutput: runAcc.partialOutput ?? null,
-      }).catch((e) => console.warn('[Jarvis] failed to persist terminal run:', e));
+      });
     };
     const acceptTerminal = (next: DecodedStreamTerminal): boolean => {
       const accepted = acceptFirstTerminal(terminal, next);
@@ -1765,6 +1885,7 @@ export function ChatPanel({
     setShowAgents(true);
     setToolCalls([]);
     resetActivityLedger();
+    clearRunRecord();
     setTurnCost(null);
     setScopeNotice(null);
     setRunMetrics(null);
@@ -1850,7 +1971,7 @@ export function ChatPanel({
       // now" check that needs a single finish() on every exit.
       sendInFlightRef.current.finish();
     }
-  }, [isStreaming, messages, activeSession, sessionId, onSessionCreated, setActiveSession, streamFromJarvisApi, discardPendingTokens, takePendingTokens, applyTokenChunk, publishDraftStore, resetActivityLedger]);
+  }, [isStreaming, messages, activeSession, sessionId, onSessionCreated, setActiveSession, clearRunRecord, streamFromJarvisApi, discardPendingTokens, takePendingTokens, applyTokenChunk, publishDraftStore, resetActivityLedger]);
 
   // Phase 1.3 — real Stop. POST /chat/cancel on the Bun server; SseRelay now
   // treats the resulting `cancelled` frame as terminal, so isStreaming flips.
@@ -1998,6 +2119,10 @@ export function ChatPanel({
     approvalName: pendingApproval?.name,
   });
   const streamStatusText = turnProgress?.text;
+  // One fixed sentence per run-record phase, derived only from what Native's
+  // read-back reported (see `runRecordView`).
+  const runRecordSummary = runRecordView(runRecord);
+  const runRecordInFlight = runRecord?.phase === 'writing' || runRecord?.phase === 'confirming';
   const showSkeleton =
     isStreaming &&
     !loadingHistory &&
@@ -2053,6 +2178,37 @@ export function ChatPanel({
           className="shrink-0 mb-3 rounded-lg border border-cyan-neon/20 bg-cyan-neon/5 px-3 py-2 text-xs font-mono text-bone-muted"
         >
           {turnProgress.text}
+        </div>
+      )}
+
+      {/* Durable run record. Confirmed only when Native's read-back reports
+          this run id; anything else stays visible as an unconfirmed record
+          with a deliberate retry, never as a recorded run. */}
+      {runRecordSummary && (
+        <div
+          role="status"
+          aria-label="Recorded run confirmation"
+          aria-atomic="true"
+          className={cn(
+            'shrink-0 mb-3 rounded-lg border px-3 py-2 text-xs font-mono flex items-start gap-2',
+            runRecordSummary.confirmed
+              ? 'border-emerald-500/20 bg-emerald-500/5 text-emerald-300/90'
+              : 'border-amber-500/20 bg-amber-500/5 text-amber-200/90',
+          )}
+        >
+          <span className="min-w-0">{runRecordSummary.text}</span>
+          {runRecordSummary.retryable && (
+            <button
+              type="button"
+              onClick={retryRunRecord}
+              disabled={runRecordInFlight}
+              className="shrink-0 underline disabled:opacity-40"
+            >
+              {runRecordSummary.phase === 'unreadable'
+                ? 'Read the run outcome again'
+                : 'Record the run outcome again'}
+            </button>
+          )}
         </div>
       )}
 
@@ -3176,12 +3332,13 @@ function ApprovalModal({ call_id, name, args, error, pending, onRetry, onApprove
 // ═══════════════════════════════════════════════════════════════
 
 function SessionsPanel({
-  sessions, loading, error, runTelemetry, activeSession, deleteOperations, onSelect, onNew, onDelete, onRetryDeleteRead, onRefresh,
+  sessions, loading, error, runTelemetry, runRecord, activeSession, deleteOperations, onSelect, onNew, onDelete, onRetryDeleteRead, onRefresh,
 }: {
   sessions: JarvisSession[];
   loading: boolean;
   error: string | null;
   runTelemetry: SessionRunTelemetry;
+  runRecord: RunRecordState | null;
   activeSession: string | null;
   deleteOperations: Record<string, SessionDeleteOperation<JarvisSession>>;
   onSelect: (id: string) => void;
@@ -3193,6 +3350,8 @@ function SessionsPanel({
   // Free-text filter — case-insensitive subsequence match against name /
   // title / id / model / backend. See `session-filter.ts` for the contract.
   const [filterQuery, setFilterQuery] = useState('');
+  // Which Session's recorded-run history is expanded (one at a time).
+  const [expandedRuns, setExpandedRuns] = useState<string | null>(null);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const filteredSessions = filterSessions(sessions, filterQuery);
   const isFiltering = filterQuery.trim().length > 0;
@@ -3327,6 +3486,11 @@ function SessionsPanel({
             const operation = deleteOperations[session.id];
             const deleteLocked = sessionDeleteLocked(operation);
             const outcome = sessionOutcomeView(runTelemetry, session.id);
+            // A turn whose run record was never confirmed must not read as a
+            // Session that ran cleanly, even when the durable read is honest
+            // about finding no run for it.
+            const unconfirmedRun = runRecord?.intent.sessionId === session.id
+              && runRecord.phase !== 'confirmed';
             return (
             <GlassCard
               key={session.id}
@@ -3367,6 +3531,14 @@ function SessionsPanel({
                           {outcome.run.selected_model && (
                             <span className="ml-1 text-bone-faint">({outcome.run.selected_model})</span>
                           )}
+                          {/* The durable run_id, so an operator can match this
+                              row against the run the turn reported. */}
+                          <span className="ml-1 text-bone-faint">· run {outcome.run.run_id}</span>
+                          {outcome.olderCount > 0 && (
+                            <span className="ml-1 text-bone-faint">
+                              · {outcome.olderCount} older {outcome.olderCount === 1 ? 'run' : 'runs'}
+                            </span>
+                          )}
                         </span>
                       )}
                       {outcome.kind === 'not_recorded' && (
@@ -3385,6 +3557,12 @@ function SessionsPanel({
                         <>
                           {' · '}
                           <span>{RUN_OUTCOME_PENDING_TEXT}</span>
+                        </>
+                      )}
+                      {unconfirmedRun && (
+                        <>
+                          {' · '}
+                          <span className="text-amber-400">{RUN_ROW_UNCONFIRMED_TEXT}</span>
                         </>
                       )}
                     </div>
@@ -3414,6 +3592,22 @@ function SessionsPanel({
                   <button type="button" onClick={(e) => { e.stopPropagation(); onRetryDeleteRead(session.id); }} disabled={loading} className="underline disabled:opacity-40">Retry</button>
                 </div>
               )}
+              {/* Per-Session run history, read through Native's own per-Session
+                  command. Collapsed by default so the list keeps its density. */}
+              <div className="mt-1">
+                <button
+                  type="button"
+                  aria-expanded={expandedRuns === session.id}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setExpandedRuns(current => (current === session.id ? null : session.id));
+                  }}
+                  className="text-[11px] font-mono text-bone-faint underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
+                >
+                  {expandedRuns === session.id ? 'Hide recorded runs' : 'Show recorded runs'}
+                </button>
+                {expandedRuns === session.id && <SessionRunsView sessionId={session.id} />}
+              </div>
             </GlassCard>
             );
           })
