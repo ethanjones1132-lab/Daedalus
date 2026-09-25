@@ -1,12 +1,11 @@
 import { createHash } from "crypto";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, unlinkSync } from "fs";
 import { join } from "path";
 import type { SharedContextHints } from "./coordinator";
 import type { SessionMemoryConfig } from "../config";
 import { SESSIONS_DIR } from "../config";
 import type { ToolResult } from "../tool-types";
 import {
-  normalizeTaskRunOnRead,
   resolveTaskRunTurn,
   setTaskPlan,
   type CreateTaskPlanItemInput,
@@ -18,6 +17,7 @@ import {
   seedTaskPlanFromPlanning,
   type OwnedPlanningAttachment,
 } from "./runtime-loop";
+import { parseSessionMemoryState, writeJsonAtomic } from "./session-runtime-persistence";
 
 export interface ToolResultCacheEntry {
   key: string;
@@ -656,10 +656,9 @@ export class SessionMemory {
   private persist(session: SessionMemoryState): void {
     if (!this.config().persist) return;
     try {
-      mkdirSync(memoryDir(this.sessionsRoot), { recursive: true });
-      writeFileSync(memoryFilePath(session.sessionId, this.sessionsRoot), JSON.stringify(session, null, 2), "utf-8");
-    } catch (e) {
-      console.warn(`[SessionMemory] Failed to persist ${session.sessionId}: ${e instanceof Error ? e.message : String(e)}`);
+      writeJsonAtomic(memoryFilePath(session.sessionId, this.sessionsRoot), session);
+    } catch {
+      console.warn("[SessionMemory] Failed to persist state: write_failed");
     }
   }
 
@@ -667,24 +666,19 @@ export class SessionMemory {
     if (!this.config().persist) return null;
     const path = memoryFilePath(sessionId, this.sessionsRoot);
     if (!existsSync(path)) return null;
+    let raw: unknown;
     try {
-      const raw = JSON.parse(readFileSync(path, "utf-8")) as SessionMemoryState;
-      if (!raw || raw.sessionId !== sessionId) return null;
-      raw.toolResults ??= {};
-      raw.fileSnapshots ??= {};
-      raw.discoveredFacts ??= {};
-      raw.failureHistory ??= [];
-      // Legacy task-run rows (no schemaVersion / v1) are marked
-      // reconstruction_required — remainingWork was never populated, so there
-      // is no structural migration, only a version check on read.
-      raw.taskRun = raw.taskRun
-        ? normalizeTaskRunOnRead(raw.taskRun) ?? undefined
-        : undefined;
-      raw.lastActiveAt = raw.lastActiveAt ?? Date.now();
-      return raw;
+      raw = JSON.parse(readFileSync(path, "utf-8"));
     } catch {
+      console.warn("[SessionMemory] Ignoring persisted state: invalid_json");
       return null;
     }
+    const parsed = parseSessionMemoryState(raw, sessionId);
+    if (!parsed.ok) {
+      console.warn("[SessionMemory] Ignoring persisted state: invalid_state");
+      return null;
+    }
+    return parsed.state;
   }
 }
 

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import {
@@ -1704,6 +1704,40 @@ describe("PersistentConductor", () => {
       const safeName = "iso-sess".replace(/[^a-zA-Z0-9._-]/g, "_");
       expect(safeName).toBe("iso-sess");
     } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a malformed persisted transcript and starts from a redacted clean state", async () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), "jarvis-conductor-invalid-"));
+    const conductorDir = join(tempRoot, "conductor");
+    const path = join(conductorDir, "invalid-sess.json");
+    const originalWarn = console.warn;
+    const warnings: string[] = [];
+    mkdirSync(conductorDir, { recursive: true });
+    writeFileSync(path, JSON.stringify({
+      sessionId: "invalid-sess",
+      turns: 4,
+      messages: [{ role: "tool", content: "secret persisted content" }],
+      lastActiveAt: Date.now(),
+    }), "utf-8");
+    mockOllamaChat([
+      '{"task_type":"general","pipeline":["synthesizer"],"topology":"linear","context":{"needs_workspace_inspection":false,"needs_memory":true,"estimated_complexity":"low"},"coordinator_rationale":"clean"}',
+    ]);
+
+    try {
+      console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(" "));
+      const cfg = makeConfig({ persist_sessions: true });
+      const conductor = new PersistentConductor(() => cfg, tempRoot);
+      await conductor.routeTurn({ sessionId: "invalid-sess", request: "clean request", turnNumber: 1 });
+
+      expect(warnings).toEqual(["[PersistentConductor] Ignoring persisted state: invalid_state"]);
+      const healed = JSON.parse(readFileSync(path, "utf-8"));
+      expect(healed.sessionId).toBe("invalid-sess");
+      expect(healed.messages.every((message: { role: string }) => ["system", "user", "assistant"].includes(message.role))).toBe(true);
+      expect(readFileSync(path, "utf-8")).not.toContain("secret persisted content");
+    } finally {
+      console.warn = originalWarn;
       rmSync(tempRoot, { recursive: true, force: true });
     }
   });

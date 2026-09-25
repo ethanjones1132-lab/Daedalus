@@ -535,4 +535,44 @@ describe("session-memory", () => {
       rmSync(tempRoot, { recursive: true, force: true });
     }
   });
+
+  test("rejects an invalid persisted envelope and heals it on the next atomic write", () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), "jarvis-memory-invalid-"));
+    const originalWarn = console.warn;
+    const warnings: string[] = [];
+    try {
+      const memoryDir = join(tempRoot, "memory");
+      const path = join(memoryDir, "invalid-sess.json");
+      mkdirSync(memoryDir, { recursive: true });
+      writeFileSync(path, JSON.stringify({
+        sessionId: "invalid-sess",
+        lastActiveAt: Date.now(),
+        toolResults: [],
+        fileSnapshots: {},
+        discoveredFacts: {},
+        failureHistory: [],
+      }), "utf-8");
+      console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(" "));
+
+      const cfg = makeConfig({ persist: true });
+      const memory = new SessionMemory(() => cfg, tempRoot);
+      expect(memory.lookupCachedToolResult("invalid-sess", "read_file", { path: "secret" })).toBeUndefined();
+      expect(warnings).toEqual(["[SessionMemory] Ignoring persisted state: invalid_state"]);
+
+      memory.recordToolResult({
+        sessionId: "invalid-sess",
+        toolName: "read_file",
+        args: { path: "safe.ts" },
+        result: { output: "safe", is_error: false },
+      });
+
+      const healed = JSON.parse(require("fs").readFileSync(path, "utf-8"));
+      expect(healed.sessionId).toBe("invalid-sess");
+      expect(Object.keys(healed.toolResults)).toHaveLength(1);
+      expect(warnings).toHaveLength(1);
+    } finally {
+      console.warn = originalWarn;
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
 });

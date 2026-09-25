@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
+import { existsSync, readdirSync, readFileSync, statSync, unlinkSync } from "fs";
 import { join } from "path";
 import { estimateTokens, recordConductorCache } from "./conductor-metrics";
 import { loadPrompt } from "./prompt-loader";
@@ -27,6 +27,7 @@ import {
   stripGemmaThinkingArtifacts,
   type OllamaChatMessage,
 } from "./conductor-routing";
+import { parseConductorSessionState, writeJsonAtomic } from "./session-runtime-persistence";
 
 export interface ConductorMessage {
   role: "system" | "user" | "assistant";
@@ -1261,11 +1262,9 @@ export class PersistentConductor {
   private persistSession(session: ConductorSessionState): void {
     if (!this.config().persist_sessions && !this.config().kv_persist) return;
     try {
-      const path = sessionFilePath(session.sessionId, this.sessionsRoot);
-      mkdirSync(join(this.sessionsRoot, "conductor"), { recursive: true });
-      writeFileSync(path, JSON.stringify(session, null, 2), "utf-8");
-    } catch (e) {
-      console.warn(`[PersistentConductor] Failed to persist session ${session.sessionId}: ${e instanceof Error ? e.message : String(e)}`);
+      writeJsonAtomic(sessionFilePath(session.sessionId, this.sessionsRoot), session);
+    } catch {
+      console.warn("[PersistentConductor] Failed to persist state: write_failed");
     }
   }
 
@@ -1273,13 +1272,18 @@ export class PersistentConductor {
     if (!this.config().persist_sessions) return null;
     const path = sessionFilePath(sessionId, this.sessionsRoot);
     if (!existsSync(path)) return null;
+    let raw: unknown;
     try {
-      const raw = JSON.parse(readFileSync(path, "utf-8")) as ConductorSessionState;
-      if (!raw || raw.sessionId !== sessionId || !Array.isArray(raw.messages)) return null;
-      raw.lastActiveAt = raw.lastActiveAt ?? Date.now();
-      return raw;
+      raw = JSON.parse(readFileSync(path, "utf-8"));
     } catch {
+      console.warn("[PersistentConductor] Ignoring persisted state: invalid_json");
       return null;
     }
+    const parsed = parseConductorSessionState(raw, sessionId);
+    if (!parsed.ok) {
+      console.warn("[PersistentConductor] Ignoring persisted state: invalid_state");
+      return null;
+    }
+    return parsed.state;
   }
 }
