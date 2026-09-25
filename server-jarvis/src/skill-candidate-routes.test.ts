@@ -6,6 +6,7 @@ import { handleSkillCandidateRequest } from "./skill-candidate-routes";
 import { loadSkillCandidate, saveSkillCandidate } from "./intelligence/skill-store";
 import type { SkillCandidate } from "./intelligence/skill-types";
 import type { CallModelFn } from "./orchestration/coordinator";
+import { computeSkillToolSequenceDigest, decodeSkillStageRuns } from "./intelligence/skill-source-evidence";
 
 const config = {
   enabled: true,
@@ -17,17 +18,54 @@ const config = {
 
 let root = "";
 
+function groundingStage(runId: string) {
+  return {
+    id: `stage_${runId}`,
+    agent_run_id: runId,
+    mode_id: "executor",
+    turn_number: 1,
+    was_successful: 1,
+    had_error: 0,
+    tool_calls_json: JSON.stringify([{ name: "read_file", arguments: { path: "src/failing.ts" } }]),
+  };
+}
+
+function groundingDigest(runId: string): string {
+  const decoded = decodeSkillStageRuns([groundingStage(runId)], runId);
+  if (!decoded.ok) throw new Error("grounding fixture failed to decode");
+  return computeSkillToolSequenceDigest(decoded.stages);
+}
+
+function groundingSnapshot(runId: string) {
+  return {
+    version: 1,
+    agent_run_id: runId,
+    session_id: "session-1",
+    task_type: "debug",
+    run_outcome: "success",
+    duration_ms: 100,
+    routing: {},
+    instruction_variants: {},
+    stage_runs: [groundingStage(runId)],
+    model_attributions: [],
+    user_request: "Read the failing test before editing.",
+    worker_instructions: { executor: "Read the failing test." },
+  };
+}
+
 function candidate(id = "candidate-1", overrides: Partial<SkillCandidate> = {}): SkillCandidate {
+  const runId = `run-${id}`;
   return {
     id,
     name: `distilled-${id}`,
     description: "Synthetic distilled candidate",
     trigger: { task_types: ["debug"], requirements: ["workspace_read"], signals: ["mutation_verb"] },
     body: "## Conductor worker guidance\nRead the failing test before editing. ".repeat(12),
-    source_run_ids: [`run-${id}`],
+    source_run_ids: [runId],
     source_session_id: "session-1",
     confidence: 0.9,
     status: "candidate",
+    tool_sequence_digest: groundingDigest(runId),
     eval_score: 0.8,
     created_at: "2026-09-24T00:00:00.000Z",
     updated_at: "2026-09-24T00:00:00.000Z",
@@ -56,7 +94,7 @@ function dependencies(model: CallModelFn = passingModel()) {
   return {
     loadDistillationConfig: () => config,
     makeCallModel: () => model,
-    fetchSnapshot: () => ({ worker_instructions: { executor: "Read the failing test." } }),
+    fetchSnapshot: (runId: string) => groundingSnapshot(runId),
   };
 }
 

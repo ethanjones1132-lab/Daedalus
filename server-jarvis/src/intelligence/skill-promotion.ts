@@ -1,5 +1,10 @@
 import type { SkillDistillationConfig } from "../config";
 import type { SkillCandidate, SkillRejectionReason } from "./skill-types";
+import {
+  decodeSkillTrajectoryPayload,
+  decodeSkillTrajectorySnapshot,
+  type DecodedSkillTrajectory,
+} from "./skill-source-evidence";
 import { isValidSkillCandidate } from "./skill-candidate-validation";
 import { listSkillCandidates, readSkillCandidate, skillCandidateLifecycleVersion, transitionSkillCandidate, updateSkillCandidateStatus } from "./skill-store";
 import { judgeAnswer, type JudgeVerdict } from "../eval/judge";
@@ -316,10 +321,9 @@ export async function promoteCandidates(
 export interface GroundingSnapshot {
   worker_instructions?: Record<string, string>;
   user_request?: string;
+  [key: string]: unknown;
 }
 
-/** Fetches the grounding snapshot for an agent run. Injectable for tests;
- *  defaults to a real lookup against the self-tuning trajectory store. */
 export type SnapshotFetcher = (agentRunId: string) => GroundingSnapshot | null;
 
 function defaultSnapshotFetcher(agentRunId: string): GroundingSnapshot | null {
@@ -335,6 +339,154 @@ function defaultSnapshotFetcher(agentRunId: string): GroundingSnapshot | null {
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isDecodedTrajectory(value: GroundingSnapshot | DecodedSkillTrajectory | null): value is DecodedSkillTrajectory {
+  return isRecord(value) && value.version === 1 && Array.isArray(value.stage_runs) && typeof value.tool_sequence_digest === "string";
+}
+
+function decodeGroundingSnapshot(
+  snapshot: GroundingSnapshot,
+  sourceRunId: string,
+  sourceSessionId?: string,
+) {
+  if (typeof snapshot.snapshot_json === "string") {
+    return decodeSkillTrajectorySnapshot(snapshot as unknown as TrajectorySnapshot);
+  }
+  return decodeSkillTrajectoryPayload(snapshot, {
+    agentRunId: sourceRunId,
+    ...(sourceSessionId === undefined ? {} : { sessionId: sourceSessionId }),
+  });
+}
+
+const OBSERVABLE_TOOL_NAMES = new Set([
+  "read_file",
+  "write_file",
+  "edit_file",
+  "multi_edit",
+  "apply_patch",
+  "glob",
+  "grep",
+  "list_directory",
+  "bash",
+  "powershell",
+  "web_fetch",
+  "web_search",
+  "git_metadata",
+  "mcp_call_tool",
+  "todo_write",
+  "todo_list",
+  "tools_enum",
+  "run_background_command",
+  "agent",
+  "task_create",
+  "task_list",
+  "task_get",
+  "task_output",
+  "task_stop",
+  "delegate",
+  "shell_execute",
+]);
+
+function looksLikeToolToken(value: string): boolean {
+  if (OBSERVABLE_TOOL_NAMES.has(value)) return true;
+  if (!value.includes("_")) return false;
+  return /(tool|file|read|write|edit|patch|glob|grep|list|fetch|search|bash|shell|agent|task|delegate|mcp|git|todo|powershell|run)/.test(value);
+}
+
+function mentionedToolNames(body: string): string[] {
+  const guidance = bodyGuidanceSection(body);
+  const names = new Set<string>();
+  for (const match of guidance.matchAll(/`([^`\n]{1,80})`/g)) {
+    const value = match[1].trim();
+    if (/^[a-z][a-z0-9_]*$/.test(value) && looksLikeToolToken(value)) names.add(value);
+  }
+  for (const match of guidance.matchAll(/\b[a-z][a-z0-9_]{1,63}\b/g)) {
+    const value = match[0];
+    if (looksLikeToolToken(value)) names.add(value);
+  }
+  return [...names];
+}
+
+function pathValues(text: string): string[] {
+  const values: string[] = [];
+  const pattern = /(?:[A-Za-z]:[\\/][^\s"'`<>]+|(?:~|\.{1,2})?\/[^\s"'`<>]+|\b[\w.-]+\/[\w./-]+|\b[\w.-]+\.(?:ts|tsx|js|jsx|json|md|py|rs|toml|yaml|yml|html|css|sh)\b)/g;
+  for (const match of text.matchAll(pattern)) {
+    const value = match[0].replace(/[),.;:!?]+$/g, "").replace(/\\/g, "/");
+    if (value.length <= 240) values.push(value);
+    if (values.length >= 64) break;
+  }
+  return values;
+}
+
+function collectArgumentPaths(value: unknown, key: string, result: Set<string>, depth = 0): void {
+  if (depth > 4 || result.size >= 64) return;
+  if (typeof value === "string") {
+    if (/path|file|dir|cwd|target|root/i.test(key) || /[\\/]|\.[a-z0-9]+$/i.test(value)) {
+      for (const path of pathValues(value)) result.add(path);
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectArgumentPaths(item, key, result, depth + 1);
+    return;
+  }
+  if (isRecord(value)) {
+    for (const [childKey, childValue] of Object.entries(value)) {
+      collectArgumentPaths(childValue, childKey, result, depth + 1);
+    }
+  }
+}
+
+function observedPaths(trajectory: DecodedSkillTrajectory): string[] {
+  const result = new Set<string>();
+  for (const stage of trajectory.stage_runs) {
+    for (const call of stage.tool_calls) {
+      if (call.arguments) collectArgumentPaths(call.arguments, "argument", result);
+    }
+  }
+  for (const path of pathValues(trajectory.user_request)) result.add(path);
+  for (const instruction of Object.values(trajectory.worker_instructions)) {
+    for (const path of pathValues(instruction)) result.add(path);
+  }
+  return [...result].slice(0, 64);
+}
+
+function normalizedPath(value: string): string {
+  return value.replace(/\\/g, "/").replace(/\/+/g, "/").toLowerCase();
+}
+
+function pathIsObserved(candidatePath: string, sourcePaths: readonly string[]): boolean {
+  const candidate = normalizedPath(candidatePath);
+  return sourcePaths.some((sourcePath) => {
+    const source = normalizedPath(sourcePath);
+    return source === candidate || source.endsWith(`/${candidate}`) || candidate.endsWith(`/${source}`);
+  });
+}
+
+function ungroundedClaim(candidate: SkillCandidate, trajectory: DecodedSkillTrajectory): string | null {
+  const observedTools = new Set(trajectory.stage_runs.flatMap((stage) => stage.tool_names));
+  for (const tool of mentionedToolNames(candidate.body)) {
+    if (!observedTools.has(tool)) return "tool claim is absent from source evidence";
+  }
+  const sourcePaths = observedPaths(trajectory);
+  for (const path of pathValues(bodyGuidanceSection(candidate.body))) {
+    if (!pathIsObserved(path, sourcePaths)) return "path claim is absent from source evidence";
+  }
+  return null;
+}
+
+function evidenceSummary(trajectory: DecodedSkillTrajectory): string {
+  const tools = trajectory.stage_runs.flatMap((stage) => stage.tool_names).slice(0, 64);
+  const paths = observedPaths(trajectory).slice(0, 32);
+  return [
+    `Observed tools (ordered): ${tools.length > 0 ? tools.join(", ") : "none recorded"}`,
+    `Observed paths (bounded): ${paths.length > 0 ? paths.join(", ") : "none recorded"}`,
+  ].join("\n");
+}
+
 /**
  * Deterministic rubric derived from the candidate and its source trajectory
  * snapshot. Kept deliberately small and factual — the judge does exact-
@@ -344,7 +496,7 @@ function defaultSnapshotFetcher(agentRunId: string): GroundingSnapshot | null {
  */
 export function buildGroundingRubric(
   candidate: SkillCandidate,
-  snapshot: GroundingSnapshot | null,
+  snapshot: GroundingSnapshot | DecodedSkillTrajectory | null,
 ): string[] {
   const rubric: string[] = [];
   const taskType = candidate.trigger.task_types[0];
@@ -352,10 +504,17 @@ export function buildGroundingRubric(
     rubric.push(`the body mentions the task type "${taskType}"`);
   }
   rubric.push("the body does not state an absolute path that is absent from the source run");
-  const hasWorkerInstructions =
-    !!snapshot?.worker_instructions && Object.keys(snapshot.worker_instructions).length > 0;
-  if (hasWorkerInstructions) {
+  const workerInstructions = snapshot && isRecord(snapshot.worker_instructions)
+    ? snapshot.worker_instructions
+    : undefined;
+  if (workerInstructions && Object.keys(workerInstructions).length > 0) {
     rubric.push("the body includes a worker guidance section");
+  }
+  if (isDecodedTrajectory(snapshot)) {
+    const tools = snapshot.stage_runs.flatMap((stage) => stage.tool_names).slice(0, 32);
+    const paths = observedPaths(snapshot).slice(0, 16);
+    rubric.push(`the body names only tools observed in the source run: ${tools.length > 0 ? tools.join(", ") : "none recorded"}`);
+    rubric.push(`the body names only paths observed in the source run: ${paths.length > 0 ? paths.join(", ") : "none recorded"}`);
   }
   return rubric;
 }
@@ -383,9 +542,29 @@ export async function runGroundingJudge(
   if (!snapshot) {
     return { ok: false, error: "no_grounding_source" };
   }
+  const decoded = decodeGroundingSnapshot(
+    snapshot,
+    sourceRunId,
+    candidate.source_session_id,
+  );
+  if (!decoded.ok) {
+    return { ok: false, error: "no_grounding_source", detail: "source evidence failed validation" };
+  }
+  if (decoded.trajectory.tool_sequence_digest !== candidate.tool_sequence_digest) {
+    return { ok: false, error: "no_grounding_source", detail: "source tool evidence digest is missing or mismatched" };
+  }
+  const claim = ungroundedClaim(candidate, decoded.trajectory);
+  if (claim) {
+    return { ok: false, error: "no_grounding_source", detail: claim };
+  }
 
-  const rubric = buildGroundingRubric(candidate, snapshot);
-  const request = snapshot.user_request ?? candidate.description;
+  const rubric = buildGroundingRubric(candidate, decoded.trajectory);
+  const request = [
+    decoded.trajectory.user_request,
+    "",
+    "Source-run evidence (bounded, tool names and path targets only):",
+    evidenceSummary(decoded.trajectory),
+  ].join("\n");
 
   try {
     const verdict = await judgeAnswer(callModel, request, candidate.body, rubric);
@@ -393,12 +572,8 @@ export async function runGroundingJudge(
       return { ok: false, error: "judge_invalid", detail: verdict.rationale };
     }
     return { ok: true, verdict };
-  } catch (e) {
-    return {
-      ok: false,
-      error: "judge_unavailable",
-      detail: e instanceof Error ? e.message : String(e),
-    };
+  } catch {
+    return { ok: false, error: "judge_unavailable", detail: "grounding judge unavailable" };
   }
 }
 

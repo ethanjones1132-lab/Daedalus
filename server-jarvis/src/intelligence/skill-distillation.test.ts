@@ -19,6 +19,10 @@ import type { SkillCandidate } from "./skill-types";
 import type { TrajectorySnapshot } from "../self-tuning/store";
 import { countTokens } from "../tokens";
 import type { CallModelFn } from "../orchestration/coordinator";
+import {
+  computeSkillToolSequenceDigest,
+  decodeSkillStageRuns,
+} from "./skill-source-evidence";
 
 describe("skill distillation (Track C)", () => {
   let tempRoot = "";
@@ -519,7 +523,7 @@ describe("skill distillation (Track C)", () => {
         duration_ms: 100,
         routing: {},
         instruction_variants: {},
-        stage_runs: [baseStageRun],
+        stage_runs: [{ ...baseStageRun, agent_run_id: "run_dry_run" }],
         model_attributions: [],
         user_request: "fix the failing import",
       }),
@@ -554,7 +558,7 @@ describe("skill distillation (Track C)", () => {
         duration_ms: 100,
         routing: {},
         instruction_variants: {},
-        stage_runs: [baseStageRun],
+        stage_runs: [{ ...baseStageRun, agent_run_id: "run_redistill_dry_run" }],
         model_attributions: [],
         user_request: "fix the failing import",
       }),
@@ -576,7 +580,12 @@ describe("skill distillation (Track C)", () => {
       promotion_eval_delta: 0.02,
       max_candidates: 50,
     };
-    const input = { ...baseDistillInput, agentRunId: "run_rebuild_1", runOutcome: "success" as const };
+    const input = {
+      ...baseDistillInput,
+      agentRunId: "run_rebuild_1",
+      stageRuns: [{ ...baseStageRun, agent_run_id: "run_rebuild_1" }],
+      runOutcome: "success" as const,
+    };
     const original = distillSkillCandidate(input, config);
     expect(original).not.toBeNull();
     const promoted = {
@@ -699,11 +708,11 @@ describe("skill distillation (Track C)", () => {
     };
     // Use distinct agentRunIds so the two distillations produce distinct candidates.
     const successCand = distillSkillCandidate(
-      { ...baseDistillInput, agentRunId: "run_redistill_success_1", runOutcome: "success" },
+      { ...baseDistillInput, agentRunId: "run_redistill_success_1", stageRuns: [{ ...baseStageRun, agent_run_id: "run_redistill_success_1" }], runOutcome: "success" },
       cfg,
     );
     const degradedCand = distillSkillCandidate(
-      { ...baseDistillInput, agentRunId: "run_redistill_degraded_1", runOutcome: "degraded" },
+      { ...baseDistillInput, agentRunId: "run_redistill_degraded_1", stageRuns: [{ ...baseStageRun, agent_run_id: "run_redistill_degraded_1" }], runOutcome: "degraded" },
       cfg,
     );
     expect(successCand).not.toBeNull();
@@ -878,18 +887,55 @@ describe("skill distillation (Track C)", () => {
       min_judge_score: 0.75,
     };
 
+    function groundingStage(runId: string) {
+      return {
+        id: `stage_${runId}`,
+        agent_run_id: runId,
+        mode_id: "executor",
+        turn_number: 1,
+        was_successful: 1,
+        had_error: 0,
+        tool_calls_json: JSON.stringify([{ name: "read_file", arguments: { path: "src/foo.ts" } }]),
+      };
+    }
+
+    function groundingDigest(runId: string): string {
+      const decoded = decodeSkillStageRuns([groundingStage(runId)], runId);
+      if (!decoded.ok) throw new Error("grounding fixture failed to decode");
+      return computeSkillToolSequenceDigest(decoded.stages);
+    }
+
+    function groundingSnapshot(runId: string) {
+      return {
+        version: 1,
+        agent_run_id: runId,
+        session_id: "session_grounding",
+        task_type: "debug",
+        run_outcome: "success",
+        duration_ms: 100,
+        routing: {},
+        instruction_variants: {},
+        stage_runs: [groundingStage(runId)],
+        model_attributions: [],
+        user_request: "Read the file first.",
+        worker_instructions: { executor: "Read the file first." },
+      };
+    }
+
     function groundableCandidate(id: string): SkillCandidate {
+      const runId = `run_for_${id}`;
       return {
         id, name: `rc-${id}`, description: "x",
         trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: ["mutation_verb", "read_verb"] },
         body: "## Conductor worker guidance\nRead the file first. ".repeat(20),
-        source_run_ids: [`run_for_${id}`], confidence: 0.9, status: "candidate",
+        source_run_ids: [runId], source_session_id: "session_grounding", confidence: 0.9, status: "candidate",
+        tool_sequence_digest: groundingDigest(runId),
         created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
       };
     }
 
-    function snapshotFetcherFor(runId: string, snapshot: { worker_instructions?: Record<string, string>; user_request?: string } | null) {
-      return (candidateRunId: string) => (candidateRunId === runId ? snapshot : null);
+    function snapshotFetcherFor(runId: string, _snapshot: { worker_instructions?: Record<string, string>; user_request?: string } | null) {
+      return (candidateRunId: string) => (candidateRunId === runId ? groundingSnapshot(runId) : null);
     }
 
     test("candidate not found returns candidate_not_found without calling the judge", async () => {
@@ -1068,6 +1114,41 @@ describe("skill distillation (Track C)", () => {
       };
     }
 
+    function groundingStage(runId: string) {
+      return {
+        id: `stage_${runId}`,
+        agent_run_id: runId,
+        mode_id: "executor",
+        turn_number: 1,
+        was_successful: 1,
+        had_error: 0,
+        tool_calls_json: JSON.stringify([{ name: "read_file", arguments: { path: "src/foo.ts" } }]),
+      };
+    }
+
+    function groundingDigest(runId: string): string {
+      const decoded = decodeSkillStageRuns([groundingStage(runId)], runId);
+      if (!decoded.ok) throw new Error("grounding fixture failed to decode");
+      return computeSkillToolSequenceDigest(decoded.stages);
+    }
+
+    function groundingSnapshot(runId: string) {
+      return {
+        version: 1,
+        agent_run_id: runId,
+        session_id: "session_grounding",
+        task_type: "debug",
+        run_outcome: "success",
+        duration_ms: 100,
+        routing: {},
+        instruction_variants: {},
+        stage_runs: [groundingStage(runId)],
+        model_attributions: [],
+        user_request: "Read the file first.",
+        worker_instructions: { executor: "Read the file first." },
+      };
+    }
+
     test("bulk promotion refuses a candidate without a passing judge decision", async () => {
       saveSkillCandidate({
         id: "candidate-1",
@@ -1093,14 +1174,16 @@ describe("skill distillation (Track C)", () => {
         trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: ["mutation_verb", "read_verb"] },
         body: "## Conductor worker guidance\nRead the file first. ".repeat(20),
         source_run_ids: ["run_for_candidate_2"],
+        source_session_id: "session_grounding",
         confidence: 0.9,
         status: "candidate",
+        tool_sequence_digest: groundingDigest("run_for_candidate_2"),
         eval_score: 1.0,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       });
       const fetcher = (runId: string) =>
-        runId === "run_for_candidate_2" ? { worker_instructions: { executor: "Read first." } } : null;
+        runId === "run_for_candidate_2" ? groundingSnapshot(runId) : null;
       const decisions = await promoteCandidates(["candidate-2"], passingCallModel(), bulkCfg, fetcher);
       expect(decisions).toHaveLength(1);
       expect(decisions[0].candidate_id).toBe("candidate-2");
@@ -1140,12 +1223,49 @@ describe("skill distillation (Track C)", () => {
       };
     }
 
+    function groundingStage(runId: string) {
+      return {
+        id: `stage_${runId}`,
+        agent_run_id: runId,
+        mode_id: "executor",
+        turn_number: 1,
+        was_successful: 1,
+        had_error: 0,
+        tool_calls_json: JSON.stringify([{ name: "read_file", arguments: { path: "src/foo.ts" } }]),
+      };
+    }
+
+    function groundingDigest(runId: string): string {
+      const decoded = decodeSkillStageRuns([groundingStage(runId)], runId);
+      if (!decoded.ok) throw new Error("grounding fixture failed to decode");
+      return computeSkillToolSequenceDigest(decoded.stages);
+    }
+
+    function groundingSnapshot(runId: string) {
+      return {
+        version: 1,
+        agent_run_id: runId,
+        session_id: "session_grounding",
+        task_type: "debug",
+        run_outcome: "success",
+        duration_ms: 100,
+        routing: {},
+        instruction_variants: {},
+        stage_runs: [groundingStage(runId)],
+        model_attributions: [],
+        user_request: "Read the file first.",
+        worker_instructions: { executor: "Read the file first." },
+      };
+    }
+
     function candidate(id: string): SkillCandidate {
+      const runId = `run_for_${id}`;
       return {
         id, name: `rc-${id}`, description: "x",
         trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: ["mutation_verb"] },
         body: "## Conductor worker guidance\nRead the file first. ".repeat(20),
-        source_run_ids: [`run_for_${id}`], confidence: 0.9, status: "candidate",
+        source_run_ids: [runId], source_session_id: "session_grounding", confidence: 0.9, status: "candidate",
+        tool_sequence_digest: groundingDigest(runId),
         created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
       };
     }
@@ -1170,7 +1290,7 @@ describe("skill distillation (Track C)", () => {
 
     test("snapshot found -> calls the judge and returns its verdict", async () => {
       const c = candidate("rg3");
-      const fetcher = (runId: string) => (runId === "run_for_rg3" ? { worker_instructions: { executor: "Read first." } } : null);
+      const fetcher = (runId: string) => (runId === "run_for_rg3" ? groundingSnapshot(runId) : null);
       const result = await runGroundingJudge(c, passingCallModel(), fetcher);
       expect(result.ok).toBe(true);
       expect(result.ok && result.verdict.score).toBe(1);
@@ -1178,7 +1298,7 @@ describe("skill distillation (Track C)", () => {
 
     test("invalid judge partition -> judge_invalid", async () => {
       const c = candidate("rg-invalid");
-      const fetcher = (runId: string) => (runId === "run_for_rg-invalid" ? { worker_instructions: {} } : null);
+      const fetcher = (runId: string) => (runId === "run_for_rg-invalid" ? groundingSnapshot(runId) : null);
       const result = await runGroundingJudge(c, async (messages) => {
         const userMsg = messages.find((m) => m.role === "user")?.content ?? "";
         const items = [...(userMsg.split("Rubric items")[1] ?? "").matchAll(/^- (.+)$/gm)].map((m) => m[1]);
@@ -1192,7 +1312,7 @@ describe("skill distillation (Track C)", () => {
 
     test("judge call throwing -> judge_unavailable", async () => {
       const c = candidate("rg4");
-      const fetcher = (runId: string) => (runId === "run_for_rg4" ? { worker_instructions: {} } : null);
+      const fetcher = (runId: string) => (runId === "run_for_rg4" ? groundingSnapshot(runId) : null);
       const result = await runGroundingJudge(c, async () => { throw new Error("down"); }, fetcher);
       expect(result.ok).toBe(false);
       expect(!result.ok && result.error).toBe("judge_unavailable");

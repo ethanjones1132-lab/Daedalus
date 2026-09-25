@@ -12,6 +12,8 @@
 import type { RoutingResult } from "../orchestration/router";
 import type { StageName, Topology, TaskType } from "../orchestration/coordinator";
 import type { SkillCandidate } from "../intelligence/skill-types";
+import type { GroundingSnapshot } from "../intelligence/skill-promotion";
+import { computeSkillToolSequenceDigest, decodeSkillStageRuns } from "../intelligence/skill-source-evidence";
 import type { TurnRequirement } from "../orchestration/turn-requirements";
 
 export const DEFAULT_PIPELINE: StageName[] = ["planner", "executor", "reviewer", "synthesizer"];
@@ -498,13 +500,48 @@ export const SKILL_CASES: SkillCase[] = [
 // plumbing: rubric shape, and that a judge-reported pass/fail (or a missing
 // grounding source) correctly flows into a promote/reject decision.
 
+function groundingStage(runId: string) {
+  return {
+    id: `stage_${runId}`,
+    agent_run_id: runId,
+    mode_id: "executor",
+    turn_number: 1,
+    was_successful: 1,
+    had_error: 0,
+    tool_calls_json: JSON.stringify([{ name: "read_file", arguments: { path: "src/auth.ts" } }]),
+  };
+}
+
+function groundingDigest(runId: string): string {
+  const decoded = decodeSkillStageRuns([groundingStage(runId)], runId);
+  if (!decoded.ok) throw new Error("grounding fixture failed to decode");
+  return computeSkillToolSequenceDigest(decoded.stages);
+}
+
+function groundingSnapshot(runId: string): GroundingSnapshot {
+  return {
+    version: 1,
+    agent_run_id: runId,
+    session_id: `session_${runId}`,
+    task_type: "debug",
+    run_outcome: "success",
+    duration_ms: 100,
+    routing: {},
+    instruction_variants: {},
+    stage_runs: [groundingStage(runId)],
+    model_attributions: [],
+    user_request: "fix the auth bug in src/auth.ts",
+    worker_instructions: { executor: "Read src/auth.ts before editing." },
+  };
+}
+
 export interface SkillGroundingCase {
   id: string;
   kind: "skill_grounding";
   fixture: SkillCandidate;
   /** Fixture trajectory snapshot the candidate is grounded against, or null
    *  to exercise the "no grounding source available" path. */
-  snapshot: { worker_instructions?: Record<string, string>; user_request?: string } | null;
+  snapshot: GroundingSnapshot | null;
   /** Canned judge behavior: "pass" echoes every rubric item back as covered
    *  (score 1.0); "fail" reports every item as missed (score 0). Ignored
    *  when `snapshot` is null — the judge is never called in that case. */
@@ -527,15 +564,14 @@ export const SKILL_GROUNDING_CASES: SkillGroundingCase[] = [
       trigger: { task_types: ["debug"], requirements: ["workspace_read"], signals: ["mutation_verb"] },
       body: "## Conductor worker guidance\nRead src/auth.ts before editing. Verify tests pass.",
       source_run_ids: ["eval_run_grounding_clean"],
+      source_session_id: "session_eval_run_grounding_clean",
       confidence: 0.85,
       status: "candidate",
+      tool_sequence_digest: groundingDigest("eval_run_grounding_clean"),
       created_at: nowIso,
       updated_at: nowIso,
     },
-    snapshot: {
-      worker_instructions: { executor: "Read src/auth.ts before editing." },
-      user_request: "fix the auth bug in src/auth.ts",
-    },
+    snapshot: groundingSnapshot("eval_run_grounding_clean"),
     judgeOutcome: "pass",
     expect: { minRubricItems: 2, rubricContains: "debug", groundingPasses: true },
   },
@@ -549,17 +585,14 @@ export const SKILL_GROUNDING_CASES: SkillGroundingCase[] = [
       trigger: { task_types: ["debug"], requirements: ["workspace_read"], signals: ["mutation_verb"] },
       body: "## Conductor worker guidance\nEdit C:\\fake\\path\\that\\does\\not\\exist\\config.json before proceeding.",
       source_run_ids: ["eval_run_grounding_bad_path"],
+      source_session_id: "session_eval_run_grounding_bad_path",
       confidence: 0.85,
       status: "candidate",
+      tool_sequence_digest: groundingDigest("eval_run_grounding_bad_path"),
       created_at: nowIso,
       updated_at: nowIso,
     },
-    snapshot: {
-      worker_instructions: { executor: "Read src/auth.ts before editing." },
-      user_request: "fix the auth bug in src/auth.ts",
-    },
-    // A real judge should notice the invented path isn't grounded in the
-    // source run and report it missed; this pins what happens when it does.
+    snapshot: groundingSnapshot("eval_run_grounding_bad_path"),
     judgeOutcome: "fail",
     expect: { groundingPasses: false },
   },

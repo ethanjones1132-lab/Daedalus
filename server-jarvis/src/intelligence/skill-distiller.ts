@@ -7,6 +7,12 @@ import type { SkillCandidate, SkillTrigger } from "./skill-types";
 import { readSkillCandidate, saveSkillCandidate, pruneSkillCandidates } from "./skill-store";
 import type { SkillDistillationConfig } from "../config";
 import type { TrajectorySnapshot } from "../self-tuning/store";
+import {
+  computeSkillToolSequenceDigest,
+  decodeSkillStageRuns,
+  decodeSkillTrajectorySnapshot,
+  type DecodedSkillStageEvidence,
+} from "./skill-source-evidence";
 
 export interface DistillationInput {
   agentRunId: string;
@@ -36,7 +42,7 @@ function slugify(text: string): string {
     .slice(0, 48) || "distilled-skill";
 }
 
-function buildSkillBody(input: DistillationInput): string {
+function buildSkillBody(input: DistillationInput, stages: readonly DecodedSkillStageEvidence[]): string {
   const blocks: string[] = [
     `# Distilled: ${input.taskType}`,
     "",
@@ -52,18 +58,13 @@ function buildSkillBody(input: DistillationInput): string {
     blocks.push("");
   }
 
-  const toolStages = input.stageRuns.filter((s) => {
-    try {
-      const tools = JSON.parse(s.tool_calls_json ?? "[]");
-      return Array.isArray(tools) && tools.length > 0;
-    } catch {
-      return false;
-    }
-  });
+  const toolStages = stages.filter((stage) => stage.tool_names.length > 0);
   if (toolStages.length > 0) {
     blocks.push("## Successful tool usage pattern");
     for (const stage of toolStages) {
-      blocks.push(`- ${stage.mode_id}: tools used on turn ${stage.turn_number}`);
+      const names = stage.tool_names.slice(0, 32);
+      const suffix = stage.tool_names.length > names.length ? ", …" : "";
+      blocks.push(`- ${stage.mode_id}: ${names.join(", ")}${suffix} on turn ${stage.turn_number}`);
     }
     blocks.push("");
   }
@@ -97,6 +98,9 @@ export function buildSkillCandidate(
   if (!config.enabled) return null;
   if (input.taskRunAccepted === false) return null;
 
+  const evidence = decodeSkillStageRuns(input.stageRuns, input.agentRunId);
+  if (!evidence.ok) return null;
+
   const distillOn = config.distill_on ?? ["success"];
   if (!distillOn.includes(input.runOutcome)) return null;
 
@@ -119,7 +123,8 @@ export function buildSkillCandidate(
     name: `distilled-${input.taskType}-${input.agentRunId.slice(-6)}`,
     description: `Distilled orchestration pattern for ${input.taskType} (${turnReq.requirement})`,
     trigger,
-    body: buildSkillBody(input),
+    body: buildSkillBody(input, evidence.stages),
+    tool_sequence_digest: computeSkillToolSequenceDigest(evidence.stages),
     source_run_ids: [input.agentRunId],
     source_session_id: input.sessionId,
     confidence,
@@ -136,6 +141,9 @@ function candidateDigest(candidate: SkillCandidate): string {
       trigger: candidate.trigger,
       source_run_ids: candidate.source_run_ids,
       source_session_id: candidate.source_session_id ?? null,
+      ...(candidate.tool_sequence_digest === undefined
+        ? {}
+        : { tool_sequence_digest: candidate.tool_sequence_digest }),
     }))
     .digest("hex")
     .slice(0, 12);
@@ -215,31 +223,11 @@ export function distillFromTrajectorySnapshot(
   const { snapshot, config } = input;
   if (!config.enabled) return null;
 
-  let traj: {
-    version: number;
-    agent_run_id: string;
-    session_id: string;
-    task_type: TaskType;
-    run_outcome: "success" | "degraded" | "failed";
-    duration_ms: number;
-    routing: any;
-    worker_instructions?: WorkerInstructions;
-    instruction_variants: Record<string, string>;
-    stage_runs: StageRun[];
-    model_attributions: any[];
-    user_request: string;
-  };
-
-  try {
-    traj = JSON.parse(snapshot.snapshot_json);
-  } catch {
-    return null;
-  }
-
-  // Policy: only distill from success outcomes (degraded only if replan-rescued with clean synthesizer)
+  const decoded = decodeSkillTrajectorySnapshot(snapshot);
+  if (!decoded.ok) return null;
+  const traj = decoded.trajectory;
   if (traj.run_outcome !== "success") return null;
 
-  // Check if this was a replan-rescued degraded run - if so, allow distillation
   const distillOn = config.distill_on ?? ["success"];
   if (!distillOn.includes(traj.run_outcome)) return null;
 
@@ -250,7 +238,7 @@ export function distillFromTrajectorySnapshot(
       taskType: traj.task_type,
       userRequest: traj.user_request,
       workerInstructions: traj.worker_instructions,
-      stageRuns: traj.stage_runs,
+      stageRuns: traj.stage_runs.map((stage) => stage.stage),
       runOutcome: traj.run_outcome,
     },
     config,
