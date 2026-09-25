@@ -5,7 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { cn, ConfirmModal, EmptyState, LoadingState, ErrorState } from '../ui';
 import type { CompanionState } from './types';
 import {
-  JarvisSession, JarvisMessage, JarvisConfig, JarvisStatus, SessionRunRecord,
+  JarvisSession, JarvisMessage, JarvisConfig, JarvisStatus,
   OPENROUTER_MODELS,
 } from './types';
 import ControlCenterView, { type ControlCenterTab } from './ControlCenterView';
@@ -75,6 +75,16 @@ import {
 import { formatSessionStatsLine, shouldShowSessionStats } from './session-stats';
 import { filterSessions, formatFilterResultCount } from './session-filter';
 import {
+  RUN_NOT_RECORDED_TEXT,
+  RUN_OUTCOME_PENDING_TEXT,
+  RUN_OUTCOME_UNAVAILABLE_TEXT,
+  RUN_TELEMETRY_UNAVAILABLE_MESSAGE,
+  decideSessionRunTelemetry,
+  sessionOutcomeView,
+  singleFlightSessionRunRead,
+  type SessionRunTelemetry,
+} from './session-run-telemetry';
+import {
   reconcileSessionDeletions,
   sessionDeleteLocked,
   type SessionDeleteOperation,
@@ -135,7 +145,15 @@ export default function JarvisView({ initialSubView = 'chat', initialControlTab,
   const [sessionsLoading, setSessionsLoading] = useState(true);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
   const sessionsRequest = useRef(0);
-  const [sessionRuns, setSessionRuns] = useState<Record<string, SessionRunRecord>>({});
+  // The recorded run outcome of a Session is durable Native state
+  // (`get_all_session_runs` over the `session_runs` table). A rejected or
+  // undecodable read is tracked as `unavailable` rather than collapsed into an
+  // empty list, so a Session whose outcome could not be read is never shown as
+  // a Session that never ran. See `session-run-telemetry.ts`.
+  const [runTelemetry, setRunTelemetry] = useState<SessionRunTelemetry>({ state: 'pending' });
+  const sessionRunReader = useRef<ReturnType<typeof singleFlightSessionRunRead> | null>(null);
+  const readSessionRuns = sessionRunReader.current
+    ?? (sessionRunReader.current = singleFlightSessionRunRead(() => invoke<unknown>('get_all_session_runs')));
   const [sessionDeleteOperations, setSessionDeleteOperations] = useState<Record<string, SessionDeleteOperation<JarvisSession>>>({});
   const sessionDeleteOperationsRef = useRef<Record<string, SessionDeleteOperation<JarvisSession>>>({});
   const sessionDeleteReadPending = useRef(false);
@@ -162,26 +180,26 @@ export default function JarvisView({ initialSubView = 'chat', initialControlTab,
     setSessionsLoading(true);
     setSessionsError(null);
     try {
-      const [result, runs] = await Promise.all([
-        invoke<JarvisSession[]>('jarvis_list_sessions'),
-        invoke<SessionRunRecord[]>('get_all_session_runs').catch(() => [] as SessionRunRecord[]),
-      ]);
+      const result = await invoke<JarvisSession[]>('jarvis_list_sessions');
       if (request !== sessionsRequest.current) return;
       const reconciled = reconcileSessionDeletions(result, sessionDeleteOperationsRef.current, request);
       publishSessionDeleteOperations(reconciled.operations);
       setSessions(reconciled.rows);
-      const visibleIds = new Set(reconciled.rows.map(row => row.id));
-      const runMap: Record<string, SessionRunRecord> = {};
-      for (const run of runs) {
-        if (visibleIds.has(run.session_id) && !runMap[run.session_id]) {
-          runMap[run.session_id] = run;
-        }
-      }
-      setSessionRuns(runMap);
+      setRunTelemetry({ state: 'pending' });
       const confirmed = new Set(reconciled.confirmed);
       if (confirmed.size > 0) {
         setActiveSession(current => current && confirmed.has(current) ? null : current);
       }
+      // The recorded-run read is a second, independent native request. It is
+      // deliberately not awaited with the list: the Session rows are
+      // authoritative and a slow or hung outcome read must never hold them
+      // hostage. The request identity still applies, so a stale read cannot
+      // overwrite a newer one.
+      const visibleIds = reconciled.rows.map(row => row.id);
+      void readSessionRuns().then(read => {
+        if (request !== sessionsRequest.current) return;
+        setRunTelemetry(decideSessionRunTelemetry(read, visibleIds));
+      });
     } catch (e) {
       if (request !== sessionsRequest.current) return;
       const next = { ...sessionDeleteOperationsRef.current };
@@ -200,7 +218,7 @@ export default function JarvisView({ initialSubView = 'chat', initialControlTab,
         setSessionsLoading(false);
       }
     }
-  }, [publishSessionDeleteOperations]);
+  }, [publishSessionDeleteOperations, readSessionRuns]);
 
   const deleteSession = useCallback((session: JarvisSession) => {
     if (sessionDeleteLocked(sessionDeleteOperationsRef.current[session.id])) return;
@@ -419,7 +437,7 @@ export default function JarvisView({ initialSubView = 'chat', initialControlTab,
                 sessions={sessions}
                 loading={sessionsLoading}
                 error={sessionsError}
-                sessionRuns={sessionRuns}
+                runTelemetry={runTelemetry}
                 activeSession={activeSession}
                 deleteOperations={sessionDeleteOperations}
                 onSelect={(id) => { setActiveSession(id); setSubView('chat'); }}
@@ -3158,12 +3176,12 @@ function ApprovalModal({ call_id, name, args, error, pending, onRetry, onApprove
 // ═══════════════════════════════════════════════════════════════
 
 function SessionsPanel({
-  sessions, loading, error, sessionRuns, activeSession, deleteOperations, onSelect, onNew, onDelete, onRetryDeleteRead, onRefresh,
+  sessions, loading, error, runTelemetry, activeSession, deleteOperations, onSelect, onNew, onDelete, onRetryDeleteRead, onRefresh,
 }: {
   sessions: JarvisSession[];
   loading: boolean;
   error: string | null;
-  sessionRuns: Record<string, SessionRunRecord>;
+  runTelemetry: SessionRunTelemetry;
   activeSession: string | null;
   deleteOperations: Record<string, SessionDeleteOperation<JarvisSession>>;
   onSelect: (id: string) => void;
@@ -3273,6 +3291,23 @@ function SessionsPanel({
             />
           </div>
         )}
+        {/* Announced summary of the run-outcome read. Native error detail is
+            never shown here: the message is fixed and the per-row marker
+            carries the state. */}
+        {runTelemetry.state === 'unavailable' && !loading && sessions.length > 0 && (
+          <div role="alert" className="text-xs text-amber-200/90 font-mono">
+            {RUN_TELEMETRY_UNAVAILABLE_MESSAGE}{' '}
+            <button
+              type="button"
+              onClick={onRefresh}
+              disabled={loading}
+              aria-label="Retry run outcomes"
+              className="underline disabled:opacity-40"
+            >
+              Retry run outcomes
+            </button>
+          </div>
+        )}
         {sessions.length === 0 && (loading || error) ? null : sessions.length === 0 ? (
           <div className="flex items-center justify-center h-48">
             <div className="text-center">
@@ -3291,6 +3326,7 @@ function SessionsPanel({
           filteredSessions.map(session => {
             const operation = deleteOperations[session.id];
             const deleteLocked = sessionDeleteLocked(operation);
+            const outcome = sessionOutcomeView(runTelemetry, session.id);
             return (
             <GlassCard
               key={session.id}
@@ -3314,24 +3350,42 @@ function SessionsPanel({
                     </div>
                     <div className="text-[11px] font-mono text-bone-faint">
                       {session.message_count} msgs · {new Date(session.created_at).toLocaleDateString()}
-                      {sessionRuns[session.id] && (
+                      {outcome.kind === 'recorded' && (
                         <span className="ml-2">
                           ·{' '}
                           <span
                             className={cn(
-                              sessionRuns[session.id]!.outcome === 'success' && 'text-emerald-400',
-                              sessionRuns[session.id]!.outcome === 'partial' && 'text-amber-400',
-                              sessionRuns[session.id]!.outcome === 'failed' && 'text-error',
-                              sessionRuns[session.id]!.outcome === 'timed_out' && 'text-amber-400',
-                              sessionRuns[session.id]!.outcome === 'cancelled' && 'text-bone-dim',
+                              outcome.run.outcome === 'success' && 'text-emerald-400',
+                              outcome.run.outcome === 'partial' && 'text-amber-400',
+                              outcome.run.outcome === 'failed' && 'text-error',
+                              outcome.run.outcome === 'timed_out' && 'text-amber-400',
+                              outcome.run.outcome === 'cancelled' && 'text-bone-dim',
                             )}
                           >
-                            {sessionRuns[session.id]!.outcome}
+                            {outcome.run.outcome}
                           </span>
-                          {sessionRuns[session.id]!.selected_model && (
-                            <span className="ml-1 text-bone-faint">({sessionRuns[session.id]!.selected_model})</span>
+                          {outcome.run.selected_model && (
+                            <span className="ml-1 text-bone-faint">({outcome.run.selected_model})</span>
                           )}
                         </span>
+                      )}
+                      {outcome.kind === 'not_recorded' && (
+                        <>
+                          {' · '}
+                          <span>{RUN_NOT_RECORDED_TEXT}</span>
+                        </>
+                      )}
+                      {outcome.kind === 'unavailable' && (
+                        <>
+                          {' · '}
+                          <span className="text-amber-400">{RUN_OUTCOME_UNAVAILABLE_TEXT}</span>
+                        </>
+                      )}
+                      {outcome.kind === 'pending' && (
+                        <>
+                          {' · '}
+                          <span>{RUN_OUTCOME_PENDING_TEXT}</span>
+                        </>
                       )}
                     </div>
                   </div>

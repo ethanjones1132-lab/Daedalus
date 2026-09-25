@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import JarvisView from './JarvisView';
 
@@ -79,7 +79,7 @@ describe('Sessions resource states', () => {
     expect(screen.getByText('Saved work', { selector: 'span' })).toBeInTheDocument();
   });
 
-  it('still loads Sessions when optional run telemetry is unavailable', async () => {
+  it('still loads Sessions when run telemetry is unavailable, and says so', async () => {
     invokeMock.mockImplementation(async (command: string) => {
       if (command === 'jarvis_list_sessions') return [session];
       if (command === 'get_all_session_runs') throw new Error('telemetry unavailable');
@@ -87,6 +87,95 @@ describe('Sessions resource states', () => {
     });
     render(<JarvisView initialSubView="sessions" />);
     await waitFor(() => expect(screen.getByText('Saved work', { selector: 'span' })).toBeInTheDocument());
+    expect(screen.getByRole('alert')).toHaveTextContent('Could not read recorded run outcomes.');
+    expect(screen.getByText('run outcome unavailable')).toBeInTheDocument();
+    // A read that failed must never read as a confirmed absence of a run.
+    expect(screen.queryByText('no run recorded')).not.toBeInTheDocument();
+  });
+
+  it('reads a confirmed empty run-outcome read as no runs recorded, not as unavailable', async () => {
+    invokeMock.mockImplementation(async (command: string) =>
+      command === 'jarvis_list_sessions' ? [session] : []);
+    render(<JarvisView initialSubView="sessions" />);
+    await waitFor(() => expect(screen.getByText('Saved work', { selector: 'span' })).toBeInTheDocument());
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByText('no run recorded')).toBeInTheDocument();
+  });
+
+  it('shows a recorded outcome and clears the unavailable state on a later successful read', async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'jarvis_list_sessions') return [session];
+      if (command === 'get_all_session_runs') throw new Error('telemetry unavailable');
+      return null;
+    });
+    render(<JarvisView initialSubView="sessions" />);
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('Could not read recorded run outcomes.'));
+
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'jarvis_list_sessions') return [session];
+      if (command === 'get_all_session_runs') {
+        return [{
+          session_id: 's-1', run_id: 'run-77', outcome: 'failed',
+          selected_model: 'slow-model', token_count: 12, tool_count: 3,
+        }];
+      }
+      return null;
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Retry run outcomes' }));
+    expect(await screen.findByText('failed')).toBeInTheDocument();
+    expect(screen.getByText('(slow-model)')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.queryByText('run outcome unavailable')).not.toBeInTheDocument();
+    expect(screen.queryByText('no run recorded')).not.toBeInTheDocument();
+  });
+
+  it('reports a pending outcome read as pending, never as a confirmed absence', async () => {
+    const runs = deferred<unknown[]>();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'jarvis_list_sessions') return Promise.resolve([session]);
+      if (command === 'get_all_session_runs') return runs.promise;
+      return Promise.resolve(null);
+    });
+    render(<JarvisView initialSubView="sessions" />);
+    // The authoritative Session list is not held hostage by the outcome read.
+    expect(await screen.findByText('Saved work', { selector: 'span' })).toBeInTheDocument();
+    expect(screen.getByText('reading run outcome…')).toBeInTheDocument();
+    expect(screen.queryByText('no run recorded')).not.toBeInTheDocument();
+    expect(screen.queryByText('run outcome unavailable')).not.toBeInTheDocument();
+    await act(async () => runs.resolve([]));
+    expect(await screen.findByText('no run recorded')).toBeInTheDocument();
+  });
+
+  it('treats a malformed run-outcome read as unavailable rather than as no runs', async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'jarvis_list_sessions') return [session];
+      if (command === 'get_all_session_runs') return { rows: [] };
+      return null;
+    });
+    render(<JarvisView initialSubView="sessions" />);
+    await waitFor(() => expect(screen.getByText('run outcome unavailable')).toBeInTheDocument());
+    expect(screen.queryByText('no run recorded')).not.toBeInTheDocument();
+  });
+
+  it('issues one in-flight run-outcome read when a list reload overlaps a pending one', async () => {
+    const runs = deferred<unknown[]>();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'jarvis_list_sessions') return Promise.resolve([session]);
+      if (command === 'get_all_session_runs') return runs.promise;
+      return Promise.resolve(null);
+    });
+    render(<JarvisView initialSubView="sessions" />);
+    const selection = await screen.findByRole('button', { name: 'Select session Saved work' });
+    const row = within(selection.parentElement!.parentElement!);
+    fireEvent.click(row.getByRole('button', { name: 'Delete session Saved work' }));
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Delete' }));
+    await waitFor(() => expect(
+      invokeMock.mock.calls.filter(([command]) => command === 'get_all_session_runs'),
+    ).toHaveLength(1));
+    await act(async () => runs.resolve([]));
+    expect(await screen.findByText('no run recorded')).toBeInTheDocument();
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === 'get_all_session_runs'),
+    ).toHaveLength(1);
   });
 });
