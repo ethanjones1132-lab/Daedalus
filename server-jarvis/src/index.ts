@@ -118,9 +118,11 @@ import {
 } from "./stream-control";
 import {
   classifyCallAbort,
+  decideStageOutcomePublication,
   linkStageAbortToTransport,
   settleStageAttempt,
   StageAbortedError,
+  type StageSettlementDecision,
 } from "./orchestration/stage-abort-link";
 import { runEmptyCompletionCascade } from "./orchestration/empty-cascade-advance";
 import {
@@ -1727,6 +1729,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let runtimeStarvation = false;
           /** Kept so the settlement below can name why the attempt stopped. */
           let attemptError: unknown;
+          /**
+           * One settlement for the whole attempt. Set on the success path (where
+           * an abort that turned the final `reader.read()` into a clean `done`
+           * can never be seen again by the loop's own guard) and read by the
+           * `finally`, so the fallback cascade, the scorecard, the telemetry,
+           * and the self-tuning attribution can never disagree about it.
+           */
+          let attemptSettlement: StageSettlementDecision | null = null;
           const attemptStage = callOptions?.stageLabel as string | undefined;
           try {
           const activeBackendIsOllama = cfg.active_backend === "ollama";
@@ -2619,16 +2629,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           attemptModel = actualModelUsed;
           attemptProvider = actualProviderUsed;
           attemptFirstTokenMs = firstTokenLatencyMs;
-          // Capture the actual provider/model used by this attempt so the
-          // orchestrator's `recordInference` error/empty paths can attribute
-          // the turn to the real backend (not the user's selected
-          // `cfg.active_backend`). The orchestrator's pool routinely routes
-          // through opencode_zen / opencode_go for planner/executor/synthesizer
-          // defaults — without this, all of those turns would be misattributed
-          // to "openrouter" in `/health/inference`.
-          orchLastModel = actualModelUsed;
-          orchLastProvider = actualProviderUsed;
-          orchLastFirstTokenMs = firstTokenLatencyMs;
+          // Settle once, here, while the read loop's own stage guard can no
+          // longer see the signal. That guard only runs at the top of an
+          // iteration, so an abort that landed during the final `reader.read()`
+          // and resolved it as a clean `done` breaks the loop with the stage
+          // signal already fired, and everything below would credit a model for
+          // an answer the pipeline is about to discard.
+          attemptSettlement = settleStageAttempt({
+            stageAbort: callOptions?.stageAbort,
+            turnAbort: streamAbort.signal,
+          });
           // T0.1: settle finish_reason once. Missing finish_reason ⇒ truncated
           // only for surfaceAsAnswer stages (some providers omit it elsewhere).
           const isAnswerStage = callOptions?.surfaceAsAnswer === true;
@@ -2645,6 +2655,30 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             } else {
               attemptOutcome = hasContent || hasToolCalls ? "success" : "empty_completion";
             }
+          }
+          // What this attempt is allowed to say about itself, now that its
+          // outcome is known. The self-tuning attribution below is the one
+          // remaining write that ran on a stage-aborted attempt: it is inside
+          // the success path, so the `finally`'s guard could not reach it.
+          const publication = decideStageOutcomePublication({
+            stage: stageLabel ?? "agent",
+            settlement: attemptSettlement,
+            attemptSucceeded: attemptOutcome === "success" || attemptOutcome === "truncated",
+          });
+          // Capture the actual provider/model used by this attempt so the
+          // orchestrator's `recordInference` error/empty paths can attribute
+          // the turn to the real backend (not the user's selected
+          // `cfg.active_backend`). The orchestrator's pool routinely routes
+          // through opencode_zen / opencode_go for planner/executor/synthesizer
+          // defaults — without this, all of those turns would be misattributed
+          // to "openrouter" in `/health/inference`. A stage the Conductor
+          // stopped never speaks for the turn: the pipeline discards its answer,
+          // so naming it here would attribute the turn — and the coordinator
+          // row, and the routing-parse strike — to work nobody received.
+          if (publication.publishTurnModel) {
+            orchLastModel = actualModelUsed;
+            orchLastProvider = actualProviderUsed;
+            orchLastFirstTokenMs = firstTokenLatencyMs;
           }
           if (
             orchestratorAgentRunId &&
@@ -2699,19 +2733,24 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             // A missing observation stays NULL; substituting total stage
             // duration made TTFT indistinguishable from completion latency.
             const firstTokenMs = firstTokenLatencyMs;
-            conductorLearning.recordStageModel({
-              agentRunId: orchestratorAgentRunId,
-              stageId: stageLabel,
-              stageRunId: typeof callOptions?.stageRunId === "string" ? callOptions.stageRunId : undefined,
-              agentId: poolResolvedAgent?.id,
-              provider: actualProviderUsed,
-              modelId: actualModelUsed,
-              durationMs: Date.now() - stageAttemptStart,
-              firstTokenMs,
-              fallbackUsed: attemptFallbackRetries > 0,
-              wasSuccessful: answerOk,
-              hadError: !answerOk,
-            });
+            // A stage the Conductor stopped records nothing: its answer is
+            // discarded, so a `was_successful` row would credit a model for
+            // work the operator was told had been stopped.
+            if (publication.recordStageAttribution) {
+              conductorLearning.recordStageModel({
+                agentRunId: orchestratorAgentRunId,
+                stageId: stageLabel,
+                stageRunId: typeof callOptions?.stageRunId === "string" ? callOptions.stageRunId : undefined,
+                agentId: poolResolvedAgent?.id,
+                provider: actualProviderUsed,
+                modelId: actualModelUsed,
+                durationMs: Date.now() - stageAttemptStart,
+                firstTokenMs,
+                fallbackUsed: attemptFallbackRetries > 0,
+                wasSuccessful: answerOk,
+                hadError: !answerOk,
+              });
+            }
           }
           if (
             callOptions?.surfaceAsAnswer === true &&
@@ -2789,18 +2828,24 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             // stopped never was: the old gate consulted only the turn-wide
             // signal, so the transport's own StageAbortedError fell through as
             // `http_error` and was recorded against a model that never had the
-            // chance to fail.
-            const settlement = settleStageAttempt({
+            // chance to fail. The success path already settled the same attempt
+            // (without an error, because there was none); reuse that decision so
+            // the two halves cannot disagree.
+            const settlement = attemptSettlement ?? settleStageAttempt({
               stageAbort: callOptions?.stageAbort,
               turnAbort: streamAbort.signal,
               error: attemptError,
             });
             const attemptSucceeded = attemptOutcome === "success" || attemptOutcome === "truncated";
-            if (settlement.settlement === "stage_aborted" && !attemptSucceeded) {
-              console.warn(
-                `[Jarvis Orchestrator] stage=${attemptStage ?? callOptions?.stageLabel ?? "agent"} ` +
-                `settled as stage_aborted (Conductor stop) — no model attribution recorded`,
-              );
+            // One bounded line per stopped attempt, whether the pipeline
+            // discarded a completed answer or never got one.
+            const publication = decideStageOutcomePublication({
+              stage: attemptStage ?? callOptions?.stageLabel ?? "agent",
+              settlement,
+              attemptSucceeded,
+            });
+            if (publication.warning) {
+              console.warn(`[Jarvis Orchestrator] ${publication.warning}`);
             }
             // Runtime starvation is not model failure — do not poison scorecard.
             if (
@@ -2811,7 +2856,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               !runtimeStarvation
             ) {
               const trackedScorecardAttempt = modelScorecard.record(attemptStage, `${attemptProvider}:${attemptModel}`, {
-                ok: attemptOutcome === "success" || attemptOutcome === "truncated",
+                ok: attemptSucceeded,
                 firstTokenMs: attemptFirstTokenMs,
               });
               if (attemptStage === "coordinator") orchLastScorecardAttempt = trackedScorecardAttempt;

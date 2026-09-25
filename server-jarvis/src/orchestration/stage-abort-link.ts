@@ -115,6 +115,59 @@ export function settleStageAttempt(options: {
   const stopped = settlement !== "in_flight";
   return { settlement, stopped, mayAdvanceFallback: !stopped, mayRecordModelAttribution: !stopped };
 }
+
+/** What one settled attempt is allowed to say about itself afterwards. */
+export interface StageOutcomePublication {
+  /** Persist this attempt's stage/model attribution for self-tuning. */
+  recordStageAttribution: boolean;
+  /**
+   * Publish this attempt as the turn's model — the coordinator-stage row, the
+   * routing-parse strike, and the turn's own provider/model telemetry all read
+   * that one projection.
+   */
+  publishTurnModel: boolean;
+  /** One bounded operator line explaining a dropped outcome, else null. */
+  warning: string | null;
+}
+
+/**
+ * Decide whether a settled attempt's outcome may be published to learning and
+ * telemetry, and say once why it was dropped.
+ *
+ * `settleStageAttempt` decides *why an attempt stopped*; this decides what
+ * survives that. A stage the Conductor ordered to stop produces no model
+ * outcome, even when the read loop broke on a `done` read that the abort turned
+ * into a clean finish: the pipeline discards that answer, so persisting a
+ * `was_successful` row for it would credit a model for work nobody received,
+ * and naming it as the turn's model would attribute the turn to a stage the
+ * operator was told had stopped.
+ *
+ * `warning` is deliberately non-null only for a Conductor stop, and only once
+ * per attempt: the transport logs it from the single `finally` that already
+ * settles every attempt, so a suppressed success and a suppressed failure are
+ * both explained exactly once and an operator cancellation stays as quiet as it
+ * was before.
+ */
+export function decideStageOutcomePublication(options: {
+  stage: string;
+  settlement: StageSettlementDecision;
+  attemptSucceeded: boolean;
+}): StageOutcomePublication {
+  const { stage, settlement, attemptSucceeded } = options;
+  if (!settlement.stopped) {
+    return { recordStageAttribution: true, publishTurnModel: true, warning: null };
+  }
+  const discarded = attemptSucceeded ? "discarded a completed model outcome; " : "";
+  return {
+    recordStageAttribution: settlement.mayRecordModelAttribution,
+    publishTurnModel: settlement.mayRecordModelAttribution,
+    warning:
+      settlement.settlement === "stage_aborted"
+        ? `stage=${stage} settled as ${STAGE_ABORTED_CODE} (Conductor stop) — ${discarded}no model attribution recorded`
+        : null,
+  };
+}
+
 /**
  * Bind one stage signal to the transport work that stage owns: the pending
  * provider request and, once headers have arrived, its body reader.

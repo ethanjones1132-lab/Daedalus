@@ -4,6 +4,7 @@ import {
   STAGE_ABORTED_ABORT_REASON,
   StageAbortedError,
   classifyCallAbort,
+  decideStageOutcomePublication,
   isStageAbortedError,
   linkStageAbortToTransport,
   settleStageAttempt,
@@ -274,6 +275,135 @@ describe("settleStageAttempt", () => {
     settleStageAttempt({ stageAbort: stageAbort.signal, turnAbort: lease.controller.signal });
     settleStageAttempt({ error: new StageAbortedError("executor") });
 
+    expect(lease.controller.signal.aborted).toBe(false);
+    expect(otherStage.signal.aborted).toBe(false);
+    expect(registry.size).toBe(1);
+  });
+});
+
+describe("decideStageOutcomePublication", () => {
+  const liveTurn = () => new AbortController().signal;
+
+  test("a live attempt publishes its attribution and its turn model", () => {
+    const settlement = settleStageAttempt({ stageAbort: new AbortController().signal, turnAbort: liveTurn() });
+
+    const publication = decideStageOutcomePublication({
+      stage: "synthesizer",
+      settlement,
+      attemptSucceeded: true,
+    });
+
+    expect(publication.recordStageAttribution).toBe(true);
+    expect(publication.publishTurnModel).toBe(true);
+    expect(publication.warning).toBeNull();
+  });
+
+  test("a stage abort that still produced an answer publishes nothing and says the outcome was discarded", () => {
+    const stageAbort = new AbortController();
+    stageAbort.abort("executor is unrecoverable");
+    const settlement = settleStageAttempt({ stageAbort: stageAbort.signal, turnAbort: liveTurn() });
+
+    const publication = decideStageOutcomePublication({
+      stage: "executor",
+      settlement,
+      attemptSucceeded: true,
+    });
+
+    expect(publication.recordStageAttribution).toBe(false);
+    expect(publication.publishTurnModel).toBe(false);
+    expect(publication.warning).toBe(
+      "stage=executor settled as stage_aborted (Conductor stop) — discarded a completed model outcome; no model attribution recorded",
+    );
+  });
+
+  test("a stopped attempt that failed is explained as a stop, not as a model failure", () => {
+    const stageAbort = new AbortController();
+    stageAbort.abort("planner dropped this stage");
+    const settlement = settleStageAttempt({ stageAbort: stageAbort.signal, turnAbort: liveTurn() });
+
+    const publication = decideStageOutcomePublication({
+      stage: "planner",
+      settlement,
+      attemptSucceeded: false,
+    });
+
+    expect(publication.recordStageAttribution).toBe(false);
+    expect(publication.publishTurnModel).toBe(false);
+    expect(publication.warning).toBe(
+      "stage=planner settled as stage_aborted (Conductor stop) — no model attribution recorded",
+    );
+  });
+
+  test("a turn cancellation suppresses publication without a Conductor-stop line", () => {
+    const turnAbort = new AbortController();
+    turnAbort.abort("User pressed Stop");
+    const settlement = settleStageAttempt({ stageAbort: new AbortController().signal, turnAbort: turnAbort.signal });
+
+    const publication = decideStageOutcomePublication({
+      stage: "executor",
+      settlement,
+      attemptSucceeded: true,
+    });
+
+    expect(publication.recordStageAttribution).toBe(false);
+    expect(publication.publishTurnModel).toBe(false);
+    expect(publication.warning).toBeNull();
+  });
+
+  test("an ordinary transport failure still publishes, so a real failure stays visible", () => {
+    const settlement = settleStageAttempt({
+      stageAbort: new AbortController().signal,
+      turnAbort: liveTurn(),
+      error: Object.assign(new Error("First-token timeout"), { name: "FirstTokenTimeoutError" }),
+    });
+
+    const publication = decideStageOutcomePublication({
+      stage: "executor",
+      settlement,
+      attemptSucceeded: false,
+    });
+
+    expect(publication.recordStageAttribution).toBe(true);
+    expect(publication.publishTurnModel).toBe(true);
+    expect(publication.warning).toBeNull();
+  });
+
+  test("one settlement keeps the cascade, the attribution, and the turn model in agreement", () => {
+    const stageAbort = new AbortController();
+    stageAbort.abort("executor is unrecoverable");
+    const turnAbort = new AbortController();
+    turnAbort.abort("Superseded by a newer Session turn");
+
+    const settlements = [
+      settleStageAttempt({ stageAbort: new AbortController().signal, turnAbort: new AbortController().signal }),
+      settleStageAttempt({ stageAbort: stageAbort.signal, turnAbort: new AbortController().signal }),
+      settleStageAttempt({ stageAbort: stageAbort.signal, turnAbort: turnAbort.signal }),
+    ];
+
+    for (const settlement of settlements) {
+      for (const attemptSucceeded of [true, false]) {
+        const publication = decideStageOutcomePublication({ stage: "executor", settlement, attemptSucceeded });
+        expect(publication.recordStageAttribution).toBe(settlement.mayRecordModelAttribution);
+        expect(publication.publishTurnModel).toBe(settlement.mayRecordModelAttribution);
+        expect(publication.recordStageAttribution).toBe(settlement.mayAdvanceFallback);
+      }
+    }
+  });
+
+  test("the publication decision never touches the Session lease or an unrelated stage", () => {
+    const registry = new ActiveStreamRegistry();
+    const lease = registry.begin("session-publish");
+    const otherStage = new AbortController();
+    const stageAbort = new AbortController();
+    stageAbort.abort("stop the executor only");
+
+    const publication = decideStageOutcomePublication({
+      stage: "executor",
+      settlement: settleStageAttempt({ stageAbort: stageAbort.signal, turnAbort: lease.controller.signal }),
+      attemptSucceeded: true,
+    });
+
+    expect(publication.publishTurnModel).toBe(false);
     expect(lease.controller.signal.aborted).toBe(false);
     expect(otherStage.signal.aborted).toBe(false);
     expect(registry.size).toBe(1);
