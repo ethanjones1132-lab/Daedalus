@@ -1449,6 +1449,28 @@ export class SelfTuningStore {
     }
   }
 
+  /**
+   * What instruction text each stage of a run actually received. The table was
+   * write-only, which is why a run could record an arm it never sent without
+   * anything noticing.
+   */
+  getWorkerInstructionOutcomes(agentRunId: string): WorkerInstructionOutcome[] {
+    const db = this.getDb();
+    if (!db) return [];
+    try {
+      return db
+        .prepare(
+          `SELECT * FROM worker_instruction_outcomes WHERE agent_run_id = ? ORDER BY created_at ASC`,
+        )
+        .all(agentRunId) as WorkerInstructionOutcome[];
+    } catch (e) {
+      console.error("[SelfTuningStore] getWorkerInstructionOutcomes failed:", e);
+      return [];
+    } finally {
+      db.close();
+    }
+  }
+
   insertModelAttribution(row: ModelAttribution): void {
     const db = this.getDb();
     if (!db) return;

@@ -3468,6 +3468,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 // `replan_events` row per re-invocation.
                 sessionCounter: replanCounter,
                 sessionId,
+                // A replan can replace the instruction set the A/B selector
+                // chose. Record what the remaining workers were actually sent
+                // so completion attribution never claims the route's original
+                // text was executed.
+                onInstructionsRevised: (report) => runFinalizer.setExecutedInstructions(report),
               }),
           );
         } finally {

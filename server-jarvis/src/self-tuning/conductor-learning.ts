@@ -34,6 +34,11 @@ import {
 import { runWithPolicyOverlay } from "./learned-pool-state";
 import { DEFAULT_MAX_TRAJECTORY_SNAPSHOTS } from "./trajectory-retention";
 import { hashInstruction, type InstructionVariantSelection } from "../orchestration/worker-prompt";
+import {
+  normalizeInstruction,
+  sentInstructionMatchesSelection,
+  unselectedInstructionVariant,
+} from "../orchestration/instruction-binding";
 
 export interface RoutingRecordInput {
   agentRunId: string;
@@ -138,21 +143,34 @@ export class ConductorLearningLoop {
         ) {
           continue;
         }
-        const custom = input.workerInstructions?.[stage as StageName]?.trim();
+        const stageName = stage as StageName;
+        const selected = input.instructionVariants.instructions?.[stageName];
+        const sent = normalizeInstruction(input.workerInstructions?.[stageName]);
+        // Arm credit requires that the prompt the worker received is the one
+        // this selector arbitrated. A replan revision (or a caller that hands
+        // over a different executed set) still gets provenance below, but must
+        // not teach the bandit about an arm it never chose.
+        const sentAsSelected = sentInstructionMatchesSelection(selected, sent);
         const success = stageRun.was_successful === 1 && stageRun.had_error === 0;
-        instructionVariants.push({
-          variantId: variant,
-          stageId: stage,
-          taskType: input.taskType,
-          success,
-        });
+        if (sentAsSelected) {
+          instructionVariants.push({
+            variantId: variant,
+            stageId: stage,
+            taskType: input.taskType,
+            success,
+          });
+        }
         workerInstructionOutcomes.push({
           id: `wi_${crypto.randomUUID()}`,
           agent_run_id: input.agentRunId,
           stage_id: stage,
-          instruction_hash: custom ? hashInstruction(custom) : "baseline",
-          instruction_variant: variant,
-          instruction_text: custom?.slice(0, 2000),
+          instruction_hash: sent ? hashInstruction(sent) : "baseline",
+          instruction_variant: sentAsSelected
+            ? variant
+            : sent
+              ? unselectedInstructionVariant(sent)
+              : "baseline",
+          instruction_text: sent?.slice(0, 2000),
           was_successful: stageRun.was_successful,
           had_error: stageRun.had_error,
         });

@@ -15,6 +15,10 @@ import { splitPipelineAtReplan, buildReplanRequest } from "./replan";
 import type { PipelineStageState } from "./stage-output";
 import type { SessionReplanCounter, ReplanCapKind } from "./replan-telemetry";
 import { segmentOutcomeFromCarry } from "./replan-telemetry";
+import {
+  resolveSegmentInstructions,
+  type InstructionRevisionReport,
+} from "./instruction-binding";
 import { applyEffectGate, evaluateEffectGate, isTerminalNoWriteEffect } from "./effect-gate";
 import { applyCheckHonestyGate } from "./check-runner";
 
@@ -69,6 +73,14 @@ export interface ReplanLoopArgs {
   /** B-04: session id for the per-session cap and telemetry. Required
    *  when `sessionCounter` is supplied. */
   sessionId?: string;
+  /**
+   * Reports the instruction set a replan actually changed the workers to, so
+   * the turn's self-tuning attribution can record the prompt that was sent
+   * instead of the route the turn started from. Called at most once per turn,
+   * only when a revised decision supplied instructions the A/B selector never
+   * arbitrated.
+   */
+  onInstructionsRevised?: (report: InstructionRevisionReport) => void;
 }
 
 /**
@@ -101,6 +113,21 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
   let perTurnCap = args.maxReplans;
   let sessionCapHit = false;
   const forceStages = new Set<StageName>();
+  // False until the conductor re-routes. The initial decision's own
+  // `worker_instructions` were already arbitrated by the A/B selector before
+  // this loop ran, so they are not authoritative for the first pass; only a
+  // revised decision carries instructions the selector has not seen.
+  let decisionRevised = false;
+
+  const segmentInstructions = (): InstructionRevisionReport => {
+    const resolved = resolveSegmentInstructions({
+      decisionInstructions: decision.worker_instructions,
+      selectedInstructions: args.baseOptions.workerInstructions,
+      decisionRevised,
+    });
+    if (resolved.revised) args.onInstructionsRevised?.(resolved);
+    return resolved;
+  };
 
   while (true) {
     const normalized = normalizeRoute(decision, args.turnRequirement, "model");
@@ -144,6 +171,7 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
         (stage) => forceStages.has(stage) || explicitlyRequested.has(stage) || !isStageCompleted(stage, carry),
       );
       for (const stage of remainingPipeline) forceStages.delete(stage);
+      const instructions = segmentInstructions();
       const segment = await args.executor.executeSegment(
         args.contextMessage,
         remainingPipeline,
@@ -153,7 +181,7 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
           ...args.baseOptions,
           topology: normalized.topology,
           executionProfile: normalized.profile,
-          workerInstructions: decision.worker_instructions ?? args.baseOptions.workerInstructions,
+          workerInstructions: instructions.instructions,
           sharedContext: decision.shared_context ?? args.baseOptions.sharedContext,
           allowMidRunReplan: !budgetExhausted,
           allowEffectGateReplan: replans === 0,
@@ -214,6 +242,7 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
           return finalizeSegment(finalSegment, sessionCapHit);
         }
         decision = replanDecision;
+        decisionRevised = true;
         if (args.sessionCounter && args.sessionId) {
           const capTag: ReplanCapKind = replans + 1 >= args.maxReplans ? "per_turn" : "";
           args.sessionCounter.record({
@@ -237,6 +266,7 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
     const firstSegmentStages = segments[0] ?? [];
     args.onStateChange({ stage: "conductor_replan", status: "running", output: "Re-planning remaining stages…" });
 
+    const instructions = segmentInstructions();
     const segment = await args.executor.executeSegment(
       args.contextMessage,
       firstSegmentStages,
@@ -246,7 +276,7 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
         ...args.baseOptions,
         topology: "linear",
         executionProfile: normalized.profile,
-        workerInstructions: decision.worker_instructions ?? args.baseOptions.workerInstructions,
+        workerInstructions: instructions.instructions,
         sharedContext: decision.shared_context ?? args.baseOptions.sharedContext,
       },
       carry,
@@ -268,6 +298,7 @@ export async function runPipelineWithReplanning(args: ReplanLoopArgs): Promise<P
     // replan marker and runs the remainder to completion.
     try {
       decision = await args.coordinator.route(replanRequestText, args.routeOptions);
+      decisionRevised = true;
     } catch (routeErr) {
       console.warn(
         `[replan-loop] conductor_replan coordinator failed (${(routeErr as Error)?.message ?? routeErr}) — continuing with planned stages`,

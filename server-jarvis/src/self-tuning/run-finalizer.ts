@@ -1,6 +1,7 @@
 import { summarizeTurnMetrics } from "../orchestration/turn-metrics";
-import type { CoordinatorResult, TaskType } from "../orchestration/coordinator";
+import type { CoordinatorResult, TaskType, WorkerInstructions } from "../orchestration/coordinator";
 import type { InstructionVariantSelection } from "../orchestration/worker-prompt";
+import type { InstructionRevisionReport } from "../orchestration/instruction-binding";
 import { ConductorLearningLoop, type RunCompletionInput } from "./conductor-learning";
 import { SessionOutcomeCollector } from "./collector";
 import { evaluatePendingTuningOutcomes } from "./outcome-loop";
@@ -57,6 +58,14 @@ export class RunFinalizer {
   private finalized = false;
   private conductorRunId = "";
   private instructionVariants: InstructionVariantSelection = { variants: {} };
+  /**
+   * The instruction set the workers actually received. Starts as the A/B
+   * selection and is replaced only when a replan reports a revision. Never
+   * re-derived from `route.worker_instructions`: that is the text the
+   * *selector* considered, and a baseline pick means the workers were
+   * deliberately sent something else.
+   */
+  private executedInstructions: WorkerInstructions | undefined;
 
   constructor(private readonly options: RunFinalizerOptions) {
     this.store = options.store ?? options.collector?.store ?? new SelfTuningStore();
@@ -107,6 +116,13 @@ export class RunFinalizer {
 
   setInstructionVariants(selection: InstructionVariantSelection): void {
     this.instructionVariants = selection;
+    this.executedInstructions = selection.instructions;
+  }
+
+  /** Records the instruction set a replan actually sent the remaining workers. */
+  setExecutedInstructions(report: InstructionRevisionReport): void {
+    if (!report.revised) return;
+    this.executedInstructions = report.instructions;
   }
 
   isFinalized(): boolean {
@@ -141,7 +157,10 @@ export class RunFinalizer {
       taskType: this.options.taskType,
       route: this.options.route,
       runOutcome: learningOutcome,
-      workerInstructions: this.options.route.worker_instructions,
+      // The executed set, not `route.worker_instructions`: a baseline pick or a
+      // replan revision means the workers ran something other than the route's
+      // own text, and recording that route would describe a prompt nobody sent.
+      workerInstructions: this.executedInstructions,
       instructionVariants,
       stageRuns,
       modelAttributions,
