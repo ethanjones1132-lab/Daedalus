@@ -3,6 +3,8 @@ import { promises as fs, existsSync } from "fs";
 import { join, resolve, relative } from "path";
 import type { JarvisConfig } from "./config";
 import { CONFIG_DIR } from "./config";
+import { TOOL_TIMEOUT_REASON, type ExecutionContext } from "./tool-runtime";
+import { ToolExecutionError } from "./tool-types";
 import { buildLocalClaudeArgs, buildLocalClaudeEnv, resolveClaudePath } from "./claude-cli";
 
 type TaskStatus = "running" | "completed" | "failed" | "stopped";
@@ -354,18 +356,29 @@ export function startTaskMonitor(): void {
   }, 60000);
 }
 
-export async function toolAgent(args: Record<string, unknown>, cfg: JarvisConfig): Promise<string> {
+export async function toolAgent(
+  args: Record<string, unknown>,
+  cfg: JarvisConfig,
+  ctx?: ExecutionContext,
+): Promise<string> {
   const description = stringArg(args.description) || "Agent task";
   const prompt = stringArg(args.prompt ?? args.task ?? args.input);
   const agentType = stringArg(args.subagent_type ?? args.agent_type ?? args.type) || "general";
-  const timeoutMs = numberArg(args.timeout_ms, Math.min(cfg.claude_cli.timeout_ms || 120000, 180000));
+  const requestedTimeout = numberArg(args.timeout_ms, Math.min(cfg.claude_cli.timeout_ms || 120000, 180000));
+  const timeoutMs = typeof ctx?.timeout_ms === "number" && Number.isFinite(ctx.timeout_ms) && ctx.timeout_ms > 0
+    ? Math.min(requestedTimeout, Math.floor(ctx.timeout_ms))
+    : requestedTimeout;
 
-  if (!prompt) return "Error: agent requires a prompt.";
+  if (!prompt) throw new ToolExecutionError("execution_error", "agent requires a prompt");
+  if (ctx?.signal?.aborted) {
+    const code = ctx.signal.reason === TOOL_TIMEOUT_REASON ? "timeout" : "cancelled";
+    throw new ToolExecutionError(code, code === "timeout" ? "Agent execution timed out" : "Agent execution cancelled");
+  }
 
   const wrappedPrompt = buildAgentPrompt(agentType, description, prompt);
-  const result = await runPromptOnce(wrappedPrompt, cfg, timeoutMs);
+  const result = await runPromptOnce(wrappedPrompt, cfg, timeoutMs, undefined, ctx?.signal);
   if (isErrorResult(result)) {
-    return `Error: agent ${agentType} failed:\n\n${result}`;
+    throw new ToolExecutionError("execution_error", `agent ${agentType} failed: ${result}`);
   }
   return `Agent ${agentType} completed:\n\n${result}`;
 }
@@ -407,22 +420,22 @@ export async function toolTaskList(args: Record<string, unknown>): Promise<strin
 
 export async function toolTaskGet(args: Record<string, unknown>): Promise<string> {
   const id = stringArg(args.id ?? args.task_id);
-  if (!id) return "Error: task_get requires id.";
+  if (!id) throw new ToolExecutionError("execution_error", "task_get requires id");
   const task = (await loadTasks()).find(item => item.id === id);
-  if (!task) return `Error: task ${id} not found.`;
+  if (!task) throw new ToolExecutionError("execution_error", `task ${id} not found`);
   const outputPreview = task.output ? `\n\nOutput preview:\n${tail(task.output, 4000)}` : "";
   return JSON.stringify({ ...task, output: undefined }, null, 2) + outputPreview;
 }
 
 export async function toolTaskOutput(args: Record<string, unknown>): Promise<string> {
   const id = stringArg(args.id ?? args.task_id);
-  if (!id) return "Error: task_output requires id.";
+  if (!id) throw new ToolExecutionError("execution_error", "task_output requires id");
   const limit = numberArg(args.limit, 12000);
   const offset = numberArg(args.offset, 0);
   const pattern = stringArg(args.pattern);
 
   const task = (await loadTasks()).find(item => item.id === id);
-  if (!task) return `Error: task ${id} not found.`;
+  if (!task) throw new ToolExecutionError("execution_error", `task ${id} not found`);
   if (!task.output) return `(task ${id} has no output yet)`;
 
   let output = task.output;
@@ -459,7 +472,7 @@ export async function toolTaskOutput(args: Record<string, unknown>): Promise<str
 
 export async function toolTaskStop(args: Record<string, unknown>): Promise<string> {
   const id = stringArg(args.id ?? args.task_id);
-  if (!id) return "Error: task_stop requires id.";
+  if (!id) throw new ToolExecutionError("execution_error", "task_stop requires id");
 
   const running = runningTasks.get(id);
   stoppingTasks.add(id);
@@ -471,7 +484,7 @@ export async function toolTaskStop(args: Record<string, unknown>): Promise<strin
   const task = tasks.find(item => item.id === id);
   if (!task) {
     stoppingTasks.delete(id);
-    return `Error: task ${id} not found.`;
+    throw new ToolExecutionError("execution_error", `task ${id} not found`);
   }
   if (task.status !== "running") {
     stoppingTasks.delete(id);
@@ -518,45 +531,95 @@ async function runTask(task: TaskRecord, cfg: JarvisConfig): Promise<void> {
   }
 }
 
-async function runPromptOnce(prompt: string, cfg: JarvisConfig, timeoutMs: number, taskId?: string): Promise<string> {
+async function runPromptOnce(
+  prompt: string,
+  cfg: JarvisConfig,
+  timeoutMs: number,
+  taskId?: string,
+  signal?: AbortSignal,
+): Promise<string> {
   if (cfg.claude_cli.enabled) {
-    const cliOutput = await runClaudeCliPrompt(prompt, cfg, timeoutMs, taskId);
+    const cliOutput = await runClaudeCliPrompt(prompt, cfg, timeoutMs, taskId, signal);
     if (!cliOutput.startsWith("Error:")) return cliOutput;
   }
-  return runModelPrompt(prompt, cfg, timeoutMs, taskId);
+  return runModelPrompt(prompt, cfg, timeoutMs, taskId, signal);
 }
 
-async function runClaudeCliPrompt(prompt: string, cfg: JarvisConfig, timeoutMs: number, taskId?: string): Promise<string> {
+async function runClaudeCliPrompt(
+  prompt: string,
+  cfg: JarvisConfig,
+  timeoutMs: number,
+  taskId?: string,
+  signal?: AbortSignal,
+): Promise<string> {
   const launchOptions = { authMode: cfg.claude_cli.auth_mode };
   const args = buildLocalClaudeArgs([...(cfg.claude_cli.args || []), prompt], launchOptions);
   const resolvedPath = resolveClaudePath(cfg.claude_cli.path);
+  if (signal?.aborted) {
+    const code = signal.reason === TOOL_TIMEOUT_REASON ? "timeout" : "cancelled";
+    throw new ToolExecutionError(code, code === "timeout" ? "Agent execution timed out" : "Agent execution cancelled");
+  }
 
-  return new Promise((resolve) => {
-    const proc = spawn(resolvedPath, args, {
-      stdio: ["pipe", "pipe", "pipe"],
-      cwd: cfg.jarvis_path || cfg.claude_cli.cwd || cfg.jarvis_path,
-      env: {
-        ...buildLocalClaudeEnv(process.env, launchOptions),
-        CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: "1",
-      },
-    });
+  return new Promise((resolve, reject) => {
+    let proc;
+    try {
+      proc = spawn(resolvedPath, args, {
+        stdio: ["pipe", "pipe", "pipe"],
+        cwd: cfg.jarvis_path || cfg.claude_cli.cwd || cfg.jarvis_path,
+        env: {
+          ...buildLocalClaudeEnv(process.env, launchOptions),
+          CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: "1",
+        },
+        detached: process.platform !== "win32",
+      });
+    } catch (error: any) {
+      resolve(`Error: Failed to spawn Claude CLI: ${error?.message ?? String(error)}`);
+      return;
+    }
     if (taskId) runningTasks.set(taskId, { proc });
     proc.stdin?.end();
 
     let stdout = "";
     let stderr = "";
+    let closed = false;
     let timedOut = false;
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      proc.kill("SIGTERM");
-    }, timeoutMs);
+    let cancelled = false;
+    let hardKillTimer: ReturnType<typeof setTimeout> | undefined;
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: () => void = () => {};
+    const cleanup = (): void => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (hardKillTimer) clearTimeout(hardKillTimer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const stop = (kind: "timeout" | "cancelled"): void => {
+      if (closed) return;
+      if (kind === "timeout") timedOut = true;
+      else cancelled = true;
+      try { proc.kill("SIGTERM"); } catch {}
+      hardKillTimer = setTimeout(() => {
+        try { proc.kill("SIGKILL"); } catch {}
+      }, 250);
+      hardKillTimer.unref?.();
+    };
 
-    proc.stdout?.on("data", d => { stdout += d.toString(); });
-    proc.stderr?.on("data", d => { stderr += d.toString(); });
-    proc.on("close", code => {
-      clearTimeout(timeout);
+    onAbort = (): void => stop(signal?.reason === TOOL_TIMEOUT_REASON ? "timeout" : "cancelled");
+    timeoutTimer = setTimeout(() => stop("timeout"), timeoutMs);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+
+    proc.stdout?.on("data", d => { stdout = (stdout + d.toString()).slice(-12_000); });
+    proc.stderr?.on("data", d => { stderr = (stderr + d.toString()).slice(-4_000); });
+    proc.once("close", code => {
+      if (closed) return;
+      closed = true;
+      cleanup();
+      if (cancelled) {
+        reject(new ToolExecutionError("cancelled", "Agent execution cancelled"));
+        return;
+      }
       if (timedOut) {
-        resolve(`Error: Claude CLI timed out after ${timeoutMs}ms`);
+        reject(new ToolExecutionError("timeout", `Agent execution timed out after ${timeoutMs}ms`));
         return;
       }
       if (code === 0) {
@@ -565,17 +628,35 @@ async function runClaudeCliPrompt(prompt: string, cfg: JarvisConfig, timeoutMs: 
         resolve(`Error: Claude CLI exited with code ${code}${stderr ? `:\n${stderr}` : ""}`);
       }
     });
-    proc.on("error", e => {
-      clearTimeout(timeout);
-      resolve(`Error: Failed to spawn Claude CLI: ${e.message}`);
+    proc.once("error", error => {
+      if (closed) return;
+      closed = true;
+      cleanup();
+      resolve(`Error: Failed to spawn Claude CLI: ${error.message}`);
     });
   });
 }
 
-async function runModelPrompt(prompt: string, cfg: JarvisConfig, timeoutMs: number, taskId?: string): Promise<string> {
+async function runModelPrompt(
+  prompt: string,
+  cfg: JarvisConfig,
+  timeoutMs: number,
+  taskId?: string,
+  signal?: AbortSignal,
+): Promise<string> {
   const abort = new AbortController();
+  let timedOut = false;
+  const onAbort = (): void => {
+    if (signal?.reason === TOOL_TIMEOUT_REASON || timedOut) return;
+    abort.abort(signal?.reason);
+  };
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    abort.abort(TOOL_TIMEOUT_REASON);
+  }, timeoutMs);
   if (taskId) runningTasks.set(taskId, { abort });
-  const timeout = setTimeout(() => abort.abort(), timeoutMs);
+  signal?.addEventListener("abort", onAbort, { once: true });
+  if (signal?.aborted) onAbort();
 
   try {
     const isOllama = cfg.active_backend !== "openrouter";
@@ -599,11 +680,23 @@ async function runModelPrompt(prompt: string, cfg: JarvisConfig, timeoutMs: numb
         ],
       }),
     });
-    if (!res.ok) return `Error: model request failed (${res.status}): ${(await res.text()).slice(0, 1000)}`;
+    if (!res.ok) {
+      throw new ToolExecutionError("execution_error", `model request failed (${res.status}): ${(await res.text()).slice(0, 1000)}`);
+    }
     const json = await res.json();
+    if (signal?.aborted || timedOut) {
+      throw new ToolExecutionError(timedOut ? "timeout" : "cancelled", timedOut ? "Agent execution timed out" : "Agent execution cancelled");
+    }
     return json.choices?.[0]?.message?.content || JSON.stringify(json).slice(0, 12000);
+  } catch (error) {
+    if (error instanceof ToolExecutionError) throw error;
+    if (timedOut) throw new ToolExecutionError("timeout", `Agent execution timed out after ${timeoutMs}ms`);
+    if (signal?.aborted) throw new ToolExecutionError("cancelled", "Agent execution cancelled");
+    const message = error instanceof Error ? error.message : String(error);
+    throw new ToolExecutionError("execution_error", `Agent model request failed: ${message}`, message);
   } finally {
     clearTimeout(timeout);
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 

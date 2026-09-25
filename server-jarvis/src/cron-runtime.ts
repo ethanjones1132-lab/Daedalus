@@ -123,7 +123,7 @@ async function executeWithTimeout(
         output: "",
         is_error: true,
         error: initialStatus === "timeout" ? "Cron execution deadline exceeded" : "Cron execution cancelled",
-        error_code: "handler_error",
+        error_code: initialStatus === "timeout" ? "timeout" : "cancelled",
         duration_ms: 0,
       },
       status: initialStatus,
@@ -169,7 +169,7 @@ async function executeWithTimeout(
       error: stoppedStatus === "timeout"
         ? `Cron tool execution timed out after ${CRON_TOOL_TIMEOUT_MS}ms`
         : "Cron execution cancelled",
-      error_code: "handler_error",
+      error_code: stoppedStatus === "timeout" ? "timeout" : "cancelled",
       duration_ms: 0,
     },
     status: stoppedStatus,
@@ -212,10 +212,12 @@ function classifyStatus(result: CronRunResult): ExecutionEvidence["status"] {
   const timedOut = result.results.some(
     (r) =>
       r.is_error &&
-      (r.error_code === "handler_error" || !r.error_code) &&
-      /timed out/i.test(r.error || ""),
+      (r.error_code === "timeout" || r.error_code === "handler_error" || !r.error_code) &&
+      (r.error_code === "timeout" || /timed out|timeout/i.test(r.error || "")),
   );
-  return timedOut ? "timeout" : "failed";
+  if (timedOut) return "timeout";
+  const cancelled = result.results.some((r) => r.is_error && r.error_code === "cancelled");
+  return cancelled ? "cancelled" : "failed";
 }
 
 function buildEvidence(result: CronRunResult, run_id: string): ExecutionEvidence {

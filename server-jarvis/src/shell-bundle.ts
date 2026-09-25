@@ -3,10 +3,10 @@
 // ═══════════════════════════════════════════════════════════════
 // The `bash` tool registered into the ToolRuntime. Dangerous + approval-required.
 
-import { spawn } from "child_process";
+import { spawn, type ChildProcess } from "child_process";
 import { existsSync, statSync } from "fs";
-import type { ToolRuntime, ExecutionContext } from "./tool-runtime";
-import type { ToolDefinition } from "./tool-types";
+import { TOOL_TIMEOUT_REASON, type ToolRuntime, type ExecutionContext } from "./tool-runtime";
+import { ToolExecutionError, type ToolDefinition } from "./tool-types";
 import { resolveSafePath } from "./fs-scope";
 
 /** Hard ceiling when config carries no `tools.shell_timeout_max_ms`. */
@@ -55,12 +55,19 @@ export function resolveBashProgram(cfg: { tools?: { bash_path?: string } }): str
   return "bash";
 }
 
-function shellTimeout(args: Record<string, unknown>, cfg: { tools?: { shell_timeout_max_ms?: number } }): number {
+function shellTimeout(
+  args: Record<string, unknown>,
+  cfg: { tools?: { shell_timeout_max_ms?: number } },
+  ctx: ExecutionContext,
+): number {
   const max = cfg.tools?.shell_timeout_max_ms ?? DEFAULT_SHELL_TIMEOUT_MAX_MS;
   const requested = typeof args.timeout_ms === "number" && args.timeout_ms > 0
     ? args.timeout_ms
     : DEFAULT_SHELL_TIMEOUT_MS;
-  return Math.min(requested, max);
+  const contextLimit = typeof ctx.timeout_ms === "number" && Number.isFinite(ctx.timeout_ms) && ctx.timeout_ms > 0
+    ? ctx.timeout_ms
+    : Number.POSITIVE_INFINITY;
+  return Math.min(requested, max, contextLimit);
 }
 
 const BASH_DEF: ToolDefinition = {
@@ -84,6 +91,29 @@ const BASH_DEF: ToolDefinition = {
   capability: { class: "shell", evidence: "execution" },
 };
 
+const MAX_SHELL_OUTPUT_CHARS = 8_000;
+
+function boundedShellText(value: string): string {
+  if (value.length <= MAX_SHELL_OUTPUT_CHARS) return value;
+  return `${value.slice(0, MAX_SHELL_OUTPUT_CHARS)}… [truncated]`;
+}
+
+function terminateProcess(proc: ChildProcess, signal: "SIGTERM" | "SIGKILL" = "SIGTERM"): void {
+  try {
+    if (process.platform !== "win32" && proc.pid) {
+      process.kill(-proc.pid, signal);
+    } else {
+      proc.kill(signal);
+    }
+  } catch {
+    try { proc.kill(signal); } catch {}
+  }
+}
+
+function shellFailure(code: "execution_error" | "spawn_error" | "cancelled" | "timeout", message: string, output: string, cause?: unknown): ToolExecutionError {
+  return new ToolExecutionError(code, boundedShellText(message), boundedShellText(output), cause);
+}
+
 async function handleShell(
   args: Record<string, unknown>,
   ctx: ExecutionContext,
@@ -91,7 +121,7 @@ async function handleShell(
 ): Promise<string> {
   const cfg = ctx.config;
   const command = args.command as string;
-  const timeout = shellTimeout(args, cfg as { tools?: { shell_timeout_max_ms?: number } });
+  const timeout = shellTimeout(args, cfg as { tools?: { shell_timeout_max_ms?: number } }, ctx);
   const requestedCwd = typeof args.cwd === "string" && args.cwd.trim().length > 0
     ? args.cwd
     : (ctx.workspace_path || cfg.jarvis_path || process.cwd());
@@ -105,41 +135,113 @@ async function handleShell(
     throw new Error(`Shell cwd is not a directory: ${requestedCwd}`);
   }
   resolution.revalidate();
+  if (ctx.signal?.aborted) {
+    const reason = ctx.signal.reason === TOOL_TIMEOUT_REASON ? "timeout" : "cancelled";
+    throw shellFailure(reason, reason === "timeout" ? "Shell execution timed out" : "Shell execution cancelled", "Shell execution cancelled");
+  }
 
-  const { program, prefixArgs } = spawnShell(cfg);
+  let program: string;
+  let prefixArgs: string[];
+  try {
+    ({ program, prefixArgs } = spawnShell(cfg));
+  } catch (e: any) {
+    throw shellFailure("spawn_error", `Failed to spawn shell: ${e?.message ?? String(e)}`, `Failed to spawn shell: ${e?.message ?? String(e)}`, e);
+  }
 
-  return new Promise((resolve) => {
-    resolution.revalidate();
-    const proc = spawn(program, [...prefixArgs, command], {
-      cwd,
-      timeout,
-      env: { ...process.env, PATH: process.env.PATH },
-    });
+  return new Promise((resolve, reject) => {
+    let proc: ChildProcess;
+    try {
+      resolution.revalidate();
+      proc = spawn(program, [...prefixArgs, command], {
+        cwd,
+        env: { ...process.env, PATH: process.env.PATH },
+        detached: process.platform !== "win32",
+      });
+    } catch (e: any) {
+      reject(shellFailure("spawn_error", `Failed to spawn shell: ${e?.message ?? String(e)}`, `Failed to spawn shell: ${e?.message ?? String(e)}`, e));
+      return;
+    }
 
     let stdout = "";
     let stderr = "";
+    let closed = false;
+    let stopReason: "cancelled" | "timeout" | undefined;
+    let spawnError: Error | undefined;
+    let hardKillTimer: ReturnType<typeof setTimeout> | undefined;
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: () => void = () => {};
 
-    proc.stdout?.on("data", (d) => { stdout += d.toString(); });
-    proc.stderr?.on("data", (d) => { stderr += d.toString(); });
+    const cleanup = (): void => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (hardKillTimer) clearTimeout(hardKillTimer);
+      ctx.signal?.removeEventListener("abort", onAbort);
+    };
+    const requestStop = (reason: "cancelled" | "timeout"): void => {
+      if (closed || stopReason) return;
+      stopReason = reason;
+      terminateProcess(proc);
+      hardKillTimer = setTimeout(() => {
+        if (!closed) terminateProcess(proc, "SIGKILL");
+      }, 500);
+      hardKillTimer.unref?.();
+    };
 
-    proc.on("close", (code) => {
-      const output = stdout.trim();
-      const err = stderr.trim();
-      if (code === 0) {
-        resolve(output || "(no output)");
-      } else {
-        let msg = `Command failed with exit code ${code}`;
-        if (err) msg += `\nError: ${err}`;
-        if (output) msg += `\nPartial output: ${output}`;
-        if (code === 127) msg += "\nHint: Command not found. Check if the tool is installed or use the full path.";
-        else if (code === 1 && err.includes("Permission denied")) msg += "\nHint: Permission denied. Try checking file permissions with ls -la, or use a different approach.";
-        else if (code === 1 && err.includes("No such file")) msg += "\nHint: File or directory not found. Use glob to find the correct path.";
-        else if (err.includes("already exists")) msg += "\nHint: Target already exists. Use read_file to check current content, or use a different filename.";
-        resolve(msg);
+    onAbort = (): void => requestStop(ctx.signal?.reason === TOOL_TIMEOUT_REASON ? "timeout" : "cancelled");
+    timeoutTimer = setTimeout(() => requestStop("timeout"), timeout);
+
+    if (ctx.signal) {
+      if (ctx.signal.aborted) onAbort();
+      else ctx.signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    proc.stdout?.on("data", (data) => {
+      stdout = boundedShellText(stdout + data.toString());
+    });
+    proc.stderr?.on("data", (data) => {
+      stderr = boundedShellText(stderr + data.toString());
+    });
+    proc.once("error", (error) => {
+      spawnError = error;
+      if (proc.pid === undefined) {
+        closed = true;
+        cleanup();
+        reject(shellFailure("spawn_error", `Failed to spawn shell: ${error.message}`, `Failed to spawn shell: ${error.message}`, error));
       }
     });
-
-    proc.on("error", (e) => resolve(`Error: ${e.message}`));
+    proc.once("close", (code, signal) => {
+      if (closed) return;
+      closed = true;
+      cleanup();
+      const output = stdout.trim();
+      const err = stderr.trim();
+      if (stopReason) {
+        const message = stopReason === "timeout"
+          ? `Shell execution timed out after ${timeout}ms`
+          : "Shell execution cancelled";
+        reject(shellFailure(stopReason, message, output || err || message));
+        return;
+      }
+      if (spawnError) {
+        reject(shellFailure("spawn_error", `Failed to spawn shell: ${spawnError.message}`, `Failed to spawn shell: ${spawnError.message}`, spawnError));
+        return;
+      }
+      if (code === 0) {
+        resolve(output || "(no output)");
+        return;
+      }
+      if (signal) {
+        reject(shellFailure("execution_error", `Shell command terminated by ${signal}`, `Shell command terminated by ${signal}\nPartial output: ${output}`));
+        return;
+      }
+      let message = `Command failed with exit code ${code}`;
+      if (err) message += `\nError: ${err}`;
+      if (output) message += `\nPartial output: ${output}`;
+      if (code === 127) message += "\nHint: Command not found. Check if the tool is installed or use the full path.";
+      else if (code === 1 && err.includes("Permission denied")) message += "\nHint: Permission denied. Try checking file permissions with ls -la, or use a different approach.";
+      else if (code === 1 && err.includes("No such file")) message += "\nHint: File or directory not found. Use glob to find the correct path.";
+      else if (err.includes("already exists")) message += "\nHint: Target already exists. Use read_file to check current content, or use a different filename.";
+      reject(shellFailure("execution_error", message, message));
+    });
   });
 }
 

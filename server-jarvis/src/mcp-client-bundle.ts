@@ -63,8 +63,24 @@ const READ_RESOURCE_DEF = def("mcp_read_resource",
 
 export function registerMcpClientBundle(rt: ToolRuntime): void {
   rt.register(LIST_SERVERS_DEF, (a, c) => toolMcpListServers(a, c.config));
-  rt.register(LIST_TOOLS_DEF, (a, c) => toolMcpListTools(a, c.config));
-  rt.register(CALL_TOOL_DEF, (a, c) => toolMcpCallTool(a, c.config));
-  rt.register(LIST_RESOURCES_DEF, (a, c) => toolMcpListResources(a, c.config));
-  rt.register(READ_RESOURCE_DEF, (a, c) => toolMcpReadResource(a, c.config));
+  rt.register(LIST_TOOLS_DEF, (a, c) => toolMcpListTools(a, c.config, {
+    signal: c.signal,
+    timeout_ms: c.timeout_ms,
+    strict: true,
+  }));
+  rt.register(CALL_TOOL_DEF, (a, c) => toolMcpCallTool(a, c.config, {
+    signal: c.signal,
+    timeout_ms: c.timeout_ms,
+    strict: true,
+  }));
+  rt.register(LIST_RESOURCES_DEF, (a, c) => toolMcpListResources(a, c.config, {
+    signal: c.signal,
+    timeout_ms: c.timeout_ms,
+    strict: true,
+  }));
+  rt.register(READ_RESOURCE_DEF, (a, c) => toolMcpReadResource(a, c.config, {
+    signal: c.signal,
+    timeout_ms: c.timeout_ms,
+    strict: true,
+  }));
 }

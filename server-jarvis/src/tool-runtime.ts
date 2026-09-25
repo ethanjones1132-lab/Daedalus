@@ -9,11 +9,83 @@
 // through separate tool implementations.
 
 import type { JarvisConfig } from "./config";
+import { ToolExecutionError } from "./tool-types";
 import type { ToolDefinition, ToolCall, ToolResult, ToolErrorCode } from "./tool-types";
 import type { WriteEffectObservation } from "./orchestration/content-fingerprint";
 
 // ── Re-export tool types so callers import from one place ─────────────────────
 export type { ToolDefinition, ToolCall, ToolResult };
+export { ToolExecutionError };
+
+export const TOOL_TIMEOUT_REASON = "tool_timeout";
+const MAX_TOOL_ERROR_CHARS = 12_000;
+
+function boundedToolText(value: string): string {
+  if (value.length <= MAX_TOOL_ERROR_CHARS) return value;
+  return `${value.slice(0, MAX_TOOL_ERROR_CHARS)}… [truncated]`;
+}
+
+function stoppedToolResult(
+  call: ToolCall,
+  start: number,
+  reason: "cancelled" | "timeout",
+  timeoutMs?: number,
+): ToolResult {
+  const message = reason === "timeout"
+    ? `Tool execution timed out${timeoutMs !== undefined ? ` after ${timeoutMs}ms` : ""}`
+    : "Tool execution cancelled";
+  return {
+    call_id: call.id,
+    name: call.name,
+    output: message,
+    is_error: true,
+    error: message,
+    error_code: reason,
+    duration_ms: Date.now() - start,
+  };
+}
+
+interface ExecutionControl {
+  signal: AbortSignal;
+  reason: () => "cancelled" | "timeout" | undefined;
+  cleanup: () => void;
+}
+
+function createExecutionControl(ctx: ExecutionContext): ExecutionControl {
+  const controller = new AbortController();
+  let reason: "cancelled" | "timeout" | undefined;
+  const timeoutMs = typeof ctx.timeout_ms === "number" && Number.isFinite(ctx.timeout_ms) && ctx.timeout_ms > 0
+    ? Math.max(1, Math.floor(ctx.timeout_ms))
+    : undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const onCallerAbort = (): void => {
+    if (reason) return;
+    reason = "cancelled";
+    controller.abort(ctx.signal?.reason);
+  };
+
+  if (ctx.signal) {
+    if (ctx.signal.aborted) onCallerAbort();
+    else ctx.signal.addEventListener("abort", onCallerAbort, { once: true });
+  }
+  if (timeoutMs !== undefined) {
+    timer = setTimeout(() => {
+      if (reason) return;
+      reason = "timeout";
+      controller.abort(TOOL_TIMEOUT_REASON);
+    }, timeoutMs);
+  }
+
+  return {
+    signal: controller.signal,
+    reason: () => reason,
+    cleanup: () => {
+      if (timer) clearTimeout(timer);
+      ctx.signal?.removeEventListener("abort", onCallerAbort);
+    },
+  };
+}
 
 /** Text of a tool result as the model should see it (error text on failure). */
 export function toolResultModelText(result: ToolResult): string {
@@ -363,31 +435,22 @@ export function createToolRuntime(): ToolRuntime {
       }
     }
     if (ctx.signal?.aborted) {
-      return {
-        call_id: call.id,
-        name: call.name,
-        output: "Tool execution cancelled",
-        is_error: true,
-        error: "Tool execution cancelled",
-        error_code: "handler_error",
-        duration_ms: Date.now() - start,
-      };
+      return stoppedToolResult(call, start, "cancelled");
     }
 
-    // Execute handler — catch all throws
+    const control = createExecutionControl(ctx);
+    const executionCtx: ExecutionContext = { ...ctx, signal: control.signal };
+    const timeoutMs = typeof ctx.timeout_ms === "number" && Number.isFinite(ctx.timeout_ms) && ctx.timeout_ms > 0
+      ? Math.max(1, Math.floor(ctx.timeout_ms))
+      : undefined;
+
     try {
-      const output = await entry.handler(callArguments, ctx);
-      if (ctx.signal?.aborted) {
-        return {
-          call_id: call.id,
-          name: call.name,
-          output: "Tool execution cancelled",
-          is_error: true,
-          error: "Tool execution cancelled",
-          error_code: "handler_error",
-          duration_ms: Date.now() - start,
-        };
-      }
+      const initialReason = control.reason();
+      if (initialReason) return stoppedToolResult(call, start, initialReason, timeoutMs);
+
+      const output = await entry.handler(callArguments, executionCtx);
+      const stopReason = control.reason();
+      if (stopReason) return stoppedToolResult(call, start, stopReason, timeoutMs);
       return {
         call_id: call.id,
         name: call.name,
@@ -396,7 +459,21 @@ export function createToolRuntime(): ToolRuntime {
         duration_ms: Date.now() - start,
       };
     } catch (e: any) {
-      const msg = e?.message ?? String(e);
+      const stopReason = control.reason();
+      if (stopReason) return stoppedToolResult(call, start, stopReason, timeoutMs);
+      if (e instanceof ToolExecutionError) {
+        const message = boundedToolText(e.message || "Tool execution failed");
+        return {
+          call_id: call.id,
+          name: call.name,
+          output: boundedToolText(e.output || `Error: ${message}`),
+          is_error: true,
+          error: message,
+          error_code: e.code,
+          duration_ms: Date.now() - start,
+        };
+      }
+      const msg = boundedToolText(e?.message ?? String(e));
       return {
         call_id: call.id,
         name: call.name,
@@ -406,6 +483,8 @@ export function createToolRuntime(): ToolRuntime {
         error_code: "handler_error" satisfies ToolErrorCode,
         duration_ms: Date.now() - start,
       };
+    } finally {
+      control.cleanup();
     }
   }
 

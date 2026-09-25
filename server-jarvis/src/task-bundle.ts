@@ -100,7 +100,7 @@ export function registerTaskControlBundle(rt: ToolRuntime): void {
 
 export function registerTaskBundle(rt: ToolRuntime): void {
   rt.register(RUN_BG_DEF, (a, c) => toolRunBackgroundCommand(a, c.config));
-  rt.register(AGENT_DEF, (a, c) => toolAgent(a, c.config));
+  rt.register(AGENT_DEF, (a, c) => toolAgent(a, c.config, c));
   rt.register(TASK_CREATE_DEF, (a, c) => toolTaskCreate(a, c.config));
   registerTaskControlBundle(rt);
 }

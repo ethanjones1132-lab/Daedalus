@@ -114,9 +114,28 @@ export type ToolErrorCode =
   | "approval_rejected"
   | "approval_unavailable"
   | "handler_error"
+  | "execution_error"
+  | "spawn_error"
+  | "protocol_error"
+  | "cancelled"
+  | "timeout"
   | "delegate_write_unverified"
   | "delegate_cleanup_unconfirmed"
   | "delegate_cleanup_signal_error";
+
+export class ToolExecutionError extends Error {
+  readonly code: ToolErrorCode;
+  readonly output?: string;
+  readonly cause?: unknown;
+
+  constructor(code: ToolErrorCode, message: string, output?: string, cause?: unknown) {
+    super(message);
+    this.name = "ToolExecutionError";
+    this.code = code;
+    this.output = output;
+    this.cause = cause;
+  }
+}
 
 export interface ToolResult {
   call_id: string;
