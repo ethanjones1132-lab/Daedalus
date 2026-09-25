@@ -222,4 +222,56 @@ describe('useHermesChat', () => {
     expect(screen.getByTestId('messages')).toHaveTextContent('Hermes turn failed.');
     expect(screen.getByTestId('messages')).not.toHaveTextContent('secret-value');
   });
+
+  it('serializes repeated prompt submissions', async () => {
+    const request = deferred<unknown>();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'hermes_status') return Promise.resolve(status('ready'));
+      if (command === 'hermes_invoke') return request.promise;
+      return Promise.resolve(null);
+    });
+    render(<Harness />);
+    await waitFor(() => expect(screen.getByTestId('state')).toHaveTextContent('ready'));
+    const send = screen.getByRole('button', { name: 'send' });
+    fireEvent.click(send);
+    fireEvent.click(send);
+    await waitFor(() => expect(invokeCalls('hermes_invoke')).toHaveLength(1));
+    await act(async () => request.reject(new Error('private failure detail')));
+    await waitFor(() => expect(screen.getByTestId('streaming')).toHaveTextContent('false'));
+    expect(invokeCalls('hermes_invoke')).toHaveLength(1);
+  });
+
+  it('does not let an older rejection terminate a newer Session turn', async () => {
+    const firstRequest = deferred<unknown>();
+    const secondRequest = deferred<unknown>();
+    let submitCount = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'hermes_status') return Promise.resolve(status('ready'));
+      if (command === 'hermes_invoke') {
+        submitCount += 1;
+        return submitCount === 1 ? firstRequest.promise : secondRequest.promise;
+      }
+      return Promise.resolve(null);
+    });
+
+    const view = render(<Harness sessionId="session-1" />);
+    await waitFor(() => expect(screen.getByTestId('state')).toHaveTextContent('ready'));
+    fireEvent.click(screen.getByRole('button', { name: 'send' }));
+    await waitFor(() => expect(invokeCalls('hermes_invoke')).toHaveLength(1));
+
+    view.rerender(<Harness sessionId="session-2" />);
+    await waitFor(() => expect(screen.getByTestId('streaming')).toHaveTextContent('false'));
+    fireEvent.click(screen.getByRole('button', { name: 'send' }));
+    await waitFor(() => expect(invokeCalls('hermes_invoke')).toHaveLength(2));
+    expect(invokeCalls('hermes_invoke')[1][1]).toEqual({
+      args: { method: 'prompt.submit', params: { text: 'hello', session_id: 'session-2' }, timeout_ms: 300000 },
+    });
+
+    await act(async () => firstRequest.reject(new Error('old Session detail')));
+    expect(screen.getByTestId('streaming')).toHaveTextContent('true');
+    expect(screen.getByTestId('messages')).not.toHaveTextContent('Hermes turn failed.');
+    await act(async () => secondRequest.resolve({}));
+    await emit({ type: 'stream.done', session_id: 'session-2', params: {} });
+    expect(screen.getByTestId('streaming')).toHaveTextContent('false');
+  });
 });

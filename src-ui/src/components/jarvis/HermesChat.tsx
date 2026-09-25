@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useHermesChat, type HermesState } from '../../lib/hermes';
-import { HERMES_TURN_STOPPED } from '../../lib/hermes-state';
+import { HERMES_SUBMIT_FAILED_REASON, HERMES_TURN_STOPPED } from '../../lib/hermes-state';
 import { cn, GlassCard, StatusDot } from '../ui';
 
 const stateLabel = (s: HermesState): string => {
@@ -40,9 +40,22 @@ export function HermesChat() {
     isReady,
   } = useHermesChat(sessionId ?? '');
   const [input, setInput] = useState('');
+  const [submitError, setSubmitError] = useState<string | null>(null);
   const transcriptRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const inputVersionRef = useRef(0);
+  const sendPendingRef = useRef(false);
+  const mountedRef = useRef(true);
+  const sessionIdRef = useRef<string | null>(null);
+  sessionIdRef.current = sessionId;
   const bridgeReady = isReady && sessionId !== null;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!isReady || sessionId) return;
@@ -58,11 +71,38 @@ export function HermesChat() {
   }, [messages.length]);
 
   const onSend = async () => {
+    const activeSession = sessionIdRef.current;
     const text = input.trim();
-    if (!text) return;
+    if (!text || !activeSession || sendPendingRef.current) return;
+    const inputVersion = ++inputVersionRef.current;
+    sendPendingRef.current = true;
     setInput('');
-    await submit(text);
-    inputRef.current?.focus();
+    try {
+      const accepted = await submit(text);
+      if (accepted) {
+        setSubmitError(null);
+        inputRef.current?.focus();
+        return;
+      }
+      if (
+        !mountedRef.current
+        || sessionIdRef.current !== activeSession
+        || inputVersionRef.current !== inputVersion
+      ) {
+        return;
+      }
+      setInput(text);
+      setSubmitError(HERMES_SUBMIT_FAILED_REASON);
+      inputRef.current?.focus();
+    } finally {
+      sendPendingRef.current = false;
+    }
+  };
+
+  const onInputChange = (value: string) => {
+    inputVersionRef.current += 1;
+    setInput(value);
+    setSubmitError(null);
   };
 
   const onKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -114,6 +154,21 @@ export function HermesChat() {
       {interruptError && (
         <div role="alert" aria-label="Hermes turn interruption" className="mx-4 mt-3 rounded-xl border border-amber-300/20 bg-amber-500/10 p-3 text-sm text-amber-100">
           <p>{interruptError}</p>
+        </div>
+      )}
+
+      {submitError && (
+        <div role="alert" aria-label="Hermes prompt submission" className="mx-4 mt-3 rounded-xl border border-red-400/20 bg-red-500/10 p-3 text-sm text-red-100">
+          <p>{submitError}</p>
+          <button
+            type="button"
+            aria-label="Retry Hermes prompt"
+            onClick={() => void onSend()}
+            disabled={isStreaming || isStarting || isStopping || !bridgeReady}
+            className="mt-2 rounded-lg border border-red-200/20 px-3 py-1 text-xs text-red-100 disabled:opacity-50"
+          >
+            Retry
+          </button>
         </div>
       )}
 
@@ -175,7 +230,7 @@ export function HermesChat() {
           ref={inputRef}
           aria-label="Message Hermes"
           value={input}
-          onChange={(e) => setInput(e.target.value)}
+          onChange={(e) => onInputChange(e.target.value)}
           onKeyDown={onKey}
           disabled={!bridgeReady || isStreaming || isStarting || isStopping}
           rows={1}

@@ -30,6 +30,12 @@ function status(state: string) {
   return { state, reason: null };
 }
 
+async function emit(payload: Record<string, unknown>) {
+  const listener = listeners.get('hermes-event');
+  expect(listener).toBeDefined();
+  await act(async () => listener?.({ payload }));
+}
+
 beforeEach(() => {
   invokeMock.mockReset();
   listeners.clear();
@@ -91,5 +97,71 @@ describe('HermesChat availability and turn termination', () => {
     await act(async () => stop.resolve(status('cold')));
     expect(await screen.findByText('Session turn stopped.')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Stopping…' })).not.toBeInTheDocument();
+  });
+
+  it('restores a failed prompt and retries it once against the same Session', async () => {
+    const firstRequest = deferred<unknown>();
+    const retryRequest = deferred<unknown>();
+    let submitCount = 0;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'hermes_status') return Promise.resolve(status('ready'));
+      if (command === 'hermes_invoke') {
+        submitCount += 1;
+        return submitCount === 1 ? firstRequest.promise : retryRequest.promise;
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<HermesChat />);
+    const input = await screen.findByRole('textbox', { name: 'Message Hermes' });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: 'recover this prompt' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(invokeMock.mock.calls.filter(([command]) => command === 'hermes_invoke')).toHaveLength(1));
+
+    await act(async () => firstRequest.reject(new Error('token=private-value')));
+    expect(await screen.findByRole('alert', { name: 'Hermes prompt submission' })).toHaveTextContent('Could not submit the Hermes prompt.');
+    expect(input).toHaveValue('recover this prompt');
+    expect(screen.queryByText(/private-value/)).not.toBeInTheDocument();
+
+    const retry = screen.getByRole('button', { name: 'Retry Hermes prompt' });
+    fireEvent.click(retry);
+    fireEvent.click(retry);
+    await waitFor(() => expect(invokeMock.mock.calls.filter(([command]) => command === 'hermes_invoke')).toHaveLength(2));
+    const submitCalls = invokeMock.mock.calls.filter(([command]) => command === 'hermes_invoke');
+    expect(submitCalls[1][1]).toEqual(submitCalls[0][1]);
+    expect(retry).toBeDisabled();
+
+    const submittedArgs = submitCalls[0][1].args;
+    await act(async () => retryRequest.resolve({}));
+    await emit({
+      type: 'stream.done',
+      session_id: submittedArgs.params.session_id,
+      params: {},
+    });
+    await waitFor(() => expect(input).toHaveValue(''));
+    expect(screen.queryByRole('alert', { name: 'Hermes prompt submission' })).not.toBeInTheDocument();
+  });
+
+  it('does not replace a newer composer edit when an older submission rejects', async () => {
+    const request = deferred<unknown>();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'hermes_status') return Promise.resolve(status('ready'));
+      if (command === 'hermes_invoke') return request.promise;
+      return Promise.resolve(null);
+    });
+
+    render(<HermesChat />);
+    const input = await screen.findByRole('textbox', { name: 'Message Hermes' });
+    await waitFor(() => expect(input).toBeEnabled());
+    fireEvent.change(input, { target: { value: 'failed prompt' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    fireEvent.change(input, { target: { value: 'newer prompt' } });
+
+    await act(async () => request.reject(new Error('private failure detail')));
+    await waitFor(() => expect(input).toHaveValue('newer prompt'));
+    expect(screen.queryByRole('alert', { name: 'Hermes prompt submission' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/private failure detail/)).not.toBeInTheDocument();
   });
 });

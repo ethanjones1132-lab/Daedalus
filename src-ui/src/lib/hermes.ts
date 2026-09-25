@@ -102,7 +102,7 @@ export interface UseHermesChat {
   interruptError: string | null;
   state: HermesState;
   reason: string | null;
-  submit: (text: string) => Promise<void>;
+  submit: (text: string) => Promise<boolean>;
   interrupt: () => Promise<void>;
   retry: () => Promise<void>;
   clear: () => void;
@@ -126,6 +126,7 @@ export function useHermesChat(sessionId: string): UseHermesChat {
   const turnSessionIdRef = useRef<string | null>(null);
   const isStreamingRef = useRef(false);
   const sendPendingRef = useRef(false);
+  const sendOwnerRef = useRef<string | null>(null);
   const startPendingRef = useRef(false);
   const retryPendingRef = useRef(false);
   const stopPendingRef = useRef(false);
@@ -286,7 +287,12 @@ export function useHermesChat(sessionId: string): UseHermesChat {
     const previous = previousSessionRef.current;
     previousSessionRef.current = sessionId;
     if (previous !== sessionId) {
+      const supersededAssistantId = assistantIdRef.current;
       settleActiveTurn('stopped');
+      if (supersededAssistantId && sendOwnerRef.current === supersededAssistantId) {
+        sendPendingRef.current = false;
+        sendOwnerRef.current = null;
+      }
     }
   }, [sessionId, settleActiveTurn]);
 
@@ -306,7 +312,7 @@ export function useHermesChat(sessionId: string): UseHermesChat {
   const submit = useCallback(async (text: string) => {
     const trimmed = text.trim();
     const activeSession = sessionIdRef.current;
-    if (!trimmed || !activeSession || sendPendingRef.current || isStreamingRef.current || stateRef.current !== 'ready') return;
+    if (!trimmed || !activeSession || sendPendingRef.current || isStreamingRef.current || stateRef.current !== 'ready') return false;
     sendPendingRef.current = true;
     isStreamingRef.current = true;
     setIsStreaming(true);
@@ -320,6 +326,7 @@ export function useHermesChat(sessionId: string): UseHermesChat {
       createdAt: now,
     };
     const assistantId = `a-${now}-${suffix}`;
+    sendOwnerRef.current = assistantId;
     assistantIdRef.current = assistantId;
     turnSessionIdRef.current = activeSession;
     const assistantMessage: HermesMessage = {
@@ -336,10 +343,21 @@ export function useHermesChat(sessionId: string): UseHermesChat {
         params: { text: trimmed, session_id: activeSession },
         timeout_ms: 300_000,
       });
+      return true;
     } catch {
-      if (mountedRef.current) settleActiveTurn('error');
+      if (
+        mountedRef.current
+        && assistantIdRef.current === assistantId
+        && turnSessionIdRef.current === activeSession
+      ) {
+        settleActiveTurn('error');
+      }
+      return false;
     } finally {
-      sendPendingRef.current = false;
+      if (sendOwnerRef.current === assistantId) {
+        sendPendingRef.current = false;
+        sendOwnerRef.current = null;
+      }
     }
   }, [settleActiveTurn]);
 
