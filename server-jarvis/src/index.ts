@@ -210,7 +210,11 @@ import { countTokens } from "./tokens";
 import { WorkspaceAffinityStore } from "./orchestration/workspace-affinity";
 import { createRuntimeMonitor, shouldLogRuntimePerformance } from "./performance/runtime-monitor";
 import { loadInferenceFeedback } from "./self-tuning/inference-feedback";
-import { loadPolicyVersions, getPolicyVersionStore } from "./self-tuning/policy-staging";
+import {
+  loadPolicyVersions,
+  getPolicyVersionStore,
+  type PolicyEvidence,
+} from "./self-tuning/policy-staging";
 import {
   assessTaskRunAcceptance,
   getActivePlanItem,
@@ -3627,11 +3631,26 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         if (conductorRunId && terminalStatus === "claimed") {
           // Staged policy lifecycle on the live request path:
           // - canary arm → noteCanaryPolicyOutcome (may auto-promote/rollback)
-          // - candidate/shadow → noteEligiblePolicyOutcome (eligible → shadow →
-          //   live shadow progress → canary without an offline job)
+          // - candidate/shadow → noteEligiblePolicyOutcome with live-turn
+          //   provenance; only candidate executions or replay receipts qualify
           // Instruction A/B + capability deltas stay immediate in optimizeAndApply.
           const policySuccess = rewardOutcome === "success";
           const policyStore = getPolicyVersionStore();
+          const policyCandidate = policyStore.candidate;
+          const livePolicyEvidence: PolicyEvidence | undefined = policyCandidate
+            ? {
+                evidenceId: `turn_${agentRunId}`,
+                policyId: policyCandidate.id,
+                policyVersion: policyCandidate.version,
+                patch: policyCandidate.patch,
+                source: "live_turn",
+                arm: policyCanaryTurn ? "canary" : "production",
+                runId: agentRunId,
+                sessionId,
+                taskType: route.task_type,
+                outcome: rewardOutcome,
+              }
+            : undefined;
           if (policyStore.canary?.stage === "canary") {
             const arm = policyCanaryTurn ? "canary" : "production";
             const transition = conductorLearning.noteCanaryPolicyOutcome(arm, policySuccess);
@@ -3645,7 +3664,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             policyStore.candidate &&
             (policyStore.candidate.stage === "candidate" || policyStore.candidate.stage === "shadow")
           ) {
-            const transition = conductorLearning.noteEligiblePolicyOutcome(rewardOutcome);
+            const transition = conductorLearning.noteEligiblePolicyOutcome(
+              rewardOutcome,
+              livePolicyEvidence,
+            );
             if (
               transition.action === "entered_shadow" ||
               transition.action === "entered_canary" ||

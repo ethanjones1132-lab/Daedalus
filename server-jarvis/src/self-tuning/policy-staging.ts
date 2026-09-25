@@ -6,7 +6,7 @@
  * in a staged lifecycle:
  *
  *   candidate (held back)
- *     → 20 eligible outcomes
+ *     → 20 candidate-executed outcomes
  *     → shadow replay
  *     → canary (10% traffic, ≥20 runs)
  *     → promotion criteria
@@ -93,6 +93,28 @@ export interface PolicyPatch {
   theta?: Record<string, number>;
 }
 
+export type PolicyOutcome = "success" | "degraded" | "failed";
+export type PolicyEvidenceSource = "live_turn" | "candidate_execution" | "offline_replay";
+export type PolicyEvidenceArm = "production" | "candidate" | "canary" | "offline_replay";
+
+export interface PolicyEvidence {
+  evidenceId: string;
+  policyId: string;
+  policyVersion: number;
+  patch: PolicyPatch;
+  source: PolicyEvidenceSource;
+  arm: PolicyEvidenceArm;
+  runId: string;
+  sessionId: string;
+  taskType: string;
+  outcome: PolicyOutcome;
+}
+
+export interface PolicyEvidenceLedger {
+  evidenceIds: string[];
+  runIds: string[];
+}
+
 export interface PolicyVersion {
   id: string;
   version: number;
@@ -108,6 +130,7 @@ export interface PolicyVersion {
   eligibleOutcomes: number;
   eligibleSuccessCount: number;
   eligibleFailureCount: number;
+  qualificationEvidence?: PolicyEvidenceLedger;
   shadow?: {
     replayed: number;
     successCount: number;
@@ -299,6 +322,7 @@ export function proposePolicy(
     eligibleOutcomes: 0,
     eligibleSuccessCount: 0,
     eligibleFailureCount: 0,
+    qualificationEvidence: { evidenceIds: [], runIds: [] },
     history: [{ at: createdAt, from: "candidate", to: "candidate", reason: "proposed" }],
   };
   store.candidate = version;
@@ -307,19 +331,92 @@ export function proposePolicy(
 
 // ── Eligible outcomes → shadow ──────────────────────────────────────────────
 
-/**
- * Record an eligible production outcome while a candidate is held back, or
- * accumulate live shadow progress once the candidate has entered `shadow`.
- *
- * Candidate stage: after {@link POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow}
- * outcomes the candidate automatically enters `shadow`.
- *
- * Shadow stage: further live outcomes feed shadow counters so candidates can
- * leave shadow without an offline replay job. After the same threshold of
- * additional outcomes the quality gate runs and may advance into canary.
- */
+function evidenceFailure(candidate: PolicyVersion, reason: string): TransitionResult {
+  return { action: "none", reason, version: candidate, store };
+}
+
+function isPolicyOutcome(value: unknown): value is PolicyOutcome {
+  return value === "success" || value === "degraded" || value === "failed";
+}
+
+function isPolicyEvidenceSource(value: unknown): value is PolicyEvidenceSource {
+  return value === "live_turn" || value === "candidate_execution" || value === "offline_replay";
+}
+
+function isPolicyEvidenceArm(value: unknown): value is PolicyEvidenceArm {
+  return (
+    value === "production" ||
+    value === "candidate" ||
+    value === "canary" ||
+    value === "offline_replay"
+  );
+}
+
+function evidenceLedger(candidate: PolicyVersion): PolicyEvidenceLedger {
+  if (!candidate.qualificationEvidence) {
+    candidate.qualificationEvidence = { evidenceIds: [], runIds: [] };
+  }
+  return candidate.qualificationEvidence;
+}
+
+function validateQualificationEvidence(
+  candidate: PolicyVersion,
+  evidence: PolicyEvidence | undefined,
+  expectedOutcome: PolicyOutcome,
+): string | null {
+  if (!evidence || typeof evidence !== "object") return "evidence_required";
+  if (
+    typeof evidence.evidenceId !== "string" ||
+    evidence.evidenceId.length === 0 ||
+    typeof evidence.policyId !== "string" ||
+    evidence.policyId.length === 0 ||
+    !isCounter(evidence.policyVersion) ||
+    !isPolicyEvidenceSource(evidence.source) ||
+    !isPolicyEvidenceArm(evidence.arm) ||
+    typeof evidence.runId !== "string" ||
+    evidence.runId.length === 0 ||
+    typeof evidence.sessionId !== "string" ||
+    evidence.sessionId.length === 0 ||
+    typeof evidence.taskType !== "string" ||
+    evidence.taskType.length === 0 ||
+    !isPolicyOutcome(evidence.outcome)
+  ) {
+    return "invalid_evidence";
+  }
+  if (evidence.outcome !== expectedOutcome) return "outcome_mismatch";
+  if (evidence.source === "live_turn") return "live_turn_not_qualifying";
+  if (evidence.source === "candidate_execution" && evidence.arm !== "candidate") {
+    return "wrong_policy_arm";
+  }
+  if (evidence.source === "offline_replay" && evidence.arm !== "offline_replay") {
+    return "wrong_policy_arm";
+  }
+  if (evidence.policyId !== candidate.id) return "stale_policy_id";
+  if (evidence.policyVersion !== candidate.version) return "stale_policy_version";
+  try {
+    if (policyPatchFingerprint(evidence.patch) !== policyPatchFingerprint(candidate.patch)) {
+      return "patch_mismatch";
+    }
+  } catch {
+    return "invalid_evidence";
+  }
+  const ledger = candidate.qualificationEvidence;
+  if (ledger?.evidenceIds.includes(evidence.evidenceId)) return "duplicate_evidence";
+  if (ledger?.runIds.includes(evidence.runId)) return "duplicate_run";
+  return null;
+}
+
+function rememberEvidence(candidate: PolicyVersion, evidence: PolicyEvidence): boolean {
+  const ledger = evidenceLedger(candidate);
+  if (ledger.evidenceIds.length >= 256) return false;
+  ledger.evidenceIds.push(evidence.evidenceId);
+  ledger.runIds.push(evidence.runId);
+  return true;
+}
+
 export function recordEligibleOutcome(
-  outcome: "success" | "degraded" | "failed",
+  outcome: PolicyOutcome,
+  evidence?: PolicyEvidence,
 ): TransitionResult {
   const candidate = store.candidate;
   if (!candidate) {
@@ -331,18 +428,26 @@ export function recordEligibleOutcome(
     };
   }
 
-  // Live shadow progress (no offline job required).
   if (candidate.stage === "shadow") {
-    return recordShadowLiveOutcome(candidate, outcome === "success");
+    const reason = validateQualificationEvidence(candidate, evidence, outcome);
+    if (reason) return evidenceFailure(candidate, reason);
+    if (!rememberEvidence(candidate, evidence!)) {
+      return evidenceFailure(candidate, "evidence_capacity_exceeded");
+    }
+    return recordShadowLiveOutcome(candidate, evidence!);
   }
 
   if (candidate.stage !== "candidate") {
-    return {
-      action: "none",
-      reason: `stage_${candidate.stage}`,
-      version: candidate,
-      store,
-    };
+    return evidenceFailure(candidate, `stage_${candidate.stage}`);
+  }
+
+  const reason = validateQualificationEvidence(candidate, evidence, outcome);
+  if (reason) return evidenceFailure(candidate, reason);
+  if (evidence!.source === "offline_replay") {
+    return evidenceFailure(candidate, "offline_replay_requires_shadow");
+  }
+  if (!rememberEvidence(candidate, evidence!)) {
+    return evidenceFailure(candidate, "evidence_capacity_exceeded");
   }
 
   candidate.eligibleOutcomes += 1;
@@ -371,19 +476,15 @@ export function recordEligibleOutcome(
   };
 }
 
-/**
- * Feed one live outcome into a shadow-stage candidate. Completing the required
- * count advances into canary (or rejects) using the same gates as offline replay.
- */
 function recordShadowLiveOutcome(
   candidate: PolicyVersion,
-  success: boolean,
+  evidence: PolicyEvidence,
 ): TransitionResult {
   if (!candidate.shadow) {
     candidate.shadow = { replayed: 0, successCount: 0, failureCount: 0 };
   }
   candidate.shadow.replayed += 1;
-  if (success) candidate.shadow.successCount += 1;
+  if (evidence.outcome === "success") candidate.shadow.successCount += 1;
   else candidate.shadow.failureCount += 1;
   candidate.updatedAt = nowIso();
 
@@ -401,18 +502,14 @@ function recordShadowLiveOutcome(
 
 // ── Shadow replay ───────────────────────────────────────────────────────────
 
-/**
- * Shared shadow completion gate used by offline replay and live shadow progress.
- */
 function finalizeShadowReplay(candidate: PolicyVersion): TransitionResult {
   if (!candidate.shadow) {
     candidate.shadow = { replayed: 0, successCount: 0, failureCount: 0 };
   }
 
-  // Require a full shadow pass of at least minEligibleOutcomesBeforeShadow replays.
   if (candidate.shadow.replayed < POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow) {
     return {
-      action: "none",
+      action: "eligible_recorded",
       reason: `shadow_partial_${candidate.shadow.replayed}`,
       version: candidate,
       store,
@@ -420,7 +517,6 @@ function finalizeShadowReplay(candidate: PolicyVersion): TransitionResult {
   }
 
   const shadowRate = successRate(candidate.shadow.successCount, candidate.shadow.failureCount);
-  // Reject shadow if absolute rate is catastrophic.
   if (shadowRate < POLICY_STAGING_THRESHOLDS.minCanarySuccessRate) {
     recordTransition(candidate, "rejected", `shadow_rate_${shadowRate.toFixed(3)}`);
     store.candidate = null;
@@ -443,7 +539,6 @@ function finalizeShadowReplay(candidate: PolicyVersion): TransitionResult {
     productionFailureCount: 0,
   };
   store.canary = candidate;
-  // Candidate pointer remains while canarying so restart reloads both slots.
   return {
     action: "entered_canary",
     reason: "shadow_replay_passed",
@@ -452,32 +547,54 @@ function finalizeShadowReplay(candidate: PolicyVersion): TransitionResult {
   };
 }
 
-/**
- * Feed offline / historical replay results into a shadow-stage candidate.
- * Completing the required replay count advances the candidate into canary.
- * Prefer live progress via {@link recordEligibleOutcome} when an offline job
- * is not available.
- */
 export function runShadowReplay(
-  outcomes: ReadonlyArray<{ success: boolean }>,
+  outcomes: ReadonlyArray<PolicyEvidence>,
 ): TransitionResult {
   const candidate = store.candidate;
   if (!candidate || candidate.stage !== "shadow") {
     return {
       action: "none",
-      reason: candidate ? `stage_${candidate.stage}` : "no_candidate",
+      reason: candidate
+        ? candidate.stage === "candidate"
+          ? "replay_requires_shadow"
+          : `stage_${candidate.stage}`
+        : "no_candidate",
       version: candidate,
       store,
     };
   }
 
+  if (outcomes.length === 0) return evidenceFailure(candidate, "empty_replay");
+
+  const evidenceIds = new Set(candidate.qualificationEvidence?.evidenceIds ?? []);
+  const runIds = new Set(candidate.qualificationEvidence?.runIds ?? []);
+  if (evidenceIds.size + outcomes.length > 256) {
+    return evidenceFailure(candidate, "evidence_capacity_exceeded");
+  }
+  for (const row of outcomes) {
+    if (!row || typeof row !== "object") {
+      return evidenceFailure(candidate, "invalid_evidence");
+    }
+    if (row.source !== "offline_replay" || row.arm !== "offline_replay") {
+      return evidenceFailure(candidate, "replay_source_mismatch");
+    }
+    const reason = validateQualificationEvidence(candidate, row, row.outcome);
+    if (reason) return evidenceFailure(candidate, reason);
+    if (evidenceIds.has(row.evidenceId)) return evidenceFailure(candidate, "duplicate_evidence");
+    if (runIds.has(row.runId)) return evidenceFailure(candidate, "duplicate_run");
+    evidenceIds.add(row.evidenceId);
+    runIds.add(row.runId);
+  }
+
   if (!candidate.shadow) {
     candidate.shadow = { replayed: 0, successCount: 0, failureCount: 0 };
   }
-
   for (const row of outcomes) {
+    if (!rememberEvidence(candidate, row)) {
+      return evidenceFailure(candidate, "evidence_capacity_exceeded");
+    }
     candidate.shadow.replayed += 1;
-    if (row.success) candidate.shadow.successCount += 1;
+    if (row.outcome === "success") candidate.shadow.successCount += 1;
     else candidate.shadow.failureCount += 1;
   }
   candidate.updatedAt = nowIso();
@@ -663,6 +780,7 @@ function promoteCanary(reason: string): TransitionResult {
       eligibleOutcomes: 0,
       eligibleSuccessCount: 0,
       eligibleFailureCount: 0,
+      qualificationEvidence: { evidenceIds: [], runIds: [] },
       history: [],
     };
     store.lastKnownGood = seed;
@@ -769,6 +887,20 @@ function isCounter(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (isRecord(value)) {
+    const result: Record<string, unknown> = {};
+    for (const key of Object.keys(value).sort()) result[key] = canonicalize(value[key]);
+    return result;
+  }
+  return value;
+}
+
+export function policyPatchFingerprint(patch: PolicyPatch): string {
+  return JSON.stringify(canonicalize(patch)) ?? "null";
+}
+
 function isPolicyDomain(value: unknown): value is PolicyDomain {
   return typeof value === "string" && POLICY_DOMAINS.has(value as PolicyDomain);
 }
@@ -872,6 +1004,31 @@ function validateShadow(value: unknown): void {
   }
 }
 
+function validateEvidenceLedger(value: unknown, version: Record<string, unknown>): void {
+  if (!isRecord(value)) rejectPolicyState("invalid_evidence_ledger");
+  const lengths: number[] = [];
+  for (const field of ["evidenceIds", "runIds"] as const) {
+    const entries = value[field];
+    if (!Array.isArray(entries) || entries.length > 256) {
+      rejectPolicyState("invalid_evidence_ledger");
+    }
+    const seen = new Set<string>();
+    for (const entry of entries) {
+      if (typeof entry !== "string" || entry.length === 0 || seen.has(entry)) {
+        rejectPolicyState("invalid_evidence_ledger");
+      }
+      seen.add(entry);
+    }
+    lengths.push(entries.length);
+  }
+  if (lengths[0] !== lengths[1]) rejectPolicyState("invalid_evidence_ledger");
+  const eligible = isCounter(version.eligibleOutcomes) ? version.eligibleOutcomes : 0;
+  const shadow = isRecord(version.shadow) && isCounter(version.shadow.replayed)
+    ? version.shadow.replayed
+    : 0;
+  if (lengths[0] < eligible + shadow) rejectPolicyState("invalid_evidence_ledger");
+}
+
 function validateCanaryStats(value: unknown): void {
   if (!isRecord(value)) rejectPolicyState("invalid_canary_stats");
   validateCounterSet(
@@ -920,6 +1077,9 @@ function validateVersion(value: unknown, slot: keyof PolicyVersionStore): Policy
   );
   validateHistory(value.history);
   if (value.shadow !== undefined) validateShadow(value.shadow);
+  if (value.qualificationEvidence !== undefined) {
+    validateEvidenceLedger(value.qualificationEvidence, value);
+  }
   if (value.canaryStats !== undefined) validateCanaryStats(value.canaryStats);
 
   if (value.stage === "shadow" && value.shadow === undefined) {

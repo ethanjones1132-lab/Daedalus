@@ -26,6 +26,7 @@ import {
   recordEligibleOutcome,
   runShadowReplay,
   shouldApplyCanary,
+  type PolicyEvidence,
   type PolicyPatch,
   type PolicySnapshot,
   type TransitionResult,
@@ -427,12 +428,15 @@ export class ConductorLearningLoop {
   }
 
   /**
-   * Advance held-back candidates with an eligible production outcome.
-   * Also drives live shadow progress so candidates leave shadow without an
-   * offline replay job (see policy-staging recordEligibleOutcome).
+   * Advance held-back candidates only with provenance-bearing evidence.
+   * Production terminals are accepted as non-qualifying context by the policy
+   * boundary; candidate execution and offline replay receipts advance it.
    */
-  noteEligiblePolicyOutcome(outcome: "success" | "degraded" | "failed"): TransitionResult {
-    const result = recordEligibleOutcome(outcome);
+  noteEligiblePolicyOutcome(
+    outcome: "success" | "degraded" | "failed",
+    evidence?: PolicyEvidence,
+  ): TransitionResult {
+    const result = recordEligibleOutcome(outcome, evidence);
     if (
       result.action === "entered_shadow" ||
       result.action === "eligible_recorded" ||
@@ -445,7 +449,7 @@ export class ConductorLearningLoop {
   }
 
   /** Feed shadow-replay results; may advance into canary. */
-  completeShadowReplay(outcomes: ReadonlyArray<{ success: boolean }>): TransitionResult {
+  completeShadowReplay(outcomes: ReadonlyArray<PolicyEvidence>): TransitionResult {
     const result = runShadowReplay(outcomes);
     if (result.action !== "none") persistPolicyVersions();
     return result;

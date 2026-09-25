@@ -2,7 +2,11 @@ import { describe, expect, test, beforeEach } from "bun:test";
 import { ConductorLearningLoop } from "./conductor-learning";
 import { SelfTuningStore } from "./store";
 import { resetLearnedPoolStateForTests } from "./learned-pool-state";
-import { getPolicyVersionStore, resetPolicyStagingForTests } from "./policy-staging";
+import {
+  getPolicyVersionStore,
+  resetPolicyStagingForTests,
+  type PolicyEvidence,
+} from "./policy-staging";
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
 import { hashInstruction } from "../orchestration/worker-prompt";
 import { defaultConfig } from "../config";
@@ -17,6 +21,26 @@ const sampleAgent: OrchestratorAgent = {
   default_for: ["executor"],
   enabled: true,
 };
+
+function candidateEvidence(
+  index: number,
+  outcome: PolicyEvidence["outcome"] = "success",
+): PolicyEvidence {
+  const candidate = getPolicyVersionStore().candidate;
+  if (!candidate) throw new Error("candidate is not available");
+  return {
+    evidenceId: `loop-evidence-${index}`,
+    policyId: candidate.id,
+    policyVersion: candidate.version,
+    patch: candidate.patch,
+    source: "candidate_execution",
+    arm: "candidate",
+    runId: `loop-run-${index}`,
+    sessionId: `loop-session-${index}`,
+    taskType: index % 2 === 0 ? "refactor" : "debug",
+    outcome,
+  };
+}
 
 describe("Conductor learning (Phase 4)", () => {
   beforeEach(() => {
@@ -444,8 +468,10 @@ describe("Conductor learning (Phase 4)", () => {
     expect(getLearnedPoolState().modelFirstTokenTimeouts.size).toBe(0);
 
     // Eligible outcomes advance toward shadow without mutating production maps.
-    for (let i = 0; i < 19; i++) loop.noteEligiblePolicyOutcome("success");
-    const entered = loop.noteEligiblePolicyOutcome("success");
+    for (let i = 0; i < 19; i++) {
+      loop.noteEligiblePolicyOutcome("success", candidateEvidence(i));
+    }
+    const entered = loop.noteEligiblePolicyOutcome("success", candidateEvidence(19));
     expect(entered.action).toBe("entered_shadow");
     expect(getLearnedPoolState().modelFirstTokenTimeouts.size).toBe(0);
   });
@@ -471,16 +497,15 @@ describe("Conductor learning (Phase 4)", () => {
     expect(staged.action).toBe("proposed");
 
     for (let i = 0; i < 20; i++) {
-      loop.noteEligiblePolicyOutcome("success");
+      loop.noteEligiblePolicyOutcome("success", candidateEvidence(100 + i));
     }
     expect(getPolicyVersionStore().candidate?.stage).toBe("shadow");
 
-    // Live shadow progress (no completeShadowReplay offline job).
     for (let i = 0; i < 19; i++) {
-      const r = loop.noteEligiblePolicyOutcome("success");
+      const r = loop.noteEligiblePolicyOutcome("success", candidateEvidence(200 + i));
       expect(r.action).toBe("eligible_recorded");
     }
-    const canaryEnter = loop.noteEligiblePolicyOutcome("success");
+    const canaryEnter = loop.noteEligiblePolicyOutcome("success", candidateEvidence(219));
     expect(canaryEnter.action).toBe("entered_canary");
     expect(getPolicyVersionStore().canary?.stage).toBe("canary");
 

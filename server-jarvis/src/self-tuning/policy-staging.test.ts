@@ -25,6 +25,7 @@ import {
   rollbackPolicy,
   runShadowReplay,
   shouldApplyCanary,
+  type PolicyEvidence,
   type PolicyPatch,
 } from "./policy-staging";
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
@@ -45,21 +46,28 @@ function advanceToShadow(): void {
   const proposed = proposePolicy(routingPatch, "boost reliable model");
   expect(proposed.action).toBe("proposed");
   for (let i = 0; i < POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow - 1; i++) {
-    const r = recordEligibleOutcome(i % 5 === 0 ? "failed" : "success");
+    const r = recordCandidateOutcome(i % 5 === 0 ? "failed" : "success", i);
     expect(r.action).toBe("eligible_recorded");
   }
-  const entered = recordEligibleOutcome("success");
+  const entered = recordCandidateOutcome(
+    "success",
+    POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow - 1,
+  );
   expect(entered.action).toBe("entered_shadow");
   expect(entered.version?.stage).toBe("shadow");
 }
 
 function advanceToCanary(successRate = 0.9): void {
   advanceToShadow();
+  const candidate = getPolicyVersionStore().candidate;
+  if (!candidate) throw new Error("shadow candidate is not available");
   const n = POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow;
-  const outcomes = Array.from({ length: n }, (_, i) => ({
-    success: i / n < successRate,
+  const outcomes = replayOutcomes(candidate, n, "success");
+  const adjusted = outcomes.map((row, index) => ({
+    ...row,
+    outcome: index / n < successRate ? "success" : "failed",
   }));
-  const r = runShadowReplay(outcomes);
+  const r = runShadowReplay(adjusted);
   expect(r.action).toBe("entered_canary");
   expect(r.version?.stage).toBe("canary");
   expect(getPolicyVersionStore().canary?.id).toBe(r.version?.id);
@@ -97,6 +105,169 @@ function snapshotPool(): Record<string, Array<[string, unknown]>> {
     recoveryPolicy: [...state.recoveryPolicy.entries()],
   };
 }
+
+function policyEvidence(
+  candidate: NonNullable<ReturnType<typeof getPolicyVersionStore>["candidate"]>,
+  index: number,
+  source: PolicyEvidence["source"],
+  arm: PolicyEvidence["arm"],
+  outcome: PolicyEvidence["outcome"] = "success",
+): PolicyEvidence {
+  return {
+    evidenceId: `evidence-${index}`,
+    policyId: candidate.id,
+    policyVersion: candidate.version,
+    patch: candidate.patch,
+    source,
+    arm,
+    runId: `run-${index}`,
+    sessionId: `session-${index}`,
+    taskType: index % 2 === 0 ? "refactor" : "debug",
+    outcome,
+  };
+}
+
+function recordCandidateOutcome(
+  outcome: PolicyEvidence["outcome"],
+  index: number,
+): ReturnType<typeof recordEligibleOutcome> {
+  const candidate = getPolicyVersionStore().candidate;
+  if (!candidate) throw new Error("candidate is not available");
+  return recordEligibleOutcome(
+    outcome,
+    policyEvidence(candidate, index, "candidate_execution", "candidate", outcome),
+  );
+}
+
+function replayOutcomes(
+  candidate: NonNullable<ReturnType<typeof getPolicyVersionStore>["candidate"]>,
+  count: number,
+  outcome: PolicyEvidence["outcome"] = "success",
+  start = 10_000,
+): PolicyEvidence[] {
+  return Array.from({ length: count }, (_, index) =>
+    policyEvidence(candidate, start + index, "offline_replay", "offline_replay", outcome),
+  );
+}
+
+describe("qualification provenance", () => {
+  beforeEach(() => {
+    resetPolicyStagingForTests();
+    resetLearnedPoolStateForTests();
+  });
+
+  test("ignores forty production-arm terminals with mixed task types", () => {
+    const proposed = proposePolicy(routingPatch, "candidate provenance");
+    expect(proposed.action).toBe("proposed");
+    const candidate = getPolicyVersionStore().candidate;
+    if (!candidate) throw new Error("candidate was not proposed");
+    expect(recordEligibleOutcome("success").reason).toBe("evidence_required");
+
+    for (let i = 0; i < 40; i += 1) {
+      const outcome = i % 3 === 0 ? "failed" : "success";
+      const result = recordEligibleOutcome(
+        outcome,
+        policyEvidence(candidate, i, "live_turn", "production", outcome),
+      );
+      expect(result.action).toBe("none");
+    }
+
+    const current = getPolicyVersionStore().candidate;
+    expect(current?.stage).toBe("candidate");
+    expect(current?.eligibleOutcomes).toBe(0);
+
+    for (let i = 0; i < POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow; i += 1) {
+      recordCandidateOutcome("success", 1_000 + i);
+    }
+    const shadow = getPolicyVersionStore().candidate;
+    if (!shadow) throw new Error("candidate did not enter shadow");
+    for (let i = 0; i < 40; i += 1) {
+      const outcome = i % 3 === 0 ? "failed" : "success";
+      const result = recordEligibleOutcome(
+        outcome,
+        policyEvidence(shadow, 2_000 + i, "live_turn", "production", outcome),
+      );
+      expect(result.action).toBe("none");
+    }
+    expect(getPolicyVersionStore().candidate?.shadow?.replayed).toBe(0);
+  });
+
+  test("counts only matching candidate executions and offline replay receipts", () => {
+    expect(proposePolicy(routingPatch, "candidate provenance").action).toBe("proposed");
+    for (let i = 0; i < POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow; i += 1) {
+      const candidate = getPolicyVersionStore().candidate;
+      if (!candidate) throw new Error("candidate disappeared");
+      const result = recordEligibleOutcome(
+        "success",
+        policyEvidence(candidate, i, "candidate_execution", "candidate"),
+      );
+      expect(result.action).toBe(i === 19 ? "entered_shadow" : "eligible_recorded");
+    }
+
+    const candidate = getPolicyVersionStore().candidate;
+    if (!candidate) throw new Error("shadow candidate disappeared");
+    const replay = runShadowReplay(
+      Array.from({ length: POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow }, (_, i) =>
+        policyEvidence(candidate, 100 + i, "offline_replay", "offline_replay"),
+      ),
+    );
+    expect(replay.action).toBe("entered_canary");
+    expect(getPolicyVersionStore().canary?.stage).toBe("canary");
+  });
+
+  test("fails closed for duplicate, stale, wrong-arm, and mismatched evidence", () => {
+    expect(proposePolicy(routingPatch, "candidate provenance").action).toBe("proposed");
+    const candidate = getPolicyVersionStore().candidate;
+    if (!candidate) throw new Error("candidate was not proposed");
+    const valid = policyEvidence(candidate, 1, "candidate_execution", "candidate");
+    expect(recordEligibleOutcome("success", valid).action).toBe("eligible_recorded");
+    expect(recordEligibleOutcome("success", valid).reason).toBe("duplicate_evidence");
+
+    const stale = {
+      ...policyEvidence(candidate, 2, "candidate_execution", "candidate"),
+      policyVersion: candidate.version + 1,
+    };
+    expect(recordEligibleOutcome("success", stale).reason).toBe("stale_policy_version");
+    const wrongArm = {
+      ...policyEvidence(candidate, 3, "candidate_execution", "production"),
+    };
+    expect(recordEligibleOutcome("success", wrongArm).reason).toBe("wrong_policy_arm");
+    const patchMismatch = {
+      ...policyEvidence(candidate, 4, "candidate_execution", "candidate"),
+      patch: { ...candidate.patch, modelRoutingScoreDeltas: { changed: 0.2 } },
+    };
+    expect(recordEligibleOutcome("success", patchMismatch).reason).toBe("patch_mismatch");
+    const mismatched = {
+      ...policyEvidence(candidate, 5, "offline_replay", "offline_replay"),
+    };
+    expect(runShadowReplay([mismatched]).reason).toBe("replay_requires_shadow");
+  });
+
+  test("reports partial replay progress as recorded evidence", () => {
+    advanceToShadow();
+    const candidate = getPolicyVersionStore().candidate;
+    if (!candidate) throw new Error("shadow candidate is not available");
+    const result = runShadowReplay(replayOutcomes(candidate, 1, "success", 400));
+    expect(result.action).toBe("eligible_recorded");
+    expect(candidate.shadow?.replayed).toBe(1);
+  });
+
+  test("rejects a replay batch atomically when one receipt is stale", () => {
+    advanceToShadow();
+    const candidate = getPolicyVersionStore().candidate;
+    if (!candidate) throw new Error("shadow candidate is not available");
+    const beforeEvidence = [...(candidate.qualificationEvidence?.evidenceIds ?? [])];
+    const valid = policyEvidence(candidate, 300, "offline_replay", "offline_replay");
+    const stale = {
+      ...policyEvidence(candidate, 301, "offline_replay", "offline_replay"),
+      policyVersion: candidate.version + 1,
+    };
+    const result = runShadowReplay([valid, stale]);
+    expect(result.reason).toBe("stale_policy_version");
+    expect(candidate.shadow?.replayed).toBe(0);
+    expect(candidate.qualificationEvidence?.evidenceIds).toEqual(beforeEvidence);
+  });
+});
 
 describe("policy staging thresholds", () => {
   test("plan thresholds are pinned", () => {
@@ -144,9 +315,9 @@ describe("propose → eligible → shadow → canary → promote", () => {
 
   test("shadow replay rejects low quality and advances high quality to canary", () => {
     advanceToShadow();
-    const fail = runShadowReplay(
-      Array.from({ length: 20 }, () => ({ success: false })),
-    );
+    const candidate = getPolicyVersionStore().candidate;
+    if (!candidate) throw new Error("shadow candidate is not available");
+    const fail = runShadowReplay(replayOutcomes(candidate, 20, "failed"));
     expect(fail.action).toBe("rejected");
     expect(fail.reason).toBe("shadow_failed_quality_gate");
     expect(getPolicyVersionStore().candidate).toBeNull();
@@ -305,7 +476,7 @@ describe("restart survival", () => {
     // Start a new candidate mid-flight.
     const mid = proposePolicy(budgetPatch, "raise first-token budget");
     expect(mid.action).toBe("proposed");
-    for (let i = 0; i < 5; i++) recordEligibleOutcome("success");
+    for (let i = 0; i < 5; i++) recordCandidateOutcome("success", i);
 
     persistPolicyVersions(root);
     expect(existsSync(policyVersionsPath(root))).toBe(true);
@@ -314,6 +485,7 @@ describe("restart survival", () => {
     expect(onDisk.production.id).toBe(productionId);
     expect(onDisk.candidate.stage).toBe("candidate");
     expect(onDisk.candidate.eligibleOutcomes).toBe(5);
+    expect(onDisk.candidate.qualificationEvidence.runIds).toHaveLength(5);
     expect(onDisk.lastKnownGood.id).toBe(lkgId);
 
     // Simulate process restart: wipe memory, reload.
@@ -326,6 +498,7 @@ describe("restart survival", () => {
     const reloaded = getPolicyVersionStore();
     expect(reloaded.production?.id).toBe(productionId);
     expect(reloaded.candidate?.eligibleOutcomes).toBe(5);
+    expect(reloaded.candidate?.qualificationEvidence?.runIds).toHaveLength(5);
     expect(reloaded.candidate?.patch.domain).toBe("budget");
     expect(reloaded.lastKnownGood?.id).toBe(lkgId);
     // Production snapshot re-applied to pool maps.
@@ -341,11 +514,11 @@ describe("restart survival", () => {
     );
     expect(proposed.action).toBe("proposed");
     for (let i = 0; i < POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow; i++) {
-      recordEligibleOutcome("success");
+      recordCandidateOutcome("success", i);
     }
-    expect(runShadowReplay(Array.from({ length: 20 }, () => ({ success: true }))).action).toBe(
-      "entered_canary",
-    );
+    const shadowCandidate = getPolicyVersionStore().candidate;
+    if (!shadowCandidate) throw new Error("shadow candidate is not available");
+    expect(runShadowReplay(replayOutcomes(shadowCandidate, 20)).action).toBe("entered_canary");
     for (let i = 0; i < POLICY_STAGING_THRESHOLDS.minCanaryRunsBeforePromotion; i++) {
       recordCanaryOutcome("canary", true);
       recordCanaryOutcome("production", true);
@@ -537,8 +710,10 @@ describe("recovery + budget domains", () => {
       recovery: { prefer_fallback_on_timeout: true, max_recovery_attempts: 2 },
     };
     proposePolicy(patch, "safer recovery");
-    for (let i = 0; i < 20; i++) recordEligibleOutcome("success");
-    runShadowReplay(Array.from({ length: 20 }, () => ({ success: true })));
+    for (let i = 0; i < 20; i++) recordCandidateOutcome("success", i);
+    const candidate = getPolicyVersionStore().candidate;
+    if (!candidate) throw new Error("shadow candidate is not available");
+    runShadowReplay(replayOutcomes(candidate, 20));
     expect(getLearnedPoolState().recoveryPolicy.size).toBe(0);
     for (let i = 0; i < 20; i++) {
       recordCanaryOutcome("canary", true);
@@ -621,11 +796,14 @@ describe("merge apply + live shadow progress + canary overlay", () => {
     expect(getPolicyVersionStore().candidate?.stage).toBe("shadow");
 
     for (let i = 0; i < POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow - 1; i++) {
-      const r = recordEligibleOutcome("success");
+      const r = recordCandidateOutcome("success", 100 + i);
       expect(r.action).toBe("eligible_recorded");
       expect(r.reason).toContain("shadow_live_");
     }
-    const entered = recordEligibleOutcome("success");
+    const entered = recordCandidateOutcome(
+      "success",
+      100 + POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow - 1,
+    );
     expect(entered.action).toBe("entered_canary");
     expect(entered.version?.stage).toBe("canary");
     expect(getPolicyVersionStore().canary?.id).toBe(entered.version?.id);
@@ -635,9 +813,9 @@ describe("merge apply + live shadow progress + canary overlay", () => {
 
   test("live shadow rejects catastrophic success rate without offline job", () => {
     advanceToShadow();
-    let last = recordEligibleOutcome("failed");
+    let last = recordCandidateOutcome("failed", 200);
     for (let i = 1; i < POLICY_STAGING_THRESHOLDS.minEligibleOutcomesBeforeShadow; i++) {
-      last = recordEligibleOutcome("failed");
+      last = recordCandidateOutcome("failed", 200 + i);
     }
     expect(last.action).toBe("rejected");
     expect(last.reason).toBe("shadow_failed_quality_gate");
