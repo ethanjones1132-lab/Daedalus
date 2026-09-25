@@ -25,6 +25,9 @@ export interface McpRequestOptions {
 
 const DEFAULT_MCP_TIMEOUT_MS = 15_000;
 const MAX_MCP_ERROR_CHARS = 1_000;
+/** Extracted remote text in an in-band refusal is capped well below the envelope cap. */
+const MAX_MCP_REFUSAL_DETAIL_CHARS = 500;
+const MCP_REFUSAL_DETAIL_PLACEHOLDER = "the server reported a tool-level failure with no text";
 
 function boundedMcpText(value: string): string {
   if (value.length <= MAX_MCP_ERROR_CHARS) return value;
@@ -32,12 +35,90 @@ function boundedMcpText(value: string): string {
 }
 
 function mcpFailure(
-  code: "execution_error" | "spawn_error" | "protocol_error" | "cancelled" | "timeout",
+  code: "execution_error" | "spawn_error" | "protocol_error" | "mcp_refusal" | "cancelled" | "timeout",
   message: string,
   cause?: unknown,
 ): ToolExecutionError {
   const bounded = boundedMcpText(message);
   return new ToolExecutionError(code, bounded, bounded, cause);
+}
+
+/**
+ * Verdict for a decoded MCP result.
+ *
+ * The MCP spec lets a server answer `tools/call` and `resources/read` with a
+ * well-formed result that still reports a tool-level failure through
+ * `isError: true`. Transport-level success is therefore not execution
+ * success, and the flag has to be read before the result is presented as tool
+ * output.
+ */
+export type McpResultVerdict =
+  | { kind: "ok" }
+  | { kind: "refusal"; detail: string }
+  | { kind: "malformed_flag" };
+
+function collectTextBlocks(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const parts: string[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const text = (item as Record<string, unknown>).text;
+    if (typeof text === "string" && text.trim()) parts.push(text.trim());
+  }
+  return parts;
+}
+
+/**
+ * Pull the remote explanation out of a refusal without copying the server's
+ * raw payload: only text blocks and the bounded error/message fields are
+ * read, and the whole detail is capped.
+ */
+function boundedRefusalDetail(result: Record<string, unknown>): string {
+  const parts = [
+    ...collectTextBlocks(result.content),
+    ...collectTextBlocks(result.contents),
+  ];
+  for (const key of ["error", "message", "statusMessage"]) {
+    const value = result[key];
+    if (typeof value === "string" && value.trim()) {
+      parts.push(value.trim());
+      break;
+    }
+  }
+  const joined = parts.join("\n") || MCP_REFUSAL_DETAIL_PLACEHOLDER;
+  return joined.length <= MAX_MCP_REFUSAL_DETAIL_CHARS
+    ? joined
+    : `${joined.slice(0, MAX_MCP_REFUSAL_DETAIL_CHARS)}…`;
+}
+
+/**
+ * Classify a decoded MCP result. An absent or null flag claims nothing, so it
+ * stays `ok`; a non-boolean flag is a shape we cannot read and is reported as
+ * malformed rather than trusted as success or treated as a refusal.
+ */
+export function classifyMcpResult(result: unknown): McpResultVerdict {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return { kind: "ok" };
+  const flag = (result as Record<string, unknown>).isError;
+  if (flag === undefined || flag === null) return { kind: "ok" };
+  if (typeof flag !== "boolean") return { kind: "malformed_flag" };
+  if (!flag) return { kind: "ok" };
+  return { kind: "refusal", detail: boundedRefusalDetail(result as Record<string, unknown>) };
+}
+
+/**
+ * Settle an in-band refusal through the one typed error path so the Tool
+ * runtime records `is_error: true` with a stable code, naming the server and
+ * the requested tool/resource in a bounded reason. A transport failure is not
+ * a refusal: this runs only after a successful request/response round trip.
+ */
+function assertMcpResultAccepted(serverName: string, target: string, result: unknown): void {
+  const verdict = classifyMcpResult(result);
+  if (verdict.kind === "malformed_flag") {
+    throw mcpFailure("protocol_error", `MCP ${serverName} returned a malformed in-band error flag for ${target}`);
+  }
+  if (verdict.kind === "refusal") {
+    throw mcpFailure("mcp_refusal", `MCP ${serverName} refused ${target}: ${verdict.detail}`);
+  }
 }
 
 function mcpConfigPath(cfg: JarvisConfig): string {
@@ -408,6 +489,7 @@ export async function toolMcpCallTool(
       name: toolName,
       arguments: args.arguments && typeof args.arguments === "object" ? args.arguments : {},
     }, cfg, requestOptions(options));
+    assertMcpResultAccepted(serverName, `tool ${toolName}`, result);
     return JSON.stringify(result, null, 2);
   } catch (error) {
     return rethrowOrText(error, "MCP tool call failed", options.strict);
@@ -454,6 +536,7 @@ export async function toolMcpReadResource(
   }
   try {
     const result = await mcpRequest(serverName, server, "resources/read", { uri }, cfg, requestOptions(options));
+    assertMcpResultAccepted(serverName, `resource ${uri}`, result);
     return JSON.stringify(result, null, 2);
   } catch (error) {
     return rethrowOrText(error, "MCP resource read failed", options.strict);

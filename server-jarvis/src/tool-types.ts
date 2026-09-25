@@ -117,6 +117,7 @@ export type ToolErrorCode =
   | "execution_error"
   | "spawn_error"
   | "protocol_error"
+  | "mcp_refusal"
   | "cancelled"
   | "timeout"
   | "delegate_write_unverified"
