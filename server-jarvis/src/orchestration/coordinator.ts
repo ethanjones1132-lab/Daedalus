@@ -130,6 +130,7 @@ export interface CoordinatorRouteOptions {
   lastOutcome?: string;
   /** Inter-workflow shared memory injected into conductor routing turns. */
   sessionMemoryHints?: SharedContextHints;
+  signal?: AbortSignal;
 }
 
 interface CoordinatorState {
@@ -150,6 +151,15 @@ const VALID_TASK_TYPES = new Set<TaskType>(["code_review", "debug", "refactor", 
 const VALID_COMPLEXITIES = new Set<Complexity>(["low", "medium", "high"]);
 const VALID_STAGES = new Set<StageName>(["planner", "executor", "reviewer", "rewriter", "synthesizer"]);
 const VALID_TOPOLOGIES = new Set<Topology>(["linear", "speculative_parallel", "speculative_cascade", "recursive"]);
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  const message = typeof signal.reason === "string" ? signal.reason : "Turn aborted";
+  const error = new Error(message);
+  error.name = "AbortError";
+  throw error;
+}
 
 /**
  * Keep the API coordinator on the same retrieved-context contract as the local
@@ -212,6 +222,7 @@ export class Coordinator {
   ) {}
 
   async route(request: string, options: CoordinatorRouteOptions): Promise<CoordinatorResult> {
+    throwIfAborted(options.signal);
     const state = this.getState(options.sessionId);
     const raw = options.rawMessage ?? request;
     const continuation = isContinuationTurn(raw)
@@ -220,6 +231,7 @@ export class Coordinator {
       );
 
     if (isTrivialConversationalTurn(raw) && !continuation) {
+      throwIfAborted(options.signal);
       const decision = { ...this.conversationalRoute(), conductor_source: "trivial" as const };
       // Trivial turns are always low-complexity conductor_direct (single synth item).
       const planning = attachOwnedPlanning(raw, "low", { taskType: decision.task_type });
@@ -238,7 +250,9 @@ export class Coordinator {
       history: options.history,
       sessionMemoryHints: options.sessionMemoryHints,
       rawMessage: options.rawMessage,
+      signal: options.signal,
     });
+    throwIfAborted(options.signal);
 
     // Resilient routing: a coordinator model that returns empty/garbled output
     // (e.g. a reasoning model that spends its budget on <think> and emits no
@@ -289,6 +303,7 @@ export class Coordinator {
       decision.plan_brief = planning.plan_brief;
     }
 
+    throwIfAborted(options.signal);
     state.turns += 1;
     state.lastOutcome = options.lastOutcome ?? state.lastOutcome;
     state.lastDecision = decision;
@@ -331,12 +346,15 @@ export class Coordinator {
       sessionMemoryHints?: SharedContextHints;
       /** Raw user message for deterministic degradation classification. */
       rawMessage?: string;
+      signal?: AbortSignal;
     },
   ): Promise<{ content: string; source: "local" | "api" | "deterministic"; model?: string }> {
+    throwIfAborted(options.signal);
     const conductor = this.persistentConductor;
     if (conductor) {
       try {
         if (await conductor.isAvailable()) {
+          throwIfAborted(options.signal);
           const local = await conductor.routeTurn({
             sessionId: options.sessionId,
             request,
@@ -344,7 +362,9 @@ export class Coordinator {
             lastOutcome: options.lastOutcome,
             recentHistory: options.history,
             sessionMemoryHints: options.sessionMemoryHints,
+            signal: options.signal,
           });
+          throwIfAborted(options.signal);
           console.log(
             `[Coordinator] Local conductor routed turn ${options.turnNumber} for ${options.sessionId} ` +
             `via ${local.model} in ${local.latencyMs}ms`,
@@ -359,6 +379,7 @@ export class Coordinator {
           });
         }
       } catch (e) {
+        if (options.signal?.aborted) throwIfAborted(options.signal);
         const message = e instanceof Error ? e.message : String(e);
         // F2: cold-start / routing-timeout under GPU eviction must degrade to
         // the deterministic route (sub-ms, correct pipeline) — NOT the remote
@@ -407,8 +428,9 @@ export class Coordinator {
       .map((m) => `[${m.role.toUpperCase()}]: ${m.content.slice(0, 1200)}${m.content.length > 1200 ? "..." : ""}`)
       .join("\n");
 
+    throwIfAborted(options.signal);
     if (conductor) {
-      conductor.markApiFallback(options.sessionId);
+      conductor.markApiFallback(options.sessionId, options.signal);
     }
 
     const api = await this.callModel([
@@ -432,7 +454,9 @@ export class Coordinator {
       max_tokens: 4096,
       stageLabel: "coordinator",
       suppressActivity: true,
+      stageAbort: options.signal,
     });
+    throwIfAborted(options.signal);
     return {
       content: api.content,
       source: "api",

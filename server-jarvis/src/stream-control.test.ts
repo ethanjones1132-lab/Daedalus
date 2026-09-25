@@ -71,6 +71,17 @@ describe("ActiveStreamRegistry", () => {
     expect(registry.size).toBe(0);
   });
 
+  test("exposes whether a lease still owns the active generation", () => {
+    const registry = new ActiveStreamRegistry();
+    const first = registry.begin("session-generation");
+    const second = registry.begin("session-generation");
+
+    expect(first.isCurrent()).toBe(false);
+    expect(second.isCurrent()).toBe(true);
+
+    second.release();
+    expect(second.isCurrent()).toBe(false);
+  });
   test("repeated cancellation has one side effect and cleanup remains lease-owned", () => {
     const registry = new ActiveStreamRegistry();
     const lease = registry.begin("session-1");

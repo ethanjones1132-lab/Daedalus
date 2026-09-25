@@ -58,6 +58,7 @@ export interface ConductorRouteTurnInput {
   lastOutcome?: string;
   recentHistory?: ChatMessage[];
   sessionMemoryHints?: SharedContextHints;
+  signal?: AbortSignal;
 }
 
 export interface ConductorRouteTurnResult {
@@ -404,6 +405,15 @@ function errorText(error: unknown): string {
   return error instanceof Error ? `${error.name} ${error.message}` : String(error);
 }
 
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  const message = typeof signal.reason === "string" ? signal.reason : "Turn aborted";
+  const error = new Error(message);
+  error.name = "AbortError";
+  throw error;
+}
+
 function isAbortOrTimeoutError(error: unknown): boolean {
   const text = errorText(error);
   return /\bAbortError\b|\bTimeoutError\b|aborted|timed?\s*out|timeout|first-token timeout|stream idle timeout|visible-progress timeout/i.test(text);
@@ -611,6 +621,7 @@ export class PersistentConductor {
   }
 
   async routeTurn(input: ConductorRouteTurnInput): Promise<ConductorRouteTurnResult> {
+    throwIfAborted(input.signal);
     if (!this.config().enabled) {
       throw new PersistentConductorError("Persistent conductor is disabled");
     }
@@ -637,6 +648,7 @@ export class PersistentConductor {
         );
       }
     }
+    throwIfAborted(input.signal);
 
     const session = this.getSession(input.sessionId);
     const recentOutcomeHint = formatRecentOutcomeHint(
@@ -649,52 +661,57 @@ export class PersistentConductor {
     );
     const systemPrompt = loadPrompt("coordinator.md");
     const systemHash = hashText(systemPrompt);
+    const candidateMessages = session.messages.map((message) => ({ ...message }));
 
-    const hadSystem = session.messages.some((m) => m.role === "system");
+    const hadSystem = candidateMessages.some((m) => m.role === "system");
     const rebuiltPrefix = !hadSystem || session.apiFallbackUsed || session.systemPromptHash !== systemHash;
     if (rebuiltPrefix) {
-      const existingSystemIdx = session.messages.findIndex((m) => m.role === "system");
+      const existingSystemIdx = candidateMessages.findIndex((m) => m.role === "system");
       if (existingSystemIdx >= 0) {
-        session.messages[existingSystemIdx] = { role: "system", content: systemPrompt };
+        candidateMessages[existingSystemIdx] = { role: "system", content: systemPrompt };
       } else {
-        session.messages.unshift({ role: "system", content: systemPrompt });
+        candidateMessages.unshift({ role: "system", content: systemPrompt });
       }
-      session.systemPromptHash = systemHash;
-      session.apiFallbackUsed = false;
     }
 
-    const prefixTokensBefore = estimateMessageTokens(session.messages);
+    const prefixTokensBefore = estimateMessageTokens(candidateMessages);
     const cacheHit = hadSystem && !rebuiltPrefix && session.kvGeneration !== undefined && session.kvGeneration > 0
       && session.systemPromptHash === systemHash;
-
-    session.messages.push({ role: "user", content: userContent });
+    const nextKvGeneration = (session.kvGeneration ?? 0) + 1;
+    candidateMessages.push({ role: "user", content: userContent });
     const deltaTokens = estimateTokens(userContent);
-    session.kvGeneration = (session.kvGeneration ?? 0) + 1;
 
     const start = Date.now();
     let content: string;
     let ok = true;
     try {
       const routed = await this.withRuntimeFallback(target, (candidate) =>
-        this.callOllamaChat(candidate, session.messages));
+        this.callOllamaChat(candidate, candidateMessages, input.signal));
       target = routed.target;
       content = routed.value;
+      throwIfAborted(input.signal);
       this.lastWarmRenewedAt = Date.now();
       this.clearRuntimeFailure();
     } catch (e) {
       ok = false;
+      if (input.signal?.aborted) throwIfAborted(input.signal);
       this.recordRuntimeFailure(e);
-      session.messages.pop();
       throw e;
     }
     const latencyMs = Date.now() - start;
 
-    session.messages.push({ role: "assistant", content });
-    session.turns = input.turnNumber;
-    session.lastOutcome = input.lastOutcome;
-    session.lastActiveAt = Date.now();
-    session.lastModel = target.model;
-    session.cachedPrefixTokens = prefixTokensBefore;
+    candidateMessages.push({ role: "assistant", content });
+    const nextSession: ConductorSessionState = {
+      ...session,
+      messages: candidateMessages,
+      turns: input.turnNumber,
+      lastOutcome: input.lastOutcome,
+      lastActiveAt: Date.now(),
+      lastModel: target.model,
+      cachedPrefixTokens: prefixTokensBefore,
+      kvGeneration: nextKvGeneration,
+      ...(rebuiltPrefix ? { systemPromptHash: systemHash, apiFallbackUsed: false } : {}),
+    };
 
     const prefixRecomputed = cacheHit ? 0 : prefixTokensBefore;
     recordConductorCache({
@@ -708,12 +725,15 @@ export class PersistentConductor {
       prefix_tokens_estimated: prefixTokensBefore,
       delta_tokens_estimated: deltaTokens + estimateTokens(content),
       prefix_tokens_recomputed: prefixRecomputed,
-      kv_generation: session.kvGeneration,
+      kv_generation: nextKvGeneration,
     });
 
-    this.pruneSessionMessages(session);
-    this.persistSession(session);
-    this.touchSession(input.sessionId, session);
+    this.pruneSessionMessages(nextSession);
+    if (!input.signal?.aborted) {
+      Object.assign(session, nextSession);
+      this.persistSession(session);
+      this.touchSession(input.sessionId, session);
+    }
 
     return {
       content,
@@ -724,7 +744,7 @@ export class PersistentConductor {
       prefixTokensEstimated: prefixTokensBefore,
       deltaTokensEstimated: deltaTokens + estimateTokens(content),
       prefixTokensRecomputed: prefixRecomputed,
-      kvGeneration: session.kvGeneration,
+      kvGeneration: nextKvGeneration,
     };
   }
 
@@ -812,7 +832,8 @@ export class PersistentConductor {
   }
 
   /** Mark session after API coordinator fallback so next local turn rebuilds prefix. */
-  markApiFallback(sessionId: string): void {
+  markApiFallback(sessionId: string, signal?: AbortSignal): void {
+    throwIfAborted(signal);
     const session = this.sessions.get(sessionId);
     if (session) {
       session.apiFallbackUsed = true;
@@ -1096,11 +1117,16 @@ export class PersistentConductor {
       numPredict: number;
       timeoutMs: number;
       temperature?: number;
+      signal?: AbortSignal;
     },
   ): Promise<OllamaChatMessage> {
     const conductor = this.config();
     const ctrl = new AbortController();
     const timeout = this.timers.setTimeout(() => ctrl.abort(), options.timeoutMs);
+    const abortFromCaller = () => ctrl.abort(options.signal?.reason);
+    if (options.signal?.aborted) abortFromCaller();
+    else options.signal?.addEventListener("abort", abortFromCaller, { once: true });
+    const cleanupSignal = () => options.signal?.removeEventListener("abort", abortFromCaller);
 
     const body: Record<string, unknown> = {
       model: target.model,
@@ -1125,7 +1151,6 @@ export class PersistentConductor {
         body: JSON.stringify(body),
         signal: ctrl.signal,
       });
-      this.timers.clearTimeout(timeout);
 
       if (!res.ok) {
         const errBody = await res.text().catch(() => "");
@@ -1140,14 +1165,20 @@ export class PersistentConductor {
       if (!json.message) throw new PersistentConductorError("Ollama conductor returned no message");
       return json.message;
     } catch (e) {
-      this.timers.clearTimeout(timeout);
       if (isAbortOrTimeoutError(e)) throw e;
       if (e instanceof PersistentConductorError) throw e;
       throw new PersistentConductorError(e instanceof Error ? e.message : String(e));
+    } finally {
+      this.timers.clearTimeout(timeout);
+      cleanupSignal();
     }
   }
 
-  private async callOllamaChat(target: ResolvedConductorTarget, messages: ConductorMessage[]): Promise<string> {
+  private async callOllamaChat(
+    target: ResolvedConductorTarget,
+    messages: ConductorMessage[],
+    signal?: AbortSignal,
+  ): Promise<string> {
     // Route selection is deliberately schema-only. The conductor should emit
     // a compact decision, not author worker prompts or replay session memory;
     // those details are assembled by Jarvis-owned code after routing.
@@ -1155,6 +1186,7 @@ export class PersistentConductor {
       format: COORDINATOR_ROUTE_JSON_SCHEMA,
       numPredict: 320,
       timeoutMs: ROUTING_TIMEOUT_MS,
+      signal,
     });
     return extractConductorRoutingJson(message);
   }

@@ -26,6 +26,7 @@ export function classifyAbortReason(reason: unknown): CancelReason {
 
 export interface StreamLease {
   readonly controller: AbortController;
+  isCurrent(): boolean;
   release(): boolean;
 }
 
@@ -62,6 +63,7 @@ export class ActiveStreamRegistry {
 
     return {
       controller: entry.controller,
+      isCurrent: () => this.entries.get(sessionId)?.generation === entry.generation,
       release: () => {
         const current = this.entries.get(sessionId);
         if (current?.generation !== entry.generation) return false;

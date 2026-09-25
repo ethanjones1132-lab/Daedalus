@@ -75,12 +75,22 @@ function nextTick(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+async function waitFor(predicate: () => boolean, attempts = 30): Promise<void> {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (predicate()) return;
+    await nextTick();
+  }
+  throw new Error("Timed out waiting for test condition");
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (reason?: unknown) => void } {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((res) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
     resolve = res;
+    reject = rej;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function makeTimerHarness() {
@@ -682,6 +692,122 @@ describe("PersistentConductor", () => {
     })).rejects.toThrow(/aborted|Abort/i);
     expect(attemptedModels).toEqual(["gemma4:e2b"]);
   });
+  test("keeps a newer turn intact when an older turn fails after it starts", async () => {
+    const chatBodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    const firstResponse = deferred<Response>();
+    const secondResponse = deferred<Response>();
+    let chatCall = 0;
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/ps")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/chat")) {
+        chatBodies.push(JSON.parse(String(init?.body ?? "{}")));
+        return chatCall++ === 0 ? firstResponse.promise : secondResponse.promise;
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const conductor = new PersistentConductor(() => makeConfig({ persist_sessions: false }));
+    const firstAbort = new AbortController();
+    const first = conductor.routeTurn({
+      sessionId: "superseded-failure",
+      request: "first turn",
+      turnNumber: 1,
+      signal: firstAbort.signal,
+    });
+    await waitFor(() => chatBodies.length === 1);
+
+    const second = conductor.routeTurn({
+      sessionId: "superseded-failure",
+      request: "second turn",
+      turnNumber: 2,
+      signal: new AbortController().signal,
+    });
+    await waitFor(() => chatBodies.length === 2);
+    const secondUsers = chatBodies[1].messages.filter((message) => message.role === "user");
+    expect(secondUsers).toHaveLength(1);
+    expect(secondUsers[0].content).toContain("Current request:\nsecond turn");
+    expect(secondUsers[0].content).not.toContain("Current request:\nfirst turn");
+
+    firstAbort.abort("superseded");
+    firstResponse.reject(new Error("first turn failed"));
+    await expect(first).rejects.toThrow(/superseded/i);
+    secondResponse.resolve(Response.json({
+      message: {
+        role: "assistant",
+        content: JSON.stringify({
+          task_type: "general",
+          pipeline: ["synthesizer"],
+          topology: "linear",
+          context: { needs_workspace_inspection: false, needs_memory: true, estimated_complexity: "low" },
+          coordinator_rationale: "second",
+        }),
+      },
+    }));
+    await second;
+
+    const state = conductor.getSessionState("superseded-failure");
+    expect(state?.messages.filter((message) => message.role !== "system").map((message) => [message.role, message.content.includes("second turn")])).toEqual([
+      ["user", true],
+      ["assistant", false],
+    ]);
+  });
+
+  test("does not publish a late success from a superseded turn", async () => {
+    const chatBodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    const firstResponse = deferred<Response>();
+    const secondResponse = deferred<Response>();
+    let chatCall = 0;
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/ps")) return Response.json({ models: [{ name: "gemma4:e2b" }] });
+      if (url.endsWith("/api/chat")) {
+        chatBodies.push(JSON.parse(String(init?.body ?? "{}")));
+        return chatCall++ === 0 ? firstResponse.promise : secondResponse.promise;
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const conductor = new PersistentConductor(() => makeConfig({ persist_sessions: false }));
+    const firstAbort = new AbortController();
+    const first = conductor.routeTurn({
+      sessionId: "superseded-success",
+      request: "first turn",
+      turnNumber: 1,
+      signal: firstAbort.signal,
+    });
+    await waitFor(() => chatBodies.length === 1);
+    const second = conductor.routeTurn({
+      sessionId: "superseded-success",
+      request: "second turn",
+      turnNumber: 2,
+      signal: new AbortController().signal,
+    });
+    await waitFor(() => chatBodies.length === 2);
+    firstAbort.abort("superseded");
+
+    const routeContent = (rationale: string) => JSON.stringify({
+      task_type: "general",
+      pipeline: ["synthesizer"],
+      topology: "linear",
+      context: { needs_workspace_inspection: false, needs_memory: true, estimated_complexity: "low" },
+      coordinator_rationale: rationale,
+    });
+    secondResponse.resolve(Response.json({ message: { role: "assistant", content: routeContent("second") } }));
+    await second;
+    firstResponse.resolve(Response.json({ message: { role: "assistant", content: routeContent("first") } }));
+    await expect(first).rejects.toThrow(/superseded/i);
+
+    const state = conductor.getSessionState("superseded-success");
+    expect(state?.messages.filter((message) => message.role !== "system").map((message) => [message.role, message.content.includes("second turn")])).toEqual([
+      ["user", true],
+      ["assistant", false],
+    ]);
+    expect(state?.messages.some((message) => message.content.includes("first turn"))).toBe(false);
+  });
+
   test("accumulates session messages across turns for KV prefix reuse", async () => {
     const chatBodies: unknown[] = [];
     (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {

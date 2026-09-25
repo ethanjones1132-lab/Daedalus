@@ -29,6 +29,15 @@ import {
   type TurnRequirementResult,
 } from "./turn-requirements";
 
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  const message = typeof signal.reason === "string" ? signal.reason : "Turn aborted";
+  const error = new Error(message);
+  error.name = "AbortError";
+  throw error;
+}
+
 /**
  * Surviving plan state handed to route entry on a continuation turn.
  *
@@ -195,6 +204,7 @@ export interface ResolveCoordinatorRouteEntryInput extends CoordinatorRouteEntry
   activePlanItemId?: string;
   /** Surviving plan state when this turn continues a live task run. */
   continuationCarry?: ContinuationPlanCarry;
+  turnAbort?: AbortSignal;
 }
 
 export interface CoordinatorRouteEntryResult extends CoordinatorRouteEntryDecision {
@@ -240,6 +250,7 @@ export async function resolveCoordinatorRouteEntry(
   } else {
     route = await input.routeViaModel();
   }
+  throwIfAborted(input.turnAbort);
 
   const skippedCoordinatorModel = routeDecision.kind !== "model";
   const coordinatorDurationMs = skippedCoordinatorModel

@@ -10,6 +10,24 @@ import { defaultConfig } from "../config";
 
 const originalFetch = globalThis.fetch;
 
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (reason?: unknown) => void } {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+async function waitFor(predicate: () => boolean, attempts = 30): Promise<void> {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  throw new Error("Timed out waiting for test condition");
+}
+
 afterEach(() => {
   globalThis.fetch = originalFetch;
   __resetPersistentConductorCachesForTests();
@@ -111,6 +129,52 @@ describe("Coordinator", () => {
     expect(decision.routing_parse_fallback).toBe(true);
     expect(decision.conductor_model).toBe("deepseek-v4-pro");
     expect(decision.conductor_source).toBe("api");
+  });
+
+  test("does not commit a superseded coordinator decision or turn count", async () => {
+    const firstResponse = deferred<{ content: string }>();
+    const prompts: string[] = [];
+    let call = 0;
+    const coordinator = new Coordinator(async (messages) => {
+      prompts.push(messages[1]?.content ?? "");
+      if (call++ === 0) return firstResponse.promise;
+      return {
+        content: JSON.stringify({
+          task_type: "debug",
+          pipeline: ["executor", "synthesizer"],
+          topology: "linear",
+          context: { needs_workspace_inspection: true, needs_memory: true, estimated_complexity: "high" },
+          coordinator_rationale: "newer turn",
+        }),
+      };
+    });
+    const firstAbort = new AbortController();
+    const first = coordinator.route("fix the failing stream in src", {
+      sessionId: "coordinator-supersession",
+      rawMessage: "fix the failing stream in src",
+      signal: firstAbort.signal,
+    });
+    await waitFor(() => prompts.length === 1);
+    await coordinator.route("repair the newer stream in server", {
+      sessionId: "coordinator-supersession",
+      rawMessage: "repair the newer stream in server",
+    });
+    firstAbort.abort("superseded");
+    firstResponse.resolve({
+      content: JSON.stringify({
+        task_type: "docs",
+        pipeline: ["synthesizer"],
+        topology: "linear",
+        context: { needs_workspace_inspection: false, needs_memory: false, estimated_complexity: "low" },
+        coordinator_rationale: "stale turn",
+      }),
+    });
+    await expect(first).rejects.toThrow(/superseded/i);
+    await coordinator.route("inspect the current stream in server", {
+      sessionId: "coordinator-supersession",
+      rawMessage: "inspect the current stream in server",
+    });
+    expect(prompts[2]).toContain("Coordinator turn: 2");
   });
 
   test("reuses the prior executor route when continuation output is unparseable", async () => {

@@ -1314,14 +1314,22 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     : [];
   const workspaceReadScope = resolveWorkspaceReadScope(message, activeWorkspacePath);
   console.log(`[Jarvis] Active workspace session=${sessionId} path=${activeWorkspacePath}`);
-  let activeTaskRun = sessionMemory.beginTaskRun(sessionId, {
-    message,
-    requirement: initialResolvedRequirement.result.requirement,
-    workspacePath: activeWorkspacePath,
-    sessionGrants: turnSessionGrants,
-    depth: resolveDeepReadIntent(message, priorTaskRun?.depth) ? "deep" : "standard",
-    estimatedComplexity: resolveDeepReadIntent(message, priorTaskRun?.depth) ? "high" : "medium",
-  });
+  const streamLease = activeStreams.begin(sessionId);
+  const streamAbort = streamLease.controller;
+  let activeTaskRun: TaskRunContract;
+  try {
+    activeTaskRun = sessionMemory.beginTaskRun(sessionId, {
+      message,
+      requirement: initialResolvedRequirement.result.requirement,
+      workspacePath: activeWorkspacePath,
+      sessionGrants: turnSessionGrants,
+      depth: resolveDeepReadIntent(message, priorTaskRun?.depth) ? "deep" : "standard",
+      estimatedComplexity: resolveDeepReadIntent(message, priorTaskRun?.depth) ? "high" : "medium",
+    });
+  } catch (error) {
+    streamLease.release();
+    throw error;
+  }
   const { readable, writable } = new TransformStream();
   const rawWriter = writable.getWriter();
   const encoder = new TextEncoder();
@@ -1338,8 +1346,6 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     // One turn-wide domain is reserved for user Stop, client disconnect, and
     // supersession by a newer turn in the same Session. Model attempt timeouts
     // stay stage-local and must never abort this controller.
-    const streamLease = activeStreams.begin(sessionId);
-    const streamAbort = streamLease.controller;
     const cleanupExternalAbort = options.signal
       ? registerAbortHandler(options.signal, () => {
         if (!streamAbort.signal.aborted) streamAbort.abort(options.signal?.reason ?? "Cron execution cancelled");
@@ -1391,6 +1397,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       }
       throw new StreamCancelledError();
     };
+    const ownsSessionState = (): boolean => streamLease.isCurrent() && !streamAbort.signal.aborted;
     const stopHeartbeat = SSE_HEARTBEAT_ENABLED
       ? startSseHeartbeat(sessionId, SSE_HEARTBEAT_INTERVAL_MS, streamWrite)
       : () => {};
@@ -2937,16 +2944,20 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             : null,
           activePlanItemId: activePlanItem?.id,
           estimatedComplexity: activeTaskRun.estimatedComplexity,
+          turnAbort: streamAbort.signal,
           routeViaModel: () =>
             coordinator.route(contextMessage, {
-              sessionId,
-              rawMessage: message,
-              history: turnHistory,
-              lastOutcome: sessionMemory.getLastOutcome(sessionId),
-              sessionMemoryHints: memoryHints,
-            }),
-        });
-        let route = entryRoute;
+               sessionId,
+               rawMessage: message,
+               history: turnHistory,
+               lastOutcome: sessionMemory.getLastOutcome(sessionId),
+               sessionMemoryHints: memoryHints,
+               signal: streamAbort.signal,
+             }),
+         });
+         let route = entryRoute;
+         if (!streamLease.isCurrent() || streamAbort.signal.aborted) await emitCancelled();
+
 
         // T1.6: record parse_failure strike so next turn's pickFor / exclude
         // set demotes the pinned coordinator default after one strike.
@@ -3000,12 +3011,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           );
         }
         orchestratorTaskType = route.task_type;
-        const normalized = normalizeRoute(
-          route,
-          turnReq.requirement,
-          routeSource,
-        );
-        sessionMemory.updateTaskRun(sessionId, {
+         const normalized = normalizeRoute(
+           route,
+           turnReq.requirement,
+           routeSource,
+         );
+         if (!streamLease.isCurrent() || streamAbort.signal.aborted) await emitCancelled();
+         sessionMemory.updateTaskRun(sessionId, {
           estimatedComplexity: route.context.estimated_complexity,
         });
         // Owned-runtime-loop (Task 5): seed TaskPlan from intake planning.
@@ -3290,10 +3302,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 plan_brief: route.plan_brief,
               }
             : undefined,
-          onTaskPlanUpdate: (contract: TaskRunContract) => {
-            sessionMemory.setTaskRunContract(sessionId, contract);
-            liveConductor.setPlanContext(contract);
-          },
+           onTaskPlanUpdate: (contract: TaskRunContract) => {
+             if (!ownsSessionState()) return;
+             sessionMemory.setTaskRunContract(sessionId, contract);
+             liveConductor.setPlanContext(contract);
+           },
           workspaceReadScope,
           turnAbort: streamAbort.signal,
           workerInstructions: instructionSelection.instructions,
@@ -3365,9 +3378,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                   sessionId,
                   rawMessage: message,
                   history: turnHistory,
-                  lastOutcome: sessionMemory.getLastOutcome(sessionId),
-                  sessionMemoryHints: memoryHints,
-                },
+                   lastOutcome: sessionMemory.getLastOutcome(sessionId),
+                   sessionMemoryHints: memoryHints,
+                   signal: streamAbort.signal,
+                 },
                 executor,
                 agentRunId,
                 onStateChange: onOrchestratorStateChange,
@@ -3469,8 +3483,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const turnWriteTargets = successfulToolCalls
           .filter((call) => TURN_WRITE_TOOLS.has(call.name))
           .flatMap((call) => collectToolPathTargets(call.arguments));
-        if (turnWriteTargets.length > 0) {
-          sessionMemory.updateTaskRun(sessionId, {
+         if (ownsSessionState() && turnWriteTargets.length > 0) {
+           sessionMemory.updateTaskRun(sessionId, {
             lastWriteTargets: recordWriteTargets(
               sessionMemory.getTaskRun(sessionId) ?? activeTaskRun,
               turnWriteTargets,
@@ -3488,7 +3502,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // synthesizer prose must not mark multi-item plans completed while
         // items remain pending/blocked. Latest contract may have mid-turn
         // plan mutations via onTaskPlanUpdate.
-        const latestTaskRun = sessionMemory.getTaskRun(sessionId) ?? activeTaskRun;
+         const latestTaskRun = ownsSessionState()
+           ? sessionMemory.getTaskRun(sessionId) ?? activeTaskRun
+           : activeTaskRun;
         const reconciledStatus = reconcileTaskRunStatus({
           contract: latestTaskRun,
           turnAcceptanceStatus: taskAcceptance.status,
@@ -3531,12 +3547,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           decision.runOutcome,
           reward?.outcomeFloor,
         );
-        sessionMemory.updateTaskRun(sessionId, {
-          status: decision.taskStatus,
-          evidenceCount,
-          lastOutcome: verifiedRunOutcome,
-          lastTurnId: agentRunId,
-        });
+         if (ownsSessionState()) {
+           sessionMemory.updateTaskRun(sessionId, {
+             status: decision.taskStatus,
+             evidenceCount,
+             lastOutcome: verifiedRunOutcome,
+             lastTurnId: agentRunId,
+           });
+         }
         // Reward boundary: partial folds to degraded so reward math / conductor
         // learning stay on the historical 3-way vocabulary.
         const rewardOutcome: "success" | "degraded" | "failed" =
@@ -3585,13 +3603,15 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           breakdown: JSON.parse(serializeRunRewardBreakdown(runReward)),
         });
         const finalOutputForLog = trimmedAnswer || result.error || `(no output: ${result.error_code ?? "empty_completion"})`;
-        sessionMemory.recordPipelineOutcome(sessionId, {
-          outcome: rewardOutcome,
-          errorCode: result.error_code,
-          error: result.error,
-          answer: trimmedAnswer,
-          completion_reason: decision.reason,
-        });
+         if (ownsSessionState()) {
+           sessionMemory.recordPipelineOutcome(sessionId, {
+             outcome: rewardOutcome,
+             errorCode: result.error_code,
+             error: result.error,
+             answer: trimmedAnswer,
+             completion_reason: decision.reason,
+           });
+         }
         const terminalStatus = runFinalizer.finalize({
           finalOutput: finalOutputForLog,
           durationMs: duration,
