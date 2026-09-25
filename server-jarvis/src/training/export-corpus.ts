@@ -27,15 +27,22 @@
  * See ./corpus.ts for the JSONL schema and composite-reward formula.
  */
 
-import { writeFileSync, existsSync, readFileSync } from "fs";
+import { writeFileSync } from "fs";
 import { SelfTuningStore } from "../self-tuning/store";
 import {
   exportCorpus,
   DEFAULT_REWARD_WEIGHTS,
   DEFAULT_TOKEN_BUDGET,
   type RewardWeights,
-  type EvalResults,
 } from "./corpus";
+import {
+  CorpusSidecarError,
+  loadEvalSidecar,
+  loadReplanSidecar,
+  type DecodedEvalSidecar,
+  type DecodedReplanSidecar,
+  type SidecarCoverage,
+} from "./corpus-sidecars";
 
 interface CliArgs {
   out: string;
@@ -71,7 +78,7 @@ JSONL schema and reward formula: see ./corpus.ts header.
 `);
 }
 
-function parseArgs(): CliArgs {
+function parseArgs(argv: string[] = process.argv.slice(2)): CliArgs {
   const args: CliArgs = {
     out: "./training_corpus.jsonl",
     limit: 1000,
@@ -79,7 +86,7 @@ function parseArgs(): CliArgs {
     tokenBudget: DEFAULT_TOKEN_BUDGET,
     dryRun: false,
   };
-  for (const arg of process.argv.slice(2)) {
+  for (const arg of argv) {
     if (arg === "--help" || arg === "-h") {
       printUsage();
       process.exit(0);
@@ -133,64 +140,61 @@ function parseArgs(): CliArgs {
   return args;
 }
 
-function loadJsonMap(path: string, label: string): Record<string, unknown> {
-  if (!existsSync(path)) {
-    throw new Error(`${label} file not found: ${path}`);
-  }
-  let raw: string;
+function printSidecarCoverage(
+  label: string,
+  sidecar: DecodedEvalSidecar | DecodedReplanSidecar | undefined,
+  coverage: SidecarCoverage | null,
+): void {
+  if (!sidecar || !coverage) return;
+  const format = sidecar.format === "legacy"
+    ? "legacy bare map (versioned envelope preferred)"
+    : `versioned evaluator=${JSON.stringify(sidecar.metadata?.evaluator)} eval_suite=${JSON.stringify(sidecar.metadata?.evalSuite)} generated_at=${JSON.stringify(sidecar.metadata?.generatedAt)}`;
+  const truncated = coverage.truncated ? " truncated=true" : "";
+  console.log(
+    `${label} sidecar: ${format}; provided=${coverage.providedCount}, matched=${coverage.matchedCount}, unmatched=${coverage.unmatchedCount}, missing=${coverage.missingCount}; ` +
+      `provided_run_ids=${JSON.stringify(coverage.providedRunIds)} matched_run_ids=${JSON.stringify(coverage.matchedRunIds)} ` +
+      `unmatched_run_ids=${JSON.stringify(coverage.unmatchedRunIds)} missing_run_ids=${JSON.stringify(coverage.missingRunIds)}${truncated}`,
+  );
+}
+
+function loadEvalForExport(path: string): DecodedEvalSidecar {
   try {
-    raw = readFileSync(path, "utf-8");
-  } catch (e) {
-    throw new Error(`Failed to read ${label} from ${path}: ${(e as Error).message}`);
+    return loadEvalSidecar(path);
+  } catch (error) {
+    if (error instanceof CorpusSidecarError) {
+      throw new Error(`eval results sidecar: ${error.message}`);
+    }
+    throw error;
   }
-  let parsed: unknown;
+}
+
+function loadReplanForExport(path: string): DecodedReplanSidecar {
   try {
-    parsed = JSON.parse(raw);
-  } catch (e) {
-    throw new Error(`${label} is not valid JSON: ${(e as Error).message}`);
+    return loadReplanSidecar(path);
+  } catch (error) {
+    if (error instanceof CorpusSidecarError) {
+      throw new Error(`replan counts sidecar: ${error.message}`);
+    }
+    throw error;
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(`${label} must be a JSON object keyed by agent_run_id`);
-  }
-  return parsed as Record<string, unknown>;
 }
 
-function asEvalResults(map: Record<string, unknown>): EvalResults {
-  const out = new Map<string, boolean>();
-  for (const [k, v] of Object.entries(map)) {
-    if (typeof v === "boolean") out.set(k, v);
-  }
-  return out;
-}
-
-function asReplanCounts(map: Record<string, unknown>): ReadonlyMap<string, number> {
-  const out = new Map<string, number>();
-  for (const [k, v] of Object.entries(map)) {
-    if (typeof v === "number" && Number.isFinite(v) && v >= 0) out.set(k, Math.floor(v));
-  }
-  return out;
-}
-
-async function main(): Promise<void> {
-  const args = parseArgs();
-
-  const evalResults = args.evalResultsPath
-    ? asEvalResults(loadJsonMap(args.evalResultsPath, "eval results"))
-    : undefined;
-  const replanCounts = args.replanCountsPath
-    ? asReplanCounts(loadJsonMap(args.replanCountsPath, "replan counts"))
-    : undefined;
+export async function main(argv: string[] = process.argv.slice(2), store: SelfTuningStore = new SelfTuningStore()): Promise<void> {
+  const args = parseArgs(argv);
+  const evalSidecar = args.evalResultsPath ? loadEvalForExport(args.evalResultsPath) : undefined;
+  const replanSidecar = args.replanCountsPath ? loadReplanForExport(args.replanCountsPath) : undefined;
   const weights = args.weightsOverride ?? DEFAULT_REWARD_WEIGHTS;
 
-  const store = new SelfTuningStore();
-  const { rows, stats } = exportCorpus(store, args.limit, {
+  const { rows, stats, sidecarCoverage } = exportCorpus(store, args.limit, {
     rewardWeights: weights,
     tokenBudget: args.tokenBudget,
     minReward: args.minReward,
-    evalResults,
-    replanCounts,
+    evalResults: evalSidecar?.values,
+    replanCounts: replanSidecar?.values,
   });
 
+  printSidecarCoverage("eval", evalSidecar, sidecarCoverage.eval);
+  printSidecarCoverage("replan", replanSidecar, sidecarCoverage.replan);
   console.log(
     `Scanned ${stats.scanned} snapshot(s); kept ${stats.kept}, ` +
       `dropped (below min-reward ${args.minReward}): ${stats.droppedBelowThreshold}, ` +
@@ -210,7 +214,9 @@ async function main(): Promise<void> {
   console.log(`Wrote ${rows.length} row(s) to ${args.out}.`);
 }
 
-main().catch((e) => {
-  console.error("Fatal error:", e instanceof Error ? e.message : e);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((e) => {
+    console.error("Fatal error:", e instanceof Error ? e.message : e);
+    process.exit(1);
+  });
+}

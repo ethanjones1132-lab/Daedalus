@@ -57,6 +57,7 @@
  */
 
 import { SelfTuningStore, type TrajectorySnapshot, type AgentRun, type StageRun } from "../self-tuning/store";
+import { summarizeSidecarCoverage, type SidecarCoverage } from "./corpus-sidecars";
 
 /** Weights for each component of the composite reward. Sum does not need to
  *  be 1 — the final reward is normalized by the sum of supplied weights so
@@ -130,6 +131,10 @@ export interface ExportResult {
     kept: number;
     droppedBelowThreshold: number;
     droppedMalformed: number;
+  };
+  sidecarCoverage: {
+    eval: SidecarCoverage | null;
+    replan: SidecarCoverage | null;
   };
 }
 
@@ -337,6 +342,13 @@ export function exportCorpus(
   const rows: ExportedRow[] = [];
   let droppedBelowThreshold = 0;
   let droppedMalformed = 0;
+  const corpusRunIds = new Set<string>();
+  for (const snap of snapshots) {
+    const traj = parseSnapshot(snap);
+    if (traj && typeof traj.agent_run_id === "string" && traj.agent_run_id === snap.agent_run_id) {
+      corpusRunIds.add(traj.agent_run_id);
+    }
+  }
 
   for (const snap of snapshots) {
     const traj = parseSnapshot(snap);
@@ -372,6 +384,14 @@ export function exportCorpus(
       kept: rows.length,
       droppedBelowThreshold,
       droppedMalformed,
+    },
+    sidecarCoverage: {
+      eval: options.evalResults
+        ? summarizeSidecarCoverage(options.evalResults.keys(), corpusRunIds)
+        : null,
+      replan: options.replanCounts
+        ? summarizeSidecarCoverage(options.replanCounts.keys(), corpusRunIds)
+        : null,
     },
   };
 }

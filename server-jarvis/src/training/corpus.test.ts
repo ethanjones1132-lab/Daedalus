@@ -458,6 +458,58 @@ describe("D-01 exportCorpus — quality filtering", () => {
     expect(rows[0].replan_count).toBe(2);
   });
 
+  test("reports sidecar coverage while keeping missing eval evidence neutral", () => {
+    store.insertAgentRun(makeAgentRun());
+    store.insertTrajectorySnapshot(makeSnapshot());
+
+    const evalResults: EvalResults = new Map([["run_unmatched", true]]);
+    const { rows, sidecarCoverage } = exportCorpus(store, 100, { evalResults });
+
+    expect(rows[0].reward_components.eval).toBe(0.5);
+    expect(sidecarCoverage.eval).toEqual({
+      providedRunIds: ["run_unmatched"],
+      matchedRunIds: [],
+      unmatchedRunIds: ["run_unmatched"],
+      missingRunIds: ["run_test_1"],
+      providedCount: 1,
+      matchedCount: 0,
+      unmatchedCount: 1,
+      missingCount: 1,
+      truncated: false,
+    });
+  });
+
+  test("reports replan sidecar coverage for supplied and missing runs", () => {
+    store.insertAgentRun(makeAgentRun());
+    store.insertTrajectorySnapshot(makeSnapshot());
+
+    const replanCounts = new Map([["run_unmatched", 3]]);
+    const { rows, sidecarCoverage } = exportCorpus(store, 100, { replanCounts });
+
+    expect(rows[0].replan_count).toBe(0);
+    expect(sidecarCoverage.replan).toEqual({
+      providedRunIds: ["run_unmatched"],
+      matchedRunIds: [],
+      unmatchedRunIds: ["run_unmatched"],
+      missingRunIds: ["run_test_1"],
+      providedCount: 1,
+      matchedCount: 0,
+      unmatchedCount: 1,
+      missingCount: 1,
+      truncated: false,
+    });
+  });
+
+  test("does not report sidecar coverage when no sidecar is supplied", () => {
+    store.insertAgentRun(makeAgentRun());
+    store.insertTrajectorySnapshot(makeSnapshot());
+
+    const { rows, sidecarCoverage } = exportCorpus(store, 100);
+
+    expect(rows[0].reward_components.eval).toBe(0.5);
+    expect(sidecarCoverage).toEqual({ eval: null, replan: null });
+  });
+
   test("uses canonical same-run model attributions after a snapshot was retro-repaired", () => {
     store.insertAgentRun(makeAgentRun());
     store.insertTrajectorySnapshot(makeSnapshot());
