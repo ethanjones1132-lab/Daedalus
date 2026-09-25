@@ -90,6 +90,9 @@ export function decideCompletion(input: CompletionDecisionInput): CompletionDeci
     return { taskStatus: "paused", runOutcome: "partial", reason: "pipeline_partial" };
   }
   if (input.pipelineOutcome === "degraded") {
+    if (requiresVerification(input) && input.checkResult?.passed === false) {
+      return { taskStatus: "paused", runOutcome: "partial", reason: "verification_failed" };
+    }
     return { taskStatus: "paused", runOutcome: "degraded", reason: "pipeline_degraded" };
   }
   if (input.reconciledStatus !== "completed") {

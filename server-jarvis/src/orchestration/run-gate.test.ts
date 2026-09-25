@@ -149,6 +149,35 @@ describe("run gate execution", () => {
       const result = await runWrittenCodeGate([writeCall("app.py")], "update app.py", "", { root });
       expect(result.status).toBe("passed");
       expect(result.target).toBe(join(root, "test_app.py"));
+      expect(result.targetReason).toBe("adjacent_test");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves explicit test provenance through execution", async () => {
+    const root = tempRoot();
+    try {
+      writeFileSync(join(root, "named_test.py"), "print('run gate passed')\n");
+      const result = await runWrittenCodeGate([], "run named_test.py", "", { root });
+      expect(result.status).toBe("passed");
+      expect(result.targetReason).toBe("explicit_test");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves standalone script provenance through execution", async () => {
+    const root = tempRoot();
+    try {
+      writeFileSync(
+        join(root, "script.py"),
+        "if __name__ == '__main__':\n    print('run gate passed')\n",
+      );
+      const result = await runWrittenCodeGate([writeCall("script.py")], "update script.py", "", { root });
+      expect(result.status).toBe("passed");
+      expect(result.targetReason).toBe("standalone_script");
+      expect(result.reason).toBeUndefined();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -160,6 +189,7 @@ describe("run gate execution", () => {
       writeFileSync(join(root, "test_app.py"), "raise RuntimeError('broken')\n");
       const result = await runWrittenCodeGate([writeCall("app.py")], "update app.py", "", { root });
       expect(result.status).toBe("failed");
+      expect(result.targetReason).toBe("adjacent_test");
       expect(result.issues[0]?.path).toBe(join(root, "test_app.py"));
       expect(result.issues[0]?.error).toContain("RuntimeError");
     } finally {

@@ -6,6 +6,7 @@ import {
   mergeToCheckResult,
   runVerificationCheck,
 } from "./check-runner";
+import { decideCompletion } from "./completion-policy";
 import type { CheckResult } from "./check-runner";
 import type { RunGateResult } from "./run-gate";
 import type { ToolCallRecord } from "./stage-output";
@@ -26,16 +27,99 @@ describe("mergeToCheckResult (build tri-state)", () => {
   const skipped: RunGateResult = { status: "skipped", reason: "no test", issues: [] };
 
   test("passing run gate becomes a passed CheckResult at its tier", () => {
-    const run: RunGateResult = { status: "passed", target: "sol/_t.py", reason: "adjacent_test", issues: [] };
+    const run: RunGateResult = { status: "passed", target: "sol/_t.py", targetReason: "adjacent_test", issues: [] };
     const result = mergeToCheckResult({ run, build: { kind: "not_applicable", reason: "x" }, hadWrittenCode: true });
     expect(result).toMatchObject({ tier: "existing", ran: true, passed: true });
   });
 
+  test("keeps a standalone script pass in the reviewer-gated synth tier", () => {
+    const run: RunGateResult = {
+      status: "passed",
+      target: "sol/script.py",
+      targetReason: "standalone_script",
+      issues: [],
+    };
+    const result = mergeToCheckResult({
+      run,
+      build: { kind: "not_applicable", reason: "x" },
+      hadWrittenCode: true,
+    });
+    expect(result).toMatchObject({ tier: "synth", ran: true, passed: true });
+  });
+
+  test("fails closed to synth when an executed run has no target provenance", () => {
+    const run: RunGateResult = { status: "passed", target: "sol/script.py", issues: [] };
+    const result = mergeToCheckResult({
+      run,
+      build: { kind: "not_applicable", reason: "x" },
+      hadWrittenCode: true,
+    });
+    expect(result).toMatchObject({ tier: "synth", ran: true, passed: true });
+  });
+
   test("failing run gate carries the failure detail", () => {
-    const run: RunGateResult = { status: "failed", target: "sol.py", issues: [{ path: "sol.py", error: "AssertionError: 3 != 4" }] };
+    const run: RunGateResult = {
+      status: "failed",
+      target: "sol.py",
+      targetReason: "adjacent_test",
+      issues: [{ path: "sol.py", error: "AssertionError: 3 != 4" }],
+    };
     const result = mergeToCheckResult({ run, build: { kind: "not_applicable", reason: "x" }, hadWrittenCode: true });
     expect(result).toMatchObject({ tier: "existing", ran: true, passed: false });
     expect(result.detail).toContain("AssertionError");
+  });
+
+  test("a failed build dominates a passing test", () => {
+    const run: RunGateResult = {
+      status: "passed",
+      target: "sol/test_app.py",
+      targetReason: "adjacent_test",
+      issues: [],
+    };
+    const build: CheckOutcome = {
+      kind: "failed",
+      command: "cargo check --quiet",
+      detail: "compiler error",
+    };
+    const result = mergeToCheckResult({ run, build, hadWrittenCode: true });
+    expect(result).toMatchObject({
+      tier: "builtin",
+      ran: true,
+      passed: false,
+      command: "cargo check --quiet",
+      detail: "compiler error",
+    });
+  });
+
+  test("a failed test remains a failure when the build passes", () => {
+    const run: RunGateResult = {
+      status: "failed",
+      target: "sol/test_app.py",
+      targetReason: "explicit_test",
+      issues: [{ path: "sol/test_app.py", error: "assertion failed" }],
+    };
+    const result = mergeToCheckResult({
+      run,
+      build: { kind: "clean", command: "cargo check --quiet" },
+      hadWrittenCode: true,
+    });
+    expect(result).toMatchObject({ tier: "existing", ran: true, passed: false });
+    expect(result.detail).toContain("assertion failed");
+  });
+
+  test("a passing test and passing build remain a passed existing check", () => {
+    const run: RunGateResult = {
+      status: "passed",
+      target: "sol/test_app.py",
+      targetReason: "adjacent_test",
+      issues: [],
+    };
+    const result = mergeToCheckResult({
+      run,
+      build: { kind: "clean", command: "cargo check --quiet" },
+      hadWrittenCode: true,
+    });
+    expect(result).toMatchObject({ tier: "existing", ran: true, passed: true });
   });
 
   test("no runnable test, build clean → builtin passed", () => {
@@ -100,6 +184,38 @@ describe("runVerificationCheck (build)", () => {
       runTests: async () => ({ status: "skipped", reason: "no test", issues: [] }),
     });
     expect(r).toMatchObject({ tier: "builtin", ran: true, passed: true });
+  });
+
+  test("a passing test with a failed build cannot become a successful turn", async () => {
+    const result = await runVerificationCheck({
+      toolCalls: [write],
+      request: "fix a.cpp",
+      plan: "",
+      workspaceRoot: "/ws",
+      timeoutMs: 1000,
+      runBuild: async () => ({ kind: "failed", command: "cargo check", detail: "build failed" }),
+      runTests: async () => ({
+        status: "passed",
+        target: "tests/a_test.py",
+        targetReason: "adjacent_test",
+        issues: [],
+      }),
+    });
+    const gated = applyCheckHonestyGate("success", undefined, result);
+    const decision = decideCompletion({
+      pipelineOutcome: gated.outcome,
+      reconciledStatus: "completed",
+      writeIntent: true,
+      repeated: false,
+      checkResult: result,
+    });
+    expect(result).toMatchObject({ tier: "builtin", ran: true, passed: false });
+    expect(gated.outcome).toBe("degraded");
+    expect(decision).toEqual({
+      taskStatus: "paused",
+      runOutcome: "partial",
+      reason: "verification_failed",
+    });
   });
 
   test("no build system → honest none", async () => {

@@ -68,10 +68,9 @@ export function classifyRunGateTier(reason: RunTarget["reason"]): CheckTier {
 
 /**
  * Merge the outputs of the existing run-gate and build-check into a single
- * tiered CheckResult. Priority: a run-gate that actually RAN (passed/failed)
- * wins its tier; otherwise the build-check is the builtin static check; if
- * nothing real ran (build-check returned `not_applicable`) the result is `none`.
- * `not_applicable` is the vacuous-green guard — it maps to an honest `none`.
+ * tiered CheckResult. A failed build dominates every test result; otherwise
+ * a run-gate that actually ran keeps its target tier, and a clean build is the
+ * builtin fallback. `not_applicable` maps to an honest `none`.
  */
 export function mergeToCheckResult(input: {
   run: RunGateResult;
@@ -91,10 +90,20 @@ export function mergeToCheckResult(input: {
       declinedReason: "no_code_written",
     };
   }
+  if (input.build.kind === "failed") {
+    return {
+      tier: "builtin",
+      ran: true,
+      passed: false,
+      detail: input.build.detail,
+      command: input.build.command,
+      durationMs,
+    };
+  }
   if (input.run.status === "passed" || input.run.status === "failed") {
-    const tier = input.run.reason
-      ? classifyRunGateTier(input.run.reason as RunTarget["reason"])
-      : "existing";
+    const tier = input.run.targetReason
+      ? classifyRunGateTier(input.run.targetReason)
+      : "synth";
     const passed = input.run.status === "passed";
     return {
       tier,
@@ -109,8 +118,6 @@ export function mergeToCheckResult(input: {
   switch (input.build.kind) {
     case "clean":
       return { tier: "builtin", ran: true, passed: true, detail: "", command: input.build.command, durationMs };
-    case "failed":
-      return { tier: "builtin", ran: true, passed: false, detail: input.build.detail, command: input.build.command, durationMs };
     case "not_applicable":
       return {
         tier: "none",

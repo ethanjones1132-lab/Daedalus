@@ -24,6 +24,7 @@ export interface RunTarget {
 export interface RunGateResult {
   status: "passed" | "failed" | "skipped";
   target?: string;
+  targetReason?: RunTarget["reason"];
   reason?: string;
   issues: RunGateIssue[];
 }
@@ -205,11 +206,13 @@ export async function runPythonTarget(
   root: string,
   timeoutMs = 10_000,
 ): Promise<RunGateResult> {
-  let result = await runPythonCommand("python", target, root, timeoutMs);
-  if (result.unavailable) {
-    result = await runPythonCommand("py", target, root, timeoutMs);
+  const programs = process.platform === "win32" ? ["python", "py"] : ["python3", "python", "py"];
+  let result: PythonCommandResult | undefined;
+  for (const program of programs) {
+    result = await runPythonCommand(program, target, root, timeoutMs);
+    if (!result.unavailable) break;
   }
-  if (result.unavailable) {
+  if (!result || result.unavailable) {
     return { status: "skipped", target, reason: "Python interpreter unavailable", issues: [] };
   }
   if (result.exitCode === 0) {
@@ -237,11 +240,8 @@ export async function runWrittenCodeGate(
   if (!target) {
     return { status: "skipped", reason: "no runnable Python target was identified", issues: [] };
   }
-  // Deliberately does NOT attach `target.reason` to a passed/failed result:
-  // mergeToCheckResult reads `reason` to pick the tier, so surfacing it here
-  // would silently reclassify standalone_script runs from `existing` to
-  // `synth` and change reward credit. Preserving the established behaviour.
-  return runPythonTarget(target.path, options.root, options.timeoutMs ?? 10_000);
+  const result = await runPythonTarget(target.path, options.root, options.timeoutMs ?? 10_000);
+  return { ...result, targetReason: target.reason };
 }
 
 export function renderRunIssues(result: Pick<RunGateResult, "issues">): string {

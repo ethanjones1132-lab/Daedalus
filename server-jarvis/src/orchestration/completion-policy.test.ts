@@ -222,6 +222,16 @@ describe("decideCompletion", () => {
     })).toEqual({ taskStatus: "paused", runOutcome: "degraded", reason: "pipeline_degraded" });
   });
 
+  test("failed verification is reported before generic pipeline degradation", () => {
+    expect(decideCompletion({
+      pipelineOutcome: "degraded",
+      reconciledStatus: "completed",
+      writeIntent: true,
+      repeated: false,
+      checkResult: failedCheck,
+    })).toEqual({ taskStatus: "paused", runOutcome: "partial", reason: "verification_failed" });
+  });
+
   test("pipeline_failed when pipelineOutcome is failed", () => {
     expect(decideCompletion({
       pipelineOutcome: "failed",
