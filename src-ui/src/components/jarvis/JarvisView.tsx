@@ -339,7 +339,7 @@ export default function JarvisView({ initialSubView = 'chat', initialControlTab,
               className="sticky top-0 z-20 shrink-0 mb-3 -mx-1 px-1 pb-2 bg-void/95 backdrop-blur-md border-b border-white/[0.04]"
             >
             {/* System status bar — compact at-a-glance health */}
-            <SystemStatusBar />
+            <SystemStatusBar activeBackend={config?.active_backend ?? null} />
             {/* Sub-navigation tabs — ARIA tablist + tab semantics (Phase 4) */}
       <div
         role="tablist"

@@ -5,14 +5,59 @@ import {
   deriveSystemTelemetryView,
   initialSystemTelemetryState,
   reduceSystemTelemetryState,
+  summarizeVerdict,
   type HealthData,
+  type ServiceRequirement,
+  type ServiceState,
+  type TelemetryServiceKey,
+  SERVICE_NAMES,
 } from './system-telemetry-state';
 
 const BUN_URL = 'http://127.0.0.1:19877';
 
-function serviceLabel(label: string, state: 'up' | 'down' | 'unknown', stale: boolean): string {
+const CHIP_LABELS: Record<TelemetryServiceKey, string> = {
+  bun: 'BUN',
+  bridge: 'BRG',
+  ollama: 'OLL',
+  proxy: 'PRX',
+};
+
+// Severity is unchanged from before: the always-required Bun server and bridge
+// read red, the backend-dependent pair read amber. A service outside the active
+// backend's required set is deliberately neutral, so colour keeps meaning
+// "this matters for the backend you are running".
+const DOWN_CHIP_CLASS: Record<TelemetryServiceKey, string> = {
+  bun: 'bg-red-500/15 text-red-300',
+  bridge: 'bg-red-500/15 text-red-300',
+  ollama: 'bg-amber-500/15 text-amber-300',
+  proxy: 'bg-amber-500/15 text-amber-300',
+};
+
+const STATE_WORDS: Record<ServiceState, string> = {
+  up: 'is up',
+  down: 'is not running',
+  unknown: 'state is unknown',
+};
+
+const REQUIREMENT_WORDS: Record<ServiceRequirement, string> = {
+  required: ' and required by the active inference backend',
+  not_required: ' and not required by the active inference backend',
+  unknown: ' and whether it is required is unknown because the active inference backend is not confirmed',
+};
+
+const REQUIREMENT_MARKS: Record<ServiceRequirement, string> = {
+  required: '',
+  not_required: ' · NR',
+  unknown: ' · REQ?',
+};
+
+function serviceLabel(label: string, state: ServiceState, stale: boolean): string {
   const suffix = state === 'up' ? 'UP' : state === 'down' ? 'DOWN' : '?';
   return `${label} ${suffix}${stale ? ' (stale)' : ''}`;
+}
+
+function serviceAnnouncement(key: TelemetryServiceKey, state: ServiceState, stale: boolean, requirement: ServiceRequirement): string {
+  return `${SERVICE_NAMES[key]} ${STATE_WORDS[state]}${REQUIREMENT_WORDS[requirement]}.${stale ? ' This is a previously observed state.' : ''}`;
 }
 
 function percentLabel(label: string, value: number | null, stale: boolean): string {
@@ -31,10 +76,32 @@ function inferenceLabel(view: ReturnType<typeof deriveSystemTelemetryView>): str
   return `INF OK${suffix}`;
 }
 
-export default function SystemStatusBar() {
+interface SystemStatusBarProps {
+  /** The persisted `active_backend`, so a service can be judged required or not. */
+  activeBackend?: string | null;
+}
+
+export default function SystemStatusBar({ activeBackend = null }: SystemStatusBarProps) {
   const [state, dispatch] = useReducer(reduceSystemTelemetryState, undefined, initialSystemTelemetryState);
   const healthRequestId = useRef(0);
   const inferenceRequestId = useRef(0);
+  const verdictRef = useRef<HTMLSpanElement | null>(null);
+  // A focused Retry disappears the moment its read recovers. Without this the
+  // browser strands focus on the document body, so recovery is tracked and the
+  // verdict region — which always survives — takes the focus instead. The flag
+  // is held until the alert is actually gone and the region is mounted, so
+  // focus never jumps away from a Retry that is still on screen.
+  const focusAfterRetry = useRef(false);
+  const healthError = state.health.error;
+  const inferenceError = state.inference.error;
+
+  useEffect(() => {
+    if (!focusAfterRetry.current || healthError || inferenceError) return;
+    const node = verdictRef.current;
+    if (!node) return;
+    focusAfterRetry.current = false;
+    node.focus();
+  });
 
   const fetchHealth = useCallback(async () => {
     const id = ++healthRequestId.current;
@@ -70,19 +137,24 @@ export default function SystemStatusBar() {
     return () => clearInterval(interval);
   }, [fetchTelemetry]);
 
-  const view = deriveSystemTelemetryView(state);
-  const overallLabel = {
-    pending: 'SYS PENDING',
-    unavailable: 'SYS UNAVAILABLE',
-    stale: 'SYS STALE',
-    healthy: 'SYS HEALTHY',
-    degraded: 'SYS DEGRADED',
-    stopped: 'SYS STOPPED',
-  }[view.overall];
+  const view = deriveSystemTelemetryView(state, activeBackend);
   const healthStale = view.health.stale;
   const inferenceStale = view.inference.stale;
   const inferenceStatus = view.inference.status;
   const refreshing = state.health.error || state.inference.error || state.health.data !== null || state.inference.data !== null;
+  const verdict = summarizeVerdict(view);
+  const chipClass = (key: TelemetryServiceKey) => {
+    const serviceState = view.health.services[key];
+    const requirement = view.health.requirements[key];
+    if (requirement === 'not_required') return 'bg-white/[0.05] text-bone/50';
+    if (serviceState === 'up') return 'bg-emerald-500/15 text-emerald-300';
+    if (serviceState === 'down') return DOWN_CHIP_CLASS[key];
+    return 'bg-amber-500/15 text-amber-300';
+  };
+  const retry = (reader: () => void) => () => {
+    focusAfterRetry.current = true;
+    reader();
+  };
 
   return (
     <div className="border-b border-white/[0.03]">
@@ -99,19 +171,12 @@ export default function SystemStatusBar() {
           variant={view.overall === 'stopped' ? 'error' : 'default'}
           size="sm"
         />
-        <span className="text-bone/60">{overallLabel}</span>
-        <span className={cn('px-1.5 py-0.5 rounded', view.health.services.bun === 'up' ? 'bg-emerald-500/15 text-emerald-300' : view.health.services.bun === 'down' ? 'bg-red-500/15 text-red-300' : 'bg-amber-500/15 text-amber-300')}>
-          {serviceLabel('BUN', view.health.services.bun, healthStale)}
-        </span>
-        <span className={cn('px-1.5 py-0.5 rounded', view.health.services.bridge === 'up' ? 'bg-emerald-500/15 text-emerald-300' : view.health.services.bridge === 'down' ? 'bg-red-500/15 text-red-300' : 'bg-amber-500/15 text-amber-300')}>
-          {serviceLabel('BRG', view.health.services.bridge, healthStale)}
-        </span>
-        <span className={cn('px-1.5 py-0.5 rounded', view.health.services.ollama === 'up' ? 'bg-emerald-500/15 text-emerald-300' : view.health.services.ollama === 'down' ? 'bg-amber-500/15 text-amber-300' : 'bg-amber-500/15 text-amber-300')}>
-          {serviceLabel('OLL', view.health.services.ollama, healthStale)}
-        </span>
-        <span className={cn('px-1.5 py-0.5 rounded', view.health.services.proxy === 'up' ? 'bg-emerald-500/15 text-emerald-300' : view.health.services.proxy === 'down' ? 'bg-amber-500/15 text-amber-300' : 'bg-amber-500/15 text-amber-300')}>
-          {serviceLabel('PRX', view.health.services.proxy, healthStale)}
-        </span>
+        <span className="text-bone/60">{overallLabel(view.overall)}</span>
+        {(Object.keys(CHIP_LABELS) as TelemetryServiceKey[]).map(key => (
+          <span key={key} className={cn('px-1.5 py-0.5 rounded', chipClass(key))} aria-label={serviceAnnouncement(key, view.health.services[key], healthStale, view.health.requirements[key])}>
+            {serviceLabel(CHIP_LABELS[key], view.health.services[key], healthStale)}{REQUIREMENT_MARKS[view.health.requirements[key]]}
+          </span>
+        ))}
         <span className={cn('px-1.5 py-0.5 rounded', view.health.memoryPercent === null ? 'bg-amber-500/15 text-amber-300' : view.health.memoryPercent >= 90 ? 'bg-red-500/15 text-red-300' : view.health.memoryPercent >= 80 ? 'bg-amber-500/15 text-amber-300' : 'bg-emerald-500/15 text-emerald-300')}>
           {percentLabel('MEM', view.health.memoryPercent, healthStale)}
         </span>
@@ -144,18 +209,40 @@ export default function SystemStatusBar() {
           ↻
         </button>
       </div>
+      {view.health.status !== 'pending' && view.health.status !== 'unknown' && (
+        <span
+          ref={verdictRef}
+          role="status"
+          aria-label="System telemetry verdict"
+          tabIndex={-1}
+          className="block px-1 py-1 text-[10px] text-bone/50 focus:outline-none focus-visible:outline-none"
+        >
+          {verdict}
+        </span>
+      )}
       {view.health.error && (
         <div role="alert" aria-label="System health observation" className="flex items-center gap-2 px-1 py-1 text-[10px] text-amber-200">
           <span>{healthStale ? 'Showing previously observed system health; it may be stale.' : 'System health is unavailable.'}</span>
-          <button type="button" aria-label="Retry system health" onClick={() => { void fetchHealth(); }} disabled={view.loading} className="underline disabled:opacity-40">Retry</button>
+          <button type="button" aria-label="Retry system health" onClick={retry(() => { void fetchHealth(); })} disabled={view.loading} className="underline disabled:opacity-40">Retry</button>
         </div>
       )}
       {view.inference.error && (
         <div role="alert" aria-label="Inference telemetry observation" className="flex items-center gap-2 px-1 py-1 text-[10px] text-amber-200">
           <span>{inferenceStale ? 'Showing previously observed inference telemetry; it may be stale.' : 'Inference telemetry is unavailable.'}</span>
-          <button type="button" aria-label="Retry inference telemetry" onClick={() => { void fetchInference(); }} disabled={view.loading} className="underline disabled:opacity-40">Retry</button>
+          <button type="button" aria-label="Retry inference telemetry" onClick={retry(() => { void fetchInference(); })} disabled={view.loading} className="underline disabled:opacity-40">Retry</button>
         </div>
       )}
     </div>
   );
+}
+
+function overallLabel(overall: ReturnType<typeof deriveSystemTelemetryView>['overall']): string {
+  return {
+    pending: 'SYS PENDING',
+    unavailable: 'SYS UNAVAILABLE',
+    stale: 'SYS STALE',
+    healthy: 'SYS HEALTHY',
+    degraded: 'SYS DEGRADED',
+    stopped: 'SYS STOPPED',
+  }[overall];
 }

@@ -215,14 +215,75 @@ export function reduceSystemTelemetryState(state: SystemTelemetryState, action: 
 
 export type SystemTelemetryOverall = 'pending' | 'unavailable' | 'stale' | 'healthy' | 'degraded' | 'stopped';
 export type ServiceState = 'up' | 'down' | 'unknown';
+export type TelemetryServiceKey = 'bun' | 'bridge' | 'ollama' | 'proxy';
+export type ServiceRequirement = 'required' | 'not_required' | 'unknown';
+export type InferenceBackend = 'ollama' | 'openrouter' | 'claude_cli';
+export type OverallReason =
+  | 'backend_unconfirmed'
+  | 'bun_down'
+  | 'bridge_down'
+  | 'ollama_down'
+  | 'proxy_down'
+  | 'bun_give_up'
+  | 'proxy_give_up'
+  | 'ollama_give_up'
+  | 'memory_pressure'
+  | 'disk_pressure'
+  | 'inference_error_rate'
+  | 'inference_unavailable';
+
+export interface ServiceRequirementProjection {
+  backend: InferenceBackend | 'unknown';
+  requirements: Record<TelemetryServiceKey, ServiceRequirement>;
+}
+
+const ALWAYS_REQUIRED: Record<TelemetryServiceKey, ServiceRequirement> = {
+  bun: 'required',
+  bridge: 'required',
+  ollama: 'unknown',
+  proxy: 'unknown',
+};
+
+function normalizeBackend(value: unknown): InferenceBackend | null {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return normalized === 'ollama' || normalized === 'openrouter' || normalized === 'claude_cli' ? normalized : null;
+}
+
+/**
+ * Which services the confirmed active inference backend actually needs.
+ *
+ * `ollama` and `claude_cli_proxy` are the two services that only one
+ * inference backend depends on, so a service that is simply not running is
+ * only a fault when the active backend requires it. The Bun server and the
+ * bridge carry every inference turn, so they are required unconditionally.
+ * An unrecognised or absent `active_backend` yields `unknown` for the
+ * backend-dependent pair: the required set is not guessed, and an
+ * unconfirmed required set can never certify the system as healthy.
+ */
+export function projectServiceRequirements(activeBackend: unknown): ServiceRequirementProjection {
+  const backend = normalizeBackend(activeBackend);
+  if (backend === null) return { backend: 'unknown', requirements: { ...ALWAYS_REQUIRED } };
+  return {
+    backend,
+    requirements: {
+      ...ALWAYS_REQUIRED,
+      ollama: backend === 'ollama' ? 'required' : 'not_required',
+      proxy: backend === 'claude_cli' ? 'required' : 'not_required',
+    },
+  };
+}
 
 export interface SystemTelemetryView {
   overall: SystemTelemetryOverall;
+  overallReasons: OverallReason[];
   loading: boolean;
   health: {
     status: TelemetryResourceStatus;
     stale: boolean;
     error: boolean;
+    backend: InferenceBackend | 'unknown';
+    backendUnconfirmed: boolean;
+    requirements: Record<TelemetryServiceKey, ServiceRequirement>;
     services: {
       bun: ServiceState;
       bridge: ServiceState;
@@ -260,7 +321,14 @@ function isStale(status: TelemetryResourceStatus, hasData: boolean): boolean {
   return hasData && (status === 'pending' || status === 'stale');
 }
 
-export function deriveSystemTelemetryView(state: SystemTelemetryState): SystemTelemetryView {
+const SERVICE_REASON: Record<TelemetryServiceKey, OverallReason> = {
+  bun: 'bun_down',
+  bridge: 'bridge_down',
+  ollama: 'ollama_down',
+  proxy: 'proxy_down',
+};
+
+export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBackend: unknown): SystemTelemetryView {
   const healthData = state.health.data;
   const healthStale = isStale(state.health.status, healthData !== null);
   const inferenceData = state.inference.data;
@@ -274,22 +342,37 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState): SystemTe
     ollama: serviceState(healthData, 'ollama'),
     proxy: serviceState(healthData, 'claude_proxy'),
   };
-  const errorRates = inferenceData?.backends.map((backend) => backend.error_rate) ?? [];
+  const { backend, requirements } = projectServiceRequirements(activeBackend);
+  const backendUnconfirmed = requirements.ollama === 'unknown' || requirements.proxy === 'unknown';
+  const errorRates = inferenceData?.backends.map((entry) => entry.error_rate) ?? [];
   const errorRate = inferenceData && inferenceData.window_size > 0 && errorRates.length > 0
     ? Math.max(...errorRates)
     : null;
   const hasInferenceError = errorRate !== null && errorRate > 0.1;
   const inferenceUnavailable = state.inference.status === 'unavailable' || state.inference.status === 'stale' || state.inference.status === 'pending' || state.inference.status === 'unknown';
-  const warnings = healthData !== null && (
-    services.ollama === 'down'
-    || services.proxy === 'down'
-    || (healthData.supervisor?.bun_give_up ?? false)
-    || (healthData.supervisor?.proxy_give_up ?? false)
-    || (healthData.supervisor?.ollama_give_up ?? false)
-    || (memoryPercent === null || memoryPercent >= 80)
-    || (diskPercent === null || diskPercent >= 80)
-    || hasInferenceError
-  );
+  // `inferenceUnavailable` also covers a read that is merely still in flight, so
+  // the attributable reason is narrower: an unreadable resource, not a pending one.
+  const inferenceReadFailed = state.inference.status === 'unavailable' || state.inference.status === 'stale';
+
+  // A service that is not running is a fault only when the confirmed active
+  // inference backend needs it. An unconfirmed required set is itself a reason
+  // not to certify health, so the projection can never read `healthy` while the
+  // backend is unknown — but it also never claims an unprobed service is up.
+  const reasons: OverallReason[] = [];
+  if (healthData !== null) {
+    for (const key of ['bun', 'bridge', 'ollama', 'proxy'] as const) {
+      if (services[key] === 'down' && requirements[key] === 'required') reasons.push(SERVICE_REASON[key]);
+    }
+    if (backendUnconfirmed) reasons.push('backend_unconfirmed');
+    if (healthData.supervisor?.bun_give_up ?? false) reasons.push('bun_give_up');
+    if (healthData.supervisor?.proxy_give_up ?? false) reasons.push('proxy_give_up');
+    if (healthData.supervisor?.ollama_give_up ?? false) reasons.push('ollama_give_up');
+    if (memoryPercent === null || memoryPercent >= 80) reasons.push('memory_pressure');
+    if (diskPercent === null || diskPercent >= 80) reasons.push('disk_pressure');
+    if (hasInferenceError) reasons.push('inference_error_rate');
+  }
+  if (inferenceReadFailed) reasons.push('inference_unavailable');
+
   let overall: SystemTelemetryOverall;
   if (healthData === null) {
     overall = healthStatus === 'unavailable' ? 'unavailable' : 'pending';
@@ -297,18 +380,22 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState): SystemTe
     overall = 'stale';
   } else if (services.bun === 'down' || services.bridge === 'down') {
     overall = 'stopped';
-  } else if (warnings || inferenceUnavailable) {
+  } else if (inferenceUnavailable || reasons.length > 0) {
     overall = 'degraded';
   } else {
     overall = 'healthy';
   }
   return {
     overall,
+    overallReasons: reasons,
     loading: state.health.status === 'pending' || state.inference.status === 'pending',
     health: {
       status: healthStatus,
       stale: healthStale,
       error: state.health.error,
+      backend,
+      backendUnconfirmed,
+      requirements,
       services,
       memoryPercent,
       diskPercent,
@@ -326,4 +413,58 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState): SystemTe
       conductorHitRate: inferenceData?.conductor_cache?.cache_hit_rate ?? null,
     },
   };
+}
+
+export const SERVICE_NAMES: Record<TelemetryServiceKey, string> = {
+  bun: 'Bun server',
+  bridge: 'bridge',
+  ollama: 'Ollama',
+  proxy: 'claude_cli_proxy',
+};
+
+const REASON_PHRASES: Record<OverallReason, string> = {
+  backend_unconfirmed: 'the active inference backend is not confirmed',
+  bun_down: 'Bun server is not running',
+  bridge_down: 'the bridge is not running',
+  ollama_down: 'Ollama is not running',
+  proxy_down: 'claude_cli_proxy is not running',
+  bun_give_up: 'Bun server auto-restart is paused',
+  proxy_give_up: 'claude_cli_proxy auto-restart is paused',
+  ollama_give_up: 'Ollama auto-restart is paused',
+  memory_pressure: 'memory use is high',
+  disk_pressure: 'disk use is high',
+  inference_error_rate: 'the inference error rate is high',
+  inference_unavailable: 'inference telemetry is unavailable',
+};
+
+const VERDICT_LABELS: Record<SystemTelemetryOverall, string> = {
+  pending: 'Checking system telemetry',
+  unavailable: 'System health is unavailable',
+  stale: 'System health may be stale',
+  healthy: 'All required services are running',
+  degraded: 'Degraded',
+  stopped: 'Stopped',
+};
+
+function listNames(names: string[]): string {
+  if (names.length === 0) return '';
+  if (names.length === 1) return names[0];
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+}
+
+/**
+ * One sentence naming what the current verdict is and why, so degradation and
+ * recovery are both announced as text rather than only implied by colour.
+ */
+export function summarizeVerdict(view: SystemTelemetryView): string {
+  if (view.overall === 'healthy') {
+    const unused = (['bun', 'bridge', 'ollama', 'proxy'] as const)
+      .filter((key) => view.health.requirements[key] === 'not_required');
+    const suffix = unused.length > 0
+      ? ` Not required by this backend: ${listNames(unused.map((key) => SERVICE_NAMES[key]))}.`
+      : '';
+    return `All services required by the active inference backend (${view.health.backend}) are running.${suffix}`;
+  }
+  if (view.overallReasons.length === 0) return VERDICT_LABELS[view.overall];
+  return `${VERDICT_LABELS[view.overall]}: ${listNames(view.overallReasons.map((reason) => REASON_PHRASES[reason]))}.`;
 }

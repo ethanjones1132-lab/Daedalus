@@ -64,7 +64,9 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-const mount = async () => { await act(async () => { render(<SystemStatusBar />); }); };
+const mount = async (activeBackend: string | null = 'ollama') => {
+  await act(async () => { render(<SystemStatusBar activeBackend={activeBackend} />); });
+};
 const settleHealth = async (index: number, value: unknown = baseHealth) => { await act(async () => { healthRequests[index].resolve(value); }); };
 const failHealth = async (index: number) => { await act(async () => { healthRequests[index].reject(new Error('private native health detail')); }); };
 const settleInference = async (index: number, value: unknown = emptyInference) => { await act(async () => { inferenceRequests[index].resolve(new Response(JSON.stringify(value), { status: 200 })); }); };
@@ -137,7 +139,8 @@ describe('SystemStatusBar telemetry observation state', () => {
     expect(screen.getByText('SYS HEALTHY')).toBeInTheDocument();
     expect(screen.getByText('BUN UP')).toBeInTheDocument();
     expect(screen.getByText('BRG UP')).toBeInTheDocument();
-    expect(screen.getByText('PRX UP')).toBeInTheDocument();
+    // Under the ollama inference backend the claude_cli_proxy is not required.
+    expect(screen.getByText('PRX UP · NR')).toBeInTheDocument();
     expect(screen.getByText('MEM 42%')).toBeInTheDocument();
     expect(screen.getByText('DSK 40%')).toBeInTheDocument();
     expect(screen.getByText('INF EMPTY')).toBeInTheDocument();
@@ -157,7 +160,9 @@ describe('SystemStatusBar telemetry observation state', () => {
     });
     expect(screen.getByText('SYS DEGRADED')).toBeInTheDocument();
     expect(screen.getByText('OLL DOWN')).toBeInTheDocument();
-    expect(screen.getByText('PRX DOWN')).toBeInTheDocument();
+    // Under the ollama inference backend the claude_cli_proxy is not required,
+    // so its own state is reported without pretending it is a fault.
+    expect(screen.getByText('PRX DOWN · NR')).toBeInTheDocument();
     expect(screen.getByText('ERR 25%')).toBeInTheDocument();
     expect(screen.getByText('BUN GIVE-UP')).toBeInTheDocument();
     expect(screen.getByText('PRX GIVE-UP')).toBeInTheDocument();
@@ -210,5 +215,98 @@ describe('SystemStatusBar telemetry observation state', () => {
     expect(screen.getByText('SYS STOPPED')).toBeInTheDocument();
     expect(screen.getByText('BUN DOWN')).toBeInTheDocument();
     expect(screen.queryByText('BUN UP')).not.toBeInTheDocument();
+  });
+});
+
+const verdict = () => screen.getByRole('status', { name: 'System telemetry verdict' });
+const stockOpenRouterHealth: HealthData = {
+  ...baseHealth,
+  ollama: { ...baseHealth.ollama, running: false, model: null },
+  claude_proxy: { ...baseHealth.claude_proxy, running: false },
+};
+
+describe('SystemStatusBar required-set presentation', () => {
+  it('prints the required/not-required distinction as text and confirms health on a stock OpenRouter install', async () => {
+    await mount('openrouter');
+    await settleHealth(0, stockOpenRouterHealth);
+    await settleInference(0);
+    expect(screen.getByText('SYS HEALTHY')).toBeInTheDocument();
+    expect(screen.getByText('OLL DOWN · NR')).toBeInTheDocument();
+    expect(screen.getByText('PRX DOWN · NR')).toBeInTheDocument();
+    expect(screen.getByText('BUN UP')).toBeInTheDocument();
+    expect(verdict()).toHaveTextContent(
+      'All services required by the active inference backend (openrouter) are running.',
+    );
+    expect(verdict()).toHaveTextContent('Not required by this backend: Ollama and claude_cli_proxy.');
+  });
+
+  it('still names a required service that is down and still degrades', async () => {
+    await mount('claude_cli');
+    await settleHealth(0, stockOpenRouterHealth);
+    await settleInference(0);
+    expect(screen.getByText('SYS DEGRADED')).toBeInTheDocument();
+    expect(screen.getByText('PRX DOWN')).toBeInTheDocument();
+    expect(screen.getByText('OLL DOWN · NR')).toBeInTheDocument();
+    expect(verdict()).toHaveTextContent('Degraded: claude_cli_proxy is not running.');
+  });
+
+  it('degrades on Ollama under the ollama backend for the very same observation', async () => {
+    await mount('ollama');
+    await settleHealth(0, stockOpenRouterHealth);
+    await settleInference(0);
+    expect(screen.getByText('SYS DEGRADED')).toBeInTheDocument();
+    expect(screen.getByText('OLL DOWN')).toBeInTheDocument();
+    expect(screen.getByText('PRX DOWN · NR')).toBeInTheDocument();
+    expect(verdict()).toHaveTextContent('Degraded: Ollama is not running.');
+  });
+
+  it('never claims health while the active inference backend is unconfirmed', async () => {
+    await mount(null);
+    await settleHealth(0, stockOpenRouterHealth);
+    await settleInference(0);
+    expect(screen.queryByText('SYS HEALTHY')).not.toBeInTheDocument();
+    expect(screen.getByText('SYS DEGRADED')).toBeInTheDocument();
+    expect(screen.getByText('OLL DOWN · REQ?')).toBeInTheDocument();
+    expect(screen.getByText('PRX DOWN · REQ?')).toBeInTheDocument();
+    expect(verdict()).toHaveTextContent('the active inference backend is not confirmed');
+  });
+
+  it('carries a non-colour accessible name for every service chip', async () => {
+    await mount('openrouter');
+    await settleHealth(0, stockOpenRouterHealth);
+    await settleInference(0);
+    expect(screen.getByText('BUN UP')).toHaveAccessibleName('Bun server is up and required by the active inference backend.');
+    expect(screen.getByText('BRG UP')).toHaveAccessibleName('bridge is up and required by the active inference backend.');
+    expect(screen.getByText('OLL DOWN · NR')).toHaveAccessibleName('Ollama is not running and not required by the active inference backend.');
+    expect(screen.getByText('PRX DOWN · NR')).toHaveAccessibleName('claude_cli_proxy is not running and not required by the active inference backend.');
+  });
+
+  it('announces recovery, not only degradation', async () => {
+    await mount('ollama');
+    await settleHealth(0, stockOpenRouterHealth);
+    await settleInference(0);
+    expect(verdict()).toHaveTextContent('Degraded: Ollama is not running.');
+
+    fireEvent.click(refresh());
+    await settleHealth(1, baseHealth);
+    await settleInference(1);
+    expect(screen.getByText('SYS HEALTHY')).toBeInTheDocument();
+    expect(verdict()).toHaveTextContent('All services required by the active inference backend (ollama) are running.');
+  });
+
+  it('keeps focus off the document body when a focused Retry disappears on recovery', async () => {
+    const { container } = render(<SystemStatusBar activeBackend="ollama" />);
+    await act(async () => {});
+    await failHealth(0);
+    await settleInference(0);
+    const retry = screen.getByRole('button', { name: 'Retry system health' });
+    retry.focus();
+    expect(document.activeElement).toBe(retry);
+
+    fireEvent.click(retry);
+    await settleHealth(1, baseHealth);
+    expect(screen.queryByRole('button', { name: 'Retry system health' })).not.toBeInTheDocument();
+    expect(document.activeElement).not.toBe(document.body);
+    expect(container.contains(document.activeElement)).toBe(true);
   });
 });
