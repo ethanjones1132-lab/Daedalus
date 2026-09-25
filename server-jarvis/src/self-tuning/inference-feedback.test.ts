@@ -14,6 +14,7 @@ import {
   clearInferenceFeedbackState,
   getLearnedPoolState,
   resetLearnedPoolStateForTests,
+  setLearnedPoolClockForTests,
 } from "./learned-pool-state";
 import {
   getPolicyVersionStore,
@@ -71,12 +72,21 @@ describe("inference feedback policy", () => {
   beforeEach(() => {
     resetPolicyStagingForTests();
     resetLearnedPoolStateForTests();
+    // These cases inject a historical `now` and a report that expires two days
+    // later. Readers re-validate freshness against the process clock, so pin
+    // it to the same instant — otherwise every value here is (correctly)
+    // released before it is read.
+    setLearnedPoolClockForTests(() => Date.parse("2026-07-10T12:00:00.000Z"));
+  });
+
+  afterEach(() => {
+    setLearnedPoolClockForTests(null);
   });
 
   test("valid empirical policy can demote a failing default and tune first-token budget", () => {
     expect(applyInferenceFeedback(policy("2026-07-12T00:00:00.000Z"), {
       now: new Date("2026-07-10T12:00:00.000Z"),
-    })).toEqual({ applied: 2, ignored: 0, reason: undefined });
+    })).toEqual({ applied: 2, ignored: 0, reason: undefined, expiresAt: "2026-07-12T00:00:00.000Z" });
 
     const pool = new AgentPool([slowDefault, fastAlternative]);
     expect(pool.pickFor("synthesizer", "general")?.id).toBe("fast-alternative");
@@ -133,7 +143,7 @@ describe("inference feedback policy", () => {
       },
     }, { now: new Date("2026-07-10T12:00:00.000Z") });
 
-    expect(result).toEqual({ applied: 4, ignored: 0, reason: undefined });
+    expect(result).toEqual({ applied: 4, ignored: 0, reason: undefined, expiresAt: "2026-07-12T00:00:00.000Z" });
     const state = getLearnedPoolState();
     expect(state.modelRoutingScoreDeltas.get("openrouter:stage-bad")).toBe(-0.25);
     expect(state.stageModelRoutingScoreDeltas.get("openrouter:stage-bad:coordinator")).toBe(-0.25);
@@ -163,7 +173,7 @@ describe("inference feedback policy", () => {
       },
     }, { now: new Date("2026-07-10T12:00:00.000Z") });
 
-    expect(result).toEqual({ applied: 0, ignored: 1, reason: undefined });
+    expect(result).toEqual({ applied: 0, ignored: 1, reason: undefined, expiresAt: "2026-07-12T00:00:00.000Z" });
     expect(getLearnedPoolState().stageModelRoutingScoreDeltas.has(key)).toBe(false);
   });
 
@@ -182,7 +192,7 @@ describe("inference feedback policy", () => {
       },
     }, { now: new Date("2026-07-10T12:00:00.000Z") });
 
-    expect(result).toEqual({ applied: 0, ignored: 1, reason: undefined });
+    expect(result).toEqual({ applied: 0, ignored: 1, reason: undefined, expiresAt: "2026-07-12T00:00:00.000Z" });
   });
 });
 
@@ -400,6 +410,13 @@ describe("production policy durability across inference-feedback clear/apply", (
   beforeEach(() => {
     resetPolicyStagingForTests();
     resetLearnedPoolStateForTests();
+    // Same fixture alignment as above: the injected `now` is historical, so
+    // the process clock must match it for the applied values to still be live.
+    setLearnedPoolClockForTests(() => Date.parse("2026-07-10T12:00:00.000Z"));
+  });
+
+  afterEach(() => {
+    setLearnedPoolClockForTests(null);
   });
 
   test("reapplyProductionPolicySnapshot restores keys wiped by clearInferenceFeedbackState", () => {
@@ -428,7 +445,7 @@ describe("production policy durability across inference-feedback clear/apply", (
     const result = applyInferenceFeedback(policy("2026-07-12T00:00:00.000Z"), {
       now: new Date("2026-07-10T12:00:00.000Z"),
     });
-    expect(result).toEqual({ applied: 2, ignored: 0, reason: undefined });
+    expect(result).toEqual({ applied: 2, ignored: 0, reason: undefined, expiresAt: "2026-07-12T00:00:00.000Z" });
 
     // Production key survives clear + operational reload.
     expect(state.modelRoutingScoreDeltas.get(productionKey)).toBe(0.12);

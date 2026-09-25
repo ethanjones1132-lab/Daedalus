@@ -59,7 +59,15 @@ export async function refreshInferenceFeedback(options: {
   runCommand?: (command: string[]) => Promise<CommandResult>;
   loadPolicy?: (path: string) => FeedbackApplyResult;
   paths?: Partial<InferenceFeedbackCommandPaths>;
-} = {}): Promise<{ success: boolean; output: string; applied?: number; ignored?: number; error?: string }> {
+} = {}): Promise<{
+  success: boolean;
+  output: string;
+  applied?: number;
+  ignored?: number;
+  /** Deadline of the policy now in force, reported only on the applied path. */
+  expiresAt?: string;
+  error?: string;
+}> {
   const scriptPath = options.scriptPath ?? findInferenceMetricsScript();
   if (!scriptPath) {
     return { success: false, output: "", error: "automate_inference_metrics.py not found in runtime assets" };
@@ -95,6 +103,7 @@ export async function refreshInferenceFeedback(options: {
       output: result.stdout.trim(),
       applied: applied.applied,
       ignored: applied.ignored,
+      ...(applied.expiresAt ? { expiresAt: applied.expiresAt } : {}),
     };
   } catch (error) {
     return { success: false, output: "", error: error instanceof Error ? error.message : String(error) };

@@ -22,6 +22,7 @@ import { dirname, join } from "path";
 import { SESSIONS_DIR } from "../config";
 import {
   applyPolicySnapshotToPool,
+  clearInferenceFeedbackExpiries,
   getLearnedPoolState,
   snapshotStagedPolicyFields,
   type PolicySnapshot,
@@ -1214,6 +1215,8 @@ function restoreStagedPolicyMaps(snapshot: PolicySnapshot): void {
   state.fallbackBoosts.clear();
   state.modelFirstTokenTimeouts.clear();
   state.recoveryPolicy.clear();
+  // The cleared cron values are gone, so their report deadlines go with them.
+  clearInferenceFeedbackExpiries(state);
   applyPolicySnapshotToPool(snapshot, state);
 }
 

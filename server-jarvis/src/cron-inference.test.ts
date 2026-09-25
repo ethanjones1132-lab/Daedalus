@@ -328,6 +328,37 @@ describe("Cron inference route", () => {
     expect(streamCalls).toBe(0);
   });
 
+  test("states the deadline of an applied inference-feedback policy when the producer is silent", async () => {
+    const withDeadline = await runCronInference(
+      { job_id: "jarvis-system-inference-feedback" },
+      makeDependencies(new Response(null), {
+        refreshInferenceFeedback: async () => ({
+          success: true,
+          output: "",
+          applied: 2,
+          expiresAt: "2026-07-12T00:00:00.000Z",
+        }),
+      }),
+    );
+    expect(withDeadline).toMatchObject({
+      success: true,
+      output: "Applied 2 inference feedback adjustment(s) until 2026-07-12T00:00:00.000Z.",
+    });
+
+    // A refresh that reported no deadline keeps the original wording rather
+    // than claiming a policy lifetime it cannot name.
+    const withoutDeadline = await runCronInference(
+      { job_id: "jarvis-system-inference-feedback" },
+      makeDependencies(new Response(null), {
+        refreshInferenceFeedback: async () => ({ success: true, output: "", applied: 0 }),
+      }),
+    );
+    expect(withoutDeadline).toMatchObject({
+      success: true,
+      output: "Applied 0 inference feedback adjustment(s).",
+    });
+  });
+
   test("keeps inference feedback and prompt/projection short circuits independent", async () => {
     let streamCalls = 0;
     const feedbackResult = await runCronInference(

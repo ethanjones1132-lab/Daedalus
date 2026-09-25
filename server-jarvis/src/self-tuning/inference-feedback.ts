@@ -17,13 +17,20 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { clearInferenceFeedbackState, getLearnedPoolState } from "./learned-pool-state";
+import { clearInferenceFeedbackState, getLearnedPoolState, recordInferenceFeedbackExpiry } from "./learned-pool-state";
 import { reapplyProductionPolicySnapshot } from "./policy-staging";
 
 export interface FeedbackApplyResult {
   applied: number;
   ignored: number;
   reason?: "missing" | "invalid" | "expired";
+  /**
+   * Deadline of the report now in force, as a normalized ISO-8601 string.
+   * Absent when nothing was applied. The learned values are re-validated
+   * against this instant on every read, so it is the operator-visible
+   * statement of how long this policy can still steer routing.
+   */
+  expiresAt?: string;
 }
 
 export function inferenceFeedbackPath(): string {
@@ -43,6 +50,10 @@ function finiteClamped(value: unknown, low: number, high: number): number | unde
  * Always clears the four cron-managed maps first, then reloads feedback, then
  * re-merges staged production so a promote cannot be undone in-process by a
  * feedback refresh (until restart would re-load policy-versions.json).
+ *
+ * Every accepted value is stamped with the report's `expires_at`, so a producer
+ * that never re-runs cannot leave one measurement steering routing and the
+ * first-token watchdog past its deadline (see `learned-pool-state`).
  */
 export function applyInferenceFeedback(
   value: unknown,
@@ -73,12 +84,21 @@ export function applyInferenceFeedback(
       const speed = finiteClamped(raw.speed_capability_delta, -0.15, 0.10);
       const reliability = finiteClamped(raw.reliability_capability_delta, -0.15, 0.10);
       const firstToken = finiteClamped(raw.first_token_timeout_ms, 1_000, 55_000);
-      if (routing !== undefined) state.modelRoutingScoreDeltas.set(key, routing);
+      if (routing !== undefined) {
+        state.modelRoutingScoreDeltas.set(key, routing);
+        recordInferenceFeedbackExpiry("modelRoutingScoreDeltas", key, expiresAt, state);
+      }
       const deltas: Record<string, number> = {};
       if (speed !== undefined) deltas.speed = speed;
       if (reliability !== undefined) deltas.json_reliability = reliability;
-      if (Object.keys(deltas).length > 0) state.modelCapabilityDeltas.set(key, deltas);
-      if (firstToken !== undefined) state.modelFirstTokenTimeouts.set(key, firstToken);
+      if (Object.keys(deltas).length > 0) {
+        state.modelCapabilityDeltas.set(key, deltas);
+        recordInferenceFeedbackExpiry("modelCapabilityDeltas", key, expiresAt, state);
+      }
+      if (firstToken !== undefined) {
+        state.modelFirstTokenTimeouts.set(key, firstToken);
+        recordInferenceFeedbackExpiry("modelFirstTokenTimeouts", key, expiresAt, state);
+      }
       applied += 1;
     }
     for (const [key, raw] of Object.entries(report.routing_policy.stage_adjustments ?? {})) {
@@ -93,10 +113,13 @@ export function applyInferenceFeedback(
         continue;
       }
       const routing = finiteClamped(stageAdj.routing_score_delta, -0.25, 0.15);
-      if (routing !== undefined) state.stageModelRoutingScoreDeltas.set(key, routing);
+      if (routing !== undefined) {
+        state.stageModelRoutingScoreDeltas.set(key, routing);
+        recordInferenceFeedbackExpiry("stageModelRoutingScoreDeltas", key, expiresAt, state);
+      }
       applied += 1;
     }
-    return { applied, ignored, reason: undefined };
+    return { applied, ignored, reason: undefined, expiresAt: new Date(expiresAt).toISOString() };
   } finally {
     // Promote keys share these maps; re-merge so cron refresh cannot undo production.
     reapplyProductionPolicySnapshot();

@@ -65,6 +65,8 @@ export interface CronFeedbackResult {
   success: boolean;
   output: string;
   applied?: number;
+  /** Deadline of the policy now in force, when the refresh applied one. */
+  expiresAt?: string;
   error?: string;
 }
 
@@ -459,7 +461,8 @@ export async function runCronInference(
       return {
         success: refreshed.success,
         output: refreshed.output || (refreshed.success
-          ? `Applied ${refreshed.applied ?? 0} inference feedback adjustment(s).`
+          ? `Applied ${refreshed.applied ?? 0} inference feedback adjustment(s)`
+            + `${refreshed.expiresAt ? ` until ${refreshed.expiresAt}` : ""}.`
           : ""),
         error: refreshed.error,
         execution_evidence: {
