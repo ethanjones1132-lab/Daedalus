@@ -24,6 +24,7 @@ import { buildLearningPrompt, buildReviewPrompt, buildCodebaseAuditPrompt, build
 import { createLifecycleService, validateLifecycleSnapshot, type LifecycleSnapshot } from "./agent-lifecycle";
 import { createBoundaryProjectionStore } from "./activation-boundary";
 import { handleAgentRequest } from "./agent-routes";
+import { handleChatStreamRequest, type ChatStreamOptions } from "./chat-routes";
 import { effectiveOllamaUrl, checkOllamaHealth, checkOllamaModelSupportsTools, resolveWindowsHostIP, resolveDesiredOllamaModel } from "./ollama";
 import { buildClaudeCliChatArgs, streamClaudeCli, isClaudeCliAvailable, compactTurnHistoryForCli } from "./claude-cli";
 import { ReasoningParser, stripReasoningFromText, type ReasoningEvent } from "./reasoning";
@@ -107,6 +108,7 @@ import {
 } from "./stream-liveness";
 import {
   ActiveStreamRegistry,
+  bindClientDisconnectToStreamLease,
   classifyAbortReason,
   CLIENT_DISCONNECTED_ABORT_REASON,
   createIdempotentReaderCancel,
@@ -482,19 +484,7 @@ export interface BridgeResponse {
   error?: string;
 }
 
-interface ChatHistoryMessage {
-  role: "user" | "assistant" | "system" | "tool" | string;
-  content: string;
-}
-
-interface StreamJarvisOptions {
-  config?: Partial<JarvisConfig>;
-  history?: ChatHistoryMessage[];
-  systemPromptOverride?: string;
-  surface?: SurfaceType;
-  signal?: AbortSignal;
-  onComplete?: () => void;
-}
+type StreamJarvisOptions = ChatStreamOptions;
 
 // OpenClaw interfaces removed — Jarvis is now self-contained
 
@@ -1346,17 +1336,23 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     // One turn-wide domain is reserved for user Stop, client disconnect, and
     // supersession by a newer turn in the same Session. Model attempt timeouts
     // stay stage-local and must never abort this controller.
+    let admissionLease: AdmissionLease | undefined;
+    let clientDisconnected = false;
+    const markClientDisconnected = (): void => {
+      clientDisconnected = true;
+    };
+    const cleanupRequestAbort = options.requestSignal
+      ? bindClientDisconnectToStreamLease(options.requestSignal, streamLease, markClientDisconnected)
+      : () => {};
     const cleanupExternalAbort = options.signal
       ? registerAbortHandler(options.signal, () => {
         if (!streamAbort.signal.aborted) streamAbort.abort(options.signal?.reason ?? "Cron execution cancelled");
       })
       : () => {};
-    let admissionLease: AdmissionLease | undefined;
-    let clientDisconnected = false;
     const writeBytes = createDisconnectAwareWrite(
       (chunk) => rawWriter.write(chunk),
       () => {
-        clientDisconnected = true;
+        markClientDisconnected();
         if (!streamAbort.signal.aborted) streamAbort.abort(CLIENT_DISCONNECTED_ABORT_REASON);
       },
     );
@@ -1609,6 +1605,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           policy_source: req.policy_source,
           session_id: sessionId,
           surface: "chat",
+          signal: streamAbort.signal,
         });
       };
 
@@ -4868,6 +4865,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       }
       stopHeartbeat();
       admissionLease?.release();
+      cleanupRequestAbort();
       cleanupExternalAbort();
       streamLease.release();
       try {
@@ -5296,13 +5294,8 @@ export async function baseFetch(req: Request): Promise<Response> {
       });
     }
     if (path === "/chat/stream" && req.method === "POST") {
-      const body = await req.json();
-      return streamJarvis(body.message, body.session_id || crypto.randomUUID(), {
-        config: body.config,
-        history: Array.isArray(body.history) ? body.history : [],
-        systemPromptOverride: body.system_prompt_override,
-        surface: body.surface,
-      });
+      const response = await handleChatStreamRequest(req, { stream: streamJarvis });
+      if (response) return response;
     }
     if (path === "/chat/cancel" && req.method === "POST") {
       const body = await req.json();

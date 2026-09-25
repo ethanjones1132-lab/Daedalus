@@ -649,6 +649,7 @@ export function ChatPanel({
   // Stable refs for values the stream handlers need without re-subscribing
   // listeners mid-turn (see memory/jarvis-tauri-listen-race.md).
   const activeSessionRef = useRef(activeSession);
+  const mountedRef = useRef(true);
   const sessionIdRef = useRef(sessionId);
   const onSessionCreatedRef = useRef(onSessionCreated);
   const streamAbortRef = useRef<AbortController | null>(null);
@@ -713,6 +714,7 @@ export function ChatPanel({
   useEffect(() => { onSessionCreatedRef.current = onSessionCreated; }, [onSessionCreated]);
 
   const matchesStreamSession = useCallback((sid: string | undefined) => {
+    if (!mountedRef.current) return false;
     const current = activeSessionRef.current;
     if (current === null) return sid === undefined || sid === '';
     if (!sid) return false;
@@ -754,6 +756,10 @@ export function ChatPanel({
   /** Apply any buffered tokens into messages state (rAF path). */
   const flushPendingTokens = useCallback(() => {
     tokenRafRef.current = null;
+    if (!mountedRef.current) {
+      pendingTokenRef.current = '';
+      return;
+    }
     const text = pendingTokenRef.current;
     if (!text) return;
     pendingTokenRef.current = '';
@@ -771,7 +777,7 @@ export function ChatPanel({
   }, [cancelTokenRaf]);
 
   const appendAssistantText = useCallback((text: string) => {
-    if (!text) return;
+    if (!mountedRef.current || !text) return;
     pendingTokenRef.current += text;
     if (tokenRafRef.current !== null) return;
     tokenRafRef.current = requestAnimationFrame(() => {
@@ -780,6 +786,7 @@ export function ChatPanel({
   }, [flushPendingTokens]);
 
   const finalizeAssistantMessage = useCallback((sid?: string, terminal?: DecodedStreamTerminal) => {
+    if (!mountedRef.current) return;
     // Drain rAF buffer inside the same setMessages as finalize so React
     // batching cannot drop the last ~16ms of streamed text.
     const pending = takePendingTokens();
@@ -972,8 +979,18 @@ export function ChatPanel({
     return () => { cancelled = true; };
   }, [activeSession, clearPendingApproval, historyRetry, scrollToBottom, discardPendingTokens]);
 
-  // Cancel any pending token rAF on unmount so we never setState after teardown.
-  useEffect(() => () => { discardPendingTokens(); }, [discardPendingTokens]);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      sendGateRef.current.invalidate();
+      sendInFlightRef.current.finish();
+      const controller = streamAbortRef.current;
+      streamAbortRef.current = null;
+      controller?.abort('Passive view teardown');
+      discardPendingTokens();
+    };
+  }, [discardPendingTokens]);
 
   // Register jarvis:// listeners once on mount. Async listen() + deps that
   // change during streaming causes a re-subscribe storm (jarvis-tauri-listen-race).
@@ -1203,6 +1220,12 @@ export function ChatPanel({
     streamAbortRef.current?.abort();
     const controller = new AbortController();
     streamAbortRef.current = controller;
+    const requestIsCurrent = () => (
+      mountedRef.current
+      && sendGateRef.current.isCurrent(sendGeneration)
+      && matchesStreamSession(sid)
+      && streamAbortRef.current === controller
+    );
 
     // `append_message` returns the DB row id (sessions.rs `insert_message_row`).
     // Swap the client-generated id for the persisted one so a later
@@ -1214,11 +1237,11 @@ export function ChatPanel({
       role: 'user',
       content: userMsg,
     }).then((dbId) => {
-      if (!matchesStreamSession(sid)) return;
+      if (!requestIsCurrent()) return;
       if (typeof dbId !== 'string' || !dbId) return;
       setMessages(prev => prev.map((m) => (m.id === clientMessageId ? { ...m, id: dbId } : m)));
     }).catch((e: any) => {
-      if (!matchesStreamSession(sid)) return;
+      if (!requestIsCurrent()) return;
       console.error('Failed to persist user message:', e);
       setError('Append failed: ' + (e?.message || String(e)));
     });
@@ -1241,7 +1264,7 @@ export function ChatPanel({
     if (!response.body) {
       throw new Error('Jarvis server returned no response stream.');
     }
-    if (!sendGateRef.current.isCurrent(sendGeneration) || !matchesStreamSession(sid)) {
+    if (!requestIsCurrent()) {
       controller.abort('Stale Session turn');
       throw new DOMException('Stale Session turn', 'AbortError');
     }
@@ -1271,7 +1294,7 @@ export function ChatPanel({
      let terminal: DecodedStreamTerminal | null = null;
      let activityTerminalDispatched = false;
     const persistTerminalRun = () => {
-      if (!runAcc.outcome) return;
+      if (!requestIsCurrent() || !runAcc.outcome) return;
       // A force-stop can land before the pipeline ever emitted agent_run_id
       // (the incident's exact case) — synthesize an id so the cancellation
       // is still durably recorded. run_id is the idempotency key, so a
@@ -1311,7 +1334,7 @@ export function ChatPanel({
     );
 
     const handleFrame = (frame: any) => {
-      if (!sendGateRef.current.isCurrent(sendGeneration) || !matchesStreamSession(sid)) return;
+      if (!requestIsCurrent()) return;
       if (!frame || typeof frame !== 'object') return;
       if (frame.type === 'stream_event' && frame.delta?.text) {
         const text = String(frame.delta.text);
@@ -1660,7 +1683,7 @@ export function ChatPanel({
       // Stream ends without a terminal frame: an inactivity timeout is
       // timed_out; a client-side abort (user Stop that raced ahead of the
       // server's `cancelled` frame, or component teardown) is cancelled.
-      if (!runAcc.outcome) {
+      if (requestIsCurrent() && !runAcc.outcome) {
         if (inactivityTimedOut) {
           runAcc.outcome = 'timed_out';
         } else if (controller.signal.aborted || stopRequestedRef.current) {
@@ -1678,7 +1701,7 @@ export function ChatPanel({
       throw new Error(`Jarvis stream was inactive for ${STREAM_INACTIVITY_TIMEOUT_MS / 1000} seconds.`);
     }
 
-    if (sendGateRef.current.isCurrent(sendGeneration)) finalizeAssistantMessage(sid, terminal ?? undefined);
+    if (requestIsCurrent()) finalizeAssistantMessage(sid, terminal ?? undefined);
     if (streamAbortRef.current === controller) streamAbortRef.current = null;
   }, [appendAssistantText, applyTokenChunk, clearPendingApproval, dispatchActivity, finalizeAssistantMessage, matchesStreamSession, presentApprovalRequest, takePendingTokens]);
 
@@ -1745,6 +1768,7 @@ export function ChatPanel({
         const newSession = await invoke<JarvisSession>('jarvis_new_session', {
           name: userMsg.slice(0, 60),
         });
+        if (!mountedRef.current || !sendGateRef.current.isCurrent(sendGeneration)) return;
         effectiveSessionId = newSession.id;
         // Suppress the history-load effect that setActiveSession is about to
         // trigger — otherwise it overwrites the optimistic messages above with
@@ -1761,6 +1785,7 @@ export function ChatPanel({
         publishDraftStore(clearSubmittedSessionDraft(draftStoreRef.current, submittedDraft));
       }, clientMessageId);
     } catch (e) {
+      if (!mountedRef.current) return;
       if (!sendGateRef.current.isCurrent(sendGeneration)) {
         publishDraftStore(restoreFailedSessionDraft(draftStoreRef.current, submittedDraft));
         return;
@@ -1819,8 +1844,7 @@ export function ChatPanel({
     }
     stopRequestedRef.current = true;
     clearPendingApproval();
-    streamAbortRef.current?.abort();
-    streamAbortRef.current = null;
+    const controller = streamAbortRef.current;
     setReasoningText('');
     setShowReasoning(false);
     fetch(`${JARVIS_API_URL}/chat/cancel`, {
@@ -1830,9 +1854,15 @@ export function ChatPanel({
     }).catch(() => {});
     try {
       const cancelled = await invoke<boolean>('cancel_chat_stream', sessionInvokeArgs(sid));
-      if (!cancelled) setIsStreaming(false);
+      if (cancelled) {
+        controller?.abort('Explicit Stop confirmed');
+      } else {
+        controller?.abort('Explicit Stop was not confirmed');
+        setIsStreaming(false);
+      }
     } catch (e) {
       console.error('Failed to cancel stream:', e);
+      controller?.abort('Explicit Stop request failed');
       setIsStreaming(false);
     }
   }, [activeSession, clearPendingApproval, sessionId]);

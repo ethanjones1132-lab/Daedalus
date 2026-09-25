@@ -32,6 +32,18 @@ describe("approval-registry", () => {
     expect(await p).toBe(false);
   });
 
+  test("caller abort clears a pending approval without waiting for timeout", async () => {
+    const reg = createApprovalRegistry({ dbPath: ":memory:" });
+    const controller = new AbortController();
+    const pending = reg.request({ ...details("call-abort"), signal: controller.signal });
+
+    controller.abort("client disconnected");
+
+    expect(await pending).toBe(false);
+    expect(reg.pending()).toBe(0);
+    expect(reg.getRecord("call-abort")?.status).toBe("expired");
+  });
+
   test("resolve clears the pending entry", async () => {
     const reg = createApprovalRegistry({ dbPath: ":memory:" });
     const p = reg.request(details("call-4"));

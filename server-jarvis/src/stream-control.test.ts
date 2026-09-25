@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from "bun:test";
 import {
   ActiveStreamRegistry,
+  bindClientDisconnectToStreamLease,
   classifyAbortReason,
   collectTerminalEvents,
   createIdempotentReaderCancel,
@@ -95,6 +96,56 @@ describe("ActiveStreamRegistry", () => {
 
     expect(lease.release()).toBe(true);
     expect(registry.size).toBe(0);
+  });
+});
+
+describe("client disconnect lifetime", () => {
+  test("aborts the exact lease once and keeps generation ownership until producer release", () => {
+    const registry = new ActiveStreamRegistry();
+    const request = new AbortController();
+    const lease = registry.begin("session-1");
+    const onDisconnect = mock(() => {});
+    const cleanup = bindClientDisconnectToStreamLease(request.signal, lease, onDisconnect);
+
+    request.abort("socket closed");
+
+    expect(lease.controller.signal.aborted).toBe(true);
+    expect(lease.controller.signal.reason).toBe("Client disconnected");
+    expect(onDisconnect).toHaveBeenCalledTimes(1);
+    expect(registry.size).toBe(1);
+    expect(lease.release()).toBe(true);
+    expect(registry.size).toBe(0);
+    cleanup();
+  });
+
+  test("a late disconnect from an older request cannot abort or release a replacement turn", () => {
+    const registry = new ActiveStreamRegistry();
+    const oldRequest = new AbortController();
+    const oldLease = registry.begin("session-1");
+    bindClientDisconnectToStreamLease(oldRequest.signal, oldLease, () => {});
+    const replacement = registry.begin("session-1");
+
+    oldRequest.abort("old socket closed");
+
+    expect(oldLease.controller.signal.reason).toBe("Superseded by a newer Session turn");
+    expect(replacement.controller.signal.aborted).toBe(false);
+    expect(oldLease.release()).toBe(false);
+    expect(replacement.isCurrent()).toBe(true);
+    expect(registry.size).toBe(1);
+  });
+
+  test("normal completion removes request ownership before a later transport abort", () => {
+    const registry = new ActiveStreamRegistry();
+    const request = new AbortController();
+    const lease = registry.begin("session-1");
+    const onDisconnect = mock(() => {});
+    const cleanup = bindClientDisconnectToStreamLease(request.signal, lease, onDisconnect);
+
+    cleanup();
+    request.abort("late transport event");
+
+    expect(lease.controller.signal.aborted).toBe(false);
+    expect(onDisconnect).not.toHaveBeenCalled();
   });
 });
 

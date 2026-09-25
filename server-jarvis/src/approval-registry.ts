@@ -9,6 +9,7 @@
 // and replayed across Bun restarts.
 
 import { ApprovalStore, type ApprovalRecord } from "./approval-store";
+import { registerAbortHandler } from "./stream-control";
 
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -19,11 +20,13 @@ export interface ApprovalRequestDetails {
   policy_source: string;
   session_id?: string;
   surface?: string;
+  signal?: AbortSignal;
 }
 
 interface PendingApproval {
   resolve: (approved: boolean) => void;
   timer: ReturnType<typeof setTimeout>;
+  cleanup: () => void;
 }
 
 export interface ApprovalRegistryOptions {
@@ -59,6 +62,7 @@ export function createApprovalRegistry(opts: ApprovalRegistryOptions = {}): Appr
     const entry = pending.get(callId);
     if (!entry) return false;
     clearTimeout(entry.timer);
+    entry.cleanup();
     pending.delete(callId);
     entry.resolve(approved);
     return true;
@@ -83,12 +87,22 @@ export function createApprovalRegistry(opts: ApprovalRegistryOptions = {}): Appr
         surface: details.surface,
         expires_at: expiresAt(timeoutMs),
       });
+      if (details.signal?.aborted) {
+        store.resolve(details.call_id, "expired");
+        return Promise.resolve(false);
+      }
       return new Promise<boolean>((resolve) => {
         const timer = setTimeout(() => {
           store.resolve(details.call_id, "expired");
           settle(details.call_id, false);
         }, timeoutMs);
-        pending.set(details.call_id, { resolve, timer });
+        const cleanupSignal = details.signal
+          ? registerAbortHandler(details.signal, () => {
+            store.resolve(details.call_id, "expired");
+            settle(details.call_id, false);
+          })
+          : () => {};
+        pending.set(details.call_id, { resolve, timer, cleanup: cleanupSignal });
       });
     },
     resolve(callId: string, approved: boolean): boolean {

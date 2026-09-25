@@ -354,6 +354,123 @@ describe('ChatPanel state machine', () => {
     expect(screen.queryByText('incomplete')).not.toBeInTheDocument();
     expect(secondComposer).toHaveValue('');
   });
+
+  it('aborts a pending request on passive unmount and ignores a response that resolves late', async () => {
+    let resolveFetch!: (response: Response) => void;
+    let requestSignal!: AbortSignal;
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      requestSignal = init?.signal as AbortSignal;
+      return new Promise<Response>((resolve) => { resolveFetch = resolve; });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const onSessionCreated = vi.fn();
+    const view = render(<ChatPanel {...props} onSessionCreated={onSessionCreated} />);
+    const composer = await screen.findByLabelText('Chat input');
+    fireEvent.change(composer, { target: { value: 'leave before response' } });
+    fireEvent.keyDown(composer, { key: 'Enter' });
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    view.unmount();
+
+    expect(requestSignal?.aborted).toBe(true);
+    await act(async () => {
+      resolveFetch(new Response('data: {"type":"result","result":"late answer"}\n\n', {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(0);
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'record_terminal_run')).toHaveLength(0);
+    expect(onSessionCreated).not.toHaveBeenCalled();
+  });
+
+  it('drops late output and terminal effects after passive teardown', async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let requestSignal!: AbortSignal;
+    const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestSignal = init?.signal as AbortSignal;
+      return new Response(stream, { headers: { 'Content-Type': 'text/event-stream' } });
+    }));
+    const onSessionCreated = vi.fn();
+    const view = render(<ChatPanel {...props} onSessionCreated={onSessionCreated} />);
+    const composer = await screen.findByLabelText('Chat input');
+    fireEvent.change(composer, { target: { value: 'leave after output' } });
+    fireEvent.keyDown(composer, { key: 'Enter' });
+    await waitFor(() => expect(requestSignal).toBeDefined());
+    await act(async () => {
+      controller.enqueue(new TextEncoder().encode('data: {"type":"stream_event","delta":{"text":"visible partial"}}\n\n'));
+    });
+    await waitFor(() => expect(screen.getByText('visible partial')).toBeInTheDocument());
+
+    view.unmount();
+
+    expect(requestSignal?.aborted).toBe(true);
+    await act(async () => {
+      controller.enqueue(new TextEncoder().encode('data: {"type":"result","result":"late answer"}\n\n'));
+      controller.close();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(0);
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'record_terminal_run')).toHaveLength(0);
+    expect(onSessionCreated).not.toHaveBeenCalled();
+  });
+
+  it('isolates a remounted same-Session turn from the detached request', async () => {
+    const controllers: Array<ReadableStreamDefaultController<Uint8Array>> = [];
+    const signals: AbortSignal[] = [];
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.signal) signals.push(init.signal);
+      const stream = new ReadableStream<Uint8Array>({ start(value) { controllers.push(value); } });
+      return Promise.resolve(new Response(stream, { headers: { 'Content-Type': 'text/event-stream' } }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const onSessionCreated = vi.fn();
+    const view = render(<ChatPanel key="old" {...props} onSessionCreated={onSessionCreated} />);
+    const oldComposer = await screen.findByLabelText('Chat input');
+    fireEvent.change(oldComposer, { target: { value: 'old detached turn' } });
+    fireEvent.keyDown(oldComposer, { key: 'Enter' });
+    await waitFor(() => expect(controllers).toHaveLength(1));
+
+    view.rerender(<ChatPanel key="new" {...props} onSessionCreated={onSessionCreated} />);
+
+    expect(signals[0]?.aborted).toBe(true);
+    const newComposer = await screen.findByLabelText('Chat input');
+    fireEvent.change(newComposer, { target: { value: 'new mounted turn' } });
+    fireEvent.keyDown(newComposer, { key: 'Enter' });
+    await waitFor(() => expect(controllers).toHaveLength(2));
+    await act(async () => {
+      controllers[1].enqueue(new TextEncoder().encode([
+        'data: {"type":"agent_run_id","agent_run_id":"run-new"}',
+        'data: {"type":"result","result":"new answer"}',
+        '',
+      ].join('\n\n')));
+      controllers[1].close();
+    });
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('append_message', expect.objectContaining({
+      role: 'assistant',
+      content: 'new answer',
+    })));
+
+    await act(async () => {
+      controllers[0].enqueue(new TextEncoder().encode([
+        'data: {"type":"agent_run_id","agent_run_id":"run-old"}',
+        'data: {"type":"result","result":"old answer"}',
+        '',
+      ].join('\n\n')));
+      controllers[0].close();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const assistantAppends = invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant');
+    expect(assistantAppends).toHaveLength(1);
+    expect(assistantAppends[0]?.[1]?.content).toBe('new answer');
+    const terminalRuns = invokeMock.mock.calls.filter(call => call[0] === 'record_terminal_run');
+    expect(terminalRuns).toHaveLength(1);
+    expect(terminalRuns[0]?.[1]?.runId).toBe('run-new');
+    expect(onSessionCreated).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('Jarvis viewport navigation', () => {

@@ -103,6 +103,19 @@ export function registerAbortHandler(signal: AbortSignal, handler: () => void): 
   };
 }
 
+export function bindClientDisconnectToStreamLease(
+  signal: AbortSignal,
+  lease: StreamLease,
+  onDisconnect: () => void,
+): () => void {
+  return registerAbortHandler(signal, () => {
+    onDisconnect();
+    if (!lease.controller.signal.aborted) {
+      lease.controller.abort(CLIENT_DISCONNECTED_ABORT_REASON);
+    }
+  });
+}
+
 interface CancellableReader {
   cancel(reason?: unknown): Promise<void>;
 }
