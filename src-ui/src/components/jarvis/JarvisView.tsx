@@ -10,6 +10,15 @@ import {
 } from './types';
 import ControlCenterView, { type ControlCenterTab } from './ControlCenterView';
 import { sessionScroll } from './session-scroll';
+import {
+  clearSubmittedSessionDraft,
+  createSessionDraftStore,
+  getSessionDraft,
+  getSessionDraftSnapshot,
+  restoreFailedSessionDraft,
+  updateSessionDraft,
+  type SessionDraftStore,
+} from './session-draft-state';
 import MarkdownView from './MarkdownView';
 import WorkspaceGrantsChip from './WorkspaceGrantsChip';
 import SystemStatusBar from './SystemStatusBar';
@@ -37,7 +46,6 @@ import {
   formatRunDuration,
   isToolCallEchoOnly,
   mergeToolResult,
-  recoverComposerAfterFailure,
   sanitizeAssistantDisplay,
   shouldSubmitComposerKey,
   type ActivityItem,
@@ -538,7 +546,9 @@ export function ChatPanel({
   onSessionCreated: () => void;
 }) {
   const [messages, setMessages] = useState<JarvisMessage[]>([]);
-  const [input, setInput] = useState('');
+  const [draftStore, setDraftStore] = useState<SessionDraftStore>(() => createSessionDraftStore());
+  const draftStoreRef = useRef<SessionDraftStore>(draftStore);
+  const input = getSessionDraft(draftStore, activeSession).text;
   const [isStreaming, setIsStreaming] = useState(false);
   const [sessionId, setSessionId] = useState<string>('');
   const selectedSessionId = activeSession ?? '';
@@ -647,6 +657,22 @@ export function ChatPanel({
     setApprovalRetryDecision(null);
   }, []);
 
+  const publishDraftStore = useCallback((nextStore: SessionDraftStore) => {
+    if (nextStore === draftStoreRef.current) return;
+    draftStoreRef.current = nextStore;
+    setDraftStore(nextStore);
+  }, []);
+
+  const setInput = useCallback((
+    next: string | ((current: string) => string),
+    sessionId: string | null = activeSession,
+  ) => {
+    const currentStore = draftStoreRef.current;
+    const currentText = getSessionDraft(currentStore, sessionId).text;
+    const nextText = typeof next === 'function' ? next(currentText) : next;
+    publishDraftStore(updateSessionDraft(currentStore, sessionId, nextText));
+  }, [activeSession, publishDraftStore]);
+
   const presentApprovalRequest = useCallback((request: ToolApprovalRequest | null | undefined) => {
     if (!request || !request.session_id || !request.call_id || !request.name) return false;
     const key = JSON.stringify([request.session_id, request.call_id]);
@@ -660,7 +686,7 @@ export function ChatPanel({
     return true;
   }, []);
 
-  useEffect(() => { activeSessionRef.current = activeSession; }, [activeSession]);
+  useLayoutEffect(() => { activeSessionRef.current = activeSession; }, [activeSession]);
   useEffect(() => {
     if (!isStreaming || turnStartedAtRef.current === null) return;
     const tick = () => setTurnElapsedMs(Date.now() - (turnStartedAtRef.current ?? Date.now()));
@@ -668,12 +694,12 @@ export function ChatPanel({
     const id = window.setInterval(tick, 250);
     return () => window.clearInterval(id);
   }, [isStreaming]);
-  useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
+  useLayoutEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
   useEffect(() => { onSessionCreatedRef.current = onSessionCreated; }, [onSessionCreated]);
 
   const matchesStreamSession = useCallback((sid: string | undefined) => {
-    const current = activeSessionRef.current || sessionIdRef.current;
-    if (!current) return true;
+    const current = activeSessionRef.current;
+    if (current === null) return sid === undefined || sid === '';
     if (!sid) return false;
     return sid === current;
   }, []);
@@ -851,10 +877,14 @@ export function ChatPanel({
       setReasoningText('');
       setShowReasoning(false);
       setAgentSteps([]);
-      setShowAgents(true);
-      setToolCalls([]);
-      setTurnCost(null);
-      clearPendingApproval();
+       setShowAgents(true);
+       setToolCalls([]);
+       setTurnCost(null);
+       setScopeNotice(null);
+       setRunMetrics(null);
+       setTurnElapsedMs(0);
+       turnStartedAtRef.current = null;
+       clearPendingApproval();
       setApprovalError(null);
       setError(null);
       turnHadResponseTextRef.current = false;
@@ -868,11 +898,15 @@ export function ChatPanel({
     if (!activeSession) {
       setLoadingHistory(false);
       discardPendingTokens();
-      setMessages([]);
-      setSessionId('');
-      setToolCalls([]);
-      setTurnCost(null);
-      setError(null);
+       setMessages([]);
+       setSessionId('');
+       setToolCalls([]);
+       setTurnCost(null);
+       setScopeNotice(null);
+       setRunMetrics(null);
+       setTurnElapsedMs(0);
+       turnStartedAtRef.current = null;
+       setError(null);
       setPipelineStage('');
       setReasoningText('');
       setAgentSteps([]);
@@ -1145,13 +1179,14 @@ export function ChatPanel({
       role: 'user',
       content: userMsg,
     }).then((dbId) => {
-      // Guard for a non-empty string specifically — `invoke` is typed as
-      // `Promise<string>` but nothing prevents a stale/mocked backend from
-      // resolving something else (e.g. a bare `true`), which would corrupt
-      // JarvisMessage.id and the `key` it feeds into.
+      if (!matchesStreamSession(sid)) return;
       if (typeof dbId !== 'string' || !dbId) return;
       setMessages(prev => prev.map((m) => (m.id === clientMessageId ? { ...m, id: dbId } : m)));
-    }).catch((e: any) => { console.error('Failed to persist user message:', e); setError('Append failed: ' + (e?.message || String(e))); });
+    }).catch((e: any) => {
+      if (!matchesStreamSession(sid)) return;
+      console.error('Failed to persist user message:', e);
+      setError('Append failed: ' + (e?.message || String(e)));
+    });
 
     const response = await fetch(`${JARVIS_API_URL}/chat/stream`, {
       method: 'POST',
@@ -1171,7 +1206,7 @@ export function ChatPanel({
     if (!response.body) {
       throw new Error('Jarvis server returned no response stream.');
     }
-    if (!sendGateRef.current.isCurrent(sendGeneration)) {
+    if (!sendGateRef.current.isCurrent(sendGeneration) || !matchesStreamSession(sid)) {
       controller.abort('Stale Session turn');
       throw new DOMException('Stale Session turn', 'AbortError');
     }
@@ -1240,7 +1275,7 @@ export function ChatPanel({
     );
 
     const handleFrame = (frame: any) => {
-      if (!sendGateRef.current.isCurrent(sendGeneration)) return;
+      if (!sendGateRef.current.isCurrent(sendGeneration) || !matchesStreamSession(sid)) return;
       if (!frame || typeof frame !== 'object') return;
       if (frame.type === 'stream_event' && frame.delta?.text) {
         const text = String(frame.delta.text);
@@ -1569,7 +1604,7 @@ export function ChatPanel({
 
     if (sendGateRef.current.isCurrent(sendGeneration)) finalizeAssistantMessage(sid, terminal ?? undefined);
     if (streamAbortRef.current === controller) streamAbortRef.current = null;
-  }, [appendAssistantText, applyTokenChunk, clearPendingApproval, finalizeAssistantMessage, presentApprovalRequest, takePendingTokens]);
+  }, [appendAssistantText, applyTokenChunk, clearPendingApproval, finalizeAssistantMessage, matchesStreamSession, presentApprovalRequest, takePendingTokens]);
 
   const handleSend = useCallback(async () => {
     // 2026-07-13 live incident (session 7254c3ae): the `isStreaming` React
@@ -1584,7 +1619,8 @@ export function ChatPanel({
       setError('A turn is still streaming — please wait for it to finish before sending again.');
       return;
     }
-    if (!input.trim() || isStreaming) {
+    const submittedDraft = getSessionDraftSnapshot(draftStoreRef.current, activeSession);
+    if (!submittedDraft.text.trim() || isStreaming) {
       sendInFlightRef.current.finish();
       return;
     }
@@ -1594,7 +1630,7 @@ export function ChatPanel({
       return;
     }
     stopRequestedRef.current = false;
-    const userMsg = input.trim();
+    const userMsg = submittedDraft.text.trim();
     const history = messages
       .filter((msg) => !msg.isStreaming && msg.content.trim())
       .map((msg) => ({ role: msg.role, content: msg.content }));
@@ -1636,17 +1672,22 @@ export function ChatPanel({
         // Suppress the history-load effect that setActiveSession is about to
         // trigger — otherwise it overwrites the optimistic messages above with
         // the empty history of this brand-new session.
-        suppressHistoryLoadRef.current = newSession.id;
-        setSessionId(newSession.id);
-        setActiveSession(newSession.id);
+         suppressHistoryLoadRef.current = newSession.id;
+         setSessionId(newSession.id);
+         sessionIdRef.current = newSession.id;
+         activeSessionRef.current = newSession.id;
+         setActiveSession(newSession.id);
         onSessionCreated();
       }
 
       await streamFromJarvisApi(effectiveSessionId, userMsg, history, sendGeneration, () => {
-        setInput(current => current.trim() === userMsg ? '' : current);
+        publishDraftStore(clearSubmittedSessionDraft(draftStoreRef.current, submittedDraft));
       }, clientMessageId);
     } catch (e) {
-      if (!sendGateRef.current.isCurrent(sendGeneration)) return;
+      if (!sendGateRef.current.isCurrent(sendGeneration)) {
+        publishDraftStore(restoreFailedSessionDraft(draftStoreRef.current, submittedDraft));
+        return;
+      }
       streamAbortRef.current = null;
       clearPendingApproval();
       const pending = takePendingTokens();
@@ -1662,10 +1703,10 @@ export function ChatPanel({
       // detail — instead of leaving a plain assistant-looking message and
       // relying solely on the (dismissable, easy-to-miss) banner below.
       const errorMessage = String(e instanceof Error ? e.message : e);
-      const errorCode = e instanceof JarvisStreamError ? e.code : undefined;
-      setError(errorMessage);
-      setInput(current => recoverComposerAfterFailure(current, userMsg));
-      setMessages(prev => {
+       const errorCode = e instanceof JarvisStreamError ? e.code : undefined;
+       setError(errorMessage);
+       publishDraftStore(restoreFailedSessionDraft(draftStoreRef.current, submittedDraft));
+       setMessages(prev => {
         const withTokens = applyTokenChunk(prev, pending);
         const last = withTokens[withTokens.length - 1];
         if (last?.role === 'assistant' && last.isStreaming) {
@@ -1689,7 +1730,7 @@ export function ChatPanel({
       // now" check that needs a single finish() on every exit.
       sendInFlightRef.current.finish();
     }
-  }, [input, isStreaming, messages, activeSession, sessionId, onSessionCreated, setActiveSession, streamFromJarvisApi, discardPendingTokens, takePendingTokens, applyTokenChunk]);
+  }, [isStreaming, messages, activeSession, sessionId, onSessionCreated, setActiveSession, streamFromJarvisApi, discardPendingTokens, takePendingTokens, applyTokenChunk, publishDraftStore]);
 
   // Phase 1.3 — real Stop. POST /chat/cancel on the Bun server; SseRelay now
   // treats the resulting `cancelled` frame as terminal, so isStreaming flips.
@@ -1792,6 +1833,8 @@ export function ChatPanel({
     setMessages([]);
     setSessionId('');
     setActiveSession(null);
+    activeSessionRef.current = null;
+    sessionIdRef.current = '';
     setError(null);
     setPipelineStage('');
     setRecursionDepth(null);
@@ -1800,6 +1843,12 @@ export function ChatPanel({
     setAgentSteps([]);
     setToolCalls([]);
     setTurnCost(null);
+    setScopeNotice(null);
+    setRunMetrics(null);
+    setTurnElapsedMs(0);
+    turnStartedAtRef.current = null;
+    setSessionStats({ tokens: 0, turnCount: 0 });
+    lastAccumulatedRunIdRef.current = undefined;
     clearPendingApproval();
     setUserPinnedToBottom(true);
     setTimeout(() => inputRef.current?.focus(), 50);
