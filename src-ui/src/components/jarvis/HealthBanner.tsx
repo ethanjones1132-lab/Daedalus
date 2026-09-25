@@ -4,15 +4,18 @@
 //
 // Polls `jarvis_check_status` and stays invisible while the active backend
 // is healthy; shows amber (degraded) or red (down) the moment something
-// needs attention.
+// needs attention. Recovery unmounts the strip, so the verdict is also
+// carried by a live region that survives it — otherwise a self-hiding strip
+// can never announce that it came back.
 
-import { useCallback, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { AnimatePresence, motion } from 'framer-motion';
 import { cn } from '../ui';
 import { usePolling } from '../../hooks/usePolling';
 import type { JarvisStatus } from './types';
 import { initialRegistryState, reduceRegistryState } from './action-registry-state';
+import { projectHealthSubsystems, recoverAnnouncement, type HealthSubsystemState } from './health-banner-subsystems';
 
 type Level = 'ok' | 'starting' | 'warn' | 'down' | 'unavailable';
 export const STARTUP_GRACE_MS = 20_000;
@@ -83,12 +86,31 @@ export function deriveHealthPresentation(
 
 // ── Component ──────────────────────────────────────────────────
 
+const DOT_CLASS: Record<HealthSubsystemState, string> = {
+  up: 'bg-emerald-400',
+  down: 'bg-red-400',
+  unknown: 'bg-amber-400',
+  unprobed: 'bg-bone/40',
+};
+
+const DETAIL_CLASS: Record<HealthSubsystemState, string> = {
+  up: 'text-bone/70',
+  down: 'text-amber-200',
+  unknown: 'text-amber-200/80',
+  unprobed: 'text-bone/50',
+};
+
 export default function HealthBanner() {
   const mountedAtRef = useRef(Date.now());
   const [observation, dispatch] = useReducer(reduceRegistryState<JarvisStatus>, initialRegistryState<JarvisStatus>());
   const requestIdRef = useRef(0);
   const { snapshot: status, loading, error } = observation;
   const [expanded, setExpanded] = useState(false);
+  // A focused Retry disappears with the strip the moment its read recovers.
+  // Without a hand-off the browser strands focus on the document body, so the
+  // flag is held until the announcement region is mounted and takes it instead.
+  const focusAfterRetry = useRef(false);
+  const announcementRef = useRef<HTMLDivElement | null>(null);
 
   const fetchStatus = useCallback(async () => {
     const requestId = ++requestIdRef.current;
@@ -107,74 +129,89 @@ export default function HealthBanner() {
     ? deriveHealthPresentation(status, error ? 'unavailable' : null, Date.now() - mountedAtRef.current)
     : { level: 'unavailable' as const, label: 'Unavailable', summary: 'Health observation is unavailable.' };
   const level = presentation.level;
-  if (level === 'ok') return null;
+  const stripStyle = level === 'ok' ? null : LEVEL_STYLES[level];
+  const subsystems = projectHealthSubsystems(status);
+  // The strip unmounts itself when healthy, so recovery is only ever said here.
+  const announcement = level === 'ok' ? recoverAnnouncement(subsystems) : presentation.summary;
 
-  const style = LEVEL_STYLES[level];
-  const subsystems: Array<{ name: string; up: boolean; detail?: string }> = status ? [
-    { name: 'Bun server', up: !!(status.bun_server_running), detail: status.bun_server_url ?? undefined },
-    { name: 'Ollama', up: !!(status.ollama_running), detail: (status.model_available ? status.model : 'model not loaded') ?? 'model not loaded' },
-    { name: 'Model', up: !!(status.model_available), detail: status.model ?? '—' },
-    { name: 'OR key', up: !!(status.openrouter_key_set) },
-    { name: 'Claude proxy', up: !!(status.claude_proxy_running), detail: ':19878' },
-    { name: 'Bridge', up: !!(status.bridge_active), detail: status.bridge_port !== undefined ? `:${status.bridge_port}` : undefined },
-  ] : [];
+  useEffect(() => {
+    if (!focusAfterRetry.current || !announcement) return;
+    const node = announcementRef.current;
+    if (!node) return;
+    focusAfterRetry.current = false;
+    node.focus();
+  }, [announcement]);
+
+  const retry = () => {
+    focusAfterRetry.current = true;
+    void fetchStatus();
+  };
 
   return (
-    <div className={cn('border-b px-6 py-1.5 text-xs', style.bar)}>
-      {loading && (
-        <div role="status" aria-label="Health observation">
-          {status ? 'Refreshing health observation…' : 'Checking health…'}
-        </div>
-      )}
-      {error && (
-        <div role="alert" className="flex items-center gap-2">
-          <span>
-            Health observation is unavailable.
-            {status && ' Showing previously observed health details; they may be stale.'}
-          </span>
-          <button type="button" disabled={loading} onClick={fetchStatus}
-            className="rounded border px-2 py-0.5 disabled:opacity-50">
-            Retry
-          </button>
-        </div>
-      )}
-      {status && <>
-      <button
-        type="button"
-        aria-expanded={expanded}
-        onClick={() => setExpanded(e => !e)}
-        className="flex items-center gap-2 w-full text-left"
-      >
-        <span className={cn('w-2 h-2 rounded-full animate-pulse', style.dot)} />
-        <span className="font-medium uppercase tracking-wider text-[10px]">{presentation.label}</span>
-        <span className="truncate opacity-90">{presentation.summary}</span>
-        <span className="ml-auto opacity-60 font-mono text-[10px]">
-          {expanded ? 'hide ▲' : 'details ▼'}
-        </span>
-      </button>
-
-      <AnimatePresence initial={false}>
-        {expanded && (
-          <motion.div
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: 'auto', opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            className="overflow-hidden"
-          >
-            <div className="flex flex-wrap gap-x-4 gap-y-1 pt-2 pb-1 font-mono text-[10px] text-bone/70">
-              {subsystems.map(sub => (
-                <span key={sub.name} className="inline-flex items-center gap-1">
-                  <span className={cn('w-1.5 h-1.5 rounded-full', sub.up ? 'bg-emerald-400' : 'bg-red-400')} />
-                  {sub.name}
-                  {sub.detail && <span className="opacity-50">({sub.detail})</span>}
-                </span>
-              ))}
-              <span className="opacity-50">active: {status.active_backend}</span>
-            </div>
-          </motion.div>
+    <>
+      <div role="status" aria-label="Health announcement" aria-atomic="true" className="sr-only">
+        <div ref={announcementRef} tabIndex={-1} className="focus:outline-none">{announcement}</div>
+      </div>
+      {stripStyle && (
+        <div className={cn('border-b px-6 py-1.5 text-xs', stripStyle.bar)}>
+        {loading && (
+          <div role="status" aria-label="Health observation">
+            {status ? 'Refreshing health observation…' : 'Checking health…'}
+          </div>
         )}
-      </AnimatePresence>
-      </>}
-    </div>
+        {error && (
+          <div role="alert" className="flex items-center gap-2">
+            <span>
+              Health observation is unavailable.
+              {status && ' Showing previously observed health details; they may be stale.'}
+            </span>
+            <button type="button" disabled={loading} onClick={retry}
+              className="rounded border px-2 py-0.5 disabled:opacity-50">
+              Retry
+            </button>
+          </div>
+        )}
+        {status && <>
+        <button
+          type="button"
+          aria-expanded={expanded}
+          onClick={() => setExpanded(e => !e)}
+          className="flex items-center gap-2 w-full text-left"
+        >
+          <span className={cn('w-2 h-2 rounded-full animate-pulse', stripStyle.dot)} />
+          <span className="font-medium uppercase tracking-wider text-[10px]">{presentation.label}</span>
+          <span className="truncate opacity-90">{presentation.summary}</span>
+          <span className="ml-auto opacity-60 font-mono text-[10px]">
+            {expanded ? 'hide ▲' : 'details ▼'}
+          </span>
+        </button>
+
+        <AnimatePresence initial={false}>
+          {expanded && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              className="overflow-hidden"
+            >
+              <ul className="flex flex-wrap gap-x-4 gap-y-1 pt-2 pb-1 font-mono text-[10px] text-bone/70">
+                {subsystems.rows.map(row => (
+                  <li key={row.key} aria-label={row.announcement} className="inline-flex items-center gap-1">
+                    <span className={cn('w-1.5 h-1.5 rounded-full', DOT_CLASS[row.state])} />
+                    {row.name}
+                    <span className={DETAIL_CLASS[row.state]}>{row.stateWord}</span>
+                    <span className="opacity-50">· {row.requirementLabel}</span>
+                    {row.detail && <span className="opacity-50">({row.detail})</span>}
+                  </li>
+                ))}
+                <li className="opacity-50">active: {status.active_backend}</li>
+              </ul>
+            </motion.div>
+          )}
+        </AnimatePresence>
+        </>}
+        </div>
+      )}
+    </>
   );
 }

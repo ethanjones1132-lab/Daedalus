@@ -56,7 +56,12 @@ describe('HealthBanner observation state', () => {
     expect(requests).toHaveLength(2);
     await settle(1);
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
-    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    // The strip self-hides on health, so the recovery is asserted where it is
+    // still said out loud rather than as an absence of the strip.
+    expect(screen.queryByRole('status', { name: 'Health observation' })).not.toBeInTheDocument();
+    expect(screen.getByRole('status', { name: 'Health announcement' })).toHaveTextContent(
+      'Health recovered: all services required by the active inference backend (openrouter) are running.',
+    );
     expect(screen.queryByRole('button')).not.toBeInTheDocument();
     expect(vi.mocked(invoke).mock.calls).toEqual([['jarvis_check_status'], ['jarvis_check_status']]);
   });
@@ -121,5 +126,110 @@ describe('HealthBanner observation state', () => {
     cleanup();
     await advance();
     expect(requests).toHaveLength(3);
+  });
+});
+
+const announcement = () => screen.getByRole('status', { name: 'Health announcement' });
+const offline: JarvisStatus = { ...healthy, openrouter_key_set: false };
+const details = () => fireEvent.click(screen.getByRole('button', { name: /details/ }));
+
+describe('HealthBanner required-set presentation', () => {
+  it('prints the required/not-required distinction as text for every subsystem', async () => {
+    await mount();
+    await settle(0, { ...offline, ollama_running: false, claude_proxy_running: false, model_available: true });
+    details();
+
+    expect(screen.getByRole('listitem', { name: 'Bun server is running and required by the active inference backend.' })).toBeInTheDocument();
+    expect(screen.getByRole('listitem', { name: 'Bridge is running and required by the active inference backend.' })).toBeInTheDocument();
+    expect(screen.getByRole('listitem', { name: 'OpenRouter key is not set and required by the active inference backend.' })).toBeInTheDocument();
+    expect(screen.getByRole('listitem', { name: 'Ollama is not running and not required by the active inference backend.' })).toBeInTheDocument();
+    expect(screen.getByRole('listitem', { name: 'Claude proxy is not running and not required by the active inference backend.' })).toBeInTheDocument();
+    // The state is legible without colour: the same words are in the rendered text.
+    expect(screen.getByRole('listitem', { name: /Ollama/ })).toHaveTextContent('not required');
+    expect(screen.getByRole('listitem', { name: /Claude proxy/ })).toHaveTextContent('not required');
+    expect(screen.getByRole('listitem', { name: /OpenRouter key/ })).toHaveTextContent('is not set');
+  });
+
+  it('never presents the model row as measured when the active backend is not Ollama', async () => {
+    await mount();
+    // `model_available: true` is what Native reports for any non-Ollama backend.
+    await settle(0, { ...offline, ollama_running: false, model_available: true, model: 'openrouter/free' });
+    details();
+
+    expect(screen.getByRole('listitem', { name: 'Local model was not probed and not required by the active inference backend.' })).toBeInTheDocument();
+    const model = screen.getByRole('listitem', { name: /Local model/ });
+    expect(model).toHaveTextContent('not probed');
+    expect(model).toHaveTextContent('(openrouter/free)');
+    expect(screen.queryByText(/is loaded/)).not.toBeInTheDocument();
+  });
+
+  it('does not blame the model when Ollama itself is down under the Ollama backend', async () => {
+    await mount();
+    await settle(0, {
+      ...offline,
+      active_backend: 'ollama',
+      ollama_running: false,
+      model_available: false,
+      model: 'qwen3:8b',
+    });
+    details();
+
+    expect(screen.getByRole('listitem', { name: 'Ollama is not running and required by the active inference backend.' })).toBeInTheDocument();
+    const model = screen.getByRole('listitem', { name: 'Local model was not probed and required by the active inference backend.' });
+    expect(model).toBeInTheDocument();
+    expect(model).toHaveTextContent('not probed');
+    expect(screen.queryByText(/model not loaded/)).not.toBeInTheDocument();
+  });
+});
+
+describe('HealthBanner recovery', () => {
+  it('announces recovery after the strip self-hides', async () => {
+    await mount();
+    await settle(0, offline);
+    expect(screen.getByText('Offline')).toBeInTheDocument();
+    expect(announcement()).toHaveTextContent('Backend "openrouter" is unreachable');
+
+    await advance();
+    await settle(1, healthy);
+    expect(screen.queryByText('Offline')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button')).not.toBeInTheDocument();
+    expect(announcement()).toHaveTextContent(
+      'Health recovered: all services required by the active inference backend (openrouter) are running.',
+    );
+    expect(announcement()).toHaveTextContent('Not required by this backend: Ollama, Local model and Claude proxy.');
+  });
+
+  it('announces a degradation that appears after health', async () => {
+    await mount();
+    await settle(0, healthy);
+    expect(announcement()).toHaveTextContent('Health recovered');
+
+    await advance();
+    await settle(1, offline);
+    expect(announcement()).toHaveTextContent('Backend "openrouter" is unreachable');
+  });
+
+  it('never announces recovery while the active inference backend is unconfirmed', async () => {
+    await mount();
+    await settle(0, { ...offline, active_backend: 'llama_cpp' });
+
+    expect(screen.getByText('Offline')).toBeInTheDocument();
+    expect(announcement()).not.toHaveTextContent('Health recovered');
+    expect(announcement()).toHaveTextContent('Backend "llama_cpp" is unreachable');
+  });
+
+  it('keeps focus off the document body when a focused Retry disappears on recovery', async () => {
+    const { container } = render(<HealthBanner />);
+    await act(async () => {});
+    await fail(0);
+    const retry = screen.getByRole('button', { name: 'Retry' });
+    retry.focus();
+    expect(document.activeElement).toBe(retry);
+
+    fireEvent.click(retry);
+    await settle(1, healthy);
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
+    expect(document.activeElement).not.toBe(document.body);
+    expect(container.contains(document.activeElement)).toBe(true);
   });
 });

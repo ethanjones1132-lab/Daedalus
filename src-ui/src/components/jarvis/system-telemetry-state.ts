@@ -451,6 +451,18 @@ function listNames(names: string[]): string {
   if (names.length === 1) return names[0];
   return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
 }
+export { listNames };
+
+/**
+ * The one requirement vocabulary both mounted health surfaces print, so a
+ * service the active backend does not need can never read as a fault on one
+ * surface and as a fault on the other.
+ */
+export const REQUIREMENT_WORDS: Record<ServiceRequirement, string> = {
+  required: ' and required by the active inference backend',
+  not_required: ' and not required by the active inference backend',
+  unknown: ' and whether it is required is unknown because the active inference backend is not confirmed',
+};
 
 /**
  * One sentence naming what the current verdict is and why, so degradation and

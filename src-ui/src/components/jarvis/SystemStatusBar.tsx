@@ -10,6 +10,7 @@ import {
   type ServiceRequirement,
   type ServiceState,
   type TelemetryServiceKey,
+  REQUIREMENT_WORDS,
   SERVICE_NAMES,
 } from './system-telemetry-state';
 
@@ -37,12 +38,6 @@ const STATE_WORDS: Record<ServiceState, string> = {
   up: 'is up',
   down: 'is not running',
   unknown: 'state is unknown',
-};
-
-const REQUIREMENT_WORDS: Record<ServiceRequirement, string> = {
-  required: ' and required by the active inference backend',
-  not_required: ' and not required by the active inference backend',
-  unknown: ' and whether it is required is unknown because the active inference backend is not confirmed',
 };
 
 const REQUIREMENT_MARKS: Record<ServiceRequirement, string> = {
