@@ -97,10 +97,16 @@ it.each(['success', 'failure'])('ignores obsolete %s after a post-restart refres
   render(<ControlCenterView />);
   await screen.findByText('Alpha'); diagnostics();
   const old = deferred();
-  invokeMock.mockReturnValue(old.promise);
+  invokeMock.mockImplementation((command: string) => command === 'get_doctor_report' ? old.promise : Promise.resolve(fixtures[command] ?? true));
   fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
   expect(screen.getByRole('button', { name: 'Refresh' })).toBeDisabled();
-  invokeMock.mockImplementation((command: string) => Promise.resolve(command === 'get_doctor_report' ? { ...doctor, checks: [{ name: 'New observation', status: 'ok', detail: 'new' }] } : fixtures[command] ?? true));
+  invokeMock.mockImplementation((command: string) => Promise.resolve(
+     command === 'get_doctor_report'
+       ? { ...doctor, checks: [{ name: 'New observation', status: 'ok', detail: 'new' }] }
+       : command === 'get_system_health'
+         ? { ...health, bun_server: { ...health.bun_server, running: true } }
+         : fixtures[command] ?? true,
+   ));
   fireEvent.click(screen.getByRole('button', { name: 'Restart Bun server' }));
   await screen.findByText('New observation');
   await act(async () => { if (outcome === 'success') old.resolve(doctor); else old.reject(new Error('obsolete error')); });

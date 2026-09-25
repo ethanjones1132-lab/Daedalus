@@ -25,6 +25,13 @@ import {
 } from '../ui';
 import McpPanel from './McpPanel';
 import {
+  initialServiceRestartState,
+  reduceServiceRestartState,
+  restartServiceRunning,
+  serviceRestartBusy,
+  type ServiceRestartState,
+} from './service-restart-state';
+import {
   DEFAULT_MODEL_PROFILE_DRAFT,
   validateCreateProfileDraft,
   type CreateProfileArgs,
@@ -142,11 +149,17 @@ function Bar({ percent, danger }: { percent: number; danger?: boolean }) {
 
 // Each native resource owns its observation lifetime. Post-operation reads may
 // supersede pending reads; only the newest completion can publish a snapshot.
+interface ResourceLoadResult<S> {
+  snapshot: S | null;
+  accepted: boolean;
+  failed: boolean;
+}
+
 function useControlResource<S>(command: string) {
   const [state, setState] = useState(initialRegistryState<S>);
   const request = useRef(0);
   const pending = useRef(false);
-  const load = useCallback(async (supersede = false) => {
+  const loadDetailed = useCallback(async (supersede = false): Promise<ResourceLoadResult<S> | null> => {
     if (pending.current && !supersede) return null;
     pending.current = true;
     const requestId = ++request.current;
@@ -154,23 +167,27 @@ function useControlResource<S>(command: string) {
     try {
       const snapshot = await invoke<S>(command);
       if (snapshot == null) throw new Error('Missing observation');
-      if (request.current !== requestId) return null;
+      if (request.current !== requestId) return { snapshot: null, accepted: false, failed: false };
       setState((prev) => reduceRegistryState(prev, { type: 'success', requestId, snapshot }));
-      return snapshot;
+      return { snapshot, accepted: true, failed: false };
     } catch {
-      if (request.current !== requestId) return null;
+      if (request.current !== requestId) return { snapshot: null, accepted: false, failed: false };
       setState((prev) => reduceRegistryState(prev, { type: 'failure', requestId }));
-      return null;
+      return { snapshot: null, accepted: true, failed: true };
     } finally {
       if (request.current === requestId) pending.current = false;
     }
   }, [command]);
+  const load = useCallback(async (supersede = false) => {
+    const result = await loadDetailed(supersede);
+    return result?.snapshot ?? null;
+  }, [loadDetailed]);
   const invalidate = useCallback(() => {
     const requestId = ++request.current;
     pending.current = false;
     setState((prev) => ({ ...prev, requestId, loading: false }));
   }, []);
-  return { ...state, load, invalidate };
+  return { ...state, load, loadDetailed, invalidate };
 }
 
 function ObservationFeedback({ label, resource }: {
@@ -198,6 +215,40 @@ function ObservationFeedback({ label, resource }: {
   );
 }
 
+function RestartFeedback({ state, name, busy, onRetryRestart, onRetryHealth }: {
+  state: ServiceRestartState;
+  name: string;
+  busy: boolean;
+  onRetryRestart: () => void;
+  onRetryHealth: () => void;
+}) {
+  const label = `Restart ${name}`;
+  if (state.phase === 'writing') return <div role="status" aria-label={label}>Restarting {name}…</div>;
+  if (state.phase === 'confirming') return <div role="status" aria-label={label}>Confirming {name} restart…</div>;
+  if (state.phase === 'confirmed') return <div role="status" aria-label={label}>{name} restart confirmed.</div>;
+  if (state.phase === 'noop') return <div role="status" aria-label={label}>{name} restart not required; no restart was performed.</div>;
+  if (state.phase === 'write-failed') {
+    return (
+      <div role="alert" aria-label={label}>
+        Could not restart {name}. Showing the last observed health snapshot.
+        <button type="button" disabled={busy} onClick={onRetryRestart} className="ml-2 px-2 py-1 rounded border border-white/10 disabled:opacity-50">Retry restart</button>
+      </div>
+    );
+  }
+  if (state.phase === 'read-failed' || state.phase === 'read-mismatch') {
+    const message = state.phase === 'read-failed'
+      ? `${name} restart was requested, but health did not confirm it. Showing the last observed health snapshot; it may be stale.`
+      : `${name} restart was requested, but health reported it not running. Showing the last observed health snapshot; it may be stale.`;
+    return (
+      <div role="alert" aria-label={label}>
+        {message}
+        <button type="button" disabled={busy} onClick={onRetryHealth} className="ml-2 px-2 py-1 rounded border border-white/10 disabled:opacity-50">Retry health confirmation</button>
+      </div>
+    );
+  }
+  return null;
+}
+
 // ── Main view ──────────────────────────────────────────────────
 
 interface ControlCenterViewProps {
@@ -210,7 +261,7 @@ export default function ControlCenterView({ initialTab = 'overview' }: ControlCe
   const healthResource = useControlResource<HealthData>('get_system_health');
   const doctorResource = useControlResource<DoctorReport>('get_doctor_report');
   const { load: loadProfiles, invalidate: invalidateProfiles } = profileResource;
-  const { load: loadHealth } = healthResource;
+  const { load: loadHealth, loadDetailed: loadHealthDetailed, invalidate: invalidateHealth } = healthResource;
   const { load: loadDoctor } = doctorResource;
   const profiles = profileResource.snapshot ?? [];
   const health = healthResource.snapshot;
@@ -234,8 +285,11 @@ export default function ControlCenterView({ initialTab = 'overview' }: ControlCe
     setPhase(operationPhase.current);
   }, []);
   const mutationLocked = profileOperationLocked(phase) || creatingProfile || profileCreationError === 'reconciliation';
-  const [restarting, setRestarting] = useState<SubsystemKey | null>(null);
-  const { success, error: toastError } = useToast();
+  const [restartState, setRestartState] = useState<ServiceRestartState>(initialServiceRestartState);
+  const restartPending = useRef(false);
+  const restartOperation = useRef(0);
+  const restartBusy = serviceRestartBusy(restartState);
+  const { success, info } = useToast();
 
   const refreshProfiles = useCallback(async (supersede = false) => {
     if (profileOperationLocked(operationPhase.current) || profileCreatePending.current) return null;
@@ -384,27 +438,76 @@ export default function ControlCenterView({ initialTab = 'overview' }: ControlCe
     if (pendingDelete) await mutateProfile('delete', pendingDelete);
   }, [pendingDelete, mutateProfile]);
 
-  // Per-row restart handler. The backend commands return a specific error
-  // string (see lib.rs force_restart_jarvis_server / recovery_stubs
-  // jarvis_restart_*) so the toast surfaces the real reason instead of
-  // silently doing nothing.
-  const restartSubsystem = useCallback(
-    async (row: SubsystemRow) => {
-      if (restarting) return;
-      setRestarting(row.key);
-      try {
-        await invoke<boolean>(row.command);
-        success(`${row.name} restarted`, 'Restart');
-        await fetchAll();
-      } catch (e) {
-        toastError(String(e), `Restart ${row.name} failed`);
-        await fetchAll();
-      } finally {
-        setRestarting(null);
+  const subsystemRows: SubsystemRow[] = health ? [
+    { key: 'ollama', name: 'Ollama', up: health.ollama.running, detail: health.ollama.url, command: 'jarvis_restart_ollama', giveUp: health.supervisor?.ollama_give_up === true },
+    { key: 'bun', name: 'Bun server', up: health.bun_server.running, detail: health.bun_server.url, command: 'jarvis_restart_server', giveUp: health.supervisor?.bun_give_up === true },
+    { key: 'bridge', name: 'Bridge', up: health.bridge.running, detail: `:${health.bridge.port}`, command: 'restart_bridge', giveUp: false },
+    { key: 'proxy', name: 'Claude proxy', up: health.claude_proxy.running, detail: `:${health.claude_proxy.port}`, command: 'jarvis_restart_proxy', giveUp: health.supervisor?.proxy_give_up === true },
+  ] : [];
+
+  const confirmRestartReadback = useCallback(async (row: SubsystemRow, operationId: number) => {
+    if (operationId !== restartOperation.current) return;
+    setRestartState((current) => reduceServiceRestartState(current, { type: 'readback-start', key: row.key }));
+    const result = await loadHealthDetailed(true);
+    if (operationId !== restartOperation.current) return;
+    if (!result?.accepted || result.failed || result.snapshot === null) {
+      setRestartState((current) => reduceServiceRestartState(current, { type: 'readback-failed', key: row.key }));
+      return;
+    }
+    if (row.key !== 'bridge' && !restartServiceRunning(row.key, result.snapshot)) {
+      setRestartState((current) => reduceServiceRestartState(current, { type: 'readback-mismatch', key: row.key }));
+      return;
+    }
+    setRestartState((current) => reduceServiceRestartState(current, { type: 'readback-confirmed', key: row.key }));
+    success(`${row.name} restarted`, 'Restart');
+    void loadDoctor(true);
+  }, [loadDoctor, loadHealthDetailed, success]);
+
+  const restartSubsystem = useCallback(async (row: SubsystemRow) => {
+    if (restartPending.current) return;
+    restartPending.current = true;
+    const operationId = ++restartOperation.current;
+    invalidateHealth();
+    setRestartState((current) => reduceServiceRestartState(current, { type: 'start', key: row.key }));
+    try {
+      const result = await invoke<boolean>(row.command);
+      if (operationId !== restartOperation.current) return;
+      if (result !== true) {
+        setRestartState((current) => reduceServiceRestartState(current, { type: 'command-false', key: row.key }));
+        info(`${row.name} restart not required; no restart was performed.`, 'Restart');
+        return;
       }
-    },
-    [restarting, fetchAll, success, toastError],
-  );
+      if (row.key === 'bridge') {
+        setRestartState((current) => reduceServiceRestartState(current, { type: 'readback-confirmed', key: row.key }));
+        success(`${row.name} restarted`, 'Restart');
+        return;
+      }
+      await confirmRestartReadback(row, operationId);
+    } catch {
+      if (operationId === restartOperation.current) {
+        setRestartState((current) => reduceServiceRestartState(current, { type: 'command-failed', key: row.key }));
+      }
+    } finally {
+      if (operationId === restartOperation.current) restartPending.current = false;
+    }
+  }, [confirmRestartReadback, info, invalidateHealth, success]);
+
+  const retryRestartHealth = useCallback(async () => {
+    if (restartPending.current || (restartState.phase !== 'read-failed' && restartState.phase !== 'read-mismatch')) return;
+    const row = subsystemRows.find((candidate) => candidate.key === restartState.key);
+    if (!row || row.key === 'bridge') return;
+    restartPending.current = true;
+    const operationId = ++restartOperation.current;
+    await confirmRestartReadback(row, operationId);
+    if (operationId === restartOperation.current) restartPending.current = false;
+  }, [confirmRestartReadback, restartState, subsystemRows]);
+
+  const retryRestart = useCallback(() => {
+    const row = subsystemRows.find((candidate) => candidate.key === restartState.key);
+    if (row) void restartSubsystem(row);
+  }, [restartState, restartSubsystem, subsystemRows]);
+
+  const restartRow = restartState.key ? subsystemRows.find((row) => row.key === restartState.key) : undefined;
 
   const activeProfile = profiles.find((p) => p.is_active) ?? null;
 
@@ -424,8 +527,8 @@ export default function ControlCenterView({ initialTab = 'overview' }: ControlCe
         action={
           <button
             type="button"
-            onClick={() => { if (!loading && !creatingProfile) void fetchAll(); }}
-            disabled={loading || creatingProfile}
+            onClick={() => { if (!loading && !creatingProfile && !restartBusy) void fetchAll(); }}
+            disabled={loading || creatingProfile || restartBusy}
             className="px-3 py-1.5 text-xs rounded-lg border border-white/10 text-bone/60 hover:text-bone transition-colors"
           >
             Refresh
@@ -760,6 +863,15 @@ export default function ControlCenterView({ initialTab = 'overview' }: ControlCe
         ) : tab === 'diagnostics' ? (
           // ── Diagnostics ──
           <div className="space-y-3">
+            {restartRow && (
+              <RestartFeedback
+                state={restartState}
+                name={restartRow.name}
+                busy={restartBusy}
+                onRetryRestart={retryRestart}
+                onRetryHealth={() => { void retryRestartHealth(); }}
+              />
+            )}
             {health ? (
               <GlassCard className="p-4 space-y-3">
                 <div className="flex items-center gap-2">
@@ -771,13 +883,8 @@ export default function ControlCenterView({ initialTab = 'overview' }: ControlCe
                   </span>
                 </div>
                 <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
-                  {([
-                    { key: 'ollama', name: 'Ollama', up: health.ollama.running, detail: health.ollama.url, command: 'jarvis_restart_ollama', giveUp: health.supervisor?.ollama_give_up === true },
-                    { key: 'bun', name: 'Bun server', up: health.bun_server.running, detail: health.bun_server.url, command: 'jarvis_restart_server', giveUp: health.supervisor?.bun_give_up === true },
-                    { key: 'bridge', name: 'Bridge', up: health.bridge.running, detail: `:${health.bridge.port}`, command: 'restart_bridge', giveUp: false },
-                    { key: 'proxy', name: 'Claude proxy', up: health.claude_proxy.running, detail: `:${health.claude_proxy.port}`, command: 'jarvis_restart_proxy', giveUp: health.supervisor?.proxy_give_up === true },
-                  ] as SubsystemRow[]).map((s) => {
-                    const busy = restarting === s.key;
+                  {subsystemRows.map((s) => {
+                    const busy = restartBusy && restartState.key === s.key;
                     // Surface the silent-give-up state: the supervisor has hit
                     // `MAX_CONSECUTIVE_RESTARTS` and is no longer auto-restarting
                     // this service. The pill + the inline hint steer the user
@@ -802,7 +909,7 @@ export default function ControlCenterView({ initialTab = 'overview' }: ControlCe
                         <button
                           type="button"
                           onClick={() => restartSubsystem(s)}
-                          disabled={busy || restarting !== null}
+                          disabled={restartBusy || busy}
                           className={cn(
                             'px-2 py-0.5 rounded-md border text-[10px] font-mono transition-colors',
                             'border-white/10 text-bone/60 hover:text-bone hover:border-white/20',
