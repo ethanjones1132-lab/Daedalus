@@ -1,6 +1,9 @@
 import type { JarvisMessage, JarvisTerminalOutcome } from './types';
+import type { ActivityItem } from './activity-ledger';
 import { isTerminalStageStatus } from './sse-protocol';
 import type { ToolResultTruncationMetadata } from './sse-protocol';
+
+export type { ActivityItem } from './activity-ledger';
 
 /** Synchronous send lock with generations so stale completions cannot unlock a replacement. */
 export class SendGate {
@@ -286,10 +289,6 @@ export function formatAgentProgressSummary(
 // answer. Pure / order-preserving: steps then tools, with an optional live
 // stage row when the orchestrator is mid-stage.
 
-export type ActivityItem =
-  | { kind: 'stage'; id: string; stage: string }
-  | { kind: 'tool'; id: string; call: ToolCallState }
-  | { kind: 'plan'; id: string; stage: string; text: string };
 
 /**
  * Build a chronological activity feed from existing turn telemetry.
@@ -349,6 +348,8 @@ export function buildActivityFeed(
 export function formatActivityFeedSummary(items: ActivityItem[]): string {
   const planCount = items.filter((item) => item.kind === 'plan').length;
   const toolCount = items.filter((item) => item.kind === 'tool').length;
+  const directiveCount = items.filter((item) => item.kind === 'directive').length;
+  const diagnosticCount = items.filter((item) => item.kind === 'diagnostic').length;
   const liveStage = [...items].reverse().find((item) => item.kind === 'stage');
   const parts: string[] = [];
   if (planCount > 0) {
@@ -356,6 +357,12 @@ export function formatActivityFeedSummary(items: ActivityItem[]): string {
   }
   if (toolCount > 0) {
     parts.push(`${toolCount} tool${toolCount === 1 ? '' : 's'}`);
+  }
+  if (directiveCount > 0) {
+    parts.push(`${directiveCount} directive${directiveCount === 1 ? '' : 's'}`);
+  }
+  if (diagnosticCount > 0) {
+    parts.push(`${diagnosticCount} diagnostic${diagnosticCount === 1 ? '' : 's'}`);
   }
   if (liveStage && liveStage.kind === 'stage') {
     parts.push(liveStage.stage);

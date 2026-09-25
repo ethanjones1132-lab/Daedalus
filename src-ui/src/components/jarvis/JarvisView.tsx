@@ -29,7 +29,6 @@ import {
   isPassiveSseFrame,
   parseSseDataLine,
   readToolResultTruncation,
-  type ToolResultTruncationMetadata,
 } from './sse-protocol';
 import {
   SendGate,
@@ -52,6 +51,15 @@ import {
   type ToolCallState,
 } from './chat-state';
 import { errorDisplayForCode } from './error-display';
+import {
+  activityLedgerItems,
+  createActivityLedger,
+  decodeConductorDirectiveFrame,
+  reduceActivityLedger,
+  type ActivityLedgerEvent,
+  type ActivityLedgerState,
+  type ActivityToolCall,
+} from './activity-ledger';
 import {
   acceptFirstTerminal,
   boundedPartialOutput,
@@ -579,6 +587,13 @@ export function ChatPanel({
 
   // Phase 3.1 — inline tool-call cards built from `tool_use` / `tool_result`.
   const [toolCalls, setToolCalls] = useState<ToolCallState[]>([]);
+  const [activityLedger, setActivityLedger] = useState<ActivityLedgerState>(() => createActivityLedger());
+  const dispatchActivity = useCallback((event: ActivityLedgerEvent) => {
+    setActivityLedger((current) => reduceActivityLedger(current, event));
+  }, []);
+  const resetActivityLedger = useCallback(() => {
+    setActivityLedger(createActivityLedger());
+  }, []);
 
   // Phase 3.3 — token / cost tally for the current turn.
   const [turnCost, setTurnCost] = useState<{ tokens: number; costUsd: number } | null>(null);
@@ -742,11 +757,12 @@ export function ChatPanel({
     const text = pendingTokenRef.current;
     if (!text) return;
     pendingTokenRef.current = '';
-    setError(null);
-    setPipelineStage('');
-    turnHadResponseTextRef.current = true;
+     setError(null);
+     setPipelineStage('');
+     dispatchActivity({ kind: 'live_stage', stage: '' });
+     turnHadResponseTextRef.current = true;
     setMessages(prev => applyTokenChunk(prev, text));
-  }, [applyTokenChunk]);
+  }, [applyTokenChunk, dispatchActivity]);
 
   /** Drop buffered tokens + cancel rAF (session wipe / new chat). */
   const discardPendingTokens = useCallback(() => {
@@ -877,14 +893,15 @@ export function ChatPanel({
       setReasoningText('');
       setShowReasoning(false);
       setAgentSteps([]);
-       setShowAgents(true);
-       setToolCalls([]);
-       setTurnCost(null);
-       setScopeNotice(null);
-       setRunMetrics(null);
-       setTurnElapsedMs(0);
-       turnStartedAtRef.current = null;
-       clearPendingApproval();
+      setShowAgents(true);
+      setToolCalls([]);
+      resetActivityLedger();
+      setTurnCost(null);
+      setScopeNotice(null);
+      setRunMetrics(null);
+      setTurnElapsedMs(0);
+      turnStartedAtRef.current = null;
+      clearPendingApproval();
       setApprovalError(null);
       setError(null);
       turnHadResponseTextRef.current = false;
@@ -898,15 +915,16 @@ export function ChatPanel({
     if (!activeSession) {
       setLoadingHistory(false);
       discardPendingTokens();
-       setMessages([]);
-       setSessionId('');
-       setToolCalls([]);
-       setTurnCost(null);
-       setScopeNotice(null);
-       setRunMetrics(null);
-       setTurnElapsedMs(0);
-       turnStartedAtRef.current = null;
-       setError(null);
+      setMessages([]);
+      setSessionId('');
+      setToolCalls([]);
+      resetActivityLedger();
+      setTurnCost(null);
+      setScopeNotice(null);
+      setRunMetrics(null);
+      setTurnElapsedMs(0);
+      turnStartedAtRef.current = null;
+      setError(null);
       setPipelineStage('');
       setReasoningText('');
       setAgentSteps([]);
@@ -977,6 +995,7 @@ export function ChatPanel({
 
     track(listen<{ session_id: string }>('jarvis://done', (event) => {
       if (!matchesStreamSession(event.payload.session_id)) return;
+      dispatchActivity({ kind: 'terminal', outcome: 'success' });
       finalizeAssistantMessage(event.payload.session_id);
     }));
 
@@ -993,6 +1012,7 @@ export function ChatPanel({
       const pending = takePendingTokens();
       setIsStreaming(false);
       setPipelineStage('');
+      dispatchActivity({ kind: 'terminal', outcome: 'failed' });
       setRecursionDepth(null);
       clearPendingApproval();
       setError(event.payload.error);
@@ -1030,6 +1050,7 @@ export function ChatPanel({
       const pending = takePendingTokens();
       setIsStreaming(false);
       setPipelineStage('');
+      dispatchActivity({ kind: 'terminal', outcome: 'cancelled' });
       setRecursionDepth(null);
       setError(null);
       setMessages(prev => {
@@ -1053,6 +1074,7 @@ export function ChatPanel({
         text: isTerminalStageStatus(status) ? status : 'started',
         source: 'stage',
       }));
+      dispatchActivity({ kind: 'stage', stage, status });
     }));
 
     track(listen<{ depth: number; status: string; reenter_stage?: string; critique?: string; session_id?: string }>('jarvis://recursion', (event) => {
@@ -1082,8 +1104,12 @@ export function ChatPanel({
       const { stage, text } = event.payload;
       if (stage === 'coordinator') {
         setPipelineStage('coordinator');
+        dispatchActivity({ kind: 'live_stage', stage });
         return;
       }
+      const filtered = appendAgentProgress([], { stage, text, source: 'activity' });
+      const step = filtered[0];
+      if (step) dispatchActivity({ kind: 'agent_activity', stage: step.stage, text: step.text });
       setAgentSteps(prev => appendAgentProgress(prev, { stage, text, source: 'activity' }));
     }));
 
@@ -1105,11 +1131,13 @@ export function ChatPanel({
 
     track(listen<{ call_id?: string; name: string; arguments: unknown; session_id?: string }>('jarvis://tool_call', (event) => {
       if (!matchesStreamSession(event.payload.session_id)) return;
-      setToolCalls(prev => [...prev, {
+      const call = {
         call_id: event.payload.call_id,
         name: event.payload.name,
         arguments: event.payload.arguments,
-      }]);
+      };
+      setToolCalls(prev => [...prev, call]);
+      dispatchActivity({ kind: 'tool_use', callId: call.call_id, name: call.name, arguments: call.arguments });
     }));
 
     track(listen<{
@@ -1127,6 +1155,13 @@ export function ChatPanel({
         output,
         isError: is_error,
       }));
+      dispatchActivity({
+        kind: 'tool_result',
+        callId: call_id,
+        name,
+        output,
+        isError: is_error,
+      });
     }));
 
     track(listen<{ tokens: number; cost_usd: number; session_id?: string }>('jarvis://cost', (event) => {
@@ -1138,7 +1173,7 @@ export function ChatPanel({
       disposed = true;
       unsubs.forEach((f) => f());
     };
-  }, [appendAssistantText, applyTokenChunk, clearPendingApproval, finalizeAssistantMessage, matchesStreamSession, presentApprovalRequest, takePendingTokens]);
+  }, [appendAssistantText, applyTokenChunk, clearPendingApproval, dispatchActivity, finalizeAssistantMessage, matchesStreamSession, presentApprovalRequest, takePendingTokens]);
 
   // True autosize composer (Phase 2.4). The previous rows=⟨line-count⟩ approach
   // overflowed for single-line wrapped text.
@@ -1232,8 +1267,9 @@ export function ChatPanel({
       cancelledReason?: string;
       partialOutput?: string;
     } = { tokenCount: 0, toolCount: 0 };
-    let terminalFrame: StreamTerminalFrame = null;
-    let terminal: DecodedStreamTerminal | null = null;
+     let terminalFrame: StreamTerminalFrame = null;
+     let terminal: DecodedStreamTerminal | null = null;
+     let activityTerminalDispatched = false;
     const persistTerminalRun = () => {
       if (!runAcc.outcome) return;
       // A force-stop can land before the pipeline ever emitted agent_run_id
@@ -1288,11 +1324,16 @@ export function ChatPanel({
         const stage = String(frame.stage || 'agent');
         if (stage === 'coordinator') {
           setPipelineStage('coordinator');
+          dispatchActivity({ kind: 'live_stage', stage });
           return;
         }
+        const activityText = String(frame.text);
+        const filtered = appendAgentProgress([], { stage, text: activityText, source: 'activity' });
+        const step = filtered[0];
+        if (step) dispatchActivity({ kind: 'agent_activity', stage: step.stage, text: step.text });
         setAgentSteps(prev => appendAgentProgress(prev, {
           stage,
-          text: String(frame.text),
+          text: activityText,
           source: 'activity',
         }));
         return;
@@ -1313,6 +1354,7 @@ export function ChatPanel({
           text: progressText,
           source: detail.startsWith('tool:') ? 'tool' : 'stage',
         }));
+        dispatchActivity({ kind: 'stage', stage, status: frame.status, detail: frame.detail, elapsedMs: frame.elapsed_ms });
         return;
       }
       if (frame.type === 'orchestrator_recursion') {
@@ -1349,11 +1391,13 @@ export function ChatPanel({
       }
       if (frame.type === 'tool_use') {
         runAcc.toolCount += 1;
-        setToolCalls(prev => [...prev, {
+        const call = {
           call_id: frame.id || frame.call_id,
           name: frame.name || frame.tool_name || 'unknown',
           arguments: frame.arguments ?? frame.input ?? null,
-        }]);
+        };
+        setToolCalls(prev => [...prev, call]);
+        dispatchActivity({ kind: 'tool_use', callId: call.call_id, name: call.name, arguments: call.arguments });
         return;
       }
       if (frame.type === 'tool_result') {
@@ -1369,6 +1413,24 @@ export function ChatPanel({
           isError,
           contextTruncation: contextTruncation ?? undefined,
         }));
+        dispatchActivity({
+          kind: 'tool_result',
+          callId,
+          name,
+          output,
+          isError,
+          contextTruncation: contextTruncation ?? undefined,
+        });
+        return;
+      }
+      if (frame.type === 'conductor_directive') {
+        const decoded = decodeConductorDirectiveFrame(frame, sid);
+        if (decoded.kind === 'ignored') return;
+        if (decoded.kind === 'valid') {
+          dispatchActivity({ kind: 'directive', key: decoded.key, directive: decoded.directive, stage: decoded.directive.stage });
+        } else {
+          dispatchActivity({ kind: 'diagnostic', text: decoded.message });
+        }
         return;
       }
       if (frame.type === 'cost_info') {
@@ -1440,7 +1502,9 @@ export function ChatPanel({
         return;
       }
       if (frame.type === 'fallback_notice') {
-        setPipelineStage(formatFallbackProgress(frame));
+        const fallbackStage = formatFallbackProgress(frame);
+        setPipelineStage(fallbackStage);
+        dispatchActivity({ kind: 'live_stage', stage: fallbackStage });
         return;
       }
       // Task 4.1: agent_run_id is otherwise passive but carries the durable
@@ -1453,6 +1517,8 @@ export function ChatPanel({
       if (frame.type === 'result') {
         const decision = decodeResultFrame(frame);
         if (!acceptTerminal(decision)) return;
+        dispatchActivity({ kind: 'terminal', outcome: decision.outcome });
+        activityTerminalDispatched = true;
         if (decision.hardError) {
           const message = decision.text || String(frame.error || 'Jarvis returned a non-success result.');
           throw new JarvisStreamError(message, decision.code);
@@ -1470,6 +1536,8 @@ export function ChatPanel({
           hardError: true,
         };
         if (!acceptTerminal(decision)) return;
+        dispatchActivity({ kind: 'terminal', outcome: decision.outcome });
+        activityTerminalDispatched = true;
         if (code) {
           // eslint-disable-next-line no-console
           console.warn(`[Jarvis] stream error code=${code}: ${frame.error}`);
@@ -1485,6 +1553,8 @@ export function ChatPanel({
           hardError: false,
         };
         if (!acceptTerminal(decision)) return;
+        dispatchActivity({ kind: 'terminal', outcome: decision.outcome });
+        activityTerminalDispatched = true;
         // P0-B (2026-07-02): `cancelled` is now reserved for genuine user
         // / `/chat/cancel` aborts (the server-side fix prevents a hung
         // model from emitting this). Previously the UI had no handler for
@@ -1575,6 +1645,8 @@ export function ChatPanel({
       if (termination === 'unterminated') {
         runAcc.outcome = 'failed';
         runAcc.partialOutput = boundedPartialOutput(streamedRawText);
+        dispatchActivity({ kind: 'terminal', outcome: 'failed' });
+        activityTerminalDispatched = true;
         throw new JarvisStreamError(STREAM_INCOMPLETE_MESSAGE, STREAM_INCOMPLETE_CODE);
       }
     } catch (error) {
@@ -1595,6 +1667,10 @@ export function ChatPanel({
           runAcc.outcome = 'cancelled';
           runAcc.cancelledReason = 'client_abort';
         }
+        if (!activityTerminalDispatched) {
+          dispatchActivity({ kind: 'terminal', outcome: runAcc.outcome ?? 'failed' });
+          activityTerminalDispatched = true;
+        }
       }
       persistTerminalRun();
     }
@@ -1604,7 +1680,7 @@ export function ChatPanel({
 
     if (sendGateRef.current.isCurrent(sendGeneration)) finalizeAssistantMessage(sid, terminal ?? undefined);
     if (streamAbortRef.current === controller) streamAbortRef.current = null;
-  }, [appendAssistantText, applyTokenChunk, clearPendingApproval, finalizeAssistantMessage, matchesStreamSession, presentApprovalRequest, takePendingTokens]);
+  }, [appendAssistantText, applyTokenChunk, clearPendingApproval, dispatchActivity, finalizeAssistantMessage, matchesStreamSession, presentApprovalRequest, takePendingTokens]);
 
   const handleSend = useCallback(async () => {
     // 2026-07-13 live incident (session 7254c3ae): the `isStreaming` React
@@ -1647,6 +1723,7 @@ export function ChatPanel({
     setAgentSteps([]);
     setShowAgents(true);
     setToolCalls([]);
+    resetActivityLedger();
     setTurnCost(null);
     setScopeNotice(null);
     setRunMetrics(null);
@@ -1730,7 +1807,7 @@ export function ChatPanel({
       // now" check that needs a single finish() on every exit.
       sendInFlightRef.current.finish();
     }
-  }, [isStreaming, messages, activeSession, sessionId, onSessionCreated, setActiveSession, streamFromJarvisApi, discardPendingTokens, takePendingTokens, applyTokenChunk, publishDraftStore]);
+  }, [isStreaming, messages, activeSession, sessionId, onSessionCreated, setActiveSession, streamFromJarvisApi, discardPendingTokens, takePendingTokens, applyTokenChunk, publishDraftStore, resetActivityLedger]);
 
   // Phase 1.3 — real Stop. POST /chat/cancel on the Bun server; SseRelay now
   // treats the resulting `cancelled` frame as terminal, so isStreaming flips.
@@ -1840,9 +1917,10 @@ export function ChatPanel({
     setRecursionDepth(null);
     setReasoningText('');
     setShowReasoning(false);
-    setAgentSteps([]);
-    setToolCalls([]);
-    setTurnCost(null);
+     setAgentSteps([]);
+     setToolCalls([]);
+     resetActivityLedger();
+     setTurnCost(null);
     setScopeNotice(null);
     setRunMetrics(null);
     setTurnElapsedMs(0);
@@ -2082,7 +2160,13 @@ export function ChatPanel({
 
         {/* M4 — unified activity feed (agentSteps + toolCalls + pipelineStage). */}
         {(() => {
-          const activityFeed = buildActivityFeed(agentSteps, toolCalls, pipelineStage || undefined);
+          const ledgerFeed = activityLedgerItems(activityLedger);
+          const legacyFeed = buildActivityFeed(agentSteps, toolCalls, pipelineStage || undefined);
+          const activityFeed = ledgerFeed.length === 0
+            ? legacyFeed
+            : ledgerFeed.some((item) => item.kind === 'tool' || item.kind === 'tool_result')
+              ? ledgerFeed
+              : [...ledgerFeed, ...legacyFeed.filter((item) => item.kind === 'tool')];
           if (activityFeed.length === 0) return null;
           return (
             <ActivityFeed
@@ -2534,14 +2618,7 @@ function ToolCallEchoCard({ content }: { content: string }) {
 // ═══════════════════════════════════════════════════════════════
 
 function ToolCallCard({ call }: {
-  call: {
-    name: string;
-    arguments: unknown;
-    result?: string;
-    is_error?: boolean;
-    matched?: boolean;
-    contextTruncation?: ToolResultTruncationMetadata;
-  };
+  call: ActivityToolCall;
 }) {
   const [open, setOpen] = useState(false);
   const argText = (() => {
@@ -2553,12 +2630,17 @@ function ToolCallCard({ call }: {
   })();
 
   return (
-    <div
-      className={cn(
-        'rounded-xl border border-iron/30 bg-obsidian/40 overflow-hidden mr-8',
-        call.is_error ? 'border-error/40' : 'border-iron/30'
-      )}
-    >
+     <div
+       aria-label={`Tool: ${call.name}`}
+       data-activity-item="true"
+       data-activity-kind="tool"
+       className={cn(
+         'rounded-xl border border-iron/30 bg-obsidian/40 overflow-hidden mr-8',
+         call.is_error || call.terminalState === 'incomplete' || call.terminalState === 'failed'
+           ? 'border-error/40'
+           : 'border-iron/30'
+       )}
+     >
       <button
         type="button"
         onClick={() => setOpen(o => !o)}
@@ -2567,13 +2649,15 @@ function ToolCallCard({ call }: {
       >
         <Wrench size={10} className="text-royal-light" />
         <span className="text-bone">{call.name}</span>
-        {call.result === undefined && (
-          <span className="text-amber-400 flex items-center gap-0.5">
-            <LoaderCircle size={9} className="animate-spin" /> running
-          </span>
-        )}
-        {call.is_error && <Pill variant="error">error</Pill>}
-        {call.result !== undefined && !call.is_error && <Pill variant="success">done</Pill>}
+         {call.result === undefined && (
+           <span className="text-amber-400 flex items-center gap-0.5">
+             <LoaderCircle size={9} className="animate-spin" /> running
+           </span>
+         )}
+         {call.terminalState === 'cancelled' && <Pill>cancelled</Pill>}
+         {call.terminalState === 'incomplete' && <Pill variant="warning">incomplete</Pill>}
+         {call.is_error && <Pill variant="error">error</Pill>}
+         {call.result !== undefined && !call.is_error && !call.terminalState && <Pill variant="success">done</Pill>}
         {call.contextTruncation && <Pill variant="warning">context trimmed</Pill>}
         <span className="ml-auto opacity-70">{open ? <ChevronDown size={10} /> : <ChevronRight size={10} />}</span>
       </button>
@@ -2678,43 +2762,98 @@ function ActivityFeed({
             transition={{ duration: 0.18 }}
             className="px-3 py-2 space-y-2 max-h-72 overflow-y-auto bg-obsidian/20"
           >
-            {items.map((item) => {
-              if (item.kind === 'tool') {
-                return <ToolCallCard key={item.id} call={item.call} />;
-              }
-              if (item.kind === 'stage') {
-                return (
-                  <div
-                    key={item.id}
-                    className="flex items-center gap-2 px-2 py-1.5 rounded-md bg-royal/5 border border-royal/15 text-[10px] font-mono text-royal-light"
-                    aria-label={`Orchestrator stage: ${item.stage}`}
-                  >
-                    <motion.span
-                      animate={prefersReducedMotion ? undefined : { opacity: [0.4, 1, 0.4] }}
-                      transition={{ duration: 1.2, repeat: prefersReducedMotion ? 0 : Infinity }}
-                      aria-hidden="true"
-                    >
-                      <Sparkles size={11} />
-                    </motion.span>
-                    <span className="uppercase tracking-wider">{item.stage}</span>
-                    {isStreaming && (
-                      <span className="text-bone-faint ml-auto">running</span>
-                    )}
-                  </div>
-                );
-              }
-              // plan
-              return (
-                <div key={item.id} className="px-1">
-                  <div className="text-[9px] font-mono text-royal-light uppercase tracking-widest mb-0.5 flex items-center gap-1">
-                    <Sparkles size={9} /> {item.stage}
-                  </div>
-                  <div className="text-[11px] font-mono text-bone-faint whitespace-pre-wrap leading-relaxed">
-                    {item.text}
-                  </div>
-                </div>
-              );
-            })}
+             {items.map((item) => {
+               if (item.kind === 'tool') {
+                 return <ToolCallCard key={item.id} call={item.call} />;
+               }
+               if (item.kind === 'tool_result') {
+                 return (
+                   <div
+                     key={item.id}
+                     data-activity-item="true"
+                     data-activity-kind="tool_result"
+                     aria-label={`Tool result: ${item.name}`}
+                     className="px-2 py-1.5 rounded-md border border-iron/20 bg-obsidian/30 text-[10px] font-mono"
+                   >
+                     <div className="flex items-center gap-2 text-bone-dim">
+                       <Wrench size={10} className="text-royal-light" />
+                       <span>{item.name} result</span>
+                       {item.isError ? <Pill variant="error">error</Pill> : <Pill variant="success">done</Pill>}
+                     </div>
+                     <div className="mt-1 whitespace-pre-wrap break-words text-bone-faint">{item.output || 'No output reported.'}</div>
+                   </div>
+                 );
+               }
+               if (item.kind === 'directive') {
+                 return (
+                   <div
+                     key={item.id}
+                     data-activity-item="true"
+                     data-activity-kind="directive"
+                     aria-label={`Conductor directive: ${item.directive.label}`}
+                     className="px-2 py-1.5 rounded-md border border-amber-400/25 bg-amber-400/5 text-[10px] font-mono"
+                   >
+                     <div className="flex items-center gap-2 text-amber-200">
+                       <Sparkles size={10} />
+                       <span className="uppercase tracking-wider">Conductor</span>
+                       <span>{item.directive.label}</span>
+                     </div>
+                     <div className="mt-1 text-bone-faint">{item.directive.detail}</div>
+                   </div>
+                 );
+               }
+               if (item.kind === 'diagnostic') {
+                 return (
+                   <div
+                     key={item.id}
+                     data-activity-item="true"
+                     data-activity-kind="diagnostic"
+                     aria-label="Activity diagnostic"
+                     className="px-2 py-1.5 rounded-md border border-amber-400/25 bg-amber-400/5 text-[10px] font-mono text-amber-200"
+                   >
+                     {item.text}
+                   </div>
+                 );
+               }
+               if (item.kind === 'stage') {
+                 return (
+                   <div
+                     key={item.id}
+                     data-activity-item="true"
+                     data-activity-kind="stage"
+                     className="flex items-center gap-2 px-2 py-1.5 rounded-md bg-royal/5 border border-royal/15 text-[10px] font-mono text-royal-light"
+                     aria-label={`Orchestrator stage: ${item.stage}`}
+                   >
+                     <motion.span
+                       animate={prefersReducedMotion ? undefined : { opacity: [0.4, 1, 0.4] }}
+                       transition={{ duration: 1.2, repeat: prefersReducedMotion ? 0 : Infinity }}
+                       aria-hidden="true"
+                     >
+                       <Sparkles size={11} />
+                     </motion.span>
+                     <span className="uppercase tracking-wider">{item.stage}</span>
+                     {isStreaming && (
+                       <span className="text-bone-faint ml-auto">running</span>
+                     )}
+                   </div>
+                 );
+               }
+               return (
+                 <div
+                   key={item.id}
+                   data-activity-item="true"
+                   data-activity-kind="plan"
+                   className="px-1"
+                 >
+                   <div className="text-[9px] font-mono text-royal-light uppercase tracking-widest mb-0.5 flex items-center gap-1">
+                     <Sparkles size={9} /> {item.stage}
+                   </div>
+                   <div className="text-[11px] font-mono text-bone-faint whitespace-pre-wrap leading-relaxed">
+                     {item.text}
+                   </div>
+                 </div>
+               );
+             })}
           </motion.div>
         )}
       </AnimatePresence>
