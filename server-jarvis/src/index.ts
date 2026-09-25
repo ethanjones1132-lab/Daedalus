@@ -117,6 +117,11 @@ import {
   shouldArmFinalGrace,
 } from "./stream-control";
 import {
+  classifyCallAbort,
+  linkStageAbortToTransport,
+  StageAbortedError,
+} from "./orchestration/stage-abort-link";
+import {
   createStreamFinishTracker,
   serverCancelFromReadStop,
 } from "./stream-finish";
@@ -2011,6 +2016,15 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             ctrl.abort();
           }, requestBudgetMs);
           const cleanupRequestAbort = registerAbortHandler(streamAbort.signal, () => ctrl.abort());
+          // Stage-local cancellation (live-Conductor `abort_stage`). The stage
+          // signal is separate from the turn-wide streamAbort, so stopping one
+          // stage during M3 overlap must cancel this attempt's request without
+          // touching the Session turn lease.
+          const stageAbortLink = linkStageAbortToTransport({
+            stage: stageLabel ?? "agent",
+            stageAbort: callOptions?.stageAbort,
+            request: ctrl,
+          });
 
           let fetchRes: Response;
           let actualModelUsed = modelName;
@@ -2064,6 +2078,15 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           } catch (fetchErr: any) {
             clearTimeout(timeout);
             cleanupRequestAbort();
+            stageAbortLink.cleanup();
+            const abortCause = classifyCallAbort({
+              stageAbort: callOptions?.stageAbort,
+              turnAbort: streamAbort.signal,
+              turnDeadlineReached: turnDeadlineAbortedRequest || Date.now() >= turnBudget.deadlineAt,
+            });
+            if (abortCause === "stage_aborted") {
+              throw new StageAbortedError(stageLabel ?? callOptions?.stageLabel ?? "agent");
+            }
             if (fetchErr.name === "AbortError" && streamAbort.signal.aborted) {
               await emitCancelled();
             }
@@ -2098,6 +2121,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               }
               clearTimeout(timeout);
               cleanupRequestAbort();
+              stageAbortLink.cleanup();
               const retryTarget = resolveProviderTarget(cfg, actualProviderUsed);
               const retryBudgetMs = computeBoundedRequestTimeoutMs(
                 callOptions?.stageLabel ?? "orchestrator_request",
@@ -2108,6 +2132,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               const retryCtrl = new AbortController();
               const retryTimeout = setTimeout(() => retryCtrl.abort(), retryBudgetMs);
               const cleanupRetryAbort = registerAbortHandler(streamAbort.signal, () => retryCtrl.abort());
+              const retryStageAbortLink = linkStageAbortToTransport({
+                stage: callOptions?.stageLabel ?? "agent",
+                stageAbort: callOptions?.stageAbort,
+                request: retryCtrl,
+              });
               try {
                 fetchRes = await fetch(providerChatUrl(retryTarget, actualModelUsed), {
                   method: "POST",
@@ -2120,16 +2149,25 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                   throw new Error(`API ${fetchRes.status}: ${retryErrText.slice(0, 300)}`);
                 }
               } catch (retryErr: any) {
+                if (classifyCallAbort({
+                  stageAbort: callOptions?.stageAbort,
+                  turnAbort: streamAbort.signal,
+                  turnDeadlineReached: false,
+                }) === "stage_aborted") {
+                  throw new StageAbortedError(callOptions?.stageLabel ?? "agent");
+                }
                 if (retryErr.name === "AbortError" && streamAbort.signal.aborted) await emitCancelled();
                 if (retryErr.name === "AbortError") throw new Error(requestTimeoutMessage(retryBudgetMs));
                 throw retryErr;
               } finally {
                 clearTimeout(retryTimeout);
                 cleanupRetryAbort();
+                retryStageAbortLink.cleanup();
               }
             } else {
               clearTimeout(timeout);
               cleanupRequestAbort();
+              stageAbortLink.cleanup();
               throw new Error(`API ${fetchRes.status}: ${errText.slice(0, 300)}`);
             }
           }
@@ -2138,12 +2176,22 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const reader = fetchRes.body?.getReader();
           if (!reader) {
             cleanupRequestAbort();
+            stageAbortLink.cleanup();
             throw new Error("No response body from API");
           }
           cleanupRequestAbort();
+          stageAbortLink.cleanup();
           const cancelReader = createIdempotentReaderCancel(reader);
           const cleanupReaderAbort = registerAbortHandler(streamAbort.signal, () => {
             void cancelReader("Session turn cancelled");
+          });
+          // Headers are in: the request controller is spent, so the stage link
+          // now owns only the body reader. A stage aborted mid-body must stop
+          // the read instead of racing a TaskPlan the Conductor already moved on.
+          linkStageAbortToTransport({
+            stage: stageLabel ?? "agent",
+            stageAbort: callOptions?.stageAbort,
+            cancelReader,
           });
 
           const reasoningParser = new ReasoningParser(sessionId);
@@ -2328,6 +2376,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           while (true) {
             if (streamAbort.signal.aborted) {
               await emitCancelled();
+            }
+            // A stage the Conductor stopped must not keep streaming: settle
+            // before the next read so no late chunk, activity row, or tool
+            // dispatch can outlive the stage. This is stage-local — the Session
+            // turn lease stays live and emitCancelled is never reached.
+            if (callOptions?.stageAbort?.aborted) {
+              throw new StageAbortedError(stageLabel ?? "agent");
             }
             const readResult = await reader.read();
             const { done, value } = readResult;

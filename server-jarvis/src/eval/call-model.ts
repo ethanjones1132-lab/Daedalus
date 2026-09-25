@@ -10,6 +10,7 @@ import { type JarvisConfig } from "../config";
 import { chatCompletionWithFallback, isOpenRouterModelSupportsTools } from "../openrouter";
 import { buildTextToolInstructions, extractTextToolCalls, resolveToolCallsFromTurn } from "../text-tools";
 import { AgentPool } from "../orchestration/agent-pool";
+import { StageAbortedError } from "../orchestration/stage-abort-link";
 import type { CallModelFn, ChatMessage } from "../orchestration/coordinator";
 import type { ToolDefinition } from "../tool-types";
 
@@ -48,6 +49,19 @@ function withTextToolInstructions(messages: ChatMessage[], tools: ToolDefinition
   return effectiveMessages;
 }
 
+/**
+ * Fail closed when the caller's stage was already aborted before this call
+ * started. Returns the error to throw, or null when the stage is still live.
+ */
+export function stageAbortGuard(options: {
+  stage: string;
+  stageAbort?: AbortSignal;
+  stageLabel?: string;
+}): StageAbortedError | null {
+  if (!options.stageAbort?.aborted) return null;
+  return new StageAbortedError(options.stageLabel ?? options.stage);
+}
+
 /** Minimal callModel that goes through the real fallback cascade for a fixed stage.
  *  Mirrors production's native-vs-text tool-calling branch (index.ts): resolve
  *  which agent the pool would pick for `stage`, and if it doesn't support
@@ -60,13 +74,20 @@ export function makeCallModel(cfg: JarvisConfig, stage: string): CallModelFn {
     const useTextTools = tools.length > 0 && !resolveModelSupportsNativeTools(cfg, stage);
     const effectiveMessages = useTextTools ? withTextToolInstructions(messages, tools) : messages;
 
+    // Stage-local cancellation: the caller's stage signal reaches the real
+    // provider request, so a stage the Conductor stopped cannot keep spending
+    // provider work after the shared adapter returned nothing. It is a separate
+    // domain from the turn-wide signal, which stays untouched.
+    const stageAborted = stageAbortGuard({ stage, stageAbort: options?.stageAbort, stageLabel: options?.stageLabel });
+    if (stageAborted) throw stageAborted;
+
     const { response } = await chatCompletionWithFallback(cfg, {
       messages: effectiveMessages,
       temperature: options?.temperature ?? 0.2,
       max_tokens: options?.max_tokens ?? 1024,
       stream: false,
       tools: useTextTools ? undefined : options?.tools,
-    }, undefined, { stage });
+    }, options?.stageAbort, { stage });
     const json = await response.json();
     const choice = json.choices?.[0]?.message ?? {};
     const content: string = choice.content ?? "";
