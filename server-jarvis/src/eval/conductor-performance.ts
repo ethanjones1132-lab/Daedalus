@@ -23,6 +23,10 @@
 
 import type { ConductorDirectiveRow, ModelAttribution, StageRun } from "../self-tuning/store";
 import { isStatusOrLogDocPath, pathInTargetSet } from "../orchestration/effect-gate";
+import {
+  decodeToolCallEvidence,
+  type StoredToolCallEvidence,
+} from "./tool-evidence";
 
 /** One stored turn, assembled from the tables keyed by agent_run_id. */
 export interface ConductorPerformanceFixture {
@@ -96,12 +100,18 @@ export const RELEASE_THRESHOLDS: ConductorPerformanceThresholds = {
 /** Minimum delegate fixtures before the verified-write rate is a hard gate. */
 export const MIN_DELEGATE_SAMPLE = 5;
 
-export type DelegateGate = "pass" | "fail" | "insufficient_sample" | "not_applicable";
+export type DelegateGate =
+  | "pass"
+  | "fail"
+  | "insufficient_sample"
+  | "not_applicable"
+  | "unavailable";
 
 export type GateFailureCode =
   | "executor_no_tool_ratio"
   | "delegate_verified_write_rate"
   | "writes_landed_per_run"
+  | "invalid_tool_evidence"
   | "unverified_successes"
   | "unchecked_write_ratio"
   | "false_complete_runs"
@@ -109,51 +119,51 @@ export type GateFailureCode =
 
 export interface ConductorPerformanceSummary {
   runs: number;
-  executorTurns: number;
-  executorNoToolTurns: number;
-  /** 0 when there are no executor turns. */
-  executorNoToolRatio: number;
-  delegateRuns: number;
+  toolEvidenceUnavailableRuns: number;
+  executorTurns: number | null;
+  executorNoToolTurns: number | null;
+  executorNoToolRatio: number | null;
+  delegateRuns: number | null;
   /**
    * Diagnostic: row-level "verified" writes (strict stage-row matching).
    * May stay near zero when verification tier is off — not used for the hard gate.
    */
-  delegateVerifiedWrites: number;
+  delegateVerifiedWrites: number | null;
   /**
    * Diagnostic: strict verified writes / delegate runs (row-level matching).
    * Kept for comparison; hard gate uses `delegateWriteLandRate` (Stage 0a.2).
    */
-  delegateVerifiedWriteRate: number;
+  delegateVerifiedWriteRate: number | null;
   /**
    * Stage 0a.2 gate metric: fraction of delegate runs that landed ≥1 successful
    * write tool call (any path that counts as a write land). Real dynamic range
    * across minimax-good vs free-pool-bad eras.
    */
-  delegateWriteLandRate: number;
+  delegateWriteLandRate: number | null;
   /**
    * W2.2 — average successful write-tool calls per run (total / runs).
-   * 0 when there are no runs. Also a hard gate when sample is sufficient.
+   * Also a hard gate when sample is sufficient.
    */
-  writesLandedPerRun: number;
+  writesLandedPerRun: number | null;
   /**
    * W2.2 — total successful write-tool calls on non-status paths (or on
    * fixture taskTargets when provided). Absolute count across the window.
    */
-  taskTargetWrites: number;
-  unverifiedSuccesses: number;
+  taskTargetWrites: number | null;
+  unverifiedSuccesses: number | null;
   /**
    * Successes that wrote code and were never runtime-checked
    * (check_tier not `builtin` and not `existing`). Hard-gated via
    * maxUncheckedWriteRatio (default 0).
    */
-  uncheckedWriteRuns: number;
+  uncheckedWriteRuns: number | null;
   /**
    * Successes that landed ≥1 write-effect tool call. Denominator for the
-   * unchecked-write ratio (0 when none — ratio treated as 0).
+   * unchecked-write ratio.
    */
-  successfulWriteRuns: number;
-  falseCompleteRuns: number;
-  duplicateWritePressureRuns: number;
+  successfulWriteRuns: number | null;
+  falseCompleteRuns: number | null;
+  duplicateWritePressureRuns: number | null;
   /** Whether every hard release threshold passes (delegate soft below sample). */
   meetsReleaseGate: boolean;
   gateFailures: GateFailureCode[];
@@ -185,32 +195,14 @@ const DELEGATE_PROVIDER = "claude_cli";
 const INCOMPLETE_PROGRESS_PATTERN =
   /\b(?:incomplete|unfinished|cut short|partial(?:ly)?|could not be (?:confirmed|completed|applied|written|verified)|not (?:yet )?(?:been )?(?:applied|completed|confirmed|written|started)|not yet complete|was not (?:applied|modified|updated|written)|remains? (?:unchanged|unmodified|unapplied|to be)|more (?:files|work|evidence)|still (?:need|needs|needed|remains?|pending)|not enough evidence|could not gather|unable to complete|remaining work)\b/i;
 
-interface ParsedToolCall {
-  name?: string;
-  is_error?: boolean;
-  output?: unknown;
-  arguments?: Record<string, unknown>;
+function toolCallsForStage(stage: StageRun): StoredToolCallEvidence[] {
+  const decoded = decodeToolCallEvidence(stage.tool_calls_json);
+  return decoded.ok ? decoded.calls : [];
 }
 
-function parseToolCalls(raw: string | undefined): ParsedToolCall[] {
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as ParsedToolCall[]) : [];
-  } catch {
-    return [];
-  }
-}
-
-function parseToolCallCount(raw: string | undefined): number {
-  if (!raw) return 0;
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.length : 0;
-  } catch {
-    // Unparseable is not evidence of a no-op (matches conductor-replay).
-    return 1;
-  }
+function toolCallCountForStage(stage: StageRun): number | null {
+  const decoded = decodeToolCallEvidence(stage.tool_calls_json);
+  return decoded.ok ? decoded.calls.length : null;
 }
 
 function isWritePressureNote(note: string | undefined | null): boolean {
@@ -222,14 +214,14 @@ function isWritePressureNote(note: string | undefined | null): boolean {
 }
 
 function stageHasSuccessfulWrite(stage: StageRun): boolean {
-  const calls = parseToolCalls(stage.tool_calls_json);
+  const calls = toolCallsForStage(stage);
   return calls.some(
     (c) => c.name && WRITE_EFFECT_TOOLS.has(c.name) && c.is_error !== true,
   );
 }
 
 function stageHasDelegateCleanup(stage: StageRun): boolean {
-  return parseToolCalls(stage.tool_calls_json).some((c) => c.name === DELEGATE_MARKER_TOOL);
+  return toolCallsForStage(stage).some((c) => c.name === DELEGATE_MARKER_TOOL);
 }
 
 /** Pipeline persists { delegate_request_id, ... } on Claude-delegate stage rows. */
@@ -269,7 +261,7 @@ function firstExecutorStage(stages: readonly StageRun[]): StageRun | undefined {
 }
 
 function runHasWriteIntent(fixture: ConductorPerformanceFixture): boolean {
-  const calls = fixture.stageRuns.flatMap((s) => parseToolCalls(s.tool_calls_json));
+  const calls = fixture.stageRuns.flatMap((s) => toolCallsForStage(s));
   return calls.some(
     (c) => c.name === DELEGATE_MARKER_TOOL || (c.name && WRITE_EFFECT_TOOLS.has(c.name)),
   );
@@ -361,7 +353,7 @@ function hasDuplicateWritePressure(fixture: ConductorPerformanceFixture): boolea
   return count > 1;
 }
 
-function writeToolPath(call: ParsedToolCall): string | undefined {
+function writeToolPath(call: StoredToolCallEvidence): string | undefined {
   const args = call.arguments;
   if (!args || typeof args !== "object") return undefined;
   const raw = args.path ?? args.file_path;
@@ -384,7 +376,7 @@ function countWriteMetrics(fixture: ConductorPerformanceFixture): {
   const hasTargets = targets.length > 0;
 
   for (const stage of fixture.stageRuns) {
-    for (const call of parseToolCalls(stage.tool_calls_json)) {
+    for (const call of toolCallsForStage(stage)) {
       if (!call.name || !WRITE_EFFECT_TOOLS.has(call.name) || call.is_error === true) {
         continue;
       }
@@ -410,7 +402,6 @@ export function summarizeConductorPerformance(
   let executorNoToolTurns = 0;
   let delegateRuns = 0;
   let delegateVerifiedWrites = 0;
-  /** Delegate runs that landed ≥1 successful write (Stage 0a.2 gate numerator). */
   let delegateRunsWithWrite = 0;
   let totalWritesLanded = 0;
   let taskTargetWrites = 0;
@@ -419,12 +410,21 @@ export function summarizeConductorPerformance(
   let successfulWriteRuns = 0;
   let falseCompleteRuns = 0;
   let duplicateWritePressureRuns = 0;
+  let toolEvidenceUnavailableRuns = 0;
 
   for (const fixture of fixtures) {
+    const evidenceAvailable = fixture.stageRuns.every(
+      (stage) => decodeToolCallEvidence(stage.tool_calls_json).ok,
+    );
+    if (!evidenceAvailable) {
+      toolEvidenceUnavailableRuns += 1;
+      continue;
+    }
+
     const executorStages = fixture.stageRuns.filter((s) => s.mode_id === "executor");
-    for (const s of executorStages) {
+    for (const stage of executorStages) {
       executorTurns += 1;
-      if (parseToolCallCount(s.tool_calls_json) === 0) executorNoToolTurns += 1;
+      if (toolCallCountForStage(stage) === 0) executorNoToolTurns += 1;
     }
 
     const writes = countWriteMetrics(fixture);
@@ -433,10 +433,7 @@ export function summarizeConductorPerformance(
 
     if (isDelegateRun(fixture)) {
       delegateRuns += 1;
-      // Diagnostic only — strict row-level verification (may stay near zero when
-      // verification tier is off or stage rows lack cleanup markers).
       if (isDelegateVerifiedWrite(fixture)) delegateVerifiedWrites += 1;
-      // Stage 0a.2 gate: any successful write on a delegate-attributed run.
       if (writes.writesLanded > 0) delegateRunsWithWrite += 1;
     }
 
@@ -450,11 +447,33 @@ export function summarizeConductorPerformance(
   }
 
   const runs = fixtures.length;
+  if (toolEvidenceUnavailableRuns > 0) {
+    return {
+      runs,
+      toolEvidenceUnavailableRuns,
+      executorTurns: null,
+      executorNoToolTurns: null,
+      executorNoToolRatio: null,
+      delegateRuns: null,
+      delegateVerifiedWrites: null,
+      delegateVerifiedWriteRate: null,
+      delegateWriteLandRate: null,
+      writesLandedPerRun: null,
+      taskTargetWrites: null,
+      unverifiedSuccesses: null,
+      uncheckedWriteRuns: null,
+      successfulWriteRuns: null,
+      falseCompleteRuns: null,
+      duplicateWritePressureRuns: null,
+      meetsReleaseGate: false,
+      gateFailures: ["invalid_tool_evidence"],
+      delegateGate: "unavailable",
+    };
+  }
+
   const executorNoToolRatio = executorTurns === 0 ? 0 : executorNoToolTurns / executorTurns;
-  // Diagnostic: strict row-level verification (often near zero with verification off).
   const delegateVerifiedWriteRate =
     delegateRuns === 0 ? 0 : delegateVerifiedWrites / delegateRuns;
-  // Stage 0a.2 gate: write-land among delegate runs (has real dynamic range).
   const delegateWriteLandRate =
     delegateRuns === 0 ? 0 : delegateRunsWithWrite / delegateRuns;
   const writesLandedPerRun = runs === 0 ? 0 : totalWritesLanded / runs;
@@ -477,8 +496,6 @@ export function summarizeConductorPerformance(
   if (delegateGate === "fail") {
     gateFailures.push("delegate_verified_write_rate");
   }
-  // Absolute volume dial — only hard-fail when the window is large enough that
-  // a near-zero rate is meaningful (reuse MIN_DELEGATE_SAMPLE as the floor).
   if (
     runs >= MIN_DELEGATE_SAMPLE
     && writesLandedPerRun < thresholds.minWritesLandedPerRun
@@ -488,8 +505,6 @@ export function summarizeConductorPerformance(
   if (unverifiedSuccesses > thresholds.maxUnverifiedSuccesses) {
     gateFailures.push("unverified_successes");
   }
-  // Coverage gate: fraction of successful write runs that skipped a runtime check.
-  // Denominator is max(1, successfulWriteRuns) so a zero-write window does not fail.
   const uncheckedWriteRatio = uncheckedWriteRuns / Math.max(1, successfulWriteRuns);
   if (uncheckedWriteRatio > thresholds.maxUncheckedWriteRatio) {
     gateFailures.push("unchecked_write_ratio");
@@ -503,6 +518,7 @@ export function summarizeConductorPerformance(
 
   return {
     runs,
+    toolEvidenceUnavailableRuns: 0,
     executorTurns,
     executorNoToolTurns,
     executorNoToolRatio,

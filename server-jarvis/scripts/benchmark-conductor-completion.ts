@@ -97,6 +97,14 @@ function fmtMs(value: number | null): string {
   return `${value.toFixed(0)} ms`;
 }
 
+function formatMetric(value: number | null, digits = 0): string {
+  return value === null ? "unavailable" : value.toFixed(digits);
+}
+
+function formatPercent(value: number | null): string {
+  return value === null ? "unavailable" : `${(value * 100).toFixed(1)}%`;
+}
+
 // Exit non-zero when any hard threshold fails. The delegate-rate axis only
 // contributes a failure when delegateGate === "fail" (sample ≥5 and rate low);
 // insufficient_sample is reported but does not force exit by itself.
@@ -130,48 +138,53 @@ if (since) console.log(`  since: ${since}`);
 console.log();
 console.log(`  runs:                         ${summary.runs}`);
 console.log(
-  `  executor no-tool:             ${summary.executorNoToolTurns}/${summary.executorTurns}` +
-    ` (${(summary.executorNoToolRatio * 100).toFixed(1)}%)` +
+  `  unavailable tool-evidence:    ${summary.toolEvidenceUnavailableRuns} run(s)`,
+);
+console.log(
+  `  executor no-tool:             ${formatMetric(summary.executorNoToolTurns)}/${formatMetric(summary.executorTurns)}` +
+    ` (${formatPercent(summary.executorNoToolRatio)})` +
     `  [max ${(RELEASE_THRESHOLDS.maxExecutorNoToolRatio * 100).toFixed(0)}%]`,
 );
 console.log(
-  `  delegate write-land rate:     ${summary.delegateRuns > 0 ? (summary.delegateWriteLandRate * 100).toFixed(1) : "0.0"}%` +
-    ` (${summary.delegateRuns} delegate runs)` +
+  `  delegate write-land rate:     ${formatPercent(summary.delegateWriteLandRate)}` +
+    ` (${formatMetric(summary.delegateRuns)} delegate runs)` +
     `  gate=${summary.delegateGate}` +
     (summary.delegateGate === "insufficient_sample"
       ? " (need ≥5 delegate fixtures)"
-      : `  [min ${(RELEASE_THRESHOLDS.minDelegateVerifiedWriteRate * 100).toFixed(0)}%]`),
+      : summary.delegateGate === "unavailable"
+        ? " (tool evidence unavailable)"
+        : `  [min ${(RELEASE_THRESHOLDS.minDelegateVerifiedWriteRate * 100).toFixed(0)}%]`),
 );
 console.log(
-  `  delegate verified (diagnostic): ${summary.delegateVerifiedWrites}/${summary.delegateRuns}` +
-    ` (${(summary.delegateVerifiedWriteRate * 100).toFixed(1)}%)` +
+  `  delegate verified (diagnostic): ${formatMetric(summary.delegateVerifiedWrites)}/${formatMetric(summary.delegateRuns)}` +
+    ` (${formatPercent(summary.delegateVerifiedWriteRate)})` +
     `  — not a hard gate (Stage 0a.2)`,
 );
 console.log(
-  `  unverified successes:         ${summary.unverifiedSuccesses}` +
+  `  unverified successes:         ${formatMetric(summary.unverifiedSuccesses)}` +
     `  [max ${RELEASE_THRESHOLDS.maxUnverifiedSuccesses}]`,
 );
 console.log(
-  `  unchecked writes:             ${summary.uncheckedWriteRuns}` +
+  `  unchecked writes:             ${formatMetric(summary.uncheckedWriteRuns)}` +
     `  [max 0]` +
-    (summary.successfulWriteRuns > 0
+    (summary.successfulWriteRuns !== null && summary.successfulWriteRuns > 0
       ? `  (${summary.uncheckedWriteRuns}/${summary.successfulWriteRuns} successful write runs)`
       : ""),
 );
 console.log(
-  `  false-complete runs:          ${summary.falseCompleteRuns}` +
+  `  false-complete runs:          ${formatMetric(summary.falseCompleteRuns)}` +
     `  [max ${RELEASE_THRESHOLDS.maxFalseCompleteRuns}]`,
 );
 console.log(
-  `  duplicate write-pressure:     ${summary.duplicateWritePressureRuns}` +
+  `  duplicate write-pressure:     ${formatMetric(summary.duplicateWritePressureRuns)}` +
     `  [max ${RELEASE_THRESHOLDS.maxDuplicateWritePressureRuns}]`,
 );
 console.log(
-  `  writes landed per run:        ${summary.writesLandedPerRun.toFixed(2)}` +
+  `  writes landed per run:        ${formatMetric(summary.writesLandedPerRun, 2)}` +
     `  [min ${RELEASE_THRESHOLDS.minWritesLandedPerRun}]`,
 );
 console.log(
-  `  task-target writes:           ${summary.taskTargetWrites}` +
+  `  task-target writes:           ${formatMetric(summary.taskTargetWrites)}` +
     `  (non-status paths; targets when known)`,
 );
 console.log();

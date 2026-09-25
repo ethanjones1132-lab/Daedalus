@@ -31,6 +31,10 @@
 
 import type { ConductorDirectiveRow, ModelAttribution, StageRun } from "../self-tuning/store";
 import { DELEGATE_TOOL_INCAPABLE_MODELS } from "../orchestration/delegate-model-select";
+import {
+  decodeToolCallEvidence,
+  type StoredToolCallEvidence,
+} from "./tool-evidence";
 
 /** A single stored turn, assembled from the tables keyed by agent_run_id. */
 export interface ReplayRun {
@@ -67,6 +71,7 @@ export type ReplayRule =
   | "turn_cap_saturation"
   | "delegate_never_wrote"
   | "delegate_failed_before_fallback"
+  | "invalid_tool_evidence"
   | "success_without_runtime_check"
   | "success_declares_incomplete"
   | "delegate_benched_model_selected";
@@ -130,37 +135,19 @@ const WRITE_EFFECT_TOOLS = new Set(["write_file", "edit_file", "multi_edit", "ap
  */
 const DELEGATE_MARKER_TOOL = "delegate_cleanup";
 
-interface ParsedToolCall {
-  name?: string;
-  is_error?: boolean;
-  output?: unknown;
+function toolCallsForStage(stage: StageRun): StoredToolCallEvidence[] {
+  const decoded = decodeToolCallEvidence(stage.tool_calls_json);
+  return decoded.ok ? decoded.calls : [];
 }
 
-function parseToolCalls(raw: string | undefined): ParsedToolCall[] {
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as ParsedToolCall[]) : [];
-  } catch {
-    return [];
-  }
+function toolCallCountForStage(stage: StageRun): number | null {
+  const decoded = decodeToolCallEvidence(stage.tool_calls_json);
+  return decoded.ok ? decoded.calls.length : null;
 }
 
 function truncate(value: string, max = 120): string {
   const flat = value.replace(/\s+/g, " ").trim();
   return flat.length <= max ? flat : `${flat.slice(0, max)}…`;
-}
-
-function parseToolCallCount(raw: string | undefined): number {
-  if (!raw) return 0;
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.length : 0;
-  } catch {
-    // A row we cannot parse is not evidence of a no-op; treat it as active so
-    // a serialization change can never manufacture a spin finding.
-    return 1;
-  }
 }
 
 /**
@@ -228,6 +215,27 @@ function checkPlaceholderNotes(run: ReplayRun): ReplayViolation[] {
   return out;
 }
 
+function checkInvalidToolEvidence(run: ReplayRun): ReplayViolation[] {
+  const issues = run.stageRuns.flatMap((stage, stageIndex) => {
+    const decoded = decodeToolCallEvidence(stage.tool_calls_json);
+    if (decoded.ok) return [];
+    const entry = decoded.entryIndex === undefined ? "" : `#${decoded.entryIndex}`;
+    return [`row=${stageIndex + 1}:${decoded.code}${entry}`];
+  });
+  if (issues.length === 0) return [];
+  const samples = issues.slice(0, 3);
+  const omitted = issues.length - samples.length;
+  return [{
+    rule: "invalid_tool_evidence",
+    agentRunId: run.agentRunId,
+    severity: "high",
+    count: issues.length,
+    detail:
+      `${issues.length} stage row(s) contain malformed tool evidence ` +
+      `(${samples.join(", ")}${omitted > 0 ? `; ${omitted} more` : ""})`,
+  }];
+}
+
 function checkStageDeadlines(run: ReplayRun): ReplayViolation[] {
   const out: ReplayViolation[] = [];
   for (const stage of run.stageRuns) {
@@ -255,7 +263,8 @@ function checkStageDeadlines(run: ReplayRun): ReplayViolation[] {
  * Segments use the same turn_number restart rule as `executorSegmentLengths`.
  */
 function isNoopWasteTurn(stage: StageRun, isLastInSegment: boolean): boolean {
-  if (parseToolCallCount(stage.tool_calls_json) !== 0) return false;
+  const toolCallCount = toolCallCountForStage(stage);
+  if (toolCallCount === null || toolCallCount !== 0) return false;
   if (!isLastInSegment) return true;
   // Terminal empty: waste only when it looks like a typed no-tool failure.
   if (stage.stop_reason === "no_tool") return true;
@@ -326,7 +335,7 @@ function checkTurnCapSaturation(run: ReplayRun, t: ReplayThresholds): ReplayViol
  * that long.
  */
 function checkDelegateNeverWrote(run: ReplayRun): ReplayViolation[] {
-  const calls = run.stageRuns.flatMap((s) => parseToolCalls(s.tool_calls_json));
+  const calls = run.stageRuns.flatMap((s) => toolCallsForStage(s));
   if (!calls.some((c) => c.name === DELEGATE_MARKER_TOOL)) return [];
   const wrote = calls.some((c) => c.name && WRITE_EFFECT_TOOLS.has(c.name) && c.is_error !== true);
   if (wrote) return [];
@@ -352,7 +361,7 @@ function checkDelegateNeverWrote(run: ReplayRun): ReplayViolation[] {
 function checkDelegateFailedBeforeFallback(run: ReplayRun): ReplayViolation[] {
   const out: ReplayViolation[] = [];
   for (const stage of run.stageRuns) {
-    const calls = parseToolCalls(stage.tool_calls_json);
+    const calls = toolCallsForStage(stage);
     if (!calls.some((c) => c.name === DELEGATE_MARKER_TOOL)) continue;
     const wroteInRow = calls.some(
       (c) => c.name && WRITE_EFFECT_TOOLS.has(c.name) && c.is_error !== true,
@@ -372,7 +381,7 @@ function checkDelegateFailedBeforeFallback(run: ReplayRun): ReplayViolation[] {
 }
 
 function runHasWriteIntent(run: ReplayRun): boolean {
-  const calls = run.stageRuns.flatMap((s) => parseToolCalls(s.tool_calls_json));
+  const calls = run.stageRuns.flatMap((s) => toolCallsForStage(s));
   return calls.some(
     (c) => c.name === DELEGATE_MARKER_TOOL || (c.name && WRITE_EFFECT_TOOLS.has(c.name)),
   );
@@ -466,6 +475,7 @@ export function checkReplayInvariants(
   thresholds: ReplayThresholds = DEFAULT_REPLAY_THRESHOLDS,
 ): ReplayViolation[] {
   return [
+    ...checkInvalidToolEvidence(run),
     ...checkRepeatedNudges(run, thresholds),
     ...checkPlaceholderNotes(run),
     ...checkStageDeadlines(run),

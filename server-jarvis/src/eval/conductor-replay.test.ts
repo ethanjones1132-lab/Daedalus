@@ -1,10 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import {
   DEFAULT_REPLAY_THRESHOLDS,
   checkReplayInvariants,
   summarizeViolations,
   type ReplayRun,
 } from "./conductor-replay";
+import { decodeToolCallEvidence } from "./tool-evidence";
 import type { ConductorDirectiveRow, StageRun } from "../self-tuning/store";
 
 // ---------------------------------------------------------------------------
@@ -544,6 +549,49 @@ describe("conductor replay — delegate benched model selected (W1.4)", () => {
   });
 });
 
+describe("conductor replay — invalid stored tool evidence", () => {
+  test("flags malformed evidence without exposing the stored payload", () => {
+    const run = replayRun({
+      stageRuns: [
+        stage({
+          id: "stage_sensitive",
+          tool_calls_json: JSON.stringify({ token: "do-not-expose" }),
+        }),
+      ],
+    });
+    const found = checkReplayInvariants(run).filter((v) => v.rule === "invalid_tool_evidence");
+    expect(found).toHaveLength(1);
+    expect(found[0]?.count).toBe(1);
+    expect(found[0]?.detail).toContain("invalid_root");
+    expect(found[0]?.detail).not.toContain("do-not-expose");
+  });
+
+  test("bounds diagnostics when a run has multiple malformed stage rows", () => {
+    const run = replayRun({
+      stageRuns: Array.from({ length: 5 }, (_, index) =>
+        stage({
+          id: `stage_${index}`,
+          tool_calls_json: index % 2 === 0 ? "{" : "[null]",
+        }),
+      ),
+    });
+    const found = checkReplayInvariants(run).filter((v) => v.rule === "invalid_tool_evidence");
+    expect(found).toHaveLength(1);
+    expect(found[0]?.count).toBe(5);
+    expect(found[0]?.detail).toContain("2 more");
+  });
+
+  test("keeps valid empty and absent legacy tool evidence valid", () => {
+    const run = replayRun({
+      stageRuns: [
+        stage({ id: "stage_empty", tool_calls_json: "[]" }),
+        stage({ id: "stage_absent", tool_calls_json: undefined }),
+      ],
+    });
+    expect(checkReplayInvariants(run).filter((v) => v.rule === "invalid_tool_evidence")).toHaveLength(0);
+  });
+});
+
 describe("conductor replay — reporting", () => {
   test("a clean run yields no violations", () => {
     const run = replayRun({
@@ -593,5 +641,332 @@ describe("conductor replay — reporting", () => {
       maxIdenticalNudges: 1,
     });
     expect(strict.filter((v) => v.rule === "repeated_nudge")).toHaveLength(1);
+  });
+});
+
+describe("stored tool-call evidence decoder", () => {
+  test("accepts absent legacy evidence, empty arrays, and valid calls", () => {
+    expect(decodeToolCallEvidence(undefined)).toEqual({ ok: true, calls: [] });
+    expect(decodeToolCallEvidence(null)).toEqual({ ok: true, calls: [] });
+    expect(decodeToolCallEvidence("[]")).toEqual({ ok: true, calls: [] });
+    expect(
+      decodeToolCallEvidence(
+        JSON.stringify([
+          { name: "read_file", arguments: { path: "a.ts" } },
+          { name: "write_file", arguments: { path: "a.ts" }, is_error: true, output: "failed" },
+        ]),
+      ),
+    ).toEqual({
+      ok: true,
+      calls: [
+        {
+          name: "read_file",
+          arguments: { path: "a.ts" },
+          is_error: false,
+          output: undefined,
+        },
+        {
+          name: "write_file",
+          arguments: { path: "a.ts" },
+          is_error: true,
+          output: "failed",
+        },
+      ],
+    });
+  });
+
+  test("rejects malformed JSON, invalid roots, and invalid entries with stable codes", () => {
+    const cases = [
+      ["{", "malformed_json"],
+      ["null", "invalid_root"],
+      ["{}", "invalid_root"],
+      ["[null]", "invalid_entry"],
+      ["[1]", "invalid_entry"],
+      ["[[]]", "invalid_entry"],
+      ["[{}]", "missing_tool_name"],
+      ['[{"name":"   "}]', "missing_tool_name"],
+      ['[{"name":"write_file","is_error":"false"}]', "invalid_error_flag"],
+      ['[{"name":"write_file","arguments":[]}]', "invalid_arguments"],
+    ] as const;
+    for (const [raw, code] of cases) {
+      const result = decodeToolCallEvidence(raw);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.code).toBe(code);
+    }
+  });
+});
+
+interface CliStageInput {
+  id: string;
+  toolCallsJson: string;
+  modeId?: string;
+  turnNumber?: number;
+}
+
+interface CliRunInput {
+  id: string;
+  outcome: string;
+  checkTier?: string | null;
+  finalOutput?: string;
+  stages: CliStageInput[];
+  delegate?: boolean;
+}
+
+function withCliDatabase<T>(callback: (context: {
+  db: Database;
+  dbPath: string;
+  insertRun: (run: CliRunInput) => void;
+}) => T): T {
+  const root = mkdtempSync(join(tmpdir(), "jarvis-tool-evidence-"));
+  const dbPath = join(root, "self-tuning.db");
+  const db = new Database(dbPath);
+  db.exec(`
+    CREATE TABLE agent_runs (
+      id TEXT PRIMARY KEY,
+      task_type TEXT NOT NULL,
+      outcome TEXT,
+      final_output TEXT,
+      verified_via TEXT,
+      check_tier TEXT,
+      duration_ms INTEGER,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE stage_runs (
+      id TEXT PRIMARY KEY,
+      agent_run_id TEXT NOT NULL,
+      mode_id TEXT NOT NULL,
+      turn_number INTEGER NOT NULL,
+      tool_calls_json TEXT,
+      duration_ms INTEGER,
+      was_successful INTEGER NOT NULL,
+      had_error INTEGER NOT NULL,
+      error_message TEXT,
+      stop_reason TEXT,
+      partial_error_code TEXT,
+      diagnostic_json TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE conductor_directives (
+      id TEXT PRIMARY KEY,
+      agent_run_id TEXT NOT NULL,
+      stage TEXT NOT NULL,
+      directive_type TEXT NOT NULL,
+      inject_note TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE model_attributions (
+      id TEXT PRIMARY KEY,
+      agent_run_id TEXT NOT NULL,
+      stage_id TEXT NOT NULL,
+      stage_run_id TEXT,
+      agent_id TEXT,
+      provider TEXT NOT NULL,
+      model_id TEXT NOT NULL,
+      was_successful INTEGER NOT NULL,
+      had_error INTEGER NOT NULL,
+      fallback_used INTEGER NOT NULL,
+      created_at TEXT NOT NULL
+    );
+  `);
+  const insertRun = (run: CliRunInput): void => {
+    const createdAt = new Date().toISOString();
+    db.query(
+      "INSERT INTO agent_runs (id, task_type, outcome, final_output, verified_via, check_tier, duration_ms, created_at) VALUES (?, 'write', ?, ?, ?, ?, 100, ?)",
+    ).run(
+      run.id,
+      run.outcome,
+      run.finalOutput ?? "Stored result.",
+      run.checkTier === null ? null : run.checkTier ?? "builtin",
+      run.checkTier === null ? null : run.checkTier ?? "builtin",
+      createdAt,
+    );
+    const insertStage = db.query(
+      "INSERT INTO stage_runs (id, agent_run_id, mode_id, turn_number, tool_calls_json, duration_ms, was_successful, had_error, stop_reason, created_at) VALUES (?, ?, ?, ?, ?, 10, ?, ?, ?, ?)",
+    );
+    for (const [index, stage] of run.stages.entries()) {
+      insertStage.run(
+        stage.id,
+        run.id,
+        stage.modeId ?? "executor",
+        stage.turnNumber ?? index + 1,
+        stage.toolCallsJson,
+        run.outcome === "success" ? 1 : 0,
+        run.outcome === "success" ? 0 : 1,
+        "stop",
+        createdAt,
+      );
+    }
+    if (run.delegate) {
+      db.query(
+        "INSERT INTO model_attributions (id, agent_run_id, stage_id, stage_run_id, agent_id, provider, model_id, was_successful, had_error, fallback_used, created_at) VALUES (?, ?, 'executor', ?, 'claude_delegate', 'claude_cli', 'sonnet', ?, ?, 0, ?)",
+      ).run(
+        `attr_${run.id}`,
+        run.id,
+        run.stages[0]?.id ?? null,
+        run.outcome === "success" ? 1 : 0,
+        run.outcome === "success" ? 0 : 1,
+        createdAt,
+      );
+    }
+  };
+  try {
+    return callback({ db, dbPath, insertRun });
+  } finally {
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function runCli(relativeScript: "replay-conductor.ts" | "benchmark-conductor-completion.ts", dbPath: string) {
+  const result = Bun.spawnSync({
+    cmd: [
+      "bun",
+      join(import.meta.dir, "..", "..", "scripts", relativeScript),
+      "--db",
+      dbPath,
+      "--json",
+    ],
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  return {
+    exitCode: result.exitCode,
+    stdout: result.stdout.toString(),
+    stderr: result.stderr.toString(),
+  };
+}
+
+describe("conductor tool-evidence CLI gates", () => {
+  test("mixed valid and malformed rows fail replay without mutating SQLite", () => {
+    withCliDatabase(({ db, dbPath, insertRun }) => {
+      insertRun({
+        id: "run_valid",
+        outcome: "success",
+        stages: [{ id: "stage_valid", toolCallsJson: "[]" }],
+      });
+      insertRun({
+        id: "run_invalid",
+        outcome: "partial",
+        checkTier: "none",
+        stages: [{ id: "stage_invalid", toolCallsJson: '{"secret":"do-not-expose"}' }],
+      });
+      const before = db
+        .query("SELECT tool_calls_json FROM stage_runs WHERE agent_run_id = 'run_invalid'")
+        .get() as { tool_calls_json: string };
+      const result = runCli("replay-conductor.ts", dbPath);
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toBe("");
+      const output = JSON.parse(result.stdout) as {
+        scanned: number;
+        summary: { byRule: Array<{ rule: string }> };
+      };
+      expect(output.scanned).toBe(2);
+      expect(output.summary.byRule.map((rule) => rule.rule)).toContain("invalid_tool_evidence");
+      expect(result.stdout).not.toContain("do-not-expose");
+      const after = db
+        .query("SELECT tool_calls_json FROM stage_runs WHERE agent_run_id = 'run_invalid'")
+        .get() as { tool_calls_json: string };
+      expect(after.tool_calls_json).toBe(before.tool_calls_json);
+    });
+  });
+
+  test("successful-write rows with mixed evidence make performance metrics unavailable", () => {
+    withCliDatabase(({ dbPath, insertRun }) => {
+      insertRun({
+        id: "run_successful_write",
+        outcome: "success",
+        stages: [
+          {
+            id: "stage_write",
+            toolCallsJson: JSON.stringify([
+              { name: "write_file", arguments: { path: "out.ts" } },
+            ]),
+          },
+          { id: "stage_malformed", toolCallsJson: "[{}]" },
+        ],
+      });
+      const result = runCli("benchmark-conductor-completion.ts", dbPath);
+      expect(result.exitCode).toBe(1);
+      const output = JSON.parse(result.stdout) as {
+        summary: {
+          toolEvidenceUnavailableRuns: number;
+          writesLandedPerRun: number | null;
+          successfulWriteRuns: number | null;
+          uncheckedWriteRuns: number | null;
+          gateFailures: string[];
+        };
+      };
+      expect(output.summary.toolEvidenceUnavailableRuns).toBe(1);
+      expect(output.summary.writesLandedPerRun).toBeNull();
+      expect(output.summary.successfulWriteRuns).toBeNull();
+      expect(output.summary.uncheckedWriteRuns).toBeNull();
+      expect(output.summary.gateFailures).toContain("invalid_tool_evidence");
+    });
+  });
+
+  test("failed delegate evidence is unavailable rather than not applicable", () => {
+    withCliDatabase(({ dbPath, insertRun }) => {
+      insertRun({
+        id: "run_failed_delegate",
+        outcome: "partial",
+        checkTier: "none",
+        delegate: true,
+        stages: [{ id: "stage_delegate", toolCallsJson: "{" }],
+      });
+      const result = runCli("benchmark-conductor-completion.ts", dbPath);
+      expect(result.exitCode).toBe(1);
+      const output = JSON.parse(result.stdout) as {
+        summary: {
+          delegateGate: string;
+          delegateWriteLandRate: number | null;
+          toolEvidenceUnavailableRuns: number;
+        };
+      };
+      expect(output.summary.delegateGate).toBe("unavailable");
+      expect(output.summary.delegateWriteLandRate).toBeNull();
+      expect(output.summary.toolEvidenceUnavailableRuns).toBe(1);
+    });
+  });
+
+  test("valid read-only evidence keeps both CLIs clean and SQLite unchanged", () => {
+    withCliDatabase(({ db, dbPath, insertRun }) => {
+      insertRun({
+        id: "run_read_only",
+        outcome: "success",
+        stages: [
+          {
+            id: "stage_read",
+            toolCallsJson: JSON.stringify([
+              { name: "read_file", arguments: { path: "README.md" } },
+            ]),
+          },
+        ],
+      });
+      const before = db
+        .query("SELECT tool_calls_json FROM stage_runs WHERE agent_run_id = 'run_read_only'")
+        .get() as { tool_calls_json: string };
+      const replay = runCli("replay-conductor.ts", dbPath);
+      const benchmark = runCli("benchmark-conductor-completion.ts", dbPath);
+      expect(replay.exitCode).toBe(0);
+      expect(benchmark.exitCode).toBe(0);
+      const output = JSON.parse(benchmark.stdout) as {
+        summary: {
+          toolEvidenceUnavailableRuns: number;
+          writesLandedPerRun: number;
+          uncheckedWriteRuns: number;
+          successfulWriteRuns: number;
+        };
+      };
+      expect(output.summary).toMatchObject({
+        toolEvidenceUnavailableRuns: 0,
+        writesLandedPerRun: 0,
+        uncheckedWriteRuns: 0,
+        successfulWriteRuns: 0,
+      });
+      const after = db
+        .query("SELECT tool_calls_json FROM stage_runs WHERE agent_run_id = 'run_read_only'")
+        .get() as { tool_calls_json: string };
+      expect(after.tool_calls_json).toBe(before.tool_calls_json);
+    });
   });
 });
