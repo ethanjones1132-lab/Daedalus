@@ -68,7 +68,10 @@ function policy(expiresAt: string) {
 }
 
 describe("inference feedback policy", () => {
-  beforeEach(() => resetLearnedPoolStateForTests());
+  beforeEach(() => {
+    resetPolicyStagingForTests();
+    resetLearnedPoolStateForTests();
+  });
 
   test("valid empirical policy can demote a failing default and tune first-token budget", () => {
     expect(applyInferenceFeedback(policy("2026-07-12T00:00:00.000Z"), {
@@ -87,6 +90,81 @@ describe("inference feedback policy", () => {
     const pool = new AgentPool([slowDefault, fastAlternative]);
     expect(pool.pickFor("synthesizer", "general")?.id).toBe("slow-default");
     expect(firstTokenTimeoutFor(pool, "slow-model", 30_000, 60_000, "openrouter")).toBe(30_000);
+  });
+
+  test("stage-scoped adjustments demote only the affected default pin", () => {
+    const stagePin: OrchestratorAgent = {
+      ...slowDefault,
+      id: "stage-pin",
+      model_id: "stage-bad",
+      default_for: ["coordinator", "executor", "synthesizer"],
+      capabilities: { ...slowDefault.capabilities, speed: 0.9 },
+    };
+    const stageAlternative: OrchestratorAgent = {
+      ...fastAlternative,
+      id: "stage-alternative",
+      model_id: "stage-good",
+    };
+    const result = applyInferenceFeedback({
+      schema_version: 1,
+      expires_at: "2026-07-12T00:00:00.000Z",
+      routing_policy: {
+        min_samples: 5,
+        model_adjustments: {
+          "openrouter:stage-bad": {
+            sample_count: 10,
+            routing_score_delta: -0.25,
+          },
+        },
+        stage_adjustments: {
+          "openrouter:stage-bad:executor": {
+            sample_count: 5,
+            routing_score_delta: 0.15,
+          },
+          "openrouter:stage-bad:coordinator": {
+            sample_count: 5,
+            routing_score_delta: -0.25,
+          },
+          "openrouter:stage-bad:synthesizer": {
+            sample_count: 5,
+            routing_score_delta: 0.15,
+          },
+        },
+      },
+    }, { now: new Date("2026-07-10T12:00:00.000Z") });
+
+    expect(result).toEqual({ applied: 4, ignored: 0, reason: undefined });
+    const state = getLearnedPoolState();
+    expect(state.modelRoutingScoreDeltas.get("openrouter:stage-bad")).toBe(-0.25);
+    expect(state.stageModelRoutingScoreDeltas.get("openrouter:stage-bad:coordinator")).toBe(-0.25);
+    expect(state.stageModelRoutingScoreDeltas.get("openrouter:stage-bad:executor")).toBe(0.15);
+    expect(state.stageModelRoutingScoreDeltas.get("openrouter:stage-bad:synthesizer")).toBe(0.15);
+
+    const pool = new AgentPool([stagePin, stageAlternative]);
+    expect(pool.pickFor("coordinator", "general")?.id).toBe("stage-alternative");
+    expect(pool.pickFor("executor", "general")?.id).toBe("stage-pin");
+    expect(pool.pickFor("synthesizer", "general")?.id).toBe("stage-pin");
+  });
+
+  test("stage adjustments below the sample floor stay out of learned state", () => {
+    const key = "openrouter:stage-bad:coordinator";
+    const result = applyInferenceFeedback({
+      schema_version: 1,
+      expires_at: "2026-07-12T00:00:00.000Z",
+      routing_policy: {
+        min_samples: 5,
+        model_adjustments: {},
+        stage_adjustments: {
+          [key]: {
+            sample_count: 4,
+            routing_score_delta: -0.25,
+          },
+        },
+      },
+    }, { now: new Date("2026-07-10T12:00:00.000Z") });
+
+    expect(result).toEqual({ applied: 0, ignored: 1, reason: undefined });
+    expect(getLearnedPoolState().stageModelRoutingScoreDeltas.has(key)).toBe(false);
   });
 
   test("ignores stage adjustments with non-numeric sample counts", () => {

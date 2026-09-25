@@ -117,6 +117,7 @@ def collect_metrics(
     try:
         attribution_columns = _columns(conn, "model_attributions")
         first_token_expr = "first_token_ms" if "first_token_ms" in attribution_columns else "NULL AS first_token_ms"
+        stage_expr = "stage_id" if "stage_id" in attribution_columns else "NULL AS stage_id"
         runs = conn.execute(
             "SELECT id, duration_ms, outcome, token_count, user_rating, created_at "
             "FROM agent_runs WHERE completed = 1 AND created_at >= ? ORDER BY created_at",
@@ -128,7 +129,7 @@ def collect_metrics(
             (_iso_z(cutoff),),
         ).fetchall()
         models = conn.execute(
-            f"SELECT provider, model_id, duration_ms, {first_token_expr}, was_successful, had_error, fallback_used, created_at "
+            f"SELECT provider, model_id, {stage_expr}, duration_ms, {first_token_expr}, was_successful, had_error, fallback_used, created_at "
             "FROM model_attributions WHERE created_at >= ? ORDER BY created_at",
             (_iso_z(cutoff),),
         ).fetchall()
@@ -181,6 +182,31 @@ def collect_metrics(
             "p99_first_token_ms": _percentile(first_tokens, 0.99),
         }
 
+    stage_groups: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    for row in models:
+        stage = str(row["stage_id"] or "").strip()
+        if not stage:
+            continue
+        stage_groups[f'{row["provider"]}:{row["model_id"]}:{stage}'].append(row)
+
+    stage_adjustments: dict[str, dict[str, Any]] = {}
+    for key, rows in sorted(stage_groups.items()):
+        latency = _latency_stats(row["duration_ms"] for row in rows)
+        first_tokens = [row["first_token_ms"] for row in rows if row["first_token_ms"] is not None]
+        stage_model = {
+            "sample_count": len(rows),
+            "success_rate": round(sum(int(row["was_successful"] or 0) for row in rows) / len(rows), 4),
+            "p95_duration_ms": latency["p95"],
+            "first_token_sample_count": len(first_tokens),
+            "p99_first_token_ms": _percentile(first_tokens, 0.99),
+        }
+        stage_policy = _model_policy(stage_model, max(1, min_samples))
+        if stage_policy is not None:
+            stage_adjustments[key] = {
+                "sample_count": stage_policy["sample_count"],
+                "routing_score_delta": stage_policy["routing_score_delta"],
+            }
+
     adjustments = {
         key: policy
         for key, model in model_report.items()
@@ -209,6 +235,7 @@ def collect_metrics(
             "min_samples": max(1, min_samples),
             "first_token_min_samples": max(max(1, min_samples), MIN_FIRST_TOKEN_SAMPLES),
             "model_adjustments": adjustments,
+            "stage_adjustments": stage_adjustments,
         },
     }
     return report
