@@ -9,10 +9,12 @@
 // a timeout — a stage the Conductor had already ordered to stop was recorded as
 // a slow model.
 //
-// This module owns the linking rules only. It is deliberately turn-agnostic:
-// it takes no Session/turn signal, so it is structurally incapable of aborting
-// the active-stream lease, and a stage abort settles as `stage_aborted` rather
-// than as a cancellation, timeout, or turn deadline.
+// This module owns the stage-local abort boundary: the rules for linking the
+// signal to transport work, and the rules for deciding why an attempt stopped.
+// It is deliberately turn-agnostic: it takes no Session/turn signal it can
+// cancel, so it is structurally incapable of aborting the active-stream lease,
+// and a stage abort settles as `stage_aborted` rather than as a cancellation,
+// timeout, or turn deadline.
 
 import { registerAbortHandler } from "../stream-control";
 
@@ -66,6 +68,53 @@ export interface StageAbortTransportLink {
   cleanup(): void;
 }
 
+/**
+ * How one stage attempt ended, as the code *around* the attempt sees it.
+ * `in_flight` means nothing stopped it: a real model outcome to cascade from
+ * and to attribute. The other two are operator/Conductor stops.
+ */
+export type StageSettlement = "in_flight" | "stage_aborted" | "turn_cancelled";
+
+export interface StageSettlementDecision {
+  settlement: StageSettlement;
+  /** Somebody deliberately stopped this stage — the Conductor or the operator. */
+  stopped: boolean;
+  /** A stopped attempt must not spend another provider call on a fallback. */
+  mayAdvanceFallback: boolean;
+  /** A stopped attempt must not be scored against the model that served it. */
+  mayRecordModelAttribution: boolean;
+}
+
+/**
+ * Decide how a stage attempt settled, once, for every consumer downstream of it.
+ *
+ * The transport settles the *attempt*; the fallback cascade and the model
+ * attribution around it are separate code that used to consult only the
+ * turn-wide signal. A stage the Conductor had already ordered to stop could
+ * therefore still advance the cascade onto another model, and the stopped
+ * attempt was then recorded as a `http_error` against a model that never had
+ * the chance to fail. One settlement feeds both, so the two cannot disagree.
+ *
+ * `error` is consulted as well as the signals: a `StageAbortedError` is
+ * authoritative on its own, so a lost signal reference cannot let a stopped
+ * attempt back into the cascade. An ordinary transport failure reports
+ * `in_flight`, which keeps it fallback-eligible exactly as before.
+ */
+export function settleStageAttempt(options: {
+  stageAbort?: AbortSignal;
+  turnAbort: AbortSignal;
+  error?: unknown;
+}): StageSettlementDecision {
+  const settlement: StageSettlement = options.stageAbort?.aborted
+    ? "stage_aborted"
+    : isStageAbortedError(options.error)
+      ? "stage_aborted"
+      : options.turnAbort.aborted
+        ? "turn_cancelled"
+        : "in_flight";
+  const stopped = settlement !== "in_flight";
+  return { settlement, stopped, mayAdvanceFallback: !stopped, mayRecordModelAttribution: !stopped };
+}
 /**
  * Bind one stage signal to the transport work that stage owns: the pending
  * provider request and, once headers have arrived, its body reader.

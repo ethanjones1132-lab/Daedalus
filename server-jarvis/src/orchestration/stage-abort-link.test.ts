@@ -6,6 +6,7 @@ import {
   classifyCallAbort,
   isStageAbortedError,
   linkStageAbortToTransport,
+  settleStageAttempt,
 } from "./stage-abort-link";
 
 describe("linkStageAbortToTransport", () => {
@@ -192,5 +193,89 @@ describe("StageAbortedError", () => {
     expect(isStageAbortedError(new Error("Request timed out after 30000ms"))).toBe(false);
     expect(isStageAbortedError("stage_aborted")).toBe(false);
     expect(isStageAbortedError(undefined)).toBe(false);
+  });
+});
+
+describe("settleStageAttempt", () => {
+  test("a live stage reports in_flight and may still advance and be attributed", () => {
+    const decision = settleStageAttempt({
+      stageAbort: new AbortController().signal,
+      turnAbort: new AbortController().signal,
+    });
+
+    expect(decision.settlement).toBe("in_flight");
+    expect(decision.stopped).toBe(false);
+    expect(decision.mayAdvanceFallback).toBe(true);
+    expect(decision.mayRecordModelAttribution).toBe(true);
+  });
+
+  test("a stage abort stops the attempt: no cascade advance, no model attribution", () => {
+    const stageAbort = new AbortController();
+    stageAbort.abort("executor is unrecoverable");
+
+    const decision = settleStageAttempt({ stageAbort: stageAbort.signal, turnAbort: new AbortController().signal });
+
+    expect(decision.settlement).toBe("stage_aborted");
+    expect(decision.stopped).toBe(true);
+    expect(decision.mayAdvanceFallback).toBe(false);
+    expect(decision.mayRecordModelAttribution).toBe(false);
+  });
+
+  test("a turn cancellation stops the attempt for the same reasons", () => {
+    const turnAbort = new AbortController();
+    turnAbort.abort("User pressed Stop");
+
+    const decision = settleStageAttempt({ stageAbort: new AbortController().signal, turnAbort: turnAbort.signal });
+
+    expect(decision.settlement).toBe("turn_cancelled");
+    expect(decision.mayAdvanceFallback).toBe(false);
+    expect(decision.mayRecordModelAttribution).toBe(false);
+  });
+
+  test("a stage abort outranks a turn cancellation that raced it", () => {
+    const stageAbort = new AbortController();
+    const turnAbort = new AbortController();
+    turnAbort.abort("Superseded by a newer Session turn");
+    stageAbort.abort("planner dropped this stage");
+
+    expect(settleStageAttempt({ stageAbort: stageAbort.signal, turnAbort: turnAbort.signal }).settlement)
+      .toBe("stage_aborted");
+  });
+
+  test("a thrown StageAbortedError settles the attempt even if the signal was lost", () => {
+    const decision = settleStageAttempt({
+      turnAbort: new AbortController().signal,
+      error: new StageAbortedError("rewriter"),
+    });
+
+    expect(decision.settlement).toBe("stage_aborted");
+    expect(decision.mayAdvanceFallback).toBe(false);
+  });
+
+  test("an ordinary transport failure is a live attempt, not a Conductor stop", () => {
+    const timeout = Object.assign(new Error("First-token timeout"), { name: "FirstTokenTimeoutError" });
+    const decision = settleStageAttempt({
+      stageAbort: new AbortController().signal,
+      turnAbort: new AbortController().signal,
+      error: timeout,
+    });
+
+    expect(decision.settlement).toBe("in_flight");
+    expect(decision.mayAdvanceFallback).toBe(true);
+  });
+
+  test("settlement never touches the Session lease or an unrelated stage", () => {
+    const registry = new ActiveStreamRegistry();
+    const lease = registry.begin("session-settle");
+    const otherStage = new AbortController();
+    const stageAbort = new AbortController();
+    stageAbort.abort("stop the executor only");
+
+    settleStageAttempt({ stageAbort: stageAbort.signal, turnAbort: lease.controller.signal });
+    settleStageAttempt({ error: new StageAbortedError("executor") });
+
+    expect(lease.controller.signal.aborted).toBe(false);
+    expect(otherStage.signal.aborted).toBe(false);
+    expect(registry.size).toBe(1);
   });
 });

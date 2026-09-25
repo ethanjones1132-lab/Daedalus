@@ -119,8 +119,10 @@ import {
 import {
   classifyCallAbort,
   linkStageAbortToTransport,
+  settleStageAttempt,
   StageAbortedError,
 } from "./orchestration/stage-abort-link";
+import { runEmptyCompletionCascade } from "./orchestration/empty-cascade-advance";
 import {
   createStreamFinishTracker,
   serverCancelFromReadStop,
@@ -1723,6 +1725,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let attemptFallbackReason: string | undefined;
           /** F2/F3: stage/turn budget exhaustion is not model failure. */
           let runtimeStarvation = false;
+          /** Kept so the settlement below can name why the attempt stopped. */
+          let attemptError: unknown;
           const attemptStage = callOptions?.stageLabel as string | undefined;
           try {
           const activeBackendIsOllama = cfg.active_backend === "ollama";
@@ -2750,6 +2754,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             cleanupRequestAbort();
           }
           } catch (error) {
+            attemptError = error;
             const name = String((error as { name?: unknown })?.name ?? "");
             if (
               name === "StageBudgetExhaustedError" ||
@@ -2779,12 +2784,30 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             if (callOptions?.stageLabel) {
               turnBudget.endStage(callOptions.stageLabel as string);
             }
+            // One settlement decides, for every consumer below, whether this
+            // attempt was a model outcome at all. A stage the Conductor ordered
+            // stopped never was: the old gate consulted only the turn-wide
+            // signal, so the transport's own StageAbortedError fell through as
+            // `http_error` and was recorded against a model that never had the
+            // chance to fail.
+            const settlement = settleStageAttempt({
+              stageAbort: callOptions?.stageAbort,
+              turnAbort: streamAbort.signal,
+              error: attemptError,
+            });
+            const attemptSucceeded = attemptOutcome === "success" || attemptOutcome === "truncated";
+            if (settlement.settlement === "stage_aborted" && !attemptSucceeded) {
+              console.warn(
+                `[Jarvis Orchestrator] stage=${attemptStage ?? callOptions?.stageLabel ?? "agent"} ` +
+                `settled as stage_aborted (Conductor stop) — no model attribution recorded`,
+              );
+            }
             // Runtime starvation is not model failure — do not poison scorecard.
             if (
               attemptStage &&
               attemptModel &&
               attemptProvider &&
-              !streamAbort.signal.aborted &&
+              settlement.mayRecordModelAttribution &&
               !runtimeStarvation
             ) {
               const trackedScorecardAttempt = modelScorecard.record(attemptStage, `${attemptProvider}:${attemptModel}`, {
@@ -2835,7 +2858,17 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 throw error;
               }
               const failure = recoverableStageFailure(error);
-              if (!failure || streamAbort.signal.aborted || !canRetryStage || retry >= turnBudget.max_stage_attempts - 1 || Date.now() + 5_000 >= turnBudget.deadlineAt) {
+              // A stage the Conductor ordered to stop is not a recoverable model
+              // failure: advancing the cascade would spend another candidate's
+              // turn on work that was already cancelled. An ordinary transport
+              // failure settles as in_flight and stays exactly as eligible as it
+              // was before.
+              const settlement = settleStageAttempt({
+                stageAbort: callOptions?.stageAbort,
+                turnAbort: streamAbort.signal,
+                error,
+              });
+              if (!failure || !settlement.mayAdvanceFallback || !canRetryStage || retry >= turnBudget.max_stage_attempts - 1 || Date.now() + 5_000 >= turnBudget.deadlineAt) {
                 throw error;
               }
               exclude.add(`${failure.provider}:${failure.modelId}`);
@@ -2847,92 +2880,34 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
           }
           if (!canAdvanceEmpty) return last;
-          // Bounded empty-completion cascade-advance. If a user-visible stage
-          // returns a semantically-empty 200 (no content + no tool calls) and
+          // Bounded empty-completion cascade-advance: if a user-visible stage
+          // returned a semantically-empty 200 (no content + no tool calls) and
           // we have a fallback cascade, advance PAST that model and try the
-          // next one. A model that just returned empty will almost always
-          // return empty again, so retrying the same model is pointless — we
-          // exclude it via the `exclude` set (now honored by both the pool
-          // selection and `chatCompletionWithFallback`).
+          // next one. The loop — its bound, its prompt nudge, its pool/budget
+          // stops, and now its stage-settlement stops — lives in
+          // `orchestration/empty-cascade-advance.ts`.
           //
-          // Bound to 2 extra attempts. Stop early if:
-          //   - the new attempt produced content/tool_calls (success)
-          //   - the stream was aborted (user gave up)
-          //   - the pool returned the same model we just excluded (no other
-          //     candidate available) — this prevents a silent infinite loop
-          //     that the previous build hit on the live smoke test.
           // Final-answer stages may walk more of the pool than internal
           // stages: the 2026-07-16 PM incident (session f458849c) gave up
           // after one advance with ~78s of turn budget left and shipped
-          // nothing. The wall-clock guard below keeps this from overrunning.
+          // nothing. The wall-clock guard keeps this from overrunning.
           const maxEmptyAdvances = callOptions?.surfaceAsAnswer === true
             ? 3
             : turnBudget.max_stage_attempts - 1;
-          for (let advance = 0; advance < maxEmptyAdvances; advance++) {
-            const hasContent = typeof last?.content === "string" && last.content.trim().length > 0;
-            const hasToolCalls = !callOptions?.surfaceAsAnswer
-              && Array.isArray(last?.tool_calls)
-              && last.tool_calls.length > 0;
-            // A user-visible stage is only "done" when it produced clean prose.
-            // Tool calls count for model-only stages; synthesizer tool calls do not:
-            // no tools to run it with, and before 2026-07-04 the leaked call
-            // text itself was accepted as the answer (session 1d4727cf) — and
-            // then reinforced by the tuning loop as a success.
-            if (hasContent || hasToolCalls || streamAbort.signal.aborted) {
-              if ((hasContent || hasToolCalls) && last?._provider && last?._modelUsed) {
-                stageHealth.recordSuccess({
-                  provider: last._provider,
-                  modelId: last._modelUsed,
-                  stage: callOptions?.stageLabel ?? "agent",
-                });
-              }
-              break;
-            }
-            if (last?._provider && last?._modelUsed) {
-              const key = `${last._provider}:${last._modelUsed}`;
-              if (exclude.has(key)) {
-                console.warn(`[Jarvis Orchestrator] empty-completion cascade-advance has no different model left in pool (only ${key} available) — stopping`);
-                break;
-              }
-              exclude.add(key);
-              stageHealth.recordFailure({
-                provider: last._provider,
-                modelId: last._modelUsed,
-                stage: callOptions?.stageLabel ?? "agent",
-                kind: "empty_completion",
-              });
-            }
-            if (exclude.size === 0) break; // no exclusion built → nothing to advance past
-            if (Date.now() + 15_000 >= turnBudget.deadlineAt) {
-              console.warn(`[Jarvis Orchestrator] empty-completion cascade-advance stopped: <15s of turn budget remaining`);
-              break;
-            }
-            console.warn(`[Jarvis Orchestrator] empty completion from ${last?._provider}:${last?._modelUsed} stage=${callOptions?.stageLabel ?? "?"} — advancing cascade (excluding it)`);
-            // Nudge the retry model toward plain prose. `normalizeMessagesForLLM`
-            // (above) only merges LEADING system messages into one; a system
-            // message appended at the end would land mid-array and get
-            // demoted to a `[System: ...]`-wrapped user message instead of
-            // staying in the actual system prompt. So we splice the nudge
-            // into the existing leading system message's content (or add one
-            // if the stage somehow has none) rather than pushing a new
-            // trailing message — and we copy the array/message objects so the
-            // original `messages` passed to this closure is never mutated.
-            const nudge = callOptions?.surfaceAsAnswer
-              ? "You have no tools available. Answer the user in plain prose now. Do not emit tool_call syntax, tool JSON, or any function-call markup."
-              : "If you need a tool, emit a valid tool call; otherwise answer in plain prose. Do not emit tool-call syntax as visible text.";
-            const nudgedMessages = [...messages];
-            const leadingSystemIdx = nudgedMessages.findIndex((m) => m?.role === "system");
-            if (leadingSystemIdx >= 0) {
-              nudgedMessages[leadingSystemIdx] = {
-                ...nudgedMessages[leadingSystemIdx],
-                content: `${nudgedMessages[leadingSystemIdx].content ?? ""}\n\n${nudge}`,
-              };
-            } else {
-              nudgedMessages.unshift({ role: "system", content: nudge });
-            }
-            last = await callModelAttempt(nudgedMessages, callOptions, exclude);
-          }
-          return last;
+          return runEmptyCompletionCascade({
+            messages,
+            surfaceAsAnswer: callOptions?.surfaceAsAnswer === true,
+            stage: callOptions?.stageLabel ?? "agent",
+            exclude,
+            maxAdvances: maxEmptyAdvances,
+            attempt: (nudgedMessages) => callModelAttempt(nudgedMessages, callOptions, exclude),
+            stageHealth,
+            // Re-read per pass: `abort_stage` can land while an attempt awaits.
+            settlement: () =>
+              settleStageAttempt({ stageAbort: callOptions?.stageAbort, turnAbort: streamAbort.signal }).settlement,
+            budgetExhausted: () => Date.now() + 15_000 >= turnBudget.deadlineAt,
+            warn: (message) => console.warn(`[Jarvis Orchestrator] ${message}`),
+          }, last);
         };
 
         // Route the user request through the Fugu-style coordinator. The
