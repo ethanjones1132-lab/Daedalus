@@ -24,6 +24,7 @@ import { buildLearningPrompt, buildReviewPrompt, buildCodebaseAuditPrompt, build
 import { createLifecycleService, validateLifecycleSnapshot, type LifecycleSnapshot } from "./agent-lifecycle";
 import { createBoundaryProjectionStore } from "./activation-boundary";
 import { handleAgentRequest } from "./agent-routes";
+import { handleTuningProposalsRequest } from "./tuning-routes";
 import { handleChatStreamRequest, type ChatStreamOptions } from "./chat-routes";
 import { effectiveOllamaUrl, checkOllamaHealth, checkOllamaModelSupportsTools, resolveWindowsHostIP, resolveDesiredOllamaModel } from "./ollama";
 import { buildClaudeCliChatArgs, streamClaudeCli, isClaudeCliAvailable, compactTurnHistoryForCli } from "./claude-cli";
@@ -5565,17 +5566,8 @@ export async function baseFetch(req: Request): Promise<Response> {
       return Response.json({ ok: true, session_id: sid, state: body.state || null });
     }
 
-    if (path === "/tuning/proposals" && req.method === "GET") {
-      const store = new SelfTuningStore();
-      return Response.json({ pending: store.getPendingProposals(), applied: store.getAppliedProposals() });
-    }
-    if (path === "/tuning/proposals/apply" && req.method === "POST") {
-      const body = await req.json().catch(() => ({}));
-      if (!body.id) return Response.json({ error: "Missing proposal id" }, { status: 400 });
-      const store = new SelfTuningStore();
-      store.applyTuningProposal(body.id);
-      return Response.json({ ok: true });
-    }
+    const tuningResponse = await handleTuningProposalsRequest(req, new SelfTuningStore());
+    if (tuningResponse) return tuningResponse;
 
     return Response.json({ error: `Not found: ${req.method} ${path}` }, { status: 404 });
   } catch (err: any) {

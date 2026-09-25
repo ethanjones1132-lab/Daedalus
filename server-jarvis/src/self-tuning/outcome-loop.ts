@@ -7,19 +7,27 @@
  *  3. Once ≥ minSamples post-apply runs exist, write a `tuning_outcomes` row
  *     with measured vs baseline and improved true/false
  *
+ * A row is written only when `decideProposalMeasurement` can actually compare
+ * two rates. A window with too few known outcomes, or a proposal whose baseline
+ * was never measurable, stays pending and unmeasured rather than being recorded
+ * as an `improved` verdict against a fabricated zero.
+ *
  * Call `evaluatePendingTuningOutcomes` from completeAgentRun (or a cron) so
  * outcomes get written without a separate offline job.
  */
 
 import {
   SelfTuningStore,
-  successRateOfRuns,
   type TuningOutcome,
   type TuningProposal,
 } from "./store";
+import {
+  DEFAULT_MIN_POST_APPLY_SAMPLES,
+  decideProposalMeasurement,
+  postApplyRuns,
+} from "./tuning-measurement";
 
-/** Default post-apply completed runs required before writing an outcome. */
-export const DEFAULT_MIN_POST_APPLY_SAMPLES = 3;
+export { DEFAULT_MIN_POST_APPLY_SAMPLES, postApplyRuns };
 
 export interface EvaluatePendingOptions {
   minSamples?: number;
@@ -47,60 +55,33 @@ export function evaluatePendingTuningOutcomes(
   return written;
 }
 
-function parsePreApplyRunIds(prop: TuningProposal): Set<string> | null {
-  if (!prop.pre_apply_run_ids) return null;
-  try {
-    const parsed = JSON.parse(prop.pre_apply_run_ids) as unknown;
-    if (!Array.isArray(parsed)) return null;
-    return new Set(parsed.map(String));
-  } catch {
-    return null;
-  }
-}
-
-/** Completed runs for task_type that were not part of the apply-time baseline set. */
-export function postApplyRuns(
-  all: ReturnType<SelfTuningStore["getCompletedAgentRunsForTaskType"]>,
-  prop: TuningProposal,
-): ReturnType<SelfTuningStore["getCompletedAgentRunsForTaskType"]> {
-  const priorIds = parsePreApplyRunIds(prop);
-  if (priorIds) {
-    return all.filter((r) => !priorIds.has(r.id));
-  }
-  // Legacy fallbacks when pre_apply_run_ids is missing.
-  if (prop.pre_apply_run_count != null) {
-    return all.slice(prop.pre_apply_run_count);
-  }
-  if (prop.applied_at) {
-    return all.filter((r) => (r.created_at ?? "") > prop.applied_at!);
-  }
-  return [];
-}
-
 function maybeMeasureProposal(
   store: SelfTuningStore,
   prop: TuningProposal,
   minSamples: number,
 ): TuningOutcome | null {
-  const all = store.getCompletedAgentRunsForTaskType(prop.task_type);
   // Prefer id-set captured at apply (immune to same-ms created_at ordering).
-  const post = postApplyRuns(all, prop);
+  const all = store.getCompletedAgentRunsForTaskType(prop.task_type);
+  const verdict = decideProposalMeasurement({ proposal: prop, outcome: null, completedRuns: all, minSamples });
 
-  if (post.length < minSamples) return null;
+  if (verdict.state !== "measured") {
+    // Nothing to conclude yet. The reason is recoverable from the read path
+    // (/tuning/proposals) rather than a note on a row that does not exist.
+    return null;
+  }
 
-  const measured = successRateOfRuns(post);
-  const baseline = prop.baseline_success_rate ?? 0;
-  const improved = measured.rate > baseline;
+  const measured = verdict.measured as number;
+  const baseline = verdict.baseline as number;
   const notes =
     `task_type=${prop.task_type} proposal_type=${prop.proposal_type}: ` +
-    `post-apply success_rate=${measured.rate.toFixed(3)} vs baseline=${baseline.toFixed(3)} ` +
-    `over sample_n=${measured.sample_n} (min=${minSamples})`;
+    `post-apply success_rate=${measured.toFixed(3)} vs baseline=${baseline.toFixed(3)} ` +
+    `over sample_n=${verdict.sample_n} (min=${minSamples})`;
 
   return store.recordTuningOutcome(prop.id, {
-    measured: measured.rate,
+    measured,
     baseline,
-    improved,
-    sample_n: measured.sample_n,
+    improved: verdict.improved === 1,
+    sample_n: verdict.sample_n,
     notes,
   });
 }

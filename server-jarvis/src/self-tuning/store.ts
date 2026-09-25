@@ -134,6 +134,38 @@ export interface TuningOutcomeMeasurement {
   notes?: string;
 }
 
+/**
+ * A tuning proposal id: bounded length and a conservative charset, so a
+ * mistyped or hostile id is refused before it reaches SQLite rather than
+ * binding a parameter that was never checked.
+ */
+export const TUNING_PROPOSAL_ID_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/;
+
+export function isTuningProposalId(value: unknown): value is string {
+  return typeof value === "string" && TUNING_PROPOSAL_ID_PATTERN.test(value);
+}
+
+/** Why an apply did not apply. Stable codes — never prose, never DB detail. */
+export type ApplyTuningProposalReason =
+  | "invalid_id"
+  | "not_found"
+  | "store_unavailable"
+  | "store_failed";
+
+export type ApplyTuningProposalResult =
+  | {
+      ok: true;
+      id: string;
+      /** False when the row was already applied: this call changed nothing. */
+      applied: boolean;
+      applied_at: string | null;
+      /** Apply-time success rate, or null when it was not measurable. */
+      baseline: number | null;
+      baseline_state: "available" | "unavailable";
+      pre_apply_run_count: number | null;
+    }
+  | { ok: false; id: string; reason: ApplyTuningProposalReason };
+
 /** Auditable directive emitted by the optional live conductor. */
 export interface ConductorDirectiveRow {
   id: string;
@@ -597,18 +629,42 @@ export function selfTuningDbPath(): string {
   return p;
 }
 
+/** A success-rate dial that reports how much of its sample it could actually see. */
+export interface SuccessRateDial {
+  /** Successes over the known completed runs (0..1). 0 when none are known. */
+  rate: number;
+  /** Completed runs considered. */
+  sample_n: number;
+  /** Completed runs whose outcome is known (explicit `outcome` or a rating). */
+  known_n: number;
+  /** Completed runs with neither an `outcome` nor a `user_rating`. */
+  unknown_n: number;
+  /** True when at least one completed run had a known outcome. */
+  known: boolean;
+}
+
 /**
  * Simple success-rate dial over completed agent runs.
  * Prefer the truthful `outcome` column; fall back to user_rating for legacy rows.
+ *
+ * A completed run with neither an outcome nor a rating is *unknown*, not a
+ * success: the `outcome` column arrived through a guarded ALTER, so every
+ * pre-migration completed row is NULL and used to score 1.0 — which made a
+ * captured baseline fiction and every later `improved` verdict a comparison
+ * against it. Unrated rows are now excluded from the denominator and counted in
+ * `unknown_n` so the shortfall is visible instead of silently scored.
  */
-export function successRateOfRuns(runs: AgentRun[]): { rate: number; sample_n: number } {
+export function successRateOfRuns(runs: AgentRun[]): SuccessRateDial {
   const completed = runs.filter((r) => r.completed === 1);
   const sample_n = completed.length;
-  if (sample_n === 0) return { rate: 0, sample_n: 0 };
+  if (sample_n === 0) return { rate: 0, sample_n: 0, known_n: 0, unknown_n: 0, known: false };
   let successes = 0;
+  let known_n = 0;
+  let unknown_n = 0;
   for (const r of completed) {
     if (r.outcome === "success") {
       successes += 1;
+      known_n += 1;
       continue;
     }
     if (
@@ -617,12 +673,25 @@ export function successRateOfRuns(runs: AgentRun[]): { rate: number; sample_n: n
       r.outcome === "partial" ||
       r.outcome === "cancelled"
     ) {
+      known_n += 1;
       continue;
     }
-    // Legacy rows without outcome: rating >= 3 counts as success; unrated completed = success.
-    if (r.user_rating == null || r.user_rating >= 3) successes += 1;
+    // Legacy rows without outcome: a rating still decides (>= 3 counts as
+    // success). No outcome and no rating is unknown — never a success.
+    if (r.user_rating == null) {
+      unknown_n += 1;
+      continue;
+    }
+    known_n += 1;
+    if (r.user_rating >= 3) successes += 1;
   }
-  return { rate: successes / sample_n, sample_n };
+  return {
+    rate: known_n === 0 ? 0 : successes / known_n,
+    sample_n,
+    known_n,
+    unknown_n,
+    known: known_n > 0,
+  };
 }
 
 export class SelfTuningStore {
@@ -1296,31 +1365,43 @@ export class SelfTuningStore {
    * Mark a proposal applied and open a pending measurement window (M7).
    * Captures baseline success rate + pre-apply run count for the proposal's task_type
    * so later evaluation can compare post-apply runs without recomputing history.
+   *
+   * Reports what it actually did: a missing row is `not_found` rather than a
+   * silent `applied = 1` write that affected nothing, a malformed id is refused
+   * before the DB is opened, and a re-apply returns the stored snapshot without
+   * re-baselining (which would have silently swallowed the post-apply runs the
+   * open window is waiting for). A baseline with no known outcome behind it is
+   * recorded as unavailable, not as 0.
    */
-  applyTuningProposal(id: string): void {
+  applyTuningProposal(id: string): ApplyTuningProposalResult {
+    if (!isTuningProposalId(id)) {
+      return { ok: false, id: String(id), reason: "invalid_id" };
+    }
     const prop = this.getTuningProposal(id);
     if (!prop) {
-      // Still attempt the legacy applied=1 write so callers that race a missing
-      // row don't throw; no-op when the id truly does not exist.
-      const db = this.getDb();
-      if (!db) return;
-      try {
-        db.prepare("UPDATE tuning_proposals SET applied = 1 WHERE id = ?").run(id);
-      } catch (e) {
-        console.error("[SelfTuningStore] applyTuningProposal failed:", e);
-      } finally {
-        db.close();
-      }
-      return;
+      return { ok: false, id, reason: "not_found" };
+    }
+
+    if (prop.applied === 1) {
+      return {
+        ok: true,
+        id,
+        applied: false,
+        applied_at: prop.applied_at ?? null,
+        baseline: prop.baseline_success_rate ?? null,
+        baseline_state: prop.baseline_success_rate == null ? "unavailable" : "available",
+        pre_apply_run_count: prop.pre_apply_run_count ?? null,
+      };
     }
 
     const priorRuns = this.getCompletedAgentRunsForTaskType(prop.task_type);
     const baseline = successRateOfRuns(priorRuns);
     const appliedAt = new Date().toISOString();
     const priorIds = JSON.stringify(priorRuns.map((r) => r.id));
+    const baselineState: "available" | "unavailable" = baseline.known ? "available" : "unavailable";
 
     const db = this.getDb();
-    if (!db) return;
+    if (!db) return { ok: false, id, reason: "store_unavailable" };
     try {
       db.prepare(
         `UPDATE tuning_proposals
@@ -1330,12 +1411,28 @@ export class SelfTuningStore {
              pre_apply_run_count = ?,
              pre_apply_run_ids = ?
          WHERE id = ?`,
-      ).run(appliedAt, baseline.rate, baseline.sample_n, priorIds, id);
+      ).run(
+        appliedAt,
+        baselineState === "available" ? baseline.rate : null,
+        baseline.sample_n,
+        priorIds,
+        id,
+      );
     } catch (e) {
       console.error("[SelfTuningStore] applyTuningProposal failed:", e);
+      return { ok: false, id, reason: "store_failed" };
     } finally {
       db.close();
     }
+    return {
+      ok: true,
+      id,
+      applied: true,
+      applied_at: appliedAt,
+      baseline: baselineState === "available" ? baseline.rate : null,
+      baseline_state: baselineState,
+      pre_apply_run_count: baseline.sample_n,
+    };
   }
 
   updateUserRating(runId: string, rating: number): void {
