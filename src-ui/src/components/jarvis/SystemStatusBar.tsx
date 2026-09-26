@@ -144,6 +144,10 @@ export default function SystemStatusBar({ activeBackend = null }: SystemStatusBa
   const inferenceStatus = view.inference.status;
   const refreshing = state.health.error || state.inference.error || state.health.data !== null || state.inference.data !== null;
   const verdict = summarizeVerdict(view);
+  // The chip keeps its existing `—` vocabulary for a reading it does not have;
+  // the basis sentence rides in the accessible name so an assistive-technology
+  // user is told *why* there is no number, which the fixed label alone cannot say.
+  const memoryBasis = view.health.memoryReading?.basis ?? null;
   const chipClass = (key: TelemetryServiceKey) => {
     const serviceState = view.health.services[key];
     const requirement = view.health.requirements[key];
@@ -178,7 +182,10 @@ export default function SystemStatusBar({ activeBackend = null }: SystemStatusBa
             {serviceLabel(CHIP_LABELS[key], view.health.services[key], healthStale)}{REQUIREMENT_MARKS[view.health.requirements[key]]}
           </span>
         ))}
-        <span className={cn('px-1.5 py-0.5 rounded', view.health.memoryPercent === null ? 'bg-amber-500/15 text-amber-300' : view.health.memoryPercent >= 90 ? 'bg-red-500/15 text-red-300' : view.health.memoryPercent >= 80 ? 'bg-amber-500/15 text-amber-300' : 'bg-emerald-500/15 text-emerald-300')}>
+        <span
+          className={cn('px-1.5 py-0.5 rounded', view.health.memoryPercent === null ? 'bg-amber-500/15 text-amber-300' : view.health.memoryPercent >= 90 ? 'bg-red-500/15 text-red-300' : view.health.memoryPercent >= 80 ? 'bg-amber-500/15 text-amber-300' : 'bg-emerald-500/15 text-emerald-300')}
+          aria-label={memoryBasis === null ? undefined : `${percentLabel('MEM', view.health.memoryPercent, healthStale)} ${memoryBasis}`}
+        >
           {percentLabel('MEM', view.health.memoryPercent, healthStale)}
         </span>
         <span className={cn('px-1.5 py-0.5 rounded', view.health.diskPercent === null ? 'bg-amber-500/15 text-amber-300' : view.health.diskPercent >= 90 ? 'bg-red-500/15 text-red-300' : view.health.diskPercent >= 80 ? 'bg-amber-500/15 text-amber-300' : 'bg-emerald-500/15 text-emerald-300')}>

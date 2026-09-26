@@ -4,6 +4,7 @@ import { useCallback, useEffect, useId, useMemo, useReducer, useRef, useState } 
 import { initialSessionListState, reduceSessionListState } from './session-list-state';
 import { createReadGuard, type ReadIdentity } from './lib/read-identity';
 import { decodeContextUsage } from './lib/context-usage';
+import { decodeMemoryReading } from './lib/memory-reading';
 import { initialRegistryState, reduceRegistryState, parseActionRegistryAlerts, type ActionRegistryAlert } from './components/jarvis/action-registry-state';
 import {
   initialAlertChannelState,
@@ -361,6 +362,10 @@ function OverviewView() {
   </PageTransition>;
 
   const { health, agents, sessions } = data;
+  // The same decoder the top bar reads, so the two surfaces cannot print a
+  // number in one place and a sentence in the other for one record. A zeroed
+  // `memory_health` is Native's "the probe did not report" sentinel, not a 0%.
+  const memoryReading = decodeMemoryReading(health.memory);
   const enabledAgents = agents.filter((agent) => agent.enabled);
   const activeSessions = sessions.filter((session) => {
     const updatedAt = Date.parse(session.updated_at);
@@ -402,8 +407,9 @@ function OverviewView() {
           <div className="space-y-2 text-xs font-mono">
             <div className="flex justify-between"><span className="text-bone-dim">Ollama</span><span className={health.ollama.running ? 'text-cyan-glow' : 'text-error'}>{health.ollama.running ? 'running' : 'offline'}</span></div>
             <div className="flex justify-between"><span className="text-bone-dim">Model</span><span className="text-bone-muted truncate ml-2 max-w-[200px]">{health.ollama.model || 'none'}</span></div>
-            <div className="flex justify-between"><span className="text-bone-dim">Memory</span><span className="text-bone-muted">{health.memory.used_percent.toFixed(1)}%</span></div>
+            <div className="flex justify-between"><span className="text-bone-dim">Memory</span><span className="text-bone-muted">{memoryReading.label}</span></div>
             <div className="flex justify-between"><span className="text-bone-dim">Disk</span><span className="text-bone-muted">{health.disk.use_percent}</span></div>
+            {memoryReading.basis !== null && <p className="text-[10px] text-bone-muted">{memoryReading.basis}</p>}
           </div>
         </TiltCard>
         <TiltCard glow accent="aurora" intensity="subtle">

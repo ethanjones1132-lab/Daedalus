@@ -433,3 +433,50 @@ describe('an inference read that has not come back', () => {
     );
   });
 });
+
+describe('memory reading sentinel in the shared verdict', () => {
+  // Native reports a memory probe that could not run as a zeroed record rather
+  // than the "?" string its disk probe uses, so `used_percent: 0` alongside
+  // `total_mb: 0` means "not measured". The shared decoder read that zero as a
+  // real 0%, which certified the system and printed an emerald chip.
+  const unprobed: HealthData['memory'] = { total_mb: 0, available_mb: 0, used_mb: 0, used_percent: 0 };
+
+  it('does not project a measurement for a record whose probe never reported', () => {
+    const view = deriveSystemTelemetryView(readyWith({ ...health, memory: unprobed }), 'ollama');
+    expect(view.health.memoryPercent).toBeNull();
+    expect(view.overall).toBe('degraded');
+    expect(view.overallReasons).toContain('memory_pressure');
+  });
+
+  it('treats the unprobed sentinel the same way it treats an unreadable disk row', () => {
+    const memory = deriveSystemTelemetryView(readyWith({ ...health, memory: unprobed }), 'ollama');
+    const disk = deriveSystemTelemetryView(readyWith({ ...health, disk: { ...health.disk, use_percent: '?' } }), 'ollama');
+    expect(memory.overallReasons.filter((reason) => reason.endsWith('pressure'))).toEqual(['memory_pressure']);
+    expect(disk.overallReasons.filter((reason) => reason.endsWith('pressure'))).toEqual(['disk_pressure']);
+    // Disk keeps its own string convention; the two rows are one rule now.
+    expect(disk.health.diskPercent).toBeNull();
+  });
+
+  it('keeps a real memory reading a real reading, including a genuine zero', () => {
+    const measured = deriveSystemTelemetryView(readyWith({ ...health, memory: { ...health.memory, used_percent: 42 } }), 'ollama');
+    expect(measured.health.memoryPercent).toBe(42);
+    expect(measured.overallReasons).toEqual([]);
+
+    const idle = deriveSystemTelemetryView(
+      readyWith({ ...health, memory: { total_mb: 16384, available_mb: 16384, used_mb: 0, used_percent: 0 } }),
+      'ollama',
+    );
+    expect(idle.health.memoryPercent).toBe(0);
+    expect(idle.overallReasons).toEqual([]);
+    expect(idle.overall).toBe('healthy');
+  });
+
+  it('claims no memory reading before the health read has come back', () => {
+    const pending = deriveSystemTelemetryView(
+      reduceSystemTelemetryState(initialSystemTelemetryState(), { type: 'pending', requestId: 1 }),
+      'ollama',
+    );
+    expect(pending.health.memoryPercent).toBeNull();
+    expect(pending.overall).toBe('pending');
+  });
+});

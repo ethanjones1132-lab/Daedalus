@@ -1,3 +1,5 @@
+import { decodeMemoryReading, type MemoryReading } from '../../lib/memory-reading';
+
 export interface OllamaHealth {
   running: boolean;
   model: string | null;
@@ -291,6 +293,12 @@ export interface SystemTelemetryView {
       proxy: ServiceState;
     };
     memoryPercent: number | null;
+    /**
+     * The decoded memory reading, or `null` while no health read has come back.
+     * `null` here means the read is outstanding, which is different from a
+     * reading this build cannot make: only the latter carries a basis sentence.
+     */
+    memoryReading: MemoryReading | null;
     diskPercent: number | null;
     bunGiveUp: boolean;
     proxyGiveUp: boolean;
@@ -336,7 +344,12 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBac
   const inferenceData = state.inference.data;
   const inferenceStale = isStale(state.inference.status, inferenceData !== null);
   const healthStatus = state.health.status;
-  const memoryPercent = healthData ? parsePercent(healthData.memory.used_percent) : null;
+  // The memory field is decoded once, here, because the top bar and the Overview
+  // read the same record: a zeroed `memory_health` is Native's "the probe did
+  // not report" sentinel rather than a real 0%, and both surfaces used to print
+  // it as one.
+  const memoryReading = healthData ? decodeMemoryReading(healthData.memory) : null;
+  const memoryPercent = memoryReading === null ? null : memoryReading.percent;
   const diskPercent = healthData ? parsePercent(healthData.disk.use_percent) : null;
   const services = {
     bun: serviceState(healthData, 'bun_server'),
@@ -406,6 +419,7 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBac
       requirements,
       services,
       memoryPercent,
+      memoryReading,
       diskPercent,
       bunGiveUp: healthData?.supervisor?.bun_give_up ?? false,
       proxyGiveUp: healthData?.supervisor?.proxy_give_up ?? false,
