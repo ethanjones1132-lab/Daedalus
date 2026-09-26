@@ -10,29 +10,11 @@ import {
 } from '../ui';
 import { usePolling } from '../../hooks/usePolling';
 import { initialRegistryState, reduceRegistryState } from './action-registry-state';
-
-interface GatewayStatus {
-  running: boolean;
-  port: number;
-  active_connections: number;
-  uptime_seconds: number;
-  version: string;
-  timestamp: string;
-}
-
-function formatUptime(seconds: number): string {
-  if (seconds <= 0) return '—';
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = seconds % 60;
-  if (h > 0) return `${h}h ${m}m`;
-  if (m > 0) return `${m}m ${s}s`;
-  return `${s}s`;
-}
+import { projectGatewayStatus, type GatewayStatusRecord } from './gateway-metrics';
 
 export default function GatewayView() {
   const [{ snapshot: status, loading, error }, dispatch] = useReducer(
-    reduceRegistryState<GatewayStatus>, initialRegistryState<GatewayStatus>(),
+    reduceRegistryState<GatewayStatusRecord>, initialRegistryState<GatewayStatusRecord>(),
   );
   const requestId = useRef(0);
 
@@ -40,7 +22,7 @@ export default function GatewayView() {
     const id = ++requestId.current;
     dispatch({ type: 'pending', requestId: id });
     try {
-      const snapshot = await invoke<GatewayStatus>('get_gateway_status');
+      const snapshot = await invoke<GatewayStatusRecord>('get_gateway_status');
       dispatch({ type: 'success', requestId: id, snapshot });
     } catch {
       dispatch({ type: 'failure', requestId: id });
@@ -49,14 +31,7 @@ export default function GatewayView() {
 
   usePolling(fetchStatus, 10000, [fetchStatus]);
 
-  const metrics = status
-    ? [
-        { label: 'Port', value: String(status.port) },
-        { label: 'Connections', value: String(status.active_connections) },
-        { label: 'Uptime', value: formatUptime(status.uptime_seconds) },
-        { label: 'Version', value: status.version },
-      ]
-    : [];
+  const view = status ? projectGatewayStatus(status) : null;
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-hidden">
@@ -82,27 +57,29 @@ export default function GatewayView() {
         <p>{status === null ? 'Could not load gateway status.' : 'Could not refresh gateway status. Showing previously observed gateway status; it may be stale.'}</p>
         <button type="button" onClick={fetchStatus} disabled={loading} className="btn-ghost text-xs mt-2 disabled:opacity-50">Retry</button>
       </div>}
-      {status ? (
+      {view ? (
         <div className="space-y-3">
           <GlassCard className="p-4">
             <div className="flex items-center gap-2">
-              <StatusDot ok={status.running} warn={!status.running} pulse={status.running} />
+              <StatusDot ok={view.ok} warn={view.warn} />
               <span className="text-sm font-medium text-bone">
-                Gateway is {status.running ? 'running' : 'stopped'}
+                {view.claimLabel}
               </span>
-              <Pill variant={status.running ? 'success' : 'error'}>
-                {status.running ? 'online' : 'offline'}
+              <Pill variant={view.tone}>
+                {view.pill}
               </Pill>
             </div>
+            <p className="mt-2 text-[11px] text-bone-faint">{view.basis}</p>
           </GlassCard>
 
           <div className="grid grid-cols-2 gap-3">
-            {metrics.map((m) => (
-              <GlassCard key={m.label} className="p-3">
+            {view.metrics.map((m) => (
+              <GlassCard key={m.key} className="p-3">
                 <div className="text-lg font-semibold text-bone truncate">{m.value}</div>
                 <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40">
                   {m.label}
                 </div>
+                <p className="mt-1 text-[10px] text-bone-faint">{m.basis}</p>
               </GlassCard>
             ))}
           </div>
