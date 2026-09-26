@@ -1,5 +1,5 @@
 import { motion, AnimatePresence, type Variants } from 'framer-motion';
-import { Component as ReactComponent, ReactNode, useEffect, useState, useCallback, useMemo, useRef, createContext, useContext } from 'react';
+import { Component as ReactComponent, Fragment, ReactNode, useEffect, useState, useCallback, useMemo, useRef, createContext, useContext } from 'react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
@@ -416,27 +416,49 @@ export function EmptyState({
 // ── Error boundary ──
 // ═══════════════════════════════════════════════════════════════
 
+// Fixed vocabulary: a route failure is announced without naming the native
+// command, schema detail, or any other internals text behind it.
+const ROUTE_FAILURE_MESSAGE =
+  'This view stopped unexpectedly. Daedalus is still running.';
+
 export class ErrorBoundary extends ReactComponent<
   { children: ReactNode; fallback?: ReactNode },
-  { error: Error | null }
+  // The caught value is boxed and typed `unknown`, so a throw that is not an
+  // `Error` — a bare string, the `undefined` of a null dereference, even
+  // `null` or `0` itself — cannot read as "no failure" and re-render the
+  // children that just threw.
+  { error: { value: unknown } | null; resetKey: number }
 > {
   constructor(props: { children: ReactNode; fallback?: ReactNode }) {
     super(props);
-    this.state = { error: null };
+    this.state = { error: null, resetKey: 0 };
   }
-  static getDerivedStateFromError(error: Error) {
-    return { error };
+  static getDerivedStateFromError(error: unknown) {
+    return { error: { value: error } };
   }
-  componentDidCatch(error: Error, info: unknown) {
+  componentDidCatch(error: unknown, info: unknown) {
     console.error('[ErrorBoundary]', error, info);
   }
   render() {
     if (this.state.error) {
-      return this.props.fallback ?? (
-        <ErrorState error={this.state.error.message} />
+      if (this.props.fallback != null) return this.props.fallback;
+      return (
+        <div role="alert">
+          <ErrorState
+            error={ROUTE_FAILURE_MESSAGE}
+            onRetry={() =>
+              this.setState((prev) => ({
+                error: null,
+                resetKey: prev.resetKey + 1,
+              }))
+            }
+          />
+        </div>
       );
     }
-    return this.props.children;
+    // The key makes Retry a real remount: a recovered route re-reads its data
+    // instead of re-rendering the subtree that just threw.
+    return <Fragment key={this.state.resetKey}>{this.props.children}</Fragment>;
   }
 }
 

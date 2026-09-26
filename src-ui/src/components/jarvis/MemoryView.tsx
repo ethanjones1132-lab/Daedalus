@@ -12,6 +12,18 @@ import {
   type MemoryEntry,
   type Tier,
 } from './memory-recall-state';
+import {
+  TIER_STATS_GROUP_LABEL,
+  TIER_STATS_RETRY_LABEL,
+  TIERS,
+  beginTierStatsRead,
+  formatTierCount,
+  initialTierStatsState,
+  rejectTierStatsRead,
+  resolveTierStatsRead,
+  tierStatsView,
+  type TierStatsState,
+} from './memory-tier-stats';
 
 // Defensive formatters — the memory backend has drifted shape during recovery, so the
 // render must never throw on a missing/oddly-typed field (that blanks the whole page).
@@ -54,7 +66,7 @@ function fmtDate(value: string | undefined | null): string {
 
 export default function MemoryView() {
   const [memories, setMemories] = useState<MemoryEntry[]>([]);
-  const [tierStats, setTierStats] = useState<Record<Tier, number> | null>(null);
+  const [tierStats, setTierStats] = useState<TierStatsState>(initialTierStatsState);
   const [query, setQuery] = useState('');
   const [tier, setTier] = useState<Tier | 'all'>('all');
   const [loading, setLoading] = useState(true);
@@ -65,6 +77,21 @@ export default function MemoryView() {
   const inspectionButtons = useRef(new Map<string, HTMLButtonElement>());
   const searchInput = useRef<HTMLInputElement>(null);
   const requestId = useRef(0);
+  const tierRequestId = useRef(0);
+
+  // The tier tally is a second read with its own request identity: it can fail or
+  // hang without holding the memory list behind it, and a superseded read of it
+  // can neither publish a verdict nor end the newest read's pending state.
+  const readTierStats = useCallback(async () => {
+    const id = ++tierRequestId.current;
+    setTierStats((state) => beginTierStatsRead(state, id));
+    try {
+      const raw = await invoke<unknown>('jarvis_get_tier_stats');
+      setTierStats((state) => resolveTierStatsRead(state, id, raw));
+    } catch {
+      setTierStats((state) => rejectTierStatsRead(state, id));
+    }
+  }, []);
 
   // List and recall share one boundary: neither may overwrite a newer request.
   const load = useCallback(async (requestedQuery: string) => {
@@ -80,13 +107,11 @@ export default function MemoryView() {
         if (id !== requestId.current) return;
         setMemories(decodeMemoryRecallResults(results));
       } else {
-        const [list, stats] = await Promise.all([
-          invoke<MemoryEntry[]>('list_recent_memories'),
-          invoke<Record<Tier, number>>('jarvis_get_tier_stats').catch(() => null),
-        ]);
+        const listed = invoke<MemoryEntry[]>('list_recent_memories');
+        void readTierStats();
+        const list = await listed;
         if (id !== requestId.current) return;
         setMemories(list);
-        setTierStats(stats);
       }
     } catch {
       if (id !== requestId.current) return;
@@ -121,6 +146,14 @@ export default function MemoryView() {
     else searchInput.current?.focus();
   };
 
+  const tierView = tierStatsView(tierStats);
+  const tierReadings = tierView.readings
+    ? TIERS.map((tier) => ({
+        tier,
+        text: formatTierCount(tierView.readings!.find((reading) => reading.tier === tier)!),
+      }))
+    : [];
+
   return (
     <div className="flex flex-col gap-4 h-full overflow-hidden">
       <SectionHeader
@@ -128,22 +161,40 @@ export default function MemoryView() {
         subtitle="Browse, recall, and inspect the memory system"
         count={memories.length}
         action={
-          <div className="flex gap-2">
-            {tierStats && (
-              <div className="flex gap-1.5 text-[10px]">
-                {(['hot', 'warm', 'cold'] as Tier[]).map((t) => (
+          <div className="flex flex-col items-end gap-1">
+            {tierReadings.length > 0 && (
+              <div role="group" aria-label={TIER_STATS_GROUP_LABEL} className="flex gap-1.5 text-[10px]">
+                {tierReadings.map(({ tier, text }) => (
                   <span
-                    key={t}
+                    key={tier}
                     className={cn(
                       'rounded-full border px-2 py-0.5 font-mono uppercase tracking-wider',
-                      t === 'hot' && 'border-amber-500/30 text-amber-200',
-                      t === 'warm' && 'border-cyan-500/30 text-cyan-200',
-                      t === 'cold' && 'border-bone/20 text-bone/50',
+                      tier === 'hot' && 'border-amber-500/30 text-amber-200',
+                      tier === 'warm' && 'border-cyan-500/30 text-cyan-200',
+                      tier === 'cold' && 'border-bone/20 text-bone/50',
                     )}
                   >
-                    {t} {tierStats[t] ?? 0}
+                    {tier} {text}
                   </span>
                 ))}
+              </div>
+            )}
+            {tierView.kind === 'pending' && (
+              <span role="status" className="text-[10px] text-bone/40">
+                {tierView.message}
+              </span>
+            )}
+            {tierView.kind === 'unavailable' && (
+              <div role="alert" className="flex items-center gap-2 text-[10px] text-red-300/80">
+                <span className="max-w-xs text-right">{tierView.message}</span>
+                <button
+                  type="button"
+                  onClick={() => { void readTierStats(); }}
+                  disabled={tierStats.pending}
+                  className="shrink-0 rounded-md border border-white/10 px-2 py-0.5 text-bone/70 hover:text-bone disabled:opacity-40"
+                >
+                  {TIER_STATS_RETRY_LABEL}
+                </button>
               </div>
             )}
           </div>
