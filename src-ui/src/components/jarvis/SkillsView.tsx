@@ -22,7 +22,7 @@ import {
   EmptyState,
   useToast,
 } from '../ui';
-import { sectionCount } from '../../lib/list-tally';
+import { countProp, listRead, projectListTally, tallyNumber, tallyTone } from '../../lib/list-tally';
 import MarkdownRenderer from './MarkdownRenderer';
 import { initialRegistryState, reduceRegistryState, type RegistrySnapshotState } from './action-registry-state';
 import { applySkillListRead, confirmSkillToggle, type SkillToggleProtection } from './skill-toggle-state';
@@ -821,7 +821,11 @@ export function SkillsView() {
    const selectedCandidateId = selected ? candidateIdOf(selected) : null;
    const selectedCandidateMutation = selectedCandidateId ? candidateMutations[selectedCandidateId] ?? null : null;
 
-   const enabledCount = skills.filter((s) => s.enabled).length;
+  // One read, two numbers: the count inside the heading and the `enabled` pill
+  // beside it are tallies over the same `list_skills` rows, so they are absent
+  // together and neither can be a measurement a failed read invented.
+  const tally = projectListTally(skills, listRead(skills, { loading, failed: error !== null }));
+  const enabledCount = tallyNumber(skills, tally, (skill) => skill.enabled);
 
   const runCandidateAction = useCallback(
     async (skill: Skill, candidateId: string, action: SkillCandidateAction) => {
@@ -912,11 +916,11 @@ export function SkillsView() {
       <SectionHeader
         title="Skills"
         subtitle="Browse, toggle, inspect, and restore skill revisions"
-        count={sectionCount(skills, { loading, failed: error !== null })}
+        count={countProp(tally)}
         action={
-          <Pill variant={enabledCount > 0 ? 'success' : 'default'}>
-            {enabledCount} enabled
-          </Pill>
+          enabledCount === null ? undefined : (
+            <Pill variant={tallyTone(enabledCount)}>{enabledCount} enabled</Pill>
+          )
         }
       />
 

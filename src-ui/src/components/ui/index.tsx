@@ -242,10 +242,13 @@ export function Pill({
   children,
   variant = 'default',
   className,
+  title,
 }: {
   children: ReactNode;
   variant?: StatusVariant;
   className?: string;
+  /** Optional basis for the claim the pill's text makes. Omitted entirely when absent, so an unlabelled render is identical to before. */
+  title?: string;
 }) {
   const styles: Record<StatusVariant, string> = {
     success: 'bg-emerald-500/15 text-emerald-200 border-emerald-500/30',
@@ -262,6 +265,7 @@ export function Pill({
         styles[variant],
         className,
       )}
+      {...(title ? { title } : {})}
     >
       {children}
     </span>

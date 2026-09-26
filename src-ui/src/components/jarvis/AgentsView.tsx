@@ -16,6 +16,11 @@ import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { initialBindingState, reduceBindingState } from './agent-binding-state';
 import { initialDiscoveryState, reduceDiscoveryState, type LifecycleAgent } from './agent-discovery-state';
 import {
+  AGENT_RECORD_FIELD_BASIS,
+  AGENT_RECORD_SCOPE,
+  decodeAgentModelLabel,
+} from './agent-routing-scope';
+import {
   canActivateLifecycle,
   canDeactivateLifecycle,
   effectiveLifecycleState,
@@ -450,9 +455,13 @@ export function AgentsView() {
       for (const id of result.confirmed) {
         const operation = previous[id];
         if (!operation) continue;
-        if (operation.action === 'edit') successRef.current('Agent updated');
-        if (operation.action === 'enable') successRef.current('Agent enabled');
-        if (operation.action === 'disable') successRef.current('Agent disabled');
+        // A confirmed write is announced for the store it actually wrote. The
+        // readback above is the `agents` table, so "Agent record" is the whole
+        // claim: a bare "Agent enabled" is read as routing, which this write
+        // does not do (see AGENT_RECORD_SCOPE).
+        if (operation.action === 'edit') successRef.current('Agent record updated');
+        if (operation.action === 'enable') successRef.current('Agent record enabled');
+        if (operation.action === 'disable') successRef.current('Agent record disabled');
         if (operation.action === 'delete' && operation.row) successRef.current(`Deleted ${operation.row.name}`);
         if (operation.action === 'edit' && editingIdRef.current === id) setEditing(null);
       }
@@ -808,6 +817,8 @@ export function AgentsView() {
         }
       />
 
+      <p className="text-[11px] text-bone/50 max-w-3xl -mt-2">{AGENT_RECORD_SCOPE}</p>
+
       {creating && (
         <AgentEditor
           initial={EMPTY_DRAFT}
@@ -961,6 +972,7 @@ export function AgentsView() {
             {agents.map((a) => {
               const operation = operations[a.id];
               const rowLocked = operation !== undefined;
+              const modelLabel = decodeAgentModelLabel(a.model);
               if (editingId === a.id) {
                 return (
                   <li key={a.id}>
@@ -987,7 +999,10 @@ export function AgentsView() {
                     <div className="flex items-center gap-2 mb-1">
                       <StatusDot ok={a.enabled} warn={!a.enabled} />
                       <h3 className="text-sm font-medium text-bone truncate">{a.name}</h3>
-                      <Pill variant="default">{a.model}</Pill>
+                      {/* The record's own model cell, labelled as such: a bare pill
+                          beside a name and an enable switch is the one place on
+                          this card that would read as a routing pin. */}
+                      <Pill variant="default" title={modelLabel.basis}>{modelLabel.label}</Pill>
                       {a.backend && a.backend !== 'jarvis' && (
                         <Pill variant="info">{a.backend}</Pill>
                       )}
@@ -996,6 +1011,7 @@ export function AgentsView() {
                           type="button"
                           onClick={() => toggleEnabled(a)}
                           disabled={rowLocked}
+                          title={AGENT_RECORD_FIELD_BASIS}
                           className={cn(
                             'px-2 py-0.5 rounded-md border transition-colors disabled:opacity-40 disabled:cursor-not-allowed',
                             a.enabled

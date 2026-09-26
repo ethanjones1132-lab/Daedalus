@@ -13,7 +13,16 @@
 // header and the body beneath it cannot disagree about the same read.
 
 import { describe, expect, it } from 'vitest';
-import { countProp, listRead, projectListTally, sectionCount, type ListRead } from './list-tally';
+import {
+  countProp,
+  listRead,
+  projectListTally,
+  sectionCount,
+  tallyNumber,
+  tallyTone,
+  type ListRead,
+  type ListTally,
+} from './list-tally';
 
 const NO_READ = { loading: false, failed: false };
 const IN_FLIGHT = { loading: true, failed: false };
@@ -143,5 +152,89 @@ describe('sectionCount', () => {
         expect(countProp(tally)).toBe(prop);
       }
     }
+  });
+});
+
+// A header states its count inside its own name (`Channels(3)`) and the rest of
+// the summary in the `action` slot beside it — `{n} connected`, `{n} delivery
+// verified`, `{n} enabled`. Those are claims in the same sentence, so they are
+// held to the same read: the count row routed thirteen counts through
+// `lib/list-tally.ts` and left these three printing whatever a list that starts
+// `[]` happened to filter down to, which on a failed or unanswered read is a
+// confident `0 enabled` sitting above the surface's own "could not load".
+
+describe('tallyNumber', () => {
+  const CONFIRMED = projectListTally(THREE, 'confirmed');
+  const PENDING = projectListTally([], 'pending');
+  const FAILED_READ = projectListTally([], 'failed');
+  const ENABLED = { enabled: true };
+  const DISABLED = { enabled: false };
+  const MIXED = [ENABLED, DISABLED, ENABLED];
+
+  it('counts the rows that match, for a read that confirmed the list', () => {
+    expect(tallyNumber(MIXED, CONFIRMED, (row) => row.enabled)).toBe(2);
+  });
+
+  it('states a confirmed zero rather than nothing, so a real zero stays a zero', () => {
+    // The load-bearing case for a pill: `0 enabled` on a confirmed list is a
+    // measurement, and it must not be confused with having nothing to say.
+    expect(tallyNumber([DISABLED, DISABLED], CONFIRMED, (row) => row.enabled)).toBe(0);
+  });
+
+  it('states nothing while the read is unanswered, even when rows are held', () => {
+    expect(tallyNumber(MIXED, PENDING, (row) => row.enabled)).toBeNull();
+  });
+
+  it('states nothing once the read has failed, even when rows are held', () => {
+    // A retained list is not a claim this row is entitled to make on its own.
+    expect(tallyNumber(MIXED, FAILED_READ, (row) => row.enabled)).toBeNull();
+  });
+
+  it('is absent exactly when the count beside it is absent, for every read', () => {
+    // The property that makes "the two numbers on one header cannot disagree
+    // about one read" a fact rather than a convention: a surface cannot print
+    // the count and drop the pill, or the reverse.
+    for (const flags of [NO_READ, IN_FLIGHT, FAILED, FAILED_AND_STILL_LOADING]) {
+      for (const items of [[], THREE]) {
+        const tally = projectListTally(items, listRead(items, flags));
+        const stated = tallyNumber(items, tally, () => true);
+        expect(stated === null, `${JSON.stringify(flags)} over ${items.length} rows`).toBe(tally.count === null);
+        expect(countProp(tally) === undefined).toBe(stated === null);
+      }
+    }
+  });
+
+  it('counts a subset of the list it is given, so a second read over the same rows can be stated too', () => {
+    // Channels states two tallies from one channel list, and they have to be
+    // able to disagree with each other: a connected channel is not a verified
+    // delivery. A tally that only ever counted everything could not say that.
+    const tally: ListTally = { count: 3 };
+    expect(tallyNumber(MIXED, tally, () => true)).toBe(3);
+    expect(tallyNumber(MIXED, tally, () => false)).toBe(0);
+  });
+
+  it('never sees the read that failed, so no native text can reach a pill', () => {
+    // The tally is derived from a `ListTally` rather than from a read, so there
+    // is nowhere for a rejection string to enter even by accident.
+    const verdict: ListTally = { count: null };
+    expect(tallyNumber(MIXED, verdict, () => true)).toBeNull();
+  });
+});
+
+describe('tallyTone', () => {
+  it('keeps the threshold every one of these pills already used', () => {
+    // `> 0 ? 'success' : 'default'` was written out three times on three
+    // surfaces. The threshold is the operator's, so it moves into one place
+    // rather than being re-decided per surface.
+    expect(tallyTone(1)).toBe('success');
+    expect(tallyTone(12)).toBe('success');
+    expect(tallyTone(0)).toBe('default');
+  });
+
+  it('is the same for a stated zero as for an unstatable one, because a surface omits the pill instead', () => {
+    // `null` never reaches a rendered pill: the surface's `=== null` branch
+    // leaves the slot empty. The tone is a property of the number, so the
+    // honest answer for nothing is the quiet one.
+    expect(tallyTone(null)).toBe('default');
   });
 });

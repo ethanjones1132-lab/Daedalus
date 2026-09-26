@@ -13,12 +13,14 @@
 // only the header was not.
 //
 // The `PluginsView` tally row fixed one surface and shipped the rule *in that
-// one module*, so the class recurred. This is the rule, as a ratchet: every
-// `count={` in the UI source is either routed through the one shared tally, is
-// optional-chained off a value that is `null` until its read returns, or has a
-// documented reason why it makes no claim. A new count on a list no read has
-// returned cannot ship until someone writes down what read is behind it — and a
-// count with no such read has no sentence to write.
+// one module*, so the class recurred twice more: first the nine `count={length}`
+// headers, then the tally pills in the same headers' `action` slot. This is the
+// rule, as a ratchet: every claim a header makes about a read — the parenthetical
+// inside its name and every numbered pill beside it — is either routed through the
+// one shared tally, is optional-chained off a value that is `null` until its read
+// returns, or has a documented reason why it makes no claim. A new count or tally
+// on a list no read has returned cannot ship until someone writes down what read is
+// behind it — and a claim with no such read has no sentence to write.
 //
 // It reads the source as text rather than rendering anything: the rule spans
 // files, and rendering the app needs Tauri IPC mocks. No Rust toolchain, no
@@ -42,13 +44,14 @@ const sources = import.meta.glob('./**/*.{ts,tsx}', {
 }) as Record<string, string>;
 
 /**
- * Every count in the UI source, with the evidence that the read behind it can
- * end. Three kinds are allowed:
+ * Every claim a header makes about a read, with the evidence that the read behind
+ * it can end. Three kinds are allowed:
  *
  * - `confirmed-read` — the number comes from `lib/list-tally.ts`, which states
  *   it only while a confirmed read is the list on screen: nothing for a read in
  *   flight, nothing for a read that failed with no rows on screen, and a real
- *   `0` for a confirmed empty one.
+ *   `0` for a confirmed empty one. Two slots qualify: the `count` prop inside the
+ *   heading, and a numbered `Pill` in the `action` slot beside it.
  * - `optional-read` — the expression is optional-chained off a value that is
  *   `null` until its read returns, so the primitive receives `undefined` and
  *   prints no parenthetical at all until then.
@@ -87,10 +90,10 @@ const ALLOWLIST: SectionCountAllowlistEntry[] = [
   },
   {
     file: './components/jarvis/ChannelsView.tsx',
-    text: 'count={sectionCount(channels, { loading, failed: error !== null })}',
+    text: 'count={countProp(tally)}',
     kind: 'confirmed-read',
     reason:
-      'The Channels header, over the rows `list_channels` returned. A failed read keeps the confirmed rows on screen under the surface’s own staleness warning, so the count of those rows is not in doubt and stays; a failed first read has no rows, and states nothing.',
+      'The Channels header, over the rows `list_channels` returned. A failed read keeps the confirmed rows on screen under the surface’s own staleness warning, so the count of those rows is not in doubt and stays; a failed first read has no rows, and states nothing. The count and the two pills in the slot beside it now come from one tally, so the three numbers on that header cannot disagree about one read.',
   },
   {
     file: './components/jarvis/CommitmentsView.tsx',
@@ -108,10 +111,10 @@ const ALLOWLIST: SectionCountAllowlistEntry[] = [
   },
   {
     file: './components/jarvis/SkillsView.tsx',
-    text: 'count={sectionCount(skills, { loading, failed: error !== null })}',
+    text: 'count={countProp(tally)}',
     kind: 'confirmed-read',
     reason:
-      'The Skills header, over the rows `list_skills` returned, and the largest list in the app: a failed read used to read as `Skills(0)` beside the surface’s own `Could not load skills.`, which is the reading that most strongly says this install has no skills at all.',
+      'The Skills header, over the rows `list_skills` returned, and the largest list in the app: a failed read used to read as `Skills(0)` beside the surface’s own `Could not load skills.`, which is the reading that most strongly says this install has no skills at all. The `enabled` pill in the slot beside it is derived from the same tally, so a failed read takes both numbers away together rather than leaving `0 enabled` next to a count that claims nothing.',
   },
   {
     file: './components/jarvis/AgentsView.tsx',
@@ -162,6 +165,34 @@ const ALLOWLIST: SectionCountAllowlistEntry[] = [
     reason:
       'The Plugins header, the surface that established the rule: `projectPluginTally` returns `count: null` for anything that is not a confirmed read, and its count now comes from the same shared tally every other header uses, so the two cannot drift apart.',
   },
+  {
+    file: './components/jarvis/SkillsView.tsx',
+    text: '{enabledCount} enabled',
+    kind: 'confirmed-read',
+    reason:
+      'The Skills `enabled` pill, the second half of the sentence its count starts. `list_skills` is the only read behind it, `tallyNumber` derives the number from the same tally the count prints, and the `tallyTone` threshold is the `> 0 ? success : default` this pill already used. An unanswered or failed read states no number at all here — a `0 enabled` beside `Could not load skills.` reads as a measured claim that this install has nothing enabled, which is the strongest thing a pill can say and the one thing a read that returned nothing cannot support.',
+  },
+  {
+    file: './components/jarvis/ChannelsView.tsx',
+    text: '{connectedCount} connected',
+    kind: 'confirmed-read',
+    reason:
+      'The Channels `connected` pill, counted from the same `list_channels` rows the count beside it prints. The number is a stored login flag rather than a live socket, which the line under the header already says in words, so the pill’s job is only to answer for the read: nothing while a read is unanswered, nothing once one has failed with no rows on screen, and the real figure — including a real `0` — once a read has confirmed the list.',
+  },
+  {
+    file: './components/jarvis/ChannelsView.tsx',
+    text: '{verifiedCount} delivery verified',
+    kind: 'confirmed-read',
+    reason:
+      'The Channels `delivery verified` pill, the strongest claim in that slot: only a probe that delivered a message adds a channel to it, so `0 delivery verified` reads as "nothing has been proven to deliver" rather than as "no channel exists". It is counted over the same confirmed `list_channels` rows as the two numbers beside it, which is why it disappears with them on a read that failed and why a confirmed zero stays stated.',
+  },
+  {
+    file: './components/jarvis/PluginsView.tsx',
+    text: '{tally.enabled} enabled',
+    kind: 'confirmed-read',
+    reason:
+      'The Plugins `enabled` pill, the surface that already gated it by hand (`tally.enabled === null ? undefined : …`) and therefore the one the shared tally was modelled on. Its number now comes from `tallyNumber` rather than from a second `filter` inside this module, and its tone from `tallyTone`, so the pill and the count it sits beside are two readings of one decision instead of two implementations of one idea.',
+  },
 ];
 
 describe('section-count guard', () => {
@@ -176,16 +207,32 @@ describe('section-count guard', () => {
     ).toBe(true);
   });
 
-  it('allows no count that a documented read does not account for', () => {
+  it('finds every tally pill in a header’s action slot, so that half cannot pass vacuously', () => {
+    const slots = findCountSites(sources).filter((site) => site.slot === 'action');
+    // A tally pill is the other half of the sentence a count starts, and it
+    // lives outside the heading, so the count scan alone never saw any of these.
+    // Four is the whole inventory: two in Channels, one in Skills, one in
+    // Plugins. A fifth claim in a header is the case the guard exists for, so
+    // this number is the count, not a lower bound.
+    expect(slots).toHaveLength(4);
+    for (const unit of ['{connectedCount} connected', '{verifiedCount} delivery verified', '{enabledCount} enabled', '{tally.enabled} enabled']) {
+      expect(
+        slots.some((site) => site.text.includes(unit)),
+        `the scan should find the \`${unit}\` pill`,
+      ).toBe(true);
+    }
+  });
+
+  it('allows no claim that a documented read does not account for', () => {
     const sites = findCountSites(sources);
     const { undocumented, unused } = matchCountAllowlist(sites, ALLOWLIST);
     expect(
-      undocumented.map((site) => `${site.file}: ${site.text}`),
-      'count props with no documented read behind them — route the number through `sectionCount` from lib/list-tally.ts, optional-chain it off a value that is null until its read returns, or add an entry above saying what read is behind it',
+      undocumented.map((site) => `${site.file}:${site.line} [${site.slot}]: ${site.text}`),
+      'header claims with no documented read behind them — route the number through `sectionCount`, `countProp`, `tallyNumber` or `tallyTone` from lib/list-tally.ts, optional-chain it off a value that is null until its read returns, or add an entry above saying what read is behind it',
     ).toEqual([]);
     expect(
       unused.map((entry) => `${entry.file}: ${entry.text}`),
-      'allowlist entries that match no site — the count moved or was deleted, so the entry is now a claim about nothing',
+      'allowlist entries that match no site — the claim moved or was deleted, so the entry is now a claim about nothing',
     ).toEqual([]);
   });
 

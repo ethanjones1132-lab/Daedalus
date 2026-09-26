@@ -15,7 +15,7 @@
 // flag as a stored flag and rests a connection claim on the delivery probe below.
 
 import { invoke } from '@tauri-apps/api/core';
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { channelProbePhase, projectChannelLiveness } from './channel-liveness';
 import { initialReceiptState, parseDiscordSendResponse, parseReceipts, reduceReceiptState, type DeliveryReceipt } from './channel-receipt-state';
 import { canVerifyChannel, channelId, channelLocked, isConfiguredChannel, isConnected, reconcileChannels, type Channel, type ChannelOperation } from './channel-state';
@@ -29,7 +29,7 @@ import {
   EmptyState,
   useToast,
 } from '../ui';
-import { sectionCount } from '../../lib/list-tally';
+import { countProp, listRead, projectListTally, tallyNumber, tallyTone } from '../../lib/list-tally';
 
 const CHANNEL_TYPES = [{ value: 'discord', label: 'Discord' }];
 const BUN_URL = 'http://127.0.0.1:19877';
@@ -354,8 +354,14 @@ export function ChannelsView() {
   const deleteOperation = pendingDelete ? operations[pendingDelete.id] : undefined;
   const deleting = deleteOperation?.action === 'remove' && deleteOperation.phase === 'writing';
 
-  const connectedCount = useMemo(() => channels.filter(isConnected).length, [channels]);
-  const verifiedCount = useMemo(() => channels.filter(channel => verifiedChannels.has(channel.id)).length, [channels, verifiedChannels]);
+  // One read, three numbers: the count inside the heading and the two pills
+  // beside it are tallies over the same `list_channels` rows, so they are absent
+  // together. `0 delivery verified` beside `Could not refresh channels.` is the
+  // claim this replaces — a failed read printing a measured "nothing has been
+  // proven to deliver" over a list it never returned.
+  const tally = projectListTally(channels, listRead(channels, { loading, failed: error !== null }));
+  const connectedCount = tallyNumber(channels, tally, isConnected);
+  const verifiedCount = tallyNumber(channels, tally, (channel) => verifiedChannels.has(channel.id));
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-hidden">
@@ -371,15 +377,15 @@ export function ChannelsView() {
       <SectionHeader
         title="Channels"
         subtitle="Add, connect, and manage delivery channels"
-        count={sectionCount(channels, { loading, failed: error !== null })}
+        count={countProp(tally)}
         action={
           <div className="flex items-center gap-2">
-            <Pill variant={connectedCount > 0 ? 'success' : 'default'}>
-              {connectedCount} connected
-            </Pill>
-            <Pill variant={verifiedCount > 0 ? 'success' : 'default'}>
-              {verifiedCount} delivery verified
-            </Pill>
+            {connectedCount === null ? null : (
+              <Pill variant={tallyTone(connectedCount)}>{connectedCount} connected</Pill>
+            )}
+            {verifiedCount === null ? null : (
+              <Pill variant={tallyTone(verifiedCount)}>{verifiedCount} delivery verified</Pill>
+            )}
             <button
               type="button"
               onClick={() => changeAdding(!adding)}

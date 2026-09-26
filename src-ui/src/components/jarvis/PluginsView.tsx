@@ -3,7 +3,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { confirmPluginEnablement, projectPluginTally, type PluginListRead } from './plugin-state';
-import { countProp } from '../../lib/list-tally';
+import { countProp, tallyTone } from '../../lib/list-tally';
 import {
   cn,
   GlassCard,
@@ -92,7 +92,7 @@ export default function PluginsView() {
         count={countProp(tally)}
         action={
           tally.enabled === null ? undefined : (
-            <Pill variant={tally.enabled > 0 ? 'success' : 'default'}>{tally.enabled} enabled</Pill>
+            <Pill variant={tallyTone(tally.enabled)}>{tally.enabled} enabled</Pill>
           )
         }
       />
