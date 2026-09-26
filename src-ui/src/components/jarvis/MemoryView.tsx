@@ -5,6 +5,7 @@
 import { useState, useEffect, useCallback, useId, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { cn, GlassCard, LoadingState, ErrorState, EmptyState, SectionHeader } from '../ui';
+import { sectionCount } from '../../lib/list-tally';
 import {
   decodeMemoryRecallResults,
   filterMemoriesByTier,
@@ -159,7 +160,7 @@ export default function MemoryView() {
       <SectionHeader
         title="Memory"
         subtitle="Browse, recall, and inspect the memory system"
-        count={memories.length}
+        count={sectionCount(memories, { loading, failed: error !== null })}
         action={
           <div className="flex flex-col items-end gap-1">
             {tierReadings.length > 0 && (

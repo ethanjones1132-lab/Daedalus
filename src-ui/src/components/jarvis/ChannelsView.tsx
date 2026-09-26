@@ -29,6 +29,7 @@ import {
   EmptyState,
   useToast,
 } from '../ui';
+import { sectionCount } from '../../lib/list-tally';
 
 const CHANNEL_TYPES = [{ value: 'discord', label: 'Discord' }];
 const BUN_URL = 'http://127.0.0.1:19877';
@@ -370,7 +371,7 @@ export function ChannelsView() {
       <SectionHeader
         title="Channels"
         subtitle="Add, connect, and manage delivery channels"
-        count={channels.length}
+        count={sectionCount(channels, { loading, failed: error !== null })}
         action={
           <div className="flex items-center gap-2">
             <Pill variant={connectedCount > 0 ? 'success' : 'default'}>

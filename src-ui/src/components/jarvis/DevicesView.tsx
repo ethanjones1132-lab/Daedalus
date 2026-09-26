@@ -6,6 +6,7 @@ import { projectDevicePresence } from './device-presence';
 import RecordIdBadge from './RecordIdBadge';
 import { createFailureSentence, decideCreateReadback, type CreateFailure } from './create-readback';
 import { reconcileRemovals, removalLocked, type RemovalOperation } from './removal-state';
+import { sectionCount } from '../../lib/list-tally';
 import {
   cn,
   ConfirmModal,
@@ -178,7 +179,11 @@ export default function DevicesView() {
         onConfirm={confirmDelete}
         onCancel={() => { if (!deleting) setPendingDelete(null); }}
       />
-      <SectionHeader title="Devices" subtitle="Paired devices and their status" count={devices.length} />
+      <SectionHeader
+        title="Devices"
+        subtitle="Paired devices and their status"
+        count={sectionCount(devices, { loading, failed: error !== null })}
+      />
 
       {createFailure && (
         <div role="alert" className="text-sm text-red-200">

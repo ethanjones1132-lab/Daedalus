@@ -16,6 +16,7 @@ import {
   EmptyState,
   useToast,
 } from '../ui';
+import { sectionCount } from '../../lib/list-tally';
 
 interface Commitment {
   id: string;
@@ -161,7 +162,7 @@ export default function CommitmentsView() {
       <SectionHeader
         title="Commitments"
         subtitle="Promises the agent has made and must keep"
-        count={commitments.length}
+        count={sectionCount(commitments, { loading, failed: error !== null })}
         action={
           <select
             value={filter}

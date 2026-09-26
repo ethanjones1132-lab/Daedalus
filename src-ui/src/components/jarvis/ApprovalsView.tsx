@@ -25,6 +25,7 @@ import {
   EmptyState,
   useToast,
 } from '../ui';
+import { sectionCount } from '../../lib/list-tally';
 
 type DecisionPhase = 'writing' | 'failed' | 'confirming' | 'unverified' | 'unconfirmed';
 type AlertPhase = 'failed' | 'unverified' | 'unconfirmed';
@@ -167,7 +168,7 @@ export default function ApprovalsView() {
       <SectionHeader
         title="Approvals"
         subtitle="Actions waiting on your decision"
-        count={approvals.length}
+        count={sectionCount(approvals, { loading, failed: error !== null })}
         action={
           <button
             type="button"

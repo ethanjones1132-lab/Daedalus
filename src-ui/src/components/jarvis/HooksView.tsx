@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import RecordIdBadge from './RecordIdBadge';
 import { createFailureSentence, decideCreateReadback, type CreateFailure } from './create-readback';
 import { reconcileRemovals, removalLocked, type RemovalOperation } from './removal-state';
+import { sectionCount } from '../../lib/list-tally';
 import {
   cn,
   ConfirmModal,
@@ -189,7 +190,11 @@ export default function HooksView() {
         onConfirm={confirmDelete}
         onCancel={() => { if (!deleting) setPendingDelete(null); }}
       />
-      <SectionHeader title="Hooks" subtitle="Event-driven automation hooks" count={hooks.length} />
+      <SectionHeader
+        title="Hooks"
+        subtitle="Event-driven automation hooks"
+        count={sectionCount(hooks, { loading, failed: error !== null })}
+      />
 
       <GlassCard className="p-3 space-y-2">
         {createFailure && (

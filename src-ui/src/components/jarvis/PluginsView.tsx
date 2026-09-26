@@ -3,6 +3,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { confirmPluginEnablement, projectPluginTally, type PluginListRead } from './plugin-state';
+import { countProp } from '../../lib/list-tally';
 import {
   cn,
   GlassCard,
@@ -88,7 +89,7 @@ export default function PluginsView() {
       <SectionHeader
         title="Plugins"
         subtitle="Installed extensions"
-        count={tally.count ?? undefined}
+        count={countProp(tally)}
         action={
           tally.enabled === null ? undefined : (
             <Pill variant={tally.enabled > 0 ? 'success' : 'default'}>{tally.enabled} enabled</Pill>

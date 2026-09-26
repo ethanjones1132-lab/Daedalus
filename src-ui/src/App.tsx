@@ -60,6 +60,7 @@ import HermesChat from './components/jarvis/HermesChat';
 import BuildBadge from './components/jarvis/BuildBadge';
 import CommandPalette from './components/jarvis/CommandPalette';
 import { MainSurface } from './components/layout/MainSurface';
+import { sectionCount } from './lib/list-tally';
 
 const NAV_SECTIONS: NavSection[] = [
   { title: 'JARVIS', items: [{ id: 'jarvis', label: 'Jarvis', icon: 'J' }] },
@@ -366,6 +367,11 @@ function OverviewView() {
   // number in one place and a sentence in the other for one record. A zeroed
   // `memory_health` is Native's "the probe did not report" sentinel, not a 0%.
   const memoryReading = decodeMemoryReading(health.memory);
+  // The header titles these five rows, so it counts these five rows. The count is
+  // the list on screen, not a claim about how many Sessions the store holds.
+  // `error` here is the snapshot reducer's boolean, not one of the views' string
+  // sentences — comparing it against `null` would make every read look failed.
+  const recent = sessions.slice(0, 5);
   const enabledAgents = agents.filter((agent) => agent.enabled);
   const activeSessions = sessions.filter((session) => {
     const updatedAt = Date.parse(session.updated_at);
@@ -427,9 +433,12 @@ function OverviewView() {
         <MetricCard value={sessions.reduce((sum, session) => sum + session.message_count, 0)} label="Messages" color="text-bone-muted" />
         <MetricCard value={activeSessions.length} label="Active (1h)" color="text-bone" />
       </AnimatedGrid>
-      <SectionHeader title="Recent Sessions" count={Math.min(sessions.length, 5)} />
+      <SectionHeader
+        title="Recent Sessions"
+        count={sectionCount(recent, { loading, failed: error })}
+      />
       <AnimatedList>
-        {sessions.slice(0, 5).map((session) => (
+        {recent.map((session) => (
           <TiltCard key={session.id} intensity="subtle" accent="royal" className="!p-3.5">
             <div className="flex items-center gap-3">
               <StatusDot ok={!session.archived} warn={session.archived} size="sm" />
@@ -518,7 +527,11 @@ export function ChatFeedsView() {
 
   return (
     <PageTransition>
-      <SectionHeader title="Chat Feeds" count={filtered.length} subtitle="session streams" />
+      <SectionHeader
+        title="Chat Feeds"
+        count={sectionCount(filtered, { loading, failed: listFailed })}
+        subtitle="session streams"
+      />
       <div className="mb-3 flex flex-col gap-2">{listFeedback}</div>
       <div className="flex gap-4 h-[calc(100vh-10rem)]">
         <div className="w-80 shrink-0 flex flex-col">

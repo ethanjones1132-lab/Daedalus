@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import RecordIdBadge from './RecordIdBadge';
 import { createFailureSentence, decideCreateReadback, type CreateFailure } from './create-readback';
 import { reconcileRemovals, removalLocked, type RemovalOperation } from './removal-state';
+import { sectionCount } from '../../lib/list-tally';
 import {
   cn,
   ConfirmModal,
@@ -181,7 +182,11 @@ export default function NodesView() {
         onConfirm={confirmDelete}
         onCancel={() => { if (!deleting) setPendingDelete(null); }}
       />
-      <SectionHeader title="Nodes" subtitle="Distributed compute nodes" count={nodes.length} />
+      <SectionHeader
+        title="Nodes"
+        subtitle="Distributed compute nodes"
+        count={sectionCount(nodes, { loading, failed: error !== null })}
+      />
 
       {createFailure && (
         <div role="alert" className="text-sm text-red-200">

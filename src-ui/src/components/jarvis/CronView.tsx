@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { aggregateInsights, selectInsightJobs } from './cron-insights';
+import { sectionCount } from '../../lib/list-tally';
 import {
   reconcileCronOperations,
   startCronOperation,
@@ -1420,7 +1421,7 @@ export default function CronView() {
     <PageTransition>
       <SectionHeader
         title="Cron Jobs"
-        count={jobs.length}
+        count={sectionCount(jobs, { loading, failed: error !== null })}
         subtitle={jobs.length > 0 ? `${enabledCount} enabled · ${learningCount} learning · ${reviewCount} review` : undefined}
         action={
           <div className="flex items-center gap-2">

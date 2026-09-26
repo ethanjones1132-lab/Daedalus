@@ -41,6 +41,7 @@ import {
   EmptyState,
   useToast,
 } from '../ui';
+import { sectionCount } from '../../lib/list-tally';
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -794,7 +795,7 @@ export function AgentsView() {
       <SectionHeader
         title="Agents"
         subtitle="Create, configure, and bind agents to channels"
-        count={agents.length}
+        count={sectionCount(agents, { loading, failed: listError !== null })}
         action={
           <button
             type="button"

@@ -22,6 +22,7 @@ import {
   EmptyState,
   useToast,
 } from '../ui';
+import { sectionCount } from '../../lib/list-tally';
 import MarkdownRenderer from './MarkdownRenderer';
 import { initialRegistryState, reduceRegistryState, type RegistrySnapshotState } from './action-registry-state';
 import { applySkillListRead, confirmSkillToggle, type SkillToggleProtection } from './skill-toggle-state';
@@ -911,7 +912,7 @@ export function SkillsView() {
       <SectionHeader
         title="Skills"
         subtitle="Browse, toggle, inspect, and restore skill revisions"
-        count={skills.length}
+        count={sectionCount(skills, { loading, failed: error !== null })}
         action={
           <Pill variant={enabledCount > 0 ? 'success' : 'default'}>
             {enabledCount} enabled

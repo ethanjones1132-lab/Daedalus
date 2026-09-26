@@ -73,6 +73,17 @@ import {
   type StreamTerminalFrame,
   type StreamTerminalOutcome,
 } from './stream-lifecycle';
+import {
+  STOP_RETRY_LABEL,
+  decodeStopConfirmation,
+  initialStopRequestState,
+  isCurrentStopRequest,
+  projectStopRequest,
+  reduceStopRequest,
+  type StopRequestEvent,
+  type StopRequestState,
+  type StopOutcome,
+} from './turn-cancellation';
 import { formatSessionStatsLine, shouldShowSessionStats } from './session-stats';
 import { filterSessions, formatFilterResultCount } from './session-filter';
 import {
@@ -752,7 +763,33 @@ export function ChatPanel({
   // superseded the in-flight turn. This ref-backed synchronous guard
   // closes the race on the client side; see SendInFlightGuard.
   const sendInFlightRef = useRef(new SendInFlightGuard());
-  const stopRequestedRef = useRef(false);
+  // ── Stop: one lifecycle owner ──────────────────────────────────────
+  // `stopConfirmedRef` is the only claim the app makes that a turn was
+  // stopped, and it is set from exactly one place: the settlement of a
+  // `cancel_chat_stream` the server answered `true`. Everything else that
+  // tears a reader down (session switch, new chat, passive teardown) is not a
+  // stop and must not be recorded as one, which is why this used to be called
+  // `stopRequestedRef` and was set before the server had been asked.
+  const stopConfirmedRef = useRef(false);
+  const [stopRequest, setStopRequest] = useState<StopRequestState>(initialStopRequestState);
+  const stopRequestRef = useRef<StopRequestState>(initialStopRequestState);
+  const stopAttemptRef = useRef(0);
+  const stopInFlightRef = useRef(false);
+  const stopView = projectStopRequest(stopRequest);
+  const dispatchStopRequest = useCallback((event: StopRequestEvent) => {
+    const next = reduceStopRequest(stopRequestRef.current, event);
+    if (next === stopRequestRef.current) return;
+    stopRequestRef.current = next;
+    if (mountedRef.current) setStopRequest(next);
+  }, []);
+  // A new turn, a new Session, or a new chat re-arms the control: the claim
+  // the previous attempt made is about a turn that is no longer on screen, and
+  // leaving it up would attribute one turn's stop to the next one.
+  const resetStopRequest = useCallback(() => {
+    stopInFlightRef.current = false;
+    stopConfirmedRef.current = false;
+    dispatchStopRequest({ type: 'clear' });
+  }, [dispatchStopRequest]);
   // Whether any response text frame has landed this Session turn. Ref-backed
   // so the pure `buildTurnProgress` view-model can distinguish "receiving
   // response text" from unverified stage work without a dedicated state
@@ -953,6 +990,10 @@ export function ChatPanel({
     clearPendingApproval();
     setUserPinnedToBottom(true);
     turnHadResponseTextRef.current = false;
+    // The turn is over by any route, so a stop claim about it is over too —
+    // otherwise a stop request that is still in flight would leave
+    // `Stopping Session turn…` on screen under a finished answer.
+    resetStopRequest();
     const effectiveSid = sid || activeSessionRef.current || sessionIdRef.current;
     setMessages(prev => {
       const withTokens = applyTokenChunk(prev, pending);
@@ -978,7 +1019,32 @@ export function ChatPanel({
       return withTokens;
     });
     onSessionCreatedRef.current();
-  }, [applyTokenChunk, clearPendingApproval, takePendingTokens]);
+  }, [applyTokenChunk, clearPendingApproval, resetStopRequest, takePendingTokens]);
+
+  /**
+   * The one place a turn becomes an intentionally-stopped turn. Two routes
+   * reach it — the server's `cancelled` frame, and the local reader teardown
+   * that follows a stop the server confirmed — and they used to be two copies
+   * of the same bubble finalization, one of which produced a plain finalized
+   * answer that looked like a complete one. Partial text is kept and marked
+   * stopped; a turn that streamed nothing leaves no empty bubble behind.
+   */
+  const finalizeStoppedTurn = useCallback(() => {
+    const pending = takePendingTokens();
+    setIsStreaming(false);
+    setError(null);
+    resetStopRequest();
+    setMessages(prev => {
+      const withTokens = applyTokenChunk(prev, pending);
+      const last = withTokens[withTokens.length - 1];
+      if (last?.role === 'assistant' && last.isStreaming) {
+        const content = sanitizeAssistantDisplay(last.content);
+        if (!content) return withTokens.slice(0, -1);
+        return [...withTokens.slice(0, -1), { ...last, content, isStreaming: false, isCancelled: true }];
+      }
+      return finalizeStreamingMessages(withTokens);
+    });
+  }, [applyTokenChunk, resetStopRequest, takePendingTokens]);
 
   // Reduced-motion respect — we use it to disable token fade-in / shimmer.
   const prefersReducedMotion = useRef(false);
@@ -1048,7 +1114,7 @@ export function ChatPanel({
       streamAbortRef.current?.abort('Session switched');
       streamAbortRef.current = null;
       sendGateRef.current.invalidate();
-      stopRequestedRef.current = false;
+      resetStopRequest();
       discardPendingTokens();
       setMessages([]);
       setIsStreaming(false);
@@ -1134,7 +1200,7 @@ export function ChatPanel({
         }
       });
     return () => { cancelled = true; };
-  }, [activeSession, clearPendingApproval, historyRetry, scrollToBottom, discardPendingTokens]);
+  }, [activeSession, clearPendingApproval, historyRetry, scrollToBottom, discardPendingTokens, resetStopRequest]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -1760,20 +1826,10 @@ export function ChatPanel({
         // server build omits the field.
         runAcc.cancelledReason = typeof frame.reason === 'string' ? frame.reason : 'user_stop';
         clearPendingApproval();
-        const pending = takePendingTokens();
-        setIsStreaming(false);
-        stopRequestedRef.current = false;
-        setError(null);
-        setMessages(prev => {
-          const withTokens = applyTokenChunk(prev, pending);
-          const last = withTokens[withTokens.length - 1];
-          if (last?.role === 'assistant' && last.isStreaming) {
-            const content = sanitizeAssistantDisplay(last.content);
-            if (!content) return withTokens.slice(0, -1);
-            return [...withTokens.slice(0, -1), { ...last, content, isStreaming: false, isCancelled: true }];
-          }
-          return finalizeStreamingMessages(withTokens);
-        });
+        // The server has now answered for itself, so any confirmation still in
+        // flight belongs to a question the frame already settled.
+        stopConfirmedRef.current = false;
+        finalizeStoppedTurn();
         return;
       }
       // P0-I (2026-07-02): unknown / unhandled frame types used to be
@@ -1823,7 +1879,7 @@ export function ChatPanel({
         terminalOutcome: runAcc.outcome ?? null,
         inactivityTimedOut,
         aborted: controller.signal.aborted,
-        stopRequested: stopRequestedRef.current,
+        stopRequested: stopConfirmedRef.current,
       });
       if (termination === 'unterminated') {
         runAcc.outcome = 'failed';
@@ -1841,14 +1897,21 @@ export function ChatPanel({
       inactivityWatchdog.stop();
       // Task 4.1: durably record the terminal outcome on every exit path.
       // Stream ends without a terminal frame: an inactivity timeout is
-      // timed_out; a client-side abort (user Stop that raced ahead of the
-      // server's `cancelled` frame, or component teardown) is cancelled.
+      // timed_out; a stop the server confirmed is a user stop; any other
+      // client-side abort (component teardown, session switch) is a local
+      // cancellation nobody asked the server about. The two were one value,
+      // which recorded a confirmed operator stop as `client_abort`.
       if (requestIsCurrent() && !runAcc.outcome) {
         if (inactivityTimedOut) {
           runAcc.outcome = 'timed_out';
-        } else if (controller.signal.aborted || stopRequestedRef.current) {
+        } else if (controller.signal.aborted || stopConfirmedRef.current) {
           runAcc.outcome = 'cancelled';
-          runAcc.cancelledReason = 'client_abort';
+          // `cancel_chat_stream` cancels through the registry's
+          // `USER_STOP_ABORT_REASON` (`server-jarvis/src/stream-control.ts:76`),
+          // so a confirmed stop and the frame the server would have sent carry
+          // the same reason. Writing the server's own word here is what lets
+          // the durable record distinguish an operator stop from a teardown.
+          runAcc.cancelledReason = stopConfirmedRef.current ? 'user_stop' : 'client_abort';
         }
         if (!activityTerminalDispatched) {
           dispatchActivity({ kind: 'terminal', outcome: runAcc.outcome ?? 'failed' });
@@ -1863,7 +1926,7 @@ export function ChatPanel({
 
     if (requestIsCurrent()) finalizeAssistantMessage(sid, terminal ?? undefined);
     if (streamAbortRef.current === controller) streamAbortRef.current = null;
-  }, [appendAssistantText, applyTokenChunk, clearPendingApproval, dispatchActivity, finalizeAssistantMessage, matchesStreamSession, presentApprovalRequest, takePendingTokens]);
+  }, [appendAssistantText, applyTokenChunk, clearPendingApproval, dispatchActivity, finalizeAssistantMessage, finalizeStoppedTurn, matchesStreamSession, presentApprovalRequest, takePendingTokens]);
 
   const handleSend = useCallback(async () => {
     // 2026-07-13 live incident (session 7254c3ae): the `isStreaming` React
@@ -1888,7 +1951,9 @@ export function ChatPanel({
       sendInFlightRef.current.finish();
       return;
     }
-    stopRequestedRef.current = false;
+    // A new turn owns the Stop control again, so the previous turn's stop
+    // claim — confirmed or not — has nothing to say about this one.
+    resetStopRequest();
     const userMsg = submittedDraft.text.trim();
     const history = messages
       .filter((msg) => !msg.isStreaming && msg.content.trim())
@@ -1953,14 +2018,17 @@ export function ChatPanel({
       }
       streamAbortRef.current = null;
       clearPendingApproval();
-      const pending = takePendingTokens();
-      setIsStreaming(false);
-      if (stopRequestedRef.current) {
-        stopRequestedRef.current = false;
-        setError(null);
-        setMessages(prev => finalizeStreamingMessages(applyTokenChunk(prev, pending)));
+      if (stopConfirmedRef.current) {
+        // The server confirmed this cancel before the local reader tore down,
+        // so the turn is intentionally stopped — the same stopped bubble the
+        // `cancelled` frame produces. This used to finalize a plain answer
+        // instead, which read exactly like a turn that had run to completion.
+        stopConfirmedRef.current = false;
+        finalizeStoppedTurn();
         return;
       }
+      const pending = takePendingTokens();
+      setIsStreaming(false);
       // Task 7 Part C (incident 1d4727cf): finalize the streaming bubble into
       // a designed error bubble — friendly text, `errorCode` as small muted
       // detail — instead of leaving a plain assistant-looking message and
@@ -1995,38 +2063,52 @@ export function ChatPanel({
     }
   }, [isStreaming, messages, activeSession, sessionId, onSessionCreated, setActiveSession, clearRunRecord, streamFromJarvisApi, discardPendingTokens, takePendingTokens, applyTokenChunk, publishDraftStore, resetActivityLedger]);
 
-  // Phase 1.3 — real Stop. POST /chat/cancel on the Bun server; SseRelay now
-  // treats the resulting `cancelled` frame as terminal, so isStreaming flips.
+  // The Stop control's one lifecycle owner. It asks Native — the only reader
+  // of the cancellation, and the one that reports whether the server agreed —
+  // and it acts on the answer rather than on the request: a confirmed stop
+  // tears the local reader down and marks the turn stopped, and an unconfirmed
+  // one changes nothing at all, because the turn is still live and its answer
+  // may still be on the wire. The duplicate `fetch` to `/chat/cancel` that used
+  // to sit beside this asked the same question a second time and could not
+  // report either answer, so it is gone rather than kept as a fallback.
   const handleStop = useCallback(async () => {
     const sid = activeSession || sessionId;
     if (!sid) {
       setIsStreaming(false);
       return;
     }
-    stopRequestedRef.current = true;
-    clearPendingApproval();
+    // One request per attempt, whatever the entry point: a click, a second
+    // click, or Esc in the composer all land here.
+    if (stopInFlightRef.current) return;
+    stopInFlightRef.current = true;
+    const attempt = ++stopAttemptRef.current;
     const controller = streamAbortRef.current;
+    dispatchStopRequest({ type: 'begin', attempt, sessionId: sid });
+    let outcome: StopOutcome;
+    try {
+      outcome = decodeStopConfirmation(await invoke<boolean>('cancel_chat_stream', sessionInvokeArgs(sid)));
+    } catch {
+      // The reason is withheld: it can carry a store path, and the operator
+      // gets a sentence they can act on rather than one they can only read.
+      outcome = 'unavailable';
+    }
+    stopInFlightRef.current = false;
+    if (!mountedRef.current) return;
+    // A newer attempt, or a Session this view has already left, owns the
+    // control now. This answer is about a turn that is no longer on screen.
+    if (!isCurrentStopRequest(stopRequestRef.current, attempt, sid)) return;
+    dispatchStopRequest({ type: 'settle', attempt, sessionId: sid, outcome });
+    if (outcome !== 'confirmed') return;
+    // A confirmation that arrives after the turn already ended confirms
+    // nothing: the reader this stop named has been released, so there is no
+    // turn left to tear down and nothing to record as a user stop.
+    if (streamAbortRef.current !== controller) return;
+    stopConfirmedRef.current = true;
+    clearPendingApproval();
     setReasoningText('');
     setShowReasoning(false);
-    fetch(`${JARVIS_API_URL}/chat/cancel`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sid }),
-    }).catch(() => {});
-    try {
-      const cancelled = await invoke<boolean>('cancel_chat_stream', sessionInvokeArgs(sid));
-      if (cancelled) {
-        controller?.abort('Explicit Stop confirmed');
-      } else {
-        controller?.abort('Explicit Stop was not confirmed');
-        setIsStreaming(false);
-      }
-    } catch (e) {
-      console.error('Failed to cancel stream:', e);
-      controller?.abort('Explicit Stop request failed');
-      setIsStreaming(false);
-    }
-  }, [activeSession, clearPendingApproval, sessionId]);
+    controller?.abort('Explicit Stop confirmed by the server');
+  }, [activeSession, clearPendingApproval, dispatchStopRequest, sessionId]);
 
   // Phase 1.1 — approve / deny the pending tool call and forward the decision
   // to the Bun server. Surface any POST error so the user can retry.
@@ -2095,7 +2177,7 @@ export function ChatPanel({
     streamAbortRef.current?.abort('New Session');
     streamAbortRef.current = null;
     sendGateRef.current.invalidate();
-    stopRequestedRef.current = false;
+    resetStopRequest();
     discardPendingTokens();
     setIsStreaming(false);
     setMessages([]);
@@ -2461,6 +2543,29 @@ export function ChatPanel({
           </motion.div>
         )}
 
+        {/* A stop the server would not confirm. The turn is still live, so this
+            is a recovery offer beside the control that failed, not a verdict
+            on the turn — and it says what is still true: the answer may yet
+            arrive. */}
+        {stopView.alert && (
+          <div
+            role="alert"
+            aria-label="Session turn stop"
+            className="p-3 bg-warning/10 border border-warning/30 rounded-xl flex items-start justify-between gap-3"
+          >
+            <p className="text-warning text-xs font-mono break-words">{stopView.alert}</p>
+            <button
+              type="button"
+              onClick={handleStop}
+              disabled={stopView.stopDisabled}
+              aria-label={STOP_RETRY_LABEL}
+              className="shrink-0 px-2 py-1 rounded-lg text-[11px] font-mono border border-warning/40 text-warning hover:bg-warning/20 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {STOP_RETRY_LABEL}
+            </button>
+          </div>
+        )}
+
         {/* Follow-up suggestion chips once an assistant message is finalized. */}
         {lastAssistantFinished && (
           <div className="flex flex-wrap gap-1.5 pt-1">
@@ -2521,13 +2626,15 @@ export function ChatPanel({
           />
           <button
             onClick={isStreaming ? handleStop : handleSend}
-            disabled={!isStreaming && !input.trim()}
+            disabled={isStreaming ? stopView.stopDisabled : !input.trim()}
             aria-label={isStreaming ? 'Stop streaming' : 'Send message'}
             className={cn(
               'absolute right-2 bottom-2 w-8 h-8 rounded-lg flex items-center justify-center transition-all',
               'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50',
               isStreaming
-                ? 'bg-error/30 text-error hover:bg-error/50 cursor-pointer'
+                ? stopView.stopDisabled
+                  ? 'bg-error/20 text-error/60 cursor-not-allowed'
+                  : 'bg-error/30 text-error hover:bg-error/50 cursor-pointer'
                 : !input.trim()
                   ? 'bg-iron/20 text-bone-faint cursor-not-allowed'
                   : 'bg-royal/30 text-royal-light hover:bg-royal/50 cursor-pointer'
@@ -2560,7 +2667,9 @@ export function ChatPanel({
         </div>
         <div className="flex items-center justify-between mt-1.5 px-1">
           <span className="text-[10px] font-mono text-bone-faint">
-            {isStreaming ? `● Streaming · ${formatRunDuration(turnElapsedMs)}` : `${messages.filter(m => m.role === 'user').length} message${messages.filter(m => m.role === 'user').length !== 1 ? 's' : ''} sent`}
+            {stopView.status ? (
+              <span role="status" aria-label="Session turn stop">{stopView.status}</span>
+            ) : isStreaming ? `● Streaming · ${formatRunDuration(turnElapsedMs)}` : `${messages.filter(m => m.role === 'user').length} message${messages.filter(m => m.role === 'user').length !== 1 ? 's' : ''} sent`}
           </span>
           <span className="text-[10px] font-mono text-bone-faint flex items-center gap-2">
             {turnCost && (
