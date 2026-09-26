@@ -36,6 +36,15 @@ const status: JarvisStatus = {
   active_backend: 'ollama', model: 'navigation-test-model', openrouter_key_set: false,
 };
 
+const health = {
+  ollama: { running: true, model: 'navigation-test-model', url: 'http://localhost:11434' },
+  bun_server: { running: true, url: 'http://localhost:19877' },
+  bridge: { running: true, port: 19876 },
+  claude_proxy: { running: false, port: 19878 },
+  disk: { total: '1T', used: '1T', available: '0', use_percent: '1%' },
+  memory: { total_mb: 1, available_mb: 1, used_mb: 1, used_percent: 1 },
+  timestamp: '2026-09-16T00:00:00Z',
+};
 beforeEach(() => {
   localStorage.clear();
   vi.stubGlobal('scrollTo', vi.fn());
@@ -45,10 +54,18 @@ beforeEach(() => {
   vi.mocked(invoke).mockImplementation(async (command) => {
     if (command === 'jarvis_get_config') return config;
     if (command === 'jarvis_check_status') return status;
+    if (command === 'get_system_health') return health;
     if (['jarvis_list_sessions', 'get_all_session_runs', 'list_sessions', 'list_model_profiles',
-      'list_cron_jobs', 'list_pending_missed_jobs', 'get_action_registry_alerts'].includes(command)) return [];
+      'list_cron_jobs', 'list_pending_missed_jobs', 'get_action_registry_alerts',
+      'list_agents', 'jarvis_list_agents'].includes(command)) return [];
     return null;
   });
+  // jsdom implements no media-query engine, and the Jarvis hub reads one on mount.
+  window.matchMedia ??= ((query: string) => ({
+    matches: false, media: query, onchange: null,
+    addEventListener: () => {}, removeEventListener: () => {},
+    addListener: () => {}, removeListener: () => {}, dispatchEvent: () => false,
+  })) as typeof window.matchMedia;
 });
 afterEach(() => {
   cleanup();
@@ -135,5 +152,36 @@ describe('App Config and Health destinations', () => {
     expect(await screen.findByRole('heading', { name: 'Hermes Bridge', level: 1 })).toBeInTheDocument();
     expect(await screen.findByRole('alert', { name: 'Hermes Bridge availability' })).toHaveTextContent('Hermes Bridge is unavailable.');
     expect(screen.queryByText(/private executable path/)).not.toBeInTheDocument();
+  });
+});
+
+describe('restored legacy navigation state', () => {
+  it('lands a restored pre-split Jarvis id on the surface its case maps to', async () => {
+    // `jarvis-sessions` has a renderView case but no nav item; before the
+    // documented allowlist the initial read discarded it and every restored
+    // legacy id silently rendered Overview.
+    localStorage.setItem('jarvis-current-view', 'jarvis-sessions');
+    await act(async () => { render(<App />); });
+    expect(await screen.findByRole('heading', { name: /^Sessions/, level: 2 }))
+      .toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Overview', level: 2 })).not.toBeInTheDocument();
+    expect(localStorage.getItem('jarvis-current-view')).toBe('jarvis-sessions');
+  });
+
+  it('still lands a restored unshipped id on the overview fallback it documents', async () => {
+    localStorage.setItem('jarvis-current-view', 'doctor');
+    await act(async () => { render(<App />); });
+    expect(await screen.findByRole('heading', { name: 'Overview', level: 2 }))
+      .toBeInTheDocument();
+  });
+
+  it('does not let an unknown stored id resurrect a dead path', async () => {
+    // An id that is neither a nav item nor a documented legacy id is discarded
+    // for the default hub — it must not be rendered as if it were a surface.
+    localStorage.setItem('jarvis-current-view', 'not-a-view');
+    await act(async () => { render(<App />); });
+    expect(await screen.findByRole('heading', { name: 'Jarvis', level: 2 }))
+      .toBeInTheDocument();
+    expect(localStorage.getItem('jarvis-current-view')).toBe('jarvis');
   });
 });

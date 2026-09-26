@@ -15,8 +15,6 @@ import {
   SectionHeader,
   ProgressBar,
   SidebarNavItem,
-  LoadingState,
-  ErrorState,
   EmptyState,
   ErrorBoundary,
   cn,
@@ -61,6 +59,7 @@ const NAV_SECTIONS: NavSection[] = [
     items: [
       { id: 'overview', label: 'Overview', icon: 'O' },
       { id: 'sessions', label: 'Sessions', icon: 'S' },
+      { id: 'chat-feeds', label: 'Chat Feeds', icon: 'C' },
       { id: 'cron', label: 'Cron', icon: 'T' },
       { id: 'action-registry', label: 'Actions', icon: 'R' },
       { id: 'channels', label: 'Channels', icon: 'N' },
@@ -121,6 +120,22 @@ interface CompanionCronJob {
   prompt: string;
   enabled: boolean;
 }
+
+/**
+ * Ids a shipped `renderView` case answers that no nav item names: the
+ * pre-split Jarvis ids and the four ids that have always fallen back to the
+ * overview contract. They are unreachable from the sidebar and the palette by
+ * design, but a restored local-storage navigation state can still name one, so
+ * the initial view read consults this list instead of discarding it.
+ *
+ * `App.deadpath.test.ts` fails when a `case` is named by neither this list nor
+ * NAV_SECTIONS: an unreachable case is a dead path that compiles and tests green.
+ */
+const LEGACY_VIEW_IDS: readonly ViewId[] = [
+  'jarvis-hub', 'jarvis-companion', 'jarvis-config', 'jarvis-status',
+  'jarvis-sessions', 'jarvis-skills', 'jarvis-tools',
+  'instances', 'usage', 'logs', 'doctor',
+];
 
 /** Phase 2.5 — explicit placeholder for ViewId members not yet in the nav. */
 export function UnwiredView({ viewId }: { viewId: ViewId }) {
@@ -406,13 +421,16 @@ function OverviewView() {
 }
 
 export function ChatFeedsView() {
-  const { error: toastError } = useToast();
   const [sessions, setSessions] = useState<BackendSession[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [history, setHistory] = useState<SessionMessage[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [historyLoading, setHistoryLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // Native rejections are never rendered or logged here: a native error string
+  // can embed store or session detail, so both reads carry a fixed message and
+  // a deliberate retry instead.
+  const [listFailed, setListFailed] = useState(false);
+  const [historyFailed, setHistoryFailed] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   // The transcript read is started by a selection, not by the poll, so it owns
@@ -427,10 +445,10 @@ export function ChatFeedsView() {
       const sorted = [...result].sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
       if (!read.isCurrent()) return; // a newer poll has already read this list
       setSessions(sorted);
-      setError(null);
-    } catch (e) {
+      setListFailed(false);
+    } catch {
       if (!read.isCurrent()) return;
-      setError(String(e));
+      setListFailed(true);
     } finally {
       if (read.isCurrent()) setLoading(false);
     }
@@ -443,16 +461,17 @@ export function ChatFeedsView() {
     const request = historyRead.issue();
     setSelectedId(sessionId);
     setHistoryLoading(true);
+    setHistoryFailed(false);
     setHistory(null);
     try {
       const messages = await invoke<SessionMessage[]>('get_session_history', { sessionId });
       historyRead.publish(request.id, () => setHistory(messages));
-    } catch (e) {
-      historyRead.publish(request.id, () => toastError(`Failed to load history: ${e}`, 'Chat Error'));
+    } catch {
+      historyRead.publish(request.id, () => setHistoryFailed(true));
     } finally {
       historyRead.publish(request.id, () => setHistoryLoading(false));
     }
-  }, [historyRead, toastError]);
+  }, [historyRead]);
 
   const filtered = sessions.filter((session) => {
     if (!searchQuery) return true;
@@ -460,13 +479,24 @@ export function ChatFeedsView() {
     return [session.agent_id, session.id, session.title, session.model, session.backend].some((value) => value.toLowerCase().includes(query));
   });
   const selectedSession = sessions.find((session) => session.id === selectedId);
+  const transcriptPending = Boolean(selectedId) && historyLoading;
 
-  if (loading) return <LoadingState />;
-  if (error) return <ErrorState error={error} />;
+  const listFeedback = <>
+    {loading && <div role="status" aria-label="Session list" className="text-sm text-bone-dim">
+      {sessions.length === 0 ? 'Loading sessions…' : 'Refreshing sessions…'}
+    </div>}
+    {listFailed && <div role="alert" className="text-sm text-bone-dim">
+      <p>{sessions.length === 0
+        ? 'Could not load sessions.'
+        : 'Could not refresh sessions. Showing previously loaded sessions; they may be stale.'}</p>
+      <button type="button" onClick={() => void fetchSessions(createReadGuard().issue())} disabled={loading} className="btn-ghost text-xs mt-2 disabled:opacity-50">Retry</button>
+    </div>}
+  </>;
 
   return (
     <PageTransition>
       <SectionHeader title="Chat Feeds" count={filtered.length} subtitle="session streams" />
+      <div className="mb-3 flex flex-col gap-2">{listFeedback}</div>
       <div className="flex gap-4 h-[calc(100vh-10rem)]">
         <div className="w-80 shrink-0 flex flex-col">
           <div className="mb-3">
@@ -474,19 +504,24 @@ export function ChatFeedsView() {
           </div>
           <div className="flex-1 overflow-y-auto space-y-1">
             {filtered.map((session) => (
-              <motion.button key={session.id} onClick={() => loadHistory(session.id)} className={cn('w-full text-left px-3 py-2 rounded-lg border transition-all duration-150', selectedId === session.id ? 'bg-royal/15 border-royal/30' : 'bg-obsidian/30 border-iron/20 hover:border-iron/40 hover:bg-obsidian/50')} whileHover={{ x: 2 }} layout>
+              <motion.button key={session.id} onClick={() => void loadHistory(session.id)} className={cn('w-full text-left px-3 py-2 rounded-lg border transition-all duration-150', selectedId === session.id ? 'bg-royal/15 border-royal/30' : 'bg-obsidian/30 border-iron/20 hover:border-iron/40 hover:bg-obsidian/50')} whileHover={{ x: 2 }} layout>
                 <div className="flex items-center gap-2 mb-0.5"><StatusDot ok={!session.archived} warn={session.archived} size="sm" /><span className="text-xs font-semibold text-bone truncate">{session.title || session.agent_id}</span><span className="text-[10px] font-mono text-bone-faint ml-auto shrink-0">{formatIsoAge(session.updated_at)}</span></div>
                 <div className="text-[11px] font-mono text-bone-faint truncate pl-4">{session.message_count} messages - {session.backend}</div>
                 <div className="text-[10px] font-mono text-bone-dim mt-0.5 pl-4">{session.model}</div>
               </motion.button>
             ))}
-            {filtered.length === 0 && <EmptyState message="No sessions match filter" />}
+            {!loading && !listFailed && filtered.length === 0 && (
+              <EmptyState message={searchQuery
+                ? `No sessions match "${searchQuery}".`
+                : 'No sessions yet.'} />
+            )}
           </div>
         </div>
         <div className="flex-1 min-w-0">
           {!selectedId ? (
             <GlassCard className="h-full flex items-center justify-center"><div className="text-center"><motion.div className="text-4xl mb-4 opacity-20" animate={{ opacity: [0.15, 0.25, 0.15] }} transition={{ duration: 3, repeat: Infinity }}>O</motion.div><p className="text-bone-dim text-sm font-mono">Select a session to view its chat feed</p></div></GlassCard>
-          ) : historyLoading ? <LoadingState />
+          ) : transcriptPending ? <div role="status" aria-label="Session transcript" className="flex h-full items-center justify-center text-sm text-bone-dim font-mono">Loading transcript…</div>
+          : historyFailed ? <div role="alert" className="flex h-full items-center justify-center"><div className="text-center"><p className="text-bone-dim text-sm font-mono">Could not load this session&apos;s transcript.</p><button type="button" onClick={() => void loadHistory(selectedId)} className="btn-ghost text-xs mt-2">Retry transcript</button></div></div>
           : history ? (
             <GlassCard className="h-full flex flex-col">
               <div className="pb-3 border-b border-iron/30 mb-3 shrink-0"><div className="flex items-center gap-2 mb-1"><StatusDot ok={!selectedSession?.archived} warn={selectedSession?.archived} /><span className="text-sm font-semibold text-bone">{selectedSession?.title || selectedSession?.agent_id || 'Session'}</span><Pill variant="info">{history.length} msgs</Pill></div><div className="text-[11px] font-mono text-bone-faint truncate">{selectedId}</div></div>
@@ -505,7 +540,7 @@ export function ChatFeedsView() {
                 <div ref={messagesEndRef} />
               </div>
             </GlassCard>
-          ) : <EmptyState message="Failed to load chat history" />}
+          ) : <EmptyState message="No transcript loaded yet." />}
         </div>
       </div>
     </PageTransition>
@@ -602,8 +637,11 @@ function AppInner() {
   const [currentView, setCurrentView] = useState<ViewId>(() => {
     try {
       const saved = localStorage.getItem('jarvis-current-view') as ViewId | null;
-      const known = NAV_SECTIONS.flatMap((s) => s.items).some((i) => i.id === saved);
-      return saved && known ? saved : 'jarvis';
+      const inNav = NAV_SECTIONS.flatMap((s) => s.items).some((i) => i.id === saved);
+      // A restored navigation state may name a legacy id that still has a
+      // renderView case; honour it rather than silently landing on Overview.
+      const isLegacy = saved !== null && LEGACY_VIEW_IDS.includes(saved);
+      return saved && (inNav || isLegacy) ? saved : 'jarvis';
     } catch { return 'jarvis'; }
   });
   const [companion, setCompanion] = useState<CompanionState | null>(null);
