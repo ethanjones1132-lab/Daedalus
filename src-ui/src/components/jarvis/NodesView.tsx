@@ -76,7 +76,9 @@ export default function NodesView() {
         }
       }
       publishOperations(next);
-      if (!opts?.removalRead || !removalFailure) setError(String(e));
+      // The reason stays here: a native error string can embed store or node
+      // detail, so the surface names the failure and withholds the text.
+      if (!opts?.removalRead || !removalFailure) setError('Could not load nodes.');
       return null;
     } finally {
       if (request === requestId.current) {

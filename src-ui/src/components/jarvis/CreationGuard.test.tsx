@@ -38,6 +38,7 @@ describe.each([
     field: 'Hook name',
     button: 'Register',
     success: 'Registered hook example',
+    listFailure: 'Could not load hooks.',
     retry: 'Retry registering the hook',
     stored: { id: 'created-1', name: 'example', event: 'session.start', script: '', enabled: true, created_at: '' },
   },
@@ -48,6 +49,7 @@ describe.each([
     field: 'Node name',
     button: 'Add',
     success: 'Added node example',
+    listFailure: 'Could not load nodes.',
     retry: 'Retry adding the node',
     stored: { id: 'created-1', name: 'example', address: 'localhost:7000', status: 'unknown', latency_ms: null, last_ping: '', capabilities: [] },
   },
@@ -58,10 +60,11 @@ describe.each([
     field: 'Device name',
     button: 'Add',
     success: 'Added device example',
+    listFailure: 'Could not load devices.',
     retry: 'Retry adding the device',
     stored: { id: 'created-1', name: 'example', device_type: 'desktop', status: 'online', last_seen: '' },
   },
-])('$create read-back boundary', ({ View, list, create, field, button, success, retry, stored }) => {
+])('$create read-back boundary', ({ View, list, create, field, button, success, retry, stored, listFailure }) => {
   it('does not report a create it could not read back, and the list retry reloads the list only', async () => {
     const creation = deferred<unknown>();
     const confirming = deferred<unknown>();
@@ -93,7 +96,12 @@ describe.each([
     // A failed confirming read is a list failure and an unconfirmed create, not a success.
     await act(async () => { confirming.reject(new Error('List refresh unavailable')); });
     expect(screen.queryByText(success)).not.toBeInTheDocument();
-    expect(screen.getByText('Error: List refresh unavailable')).toBeInTheDocument();
+    // The list failure names itself. This assertion used to require the native
+    // string ('Error: List refresh unavailable') to be rendered, which pinned the
+    // leak this surface no longer has; the two below are stronger in that
+    // direction, because they fail if any part of the rejection reaches the DOM.
+    expect(document.body.textContent ?? '').not.toContain('List refresh unavailable');
+    expect(screen.getByText(listFailure)).toBeInTheDocument();
     const unconfirmed = screen.getAllByRole('alert').filter(node => /draft was kept/.test(node.textContent ?? ''));
     expect(unconfirmed).toHaveLength(1);
     expect(name).toHaveValue('example');

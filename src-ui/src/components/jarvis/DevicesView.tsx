@@ -81,7 +81,9 @@ export default function DevicesView() {
         }
       }
       publishOperations(next);
-      if (!opts?.removalRead || !removalFailure) setError(String(e));
+      // The reason stays here: a native error string can embed store or pairing
+      // detail, so the surface names the failure and withholds the text.
+      if (!opts?.removalRead || !removalFailure) setError('Could not load devices.');
       return null;
     } finally {
       if (request === requestId.current) {

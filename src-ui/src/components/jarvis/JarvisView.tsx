@@ -171,6 +171,10 @@ const readSessionRunsFor = async (sessionId: string): Promise<SessionRunRead> =>
 
 const JARVIS_API_URL = 'http://127.0.0.1:19877';
 const STREAM_INACTIVITY_TIMEOUT_MS = 90_000;
+// One sentence for every failed `append_message`, and the reason is withheld: a
+// native error string can embed store or session detail, and the operator reads
+// this in the banner. The value is still logged, where a developer can find it.
+const APPEND_FAILED_COPY = 'Append failed: Daedalus could not save this message to the Session.';
 
 // Task 7 Part C (2026-07-03 incident 1d4727cf): the server's structured
 // `error` frame carries a `code` (e.g. "first_token_timeout") that
@@ -952,7 +956,7 @@ export function ChatPanel({
             ...sessionInvokeArgs(effectiveSid),
             role: 'assistant',
             content: finalized.content,
-          }).catch((e: any) => { console.error('Failed to persist assistant message:', e); setError('Append failed: ' + (e?.message || String(e))); });
+          }).catch((e: any) => { console.error('Failed to persist assistant message:', e); setError(APPEND_FAILED_COPY); });
         }
         return finalizedMessages;
       }
@@ -1381,7 +1385,7 @@ export function ChatPanel({
     }).catch((e: any) => {
       if (!requestIsCurrent()) return;
       console.error('Failed to persist user message:', e);
-      setError('Append failed: ' + (e?.message || String(e)));
+      setError(APPEND_FAILED_COPY);
     });
 
     const response = await fetch(`${JARVIS_API_URL}/chat/stream`, {

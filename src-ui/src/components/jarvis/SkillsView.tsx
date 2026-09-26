@@ -40,6 +40,11 @@ import {
   type CandidatePerformanceResponse,
   type CandidatePerformanceState,
 } from './skill-candidate-performance';
+import {
+  decodeSkillScore,
+  projectCandidateScores,
+  projectImprovementScore,
+} from '../../lib/skill-score-reading';
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -246,6 +251,12 @@ function SkillDetail({
   const { success, error: toastError } = useToast();
   const distilled = isDistilledSkill(skill);
   const candidateActionLocked = skillCandidateMutationLocked(candidateMutation);
+  // One projection for both scores, so this card and the list row below cannot
+  // disagree about whether a score is readable. An operand nobody could read
+  // prints no number and cannot reach the promotion threshold below.
+  const candidateScores = useMemo(() => projectCandidateScores(candidateDetail), [candidateDetail]);
+  const candidateCanPromote =
+    candidateScores?.evalScore?.kind === 'measured' && candidateScores.evalScore.value >= 0.75;
 
   const performanceCandidateId = candidateDetail?.status === 'promoted' ? candidateDetail.id : null;
   const [performanceState, setPerformanceState] = useState<CandidatePerformanceState>(initialCandidatePerformanceState);
@@ -344,16 +355,12 @@ function SkillDetail({
               <>
                 <button
                   type="button"
-                  disabled={
-                    candidateActionLocked || !candidateCurrent ||
-                    candidateDetail.eval_score === undefined ||
-                    candidateDetail.eval_score < 0.75
-                  }
+                  disabled={candidateActionLocked || !candidateCurrent || !candidateCanPromote}
                   onClick={() => onCandidateAction('promote')}
                   title={
-                    candidateDetail.eval_score === undefined || candidateDetail.eval_score < 0.75
-                      ? 'Run eval first — promotion requires a passing judge decision (≥0.75)'
-                      : 'Promote to live skill'
+                    candidateCanPromote
+                      ? 'Promote to live skill'
+                      : 'Run eval first — promotion requires a passing judge decision (≥0.75)'
                   }
                   className="px-3 py-1.5 text-xs rounded-lg border border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10 transition-colors disabled:opacity-50"
                 >
@@ -453,17 +460,21 @@ function SkillDetail({
         </div>
       )}
 
-      {candidateDetail && (
+      {candidateDetail && candidateScores && (
         <GlassCard className="p-3 mb-3 text-xs space-y-1.5">
           {!candidateCurrent && <p className="text-amber-200">Previous lifecycle observation; it may be stale. Actions are unavailable.</p>}
           <div className="flex items-center gap-2 flex-wrap">
             <span className="text-bone/50">Confidence</span>
-            <Pill variant="default">{candidateDetail.confidence.toFixed(2)}</Pill>
-            {candidateDetail.eval_score !== undefined && (
+            {candidateScores.confidence.kind === 'measured' ? (
+              <Pill variant="default">{candidateScores.confidence.label}</Pill>
+            ) : (
+              <span className="text-bone/50">{candidateScores.confidence.label}</span>
+            )}
+            {candidateScores.evalScore?.kind === 'measured' && (
               <>
                 <span className="text-bone/50">Eval score</span>
-                <Pill variant={candidateDetail.eval_score >= 0.75 ? 'success' : 'warn'}>
-                  {candidateDetail.eval_score.toFixed(2)}
+                <Pill variant={candidateScores.evalScore.value >= 0.75 ? 'success' : 'warn'}>
+                  {candidateScores.evalScore.label}
                 </Pill>
               </>
             )}
@@ -483,6 +494,11 @@ function SkillDetail({
           {candidateDetail.rejection_detail && (
             <p className="text-bone/50">{candidateDetail.rejection_detail}</p>
           )}
+          {/* One fixed sentence per field this build could not read, so an
+              unreadable score costs its own field and nothing else. */}
+          {candidateScores.bases.map((basis) => (
+            <p key={basis} role="status" className="text-bone/50">{basis}</p>
+          ))}
           {candidateDetail.eval_missed && candidateDetail.eval_missed.length > 0 && (
             <p className="text-bone/50">Missed: {candidateDetail.eval_missed.join('; ')}</p>
           )}
@@ -729,8 +745,11 @@ export function SkillsView() {
       protections.current = reconciled.protections;
       setSkills(reconciled.skills);
 
-    } catch (e) {
-      if (readId === listReadId.current) setError(String(e));
+    } catch {
+      // A native error string can embed store or lifecycle detail, so the list
+      // failure names itself. This file's other reads already do (`Could not
+      // load ${label}.`), and the reason is deliberately withheld.
+      if (readId === listReadId.current) setError('Could not load skills.');
     } finally {
       if (readId === listReadId.current) setLoading(false);
     }
@@ -958,10 +977,11 @@ export function SkillsView() {
                 const candidateId = candidateIdOf(s);
                 const candidate = candidateId ? candidates?.[candidateId] : null;
                  const candidateStatus = candidate?.status;
-                 const candidateEvalScore = candidate?.eval_score;
+                 const candidateEvalScore = candidate ? decodeSkillScore(candidate.eval_score, 'eval_score') : null;
                  const candidateMutation = candidateId ? candidateMutations[candidateId] ?? null : null;
                  const candidateActionLocked = skillCandidateMutationLocked(candidateMutation);
-                 const canPromote = candidateCurrent && !candidateActionLocked && candidateEvalScore !== undefined && candidateEvalScore >= 0.75;
+                 const canPromote = candidateCurrent && !candidateActionLocked && candidateEvalScore?.kind === 'measured' && candidateEvalScore.value >= 0.75;
+                 const improvement = projectImprovementScore(s.improvement_score);
                 return (
                   <li key={s.id}>
                     <GlassCard
@@ -1075,10 +1095,13 @@ export function SkillsView() {
                           <button type="button" disabled={togglePending[s.id] === true} onClick={(e) => { e.stopPropagation(); toggle(s); }} className="underline disabled:opacity-40">Retry</button>
                         </div>
                       )}
+                      {improvement.basis && (
+                        <p role="status" className="mt-1 text-[11px] text-bone/40">{improvement.basis}</p>
+                      )}
                       <div className="flex items-center gap-2 mt-1.5 text-[10px] font-mono text-bone/30">
                         <span>v{s.version}</span>
-                        {s.improvement_score > 0 && (
-                          <span>score {s.improvement_score.toFixed(2)}</span>
+                        {improvement.text && (
+                          <span>score {improvement.text}</span>
                         )}
                         <span className="ml-auto">{formatDate(s.updated_at)}</span>
                       </div>

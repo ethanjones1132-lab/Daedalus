@@ -46,8 +46,10 @@ export default function McpPanel() {
         Object.entries(s).map(([name, server]) => [name, encodeMcpArguments(server.args)]),
       ));
       setArgumentErrors({});
-    } catch (e) {
-      setError(String(e));
+    } catch {
+      // Native errors may embed configuration values, so the read failure names
+      // itself and withholds the text, exactly as the save failure below does.
+      setError('Could not load .mcp.json. Your draft is kept; it is not shown until a read succeeds.');
     } finally {
       setLoading(false);
     }
@@ -130,7 +132,9 @@ export default function McpPanel() {
   };
 
   if (loading) return <LoadingState message="Loading MCP servers…" />;
-  if (error) return <ErrorState error={error} onRetry={load} />;
+  // Announced on the same terms as this surface's own save failure: the read
+  // failure was the only state here with no live region at all.
+  if (error) return <div role="alert"><ErrorState error={error} onRetry={load} /></div>;
   if (!servers) return null;
 
   const names = Object.keys(servers).sort();
