@@ -12,6 +12,7 @@ import {
   type AlertChannelId,
 } from './components/jarvis/registry-alert-channel';
 import { ActionRegistryAlertBanner } from './components/jarvis/ActionRegistryAlertBanner';
+import { projectShellLiveness, type ShellLivenessView } from './components/jarvis/shell-liveness';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   PageTransition,
@@ -247,7 +248,7 @@ function MetricCard({ label, value, sub, color, icon }: { label: string; value: 
   );
 }
 
-function Sidebar({ currentView, onNavigate }: { currentView: ViewId; onNavigate: (v: ViewId) => void }) {
+function Sidebar({ currentView, onNavigate, liveness }: { currentView: ViewId; onNavigate: (v: ViewId) => void; liveness: ShellLivenessView }) {
   return (
     <motion.div
       initial={{ x: -20, opacity: 0 }}
@@ -305,9 +306,14 @@ function Sidebar({ currentView, onNavigate }: { currentView: ViewId; onNavigate:
       </nav>
       <div className="px-4 py-3 border-t border-white/[0.04] flex items-center justify-between">
         <BuildBadge />
-        <div className="flex items-center gap-1.5">
-          <span className="w-1.5 h-1.5 rounded-full bg-cyan-neon animate-pulse" style={{ boxShadow: '0 0 6px rgba(34, 211, 238, 0.7)' }} />
-          <span className="text-[9px] font-mono uppercase tracking-widest text-cyan-glow">live</span>
+        {/* The badge used to be a pulsing dot and the word `live`, hardcoded, in a
+            component that received no read at all — so nothing could end the
+            animation. It now reports the shell's own Action-registry alert channel
+            and says, in text, which read it is reporting. */}
+        <div role="status" aria-label="Shell liveness" title={liveness.basis} className="flex items-center gap-1.5">
+          <span aria-hidden="true" className={cn('w-1.5 h-1.5 rounded-full', liveness.dot, liveness.pulse && 'animate-pulse')} />
+          <span className={cn('text-[9px] font-mono uppercase tracking-widest', liveness.text)}>{liveness.label}</span>
+          <span className="sr-only">{liveness.basis}</span>
         </div>
       </div>
     </motion.div>
@@ -807,6 +813,9 @@ function AppInner() {
   }, [armAlertChannel]);
 
   const alertChannelView = projectAlertChannel(alertChannel);
+  // The one read the shell owns end to end, and the only thing the sidebar
+  // footer can honestly call alive.
+  const shellLiveness = projectShellLiveness(alertChannel);
 
   useEffect(() => {
     if (currentView === 'cron') {
@@ -865,7 +874,7 @@ function AppInner() {
 
   return (
     <div className="w-full h-full flex">
-      <Sidebar currentView={currentView} onNavigate={setCurrentView} />
+      <Sidebar currentView={currentView} onNavigate={setCurrentView} liveness={shellLiveness} />
       <div className="flex-1 flex flex-col min-w-0 relative">
         <motion.header
           className="h-14 glass-strong border-b border-white/[0.04] flex items-center px-6 shrink-0 relative z-10"

@@ -130,7 +130,14 @@ export default function HealthBanner() {
     : { level: 'unavailable' as const, label: 'Unavailable', summary: 'Health observation is unavailable.' };
   const level = presentation.level;
   const stripStyle = level === 'ok' ? null : LEVEL_STYLES[level];
-  const subsystems = projectHealthSubsystems(status);
+  // The dot animates only while the observation on screen is one a read confirmed.
+  // A failed read keeps the last snapshot — which is why the strip stays useful —
+  // and that snapshot is exactly the reading the alert beside it disowns, so the
+  // animation stops with it. A refresh in flight is not a failed read: the strip
+  // says `Refreshing health observation…` out loud, and the reading is the last
+  // confirmed one.
+  const liveness = { pulse: !error };
+  const subsystems = projectHealthSubsystems(status, error);
   // The strip unmounts itself when healthy, so recovery is only ever said here.
   const announcement = level === 'ok' ? recoverAnnouncement(subsystems) : presentation.summary;
 
@@ -178,7 +185,7 @@ export default function HealthBanner() {
           onClick={() => setExpanded(e => !e)}
           className="flex items-center gap-2 w-full text-left"
         >
-          <span className={cn('w-2 h-2 rounded-full animate-pulse', stripStyle.dot)} />
+          <span aria-hidden="true" className={cn('w-2 h-2 rounded-full', liveness.pulse && 'animate-pulse', stripStyle.dot)} />
           <span className="font-medium uppercase tracking-wider text-[10px]">{presentation.label}</span>
           <span className="truncate opacity-90">{presentation.summary}</span>
           <span className="ml-auto opacity-60 font-mono text-[10px]">
@@ -200,6 +207,7 @@ export default function HealthBanner() {
                     <span className={cn('w-1.5 h-1.5 rounded-full', DOT_CLASS[row.state])} />
                     {row.name}
                     <span className={DETAIL_CLASS[row.state]}>{row.stateWord}</span>
+                    {row.stale && <span className="opacity-50">(stale)</span>}
                     <span className="opacity-50">· {row.requirementLabel}</span>
                     {row.detail && <span className="opacity-50">({row.detail})</span>}
                   </li>

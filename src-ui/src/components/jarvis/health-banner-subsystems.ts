@@ -32,6 +32,12 @@ export interface HealthSubsystemRow {
   requirementLabel: string;
   requirementClause: string;
   detail: string | null;
+  /**
+   * True when the read behind this row failed, so the reading is the previous
+   * observation rather than the current one. The reading is retained and stays
+   * true to what it measured; what it stops being is a reading of right now.
+   */
+  stale: boolean;
   /** One sentence carrying the whole row, used as its accessible name. */
   announcement: string;
 }
@@ -90,6 +96,7 @@ function row(
   state: HealthSubsystemState,
   requirement: ServiceRequirement,
   detail: string | null = null,
+  stale = false,
 ): HealthSubsystemRow {
   const name = NAMES[key];
   const stateWord = UNIT_WORDS[unit][state];
@@ -103,11 +110,19 @@ function row(
     requirementLabel: REQUIREMENT_LABELS[requirement],
     requirementClause,
     detail,
-    announcement: `${name} ${stateWord}${requirementClause}.`,
+    stale,
+    // The same sentence the sibling telemetry bar uses for a retained reading, so
+    // a stale row here and a stale chip there read identically.
+    announcement: `${name} ${stateWord}${requirementClause}.${stale ? ' This is a previously observed state.' : ''}`,
   };
 }
 
-export function projectHealthSubsystems(status: JarvisStatus | null): HealthSubsystems {
+/**
+ * `stale` is the caller's read state, not a property of the record: the same
+ * snapshot is a current observation when the read confirmed it and a previous one
+ * the moment a later read fails.
+ */
+export function projectHealthSubsystems(status: JarvisStatus | null, stale = false): HealthSubsystems {
   const { backend, requirements } = projectServiceRequirements(status?.active_backend);
   const modelId = nonEmptyString(status?.model);
   // A local model is only ever measured by Ollama. For every other backend
@@ -120,14 +135,14 @@ export function projectHealthSubsystems(status: JarvisStatus | null): HealthSubs
   // is the one case where naming the model would read as blaming it.
   const modelDetail = backend === 'ollama' && status?.ollama_running === false ? null : modelId;
   const rows: HealthSubsystemRow[] = [
-    row('bun', 'process', flagState(status?.bun_server_running), requirements.bun, nonEmptyString(status?.bun_server_url)),
-    row('bridge', 'process', flagState(status?.bridge_active), requirements.bridge, portDetail(status?.bridge_port)),
-    row('ollama', 'process', flagState(status?.ollama_running), requirements.ollama),
+    row('bun', 'process', flagState(status?.bun_server_running), requirements.bun, nonEmptyString(status?.bun_server_url), stale),
+    row('bridge', 'process', flagState(status?.bridge_active), requirements.bridge, portDetail(status?.bridge_port), stale),
+    row('ollama', 'process', flagState(status?.ollama_running), requirements.ollama, null, stale),
     // A local model is only ever required by the Ollama backend, so it shares
     // that requirement rather than inventing a second opinion about it.
-    row('model', 'model', modelState, requirements.ollama, modelDetail),
-    row('openrouter_key', 'key', flagState(status?.openrouter_key_set), openrouterKeyRequirement(backend)),
-    row('claude_proxy', 'process', flagState(status?.claude_proxy_running), requirements.proxy, ':19878'),
+    row('model', 'model', modelState, requirements.ollama, modelDetail, stale),
+    row('openrouter_key', 'key', flagState(status?.openrouter_key_set), openrouterKeyRequirement(backend), null, stale),
+    row('claude_proxy', 'process', flagState(status?.claude_proxy_running), requirements.proxy, ':19878', stale),
   ];
   return { backend, rows, faults: rows.filter((entry) => entry.state === 'down' && entry.requirement === 'required') };
 }

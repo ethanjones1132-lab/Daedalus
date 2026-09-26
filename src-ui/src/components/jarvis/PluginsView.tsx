@@ -2,7 +2,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { confirmPluginEnablement } from './plugin-state';
+import { confirmPluginEnablement, projectPluginTally, type PluginListRead } from './plugin-state';
 import {
   cn,
   GlassCard,
@@ -80,15 +80,20 @@ export default function PluginsView() {
     [success],
   );
 
-  const enabledCount = plugins.filter((p) => p.enabled).length;
+  const read: PluginListRead = loading ? 'pending' : error ? 'failed' : 'confirmed';
+  const tally = projectPluginTally(plugins, read);
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-hidden">
       <SectionHeader
         title="Plugins"
         subtitle="Installed extensions"
-        count={plugins.length}
-        action={<Pill variant={enabledCount > 0 ? 'success' : 'default'}>{enabledCount} enabled</Pill>}
+        count={tally.count ?? undefined}
+        action={
+          tally.enabled === null ? undefined : (
+            <Pill variant={tally.enabled > 0 ? 'success' : 'default'}>{tally.enabled} enabled</Pill>
+          )
+        }
       />
 
       <div className="flex-1 overflow-y-auto min-h-0">
