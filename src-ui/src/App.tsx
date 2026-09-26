@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import { useCallback, useEffect, useId, useMemo, useReducer, useRef, useState } from 'react';
 import { initialSessionListState, reduceSessionListState } from './session-list-state';
 import { createReadGuard, type ReadIdentity } from './lib/read-identity';
+import { decodeContextUsage } from './lib/context-usage';
 import { initialRegistryState, reduceRegistryState } from './components/jarvis/action-registry-state';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
@@ -196,7 +197,10 @@ function formatIsoAge(value: string): string {
 }
 
 function formatTokens(n: number | null): string {
-  if (n === null || n === undefined) return '-';
+  // A count this build cannot print reads as absent, by the same rule the
+  // null branch already follows: a drifted record that carried NaN used to
+  // print the literal `NaN` here, in the same disclosure as the meter.
+  if (n === null || n === undefined || !Number.isFinite(n)) return '-';
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return n.toString();
@@ -588,7 +592,11 @@ function SessionsView() {
       <AnimatedList>
         {(sessions ?? []).map((session) => {
           const isExpanded = expanded.has(session.id);
-          const percentUsed = session.context_tokens > 0 ? Math.min(100, (session.total_tokens / session.context_tokens) * 100) : null;
+          const contextUsage = decodeContextUsage({
+            totalTokens: session.total_tokens,
+            contextTokens: session.context_tokens,
+          });
+          const usageName = `Context usage for ${session.title || session.agent_id}`;
           return (
             <motion.div key={session.id} layout>
               <TiltCard
@@ -610,7 +618,7 @@ function SessionsView() {
                   <span aria-hidden="true" className="text-bone-dim">{isExpanded ? '▾' : '▸'}</span>
                 </button>
                 <div id={`${disclosureId}-${session.id}`} hidden={!isExpanded}>
-                <AnimatePresence>{isExpanded && (<motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} transition={{ duration: 0.2 }} className="overflow-hidden"><div className="px-3 pb-3 border-t border-white/[0.06] mt-3 pt-3"><div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs font-mono"><div><span className="text-bone-dim block mb-0.5">Session ID</span><span className="text-bone-muted break-all">{session.id}</span></div><div><span className="text-bone-dim block mb-0.5">Agent</span><span className="text-bone-muted">{session.agent_id}</span></div><div><span className="text-bone-dim block mb-0.5">Messages</span><span className="text-bone-muted">{session.message_count}</span></div><div><span className="text-bone-dim block mb-0.5">Tokens</span><span className="text-bone-muted">{formatTokens(session.total_tokens)} / {formatTokens(session.context_tokens)}</span></div><div><span className="text-bone-dim block mb-0.5">Created</span><span className="text-bone-muted">{formatIsoAge(session.created_at)}</span></div><div><span className="text-bone-dim block mb-0.5">Updated</span><span className="text-bone-muted">{formatIsoAge(session.updated_at)}</span></div>{percentUsed !== null && (<div className="col-span-2 md:col-span-4"><div className="flex items-center justify-between mb-1"><span className="text-bone-dim">Context Usage</span><span className={percentColor(percentUsed)}>{percentUsed.toFixed(1)}%</span></div><ProgressBar percent={percentUsed} /></div>)}</div></div></motion.div>)}</AnimatePresence>
+                <AnimatePresence>{isExpanded && (<motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} transition={{ duration: 0.2 }} className="overflow-hidden"><div className="px-3 pb-3 border-t border-white/[0.06] mt-3 pt-3"><div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs font-mono"><div><span className="text-bone-dim block mb-0.5">Session ID</span><span className="text-bone-muted break-all">{session.id}</span></div><div><span className="text-bone-dim block mb-0.5">Agent</span><span className="text-bone-muted">{session.agent_id}</span></div><div><span className="text-bone-dim block mb-0.5">Messages</span><span className="text-bone-muted">{session.message_count}</span></div><div><span className="text-bone-dim block mb-0.5">Tokens</span><span className="text-bone-muted">{formatTokens(session.total_tokens)} / {formatTokens(session.context_tokens)}</span></div><div><span className="text-bone-dim block mb-0.5">Created</span><span className="text-bone-muted">{formatIsoAge(session.created_at)}</span></div><div><span className="text-bone-dim block mb-0.5">Updated</span><span className="text-bone-muted">{formatIsoAge(session.updated_at)}</span></div><div className="col-span-2 md:col-span-4"><div className="flex items-center justify-between mb-1"><span className="text-bone-dim">Context Usage</span><span className={percentColor(contextUsage.ratio)}>{contextUsage.percent}</span></div>{contextUsage.barPercent !== null && <ProgressBar percent={contextUsage.barPercent} label={usageName} {...(contextUsage.valueText ? { valueText: contextUsage.valueText } : {})} />}{contextUsage.basis && <p className="mt-1 text-bone-faint">{contextUsage.basis}</p>}</div></div></div></motion.div>)}</AnimatePresence>
                 </div>
               </TiltCard>
             </motion.div>

@@ -10,10 +10,13 @@
 //
 // Connection state is persisted inside `config.connected` (login/logout flip it);
 // the top-level `connected` field from list_channels is always false, so we read
-// the flag out of config.
+// the flag out of config. That flag records one login, not a live socket, so the
+// row's liveness claim is projected separately: `channel-liveness` reports a stored
+// flag as a stored flag and rests a connection claim on the delivery probe below.
 
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { channelProbePhase, projectChannelLiveness } from './channel-liveness';
 import { initialReceiptState, parseDiscordSendResponse, parseReceipts, reduceReceiptState, type DeliveryReceipt } from './channel-receipt-state';
 import { canVerifyChannel, channelId, channelLocked, isConfiguredChannel, isConnected, reconcileChannels, type Channel, type ChannelOperation } from './channel-state';
 import {
@@ -305,11 +308,8 @@ export function ChannelsView() {
     const operation: ChannelOperation<Channel> = { row: channel, action, phase: 'writing', after: requestId.current };
     publishOperations({ ...operationsRef.current, [channel.id]: operation });
     if (action === 'connect') {
-      setVerifiedChannels((current) => {
-        const next = new Set(current);
-        next.delete(channel.id);
-        return next;
-      });
+      // A confirmation already on the row is kept while the probe runs: a probe that
+      // fails next leaves it visible and stale rather than deleting the last reading.
       if (!await verifyDelivery(channel)) {
         publishOperations({ ...operationsRef.current, [channel.id]: { ...operation, phase: 'verification-failed', after: requestId.current } });
         return;
@@ -391,6 +391,10 @@ export function ChannelsView() {
         }
       />
 
+      <p className="text-[10px] font-mono text-bone/40">
+        The connected tally counts stored login flags. Only a probe that delivers a message confirms a channel.
+      </p>
+
       {adding && <AddChannelForm onCreate={create} onCancel={() => changeAdding(false)} saving={saving} createError={createError} />}
 
       <div className="text-xs text-bone/60 space-y-1">
@@ -444,15 +448,19 @@ export function ChannelsView() {
               const verified = verifiedChannels.has(c.id);
               const operation = operations[c.id];
               const locked = channelLocked(operation);
+              const liveness = projectChannelLiveness(c, { verified, probe: channelProbePhase(operation) });
               return (
-                <li key={c.id}>
+                <li key={c.id} aria-label={liveness.announcement}>
                   <GlassCard className="p-3">
                     <div className="flex items-center gap-2">
-                      <StatusDot ok={connected} warn={!connected} pulse={connected} />
+                      <StatusDot ok={liveness.tone === 'success'} warn={liveness.tone === 'warn'} />
                       <h3 className="text-sm font-medium text-bone truncate">{c.name}</h3>
                       <Pill variant="default">{c.type}</Pill>
                       {configured && <Pill>configured</Pill>}
-                      {connected && <Pill variant="success">connected</Pill>}
+                      {liveness.claim === 'confirmed' && <Pill variant="success">connected</Pill>}
+                      {liveness.claim === 'stored' && <Pill variant="warn">stored as connected</Pill>}
+                      {liveness.claim === 'probing' && <Pill>probing</Pill>}
+                      {liveness.claim === 'flag-unreadable' && <Pill>flag not readable</Pill>}
                       {verified && <Pill variant="success">delivery verified</Pill>}
                       {!supported && <Pill>unsupported adapter</Pill>}
                       {supported && !configured && <Pill>needs channel ID</Pill>}
@@ -509,6 +517,13 @@ export function ChannelsView() {
                         <button type="button" className="underline disabled:opacity-40" disabled={loading} onClick={retryRead}>Retry</button>
                       </div>
                     )}
+                    <div
+                      data-testid="channel-liveness"
+                      className="mt-1 flex flex-wrap items-baseline gap-x-1.5 text-[10px] font-mono text-bone/40"
+                    >
+                      <span className="text-bone/60">{liveness.claimLabel}</span>
+                      <span>{liveness.basis}</span>
+                    </div>
                     <div className="flex items-center gap-2 mt-1.5 text-[10px] font-mono text-bone/30">
                       <span>last used {formatTimestamp(c.last_used)}</span>
                       <span className="ml-auto">added {formatTimestamp(c.created_at)}</span>

@@ -695,11 +695,17 @@ export function ProgressBar({
   className,
   size = 'md',
   variant = 'default',
+  label,
+  valueText,
 }: {
   percent: number;
   className?: string;
   size?: 'sm' | 'md' | 'lg';
   variant?: 'default' | 'success' | 'warning' | 'error';
+  /** Supplying a name is what makes the bar a labelled progressbar. */
+  label?: string;
+  /** The accessible value when it must differ from the clamped bar width. */
+  valueText?: string;
 }) {
   const clamped = Math.max(0, Math.min(100, percent));
   const sizeClass = {
@@ -715,8 +721,19 @@ export function ProgressBar({
     error: 'bg-red-400',
   }[variant];
 
+  const trackProps = label
+    ? ({
+        role: 'progressbar',
+        'aria-label': label,
+        'aria-valuenow': clamped,
+        'aria-valuemin': 0,
+        'aria-valuemax': 100,
+        ...(valueText ? { 'aria-valuetext': valueText } : {}),
+      } as const)
+    : {};
+
   return (
-    <div className={cn('w-full bg-white/10 rounded-full overflow-hidden', sizeClass, className)}>
+    <div className={cn('w-full bg-white/10 rounded-full overflow-hidden', sizeClass, className)} {...trackProps}>
       <motion.div
         className={cn('h-full rounded-full', variantColor)}
         initial={{ width: 0 }}
