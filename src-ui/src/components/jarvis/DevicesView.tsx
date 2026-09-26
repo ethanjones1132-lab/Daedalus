@@ -2,6 +2,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { projectDevicePresence } from './device-presence';
 import { reconcileRemovals, removalLocked, type RemovalOperation } from './removal-state';
 import {
   cn,
@@ -26,10 +27,8 @@ interface Device {
 
 const DEVICE_TYPES = ['desktop', 'laptop', 'phone', 'tablet', 'server', 'iot'];
 
-function formatWhen(ts: string): string {
-  const d = new Date(ts);
-  if (Number.isNaN(d.getTime())) return ts;
-  return d.toLocaleString();
+function formatStamp(at: number): string {
+  return new Date(at).toLocaleString();
 }
 
 export default function DevicesView() {
@@ -218,17 +217,17 @@ export default function DevicesView() {
             ) : (
               <ul className="space-y-2">
                 {devices.map((d) => {
-                  const online = d.status.toLowerCase() === 'online';
+                  const presence = projectDevicePresence(d);
                   const operation = operations[d.id];
                   const locked = removalLocked(operation);
                   return (
-                    <li key={d.id}>
+                    <li key={d.id} aria-label={presence.announcement}>
                       <GlassCard className="p-3">
                         <div className="flex items-center gap-2">
-                          <StatusDot ok={online} warn={!online} pulse={online} />
+                          <StatusDot ok={presence.tone === 'success'} warn={presence.tone === 'warn'} />
                           <span className="text-sm font-medium text-bone truncate">{d.name}</span>
                           <Pill variant="default">{d.device_type}</Pill>
-                          <Pill variant={online ? 'success' : 'default'}>{d.status}</Pill>
+                          <Pill variant={presence.tone}>{presence.recorded}</Pill>
                           <button
                             type="button"
                             onClick={() => remove(d)}
@@ -252,9 +251,18 @@ export default function DevicesView() {
                             <button type="button" onClick={retryRead} disabled={loading} className="underline disabled:opacity-40">Retry</button>
                           </div>
                         )}
-                        <div className="mt-1 text-[10px] font-mono text-bone/30">
-                          last seen {formatWhen(d.last_seen)}
+                        <div
+                          data-testid="device-presence"
+                          className="mt-1 flex flex-wrap items-baseline gap-x-1.5 text-[10px] font-mono text-bone/40"
+                        >
+                          <span className="text-bone/60">{presence.claimLabel}</span>
+                          <span>{presence.basis}</span>
                         </div>
+                        {presence.lastSeenAt !== null && (
+                          <div data-testid="device-stamp" className="mt-0.5 text-[10px] font-mono text-bone/30">
+                            stamped {formatStamp(presence.lastSeenAt)} · {presence.lastSeenAge} ago
+                          </div>
+                        )}
                       </GlassCard>
                     </li>
                   );
