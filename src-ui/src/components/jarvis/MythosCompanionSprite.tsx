@@ -65,6 +65,8 @@ export const MythosCompanionSprite = memo(function MythosCompanionSprite(
     </motion.svg>
     {cronAwareness && (
       <motion.div
+        role="status"
+        aria-label="Cron awareness"
         initial={{ opacity: 0, y: 4 }}
         animate={{ opacity: 1, y: 0 }}
         className="absolute -bottom-6 left-1/2 -translate-x-1/2 whitespace-nowrap text-[10px] text-bone/50 font-mono"

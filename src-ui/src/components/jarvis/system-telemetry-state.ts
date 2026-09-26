@@ -300,6 +300,8 @@ export interface SystemTelemetryView {
     status: TelemetryResourceStatus;
     stale: boolean;
     error: boolean;
+    /** The request is still in flight: nothing has come back, so nothing is claimed. */
+    awaiting: boolean;
     hasData: boolean;
     hasAttempts: boolean;
     errorRate: number | null;
@@ -349,9 +351,13 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBac
     ? Math.max(...errorRates)
     : null;
   const hasInferenceError = errorRate !== null && errorRate > 0.1;
-  const inferenceUnavailable = state.inference.status === 'unavailable' || state.inference.status === 'stale' || state.inference.status === 'pending' || state.inference.status === 'unknown';
-  // `inferenceUnavailable` also covers a read that is merely still in flight, so
-  // the attributable reason is narrower: an unreadable resource, not a pending one.
+  // A read that has not come back yet is not a fault, so it never degrades the
+  // verdict on its own: `pending` is the word this surface already prints for a
+  // request in flight, and the reads are issued together, so a half-observation
+  // is the ordinary case. The unreadable cases stay faults, and they are
+  // attributable — `inferenceReadFailed` names one as `inference_unavailable`
+  // below, so a fault that reaches the verdict can always name its cause.
+  const inferenceAwaiting = state.inference.status === 'pending' || state.inference.status === 'unknown';
   const inferenceReadFailed = state.inference.status === 'unavailable' || state.inference.status === 'stale';
 
   // A service that is not running is a fault only when the confirmed active
@@ -380,8 +386,10 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBac
     overall = 'stale';
   } else if (services.bun === 'down' || services.bridge === 'down') {
     overall = 'stopped';
-  } else if (inferenceUnavailable || reasons.length > 0) {
+  } else if (reasons.length > 0) {
     overall = 'degraded';
+  } else if (inferenceAwaiting) {
+    overall = 'pending';
   } else {
     overall = 'healthy';
   }
@@ -407,6 +415,7 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBac
       status: state.inference.status,
       stale: inferenceStale,
       error: state.inference.error,
+      awaiting: inferenceAwaiting,
       hasData: inferenceData !== null,
       hasAttempts: inferenceData !== null && inferenceData.window_size > 0,
       errorRate,

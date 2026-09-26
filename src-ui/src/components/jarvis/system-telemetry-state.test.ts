@@ -338,5 +338,98 @@ describe('verdict summary', () => {
       'ollama',
     );
     expect(pendingInference.overallReasons).toEqual([]);
+    // The verdict itself, not only the reason list: a request that has not come
+    // back is a reading in progress, not a confirmed fault. `{ type: 'pending' }`
+    // re-pends both reads, so the retained health snapshot is outstanding too and
+    // the verdict is the stale one — still not a fault.
+    expect(pendingInference.overall).toBe('stale');
+    expect(pendingInference.overall).not.toBe('degraded');
+    expect(summarizeVerdict(pendingInference)).toBe('System health may be stale');
+  });
+});
+
+describe('an inference read that has not come back', () => {
+  // The two reads are issued together (`Promise.all([fetchHealth(),
+  // fetchInference()])`), so the health read answering first is the ordinary
+  // case, not a corner: the verdict is then a half-observation.
+  const healthSettledInferenceOutstanding = reduceSystemTelemetryState(
+    loaded(health),
+    { type: 'inference-pending', requestId: 1 },
+  );
+  const refreshWithInferenceOutstanding = reduceSystemTelemetryState(
+    healthyReady(),
+    { type: 'inference-pending', requestId: 2 },
+  );
+
+  it('reads a settled system with an unanswered inference read as still checking', () => {
+    for (const state of [healthSettledInferenceOutstanding, refreshWithInferenceOutstanding]) {
+      const view = deriveSystemTelemetryView(state, 'ollama');
+      expect(view.overall).not.toBe('degraded');
+      expect(view.overall).toBe('pending');
+      expect(view.overallReasons).toEqual([]);
+      expect(view.inference.awaiting).toBe(true);
+      expect(summarizeVerdict(view)).toBe('Checking system telemetry');
+    }
+    // The first of the two carries no inference data at all, so the reading it
+    // has not received is the only thing missing from the verdict.
+    expect(healthSettledInferenceOutstanding.inference.data).toBeNull();
+    expect(refreshWithInferenceOutstanding.inference.data).not.toBeNull();
+  });
+
+  it('never waits on the inference read to name a fault the health read already confirmed', () => {
+    const degraded = deriveSystemTelemetryView(
+      reduceSystemTelemetryState(
+        loaded({ ...health, ollama: { ...health.ollama, running: false }, memory: { ...health.memory, used_percent: 85 } }),
+        { type: 'inference-pending', requestId: 1 },
+      ),
+      'ollama',
+    );
+    expect(degraded.overall).toBe('degraded');
+    expect(degraded.overallReasons).toEqual(['ollama_down', 'memory_pressure']);
+    expect(summarizeVerdict(degraded)).toBe('Degraded: Ollama is not running and memory use is high.');
+    // Still honestly marked outstanding, without that becoming a reason of its own.
+    expect(degraded.inference.awaiting).toBe(true);
+    expect(degraded.overallReasons).not.toContain('inference_unavailable');
+  });
+
+  it('still reports a stopped system while the inference read is outstanding', () => {
+    const stopped = deriveSystemTelemetryView(
+      reduceSystemTelemetryState(
+        loaded({ ...health, bun_server: { ...health.bun_server, running: false } }),
+        { type: 'inference-pending', requestId: 1 },
+      ),
+      'ollama',
+    );
+    expect(stopped.overall).toBe('stopped');
+    expect(stopped.overallReasons).toEqual(['bun_down']);
+    expect(summarizeVerdict(stopped)).toBe('Stopped: Bun server is not running.');
+  });
+
+  it('still reports a stale system health while the inference read is outstanding', () => {
+    const staling = reduceSystemTelemetryState(healthyReady(), { type: 'health-pending', requestId: 9 });
+    const stillOutstanding = reduceSystemTelemetryState(staling, { type: 'inference-pending', requestId: 9 });
+    const view = deriveSystemTelemetryView(stillOutstanding, 'ollama');
+    expect(view.inference.awaiting).toBe(true);
+    expect(view.overall).toBe('stale');
+    expect(summarizeVerdict(view)).toBe('System health may be stale');
+  });
+
+  it('keeps a confirmed verdict a confirmed verdict: neither half is a permanent hedge', () => {
+    const fault = deriveSystemTelemetryView(
+      reduceSystemTelemetryState(healthyReady(), { type: 'inference-failure', requestId: 3 }),
+      'ollama',
+    );
+    expect(fault.overall).toBe('degraded');
+    expect(fault.overallReasons).toEqual(['inference_unavailable']);
+    expect(fault.inference.awaiting).toBe(false);
+    expect(summarizeVerdict(fault)).toBe('Degraded: inference telemetry is unavailable.');
+
+    const healthy = deriveSystemTelemetryView(healthyReady(), 'ollama');
+    expect(healthy.overall).toBe('healthy');
+    expect(healthy.overallReasons).toEqual([]);
+    expect(healthy.inference.awaiting).toBe(false);
+    expect(summarizeVerdict(healthy)).toBe(
+      'All services required by the active inference backend (ollama) are running. Not required by this backend: claude_cli_proxy.',
+    );
   });
 });

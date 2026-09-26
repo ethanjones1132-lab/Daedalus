@@ -34,6 +34,12 @@ const DOWN_CHIP_CLASS: Record<TelemetryServiceKey, string> = {
   proxy: 'bg-amber-500/15 text-amber-300',
 };
 
+// A reading that has not come back is not a fault and is not a confirmation, so
+// it reads neutral — the colour this bar already uses where there is nothing to
+// report. Amber stays reserved for a service or resource that was read and found
+// wrong, so a request in flight can never be mistaken for either.
+const PENDING_CHIP_CLASS = 'bg-white/[0.05] text-bone/50';
+
 const STATE_WORDS: Record<ServiceState, string> = {
   up: 'is up',
   down: 'is not running',
@@ -178,7 +184,7 @@ export default function SystemStatusBar({ activeBackend = null }: SystemStatusBa
         <span className={cn('px-1.5 py-0.5 rounded', view.health.diskPercent === null ? 'bg-amber-500/15 text-amber-300' : view.health.diskPercent >= 90 ? 'bg-red-500/15 text-red-300' : view.health.diskPercent >= 80 ? 'bg-amber-500/15 text-amber-300' : 'bg-emerald-500/15 text-emerald-300')}>
           {percentLabel('DSK', view.health.diskPercent, healthStale)}
         </span>
-        <span className={cn('px-1.5 py-0.5 rounded', inferenceStatus === 'unavailable' || inferenceStale ? 'bg-amber-500/15 text-amber-300' : view.inference.errorRate !== null && view.inference.errorRate > 0.1 ? 'bg-red-500/15 text-red-300' : 'bg-emerald-500/15 text-emerald-300')}>
+        <span className={cn('px-1.5 py-0.5 rounded', view.inference.awaiting && !view.inference.hasData ? PENDING_CHIP_CLASS : inferenceStatus === 'unavailable' || inferenceStale ? 'bg-amber-500/15 text-amber-300' : view.inference.errorRate !== null && view.inference.errorRate > 0.1 ? 'bg-red-500/15 text-red-300' : 'bg-emerald-500/15 text-emerald-300')}>
           {inferenceLabel(view)}
         </span>
         {view.inference.conductorHitRate !== null && (

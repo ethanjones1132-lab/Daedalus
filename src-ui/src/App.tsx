@@ -4,7 +4,14 @@ import { useCallback, useEffect, useId, useMemo, useReducer, useRef, useState } 
 import { initialSessionListState, reduceSessionListState } from './session-list-state';
 import { createReadGuard, type ReadIdentity } from './lib/read-identity';
 import { decodeContextUsage } from './lib/context-usage';
-import { initialRegistryState, reduceRegistryState } from './components/jarvis/action-registry-state';
+import { initialRegistryState, reduceRegistryState, parseActionRegistryAlerts, type ActionRegistryAlert } from './components/jarvis/action-registry-state';
+import {
+  initialAlertChannelState,
+  projectAlertChannel,
+  reduceAlertChannel,
+  type AlertChannelId,
+} from './components/jarvis/registry-alert-channel';
+import { ActionRegistryAlertBanner } from './components/jarvis/ActionRegistryAlertBanner';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   PageTransition,
@@ -630,15 +637,6 @@ function SessionsView() {
 }
 
 
-interface ActionRegistryAlert {
-  id: string;
-  kind: string;
-  severity: string;
-  title: string;
-  message: string;
-  count?: number;
-}
-
 function AppInner() {
   const { warn, error: toastError } = useToast();
   const { theme, toggle: toggleTheme } = useTheme();
@@ -659,6 +657,10 @@ function AppInner() {
     [],
   );
   const [cronAwareness, setCronAwareness] = useState<string | null>('Loading cron awareness…');
+  const [alertChannel, dispatchAlertChannel] = useReducer(
+    reduceAlertChannel,
+    initialAlertChannelState(),
+  );
 
   useEffect(() => {
     try { localStorage.setItem('jarvis-current-view', currentView); } catch {}
@@ -702,46 +704,72 @@ function AppInner() {
     return () => clearInterval(awarenessInterval);
   }, [refreshCronAwareness]);
 
-  useEffect(() => {
-    const showRegistryAlert = (alerts: ActionRegistryAlert[]) => {
-      const highPriority = alerts.find((alert) => alert.severity === 'high') ?? alerts[0];
-      if (!highPriority) return;
-      const toastFn = highPriority.severity === 'high' ? toastError : warn;
-      toastFn(
-        highPriority.message,
-        highPriority.title,
-        undefined,
-        {
-          label: 'Open Actions',
-          onClick: () => setCurrentView('action-registry'),
-        },
-      );
-    };
+  // ── Action registry alert channel ──
+  // One boot read and two event subscriptions, armed together under a single
+  // attempt id. None of the three is a poll, so none of them was ever retried:
+  // a refused subscription stayed dead for the life of the process and a
+  // refused boot read was discarded, which left a quiet Actions tab as the only
+  // evidence a real high-severity registry fault would never be delivered. The
+  // attempt id is what lets a deliberate Retry re-arm all three, and what stops
+  // a refusal from a torn-down attempt from outliving the attempt that
+  // replaced it.
+  const alertAttemptRef = useRef(0);
+  const alertUnlistensRef = useRef<Array<() => void>>([]);
+  const alertDisposedRef = useRef(false);
 
-    void invoke<ActionRegistryAlert[]>('get_action_registry_alerts')
-      .then((alerts) => {
-        if (alerts.length > 0) showRegistryAlert(alerts);
-      })
-      .catch(() => {});
-
-    const unsubs: Array<() => void> = [];
-    let disposed = false;
-    listen<ActionRegistryAlert[]>('action-registry://alerts', (e) => {
-      showRegistryAlert(e.payload);
-    }).then((unlisten) => {
-      if (disposed) unlisten();
-      else unsubs.push(unlisten);
-    });
-
-    return () => {
-      disposed = true;
-      unsubs.forEach((f) => f());
-    };
+  const showRegistryAlert = useCallback((alerts: ActionRegistryAlert[]) => {
+    const highPriority = alerts.find((alert) => alert.severity === 'high') ?? alerts[0];
+    if (!highPriority) return;
+    const toastFn = highPriority.severity === 'high' ? toastError : warn;
+    toastFn(
+      highPriority.message,
+      highPriority.title,
+      undefined,
+      {
+        label: 'Open Actions',
+        onClick: () => setCurrentView('action-registry'),
+      },
+    );
   }, [warn, toastError]);
 
-  useEffect(() => {
-    const unsubs: Array<() => void> = [];
-    let disposed = false;
+  const armAlertChannel = useCallback(() => {
+    // A Retry replaces the whole attempt, so the subscriptions the previous one
+    // was granted are released here rather than left doubling every toast.
+    const granted = alertUnlistensRef.current;
+    alertUnlistensRef.current = [];
+    granted.forEach((unlisten) => unlisten());
+
+    const attempt = ++alertAttemptRef.current;
+    const superseded = () => alertDisposedRef.current || alertAttemptRef.current !== attempt;
+    const track = (unlisten: () => void) => {
+      if (superseded()) unlisten();
+      else alertUnlistensRef.current.push(unlisten);
+    };
+    const settle = (channel: AlertChannelId, type: 'live' | 'failed') => {
+      if (superseded()) return;
+      dispatchAlertChannel({ type, attempt, channel });
+    };
+
+    dispatchAlertChannel({ type: 'begin', attempt });
+
+    void (async () => {
+      let alerts: ActionRegistryAlert[];
+      try {
+        alerts = parseActionRegistryAlerts(await invoke<unknown>('get_action_registry_alerts'));
+      } catch {
+        settle('boot-read', 'failed');
+        return;
+      }
+      settle('boot-read', 'live');
+      if (alerts.length > 0) showRegistryAlert(alerts);
+    })();
+
+    listen<ActionRegistryAlert[]>('action-registry://alerts', (e) => {
+      showRegistryAlert(e.payload);
+    })
+      .then((unlisten) => { settle('registry-events', 'live'); track(unlisten); })
+      .catch(() => settle('registry-events', 'failed'));
+
     listen<CompanionCronJob[]>('cron://missed-jobs', (e) => {
       const count = e.payload.length;
       if (count > 0) {
@@ -762,16 +790,23 @@ function AppInner() {
       } else {
         void refreshCronAwareness();
       }
-    }).then((unlisten) => {
-      if (disposed) unlisten();
-      else unsubs.push(unlisten);
-    });
+    })
+      .then((unlisten) => { settle('missed-cron-events', 'live'); track(unlisten); })
+      .catch(() => settle('missed-cron-events', 'failed'));
+  }, [showRegistryAlert, refreshCronAwareness, warn]);
 
+  useEffect(() => {
+    alertDisposedRef.current = false;
+    armAlertChannel();
     return () => {
-      disposed = true;
-      unsubs.forEach((f) => f());
+      alertDisposedRef.current = true;
+      const granted = alertUnlistensRef.current;
+      alertUnlistensRef.current = [];
+      granted.forEach((unlisten) => unlisten());
     };
-  }, [warn, refreshCronAwareness]);
+  }, [armAlertChannel]);
+
+  const alertChannelView = projectAlertChannel(alertChannel);
 
   useEffect(() => {
     if (currentView === 'cron') {
@@ -858,6 +893,7 @@ function AppInner() {
           </div>
         </motion.header>
         <HealthBanner />
+        <ActionRegistryAlertBanner view={alertChannelView} onRetry={armAlertChannel} />
         <MainSurface><AnimatePresence mode="wait"><div key={currentView} className="h-full min-h-0"><ErrorBoundary>{renderView()}</ErrorBoundary></div></AnimatePresence></MainSurface>
         <motion.div
           className="fixed bottom-6 right-6 z-50"
