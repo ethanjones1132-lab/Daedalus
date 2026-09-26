@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useCallback, useEffect, useId, useMemo, useReducer, useRef, useState } from 'react';
 import { initialSessionListState, reduceSessionListState } from './session-list-state';
+import { createReadGuard, type ReadIdentity } from './lib/read-identity';
 import { initialRegistryState, reduceRegistryState } from './components/jarvis/action-registry-state';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
@@ -404,7 +405,7 @@ function OverviewView() {
   );
 }
 
-function ChatFeedsView() {
+export function ChatFeedsView() {
   const { error: toastError } = useToast();
   const [sessions, setSessions] = useState<BackendSession[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -414,16 +415,24 @@ function ChatFeedsView() {
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  // The transcript read is started by a selection, not by the poll, so it owns
+  // its own identity: a superseded read must not publish one Session's
+  // transcript under another Session's header, nor end the newer read's
+  // pending state when it settles first.
+  const historyRead = useMemo(() => createReadGuard(), []);
 
-  const fetchSessions = useCallback(async () => {
+  const fetchSessions = useCallback(async (read: ReadIdentity) => {
     try {
       const result = await invoke<BackendSession[]>('list_sessions');
-      setSessions([...result].sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at)));
+      const sorted = [...result].sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
+      if (!read.isCurrent()) return; // a newer poll has already read this list
+      setSessions(sorted);
       setError(null);
     } catch (e) {
+      if (!read.isCurrent()) return;
       setError(String(e));
     } finally {
-      setLoading(false);
+      if (read.isCurrent()) setLoading(false);
     }
   }, []);
 
@@ -431,17 +440,19 @@ function ChatFeedsView() {
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [history]);
 
   const loadHistory = useCallback(async (sessionId: string) => {
+    const request = historyRead.issue();
     setSelectedId(sessionId);
     setHistoryLoading(true);
     setHistory(null);
     try {
-      setHistory(await invoke<SessionMessage[]>('get_session_history', { sessionId }));
+      const messages = await invoke<SessionMessage[]>('get_session_history', { sessionId });
+      historyRead.publish(request.id, () => setHistory(messages));
     } catch (e) {
-      toastError(`Failed to load history: ${e}`, 'Chat Error');
+      historyRead.publish(request.id, () => toastError(`Failed to load history: ${e}`, 'Chat Error'));
     } finally {
-      setHistoryLoading(false);
+      historyRead.publish(request.id, () => setHistoryLoading(false));
     }
-  }, [toastError]);
+  }, [historyRead, toastError]);
 
   const filtered = sessions.filter((session) => {
     if (!searchQuery) return true;

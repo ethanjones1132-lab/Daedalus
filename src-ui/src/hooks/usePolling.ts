@@ -1,13 +1,22 @@
 import { useEffect, useRef, useCallback } from 'react';
+import { createReadGuard, type ReadIdentity } from '../lib/read-identity';
 
 /**
  * Visibility-aware polling hook.
  * Only polls when the document is visible (tab is active).
  * Immediately fetches on mount, then polls at the given interval.
  * Cleans up on unmount.
+ *
+ * Every dispatch — mount, interval tick, visibility re-read — issues a read,
+ * because a read that hangs must never be able to block a newer observation.
+ * What the hook now owns is the read's *identity*: each callback receives a
+ * `ReadIdentity` and can test `read.isCurrent()` before it publishes, so a
+ * response that resolves after a newer one is dropped instead of reverting the
+ * surface. That guard used to be a hand-rolled `requestId` ref in each caller
+ * (and was missing entirely from one of them), so it is here now.
  */
 export function usePolling(
-  callback: () => void,
+  callback: (read: ReadIdentity) => void | PromiseLike<unknown>,
   intervalMs: number,
   deps: unknown[] = []
 ) {
@@ -15,13 +24,18 @@ export function usePolling(
   savedCallback.current = callback;
 
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const guardRef = useRef(createReadGuard());
+
+  const run = useCallback(() => {
+    savedCallback.current(guardRef.current.issue());
+  }, []);
 
   const startPolling = useCallback(() => {
     if (intervalRef.current) return; // already polling
     intervalRef.current = setInterval(() => {
-      savedCallback.current();
+      run();
     }, intervalMs);
-  }, [intervalMs]);
+  }, [intervalMs, run]);
 
   const stopPolling = useCallback(() => {
     if (intervalRef.current) {
@@ -39,13 +53,13 @@ export function usePolling(
       if (document.hidden) {
         stopPolling();
       } else {
-        savedCallback.current(); // immediate fetch when becoming visible
+        run(); // immediate fetch when becoming visible
         startPolling();
       }
     };
 
     // Initial fetch + start polling if visible
-    savedCallback.current();
+    run();
     if (!document.hidden) {
       startPolling();
     }
@@ -55,5 +69,5 @@ export function usePolling(
       stopPolling();
       document.removeEventListener('visibilitychange', handleVisibility);
     };
-  }, [startPolling, stopPolling, ...deps]);
+  }, [startPolling, stopPolling, run, ...deps]);
 }
