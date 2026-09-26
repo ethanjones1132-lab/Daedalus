@@ -175,6 +175,21 @@ const STREAM_INACTIVITY_TIMEOUT_MS = 90_000;
 // native error string can embed store or session detail, and the operator reads
 // this in the banner. The value is still logged, where a developer can find it.
 const APPEND_FAILED_COPY = 'Append failed: Daedalus could not save this message to the Session.';
+// The tail of the Session list's own alert. The surface already prefixes
+// `Could not load sessions.` and already appends its own staleness clause, so this
+// is the part it still owed an operator: what to do next. The store's own reason is
+// withheld for the reason the other seven fixed surfaces withhold theirs.
+const SESSIONS_READ_FAILED_COPY = 'Retry to read the Session list again.';
+
+// A failed turn has exactly one claim worth printing, and it depends on what failed.
+// A turn that ends on a *stable code* is the Conductor's own account of the turn: the
+// terminal SSE frame carries both the code and text explaining it, so the text is
+// authored product copy and it is the operator's only diagnosis — it prints beside
+// the code's `errorDisplayForCode` label and hint. A turn that fails with no code is
+// a transport failure (an HTTP status, a `TypeError`, the inactivity watchdog), and
+// there the text is whatever the failing layer chose to say, so it is named instead.
+// Both reach the banner and the designed error bubble, so the split is here, once.
+const TURN_FAILED_COPY = 'The turn failed. Your message is kept as a draft — send it again to retry.';
 
 // Task 7 Part C (2026-07-03 incident 1d4727cf): the server's structured
 // `error` frame carries a `code` (e.g. "first_token_timeout") that
@@ -267,7 +282,7 @@ export default function JarvisView({ initialSubView = 'chat', initialControlTab,
         }
       }
       if (removalFailure) publishSessionDeleteOperations(next);
-      else setSessionsError(String(e));
+      else setSessionsError(SESSIONS_READ_FAILED_COPY);
     } finally {
       if (request === sessionsRequest.current) {
         if (options?.deletionRead) sessionDeleteReadPending.current = false;
@@ -1400,8 +1415,11 @@ export function ChatPanel({
     });
 
     if (!response.ok) {
-      const body = await response.text().catch(() => '');
-      throw new Error(`Jarvis server returned ${response.status}: ${body}`);
+      // Drain the body so the connection can be reused, but never print it: it is
+      // whatever answered — a proxy, a gateway, a relay — not something the
+      // operator can act on, and a non-JSON error page would land in the chat.
+      await response.text().catch(() => '');
+      throw new Error(`Jarvis server returned ${response.status}.`);
     }
     if (!response.body) {
       throw new Error('Jarvis server returned no response stream.');
@@ -1947,9 +1965,9 @@ export function ChatPanel({
       // a designed error bubble — friendly text, `errorCode` as small muted
       // detail — instead of leaving a plain assistant-looking message and
       // relying solely on the (dismissable, easy-to-miss) banner below.
-      const errorMessage = String(e instanceof Error ? e.message : e);
-       const errorCode = e instanceof JarvisStreamError ? e.code : undefined;
-       setError(errorMessage);
+      const errorCode = e instanceof JarvisStreamError ? e.code : undefined;
+      const errorMessage = errorCode ? String(e instanceof Error ? e.message : e) : TURN_FAILED_COPY;
+      setError(errorMessage);
        publishDraftStore(restoreFailedSessionDraft(draftStoreRef.current, submittedDraft));
        setMessages(prev => {
         const withTokens = applyTokenChunk(prev, pending);

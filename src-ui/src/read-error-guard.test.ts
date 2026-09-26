@@ -1,11 +1,12 @@
 // Raw-error guard: the rule, as a ratchet.
 //
-// The fixed-message rule is established in five sibling surfaces and violated in
-// thirteen places across eight files. That is the same shape as the pulse class:
+// The fixed-message rule is established in five sibling surfaces and was violated
+// in thirteen places across eight files. That is the same shape as the pulse class:
 // a rule stated in a row's Acceptance, fixed one surface at a time, and enforced by
 // nothing — so a new surface can ship a raw Native rejection and the suite stays
-// green. `read-error-guard.test.tsx` fixed the read paths this row names; this
-// file is the part that keeps them fixed.
+// green. `read-error-guard.test.tsx` fixed the read paths the first row named and
+// `ReadErrorDebt.test.tsx` fixed the ten writes and reads this row named; this file
+// is the part that keeps them fixed.
 //
 // Every line that stringifies a caught value is either documented here or the
 // guard fails. The table below is CLOSED, and that is the part that matters:
@@ -16,7 +17,13 @@
 //   a stale claim is an error, not a leftover;
 // - `deferred` entries are leaks, not permissions. Each names the Ready row that
 //   owns it, and the deferred set is pinned to an exact list, so the debt can
-//   shrink but never grow quietly;
+//   shrink but never grow quietly. That set is now EMPTY: every leak this guard
+//   named has been fixed, and the next one starts from nothing;
+// - `authored` is the one place a value still reaches a surface on purpose. It is
+//   not a re-opened leak and it is not a renamed `deferred`: the entry must name
+//   the classifier that carries the actionable meaning and the guard proves the
+//   file routes the printed text through it, so "the server's own claim" is a
+//   checked mechanism rather than an assertion in prose;
 // - `unreachable` entries are machine-checked below: if a module listed as
 //   unreachable ever gains an importer, the guard fails and the entry has to be
 //   re-argued rather than inherited.
@@ -39,78 +46,13 @@ const sources = import.meta.glob('./**/*.{ts,tsx}', {
   eager: true,
 }) as Record<string, string>;
 
-const DEBT_ROW = '`fix(ui): withhold the native rejection on the four surfaces this guard lists as debt` (.sprint/BACKLOG.md)';
-
 const ALLOWLIST: ReadErrorEntry[] = [
   {
     file: './components/jarvis/JarvisView.tsx',
-    text: 'else setSessionsError(String(e));',
-    verdict: 'deferred',
+    text: 'String(e instanceof Error ? e.message : e)',
+    verdict: 'authored',
     reason:
-      `The Session list read still renders the Native string in its announced alert, and \`JarvisView.sessions.test.tsx\` pins that raw copy today. ${DEBT_ROW} owns it.`,
-  },
-  {
-    file: './components/jarvis/JarvisView.tsx',
-    text: 'const errorMessage = String(e instanceof Error ? e.message : e);',
-    verdict: 'deferred',
-    reason:
-      `A failed chat turn renders the Bun server's own turn-failure copy in the designed error bubble beside an \`errorDisplayForCode\` label, so this is the server's authored text rather than a Native store rejection — a different claim, and the one place a turn failure has to say something specific. ${DEBT_ROW} owns it.`,
-  },
-  {
-    file: './components/jarvis/ModelProfilesView.tsx',
-    text: 'setError(String(e));',
-    verdict: 'deferred',
-    reason:
-      `The model-profile list read still renders the Native string through ErrorState. ${DEBT_ROW} owns it.`,
-  },
-  {
-    file: './components/jarvis/ModelProfilesView.tsx',
-    text: "toastError(String(e), 'Activation failed');",
-    verdict: 'deferred',
-    reason:
-      `The activation write toast still carries the Native string under a fixed title. ${DEBT_ROW} owns it.`,
-  },
-  {
-    file: './components/jarvis/ModelProfilesView.tsx',
-    text: "toastError(String(e), 'Delete failed');",
-    verdict: 'deferred',
-    reason:
-      `The delete write toast still carries the Native string under a fixed title. ${DEBT_ROW} owns it.`,
-  },
-  {
-    file: './components/jarvis/ModelProfilesView.tsx',
-    text: "toastError(String(e), 'Create failed');",
-    verdict: 'deferred',
-    reason:
-      `The create write toast still carries the Native string under a fixed title. ${DEBT_ROW} owns it.`,
-  },
-  {
-    file: './components/jarvis/SettingsView.tsx',
-    text: 'setError(String(e));',
-    verdict: 'deferred',
-    reason:
-      `The settings read still renders the Native string, and a settings row is exactly where configuration values live. ${DEBT_ROW} owns it.`,
-  },
-  {
-    file: './components/jarvis/SettingsView.tsx',
-    text: 'toastError(String(e), `Failed to save ${key}`);',
-    verdict: 'deferred',
-    reason:
-      `The per-setting save toast still carries the Native string under a fixed title. ${DEBT_ROW} owns it.`,
-  },
-  {
-    file: './components/jarvis/SkillsView.tsx',
-    text: 'setRevError(String(e));',
-    verdict: 'deferred',
-    reason:
-      `The skill-revision read still renders the Native string; the list read in the same file is fixed by this row and this one is a different read. ${DEBT_ROW} owns it.`,
-  },
-  {
-    file: './components/jarvis/SkillsView.tsx',
-    text: "toastError(String(e), 'Restore failed');",
-    verdict: 'deferred',
-    reason:
-      `The revision-restore write toast still carries the Native string under a fixed title. ${DEBT_ROW} owns it.`,
+      'A chat turn that ends with a stable code is the Conductor’s own claim about the turn: the terminal SSE frame carries both a code and text explaining that code, so the text is authored product copy rather than a failing layer’s diagnostics, and it is the operator’s only diagnosis of why the turn stopped. It prints beside the code’s `errorDisplayForCode` label and actionable hint, and the check below proves this file routes the text through that classifier. A turn that fails with no code is a transport failure and prints `TURN_FAILED_COPY` instead, so no `authored` entry covers a `TypeError`, an HTTP body or a watchdog.',
   },
   {
     file: './components/jarvis/SystemHealthView.tsx',
@@ -128,19 +70,50 @@ const ALLOWLIST: ReadErrorEntry[] = [
   },
 ];
 
-const DEFERRED_EXPECTED = ALLOWLIST.filter((entry) => entry.verdict === 'deferred')
-  .map((entry) => `${entry.file}: ${entry.text}`);
+/**
+ * The debt this guard exists to shrink, written out rather than derived from the
+ * table above. Derived, it would be a tautology: deleting a row from `ALLOWLIST`
+ * would satisfy it. Written out, growing the debt is a deliberate edit to this
+ * list — which is the point.
+ */
+const EXPECTED_DEFERRED: string[] = [];
 
 describe('raw-error guard', () => {
-  it('finds every stringified rejection in the UI source, so the allowlist below cannot pass vacuously', () => {
+  it('still scans the whole tree, so the allowlist below cannot pass vacuously', () => {
     const sites = findReadErrorSites(sources);
     expect(sites.length).toBeGreaterThan(0);
-    // The anchor is a site that is still listed as debt, so the scan cannot pass
-    // by having stopped seeing the class it is meant to police.
+    // The anchors are sites that are still listed, so the scan cannot pass by
+    // having stopped seeing the class it is meant to police. They are the two
+    // unreachable modules rather than a fixed one: an anchor on a site this
+    // project fixes is an anchor that fails on success.
     expect(
-      sites.some((site) => site.file === './components/jarvis/ModelProfilesView.tsx' && site.text.includes('setError(String(e))')),
-      'the scan should still find a read-path stringification the allowlist lists as debt — if it cannot, the scan stopped seeing the class',
+      sites.some((site) => site.file === './components/jarvis/SystemHealthView.tsx' && site.text.includes('setError(String(e))')),
+      'the scan should still find a read-path stringification the allowlist lists — if it cannot, the scan stopped seeing the class',
     ).toBe(true);
+    expect(
+      sites.some((site) => site.file === './hooks/useResourceList.ts'),
+      'the scan should still reach the hooks directory',
+    ).toBe(true);
+  });
+
+  it('no longer finds a stringified rejection on the four surfaces this guard listed as debt', () => {
+    // The other half of the non-vacuity pair: an allowlist entry can be deleted by
+    // editing the table, so the scan itself has to be shown to have stopped
+    // reporting the fixed sites. `JarvisView.tsx` is the one file that keeps a
+    // site, and it keeps exactly one — the `authored` turn-failure copy — so a new
+    // leak there fails this rather than hiding behind the entry.
+    const expectedResidual: Record<string, string[]> = {
+      './components/jarvis/ModelProfilesView.tsx': [],
+      './components/jarvis/SettingsView.tsx': [],
+      './components/jarvis/SkillsView.tsx': [],
+      './components/jarvis/JarvisView.tsx': ['const errorMessage = errorCode ? String(e instanceof Error ? e.message : e) : TURN_FAILED_COPY;'],
+    };
+    for (const [file, expected] of Object.entries(expectedResidual)) {
+      expect(
+        findReadErrorSites({ [file]: sources[file] }).map((site) => site.text),
+        `${file} should report only the sites it still claims`,
+      ).toEqual(expected);
+    }
   });
 
   it('allows no stringified rejection that the allowlist does not account for', () => {
@@ -156,15 +129,15 @@ describe('raw-error guard', () => {
     ).toEqual([]);
   });
 
-  it('holds the debt still: every deferred site is listed, and no deferred site has been added quietly', () => {
+  it('holds the debt still: no site is listed as deferred, and none can be added quietly', () => {
     const sites = findReadErrorSites(sources);
     const { undocumented, unused } = matchReadErrorAllowlist(sites, ALLOWLIST);
     const deferred = ALLOWLIST.filter((entry) => entry.verdict === 'deferred');
     // An entry that claims a fixed site is an unused entry and fails above, so the
-    // only way the list below grows is a deliberate edit here — which is the point.
+    // only way the list below grows is a deliberate edit to it.
     expect(undocumented).toEqual([]);
     expect(unused).toEqual([]);
-    expect(deferred.map((entry) => `${entry.file}: ${entry.text}`)).toEqual(DEFERRED_EXPECTED);
+    expect(deferred.map((entry) => `${entry.file}: ${entry.text}`)).toEqual(EXPECTED_DEFERRED);
   });
 
   it('names the row that owns every deferred leak, because a debt with no owner is a promise', () => {
@@ -186,6 +159,26 @@ describe('raw-error guard', () => {
         importers,
         `${entry.file} is listed as unreachable but ${importers.join(', ')} mentions it — re-argue the entry as deferred instead of inheriting it`,
       ).toEqual([]);
+    }
+  });
+
+  it('proves every authored entry is classified, so "the server’s own claim" is a mechanism', () => {
+    const authored = ALLOWLIST.filter((item) => item.verdict === 'authored');
+    // A guard that lets a surface print a raw string by calling it authored, with
+    // nothing checked, is the leak renamed. So the claim must name a classifier and
+    // the file must actually call one of the identifiers it named.
+    expect(authored.length, 'an authored entry is a deliberate exception and must be listed').toBeGreaterThan(0);
+    for (const entry of authored) {
+      const named = [...entry.reason.matchAll(/`(\w+)`/g)].map((match) => match[1]);
+      expect(
+        named.length,
+        `${entry.file}: ${entry.text} must name the classifier that carries the failure's meaning, in backticks`,
+      ).toBeGreaterThan(0);
+      const called = named.filter((name) => sources[entry.file]?.includes(`${name}(`));
+      expect(
+        called,
+        `${entry.file} names ${named.join(', ')} as what classifies this text but calls none of it`,
+      ).not.toEqual([]);
     }
   });
 

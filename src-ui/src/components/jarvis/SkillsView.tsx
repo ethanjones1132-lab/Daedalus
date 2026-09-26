@@ -46,6 +46,15 @@ import {
   projectImprovementScore,
 } from '../../lib/skill-score-reading';
 
+// A rejection from the layer below is whatever that layer chose to say, and the
+// revision read and the restore write are two more of the reads and writes that
+// touch the operator's own stored skills. Each names what failed in one authored
+// sentence and withholds the reason, matching `ApprovalsView`, `CommitmentsView`,
+// `ChannelsView` and `MemoryView` and the list read in this same file.
+// `src-ui/src/read-error-guard.test.ts` keeps the class honest.
+const REVISIONS_READ_FAILED_COPY = 'Could not load skill revisions.';
+const RESTORE_FAILED_COPY = 'The skill was not restored to the earlier revision.';
+
 // ── Types ──────────────────────────────────────────────────────
 
 interface Skill {
@@ -292,8 +301,8 @@ function SkillDetail({
         limit: 50,
       });
       setRevisions(revs);
-    } catch (e) {
-      setRevError(String(e));
+    } catch {
+      setRevError(REVISIONS_READ_FAILED_COPY);
     } finally {
       setLoadingRevs(false);
     }
@@ -310,8 +319,8 @@ function SkillDetail({
         success(`Restored ${skill.name} to v${rev.version}`, 'Revision restored');
         await loadRevisions();
         onChanged();
-      } catch (e) {
-        toastError(String(e), 'Restore failed');
+      } catch {
+        toastError(RESTORE_FAILED_COPY, 'Restore failed');
       }
     },
     [skill.name, loadRevisions, onChanged, success, toastError],

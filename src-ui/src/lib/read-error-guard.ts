@@ -31,12 +31,21 @@ export interface ReadErrorSite {
  *   or it only decides control flow. There is nothing to fix here.
  * - `unreachable` — the module is imported by nothing but its own test, so the
  *   value reaches no operator at all until the module is retired.
- * - `deferred` — the value DOES still reach a surface. The entry names the
- *   Ready row that owns the fix. This is a debt, not a permission: the allowlist
- *   is closed, a new site is always undocumented, and an entry whose site was
- *   fixed becomes an unused entry, which fails the guard.
+ * - `authored` — the value is the *product's own* claim about what happened, not
+ *   a failing layer's diagnostics, and it is delivered beside a stable code that
+ *   classifies it. The one site that qualifies is a chat turn's terminal failure:
+ *   the Conductor authors the text to explain its own code, and the surface is
+ *   where that explanation belongs — withholding it would leave the operator no
+ *   diagnosis at all. The entry names the classifier that carries the actionable
+ *   meaning, and the guard machine-checks that the file really routes the text
+ *   through it. Anything a *transport* said — an HTTP body, a `TypeError`, a
+ *   watchdog — is not authored and has no such entry.
+ * - `deferred` — the value DOES still reach a surface and nobody has fixed it
+ *   yet. The entry names the Ready row that owns the fix. This is a debt, not a
+ *   permission: the allowlist is closed, a new site is always undocumented, and
+ *   an entry whose site was fixed becomes an unused entry, which fails the guard.
  */
-export type ReadErrorVerdict = 'withheld' | 'unreachable' | 'deferred';
+export type ReadErrorVerdict = 'withheld' | 'unreachable' | 'authored' | 'deferred';
 
 export interface ReadErrorEntry {
   file: string;

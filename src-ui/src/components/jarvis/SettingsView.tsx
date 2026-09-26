@@ -18,6 +18,17 @@ const KNOWN_SETTING_KEYS = new Set([
   'profiles', 'active_profile', 'api_sports_key', 'agents_root',
 ]);
 
+// A rejection from the layer below is whatever that layer chose to say, and this is
+// the surface where configuration values live — the repo says so itself: "a native
+// error string can embed store or session detail". So the read and the per-key save
+// each name what failed in one authored sentence and withhold the reason, matching
+// `ApprovalsView`, `CommitmentsView`, `ChannelsView` and `MemoryView`. The save
+// sentence also says the one thing that is true and useful: the operator's edit is
+// still on the row and still savable. `src-ui/src/read-error-guard.test.ts` keeps
+// the class honest.
+const SETTINGS_READ_FAILED_COPY = 'Could not load settings.';
+const SETTING_SAVE_FAILED_COPY = 'The setting was not saved. Your edit is kept — save the key again to retry.';
+
 export function SettingsView() {
   const [settings, setSettings] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
@@ -36,8 +47,8 @@ export function SettingsView() {
       setSettings(s);
       setEditing(s);
       setDirty(new Set());
-    } catch (e) {
-      setError(String(e));
+    } catch {
+      setError(SETTINGS_READ_FAILED_COPY);
     } finally {
       setLoading(false);
     }
@@ -65,8 +76,8 @@ export function SettingsView() {
       setSettings(prev => ({ ...prev, [key]: editing[key] }));
       setDirty(prev => { const n = new Set(prev); n.delete(key); return n; });
       success(`Saved ${key}`);
-    } catch (e) {
-      toastError(String(e), `Failed to save ${key}`);
+    } catch {
+      toastError(SETTING_SAVE_FAILED_COPY, `Failed to save ${key}`);
     } finally {
       setSaving(prev => { const n = new Set(prev); n.delete(key); return n; });
     }

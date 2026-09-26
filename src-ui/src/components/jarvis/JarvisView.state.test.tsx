@@ -133,7 +133,14 @@ describe('ChatPanel state machine', () => {
     fireEvent.change(composer, { target: { value: 'keep this message' } });
     fireEvent.keyDown(composer, { key: 'Enter' });
 
-    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('connection refused'));
+    // A refused connection is a transport failure, not a turn the Conductor
+    // explained, so the banner names it in the fixed sentence instead of printing
+    // the transport's own words. This assertion used to require `connection
+    // refused` to be rendered, which pinned that leak in place.
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('The turn failed.');
+    expect(alert).toHaveTextContent('kept as a draft');
+    expect(document.body.textContent ?? '').not.toContain('connection refused');
     expect(composer.value).toBe('keep this message');
   });
 

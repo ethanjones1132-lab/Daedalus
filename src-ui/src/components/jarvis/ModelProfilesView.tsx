@@ -48,6 +48,19 @@ const DEFAULT_FORM: NewProfileForm = {
   engine: 'native',
 };
 
+// A rejection from the layer below is whatever that layer chose to say, and these
+// are the reads and writes that touch the operator's own saved configurations —
+// a store path, a SQL state or a rejected argument value can all ride along in it.
+// Every surface here says what failed in one authored sentence and withholds the
+// reason, which is the rule `ApprovalsView`, `CommitmentsView`, `ChannelsView` and
+// `MemoryView` already follow. `src-ui/src/read-error-guard.test.ts` keeps the
+// class honest, so a new stringified rejection is a red test rather than a
+// convention nobody enforces.
+const PROFILES_READ_FAILED_COPY = 'Could not load model profiles.';
+const ACTIVATION_FAILED_COPY = 'The active profile was not changed.';
+const DELETE_FAILED_COPY = 'The profile was not deleted.';
+const CREATE_FAILED_COPY = 'The profile was not created.';
+
 export function ModelProfilesView() {
   const [profiles, setProfiles] = useState<ModelProfile[]>([]);
   const [loading, setLoading] = useState(true);
@@ -67,8 +80,8 @@ export function ModelProfilesView() {
     try {
       const list = await invoke<ModelProfile[]>('list_model_profiles');
       setProfiles(list);
-    } catch (e) {
-      setError(String(e));
+    } catch {
+      setError(PROFILES_READ_FAILED_COPY);
     } finally {
       setLoading(false);
     }
@@ -82,8 +95,8 @@ export function ModelProfilesView() {
       const effective = await invoke<{ provider: string; model: string }>('set_active_profile', { id: profile.id });
       success(`Activated "${profile.name}" · ${effective.provider}/${effective.model}`);
       await load();
-    } catch (e) {
-      toastError(String(e), 'Activation failed');
+    } catch {
+      toastError(ACTIVATION_FAILED_COPY, 'Activation failed');
       await load();
     }
   }, [load, success, toastError]);
@@ -98,8 +111,8 @@ export function ModelProfilesView() {
       await invoke('delete_profile', { id: profile.id });
       success(`Deleted "${profile.name}"`);
       await load();
-    } catch (e) {
-      toastError(String(e), 'Delete failed');
+    } catch {
+      toastError(DELETE_FAILED_COPY, 'Delete failed');
     }
   }, [pendingDelete, load, success, toastError]);
 
@@ -109,7 +122,7 @@ export function ModelProfilesView() {
     try {
       const models = await invoke<{ id: string; name: string; provider: string }[]>('jarvis_discover_models');
       setDiscovered(models.map((m) => `${m.provider}/${m.name}`));
-    } catch (e) {
+    } catch {
       setDiscovered([]);
     } finally {
       setDiscovering(false);
@@ -139,8 +152,8 @@ export function ModelProfilesView() {
       setForm(DEFAULT_FORM);
       setShowNew(false);
       await load();
-    } catch (e) {
-      toastError(String(e), 'Create failed');
+    } catch {
+      toastError(CREATE_FAILED_COPY, 'Create failed');
     } finally {
       setCreating(false);
     }

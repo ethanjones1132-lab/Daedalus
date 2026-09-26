@@ -651,7 +651,7 @@ function SessionsView() {
 
 function AppInner() {
   const { warn, error: toastError } = useToast();
-  const { theme, toggle: toggleTheme } = useTheme();
+  const { theme, toggle: toggleTheme, choice: themeChoice } = useTheme();
   const [currentView, setCurrentView] = useState<ViewId>(() => {
     try {
       const saved = localStorage.getItem('jarvis-current-view') as ViewId | null;
@@ -895,6 +895,23 @@ function AppInner() {
             <Label tone="muted">command surface</Label>
           </div>
           <div className="ml-auto flex items-center gap-5">
+            {/* What the toggle knows about the two durable reads, in one authored
+                sentence with the reason withheld. It sits on the control that made
+                the choice rather than in a toast, because a toast outlives its own
+                failure: a write that is still in flight says so, a write the store
+                refused says the choice is not stored, and a confirmed write says
+                nothing at all. `useTheme.ts` owns the words. */}
+            {themeChoice.message && (
+              <span
+                role="status"
+                className={cn(
+                  'max-w-[20rem] text-right text-xs leading-tight',
+                  themeChoice.status === 'saving' ? 'text-bone/60' : 'text-warning',
+                )}
+              >
+                {themeChoice.message}
+              </span>
+            )}
             <button
               type="button"
               onClick={toggleTheme}

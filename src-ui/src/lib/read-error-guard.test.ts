@@ -113,4 +113,26 @@ describe('matchReadErrorAllowlist', () => {
     expect(undocumented).toEqual([]);
     expect(unused).toEqual([]);
   });
+
+  it('treats an authored claim as a documented site, not as a leak, and still holds it to one entry', () => {
+    // `authored` is the verdict for the one value that reaches a surface on
+    // purpose: the product's own claim about a chat turn, delivered beside a
+    // stable code. It must satisfy the matcher exactly like any other entry, so
+    // naming it is a decision someone wrote down rather than a hole in the table.
+    const { undocumented, unused } = matchReadErrorAllowlist(sites, [
+      entry({ text: 'setError(String(e))', verdict: 'authored' }),
+      entry({ file: 'c/Toast.tsx', text: "toast.error('Delete failed'" }),
+      entry({ file: 'g/Joined.tsx', text: 'Append failed' }),
+    ]);
+    expect(undocumented).toEqual([]);
+    expect(unused).toEqual([]);
+    // Two sites on the same shape still need two entries, whatever the verdict.
+    const doubled = [...sites, { file: 'h/Second.tsx', text: 'catch (e) { setError(String(e)); }' }];
+    const second = matchReadErrorAllowlist(doubled, [
+      entry({ verdict: 'authored' }),
+      entry({ file: 'c/Toast.tsx', text: "toast.error('Delete failed'" }),
+      entry({ file: 'g/Joined.tsx', text: 'Append failed' }),
+    ]);
+    expect(second.undocumented.map((site) => site.file)).toEqual(['h/Second.tsx']);
+  });
 });

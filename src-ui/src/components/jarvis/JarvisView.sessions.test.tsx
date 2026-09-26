@@ -48,7 +48,13 @@ describe('Sessions resource states', () => {
       return [];
     });
     render(<JarvisView initialSubView="sessions" />);
-    expect(await screen.findByRole('alert')).toHaveTextContent('sqlite unavailable');
+    // The alert names the failure in one authored sentence and withholds the
+    // store's reason: a native error string can embed a store path. It used to
+    // assert `sqlite unavailable` was rendered, which pinned the leak in place.
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Could not load sessions.');
+    expect(alert).toHaveTextContent('Retry to read the Session list again.');
+    expect(document.body.textContent ?? '').not.toContain('sqlite unavailable');
     expect(screen.queryByText('No sessions yet')).not.toBeInTheDocument();
 
     const retry = deferred<unknown[]>();
@@ -74,8 +80,11 @@ describe('Sessions resource states', () => {
     expect(screen.getByRole('status')).toHaveTextContent('Refreshing sessions');
     expect(screen.getByText('Saved work', { selector: 'span' })).toBeInTheDocument();
     await act(async () => refresh.reject('native surface disconnected'));
+    // The staleness clause and the withheld reason, on the same terms as the
+    // empty-list failure above.
     expect(await screen.findByRole('alert')).toHaveTextContent('Showing previously loaded sessions');
-    expect(screen.getByRole('alert')).toHaveTextContent('native surface disconnected');
+    expect(screen.getByRole('alert')).toHaveTextContent('Could not load sessions.');
+    expect(document.body.textContent ?? '').not.toContain('native surface disconnected');
     expect(screen.getByText('Saved work', { selector: 'span' })).toBeInTheDocument();
   });
 
