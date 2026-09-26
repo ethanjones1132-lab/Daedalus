@@ -1,5 +1,13 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useReducer, useRef } from 'react';
 import { cn } from '../ui';
+import { projectLink } from '../../lib/link-scheme';
+import RefusedMarkdownLink from './RefusedMarkdownLink';
+import {
+  COPY_SUCCESS_TIMEOUT_MS,
+  initialCopyOutcome,
+  projectCopyOutcome,
+  reduceCopyOutcome,
+} from './copy-outcome';
 
 interface MarkdownRendererProps {
   content: string;
@@ -11,20 +19,48 @@ interface MarkdownRendererProps {
  * Handles basic formatting: bold, italic, code, code blocks, lists, and links.
  */
 export default function MarkdownRenderer({ content, className }: MarkdownRendererProps) {
-  const [copied, setCopied] = useState(false);
+  const [copyState, dispatchCopy] = useReducer(reduceCopyOutcome, undefined, initialCopyOutcome);
+  const copyAttempt = useRef(0);
+  const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copy = projectCopyOutcome(copyState);
+
+  const clearCopyTimer = useCallback(() => {
+    if (copyTimer.current === null) return;
+    clearTimeout(copyTimer.current);
+    copyTimer.current = null;
+  }, []);
+
+  // A claim is about the text that was on screen when the control was clicked,
+  // so a different `content` retires it and re-fences any write still in flight
+  // for the old text. The success timer is cleared on the way out, and on unmount.
+  useEffect(() => {
+    copyAttempt.current += 1;
+    dispatchCopy({ type: 'reset', attempt: copyAttempt.current });
+    return clearCopyTimer;
+  }, [content, clearCopyTimer]);
+
   const handleCopy = useCallback(async () => {
+    const attempt = ++copyAttempt.current;
+    clearCopyTimer();
+    dispatchCopy({ type: 'attempt', attempt });
     try {
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(content ?? '');
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1500);
+        dispatchCopy({ type: 'confirmed', attempt });
+        copyTimer.current = setTimeout(() => {
+          copyTimer.current = null;
+          dispatchCopy({ type: 'expired', attempt });
+        }, COPY_SUCCESS_TIMEOUT_MS);
       } else {
         throw new Error('clipboard unavailable');
       }
-    } catch {
-      setCopied(false);
+    } catch (e) {
+      // The caught value stays with a developer; the surface gets the fixed
+      // sentence from the shared projection, which cannot carry a reason.
+      console.error('Failed to copy:', e);
+      dispatchCopy({ type: 'failed', attempt });
     }
-  }, [content]);
+  }, [clearCopyTimer, content]);
   if (!content) return null;
 
   // Split content by code blocks first
@@ -66,15 +102,21 @@ export default function MarkdownRenderer({ content, className }: MarkdownRendere
   return (
     <div className={cn('markdown-content', className)}>
       <div className="flex items-center justify-between mb-2">
-        <button
-          type="button"
-          onClick={handleCopy}
-          aria-label={copied ? 'Copied' : 'Copy to clipboard'}
-          className="text-xs px-2 py-0.5 rounded bg-ink/60 text-bone/90 hover:bg-ink/80 transition-colors"
-        >
-          {copied ? 'Copied' : 'Copy'}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={handleCopy}
+            aria-label={copy.copied ? 'Copied' : 'Copy to clipboard'}
+            className="text-xs px-2 py-0.5 rounded bg-ink/60 text-bone/90 hover:bg-ink/80 transition-colors"
+          >
+            {copy.copied ? 'Copied' : 'Copy'}
+          </button>
+          {copy.message && (
+            <span role="alert" className="text-[10px] leading-tight text-red-300">{copy.message}</span>
+          )}
+        </div>
       </div>
+
       {segments.map((segment, idx) =>
         segment.type === 'code' ? (
           <pre
@@ -313,11 +355,18 @@ function processInlineStyles(text: string): React.ReactNode {
           </em>
         );
         break;
-      case 'link':
+      case 'link': {
+        const link = projectLink(match.groups[1]);
+        if (!link.allowed) {
+          parts.push(
+            <RefusedMarkdownLink key={key++} text={match.groups[0]} address={link.address} />
+          );
+          break;
+        }
         parts.push(
           <a
             key={key++}
-            href={match.groups[1]}
+            href={link.href}
             target="_blank"
             rel="noopener noreferrer"
             className="text-cyan-neon hover:text-cyan-glow underline underline-offset-2"
@@ -326,6 +375,7 @@ function processInlineStyles(text: string): React.ReactNode {
           </a>
         );
         break;
+      }
     }
 
     currentPos = match.index + match.length;

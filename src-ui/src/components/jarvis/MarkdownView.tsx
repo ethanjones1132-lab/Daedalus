@@ -1,9 +1,11 @@
 import { isValidElement, memo, useState, useCallback, useEffect, useMemo, useRef } from 'react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { defaultUrlTransform, type UrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { Check, Copy } from 'lucide-react';
 import { cn } from '../ui';
+import { projectLink } from '../../lib/link-scheme';
+import RefusedMarkdownLink from './RefusedMarkdownLink';
 
 interface MarkdownViewProps {
   content: string;
@@ -60,6 +62,18 @@ function textFromNode(node: React.ReactNode): string {
   return '';
 }
 
+/**
+ * Hand an `href` to this app's own decision rather than the library's, and leave
+ * every other url attribute (`img src`, and whatever `html-url-attributes` lists
+ * next) on the library's transform exactly as it was.
+ *
+ * The reason is that `defaultUrlTransform` answers a refused scheme with `''`, and
+ * a component override cannot tell an empty address from a refused one: both
+ * arrive as `href=""`, focusable, and looking exactly like a working link.
+ */
+const markdownUrlTransform: UrlTransform = (url, key) =>
+  key === 'href' ? url : defaultUrlTransform(url);
+
 const markdownComponents = {
   // Render `code` inside `pre` with a copy button + language chip. Inline
   // code (no language, single line) gets a lighter treatment.
@@ -94,9 +108,13 @@ const markdownComponents = {
   },
   a(props: React.ComponentPropsWithoutRef<'a'>) {
     const { href, children } = props;
+    const link = projectLink(href);
+    if (!link.allowed) {
+      return <RefusedMarkdownLink text={textFromNode(children)} address={link.address} />;
+    }
     return (
       <a
-        href={href}
+        href={link.href}
         target="_blank"
         rel="noopener noreferrer"
         className="text-cyan-glow underline underline-offset-2 hover:text-cyan-neon transition-colors"
@@ -202,6 +220,7 @@ function MarkdownView({ content, className }: MarkdownViewProps) {
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
+        urlTransform={markdownUrlTransform}
         components={markdownComponents}
       >
         {processed}

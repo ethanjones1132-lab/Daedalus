@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useLayoutEffect, memo } from 'react';
+import { useState, useEffect, useReducer, useRef, useCallback, useLayoutEffect, memo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
@@ -20,6 +20,12 @@ import {
   type SessionDraftStore,
 } from './session-draft-state';
 import MarkdownView from './MarkdownView';
+import {
+  COPY_SUCCESS_TIMEOUT_MS,
+  initialCopyOutcome,
+  projectCopyOutcome,
+  reduceCopyOutcome,
+} from './copy-outcome';
 import SessionRunsView from './SessionRunsView';
 import WorkspaceGrantsChip from './WorkspaceGrantsChip';
 import SystemStatusBar from './SystemStatusBar';
@@ -2770,17 +2776,42 @@ function ChatMessage({
   // `tool_call` SSE frame. Pure defense-in-depth — the server should never
   // send this — so keep the detector conservative (chat-state.ts).
   const isToolEcho = !isUser && !isTool && isToolCallEchoOnly(displayContent);
-  const [copied, setCopied] = useState(false);
+  const [copyState, dispatchCopy] = useReducer(reduceCopyOutcome, undefined, initialCopyOutcome);
+  const copyAttempt = useRef(0);
+  const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copy = projectCopyOutcome(copyState);
+
+  const clearCopyTimer = useCallback(() => {
+    if (copyTimer.current === null) return;
+    clearTimeout(copyTimer.current);
+    copyTimer.current = null;
+  }, []);
+
+  // The claim is about the text this bubble showed when it was clicked, so a
+  // different `displayContent` retires it and re-fences a write still in flight.
+  useEffect(() => {
+    copyAttempt.current += 1;
+    dispatchCopy({ type: 'reset', attempt: copyAttempt.current });
+    return clearCopyTimer;
+  }, [clearCopyTimer, displayContent]);
 
   const handleCopy = useCallback(async () => {
+    const attempt = ++copyAttempt.current;
+    clearCopyTimer();
+    dispatchCopy({ type: 'attempt', attempt });
     try {
       await navigator.clipboard.writeText(displayContent);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      dispatchCopy({ type: 'confirmed', attempt });
+      copyTimer.current = setTimeout(() => {
+        copyTimer.current = null;
+        dispatchCopy({ type: 'expired', attempt });
+      }, COPY_SUCCESS_TIMEOUT_MS);
     } catch (e) {
+      // Kept for a developer; the bubble announces the fixed sentence instead.
       console.error('Failed to copy:', e);
+      dispatchCopy({ type: 'failed', attempt });
     }
-  }, [displayContent]);
+  }, [clearCopyTimer, displayContent]);
 
   const isErrorBubble = !isUser && !isTool && (message.isError || message.terminalOutcome === 'failed');
   const isPartialBubble = !isUser && !isTool && message.terminalOutcome === 'partial';
@@ -2870,13 +2901,20 @@ function ChatMessage({
           </span>
         )}
         {!message.isStreaming && !isUser && (
-          <button
-            onClick={handleCopy}
-            aria-label={`Copy message ${index + 1}`}
-            className="ml-auto text-bone-faint hover:text-cyan-glow transition-colors p-1 rounded border border-iron/20 hover:border-cyan-neon/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
-          >
-            {copied ? <Check size={10} /> : <Copy size={10} />}
-          </button>
+          <div className="ml-auto flex items-center gap-1.5">
+            <button
+              onClick={handleCopy}
+              aria-label={`Copy message ${index + 1}`}
+              className="text-bone-faint hover:text-cyan-glow transition-colors p-1 rounded border border-iron/20 hover:border-cyan-neon/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50"
+            >
+              {copy.copied ? <Check size={10} /> : <Copy size={10} />}
+            </button>
+            {copy.message && (
+              <span role="alert" className="text-[10px] leading-tight text-red-300 max-w-[16rem] text-right">
+                {copy.message}
+              </span>
+            )}
+          </div>
         )}
       </div>
       <div className={cn(
