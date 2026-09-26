@@ -3,6 +3,8 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { projectDevicePresence } from './device-presence';
+import RecordIdBadge from './RecordIdBadge';
+import { createFailureSentence, decideCreateReadback, type CreateFailure } from './create-readback';
 import { reconcileRemovals, removalLocked, type RemovalOperation } from './removal-state';
 import {
   cn,
@@ -39,7 +41,7 @@ export default function DevicesView() {
   const [type, setType] = useState(DEVICE_TYPES[0]);
   const [pendingDelete, setPendingDelete] = useState<Device | null>(null);
   const [creating, setCreating] = useState(false);
-  const [createError, setCreateError] = useState(false);
+  const [createFailure, setCreateFailure] = useState<CreateFailure | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [operations, setOperations] = useState<Record<string, RemovalOperation<Device>>>({});
   const createPending = useRef(false);
@@ -52,20 +54,24 @@ export default function DevicesView() {
     setOperations(next);
   }, []);
 
-  const fetchDevices = useCallback(async (opts?: { removalRead?: boolean }) => {
+  // Returns the confirmed store contents, or null when this read observed
+  // nothing (it failed, or a newer read superseded it). Callers that must
+  // confirm a write treat null as "not observed", never as "not stored".
+  const fetchDevices = useCallback(async (opts?: { removalRead?: boolean }): Promise<Device[] | null> => {
     const request = ++requestId.current;
     reading.current = true;
     setLoading(true);
     setError(null);
     try {
       const snapshot = await invoke<Device[]>('get_devices');
-      if (request !== requestId.current) return;
+      if (request !== requestId.current) return null;
       const result = reconcileRemovals(snapshot, operationsRef.current, request);
       publishOperations(result.operations);
       setDevices(result.rows);
       setLoaded(true);
+      return snapshot;
     } catch (e) {
-      if (request !== requestId.current) return;
+      if (request !== requestId.current) return null;
       const next = { ...operationsRef.current };
       let removalFailure = false;
       for (const [id, operation] of Object.entries(next)) {
@@ -76,6 +82,7 @@ export default function DevicesView() {
       }
       publishOperations(next);
       if (!opts?.removalRead || !removalFailure) setError(String(e));
+      return null;
     } finally {
       if (request === requestId.current) {
         reading.current = false;
@@ -97,14 +104,20 @@ export default function DevicesView() {
     if (createPending.current || !name.trim()) return;
     createPending.current = true;
     setCreating(true);
-    setCreateError(false);
+    setCreateFailure(null);
     try {
-      await invoke<Device>('add_device', { name: name.trim(), deviceType: type });
-      success(`Added device ${name}`);
+      const returned = await invoke<Device>('add_device', { name: name.trim(), deviceType: type });
+      // The write's own return value is not a confirmation. Only a later read
+      // that contains the record under the id Native assigned can confirm it.
+      const verdict = decideCreateReadback<Device>(returned, await fetchDevices());
+      if (verdict.status !== 'confirmed') {
+        setCreateFailure(verdict.status);
+        return;
+      }
+      success(`Added device ${verdict.row.name}`);
       setName('');
-      await fetchDevices();
     } catch {
-      setCreateError(true);
+      setCreateFailure('write-failed');
     } finally {
       createPending.current = false;
       setCreating(false);
@@ -165,10 +178,18 @@ export default function DevicesView() {
       />
       <SectionHeader title="Devices" subtitle="Paired devices and their status" count={devices.length} />
 
-      {createError && (
+      {createFailure && (
         <div role="alert" className="text-sm text-red-200">
-          Could not add the device. Your draft was kept.{' '}
-          <button type="button" onClick={add} disabled={creating || !name.trim()} className="underline disabled:opacity-40">Retry</button>
+          {createFailureSentence('device', createFailure)}{' '}
+          <button
+            type="button"
+            aria-label="Retry adding the device"
+            onClick={add}
+            disabled={creating || !name.trim()}
+            className="underline disabled:opacity-40"
+          >
+            Retry
+          </button>
         </div>
       )}
 
@@ -263,6 +284,7 @@ export default function DevicesView() {
                             stamped {formatStamp(presence.lastSeenAt)} · {presence.lastSeenAge} ago
                           </div>
                         )}
+                        <RecordIdBadge id={d.id} label="device" />
                       </GlassCard>
                     </li>
                   );

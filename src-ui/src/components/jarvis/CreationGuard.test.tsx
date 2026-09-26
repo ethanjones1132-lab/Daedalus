@@ -31,16 +31,49 @@ async function renderIdle(ui: React.ReactNode) {
 }
 
 describe.each([
-  { View: HooksView, list: 'get_hooks', create: 'register_hook', field: 'Hook name', button: 'Register', success: 'Registered hook example' },
-  { View: NodesView, list: 'get_nodes', create: 'add_node', field: 'Node name', button: 'Add', success: 'Added node example' },
-  { View: DevicesView, list: 'get_devices', create: 'add_device', field: 'Device name', button: 'Add', success: 'Added device example' },
-])('$create refresh boundary', ({ View, list, create, field, button, success }) => {
-  it('keeps creation successful when list refresh fails and retries only the list', async () => {
+  {
+    View: HooksView,
+    list: 'get_hooks',
+    create: 'register_hook',
+    field: 'Hook name',
+    button: 'Register',
+    success: 'Registered hook example',
+    retry: 'Retry registering the hook',
+    stored: { id: 'created-1', name: 'example', event: 'session.start', script: '', enabled: true, created_at: '' },
+  },
+  {
+    View: NodesView,
+    list: 'get_nodes',
+    create: 'add_node',
+    field: 'Node name',
+    button: 'Add',
+    success: 'Added node example',
+    retry: 'Retry adding the node',
+    stored: { id: 'created-1', name: 'example', address: 'localhost:7000', status: 'unknown', latency_ms: null, last_ping: '', capabilities: [] },
+  },
+  {
+    View: DevicesView,
+    list: 'get_devices',
+    create: 'add_device',
+    field: 'Device name',
+    button: 'Add',
+    success: 'Added device example',
+    retry: 'Retry adding the device',
+    stored: { id: 'created-1', name: 'example', device_type: 'desktop', status: 'online', last_seen: '' },
+  },
+])('$create read-back boundary', ({ View, list, create, field, button, success, retry, stored }) => {
+  it('does not report a create it could not read back, and the list retry reloads the list only', async () => {
     const creation = deferred<unknown>();
-    const refresh = deferred<unknown>();
+    const confirming = deferred<unknown>();
+    const reload = deferred<unknown>();
     let listCalls = 0;
     invokeMock.mockImplementation((command: string) => {
-      if (command === list) return ++listCalls === 2 ? refresh.promise : Promise.resolve([]);
+      if (command === list) {
+        listCalls += 1;
+        if (listCalls === 1) return Promise.resolve([]);
+        if (listCalls === 2) return confirming.promise;
+        return reload.promise;
+      }
       if (command === create) return creation.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
@@ -51,28 +84,39 @@ describe.each([
     if (address) fireEvent.change(address, { target: { value: 'localhost:7000' } });
     fireEvent.click(screen.getByRole('button', { name: button }));
     expect(screen.queryByText(success)).not.toBeInTheDocument();
-    await act(async () => { creation.resolve({ id: 'created' }); });
-    expect(screen.getByText(success)).toBeInTheDocument();
-    expect(name).toHaveValue('');
+
+    // The write resolves, but the confirming read is still in flight.
+    await act(async () => { creation.resolve(stored); });
+    expect(screen.queryByText(success)).not.toBeInTheDocument();
     expect(name).toBeDisabled();
-    await act(async () => { refresh.reject(new Error('List refresh unavailable')); });
-    expect(screen.getByText(success)).toBeInTheDocument();
-    expect(screen.queryByText(/Could not (add|register) the/)).not.toBeInTheDocument();
+
+    // A failed confirming read is a list failure and an unconfirmed create, not a success.
+    await act(async () => { confirming.reject(new Error('List refresh unavailable')); });
+    expect(screen.queryByText(success)).not.toBeInTheDocument();
     expect(screen.getByText('Error: List refresh unavailable')).toBeInTheDocument();
+    const unconfirmed = screen.getAllByRole('alert').filter(node => /draft was kept/.test(node.textContent ?? ''));
+    expect(unconfirmed).toHaveLength(1);
+    expect(name).toHaveValue('example');
     expect(name).toBeEnabled();
-    fireEvent.change(name, { target: { value: 'next draft' } });
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry' })); });
+
+    // The list Retry reloads the list and never repeats the create.
+    const listRetries = screen.getAllByRole('button', { name: 'Retry' });
+    expect(listRetries).toHaveLength(1);
+    expect(screen.getByRole('button', { name: retry })).toBeInTheDocument();
+    fireEvent.click(listRetries[0]);
     expect(invokeMock.mock.calls.filter(([c]) => c === create)).toHaveLength(1);
-    expect(listCalls).toBe(3);
-    expect(name).toHaveValue('next draft');
+    await act(async () => { reload.resolve([stored]); });
+    expect(screen.getByTestId('record-id')).toHaveTextContent('created-1');
+    expect(name).toHaveValue('example');
   });
 });
 
 describe('HooksView creation guard', () => {
   it('invokes register_hook exactly once across click and Enter repetition while pending', async () => {
     const first = deferred<unknown>();
+    const store: unknown[] = [];
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_hooks') return Promise.resolve([]);
+      if (command === 'get_hooks') return Promise.resolve([...store]);
       if (command === 'register_hook') return first.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
@@ -97,7 +141,11 @@ describe('HooksView creation guard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Registering…' }));
     expect(invokeMock.mock.calls.filter(([c]) => c === 'register_hook')).toHaveLength(1);
 
-    await act(async () => { first.resolve({ id: 'h1', name: 'on-start', event: 'session.start', script: '', enabled: true, created_at: '' }); });
+    const created = { id: 'h1', name: 'on-start', event: 'session.start', script: '', enabled: true, created_at: '' };
+    await act(async () => {
+      store.push(created);
+      first.resolve(created);
+    });
     expect(screen.getByPlaceholderText('Hook name')).toHaveValue('');
     expect(screen.getByPlaceholderText('Hook name')).toBeEnabled();
     expect(screen.getByRole('button', { name: 'Register' })).toBeDisabled();
@@ -106,8 +154,9 @@ describe('HooksView creation guard', () => {
   it('retains the draft after a rejected register with retryable feedback and no native error detail', async () => {
     const first = deferred<unknown>();
     const retry = deferred<unknown>();
+    const store: unknown[] = [];
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_hooks') return Promise.resolve([]);
+      if (command === 'get_hooks') return Promise.resolve([...store]);
       if (command === 'register_hook') return first.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
@@ -127,17 +176,21 @@ describe('HooksView creation guard', () => {
     expect(screen.getByPlaceholderText('Hook name')).toBeEnabled();
 
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_hooks') return Promise.resolve([]);
+      if (command === 'get_hooks') return Promise.resolve([...store]);
       if (command === 'register_hook') return retry.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Retry registering the hook' }));
     expect(invokeMock.mock.calls.filter(([c]) => c === 'register_hook')).toHaveLength(2);
     expect(invokeMock.mock.calls.filter(([c]) => c === 'register_hook')[1]).toEqual([
       'register_hook',
       { name: 'on-start', event: 'session.start', script: 'run.sh' },
     ]);
-    await act(async () => { retry.resolve({ id: 'h1' }); });
+    const created = { id: 'h1', name: 'on-start', event: 'session.start', script: 'run.sh', enabled: true, created_at: '' };
+    await act(async () => {
+      store.push(created);
+      retry.resolve(created);
+    });
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.getByPlaceholderText('Hook name')).toHaveValue('');
   });
@@ -146,8 +199,9 @@ describe('HooksView creation guard', () => {
 describe('NodesView creation guard', () => {
   it('invokes add_node exactly once across click and Enter repetition while pending', async () => {
     const first = deferred<unknown>();
+    const store: unknown[] = [];
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_nodes') return Promise.resolve([]);
+      if (command === 'get_nodes') return Promise.resolve([...store]);
       if (command === 'add_node') return first.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
@@ -170,7 +224,11 @@ describe('NodesView creation guard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Adding…' }));
     expect(invokeMock.mock.calls.filter(([c]) => c === 'add_node')).toHaveLength(1);
 
-    await act(async () => { first.resolve({ id: 'n1' }); });
+    const created = { id: 'n1', name: 'edge-1', address: '10.0.0.5:7000', status: 'unknown', latency_ms: null, last_ping: '', capabilities: [] };
+    await act(async () => {
+      store.push(created);
+      first.resolve(created);
+    });
     expect(screen.getByPlaceholderText('Node name')).toHaveValue('');
     expect(screen.getByPlaceholderText('Address (host:port)')).toHaveValue('');
   });
@@ -178,8 +236,9 @@ describe('NodesView creation guard', () => {
   it('retains the draft after a rejected add with retryable feedback', async () => {
     const first = deferred<unknown>();
     const retry = deferred<unknown>();
+    const store: unknown[] = [];
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_nodes') return Promise.resolve([]);
+      if (command === 'get_nodes') return Promise.resolve([...store]);
       if (command === 'add_node') return first.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
@@ -196,12 +255,16 @@ describe('NodesView creation guard', () => {
     expect(screen.getByPlaceholderText('Address (host:port)')).toHaveValue('10.0.0.5:7000');
 
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_nodes') return Promise.resolve([]);
+      if (command === 'get_nodes') return Promise.resolve([...store]);
       if (command === 'add_node') return retry.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
-    await act(async () => { retry.resolve({ id: 'n1' }); });
+    fireEvent.click(screen.getByRole('button', { name: 'Retry adding the node' }));
+    const created = { id: 'n1', name: 'edge-1', address: '10.0.0.5:7000', status: 'unknown', latency_ms: null, last_ping: '', capabilities: [] };
+    await act(async () => {
+      store.push(created);
+      retry.resolve(created);
+    });
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.getByPlaceholderText('Node name')).toHaveValue('');
   });
@@ -210,8 +273,9 @@ describe('NodesView creation guard', () => {
 describe('DevicesView creation guard', () => {
   it('invokes add_device exactly once across click and Enter repetition while pending', async () => {
     const first = deferred<unknown>();
+    const store: unknown[] = [];
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_devices') return Promise.resolve([]);
+      if (command === 'get_devices') return Promise.resolve([...store]);
       if (command === 'add_device') return first.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
@@ -233,15 +297,20 @@ describe('DevicesView creation guard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Adding…' }));
     expect(invokeMock.mock.calls.filter(([c]) => c === 'add_device')).toHaveLength(1);
 
-    await act(async () => { first.resolve({ id: 'd1' }); });
+    const created = { id: 'd1', name: 'studio-mac', device_type: 'desktop', status: 'online', last_seen: '' };
+    await act(async () => {
+      store.push(created);
+      first.resolve(created);
+    });
     expect(screen.getByPlaceholderText('Device name')).toHaveValue('');
   });
 
   it('retains the draft after a rejected add with retryable feedback', async () => {
     const first = deferred<unknown>();
     const retry = deferred<unknown>();
+    const store: unknown[] = [];
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_devices') return Promise.resolve([]);
+      if (command === 'get_devices') return Promise.resolve([...store]);
       if (command === 'add_device') return first.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
@@ -256,12 +325,16 @@ describe('DevicesView creation guard', () => {
     expect(screen.getByPlaceholderText('Device name')).toHaveValue('studio-mac');
 
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_devices') return Promise.resolve([]);
+      if (command === 'get_devices') return Promise.resolve([...store]);
       if (command === 'add_device') return retry.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
-    await act(async () => { retry.resolve({ id: 'd1' }); });
+    fireEvent.click(screen.getByRole('button', { name: 'Retry adding the device' }));
+    const created = { id: 'd1', name: 'studio-mac', device_type: 'desktop', status: 'online', last_seen: '' };
+    await act(async () => {
+      store.push(created);
+      retry.resolve(created);
+    });
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.getByPlaceholderText('Device name')).toHaveValue('');
   });

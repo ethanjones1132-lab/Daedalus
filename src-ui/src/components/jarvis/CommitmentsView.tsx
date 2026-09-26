@@ -3,6 +3,8 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { commitmentLocked, reconcileCommitments, type CommitmentOperation } from './commitment-state';
+import RecordIdBadge from './RecordIdBadge';
+import { createFailureSentence, decideCreateReadback, type CreateFailure } from './create-readback';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   cn,
@@ -41,7 +43,7 @@ export default function CommitmentsView() {
   const [text, setText] = useState('');
   const [due, setDue] = useState('');
   const [creating, setCreating] = useState(false);
-  const [createError, setCreateError] = useState(false);
+  const [createFailure, setCreateFailure] = useState<CreateFailure | null>(null);
   const createPending = useRef(false);
   const [filter, setFilter] = useState<Filter>('open');
   const { success } = useToast();
@@ -55,20 +57,24 @@ export default function CommitmentsView() {
     setOperations(next);
   }, []);
 
-  const fetchCommitments = useCallback(async () => {
+  // Returns the confirmed store contents, or null when this read observed
+  // nothing (it failed, or a newer read superseded it). Callers that must
+  // confirm a write treat null as "not observed", never as "not stored".
+  const fetchCommitments = useCallback(async (): Promise<Commitment[] | null> => {
     const request = ++requestId.current;
     reading.current = true;
     setLoading(true);
     try {
       const snapshot = await invoke<Commitment[]>('get_commitments');
-      if (request !== requestId.current) return;
+      if (request !== requestId.current) return null;
       const result = reconcileCommitments(snapshot, operationsRef.current, request);
       publishOperations(result.operations);
       setCommitments(result.rows);
       setLoaded(true);
       setError(null);
+      return snapshot;
     } catch {
-      if (request !== requestId.current) return;
+      if (request !== requestId.current) return null;
       const next = { ...operationsRef.current };
       let rowFailure = false;
       for (const [id, operation] of Object.entries(next)) {
@@ -79,6 +85,7 @@ export default function CommitmentsView() {
       }
       publishOperations(next);
       if (!rowFailure) setError('Could not refresh commitments. Retry reloads the list only.');
+      return null;
     } finally {
       if (request === requestId.current) {
         reading.current = false;
@@ -100,18 +107,24 @@ export default function CommitmentsView() {
     if (createPending.current || !text.trim()) return;
     createPending.current = true;
     setCreating(true);
+    setCreateFailure(null);
     try {
-      await invoke<Commitment>('add_commitment', {
+      const returned = await invoke<Commitment>('add_commitment', {
         text: text.trim(),
         due: due ? new Date(due).toISOString() : null,
       });
+      // The write's own return value is not a confirmation. Only a later read
+      // that contains the record under the id Native assigned can confirm it.
+      const verdict = decideCreateReadback<Commitment>(returned, await fetchCommitments());
+      if (verdict.status !== 'confirmed') {
+        setCreateFailure(verdict.status);
+        return;
+      }
       success('Commitment added');
-      setCreateError(false);
       setText('');
       setDue('');
-      await fetchCommitments();
     } catch {
-      setCreateError(true);
+      setCreateFailure('write-failed');
     } finally {
       createPending.current = false;
       setCreating(false);
@@ -162,10 +175,18 @@ export default function CommitmentsView() {
         }
       />
 
-      {createError && (
+      {createFailure && (
         <div role="alert" className="text-sm text-red-200">
-          Could not add the commitment. Your draft was kept.{' '}
-          <button type="button" onClick={add} disabled={creating || !text.trim()} className="underline disabled:opacity-40">Retry</button>
+          {createFailureSentence('commitment', createFailure)}{' '}
+          <button
+            type="button"
+            aria-label="Retry adding the commitment"
+            onClick={add}
+            disabled={creating || !text.trim()}
+            className="underline disabled:opacity-40"
+          >
+            Retry
+          </button>
         </div>
       )}
 
@@ -250,6 +271,7 @@ export default function CommitmentsView() {
                       </div>
                     </div>
                     <div className="mt-1 text-[10px] font-mono text-bone/30">{formatDue(c.due)}</div>
+                    <RecordIdBadge id={c.id} label="commitment" />
                     {operation?.phase === 'writing' && (
                       <div role="status">{operation.action === 'complete' ? 'Completing…' : 'Deleting…'}</div>
                     )}

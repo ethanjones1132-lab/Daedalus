@@ -2,6 +2,8 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import RecordIdBadge from './RecordIdBadge';
+import { createFailureSentence, decideCreateReadback, type CreateFailure } from './create-readback';
 import { reconcileRemovals, removalLocked, type RemovalOperation } from './removal-state';
 import {
   cn,
@@ -45,7 +47,7 @@ export default function HooksView() {
   const [script, setScript] = useState('');
   const [pendingDelete, setPendingDelete] = useState<Hook | null>(null);
   const [creating, setCreating] = useState(false);
-  const [createError, setCreateError] = useState(false);
+  const [createFailure, setCreateFailure] = useState<CreateFailure | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [operations, setOperations] = useState<Record<string, RemovalOperation<Hook>>>({});
   const createPending = useRef(false);
@@ -58,20 +60,24 @@ export default function HooksView() {
     setOperations(next);
   }, []);
 
-  const fetchHooks = useCallback(async (opts?: { removalRead?: boolean }) => {
+  // Returns the confirmed store contents, or null when this read observed
+  // nothing (it failed, or a newer read superseded it). Callers that must
+  // confirm a write treat null as "not observed", never as "not stored".
+  const fetchHooks = useCallback(async (opts?: { removalRead?: boolean }): Promise<Hook[] | null> => {
     const request = ++requestId.current;
     reading.current = true;
     setLoading(true);
     setError(null);
     try {
       const snapshot = await invoke<Hook[]>('get_hooks');
-      if (request !== requestId.current) return;
+      if (request !== requestId.current) return null;
       const result = reconcileRemovals(snapshot, operationsRef.current, request);
       publishOperations(result.operations);
       setHooks(result.rows);
       setLoaded(true);
+      return snapshot;
     } catch (e) {
-      if (request !== requestId.current) return;
+      if (request !== requestId.current) return null;
       const next = { ...operationsRef.current };
       let removalFailure = false;
       for (const [id, operation] of Object.entries(next)) {
@@ -82,6 +88,7 @@ export default function HooksView() {
       }
       publishOperations(next);
       if (!opts?.removalRead || !removalFailure) setError(String(e));
+      return null;
     } finally {
       if (request === requestId.current) {
         reading.current = false;
@@ -103,19 +110,25 @@ export default function HooksView() {
     if (createPending.current || !name.trim()) return;
     createPending.current = true;
     setCreating(true);
-    setCreateError(false);
+    setCreateFailure(null);
     try {
-      await invoke<Hook>('register_hook', {
+      const returned = await invoke<Hook>('register_hook', {
         name: name.trim(),
         event,
         script: script.trim() || null,
       });
-      success(`Registered hook ${name}`);
+      // The write's own return value is not a confirmation. Only a later read
+      // that contains the record under the id Native assigned can confirm it.
+      const verdict = decideCreateReadback<Hook>(returned, await fetchHooks());
+      if (verdict.status !== 'confirmed') {
+        setCreateFailure(verdict.status);
+        return;
+      }
+      success(`Registered hook ${verdict.row.name}`);
       setName('');
       setScript('');
-      await fetchHooks();
     } catch {
-      setCreateError(true);
+      setCreateFailure('write-failed');
     } finally {
       createPending.current = false;
       setCreating(false);
@@ -177,10 +190,18 @@ export default function HooksView() {
       <SectionHeader title="Hooks" subtitle="Event-driven automation hooks" count={hooks.length} />
 
       <GlassCard className="p-3 space-y-2">
-        {createError && (
+        {createFailure && (
           <div role="alert" className="text-sm text-red-200">
-            Could not register the hook. Your draft was kept.{' '}
-            <button type="button" onClick={register} disabled={creating || !name.trim()} className="underline disabled:opacity-40">Retry</button>
+            {createFailureSentence('hook', createFailure)}{' '}
+            <button
+              type="button"
+              aria-label="Retry registering the hook"
+              onClick={register}
+              disabled={creating || !name.trim()}
+              className="underline disabled:opacity-40"
+            >
+              Retry
+            </button>
           </div>
         )}
         <div className="flex gap-2">
@@ -275,6 +296,7 @@ export default function HooksView() {
                             {h.script}
                           </pre>
                         )}
+                        <RecordIdBadge id={h.id} label="hook" />
                       </GlassCard>
                     </li>
                   );

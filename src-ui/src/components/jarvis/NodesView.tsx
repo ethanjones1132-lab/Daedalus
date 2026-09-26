@@ -2,6 +2,8 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import RecordIdBadge from './RecordIdBadge';
+import { createFailureSentence, decideCreateReadback, type CreateFailure } from './create-readback';
 import { reconcileRemovals, removalLocked, type RemovalOperation } from './removal-state';
 import {
   cn,
@@ -34,7 +36,7 @@ export default function NodesView() {
   const [address, setAddress] = useState('');
   const [pendingDelete, setPendingDelete] = useState<Node | null>(null);
   const [creating, setCreating] = useState(false);
-  const [createError, setCreateError] = useState(false);
+  const [createFailure, setCreateFailure] = useState<CreateFailure | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [operations, setOperations] = useState<Record<string, RemovalOperation<Node>>>({});
   const createPending = useRef(false);
@@ -47,20 +49,24 @@ export default function NodesView() {
     setOperations(next);
   }, []);
 
-  const fetchNodes = useCallback(async (opts?: { removalRead?: boolean }) => {
+  // Returns the confirmed store contents, or null when this read observed
+  // nothing (it failed, or a newer read superseded it). Callers that must
+  // confirm a write treat null as "not observed", never as "not stored".
+  const fetchNodes = useCallback(async (opts?: { removalRead?: boolean }): Promise<Node[] | null> => {
     const request = ++requestId.current;
     reading.current = true;
     setLoading(true);
     setError(null);
     try {
       const snapshot = await invoke<Node[]>('get_nodes');
-      if (request !== requestId.current) return;
+      if (request !== requestId.current) return null;
       const result = reconcileRemovals(snapshot, operationsRef.current, request);
       publishOperations(result.operations);
       setNodes(result.rows);
       setLoaded(true);
+      return snapshot;
     } catch (e) {
-      if (request !== requestId.current) return;
+      if (request !== requestId.current) return null;
       const next = { ...operationsRef.current };
       let removalFailure = false;
       for (const [id, operation] of Object.entries(next)) {
@@ -71,6 +77,7 @@ export default function NodesView() {
       }
       publishOperations(next);
       if (!opts?.removalRead || !removalFailure) setError(String(e));
+      return null;
     } finally {
       if (request === requestId.current) {
         reading.current = false;
@@ -92,15 +99,21 @@ export default function NodesView() {
     if (createPending.current || !name.trim() || !address.trim()) return;
     createPending.current = true;
     setCreating(true);
-    setCreateError(false);
+    setCreateFailure(null);
     try {
-      await invoke<Node>('add_node', { name: name.trim(), address: address.trim() });
-      success(`Added node ${name}`);
+      const returned = await invoke<Node>('add_node', { name: name.trim(), address: address.trim() });
+      // The write's own return value is not a confirmation. Only a later read
+      // that contains the record under the id Native assigned can confirm it.
+      const verdict = decideCreateReadback<Node>(returned, await fetchNodes());
+      if (verdict.status !== 'confirmed') {
+        setCreateFailure(verdict.status);
+        return;
+      }
+      success(`Added node ${verdict.row.name}`);
       setName('');
       setAddress('');
-      await fetchNodes();
     } catch {
-      setCreateError(true);
+      setCreateFailure('write-failed');
     } finally {
       createPending.current = false;
       setCreating(false);
@@ -168,10 +181,18 @@ export default function NodesView() {
       />
       <SectionHeader title="Nodes" subtitle="Distributed compute nodes" count={nodes.length} />
 
-      {createError && (
+      {createFailure && (
         <div role="alert" className="text-sm text-red-200">
-          Could not add the node. Your draft was kept.{' '}
-          <button type="button" onClick={add} disabled={creating || !name.trim() || !address.trim()} className="underline disabled:opacity-40">Retry</button>
+          {createFailureSentence('node', createFailure)}{' '}
+          <button
+            type="button"
+            aria-label="Retry adding the node"
+            onClick={add}
+            disabled={creating || !name.trim() || !address.trim()}
+            className="underline disabled:opacity-40"
+          >
+            Retry
+          </button>
         </div>
       )}
 
@@ -264,6 +285,7 @@ export default function NodesView() {
                             </span>
                           ))}
                         </div>
+                        <RecordIdBadge id={n.id} label="node" />
                       </GlassCard>
                     </li>
                   );
