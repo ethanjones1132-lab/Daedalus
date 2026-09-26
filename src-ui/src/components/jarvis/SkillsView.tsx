@@ -33,6 +33,13 @@ import {
   type SkillCandidateAction,
   type SkillCandidateMutation,
 } from './skill-candidate-operation-state';
+import {
+  candidatePerformanceView,
+  initialCandidatePerformanceState,
+  reduceCandidatePerformance,
+  type CandidatePerformanceResponse,
+  type CandidatePerformanceState,
+} from './skill-candidate-performance';
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -84,15 +91,6 @@ interface SkillCandidateDetail {
   promoted_at?: string;
   created_at: string;
   updated_at: string;
-}
-
-interface CandidatePerformance {
-  id: string;
-  promoted_at: string;
-  task_types: string[];
-  before: { runs: number; successes: number; success_rate: number | null };
-  after: { runs: number; successes: number; success_rate: number | null };
-  delta: number | null;
 }
 
 type Filter = 'all' | 'enabled' | 'disabled' | 'candidates';
@@ -191,6 +189,29 @@ async function postSkillCandidateAction(
   }
 }
 
+/**
+ * Read one promoted candidate's performance-since-promotion window. A rejected
+ * request, a status the route uses to refuse the read, and an undecodable body
+ * are each reported as themselves so `skill-candidate-performance` can name
+ * what it could not learn; no transport or server text is carried, and the
+ * `status` is normalised because a synthetic or partial response may not carry
+ * one at all.
+ */
+async function readCandidatePerformance(candidateId: string): Promise<CandidatePerformanceResponse> {
+  let res: Response;
+  try {
+    res = await fetch(`${BUN_URL}/skills/candidates/${encodeURIComponent(candidateId)}/performance`);
+  } catch {
+    return { kind: 'transport' };
+  }
+  const status = typeof res.status === 'number' ? res.status : 0;
+  try {
+    return { kind: 'http', status, value: await res.json() };
+  } catch {
+    return { kind: 'body' };
+  }
+}
+
 // ── Detail panel ───────────────────────────────────────────────
 
 function SkillDetail({
@@ -222,20 +243,34 @@ function SkillDetail({
   const [revisions, setRevisions] = useState<SkillRevision[] | null>(null);
   const [loadingRevs, setLoadingRevs] = useState(false);
   const [revError, setRevError] = useState<string | null>(null);
-  const [performance, setPerformance] = useState<CandidatePerformance | null>(null);
   const { success, error: toastError } = useToast();
   const distilled = isDistilledSkill(skill);
   const candidateActionLocked = skillCandidateMutationLocked(candidateMutation);
 
-  useEffect(() => {
-    setPerformance(null);
-    if (candidateDetail?.status === 'promoted') {
-      fetch(`${BUN_URL}/skills/candidates/${encodeURIComponent(candidateDetail.id)}/performance`)
-        .then((r) => (r.ok ? r.json() : null))
-        .then((data) => setPerformance(data))
-        .catch(() => setPerformance(null));
+  const performanceCandidateId = candidateDetail?.status === 'promoted' ? candidateDetail.id : null;
+  const [performanceState, setPerformanceState] = useState<CandidatePerformanceState>(initialCandidatePerformanceState);
+  const performanceRequestId = useRef(0);
+  const performancePending = useRef(false);
+  const readPerformance = useCallback(async (retry: boolean) => {
+    if (retry && performancePending.current) return;
+    const requestId = ++performanceRequestId.current;
+    performancePending.current = true;
+    if (!performanceCandidateId) {
+      setPerformanceState((prev) => reduceCandidatePerformance(prev, { type: 'invalidate', requestId }));
+      performancePending.current = false;
+      return;
     }
-  }, [candidateDetail?.id, candidateDetail?.status]);
+    setPerformanceState((prev) => reduceCandidatePerformance(prev, { type: 'start', requestId }));
+    const response = await readCandidatePerformance(performanceCandidateId);
+    setPerformanceState((prev) => reduceCandidatePerformance(prev, { type: 'settle', requestId, response }));
+    if (requestId === performanceRequestId.current) performancePending.current = false;
+  }, [performanceCandidateId]);
+
+  useEffect(() => {
+    void readPerformance(false);
+  }, [readPerformance]);
+
+  const performanceView = candidatePerformanceView(performanceState);
 
   const loadRevisions = useCallback(async () => {
     setLoadingRevs(true);
@@ -457,20 +492,47 @@ function SkillDetail({
               <span>runs {candidateDetail.source_run_ids.join(', ')}</span>
             )}
           </div>
-          {performance && (
-            <div className="pt-1.5 mt-1.5 border-t border-white/10 flex items-center gap-2 flex-wrap">
-              <span className="text-bone/50">Since promotion</span>
-              <span className="text-bone/70">
-                {performance.before.success_rate !== null ? `${(performance.before.success_rate * 100).toFixed(0)}%` : '—'}
-                {' → '}
-                {performance.after.success_rate !== null ? `${(performance.after.success_rate * 100).toFixed(0)}%` : '—'}
-              </span>
-              {performance.delta !== null && (
-                <Pill variant={performance.delta >= 0 ? 'success' : 'error'}>
-                  {performance.delta >= 0 ? '+' : ''}
-                  {(performance.delta * 100).toFixed(0)}%
-                </Pill>
+          {candidateDetail.status === 'promoted' && performanceView && (
+            <div
+              role="group"
+              aria-label="Skill performance since promotion"
+              className="pt-1.5 mt-1.5 border-t border-white/10 space-y-1"
+            >
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-bone/50">Since promotion</span>
+                {performanceView.measured && (
+                  <>
+                    <span className="text-bone/70">
+                      {performanceView.measured.before.rate}
+                      {' → '}
+                      {performanceView.measured.after.rate}
+                    </span>
+                    {performanceView.measured.delta ? (
+                      <Pill variant={performanceView.measured.delta.positive ? 'success' : 'error'}>
+                        {performanceView.measured.delta.text}
+                      </Pill>
+                    ) : (
+                      <span className="text-bone/50">delta —</span>
+                    )}
+                  </>
+                )}
+              </div>
+              {performanceView.measured && <p className="text-bone/40">{performanceView.measured.text}</p>}
+              {performanceView.kind === 'pending' && <p role="status" className="text-bone/50">{performanceView.text}</p>}
+              {performanceView.failureText && (
+                <div role="alert" className="text-amber-200">
+                  {performanceView.failureText}{' '}
+                  <button
+                    type="button"
+                    disabled={performanceView.kind === 'pending'}
+                    onClick={() => void readPerformance(true)}
+                    className="underline disabled:opacity-40"
+                  >
+                    Retry
+                  </button>
+                </div>
               )}
+              {performanceView.kind === 'unmeasured' && <p className="text-bone/50">{performanceView.text}</p>}
             </div>
           )}
         </GlassCard>
