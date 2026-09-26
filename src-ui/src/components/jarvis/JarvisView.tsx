@@ -20,6 +20,15 @@ import {
   type SessionDraftStore,
 } from './session-draft-state';
 import MarkdownView from './MarkdownView';
+import { TranscriptWindowNotice } from './TranscriptWindowNotice';
+import {
+  TRANSCRIPT_WINDOW,
+  anchoredScrollTop,
+  extendWindow,
+  transcriptWindow,
+  windowSlice,
+  windowStart,
+} from '../../lib/transcript-window';
 import {
   COPY_SUCCESS_TIMEOUT_MS,
   initialCopyOutcome,
@@ -747,6 +756,31 @@ export function ChatPanel({
   const [historyError, setHistoryError] = useState(false);
   const [historyRetry, setHistoryRetry] = useState(0);
 
+  // A Session read is unbounded — `get_session_history` takes no paging argument
+  // — so the transcript shows a window over the newest messages and states the
+  // bound rather than implying the rows it drew are the whole conversation. The
+  // withheld run is reachable on demand, and the window resets with the Session
+  // so a reach sized for one conversation cannot withhold from the next.
+  const [windowVisible, setWindowVisible] = useState(TRANSCRIPT_WINDOW);
+  // Where the reader was before a press inserted earlier messages above them, so
+  // the same message stays under the eye instead of jumping down by their height.
+  const scrollAnchorRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
+  const windowState = transcriptWindow(messages.length, windowVisible);
+  const extendTranscript = useCallback(() => {
+    setWindowVisible(visible => extendWindow(visible, messages.length));
+    const el = scrollContainerRef.current;
+    scrollAnchorRef.current = el ? { scrollHeight: el.scrollHeight, scrollTop: el.scrollTop } : null;
+  }, [messages.length]);
+  // Applies the anchor after the extended window has rendered. The transcript's
+  // own scroll-to-end is untouched and still owns the pinned-to-bottom case.
+  useLayoutEffect(() => {
+    const before = scrollAnchorRef.current;
+    const el = scrollContainerRef.current;
+    if (!before || !el) return;
+    scrollAnchorRef.current = null;
+    el.scrollTop = anchoredScrollTop(before, el.scrollHeight);
+  }, [windowVisible, messages.length]);
+
   // Scroll-aware autoscroll (Phase 2.5). When the user scrolls up we pause
   // automatic anchoring so the chat isn't yanked away mid-read. A floating
   // "jump to latest" button re-engages the anchor.
@@ -1104,6 +1138,9 @@ export function ChatPanel({
   useEffect(() => {
     const prev = prevActiveSessionRef.current;
     setHistoryError(false);
+    // The window is per-Session reach: a conversation the operator widened must
+    // not narrow the next one, so it starts at the bound with every read.
+    setWindowVisible(TRANSCRIPT_WINDOW);
     if (suppressHistoryLoadRef.current && suppressHistoryLoadRef.current === activeSession) {
       // Freshly created by handleSend: preserve its optimistic turn and make
       // this Session the new comparison baseline without invalidating the send.
@@ -2418,15 +2455,28 @@ export function ChatPanel({
 
         {messages.length === 0 && !loadingHistory && !historyError && <EmptyState message="No messages yet" />}
 
-        {messages.map((msg, i) => (
-          <ChatMessage
-            key={msg.id ?? i}
-            message={msg}
-            index={i}
-            prefersReducedMotion={prefersReducedMotion.current}
-            streamStatus={msg.isStreaming && !msg.content.trim() && !showSkeleton ? streamStatusText : undefined}
-          />
-        ))}
+        {/* The bound, stated where the withheld run is: above the oldest message
+            on screen, and absent entirely when nothing is withheld. */}
+        <TranscriptWindowNotice window={windowState} onExtend={extendTranscript} />
+
+        {(() => {
+          // Absolute, not slice-relative: `index` is what the per-message copy
+          // control has always numbered itself by, and that number is the
+          // message's place in the conversation rather than in the window.
+          const start = windowStart(messages.length, windowVisible);
+          return windowSlice(messages, windowVisible).map((msg, i) => {
+            const position = start + i;
+            return (
+            <ChatMessage
+              key={msg.id ?? position}
+              message={msg}
+              index={position}
+              prefersReducedMotion={prefersReducedMotion.current}
+              streamStatus={msg.isStreaming && !msg.content.trim() && !showSkeleton ? streamStatusText : undefined}
+            />
+            );
+          });
+        })()}
 
         {/* First-token skeleton (Phase 2.5) — shimmer placeholder for the
             assistant bubble before any token has landed. */}

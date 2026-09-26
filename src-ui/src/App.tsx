@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { useCallback, useEffect, useId, useMemo, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { initialSessionListState, reduceSessionListState } from './session-list-state';
 import { createReadGuard, type ReadIdentity } from './lib/read-identity';
 import { decodeContextUsage } from './lib/context-usage';
@@ -38,6 +38,16 @@ import {
 import { usePolling } from './hooks/usePolling';
 import { useTheme } from './hooks/useTheme';
 import MarkdownRenderer from './components/jarvis/MarkdownRenderer';
+import { TranscriptWindowNotice } from './components/jarvis/TranscriptWindowNotice';
+import {
+  TRANSCRIPT_WINDOW,
+  anchoredScrollTop,
+  extendWindow,
+  transcriptCountLabel,
+  transcriptWindow,
+  windowSlice,
+  windowStart,
+} from './lib/transcript-window';
 import type { BackendSession, NavSection, SessionMessage, ViewId } from './types';
 import type { CompanionRarity, CompanionSpecies, CompanionState } from './components/jarvis/types';
 import JarvisView from './components/jarvis/JarvisView';
@@ -465,6 +475,26 @@ export function ChatFeedsView() {
   const [historyFailed, setHistoryFailed] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  // A Session read is unbounded — `get_session_history` takes no paging argument
+  // — so the feed shows a window over the newest messages, states the bound, and
+  // keeps the withheld run reachable. The window is per-Session reach, so it
+  // starts at the bound with every selection.
+  const [windowVisible, setWindowVisible] = useState(TRANSCRIPT_WINDOW);
+  const transcriptRef = useRef<HTMLDivElement>(null);
+  const scrollAnchorRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
+  const windowState = transcriptWindow(history?.length ?? 0, windowVisible);
+  const extendTranscript = useCallback(() => {
+    setWindowVisible(visible => extendWindow(visible, history?.length ?? 0));
+    const el = transcriptRef.current;
+    scrollAnchorRef.current = el ? { scrollHeight: el.scrollHeight, scrollTop: el.scrollTop } : null;
+  }, [history]);
+  useLayoutEffect(() => {
+    const before = scrollAnchorRef.current;
+    const el = transcriptRef.current;
+    if (!before || !el) return;
+    scrollAnchorRef.current = null;
+    el.scrollTop = anchoredScrollTop(before, el.scrollHeight);
+  }, [windowVisible, history]);
   // The transcript read is started by a selection, not by the poll, so it owns
   // its own identity: a superseded read must not publish one Session's
   // transcript under another Session's header, nor end the newer read's
@@ -492,6 +522,7 @@ export function ChatFeedsView() {
   const loadHistory = useCallback(async (sessionId: string) => {
     const request = historyRead.issue();
     setSelectedId(sessionId);
+    setWindowVisible(TRANSCRIPT_WINDOW);
     setHistoryLoading(true);
     setHistoryFailed(false);
     setHistory(null);
@@ -560,9 +591,15 @@ export function ChatFeedsView() {
           : historyFailed ? <div role="alert" className="flex h-full items-center justify-center"><div className="text-center"><p className="text-bone-dim text-sm font-mono">Could not load this session&apos;s transcript.</p><button type="button" onClick={() => void loadHistory(selectedId)} className="btn-ghost text-xs mt-2">Retry transcript</button></div></div>
           : history ? (
             <GlassCard className="h-full flex flex-col">
-              <div className="pb-3 border-b border-iron/30 mb-3 shrink-0"><div className="flex items-center gap-2 mb-1"><StatusDot ok={!selectedSession?.archived} warn={selectedSession?.archived} /><span className="text-sm font-semibold text-bone">{selectedSession?.title || selectedSession?.agent_id || 'Session'}</span><Pill variant="info">{history.length} msgs</Pill></div><div className="text-[11px] font-mono text-bone-faint truncate">{selectedId}</div></div>
-              <div className="flex-1 overflow-y-auto space-y-3 pr-1">
-                {history.map((msg, index) => {
+              <div className="pb-3 border-b border-iron/30 mb-3 shrink-0"><div className="flex items-center gap-2 mb-1"><StatusDot ok={!selectedSession?.archived} warn={selectedSession?.archived} /><span className="text-sm font-semibold text-bone">{selectedSession?.title || selectedSession?.agent_id || 'Session'}</span><Pill variant="info">{transcriptCountLabel(windowState)}</Pill></div><div className="text-[11px] font-mono text-bone-faint truncate">{selectedId}</div></div>
+              <div ref={transcriptRef} className="flex-1 overflow-y-auto space-y-3 pr-1">
+                {/* The bound, stated above the oldest message on screen, and absent
+                    entirely when nothing is withheld. */}
+                <TranscriptWindowNotice window={windowState} onExtend={extendTranscript} />
+                {(() => {
+                  const start = windowStart(history.length, windowVisible);
+                  return windowSlice(history, windowVisible).map((msg, i) => {
+                  const index = start + i;
                   const isUser = msg.role === 'user';
                   const isTool = msg.role === 'tool' || msg.content.startsWith('[tool:') || msg.content.startsWith('[result:');
                   return (
@@ -571,7 +608,8 @@ export function ChatFeedsView() {
                       <div className={cn('text-xs leading-relaxed', isUser ? 'text-bone' : isTool ? 'text-bone-dim' : 'text-bone-muted')}><MarkdownRenderer content={msg.content.length > 2000 ? `${msg.content.slice(0, 2000)}\n\n... (truncated)` : msg.content} /></div>
                     </motion.div>
                   );
-                })}
+                  });
+                })()}
                 {history.length === 0 && <EmptyState message="No messages in this session" />}
                 <div ref={messagesEndRef} />
               </div>
