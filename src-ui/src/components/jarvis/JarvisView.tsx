@@ -477,8 +477,8 @@ export default function JarvisView({ initialSubView = 'chat', initialControlTab,
                 activeSession={activeSession}
                 setActiveSession={setActiveSession}
                 config={config}
-                backendLabel={config?.active_backend === 'openrouter' ? 'OpenRouter' : (config?.active_backend === 'claude_cli' ? 'Claude CLI' : 'Ollama')}
-                modelLabel={config ? (config.active_backend === 'ollama' ? config.ollama.model : (config.active_backend === 'claude_cli' ? (config.claude_cli.model ?? '') : config.openrouter.model)) : ''}
+                backendLabel={config?.active_backend === 'openrouter' ? 'OpenRouter' : config?.active_backend === 'llama_cpp' ? 'Gemma 4 · llama.cpp' : (config?.active_backend === 'claude_cli' ? 'Claude CLI' : 'Ollama')}
+                modelLabel={config ? (config.active_backend === 'ollama' ? config.ollama.model : config.active_backend === 'llama_cpp' ? config.llama_cpp.model : (config.active_backend === 'claude_cli' ? (config.claude_cli.model ?? '') : config.openrouter.model)) : ''}
                 onSessionCreated={loadSessions}
                 onRunRecordSettled={setRunRecord}
               />
@@ -3726,7 +3726,7 @@ function ConfigPanel({ config, setConfig, loading, loadError, onRetry }: {
         {/* Backend Selection */}
         <GlassCard hoverable={false}>
           <h3 className="text-sm font-semibold text-bone mb-3">Backend</h3>
-          <div className="flex gap-2">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
             <button
               onClick={() => updateField('active_backend', 'ollama')}
               className={cn(
@@ -3739,6 +3739,19 @@ function ConfigPanel({ config, setConfig, loading, loadError, onRetry }: {
             >
               <div className="font-semibold">Ollama</div>
               <div className="text-[10px] text-bone-faint mt-0.5">Local models</div>
+            </button>
+            <button
+              onClick={() => updateField('active_backend', 'llama_cpp')}
+              className={cn(
+                'flex-1 px-4 py-3 rounded-xl border text-sm font-mono transition-all text-center',
+                'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-neon/50',
+                localConfig.active_backend === 'llama_cpp'
+                  ? 'bg-cyan-neon/15 border-cyan-neon/40 text-cyan-glow'
+                  : 'bg-obsidian/40 border-iron/30 text-bone-dim hover:border-iron/50'
+              )}
+            >
+              <div className="font-semibold">Gemma 4 · llama.cpp</div>
+              <div className="text-[10px] font-mono text-bone-faint mt-0.5">Local · 26B-A4B</div>
             </button>
             <button
               onClick={() => updateField('active_backend', 'openrouter')}
@@ -3858,6 +3871,32 @@ function ConfigPanel({ config, setConfig, loading, loadError, onRetry }: {
                 placeholder="Enter custom model ID"
                 className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors"
               />
+            </div>
+          ) : localConfig.active_backend === 'llama_cpp' ? (
+            <div className="space-y-2">
+              <input
+                type="text"
+                value={localConfig.llama_cpp?.model ?? ''}
+                onChange={(e) => updateField('llama_cpp', { ...localConfig.llama_cpp, model: e.target.value })}
+                placeholder="Gemma llama.cpp model alias"
+                className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors"
+              />
+              {([
+                ['server_path', 'llama-server executable path (or JARVIS_LLAMA_SERVER_PATH)'],
+                ['model_path', 'GGUF model file path (or JARVIS_LLAMA_MODEL_PATH)'],
+                ['mtp_path', 'Optional MTP draft head path (or JARVIS_LLAMA_MTP_PATH)'],
+              ] as const).map(([field, placeholder]) => (
+                <input
+                  key={field}
+                  type="text"
+                  aria-label={`llama.cpp ${field}`}
+                  value={localConfig.llama_cpp?.[field] ?? ''}
+                  onChange={(e) => updateField('llama_cpp', { ...localConfig.llama_cpp, [field]: e.target.value })}
+                  placeholder={placeholder}
+                  className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors"
+                />
+              ))}
+              <div className="text-[10px] font-mono text-bone-faint">Server: {localConfig.llama_cpp?.base_url ?? 'http://127.0.0.1:8080/v1'} · context {localConfig.llama_cpp?.context_window ?? 16384} · reasoning budget {localConfig.llama_cpp?.reasoning_budget ?? 1536}</div>
             </div>
           ) : (
             <input

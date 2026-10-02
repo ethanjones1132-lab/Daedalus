@@ -51,8 +51,9 @@ function serviceLabel(label: string, state: ServiceState, stale: boolean): strin
   return `${label} ${suffix}${stale ? ' (stale)' : ''}`;
 }
 
-function serviceAnnouncement(key: TelemetryServiceKey, state: ServiceState, stale: boolean, requirement: ServiceRequirement): string {
-  return `${SERVICE_NAMES[key]} ${STATE_WORDS[state]}${REQUIREMENT_WORDS[requirement]}.${stale ? ' This is a previously observed state.' : ''}`;
+function serviceAnnouncement(key: TelemetryServiceKey, state: ServiceState, stale: boolean, requirement: ServiceRequirement, backend: string): string {
+  const name = key === 'ollama' && backend === 'llama_cpp' ? 'Gemma llama.cpp server' : SERVICE_NAMES[key];
+  return `${name} ${STATE_WORDS[state]}${REQUIREMENT_WORDS[requirement]}.${stale ? ' This is a previously observed state.' : ''}`;
 }
 
 function percentLabel(label: string, value: number | null, stale: boolean): string {
@@ -168,8 +169,8 @@ export default function SystemStatusBar({ activeBackend = null }: SystemStatusBa
         />
         <span className="text-bone/60">{overallLabel(view.overall)}</span>
         {(Object.keys(CHIP_LABELS) as TelemetryServiceKey[]).map(key => (
-          <span key={key} className={cn('px-1.5 py-0.5 rounded', chipClass(key))} aria-label={serviceAnnouncement(key, view.health.services[key], healthStale, view.health.requirements[key])}>
-            {serviceLabel(CHIP_LABELS[key], view.health.services[key], healthStale)}{REQUIREMENT_MARKS[view.health.requirements[key]]}
+          <span key={key} className={cn('px-1.5 py-0.5 rounded', chipClass(key))} aria-label={serviceAnnouncement(key, view.health.services[key], healthStale, view.health.requirements[key], view.health.backend)}>
+            {serviceLabel(key === 'ollama' && view.health.backend === 'llama_cpp' ? 'GEM' : CHIP_LABELS[key], view.health.services[key], healthStale)}{REQUIREMENT_MARKS[view.health.requirements[key]]}
           </span>
         ))}
         <span className={cn('px-1.5 py-0.5 rounded', view.health.memoryPercent === null ? 'bg-amber-500/15 text-amber-300' : view.health.memoryPercent >= 90 ? 'bg-red-500/15 text-red-300' : view.health.memoryPercent >= 80 ? 'bg-amber-500/15 text-amber-300' : 'bg-emerald-500/15 text-emerald-300')}>
@@ -188,7 +189,7 @@ export default function SystemStatusBar({ activeBackend = null }: SystemStatusBa
         )}
         {view.health.bunGiveUp && <Pill variant="error" className="text-[9px]">BUN GIVE-UP</Pill>}
         {view.health.proxyGiveUp && <Pill variant="error" className="text-[9px]">PRX GIVE-UP</Pill>}
-        {view.health.ollamaGiveUp && <Pill variant="error" className="text-[9px]">OLL GIVE-UP</Pill>}
+        {view.health.ollamaGiveUp && <Pill variant="error" className="text-[9px]">{view.health.backend === 'llama_cpp' ? 'GEM' : 'OLL'} GIVE-UP</Pill>}
         {view.loading && (
           <span role="status" aria-label="System telemetry">
             {refreshing ? 'Refreshing system telemetry…' : 'Checking system telemetry…'}

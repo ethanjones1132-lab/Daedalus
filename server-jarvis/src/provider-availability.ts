@@ -57,6 +57,8 @@ export function configuredInferenceFacts(cfg: JarvisConfig): { backend: BackendT
   switch (cfg.active_backend) {
     case "ollama":
       return { backend: "ollama", selectedModel: cfg.ollama.model };
+    case "llama_cpp":
+      return { backend: "llama_cpp", selectedModel: cfg.llama_cpp.model };
     case "claude_cli":
       return { backend: "claude_cli", selectedModel: cfg.claude_cli.model ?? "" };
     case "openrouter":

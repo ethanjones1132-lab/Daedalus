@@ -125,13 +125,13 @@ describe('an unprobed service is never presented as measured', () => {
 });
 
 describe('an unconfirmed backend is never guessed', () => {
-  it.each([undefined, null, '', 'llama_cpp', 42])(
+  it.each([undefined, null, '', 'vllm', 42])(
     'leaves every backend-dependent requirement unknown for %s',
     (activeBackend) => {
       const subsystems = projectHealthSubsystems({ ...stockOpenRouter, active_backend: activeBackend as never });
 
       expect(subsystems.backend).toBe('unknown');
-      for (const key of ['ollama', 'model', 'openrouter_key', 'claude_proxy'] as const) {
+      for (const key of ['ollama', 'llama_cpp', 'model', 'openrouter_key', 'claude_proxy'] as const) {
         expect(row(subsystems, key).requirement).toBe('unknown');
       }
       expect(row(subsystems, 'bun').requirement).toBe('required');
@@ -188,6 +188,7 @@ describe('every row carries text for the state it claims', () => {
       'Bun server',
       'Bridge',
       'Ollama',
+      'Gemma llama.cpp server',
       'Local model',
       'OpenRouter key',
       'Claude proxy',
@@ -216,7 +217,7 @@ describe('recovery is announced as text', () => {
     const subsystems = projectHealthSubsystems(stockOpenRouter);
 
     expect(recoverAnnouncement(subsystems)).toBe(
-      'Health recovered: all services required by the active inference backend (openrouter) are running. Not required by this backend: Ollama, Local model and Claude proxy.',
+      'Health recovered: all services required by the active inference backend (openrouter) are running. Not required by this backend: Ollama, Gemma llama.cpp server, Local model and Claude proxy.',
     );
   });
 
@@ -229,13 +230,29 @@ describe('recovery is announced as text', () => {
     });
 
     expect(recoverAnnouncement(subsystems)).toBe(
-      'Health recovered: all services required by the active inference backend (ollama) are running. Not required by this backend: OpenRouter key and Claude proxy.',
+      'Health recovered: all services required by the active inference backend (ollama) are running. Not required by this backend: Gemma llama.cpp server, OpenRouter key and Claude proxy.',
+    );
+  });
+
+  it('names the rows the llama.cpp backend does not need and requires its server and model', () => {
+    const subsystems = projectHealthSubsystems({
+      ...stockOpenRouter,
+      active_backend: 'llama_cpp',
+      llama_cpp_running: true,
+      model_available: true,
+    });
+
+    expect(row(subsystems, 'llama_cpp')).toMatchObject({ state: 'up', requirement: 'required' });
+    expect(row(subsystems, 'model').requirement).toBe('required');
+    expect(row(subsystems, 'ollama').requirement).toBe('not_required');
+    expect(recoverAnnouncement(subsystems)).toBe(
+      'Health recovered: all services required by the active inference backend (llama_cpp) are running. Not required by this backend: Ollama, OpenRouter key and Claude proxy.',
     );
   });
 
   it('announces nothing when the active inference backend is not confirmed', () => {
     // An unconfirmed required set cannot certify recovery, so the strip must
     // never speak a recovery sentence it cannot support.
-    expect(recoverAnnouncement(projectHealthSubsystems({ ...stockOpenRouter, active_backend: 'llama_cpp' }))).toBe('');
+    expect(recoverAnnouncement(projectHealthSubsystems({ ...stockOpenRouter, active_backend: 'vllm' as never }))).toBe('');
   });
 });

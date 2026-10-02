@@ -19,7 +19,7 @@ import {
 
 // ── Types ──
 
-export type BackendType = 'ollama' | 'openrouter' | 'claude_cli';
+export type BackendType = 'ollama' | 'openrouter' | 'llama_cpp' | 'claude_cli';
 
 export type SurfaceType = 'chat' | 'tool' | 'cron' | 'agent' | 'compaction';
 
@@ -84,6 +84,25 @@ export interface OpenRouterConfig {
   max_retries: number;
   /** Request timeout in milliseconds */
   timeout_ms: number;
+}
+
+export interface LlamaCppConfig {
+  base_url: string;
+  model: string;
+  /**
+   * Machine-specific llama.cpp artifacts. Blank in source; set per install in
+   * Settings, or via JARVIS_LLAMA_SERVER_PATH / JARVIS_LLAMA_MODEL_PATH /
+   * JARVIS_LLAMA_MTP_PATH, which the native shell reads when a field is blank.
+   * The native shell launches llama-server from these; the Bun server only
+   * talks to `base_url`.
+   */
+  server_path: string;
+  model_path: string;
+  /** Optional MTP draft head; blank starts llama-server without MTP. */
+  mtp_path: string;
+  port: number;
+  context_window: number;
+  reasoning_budget: number;
 }
 
 /**
@@ -216,13 +235,13 @@ export interface CompanionConfig {
 
 /**
  * Local persistent Conductor (Phase 1) — Fugu-style coordinator that runs as a
- * warm Ollama process with per-session message/KV state instead of a cold API
+ * warm local inference process with per-session message/KV state instead of a cold API
  * call each turn.
  */
 export type ConductorOutputMode = "tool_call" | "json_schema" | "prompt";
 
 export interface ConductorConfig {
-  /** When true, coordinator routing uses the local Ollama conductor model. */
+  /** When true, coordinator routing uses the configured resident local model. */
   enabled: boolean;
   /**
    * Rung 2 in-turn executor driver (mid-loop supervision on native +
@@ -232,11 +251,11 @@ export interface ConductorConfig {
   in_turn_driver: {
     enabled: boolean;
   };
-  /** Primary local conductor model (Gemma 4 E2B recommended). */
+  /** Primary resident conductor model. */
   model: string;
-  /** Secondary local model when the primary is not installed (Gemma 4 E4B). */
+  /** Optional secondary model supported by the selected KV backend. */
   fallback_model: string;
-  /** Override Ollama base URL; blank inherits `ollama.base_url`. */
+  /** Override local inference base URL; blank inherits from the selected KV backend. */
   base_url: string;
   /**
    * How routing JSON is emitted. Gemma 4 supports native `tool_call` and
@@ -298,8 +317,8 @@ export interface ConductorConfig {
    * `touchSession`).
    */
   kv_persist: boolean;
-  /** KV backend implementation (Ollama message-prefix reuse today). */
-  kv_backend: "ollama";
+  /** KV backend implementation used by the resident conductor. */
+  kv_backend: "ollama" | "llama_cpp";
   /** Live-conductor supervision policy (request-scoped, never global). */
   supervision: ConductorSupervisionConfig;
 }
@@ -434,6 +453,7 @@ export interface JarvisConfig {
   active_backend: BackendType;
   ollama: OllamaConfig;
   openrouter: OpenRouterConfig;
+  llama_cpp: LlamaCppConfig;
   /** OpenCode Zen — OpenAI-compatible secondary provider for pool agents. */
   opencode_zen: OpenCodeProviderConfig;
   /** OpenCode Go — OpenAI-compatible secondary provider for pool agents. */
@@ -506,7 +526,7 @@ export const LOGS_DIR = join(CONFIG_DIR, "logs");
 export function defaultConfig(): JarvisConfig {
   return {
     version: "3.0.0",
-    active_backend: "ollama",
+    active_backend: "llama_cpp",
     ollama: {
       base_url: "http://localhost:11434/v1",
       model: "qwen3.5-9b:latest",
@@ -536,6 +556,17 @@ export function defaultConfig(): JarvisConfig {
       enable_paid_fallbacks: false,
       max_retries: 3,
       timeout_ms: 60000,
+    },
+    llama_cpp: {
+      base_url: "http://127.0.0.1:8080/v1",
+      model: "gemma-4-26B-A4B-it-IQ2_M.gguf",
+      // Machine-specific paths ship blank; see LlamaCppConfig.
+      server_path: "",
+      model_path: "",
+      mtp_path: "",
+      port: 8080,
+      context_window: 16384,
+      reasoning_budget: 1536,
     },
     // Secondary OpenAI-compatible providers. Keys are intentionally blank in
     // source (no secrets committed) — they are written to the live config.json
@@ -640,39 +671,9 @@ export function defaultConfig(): JarvisConfig {
         in_turn_driver: {
           enabled: true,
         },
-        // 2026-07-18 measured on the live Ollama host: qwen3.5:4b answers a
-        // conductor directive in ~1.8s vs gemma4:e2b's ~4.4s (both with
-        // think:false; both otherwise burn the whole budget in the thinking
-        // channel and emit empty content).
-        // 2026-07-29: gemma4:e2b was retired as the fallback. model_attributions
-        // shows it at 85.1% error across 67 calls (self-tuning.db), but that
-        // figure is from its use as a Claude-CLI DELEGATE model (provider=
-        // claude_cli, stage_id=stage_<uuid> — the Task-B1 delegate path), NOT
-        // from the conductor role: stage_id='conductor_supervision' has zero
-        // rows for gemma4:e2b, so there is no direct evidence of it failing as
-        // the conductor fallback specifically. Still excluded on general
-        // grounds — a model failing 85% of the time in any role is a bad
-        // default to hand new users even without on-role evidence against it.
-        // 2026-07-29 (whole-branch review correction): a same-day pass briefly
-        // set `model` to `qwythos9b-conductor:latest` — this developer's own
-        // personal Ollama fine-tune, evaluated only via a one-off local A/B
-        // harness (docs/superpowers/plans/2026-07-26-qwythos-quality-evaluation.md).
-        // No other install of this software would have that model pulled, so
-        // it shipped a non-portable code default (PersistentConductor falls
-        // back gracefully to the remote API coordinator when neither `model`
-        // nor `fallback_model` resolves in Ollama, so this didn't crash — it
-        // just silently lost the local-conductor path on every other install).
-        // Reverted `model` to `qwen3.5:4b`, the original pre-review primary.
-        // `fallback_model` is `qwen3:8b`: a real, commonly-pulled qwen-family
-        // model, distinct from primary (see the structural
-        // `fallback_model !== model` test in config.test.ts) and not the
-        // 85%-error gemma4:e2b. This is a REASONABLE, PORTABLE default pair —
-        // both real qwen-family models any qwen-family install would
-        // recognize — not a claim of direct conductor-role telemetry for
-        // qwen3:8b specifically; we have no on-role error-rate data for it.
-        model: "qwen3.5:4b",
-        fallback_model: "qwen3:8b",
-        base_url: "",
+        model: "gemma-4-26B-A4B-it-IQ2_M.gguf",
+        fallback_model: "",
+        base_url: "http://127.0.0.1:8080/v1",
         output_mode: "tool_call",
         temperature: 1.0,
         top_p: 0.95,
@@ -680,7 +681,7 @@ export function defaultConfig(): JarvisConfig {
         // 700 structurally truncated multi-stage replan decisions (2026-07-16
         // incident memory) — routing itself stays capped by per-call
         // numPredict, so the wider ceiling only helps the bigger decisions.
-        max_tokens: 1600,
+        max_tokens: 4096,
         num_ctx: 16384,
         fallback_to_api: true,
         keep_warm: true,
@@ -690,7 +691,7 @@ export function defaultConfig(): JarvisConfig {
         max_turns_in_cache: 12,
         persist_sessions: true,
         kv_persist: true,
-        kv_backend: "ollama",
+        kv_backend: "llama_cpp",
         supervision: {
           // 5s left no headroom above the ~2-4.5s measured local latency;
           // a single GC pause turned supervision into fallback-continue.
@@ -740,7 +741,7 @@ export function defaultConfig(): JarvisConfig {
         thrift: { dead_tool_suppression: true, achieved_effect_early_stop: true },
       },
     },
-    system_prompt: `You are Jarvis, a local AI coding assistant running on Qwen 3.5 9B in WSL2.
+    system_prompt: `You are Jarvis, a local AI coding assistant running on Gemma 4 26B-A4B via llama.cpp.
 Workspace: \`/home/ethan/.openclaw/agents/coderclaw/workspace/home-base\`.
 
 ## Tool Protocol (No native tool support. Always emit this format for file/shell/web operations):
@@ -769,7 +770,7 @@ Workspace: \`/home/ethan/.openclaw/agents/coderclaw/workspace/home-base\`.
       agent: 0.2,
       compaction: 0.3,
     },
-    max_tokens: 8192,
+    max_tokens: 4096,
     top_p: 0.95,
     top_k: 40,
     bridge_port: 19876,
@@ -1107,6 +1108,18 @@ export function validateConfig(cfg: JarvisConfig): ConfigValidation {
       errors.push("OpenRouter API key is required (min 10 chars)");
     }
     if (!cfg.openrouter.model) errors.push("OpenRouter model is required");
+  } else if (cfg.active_backend === "llama_cpp") {
+    if (!cfg.llama_cpp?.base_url) errors.push("llama.cpp base URL is required");
+    if (!cfg.llama_cpp?.model) errors.push("llama.cpp model is required");
+    // Warnings, not errors: the native shell can also take these from the
+    // JARVIS_LLAMA_* environment variables, and an already-running server
+    // needs neither.
+    if (!cfg.llama_cpp?.server_path?.trim()) {
+      warnings.push("llama.cpp server_path is not set; Jarvis can only use an already-running server unless JARVIS_LLAMA_SERVER_PATH is set");
+    }
+    if (!cfg.llama_cpp?.model_path?.trim()) {
+      warnings.push("llama.cpp model_path is not set; Jarvis can only use an already-running server unless JARVIS_LLAMA_MODEL_PATH is set");
+    }
   } else if (cfg.active_backend === "claude_cli") {
     if (!cfg.claude_cli.path) errors.push("Claude CLI path is required");
   }

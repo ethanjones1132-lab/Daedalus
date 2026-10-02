@@ -152,6 +152,19 @@ export interface ConductorHealthSnapshot {
   policy_candidate_id: string | null;
 }
 
+export type ConductorReadinessState = "pending" | "warming" | "ready" | "degraded" | "disabled";
+
+/** Cached startup state; reading it never probes Ollama or loads a model. */
+export interface ConductorReadinessSnapshot {
+  enabled: boolean;
+  state: ConductorReadinessState;
+  model: string;
+  started_at: number | null;
+  completed_at: number | null;
+  latency_ms: number | null;
+  error: string | null;
+}
+
 /** Null ledger fields used when no active task is available. */
 export function emptyTaskPlanHealthFields(): Pick<
   ConductorHealthSnapshot,
@@ -293,6 +306,17 @@ export class PersistentConductorError extends Error {
 interface ResolvedConductorTarget {
   baseUrl: string;
   model: string;
+  backend: "ollama" | "llama_cpp";
+}
+
+/**
+ * Resident-model listing returned by the local runtime: Ollama `/api/ps`
+ * reports `models[].name|model`; llama.cpp's OpenAI-compatible `/v1/models`
+ * reports `data[].id`.
+ */
+interface LoadedModelsResponse {
+  models?: Array<{ name?: string; model?: string }>;
+  data?: Array<{ id?: string }>;
 }
 
 export interface ConductorTimerApi {
@@ -491,6 +515,11 @@ export class PersistentConductor {
   private keepWarmTimer: ReturnType<typeof setInterval> | null = null;
   private keepWarmInFlight: Promise<void> | null = null;
   private lastWarmRenewedAt = 0;
+  private readinessState: ConductorReadinessState = "pending";
+  private readinessStartedAt: number | null = null;
+  private readinessCompletedAt: number | null = null;
+  private readinessLatencyMs: number | null = null;
+  private readinessError: string | null = null;
   private lastRuntimeFailureAt = 0;
   private lastRuntimeFailureMessage = "";
   private lastSupervisionFailureAt = 0;
@@ -507,6 +536,19 @@ export class PersistentConductor {
     return this.getConfig().orchestrator.conductor;
   }
 
+  readinessSnapshot(): ConductorReadinessSnapshot {
+    const conductor = this.config();
+    return {
+      enabled: conductor.enabled,
+      state: conductor.enabled ? this.readinessState : "disabled",
+      model: conductor.model,
+      started_at: this.readinessStartedAt,
+      completed_at: this.readinessCompletedAt,
+      latency_ms: this.readinessLatencyMs,
+      error: conductor.enabled ? this.readinessError : null,
+    };
+  }
+
   private ollamaConfig() {
     const cfg = this.getConfig();
     const conductor = this.config();
@@ -517,10 +559,26 @@ export class PersistentConductor {
     };
   }
 
+  private llamaCppBaseUrl(): string {
+    const cfg = this.getConfig();
+    return (this.config().base_url?.trim() || cfg.llama_cpp.base_url).replace(/\/+$/, "");
+  }
+
   async isAvailable(): Promise<boolean> {
     if (!this.config().enabled) return false;
     if (this.hasRecentRuntimeFailure()) return false;
     const conductor = this.config();
+    if (conductor.kv_backend === "llama_cpp") {
+      try {
+        const response = await fetch(`${this.llamaCppBaseUrl()}/models`, { signal: AbortSignal.timeout(3_000) });
+        if (!response.ok) return false;
+        const body = await response.json() as { data?: Array<{ id?: string }> };
+        const models = (body.data ?? []).map((item) => item.id ?? "").filter(Boolean);
+        return models.length > 0 && modelAvailable(models, conductor.model);
+      } catch {
+        return false;
+      }
+    }
     for (const model of conductorModelCandidates(conductor)) {
       const health = await checkOllamaHealth({ ...this.ollamaConfig(), model });
       if (health.running && health.modelAvailable) return true;
@@ -602,7 +660,7 @@ export class PersistentConductor {
           ? undefined
           : this.hasRecentRuntimeFailure()
             ? `recent_runtime_failure: ${this.lastRuntimeFailureMessage}`
-            : "ollama_unavailable_or_model_missing",
+          : conductor.kv_backend === "llama_cpp" ? "llama_cpp_unavailable_or_model_missing" : "ollama_unavailable_or_model_missing",
         supervision_warning: this.recentSupervisionWarning(),
         ...extras,
       };
@@ -692,6 +750,9 @@ export class PersistentConductor {
       content = routed.value;
       throwIfAborted(input.signal);
       this.lastWarmRenewedAt = Date.now();
+      this.readinessState = "ready";
+      this.readinessCompletedAt = Date.now();
+      this.readinessError = null;
       this.clearRuntimeFailure();
     } catch (e) {
       ok = false;
@@ -778,7 +839,7 @@ export class PersistentConductor {
     target = supervised.target;
     const message = supervised.value;
     const content = stripGemmaThinkingArtifacts(message.content ?? "");
-    if (!content) throw new PersistentConductorError("Ollama conductor returned empty supervision output");
+    if (!content) throw new PersistentConductorError("Local conductor returned empty supervision output");
     this.clearSupervisionFailure();
     return {
       content,
@@ -791,44 +852,83 @@ export class PersistentConductor {
   /** Load and retain the configured conductor model before the first user turn. */
   async warmUp(timeoutMs = 90_000): Promise<{ model: string; latencyMs: number }> {
     if (!this.config().enabled) {
+      this.readinessState = "disabled";
+      this.readinessCompletedAt = Date.now();
+      this.readinessError = null;
       throw new PersistentConductorError("Persistent conductor is disabled");
     }
-    let target = await this.resolveTarget();
-    const ctrl = new AbortController();
-    const timeout = this.timers.setTimeout(() => ctrl.abort(), timeoutMs);
     const startedAt = Date.now();
+    this.readinessState = "warming";
+    this.readinessStartedAt = startedAt;
+    this.readinessCompletedAt = null;
+    this.readinessLatencyMs = null;
+    this.readinessError = null;
+
+    let target: ResolvedConductorTarget | undefined;
+    let timeout: ReturnType<ConductorTimerApi["setTimeout"]> | undefined;
     try {
-      const res = await fetch(`${target.baseUrl}/api/generate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: target.model,
-          prompt: "",
-          stream: false,
-          keep_alive: "30m",
-          options: {
-            num_predict: 1,
-            num_ctx: this.config().num_ctx,
-          },
-        }),
-        signal: ctrl.signal,
-      });
+      target = await this.resolveTarget();
+      const controller = new AbortController();
+      timeout = this.timers.setTimeout(() => controller.abort(), timeoutMs);
+      const warmupResponse = target.backend === "llama_cpp"
+        ? await fetch(`${target.baseUrl}/chat/completions`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: target.model,
+              messages: [
+                { role: "system", content: loadPrompt("coordinator.md") },
+                { role: "user", content: "Return a single short readiness response." },
+              ],
+              stream: false,
+              max_tokens: Math.max(4_096, this.config().max_tokens),
+              temperature: 0,
+              cache_prompt: true,
+            }),
+            signal: controller.signal,
+          })
+        : await fetch(`${target.baseUrl}/api/generate`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: target.model,
+              prompt: "",
+              stream: false,
+              keep_alive: "30m",
+              options: {
+                num_predict: 1,
+                num_ctx: this.config().num_ctx,
+              },
+            }),
+            signal: controller.signal,
+          });
+      const res = warmupResponse;
       if (!res.ok) {
         const body = await res.text().catch(() => "");
         throw new PersistentConductorError(
-          `Ollama warm-up failed: HTTP ${res.status}${body ? ` — ${body.slice(0, 200)}` : ""}`,
+          `Local conductor warm-up failed: HTTP ${res.status}${body ? ` — ${body.slice(0, 200)}` : ""}`,
         );
       }
       await res.json().catch(() => ({}));
+      const latencyMs = Date.now() - startedAt;
       this.lastWarmRenewedAt = Date.now();
-      return { model: target.model, latencyMs: Date.now() - startedAt };
+      this.readinessState = "ready";
+      this.readinessCompletedAt = Date.now();
+      this.readinessLatencyMs = latencyMs;
+      this.readinessError = null;
+      this.clearRuntimeFailure();
+      return { model: target.model, latencyMs };
     } catch (error) {
+      this.readinessState = "degraded";
+      this.readinessCompletedAt = Date.now();
+      this.readinessLatencyMs = Date.now() - startedAt;
+      this.readinessError = errorText(error).slice(0, 240);
       this.recordRuntimeFailure(error);
-      this.quarantineTarget(target);
+      if (target) this.quarantineTarget(target);
       if (error instanceof PersistentConductorError) throw error;
       throw new PersistentConductorError(error instanceof Error ? error.message : String(error));
     } finally {
-      this.timers.clearTimeout(timeout);
+      if (timeout !== undefined) this.timers.clearTimeout(timeout);
     }
   }
 
@@ -883,9 +983,32 @@ export class PersistentConductor {
   }
 
   private async resolveTarget(): Promise<ResolvedConductorTarget> {
-    const ollamaCfg = this.ollamaConfig();
     const conductor = this.config();
-    const cacheKey = `${ollamaCfg.base_url}|${conductor.model}|${conductor.fallback_model}`;
+    if (conductor.kv_backend === "llama_cpp") {
+      const baseUrl = this.llamaCppBaseUrl();
+      const cacheKey = `llama_cpp|${baseUrl}|${conductor.model}`;
+      const now = Date.now();
+      if (cachedTarget && cachedTargetKey === cacheKey && now - cachedTargetAt < TARGET_CACHE_TTL_MS) return cachedTarget;
+      try {
+        const response = await fetch(`${baseUrl}/models`, { signal: AbortSignal.timeout(3_000) });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const body = await response.json() as { data?: Array<{ id?: string }> };
+        const models = (body.data ?? []).map((item) => item.id ?? "").filter(Boolean);
+        if (!modelAvailable(models, conductor.model)) {
+          throw new Error(`configured model '${conductor.model}' is not served`);
+        }
+        const target: ResolvedConductorTarget = { baseUrl, model: conductor.model, backend: "llama_cpp" };
+        cachedTarget = target;
+        cachedTargetKey = cacheKey;
+        cachedTargetAt = now;
+        return target;
+      } catch (error) {
+        throw new PersistentConductorError(`Local conductor unreachable. Tried llama.cpp at ${baseUrl}: ${errorText(error)}`);
+      }
+    }
+
+    const ollamaCfg = this.ollamaConfig();
+    const cacheKey = `ollama|${ollamaCfg.base_url}|${conductor.model}|${conductor.fallback_model}`;
     const now = Date.now();
     if (cachedTarget && cachedTargetKey === cacheKey && (now - cachedTargetAt) < TARGET_CACHE_TTL_MS) {
       return cachedTarget;
@@ -909,13 +1032,14 @@ export class PersistentConductor {
         const installedCandidates = conductorModelCandidates(this.config())
           .filter((candidate) => modelAvailable(models, candidate));
         const installed = installedCandidates.find((candidate) =>
-          !this.targetIsQuarantined({ baseUrl: cleanUrl, model: candidate }))
+          !this.targetIsQuarantined({ baseUrl: cleanUrl, model: candidate, backend: "ollama" }))
           ?? installedCandidates[0];
         if (!installed) continue;
 
         const target: ResolvedConductorTarget = {
           baseUrl: cleanUrl,
           model: installed,
+          backend: "ollama",
         };
 
         cachedTarget = target;
@@ -968,10 +1092,18 @@ export class PersistentConductor {
     const ctrl = new AbortController();
     const timeout = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      const res = await fetch(`${baseUrl}/api/ps`, { signal: ctrl.signal });
+      const useLlamaCpp = this.config().kv_backend === "llama_cpp";
+      const res = await fetch(useLlamaCpp ? `${baseUrl}/models` : `${baseUrl}/api/ps`, { signal: ctrl.signal });
       if (!res.ok) return null;
-      const json = await res.json().catch(() => null) as { models?: Array<{ name?: string; model?: string }> } | null;
-      if (!json || !Array.isArray(json.models)) return null;
+      const json = await res.json().catch(() => null) as LoadedModelsResponse | null;
+      if (!json) return null;
+      if (useLlamaCpp) {
+        if (!Array.isArray(json.data)) return null;
+        return json.data
+          .map((model) => model?.id ?? "")
+          .filter(Boolean);
+      }
+      if (!Array.isArray(json.models)) return null;
       return json.models
         .map((model) => model?.name || model?.model || "")
         .filter(Boolean);
@@ -1008,7 +1140,7 @@ export class PersistentConductor {
     // it is resident, otherwise the resident fallback.
     for (const model of conductorModelCandidates(this.config())) {
       if (modelAvailable(loaded, model)) {
-        return { baseUrl: primary.baseUrl, model };
+        return { baseUrl: primary.baseUrl, model, backend: primary.backend };
       }
     }
     return null;
@@ -1086,6 +1218,9 @@ export class PersistentConductor {
     if (!isRetryableRuntimeFailure(error)) return;
     this.lastRuntimeFailureAt = Date.now();
     this.lastRuntimeFailureMessage = errorText(error).slice(0, 240);
+    this.readinessState = "degraded";
+    this.readinessCompletedAt = this.lastRuntimeFailureAt;
+    this.readinessError = this.lastRuntimeFailureMessage;
   }
 
   private clearRuntimeFailure(): void {
@@ -1129,24 +1264,38 @@ export class PersistentConductor {
     else options.signal?.addEventListener("abort", abortFromCaller, { once: true });
     const cleanupSignal = () => options.signal?.removeEventListener("abort", abortFromCaller);
 
-    const body: Record<string, unknown> = {
-      model: target.model,
-      messages,
-      stream: false,
-      keep_alive: "30m",
-      think: false,
-      options: {
-        temperature: options.temperature ?? conductor.temperature,
-        top_p: conductor.top_p,
-        top_k: conductor.top_k,
-        num_ctx: conductor.num_ctx,
-        num_predict: Math.min(options.numPredict, Math.max(64, conductor.max_tokens)),
-      },
-      format: options.format,
-    };
+    const body: Record<string, unknown> = target.backend === "llama_cpp"
+      ? {
+          model: target.model,
+          messages,
+          stream: false,
+          max_tokens: Math.max(4_096, conductor.max_tokens),
+          temperature: options.temperature ?? conductor.temperature,
+          top_p: conductor.top_p,
+          cache_prompt: true,
+          response_format: {
+            type: "json_schema",
+            json_schema: { name: "conductor_response", strict: true, schema: options.format },
+          },
+        }
+      : {
+          model: target.model,
+          messages,
+          stream: false,
+          keep_alive: "30m",
+          think: false,
+          options: {
+            temperature: options.temperature ?? conductor.temperature,
+            top_p: conductor.top_p,
+            top_k: conductor.top_k,
+            num_ctx: conductor.num_ctx,
+            num_predict: Math.min(options.numPredict, Math.max(64, conductor.max_tokens)),
+          },
+          format: options.format,
+        };
 
     try {
-      const res = await fetch(`${target.baseUrl}/api/chat`, {
+      const res = await fetch(target.backend === "llama_cpp" ? `${target.baseUrl}/chat/completions` : `${target.baseUrl}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -1157,14 +1306,15 @@ export class PersistentConductor {
         const errBody = await res.text().catch(() => "");
         const retryable = res.status >= 500 || /runner|failed to load|load failed|unavailable/i.test(errBody);
         throw new PersistentConductorError(
-          `Ollama chat failed: HTTP ${res.status}${errBody ? ` — ${errBody.slice(0, 200)}` : ""}`,
+          `Local conductor chat failed: HTTP ${res.status}${errBody ? ` — ${errBody.slice(0, 200)}` : ""}`,
           { status: res.status, retryable },
         );
       }
 
-      const json = await res.json() as { message?: OllamaChatMessage };
-      if (!json.message) throw new PersistentConductorError("Ollama conductor returned no message");
-      return json.message;
+      const json = await res.json() as { message?: OllamaChatMessage; choices?: Array<{ message?: OllamaChatMessage }> };
+      const message = target.backend === "llama_cpp" ? json.choices?.[0]?.message : json.message;
+      if (!message) throw new PersistentConductorError("Local conductor returned no message");
+      return message;
     } catch (e) {
       if (isAbortOrTimeoutError(e)) throw e;
       if (e instanceof PersistentConductorError) throw e;
@@ -1186,7 +1336,7 @@ export class PersistentConductor {
     const message = await this.callOllamaMessage(target, messages, {
       format: COORDINATOR_ROUTE_JSON_SCHEMA,
       numPredict: 320,
-      timeoutMs: ROUTING_TIMEOUT_MS,
+      timeoutMs: this.config().kv_backend === "llama_cpp" ? 90_000 : ROUTING_TIMEOUT_MS,
       signal,
     });
     return extractConductorRoutingJson(message);

@@ -17,7 +17,7 @@
 import { projectServiceRequirements, REQUIREMENT_WORDS, listNames, type InferenceBackend, type ServiceRequirement } from './system-telemetry-state';
 import type { JarvisStatus } from './types';
 
-export type HealthSubsystemKey = 'bun' | 'bridge' | 'ollama' | 'model' | 'openrouter_key' | 'claude_proxy';
+export type HealthSubsystemKey = 'bun' | 'bridge' | 'ollama' | 'llama_cpp' | 'model' | 'openrouter_key' | 'claude_proxy';
 
 export type HealthSubsystemState = 'up' | 'down' | 'unknown' | 'unprobed';
 
@@ -55,6 +55,7 @@ const NAMES: Record<HealthSubsystemKey, string> = {
   bun: 'Bun server',
   bridge: 'Bridge',
   ollama: 'Ollama',
+  llama_cpp: 'Gemma llama.cpp server',
   model: 'Local model',
   openrouter_key: 'OpenRouter key',
   claude_proxy: 'Claude proxy',
@@ -114,18 +115,23 @@ export function projectHealthSubsystems(status: JarvisStatus | null): HealthSubs
   // Native reports `model_available` as `!is_ollama`, and under the Ollama
   // backend a stopped Ollama means the model was never asked about — so the row
   // is unprobed rather than loaded, or blamed for a server that is not up.
-  const modelProbeBlocked = backend !== 'ollama' || status?.ollama_running !== true;
+  const localBackend = backend === 'ollama' || backend === 'llama_cpp';
+  const localServerRunning = backend === 'llama_cpp' ? status?.llama_cpp_running : status?.ollama_running;
+  const modelProbeBlocked = !localBackend || localServerRunning !== true;
   const modelState: HealthSubsystemState = modelProbeBlocked ? 'unprobed' : flagState(status?.model_available);
   // A model name is only withheld when Ollama was measured down, because that
   // is the one case where naming the model would read as blaming it.
-  const modelDetail = backend === 'ollama' && status?.ollama_running === false ? null : modelId;
+  const modelDetail = localBackend && localServerRunning === false ? null : modelId;
+  const ollamaRequirement = backend === 'llama_cpp' ? 'not_required' : requirements.ollama;
+  const gemmaRequirement: ServiceRequirement = backend === 'unknown' ? 'unknown' : backend === 'llama_cpp' ? 'required' : 'not_required';
   const rows: HealthSubsystemRow[] = [
     row('bun', 'process', flagState(status?.bun_server_running), requirements.bun, nonEmptyString(status?.bun_server_url)),
     row('bridge', 'process', flagState(status?.bridge_active), requirements.bridge, portDetail(status?.bridge_port)),
-    row('ollama', 'process', flagState(status?.ollama_running), requirements.ollama),
+    row('ollama', 'process', flagState(status?.ollama_running), ollamaRequirement),
+    row('llama_cpp', 'process', flagState(status?.llama_cpp_running), gemmaRequirement, ':8080'),
     // A local model is only ever required by the Ollama backend, so it shares
     // that requirement rather than inventing a second opinion about it.
-    row('model', 'model', modelState, requirements.ollama, modelDetail),
+    row('model', 'model', modelState, localBackend ? 'required' : requirements.ollama, modelDetail),
     row('openrouter_key', 'key', flagState(status?.openrouter_key_set), openrouterKeyRequirement(backend)),
     row('claude_proxy', 'process', flagState(status?.claude_proxy_running), requirements.proxy, ':19878'),
   ];

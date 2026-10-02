@@ -167,20 +167,40 @@ pub fn clear_cached_bun_url() {
     *guard = None;
 }
 
-/// Helper to generate candidate API URLs for the Bun server.
-pub fn jarvis_api_candidates() -> Vec<String> {
-    let mut candidates = vec![
-        std::env::var("JARVIS_API").unwrap_or_default(),
+/// Candidate URLs that can be checked without starting WSL.
+pub fn local_jarvis_api_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(cached) = get_cached_bun_url() {
+        candidates.push(cached);
+    }
+    if let Ok(configured) = std::env::var("JARVIS_API") {
+        candidates.push(configured);
+    }
+    candidates.extend([
         "http://127.0.0.1:19877".to_string(),
         "http://localhost:19877".to_string(),
-    ];
+    ]);
 
-    for ip in wsl_hostname_ips() {
-        candidates.push(format!("http://{}:19877", ip));
+    let mut unique = Vec::new();
+    for candidate in candidates {
+        if !candidate.trim().is_empty() && !unique.contains(&candidate) {
+            unique.push(candidate);
+        }
     }
+    unique
+}
 
-    candidates.retain(|value| !value.trim().is_empty());
-    candidates.dedup();
+/// Helper to generate candidate API URLs for the Bun server. WSL hostname
+/// discovery is intentionally lazy; callers on local Bun deployments should
+/// use `local_jarvis_api_candidates()` first and avoid waking a cold distro.
+pub fn jarvis_api_candidates() -> Vec<String> {
+    let mut candidates = local_jarvis_api_candidates();
+    for ip in wsl_hostname_ips() {
+        let candidate = format!("http://{}:19877", ip);
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
     candidates
 }
 

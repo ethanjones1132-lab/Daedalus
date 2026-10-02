@@ -103,6 +103,7 @@ pub struct Plugin {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthData {
     pub ollama: OllamaHealth,
+    pub llama_cpp: LlamaCppHealth,
     pub bun_server: BunHealth,
     pub bridge: BridgeHealth,
     pub claude_proxy: ClaudeProxyHealth,
@@ -123,6 +124,7 @@ pub struct SupervisorStatus {
     pub bun_give_up: bool,
     pub proxy_give_up: bool,
     pub ollama_give_up: bool,
+    pub llama_cpp_give_up: bool,
     /// Consecutive failed Bun relaunches in the current retry budget.
     pub bun_restart_failures: u32,
     /// Maximum consecutive failures before automatic Bun relaunch pauses.
@@ -137,6 +139,13 @@ pub struct SupervisorStatus {
 pub struct OllamaHealth {
     pub running: bool,
     pub model: Option<String>,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlamaCppHealth {
+    pub running: bool,
+    pub model: String,
     pub url: String,
 }
 
@@ -380,13 +389,12 @@ pub async fn get_system_health(
     };
 
     // Bun server: probe the cached health URL via crate helper if available
-    let bun_running = crate::is_port_listening(19877);
+    let bun_running = crate::bun_server_is_listening();
     let bridge_running = crate::is_port_listening(19876);
-    let proxy_required = {
-        let config = state.config.lock().await;
-        crate::claude_proxy_enabled(&config)
-    };
-    let proxy_running = proxy_required && crate::is_port_listening(19878);
+    let config = state.config.lock().await.clone();
+    let llama_cpp_running = crate::is_port_listening(config.llama_cpp.port);
+    let proxy_required = crate::claude_proxy_enabled(&config);
+    let proxy_running = proxy_required && crate::claude_proxy_is_listening();
 
     let disk = disk_health().await;
     let mem = memory_health();
@@ -403,6 +411,11 @@ pub async fn get_system_health(
             running: ollama_running,
             model: ollama_model,
             url: ollama_url,
+        },
+        llama_cpp: LlamaCppHealth {
+            running: llama_cpp_running,
+            model: config.llama_cpp.model.clone(),
+            url: config.llama_cpp.base_url.clone(),
         },
         bun_server: BunHealth {
             running: bun_running,
@@ -525,20 +538,42 @@ pub async fn get_doctor_report(
     let mut checks: Vec<DoctorCheck> = Vec::new();
     let config = state.config.lock().await.clone();
 
-    // Ollama
+    // Active local inference backends
+    let ollama_required = matches!(config.active_backend, crate::jarvis::types::JarvisBackend::Ollama);
     let ollama = crate::is_port_listening(11434);
     checks.push(DoctorCheck {
         name: "ollama".into(),
-        status: if ollama { "ok".into() } else { "warn".into() },
-        detail: if ollama {
+        status: if !ollama_required || ollama { "ok".into() } else { "warn".into() },
+        detail: if !ollama_required {
+            "Ollama is not the active inference backend".into()
+        } else if ollama {
             "Ollama reachable on 127.0.0.1:11434".into()
         } else {
-            "Ollama not running; chat will fall back to OpenRouter or CLI proxy".into()
+            "Ollama is the active inference backend but is not running".into()
+        },
+    });
+
+    let llama_cpp_required = matches!(config.active_backend, crate::jarvis::types::JarvisBackend::LlamaCpp);
+    let llama_cpp_running = crate::is_port_listening(config.llama_cpp.port);
+    checks.push(DoctorCheck {
+        name: "llama_cpp".into(),
+        status: if !llama_cpp_required || llama_cpp_running { "ok".into() } else { "warn".into() },
+        detail: if !llama_cpp_required {
+            "Gemma llama.cpp is not the active inference backend".into()
+        } else if llama_cpp_running {
+            format!("Gemma model {} is listening at {}", config.llama_cpp.model, config.llama_cpp.base_url)
+        } else {
+            let paths = config.llama_cpp.clone().with_env_fallbacks();
+            let mut detail = format!("Gemma llama.cpp is the active backend but is not listening on port {}", config.llama_cpp.port);
+            if paths.server_path.trim().is_empty() || paths.model_path.trim().is_empty() {
+                detail.push_str("; llama_cpp.server_path / model_path are not configured (Settings or JARVIS_LLAMA_SERVER_PATH / JARVIS_LLAMA_MODEL_PATH)");
+            }
+            detail
         },
     });
 
     // Bun server
-    let bun = crate::is_port_listening(19877);
+    let bun = crate::bun_server_is_listening();
     checks.push(DoctorCheck {
         name: "bun_server".into(),
         status: if bun { "ok".into() } else { "error".into() },
@@ -561,9 +596,7 @@ pub async fn get_doctor_report(
     });
 
     // Claude CLI proxy
-    checks.push(claude_proxy_doctor_check(&config, || {
-        crate::is_port_listening(19878)
-    }));
+    checks.push(claude_proxy_doctor_check(&config, crate::claude_proxy_is_listening));
 
     // System store
     let store_ok = system_store_path().exists()

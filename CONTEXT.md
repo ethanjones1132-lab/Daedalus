@@ -9,11 +9,11 @@ This app. The Tauri shell (Rust + TypeScript) plus its supporting Bun server. Ow
 _Avoid_: "the client", "the desktop app"
 
 **Inference backend**:
-The actual LLM provider behind a chat turn. One of: Ollama (local, default), OpenRouter (cloud), or Claude Code CLI (local). Selected per session via `active_backend`.
+The actual LLM provider behind a chat turn. One of: Ollama (local), llama.cpp (local Gemma, default), OpenRouter (cloud), or Claude Code CLI (local). Selected per session via `active_backend`. llama.cpp's machine-specific paths (`llama_cpp.server_path`, `llama_cpp.model_path`, optional `llama_cpp.mtp_path`) are never committed defaults: they come from Settings, or from `JARVIS_LLAMA_SERVER_PATH` / `JARVIS_LLAMA_MODEL_PATH` / `JARVIS_LLAMA_MTP_PATH` when the setting is blank.
 _Avoid_: "model", "provider" (used for finer concepts elsewhere)
 
 **`claude_cli_proxy`**:
-Python shim at `~/.openclaw/jarvis/hermes/claude_cli_proxy.py`, port 19878. Speaks an Anthropic-compatible `/v1/messages` API and routes to whichever inference backend is active. Auto-spawned by Jarvis at app start alongside Ollama.
+Python shim at `~/.openclaw/jarvis/hermes/claude_cli_proxy.py`, port 19878. Speaks an Anthropic-compatible `/v1/messages` API for Claude CLI proxy authentication. Jarvis starts it at app launch only when Claude CLI is enabled with proxy authentication; it is not the chat transport for the other inference backends.
 _Avoid_: "the bridge", "the gateway"
 
 **Bun server**:
@@ -21,7 +21,7 @@ Long-running Bun process (`server-jarvis/`) that the Tauri shell spawns at boot.
 _Avoid_: "the gateway", "the API"
 
 **Chat path (today)**:
-UI → `ChatPanel` → `jarvis_send_message` Tauri command → Bun server → `claude_cli_proxy` → inference backend. All native, no external agent runtime.
+UI → `ChatPanel` → `jarvis_send_message` Tauri command → Bun server → active inference backend. The Bun server uses the OpenAI-compatible endpoint for Ollama, llama.cpp, and OpenRouter, and invokes Claude CLI directly for that backend. All native, no external agent runtime.
 
 **Native surface**:
 The Tauri commands in `src-tauri/src/commands/` that are backed by SQLite (via `db/`) rather than by the Bun server. Sessions, agents, skills, models, channels, cron, agents, system health — all native Rust.
@@ -126,8 +126,7 @@ _Avoid_: "opportunistic migration", "flat backlog"
 - A **Session** belongs to one **Agent** and runs against one **Inference backend** at a time.
 - A **Session turn** is persisted by the **Native surface** before and after **Bun server** inference streaming.
 - The **Chat path** is fully native — no external agent runtime in the loop.
-- **`claude_cli_proxy`** is the single point of fan-out to all three **Inference backends**.
-- **Jarvis** auto-spawns three child processes at boot: Ollama, `claude_cli_proxy`, Bun server.
+- **Jarvis** manages child processes at boot: Bun always; Ollama or llama.cpp when that local **Inference backend** is active; and `claude_cli_proxy` only when proxy authentication is required. The native process lifecycle manager terminates only child handles created by this Jarvis process; it leaves unrelated listeners alone.
 - An **Agent** is defined by **`soul.md`** and then loaded into Jarvis for runtime use.
 - An **Agent directory** is the portable filesystem home of an **Agent**.
 - A **Capability donor** informs Jarvis features without becoming part of Jarvis runtime architecture.

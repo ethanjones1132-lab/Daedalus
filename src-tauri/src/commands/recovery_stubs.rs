@@ -214,6 +214,7 @@ pub async fn jarvis_switch_backend(
     let new_backend = match backend.as_str() {
         "ollama" => JarvisBackend::Ollama,
         "openrouter" => JarvisBackend::OpenRouter,
+        "llama_cpp" => JarvisBackend::LlamaCpp,
         "claude_cli" => JarvisBackend::ClaudeCli,
         other => return Err(format!("unknown backend: {other}")),
     };
@@ -224,13 +225,14 @@ pub async fn jarvis_switch_backend(
     cfg.active_backend = new_backend.clone();
     crate::commands::persist_jarvis_config(&db, &cfg)?;
     let ollama_model = cfg.ollama.model.clone();
+    let llama_cpp = cfg.llama_cpp.clone();
     {
         let mut guard = state.config.lock().await;
         *guard = cfg;
     }
 
     // Start whatever the new backend needs (Ollama for local; Bun for all).
-    crate::reconcile_backend_services(new_backend, ollama_model);
+    crate::reconcile_backend_services(new_backend, ollama_model, llama_cpp);
     Ok(())
 }
 
@@ -270,13 +272,7 @@ pub async fn jarvis_restart_ollama(
     // we simply (re)ensure it is up.
     crate::supervisor::reset_failures(crate::supervisor::SupervisedService::Ollama);
     let model = state.config.lock().await.ollama.model.clone();
-    if let Some(m) = crate::OLLAMA_PROCESS.get() {
-        if let Ok(mut g) = m.lock() {
-            if let Some(mut child) = g.take() {
-                let _ = child.kill();
-            }
-        }
-    }
+    crate::process_lifecycle::stop(crate::process_lifecycle::ManagedProcess::Ollama);
     tokio::time::sleep(std::time::Duration::from_millis(700)).await;
     crate::start_ollama_and_warm(model).await;
     if crate::is_port_listening(11434) {
@@ -326,48 +322,18 @@ pub async fn jarvis_restart_proxy(
     }
 
     // Re-arm the supervisor (a long silent outage may have driven the proxy
-    // counter to the give-up cap), kill the tracked child, sleep briefly so
-    // the port is released, then re-spawn and probe :19878.
+    // counter to the give-up cap), replace the tracked child, then probe :19878.
     crate::supervisor::reset_failures(crate::supervisor::SupervisedService::Proxy);
     let model = config.ollama.model.clone();
     let openrouter_api_key = config.openrouter.api_key;
 
-    if let Some(m) = crate::PROXY_PROCESS.get() {
-        if let Ok(mut g) = m.lock() {
-            if let Some(mut child) = g.take() {
-                let _ = child.kill();
-            }
-        }
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    // `spawn_claude_cli_proxy` returns `None` when either the script or the
-    // python interpreter can't be located; the underlying spawn error is
-    // already logged via eprintln in lib.rs. Wrap with a specific error
-    // string the UI can surface verbatim.
-    let child = match crate::spawn_claude_cli_proxy(model.clone(), openrouter_api_key) {
-        Some(c) => c,
-        None => {
-            return Err(match (model.is_empty(), true) {
-                _ if !model.is_empty() => {
-                    "claude_cli_proxy: failed to start (check python interpreter and claude_cli_proxy.py path)"
-                        .to_string()
-                }
-                _ => "claude_cli_proxy: failed to start (no model configured)".to_string(),
-            });
-        }
-    };
-
-    if let Some(m) = crate::PROXY_PROCESS.get() {
-        if let Ok(mut g) = m.lock() {
-            *g = Some(child);
-        }
-    }
+    crate::restart_claude_cli_proxy(model, openrouter_api_key)
+        .map_err(|error| format!("claude_cli_proxy: {error}"))?;
 
     // Wait for the proxy to bind :19878.
     let start = std::time::Instant::now();
     while start.elapsed() < std::time::Duration::from_secs(8) {
-        if crate::is_port_listening(19878) {
+        if crate::claude_proxy_is_listening() {
             return Ok(true);
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;

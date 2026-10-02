@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-// Process supervisor — keep the three boot children alive
+// Process supervisor — keep the long-running native children alive
 // ═══════════════════════════════════════════════════════════════
 //
 // Jarvis spawns three long-lived children at boot: Ollama (only when it's the
@@ -22,8 +22,6 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 
 const TICK: Duration = Duration::from_secs(20);
-const BUN_PORT: u16 = 19877;
-const PROXY_PORT: u16 = 19878;
 const OLLAMA_PORT: u16 = 11434;
 const MAX_CONSECUTIVE_RESTARTS: u32 = 5;
 
@@ -35,6 +33,7 @@ const MAX_CONSECUTIVE_RESTARTS: u32 = 5;
 pub(crate) static BUN_FAILS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static PROXY_FAILS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static OLLAMA_FAILS: AtomicU32 = AtomicU32::new(0);
+pub(crate) static LLAMA_CPP_FAILS: AtomicU32 = AtomicU32::new(0);
 static BUN_LAST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +41,7 @@ pub(crate) enum SupervisedService {
     Bun,
     Proxy,
     Ollama,
+    LlamaCpp,
 }
 
 /// Whether another restart attempt is allowed given the consecutive-failure
@@ -55,6 +55,7 @@ fn failure_counter(service: SupervisedService) -> &'static AtomicU32 {
         SupervisedService::Bun => &BUN_FAILS,
         SupervisedService::Proxy => &PROXY_FAILS,
         SupervisedService::Ollama => &OLLAMA_FAILS,
+        SupervisedService::LlamaCpp => &LLAMA_CPP_FAILS,
     }
 }
 
@@ -126,6 +127,7 @@ pub fn give_up_status() -> SupervisorStatus {
         bun_give_up: bun_restart_failures >= MAX_CONSECUTIVE_RESTARTS,
         proxy_give_up: PROXY_FAILS.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_RESTARTS,
         ollama_give_up: OLLAMA_FAILS.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_RESTARTS,
+        llama_cpp_give_up: LLAMA_CPP_FAILS.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_RESTARTS,
         bun_restart_failures,
         restart_limit: MAX_CONSECUTIVE_RESTARTS,
         bun_diagnostic: bun_diagnostic(bun_restart_failures, bun_last_error.as_deref()),
@@ -155,19 +157,21 @@ fn proxy_heartbeat_status(proxy_required: bool, probe: impl FnOnce() -> bool) ->
 
 async fn tick(handle: &AppHandle) {
     // Read the active backend + model once per tick.
-    let (is_ollama, ollama_model, proxy_required, openrouter_api_key) = {
+    let (is_ollama, ollama_model, is_llama_cpp, llama_cpp_config, proxy_required, openrouter_api_key) = {
         let state = handle.state::<JarvisState>();
         let cfg = state.config.lock().await;
         (
             matches!(cfg.active_backend, JarvisBackend::Ollama),
             cfg.ollama.model.clone(),
+            matches!(cfg.active_backend, JarvisBackend::LlamaCpp),
+            cfg.llama_cpp.clone(),
             crate::claude_proxy_enabled(&cfg),
             cfg.openrouter.api_key.clone(),
         )
     };
 
     // ── Bun server (required by every backend for tools/skills/models) ──
-    if crate::is_port_listening(BUN_PORT) {
+    if crate::bun_server_is_listening() {
         reset_failures(SupervisedService::Bun);
     } else {
         let fails = BUN_FAILS.load(Ordering::Relaxed);
@@ -197,41 +201,22 @@ async fn tick(handle: &AppHandle) {
     // ── claude_cli_proxy (routes to whichever backend is active) ──
     if !proxy_required {
         PROXY_FAILS.store(0, Ordering::Relaxed);
-        if let Some(m) = crate::PROXY_PROCESS.get() {
-            if let Ok(mut g) = m.lock() {
-                if let Some(mut old) = g.take() {
-                    let _ = old.kill();
-                    println!("[supervisor] claude_cli_proxy stopped; proxy auth is not enabled.");
-                }
-            }
-        }
-    } else if crate::is_port_listening(PROXY_PORT) {
+        crate::process_lifecycle::stop(crate::process_lifecycle::ManagedProcess::ClaudeProxy);
+    } else if crate::claude_proxy_is_listening() {
         PROXY_FAILS.store(0, Ordering::Relaxed);
     } else {
         let fails = PROXY_FAILS.load(Ordering::Relaxed);
         if may_restart(fails) {
-            // Drop any stale tracked handle (the process is gone if the port is down).
-            if let Some(m) = crate::PROXY_PROCESS.get() {
-                if let Ok(mut g) = m.lock() {
-                    if let Some(mut old) = g.take() {
-                        let _ = old.kill();
-                    }
-                }
-            }
-            match crate::spawn_claude_cli_proxy(ollama_model.clone(), openrouter_api_key.clone()) {
-                Some(child) => {
-                    if let Some(m) = crate::PROXY_PROCESS.get() {
-                        if let Ok(mut g) = m.lock() {
-                            *g = Some(child);
-                        }
-                    }
+            match crate::restart_claude_cli_proxy(ollama_model.clone(), openrouter_api_key.clone())
+            {
+                Ok(_) => {
                     PROXY_FAILS.store(0, Ordering::Relaxed);
                     println!("[supervisor] claude_cli_proxy was down — relaunched.");
                 }
-                None => {
-                    let next = PROXY_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+                Err(error) => {
+                    let next = record_restart_failure(SupervisedService::Proxy, &error);
                     eprintln!(
-                        "[supervisor] claude_cli_proxy restart failed ({next}/{MAX_CONSECUTIVE_RESTARTS})."
+                        "[supervisor] claude_cli_proxy restart failed ({next}/{MAX_CONSECUTIVE_RESTARTS}): {error}"
                     );
                 }
             }
@@ -257,20 +242,45 @@ async fn tick(handle: &AppHandle) {
         }
     }
 
+    // ── llama.cpp (only required when Gemma is the active backend) ──
+    if !is_llama_cpp || crate::is_port_listening(llama_cpp_config.port) {
+        LLAMA_CPP_FAILS.store(0, Ordering::Relaxed);
+        if !is_llama_cpp {
+            crate::process_lifecycle::stop(crate::process_lifecycle::ManagedProcess::LlamaCpp);
+        }
+    } else {
+        let fails = LLAMA_CPP_FAILS.load(Ordering::Relaxed);
+        if may_restart(fails) {
+            match crate::start_llama_cpp_server(llama_cpp_config.clone()).await {
+                Ok(_) => {
+                    LLAMA_CPP_FAILS.store(0, Ordering::Relaxed);
+                    println!("[supervisor] llama.cpp is starting or was relaunched.");
+                }
+                Err(error) => {
+                    let next = record_restart_failure(SupervisedService::LlamaCpp, &error);
+                    eprintln!("[supervisor] llama.cpp restart failed ({next}/{MAX_CONSECUTIVE_RESTARTS}): {error}");
+                }
+            }
+        }
+    }
+
     // Heartbeat for any UI that wants to show supervisor activity.
     let supervisor = give_up_status();
     let _ = handle.emit(
         "jarvis://supervisor",
         serde_json::json!({
-            "bun_up": crate::is_port_listening(BUN_PORT),
+            "bun_up": crate::bun_server_is_listening(),
             "proxy_up": proxy_heartbeat_status(proxy_required, || {
-                crate::is_port_listening(PROXY_PORT)
+                crate::claude_proxy_is_listening()
             }),
             "ollama_up": crate::is_port_listening(OLLAMA_PORT),
             "ollama_required": is_ollama,
             "bun_give_up": supervisor.bun_give_up,
             "proxy_give_up": supervisor.proxy_give_up,
             "ollama_give_up": supervisor.ollama_give_up,
+            "llama_cpp_up": crate::is_port_listening(llama_cpp_config.port),
+            "llama_cpp_required": is_llama_cpp,
+            "llama_cpp_give_up": supervisor.llama_cpp_give_up,
             "bun_restart_failures": supervisor.bun_restart_failures,
             "restart_limit": supervisor.restart_limit,
             "bun_last_error": supervisor.bun_last_error,

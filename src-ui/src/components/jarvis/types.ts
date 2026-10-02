@@ -2,7 +2,7 @@
 // ── Jarvis View Types v3.0 ──
 // ═══════════════════════════════════════════════════════════════
 
-export type JarvisBackend = 'ollama' | 'openrouter' | 'claude_cli';
+export type JarvisBackend = 'ollama' | 'openrouter' | 'llama_cpp' | 'claude_cli';
 
 /// Build provenance returned by the `get_build_info` Tauri command.
 export interface BuildInfo {
@@ -36,6 +36,16 @@ export interface JarvisConfig {
     enable_paid_fallbacks: boolean;
     max_retries: number;
     timeout_ms: number;
+  };
+  llama_cpp: {
+    base_url: string;
+    model: string;
+    server_path: string;
+    model_path: string;
+    mtp_path: string;
+    port: number;
+    context_window: number;
+    reasoning_budget: number;
   };
   opencode_zen: {
     base_url: string;
@@ -209,6 +219,7 @@ export interface ToolResult {
 export interface JarvisStatus {
   // Ollama backend
   ollama_running: boolean;
+  llama_cpp_running?: boolean;
   model_available: boolean;
   // Bun server (needed by all backends)
   bun_server_running: boolean;

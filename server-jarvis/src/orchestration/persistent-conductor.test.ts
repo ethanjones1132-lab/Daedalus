@@ -28,6 +28,13 @@ function makeConfig(overrides: Partial<JarvisConfig["orchestrator"]["conductor"]
     // keeps gemma4:e2b as sample fallback data, independent of whatever
     // config.ts's real default is.
     fallback_model: "gemma4:e2b",
+    // These fixtures emulate the Ollama conductor transport (/api/tags,
+    // /api/ps, /api/chat). The shipped default is the llama.cpp resident
+    // conductor, so pin the Ollama path and its pre-llama.cpp primary here;
+    // llama.cpp-specific behaviour is covered by its own tests below.
+    kv_backend: "ollama",
+    base_url: "",
+    model: "qwen3.5:4b",
     ...overrides,
   };
   return cfg;
@@ -355,6 +362,61 @@ describe("PersistentConductor", () => {
     };
 
     const cfg = makeConfig({ persist_sessions: false });
+    const conductor = new PersistentConductor(() => cfg);
+
+    expect(await conductor.isWarm()).toBe(true);
+    expect(await conductor.isWarm()).toBe(false);
+    expect(await conductor.isWarm()).toBe(true);
+  });
+
+  function llamaCppConfig(): JarvisConfig {
+    return makeConfig({
+      persist_sessions: false,
+      kv_backend: "llama_cpp",
+      base_url: "http://127.0.0.1:8080/v1",
+      model: "gemma-test.gguf",
+      fallback_model: "",
+    });
+  }
+
+  test("llama.cpp conductor routes through the OpenAI-compatible endpoints", async () => {
+    const urls: string[] = [];
+    let body: Record<string, any> | undefined;
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      urls.push(url);
+      if (url === "http://127.0.0.1:8080/v1/models") return Response.json({ data: [{ id: "gemma-test.gguf" }] });
+      if (url === "http://127.0.0.1:8080/v1/chat/completions") {
+        body = JSON.parse(String(init?.body ?? "{}"));
+        return Response.json({ choices: [{ message: { role: "assistant", content: '{"task_type":"general","pipeline":["synthesizer"],"topology":"linear","context":{"needs_workspace_inspection":false,"needs_memory":true,"estimated_complexity":"low"},"coordinator_rationale":"llama"}' } }] });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg = llamaCppConfig();
+    const conductor = new PersistentConductor(() => cfg);
+    await conductor.routeTurn({ sessionId: "llama-route", request: "hello", turnNumber: 1 });
+
+    expect(urls.some((url) => url.includes("/api/"))).toBe(false);
+    expect(body?.model).toBe("gemma-test.gguf");
+    expect(body?.response_format?.type).toBe("json_schema");
+  });
+
+  test("isWarm reads llama.cpp model ids and fails open on a non-llama.cpp listing", async () => {
+    const bodies: unknown[] = [
+      { data: [{ id: "gemma-test.gguf" }] }, // target resolution
+      { data: [{ id: "gemma-test.gguf" }] }, // resident: warm
+      { data: [{ id: "other.gguf" }] }, // resident: confidently absent
+      { models: [{ name: "gemma-test.gguf" }] }, // wrong shape for llama.cpp: unknown
+    ];
+    let index = 0;
+    (globalThis as any).fetch = async (input: string | URL) => {
+      const url = String(input);
+      if (url === "http://127.0.0.1:8080/v1/models") return Response.json(bodies[Math.min(index++, bodies.length - 1)]);
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg = llamaCppConfig();
     const conductor = new PersistentConductor(() => cfg);
 
     expect(await conductor.isWarm()).toBe(true);
