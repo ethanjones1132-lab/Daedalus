@@ -4,6 +4,12 @@ export interface OllamaHealth {
   url: string;
 }
 
+export interface LlamaCppHealth {
+  running: boolean;
+  model: string;
+  url: string;
+}
+
 export interface BunHealth {
   running: boolean;
   url: string;
@@ -37,10 +43,12 @@ export interface SupervisorStatus {
   bun_give_up: boolean;
   proxy_give_up: boolean;
   ollama_give_up: boolean;
+  llama_cpp_give_up?: boolean;
 }
 
 export interface HealthData {
   ollama: OllamaHealth;
+  llama_cpp?: LlamaCppHealth;
   bun_server: BunHealth;
   bridge: BridgeHealth;
   claude_proxy: ClaudeProxyHealth;
@@ -136,6 +144,7 @@ function isHealthData(value: unknown): value is HealthData {
   if (value.supervisor !== undefined) {
     if (!isRecord(value.supervisor) || typeof value.supervisor.bun_give_up !== 'boolean' || typeof value.supervisor.proxy_give_up !== 'boolean' || typeof value.supervisor.ollama_give_up !== 'boolean') return false;
   }
+  if (value.llama_cpp !== undefined && (!isRecord(value.llama_cpp) || typeof value.llama_cpp.running !== 'boolean' || typeof value.llama_cpp.model !== 'string' || typeof value.llama_cpp.url !== 'string')) return false;
   return true;
 }
 
@@ -217,16 +226,18 @@ export type SystemTelemetryOverall = 'pending' | 'unavailable' | 'stale' | 'heal
 export type ServiceState = 'up' | 'down' | 'unknown';
 export type TelemetryServiceKey = 'bun' | 'bridge' | 'ollama' | 'proxy';
 export type ServiceRequirement = 'required' | 'not_required' | 'unknown';
-export type InferenceBackend = 'ollama' | 'openrouter' | 'claude_cli';
+export type InferenceBackend = 'ollama' | 'openrouter' | 'llama_cpp' | 'claude_cli';
 export type OverallReason =
   | 'backend_unconfirmed'
   | 'bun_down'
   | 'bridge_down'
   | 'ollama_down'
+  | 'llama_cpp_down'
   | 'proxy_down'
   | 'bun_give_up'
   | 'proxy_give_up'
   | 'ollama_give_up'
+  | 'llama_cpp_give_up'
   | 'memory_pressure'
   | 'disk_pressure'
   | 'inference_error_rate'
@@ -246,7 +257,7 @@ const ALWAYS_REQUIRED: Record<TelemetryServiceKey, ServiceRequirement> = {
 
 function normalizeBackend(value: unknown): InferenceBackend | null {
   const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
-  return normalized === 'ollama' || normalized === 'openrouter' || normalized === 'claude_cli' ? normalized : null;
+  return normalized === 'ollama' || normalized === 'openrouter' || normalized === 'llama_cpp' || normalized === 'claude_cli' ? normalized : null;
 }
 
 /**
@@ -267,7 +278,7 @@ export function projectServiceRequirements(activeBackend: unknown): ServiceRequi
     backend,
     requirements: {
       ...ALWAYS_REQUIRED,
-      ollama: backend === 'ollama' ? 'required' : 'not_required',
+      ollama: backend === 'ollama' || backend === 'llama_cpp' ? 'required' : 'not_required',
       proxy: backend === 'claude_cli' ? 'required' : 'not_required',
     },
   };
@@ -336,13 +347,15 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBac
   const healthStatus = state.health.status;
   const memoryPercent = healthData ? parsePercent(healthData.memory.used_percent) : null;
   const diskPercent = healthData ? parsePercent(healthData.disk.use_percent) : null;
+  const { backend, requirements } = projectServiceRequirements(activeBackend);
   const services = {
     bun: serviceState(healthData, 'bun_server'),
     bridge: serviceState(healthData, 'bridge'),
-    ollama: serviceState(healthData, 'ollama'),
+    ollama: backend === 'llama_cpp'
+      ? (healthData?.llama_cpp ? (healthData.llama_cpp.running ? 'up' : 'down') : 'unknown')
+      : serviceState(healthData, 'ollama'),
     proxy: serviceState(healthData, 'claude_proxy'),
   };
-  const { backend, requirements } = projectServiceRequirements(activeBackend);
   const backendUnconfirmed = requirements.ollama === 'unknown' || requirements.proxy === 'unknown';
   const errorRates = inferenceData?.backends.map((entry) => entry.error_rate) ?? [];
   const errorRate = inferenceData && inferenceData.window_size > 0 && errorRates.length > 0
@@ -361,12 +374,16 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBac
   const reasons: OverallReason[] = [];
   if (healthData !== null) {
     for (const key of ['bun', 'bridge', 'ollama', 'proxy'] as const) {
-      if (services[key] === 'down' && requirements[key] === 'required') reasons.push(SERVICE_REASON[key]);
+      if (services[key] === 'down' && requirements[key] === 'required') {
+        reasons.push(key === 'ollama' && backend === 'llama_cpp' ? 'llama_cpp_down' : SERVICE_REASON[key]);
+      }
     }
     if (backendUnconfirmed) reasons.push('backend_unconfirmed');
     if (healthData.supervisor?.bun_give_up ?? false) reasons.push('bun_give_up');
     if (healthData.supervisor?.proxy_give_up ?? false) reasons.push('proxy_give_up');
-    if (healthData.supervisor?.ollama_give_up ?? false) reasons.push('ollama_give_up');
+    if (backend === 'llama_cpp' ? (healthData.supervisor?.llama_cpp_give_up ?? false) : (healthData.supervisor?.ollama_give_up ?? false)) {
+      reasons.push(backend === 'llama_cpp' ? 'llama_cpp_give_up' : 'ollama_give_up');
+    }
     if (memoryPercent === null || memoryPercent >= 80) reasons.push('memory_pressure');
     if (diskPercent === null || diskPercent >= 80) reasons.push('disk_pressure');
     if (hasInferenceError) reasons.push('inference_error_rate');
@@ -401,7 +418,9 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBac
       diskPercent,
       bunGiveUp: healthData?.supervisor?.bun_give_up ?? false,
       proxyGiveUp: healthData?.supervisor?.proxy_give_up ?? false,
-      ollamaGiveUp: healthData?.supervisor?.ollama_give_up ?? false,
+      ollamaGiveUp: backend === 'llama_cpp'
+        ? (healthData?.supervisor?.llama_cpp_give_up ?? false)
+        : (healthData?.supervisor?.ollama_give_up ?? false),
     },
     inference: {
       status: state.inference.status,
@@ -427,10 +446,12 @@ const REASON_PHRASES: Record<OverallReason, string> = {
   bun_down: 'Bun server is not running',
   bridge_down: 'the bridge is not running',
   ollama_down: 'Ollama is not running',
+  llama_cpp_down: 'Gemma llama.cpp server is not running',
   proxy_down: 'claude_cli_proxy is not running',
   bun_give_up: 'Bun server auto-restart is paused',
   proxy_give_up: 'claude_cli_proxy auto-restart is paused',
   ollama_give_up: 'Ollama auto-restart is paused',
+  llama_cpp_give_up: 'Gemma llama.cpp auto-restart is paused',
   memory_pressure: 'memory use is high',
   disk_pressure: 'disk use is high',
   inference_error_rate: 'the inference error rate is high',

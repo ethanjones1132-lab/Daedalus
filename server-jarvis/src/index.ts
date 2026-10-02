@@ -2,8 +2,8 @@
 // ── Jarvis Bun Server v2.0 ──
 // ═══════════════════════════════════════════════════════════════
 // WSL-side HTTP server on port 19877.
-// Uses OpenAI-compatible API for both OpenRouter and Ollama.
-// Hosts Qwen 3.5 9B locally via Ollama with OpenRouter fallback.
+// Uses OpenAI-compatible APIs for llama.cpp Gemma, Ollama, and OpenRouter.
+// Gemma via llama.cpp is the default local chat and persistent-conductor backend.
 // Task 4.3: the self-log tee must install before ANY other module logs, so
 // every line of this process's life is in the guaranteed log regardless of
 // how the server was spawned (Tauri supervisor, deploy script, manual bun).
@@ -807,6 +807,25 @@ function loadTools(): ToolDef[] { return BUILTIN_TOOLS; }
 // ═══════════════════════════════════════════════════════════════
 async function discoverModels(configOverride?: Partial<JarvisConfig>): Promise<any[]> {
   const cfg = resolveConfig(configOverride);
+  if (cfg.active_backend === "llama_cpp") {
+    try {
+      const response = await fetch(`${cfg.llama_cpp.base_url.replace(/\/+$/, "")}/models`, { signal: AbortSignal.timeout(5000) });
+      if (!response.ok) return [];
+      const json = await response.json();
+      return (json.data ?? []).map((model: any) => ({
+        id: model.id ?? cfg.llama_cpp.model,
+        name: model.id ?? cfg.llama_cpp.model,
+        context_length: cfg.llama_cpp.context_window,
+        pricing: "free",
+        description: "Local Gemma model served by llama.cpp",
+        source: "llama_cpp",
+        already_installed: true,
+      }));
+    } catch (error) {
+      console.warn("[Jarvis] llama.cpp model discovery failed:", error);
+      return [];
+    }
+  }
   if (cfg.active_backend === "ollama") {
     let emptyReachableModels: any[] | null = null;
     for (const cleanUrl of ollamaBaseUrlCandidates(cfg.ollama)) {
@@ -860,6 +879,19 @@ async function discoverModels(configOverride?: Partial<JarvisConfig>): Promise<a
 // ═══════════════════════════════════════════════════════════════
 async function testConnection(configOverride?: Partial<JarvisConfig>): Promise<{ ok: boolean; latency_ms: number; error?: string }> {
   const cfg = resolveConfig(configOverride);
+  if (cfg.active_backend === "llama_cpp") {
+    const startedAt = Date.now();
+    try {
+      const response = await fetch(`${cfg.llama_cpp.base_url.replace(/\/+$/, "")}/models`, { signal: AbortSignal.timeout(5000) });
+      if (!response.ok) return { ok: false, latency_ms: Date.now() - startedAt, error: `llama.cpp returned HTTP ${response.status}` };
+      const json = await response.json();
+      const models = Array.isArray(json.data) ? json.data : [];
+      const available = models.some((model: any) => !model.id || model.id === cfg.llama_cpp.model);
+      return { ok: available, latency_ms: Date.now() - startedAt, error: available ? undefined : `Model "${cfg.llama_cpp.model}" is not served by llama.cpp` };
+    } catch (error: any) {
+      return { ok: false, latency_ms: Date.now() - startedAt, error: error?.message ?? String(error) };
+    }
+  }
   if (cfg.active_backend === "ollama") {
     const health = await checkOllamaHealth(cfg.ollama);
     return { ok: health.running && health.modelAvailable, latency_ms: health.latencyMs, error: health.error };
@@ -1028,6 +1060,7 @@ async function compactHistory(
   messages: Array<any>,
   cfg: JarvisConfig,
   isOllama: boolean,
+  isLlamaCpp: boolean,
   ollamaTarget: { chatUrl: string; modelName: string } | null,
   resolvedOpenRouterModel: string | null,
   keepRecent: number = 20,
@@ -1042,10 +1075,14 @@ async function compactHistory(
     .map((m) => `${m.role}: ${m.content || ""}`.slice(0, 2000))
     .join("\n\n");
 
-  const modelName = isOllama
+  const modelName = isLlamaCpp
+    ? cfg.llama_cpp.model
+    : isOllama
     ? (cfg.compaction?.enabled && cfg.compaction?.model ? cfg.compaction.model : (ollamaTarget?.modelName ?? cfg.ollama.model))
     : resolvedOpenRouterModel ?? cfg.openrouter.model;
-  const chatUrl = isOllama
+  const chatUrl = isLlamaCpp
+    ? `${cfg.llama_cpp.base_url.replace(/\/+$/, "")}/chat/completions`
+    : isOllama
     ? (cfg.compaction?.enabled && cfg.compaction?.ollama_url ? `${cfg.compaction.ollama_url.replace(/\/+$/, "")}/v1/chat/completions` : (ollamaTarget?.chatUrl ?? `${cfg.ollama.base_url}/v1/chat/completions`))
     : `${cfg.openrouter.base_url}/chat/completions`;
 
@@ -1058,9 +1095,12 @@ async function compactHistory(
     stream: false,
     temperature: surfaceTemperature(cfg, "compaction"),
     ...(isOllama ? { options: { temperature: surfaceTemperature(cfg, "compaction"), num_ctx: 4096 } } : {}),
+    ...(isLlamaCpp ? { cache_prompt: true } : {}),
   };
-  if (isOllama) {
+  if (isOllama && !isLlamaCpp) {
     requestBody.max_tokens = cfg.compaction?.max_tokens ?? 2048;
+  } else if (isLlamaCpp) {
+    requestBody.max_tokens = Math.max(4_096, cfg.compaction?.max_tokens ?? 2048);
   } else {
     await applyOpenRouterRequestConfig(requestBody, cfg, modelName, requestBody.messages, {
       requestedTemperature: surfaceTemperature(cfg, "compaction"),
@@ -1070,10 +1110,11 @@ async function compactHistory(
   }
 
   const headers: Record<string, string> = {
-    "Authorization": isOllama ? "Bearer ollama" : `Bearer ${cfg.openrouter.api_key}`,
     "Content-Type": "application/json",
   };
-  if (!isOllama) {
+  if (isOllama && !isLlamaCpp) headers.Authorization = "Bearer ollama";
+  if (!isOllama && !isLlamaCpp) {
+    headers.Authorization = `Bearer ${cfg.openrouter.api_key}`;
     headers["HTTP-Referer"] = cfg.openrouter.site_url || "http://localhost:19877";
     headers["X-Title"] = cfg.openrouter.site_name || "Jarvis";
   }
@@ -1452,8 +1493,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       });
       if (!acquiredLease) return;
       admissionLease = acquiredLease;
-      const isOllama = cfg.active_backend === "ollama";
-      const ollamaTarget = isOllama ? await resolveOllamaChatTarget(cfg) : null;
+      const isLlamaCpp = cfg.active_backend === "llama_cpp";
+      const isOllama = cfg.active_backend === "ollama" || isLlamaCpp;
+      const localTarget = isLlamaCpp
+        ? { chatUrl: `${cfg.llama_cpp.base_url.replace(/\/+$/, "")}/chat/completions`, modelName: cfg.llama_cpp.model, tried: [cfg.llama_cpp.base_url], supportsNativeTools: true }
+        : isOllama ? await resolveOllamaChatTarget(cfg) : null;
+      const ollamaTarget = localTarget;
       const resolvedOpenRouterModel = cfg.active_backend === "openrouter"
         ? await resolveOpenRouterModel(cfg)
         : null;
@@ -1461,7 +1506,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         ? `claude-cli:${cfg.ollama.model}`
         : cfg.active_backend === "openrouter"
           ? resolvedOpenRouterModel
-          : ollamaTarget?.modelName ?? cfg.ollama.model;
+          : isLlamaCpp ? cfg.llama_cpp.model : localTarget?.modelName ?? cfg.ollama.model;
 
       console.log(`[Jarvis] Stream start session=${sessionId} backend=${cfg.active_backend} model=${modelLabel}`);
       await session.init(modelLabel);
@@ -1741,6 +1786,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const attemptStage = callOptions?.stageLabel as string | undefined;
           try {
           const activeBackendIsOllama = cfg.active_backend === "ollama";
+          const activeBackendIsLlamaCpp = cfg.active_backend === "llama_cpp";
 
           // Resolve model from agent pool when a stage label is provided.
           // Each orchestrator stage gets its designated model directly,
@@ -1868,32 +1914,36 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // local model even when the global default backend is openrouter.
           const isPoolOllama = poolProvider === "ollama";
           const isOllama = isPoolOllama || (activeBackendIsOllama && !poolProvider);
-          const ollamaTarget = isOllama
+          const isLlamaCpp = activeBackendIsLlamaCpp && !poolProvider;
+          const isLocalInference = isOllama || isLlamaCpp;
+          const localTarget = isLlamaCpp
+            ? { chatUrl: `${cfg.llama_cpp.base_url.replace(/\/+$/, "")}/chat/completions`, modelName: cfg.llama_cpp.model, tried: [cfg.llama_cpp.base_url], supportsNativeTools: true }
+            : isOllama
             ? await resolveOllamaChatTarget(cfg, isPoolOllama ? poolModel ?? undefined : undefined)
             : null;
 
-          const modelName = isOllama
-            ? (ollamaTarget?.modelName ?? (isPoolOllama ? poolModel! : cfg.ollama.model))
+          const modelName = isLocalInference
+            ? (localTarget?.modelName ?? (isPoolOllama ? poolModel! : isLlamaCpp ? cfg.llama_cpp.model : cfg.ollama.model))
             : poolModel ?? resolvedOpenRouterModel ?? cfg.openrouter.model;
           // The effective provider for the PRIMARY request. OpenCode providers
           // speak OpenAI-compatible /chat/completions but live on their own
           // base_url + key (resolveProviderTarget). OpenRouter is the default.
           const effectiveProvider = poolProvider ?? "openrouter";
           attemptModel = modelName;
-          attemptProvider = effectiveProvider;
+          attemptProvider = isLlamaCpp ? "llama_cpp" : effectiveProvider;
           const isOpenCodeProvider = effectiveProvider === "opencode_zen" || effectiveProvider === "opencode_go";
-          const providerTarget = !isOllama ? resolveProviderTarget(cfg, effectiveProvider) : null;
+          const providerTarget = !isLocalInference ? resolveProviderTarget(cfg, effectiveProvider) : null;
           // Only the OpenRouter catalog can describe OpenRouter models; skip it
           // for OpenCode (its models aren't in that catalog).
-          const openRouterEffective = (!isOllama && !isOpenCodeProvider)
+          const openRouterEffective = (!isLocalInference && !isOpenCodeProvider)
             ? await resolveEffectiveOpenRouterRequestConfig(cfg, modelName, messages, { surface })
             : null;
-          const baseUrl = isOllama
-            ? ollamaTarget!.chatUrl
+          const baseUrl = isLocalInference
+            ? localTarget!.chatUrl
             : providerChatUrl(providerTarget!);
 
-          const modelSupportsNativeTools = isOllama
-            ? (ollamaTarget?.supportsNativeTools ?? false)
+          const modelSupportsNativeTools = isLocalInference
+            ? (localTarget?.supportsNativeTools ?? false)
             : isOpenCodeProvider
               ? supportsNativeToolsForProvider(effectiveProvider, modelName)
               : (openRouterEffective?.supports_tools ?? isOpenRouterModelSupportsTools(modelName));
@@ -1925,8 +1975,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             stream: true,
           };
 
-          if (isOllama) {
-            await applyOutputMaxTokens(requestBody, cfg, isOllama, modelName, normalizedMessages, callOptions?.max_tokens);
+          if (isLocalInference) {
+            if (isLlamaCpp) {
+              requestBody.max_tokens = Math.max(4_096, callOptions?.max_tokens ?? cfg.max_tokens);
+              requestBody.temperature = callOptions?.temperature ?? cfg.temperature;
+              if (cfg.top_p !== undefined) requestBody.top_p = cfg.top_p;
+              requestBody.cache_prompt = true;
+            } else {
+            await applyOutputMaxTokens(requestBody, cfg, true, modelName, normalizedMessages, callOptions?.max_tokens);
             if (callOptions?.temperature !== undefined) {
               requestBody.temperature = callOptions.temperature;
             } else if (cfg.temperature !== undefined) {
@@ -1952,6 +2008,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             if (cfg.orchestrator?.local_disable_thinking !== false) {
               requestBody.reasoning_effort = "none";
             }
+            }
           } else if (isOpenCodeProvider) {
             // OpenCode (Zen/Go): OpenAI-compatible but not in the OpenRouter
             // catalog. Apply a lean config from callOptions/cfg directly.
@@ -1971,7 +2028,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
           if (cfg.tools.enabled && !useTextTools && callOptions?.tools && callOptions.tools.length > 0) {
             requestBody.tools = toApiTools(callOptions.tools);
-            if (!isOllama && !isOpenCodeProvider) {
+            if (!isLocalInference && !isOpenCodeProvider) {
               await applyOpenRouterRequestConfig(requestBody, cfg, modelName, normalizedMessages, {
                 requestedMaxTokens: callOptions?.max_tokens,
                 requestedTemperature: callOptions?.temperature,
@@ -1983,15 +2040,17 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
           const headers: Record<string, string> = isOllama
             ? { "Authorization": "Bearer ollama", "Content-Type": "application/json" }
-            : providerHeaders(cfg, providerTarget!);
+            : isLlamaCpp
+              ? { "Content-Type": "application/json" }
+              : providerHeaders(cfg, providerTarget!);
 
           // Use the same fallback/retry pipeline as the main Agent Loop so the
           // orchestrator is not single-shot on the OpenRouter free tier (which
           // 429s frequently and 503s during provider outages). Without this
           // every orchestrator stage dies on the first transient error and the
           // user sees a silent stall.
-          const useFallback = !isOllama && cfg.openrouter.enable_fallbacks;
-          const requestTimeout = isOllama ? MODEL_REQUEST_TIMEOUT_MS : (cfg.openrouter.timeout_ms || MODEL_REQUEST_TIMEOUT_MS);
+          const useFallback = !isLocalInference && cfg.openrouter.enable_fallbacks;
+          const requestTimeout = isLocalInference ? MODEL_REQUEST_TIMEOUT_MS : (cfg.openrouter.timeout_ms || MODEL_REQUEST_TIMEOUT_MS);
           const ctrl = new AbortController();
           // F3: distinguish true turn exhaustion from per-stage usage exhaustion
           // *before* arming inflight so a hard refuse does not consume usage.
@@ -2043,7 +2102,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
           let fetchRes: Response;
           let actualModelUsed = modelName;
-          let actualProviderUsed: string = isOllama ? "ollama" : effectiveProvider;
+          let actualProviderUsed: string = isLlamaCpp ? "llama_cpp" : isOllama ? "ollama" : effectiveProvider;
           try {
             if (useFallback) {
               const result = await chatCompletionWithFallback(cfg, requestBody, ctrl.signal, {
@@ -2111,8 +2170,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             if (fetchErr.name === "AbortError") {
               throw new Error(requestTimeoutMessage(requestBudgetMs));
             }
-            if (isOllama && (fetchErr.message?.includes("ECONNREFUSED") || fetchErr.message?.includes("fetch failed"))) {
-              throw new Error(`Cannot connect to Ollama. Tried: ${ollamaTarget?.tried.join("; ") || baseUrl}. Make sure Ollama is running and the model is pulled (ollama pull ${modelName}).`);
+            if (isLocalInference && (fetchErr.message?.includes("ECONNREFUSED") || fetchErr.message?.includes("fetch failed"))) {
+              throw new Error(isLlamaCpp
+                ? `Cannot connect to llama.cpp at ${baseUrl}. Make sure the local Gemma server is running.`
+                : `Cannot connect to Ollama. Tried: ${localTarget?.tried.join("; ") || baseUrl}. Make sure Ollama is running and the model is pulled (ollama pull ${modelName}).`);
             }
             throw fetchErr;
           }
@@ -2886,7 +2947,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // extra advance to cap latency; if both come back empty the pipeline
         // records `empty_completion` and the user gets the friendly retry notice.
         const callModel = async (messages: any[], callOptions?: any) => {
-          const canRetryStage = Boolean(callOptions?.stageLabel) && cfg.active_backend !== "ollama" && cfg.openrouter.enable_fallbacks;
+          const canRetryStage = Boolean(callOptions?.stageLabel) && cfg.active_backend !== "ollama" && cfg.active_backend !== "llama_cpp" && cfg.openrouter.enable_fallbacks;
           const canAdvanceEmpty = (callOptions?.surfaceAsAnswer === true || callOptions?.advanceOnEmpty === true) && canRetryStage;
           const exclude = new Set<string>(callOptions?.excludeModels ?? []);
           let last: any;
@@ -4065,7 +4126,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const compactProfile = cfg.profiles?.[cfg.active_profile];
         // ── Auto-compaction: summarize when context is filling up ──
         try {
-          const compactCtx = compactProfile?.context_window ?? cfg.ollama?.options?.num_ctx ?? 16384;
+        const compactCtx = cfg.llama_cpp.context_window ?? compactProfile?.context_window ?? cfg.ollama?.options?.num_ctx ?? 16384;
           // First, check if we can apply cached compaction on originalHistory
           const cached = compactionCache.get(sessionId);
           if (cached && originalHistory.length >= cached.originalLength) {
@@ -4094,7 +4155,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             const prefixHash = getMessagesHash(prefixToCompact);
 
             activeHistory = await compactHistory(
-              activeHistory, cfg, isOllama, ollamaTarget, resolvedOpenRouterModel,
+              activeHistory, cfg, isOllama && !isLlamaCpp, isLlamaCpp, ollamaTarget, resolvedOpenRouterModel,
               keepRecent
             );
 
@@ -4114,7 +4175,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         }
 
         const num_ctx = isOllama
-          ? (compactProfile?.context_window ?? cfg.ollama?.options?.num_ctx ?? 16384)
+          ? (isLlamaCpp ? cfg.llama_cpp.context_window : compactProfile?.context_window ?? cfg.ollama?.options?.num_ctx ?? 16384)
           : (openRouterEffective?.context_length ?? 16384);
         const previousLength = activeHistory.length;
         activeHistory = optimizeContextWindow(activeHistory, effectiveSystemPrompt, message, num_ctx);
@@ -4168,15 +4229,22 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const normalizedMessages = normalizeMessagesForLLM(messages);
         const requestBody: Record<string, any> = { model: modelName, messages: normalizedMessages, stream: true };
         if (isOllama) {
-          await applyOutputMaxTokens(requestBody, cfg, isOllama, modelName, normalizedMessages);
-          requestBody.temperature = effectiveTemp;
-          if (cfg.top_p !== undefined) requestBody.top_p = cfg.top_p;
-          const activeProfile = cfg.profiles?.[cfg.active_profile];
-          requestBody.options = {
-            temperature: effectiveTemp,
-            top_p: cfg.top_p ?? 0.95,
-            num_ctx: activeProfile?.context_window ?? cfg.ollama.options?.num_ctx ?? 8192,
-          };
+          if (isLlamaCpp) {
+            requestBody.max_tokens = Math.max(4_096, cfg.max_tokens);
+            requestBody.temperature = effectiveTemp;
+            if (cfg.top_p !== undefined) requestBody.top_p = cfg.top_p;
+            requestBody.cache_prompt = true;
+          } else {
+            await applyOutputMaxTokens(requestBody, cfg, true, modelName, normalizedMessages);
+            requestBody.temperature = effectiveTemp;
+            if (cfg.top_p !== undefined) requestBody.top_p = cfg.top_p;
+            const activeProfile = cfg.profiles?.[cfg.active_profile];
+            requestBody.options = {
+              temperature: effectiveTemp,
+              top_p: cfg.top_p ?? 0.95,
+              num_ctx: activeProfile?.context_window ?? cfg.ollama.options?.num_ctx ?? 8192,
+            };
+          }
         } else {
           await applyOpenRouterRequestConfig(requestBody, cfg, modelName, normalizedMessages, {
             requestedTemperature: effectiveTemp,
@@ -4197,10 +4265,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }
         }
 
-        const headers: Record<string, string> = {
-          "Authorization": isOllama ? "Bearer ollama" : `Bearer ${cfg.openrouter.api_key}`,
-          "Content-Type": "application/json",
-        };
+        const headers: Record<string, string> = { "Content-Type": "application/json" };
+        if (isOllama && !isLlamaCpp) headers.Authorization = "Bearer ollama";
+        else if (!isLlamaCpp) headers.Authorization = `Bearer ${cfg.openrouter.api_key}`;
         if (!isOllama) {
           headers["HTTP-Referer"] = cfg.openrouter.site_url || "http://localhost:19877";
           headers["X-Title"] = cfg.openrouter.site_name || "Jarvis";
@@ -4253,7 +4320,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             // covers the case where fallbacks are disabled in config but the
             // request still happens (recordInference needs SOMETHING to bucket
             // the turn under).
-            lastProviderUsed = isOllama ? "ollama" : "openrouter";
+            lastProviderUsed = isLlamaCpp ? "llama_cpp" : isOllama ? "ollama" : "openrouter";
             fetchRes = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(requestBody), signal: ctrl.signal });
           }
         } catch (fetchErr: any) {
@@ -4269,7 +4336,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             throw new Error(requestTimeoutMessage(requestBudgetMs));
           }
           if (isOllama && (fetchErr.message?.includes("ECONNREFUSED") || fetchErr.message?.includes("fetch failed"))) {
-            throw new Error(`Cannot connect to Ollama. Tried: ${ollamaTarget?.tried.join("; ") || baseUrl}. Make sure Ollama is running and the model is pulled (ollama pull ${modelName}).`);
+            throw new Error(isLlamaCpp
+              ? `Cannot connect to llama.cpp at ${baseUrl}. Make sure the local Gemma server is running.`
+              : `Cannot connect to Ollama. Tried: ${ollamaTarget?.tried.join("; ") || baseUrl}. Make sure Ollama is running and the model is pulled (ollama pull ${modelName}).`);
           }
           throw fetchErr;
         }
@@ -4281,7 +4350,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           if (isNativeToolProtocolUnsupportedError(fetchRes.status, errText) && requestBody.tools) {
             cleanupRequestAbort();
             markNativeToolProtocolUnsupported(
-              isOllama ? "ollama" : "openrouter",
+              isLlamaCpp ? "llama_cpp" : isOllama ? "ollama" : "openrouter",
               actualModelUsed,
             );
             console.warn(`[Jarvis] Model ${actualModelUsed} does not support native tools. Retrying without tools...`);
@@ -4513,7 +4582,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                   }
                 }
 
-                if (json.usage && !isOllama) {
+                if (json.usage && (!isOllama || isLlamaCpp)) {
                   // M2 probe: optional provider cache signal (non-blocking).
                   const cachedTokens = logCachedTokensProbe({
                     usage: json.usage,
@@ -5073,6 +5142,24 @@ async function checkStatus(configOverride?: Partial<JarvisConfig> | null) {
   const cfg = resolveConfig(configOverride);
 
   const ollamaHealth = await checkOllamaHealth(cfg.ollama);
+  let llamaCppRunning = false;
+  let llamaCppModelAvailable = false;
+  let llamaCppLatencyMs = 0;
+  if (cfg.active_backend === "llama_cpp") {
+    const probeStartedAt = Date.now();
+    try {
+      const response = await fetch(`${cfg.llama_cpp.base_url.replace(/\/+$/, "")}/models`, { signal: AbortSignal.timeout(3000) });
+      llamaCppLatencyMs = Date.now() - probeStartedAt;
+      llamaCppRunning = response.ok;
+      if (response.ok) {
+        const body = await response.json();
+        const models = Array.isArray(body.data) ? body.data : [];
+        llamaCppModelAvailable = models.length === 0 || models.some((model: any) => !model.id || model.id === cfg.llama_cpp.model);
+      }
+    } catch {
+      llamaCppLatencyMs = Date.now() - probeStartedAt;
+    }
+  }
 
   let openrouterOk = false;
   let openrouterLatencyMs = 0;
@@ -5114,6 +5201,11 @@ async function checkStatus(configOverride?: Partial<JarvisConfig> | null) {
   } else if (cfg.active_backend === "ollama" && !ollamaHealth.modelAvailable) {
     configWarnings.push(`Model "${cfg.ollama.model}" not found in Ollama. Run: ollama pull ${cfg.ollama.model}`);
   }
+  if (cfg.active_backend === "llama_cpp" && !llamaCppRunning) {
+    configWarnings.push(`llama.cpp is not responding at ${cfg.llama_cpp.base_url}. Start the local Gemma server.`);
+  } else if (cfg.active_backend === "llama_cpp" && !llamaCppModelAvailable) {
+    configWarnings.push(`Model "${cfg.llama_cpp.model}" is not served by llama.cpp.`);
+  }
   // /v1 discards per-request options.num_ctx; production local stages need the
   // daemon default (OLLAMA_CONTEXT_LENGTH) raised. Warn when a loaded model
   // reports context_length under the 16k floor via /api/ps.
@@ -5152,6 +5244,9 @@ async function checkStatus(configOverride?: Partial<JarvisConfig> | null) {
     ollama_model_available: ollamaHealth.modelAvailable,
     ollama_latency_ms: ollamaHealth.latencyMs,
     ollama_models: ollamaHealth.models,
+    llama_cpp_running: llamaCppRunning,
+    llama_cpp_model_available: llamaCppModelAvailable,
+    llama_cpp_latency_ms: llamaCppLatencyMs,
     openrouter_ok: openrouterOk,
     openrouter_latency_ms: openrouterLatencyMs,
     claude_cli_available: claudeCliAvailable,
@@ -5164,7 +5259,7 @@ async function checkStatus(configOverride?: Partial<JarvisConfig> | null) {
     active_sessions: activeStreams.size,
     active_backend: cfg.active_backend,
     backend: cfg.active_backend,
-    model: cfg.active_backend === "openrouter" ? cfg.openrouter.model : cfg.ollama.model,
+    model: cfg.active_backend === "openrouter" ? cfg.openrouter.model : cfg.active_backend === "llama_cpp" ? cfg.llama_cpp.model : cfg.active_backend === "claude_cli" ? (cfg.claude_cli.model ?? "") : cfg.ollama.model,
     config_valid: configWarnings.length === 0,
     config_errors: [] as string[],
     config_warnings: configWarnings,
@@ -5182,7 +5277,7 @@ async function searchDuckDuckGo(query: string): Promise<Record<string, any>> {
 export async function baseFetch(req: Request): Promise<Response> {
   const requestStart = performance.now();
   const path = new URL(req.url).pathname;
-  const isNoisy = path === "/status" || path === "/health";
+  const isNoisy = path === "/status" || path === "/health" || path === "/health/readiness";
 
   if (req.method === "OPTIONS") {
     return new Response(null, {
@@ -5207,10 +5302,13 @@ export async function baseFetch(req: Request): Promise<Response> {
       // and left :19877 in a ghost LISTEN state (live 2026-08-05/06 session logs).
       // Deep diagnostics live on /health/inference and /health/conductor-*.
       const hcfg = loadConfig();
-      const model =
-        hcfg.active_backend === "openrouter" ? hcfg.openrouter.model : hcfg.ollama.model;
-      const configured_model =
-        hcfg.active_backend === "ollama" ? hcfg.ollama.model : undefined;
+      const model = hcfg.active_backend === "openrouter" ? hcfg.openrouter.model
+        : hcfg.active_backend === "llama_cpp" ? hcfg.llama_cpp.model
+        : hcfg.active_backend === "claude_cli" ? (hcfg.claude_cli.model ?? "")
+        : hcfg.ollama.model;
+      const configured_model = hcfg.active_backend === "ollama" ? hcfg.ollama.model
+        : hcfg.active_backend === "llama_cpp" ? hcfg.llama_cpp.model
+        : undefined;
       return Response.json({
         ok: true,
         uptime: process.uptime(),
@@ -5226,6 +5324,12 @@ export async function baseFetch(req: Request): Promise<Response> {
         git_dirty: JARVIS_GIT_DIRTY,
         source_tree_sha256: JARVIS_SOURCE_TREE_SHA256,
       });
+    }
+    if (path === "/health/readiness" && req.method === "GET") {
+      // Cached orchestration readiness is separate from Bun liveness. This
+      // snapshot never contacts Ollama, so native health polling cannot trigger
+      // model discovery or a service restart.
+      return Response.json({ conductor: persistentConductor.readinessSnapshot() });
     }
     if (path === "/health/inference") {
       // Task 3.4: pool composition is part of inference health. A
@@ -5595,16 +5699,28 @@ serve({
 
 console.log(`[Jarvis API] Listening on http://localhost:${PORT}`);
 
-// Load the local conductor in the background at server boot. Without this,
-// the first user turn pays the full 15-30s model-load cost and may fall through
-// to the slower API coordinator before Ollama becomes ready.
-void persistentConductor.warmUp()
-  .then(({ model, latencyMs }) => {
-    console.log(`[PersistentConductor] warm model=${model} latency_ms=${latencyMs}`);
-    persistentConductor.startKeepWarm();
-  })
-  .catch((error) => {
-    console.warn(
-      `[PersistentConductor] warm-up skipped: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  });
+// Warm the resident conductor in the background. Native startup launches the
+// model server asynchronously, so Bun can bind before llama.cpp finishes
+// loading. Retry transient startup failures until the configured conductor is
+// ready; otherwise it would remain cold forever after a single early miss.
+async function warmPersistentConductorUntilReady(): Promise<void> {
+  let attempt = 0;
+  while (loadConfig().orchestrator.conductor.enabled) {
+    try {
+      const { model, latencyMs } = await persistentConductor.warmUp();
+      console.log(`[PersistentConductor] warm model=${model} latency_ms=${latencyMs}`);
+      persistentConductor.startKeepWarm();
+      return;
+    } catch (error) {
+      if (!loadConfig().orchestrator.conductor.enabled) return;
+      attempt += 1;
+      const retryMs = Math.min(30_000, 1_000 * 2 ** Math.min(attempt - 1, 5));
+      console.warn(
+        `[PersistentConductor] warm-up attempt=${attempt} failed; retry_ms=${retryMs}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, retryMs));
+    }
+  }
+}
+
+void warmPersistentConductorUntilReady();

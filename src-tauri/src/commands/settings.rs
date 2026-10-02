@@ -46,6 +46,7 @@ const KNOWN_SETTING_KEYS: &[&str] = &[
     "active_backend",
     "ollama",
     "openrouter",
+    "llama_cpp",
     "opencode_zen",
     "opencode_go",
     "claude_cli",
@@ -145,6 +146,7 @@ pub fn load_jarvis_config_conn(conn: &rusqlite::Connection) -> Result<JarvisConf
         config.active_backend = match v.as_str() {
             "ollama" => crate::jarvis::types::JarvisBackend::Ollama,
             "openrouter" => crate::jarvis::types::JarvisBackend::OpenRouter,
+            "llama_cpp" => crate::jarvis::types::JarvisBackend::LlamaCpp,
             "claude_cli" => crate::jarvis::types::JarvisBackend::ClaudeCli,
             _ => crate::jarvis::types::JarvisBackend::Ollama,
         };
@@ -157,6 +159,11 @@ pub fn load_jarvis_config_conn(conn: &rusqlite::Connection) -> Result<JarvisConf
     if let Some(v) = settings.get("openrouter") {
         if let Ok(parsed) = serde_json::from_str::<crate::jarvis::types::OpenRouterConfig>(v) {
             config.openrouter = parsed;
+        }
+    }
+    if let Some(v) = settings.get("llama_cpp") {
+        if let Ok(parsed) = serde_json::from_str::<crate::jarvis::types::LlamaCppConfig>(v) {
+            config.llama_cpp = parsed;
         }
     }
     if let Some(v) = settings.get("opencode_zen") {
@@ -306,6 +313,10 @@ pub fn persist_jarvis_config_conn(
         (
             "openrouter",
             serde_json::to_string(&config.openrouter).map_err(|e| e.to_string())?,
+        ),
+        (
+            "llama_cpp",
+            serde_json::to_string(&config.llama_cpp).map_err(|e| e.to_string())?,
         ),
         (
             "opencode_zen",

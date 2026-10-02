@@ -223,6 +223,7 @@ pub fn set_active_profile_and_reconcile(
         model: match config.active_backend {
             JarvisBackend::Ollama => config.ollama.model.clone(),
             JarvisBackend::OpenRouter => config.openrouter.model.clone(),
+            JarvisBackend::LlamaCpp => config.llama_cpp.model.clone(),
             JarvisBackend::ClaudeCli => config.claude_cli.model.clone().unwrap_or_default(),
         },
         source: profile.name.clone(),

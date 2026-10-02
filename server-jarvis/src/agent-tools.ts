@@ -659,21 +659,24 @@ async function runModelPrompt(
   if (signal?.aborted) onAbort();
 
   try {
-    const isOllama = cfg.active_backend !== "openrouter";
-    const baseUrl = isOllama ? cfg.ollama.base_url : cfg.openrouter.base_url;
+    const isLlamaCpp = cfg.active_backend === "llama_cpp";
+    const isOllama = cfg.active_backend !== "openrouter" && !isLlamaCpp;
+    const baseUrl = isLlamaCpp ? cfg.llama_cpp.base_url : isOllama ? cfg.ollama.base_url : cfg.openrouter.base_url;
     const url = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
     const res = await fetch(url, {
       method: "POST",
       signal: abort.signal,
       headers: {
         "Content-Type": "application/json",
-        "Authorization": isOllama ? "Bearer ollama" : `Bearer ${cfg.openrouter.api_key}`,
+        ...(isOllama ? { "Authorization": "Bearer ollama" } : {}),
+        ...(!isOllama && !isLlamaCpp ? { "Authorization": `Bearer ${cfg.openrouter.api_key}` } : {}),
       },
       body: JSON.stringify({
-        model: isOllama ? cfg.ollama.model : cfg.openrouter.model,
+        model: isLlamaCpp ? cfg.llama_cpp.model : isOllama ? cfg.ollama.model : cfg.openrouter.model,
         stream: false,
         temperature: cfg.temperature,
-        max_tokens: cfg.max_tokens,
+        max_tokens: isLlamaCpp ? Math.max(4096, cfg.max_tokens) : cfg.max_tokens,
+        ...(isLlamaCpp ? { cache_prompt: true } : {}),
         messages: [
           { role: "system", content: "You are a Jarvis sub-agent. Complete the delegated task and return concise findings with evidence." },
           { role: "user", content: prompt },

@@ -55,6 +55,7 @@ interface ModelProfile {
 
 interface HealthData {
   ollama: { running: boolean; model: string | null; url: string };
+  llama_cpp?: { running: boolean; model: string; url: string };
   bun_server: { running: boolean; url: string };
   bridge: { running: boolean; port: number };
   claude_proxy: { running: boolean; port: number };

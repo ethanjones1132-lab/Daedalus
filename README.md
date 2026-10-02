@@ -12,7 +12,7 @@ Rust/Tauri shell · Bun orchestration server · React UI · SQLite · MIT
 
 ## What this is
 
-**Jarvis** is a desktop application that runs AI agents on your own machine. It owns its full stack — native window, HTTP server, database, tool runtime, and agent lifecycle — and depends on no external agent platform. It can call out to cloud models if you configure it to, or run entirely against local models through Ollama.
+**Jarvis** is a desktop application that runs AI agents on your own machine. It owns its full stack — native window, HTTP server, database, tool runtime, and agent lifecycle — and depends on no external agent platform. It can call out to cloud models if you configure it to, or run against local models through Ollama or llama.cpp.
 
 **Daedalus** is the GitHub repository. **Jarvis** is the application. Same project; the names come from different layers of the stack, and the [Repo origins](#repo-origins) section explains why.
 
@@ -183,7 +183,11 @@ Config is auto-created at `%USERPROFILE%\.openclaw\jarvis\config.json` (Windows)
 
 | Key | Meaning |
 |---|---|
-| `active_backend` | `ollama` · `openrouter` · `claude_cli` |
+| `active_backend` | `ollama` · `openrouter` · `llama_cpp` · `claude_cli` |
+| `llama_cpp.base_url` / `llama_cpp.model` | OpenAI-compatible llama.cpp endpoint (default `http://127.0.0.1:8080/v1`) and the model alias it serves |
+| `llama_cpp.server_path` | `llama-server` executable. Blank in source; set per machine in Settings or `JARVIS_LLAMA_SERVER_PATH` |
+| `llama_cpp.model_path` | GGUF model file. Blank in source; set per machine in Settings or `JARVIS_LLAMA_MODEL_PATH` |
+| `llama_cpp.mtp_path` | Optional MTP draft head (Settings or `JARVIS_LLAMA_MTP_PATH`); blank starts llama-server without MTP |
 | `orchestrator.enabled` | Master switch for the multi-stage pipeline |
 | `orchestrator.max_conductor_replans` | Per-turn replan cap (default 2) |
 | `orchestrator.max_conductor_replans_per_session` | Per-session cap (default 6) |
@@ -192,9 +196,11 @@ Config is auto-created at `%USERPROFILE%\.openclaw\jarvis\config.json` (Windows)
 | `jarvis_path` | Filesystem sandbox root |
 | `tools.sandbox_mode` | `strict` · `permissive` · `off` |
 
+llama.cpp artifact paths are machine-specific, so the code ships them blank. The native shell reads them from the `llama_cpp` entry of the App database settings table (edited through Settings; the Bun server's `config.json` carries the same block). A path set there always wins; the `JARVIS_LLAMA_*` environment variables only fill blank fields. If `llama_cpp.port` already has a server listening, Jarvis uses it as-is. Otherwise a missing `server_path` or `model_path` fails the launch with an error naming the setting to fill in.
+
 | Database | Path | Holds |
 |---|---|---|
-| App | `%LOCALAPPDATA%\com.jarvis.desktop\jarvis.db` | Conversations, agents, cron, skills, channels |
+| App | `%USERPROFILE%\.local\share\com.jarvis.desktop\jarvis.db` (`~/.local/share/...` on Linux) | Conversations, agents, cron, skills, channels |
 | Self-tuning | `~/.openclaw/jarvis/self-tuning.db` | Run records, stage timing, model attribution, trajectories, tuning proposals |
 
 ---

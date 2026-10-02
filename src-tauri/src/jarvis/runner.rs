@@ -1348,9 +1348,12 @@ fn check_claude_proxy_status(config: &JarvisConfig, probe: impl FnOnce() -> bool
 
 pub fn check_jarvis_status(config: &JarvisConfig) -> JarvisStatus {
     let is_ollama = matches!(config.active_backend, JarvisBackend::Ollama);
+    let is_llama_cpp = matches!(config.active_backend, JarvisBackend::LlamaCpp);
 
     // ── Ollama ──────────────────────────────────────────────────
     let ollama_running = crate::is_port_listening(11434);
+
+    let llama_cpp_running = crate::is_port_listening(config.llama_cpp.port);
 
     let model_available = if is_ollama && ollama_running {
         let url = config.ollama.base_url.clone();
@@ -1383,8 +1386,26 @@ pub fn check_jarvis_status(config: &JarvisConfig) -> JarvisStatus {
         })
         .join()
         .unwrap_or(false)
+    } else if is_llama_cpp && llama_cpp_running {
+        let url = format!("{}/models", config.llama_cpp.base_url.trim_end_matches('/'));
+        let model = config.llama_cpp.model.clone();
+        std::thread::spawn(move || {
+            reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .ok()
+                .and_then(|client| client.get(url).send().ok())
+                .and_then(|response| response.json::<serde_json::Value>().ok())
+                .and_then(|json| json.get("data").and_then(|data| data.as_array()).cloned())
+                .map(|models| models.is_empty() || models.iter().any(|item| {
+                    item.get("id").and_then(|id| id.as_str()).map_or(true, |id| id == model)
+                }))
+                .unwrap_or(false)
+        })
+        .join()
+        .unwrap_or(false)
     } else {
-        !is_ollama // non-Ollama backends don't need a local model
+        !is_ollama && !is_llama_cpp
     };
 
     // ── Bun server ──────────────────────────────────────────────
@@ -1403,7 +1424,7 @@ pub fn check_jarvis_status(config: &JarvisConfig) -> JarvisStatus {
 
     // ── Claude CLI proxy ─────────────────────────────────────────
     let claude_proxy_running =
-        check_claude_proxy_status(config, || crate::is_port_listening(19878));
+        check_claude_proxy_status(config, crate::claude_proxy_is_listening);
 
     // ── Bridge ───────────────────────────────────────────────────
     let bridge_active =
@@ -1418,6 +1439,7 @@ pub fn check_jarvis_status(config: &JarvisConfig) -> JarvisStatus {
     let (active_backend, model) = match config.active_backend {
         JarvisBackend::Ollama => ("ollama".to_string(), config.ollama.model.clone()),
         JarvisBackend::OpenRouter => ("openrouter".to_string(), config.openrouter.model.clone()),
+        JarvisBackend::LlamaCpp => ("llama_cpp".to_string(), config.llama_cpp.model.clone()),
         JarvisBackend::ClaudeCli => (
             "claude_cli".to_string(),
             config.claude_cli.model.clone().unwrap_or_default(),
@@ -1426,6 +1448,7 @@ pub fn check_jarvis_status(config: &JarvisConfig) -> JarvisStatus {
 
     JarvisStatus {
         ollama_running,
+        llama_cpp_running,
         model_available,
         bun_server_running,
         bun_server_url,

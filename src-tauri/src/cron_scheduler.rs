@@ -80,27 +80,39 @@ pub fn validate_cron_schedule(schedule_expr: &str) -> Result<(), String> {
 
 /// Probe candidate Bun-server URLs and return the first healthy one.
 pub async fn resolve_jarvis_url(client: &Client) -> String {
-    if let Some(cached) = crate::wsl::get_cached_bun_url() {
-        let probe = format!("{}/health", cached);
-        if client
-            .get(&probe)
-            .timeout(Duration::from_secs(2))
-            .send()
-            .await
-            .is_ok()
-        {
-            return cached;
-        }
-        crate::wsl::clear_cached_bun_url();
-    }
-    for candidate in crate::wsl::jarvis_api_candidates() {
+    let local_candidates = crate::wsl::local_jarvis_api_candidates();
+    for candidate in &local_candidates {
         let probe = format!("{}/health", candidate);
         if client
             .get(&probe)
             .timeout(Duration::from_secs(2))
             .send()
             .await
-            .is_ok()
+            .map(|response| response.status().is_success())
+            .unwrap_or(false)
+        {
+            crate::wsl::set_cached_bun_url(candidate.clone());
+            return candidate.clone();
+        }
+    }
+
+    crate::wsl::clear_cached_bun_url();
+
+    let candidates = tokio::task::spawn_blocking(crate::wsl::jarvis_api_candidates)
+        .await
+        .unwrap_or_default();
+    for candidate in candidates {
+        if local_candidates.contains(&candidate) {
+            continue;
+        }
+        let probe = format!("{}/health", candidate);
+        if client
+            .get(&probe)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .map(|response| response.status().is_success())
+            .unwrap_or(false)
         {
             crate::wsl::set_cached_bun_url(candidate.clone());
             return candidate;

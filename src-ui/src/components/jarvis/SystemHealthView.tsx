@@ -77,12 +77,27 @@ interface MemoryHealth { total_mb: number; available_mb: number; used_mb: number
 
 interface HealthData {
   ollama: OllamaHealth;
+  llama_cpp?: { running: boolean; model: string; url: string };
   bun_server: BunHealth;
   bridge: BridgeHealth;
   claude_proxy: ClaudeProxyHealth;
   disk: DiskHealth;
   memory: MemoryHealth;
   timestamp: string;
+}
+
+interface ConductorReadiness {
+  enabled: boolean;
+  state: 'pending' | 'warming' | 'ready' | 'degraded' | 'disabled';
+  model: string;
+  started_at: number | null;
+  completed_at: number | null;
+  latency_ms: number | null;
+  error: string | null;
+}
+
+interface ReadinessHealth {
+  conductor: ConductorReadiness;
 }
 
 interface RuntimeHealth {
@@ -158,6 +173,7 @@ export default function SystemHealthView() {
   const [inferenceMetrics, setInferenceMetrics] = useState<InferenceMetrics | null>(null);
   const [directiveMetrics, setDirectiveMetrics] = useState<ConductorDirectiveSummary | null>(null);
   const [runtimeHealth, setRuntimeHealth] = useState<RuntimeHealth | null>(null);
+  const [readinessHealth, setReadinessHealth] = useState<ReadinessHealth | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lastRefresh, setLastRefresh] = useState<Date>(new Date());
@@ -166,18 +182,20 @@ export default function SystemHealthView() {
     setLoading(true);
     setError(null);
     try {
-      const [h, d, im, cd, rh] = await Promise.all([
+      const [h, d, im, cd, rh, readiness] = await Promise.all([
         invoke<HealthData>('get_system_health').catch(() => null),
         invoke<DoctorReport>('get_doctor_report').catch(() => null),
         globalThis.fetch?.(`${BUN_URL}/health/inference`).then(r => r.ok ? r.json() as Promise<InferenceMetrics> : null).catch(() => null) ?? Promise.resolve(null),
         globalThis.fetch?.(`${BUN_URL}/health/conductor-directives`).then(r => r.ok ? r.json() as Promise<ConductorDirectiveSummary> : null).catch(() => null) ?? Promise.resolve(null),
         globalThis.fetch?.(`${BUN_URL}/health`).then(r => r.ok ? r.json() as Promise<RuntimeHealth> : null).catch(() => null) ?? Promise.resolve(null),
+        globalThis.fetch?.(`${BUN_URL}/health/readiness`).then(r => r.ok ? r.json() as Promise<ReadinessHealth> : null).catch(() => null) ?? Promise.resolve(null),
       ]);
       setHealth(h);
       setDoctor(d);
       setInferenceMetrics(im);
       setDirectiveMetrics(cd);
       setRuntimeHealth(rh);
+      setReadinessHealth(readiness);
       setLastRefresh(new Date());
     } catch (e) {
       setError(String(e));
@@ -190,6 +208,7 @@ export default function SystemHealthView() {
 
   const subsystems = health ? [
     { name: 'Ollama', up: health.ollama.running, detail: health.ollama.url },
+    ...(health.llama_cpp ? [{ name: 'Gemma llama.cpp', up: health.llama_cpp.running, detail: health.llama_cpp.url }] : []),
     { name: 'Bun server', up: health.bun_server.running, detail: health.bun_server.url },
     { name: 'Bridge', up: health.bridge.running, detail: `:${health.bridge.port}` },
     { name: 'Claude proxy', up: health.claude_proxy.running, detail: `:${health.claude_proxy.port}` },
@@ -235,6 +254,29 @@ export default function SystemHealthView() {
                 </Pill>
               </div>
             </GlassCard>
+            {readinessHealth?.conductor && (
+              <GlassCard className="p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40">Conductor readiness</div>
+                    <div className="mt-1 text-xs text-bone font-mono truncate">
+                      {readinessHealth.conductor.enabled ? readinessHealth.conductor.model : 'disabled'}
+                      {readinessHealth.conductor.latency_ms !== null ? ` · warm-up ${readinessHealth.conductor.latency_ms}ms` : ''}
+                    </div>
+                    {readinessHealth.conductor.error && (
+                      <div className="mt-1 text-[10px] text-amber-200/70 break-words">{readinessHealth.conductor.error}</div>
+                    )}
+                  </div>
+                  <Pill variant={
+                    readinessHealth.conductor.state === 'ready' ? 'success'
+                      : readinessHealth.conductor.state === 'degraded' ? 'error'
+                        : readinessHealth.conductor.state === 'disabled' ? 'default' : 'warn'
+                  }>
+                    {readinessHealth.conductor.state}
+                  </Pill>
+                </div>
+              </GlassCard>
+            )}
             {/* Subsystem status chips */}
             <GlassCard className="p-4">
               <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40 mb-3">

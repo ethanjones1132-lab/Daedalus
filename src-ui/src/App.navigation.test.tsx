@@ -15,6 +15,8 @@ const config: JarvisConfig = {
   version: 'test', active_backend: 'ollama',
   ollama: { base_url: 'http://localhost:11434', model: 'navigation-test-model', auto_pull: false,
     health_check_interval_ms: 1000, options: { num_ctx: 4096, num_gpu: 0, num_thread: 1 } },
+  llama_cpp: { base_url: 'http://localhost:8080/v1', model: 'gemma-4-26B-A4B-it-IQ2_M.gguf',
+    server_path: '', model_path: '', mtp_path: '', port: 8080, context_window: 16384, reasoning_budget: 1536 },
   openrouter: { base_url: '', api_key: '', model: '', site_url: '', site_name: '',
     fallbacks: [], enable_fallbacks: false, enable_paid_fallbacks: false, max_retries: 0, timeout_ms: 1000 },
   opencode_go: { base_url: '', api_key: '', first_token_timeout_ms: 1000 },

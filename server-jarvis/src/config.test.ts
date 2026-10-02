@@ -233,3 +233,30 @@ describe("conductor fallback default", () => {
     expect(cfg.orchestrator.conductor.fallback_model).not.toBe(cfg.orchestrator.conductor.model);
   });
 });
+
+describe("llama.cpp artifact paths", () => {
+  test("defaultConfig ships no machine-specific llama.cpp paths", () => {
+    const cfg = defaultConfig();
+    expect(cfg.llama_cpp.server_path).toBe("");
+    expect(cfg.llama_cpp.model_path).toBe("");
+    expect(cfg.llama_cpp.mtp_path).toBe("");
+  });
+
+  test("blank llama.cpp paths warn instead of blocking a save", () => {
+    const cfg = defaultConfig();
+    cfg.active_backend = "llama_cpp";
+    const validation = validateConfig(cfg);
+    expect(validation.errors).toEqual([]);
+    expect(validation.warnings.some((w) => w.includes("JARVIS_LLAMA_SERVER_PATH"))).toBe(true);
+    expect(validation.warnings.some((w) => w.includes("JARVIS_LLAMA_MODEL_PATH"))).toBe(true);
+  });
+
+  test("configured llama.cpp paths survive normalization of a stored config", () => {
+    const stored = { llama_cpp: { server_path: "X:/llama/llama-server.exe", model_path: "X:/models/model.gguf" } };
+    const cfg = normalizeConfig(stored);
+    expect(cfg.llama_cpp.server_path).toBe("X:/llama/llama-server.exe");
+    expect(cfg.llama_cpp.model_path).toBe("X:/models/model.gguf");
+    expect(cfg.llama_cpp.mtp_path).toBe("");
+    expect(validateConfig({ ...cfg, active_backend: "llama_cpp" }).warnings.some((w) => w.includes("llama.cpp"))).toBe(false);
+  });
+});

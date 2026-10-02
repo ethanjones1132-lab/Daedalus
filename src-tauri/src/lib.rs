@@ -3,6 +3,7 @@ pub mod cron_scheduler;
 pub mod db;
 pub mod jarvis;
 pub mod parsers;
+mod process_lifecycle;
 pub mod supervisor;
 pub mod types;
 pub mod wsl;
@@ -25,13 +26,7 @@ use tokio::sync::Mutex;
 
 // ─── Jarvis Bun Server Auto-Start ────────────────────────────────────────────
 
-pub(crate) static SERVER_PROCESS: std::sync::OnceLock<
-    std::sync::Mutex<Option<std::process::Child>>,
-> = std::sync::OnceLock::new();
-
-#[allow(dead_code)]
-pub(crate) static SERVER_SPAWNING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static BUN_ENSURE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
 
 // ─── WSL Home ────────────────────────────────────────────────────────────────
 // Resolves the WSL home directory on Windows (via `wsl.exe`), falling back to
@@ -65,13 +60,6 @@ pub(crate) fn wsl_home() -> String {
 //   • Ollama serve  (port 11434) — runs the local model
 //   • claude_cli_proxy.py (port 19878) — Anthropic /v1/messages -> claude CLI
 // Both are spawned lazily off the main thread so the window paints fast.
-
-pub(crate) static OLLAMA_PROCESS: std::sync::OnceLock<
-    std::sync::Mutex<Option<std::process::Child>>,
-> = std::sync::OnceLock::new();
-pub(crate) static PROXY_PROCESS: std::sync::OnceLock<
-    std::sync::Mutex<Option<std::process::Child>>,
-> = std::sync::OnceLock::new();
 
 fn find_ollama_binary() -> Option<String> {
     [
@@ -216,6 +204,13 @@ fn warm_model(model: String) {
 /// `"qwen3:8b"` only when an empty string is passed (e.g. from the reconcile path
 /// before a config is fully loaded).
 pub(crate) async fn start_ollama_and_warm(model: String) {
+    static OLLAMA_START_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    let _start_guard = OLLAMA_START_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+
     let model = if model.is_empty() {
         "qwen3:8b".to_string()
     } else {
@@ -223,7 +218,34 @@ pub(crate) async fn start_ollama_and_warm(model: String) {
     };
     if is_port_listening(11434) {
         println!("[Jarvis] Ollama already running on port 11434");
-    } else if let Some(child) = spawn_ollama() {
+    } else {
+        let launch = process_lifecycle::launch(
+            process_lifecycle::ManagedProcess::Ollama,
+            true,
+            || {
+                if is_port_listening(11434) {
+                    return Err(
+                        "Ollama port 11434 is occupied by a process this app does not own; leaving it untouched".into(),
+                    );
+                }
+                spawn_ollama().ok_or_else(|| "could not spawn Ollama".to_string())
+            },
+        );
+        match launch {
+            Ok(process_lifecycle::StartOutcome::Started(pid)) => {
+                println!("[Jarvis] Ollama child registered (PID {pid})");
+            }
+            Ok(process_lifecycle::StartOutcome::AlreadyRunning(pid)) => {
+                println!("[Jarvis] Ollama start already in progress (PID {pid})");
+            }
+            Ok(process_lifecycle::StartOutcome::AlreadyListening) => {
+                println!("[Jarvis] Ollama port is already listening");
+            }
+            Err(error) => {
+                eprintln!("[Jarvis] Ollama startup failed: {error}");
+                return;
+            }
+        }
         let mut ready = false;
         for _ in 0..30 {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -237,14 +259,116 @@ pub(crate) async fn start_ollama_and_warm(model: String) {
         } else {
             println!("[Jarvis] Ollama ready on 11434");
         }
-        if let Some(m) = OLLAMA_PROCESS.get() {
-            if let Ok(mut g) = m.lock() {
-                *g = Some(child);
-            }
-        }
     }
     // Warm the model off the async runtime so we don't block the boot task.
     std::thread::spawn(move || warm_model(model));
+}
+
+/// Start the configured local llama.cpp server with the measured Gemma 4
+/// placement, MTP head, and bounded reasoning budget. The Child is owned by
+/// the shared lifecycle manager, so switching backends or exiting Daedalus
+/// only stops a server that this process actually spawned.
+pub(crate) async fn start_llama_cpp_server(
+    config: crate::jarvis::types::LlamaCppConfig,
+) -> Result<process_lifecycle::StartOutcome, String> {
+    use crate::jarvis::types::{LLAMA_MODEL_PATH_ENV, LLAMA_SERVER_PATH_ENV};
+
+    // A server that is already listening (started by this process earlier or
+    // by the user by hand) is usable even when no artifact paths are set.
+    if is_port_listening(config.port) {
+        return Ok(process_lifecycle::StartOutcome::AlreadyListening);
+    }
+
+    let config = config.with_env_fallbacks();
+    if config.server_path.trim().is_empty() {
+        return Err(format!(
+            "llama.cpp server_path is not configured: set llama_cpp.server_path in Settings or the {LLAMA_SERVER_PATH_ENV} environment variable to the llama-server executable"
+        ));
+    }
+    if config.model_path.trim().is_empty() {
+        return Err(format!(
+            "llama.cpp model_path is not configured: set llama_cpp.model_path in Settings or the {LLAMA_MODEL_PATH_ENV} environment variable to the GGUF model file"
+        ));
+    }
+    let server_path = std::path::PathBuf::from(config.server_path.trim());
+    let model_path = std::path::PathBuf::from(config.model_path.trim());
+    let mtp_path = std::path::PathBuf::from(config.mtp_path.trim());
+    if !server_path.is_file() {
+        return Err(format!("llama-server executable not found: {}", server_path.display()));
+    }
+    if !model_path.is_file() {
+        return Err(format!("Gemma GGUF not found: {}", model_path.display()));
+    }
+
+    let outcome = process_lifecycle::launch(
+        process_lifecycle::ManagedProcess::LlamaCpp,
+        false,
+        || {
+            if is_port_listening(config.port) {
+                return Err(format!(
+                    "llama.cpp port {} became occupied by an untracked listener; leaving it untouched",
+                    config.port
+                ));
+            }
+
+            use std::process::{Command, Stdio};
+            let mut command = Command::new(&server_path);
+            command.args([
+                "-m", model_path.to_string_lossy().as_ref(),
+                "--alias", &config.model,
+                "--host", "127.0.0.1",
+                "--port", &config.port.to_string(),
+                "-ngl", "99",
+                "--n-cpu-moe", "20",
+                "-c", &config.context_window.to_string(),
+                "-ctk", "q8_0", "-ctv", "q8_0",
+                "--flash-attn", "on",
+                "-b", "512", "-ub", "512", "-np", "1",
+                "--jinja",
+                "--reasoning-budget", &config.reasoning_budget.to_string(),
+                "--no-webui",
+            ]);
+            if mtp_path.is_file() {
+                command.args([
+                    "--spec-type", "draft-mtp",
+                    "-md", mtp_path.to_string_lossy().as_ref(),
+                    "--spec-draft-n-max", "2",
+                ]);
+            } else if mtp_path.as_os_str().is_empty() {
+                eprintln!("[Daedalus] no MTP head configured (llama_cpp.mtp_path); starting without MTP");
+            } else {
+                eprintln!("[Daedalus] MTP head not found at {}; starting without MTP", mtp_path.display());
+            }
+
+            let log_dir = std::env::var_os("USERPROFILE")
+                .map(std::path::PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+                .unwrap_or_else(std::env::temp_dir)
+                .join(".openclaw")
+                .join("jarvis")
+                .join("logs");
+            std::fs::create_dir_all(&log_dir)
+                .map_err(|error| format!("could not create llama.cpp log directory: {error}"))?;
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_dir.join("llama-server.log"))
+                .map_err(|error| format!("could not open llama.cpp log: {error}"))?;
+            let stderr = log
+                .try_clone()
+                .map_err(|error| format!("could not duplicate llama.cpp log handle: {error}"))?;
+            command.stdout(Stdio::from(log)).stderr(Stdio::from(stderr));
+            crate::wsl::hide_windows_console(&mut command);
+            command.spawn().map_err(|error| {
+                format!("failed to spawn llama-server {}: {error}", server_path.display())
+            })
+        },
+    )?;
+
+    // Model loading can take longer than app bootstrap. Return as soon as the
+    // child is spawned; the supervisor and health probes observe readiness
+    // without delaying Bun/UI startup.
+    Ok(outcome)
 }
 
 /// Bring up the servers the given backend needs, in the background. Idempotent —
@@ -259,10 +383,18 @@ pub(crate) async fn start_ollama_and_warm(model: String) {
 pub fn reconcile_backend_services(
     backend: crate::jarvis::types::JarvisBackend,
     ollama_model: String,
+    llama_cpp: crate::jarvis::types::LlamaCppConfig,
 ) {
     tauri::async_runtime::spawn(async move {
         if matches!(backend, crate::jarvis::types::JarvisBackend::Ollama) {
             start_ollama_and_warm(ollama_model).await;
+        }
+        if matches!(backend, crate::jarvis::types::JarvisBackend::LlamaCpp) {
+            if let Err(error) = start_llama_cpp_server(llama_cpp).await {
+                eprintln!("[Daedalus] Gemma server startup failed: {error}");
+            }
+        } else {
+            process_lifecycle::stop(process_lifecycle::ManagedProcess::LlamaCpp);
         }
         if let Err(e) = ensure_jarvis_server_started().await {
             eprintln!(
@@ -344,6 +476,14 @@ fn configure_proxy_runtime(
 /// The port `claude_cli_proxy.py` binds. Shared with `supervisor.rs` so both
 /// sides agree on what "the proxy port" means.
 pub(crate) const CLAUDE_PROXY_PORT: u16 = 19878;
+static PROXY_USES_WSL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn claude_proxy_is_listening() -> bool {
+    local_port_is_listening(CLAUDE_PROXY_PORT)
+        || (PROXY_USES_WSL.load(std::sync::atomic::Ordering::Relaxed)
+            && is_wsl_port_listening(CLAUDE_PROXY_PORT))
+}
 
 /// Parse `netstat -ano` output for PIDs LISTENING on `port` (Windows-format
 /// rows: `  TCP    127.0.0.1:19878   0.0.0.0:0   LISTENING   29084`). Pure and
@@ -382,63 +522,8 @@ fn pids_listening_on_port(port: u16) -> Vec<u32> {
     parse_listening_pids(&String::from_utf8_lossy(&output.stdout), port)
 }
 
-/// The port the Bun server binds. Shared with `supervisor.rs` so both sides
-/// agree on what "the Bun port" means when reaping orphans before spawn.
+/// The port the Bun server binds. Shared with `supervisor.rs`.
 pub(crate) const BUN_SERVER_PORT: u16 = 19877;
-
-/// Reap any process currently bound to `port` before spawning a fresh one.
-/// Closes the stale-code hazard: an orphaned child from a previous app
-/// instance/deploy can survive indefinitely once nothing tracks it (observed
-/// live for both :19878 proxy and :19877 Bun — EADDRINUSE thrash + ghost
-/// LISTEN PIDs that no longer resolve in tasklist).
-///
-/// `is_port_listening` alone cannot distinguish "healthy current service" from
-/// "stale process squatting the port" — both answer the TCP probe the same way,
-/// so the supervisor's own TCP health check would never flag an orphan as a
-/// problem. Callers run this unconditionally right before every spawn attempt
-/// so the newest process always wins the port. Best-effort: a kill failure is
-/// logged, never fatal to the spawn. After any kill, sleeps briefly so the OS
-/// can release the socket before the next bind (without this, spawn races the
-/// TIME_WAIT/CLOSE_WAIT cleanup and still gets EADDRINUSE).
-fn reap_stale_port_listeners(port: u16, label: &str) {
-    let pids = pids_listening_on_port(port);
-    if pids.is_empty() {
-        return;
-    }
-    for pid in pids {
-        println!(
-            "[Jarvis] reaping process PID {pid} already listening on :{port} before spawning {label}"
-        );
-        match std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
-            .output()
-        {
-            Ok(o) if o.status.success() => {}
-            Ok(o) => eprintln!(
-                "[Jarvis] taskkill PID {pid} exited non-zero: {}",
-                String::from_utf8_lossy(&o.stderr)
-            ),
-            Err(e) => eprintln!("[Jarvis] taskkill PID {pid} failed to spawn: {e}"),
-        }
-    }
-    // Give Windows a beat to release the socket after forced kill.
-    std::thread::sleep(std::time::Duration::from_millis(350));
-}
-
-/// Reap orphans on the Claude CLI proxy port before spawn.
-fn reap_stale_proxy_listeners() {
-    reap_stale_port_listeners(CLAUDE_PROXY_PORT, "claude_cli_proxy");
-}
-
-/// Reap orphans on the Bun server port before spawn. Without this,
-/// `ensure_jarvis_server_started` / force-restart only kill the *tracked*
-/// child handle; if that handle was lost (app restart, external bun, prior
-/// EADDRINUSE crash) the port stays held and every new spawn dies immediately
-/// with `Failed to start server. Is port 19877 in use?` — leaving the runtime
-/// dark until a manual taskkill.
-fn reap_stale_bun_listeners() {
-    reap_stale_port_listeners(BUN_SERVER_PORT, "Bun server");
-}
 
 /// True when `tasklist` cannot find a process for `pid` (Windows). Used to
 /// detect "ghost sockets": netstat still shows LISTENING with a PID that no
@@ -538,19 +623,70 @@ Active Connections
     }
 }
 
-pub(crate) fn spawn_claude_cli_proxy(
+pub(crate) fn start_claude_cli_proxy(
     ollama_model: String,
     openrouter_api_key: String,
-) -> Option<std::process::Child> {
-    use std::process::Command;
-    let script = find_claude_cli_proxy()?;
+) -> Result<process_lifecycle::StartOutcome, String> {
+    if local_port_is_listening(CLAUDE_PROXY_PORT) {
+        return Ok(process_lifecycle::StartOutcome::AlreadyListening);
+    }
+    let (script, py) = prepare_claude_cli_proxy()?;
+    if claude_proxy_is_listening() {
+        return Ok(process_lifecycle::StartOutcome::AlreadyListening);
+    }
+
+    process_lifecycle::launch(
+        process_lifecycle::ManagedProcess::ClaudeProxy,
+        false,
+        || {
+            if claude_proxy_is_listening() {
+                return Err(format!(
+                    "Claude proxy port {CLAUDE_PROXY_PORT} became occupied by an untracked listener; leaving it untouched"
+                ));
+            }
+            spawn_claude_cli_proxy_child(script, py, ollama_model, openrouter_api_key)
+        },
+    )
+}
+
+pub(crate) fn restart_claude_cli_proxy(
+    ollama_model: String,
+    openrouter_api_key: String,
+) -> Result<process_lifecycle::StartOutcome, String> {
+    let (script, py) = prepare_claude_cli_proxy()?;
+    process_lifecycle::launch(process_lifecycle::ManagedProcess::ClaudeProxy, true, || {
+        if claude_proxy_is_listening() {
+            return Err(format!(
+                    "Claude proxy port {CLAUDE_PROXY_PORT} remains occupied by a listener this app does not own; leaving it untouched"
+                ));
+        }
+        spawn_claude_cli_proxy_child(script, py, ollama_model, openrouter_api_key)
+    })
+}
+
+fn prepare_claude_cli_proxy() -> Result<(ProxyScript, PythonInvocation), String> {
+    let script = find_claude_cli_proxy().ok_or("Claude proxy script not found")?;
     let py = match script.kind {
-        ProxyScriptKind::Native => find_jarvis_python()?,
+        ProxyScriptKind::Native => find_jarvis_python().ok_or("Python interpreter not found")?,
         ProxyScriptKind::Wsl => PythonInvocation {
             program: "wsl.exe".into(),
             prefix_args: vec!["--".to_string(), "python3".to_string()],
         },
     };
+    PROXY_USES_WSL.store(
+        matches!(script.kind, ProxyScriptKind::Wsl),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    Ok((script, py))
+}
+
+fn spawn_claude_cli_proxy_child(
+    script: ProxyScript,
+    py: PythonInvocation,
+    ollama_model: String,
+    openrouter_api_key: String,
+) -> Result<std::process::Child, String> {
+    use std::process::Command;
     let model = if ollama_model.is_empty() {
         "qwen3:8b".to_string()
     } else {
@@ -569,10 +705,6 @@ pub(crate) fn spawn_claude_cli_proxy(
         through_wsl,
     );
     crate::wsl::hide_windows_console(&mut command);
-    // Script and interpreter are both confirmed to exist at this point, so
-    // reaping now cannot leave the user with nothing: any process squatting
-    // the port is cleared immediately before this exact spawn attempt claims it.
-    reap_stale_proxy_listeners();
     let child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -583,7 +715,7 @@ pub(crate) fn spawn_claude_cli_proxy(
                 script.path.display(),
                 script.kind,
             );
-            return None;
+            return Err(format!("Claude proxy spawn failed: {e}"));
         }
     };
     println!(
@@ -595,7 +727,7 @@ pub(crate) fn spawn_claude_cli_proxy(
         script.kind,
         model,
     );
-    Some(child)
+    Ok(child)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -860,17 +992,30 @@ fn find_jarvis_server() -> Option<String> {
     }
 }
 
-/// Async health probe across candidate URLs. Uses a 2s per-probe timeout because
-/// WSL2 localhost-forwarded first-connects routinely exceed sub-second latency —
-/// the old 300ms blocking probe made the app wrongly conclude the server was down
-/// even when it was reachable. Candidate generation (which may spawn `wsl.exe`)
-/// runs on the blocking pool so it never stalls async workers. Caches the first
-/// reachable URL.
+/// Async health probe with a local fast path. WSL hostname discovery can take
+/// 15s on a cold distro, so it only runs when this install launches Bun through
+/// WSL and all configured/loopback URLs have failed.
 async fn probe_jarvis_healthy() -> bool {
+    let client = reqwest::Client::new();
+    let local_candidates = crate::wsl::local_jarvis_api_candidates();
+    if probe_jarvis_candidates(&client, &local_candidates).await {
+        return true;
+    }
+    if !bun_uses_wsl() {
+        return false;
+    }
+
     let candidates = tokio::task::spawn_blocking(crate::wsl::jarvis_api_candidates)
         .await
         .unwrap_or_default();
-    let client = reqwest::Client::new();
+    let wsl_candidates: Vec<String> = candidates
+        .into_iter()
+        .filter(|candidate| !local_candidates.contains(candidate))
+        .collect();
+    probe_jarvis_candidates(&client, &wsl_candidates).await
+}
+
+async fn probe_jarvis_candidates(client: &reqwest::Client, candidates: &[String]) -> bool {
     for base in candidates {
         let trimmed = base.trim_end_matches('/').to_string();
         let probe = format!("{}/health", trimmed);
@@ -921,7 +1066,9 @@ fn find_bun_executable() -> String {
         }
         // Fall back: bun lives inside WSL.  Return the WSL path; callers that
         // run it via `wsl.exe -- bash -lc` will resolve it through WSL PATH.
-        return format!("{}/.bun/bin/bun", wsl_home());
+        // This value is consumed by `bash -lc` below. Avoid invoking `wsl.exe`
+        // just to expand the distro home; the shell already knows `$HOME`.
+        return "$HOME/.bun/bin/bun".to_string();
     }
     if std::path::Path::new("/usr/bin/bun").exists() {
         return "/usr/bin/bun".to_string();
@@ -961,16 +1108,11 @@ fn should_hide_jarvis_server_console(is_windows: bool, _looks_like_local_bun: bo
     is_windows
 }
 
-fn spawn_jarvis_server(entry: &str) -> Option<std::process::Child> {
+fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
     let bun = find_bun_executable();
     let is_windows = cfg!(target_os = "windows");
     let looks_like_local_bun =
         is_windows && bun.to_lowercase().ends_with(".exe") && !bun.contains("wsl");
-
-    // Always free :19877 before bind. Tracked-child kill in ensure/force_restart
-    // only covers the handle we own; orphans from prior sessions / EADDRINUSE
-    // crashes need a port-level reap (same pattern as claude_cli_proxy).
-    reap_stale_bun_listeners();
 
     let spawn_result = if is_windows && !looks_like_local_bun {
         // Original WSL path for dev / full WSL setups.
@@ -1008,11 +1150,43 @@ fn spawn_jarvis_server(entry: &str) -> Option<std::process::Child> {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[Jarvis] Bun spawn failed: {e} (bun={bun}, entry={entry})");
-            return None;
+            return Err(format!("Bun spawn failed: {e}"));
         }
     };
     println!("[Jarvis] Bun server spawned (PID {})", child.id());
-    Some(child)
+    Ok(child)
+}
+
+fn bun_uses_wsl() -> bool {
+    cfg!(target_os = "windows") && !find_bun_executable().to_ascii_lowercase().ends_with(".exe")
+}
+
+/// Port-only check used by the supervisor. Native desktop launches do not
+/// start `wsl.exe` just to learn that the local Bun listener is absent.
+pub(crate) fn bun_server_is_listening() -> bool {
+    if local_port_is_listening(BUN_SERVER_PORT) {
+        return true;
+    }
+    bun_uses_wsl() && is_wsl_port_listening(BUN_SERVER_PORT)
+}
+
+fn start_jarvis_server(
+    entry: &str,
+    replace: bool,
+) -> Result<process_lifecycle::StartOutcome, String> {
+    let entry = entry.to_string();
+    process_lifecycle::launch(
+        process_lifecycle::ManagedProcess::BunServer,
+        replace,
+        || {
+            if bun_server_is_listening() {
+                return Err(format!(
+                    "Bun port {BUN_SERVER_PORT} is occupied by a listener this app does not own; leaving it untouched"
+                ));
+            }
+            spawn_jarvis_server(&entry)
+        },
+    )
 }
 
 /// Force-restart the Bun server. Bypasses the HEALTHY_TTL fast-path in
@@ -1022,6 +1196,11 @@ fn spawn_jarvis_server(entry: &str) -> Option<std::process::Child> {
 /// a user-driven restart. Returns a specific error string on failure so the
 /// UI can show why (missing server bundle, spawn error, health timeout).
 pub async fn force_restart_jarvis_server() -> Result<(), String> {
+    let _start_guard = BUN_ENSURE_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+
     // 1. Re-arm the supervisor so a subsequent auto-restart is allowed even
     //    if previous ticks drove the counter to the give-up cap.
     crate::supervisor::reset_failures(crate::supervisor::SupervisedService::Bun);
@@ -1032,26 +1211,12 @@ pub async fn force_restart_jarvis_server() -> Result<(), String> {
         "server bundle not found (no index.js / index.ts beside the app or in the repo)".to_string()
     })?;
 
-    // 3. Kill the tracked child (if any) and re-spawn off the runtime.
-    let spawn_result: Result<(), String> = spawn_blocking_on_current_runtime(move || {
-        if SERVER_PROCESS.get().is_none() {
-            let _ = SERVER_PROCESS.set(std::sync::Mutex::new(None));
-        }
-        let m = SERVER_PROCESS
-            .get()
-            .ok_or("SERVER_PROCESS not initialized")?;
-        let mut guard = m.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(mut child) = guard.take() {
-            let _ = child.kill();
-        }
-        let child = spawn_jarvis_server(&server_entry).ok_or_else(|| {
-            "Failed to spawn Bun server (see [Jarvis] logs above for the OS error)".to_string()
-        })?;
-        *guard = Some(child);
-        Ok(())
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
+    // 3. Replace only the child owned by this app. An unrelated listener on
+    //    :19877 is reported and left untouched.
+    let spawn_result =
+        spawn_blocking_on_current_runtime(move || start_jarvis_server(&server_entry, true))
+            .await
+            .map_err(|e| format!("Task join error: {}", e))?;
 
     spawn_result?;
 
@@ -1077,9 +1242,6 @@ pub async fn ensure_jarvis_server_started() -> Result<(), String> {
     // Last time the server was confirmed healthy (epoch ms). A short TTL lets the
     // many callers (boot + every frontend status poll) skip all probing/spawning.
     static LAST_HEALTHY_MS: AtomicI64 = AtomicI64::new(0);
-    // Serializes the probe/spawn sequence so concurrent callers can't pile up
-    // overlapping `wsl.exe` spawns and reqwest threads (the cause of the UI hang).
-    static ENSURE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     const HEALTHY_TTL_MS: i64 = 10_000;
 
     let fresh = || {
@@ -1094,7 +1256,7 @@ pub async fn ensure_jarvis_server_started() -> Result<(), String> {
 
     // Only one probe/spawn sequence at a time; queued callers fall through to the
     // re-check below and return immediately once the first call succeeds.
-    let lock = ENSURE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
+    let lock = BUN_ENSURE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
     let _guard = lock.lock().await;
     if fresh() {
         return Ok(());
@@ -1110,7 +1272,7 @@ pub async fn ensure_jarvis_server_started() -> Result<(), String> {
     // overloaded event-loop tick can miss a 2s budget; killing a live server
     // mid-turn is far worse than waiting one more second. If the port is
     // closed, fall through to spawn immediately.
-    if is_port_listening(BUN_SERVER_PORT) {
+    if bun_server_is_listening() {
         log::info!(
             target: "jarvis::startup",
             "Bun port :{BUN_SERVER_PORT} is open but /health missed the first probe; retrying once"
@@ -1122,31 +1284,18 @@ pub async fn ensure_jarvis_server_started() -> Result<(), String> {
         }
         log::warn!(
             target: "jarvis::startup",
-            "Bun port open but /health still failing — reaping and respawning"
+            "Bun port open but /health still failing — replacing the tracked child"
         );
     }
 
-    // Not reachable — spawn the server once (spawn reaps any port squatters).
+    // Not reachable — replace the tracked child once. Port listeners without
+    // an owned Child handle are never terminated by startup recovery.
     log::info!(target: "jarvis::startup", "Bun health probe failed; locating server entry");
-    if SERVER_PROCESS.get().is_none() {
-        SERVER_PROCESS.set(std::sync::Mutex::new(None)).ok();
-    }
     let server_entry = find_jarvis_server().ok_or("server-jarvis index.ts not found")?;
     log::info!(target: "jarvis::startup", "Bun server entry resolved: {server_entry}");
-    spawn_blocking_on_current_runtime(move || -> Result<(), String> {
-        let m = SERVER_PROCESS
-            .get()
-            .ok_or("SERVER_PROCESS not initialized")?;
-        let mut guard = m.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(mut child) = guard.take() {
-            let _ = child.kill();
-        }
-        let child = spawn_jarvis_server(&server_entry).ok_or("Failed to spawn Bun server")?;
-        *guard = Some(child);
-        Ok(())
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))??;
+    spawn_blocking_on_current_runtime(move || start_jarvis_server(&server_entry, true))
+        .await
+        .map_err(|e| format!("Task join error: {}", e))??;
     log::info!(target: "jarvis::startup", "Bun child spawn returned");
 
     // Wait (off the main thread) for the freshly spawned server to come up.
@@ -1170,6 +1319,13 @@ pub async fn ensure_jarvis_server_started() -> Result<(), String> {
 }
 
 pub fn is_port_listening(port: u16) -> bool {
+    if local_port_is_listening(port) {
+        return true;
+    }
+    is_wsl_port_listening(port)
+}
+
+fn local_port_is_listening(port: u16) -> bool {
     if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&format!("127.0.0.1:{}", port)) {
         for addr in addrs {
             if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200))
@@ -1179,7 +1335,7 @@ pub fn is_port_listening(port: u16) -> bool {
             }
         }
     }
-    is_wsl_port_listening(port)
+    false
 }
 
 fn is_wsl_port_listening(port: u16) -> bool {
@@ -1261,6 +1417,11 @@ async fn bootstrap_services(handle: tauri::AppHandle) {
         crate::jarvis::types::JarvisBackend::Ollama => {
             crate::start_ollama_and_warm(cfg.ollama.model.clone()).await;
         }
+        crate::jarvis::types::JarvisBackend::LlamaCpp => {
+            if let Err(error) = crate::start_llama_cpp_server(cfg.llama_cpp.clone()).await {
+                eprintln!("[Daedalus] Gemma server startup failed: {error}");
+            }
+        }
         crate::jarvis::types::JarvisBackend::OpenRouter => {
             if cfg.openrouter.api_key.trim().is_empty() {
                 eprintln!(
@@ -1290,22 +1451,21 @@ async fn bootstrap_services(handle: tauri::AppHandle) {
         let proxy_model = cfg.ollama.model.clone();
         let openrouter_api_key = cfg.openrouter.api_key.clone();
         let proxy_result = spawn_blocking_on_current_runtime(move || {
-            crate::spawn_claude_cli_proxy(proxy_model, openrouter_api_key)
+            crate::start_claude_cli_proxy(proxy_model, openrouter_api_key)
         })
         .await;
         match proxy_result {
-            Ok(Some(child)) => {
-                if let Some(m) = crate::PROXY_PROCESS.get() {
-                    if let Ok(mut g) = m.lock() {
-                        println!(
-                            "[Jarvis] Claude CLI proxy registered at startup (PID {})",
-                            child.id()
-                        );
-                        *g = Some(child);
-                    }
-                }
+            Ok(Ok(process_lifecycle::StartOutcome::Started(pid))) => {
+                println!("[Jarvis] Claude CLI proxy registered at startup (PID {pid})")
             }
-            _ => eprintln!("[Jarvis] Claude CLI proxy not started (not found or spawn failed)"),
+            Ok(Ok(process_lifecycle::StartOutcome::AlreadyRunning(pid))) => {
+                println!("[Jarvis] Claude CLI proxy already managed (PID {pid})")
+            }
+            Ok(Ok(process_lifecycle::StartOutcome::AlreadyListening)) => println!(
+                "[Jarvis] Claude CLI proxy port already has a listener; leaving it in place"
+            ),
+            Ok(Err(error)) => eprintln!("[Jarvis] Claude CLI proxy not started: {error}"),
+            Err(error) => eprintln!("[Jarvis] Claude CLI proxy start task failed: {error}"),
         }
     } else {
         println!(
@@ -1398,11 +1558,6 @@ pub fn run() {
         .manage(db)
         .manage(HermesAppState::with_config(build_hermes_config()))
         .setup(|app| {
-            // Ensure the OnceLocks are initialized
-            crate::PROXY_PROCESS.get_or_init(|| std::sync::Mutex::new(None));
-            crate::OLLAMA_PROCESS.get_or_init(|| std::sync::Mutex::new(None));
-            crate::SERVER_PROCESS.get_or_init(|| std::sync::Mutex::new(None));
-
             let handle = app.handle().clone();
             if let Err(e) = spawn_bootstrap_services(handle) {
                 log::error!(target: "jarvis::startup", "failed to dispatch startup thread: {e}");
@@ -1564,19 +1719,7 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|_app_handle, event| {
             if let tauri::RunEvent::ExitRequested { .. } = event {
-                for (slot, _name) in [
-                    (SERVER_PROCESS.get(), "Bun server"),
-                    (PROXY_PROCESS.get(), "claude_cli_proxy"),
-                    (OLLAMA_PROCESS.get(), "Ollama"),
-                ] {
-                    if let Some(m) = slot {
-                        if let Ok(mut g) = m.lock() {
-                            if let Some(mut child) = g.take() {
-                                let _ = child.kill();
-                            }
-                        }
-                    }
-                }
+                process_lifecycle::stop_all();
             }
         });
 }
@@ -1819,10 +1962,8 @@ mod startup_thread_tests {
         assert!(verify.contains("'resources\\opencode_go_openai_models.json'"));
 
         let build_helper = include_str!("../build.rs");
-        assert!(build_helper
-            .contains("cargo:rerun-if-changed=../scripts/claude_cli_proxy.py"));
-        assert!(build_helper
-            .contains("cargo:rerun-if-changed=../scripts/opencode_go_openai_models.json"));
+        assert!(build_helper.contains("cargo:rerun-if-changed=../scripts/claude_cli_proxy.py"));
+        assert!(build_helper.contains("cargo:rerun-if-changed=../scripts/opencode_go_openai_models.json"));
         assert!(build_helper.contains(
             "let proxy_dest = release_dir.join(\"resources\").join(\"claude_cli_proxy.py\")"
         ));

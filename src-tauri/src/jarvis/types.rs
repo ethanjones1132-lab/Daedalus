@@ -8,10 +8,12 @@ use std::collections::HashMap;
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 pub enum JarvisBackend {
     #[serde(rename = "ollama")]
-    #[default]
     Ollama,
     #[serde(rename = "openrouter")]
     OpenRouter,
+    #[serde(rename = "llama_cpp")]
+    #[default]
+    LlamaCpp,
     #[serde(rename = "claude_cli")]
     ClaudeCli,
 }
@@ -21,6 +23,7 @@ impl std::fmt::Display for JarvisBackend {
         match self {
             JarvisBackend::Ollama => f.write_str("ollama"),
             JarvisBackend::OpenRouter => f.write_str("openrouter"),
+            JarvisBackend::LlamaCpp => f.write_str("llama_cpp"),
             JarvisBackend::ClaudeCli => f.write_str("claude_cli"),
         }
     }
@@ -35,6 +38,8 @@ pub struct JarvisConfig {
     pub active_backend: JarvisBackend,
     pub ollama: OllamaConfig,
     pub openrouter: OpenRouterConfig,
+    #[serde(default)]
+    pub llama_cpp: LlamaCppConfig,
     #[serde(default)]
     pub opencode_zen: OpenCodeProviderConfig,
     #[serde(default)]
@@ -67,9 +72,10 @@ impl Default for JarvisConfig {
     fn default() -> Self {
         JarvisConfig {
             version: "3.1.0".to_string(),
-            active_backend: JarvisBackend::Ollama,
+            active_backend: JarvisBackend::LlamaCpp,
             ollama: OllamaConfig::default(),
             openrouter: OpenRouterConfig::default(),
+            llama_cpp: LlamaCppConfig::default(),
             opencode_zen: OpenCodeProviderConfig {
                 base_url: "https://opencode.ai/zen/v1".to_string(),
                 api_key: String::new(),
@@ -91,7 +97,7 @@ impl Default for JarvisConfig {
             mode: "general".to_string(),
             prizepicks_prompt: String::new(),
             temperature: 0.7,
-            max_tokens: 2048,
+            max_tokens: 4096,
             top_p: 0.95,
             bridge_port: 19876,
             bridge_enabled: true,
@@ -111,6 +117,7 @@ impl JarvisConfig {
         match self.active_backend {
             JarvisBackend::Ollama => self.ollama.base_url.clone(),
             JarvisBackend::OpenRouter => self.openrouter.base_url.clone(),
+            JarvisBackend::LlamaCpp => self.llama_cpp.base_url.clone(),
             JarvisBackend::ClaudeCli => self.claude_cli.path.clone(),
         }
     }
@@ -162,6 +169,103 @@ pub struct OpenRouterConfig {
     pub max_retries: u32,
     #[serde(default)]
     pub timeout_ms: u64,
+}
+
+/// Local llama.cpp OpenAI-compatible server configuration. Daedalus owns the
+/// server process when this backend is active; model artifacts remain in their
+/// existing local locations and are never copied into the app bundle.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct LlamaCppConfig {
+    pub base_url: String,
+    pub model: String,
+    pub server_path: String,
+    pub model_path: String,
+    pub mtp_path: String,
+    pub port: u16,
+    pub context_window: u32,
+    pub reasoning_budget: u32,
+}
+
+impl Default for LlamaCppConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "http://127.0.0.1:8080/v1".to_string(),
+            model: "gemma-4-26B-A4B-it-IQ2_M.gguf".to_string(),
+            // Artifact locations are machine-specific, so source ships them
+            // blank. Each install sets them in Settings (persisted as the
+            // `llama_cpp` row of the app settings table) or through the
+            // JARVIS_LLAMA_* environment variables; see `with_env_fallbacks`.
+            server_path: String::new(),
+            model_path: String::new(),
+            mtp_path: String::new(),
+            port: 8080,
+            context_window: 16384,
+            reasoning_budget: 1536,
+        }
+    }
+}
+
+/// Supplies `llama_cpp.server_path` (the llama-server executable) when Settings leaves it blank.
+pub const LLAMA_SERVER_PATH_ENV: &str = "JARVIS_LLAMA_SERVER_PATH";
+/// Supplies `llama_cpp.model_path` (the GGUF model file) when Settings leaves it blank.
+pub const LLAMA_MODEL_PATH_ENV: &str = "JARVIS_LLAMA_MODEL_PATH";
+/// Supplies `llama_cpp.mtp_path` (optional MTP draft head) when Settings leaves it blank.
+pub const LLAMA_MTP_PATH_ENV: &str = "JARVIS_LLAMA_MTP_PATH";
+
+impl LlamaCppConfig {
+    /// Fill blank artifact paths from the `JARVIS_LLAMA_*` environment
+    /// variables. A path set in Settings always wins over the environment.
+    pub fn with_env_fallbacks(self) -> Self {
+        self.with_path_fallbacks(|key| std::env::var(key).ok())
+    }
+
+    fn with_path_fallbacks(mut self, lookup: impl Fn(&str) -> Option<String>) -> Self {
+        for (field, key) in [
+            (&mut self.server_path, LLAMA_SERVER_PATH_ENV),
+            (&mut self.model_path, LLAMA_MODEL_PATH_ENV),
+            (&mut self.mtp_path, LLAMA_MTP_PATH_ENV),
+        ] {
+            if field.trim().is_empty() {
+                if let Some(value) = lookup(key)
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                {
+                    *field = value;
+                }
+            }
+        }
+        self
+    }
+}
+
+#[cfg(test)]
+mod llama_cpp_config_tests {
+    use super::*;
+
+    #[test]
+    fn default_ships_no_machine_specific_paths() {
+        let config = LlamaCppConfig::default();
+        assert!(config.server_path.is_empty());
+        assert!(config.model_path.is_empty());
+        assert!(config.mtp_path.is_empty());
+    }
+
+    #[test]
+    fn environment_fills_only_blank_paths() {
+        let config = LlamaCppConfig {
+            server_path: "configured-llama-server".to_string(),
+            ..LlamaCppConfig::default()
+        };
+        let resolved = config.with_path_fallbacks(|key| match key {
+            LLAMA_SERVER_PATH_ENV => Some("env-llama-server".to_string()),
+            LLAMA_MODEL_PATH_ENV => Some("  env-model.gguf  ".to_string()),
+            _ => Some("   ".to_string()),
+        });
+        assert_eq!(resolved.server_path, "configured-llama-server");
+        assert_eq!(resolved.model_path, "env-model.gguf");
+        assert_eq!(resolved.mtp_path, "");
+    }
 }
 
 /// OpenAI-compatible credentials used by the Bun provider cascade for
@@ -494,6 +598,8 @@ pub struct StreamEvent {
 pub struct JarvisStatus {
     // Ollama backend
     pub ollama_running: bool,
+    // llama.cpp backend
+    pub llama_cpp_running: bool,
     pub model_available: bool,
     // Bun server (needed by all backends)
     pub bun_server_running: bool,

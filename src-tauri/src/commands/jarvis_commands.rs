@@ -257,6 +257,7 @@ pub async fn jarvis_new_session(
         let model = match config.active_backend {
             crate::jarvis::types::JarvisBackend::Ollama => config.ollama.model.clone(),
             crate::jarvis::types::JarvisBackend::OpenRouter => config.openrouter.model.clone(),
+            crate::jarvis::types::JarvisBackend::LlamaCpp => config.llama_cpp.model.clone(),
             crate::jarvis::types::JarvisBackend::ClaudeCli => {
                 config.claude_cli.model.clone().unwrap_or_default()
             }
@@ -351,13 +352,14 @@ pub async fn jarvis_save_config(
     crate::commands::persist_jarvis_config(&db, &config)?;
     let backend = config.active_backend.clone();
     let ollama_model = config.ollama.model.clone();
+    let llama_cpp = config.llama_cpp.clone();
     {
         let mut guard = state.config.lock().await;
         *guard = config;
     }
     // Bring up whatever the (possibly newly selected) backend needs — e.g. start
     // Ollama when the user switches to it in Control. Idempotent + non-blocking.
-    crate::reconcile_backend_services(backend, ollama_model);
+    crate::reconcile_backend_services(backend, ollama_model, llama_cpp);
     Ok(())
 }
 

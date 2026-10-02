@@ -340,6 +340,10 @@ describe("Coordinator", () => {
     // 2026-07-29 defaults (qwen3.5:4b primary / qwen3:8b fallback) is
     // gemma4:e2b, so pin the fallback explicitly as sample data.
     cfg.orchestrator.conductor.fallback_model = "gemma4:e2b";
+    // Ollama conductor fixture: the shipped default is the llama.cpp resident
+    // conductor, so pin the Ollama transport these mocks emulate.
+    cfg.orchestrator.conductor.kv_backend = "ollama";
+    cfg.orchestrator.conductor.base_url = "";
     const conductor = new PersistentConductor(() => cfg);
     const coordinator = new Coordinator(async () => {
       apiCalls += 1;
@@ -412,6 +416,10 @@ describe("Coordinator", () => {
     cfg.orchestrator.conductor.persist_sessions = false;
     // See note above: mocked /api/tags reports only "gemma4:e2b" installed.
     cfg.orchestrator.conductor.fallback_model = "gemma4:e2b";
+    // Ollama conductor fixture: the shipped default is the llama.cpp resident
+    // conductor, so pin the Ollama transport these mocks emulate.
+    cfg.orchestrator.conductor.kv_backend = "ollama";
+    cfg.orchestrator.conductor.base_url = "";
     const conductor = new PersistentConductor(() => cfg);
     const coordinator = new Coordinator(async () => {
       apiCalls += 1;
@@ -446,6 +454,10 @@ describe("Coordinator", () => {
     cfg.orchestrator.conductor.persist_sessions = false;
     // See note above: mocked /api/tags reports only "gemma4:e2b" installed.
     cfg.orchestrator.conductor.fallback_model = "gemma4:e2b";
+    // Ollama conductor fixture: the shipped default is the llama.cpp resident
+    // conductor, so pin the Ollama transport these mocks emulate.
+    cfg.orchestrator.conductor.kv_backend = "ollama";
+    cfg.orchestrator.conductor.base_url = "";
     const conductor = new PersistentConductor(() => cfg);
     const coordinator = new Coordinator(async () => {
       apiCalls += 1;

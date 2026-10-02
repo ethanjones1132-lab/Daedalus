@@ -196,7 +196,7 @@ describe('HealthBanner recovery', () => {
     expect(announcement()).toHaveTextContent(
       'Health recovered: all services required by the active inference backend (openrouter) are running.',
     );
-    expect(announcement()).toHaveTextContent('Not required by this backend: Ollama, Local model and Claude proxy.');
+    expect(announcement()).toHaveTextContent('Not required by this backend: Ollama, Gemma llama.cpp server, Local model and Claude proxy.');
   });
 
   it('announces a degradation that appears after health', async () => {
@@ -211,11 +211,11 @@ describe('HealthBanner recovery', () => {
 
   it('never announces recovery while the active inference backend is unconfirmed', async () => {
     await mount();
-    await settle(0, { ...offline, active_backend: 'llama_cpp' });
+    await settle(0, { ...offline, active_backend: 'vllm' as never });
 
     expect(screen.getByText('Offline')).toBeInTheDocument();
     expect(announcement()).not.toHaveTextContent('Health recovered');
-    expect(announcement()).toHaveTextContent('Backend "llama_cpp" is unreachable');
+    expect(announcement()).toHaveTextContent('Backend "vllm" is unreachable');
   });
 
   it('keeps focus off the document body when a focused Retry disappears on recovery', async () => {
