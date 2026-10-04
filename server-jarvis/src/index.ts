@@ -23,6 +23,7 @@ import {
   fitTurnMemory,
   resolveTurnMemoryInputBudget,
   withTurnMemory,
+  TURN_MEMORY_CLI_OVERHEAD_RESERVE_TOKENS,
   type AppliedTurnMemory,
 } from "./turn-memory-context";
 import type { PreparedMemoryTurn } from "./memory-contract";
@@ -31,7 +32,7 @@ import { PRIZEPICKS_SYSTEM_PROMPT, buildPrizePicksContext, buildFullDatabaseCont
 
 import { serve } from "bun";
 import { readdirSync, existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync } from "fs";
-import { join } from "path";
+import { join, isAbsolute, relative, resolve } from "path";
 import { homedir } from "os";
 import { spawn, execSync } from "child_process";
 import { loadConfig, saveConfig, saveConfigWithValidation, normalizeConfig, InvalidConfigError, CONFIG_DIR, COMPANION_FILE, surfaceTemperature } from "./config";
@@ -44,7 +45,14 @@ import { handleAgentRequest } from "./agent-routes";
 import { handleTuningProposalsRequest } from "./tuning-routes";
 import { handleChatStreamRequest, type ChatStreamOptions } from "./chat-routes";
 import { effectiveOllamaUrl, checkOllamaHealth, checkOllamaModelSupportsTools, resolveWindowsHostIP, resolveDesiredOllamaModel } from "./ollama";
-import { buildClaudeCliChatArgs, streamClaudeCli, isClaudeCliAvailable, compactTurnHistoryForCli } from "./claude-cli";
+import {
+  buildClaudeCliChatArgs,
+  streamClaudeCli,
+  isClaudeCliAvailable,
+  compactTurnHistoryForCli,
+  claudeCliSupportsNoSessionPersistence,
+  configuredCliForcesResume,
+} from "./claude-cli";
 import { ReasoningParser, stripReasoningFromText, type ReasoningEvent } from "./reasoning";
 import {
   listOpenRouterModels,
@@ -468,19 +476,47 @@ function terminalStatusForRunOutcome(
   return "partial";
 }
 
+function pathWithinRoot(realRoot: string, realCandidate: string): boolean {
+  const rel = relative(realRoot, realCandidate);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
 /**
- * Canonical path attached to a runtime evidence ref: only from a path-shaped
- * runtime argument that resolves on disk through the shared path-identity
- * helper. A relative/unknown/nonexistent path yields null rather than a
- * fabricated location. Observation is not verification authority.
+ * Canonical path attached to a runtime evidence ref. A relative argument is
+ * resolved against the trusted execution workspace (never the Bun process
+ * cwd) and accepted only when the real path stays inside the execution
+ * workspace or an authorized session grant. A path that is nonexistent,
+ * outside every authorized root, or otherwise not runtime-normalizable yields
+ * null rather than a fabricated location. Observation is not authority.
  */
-function canonicalToolArgumentPath(args: Record<string, unknown> | undefined | null): string | null {
+function canonicalToolArgumentPath(
+  args: Record<string, unknown> | undefined | null,
+  ctx: Pick<ExecutionContext, "workspace_path" | "session_grants">,
+): string | null {
   if (!args || typeof args !== "object") return null;
-  for (const key of ["path", "file_path", "directory"] as const) {
+  const workspace = typeof ctx.workspace_path === "string" && ctx.workspace_path ? ctx.workspace_path : null;
+  const roots = [workspace, ...(ctx.session_grants ?? [])]
+    .filter((root): root is string => typeof root === "string" && root.length > 0)
+    .map((root) => {
+      try { return realpathSync(root); } catch { return null; }
+    })
+    .filter((root): root is string => root !== null);
+  if (roots.length === 0) return null;
+
+  // `relative_workspace_path` is the runtime's own alias for `path`; include
+  // it so a path the runtime normalized is still attributable.
+  for (const key of ["path", "relative_workspace_path", "file_path", "directory"] as const) {
     const value = (args as Record<string, unknown>)[key];
     if (typeof value !== "string" || value.trim().length === 0) continue;
+    const candidate = isAbsolute(value)
+      ? value
+      : workspace
+        ? resolve(workspace, value)
+        : null;
+    if (!candidate) return null;
     try {
-      const real = realpathSync(value);
+      const real = realpathSync(candidate);
+      if (!roots.some((root) => pathWithinRoot(root, real))) return null;
       return resolveWorkspacePathIdentity(real) ?? null;
     } catch {
       return null;
@@ -1436,20 +1472,25 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
   // prepared effective workspace, and this actual active workspace (enforced
   // inside the registry). Any failure yields a null envelope and ordinary
   // inference; it never changes workspace grants.
-  const memoryTurnId = typeof options.turnId === "string" && options.turnId.length > 0
+  const providedTurnId = typeof options.turnId === "string" && options.turnId.length > 0
     ? options.turnId
     : undefined;
+  // Ordinary streams receive a stable server-local transient turn identity so
+  // terminal/status frames can always correlate them. It is never persisted,
+  // never native-recorded, and carries no memory authority. A caller-provided
+  // native turn id is preserved exactly.
+  const memoryTurnId = providedTurnId ?? crypto.randomUUID();
   const memoryPreparationId = typeof options.memoryPreparationId === "string" && options.memoryPreparationId.length > 0
     ? options.memoryPreparationId
     : undefined;
   let turnMemoryConsume: ConsumeMemoryResult | null = null;
-  if (memoryTurnId && memoryPreparationId) {
+  if (providedTurnId && memoryPreparationId) {
     try {
       turnMemoryConsume = resolveTurnMemory(
         nativeMemoryRegistry,
         {
           preparationId: memoryPreparationId,
-          turnId: memoryTurnId,
+          turnId: providedTurnId,
           sessionId,
           message,
         },
@@ -1551,7 +1592,6 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       envelope: PreparedMemoryTurn | null,
       code?: string,
     ): Promise<void> => {
-      if (!memoryTurnId) return;
       await streamWrite(`data: ${JSON.stringify({
         type: "memory_status",
         turn_id: memoryTurnId,
@@ -1584,7 +1624,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         status: applied.status,
       });
     };
-    const observeTurnMemoryToolEvidence = (call: ToolCall, result: ToolResult): void => {
+    const observeTurnMemoryToolEvidence = (
+      call: ToolCall,
+      result: ToolResult,
+      executionCtx: Pick<ExecutionContext, "workspace_path" | "session_grants">,
+    ): void => {
       if (!activeTurnMemory) return;
       const rawOutput = result.is_error ? (result.error || result.output) : result.output;
       let digest = "";
@@ -1597,12 +1641,38 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       nativeMemoryRegistry.observeToolEvidence(activeTurnMemory.preparationId, {
         tool_call_id: call.id,
         tool_name: call.name,
-        canonical_path: canonicalToolArgumentPath(call.arguments),
+        canonical_path: canonicalToolArgumentPath(call.arguments, executionCtx),
         output_sha256: digest,
         observed_at: new Date().toISOString(),
         success: !result.is_error,
       });
     };
+    /**
+     * Fit the same snapshot against a CLEAN base message list and return the
+     * cloned list carrying at most one carrier. Never mutate the clean base.
+     */
+    const attachTurnMemory = (
+      cleanMessages: readonly any[],
+      toolSchemas: unknown,
+      contextWindowTokens: number | null,
+      outputReserveTokens: number | null,
+    ): { messages: any[]; applied: AppliedTurnMemory | null } => {
+      if (!turnMemoryEnvelope) return { messages: cleanMessages as any[], applied: null };
+      const applied = fitTurnMemory(
+        turnMemoryEnvelope,
+        cleanMessages as any,
+        resolveTurnMemoryInputBudget({
+          contextWindowTokens,
+          outputReserveTokens,
+          toolSchemaTokens: toolSchemas ? countTokens(JSON.stringify(toolSchemas)) : 0,
+        }),
+      );
+      return {
+        messages: applied.block ? withTurnMemory(cleanMessages as any, applied) : (cleanMessages as any[]),
+        applied,
+      };
+    };
+
     const recordMemoryTerminal = (
       status: MemoryTurnTerminalStatus,
       errorCode: string | null = null,
@@ -1620,6 +1690,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       sessionId,
       write: streamWrite,
       isAborted: () => streamAbort.signal.aborted,
+      turnId: memoryTurnId,
     });
     // Emit the stable turn identity + prepared selection metadata before
     // admission so setup failure, cancellation, and EOF still carry it. A
@@ -1648,7 +1719,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       recordMemoryTerminal(clientDisconnected ? "unterminated" : "cancelled", cancelReason);
       if (session.noteOutcome()) {
         session.noteTerminal();
-        await streamWrite(`data: ${JSON.stringify({ type: "cancelled", session_id: sessionId, reason: cancelReason })}\n\n`);
+        await streamWrite(`data: ${JSON.stringify({ type: "cancelled", session_id: sessionId, turn_id: memoryTurnId, reason: cancelReason })}\n\n`);
       }
       throw new StreamCancelledError();
     };
@@ -1727,16 +1798,25 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const reasoningParser = new ReasoningParser(sessionId);
         // Memory-enabled fresh-turn mode. A consumed snapshot must never ride
         // on `cliSessionMap` resume: deleted/invalidated memory could otherwise
-        // survive in the CLI's persisted session. If the configured CLI args
-        // force resume/continue, this mode is unsupported — report unavailable
-        // and run ordinary CLI inference without recall.
+        // survive in the CLI's persisted session. The mode additionally
+        // requires the installed executable to accept
+        // `--no-session-persistence`; if it cannot, or configured args force
+        // resume/continue (including equals forms), report unavailable and run
+        // ordinary CLI inference WITHOUT a memory appendix or an unknown flag.
         const memoryCliRequested = activeTurnMemory !== null;
-        const cliResumeFlags = new Set(["--resume", "-r", "--continue", "-c", "--session-id"]);
-        const cliArgsForceResume = (cfg.claude_cli.args || []).some((arg) => cliResumeFlags.has(arg));
-        const memoryCliSupported = memoryCliRequested && !cliArgsForceResume;
+        const cliArgsForceResume = configuredCliForcesResume(cfg.claude_cli.args);
+        const cliSupportsNoPersistence = memoryCliRequested && !cliArgsForceResume
+          ? await claudeCliSupportsNoSessionPersistence(cfg.claude_cli.path)
+          : false;
+        const memoryCliSupported = memoryCliRequested && !cliArgsForceResume && cliSupportsNoPersistence;
         if (memoryCliRequested && !memoryCliSupported) {
-          console.warn(`[Jarvis] Memory-enabled Claude CLI mode unsupported (configured resume/continue flags) session=${sessionId} — running ordinary CLI inference without recall`);
-          await emitMemoryStatusFrame("unavailable", null, "cli_mode_unsupported");
+          const reason = cliArgsForceResume ? "cli_mode_unsupported" : "cli_capability_unavailable";
+          console.warn(`[Jarvis] Memory-enabled Claude CLI mode unavailable (${reason}) session=${sessionId} — running ordinary CLI inference without recall`);
+          await emitMemoryStatusFrame("unavailable", null, reason);
+          // Truthful private receipt: record unavailability/empty application
+          // rather than leaving recall_status at `ready` while only the wire
+          // frame says unavailable.
+          observeTurnMemoryObservation({ stage: "claude_cli", selected_ids: [], status: "unavailable" });
         }
         const resumedSessionId = memoryCliSupported ? undefined : cliSessionMap.get(sessionId);
         const historyForCli = !resumedSessionId
@@ -1757,10 +1837,21 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         let promptBody = basePromptBody;
         let cliMemoryApplied: AppliedTurnMemory | null = null;
         if (memoryCliSupported && activeTurnMemory) {
+          // Budget against the actual CLI request: bounded history + user
+          // prompt + the appended system prompt, plus an explicit conservative
+          // reserve for unknown CLI stock/MCP tool-schema and output overhead.
+          const cliBaseMessages: Array<{ role: string; content: string }> = [
+            ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
+            { role: "user", content: basePromptBody },
+          ];
           cliMemoryApplied = fitTurnMemory(
             activeTurnMemory.envelope,
-            [{ role: "user", content: basePromptBody }],
-            resolveTurnMemoryInputBudget({ contextWindowTokens: null, outputReserveTokens: null }),
+            cliBaseMessages,
+            resolveTurnMemoryInputBudget({
+              contextWindowTokens: null,
+              outputReserveTokens: null,
+              additionalReserveTokens: TURN_MEMORY_CLI_OVERHEAD_RESERVE_TOKENS,
+            }),
           );
           if (cliMemoryApplied.block) {
             promptBody = `${basePromptBody}\n\n${cliMemoryApplied.block}`;
@@ -1839,21 +1930,30 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               session_id: sessionId,
             })}\n\n`));
           } else if (evt.type === "message_stop") {
-            recordMemoryTerminal("completed");
+            // Transport terminator only. An assistant `message_stop` is NOT
+            // the authoritative whole-turn result and must never latch the
+            // turn as completed before a later error/partial/cancel.
             session.noteTerminal();
-            await streamWrite(`data: ${JSON.stringify({ type: "message_stop", session_id: sessionId })}\n\n`);
+            await streamWrite(`data: ${JSON.stringify({ type: "message_stop", session_id: sessionId, turn_id: memoryTurnId })}\n\n`);
           } else if (evt.type === "error") {
             if (resumedSessionId) {
               cliSessionMap.delete(sessionId);
             }
             recordMemoryTerminal("failed", "claude_cli_error");
             if (session.noteOutcome()) {
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ ...evt, session_id: sessionId })}\n\n`));
+              await writer.write(encoder.encode(`data: ${JSON.stringify({ ...evt, session_id: sessionId, turn_id: memoryTurnId })}\n\n`));
             }
           } else if (evt.type === "result") {
-            if (evt.is_error === true) {
-              recordMemoryTerminal("failed", "claude_cli_result_error");
-            }
+            // The CLI `result` record is the authoritative turn outcome.
+            const cliResultIsError = evt.is_error === true
+              || (typeof evt.subtype === "string" && evt.subtype.startsWith("error"));
+            const cliResultIsPartial = !cliResultIsError
+              && typeof evt.subtype === "string"
+              && /partial|interrupt|length|max_turns|max_tokens/i.test(evt.subtype);
+            recordMemoryTerminal(
+              cliResultIsError ? "failed" : cliResultIsPartial ? "partial" : "completed",
+              cliResultIsError ? (evt.subtype ?? "claude_cli_result_error") : null,
+            );
             if (evt.session_id && !memoryCliSupported) {
               cliSessionMap.set(sessionId, evt.session_id);
             }
@@ -1873,7 +1973,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_complete", trace, session_id: sessionId })}\n\n`));
             }
             if (session.noteOutcome()) {
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ ...evt, session_id: sessionId })}\n\n`));
+              await writer.write(encoder.encode(`data: ${JSON.stringify({ ...evt, session_id: sessionId, turn_id: memoryTurnId })}\n\n`));
             }
           }
         }
@@ -1895,7 +1995,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       // only when a validated snapshot was consumed. Hashes the raw result
       // before any caller context truncation.
       if (activeTurnMemory) {
-        ctx.onToolResult = (call, result) => observeTurnMemoryToolEvidence(call, result);
+        ctx.onToolResult = (call, result) => observeTurnMemoryToolEvidence(call, result, ctx);
       }
       // Wire the approval hook: emit a `tool_approval_request` SSE event so
       // the Tauri runner relays it to the UI (ToolApprovalModal), then await
@@ -2359,37 +2459,45 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           });
 
           // ── Ephemeral native memory at this stage's final provider boundary ──
-          // Fitted against the fully assembled request (cache-stable prefix +
-          // normalization already applied), reserving tool schemas and output
-          // tokens. Attached to the request's cloned message list only; the
-          // stage messages, activeHistory, and every cache stay memory-free.
-          let attemptAppliedMemory: AppliedTurnMemory | null = null;
-          if (turnMemoryEnvelope) {
-            const candidateContextWindow = isLlamaCpp
-              ? cfg.llama_cpp.context_window
-              : isOllama
-                ? (cfg.profiles?.[cfg.active_profile]?.context_window ?? cfg.ollama.options?.num_ctx ?? 8192)
-                : isOpenCodeProvider
-                  ? null
-                  : (openRouterEffective?.context_length ?? null);
+          // The cascade path carries the reference and refits + attaches
+          // independently per candidate; the single-provider path fits inline
+          // against the fully assembled request (cache-stable prefix +
+          // normalization already applied), reserving tool schemas and output.
+          // `requestBody` itself stays memory-free as the clean base so a
+          // candidate/retry never re-fits a list that already has memory.
+          const providerContextWindow = isLlamaCpp
+            ? cfg.llama_cpp.context_window
+            : isOllama
+              ? (cfg.profiles?.[cfg.active_profile]?.context_window ?? cfg.ollama.options?.num_ctx ?? 8192)
+              : isOpenCodeProvider
+                ? null
+                : (openRouterEffective?.context_length ?? null);
+          const stageContextCeiling = typeof callOptions?.contextCeilingTokens === "number"
+            ? callOptions.contextCeilingTokens
+            : null;
+          const candidateContextWindow = stageContextCeiling == null
+            ? providerContextWindow
+            : providerContextWindow == null
+              ? stageContextCeiling
+              : Math.min(providerContextWindow, stageContextCeiling);
+          const attemptMemoryFallback = turnMemoryEnvelope && useFallback
+            ? {
+                envelope: turnMemoryEnvelope,
+                contextWindowFor: (): number | null => candidateContextWindow,
+                onApplied: (observation: MemoryAppliedObservation) => observeTurnMemoryObservation(observation),
+              }
+            : undefined;
+          if (turnMemoryEnvelope && !useFallback) {
             const outputReserve = typeof requestBody.max_tokens === "number"
               ? requestBody.max_tokens
               : typeof requestBody.max_completion_tokens === "number"
                 ? requestBody.max_completion_tokens
                 : cfg.max_tokens;
-            attemptAppliedMemory = fitTurnMemory(
-              turnMemoryEnvelope,
-              normalizedMessages,
-              resolveTurnMemoryInputBudget({
-                contextWindowTokens: candidateContextWindow,
-                outputReserveTokens: outputReserve,
-                toolSchemaTokens: requestBody.tools ? countTokens(JSON.stringify(requestBody.tools)) : 0,
-              }),
-            );
-            if (attemptAppliedMemory.block) {
-              requestBody.messages = withTurnMemory(normalizedMessages, attemptAppliedMemory);
+            const attached = attachTurnMemory(normalizedMessages, requestBody.tools, candidateContextWindow, outputReserve);
+            if (attached.applied) {
+              requestBody.messages = attached.messages;
+              observeTurnMemoryApplied(stageLabel ?? "orchestrator", attached.applied);
             }
-            observeTurnMemoryApplied(stageLabel ?? "orchestrator", attemptAppliedMemory);
           }
 
           let fetchRes: Response;
@@ -2404,6 +2512,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 excludeModels: stageExclusions,
                 deadlineAt: turnBudget.deadlineAt,
                 turnBudgetMs: TOTAL_TURN_TIMEOUT_MS,
+                memory: attemptMemoryFallback,
               });
               fetchRes = result.response;
               actualModelUsed = result.model_used;
@@ -2481,11 +2590,32 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               console.warn(`[Jarvis Orchestrator] Model ${actualModelUsed} does not support native tools. Retrying without tools...`);
               delete requestBody.tools;
               const instructions = buildTextToolInstructions(runtime.listTools());
-              const systemMessage = requestBody.messages.find((item: any) => item.role === "system");
-              if (systemMessage) {
-                systemMessage.content = [systemMessage.content, instructions].filter(Boolean).join("\n\n");
+              // Rebuild from the CLEAN base, add text-tool instructions, then
+              // refit against the changed system/tool cost and attach exactly
+              // one new carrier. Never re-fit a list that already has memory.
+              const retryBase = normalizedMessages.map((m: any) => ({ ...m }));
+              const retrySystemIndex = retryBase.findIndex((m: any) => m.role === "system");
+              if (retrySystemIndex >= 0) {
+                retryBase[retrySystemIndex] = {
+                  ...retryBase[retrySystemIndex],
+                  content: [retryBase[retrySystemIndex].content, instructions].filter(Boolean).join("\n\n"),
+                };
               } else {
-                requestBody.messages.unshift({ role: "system", content: instructions });
+                retryBase.unshift({ role: "system", content: instructions });
+              }
+              if (turnMemoryEnvelope) {
+                const retryOutputReserve = typeof requestBody.max_tokens === "number"
+                  ? requestBody.max_tokens
+                  : typeof requestBody.max_completion_tokens === "number"
+                    ? requestBody.max_completion_tokens
+                    : cfg.max_tokens;
+                const retryAttached = attachTurnMemory(retryBase, undefined, null, retryOutputReserve);
+                requestBody.messages = retryAttached.applied ? retryAttached.messages : retryBase;
+                if (retryAttached.applied) {
+                  observeTurnMemoryApplied(`${stageLabel ?? "orchestrator"}:retry`, retryAttached.applied);
+                }
+              } else {
+                requestBody.messages = retryBase;
               }
               clearTimeout(timeout);
               cleanupRequestAbort();
@@ -2506,9 +2636,6 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 request: retryCtrl,
               });
               try {
-                if (attemptAppliedMemory) {
-                  observeTurnMemoryApplied(`${stageLabel ?? "orchestrator"}:retry`, attemptAppliedMemory);
-                }
                 fetchRes = await fetch(providerChatUrl(retryTarget, actualModelUsed), {
                   method: "POST",
                   headers: providerHeaders(cfg, retryTarget, actualModelUsed),
@@ -4572,29 +4699,30 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         }
 
         // ── Ephemeral native memory at the final direct-provider boundary ──
-        // Injected after compaction, context optimization, and normalization,
-        // reserving tool schemas and output tokens. `requestBody.messages` is
-        // a cloned list; activeHistory/originalHistory stay untouched.
-        let appliedTurnMemoryForRequest: AppliedTurnMemory | null = null;
-        if (turnMemoryEnvelope) {
+        // Injected after compaction, context optimization, and normalization.
+        // The cascade path refits + attaches independently per candidate; the
+        // single-provider path fits inline. `requestBody` stays memory-free as
+        // the clean base so a candidate/retry never re-fits a list already
+        // carrying memory. activeHistory/originalHistory stay untouched.
+        const directUseFallback = !isOllama && cfg.openrouter.enable_fallbacks;
+        const directMemoryFallback = turnMemoryEnvelope && directUseFallback
+          ? {
+              envelope: turnMemoryEnvelope,
+              contextWindowFor: (): number | null => null,
+              onApplied: (observation: MemoryAppliedObservation) => observeTurnMemoryObservation(observation),
+            }
+          : undefined;
+        if (turnMemoryEnvelope && !directUseFallback) {
           const outputReserve = typeof requestBody.max_tokens === "number"
             ? requestBody.max_tokens
             : typeof requestBody.max_completion_tokens === "number"
               ? requestBody.max_completion_tokens
               : cfg.max_tokens;
-          appliedTurnMemoryForRequest = fitTurnMemory(
-            turnMemoryEnvelope,
-            normalizedMessages,
-            resolveTurnMemoryInputBudget({
-              contextWindowTokens: num_ctx,
-              outputReserveTokens: outputReserve,
-              toolSchemaTokens: requestBody.tools ? countTokens(JSON.stringify(requestBody.tools)) : 0,
-            }),
-          );
-          if (appliedTurnMemoryForRequest.block) {
-            requestBody.messages = withTurnMemory(normalizedMessages, appliedTurnMemoryForRequest);
+          const attached = attachTurnMemory(normalizedMessages, requestBody.tools, num_ctx, outputReserve);
+          if (attached.applied) {
+            requestBody.messages = attached.messages;
+            observeTurnMemoryApplied("agent_loop", attached.applied);
           }
-          observeTurnMemoryApplied("agent_loop", appliedTurnMemoryForRequest);
         }
 
         const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -4605,7 +4733,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           headers["X-Title"] = cfg.openrouter.site_name || "Jarvis";
         }
 
-        const useFallback = !isOllama && cfg.openrouter.enable_fallbacks;
+        const useFallback = directUseFallback;
         const requestTimeout = isOllama ? MODEL_REQUEST_TIMEOUT_MS : (cfg.openrouter.timeout_ms || MODEL_REQUEST_TIMEOUT_MS);
         const ctrl = new AbortController();
         const requestBudgetMs = computeBoundedRequestTimeoutMs("agent_loop", turnBudget, requestTimeout);
@@ -4630,6 +4758,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               stage: "agent_loop",
               deadlineAt: turnBudget.deadlineAt,
               turnBudgetMs: TOTAL_TURN_TIMEOUT_MS,
+              memory: directMemoryFallback,
             });
             fetchRes = result.response;
             actualModelUsed = result.model_used;
@@ -4689,11 +4818,28 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             delete requestBody.tools;
             useTextToolProtocol = true;
             const instructions = buildTextToolInstructions(runtime.listTools());
-            const systemMessage = requestBody.messages.find((item: any) => item.role === "system");
-            if (systemMessage) {
-              systemMessage.content = [systemMessage.content, instructions].filter(Boolean).join("\n\n");
+            // Rebuild from the CLEAN base, add text-tool instructions, then
+            // refit against the changed system/tool cost and attach exactly one
+            // new carrier. Never reuse the initial applied IDs.
+            const retryBase = normalizedMessages.map((m: any) => ({ ...m }));
+            const retrySystemIndex = retryBase.findIndex((m: any) => m.role === "system");
+            if (retrySystemIndex >= 0) {
+              retryBase[retrySystemIndex] = {
+                ...retryBase[retrySystemIndex],
+                content: [retryBase[retrySystemIndex].content, instructions].filter(Boolean).join("\n\n"),
+              };
             } else {
-              requestBody.messages.unshift({ role: "system", content: instructions });
+              retryBase.unshift({ role: "system", content: instructions });
+            }
+            const retryOutputReserve = typeof requestBody.max_tokens === "number"
+              ? requestBody.max_tokens
+              : typeof requestBody.max_completion_tokens === "number"
+                ? requestBody.max_completion_tokens
+                : cfg.max_tokens;
+            const retryAttached = attachTurnMemory(retryBase, undefined, num_ctx, retryOutputReserve);
+            requestBody.messages = retryAttached.applied ? retryAttached.messages : retryBase;
+            if (retryAttached.applied) {
+              observeTurnMemoryApplied("agent_loop:retry", retryAttached.applied);
             }
             const retryCtrl = new AbortController();
             // Recompute immediately before the fallback fetch. Time consumed by
@@ -4702,9 +4848,6 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             const retryTimeout = setTimeout(() => retryCtrl.abort(), retryRequestBudgetMs);
             const cleanupRetryAbort = registerAbortHandler(streamAbort.signal, () => retryCtrl.abort());
             try {
-              if (appliedTurnMemoryForRequest) {
-                observeTurnMemoryApplied("agent_loop:retry", appliedTurnMemoryForRequest);
-              }
               fetchRes = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(requestBody), signal: retryCtrl.signal });
               if (!fetchRes.ok) {
                 const retryErrText = await fetchRes.text();

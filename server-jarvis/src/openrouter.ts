@@ -16,6 +16,10 @@ import { isTemporarilyExcluded, recordHardFailure, recordRateLimit, recordStall,
 import { backendForProvider, recordInferenceAttempt } from "./inference-metrics";
 import { TurnDeadlineExceededError } from "./stream-liveness";
 import { openCodeGoProtocolForModel } from "./orchestration/live-model-catalog";
+import { countTokens } from "./tokens";
+import type { MemoryAppliedObservation } from "./native-memory";
+import type { PreparedMemoryTurn } from "./memory-contract";
+import { fitTurnMemory, resolveTurnMemoryInputBudget, withTurnMemory } from "./turn-memory-context";
 
 // ═══════════════════════════════════════════════════════════════
 // Types
@@ -585,6 +589,19 @@ interface FallbackResolveOptions {
   deadlineAt?: number;
   /** Original turn budget, retained for actionable timeout metadata. */
   turnBudgetMs?: number;
+  /**
+   * Ephemeral native recall to refit and attach independently for every
+   * cascade candidate (including same-model retries). `requestBody` must be
+   * supplied WITHOUT any memory carrier; this option attaches exactly one
+   * framed block per attempted request against that attempt's own messages,
+   * tools, output reserve, and context constraint.
+   */
+  memory?: {
+    envelope: PreparedMemoryTurn;
+    /** Provider/model → context window; null uses the conservative fallback. */
+    contextWindowFor?: (provider: HttpProviderId, modelId: string) => number | null;
+    onApplied?: (observation: MemoryAppliedObservation) => void;
+  };
 }
 
 function assertFallbackDeadline(options: FallbackResolveOptions): void {
@@ -1025,6 +1042,38 @@ export async function chatCompletionWithFallback(
       try {
         totalAttempts += 1;
         const attemptBody = await buildAttemptBody(cfg, provider, requestBody, model);
+        // Refit memory against THIS candidate's complete assembled request
+        // (messages + tools + output reserve + context) and attach exactly one
+        // carrier. `requestBody` stays memory-free so the next candidate/retry
+        // rebuilds clean rather than re-fitting a list that already has memory.
+        if (options.memory) {
+          const cleanMessages: unknown[] = Array.isArray(attemptBody.messages) ? attemptBody.messages : [];
+          const applied = fitTurnMemory(
+            options.memory.envelope,
+            cleanMessages as any,
+            resolveTurnMemoryInputBudget({
+              contextWindowTokens: options.memory.contextWindowFor?.(provider, model) ?? null,
+              outputReserveTokens: typeof attemptBody.max_tokens === "number"
+                ? attemptBody.max_tokens
+                : typeof attemptBody.max_completion_tokens === "number"
+                  ? attemptBody.max_completion_tokens
+                  : null,
+              toolSchemaTokens: attemptBody.tools ? countTokens(JSON.stringify(attemptBody.tools)) : 0,
+            }),
+          );
+          if (applied.block) {
+            attemptBody.messages = withTurnMemory(cleanMessages as any, applied);
+          }
+          try {
+            options.memory.onApplied?.({
+              stage: options.stage ?? "agent",
+              selected_ids: applied.selected_ids,
+              status: applied.status,
+            });
+          } catch {
+            // Observation is diagnostics only; never affect the cascade.
+          }
+        }
         // Headers leash (live incident 2026-07-16 PM, session f458849c): the
         // body-bytes watchdog below only arms AFTER the HTTP response headers
         // arrive. A provider that accepts the connection and never answers

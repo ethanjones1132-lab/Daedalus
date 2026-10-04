@@ -176,6 +176,73 @@ export function buildLocalClaudeEnv(
   };
 }
 
+/** Resume/continuation flags that make a fresh, persistence-free turn impossible. */
+const CLAUDE_RESUME_FLAGS = new Set(["--resume", "-r", "--continue", "-c", "--session-id"]);
+
+/**
+ * Whether configured CLI args force resuming/continuing an existing session.
+ * Handles both space-separated (`--resume <id>`) and equals forms
+ * (`--resume=<id>`, `--session-id=<id>`), so equals forms cannot bypass the
+ * memory fresh-turn guard.
+ */
+export function configuredCliForcesResume(args: readonly string[] | undefined): boolean {
+  if (!args) return false;
+  return args.some((arg) => {
+    if (typeof arg !== "string" || arg.length === 0) return false;
+    const name = arg.startsWith("-") ? arg.split("=", 1)[0] : arg;
+    return CLAUDE_RESUME_FLAGS.has(name);
+  });
+}
+
+/**
+ * Cached, bounded probe for `--no-session-persistence` support. The flag is
+ * required for a memory-enabled fresh CLI turn; a CLI that cannot accept it
+ * must fall back to ordinary inference rather than receive an unknown flag.
+ * Fails closed (unsupported) on spawn error or timeout.
+ */
+export function claudeCliSupportsNoSessionPersistence(path: string): Promise<boolean> {
+  const resolved = resolveClaudePath(path);
+  const cached = noSessionPersistenceProbes.get(resolved);
+  if (cached) return cached;
+  const probe = probeClaudeCliForFlag(resolved, "--no-session-persistence");
+  noSessionPersistenceProbes.set(resolved, probe);
+  return probe;
+}
+
+const noSessionPersistenceProbes = new Map<string, Promise<boolean>>();
+const CLI_HELP_OUTPUT_CAP = 64 * 1024;
+
+function probeClaudeCliForFlag(executable: string, flag: string): Promise<boolean> {
+  return new Promise<boolean>((resolveProbe) => {
+    let output = "";
+    let settled = false;
+    const finish = (supported: boolean): void => {
+      if (settled) return;
+      settled = true;
+      resolveProbe(supported);
+    };
+    let proc: ReturnType<typeof spawn>;
+    try {
+      proc = spawn(executable, ["--help"], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    } catch {
+      finish(false);
+      return;
+    }
+    const timer = setTimeout(() => {
+      try { proc.kill("SIGKILL"); } catch {}
+      finish(false);
+    }, 5_000);
+    const append = (chunk: Buffer | string): void => {
+      if (output.length >= CLI_HELP_OUTPUT_CAP) return;
+      output += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    };
+    proc.stdout?.on("data", append);
+    proc.stderr?.on("data", append);
+    proc.once("error", () => { clearTimeout(timer); finish(false); });
+    proc.once("close", () => { clearTimeout(timer); finish(output.includes(flag)); });
+  });
+}
+
 export function buildLocalClaudeArgs(
   args: string[],
   { authMode }: ClaudeCliLaunchOptions = { authMode: "proxy" },

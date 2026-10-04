@@ -3463,6 +3463,9 @@ export class PipelineExecutor {
             stream: true,
             stageLabel: "executor",
             stageRunId,
+            // Effective stage context ceiling; the provider-boundary memory
+            // fit intersects this with the provider context window.
+            contextCeilingTokens: transcriptBudgetTokens,
             complexity: options.estimatedComplexity,
             preferStrongModel: preferStrongNextTurn,
             excludeModels: inLoopModelExclusions.length > 0 ? inLoopModelExclusions : options.modelExclusions,
@@ -4427,6 +4430,9 @@ export class PipelineExecutor {
             stream: true,
             stageLabel: "rewriter",
             stageRunId,
+            // Effective stage context ceiling; intersected with the provider
+            // context window at the memory fit boundary.
+            contextCeilingTokens: rewriterTranscriptBudget,
             complexity: options.estimatedComplexity,
             advanceOnEmpty: true,
             stageAbort: this.registerStageAbort("rewriter"),

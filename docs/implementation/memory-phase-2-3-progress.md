@@ -105,10 +105,10 @@
   args force resume/continue, the mode is unsupported: `memory_status`
   reports `unavailable` with `cli_mode_unsupported` and ordinary CLI inference
   runs without recall.
-- `orchestration/prompt-cache-stable.ts` and `claude-cli.ts` required **no
-  source change**: the cache-stable head stays memory-free because injection is
-  a cloned tail, and the CLI adds `--no-session-persistence` at the call site
-  while `streamClaudeCli` already omits `--resume` when no session id is given.
+- `orchestration/prompt-cache-stable.ts` required **no source change**: the
+  cache-stable head stays memory-free because injection is a cloned tail.
+  `claude-cli.ts` gains the fresh-turn capability probe and resume-flag
+  detection described in the corrective pass below.
 
 ## Task 4 — Exact observations for authenticated sync
 
@@ -126,10 +126,12 @@
 - `recordMemoryTerminal` records the authoritative terminal into the registry
   before any terminal SSE is yielded, at every terminal seam: orchestrator
   success/partial/error/empty/short-circuit, direct success/`ask_user_question`,
-  CLI `message_stop`/`error`/error result, admission deadline, cancellation,
-  and the outer error path. Abrupt client disconnect is `unterminated`;
-  `finally` records a last `unterminated`/`cancelled` before `ensureTerminal`.
-  A model/tool success is never recorded as an accepted fact.
+  CLI authoritative `result` success/partial/error and `error`, admission
+  deadline, cancellation, and the outer error path. A CLI `message_stop` is a
+  transport terminator only and never latches completion. Abrupt client
+  disconnect is `unterminated`; `finally` records a last
+  `unterminated`/`cancelled` before `ensureTerminal`. A model/tool success is
+  never recorded as an accepted fact.
 
 ## Frozen-interface compliance
 
@@ -148,20 +150,83 @@
 
 - Covered: direct Ollama, llama.cpp, and OpenRouter; orchestrated coordinator,
   planner, executor, reviewer, rewriter, and synthesizer; native-tool-protocol
-  retry; recursive re-entry; Claude delegate; and main memory-enabled Claude
-  CLI fresh-turn mode.
+  retry; cross-provider cascade candidates; recursive re-entry; Claude
+  delegate; and main memory-enabled Claude CLI fresh-turn mode.
 - Standalone HTTP-only, cron, Agent, and MCP inference paths do not supply a
-  preparation reference and remain memory-unavailable by design.
-- `chatCompletionWithFallback`'s *internal* per-candidate cascade reuses the
-  already-fitted body; it is not re-fit per internal cascade model. The block
-  is ≤4,000 scalars and is fit under a conservative input floor, and every new
-  stage/outer attempt refits. This is a bounded limitation, not a claim of
-  per-candidate budget exactness.
+  preparation reference. They now receive a stable server-local transient
+  `turn_id` and an explicit `memory_status unavailable` frame, and can never
+  elevate a status from the client-supplied `memory_status` hint.
+- `chatCompletionWithFallback` refits and attaches the snapshot independently
+  for every cascade candidate and same-model retry, against that attempt's own
+  messages, tool schemas, output reserve, and context constraint (the stage
+  ceiling intersected with the provider window when both are known; a
+  conservative floor otherwise). `requestBody` is passed memory-free as the
+  clean base, so no attempt re-fits a list that already carries memory.
 - Live conductor supervision (`persistentConductor.supervise`) is an internal
   control-plane call with cached prefix state; it is deliberately excluded so
   no recalled block can enter conductor cache state.
 - The delegate/main-CLI context window is unknown at this seam; both use the
-  conservative fallback rather than assuming an unlimited CLI context.
+  conservative fallback plus an explicit `TURN_MEMORY_CLI_OVERHEAD_RESERVE_TOKENS`
+  reserve for stock/MCP tool schemas and output overhead, and omit memory
+  truthfully when it cannot be safely fit.
+- Tool evidence paths only from a runtime argument that resolves inside the
+  trusted execution workspace or an authorized session grant (relative paths
+  resolve against the execution workspace, never the Bun process cwd); CLI and
+  delegate tool events are never turned into fabricated evidence.
+
+## Root-review corrective pass
+
+A root review of the initial 2.3 source identified six concrete gaps. All were
+corrected in source in this same session with no tests/runtime execution.
+
+1. **CLI terminal is authoritative.** `recordMemoryTerminal("completed")` was
+   removed from the CLI `message_stop` handler (now a transport terminator
+   only). The CLI `result` record is now the authoritative outcome: `is_error`
+   or an `error` subtype → `failed`; a partial/interrupt/length/max-turns
+   subtype → `partial`; otherwise `completed`; recorded before the result frame
+   is published. Missing result falls through to `finally` normalization
+   (`unterminated`). Every direct/orchestrated terminal branch remains
+   explicitly recorded. `StreamSession` and the CLI/cancelled frames now carry
+   the stable `turn_id` even when no inference `run_id` exists.
+2. **CLI fresh-turn support is verified, not assumed.** Added
+   `configuredCliForcesResume` (handles `--resume=<id>`, `--session-id=<id>`,
+   `-r=`, `-c=`) and a bounded, cached `claudeCliSupportsNoSessionPersistence`
+   probe of `--help`. Unsupported/unknown capability reports `unavailable`
+   (`cli_mode_unsupported` / `cli_capability_unavailable`), runs ordinary
+   inference without a memory appendix or an unknown flag, preserves existing
+   permission arguments, and records `unavailable` with empty applied IDs on
+   the private receipt. Applied IDs are observed only on real dispatched
+   events, never on pre-spawn `init`/`error`, and memory-enabled CLI sessions
+   are neither resumed nor persisted.
+3. **Budgets use the real request.** Main CLI now fits against bounded history
+   + current user + the appended system prompt; delegate fits against the full
+   delegate prompt; both add an explicit
+   `TURN_MEMORY_CLI_OVERHEAD_RESERVE_TOKENS` reserve for unknown stock/MCP tool
+   schemas and output overhead and omit memory truthfully when it cannot fit.
+   Direct/orchestrated cascade candidates refit independently against their own
+   assembled messages/tools/output/context.
+4. **Canonical evidence path is trustworthy.** `canonicalToolArgumentPath`
+   resolves relative arguments against the trusted execution workspace and
+   accepts only real paths contained in the execution workspace or an
+   authorized session grant (never the Bun process cwd); unknown/outside paths
+   are `null`. The raw output is hashed before caller truncation; CLI/delegate
+   tool events never fabricate evidence.
+5. **Native-tool fallback no longer reuses the fitted carrier.** Both the
+   shared orchestrator and direct branches now rebuild a clean cloned base
+   without the memory carrier, add the text-tool instructions, refit against
+   the changed system/tool cost and output budget, attach exactly one new
+   carrier, and observe that retry's own IDs. `chatCompletionWithFallback`
+   refits per candidate from the clean `requestBody`.
+6. **Ordinary streams report unavailable.** A stable server-local transient
+   `turn_id` is generated when the caller supplies none (a caller-provided
+   native turn id is preserved exactly), so `memory_status unavailable` is
+   emitted for ordinary HTTP/cron/Agent streams and terminal frames always
+   carry `turn_id`. The client `memory_status` field can never elevate a
+   status without a consumed authenticated envelope.
+
+Also added: `CallModelFn.contextCeilingTokens` and executor/rewriter stage
+ceilings so the memory fit intersects the stage transcript bound with the
+provider context window.
 
 ## `MIN_BODY_SCALARS` note
 
@@ -174,8 +239,8 @@ to remove; the bounded renderer behavior is unchanged.
 
 | Command | Result |
 |---|---|
-| `bun run typecheck` (workdir `server-jarvis`) | **PASS** — `tsc --noEmit`, exit 0 |
-| `bun run build` (workdir `server-jarvis`) | **PASS** — bundled `dist/index.js` (196 modules) |
+| `bun run typecheck` (workdir `server-jarvis`) | **PASS** — `tsc --noEmit`, exit 0 (re-run after the corrective pass) |
+| `bun run build` (workdir `server-jarvis`) | **PASS** — bundled `dist/index.js` (196 modules; re-run after the corrective pass) |
 | `git diff --check` (repo root) | **PASS** — no whitespace errors |
 
 `cargo check` was not required: no Rust source, DTO, migration, or command was
@@ -206,10 +271,15 @@ No test files (`memory-turn-routing.test.ts`, `turn-memory-context.test.ts`,
   typecheck, and bundling only.
 - **Cross-language framing parity.** The TS frame strings mirror the frozen
   Rust constants; the cross-language roundtrip is not executed here.
-- **Internal cascade refit.** See the coverage/limitations note above.
-- **Unsupported CLI mode.** Determined by configured `--resume`/`--continue`/
-  `--session-id` flags; a CLI that cannot run without persistence is reported
-  unavailable and runs ordinary inference. Not exercised live.
+- **Cascade refit.** Each candidate/retry now refits from the clean base; the
+  per-candidate context window is the stage ceiling intersected with the
+  provider window, falling back to the conservative floor when either is
+  unknown. Not exercised live.
+- **CLI capability probe.** `--no-session-persistence` support is probed via a
+  bounded, cached `claude --help`; a failed/timed-out probe fails closed to
+  `unavailable` and ordinary inference. Not exercised against a real binary
+  here, and the probe's own side effects (one short-lived `--help` process per
+  executable path) are cached for the process lifetime.
 - **Evidence is not authority.** Tool success/hash observations are bounded
   diagnostics; they never establish durable verified facts.
 - **Phase 2.4 dependency.** UI direct SSE/native relay wiring, terminal sync/ACK
@@ -217,10 +287,13 @@ No test files (`memory-turn-routing.test.ts`, `turn-memory-context.test.ts`,
 
 ## Completion boundary
 
-Phase 2.3 source is delivered: the trusted reference is consumed only after
-real workspace resolution, a single one-shot envelope is bounded and injected
-at every supported final provider boundary, recall never enters durable
-history/caches/TaskRun, and applied IDs/status/terminal/evidence flow to the
+Phase 2.3 source is delivered and has passed a root-review corrective pass: the
+trusted reference is consumed only after real workspace resolution, a single
+one-shot envelope is bounded and injected at every supported final provider
+boundary (with independent per-candidate/retry refit from a clean base), recall
+never enters durable history/caches/TaskRun, CLI terminal status comes from the
+authoritative result, unsupported CLI modes report unavailable without an
+unknown flag, and applied IDs/status/terminal/evidence flow to the
 authenticated 2.2 receipt. `bun run typecheck` and `bun run build` pass. Phase
 2.3 runtime/test acceptance and the Phase 1/2.1/2.2 test gates remain **OPEN**;
 this ledger is not runtime evidence, does not claim UI integration or live

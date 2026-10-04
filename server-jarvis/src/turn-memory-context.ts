@@ -36,6 +36,13 @@ export const TURN_MEMORY_FRAME_SUFFIX = "\n[/Jarvis recalled data]";
 export const TURN_MEMORY_UNKNOWN_CONTEXT_TOKENS = 16_384;
 /** Output-token reserve used when the assembled request reports none. */
 export const TURN_MEMORY_DEFAULT_OUTPUT_RESERVE = 2_048;
+/**
+ * Conservative reserve for CLI transports (Claude CLI main and delegate) whose
+ * system prompt/flag and stock/MCP tool schemas are not part of the message
+ * JSON. Applied in addition to the output reserve so a CLI request can never
+ * overflow just because its tool-schema overhead is unknown.
+ */
+export const TURN_MEMORY_CLI_OVERHEAD_RESERVE_TOKENS = 4_096;
 
 export interface AppliedTurnMemory {
   /** Framed data block actually appended; empty when nothing was applied. */
@@ -52,6 +59,11 @@ export interface TurnMemoryBudgetInput {
   outputReserveTokens?: number | null;
   /** Tokens consumed by the request's tool schemas. */
   toolSchemaTokens?: number | null;
+  /**
+   * Additional conservative reserve for overhead not represented in the
+   * message JSON (e.g. CLI flags/stock tool schemas).
+   */
+  additionalReserveTokens?: number | null;
 }
 
 /**
@@ -71,7 +83,11 @@ export function resolveTurnMemoryInputBudget(input: TurnMemoryBudgetInput): numb
   const tools = typeof rawTools === "number" && Number.isFinite(rawTools) && rawTools > 0
     ? Math.floor(rawTools)
     : 0;
-  return Math.max(0, context - Math.min(output, context) - tools);
+  const rawAdditional = input.additionalReserveTokens;
+  const additional = typeof rawAdditional === "number" && Number.isFinite(rawAdditional) && rawAdditional > 0
+    ? Math.floor(rawAdditional)
+    : 0;
+  return Math.max(0, context - Math.min(output, context) - tools - additional);
 }
 
 /** Render the exact frozen native frame around JSON-escaped item text. */

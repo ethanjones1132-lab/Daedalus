@@ -32,6 +32,7 @@ import type { PreparedMemoryTurn } from "../memory-contract";
 import {
   fitTurnMemory,
   resolveTurnMemoryInputBudget,
+  TURN_MEMORY_CLI_OVERHEAD_RESERVE_TOKENS,
   type AppliedTurnMemory,
 } from "../turn-memory-context";
 
@@ -441,11 +442,19 @@ export function buildClaudeDelegateInvocation(
   // Fit the ephemeral native snapshot against the delegate prompt under the
   // conservative unknown-context fallback; CLI context is never assumed
   // unlimited. The frozen frame is appended as data; it grants no authority.
+  // `input.prompt` already carries the delegate system prompt, request, plan
+  // and runtime contracts; the explicit CLI reserve covers the stock/MCP tool
+  // schemas and output overhead that are not part of that text. If the
+  // snapshot cannot be safely fit, it is truthfully omitted.
   const memoryApplied = input.turnMemory && input.turnMemory.selected.length > 0
     ? fitTurnMemory(
         input.turnMemory,
         [{ role: "user", content: input.prompt }],
-        resolveTurnMemoryInputBudget({ contextWindowTokens: null, outputReserveTokens: null }),
+        resolveTurnMemoryInputBudget({
+          contextWindowTokens: null,
+          outputReserveTokens: null,
+          additionalReserveTokens: TURN_MEMORY_CLI_OVERHEAD_RESERVE_TOKENS,
+        }),
       )
     : undefined;
   const deliveredPrompt = memoryApplied?.block
