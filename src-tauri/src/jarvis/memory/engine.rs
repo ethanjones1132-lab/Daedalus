@@ -172,6 +172,7 @@ pub fn update_manual_memory(
 ) -> Result<MemoryEntry, String> {
     validate_memory_payload(&title, &content, &category).map_err(|b| b.reason)?;
     let before = read_memory(conn, &id)?;
+    require_legacy_scope(conn, &id)?;
     let now = now();
     let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
     conn.execute(
@@ -237,6 +238,7 @@ pub fn restore_memory(conn: &Connection, id: &str) -> Result<bool, String> {
         Ok(m) => m,
         Err(_) => return Ok(false),
     };
+    require_legacy_scope(conn, id)?;
     let now = now();
     conn.execute(
         "UPDATE memory SET status = 'active', updated_at = ?, supersedes_id = NULL WHERE id = ?",
@@ -1365,10 +1367,14 @@ fn like_candidates(conn: &Connection, query: &str) -> Result<Vec<MemoryEntry>, S
     collect_memories(rows)
 }
 
+/// Legacy consolidation scan. Restricted to quarantined pre-scope rows so it
+/// never merges or mutates explicitly scoped memory.
 fn active_memories(conn: &Connection) -> Result<Vec<MemoryEntry>, String> {
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT {} FROM memory WHERE status = 'active' ORDER BY updated_at DESC LIMIT ?",
+            "SELECT {} FROM memory
+             WHERE status = 'active' AND scope_kind = 'legacy_unscoped'
+             ORDER BY updated_at DESC LIMIT ?",
             memory_columns()
         ))
         .map_err(|e| e.to_string())?;
@@ -1376,6 +1382,26 @@ fn active_memories(conn: &Connection) -> Result<Vec<MemoryEntry>, String> {
         .query_map([RECALL_CANDIDATE_LIMIT as i64], memory_from_row)
         .map_err(|e| e.to_string())?;
     collect_memories(rows)
+}
+
+fn memory_scope_kind_of(conn: &Connection, id: &str) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT scope_kind FROM memory WHERE id = ?",
+        [id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+fn require_legacy_scope(conn: &Connection, id: &str) -> Result<(), String> {
+    match memory_scope_kind_of(conn, id)? {
+        Some(kind) if kind == "legacy_unscoped" => Ok(()),
+        Some(_) => Err(
+            "This memory is explicitly scoped; use the scoped memory APIs to change it".to_string(),
+        ),
+        None => Ok(()),
+    }
 }
 
 fn find_similar_memory(
@@ -1393,11 +1419,20 @@ fn find_similar_memory(
     };
     let normalized_title = normalize_key(title);
     let normalized_content = normalize_key(&truncate(content, 160));
-    Ok(candidates.into_iter().find(|m| {
-        m.category == category
-            && (normalize_key(&m.title) == normalized_title
-                || normalize_key(&truncate(&m.content, 160)) == normalized_content)
-    }))
+    for candidate in candidates {
+        // Merge candidates are restricted to quarantined pre-scope rows so a
+        // scoped record is never silently merged into legacy memory.
+        if memory_scope_kind_of(conn, &candidate.id)?.as_deref() != Some("legacy_unscoped") {
+            continue;
+        }
+        if candidate.category == category
+            && (normalize_key(&candidate.title) == normalized_title
+                || normalize_key(&truncate(&candidate.content, 160)) == normalized_content)
+        {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
 }
 
 fn get_session_memory(
