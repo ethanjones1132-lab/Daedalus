@@ -11,6 +11,7 @@
 // TCP listener as proof of ownership: only the tracked child handle plus a
 // capability-authenticated response establish an owned generation.
 
+use std::io::Read;
 use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
@@ -26,6 +27,7 @@ use super::turn::{
     PreparedMemoryTurn,
 };
 use crate::db::AppDb;
+use crate::process_lifecycle::BunOwnership;
 
 /// Capability env var names. Exactly these spellings, only on the owned child.
 pub const CAPABILITY_ENV: &str = "JARVIS_NATIVE_MEMORY_CAPABILITY";
@@ -64,20 +66,24 @@ struct AckRequest {
 /// mutation serialize through it, so no registration can race a commit.
 #[derive(Default)]
 struct TransportState {
-    generation: u64,
-    current_bun_instance_id: Option<String>,
+    /// The owned generation whose registration response we accepted, and the
+    /// bun instance id it reported. `None` means registration is ambiguous
+    /// (never attempted, or the response was lost).
+    bound_generation: Option<u64>,
+    bound_bun_instance_id: Option<String>,
 }
 
 pub struct NativeMemoryTransport {
     capability: String,
     app_instance_id: String,
-    client: OnceLock<reqwest::blocking::Client>,
+    client: OnceLock<Option<reqwest::blocking::Client>>,
     state: Mutex<TransportState>,
 }
 
 #[derive(Debug)]
 enum HttpFailure {
-    /// No owned capability server responded (401/503/network/other).
+    /// No owned capability server responded (401/503/network/other), or the
+    /// client could not be constructed with the required timeouts.
     Unavailable,
 }
 
@@ -85,11 +91,7 @@ impl NativeMemoryTransport {
     fn new() -> Self {
         // Two concatenated UUID v4 values, no separators: an unguessable
         // app-lifetime secret. Never persisted, never exposed to the UI.
-        let capability = format!(
-            "{}{}",
-            Uuid::new_v4().simple(),
-            Uuid::new_v4().simple()
-        );
+        let capability = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         Self {
             capability,
             app_instance_id: Uuid::new_v4().to_string(),
@@ -108,37 +110,26 @@ impl NativeMemoryTransport {
         &self.capability
     }
 
-    fn client(&self) -> &reqwest::blocking::Client {
-        self.client.get_or_init(|| {
-            reqwest::blocking::Client::builder()
-                .connect_timeout(std::time::Duration::from_millis(CONNECT_TIMEOUT_MS))
-                .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
-                .build()
-                .unwrap_or_else(|_| reqwest::blocking::Client::new())
-        })
+    /// A bounded blocking client. Build failure (or a build inside an async
+    /// context) is reported as unavailable and no HTTP is attempted; there is
+    /// no untimed fallback client.
+    fn client(&self) -> Result<&reqwest::blocking::Client, HttpFailure> {
+        self.client
+            .get_or_init(|| {
+                reqwest::blocking::Client::builder()
+                    .connect_timeout(std::time::Duration::from_millis(CONNECT_TIMEOUT_MS))
+                    .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
+                    .build()
+                    .ok()
+            })
+            .as_ref()
+            .ok_or(HttpFailure::Unavailable)
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, TransportState> {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Called by the owned spawn path after a successful spawn. A new tracked
-    /// child is a new generation: any prior `bun_instance_id` no longer
-    /// describes a live registry.
-    pub fn note_owned_spawn(&self) {
-        let mut state = self.lock_state();
-        state.generation = state.generation.wrapping_add(1);
-        state.current_bun_instance_id = None;
-    }
-
-    /// Clear the owned generation when the tracked child is stopped. The
-    /// reloaded registry is empty, so no pending envelope can survive.
-    pub fn note_owned_stop(&self) {
-        let mut state = self.lock_state();
-        state.generation = state.generation.wrapping_add(1);
-        state.current_bun_instance_id = None;
     }
 
     fn base_url() -> String {
@@ -155,7 +146,7 @@ impl NativeMemoryTransport {
     ) -> Result<String, HttpFailure> {
         let url = format!("{}{}", Self::base_url(), path);
         let response = self
-            .client()
+            .client()?
             .post(url)
             .bearer_auth(&self.capability)
             .json(body)
@@ -170,7 +161,7 @@ impl NativeMemoryTransport {
     fn get_json(&self, path: &str, expected_status: u16) -> Result<String, HttpFailure> {
         let url = format!("{}{}", Self::base_url(), path);
         let response = self
-            .client()
+            .client()?
             .get(url)
             .bearer_auth(&self.capability)
             .send()
@@ -181,67 +172,103 @@ impl NativeMemoryTransport {
         Self::read_bounded(response)
     }
 
+    /// Read at most `MAX_RESPONSE_BYTES`; a larger body is rejected without
+    /// first buffering the whole response.
     fn read_bounded(response: reqwest::blocking::Response) -> Result<String, HttpFailure> {
-        let bytes = response.bytes().map_err(|_| HttpFailure::Unavailable)?;
-        if bytes.len() > MAX_RESPONSE_BYTES {
+        let mut buffer = Vec::new();
+        let limit = (MAX_RESPONSE_BYTES as u64) + 1;
+        response
+            .take(limit)
+            .read_to_end(&mut buffer)
+            .map_err(|_| HttpFailure::Unavailable)?;
+        if buffer.len() > MAX_RESPONSE_BYTES {
             return Err(HttpFailure::Unavailable);
         }
-        String::from_utf8(bytes.to_vec()).map_err(|_| HttpFailure::Unavailable)
+        String::from_utf8(buffer).map_err(|_| HttpFailure::Unavailable)
     }
 
-    /// Register one prepared envelope with the live owned registry. On success
-    /// the response is the only evidence that the current owned child accepted
-    /// the turn; the `bun_instance_id` is recorded for this generation.
+    /// Register one prepared envelope with the live owned registry. Requires an
+    /// actual owned live child and detects replacement across HTTP using the
+    /// atomic generation. The response is the only evidence that the current
+    /// owned child accepted the turn.
     fn register_envelope(
         &self,
         state: &mut TransportState,
         envelope: &PreparedMemoryTurn,
     ) -> Result<RegistrationResult, HttpFailure> {
-        let generation = state.generation;
+        if !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live) {
+            return Err(HttpFailure::Unavailable);
+        }
+        let generation = crate::process_lifecycle::bun_generation();
         let body = self.post_json("/internal/memory/preparations", envelope, 200)?;
         let parsed: RegistrationResult =
             serde_json::from_str(&body).map_err(|_| HttpFailure::Unavailable)?;
         if parsed.preparation_id != envelope.preparation_id {
             return Err(HttpFailure::Unavailable);
         }
-        // Only bind the generation if the owned child did not change while the
-        // request was in flight.
-        if state.generation == generation {
-            state.current_bun_instance_id = Some(parsed.bun_instance_id.clone());
+        // Reject a response whose owned child was replaced while in flight.
+        if crate::process_lifecycle::bun_generation() != generation
+            || !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live)
+        {
+            return Err(HttpFailure::Unavailable);
         }
+        state.bound_generation = Some(generation);
+        state.bound_bun_instance_id = Some(parsed.bun_instance_id.clone());
         Ok(parsed)
     }
 
-    /// Ask the live owned registry to drop every unconsumed envelope. Returns
-    /// `Ok(())` only when the live owned child acknowledged, or when the
-    /// tracked child is confirmed gone/replaced (the old registry is gone).
+    /// Ask the live owned registry to drop every unconsumed envelope.
     ///
-    /// A live owned child is always asked to acknowledge, even when no
-    /// registration response was recorded: a lost response can still have left
-    /// an envelope in the registry, so the ACK is the only proof the registry
-    /// is clear. A live child that cannot acknowledge is `Unavailable` and must
-    /// block the mutation.
+    /// - `None`/`Exited`: the tracked child is gone; the old registry is gone
+    ///   and the mutation may proceed.
+    /// - `Unknown`: the handle could not report; fail closed.
+    /// - `Live`: an authenticated ACK is required. If we hold a bound
+    ///   generation and it differs from the current generation, the old
+    ///   registry was replaced and is gone. Even when registration is
+    ///   ambiguous (`bound_generation == None`), the live child must still ACK,
+    ///   because a lost registration response can have left an envelope.
     fn invalidate_registry(
         &self,
         state: &mut TransportState,
         reason: &str,
     ) -> Result<(), HttpFailure> {
-        if !crate::process_lifecycle::bun_server_is_alive() {
-            // Confirmed exited/replaced: the old registry is gone.
-            return Ok(());
+        match crate::process_lifecycle::bun_ownership() {
+            BunOwnership::None | BunOwnership::Exited => return Ok(()),
+            BunOwnership::Unknown => return Err(HttpFailure::Unavailable),
+            BunOwnership::Live => {}
         }
+
+        let generation = crate::process_lifecycle::bun_generation();
+        if let Some(bound) = state.bound_generation {
+            if bound != generation {
+                // The registry we would have invalidated was replaced.
+                return Ok(());
+            }
+        }
+
         let request = InvalidationRequest {
             app_instance_id: self.app_instance_id.clone(),
             reason: reason.to_string(),
         };
         let body = self.post_json("/internal/memory/invalidate", &request, 200)?;
-        if let Ok(parsed) = serde_json::from_str::<InvalidationResponse>(&body) {
-            state.current_bun_instance_id = Some(parsed.bun_instance_id);
+        let parsed: InvalidationResponse =
+            serde_json::from_str(&body).map_err(|_| HttpFailure::Unavailable)?;
+        // When a generation is bound, the ACK must come from that generation's
+        // registry; an invalid or mismatched ACK must never clear the gate.
+        if let Some(bound_id) = state.bound_bun_instance_id.as_deref() {
+            if parsed.bun_instance_id != bound_id {
+                return Err(HttpFailure::Unavailable);
+            }
         }
+        state.bound_generation = Some(generation);
+        state.bound_bun_instance_id = Some(parsed.bun_instance_id);
         Ok(())
     }
 
-    fn fetch_receipt(&self, preparation_id: &str) -> Result<Option<NativeMemoryRuntimeReceipt>, HttpFailure> {
+    fn fetch_receipt(
+        &self,
+        preparation_id: &str,
+    ) -> Result<Option<NativeMemoryRuntimeReceipt>, HttpFailure> {
         let path = format!("/internal/memory/turns/{}", preparation_id);
         match self.get_json(&path, 200) {
             Ok(body) => serde_json::from_str::<NativeMemoryRuntimeReceipt>(&body)
@@ -253,8 +280,14 @@ impl NativeMemoryTransport {
 
     fn ack_receipt(&self, preparation_id: &str, turn_id: &str) -> Result<(), HttpFailure> {
         let path = format!("/internal/memory/turns/{}/ack", preparation_id);
-        self.post_json(&path, &AckRequest { turn_id: turn_id.to_string() }, 200)
-            .map(|_| ())
+        self.post_json(
+            &path,
+            &AckRequest {
+                turn_id: turn_id.to_string(),
+            },
+            200,
+        )
+        .map(|_| ())
     }
 }
 
@@ -300,10 +333,8 @@ pub fn prepare_memory_turn(
         turn::read_memory_turn(&conn, &request.session_id, &request.turn_id)?
     };
 
-    if matches!(
-        persisted.recall_status,
-        MemoryRecallStatus::RetrievalFailed
-    ) || !matches!(persisted.state, turn::MemoryTurnState::Prepared)
+    if matches!(persisted.recall_status, MemoryRecallStatus::RetrievalFailed)
+        || !matches!(persisted.state, turn::MemoryTurnState::Prepared)
     {
         return Ok(MemoryTurnPreparation {
             turn_id: request.turn_id,
@@ -348,17 +379,29 @@ pub fn prepare_memory_turn(
     }
 }
 
-/// Fetch an authenticated receipt for one turn, validate the exact immutable
-/// tuple against the durable row, persist applied/terminal metadata
-/// idempotently, then ACK the registry entry. ACK happens only after native
-/// persistence succeeds.
+/// A receipt may be acknowledged only after it durably represents a terminal
+/// outcome or an authoritative validation-end (no start, no terminal). A
+/// started-but-nonterminal receipt may still accumulate model/tool
+/// observations and must stay replayable.
+fn receipt_can_ack(receipt: &NativeMemoryRuntimeReceipt) -> bool {
+    receipt.terminal_status.is_some() || receipt.started_at.is_none()
+}
+
+/// Fetch an authenticated receipt for one turn, verify the current app
+/// instance and owned generation in addition to the immutable tuple, persist
+/// applied/terminal metadata idempotently, then ACK only after durability.
+///
+/// Missing receipts and generation loss are recorded truthfully:
+/// `started` -> `unterminated`/`evidence_unavailable`, never-started
+/// `registered` after TTL or generation loss -> `expired`. A turn that was
+/// never consumed stays untouched.
 pub fn sync_memory_turn(
     db: &AppDb,
     transport: &NativeMemoryTransport,
     request: MemoryTurnIdentityRequest,
     now: DateTime<Utc>,
 ) -> Result<MemoryTurnDiagnostic, MemoryError> {
-    let _state = transport.lock_state();
+    let state = transport.lock_state();
 
     let persisted = {
         let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
@@ -366,27 +409,90 @@ pub fn sync_memory_turn(
     };
 
     let preparation_id = match persisted.preparation_id.as_deref() {
-        Some(id) if matches!(persisted.state, turn::MemoryTurnState::Registered | turn::MemoryTurnState::Started | turn::MemoryTurnState::Terminal) => {
+        Some(id)
+            if matches!(
+                persisted.state,
+                turn::MemoryTurnState::Registered
+                    | turn::MemoryTurnState::Started
+                    | turn::MemoryTurnState::Terminal
+                    | turn::MemoryTurnState::Invalidated
+            ) =>
+        {
             id.to_string()
         }
         _ => return Ok(turn::memory_turn_diagnostic(&persisted)),
     };
 
-    let receipt = match transport.fetch_receipt(&preparation_id) {
-        Ok(Some(receipt)) => receipt,
-        // No authenticated receipt: leave the durable row untouched and report
-        // its current diagnostic; never invent success.
-        Ok(None) | Err(_) => return Ok(turn::memory_turn_diagnostic(&persisted)),
+    let current_generation = crate::process_lifecycle::bun_generation();
+
+    let receipt = transport.fetch_receipt(&preparation_id).ok().flatten();
+
+    let generation_lost = match &receipt {
+        Some(receipt) => {
+            let app_matches = receipt.app_instance_id == transport.app_instance_id();
+            let generation_matches = state
+                .bound_generation
+                .map(|bound| bound == current_generation)
+                .unwrap_or(true);
+            let bun_matches = state
+                .bound_bun_instance_id
+                .as_deref()
+                .map(|bound| bound == receipt.bun_instance_id)
+                .unwrap_or(true);
+            !(app_matches && generation_matches && bun_matches)
+        }
+        None => true,
     };
 
+    if generation_lost {
+        // Preserve an already durable terminal; otherwise record truth. A
+        // missing/unavailable receipt must not leave a ready/registered turn.
+        if matches!(persisted.state, turn::MemoryTurnState::Terminal) {
+            return Ok(turn::memory_turn_diagnostic(&persisted));
+        }
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        return if matches!(
+            persisted.state,
+            turn::MemoryTurnState::Started | turn::MemoryTurnState::Invalidated
+        ) {
+            turn::mark_turn_unterminated(&conn, &request.session_id, &request.turn_id)
+        } else if matches!(
+            persisted.state,
+            turn::MemoryTurnState::Registered | turn::MemoryTurnState::Prepared
+        ) {
+            turn::mark_turn_expired(&conn, &request.session_id, &request.turn_id)
+        } else {
+            Ok(turn::memory_turn_diagnostic(&persisted))
+        };
+    }
+
+    let receipt = receipt.expect("receipt present when generation is stable");
     let diagnostic = {
         let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-        turn::apply_memory_turn_receipt(&conn, &request.session_id, &request.turn_id, &receipt, now)?
+        turn::apply_memory_turn_receipt(
+            &conn,
+            &request.session_id,
+            &request.turn_id,
+            &receipt,
+            now,
+        )?
     };
 
-    // Only after native persistence: drop the ephemeral Bun receipt. A failed
-    // ACK is retryable and leaves the receipt in place.
-    let _ = transport.ack_receipt(&preparation_id, &request.turn_id);
+    // Only after durable persistence; a started/nonterminal receipt is left in
+    // place so a later sync can pick up terminal metadata. A bounded ACK
+    // failure stays retryable (the receipt remains) and is observable, and it
+    // never changes the caller's terminal inference outcome.
+    if receipt_can_ack(&receipt) {
+        if transport
+            .ack_receipt(&preparation_id, &request.turn_id)
+            .is_err()
+        {
+            eprintln!(
+                "[memory] turn receipt ack failed preparation={} turn={} (retryable)",
+                preparation_id, request.turn_id
+            );
+        }
+    }
     Ok(diagnostic)
 }
 
@@ -402,7 +508,9 @@ pub fn invalidate_unconsumed_memory_turns(
     let mut state = transport.lock_state();
     transport
         .invalidate_registry(&mut state, reason)
-        .map_err(|_| MemoryError::invalidation_unavailable("Memory registry did not acknowledge invalidation"))?;
+        .map_err(|_| {
+            MemoryError::invalidation_unavailable("Memory registry did not acknowledge invalidation")
+        })?;
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     turn::mark_pending_turns_invalidated(&conn, now)?;
     Ok(())
@@ -412,7 +520,7 @@ pub fn invalidate_unconsumed_memory_turns(
 /// mutation. Lock order: operation gate -> HTTP invalidate (no AppDb mutex) ->
 /// AppDb mutex -> mutation callback. A live owned registry that cannot
 /// acknowledge blocks the callback; a confirmed exited/replaced generation
-/// permits the mutation.
+/// permits the mutation; an unknown ownership state fails closed.
 pub fn with_memory_mutation_gate<T>(
     db: &AppDb,
     transport: &NativeMemoryTransport,
@@ -436,8 +544,8 @@ pub fn with_memory_mutation_gate<T>(
     mutation(&conn)
 }
 
-/// Build the capability/instance environment for an owned spawn and stage the
-/// WSLENV forwarding flags. Never logs either value.
+/// Build the capability/instance environment for an owned spawn. Never logs
+/// either value.
 pub fn owned_memory_env() -> (&'static str, String, &'static str, String) {
     let transport = native_memory_transport();
     (

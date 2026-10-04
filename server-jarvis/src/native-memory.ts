@@ -4,30 +4,44 @@
 // `process.env` at module evaluation (before any child subprocess can clone
 // the environment), and keeps them in module-private state.
 //
-// This registry is memory-only, bounded, and single-consumption. It never
-// reads or writes the native App memory database and never carries recalled
-// text into any durable field.
+// This registry is memory-only, bounded, single-consumption, and never reads
+// or writes the native App memory database. It carries no recalled text into
+// any durable field or receipt.
 
 import { realpathSync } from "node:fs";
-import { resolve, sep } from "node:path";
 
 import type {
   MemoryRecallStatus,
   MemoryRuntimeEvidence,
   PreparedMemoryTurn,
 } from "./memory-contract";
+import { resolveWorkspacePathIdentity } from "./orchestration/path-identity";
 
 const CAPABILITY_ENV = "JARVIS_NATIVE_MEMORY_CAPABILITY";
 const APP_INSTANCE_ENV = "JARVIS_NATIVE_APP_INSTANCE_ID";
 
 export const NATIVE_MEMORY_UNCONSUMED_CAP = 256;
 export const NATIVE_MEMORY_RECEIPT_CAP = 256;
+/**
+ * Combined live-identity cap. Each unconsumed preparation becomes a receipt
+ * (consume) and then a tombstone (ack/expiry/invalidation), so the total
+ * number of tracked identities never exceeds the number of registrations
+ * within the retention window. Registering under combined pressure is refused
+ * so an unexpired replay tombstone is never evicted to make room.
+ */
+export const NATIVE_MEMORY_IDENTITY_CAP =
+  NATIVE_MEMORY_UNCONSUMED_CAP + NATIVE_MEMORY_RECEIPT_CAP;
 export const NATIVE_MEMORY_BODY_CAP_BYTES = 128 * 1024;
 export const NATIVE_MEMORY_EVIDENCE_REF_CAP = 100;
 export const NATIVE_MEMORY_EVIDENCE_BYTES_CAP = 64 * 1024;
 export const NATIVE_MEMORY_TTL_MS = 120_000;
 
-export interface NativeMemoryBootstrap {
+const MAX_ITEMS = 5;
+const MAX_ITEM_SCALARS = 600;
+const MAX_BLOCK_SCALARS = 4_000;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+
+interface NativeMemoryBootstrap {
   capability: string;
   appInstanceId: string;
 }
@@ -108,7 +122,24 @@ interface UnconsumedEntry {
   effectiveWorkspace: string | null;
   projectRoot: string | null;
   scopeKind: string;
+  selectedIds: string[];
   expiresAtMonotonic: number;
+}
+
+interface ReceiptRecord {
+  receipt: NativeMemoryRuntimeReceipt;
+  selectedIds: string[];
+}
+
+interface Tombstone {
+  expiresAtMonotonic: number;
+}
+
+interface RegistryMeta {
+  bunInstanceId: string;
+  capability: string | null;
+  appInstanceId: string | null;
+  onInvalidate?: (reason: string) => void;
 }
 
 class RegistryError extends Error {
@@ -121,7 +152,7 @@ class RegistryError extends Error {
   }
 }
 
-function captureNativeMemoryBootstrap(
+function captureBootstrap(
   env: Record<string, string | undefined>,
 ): NativeMemoryBootstrap | null {
   const capability = env[CAPABILITY_ENV];
@@ -133,11 +164,12 @@ function captureNativeMemoryBootstrap(
   return { capability, appInstanceId };
 }
 
-/**
- * Captured at module evaluation, before any tool runtime or child launch.
- * Independent HTTP-only servers have no capability and report unavailable.
- */
-export const nativeMemoryBootstrap = captureNativeMemoryBootstrap(process.env);
+// Module-private. Never exported: the production capability must not leak.
+const CAPTURED_BOOTSTRAP = captureBootstrap(process.env);
+
+export function nativeMemoryConfigured(): boolean {
+  return CAPTURED_BOOTSTRAP !== null;
+}
 
 function nowMonotonic(): number {
   return performance.now();
@@ -147,121 +179,225 @@ function sha256Hex(value: string): string {
   return new Bun.CryptoHasher("sha256").update(value).digest("hex");
 }
 
+function scalarLength(value: string): number {
+  return [...value].length;
+}
+
+/**
+ * Canonical workspace identity. An unresolved/realpath-failing root returns
+ * null (fails closed); there is no `resolve` fallback that would let a
+ * nonexistent path match by string shape. Platform/UNC/WSL normalization is
+ * delegated to the shared workspace path-identity helper.
+ */
 function canonicalWorkspace(value: string | null): string | null {
   if (value == null) return null;
-  let out = value;
+  let real: string;
   try {
-    out = realpathSync(out);
+    real = realpathSync(value);
   } catch {
-    // A missing path fails closed in the comparison below.
+    return null;
   }
-  out = resolve(out);
-  while (out.length > 1 && (out.endsWith(sep) || out.endsWith("/"))) {
-    out = out.slice(0, -1);
-  }
-  if (process.platform === "win32") out = out.toLowerCase();
-  return out;
+  return resolveWorkspacePathIdentity(real) ?? null;
 }
 
 function deepEqual(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-function emptyReceipt(
-  entry: UnconsumedEntry,
-  bunInstanceId: string,
-  recallStatus: MemoryRecallStatus,
-  errorCode: string | null,
-): NativeMemoryRuntimeReceipt {
-  return {
-    preparation_id: entry.envelope.preparation_id,
-    turn_id: entry.turnId,
-    session_id: entry.sessionId,
-    message_hash: entry.messageHash,
-    app_instance_id: entry.appInstanceId,
-    bun_instance_id: bunInstanceId,
-    started_at: null,
-    finished_at: null,
-    terminal_status: null,
-    run_id: null,
-    recall_status: recallStatus,
-    error_code: errorCode,
-    applied_selected_ids: [],
-    runtime_evidence: [],
-  };
+function cloneReceipt(receipt: NativeMemoryRuntimeReceipt): NativeMemoryRuntimeReceipt {
+  return JSON.parse(JSON.stringify(receipt)) as NativeMemoryRuntimeReceipt;
+}
+
+function freezeDeep<T>(value: T): T {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const key of Object.keys(value)) {
+      freezeDeep((value as Record<string, unknown>)[key]);
+    }
+  }
+  return value;
+}
+
+/**
+ * Deep clone and freeze the accepted envelope. The registered snapshot must
+ * never alias caller state: a later request mutation cannot change what this
+ * registry holds.
+ */
+function cloneEnvelope(envelope: PreparedMemoryTurn): PreparedMemoryTurn {
+  return freezeDeep(JSON.parse(JSON.stringify(envelope)) as PreparedMemoryTurn);
+}
+
+function validateEnvelope(envelope: PreparedMemoryTurn): void {
+  if (envelope.schema_version !== 1) {
+    throw new RegistryError("invalid_envelope", 400, "unsupported envelope schema version");
+  }
+  if (
+    typeof envelope.preparation_id !== "string" ||
+    envelope.preparation_id.length === 0 ||
+    typeof envelope.turn_id !== "string" ||
+    envelope.turn_id.length === 0 ||
+    typeof envelope.session_id !== "string" ||
+    envelope.session_id.length === 0
+  ) {
+    throw new RegistryError("invalid_envelope", 400, "envelope is missing identity fields");
+  }
+  if (typeof envelope.message_hash !== "string" || !SHA256_HEX.test(envelope.message_hash)) {
+    throw new RegistryError("invalid_envelope", 400, "envelope message hash is not a valid digest");
+  }
+  if (!Array.isArray(envelope.selected) || envelope.selected.length > MAX_ITEMS) {
+    throw new RegistryError("invalid_envelope", 400, "envelope selection exceeds the item bound");
+  }
+  if (typeof envelope.block !== "string" || scalarLength(envelope.block) > MAX_BLOCK_SCALARS) {
+    throw new RegistryError("invalid_envelope", 400, "envelope block exceeds the scalar bound");
+  }
+  for (const item of envelope.selected) {
+    if (typeof item.text !== "string" || scalarLength(item.text) > MAX_ITEM_SCALARS) {
+      throw new RegistryError("invalid_envelope", 400, "envelope item exceeds the scalar bound");
+    }
+  }
 }
 
 export function createNativeMemoryRegistry(
-  bootstrap: NativeMemoryBootstrap | null,
+  bootstrap: NativeMemoryBootstrap | null = CAPTURED_BOOTSTRAP,
+  onInvalidate?: (reason: string) => void,
 ): NativeMemoryRegistry {
   const bunInstanceId = crypto.randomUUID();
   const unconsumed = new Map<string, UnconsumedEntry>();
-  const receipts = new Map<string, NativeMemoryRuntimeReceipt>();
+  const receipts = new Map<string, ReceiptRecord>();
+  const tombstones = new Map<string, Tombstone>();
 
-  function configured(): boolean {
-    return bootstrap !== null;
+  function tombstone(id: string, remainingMs: number, finished: boolean): void {
+    const duration = Math.max(remainingMs, finished ? NATIVE_MEMORY_TTL_MS : 0);
+    tombstones.set(id, { expiresAtMonotonic: nowMonotonic() + duration });
   }
 
-  function recordFailure(entry: UnconsumedEntry, status: MemoryRecallStatus, code: string): ConsumeMemoryResult {
-    unconsumed.delete(entry.envelope.preparation_id);
-    receipts.set(entry.envelope.preparation_id, emptyReceipt(entry, bunInstanceId, status, code));
+  function prune(): void {
+    for (const [id, entry] of unconsumed) {
+      if (nowMonotonic() >= entry.expiresAtMonotonic) {
+        tombstone(id, 0, false);
+        unconsumed.delete(id);
+      }
+    }
+    const now = nowMonotonic();
+    for (const [id, marker] of tombstones) {
+      if (now >= marker.expiresAtMonotonic) tombstones.delete(id);
+    }
+  }
+
+  function makeEntry(envelope: PreparedMemoryTurn): UnconsumedEntry {
+    const snapshot = cloneEnvelope(envelope);
+    const wallExpiry = Date.parse(snapshot.expires_at);
+    if (!Number.isFinite(wallExpiry)) {
+      throw new RegistryError("invalid_envelope", 400, "envelope expiry is not a valid timestamp");
+    }
+    const remaining = Math.min(NATIVE_MEMORY_TTL_MS, wallExpiry - Date.now());
+    if (remaining <= 0) {
+      throw new RegistryError("expired", 409, "envelope is already expired");
+    }
+    return {
+      envelope: snapshot,
+      turnId: snapshot.turn_id,
+      sessionId: snapshot.session_id,
+      messageHash: snapshot.message_hash,
+      appInstanceId: snapshot.app_instance_id,
+      effectiveWorkspace: snapshot.effective_workspace,
+      projectRoot: snapshot.scope?.project_root ?? null,
+      scopeKind: snapshot.scope?.kind ?? "agent",
+      selectedIds: snapshot.selected.map((item) => item.selection.id),
+      expiresAtMonotonic: nowMonotonic() + remaining,
+    };
+  }
+
+  function emptyReceipt(
+    source: UnconsumedEntry,
+    status: MemoryRecallStatus,
+    errorCode: string | null,
+  ): ReceiptRecord {
+    return {
+      receipt: {
+        preparation_id: source.envelope.preparation_id,
+        turn_id: source.turnId,
+        session_id: source.sessionId,
+        message_hash: source.messageHash,
+        app_instance_id: source.appInstanceId,
+        bun_instance_id: bunInstanceId,
+        started_at: null,
+        finished_at: null,
+        terminal_status: null,
+        run_id: null,
+        recall_status: status,
+        error_code: errorCode,
+        applied_selected_ids: [],
+        runtime_evidence: [],
+      },
+      selectedIds: source.selectedIds,
+    };
+  }
+
+  function recordFailure(
+    source: UnconsumedEntry,
+    status: MemoryRecallStatus,
+    code: string,
+  ): ConsumeMemoryResult {
+    unconsumed.delete(source.envelope.preparation_id);
+    tombstone(source.envelope.preparation_id, 0, false);
+    receipts.set(source.envelope.preparation_id, emptyReceipt(source, status, code));
     return { envelope: null, status, code };
   }
 
   const registry: NativeMemoryRegistry = {
     register(envelope: PreparedMemoryTurn): RegistrationResult {
-      if (!configured() || !bootstrap) {
+      prune();
+      if (!bootstrap) {
         throw new RegistryError("memory_unavailable", 503, "native memory capability is not configured");
       }
+      validateEnvelope(envelope);
       if (envelope.app_instance_id !== bootstrap.appInstanceId) {
         throw new RegistryError("app_instance_mismatch", 409, "envelope app instance does not match this server");
       }
-      if (!envelope.preparation_id || !envelope.turn_id || !envelope.session_id || !envelope.message_hash) {
-        throw new RegistryError("invalid_envelope", 400, "envelope is missing required identity fields");
+      const id = envelope.preparation_id;
+      if (tombstones.has(id)) {
+        throw new RegistryError("already_exists", 409, "preparation id was consumed, invalidated, or expired");
       }
-      if (receipts.has(envelope.preparation_id)) {
+      if (receipts.has(id)) {
         throw new RegistryError("already_consumed", 409, "preparation was already consumed");
       }
-      const existing = unconsumed.get(envelope.preparation_id);
+      const existing = unconsumed.get(id);
       if (existing) {
         if (deepEqual(existing.envelope, envelope)) {
-          return { preparation_id: envelope.preparation_id, bun_instance_id: bunInstanceId };
+          return { preparation_id: id, bun_instance_id: bunInstanceId };
         }
         throw new RegistryError("registration_conflict", 409, "preparation id is bound to a different envelope");
       }
-      if (unconsumed.size >= NATIVE_MEMORY_UNCONSUMED_CAP) {
-        // Never evict an active identity; refuse the new registration.
-        throw new RegistryError("registry_full", 507, "unconsumed preparation registry is full");
+      if (
+        unconsumed.size >= NATIVE_MEMORY_UNCONSUMED_CAP ||
+        receipts.size >= NATIVE_MEMORY_RECEIPT_CAP ||
+        unconsumed.size + receipts.size + tombstones.size >= NATIVE_MEMORY_IDENTITY_CAP
+      ) {
+        // Never evict an active identity or an unexpired replay tombstone;
+        // refuse the new registration instead.
+        throw new RegistryError("registry_full", 507, "preparation registry cannot reserve capacity");
       }
-
-      const entry: UnconsumedEntry = {
-        envelope,
-        turnId: envelope.turn_id,
-        sessionId: envelope.session_id,
-        messageHash: envelope.message_hash,
-        appInstanceId: envelope.app_instance_id,
-        effectiveWorkspace: envelope.effective_workspace,
-        projectRoot: envelope.scope?.project_root ?? null,
-        scopeKind: envelope.scope?.kind ?? "agent",
-        expiresAtMonotonic: nowMonotonic() + NATIVE_MEMORY_TTL_MS,
-      };
-      unconsumed.set(envelope.preparation_id, entry);
-      return { preparation_id: envelope.preparation_id, bun_instance_id: bunInstanceId };
+      unconsumed.set(id, makeEntry(envelope));
+      return { preparation_id: id, bun_instance_id: bunInstanceId };
     },
 
     consume(input: ConsumeMemoryRequest): ConsumeMemoryResult {
+      prune();
       const entry = unconsumed.get(input.preparation_id);
       if (!entry) {
-        if (receipts.has(input.preparation_id)) {
+        if (receipts.has(input.preparation_id) || tombstones.has(input.preparation_id)) {
           return { envelope: null, status: "already_consumed", code: "already_consumed" };
         }
         return { envelope: null, status: "unavailable", code: "memory_unavailable" };
       }
-
+      if (receipts.size >= NATIVE_MEMORY_RECEIPT_CAP) {
+        // Keep the entry consumable later rather than evict an active receipt.
+        return { envelope: null, status: "unavailable", code: "receipt_capacity" };
+      }
       if (nowMonotonic() >= entry.expiresAtMonotonic) {
         return recordFailure(entry, "expired", "expired");
       }
-
       if (
         entry.turnId !== input.turn_id ||
         entry.sessionId !== input.session_id ||
@@ -269,7 +405,6 @@ export function createNativeMemoryRegistry(
       ) {
         return recordFailure(entry, "scope_mismatch", "turn_mismatch");
       }
-
       if (entry.scopeKind === "project") {
         const active = canonicalWorkspace(input.active_workspace);
         const bound = canonicalWorkspace(entry.projectRoot);
@@ -287,66 +422,92 @@ export function createNativeMemoryRegistry(
 
       unconsumed.delete(entry.envelope.preparation_id);
       const status: MemoryRecallStatus = entry.envelope.block.length > 0 ? "ready" : "empty";
-      const receipt = emptyReceipt(entry, bunInstanceId, status, null);
-      receipt.started_at = new Date().toISOString();
-      receipts.set(entry.envelope.preparation_id, receipt);
-      while (receipts.size > NATIVE_MEMORY_RECEIPT_CAP) {
-        const oldest = receipts.keys().next().value;
-        if (oldest == null) break;
-        receipts.delete(oldest);
-      }
+      const record = emptyReceipt(entry, status, null);
+      record.receipt.started_at = new Date().toISOString();
+      receipts.set(entry.envelope.preparation_id, record);
       return { envelope: entry.envelope, status };
     },
 
-    invalidate(_reason: string): number {
+    invalidate(reason: string): number {
+      prune();
       const count = unconsumed.size;
+      for (const [id, entry] of unconsumed) {
+        const remaining = Math.max(0, entry.expiresAtMonotonic - nowMonotonic());
+        tombstone(id, remaining, false);
+      }
       unconsumed.clear();
+      onInvalidate?.(reason);
       return count;
     },
 
     observeApplied(preparationId: string, observation: MemoryAppliedObservation): void {
-      const receipt = receipts.get(preparationId);
-      if (!receipt) return;
-      if (observation.status) receipt.recall_status = observation.status;
+      const record = receipts.get(preparationId);
+      if (!record || record.receipt.started_at == null) return;
+      // Applied IDs describe what a live turn actually used; a finished
+      // terminal receipt is immutable.
+      if (record.receipt.terminal_status != null) return;
+      if (observation.status) record.receipt.recall_status = observation.status;
+      const allowed = new Set(record.selectedIds);
       for (const id of observation.selected_ids) {
-        if (!receipt.applied_selected_ids.includes(id)) receipt.applied_selected_ids.push(id);
+        if (allowed.has(id) && !record.receipt.applied_selected_ids.includes(id)) {
+          record.receipt.applied_selected_ids.push(id);
+        }
       }
     },
 
     observeTerminal(preparationId: string, event: MemoryTerminalObservation): void {
-      const receipt = receipts.get(preparationId);
-      if (!receipt) return;
+      const record = receipts.get(preparationId);
+      if (!record) return;
       // Preserve the first terminal outcome; duplicate terminal frames are no-ops.
-      if (receipt.terminal_status != null) return;
-      receipt.terminal_status = event.terminal_status;
-      receipt.finished_at = event.finished_at;
-      receipt.run_id = event.run_id;
-      receipt.error_code = event.error_code;
+      if (record.receipt.terminal_status != null) return;
+      record.receipt.terminal_status = event.terminal_status;
+      record.receipt.finished_at = event.finished_at;
+      record.receipt.run_id = event.run_id;
+      // A terminal frame with no error must not erase an earlier diagnostic
+      // such as `evidence_unavailable`.
+      if (event.error_code != null) record.receipt.error_code = event.error_code;
     },
 
     observeToolEvidence(preparationId: string, ref: MemoryRuntimeEvidence): void {
-      const receipt = receipts.get(preparationId);
-      if (!receipt) return;
-      if (receipt.runtime_evidence.length >= NATIVE_MEMORY_EVIDENCE_REF_CAP) return;
-      const projected = JSON.stringify([...receipt.runtime_evidence, ref]);
-      if (Buffer.byteLength(projected, "utf8") > NATIVE_MEMORY_EVIDENCE_BYTES_CAP) return;
-      receipt.runtime_evidence.push(ref);
+      const record = receipts.get(preparationId);
+      if (!record || record.receipt.started_at == null) return;
+      if (record.receipt.terminal_status != null) return;
+      if (record.receipt.runtime_evidence.length >= NATIVE_MEMORY_EVIDENCE_REF_CAP) {
+        record.receipt.error_code = "evidence_unavailable";
+        return;
+      }
+      const projected = JSON.stringify([...record.receipt.runtime_evidence, ref]);
+      if (Buffer.byteLength(projected, "utf8") > NATIVE_MEMORY_EVIDENCE_BYTES_CAP) {
+        record.receipt.error_code = "evidence_unavailable";
+        return;
+      }
+      record.receipt.runtime_evidence.push(ref);
     },
 
     receipt(id: string): NativeMemoryRuntimeReceipt | null {
-      return receipts.get(id) ?? null;
+      const record = receipts.get(id);
+      return record ? cloneReceipt(record.receipt) : null;
     },
 
     ack(id: string, turnId: string): void {
-      const receipt = receipts.get(id);
-      if (receipt && receipt.turn_id === turnId) {
+      const record = receipts.get(id);
+      if (record && record.receipt.turn_id === turnId) {
         receipts.delete(id);
+        tombstone(id, 0, true);
       }
     },
   };
-  registryById.set(registry, bunInstanceId);
+
+  registryMeta.set(registry, {
+    bunInstanceId,
+    capability: bootstrap?.capability ?? null,
+    appInstanceId: bootstrap?.appInstanceId ?? null,
+    onInvalidate,
+  });
   return registry;
 }
+
+const registryMeta = new WeakMap<NativeMemoryRegistry, RegistryMeta>();
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -355,20 +516,41 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-function authorized(req: Request, bootstrap: NativeMemoryBootstrap | null): boolean {
-  if (!bootstrap) return false;
+/**
+ * Read the request body without buffering more than the internal cap. The
+ * stream is cancelled as soon as it overflows.
+ */
+async function readBoundedBody(req: Request): Promise<unknown> {
+  const body = req.body;
+  if (!body) return {};
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > NATIVE_MEMORY_BODY_CAP_BYTES) {
+        await reader.cancel("body_too_large").catch(() => {});
+        throw new RegistryError("body_too_large", 413, "request body exceeds the internal limit");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const raw = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8");
+  return raw.length > 0 ? JSON.parse(raw) : {};
+}
+
+function bearerAuthorized(req: Request, capability: string | null): boolean {
+  if (!capability) return false;
   const header = req.headers.get("authorization") ?? "";
   const prefix = "Bearer ";
   if (!header.startsWith(prefix)) return false;
-  return header.slice(prefix.length) === bootstrap.capability;
-}
-
-async function readBoundedBody(req: Request): Promise<unknown> {
-  const raw = await req.arrayBuffer();
-  if (raw.byteLength > NATIVE_MEMORY_BODY_CAP_BYTES) {
-    throw new RegistryError("body_too_large", 413, "request body exceeds the internal limit");
-  }
-  return JSON.parse(new TextDecoder().decode(raw));
+  return header.slice(prefix.length) === capability;
 }
 
 /**
@@ -380,28 +562,29 @@ export async function handleNativeMemoryRequest(
   req: Request,
   registry: NativeMemoryRegistry,
 ): Promise<Response | null> {
-  const url = new URL(req.url);
-  const path = url.pathname;
+  const path = new URL(req.url).pathname;
   if (!path.startsWith("/internal/memory")) return null;
 
-  const bootstrap = nativeMemoryBootstrap;
-  if (!bootstrap) {
+  const meta = registryMeta.get(registry);
+  if (!meta || !meta.capability) {
     return json({ code: "memory_unavailable" }, 503);
   }
-  if (!authorized(req, bootstrap)) {
+  if (!bearerAuthorized(req, meta.capability)) {
     return json({ code: "unauthorized" }, 401);
   }
 
   try {
     if (path === "/internal/memory/preparations" && req.method === "POST") {
       const body = (await readBoundedBody(req)) as PreparedMemoryTurn;
-      const result = registry.register(body);
-      return json(result);
+      return json(registry.register(body));
     }
     if (path === "/internal/memory/invalidate" && req.method === "POST") {
       const body = (await readBoundedBody(req)) as { app_instance_id?: string; reason?: string };
+      if (typeof body.app_instance_id !== "string" || body.app_instance_id !== meta.appInstanceId) {
+        return json({ code: "app_instance_mismatch" }, 409);
+      }
       const invalidated = registry.invalidate(body.reason ?? "native_mutation");
-      return json({ invalidated_count: invalidated, bun_instance_id: registryBunId(registry) });
+      return json({ invalidated_count: invalidated, bun_instance_id: meta.bunInstanceId });
     }
 
     const receiptMatch = path.match(/^\/internal\/memory\/turns\/([^/]+)$/);
@@ -417,7 +600,7 @@ export async function handleNativeMemoryRequest(
         return json({ code: "invalid_request" }, 400);
       }
       registry.ack(decodeURIComponent(ackMatch[1]), body.turn_id);
-      return json({ ok: true, bun_instance_id: registryBunId(registry) });
+      return json({ ok: true, bun_instance_id: meta.bunInstanceId });
     }
 
     return json({ code: "not_found" }, 404);
@@ -427,13 +610,4 @@ export async function handleNativeMemoryRequest(
     }
     return json({ code: "memory_unavailable" }, 503);
   }
-}
-
-// The bun instance id is intentionally private to the registry interface; the
-// route handler reads it through this module-private map for invalidation/ack
-// responses. It never appears in a durable native field other than the
-// registration generation recorded by the native side.
-const registryById = new WeakMap<NativeMemoryRegistry, string>();
-function registryBunId(registry: NativeMemoryRegistry): string {
-  return registryById.get(registry) ?? "";
 }

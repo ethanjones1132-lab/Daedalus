@@ -10,7 +10,7 @@
 - **Execution baseline:** `dfe39904b8d7fa3ed731e5342e7e80437a6a3b40`
 - **Predecessor HEAD:** `846aed7` (`docs: record memory phase 2.1 root-review corrections`)
 - **Branch:** `codex/memory-deepseek-20261004`
-- **Phase 2.2 source commits:** `ea813c2` (transport/registry/commands, Tasks 1–3), `19b97b8` (precommit mutation gate, Task 4), and the ledger commit for Task 5.
+- **Phase 2.2 source commits:** `ea813c2` (transport/registry/commands, Tasks 1–3), `19b97b8` (precommit mutation gate, Task 4), `227c3be` (always require the live invalidation ACK), and the root-review corrective commit (below).
 
 ## Execution environment
 
@@ -176,6 +176,93 @@ are unchanged.
 
 No `cargo test`, `bun test`, ephemeral SQL script, or live/runtime transport
 experiment was run.
+
+## Root-review corrective pass
+
+A root review of the initial 2.2 source identified concrete gaps; all were
+corrected in source in this same session with no test/runtime execution.
+
+1. **Lock order and confirmed ownership.** `process_lifecycle` no longer calls
+   the transport at all. CHILDREN is never held while acquiring a lock held
+   across HTTP. Ownership is an explicit `BunOwnership::{None,Live,Exited,
+   Unknown}` derived from the actual `Child` handle plus an atomic owned
+   generation (`bun_generation`). `try_wait` error is `Unknown` and fails
+   closed. An unconfirmed termination (`stop_slot` kill/wait failure) retains
+   the handle and sets `BUN_TERMINATION_UNCONFIRMED`, which forces `Unknown`
+   and does not bump the generation that would authorize an invalidation
+   bypass. The gate reads ownership/generation after acquiring the operation
+   gate (order `transport state -> CHILDREN`).
+2. **Ambiguous registration/invalidation.** Invalidation requires an
+   authenticated ACK whenever the tracked child is `Live`, even when
+   `bound_generation == None` (a lost registration response), and parses the
+   ACK's `bun_instance_id`; an invalid or mismatched ACK never clears the gate.
+   Registration first requires a `Live` owned child and re-checks the atomic
+   generation after the HTTP round-trip, so a replacement or unrelated listener
+   is rejected.
+3. **Receipt synchronization.** `sync_memory_turn` verifies the current app
+   instance and the current owned generation in addition to the persisted
+   tuple. Missing receipt/generation loss is recorded truthfully
+   (`started`/`invalidated` -> `unterminated`/`evidence_unavailable`;
+   missing-receipt `registered`/`prepared` -> `expired`); an already durable
+   terminal is preserved. A nonterminal started receipt is never ACKed. ACK
+   failure is logged (ids only, no memory text) and remains retryable.
+4. **Native bounds.** Response reads stream through `Read::take(MAX+1)` and
+   reject overflow without buffering the whole body. The blocking client is
+   built with connect/total timeouts and there is no untimed fallback; build
+   failure is unavailable with no HTTP. No secret appears in errors/logs.
+5. **Registry lifecycle/capacity.** Tombstones are never evicted before their
+   deadline; only expired markers are pruned. Registration reserves combined
+   `unconsumed + receipts + tombstones` capacity and is refused under pressure
+   (per-category 256 plus a combined 512 identity cap). The accepted envelope
+   is deep-cloned and deeply frozen; receipts are returned as clones. TTL is
+   `min(120s, native wall expiry)` from registration and invalid/expired
+   timestamps are rejected. Envelope schema and 5-item/600-scalar/4,000-block
+   bounds are validated. Evidence overflow sets an observable
+   `evidence_unavailable` code. `observeApplied`/`observeToolEvidence` act only
+   on a started, nonterminal receipt and applied IDs are restricted to the
+   original selection.
+6. **Bun request/auth/path.** Request bodies stream through
+   `req.body.getReader()`, cancel on overflow, and never buffer the whole body
+   first. `canonicalWorkspace` returns `null` on realpath failure (no `resolve`
+   fallback) and delegates platform/UNC/WSL normalization to the shared
+   workspace path-identity helper. Invalidation verifies `app_instance_id`,
+   drops in-memory session compaction carriers, and returns this registry's
+   actual `bun_instance_id`. The captured capability stays module-private; the
+   secret object is not exported.
+7. **Durable receipt validity.** `apply_memory_turn_receipt` never manufactures
+   `started_at`; a receipt with neither start nor terminal is an authoritative
+   validation-end recorded without granting a started lifecycle. Applied IDs
+   are filtered to the original selection, evidence is bounded, and a
+   conservatively `invalidated` row may reconcile an authenticated
+   started/terminal receipt without resurrecting its public reference.
+   Bun never consumes invalidated unstarted entries.
+8. **Additional owner mutation.** `commands/agents.rs::delete_agent` enters the
+   precommit gate before its AppDb lock; `delete_agent_row` remains a pure
+   helper. Agent name/model edits are unchanged (they do not alter memory
+   scope).
+
+Also corrected: the bounded native item renderer now drops the title label,
+then the whole label, when it cannot fit without starving the excerpt.
+
+Corrective-pass files: `src-tauri/src/process_lifecycle.rs`,
+`src-tauri/src/jarvis/memory/transport.rs`,
+`src-tauri/src/jarvis/memory/turn.rs`, `src-tauri/src/commands/agents.rs`,
+`server-jarvis/src/native-memory.ts`,
+`server-jarvis/src/orchestration/session-memory.ts`,
+`server-jarvis/src/index.ts`, and this ledger.
+
+## Corrective source commands run
+
+| Command | Result |
+|---|---|
+| `cargo check --manifest-path src-tauri/Cargo.toml` (workdir repo root) | **PASS** — only the 2 pre-existing warnings |
+| `bun run typecheck` (workdir `server-jarvis`) | **PASS** — `tsc --noEmit`, exit 0 |
+| `bun run build` (workdir `server-jarvis`) | **PASS** — bundled `dist/index.js` |
+
+Two earlier verification invocations were auto-rejected by the OpenCode CLI
+before they ran (both used a chained `cd ..`/multi-directory shell command).
+They produced no result and are not evidence; the equivalent authorized checks
+above were re-run from within the worktree using the tool's `workdir`.
 
 ## Commands and gates NOT RUN
 

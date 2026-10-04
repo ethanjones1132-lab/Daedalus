@@ -513,6 +513,15 @@ export class SessionMemory {
     }
   }
 
+  /**
+   * Drop every in-memory compaction carrier. Native memory invalidation calls
+   * this so a mutation cannot leave recalled project context cached. Durable
+   * per-session files keep their existing lifecycle.
+   */
+  clearAll(): void {
+    this.sessions.clear();
+  }
+
   getSessionState(sessionId: string): SessionMemoryState | undefined {
     return this.sessions.get(sessionId);
   }

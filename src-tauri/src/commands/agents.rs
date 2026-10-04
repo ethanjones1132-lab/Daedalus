@@ -8,9 +8,10 @@
 // `State` (see the `tests` module at the bottom).
 
 use crate::db::AppDb;
+use crate::jarvis::memory::contracts::MemoryError;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, State};
 
 /// An agent stored in the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -424,10 +425,18 @@ pub fn add_agent(
 }
 
 /// Delete an agent by id.
+///
+/// Agent identity is required by `resolve_session_memory_scope`, so removing an
+/// Agent changes native memory ownership eligibility. The production adapter
+/// enters the precommit gate before locking AppDb; `delete_agent_row` stays a
+/// pure helper for existing callers and tests.
 #[tauri::command]
-pub fn delete_agent(db: State<AppDb>, id: String) -> Result<(), String> {
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    delete_agent_row(&conn, &id)
+pub async fn delete_agent(app: AppHandle, id: String) -> Result<(), String> {
+    super::memory_turn::run_gated_mutation(app, "agent_delete", move |conn| {
+        delete_agent_row(conn, &id).map_err(MemoryError::storage_unavailable)
+    })
+    .await
+    .map_err(|error| error.message)
 }
 
 /// Update an agent's identity fields (name / description / system prompt / model).

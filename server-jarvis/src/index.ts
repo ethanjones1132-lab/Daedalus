@@ -14,7 +14,6 @@ installSelfLog();
 import {
   createNativeMemoryRegistry,
   handleNativeMemoryRequest,
-  nativeMemoryBootstrap,
 } from "./native-memory";
 import { NFL_2025_PLAYERS, NFL_2025_DEFENSES } from "./football";
 import { PRIZEPICKS_SYSTEM_PROMPT, buildPrizePicksContext, buildFullDatabaseContext, normalizeStatType, findPlayerName, generateWeeklyPicks } from "./prizepicks";
@@ -577,8 +576,12 @@ const persistentConductor = new PersistentConductor(loadConfig);
 
 /** Ephemeral owned-registry for native memory. Empty when this server was not
  *  launched with the native capability; internal routes then report
- *  `memory_unavailable` instead of serving a second App-memory authority. */
-const nativeMemoryRegistry = createNativeMemoryRegistry(nativeMemoryBootstrap);
+ *  `memory_unavailable` instead of serving a second App-memory authority.
+ *  Invalidation also drops in-memory session compaction carriers so a
+ *  semantic mutation cannot leave recalled project context cached. */
+const nativeMemoryRegistry = createNativeMemoryRegistry(undefined, () => {
+  sessionMemory.clearAll();
+});
 
 /** Inter-workflow shared memory — tool results, file snapshots, failure patterns. */
 const sessionMemory = new SessionMemory(() => loadConfig().orchestrator.session_memory);
