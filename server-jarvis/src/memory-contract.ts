@@ -19,7 +19,12 @@ export type MemoryErrorCode =
   // Phase 2 additive turn-lifecycle error codes. Frozen spellings.
   | "turn_conflict"
   | "invalid_turn"
-  | "invalidation_unavailable";
+  | "invalidation_unavailable"
+  // Phase 3 additive capture error codes. Frozen spellings.
+  | "operation_conflict"
+  | "invalid_acceptance"
+  | "unsupported_verification"
+  | "capture_unavailable";
 
 export interface MemoryError {
   code: MemoryErrorCode;
@@ -343,3 +348,113 @@ export interface PromptHistoryMessage {
 }
 
 export const PREPARED_TURN_SCHEMA_VERSION = 1;
+
+// ── Phase 3.1 capture wire contracts ─────────────────────────────────────────
+// Types-only mirror of the frozen Rust DTOs in
+// `src-tauri/src/jarvis/memory/capture_contracts.rs`. Phase 3.1 owns these
+// definitions; later phases consume them unchanged. Field names and enum
+// values must stay in exact lockstep with the Rust side. Request DTOs deny
+// unknown fields on the Rust side, so a forged `agent_id`, `terminal_status`,
+// or `verified_at` is rejected before any transaction opens.
+
+export type CaptureOperationStatus =
+  | "saved"
+  | "forgotten"
+  | "corrected"
+  | "pending"
+  | "blocked";
+
+export interface CaptureOperationReceipt {
+  operation_id: string;
+  status: CaptureOperationStatus;
+  memory_id: string | null;
+  replacement_id: string | null;
+  reason_code: string | null;
+}
+
+export interface CaptureReceipt {
+  turn_id: string;
+  session_id: string;
+  terminal_status: MemoryTurnTerminalStatus | null;
+  operations: CaptureOperationReceipt[];
+  store_revision: number;
+  continuity_revision: number;
+  saved_count: number;
+  pending_count: number;
+}
+
+export interface CorrectionResult {
+  previous: ScopedMemoryEntry;
+  replacement: ScopedMemoryEntry;
+  store_revision: number;
+  changed: boolean;
+}
+
+export interface ForgetResult {
+  memory: ScopedMemoryEntry;
+  store_revision: number;
+  changed: boolean;
+  suppressed_message_ids: string[];
+}
+
+export interface ActiveObjective {
+  text: string;
+  source_message_id: string;
+  source_turn_id: string | null;
+  depends_on_memory_ids: string[];
+}
+
+export interface SessionContinuity {
+  session_id: string;
+  active_objective: ActiveObjective | null;
+  latest_turn_id: string | null;
+  revision: number;
+}
+
+export interface CaptureTurnRequest {
+  session_id: string;
+  turn_id: string;
+}
+
+export interface CaptureReceiptsRequest {
+  session_id: string;
+  turn_id: string;
+}
+
+export interface ScopedCorrectRequest {
+  session_id: string;
+  selector: ScopeSelector;
+  id: string;
+  expected_revision: number;
+  draft: MemoryDraft;
+  operation_id: string;
+}
+
+export interface ScopedForgetRequest {
+  session_id: string;
+  selector: ScopeSelector;
+  id: string;
+  expected_revision: number;
+  reason: string;
+  operation_id: string;
+}
+
+export interface StageProposalRequest {
+  session_id: string;
+  turn_id: string;
+  assistant_message_id: string;
+  draft: MemoryDraft;
+  operation_id: string;
+}
+
+export interface ContinuityReadRequest {
+  session_id: string;
+}
+
+export interface ContinuitySetRequest {
+  session_id: string;
+  expected_revision: number;
+  source_message_id: string;
+  objective: string | null;
+  operation_id: string;
+}

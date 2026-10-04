@@ -27,6 +27,11 @@ pub enum MemoryErrorCode {
     TurnConflict,
     InvalidTurn,
     InvalidationUnavailable,
+    // Phase 3 additive capture error codes. Frozen spellings.
+    OperationConflict,
+    InvalidAcceptance,
+    UnsupportedVerification,
+    CaptureUnavailable,
 }
 
 /// Typed native memory error. Serialization never includes SQL, paths
@@ -99,6 +104,22 @@ impl MemoryError {
 
     pub fn invalidation_unavailable(message: impl Into<String>) -> Self {
         Self::new(MemoryErrorCode::InvalidationUnavailable, message)
+    }
+
+    pub fn operation_conflict(message: impl Into<String>) -> Self {
+        Self::new(MemoryErrorCode::OperationConflict, message)
+    }
+
+    pub fn invalid_acceptance(message: impl Into<String>) -> Self {
+        Self::new(MemoryErrorCode::InvalidAcceptance, message)
+    }
+
+    pub fn unsupported_verification(message: impl Into<String>) -> Self {
+        Self::new(MemoryErrorCode::UnsupportedVerification, message)
+    }
+
+    pub fn capture_unavailable(message: impl Into<String>) -> Self {
+        Self::new(MemoryErrorCode::CaptureUnavailable, message)
     }
 }
 

@@ -280,6 +280,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
     apply_schema_patches(conn)?;
     apply_scoped_memory_migrations(conn)?;
     apply_memory_turn_migrations(conn)?;
+    apply_memory_capture_migrations(conn)?;
 
     Ok(())
 }
@@ -1019,6 +1020,123 @@ pub fn apply_memory_turn_migrations(conn: &Connection) -> Result<(), rusqlite::E
         CREATE INDEX IF NOT EXISTS idx_memory_turn_pending ON memory_turn_preparations(state, expires_at);
         "#,
     )
+}
+
+/// Phase 3.1 native capture schema. Additive only and idempotent: it creates
+/// the operation ledger, per-turn capture receipts, structured Session
+/// continuity, prompt-source suppressions, turn/message associations, and the
+/// derived-invalidation outbox without touching or backfilling existing memory,
+/// Session, message, or turn rows. No old summary/current_goal is ever promoted
+/// into an accepted memory or typed continuity objective. The whole group runs
+/// inside a named savepoint so a partial failure cannot leave the store in a
+/// half-migrated state.
+pub fn apply_memory_capture_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("SAVEPOINT memory_capture_migration;")?;
+    let result = (|| -> Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            r#"
+            -- Idempotent operation ledger. One row per (Session, operation_id).
+            -- payload_hash is the canonical SHA-256 of the exact operation inputs;
+            -- response_json is the original persisted response, replayed verbatim
+            -- on an exact retry and never overwritten once written.
+            CREATE TABLE IF NOT EXISTS memory_operations (
+                session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                operation_id  TEXT NOT NULL,
+                payload_hash  TEXT NOT NULL,
+                response_json TEXT NOT NULL CHECK(json_valid(response_json)),
+                created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                PRIMARY KEY (session_id, operation_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_operations_session
+                ON memory_operations(session_id, created_at);
+
+            -- At most one committed capture receipt per native turn. terminal_hash
+            -- is the authenticated tuple hash from the Phase 2 turn snapshot; it is
+            -- nullable before the terminal observation is finalized but never
+            -- rewritten once the receipt has a terminal status.
+            CREATE TABLE IF NOT EXISTS memory_capture_receipts (
+                turn_id       TEXT PRIMARY KEY
+                    REFERENCES memory_turn_preparations(turn_id) ON DELETE CASCADE,
+                session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                terminal_hash TEXT,
+                receipt_json  TEXT NOT NULL CHECK(json_valid(receipt_json)),
+                updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_capture_receipts_session
+                ON memory_capture_receipts(session_id, updated_at);
+
+            -- Structured Session continuity. Distinct from the legacy
+            -- session_memory summary/current_goal row; legacy fields are never
+            -- read into this table by migration.
+            CREATE TABLE IF NOT EXISTS session_continuity (
+                session_id            TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                active_objective_json TEXT CHECK(
+                    active_objective_json IS NULL OR json_valid(active_objective_json)
+                ),
+                latest_turn_id        TEXT
+                    REFERENCES memory_turn_preparations(turn_id) ON DELETE SET NULL,
+                revision              INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
+                updated_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+
+            -- Prompt-source suppression: exact (Session, message, memory) ids whose
+            -- source instructions must not be replayed from any derived prompt
+            -- state. The visible operator transcript is untouched; deleted source
+            -- rows leave the audit ids recorded here rather than reviving facts.
+            CREATE TABLE IF NOT EXISTS memory_prompt_suppressions (
+                session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                message_id  TEXT NOT NULL,
+                memory_id   TEXT NOT NULL,
+                reason      TEXT NOT NULL DEFAULT '',
+                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                PRIMARY KEY (session_id, message_id, memory_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_prompt_suppressions_memory
+                ON memory_prompt_suppressions(memory_id);
+
+            -- Assistant turn/message association. Establishes transcript
+            -- provenance only; it never grants factual authority.
+            CREATE TABLE IF NOT EXISTS memory_turn_messages (
+                turn_id    TEXT NOT NULL REFERENCES memory_turn_preparations(turn_id) ON DELETE CASCADE,
+                message_id TEXT NOT NULL UNIQUE REFERENCES messages(id) ON DELETE CASCADE,
+                PRIMARY KEY (turn_id, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_turn_messages_message
+                ON memory_turn_messages(message_id);
+
+            -- Derived-state invalidation outbox. Drained in Part 3.2; persisted
+            -- atomically with the native mutation that produced it.
+            CREATE TABLE IF NOT EXISTS memory_derived_invalidations (
+                session_id                 TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                operation_id               TEXT NOT NULL,
+                scope_json                 TEXT NOT NULL CHECK(json_valid(scope_json)),
+                affected_session_ids_json  TEXT NOT NULL DEFAULT '[]'
+                    CHECK(json_valid(affected_session_ids_json)),
+                memory_ids_json            TEXT NOT NULL DEFAULT '[]'
+                    CHECK(json_valid(memory_ids_json)),
+                acknowledged_at            TEXT,
+                PRIMARY KEY (session_id, operation_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_derived_invalidations_pending
+                ON memory_derived_invalidations(acknowledged_at);
+            "#,
+        )?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE SAVEPOINT memory_capture_migration;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT memory_capture_migration; \
+                 RELEASE SAVEPOINT memory_capture_migration;",
+            );
+            Err(err)
+        }
+    }
 }
 
 #[cfg(test)]
