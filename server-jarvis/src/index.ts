@@ -24,6 +24,7 @@ import {
   resolveTurnMemoryInputBudget,
   withTurnMemory,
   TURN_MEMORY_CLI_OVERHEAD_RESERVE_TOKENS,
+  TURN_MEMORY_UNKNOWN_CONTEXT_TOKENS,
   type AppliedTurnMemory,
 } from "./turn-memory-context";
 import type { PreparedMemoryTurn } from "./memory-contract";
@@ -2475,13 +2476,15 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 ? null
                 : (openRouterEffective?.context_length ?? null);
           const stageContextCeiling = typeof callOptions?.contextCeilingTokens === "number"
+            && callOptions.contextCeilingTokens > 0
             ? callOptions.contextCeilingTokens
             : null;
+          // Unknown provider context resolves to the conservative floor FIRST,
+          // then intersects any valid positive stage ceiling, so a larger
+          // ceiling can never enlarge the unknown-model floor.
           const candidateContextWindow = stageContextCeiling == null
             ? providerContextWindow
-            : providerContextWindow == null
-              ? stageContextCeiling
-              : Math.min(providerContextWindow, stageContextCeiling);
+            : Math.min(providerContextWindow ?? TURN_MEMORY_UNKNOWN_CONTEXT_TOKENS, stageContextCeiling);
           const orchestratorOutputReserve = typeof requestBody.max_tokens === "number"
             ? requestBody.max_tokens
             : typeof requestBody.max_completion_tokens === "number"

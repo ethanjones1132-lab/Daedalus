@@ -256,6 +256,25 @@ Four remaining source gaps were fixed narrowly with no tests/runtime runs.
    positive output budget is configured. Ordinary no-memory requests are
    unchanged.
 
+## Third root-review budget correction
+
+One narrow budget bug remained: an unknown provider/candidate context with a
+stage ceiling above `TURN_MEMORY_UNKNOWN_CONTEXT_TOKENS` replaced rather than
+intersected the conservative floor. Fixed in both places:
+
+- `openrouter.ts` (cascade candidates): `effectiveBase = baseContext ??
+  TURN_MEMORY_UNKNOWN_CONTEXT_TOKENS`, then `contextWindowTokens = ceiling ==
+  null ? effectiveBase : Math.min(effectiveBase, ceiling)`; the ceiling must be
+  a valid positive number.
+- `index.ts` (single-provider orchestrator): `candidateContextWindow =
+  stageContextCeiling == null ? providerContextWindow :
+  Math.min(providerContextWindow ?? TURN_MEMORY_UNKNOWN_CONTEXT_TOKENS,
+  stageContextCeiling)`.
+
+Unknown model + larger stage ceiling can no longer enlarge the conservative
+floor; known candidate limits still govern independently. No other behavior
+changed.
+
 ## `MIN_BODY_SCALARS` note
 
 There is no `MIN_BODY_SCALARS` declaration in TypeScript. The only declaration

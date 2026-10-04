@@ -19,7 +19,12 @@ import { openCodeGoProtocolForModel } from "./orchestration/live-model-catalog";
 import { countTokens } from "./tokens";
 import type { MemoryAppliedObservation } from "./native-memory";
 import type { PreparedMemoryTurn } from "./memory-contract";
-import { fitTurnMemory, resolveTurnMemoryInputBudget, withTurnMemory } from "./turn-memory-context";
+import {
+  fitTurnMemory,
+  resolveTurnMemoryInputBudget,
+  withTurnMemory,
+  TURN_MEMORY_UNKNOWN_CONTEXT_TOKENS,
+} from "./turn-memory-context";
 
 // ═══════════════════════════════════════════════════════════════
 // Types
@@ -1099,13 +1104,16 @@ export async function chatCompletionWithFallback(
             : null;
           const baseContext = candidateContext ?? fallbackContext;
           const ceiling = typeof options.memory.contextCeilingTokens === "number"
+            && options.memory.contextCeilingTokens > 0
             ? options.memory.contextCeilingTokens
             : null;
-          const contextWindowTokens = baseContext == null
-            ? ceiling
-            : ceiling == null
-              ? baseContext
-              : Math.min(baseContext, ceiling);
+          // Unknown candidate/provider context resolves to the conservative
+          // floor FIRST, then intersects any valid positive stage ceiling. A
+          // larger ceiling can never enlarge the unknown-model floor.
+          const effectiveBase = baseContext ?? TURN_MEMORY_UNKNOWN_CONTEXT_TOKENS;
+          const contextWindowTokens = ceiling == null
+            ? effectiveBase
+            : Math.min(effectiveBase, ceiling);
           const outputReserve = typeof attemptBody.max_tokens === "number"
             ? attemptBody.max_tokens
             : typeof attemptBody.max_completion_tokens === "number"
