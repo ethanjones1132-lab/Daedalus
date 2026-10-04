@@ -42,7 +42,10 @@
   `memory`, `scope`, `agent_id`, and `effective_workspace` fields are never
   read or forwarded; scope, authority, and content come only from the
   authenticated native envelope. `memory_status` is parsed against the frozen
-  status vocabulary and treated as an informational hint only.
+  status vocabulary and treated as an informational hint only. The new
+  reference keys are added to the options object only when actually present, so
+  ordinary callers keep their exact existing options shape and the existing
+  route test is preserved unchanged.
 - `native-memory.ts`: added `resolveTurnMemory(registry, identity,
   activeWorkspace): ConsumeMemoryResult`, the sole inference entry point. It
   takes references only, fails closed with a null envelope for an empty
