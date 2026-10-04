@@ -83,6 +83,7 @@ import {
   type MemoryRecallStatus,
   type MemoryTurnDiagnosticView,
 } from './memory-turn-state';
+import { clearRelayMemoryTurn, isRegisteredRelayMemoryTurn } from './relay-memory-correlation';
 import { formatSessionStatsLine, shouldShowSessionStats } from './session-stats';
 import { filterSessions, formatFilterResultCount } from './session-filter';
 import {
@@ -692,15 +693,23 @@ export function ChatPanel({
   const [memoryDiagnostic, setMemoryDiagnostic] = useState<MemoryTurnDiagnosticView | null>(null);
   const [memoryHistoryWarning, setMemoryHistoryWarning] = useState<string | null>(null);
   const [memoryFinalizationNotice, setMemoryFinalizationNotice] = useState<string | null>(null);
-  // Guards relay `jarvis://memory-status`/`memory-diagnostic` events so a late
-  // event from a previous relay turn cannot overwrite the current one.
-  const relayMemoryTurnRef = useRef<{ sessionId: string; turnId: string } | null>(null);
   // Explicit per-turn user-wide opt-in. Default false; cleared whenever the
   // selected Session (and therefore Agent scope) changes so it can never carry
   // silently into a different Session/Agent.
   const [includeUserScope, setIncludeUserScope] = useState(false);
+  // The owning relay memory turn currently displayed. Used to drop stale
+  // warnings/diagnostics when a different relay submission becomes active.
+  const memoryOwnerRef = useRef<{ sessionId: string; turnId: string } | null>(null);
   useEffect(() => {
+    // A Session change invalidates the previous turn's memory surface and any
+    // relay correlation: no old warning/diagnostic may survive it.
     setIncludeUserScope(false);
+    setMemoryLiveStatus(null);
+    setMemoryDiagnostic(null);
+    setMemoryHistoryWarning(null);
+    setMemoryFinalizationNotice(null);
+    memoryOwnerRef.current = null;
+    clearRelayMemoryTurn();
   }, [activeSession]);
 
   // Phase 3.3 — token / cost tally for the current turn.
@@ -1183,8 +1192,18 @@ export function ChatPanel({
       appendAssistantText(text);
     }));
 
-    track(listen<{ session_id: string }>('jarvis://done', (event) => {
+    // A relay terminal event that carries a `turn_id` is memory-correlated and
+    // must match the exact registered relay submission; otherwise a late
+    // done/error from an old relay turn could finalize a newer direct turn.
+    // Legacy events without a `turn_id` keep their existing behavior.
+    const relayTerminalIsCorrelated = (sessionId: unknown, turnId: unknown): boolean => {
+      if (turnId === undefined || turnId === null) return true;
+      return isRegisteredRelayMemoryTurn(sessionId, turnId);
+    };
+
+    track(listen<{ session_id: string; turn_id?: string }>('jarvis://done', (event) => {
       if (!matchesStreamSession(event.payload.session_id)) return;
+      if (!relayTerminalIsCorrelated(event.payload.session_id, event.payload.turn_id)) return;
       dispatchActivity({ kind: 'terminal', outcome: 'success' });
       finalizeAssistantMessage(event.payload.session_id);
     }));
@@ -1197,8 +1216,9 @@ export function ChatPanel({
     // this path. The Rust `SseFrameOutcome::Error` variant only carries a
     // message string, not a `code` (unlike the fetch path's raw JSON
     // frames) — reported as a gap below rather than changing Rust.
-    track(listen<{ error: string; session_id: string; code?: string }>('jarvis://error', (event) => {
+    track(listen<{ error: string; session_id: string; code?: string; turn_id?: string }>('jarvis://error', (event) => {
       if (!matchesStreamSession(event.payload.session_id)) return;
+      if (!relayTerminalIsCorrelated(event.payload.session_id, event.payload.turn_id)) return;
       const pending = takePendingTokens();
       setIsStreaming(false);
       setPipelineStage('');
@@ -1235,8 +1255,9 @@ export function ChatPanel({
     // rather than dead code masking a real handler. If a future Rust change
     // adds a genuine `jarvis://cancelled` emit, this starts working without
     // further UI changes.
-    track(listen<{ session_id: string }>('jarvis://cancelled', (event) => {
+    track(listen<{ session_id: string; turn_id?: string }>('jarvis://cancelled', (event) => {
       if (!matchesStreamSession(event.payload.session_id)) return;
+      if (!relayTerminalIsCorrelated(event.payload.session_id, event.payload.turn_id)) return;
       const pending = takePendingTokens();
       setIsStreaming(false);
       setPipelineStage('');
@@ -1359,17 +1380,31 @@ export function ChatPanel({
       setTurnCost({ tokens: event.payload.tokens, costUsd: event.payload.cost_usd });
     }));
 
-    // Phase 2.4 — relay memory metadata. Guarded by Session identity and a
-    // first-seen turn id per submission so a late event from an old relay turn
-    // cannot overwrite another turn. These are metadata only and never
-    // authority; durable counts come from the native diagnostic projection.
-    const acceptRelayMemoryTurn = (sid: string | undefined, turnId: unknown): boolean => {
-      if (!matchesStreamSession(sid)) return false;
-      if (typeof sid !== 'string' || typeof turnId !== 'string' || !turnId) return false;
-      const current = relayMemoryTurnRef.current;
-      if (current && current.sessionId === sid && current.turnId !== turnId) return false;
-      relayMemoryTurnRef.current = { sessionId: sid, turnId };
-      return true;
+    // Phase 2.4 — relay memory metadata. Accepted ONLY for the exact
+    // `{session_id, turn_id}` registered by the owning submission before it
+    // invoked the relay (see `relay-memory-correlation`). Events cannot
+    // establish their own identity, so a delayed older relay event can never
+    // bind or overwrite a newer turn. Metadata only; durable counts come from
+    // the native diagnostic projection. Typed warning codes are surfaced
+    // visibly and persist until the next submission/Session change.
+    const applyRelayWarning = (code: unknown): void => {
+      if (code === 'history_unavailable') {
+        setMemoryHistoryWarning('Relay memory history unavailable for this turn.');
+      } else if (code === 'memory_finalization_failed') {
+        setMemoryFinalizationNotice('Relay memory finalization failed; showing the ordinary result.');
+      } else if (code === 'memory_finalization_pending') {
+        setMemoryFinalizationNotice('Relay memory finalization is pending; showing the ordinary result.');
+      }
+    };
+    // Bind the owning relay submission. On a different owner, drop the previous
+    // turn's warning/diagnostic so nothing stale survives a submission change.
+    const bindRelayMemoryOwner = (sid: string, turnId: string): void => {
+      const owner = memoryOwnerRef.current;
+      if (owner && owner.sessionId === sid && owner.turnId === turnId) return;
+      setMemoryDiagnostic(null);
+      setMemoryHistoryWarning(null);
+      setMemoryFinalizationNotice(null);
+      memoryOwnerRef.current = { sessionId: sid, turnId };
     };
     track(listen<{
       session_id?: string;
@@ -1380,7 +1415,10 @@ export function ChatPanel({
       code?: unknown;
     }>('jarvis://memory-status', (event) => {
       const p = event.payload;
-      if (!acceptRelayMemoryTurn(p.session_id, p.turn_id)) return;
+      if (!matchesStreamSession(p.session_id)) return;
+      if (!isRegisteredRelayMemoryTurn(p.session_id, p.turn_id)) return;
+      bindRelayMemoryOwner(p.session_id as string, p.turn_id as string);
+      applyRelayWarning(p.code);
       const decoded = decodeMemoryStatusFrame(p);
       if (decoded) setMemoryLiveStatus(decoded.status);
     }));
@@ -1388,7 +1426,9 @@ export function ChatPanel({
       'jarvis://memory-diagnostic',
       (event) => {
         const p = event.payload;
-        if (!acceptRelayMemoryTurn(p.session_id, p.turn_id)) return;
+        if (!matchesStreamSession(p.session_id)) return;
+        if (!isRegisteredRelayMemoryTurn(p.session_id, p.turn_id)) return;
+        bindRelayMemoryOwner(p.session_id as string, p.turn_id as string);
         try {
           const view = decodeMemoryTurnDiagnostic(p);
           if (view.turnId === p.turn_id && view.sessionId === p.session_id) {
@@ -1441,9 +1481,18 @@ export function ChatPanel({
       && streamAbortRef.current === controller
     );
 
+    // Submission guard: Session/generation/controller ownership PLUS an
+    // explicit abort/Stop. Used after each awaited setup operation and before
+    // starting inference, so a Stop during append/prepare/history cannot race
+    // `/chat/cancel` and then still launch a fetch. The display guard
+    // (`requestIsCurrent`) is intentionally separate so a legitimate
+    // cancellation terminal can still render for the current turn.
+    const submissionAlive = () => (
+      requestIsCurrent() && !controller.signal.aborted && !stopRequestedRef.current
+    );
     const stopIfStale = () => {
-      if (requestIsCurrent()) return;
-      controller.abort('Stale Session turn');
+      if (submissionAlive()) return;
+      if (!controller.signal.aborted) controller.abort('Stale Session turn');
       throw new DOMException('Stale Session turn', 'AbortError');
     };
 
@@ -1474,42 +1523,49 @@ export function ChatPanel({
       finalizePromise = (async (): Promise<boolean> => {
         if (!userMessageId) return true;
         let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-        const timeout = new Promise<'timeout'>((resolve) => {
-          timeoutHandle = setTimeout(() => resolve('timeout'), MEMORY_FINALIZE_TIMEOUT_MS);
+        const timeout = new Promise<{ kind: 'timeout' }>((resolve) => {
+          timeoutHandle = setTimeout(() => resolve({ kind: 'timeout' }), MEMORY_FINALIZE_TIMEOUT_MS);
         });
-        const sync = invoke('memory_sync_turn', {
+        // `memory_sync_turn` already returns the authenticated native
+        // `MemoryTurnDiagnostic`; the whole sync+decode lives inside this one
+        // bounded race, so there is no second unbounded await. A late resolve
+        // after the timeout can never reach the decode/repaint path.
+        const sync = invoke<unknown>('memory_sync_turn', {
           request: { session_id: sid, turn_id: turnId },
-        }).then(() => 'ok' as const, () => 'failed' as const);
+        }).then(
+          (diagnostic) => ({ kind: 'ok' as const, diagnostic }),
+          () => ({ kind: 'failed' as const, diagnostic: null }),
+        );
         const outcome = await Promise.race([sync, timeout]);
         if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
-        if (outcome === 'timeout') {
+        if (outcome.kind === 'timeout') {
           if (requestIsCurrent()) {
             setMemoryFinalizationNotice('Memory finalization is pending; showing the ordinary result.');
           }
           return false;
         }
-        if (outcome === 'failed') {
+        if (outcome.kind === 'failed') {
           if (requestIsCurrent()) {
             setMemoryFinalizationNotice('Memory sync unavailable; showing the ordinary result.');
           }
           return false;
         }
-        if (!requestIsCurrent()) return true;
+        // Success: decode the already-returned authenticated diagnostic. A
+        // tuple mismatch is an observable failure rather than a stale repaint.
         try {
-          const diagnostic = await invoke('memory_turn_diagnostic', {
-            request: { session_id: sid, turn_id: turnId },
-          });
-          const view = decodeMemoryTurnDiagnostic(diagnostic);
-          // Only an exact expected tuple is accepted; a stale Session/turn
-          // read-back is dropped.
-          if (requestIsCurrent() && view.turnId === turnId && view.sessionId === sid) {
-            setMemoryDiagnostic(view);
+          const view = decodeMemoryTurnDiagnostic(outcome.diagnostic);
+          if (!requestIsCurrent()) return true;
+          if (view.turnId !== turnId || view.sessionId !== sid) {
+            setMemoryFinalizationNotice('Memory status did not match this turn.');
+            return false;
           }
+          setMemoryDiagnostic(view);
         } catch (e) {
           console.warn('[Jarvis] memory diagnostic read-back failed:', e);
           if (requestIsCurrent()) {
             setMemoryFinalizationNotice('Memory status unavailable for this turn.');
           }
+          return false;
         }
         return true;
       })();
@@ -1900,8 +1956,11 @@ export function ChatPanel({
       if (frame.type === 'result') {
         const decision = decodeResultFrame(frame);
         // Phase 2.4 — finalize the native turn before any local terminal
-        // publication (activity, outcome, run-record write).
+        // publication (activity, outcome, run-record write). Re-check current
+        // ownership after the await so a Session switch during the bounded wait
+        // cannot repaint another Session.
         await finalizeMemoryTurn();
+        if (!requestIsCurrent()) return;
         if (!acceptTerminal(decision)) return;
         dispatchActivity({ kind: 'terminal', outcome: decision.outcome });
         activityTerminalDispatched = true;
@@ -1922,6 +1981,7 @@ export function ChatPanel({
           hardError: true,
         };
         await finalizeMemoryTurn();
+        if (!requestIsCurrent()) return;
         if (!acceptTerminal(decision)) return;
         dispatchActivity({ kind: 'terminal', outcome: decision.outcome });
         activityTerminalDispatched = true;
@@ -1940,6 +2000,7 @@ export function ChatPanel({
           hardError: false,
         };
         await finalizeMemoryTurn();
+        if (!requestIsCurrent()) return;
         if (!acceptTerminal(decision)) return;
         dispatchActivity({ kind: 'terminal', outcome: decision.outcome });
         activityTerminalDispatched = true;
@@ -2035,6 +2096,7 @@ export function ChatPanel({
         runAcc.partialOutput = boundedPartialOutput(streamedRawText);
         // Finalize before the EOF/abort terminal publication and run write.
         await finalizeMemoryTurn();
+        if (!requestIsCurrent()) return;
         dispatchActivity({ kind: 'terminal', outcome: 'failed' });
         activityTerminalDispatched = true;
         throw new JarvisStreamError(STREAM_INCOMPLETE_MESSAGE, STREAM_INCOMPLETE_CODE);
@@ -2116,7 +2178,10 @@ export function ChatPanel({
     setMemoryDiagnostic(null);
     setMemoryHistoryWarning(null);
     setMemoryFinalizationNotice(null);
-    relayMemoryTurnRef.current = null;
+    // A new submission invalidates any prior relay correlation so a late relay
+    // event from a previous turn cannot bind to this one.
+    clearRelayMemoryTurn();
+    memoryOwnerRef.current = null;
     // Consume the per-turn user-wide opt-in: this turn snapshots the explicit
     // choice, then the control resets to the Session default (false) so it can
     // never silently carry across an Agent change within the same Session.

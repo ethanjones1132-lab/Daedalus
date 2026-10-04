@@ -147,11 +147,36 @@ pub fn finalize_relay_memory_turn(
     crate::jarvis::memory::transport::sync_memory_turn(db, transport, identity, chrono::Utc::now())
 }
 
+/// UI/relay-caller wait bound for one native memory finalization. Above the
+/// owned transport's own 1 s connect / 3 s total request bounds. A timeout
+/// surfaces a typed pending status and never manufactures success.
+const RELAY_MEMORY_FINALIZE_TIMEOUT_MS: u64 = 5_000;
+
+/// Emit a metadata-only relay memory failure/pending status. Never content,
+/// never scope, never terminal evidence.
+fn emit_relay_memory_failure(app: &AppHandle, session_id: &str, turn_id: &str, code: &str) {
+    let _ = app.emit(
+        "jarvis://memory-status",
+        serde_json::json!({
+            "turn_id": turn_id,
+            "session_id": session_id,
+            "status": "unavailable",
+            "selected_ids": [],
+            "store_revision": serde_json::Value::Null,
+            "code": code,
+        }),
+    );
+}
+
 /// One-shot wrapper around [`finalize_relay_memory_turn`] for the relay thread.
 /// Only attempts a sync when a real persisted Session/turn identity exists.
-/// Returns `true` once attempted (success or subsequent no-op) and `false` when
-/// the bounded sync failed, so the caller can emit observable
-/// memory-unavailable metadata without rewriting the model result.
+///
+/// The blocking authenticated sync runs on an AppHandle-owned worker so the
+/// relay caller's wait is **bounded** even if the native operation gate or the
+/// AppDb queue is backed up. The worker only returns data over a channel; it
+/// never emits a late diagnostic after the caller has timed out. The caller
+/// emits exactly one result — the actual native diagnostic projection, or a
+/// typed pending/unavailable status — before the ordinary terminal publication.
 fn attempt_relay_memory_finalize(
     app: &AppHandle,
     session_id: &str,
@@ -163,21 +188,36 @@ fn attempt_relay_memory_finalize(
         return true;
     }
     *finalized = true;
-    let transport = crate::jarvis::memory::transport::native_memory_transport();
-    let db_state = app.state::<AppDb>();
-    match finalize_relay_memory_turn(
-        db_state.inner(),
-        transport,
-        MemoryTurnIdentityRequest {
-            session_id: session_id.to_string(),
-            turn_id: turn_id.to_string(),
-        },
-    ) {
-        Ok(diagnostic) => {
-            // Emit an authoritative native diagnostic projection: metadata and
+
+    let worker_app = app.clone();
+    let worker_session = session_id.to_string();
+    let worker_turn = turn_id.to_string();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<MemoryTurnDiagnostic, String>>();
+    std::thread::spawn(move || {
+        let transport = crate::jarvis::memory::transport::native_memory_transport();
+        let db_state = worker_app.state::<AppDb>();
+        let result = finalize_relay_memory_turn(
+            db_state.inner(),
+            transport,
+            MemoryTurnIdentityRequest {
+                session_id: worker_session,
+                turn_id: worker_turn,
+            },
+        )
+        .map_err(|error| error.to_string());
+        // Return data only; the receiver may already be gone.
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_millis(RELAY_MEMORY_FINALIZE_TIMEOUT_MS)) {
+        Ok(Ok(diagnostic)) => {
+            if diagnostic.turn_id != turn_id || diagnostic.session_id != session_id {
+                emit_relay_memory_failure(app, session_id, turn_id, "memory_turn_mismatch");
+                return false;
+            }
+            // Authoritative native diagnostic projection: metadata and
             // selected/applied IDs only, never scope, recalled text, or the
-            // block. The UI uses this for durable counts; transient SSE frames
-            // are never authority.
+            // block.
             let selected_ids: Vec<serde_json::Value> = diagnostic
                 .selected
                 .iter()
@@ -199,24 +239,22 @@ fn attempt_relay_memory_finalize(
             );
             true
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             eprintln!(
                 "[memory] relay finalize failed session={} turn={} error={}",
                 session_id, turn_id, error
             );
-            // Metadata-only, typed failure surfaced before the terminal
-            // publication. It never manufactures receipt or terminal evidence.
-            let _ = app.emit(
-                "jarvis://memory-status",
-                serde_json::json!({
-                    "turn_id": turn_id,
-                    "session_id": session_id,
-                    "status": "unavailable",
-                    "selected_ids": [],
-                    "store_revision": serde_json::Value::Null,
-                    "code": "memory_finalization_failed",
-                }),
-            );
+            emit_relay_memory_failure(app, session_id, turn_id, "memory_finalization_failed");
+            false
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // The worker may still complete later; it only sends to a dropped
+            // channel and never emits, so no late diagnostic can repaint.
+            emit_relay_memory_failure(app, session_id, turn_id, "memory_finalization_pending");
+            false
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            emit_relay_memory_failure(app, session_id, turn_id, "memory_finalization_failed");
             false
         }
     }

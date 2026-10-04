@@ -151,6 +151,10 @@ pub async fn jarvis_send_message(
     db: tauri::State<'_, crate::db::AppDb>,
     message: String,
     session_id: String,
+    // Optional caller-supplied stable turn id (additive, backward compatible).
+    // It is only a correlation identity: Native still prepares the turn against
+    // its own persisted row and never treats a client id as memory authority.
+    turn_id: Option<String>,
 ) -> Result<(), String> {
     // Chat is served by the native Bun server, which loads the active config
     // (backend + model + OpenRouter key) itself. Make sure it is up, then hand the
@@ -218,9 +222,12 @@ pub async fn jarvis_send_message(
     }
 
     // One stable turn identity for this relay turn, distinct from the opaque
-    // native preparation id. Preparation is references-only; its status is a
-    // public hint. A preparation failure still runs ordinary relay inference.
-    let turn_id = uuid::Uuid::new_v4().to_string();
+    // native preparation id. A caller may supply it so the UI can correlate the
+    // relay's asynchronous events unambiguously; otherwise it is generated.
+    let turn_id = match turn_id {
+        Some(id) if !id.trim().is_empty() => id,
+        _ => uuid::Uuid::new_v4().to_string(),
+    };
 
     // Metadata-only, observable history warning tied to this turn. It does not
     // fabricate a saved row or memory readiness.
