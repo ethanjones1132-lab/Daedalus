@@ -228,6 +228,34 @@ Also added: `CallModelFn.contextCeilingTokens` and executor/rewriter stage
 ceilings so the memory fit intersects the stage transcript bound with the
 provider context window.
 
+## Second root-review corrective pass
+
+Four remaining source gaps were fixed narrowly with no tests/runtime runs.
+
+1. **Truly per-candidate fallback context.** `buildAttemptBody` now returns the
+   candidate's resolved OpenRouter catalog metadata (`EffectiveOpenRouterRequestConfig`)
+   instead of discarding it, and `chatCompletionWithFallback` fits each
+   candidate against that candidate's own `context_length` and output
+   reservation, intersected with the stage ceiling. A candidate with no
+   metadata (OpenCode Zen/Go, or a catalog miss) stays on the conservative
+   unknown-context floor; the primary model's larger limit is never reused.
+   The metadata comes from the existing cached catalog resolution — no new
+   network request.
+2. **Anthropic OpenCode Go counts the system prompt.** `memoryCostMessages`
+   includes the converted body's top-level `system` text in the token fit
+   (without inserting a synthetic system message into the wire payload); the
+   carrier is attached once to the protocol's `messages` array.
+3. **CLI capability probe hardened.** `probeClaudeCliForFlag` now requires a
+   clean exit (`code === 0`, no signal) and an actual line-anchored help
+   option declaration, fails closed on error/timeout/nonzero exit, and bounds
+   accumulated output to the cap without overshooting on a whole chunk.
+4. **CLI output reserve uses configured tokens.** Main CLI and delegate fits
+   now pass `cfg.max_tokens` / `input.config.max_tokens` as
+   `outputReserveTokens` (alongside the explicit CLI overhead reserve and the
+   complete system text), falling back to the utility default only when no
+   positive output budget is configured. Ordinary no-memory requests are
+   unchanged.
+
 ## `MIN_BODY_SCALARS` note
 
 There is no `MIN_BODY_SCALARS` declaration in TypeScript. The only declaration
@@ -239,8 +267,8 @@ to remove; the bounded renderer behavior is unchanged.
 
 | Command | Result |
 |---|---|
-| `bun run typecheck` (workdir `server-jarvis`) | **PASS** — `tsc --noEmit`, exit 0 (re-run after the corrective pass) |
-| `bun run build` (workdir `server-jarvis`) | **PASS** — bundled `dist/index.js` (196 modules; re-run after the corrective pass) |
+| `bun run typecheck` (workdir `server-jarvis`) | **PASS** — `tsc --noEmit`, exit 0 (re-run after both corrective passes) |
+| `bun run build` (workdir `server-jarvis`) | **PASS** — bundled `dist/index.js` (196 modules; re-run after both corrective passes) |
 | `git diff --check` (repo root) | **PASS** — no whitespace errors |
 
 `cargo check` was not required: no Rust source, DTO, migration, or command was
@@ -271,15 +299,17 @@ No test files (`memory-turn-routing.test.ts`, `turn-memory-context.test.ts`,
   typecheck, and bundling only.
 - **Cross-language framing parity.** The TS frame strings mirror the frozen
   Rust constants; the cross-language roundtrip is not executed here.
-- **Cascade refit.** Each candidate/retry now refits from the clean base; the
-  per-candidate context window is the stage ceiling intersected with the
-  provider window, falling back to the conservative floor when either is
-  unknown. Not exercised live.
+- **Cascade refit.** Each candidate/retry refits from the clean base against
+  that candidate's own resolved catalog `context_length`/output reservation
+  intersected with the stage ceiling; missing metadata stays on the
+  conservative floor rather than borrowing the primary limit. Not exercised
+  live.
 - **CLI capability probe.** `--no-session-persistence` support is probed via a
-  bounded, cached `claude --help`; a failed/timed-out probe fails closed to
-  `unavailable` and ordinary inference. Not exercised against a real binary
-  here, and the probe's own side effects (one short-lived `--help` process per
-  executable path) are cached for the process lifetime.
+  bounded, cached `claude --help` that requires a clean exit and a real
+  line-anchored option declaration; any error/timeout/nonzero exit fails
+  closed to `unavailable` and ordinary inference. Not exercised against a real
+  binary here, and the probe's own side effects (one short-lived `--help`
+  process per executable path) are cached for the process lifetime.
 - **Evidence is not authority.** Tool success/hash observations are bounded
   diagnostics; they never establish durable verified facts.
 - **Phase 2.4 dependency.** UI direct SSE/native relay wiring, terminal sync/ACK

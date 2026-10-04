@@ -212,6 +212,12 @@ export function claudeCliSupportsNoSessionPersistence(path: string): Promise<boo
 const noSessionPersistenceProbes = new Map<string, Promise<boolean>>();
 const CLI_HELP_OUTPUT_CAP = 64 * 1024;
 
+/** True only for an actual help option declaration, not an incidental mention. */
+function declaresCliFlag(output: string, flag: string): boolean {
+  const escaped = flag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|\\n)[ \\t]*${escaped}(?:[ \\t]|=|,|$)`).test(output);
+}
+
 function probeClaudeCliForFlag(executable: string, flag: string): Promise<boolean> {
   return new Promise<boolean>((resolveProbe) => {
     let output = "";
@@ -234,12 +240,22 @@ function probeClaudeCliForFlag(executable: string, flag: string): Promise<boolea
     }, 5_000);
     const append = (chunk: Buffer | string): void => {
       if (output.length >= CLI_HELP_OUTPUT_CAP) return;
-      output += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      const remaining = CLI_HELP_OUTPUT_CAP - output.length;
+      output += text.length <= remaining ? text : text.slice(0, remaining);
     };
     proc.stdout?.on("data", append);
     proc.stderr?.on("data", append);
     proc.once("error", () => { clearTimeout(timer); finish(false); });
-    proc.once("close", () => { clearTimeout(timer); finish(output.includes(flag)); });
+    proc.once("close", (code, signal) => {
+      clearTimeout(timer);
+      // Fail closed on any non-clean exit and require a real option declaration.
+      if (code !== 0 || signal) {
+        finish(false);
+        return;
+      }
+      finish(declaresCliFlag(output, flag));
+    });
   });
 }
 

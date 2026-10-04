@@ -452,7 +452,9 @@ export function buildClaudeDelegateInvocation(
         [{ role: "user", content: input.prompt }],
         resolveTurnMemoryInputBudget({
           contextWindowTokens: null,
-          outputReserveTokens: null,
+          // Reserve the configured positive output budget; the utility falls
+          // back to its default only when none is configured.
+          outputReserveTokens: input.config.max_tokens,
           additionalReserveTokens: TURN_MEMORY_CLI_OVERHEAD_RESERVE_TOKENS,
         }),
       )

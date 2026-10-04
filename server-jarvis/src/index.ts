@@ -1849,7 +1849,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             cliBaseMessages,
             resolveTurnMemoryInputBudget({
               contextWindowTokens: null,
-              outputReserveTokens: null,
+              // Reserve the configured positive output budget; the utility
+              // falls back to its default only when none is configured.
+              outputReserveTokens: cfg.max_tokens,
               additionalReserveTokens: TURN_MEMORY_CLI_OVERHEAD_RESERVE_TOKENS,
             }),
           );
@@ -2480,20 +2482,25 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             : providerContextWindow == null
               ? stageContextCeiling
               : Math.min(providerContextWindow, stageContextCeiling);
+          const orchestratorOutputReserve = typeof requestBody.max_tokens === "number"
+            ? requestBody.max_tokens
+            : typeof requestBody.max_completion_tokens === "number"
+              ? requestBody.max_completion_tokens
+              : cfg.max_tokens;
           const attemptMemoryFallback = turnMemoryEnvelope && useFallback
             ? {
                 envelope: turnMemoryEnvelope,
-                contextWindowFor: (): number | null => candidateContextWindow,
+                // Candidate catalog metadata wins inside the cascade; the stage
+                // ceiling bounds it. No primary-model fallback is supplied, so
+                // a candidate without metadata stays conservatively floored.
+                contextCeilingTokens: stageContextCeiling,
+                fallbackContextWindowFor: (): number | null => null,
+                outputReserveTokens: orchestratorOutputReserve,
                 onApplied: (observation: MemoryAppliedObservation) => observeTurnMemoryObservation(observation),
               }
             : undefined;
           if (turnMemoryEnvelope && !useFallback) {
-            const outputReserve = typeof requestBody.max_tokens === "number"
-              ? requestBody.max_tokens
-              : typeof requestBody.max_completion_tokens === "number"
-                ? requestBody.max_completion_tokens
-                : cfg.max_tokens;
-            const attached = attachTurnMemory(normalizedMessages, requestBody.tools, candidateContextWindow, outputReserve);
+            const attached = attachTurnMemory(normalizedMessages, requestBody.tools, candidateContextWindow, orchestratorOutputReserve);
             if (attached.applied) {
               requestBody.messages = attached.messages;
               observeTurnMemoryApplied(stageLabel ?? "orchestrator", attached.applied);
@@ -4705,20 +4712,24 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // the clean base so a candidate/retry never re-fits a list already
         // carrying memory. activeHistory/originalHistory stay untouched.
         const directUseFallback = !isOllama && cfg.openrouter.enable_fallbacks;
+        const directOutputReserve = typeof requestBody.max_tokens === "number"
+          ? requestBody.max_tokens
+          : typeof requestBody.max_completion_tokens === "number"
+            ? requestBody.max_completion_tokens
+            : cfg.max_tokens;
         const directMemoryFallback = turnMemoryEnvelope && directUseFallback
           ? {
               envelope: turnMemoryEnvelope,
-              contextWindowFor: (): number | null => null,
+              // No stage ceiling and no primary-model fallback: each candidate
+              // uses its own catalog context, otherwise the conservative floor.
+              contextCeilingTokens: null,
+              fallbackContextWindowFor: (): number | null => null,
+              outputReserveTokens: directOutputReserve,
               onApplied: (observation: MemoryAppliedObservation) => observeTurnMemoryObservation(observation),
             }
           : undefined;
         if (turnMemoryEnvelope && !directUseFallback) {
-          const outputReserve = typeof requestBody.max_tokens === "number"
-            ? requestBody.max_tokens
-            : typeof requestBody.max_completion_tokens === "number"
-              ? requestBody.max_completion_tokens
-              : cfg.max_tokens;
-          const attached = attachTurnMemory(normalizedMessages, requestBody.tools, num_ctx, outputReserve);
+          const attached = attachTurnMemory(normalizedMessages, requestBody.tools, num_ctx, directOutputReserve);
           if (attached.applied) {
             requestBody.messages = attached.messages;
             observeTurnMemoryApplied("agent_loop", attached.applied);
