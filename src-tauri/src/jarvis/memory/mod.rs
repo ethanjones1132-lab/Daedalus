@@ -1,3 +1,4 @@
+pub mod contracts;
 pub mod engine;
 pub mod frontmatter;
 pub mod paths;

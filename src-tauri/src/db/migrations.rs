@@ -18,7 +18,11 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
          PRAGMA cache_size = -20000;",
     )?;
 
-    // Drop old memory table if it has 'path' column to recreate it with the correct schema
+    // Older versions of this database shipped a file-path-based `memory`
+    // table. Instead of destroying it to make room for the current schema,
+    // preserve it verbatim as `memory_legacy_path_backup`. The backup is
+    // never exposed to automatic retrieval; it exists so operators can
+    // recover pre-scope information deliberately.
     let has_path_col: bool = conn
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('memory') WHERE name = 'path'",
@@ -28,7 +32,28 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
         .unwrap_or(0)
         > 0;
     if has_path_col {
-        let _ = conn.execute("DROP TABLE memory;", []);
+        let backup_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memory_legacy_path_backup'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if backup_exists {
+            // A backup already exists AND the live table still has the old
+            // path schema. Renaming would overwrite recoverable data, so fail
+            // loudly instead of silently discarding it.
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                Some(
+                    "memory_legacy_path_backup already exists while memory still has a path \
+                     column; refusing to overwrite legacy memory data"
+                        .to_string(),
+                ),
+            ));
+        }
+        conn.execute("ALTER TABLE memory RENAME TO memory_legacy_path_backup", [])?;
     }
 
     conn.execute_batch(
@@ -253,6 +278,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
     create_self_tuning_tables(conn)?;
     create_session_memory_table(conn)?;
     apply_schema_patches(conn)?;
+    apply_scoped_memory_migrations(conn)?;
 
     Ok(())
 }
@@ -740,6 +766,218 @@ fn apply_schema_patches(conn: &Connection) -> Result<(), rusqlite::Error> {
     add_column_if_missing(conn, "memory_events", "after_json", "after_json TEXT")?;
 
     Ok(())
+}
+
+/// Phase 1 scoped-memory schema. Additive only: it never rebuilds the current
+/// `memory` table or its FTS triggers. The whole group runs inside a savepoint
+/// so a partial failure cannot leave the store in a half-migrated state.
+pub fn apply_scoped_memory_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("SAVEPOINT scoped_memory_migration;")?;
+    let result = (|| -> Result<(), rusqlite::Error> {
+        // Nullable workspace binding on persisted Sessions.
+        add_column_if_missing(conn, "sessions", "project_root", "project_root TEXT")?;
+
+        // Scope + provenance + per-entry revision on memory rows.
+        add_column_if_missing(
+            conn,
+            "memory",
+            "scope_kind",
+            "scope_kind TEXT NOT NULL DEFAULT 'legacy_unscoped'",
+        )?;
+        add_column_if_missing(conn, "memory", "project_root", "project_root TEXT")?;
+        add_column_if_missing(
+            conn,
+            "memory",
+            "authority_kind",
+            "authority_kind TEXT NOT NULL DEFAULT 'legacy_unknown'",
+        )?;
+        add_column_if_missing(conn, "memory", "source_run_id", "source_run_id TEXT")?;
+        add_column_if_missing(conn, "memory", "verified_at", "verified_at TEXT")?;
+        add_column_if_missing(
+            conn,
+            "memory",
+            "revision",
+            "revision INTEGER NOT NULL DEFAULT 1",
+        )?;
+
+        // Singleton store revision. A monotonic invalidation counter, not a
+        // mutation count: it changes transactionally with knowledge/scope/
+        // eligibility mutations and not with recall usage counters.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS memory_store_state (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                revision  INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT OR IGNORE INTO memory_store_state (singleton, revision) VALUES (1, 0);
+            "#,
+        )?;
+
+        conn.execute_batch(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_memory_scope_eligibility
+                ON memory(scope_kind, agent_id, project_root, status, tier);
+            "#,
+        )?;
+
+        // ── Validation triggers ──────────────────────────────────────
+        conn.execute_batch(
+            r#"
+            CREATE TRIGGER IF NOT EXISTS memory_scope_validate_bi
+            BEFORE INSERT ON memory
+            WHEN NOT (
+                (NEW.scope_kind = 'project' AND NEW.project_root IS NOT NULL AND NEW.agent_id <> '')
+             OR (NEW.scope_kind = 'agent'   AND NEW.project_root IS NULL     AND NEW.agent_id <> '')
+             OR (NEW.scope_kind = 'user'    AND NEW.project_root IS NULL     AND NEW.agent_id = '')
+             OR (NEW.scope_kind = 'legacy_unscoped')
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid memory scope shape');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_scope_validate_bu
+            BEFORE UPDATE ON memory
+            WHEN NOT (
+                (NEW.scope_kind = 'project' AND NEW.project_root IS NOT NULL AND NEW.agent_id <> '')
+             OR (NEW.scope_kind = 'agent'   AND NEW.project_root IS NULL     AND NEW.agent_id <> '')
+             OR (NEW.scope_kind = 'user'    AND NEW.project_root IS NULL     AND NEW.agent_id = '')
+             OR (NEW.scope_kind = 'legacy_unscoped')
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid memory scope shape');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_scope_kind_validate_bi
+            BEFORE INSERT ON memory
+            WHEN NEW.scope_kind NOT IN ('project','agent','user','legacy_unscoped')
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid memory scope kind');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_scope_kind_validate_bu
+            BEFORE UPDATE ON memory
+            WHEN NEW.scope_kind NOT IN ('project','agent','user','legacy_unscoped')
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid memory scope kind');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_authority_kind_validate_bi
+            BEFORE INSERT ON memory
+            WHEN NEW.authority_kind NOT IN
+                ('manual','user_statement','verified_observation','assistant_proposal','legacy_unknown')
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid memory authority kind');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_authority_kind_validate_bu
+            BEFORE UPDATE ON memory
+            WHEN NEW.authority_kind NOT IN
+                ('manual','user_statement','verified_observation','assistant_proposal','legacy_unknown')
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid memory authority kind');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_revision_positive_bi
+            BEFORE INSERT ON memory
+            WHEN NEW.revision < 1
+            BEGIN
+                SELECT RAISE(ABORT, 'memory revision must be positive');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_revision_positive_bu
+            BEFORE UPDATE ON memory
+            WHEN NEW.revision < 1
+            BEGIN
+                SELECT RAISE(ABORT, 'memory revision must be positive');
+            END;
+
+            -- An established (non-legacy) scope is immutable. Legacy rows can
+            -- be adopted once: their OLD scope_kind is still legacy_unscoped.
+            CREATE TRIGGER IF NOT EXISTS memory_scope_immutable_bu
+            BEFORE UPDATE OF scope_kind, project_root, agent_id ON memory
+            WHEN OLD.scope_kind <> 'legacy_unscoped'
+             AND (NEW.scope_kind IS NOT OLD.scope_kind
+                  OR NEW.project_root IS NOT OLD.project_root
+                  OR NEW.agent_id IS NOT OLD.agent_id)
+            BEGIN
+                SELECT RAISE(ABORT, 'memory scope cannot be reassigned');
+            END;
+            "#,
+        )?;
+
+        // ── Store revision triggers ─────────────────────────────────
+        let semantic_change = "NEW.title IS NOT OLD.title
+             OR NEW.content IS NOT OLD.content
+             OR NEW.tags IS NOT OLD.tags
+             OR NEW.category IS NOT OLD.category
+             OR NEW.agent_id IS NOT OLD.agent_id
+             OR NEW.scope_kind IS NOT OLD.scope_kind
+             OR NEW.project_root IS NOT OLD.project_root
+             OR NEW.authority_kind IS NOT OLD.authority_kind
+             OR NEW.source IS NOT OLD.source
+             OR NEW.source_session_id IS NOT OLD.source_session_id
+             OR NEW.source_message_ids IS NOT OLD.source_message_ids
+             OR NEW.source_run_id IS NOT OLD.source_run_id
+             OR NEW.verified_at IS NOT OLD.verified_at
+             OR NEW.confidence IS NOT OLD.confidence
+             OR NEW.status IS NOT OLD.status
+             OR NEW.expires_at IS NOT OLD.expires_at
+             OR NEW.review_after IS NOT OLD.review_after
+             OR NEW.supersedes_id IS NOT OLD.supersedes_id
+             OR NEW.metadata IS NOT OLD.metadata
+             OR NEW.tier IS NOT OLD.tier
+             OR NEW.summary IS NOT OLD.summary";
+
+        conn.execute_batch(&format!(
+            r#"
+            CREATE TRIGGER IF NOT EXISTS memory_store_revision_ai
+            AFTER INSERT ON memory
+            BEGIN
+                UPDATE memory_store_state SET revision = revision + 1 WHERE singleton = 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_store_revision_ad
+            AFTER DELETE ON memory
+            BEGIN
+                UPDATE memory_store_state SET revision = revision + 1 WHERE singleton = 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_store_revision_au
+            AFTER UPDATE ON memory
+            WHEN {semantic_change}
+            BEGIN
+                UPDATE memory_store_state SET revision = revision + 1 WHERE singleton = 1;
+            END;
+
+            -- Legacy mutations do not set revision explicitly; bump the
+            -- per-row revision for those same semantic changes so invalidation
+            -- is uniform. Scoped updates set revision themselves, so
+            -- NEW.revision <> OLD.revision and this trigger stays out of the way.
+            CREATE TRIGGER IF NOT EXISTS memory_row_revision_au
+            AFTER UPDATE ON memory
+            WHEN NEW.revision = OLD.revision AND ({semantic_change})
+            BEGIN
+                UPDATE memory SET revision = revision + 1 WHERE id = NEW.id;
+            END;
+            "#
+        ))?;
+
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE SAVEPOINT scoped_memory_migration;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT scoped_memory_migration; \
+                 RELEASE SAVEPOINT scoped_memory_migration;",
+            );
+            Err(err)
+        }
+    }
 }
 
 #[cfg(test)]
