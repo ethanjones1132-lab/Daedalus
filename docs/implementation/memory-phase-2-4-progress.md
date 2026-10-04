@@ -10,7 +10,8 @@
 - **Execution baseline:** `dfe39904b8d7fa3ed731e5342e7e80437a6a3b40`
 - **Predecessor HEAD:** `e380014` (`fix: intersect unknown-context floor with stage ceiling instead of replacing it`)
 - **Branch:** `codex/memory-deepseek-20261004`
-- **Phase 2.4 source commit:** `7de87c7` — `feat: prepare native recall on both Session transports` (source changes; this ledger update is a follow-up docs commit).
+- **Phase 2.4 source commit:** `7de87c7` — `feat: prepare native recall on both Session transports`.
+- **Phase 2.4 root-review corrective commit:** `f14b275` — `fix: harden phase 2.4 persistence, finalization ordering, and relay diagnostics` (see "Root-review corrective pass"). This ledger update is a follow-up docs commit.
 
 ## Execution environment
 
@@ -143,6 +144,78 @@ carry to another Session/Agent.
 - Native `memory_turn_diagnostic` read-back remains the authority; the UI never
   treats model/tool success as accepted memory.
 
+## Root-review corrective pass
+
+A root source review identified six concrete gaps in the initial 2.4 pass. All
+were corrected in source with no tests/runtime execution. This pass supersedes
+the corresponding descriptions above where they differ.
+
+1. **No inference without a saved source row (UI).** The append is awaited and
+   its returned id validated. A rejected append or a missing/empty/invalid row
+   id now stops before preparation/history/fetch and throws a truthful
+   persistence failure (`Could not save your message: …`) to the existing draft
+   recovery path; the optimistic bubble is never represented as saved. A
+   recall/history failure after a saved row still runs ordinary inference.
+2. **Complete, ordered, idempotent finalization (UI).** The full persisted-turn
+   append→prepare→history→fetch→read lifecycle is wrapped in an outer
+   `try/finally`, and a memoized `finalizeMemoryTurn` promise ensures one
+   ID-only `memory_sync_turn({session_id, turn_id})` per saved turn. `handleFrame`
+   is now `async` and awaited; the `result`/`error`/`cancelled` branches and the
+   EOF-unterminated branch finalize before any local terminal publication, and
+   the read-loop finally finalizes before the run-record write. Setup/HTTP/body
+   failures finalize via the outer finally. Sync is attempted even after a
+   Session switch/abort (old-identity), but the diagnostic display and all state
+   writes stay guarded by `requestIsCurrent()` so a stale Session is never
+   repainted. No inference run id is used.
+3. **Truthful, observable diagnostics (UI).** Sync/readback failures and
+   nonterminal read-backs now surface the compact `memoryFinalizationNotice`
+   instead of being log-only; a `registered`/`started`/`prepared` read-back is
+   labelled as nonterminal and never as success. `decodeMemoryTurnPreparation`
+   verifies `turn_id`, and the diagnostic tuple `{turn_id, session_id}` is
+   checked before use. History rows are validated
+   (`decodeNativeHistoryRows`); unknown/malformed rows degrade to empty history
+   plus a visible warning rather than blindly mapping or using a UI cache. A
+   preparation catch maps only a real typed `status`/`code` via
+   `coerceMemoryRecallStatus`, otherwise `unavailable` (never a blanket
+   `registration_failed`). The `ready` label is now `ready` (not `recalled`) so
+   prepared selection is not presented as actual use. The per-turn user-wide
+   opt-in is snapshotted then reset to the Session default (false) on every
+   submit, and still resets on Session change, so it cannot silently carry
+   across an Agent change within the same Session.
+4. **Relay finalization is surfaced and consumed (Rust + UI).** The relay
+   finalizer now emits a metadata-only `jarvis://memory-status` failure
+   (`status: unavailable`, `code: memory_finalization_failed`) with the stable
+   Session/turn on sync failure, and an authoritative `jarvis://memory-diagnostic`
+   projection (turn/session, store revision, selected **ids only**, applied ids,
+   state/status/error/terminal) on success — never scope, recalled text, or the
+   block. The UI adds guarded `jarvis://memory-status` and
+   `jarvis://memory-diagnostic` listeners (previously no consumer), keyed by
+   Session identity and first-seen turn per submission so a late event cannot
+   overwrite another turn. Durable counts come only from the native diagnostic.
+   Relay terminal `jarvis://error` payloads now carry `turn_id`.
+5. **Relay terminal ordering and history/join honesty (Rust).** In
+   `ResultThenDone`, finalization now occurs before the terminal error/done
+   emission; setup, cancellation, failed/partial/no-run-id and EOF branches
+   were re-inspected and finalize before terminal publication. A failed native
+   history read no longer silently `.unwrap_or_default()`s: ordinary relay
+   inference still runs with empty history, but an observable metadata-only
+   `jarvis://memory-status` history warning (`code: history_unavailable`) is
+   emitted. A `spawn_blocking` join failure during preparation no longer
+   returns early after a persisted row: it falls back to typed `unavailable`
+   and ordinary relay inference (where the terminal finalizer runs). A blank
+   Session still fabricates no row and stays an explicitly memory-unavailable
+   ordinary path.
+6. **Bounded finalization (UI).** `finalizeMemoryTurn` races the ID-only sync
+   against a 5,000 ms UI deadline (`MEMORY_FINALIZE_TIMEOUT_MS`), above the
+   owned transport's own 1 s connect / 3 s total request bounds, so a native
+   task or operation-gate backlog cannot postpone terminal publication
+   indefinitely. On timeout or failure it shows a truthful pending/unavailable
+   notice and the ordinary result; it never manufactures receipt/terminal
+   evidence, never retries the same finalizer, ignores late completion, and
+   retains the exact captured `{session_id, turn_id}` tuple. A successful sync
+   then performs a guarded native `memory_turn_diagnostic` read-back as the sole
+   authority for selected/applied counts.
+
 ## Frozen-interface compliance
 
 - 2.2 commands consumed unchanged: `memory_prepare_turn`,
@@ -160,13 +233,22 @@ carry to another Session/Agent.
 
 ## Exact source commands run
 
+All commands below were run **unfiltered** as separate simple commands with the
+tool's `workdir` argument (no `cd`, no pipes/`tail`, no chained directories):
+
 | Command | Result |
 |---|---|
 | `/Users/charlottehughes/.cargo/bin/cargo check --manifest-path src-tauri/Cargo.toml` (workdir repo root) | **PASS** — only the 2 pre-existing warnings (`supervisor.rs` deprecated `fetch_update`, `wsl.rs` unused `shlex_join`) |
-| `bun run build` (workdir `src-ui`) | **PASS** — `tsc -b` then `vite build` (2717 modules); after restoring the iCloud-offloaded build artifacts |
+| `bun run build` (workdir `src-ui`) | **PASS** — `tsc -b` then `vite build` (2717 modules) |
 | `bun run typecheck` (workdir `server-jarvis`) | **PASS** — `tsc --noEmit`, exit 0 |
 | `bun run build` (workdir `server-jarvis`) | **PASS** — bundled `dist/index.js` (196 modules) |
-| `git diff --check` (repo root) | **PASS** — no whitespace errors |
+| `git diff --check` (workdir repo root) | **PASS** — no whitespace errors |
+
+The same five commands were re-run after the corrective pass and all **PASS**.
+The `src-ui` native build artifacts (`lightningcss-darwin-arm64`,
+`@tailwindcss/oxide-darwin-arm64`) were restored from the existing locked
+install immediately before the build because iCloud had re-offloaded them; no
+dependency, lockfile, or manifest changed.
 
 No `cargo test`, `bun test`, ephemeral SQL script, or live inference/transport
 experiment was run. `server-jarvis` source was not changed in 2.4; its
@@ -195,9 +277,21 @@ No test files (`memory-turn-state.test.ts`, `JarvisView.memory-turn.test.tsx`,
   always passes `include_user_scope: false`; user-wide recall cannot be enabled
   through the relay in this phase.
 - **Sync failure is non-fatal.** A bounded native sync/ACK failure preserves the
-  ordinary inference outcome and logs ids only. Missing/nonterminal receipts are
-  recorded truthfully by the 2.2 sync path (`unterminated`/`expired`), never as
-  terminal success.
+  ordinary inference outcome and surfaces a metadata-only failure notice. Missing
+  or nonterminal receipts are recorded truthfully by the 2.2 sync path
+  (`unterminated`/`expired`), never as terminal success.
+- **Finalization is bounded at 5,000 ms (UI).** The UI deadline is above the
+  owned transport's own 1 s connect / 3 s total request bounds. If the deadline
+  elapses (e.g. a native operation-gate backlog), the client shows a
+  pending/unavailable notice and the ordinary result; it does not retry, and a
+  late native success is not re-applied. The exact `{session_id, turn_id}` tuple
+  is captured before the race. This bound is a UI honesty measure only; the
+  native operation gate itself remains authoritative and unchanged.
+- **Relay event gating is best-effort ordering.** Relay status/diagnostic
+  listeners accept the current Session plus the first turn id seen per
+  submission; with no cross-process generation token in the event payload they
+  cannot order two same-Session turns beyond that first-seen rule. Native
+  diagnostic read-back remains the durable authority.
 - **Phase 2 done gate remains OPEN.** 2.4 closes only the application-wiring
   source task. Runtime tests, lifecycle races, live configured-backend smoke,
   deletion-next-turn behavior, direct/orchestrated route proof, and restart
