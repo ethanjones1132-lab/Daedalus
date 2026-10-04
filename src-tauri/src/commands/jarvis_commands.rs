@@ -283,11 +283,13 @@ pub async fn jarvis_list_sessions(
 }
 
 #[tauri::command]
-pub async fn jarvis_delete_session(
-    session_id: String,
-    db: State<'_, crate::db::AppDb>,
-) -> Result<(), String> {
-    crate::commands::delete_session_row(&db, &session_id)?;
+pub async fn jarvis_delete_session(app: AppHandle, session_id: String) -> Result<(), String> {
+    crate::commands::memory_turn::run_gated_mutation(app, "session_delete", move |conn| {
+        crate::commands::sessions::delete_session_row_conn(conn, &session_id)
+            .map_err(crate::jarvis::memory::contracts::MemoryError::storage_unavailable)
+    })
+    .await
+    .map_err(|error| error.message)?;
     Ok(())
 }
 

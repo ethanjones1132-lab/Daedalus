@@ -8,7 +8,7 @@ use crate::jarvis::memory::{scope, scoped};
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use serde::Deserialize;
-use tauri::State;
+use tauri::{AppHandle, State};
 
 #[tauri::command]
 pub fn memory_list(db: State<AppDb>) -> Result<Vec<MemoryEntry>, String> {
@@ -23,40 +23,55 @@ pub fn memory_read(db: State<AppDb>, id: String) -> Result<MemoryEntry, String> 
 }
 
 #[tauri::command]
-pub fn memory_save(
-    db: State<AppDb>,
+pub async fn memory_save(
+    app: AppHandle,
     title: String,
     content: String,
     tags: Vec<String>,
     category: String,
 ) -> Result<MemoryEntry, String> {
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    engine::save_manual_memory(&conn, title, content, tags, category)
+    super::memory_turn::run_gated_mutation(app, "legacy_memory_save", move |conn| {
+        engine::save_manual_memory(conn, title, content, tags, category)
+            .map_err(MemoryError::storage_unavailable)
+    })
+    .await
+    .map_err(|error| error.message)
 }
 
 #[tauri::command]
-pub fn memory_update(
-    db: State<AppDb>,
+pub async fn memory_update(
+    app: AppHandle,
     id: String,
     title: String,
     content: String,
     tags: Vec<String>,
     category: String,
 ) -> Result<MemoryEntry, String> {
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    engine::update_manual_memory(&conn, id, title, content, tags, category)
+    super::memory_turn::run_gated_mutation(app, "legacy_memory_update", move |conn| {
+        engine::update_manual_memory(conn, id, title, content, tags, category)
+            .map_err(MemoryError::storage_unavailable)
+    })
+    .await
+    .map_err(|error| error.message)
 }
 
 #[tauri::command]
-pub fn memory_delete(db: State<AppDb>, id: String) -> Result<bool, String> {
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    engine::tombstone_memory(&conn, &id, "user", "User deleted via UI", None, None)
+pub async fn memory_delete(app: AppHandle, id: String) -> Result<bool, String> {
+    super::memory_turn::run_gated_mutation(app, "legacy_memory_delete", move |conn| {
+        engine::tombstone_memory(conn, &id, "user", "User deleted via UI", None, None)
+            .map_err(MemoryError::storage_unavailable)
+    })
+    .await
+    .map_err(|error| error.message)
 }
 
 #[tauri::command]
-pub fn memory_restore(db: State<AppDb>, id: String) -> Result<bool, String> {
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    engine::restore_memory(&conn, &id)
+pub async fn memory_restore(app: AppHandle, id: String) -> Result<bool, String> {
+    super::memory_turn::run_gated_mutation(app, "legacy_memory_restore", move |conn| {
+        engine::restore_memory(conn, &id).map_err(MemoryError::storage_unavailable)
+    })
+    .await
+    .map_err(|error| error.message)
 }
 
 #[tauri::command]
@@ -92,12 +107,20 @@ pub fn memory_runs_list(
 }
 
 #[tauri::command]
-pub fn memory_run_now(db: State<AppDb>, kind: String) -> Result<MemoryRun, String> {
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    match kind.as_str() {
-        "consolidation" | "auto_dream" => engine::consolidate_memories(&conn),
-        other => Err(format!("Unsupported memory run kind '{}'", other)),
-    }
+pub async fn memory_run_now(app: AppHandle, kind: String) -> Result<MemoryRun, String> {
+    super::memory_turn::run_gated_mutation(app, "legacy_memory_run_now", move |conn| {
+        match kind.as_str() {
+            "consolidation" | "auto_dream" => {
+                engine::consolidate_memories(conn).map_err(MemoryError::storage_unavailable)
+            }
+            _ => Err(MemoryError::invalid_payload(format!(
+                "Unsupported memory run kind '{}'",
+                kind
+            ))),
+        }
+    })
+    .await
+    .map_err(|error| error.message)
 }
 
 fn expand_path_safe(path_str: &str) -> Result<std::path::PathBuf, String> {
@@ -418,21 +441,25 @@ pub fn execute_adopt_legacy(
 }
 
 #[tauri::command]
-pub fn memory_bind_session_workspace(
-    db: State<AppDb>,
+pub async fn memory_bind_session_workspace(
+    app: AppHandle,
     request: BindSessionWorkspaceRequest,
 ) -> Result<MemoryScope, MemoryError> {
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    execute_bind_session_workspace(&conn, request)
+    super::memory_turn::run_gated_mutation(app, "session_bind_workspace", move |conn| {
+        execute_bind_session_workspace(conn, request)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn memory_scoped_save(
-    db: State<AppDb>,
+pub async fn memory_scoped_save(
+    app: AppHandle,
     request: ScopedSaveRequest,
 ) -> Result<MutationResult, MemoryError> {
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    execute_scoped_save(&conn, request, Utc::now())
+    super::memory_turn::run_gated_mutation(app, "scoped_memory_save", move |conn| {
+        execute_scoped_save(conn, request, Utc::now())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -454,30 +481,36 @@ pub fn memory_scoped_list(
 }
 
 #[tauri::command]
-pub fn memory_scoped_update(
-    db: State<AppDb>,
+pub async fn memory_scoped_update(
+    app: AppHandle,
     request: ScopedUpdateRequest,
 ) -> Result<MutationResult, MemoryError> {
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    execute_scoped_update(&conn, request, Utc::now())
+    super::memory_turn::run_gated_mutation(app, "scoped_memory_update", move |conn| {
+        execute_scoped_update(conn, request, Utc::now())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn memory_scoped_delete(
-    db: State<AppDb>,
+pub async fn memory_scoped_delete(
+    app: AppHandle,
     request: ScopedDeleteRequest,
 ) -> Result<MutationResult, MemoryError> {
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    execute_scoped_delete(&conn, request, Utc::now())
+    super::memory_turn::run_gated_mutation(app, "scoped_memory_delete", move |conn| {
+        execute_scoped_delete(conn, request, Utc::now())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn memory_scoped_restore(
-    db: State<AppDb>,
+pub async fn memory_scoped_restore(
+    app: AppHandle,
     request: ScopedRestoreRequest,
 ) -> Result<MutationResult, MemoryError> {
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    execute_scoped_restore(&conn, request, Utc::now())
+    super::memory_turn::run_gated_mutation(app, "scoped_memory_restore", move |conn| {
+        execute_scoped_restore(conn, request, Utc::now())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -490,10 +523,12 @@ pub fn memory_scoped_recall_preview(
 }
 
 #[tauri::command]
-pub fn memory_adopt_legacy(
-    db: State<AppDb>,
+pub async fn memory_adopt_legacy(
+    app: AppHandle,
     request: AdoptLegacyRequest,
 ) -> Result<MutationResult, MemoryError> {
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    execute_adopt_legacy(&conn, request, Utc::now())
+    super::memory_turn::run_gated_mutation(app, "memory_adopt_legacy", move |conn| {
+        execute_adopt_legacy(conn, request, Utc::now())
+    })
+    .await
 }

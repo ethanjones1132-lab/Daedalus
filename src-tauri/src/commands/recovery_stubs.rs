@@ -35,8 +35,9 @@
 #![allow(dead_code)]
 
 use crate::db::AppDb;
+use crate::jarvis::memory::contracts::MemoryError;
 use serde_json::Value;
-use tauri::State;
+use tauri::{AppHandle, State};
 
 /// Resolve the base URL of the live Bun server, starting it if needed.
 ///
@@ -354,23 +355,30 @@ fn stable_commit_id(session_id: &str) -> String {
 
 #[tauri::command]
 pub async fn jarvis_review_session(
+    app: AppHandle,
     session_id: String,
-    db: tauri::State<'_, crate::db::AppDb>,
 ) -> Result<Value, String> {
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    crate::jarvis::memory::engine::review_session(&conn, &session_id)
+    crate::commands::memory_turn::run_gated_mutation(app, "session_review", move |conn| {
+        crate::jarvis::memory::engine::review_session(conn, &session_id)
+            .map_err(MemoryError::storage_unavailable)
+    })
+    .await
+    .map_err(|error| error.message)
 }
 
 #[tauri::command]
 pub async fn jarvis_commit_session_end(
+    app: AppHandle,
     session_id: String,
-    db: tauri::State<'_, crate::db::AppDb>,
 ) -> Result<CommitSessionResult, String> {
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    crate::jarvis::memory::engine::commit_session_end(&conn, &session_id)?;
-    Ok(CommitSessionResult {
-        commit_id: stable_commit_id(&session_id),
+    let commit_id = stable_commit_id(&session_id);
+    crate::commands::memory_turn::run_gated_mutation(app, "session_commit_end", move |conn| {
+        crate::jarvis::memory::engine::commit_session_end(conn, &session_id)
+            .map_err(MemoryError::storage_unavailable)
     })
+    .await
+    .map_err(|error| error.message)?;
+    Ok(CommitSessionResult { commit_id })
 }
 
 #[tauri::command]

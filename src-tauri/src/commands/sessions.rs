@@ -3,7 +3,8 @@
 // ═══════════════════════════════════════════════════════════════
 
 use crate::db::AppDb;
-use tauri::State;
+use crate::jarvis::memory::contracts::MemoryError;
+use tauri::{AppHandle, State};
 
 // ── Compaction ────────────────────────────────────────────────
 
@@ -470,8 +471,10 @@ pub fn create_session_row(
     })
 }
 
-pub fn delete_session_row(db: &AppDb, session_id: &str) -> Result<bool, String> {
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+pub fn delete_session_row_conn(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<bool, String> {
     conn.execute(
         "DELETE FROM messages WHERE session_id = ?",
         rusqlite::params![session_id],
@@ -484,6 +487,11 @@ pub fn delete_session_row(db: &AppDb, session_id: &str) -> Result<bool, String> 
         )
         .map_err(|e| e.to_string())?;
     Ok(n > 0)
+}
+
+pub fn delete_session_row(db: &AppDb, session_id: &str) -> Result<bool, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    delete_session_row_conn(&conn, session_id)
 }
 
 #[tauri::command]
@@ -513,8 +521,12 @@ pub fn create_session(
 }
 
 #[tauri::command]
-pub fn delete_session(db: State<AppDb>, session_id: String) -> Result<bool, String> {
-    delete_session_row(&db, &session_id)
+pub async fn delete_session(app: AppHandle, session_id: String) -> Result<bool, String> {
+    super::memory_turn::run_gated_mutation(app, "session_delete", move |conn| {
+        delete_session_row_conn(conn, &session_id).map_err(MemoryError::storage_unavailable)
+    })
+    .await
+    .map_err(|error| error.message)
 }
 
 #[tauri::command]
