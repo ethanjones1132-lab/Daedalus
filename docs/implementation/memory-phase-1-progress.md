@@ -83,14 +83,23 @@
 - `src-tauri/src/jarvis/memory/engine.rs`: exposed the reusable helpers as `pub(crate)`.
 
 ### Task 4
-- `scoped.rs::recall_scoped_memories`: scoped FTS candidates (limit 30) then scoped LIKE fallback;
-  eligibility excludes non-active/tombstoned/cold/expired/malformed/legacy/assistant-proposal records;
+- `scoped.rs::recall_scoped_memories`: scoped FTS candidate stream, then scoped LIKE fallback;
   pure re-scoring then limit clamp 0–5; read-only preview (no usage/event/revision writes).
-  - Ruling: FTS failure falls back to LIKE; like/storage failure returns typed `storage_unavailable`.
-  - Eligibility uses a strict date-time shape guard (`GLOB`) plus `julianday()` (fractional-second
-    preserving) before the candidate limit, so malformed persisted timestamps cannot consume the budget.
-  - Rust parsing excludes any residual malformed timestamp, emits a structured warning containing only
-    `memory_id` and the field name, and never treats it as not-stale.
+  - Exact filtering sequence (both FTS and literal fallback use the same path):
+    1. SQL applies only the coarse lifecycle filter (`status='active'`, `tier IN ('hot','warm')`,
+       `authority_kind IN ('manual','user_statement','verified_observation')`) plus the Agent/project/
+       user scope predicate. No SQL expiry predicate, `GLOB`, `julianday`, `ORDER BY`, or `LIMIT`.
+    2. The result set is streamed row by row (never collected wholesale). For each row:
+       strict `chrono` RFC3339 parsing of `expires_at` and `review_after`; a present-but-unparseable
+       value emits a structured warning naming only `memory_id` + field and the row is skipped;
+       precise `DateTime<Utc>` expiry comparison drops expired rows; only then is the row admitted
+       with its computed `stale` flag.
+    3. Admission stops as soon as 30 genuinely eligible entries exist, so 30 malformed/expired
+       matching rows cannot displace a valid candidate and SQLite's lossy timestamp handling is never
+       authoritative.
+  - Ruling: FTS prepare/iteration failure falls back to LIKE; like/storage failure returns typed
+    `storage_unavailable`.
+  - Ruling: candidate filter requires non-empty matched terms to avoid unrelated records on hostile input.
 
 ### Task 5
 - `src-tauri/src/commands/memory.rs`: request DTOs and `execute_*` helpers plus Tauri commands
@@ -120,7 +129,9 @@
 | scoped `git add`/`git commit` | Commits per task (see table) |
 
 Local build prerequisites (`server-jarvis/dist/index.js`, `src-ui/dist`) were generated only to satisfy
-the Tauri build script; both are gitignored and were not committed.
+the Tauri build script; both are gitignored and were not committed. Both `cargo check` commands above
+were re-run after the streaming-recall correction and still passed (same two pre-existing warnings only).
+No SQL script or runtime assertion was executed.
 
 ## Commands NOT RUN
 

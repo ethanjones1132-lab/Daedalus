@@ -445,19 +445,13 @@ pub fn save_scoped_memory(
     })
 }
 
-/// Eligible-candidate predicate applied before the candidate limit. A strict
-/// date-time shape guard plus `julianday` (fractional-second preserving) keeps
-/// malformed persisted expiry/review timestamps out of the candidate budget.
-const ELIGIBLE_PREDICATE: &str = "(m.status = 'active'
+/// Coarse lifecycle filter applied in SQL. It intentionally does not evaluate
+/// expiry or timestamp validity: exact RFC3339 parsing and precise comparison
+/// cannot be expressed in SQLite. Malformed and expired rows are rejected
+/// during streaming admission before they can enter the candidate budget.
+const LIFECYCLE_FILTER: &str = "(m.status = 'active'
     AND m.tier IN ('hot','warm')
-    AND m.authority_kind IN ('manual','user_statement','verified_observation')
-    AND (m.expires_at IS NULL
-         OR (m.expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*'
-             AND julianday(m.expires_at) IS NOT NULL
-             AND julianday(m.expires_at) > julianday(?)))
-    AND (m.review_after IS NULL
-         OR (m.review_after GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*'
-             AND julianday(m.review_after) IS NOT NULL)))";
+    AND m.authority_kind IN ('manual','user_statement','verified_observation'))";
 
 fn recall_scope_predicate(scope: &MemoryScope, include_user: bool) -> (String, Vec<Value>) {
     let (base, params) = match scope.kind {
@@ -509,16 +503,40 @@ fn escape_like(input: &str) -> String {
     out
 }
 
-fn query_scoped_rows(
-    conn: &Connection,
-    sql: &str,
-    values: Vec<Value>,
-) -> Result<Vec<ScopedMemoryEntry>, MemoryError> {
-    let mut stmt = conn.prepare(sql).map_err(MemoryError::from)?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(values), scoped_from_row)
-        .map_err(MemoryError::from)?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(MemoryError::from)
+/// Stream a scoped result set, applying strict lifecycle admission. Each row is
+/// parsed and compared in Rust before it may consume a candidate slot, and
+/// iteration stops as soon as `limit` genuinely eligible entries exist. This
+/// keeps matching rows from being materialized and prevents malformed/expired
+/// rows (which SQL cannot judge precisely) from displacing valid candidates.
+fn admit_lifecycle(
+    rows: impl Iterator<Item = rusqlite::Result<ScopedMemoryEntry>>,
+    now: &DateTime<Utc>,
+    limit: usize,
+) -> Result<Vec<(ScopedMemoryEntry, bool)>, MemoryError> {
+    let mut admitted: Vec<(ScopedMemoryEntry, bool)> = Vec::new();
+    let mut rows = rows;
+    while admitted.len() < limit {
+        let Some(row) = rows.next() else { break };
+        let memory = row.map_err(MemoryError::from)?;
+        let id = memory.entry.id.clone();
+        let expires_at = match parse_recall_timestamp(&memory.entry.expires_at, &id, "expires_at") {
+            Ok(value) => value,
+            Err(()) => continue,
+        };
+        let review_after =
+            match parse_recall_timestamp(&memory.entry.review_after, &id, "review_after") {
+                Ok(value) => value,
+                Err(()) => continue,
+            };
+        if expires_at.map(|expires| expires <= *now).unwrap_or(false) {
+            continue;
+        }
+        let stale = review_after
+            .map(|review| review <= *now)
+            .unwrap_or(false);
+        admitted.push((memory, stale));
+    }
+    Ok(admitted)
 }
 
 /// Parse one persisted lifecycle timestamp. Returns `Err(())` for a present but
@@ -565,24 +583,28 @@ pub fn recall_scoped_memories(
         });
     }
 
-    let now_sql = now.to_rfc3339();
     let (scope_clause, scope_params) = recall_scope_predicate(scope, options.include_user_scope);
 
-    let mut candidates: Vec<ScopedMemoryEntry> = Vec::new();
+    let mut candidates: Vec<(ScopedMemoryEntry, bool)> = Vec::new();
 
     if let Some(expr) = engine::fts_expr(query) {
         let sql = format!(
             "SELECT {} FROM memory_fts JOIN memory m ON m.id = memory_fts.id
-             WHERE memory_fts MATCH ? AND {} AND {}
-             LIMIT ?",
+             WHERE memory_fts MATCH ? AND {} AND {}",
             scoped_select_columns(),
-            ELIGIBLE_PREDICATE,
+            LIFECYCLE_FILTER,
             scope_clause
         );
-        let mut values: Vec<Value> = vec![Value::from(expr), Value::from(now_sql.clone())];
-        values.extend(scope_params.clone());
-        values.push(Value::from(CANDIDATE_LIMIT as i64));
-        match query_scoped_rows(conn, &sql, values) {
+        let attempt = (|| -> Result<Vec<(ScopedMemoryEntry, bool)>, MemoryError> {
+            let mut stmt = conn.prepare(&sql).map_err(MemoryError::from)?;
+            let mut values: Vec<Value> = vec![Value::from(expr.clone())];
+            values.extend(scope_params.clone());
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(values), scoped_from_row)
+                .map_err(MemoryError::from)?;
+            admit_lifecycle(rows, &now, CANDIDATE_LIMIT)
+        })();
+        match attempt {
             Ok(rows) => candidates = rows,
             Err(err) => {
                 // A missing or broken FTS index is not fatal; fall through to
@@ -600,43 +622,28 @@ pub fn recall_scoped_memories(
             "SELECT {} FROM memory m WHERE {} AND
                 (m.title LIKE ? ESCAPE '\\' OR m.content LIKE ? ESCAPE '\\'
                  OR m.tags LIKE ? ESCAPE '\\' OR m.category LIKE ? ESCAPE '\\')
-             AND {} LIMIT ?",
+             AND {}",
             scoped_select_columns(),
-            ELIGIBLE_PREDICATE,
+            LIFECYCLE_FILTER,
             scope_clause
         );
         let mut values: Vec<Value> = vec![
-            Value::from(now_sql.clone()),
             Value::from(pattern.clone()),
             Value::from(pattern.clone()),
             Value::from(pattern.clone()),
             Value::from(pattern),
         ];
         values.extend(scope_params);
-        values.push(Value::from(CANDIDATE_LIMIT as i64));
-        candidates = query_scoped_rows(conn, &sql, values)?;
+        let mut stmt = conn.prepare(&sql).map_err(MemoryError::from)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(values), scoped_from_row)
+            .map_err(MemoryError::from)?;
+        candidates = admit_lifecycle(rows, &now, CANDIDATE_LIMIT)?;
     }
 
     let mut recalls: Vec<ScopedMemoryRecall> = candidates
         .into_iter()
-        .filter_map(|memory| {
-            let id = memory.entry.id.clone();
-            let expires_at =
-                match parse_recall_timestamp(&memory.entry.expires_at, &id, "expires_at") {
-                    Ok(value) => value,
-                    Err(()) => return None,
-                };
-            let review_after =
-                match parse_recall_timestamp(&memory.entry.review_after, &id, "review_after") {
-                    Ok(value) => value,
-                    Err(()) => return None,
-                };
-            if expires_at.map(|expires| expires <= now).unwrap_or(false) {
-                return None;
-            }
-            let stale = review_after
-                .map(|review| review <= now)
-                .unwrap_or(false);
+        .filter_map(|(memory, stale)| {
             let (score, matched_terms) = engine::score_memory(&memory.entry, &terms);
             if matched_terms.is_empty() || score <= 0.05 {
                 return None;
