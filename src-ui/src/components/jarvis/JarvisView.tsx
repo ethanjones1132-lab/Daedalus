@@ -1200,11 +1200,17 @@ export function ChatPanel({
     // must match the exact registered relay submission; otherwise a late
     // done/error from an old relay turn could finalize a newer direct turn.
     // Legacy events without a `turn_id` are accepted only while no direct
-    // submission and no registered relay turn owns the Session, so they can
-    // never overwrite an active turn; idle legacy behavior is preserved.
+    // submission and no registered relay turn owns the Session. The
+    // synchronous `sendInFlightRef` guard is required too, because `handleSend`
+    // acquires it before awaiting initial Session creation (when
+    // `streamAbortRef` is still null and no Session is selected yet), so a
+    // legacy event could otherwise mutate a pending direct submission; idle
+    // legacy behavior is preserved.
     const relayTerminalIsCorrelated = (sessionId: unknown, turnId: unknown): boolean => {
       if (turnId === undefined || turnId === null) {
-        return activeRelayMemoryTurn() === null && streamAbortRef.current === null;
+        return activeRelayMemoryTurn() === null
+          && streamAbortRef.current === null
+          && !sendInFlightRef.current.isInFlight();
       }
       return isRegisteredRelayMemoryTurn(sessionId, turnId);
     };

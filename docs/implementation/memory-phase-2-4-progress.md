@@ -14,6 +14,7 @@
 - **Phase 2.4 root-review corrective commit:** `f14b275` — `fix: harden phase 2.4 persistence, finalization ordering, and relay diagnostics` (see "Root-review corrective pass").
 - **Phase 2.4 second root-review corrective commit:** `ad933bc` — `fix: bound phase 2.4 finalization, submission, and relay correlation` (see "Third root-review corrective pass").
 - **Phase 2.4 relay-adapter corrective commit:** `ca1eb94` — `feat: add executable relay memory-turn submission adapter` (executable `submitRelayMemoryTurn` adapter + legacy-direct terminal guard; see "Fourth narrow corrective pass").
+- **Phase 2.4 legacy-ownership corrective commit:** `PENDING` — added the synchronous `SendInFlightGuard` check to the idle-only legacy terminal predicate (see "Fifth narrow corrective pass").
 
 ## Execution environment
 
@@ -303,10 +304,26 @@ exported a raw `registerRelayMemoryTurn` with no production caller, so the
 - **Legacy terminal cannot clobber an active direct turn.**
   `relayTerminalIsCorrelated` now accepts a legacy terminal event with no
   `turn_id` only while `activeRelayMemoryTurn() === null` **and**
-  `streamAbortRef.current === null` (no in-flight direct submission). A
-  correlated event with a `turn_id` still requires the exact registration. The
-  new native emitter always includes `turn_id`, so this is a conservative
-  safety net for legacy/idle events only.
+  `streamAbortRef.current === null` (`no in-flight direct stream`) **and**
+  `!sendInFlightRef.current.isInFlight()`. The synchronous `SendInFlightGuard`
+  check is required because `handleSend` acquires it before awaiting initial
+  Session creation, at which point `streamAbortRef` is still null; without it a
+  legacy event could mutate a pending direct submission. A correlated event with
+  a `turn_id` still requires the exact registration and is unchanged. The new
+  native emitter always includes `turn_id`, so this is a conservative safety net
+  for legacy/idle events only.
+
+## Fifth narrow corrective pass (legacy terminal ownership)
+
+A final ownership review found that the idle-only legacy terminal predicate
+(`activeRelayMemoryTurn() === null && streamAbortRef.current === null`) was
+incomplete: `handleSend` acquires the synchronous `SendInFlightGuard` **before**
+awaiting initial Session creation, while `streamAbortRef` is still null and
+`matchesStreamSession` accepts empty/undefined-Session events when no Session is
+selected. A legacy no-`turn_id` terminal could therefore mutate a pending direct
+submission. The predicate now also requires
+`!sendInFlightRef.current.isInFlight()` (exported by `chat-state.ts`). Correlated
+events with a `turn_id` are unchanged. No other source changed.
 
 ## Frozen-interface compliance
 
