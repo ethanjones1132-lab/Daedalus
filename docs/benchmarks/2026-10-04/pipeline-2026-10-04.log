@@ -1,0 +1,109 @@
+2026-10-04 02:27:47 === xing4-iq3xxs  (C: free 42.2 GB)
+2026-10-04 02:27:47   using staged Xing4.0-29B-A4B-IQ3_XXS.gguf (11.58 GB)
+2026-10-04 02:27:48   prefetching gptoss20b-mxfp4 while a llama.cpp build finishes
+2026-10-04 02:38:12   waited 10 min for builds to finish
+2026-10-04 02:41:16   downloaded gpt-oss-20b-MXFP4.gguf (12.11 GB, sha256 ok) in 808 s
+2026-10-04 02:42:32   downloaded eagle3-gpt-oss-20b-Q8_0.gguf (0.92 GB, sha256 ok) in 76 s
+2026-10-04 02:55:38   probe ncmoe 18 mtp 0: 12.24 tok/s, VRAM 6602 MiB, paging_risk=False, error=None
+2026-10-04 02:59:19   probe ncmoe 22 mtp 0: 32.39 tok/s, VRAM 6446 MiB, paging_risk=True, error=None
+2026-10-04 03:03:58   probe ncmoe 26 mtp 0: 28.74 tok/s, VRAM 5448 MiB, paging_risk=True, error=None
+2026-10-04 03:03:58   chosen: ncmoe 22 mtp 0 -> 32.39 tok/s, 6446 MiB
+2026-10-04 03:03:58   tier2b -> tier2b-xing4-iq3xxs-off-2026-10-04.jsonl
+2026-10-04 03:14:29   tier2b result: 56/117 in 10.2 min, restarts 0
+2026-10-04 03:14:29 === gptoss20b-mxfp4  (C: free 28.1 GB)
+2026-10-04 03:15:53   waited 1 min for builds to finish
+2026-10-04 03:19:21   probe ncmoe 12 mtp 3: 27.59 tok/s, VRAM 7423 MiB, paging_risk=False, error=None
+2026-10-04 03:23:15   probe ncmoe 15 mtp 3: 22.45 tok/s, VRAM 6584 MiB, paging_risk=True, error=None
+2026-10-04 03:27:38   probe ncmoe 18 mtp 3: 19.41 tok/s, VRAM 5364 MiB, paging_risk=False, error=None
+2026-10-04 03:27:38   chosen: ncmoe 15 mtp 3 -> 22.45 tok/s, 6584 MiB
+2026-10-04 03:27:38   tier2b -> tier2b-gptoss20b-mxfp4-b-1-2026-10-04.jsonl
+2026-10-04 03:50:29   tier2b result: 109/117 in 22.6 min, restarts 0
+2026-10-04 03:50:29 === tiel-iq3xxs  (C: free 28.1 GB)
+2026-10-04 04:08:16   downloaded Tiel-Coder-35B-A3B-MTP-UD-IQ3_XXS.gguf (13.60 GB, sha256 ok) in 1067 s
+2026-10-04 04:14:03   probe ncmoe 24 mtp 2: 49.73 tok/s, VRAM 7121 MiB, paging_risk=True, error=None
+2026-10-04 04:18:01   probe ncmoe 26 mtp 2: 47.67 tok/s, VRAM 6597 MiB, paging_risk=True, error=None
+2026-10-04 04:22:45   probe ncmoe 28 mtp 2: 45.28 tok/s, VRAM 6047 MiB, paging_risk=False, error=None
+2026-10-04 04:22:45   chosen: ncmoe 24 mtp 2 -> 49.73 tok/s, 7121 MiB
+2026-10-04 04:22:45   tier2b -> tier2b-tiel-iq3xxs-off-2026-10-04.jsonl
+2026-10-04 04:27:46   tier2b result: 83/117 in 4.8 min, restarts 0
+2026-10-04 04:27:46 === gemma4-qat-q4kxl  (C: free 15.1 GB)
+2026-10-04 04:27:47   evicted xing4-iq3xxs to make room (C: free now 26.7 GB)
+2026-10-04 04:45:03   downloaded gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf (14.25 GB, sha256 ok) in 1036 s
+2026-10-04 04:45:24   downloaded mtp-gemma-4-26B-A4B-it.gguf (0.25 GB, sha256 ok) in 21 s
+2026-10-04 04:47:32   waited 1 min for builds to finish
+2026-10-04 04:51:58   probe ncmoe 22 mtp 2: 40.95 tok/s, VRAM 5869 MiB, paging_risk=True, error=None
+2026-10-04 04:56:18   probe ncmoe 24 mtp 2: 38.23 tok/s, VRAM 5051 MiB, paging_risk=True, error=None
+2026-10-04 05:01:33   probe ncmoe 26 mtp 2: 29.74 tok/s, VRAM 4235 MiB, paging_risk=True, error=None
+2026-10-04 05:01:33   chosen: ncmoe 22 mtp 2 -> 40.95 tok/s, 5869 MiB
+2026-10-04 05:01:33   tier2b -> tier2b-gemma4-qat-q4kxl-off-2026-10-04.jsonl
+2026-10-04 05:09:24   tier2b result: 102/117 in 7.2 min, restarts 0
+2026-10-04 05:09:24 === k2h-iq3xxs  (C: free 12.4 GB)
+2026-10-04 05:10:24   starting llama.cpp build pr-k2h in the background
+2026-10-04 05:10:45   evicted gptoss20b-mxfp4 to make room (C: free now 25.4 GB)
+2026-10-04 05:29:18   downloaded K2-Horizon-MoVA-36B-A4B-IQ3_XXS.gguf (14.60 GB, sha256 ok) in 1113 s
+2026-10-04 05:47:40   probe ncmoe 22 mtp 0: 6.49 tok/s, VRAM 7722 MiB, paging_risk=False, error=None
+2026-10-04 06:03:53   probe ncmoe 26 mtp 0: 7.01 tok/s, VRAM 7735 MiB, paging_risk=False, error=None
+--- pipeline stopped at 06:12:06: K2 probe without the attn_v_exps fix abandoned
+2026-10-04 06:12:09 after_pipeline: retrying K2-Horizon with attn_v_exps on the CPU
+2026-10-04 06:12:11 === k2h-iq3xxs  (C: free 9.6 GB)
+2026-10-04 06:12:12   k2h-iq3xxs FAILED: RuntimeError: not enough space on C: (9.6 GB free, need 14.6 + margin)
+2026-10-04 06:12:12 pipeline done (Flash-Next deferred: its 58.4 GB of shards do not fit on C: with D: offline)
+2026-10-04 06:12:12 after_pipeline: starting the pruning pilot (prune_experiment.py)
+2026-10-04 06:12:13 prune: imatrix on stdlib code
+2026-10-04 06:16:28 prune: imatrix done in 4 min
+2026-10-04 06:16:28 prune: evicted tiel-iq3xxs for space (C: free 23.1 GB)
+2026-10-04 06:18:35 prune: sliced to 192: {"arch": "qwen35moe", "experts": "256->192", "mean_importance_retained": 0.9824, "fallback_layers": [40]} (9.34 GB)
+2026-10-04 06:18:37 prune: evicted gemma4-qat-q4kxl for space (C: free 28.2 GB)
+2026-10-04 06:20:35 prune: sliced to 128: {"arch": "qwen35moe", "experts": "256->128", "mean_importance_retained": 0.9371, "fallback_layers": [40]} (6.79 GB)
+2026-10-04 06:26:08   probe ncmoe 20 mtp 2: 61.81 tok/s, VRAM 7239 MiB, paging_risk=False, error=None
+2026-10-04 06:31:18   probe ncmoe 22 mtp 2: 57.92 tok/s, VRAM 6777 MiB, paging_risk=False, error=None
+2026-10-04 06:36:42   probe ncmoe 24 mtp 2: 54.6 tok/s, VRAM 6319 MiB, paging_risk=False, error=None
+2026-10-04 06:36:42   chosen: ncmoe 22 mtp 2 -> 57.92 tok/s, 6777 MiB
+2026-10-04 06:36:42   tier2b -> tier2b-qwen36-iq2m-full-off-2026-10-04.jsonl
+2026-10-04 06:40:56   tier2b result: 94/117 in 4.1 min, restarts 0
+2026-10-04 06:45:13   probe ncmoe 16 mtp 2: 68.97 tok/s, VRAM 6631 MiB, paging_risk=True, error=None
+2026-10-04 06:49:23   probe ncmoe 20 mtp 2: 61.4 tok/s, VRAM 5941 MiB, paging_risk=False, error=None
+2026-10-04 06:54:54   probe ncmoe 24 mtp 2: 55.04 tok/s, VRAM 5249 MiB, paging_risk=False, error=None
+2026-10-04 06:54:54   chosen: ncmoe 16 mtp 2 -> 68.97 tok/s, 6631 MiB
+2026-10-04 06:54:54   tier2b -> tier2b-qwen36-iq2m-keep192-off-2026-10-04.jsonl
+2026-10-04 06:57:49   tier2b result: 99/117 in 2.8 min, restarts 0
+2026-10-04 07:01:46   probe ncmoe 16 mtp 2: 68.77 tok/s, VRAM 5097 MiB, paging_risk=False, error=None
+2026-10-04 07:06:31   probe ncmoe 20 mtp 2: 59.47 tok/s, VRAM 4637 MiB, paging_risk=False, error=None
+2026-10-04 07:10:53   probe ncmoe 24 mtp 2: 54.01 tok/s, VRAM 4177 MiB, paging_risk=False, error=None
+2026-10-04 07:10:53   chosen: ncmoe 16 mtp 2 -> 68.77 tok/s, 5097 MiB
+2026-10-04 07:10:53   tier2b -> tier2b-qwen36-iq2m-keep128-off-2026-10-04.jsonl
+2026-10-04 07:14:09   tier2b result: 95/117 in 3.2 min, restarts 0
+2026-10-04 07:14:09 prune experiment done
+2026-10-04 07:14:09 after_pipeline: pruning pilot exited
+2026-10-04 07:14:10 after_prune: retrying K2-Horizon with attn_v_exps on the CPU
+2026-10-04 07:14:11 === k2h-iq3xxs  (C: free 21.4 GB)
+2026-10-04 07:14:11   using staged K2-Horizon-MoVA-36B-A4B-IQ3_XXS.gguf (14.60 GB)
+2026-10-04 07:16:12   waited 1 min for builds to finish
+2026-10-04 07:24:40   probe ncmoe 30 mtp 0: 16.78 tok/s, VRAM 7017 MiB, paging_risk=True, error=None
+2026-10-04 07:32:55   probe ncmoe 34 mtp 0: 14.78 tok/s, VRAM 6151 MiB, paging_risk=True, error=None
+2026-10-04 07:41:51   probe ncmoe 38 mtp 0: 13.79 tok/s, VRAM 5293 MiB, paging_risk=True, error=None
+2026-10-04 07:41:51   chosen: ncmoe 30 mtp 0 -> 16.78 tok/s, 7017 MiB
+2026-10-04 07:41:51   tier2b -> tier2b-k2h-iq3xxs-off-2026-10-04.jsonl
+2026-10-04 07:56:44   tier2b result: 93/117 in 14.4 min, restarts 0
+2026-10-04 07:56:44 pipeline done (Flash-Next deferred: its 58.4 GB of shards do not fit on C: with D: offline)
+2026-10-04 07:56:44 after_prune: K2 retry exited
+2026-10-04 07:57:05 after_k2: starting pruning pilot part 2 (prune_more.py)
+2026-10-04 08:02:40   probe ncmoe 4 mtp 2: 104.34 tok/s, VRAM 6458 MiB, paging_risk=False, error=None
+2026-10-04 08:06:32   probe ncmoe 8 mtp 2: 87.9 tok/s, VRAM 6014 MiB, paging_risk=False, error=None
+2026-10-04 08:10:57   probe ncmoe 12 mtp 2: 76.31 tok/s, VRAM 5583 MiB, paging_risk=True, error=None
+2026-10-04 08:10:57   chosen: ncmoe 4 mtp 2 -> 104.34 tok/s, 6458 MiB
+2026-10-04 08:13:02 prune2: sliced to 96: {"arch": "qwen35moe", "experts": "256->96", "mean_importance_retained": 0.8938, "fallback_layers": [40]} (5.52 GB)
+2026-10-04 08:18:03   probe ncmoe 0 mtp 2: 132.2 tok/s, VRAM 5696 MiB, paging_risk=False, error=None
+2026-10-04 08:22:50   probe ncmoe 4 mtp 2: 102.48 tok/s, VRAM 5350 MiB, paging_risk=False, error=None
+2026-10-04 08:27:07   probe ncmoe 8 mtp 2: 87.84 tok/s, VRAM 4984 MiB, paging_risk=False, error=None
+2026-10-04 08:27:07   chosen: ncmoe 0 mtp 2 -> 132.2 tok/s, 5696 MiB
+2026-10-04 08:27:07   tier2b -> tier2b-qwen36-iq2m-keep96-off-2026-10-04.jsonl
+2026-10-04 08:28:49   tier2b result: 99/117 in 1.6 min, restarts 0
+2026-10-04 08:30:11 prune2: sliced to 64: {"arch": "qwen35moe", "experts": "256->64", "mean_importance_retained": 0.822, "fallback_layers": [40]} (4.25 GB)
+2026-10-04 08:33:32   probe ncmoe 0 mtp 2: 136.62 tok/s, VRAM 4480 MiB, paging_risk=False, error=None
+2026-10-04 08:37:11   probe ncmoe 4 mtp 2: 104.09 tok/s, VRAM 4276 MiB, paging_risk=False, error=None
+2026-10-04 08:37:11   chosen: ncmoe 0 mtp 2 -> 136.62 tok/s, 4480 MiB
+2026-10-04 08:37:11   tier2b -> tier2b-qwen36-iq2m-keep64-off-2026-10-04.jsonl
+2026-10-04 08:40:14   tier2b result: 92/117 in 3.0 min, restarts 0
+2026-10-04 08:40:14 prune2 done
+2026-10-04 08:40:14 after_k2: pruning pilot part 2 exited
