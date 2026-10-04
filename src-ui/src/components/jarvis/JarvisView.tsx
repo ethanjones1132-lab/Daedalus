@@ -74,9 +74,11 @@ import {
   type StreamTerminalOutcome,
 } from './stream-lifecycle';
 import {
+  coerceMemoryRecallStatus,
   decodeMemoryStatusFrame,
   decodeMemoryTurnDiagnostic,
   decodeMemoryTurnPreparation,
+  decodeNativeHistoryRows,
   formatMemoryTurnLabel,
   type MemoryRecallStatus,
   type MemoryTurnDiagnosticView,
@@ -179,6 +181,12 @@ const readSessionRunsFor = async (sessionId: string): Promise<SessionRunRead> =>
 
 const JARVIS_API_URL = 'http://127.0.0.1:19877';
 const STREAM_INACTIVITY_TIMEOUT_MS = 90_000;
+// Phase 2.4 — bound the UI's native memory finalization attempt (including the
+// Tauri command wait and any native operation-gate backlog) so a stuck native
+// task cannot postpone terminal publication indefinitely. Above the owned
+// transport's own 1s connect / 3s total request bounds; on timeout the ordinary
+// result is shown with a truthful pending notice. The finalizer is not retried.
+const MEMORY_FINALIZE_TIMEOUT_MS = 5_000;
 
 // Task 7 Part C (2026-07-03 incident 1d4727cf): the server's structured
 // `error` frame carries a `code` (e.g. "first_token_timeout") that
@@ -683,6 +691,10 @@ export function ChatPanel({
   const [memoryLiveStatus, setMemoryLiveStatus] = useState<MemoryRecallStatus | null>(null);
   const [memoryDiagnostic, setMemoryDiagnostic] = useState<MemoryTurnDiagnosticView | null>(null);
   const [memoryHistoryWarning, setMemoryHistoryWarning] = useState<string | null>(null);
+  const [memoryFinalizationNotice, setMemoryFinalizationNotice] = useState<string | null>(null);
+  // Guards relay `jarvis://memory-status`/`memory-diagnostic` events so a late
+  // event from a previous relay turn cannot overwrite the current one.
+  const relayMemoryTurnRef = useRef<{ sessionId: string; turnId: string } | null>(null);
   // Explicit per-turn user-wide opt-in. Default false; cleared whenever the
   // selected Session (and therefore Agent scope) changes so it can never carry
   // silently into a different Session/Agent.
@@ -1347,6 +1359,47 @@ export function ChatPanel({
       setTurnCost({ tokens: event.payload.tokens, costUsd: event.payload.cost_usd });
     }));
 
+    // Phase 2.4 — relay memory metadata. Guarded by Session identity and a
+    // first-seen turn id per submission so a late event from an old relay turn
+    // cannot overwrite another turn. These are metadata only and never
+    // authority; durable counts come from the native diagnostic projection.
+    const acceptRelayMemoryTurn = (sid: string | undefined, turnId: unknown): boolean => {
+      if (!matchesStreamSession(sid)) return false;
+      if (typeof sid !== 'string' || typeof turnId !== 'string' || !turnId) return false;
+      const current = relayMemoryTurnRef.current;
+      if (current && current.sessionId === sid && current.turnId !== turnId) return false;
+      relayMemoryTurnRef.current = { sessionId: sid, turnId };
+      return true;
+    };
+    track(listen<{
+      session_id?: string;
+      turn_id?: string;
+      status?: unknown;
+      selected_ids?: unknown;
+      store_revision?: unknown;
+      code?: unknown;
+    }>('jarvis://memory-status', (event) => {
+      const p = event.payload;
+      if (!acceptRelayMemoryTurn(p.session_id, p.turn_id)) return;
+      const decoded = decodeMemoryStatusFrame(p);
+      if (decoded) setMemoryLiveStatus(decoded.status);
+    }));
+    track(listen<Record<string, unknown> & { session_id?: string; turn_id?: string }>(
+      'jarvis://memory-diagnostic',
+      (event) => {
+        const p = event.payload;
+        if (!acceptRelayMemoryTurn(p.session_id, p.turn_id)) return;
+        try {
+          const view = decodeMemoryTurnDiagnostic(p);
+          if (view.turnId === p.turn_id && view.sessionId === p.session_id) {
+            setMemoryDiagnostic(view);
+          }
+        } catch (e) {
+          console.warn('[Jarvis] relay memory diagnostic was malformed:', e);
+        }
+      },
+    ));
+
     return () => {
       disposed = true;
       unsubs.forEach((f) => f());
@@ -1388,6 +1441,12 @@ export function ChatPanel({
       && streamAbortRef.current === controller
     );
 
+    const stopIfStale = () => {
+      if (requestIsCurrent()) return;
+      controller.abort('Stale Session turn');
+      throw new DOMException('Stale Session turn', 'AbortError');
+    };
+
     // One stable turn identity for this submitted turn, held across every
     // frame and the terminal native sync. It is distinct from the opaque
     // native preparation id returned by `memory_prepare_turn`.
@@ -1395,51 +1454,109 @@ export function ChatPanel({
     setMemoryLiveStatus(null);
     setMemoryDiagnostic(null);
     setMemoryHistoryWarning(null);
+    setMemoryFinalizationNotice(null);
 
-    // ── 1. Persist the user row FIRST. Native preparation must reference the
-    // exact persisted row id, never the optimistic UI id. `append_message`
-    // returns the DB row id (sessions.rs `insert_message_row`); swapping the
-    // client-generated id for it lets a later history-reload dedupe this as
-    // the SAME message instance (2026-07-03 incident 1d4727cf). ─────────────
     let userMessageId: string | null = null;
-    let appendFailure = false;
+    let inactivityTimedOut = false;
+    let terminal: DecodedStreamTerminal | null = null;
+
+    // One memoized, bounded, ID-only native finalization per local turn. It is
+    // attempted on every exit path (success, error, cancellation, EOF and
+    // stale-Session teardown), even after a Session switch/abort, but it never
+    // repaints a stale Session. The exact `{session_id, turn_id}` tuple is
+    // captured and late completion after the deadline is ignored. The native
+    // diagnostic read-back is the sole authority for persisted selected/applied
+    // metadata; a timeout or failure surfaces a truthful notice and never
+    // manufactures receipt or terminal evidence.
+    let finalizePromise: Promise<boolean> | null = null;
+    const finalizeMemoryTurn = (): Promise<boolean> => {
+      if (finalizePromise) return finalizePromise;
+      finalizePromise = (async (): Promise<boolean> => {
+        if (!userMessageId) return true;
+        let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<'timeout'>((resolve) => {
+          timeoutHandle = setTimeout(() => resolve('timeout'), MEMORY_FINALIZE_TIMEOUT_MS);
+        });
+        const sync = invoke('memory_sync_turn', {
+          request: { session_id: sid, turn_id: turnId },
+        }).then(() => 'ok' as const, () => 'failed' as const);
+        const outcome = await Promise.race([sync, timeout]);
+        if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+        if (outcome === 'timeout') {
+          if (requestIsCurrent()) {
+            setMemoryFinalizationNotice('Memory finalization is pending; showing the ordinary result.');
+          }
+          return false;
+        }
+        if (outcome === 'failed') {
+          if (requestIsCurrent()) {
+            setMemoryFinalizationNotice('Memory sync unavailable; showing the ordinary result.');
+          }
+          return false;
+        }
+        if (!requestIsCurrent()) return true;
+        try {
+          const diagnostic = await invoke('memory_turn_diagnostic', {
+            request: { session_id: sid, turn_id: turnId },
+          });
+          const view = decodeMemoryTurnDiagnostic(diagnostic);
+          // Only an exact expected tuple is accepted; a stale Session/turn
+          // read-back is dropped.
+          if (requestIsCurrent() && view.turnId === turnId && view.sessionId === sid) {
+            setMemoryDiagnostic(view);
+          }
+        } catch (e) {
+          console.warn('[Jarvis] memory diagnostic read-back failed:', e);
+          if (requestIsCurrent()) {
+            setMemoryFinalizationNotice('Memory status unavailable for this turn.');
+          }
+        }
+        return true;
+      })();
+      return finalizePromise;
+    };
+
+    // ── Persisted-turn lifecycle ──────────────────────────────────────────
+    // A saved source row is a precondition for any inference. The complete
+    // append→prepare→history→fetch→read lifecycle is wrapped so a saved turn is
+    // finalized exactly once even on setup/HTTP/body/EOF/abort failure.
     try {
-      const dbId = await invoke<string>('append_message', {
-        ...sessionInvokeArgs(sid),
-        role: 'user',
-        content: userMsg,
-      });
-      if (typeof dbId === 'string' && dbId) {
+      // 1. Persist the user row FIRST. Native preparation must reference the
+      // exact persisted row id, never the optimistic UI id. `append_message`
+      // returns the DB row id (sessions.rs `insert_message_row`); swapping the
+      // client-generated id for it lets a later history-reload dedupe this as
+      // the SAME message instance (2026-07-03 incident 1d4727cf).
+      try {
+        const dbId = await invoke<string>('append_message', {
+          ...sessionInvokeArgs(sid),
+          role: 'user',
+          content: userMsg,
+        });
+        if (typeof dbId !== 'string' || !dbId) {
+          throw new Error('the server did not return a saved message id');
+        }
         userMessageId = dbId;
         if (requestIsCurrent()) {
           setMessages(prev => prev.map((m) => (m.id === clientMessageId ? { ...m, id: dbId } : m)));
         }
-      }
-    } catch (e: any) {
-      appendFailure = true;
-      if (requestIsCurrent()) {
+      } catch (e: any) {
+        stopIfStale();
         console.error('Failed to persist user message:', e);
-        setError('Append failed: ' + (e?.message || String(e)));
+        // No saved row -> no inference. Throw a truthful persistence failure to
+        // the existing draft-recovery path; never claim the optimistic bubble
+        // is saved.
+        throw new Error('Could not save your message: ' + (e?.message || String(e)));
       }
-    }
+      stopIfStale();
 
-    if (!requestIsCurrent()) {
-      controller.abort('Stale Session turn');
-      throw new DOMException('Stale Session turn', 'AbortError');
-    }
-
-    // ── 2. Prepare native recall and load native prompt history. References
-    // only; no memory text crosses the webview. A failed append means no
-    // preparation and no capture. A failed preparation still runs ordinary
-    // inference with a typed status and no preparation reference. A failed
-    // history read sends empty prior history with a visible warning rather
-    // than stale UI cache. ──────────────────────────────────────────────────
-    let memoryPreparationId: string | null = null;
-    let initialMemoryStatus: MemoryRecallStatus = 'unavailable';
-    let history: Array<{ role: string; content: string }> = [];
-    if (appendFailure) {
-      initialMemoryStatus = 'unavailable';
-    } else if (userMessageId) {
+      // 2. Prepare native recall and load native prompt history. References
+      // only; no memory text crosses the webview. A failed preparation still
+      // runs ordinary inference with a typed status and no preparation
+      // reference. A failed/unreadable history read sends empty prior history
+      // with a visible warning rather than a stale UI cache.
+      let memoryPreparationId: string | null = null;
+      let initialMemoryStatus: MemoryRecallStatus = 'unavailable';
+      let history: Array<{ role: string; content: string }> = [];
       try {
         const prepared = decodeMemoryTurnPreparation(await invoke('memory_prepare_turn', {
           request: {
@@ -1449,66 +1566,63 @@ export function ChatPanel({
             include_user_scope: includeUserScope,
           },
         }));
+        if (prepared.turn_id !== turnId) {
+          throw new Error('memory preparation identity mismatch');
+        }
         initialMemoryStatus = prepared.status;
         memoryPreparationId = prepared.preparation_id;
       } catch (e) {
         console.warn('[Jarvis] memory preparation failed:', e);
-        initialMemoryStatus = 'registration_failed';
+        initialMemoryStatus = coerceMemoryRecallStatus(e);
         memoryPreparationId = null;
       }
+      stopIfStale();
       try {
-        const nativeHistory = await invoke<Array<{ id: string; role: string; content: string }>>(
+        const nativeHistory = await invoke<unknown>(
           'memory_turn_history',
           { request: { session_id: sid, user_message_id: userMessageId } },
         );
-        if (Array.isArray(nativeHistory)) {
-          history = nativeHistory.map((m) => ({ role: m.role, content: m.content }));
+        const rows = decodeNativeHistoryRows(nativeHistory);
+        if (rows) {
+          history = rows;
+        } else if (requestIsCurrent()) {
+          setMemoryHistoryWarning('Memory history was unreadable; sending this turn without prior context.');
         }
       } catch (e) {
         console.warn('[Jarvis] native memory history failed:', e);
-        history = [];
         if (requestIsCurrent()) setMemoryHistoryWarning('Memory history unavailable for this turn.');
       }
-    }
+      stopIfStale();
 
-    if (!requestIsCurrent()) {
-      controller.abort('Stale Session turn');
-      throw new DOMException('Stale Session turn', 'AbortError');
-    }
+      const response = await fetch(`${JARVIS_API_URL}/chat/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: userMsg,
+          session_id: sid,
+          history,
+          turn_id: turnId,
+          memory_status: initialMemoryStatus,
+          ...(memoryPreparationId ? { memory_preparation_id: memoryPreparationId } : {}),
+        }),
+        signal: controller.signal,
+      });
 
-    const response = await fetch(`${JARVIS_API_URL}/chat/stream`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        message: userMsg,
-        session_id: sid,
-        history,
-        turn_id: turnId,
-        memory_status: initialMemoryStatus,
-        ...(memoryPreparationId ? { memory_preparation_id: memoryPreparationId } : {}),
-      }),
-      signal: controller.signal,
-    });
-
-    if (!response.ok) {
-      const body = await response.text().catch(() => '');
-      throw new Error(`Jarvis server returned ${response.status}: ${body}`);
-    }
-    if (!response.body) {
-      throw new Error('Jarvis server returned no response stream.');
-    }
-    if (!requestIsCurrent()) {
-      controller.abort('Stale Session turn');
-      throw new DOMException('Stale Session turn', 'AbortError');
-    }
-    onAccepted();
+      if (!response.ok) {
+        const body = await response.text().catch(() => '');
+        throw new Error(`Jarvis server returned ${response.status}: ${body}`);
+      }
+      if (!response.body) {
+        throw new Error('Jarvis server returned no response stream.');
+      }
+      stopIfStale();
+      onAccepted();
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
     let streamedVisibleText = false;
     let streamedRawText = '';
-    let inactivityTimedOut = false;
     // Task 4.1: mirror the Rust relay's TerminalRunAccumulator (jarvis/
     // runner.rs). This direct-fetch path bypasses that relay, so the UI
     // reports the terminal outcome it observed via the `record_terminal_run`
@@ -1524,7 +1638,6 @@ export function ChatPanel({
       partialOutput?: string;
     } = { tokenCount: 0, toolCount: 0 };
      let terminalFrame: StreamTerminalFrame = null;
-     let terminal: DecodedStreamTerminal | null = null;
      let activityTerminalDispatched = false;
     const persistTerminalRun = () => {
       if (!requestIsCurrent() || !runAcc.outcome) return;
@@ -1543,30 +1656,6 @@ export function ChatPanel({
         cancelledReason: runAcc.cancelledReason ?? null,
         partialOutput: runAcc.partialOutput ?? null,
       });
-    };
-    // One ID-only native sync per local turn exit, attempted on success,
-    // error, cancellation, EOF and stale-Session teardown. It never rewrites
-    // the ordinary inference outcome: a bounded sync failure is logged and the
-    // model result stands. The native diagnostic read-back is the sole
-    // authority for the persisted selected/applied metadata surfaced in the UI.
-    const finalizeMemoryTurn = async () => {
-      if (!userMessageId) return;
-      try {
-        await invoke('memory_sync_turn', {
-          request: { session_id: sid, turn_id: turnId },
-        });
-      } catch (e) {
-        console.warn('[Jarvis] memory sync failed (ordinary outcome preserved):', e);
-      }
-      if (!requestIsCurrent()) return;
-      try {
-        const diagnostic = await invoke('memory_turn_diagnostic', {
-          request: { session_id: sid, turn_id: turnId },
-        });
-        if (requestIsCurrent()) setMemoryDiagnostic(decodeMemoryTurnDiagnostic(diagnostic));
-      } catch (e) {
-        console.warn('[Jarvis] memory diagnostic read-back failed:', e);
-      }
     };
     const acceptTerminal = (next: DecodedStreamTerminal): boolean => {
       const accepted = acceptFirstTerminal(terminal, next);
@@ -1590,7 +1679,7 @@ export function ChatPanel({
       },
     );
 
-    const handleFrame = (frame: any) => {
+    const handleFrame = async (frame: any): Promise<void> => {
       if (!requestIsCurrent()) return;
       if (!frame || typeof frame !== 'object') return;
       // Phase 2.4 — transient memory diagnostics. Never authority: the native
@@ -1810,6 +1899,9 @@ export function ChatPanel({
       if (isPassiveSseFrame(frame.type)) return;
       if (frame.type === 'result') {
         const decision = decodeResultFrame(frame);
+        // Phase 2.4 — finalize the native turn before any local terminal
+        // publication (activity, outcome, run-record write).
+        await finalizeMemoryTurn();
         if (!acceptTerminal(decision)) return;
         dispatchActivity({ kind: 'terminal', outcome: decision.outcome });
         activityTerminalDispatched = true;
@@ -1829,6 +1921,7 @@ export function ChatPanel({
           text: '',
           hardError: true,
         };
+        await finalizeMemoryTurn();
         if (!acceptTerminal(decision)) return;
         dispatchActivity({ kind: 'terminal', outcome: decision.outcome });
         activityTerminalDispatched = true;
@@ -1846,6 +1939,7 @@ export function ChatPanel({
           text: '',
           hardError: false,
         };
+        await finalizeMemoryTurn();
         if (!acceptTerminal(decision)) return;
         dispatchActivity({ kind: 'terminal', outcome: decision.outcome });
         activityTerminalDispatched = true;
@@ -1924,7 +2018,7 @@ export function ChatPanel({
             }
             if (frame) {
               inactivityWatchdog.touch();
-              handleFrame(frame);
+              await handleFrame(frame);
             }
           }
         }
@@ -1939,6 +2033,8 @@ export function ChatPanel({
       if (termination === 'unterminated') {
         runAcc.outcome = 'failed';
         runAcc.partialOutput = boundedPartialOutput(streamedRawText);
+        // Finalize before the EOF/abort terminal publication and run write.
+        await finalizeMemoryTurn();
         dispatchActivity({ kind: 'terminal', outcome: 'failed' });
         activityTerminalDispatched = true;
         throw new JarvisStreamError(STREAM_INCOMPLETE_MESSAGE, STREAM_INCOMPLETE_CODE);
@@ -1950,6 +2046,10 @@ export function ChatPanel({
       throw error;
     } finally {
       inactivityWatchdog.stop();
+      // Phase 2.4 — finalize the native turn BEFORE any local terminal
+      // publication or run-record write. This is memoized, so terminal-frame
+      // branches that already finalized are a no-op here.
+      await finalizeMemoryTurn();
       // Task 4.1: durably record the terminal outcome on every exit path.
       // Stream ends without a terminal frame: an inactivity timeout is
       // timed_out; a client-side abort (user Stop that raced ahead of the
@@ -1967,8 +2067,12 @@ export function ChatPanel({
         }
       }
       persistTerminalRun();
-      // Phase 2.4 — finalize the native turn before the local turn closes.
-      // Attempted on every exit path, including abort/EOF/error.
+    }
+    } finally {
+      // Safety net for setup/HTTP/body failures that occur before the read
+      // loop starts. The same memoized finalizer runs, so a saved turn is
+      // finalized exactly once on every exit path, including stale/aborted
+      // submissions.
       await finalizeMemoryTurn();
     }
     if (inactivityTimedOut) {
@@ -2011,6 +2115,13 @@ export function ChatPanel({
     setMemoryLiveStatus(null);
     setMemoryDiagnostic(null);
     setMemoryHistoryWarning(null);
+    setMemoryFinalizationNotice(null);
+    relayMemoryTurnRef.current = null;
+    // Consume the per-turn user-wide opt-in: this turn snapshots the explicit
+    // choice, then the control resets to the Session default (false) so it can
+    // never silently carry across an Agent change within the same Session.
+    const includeUserScopeForTurn = includeUserScope;
+    setIncludeUserScope(false);
     setIsStreaming(true);
     turnStartedAtRef.current = Date.now();
     setTurnElapsedMs(0);
@@ -2060,7 +2171,7 @@ export function ChatPanel({
 
       await streamFromJarvisApi(effectiveSessionId, userMsg, sendGeneration, () => {
         publishDraftStore(clearSubmittedSessionDraft(draftStoreRef.current, submittedDraft));
-      }, clientMessageId, includeUserScope);
+      }, clientMessageId, includeUserScopeForTurn);
     } catch (e) {
       if (!mountedRef.current) return;
       if (!sendGateRef.current.isCurrent(sendGeneration)) {
@@ -2722,6 +2833,15 @@ export function ChatPanel({
             className="mt-0.5 px-1 text-[10px] font-mono text-bone-faint"
           >
             {memoryHistoryWarning}
+          </p>
+        )}
+        {memoryFinalizationNotice && (
+          <p
+            role="status"
+            aria-label="Memory finalization status"
+            className="mt-0.5 px-1 text-[10px] font-mono text-bone-faint"
+          >
+            {memoryFinalizationNotice}
           </p>
         )}
       </div>

@@ -78,6 +78,39 @@ export function isMemoryRecallStatus(value: unknown): value is MemoryRecallStatu
   return typeof value === 'string' && RECALL_STATUSES.has(value);
 }
 
+/**
+ * Map an unknown thrown/typed error to a known recall status. Only an exact
+ * frozen status on the error's `status`/`code` is honored; anything else
+ * degrades to `unavailable` rather than inventing `registration_failed`.
+ */
+export function coerceMemoryRecallStatus(value: unknown): MemoryRecallStatus {
+  if (value && typeof value === 'object') {
+    const candidate = (value as { status?: unknown }).status
+      ?? (value as { code?: unknown }).code;
+    if (isMemoryRecallStatus(candidate)) return candidate;
+  }
+  return 'unavailable';
+}
+
+/**
+ * Validate native prompt-history rows before use. Unknown/malformed data
+ * degrades to `null` so the caller sends empty history plus a visible warning
+ * instead of blindly mapping malformed rows or falling back to a UI cache.
+ */
+export function decodeNativeHistoryRows(
+  value: unknown,
+): Array<{ role: string; content: string }> | null {
+  if (!Array.isArray(value)) return null;
+  const rows: Array<{ role: string; content: string }> = [];
+  for (const entry of value) {
+    if (!isRecord(entry) || typeof entry.role !== 'string' || typeof entry.content !== 'string') {
+      return null;
+    }
+    rows.push({ role: entry.role, content: entry.content });
+  }
+  return rows;
+}
+
 export function isMemoryTurnState(value: unknown): value is MemoryTurnState {
   return typeof value === 'string' && TURN_STATES.has(value);
 }
@@ -229,7 +262,7 @@ export function decodeMemoryTurnDiagnostic(value: unknown): MemoryTurnDiagnostic
 }
 
 const RECALL_STATUS_LABELS: Record<MemoryRecallStatus, string> = {
-  ready: 'recalled',
+  ready: 'ready',
   empty: 'no matches',
   unavailable: 'unavailable',
   retrieval_failed: 'retrieval failed',
@@ -246,6 +279,25 @@ export function memoryRecallStatusLabel(status: MemoryRecallStatus): string {
   return RECALL_STATUS_LABELS[status] ?? 'unavailable';
 }
 
+const TURN_STATE_LABELS: Record<MemoryTurnState, string> = {
+  prepared: 'prepared',
+  registered: 'registered',
+  started: 'started',
+  terminal: 'finished',
+  invalidated: 'invalidated',
+  expired: 'expired',
+  unavailable: 'unavailable',
+  unterminated: 'unterminated',
+};
+
+/**
+ * True only when the native turn reached a terminal state. A `registered`,
+ * `started`, or `prepared` read-back is explicitly NOT terminal success.
+ */
+export function isMemoryTurnTerminal(state: MemoryTurnState): boolean {
+  return state === 'terminal';
+}
+
 /**
  * Compact, honest per-turn status label. Counts come only from the native
  * diagnostic; the transient status is used solely while no diagnostic exists.
@@ -258,7 +310,12 @@ export function formatMemoryTurnLabel(
   if (diagnostic) {
     const selected = diagnostic.selectedIds.length;
     const applied = diagnostic.appliedSelectedIds.length;
-    const base = `Memory: ${memoryRecallStatusLabel(diagnostic.recallStatus)}`;
+    // A nonterminal read-back is surfaced explicitly and never presented as
+    // completion; only the native `terminal` state is finished.
+    const stateSuffix = isMemoryTurnTerminal(diagnostic.state)
+      ? ''
+      : ` · ${TURN_STATE_LABELS[diagnostic.state]}`;
+    const base = `Memory: ${memoryRecallStatusLabel(diagnostic.recallStatus)}${stateSuffix}`;
     if (diagnostic.recallStatus === 'ready' || diagnostic.recallStatus === 'applied' || selected > 0 || applied > 0) {
       return `${base} · selected ${selected} · applied ${applied}`;
     }

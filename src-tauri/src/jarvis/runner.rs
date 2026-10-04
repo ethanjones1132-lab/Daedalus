@@ -173,11 +173,49 @@ fn attempt_relay_memory_finalize(
             turn_id: turn_id.to_string(),
         },
     ) {
-        Ok(_) => true,
+        Ok(diagnostic) => {
+            // Emit an authoritative native diagnostic projection: metadata and
+            // selected/applied IDs only, never scope, recalled text, or the
+            // block. The UI uses this for durable counts; transient SSE frames
+            // are never authority.
+            let selected_ids: Vec<serde_json::Value> = diagnostic
+                .selected
+                .iter()
+                .map(|selection| serde_json::json!({ "id": selection.id }))
+                .collect();
+            let _ = app.emit(
+                "jarvis://memory-diagnostic",
+                serde_json::json!({
+                    "turn_id": diagnostic.turn_id,
+                    "session_id": diagnostic.session_id,
+                    "store_revision": diagnostic.store_revision,
+                    "selected": selected_ids,
+                    "applied_selected_ids": diagnostic.applied_selected_ids,
+                    "state": diagnostic.state,
+                    "recall_status": diagnostic.recall_status,
+                    "error_code": diagnostic.error_code,
+                    "terminal_status": diagnostic.terminal_status,
+                }),
+            );
+            true
+        }
         Err(error) => {
             eprintln!(
                 "[memory] relay finalize failed session={} turn={} error={}",
                 session_id, turn_id, error
+            );
+            // Metadata-only, typed failure surfaced before the terminal
+            // publication. It never manufactures receipt or terminal evidence.
+            let _ = app.emit(
+                "jarvis://memory-status",
+                serde_json::json!({
+                    "turn_id": turn_id,
+                    "session_id": session_id,
+                    "status": "unavailable",
+                    "selected_ids": [],
+                    "store_revision": serde_json::Value::Null,
+                    "code": "memory_finalization_failed",
+                }),
             );
             false
         }
@@ -231,10 +269,10 @@ pub fn run_jarvis_message(
             }),
         );
 
-        let emit_error = |app: &AppHandle, sid: &str, msg: String| {
+        let emit_error = |app: &AppHandle, sid: &str, turn_id: &str, msg: String| {
             let _ = app.emit(
                 "jarvis://error",
-                serde_json::json!({ "error": msg, "session_id": sid }),
+                serde_json::json!({ "error": msg, "session_id": sid, "turn_id": turn_id }),
             );
         };
 
@@ -252,7 +290,7 @@ pub fn run_jarvis_message(
             Ok(c) => c,
             Err(e) => {
                 attempt_relay_memory_finalize(&app, &sid, &turn_id, memory_turn_enabled, &mut memory_finalized);
-                emit_error(&app, &sid, format!("HTTP client error: {e}"));
+                emit_error(&app, &sid, &turn_id, format!("HTTP client error: {e}"));
                 return;
             }
         };
@@ -278,6 +316,7 @@ pub fn run_jarvis_message(
                 emit_error(
                     &app,
                     &sid,
+                    &turn_id,
                     format!("Could not reach the Jarvis server: {e}"),
                 );
                 return;
@@ -294,7 +333,7 @@ pub fn run_jarvis_message(
             let code = resp.status();
             let body = resp.text().unwrap_or_default();
             attempt_relay_memory_finalize(&app, &sid, &turn_id, memory_turn_enabled, &mut memory_finalized);
-            emit_error(&app, &sid, format!("Jarvis server returned {code}: {body}"));
+            emit_error(&app, &sid, &turn_id, format!("Jarvis server returned {code}: {body}"));
             return;
         }
 
@@ -372,7 +411,7 @@ pub fn run_jarvis_message(
                 }
                 SseFrameOutcome::Error(err) => {
                     attempt_relay_memory_finalize(&app, &sid, &turn_id, memory_turn_enabled, &mut memory_finalized);
-                    emit_error(&app, &sid, err);
+                    emit_error(&app, &sid, &turn_id, err);
                     terminated = true;
                     break;
                 }
@@ -385,10 +424,11 @@ pub fn run_jarvis_message(
                             serde_json::json!({ "text": t, "session_id": sid }),
                         );
                     }
-                    if let Some(e) = error {
-                        emit_error(&app, &sid, e);
-                    }
+                    // Finalize before any terminal error/done publication.
                     attempt_relay_memory_finalize(&app, &sid, &turn_id, memory_turn_enabled, &mut memory_finalized);
+                    if let Some(e) = error {
+                        emit_error(&app, &sid, &turn_id, e);
+                    }
                     let _ = app.emit(
                         "jarvis://done",
                         serde_json::json!({ "session_id": sid, "turn_id": turn_id }),

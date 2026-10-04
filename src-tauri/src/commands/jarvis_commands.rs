@@ -5,7 +5,7 @@ use crate::jarvis::types::*;
 use crate::jarvis_types::JarvisState;
 use serde::Serialize;
 use std::time::Duration;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 async fn chat_base_url() -> Result<String, String> {
     let client = reqwest::Client::builder()
@@ -193,26 +193,51 @@ pub async fn jarvis_send_message(
     };
 
     // Native prompt history stops before the exact source row and excludes all
-    // later rows. The operator transcript command is untouched.
-    let history = match user_message_id.as_deref() {
-        Some(user_message_id) => {
+    // later rows. The operator transcript command is untouched. A failed read
+    // preserves ordinary relay inference with empty history and surfaces an
+    // observable warning; it never silently erases the error.
+    let mut history = Vec::new();
+    let mut history_unavailable = false;
+    if let Some(user_message_id) = user_message_id.as_deref() {
+        let history_result = {
             let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
             crate::jarvis::memory::turn::history_for_memory_turn(&conn, &session_id, user_message_id)
-                .map(|messages| {
-                    messages
-                        .into_iter()
-                        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
+        };
+        match history_result {
+            Ok(messages) => {
+                history = messages
+                    .into_iter()
+                    .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+                    .collect();
+            }
+            Err(error) => {
+                history_unavailable = true;
+                eprintln!("[jarvis-chat] native memory history failed: {}", error);
+            }
         }
-        None => Vec::new(),
-    };
+    }
 
     // One stable turn identity for this relay turn, distinct from the opaque
     // native preparation id. Preparation is references-only; its status is a
     // public hint. A preparation failure still runs ordinary relay inference.
     let turn_id = uuid::Uuid::new_v4().to_string();
+
+    // Metadata-only, observable history warning tied to this turn. It does not
+    // fabricate a saved row or memory readiness.
+    if history_unavailable {
+        let _ = app.emit(
+            "jarvis://memory-status",
+            serde_json::json!({
+                "turn_id": &turn_id,
+                "session_id": &session_id,
+                "status": "unavailable",
+                "selected_ids": [],
+                "store_revision": serde_json::Value::Null,
+                "code": "history_unavailable",
+            }),
+        );
+    }
+
     let (memory_preparation_id, initial_memory_status) = match user_message_id.as_deref() {
         Some(user_message_id) => {
             let request = PrepareMemoryTurnRequest {
@@ -222,7 +247,7 @@ pub async fn jarvis_send_message(
                 include_user_scope: false,
             };
             let app_for_prepare = app.clone();
-            let prepared = tauri::async_runtime::spawn_blocking(move || {
+            match tauri::async_runtime::spawn_blocking(move || {
                 let db = app_for_prepare.state::<crate::db::AppDb>();
                 let transport = crate::jarvis::memory::transport::native_memory_transport();
                 crate::jarvis::memory::transport::prepare_memory_turn(
@@ -233,11 +258,17 @@ pub async fn jarvis_send_message(
                 )
             })
             .await
-            .map_err(|error| format!("memory prepare task join error: {error}"))?;
-            match prepared {
-                Ok(preparation) => (preparation.preparation_id, preparation.status),
-                Err(error) => {
+            {
+                Ok(Ok(preparation)) => (preparation.preparation_id, preparation.status),
+                Ok(Err(error)) => {
                     eprintln!("[jarvis-chat] memory preparation failed: {}", error);
+                    (None, MemoryRecallStatus::Unavailable)
+                }
+                Err(error) => {
+                    // A join failure must not skip the persisted turn: fail
+                    // closed to typed unavailable and continue ordinary relay
+                    // inference, where the terminal finalizer still runs.
+                    eprintln!("[jarvis-chat] memory prepare task join error: {}", error);
                     (None, MemoryRecallStatus::Unavailable)
                 }
             }
