@@ -15,8 +15,9 @@ use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value as JsonValue;
 
 use super::contracts::{
-    AuthorityKind, MemoryDraft, MemoryError, MemoryProvenance, MemoryScope, MemoryScopeKind,
-    MutationResult, ScopedMemoryEntry,
+    AuthorityKind, MemoryDraft, MemoryError, MemoryProvenance, MemoryScope,
+    MemoryScopeKind, MutationResult, RecallOptions, RecallPreview, ScopedMemoryEntry,
+    ScopedMemoryRecall,
 };
 use super::engine;
 
@@ -398,6 +399,191 @@ pub fn save_scoped_memory(
         changed: true,
     })
 }
+
+/// Eligible-candidate predicate applied before the candidate limit. Malformed
+/// persisted expiry/review timestamps are excluded so they cannot consume the
+/// candidate budget and displace valid records.
+const ELIGIBLE_PREDICATE: &str = "(m.status = 'active'
+    AND m.tier IN ('hot','warm')
+    AND m.authority_kind IN ('manual','user_statement','verified_observation')
+    AND (m.expires_at IS NULL
+         OR (datetime(m.expires_at) IS NOT NULL AND datetime(m.expires_at) > datetime(?)))
+    AND (m.review_after IS NULL OR datetime(m.review_after) IS NOT NULL))";
+
+fn recall_scope_predicate(scope: &MemoryScope, include_user: bool) -> (String, Vec<Value>) {
+    let (base, params) = match scope.kind {
+        MemoryScopeKind::Project => (
+            "( (m.scope_kind = 'project' AND m.agent_id = ? AND m.project_root = ?)
+               OR (m.scope_kind = 'agent' AND m.agent_id = ?) )"
+                .to_string(),
+            vec![
+                Value::from(scope.agent_id.clone()),
+                Value::from(scope.project_root.clone().unwrap_or_default()),
+                Value::from(scope.agent_id.clone()),
+            ],
+        ),
+        MemoryScopeKind::Agent => (
+            "(m.scope_kind = 'agent' AND m.agent_id = ?)".to_string(),
+            vec![Value::from(scope.agent_id.clone())],
+        ),
+        MemoryScopeKind::User => (
+            "(m.scope_kind = 'user' AND m.agent_id = '')".to_string(),
+            vec![],
+        ),
+        MemoryScopeKind::LegacyUnscoped => (
+            "(m.scope_kind = 'legacy_unscoped')".to_string(),
+            vec![],
+        ),
+    };
+
+    if include_user && scope.kind != MemoryScopeKind::User {
+        (
+            format!("({} OR (m.scope_kind = 'user' AND m.agent_id = ''))", base),
+            params,
+        )
+    } else {
+        (base, params)
+    }
+}
+
+fn escape_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn query_scoped_rows(
+    conn: &Connection,
+    sql: &str,
+    values: Vec<Value>,
+) -> Result<Vec<ScopedMemoryEntry>, MemoryError> {
+    let mut stmt = conn.prepare(sql).map_err(MemoryError::from)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(values), scoped_from_row)
+        .map_err(MemoryError::from)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(MemoryError::from)
+}
+
+fn is_stale(review_after: &Option<String>, now: &DateTime<Utc>) -> bool {
+    match review_after {
+        Some(raw) => DateTime::parse_from_rfc3339(raw)
+            .map(|dt| dt.with_timezone(&Utc) <= *now)
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
+/// Retrieve only eligible memories inside the explicit scope, ranking and
+/// limiting after scope/status/expiry/tier filtering. This is a read-only
+/// preview: it never marks usage, writes recall events, or touches revisions.
+pub fn recall_scoped_memories(
+    conn: &Connection,
+    scope: &MemoryScope,
+    query: &str,
+    options: &RecallOptions,
+    now: DateTime<Utc>,
+) -> Result<RecallPreview, MemoryError> {
+    let store_revision = memory_store_revision(conn)?;
+    let limit = options.limit.min(RECALL_LIMIT);
+    let terms = engine::query_terms(query);
+    if terms.is_empty() || limit == 0 {
+        return Ok(RecallPreview {
+            scope: scope.clone(),
+            store_revision,
+            entries: Vec::new(),
+        });
+    }
+
+    let now_sql = now.to_rfc3339();
+    let (scope_clause, scope_params) = recall_scope_predicate(scope, options.include_user_scope);
+
+    let mut candidates: Vec<ScopedMemoryEntry> = Vec::new();
+
+    if let Some(expr) = engine::fts_expr(query) {
+        let sql = format!(
+            "SELECT {} FROM memory_fts JOIN memory m ON m.id = memory_fts.id
+             WHERE memory_fts MATCH ? AND {} AND {}
+             LIMIT ?",
+            scoped_select_columns(),
+            ELIGIBLE_PREDICATE,
+            scope_clause
+        );
+        let mut values: Vec<Value> = vec![Value::from(expr), Value::from(now_sql.clone())];
+        values.extend(scope_params.clone());
+        values.push(Value::from(CANDIDATE_LIMIT as i64));
+        match query_scoped_rows(conn, &sql, values) {
+            Ok(rows) => candidates = rows,
+            Err(err) => {
+                // A missing or broken FTS index is not fatal; fall through to
+                // the scoped literal fallback below. Genuine storage failure
+                // will fail there too and surface as storage_unavailable.
+                eprintln!("[memory] scoped FTS recall unavailable: {err}");
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        let escaped = escape_like(query.trim());
+        let pattern = format!("%{}%", escaped);
+        let sql = format!(
+            "SELECT {} FROM memory m WHERE {} AND
+                (m.title LIKE ? ESCAPE '\\' OR m.content LIKE ? ESCAPE '\\'
+                 OR m.tags LIKE ? ESCAPE '\\' OR m.category LIKE ? ESCAPE '\\')
+             AND {} LIMIT ?",
+            scoped_select_columns(),
+            ELIGIBLE_PREDICATE,
+            scope_clause
+        );
+        let mut values: Vec<Value> = vec![
+            Value::from(now_sql.clone()),
+            Value::from(pattern.clone()),
+            Value::from(pattern.clone()),
+            Value::from(pattern.clone()),
+            Value::from(pattern),
+        ];
+        values.extend(scope_params);
+        values.push(Value::from(CANDIDATE_LIMIT as i64));
+        candidates = query_scoped_rows(conn, &sql, values)?;
+    }
+
+    let mut recalls: Vec<ScopedMemoryRecall> = candidates
+        .into_iter()
+        .map(|memory| {
+            let (score, matched_terms) = engine::score_memory(&memory.entry, &terms);
+            let stale = is_stale(&memory.entry.review_after, &now);
+            ScopedMemoryRecall {
+                memory,
+                score,
+                matched_terms,
+                stale,
+            }
+        })
+        .filter(|recall| !recall.matched_terms.is_empty() && recall.score > 0.05)
+        .collect();
+
+    recalls.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.memory.entry.id.cmp(&b.memory.entry.id))
+    });
+    recalls.truncate(limit);
+
+    Ok(RecallPreview {
+        scope: scope.clone(),
+        store_revision,
+        entries: recalls,
+    })
+}
+
 
 #[allow(clippy::too_many_arguments)]
 pub fn update_scoped_memory(
