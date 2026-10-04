@@ -4,6 +4,7 @@ pub mod frontmatter;
 pub mod paths;
 pub mod scope;
 pub mod scoped;
+pub mod turn;
 pub mod types;
 
 // Legacy file-based modules kept for `learning.rs` (research output only).

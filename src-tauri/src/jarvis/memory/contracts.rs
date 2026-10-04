@@ -23,6 +23,10 @@ pub enum MemoryErrorCode {
     InvalidProvenance,
     RevisionConflict,
     StorageUnavailable,
+    // Phase 2 additive turn-lifecycle error codes. Frozen spellings.
+    TurnConflict,
+    InvalidTurn,
+    InvalidationUnavailable,
 }
 
 /// Typed native memory error. Serialization never includes SQL, paths
@@ -83,6 +87,18 @@ impl MemoryError {
 
     pub fn storage_unavailable(message: impl Into<String>) -> Self {
         Self::new(MemoryErrorCode::StorageUnavailable, message)
+    }
+
+    pub fn turn_conflict(message: impl Into<String>) -> Self {
+        Self::new(MemoryErrorCode::TurnConflict, message)
+    }
+
+    pub fn invalid_turn(message: impl Into<String>) -> Self {
+        Self::new(MemoryErrorCode::InvalidTurn, message)
+    }
+
+    pub fn invalidation_unavailable(message: impl Into<String>) -> Self {
+        Self::new(MemoryErrorCode::InvalidationUnavailable, message)
     }
 }
 

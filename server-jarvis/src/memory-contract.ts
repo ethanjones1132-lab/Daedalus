@@ -15,7 +15,11 @@ export type MemoryErrorCode =
   | "invalid_payload"
   | "invalid_provenance"
   | "revision_conflict"
-  | "storage_unavailable";
+  | "storage_unavailable"
+  // Phase 2 additive turn-lifecycle error codes. Frozen spellings.
+  | "turn_conflict"
+  | "invalid_turn"
+  | "invalidation_unavailable";
 
 export interface MemoryError {
   code: MemoryErrorCode;
@@ -188,3 +192,154 @@ export const DEFAULT_RECALL_OPTIONS: RecallOptions = {
   limit: 5,
   include_user_scope: false,
 };
+
+// ── Phase 2 prepared turn wire contracts ─────────────────────────────────────
+// Types-only mirror of `src-tauri/src/jarvis/memory/turn.rs`. Phase 2.1 owns
+// these definitions; later phases consume them unchanged. Field names and enum
+// values must stay in exact lockstep with the Rust side. No recalled text or
+// rendered block is ever persisted; `PreparedMemoryTurn` is the ephemeral
+// registration envelope only.
+
+export type MemoryRecallStatus =
+  | "ready"
+  | "empty"
+  | "unavailable"
+  | "retrieval_failed"
+  | "registration_failed"
+  | "expired"
+  | "invalidated"
+  | "scope_mismatch"
+  | "already_consumed"
+  | "budget_omitted"
+  | "applied";
+
+export type MemoryTurnState =
+  | "prepared"
+  | "registered"
+  | "started"
+  | "terminal"
+  | "invalidated"
+  | "expired"
+  | "unavailable"
+  | "unterminated";
+
+export type MemoryTurnTerminalStatus =
+  | "completed"
+  | "partial"
+  | "cancelled"
+  | "failed"
+  | "unterminated";
+
+export interface PrepareMemoryTurnRequest {
+  session_id: string;
+  turn_id: string;
+  user_message_id: string;
+  include_user_scope: boolean;
+}
+
+export interface MemoryTurnIdentityRequest {
+  session_id: string;
+  turn_id: string;
+}
+
+export interface MemoryTurnHistoryRequest {
+  session_id: string;
+  user_message_id: string;
+}
+
+export interface MemoryTurnPreparation {
+  turn_id: string;
+  preparation_id: string | null;
+  status: MemoryRecallStatus;
+}
+
+export interface PreparedMemorySelection {
+  id: string;
+  revision: number;
+  scope: MemoryScope;
+  authority_kind: AuthorityKind;
+  source_session_id: string | null;
+  source_message_ids: string[];
+  source_run_id: string | null;
+  verified_at: string | null;
+  stale: boolean;
+}
+
+export interface PreparedMemoryItem {
+  selection: PreparedMemorySelection;
+  text: string;
+}
+
+export interface PreparedMemoryTurn {
+  schema_version: number;
+  preparation_id: string;
+  turn_id: string;
+  session_id: string;
+  message_hash: string;
+  scope: MemoryScope;
+  include_user_scope: boolean;
+  effective_workspace: string | null;
+  store_revision: number;
+  selected: PreparedMemoryItem[];
+  block: string;
+  prepared_at: string;
+  expires_at: string;
+  app_instance_id: string;
+}
+
+export interface MemoryRuntimeEvidence {
+  tool_call_id: string;
+  tool_name: string;
+  canonical_path: string | null;
+  output_sha256: string;
+  observed_at: string;
+  success: boolean;
+}
+
+export interface PersistedMemoryTurn {
+  turn_id: string;
+  preparation_id: string | null;
+  session_id: string;
+  source_message_id: string;
+  user_message: string;
+  message_hash: string;
+  scope: MemoryScope;
+  include_user_scope: boolean;
+  effective_workspace: string | null;
+  store_revision: number;
+  selected: PreparedMemorySelection[];
+  applied_selected_ids: string[];
+  app_instance_id: string;
+  bun_instance_id: string | null;
+  state: MemoryTurnState;
+  recall_status: MemoryRecallStatus;
+  error_code: string | null;
+  prepared_at: string;
+  expires_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  terminal_status: MemoryTurnTerminalStatus | null;
+  run_id: string | null;
+  runtime_evidence: MemoryRuntimeEvidence[];
+}
+
+export interface MemoryTurnDiagnostic {
+  turn_id: string;
+  session_id: string;
+  scope: MemoryScope;
+  store_revision: number;
+  selected: PreparedMemorySelection[];
+  applied_selected_ids: string[];
+  state: MemoryTurnState;
+  recall_status: MemoryRecallStatus;
+  error_code: string | null;
+  terminal_status: MemoryTurnTerminalStatus | null;
+}
+
+export interface PromptHistoryMessage {
+  id: string;
+  role: string;
+  content: string;
+}
+
+export const PREPARED_TURN_SCHEMA_VERSION = 1;

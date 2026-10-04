@@ -279,6 +279,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
     create_session_memory_table(conn)?;
     apply_schema_patches(conn)?;
     apply_scoped_memory_migrations(conn)?;
+    apply_memory_turn_migrations(conn)?;
 
     Ok(())
 }
@@ -978,6 +979,46 @@ pub fn apply_scoped_memory_migrations(conn: &Connection) -> Result<(), rusqlite:
             Err(err)
         }
     }
+}
+
+/// Phase 2.1 native turn preparation schema. Additive only and idempotent: it
+/// creates the durable per-turn identity table and its indexes without touching
+/// existing Session, message, or memory rows. The row stores metadata plus the
+/// immutable original user message; it never stores recalled text or the
+/// rendered block.
+pub fn apply_memory_turn_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS memory_turn_preparations (
+          turn_id TEXT PRIMARY KEY,
+          preparation_id TEXT UNIQUE,
+          session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          source_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+          user_message TEXT NOT NULL,
+          message_hash TEXT NOT NULL,
+          scope_json TEXT NOT NULL CHECK(json_valid(scope_json)),
+          include_user_scope INTEGER NOT NULL DEFAULT 0 CHECK(include_user_scope IN (0,1)),
+          effective_workspace TEXT,
+          store_revision INTEGER NOT NULL,
+          selected_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(selected_json)),
+          applied_selected_ids_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(applied_selected_ids_json)),
+          app_instance_id TEXT NOT NULL,
+          bun_instance_id TEXT,
+          state TEXT NOT NULL CHECK(state IN ('prepared','registered','started','terminal','invalidated','expired','unavailable','unterminated')),
+          recall_status TEXT NOT NULL,
+          error_code TEXT,
+          prepared_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          started_at TEXT,
+          finished_at TEXT,
+          terminal_status TEXT CHECK(terminal_status IS NULL OR terminal_status IN ('completed','partial','cancelled','failed','unterminated')),
+          run_id TEXT,
+          runtime_evidence_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(runtime_evidence_json))
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_turn_session ON memory_turn_preparations(session_id, prepared_at);
+        CREATE INDEX IF NOT EXISTS idx_memory_turn_pending ON memory_turn_preparations(state, expires_at);
+        "#,
+    )
 }
 
 #[cfg(test)]

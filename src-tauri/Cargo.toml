@@ -41,6 +41,8 @@ reqwest = { version = "0.12", features = ["json", "blocking"] }
 chrono = { version = "0.4", features = ["serde"] }
 # IDs for sessions, messages, agents
 uuid = { version = "1", features = ["v4", "serde"] }
+# Interoperable SHA-256 for exact saved user-message bytes (Phase 2 turn identity)
+sha2 = "0.10"
 # adapters.yaml / config parsing
 serde_yaml = "0.9"
 # typed error enums
