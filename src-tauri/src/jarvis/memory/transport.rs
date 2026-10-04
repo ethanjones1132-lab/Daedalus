@@ -49,6 +49,12 @@ struct InvalidationRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct InvalidationResponse {
+    invalidated_count: i64,
+    bun_instance_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct AckRequest {
     turn_id: String,
 }
@@ -207,30 +213,32 @@ impl NativeMemoryTransport {
     }
 
     /// Ask the live owned registry to drop every unconsumed envelope. Returns
-    /// `Ok(())` when the registry acknowledged, when there is no registered
-    /// envelope in the current generation, or when the tracked child is
-    /// confirmed gone/replaced. A live owned child that cannot acknowledge is
-    /// `Unavailable` and must block the mutation.
+    /// `Ok(())` only when the live owned child acknowledged, or when the
+    /// tracked child is confirmed gone/replaced (the old registry is gone).
+    ///
+    /// A live owned child is always asked to acknowledge, even when no
+    /// registration response was recorded: a lost response can still have left
+    /// an envelope in the registry, so the ACK is the only proof the registry
+    /// is clear. A live child that cannot acknowledge is `Unavailable` and must
+    /// block the mutation.
     fn invalidate_registry(
         &self,
-        state: &TransportState,
+        state: &mut TransportState,
         reason: &str,
     ) -> Result<(), HttpFailure> {
         if !crate::process_lifecycle::bun_server_is_alive() {
             // Confirmed exited/replaced: the old registry is gone.
             return Ok(());
         }
-        if state.current_bun_instance_id.is_none() {
-            // No successful registration exists for this generation, so no
-            // unconsumed envelope can be live in the owned child.
-            return Ok(());
-        }
         let request = InvalidationRequest {
             app_instance_id: self.app_instance_id.clone(),
             reason: reason.to_string(),
         };
-        self.post_json("/internal/memory/invalidate", &request, 200)
-            .map(|_| ())
+        let body = self.post_json("/internal/memory/invalidate", &request, 200)?;
+        if let Ok(parsed) = serde_json::from_str::<InvalidationResponse>(&body) {
+            state.current_bun_instance_id = Some(parsed.bun_instance_id);
+        }
+        Ok(())
     }
 
     fn fetch_receipt(&self, preparation_id: &str) -> Result<Option<NativeMemoryRuntimeReceipt>, HttpFailure> {
@@ -391,9 +399,9 @@ pub fn invalidate_unconsumed_memory_turns(
     reason: &str,
     now: DateTime<Utc>,
 ) -> Result<(), MemoryError> {
-    let state = transport.lock_state();
+    let mut state = transport.lock_state();
     transport
-        .invalidate_registry(&state, reason)
+        .invalidate_registry(&mut state, reason)
         .map_err(|_| MemoryError::invalidation_unavailable("Memory registry did not acknowledge invalidation"))?;
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     turn::mark_pending_turns_invalidated(&conn, now)?;
@@ -412,10 +420,10 @@ pub fn with_memory_mutation_gate<T>(
     now: DateTime<Utc>,
     mutation: impl FnOnce(&Connection) -> Result<T, MemoryError>,
 ) -> Result<T, MemoryError> {
-    let state = transport.lock_state();
+    let mut state = transport.lock_state();
 
     transport
-        .invalidate_registry(&state, reason)
+        .invalidate_registry(&mut state, reason)
         .map_err(|_| {
             MemoryError::invalidation_unavailable(
                 "Memory registry did not acknowledge invalidation",

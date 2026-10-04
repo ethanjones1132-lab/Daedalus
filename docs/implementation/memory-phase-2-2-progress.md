@@ -109,7 +109,11 @@
 `with_memory_mutation_gate` acquires the operation gate, invalidates the live
 owned registry **before** the AppDb mutex (HTTP completes first), marks native
 `prepared|registered` rows `invalidated`, then invokes the mutation callback
-under the AppDb mutex. A live owned registry that cannot acknowledge returns
+under the AppDb mutex. Whenever the tracked child is confirmed alive the gate
+requires an authenticated invalidation ACK, even if no registration response
+was recorded: a lost response can still have left an envelope in the registry,
+so skipping the ACK on an unrecorded generation would let a stale envelope be
+consumed after commit. A live owned registry that cannot acknowledge returns
 `invalidation_unavailable` and invokes no callback. A confirmed exited/replaced
 tracked child permits the mutation (a port probe is not ownership evidence).
 Never stops a healthy child.
@@ -198,6 +202,11 @@ experiment was run.
 - **Lock order.** `transport state -> CHILDREN` is enforced by dropping the
   CHILDREN guard before any transport-state call; this is reviewed by
   inspection, not stress-tested.
+- **Mutation latency.** Every semantic mutation now performs one bounded
+  authenticated invalidation HTTP call whenever the tracked child is alive,
+  even for unrelated or no-op mutations. This is the conservative safety cost
+  of the precommit invariant; a live child that cannot answer blocks the
+  mutation with `invalidation_unavailable` rather than committing unsafely.
 - **Phase 2.3 dependency.** `consume`, one-shot state, and
   `observeApplied`/`observeTerminal`/`observeToolEvidence` are implemented and
   exposed for 2.3 but not wired to inference. Phase 2.2 does not claim model
