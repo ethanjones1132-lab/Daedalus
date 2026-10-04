@@ -584,6 +584,79 @@ pub fn recall_scoped_memories(
     })
 }
 
+/// Deliberately adopt one legacy quarantined record into an explicit scope.
+/// The original content/metadata is preserved; only scope and authority are
+/// changed, and the scope change is audited with before/after values.
+pub fn adopt_legacy_memory(
+    conn: &Connection,
+    id: &str,
+    expected_revision: i64,
+    target: &MemoryScope,
+    now: DateTime<Utc>,
+) -> Result<MutationResult, MemoryError> {
+    validate_writable_scope(target)?;
+    let (scope_kind, project_root) = scope_columns(target);
+    let legacy = MemoryScope {
+        kind: MemoryScopeKind::LegacyUnscoped,
+        agent_id: String::new(),
+        project_root: None,
+    };
+
+    let adopted = with_memory_savepoint(conn, |conn| {
+        let before = read_scoped_memory_inner(conn, &legacy, id)?;
+        if before.revision != expected_revision {
+            return Err(MemoryError::revision_conflict(
+                "Memory revision no longer matches the expected revision",
+            ));
+        }
+        let adopted_authority = if before.entry.source == "manual" {
+            AuthorityKind::Manual
+        } else {
+            // Unknown/automatic old attribution stays quarantined and
+            // ineligible until a new explicit correction or verified record.
+            AuthorityKind::LegacyUnknown
+        };
+        let now_str = now.to_rfc3339();
+        conn.execute(
+            "UPDATE memory SET scope_kind = ?, agent_id = ?, project_root = ?,
+                 authority_kind = ?, revision = revision + 1, updated_at = ?
+             WHERE id = ? AND scope_kind = 'legacy_unscoped'",
+            rusqlite::params![
+                scope_kind,
+                &target.agent_id,
+                &project_root,
+                authority_str(adopted_authority),
+                &now_str,
+                id,
+            ],
+        )
+        .map_err(MemoryError::from)?;
+
+        let after = read_scoped_memory_inner(conn, target, id)?;
+        engine::write_memory_event(
+            conn,
+            Some(id),
+            "adopt_legacy",
+            "memory_scoped",
+            Some(serde_json::to_value(&before).unwrap_or(JsonValue::Null)),
+            Some(serde_json::to_value(&after).unwrap_or(JsonValue::Null)),
+            "Explicit legacy memory adoption",
+            1.0,
+            None,
+        )
+        .map_err(MemoryError::storage_unavailable)?;
+        Ok(after)
+    })?;
+
+    let store_revision = memory_store_revision(conn)?;
+    Ok(MutationResult {
+        memory: adopted,
+        store_revision,
+        changed: true,
+    })
+}
+
+
 
 #[allow(clippy::too_many_arguments)]
 pub fn update_scoped_memory(

@@ -1,5 +1,13 @@
 use crate::db::AppDb;
+use crate::jarvis::memory::contracts::{
+    AuthorityKind, MemoryDraft, MemoryError, MemoryProvenance, MemoryScope, MutationResult,
+    RecallOptions, RecallPreview, ScopeSelector, ScopedMemoryEntry,
+};
 use crate::jarvis::memory::engine::{self, MemoryEntry, MemoryEvent, MemoryRecall, MemoryRun};
+use crate::jarvis::memory::{scope, scoped};
+use chrono::{DateTime, Utc};
+use rusqlite::Connection;
+use serde::Deserialize;
 use tauri::State;
 
 #[tauri::command]
@@ -203,4 +211,289 @@ pub fn list_workspace_files(path: String) -> Result<Vec<String>, String> {
 pub fn read_workspace_file(path: String) -> Result<String, String> {
     let expanded = expand_path_safe(&path)?;
     std::fs::read_to_string(&expanded).map_err(|e| format!("Failed to read workspace file: {}", e))
+}
+
+// ── Scoped memory commands (Phase 1 native surface) ─────────────────────────
+//
+// Ownership is always resolved from the persisted Session: the request DTO
+// carries no Agent/project/provenance authority. Manual commands construct
+// manual authority themselves and never fabricate verification.
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct BindSessionWorkspaceRequest {
+    pub session_id: String,
+    pub workspace_root: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ScopedSaveRequest {
+    pub session_id: String,
+    pub selector: ScopeSelector,
+    pub draft: MemoryDraft,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ScopedReadRequest {
+    pub session_id: String,
+    pub selector: ScopeSelector,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ScopedListRequest {
+    pub session_id: String,
+    pub selector: ScopeSelector,
+    #[serde(default)]
+    pub include_inactive: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ScopedUpdateRequest {
+    pub session_id: String,
+    pub selector: ScopeSelector,
+    pub id: String,
+    pub expected_revision: i64,
+    pub draft: MemoryDraft,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ScopedDeleteRequest {
+    pub session_id: String,
+    pub selector: ScopeSelector,
+    pub id: String,
+    pub expected_revision: i64,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ScopedRestoreRequest {
+    pub session_id: String,
+    pub selector: ScopeSelector,
+    pub id: String,
+    pub expected_revision: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ScopedRecallPreviewRequest {
+    pub session_id: String,
+    pub query: String,
+    #[serde(default)]
+    pub options: RecallOptions,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct AdoptLegacyRequest {
+    pub session_id: String,
+    pub selector: ScopeSelector,
+    pub id: String,
+    pub expected_revision: i64,
+}
+
+fn manual_provenance(session_id: &str) -> MemoryProvenance {
+    MemoryProvenance {
+        authority_kind: AuthorityKind::Manual,
+        source: "manual".to_string(),
+        source_session_id: Some(session_id.to_string()),
+        source_message_ids: Vec::new(),
+        source_run_id: None,
+        verified_at: None,
+    }
+}
+
+pub fn execute_bind_session_workspace(
+    conn: &Connection,
+    request: BindSessionWorkspaceRequest,
+) -> Result<MemoryScope, MemoryError> {
+    scope::bind_session_workspace(conn, &request.session_id, request.workspace_root.as_deref())
+}
+
+pub fn execute_scoped_save(
+    conn: &Connection,
+    request: ScopedSaveRequest,
+    now: DateTime<Utc>,
+) -> Result<MutationResult, MemoryError> {
+    let write_scope =
+        scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
+    let provenance = manual_provenance(&request.session_id);
+    scoped::save_scoped_memory(conn, &write_scope, request.draft, &provenance, now)
+}
+
+pub fn execute_scoped_read(
+    conn: &Connection,
+    request: ScopedReadRequest,
+) -> Result<ScopedMemoryEntry, MemoryError> {
+    let read_scope =
+        scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
+    scoped::read_scoped_memory(conn, &read_scope, &request.id)
+}
+
+pub fn execute_scoped_list(
+    conn: &Connection,
+    request: ScopedListRequest,
+) -> Result<Vec<ScopedMemoryEntry>, MemoryError> {
+    let read_scope =
+        scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
+    scoped::list_scoped_memories(conn, &read_scope, request.include_inactive)
+}
+
+pub fn execute_scoped_update(
+    conn: &Connection,
+    request: ScopedUpdateRequest,
+    now: DateTime<Utc>,
+) -> Result<MutationResult, MemoryError> {
+    let write_scope =
+        scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
+    let provenance = manual_provenance(&request.session_id);
+    scoped::update_scoped_memory(
+        conn,
+        &write_scope,
+        &request.id,
+        request.expected_revision,
+        request.draft,
+        &provenance,
+        now,
+    )
+}
+
+pub fn execute_scoped_delete(
+    conn: &Connection,
+    request: ScopedDeleteRequest,
+    now: DateTime<Utc>,
+) -> Result<MutationResult, MemoryError> {
+    let write_scope =
+        scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
+    scoped::tombstone_scoped_memory(
+        conn,
+        &write_scope,
+        &request.id,
+        request.expected_revision,
+        &request.reason,
+        now,
+    )
+}
+
+pub fn execute_scoped_restore(
+    conn: &Connection,
+    request: ScopedRestoreRequest,
+    now: DateTime<Utc>,
+) -> Result<MutationResult, MemoryError> {
+    let write_scope =
+        scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
+    scoped::restore_scoped_memory(
+        conn,
+        &write_scope,
+        &request.id,
+        request.expected_revision,
+        now,
+    )
+}
+
+pub fn execute_scoped_recall_preview(
+    conn: &Connection,
+    request: ScopedRecallPreviewRequest,
+    now: DateTime<Utc>,
+) -> Result<RecallPreview, MemoryError> {
+    let read_scope = scope::resolve_session_memory_scope(conn, &request.session_id)?;
+    scoped::recall_scoped_memories(conn, &read_scope, &request.query, &request.options, now)
+}
+
+pub fn execute_adopt_legacy(
+    conn: &Connection,
+    request: AdoptLegacyRequest,
+    now: DateTime<Utc>,
+) -> Result<MutationResult, MemoryError> {
+    let target_scope =
+        scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
+    scoped::adopt_legacy_memory(conn, &request.id, request.expected_revision, &target_scope, now)
+}
+
+#[tauri::command]
+pub fn memory_bind_session_workspace(
+    db: State<AppDb>,
+    request: BindSessionWorkspaceRequest,
+) -> Result<MemoryScope, MemoryError> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    execute_bind_session_workspace(&conn, request)
+}
+
+#[tauri::command]
+pub fn memory_scoped_save(
+    db: State<AppDb>,
+    request: ScopedSaveRequest,
+) -> Result<MutationResult, MemoryError> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    execute_scoped_save(&conn, request, Utc::now())
+}
+
+#[tauri::command]
+pub fn memory_scoped_read(
+    db: State<AppDb>,
+    request: ScopedReadRequest,
+) -> Result<ScopedMemoryEntry, MemoryError> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    execute_scoped_read(&conn, request)
+}
+
+#[tauri::command]
+pub fn memory_scoped_list(
+    db: State<AppDb>,
+    request: ScopedListRequest,
+) -> Result<Vec<ScopedMemoryEntry>, MemoryError> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    execute_scoped_list(&conn, request)
+}
+
+#[tauri::command]
+pub fn memory_scoped_update(
+    db: State<AppDb>,
+    request: ScopedUpdateRequest,
+) -> Result<MutationResult, MemoryError> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    execute_scoped_update(&conn, request, Utc::now())
+}
+
+#[tauri::command]
+pub fn memory_scoped_delete(
+    db: State<AppDb>,
+    request: ScopedDeleteRequest,
+) -> Result<MutationResult, MemoryError> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    execute_scoped_delete(&conn, request, Utc::now())
+}
+
+#[tauri::command]
+pub fn memory_scoped_restore(
+    db: State<AppDb>,
+    request: ScopedRestoreRequest,
+) -> Result<MutationResult, MemoryError> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    execute_scoped_restore(&conn, request, Utc::now())
+}
+
+#[tauri::command]
+pub fn memory_scoped_recall_preview(
+    db: State<AppDb>,
+    request: ScopedRecallPreviewRequest,
+) -> Result<RecallPreview, MemoryError> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    execute_scoped_recall_preview(&conn, request, Utc::now())
+}
+
+#[tauri::command]
+pub fn memory_adopt_legacy(
+    db: State<AppDb>,
+    request: AdoptLegacyRequest,
+) -> Result<MutationResult, MemoryError> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    execute_adopt_legacy(&conn, request, Utc::now())
 }
