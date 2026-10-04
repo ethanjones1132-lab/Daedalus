@@ -83,7 +83,11 @@ import {
   type MemoryRecallStatus,
   type MemoryTurnDiagnosticView,
 } from './memory-turn-state';
-import { clearRelayMemoryTurn, isRegisteredRelayMemoryTurn } from './relay-memory-correlation';
+import {
+  activeRelayMemoryTurn,
+  clearRelayMemoryTurn,
+  isRegisteredRelayMemoryTurn,
+} from './relay-memory-correlation';
 import { formatSessionStatsLine, shouldShowSessionStats } from './session-stats';
 import { filterSessions, formatFilterResultCount } from './session-filter';
 import {
@@ -1195,9 +1199,13 @@ export function ChatPanel({
     // A relay terminal event that carries a `turn_id` is memory-correlated and
     // must match the exact registered relay submission; otherwise a late
     // done/error from an old relay turn could finalize a newer direct turn.
-    // Legacy events without a `turn_id` keep their existing behavior.
+    // Legacy events without a `turn_id` are accepted only while no direct
+    // submission and no registered relay turn owns the Session, so they can
+    // never overwrite an active turn; idle legacy behavior is preserved.
     const relayTerminalIsCorrelated = (sessionId: unknown, turnId: unknown): boolean => {
-      if (turnId === undefined || turnId === null) return true;
+      if (turnId === undefined || turnId === null) {
+        return activeRelayMemoryTurn() === null && streamAbortRef.current === null;
+      }
       return isRegisteredRelayMemoryTurn(sessionId, turnId);
     };
 

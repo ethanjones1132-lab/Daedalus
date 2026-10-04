@@ -12,7 +12,8 @@
 - **Branch:** `codex/memory-deepseek-20261004`
 - **Phase 2.4 source commit:** `7de87c7` — `feat: prepare native recall on both Session transports`.
 - **Phase 2.4 root-review corrective commit:** `f14b275` — `fix: harden phase 2.4 persistence, finalization ordering, and relay diagnostics` (see "Root-review corrective pass").
-- **Phase 2.4 second root-review corrective commit:** `ad933bc` — `fix: bound phase 2.4 finalization, submission, and relay correlation` (see "Third root-review corrective pass"). This ledger update is a follow-up docs commit.
+- **Phase 2.4 second root-review corrective commit:** `ad933bc` — `fix: bound phase 2.4 finalization, submission, and relay correlation` (see "Third root-review corrective pass").
+- **Phase 2.4 relay-adapter corrective commit:** see the concrete commit recorded with this ledger pass (executable `submitRelayMemoryTurn` adapter + legacy-direct terminal guard; see "Fourth narrow corrective pass").
 
 ## Execution environment
 
@@ -249,20 +250,30 @@ gaps. All were corrected in source with no tests/runtime execution.
    the bounded wait cannot repaint another Session. The read-loop and outer
    finalies keep the same guard (run dispatch/persist and
    `finalizeAssistantMessage` remain `requestIsCurrent`-gated).
-3. **Relay correlation is explicit, not first-seen.** A new
-   `src-ui/.../relay-memory-correlation.ts` is the concrete seam: the relay
-   invoker calls `registerRelayMemoryTurn(sessionId, turnId)` **before** invoking
-   `jarvis_send_message` with the same caller-supplied `turn_id` (now an additive
-   optional native parameter; Native still prepares against its own saved row and
-   never trusts it as authority). Relay memory events are accepted only when
+3. **Relay correlation is explicit, not first-seen, with an executable
+   adapter.** `src-ui/.../relay-memory-correlation.ts` exports
+   `submitRelayMemoryTurn(sessionId, message)` — the production
+   register-before-invoke adapter. In one call it: mints a UUID; rejects a
+   blank Session; registers the exact `{sessionId, turnId}` **before**
+   invoking native `jarvis_send_message` with that same `turn_id`; on invocation
+   failure clears ONLY its own still-current registration (a newer registration
+   is left intact) and rethrows; and returns the `{sessionId, turnId}` tuple to
+   the caller. The native `jarvis_send_message` accepts the caller-supplied
+   `turn_id` as an additive optional parameter but still prepares the turn
+   against its own persisted row and never trusts a client id as memory
+   authority; native caller compatibility and the direct-SSE default are
+   preserved (the adapter is an opt-in relay submission helper, not a transport
+   chooser). Relay memory events are accepted only when
    `isRegisteredRelayMemoryTurn(sessionId, turnId)` matches exactly; registration
-   is replaced on a new register and cleared on every direct submission and
-   Session change, so a delayed older relay event cannot bind or overwrite a
-   newer submission. Unregistered/legacy events are rejected conservatively.
-   Terminal relay listeners (`jarvis://done`, `jarvis://error`,
-   `jarvis://cancelled`) also require the registered correlation when the event
-   carries a `turn_id`, so an old relay terminal cannot finalize a newer direct
-   turn; events without a `turn_id` keep the existing behavior.
+   is replaced on each submit and cleared on every direct submission and Session
+   change, so a delayed older relay event cannot bind or overwrite a newer
+   submission. Unregistered/legacy relay memory events are rejected
+   conservatively. Terminal relay listeners (`jarvis://done`, `jarvis://error`,
+   `jarvis://cancelled`) with a `turn_id` require the exact registered
+   correlation; a legacy terminal event with **no** `turn_id` is accepted only
+   while neither a registered relay turn nor an active direct submission
+   (`streamAbortRef.current !== null`) owns the Session, so it can never
+   overwrite an active direct turn, and idle legacy behavior is preserved.
 4. **Relay warning codes are visible and owner-scoped.** The relay
    `jarvis://memory-status` listener now maps `history_unavailable` to the
    history warning and `memory_finalization_failed` / `memory_finalization_pending`
@@ -275,6 +286,27 @@ gaps. All were corrected in source with no tests/runtime execution.
    still `registered`/`started`/`unterminated` is labelled as that actual
    nonterminal state rather than implied finished. The per-turn opt-in is still
    snapshotted then reset to the Session default (false).
+
+## Fourth narrow corrective pass (relay adapter)
+
+A final root review noted that `relay-memory-correlation.ts` previously
+exported a raw `registerRelayMemoryTurn` with no production caller, so the
+"register before invoking" contract was only documented, not executable.
+
+- **Executable adapter.** Added `submitRelayMemoryTurn(sessionId, message)`: it
+  mints `crypto.randomUUID()`, rejects a blank Session, registers the exact
+  `{sessionId, turnId}` before invoking native `jarvis_send_message` (both
+  `turnId` and `turn_id` spelling), and returns the tuple. On invocation failure
+  it clears only its own still-current registration and rethrows. Callers no
+  longer have to manually sequence two unrelated APIs. Native and direct-SSE
+  behavior are unchanged.
+- **Legacy terminal cannot clobber an active direct turn.**
+  `relayTerminalIsCorrelated` now accepts a legacy terminal event with no
+  `turn_id` only while `activeRelayMemoryTurn() === null` **and**
+  `streamAbortRef.current === null` (no in-flight direct submission). A
+  correlated event with a `turn_id` still requires the exact registration. The
+  new native emitter always includes `turn_id`, so this is a conservative
+  safety net for legacy/idle events only.
 
 ## Frozen-interface compliance
 
@@ -305,10 +337,11 @@ tool's `workdir` argument (no `cd`, no pipes/`tail`, no chained directories):
 | `git diff --check` (workdir repo root) | **PASS** — no whitespace errors |
 
 The same five commands were re-run after the second and third corrective passes
-and all **PASS**. The `src-ui` native build artifacts
-(`lightningcss-darwin-arm64`, `@tailwindcss/oxide-darwin-arm64`) were restored
-from the existing locked install immediately before the build because iCloud had
-re-offloaded them; no dependency, lockfile, or manifest changed.
+and again after the relay-adapter pass, and all **PASS**. The `src-ui` native
+build artifacts (`lightningcss-darwin-arm64`,
+`@tailwindcss/oxide-darwin-arm64`) were restored from the existing locked
+install immediately before the build because iCloud had re-offloaded them; no
+dependency, lockfile, or manifest changed.
 
 No `cargo test`, `bun test`, ephemeral SQL script, or live inference/transport
 experiment was run. `server-jarvis` source was not changed in 2.4; its

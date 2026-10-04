@@ -7,16 +7,18 @@
 // the event's exact `{session_id, turn_id}` was registered by the owning
 // submission BEFORE it invoked the relay.
 //
-// This module is the concrete correlation seam: the relay invoker calls
-// `registerRelayMemoryTurn(sessionId, turnId)` before invoking
-// `jarvis_send_message` with that same `turn_id`; the UI calls
-// `isRegisteredRelayMemoryTurn(event.session_id, event.turn_id)` before
-// accepting any relay memory metadata. Registering a new turn replaces the
-// previous one, and `clearRelayMemoryTurn()` is called on every new submission
-// and Session change, so a delayed older event can never bind a newer turn.
+// `submitRelayMemoryTurn` is the executable register-before-invoke adapter:
+// it mints a UUID, registers the exact nonempty Session/turn, then invokes the
+// native `jarvis_send_message` with that same `turn_id`. Callers no longer have
+// to manually sequence two unrelated APIs. On invocation failure it clears ONLY
+// its own still-current registration (a newer registration is left intact) and
+// rethrows. The native relay still prepares the turn against its own persisted
+// row; a caller-supplied turn id is never trusted as memory authority.
 //
-// Native still prepares the turn against its own saved row; a client-supplied
-// turn id is never trusted as memory authority.
+// The direct SSE transport remains the UI default; this adapter is a narrow,
+// opt-in relay submission helper and is not a transport chooser.
+
+import { invoke } from '@tauri-apps/api/core';
 
 export interface RelayMemoryRegistration {
   sessionId: string;
@@ -45,4 +47,40 @@ export function isRegisteredRelayMemoryTurn(sessionId: unknown, turnId: unknown)
 
 export function activeRelayMemoryTurn(): RelayMemoryRegistration | null {
   return activeRegistration;
+}
+
+/**
+ * Submit one memory-correlated relay turn. Mints a stable turn id, registers
+ * the exact nonempty `{sessionId, turnId}` correlation BEFORE invoking the
+ * native relay with that id, and returns the tuple so the caller can display
+ * or clear it. A rejected invocation clears only this submission's still-current
+ * registration (never a newer one) and rethrows.
+ */
+export async function submitRelayMemoryTurn(
+  sessionId: string,
+  message: string,
+): Promise<RelayMemoryRegistration> {
+  if (typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+    throw new Error('A persisted Session is required for a relay memory turn.');
+  }
+  const turnId = crypto.randomUUID();
+  registerRelayMemoryTurn(sessionId, turnId);
+  try {
+    // Both spellings are sent for compatibility with the existing native
+    // command argument conventions (see `sessionInvokeArgs`).
+    await invoke('jarvis_send_message', {
+      sessionId,
+      session_id: sessionId,
+      message,
+      turnId,
+      turn_id: turnId,
+    });
+  } catch (error) {
+    const current = activeRegistration;
+    if (current && current.sessionId === sessionId && current.turnId === turnId) {
+      clearRelayMemoryTurn();
+    }
+    throw error;
+  }
+  return { sessionId, turnId };
 }
