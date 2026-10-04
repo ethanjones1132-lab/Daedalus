@@ -111,8 +111,8 @@ pub struct MemoryWrite {
 }
 
 #[derive(Debug, Clone)]
-struct SafetyBlock {
-    reason: String,
+pub(crate) struct SafetyBlock {
+    pub(crate) reason: String,
 }
 
 pub fn list_memories(conn: &Connection) -> Result<Vec<MemoryEntry>, String> {
@@ -1281,7 +1281,7 @@ fn finish_run(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_memory_event(
+pub(crate) fn write_memory_event(
     conn: &Connection,
     memory_id: Option<&str>,
     event_type: &str,
@@ -1439,7 +1439,7 @@ fn active_prompt_deltas(conn: &Connection) -> Result<Vec<String>, String> {
     Ok(collected)
 }
 
-fn validate_memory_payload(title: &str, content: &str, category: &str) -> Result<(), SafetyBlock> {
+pub(crate) fn validate_memory_payload(title: &str, content: &str, category: &str) -> Result<(), SafetyBlock> {
     let allowed = ["general", "user", "feedback", "project", "reference"];
     if !allowed.contains(&category) {
         return Err(SafetyBlock {
@@ -1494,7 +1494,7 @@ fn validate_skill_change(change: &str) -> Result<(), SafetyBlock> {
     validate_memory_payload("skill improvement", change, "feedback")
 }
 
-fn score_memory(memory: &MemoryEntry, terms: &[String]) -> (f64, Vec<String>) {
+pub(crate) fn score_memory(memory: &MemoryEntry, terms: &[String]) -> (f64, Vec<String>) {
     // Fast path: score fields separately, short-circuit on title match
     let title_lower = memory.title.to_lowercase();
     let tags_lower = memory.tags.to_lowercase();
@@ -1744,7 +1744,7 @@ fn title_from_content(content: &str) -> String {
     title
 }
 
-fn query_terms(query: &str) -> Vec<String> {
+pub(crate) fn query_terms(query: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     query
         .split(|c: char| !c.is_ascii_alphanumeric())
@@ -1755,7 +1755,7 @@ fn query_terms(query: &str) -> Vec<String> {
         .collect()
 }
 
-fn fts_expr(query: &str) -> Option<String> {
+pub(crate) fn fts_expr(query: &str) -> Option<String> {
     let terms = query_terms(query);
     if terms.is_empty() {
         None
@@ -1827,14 +1827,14 @@ fn now() -> String {
     Utc::now().to_rfc3339()
 }
 
-fn memory_columns() -> &'static str {
+pub(crate) fn memory_columns() -> &'static str {
     "id, title, content, tags, category, created_at, updated_at, relevance_score,
      agent_id, source, source_session_id, source_message_ids, confidence, last_used_at,
      usage_count, expires_at, review_after, status, supersedes_id, metadata,
      tier, drive_file_id, summary, archived_at, updated_at_ms"
 }
 
-fn prefixed_memory_columns(prefix: &str) -> String {
+pub(crate) fn prefixed_memory_columns(prefix: &str) -> String {
     memory_columns()
         .split(',')
         .map(|col| format!("{}.{}", prefix, col.trim()))
@@ -1842,7 +1842,7 @@ fn prefixed_memory_columns(prefix: &str) -> String {
         .join(", ")
 }
 
-fn memory_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
+pub(crate) fn memory_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
     Ok(MemoryEntry {
         id: row.get(0)?,
         title: row.get(1)?,
