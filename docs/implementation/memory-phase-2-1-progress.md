@@ -10,6 +10,7 @@
 - **Execution baseline:** `dfe39904b8d7fa3ed731e5342e7e80437a6a3b40`
 - **Branch:** `codex/memory-deepseek-20261004`
 - **Source commit:** `083a9d0` — `feat: record native memory turn identity and bounded context`
+- **Root-review corrective commit:** `5712036` — `fix: align bounded turn text, public reference eligibility, and history boundary`
 
 ## Execution environment
 
@@ -31,11 +32,37 @@ UI, inference, or mutation interception was added (those are Phase 2.2+).
 
 | Task | Status | Source |
 |---|---|---|
-| 1. Prepared turn DTOs and bounded rendering | Implemented (source) | `083a9d0` |
-| 2. Durable preparation schema + immutable source binding | Implemented (source) | `083a9d0` |
-| 3. Native history and diagnostic read helpers | Implemented (source) | `083a9d0` |
-| 4. Stable preparation contracts handed to 2.2 | Implemented (source) | `083a9d0` |
+| 1. Prepared turn DTOs and bounded rendering | Implemented (source) | `083a9d0`, corrected `5712036` |
+| 2. Durable preparation schema + immutable source binding | Implemented (source) | `083a9d0`, corrected `5712036` |
+| 3. Native history and diagnostic read helpers | Implemented (source) | `083a9d0`, corrected `5712036` |
+| 4. Stable preparation contracts handed to 2.2 | Implemented (source) | `083a9d0`, corrected `5712036` |
 | 5. Scoped source checkpoint ledger | This document | pending commit |
+
+## Root-review corrective pass (`5712036`)
+
+The refreshed Luna 2.1 plan and an external root review identified four
+concrete gaps in the initial source. All four were fixed in this phase with no
+frozen signature change, no tests, and no runtime experiments:
+
+1. **Unbounded item text.** `build_prepared_memory_items` now builds each
+   item's labelled text once and bounds it to 600 Unicode scalar values;
+   `render_memory_block` JSON-escapes that text without adding labels a second
+   time. Envelope `selected`, persisted `selected_json`, and the block are
+   aligned to exactly the whole retained items; all-dropped yields an empty
+   block and empty selection.
+2. **Over-exposed public reference.** `preparation_from_turn` now returns a
+   non-null `preparation_id` only for a currently `registered`, `ready`/`empty`,
+   unexpired turn; retrieval/registration failures, expired/consumed work, and
+   merely `prepared` rows return null. Replay evaluates the 120-second TTL
+   read-only and reports `expired` without mutating durable identity.
+3. **History rowid-only boundary.** `history_for_memory_turn` now uses the
+   source row's `(created_at, rowid)` lexicographic tuple as a strict cutoff
+   within the Session, so later-timestamp rows with smaller rowids cannot leak.
+4. **Discarded retrieval failure.** `prepare_memory_turn_record` now persists
+   `state=unavailable`, `recall_status=retrieval_failed`, and the typed
+   `error_code`; no live public reference is produced and Phase 2.2 must skip
+   network registration for that turn. Registration helpers re-read the fresh
+   row and never overwrite a prior retrieval/registration failure.
 
 ## Files changed
 
@@ -80,27 +107,46 @@ UI, inference, or mutation interception was added (those are Phase 2.2+).
 - Replay compares Session, source-message ID, exact message bytes, opt-in,
   resolved scope, and app instance; mismatch is `turn_conflict` and never
   mutates the original row. Exact replay returns `Existing` without re-recall,
-  rebinding, selection change, or ID replacement.
+  rebinding, selection change, or ID replacement. Replay also evaluates the
+  120-second TTL read-only and reports `expired` without mutating identity,
+  timestamps, or selection.
+- **Public reference eligibility (corrective fix 2).** The durable opaque
+  `preparation_id` always stays stored, but the public
+  `MemoryTurnPreparation.preparation_id` is non-null only when the turn is
+  currently `registered` with a `ready`/`empty` status and not expired. Failed
+  retrieval, registration failure, expired/consumed/started/terminal work, and
+  work not yet registered all report `None`. An exact replay of a merely
+  `prepared` row therefore hands back status only and never implies
+  registration.
+- **Bounded item text (corrective fix 1).** `build_prepared_memory_items`
+  bakes the compact `id/revision/stale/authority/title` label and excerpt into
+  `PreparedMemoryItem.text` exactly once, truncated to `MAX_ITEM_SCALARS`
+  (600). `render_memory_block` JSON-string-escapes that text without adding
+  labels again. The envelope `selected`, the persisted `selected_json`, and the
+  final block are all aligned to the same whole retained items; the total
+  escaped frame is capped at 4,000, and if no item fits the block is empty and
+  no selection is persisted.
 - TTL is exactly 120 seconds (`now + 120s`, RFC3339 UTC). Project effective
   workspace is the canonical project root; Agent scope is `None`.
 
 ## Interface rulings (recorded)
 
-1. **Title label.** The parent plan mentions "ID/revision/stale/title labels",
-   but the frozen `PreparedMemoryItem` has only `selection` + `text` and
-   `PreparedMemorySelection` has no title field. To avoid inventing a competing
-   interface, the excerpt is built as `"<title>: <content>"` (warm tier:
-   `"<title>: <summary>"`) in `build_prepared_memory_items`, while
-   `render_memory_block` adds compact `id/revision/stale/authority` labels from
-   the frozen selection. This preserves the title data without extending the
-   frozen DTO.
-2. **Retrieval failure.** `recall_scoped_memories` errors are caught inside the
-   preparation transaction and persisted with `recall_status=retrieval_failed`
-   and an empty selection/block so the turn remains diagnosable and ordinary
-   inference stays possible. It is not reported as a prepared/ready turn.
+1. **Title label.** The frozen `PreparedMemoryItem` has only `selection` +
+   `text` and `PreparedMemorySelection` has no title field, so the title is
+   carried inside the bounded labelled `text` as
+   `id=<id> revision=<rev> stale=<bool> authority=<kind> title=<title> :: <body>`
+   (warm-tier body is the local summary). This keeps the title data without
+   extending the frozen DTO and without double-labelling in framing.
+2. **Retrieval failure (corrective fix 4).** `recall_scoped_memories` errors are
+   caught inside the preparation transaction and persisted with
+   `state=unavailable`, `recall_status=retrieval_failed`, and the typed
+   `error_code` retained. No public reference is produced (`preparation_id`
+   null) and ordinary inference stays possible. Phase 2.2 must skip network
+   registration for this turn; registration transition helpers refuse to
+   advance a non-`prepared` row so the original failure is never overwritten.
 3. **Budget omission.** When entries existed but no item fits the 4,000-scalar
-   framed block, `recall_status=budget_omitted` and the block is empty; the
-   selection metadata is still persisted.
+   framed block, `recall_status=budget_omitted`, the block is empty, and the
+   persisted selection is empty so selection stays aligned to the block.
 4. **Library-only scope.** No `commands/memory_turn.rs`, no `invoke_handler`
    registration, no transport/registry, no UI, and no mutation gate were added.
    These remain Phase 2.2/2.3/2.4 deliverables.
@@ -111,26 +157,34 @@ UI, inference, or mutation interception was added (those are Phase 2.2+).
    must exist in the requesting Session with role `user`, else `invalid_turn`
    before any row is written. Cross-session/missing/assistant IDs cannot yield
    a preparation.
-2. `prepared_memory_block_uses_unicode_scalar_limits` (future): per-item
-   escaped JSON element is bounded to 600 Unicode scalar values; the whole
-   escaped frame to 4,000; truncation uses `chars()` (no byte splitting);
-   framing is never truncated.
+2. `prepared_memory_block_uses_unicode_scalar_limits` (future): each
+   `PreparedMemoryItem.text` is bounded to 600 Unicode scalar values and is the
+   exact labelled string used in the block; the whole escaped frame is bounded
+   to 4,000; truncation uses `chars()` (no byte splitting); framing is never
+   truncated.
 3. `prepared_items_preserve_only_recall_preview_selection` (future): items come
    from the already-ranked, Phase 1-eligibility-filtered `RecallPreview.entries`
-   in order, capped at five; warm-tier rows use the local summary.
+   in order, capped at five; warm-tier rows use the local summary; envelope and
+   persisted selection contain only the whole items retained in the block.
 4. `memory_turn_identity_conflict_is_atomic` (future): replay mismatch returns
-   `turn_conflict` and performs no UPDATE on the original row.
-5. `memory_turn_history_excludes_current_and_later_rows` (future): history is
-   `created_at,rowid`-ordered and bounded strictly before the source `rowid`.
+   `turn_conflict` and performs no UPDATE on the original row; replay evaluation
+   itself never mutates identity/timestamps/selection.
+5. `memory_turn_history_excludes_current_and_later_rows` (future): history uses
+   the source row's `(created_at,rowid)` as a strict lexicographic cutoff
+   (`created_at < source OR (created_at = source AND rowid < source)`), so a
+   later-in-timestamp row with a smaller rowid cannot leak.
 
 ## Exact source commands run
 
 | Command | Result |
 |---|---|
 | `cargo check --manifest-path src-tauri/Cargo.toml` (baseline, pre-change) | **PASS** — 2 pre-existing warnings only |
-| `cargo check --manifest-path src-tauri/Cargo.toml` (post-change) | **PASS** — same 2 pre-existing warnings (`supervisor.rs` deprecated `fetch_update`, `wsl.rs` unused `shlex_join`); `sha2` 0.10.9 compiled |
-| `(cd server-jarvis && bun run typecheck)` | **PASS** — `tsc --noEmit`, exit 0 |
-| `git diff --check` | **PASS** — no whitespace errors |
+| `cargo check --manifest-path src-tauri/Cargo.toml` (initial post-change) | **PASS** — same 2 pre-existing warnings (`supervisor.rs` deprecated `fetch_update`, `wsl.rs` unused `shlex_join`); `sha2` 0.10.9 compiled |
+| `(cd server-jarvis && bun run typecheck)` (initial) | **PASS** — `tsc --noEmit`, exit 0 |
+| `git diff --check` (initial) | **PASS** — no whitespace errors |
+| `cargo check --manifest-path src-tauri/Cargo.toml` (after corrective `5712036`) | **PASS** — same 2 pre-existing warnings only |
+| `(cd server-jarvis && bun run typecheck)` (after corrective `5712036`) | **PASS** — `tsc --noEmit`, exit 0 |
+| `git diff --check` (after corrective `5712036`) | **PASS** — no whitespace errors |
 
 No `cargo test`, `bun test`, ephemeral SQL, or runtime/live experiment was run.
 
@@ -162,8 +216,11 @@ above are future proposals from the plan, not current evidence.
   closed rather than overwrite identity, but this is not raced in a test here.
 - **Downstream.** Phase 2.2 must read `recall_status` back (e.g. via
   `read_memory_turn`) after a `New` outcome, because the frozen `New { envelope }`
-  variant intentionally carries no status. No process capability, registration,
-  sync, or invalidation exists yet; ordinary inference is unaffected.
+  variant intentionally carries no status. For a `New` row persisted with
+  `state=unavailable` / `recall_status=retrieval_failed`, Phase 2.2 must skip
+  network registration and return the typed retrieval failure; it must not
+  register the empty envelope. No process capability, registration, sync, or
+  invalidation exists yet; ordinary inference is unaffected.
 - **Phase 1 warning.** `authority_str` was already `pub(crate)` in `scoped.rs`;
   no Phase 1 file semantics changed.
 
