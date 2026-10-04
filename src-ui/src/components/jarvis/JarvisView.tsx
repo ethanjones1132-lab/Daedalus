@@ -73,6 +73,14 @@ import {
   type StreamTerminalFrame,
   type StreamTerminalOutcome,
 } from './stream-lifecycle';
+import {
+  decodeMemoryStatusFrame,
+  decodeMemoryTurnDiagnostic,
+  decodeMemoryTurnPreparation,
+  formatMemoryTurnLabel,
+  type MemoryRecallStatus,
+  type MemoryTurnDiagnosticView,
+} from './memory-turn-state';
 import { formatSessionStatsLine, shouldShowSessionStats } from './session-stats';
 import { filterSessions, formatFilterResultCount } from './session-filter';
 import {
@@ -667,6 +675,21 @@ export function ChatPanel({
   const resetActivityLedger = useCallback(() => {
     setActivityLedger(createActivityLedger());
   }, []);
+
+  // Phase 2.4 — per-turn native memory diagnostics. The transient status comes
+  // from `memory_status`/`memory_applied` SSE frames; the native diagnostic
+  // read-back after terminal sync is the authority. No recalled text or
+  // capability ever reaches the UI.
+  const [memoryLiveStatus, setMemoryLiveStatus] = useState<MemoryRecallStatus | null>(null);
+  const [memoryDiagnostic, setMemoryDiagnostic] = useState<MemoryTurnDiagnosticView | null>(null);
+  const [memoryHistoryWarning, setMemoryHistoryWarning] = useState<string | null>(null);
+  // Explicit per-turn user-wide opt-in. Default false; cleared whenever the
+  // selected Session (and therefore Agent scope) changes so it can never carry
+  // silently into a different Session/Agent.
+  const [includeUserScope, setIncludeUserScope] = useState(false);
+  useEffect(() => {
+    setIncludeUserScope(false);
+  }, [activeSession]);
 
   // Phase 3.3 — token / cost tally for the current turn.
   const [turnCost, setTurnCost] = useState<{ tokens: number; costUsd: number } | null>(null);
@@ -1350,10 +1373,10 @@ export function ChatPanel({
   const streamFromJarvisApi = useCallback(async (
     sid: string,
     userMsg: string,
-    history: Array<{ role: string; content: string }>,
     sendGeneration: number,
     onAccepted: () => void,
     clientMessageId: string,
+    includeUserScope: boolean,
   ) => {
     streamAbortRef.current?.abort();
     const controller = new AbortController();
@@ -1365,24 +1388,93 @@ export function ChatPanel({
       && streamAbortRef.current === controller
     );
 
-    // `append_message` returns the DB row id (sessions.rs `insert_message_row`).
-    // Swap the client-generated id for the persisted one so a later
-    // history-reload (which maps DB row ids into JarvisMessage.id) recognizes
-    // this as the SAME message instance and dedupes it, instead of showing it
-    // twice — the 2026-07-03 incident 1d4727cf "two YOU bubbles" bug.
-    invoke<string>('append_message', {
-      ...sessionInvokeArgs(sid),
-      role: 'user',
-      content: userMsg,
-    }).then((dbId) => {
-      if (!requestIsCurrent()) return;
-      if (typeof dbId !== 'string' || !dbId) return;
-      setMessages(prev => prev.map((m) => (m.id === clientMessageId ? { ...m, id: dbId } : m)));
-    }).catch((e: any) => {
-      if (!requestIsCurrent()) return;
-      console.error('Failed to persist user message:', e);
-      setError('Append failed: ' + (e?.message || String(e)));
-    });
+    // One stable turn identity for this submitted turn, held across every
+    // frame and the terminal native sync. It is distinct from the opaque
+    // native preparation id returned by `memory_prepare_turn`.
+    const turnId = crypto.randomUUID();
+    setMemoryLiveStatus(null);
+    setMemoryDiagnostic(null);
+    setMemoryHistoryWarning(null);
+
+    // ── 1. Persist the user row FIRST. Native preparation must reference the
+    // exact persisted row id, never the optimistic UI id. `append_message`
+    // returns the DB row id (sessions.rs `insert_message_row`); swapping the
+    // client-generated id for it lets a later history-reload dedupe this as
+    // the SAME message instance (2026-07-03 incident 1d4727cf). ─────────────
+    let userMessageId: string | null = null;
+    let appendFailure = false;
+    try {
+      const dbId = await invoke<string>('append_message', {
+        ...sessionInvokeArgs(sid),
+        role: 'user',
+        content: userMsg,
+      });
+      if (typeof dbId === 'string' && dbId) {
+        userMessageId = dbId;
+        if (requestIsCurrent()) {
+          setMessages(prev => prev.map((m) => (m.id === clientMessageId ? { ...m, id: dbId } : m)));
+        }
+      }
+    } catch (e: any) {
+      appendFailure = true;
+      if (requestIsCurrent()) {
+        console.error('Failed to persist user message:', e);
+        setError('Append failed: ' + (e?.message || String(e)));
+      }
+    }
+
+    if (!requestIsCurrent()) {
+      controller.abort('Stale Session turn');
+      throw new DOMException('Stale Session turn', 'AbortError');
+    }
+
+    // ── 2. Prepare native recall and load native prompt history. References
+    // only; no memory text crosses the webview. A failed append means no
+    // preparation and no capture. A failed preparation still runs ordinary
+    // inference with a typed status and no preparation reference. A failed
+    // history read sends empty prior history with a visible warning rather
+    // than stale UI cache. ──────────────────────────────────────────────────
+    let memoryPreparationId: string | null = null;
+    let initialMemoryStatus: MemoryRecallStatus = 'unavailable';
+    let history: Array<{ role: string; content: string }> = [];
+    if (appendFailure) {
+      initialMemoryStatus = 'unavailable';
+    } else if (userMessageId) {
+      try {
+        const prepared = decodeMemoryTurnPreparation(await invoke('memory_prepare_turn', {
+          request: {
+            session_id: sid,
+            turn_id: turnId,
+            user_message_id: userMessageId,
+            include_user_scope: includeUserScope,
+          },
+        }));
+        initialMemoryStatus = prepared.status;
+        memoryPreparationId = prepared.preparation_id;
+      } catch (e) {
+        console.warn('[Jarvis] memory preparation failed:', e);
+        initialMemoryStatus = 'registration_failed';
+        memoryPreparationId = null;
+      }
+      try {
+        const nativeHistory = await invoke<Array<{ id: string; role: string; content: string }>>(
+          'memory_turn_history',
+          { request: { session_id: sid, user_message_id: userMessageId } },
+        );
+        if (Array.isArray(nativeHistory)) {
+          history = nativeHistory.map((m) => ({ role: m.role, content: m.content }));
+        }
+      } catch (e) {
+        console.warn('[Jarvis] native memory history failed:', e);
+        history = [];
+        if (requestIsCurrent()) setMemoryHistoryWarning('Memory history unavailable for this turn.');
+      }
+    }
+
+    if (!requestIsCurrent()) {
+      controller.abort('Stale Session turn');
+      throw new DOMException('Stale Session turn', 'AbortError');
+    }
 
     const response = await fetch(`${JARVIS_API_URL}/chat/stream`, {
       method: 'POST',
@@ -1391,6 +1483,9 @@ export function ChatPanel({
         message: userMsg,
         session_id: sid,
         history,
+        turn_id: turnId,
+        memory_status: initialMemoryStatus,
+        ...(memoryPreparationId ? { memory_preparation_id: memoryPreparationId } : {}),
       }),
       signal: controller.signal,
     });
@@ -1449,6 +1544,30 @@ export function ChatPanel({
         partialOutput: runAcc.partialOutput ?? null,
       });
     };
+    // One ID-only native sync per local turn exit, attempted on success,
+    // error, cancellation, EOF and stale-Session teardown. It never rewrites
+    // the ordinary inference outcome: a bounded sync failure is logged and the
+    // model result stands. The native diagnostic read-back is the sole
+    // authority for the persisted selected/applied metadata surfaced in the UI.
+    const finalizeMemoryTurn = async () => {
+      if (!userMessageId) return;
+      try {
+        await invoke('memory_sync_turn', {
+          request: { session_id: sid, turn_id: turnId },
+        });
+      } catch (e) {
+        console.warn('[Jarvis] memory sync failed (ordinary outcome preserved):', e);
+      }
+      if (!requestIsCurrent()) return;
+      try {
+        const diagnostic = await invoke('memory_turn_diagnostic', {
+          request: { session_id: sid, turn_id: turnId },
+        });
+        if (requestIsCurrent()) setMemoryDiagnostic(decodeMemoryTurnDiagnostic(diagnostic));
+      } catch (e) {
+        console.warn('[Jarvis] memory diagnostic read-back failed:', e);
+      }
+    };
     const acceptTerminal = (next: DecodedStreamTerminal): boolean => {
       const accepted = acceptFirstTerminal(terminal, next);
       if (!accepted || accepted === terminal) return false;
@@ -1474,6 +1593,20 @@ export function ChatPanel({
     const handleFrame = (frame: any) => {
       if (!requestIsCurrent()) return;
       if (!frame || typeof frame !== 'object') return;
+      // Phase 2.4 — transient memory diagnostics. Never authority: the native
+      // diagnostic read-back after terminal sync is. Stale turn/Session frames
+      // are ignored so a late completion cannot repaint another turn.
+      if (frame.type === 'memory_status') {
+        const decoded = decodeMemoryStatusFrame(frame);
+        if (!decoded || decoded.turn_id !== turnId) return;
+        setMemoryLiveStatus(decoded.status);
+        return;
+      }
+      if (frame.type === 'memory_applied') {
+        // Metadata only. Applied IDs shown to the operator come from the
+        // native diagnostic, never from an unsigned SSE frame.
+        return;
+      }
       if (frame.type === 'stream_event' && frame.delta?.text) {
         const text = String(frame.delta.text);
         streamedRawText += text;
@@ -1834,6 +1967,9 @@ export function ChatPanel({
         }
       }
       persistTerminalRun();
+      // Phase 2.4 — finalize the native turn before the local turn closes.
+      // Attempted on every exit path, including abort/EOF/error.
+      await finalizeMemoryTurn();
     }
     if (inactivityTimedOut) {
       throw new Error(`Jarvis stream was inactive for ${STREAM_INACTIVITY_TIMEOUT_MS / 1000} seconds.`);
@@ -1868,11 +2004,13 @@ export function ChatPanel({
     }
     stopRequestedRef.current = false;
     const userMsg = submittedDraft.text.trim();
-    const history = messages
-      .filter((msg) => !msg.isStreaming && msg.content.trim())
-      .map((msg) => ({ role: msg.role, content: msg.content }));
     discardPendingTokens();
     setError(null);
+    // Phase 2.4 — clear the previous turn's memory surface. The native history
+    // is read inside `streamFromJarvisApi`, never from the UI cache.
+    setMemoryLiveStatus(null);
+    setMemoryDiagnostic(null);
+    setMemoryHistoryWarning(null);
     setIsStreaming(true);
     turnStartedAtRef.current = Date.now();
     setTurnElapsedMs(0);
@@ -1920,9 +2058,9 @@ export function ChatPanel({
         onSessionCreated();
       }
 
-      await streamFromJarvisApi(effectiveSessionId, userMsg, history, sendGeneration, () => {
+      await streamFromJarvisApi(effectiveSessionId, userMsg, sendGeneration, () => {
         publishDraftStore(clearSubmittedSessionDraft(draftStoreRef.current, submittedDraft));
-      }, clientMessageId);
+      }, clientMessageId, includeUserScope);
     } catch (e) {
       if (!mountedRef.current) return;
       if (!sendGateRef.current.isCurrent(sendGeneration)) {
@@ -1971,7 +2109,7 @@ export function ChatPanel({
       // now" check that needs a single finish() on every exit.
       sendInFlightRef.current.finish();
     }
-  }, [isStreaming, messages, activeSession, sessionId, onSessionCreated, setActiveSession, clearRunRecord, streamFromJarvisApi, discardPendingTokens, takePendingTokens, applyTokenChunk, publishDraftStore, resetActivityLedger]);
+  }, [isStreaming, messages, activeSession, sessionId, onSessionCreated, setActiveSession, clearRunRecord, streamFromJarvisApi, discardPendingTokens, takePendingTokens, applyTokenChunk, publishDraftStore, resetActivityLedger, includeUserScope]);
 
   // Phase 1.3 — real Stop. POST /chat/cancel on the Bun server; SseRelay now
   // treats the resulting `cancelled` frame as terminal, so isStreaming flips.
@@ -2144,6 +2282,10 @@ export function ChatPanel({
   const displayedRoute = runMetrics?.provider || runMetrics?.model
     ? formatInferenceRoute(runMetrics.provider, runMetrics.model)
     : formatInferenceRoute(config?.active_backend, modelLabel);
+  // Concrete, honest memory-turn status. Counts come only from the native
+  // diagnostic; while the turn is live a transient status may be shown without
+  // counts.
+  const memoryStatusLabel = formatMemoryTurnLabel(memoryLiveStatus, memoryDiagnostic);
 
   return (
     <div className="h-full flex flex-col">
@@ -2551,6 +2693,37 @@ export function ChatPanel({
             via {displayedRoute}
           </span>
         </div>
+        <div className="flex items-center justify-between gap-3 mt-1.5 px-1">
+          <label className="flex items-center gap-1.5 text-[10px] font-mono text-bone-faint cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={includeUserScope}
+              onChange={(e) => setIncludeUserScope(e.target.checked)}
+              disabled={isStreaming}
+              className="accent-royal"
+              aria-label="Include user-wide memory"
+            />
+            Include user-wide memory
+          </label>
+          {memoryStatusLabel && (
+            <span
+              role="status"
+              aria-label="Memory recall status"
+              className="text-[10px] font-mono text-bone-faint truncate"
+            >
+              {memoryStatusLabel}
+            </span>
+          )}
+        </div>
+        {memoryHistoryWarning && (
+          <p
+            role="status"
+            aria-label="Memory history warning"
+            className="mt-0.5 px-1 text-[10px] font-mono text-bone-faint"
+          >
+            {memoryHistoryWarning}
+          </p>
+        )}
       </div>
 
       {/* Phase 1.1 — Tool approval modal. Rendered outside the scroll area so

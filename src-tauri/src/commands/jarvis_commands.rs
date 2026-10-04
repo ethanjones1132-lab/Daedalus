@@ -1,10 +1,11 @@
 use crate::jarvis::bridge::{start_bridge, stop_bridge};
+use crate::jarvis::memory::turn::{MemoryRecallStatus, PrepareMemoryTurnRequest};
 use crate::jarvis::runner::{check_jarvis_status, run_jarvis_message};
 use crate::jarvis::types::*;
 use crate::jarvis_types::JarvisState;
 use serde::Serialize;
 use std::time::Duration;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 async fn chat_base_url() -> Result<String, String> {
     let client = reqwest::Client::builder()
@@ -175,19 +176,88 @@ pub async fn jarvis_send_message(
         session_id, base_url
     );
 
-    let history = if session_id.is_empty() {
-        Vec::new()
+    // Persist the exact user row FIRST when a real Session exists. Native
+    // memory preparation must reference the persisted row id, never an
+    // optimistic identity; a blank Session runs ordinary relay inference and
+    // cannot become a memory-enabled turn.
+    let user_message_id = if session_id.is_empty() {
+        None
     } else {
-        crate::commands::sessions::history_for_chat_stream(&db, &session_id)?
+        Some(crate::commands::sessions::insert_message_row(
+            &db,
+            &session_id,
+            "user",
+            &message,
+            0,
+        )?)
     };
 
-    if !session_id.is_empty() {
-        crate::commands::sessions::insert_message_row(&db, &session_id, "user", &message, 0)?;
-    }
+    // Native prompt history stops before the exact source row and excludes all
+    // later rows. The operator transcript command is untouched.
+    let history = match user_message_id.as_deref() {
+        Some(user_message_id) => {
+            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            crate::jarvis::memory::turn::history_for_memory_turn(&conn, &session_id, user_message_id)
+                .map(|messages| {
+                    messages
+                        .into_iter()
+                        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
+
+    // One stable turn identity for this relay turn, distinct from the opaque
+    // native preparation id. Preparation is references-only; its status is a
+    // public hint. A preparation failure still runs ordinary relay inference.
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    let (memory_preparation_id, initial_memory_status) = match user_message_id.as_deref() {
+        Some(user_message_id) => {
+            let request = PrepareMemoryTurnRequest {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                user_message_id: user_message_id.to_string(),
+                include_user_scope: false,
+            };
+            let app_for_prepare = app.clone();
+            let prepared = tauri::async_runtime::spawn_blocking(move || {
+                let db = app_for_prepare.state::<crate::db::AppDb>();
+                let transport = crate::jarvis::memory::transport::native_memory_transport();
+                crate::jarvis::memory::transport::prepare_memory_turn(
+                    db.inner(),
+                    transport,
+                    request,
+                    chrono::Utc::now(),
+                )
+            })
+            .await
+            .map_err(|error| format!("memory prepare task join error: {error}"))?;
+            match prepared {
+                Ok(preparation) => (preparation.preparation_id, preparation.status),
+                Err(error) => {
+                    eprintln!("[jarvis-chat] memory preparation failed: {}", error);
+                    (None, MemoryRecallStatus::Unavailable)
+                }
+            }
+        }
+        None => (None, MemoryRecallStatus::Unavailable),
+    };
 
     eprintln!("[jarvis-chat] spawning stream relay session={}", session_id);
     let db_path = db.db_path.clone();
-    run_jarvis_message(app, base_url, session_id, message, history, db_path)
+    run_jarvis_message(
+        app,
+        base_url,
+        session_id,
+        message,
+        history,
+        db_path,
+        turn_id,
+        memory_preparation_id,
+        initial_memory_status,
+    )
 }
 
 #[tauri::command]
