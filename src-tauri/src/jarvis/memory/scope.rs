@@ -35,9 +35,19 @@ fn session_owner(conn: &Connection, session_id: &str) -> Result<(String, Option<
 
 #[cfg(windows)]
 fn canonical_to_string(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
-    stripped.replace('/', "\\")
+    // `canonicalize` returns verbatim paths on Windows (`\\?\C:\...` or
+    // `\\?\UNC\server\share\...`). Convert them back to ordinary absolute
+    // forms while preserving a valid UNC identity: stripping only `\\?\`
+    // from a UNC path would leave `UNC\server\share`, which is not absolute.
+    let raw = path.to_string_lossy().to_string();
+    let converted = if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", rest)
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        raw
+    };
+    converted.replace('/', "\\")
 }
 
 #[cfg(not(windows))]

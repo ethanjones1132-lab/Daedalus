@@ -22,6 +22,8 @@ use super::contracts::{
 use super::engine;
 
 const MAX_MEMORY_CONTENT_BYTES: usize = 4096;
+const RECALL_LIMIT: usize = 5;
+const CANDIDATE_LIMIT: usize = 30;
 
 static SAVEPOINT_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -163,6 +165,7 @@ fn normalize_optional_ts(value: Option<&str>) -> Result<Option<String>, MemoryEr
 
 fn validate_provenance_for_write(
     conn: &Connection,
+    scope: &MemoryScope,
     provenance: &MemoryProvenance,
 ) -> Result<(), MemoryError> {
     match provenance.authority_kind {
@@ -172,16 +175,57 @@ fn validate_provenance_for_write(
         AuthorityKind::VerifiedObservation => Err(MemoryError::invalid_provenance(
             "Verified observations require trusted native capture evidence (phase 3)",
         )),
-        AuthorityKind::Manual | AuthorityKind::AssistantProposal => Ok(()),
-        AuthorityKind::UserStatement => {
-            let session = provenance.source_session_id.as_deref().ok_or_else(|| {
-                MemoryError::invalid_provenance("user_statement requires a source Session")
+        AuthorityKind::Manual | AuthorityKind::AssistantProposal | AuthorityKind::UserStatement => {
+            // Source-less manual writes are valid. Any supplied provenance must
+            // be internally consistent: the cited Session must exist, its
+            // Agent must match a project/Agent scope, and every cited message
+            // must belong to that Session.
+            let session = match provenance.source_session_id.as_deref() {
+                Some(session) => session,
+                None => {
+                    if !provenance.source_message_ids.is_empty() {
+                        return Err(MemoryError::invalid_provenance(
+                            "cited messages require a source Session",
+                        ));
+                    }
+                    if provenance.authority_kind == AuthorityKind::UserStatement {
+                        return Err(MemoryError::invalid_provenance(
+                            "user_statement requires a source Session",
+                        ));
+                    }
+                    return Ok(());
+                }
+            };
+
+            let owner: Option<String> = conn
+                .query_row(
+                    "SELECT agent_id FROM sessions WHERE id = ?",
+                    [session],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(MemoryError::from)?;
+            let owner = owner.ok_or_else(|| {
+                MemoryError::invalid_provenance("source Session does not exist")
             })?;
-            if provenance.source_message_ids.is_empty() {
+            if matches!(
+                scope.kind,
+                MemoryScopeKind::Project | MemoryScopeKind::Agent
+            ) && owner != scope.agent_id
+            {
+                return Err(MemoryError::invalid_provenance(
+                    "source Session Agent does not match the memory scope",
+                ));
+            }
+
+            if provenance.authority_kind == AuthorityKind::UserStatement
+                && provenance.source_message_ids.is_empty()
+            {
                 return Err(MemoryError::invalid_provenance(
                     "user_statement requires cited message IDs",
                 ));
             }
+
             for message_id in &provenance.source_message_ids {
                 let role: Option<String> = conn
                     .query_row(
@@ -193,11 +237,12 @@ fn validate_provenance_for_write(
                     .map_err(MemoryError::from)?;
                 match role.as_deref() {
                     Some("user") => {}
-                    Some(_) => {
+                    Some(_) if provenance.authority_kind == AuthorityKind::UserStatement => {
                         return Err(MemoryError::invalid_provenance(
                             "cited message is not a user statement",
                         ))
                     }
+                    Some(_) => {}
                     None => {
                         return Err(MemoryError::invalid_provenance(
                             "cited message does not belong to the Session",
@@ -330,7 +375,7 @@ pub fn save_scoped_memory(
 ) -> Result<MutationResult, MemoryError> {
     validate_writable_scope(scope)?;
     validate_draft(&draft)?;
-    validate_provenance_for_write(conn, provenance)?;
+    validate_provenance_for_write(conn, scope, provenance)?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let stored = with_memory_savepoint(conn, |conn| {
@@ -400,15 +445,19 @@ pub fn save_scoped_memory(
     })
 }
 
-/// Eligible-candidate predicate applied before the candidate limit. Malformed
-/// persisted expiry/review timestamps are excluded so they cannot consume the
-/// candidate budget and displace valid records.
+/// Eligible-candidate predicate applied before the candidate limit. A strict
+/// date-time shape guard plus `julianday` (fractional-second preserving) keeps
+/// malformed persisted expiry/review timestamps out of the candidate budget.
 const ELIGIBLE_PREDICATE: &str = "(m.status = 'active'
     AND m.tier IN ('hot','warm')
     AND m.authority_kind IN ('manual','user_statement','verified_observation')
     AND (m.expires_at IS NULL
-         OR (datetime(m.expires_at) IS NOT NULL AND datetime(m.expires_at) > datetime(?)))
-    AND (m.review_after IS NULL OR datetime(m.review_after) IS NOT NULL))";
+         OR (m.expires_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*'
+             AND julianday(m.expires_at) IS NOT NULL
+             AND julianday(m.expires_at) > julianday(?)))
+    AND (m.review_after IS NULL
+         OR (m.review_after GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*'
+             AND julianday(m.review_after) IS NOT NULL)))";
 
 fn recall_scope_predicate(scope: &MemoryScope, include_user: bool) -> (String, Vec<Value>) {
     let (base, params) = match scope.kind {
@@ -472,12 +521,26 @@ fn query_scoped_rows(
     rows.collect::<Result<Vec<_>, _>>().map_err(MemoryError::from)
 }
 
-fn is_stale(review_after: &Option<String>, now: &DateTime<Utc>) -> bool {
-    match review_after {
-        Some(raw) => DateTime::parse_from_rfc3339(raw)
-            .map(|dt| dt.with_timezone(&Utc) <= *now)
-            .unwrap_or(false),
-        None => false,
+/// Parse one persisted lifecycle timestamp. Returns `Err(())` for a present but
+/// unparseable value, emitting a structured warning that contains only the
+/// memory ID and the offending field (never memory content).
+fn parse_recall_timestamp(
+    value: &Option<String>,
+    memory_id: &str,
+    field: &'static str,
+) -> Result<Option<DateTime<Utc>>, ()> {
+    match value {
+        None => Ok(None),
+        Some(raw) => match DateTime::parse_from_rfc3339(raw) {
+            Ok(dt) => Ok(Some(dt.with_timezone(&Utc))),
+            Err(_) => {
+                eprintln!(
+                    "[memory] malformed timestamp memory_id={} field={}",
+                    memory_id, field
+                );
+                Err(())
+            }
+        },
     }
 }
 
@@ -556,17 +619,35 @@ pub fn recall_scoped_memories(
 
     let mut recalls: Vec<ScopedMemoryRecall> = candidates
         .into_iter()
-        .map(|memory| {
+        .filter_map(|memory| {
+            let id = memory.entry.id.clone();
+            let expires_at =
+                match parse_recall_timestamp(&memory.entry.expires_at, &id, "expires_at") {
+                    Ok(value) => value,
+                    Err(()) => return None,
+                };
+            let review_after =
+                match parse_recall_timestamp(&memory.entry.review_after, &id, "review_after") {
+                    Ok(value) => value,
+                    Err(()) => return None,
+                };
+            if expires_at.map(|expires| expires <= now).unwrap_or(false) {
+                return None;
+            }
+            let stale = review_after
+                .map(|review| review <= now)
+                .unwrap_or(false);
             let (score, matched_terms) = engine::score_memory(&memory.entry, &terms);
-            let stale = is_stale(&memory.entry.review_after, &now);
-            ScopedMemoryRecall {
+            if matched_terms.is_empty() || score <= 0.05 {
+                return None;
+            }
+            Some(ScopedMemoryRecall {
                 memory,
                 score,
                 matched_terms,
                 stale,
-            }
+            })
         })
-        .filter(|recall| !recall.matched_terms.is_empty() && recall.score > 0.05)
         .collect();
 
     recalls.sort_by(|a, b| {
@@ -670,7 +751,7 @@ pub fn update_scoped_memory(
 ) -> Result<MutationResult, MemoryError> {
     validate_writable_scope(scope)?;
     validate_draft(&draft)?;
-    validate_provenance_for_write(conn, provenance)?;
+    validate_provenance_for_write(conn, scope, provenance)?;
 
     let (predicate, scope_params) = scope_predicate("memory", scope);
     let updated = with_memory_savepoint(conn, |conn| {
@@ -695,7 +776,7 @@ pub fn update_scoped_memory(
             Value::from(draft.category.clone()),
             expires_at.clone().map(Value::from).unwrap_or(Value::Null),
             review_after.clone().map(Value::from).unwrap_or(Value::Null),
-            Value::from(authority_str(provenance.authority_kind)),
+            Value::from(authority_str(provenance.authority_kind).to_string()),
             Value::from(provenance.source.clone()),
             provenance
                 .source_session_id
@@ -765,13 +846,13 @@ pub fn tombstone_scoped_memory(
     let (predicate, scope_params) = scope_predicate("memory", scope);
     let (stored, changed) = with_memory_savepoint(conn, |conn| {
         let before = read_scoped_memory_inner(conn, scope, id)?;
-        if before.entry.status == "tombstoned" {
-            return Ok((before, false));
-        }
         if before.revision != expected_revision {
             return Err(MemoryError::revision_conflict(
                 "Memory revision no longer matches the expected revision",
             ));
+        }
+        if before.entry.status == "tombstoned" {
+            return Ok((before, false));
         }
         let mut values: Vec<Value> = vec![
             Value::from(now.to_rfc3339()),
@@ -820,13 +901,13 @@ pub fn restore_scoped_memory(
     let (predicate, scope_params) = scope_predicate("memory", scope);
     let (stored, changed) = with_memory_savepoint(conn, |conn| {
         let before = read_scoped_memory_inner(conn, scope, id)?;
-        if before.entry.status == "active" {
-            return Ok((before, false));
-        }
         if before.revision != expected_revision {
             return Err(MemoryError::revision_conflict(
                 "Memory revision no longer matches the expected revision",
             ));
+        }
+        if before.entry.status == "active" {
+            return Ok((before, false));
         }
         let mut values: Vec<Value> = vec![
             Value::from(now.to_rfc3339()),
