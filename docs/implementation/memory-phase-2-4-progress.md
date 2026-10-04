@@ -10,7 +10,7 @@
 - **Execution baseline:** `dfe39904b8d7fa3ed731e5342e7e80437a6a3b40`
 - **Predecessor HEAD:** `e380014` (`fix: intersect unknown-context floor with stage ceiling instead of replacing it`)
 - **Branch:** `codex/memory-deepseek-20261004`
-- **Phase 2.4 source commit:** see the phase-scoped commit recorded with this ledger.
+- **Phase 2.4 source commit:** `7de87c7` — `feat: prepare native recall on both Session transports` (source changes; this ledger update is a follow-up docs commit).
 
 ## Execution environment
 
