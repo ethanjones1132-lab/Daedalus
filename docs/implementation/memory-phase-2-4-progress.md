@@ -11,7 +11,8 @@
 - **Predecessor HEAD:** `e380014` (`fix: intersect unknown-context floor with stage ceiling instead of replacing it`)
 - **Branch:** `codex/memory-deepseek-20261004`
 - **Phase 2.4 source commit:** `7de87c7` — `feat: prepare native recall on both Session transports`.
-- **Phase 2.4 root-review corrective commit:** `f14b275` — `fix: harden phase 2.4 persistence, finalization ordering, and relay diagnostics` (see "Root-review corrective pass"). This ledger update is a follow-up docs commit.
+- **Phase 2.4 root-review corrective commit:** `f14b275` — `fix: harden phase 2.4 persistence, finalization ordering, and relay diagnostics` (see "Root-review corrective pass").
+- **Phase 2.4 second root-review corrective commit:** `ad933bc` — `fix: bound phase 2.4 finalization, submission, and relay correlation` (see "Third root-review corrective pass"). This ledger update is a follow-up docs commit.
 
 ## Execution environment
 
@@ -216,6 +217,65 @@ the corresponding descriptions above where they differ.
    then performs a guarded native `memory_turn_diagnostic` read-back as the sole
    authority for selected/applied counts.
 
+## Third root-review corrective pass
+
+A second root review identified four remaining source-level races/coverage
+gaps. All were corrected in source with no tests/runtime execution.
+
+1. **Finalization is now fully bounded.** The UI no longer awaits a separate
+   unbounded `memory_turn_diagnostic`: `memory_sync_turn` already returns the
+   authenticated `MemoryTurnDiagnostic`, so the entire sync+decode is inside the
+   single 5,000 ms race. Late completion after the deadline can never reach the
+   decode/repaint path, the timer is cleared, and a returned tuple that does not
+   match `{turn_id, session_id}` is an observable failure
+   (`Memory status did not match this turn.`). On the relay side,
+   `attempt_relay_memory_finalize` now runs the blocking authenticated sync on an
+   `AppHandle`-owned worker thread and waits at most `RELAY_MEMORY_FINALIZE_TIMEOUT_MS`
+   (5,000 ms) on a channel; the worker only returns data and never emits. The
+   caller emits exactly once — the native diagnostic projection, or a typed
+   `memory_finalization_failed` / `memory_finalization_pending` /
+   `memory_turn_mismatch` status — before the ordinary terminal publication, and
+   a late worker completion only sends to a dropped channel.
+2. **Submission guard includes abort/Stop; every awaited finalizer re-checks
+   ownership.** `stopIfStale` now uses `submissionAlive` = `requestIsCurrent()
+   && !controller.signal.aborted && !stopRequestedRef.current`, evaluated after
+   the awaited append, after preparation, after history and before fetch, so a
+   Stop during setup cannot race `/chat/cancel` and then still launch inference.
+   The display guard `requestIsCurrent` stays separate so a legitimate
+   cancellation terminal can still render. Every terminal `handleFrame` branch
+   (`result`, `error`, `cancelled`) and the EOF-unterminated branch now
+   re-check `requestIsCurrent()` immediately after `await finalizeMemoryTurn()`
+   and before any activity/state/terminal mutation, so a Session switch during
+   the bounded wait cannot repaint another Session. The read-loop and outer
+   finalies keep the same guard (run dispatch/persist and
+   `finalizeAssistantMessage` remain `requestIsCurrent`-gated).
+3. **Relay correlation is explicit, not first-seen.** A new
+   `src-ui/.../relay-memory-correlation.ts` is the concrete seam: the relay
+   invoker calls `registerRelayMemoryTurn(sessionId, turnId)` **before** invoking
+   `jarvis_send_message` with the same caller-supplied `turn_id` (now an additive
+   optional native parameter; Native still prepares against its own saved row and
+   never trusts it as authority). Relay memory events are accepted only when
+   `isRegisteredRelayMemoryTurn(sessionId, turnId)` matches exactly; registration
+   is replaced on a new register and cleared on every direct submission and
+   Session change, so a delayed older relay event cannot bind or overwrite a
+   newer submission. Unregistered/legacy events are rejected conservatively.
+   Terminal relay listeners (`jarvis://done`, `jarvis://error`,
+   `jarvis://cancelled`) also require the registered correlation when the event
+   carries a `turn_id`, so an old relay terminal cannot finalize a newer direct
+   turn; events without a `turn_id` keep the existing behavior.
+4. **Relay warning codes are visible and owner-scoped.** The relay
+   `jarvis://memory-status` listener now maps `history_unavailable` to the
+   history warning and `memory_finalization_failed` / `memory_finalization_pending`
+   to the finalization notice, so a typed failure is a compact visible warning
+   that a later `ready` frame cannot overwrite. A relay owner ref drops the
+   previous turn's warning/diagnostic whenever a different registered relay
+   submission becomes active, and all memory state is reset on Session change and
+   each new submission. The native diagnostic remains the authority, with
+   selected and applied IDs shown separately, and a direct read-back that is
+   still `registered`/`started`/`unterminated` is labelled as that actual
+   nonterminal state rather than implied finished. The per-turn opt-in is still
+   snapshotted then reset to the Session default (false).
+
 ## Frozen-interface compliance
 
 - 2.2 commands consumed unchanged: `memory_prepare_turn`,
@@ -244,11 +304,11 @@ tool's `workdir` argument (no `cd`, no pipes/`tail`, no chained directories):
 | `bun run build` (workdir `server-jarvis`) | **PASS** — bundled `dist/index.js` (196 modules) |
 | `git diff --check` (workdir repo root) | **PASS** — no whitespace errors |
 
-The same five commands were re-run after the corrective pass and all **PASS**.
-The `src-ui` native build artifacts (`lightningcss-darwin-arm64`,
-`@tailwindcss/oxide-darwin-arm64`) were restored from the existing locked
-install immediately before the build because iCloud had re-offloaded them; no
-dependency, lockfile, or manifest changed.
+The same five commands were re-run after the second and third corrective passes
+and all **PASS**. The `src-ui` native build artifacts
+(`lightningcss-darwin-arm64`, `@tailwindcss/oxide-darwin-arm64`) were restored
+from the existing locked install immediately before the build because iCloud had
+re-offloaded them; no dependency, lockfile, or manifest changed.
 
 No `cargo test`, `bun test`, ephemeral SQL script, or live inference/transport
 experiment was run. `server-jarvis` source was not changed in 2.4; its
