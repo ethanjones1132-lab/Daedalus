@@ -428,13 +428,42 @@ pub fn add_agent(
 ///
 /// Agent identity is required by `resolve_session_memory_scope`, so removing an
 /// Agent changes native memory ownership eligibility. The production adapter
-/// enters the precommit gate before locking AppDb; `delete_agent_row` stays a
-/// pure helper for existing callers and tests.
+/// enters the derived gate before locking AppDb and resolves the exact affected
+/// Sessions for this Agent; `delete_agent_row` stays a pure helper for existing
+/// callers and tests.
 #[tauri::command]
 pub async fn delete_agent(app: AppHandle, id: String) -> Result<(), String> {
-    super::memory_turn::run_gated_mutation(app, "agent_delete", move |conn| {
-        delete_agent_row(conn, &id).map_err(MemoryError::storage_unavailable)
-    })
+    let plan_agent = id.clone();
+    super::memory_turn::run_derived_gated_mutation(
+        app,
+        String::new(),
+        move |conn| {
+            // Every Session owned by this Agent is a derived-context consumer.
+            let mut affected_session_ids: Vec<String> = Vec::new();
+            let mut stmt = conn
+                .prepare("SELECT id FROM sessions WHERE agent_id = ?")
+                .map_err(MemoryError::from)?;
+            let rows = stmt
+                .query_map([&plan_agent], |row| row.get::<_, String>(0))
+                .map_err(MemoryError::from)?;
+            for row in rows {
+                affected_session_ids.push(row.map_err(MemoryError::from)?);
+            }
+            Ok(crate::jarvis::memory::capture_contracts::NativeDerivedMutationPlan {
+                invalidation:
+                    crate::jarvis::memory::capture_contracts::MemoryDerivedInvalidation {
+                        operation_id: uuid::Uuid::new_v4().to_string(),
+                        affected_session_ids,
+                        memory_ids: Vec::new(),
+                        source_message_ids: Vec::new(),
+                    },
+                scope: None,
+            })
+        },
+        move |conn, _plan| {
+            delete_agent_row(conn, &id).map_err(MemoryError::storage_unavailable)
+        },
+    )
     .await
     .map_err(|error| error.message)
 }

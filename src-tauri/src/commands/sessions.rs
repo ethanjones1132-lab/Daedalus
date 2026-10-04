@@ -4,7 +4,7 @@
 
 use crate::db::AppDb;
 use crate::jarvis::memory::contracts::MemoryError;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 // ── Compaction ────────────────────────────────────────────────
 
@@ -100,31 +100,36 @@ pub fn update_db_token_count(
 /// via the local model, and returns a summary payload.
 #[tauri::command]
 pub async fn compact_session_db(
-    db: State<'_, AppDb>,
+    app: AppHandle,
+    _db: State<'_, AppDb>,
     session_id: String,
 ) -> Result<serde_json::Value, String> {
-    let sid = session_id.clone();
-    let db_path = db.db_path.clone();
-
-    let messages: Vec<(String, String)> = tokio::task::spawn_blocking(move || {
-        let conn = rusqlite::Connection::open(&db_path)
-            .map_err(|e| format!("Failed to open DB at {:?}: {}", db_path, e))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at ASC",
-            )
-            .map_err(|e| e.to_string())?;
-        let msgs: Vec<(String, String)> = stmt
-            .query_map([&sid], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok::<_, String>(msgs)
+    // Take the sanitized, suppression-aware transcript snapshot under the
+    // operation gate (pending-cleanup drain + revision capture) so a forgotten
+    // or corrected source can never enter the model-facing summary and no
+    // unrelated mutation can interleave. Run on a blocking thread so the
+    // bounded HTTP does not block the Tauri executor; a cleanup failure
+    // surfaces as a typed error rather than a stale summary.
+    let app_for_snapshot = app.clone();
+    let session_for_snapshot = session_id.clone();
+    let snapshot = tauri::async_runtime::spawn_blocking(move || {
+        let state = app_for_snapshot.state::<AppDb>();
+        crate::jarvis::memory::transport::snapshot_sanitized_session_messages(
+            state.inner(),
+            crate::jarvis::memory::transport::native_memory_transport(),
+            &session_for_snapshot,
+            chrono::Utc::now(),
+        )
+        .map_err(|error| error.message)
     })
     .await
-    .map_err(|e| format!("Task join error: {}", e))??;
+    .map_err(|error| format!("memory snapshot task join error: {error}"))??;
+
+    let messages: Vec<(String, String)> = snapshot
+        .messages
+        .iter()
+        .map(|message| (message.role.clone(), message.content.clone()))
+        .collect();
 
     if messages.len() < 4 {
         return Ok(serde_json::json!({ "compacted": false, "reason": "too few messages" }));
@@ -133,6 +138,32 @@ pub async fn compact_session_db(
     let split = messages.len() / 2;
     let (old, recent) = messages.split_at(split);
     let summary = compact_messages(old, "http://127.0.0.1:11434", "qwen2.5:7b", 1024).await?;
+
+    // Refuse to publish a summary built from a snapshot that a memory mutation
+    // invalidated while the model was running. The raw stale summary never
+    // returns; the caller may retry against a fresh sanitized snapshot.
+    let app_for_recheck = app.clone();
+    let session_for_recheck = session_id.clone();
+    let (store_revision, continuity_revision, session_binding_revision) =
+        tauri::async_runtime::spawn_blocking(move || {
+            let state = app_for_recheck.state::<AppDb>();
+            crate::jarvis::memory::transport::memory_context_revisions(
+                state.inner(),
+                &session_for_recheck,
+            )
+            .map_err(|error| error.message)
+        })
+        .await
+        .map_err(|error| format!("memory revision recheck task join error: {error}"))??;
+    if store_revision != snapshot.store_revision
+        || continuity_revision != snapshot.continuity_revision
+        || session_binding_revision != snapshot.session_binding_revision
+    {
+        return Ok(serde_json::json!({
+            "compacted": false,
+            "reason": "memory_invalidated",
+        }));
+    }
 
     Ok(serde_json::json!({
         "compacted": true,
@@ -522,9 +553,32 @@ pub fn create_session(
 
 #[tauri::command]
 pub async fn delete_session(app: AppHandle, session_id: String) -> Result<bool, String> {
-    super::memory_turn::run_gated_mutation(app, "session_delete", move |conn| {
-        delete_session_row_conn(conn, &session_id).map_err(MemoryError::storage_unavailable)
-    })
+    super::memory_turn::run_derived_gated_mutation(
+        app,
+        session_id.clone(),
+        {
+            let session_for_plan = session_id.clone();
+            move |_conn| {
+                // The deleted Session's own derived prompt state must be evicted
+                // before it disappears; the outbox row has no Session FK, so it
+                // survives that Session's deletion and the drain reuses the
+                // exact original initiating-Session wire key.
+                Ok(crate::jarvis::memory::capture_contracts::NativeDerivedMutationPlan {
+                    invalidation:
+                        crate::jarvis::memory::capture_contracts::MemoryDerivedInvalidation {
+                            operation_id: uuid::Uuid::new_v4().to_string(),
+                            affected_session_ids: vec![session_for_plan],
+                            memory_ids: Vec::new(),
+                            source_message_ids: Vec::new(),
+                        },
+                    scope: None,
+                })
+            }
+        },
+        move |conn, _plan| {
+            delete_session_row_conn(conn, &session_id).map_err(MemoryError::storage_unavailable)
+        },
+    )
     .await
     .map_err(|error| error.message)
 }

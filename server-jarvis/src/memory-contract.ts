@@ -458,3 +458,18 @@ export interface ContinuitySetRequest {
   objective: string | null;
   operation_id: string;
 }
+
+// ── Phase 3.2 derived-state invalidation wire contract ───────────────────────
+// Capability-only mirror of the frozen Rust DTO in
+// `src-tauri/src/jarvis/memory/capture_contracts.rs` and the private native
+// `derived` field on `/internal/memory/invalidate`. `operation_id` is
+// native-namespaced (`session/<session_id>/operation/<operation_id>`). EXACTLY
+// these four fields; it carries ids only: never recalled text, scope, or a
+// capability value. The resolved scope is native-internal routing metadata.
+
+export interface MemoryDerivedInvalidation {
+  operation_id: string;
+  affected_session_ids: string[];
+  memory_ids: string[];
+  source_message_ids: string[];
+}

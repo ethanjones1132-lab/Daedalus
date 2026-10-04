@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
+use super::contracts::MemoryError;
+
 const RECALL_LIMIT: usize = 5;
 const RECALL_CANDIDATE_LIMIT: usize = 30;
 const MAX_MEMORY_CONTENT_BYTES: usize = 4096;
@@ -1384,6 +1386,27 @@ fn active_memories(conn: &Connection) -> Result<Vec<MemoryEntry>, String> {
     collect_memories(rows)
 }
 
+/// The exact ids a legacy consolidation/auto-dream run can touch: active
+/// legacy-unscoped rows only. This is the same filter `consolidate_memories`
+/// uses, exposed so the command can resolve derived invalidation for those
+/// exact candidates without enumerating (or blocking on) unrelated explicitly
+/// scoped facts.
+pub fn legacy_consolidation_candidate_ids(
+    conn: &Connection,
+) -> Result<Vec<String>, MemoryError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM memory
+             WHERE status = 'active' AND scope_kind = 'legacy_unscoped'
+             ORDER BY updated_at DESC LIMIT ?",
+        )
+        .map_err(MemoryError::from)?;
+    let rows = stmt
+        .query_map([RECALL_CANDIDATE_LIMIT as i64], |row| row.get::<_, String>(0))
+        .map_err(MemoryError::from)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(MemoryError::from)
+}
+
 fn memory_scope_kind_of(conn: &Connection, id: &str) -> Result<Option<String>, String> {
     conn.query_row(
         "SELECT scope_kind FROM memory WHERE id = ?",
@@ -1401,6 +1424,29 @@ fn require_legacy_scope(conn: &Connection, id: &str) -> Result<(), String> {
             "This memory is explicitly scoped; use the scoped memory APIs to change it".to_string(),
         ),
         None => Ok(()),
+    }
+}
+
+/// Preflight guard for the legacy (unscoped) command routes. A row that exists
+/// but is explicitly scoped must be rejected with a typed scope mismatch: the
+/// generic legacy engine helpers cannot enforce scope, so the legacy command
+/// route must refuse before it can bypass scoped revision/safety checks. A
+/// genuinely absent row returns the compatibility `false` (the historical
+/// not-found-as-false contract); a real storage failure is surfaced, never
+/// masked as `false`. The legacy delete route additionally requires the row to
+/// be verified legacy unscoped, so a scoped fact can never be tombstoned
+/// through it.
+pub fn legacy_command_guard(conn: &Connection, id: &str) -> Result<bool, MemoryError> {
+    let kind = match memory_scope_kind_of(conn, id) {
+        Ok(kind) => kind,
+        Err(_) => return Err(MemoryError::storage_unavailable("Memory storage is unavailable")),
+    };
+    match kind.as_deref() {
+        Some("legacy_unscoped") => Ok(true),
+        Some(_) => Err(MemoryError::invalid_scope(
+            "This memory is explicitly scoped; use the scoped memory APIs to change it",
+        )),
+        None => Ok(false),
     }
 }
 

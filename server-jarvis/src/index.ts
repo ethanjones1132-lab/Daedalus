@@ -28,6 +28,13 @@ import {
   type AppliedTurnMemory,
 } from "./turn-memory-context";
 import type { PreparedMemoryTurn } from "./memory-contract";
+import {
+  configureMemoryDerivedState,
+  invalidateMemoryDerivedState,
+  MemoryDerivedStateUnavailableError,
+  noteMemoryDerivedActivity,
+  trySessionInvalidationWatermark,
+} from "./memory-derived-state";
 import { NFL_2025_PLAYERS, NFL_2025_DEFENSES } from "./football";
 import { PRIZEPICKS_SYSTEM_PROMPT, buildPrizePicksContext, buildFullDatabaseContext, normalizeStatType, findPlayerName, generateWeeklyPicks } from "./prizepicks";
 
@@ -36,7 +43,7 @@ import { readdirSync, existsSync, readFileSync, writeFileSync, mkdirSync, realpa
 import { join, isAbsolute, relative, resolve } from "path";
 import { homedir } from "os";
 import { spawn, execSync } from "child_process";
-import { loadConfig, saveConfig, saveConfigWithValidation, normalizeConfig, InvalidConfigError, CONFIG_DIR, COMPANION_FILE, surfaceTemperature } from "./config";
+import { loadConfig, saveConfig, saveConfigWithValidation, normalizeConfig, InvalidConfigError, CONFIG_DIR, COMPANION_FILE, SESSIONS_DIR, surfaceTemperature } from "./config";
 import type { JarvisConfig, OllamaConfig, SurfaceType } from "./config";
 import { Database } from "bun:sqlite";
 import { buildLearningPrompt, buildReviewPrompt, buildCodebaseAuditPrompt, buildFootballAuditPrompt } from "./cron-prompts";
@@ -668,14 +675,30 @@ const persistentConductor = new PersistentConductor(loadConfig);
 /** Ephemeral owned-registry for native memory. Empty when this server was not
  *  launched with the native capability; internal routes then report
  *  `memory_unavailable` instead of serving a second App-memory authority.
- *  Invalidation also drops in-memory session compaction carriers so a
- *  semantic mutation cannot leave recalled project context cached. */
-const nativeMemoryRegistry = createNativeMemoryRegistry(undefined, () => {
-  sessionMemory.clearAll();
-});
+ *  Semantic mutations drive scoped derived-state cleanup through the `derived`
+ *  field of the private `/internal/memory/invalidate` route; the predecessor's
+ *  broad `sessionMemory.clearAll()` callback was removed so independent
+ *  TaskRuns/tool/file/check caches survive memory mutation. */
+const nativeMemoryRegistry = createNativeMemoryRegistry();
 
 /** Inter-workflow shared memory — tool results, file snapshots, failure patterns. */
 const sessionMemory = new SessionMemory(() => loadConfig().orchestrator.session_memory);
+
+// Phase 3.2 scoped derived-state cleanup. Each hook persists synchronously and
+// throws on failure so the private route withholds its ACK on incomplete
+// cleanup. Unrelated Sessions, independent evidence caches, and TaskRuns are
+// never globally reset.
+configureMemoryDerivedState({
+  sessionsRoot: SESSIONS_DIR,
+  host: {
+    evictSessionDerivedState: (sessionId, invalidation) => {
+      sessionMemory.evictMemoryDerivedState(sessionId, invalidation);
+    },
+    evictConductorSession: (sessionId) => {
+      persistentConductor.evictDerivedState(sessionId);
+    },
+  },
+});
 
 /** Last effective authority per session, retained for terse continuation turns. */
 const MAX_CONTINUATION_REQUIREMENTS = 256;
@@ -1403,6 +1426,12 @@ class DegenerateStreamError extends Error {
 
 async function streamJarvis(message: string, sessionId: string, options: StreamJarvisOptions = {}): Promise<Response> {
   const turnStartedAt = Date.now();
+  // Fail closed: record this Session turn's derived-context activity epoch
+  // BEFORE any derived state is loaded or created (native and ordinary turns
+  // alike). If the epoch cannot be durably persisted, no derived context may be
+  // created, so the turn is refused rather than accumulating un-invalidatable
+  // state.
+  noteMemoryDerivedActivity(sessionId);
   // Invariant: the turn budget and coordinator route derive from the same
   // continuation-aware requirement; do not freeze a raw-message budget first.
   const priorTaskRun = sessionMemory.getTaskRun(sessionId);
@@ -1498,6 +1527,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         activeWorkspacePath,
       );
     } catch (error) {
+      // Activity-tracking failure is fail-closed: do not silently downgrade to
+      // "no memory" and continue building derived state with no epoch.
+      if (error instanceof MemoryDerivedStateUnavailableError) throw error;
       console.warn(
         `[Jarvis] Native memory reference resolution failed session=${sessionId}: ` +
         `${error instanceof Error ? error.message : String(error)}`,
@@ -1513,6 +1545,18 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       }
     : null;
   const turnMemoryEnvelope = activeTurnMemory?.envelope ?? null;
+  // Snapshot the current invalidation watermark for this started turn. This
+  // guard applies to EVERY turn that has a Session (native and ordinary HTTP),
+  // not just native-provided turn ids. If a semantic mutation advances it
+  // before a late write, that write is suppressed rather than allowed to
+  // restore stale memory-derived metadata. A watermark that cannot be trusted
+  // (null) is treated as permanently invalidated (fail closed).
+  const turnStartedWatermark = trySessionInvalidationWatermark(sessionId);
+  const turnInvalidated = (): boolean => {
+    if (turnStartedWatermark === null) return true;
+    const current = trySessionInvalidationWatermark(sessionId);
+    return current === null || current !== turnStartedWatermark;
+  };
   console.log(
     `[Jarvis] Memory turn session=${sessionId} turn=${memoryTurnId ?? "<none>"} ` +
     `status=${turnMemoryConsume?.status ?? "unavailable"} applied_envelope=${activeTurnMemory ? "yes" : "no"}`,
@@ -1679,6 +1723,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       errorCode: string | null = null,
     ): void => {
       if (!activeTurnMemory || memoryTerminalRecorded) return;
+      // A started turn retains a valid snapshot and MUST report its actual
+      // terminal outcome, applied ids, and tool refs even if a semantic
+      // mutation invalidated memory during the turn. These are diagnostics, not
+      // accepted facts, so the derived-persistence watermark does NOT gate the
+      // authenticated runtime lifecycle.
       memoryTerminalRecorded = true;
       nativeMemoryRegistry.observeTerminal(activeTurnMemory.preparationId, {
         terminal_status: status,
@@ -1754,7 +1803,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           deadlineAt: turnBudget.deadlineAt,
         }),
         onDeadline: async () => {
-          if (sessionMemory.getTaskRun(sessionId) === activeTaskRun) {
+          if (!turnInvalidated() && sessionMemory.getTaskRun(sessionId) === activeTaskRun) {
             sessionMemory.updateTaskRun(sessionId, {
               status: "paused",
               lastOutcome: "admission_deadline",
@@ -2090,6 +2139,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // depend on client-supplied history (which may also be truncated
         // past the original request by the history budget).
         if (
+          !turnInvalidated() &&
+          activeTaskRun.reconstruction !== "reconstruction_required" &&
           activeTaskRun.turnCount > 1 &&
           activeTaskRun.objective &&
           activeTaskRun.objective.trim() !== message.trim()
@@ -3587,15 +3638,17 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
            routeSource,
          );
          if (!streamLease.isCurrent() || streamAbort.signal.aborted) await emitCancelled();
-         sessionMemory.updateTaskRun(sessionId, {
-          estimatedComplexity: route.context.estimated_complexity,
-        });
+         if (!turnInvalidated()) {
+           sessionMemory.updateTaskRun(sessionId, {
+            estimatedComplexity: route.context.estimated_complexity,
+          });
+         }
         // Owned-runtime-loop (Task 5): seed TaskPlan from intake planning.
         // Simple (low): Conductor-authored items land only when ledger is empty
         // or unusable — never wipe verified/blocked progress on continuation.
         // Complex: brief only — ledger filled after Planner validate in pipeline.
         // Active-plan continuation must not reseed — plan is already expanded.
-        if (route.plan_authorship && !useActivePlanContinuation) {
+        if (route.plan_authorship && !useActivePlanContinuation && !turnInvalidated()) {
           const priorPlanItems = activeTaskRun.plan?.items?.length ?? 0;
           const seeded = sessionMemory.applyOwnedPlanning(sessionId, {
             plan_authorship: route.plan_authorship,
@@ -3873,7 +3926,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               }
             : undefined,
            onTaskPlanUpdate: (contract: TaskRunContract) => {
-             if (!ownsSessionState()) return;
+             if (!ownsSessionState() || turnInvalidated()) return;
              sessionMemory.setTaskRunContract(sessionId, contract);
              liveConductor.setPlanContext(contract);
            },
@@ -4062,7 +4115,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const turnWriteTargets = successfulToolCalls
           .filter((call) => TURN_WRITE_TOOLS.has(call.name))
           .flatMap((call) => collectToolPathTargets(call.arguments));
-         if (ownsSessionState() && turnWriteTargets.length > 0) {
+         if (ownsSessionState() && !turnInvalidated() && turnWriteTargets.length > 0) {
            sessionMemory.updateTaskRun(sessionId, {
             lastWriteTargets: recordWriteTargets(
               sessionMemory.getTaskRun(sessionId) ?? activeTaskRun,
@@ -4126,7 +4179,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           decision.runOutcome,
           reward?.outcomeFloor,
         );
-         if (ownsSessionState()) {
+         if (ownsSessionState() && !turnInvalidated()) {
            sessionMemory.updateTaskRun(sessionId, {
              status: decision.taskStatus,
              evidenceCount,
@@ -4182,7 +4235,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           breakdown: JSON.parse(serializeRunRewardBreakdown(runReward)),
         });
         const finalOutputForLog = trimmedAnswer || result.error || `(no output: ${result.error_code ?? "empty_completion"})`;
-         if (ownsSessionState()) {
+         if (ownsSessionState() && !turnInvalidated()) {
            sessionMemory.recordPipelineOutcome(sessionId, {
              outcome: rewardOutcome,
              errorCode: result.error_code,
@@ -5784,7 +5837,11 @@ export async function baseFetch(req: Request): Promise<Response> {
 
   // Internal native-memory routes bypass general CORS/preflight handling and
   // are capability-authenticated. Unknown paths fall through untouched.
-  const internalMemory = await handleNativeMemoryRequest(req, nativeMemoryRegistry);
+  const internalMemory = await handleNativeMemoryRequest(
+    req,
+    nativeMemoryRegistry,
+    invalidateMemoryDerivedState,
+  );
   if (internalMemory) return internalMemory;
 
   if (req.method === "OPTIONS") {

@@ -190,6 +190,12 @@ export function parseSessionMemoryState(
     return { ok: false, reason: "invalid_state" };
   }
   if (!isOptionalString(value.lastOutcome)) return { ok: false, reason: "invalid_state" };
+  // Strict immutable generation marker: a persisted carrier whose marker is not
+  // a non-negative safe integer cannot be trusted and must not be treated as
+  // fresh derived state.
+  if (value.derivedWatermark !== undefined && !isNonNegativeInteger(value.derivedWatermark)) {
+    return { ok: false, reason: "invalid_state" };
+  }
   const toolResults = parseEntryMap(value.toolResults, parseToolResultEntry);
   const fileSnapshots = parseEntryMap(value.fileSnapshots, parseFileSnapshotEntry);
   const discoveredFacts = parseEntryMap(value.discoveredFacts, parseDiscoveredFactEntry);
@@ -246,6 +252,9 @@ export function parseConductorSessionState(
     return { ok: false, reason: "invalid_state" };
   }
   if (!isOptionalBoolean(value.apiFallbackUsed)) return { ok: false, reason: "invalid_state" };
+  if (value.derivedWatermark !== undefined && !isNonNegativeInteger(value.derivedWatermark)) {
+    return { ok: false, reason: "invalid_state" };
+  }
   const messages: ConductorMessage[] = [];
   for (const entry of value.messages) {
     const message = parseConductorMessage(entry);

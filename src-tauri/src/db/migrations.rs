@@ -778,6 +778,28 @@ pub fn apply_scoped_memory_migrations(conn: &Connection) -> Result<(), rusqlite:
     let result = (|| -> Result<(), rusqlite::Error> {
         // Nullable workspace binding on persisted Sessions.
         add_column_if_missing(conn, "sessions", "project_root", "project_root TEXT")?;
+        // Explicit monotonic Session workspace-binding revision. Advances on
+        // every `project_root` change so a preparation can detect a pure rebind
+        // that changes the effective memory scope even when the global store
+        // and continuity revisions are unchanged.
+        add_column_if_missing(
+            conn,
+            "sessions",
+            "binding_revision",
+            "binding_revision INTEGER NOT NULL DEFAULT 0",
+        )?;
+        conn.execute_batch(
+            r#"
+            CREATE TRIGGER IF NOT EXISTS sessions_binding_revision_au
+            AFTER UPDATE OF project_root ON sessions
+            FOR EACH ROW
+            WHEN NEW.binding_revision <= OLD.binding_revision
+            BEGIN
+                UPDATE sessions SET binding_revision = OLD.binding_revision + 1
+                WHERE id = NEW.id;
+            END;
+            "#,
+        )?;
 
         // Scope + provenance + per-entry revision on memory rows.
         add_column_if_missing(
@@ -1105,9 +1127,19 @@ pub fn apply_memory_capture_migrations(conn: &Connection) -> Result<(), rusqlite
                 ON memory_turn_messages(message_id);
 
             -- Derived-state invalidation outbox. Drained in Part 3.2; persisted
-            -- atomically with the native mutation that produced it.
+            -- atomically with the native mutation that produced it. It has NO
+            -- Session FK so a pending cleanup survives the deletion of the
+            -- initiating Session. session_id holds the ORIGINAL initiating
+            -- Session id (audit metadata only, possibly deleted); operation_id
+            -- holds the raw native operation id. The wire key is rebuilt
+            -- deterministically as `session/<session_id>/operation/<operation_id>`
+            -- so the initial cleanup and every later drain send the exact same
+            -- key. scope_json holds the actual MemoryScope JSON;
+            -- source_message_ids_json holds the exact source message ids.
+            -- Malformed metadata is a typed storage failure, never silently
+            -- defaulted.
             CREATE TABLE IF NOT EXISTS memory_derived_invalidations (
-                session_id                 TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                session_id                 TEXT NOT NULL,
                 operation_id               TEXT NOT NULL,
                 scope_json                 TEXT NOT NULL CHECK(json_valid(scope_json)),
                 affected_session_ids_json  TEXT NOT NULL DEFAULT '[]'
@@ -1119,6 +1151,64 @@ pub fn apply_memory_capture_migrations(conn: &Connection) -> Result<(), rusqlite
             );
             CREATE INDEX IF NOT EXISTS idx_memory_derived_invalidations_pending
                 ON memory_derived_invalidations(acknowledged_at);
+            "#,
+        )?;
+        add_column_if_missing(
+            conn,
+            "memory_derived_invalidations",
+            "source_message_ids_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+
+        // Additive Part 3.2 outbox. Committed Part 3.1 already created
+        // `memory_derived_invalidations` WITH a `REFERENCES sessions ON DELETE
+        // CASCADE` FK; `CREATE TABLE IF NOT EXISTS` cannot remove it, so a
+        // pending cleanup row could be cascaded away by a Session delete. This
+        // NEW table has NO Session FK and is the production outbox. The old
+        // table is retained (never dropped, rows preserved); every surviving row
+        // is copied here idempotently (`INSERT OR IGNORE`), preserving the
+        // original initiating Session id, the raw operation id, the resolved
+        // scope, the source/affected/memory ids, and the acknowledgement.
+        // `source_message_ids_json` is added to the old table before the copy so
+        // the column always exists.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS memory_derived_cleanup_outbox (
+                session_id                 TEXT NOT NULL,
+                operation_id               TEXT NOT NULL,
+                scope_json                 TEXT NOT NULL CHECK(json_valid(scope_json)),
+                affected_session_ids_json  TEXT NOT NULL DEFAULT '[]'
+                    CHECK(json_valid(affected_session_ids_json)),
+                memory_ids_json            TEXT NOT NULL DEFAULT '[]'
+                    CHECK(json_valid(memory_ids_json)),
+                source_message_ids_json    TEXT NOT NULL DEFAULT '[]'
+                    CHECK(json_valid(source_message_ids_json)),
+                acknowledged_at            TEXT,
+                PRIMARY KEY (session_id, operation_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_derived_cleanup_outbox_pending
+                ON memory_derived_cleanup_outbox(acknowledged_at);
+            INSERT OR IGNORE INTO memory_derived_cleanup_outbox
+                (session_id, operation_id, scope_json, affected_session_ids_json,
+                 memory_ids_json, source_message_ids_json, acknowledged_at)
+            SELECT session_id, operation_id, scope_json, affected_session_ids_json,
+                   memory_ids_json, source_message_ids_json, acknowledged_at
+              FROM memory_derived_invalidations;
+            "#,
+        )?;
+
+        // A new prompt-source suppression is a semantic invalidation, so it
+        // must advance the singleton store revision even when it commits
+        // without a memory-row change (for example a historically-tombstoned
+        // forget with no-op memory update). This lets a prepared snapshot's
+        // revision recheck detect a suppression that lands during a model call.
+        conn.execute_batch(
+            r#"
+            CREATE TRIGGER IF NOT EXISTS memory_store_revision_suppression_ai
+            AFTER INSERT ON memory_prompt_suppressions
+            BEGIN
+                UPDATE memory_store_state SET revision = revision + 1 WHERE singleton = 1;
+            END;
             "#,
         )?;
         Ok(())

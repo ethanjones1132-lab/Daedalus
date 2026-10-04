@@ -898,8 +898,13 @@ pub fn read_memory_turn(
 
 /// Native prompt history strictly before the exact persisted source user
 /// message, in stable `created_at,rowid` order. The source row and every later
-/// row are excluded, even under equal timestamps. The operator transcript
-/// command is untouched.
+/// row are excluded, even under equal timestamps.
+///
+/// Model-facing suppression: any message recorded in
+/// `memory_prompt_suppressions` is replaced with the exact neutral marker
+/// `[Memory source removed]` so a forgotten/corrected instruction can never be
+/// replayed into future model context. The stable message id and role are
+/// preserved. The operator transcript command is untouched.
 pub fn history_for_memory_turn(
     conn: &Connection,
     session_id: &str,
@@ -927,6 +932,22 @@ pub fn history_for_memory_turn(
         }
     }
 
+    let suppressed: std::collections::HashSet<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT message_id FROM memory_prompt_suppressions
+                 WHERE session_id = ?",
+            )
+            .map_err(MemoryError::from)?;
+        let rows = stmt
+            .query_map(params![session_id], |row| row.get::<_, String>(0))
+            .map_err(MemoryError::from)?;
+        // A decode failure is a real storage error, never a silently-dropped
+        // suppression that would let a forgotten source back into history.
+        rows.collect::<Result<std::collections::HashSet<String>, _>>()
+            .map_err(MemoryError::from)?
+    };
+
     let mut stmt = conn
         .prepare(
             "SELECT m.id, m.role, m.content
@@ -940,11 +961,59 @@ pub fn history_for_memory_turn(
         .map_err(MemoryError::from)?;
     let rows = stmt
         .query_map(params![before_message_id, session_id, session_id], |row| {
-            Ok(PromptHistoryMessage {
-                id: row.get(0)?,
-                role: row.get(1)?,
-                content: row.get(2)?,
-            })
+            let id: String = row.get(0)?;
+            let role: String = row.get(1)?;
+            let original: String = row.get(2)?;
+            let content = if suppressed.contains(&id) {
+                super::continuity::source_removed_marker().to_string()
+            } else {
+                original
+            };
+            Ok(PromptHistoryMessage { id, role, content })
+        })
+        .map_err(MemoryError::from)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(MemoryError::from)
+}
+
+/// Suppression-aware model-facing transcript for the whole Session in stable
+/// `created_at,rowid` order, returned as `(id, role, content)`. A suppressed
+/// message is replaced with the exact neutral marker; the raw operator
+/// transcript (and every transcript-row byte) is untouched. Used so model-facing
+/// compaction input can never resurrect a forgotten/corrected source.
+pub fn sanitized_session_messages(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<PromptHistoryMessage>, MemoryError> {
+    let suppressed: std::collections::HashSet<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT message_id FROM memory_prompt_suppressions
+                 WHERE session_id = ?",
+            )
+            .map_err(MemoryError::from)?;
+        let rows = stmt
+            .query_map(params![session_id], |row| row.get::<_, String>(0))
+            .map_err(MemoryError::from)?;
+        rows.collect::<Result<std::collections::HashSet<String>, _>>()
+            .map_err(MemoryError::from)?
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, role, content FROM messages
+             WHERE session_id = ? ORDER BY created_at, rowid",
+        )
+        .map_err(MemoryError::from)?;
+    let rows = stmt
+        .query_map(params![session_id], |row| {
+            let id: String = row.get(0)?;
+            let role: String = row.get(1)?;
+            let original: String = row.get(2)?;
+            let content = if suppressed.contains(&id) {
+                super::continuity::source_removed_marker().to_string()
+            } else {
+                original
+            };
+            Ok(PromptHistoryMessage { id, role, content })
         })
         .map_err(MemoryError::from)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(MemoryError::from)
@@ -1167,10 +1236,10 @@ pub fn mark_turn_unterminated(
     turn_id: &str,
 ) -> Result<MemoryTurnDiagnostic, MemoryError> {
     let turn = read_memory_turn(conn, session_id, turn_id)?;
-    if !matches!(
-        turn.state,
-        MemoryTurnState::Registered | MemoryTurnState::Started | MemoryTurnState::Invalidated
-    ) {
+    // Only an actually-started turn may become `unterminated`. A registered,
+    // prepared, or invalidated never-started preparation must not be promoted.
+    let was_started = matches!(turn.state, MemoryTurnState::Started) || turn.started_at.is_some();
+    if !was_started {
         return Ok(memory_turn_diagnostic(&turn));
     }
     conn.execute(

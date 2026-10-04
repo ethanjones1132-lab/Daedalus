@@ -669,6 +669,41 @@ fn replay_ledger<T: DeserializeOwned>(
 
 // ── Provenance helpers ──────────────────────────────────────────────────────
 
+/// Canonical payload hash for an operator manual correction. Exposed so a
+/// command can resolve an exact canonical replay before any cleanup/invalidation.
+pub fn manual_correct_hash(
+    session_id: &str,
+    scope: &MemoryScope,
+    id: &str,
+    expected_revision: i64,
+    draft: &MemoryDraft,
+) -> String {
+    manual_correct_operation_hash(session_id, scope, id, expected_revision, draft)
+}
+
+/// Canonical payload hash for an operator manual forget.
+pub fn manual_forget_hash(
+    session_id: &str,
+    scope: &MemoryScope,
+    id: &str,
+    expected_revision: i64,
+    reason: &str,
+) -> String {
+    manual_forget_operation_hash(session_id, scope, id, expected_revision, reason)
+}
+
+/// Exact canonical replay of a persisted operation result. Returns `Ok(None)`
+/// when no ledger row exists; a same-identity/different-payload request is
+/// `operation_conflict`. This never writes and never submits to the mutation.
+pub fn replay_operation_result<T: DeserializeOwned>(
+    conn: &Connection,
+    session_id: &str,
+    operation_id: &str,
+    payload_hash: &str,
+) -> Result<Option<T>, MemoryError> {
+    replay_ledger::<T>(conn, session_id, operation_id, payload_hash)
+}
+
 fn user_statement_provenance(turn: &PersistedMemoryTurn, source: &str) -> MemoryProvenance {
     MemoryProvenance {
         authority_kind: AuthorityKind::UserStatement,
@@ -763,7 +798,6 @@ fn replace_scoped_memory(
     let _ = continuity::suppress_memory_sources(conn, scope, &[target_id.to_string()], now)?;
     let _ =
         continuity::clear_continuity_dependent_on(conn, &[target_id.to_string()], now)?;
-
     Ok(CorrectionResult {
         previous: tombstoned.memory,
         replacement,
@@ -1443,6 +1477,47 @@ pub fn read_capture_receipt(
         Some(stored) if stored.session_id == session_id => Ok(Some(stored.receipt)),
         _ => Ok(None),
     }
+}
+
+/// Resolve an exact canonical stage-proposal replay before cleanup/invalidation.
+/// The operation identity is checked against the exact current assistant
+/// substring payload; a same-identity/different-payload request is
+/// `operation_conflict`. This never writes.
+pub fn stage_memory_proposal_replay(
+    conn: &Connection,
+    request: &StageProposalRequest,
+) -> Result<Option<MutationResult>, MemoryError> {
+    if request.assistant_message_id.trim().is_empty() || request.draft.content.trim().is_empty() {
+        return Ok(None);
+    }
+    let turn = match turn::read_memory_turn(conn, &request.session_id, &request.turn_id) {
+        Ok(turn) => turn,
+        Err(_) => return Ok(None),
+    };
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT role, content FROM messages WHERE id = ? AND session_id = ?",
+            params![&request.assistant_message_id, &request.session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(MemoryError::from)?;
+    let Some((role, content)) = row else {
+        return Ok(None);
+    };
+    if role != "assistant" {
+        return Ok(None);
+    }
+    let assistant_hash = sha256_hex(content.as_bytes());
+    let payload_hash = stage_operation_hash(
+        &turn.scope,
+        &request.session_id,
+        &request.assistant_message_id,
+        &assistant_hash,
+        &request.operation_id,
+        &request.draft,
+    );
+    replay_ledger::<MutationResult>(conn, &request.session_id, &request.operation_id, &payload_hash)
 }
 
 /// Stage an exact assistant-substring proposal. Staging requires an

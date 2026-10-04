@@ -19,6 +19,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::capture_contracts::{MemoryDerivedInvalidation, NativeDerivedMutationPlan};
 use super::contracts::MemoryError;
 use super::turn::{
     self, mark_memory_turn_registered, mark_memory_turn_registration_failed,
@@ -26,6 +27,7 @@ use super::turn::{
     NativeMemoryRuntimeReceipt, PrepareMemoryTurnOutcome, PrepareMemoryTurnRequest,
     PreparedMemoryTurn,
 };
+use super::{continuity, scoped};
 use crate::db::AppDb;
 use crate::process_lifecycle::BunOwnership;
 
@@ -44,10 +46,20 @@ pub struct RegistrationResult {
     pub bun_instance_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
+struct DerivedWirePayload {
+    operation_id: String,
+    affected_session_ids: Vec<String>,
+    memory_ids: Vec<String>,
+    source_message_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct InvalidationRequest {
     app_instance_id: String,
     reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    derived: Option<DerivedWirePayload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,38 +229,55 @@ impl NativeMemoryTransport {
         Ok(parsed)
     }
 
-    /// Ask the live owned registry to drop every unconsumed envelope.
+    /// Ask the live owned registry to drop every unconsumed envelope AND, when a
+    /// derived payload is supplied, synchronously evict memory-derived prompt
+    /// state for the affected Sessions in the same authenticated round trip.
     ///
-    /// - `None`/`Exited`: the tracked child is gone; the old registry is gone
-    ///   and the mutation may proceed.
-    /// - `Unknown`: the handle could not report; fail closed.
-    /// - `Live`: an authenticated ACK is required. If we hold a bound
-    ///   generation and it differs from the current generation, the old
-    ///   registry was replaced and is gone. Even when registration is
-    ///   ambiguous (`bound_generation == None`), the live child must still ACK,
-    ///   because a lost registration response can have left an envelope.
+    /// Returns whether an actual live owned child ACKed. A confirmed
+    /// `None`/`Exited` generation permits the native mutation but reports
+    /// `false`: durable Bun cleanup remains pending (the outbox row must not be
+    /// acknowledged), and a later live drain must succeed before the next
+    /// preparation/history read.
+    ///
+    /// Ownership handling: EVERY current live owned child must ACK the current
+    /// generation, including when the previously-bound generation was replaced.
+    /// We clear obsolete bound metadata and authenticate against the actual new
+    /// child; an unknown ownership state fails closed. A healthy live child is
+    /// never killed to manufacture success.
     fn invalidate_registry(
         &self,
         state: &mut TransportState,
         reason: &str,
-    ) -> Result<(), HttpFailure> {
+        derived: Option<(&str, &MemoryDerivedInvalidation)>,
+    ) -> Result<bool, HttpFailure> {
+        // `derived` is `(wire_operation_key, invalidation)`. The key is already
+        // native-namespaced by the original initiating Session exactly once, so
+        // the initial cleanup and every later drain send the same key.
         match crate::process_lifecycle::bun_ownership() {
-            BunOwnership::None | BunOwnership::Exited => return Ok(()),
+            BunOwnership::None | BunOwnership::Exited => return Ok(false),
             BunOwnership::Unknown => return Err(HttpFailure::Unavailable),
             BunOwnership::Live => {}
         }
 
         let generation = crate::process_lifecycle::bun_generation();
-        if let Some(bound) = state.bound_generation {
-            if bound != generation {
-                // The registry we would have invalidated was replaced.
-                return Ok(());
-            }
+        // A replaced/unbound generation must still authenticate against the
+        // actual current live child; clear any obsolete bound identity first.
+        if state.bound_generation != Some(generation) {
+            state.bound_generation = None;
+            state.bound_bun_instance_id = None;
         }
+
+        let derived_payload = derived.map(|(wire_key, invalidation)| DerivedWirePayload {
+            operation_id: wire_key.to_string(),
+            affected_session_ids: invalidation.affected_session_ids.clone(),
+            memory_ids: invalidation.memory_ids.clone(),
+            source_message_ids: invalidation.source_message_ids.clone(),
+        });
 
         let request = InvalidationRequest {
             app_instance_id: self.app_instance_id.clone(),
             reason: reason.to_string(),
+            derived: derived_payload,
         };
         let body = self.post_json("/internal/memory/invalidate", &request, 200)?;
         let parsed: InvalidationResponse =
@@ -262,7 +291,7 @@ impl NativeMemoryTransport {
         }
         state.bound_generation = Some(generation);
         state.bound_bun_instance_id = Some(parsed.bun_instance_id);
-        Ok(())
+        Ok(true)
     }
 
     fn fetch_receipt(
@@ -307,7 +336,14 @@ pub fn prepare_memory_turn(
     request: PrepareMemoryTurnRequest,
     now: DateTime<Utc>,
 ) -> Result<MemoryTurnPreparation, MemoryError> {
+    // Hold the operation mutex across drain + snapshot + register so a mutation
+    // cannot interleave between pending-cleanup and the new registration. The
+    // internal drain does not re-lock; there is no nested gate. A drain failure
+    // (live owned child that cannot ACK durable cleanup) fails closed with a
+    // typed unavailable error rather than serving stale derived context.
     let mut state = transport.lock_state();
+    drain_pending_locked(db, transport, &mut state, now)
+        .map_err(|_| map_invalidation_error())?;
 
     let preparation_id = Uuid::new_v4().to_string();
     let outcome = {
@@ -450,15 +486,21 @@ pub fn sync_memory_turn(
         if matches!(persisted.state, turn::MemoryTurnState::Terminal) {
             return Ok(turn::memory_turn_diagnostic(&persisted));
         }
+        // Only an actually-started turn (`started` state or a durable
+        // `started_at`) may be recorded as `unterminated`. A never-started
+        // preparation — including an `invalidated` unconsumed row — must NOT be
+        // promoted to unterminated; it retains its terminal NULL (or expires
+        // when it was registered/prepared).
+        let was_started = matches!(persisted.state, turn::MemoryTurnState::Started)
+            || persisted.started_at.is_some();
         let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-        return if matches!(
-            persisted.state,
-            turn::MemoryTurnState::Started | turn::MemoryTurnState::Invalidated
-        ) {
+        return if was_started {
             turn::mark_turn_unterminated(&conn, &request.session_id, &request.turn_id)
         } else if matches!(
             persisted.state,
-            turn::MemoryTurnState::Registered | turn::MemoryTurnState::Prepared
+            turn::MemoryTurnState::Registered
+                | turn::MemoryTurnState::Prepared
+                | turn::MemoryTurnState::Invalidated
         ) {
             turn::mark_turn_expired(&conn, &request.session_id, &request.turn_id)
         } else {
@@ -507,7 +549,7 @@ pub fn invalidate_unconsumed_memory_turns(
 ) -> Result<(), MemoryError> {
     let mut state = transport.lock_state();
     transport
-        .invalidate_registry(&mut state, reason)
+        .invalidate_registry(&mut state, reason, None)
         .map_err(|_| {
             MemoryError::invalidation_unavailable("Memory registry did not acknowledge invalidation")
         })?;
@@ -516,11 +558,12 @@ pub fn invalidate_unconsumed_memory_turns(
     Ok(())
 }
 
-/// The single native operation gate for every semantic memory/Session-binding
-/// mutation. Lock order: operation gate -> HTTP invalidate (no AppDb mutex) ->
-/// AppDb mutex -> mutation callback. A live owned registry that cannot
-/// acknowledge blocks the callback; a confirmed exited/replaced generation
-/// permits the mutation; an unknown ownership state fails closed.
+/// Frozen Phase 2 mutation gate. Retains its original signature for
+/// non-semantic compatibility uses: it invalidates unconsumed preparations and
+/// marks native pending rows invalidated before running the mutation, but it
+/// carries no derived payload. Semantic knowledge/scope mutators must NOT use
+/// this as a `derived:None` bypass; they must provide affected ids through
+/// [`run_derived_mutation_gate`].
 pub fn with_memory_mutation_gate<T>(
     db: &AppDb,
     transport: &NativeMemoryTransport,
@@ -529,19 +572,392 @@ pub fn with_memory_mutation_gate<T>(
     mutation: impl FnOnce(&Connection) -> Result<T, MemoryError>,
 ) -> Result<T, MemoryError> {
     let mut state = transport.lock_state();
-
     transport
-        .invalidate_registry(&mut state, reason)
-        .map_err(|_| {
-            MemoryError::invalidation_unavailable(
-                "Memory registry did not acknowledge invalidation",
+        .invalidate_registry(&mut state, reason, None)
+        .map_err(|_| map_invalidation_error())?;
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    turn::mark_pending_turns_invalidated(&conn, now)?;
+    mutation(&conn)
+}
+
+/// Shared private coordinator for the derived-state mutation gate. `state` is
+/// the already-acquired operation mutex; no wrapper may re-acquire it.
+///
+/// Lock order: operation mutex -> single authenticated `/invalidate` ACK (both
+/// the unconsumed-preparation invalidation and the derived cleanup; all
+/// network, no AppDb mutex) -> AppDb mutex -> pending rows invalidated ->
+/// atomic outbox + mutation.
+///
+/// When a live owned child ACKed the derived cleanup, the outbox acknowledgement
+/// is written INSIDE the mutation savepoint so an acknowledgement failure rolls
+/// back the memory/suppression/ledger/receipt writes too. When no live child
+/// ACKed (confirmed exited/replaced generation), the mutation commits and the
+/// outbox row stays pending: the next live drain must succeed before any
+/// preparation/history read. An unknown ownership state fails closed.
+fn finish_plan_locked<T>(
+    db: &AppDb,
+    transport: &NativeMemoryTransport,
+    state: &mut TransportState,
+    originating_session_id: &str,
+    plan: NativeDerivedMutationPlan,
+    now: DateTime<Utc>,
+    mutation: impl FnOnce(&Connection, &NativeDerivedMutationPlan) -> Result<T, MemoryError>,
+) -> Result<T, MemoryError> {
+    // An empty affected-Session set is legitimate (for example an Agent or
+    // legacy mutation with no consumer Sessions). There is nothing to evict in
+    // Bun derived state, so no derived cleanup payload is sent and no outbox row
+    // is persisted (never a fictitious Session). The authenticated registry
+    // round trip still invalidates unconsumed preparations.
+    let has_consumers = !plan.invalidation.affected_session_ids.is_empty();
+    let wire_key = wire_operation_id(originating_session_id, &plan.invalidation.operation_id);
+    let acked = if has_consumers {
+        transport
+            .invalidate_registry(
+                state,
+                "memory_derived_mutation",
+                Some((wire_key.as_str(), &plan.invalidation)),
             )
-        })?;
+            .map_err(|_| map_invalidation_error())?
+    } else {
+        transport
+            .invalidate_registry(state, "memory_derived_mutation", None)
+            .map_err(|_| map_invalidation_error())?
+    };
 
     // Network is complete; now acquire the AppDb mutex and run the mutation.
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     turn::mark_pending_turns_invalidated(&conn, now)?;
-    mutation(&conn)
+
+    let operation_id = plan.invalidation.operation_id.clone();
+    scoped::with_memory_savepoint(&conn, |conn| {
+        if has_consumers {
+            record_outbox_row(conn, originating_session_id, &plan, now)?;
+        }
+        continuity::sanitize_legacy_session_summary(
+            conn,
+            &plan.invalidation.affected_session_ids,
+            now,
+        )?;
+        let result = mutation(conn, &plan)?;
+        // A live ACK means cleanup is durable: acknowledge the outbox row in the
+        // same savepoint as the mutation so a failure rolls back both.
+        if has_consumers && acked {
+            acknowledge_outbox_row(conn, originating_session_id, &operation_id, now)?;
+        }
+        Ok(result)
+    })
+}
+
+/// One operation-gate-scoped derived mutation. Takes the operation mutex once,
+/// resolves/revalidates the full native metadata (including the internal scope)
+/// under a brief AppDb snapshot, and either returns an exact canonical replay
+/// (no HTTP, no invalidation) or ACKs cleanup and runs the mutation. `resolve`
+/// and `mutation` both run while the operation mutex is held, so no other
+/// Session can interleave a consume or mutation.
+fn plan_derived_mutation<T, P, F>(
+    db: &AppDb,
+    transport: &NativeMemoryTransport,
+    initiating_session_id: &str,
+    now: DateTime<Utc>,
+    resolve: P,
+    mutation: F,
+) -> Result<T, MemoryError>
+where
+    P: FnOnce(&Connection) -> Result<DerivedGatePlan<T>, MemoryError>,
+    F: FnOnce(&Connection, &NativeDerivedMutationPlan) -> Result<T, MemoryError>,
+{
+    let mut state = transport.lock_state();
+    let outcome = {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        resolve(&conn)?
+    };
+    match outcome {
+        DerivedGatePlan::Replay(result) => Ok(result),
+        DerivedGatePlan::Invalidate(plan) => {
+            let originating_session_id = if initiating_session_id.is_empty() {
+                plan.invalidation
+                    .affected_session_ids
+                    .first()
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                initiating_session_id.to_string()
+            };
+            finish_plan_locked(
+                db,
+                transport,
+                &mut state,
+                &originating_session_id,
+                plan,
+                now,
+                mutation,
+            )
+        }
+    }
+}
+
+/// Build the capability-namespaced wire operation id from the original
+/// initiating Session and the native (untrusted) operation id. The operation id
+/// is ALWAYS namespaced exactly once: a public manual/caller operation id must
+/// never control the namespace (a value beginning with `session/` must not
+/// bypass the prefix and collide with another Session). The SAME deterministic
+/// key is rebuilt for the initial cleanup and every later drain, so repeated
+/// sends are idempotent. An empty initiating Session uses the explicit
+/// `global` audit namespace; production callers that reach the outbox always
+/// carry a real consumer Session.
+fn wire_operation_id(session_id: &str, operation_id: &str) -> String {
+    let namespace = if session_id.is_empty() { "global" } else { session_id };
+    format!("session/{}/operation/{}", namespace, operation_id)
+}
+
+fn map_invalidation_error() -> MemoryError {
+    MemoryError::invalidation_unavailable("Memory registry did not acknowledge invalidation")
+}
+
+/// Persist one outbox row keyed on the ORIGINAL initiating Session. The table
+/// has no Session FK so the row survives that Session's deletion.
+fn record_outbox_row(
+    conn: &Connection,
+    originating_session_id: &str,
+    plan: &NativeDerivedMutationPlan,
+    now: DateTime<Utc>,
+) -> Result<(), MemoryError> {
+    continuity::record_memory_derived_invalidation(
+        conn,
+        originating_session_id,
+        &plan.invalidation,
+        plan.scope.as_ref(),
+        now,
+    )
+}
+
+/// Acknowledge the outbox row under the original initiating Session only after
+/// a confirmed live ACK. Written inside the mutation savepoint so a failure
+/// rolls back the mutation too.
+fn acknowledge_outbox_row(
+    conn: &Connection,
+    originating_session_id: &str,
+    operation_id: &str,
+    now: DateTime<Utc>,
+) -> Result<(), MemoryError> {
+    continuity::acknowledge_memory_derived_invalidation(
+        conn,
+        originating_session_id,
+        operation_id,
+        now,
+    )
+}
+
+/// The Phase 3.2 derived-state mutation gate. The supplied four-field
+/// `MemoryDerivedInvalidation` is the frozen public contract; the resolved
+/// scope is inferred internally under the operation gate. The initiating
+/// Session is the first affected Session and namespaces the wire key.
+pub fn with_memory_derived_mutation_gate<T>(
+    db: &AppDb,
+    transport: &NativeMemoryTransport,
+    invalidation: &MemoryDerivedInvalidation,
+    now: DateTime<Utc>,
+    mutation: impl FnOnce(&Connection) -> Result<T, MemoryError>,
+) -> Result<T, MemoryError> {
+    plan_derived_mutation(
+        db,
+        transport,
+        invalidation
+            .affected_session_ids
+            .first()
+            .map(String::as_str)
+            .unwrap_or(""),
+        now,
+        |_conn| {
+            Ok(DerivedGatePlan::Invalidate(
+                NativeDerivedMutationPlan::from_invalidation(invalidation.clone()),
+            ))
+        },
+        move |conn, _plan| mutation(conn),
+    )
+}
+
+/// One operation-gate-scoped derived mutation. Takes the operation mutex once,
+/// resolves/revalidates the full native metadata (including the internal scope)
+/// under a brief AppDb snapshot, releases the AppDb lock for HTTP, then runs the
+/// mutation under the savepoint. `resolve` and `mutation` both run while the
+/// operation mutex is held, so no other Session can interleave a consume or
+/// mutation.
+///
+/// `mutation` receives the internal plan so it can re-validate its target
+/// against the exact scope that was cleaned and reject a scope/rebind race.
+pub fn run_derived_mutation_gate<T>(
+    db: &AppDb,
+    transport: &NativeMemoryTransport,
+    initiating_session_id: &str,
+    resolve: impl FnOnce(&Connection) -> Result<NativeDerivedMutationPlan, MemoryError>,
+    mutation: impl FnOnce(&Connection, &NativeDerivedMutationPlan) -> Result<T, MemoryError>,
+) -> Result<T, MemoryError> {
+    plan_derived_mutation(
+        db,
+        transport,
+        initiating_session_id,
+        Utc::now(),
+        move |conn| resolve(conn).map(DerivedGatePlan::Invalidate),
+        mutation,
+    )
+}
+
+/// Like [`run_derived_mutation_gate`] but the resolver may return an exact
+/// canonical replay result. On a replay the gate performs NO HTTP cleanup and
+/// NO invalidation and returns the persisted result directly (an exact retry
+/// must not re-invalidate). Otherwise it behaves as the derived gate, and the
+/// mutation rechecks the operation identity inside the savepoint to close races.
+pub fn run_derived_mutation_gate_with_replay<T>(
+    db: &AppDb,
+    transport: &NativeMemoryTransport,
+    initiating_session_id: &str,
+    resolve: impl FnOnce(&Connection) -> Result<DerivedGatePlan<T>, MemoryError>,
+    mutation: impl FnOnce(&Connection, &NativeDerivedMutationPlan) -> Result<T, MemoryError>,
+) -> Result<T, MemoryError> {
+    plan_derived_mutation(
+        db,
+        transport,
+        initiating_session_id,
+        Utc::now(),
+        resolve,
+        mutation,
+    )
+}
+
+/// Outcome of a manual-operation resolver that may short-circuit on replay.
+pub enum DerivedGatePlan<T> {
+    Replay(T),
+    Invalidate(NativeDerivedMutationPlan),
+}
+
+/// Internal non-locking drain used by callers that already hold the operation
+/// mutex (preparation/history reads). Sends each pending cleanup using the
+/// stored original initiating Session to rebuild the exact wire key, then
+/// persists the acknowledgement under a brief AppDb lock. A no-live-child send
+/// returns `false`; the row stays pending.
+fn drain_pending_locked(
+    db: &AppDb,
+    transport: &NativeMemoryTransport,
+    state: &mut TransportState,
+    now: DateTime<Utc>,
+) -> Result<(), MemoryError> {
+    let pending = {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        continuity::pending_memory_derived_invalidations(&conn)?
+    };
+    for row in pending {
+        // The stored session_id is the ORIGINAL initiating Session; the wire
+        // key is rebuilt identically every drain so retries are idempotent.
+        let originating_session_id = row.session_id.clone();
+        let wire_key = wire_operation_id(&originating_session_id, &row.invalidation.operation_id);
+        let acked = transport
+            .invalidate_registry(
+                state,
+                "memory_derived_drain",
+                Some((wire_key.as_str(), &row.invalidation)),
+            )
+            .map_err(|_| {
+                MemoryError::invalidation_unavailable(
+                    "Memory derived state did not acknowledge pending cleanup",
+                )
+            })?;
+        if acked {
+            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            acknowledge_outbox_row(
+                &conn,
+                &originating_session_id,
+                &row.invalidation.operation_id,
+                now,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Drain pending derived-invalidation outbox rows before serving a new
+/// preparation or history read. Holds the operation mutex once. A cleanup
+/// failure (or a live child that cannot ACK) yields typed failure instead of
+/// serving stale derived context; a confirmed-exited/replaced generation leaves
+/// the row pending.
+pub fn drain_memory_derived_invalidations(
+    db: &AppDb,
+    transport: &NativeMemoryTransport,
+    now: DateTime<Utc>,
+) -> Result<(), MemoryError> {
+    let mut state = transport.lock_state();
+    drain_pending_locked(db, transport, &mut state, now)
+}
+
+/// Read suppression-aware model history while holding the operation mutex
+/// across pending-cleanup drain and the history snapshot.
+pub fn read_memory_turn_history(
+    db: &AppDb,
+    transport: &NativeMemoryTransport,
+    session_id: &str,
+    before_message_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Vec<turn::PromptHistoryMessage>, MemoryError> {
+    let mut state = transport.lock_state();
+    drain_pending_locked(db, transport, &mut state, now)?;
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    turn::history_for_memory_turn(&conn, session_id, before_message_id)
+}
+
+/// A model-facing, suppression-aware transcript snapshot taken under the
+/// operation gate, together with the revisions needed to detect a memory
+/// mutation that commits during a subsequent model call. Callers must re-read
+/// the same revisions before publishing derived output and must refuse to
+/// publish when either changed. `session_binding_revision` additionally covers
+/// a pure Session workspace rebind (which can change the effective memory scope
+/// without touching the global store revision); suppression generation is
+/// already included in `store_revision` via the `memory_prompt_suppressions`
+/// triggers.
+pub struct MemoryContextSnapshot {
+    pub messages: Vec<turn::PromptHistoryMessage>,
+    pub store_revision: i64,
+    pub continuity_revision: i64,
+    pub session_binding_revision: i64,
+}
+
+/// Take a sanitized Session transcript snapshot under the operation gate:
+/// drain pending derived cleanup, then read the suppression-aware transcript so
+/// the model never sees a forgotten/corrected source. The AppDb lock is held
+/// only for the snapshot; the caller runs its model call after this returns.
+pub fn snapshot_sanitized_session_messages(
+    db: &AppDb,
+    transport: &NativeMemoryTransport,
+    session_id: &str,
+    now: DateTime<Utc>,
+) -> Result<MemoryContextSnapshot, MemoryError> {
+    let mut state = transport.lock_state();
+    drain_pending_locked(db, transport, &mut state, now)?;
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let messages = turn::sanitized_session_messages(&conn, session_id)?;
+    let store_revision = scoped::memory_store_revision(&conn)?;
+    let continuity_revision = continuity::read_session_continuity(&conn, session_id)?.revision;
+    let session_binding_revision = continuity::session_binding_revision(&conn, session_id)?;
+    Ok(MemoryContextSnapshot {
+        messages,
+        store_revision,
+        continuity_revision,
+        session_binding_revision,
+    })
+}
+
+/// Re-read the revision triple a [`MemoryContextSnapshot`] captured. A change
+/// means a memory mutation — or a Session workspace rebind — committed during
+/// the model call, so derived output built from the earlier snapshot must not be
+/// published.
+pub fn memory_context_revisions(
+    db: &AppDb,
+    session_id: &str,
+) -> Result<(i64, i64, i64), MemoryError> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let store_revision = scoped::memory_store_revision(&conn)?;
+    let continuity_revision = continuity::read_session_continuity(&conn, session_id)?.revision;
+    let session_binding_revision = continuity::session_binding_revision(&conn, session_id)?;
+    Ok((store_revision, continuity_revision, session_binding_revision))
 }
 
 /// Build the capability/instance environment for an owned spawn. Never logs

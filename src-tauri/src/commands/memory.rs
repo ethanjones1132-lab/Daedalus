@@ -1,14 +1,68 @@
 use crate::db::AppDb;
+use crate::jarvis::memory::capture_contracts::{
+    MemoryDerivedInvalidation, NativeDerivedMutationPlan,
+};
 use crate::jarvis::memory::contracts::{
     AuthorityKind, MemoryDraft, MemoryError, MemoryProvenance, MemoryScope, MutationResult,
     RecallOptions, RecallPreview, ScopeSelector, ScopedMemoryEntry,
 };
 use crate::jarvis::memory::engine::{self, MemoryEntry, MemoryEvent, MemoryRecall, MemoryRun};
-use crate::jarvis::memory::{scope, scoped};
+use crate::jarvis::memory::{continuity, scope, scoped};
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use serde::Deserialize;
 use tauri::{AppHandle, State};
+
+/// Build a derived-invalidation payload for a scoped mutation: exact source
+/// lineage (including assistant consequence ids) plus every bounded Session
+/// whose derived prompt state could hold the affected memories. `operation_id`
+/// is a fresh UUID for operator/manual routes.
+fn plan_scoped_invalidation(
+    conn: &Connection,
+    session_id: &str,
+    scope: &MemoryScope,
+    memory_ids: Vec<String>,
+    operation_id: String,
+) -> Result<NativeDerivedMutationPlan, MemoryError> {
+    let source_message_ids =
+        continuity::collect_memory_source_message_ids(conn, scope, &memory_ids)?;
+    let affected_session_ids =
+        continuity::collect_affected_session_ids(conn, session_id, Some(scope), &memory_ids)?;
+    Ok(NativeDerivedMutationPlan {
+        invalidation: MemoryDerivedInvalidation {
+            operation_id,
+            affected_session_ids,
+            memory_ids,
+            source_message_ids,
+        },
+        scope: Some(scope.clone()),
+    })
+}
+
+/// Build a derived-invalidation plan for a legacy (unscoped) mutation.
+fn plan_legacy_invalidation(
+    conn: &Connection,
+    session_id: &str,
+    memory_ids: Vec<String>,
+    operation_id: String,
+) -> Result<NativeDerivedMutationPlan, MemoryError> {
+    let source_message_ids = continuity::collect_legacy_source_message_ids(conn, &memory_ids)?;
+    let affected_session_ids =
+        continuity::collect_affected_session_ids(conn, session_id, None, &memory_ids)?;
+    Ok(NativeDerivedMutationPlan {
+        invalidation: MemoryDerivedInvalidation {
+            operation_id,
+            affected_session_ids,
+            memory_ids,
+            source_message_ids,
+        },
+        scope: None,
+    })
+}
+
+fn fresh_operation_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
 
 #[tauri::command]
 pub fn memory_list(db: State<AppDb>) -> Result<Vec<MemoryEntry>, String> {
@@ -30,10 +84,15 @@ pub async fn memory_save(
     tags: Vec<String>,
     category: String,
 ) -> Result<MemoryEntry, String> {
-    super::memory_turn::run_gated_mutation(app, "legacy_memory_save", move |conn| {
-        engine::save_manual_memory(conn, title, content, tags, category)
-            .map_err(MemoryError::storage_unavailable)
-    })
+    super::memory_turn::run_derived_gated_mutation(
+        app,
+        String::new(),
+        move |conn| plan_legacy_invalidation(conn, "", Vec::new(), fresh_operation_id()),
+        move |conn, _invalidation| {
+            engine::save_manual_memory(conn, title, content, tags, category)
+                .map_err(MemoryError::storage_unavailable)
+        },
+    )
     .await
     .map_err(|error| error.message)
 }
@@ -47,29 +106,81 @@ pub async fn memory_update(
     tags: Vec<String>,
     category: String,
 ) -> Result<MemoryEntry, String> {
-    super::memory_turn::run_gated_mutation(app, "legacy_memory_update", move |conn| {
-        engine::update_manual_memory(conn, id, title, content, tags, category)
-            .map_err(MemoryError::storage_unavailable)
-    })
+    let plan_id = id.clone();
+    super::memory_turn::run_derived_gated_mutation(
+        app,
+        String::new(),
+        move |conn| plan_legacy_invalidation(conn, "", vec![plan_id], fresh_operation_id()),
+        move |conn, _invalidation| {
+            // Preflight: the legacy update route may only touch a verified
+            // legacy-unscoped row. An explicitly scoped fact must use the
+            // scoped APIs (which enforce expected_revision); a scoped row is a
+            // typed scope mismatch, and a genuinely absent row keeps the
+            // historical not-found error.
+            if !engine::legacy_command_guard(conn, &id)? {
+                return Err(MemoryError::not_found("Memory not found"));
+            }
+            // Suppress the OLD provenance before the in-place overwrite so the
+            // replaced source text can never be replayed from derived state.
+            continuity::suppress_legacy_memory_sources(conn, &[id.clone()], Utc::now())?;
+            engine::update_manual_memory(conn, id, title, content, tags, category)
+                .map_err(MemoryError::storage_unavailable)
+        },
+    )
     .await
     .map_err(|error| error.message)
 }
 
 #[tauri::command]
 pub async fn memory_delete(app: AppHandle, id: String) -> Result<bool, String> {
-    super::memory_turn::run_gated_mutation(app, "legacy_memory_delete", move |conn| {
-        engine::tombstone_memory(conn, &id, "user", "User deleted via UI", None, None)
-            .map_err(MemoryError::storage_unavailable)
-    })
+    let plan_id = id.clone();
+    super::memory_turn::run_derived_gated_mutation(
+        app,
+        String::new(),
+        move |conn| {
+            plan_legacy_invalidation(conn, "", vec![plan_id], fresh_operation_id())
+        },
+        move |conn, _invalidation| {
+            // Preflight: the legacy delete route may only tombstone a verified
+            // legacy-unscoped row. A scoped fact must go through the scoped
+            // route with its expected_revision; it is never tombstoned here via
+            // the generic engine helper. A truly absent row is compatibility
+            // false.
+            if !engine::legacy_command_guard(conn, &id)? {
+                return Ok(false);
+            }
+            continuity::suppress_legacy_memory_sources(conn, &[id.clone()], Utc::now())?;
+            engine::tombstone_memory(conn, &id, "user", "User deleted via UI", None, None)
+                .map_err(MemoryError::storage_unavailable)
+        },
+    )
     .await
     .map_err(|error| error.message)
 }
 
 #[tauri::command]
 pub async fn memory_restore(app: AppHandle, id: String) -> Result<bool, String> {
-    super::memory_turn::run_gated_mutation(app, "legacy_memory_restore", move |conn| {
-        engine::restore_memory(conn, &id).map_err(MemoryError::storage_unavailable)
-    })
+    let plan_id = id.clone();
+    super::memory_turn::run_derived_gated_mutation(
+        app,
+        String::new(),
+        move |conn| {
+            plan_legacy_invalidation(conn, "", vec![plan_id], fresh_operation_id())
+        },
+        move |conn, _invalidation| {
+            // Preflight: restore preserves the legacy-scope guard that
+            // `engine::restore_memory` only partially enforces (it returns
+            // `false` for an absent row). A scoped row is a typed mismatch.
+            if !engine::legacy_command_guard(conn, &id)? {
+                return Ok(false);
+            }
+            // Restore never removes suppression; the row's own source lineage is
+            // (re)suppressed and any dependent objective is cleared.
+            continuity::suppress_legacy_memory_sources(conn, &[id.clone()], Utc::now())?;
+            let _ = continuity::clear_continuity_dependent_on(conn, &[id.clone()], Utc::now())?;
+            engine::restore_memory(conn, &id).map_err(MemoryError::storage_unavailable)
+        },
+    )
     .await
     .map_err(|error| error.message)
 }
@@ -108,21 +219,38 @@ pub fn memory_runs_list(
 
 #[tauri::command]
 pub async fn memory_run_now(app: AppHandle, kind: String) -> Result<MemoryRun, String> {
-    super::memory_turn::run_gated_mutation(app, "legacy_memory_run_now", move |conn| {
-        match kind.as_str() {
+    let plan_kind = kind.clone();
+    super::memory_turn::run_derived_gated_mutation(
+        app,
+        String::new(),
+        move |conn| {
+            // Invalidation targets only the exact active legacy-unscoped rows a
+            // consolidation/auto-dream run can actually mutate. Unrelated
+            // explicitly scoped facts are neither enumerated nor invalidated.
+            let ids: Vec<String> = if plan_kind == "consolidation" || plan_kind == "auto_dream" {
+                engine::legacy_consolidation_candidate_ids(conn)?
+            } else {
+                Vec::new()
+            };
+            plan_legacy_invalidation(conn, "", ids, fresh_operation_id())
+        },
+        move |conn, _invalidation| match kind.as_str() {
             "consolidation" | "auto_dream" => {
+                // `consolidate_memories` already reads only active legacy rows
+                // via its own legacy-only filter, so unrelated explicitly scoped
+                // facts are untouched and must not abort the run. Manual legacy
+                // consolidation therefore keeps working alongside scoped memory.
                 engine::consolidate_memories(conn).map_err(MemoryError::storage_unavailable)
             }
             _ => Err(MemoryError::invalid_payload(format!(
                 "Unsupported memory run kind '{}'",
                 kind
             ))),
-        }
-    })
+        },
+    )
     .await
     .map_err(|error| error.message)
 }
-
 fn expand_path_safe(path_str: &str) -> Result<std::path::PathBuf, String> {
     if path_str.contains("..") || path_str.contains('\0') {
         return Err("Path traversal or invalid characters detected".to_string());
@@ -445,9 +573,24 @@ pub async fn memory_bind_session_workspace(
     app: AppHandle,
     request: BindSessionWorkspaceRequest,
 ) -> Result<MemoryScope, MemoryError> {
-    super::memory_turn::run_gated_mutation(app, "session_bind_workspace", move |conn| {
-        execute_bind_session_workspace(conn, request)
-    })
+    let session_id = request.session_id.clone();
+    let plan_session = session_id.clone();
+    super::memory_turn::run_derived_gated_mutation(
+        app,
+        session_id,
+        move |_conn| {
+            Ok(NativeDerivedMutationPlan {
+                invalidation: MemoryDerivedInvalidation {
+                    operation_id: fresh_operation_id(),
+                    affected_session_ids: vec![plan_session],
+                    memory_ids: Vec::new(),
+                    source_message_ids: Vec::new(),
+                },
+                scope: None,
+            })
+        },
+        move |conn, _plan| execute_bind_session_workspace(conn, request),
+    )
     .await
 }
 
@@ -456,9 +599,24 @@ pub async fn memory_scoped_save(
     app: AppHandle,
     request: ScopedSaveRequest,
 ) -> Result<MutationResult, MemoryError> {
-    super::memory_turn::run_gated_mutation(app, "scoped_memory_save", move |conn| {
-        execute_scoped_save(conn, request, Utc::now())
-    })
+    let session_id = request.session_id.clone();
+    let plan_request = request.clone();
+    super::memory_turn::run_derived_gated_mutation(
+        app,
+        session_id,
+        move |conn| {
+            let write_scope =
+                scope::resolve_write_scope(conn, &plan_request.session_id, &plan_request.selector)?;
+            plan_scoped_invalidation(
+                conn,
+                &plan_request.session_id,
+                &write_scope,
+                Vec::new(),
+                fresh_operation_id(),
+            )
+        },
+        move |conn, _invalidation| execute_scoped_save(conn, request, Utc::now()),
+    )
     .await
 }
 
@@ -485,9 +643,35 @@ pub async fn memory_scoped_update(
     app: AppHandle,
     request: ScopedUpdateRequest,
 ) -> Result<MutationResult, MemoryError> {
-    super::memory_turn::run_gated_mutation(app, "scoped_memory_update", move |conn| {
-        execute_scoped_update(conn, request, Utc::now())
-    })
+    let session_id = request.session_id.clone();
+    let plan_request = request.clone();
+    super::memory_turn::run_derived_gated_mutation(
+        app,
+        session_id,
+        move |conn| {
+            let write_scope =
+                scope::resolve_write_scope(conn, &plan_request.session_id, &plan_request.selector)?;
+            plan_scoped_invalidation(
+                conn,
+                &plan_request.session_id,
+                &write_scope,
+                vec![plan_request.id.clone()],
+                fresh_operation_id(),
+            )
+        },
+        move |conn, _invalidation| {
+            // Suppress the OLD provenance before the in-place overwrite.
+            let write_scope =
+                scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
+            continuity::suppress_memory_sources(
+                conn,
+                &write_scope,
+                &[request.id.clone()],
+                Utc::now(),
+            )?;
+            execute_scoped_update(conn, request, Utc::now())
+        },
+    )
     .await
 }
 
@@ -496,9 +680,30 @@ pub async fn memory_scoped_delete(
     app: AppHandle,
     request: ScopedDeleteRequest,
 ) -> Result<MutationResult, MemoryError> {
-    super::memory_turn::run_gated_mutation(app, "scoped_memory_delete", move |conn| {
-        execute_scoped_delete(conn, request, Utc::now())
-    })
+    let session_id = request.session_id.clone();
+    let plan_request = request.clone();
+    super::memory_turn::run_derived_gated_mutation(
+        app,
+        session_id,
+        move |conn| {
+            let write_scope =
+                scope::resolve_write_scope(conn, &plan_request.session_id, &plan_request.selector)?;
+            plan_scoped_invalidation(
+                conn,
+                &plan_request.session_id,
+                &write_scope,
+                vec![plan_request.id.clone()],
+                fresh_operation_id(),
+            )
+        },
+        move |conn, _invalidation| {
+            let write_scope =
+                scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
+            continuity::suppress_memory_sources(conn, &write_scope, &[request.id.clone()], Utc::now())?;
+            let _ = continuity::clear_continuity_dependent_on(conn, &[request.id.clone()], Utc::now())?;
+            execute_scoped_delete(conn, request, Utc::now())
+        },
+    )
     .await
 }
 
@@ -507,9 +712,24 @@ pub async fn memory_scoped_restore(
     app: AppHandle,
     request: ScopedRestoreRequest,
 ) -> Result<MutationResult, MemoryError> {
-    super::memory_turn::run_gated_mutation(app, "scoped_memory_restore", move |conn| {
-        execute_scoped_restore(conn, request, Utc::now())
-    })
+    let session_id = request.session_id.clone();
+    let plan_request = request.clone();
+    super::memory_turn::run_derived_gated_mutation(
+        app,
+        session_id,
+        move |conn| {
+            let write_scope =
+                scope::resolve_write_scope(conn, &plan_request.session_id, &plan_request.selector)?;
+            plan_scoped_invalidation(
+                conn,
+                &plan_request.session_id,
+                &write_scope,
+                vec![plan_request.id.clone()],
+                fresh_operation_id(),
+            )
+        },
+        move |conn, _invalidation| execute_scoped_restore(conn, request, Utc::now()),
+    )
     .await
 }
 
@@ -527,8 +747,29 @@ pub async fn memory_adopt_legacy(
     app: AppHandle,
     request: AdoptLegacyRequest,
 ) -> Result<MutationResult, MemoryError> {
-    super::memory_turn::run_gated_mutation(app, "memory_adopt_legacy", move |conn| {
-        execute_adopt_legacy(conn, request, Utc::now())
-    })
+    let session_id = request.session_id.clone();
+    let plan_request = request.clone();
+    super::memory_turn::run_derived_gated_mutation(
+        app,
+        session_id,
+        move |conn| {
+            let target_scope =
+                scope::resolve_write_scope(conn, &plan_request.session_id, &plan_request.selector)?;
+            plan_scoped_invalidation(
+                conn,
+                &plan_request.session_id,
+                &target_scope,
+                vec![plan_request.id.clone()],
+                fresh_operation_id(),
+            )
+        },
+        move |conn, _invalidation| {
+            // Adoption retains suppression of the source provenance and clears
+            // any dependent objective with an audit event.
+            continuity::suppress_legacy_memory_sources(conn, &[request.id.clone()], Utc::now())?;
+            let _ = continuity::clear_continuity_dependent_on(conn, &[request.id.clone()], Utc::now())?;
+            execute_adopt_legacy(conn, request, Utc::now())
+        },
+    )
     .await
 }

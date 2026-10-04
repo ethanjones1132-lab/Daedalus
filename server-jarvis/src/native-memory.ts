@@ -11,10 +11,12 @@
 import { realpathSync } from "node:fs";
 
 import type {
+  MemoryDerivedInvalidation,
   MemoryRecallStatus,
   MemoryRuntimeEvidence,
   PreparedMemoryTurn,
 } from "./memory-contract";
+import { noteMemoryDerivedActivity } from "./memory-derived-state";
 import { resolveWorkspacePathIdentity } from "./orchestration/path-identity";
 
 const CAPABILITY_ENV = "JARVIS_NATIVE_MEMORY_CAPABILITY";
@@ -386,7 +388,12 @@ export function createNativeMemoryRegistry(
         // refuse the new registration instead.
         throw new RegistryError("registry_full", 507, "preparation registry cannot reserve capacity");
       }
-      unconsumed.set(id, makeEntry(envelope));
+      const entry = makeEntry(envelope);
+      // Track activity BEFORE the registry side effect. If the epoch cannot be
+      // persisted the registration is withheld, so no derived context can be
+      // created whose invalidation would be untracked.
+      noteMemoryDerivedActivity(envelope.session_id);
+      unconsumed.set(id, entry);
       return { preparation_id: id, bun_instance_id: bunInstanceId };
     },
 
@@ -428,6 +435,10 @@ export function createNativeMemoryRegistry(
         }
       }
 
+      // Track activity BEFORE consuming (the registry side effect). A failure
+      // withholds the consume; the entry stays registered and the caller fails
+      // closed rather than building derived prompt state with no epoch.
+      noteMemoryDerivedActivity(entry.sessionId);
       unconsumed.delete(entry.envelope.preparation_id);
       const status: MemoryRecallStatus = entry.envelope.block.length > 0 ? "ready" : "empty";
       const record = emptyReceipt(entry, status, null);
@@ -581,12 +592,76 @@ async function readBoundedBody(req: Request): Promise<unknown> {
   return raw.length > 0 ? JSON.parse(raw) : {};
 }
 
-function bearerAuthorized(req: Request, capability: string | null): boolean {
-  if (!capability) return false;
+function bearerAuthorized(req: Request, capability: string | null): boolean {  if (!capability) return false;
   const header = req.headers.get("authorization") ?? "";
   const prefix = "Bearer ";
   if (!header.startsWith(prefix)) return false;
   return header.slice(prefix.length) === capability;
+}
+
+/**
+ * Strictly validate the capability-only `derived` payload. EXACTLY the four
+ * frozen fields; a malformed array, oversized array, malformed entry, empty
+ * operation id, non-namespaced operation key, or unknown field is rejected
+ * (never filtered to success) so the native gate cannot receive an ACK for an
+ * ill-formed cleanup request. An EMPTY `affected_session_ids` array is a
+ * legitimate no-op accepted by the cleanup module.
+ */
+const MAX_DERIVED_ID_LENGTH = 1024;
+const MAX_DERIVED_OPERATION_LENGTH = 2048;
+const MAX_DERIVED_ARRAY_ENTRIES = 8192;
+const DERIVED_FIELDS = new Set([
+  "operation_id",
+  "affected_session_ids",
+  "memory_ids",
+  "source_message_ids",
+]);
+const NAMESPACED_DERIVED_OPERATION = /^session\/(.+)\/operation\/(.+)$/;
+
+function parseDerivedInvalidation(value: unknown): MemoryDerivedInvalidation {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new RegistryError("invalid_derived", 400, "derived payload is not an object");
+  }
+  const record = value as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (!DERIVED_FIELDS.has(key)) {
+      throw new RegistryError("invalid_derived", 400, "derived payload has an unknown field");
+    }
+  }
+  const operationId = record.operation_id;
+  if (typeof operationId !== "string" || operationId.length === 0) {
+    throw new RegistryError("invalid_derived", 400, "derived operation id is required");
+  }
+  if (operationId.length > MAX_DERIVED_OPERATION_LENGTH) {
+    throw new RegistryError("invalid_derived", 400, "derived operation id exceeds the bound");
+  }
+  if (!NAMESPACED_DERIVED_OPERATION.test(operationId)) {
+    throw new RegistryError("invalid_derived", 400, "derived operation id is not native-namespaced");
+  }
+  const arrayField = (field: string): string[] => {
+    const raw = record[field];
+    if (!Array.isArray(raw)) {
+      throw new RegistryError("invalid_derived", 400, `derived ${field} is not an array`);
+    }
+    if (raw.length > MAX_DERIVED_ARRAY_ENTRIES) {
+      throw new RegistryError("invalid_derived", 400, `derived ${field} exceeds the bound`);
+    }
+    for (const entry of raw) {
+      if (typeof entry !== "string" || entry.length === 0) {
+        throw new RegistryError("invalid_derived", 400, `derived ${field} has an invalid entry`);
+      }
+      if (entry.length > MAX_DERIVED_ID_LENGTH) {
+        throw new RegistryError("invalid_derived", 400, `derived ${field} entry exceeds the bound`);
+      }
+    }
+    return raw as string[];
+  };
+  return {
+    operation_id: operationId,
+    affected_session_ids: arrayField("affected_session_ids"),
+    memory_ids: arrayField("memory_ids"),
+    source_message_ids: arrayField("source_message_ids"),
+  };
 }
 
 /**
@@ -597,6 +672,7 @@ function bearerAuthorized(req: Request, capability: string | null): boolean {
 export async function handleNativeMemoryRequest(
   req: Request,
   registry: NativeMemoryRegistry,
+  onDerivedInvalidate?: (input: MemoryDerivedInvalidation) => void,
 ): Promise<Response | null> {
   const path = new URL(req.url).pathname;
   if (!path.startsWith("/internal/memory")) return null;
@@ -615,9 +691,23 @@ export async function handleNativeMemoryRequest(
       return json(registry.register(body));
     }
     if (path === "/internal/memory/invalidate" && req.method === "POST") {
-      const body = (await readBoundedBody(req)) as { app_instance_id?: string; reason?: string };
+      const body = (await readBoundedBody(req)) as {
+        app_instance_id?: string;
+        reason?: string;
+        derived?: unknown;
+      };
       if (typeof body.app_instance_id !== "string" || body.app_instance_id !== meta.appInstanceId) {
         return json({ code: "app_instance_mismatch" }, 409);
+      }
+      // Synchronous derived cleanup runs BEFORE the ACK. A thrown cleanup
+      // failure is caught below and answers 503, so the native gate never
+      // receives an ACK for incomplete cleanup. The `derived` payload, when
+      // present, is validated strictly inside the callback.
+      if (body.derived !== undefined && body.derived !== null) {
+        if (!onDerivedInvalidate) {
+          return json({ code: "memory_unavailable" }, 503);
+        }
+        onDerivedInvalidate(parseDerivedInvalidation(body.derived));
       }
       const invalidated = registry.invalidate(body.reason ?? "native_mutation");
       return json({ invalidated_count: invalidated, bun_instance_id: meta.bunInstanceId });

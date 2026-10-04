@@ -18,6 +18,11 @@ import {
   type OwnedPlanningAttachment,
 } from "./runtime-loop";
 import { parseSessionMemoryState, writeJsonAtomic } from "./session-runtime-persistence";
+import {
+  sessionInvalidationWatermark,
+  trySessionInvalidationWatermark,
+} from "../memory-derived-state";
+import type { MemoryDerivedInvalidation } from "../memory-contract";
 
 export interface ToolResultCacheEntry {
   key: string;
@@ -64,6 +69,12 @@ export interface SessionMemoryState {
   failureHistory: FailurePatternEntry[];
   /** Durable objective/checkpoint contract shared by continuation turns. */
   taskRun?: TaskRunContract;
+  /**
+   * Persisted invalidation watermark this snapshot was last sanitized against.
+   * A late write whose marker is older than the current watermark is
+   * re-sanitized before it can reach disk.
+   */
+  derivedWatermark?: number;
 }
 
 export interface BeginTaskRunInput {
@@ -514,12 +525,96 @@ export class SessionMemory {
   }
 
   /**
-   * Drop every in-memory compaction carrier. Native memory invalidation calls
-   * this so a mutation cannot leave recalled project context cached. Durable
-   * per-session files keep their existing lifecycle.
+   * Drop every in-memory Session carrier. Phase 3.2 scoped invalidation uses
+   * `evictMemoryDerivedState` instead so independent TaskRuns/tool/file/check
+   * state is preserved; this remains for explicit Session teardown.
    */
   clearAll(): void {
     this.sessions.clear();
+  }
+
+  /**
+   * Scoped eviction for one affected Session: load any persisted instance file
+   * (even when persistence is currently disabled, since it may be enabled
+   * later), then REPLACE the cached carrier with a detached, deep-cloned,
+   * scrubbed object bearing the current immutable generation. Memory-derived
+   * discovered facts and stale TaskRun textual carriers are neutralized while
+   * independent tool results, file snapshots, failure history, grants, executed
+   * evidence, and plan progress are preserved. Persists synchronously and throws
+   * on failure so the native ACK is withheld.
+   *
+   * The pre-eviction object is never mutated or re-stamped: it keeps its older
+   * generation permanently, so an in-flight writer holding it can neither
+   * restore derived text nor affect the fresh cached state.
+   */
+  evictMemoryDerivedState(
+    sessionId: string,
+    _invalidation: MemoryDerivedInvalidation,
+  ): void {
+    // Strict read: a corrupt watermark fails closed and withholds the ACK.
+    const current = sessionInvalidationWatermark(sessionId);
+    const existing = this.sessions.get(sessionId) ?? this.loadFromDiskForScrub(sessionId);
+    if (!existing) return;
+
+    const fresh = deepCloneState(existing);
+    setSessionGeneration(fresh, current);
+    fresh.derivedWatermark = current;
+    this.evictDerivedFields(fresh);
+
+    const path = memoryFilePath(fresh.sessionId, this.sessionsRoot);
+    if (this.config().persist || existsSync(path)) {
+      this.persistOrThrow(fresh);
+    }
+    // Replace the cached identity; the old object is detached and permanently
+    // stale by its old generation.
+    this.sessions.set(sessionId, fresh);
+  }
+
+  private evictDerivedFields(session: SessionMemoryState): void {
+    for (const key of Object.keys(session.discoveredFacts)) {
+      const fact = session.discoveredFacts[key];
+      // Accepted-memory-origin facts and unknown/untyped legacy facts are
+      // discarded conservatively; only explicitly verified tool/file sources
+      // are preserved.
+      if (shouldDiscardDerivedFact(fact)) {
+        delete session.discoveredFacts[key];
+      }
+    }
+    if (session.taskRun) {
+      session.taskRun = neutralizeTaskRunTextualCarriers(session.taskRun);
+    }
+    // Session-level outcome text is untyped/derived and may embed a suppressed
+    // source; drop it until fresh sanitized context rebuilds the carrier.
+    session.lastOutcome = undefined;
+    session.lastActiveAt = Date.now();
+  }
+
+  /**
+   * Strictly load a persisted Session file for scrubbing even when persistence
+   * is currently disabled. A missing file yields `null`; an unreadable or
+   * invalid file throws so the cleanup ACK is withheld rather than leaving
+   * stale on-disk state.
+   */
+  private loadFromDiskForScrub(sessionId: string): SessionMemoryState | null {
+    const path = memoryFilePath(sessionId, this.sessionsRoot);
+    if (!existsSync(path)) return null;
+    let raw: unknown;
+    try {
+      raw = JSON.parse(readFileSync(path, "utf-8"));
+    } catch {
+      throw new Error("memory_derived_unavailable:corrupt_session_state");
+    }
+    const parsed = parseSessionMemoryState(raw, sessionId);
+    if (!parsed.ok) {
+      throw new Error("memory_derived_unavailable:invalid_session_state");
+    }
+    setSessionGeneration(parsed.state, parsed.state.derivedWatermark ?? 0);
+    return parsed.state;
+  }
+
+  private persistOrThrow(session: SessionMemoryState): void {
+    session.derivedWatermark = sessionGeneration(session);
+    writeJsonAtomic(memoryFilePath(session.sessionId, this.sessionsRoot), session);
   }
 
   getSessionState(sessionId: string): SessionMemoryState | undefined {
@@ -643,6 +738,7 @@ export class SessionMemory {
       discoveredFacts: {},
       failureHistory: [],
     };
+    setSessionGeneration(created, trySessionInvalidationWatermark(sessionId) ?? 0);
     this.touch(sessionId, created);
     return created;
   }
@@ -664,7 +760,14 @@ export class SessionMemory {
 
   private persist(session: SessionMemoryState): void {
     if (!this.config().persist) return;
+    // Never let a stale in-flight carrier (or one whose watermark cannot be
+    // trusted) overwrite the fresh cached state on disk with older progress /
+    // evidence / TaskRun text. Fresh independent writes go through the current
+    // Session getter, whose object carries the current generation.
+    const current = trySessionInvalidationWatermark(session.sessionId);
+    if (current === null || sessionGeneration(session) < current) return;
     try {
+      session.derivedWatermark = sessionGeneration(session);
       writeJsonAtomic(memoryFilePath(session.sessionId, this.sessionsRoot), session);
     } catch {
       console.warn("[SessionMemory] Failed to persist state: write_failed");
@@ -687,10 +790,139 @@ export class SessionMemory {
       console.warn("[SessionMemory] Ignoring persisted state: invalid_state");
       return null;
     }
+    // Never render stale persisted derived text. If the marker predates the
+    // current watermark (or cannot be trusted), scrub the in-memory carrier at
+    // load time; when the marker is trustworthy the scrubbed carrier is stamped
+    // current so fresh independent writes can persist again.
+    const persistedGeneration = parsed.state.derivedWatermark ?? 0;
+    const current = trySessionInvalidationWatermark(sessionId);
+    if (current === null || persistedGeneration < current) {
+      this.evictDerivedFields(parsed.state);
+    }
+    const effectiveGeneration =
+      current !== null && persistedGeneration < current ? current : persistedGeneration;
+    setSessionGeneration(parsed.state, effectiveGeneration);
     return parsed.state;
   }
 }
 
+/**
+ * Immutable per-object generation. Assigned once when a SessionMemoryState is
+ * created or loaded from disk and never re-stamped; a late writer holding an
+ * old identity can never be treated as fresh.
+ */
+const SESSION_GENERATIONS = new WeakMap<SessionMemoryState, number>();
+
+function sessionGeneration(session: SessionMemoryState): number {
+  return SESSION_GENERATIONS.get(session) ?? 0;
+}
+
+function setSessionGeneration(session: SessionMemoryState, generation: number): void {
+  SESSION_GENERATIONS.set(session, generation);
+}
+
+/** Deep clone so a fresh eviction carrier shares no nested TaskRun/plan refs. */
+function deepCloneState(state: SessionMemoryState): SessionMemoryState {
+  return JSON.parse(JSON.stringify(state)) as SessionMemoryState;
+}
+
 export function __resetSessionMemoryForTests(): void {
   // No module-level cache beyond instance state; tests use dedicated instances.
+}
+
+/**
+ * Explicit memory/recall/proposal/legacy-unknown origins are always
+ * memory-derived.
+ */
+const EXPLICIT_MEMORY_FACT_SOURCES = new Set([
+  "memory",
+  "memory_recall",
+  "accepted_memory",
+  "recall",
+  "user_statement",
+  "assistant_proposal",
+  "verified_observation",
+  "legacy_unknown",
+  "legacy",
+]);
+
+/**
+ * Actual independent typed tool/file sources. Only these are preserved; a
+ * `file:`/`artifact:` key prefix is NOT proof of typed provenance.
+ */
+const INDEPENDENT_TOOL_FACT_SOURCES = new Set([
+  "read_file",
+  "list_directory",
+  "glob",
+  "grep",
+  "web_fetch",
+  "write_file",
+  "edit_file",
+  "multi_edit",
+  "apply_patch",
+  "write",
+  "edit",
+  "multiedit",
+  "tool_result",
+]);
+
+/**
+ * Facts from an explicit memory/recall/proposal origin are discarded FIRST;
+ * untyped/unknown legacy facts are discarded REGARDLESS of key prefix; only
+ * genuinely independent typed tool/file observations survive.
+ */
+function shouldDiscardDerivedFact(fact: DiscoveredFactEntry): boolean {
+  const source = fact.source.trim().toLowerCase();
+  if (
+    EXPLICIT_MEMORY_FACT_SOURCES.has(source) ||
+    source.includes("memory") ||
+    source.includes("recall") ||
+    source.includes("proposal")
+  ) {
+    return true;
+  }
+  if (INDEPENDENT_TOOL_FACT_SOURCES.has(source)) return false;
+  return true;
+}
+
+/** Exact neutral marker for any future model-facing suppressed carrier. */
+const MEMORY_SOURCE_REMOVED = "[Memory source removed]";
+
+/**
+ * Neutralize the stale textual carriers of a TaskRun until fresh sanitized
+ * native context rebuilds it. The objective, plan titles/descriptions/acceptance
+ * descriptions, blocked/evidence summaries, remaining work, and last outcome are
+ * all untrusted once a memory source is removed (exact spans cannot be proven),
+ * so they are replaced with the neutral marker. IDs, status, progress,
+ * dependsOn, grading mode, repair cycles, evidence refs/grounding, checks,
+ * grants/permissions, and tool/file caches are preserved. The result is a deep
+ * clone so no nested TaskRun/plan reference is shared with the pre-eviction
+ * carrier.
+ */
+function neutralizeTaskRunTextualCarriers(taskRun: TaskRunContract): TaskRunContract {
+  const clone = JSON.parse(JSON.stringify(taskRun)) as TaskRunContract;
+  clone.objective = MEMORY_SOURCE_REMOVED;
+  clone.remainingWork = [];
+  clone.lastOutcome = MEMORY_SOURCE_REMOVED;
+  clone.reconstruction = "reconstruction_required";
+  clone.updatedAt = new Date().toISOString();
+  if (clone.plan) {
+    clone.plan = {
+      activeItemId: clone.plan.activeItemId,
+      items: clone.plan.items.map((item) => ({
+        ...item,
+        title: MEMORY_SOURCE_REMOVED,
+        description: undefined,
+        blockedReason: undefined,
+        acceptanceChecks: (item.acceptanceChecks ?? []).map((check) => ({
+          ...check,
+          description: MEMORY_SOURCE_REMOVED,
+        })),
+        evidence: item.evidence
+          ? { ...item.evidence, summary: undefined }
+          : item.evidence,
+      })),
+    };
+  }
+  return clone;
 }

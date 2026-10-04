@@ -18,6 +18,10 @@ pub use memory::*;
 pub mod memory_turn;
 pub use memory_turn::*;
 
+// Native memory capture commands (Phase 3.2: gated capture/correct/forget/proposal)
+pub mod memory_capture;
+pub use memory_capture::*;
+
 // Skills command handlers (SQLite-backed)
 pub mod skills;
 pub use skills::*;

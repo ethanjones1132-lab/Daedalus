@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::contracts::{MemoryDraft, ScopeSelector, ScopedMemoryEntry};
+use super::contracts::{MemoryDraft, MemoryScope, ScopeSelector, ScopedMemoryEntry};
 use super::turn::MemoryTurnTerminalStatus;
 
 /// Terminal disposition of one operation inside a capture receipt.
@@ -63,6 +63,42 @@ pub struct ForgetResult {
     pub store_revision: i64,
     pub changed: bool,
     pub suppressed_message_ids: Vec<String>,
+}
+
+/// Capability-only derived-context invalidation payload. Native namespaces
+/// `operation_id` as `session/<session_id>/operation/<operation_id>` on the wire
+/// so equal operator UUIDs in distinct Sessions never collide. It carries ids
+/// only: never recalled text, scope paths, provenance, or a capability value.
+/// The frozen DTO has EXACTLY these four fields, mirrored in
+/// `server-jarvis/src/memory-contract.ts`. The resolved MemoryScope is internal
+/// native routing metadata (see `NativeDerivedMutationPlan`) and is never sent
+/// on the wire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct MemoryDerivedInvalidation {
+    pub operation_id: String,
+    pub affected_session_ids: Vec<String>,
+    pub memory_ids: Vec<String>,
+    pub source_message_ids: Vec<String>,
+}
+
+/// INTERNAL native routing metadata. Never serialized to the wire: the public
+/// frozen `MemoryDerivedInvalidation` keeps exactly four fields. Carries the
+/// exact resolved scope of the affected records so the outbox can persist real
+/// `scope_json` without polluting the capability DTO.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeDerivedMutationPlan {
+    pub invalidation: MemoryDerivedInvalidation,
+    pub scope: Option<MemoryScope>,
+}
+
+impl NativeDerivedMutationPlan {
+    pub fn from_invalidation(invalidation: MemoryDerivedInvalidation) -> Self {
+        Self {
+            invalidation,
+            scope: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

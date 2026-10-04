@@ -6,6 +6,10 @@ import type { ChatMessage, SharedContextHints } from "./coordinator";
 import type { ConductorConfig, JarvisConfig } from "../config";
 import { SESSIONS_DIR } from "../config";
 import {
+  sessionInvalidationWatermark,
+  trySessionInvalidationWatermark,
+} from "../memory-derived-state";
+import {
   resolveClaudeCliLaunchOptions,
   type ClaudeCliAuthMode,
 } from "../claude-cli";
@@ -50,6 +54,12 @@ export interface ConductorSessionState {
   lastModel?: string;
   /** Set when API fallback was used — next local turn rebuilds prefix safely. */
   apiFallbackUsed?: boolean;
+  /**
+   * Persisted invalidation watermark this carrier was last sanitized against.
+   * A late write whose marker predates the current watermark has its derived
+   * conversation dropped rather than restored.
+   */
+  derivedWatermark?: number;
 }
 
 export interface ConductorRouteTurnInput {
@@ -230,13 +240,17 @@ export function taskPlanHealthFields(
   }
 
   const active = getActivePlanItem(taskRun);
+  // A reconstruction-required contract's textual carriers are untrusted until
+  // fresh sanitized native context rebuilds them: never serialize an objective
+  // or plan title that may embed a suppressed source.
+  const reconstructionRequired = taskRun.reconstruction === "reconstruction_required";
   return {
     active_task_run_id: taskRun.taskRunId,
     active_task_session_id: sessionId ?? taskRun.sessionId ?? null,
     active_task_status: taskRun.status,
-    active_task_objective: taskRun.objective || null,
+    active_task_objective: reconstructionRequired ? null : (taskRun.objective || null),
     active_plan_item_id: active?.id ?? taskRun.plan?.activeItemId ?? null,
-    active_plan_item_title: active?.title ?? null,
+    active_plan_item_title: reconstructionRequired ? null : (active?.title ?? null),
     active_plan_item_status: active?.status ?? null,
     grading_mode: active
       ? resolveActiveGradingMode(active, taskRun.estimatedComplexity)
@@ -507,6 +521,21 @@ function buildTurnUserContent(
     recentOutcomeHint,
     `Current request:\n${input.request}`,
   ].filter(Boolean).join("\n\n");
+}
+
+/**
+ * Immutable per-object generation for conductor carriers. Assigned once at
+ * object creation/load and never re-stamped, so a stale in-flight reference can
+ * never be treated as fresh by writing through it.
+ */
+const CONDUCTOR_GENERATIONS = new WeakMap<ConductorSessionState, number>();
+
+function conductorGeneration(session: ConductorSessionState): number {
+  return CONDUCTOR_GENERATIONS.get(session) ?? 0;
+}
+
+function setConductorGeneration(session: ConductorSessionState, generation: number): void {
+  CONDUCTOR_GENERATIONS.set(session, generation);
 }
 
 export class PersistentConductor {
@@ -978,6 +1007,42 @@ export class PersistentConductor {
     }
   }
 
+  /**
+   * Scoped derived-state eviction for one affected Session: delete the persisted
+   * conversation/compaction carrier and REPLACE the cached identity with a
+   * detached, empty, fresh carrier at the current immutable generation so all
+   * future turns rebuild from sanitized native history. The pre-eviction object
+   * keeps its older generation permanently and can never restore old messages.
+   * An unreadable persisted copy throws so the native ACK is withheld (it must
+   * not silently survive with stale recalled context). Independent TaskRuns live
+   * in SessionMemory.
+   */
+  evictDerivedState(sessionId: string): void {
+    // Strict read: a corrupt watermark fails closed and withholds the ACK.
+    const current = sessionInvalidationWatermark(sessionId);
+    const path = sessionFilePath(sessionId, this.sessionsRoot);
+    if (existsSync(path)) {
+      // Verify the persisted copy is readable before removing it; an unreadable
+      // file is a cleanup failure, not a silent success.
+      try {
+        readFileSync(path, "utf-8");
+      } catch {
+        throw new Error("memory_derived_unavailable:corrupt_conductor_state");
+      }
+      unlinkSync(path);
+    }
+    const fresh: ConductorSessionState = {
+      sessionId,
+      turns: 0,
+      messages: [],
+      lastActiveAt: Date.now(),
+      kvGeneration: 0,
+      derivedWatermark: current,
+    };
+    setConductorGeneration(fresh, current);
+    this.sessions.set(sessionId, fresh);
+  }
+
   getSessionState(sessionId: string): ConductorSessionState | undefined {
     return this.sessions.get(sessionId);
   }
@@ -1362,11 +1427,18 @@ export class PersistentConductor {
       lastActiveAt: Date.now(),
       kvGeneration: 0,
     };
+    setConductorGeneration(created, trySessionInvalidationWatermark(sessionId) ?? 0);
     this.touchSession(sessionId, created);
     return created;
   }
 
   private touchSession(sessionId: string, session: ConductorSessionState): void {
+    const cached = this.sessions.get(sessionId);
+    // Never let a stale in-flight carrier displace a fresh (post-eviction)
+    // carrier of a newer generation.
+    if (cached && cached !== session && conductorGeneration(cached) > conductorGeneration(session)) {
+      return;
+    }
     this.sessions.delete(sessionId);
     this.sessions.set(sessionId, session);
     this.pruneInactiveSessions();
@@ -1411,7 +1483,12 @@ export class PersistentConductor {
 
   private persistSession(session: ConductorSessionState): void {
     if (!this.config().persist_sessions && !this.config().kv_persist) return;
+    // Never let a stale in-flight carrier (or one whose watermark cannot be
+    // trusted) overwrite fresh cached conversation state on disk.
+    const current = trySessionInvalidationWatermark(session.sessionId);
+    if (current === null || conductorGeneration(session) < current) return;
     try {
+      session.derivedWatermark = conductorGeneration(session);
       writeJsonAtomic(sessionFilePath(session.sessionId, this.sessionsRoot), session);
     } catch {
       console.warn("[PersistentConductor] Failed to persist state: write_failed");
@@ -1434,6 +1511,17 @@ export class PersistentConductor {
       console.warn("[PersistentConductor] Ignoring persisted state: invalid_state");
       return null;
     }
+    // Never render stale persisted messages. If the marker predates the current
+    // watermark (or cannot be trusted), drop the conversation at load time; a
+    // trustworthy marker lets the scrubbed carrier be stamped current.
+    const persistedGeneration = parsed.state.derivedWatermark ?? 0;
+    const current = trySessionInvalidationWatermark(sessionId);
+    if (current === null || persistedGeneration < current) {
+      parsed.state.messages = [];
+    }
+    const effectiveGeneration =
+      current !== null && persistedGeneration < current ? current : persistedGeneration;
+    setConductorGeneration(parsed.state, effectiveGeneration);
     return parsed.state;
   }
 }

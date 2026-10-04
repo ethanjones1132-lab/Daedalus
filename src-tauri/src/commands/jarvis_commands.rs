@@ -203,20 +203,44 @@ pub async fn jarvis_send_message(
     let mut history = Vec::new();
     let mut history_unavailable = false;
     if let Some(user_message_id) = user_message_id.as_deref() {
-        let history_result = {
-            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-            crate::jarvis::memory::turn::history_for_memory_turn(&conn, &session_id, user_message_id)
-        };
+        // One operation-gate-scoped drain + snapshot: the SAME operation mutex
+        // covers the pending-cleanup drain and the suppression-aware history
+        // read, so no semantic mutation can interleave between them (no TOCTOU)
+        // and a stale derived context is never served. The bounded HTTP runs in
+        // spawn_blocking, never on the Tauri async executor. A failed drain or
+        // history read fails closed: there is no raw-history fallback.
+        let app_for_history = app.clone();
+        let session_for_history = session_id.clone();
+        let before_for_history = user_message_id.to_string();
+        let history_result = tauri::async_runtime::spawn_blocking(move || {
+            let state = app_for_history.state::<crate::db::AppDb>();
+            let transport = crate::jarvis::memory::transport::native_memory_transport();
+            crate::jarvis::memory::transport::read_memory_turn_history(
+                state.inner(),
+                transport,
+                &session_for_history,
+                &before_for_history,
+                chrono::Utc::now(),
+            )
+        })
+        .await;
         match history_result {
-            Ok(messages) => {
+            Ok(Ok(messages)) => {
                 history = messages
                     .into_iter()
                     .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
                     .collect();
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 history_unavailable = true;
                 eprintln!("[jarvis-chat] native memory history failed: {}", error);
+            }
+            Err(error) => {
+                history_unavailable = true;
+                eprintln!(
+                    "[jarvis-chat] native memory history task join error: {}",
+                    error
+                );
             }
         }
     }
@@ -392,10 +416,29 @@ pub async fn jarvis_list_sessions(
 
 #[tauri::command]
 pub async fn jarvis_delete_session(app: AppHandle, session_id: String) -> Result<(), String> {
-    crate::commands::memory_turn::run_gated_mutation(app, "session_delete", move |conn| {
-        crate::commands::sessions::delete_session_row_conn(conn, &session_id)
-            .map_err(crate::jarvis::memory::contracts::MemoryError::storage_unavailable)
-    })
+    crate::commands::memory_turn::run_derived_gated_mutation(
+        app,
+        session_id.clone(),
+        {
+            let session_for_plan = session_id.clone();
+            move |_conn| {
+                Ok(crate::jarvis::memory::capture_contracts::NativeDerivedMutationPlan {
+                    invalidation:
+                        crate::jarvis::memory::capture_contracts::MemoryDerivedInvalidation {
+                            operation_id: uuid::Uuid::new_v4().to_string(),
+                            affected_session_ids: vec![session_for_plan],
+                            memory_ids: Vec::new(),
+                            source_message_ids: Vec::new(),
+                        },
+                    scope: None,
+                })
+            }
+        },
+        move |conn, _plan| {
+            crate::commands::sessions::delete_session_row_conn(conn, &session_id)
+                .map_err(crate::jarvis::memory::contracts::MemoryError::storage_unavailable)
+        },
+    )
     .await
     .map_err(|error| error.message)?;
     Ok(())
